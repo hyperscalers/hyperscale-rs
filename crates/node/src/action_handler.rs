@@ -291,7 +291,7 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
             per_cert_updates,
             deferred,
             aborted,
-            provision_targets,
+            waves,
         } => {
             let merged_updates =
                 hyperscale_storage::merge_database_updates_from_arcs(&per_cert_updates);
@@ -311,7 +311,7 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
                 deferred,
                 aborted,
                 shard_group_id,
-                provision_targets,
+                waves,
             );
             let prepared = result
                 .prepared_commit

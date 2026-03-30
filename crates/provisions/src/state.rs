@@ -33,7 +33,7 @@ const PROVISION_FALLBACK_TIMEOUT_BLOCKS: u64 = 10;
 
 /// Tracks an expected provision that hasn't arrived yet.
 ///
-/// Created when a remote block header's `provision_targets` includes our shard.
+/// Created when a remote block header's `waves` field targets our shard.
 /// Emits a single `RequestMissingProvisions` after the timeout; the fetch
 /// protocol owns retries from that point.
 #[derive(Debug, Clone)]
@@ -121,7 +121,7 @@ pub struct ProvisionCoordinator {
 
     /// Expected provisions that haven't arrived yet.
     /// Keyed by `(source_shard, block_height)`. Populated when a remote
-    /// header's `provision_targets` includes our shard. Cleared when
+    /// header's `waves` field targets our shard. Cleared when
     /// provisions are verified or the associated transactions are cleaned up.
     expected_provisions: HashMap<(ShardGroupId, BlockHeight), ExpectedProvision>,
 
@@ -334,7 +334,7 @@ impl ProvisionCoordinator {
                 .retain(|&(s, h), _| s != shard || h.0 >= cutoff);
         }
 
-        // Track expected provisions: if this block's provision_targets includes
+        // Track expected provisions: if this block's waves target
         // our shard, we expect provisions to arrive. If they don't arrive within
         // the timeout, we'll request them via fallback.
         //
@@ -343,10 +343,12 @@ impl ProvisionCoordinator {
         // an earlier committed header gossip from a different validator). Without
         // this guard, late-arriving duplicate headers re-register the expectation
         // after it was already cleared by verification, causing spurious timeouts.
+        let local_shard = topology.local_shard();
         if committed_header
             .header
-            .provision_targets
-            .contains(&topology.local_shard())
+            .waves
+            .iter()
+            .any(|w| w.0.contains(&local_shard))
         {
             let key = (shard, height);
             if !self.verified_remote_headers.contains_key(&key) {
@@ -752,7 +754,7 @@ mod tests {
     use super::*;
     use hyperscale_types::{
         bls_keypair_from_seed, BlockHeader, Bls12381G1PrivateKey, QuorumCertificate,
-        SubstateInclusionProof, TopologySnapshot, TxEntries, ValidatorInfo, ValidatorSet,
+        SubstateInclusionProof, TopologySnapshot, TxEntries, ValidatorInfo, ValidatorSet, WaveId,
     };
 
     fn make_test_topology(local_shard: ShardGroupId) -> TopologySnapshot {
@@ -814,7 +816,7 @@ mod tests {
             state_root: Hash::from_bytes(format!("root_{shard}_{height}").as_bytes()),
             transaction_root: Hash::ZERO,
             receipt_root: Hash::ZERO,
-            provision_targets: vec![],
+            waves: vec![],
         };
         let header_hash = header.hash();
         let mut qc = QuorumCertificate::genesis();
@@ -933,7 +935,7 @@ mod tests {
             state_root: Hash::from_bytes(b"root"),
             transaction_root: Hash::ZERO,
             receipt_root: Hash::ZERO,
-            provision_targets: vec![],
+            waves: vec![],
         };
         let mut qc = QuorumCertificate::genesis();
         qc.block_hash = Hash::from_bytes(b"wrong_hash"); // Mismatch!
@@ -963,7 +965,7 @@ mod tests {
             state_root: Hash::from_bytes(b"root"),
             transaction_root: Hash::ZERO,
             receipt_root: Hash::ZERO,
-            provision_targets: vec![],
+            waves: vec![],
         };
         let header_hash = header.hash();
         let mut qc = QuorumCertificate::genesis();
@@ -1452,6 +1454,13 @@ mod tests {
         height: u64,
         provision_targets: Vec<ShardGroupId>,
     ) -> Arc<CommittedBlockHeader> {
+        // Convert flat provision targets into waves: each target shard becomes
+        // its own single-dependency wave. This preserves the test semantics
+        // (provision_targets() returns the same set).
+        let waves: Vec<WaveId> = provision_targets
+            .into_iter()
+            .map(|s| WaveId(std::collections::BTreeSet::from([s])))
+            .collect();
         let header = BlockHeader {
             shard_group_id: shard,
             height: BlockHeight(height),
@@ -1464,7 +1473,7 @@ mod tests {
             state_root: Hash::from_bytes(format!("root_{shard}_{height}").as_bytes()),
             transaction_root: Hash::ZERO,
             receipt_root: Hash::ZERO,
-            provision_targets,
+            waves,
         };
         let header_hash = header.hash();
         let mut qc = QuorumCertificate::genesis();

@@ -223,6 +223,24 @@ pub struct ExecutionState {
     speculative_cache_miss_count: u64,
     /// Count of speculative results invalidated since last metrics read.
     speculative_invalidated_count: u64,
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Execution Certificate Cache (for fallback serving)
+    // ═══════════════════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════════════
+    // Expected Execution Certificate Tracking (Fallback Detection)
+    // ═══════════════════════════════════════════════════════════════════════
+    /// Expected execution certificates from remote shards.
+    /// Populated when remote block headers with waves targeting our shard are seen.
+    /// Cleared when the matching cert is received and verified.
+    /// After timeout, triggers `RequestMissingExecutionCerts` fallback.
+    expected_exec_certs: HashMap<(ShardGroupId, u64, WaveId), ExpectedExecCert>,
+
+    /// Fulfilled execution cert keys — prevents late-arriving duplicate headers
+    /// from re-registering expectations after certs have already been received.
+    /// Maps (source_shard, block_height, wave_id) → local_height_when_fulfilled
+    /// for age-based pruning using local time.
+    fulfilled_exec_certs: HashMap<(ShardGroupId, u64, WaveId), u64>,
 }
 
 impl Default for ExecutionState {
@@ -230,6 +248,18 @@ impl Default for ExecutionState {
         Self::new()
     }
 }
+
+/// Tracks an expected execution certificate that hasn't arrived yet.
+#[derive(Debug, Clone)]
+struct ExpectedExecCert {
+    /// Local committed height when we first learned about this expected cert.
+    discovered_at: u64,
+    /// Whether we've already sent a fallback request for this cert.
+    requested: bool,
+}
+
+/// Number of blocks to wait before requesting missing execution certificates.
+const EXEC_CERT_FALLBACK_TIMEOUT_BLOCKS: u64 = 10;
 
 /// Default maximum transactions for speculative execution (in-flight + cached).
 pub const DEFAULT_SPECULATIVE_MAX_TXS: usize = 500;
@@ -281,6 +311,8 @@ impl ExecutionState {
             speculative_late_hit_count: 0,
             speculative_cache_miss_count: 0,
             speculative_invalidated_count: 0,
+            expected_exec_certs: HashMap::new(),
+            fulfilled_exec_certs: HashMap::new(),
         }
     }
 
@@ -642,38 +674,44 @@ impl ExecutionState {
         certificate: hyperscale_types::ExecutionCertificate,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
-        let local_shard = topology.local_shard();
         let local_vid = topology.local_validator_id();
         let block_hash = certificate.block_hash;
 
-        // Determine remote participating shards from the execution accumulator
-        let key = (block_hash, wave_id.clone());
-        let remote_shards: Vec<ShardGroupId> = self
-            .accumulators
-            .get(&key)
-            .map(|acc| {
-                acc.all_participating_shards()
-                    .into_iter()
-                    .filter(|&s| s != local_shard)
-                    .collect()
-            })
-            .unwrap_or_default();
+        // The wave_id IS the set of remote shards — no need to look up the
+        // accumulator (which may have been pruned by the time the cert is
+        // aggregated, especially with many shards where provision flow is slower).
+        let remote_shards: Vec<ShardGroupId> = wave_id.0.iter().copied().collect();
 
         let certificate = Arc::new(certificate);
 
-        // Broadcast execution cert to each remote participating shard
-        for target_shard in &remote_shards {
-            let recipients: Vec<ValidatorId> = topology
-                .committee_for_shard(*target_shard)
-                .iter()
-                .copied()
-                .filter(|&v| v != local_vid)
-                .collect();
-            actions.push(Action::BroadcastExecutionCertificate {
-                shard: *target_shard,
-                certificate: Arc::clone(&certificate),
-                recipients,
-            });
+        // Cache the cert in io_loop for fallback serving — any node can serve
+        // requests from remote shards if the designated broadcaster fails.
+        actions.push(Action::CacheExecutionCertificate {
+            certificate: Arc::clone(&certificate),
+        });
+
+        // Only the designated broadcaster sends execution certs to remote shards.
+        // This reduces N×N cert messages to 1×N per wave per shard-pair.
+        // All validators still aggregate locally (needed for CertificateTracker).
+        let local_committee = topology.local_committee();
+        let designated =
+            hyperscale_types::designated_broadcaster(&block_hash, &wave_id, local_committee);
+        let is_designated = local_vid == designated;
+
+        if is_designated {
+            for target_shard in &remote_shards {
+                let recipients: Vec<ValidatorId> = topology
+                    .committee_for_shard(*target_shard)
+                    .iter()
+                    .copied()
+                    .filter(|&v| v != local_vid)
+                    .collect();
+                actions.push(Action::BroadcastExecutionCertificate {
+                    shard: *target_shard,
+                    certificate: Arc::clone(&certificate),
+                    recipients,
+                });
+            }
         }
 
         tracing::debug!(
@@ -681,7 +719,10 @@ impl ExecutionState {
             wave = %wave_id,
             tx_count = certificate.tx_outcomes.len(),
             remote_shards = remote_shards.len(),
-            "Wave cert aggregated — broadcast to remote shards, feeding per-tx finalization"
+            is_designated,
+            ?designated,
+            "Wave cert aggregated — feeding per-tx finalization{}",
+            if is_designated { ", broadcasting to remote shards" } else { "" }
         );
 
         // Feed each tx's outcome to per-tx CertificateTracker for finalization.
@@ -720,6 +761,12 @@ impl ExecutionState {
     ) -> Vec<Action> {
         let shard = cert.shard_group_id;
         let current_height = self.committed_height;
+
+        // Clear expected cert tracking and mark as fulfilled so late-arriving
+        // duplicate headers don't re-register the expectation.
+        let key = (shard, cert.block_height, cert.wave_id.clone());
+        self.expected_exec_certs.remove(&key);
+        self.fulfilled_exec_certs.insert(key, self.committed_height);
 
         // Buffer proofs for txs that don't have trackers yet (block not committed).
         // Skip txs that are already finalized.
@@ -824,6 +871,85 @@ impl ExecutionState {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
+    // Expected Execution Certificate Tracking
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// Register expected execution certificates from a remote block header.
+    ///
+    /// Called when a remote shard's committed block header is received. For each
+    /// wave in the header that includes our shard, we register an expected cert.
+    /// If the cert doesn't arrive within the timeout, we request it via fallback.
+    pub fn on_remote_block_header(
+        &mut self,
+        topology: &TopologySnapshot,
+        source_shard: ShardGroupId,
+        block_height: u64,
+        waves: &[WaveId],
+    ) {
+        let local_shard = topology.local_shard();
+
+        for wave in waves {
+            if wave.0.contains(&local_shard) {
+                let key = (source_shard, block_height, wave.clone());
+                // Don't re-register if this cert was already received.
+                // Prevents late-arriving duplicate headers from causing
+                // spurious fallback requests.
+                if self.fulfilled_exec_certs.contains_key(&key) {
+                    continue;
+                }
+                self.expected_exec_certs
+                    .entry(key)
+                    .or_insert(ExpectedExecCert {
+                        discovered_at: self.committed_height,
+                        requested: false,
+                    });
+            }
+        }
+    }
+
+    /// Check for timed-out expected execution certs and emit fallback requests.
+    ///
+    /// Called during block commit processing. Returns actions for any certs
+    /// that have exceeded the timeout.
+    fn check_exec_cert_timeouts(&mut self, topology: &TopologySnapshot) -> Vec<Action> {
+        let mut actions = Vec::new();
+        for ((source_shard, block_height, wave_id), expected) in &mut self.expected_exec_certs {
+            if expected.requested {
+                continue;
+            }
+            let age = self.committed_height.saturating_sub(expected.discovered_at);
+            if age >= EXEC_CERT_FALLBACK_TIMEOUT_BLOCKS {
+                expected.requested = true;
+                let peers = topology.committee_for_shard(*source_shard).to_vec();
+                tracing::warn!(
+                    source_shard = source_shard.0,
+                    block_height = block_height,
+                    wave = %wave_id,
+                    age,
+                    "Execution cert timeout — requesting fallback"
+                );
+                actions.push(Action::RequestMissingExecutionCerts {
+                    source_shard: *source_shard,
+                    block_height: *block_height,
+                    wave_ids: vec![wave_id.clone()],
+                    peers,
+                });
+            }
+        }
+        // Prune old entries that have been requested and are very stale
+        self.expected_exec_certs
+            .retain(|_, e| self.committed_height.saturating_sub(e.discovered_at) < 100);
+
+        // Prune fulfilled set using local height when fulfilled (not remote
+        // block height, which can differ significantly across shards).
+        let fulfilled_cutoff = self.committed_height.saturating_sub(100);
+        self.fulfilled_exec_certs
+            .retain(|_, &mut fulfilled_at| fulfilled_at > fulfilled_cutoff);
+
+        actions
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
     // Block Commit Handling
     // ═══════════════════════════════════════════════════════════════════════════
 
@@ -913,6 +1039,16 @@ impl ExecutionState {
             }
         }
 
+        // Update committed height before anything else — needed for timeout
+        // calculations and pruning even when there are no new transactions.
+        if height > self.committed_height {
+            self.committed_height = height;
+        }
+
+        // Check for timed-out expected execution certs and prune stale entries.
+        // Must run every block, not just when there are new transactions.
+        actions.extend(self.check_exec_cert_timeouts(topology));
+
         // ── Execution (dedup-filtered) ─────────────────────────────────
         //
         // Filter out already-executed transactions so we don't re-execute
@@ -931,11 +1067,6 @@ impl ExecutionState {
             tx_count = new_txs.len(),
             "Starting execution for new transactions"
         );
-
-        // Update committed height for cleanup calculations
-        if height > self.committed_height {
-            self.committed_height = height;
-        }
 
         // Mark all as executed (for dedup) with current height for later cleanup
         for tx in &new_txs {

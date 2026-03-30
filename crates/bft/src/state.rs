@@ -1026,21 +1026,10 @@ impl BftState {
             "Requesting block build for proposal"
         );
 
-        // Compute provision_targets: which remote shards need provisions from
-        // this block's cross-shard transactions. This is QC-attested (part of the
-        // block hash), so target shards can detect missing provisions.
-        let local_shard = topology.local_shard();
-        let mut provision_target_set = std::collections::BTreeSet::new();
-        for tx in transactions.iter() {
-            if !topology.is_single_shard_transaction(tx) {
-                for shard in topology.all_shards_for_transaction(tx) {
-                    if shard != local_shard {
-                        provision_target_set.insert(shard);
-                    }
-                }
-            }
-        }
-        let provision_targets: Vec<ShardGroupId> = provision_target_set.into_iter().collect();
+        // Compute waves: which cross-shard execution waves exist in this block.
+        // QC-attested (part of block hash). Used by remote shards to detect missing
+        // provisions (derived from wave union) and missing execution certificates.
+        let waves = hyperscale_types::compute_waves(topology, &transactions);
 
         // Collect per-certificate Arc<DatabaseUpdates> from execution cache.
         // Merging is deferred to the thread pool.
@@ -1069,7 +1058,7 @@ impl BftState {
                 per_cert_updates,
                 deferred: deferred_filtered,
                 aborted: aborted_with_height,
-                provision_targets,
+                waves,
             },
         ]
     }
@@ -1130,7 +1119,7 @@ impl BftState {
             state_root: parent_state_root,
             transaction_root: Hash::ZERO, // Fallback blocks have no transactions
             receipt_root: Hash::ZERO,     // No certificates
-            provision_targets: vec![],    // Empty - fallback blocks have no transactions
+            waves: vec![],                // Empty - fallback blocks have no transactions
         };
 
         let block = Block {
@@ -1250,7 +1239,7 @@ impl BftState {
             state_root: parent_state_root,
             transaction_root: Hash::ZERO, // Sync blocks have no transactions
             receipt_root: Hash::ZERO,     // No certificates
-            provision_targets: vec![],    // Empty - sync blocks have no transactions
+            waves: vec![],                // Empty - sync blocks have no transactions
         };
 
         let block = Block {
@@ -1959,12 +1948,12 @@ impl BftState {
                 }
 
                 // Validate provision_targets: recompute from transactions and compare
-                if let Err(e) = self.validate_provision_targets(topology, &block) {
+                if let Err(e) = self.validate_waves(topology, &block) {
                     warn!(
                         validator = ?topology.local_validator_id(),
                         block_hash = ?block_hash,
                         error = %e,
-                        "Block has invalid provision_targets - not voting"
+                        "Block has invalid waves - not voting"
                     );
                     return vec![];
                 }
@@ -2148,33 +2137,18 @@ impl BftState {
         Ok(())
     }
 
-    /// Validate that a block's `provision_targets` matches the recomputed value.
+    /// Validate that a block's `waves` matches the recomputed value.
     ///
-    /// Recomputes provision targets from the block's transactions using the
-    /// topology, then compares with the header's claimed value. This prevents
-    /// a byzantine proposer from lying about which shards need provisions.
-    fn validate_provision_targets(
-        &self,
-        topology: &TopologySnapshot,
-        block: &Block,
-    ) -> Result<(), String> {
-        let local_shard = topology.local_shard();
-        let mut expected = std::collections::BTreeSet::new();
-        for tx in block.transactions.iter() {
-            if !topology.is_single_shard_transaction(tx) {
-                for shard in topology.all_shards_for_transaction(tx) {
-                    if shard != local_shard {
-                        expected.insert(shard);
-                    }
-                }
-            }
-        }
-        let expected: Vec<ShardGroupId> = expected.into_iter().collect();
+    /// Recomputes waves from the block's transactions using the topology, then
+    /// compares with the header's claimed value. This prevents a byzantine
+    /// proposer from lying about which waves exist.
+    fn validate_waves(&self, topology: &TopologySnapshot, block: &Block) -> Result<(), String> {
+        let expected = hyperscale_types::compute_waves(topology, &block.transactions);
 
-        if block.header.provision_targets != expected {
+        if block.header.waves != expected {
             return Err(format!(
-                "provision_targets mismatch: header={:?}, computed={:?}",
-                block.header.provision_targets, expected
+                "waves mismatch: header={:?}, computed={:?}",
+                block.header.waves, expected
             ));
         }
 
@@ -4653,7 +4627,7 @@ mod tests {
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
             receipt_root: Hash::ZERO,
-            provision_targets: vec![],
+            waves: vec![],
         }
     }
 
@@ -4675,7 +4649,7 @@ mod tests {
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
             receipt_root: Hash::ZERO,
-            provision_targets: vec![],
+            waves: vec![],
         };
 
         // Should pass - genesis blocks skip timestamp validation
@@ -4771,7 +4745,7 @@ mod tests {
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
             receipt_root: Hash::ZERO,
-            provision_targets: vec![],
+            waves: vec![],
         };
 
         // Should pass - fallback blocks skip timestamp validation
@@ -4793,7 +4767,7 @@ mod tests {
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
             receipt_root: Hash::ZERO,
-            provision_targets: vec![],
+            waves: vec![],
         };
         assert!(
             state.validate_timestamp(&normal_header).is_err(),
@@ -4871,7 +4845,7 @@ mod tests {
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
             receipt_root: Hash::ZERO,
-            provision_targets: vec![],
+            waves: vec![],
         };
 
         // Process the block header
@@ -4955,7 +4929,7 @@ mod tests {
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
             receipt_root: Hash::ZERO,
-            provision_targets: vec![],
+            waves: vec![],
         };
 
         let block_hash = header.hash();
@@ -5043,7 +5017,7 @@ mod tests {
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
             receipt_root: Hash::ZERO,
-            provision_targets: vec![],
+            waves: vec![],
         };
 
         let block_hash = header.hash();
@@ -5118,7 +5092,7 @@ mod tests {
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
             receipt_root: Hash::ZERO,
-            provision_targets: vec![],
+            waves: vec![],
         };
 
         // Process header
@@ -5650,7 +5624,7 @@ mod tests {
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
             receipt_root: Hash::ZERO,
-            provision_targets: vec![],
+            waves: vec![],
         };
         let block_a_hash = block_a.hash();
 
@@ -5666,7 +5640,7 @@ mod tests {
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
             receipt_root: Hash::ZERO,
-            provision_targets: vec![],
+            waves: vec![],
         };
         let block_b_hash = block_b.hash();
 
@@ -5711,7 +5685,7 @@ mod tests {
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
             receipt_root: Hash::ZERO,
-            provision_targets: vec![],
+            waves: vec![],
         };
         let block_hash = block.hash();
 
@@ -5750,7 +5724,7 @@ mod tests {
                 state_root: Hash::ZERO,
                 transaction_root: Hash::ZERO,
                 receipt_root: Hash::ZERO,
-                provision_targets: vec![],
+                waves: vec![],
             };
             state.try_vote_on_block(&topology, block.hash(), height, 0);
         }
@@ -6048,7 +6022,7 @@ mod tests {
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
             receipt_root: Hash::ZERO,
-            provision_targets: vec![],
+            waves: vec![],
         };
         let original_block_hash = original_header.hash();
 
@@ -6125,7 +6099,7 @@ mod tests {
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
             receipt_root: Hash::ZERO,
-            provision_targets: vec![],
+            waves: vec![],
         };
 
         // Even though the receiving validator might be at view=31,
@@ -6161,7 +6135,7 @@ mod tests {
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
             receipt_root: Hash::ZERO,
-            provision_targets: vec![],
+            waves: vec![],
         };
 
         let result = state.validate_header(&topology, &header);
@@ -6492,7 +6466,7 @@ mod tests {
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
             receipt_root: Hash::ZERO,
-            provision_targets: vec![],
+            waves: vec![],
         };
         let original_block_hash = original_header.hash();
 
@@ -6741,7 +6715,7 @@ mod tests {
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
             receipt_root: Hash::ZERO,
-            provision_targets: vec![],
+            waves: vec![],
         };
         let block_hash_r1 = header_round1.hash();
 
@@ -6757,7 +6731,7 @@ mod tests {
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
             receipt_root: Hash::ZERO,
-            provision_targets: vec![],
+            waves: vec![],
         };
         let block_hash_r2 = header_round2.hash();
 
@@ -6773,7 +6747,7 @@ mod tests {
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
             receipt_root: Hash::ZERO,
-            provision_targets: vec![],
+            waves: vec![],
         };
         let block_hash_r3 = header_round3.hash();
 
@@ -6790,7 +6764,7 @@ mod tests {
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
             receipt_root: Hash::ZERO,
-            provision_targets: vec![],
+            waves: vec![],
         };
         let block_hash_h6 = header_height6.hash();
 
@@ -7067,7 +7041,7 @@ mod tests {
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
             receipt_root: Hash::ZERO,
-            provision_targets: vec![],
+            waves: vec![],
         };
 
         // Process first block header
@@ -7102,7 +7076,7 @@ mod tests {
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
             receipt_root: Hash::ZERO,
-            provision_targets: vec![],
+            waves: vec![],
         };
 
         // Process second block header
@@ -8077,7 +8051,7 @@ mod tests {
                 state_root: Hash::ZERO,
                 transaction_root: Hash::ZERO,
                 receipt_root: Hash::ZERO,
-                provision_targets: vec![],
+                waves: vec![],
             },
             transactions: vec![],
             certificates: vec![],

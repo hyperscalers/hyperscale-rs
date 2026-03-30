@@ -116,6 +116,16 @@ pub enum Action {
         recipients: Vec<ValidatorId>,
     },
 
+    /// Cache an aggregated execution certificate for fallback serving.
+    ///
+    /// Emitted by all validators after cert aggregation (not just the designated
+    /// broadcaster). The io_loop stores these in a shared cache so any node can
+    /// serve `GetExecutionCertsRequest` from remote shards whose designated
+    /// broadcaster failed.
+    CacheExecutionCertificate {
+        certificate: Arc<ExecutionCertificate>,
+    },
+
     /// Fetch state entries and broadcast provisions for all cross-shard txs in a block.
     ///
     /// Only the block proposer emits this (once per block). Delegated to the
@@ -407,8 +417,8 @@ pub enum Action {
         per_cert_updates: Vec<Arc<DatabaseUpdates>>,
         deferred: Vec<TransactionDefer>,
         aborted: Vec<TransactionAbort>,
-        /// Shard groups that need provisions from this block's transactions.
-        provision_targets: Vec<ShardGroupId>,
+        /// Cross-shard execution waves in this block.
+        waves: Vec<WaveId>,
     },
 
     /// Execute a batch of single-shard transactions.
@@ -729,10 +739,26 @@ pub enum Action {
         block_height: BlockHeight,
     },
 
+    /// Request missing execution certificates from a source shard.
+    ///
+    /// Emitted when expected execution certs haven't arrived within the timeout.
+    /// The designated broadcaster may be byzantine or slow, so we request from
+    /// any peer in the source shard.
+    RequestMissingExecutionCerts {
+        /// The shard that should have sent the execution certs.
+        source_shard: ShardGroupId,
+        /// The block height whose execution certs are missing.
+        block_height: u64,
+        /// Which waves' certs are missing.
+        wave_ids: Vec<WaveId>,
+        /// All validators in the source shard (candidate peers for the request).
+        peers: Vec<ValidatorId>,
+    },
+
     /// Request missing provisions from a source shard via cross-shard request.
     ///
-    /// Emitted by `ProvisionCoordinator` when a remote block's `provision_targets`
-    /// includes our shard but no provisions have arrived within the timeout window.
+    /// Emitted by `ProvisionCoordinator` when a remote block's `waves` field
+    /// targets our shard but no provisions have arrived within the timeout window.
     /// This is the fallback recovery mechanism for byzantine proposers that
     /// silently drop provisions.
     ///
@@ -761,11 +787,13 @@ impl Action {
                 | Action::SignAndBroadcastExecutionVote { .. }
                 | Action::BroadcastExecutionVote { .. }
                 | Action::BroadcastExecutionCertificate { .. }
+                | Action::CacheExecutionCertificate { .. }
                 | Action::BroadcastCommittedBlockHeader { .. }
                 | Action::PersistBlock { .. }
                 | Action::PersistAndBroadcastVote { .. }
                 | Action::PersistTransactionCertificate { .. }
                 | Action::RequestMissingProvisions { .. }
+                | Action::RequestMissingExecutionCerts { .. }
                 | Action::CancelProvisionFetch { .. }
                 | Action::RequestTxInclusionProofs { .. }
         )
@@ -814,6 +842,7 @@ impl Action {
             Action::SignAndBroadcastExecutionVote { .. } => "SignAndBroadcastExecutionVote",
             Action::BroadcastExecutionVote { .. } => "BroadcastExecutionVote",
             Action::BroadcastExecutionCertificate { .. } => "BroadcastExecutionCertificate",
+            Action::CacheExecutionCertificate { .. } => "CacheExecutionCertificate",
             Action::BroadcastCommittedBlockHeader { .. } => "BroadcastCommittedBlockHeader",
 
             // Timers
@@ -878,6 +907,7 @@ impl Action {
             Action::FetchTransactions { .. } => "FetchTransactions",
             Action::CancelFetch { .. } => "CancelFetch",
             Action::RequestMissingProvisions { .. } => "RequestMissingProvisions",
+            Action::RequestMissingExecutionCerts { .. } => "RequestMissingExecutionCerts",
             Action::CancelProvisionFetch { .. } => "CancelProvisionFetch",
             Action::RequestTxInclusionProofs { .. } => "RequestTxInclusionProof",
         }

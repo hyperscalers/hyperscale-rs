@@ -42,9 +42,9 @@ use hyperscale_metrics as metrics;
 use hyperscale_network::Network;
 use hyperscale_storage::{CommitStore, ConsensusStore, SubstateStore};
 use hyperscale_types::{
-    Block, Bls12381G1PrivateKey, Bls12381G1PublicKey, CommittedBlockHeader, Hash,
-    QuorumCertificate, RoutableTransaction, ShardGroupId, TopologySnapshot, TransactionCertificate,
-    ValidatorId,
+    Block, Bls12381G1PrivateKey, Bls12381G1PublicKey, CommittedBlockHeader, ExecutionCertificate,
+    Hash, QuorumCertificate, RoutableTransaction, ShardGroupId, TopologySnapshot,
+    TransactionCertificate, ValidatorId, WaveId,
 };
 use quick_cache::sync::Cache as QuickCache;
 use std::collections::{HashMap, HashSet};
@@ -57,6 +57,9 @@ use std::time::Duration;
 /// Updated by the io_loop when `Action::TopologyChanged` is processed.
 /// Handler closures call `.load()` to get the current snapshot atomically.
 pub type SharedTopologySnapshot = Arc<ArcSwap<TopologySnapshot>>;
+
+/// Shared execution certificate cache for fallback serving.
+type ExecCertCache = Arc<Mutex<HashMap<(Hash, WaveId), Arc<ExecutionCertificate>>>>;
 
 /// Default certificate cache capacity.
 const DEFAULT_CERT_CACHE_SIZE: usize = 10_000;
@@ -213,6 +216,10 @@ where
     // with external consumers (e.g. RPC handlers in production).
     tx_status_cache: Arc<QuickCache<Hash, hyperscale_types::TransactionStatus>>,
 
+    // Execution certificate cache for fallback serving.
+    // Shared with request handler thread. Keyed by (block_hash, wave_id).
+    exec_cert_cache: ExecCertCache,
+
     // Cached local shard peers (committee excluding self) — avoids per-call allocation.
     cached_local_peers: Vec<ValidatorId>,
 
@@ -287,6 +294,7 @@ where
             pending_block_commits: Vec::new(),
             commit_in_flight: Arc::new(AtomicBool::new(false)),
             pending_receipt_bundles: Vec::new(),
+            exec_cert_cache: Arc::new(Mutex::new(HashMap::new())),
             cached_local_peers,
             tx_status_cache: Arc::new(QuickCache::new(DEFAULT_TX_STATUS_CACHE_SIZE)),
             emitted_statuses: Vec::new(),

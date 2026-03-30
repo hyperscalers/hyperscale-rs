@@ -180,6 +180,38 @@ where
 
                 response
             });
+
+        // ── execution_cert.request → cert cache lookup ────────────────
+
+        let cert_cache = Arc::clone(&self.exec_cert_cache);
+        self.network
+            .register_request_handler::<hyperscale_messages::request::GetExecutionCertsRequest>(
+                move |req: hyperscale_messages::request::GetExecutionCertsRequest| {
+                    use hyperscale_messages::response::GetExecutionCertsResponse;
+
+                    let guard = cert_cache.lock().unwrap();
+
+                    // Find all cached certs matching the requested height + wave IDs.
+                    // We scan the cache since keys are (block_hash, wave_id) and we
+                    // only know block_height. This is fine for a bounded cache.
+                    let mut certs = Vec::new();
+                    for wave_id in &req.wave_ids {
+                        for ((_, cached_wave), cert) in guard.iter() {
+                            if cert.block_height == req.block_height && cached_wave == wave_id {
+                                certs.push(cert.as_ref().clone());
+                            }
+                        }
+                    }
+
+                    if certs.is_empty() {
+                        GetExecutionCertsResponse { certificates: None }
+                    } else {
+                        GetExecutionCertsResponse {
+                            certificates: Some(certs),
+                        }
+                    }
+                },
+            );
     }
 
     /// Register gossip handlers for broadcast message types (transactions

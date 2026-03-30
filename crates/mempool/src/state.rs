@@ -2023,7 +2023,7 @@ mod tests {
                 state_root: Hash::ZERO,
                 transaction_root: Hash::ZERO,
                 receipt_root: Hash::ZERO,
-                provision_targets: vec![],
+                waves: vec![],
             },
             transactions: transactions.into_iter().map(Arc::new).collect(),
             certificates: certificates.into_iter().map(Arc::new).collect(),

@@ -3,7 +3,7 @@
 use crate::{
     compute_merkle_root, compute_merkle_root_with_proof, compute_padded_merkle_root, BlockHeight,
     Hash, QuorumCertificate, RoutableTransaction, ShardGroupId, TransactionAbort,
-    TransactionCertificate, TransactionDefer, TransactionInclusionProof, ValidatorId,
+    TransactionCertificate, TransactionDefer, TransactionInclusionProof, ValidatorId, WaveId,
 };
 use sbor::prelude::*;
 use std::sync::Arc;
@@ -138,19 +138,22 @@ pub struct BlockHeader {
     /// For empty blocks (genesis, fallback, no certificates), this is `Hash::ZERO`.
     pub receipt_root: Hash,
 
-    /// Shard groups that need provisions from this block's transactions.
+    /// Cross-shard execution waves in this block.
     ///
-    /// Computed from the block's cross-shard transactions: for each transaction
-    /// that touches remote shards, those remote shard IDs are collected here.
+    /// Each `WaveId` is the set of remote shards that a group of transactions
+    /// depends on for provisions. Transactions with identical remote shard sets
+    /// share a wave. Wave-zero (single-shard txs) is excluded.
+    ///
     /// This is QC-attested (covered by the block hash), so a byzantine proposer
     /// cannot forge it without the block being rejected by honest validators.
     ///
-    /// Used by target shards to detect missing provisions: if a remote block's
-    /// `provision_targets` includes our shard but no provisions arrive, we know
-    /// the proposer is withholding them and can initiate fallback recovery.
+    /// Used by remote shards to:
+    /// 1. Detect missing provisions (derive provision targets from wave union)
+    /// 2. Detect missing execution certificates (know which certs to expect)
+    /// 3. Assign designated cert broadcasters per wave
     ///
     /// Empty for genesis, fallback, and sync blocks (no transactions).
-    pub provision_targets: Vec<ShardGroupId>,
+    pub waves: Vec<WaveId>,
 }
 
 impl BlockHeader {
@@ -168,8 +171,19 @@ impl BlockHeader {
             state_root,
             transaction_root: Hash::ZERO,
             receipt_root: Hash::ZERO,
-            provision_targets: vec![],
+            waves: vec![],
         }
+    }
+
+    /// Derive provision targets from waves (union of all shards across all waves).
+    ///
+    /// Returns the sorted set of all remote shards that need provisions from this block.
+    pub fn provision_targets(&self) -> Vec<ShardGroupId> {
+        let mut set = std::collections::BTreeSet::new();
+        for wave in &self.waves {
+            set.extend(wave.0.iter().copied());
+        }
+        set.into_iter().collect()
     }
 
     /// Compute hash of this block header.
@@ -685,7 +699,7 @@ mod tests {
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
             receipt_root: Hash::ZERO,
-            provision_targets: vec![],
+            waves: vec![],
         };
 
         let hash1 = header.hash();

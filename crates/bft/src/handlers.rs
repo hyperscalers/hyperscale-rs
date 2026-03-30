@@ -10,7 +10,7 @@ use hyperscale_types::{
     verify_bls12381_v1, Block, BlockHeader, BlockHeight, BlockVote, Bls12381G1PublicKey,
     Bls12381G2Signature, Hash, QuorumCertificate, RoutableTransaction, ShardGroupId,
     SignerBitfield, TransactionAbort, TransactionCertificate, TransactionDefer, ValidatorId,
-    VotePower,
+    VotePower, WaveId,
 };
 use std::sync::Arc;
 
@@ -299,7 +299,7 @@ pub fn build_proposal<S: CommitStore + SubstateStore>(
     deferred: Vec<TransactionDefer>,
     aborted: Vec<TransactionAbort>,
     local_shard: ShardGroupId,
-    provision_targets: Vec<ShardGroupId>,
+    waves: Vec<WaveId>,
 ) -> ProposalResult<S::PreparedCommit> {
     // Check if JVT is at parent_state_root (no waiting - instant check)
     let current_root = storage.state_root_hash();
@@ -343,7 +343,7 @@ pub fn build_proposal<S: CommitStore + SubstateStore>(
         state_root,
         transaction_root,
         receipt_root,
-        provision_targets,
+        waves,
     };
 
     let block = Block {

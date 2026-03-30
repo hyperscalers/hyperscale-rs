@@ -6,7 +6,7 @@ use sbor::prelude::BasicSbor;
 
 /// Request to fetch missing provisions from a source shard.
 ///
-/// Sent by target shards when a remote block's `provision_targets` includes
+/// Sent by target shards when a remote block's `waves` field indicates
 /// the target shard but no provisions arrived within the timeout window.
 /// This is the fallback recovery mechanism for byzantine proposers that
 /// silently drop provisions.

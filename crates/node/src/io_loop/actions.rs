@@ -141,6 +141,22 @@ where
                 );
                 self.network.notify(&recipients, &batch);
             }
+            Action::CacheExecutionCertificate { certificate } => {
+                let key = (certificate.block_hash, certificate.wave_id.clone());
+                if let Ok(mut cache) = self.exec_cert_cache.lock() {
+                    cache.insert(key, certificate);
+                    // Prune entries older than 50 blocks if cache grows large
+                    if cache.len() > 500 {
+                        let cutoff = cache
+                            .values()
+                            .map(|c| c.block_height)
+                            .max()
+                            .unwrap_or(0)
+                            .saturating_sub(50);
+                        cache.retain(|_, c| c.block_height > cutoff);
+                    }
+                }
+            }
             // ═══════════════════════════════════════════════════════════
             // Delegated work — batched (accumulated for batch dispatch)
             // ═══════════════════════════════════════════════════════════
@@ -221,6 +237,7 @@ where
             | Action::FetchTransactions { .. }
             | Action::CancelFetch { .. }
             | Action::RequestMissingProvisions { .. }
+            | Action::RequestMissingExecutionCerts { .. }
             | Action::CancelProvisionFetch { .. }
             | Action::RequestTxInclusionProofs { .. } => {
                 self.process_sync_fetch_action(action);
@@ -691,6 +708,41 @@ where
                     .handle(InclusionProofFetchInput::Tick);
                 self.process_inclusion_proof_fetch_outputs(tick_outputs);
                 self.update_fetch_tick_timer();
+            }
+            Action::RequestMissingExecutionCerts {
+                source_shard,
+                block_height,
+                wave_ids,
+                peers,
+            } => {
+                debug!(
+                    source_shard = source_shard.0,
+                    block_height,
+                    wave_count = wave_ids.len(),
+                    peer_count = peers.len(),
+                    "Requesting missing execution certs from source shard"
+                );
+                let request = hyperscale_messages::request::GetExecutionCertsRequest {
+                    block_height,
+                    wave_ids,
+                };
+                let event_sender = self.event_sender.clone();
+                self.network.request(
+                    &peers,
+                    None, // no preferred peer
+                    request,
+                    Box::new(move |result| {
+                        if let Ok(response) = result {
+                            if let Some(certs) = response.certificates {
+                                for cert in certs {
+                                    let _ = event_sender.send(NodeInput::Protocol(
+                                        ProtocolEvent::ExecutionCertificateReceived { cert },
+                                    ));
+                                }
+                            }
+                        }
+                    }),
+                );
             }
             _ => unreachable!(),
         }

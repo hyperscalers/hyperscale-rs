@@ -15,11 +15,12 @@
 //! Tx ordering within a wave preserves block ordering (stable partition).
 
 use crate::{
-    compute_padded_merkle_root, Bls12381G2Signature, Hash, NodeId, ShardGroupId, SignerBitfield,
-    ValidatorId,
+    compute_padded_merkle_root, Bls12381G2Signature, Hash, NodeId, RoutableTransaction,
+    ShardGroupId, SignerBitfield, TopologySnapshot, ValidatorId,
 };
 use sbor::prelude::*;
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 // ============================================================================
 // WaveId
@@ -67,6 +68,67 @@ impl std::fmt::Display for WaveId {
             write!(f, "}}")
         }
     }
+}
+
+// ============================================================================
+// Wave Computation
+// ============================================================================
+
+/// Compute the set of cross-shard waves for a block's transactions.
+///
+/// Each transaction's remote shard set (shards it touches minus local shard)
+/// defines its wave. Transactions with identical remote shard sets belong to
+/// the same wave. Wave-zero (single-shard txs) is excluded.
+///
+/// Returns a sorted `Vec<WaveId>` (deterministic via BTreeSet ordering).
+/// Used in both block proposal (to populate `BlockHeader::waves`) and
+/// validation (to verify the header's waves field).
+pub fn compute_waves(
+    topology: &TopologySnapshot,
+    transactions: &[Arc<RoutableTransaction>],
+) -> Vec<WaveId> {
+    let local_shard = topology.local_shard();
+    let mut wave_set: BTreeSet<WaveId> = BTreeSet::new();
+
+    for tx in transactions {
+        if topology.is_single_shard_transaction(tx) {
+            continue;
+        }
+        let remote_shards: BTreeSet<ShardGroupId> = topology
+            .all_shards_for_transaction(tx)
+            .into_iter()
+            .filter(|&s| s != local_shard)
+            .collect();
+        if !remote_shards.is_empty() {
+            wave_set.insert(WaveId(remote_shards));
+        }
+    }
+
+    wave_set.into_iter().collect()
+}
+
+/// Deterministically select the designated cert broadcaster for a (block, wave).
+///
+/// Uses `Hash(block_hash ++ wave_id_bytes) % committee_size` to pick one
+/// validator. All validators compute the same result from the same inputs.
+pub fn designated_broadcaster(
+    block_hash: &Hash,
+    wave_id: &WaveId,
+    committee: &[ValidatorId],
+) -> ValidatorId {
+    assert!(!committee.is_empty(), "committee must not be empty");
+    let wave_bytes = basic_encode(wave_id).expect("WaveId serialization should never fail");
+    let mut input = Vec::with_capacity(block_hash.as_bytes().len() + wave_bytes.len());
+    input.extend_from_slice(block_hash.as_bytes());
+    input.extend_from_slice(&wave_bytes);
+    let selection_hash = Hash::from_bytes(&input);
+    // Use first 8 bytes as u64 for index selection
+    let bytes = selection_hash.as_bytes();
+    let index_val = u64::from_le_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ]);
+    let index = (index_val as usize) % committee.len();
+    committee[index]
 }
 
 // ============================================================================

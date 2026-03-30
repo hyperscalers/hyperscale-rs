@@ -834,10 +834,19 @@ impl StateMachine for NodeStateMachine {
                 committed_header,
                 sender,
             } => {
-                // Arc-wrap and share with both BFT and provisions.
+                // Arc-wrap and share with BFT, provisions, and execution.
                 let header = Arc::new(committed_header);
                 let topology = self.topology.snapshot();
                 let mut actions = self.bft.insert_remote_header(topology, Arc::clone(&header));
+
+                // Register expected execution certs from this remote block's waves.
+                self.execution.on_remote_block_header(
+                    topology,
+                    header.header.shard_group_id,
+                    header.header.height.0,
+                    &header.header.waves,
+                );
+
                 actions.extend(
                     self.provisions
                         .on_remote_block_committed(topology, header, sender),
