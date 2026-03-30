@@ -447,6 +447,43 @@ impl LivelockState {
         for deferral in &block.deferred {
             self.pending_deferral_hashes.remove(&deferral.tx_hash);
         }
+
+        // Remove pending deferrals whose loser transaction was aborted in this block.
+        // If the loser is aborted (e.g., timeout), the deferral is pointless — the
+        // loser will never be retried. Keeping it would poison every proposal we make.
+        for abort in &block.aborted {
+            if self.pending_deferral_hashes.remove(&abort.tx_hash) {
+                tracing::info!(
+                    tx_hash = %abort.tx_hash,
+                    "Removed pending deferral for aborted transaction"
+                );
+            }
+        }
+
+        // Also remove pending deferrals whose winner transaction was aborted.
+        // If the winner is gone, the deferral can never complete (the loser was
+        // waiting for the winner to finish). The mempool handles creating a retry
+        // via on_winner_aborted; we just need to stop proposing the stale deferral.
+        {
+            let aborted_hashes: std::collections::HashSet<_> =
+                block.aborted.iter().map(|a| a.tx_hash).collect();
+            let mut removed_for_winner_abort = Vec::new();
+            for d in &self.pending_deferrals {
+                let DeferReason::LivelockCycle { winner_tx_hash } = &d.reason;
+                if aborted_hashes.contains(winner_tx_hash) {
+                    removed_for_winner_abort.push(d.tx_hash);
+                    tracing::info!(
+                        loser = %d.tx_hash,
+                        winner = %winner_tx_hash,
+                        "Removed pending deferral: winner was aborted"
+                    );
+                }
+            }
+            for tx_hash in &removed_for_winner_abort {
+                self.pending_deferral_hashes.remove(tx_hash);
+            }
+        }
+
         // Keep only deferrals still in our hash set (those not in this block)
         self.pending_deferrals
             .retain(|d| self.pending_deferral_hashes.contains(&d.tx_hash));
