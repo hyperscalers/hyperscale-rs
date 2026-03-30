@@ -1435,10 +1435,15 @@ impl MempoolState {
         cross_shard: bool,
         added_at: Duration,
     ) {
-        // Find all locked nodes that block this transaction
+        // Find all nodes that block this transaction: nodes locked by in-flight
+        // transactions OR already claimed by another transaction in the ready set.
+        // The ready-set check prevents conflicting transactions from being proposed
+        // in the same block.
         let mut blocking_nodes: HashSet<NodeId> = tx
             .all_declared_nodes()
-            .filter(|node| self.locked_nodes_cache.contains(node))
+            .filter(|node| {
+                self.locked_nodes_cache.contains(node) || self.ready_txs_by_node.contains_key(node)
+            })
             .copied()
             .collect();
 
@@ -1505,7 +1510,12 @@ impl MempoolState {
     fn remove_from_ready_tracking(&mut self, hash: &Hash) {
         // Remove from ready set and clean reverse index
         if let Some(entry) = self.ready.remove(hash) {
+            let freed_nodes: Vec<NodeId> = entry.tx.all_declared_nodes().copied().collect();
             self.remove_from_ready_txs_by_node(hash, &entry.tx);
+            // Promote transactions that were deferred by this ready-set TX's nodes
+            for node in freed_nodes {
+                self.promote_transactions_for_node(node);
+            }
         }
 
         // Remove from deferred tracking
@@ -1611,9 +1621,10 @@ impl MempoolState {
             }
         }
 
-        // Now promote all collected transactions
+        // Promote collected transactions through the full ready-tracking path
+        // so they're checked against remaining locked and ready-set conflicts.
         for (hash, tx, cross_shard, added_at) in to_promote {
-            self.add_to_ready_set(hash, &tx, cross_shard, added_at);
+            self.add_to_ready_tracking(hash, &tx, cross_shard, added_at);
         }
     }
 
