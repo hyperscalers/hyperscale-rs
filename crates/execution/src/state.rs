@@ -1056,6 +1056,19 @@ impl ExecutionState {
         // Must run every block, not just when there are new transactions.
         actions.extend(self.check_exec_cert_timeouts(topology));
 
+        // Prune old entries to prevent unbounded growth.
+        // Must run every block — not just when there are transactions — otherwise
+        // stale finalized certificates accumulate during empty-block periods and
+        // poison every proposal we make (receivers can't assemble the block).
+        self.prune_early_arrivals();
+        self.prune_execution_state();
+        self.prune_finalized_certificates();
+        self.prune_certificate_trackers();
+        self.prune_pending_provisioning();
+        self.prune_execution_cache();
+        self.prune_pending_speculative();
+        self.cleanup_stale_speculative(SPECULATIVE_MAX_AGE);
+
         if transactions.is_empty() {
             return actions;
         }
@@ -1073,16 +1086,6 @@ impl ExecutionState {
         for vote in early_votes {
             actions.extend(self.on_execution_vote(topology, vote));
         }
-
-        // Prune old entries to prevent unbounded growth
-        self.prune_early_arrivals();
-        self.prune_execution_state();
-        self.prune_finalized_certificates();
-        self.prune_certificate_trackers();
-        self.prune_pending_provisioning();
-        self.prune_execution_cache();
-        self.prune_pending_speculative();
-        self.cleanup_stale_speculative(SPECULATIVE_MAX_AGE);
 
         // Separate single-shard and cross-shard transactions
         let (single_shard, cross_shard): (Vec<_>, Vec<_>) = transactions
@@ -1782,15 +1785,19 @@ impl ExecutionState {
     /// Called when a transaction is deferred (livelock cycle) or aborted (timeout).
     /// This releases all resources associated with the transaction so it doesn't
     /// continue consuming memory or processing.
+    ///
+    /// When a deferral or abort is *committed* in a block, the transaction is
+    /// definitively superseded. Any finalized certificate we hold for it is stale
+    /// and must be removed — otherwise we keep including it in every proposal,
+    /// producing blocks that other validators can never assemble.
     pub fn cleanup_transaction(&mut self, tx_hash: &Hash) {
-        // If the transaction is already finalized, don't clean it up.
-        // The abort was proposed before finalization completed, but finalization won.
-        if self.finalized_certificates.contains_key(tx_hash) {
-            tracing::debug!(
-                tx_hash = ?tx_hash,
-                "Transaction already finalized, skipping cleanup"
+        // Remove finalized certificate if present — the deferral/abort committed,
+        // so this certificate will never be included in a block.
+        if self.finalized_certificates.remove(tx_hash).is_some() {
+            tracing::info!(
+                tx_hash = %tx_hash,
+                "Removed stale finalized certificate for deferred/aborted transaction"
             );
-            return;
         }
 
         // Evict from execution cache — transaction is being retried or abandoned.
