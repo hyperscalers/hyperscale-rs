@@ -28,6 +28,7 @@ use crate::batch_accumulator::BatchAccumulator;
 use crate::config::NodeConfig;
 use crate::protocol::execution_cert_fetch::{ExecCertFetchInput, ExecCertFetchProtocol};
 use crate::protocol::fetch::{FetchInput, FetchKind, FetchProtocol};
+use crate::protocol::header_fetch::{HeaderFetchInput, HeaderFetchProtocol};
 use crate::protocol::inclusion_proof_fetch::{
     InclusionProofFetchInput, InclusionProofFetchProtocol,
 };
@@ -187,6 +188,9 @@ where
     // Execution certificate fetch protocol (cross-shard exec cert fetching with peer rotation)
     exec_cert_fetch_protocol: ExecCertFetchProtocol,
 
+    // Committed block header fetch protocol (cross-shard header fetching with peer rotation)
+    header_fetch_protocol: HeaderFetchProtocol,
+
     // Transaction validation
     tx_validator: Arc<TransactionValidation>,
     pending_validation: HashSet<Hash>,
@@ -269,6 +273,8 @@ where
         let inclusion_proof_fetch_protocol =
             InclusionProofFetchProtocol::new(config.inclusion_proof_fetch.clone());
         let exec_cert_fetch_protocol = ExecCertFetchProtocol::new(config.exec_cert_fetch.clone());
+        let header_fetch_protocol =
+            HeaderFetchProtocol::new(crate::protocol::header_fetch::HeaderFetchConfig::default());
         Self {
             state,
             storage: Arc::new(storage),
@@ -292,6 +298,7 @@ where
             provision_fetch_protocol,
             inclusion_proof_fetch_protocol,
             exec_cert_fetch_protocol,
+            header_fetch_protocol,
             validation_batch: BatchAccumulator::new(b.tx_validation_max, b.tx_validation_window),
             committed_header_batch: BatchAccumulator::new(
                 b.committed_header_max,
@@ -595,6 +602,9 @@ where
                     .exec_cert_fetch_protocol
                     .handle(ExecCertFetchInput::Tick);
                 self.process_exec_cert_fetch_outputs(cert_outputs);
+                // Also tick the header fetch protocol.
+                let header_outputs = self.header_fetch_protocol.handle(HeaderFetchInput::Tick);
+                self.process_header_fetch_outputs(header_outputs);
                 self.update_fetch_tick_timer();
             }
 
@@ -699,6 +709,38 @@ where
                     .exec_cert_fetch_protocol
                     .handle(ExecCertFetchInput::Tick);
                 self.process_exec_cert_fetch_outputs(tick_outputs);
+                self.update_fetch_tick_timer();
+            }
+
+            // ── Committed block header fetch protocol ────────────────
+            NodeInput::HeaderFetchReceived {
+                source_shard,
+                from_height,
+                header,
+            } => {
+                let outputs = self
+                    .header_fetch_protocol
+                    .handle(HeaderFetchInput::Received {
+                        source_shard,
+                        from_height,
+                        header: Box::new(header),
+                    });
+                self.process_header_fetch_outputs(outputs);
+                self.update_fetch_tick_timer();
+            }
+
+            NodeInput::HeaderFetchFailed {
+                source_shard,
+                from_height,
+            } => {
+                let outputs = self.header_fetch_protocol.handle(HeaderFetchInput::Failed {
+                    source_shard,
+                    from_height,
+                });
+                self.process_header_fetch_outputs(outputs);
+                // Tick to retry with next peer immediately.
+                let tick_outputs = self.header_fetch_protocol.handle(HeaderFetchInput::Tick);
+                self.process_header_fetch_outputs(tick_outputs);
                 self.update_fetch_tick_timer();
             }
 
@@ -899,6 +941,7 @@ where
         let exec_mem = self.state.execution().memory_stats();
         let mempool_mem = self.state.mempool().memory_stats();
         let prov_mem = self.state.provisions().memory_stats();
+        let rh_mem = self.state.remote_headers().memory_stats();
         let (rocksdb_bc, rocksdb_mt) = self.storage.memory_usage_bytes();
 
         metrics::set_memory_metrics(&metrics::MemoryMetrics {
@@ -929,9 +972,12 @@ where
             mempool_tombstones: mempool_mem.tombstones,
             mempool_recently_evicted: mempool_mem.recently_evicted,
             mempool_locked_nodes: mempool_mem.locked_nodes,
+            // Remote Headers
+            rh_pending_headers: rh_mem.pending_headers,
+            rh_verified_headers: rh_mem.verified_headers,
+            rh_expected_headers: rh_mem.expected_headers,
             // Provisions
             prov_registered_txs: prov_mem.registered_txs,
-            prov_unverified_remote_headers: prov_mem.unverified_remote_headers,
             prov_verified_remote_headers: prov_mem.verified_remote_headers,
             prov_pending_provisions: prov_mem.pending_provisions,
             prov_verified_batches: prov_mem.verified_batches,

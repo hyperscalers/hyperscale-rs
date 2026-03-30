@@ -212,6 +212,33 @@ where
                     }
                 },
             );
+
+        // ── committed_header.request → serve from local storage ────────
+
+        let storage = Arc::clone(&self.storage);
+        self.network
+            .register_request_handler::<hyperscale_messages::request::GetCommittedBlockHeaderRequest>(
+                move |req: hyperscale_messages::request::GetCommittedBlockHeaderRequest| {
+                    use hyperscale_messages::response::GetCommittedBlockHeaderResponse;
+
+                    // Look up the committed block at the requested height.
+                    let block_and_qc = storage
+                        .get_block(hyperscale_types::BlockHeight(req.height.0));
+
+                    match block_and_qc {
+                        Some((block, qc)) => {
+                            let committed = hyperscale_types::CommittedBlockHeader::new(
+                                block.header,
+                                qc,
+                            );
+                            GetCommittedBlockHeaderResponse {
+                                header: Some(committed),
+                            }
+                        }
+                        None => GetCommittedBlockHeaderResponse { header: None },
+                    }
+                },
+            );
     }
 
     /// Register gossip handlers for broadcast message types (transactions

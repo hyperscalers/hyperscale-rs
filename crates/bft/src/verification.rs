@@ -4,7 +4,7 @@
 //! verifications. BftState delegates verification bookkeeping here while
 //! retaining control-flow decisions (voting, block rejection).
 
-use hyperscale_types::{Block, BlockHeader, BlockHeight, Hash, ShardGroupId};
+use hyperscale_types::{Block, BlockHeader, Hash};
 use std::collections::{HashMap, HashSet};
 use tracing::{debug, trace};
 
@@ -101,13 +101,6 @@ pub(crate) struct VerificationPipeline {
 
     /// Blocks with verified receipt roots.
     verified_receipt_roots: HashSet<Hash>,
-
-    // === Remote header QC verification ===
-    /// Remote headers with QC verification in-flight.
-    pending_remote_header_qcs: HashSet<(ShardGroupId, BlockHeight)>,
-
-    /// Remote headers whose QC has been verified.
-    verified_remote_header_qcs: HashSet<(ShardGroupId, BlockHeight)>,
 }
 
 impl VerificationPipeline {
@@ -125,8 +118,6 @@ impl VerificationPipeline {
             verified_transaction_roots: HashSet::new(),
             receipt_root_verifications_in_flight: HashSet::new(),
             verified_receipt_roots: HashSet::new(),
-            pending_remote_header_qcs: HashSet::new(),
-            verified_remote_header_qcs: HashSet::new(),
         }
     }
 
@@ -429,44 +420,6 @@ impl VerificationPipeline {
     // ═══════════════════════════════════════════════════════════════════════
     // Remote header QC verification
     // ═══════════════════════════════════════════════════════════════════════
-
-    /// Track a remote header pending QC verification.
-    pub fn track_pending_remote_header_qc(&mut self, shard: ShardGroupId, height: BlockHeight) {
-        self.pending_remote_header_qcs.insert((shard, height));
-    }
-
-    /// Record a remote header QC verification result.
-    pub fn on_remote_header_qc_verified(
-        &mut self,
-        shard: ShardGroupId,
-        height: BlockHeight,
-        valid: bool,
-    ) -> bool {
-        self.pending_remote_header_qcs.remove(&(shard, height));
-        if valid {
-            self.verified_remote_header_qcs.insert((shard, height));
-        }
-        valid
-    }
-
-    /// Check if a remote header's QC has been verified.
-    pub fn is_remote_header_qc_verified(&self, shard: ShardGroupId, height: BlockHeight) -> bool {
-        self.verified_remote_header_qcs.contains(&(shard, height))
-    }
-
-    /// Directly mark a remote header's QC as verified.
-    pub fn promote_remote_header_qc(&mut self, shard: ShardGroupId, height: BlockHeight) {
-        self.pending_remote_header_qcs.remove(&(shard, height));
-        self.verified_remote_header_qcs.insert((shard, height));
-    }
-
-    /// Prune remote header verification state for a shard below a cutoff height.
-    pub fn prune_remote_headers(&mut self, shard: ShardGroupId, cutoff_height: u64) {
-        self.pending_remote_header_qcs
-            .retain(|&(s, h)| s != shard || h.0 >= cutoff_height);
-        self.verified_remote_header_qcs
-            .retain(|&(s, h)| s != shard || h.0 >= cutoff_height);
-    }
 
     // ═══════════════════════════════════════════════════════════════════════
     // JVT state tracking

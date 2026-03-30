@@ -108,12 +108,18 @@ pub struct MemoryMetrics {
     /// Cached set of locked nodes.
     pub mempool_locked_nodes: usize,
 
+    // ── Remote Headers ──
+    /// Remote headers pending QC verification.
+    pub rh_pending_headers: usize,
+    /// Verified remote shard headers.
+    pub rh_verified_headers: usize,
+    /// Remote shards being tracked for liveness.
+    pub rh_expected_headers: usize,
+
     // ── Provisions ──
     /// Cross-shard transactions being tracked.
     pub prov_registered_txs: usize,
-    /// Unverified headers from remote shards.
-    pub prov_unverified_remote_headers: usize,
-    /// Verified remote shard headers.
+    /// Verified remote shard headers (provisions local cache).
     pub prov_verified_remote_headers: usize,
     /// Provision batches waiting for corresponding header.
     pub prov_pending_provisions: usize,

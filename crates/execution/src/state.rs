@@ -888,7 +888,7 @@ impl ExecutionState {
     /// Called when a remote shard's committed block header is received. For each
     /// wave in the header that includes our shard, we register an expected cert.
     /// If the cert doesn't arrive within the timeout, we request it via fallback.
-    pub fn on_remote_block_header(
+    pub fn on_verified_remote_header(
         &mut self,
         topology: &TopologySnapshot,
         source_shard: ShardGroupId,

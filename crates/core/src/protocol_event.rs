@@ -91,7 +91,17 @@ pub enum ProtocolEvent {
     RemoteHeaderQcVerified {
         shard: ShardGroupId,
         height: BlockHeight,
+        header: Arc<CommittedBlockHeader>,
         valid: bool,
+    },
+
+    /// A remote committed block header has been fully verified (QC + structural checks).
+    ///
+    /// Emitted by `RemoteHeaderCoordinator` as a continuation after QC verification.
+    /// Downstream consumers (BFT, Provisions, Execution) use this as their single
+    /// source of verified remote headers.
+    RemoteHeaderVerified {
+        committed_header: Arc<CommittedBlockHeader>,
     },
 
     /// State root verification completed.
@@ -350,6 +360,7 @@ impl ProtocolEvent {
             ProtocolEvent::QuorumCertificateResult { .. } => "QuorumCertificateResult",
             ProtocolEvent::QcSignatureVerified { .. } => "QcSignatureVerified",
             ProtocolEvent::RemoteHeaderQcVerified { .. } => "RemoteHeaderQcVerified",
+            ProtocolEvent::RemoteHeaderVerified { .. } => "RemoteHeaderVerified",
             ProtocolEvent::StateRootVerified { .. } => "StateRootVerified",
             ProtocolEvent::TransactionRootVerified { .. } => "TransactionRootVerified",
             ProtocolEvent::ReceiptRootVerified { .. } => "ReceiptRootVerified",

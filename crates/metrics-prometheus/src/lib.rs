@@ -127,6 +127,7 @@ pub struct Metrics {
     pub memory_bft: GaugeVec,
     pub memory_exec: GaugeVec,
     pub memory_mempool: GaugeVec,
+    pub memory_remote_headers: GaugeVec,
     pub memory_provisions: GaugeVec,
     pub memory_livelock: GaugeVec,
     pub memory_storage: GaugeVec,
@@ -650,6 +651,13 @@ impl Metrics {
             memory_mempool: register_gauge_vec!(
                 "hyperscale_memory_mempool_collections",
                 "Mempool collection sizes (entry count)",
+                &["collection"]
+            )
+            .unwrap(),
+
+            memory_remote_headers: register_gauge_vec!(
+                "hyperscale_memory_remote_headers_collections",
+                "Remote header coordinator collection sizes (entry count)",
                 &["collection"]
             )
             .unwrap(),
@@ -1257,15 +1265,25 @@ impl MetricsRecorder for PrometheusRecorder {
             .with_label_values(&["locked_nodes"])
             .set(m.mempool_locked_nodes as f64);
 
+        // Remote Headers
+        self.metrics
+            .memory_remote_headers
+            .with_label_values(&["pending_headers"])
+            .set(m.rh_pending_headers as f64);
+        self.metrics
+            .memory_remote_headers
+            .with_label_values(&["verified_headers"])
+            .set(m.rh_verified_headers as f64);
+        self.metrics
+            .memory_remote_headers
+            .with_label_values(&["expected_headers"])
+            .set(m.rh_expected_headers as f64);
+
         // Provisions
         self.metrics
             .memory_provisions
             .with_label_values(&["registered_txs"])
             .set(m.prov_registered_txs as f64);
-        self.metrics
-            .memory_provisions
-            .with_label_values(&["unverified_remote_headers"])
-            .set(m.prov_unverified_remote_headers as f64);
         self.metrics
             .memory_provisions
             .with_label_values(&["verified_remote_headers"])

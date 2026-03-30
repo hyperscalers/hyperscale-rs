@@ -1,0 +1,14 @@
+[package]
+name = "hyperscale-remote-headers"
+version.workspace = true
+edition.workspace = true
+description = "Centralized remote block header coordination for cross-shard verification"
+
+[dependencies]
+hyperscale-core.workspace = true
+hyperscale-types.workspace = true
+
+tracing.workspace = true
+
+[dev-dependencies]
+hyperscale-test-helpers.workspace = true

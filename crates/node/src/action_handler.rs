@@ -153,18 +153,6 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
             shard,
             height,
         } => {
-            // Fast path: skip crypto if already verified.
-            if header.is_qc_verified() {
-                return Some(DelegatedResult {
-                    events: vec![NodeInput::Protocol(ProtocolEvent::RemoteHeaderQcVerified {
-                        shard,
-                        height,
-                        valid: true,
-                    })],
-                    prepared_commit: None,
-                });
-            }
-
             let start = std::time::Instant::now();
 
             // Verify QC signature (BLS pairing)
@@ -184,10 +172,6 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
                 false
             };
 
-            if valid {
-                header.mark_qc_verified(true);
-            }
-
             metrics::record_signature_verification_latency(
                 "remote_header_qc",
                 start.elapsed().as_secs_f64(),
@@ -197,6 +181,7 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
                 events: vec![NodeInput::Protocol(ProtocolEvent::RemoteHeaderQcVerified {
                     shard,
                     height,
+                    header,
                     valid,
                 })],
                 prepared_commit: None,
@@ -405,20 +390,12 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
             // Prefer already-verified candidates (skip BLS).
             let qc_start = std::time::Instant::now();
             let verified_header = committed_headers.into_iter().find(|candidate| {
-                // OnceLock fast path: BFT already verified this Arc instance.
-                let qc_valid = if candidate.is_qc_verified() {
-                    true
-                } else {
-                    // Verify QC signature (BLS pairing — expensive)
-                    let valid = hyperscale_bft::handlers::verify_qc_signature(
-                        &candidate.qc,
-                        &committee_public_keys,
-                    );
-                    if valid {
-                        candidate.mark_qc_verified(true);
-                    }
-                    valid
-                };
+                // Headers are pre-verified by RemoteHeaderCoordinator.
+                // Re-verify as a safety check (no OnceLock cache needed).
+                let qc_valid = hyperscale_bft::handlers::verify_qc_signature(
+                    &candidate.qc,
+                    &committee_public_keys,
+                );
                 if !qc_valid {
                     return false;
                 }

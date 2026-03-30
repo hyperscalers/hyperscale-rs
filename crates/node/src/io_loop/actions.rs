@@ -4,6 +4,7 @@ use super::{IoLoop, TimerOp};
 use crate::action_handler::{self, ActionContext, DispatchPool};
 use crate::protocol::execution_cert_fetch::ExecCertFetchInput;
 use crate::protocol::fetch::FetchInput;
+use crate::protocol::header_fetch::HeaderFetchInput;
 use crate::protocol::provision_fetch::ProvisionFetchInput;
 use crate::protocol::sync::SyncInput;
 use hyperscale_core::{Action, NodeInput, ProtocolEvent, StateMachine};
@@ -240,7 +241,8 @@ where
             | Action::RequestMissingProvisions { .. }
             | Action::RequestMissingExecutionCerts { .. }
             | Action::CancelProvisionFetch { .. }
-            | Action::RequestTxInclusionProofs { .. } => {
+            | Action::RequestTxInclusionProofs { .. }
+            | Action::RequestMissingCommittedBlockHeader { .. } => {
                 self.process_sync_fetch_action(action);
             }
 
@@ -736,6 +738,29 @@ where
                     .exec_cert_fetch_protocol
                     .handle(ExecCertFetchInput::Tick);
                 self.process_exec_cert_fetch_outputs(tick_outputs);
+                self.update_fetch_tick_timer();
+            }
+            Action::RequestMissingCommittedBlockHeader {
+                source_shard,
+                from_height,
+                peers,
+            } => {
+                debug!(
+                    source_shard = source_shard.0,
+                    from_height = from_height.0,
+                    peer_count = peers.len(),
+                    "Requesting missing committed block header from source shard"
+                );
+                let outputs = self
+                    .header_fetch_protocol
+                    .handle(HeaderFetchInput::Request {
+                        source_shard,
+                        from_height,
+                        peers,
+                    });
+                self.process_header_fetch_outputs(outputs);
+                let tick_outputs = self.header_fetch_protocol.handle(HeaderFetchInput::Tick);
+                self.process_header_fetch_outputs(tick_outputs);
                 self.update_fetch_tick_timer();
             }
             _ => unreachable!(),

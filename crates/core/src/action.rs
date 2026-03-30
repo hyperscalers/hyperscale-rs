@@ -774,6 +774,24 @@ pub enum Action {
         /// All validators in the source shard (candidate peers for the request).
         peers: Vec<ValidatorId>,
     },
+
+    /// Request missing committed block header from a remote shard.
+    ///
+    /// Emitted by `RemoteHeaderCoordinator` when a remote shard hasn't sent
+    /// committed block headers within the liveness timeout. This is the
+    /// fallback recovery mechanism for proposer-only gossip.
+    ///
+    /// The runner sends a `GetCommittedBlockHeaderRequest` to the source shard,
+    /// and the response is fed back as `RemoteBlockCommitted` for normal
+    /// verification through the coordinator.
+    RequestMissingCommittedBlockHeader {
+        /// The shard whose headers are missing.
+        source_shard: ShardGroupId,
+        /// Request headers starting from this height.
+        from_height: BlockHeight,
+        /// All validators in the source shard (candidate peers for the request).
+        peers: Vec<ValidatorId>,
+    },
 }
 
 impl Action {
@@ -796,6 +814,7 @@ impl Action {
                 | Action::RequestMissingExecutionCerts { .. }
                 | Action::CancelProvisionFetch { .. }
                 | Action::RequestTxInclusionProofs { .. }
+                | Action::RequestMissingCommittedBlockHeader { .. }
         )
     }
 
@@ -910,6 +929,9 @@ impl Action {
             Action::RequestMissingExecutionCerts { .. } => "RequestMissingExecutionCerts",
             Action::CancelProvisionFetch { .. } => "CancelProvisionFetch",
             Action::RequestTxInclusionProofs { .. } => "RequestTxInclusionProof",
+            Action::RequestMissingCommittedBlockHeader { .. } => {
+                "RequestMissingCommittedBlockHeader"
+            }
         }
     }
 }

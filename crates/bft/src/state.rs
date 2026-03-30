@@ -320,24 +320,22 @@ impl BftState {
 
     /// Insert a remote block header and initiate QC verification.
     ///
-    /// Called when `RemoteBlockCommitted` arrives. Stores the Arc-shared header,
-    /// updates per-shard tip, prunes old headers, and emits a
-    /// `VerifyRemoteHeaderQc` action for async QC verification.
-    pub fn insert_remote_header(
-        &mut self,
-        topology: &TopologySnapshot,
-        header: Arc<CommittedBlockHeader>,
-    ) -> Vec<Action> {
+    /// Store a verified remote header from the RemoteHeaderCoordinator.
+    ///
+    /// Called when `RemoteHeaderVerified` is received. The header has already
+    /// been QC-verified by the coordinator, so we just store it for deferral
+    /// merkle proof validation.
+    pub fn on_verified_remote_header(&mut self, header: Arc<CommittedBlockHeader>) -> Vec<Action> {
         let shard = header.shard_group_id();
         let height = header.height();
         let key = (shard, height);
 
-        // Don't re-insert or re-verify
+        // Don't re-insert if we already have it.
         if self.remote_headers.contains_key(&key) {
             return vec![];
         }
 
-        self.remote_headers.insert(key, Arc::clone(&header));
+        self.remote_headers.insert(key, header);
 
         // Update tip and prune old headers for this shard.
         let tip = self
@@ -351,67 +349,8 @@ impl BftState {
         if cutoff > 0 {
             self.remote_headers
                 .retain(|&(s, h), _| s != shard || h.0 >= cutoff);
-            self.verification.prune_remote_headers(shard, cutoff);
         }
 
-        // Emit verification action
-        self.verification
-            .track_pending_remote_header_qc(shard, height);
-        let committee = topology.committee_for_shard(shard);
-        let committee_public_keys: Vec<_> = committee
-            .iter()
-            .map(|&vid| {
-                topology
-                    .public_key(vid)
-                    .expect("committee member must have a public key")
-            })
-            .collect();
-        let committee_voting_power: Vec<u64> = committee
-            .iter()
-            .map(|&vid| topology.voting_power(vid).unwrap_or(0))
-            .collect();
-        let quorum_threshold = topology.quorum_threshold_for_shard(shard);
-
-        vec![Action::VerifyRemoteHeaderQc {
-            header,
-            committee_public_keys,
-            committee_voting_power,
-            quorum_threshold,
-            shard,
-            height,
-        }]
-    }
-
-    /// Replace the stored header with one that has been QC-verified.
-    pub fn promote_verified_remote_header(
-        &mut self,
-        shard: ShardGroupId,
-        height: BlockHeight,
-        header: Arc<CommittedBlockHeader>,
-    ) {
-        let key = (shard, height);
-        self.remote_headers.insert(key, header);
-        self.verification.promote_remote_header_qc(shard, height);
-    }
-
-    /// Handle remote header QC verification result.
-    pub fn on_remote_header_qc_verified(
-        &mut self,
-        shard: ShardGroupId,
-        height: BlockHeight,
-        valid: bool,
-    ) -> Vec<Action> {
-        let key = (shard, height);
-        self.verification
-            .on_remote_header_qc_verified(shard, height, valid);
-        if !valid {
-            self.remote_headers.remove(&key);
-            tracing::warn!(
-                shard = shard.0,
-                height = height.0,
-                "Remote header QC verification failed, removing"
-            );
-        }
         vec![]
     }
 
@@ -2097,16 +2036,9 @@ impl BftState {
 
             // Rule 4: Verify merkle inclusion proof for the winner TX in the source block.
             // This is synchronous (pure hash computation) — no async dispatch needed.
-            // Only trust headers whose QC has been verified.
+            // All headers in remote_headers are pre-verified by RemoteHeaderCoordinator.
             let header_key = (deferral.source_shard, deferral.source_block_height);
             if let Some(committed_header) = self.remote_headers.get(&header_key) {
-                if !self.verification.is_remote_header_qc_verified(
-                    deferral.source_shard,
-                    deferral.source_block_height,
-                ) {
-                    // Header exists but QC not yet verified — skip proof check.
-                    continue;
-                }
                 if !verify_merkle_inclusion(
                     committed_header.header.transaction_root,
                     *winner_tx_hash,
@@ -2118,11 +2050,9 @@ impl BftState {
                     ));
                 }
             }
-            // If we don't have the remote header yet (or QC not verified), we can't
-            // verify the proof. This is acceptable: the header will arrive via gossip,
-            // and we'll verify on the next proposal attempt. Don't reject the block
-            // for this — the QC on the source block header (once verified) is the
-            // trust anchor.
+            // If we don't have the remote header yet, we can't verify the proof.
+            // This is acceptable: the header will arrive via gossip/fallback,
+            // and we'll verify on the next proposal attempt.
         }
 
         // Validate each abort
@@ -3407,23 +3337,29 @@ impl BftState {
                 block: block.clone(),
                 qc: current_qc.clone(),
             });
-            let committed_header = hyperscale_types::CommittedBlockHeader::new(
-                block.header.clone(),
-                current_qc.clone(),
-            );
-            let cbh_msg = committed_block_header_message(
-                committed_header.header.shard_group_id,
-                committed_header.header.height.0,
-                &committed_header.header.hash(),
-            );
-            let cbh_sig = self.signing_key.sign_v1(&cbh_msg);
-            actions.push(Action::BroadcastCommittedBlockHeader {
-                gossip: hyperscale_messages::CommittedBlockHeaderGossip {
-                    committed_header,
-                    sender: topology.local_validator_id(),
-                    sender_signature: cbh_sig,
-                },
-            });
+            // Only the block proposer gossips the committed header globally.
+            // Other validators rely on receiving it via gossip propagation.
+            // If the proposer is byzantine/slow, the RemoteHeaderCoordinator
+            // will detect the liveness timeout and trigger a fallback fetch.
+            if block.header.proposer == topology.local_validator_id() {
+                let committed_header = hyperscale_types::CommittedBlockHeader::new(
+                    block.header.clone(),
+                    current_qc.clone(),
+                );
+                let cbh_msg = committed_block_header_message(
+                    committed_header.header.shard_group_id,
+                    committed_header.header.height.0,
+                    &committed_header.header.hash(),
+                );
+                let cbh_sig = self.signing_key.sign_v1(&cbh_msg);
+                actions.push(Action::BroadcastCommittedBlockHeader {
+                    gossip: hyperscale_messages::CommittedBlockHeaderGossip {
+                        committed_header,
+                        sender: topology.local_validator_id(),
+                        sender_signature: cbh_sig,
+                    },
+                });
+            }
 
             // Check if the next height is buffered
             let next_height = height + 1;
@@ -3672,14 +3608,6 @@ impl BftState {
         let removed_blocks = self.cleanup_old_state(height);
 
         // Emit actions for the synced block
-        let committed_header =
-            hyperscale_types::CommittedBlockHeader::new(block.header.clone(), qc.clone());
-        let cbh_msg = committed_block_header_message(
-            committed_header.header.shard_group_id,
-            committed_header.header.height.0,
-            &committed_header.header.hash(),
-        );
-        let cbh_sig = self.signing_key.sign_v1(&cbh_msg);
         let mut actions = vec![
             Action::PersistBlock {
                 block: block.clone(),
@@ -3689,14 +3617,10 @@ impl BftState {
                 block: block.clone(),
                 qc,
             },
-            Action::BroadcastCommittedBlockHeader {
-                gossip: hyperscale_messages::CommittedBlockHeaderGossip {
-                    committed_header,
-                    sender: topology.local_validator_id(),
-                    sender_signature: cbh_sig,
-                },
-            },
         ];
+
+        // Synced blocks: do NOT gossip committed header — the original
+        // proposer already did. Fallback recovery handles missing headers.
 
         // Cancel any pending fetches for removed blocks
         for block_hash in removed_blocks {

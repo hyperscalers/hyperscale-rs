@@ -16,6 +16,7 @@ hyperscale-mempool.workspace = true
 hyperscale-messages.workspace = true
 hyperscale-network.workspace = true
 hyperscale-provisions.workspace = true
+hyperscale-remote-headers.workspace = true
 hyperscale-topology.workspace = true
 hyperscale-storage.workspace = true
 hyperscale-types.workspace = true

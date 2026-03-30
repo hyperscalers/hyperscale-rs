@@ -6,6 +6,7 @@ use hyperscale_execution::ExecutionState;
 use hyperscale_livelock::LivelockState;
 use hyperscale_mempool::{MempoolConfig, MempoolState};
 use hyperscale_provisions::ProvisionCoordinator;
+use hyperscale_remote_headers::RemoteHeaderCoordinator;
 use hyperscale_topology::TopologyState;
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, BlockManifest, Bls12381G1PrivateKey, CommittedBlockHeader,
@@ -59,6 +60,9 @@ pub struct NodeStateMachine {
 
     /// Provision coordination for cross-shard transactions.
     provisions: ProvisionCoordinator,
+
+    /// Remote block header coordination (single source of truth).
+    remote_headers: RemoteHeaderCoordinator,
 
     /// Livelock prevention state (cycle detection for cross-shard TXs).
     livelock: LivelockState,
@@ -163,6 +167,7 @@ impl NodeStateMachine {
             ),
             mempool: MempoolState::with_config(mempool_config),
             provisions: ProvisionCoordinator::new(),
+            remote_headers: RemoteHeaderCoordinator::new(),
             livelock: LivelockState::new(),
             topology,
             // Use recovered JVT root - critical for correct state root computation
@@ -216,6 +221,11 @@ impl NodeStateMachine {
     /// Get a reference to the provision coordinator.
     pub fn provisions(&self) -> &ProvisionCoordinator {
         &self.provisions
+    }
+
+    /// Get a reference to the remote header coordinator.
+    pub fn remote_headers(&self) -> &RemoteHeaderCoordinator {
+        &self.remote_headers
     }
 
     /// Get the last committed JVT root hash.
@@ -688,6 +698,12 @@ impl NodeStateMachine {
                 .on_block_committed_full(self.topology.snapshot(), &block),
         );
 
+        // Remote header coordinator: update liveness and check for timeouts.
+        actions.extend(
+            self.remote_headers
+                .on_block_committed(self.topology.snapshot()),
+        );
+
         // Let provisions coordinator handle cleanup (certificates, aborts, deferrals).
         // Enrich RequestMissingProvisions actions with the source shard's committee.
         let mut provision_actions = self
@@ -719,15 +735,9 @@ impl NodeStateMachine {
         committed_header: Option<Arc<CommittedBlockHeader>>,
         valid: bool,
     ) -> Vec<Action> {
-        if valid {
-            // Promote the verified header into BFT.
-            if let Some(ref header) = committed_header {
-                let shard = header.shard_group_id();
-                let height = header.height();
-                self.bft
-                    .promote_verified_remote_header(shard, height, Arc::clone(header));
-            }
-        }
+        // No need to promote headers into BFT — RemoteHeaderCoordinator
+        // already stores verified headers, and BFT receives them via
+        // RemoteHeaderVerified event.
         self.provisions.on_state_provisions_verified(
             self.topology.snapshot(),
             batch,
@@ -843,24 +853,13 @@ impl StateMachine for NodeStateMachine {
                 committed_header,
                 sender,
             } => {
-                // Arc-wrap and share with BFT, provisions, and execution.
+                // Route through the centralized remote header coordinator.
+                // It performs structural pre-checks and dispatches QC verification.
+                // Downstream consumers receive headers via RemoteHeaderVerified.
                 let header = Arc::new(committed_header);
                 let topology = self.topology.snapshot();
-                let mut actions = self.bft.insert_remote_header(topology, Arc::clone(&header));
-
-                // Register expected execution certs from this remote block's waves.
-                self.execution.on_remote_block_header(
-                    topology,
-                    header.header.shard_group_id,
-                    header.header.height.0,
-                    &header.header.waves,
-                );
-
-                actions.extend(
-                    self.provisions
-                        .on_remote_block_committed(topology, header, sender),
-                );
-                actions
+                self.remote_headers
+                    .on_remote_block_committed(topology, header, sender)
             }
             ProtocolEvent::BlockVoteReceived { vote } => {
                 self.bft.on_block_vote(self.topology.snapshot(), vote)
@@ -881,8 +880,50 @@ impl StateMachine for NodeStateMachine {
             ProtocolEvent::RemoteHeaderQcVerified {
                 shard,
                 height,
+                header,
                 valid,
-            } => self.bft.on_remote_header_qc_verified(shard, height, valid),
+            } => {
+                // Store valid headers into BFT immediately (before the
+                // RemoteHeaderVerified continuation is processed) so they're
+                // available for deferral merkle proof validation without a
+                // 1-step delay.
+                if valid {
+                    self.bft.on_verified_remote_header(Arc::clone(&header));
+                }
+                self.remote_headers.on_remote_header_qc_verified(
+                    self.topology.snapshot(),
+                    shard,
+                    height,
+                    header,
+                    valid,
+                )
+            }
+            ProtocolEvent::RemoteHeaderVerified { committed_header } => {
+                // Fan out verified header to all downstream consumers.
+                let topology = self.topology.snapshot();
+                let shard = committed_header.shard_group_id();
+
+                // BFT: store for deferral merkle proof validation.
+                let mut actions = self
+                    .bft
+                    .on_verified_remote_header(Arc::clone(&committed_header));
+
+                // Execution: register expected execution certs from waves.
+                self.execution.on_verified_remote_header(
+                    topology,
+                    shard,
+                    committed_header.header.height.0,
+                    &committed_header.header.waves,
+                );
+
+                // Provisions: register expected provisions and join with buffered batches.
+                actions.extend(
+                    self.provisions
+                        .on_verified_remote_header(topology, committed_header),
+                );
+
+                actions
+            }
             ProtocolEvent::StateRootVerified { block_hash, valid } => self
                 .bft
                 .on_state_root_verified(self.topology.snapshot(), block_hash, valid),

@@ -145,6 +145,19 @@ pub enum NodeInput {
         source_shard: ShardGroupId,
         block_height: u64,
     },
+
+    /// Committed block header successfully fetched from a source shard.
+    HeaderFetchReceived {
+        source_shard: ShardGroupId,
+        from_height: BlockHeight,
+        header: CommittedBlockHeader,
+    },
+
+    /// A committed block header fetch request failed.
+    HeaderFetchFailed {
+        source_shard: ShardGroupId,
+        from_height: BlockHeight,
+    },
 }
 
 impl NodeInput {
@@ -192,6 +205,8 @@ impl NodeInput {
             NodeInput::InclusionProofFetchFailed { .. } => EventPriority::Internal,
             NodeInput::ExecCertFetchReceived { .. } => EventPriority::Internal,
             NodeInput::ExecCertFetchFailed { .. } => EventPriority::Internal,
+            NodeInput::HeaderFetchReceived { .. } => EventPriority::Internal,
+            NodeInput::HeaderFetchFailed { .. } => EventPriority::Internal,
         }
     }
 
@@ -231,6 +246,8 @@ impl NodeInput {
             NodeInput::InclusionProofFetchFailed { .. } => "InclusionProofFetchFailed",
             NodeInput::ExecCertFetchReceived { .. } => "ExecCertFetchReceived",
             NodeInput::ExecCertFetchFailed { .. } => "ExecCertFetchFailed",
+            NodeInput::HeaderFetchReceived { .. } => "HeaderFetchReceived",
+            NodeInput::HeaderFetchFailed { .. } => "HeaderFetchFailed",
         }
     }
 }

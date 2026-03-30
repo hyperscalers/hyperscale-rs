@@ -11,7 +11,7 @@ use hyperscale_dispatch::Dispatch;
 use hyperscale_metrics as metrics;
 use hyperscale_network::Network;
 use hyperscale_storage::{CommitStore, ConsensusStore, SubstateStore};
-use hyperscale_types::BlockHeight;
+use hyperscale_types::{BlockHeight, ValidatorId};
 use std::time::Duration;
 
 impl<S, N, D> IoLoop<S, N, D>
@@ -372,6 +372,71 @@ where
         }
     }
 
+    /// Process HeaderFetchProtocol outputs.
+    ///
+    /// `Fetch` sends a single-peer network request for committed block headers.
+    /// `Deliver` feeds the header into the state machine via `RemoteBlockCommitted`.
+    pub(super) fn process_header_fetch_outputs(
+        &mut self,
+        outputs: Vec<crate::protocol::header_fetch::HeaderFetchOutput>,
+    ) {
+        use crate::protocol::header_fetch::HeaderFetchOutput;
+
+        for output in outputs {
+            match output {
+                HeaderFetchOutput::Fetch {
+                    source_shard,
+                    from_height,
+                    peer,
+                } => {
+                    use hyperscale_messages::request::GetCommittedBlockHeaderRequest;
+                    let request = GetCommittedBlockHeaderRequest {
+                        shard: source_shard,
+                        height: from_height,
+                    };
+                    let sender = self.event_sender.clone();
+                    self.network.request(
+                        &[peer],
+                        None,
+                        request,
+                        Box::new(move |result| match result {
+                            Ok(response) => match response.header {
+                                Some(header) => {
+                                    let _ = sender.send(NodeInput::HeaderFetchReceived {
+                                        source_shard,
+                                        from_height,
+                                        header,
+                                    });
+                                }
+                                None => {
+                                    let _ = sender.send(NodeInput::HeaderFetchFailed {
+                                        source_shard,
+                                        from_height,
+                                    });
+                                }
+                            },
+                            Err(_) => {
+                                let _ = sender.send(NodeInput::HeaderFetchFailed {
+                                    source_shard,
+                                    from_height,
+                                });
+                            }
+                        }),
+                    );
+                }
+                HeaderFetchOutput::Deliver { header } => {
+                    // Feed fetched header into the state machine as RemoteBlockCommitted.
+                    // The coordinator will verify and fan out as normal.
+                    // Use ValidatorId(0) as placeholder sender — the QC is what matters.
+                    self.feed_event(ProtocolEvent::RemoteBlockCommitted {
+                        committed_header: *header,
+                        sender: ValidatorId(0),
+                    });
+                }
+            }
+        }
+    }
+
     /// Set or cancel the periodic fetch tick timer based on protocol state.
     ///
     /// When the fetch protocol has pending work, a recurring timer fires
@@ -383,7 +448,13 @@ where
         let has_provision_work = self.provision_fetch_protocol.has_pending();
         let has_inclusion_proof_work = self.inclusion_proof_fetch_protocol.has_pending();
         let has_exec_cert_work = self.exec_cert_fetch_protocol.has_pending();
-        if has_fetch_work || has_provision_work || has_inclusion_proof_work || has_exec_cert_work {
+        let has_header_work = self.header_fetch_protocol.has_pending();
+        if has_fetch_work
+            || has_provision_work
+            || has_inclusion_proof_work
+            || has_exec_cert_work
+            || has_header_work
+        {
             self.pending_timer_ops.push(TimerOp::Set {
                 id: TimerId::FetchTick,
                 duration: Self::FETCH_TICK_INTERVAL,
