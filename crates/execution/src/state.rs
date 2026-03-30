@@ -107,6 +107,7 @@ pub struct SpeculativeResult {
 pub struct ExecutionMemoryStats {
     pub cache_entries: usize,
     pub finalized_certificates: usize,
+    pub execution_sealed: usize,
     pub pending_provisioning: usize,
     pub accumulators: usize,
     pub vote_trackers: usize,
@@ -168,6 +169,21 @@ pub struct ExecutionState {
     /// Certificate trackers for cross-shard transactions.
     /// Maps tx_hash -> (CertificateTracker, height_when_created) for stale-entry pruning.
     certificate_trackers: HashMap<Hash, (CertificateTracker, u64)>,
+
+    /// Transactions whose execution result has been included in a completed wave.
+    ///
+    /// Once a wave completes and the execution vote is signed, the EC will be
+    /// broadcast to remote shards. From that point, the transaction's outcome
+    /// is sealed — no deferral or abort should override it, because remote
+    /// shards will use this EC to form the TransactionCertificate.
+    ///
+    /// This is the **point of no return**: earlier than TC creation (which
+    /// requires collecting remote ECs), but the moment our local result is
+    /// irreversibly committed to the network.
+    ///
+    /// Entries are removed when the TC is created (finalized) or when the
+    /// stale tracking pruner runs.
+    execution_sealed: HashMap<Hash, u64>,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Early arrivals (before tracking starts)
@@ -320,6 +336,7 @@ impl ExecutionState {
             speculative_late_hit_count: 0,
             speculative_cache_miss_count: 0,
             speculative_invalidated_count: 0,
+            execution_sealed: HashMap::new(),
             expected_exec_certs: HashMap::new(),
             fulfilled_exec_certs: HashMap::new(),
         }
@@ -484,6 +501,17 @@ impl ExecutionState {
         let block_height = accumulator.block_height();
         let wave_id = accumulator.wave_id().clone();
         let participating_shards = accumulator.all_participating_shards();
+
+        // Seal all transactions with non-zero receipts. Once the execution vote
+        // is signed and broadcast, the EC is irreversible — remote shards will
+        // use it to build the TransactionCertificate. No deferral or abort can
+        // override these results without causing split-brain.
+        for outcome in &tx_outcomes {
+            if outcome.receipt_hash != Hash::ZERO {
+                self.execution_sealed
+                    .insert(outcome.tx_hash, self.committed_height);
+            }
+        }
 
         tracing::debug!(
             ?block_hash,
@@ -1064,6 +1092,7 @@ impl ExecutionState {
         self.prune_execution_state();
         self.prune_finalized_certificates();
         self.prune_certificate_trackers();
+        self.prune_execution_sealed();
         self.prune_pending_provisioning();
         self.prune_execution_cache();
         self.prune_pending_speculative();
@@ -1516,8 +1545,9 @@ impl ExecutionState {
     /// Cleans up all transaction tracking state. The certificate itself is already
     /// persisted to storage by this point and can be fetched from there by peers.
     pub fn remove_finalized_certificate(&mut self, tx_hash: &Hash) {
-        // Remove from finalized certificates
+        // Remove from finalized certificates and sealed tracking
         self.finalized_certificates.remove(tx_hash);
+        self.execution_sealed.remove(tx_hash);
 
         // Evict from execution cache — writes have been applied to JVT at this point.
         self.execution_cache.remove(tx_hash);
@@ -1676,6 +1706,19 @@ impl ExecutionState {
         }
     }
 
+    /// Prune stale execution_sealed entries.
+    ///
+    /// Sealed entries are normally removed when the TC is created or committed.
+    /// This prunes entries that linger (e.g., if the TC was never formed because
+    /// this validator was in the minority for the wave's receipt_root).
+    fn prune_execution_sealed(&mut self) {
+        let cutoff = self
+            .committed_height
+            .saturating_sub(STALE_TRACKING_RETENTION_BLOCKS);
+
+        self.execution_sealed.retain(|_, height| *height > cutoff);
+    }
+
     /// Prune stale pending provisioning entries for transactions whose
     /// provisions never arrived within the retention window.
     fn prune_pending_provisioning(&mut self) {
@@ -1743,9 +1786,23 @@ impl ExecutionState {
         }
     }
 
-    /// Check if a transaction is finalized.
+    /// Check if a transaction is finalized (TC created from all shard ECs).
     pub fn is_finalized(&self, tx_hash: &Hash) -> bool {
         self.finalized_certificates.contains_key(tx_hash)
+    }
+
+    /// Check if a transaction's execution result has been sealed.
+    ///
+    /// A sealed transaction has had its result included in a completed wave's
+    /// execution vote. The EC containing this result will be (or has been)
+    /// broadcast to remote shards. From this point, deferring or aborting the
+    /// transaction would cause split-brain with remote shards.
+    ///
+    /// This is the point of no return — earlier than `is_finalized` (which
+    /// requires all remote ECs), but the moment the local result is committed
+    /// to the network.
+    pub fn is_execution_sealed(&self, tx_hash: &Hash) -> bool {
+        self.execution_sealed.contains_key(tx_hash)
     }
 
     /// Check if we're waiting for provisioning to complete for a transaction.
@@ -1786,18 +1843,31 @@ impl ExecutionState {
     /// This releases all resources associated with the transaction so it doesn't
     /// continue consuming memory or processing.
     ///
-    /// When a deferral or abort is *committed* in a block, the transaction is
-    /// definitively superseded. Any finalized certificate we hold for it is stale
-    /// and must be removed — otherwise we keep including it in every proposal,
-    /// producing blocks that other validators can never assemble.
+    /// IMPORTANT: If a finalized TransactionCertificate exists, we preserve it.
+    /// The TC represents cross-shard consensus (all participating shards agreed on
+    /// the execution result). A local deferral/abort cannot override that — the TC
+    /// must be committed in the next block to supersede the deferral. Removing it
+    /// here would cause split-brain: remote shards commit the TC while we discard it.
+    ///
+    /// Stale TCs (where execution happened locally but was never committed) are
+    /// handled by `prune_finalized_certificates()` which runs on every block commit.
     pub fn cleanup_transaction(&mut self, tx_hash: &Hash) {
-        // Remove finalized certificate if present — the deferral/abort committed,
-        // so this certificate will never be included in a block.
-        if self.finalized_certificates.remove(tx_hash).is_some() {
+        // If the transaction's execution result is already sealed (EC produced and
+        // broadcast) or finalized (TC created), we must preserve ALL tracking state.
+        // Removing the certificate_tracker, wave_assignment, or finalized_certificate
+        // would prevent us from completing the TC when the remote EC arrives — causing
+        // split-brain with remote shards that DO form the TC from our EC.
+        if self.execution_sealed.contains_key(tx_hash)
+            || self.finalized_certificates.contains_key(tx_hash)
+        {
             tracing::info!(
                 tx_hash = %tx_hash,
-                "Removed stale finalized certificate for deferred/aborted transaction"
+                sealed = self.execution_sealed.contains_key(tx_hash),
+                finalized = self.finalized_certificates.contains_key(tx_hash),
+                "Skipping cleanup for sealed/finalized transaction \
+                 (must complete TC to avoid split-brain with remote shards)"
             );
+            return;
         }
 
         // Evict from execution cache — transaction is being retried or abandoned.
@@ -2154,6 +2224,7 @@ impl ExecutionState {
         ExecutionMemoryStats {
             cache_entries: self.execution_cache.len(),
             finalized_certificates: self.finalized_certificates.len(),
+            execution_sealed: self.execution_sealed.len(),
             pending_provisioning: self.pending_provisioning.len(),
             accumulators: self.accumulators.len(),
             vote_trackers: self.vote_trackers.len(),

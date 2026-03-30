@@ -79,6 +79,8 @@ pub struct MemoryMetrics {
     pub exec_cache_entries: usize,
     /// Certificates ready for block inclusion.
     pub exec_finalized_certificates: usize,
+    /// Transactions whose EC has been broadcast (point of no return).
+    pub exec_execution_sealed: usize,
     /// Transactions waiting for provisioning.
     pub exec_pending_provisioning: usize,
     /// Per-tx results collection per wave.

@@ -272,6 +272,56 @@ impl NodeStateMachine {
             .get_timed_out_transactions(current_height, EXECUTION_TIMEOUT_BLOCKS);
         let certificates = self.execution.get_finalized_certificates();
 
+        // Filter out deferrals and aborts for transactions whose execution result
+        // is already sealed (EC produced) or finalized (TC created). Once our shard
+        // has broadcast an EC with a non-zero receipt for a transaction, remote shards
+        // will use it to form the TransactionCertificate. Proposing a deferral/abort
+        // after that point would cause split-brain: remote shards commit the TC while
+        // we discard it.
+        //
+        // is_execution_sealed: EC produced (local wave complete, vote broadcast)
+        // is_finalized: TC created (all remote ECs collected)
+        let deferred = deferred
+            .into_iter()
+            .filter(|d| {
+                if self.execution.is_execution_sealed(&d.tx_hash) {
+                    tracing::info!(
+                        tx_hash = %d.tx_hash,
+                        "Filtering deferral from proposal: execution already sealed (EC broadcast)"
+                    );
+                    false
+                } else if self.execution.is_finalized(&d.tx_hash) {
+                    tracing::info!(
+                        tx_hash = %d.tx_hash,
+                        "Filtering deferral from proposal: transaction already finalized (TC created)"
+                    );
+                    false
+                } else {
+                    true
+                }
+            })
+            .collect();
+        let aborted = aborted
+            .into_iter()
+            .filter(|a| {
+                if self.execution.is_execution_sealed(&a.tx_hash) {
+                    tracing::info!(
+                        tx_hash = %a.tx_hash,
+                        "Filtering abort from proposal: execution already sealed (EC broadcast)"
+                    );
+                    false
+                } else if self.execution.is_finalized(&a.tx_hash) {
+                    tracing::info!(
+                        tx_hash = %a.tx_hash,
+                        "Filtering abort from proposal: transaction already finalized (TC created)"
+                    );
+                    false
+                } else {
+                    true
+                }
+            })
+            .collect();
+
         ProposalInputs {
             ready_txs,
             deferred,

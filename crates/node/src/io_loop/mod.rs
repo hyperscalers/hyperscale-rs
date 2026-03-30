@@ -958,6 +958,7 @@ where
             // Execution
             exec_cache_entries: exec_mem.cache_entries,
             exec_finalized_certificates: exec_mem.finalized_certificates,
+            exec_execution_sealed: exec_mem.execution_sealed,
             exec_pending_provisioning: exec_mem.pending_provisioning,
             exec_accumulators: exec_mem.accumulators,
             exec_vote_trackers: exec_mem.vote_trackers,
