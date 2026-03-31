@@ -164,26 +164,26 @@ impl CertificateTracker {
                 tracing::warn!(
                     tx_hash = ?self.tx_hash,
                     per_shard = ?per_shard,
-                    "Receipt hash mismatch across shards - cannot create TX certificate"
+                    "Receipt hash mismatch across shards - aborting transaction"
                 );
-                return None;
-            }
-
-            let all_succeeded = self.certificates.values().all(|c| c.is_success());
-            if all_succeeded {
-                tracing::debug!(
-                    tx_hash = ?self.tx_hash,
-                    shards = ?self.certificates.keys().collect::<Vec<_>>(),
-                    "Creating TX certificate - all shards accepted"
-                );
-                TransactionDecision::Accept
+                TransactionDecision::Aborted
             } else {
-                tracing::debug!(
-                    tx_hash = ?self.tx_hash,
-                    shards = ?self.certificates.keys().collect::<Vec<_>>(),
-                    "Creating TX certificate - at least one shard rejected"
-                );
-                TransactionDecision::Reject
+                let all_succeeded = self.certificates.values().all(|c| c.is_success());
+                if all_succeeded {
+                    tracing::debug!(
+                        tx_hash = ?self.tx_hash,
+                        shards = ?self.certificates.keys().collect::<Vec<_>>(),
+                        "Creating TX certificate - all shards accepted"
+                    );
+                    TransactionDecision::Accept
+                } else {
+                    tracing::debug!(
+                        tx_hash = ?self.tx_hash,
+                        shards = ?self.certificates.keys().collect::<Vec<_>>(),
+                        "Creating TX certificate - at least one shard rejected"
+                    );
+                    TransactionDecision::Reject
+                }
             }
         };
 
@@ -249,8 +249,11 @@ mod tests {
         tracker.add_proof(shard1, make_proof(root_b));
 
         assert!(tracker.is_complete());
-        // But can't create certificate due to mismatch
-        assert!(tracker.create_tx_certificate().is_none());
+        // Mismatch produces an Aborted TC so the mempool can clean up
+        let tc = tracker
+            .create_tx_certificate()
+            .expect("should produce TC on mismatch");
+        assert_eq!(tc.decision, TransactionDecision::Aborted);
     }
 
     #[test]
