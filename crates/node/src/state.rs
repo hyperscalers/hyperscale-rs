@@ -598,9 +598,9 @@ impl NodeStateMachine {
         // Livelock: process abort intents/certs, add tombstones, cleanup tracking
         self.livelock.on_block_committed(&block);
 
-        // Abort intents feed the execution accumulator. If execution already
-        // completed, the intent is ignored (first-write-wins).
-        // Also cleans up execution state for each aborted transaction.
+        // Abort intents feed the execution accumulator only — no cleanup,
+        // no mempool state change. The actual terminal state comes when the
+        // TC commits (via on_certificate_committed).
         for intent in &block.abort_intents {
             if let Some(completion) = self
                 .execution
@@ -615,39 +615,6 @@ impl NodeStateMachine {
                     tx_outcomes: completion.tx_outcomes,
                     participating_shards: completion.participating_shards,
                 });
-            }
-            self.execution.cleanup_transaction(&intent.tx_hash);
-        }
-
-        // Cleanup execution state for original transactions superseded by retries.
-        // When a retry T' is committed, the original T's execution state must be
-        // cleaned up so T' can execute fresh. The mempool marks T as Retried and
-        // releases its locks; here we clean up execution tracking.
-        for retry_tx in block.transactions.iter().filter(|tx| tx.is_retry()) {
-            let original_hash = retry_tx.original_hash();
-            // Only cleanup if the original is different from the retry
-            // (original_hash returns self.hash() for non-retries, but retries
-            // are filtered above via is_retry())
-            if original_hash != retry_tx.hash() {
-                // Resolve in execution accumulator before cleanup.
-                // Retried originals are effectively timed out.
-                if let Some(completion) = self.execution.record_abort_intent(
-                    original_hash,
-                    hyperscale_types::AbortReason::ExecutionTimeout {
-                        committed_at: hyperscale_types::BlockHeight(0),
-                    },
-                ) {
-                    actions.push(Action::SignAndBroadcastExecutionVote {
-                        block_hash: completion.block_hash,
-                        block_height: completion.block_height,
-                        wave_id: completion.wave_id,
-                        receipt_root: completion.receipt_root,
-                        tx_count: completion.tx_outcomes.len() as u32,
-                        tx_outcomes: completion.tx_outcomes,
-                        participating_shards: completion.participating_shards,
-                    });
-                }
-                self.execution.cleanup_transaction(&original_hash);
             }
         }
 
