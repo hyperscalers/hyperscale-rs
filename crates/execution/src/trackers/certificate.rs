@@ -99,9 +99,14 @@ impl CertificateTracker {
     ///
     /// Takes ownership of collected certificates to avoid cloning.
     ///
+    /// Decision priority: `Aborted > Reject > Accept`.
+    /// - If any shard has `receipt_hash == Hash::ZERO` (aborted), decision is `Aborted`
+    /// - Otherwise, receipt hashes must agree across all shards
+    /// - If all shards succeeded, decision is `Accept`; otherwise `Reject`
+    ///
     /// Returns `None` if:
     /// - Not all certificates have been collected
-    /// - Certificates have mismatched receipt hashes (Byzantine behavior)
+    /// - Non-aborted certificates have mismatched receipt hashes (Byzantine behavior)
     #[instrument(level = "debug", skip(self), fields(
         tx_hash = %self.tx_hash,
         shard_count = self.certificates.len(),
@@ -117,37 +122,56 @@ impl CertificateTracker {
             return None;
         }
 
-        // Verify all shards agree on receipt hash
-        let per_shard: Vec<_> = self
+        // Abort takes unconditional priority. If any shard aborted (receipt_hash
+        // == ZERO from TxOutcome::to_shard_proof()), the TC decision is Aborted
+        // regardless of what other shards reported.
+        let any_aborted = self
             .certificates
-            .iter()
-            .map(|(s, c)| (*s, c.receipt_hash))
-            .collect();
-        let first_hash = per_shard[0].1;
-        if !per_shard.iter().all(|(_, h)| *h == first_hash) {
-            tracing::warn!(
+            .values()
+            .any(|c| c.receipt_hash == Hash::ZERO);
+
+        let decision = if any_aborted {
+            tracing::debug!(
                 tx_hash = ?self.tx_hash,
-                per_shard = ?per_shard,
-                "Receipt hash mismatch across shards - cannot create TX certificate"
+                shards = ?self.certificates.keys().collect::<Vec<_>>(),
+                "Creating TX certificate with Aborted decision - at least one shard aborted"
             );
-            return None;
-        }
-
-        tracing::debug!(
-            tx_hash = ?self.tx_hash,
-            shards = ?self.certificates.keys().collect::<Vec<_>>(),
-            "Creating TX certificate - all certificates collected and receipt hashes match"
-        );
-
-        // Determine decision first (before moving certificates)
-        let all_succeeded = self.certificates.values().all(|c| c.success);
-        let decision = if all_succeeded {
-            TransactionDecision::Accept
+            TransactionDecision::Aborted
         } else {
-            TransactionDecision::Reject
+            // All shards executed — verify receipt hash agreement
+            let per_shard: Vec<_> = self
+                .certificates
+                .iter()
+                .map(|(s, c)| (*s, c.receipt_hash))
+                .collect();
+            let first_hash = per_shard[0].1;
+            if !per_shard.iter().all(|(_, h)| *h == first_hash) {
+                tracing::warn!(
+                    tx_hash = ?self.tx_hash,
+                    per_shard = ?per_shard,
+                    "Receipt hash mismatch across shards - cannot create TX certificate"
+                );
+                return None;
+            }
+
+            let all_succeeded = self.certificates.values().all(|c| c.success);
+            if all_succeeded {
+                tracing::debug!(
+                    tx_hash = ?self.tx_hash,
+                    shards = ?self.certificates.keys().collect::<Vec<_>>(),
+                    "Creating TX certificate - all shards accepted"
+                );
+                TransactionDecision::Accept
+            } else {
+                tracing::debug!(
+                    tx_hash = ?self.tx_hash,
+                    shards = ?self.certificates.keys().collect::<Vec<_>>(),
+                    "Creating TX certificate - at least one shard rejected"
+                );
+                TransactionDecision::Reject
+            }
         };
 
-        // Take ownership of certificates directly (no wrapping, no cloning!)
         let shard_proofs = std::mem::take(&mut self.certificates);
 
         Some(TransactionCertificate {
