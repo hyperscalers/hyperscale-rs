@@ -111,11 +111,10 @@ pub struct Metrics {
 
     // === Livelock ===
     pub livelock_cycles_detected: Counter,
-    pub livelock_deferrals: Counter,
-    pub livelock_deferred_transactions: Gauge,
+    pub livelock_abort_intents: Counter,
+    pub livelock_pending_abort_intents: Gauge,
 
     // === Lock Contention ===
-    pub lock_contention_deferred: Gauge,
     pub lock_contention_ratio: Gauge,
 
     // === Errors ===
@@ -588,25 +587,19 @@ impl Metrics {
             )
             .unwrap(),
 
-            livelock_deferrals: register_counter!(
-                "hyperscale_livelock_deferrals_total",
-                "Total number of transaction deferrals due to cycle detection"
+            livelock_abort_intents: register_counter!(
+                "hyperscale_livelock_abort_intents_total",
+                "Total number of abort intents committed (livelock cycle or timeout)"
             )
             .unwrap(),
 
-            livelock_deferred_transactions: register_gauge!(
-                "hyperscale_livelock_deferred_transactions",
-                "Current number of deferred transactions awaiting retry"
+            livelock_pending_abort_intents: register_gauge!(
+                "hyperscale_livelock_pending_abort_intents",
+                "Current number of abort intents queued for next block proposal"
             )
             .unwrap(),
 
             // Lock Contention
-            lock_contention_deferred: register_gauge!(
-                "hyperscale_lock_contention_deferred",
-                "Number of transactions currently deferred by lock contention"
-            )
-            .unwrap(),
-
             lock_contention_ratio: register_gauge!(
                 "hyperscale_lock_contention_ratio",
                 "Ratio of deferred transactions to total (0.0 to 1.0)"
@@ -1143,20 +1136,19 @@ impl MetricsRecorder for PrometheusRecorder {
         self.metrics.livelock_cycles_detected.inc();
     }
 
-    fn record_livelock_deferral(&self) {
-        self.metrics.livelock_deferrals.inc();
+    fn record_livelock_abort_intent(&self) {
+        self.metrics.livelock_abort_intents.inc();
     }
 
-    fn set_livelock_deferred_count(&self, count: usize) {
+    fn set_livelock_pending_abort_intents(&self, count: usize) {
         self.metrics
-            .livelock_deferred_transactions
+            .livelock_pending_abort_intents
             .set(count as f64);
     }
 
     // ── Lock Contention ──────────────────────────────────────────────
 
-    fn set_lock_contention(&self, deferred: u64, ratio: f64) {
-        self.metrics.lock_contention_deferred.set(deferred as f64);
+    fn set_lock_contention(&self, ratio: f64) {
         self.metrics.lock_contention_ratio.set(ratio);
     }
 
@@ -1250,10 +1242,6 @@ impl MetricsRecorder for PrometheusRecorder {
             .set(m.mempool_ready as f64);
         self.metrics
             .memory_mempool
-            .with_label_values(&["deferred"])
-            .set(m.mempool_deferred as f64);
-        self.metrics
-            .memory_mempool
             .with_label_values(&["tombstones"])
             .set(m.mempool_tombstones as f64);
         self.metrics
@@ -1268,10 +1256,6 @@ impl MetricsRecorder for PrometheusRecorder {
             .memory_mempool
             .with_label_values(&["in_flight_heights"])
             .set(m.mempool_in_flight_heights as f64);
-        self.metrics
-            .memory_mempool
-            .with_label_values(&["retry_exceeded"])
-            .set(m.mempool_retry_exceeded as f64);
 
         // Remote Headers
         self.metrics
@@ -1320,8 +1304,8 @@ impl MetricsRecorder for PrometheusRecorder {
             .set(m.livelock_pending_proof_fetches as f64);
         self.metrics
             .memory_livelock
-            .with_label_values(&["pending_deferrals"])
-            .set(m.livelock_pending_deferrals as f64);
+            .with_label_values(&["pending_abort_intents"])
+            .set(m.livelock_pending_abort_intents as f64);
         self.metrics
             .memory_livelock
             .with_label_values(&["tracked_txs"])

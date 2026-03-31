@@ -375,11 +375,30 @@ impl std::str::FromStr for AbortReason {
             }
             "livelock" => {
                 // Display format is "livelock(winner: <hash>, source: <shard>)"
-                // FromStr is best-effort for logging/debugging; the proof is not round-tripped.
-                Err(format!(
-                    "livelock abort reasons cannot be parsed from string (proof not serializable): {}",
-                    inner
-                ))
+                // Best-effort parse: recovers winner_tx_hash and source_shard.
+                // The inclusion proof is not round-trippable through strings, so we
+                // use a dummy proof. This is sufficient for status display / logging.
+                let parts: Vec<&str> = inner.splitn(2, ", source: ").collect();
+                if parts.len() != 2 {
+                    return Err(format!("invalid livelock format: {}", inner));
+                }
+                let winner_str = parts[0].strip_prefix("winner: ").ok_or_else(|| {
+                    format!("missing 'winner: ' prefix in livelock reason: {}", inner)
+                })?;
+                let winner_tx_hash = Hash::from_hex(winner_str)
+                    .map_err(|e| format!("invalid winner hash: {}", e))?;
+                let source_shard = parts[1]
+                    .parse::<u64>()
+                    .map_err(|_| format!("invalid source shard: {}", parts[1]))?;
+                Ok(AbortReason::LivelockCycle {
+                    winner_tx_hash,
+                    source_shard: ShardGroupId(source_shard),
+                    source_block_height: BlockHeight(0),
+                    tx_inclusion_proof: TransactionInclusionProof {
+                        siblings: vec![],
+                        leaf_index: 0,
+                    },
+                })
             }
             _ => Err(format!("unknown abort reason: {}", name)),
         }
@@ -505,7 +524,7 @@ pub enum TransactionStatus {
     /// have been applied (if accepted). This is the terminal state - the
     /// transaction can now be safely removed from the mempool.
     ///
-    /// Contains the final decision (Accept/Reject) from execution.
+    /// Contains the final decision (Accept/Reject/Aborted) from execution.
     Completed(TransactionDecision),
 
     /// Transaction was aborted due to timeout or livelock.
@@ -594,7 +613,7 @@ impl TransactionStatus {
             // Executed → Completed (certificate committed in block)
             (Executed { .. }, Completed(_)) => true,
 
-            // Executed → Aborted (execution rejected or timeout)
+            // Executed → Aborted (timeout, livelock, or receipt mismatch)
             (Executed { .. }, Aborted { .. }) => true,
 
             // No other transitions are valid

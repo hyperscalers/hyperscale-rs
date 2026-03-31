@@ -111,7 +111,7 @@ pub struct TransactionStatusResponse {
     /// Block height where committed (if committed).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub committed_height: Option<u64>,
-    /// Final decision (if executed): "accept" or "reject".
+    /// Final decision (if executed): "accept", "reject", or "aborted".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decision: Option<String>,
     /// Error message if status lookup failed.

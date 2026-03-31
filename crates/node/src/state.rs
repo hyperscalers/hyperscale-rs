@@ -277,10 +277,9 @@ impl NodeStateMachine {
             block_height: a.block_height,
         });
         // Combine both sources into a single abort_intents list.
-        let abort_intents: Vec<AbortIntent> = livelock_intents
-            .into_iter()
-            .chain(timed_out_intents)
-            .collect();
+        // Timeouts first: they are cheaper to verify (no inclusion proof) and BFT
+        // dedup keeps the first intent per tx_hash, so timeouts take priority.
+        let abort_intents: Vec<AbortIntent> = timed_out_intents.chain(livelock_intents).collect();
         let certificates = self.execution.get_finalized_certificates();
 
         // Filter out abort intents for transactions that are already finalized
@@ -381,33 +380,7 @@ impl NodeStateMachine {
         // We must count txs/certs in ALL pending blocks to avoid exceeding in-flight limits.
         let (pending_txs, pending_certs) = self.bft.pending_block_tx_cert_counts();
 
-        // Get certificates we're about to propose - these also reduce in-flight
-        let certificates = self.execution.get_finalized_certificates();
-        let new_certs = certificates.len();
-
-        // Request extra transactions to compensate for QC-chain duplicates
-        // that the proposer will filter out, keeping blocks full.
-        let parent_hash = self.bft.proposal_parent_hash();
-        let (_, qc_chain_tx_hashes, _) = self.bft.collect_qc_chain_hashes(parent_hash);
-        let max_txs = self.bft.config().max_transactions_per_block + qc_chain_tx_hashes.len();
-        let ready_txs = self.mempool.ready_transactions(
-            max_txs,
-            pending_txs,               // txs in uncommitted pipeline blocks
-            pending_certs + new_certs, // certs in pipeline + certs we're proposing
-        );
-        let current_height = BlockHeight(self.bft.committed_height() + 1);
-        let livelock_intents = self.livelock.get_pending_abort_intents().to_vec();
-        let timed_out = self
-            .mempool
-            .get_timed_out_transactions(current_height, EXECUTION_TIMEOUT_BLOCKS);
-        let abort_intents: Vec<AbortIntent> = livelock_intents
-            .into_iter()
-            .chain(timed_out.into_iter().map(|a| AbortIntent {
-                tx_hash: a.tx_hash,
-                reason: a.reason,
-                block_height: a.block_height,
-            }))
-            .collect();
+        let inputs = self.gather_proposal_inputs(pending_txs, pending_certs);
 
         // Collect per-certificate Arc<DatabaseUpdates> from execution cache.
         // The closure captures the cache; BftState calls it with the final
@@ -424,9 +397,9 @@ impl NodeStateMachine {
 
         self.bft.on_proposal_timer(
             topology,
-            &ready_txs,
-            abort_intents,
-            certificates,
+            &inputs.ready_txs,
+            inputs.abort_intents,
+            inputs.certificates,
             collect_updates,
         )
     }
@@ -568,8 +541,8 @@ impl NodeStateMachine {
     /// Handle block committed — notify all subsystems in the correct order.
     ///
     /// Order invariants:
-    /// 1. Register cross-shard TXs with livelock BEFORE processing deferrals
-    /// 2. Cleanup deferred/aborted/retried execution state BEFORE passing new TXs
+    /// 1. Register cross-shard TXs with livelock BEFORE processing abort intents
+    /// 2. Process abort intents BEFORE passing new TXs to execution
     /// 3. Process CrossShardTxRegistered continuations BEFORE other exec actions
     fn on_block_committed(&mut self, block_hash: Hash, height: u64, block: Block) -> Vec<Action> {
         let mut actions = Vec::new();
