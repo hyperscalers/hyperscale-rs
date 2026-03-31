@@ -1,6 +1,6 @@
 //! Types for RPC client communication.
 
-use hyperscale_types::{AbortReason, BlockHeight, Hash, TransactionDecision, TransactionStatus};
+use hyperscale_types::{AbortReason, BlockHeight, TransactionDecision, TransactionStatus};
 use serde::{Deserialize, Serialize};
 
 /// Request to submit a transaction.
@@ -71,7 +71,7 @@ pub struct TransactionStatusResponse {
     /// Transaction hash (hex-encoded).
     pub hash: String,
     /// Current status of the transaction.
-    /// Possible values: "pending", "committed", "executed", "completed", "deferred", "retried", "unknown", "error"
+    /// Possible values: "pending", "committed", "executed", "completed", "aborted", "unknown", "error"
     pub status: String,
     /// Block height where committed (if committed).
     #[serde(default)]
@@ -79,12 +79,6 @@ pub struct TransactionStatusResponse {
     /// Final decision (if executed): "accept" or "reject".
     #[serde(default)]
     pub decision: Option<String>,
-    /// Hash of the transaction blocking this one (if deferred).
-    #[serde(default)]
-    pub deferred_by: Option<String>,
-    /// Hash of the retry transaction (if retried).
-    #[serde(default)]
-    pub retry_tx: Option<String>,
     /// Error message if status lookup failed.
     #[serde(default)]
     pub error: Option<String>,
@@ -113,14 +107,6 @@ impl TransactionStatusResponse {
                 committed_at: BlockHeight(self.committed_height.unwrap_or(0)),
             }),
             "completed" => Some(TransactionStatus::Completed(decision()?)),
-            "deferred" => {
-                let hash = Hash::from_hex(self.deferred_by.as_deref()?).ok()?;
-                Some(TransactionStatus::Deferred { by: hash })
-            }
-            "retried" => {
-                let hash = Hash::from_hex(self.retry_tx.as_deref()?).ok()?;
-                Some(TransactionStatus::Retried { new_tx: hash })
-            }
             "aborted" => {
                 // For aborted, we store the reason in error field as a string
                 // Parse it back if possible, otherwise use a generic rejected reason

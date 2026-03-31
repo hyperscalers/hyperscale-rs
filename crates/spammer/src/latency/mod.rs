@@ -2,15 +2,10 @@
 //!
 //! Provides infrastructure for measuring end-to-end transaction latency by
 //! tracking submitted transactions and polling for their completion status.
-//!
-//! When a transaction is retried (e.g., due to conflicts), this tracker follows
-//! the retry chain to the final transaction, measuring latency from the original
-//! submission time to the final completion.
 
 use crate::client::RpcClient;
 use dashmap::DashMap;
 use hdrhistogram::Histogram;
-use hyperscale_types::TransactionStatus;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -51,8 +46,6 @@ pub struct LatencyStats {
     pub failed: AtomicU64,
     /// Number of transactions that timed out (still in-flight at end).
     pub timed_out: AtomicU64,
-    /// Number of retries followed (transactions that were retried).
-    pub retries: AtomicU64,
 }
 
 impl LatencyStats {
@@ -63,7 +56,6 @@ impl LatencyStats {
             completed: self.completed.load(Ordering::Relaxed),
             failed: self.failed.load(Ordering::Relaxed),
             timed_out: self.timed_out.load(Ordering::Relaxed),
-            retries: self.retries.load(Ordering::Relaxed),
         }
     }
 }
@@ -75,7 +67,6 @@ pub struct LatencyStatsSnapshot {
     pub completed: u64,
     pub failed: u64,
     pub timed_out: u64,
-    pub retries: u64,
 }
 
 impl LatencyTracker {
@@ -124,30 +115,6 @@ impl LatencyTracker {
 
                     match client.get_transaction_status(&tx_hash).await {
                         Ok(status_response) => {
-                            // Try to convert to typed status for better handling
-                            let typed_status = status_response.to_status();
-
-                            // Check if this is a retry - follow the new transaction hash
-                            if let Some(TransactionStatus::Retried { new_tx }) = typed_status {
-                                // Atomically update: remove old hash, add new hash with same submit time
-                                // This preserves the original submit time for accurate latency
-                                let new_hash = format!("{}", new_tx);
-
-                                // Remove old and insert new - DashMap operations are lock-free
-                                in_flight.remove(&tx_hash);
-                                in_flight.insert(new_hash.clone(), (submit_time, client_idx));
-
-                                // Atomic increment - no lock needed
-                                stats.retries.fetch_add(1, Ordering::Relaxed);
-
-                                debug!(
-                                    old_hash = %tx_hash,
-                                    new_hash = %new_hash,
-                                    "Following retried transaction"
-                                );
-                                continue;
-                            }
-
                             if status_response.is_terminal() {
                                 let latency = submit_time.elapsed();
                                 let latency_us = latency.as_micros() as u64;
@@ -320,11 +287,6 @@ impl LatencyReport {
         self.stats.timed_out
     }
 
-    /// Number of retries followed.
-    pub fn retries(&self) -> u64 {
-        self.stats.retries
-    }
-
     /// Check if we have any latency measurements.
     pub fn has_measurements(&self) -> bool {
         !self.histogram.is_empty()
@@ -337,7 +299,6 @@ impl LatencyReport {
         println!("Completed: {}", self.stats.completed);
         println!("Failed:    {}", self.stats.failed);
         println!("Timed out: {}", self.stats.timed_out);
-        println!("Retries:   {}", self.stats.retries);
 
         if self.has_measurements() {
             println!();

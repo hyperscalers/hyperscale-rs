@@ -17,9 +17,6 @@ pub struct MetricsCollector {
     /// Rejection count.
     rejections: u64,
 
-    /// Retry count (transactions that entered Retried state).
-    retries: u64,
-
     /// Latency histogram (microseconds).
     latency_histogram: Histogram<u64>,
 
@@ -45,9 +42,6 @@ pub struct MetricsCollector {
     /// Peak locked nodes observed.
     peak_locked_nodes: u64,
 
-    /// Peak deferred transactions observed.
-    peak_deferred: u64,
-
     /// Peak contention ratio observed.
     peak_contention_ratio: f64,
 
@@ -62,7 +56,6 @@ impl MetricsCollector {
             submissions: 0,
             completions: 0,
             rejections: 0,
-            retries: 0,
             latency_histogram: Histogram::new(3).expect("histogram creation should succeed"),
             start_time,
             submission_end_time: None,
@@ -71,7 +64,6 @@ impl MetricsCollector {
             last_sample_time: start_time,
             last_sample_completions: 0,
             peak_locked_nodes: 0,
-            peak_deferred: 0,
             peak_contention_ratio: 0.0,
             in_flight_at_end: 0,
         }
@@ -99,11 +91,6 @@ impl MetricsCollector {
     /// Record a transaction rejection.
     pub fn record_rejection(&mut self) {
         self.rejections += 1;
-    }
-
-    /// Record a transaction retry.
-    pub fn record_retry(&mut self) {
-        self.retries += 1;
     }
 
     /// Set the submission end time for accurate TPS calculation.
@@ -146,9 +133,6 @@ impl MetricsCollector {
         if lock_stats.locked_nodes > self.peak_locked_nodes {
             self.peak_locked_nodes = lock_stats.locked_nodes;
         }
-        if lock_stats.deferred_count > self.peak_deferred {
-            self.peak_deferred = lock_stats.deferred_count;
-        }
         let contention_ratio = lock_stats.contention_ratio();
         if contention_ratio > self.peak_contention_ratio {
             self.peak_contention_ratio = contention_ratio;
@@ -162,7 +146,6 @@ impl MetricsCollector {
             in_flight,
             instant_tps,
             locked_nodes: lock_stats.locked_nodes,
-            deferred_count: lock_stats.deferred_count,
             contention_ratio,
         });
 
@@ -194,7 +177,6 @@ impl MetricsCollector {
             total_submitted: self.submissions,
             total_completed: self.completions,
             total_rejected: self.rejections,
-            total_retries: self.retries,
             in_flight_at_end: self.in_flight_at_end,
             average_tps,
             peak_tps: self.peak_tps,
@@ -203,7 +185,6 @@ impl MetricsCollector {
             submission_duration,
             samples: self.samples,
             peak_locked_nodes: self.peak_locked_nodes,
-            peak_deferred: self.peak_deferred,
             peak_contention_ratio: self.peak_contention_ratio,
         }
     }
@@ -226,8 +207,6 @@ pub struct MetricsSample {
     pub instant_tps: f64,
     /// Number of locked nodes at this point.
     pub locked_nodes: u64,
-    /// Number of deferred transactions at this point.
-    pub deferred_count: u64,
     /// Contention ratio at this point (pending_deferred / pending_count).
     pub contention_ratio: f64,
 }
@@ -240,8 +219,6 @@ pub struct SimulationReport {
     pub total_completed: u64,
     /// Total transactions rejected.
     pub total_rejected: u64,
-    /// Total retries (transactions that entered Retried state).
-    pub total_retries: u64,
     /// Transactions still in-flight at simulation end.
     pub in_flight_at_end: u64,
     /// Average TPS over the submission period.
@@ -258,8 +235,6 @@ pub struct SimulationReport {
     pub samples: Vec<MetricsSample>,
     /// Peak number of locked nodes observed.
     pub peak_locked_nodes: u64,
-    /// Peak number of deferred transactions observed.
-    pub peak_deferred: u64,
     /// Peak contention ratio observed.
     pub peak_contention_ratio: f64,
 }
@@ -316,7 +291,6 @@ impl SimulationReport {
         println!("  Submitted:  {}", self.total_submitted);
         println!("  Completed:  {}", self.total_completed);
         println!("  Rejected:   {}", self.total_rejected);
-        println!("  Retries:    {}", self.total_retries);
         println!("  In-flight:  {} (at cutoff)", self.in_flight_at_end);
         println!();
         println!("Throughput:");
@@ -332,7 +306,6 @@ impl SimulationReport {
         println!();
         println!("Lock Contention (peak):");
         println!("  Locked nodes:     {}", self.peak_locked_nodes);
-        println!("  Deferred txs:      {}", self.peak_deferred);
         println!(
             "  Contention ratio: {:.2}%",
             self.peak_contention_ratio * 100.0

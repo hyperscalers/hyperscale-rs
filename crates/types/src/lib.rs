@@ -92,10 +92,9 @@ pub use signer_bitfield::SignerBitfield;
 pub use state::{ShardExecutionProof, StateEntry, StateProvision};
 pub use topology::{node_id_hash_u64, shard_for_node, TopologySnapshot, TopologySnapshotError};
 pub use transaction::{
-    sign_and_notarize, sign_and_notarize_with_options, AbortIntent, AbortReason, DeferReason,
-    ReadyTransactions, RetryDetails, RoutableTransaction, TransactionAbort, TransactionCertificate,
-    TransactionDecision, TransactionDefer, TransactionError, TransactionStatus,
-    TransactionStatusParseError,
+    sign_and_notarize, sign_and_notarize_with_options, AbortIntent, AbortReason, ReadyTransactions,
+    RoutableTransaction, TransactionAbort, TransactionCertificate, TransactionDecision,
+    TransactionError, TransactionStatus, TransactionStatusParseError,
 };
 pub use validator::{ValidatorInfo, ValidatorSet};
 // Re-export as compute_receipt_root would conflict with block::compute_receipt_root

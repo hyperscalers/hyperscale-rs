@@ -64,10 +64,6 @@ pub struct MempoolConfig {
     /// Set to zero to disable (default).
     #[serde(default = "default_min_dwell_time")]
     pub min_dwell_time: Duration,
-
-    /// Maximum retry attempts before a transaction is aborted.
-    #[serde(default = "default_max_retries")]
-    pub max_retries: u32,
 }
 
 fn default_max_in_flight() -> usize {
@@ -82,17 +78,12 @@ fn default_min_dwell_time() -> Duration {
     DEFAULT_MIN_DWELL_TIME
 }
 
-const fn default_max_retries() -> u32 {
-    3
-}
-
 impl Default for MempoolConfig {
     fn default() -> Self {
         Self {
             max_in_flight: DEFAULT_IN_FLIGHT_LIMIT,
             max_pending: DEFAULT_MAX_PENDING,
             min_dwell_time: DEFAULT_MIN_DWELL_TIME,
-            max_retries: default_max_retries(),
         }
     }
 }
@@ -102,8 +93,6 @@ impl Default for MempoolConfig {
 pub struct LockContentionStats {
     /// Number of nodes currently locked by in-flight transactions.
     pub locked_nodes: u64,
-    /// Number of transactions deferred waiting for a winner to complete.
-    pub deferred_count: u64,
     /// Number of transactions in Pending status.
     pub pending_count: u64,
     /// Number of pending transactions that conflict with locked nodes.
@@ -130,12 +119,10 @@ impl LockContentionStats {
 pub struct MempoolMemoryStats {
     pub pool: usize,
     pub ready: usize,
-    pub deferred: usize,
     pub tombstones: usize,
     pub recently_evicted: usize,
     pub locked_nodes: usize,
     pub in_flight_heights: usize,
-    pub retry_exceeded: usize,
 }
 
 /// Entry in the transaction pool.
@@ -178,38 +165,6 @@ struct ReadyEntry {
 pub struct MempoolState {
     /// Transaction pool sorted by hash (BTreeMap for ordered iteration).
     pool: BTreeMap<Hash, PoolEntry>,
-
-    /// Deferred transactions waiting for their winner to complete.
-    /// Maps: loser_tx_hash -> (loser_tx, winner_tx_hash, deferred_at_height)
-    ///
-    /// When a deferral commits, the loser is added here with status Deferred.
-    /// When the winner's certificate commits, we create a retry.
-    /// The deferred_at_height enables cleanup of stale entries.
-    deferred_by: HashMap<Hash, (Arc<RoutableTransaction>, Hash, BlockHeight)>,
-
-    /// Reverse index: winner_tx_hash -> Vec<loser_tx_hash>
-    /// Allows O(1) lookup of all losers deferred by a winner.
-    deferred_losers_by_winner: HashMap<Hash, Vec<Hash>>,
-
-    /// Pending deferrals for transactions not yet in the pool.
-    /// This handles sync scenarios where a deferral references a transaction
-    /// from an earlier block that hasn't been added to the pool yet.
-    /// Maps: loser_tx_hash -> (winner_tx_hash, block_height)
-    pending_deferrals: HashMap<Hash, (Hash, BlockHeight)>,
-
-    /// Pending retries for transactions not yet in the pool.
-    /// This handles sync scenarios where the winner's certificate arrives
-    /// before the deferred loser transaction. When the loser arrives,
-    /// we immediately create the retry.
-    /// Maps: loser_tx_hash -> (winner_tx_hash, cert_height)
-    pending_retries: HashMap<Hash, (Hash, BlockHeight)>,
-
-    /// Completed winners whose certificates have been committed.
-    /// Used to handle the race condition where a deferral arrives after
-    /// the winner has already completed. When a deferral references a
-    /// winner in this set, we immediately create the retry.
-    /// Maps: winner_tx_hash -> cert_height
-    completed_winners: HashMap<Hash, BlockHeight>,
 
     /// Tombstones for transactions that have reached terminal states.
     /// Prevents re-adding completed/aborted/retried transactions via gossip.
@@ -265,10 +220,6 @@ pub struct MempoolState {
     /// Enables efficient timeout scanning: only entries at old heights are checked.
     in_flight_by_height: BTreeMap<BlockHeight, Vec<Hash>>,
 
-    /// Transactions that have exceeded the maximum retry count.
-    /// Populated at retry creation time, drained during `get_timed_out_transactions`.
-    retry_exceeded: Vec<TransactionAbort>,
-
     /// Current time.
     now: Duration,
 
@@ -286,7 +237,7 @@ impl std::fmt::Debug for MempoolState {
             .field("ready", &self.ready.len())
             .field("deferred_by_nodes", &self.deferred_by_nodes.len())
             .field("in_flight", &self.in_flight())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -306,11 +257,6 @@ impl MempoolState {
     pub fn with_config(config: MempoolConfig) -> Self {
         Self {
             pool: BTreeMap::new(),
-            deferred_by: HashMap::new(),
-            deferred_losers_by_winner: HashMap::new(),
-            pending_deferrals: HashMap::new(),
-            pending_retries: HashMap::new(),
-            completed_winners: HashMap::new(),
             tombstones: HashMap::new(),
             recently_evicted: HashMap::new(),
             locked_nodes_cache: HashSet::new(),
@@ -321,7 +267,6 @@ impl MempoolState {
             txs_deferred_by_node: HashMap::new(),
             ready_txs_by_node: HashMap::new(),
             in_flight_by_height: BTreeMap::new(),
-            retry_exceeded: Vec::new(),
             now: Duration::ZERO,
             current_height: BlockHeight(0),
             config,
@@ -353,7 +298,7 @@ impl MempoolState {
             }];
         }
 
-        // Reject if tombstoned (already completed/aborted/retried)
+        // Reject if tombstoned (already completed/aborted)
         if self.is_tombstoned(&hash) {
             tracing::debug!(tx_hash = ?hash, "Rejecting tombstoned transaction submission");
             return vec![];
@@ -373,7 +318,6 @@ impl MempoolState {
 
         // Add to ready tracking
         self.add_to_ready_tracking(hash, &tx, cross_shard, self.now);
-        self.check_retry_exceeded(hash, &tx);
 
         tracing::info!(tx_hash = ?hash, pool_size = self.pool.len(), "Transaction added to mempool via submit");
 
@@ -403,7 +347,7 @@ impl MempoolState {
     ) -> Vec<Action> {
         let hash = tx.hash();
 
-        // Ignore if already have it or if tombstoned (completed/aborted/retried)
+        // Ignore if already have it or if tombstoned (completed/aborted)
         if self.pool.contains_key(&hash) || self.is_tombstoned(&hash) {
             return vec![];
         }
@@ -422,34 +366,12 @@ impl MempoolState {
 
         // Add to ready tracking
         self.add_to_ready_tracking(hash, &tx, cross_shard, self.now);
-        self.check_retry_exceeded(hash, &tx);
 
         tracing::debug!(tx_hash = ?hash, pool_size = self.pool.len(), "Transaction added to mempool via gossip");
 
         // No events emitted — gossip acceptance is silent to avoid flooding
         // the consensus channel under high transaction load.
         vec![]
-    }
-
-    /// Broadcast a transaction to all shards involved in it.
-    ///
-    /// Uses topology to determine which shards need to receive the transaction
-    /// based on its declared reads and writes.
-    fn broadcast_to_transaction_shards(
-        &self,
-        topology: &TopologySnapshot,
-        tx: &Arc<RoutableTransaction>,
-    ) -> Vec<Action> {
-        let shards = topology.all_shards_for_transaction(tx.as_ref());
-        let gossip = hyperscale_messages::TransactionGossip::from_arc(Arc::clone(tx));
-
-        shards
-            .into_iter()
-            .map(|shard| Action::BroadcastTransaction {
-                shard,
-                gossip: Box::new(gossip.clone()),
-            })
-            .collect()
     }
 
     /// Evict a transaction that has reached a terminal state.
@@ -462,7 +384,6 @@ impl MempoolState {
     /// being re-added via gossip. Terminal states include:
     /// - Completed (certificate committed)
     /// - Aborted (explicitly aborted)
-    /// - Retried (replaced by a new transaction)
     fn evict_terminal(&mut self, tx_hash: Hash) {
         // Remove locked nodes and update counters if this transaction was holding locks
         let info_to_unlock = self.pool.get(&tx_hash).and_then(|entry| {
@@ -521,13 +442,12 @@ impl MempoolState {
             .retain(|_, (_, height)| height.0 > cutoff);
     }
 
-    /// Process a committed block - update statuses and trigger retries.
+    /// Process a committed block - update statuses and finalize transactions.
     ///
     /// This handles:
     /// 1. Mark committed transactions
-    /// 2. Process deferrals → update status to Deferred
-    /// 3. Process certificates → mark completed, trigger retries for deferred TXs
-    /// 4. Process aborts → update status to terminal
+    /// 2. Process certificates → mark completed
+    /// 3. Process aborts → update status to terminal
     #[instrument(skip(self, block), fields(
         height = block.header.height.0,
         tx_count = block.transaction_count()
@@ -540,7 +460,6 @@ impl MempoolState {
         let height = block.header.height;
         let mut actions = Vec::new();
 
-        // Track current height for retry creation
         self.current_height = height;
 
         // Prune old entries from recently_evicted cache
@@ -549,7 +468,7 @@ impl MempoolState {
         // Ensure all committed transactions are in the mempool.
         // This handles the case where we fetched transactions to vote on a block
         // but didn't receive them via gossip. We need them in the mempool for
-        // status tracking (deferrals, retries, execution status updates).
+        // status tracking (execution status updates).
         for tx in block.transactions.iter() {
             let hash = tx.hash();
             if !self.pool.contains_key(&hash) {
@@ -623,7 +542,7 @@ impl MempoolState {
 
     /// Handle a certificate committed in a block.
     ///
-    /// Marks the transaction as completed and triggers retries for any TXs deferred by it.
+    /// Marks the transaction as completed (terminal state).
     fn on_certificate_committed(
         &mut self,
         _topology: &TopologySnapshot,
@@ -695,11 +614,10 @@ impl MempoolState {
     /// Mark a transaction as executed (execution complete, certificate created).
     ///
     /// Called when ExecutionState creates a TransactionCertificate.
-    /// Also triggers retries for any transactions deferred by this winner.
     #[instrument(skip(self), fields(tx_hash = ?tx_hash, accepted = accepted))]
     pub fn on_transaction_executed(
         &mut self,
-        topology: &TopologySnapshot,
+        _topology: &TopologySnapshot,
         tx_hash: Hash,
         accepted: bool,
     ) -> Vec<Action> {
@@ -744,82 +662,6 @@ impl MempoolState {
                 cross_shard,
                 submitted_locally,
             });
-        }
-
-        // Check if any deferred transactions were waiting for this winner to complete.
-        // This triggers retries immediately when the winner executes, rather than
-        // waiting for the certificate to be committed in a block.
-        // Using reverse index for O(1) lookup
-        let loser_hashes = self
-            .deferred_losers_by_winner
-            .remove(&tx_hash)
-            .unwrap_or_default();
-
-        let height = self.current_height;
-        for loser_hash in loser_hashes {
-            // Get the loser transaction from deferred_by
-            let Some((loser_tx, winner_hash, _deferred_at)) = self.deferred_by.remove(&loser_hash)
-            else {
-                continue;
-            };
-            // Create retry transaction
-            let retry_tx = loser_tx.create_retry(winner_hash, height);
-            let retry_hash = retry_tx.hash();
-
-            tracing::info!(
-                original = %loser_hash,
-                retry = %retry_hash,
-                winner = %winner_hash,
-                retry_count = retry_tx.retry_count(),
-                "Creating retry for deferred transaction (winner finalized)"
-            );
-
-            // Update original's status to Retried and evict
-            if let Some(entry) = self.pool.get(&loser_hash) {
-                let added_at = entry.added_at;
-                let cross_shard = entry.cross_shard;
-                let submitted_locally = entry.submitted_locally;
-                actions.push(Action::EmitTransactionStatus {
-                    tx_hash: loser_hash,
-                    status: TransactionStatus::Retried { new_tx: retry_hash },
-                    added_at,
-                    cross_shard,
-                    submitted_locally,
-                });
-                // Evict from pool and tombstone - terminal state
-                self.evict_terminal(loser_hash);
-            }
-
-            // Add retry to mempool if not already present (dedup by hash)
-            if !self.pool.contains_key(&retry_hash) && !self.is_tombstoned(&retry_hash) {
-                let retry_tx = Arc::new(retry_tx);
-                let cross_shard = retry_tx.is_cross_shard(topology.num_shards());
-                self.pool.insert(
-                    retry_hash,
-                    PoolEntry {
-                        tx: Arc::clone(&retry_tx),
-                        status: TransactionStatus::Pending,
-                        added_at: self.now,
-                        cross_shard,
-                        submitted_locally: false, // System-generated retry
-                    },
-                );
-
-                // Add to ready tracking
-                self.add_to_ready_tracking(retry_hash, &retry_tx, cross_shard, self.now);
-
-                // Emit status for retry transaction
-                actions.push(Action::EmitTransactionStatus {
-                    tx_hash: retry_hash,
-                    status: TransactionStatus::Pending,
-                    added_at: self.now,
-                    cross_shard,
-                    submitted_locally: false,
-                });
-
-                // Gossip the retry to relevant shards
-                actions.extend(self.broadcast_to_transaction_shards(topology, &retry_tx));
-            }
         }
 
         actions
@@ -972,23 +814,10 @@ impl MempoolState {
         }
     }
 
-    /// Flag a transaction for abort if it exceeds the maximum retry count.
-    fn check_retry_exceeded(&mut self, hash: Hash, tx: &RoutableTransaction) {
-        if tx.exceeds_max_retries(self.config.max_retries) {
-            self.retry_exceeded.push(TransactionAbort {
-                tx_hash: hash,
-                reason: AbortReason::ExecutionTimeout {
-                    committed_at: BlockHeight(0),
-                },
-                block_height: BlockHeight(0),
-            });
-        }
-    }
-
     /// Remove a transaction's nodes from the locked set.
     /// Called when a transaction transitions FROM a lock-holding state (evicted).
     ///
-    /// Also promotes any deferred transactions that were waiting on these nodes.
+    /// Also promotes any blocked transactions that were waiting on these nodes.
     fn remove_locked_nodes(&mut self, tx: &RoutableTransaction) {
         for node in tx.all_declared_nodes() {
             if self.locked_nodes_cache.remove(node) {
@@ -1019,28 +848,13 @@ impl MempoolState {
         // transactions OR already claimed by another transaction in the ready set.
         // The ready-set check prevents conflicting transactions from being proposed
         // in the same block.
-        let mut blocking_nodes: HashSet<NodeId> = tx
+        let blocking_nodes: HashSet<NodeId> = tx
             .all_declared_nodes()
             .filter(|node| {
                 self.locked_nodes_cache.contains(node) || self.ready_txs_by_node.contains_key(node)
             })
             .copied()
             .collect();
-
-        // Special case: retry transactions are not blocked by their original's locks.
-        // When a retry T' arrives (e.g., via gossip from a shard that created the retry),
-        // it should supersede T. The locks T holds should not block T'.
-        if !blocking_nodes.is_empty() && tx.is_retry() {
-            let original_hash = tx.original_hash();
-            if let Some(original_entry) = self.pool.get(&original_hash) {
-                if original_entry.status.holds_state_lock() {
-                    // Remove the original's nodes from blocking_nodes - they don't block the retry
-                    let original_nodes: HashSet<NodeId> =
-                        original_entry.tx.all_declared_nodes().copied().collect();
-                    blocking_nodes.retain(|node| !original_nodes.contains(node));
-                }
-            }
-        }
 
         if !blocking_nodes.is_empty() {
             // Transaction is deferred by one or more locked nodes
@@ -1279,7 +1093,6 @@ impl MempoolState {
     ///
     /// Returns counts of:
     /// - `locked_nodes`: Number of nodes currently locked by in-flight transactions
-    /// - `deferred_count`: Number of transactions deferred waiting for a winner
     /// - `pending_count`: Number of transactions in Pending status
     /// - `pending_deferred`: Number of pending transactions that conflict with locked nodes
     /// - `committed_count`: Number of transactions in Committed status
@@ -1288,7 +1101,6 @@ impl MempoolState {
     /// All stats are O(1) via cached counters and ready sets.
     pub fn lock_contention_stats(&self) -> LockContentionStats {
         let locked_nodes = self.locked_nodes_cache.len() as u64;
-        let deferred_count = self.deferred_by.len() as u64;
 
         // Pending counts are O(1) from ready set
         let ready_count = self.ready.len();
@@ -1297,7 +1109,6 @@ impl MempoolState {
 
         LockContentionStats {
             locked_nodes,
-            deferred_count,
             pending_count,
             pending_deferred,
             committed_count: self.committed_count as u64,
@@ -1379,12 +1190,10 @@ impl MempoolState {
         MempoolMemoryStats {
             pool: self.pool.len(),
             ready: self.ready.len(),
-            deferred: self.deferred_by.len(),
             tombstones: self.tombstones.len(),
             recently_evicted: self.recently_evicted.len(),
             locked_nodes: self.locked_nodes_cache.len(),
             in_flight_heights: self.in_flight_by_height.len(),
-            retry_exceeded: self.retry_exceeded.len(),
         }
     }
 
@@ -1427,7 +1236,6 @@ impl MempoolState {
     /// # Parameters
     /// - `current_height`: The current block height
     /// - `timeout_blocks`: Number of blocks after which a TX is considered timed out
-    /// - `max_retries`: Maximum retry count before aborting
     pub fn get_timed_out_transactions(
         &mut self,
         current_height: BlockHeight,
@@ -1467,9 +1275,6 @@ impl MempoolState {
             }
         }
 
-        // Drain retry-exceeded flags (accumulated at retry creation time)
-        aborts.append(&mut self.retry_exceeded);
-
         aborts
     }
 
@@ -1494,57 +1299,6 @@ impl MempoolState {
         let before_count = self.tombstones.len();
 
         self.tombstones.retain(|_, height| height.0 > cutoff);
-
-        // Also clean up completed_winners using the same retention policy
-        self.completed_winners.retain(|_, height| height.0 > cutoff);
-
-        // Clean up pending_deferrals - these are waiting for a transaction that
-        // hasn't arrived yet. If it's been too long, the transaction is likely
-        // never coming and we should clean up to prevent unbounded growth.
-        let before_deferrals = self.pending_deferrals.len();
-        self.pending_deferrals
-            .retain(|_, (_, height)| height.0 > cutoff);
-        let cleaned_deferrals = before_deferrals - self.pending_deferrals.len();
-
-        // Clean up pending_retries - these are waiting for a loser transaction
-        // to arrive so we can create a retry. Same cleanup logic applies.
-        let before_retries = self.pending_retries.len();
-        self.pending_retries
-            .retain(|_, (_, height)| height.0 > cutoff);
-        let cleaned_retries = before_retries - self.pending_retries.len();
-
-        // Clean up deferred_by - these are transactions waiting for their winner to
-        // complete. If it's been too long, the winner is likely never completing.
-        let before_deferred = self.deferred_by.len();
-        let stale_deferred: Vec<Hash> = self
-            .deferred_by
-            .iter()
-            .filter(|(_, (_, _, deferred_at))| deferred_at.0 <= cutoff)
-            .map(|(hash, _)| *hash)
-            .collect();
-
-        for loser_hash in &stale_deferred {
-            if let Some((_, winner_hash, _)) = self.deferred_by.remove(loser_hash) {
-                // Also clean up the reverse index
-                if let Some(losers) = self.deferred_losers_by_winner.get_mut(&winner_hash) {
-                    losers.retain(|h| h != loser_hash);
-                    if losers.is_empty() {
-                        self.deferred_losers_by_winner.remove(&winner_hash);
-                    }
-                }
-            }
-        }
-        let cleaned_deferred = before_deferred - self.deferred_by.len();
-
-        if cleaned_deferrals > 0 || cleaned_retries > 0 || cleaned_deferred > 0 {
-            tracing::debug!(
-                cleaned_deferrals,
-                cleaned_retries,
-                cleaned_deferred,
-                cutoff_height = cutoff,
-                "Cleaned up stale pending deferrals/retries/deferred"
-            );
-        }
 
         before_count - self.tombstones.len()
     }
@@ -1729,29 +1483,6 @@ mod tests {
             mempool.status(&tx_hash).is_none(),
             "Transaction should be evicted from pool after Aborted"
         );
-    }
-
-    #[test]
-    fn test_retry_has_different_hash() {
-        let tx = test_transaction(1);
-        let original_hash = tx.hash();
-
-        let retry = tx.create_retry(Hash::from_bytes(b"winner"), BlockHeight(5));
-        let retry_hash = retry.hash();
-
-        // Retry must have different hash
-        assert_ne!(
-            original_hash, retry_hash,
-            "Retry must have different hash from original"
-        );
-
-        // But same underlying transaction content (declared reads/writes are fields)
-        assert_eq!(tx.declared_reads, retry.declared_reads);
-        assert_eq!(tx.declared_writes, retry.declared_writes);
-
-        // Retry knows its original
-        assert_eq!(retry.original_hash(), original_hash);
-        assert_eq!(retry.retry_count(), 1);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -1971,7 +1702,6 @@ mod tests {
             max_in_flight: limit,
             max_pending: DEFAULT_MAX_PENDING,
             min_dwell_time: Duration::ZERO,
-            max_retries: default_max_retries(),
         }
     }
 

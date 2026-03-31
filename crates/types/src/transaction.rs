@@ -23,12 +23,6 @@ pub struct RoutableTransaction {
     /// NodeIds that this transaction writes to.
     pub declared_writes: Vec<NodeId>,
 
-    /// Retry details if this is a retry of a deferred transaction.
-    ///
-    /// When a transaction is deferred due to a cross-shard cycle, it is retried
-    /// with the same payload but different retry_details, giving it a new hash.
-    pub retry_details: Option<RetryDetails>,
-
     /// Cached hash (computed on first access).
     hash: Hash,
 
@@ -39,7 +33,7 @@ pub struct RoutableTransaction {
     /// - Computing transaction merkle roots for block headers
     /// - Re-encoding for network transmission
     ///
-    /// The hash is computed from these bytes (plus retry_details if present).
+    /// The hash is computed from these bytes.
     serialized_bytes: Vec<u8>,
 
     /// Cached validated transaction (computed on first validation).
@@ -65,7 +59,6 @@ impl Clone for RoutableTransaction {
             transaction: self.transaction.clone(),
             declared_reads: self.declared_reads.clone(),
             declared_writes: self.declared_writes.clone(),
-            retry_details: self.retry_details.clone(),
             hash: self.hash,
             serialized_bytes: self.serialized_bytes.clone(),
             validated: OnceLock::new(), // Don't clone cache - will be recomputed if needed
@@ -80,7 +73,6 @@ impl std::fmt::Debug for RoutableTransaction {
             .field("hash", &self.hash)
             .field("declared_reads", &self.declared_reads)
             .field("declared_writes", &self.declared_writes)
-            .field("retry_details", &self.retry_details)
             .finish_non_exhaustive()
     }
 }
@@ -92,38 +84,20 @@ impl RoutableTransaction {
         declared_reads: Vec<NodeId>,
         declared_writes: Vec<NodeId>,
     ) -> Self {
-        Self::new_internal(transaction, declared_reads, declared_writes, None)
-    }
-
-    /// Internal constructor that handles retry_details.
-    fn new_internal(
-        transaction: UserTransaction,
-        declared_reads: Vec<NodeId>,
-        declared_writes: Vec<NodeId>,
-        retry_details: Option<RetryDetails>,
-    ) -> Self {
         // Serialize the transaction payload - we keep these bytes for:
         // 1. Computing the hash (below)
         // 2. Efficient re-encoding for network/merkle (via serialized_bytes())
         let payload = manifest_encode(&transaction).expect("transaction should be encodable");
 
-        // Hash includes transaction payload AND retry_details (if present)
-        // This ensures retries have different hashes than originals
+        // Hash the transaction payload directly
         let mut hasher = blake3::Hasher::new();
         hasher.update(&payload);
-
-        // Include retry_details in hash if present
-        if let Some(details) = &retry_details {
-            hasher.update(&details.to_hash_bytes());
-        }
-
         let hash = Hash::from_hash_bytes(hasher.finalize().as_bytes());
 
         Self {
             transaction,
             declared_reads,
             declared_writes,
-            retry_details,
             hash,
             serialized_bytes: payload,
             validated: OnceLock::new(),
@@ -208,53 +182,6 @@ impl RoutableTransaction {
             .iter()
             .chain(self.declared_writes.iter())
     }
-
-    /// Create a retry of this transaction.
-    ///
-    /// The retry has the same underlying transaction and declared nodes,
-    /// but different retry_details (and therefore a different hash).
-    pub fn create_retry(&self, deferred_by: Hash, deferred_at: BlockHeight) -> Self {
-        let details = match &self.retry_details {
-            Some(existing) => existing.next_retry(deferred_by, deferred_at),
-            None => RetryDetails::first_retry(self.hash(), deferred_by, deferred_at),
-        };
-
-        Self::new_internal(
-            self.transaction.clone(),
-            self.declared_reads.clone(),
-            self.declared_writes.clone(),
-            Some(details),
-        )
-    }
-
-    /// Get the original transaction hash (before any retries).
-    ///
-    /// If this is a retry, returns the original_tx_hash from retry_details.
-    /// If this is not a retry, returns this transaction's hash.
-    pub fn original_hash(&self) -> Hash {
-        self.retry_details
-            .as_ref()
-            .map(|d| d.original_tx_hash)
-            .unwrap_or_else(|| self.hash())
-    }
-
-    /// Get the retry count (0 if this is not a retry).
-    pub fn retry_count(&self) -> u32 {
-        self.retry_details
-            .as_ref()
-            .map(|d| d.retry_count)
-            .unwrap_or(0)
-    }
-
-    /// Check if this transaction has exceeded the maximum retry limit.
-    pub fn exceeds_max_retries(&self, max_retries: u32) -> bool {
-        self.retry_count() >= max_retries
-    }
-
-    /// Check if this is a retry transaction.
-    pub fn is_retry(&self) -> bool {
-        self.retry_details.is_some()
-    }
 }
 
 // ============================================================================
@@ -269,7 +196,7 @@ impl<E: sbor::Encoder<sbor::NoCustomValueKind>> sbor::Encode<sbor::NoCustomValue
     }
 
     fn encode_body(&self, encoder: &mut E) -> Result<(), sbor::EncodeError> {
-        encoder.write_size(5)?; // 5 fields
+        encoder.write_size(4)?; // 4 fields
 
         // Encode hash as [u8; 32]
         let hash_bytes: [u8; 32] = *self.hash.as_bytes();
@@ -283,9 +210,6 @@ impl<E: sbor::Encoder<sbor::NoCustomValueKind>> sbor::Encode<sbor::NoCustomValue
 
         // Encode declared_writes
         encoder.encode(&self.declared_writes)?;
-
-        // Encode retry_details
-        encoder.encode(&self.retry_details)?;
 
         Ok(())
     }
@@ -301,9 +225,9 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
         decoder.check_preloaded_value_kind(value_kind, sbor::ValueKind::Tuple)?;
         let length = decoder.read_size()?;
 
-        if length != 5 {
+        if length != 4 {
             return Err(sbor::DecodeError::UnexpectedSize {
-                expected: 5,
+                expected: 4,
                 actual: length,
             });
         }
@@ -323,15 +247,11 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
         // Decode declared_writes
         let declared_writes: Vec<NodeId> = decoder.decode()?;
 
-        // Decode retry_details
-        let retry_details: Option<RetryDetails> = decoder.decode()?;
-
         Ok(Self {
             hash,
             transaction,
             declared_reads,
             declared_writes,
-            retry_details,
             serialized_bytes: tx_bytes,
             validated: OnceLock::new(),
         })
@@ -371,65 +291,6 @@ pub enum TransactionDecision {
 // ============================================================================
 // Livelock Prevention Types
 // ============================================================================
-
-/// Reason a transaction was deferred during cross-shard execution.
-///
-/// Used in `TransactionDefer` to explain why a transaction was temporarily
-/// deferred and will be retried later.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, BasicSbor)]
-pub enum DeferReason {
-    /// Transaction was part of a bidirectional cross-shard cycle.
-    ///
-    /// When two transactions form a cycle (A provisions to B while B provisions
-    /// to A), the transaction with the higher hash loses and is deferred.
-    /// The winner continues, and once complete, the loser is retried.
-    LivelockCycle {
-        /// Hash of the transaction that won the cycle (lower hash wins).
-        winner_tx_hash: Hash,
-    },
-}
-
-impl std::fmt::Display for DeferReason {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            DeferReason::LivelockCycle { winner_tx_hash } => {
-                write!(f, "LivelockCycle(winner: {})", winner_tx_hash)
-            }
-        }
-    }
-}
-
-/// A transaction deferral included in a block.
-///
-/// When a proposer detects that a transaction should be deferred (via cycle
-/// detection during provisioning), they include this in the block. All
-/// validators process it identically, releasing locks and queuing for retry.
-///
-/// The deferral proves the winner transaction's inclusion in a committed
-/// remote block via a lightweight merkle inclusion proof (~320 bytes) verified
-/// against the block header's `transaction_root` (which is QC-attested).
-#[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
-pub struct TransactionDefer {
-    /// Hash of the transaction being deferred.
-    pub tx_hash: Hash,
-
-    /// Why the transaction was deferred.
-    pub reason: DeferReason,
-
-    /// Block height where this deferral is being committed.
-    /// Used for timeout calculations on the retry.
-    pub block_height: BlockHeight,
-
-    /// Source shard where the winner transaction was committed.
-    pub source_shard: ShardGroupId,
-
-    /// Block height on the source shard where the winner was committed.
-    pub source_block_height: BlockHeight,
-
-    /// Merkle inclusion proof for the winner transaction in the source block.
-    /// Verified against the source block header's `transaction_root`.
-    pub tx_inclusion_proof: TransactionInclusionProof,
-}
 
 /// Reason a transaction was aborted.
 ///
@@ -579,67 +440,6 @@ pub struct AbortIntent {
     pub block_height: BlockHeight,
 }
 
-/// Details for a retry transaction created after deferral.
-///
-/// When a transaction is deferred due to a livelock cycle, a retry is created
-/// with the same payload but a new hash (incorporating retry details).
-/// This struct captures the lineage of the retry.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, BasicSbor)]
-pub struct RetryDetails {
-    /// Hash of the original transaction that was deferred.
-    pub original_tx_hash: Hash,
-
-    /// Which retry attempt this is (1 = first retry, 2 = second, etc.).
-    pub retry_count: u32,
-
-    /// Hash of the transaction that caused the deferral (the cycle winner).
-    pub deferred_by: Hash,
-
-    /// Block height where the deferral was committed.
-    pub deferred_at: BlockHeight,
-}
-
-impl RetryDetails {
-    /// Create details for the first retry of a transaction.
-    pub fn first_retry(
-        original_tx_hash: Hash,
-        deferred_by: Hash,
-        deferred_at: BlockHeight,
-    ) -> Self {
-        Self {
-            original_tx_hash,
-            retry_count: 1,
-            deferred_by,
-            deferred_at,
-        }
-    }
-
-    /// Create details for a subsequent retry (bumping retry_count).
-    pub fn next_retry(&self, deferred_by: Hash, deferred_at: BlockHeight) -> Self {
-        Self {
-            original_tx_hash: self.original_tx_hash,
-            retry_count: self.retry_count + 1,
-            deferred_by,
-            deferred_at,
-        }
-    }
-
-    /// Compute the additional bytes to include when hashing a retry transaction.
-    ///
-    /// The retry transaction hash = hash(original_payload || retry_details_bytes).
-    /// This ensures each retry has a unique hash while maintaining a clear
-    /// relationship to the original transaction.
-    pub fn to_hash_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(b"RETRY:");
-        bytes.extend_from_slice(self.original_tx_hash.as_bytes());
-        bytes.extend_from_slice(&self.retry_count.to_le_bytes());
-        bytes.extend_from_slice(self.deferred_by.as_bytes());
-        bytes.extend_from_slice(&self.deferred_at.0.to_le_bytes());
-        bytes
-    }
-}
-
 /// Transaction status for lifecycle tracking.
 ///
 /// Transactions progress through these states:
@@ -649,29 +449,19 @@ impl RetryDetails {
 /// Pending → Committed → Executed → Completed
 /// ```
 ///
-/// **Cross-Shard with Conflict (Livelock Prevention)**:
-/// ```text
-/// Pending → Committed → [conflict detected] → Deferred(by: winner)
-///                                                      ↓
-///                       [winner completes] → Retried(new_tx: retry_hash)
-/// ```
-///
 /// # State Descriptions
 ///
 /// - **Pending**: Transaction has been submitted but not yet included in a committed block
 /// - **Committed**: Block containing transaction has been committed; execution is in progress
 /// - **Executed**: Execution complete, certificate created (state NOT yet updated - waiting for block)
 /// - **Completed**: Certificate committed in block, state updated, transaction done
-/// - **Deferred**: Transaction was deferred due to cross-shard conflict, waiting for winner
-/// - **Retried**: Transaction was superseded by a retry transaction (terminal)
 ///
 /// # Note on Intermediate States
 ///
 /// The execution state machine internally tracks finer-grained progress (provisioning,
 /// executing, collecting votes/certificates), but the mempool only needs to know:
 /// - Is the transaction holding state locks? (Committed, Executed)
-/// - Is it done? (Completed, Retried)
-/// - Is it deferred? (Deferred)
+/// - Is it done? (Completed, Aborted)
 #[derive(Debug, Clone, PartialEq, Eq, Hash, BasicSbor)]
 pub enum TransactionStatus {
     /// Transaction submitted, waiting to be included in a block.
@@ -681,7 +471,7 @@ pub enum TransactionStatus {
     ///
     /// The transaction is now being executed. This state holds locks on all
     /// declared nodes until execution completes (Executed) or the transaction
-    /// is deferred (Deferred/Retried).
+    /// is aborted.
     ///
     /// For cross-shard transactions, this encompasses:
     /// - State provisioning (collecting state from other shards)
@@ -718,27 +508,7 @@ pub enum TransactionStatus {
     /// Contains the final decision (Accept/Reject) from execution.
     Completed(TransactionDecision),
 
-    /// Transaction was deferred due to a cross-shard cycle.
-    ///
-    /// The transaction had a lower-hash transaction conflict with it across shards.
-    /// It is waiting for the winning transaction to complete before being retried.
-    /// This status does NOT hold state locks - locks are released when entering this state.
-    Deferred {
-        /// Hash of the winning transaction we're waiting for.
-        by: Hash,
-    },
-
-    /// Transaction has been superseded by a retry transaction.
-    ///
-    /// This is a terminal state for the original TX - it will never execute.
-    /// The new transaction (`new_tx`) has the same payload but a different hash.
-    /// This status does NOT hold state locks.
-    Retried {
-        /// Hash of the retry transaction that supersedes this one.
-        new_tx: Hash,
-    },
-
-    /// Transaction was aborted due to timeout or too many retries.
+    /// Transaction was aborted due to timeout or livelock.
     ///
     /// This is a terminal state - the transaction will not be retried again.
     /// This status does NOT hold state locks.
@@ -753,14 +523,11 @@ impl TransactionStatus {
     ///
     /// Terminal states:
     /// - `Completed`: Transaction executed and certificate committed
-    /// - `Retried`: Transaction was superseded by a retry (original will never execute)
-    /// - `Aborted`: Transaction was aborted due to timeout or too many retries
+    /// - `Aborted`: Transaction was aborted due to timeout or livelock
     pub fn is_final(&self) -> bool {
         matches!(
             self,
-            TransactionStatus::Completed(_)
-                | TransactionStatus::Retried { .. }
-                | TransactionStatus::Aborted { .. }
+            TransactionStatus::Completed(_) | TransactionStatus::Aborted { .. }
         )
     }
 
@@ -775,7 +542,7 @@ impl TransactionStatus {
     ///
     /// State locks are acquired when a transaction is committed in a block and
     /// released when the TransactionCertificate is committed in a block (Completed),
-    /// or when the transaction is deferred (Deferred/Retried).
+    /// or when the transaction is aborted.
     ///
     /// The lock prevents conflicting transactions from being selected for blocks
     /// while this transaction is being executed.
@@ -783,8 +550,6 @@ impl TransactionStatus {
     /// The following statuses do NOT hold locks:
     /// - Pending: not yet committed into a block
     /// - Completed: certificate committed, transaction done
-    /// - Deferred: deferred due to conflict, locks released
-    /// - Retried: superseded by retry transaction, locks released
     /// - Aborted: transaction aborted, locks released
     pub fn holds_state_lock(&self) -> bool {
         matches!(
@@ -793,62 +558,22 @@ impl TransactionStatus {
         )
     }
 
-    /// Check if this transaction is deferred waiting for another transaction.
-    pub fn is_deferred(&self) -> bool {
-        matches!(self, TransactionStatus::Deferred { .. })
-    }
-
-    /// Get the hash of the blocking transaction if this transaction is deferred.
-    pub fn deferred_by(&self) -> Option<&Hash> {
-        match self {
-            TransactionStatus::Deferred { by } => Some(by),
-            _ => None,
-        }
-    }
-
-    /// Check if this transaction has been superseded by a retry.
-    pub fn is_retried(&self) -> bool {
-        matches!(self, TransactionStatus::Retried { .. })
-    }
-
-    /// Get the hash of the retry transaction if this transaction was retried.
-    pub fn retry_hash(&self) -> Option<&Hash> {
-        match self {
-            TransactionStatus::Retried { new_tx } => Some(new_tx),
-            _ => None,
-        }
-    }
-
-    /// Check if this transaction is in a state where it can be deferred.
-    ///
-    /// Transactions can be deferred if they are in Committed state (executing).
-    /// States that cannot be deferred:
-    /// - Pre-lock states: Pending (no locks held yet)
-    /// - Terminal states: Executed, Completed (too late to defer)
-    /// - Already deferred: Deferred, Retried (already handled)
-    pub fn is_deferrable(&self) -> bool {
-        matches!(self, TransactionStatus::Committed(_))
-    }
-
     /// Returns a rough ordering value for the status in the normal lifecycle.
     ///
     /// This is used to detect stale status updates (where we've already progressed
-    /// past the incoming status). Note that this doesn't capture all valid transitions
-    /// (e.g., Deferred/Retried can happen from multiple states), but it helps identify
-    /// clearly stale updates.
+    /// past the incoming status). Note that this doesn't capture all valid transitions,
+    /// but it helps identify clearly stale updates.
     ///
     /// Ordering: Pending(0) < Committed(1) < Executed(2) < Completed(3)
     ///
-    /// Deferred, Retried, and Aborted are terminal side-branches and get high ordinals (4, 5, 6).
+    /// Aborted is a terminal side-branch and gets a high ordinal (4).
     pub fn ordinal(&self) -> u8 {
         match self {
             TransactionStatus::Pending => 0,
             TransactionStatus::Committed(_) => 1,
             TransactionStatus::Executed { .. } => 2,
             TransactionStatus::Completed(_) => 3,
-            TransactionStatus::Deferred { .. } => 4,
-            TransactionStatus::Retried { .. } => 5,
-            TransactionStatus::Aborted { .. } => 6,
+            TransactionStatus::Aborted { .. } => 4,
         }
     }
 
@@ -860,22 +585,10 @@ impl TransactionStatus {
             // Pending → Committed
             (Pending, Committed(_)) => true,
 
-            // Pending → Retried (if a retry arrived before original was committed)
-            (Pending, Retried { .. }) => true,
-
-            // Pending → Deferred (cross-shard livelock prevention)
-            (Pending, Deferred { .. }) => true,
-
             // Committed → Executed (execution complete, certificate created)
             (Committed(_), Executed { .. }) => true,
 
-            // Committed → Deferred (deferred due to conflict)
-            (Committed(_), Deferred { .. }) => true,
-
-            // Committed → Retried (superseded by retry from another shard)
-            (Committed(_), Retried { .. }) => true,
-
-            // Committed → Aborted (timeout or too many retries)
+            // Committed → Aborted (timeout or livelock)
             (Committed(_), Aborted { .. }) => true,
 
             // Executed → Completed (certificate committed in block)
@@ -883,12 +596,6 @@ impl TransactionStatus {
 
             // Executed → Aborted (execution rejected or timeout)
             (Executed { .. }, Aborted { .. }) => true,
-
-            // Deferred → Retried (when winner completes, loser gets a retry)
-            (Deferred { .. }, Retried { .. }) => true,
-
-            // Deferred → Aborted (too many retries)
-            (Deferred { .. }, Aborted { .. }) => true,
 
             // No other transitions are valid
             _ => false,
@@ -928,8 +635,6 @@ impl std::fmt::Display for TransactionStatus {
             TransactionStatus::Completed(TransactionDecision::Aborted) => {
                 write!(f, "completed(aborted)")
             }
-            TransactionStatus::Deferred { by } => write!(f, "deferred({})", by),
-            TransactionStatus::Retried { new_tx } => write!(f, "retried({})", new_tx),
             TransactionStatus::Aborted { reason } => write!(f, "aborted({})", reason),
         }
     }
@@ -982,20 +687,6 @@ impl std::str::FromStr for TransactionStatus {
                     TransactionStatusParseError::MissingValue("completed".into())
                 })?)?;
                 Ok(TransactionStatus::Completed(decision))
-            }
-            "deferred" => {
-                let hash_str = inner
-                    .ok_or_else(|| TransactionStatusParseError::MissingValue("deferred".into()))?;
-                let hash = Hash::from_hex(hash_str)
-                    .map_err(|_| TransactionStatusParseError::InvalidValue("hash".into()))?;
-                Ok(TransactionStatus::Deferred { by: hash })
-            }
-            "retried" => {
-                let hash_str = inner
-                    .ok_or_else(|| TransactionStatusParseError::MissingValue("retried".into()))?;
-                let hash = Hash::from_hex(hash_str)
-                    .map_err(|_| TransactionStatusParseError::InvalidValue("hash".into()))?;
-                Ok(TransactionStatus::Retried { new_tx: hash })
             }
             "aborted" => {
                 let reason_str = inner

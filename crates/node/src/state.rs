@@ -283,25 +283,14 @@ impl NodeStateMachine {
             .collect();
         let certificates = self.execution.get_finalized_certificates();
 
-        // Filter out abort intents for transactions whose execution result
-        // is already sealed (EC produced) or finalized (TC created). Once our shard
-        // has broadcast an EC with a non-zero receipt for a transaction, remote shards
-        // will use it to form the TransactionCertificate. Proposing an abort
-        // after that point would cause split-brain: remote shards commit the TC while
-        // we discard it.
-        //
-        // is_execution_sealed: EC produced (local wave complete, vote broadcast)
-        // is_finalized: TC created (all remote ECs collected)
+        // Filter out abort intents for transactions that are already finalized
+        // (TC created). Once all participating shards have collected ECs and formed
+        // the TransactionCertificate, proposing an abort would cause split-brain:
+        // remote shards commit the TC while we discard it.
         let abort_intents = abort_intents
             .into_iter()
             .filter(|a| {
-                if self.execution.is_execution_sealed(&a.tx_hash) {
-                    tracing::info!(
-                        tx_hash = %a.tx_hash,
-                        "Filtering abort intent from proposal: execution already sealed (EC broadcast)"
-                    );
-                    false
-                } else if self.execution.is_finalized(&a.tx_hash) {
+                if self.execution.is_finalized(&a.tx_hash) {
                     tracing::info!(
                         tx_hash = %a.tx_hash,
                         "Filtering abort intent from proposal: transaction already finalized (TC created)"

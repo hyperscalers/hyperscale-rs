@@ -170,7 +170,6 @@ fn update_rpc_state(config: &PinnedLoopConfig, snapshot: &NodeStatusSnapshot) {
             committed_count: snapshot.mempool_committed,
             executed_count: snapshot.mempool_executed,
             total_count: snapshot.mempool_total,
-            deferred_count: snapshot.mempool_deferred,
             accepting_rpc_transactions: snapshot.accepting_rpc_transactions,
             at_pending_limit: snapshot.at_pending_limit,
             updated_at: Some(Instant::now()),

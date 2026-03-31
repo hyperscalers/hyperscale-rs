@@ -1212,10 +1212,6 @@ impl MetricsRecorder for PrometheusRecorder {
             .set(m.exec_finalized_certificates as f64);
         self.metrics
             .memory_exec
-            .with_label_values(&["execution_sealed"])
-            .set(m.exec_execution_sealed as f64);
-        self.metrics
-            .memory_exec
             .with_label_values(&["pending_provisioning"])
             .set(m.exec_pending_provisioning as f64);
         self.metrics

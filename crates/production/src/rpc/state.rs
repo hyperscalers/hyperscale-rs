@@ -61,8 +61,6 @@ pub struct MempoolSnapshot {
     pub executed_count: usize,
     /// Total number of transactions in the mempool.
     pub total_count: usize,
-    /// Number of transactions deferred waiting for a winner.
-    pub deferred_count: usize,
     /// When this snapshot was taken.
     pub updated_at: Option<Instant>,
     /// Whether the mempool is accepting new RPC transactions.
@@ -90,7 +88,6 @@ impl Default for MempoolSnapshot {
             committed_count: 0,
             executed_count: 0,
             total_count: 0,
-            deferred_count: 0,
             updated_at: None,
             accepting_rpc_transactions: true, // Default to accepting until we know otherwise
             at_pending_limit: false,          // Default to not at limit until we know otherwise
@@ -177,38 +174,6 @@ mod tests {
             status,
             TransactionStatus::Completed(TransactionDecision::Accept)
         ));
-    }
-
-    #[test]
-    fn test_cache_blocked_status() {
-        let cache = new_cache();
-        let tx_hash = Hash::from_bytes(&[3u8; 32]);
-        let blocker_hash = Hash::from_bytes(&[4u8; 32]);
-
-        cache.insert(tx_hash, TransactionStatus::Deferred { by: blocker_hash });
-
-        let status = cache.get(&tx_hash).unwrap();
-        if let TransactionStatus::Deferred { by } = &status {
-            assert_eq!(*by, blocker_hash);
-        } else {
-            panic!("Expected Deferred status");
-        }
-    }
-
-    #[test]
-    fn test_cache_retried_status() {
-        let cache = new_cache();
-        let tx_hash = Hash::from_bytes(&[5u8; 32]);
-        let retry_hash = Hash::from_bytes(&[6u8; 32]);
-
-        cache.insert(tx_hash, TransactionStatus::Retried { new_tx: retry_hash });
-
-        let status = cache.get(&tx_hash).unwrap();
-        if let TransactionStatus::Retried { new_tx } = &status {
-            assert_eq!(*new_tx, retry_hash);
-        } else {
-            panic!("Expected Retried status");
-        }
     }
 
     #[test]

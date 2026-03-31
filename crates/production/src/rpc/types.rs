@@ -106,7 +106,7 @@ pub struct TransactionStatusResponse {
     /// Transaction hash (hex-encoded).
     pub hash: String,
     /// Current status of the transaction.
-    /// Possible values: "pending", "committed", "executed", "completed", "deferred", "retried", "unknown", "error"
+    /// Possible values: "pending", "committed", "executed", "completed", "aborted", "unknown", "error"
     pub status: String,
     /// Block height where committed (if committed).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -114,12 +114,6 @@ pub struct TransactionStatusResponse {
     /// Final decision (if executed): "accept" or "reject".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decision: Option<String>,
-    /// Hash of the transaction deferreding this one (if deferred).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub deferred_by: Option<String>,
-    /// Hash of the retry transaction (if retried).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub retry_tx: Option<String>,
     /// Error message if status lookup failed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -140,8 +134,6 @@ pub struct MempoolStatusResponse {
     pub executed_count: usize,
     /// Total transactions in mempool.
     pub total_count: usize,
-    /// Number of transactions deferred waiting for a winner to complete.
-    pub deferred_count: usize,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
