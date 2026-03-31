@@ -253,8 +253,10 @@ mod tests {
         }
 
         let (_, outcomes) = acc.build_data().unwrap();
-        for i in 0..3 {
-            assert_eq!(outcomes[i].tx_hash, Hash::from_bytes(&[i as u8; 4]));
+
+        // Outcomes should be in wave order (0, 1, 2), not completion order (2, 1, 0)
+        for (i, outcome) in outcomes.iter().enumerate().take(3) {
+            assert_eq!(outcome.tx_hash, Hash::from_bytes(&[i as u8; 4]));
         }
     }
 

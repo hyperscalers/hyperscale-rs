@@ -181,7 +181,7 @@ impl NetworkTrafficAnalyzer {
             .collect();
 
         // Sort by bandwidth consumption (descending)
-        by_message_type.sort_by(|a, b| b.total_bytes.cmp(&a.total_bytes));
+        by_message_type.sort_by_key(|b| std::cmp::Reverse(b.total_bytes));
 
         // Build per-node reports
         let by_node_lock = self.by_node.read().unwrap();
@@ -338,11 +338,7 @@ impl MessageTypeStats {
 
     /// Get average message size.
     pub fn avg_size(&self) -> u64 {
-        if self.count == 0 {
-            0
-        } else {
-            self.size_sum / self.count
-        }
+        self.size_sum.checked_div(self.count).unwrap_or(0)
     }
 }
 

@@ -172,6 +172,7 @@ impl CachingAdapter {
         let mut active: Vec<(usize, jvt::NodeKey)> =
             (0..jvt_keys.len()).map(|i| (i, root_key.clone())).collect();
 
+        #[allow(clippy::needless_range_loop)]
         for depth in 0..31 {
             if active.is_empty() {
                 break;

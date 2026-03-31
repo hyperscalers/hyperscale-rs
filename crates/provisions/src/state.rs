@@ -754,7 +754,7 @@ mod tests {
         let topology = make_test_topology(ShardGroupId(0));
         let mut coordinator = ProvisionCoordinator::new();
 
-        let sender = ValidatorId(3);
+        let _sender = ValidatorId(3);
         coordinator
             .on_verified_remote_header(&topology, make_committed_header(ShardGroupId(1), 10));
         coordinator
@@ -787,7 +787,7 @@ mod tests {
         let topology = make_test_topology(ShardGroupId(0));
         let mut coordinator = ProvisionCoordinator::new();
 
-        let sender = ValidatorId(3);
+        let _sender = ValidatorId(3);
         coordinator
             .on_verified_remote_header(&topology, make_committed_header(ShardGroupId(1), 10));
         coordinator

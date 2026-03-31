@@ -727,7 +727,7 @@ mod tests {
             shard_proofs,
         });
 
-        let root = compute_receipt_root(&[cert.clone()]);
+        let root = compute_receipt_root(std::slice::from_ref(&cert));
         // Single cert: receipt_root should equal the cert's receipt_hash
         assert_eq!(root, cert.receipt_hash());
     }

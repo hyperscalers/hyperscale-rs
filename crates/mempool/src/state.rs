@@ -1650,7 +1650,7 @@ mod tests {
         assert_eq!(mempool.len(), 0);
 
         // Simulate late-arriving gossip
-        let actions = mempool.on_transaction_gossip(&topology, Arc::new(tx.clone()), false);
+        let _actions = mempool.on_transaction_gossip(&topology, Arc::new(tx.clone()), false);
 
         // Pool should still be empty - tombstone prevented resurrection
         assert_eq!(mempool.len(), 0);

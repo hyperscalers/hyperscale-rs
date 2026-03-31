@@ -463,7 +463,7 @@ mod tests {
     #[test]
     fn test_merge_single_element_is_identity() {
         let u1 = make_delta_updates(b"node1", 0, vec![1], DatabaseUpdate::Set(vec![10]));
-        let merged = merge_database_updates(&[u1.clone()]);
+        let merged = merge_database_updates(std::slice::from_ref(&u1));
         assert!(
             matches!(get_delta_value(&merged, b"node1", 0, &[1]), Some(DatabaseUpdate::Set(v)) if v == vec![10]),
             "single-element merge should be identity"

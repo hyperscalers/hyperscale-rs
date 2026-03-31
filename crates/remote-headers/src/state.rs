@@ -468,28 +468,6 @@ mod tests {
     use super::*;
     use hyperscale_types::{BlockHeader, Hash, QuorumCertificate, ShardGroupId, ValidatorId};
 
-    fn make_committed_header(shard: u64, height: u64) -> CommittedBlockHeader {
-        let header = BlockHeader {
-            shard_group_id: ShardGroupId(shard),
-            height: BlockHeight(height),
-            parent_hash: Hash::ZERO,
-            parent_qc: QuorumCertificate::genesis(),
-            proposer: ValidatorId(0),
-            timestamp: 1234567890,
-            round: 0,
-            is_fallback: false,
-            state_root: Hash::ZERO,
-            transaction_root: Hash::ZERO,
-            receipt_root: Hash::ZERO,
-            waves: vec![],
-        };
-        let mut qc = QuorumCertificate::genesis();
-        qc.block_hash = header.hash();
-        qc.shard_group_id = ShardGroupId(shard);
-        qc.height = BlockHeight(height);
-        CommittedBlockHeader::new(header, qc)
-    }
-
     // Basic structural tests — full integration tests require TopologySnapshot
     // which is tested via node-level tests.
 
@@ -526,7 +504,7 @@ mod tests {
         qc.height = BlockHeight(5);
 
         let committed = CommittedBlockHeader::new(header, qc);
-        let coord = RemoteHeaderCoordinator::new();
+        let _coord = RemoteHeaderCoordinator::new();
 
         // The structural check happens inside on_remote_block_committed which
         // needs a topology. We test the logic directly here by checking the

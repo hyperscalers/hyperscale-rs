@@ -204,7 +204,7 @@ mod tests {
             block_height: 10,
             wave_id: WaveId::zero(),
             shard_group_id: ShardGroupId(0),
-            receipt_root: receipt_root,
+            receipt_root,
             tx_count: 5,
             validator: ValidatorId(validator),
             signature: zero_bls_signature(),

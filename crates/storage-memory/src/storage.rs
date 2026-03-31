@@ -229,7 +229,7 @@ impl<D: Dispatch + 'static> SimStorage<D> {
                 ref mut versioned_substates,
                 ..
             } = *s;
-            apply_updates_to_ordmap(data, &updates, Some((ver, versioned_substates)));
+            apply_updates_to_ordmap(data, updates, Some((ver, versioned_substates)));
         }
         self.consensus
             .write()

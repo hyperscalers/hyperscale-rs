@@ -140,7 +140,7 @@ mod tests {
             zero_sig(),
         );
 
-        let all: Vec<Hash> = gossip.manifest.tx_hashes.iter().copied().collect();
+        let all: Vec<Hash> = gossip.manifest.tx_hashes.to_vec();
         assert_eq!(all, vec![tx1, tx2, tx3]);
     }
 }
