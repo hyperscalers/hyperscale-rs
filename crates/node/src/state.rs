@@ -9,9 +9,9 @@ use hyperscale_provisions::ProvisionCoordinator;
 use hyperscale_remote_headers::RemoteHeaderCoordinator;
 use hyperscale_topology::TopologyState;
 use hyperscale_types::{
-    Block, BlockHeader, BlockHeight, BlockManifest, Bls12381G1PrivateKey, CommittedBlockHeader,
-    Hash, ProvisionBatch, QuorumCertificate, ReadyTransactions, ReceiptBundle, RoutableTransaction,
-    ShardGroupId, TopologySnapshot, TransactionAbort, TransactionCertificate, TransactionDefer,
+    AbortIntent, Block, BlockHeader, BlockHeight, BlockManifest, Bls12381G1PrivateKey,
+    CommittedBlockHeader, Hash, ProvisionBatch, QuorumCertificate, ReadyTransactions,
+    ReceiptBundle, RoutableTransaction, ShardGroupId, TopologySnapshot, TransactionCertificate,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -97,8 +97,7 @@ impl std::fmt::Debug for NodeStateMachine {
 /// to avoid duplicating the ready-transaction gathering logic.
 struct ProposalInputs {
     ready_txs: ReadyTransactions,
-    deferred: Vec<TransactionDefer>,
-    aborted: Vec<TransactionAbort>,
+    abort_intents: Vec<AbortIntent>,
     certificates: Vec<Arc<TransactionCertificate>>,
 }
 
@@ -250,7 +249,7 @@ impl NodeStateMachine {
     /// Gather all inputs needed for a block proposal.
     ///
     /// Used by both `on_proposal_timer` and `on_qc_formed` to avoid duplicating
-    /// the ready-transaction + deferred + aborted + certificates gathering logic.
+    /// the ready-transaction + abort intents + certificates gathering logic.
     fn gather_proposal_inputs(
         &mut self,
         pending_txs: usize,
@@ -265,55 +264,47 @@ impl NodeStateMachine {
         let ready_txs = self
             .mempool
             .ready_transactions(max_txs, pending_txs, pending_certs);
-        let deferred = self.livelock.get_pending_deferrals().to_vec();
         let current_height = BlockHeight(self.bft.committed_height() + 1);
-        let aborted = self
+        // Livelock cycle abort intents (from cycle detection).
+        let livelock_intents = self.livelock.get_pending_abort_intents().to_vec();
+        // Timed-out transactions from the mempool, converted to AbortIntent.
+        let timed_out = self
             .mempool
             .get_timed_out_transactions(current_height, EXECUTION_TIMEOUT_BLOCKS);
+        let timed_out_intents = timed_out.into_iter().map(|a| AbortIntent {
+            tx_hash: a.tx_hash,
+            reason: a.reason,
+            block_height: a.block_height,
+        });
+        // Combine both sources into a single abort_intents list.
+        let abort_intents: Vec<AbortIntent> = livelock_intents
+            .into_iter()
+            .chain(timed_out_intents)
+            .collect();
         let certificates = self.execution.get_finalized_certificates();
 
-        // Filter out deferrals and aborts for transactions whose execution result
+        // Filter out abort intents for transactions whose execution result
         // is already sealed (EC produced) or finalized (TC created). Once our shard
         // has broadcast an EC with a non-zero receipt for a transaction, remote shards
-        // will use it to form the TransactionCertificate. Proposing a deferral/abort
+        // will use it to form the TransactionCertificate. Proposing an abort
         // after that point would cause split-brain: remote shards commit the TC while
         // we discard it.
         //
         // is_execution_sealed: EC produced (local wave complete, vote broadcast)
         // is_finalized: TC created (all remote ECs collected)
-        let deferred = deferred
-            .into_iter()
-            .filter(|d| {
-                if self.execution.is_execution_sealed(&d.tx_hash) {
-                    tracing::info!(
-                        tx_hash = %d.tx_hash,
-                        "Filtering deferral from proposal: execution already sealed (EC broadcast)"
-                    );
-                    false
-                } else if self.execution.is_finalized(&d.tx_hash) {
-                    tracing::info!(
-                        tx_hash = %d.tx_hash,
-                        "Filtering deferral from proposal: transaction already finalized (TC created)"
-                    );
-                    false
-                } else {
-                    true
-                }
-            })
-            .collect();
-        let aborted = aborted
+        let abort_intents = abort_intents
             .into_iter()
             .filter(|a| {
                 if self.execution.is_execution_sealed(&a.tx_hash) {
                     tracing::info!(
                         tx_hash = %a.tx_hash,
-                        "Filtering abort from proposal: execution already sealed (EC broadcast)"
+                        "Filtering abort intent from proposal: execution already sealed (EC broadcast)"
                     );
                     false
                 } else if self.execution.is_finalized(&a.tx_hash) {
                     tracing::info!(
                         tx_hash = %a.tx_hash,
-                        "Filtering abort from proposal: transaction already finalized (TC created)"
+                        "Filtering abort intent from proposal: transaction already finalized (TC created)"
                     );
                     false
                 } else {
@@ -324,8 +315,7 @@ impl NodeStateMachine {
 
         ProposalInputs {
             ready_txs,
-            deferred,
-            aborted,
+            abort_intents,
             certificates,
         }
     }
@@ -416,11 +406,19 @@ impl NodeStateMachine {
             pending_txs,               // txs in uncommitted pipeline blocks
             pending_certs + new_certs, // certs in pipeline + certs we're proposing
         );
-        let deferred = self.livelock.get_pending_deferrals().to_vec();
         let current_height = BlockHeight(self.bft.committed_height() + 1);
-        let aborted = self
+        let livelock_intents = self.livelock.get_pending_abort_intents().to_vec();
+        let timed_out = self
             .mempool
             .get_timed_out_transactions(current_height, EXECUTION_TIMEOUT_BLOCKS);
+        let abort_intents: Vec<AbortIntent> = livelock_intents
+            .into_iter()
+            .chain(timed_out.into_iter().map(|a| AbortIntent {
+                tx_hash: a.tx_hash,
+                reason: a.reason,
+                block_height: a.block_height,
+            }))
+            .collect();
 
         // Collect per-certificate Arc<DatabaseUpdates> from execution cache.
         // The closure captures the cache; BftState calls it with the final
@@ -438,8 +436,7 @@ impl NodeStateMachine {
         self.bft.on_proposal_timer(
             topology,
             &ready_txs,
-            deferred,
-            aborted,
+            abort_intents,
             certificates,
             collect_updates,
         )
@@ -544,8 +541,7 @@ impl NodeStateMachine {
             block_hash,
             qc,
             &inputs.ready_txs,
-            inputs.deferred,
-            inputs.aborted,
+            inputs.abort_intents,
             inputs.certificates,
             collect_updates,
         )
@@ -599,47 +595,16 @@ impl NodeStateMachine {
             }
         }
 
-        // Livelock: process deferrals/aborts/certs, add tombstones, cleanup tracking
+        // Livelock: process abort intents/certs, add tombstones, cleanup tracking
         self.livelock.on_block_committed(&block);
-
-        // Deferrals feed the accumulator as abort intents.
-        for deferral in &block.deferred {
-            let reason = match &deferral.reason {
-                hyperscale_types::DeferReason::LivelockCycle { winner_tx_hash } => {
-                    hyperscale_types::AbortReason::LivelockCycle {
-                        winner_tx_hash: *winner_tx_hash,
-                        source_shard: deferral.source_shard,
-                        source_block_height: deferral.source_block_height,
-                        tx_inclusion_proof: deferral.tx_inclusion_proof.clone(),
-                    }
-                }
-            };
-            if let Some(completion) = self.execution.record_abort_intent(deferral.tx_hash, reason) {
-                actions.push(Action::SignAndBroadcastExecutionVote {
-                    block_hash: completion.block_hash,
-                    block_height: completion.block_height,
-                    wave_id: completion.wave_id,
-                    receipt_root: completion.receipt_root,
-                    tx_count: completion.tx_outcomes.len() as u32,
-                    tx_outcomes: completion.tx_outcomes,
-                    participating_shards: completion.participating_shards,
-                });
-            }
-        }
-
-        // Cleanup execution state for deferred transactions.
-        // This must happen BEFORE passing new transactions to execution,
-        // so that retries can be processed fresh.
-        for deferral in &block.deferred {
-            self.execution.cleanup_transaction(&deferral.tx_hash);
-        }
 
         // Abort intents feed the execution accumulator. If execution already
         // completed, the intent is ignored (first-write-wins).
-        for abort in &block.aborted {
+        // Also cleans up execution state for each aborted transaction.
+        for intent in &block.abort_intents {
             if let Some(completion) = self
                 .execution
-                .record_abort_intent(abort.tx_hash, abort.reason.clone())
+                .record_abort_intent(intent.tx_hash, intent.reason.clone())
             {
                 actions.push(Action::SignAndBroadcastExecutionVote {
                     block_hash: completion.block_hash,
@@ -651,11 +616,7 @@ impl NodeStateMachine {
                     participating_shards: completion.participating_shards,
                 });
             }
-        }
-
-        // Cleanup execution state for aborted transactions
-        for abort in &block.aborted {
-            self.execution.cleanup_transaction(&abort.tx_hash);
+            self.execution.cleanup_transaction(&intent.tx_hash);
         }
 
         // Cleanup execution state for original transactions superseded by retries.

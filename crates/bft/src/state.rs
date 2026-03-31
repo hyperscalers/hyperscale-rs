@@ -46,11 +46,10 @@ pub struct BftMemoryStats {
 /// Production uses ValidatorId (from message signatures) and PeerId (libp2p).
 pub type NodeIndex = u32;
 use hyperscale_types::{
-    block_header_message, committed_block_header_message, verify_merkle_inclusion, Block,
-    BlockHeader, BlockHeight, BlockManifest, BlockVote, Bls12381G1PrivateKey, Bls12381G1PublicKey,
+    block_header_message, committed_block_header_message, AbortIntent, Block, BlockHeader,
+    BlockHeight, BlockManifest, BlockVote, Bls12381G1PrivateKey, Bls12381G1PublicKey,
     CommittedBlockHeader, Hash, QuorumCertificate, ReadyTransactions, RoutableTransaction,
-    ShardGroupId, TopologySnapshot, TransactionAbort, TransactionCertificate, TransactionDefer,
-    ValidatorId, VotePower,
+    ShardGroupId, TopologySnapshot, TransactionCertificate, ValidatorId, VotePower,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -794,10 +793,9 @@ impl BftState {
     ///
     /// Takes ready transactions from mempool (already sectioned and hash-sorted),
     /// plus deferrals, aborts, and certificates from execution.
-    #[instrument(skip(self, ready_txs, deferred, aborted, certificates, collect_updates), fields(
+    #[instrument(skip(self, ready_txs, abort_intents, certificates, collect_updates), fields(
         tx_count = ready_txs.len(),
-        deferred_count = deferred.len(),
-        aborted_count = aborted.len(),
+        abort_intent_count = abort_intents.len(),
         cert_count = certificates.len(),
     ))]
     #[allow(clippy::too_many_arguments)]
@@ -805,8 +803,7 @@ impl BftState {
         &mut self,
         topology: &TopologySnapshot,
         ready_txs: &ReadyTransactions,
-        deferred: Vec<TransactionDefer>,
-        aborted: Vec<TransactionAbort>,
+        abort_intents: Vec<AbortIntent>,
         certificates: Vec<Arc<TransactionCertificate>>,
         collect_updates: F,
     ) -> Vec<Action>
@@ -899,17 +896,8 @@ impl BftState {
         let timestamp = self.now.as_millis() as u64;
         let block_height = BlockHeight(next_height);
 
-        // Set block_height on each deferral (proposer fills this in).
-        let deferred_with_height: Vec<TransactionDefer> = deferred
-            .into_iter()
-            .map(|mut d| {
-                d.block_height = block_height;
-                d
-            })
-            .collect();
-
-        // Set block_height on each abort
-        let aborted_with_height: Vec<TransactionAbort> = aborted
+        // Set block_height on each abort intent
+        let abort_intents_with_height: Vec<AbortIntent> = abort_intents
             .into_iter()
             .map(|mut a| {
                 a.block_height = block_height;
@@ -965,20 +953,6 @@ impl BftState {
             });
 
         // Build set of certificate hashes for stale deferral filtering
-        let cert_hash_set: std::collections::HashSet<Hash> = certificates_to_propose
-            .iter()
-            .map(|c| c.transaction_hash)
-            .collect();
-
-        // Filter out stale deferrals (where the winner or loser tx is in this block's certs)
-        let deferred_filtered: Vec<TransactionDefer> = deferred_with_height
-            .into_iter()
-            .filter(|d| {
-                let hyperscale_types::DeferReason::LivelockCycle { winner_tx_hash } = &d.reason;
-                !cert_hash_set.contains(winner_tx_hash) && !cert_hash_set.contains(&d.tx_hash)
-            })
-            .collect();
-
         // Track that we have a pending proposal (for correlation)
         self.pending_proposal = Some(PendingProposal {
             height: block_height,
@@ -1024,8 +998,7 @@ impl BftState {
                 transactions,
                 certificates: certificates_to_propose,
                 per_cert_updates,
-                deferred: deferred_filtered,
-                aborted: aborted_with_height,
+                abort_intents: abort_intents_with_height,
                 waves,
             },
         ]
@@ -1094,8 +1067,7 @@ impl BftState {
             header: header.clone(),
             transactions: vec![], // Empty - fallback blocks have no transactions
             certificates: vec![], // Empty
-            deferred: vec![],
-            aborted: vec![],
+            abort_intents: vec![],
         };
 
         let block_hash = block.hash();
@@ -1214,8 +1186,7 @@ impl BftState {
             header: header.clone(),
             transactions: vec![],
             certificates: vec![],
-            deferred: vec![],
-            aborted: vec![],
+            abort_intents: vec![],
         };
 
         let block_hash = block.hash();
@@ -1893,13 +1864,13 @@ impl BftState {
         // Validate block contents before voting
         if let Some(pending) = self.pending_blocks.get(&block_hash) {
             if let Some(block) = pending.block() {
-                // Validate deferrals and aborts
-                if let Err(e) = self.validate_deferrals_and_aborts(&block) {
+                // Validate abort intents
+                if let Err(e) = self.validate_abort_intents(&block) {
                     warn!(
                         validator = ?topology.local_validator_id(),
                         block_hash = ?block_hash,
                         error = %e,
-                        "Block has invalid deferrals/aborts - not voting"
+                        "Block has invalid abort intents - not voting"
                     );
                     return vec![];
                 }
@@ -1986,88 +1957,18 @@ impl BftState {
         self.create_vote(topology, block_hash, height, round)
     }
 
-    /// Validate deferrals and aborts in a proposed block (structural validation).
+    /// Validate abort intents in a proposed block (structural validation).
     ///
     /// # Validation Rules
     ///
-    /// ## Deferrals (TransactionDefer)
-    /// Always enforced (structural rules):
-    /// - Hash ordering: deferred_hash > winner_hash (lower hash wins cycles)
-    /// - Staleness: winner cert not in same block
-    /// - Staleness: loser cert not in same block (loser already completed)
-    /// - Merkle inclusion proof: winner tx hash must verify against the source block's
-    ///   `transaction_root` via the `tx_inclusion_proof`
-    ///
-    /// Note: Merkle proof verification requires the remote block header's
-    /// `transaction_root`. This is looked up from `remote_headers` provided
-    /// by the provision coordinator's verified headers cache.
-    ///
-    /// ## Aborts (TransactionAbort)
+    /// ## Abort Intents (AbortIntent)
     /// - ExecutionTimeout: Structural rules only (timeout threshold is proposer's call)
     /// - LivelockCycle: Hash ordering only (merkle proof verified off-thread)
-    fn validate_deferrals_and_aborts(&self, block: &Block) -> Result<(), String> {
-        use hyperscale_types::{AbortReason, DeferReason};
-        use std::collections::HashSet;
+    fn validate_abort_intents(&self, block: &Block) -> Result<(), String> {
+        use hyperscale_types::AbortReason;
 
-        // Build set of certificate hashes in this block for staleness checks
-        let cert_hashes: HashSet<Hash> = block
-            .certificates
-            .iter()
-            .map(|c| c.transaction_hash)
-            .collect();
-
-        // Validate each deferral
-        for deferral in &block.deferred {
-            let DeferReason::LivelockCycle { winner_tx_hash } = &deferral.reason;
-
-            // Rule 1: Hash ordering - deferred TX must have higher hash than winner
-            // (Lower hash wins in cycle detection)
-            if deferral.tx_hash <= *winner_tx_hash {
-                return Err(format!(
-                    "Invalid deferral: deferred_hash {} must be > winner_hash {} (lower hash wins)",
-                    deferral.tx_hash, winner_tx_hash
-                ));
-            }
-
-            // Rule 2: Winner not in same block (stale deferral - winner already done)
-            if cert_hashes.contains(winner_tx_hash) {
-                return Err(format!(
-                    "Invalid deferral: winner {} has certificate in same block (stale)",
-                    winner_tx_hash
-                ));
-            }
-
-            // Rule 3: Loser not in same block (stale deferral - loser completed before defer)
-            if cert_hashes.contains(&deferral.tx_hash) {
-                return Err(format!(
-                    "Invalid deferral: deferred TX {} has certificate in same block (stale)",
-                    deferral.tx_hash
-                ));
-            }
-
-            // Rule 4: Verify merkle inclusion proof for the winner TX in the source block.
-            // This is synchronous (pure hash computation) — no async dispatch needed.
-            // All headers in remote_headers are pre-verified by RemoteHeaderCoordinator.
-            let header_key = (deferral.source_shard, deferral.source_block_height);
-            if let Some(committed_header) = self.remote_headers.get(&header_key) {
-                if !verify_merkle_inclusion(
-                    committed_header.header.transaction_root,
-                    *winner_tx_hash,
-                    &deferral.tx_inclusion_proof,
-                ) {
-                    return Err(format!(
-                        "Invalid deferral: merkle inclusion proof failed for winner {} against source block ({}, {})",
-                        winner_tx_hash, deferral.source_shard.0, deferral.source_block_height.0
-                    ));
-                }
-            }
-            // If we don't have the remote header yet, we can't verify the proof.
-            // This is acceptable: the header will arrive via gossip/fallback,
-            // and we'll verify on the next proposal attempt.
-        }
-
-        // Validate each abort
-        for abort in &block.aborted {
+        // Validate each abort intent
+        for abort in &block.abort_intents {
             match &abort.reason {
                 AbortReason::ExecutionTimeout { committed_at } => {
                     // Basic sanity: abort block_height must be after committed_at
@@ -2968,7 +2869,7 @@ impl BftState {
     ///
     /// `state_root` is the computed JVT root after applying writes from the certificates.
     /// If certificates is empty, parent state is inherited.
-    #[instrument(skip(self, qc, ready_txs, deferred, aborted, certificates, collect_updates), fields(
+    #[instrument(skip(self, qc, ready_txs, abort_intents, certificates, collect_updates), fields(
         height = qc.height.0,
         block_hash = ?block_hash
     ))]
@@ -2979,8 +2880,7 @@ impl BftState {
         block_hash: Hash,
         qc: QuorumCertificate,
         ready_txs: &ReadyTransactions,
-        deferred: Vec<TransactionDefer>,
-        aborted: Vec<TransactionAbort>,
+        abort_intents: Vec<AbortIntent>,
         certificates: Vec<Arc<TransactionCertificate>>,
         collect_updates: F,
     ) -> Vec<Action>
@@ -3065,10 +2965,8 @@ impl BftState {
         // regular proposal timer handle it.
         let next_height = height + 1;
 
-        let has_content = !ready_txs.is_empty()
-            || !deferred.is_empty()
-            || !aborted.is_empty()
-            || !certificates.is_empty();
+        let has_content =
+            !ready_txs.is_empty() || !abort_intents.is_empty() || !certificates.is_empty();
 
         // Rate limit against the latest QC time (any proposer), not just our own
         // last proposal. With rotating proposers, per-validator tracking doesn't
@@ -3094,8 +2992,7 @@ impl BftState {
             actions.extend(self.on_proposal_timer(
                 topology,
                 ready_txs,
-                deferred,
-                aborted,
+                abort_intents,
                 certificates,
                 collect_updates,
             ));
@@ -5371,202 +5268,20 @@ mod tests {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // Deferral and Abort Validation Tests
+    // Abort Intent Validation Tests
     // ═══════════════════════════════════════════════════════════════════════════
-
-    /// Create a test deferral with a merkle inclusion proof.
-    fn make_test_deferral(loser_tx: Hash, winner_tx: Hash) -> TransactionDefer {
-        use hyperscale_types::{DeferReason, TransactionInclusionProof};
-        TransactionDefer {
-            tx_hash: loser_tx,
-            reason: DeferReason::LivelockCycle {
-                winner_tx_hash: winner_tx,
-            },
-            block_height: BlockHeight(0),
-            source_shard: ShardGroupId(1),
-            source_block_height: BlockHeight(1),
-            tx_inclusion_proof: TransactionInclusionProof {
-                siblings: vec![],
-                leaf_index: 0,
-            },
-        }
-    }
 
     fn make_test_block(
         height: u64,
-        deferred: Vec<TransactionDefer>,
-        aborted: Vec<TransactionAbort>,
+        abort_intents: Vec<AbortIntent>,
         certificates: Vec<hyperscale_types::TransactionCertificate>,
     ) -> Block {
         Block {
             header: make_header_at_height(height, 100_000),
             transactions: vec![],
             certificates: certificates.into_iter().map(Arc::new).collect(),
-            deferred,
-            aborted,
+            abort_intents,
         }
-    }
-
-    #[test]
-    fn test_validate_deferral_hash_ordering() {
-        let (state, _topology) = make_test_state();
-
-        // Use raw hash bytes to control ordering deterministically
-        // Loser must have higher hash, winner must have lower hash
-        // Hash comparison is derived lexicographically from underlying bytes
-        let mut loser_bytes = [0xFFu8; 32]; // All 0xFF = max hash
-        let mut winner_bytes = [0x00u8; 32]; // All 0x00 = min hash
-        loser_bytes[0] = 0x01; // Ensure not all same bytes
-        winner_bytes[0] = 0x00;
-
-        let loser_hash = Hash::from_hash_bytes(&loser_bytes);
-        let winner_hash = Hash::from_hash_bytes(&winner_bytes);
-
-        // Verify ordering assumption
-        assert!(
-            loser_hash > winner_hash,
-            "Test setup: loser_hash must be > winner_hash"
-        );
-
-        // Valid: loser (higher) deferred to winner (lower)
-        let valid_deferral = TransactionDefer {
-            tx_hash: loser_hash,
-            reason: hyperscale_types::DeferReason::LivelockCycle {
-                winner_tx_hash: winner_hash,
-            },
-            block_height: BlockHeight(5),
-            source_shard: ShardGroupId(1),
-            source_block_height: BlockHeight(1),
-            tx_inclusion_proof: hyperscale_types::TransactionInclusionProof {
-                siblings: vec![],
-                leaf_index: 0,
-            },
-        };
-        let block = make_test_block(5, vec![valid_deferral], vec![], vec![]);
-        assert!(state.validate_deferrals_and_aborts(&block).is_ok());
-
-        // Invalid: winner (lower) cannot be deferred - hash ordering violated
-        let invalid_deferral = TransactionDefer {
-            tx_hash: winner_hash,
-            reason: hyperscale_types::DeferReason::LivelockCycle {
-                winner_tx_hash: loser_hash,
-            },
-            block_height: BlockHeight(5),
-            source_shard: ShardGroupId(1),
-            source_block_height: BlockHeight(1),
-            tx_inclusion_proof: hyperscale_types::TransactionInclusionProof {
-                siblings: vec![],
-                leaf_index: 0,
-            },
-        };
-        let block = make_test_block(5, vec![invalid_deferral], vec![], vec![]);
-        let result = state.validate_deferrals_and_aborts(&block);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("must be >"));
-    }
-
-    #[test]
-    fn test_validate_deferral_not_stale_winner() {
-        let (state, _topology) = make_test_state();
-
-        // Use raw hash bytes for deterministic ordering
-        let loser_bytes = [0xFFu8; 32]; // Higher hash
-        let winner_bytes = [0x00u8; 32]; // Lower hash
-        let loser_hash = Hash::from_hash_bytes(&loser_bytes);
-        let winner_hash = Hash::from_hash_bytes(&winner_bytes);
-
-        // Create a certificate for the winner (means winner already completed)
-        let winner_cert = hyperscale_types::TransactionCertificate {
-            transaction_hash: winner_hash,
-            decision: hyperscale_types::TransactionDecision::Accept,
-            shard_proofs: std::collections::BTreeMap::new(),
-        };
-
-        // Invalid: deferral when winner already has certificate in same block
-        let deferral = TransactionDefer {
-            tx_hash: loser_hash,
-            reason: hyperscale_types::DeferReason::LivelockCycle {
-                winner_tx_hash: winner_hash,
-            },
-            block_height: BlockHeight(5),
-            source_shard: ShardGroupId(1),
-            source_block_height: BlockHeight(1),
-            tx_inclusion_proof: hyperscale_types::TransactionInclusionProof {
-                siblings: vec![],
-                leaf_index: 0,
-            },
-        };
-        let block = make_test_block(5, vec![deferral], vec![], vec![winner_cert]);
-        let result = state.validate_deferrals_and_aborts(&block);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("stale"));
-    }
-
-    #[test]
-    fn test_validate_deferral_not_stale_loser() {
-        let (state, _topology) = make_test_state();
-
-        // Use raw hash bytes for deterministic ordering
-        let loser_bytes = [0xFFu8; 32]; // Higher hash
-        let winner_bytes = [0x00u8; 32]; // Lower hash
-        let loser_hash = Hash::from_hash_bytes(&loser_bytes);
-        let winner_hash = Hash::from_hash_bytes(&winner_bytes);
-
-        // Create a certificate for the loser (means loser already completed)
-        let loser_cert = hyperscale_types::TransactionCertificate {
-            transaction_hash: loser_hash,
-            decision: hyperscale_types::TransactionDecision::Accept,
-            shard_proofs: std::collections::BTreeMap::new(),
-        };
-
-        // Invalid: deferral when loser already has certificate in same block
-        let deferral = TransactionDefer {
-            tx_hash: loser_hash,
-            reason: hyperscale_types::DeferReason::LivelockCycle {
-                winner_tx_hash: winner_hash,
-            },
-            block_height: BlockHeight(5),
-            source_shard: ShardGroupId(1),
-            source_block_height: BlockHeight(1),
-            tx_inclusion_proof: hyperscale_types::TransactionInclusionProof {
-                siblings: vec![],
-                leaf_index: 0,
-            },
-        };
-        let block = make_test_block(5, vec![deferral], vec![], vec![loser_cert]);
-        let result = state.validate_deferrals_and_aborts(&block);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("stale"));
-    }
-
-    #[test]
-    fn test_validate_deferral_with_inclusion_proof() {
-        let (state, _topology) = make_test_state();
-
-        // Use raw hash bytes for deterministic ordering
-        let loser_bytes = [0xFFu8; 32]; // Higher hash
-        let winner_bytes = [0x00u8; 32]; // Lower hash
-        let loser_hash = Hash::from_hash_bytes(&loser_bytes);
-        let winner_hash = Hash::from_hash_bytes(&winner_bytes);
-
-        // Valid deferral with merkle inclusion proof fields
-        let deferral = TransactionDefer {
-            tx_hash: loser_hash,
-            reason: hyperscale_types::DeferReason::LivelockCycle {
-                winner_tx_hash: winner_hash,
-            },
-            block_height: BlockHeight(5),
-            source_shard: ShardGroupId(1),
-            source_block_height: BlockHeight(1),
-            tx_inclusion_proof: hyperscale_types::TransactionInclusionProof {
-                siblings: vec![],
-                leaf_index: 0,
-            },
-        };
-        let block = make_test_block(5, vec![deferral], vec![], vec![]);
-        // Structural validation should pass (merkle proof verification against
-        // remote headers is a TODO that requires provision coordinator integration)
-        assert!(state.validate_deferrals_and_aborts(&block).is_ok());
     }
 
     #[test]
@@ -5574,26 +5289,26 @@ mod tests {
         let (state, _topology) = make_test_state();
 
         // Valid: timeout at block 35 for TX committed at block 1
-        let valid_abort = TransactionAbort {
+        let valid_abort = AbortIntent {
             tx_hash: Hash::from_bytes(b"tx1"),
             reason: hyperscale_types::AbortReason::ExecutionTimeout {
                 committed_at: BlockHeight(1),
             },
             block_height: BlockHeight(35),
         };
-        let block = make_test_block(35, vec![], vec![valid_abort], vec![]);
-        assert!(state.validate_deferrals_and_aborts(&block).is_ok());
+        let block = make_test_block(35, vec![valid_abort], vec![]);
+        assert!(state.validate_abort_intents(&block).is_ok());
 
         // Invalid: block_height < committed_at
-        let invalid_abort = TransactionAbort {
+        let invalid_abort = AbortIntent {
             tx_hash: Hash::from_bytes(b"tx2"),
             reason: hyperscale_types::AbortReason::ExecutionTimeout {
                 committed_at: BlockHeight(100),
             },
             block_height: BlockHeight(50),
         };
-        let block = make_test_block(50, vec![], vec![invalid_abort], vec![]);
-        let result = state.validate_deferrals_and_aborts(&block);
+        let block = make_test_block(50, vec![invalid_abort], vec![]);
+        let result = state.validate_abort_intents(&block);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("block_height"));
     }
@@ -5606,7 +5321,7 @@ mod tests {
         let loser_hash = Hash::from_bytes(b"zzzloser"); // must be > winner
 
         // Valid: loser hash > winner hash, non-empty proof
-        let valid_abort = TransactionAbort {
+        let valid_abort = AbortIntent {
             tx_hash: loser_hash,
             reason: hyperscale_types::AbortReason::LivelockCycle {
                 winner_tx_hash: winner_hash,
@@ -5619,11 +5334,11 @@ mod tests {
             },
             block_height: BlockHeight(10),
         };
-        let block = make_test_block(10, vec![], vec![valid_abort], vec![]);
-        assert!(state.validate_deferrals_and_aborts(&block).is_ok());
+        let block = make_test_block(10, vec![valid_abort], vec![]);
+        assert!(state.validate_abort_intents(&block).is_ok());
 
         // Invalid: loser hash <= winner hash
-        let invalid_abort = TransactionAbort {
+        let invalid_abort = AbortIntent {
             tx_hash: winner_hash,
             reason: hyperscale_types::AbortReason::LivelockCycle {
                 winner_tx_hash: loser_hash,
@@ -5636,8 +5351,8 @@ mod tests {
             },
             block_height: BlockHeight(10),
         };
-        let block = make_test_block(10, vec![], vec![invalid_abort], vec![]);
-        let result = state.validate_deferrals_and_aborts(&block);
+        let block = make_test_block(10, vec![invalid_abort], vec![]);
+        let result = state.validate_abort_intents(&block);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("livelock loser hash"));
     }
@@ -6977,8 +6692,7 @@ mod tests {
             qc.block_hash,
             qc,
             &ReadyTransactions::default(), // empty mempool
-            vec![],                        // no deferrals
-            vec![],                        // no aborts
+            vec![],                        // no abort intents
             vec![],                        // no certificates
             |_certs| vec![],
         );
@@ -6995,8 +6709,8 @@ mod tests {
     }
 
     #[test]
-    fn test_qc_formed_proposes_when_has_deferrals() {
-        // When a QC forms and there IS content (e.g., deferrals), we SHOULD
+    fn test_qc_formed_proposes_when_has_abort_intents() {
+        // When a QC forms and there IS content (e.g., abort intents), we SHOULD
         // immediately propose to pipeline block production.
         let (mut state, topology) = make_test_state();
         state.set_time(Duration::from_secs(100));
@@ -7013,20 +6727,22 @@ mod tests {
             weighted_timestamp_ms: 100_000,
         };
 
-        // Create a deferral to include
-        let deferral = make_test_deferral(
-            Hash::from_bytes(b"deferred_tx"),
-            Hash::from_bytes(b"winner_tx"),
-        );
+        // Create an abort intent to include
+        let abort_intent = AbortIntent {
+            tx_hash: Hash::from_bytes(b"timeout_tx"),
+            reason: hyperscale_types::AbortReason::ExecutionTimeout {
+                committed_at: BlockHeight(1),
+            },
+            block_height: BlockHeight(0),
+        };
 
-        // Call on_qc_formed with a deferral
+        // Call on_qc_formed with an abort intent
         let actions = state.on_qc_formed(
             &topology,
             qc.block_hash,
             qc,
             &ReadyTransactions::default(), // empty mempool
-            vec![deferral],                // has a deferral
-            vec![],                        // no aborts
+            vec![abort_intent],            // has an abort intent
             vec![],                        // no certificates
             |_certs| vec![],
         );
@@ -7040,7 +6756,7 @@ mod tests {
 
         assert!(
             has_build_proposal,
-            "Should trigger proposal build after QC formation when has deferrals"
+            "Should trigger proposal build after QC formation when has abort intents"
         );
     }
 
@@ -7190,8 +6906,7 @@ mod tests {
             header: make_header_at_height(height, 100_000),
             transactions,
             certificates: vec![],
-            deferred: vec![],
-            aborted: vec![],
+            abort_intents: vec![],
         }
     }
 
@@ -7204,8 +6919,7 @@ mod tests {
             header: make_header_at_height(height, 100_000),
             transactions,
             certificates: vec![],
-            deferred: vec![],
-            aborted: vec![],
+            abort_intents: vec![],
         }
     }
 
@@ -7334,19 +7048,21 @@ mod tests {
             weighted_timestamp_ms: 1000,
         };
 
-        // Create a deferral so there's content to propose
-        let deferral = make_test_deferral(
-            Hash::from_bytes(b"deferred_tx"),
-            Hash::from_bytes(b"winner_tx"),
-        );
+        // Create an abort intent so there's content to propose
+        let abort_intent = AbortIntent {
+            tx_hash: Hash::from_bytes(b"timeout_tx"),
+            reason: hyperscale_types::AbortReason::ExecutionTimeout {
+                committed_at: BlockHeight(1),
+            },
+            block_height: BlockHeight(0),
+        };
 
         let actions = state.on_qc_formed(
             &topology,
             qc.block_hash,
             qc,
             &ReadyTransactions::default(), // empty mempool
-            vec![deferral],                // has content
-            vec![],
+            vec![abort_intent],            // has content
             vec![],
             |_certs| vec![],
         );
@@ -7387,19 +7103,21 @@ mod tests {
             weighted_timestamp_ms: 1000,
         };
 
-        // Create a deferral so there's content to propose
-        let deferral = make_test_deferral(
-            Hash::from_bytes(b"deferred_tx"),
-            Hash::from_bytes(b"winner_tx"),
-        );
+        // Create an abort intent so there's content to propose
+        let abort_intent = AbortIntent {
+            tx_hash: Hash::from_bytes(b"timeout_tx"),
+            reason: hyperscale_types::AbortReason::ExecutionTimeout {
+                committed_at: BlockHeight(1),
+            },
+            block_height: BlockHeight(0),
+        };
 
         let actions = state.on_qc_formed(
             &topology,
             qc.block_hash,
             qc,
             &ReadyTransactions::default(), // empty mempool
-            vec![deferral],                // has content
-            vec![],
+            vec![abort_intent],            // has content
             vec![],
             |_certs| vec![],
         );
@@ -7468,18 +7186,20 @@ mod tests {
             weighted_timestamp_ms: 1000,
         };
 
-        let deferral = make_test_deferral(
-            Hash::from_bytes(b"deferred_tx"),
-            Hash::from_bytes(b"winner_tx"),
-        );
+        let abort_intent = AbortIntent {
+            tx_hash: Hash::from_bytes(b"timeout_tx"),
+            reason: hyperscale_types::AbortReason::ExecutionTimeout {
+                committed_at: BlockHeight(1),
+            },
+            block_height: BlockHeight(0),
+        };
 
         let actions = state.on_qc_formed(
             &topology,
             qc.block_hash,
             qc,
             &ReadyTransactions::default(),
-            vec![deferral],
-            vec![],
+            vec![abort_intent],
             vec![],
             |_certs| vec![],
         );
@@ -7543,18 +7263,20 @@ mod tests {
             weighted_timestamp_ms: 1000,
         };
 
-        let deferral = make_test_deferral(
-            Hash::from_bytes(b"deferred_tx"),
-            Hash::from_bytes(b"winner_tx"),
-        );
+        let abort_intent = AbortIntent {
+            tx_hash: Hash::from_bytes(b"timeout_tx"),
+            reason: hyperscale_types::AbortReason::ExecutionTimeout {
+                committed_at: BlockHeight(1),
+            },
+            block_height: BlockHeight(0),
+        };
 
         let actions = state.on_qc_formed(
             &topology,
             qc.block_hash,
             qc,
             &ReadyTransactions::default(),
-            vec![deferral],
-            vec![],
+            vec![abort_intent],
             vec![],
             |_certs| vec![],
         );
@@ -7599,7 +7321,6 @@ mod tests {
             qc.block_hash,
             qc,
             &ReadyTransactions::default(),
-            vec![],
             vec![],
             vec![],
             |_certs| vec![],
@@ -7822,14 +7543,8 @@ mod tests {
             transactions: vec![Arc::new(hyperscale_types::test_utils::test_transaction(1))],
         };
 
-        let actions = state.on_proposal_timer(
-            &topology,
-            &ready_txs,
-            vec![],
-            vec![],
-            vec![],
-            |_certs| vec![],
-        );
+        let actions =
+            state.on_proposal_timer(&topology, &ready_txs, vec![], vec![], |_certs| vec![]);
 
         // Should have broadcast a block header
         let has_block_header = actions
@@ -7892,7 +7607,6 @@ mod tests {
         let actions = state.on_proposal_timer(
             &topology,
             &ReadyTransactions::default(),
-            vec![],
             vec![],
             vec![],
             |_certs| vec![],
@@ -8126,8 +7840,7 @@ mod tests {
             },
             transactions: vec![],
             certificates: vec![],
-            deferred: vec![],
-            aborted: vec![],
+            abort_intents: vec![],
         };
 
         let qc = QuorumCertificate {
@@ -8178,7 +7891,6 @@ mod tests {
         let _actions = state.on_proposal_timer(
             &topology,
             &ReadyTransactions::default(),
-            vec![],
             vec![],
             vec![],
             |_certs| vec![],
@@ -8297,7 +8009,6 @@ mod tests {
         let actions1 = state.on_proposal_timer(
             &topology,
             &ReadyTransactions::default(),
-            vec![],
             vec![],
             vec![],
             |_certs| vec![],
@@ -8723,8 +8434,7 @@ mod tests {
             },
             transactions: vec![tx1.clone()],
             certificates: vec![],
-            deferred: vec![],
-            aborted: vec![],
+            abort_intents: vec![],
         };
         let ancestor_hash = ancestor_block.hash();
         state.certified_blocks.insert(ancestor_hash, ancestor_block);
@@ -8749,8 +8459,7 @@ mod tests {
             },
             transactions: txs,
             certificates: vec![],
-            deferred: vec![],
-            aborted: vec![],
+            abort_intents: vec![],
         };
 
         let result = state.validate_no_duplicate_transactions(&block);
@@ -8783,8 +8492,7 @@ mod tests {
             },
             transactions: vec![tx1.clone()],
             certificates: vec![],
-            deferred: vec![],
-            aborted: vec![],
+            abort_intents: vec![],
         };
         let ancestor_hash = ancestor_block.hash();
         state.certified_blocks.insert(ancestor_hash, ancestor_block);
@@ -8808,8 +8516,7 @@ mod tests {
             },
             transactions: vec![tx1],
             certificates: vec![],
-            deferred: vec![],
-            aborted: vec![],
+            abort_intents: vec![],
         };
 
         // Ancestor is at committed height, so walk stops before checking it

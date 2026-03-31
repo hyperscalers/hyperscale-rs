@@ -934,7 +934,7 @@ where
 
         // ── Livelock ──
         let livelock_stats = self.state.livelock().stats();
-        metrics::set_livelock_deferred_count(livelock_stats.pending_deferrals);
+        metrics::set_livelock_deferred_count(livelock_stats.pending_abort_intents);
 
         // ── Memory ──
         let bft_mem = self.state.bft().memory_stats();
@@ -988,7 +988,7 @@ where
             // Livelock
             livelock_tombstones: livelock_stats.active_tombstones,
             livelock_pending_proof_fetches: livelock_stats.pending_proof_fetches,
-            livelock_pending_deferrals: livelock_stats.pending_deferrals,
+            livelock_pending_deferrals: livelock_stats.pending_abort_intents,
             livelock_tracked_txs: livelock_stats.tracked_transactions,
             // Storage
             jvt_node_cache_entries: self.storage.node_cache_len(),

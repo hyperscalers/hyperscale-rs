@@ -357,12 +357,12 @@ where
         let commit_latency_secs = (now_ms.saturating_sub(block.header.timestamp)) as f64 / 1000.0;
         metrics::record_block_committed(height.0, commit_latency_secs);
         metrics::set_block_height(height.0);
-        // Livelock metrics for deferrals in this block.
-        for _deferral in &block.deferred {
+        // Livelock metrics for abort intents in this block.
+        for _intent in &block.abort_intents {
             metrics::record_livelock_deferral();
             metrics::record_livelock_cycle_detected();
         }
-        metrics::set_livelock_deferred_count(self.state.livelock().stats().pending_deferrals);
+        metrics::set_livelock_deferred_count(self.state.livelock().stats().pending_abort_intents);
 
         // Feed committed height to sync protocol (just tracks progress,
         // doesn't need JVT state).

@@ -196,13 +196,8 @@ impl ProvisionCoordinator {
         }
 
         // Clean up aborted transactions
-        for abort in &block.aborted {
-            self.cleanup_tx(&abort.tx_hash);
-        }
-
-        // Clean up deferred transactions
-        for deferral in &block.deferred {
-            self.cleanup_tx(&deferral.tx_hash);
+        for intent in &block.abort_intents {
+            self.cleanup_tx(&intent.tx_hash);
         }
 
         // Update local committed height

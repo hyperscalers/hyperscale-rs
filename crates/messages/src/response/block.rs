@@ -105,8 +105,7 @@ mod tests {
             },
             transactions: vec![std::sync::Arc::new(tx)],
             certificates: vec![],
-            deferred: vec![],
-            aborted: vec![],
+            abort_intents: vec![],
         }
     }
 

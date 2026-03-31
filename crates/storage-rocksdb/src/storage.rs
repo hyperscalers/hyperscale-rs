@@ -1443,8 +1443,7 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
             header: metadata.header,
             transactions,
             certificates,
-            deferred: metadata.manifest.deferred,
-            aborted: metadata.manifest.aborted,
+            abort_intents: metadata.manifest.abort_intents,
         };
 
         let elapsed = start.elapsed().as_secs_f64();
@@ -1544,8 +1543,7 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
             header: metadata.header,
             transactions,
             certificates,
-            deferred: metadata.manifest.deferred,
-            aborted: metadata.manifest.aborted,
+            abort_intents: metadata.manifest.abort_intents,
         };
 
         let elapsed = start.elapsed().as_secs_f64();
