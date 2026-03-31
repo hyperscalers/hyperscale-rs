@@ -12,6 +12,15 @@
 //! `jvt_version()` and `state_root_hash()` for state commitment. This ensures
 //! simulation has identical JVT behavior to production.
 
-mod storage;
+mod commit;
+mod consensus;
+pub(crate) mod core;
+mod snapshot;
+mod state;
+mod store;
 
-pub use storage::{SimSnapshot, SimStorage};
+#[cfg(test)]
+mod tests;
+
+pub use core::SimStorage;
+pub use snapshot::SimSnapshot;

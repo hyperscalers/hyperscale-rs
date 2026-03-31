@@ -1,0 +1,233 @@
+//! Shared state types for simulated storage.
+//!
+//! Contains the internal state structures protected by RwLocks in `SimStorage`.
+
+use hyperscale_storage::{
+    jmt::{StoredNodeKey, TypedInMemoryTreeStore},
+    keys, DatabaseUpdate, DatabaseUpdates, DbPartitionKey, JvtSnapshot, PartitionDatabaseUpdates,
+    StateRootHash,
+};
+use hyperscale_types::{
+    Block, BlockHeight, Hash, LedgerTransactionReceipt, LocalTransactionExecution,
+    QuorumCertificate, RoutableTransaction, TransactionCertificate,
+};
+use im::OrdMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
+
+// ═══════════════════════════════════════════════════════════════════════
+// Shared substate + JVT state (single RwLock)
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Substate data and JVT state protected by a single RwLock.
+///
+/// A single lock ensures association resolution can read substate data
+/// atomically, avoiding deadlock.
+///
+/// Using RwLock (instead of Mutex) allows concurrent read access: speculative
+/// JVT computations from `prepare_block_commit` take a read lock and can run
+/// concurrently with other readers, while commits take a write lock.
+pub(crate) struct SharedState {
+    /// Radix substate data. `im::OrdMap` for O(1) structural-sharing clones.
+    pub data: OrdMap<Vec<u8>, Vec<u8>>,
+    pub tree_store: TypedInMemoryTreeStore,
+    pub current_block_height: u64,
+    pub current_root_hash: StateRootHash,
+    /// Leaf-key → substate-value associations for historical queries.
+    pub associations: HashMap<StoredNodeKey, Vec<u8>>,
+    /// MVCC versioned substate store: `(storage_key, version) → Option<value>`.
+    /// BTreeMap ordering gives prefix scans and version ordering for free.
+    /// A `None` value is a tombstone (deleted substate).
+    pub versioned_substates: VersionedSubstateStore,
+}
+
+impl SharedState {
+    pub(crate) fn new() -> Self {
+        Self {
+            data: OrdMap::new(),
+            // Pruning disabled: historical substate reads traverse the JVT at
+            // past heights and need old nodes to still exist. In production,
+            // RocksDB GC respects `jvt_history_length` (default 256).
+            // In simulation, tests are short-lived so retaining all nodes is fine.
+            tree_store: TypedInMemoryTreeStore::new(),
+            current_block_height: 0,
+            current_root_hash: Hash::ZERO,
+            versioned_substates: BTreeMap::new(),
+            associations: HashMap::new(),
+        }
+    }
+
+    /// Apply a JVT snapshot directly, inserting precomputed nodes.
+    ///
+    /// This is the fast path for block commit when we have a cached snapshot
+    /// from verification. Also stores leaf-to-substate associations for
+    /// historical queries.
+    pub(crate) fn apply_jvt_snapshot(&mut self, snapshot: JvtSnapshot) {
+        use hyperscale_storage::jmt::WriteableTreeStore;
+
+        if self.current_root_hash != snapshot.base_root {
+            panic!(
+                "JVT snapshot base ROOT mismatch: expected {:?}, got {:?}.",
+                snapshot.base_root, self.current_root_hash
+            );
+        }
+        if self.current_block_height != snapshot.base_version {
+            tracing::debug!(
+                expected_version = snapshot.base_version,
+                actual_version = self.current_block_height,
+                "JVT snapshot base VERSION mismatch (root matches) - proceeding. \
+                 This is expected when empty commits advance the version counter."
+            );
+        }
+
+        for (key, node) in snapshot.nodes {
+            self.tree_store.insert_node(key, node);
+        }
+        for stale_part in snapshot.stale_tree_parts {
+            self.tree_store.record_stale_tree_part(stale_part);
+        }
+        for a in snapshot.leaf_substate_associations {
+            self.associations.insert(a.tree_node_key, a.substate_value);
+        }
+
+        self.current_block_height = snapshot.new_version;
+        self.current_root_hash = snapshot.result_root;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Consolidated consensus state (single RwLock)
+// ═══════════════════════════════════════════════════════════════════════
+
+/// All consensus-related metadata bundled into a single RwLock.
+pub(crate) struct ConsensusState {
+    /// Committed blocks indexed by height.
+    pub blocks: BTreeMap<BlockHeight, (Block, QuorumCertificate)>,
+    /// Committed height.
+    pub committed_height: BlockHeight,
+    /// Committed block hash.
+    pub committed_hash: Option<Hash>,
+    /// Latest QC.
+    pub committed_qc: Option<QuorumCertificate>,
+    /// Transactions indexed by hash.
+    pub transactions: HashMap<Hash, RoutableTransaction>,
+    /// Transaction certificates indexed by transaction hash.
+    pub certificates: HashMap<Hash, TransactionCertificate>,
+    /// Our own votes indexed by height.
+    /// **BFT Safety Critical**: Used to prevent equivocation after restart.
+    pub own_votes: HashMap<u64, (Hash, u64)>,
+    /// Ledger receipts keyed by transaction hash.
+    pub ledger_receipts: HashMap<Hash, Arc<LedgerTransactionReceipt>>,
+    /// Local execution details keyed by transaction hash.
+    pub local_executions: HashMap<Hash, LocalTransactionExecution>,
+    /// Insertion height for each receipt, enabling height-based pruning.
+    pub receipt_heights: HashMap<Hash, u64>,
+}
+
+/// Maximum number of blocks worth of receipts to retain in simulation storage.
+const SIM_RECEIPT_RETENTION_BLOCKS: u64 = 1_000;
+
+impl ConsensusState {
+    pub(crate) fn new() -> Self {
+        Self {
+            blocks: BTreeMap::new(),
+            committed_height: BlockHeight(0),
+            committed_hash: None,
+            committed_qc: None,
+            transactions: HashMap::new(),
+            certificates: HashMap::new(),
+            own_votes: HashMap::new(),
+            ledger_receipts: HashMap::new(),
+            local_executions: HashMap::new(),
+            receipt_heights: HashMap::new(),
+        }
+    }
+
+    /// Prune receipts older than the retention window.
+    pub(crate) fn prune_receipts(&mut self, committed_height: u64) {
+        let cutoff = committed_height.saturating_sub(SIM_RECEIPT_RETENTION_BLOCKS);
+        if cutoff == 0 {
+            return;
+        }
+        self.receipt_heights.retain(|tx_hash, height| {
+            if *height <= cutoff {
+                self.ledger_receipts.remove(tx_hash);
+                self.local_executions.remove(tx_hash);
+                false
+            } else {
+                true
+            }
+        });
+    }
+}
+
+/// MVCC versioned substate store type: `(storage_key, version) → Option<value>`.
+pub(crate) type VersionedSubstateStore = BTreeMap<(Vec<u8>, u64), Option<Vec<u8>>>;
+
+/// Apply database updates to the data OrdMap and optionally the MVCC versioned store.
+///
+/// When `versioned` is `Some((version, btree))`, also writes each update to the
+/// versioned store keyed by `(storage_key, version)`. Deletes are written as
+/// `None` (tombstone).
+pub(crate) fn apply_updates_to_ordmap(
+    data: &mut OrdMap<Vec<u8>, Vec<u8>>,
+    updates: &DatabaseUpdates,
+    mut versioned: Option<(u64, &mut VersionedSubstateStore)>,
+) {
+    for (node_key, node_updates) in &updates.node_updates {
+        for (partition_num, partition_updates) in &node_updates.partition_updates {
+            let partition_key = DbPartitionKey {
+                node_key: node_key.clone(),
+                partition_num: *partition_num,
+            };
+
+            match partition_updates {
+                PartitionDatabaseUpdates::Delta { substate_updates } => {
+                    for (sort_key, update) in substate_updates {
+                        let key = keys::to_storage_key(&partition_key, sort_key);
+                        match update {
+                            DatabaseUpdate::Set(value) => {
+                                data.insert(key.clone(), value.clone());
+                                if let Some((ver, vs)) = &mut versioned {
+                                    vs.insert((key, *ver), Some(value.clone()));
+                                }
+                            }
+                            DatabaseUpdate::Delete => {
+                                data.remove(&key);
+                                if let Some((ver, vs)) = &mut versioned {
+                                    vs.insert((key, *ver), None);
+                                }
+                            }
+                        }
+                    }
+                }
+                PartitionDatabaseUpdates::Reset {
+                    new_substate_values,
+                } => {
+                    // Delete all existing in partition using range scan
+                    let prefix = keys::partition_prefix(&partition_key);
+                    let end = keys::next_prefix(&prefix).expect("storage key prefix overflow");
+
+                    let existing_keys: Vec<Vec<u8>> =
+                        data.range(prefix..end).map(|(k, _)| k.clone()).collect();
+
+                    for key in existing_keys {
+                        data.remove(&key);
+                        if let Some((ver, vs)) = &mut versioned {
+                            vs.insert((key, *ver), None);
+                        }
+                    }
+
+                    // Insert new values
+                    for (sort_key, value) in new_substate_values {
+                        let key = keys::to_storage_key(&partition_key, sort_key);
+                        data.insert(key.clone(), value.clone());
+                        if let Some((ver, vs)) = &mut versioned {
+                            vs.insert((key, *ver), Some(value.clone()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
