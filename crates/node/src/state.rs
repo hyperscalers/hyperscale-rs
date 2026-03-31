@@ -913,6 +913,9 @@ impl StateMachine for NodeStateMachine {
             ProtocolEvent::ReceiptRootVerified { block_hash, valid } => self
                 .bft
                 .on_receipt_root_verified(self.topology.snapshot(), block_hash, valid),
+            ProtocolEvent::AbortIntentProofsVerified { block_hash, valid } => self
+                .bft
+                .on_abort_intents_verified(self.topology.snapshot(), block_hash, valid),
             ProtocolEvent::ProposalBuilt {
                 height,
                 round,

@@ -113,6 +113,9 @@ pub enum ProtocolEvent {
     /// Receipt root verification completed.
     ReceiptRootVerified { block_hash: Hash, valid: bool },
 
+    /// Abort intent inclusion proof verification completed.
+    AbortIntentProofsVerified { block_hash: Hash, valid: bool },
+
     /// Proposal block built by the runner.
     ProposalBuilt {
         height: BlockHeight,
@@ -364,6 +367,7 @@ impl ProtocolEvent {
             ProtocolEvent::StateRootVerified { .. } => "StateRootVerified",
             ProtocolEvent::TransactionRootVerified { .. } => "TransactionRootVerified",
             ProtocolEvent::ReceiptRootVerified { .. } => "ReceiptRootVerified",
+            ProtocolEvent::AbortIntentProofsVerified { .. } => "AbortIntentProofsVerified",
             ProtocolEvent::ProposalBuilt { .. } => "ProposalBuilt",
 
             // State Commit

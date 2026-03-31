@@ -337,7 +337,7 @@ impl BftState {
             return vec![];
         }
 
-        self.remote_headers.insert(key, header);
+        self.remote_headers.insert(key, Arc::clone(&header));
 
         // Update tip and prune old headers for this shard.
         let tip = self
@@ -353,7 +353,9 @@ impl BftState {
                 .retain(|&(s, h), _| s != shard || h.0 >= cutoff);
         }
 
-        vec![]
+        // Unblock any pending abort intent verifications waiting on this header.
+        self.verification
+            .on_remote_header_arrived(shard, height, &header)
     }
 
     /// Compute vote recipients for a vote at the given height/round.
@@ -1951,8 +1953,23 @@ impl BftState {
                     );
                 }
 
-                // If any verifications were initiated, wait for them to complete.
-                if !verification_actions.is_empty() {
+                // Verify abort intent inclusion proofs if block has livelock intents.
+                // Resolves remote headers directly and either dispatches
+                // verification or parks until missing headers arrive.
+                if self.verification.needs_abort_intent_verification(&block) {
+                    verification_actions.extend(
+                        self.verification.initiate_abort_intent_verification(
+                            block_hash,
+                            &block,
+                            &self.remote_headers,
+                        ),
+                    );
+                }
+
+                // If any verifications were initiated or abort intent verification
+                // is pending (via ready queue), wait for them to complete.
+                if !verification_actions.is_empty() || !self.verification.is_block_verified(&block)
+                {
                     return verification_actions;
                 }
             }
@@ -1995,8 +2012,9 @@ impl BftState {
                             abort.tx_hash, winner_tx_hash
                         ));
                     }
-                    // Merkle inclusion proof verification happens off-thread
-                    // (same pattern as VerifyProvisionBatch).
+                    // Merkle inclusion proof verification is dispatched off-thread
+                    // via VerifyAbortIntentProofs (initiated in try_vote_on_block,
+                    // enriched by NodeStateMachine with remote header data).
                 }
             }
         }
@@ -2667,6 +2685,57 @@ impl BftState {
         let round = pending_block.header().round;
 
         // All verifications complete - vote
+        self.create_vote(topology, block_hash, height, round)
+    }
+
+    /// Handle abort intent proof verification result.
+    ///
+    /// Called when the runner completes `Action::VerifyAbortIntentProofs`. If any
+    /// proof is invalid, the block is rejected. If valid, proceeds to vote for
+    /// the block (assuming other verifications are also complete).
+    #[instrument(skip(self), fields(block_hash = ?block_hash, valid = valid))]
+    pub fn on_abort_intents_verified(
+        &mut self,
+        topology: &TopologySnapshot,
+        block_hash: Hash,
+        valid: bool,
+    ) -> Vec<Action> {
+        if !self
+            .verification
+            .on_abort_intents_verified(block_hash, valid)
+        {
+            warn!(
+                block_hash = ?block_hash,
+                "Abort intent proof verification FAILED - block contains invalid inclusion proofs!"
+            );
+            self.pending_blocks.remove(&block_hash);
+            return vec![];
+        }
+
+        let Some(pending_block) = self.pending_blocks.get(&block_hash) else {
+            warn!(
+                block_hash = ?block_hash,
+                "Abort intent proof verification complete but pending block not found"
+            );
+            return vec![];
+        };
+
+        let block = match pending_block.block() {
+            Some(b) => b,
+            None => return vec![],
+        };
+
+        if !self.verification.is_block_verified(&block) {
+            debug!(
+                block_hash = ?block_hash,
+                "Abort intent proofs done, waiting for other verifications"
+            );
+            return vec![];
+        }
+
+        let height = pending_block.header().height.0;
+        let round = pending_block.header().round;
+
         self.create_vote(topology, block_hash, height, round)
     }
 

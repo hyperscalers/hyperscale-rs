@@ -58,6 +58,7 @@ pub(crate) fn dispatch_pool_for(action: &Action) -> Option<DispatchPool> {
         Action::VerifyStateRoot { .. } => Some(DispatchPool::ConsensusCrypto),
         Action::VerifyTransactionRoot { .. } => Some(DispatchPool::ConsensusCrypto),
         Action::VerifyReceiptRoot { .. } => Some(DispatchPool::ConsensusCrypto),
+        Action::VerifyAbortIntentProofs { .. } => Some(DispatchPool::ConsensusCrypto),
         Action::BuildProposal { .. } => Some(DispatchPool::ConsensusCrypto),
 
         // General crypto
@@ -224,6 +225,24 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
                     block_hash,
                     valid,
                 })],
+                prepared_commit: None,
+            })
+        }
+
+        Action::VerifyAbortIntentProofs {
+            block_hash,
+            proof_inputs,
+        } => {
+            let start = std::time::Instant::now();
+            let valid = hyperscale_bft::handlers::verify_abort_intent_proofs(&proof_inputs);
+            metrics::record_signature_verification_latency(
+                "abort_intent_proofs",
+                start.elapsed().as_secs_f64(),
+            );
+            Some(DelegatedResult {
+                events: vec![NodeInput::Protocol(
+                    ProtocolEvent::AbortIntentProofsVerified { block_hash, valid },
+                )],
                 prepared_commit: None,
             })
         }
