@@ -2004,7 +2004,7 @@ impl BftState {
     ///
     /// ## Aborts (TransactionAbort)
     /// - ExecutionTimeout: Structural rules only (timeout threshold is proposer's call)
-    /// - TooManyRetries: Structural rules only (retry count is in the abort itself)
+    /// - LivelockCycle: Hash ordering only (merkle proof verified off-thread)
     fn validate_deferrals_and_aborts(&self, block: &Block) -> Result<(), String> {
         use hyperscale_types::{AbortReason, DeferReason};
         use std::collections::HashSet;
@@ -2081,17 +2081,16 @@ impl BftState {
                     // determines the timeout threshold. If we disagree on thresholds, we'd
                     // need configuration consensus, which is out of scope.
                 }
-                AbortReason::TooManyRetries { retry_count } => {
-                    // Sanity: retry count must be positive
-                    if *retry_count == 0 {
-                        return Err("Invalid abort: TooManyRetries with retry_count 0".to_string());
+                AbortReason::LivelockCycle { winner_tx_hash, .. } => {
+                    // Verify hash ordering: loser (abort target) must have higher hash
+                    if abort.tx_hash <= *winner_tx_hash {
+                        return Err(format!(
+                            "Invalid abort: livelock loser hash {} <= winner hash {}",
+                            abort.tx_hash, winner_tx_hash
+                        ));
                     }
-                    // Note: We don't validate the actual max_retries threshold - that's
-                    // configuration that may differ between nodes.
-                }
-                AbortReason::ExecutionRejected { .. } => {
-                    // No structural validation needed - execution rejection reasons are
-                    // determined by the executor
+                    // Merkle inclusion proof verification happens off-thread
+                    // (same pattern as VerifyProvisionBatch).
                 }
             }
         }
@@ -5600,44 +5599,47 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_abort_too_many_retries() {
+    fn test_validate_abort_livelock_cycle() {
         let (state, _topology) = make_test_state();
 
-        // Valid: retry_count > 0
+        let winner_hash = Hash::from_bytes(b"winner");
+        let loser_hash = Hash::from_bytes(b"zzzloser"); // must be > winner
+
+        // Valid: loser hash > winner hash, non-empty proof
         let valid_abort = TransactionAbort {
-            tx_hash: Hash::from_bytes(b"tx1"),
-            reason: hyperscale_types::AbortReason::TooManyRetries { retry_count: 3 },
+            tx_hash: loser_hash,
+            reason: hyperscale_types::AbortReason::LivelockCycle {
+                winner_tx_hash: winner_hash,
+                source_shard: hyperscale_types::ShardGroupId(1),
+                source_block_height: BlockHeight(5),
+                tx_inclusion_proof: hyperscale_types::TransactionInclusionProof {
+                    siblings: vec![Hash::from_bytes(b"sib1")],
+                    leaf_index: 0,
+                },
+            },
             block_height: BlockHeight(10),
         };
         let block = make_test_block(10, vec![], vec![valid_abort], vec![]);
         assert!(state.validate_deferrals_and_aborts(&block).is_ok());
 
-        // Invalid: retry_count = 0
+        // Invalid: loser hash <= winner hash
         let invalid_abort = TransactionAbort {
-            tx_hash: Hash::from_bytes(b"tx2"),
-            reason: hyperscale_types::AbortReason::TooManyRetries { retry_count: 0 },
+            tx_hash: winner_hash,
+            reason: hyperscale_types::AbortReason::LivelockCycle {
+                winner_tx_hash: loser_hash,
+                source_shard: hyperscale_types::ShardGroupId(1),
+                source_block_height: BlockHeight(5),
+                tx_inclusion_proof: hyperscale_types::TransactionInclusionProof {
+                    siblings: vec![Hash::from_bytes(b"sib1")],
+                    leaf_index: 0,
+                },
+            },
             block_height: BlockHeight(10),
         };
         let block = make_test_block(10, vec![], vec![invalid_abort], vec![]);
         let result = state.validate_deferrals_and_aborts(&block);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("retry_count 0"));
-    }
-
-    #[test]
-    fn test_validate_abort_execution_rejected() {
-        let (state, _topology) = make_test_state();
-
-        // ExecutionRejected always passes (no structural validation)
-        let abort = TransactionAbort {
-            tx_hash: Hash::from_bytes(b"tx1"),
-            reason: hyperscale_types::AbortReason::ExecutionRejected {
-                reason: "insufficient balance".to_string(),
-            },
-            block_height: BlockHeight(10),
-        };
-        let block = make_test_block(10, vec![], vec![abort], vec![]);
-        assert!(state.validate_deferrals_and_aborts(&block).is_ok());
+        assert!(result.unwrap_err().contains("livelock loser hash"));
     }
 
     // ═══════════════════════════════════════════════════════════════════════════

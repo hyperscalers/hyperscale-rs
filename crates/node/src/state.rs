@@ -1161,11 +1161,22 @@ impl StateMachine for NodeStateMachine {
                 // Outcomes were extracted on the handler thread — no data
                 // munging needed here on the main thread.
                 for wr in tx_outcomes {
+                    let (receipt_hash, success, write_nodes) = match wr.outcome {
+                        hyperscale_types::TxExecutionOutcome::Executed {
+                            receipt_hash,
+                            success,
+                            write_nodes,
+                        } => (receipt_hash, success, write_nodes),
+                        hyperscale_types::TxExecutionOutcome::Aborted { .. } => {
+                            // Aborted outcomes come via abort intents, not execution handlers.
+                            continue;
+                        }
+                    };
                     if let Some(completion) = self.execution.record_execution_result(
                         wr.tx_hash,
-                        wr.receipt_hash,
-                        wr.success,
-                        wr.write_nodes,
+                        receipt_hash,
+                        success,
+                        write_nodes,
                     ) {
                         actions.push(Action::SignAndBroadcastExecutionVote {
                             block_hash: completion.block_hash,

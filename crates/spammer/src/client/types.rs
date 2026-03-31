@@ -128,8 +128,8 @@ impl TransactionStatusResponse {
                     .error
                     .as_deref()
                     .and_then(|s| s.parse::<AbortReason>().ok())
-                    .unwrap_or(AbortReason::ExecutionRejected {
-                        reason: self.error.clone().unwrap_or_default(),
+                    .unwrap_or(AbortReason::ExecutionTimeout {
+                        committed_at: BlockHeight(0),
                     });
                 Some(TransactionStatus::Aborted { reason })
             }

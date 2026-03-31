@@ -507,7 +507,7 @@ impl ExecutionState {
         // use it to build the TransactionCertificate. No deferral or abort can
         // override these results without causing split-brain.
         for outcome in &tx_outcomes {
-            if outcome.receipt_hash != Hash::ZERO {
+            if !outcome.is_aborted() {
                 self.execution_sealed
                     .insert(outcome.tx_hash, self.committed_height);
             }
@@ -765,11 +765,7 @@ impl ExecutionState {
         // Feed each tx's outcome to per-tx CertificateTracker for finalization.
         // Deferred/aborted txs (Hash::ZERO) are filtered by handle_certificate_internal.
         for outcome in &certificate.tx_outcomes {
-            let proof = ShardExecutionProof {
-                receipt_hash: outcome.receipt_hash,
-                success: outcome.success,
-                write_nodes: outcome.write_nodes.clone(),
-            };
+            let proof = outcome.to_shard_proof();
 
             actions.extend(self.handle_certificate_internal(
                 topology,
@@ -818,14 +814,7 @@ impl ExecutionState {
                     .entry(outcome.tx_hash)
                     .or_insert_with(|| (Vec::new(), current_height))
                     .0
-                    .push((
-                        shard,
-                        ShardExecutionProof {
-                            receipt_hash: outcome.receipt_hash,
-                            success: outcome.success,
-                            write_nodes: outcome.write_nodes.clone(),
-                        },
-                    ));
+                    .push((shard, outcome.to_shard_proof()));
             }
         }
 
@@ -881,11 +870,7 @@ impl ExecutionState {
 
         // Extract per-tx outcomes — feed to tracker if exists, buffer otherwise
         for outcome in &certificate.tx_outcomes {
-            let proof = ShardExecutionProof {
-                receipt_hash: outcome.receipt_hash,
-                success: outcome.success,
-                write_nodes: outcome.write_nodes.clone(),
-            };
+            let proof = outcome.to_shard_proof();
 
             if self.certificate_trackers.contains_key(&outcome.tx_hash) {
                 actions.extend(self.handle_certificate_internal(
