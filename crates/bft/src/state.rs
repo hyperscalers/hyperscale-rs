@@ -909,7 +909,14 @@ impl BftState {
         // pending/certified blocks above committed height. Excluding these
         // prevents the same item appearing in consecutive blocks during the
         // two-chain commit window (mempool ready-set is only cleared on commit).
-        let (qc_chain_cert_hashes, qc_chain_tx_hashes) = self.collect_qc_chain_hashes(parent_hash);
+        let (qc_chain_cert_hashes, qc_chain_tx_hashes, qc_chain_abort_hashes) =
+            self.collect_qc_chain_hashes(parent_hash);
+
+        // Filter abort intents already in the QC chain
+        let abort_intents_with_height: Vec<AbortIntent> = abort_intents_with_height
+            .into_iter()
+            .filter(|a| !qc_chain_abort_hashes.contains(&a.tx_hash))
+            .collect();
 
         // Filter transactions and certificates already in the QC chain.
         let transactions: Vec<Arc<RoutableTransaction>> = if qc_chain_tx_hashes.is_empty() {
@@ -1573,8 +1580,6 @@ impl BftState {
                 block_hash = ?block_hash,
                 missing_txs = pending.missing_transaction_count(),
                 missing_certs = pending.missing_certificate_count(),
-                tx_timeout_ms = self.config.transaction_fetch_timeout.as_millis(),
-                cert_timeout_ms = self.config.certificate_fetch_timeout.as_millis(),
                 "Block incomplete, will fetch after timeout if still missing"
             );
         }
@@ -2036,7 +2041,7 @@ impl BftState {
             return Ok(());
         }
 
-        let (_, qc_chain_tx_hashes) = self.collect_qc_chain_hashes(block.header.parent_hash);
+        let (_, qc_chain_tx_hashes, _) = self.collect_qc_chain_hashes(block.header.parent_hash);
 
         for tx in &block.transactions {
             if qc_chain_tx_hashes.contains(&tx.hash()) {
@@ -4387,9 +4392,12 @@ impl BftState {
     ) -> (
         std::collections::HashSet<Hash>,
         std::collections::HashSet<Hash>,
+        std::collections::HashSet<Hash>,
     ) {
         let mut cert_hashes: std::collections::HashSet<Hash> = std::collections::HashSet::new();
         let mut tx_hashes: std::collections::HashSet<Hash> = std::collections::HashSet::new();
+        let mut abort_intent_hashes: std::collections::HashSet<Hash> =
+            std::collections::HashSet::new();
 
         // Walk full blocks (certified_blocks + assembled pending_blocks + genesis)
         let mut current_hash = parent_hash;
@@ -4402,6 +4410,9 @@ impl BftState {
             }
             for tx in &block.transactions {
                 tx_hashes.insert(tx.hash());
+            }
+            for intent in &block.abort_intents {
+                abort_intent_hashes.insert(intent.tx_hash);
             }
             current_hash = block.header.parent_hash;
         }
@@ -4420,12 +4431,15 @@ impl BftState {
                     for tx_hash in &pending.manifest().tx_hashes {
                         tx_hashes.insert(*tx_hash);
                     }
+                    for intent in &pending.manifest().abort_intents {
+                        abort_intent_hashes.insert(intent.tx_hash);
+                    }
                 }
                 current_hash = pending.header().parent_hash;
             }
         }
 
-        (cert_hashes, tx_hashes)
+        (cert_hashes, tx_hashes, abort_intent_hashes)
     }
 
     /// Get the BFT configuration.
