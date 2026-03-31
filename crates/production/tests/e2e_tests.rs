@@ -69,8 +69,7 @@ async fn test_storage_operations() {
         header: header.clone(),
         transactions: vec![],
         certificates: vec![],
-        deferred: vec![],
-        aborted: vec![],
+        abort_intents: vec![],
     };
 
     let qc = QuorumCertificate::genesis();

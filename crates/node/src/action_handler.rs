@@ -274,8 +274,7 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
             transactions,
             certificates,
             per_cert_updates,
-            deferred,
-            aborted,
+            abort_intents,
             waves,
         } => {
             let merged_updates =
@@ -293,8 +292,7 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
                 transactions,
                 certificates,
                 merged_updates,
-                deferred,
-                aborted,
+                abort_intents,
                 shard_group_id,
                 waves,
             );

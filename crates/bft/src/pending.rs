@@ -198,15 +198,13 @@ impl PendingBlock {
             .filter_map(|hash| self.received_certificates.remove(hash))
             .collect();
 
-        let deferred = self.manifest.deferred.clone();
-        let aborted = self.manifest.aborted.clone();
+        let abort_intents = self.manifest.abort_intents.clone();
 
         let block = Arc::new(Block {
             header: self.header.clone(),
             transactions,
             certificates,
-            deferred,
-            aborted,
+            abort_intents,
         });
 
         self.constructed_block = Some(Arc::clone(&block));

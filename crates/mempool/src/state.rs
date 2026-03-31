@@ -659,14 +659,50 @@ impl MempoolState {
             }
         }
 
-        // Process deferrals - update status to Deferred
-        for deferral in &block.deferred {
-            actions.extend(self.on_deferral_committed(
-                topology,
-                deferral.tx_hash,
-                &deferral.reason,
-                height,
-            ));
+        // Process abort intents - dispatch based on reason variant
+        for intent in &block.abort_intents {
+            match &intent.reason {
+                AbortReason::LivelockCycle {
+                    winner_tx_hash,
+                    source_shard: _,
+                    source_block_height: _,
+                    tx_inclusion_proof: _,
+                } => {
+                    let defer_reason = DeferReason::LivelockCycle {
+                        winner_tx_hash: *winner_tx_hash,
+                    };
+                    actions.extend(self.on_deferral_committed(
+                        topology,
+                        intent.tx_hash,
+                        &defer_reason,
+                        height,
+                    ));
+                }
+                AbortReason::ExecutionTimeout { .. } => {
+                    if let Some(entry) = self.pool.get(&intent.tx_hash) {
+                        let added_at = entry.added_at;
+                        let cross_shard = entry.cross_shard;
+                        let submitted_locally = entry.submitted_locally;
+                        let status = TransactionStatus::Aborted {
+                            reason: intent.reason.clone(),
+                        };
+                        actions.push(Action::EmitTransactionStatus {
+                            tx_hash: intent.tx_hash,
+                            status,
+                            added_at,
+                            cross_shard,
+                            submitted_locally,
+                        });
+                        // Evict from pool and tombstone - terminal state
+                        self.evict_terminal(intent.tx_hash);
+                    }
+
+                    // Also abort any losers that were deferred by this winner.
+                    // If the winner was aborted (e.g., timeout), the losers can never complete
+                    // because they were waiting for the winner to finish.
+                    actions.extend(self.on_winner_aborted(topology, intent.tx_hash, height));
+                }
+            }
         }
 
         // Process certificates - mark completed, trigger retries
@@ -677,33 +713,6 @@ impl MempoolState {
                 cert.decision,
                 height,
             ));
-        }
-
-        // Process aborts - mark as aborted with reason and evict.
-        // Also abort any transactions that were deferred by the aborted winner.
-        for abort in &block.aborted {
-            if let Some(entry) = self.pool.get(&abort.tx_hash) {
-                let added_at = entry.added_at;
-                let cross_shard = entry.cross_shard;
-                let submitted_locally = entry.submitted_locally;
-                let status = TransactionStatus::Aborted {
-                    reason: abort.reason.clone(),
-                };
-                actions.push(Action::EmitTransactionStatus {
-                    tx_hash: abort.tx_hash,
-                    status,
-                    added_at,
-                    cross_shard,
-                    submitted_locally,
-                });
-                // Evict from pool and tombstone - terminal state
-                self.evict_terminal(abort.tx_hash);
-            }
-
-            // Also abort any losers that were deferred by this winner.
-            // If the winner was aborted (e.g., timeout), the losers can never complete
-            // because they were waiting for the winner to finish.
-            actions.extend(self.on_winner_aborted(topology, abort.tx_hash, height));
         }
 
         actions
@@ -2013,9 +2022,9 @@ impl MempoolState {
 mod tests {
     use super::*;
     use hyperscale_types::{
-        generate_bls_keypair, test_utils::test_transaction, Block, BlockHeader, DeferReason,
-        QuorumCertificate, ShardGroupId, TransactionCertificate, TransactionDefer, ValidatorId,
-        ValidatorInfo, ValidatorSet,
+        generate_bls_keypair, test_utils::test_transaction, AbortIntent, Block, BlockHeader,
+        QuorumCertificate, ShardGroupId, TransactionCertificate, ValidatorId, ValidatorInfo,
+        ValidatorSet,
     };
     use std::collections::BTreeMap;
 
@@ -2034,9 +2043,8 @@ mod tests {
     fn make_test_block(
         height: u64,
         transactions: Vec<RoutableTransaction>,
-        deferred: Vec<TransactionDefer>,
+        abort_intents: Vec<AbortIntent>,
         certificates: Vec<TransactionCertificate>,
-        aborted: Vec<TransactionAbort>,
     ) -> Block {
         Block {
             header: BlockHeader {
@@ -2055,8 +2063,7 @@ mod tests {
             },
             transactions: transactions.into_iter().map(Arc::new).collect(),
             certificates: certificates.into_iter().map(Arc::new).collect(),
-            deferred,
-            aborted,
+            abort_intents,
         }
     }
 
@@ -2068,19 +2075,19 @@ mod tests {
         }
     }
 
-    fn make_test_deferral(loser_tx: Hash, winner_tx: Hash, height: u64) -> TransactionDefer {
-        TransactionDefer {
+    fn make_test_deferral(loser_tx: Hash, winner_tx: Hash, height: u64) -> AbortIntent {
+        AbortIntent {
             tx_hash: loser_tx,
-            reason: DeferReason::LivelockCycle {
+            reason: AbortReason::LivelockCycle {
                 winner_tx_hash: winner_tx,
+                source_shard: ShardGroupId(1),
+                source_block_height: BlockHeight(1),
+                tx_inclusion_proof: hyperscale_types::TransactionInclusionProof {
+                    siblings: vec![],
+                    leaf_index: 0,
+                },
             },
             block_height: BlockHeight(height),
-            source_shard: ShardGroupId(1),
-            source_block_height: BlockHeight(1),
-            tx_inclusion_proof: hyperscale_types::TransactionInclusionProof {
-                siblings: vec![],
-                leaf_index: 0,
-            },
         }
     }
 
@@ -2095,7 +2102,7 @@ mod tests {
         mempool.on_submit_transaction(&topology, Arc::new(tx.clone()));
 
         // Commit the transaction first (deferrals apply to committed TXs)
-        let commit_block = make_test_block(1, vec![tx.clone()], vec![], vec![], vec![]);
+        let commit_block = make_test_block(1, vec![tx.clone()], vec![], vec![]);
         mempool.on_block_committed_full(&topology, &commit_block);
 
         // Simulate the TransactionStatusChanged event from execution
@@ -2116,7 +2123,7 @@ mod tests {
         let deferral = make_test_deferral(tx_hash, winner_hash, 2);
 
         // Process block with deferral
-        let defer_block = make_test_block(2, vec![], vec![deferral], vec![], vec![]);
+        let defer_block = make_test_block(2, vec![], vec![deferral], vec![]);
         mempool.on_block_committed_full(&topology, &defer_block);
 
         // Verify status is now Deferred
@@ -2146,18 +2153,13 @@ mod tests {
         mempool.on_submit_transaction(&topology, Arc::new(winner_tx.clone()));
 
         // Commit both
-        let commit_block = make_test_block(
-            1,
-            vec![loser_tx.clone(), winner_tx.clone()],
-            vec![],
-            vec![],
-            vec![],
-        );
+        let commit_block =
+            make_test_block(1, vec![loser_tx.clone(), winner_tx.clone()], vec![], vec![]);
         mempool.on_block_committed_full(&topology, &commit_block);
 
         // Defer the loser
         let deferral = make_test_deferral(loser_hash, winner_hash, 2);
-        let defer_block = make_test_block(2, vec![], vec![deferral], vec![], vec![]);
+        let defer_block = make_test_block(2, vec![], vec![deferral], vec![]);
         mempool.on_block_committed_full(&topology, &defer_block);
 
         // Verify loser is deferred
@@ -2168,7 +2170,7 @@ mod tests {
 
         // Winner's certificate commits
         let winner_cert = make_test_certificate(winner_hash);
-        let cert_block = make_test_block(3, vec![], vec![], vec![winner_cert], vec![]);
+        let cert_block = make_test_block(3, vec![], vec![], vec![winner_cert]);
         let actions = mempool.on_block_committed_full(&topology, &cert_block);
 
         // Should have emitted Retried status for loser
@@ -2217,7 +2219,7 @@ mod tests {
         let tx_hash = tx.hash();
         mempool.on_submit_transaction(&topology, Arc::new(tx.clone()));
 
-        let commit_block = make_test_block(1, vec![tx], vec![], vec![], vec![]);
+        let commit_block = make_test_block(1, vec![tx], vec![], vec![]);
         mempool.on_block_committed_full(&topology, &commit_block);
 
         // Simulate the TransactionStatusChanged event from execution
@@ -2250,7 +2252,7 @@ mod tests {
         let tx_hash = tx.hash();
         mempool.on_submit_transaction(&topology, Arc::new(tx.clone()));
 
-        let commit_block = make_test_block(1, vec![tx], vec![], vec![], vec![]);
+        let commit_block = make_test_block(1, vec![tx], vec![], vec![]);
         mempool.on_block_committed_full(&topology, &commit_block);
 
         // Simulate committed status from execution
@@ -2328,18 +2330,18 @@ mod tests {
         let tx_hash = tx.hash();
         mempool.on_submit_transaction(&topology, Arc::new(tx.clone()));
 
-        let commit_block = make_test_block(1, vec![tx], vec![], vec![], vec![]);
+        let commit_block = make_test_block(1, vec![tx], vec![], vec![]);
         mempool.on_block_committed_full(&topology, &commit_block);
 
         // Process an abort
-        let abort = TransactionAbort {
+        let abort = AbortIntent {
             tx_hash,
             reason: AbortReason::ExecutionTimeout {
                 committed_at: BlockHeight(1),
             },
             block_height: BlockHeight(35),
         };
-        let abort_block = make_test_block(35, vec![], vec![], vec![], vec![abort]);
+        let abort_block = make_test_block(35, vec![], vec![abort], vec![]);
         let actions = mempool.on_block_committed_full(&topology, &abort_block);
 
         // Should have emitted Aborted status
@@ -2406,13 +2408,7 @@ mod tests {
         let winner_cert = make_test_certificate(winner_hash);
 
         // Process block with deferral and certificate, but WITHOUT the loser transaction
-        let sync_block = make_test_block(
-            5,
-            vec![winner_tx],
-            vec![deferral],
-            vec![winner_cert],
-            vec![],
-        );
+        let sync_block = make_test_block(5, vec![winner_tx], vec![deferral], vec![winner_cert]);
         let _actions = mempool.on_block_committed_full(&topology, &sync_block);
 
         // The loser transaction is NOT in the pool
@@ -2425,7 +2421,7 @@ mod tests {
         );
 
         // Now the earlier block arrives with the loser transaction
-        let earlier_block = make_test_block(3, vec![loser_tx.clone()], vec![], vec![], vec![]);
+        let earlier_block = make_test_block(3, vec![loser_tx.clone()], vec![], vec![]);
         let actions = mempool.on_block_committed_full(&topology, &earlier_block);
 
         // The pending retry should have been processed - we should see retry creation actions
@@ -2461,7 +2457,7 @@ mod tests {
 
         // Block N: Deferral without loser tx in pool
         let deferral = make_test_deferral(loser_hash, winner_hash, 5);
-        let block_n = make_test_block(5, vec![], vec![deferral], vec![], vec![]);
+        let block_n = make_test_block(5, vec![], vec![deferral], vec![]);
         mempool.on_block_committed_full(&topology, &block_n);
 
         // Pending deferral should be stored
@@ -2480,7 +2476,7 @@ mod tests {
 
         // Block N+1: Winner's certificate arrives
         let winner_cert = make_test_certificate(winner_hash);
-        let block_n1 = make_test_block(6, vec![winner_tx], vec![], vec![winner_cert], vec![]);
+        let block_n1 = make_test_block(6, vec![winner_tx], vec![], vec![winner_cert]);
         mempool.on_block_committed_full(&topology, &block_n1);
 
         // Pending deferral should be converted to pending retry
@@ -2494,7 +2490,7 @@ mod tests {
         );
 
         // Block N+2: Loser tx finally arrives
-        let block_n2 = make_test_block(7, vec![loser_tx.clone()], vec![], vec![], vec![]);
+        let block_n2 = make_test_block(7, vec![loser_tx.clone()], vec![], vec![]);
         let actions = mempool.on_block_committed_full(&topology, &block_n2);
 
         // Retry should be created
@@ -2526,13 +2522,7 @@ mod tests {
 
         // Block with both loser tx and deferral
         let deferral = make_test_deferral(loser_hash, winner_hash, 5);
-        let block = make_test_block(
-            5,
-            vec![loser_tx.clone(), winner_tx],
-            vec![deferral],
-            vec![],
-            vec![],
-        );
+        let block = make_test_block(5, vec![loser_tx.clone(), winner_tx], vec![deferral], vec![]);
         let actions = mempool.on_block_committed_full(&topology, &block);
 
         // Transaction should be in pool and deferred
@@ -2576,7 +2566,7 @@ mod tests {
 
         // Process blocks in order
         // Block N: TX_A committed
-        let block_n = make_test_block(5, vec![tx_a.clone(), tx_b.clone()], vec![], vec![], vec![]);
+        let block_n = make_test_block(5, vec![tx_a.clone(), tx_b.clone()], vec![], vec![]);
         mempool.on_block_committed_full(&topology, &block_n);
 
         assert!(mempool.pool.contains_key(&tx_a_hash));
@@ -2584,7 +2574,7 @@ mod tests {
 
         // Block N+1: TX_A deferred
         let deferral = make_test_deferral(tx_a_hash, tx_b_hash, 6);
-        let block_n1 = make_test_block(6, vec![], vec![deferral], vec![], vec![]);
+        let block_n1 = make_test_block(6, vec![], vec![deferral], vec![]);
         mempool.on_block_committed_full(&topology, &block_n1);
 
         // TX_A should be Deferred
@@ -2595,7 +2585,7 @@ mod tests {
 
         // Block N+2: TX_B's certificate commits
         let tx_b_cert = make_test_certificate(tx_b_hash);
-        let block_n2 = make_test_block(7, vec![], vec![], vec![tx_b_cert], vec![]);
+        let block_n2 = make_test_block(7, vec![], vec![], vec![tx_b_cert]);
         let actions = mempool.on_block_committed_full(&topology, &block_n2);
 
         // Retry should be created for TX_A
@@ -2628,12 +2618,12 @@ mod tests {
 
         // Submit and commit the transaction
         mempool.on_submit_transaction(&topology, Arc::new(tx.clone()));
-        let commit_block = make_test_block(1, vec![tx], vec![], vec![], vec![]);
+        let commit_block = make_test_block(1, vec![tx], vec![], vec![]);
         mempool.on_block_committed_full(&topology, &commit_block);
 
         // Commit the certificate
         let cert = make_test_certificate(tx_hash);
-        let cert_block = make_test_block(2, vec![], vec![], vec![cert], vec![]);
+        let cert_block = make_test_block(2, vec![], vec![], vec![cert]);
         mempool.on_block_committed_full(&topology, &cert_block);
 
         // Transaction should be tombstoned
@@ -2651,11 +2641,11 @@ mod tests {
 
         // Submit and complete the transaction
         mempool.on_submit_transaction(&topology, Arc::new(tx.clone()));
-        let commit_block = make_test_block(1, vec![tx.clone()], vec![], vec![], vec![]);
+        let commit_block = make_test_block(1, vec![tx.clone()], vec![], vec![]);
         mempool.on_block_committed_full(&topology, &commit_block);
 
         let cert = make_test_certificate(tx_hash);
-        let cert_block = make_test_block(2, vec![], vec![], vec![cert], vec![]);
+        let cert_block = make_test_block(2, vec![], vec![], vec![cert]);
         mempool.on_block_committed_full(&topology, &cert_block);
 
         // Verify it's tombstoned
@@ -2679,11 +2669,11 @@ mod tests {
 
         // Submit and complete the transaction
         mempool.on_submit_transaction(&topology, Arc::new(tx.clone()));
-        let commit_block = make_test_block(1, vec![tx.clone()], vec![], vec![], vec![]);
+        let commit_block = make_test_block(1, vec![tx.clone()], vec![], vec![]);
         mempool.on_block_committed_full(&topology, &commit_block);
 
         let cert = make_test_certificate(tx_hash);
-        let cert_block = make_test_block(2, vec![], vec![], vec![cert], vec![]);
+        let cert_block = make_test_block(2, vec![], vec![], vec![cert]);
         mempool.on_block_committed_full(&topology, &cert_block);
 
         // Try to re-submit - should be rejected (no status emitted)
@@ -2706,14 +2696,14 @@ mod tests {
         mempool.on_submit_transaction(&topology, Arc::new(tx.clone()));
 
         // Abort the transaction
-        let abort = TransactionAbort {
+        let abort = AbortIntent {
             tx_hash,
             reason: AbortReason::ExecutionTimeout {
                 committed_at: BlockHeight(1),
             },
             block_height: BlockHeight(2),
         };
-        let abort_block = make_test_block(2, vec![], vec![], vec![], vec![abort]);
+        let abort_block = make_test_block(2, vec![], vec![abort], vec![]);
         mempool.on_block_committed_full(&topology, &abort_block);
 
         // Transaction should be tombstoned
@@ -2739,23 +2729,17 @@ mod tests {
         mempool.on_submit_transaction(&topology, Arc::new(winner.clone()));
 
         // Commit both
-        let commit_block = make_test_block(
-            1,
-            vec![loser.clone(), winner.clone()],
-            vec![],
-            vec![],
-            vec![],
-        );
+        let commit_block = make_test_block(1, vec![loser.clone(), winner.clone()], vec![], vec![]);
         mempool.on_block_committed_full(&topology, &commit_block);
 
         // Defer the loser
         let deferral = make_test_deferral(loser_hash, winner_hash, 2);
-        let defer_block = make_test_block(2, vec![], vec![deferral], vec![], vec![]);
+        let defer_block = make_test_block(2, vec![], vec![deferral], vec![]);
         mempool.on_block_committed_full(&topology, &defer_block);
 
         // Complete the winner - this creates a retry for the loser
         let cert = make_test_certificate(winner_hash);
-        let cert_block = make_test_block(3, vec![], vec![], vec![cert], vec![]);
+        let cert_block = make_test_block(3, vec![], vec![], vec![cert]);
         mempool.on_block_committed_full(&topology, &cert_block);
 
         // Original loser should be tombstoned
@@ -2777,11 +2761,11 @@ mod tests {
             let tx_hash = tx.hash();
 
             mempool.on_submit_transaction(&topology, Arc::new(tx.clone()));
-            let commit_block = make_test_block(i as u64, vec![tx], vec![], vec![], vec![]);
+            let commit_block = make_test_block(i as u64, vec![tx], vec![], vec![]);
             mempool.on_block_committed_full(&topology, &commit_block);
 
             let cert = make_test_certificate(tx_hash);
-            let cert_block = make_test_block(i as u64 + 100, vec![], vec![], vec![cert], vec![]);
+            let cert_block = make_test_block(i as u64 + 100, vec![], vec![], vec![cert]);
             mempool.on_block_committed_full(&topology, &cert_block);
         }
 
@@ -2811,12 +2795,12 @@ mod tests {
 
         // Commit the transaction
         mempool.on_submit_transaction(&topology, Arc::new(tx.clone()));
-        let commit_block = make_test_block(10, vec![tx.clone()], vec![], vec![], vec![]);
+        let commit_block = make_test_block(10, vec![tx.clone()], vec![], vec![]);
         mempool.on_block_committed_full(&topology, &commit_block);
 
         // Complete the transaction
         let cert = make_test_certificate(tx_hash);
-        let cert_block = make_test_block(11, vec![], vec![], vec![cert], vec![]);
+        let cert_block = make_test_block(11, vec![], vec![], vec![cert]);
         mempool.on_block_committed_full(&topology, &cert_block);
 
         // Pool should be empty

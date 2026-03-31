@@ -1,9 +1,9 @@
 //! Block and BlockHeader types for consensus.
 
 use crate::{
-    compute_merkle_root, compute_merkle_root_with_proof, compute_padded_merkle_root, BlockHeight,
-    Hash, QuorumCertificate, RoutableTransaction, ShardGroupId, TransactionAbort,
-    TransactionCertificate, TransactionDefer, TransactionInclusionProof, ValidatorId, WaveId,
+    compute_merkle_root, compute_merkle_root_with_proof, compute_padded_merkle_root, AbortIntent,
+    BlockHeight, Hash, QuorumCertificate, RoutableTransaction, ShardGroupId,
+    TransactionCertificate, TransactionInclusionProof, ValidatorId, WaveId,
 };
 use sbor::prelude::*;
 use std::sync::Arc;
@@ -208,9 +208,8 @@ impl BlockHeader {
 /// Transactions are stored in a single flat list, sorted by hash for deterministic ordering.
 ///
 /// Additional block contents:
-/// - **certificates**: Finalized transaction certificates (Accept/Reject decisions)
-/// - **deferred**: Transactions deferred due to cross-shard cycles (livelock prevention)
-/// - **aborted**: Transactions aborted due to timeout or rejection
+/// - **certificates**: Finalized transaction certificates (Accept/Reject/Aborted decisions)
+/// - **abort_intents**: Proposals to abort transactions (timeout, livelock cycle)
 ///
 /// Transactions and certificates are stored as `Arc` for efficient cloning
 /// and sharing across the system. When serialized (for storage or network),
@@ -226,11 +225,8 @@ pub struct Block {
     /// Transaction certificates for finalized transactions.
     pub certificates: Vec<Arc<TransactionCertificate>>,
 
-    /// Transactions deferred due to cross-shard livelock cycles.
-    pub deferred: Vec<TransactionDefer>,
-
-    /// Transactions aborted due to timeout or explicit rejection.
-    pub aborted: Vec<TransactionAbort>,
+    /// Abort intents — proposals to the execution voting process.
+    pub abort_intents: Vec<AbortIntent>,
 }
 
 // Manual PartialEq - compare transaction/certificate content, not Arc pointers
@@ -248,8 +244,7 @@ impl PartialEq for Block {
                 .iter()
                 .zip(other.certificates.iter())
                 .all(|(a, b)| a.as_ref() == b.as_ref())
-            && self.deferred == other.deferred
-            && self.aborted == other.aborted
+            && self.abort_intents == other.abort_intents
     }
 }
 
@@ -280,7 +275,7 @@ impl<E: sbor::Encoder<sbor::NoCustomValueKind>> sbor::Encode<sbor::NoCustomValue
     }
 
     fn encode_body(&self, encoder: &mut E) -> Result<(), sbor::EncodeError> {
-        encoder.write_size(5)?;
+        encoder.write_size(4)?;
         encoder.encode(&self.header)?;
         encode_tx_vec(encoder, &self.transactions)?;
         // Certificates (manual encoding to unwrap Arc)
@@ -290,8 +285,7 @@ impl<E: sbor::Encoder<sbor::NoCustomValueKind>> sbor::Encode<sbor::NoCustomValue
         for cert in &self.certificates {
             encoder.encode_deeper_body(cert.as_ref())?;
         }
-        encoder.encode(&self.deferred)?;
-        encoder.encode(&self.aborted)?;
+        encoder.encode(&self.abort_intents)?;
         Ok(())
     }
 }
@@ -335,9 +329,9 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
         decoder.check_preloaded_value_kind(value_kind, sbor::ValueKind::Tuple)?;
         let length = decoder.read_size()?;
 
-        if length != 5 {
+        if length != 4 {
             return Err(sbor::DecodeError::UnexpectedSize {
-                expected: 5,
+                expected: 4,
                 actual: length,
             });
         }
@@ -362,15 +356,13 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
             certificates.push(Arc::new(cert));
         }
 
-        let deferred: Vec<TransactionDefer> = decoder.decode()?;
-        let aborted: Vec<TransactionAbort> = decoder.decode()?;
+        let abort_intents: Vec<AbortIntent> = decoder.decode()?;
 
         Ok(Self {
             header,
             transactions,
             certificates,
-            deferred,
-            aborted,
+            abort_intents,
         })
     }
 }
@@ -396,8 +388,7 @@ impl Block {
             header: BlockHeader::genesis(shard_group_id, proposer, state_root),
             transactions: vec![],
             certificates: vec![],
-            deferred: vec![],
-            aborted: vec![],
+            abort_intents: vec![],
         }
     }
 
@@ -451,39 +442,24 @@ impl Block {
             .any(|cert| &cert.transaction_hash == tx_hash)
     }
 
-    /// Get number of deferred transactions in this block.
-    pub fn deferred_count(&self) -> usize {
-        self.deferred.len()
+    /// Get number of abort intents in this block.
+    pub fn abort_intent_count(&self) -> usize {
+        self.abort_intents.len()
     }
 
-    /// Get transaction hashes of deferred transactions.
-    pub fn deferred_transaction_hashes(&self) -> Vec<Hash> {
-        self.deferred.iter().map(|d| d.tx_hash).collect()
+    /// Get transaction hashes of abort intents.
+    pub fn abort_intent_hashes(&self) -> Vec<Hash> {
+        self.abort_intents.iter().map(|a| a.tx_hash).collect()
     }
 
-    /// Check if this block contains a deferral for a specific transaction.
-    pub fn contains_deferral(&self, tx_hash: &Hash) -> bool {
-        self.deferred.iter().any(|d| &d.tx_hash == tx_hash)
-    }
-
-    /// Get number of aborted transactions in this block.
-    pub fn aborted_count(&self) -> usize {
-        self.aborted.len()
-    }
-
-    /// Get transaction hashes of aborted transactions.
-    pub fn aborted_transaction_hashes(&self) -> Vec<Hash> {
-        self.aborted.iter().map(|a| a.tx_hash).collect()
-    }
-
-    /// Check if this block contains an abort for a specific transaction.
-    pub fn contains_abort(&self, tx_hash: &Hash) -> bool {
-        self.aborted.iter().any(|a| &a.tx_hash == tx_hash)
+    /// Check if this block contains an abort intent for a specific transaction.
+    pub fn contains_abort_intent(&self, tx_hash: &Hash) -> bool {
+        self.abort_intents.iter().any(|a| &a.tx_hash == tx_hash)
     }
 
     /// Check if this block has any livelock-related content.
     pub fn has_livelock_content(&self) -> bool {
-        !self.deferred.is_empty() || !self.aborted.is_empty()
+        !self.abort_intents.is_empty()
     }
 }
 
@@ -492,7 +468,7 @@ impl Block {
 // ============================================================================
 
 /// Hash-level description of a block's contents (transactions, certificates,
-/// deferrals, and aborts).
+/// and abort intents).
 ///
 /// This is the common denominator shared by `BlockHeaderNotification`, `BlockMetadata`,
 /// and `ProtocolEvent::BlockHeaderReceived`. Extracting it into a standalone type
@@ -505,11 +481,8 @@ pub struct BlockManifest {
     /// Certificate hashes in block order.
     pub cert_hashes: Vec<Hash>,
 
-    /// Deferred transactions (small, stored inline).
-    pub deferred: Vec<TransactionDefer>,
-
-    /// Aborted transactions (small, stored inline).
-    pub aborted: Vec<TransactionAbort>,
+    /// Abort intents (small, stored inline).
+    pub abort_intents: Vec<AbortIntent>,
 }
 
 impl BlockManifest {
@@ -527,8 +500,7 @@ impl BlockManifest {
                 .iter()
                 .map(|c| c.transaction_hash)
                 .collect(),
-            deferred: block.deferred.clone(),
-            aborted: block.aborted.clone(),
+            abort_intents: block.abort_intents.clone(),
         }
     }
 }

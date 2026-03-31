@@ -1,12 +1,12 @@
-//! LivelockState sub-state machine for cycle detection and deferral management.
+//! LivelockState sub-state machine for cycle detection and abort intent management.
 //!
 //! This module implements the provision-based cycle detection system that
 //! prevents bidirectional livelock in cross-shard transactions.
 
 use crate::tracker::{CommittedCrossShardTracker, ProvisionTracker, RemoteStateNeeds};
 use hyperscale_types::{
-    BlockHeight, DeferReason, Hash, NodeId, RoutableTransaction, ShardGroupId, StateEntry,
-    TopologySnapshot, TransactionDefer, TransactionInclusionProof,
+    AbortIntent, AbortReason, BlockHeight, Hash, NodeId, RoutableTransaction, ShardGroupId,
+    StateEntry, TopologySnapshot, TransactionInclusionProof,
 };
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -15,11 +15,11 @@ use tracing::{debug, trace};
 /// Output produced by the livelock state machine when a cycle is detected.
 ///
 /// The caller must fetch the inclusion proof from the source shard and then
-/// call `on_inclusion_proof_received` to complete the deferral.
+/// call `on_inclusion_proof_received` to complete the abort intent queuing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LivelockOutput {
     /// A cycle was detected; fetch the merkle inclusion proof for the winner TX
-    /// from its source shard before we can queue the deferral.
+    /// from its source shard before we can queue the abort intent.
     FetchInclusionProof {
         source_shard: ShardGroupId,
         source_block_height: BlockHeight,
@@ -77,12 +77,12 @@ pub struct LivelockState {
     /// haven't received them yet.
     pending_proof_fetches: HashSet<Hash>,
 
-    /// Deferrals ready to be included in next block proposal.
+    /// Abort intents ready to be included in next block proposal.
     /// Kept until they appear in a committed block.
-    pending_deferrals: Vec<TransactionDefer>,
+    pending_abort_intents: Vec<AbortIntent>,
 
-    /// Hash set tracking queued deferral tx_hashes for deduplication.
-    pending_deferral_hashes: HashSet<Hash>,
+    /// Hash set tracking queued abort intent tx_hashes for deduplication.
+    pending_abort_intent_hashes: HashSet<Hash>,
 
     /// Current time.
     now: Duration,
@@ -97,7 +97,10 @@ impl std::fmt::Debug for LivelockState {
             .field("committed_tracker_len", &self.committed_tracker.len())
             .field("provision_tracker_len", &self.provision_tracker.len())
             .field("tombstones_len", &self.tombstones.len())
-            .field("pending_deferrals_len", &self.pending_deferrals.len())
+            .field(
+                "pending_abort_intents_len",
+                &self.pending_abort_intents.len(),
+            )
             .finish()
     }
 }
@@ -121,8 +124,8 @@ impl LivelockState {
             provision_tracker: ProvisionTracker::new(),
             tombstones: HashMap::new(),
             pending_proof_fetches: HashSet::new(),
-            pending_deferrals: Vec::new(),
-            pending_deferral_hashes: HashSet::new(),
+            pending_abort_intents: Vec::new(),
+            pending_abort_intent_hashes: HashSet::new(),
             now: Duration::ZERO,
             config,
         }
@@ -326,9 +329,9 @@ impl LivelockState {
                     "TRUE cycle detected with overlapping nodes - requesting inclusion proof"
                 );
 
-                // Don't queue the deferral yet — we need the inclusion proof first.
+                // Don't queue the abort intent yet — we need the inclusion proof first.
                 // Track that we have an in-flight fetch for this loser.
-                if !self.pending_deferral_hashes.contains(&loser)
+                if !self.pending_abort_intent_hashes.contains(&loser)
                     && !self.pending_proof_fetches.contains(&loser)
                 {
                     self.pending_proof_fetches.insert(loser);
@@ -354,8 +357,8 @@ impl LivelockState {
 
     /// Called when the inclusion proof for a winner transaction has been fetched.
     ///
-    /// Completes the two-phase deferral: the proof is attached to the
-    /// `TransactionDefer` which is then queued for block inclusion.
+    /// Completes the two-phase abort intent: the proof is attached to the
+    /// `AbortIntent` which is then queued for block inclusion.
     pub fn on_inclusion_proof_received(
         &mut self,
         winner_tx_hash: Hash,
@@ -365,7 +368,7 @@ impl LivelockState {
         source_block_height: BlockHeight,
     ) {
         self.pending_proof_fetches.remove(&loser_tx_hash);
-        self.queue_deferral(
+        self.queue_abort_intent(
             loser_tx_hash,
             winner_tx_hash,
             source_shard,
@@ -374,11 +377,11 @@ impl LivelockState {
         );
     }
 
-    /// Queue a deferral for inclusion in the next block.
+    /// Queue an abort intent for inclusion in the next block.
     ///
-    /// The deferral carries a merkle inclusion proof for the winner transaction.
-    /// BFT validation rejects deferrals without valid proofs.
-    fn queue_deferral(
+    /// The abort intent carries a merkle inclusion proof for the winner transaction.
+    /// BFT validation rejects abort intents without valid proofs.
+    fn queue_abort_intent(
         &mut self,
         loser_tx: Hash,
         winner_tx: Hash,
@@ -387,55 +390,50 @@ impl LivelockState {
         proof: TransactionInclusionProof,
     ) {
         // Check if already queued
-        if self.pending_deferral_hashes.contains(&loser_tx) {
-            trace!(tx = %loser_tx, "Deferral already queued");
+        if self.pending_abort_intent_hashes.contains(&loser_tx) {
+            trace!(tx = %loser_tx, "Abort intent already queued");
             return;
         }
 
-        let deferral = TransactionDefer {
+        let abort_intent = AbortIntent {
             tx_hash: loser_tx,
-            reason: DeferReason::LivelockCycle {
+            reason: AbortReason::LivelockCycle {
                 winner_tx_hash: winner_tx,
+                source_shard,
+                source_block_height,
+                tx_inclusion_proof: proof,
             },
             block_height: BlockHeight(0), // Will be filled in when included in block
-            source_shard,
-            source_block_height,
-            tx_inclusion_proof: proof,
         };
 
         debug!(
             loser_tx = %loser_tx,
             winner_tx = %winner_tx,
             source_shard = source_shard.0,
-            "Queuing deferral with inclusion proof"
+            "Queuing abort intent with inclusion proof"
         );
 
-        self.pending_deferral_hashes.insert(loser_tx);
-        self.pending_deferrals.push(deferral);
+        self.pending_abort_intent_hashes.insert(loser_tx);
+        self.pending_abort_intents.push(abort_intent);
     }
 
-    /// Get pending deferrals for block inclusion.
+    /// Get pending abort intents for block inclusion.
     ///
-    /// Returns a reference to the pending deferrals. Deferrals are only removed
-    /// when they appear in a committed block.
-    pub fn get_pending_deferrals(&self) -> &[TransactionDefer] {
-        &self.pending_deferrals
+    /// Returns a reference to the pending abort intents. Abort intents are only
+    /// removed when they appear in a committed block.
+    pub fn get_pending_abort_intents(&self) -> &[AbortIntent] {
+        &self.pending_abort_intents
     }
 
     /// Called when a block is committed.
     ///
-    /// Processes deferrals, aborts, and certificates to clean up tracking state.
+    /// Processes abort intents and certificates to clean up tracking state.
     pub fn on_block_committed(&mut self, block: &hyperscale_types::Block) {
         let height = block.header.height;
 
-        // Process committed deferrals
-        for deferral in &block.deferred {
-            self.on_deferral_committed(&deferral.tx_hash);
-        }
-
-        // Process committed aborts
-        for abort in &block.aborted {
-            self.on_abort_committed(&abort.tx_hash);
+        // Process committed abort intents (covers both livelock deferrals and timeouts)
+        for intent in &block.abort_intents {
+            self.on_abort_intent_committed(&intent.tx_hash);
         }
 
         // Process committed certificates (transactions completed)
@@ -443,62 +441,50 @@ impl LivelockState {
             self.on_certificate_committed(&cert.transaction_hash);
         }
 
-        // Remove deferrals that were included in this block from both Vec and HashSet
-        for deferral in &block.deferred {
-            self.pending_deferral_hashes.remove(&deferral.tx_hash);
+        // Remove abort intents that were included in this block from both Vec and HashSet
+        for intent in &block.abort_intents {
+            self.pending_abort_intent_hashes.remove(&intent.tx_hash);
         }
 
-        // Remove pending deferrals whose loser transaction was aborted in this block.
-        // If the loser is aborted (e.g., timeout), the deferral is pointless — the
-        // loser will never be retried. Keeping it would poison every proposal we make.
-        for abort in &block.aborted {
-            if self.pending_deferral_hashes.remove(&abort.tx_hash) {
-                tracing::info!(
-                    tx_hash = %abort.tx_hash,
-                    "Removed pending deferral for aborted transaction"
-                );
-            }
-        }
-
-        // Also remove pending deferrals whose winner transaction was aborted.
-        // If the winner is gone, the deferral can never complete (the loser was
+        // Also remove pending abort intents whose winner transaction was aborted in this block.
+        // If the winner is gone, the abort intent can never complete (the loser was
         // waiting for the winner to finish). The mempool handles creating a retry
-        // via on_winner_aborted; we just need to stop proposing the stale deferral.
+        // via on_winner_aborted; we just need to stop proposing the stale intent.
         {
             let aborted_hashes: std::collections::HashSet<_> =
-                block.aborted.iter().map(|a| a.tx_hash).collect();
+                block.abort_intents.iter().map(|a| a.tx_hash).collect();
             let mut removed_for_winner_abort = Vec::new();
-            for d in &self.pending_deferrals {
-                let DeferReason::LivelockCycle { winner_tx_hash } = &d.reason;
-                if aborted_hashes.contains(winner_tx_hash) {
-                    removed_for_winner_abort.push(d.tx_hash);
-                    tracing::info!(
-                        loser = %d.tx_hash,
-                        winner = %winner_tx_hash,
-                        "Removed pending deferral: winner was aborted"
-                    );
+            for intent in &self.pending_abort_intents {
+                if let AbortReason::LivelockCycle { winner_tx_hash, .. } = &intent.reason {
+                    if aborted_hashes.contains(winner_tx_hash) {
+                        removed_for_winner_abort.push(intent.tx_hash);
+                        tracing::info!(
+                            loser = %intent.tx_hash,
+                            winner = %winner_tx_hash,
+                            "Removed pending abort intent: winner was aborted"
+                        );
+                    }
                 }
             }
             for tx_hash in &removed_for_winner_abort {
-                self.pending_deferral_hashes.remove(tx_hash);
+                self.pending_abort_intent_hashes.remove(tx_hash);
             }
         }
 
-        // Keep only deferrals still in our hash set (those not in this block)
-        self.pending_deferrals
-            .retain(|d| self.pending_deferral_hashes.contains(&d.tx_hash));
+        // Keep only abort intents still in our hash set (those not in this block)
+        self.pending_abort_intents
+            .retain(|d| self.pending_abort_intent_hashes.contains(&d.tx_hash));
 
         trace!(
             height = height.0,
-            deferred = block.deferred.len(),
-            aborted = block.aborted.len(),
+            abort_intents = block.abort_intents.len(),
             certificates = block.certificates.len(),
             "Processed block commit for livelock state"
         );
     }
 
-    /// Called when a deferral commits.
-    fn on_deferral_committed(&mut self, tx_hash: &Hash) {
+    /// Called when an abort intent commits.
+    fn on_abort_intent_committed(&mut self, tx_hash: &Hash) {
         // Add tombstone with TTL
         let expiry = self.now + self.config.tombstone_ttl;
         self.tombstones.insert(*tx_hash, expiry);
@@ -511,22 +497,8 @@ impl LivelockState {
         debug!(
             tx = %tx_hash,
             tombstone_expiry = ?expiry,
-            "Deferral committed - added tombstone"
+            "Abort intent committed - added tombstone"
         );
-    }
-
-    /// Called when an abort commits.
-    fn on_abort_committed(&mut self, tx_hash: &Hash) {
-        // Add tombstone to prevent late provisions from re-populating state
-        let expiry = self.now + self.config.tombstone_ttl;
-        self.tombstones.insert(*tx_hash, expiry);
-
-        // Remove from tracking
-        self.committed_tracker.remove(tx_hash);
-        self.provision_tracker.remove_tx(tx_hash);
-        self.pending_proof_fetches.remove(tx_hash);
-
-        debug!(tx = %tx_hash, "Abort committed - added tombstone");
     }
 
     /// Called when a certificate commits.
@@ -573,7 +545,7 @@ impl LivelockState {
     /// Get statistics for metrics.
     pub fn stats(&self) -> LivelockStats {
         LivelockStats {
-            pending_deferrals: self.pending_deferrals.len(),
+            pending_abort_intents: self.pending_abort_intents.len(),
             active_tombstones: self.tombstones.len(),
             tracked_transactions: self.committed_tracker.len(),
             pending_proof_fetches: self.pending_proof_fetches.len(),
@@ -584,8 +556,8 @@ impl LivelockState {
 /// Statistics from the livelock state machine for metrics.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct LivelockStats {
-    /// Number of deferrals queued for next block.
-    pub pending_deferrals: usize,
+    /// Number of abort intents queued for next block.
+    pub pending_abort_intents: usize,
     /// Number of active tombstones (recently completed transactions).
     pub active_tombstones: usize,
     /// Number of transactions being tracked for cycle detection.
@@ -597,7 +569,7 @@ pub struct LivelockStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hyperscale_types::{TransactionInclusionProof, ValidatorId};
+    use hyperscale_types::{AbortReason, TransactionInclusionProof, ValidatorId};
 
     fn make_test_node_id(id: u8) -> NodeId {
         // Create a simple NodeId from bytes
@@ -675,16 +647,16 @@ mod tests {
         outputs
     }
 
-    fn make_test_deferral(loser: Hash, winner: Hash) -> TransactionDefer {
-        TransactionDefer {
+    fn make_test_abort_intent(loser: Hash, winner: Hash) -> AbortIntent {
+        AbortIntent {
             tx_hash: loser,
-            reason: DeferReason::LivelockCycle {
+            reason: AbortReason::LivelockCycle {
                 winner_tx_hash: winner,
+                source_shard: ShardGroupId(1),
+                source_block_height: BlockHeight(1),
+                tx_inclusion_proof: dummy_proof(),
             },
             block_height: BlockHeight(5),
-            source_shard: ShardGroupId(1),
-            source_block_height: BlockHeight(1),
-            tx_inclusion_proof: dummy_proof(),
         }
     }
 
@@ -720,8 +692,8 @@ mod tests {
             }
         }
 
-        // No deferral queued yet
-        assert!(state.get_pending_deferrals().is_empty());
+        // No abort intent queued yet
+        assert!(state.get_pending_abort_intents().is_empty());
 
         // Phase 2: simulate proof received
         state.on_inclusion_proof_received(
@@ -732,12 +704,14 @@ mod tests {
             BlockHeight(1),
         );
 
-        // Now the deferral should be queued
-        let deferrals = state.get_pending_deferrals();
-        assert_eq!(deferrals.len(), 1);
-        assert_eq!(deferrals[0].tx_hash, local_tx);
+        // Now the abort intent should be queued
+        let abort_intents = state.get_pending_abort_intents();
+        assert_eq!(abort_intents.len(), 1);
+        assert_eq!(abort_intents[0].tx_hash, local_tx);
 
-        let DeferReason::LivelockCycle { winner_tx_hash } = &deferrals[0].reason;
+        let AbortReason::LivelockCycle { winner_tx_hash, .. } = &abort_intents[0].reason else {
+            panic!("Expected LivelockCycle reason");
+        };
         assert_eq!(*winner_tx_hash, remote_tx);
     }
 
@@ -761,7 +735,7 @@ mod tests {
             state.on_provision_accepted(remote_tx, ShardGroupId(1), BlockHeight(1), &entries);
 
         assert!(outputs.is_empty());
-        assert!(state.get_pending_deferrals().is_empty());
+        assert!(state.get_pending_abort_intents().is_empty());
     }
 
     #[test]
@@ -785,7 +759,7 @@ mod tests {
             state.on_provision_accepted(remote_tx, ShardGroupId(1), BlockHeight(1), &entries);
 
         assert!(outputs.is_empty());
-        assert!(state.get_pending_deferrals().is_empty());
+        assert!(state.get_pending_abort_intents().is_empty());
     }
 
     #[test]
@@ -851,7 +825,7 @@ mod tests {
             &entries,
         );
 
-        assert_eq!(state.get_pending_deferrals().len(), 1);
+        assert_eq!(state.get_pending_abort_intents().len(), 1);
 
         // Receive same quorum again - should NOT queue duplicate
         let entries = make_test_entries_with_nodes(vec![conflicting_node]);
@@ -860,9 +834,9 @@ mod tests {
         assert!(outputs.is_empty());
 
         assert_eq!(
-            state.get_pending_deferrals().len(),
+            state.get_pending_abort_intents().len(),
             1,
-            "Should not queue duplicate deferral"
+            "Should not queue duplicate abort intent"
         );
 
         // Receive quorum from different shard for same cycle - still no duplicate
@@ -872,14 +846,14 @@ mod tests {
         assert!(outputs.is_empty());
 
         assert_eq!(
-            state.get_pending_deferrals().len(),
+            state.get_pending_abort_intents().len(),
             1,
-            "Should still have only one deferral for same tx"
+            "Should still have only one abort intent for same tx"
         );
     }
 
     #[test]
-    fn test_committed_tracker_cleanup_on_deferral() {
+    fn test_committed_tracker_cleanup_on_abort_intent() {
         let mut state = LivelockState::new();
 
         let tx = hash_with_prefix(0xFF);
@@ -892,7 +866,7 @@ mod tests {
         assert!(state.committed_tracker.contains(&tx));
 
         let winner = hash_with_prefix(0x00);
-        let deferral = make_test_deferral(tx, winner);
+        let abort_intent = make_test_abort_intent(tx, winner);
 
         let block = hyperscale_types::Block {
             header: hyperscale_types::BlockHeader {
@@ -911,20 +885,19 @@ mod tests {
             },
             transactions: vec![],
             certificates: vec![],
-            deferred: vec![deferral],
-            aborted: vec![],
+            abort_intents: vec![abort_intent],
         };
 
         state.on_block_committed(&block);
 
         assert!(
             !state.committed_tracker.contains(&tx),
-            "Deferred TX should be removed from committed tracker"
+            "TX with committed abort intent should be removed from committed tracker"
         );
 
         assert!(
             state.tombstones.contains_key(&tx),
-            "Tombstone should be added for deferred TX"
+            "Tombstone should be added for TX with committed abort intent"
         );
     }
 
@@ -964,8 +937,7 @@ mod tests {
             },
             transactions: vec![],
             certificates: vec![std::sync::Arc::new(cert)],
-            deferred: vec![],
-            aborted: vec![],
+            abort_intents: vec![],
         };
 
         state.on_block_committed(&block);
@@ -996,8 +968,8 @@ mod tests {
 
         assert!(outputs.is_empty());
         assert!(
-            state.get_pending_deferrals().is_empty(),
-            "Unidirectional dependency should not cause deferral"
+            state.get_pending_abort_intents().is_empty(),
+            "Unidirectional dependency should not cause abort intent"
         );
     }
 
@@ -1039,8 +1011,7 @@ mod tests {
             },
             transactions: vec![],
             certificates: vec![std::sync::Arc::new(cert)],
-            deferred: vec![],
-            aborted: vec![],
+            abort_intents: vec![],
         };
 
         state.on_block_committed(&block);
@@ -1070,7 +1041,7 @@ mod tests {
             make_remote_state_needs(&[ShardGroupId(1)], vec![(ShardGroupId(1), vec![node])]);
         state.committed_tracker.add(tx, needs);
 
-        let abort = hyperscale_types::TransactionAbort {
+        let abort_intent = hyperscale_types::AbortIntent {
             tx_hash: tx,
             reason: hyperscale_types::AbortReason::ExecutionTimeout {
                 committed_at: BlockHeight(1),
@@ -1095,8 +1066,7 @@ mod tests {
             },
             transactions: vec![],
             certificates: vec![],
-            deferred: vec![],
-            aborted: vec![abort],
+            abort_intents: vec![abort_intent],
         };
 
         state.on_block_committed(&block);
