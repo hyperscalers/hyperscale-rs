@@ -149,25 +149,18 @@ pub struct TxOutcome {
 
 impl TxOutcome {
     /// Convert this outcome into a `ShardExecutionProof` for certificate tracking.
-    ///
-    /// For executed outcomes, extracts the receipt hash, success flag, and write nodes.
-    /// For aborted outcomes, returns a zeroed proof (receipt_hash = ZERO, success = false).
     pub fn to_shard_proof(&self) -> crate::ShardExecutionProof {
         match &self.outcome {
             TxExecutionOutcome::Executed {
                 receipt_hash,
                 success,
                 write_nodes,
-            } => crate::ShardExecutionProof {
+            } => crate::ShardExecutionProof::Executed {
                 receipt_hash: *receipt_hash,
                 success: *success,
                 write_nodes: write_nodes.clone(),
             },
-            TxExecutionOutcome::Aborted { .. } => crate::ShardExecutionProof {
-                receipt_hash: Hash::ZERO,
-                success: false,
-                write_nodes: vec![],
-            },
+            TxExecutionOutcome::Aborted { .. } => crate::ShardExecutionProof::Aborted,
         }
     }
 

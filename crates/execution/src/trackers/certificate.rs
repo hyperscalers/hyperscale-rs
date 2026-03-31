@@ -81,7 +81,7 @@ impl CertificateTracker {
             return self.is_ready();
         }
 
-        let is_abort = proof.receipt_hash == Hash::ZERO;
+        let is_abort = proof.is_aborted();
         self.certificates.insert(shard, proof);
         let ready = self.is_ready();
         tracing::debug!(
@@ -111,9 +111,7 @@ impl CertificateTracker {
 
     /// Check if any shard reported an abort.
     fn has_abort(&self) -> bool {
-        self.certificates
-            .values()
-            .any(|c| c.receipt_hash == Hash::ZERO)
+        self.certificates.values().any(|c| c.is_aborted())
     }
 
     /// Create a `TransactionCertificate` from collected certificates.
@@ -143,13 +141,9 @@ impl CertificateTracker {
             return None;
         }
 
-        // Abort takes unconditional priority. If any shard aborted (receipt_hash
-        // == ZERO from TxOutcome::to_shard_proof()), the TC decision is Aborted
-        // regardless of what other shards reported.
-        let any_aborted = self
-            .certificates
-            .values()
-            .any(|c| c.receipt_hash == Hash::ZERO);
+        // Abort takes unconditional priority — if any shard aborted, the TC
+        // decision is Aborted regardless of what other shards reported.
+        let any_aborted = self.has_abort();
 
         let decision = if any_aborted {
             tracing::debug!(
@@ -163,7 +157,7 @@ impl CertificateTracker {
             let per_shard: Vec<_> = self
                 .certificates
                 .iter()
-                .map(|(s, c)| (*s, c.receipt_hash))
+                .map(|(s, c)| (*s, c.receipt_hash_or_zero()))
                 .collect();
             let first_hash = per_shard[0].1;
             if !per_shard.iter().all(|(_, h)| *h == first_hash) {
@@ -175,7 +169,7 @@ impl CertificateTracker {
                 return None;
             }
 
-            let all_succeeded = self.certificates.values().all(|c| c.success);
+            let all_succeeded = self.certificates.values().all(|c| c.is_success());
             if all_succeeded {
                 tracing::debug!(
                     tx_hash = ?self.tx_hash,
@@ -208,7 +202,7 @@ mod tests {
     use super::*;
 
     fn make_proof(receipt_hash: Hash) -> ShardExecutionProof {
-        ShardExecutionProof {
+        ShardExecutionProof::Executed {
             receipt_hash,
             success: true,
             write_nodes: vec![],

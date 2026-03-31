@@ -78,7 +78,7 @@ pub fn make_mapped_database_update(
 /// Build a `TransactionCertificate` with a deterministic hash derived from `tx_seed`.
 pub fn make_test_certificate(tx_seed: u8, shard: ShardGroupId) -> TransactionCertificate {
     let tx_hash = Hash::from_bytes(&[tx_seed; 32]);
-    let proof = ShardExecutionProof {
+    let proof = ShardExecutionProof::Executed {
         receipt_hash: Hash::from_bytes(&[0; 32]),
         success: true,
         write_nodes: vec![],
@@ -126,7 +126,7 @@ pub fn make_multi_shard_certificate(
     let tx_hash = Hash::from_bytes(&[tx_seed; 32]);
     let mut shard_proofs = BTreeMap::new();
     for shard in shards {
-        let proof = ShardExecutionProof {
+        let proof = ShardExecutionProof::Executed {
             receipt_hash: Hash::from_bytes(&[0; 32]),
             success: true,
             write_nodes: vec![],

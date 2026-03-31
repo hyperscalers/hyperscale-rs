@@ -100,13 +100,40 @@ impl StateEntry {
 /// Stored in `TransactionCertificate.shard_proofs`. BLS signatures are
 /// on the execution certificate, so this type carries only the outcome data.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
-pub struct ShardExecutionProof {
-    /// Hash of the ConsensusReceipt (outcome + event_root).
-    pub receipt_hash: Hash,
-    /// Whether execution succeeded.
-    pub success: bool,
-    /// NodeIds written during execution.
-    pub write_nodes: Vec<NodeId>,
+pub enum ShardExecutionProof {
+    /// Transaction executed on this shard.
+    /// `success=true` means writes were applied; `success=false` means the
+    /// transaction's logic failed (rejection) but execution completed.
+    Executed {
+        /// Hash of the ConsensusReceipt (outcome + event_root).
+        receipt_hash: Hash,
+        /// Whether execution succeeded.
+        success: bool,
+        /// NodeIds written during execution.
+        write_nodes: Vec<NodeId>,
+    },
+    /// Transaction was aborted on this shard before execution completed.
+    Aborted,
+}
+
+impl ShardExecutionProof {
+    /// Whether this shard executed successfully.
+    pub fn is_success(&self) -> bool {
+        matches!(self, ShardExecutionProof::Executed { success: true, .. })
+    }
+
+    /// Whether this shard aborted.
+    pub fn is_aborted(&self) -> bool {
+        matches!(self, ShardExecutionProof::Aborted)
+    }
+
+    /// Get the receipt hash, or `Hash::ZERO` for aborted proofs.
+    pub fn receipt_hash_or_zero(&self) -> Hash {
+        match self {
+            ShardExecutionProof::Executed { receipt_hash, .. } => *receipt_hash,
+            ShardExecutionProof::Aborted => Hash::ZERO,
+        }
+    }
 }
 
 /// State provision from a source shard to a target shard.
@@ -241,13 +268,13 @@ mod tests {
 
     #[test]
     fn test_shard_execution_proof() {
-        let proof = ShardExecutionProof {
+        let proof = ShardExecutionProof::Executed {
             receipt_hash: Hash::from_bytes(b"receipt"),
             success: true,
             write_nodes: vec![],
         };
 
-        assert!(proof.success);
-        assert!(proof.write_nodes.is_empty());
+        assert!(proof.is_success());
+        assert!(!proof.is_aborted());
     }
 }

@@ -685,7 +685,7 @@ mod tests {
             let mut shard_proofs = BTreeMap::new();
             shard_proofs.insert(
                 ShardGroupId(0),
-                ShardExecutionProof {
+                ShardExecutionProof::Executed {
                     receipt_hash: Hash::from_bytes(&[seed + 100; 32]),
                     success: true,
                     write_nodes: vec![],
@@ -715,7 +715,7 @@ mod tests {
         let mut shard_proofs = BTreeMap::new();
         shard_proofs.insert(
             ShardGroupId(0),
-            ShardExecutionProof {
+            ShardExecutionProof::Executed {
                 receipt_hash: Hash::from_bytes(b"receipt_hash_value"),
                 success: true,
                 write_nodes: vec![],
