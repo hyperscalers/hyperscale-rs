@@ -6,8 +6,7 @@
 //! complete, the receipt merkle tree can be built and an execution vote signed.
 
 use hyperscale_types::{
-    compute_execution_receipt_root, Hash, NodeId, ShardGroupId, TxExecutionOutcome, TxOutcome,
-    WaveId,
+    compute_execution_receipt_root, Hash, ShardGroupId, TxExecutionOutcome, TxOutcome, WaveId,
 };
 use std::collections::HashMap;
 
@@ -90,29 +89,21 @@ impl ExecutionAccumulator {
         self.completed.len() == self.expected_txs.len()
     }
 
-    /// Record a transaction's execution result.
+    /// Record a transaction's execution outcome.
     ///
     /// Returns `true` if the wave is now complete (all txs have results).
-    /// Ignores duplicate results for the same tx_hash.
-    pub fn record_result(
-        &mut self,
-        tx_hash: Hash,
-        receipt_hash: Hash,
-        success: bool,
-        write_nodes: Vec<NodeId>,
-    ) -> bool {
+    /// First-write-wins: ignores duplicate results for the same tx_hash.
+    /// This means if execution completes before an abort intent arrives,
+    /// the execution result stands (and vice versa).
+    pub fn record_result(&mut self, tx_hash: Hash, outcome: TxExecutionOutcome) -> bool {
         // Only record if this tx is expected in this wave
         if !self.expected_txs.iter().any(|(h, _)| *h == tx_hash) {
             return false;
         }
 
-        self.completed.entry(tx_hash).or_insert(TxResult {
-            outcome: TxExecutionOutcome::Executed {
-                receipt_hash,
-                success,
-                write_nodes,
-            },
-        });
+        self.completed
+            .entry(tx_hash)
+            .or_insert(TxResult { outcome });
 
         self.is_complete()
     }
@@ -185,6 +176,22 @@ mod tests {
         ExecutionAccumulator::new(WaveId::zero(), Hash::from_bytes(b"block"), 10, txs)
     }
 
+    fn executed(receipt: Hash) -> TxExecutionOutcome {
+        TxExecutionOutcome::Executed {
+            receipt_hash: receipt,
+            success: true,
+            write_nodes: vec![],
+        }
+    }
+
+    fn executed_fail(receipt: Hash) -> TxExecutionOutcome {
+        TxExecutionOutcome::Executed {
+            receipt_hash: receipt,
+            success: false,
+            write_nodes: vec![],
+        }
+    }
+
     #[test]
     fn test_empty_accumulator() {
         let acc = make_accumulator(0);
@@ -201,7 +208,7 @@ mod tests {
         let receipt = Hash::from_bytes(b"receipt");
 
         assert!(!acc.is_complete());
-        assert!(acc.record_result(tx_hash, receipt, true, vec![]));
+        assert!(acc.record_result(tx_hash, executed(receipt)));
         assert!(acc.is_complete());
 
         let (root, outcomes) = acc.build_data().unwrap();
@@ -220,19 +227,18 @@ mod tests {
     fn test_multi_tx_completion() {
         let mut acc = make_accumulator(3);
 
-        // Complete txs out of order
         let tx1 = Hash::from_bytes(&[1u8; 4]);
         let tx0 = Hash::from_bytes(&[0u8; 4]);
         let tx2 = Hash::from_bytes(&[2u8; 4]);
 
-        assert!(!acc.record_result(tx1, Hash::from_bytes(b"r1"), true, vec![]));
+        assert!(!acc.record_result(tx1, executed(Hash::from_bytes(b"r1"))));
         assert_eq!(acc.completed_count(), 1);
         assert!(!acc.is_complete());
 
-        assert!(!acc.record_result(tx0, Hash::from_bytes(b"r0"), true, vec![]));
+        assert!(!acc.record_result(tx0, executed(Hash::from_bytes(b"r0"))));
         assert_eq!(acc.completed_count(), 2);
 
-        assert!(acc.record_result(tx2, Hash::from_bytes(b"r2"), false, vec![]));
+        assert!(acc.record_result(tx2, executed_fail(Hash::from_bytes(b"r2"))));
         assert!(acc.is_complete());
     }
 
@@ -240,15 +246,13 @@ mod tests {
     fn test_order_preserved() {
         let mut acc = make_accumulator(3);
 
-        // Complete in reverse order
         for i in (0..3).rev() {
             let tx = Hash::from_bytes(&[i as u8; 4]);
             let receipt = Hash::from_bytes(&[i as u8 + 100; 4]);
-            acc.record_result(tx, receipt, true, vec![]);
+            acc.record_result(tx, executed(receipt));
         }
 
         let (_, outcomes) = acc.build_data().unwrap();
-        // Outcomes should be in wave order (0, 1, 2), not completion order (2, 1, 0)
         for i in 0..3 {
             assert_eq!(outcomes[i].tx_hash, Hash::from_bytes(&[i as u8; 4]));
         }
@@ -259,11 +263,10 @@ mod tests {
         let mut acc = make_accumulator(1);
         let tx = Hash::from_bytes(&[0u8; 4]);
 
-        acc.record_result(tx, Hash::from_bytes(b"first"), true, vec![]);
-        acc.record_result(tx, Hash::from_bytes(b"second"), false, vec![]);
+        acc.record_result(tx, executed(Hash::from_bytes(b"first")));
+        acc.record_result(tx, executed_fail(Hash::from_bytes(b"second")));
 
         let (_, outcomes) = acc.build_data().unwrap();
-        // First result should win
         match &outcomes[0].outcome {
             TxExecutionOutcome::Executed {
                 receipt_hash,
@@ -282,7 +285,7 @@ mod tests {
         let mut acc = make_accumulator(1);
         let unknown = Hash::from_bytes(b"unknown_tx");
 
-        assert!(!acc.record_result(unknown, Hash::from_bytes(b"r"), true, vec![]));
+        assert!(!acc.record_result(unknown, executed(Hash::from_bytes(b"r"))));
         assert_eq!(acc.completed_count(), 0);
     }
 
@@ -290,9 +293,49 @@ mod tests {
     fn test_build_returns_none_when_incomplete() {
         let mut acc = make_accumulator(2);
         let tx0 = Hash::from_bytes(&[0u8; 4]);
-        acc.record_result(tx0, Hash::from_bytes(b"r"), true, vec![]);
+        acc.record_result(tx0, executed(Hash::from_bytes(b"r")));
 
         assert!(acc.build_data().is_none());
+    }
+
+    #[test]
+    fn test_abort_intent_wins_race() {
+        let mut acc = make_accumulator(1);
+        let tx = Hash::from_bytes(&[0u8; 4]);
+
+        // Abort intent arrives first
+        let abort = TxExecutionOutcome::Aborted {
+            reason: hyperscale_types::AbortReason::ExecutionTimeout {
+                committed_at: hyperscale_types::BlockHeight(5),
+            },
+        };
+        assert!(acc.record_result(tx, abort));
+
+        // Execution result arrives later — ignored (first-write-wins)
+        acc.record_result(tx, executed(Hash::from_bytes(b"late")));
+
+        let (_, outcomes) = acc.build_data().unwrap();
+        assert!(outcomes[0].is_aborted());
+    }
+
+    #[test]
+    fn test_execution_wins_race() {
+        let mut acc = make_accumulator(1);
+        let tx = Hash::from_bytes(&[0u8; 4]);
+
+        // Execution result arrives first
+        assert!(acc.record_result(tx, executed(Hash::from_bytes(b"exec"))));
+
+        // Abort intent arrives later — ignored (first-write-wins)
+        let abort = TxExecutionOutcome::Aborted {
+            reason: hyperscale_types::AbortReason::ExecutionTimeout {
+                committed_at: hyperscale_types::BlockHeight(5),
+            },
+        };
+        acc.record_result(tx, abort);
+
+        let (_, outcomes) = acc.build_data().unwrap();
+        assert!(!outcomes[0].is_aborted());
     }
 
     #[test]

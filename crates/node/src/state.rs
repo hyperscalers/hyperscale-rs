@@ -602,11 +602,19 @@ impl NodeStateMachine {
         // Livelock: process deferrals/aborts/certs, add tombstones, cleanup tracking
         self.livelock.on_block_committed(&block);
 
-        // Notify execution accumulators about deferrals BEFORE cleanup removes
-        // the wave assignment. A deferred tx counts as "resolved" in its wave —
-        // if it was the last unresolved tx, this triggers execution vote signing.
+        // Deferrals feed the accumulator as abort intents.
         for deferral in &block.deferred {
-            if let Some(completion) = self.execution.record_deferral(deferral.tx_hash) {
+            let reason = match &deferral.reason {
+                hyperscale_types::DeferReason::LivelockCycle { winner_tx_hash } => {
+                    hyperscale_types::AbortReason::LivelockCycle {
+                        winner_tx_hash: *winner_tx_hash,
+                        source_shard: deferral.source_shard,
+                        source_block_height: deferral.source_block_height,
+                        tx_inclusion_proof: deferral.tx_inclusion_proof.clone(),
+                    }
+                }
+            };
+            if let Some(completion) = self.execution.record_abort_intent(deferral.tx_hash, reason) {
                 actions.push(Action::SignAndBroadcastExecutionVote {
                     block_hash: completion.block_hash,
                     block_height: completion.block_height,
@@ -626,11 +634,13 @@ impl NodeStateMachine {
             self.execution.cleanup_transaction(&deferral.tx_hash);
         }
 
-        // Notify execution accumulators about aborts BEFORE cleanup removes
-        // the wave assignment. Same pattern as deferrals — aborted txs are
-        // terminal and count as "resolved" in their wave.
+        // Abort intents feed the execution accumulator. If execution already
+        // completed, the intent is ignored (first-write-wins).
         for abort in &block.aborted {
-            if let Some(completion) = self.execution.record_deferral(abort.tx_hash) {
+            if let Some(completion) = self
+                .execution
+                .record_abort_intent(abort.tx_hash, abort.reason.clone())
+            {
                 actions.push(Action::SignAndBroadcastExecutionVote {
                     block_hash: completion.block_hash,
                     block_height: completion.block_height,
@@ -658,8 +668,14 @@ impl NodeStateMachine {
             // (original_hash returns self.hash() for non-retries, but retries
             // are filtered above via is_retry())
             if original_hash != retry_tx.hash() {
-                // Resolve in execution accumulator before cleanup
-                if let Some(completion) = self.execution.record_deferral(original_hash) {
+                // Resolve in execution accumulator before cleanup.
+                // Retried originals are effectively timed out.
+                if let Some(completion) = self.execution.record_abort_intent(
+                    original_hash,
+                    hyperscale_types::AbortReason::ExecutionTimeout {
+                        committed_at: hyperscale_types::BlockHeight(0),
+                    },
+                ) {
                     actions.push(Action::SignAndBroadcastExecutionVote {
                         block_hash: completion.block_hash,
                         block_height: completion.block_height,
@@ -687,13 +703,17 @@ impl NodeStateMachine {
                 .get_receipt_hash(&cert.transaction_hash)
             {
                 if let Some(ec) = cert.shard_proofs.values().next() {
-                    debug_assert_eq!(
-                        local_receipt_hash,
-                        ec.receipt_hash,
-                        "receipt_hash mismatch for tx {}: local engine produced different \
-                         outcome/events than certificate. This indicates an engine determinism bug.",
-                        cert.transaction_hash,
-                    );
+                    // Skip check for aborted transactions — local execution may have
+                    // completed but the abort intent won the accumulator race.
+                    if ec.receipt_hash != Hash::ZERO {
+                        debug_assert_eq!(
+                            local_receipt_hash,
+                            ec.receipt_hash,
+                            "receipt_hash mismatch for tx {}: local engine produced different \
+                             outcome/events than certificate. This indicates an engine determinism bug.",
+                            cert.transaction_hash,
+                        );
+                    }
                 }
             }
 
@@ -1161,23 +1181,10 @@ impl StateMachine for NodeStateMachine {
                 // Outcomes were extracted on the handler thread — no data
                 // munging needed here on the main thread.
                 for wr in tx_outcomes {
-                    let (receipt_hash, success, write_nodes) = match wr.outcome {
-                        hyperscale_types::TxExecutionOutcome::Executed {
-                            receipt_hash,
-                            success,
-                            write_nodes,
-                        } => (receipt_hash, success, write_nodes),
-                        hyperscale_types::TxExecutionOutcome::Aborted { .. } => {
-                            // Aborted outcomes come via abort intents, not execution handlers.
-                            continue;
-                        }
-                    };
-                    if let Some(completion) = self.execution.record_execution_result(
-                        wr.tx_hash,
-                        receipt_hash,
-                        success,
-                        write_nodes,
-                    ) {
+                    if let Some(completion) = self
+                        .execution
+                        .record_execution_result(wr.tx_hash, wr.outcome)
+                    {
                         actions.push(Action::SignAndBroadcastExecutionVote {
                             block_hash: completion.block_hash,
                             block_height: completion.block_height,

@@ -32,9 +32,9 @@
 
 use hyperscale_core::{Action, CrossShardExecutionRequest, ProtocolEvent, ProvisionRequest};
 use hyperscale_types::{
-    BlockHeight, Bls12381G1PublicKey, ExecutionVote, Hash, NodeId, RoutableTransaction,
-    ShardExecutionProof, ShardGroupId, StateProvision, TopologySnapshot, TransactionCertificate,
-    TransactionDecision, ValidatorId, WaveId,
+    AbortReason, BlockHeight, Bls12381G1PublicKey, ExecutionVote, Hash, NodeId,
+    RoutableTransaction, ShardExecutionProof, ShardGroupId, StateProvision, TopologySnapshot,
+    TransactionCertificate, TransactionDecision, TxExecutionOutcome, ValidatorId, WaveId,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -480,15 +480,13 @@ impl ExecutionState {
     pub fn record_execution_result(
         &mut self,
         tx_hash: Hash,
-        receipt_hash: Hash,
-        success: bool,
-        write_nodes: Vec<NodeId>,
+        outcome: TxExecutionOutcome,
     ) -> Option<CompletionData> {
         let wave_key = self.wave_assignments.get(&tx_hash)?.clone();
 
         let accumulator = self.accumulators.get_mut(&wave_key)?;
 
-        if !accumulator.record_result(tx_hash, receipt_hash, success, write_nodes) {
+        if !accumulator.record_result(tx_hash, outcome) {
             return None;
         }
 
@@ -530,14 +528,18 @@ impl ExecutionState {
         })
     }
 
-    /// Record a transaction deferral into the appropriate execution accumulator.
+    /// Record an abort intent into the appropriate execution accumulator.
     ///
-    /// Deferrals are terminal — the tx won't execute on this block. The wave
-    /// accumulator records it with a zeroed receipt_hash and success=false.
+    /// The abort intent is treated as an execution outcome. First-write-wins:
+    /// if execution already completed for this tx, the abort intent is ignored.
     /// If this was the last unresolved tx in the wave, returns completion data
     /// for execution vote signing.
-    pub fn record_deferral(&mut self, tx_hash: Hash) -> Option<CompletionData> {
-        self.record_execution_result(tx_hash, Hash::ZERO, false, vec![])
+    pub fn record_abort_intent(
+        &mut self,
+        tx_hash: Hash,
+        reason: AbortReason,
+    ) -> Option<CompletionData> {
+        self.record_execution_result(tx_hash, TxExecutionOutcome::Aborted { reason })
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -1138,9 +1140,14 @@ impl ExecutionState {
                         .get(&tx_hash)
                         .map(|updates| crate::handlers::extract_write_nodes(updates))
                         .unwrap_or_default();
-                    if let Some(completion) =
-                        self.record_execution_result(tx_hash, receipt_hash, true, write_nodes)
-                    {
+                    if let Some(completion) = self.record_execution_result(
+                        tx_hash,
+                        TxExecutionOutcome::Executed {
+                            receipt_hash,
+                            success: true,
+                            write_nodes,
+                        },
+                    ) {
                         actions.push(Action::SignAndBroadcastExecutionVote {
                             block_hash: completion.block_hash,
                             block_height: completion.block_height,
@@ -1175,9 +1182,14 @@ impl ExecutionState {
                         .get(&tx_hash)
                         .map(|updates| crate::handlers::extract_write_nodes(updates))
                         .unwrap_or_default();
-                    if let Some(completion) =
-                        self.record_execution_result(tx_hash, receipt_hash, true, write_nodes)
-                    {
+                    if let Some(completion) = self.record_execution_result(
+                        tx_hash,
+                        TxExecutionOutcome::Executed {
+                            receipt_hash,
+                            success: true,
+                            write_nodes,
+                        },
+                    ) {
                         actions.push(Action::SignAndBroadcastExecutionVote {
                             block_hash: completion.block_hash,
                             block_height: completion.block_height,
@@ -1433,12 +1445,6 @@ impl ExecutionState {
         cert_shard: ShardGroupId,
         proof: ShardExecutionProof,
     ) -> Vec<Action> {
-        // Skip deferred/aborted tx proofs (Hash::ZERO receipt).
-        // These are terminal states that don't produce TransactionCertificates.
-        if proof.receipt_hash == Hash::ZERO {
-            return vec![];
-        }
-
         let mut actions = Vec::new();
 
         let local_shard = topology.local_shard();
