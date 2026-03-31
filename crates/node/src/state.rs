@@ -619,18 +619,17 @@ impl NodeStateMachine {
                 .execution_cache()
                 .get_receipt_hash(&cert.transaction_hash)
             {
-                if let Some(ec) = cert.shard_proofs.values().next() {
-                    // Skip check for aborted transactions — local execution may have
-                    // completed but the abort intent won the accumulator race.
-                    if ec.receipt_hash != Hash::ZERO {
-                        debug_assert_eq!(
-                            local_receipt_hash,
-                            ec.receipt_hash,
-                            "receipt_hash mismatch for tx {}: local engine produced different \
-                             outcome/events than certificate. This indicates an engine determinism bug.",
-                            cert.transaction_hash,
-                        );
-                    }
+                if let Some(hyperscale_types::ShardExecutionProof::Executed {
+                    receipt_hash, ..
+                }) = cert.shard_proofs.values().next()
+                {
+                    debug_assert_eq!(
+                        local_receipt_hash,
+                        *receipt_hash,
+                        "receipt_hash mismatch for tx {}: local engine produced different \
+                         outcome/events than certificate. This indicates an engine determinism bug.",
+                        cert.transaction_hash,
+                    );
                 }
             }
 

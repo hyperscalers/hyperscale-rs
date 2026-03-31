@@ -787,19 +787,20 @@ impl TransactionCertificate {
 
     /// Check if all shards succeeded.
     pub fn all_shards_succeeded(&self) -> bool {
-        self.shard_proofs.values().all(|proof| proof.success)
+        self.shard_proofs.values().all(|proof| proof.is_success())
     }
 
     /// Combined receipt hash across all shards.
     ///
-    /// For single-shard transactions, returns the shard's `receipt_hash` directly.
+    /// For single-shard transactions, returns the shard's receipt hash directly.
     /// For cross-shard transactions, computes a merkle root over each shard's
-    /// `receipt_hash` in shard ID order (deterministic via BTreeMap).
+    /// receipt hash in shard ID order (deterministic via BTreeMap).
+    /// Aborted shards contribute `Hash::ZERO` to the merkle computation.
     pub fn receipt_hash(&self) -> Hash {
         let hashes: Vec<Hash> = self
             .shard_proofs
             .values()
-            .map(|proof| proof.receipt_hash)
+            .map(|proof| proof.receipt_hash_or_zero())
             .collect();
         match hashes.len() {
             0 => Hash::ZERO,

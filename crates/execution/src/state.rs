@@ -2016,7 +2016,10 @@ impl ExecutionState {
         let written_nodes: HashSet<NodeId> = certificate
             .shard_proofs
             .values()
-            .flat_map(|cert| cert.write_nodes.iter().copied())
+            .flat_map(|proof| match proof {
+                ShardExecutionProof::Executed { write_nodes, .. } => write_nodes.iter().copied(),
+                ShardExecutionProof::Aborted => [].iter().copied(),
+            })
             .collect();
 
         if written_nodes.is_empty() {
@@ -2418,15 +2421,15 @@ mod tests {
         use hyperscale_types::ShardExecutionProof;
 
         let receipt_hash = Hash::from_bytes(b"commitment");
-        let proof = ShardExecutionProof {
+        let proof = ShardExecutionProof::Executed {
             receipt_hash,
             success: true,
             write_nodes: vec![],
         };
 
-        assert!(proof.success);
-        assert_eq!(proof.receipt_hash, receipt_hash);
-        assert!(proof.write_nodes.is_empty());
+        assert!(proof.is_success());
+        assert_eq!(proof.receipt_hash_or_zero(), receipt_hash);
+        assert!(!proof.is_aborted());
     }
 
     #[test]

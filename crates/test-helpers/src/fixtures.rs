@@ -133,7 +133,7 @@ pub fn make_signed_qc(
 ///
 /// Simple proof with no BLS signatures (execution certificates handle signatures).
 pub fn make_shard_execution_proof(receipt_hash: Hash, success: bool) -> ShardExecutionProof {
-    ShardExecutionProof {
+    ShardExecutionProof::Executed {
         receipt_hash,
         success,
         write_nodes: vec![],
@@ -218,7 +218,7 @@ mod tests {
 
         let proof = make_shard_execution_proof(receipt_hash, true);
 
-        assert!(proof.success);
-        assert_eq!(proof.receipt_hash, receipt_hash);
+        assert!(proof.is_success());
+        assert_eq!(proof.receipt_hash_or_zero(), receipt_hash);
     }
 }
