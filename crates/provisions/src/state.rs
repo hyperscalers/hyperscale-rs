@@ -190,14 +190,12 @@ impl ProvisionCoordinator {
         topology: &TopologySnapshot,
         block: &hyperscale_types::Block,
     ) -> Vec<Action> {
-        // Clean up completed transactions (certificates committed)
+        // Clean up completed/aborted transactions (certificates committed).
+        // All terminal states flow through TC commit — abort intents are NOT
+        // terminal (they feed the execution accumulator). The TC with
+        // decision=Aborted is the actual terminal event.
         for cert in &block.certificates {
             self.cleanup_tx(&cert.transaction_hash);
-        }
-
-        // Clean up aborted transactions
-        for intent in &block.abort_intents {
-            self.cleanup_tx(&intent.tx_hash);
         }
 
         // Update local committed height

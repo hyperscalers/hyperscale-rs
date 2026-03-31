@@ -561,11 +561,9 @@ impl MempoolState {
                 TransactionDecision::Accept | TransactionDecision::Reject => {
                     TransactionStatus::Completed(decision)
                 }
-                TransactionDecision::Aborted => TransactionStatus::Aborted {
-                    reason: AbortReason::ExecutionTimeout {
-                        committed_at: BlockHeight(0),
-                    },
-                },
+                TransactionDecision::Aborted => {
+                    TransactionStatus::Completed(TransactionDecision::Aborted)
+                }
             };
 
             actions.push(Action::EmitTransactionStatus {
@@ -1469,13 +1467,13 @@ mod tests {
         let tc_block = make_test_block(35, vec![], vec![abort_tc]);
         let actions = mempool.on_block_committed_full(&topology, &tc_block);
 
-        // Should have emitted Aborted status
+        // Should have emitted Completed(Aborted) status
         let aborted_action = actions.iter().find(|a| {
-            matches!(a, Action::EmitTransactionStatus { tx_hash: h, status: TransactionStatus::Aborted { .. }, .. } if *h == tx_hash)
+            matches!(a, Action::EmitTransactionStatus { tx_hash: h, status: TransactionStatus::Completed(TransactionDecision::Aborted), .. } if *h == tx_hash)
         });
         assert!(
             aborted_action.is_some(),
-            "Should have emitted Aborted status"
+            "Should have emitted Completed(Aborted) status"
         );
 
         // Transaction should be evicted from pool (terminal state)

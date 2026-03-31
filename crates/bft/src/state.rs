@@ -914,10 +914,15 @@ impl BftState {
         let (qc_chain_cert_hashes, qc_chain_tx_hashes, qc_chain_abort_hashes) =
             self.collect_qc_chain_hashes(parent_hash);
 
-        // Filter abort intents already in the QC chain
+        // Filter abort intents already in the QC chain and deduplicate by
+        // tx_hash within this proposal (livelock + timeout can both fire for the
+        // same tx in the same round; keep the first intent, discard duplicates).
+        let mut seen_abort_hashes = std::collections::HashSet::new();
         let abort_intents_with_height: Vec<AbortIntent> = abort_intents_with_height
             .into_iter()
-            .filter(|a| !qc_chain_abort_hashes.contains(&a.tx_hash))
+            .filter(|a| {
+                !qc_chain_abort_hashes.contains(&a.tx_hash) && seen_abort_hashes.insert(a.tx_hash)
+            })
             .collect();
 
         // Filter transactions and certificates already in the QC chain.
@@ -961,7 +966,6 @@ impl BftState {
                 self.get_local_jvt_root()
             });
 
-        // Build set of certificate hashes for stale deferral filtering
         // Track that we have a pending proposal (for correlation)
         self.pending_proposal = Some(PendingProposal {
             height: block_height,

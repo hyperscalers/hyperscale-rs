@@ -99,8 +99,6 @@ pub struct MemoryMetrics {
     pub mempool_pool: usize,
     /// Ready transactions (no node conflicts).
     pub mempool_ready: usize,
-    /// Deferred transactions with their winner.
-    pub mempool_deferred: usize,
     /// Terminal state transactions (for dedup).
     pub mempool_tombstones: usize,
     /// Evicted transactions (for peer fetch).
@@ -109,8 +107,6 @@ pub struct MemoryMetrics {
     pub mempool_locked_nodes: usize,
     /// Distinct committed_at heights tracked for timeout scanning.
     pub mempool_in_flight_heights: usize,
-    /// Retry-exceeded transactions pending abort.
-    pub mempool_retry_exceeded: usize,
 
     // ── Remote Headers ──
     /// Remote headers pending QC verification.
@@ -137,8 +133,8 @@ pub struct MemoryMetrics {
     pub livelock_tombstones: usize,
     /// Loser txs awaiting inclusion proof.
     pub livelock_pending_proof_fetches: usize,
-    /// Deferrals ready for next block proposal.
-    pub livelock_pending_deferrals: usize,
+    /// Abort intents ready for next block proposal.
+    pub livelock_pending_abort_intents: usize,
     /// Cross-shard transactions being tracked for cycle detection.
     pub livelock_tracked_txs: usize,
 
@@ -379,16 +375,16 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     /// Record a livelock cycle detected.
     fn record_livelock_cycle_detected(&self) {}
 
-    /// Record a livelock deferral.
-    fn record_livelock_deferral(&self) {}
+    /// Record an abort intent committed.
+    fn record_livelock_abort_intent(&self) {}
 
-    /// Set the livelock deferred count gauge.
-    fn set_livelock_deferred_count(&self, count: usize) {}
+    /// Set the pending abort intents gauge.
+    fn set_livelock_pending_abort_intents(&self, count: usize) {}
 
     // ── Lock Contention ──────────────────────────────────────────────
 
     /// Set lock contention metrics.
-    fn set_lock_contention(&self, deferred: u64, ratio: f64) {}
+    fn set_lock_contention(&self, ratio: f64) {}
 
     // ── Memory ────────────────────────────────────────────────────────
 
@@ -835,24 +831,24 @@ pub fn record_livelock_cycle_detected() {
     recorder().record_livelock_cycle_detected();
 }
 
-/// Record a livelock deferral.
+/// Record an abort intent committed.
 #[inline]
-pub fn record_livelock_deferral() {
-    recorder().record_livelock_deferral();
+pub fn record_livelock_abort_intent() {
+    recorder().record_livelock_abort_intent();
 }
 
-/// Set the livelock deferred count gauge.
+/// Set the pending abort intents gauge.
 #[inline]
-pub fn set_livelock_deferred_count(count: usize) {
-    recorder().set_livelock_deferred_count(count);
+pub fn set_livelock_pending_abort_intents(count: usize) {
+    recorder().set_livelock_pending_abort_intents(count);
 }
 
 // ── Lock Contention ──────────────────────────────────────────────────
 
 /// Set lock contention metrics.
 #[inline]
-pub fn set_lock_contention(deferred: u64, ratio: f64) {
-    recorder().set_lock_contention(deferred, ratio);
+pub fn set_lock_contention(ratio: f64) {
+    recorder().set_lock_contention(ratio);
 }
 
 // ── Memory ────────────────────────────────────────────────────────

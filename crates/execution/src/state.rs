@@ -506,11 +506,26 @@ impl ExecutionState {
     /// if execution already completed for this tx, the abort intent is ignored.
     /// If this was the last unresolved tx in the wave, returns completion data
     /// for execution vote signing.
+    ///
+    /// NOTE: If the wave was already pruned (tx committed more than
+    /// `WAVE_RETENTION_BLOCKS` ago), this returns `None` and logs a warning.
+    /// Callers should ensure abort intents arrive well within that window.
     pub fn record_abort_intent(
         &mut self,
         tx_hash: Hash,
         reason: AbortReason,
     ) -> Option<CompletionData> {
+        if !self.wave_assignments.contains_key(&tx_hash) {
+            tracing::warn!(
+                tx_hash = %tx_hash,
+                ?reason,
+                committed_height = self.committed_height,
+                "Abort intent for transaction with no active wave assignment \
+                 (wave may have been pruned after {} blocks)",
+                WAVE_RETENTION_BLOCKS,
+            );
+            return None;
+        }
         self.record_execution_result(tx_hash, TxExecutionOutcome::Aborted { reason })
     }
 

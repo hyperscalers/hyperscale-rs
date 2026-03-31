@@ -279,7 +279,8 @@ pub async fn get_transaction_handler(
     // Look up in cache (QuickCache is lock-free, no await needed)
     match state.tx_status_cache.get(&tx_hash) {
         Some(status) => {
-            let (status_str, committed_height, decision) = format_transaction_status(&status);
+            let (status_str, committed_height, decision, error) =
+                format_transaction_status(&status);
 
             (
                 StatusCode::OK,
@@ -288,7 +289,7 @@ pub async fn get_transaction_handler(
                     status: status_str,
                     committed_height,
                     decision,
-                    error: None,
+                    error,
                 }),
             )
         }
@@ -306,10 +307,15 @@ pub async fn get_transaction_handler(
 }
 
 /// Format a TransactionStatus into RPC response fields.
-fn format_transaction_status(status: &TransactionStatus) -> (String, Option<u64>, Option<String>) {
+/// Formatted status fields: (status, committed_height, decision, error).
+fn format_transaction_status(
+    status: &TransactionStatus,
+) -> (String, Option<u64>, Option<String>, Option<String>) {
     match status {
-        TransactionStatus::Pending => ("pending".to_string(), None, None),
-        TransactionStatus::Committed(height) => ("committed".to_string(), Some(height.0), None),
+        TransactionStatus::Pending => ("pending".to_string(), None, None, None),
+        TransactionStatus::Committed(height) => {
+            ("committed".to_string(), Some(height.0), None, None)
+        }
         TransactionStatus::Executed {
             decision,
             committed_at,
@@ -323,6 +329,7 @@ fn format_transaction_status(status: &TransactionStatus) -> (String, Option<u64>
                 "executed".to_string(),
                 Some(committed_at.0),
                 Some(decision_str.to_string()),
+                None,
             )
         }
         TransactionStatus::Completed(decision) => {
@@ -335,10 +342,11 @@ fn format_transaction_status(status: &TransactionStatus) -> (String, Option<u64>
                 "completed".to_string(),
                 None,
                 Some(decision_str.to_string()),
+                None,
             )
         }
         TransactionStatus::Aborted { reason } => {
-            ("aborted".to_string(), None, Some(reason.to_string()))
+            ("aborted".to_string(), None, None, Some(reason.to_string()))
         }
     }
 }
@@ -455,59 +463,68 @@ mod tests {
 
     #[test]
     fn test_format_pending() {
-        let (status, height, decision) = format_transaction_status(&TransactionStatus::Pending);
+        let (status, height, decision, error) =
+            format_transaction_status(&TransactionStatus::Pending);
         assert_eq!(status, "pending");
         assert!(height.is_none());
         assert!(decision.is_none());
+        assert!(error.is_none());
     }
 
     #[test]
     fn test_format_committed() {
-        let (status, height, decision) =
+        let (status, height, decision, error) =
             format_transaction_status(&TransactionStatus::Committed(BlockHeight(42)));
         assert_eq!(status, "committed");
         assert_eq!(height, Some(42));
         assert!(decision.is_none());
+        assert!(error.is_none());
     }
 
     #[test]
     fn test_format_executed_accept() {
-        let (status, height, decision) = format_transaction_status(&TransactionStatus::Executed {
-            decision: TransactionDecision::Accept,
-            committed_at: BlockHeight(5),
-        });
+        let (status, height, decision, error) =
+            format_transaction_status(&TransactionStatus::Executed {
+                decision: TransactionDecision::Accept,
+                committed_at: BlockHeight(5),
+            });
         assert_eq!(status, "executed");
         assert_eq!(height, Some(5));
         assert_eq!(decision, Some("accept".to_string()));
+        assert!(error.is_none());
     }
 
     #[test]
     fn test_format_executed_reject() {
-        let (status, height, decision) = format_transaction_status(&TransactionStatus::Executed {
-            decision: TransactionDecision::Reject,
-            committed_at: BlockHeight(10),
-        });
+        let (status, height, decision, error) =
+            format_transaction_status(&TransactionStatus::Executed {
+                decision: TransactionDecision::Reject,
+                committed_at: BlockHeight(10),
+            });
         assert_eq!(status, "executed");
         assert_eq!(height, Some(10));
         assert_eq!(decision, Some("reject".to_string()));
+        assert!(error.is_none());
     }
 
     #[test]
     fn test_format_completed_accept() {
-        let (status, height, decision) =
+        let (status, height, decision, error) =
             format_transaction_status(&TransactionStatus::Completed(TransactionDecision::Accept));
         assert_eq!(status, "completed");
         assert!(height.is_none());
         assert_eq!(decision, Some("accept".to_string()));
+        assert!(error.is_none());
     }
 
     #[test]
     fn test_format_completed_reject() {
-        let (status, height, decision) =
+        let (status, height, decision, error) =
             format_transaction_status(&TransactionStatus::Completed(TransactionDecision::Reject));
         assert_eq!(status, "completed");
         assert!(height.is_none());
         assert_eq!(decision, Some("reject".to_string()));
+        assert!(error.is_none());
     }
 
     // ═══════════════════════════════════════════════════════════════════════════

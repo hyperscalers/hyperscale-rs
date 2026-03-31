@@ -915,7 +915,7 @@ where
         let total = mempool.len();
         let contention = mempool.lock_contention_stats();
         metrics::set_mempool_size(total);
-        metrics::set_lock_contention(0, contention.contention_ratio());
+        metrics::set_lock_contention(contention.contention_ratio());
         let in_flight = mempool.in_flight();
         metrics::set_in_flight(in_flight);
         metrics::set_backpressure_active(mempool.at_in_flight_limit());
@@ -932,7 +932,7 @@ where
 
         // ── Livelock ──
         let livelock_stats = self.state.livelock().stats();
-        metrics::set_livelock_deferred_count(livelock_stats.pending_abort_intents);
+        metrics::set_livelock_pending_abort_intents(livelock_stats.pending_abort_intents);
 
         // ── Memory ──
         let bft_mem = self.state.bft().memory_stats();
@@ -966,12 +966,10 @@ where
             // Mempool
             mempool_pool: mempool_mem.pool,
             mempool_ready: mempool_mem.ready,
-            mempool_deferred: 0,
             mempool_tombstones: mempool_mem.tombstones,
             mempool_recently_evicted: mempool_mem.recently_evicted,
             mempool_locked_nodes: mempool_mem.locked_nodes,
             mempool_in_flight_heights: mempool_mem.in_flight_heights,
-            mempool_retry_exceeded: 0,
             // Remote Headers
             rh_pending_headers: rh_mem.pending_headers,
             rh_verified_headers: rh_mem.verified_headers,
@@ -985,7 +983,7 @@ where
             // Livelock
             livelock_tombstones: livelock_stats.active_tombstones,
             livelock_pending_proof_fetches: livelock_stats.pending_proof_fetches,
-            livelock_pending_deferrals: livelock_stats.pending_abort_intents,
+            livelock_pending_abort_intents: livelock_stats.pending_abort_intents,
             livelock_tracked_txs: livelock_stats.tracked_transactions,
             // Storage
             jvt_node_cache_entries: self.storage.node_cache_len(),
