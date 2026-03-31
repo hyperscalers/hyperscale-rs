@@ -49,7 +49,11 @@ impl CertificateTracker {
         self.expected_shards.len()
     }
 
-    /// Add a proof for a shard. Returns true if all proofs are collected.
+    /// Add a proof for a shard. Returns true if ready to form a TC.
+    ///
+    /// Ready means either:
+    /// - All expected shards have reported (normal case)
+    /// - Any shard reported an abort (abort takes unconditional priority)
     #[instrument(level = "debug", skip(self, proof), fields(
         tx_hash = %self.tx_hash,
         shard = shard.0,
@@ -74,25 +78,42 @@ impl CertificateTracker {
                 shard = shard.0,
                 "Duplicate proof from shard, ignoring"
             );
-            return self.is_complete();
+            return self.is_ready();
         }
 
+        let is_abort = proof.receipt_hash == Hash::ZERO;
         self.certificates.insert(shard, proof);
-        let complete = self.is_complete();
+        let ready = self.is_ready();
         tracing::debug!(
             tx_hash = ?self.tx_hash,
             shard = shard.0,
             collected = self.certificates.len(),
             expected = self.expected_shards.len(),
-            complete = complete,
+            is_abort = is_abort,
+            ready = ready,
             "Added proof from shard"
         );
-        complete
+        ready
     }
 
     /// Check if we have all expected certificates.
     pub fn is_complete(&self) -> bool {
         self.certificates.len() == self.expected_shards.len()
+    }
+
+    /// Check if we're ready to form a TC.
+    ///
+    /// Ready if all shards reported, OR if any shard aborted (abort is
+    /// unconditionally terminal — waiting for other shards adds no information).
+    pub fn is_ready(&self) -> bool {
+        self.is_complete() || self.has_abort()
+    }
+
+    /// Check if any shard reported an abort.
+    fn has_abort(&self) -> bool {
+        self.certificates
+            .values()
+            .any(|c| c.receipt_hash == Hash::ZERO)
     }
 
     /// Create a `TransactionCertificate` from collected certificates.
@@ -105,19 +126,19 @@ impl CertificateTracker {
     /// - If all shards succeeded, decision is `Accept`; otherwise `Reject`
     ///
     /// Returns `None` if:
-    /// - Not all certificates have been collected
+    /// - Not ready (no abort and not all certificates collected)
     /// - Non-aborted certificates have mismatched receipt hashes (Byzantine behavior)
     #[instrument(level = "debug", skip(self), fields(
         tx_hash = %self.tx_hash,
         shard_count = self.certificates.len(),
     ))]
     pub fn create_tx_certificate(&mut self) -> Option<TransactionCertificate> {
-        if !self.is_complete() {
+        if !self.is_ready() {
             tracing::debug!(
                 tx_hash = ?self.tx_hash,
                 collected = self.certificates.len(),
                 expected = self.expected_shards.len(),
-                "Cannot create TX certificate - not all certificates collected"
+                "Cannot create TX certificate - not ready"
             );
             return None;
         }

@@ -1436,12 +1436,11 @@ impl ExecutionState {
                 tx_hash = ?tx_hash,
                 shards = tracker.certificate_count(),
                 local_shard = local_shard.0,
-                "All certificates collected, creating TransactionCertificate"
+                "Certificate tracker ready, creating TransactionCertificate"
             );
 
             // Create transaction certificate
             if let Some(tx_cert) = tracker.create_tx_certificate() {
-                // Determine if transaction was accepted
                 let accepted = tx_cert.decision == TransactionDecision::Accept;
 
                 tracing::debug!(
