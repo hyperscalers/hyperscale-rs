@@ -6,7 +6,8 @@
 //! complete, the receipt merkle tree can be built and an execution vote signed.
 
 use hyperscale_types::{
-    compute_execution_receipt_root, Hash, NodeId, ShardGroupId, TxOutcome, WaveId,
+    compute_execution_receipt_root, Hash, NodeId, ShardGroupId, TxExecutionOutcome, TxOutcome,
+    WaveId,
 };
 use std::collections::HashMap;
 
@@ -36,9 +37,7 @@ pub struct ExecutionAccumulator {
 /// Execution result for a single transaction.
 #[derive(Debug, Clone)]
 struct TxResult {
-    receipt_hash: Hash,
-    success: bool,
-    write_nodes: Vec<NodeId>,
+    outcome: TxExecutionOutcome,
 }
 
 impl ExecutionAccumulator {
@@ -108,9 +107,11 @@ impl ExecutionAccumulator {
         }
 
         self.completed.entry(tx_hash).or_insert(TxResult {
-            receipt_hash,
-            success,
-            write_nodes,
+            outcome: TxExecutionOutcome::Executed {
+                receipt_hash,
+                success,
+                write_nodes,
+            },
         });
 
         self.is_complete()
@@ -140,9 +141,7 @@ impl ExecutionAccumulator {
                 let result = &self.completed[tx_hash];
                 TxOutcome {
                     tx_hash: *tx_hash,
-                    receipt_hash: result.receipt_hash,
-                    success: result.success,
-                    write_nodes: result.write_nodes.clone(),
+                    outcome: result.outcome.clone(),
                 }
             })
             .collect();
@@ -209,7 +208,12 @@ mod tests {
         assert_ne!(root, Hash::ZERO);
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].tx_hash, tx_hash);
-        assert_eq!(outcomes[0].receipt_hash, receipt);
+        match &outcomes[0].outcome {
+            TxExecutionOutcome::Executed { receipt_hash, .. } => {
+                assert_eq!(*receipt_hash, receipt);
+            }
+            _ => panic!("expected Executed outcome"),
+        }
     }
 
     #[test]
@@ -260,8 +264,17 @@ mod tests {
 
         let (_, outcomes) = acc.build_data().unwrap();
         // First result should win
-        assert_eq!(outcomes[0].receipt_hash, Hash::from_bytes(b"first"));
-        assert!(outcomes[0].success);
+        match &outcomes[0].outcome {
+            TxExecutionOutcome::Executed {
+                receipt_hash,
+                success,
+                ..
+            } => {
+                assert_eq!(*receipt_hash, Hash::from_bytes(b"first"));
+                assert!(success);
+            }
+            _ => panic!("expected Executed outcome"),
+        }
     }
 
     #[test]

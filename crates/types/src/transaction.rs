@@ -354,12 +354,18 @@ impl sbor::Describe<sbor::NoCustomTypeKind> for RoutableTransaction {
 }
 
 /// Final decision for a transaction after cross-shard coordination.
+///
+/// Decision priority: `Aborted > Reject > Accept`. If any shard reports
+/// `Aborted`, the TC decision is `Aborted` regardless of other shards' results.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, BasicSbor)]
 pub enum TransactionDecision {
     /// All shards successfully executed the transaction.
     Accept,
-    /// At least one shard failed to execute the transaction.
+    /// At least one shard failed to execute the transaction (but none aborted).
     Reject,
+    /// At least one shard aborted the transaction (e.g. timeout, livelock).
+    /// Takes priority over Accept/Reject from other shards.
+    Aborted,
 }
 
 // ============================================================================
@@ -428,7 +434,10 @@ pub struct TransactionDefer {
 /// Reason a transaction was aborted.
 ///
 /// Aborts are terminal - the transaction will not be retried and any held
-/// resources are released.
+/// resources are released. Abort reasons are carried in `AbortIntent` (block
+/// level) and `TxExecutionOutcome::Aborted` (EC level). By TC level, the
+/// reason has served its purpose — `TransactionDecision::Aborted` carries
+/// no reason.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, BasicSbor)]
 pub enum AbortReason {
     /// Transaction timed out waiting for execution to complete.
@@ -441,23 +450,20 @@ pub enum AbortReason {
         committed_at: BlockHeight,
     },
 
-    /// Transaction exceeded maximum retry attempts.
+    /// Livelock cycle detected — this transaction is the loser (higher hash).
     ///
-    /// After a transaction is deferred due to livelock cycle detection, it gets
-    /// retried when the winner completes. If it keeps getting deferred and
-    /// exceeds the max retry count, it's permanently aborted.
-    TooManyRetries {
-        /// Number of retry attempts made.
-        retry_count: u32,
-    },
-
-    /// Transaction was explicitly rejected during execution.
-    ///
-    /// The execution engine determined the transaction cannot succeed
-    /// (e.g., insufficient balance, invalid state transition).
-    ExecutionRejected {
-        /// Human-readable reason for rejection.
-        reason: String,
+    /// When two transactions form a bidirectional cross-shard cycle, the
+    /// transaction with the higher hash loses and is aborted. The winner
+    /// (lower hash) continues normally.
+    LivelockCycle {
+        /// Hash of the transaction that won the cycle (lower hash wins).
+        winner_tx_hash: Hash,
+        /// Source shard where the winner transaction was committed.
+        source_shard: ShardGroupId,
+        /// Block height on the source shard where the winner was committed.
+        source_block_height: BlockHeight,
+        /// Merkle inclusion proof for the winner transaction in the source block.
+        tx_inclusion_proof: TransactionInclusionProof,
     },
 }
 
@@ -467,11 +473,16 @@ impl std::fmt::Display for AbortReason {
             AbortReason::ExecutionTimeout { committed_at } => {
                 write!(f, "timeout({})", committed_at.0)
             }
-            AbortReason::TooManyRetries { retry_count } => {
-                write!(f, "retries({})", retry_count)
-            }
-            AbortReason::ExecutionRejected { reason } => {
-                write!(f, "rejected({})", reason)
+            AbortReason::LivelockCycle {
+                winner_tx_hash,
+                source_shard,
+                ..
+            } => {
+                write!(
+                    f,
+                    "livelock(winner: {}, source: {})",
+                    winner_tx_hash, source_shard.0
+                )
             }
         }
     }
@@ -501,15 +512,14 @@ impl std::str::FromStr for AbortReason {
                     committed_at: BlockHeight(height),
                 })
             }
-            "retries" => {
-                let count = inner
-                    .parse::<u32>()
-                    .map_err(|_| format!("invalid retry count: {}", inner))?;
-                Ok(AbortReason::TooManyRetries { retry_count: count })
+            "livelock" => {
+                // Display format is "livelock(winner: <hash>, source: <shard>)"
+                // FromStr is best-effort for logging/debugging; the proof is not round-tripped.
+                Err(format!(
+                    "livelock abort reasons cannot be parsed from string (proof not serializable): {}",
+                    inner
+                ))
             }
-            "rejected" => Ok(AbortReason::ExecutionRejected {
-                reason: inner.to_string(),
-            }),
             _ => Err(format!("unknown abort reason: {}", name)),
         }
     }
@@ -546,33 +556,27 @@ impl TransactionAbort {
         }
     }
 
-    /// Create a new transaction abort for too many retries.
-    pub fn too_many_retries(tx_hash: Hash, block_height: BlockHeight, retry_count: u32) -> Self {
-        Self {
-            tx_hash,
-            reason: AbortReason::TooManyRetries { retry_count },
-            block_height,
-        }
-    }
-
-    /// Create a new transaction abort for execution rejection.
-    pub fn execution_rejected(tx_hash: Hash, block_height: BlockHeight, reason: String) -> Self {
-        Self {
-            tx_hash,
-            reason: AbortReason::ExecutionRejected { reason },
-            block_height,
-        }
-    }
-
     /// Check if this abort is due to a timeout.
     pub fn is_timeout(&self) -> bool {
         matches!(self.reason, AbortReason::ExecutionTimeout { .. })
     }
+}
 
-    /// Check if this abort is due to rejection.
-    pub fn is_rejected(&self) -> bool {
-        matches!(self.reason, AbortReason::ExecutionRejected { .. })
-    }
+/// An abort intent included in a block.
+///
+/// Abort intents are proposals to the execution voting process. They feed into
+/// the execution accumulator but do not directly change mempool state. The
+/// actual abort takes effect only when a Transaction Certificate confirms it.
+#[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
+pub struct AbortIntent {
+    /// Hash of the transaction to abort.
+    pub tx_hash: Hash,
+
+    /// Why the transaction should be aborted.
+    pub reason: AbortReason,
+
+    /// Block height where this intent is being committed.
+    pub block_height: BlockHeight,
 }
 
 /// Details for a retry transaction created after deferral.
@@ -909,11 +913,20 @@ impl std::fmt::Display for TransactionStatus {
             } => {
                 write!(f, "executed(reject)")
             }
+            TransactionStatus::Executed {
+                decision: TransactionDecision::Aborted,
+                ..
+            } => {
+                write!(f, "executed(aborted)")
+            }
             TransactionStatus::Completed(TransactionDecision::Accept) => {
                 write!(f, "completed(accept)")
             }
             TransactionStatus::Completed(TransactionDecision::Reject) => {
                 write!(f, "completed(reject)")
+            }
+            TransactionStatus::Completed(TransactionDecision::Aborted) => {
+                write!(f, "completed(aborted)")
             }
             TransactionStatus::Deferred { by } => write!(f, "deferred({})", by),
             TransactionStatus::Retried { new_tx } => write!(f, "retried({})", new_tx),
@@ -1000,6 +1013,7 @@ fn parse_decision(s: &str) -> Result<TransactionDecision, TransactionStatusParse
     match s {
         "accept" => Ok(TransactionDecision::Accept),
         "reject" => Ok(TransactionDecision::Reject),
+        "aborted" => Ok(TransactionDecision::Aborted),
         _ => Err(TransactionStatusParseError::InvalidValue("decision".into())),
     }
 }

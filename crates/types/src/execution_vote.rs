@@ -15,8 +15,8 @@
 //! Tx ordering within a wave preserves block ordering (stable partition).
 
 use crate::{
-    compute_padded_merkle_root, Bls12381G2Signature, Hash, NodeId, RoutableTransaction,
-    ShardGroupId, SignerBitfield, TopologySnapshot, ValidatorId,
+    compute_padded_merkle_root, AbortReason, Bls12381G2Signature, Hash, NodeId,
+    RoutableTransaction, ShardGroupId, SignerBitfield, TopologySnapshot, ValidatorId,
 };
 use sbor::prelude::*;
 use std::collections::BTreeSet;
@@ -143,12 +143,54 @@ pub fn designated_broadcaster(
 pub struct TxOutcome {
     /// Transaction hash.
     pub tx_hash: Hash,
-    /// Receipt hash (hash of ConsensusReceipt).
-    pub receipt_hash: Hash,
-    /// Whether execution succeeded.
-    pub success: bool,
-    /// NodeIds written by this transaction (for speculative invalidation).
-    pub write_nodes: Vec<NodeId>,
+    /// The execution outcome for this transaction.
+    pub outcome: TxExecutionOutcome,
+}
+
+impl TxOutcome {
+    /// Convert this outcome into a `ShardExecutionProof` for certificate tracking.
+    ///
+    /// For executed outcomes, extracts the receipt hash, success flag, and write nodes.
+    /// For aborted outcomes, returns a zeroed proof (receipt_hash = ZERO, success = false).
+    pub fn to_shard_proof(&self) -> crate::ShardExecutionProof {
+        match &self.outcome {
+            TxExecutionOutcome::Executed {
+                receipt_hash,
+                success,
+                write_nodes,
+            } => crate::ShardExecutionProof {
+                receipt_hash: *receipt_hash,
+                success: *success,
+                write_nodes: write_nodes.clone(),
+            },
+            TxExecutionOutcome::Aborted { .. } => crate::ShardExecutionProof {
+                receipt_hash: Hash::ZERO,
+                success: false,
+                write_nodes: vec![],
+            },
+        }
+    }
+
+    /// Whether this outcome is an abort.
+    pub fn is_aborted(&self) -> bool {
+        matches!(self.outcome, TxExecutionOutcome::Aborted { .. })
+    }
+}
+
+/// The outcome of executing a transaction on a single shard.
+#[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
+pub enum TxExecutionOutcome {
+    /// Transaction executed. `receipt_hash` is the hash of the execution receipt.
+    /// `success=true` means the transaction's logic succeeded (writes applied).
+    /// `success=false` means the transaction's logic failed (no writes).
+    Executed {
+        receipt_hash: Hash,
+        success: bool,
+        write_nodes: Vec<NodeId>,
+    },
+    /// Transaction aborted before execution could complete.
+    /// Carries the reason so the TC can propagate it to all shards.
+    Aborted { reason: AbortReason },
 }
 
 // ============================================================================
@@ -214,13 +256,32 @@ pub struct ExecutionCertificate {
 
 /// Compute the leaf hash for a transaction outcome in the receipt tree.
 ///
-/// Leaf = H(tx_hash || receipt_hash || success_byte)
-pub fn tx_outcome_leaf(tx_hash: &Hash, receipt_hash: &Hash, success: bool) -> Hash {
-    Hash::from_parts(&[
-        tx_hash.as_bytes(),
-        receipt_hash.as_bytes(),
-        &[if success { 1u8 } else { 0u8 }],
-    ])
+/// For executed outcomes: Leaf = H(tx_hash || receipt_hash || success_byte)
+/// For aborted outcomes: Leaf = H(tx_hash || "ABORTED:" || sbor_encode(reason))
+///
+/// The domain tag `b"ABORTED:"` ensures abort leaves can never collide with
+/// executed leaves.
+pub fn tx_outcome_leaf(outcome: &TxOutcome) -> Hash {
+    match &outcome.outcome {
+        TxExecutionOutcome::Executed {
+            receipt_hash,
+            success,
+            ..
+        } => Hash::from_parts(&[
+            outcome.tx_hash.as_bytes(),
+            receipt_hash.as_bytes(),
+            &[if *success { 1u8 } else { 0u8 }],
+        ]),
+        TxExecutionOutcome::Aborted { reason } => {
+            let reason_bytes = basic_encode(reason).expect("SBOR encode of AbortReason");
+            let mut parts =
+                Vec::with_capacity(outcome.tx_hash.as_bytes().len() + 8 + reason_bytes.len());
+            parts.extend_from_slice(outcome.tx_hash.as_bytes());
+            parts.extend_from_slice(b"ABORTED:");
+            parts.extend_from_slice(&reason_bytes);
+            Hash::from_bytes(&parts)
+        }
+    }
 }
 
 /// Compute the receipt root from a list of transaction outcomes.
@@ -230,10 +291,7 @@ pub fn tx_outcome_leaf(tx_hash: &Hash, receipt_hash: &Hash, success: bool) -> Ha
 ///
 /// Outcomes must be in wave order (= block order within the wave).
 pub fn compute_receipt_root(outcomes: &[TxOutcome]) -> Hash {
-    let leaves: Vec<Hash> = outcomes
-        .iter()
-        .map(|o| tx_outcome_leaf(&o.tx_hash, &o.receipt_hash, o.success))
-        .collect();
+    let leaves: Vec<Hash> = outcomes.iter().map(tx_outcome_leaf).collect();
     compute_padded_merkle_root(&leaves)
 }
 
@@ -248,10 +306,7 @@ pub fn compute_receipt_root_with_proof(
     outcomes: &[TxOutcome],
     tx_index: usize,
 ) -> (Hash, Vec<Hash>, u32, Hash) {
-    let leaves: Vec<Hash> = outcomes
-        .iter()
-        .map(|o| tx_outcome_leaf(&o.tx_hash, &o.receipt_hash, o.success))
-        .collect();
+    let leaves: Vec<Hash> = outcomes.iter().map(tx_outcome_leaf).collect();
 
     let leaf_hash = leaves[tx_index];
     let (root, proof) = crate::compute_merkle_root_with_proof(&leaves, tx_index);
@@ -264,9 +319,11 @@ mod tests {
     fn make_outcome(seed: u8) -> TxOutcome {
         TxOutcome {
             tx_hash: Hash::from_bytes(&[seed; 4]),
-            receipt_hash: Hash::from_bytes(&[seed + 100; 4]),
-            success: true,
-            write_nodes: vec![],
+            outcome: TxExecutionOutcome::Executed {
+                receipt_hash: Hash::from_bytes(&[seed + 100; 4]),
+                success: true,
+                write_nodes: vec![],
+            },
         }
     }
 
@@ -303,12 +360,7 @@ mod tests {
     fn test_receipt_root_single_tx() {
         let outcomes = vec![make_outcome(1)];
         let root = compute_receipt_root(&outcomes);
-        // Single leaf: root should be the leaf hash itself
-        let expected = tx_outcome_leaf(
-            &outcomes[0].tx_hash,
-            &outcomes[0].receipt_hash,
-            outcomes[0].success,
-        );
+        let expected = tx_outcome_leaf(&outcomes[0]);
         assert_eq!(root, expected);
     }
 
@@ -340,21 +392,15 @@ mod tests {
 
         let root = compute_receipt_root(&outcomes);
 
-        // Verify proof for each tx
         for i in 0..outcomes.len() {
             let (proof_root, siblings, leaf_index, leaf_hash) =
                 compute_receipt_root_with_proof(&outcomes, i);
 
             assert_eq!(proof_root, root, "Root mismatch for index {i}");
 
-            let expected_leaf = tx_outcome_leaf(
-                &outcomes[i].tx_hash,
-                &outcomes[i].receipt_hash,
-                outcomes[i].success,
-            );
+            let expected_leaf = tx_outcome_leaf(&outcomes[i]);
             assert_eq!(leaf_hash, expected_leaf, "Leaf hash mismatch for index {i}");
 
-            // Verify via inclusion proof
             let inclusion = crate::TransactionInclusionProof {
                 siblings,
                 leaf_index,
@@ -368,11 +414,43 @@ mod tests {
 
     #[test]
     fn test_tx_outcome_leaf_success_matters() {
-        let tx = Hash::from_bytes(b"tx");
-        let receipt = Hash::from_bytes(b"receipt");
+        let success = TxOutcome {
+            tx_hash: Hash::from_bytes(b"tx"),
+            outcome: TxExecutionOutcome::Executed {
+                receipt_hash: Hash::from_bytes(b"receipt"),
+                success: true,
+                write_nodes: vec![],
+            },
+        };
+        let failure = TxOutcome {
+            tx_hash: Hash::from_bytes(b"tx"),
+            outcome: TxExecutionOutcome::Executed {
+                receipt_hash: Hash::from_bytes(b"receipt"),
+                success: false,
+                write_nodes: vec![],
+            },
+        };
+        assert_ne!(tx_outcome_leaf(&success), tx_outcome_leaf(&failure));
+    }
 
-        let leaf_true = tx_outcome_leaf(&tx, &receipt, true);
-        let leaf_false = tx_outcome_leaf(&tx, &receipt, false);
-        assert_ne!(leaf_true, leaf_false);
+    #[test]
+    fn test_tx_outcome_leaf_aborted_differs_from_executed() {
+        let executed = TxOutcome {
+            tx_hash: Hash::from_bytes(b"tx"),
+            outcome: TxExecutionOutcome::Executed {
+                receipt_hash: Hash::from_bytes(b"receipt"),
+                success: true,
+                write_nodes: vec![],
+            },
+        };
+        let aborted = TxOutcome {
+            tx_hash: Hash::from_bytes(b"tx"),
+            outcome: TxExecutionOutcome::Aborted {
+                reason: crate::AbortReason::ExecutionTimeout {
+                    committed_at: crate::BlockHeight(10),
+                },
+            },
+        };
+        assert_ne!(tx_outcome_leaf(&executed), tx_outcome_leaf(&aborted));
     }
 }

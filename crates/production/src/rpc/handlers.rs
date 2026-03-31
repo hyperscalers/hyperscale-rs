@@ -335,6 +335,7 @@ fn format_transaction_status(
             let decision_str = match decision {
                 TransactionDecision::Accept => "accept",
                 TransactionDecision::Reject => "reject",
+                TransactionDecision::Aborted => "aborted",
             };
             (
                 "executed".to_string(),
@@ -348,6 +349,7 @@ fn format_transaction_status(
             let decision_str = match decision {
                 TransactionDecision::Accept => "accept",
                 TransactionDecision::Reject => "reject",
+                TransactionDecision::Aborted => "aborted",
             };
             (
                 "completed".to_string(),

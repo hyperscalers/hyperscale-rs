@@ -80,7 +80,7 @@ pub use block::{
 };
 pub use execution_vote::{
     compute_receipt_root_with_proof, compute_waves, designated_broadcaster, tx_outcome_leaf,
-    ExecutionCertificate, ExecutionVote, TxOutcome, WaveId,
+    ExecutionCertificate, ExecutionVote, TxExecutionOutcome, TxOutcome, WaveId,
 };
 pub use quorum_certificate::QuorumCertificate;
 pub use receipt::{
@@ -92,8 +92,8 @@ pub use signer_bitfield::SignerBitfield;
 pub use state::{ShardExecutionProof, StateEntry, StateProvision};
 pub use topology::{node_id_hash_u64, shard_for_node, TopologySnapshot, TopologySnapshotError};
 pub use transaction::{
-    sign_and_notarize, sign_and_notarize_with_options, AbortReason, DeferReason, ReadyTransactions,
-    RetryDetails, RoutableTransaction, TransactionAbort, TransactionCertificate,
+    sign_and_notarize, sign_and_notarize_with_options, AbortIntent, AbortReason, DeferReason,
+    ReadyTransactions, RetryDetails, RoutableTransaction, TransactionAbort, TransactionCertificate,
     TransactionDecision, TransactionDefer, TransactionError, TransactionStatus,
     TransactionStatusParseError,
 };

@@ -1431,8 +1431,8 @@ impl MempoolState {
         if tx.exceeds_max_retries(self.config.max_retries) {
             self.retry_exceeded.push(TransactionAbort {
                 tx_hash: hash,
-                reason: AbortReason::TooManyRetries {
-                    retry_count: tx.retry_count(),
+                reason: AbortReason::ExecutionTimeout {
+                    committed_at: BlockHeight(0),
                 },
                 block_height: BlockHeight(0),
             });
@@ -2314,7 +2314,7 @@ mod tests {
         assert_eq!(aborts.len(), 1);
         assert!(matches!(
             aborts[0].reason,
-            AbortReason::TooManyRetries { retry_count: 3 }
+            AbortReason::ExecutionTimeout { .. }
         ));
     }
 

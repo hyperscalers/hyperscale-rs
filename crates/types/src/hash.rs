@@ -166,7 +166,7 @@ pub fn compute_merkle_root(hashes: &[Hash]) -> Hash {
 /// against the block header's `transaction_root` (which is QC-attested).
 ///
 /// ~320 bytes for a typical block (10 levels × 32 bytes).
-#[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, BasicSbor)]
 pub struct TransactionInclusionProof {
     /// Sibling hashes from leaf to root, one per tree level.
     pub siblings: Vec<Hash>,

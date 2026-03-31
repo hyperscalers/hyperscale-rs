@@ -126,9 +126,11 @@ pub fn extract_execution_result(result: &hyperscale_engine::SingleTxResult) -> T
     let write_nodes = extract_write_nodes(&result.database_updates);
     TxOutcome {
         tx_hash: result.tx_hash,
-        receipt_hash: result.receipt_hash,
-        success: result.success,
-        write_nodes,
+        outcome: hyperscale_types::TxExecutionOutcome::Executed {
+            receipt_hash: result.receipt_hash,
+            success: result.success,
+            write_nodes,
+        },
     }
 }
 
