@@ -703,13 +703,9 @@ fn test_resolves_livelocks_in_under_x_seconds() {
             );
             last_status_a = status_a.clone();
 
-            // Check if TX A was retried (it should be the loser)
-            if let Some(TransactionStatus::Retried { new_tx }) = &status_a {
-                println!(
-                    "  [iter {}] TX A was retried -> tracking {:?}",
-                    iteration, new_tx
-                );
-                retry_hash = Some(*new_tx);
+            // Check if TX A was aborted (it should be the loser)
+            if let Some(TransactionStatus::Aborted { .. }) = &status_a {
+                println!("  [iter {}] TX A was aborted (livelock loser)", iteration);
                 a_retried = true;
             }
         }

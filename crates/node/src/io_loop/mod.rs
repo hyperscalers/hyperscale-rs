@@ -127,8 +127,6 @@ pub struct NodeStatusSnapshot {
     /// Execution done, awaiting certificate.
     pub mempool_executed: usize,
     pub mempool_total: usize,
-    /// Waiting for winner.
-    pub mempool_deferred: usize,
     pub accepting_rpc_transactions: bool,
     pub at_pending_limit: bool,
 }
@@ -917,7 +915,7 @@ where
         let total = mempool.len();
         let contention = mempool.lock_contention_stats();
         metrics::set_mempool_size(total);
-        metrics::set_lock_contention(contention.deferred_count, contention.contention_ratio());
+        metrics::set_lock_contention(0, contention.contention_ratio());
         let in_flight = mempool.in_flight();
         metrics::set_in_flight(in_flight);
         metrics::set_backpressure_active(mempool.at_in_flight_limit());
@@ -958,7 +956,6 @@ where
             // Execution
             exec_cache_entries: exec_mem.cache_entries,
             exec_finalized_certificates: exec_mem.finalized_certificates,
-            exec_execution_sealed: exec_mem.execution_sealed,
             exec_pending_provisioning: exec_mem.pending_provisioning,
             exec_accumulators: exec_mem.accumulators,
             exec_vote_trackers: exec_mem.vote_trackers,
@@ -969,12 +966,12 @@ where
             // Mempool
             mempool_pool: mempool_mem.pool,
             mempool_ready: mempool_mem.ready,
-            mempool_deferred: mempool_mem.deferred,
+            mempool_deferred: 0,
             mempool_tombstones: mempool_mem.tombstones,
             mempool_recently_evicted: mempool_mem.recently_evicted,
             mempool_locked_nodes: mempool_mem.locked_nodes,
             mempool_in_flight_heights: mempool_mem.in_flight_heights,
-            mempool_retry_exceeded: mempool_mem.retry_exceeded,
+            mempool_retry_exceeded: 0,
             // Remote Headers
             rh_pending_headers: rh_mem.pending_headers,
             rh_verified_headers: rh_mem.verified_headers,
@@ -1012,7 +1009,6 @@ where
             mempool_committed: contention.committed_count as usize,
             mempool_executed: contention.executed_count as usize,
             mempool_total: mempool.len(),
-            mempool_deferred: contention.deferred_count as usize,
             accepting_rpc_transactions: !mempool.at_in_flight_limit(),
             at_pending_limit: mempool.at_pending_limit(),
         }

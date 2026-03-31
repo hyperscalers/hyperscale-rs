@@ -92,7 +92,6 @@ pub async fn status_handler(State(state): State<RpcState>) -> impl IntoResponse 
             committed_count: mempool_snapshot.committed_count,
             executed_count: mempool_snapshot.executed_count,
             total_count: mempool_snapshot.total_count,
-            deferred_count: mempool_snapshot.deferred_count,
         },
     })
 }
@@ -271,8 +270,6 @@ pub async fn get_transaction_handler(
                     status: "error".to_string(),
                     committed_height: None,
                     decision: None,
-                    deferred_by: None,
-                    retry_tx: None,
                     error: Some("Invalid transaction hash: must be 64 hex characters".to_string()),
                 }),
             );
@@ -282,8 +279,7 @@ pub async fn get_transaction_handler(
     // Look up in cache (QuickCache is lock-free, no await needed)
     match state.tx_status_cache.get(&tx_hash) {
         Some(status) => {
-            let (status_str, committed_height, decision, deferred_by, retry_tx) =
-                format_transaction_status(&status);
+            let (status_str, committed_height, decision) = format_transaction_status(&status);
 
             (
                 StatusCode::OK,
@@ -292,8 +288,6 @@ pub async fn get_transaction_handler(
                     status: status_str,
                     committed_height,
                     decision,
-                    deferred_by,
-                    retry_tx,
                     error: None,
                 }),
             )
@@ -305,8 +299,6 @@ pub async fn get_transaction_handler(
                 status: "unknown".to_string(),
                 committed_height: None,
                 decision: None,
-                deferred_by: None,
-                retry_tx: None,
                 error: Some("Transaction not found in cache".to_string()),
             }),
         ),
@@ -314,20 +306,10 @@ pub async fn get_transaction_handler(
 }
 
 /// Format a TransactionStatus into RPC response fields.
-fn format_transaction_status(
-    status: &TransactionStatus,
-) -> (
-    String,
-    Option<u64>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-) {
+fn format_transaction_status(status: &TransactionStatus) -> (String, Option<u64>, Option<String>) {
     match status {
-        TransactionStatus::Pending => ("pending".to_string(), None, None, None, None),
-        TransactionStatus::Committed(height) => {
-            ("committed".to_string(), Some(height.0), None, None, None)
-        }
+        TransactionStatus::Pending => ("pending".to_string(), None, None),
+        TransactionStatus::Committed(height) => ("committed".to_string(), Some(height.0), None),
         TransactionStatus::Executed {
             decision,
             committed_at,
@@ -341,8 +323,6 @@ fn format_transaction_status(
                 "executed".to_string(),
                 Some(committed_at.0),
                 Some(decision_str.to_string()),
-                None,
-                None,
             )
         }
         TransactionStatus::Completed(decision) => {
@@ -355,31 +335,11 @@ fn format_transaction_status(
                 "completed".to_string(),
                 None,
                 Some(decision_str.to_string()),
-                None,
-                None,
             )
         }
-        TransactionStatus::Deferred { by } => (
-            "deferred".to_string(),
-            None,
-            None,
-            Some(hex::encode(by.as_bytes())),
-            None,
-        ),
-        TransactionStatus::Retried { new_tx } => (
-            "retried".to_string(),
-            None,
-            None,
-            None,
-            Some(hex::encode(new_tx.as_bytes())),
-        ),
-        TransactionStatus::Aborted { reason } => (
-            "aborted".to_string(),
-            None,
-            None,
-            None,
-            Some(reason.to_string()),
-        ),
+        TransactionStatus::Aborted { reason } => {
+            ("aborted".to_string(), None, Some(reason.to_string()))
+        }
     }
 }
 
@@ -395,7 +355,6 @@ pub async fn mempool_handler(State(state): State<RpcState>) -> impl IntoResponse
         committed_count: snapshot.committed_count,
         executed_count: snapshot.executed_count,
         total_count: snapshot.total_count,
-        deferred_count: snapshot.deferred_count,
     })
 }
 
@@ -496,98 +455,59 @@ mod tests {
 
     #[test]
     fn test_format_pending() {
-        let (status, height, decision, deferred_by, retry_tx) =
-            format_transaction_status(&TransactionStatus::Pending);
+        let (status, height, decision) = format_transaction_status(&TransactionStatus::Pending);
         assert_eq!(status, "pending");
         assert!(height.is_none());
         assert!(decision.is_none());
-        assert!(deferred_by.is_none());
-        assert!(retry_tx.is_none());
     }
 
     #[test]
     fn test_format_committed() {
-        let (status, height, decision, deferred_by, retry_tx) =
+        let (status, height, decision) =
             format_transaction_status(&TransactionStatus::Committed(BlockHeight(42)));
         assert_eq!(status, "committed");
         assert_eq!(height, Some(42));
         assert!(decision.is_none());
-        assert!(deferred_by.is_none());
-        assert!(retry_tx.is_none());
     }
 
     #[test]
     fn test_format_executed_accept() {
-        let (status, height, decision, deferred_by, retry_tx) =
-            format_transaction_status(&TransactionStatus::Executed {
-                decision: TransactionDecision::Accept,
-                committed_at: BlockHeight(5),
-            });
+        let (status, height, decision) = format_transaction_status(&TransactionStatus::Executed {
+            decision: TransactionDecision::Accept,
+            committed_at: BlockHeight(5),
+        });
         assert_eq!(status, "executed");
         assert_eq!(height, Some(5));
         assert_eq!(decision, Some("accept".to_string()));
-        assert!(deferred_by.is_none());
-        assert!(retry_tx.is_none());
     }
 
     #[test]
     fn test_format_executed_reject() {
-        let (status, height, decision, deferred_by, retry_tx) =
-            format_transaction_status(&TransactionStatus::Executed {
-                decision: TransactionDecision::Reject,
-                committed_at: BlockHeight(10),
-            });
+        let (status, height, decision) = format_transaction_status(&TransactionStatus::Executed {
+            decision: TransactionDecision::Reject,
+            committed_at: BlockHeight(10),
+        });
         assert_eq!(status, "executed");
         assert_eq!(height, Some(10));
         assert_eq!(decision, Some("reject".to_string()));
-        assert!(deferred_by.is_none());
-        assert!(retry_tx.is_none());
     }
 
     #[test]
     fn test_format_completed_accept() {
-        let (status, height, decision, deferred_by, retry_tx) =
+        let (status, height, decision) =
             format_transaction_status(&TransactionStatus::Completed(TransactionDecision::Accept));
         assert_eq!(status, "completed");
         assert!(height.is_none());
         assert_eq!(decision, Some("accept".to_string()));
-        assert!(deferred_by.is_none());
-        assert!(retry_tx.is_none());
     }
 
     #[test]
     fn test_format_completed_reject() {
-        let (status, height, decision, deferred_by, retry_tx) =
+        let (status, height, decision) =
             format_transaction_status(&TransactionStatus::Completed(TransactionDecision::Reject));
         assert_eq!(status, "completed");
         assert!(height.is_none());
         assert_eq!(decision, Some("reject".to_string()));
-        assert!(deferred_by.is_none());
-        assert!(retry_tx.is_none());
-    }
-
-    #[test]
-    fn test_format_deferred() {
-        let blocker = Hash::from_bytes(&[0xab; 32]);
-        let (status, height, decision, deferred_by, retry_tx) =
-            format_transaction_status(&TransactionStatus::Deferred { by: blocker });
-        assert_eq!(status, "deferred");
-        assert!(height.is_none());
-        assert!(decision.is_none());
-        assert_eq!(deferred_by, Some(hex::encode(blocker.as_bytes())));
-        assert!(retry_tx.is_none());
-    }
-
-    #[test]
-    fn test_format_retried() {
-        let new_tx = Hash::from_bytes(&[0xcd; 32]);
-        let (status, height, decision, deferred_by, retry_tx) =
-            format_transaction_status(&TransactionStatus::Retried { new_tx });
-        assert_eq!(status, "retried");
-        assert!(height.is_none());
-        assert!(decision.is_none());
-        assert!(deferred_by.is_none());
-        assert_eq!(retry_tx, Some(hex::encode(new_tx.as_bytes())));
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -705,7 +625,6 @@ mod tests {
             pending_count: 10,
             committed_count: 3,
             executed_count: 2,
-            deferred_count: 2,
             total_count: 17,
             ..MempoolSnapshot::default()
         }));
@@ -735,7 +654,6 @@ mod tests {
         assert_eq!(resp.pending_count, 10);
         assert_eq!(resp.committed_count, 3);
         assert_eq!(resp.executed_count, 2);
-        assert_eq!(resp.deferred_count, 2);
         assert_eq!(resp.total_count, 17);
     }
 

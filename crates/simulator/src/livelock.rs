@@ -77,9 +77,6 @@ pub struct LivelockReport {
     pub cross_shard_stuck: Vec<StuckTransaction>,
     /// Address contention map: address -> list of transactions holding/waiting
     pub address_contention: HashMap<NodeId, Vec<Hash>>,
-    /// Analysis of deferred transactions: what status is each winner in?
-    /// Maps winner_status -> count of deferred transactions waiting for winners in that status
-    pub deferred_winner_analysis: HashMap<String, usize>,
 }
 
 impl LivelockReport {
@@ -111,7 +108,7 @@ impl LivelockReport {
 
         // Status breakdown
         println!("📈 By Status:");
-        let status_order = ["Pending", "Committed", "Deferred", "Retried"];
+        let status_order = ["Pending", "Committed"];
         for status in &status_order {
             if let Some(txs) = self.by_status.get(*status) {
                 if !txs.is_empty() {
@@ -146,18 +143,6 @@ impl LivelockReport {
         }
         println!();
 
-        // Deferred winner analysis
-        if !self.deferred_winner_analysis.is_empty() {
-            println!("🔒 Deferred Transactions - Winner Status Analysis:");
-            println!("  (Why are deferred transactions not getting retried?)");
-            let mut sorted: Vec<_> = self.deferred_winner_analysis.iter().collect();
-            sorted.sort_by(|a, b| b.1.cmp(a.1)); // Sort by count descending
-            for (status, count) in sorted {
-                println!("  Winner in {}: {} deferred txs waiting", status, count);
-            }
-            println!();
-        }
-
         // Potential cycles
         if !self.potential_cycles.is_empty() {
             println!("⚠️  Potential Livelock Cycles:");
@@ -185,8 +170,6 @@ impl LivelockReport {
 pub struct LivelockAnalyzer {
     /// Incomplete transactions collected from all shards
     stuck_transactions: Vec<StuckTransaction>,
-    /// All transaction statuses (for looking up winner status)
-    all_statuses: HashMap<Hash, TransactionStatus>,
 }
 
 impl LivelockAnalyzer {
@@ -200,7 +183,6 @@ impl LivelockAnalyzer {
     ) -> Self {
         let mut stuck_transactions = Vec::new();
         let mut seen_hashes = HashSet::new();
-        let mut all_statuses = HashMap::new();
 
         // Collect from first validator of each shard (all validators see same mempool)
         for shard_idx in 0..num_shards {
@@ -211,9 +193,6 @@ impl LivelockAnalyzer {
                 let incomplete = node.mempool().incomplete_transactions();
 
                 for (hash, status, tx) in incomplete {
-                    // Store status for later lookup
-                    all_statuses.insert(hash, status.clone());
-
                     // Avoid duplicates (same transaction may appear on multiple shards)
                     if seen_hashes.insert(hash) {
                         let write_shards: Vec<_> = tx
@@ -249,10 +228,7 @@ impl LivelockAnalyzer {
             }
         }
 
-        Self {
-            stuck_transactions,
-            all_statuses,
-        }
+        Self { stuck_transactions }
     }
 
     /// Analyze the collected transactions for livelocks.
@@ -293,22 +269,6 @@ impl LivelockAnalyzer {
         // Detect potential cycles
         let potential_cycles = self.detect_cycles(&address_contention);
 
-        // Analyze deferred transactions - what status is each winner in?
-        let mut deferred_winner_analysis: HashMap<String, usize> = HashMap::new();
-        for tx in &self.stuck_transactions {
-            if let TransactionStatus::Deferred { by: winner_hash } = &tx.status {
-                let winner_status_name =
-                    if let Some(winner_status) = self.all_statuses.get(winner_hash) {
-                        status_name(winner_status)
-                    } else {
-                        "Unknown/NotInPool".to_string()
-                    };
-                *deferred_winner_analysis
-                    .entry(winner_status_name)
-                    .or_insert(0) += 1;
-            }
-        }
-
         LivelockReport {
             total_incomplete,
             by_status,
@@ -316,7 +276,6 @@ impl LivelockAnalyzer {
             potential_cycles,
             cross_shard_stuck,
             address_contention,
-            deferred_winner_analysis,
         }
     }
 

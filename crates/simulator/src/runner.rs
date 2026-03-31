@@ -383,12 +383,6 @@ impl Simulator {
                                 self.metrics.record_rejection();
                                 debug!(?hash, %status, "Transaction rejected/aborted");
                             }
-                            TransactionStatus::Retried { new_tx } => {
-                                // Transaction was retried - track the new hash instead
-                                self.in_flight.insert(new_tx, (submit_time, shard));
-                                self.metrics.record_retry();
-                                debug!(?hash, ?new_tx, "Transaction retried");
-                            }
                             _ => unreachable!("Transaction status is not final: {:?}", status),
                         }
                     }
@@ -460,7 +454,6 @@ impl Simulator {
             if let Some(node) = self.runner.node(node_idx) {
                 let stats = node.mempool().lock_contention_stats();
                 total.locked_nodes += stats.locked_nodes;
-                total.deferred_count += stats.deferred_count;
                 total.pending_count += stats.pending_count;
                 total.pending_deferred += stats.pending_deferred;
             }
