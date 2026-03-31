@@ -227,6 +227,43 @@ pub fn verify_receipt_root(
     valid
 }
 
+/// Verify abort intent inclusion proofs.
+///
+/// For each `(AbortIntent, transaction_root)` pair, verifies the merkle
+/// inclusion proof for the winner transaction against the QC-attested
+/// `transaction_root` from the remote committed block header.
+///
+/// Returns `true` only if ALL proofs are valid.
+pub fn verify_abort_intent_proofs(proof_inputs: &[(AbortIntent, Hash)]) -> bool {
+    use hyperscale_types::{verify_merkle_inclusion, AbortReason};
+
+    for (intent, transaction_root) in proof_inputs {
+        let AbortReason::LivelockCycle {
+            winner_tx_hash,
+            tx_inclusion_proof,
+            ..
+        } = &intent.reason
+        else {
+            // Only LivelockCycle intents have proofs to verify
+            continue;
+        };
+
+        // The winner_tx_hash is used directly as the leaf hash in the
+        // transaction merkle tree (see compute_transaction_root).
+        if !verify_merkle_inclusion(*transaction_root, *winner_tx_hash, tx_inclusion_proof) {
+            tracing::warn!(
+                loser_tx = %intent.tx_hash,
+                winner_tx = %winner_tx_hash,
+                transaction_root = ?transaction_root,
+                "Abort intent inclusion proof verification FAILED"
+            );
+            return false;
+        }
+    }
+
+    true
+}
+
 /// Result of state root verification.
 pub struct StateRootResult<P: Send> {
     pub valid: bool,

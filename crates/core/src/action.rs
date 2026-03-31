@@ -390,6 +390,20 @@ pub enum Action {
         certificates: Vec<Arc<TransactionCertificate>>,
     },
 
+    /// Verify abort intent inclusion proofs off-thread.
+    ///
+    /// For each livelock cycle abort intent, verifies the merkle inclusion
+    /// proof for the winner transaction against the source block's
+    /// QC-attested `transaction_root`.
+    /// Returns `ProtocolEvent::AbortIntentProofsVerified`.
+    VerifyAbortIntentProofs {
+        block_hash: Hash,
+        /// Pairs of (abort_intent, transaction_root from remote committed header).
+        /// The transaction_root is QC-attested — looked up by NodeStateMachine
+        /// from the ProvisionCoordinator's verified remote headers.
+        proof_inputs: Vec<(AbortIntent, Hash)>,
+    },
+
     /// Build a complete block proposal.
     ///
     /// Computes the new state root from certificates, builds the complete block,
@@ -831,6 +845,7 @@ impl Action {
                 | Action::VerifyStateRoot { .. }
                 | Action::VerifyTransactionRoot { .. }
                 | Action::VerifyReceiptRoot { .. }
+                | Action::VerifyAbortIntentProofs { .. }
                 | Action::BuildProposal { .. }
                 | Action::ExecuteTransactions { .. }
                 | Action::SpeculativeExecute { .. }
@@ -883,6 +898,7 @@ impl Action {
             Action::VerifyStateRoot { .. } => "VerifyStateRoot",
             Action::VerifyTransactionRoot { .. } => "VerifyTransactionRoot",
             Action::VerifyReceiptRoot { .. } => "VerifyReceiptRoot",
+            Action::VerifyAbortIntentProofs { .. } => "VerifyAbortIntentProofs",
             Action::BuildProposal { .. } => "BuildProposal",
 
             // Delegated Work - Execution

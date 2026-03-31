@@ -4,8 +4,12 @@
 //! verifications. BftState delegates verification bookkeeping here while
 //! retaining control-flow decisions (voting, block rejection).
 
-use hyperscale_types::{Block, BlockHeader, Hash};
+use hyperscale_types::{
+    AbortIntent, AbortReason, Block, BlockHeader, BlockHeight, CommittedBlockHeader, Hash,
+    ShardGroupId,
+};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use tracing::{debug, trace};
 
 use hyperscale_core::Action;
@@ -51,6 +55,22 @@ pub struct ReadyStateRootVerification {
     pub expected_root: Hash,
     pub cert_tx_hashes: Vec<Hash>,
     pub block_height: u64,
+}
+
+/// Abort intent verification waiting for remote headers to arrive.
+///
+/// When a block has livelock cycle abort intents but the remote committed
+/// header for the source shard/height hasn't been received yet, the
+/// verification is parked here. Once `on_remote_header_arrived` is called
+/// with the matching key, the verification is unblocked and dispatched.
+#[derive(Debug, Clone)]
+struct PendingAbortIntentVerification {
+    /// The livelock cycle abort intents that need proof verification.
+    livelock_intents: Vec<AbortIntent>,
+    /// Proof inputs already resolved (intent, transaction_root).
+    resolved: Vec<(AbortIntent, Hash)>,
+    /// Remote header keys still needed before dispatch.
+    waiting_on: HashSet<(ShardGroupId, BlockHeight)>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -101,6 +121,17 @@ pub(crate) struct VerificationPipeline {
 
     /// Blocks with verified receipt roots.
     verified_receipt_roots: HashSet<Hash>,
+
+    // === Abort intent proof verification ===
+    /// Blocks where abort intent proof verification is currently in-flight.
+    abort_intent_verifications_in_flight: HashSet<Hash>,
+
+    /// Blocks with verified abort intent proofs.
+    verified_abort_intents: HashSet<Hash>,
+
+    /// Abort intent verifications waiting for remote headers.
+    /// Keyed by block_hash. Unblocked by `on_remote_header_arrived`.
+    pending_abort_intent_verifications: HashMap<Hash, PendingAbortIntentVerification>,
 }
 
 impl VerificationPipeline {
@@ -118,6 +149,9 @@ impl VerificationPipeline {
             verified_transaction_roots: HashSet::new(),
             receipt_root_verifications_in_flight: HashSet::new(),
             verified_receipt_roots: HashSet::new(),
+            abort_intent_verifications_in_flight: HashSet::new(),
+            verified_abort_intents: HashSet::new(),
+            pending_abort_intent_verifications: HashMap::new(),
         }
     }
 
@@ -191,7 +225,13 @@ impl VerificationPipeline {
             self.verified_receipt_roots.contains(&block_hash)
         };
 
-        state_root_ok && transaction_root_ok && receipt_root_ok
+        let abort_intents_ok = if !Self::has_livelock_abort_intents(block) {
+            true
+        } else {
+            self.verified_abort_intents.contains(&block_hash)
+        };
+
+        state_root_ok && transaction_root_ok && receipt_root_ok && abort_intents_ok
     }
 
     // ─── State root ──────────────────────────────────────────────────────
@@ -417,6 +457,208 @@ impl VerificationPipeline {
         valid
     }
 
+    // ─── Abort intent proofs ────────────────────────────────────────────
+
+    /// Check whether a block has any livelock cycle abort intents that require
+    /// merkle inclusion proof verification.
+    fn has_livelock_abort_intents(block: &Block) -> bool {
+        block
+            .abort_intents
+            .iter()
+            .any(|a| matches!(a.reason, AbortReason::LivelockCycle { .. }))
+    }
+
+    /// Check if a block needs abort intent proof verification before voting.
+    pub fn needs_abort_intent_verification(&self, block: &Block) -> bool {
+        if !Self::has_livelock_abort_intents(block) {
+            return false;
+        }
+
+        let block_hash = block.hash();
+
+        if self.verified_abort_intents.contains(&block_hash)
+            || self
+                .abort_intent_verifications_in_flight
+                .contains(&block_hash)
+        {
+            return false;
+        }
+
+        true
+    }
+
+    /// Initiate abort intent proof verification for a block.
+    ///
+    /// Resolves remote header `transaction_root` values from `remote_headers`.
+    /// If all headers are available, emits `Action::VerifyAbortIntentProofs`
+    /// immediately. If any are missing, parks the verification in
+    /// `pending_abort_intent_verifications` until `on_remote_header_arrived`
+    /// supplies the missing header.
+    pub fn initiate_abort_intent_verification(
+        &mut self,
+        block_hash: Hash,
+        block: &Block,
+        remote_headers: &HashMap<(ShardGroupId, BlockHeight), Arc<CommittedBlockHeader>>,
+    ) -> Vec<Action> {
+        let livelock_intents: Vec<AbortIntent> = block
+            .abort_intents
+            .iter()
+            .filter(|a| matches!(a.reason, AbortReason::LivelockCycle { .. }))
+            .cloned()
+            .collect();
+
+        if livelock_intents.is_empty() {
+            return vec![];
+        }
+
+        debug!(
+            block_hash = ?block_hash,
+            intent_count = livelock_intents.len(),
+            "Initiating abort intent proof verification"
+        );
+
+        self.try_resolve_abort_intents(block_hash, livelock_intents, remote_headers)
+    }
+
+    /// Try to resolve all livelock abort intents against available remote headers.
+    ///
+    /// Returns `Action::VerifyAbortIntentProofs` if all headers are present,
+    /// otherwise parks in `pending_abort_intent_verifications`.
+    fn try_resolve_abort_intents(
+        &mut self,
+        block_hash: Hash,
+        intents: Vec<AbortIntent>,
+        remote_headers: &HashMap<(ShardGroupId, BlockHeight), Arc<CommittedBlockHeader>>,
+    ) -> Vec<Action> {
+        let mut resolved = Vec::new();
+        let mut waiting_on = HashSet::new();
+
+        for intent in &intents {
+            if let AbortReason::LivelockCycle {
+                source_shard,
+                source_block_height,
+                ..
+            } = &intent.reason
+            {
+                let key = (*source_shard, *source_block_height);
+                if let Some(header) = remote_headers.get(&key) {
+                    resolved.push((intent.clone(), header.header.transaction_root));
+                } else {
+                    waiting_on.insert(key);
+                }
+            }
+        }
+
+        if waiting_on.is_empty() {
+            // All headers available — dispatch immediately.
+            self.abort_intent_verifications_in_flight.insert(block_hash);
+            vec![Action::VerifyAbortIntentProofs {
+                block_hash,
+                proof_inputs: resolved,
+            }]
+        } else {
+            // Park until missing headers arrive.
+            debug!(
+                block_hash = ?block_hash,
+                missing = waiting_on.len(),
+                "Abort intent verification waiting for remote headers"
+            );
+            self.pending_abort_intent_verifications.insert(
+                block_hash,
+                PendingAbortIntentVerification {
+                    livelock_intents: intents,
+                    resolved,
+                    waiting_on,
+                },
+            );
+            vec![]
+        }
+    }
+
+    /// A remote header has arrived — unblock any pending abort intent verifications
+    /// that were waiting for it.
+    pub fn on_remote_header_arrived(
+        &mut self,
+        shard: ShardGroupId,
+        height: BlockHeight,
+        header: &CommittedBlockHeader,
+    ) -> Vec<Action> {
+        let key = (shard, height);
+        let transaction_root = header.header.transaction_root;
+
+        // Find all pending verifications waiting on this key.
+        let unblocked: Vec<Hash> = self
+            .pending_abort_intent_verifications
+            .iter()
+            .filter(|(_, pv)| pv.waiting_on.contains(&key))
+            .map(|(block_hash, _)| *block_hash)
+            .collect();
+
+        if unblocked.is_empty() {
+            return vec![];
+        }
+
+        let mut actions = Vec::new();
+
+        for block_hash in unblocked {
+            let pv = self
+                .pending_abort_intent_verifications
+                .get_mut(&block_hash)
+                .unwrap();
+
+            // Resolve the intents that were waiting on this header.
+            for intent in &pv.livelock_intents {
+                if let AbortReason::LivelockCycle {
+                    source_shard,
+                    source_block_height,
+                    ..
+                } = &intent.reason
+                {
+                    if (*source_shard, *source_block_height) == key {
+                        pv.resolved.push((intent.clone(), transaction_root));
+                    }
+                }
+            }
+            pv.waiting_on.remove(&key);
+
+            if pv.waiting_on.is_empty() {
+                // Fully resolved — dispatch.
+                let pv = self
+                    .pending_abort_intent_verifications
+                    .remove(&block_hash)
+                    .unwrap();
+                self.abort_intent_verifications_in_flight.insert(block_hash);
+                debug!(
+                    block_hash = ?block_hash,
+                    "Abort intent verification unblocked by remote header"
+                );
+                actions.push(Action::VerifyAbortIntentProofs {
+                    block_hash,
+                    proof_inputs: pv.resolved,
+                });
+            }
+        }
+
+        actions
+    }
+
+    /// Record an abort intent proof verification result.
+    /// Returns whether the verification passed.
+    pub fn on_abort_intents_verified(&mut self, block_hash: Hash, valid: bool) -> bool {
+        self.abort_intent_verifications_in_flight
+            .remove(&block_hash);
+
+        if valid {
+            self.verified_abort_intents.insert(block_hash);
+            debug!(
+                block_hash = ?block_hash,
+                "Abort intent proofs verified successfully"
+            );
+        }
+
+        valid
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
     // Remote header QC verification
     // ═══════════════════════════════════════════════════════════════════════
@@ -529,6 +771,15 @@ impl VerificationPipeline {
 
         self.verified_receipt_roots
             .retain(|hash| pending_blocks.contains_key(hash));
+
+        self.abort_intent_verifications_in_flight
+            .retain(|hash| pending_blocks.contains_key(hash));
+
+        self.verified_abort_intents
+            .retain(|hash| pending_blocks.contains_key(hash));
+
+        self.pending_abort_intent_verifications
+            .retain(|hash, _| pending_blocks.contains_key(hash));
 
         // verified_qcs uses height-based retention (not pending_blocks membership)
         // because QC cache entries are keyed by the certified block's hash, which
