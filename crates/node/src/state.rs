@@ -627,7 +627,7 @@ impl NodeStateMachine {
 
         // Process CrossShardTxRegistered events immediately so coordinator has
         // registrations before any subsequent provisions arrive.
-        // This ensures ProvisionAccepted can be emitted for livelock.
+        // This ensures ProvisionsAccepted can be emitted for livelock.
         for action in &exec_actions {
             if let Action::Continuation(ProtocolEvent::CrossShardTxRegistered {
                 tx_hash,
@@ -967,18 +967,8 @@ impl StateMachine for NodeStateMachine {
                 };
                 self.provisions.on_tx_registered(tx_hash, registration)
             }
-            ProtocolEvent::ProvisionAccepted {
-                tx_hash,
-                source_shard,
-                source_block_height,
-                entries,
-            } => {
-                let outputs = self.livelock.on_provision_accepted(
-                    tx_hash,
-                    source_shard,
-                    source_block_height,
-                    &entries,
-                );
+            ProtocolEvent::ProvisionsAccepted { batch } => {
+                let outputs = self.livelock.on_provisions_accepted(&batch);
                 // Group deferral proof requests by (source_shard, block_height).
                 let mut grouped: std::collections::HashMap<
                     (ShardGroupId, BlockHeight),
@@ -1020,20 +1010,14 @@ impl StateMachine for NodeStateMachine {
                 }
                 actions
             }
-            ProtocolEvent::ProvisioningComplete {
-                tx_hash,
-                provisions,
-            } => {
-                if let Some(req) = self.execution.on_provisioning_complete(
-                    self.topology.snapshot(),
-                    tx_hash,
-                    provisions,
-                ) {
-                    vec![Action::ExecuteCrossShardTransactions {
-                        requests: vec![req],
-                    }]
-                } else {
+            ProtocolEvent::ProvisioningComplete { transactions } => {
+                let requests = self
+                    .execution
+                    .on_batch_provisioning_complete(self.topology.snapshot(), transactions);
+                if requests.is_empty() {
                     vec![]
+                } else {
+                    vec![Action::ExecuteCrossShardTransactions { requests }]
                 }
             }
 

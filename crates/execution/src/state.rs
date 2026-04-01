@@ -1398,6 +1398,25 @@ impl ExecutionState {
         })
     }
 
+    /// Handle batch provisioning complete for multiple transactions.
+    ///
+    /// Returns execution requests for all transactions that are ready
+    /// (block already committed). Transactions whose blocks haven't
+    /// committed yet are buffered individually in `early_provisioning_complete`.
+    pub fn on_batch_provisioning_complete(
+        &mut self,
+        topology: &TopologySnapshot,
+        transactions: Vec<hyperscale_core::ProvisionedTransaction>,
+    ) -> Vec<CrossShardExecutionRequest> {
+        let mut requests = Vec::new();
+        for pt in transactions {
+            if let Some(req) = self.on_provisioning_complete(topology, pt.tx_hash, pt.provisions) {
+                requests.push(req);
+            }
+        }
+        requests
+    }
+
     // ═══════════════════════════════════════════════════════════════════════════
     // Phase 5: Finalization
     // ═══════════════════════════════════════════════════════════════════════════

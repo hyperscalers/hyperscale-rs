@@ -8,8 +8,8 @@
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, BlockManifest, BlockVote, CommittedBlockHeader,
     DatabaseUpdates, EpochConfig, EpochId, ExecutionCertificate, ExecutionVote, Hash,
-    ProvisionBatch, QuorumCertificate, RoutableTransaction, ShardGroupId, StateEntry,
-    StateProvision, TxOutcome, ValidatorId, WaveId,
+    ProvisionBatch, QuorumCertificate, RoutableTransaction, ShardGroupId, TxOutcome, ValidatorId,
+    WaveId,
 };
 use std::sync::Arc;
 
@@ -152,18 +152,12 @@ pub enum ProtocolEvent {
         committed_height: BlockHeight,
     },
 
-    /// A provision from a source shard has been verified and accepted.
-    ProvisionAccepted {
-        tx_hash: Hash,
-        source_shard: ShardGroupId,
-        source_block_height: BlockHeight,
-        entries: Vec<StateEntry>,
-    },
+    /// A batch of provisions from a source shard has been verified and accepted.
+    ProvisionsAccepted { batch: ProvisionBatch },
 
-    /// All required shards have reached provision quorum - ready for execution.
+    /// One or more transactions have all required provisions — ready for execution.
     ProvisioningComplete {
-        tx_hash: Hash,
-        provisions: Vec<StateProvision>,
+        transactions: Vec<crate::ProvisionedTransaction>,
     },
 
     /// Received a provision batch from a source shard (light-client path).
@@ -387,7 +381,7 @@ impl ProtocolEvent {
             // Provisions
             ProtocolEvent::SpeculativeProvisionsComplete { .. } => "SpeculativeProvisionsComplete",
             ProtocolEvent::CrossShardTxRegistered { .. } => "CrossShardTxRegistered",
-            ProtocolEvent::ProvisionAccepted { .. } => "ProvisionAccepted",
+            ProtocolEvent::ProvisionsAccepted { .. } => "ProvisionsAccepted",
             ProtocolEvent::ProvisioningComplete { .. } => "ProvisioningComplete",
             ProtocolEvent::StateProvisionsReceived { .. } => "StateProvisionsReceived",
             ProtocolEvent::StateProvisionsVerified { .. } => "StateProvisionsVerified",

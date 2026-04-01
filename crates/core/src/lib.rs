@@ -36,7 +36,7 @@ mod traits;
 
 pub use action::{
     Action, CrossShardExecutionRequest, InclusionProofFetchReason, ProvisionRequest,
-    TransactionStatus,
+    ProvisionedTransaction, TransactionStatus,
 };
 pub use input::{EventPriority, NodeInput};
 pub use protocol_event::ProtocolEvent;

@@ -257,6 +257,26 @@ impl LivelockState {
         )
     }
 
+    /// Process a batch of verified provisions for cycle detection.
+    ///
+    /// Equivalent to calling [`on_provision_accepted`] for each transaction in the
+    /// batch, returning all outputs combined.
+    pub fn on_provisions_accepted(
+        &mut self,
+        batch: &hyperscale_types::ProvisionBatch,
+    ) -> Vec<LivelockOutput> {
+        let mut outputs = Vec::new();
+        for tx_entries in &batch.transactions {
+            outputs.extend(self.on_provision_accepted(
+                tx_entries.tx_hash,
+                batch.source_shard,
+                batch.block_height,
+                &tx_entries.entries,
+            ));
+        }
+        outputs
+    }
+
     /// Check for a bidirectional cycle with a remote transaction.
     ///
     /// A TRUE cycle exists when:

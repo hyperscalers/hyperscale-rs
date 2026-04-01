@@ -11,7 +11,7 @@
 //! dispatches `VerifyStateProvisions` to verify the QC signature once and
 //! merkle proofs per provision against the committed state root.
 
-use hyperscale_core::{Action, ProtocolEvent};
+use hyperscale_core::{Action, ProtocolEvent, ProvisionedTransaction};
 use hyperscale_types::{
     BlockHeight, CommittedBlockHeader, Hash, NodeId, ProvisionBatch, ShardGroupId, StateProvision,
     TopologySnapshot, ValidatorId,
@@ -473,6 +473,13 @@ impl ProvisionCoordinator {
         let batch_key = (source_shard, batch.block_height);
         self.verified_batches.insert(batch_key, batch.clone());
 
+        // Emit batch-level accepted event (used by livelock for cycle detection).
+        actions.push(Action::Continuation(ProtocolEvent::ProvisionsAccepted {
+            batch: batch.clone(),
+        }));
+
+        // Collect any transactions that are now fully provisioned across all shards.
+        let mut completed = Vec::new();
         for tx_entries in &batch.transactions {
             let tx_hash = tx_entries.tx_hash;
 
@@ -482,14 +489,6 @@ impl ProvisionCoordinator {
                 entries = tx_entries.entries.len(),
                 "State provision verified successfully"
             );
-
-            // Emit provision accepted (used by livelock for cycle detection).
-            actions.push(Action::Continuation(ProtocolEvent::ProvisionAccepted {
-                tx_hash,
-                source_shard,
-                source_block_height: batch.block_height,
-                entries: tx_entries.entries.clone(),
-            }));
 
             // Check if ALL required shards have verified provisions
             if self.all_shards_verified(tx_hash) {
@@ -504,11 +503,16 @@ impl ProvisionCoordinator {
                     "All shards verified - ready for execution"
                 );
 
-                actions.push(Action::Continuation(ProtocolEvent::ProvisioningComplete {
+                completed.push(ProvisionedTransaction {
                     tx_hash,
                     provisions: all_provisions,
-                }));
+                });
             }
+        }
+        if !completed.is_empty() {
+            actions.push(Action::Continuation(ProtocolEvent::ProvisioningComplete {
+                transactions: completed,
+            }));
         }
 
         actions
@@ -961,14 +965,10 @@ mod tests {
         let actions =
             coordinator.on_state_provisions_verified(&topology, batch, Some(header), true);
 
-        // Should emit ProvisionAccepted
+        // Should emit ProvisionsAccepted with the batch
         assert!(actions.iter().any(|a| matches!(
             a,
-            Action::Continuation(ProtocolEvent::ProvisionAccepted {
-                tx_hash: h,
-                source_shard: s,
-                ..
-            }) if *h == tx_hash && *s == source_shard
+            Action::Continuation(ProtocolEvent::ProvisionsAccepted { .. })
         )));
 
         // Should have verified provisions
@@ -993,7 +993,7 @@ mod tests {
 
         assert!(actions.iter().all(|a| !matches!(
             a,
-            Action::Continuation(ProtocolEvent::ProvisionAccepted { .. })
+            Action::Continuation(ProtocolEvent::ProvisionsAccepted { .. })
         )));
         assert!(!coordinator.has_any_verified_provisions(&tx_hash));
     }
@@ -1036,8 +1036,8 @@ mod tests {
         // NOW should emit ProvisioningComplete
         assert!(actions.iter().any(|a| matches!(
             a,
-            Action::Continuation(ProtocolEvent::ProvisioningComplete { tx_hash: h, .. })
-            if *h == tx_hash
+            Action::Continuation(ProtocolEvent::ProvisioningComplete { transactions })
+            if transactions.iter().any(|pt| pt.tx_hash == tx_hash)
         )));
     }
 
@@ -1211,13 +1211,13 @@ mod tests {
         let actions =
             coordinator.on_state_provisions_verified(&topology, batch, Some(header), false);
 
-        // No ProvisionAccepted should be emitted
+        // No ProvisionsAccepted should be emitted
         let accepted_count = actions
             .iter()
             .filter(|a| {
                 matches!(
                     a,
-                    Action::Continuation(ProtocolEvent::ProvisionAccepted { .. })
+                    Action::Continuation(ProtocolEvent::ProvisionsAccepted { .. })
                 )
             })
             .count();
