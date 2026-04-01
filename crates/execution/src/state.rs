@@ -1146,78 +1146,24 @@ impl ExecutionState {
                     "SPECULATIVE HIT: Results already cached, skipping execution"
                 );
                 actions.extend(self.start_single_shard_execution(topology, tx.clone()));
-
-                // Wave result recording: speculative execution completed before wave
-                // tracking was set up (ExecutionBatchCompleted arrived before BlockCommitted).
-                // The results from that event were silently dropped because
-                // wave_assignments didn't exist yet. Re-extract from execution cache now.
-                if let Some(receipt_hash) = self.execution_cache.get_receipt_hash(&tx_hash) {
-                    let write_nodes = self
-                        .execution_cache
-                        .get(&tx_hash)
-                        .map(|updates| crate::handlers::extract_write_nodes(updates))
-                        .unwrap_or_default();
-                    if let Some(completion) = self.record_execution_result(
-                        tx_hash,
-                        TxExecutionOutcome::Executed {
-                            receipt_hash,
-                            success: true,
-                            write_nodes,
-                        },
-                    ) {
-                        actions.push(Action::SignAndBroadcastExecutionVote {
-                            block_hash: completion.block_hash,
-                            block_height: completion.block_height,
-                            wave_id: completion.wave_id,
-                            receipt_root: completion.receipt_root,
-                            tx_count: completion.tx_outcomes.len() as u32,
-                            tx_outcomes: completion.tx_outcomes,
-                            participating_shards: completion.participating_shards,
-                        });
-                    }
-                }
+                actions.extend(self.try_record_speculative_wave_result(tx_hash));
             } else if self.speculative_in_flight_txs.contains(&tx_hash) {
                 // Speculation in-flight - results will arrive when it completes
                 // This counts as a hit since we're skipping re-execution
                 self.speculative_cache_hit_count += 1;
+                self.speculative_late_hit_count += 1;
                 self.speculative_in_flight_txs.remove(&tx_hash);
                 tracing::debug!(
                     tx_hash = ?tx_hash,
                     "SPECULATIVE IN-FLIGHT: Results will arrive soon, skipping execution"
                 );
                 actions.extend(self.start_single_shard_execution(topology, tx.clone()));
-
-                // If the execution already completed (ExecutionBatchCompleted processed
+                // If execution already completed (ExecutionBatchCompleted processed
                 // before BlockCommitted but SpeculativeExecutionComplete hasn't been
-                // processed yet), the wave results were dropped. Re-extract from cache.
-                // If execution hasn't completed yet, cache will be empty and the
-                // later ExecutionBatchCompleted will record wave results normally
-                // (wave tracking is now set up).
-                if let Some(receipt_hash) = self.execution_cache.get_receipt_hash(&tx_hash) {
-                    let write_nodes = self
-                        .execution_cache
-                        .get(&tx_hash)
-                        .map(|updates| crate::handlers::extract_write_nodes(updates))
-                        .unwrap_or_default();
-                    if let Some(completion) = self.record_execution_result(
-                        tx_hash,
-                        TxExecutionOutcome::Executed {
-                            receipt_hash,
-                            success: true,
-                            write_nodes,
-                        },
-                    ) {
-                        actions.push(Action::SignAndBroadcastExecutionVote {
-                            block_hash: completion.block_hash,
-                            block_height: completion.block_height,
-                            wave_id: completion.wave_id,
-                            receipt_root: completion.receipt_root,
-                            tx_count: completion.tx_outcomes.len() as u32,
-                            tx_outcomes: completion.tx_outcomes,
-                            participating_shards: completion.participating_shards,
-                        });
-                    }
-                }
+                // processed yet), re-extract from cache. If execution hasn't completed
+                // yet, cache will be empty and the later ExecutionBatchCompleted will
+                // record wave results normally (wave tracking is now set up).
+                actions.extend(self.try_record_speculative_wave_result(tx_hash));
             } else {
                 // No speculation at all - execute normally
                 tracing::debug!(
@@ -1909,9 +1855,13 @@ impl ExecutionState {
         );
         self.last_view_change_height = height;
 
-        // Clear in-flight speculation - those results are likely stale
+        // Clear all speculative state — the old leader's block won't commit,
+        // so cached results are stale and would waste the memory budget.
         self.speculative_in_flight_txs.clear();
         self.pending_speculative_executions.clear();
+        for tx_hash in self.speculative_results.keys().copied().collect::<Vec<_>>() {
+            self.remove_speculative_result(&tx_hash);
+        }
     }
 
     /// Check if we should speculatively execute transactions at the given height.
@@ -2129,6 +2079,47 @@ impl ExecutionState {
                     }
                 }
             }
+        }
+    }
+
+    /// Try to record a wave result from a speculative execution's cached data.
+    ///
+    /// When speculation completes before (or during) block commit, the
+    /// `ExecutionBatchCompleted` event populated the execution cache but wave
+    /// tracking wasn't set up yet, so the result was dropped. This re-extracts
+    /// the result from the execution cache now that wave tracking is ready.
+    ///
+    /// Returns a `SignAndBroadcastExecutionVote` action if the cache had data
+    /// and the wave was completed, or empty if execution hasn't finished yet
+    /// (the later `ExecutionBatchCompleted` will record normally).
+    fn try_record_speculative_wave_result(&mut self, tx_hash: Hash) -> Vec<Action> {
+        let Some(receipt_hash) = self.execution_cache.get_receipt_hash(&tx_hash) else {
+            return vec![];
+        };
+        let write_nodes = self
+            .execution_cache
+            .get(&tx_hash)
+            .map(|updates| crate::handlers::extract_write_nodes(updates))
+            .unwrap_or_default();
+        if let Some(completion) = self.record_execution_result(
+            tx_hash,
+            TxExecutionOutcome::Executed {
+                receipt_hash,
+                success: true,
+                write_nodes,
+            },
+        ) {
+            vec![Action::SignAndBroadcastExecutionVote {
+                block_hash: completion.block_hash,
+                block_height: completion.block_height,
+                wave_id: completion.wave_id,
+                receipt_root: completion.receipt_root,
+                tx_count: completion.tx_outcomes.len() as u32,
+                tx_outcomes: completion.tx_outcomes,
+                participating_shards: completion.participating_shards,
+            }]
+        } else {
+            vec![]
         }
     }
 
