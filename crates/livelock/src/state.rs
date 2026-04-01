@@ -440,7 +440,8 @@ impl LivelockState {
     /// Get pending abort intents for block inclusion.
     ///
     /// Returns a reference to the pending abort intents. Abort intents are only
-    /// removed when they appear in a committed block.
+    /// removed when they appear in a committed block or are explicitly purged
+    /// via [`remove_abort_intents`].
     pub fn get_pending_abort_intents(&self) -> &[AbortIntent] {
         &self.pending_abort_intents
     }
@@ -464,6 +465,14 @@ impl LivelockState {
         // Remove abort intents that were included in this block from both Vec and HashSet
         for intent in &block.abort_intents {
             self.pending_abort_intent_hashes.remove(&intent.tx_hash);
+        }
+
+        // Remove pending abort intents for transactions that committed via
+        // certificate. Once a TC is committed the abort is moot — the QC chain
+        // dedup covers the 1-2 block window before the certificate lands.
+        for cert in &block.certificates {
+            self.pending_abort_intent_hashes
+                .remove(&cert.transaction_hash);
         }
 
         // Also remove pending abort intents whose winner transaction was aborted in this block.

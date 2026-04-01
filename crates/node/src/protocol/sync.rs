@@ -17,7 +17,7 @@ use hyperscale_messages::request::GetBlockRequest;
 use hyperscale_messages::response::GetBlockResponse;
 use hyperscale_metrics as metrics;
 use hyperscale_storage::ConsensusStore;
-use hyperscale_types::{Block, Hash, QuorumCertificate};
+use hyperscale_types::{Block, Hash, QuorumCertificate, TransactionDecision};
 use serde::Serialize;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
@@ -383,8 +383,15 @@ pub fn serve_block_request(
     match storage.get_block_for_sync(req.height) {
         Some((block, qc)) => {
             // Collect receipts for each certificate in the block.
-            let mut ledger_receipts = Vec::with_capacity(block.certificates.len());
-            for cert in &block.certificates {
+            // Aborted certificates have no receipts — execution never ran,
+            // so there are no state changes or receipts to sync.
+            let certs_needing_receipts: Vec<_> = block
+                .certificates
+                .iter()
+                .filter(|c| c.decision != TransactionDecision::Aborted)
+                .collect();
+            let mut ledger_receipts = Vec::with_capacity(certs_needing_receipts.len());
+            for cert in &certs_needing_receipts {
                 let tx_hash = cert.transaction_hash;
                 if let Some(receipt) = storage.get_ledger_receipt(&tx_hash) {
                     ledger_receipts.push(hyperscale_types::LedgerReceiptEntry {
@@ -394,10 +401,10 @@ pub fn serve_block_request(
                 }
             }
 
-            if ledger_receipts.len() != block.certificates.len() {
+            if ledger_receipts.len() != certs_needing_receipts.len() {
                 warn!(
                     height = req.height.0,
-                    expected = block.certificates.len(),
+                    expected = certs_needing_receipts.len(),
                     found = ledger_receipts.len(),
                     "Missing receipts for block certificates — \
                      returning not_found so requester tries another peer"

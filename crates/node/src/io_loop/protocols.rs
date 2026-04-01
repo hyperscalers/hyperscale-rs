@@ -49,14 +49,15 @@ where
                                 };
 
                                 // Validate that the peer included receipts for every
-                                // certificate in the block. A missing receipt makes the
-                                // block unusable — treat it as a failed fetch so the
-                                // sync protocol retries from another peer.
+                                // non-aborted certificate in the block. Aborted certificates
+                                // have no receipts (execution never ran, no state changes).
                                 let receipts_complete = block.as_ref().is_none_or(|(b, _)| {
                                     b.certificates.iter().all(|cert| {
-                                        ledger_receipts
-                                            .iter()
-                                            .any(|e| e.tx_hash == cert.transaction_hash)
+                                        cert.decision
+                                            == hyperscale_types::TransactionDecision::Aborted
+                                            || ledger_receipts
+                                                .iter()
+                                                .any(|e| e.tx_hash == cert.transaction_hash)
                                     })
                                 });
 

@@ -547,19 +547,21 @@ impl ExecutionState {
     /// for execution vote signing.
     ///
     /// NOTE: Wave assignments are retained as long as the transaction has not
-    /// reached terminal state, so this should always find the assignment.
-    /// A missing assignment indicates a bug (double-cleanup or missing setup).
+    /// reached terminal state. A missing assignment means the transaction
+    /// already completed (TC committed and wave cleaned up) — the abort
+    /// intent is a harmless late arrival (e.g. livelock cycle detected after
+    /// normal execution finished).
     pub fn record_abort_intent(
         &mut self,
         tx_hash: Hash,
         reason: AbortReason,
     ) -> Option<CompletionData> {
         if !self.wave_assignments.contains_key(&tx_hash) {
-            tracing::error!(
+            tracing::debug!(
                 tx_hash = %tx_hash,
                 ?reason,
                 committed_height = self.committed_height,
-                "BUG: Abort intent for transaction with no active wave assignment"
+                "Abort intent for already-completed transaction (wave cleaned up)"
             );
             return None;
         }

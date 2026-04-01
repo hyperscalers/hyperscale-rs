@@ -559,10 +559,14 @@ where
                     storage.commit_prepared_block(prepared, &block.certificates, Some(consensus))
                 } else if !block.certificates.is_empty() {
                     // Sync path: no execution cache, reconstruct DatabaseUpdates
-                    // from receipts stored during sync.
+                    // from receipts stored during sync. Aborted certificates have
+                    // no receipts (execution never ran) and no state changes.
                     let per_cert: Vec<hyperscale_types::DatabaseUpdates> = block
                         .certificates
                         .iter()
+                        .filter(|cert| {
+                            cert.decision != hyperscale_types::TransactionDecision::Aborted
+                        })
                         .map(|cert| {
                             let receipt = storage
                                 .get_ledger_receipt(&cert.transaction_hash)
