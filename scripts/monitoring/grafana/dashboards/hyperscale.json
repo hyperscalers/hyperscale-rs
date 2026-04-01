@@ -2526,8 +2526,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(hyperscale_fetch_in_flight)",
-          "legendFormat": "In Flight (cluster)",
+          "expr": "sum by (kind) (hyperscale_fetch_in_flight)",
+          "legendFormat": "{{kind}}",
           "refId": "A"
         }
       ],

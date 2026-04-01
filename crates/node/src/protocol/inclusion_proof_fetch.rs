@@ -15,6 +15,7 @@
 //! ```
 
 use hyperscale_core::InclusionProofFetchReason;
+use hyperscale_metrics as metrics;
 use hyperscale_types::{BlockHeight, Hash, ShardGroupId, TransactionInclusionProof, ValidatorId};
 use std::collections::{HashMap, HashSet};
 use tracing::{debug, trace, warn};
@@ -163,6 +164,11 @@ impl InclusionProofFetchProtocol {
         !self.pending.is_empty()
     }
 
+    /// Returns the number of currently in-flight fetch operations.
+    pub fn in_flight_count(&self) -> usize {
+        self.pending.values().filter(|s| s.in_flight).count()
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
     // Input Handlers
     // ═══════════════════════════════════════════════════════════════════════
@@ -197,6 +203,7 @@ impl InclusionProofFetchProtocol {
             peer_count = peers.len(),
             "Starting inclusion proof fetch"
         );
+        metrics::record_fetch_started("inclusion_proof");
 
         self.pending.insert(
             winner_tx_hash,
@@ -228,6 +235,7 @@ impl InclusionProofFetchProtocol {
                 winner_tx = %winner_tx_hash,
                 "Inclusion proof fetch complete"
             );
+            metrics::record_fetch_completed("inclusion_proof");
             vec![InclusionProofFetchOutput::Deliver {
                 winner_tx_hash,
                 reason,
@@ -258,6 +266,7 @@ impl InclusionProofFetchProtocol {
         if let Some(state) = self.pending.get_mut(&winner_tx_hash) {
             state.in_flight = false;
             state.retries_on_current += 1;
+            metrics::record_fetch_failed("inclusion_proof");
 
             // If we've exhausted retries on the current peer, mark it as tried
             // and move to the next one.

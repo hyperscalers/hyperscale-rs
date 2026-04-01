@@ -11,6 +11,7 @@
 //! Runner ──► HeaderFetchProtocol::handle(Input) ──► Vec<Output>
 //! ```
 
+use hyperscale_metrics as metrics;
 use hyperscale_types::{BlockHeight, CommittedBlockHeader, ShardGroupId, ValidatorId};
 use std::collections::{HashMap, HashSet};
 use tracing::{debug, trace, warn};
@@ -140,6 +141,11 @@ impl HeaderFetchProtocol {
         self.pending.keys().filter(|(s, _)| *s == shard).count()
     }
 
+    /// Returns the number of currently in-flight fetch operations.
+    pub fn in_flight_count(&self) -> usize {
+        self.pending.values().filter(|s| s.in_flight).count()
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
     // Input Handlers
     // ═══════════════════════════════════════════════════════════════════════
@@ -195,6 +201,7 @@ impl HeaderFetchProtocol {
             peer_count = peers.len(),
             "Starting committed block header fetch"
         );
+        metrics::record_fetch_started("header");
 
         self.pending.insert(
             key,
@@ -221,6 +228,7 @@ impl HeaderFetchProtocol {
                 from_height = from_height.0,
                 "Header fetch complete"
             );
+            metrics::record_fetch_completed("header");
             vec![HeaderFetchOutput::Deliver { header }]
         } else {
             trace!(
@@ -256,6 +264,7 @@ impl HeaderFetchProtocol {
         let key = (source_shard, from_height);
         if let Some(state) = self.pending.get_mut(&key) {
             state.in_flight = false;
+            metrics::record_fetch_failed("header");
             warn!(
                 source_shard = source_shard.0,
                 from_height = from_height.0,

@@ -356,8 +356,8 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     /// Record fetch operation latency.
     fn record_fetch_latency(&self, kind: &str, latency_secs: f64) {}
 
-    /// Set the fetch in-flight gauge.
-    fn set_fetch_in_flight(&self, count: usize) {}
+    /// Set the fetch in-flight gauge (per kind).
+    fn set_fetch_in_flight(&self, kind: &str, count: usize) {}
 
     /// Record items sent in response to a fetch request.
     fn record_fetch_response_sent(&self, kind: &str, count: usize) {}
@@ -791,10 +791,10 @@ pub fn record_fetch_latency(kind: &str, latency_secs: f64) {
     recorder().record_fetch_latency(kind, latency_secs);
 }
 
-/// Set the fetch in-flight gauge.
+/// Set the fetch in-flight gauge (per kind).
 #[inline]
-pub fn set_fetch_in_flight(count: usize) {
-    recorder().set_fetch_in_flight(count);
+pub fn set_fetch_in_flight(kind: &str, count: usize) {
+    recorder().set_fetch_in_flight(kind, count);
 }
 
 /// Record items sent in response to a fetch request.

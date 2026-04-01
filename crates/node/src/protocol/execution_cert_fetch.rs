@@ -11,6 +11,7 @@
 //! Runner ──► ExecCertFetchProtocol::handle(Input) ──► Vec<Output>
 //! ```
 
+use hyperscale_metrics as metrics;
 use hyperscale_types::{ExecutionCertificate, ShardGroupId, ValidatorId, WaveId};
 use std::collections::{HashMap, HashSet};
 use tracing::{debug, trace, warn};
@@ -157,6 +158,11 @@ impl ExecCertFetchProtocol {
         self.pending_count_for_shard(shard) >= self.config.max_pending_per_shard
     }
 
+    /// Returns the number of currently in-flight fetch operations.
+    pub fn in_flight_count(&self) -> usize {
+        self.pending.values().filter(|s| s.in_flight).count()
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
     // Input Handlers
     // ═══════════════════════════════════════════════════════════════════════
@@ -219,6 +225,7 @@ impl ExecCertFetchProtocol {
             peer_count = peers.len(),
             "Starting exec cert fetch"
         );
+        metrics::record_fetch_started("exec_cert");
 
         self.pending.insert(
             key,
@@ -247,6 +254,7 @@ impl ExecCertFetchProtocol {
                 count = certificates.len(),
                 "Exec cert fetch complete"
             );
+            metrics::record_fetch_completed("exec_cert");
             vec![ExecCertFetchOutput::Deliver { certificates }]
         } else {
             trace!(
@@ -281,6 +289,7 @@ impl ExecCertFetchProtocol {
         let key = (source_shard, block_height);
         if let Some(state) = self.pending.get_mut(&key) {
             state.in_flight = false;
+            metrics::record_fetch_failed("exec_cert");
             warn!(
                 source_shard = source_shard.0,
                 block_height,

@@ -107,7 +107,7 @@ pub struct Metrics {
     pub fetch_items_received: CounterVec,
     pub fetch_items_sent: CounterVec,
     pub fetch_latency: HistogramVec,
-    pub fetch_in_flight: Gauge,
+    pub fetch_in_flight: GaugeVec,
 
     // === Livelock ===
     pub livelock_cycles_detected: Counter,
@@ -574,9 +574,10 @@ impl Metrics {
             )
             .unwrap(),
 
-            fetch_in_flight: register_gauge!(
+            fetch_in_flight: register_gauge_vec!(
                 "hyperscale_fetch_in_flight",
-                "Number of fetch requests currently in flight"
+                "Number of fetch requests currently in flight",
+                &["kind"]
             )
             .unwrap(),
 
@@ -1098,8 +1099,11 @@ impl MetricsRecorder for PrometheusRecorder {
             .observe(latency_secs);
     }
 
-    fn set_fetch_in_flight(&self, count: usize) {
-        self.metrics.fetch_in_flight.set(count as f64);
+    fn set_fetch_in_flight(&self, kind: &str, count: usize) {
+        self.metrics
+            .fetch_in_flight
+            .with_label_values(&[kind])
+            .set(count as f64);
     }
 
     fn record_fetch_response_sent(&self, kind: &str, count: usize) {

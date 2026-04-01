@@ -945,7 +945,14 @@ where
 
         // ── Fetch ──
         let fetch_status = self.fetch_protocol.status();
-        metrics::set_fetch_in_flight(fetch_status.in_flight_operations);
+        metrics::set_fetch_in_flight("transaction", fetch_status.in_flight_operations);
+        metrics::set_fetch_in_flight("provision", self.provision_fetch_protocol.in_flight_count());
+        metrics::set_fetch_in_flight("exec_cert", self.exec_cert_fetch_protocol.in_flight_count());
+        metrics::set_fetch_in_flight(
+            "inclusion_proof",
+            self.inclusion_proof_fetch_protocol.in_flight_count(),
+        );
+        metrics::set_fetch_in_flight("header", self.header_fetch_protocol.in_flight_count());
 
         // ── Livelock ──
         let livelock_stats = self.state.livelock().stats();

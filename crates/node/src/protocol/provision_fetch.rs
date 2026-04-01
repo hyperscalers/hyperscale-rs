@@ -13,6 +13,7 @@
 
 use hyperscale_messages::request::GetProvisionsRequest;
 use hyperscale_messages::response::GetProvisionsResponse;
+use hyperscale_metrics as metrics;
 use hyperscale_storage::{ConsensusStore, SubstateStore};
 use hyperscale_types::{BlockHeight, ProvisionBatch, ShardGroupId, StateProvision, ValidatorId};
 use std::collections::{HashMap, HashSet};
@@ -167,6 +168,11 @@ impl ProvisionFetchProtocol {
         self.pending_count_for_shard(shard) >= self.config.max_pending_per_shard
     }
 
+    /// Returns the number of currently in-flight fetch operations.
+    pub fn in_flight_count(&self) -> usize {
+        self.pending.values().filter(|s| s.in_flight).count()
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
     // Input Handlers
     // ═══════════════════════════════════════════════════════════════════════
@@ -228,6 +234,7 @@ impl ProvisionFetchProtocol {
             peer_count = peers.len(),
             "Starting provision fetch"
         );
+        metrics::record_fetch_started("provision");
 
         self.pending.insert(
             key,
@@ -257,6 +264,7 @@ impl ProvisionFetchProtocol {
                 count = batch.transactions.len(),
                 "Provision fetch complete"
             );
+            metrics::record_fetch_completed("provision");
             vec![ProvisionFetchOutput::Deliver { batch }]
         } else {
             trace!(
@@ -292,6 +300,7 @@ impl ProvisionFetchProtocol {
         let key = (source_shard, block_height);
         if let Some(state) = self.pending.get_mut(&key) {
             state.in_flight = false;
+            metrics::record_fetch_failed("provision");
             warn!(
                 source_shard = source_shard.0,
                 block_height = block_height.0,
