@@ -44,6 +44,12 @@ struct ExpectedHeader {
     discovered_at: BlockHeight,
     /// Highest height we've verified from this shard (0 if none).
     last_verified_height: BlockHeight,
+    /// Local committed height when we last verified a header from this shard.
+    /// This is the liveness baseline: the timeout measures how many *local*
+    /// blocks have passed since we last heard from the remote shard, rather
+    /// than comparing local height to the remote shard's height (which are
+    /// independent counters that advance at different rates).
+    last_verified_at_local: BlockHeight,
     /// Whether we've already emitted a fallback request for the current gap.
     requested: bool,
     /// Local committed height when we last emitted a fallback request.
@@ -260,18 +266,14 @@ impl RemoteHeaderCoordinator {
         self.verified.insert(key, Arc::clone(&header));
         self.pending.remove(&key);
 
-        // Update liveness baseline. Only reset the request flag if we've
-        // caught up close enough that the timeout won't immediately re-fire.
-        // This prevents a verify → reset → timeout → request flood when the
-        // gap remains open (e.g. headers arrive sporadically but we're still
-        // far behind the local committed height).
+        // Update liveness tracking: advance the remote tip and record the
+        // local height at which we received it (the actual liveness signal).
+        // Reset the request flag so future gaps can trigger new requests.
         if let Some(expected) = self.expected.get_mut(&shard) {
             if height > expected.last_verified_height {
                 expected.last_verified_height = height;
-                let gap = self.local_committed_height.0.saturating_sub(height.0);
-                if gap < HEADER_LIVENESS_TIMEOUT_BLOCKS {
-                    expected.requested = false;
-                }
+                expected.last_verified_at_local = self.local_committed_height;
+                expected.requested = false;
             }
         }
 
@@ -306,6 +308,7 @@ impl RemoteHeaderCoordinator {
                 .or_insert_with(|| ExpectedHeader {
                     discovered_at: self.local_committed_height,
                     last_verified_height: BlockHeight(0),
+                    last_verified_at_local: BlockHeight(0),
                     requested: false,
                     requested_at: BlockHeight(0),
                 });
@@ -316,10 +319,12 @@ impl RemoteHeaderCoordinator {
         let current_height = self.local_committed_height.0;
 
         for (&shard, expected) in self.expected.iter_mut() {
-            // If we've verified at least one header, measure from that.
-            // Otherwise measure from when we first discovered the shard.
-            let baseline = if expected.last_verified_height.0 > 0 {
-                expected.last_verified_height.0
+            // Measure how many LOCAL blocks have passed since we last heard
+            // from this shard. Both sides of the branch are local heights,
+            // avoiding the previous bug of comparing local height against
+            // the remote shard's block height (independent counters).
+            let baseline = if expected.last_verified_at_local.0 > 0 {
+                expected.last_verified_at_local.0
             } else {
                 expected.discovered_at.0
             };
