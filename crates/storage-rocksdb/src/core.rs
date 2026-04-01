@@ -12,8 +12,8 @@
 //! On each commit, the JVT is updated and a new state root hash is computed.
 
 use crate::config::{
-    ResetOldKeys, RocksDbConfig, ASSOCIATED_STATE_TREE_VALUES_CF, JVT_NODES_CF,
-    STALE_STATE_HASH_TREE_PARTS_CF, STATE_CF, VERSIONED_SUBSTATES_CF,
+    CfHandles, ResetOldKeys, RocksDbConfig, ASSOCIATED_STATE_TREE_VALUES_CF, JVT_NODES_CF,
+    STATE_CF, VERSIONED_SUBSTATES_CF,
 };
 use crate::jvt_snapshot_store::SnapshotTreeStore;
 use hyperscale_dispatch::Dispatch;
@@ -32,6 +32,23 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tracing::{instrument, Level};
+
+/// Decode JVT metadata from raw bytes.
+///
+/// Layout: `[version_BE_8B][root_hash_32B]` (40 bytes total).
+/// Returns `(0, ZERO)` for `None` (uninitialized DB).
+pub(crate) fn decode_jvt_metadata(raw: Option<impl AsRef<[u8]>>) -> (u64, StateRootHash) {
+    match raw {
+        Some(bytes) => {
+            let bytes = bytes.as_ref();
+            assert!(bytes.len() == 40, "jmt:metadata must be 40 bytes");
+            let version = u64::from_be_bytes(bytes[..8].try_into().unwrap());
+            let root_hash = StateRootHash::from_hash_bytes(&bytes[8..40]);
+            (version, root_hash)
+        }
+        None => (0, StateRootHash::ZERO),
+    }
+}
 
 /// RocksDB-based storage for production use.
 ///
@@ -184,6 +201,10 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
         let db = DB::open_cf_descriptors(&opts, path, cf_descriptors)
             .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
 
+        // Validate all expected column families exist at startup.
+        // This fails fast instead of panicking on first access at runtime.
+        CfHandles::resolve(&db);
+
         Ok(Self {
             db: Arc::new(db),
             commit_lock: Mutex::new(()),
@@ -198,41 +219,34 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
         self.jvt_history_length
     }
 
+    /// Resolve all column family handles from the database.
+    ///
+    /// This is cheap (HashMap lookups only, ~10ns per CF) and provides typed
+    /// access to all 12 column families without repeating
+    /// `.cf_handle(NAME).expect(...)` at each call site.
+    pub(crate) fn cf(&self) -> CfHandles<'_> {
+        CfHandles::resolve(&self.db)
+    }
+
     /// Read JVT version and root hash directly from RocksDB.
     ///
-    /// These keys are written on every commit, so they're always hot in the
-    /// memtable — this is effectively a hashtable lookup, not a disk read.
-    ///
-    /// **Note:** This performs two separate `get()` calls. A concurrent
-    /// `commit_block` could update both keys between reads, returning an
-    /// inconsistent (version, root) pair. Safety-critical paths (historical
-    /// JVT reads, proof generation) use `SnapshotTreeStore::read_jvt_metadata`
-    /// instead, which reads from a point-in-time snapshot. This method is
-    /// acceptable for non-critical uses like RPC status and genesis bootstrap.
+    /// These are stored as a single 40-byte value under `jmt:metadata`:
+    /// `[version_BE_8B][root_hash_32B]`. Always hot in the memtable since
+    /// they're written on every commit.
     pub(crate) fn read_jvt_metadata(&self) -> (u64, StateRootHash) {
-        let version = self
-            .db
-            .get(b"jmt:version")
-            .expect("BFT CRITICAL: failed to read jmt:version")
-            .map(|v| {
-                u64::from_be_bytes(
-                    <[u8; 8]>::try_from(v.as_slice()).expect("jmt:version must be 8 bytes"),
-                )
-            })
-            .unwrap_or(0);
+        decode_jvt_metadata(
+            self.db
+                .get(b"jmt:metadata")
+                .expect("BFT CRITICAL: failed to read jmt:metadata"),
+        )
+    }
 
-        let root_hash = self
-            .db
-            .get(b"jmt:root_hash")
-            .expect("BFT CRITICAL: failed to read jmt:root_hash")
-            .map(|v| {
-                StateRootHash::from_hash_bytes(
-                    &<[u8; 32]>::try_from(v.as_slice()).expect("jmt:root_hash must be 32 bytes"),
-                )
-            })
-            .unwrap_or(StateRootHash::ZERO);
-
-        (version, root_hash)
+    /// Encode JVT metadata into a 40-byte value.
+    fn encode_jvt_metadata(version: u64, root: StateRootHash) -> [u8; 40] {
+        let mut buf = [0u8; 40];
+        buf[..8].copy_from_slice(&version.to_be_bytes());
+        buf[8..40].copy_from_slice(&root.to_bytes());
+        buf
     }
 
     /// Append JVT data from a snapshot to a WriteBatch.
@@ -248,42 +262,37 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
         new_version: u64,
     ) {
         // JVT nodes
-        let jvt_cf = self
-            .db
-            .cf_handle(JVT_NODES_CF)
-            .expect("jmt_nodes column family must exist");
+        let cf = self.cf();
         for (key, node) in &snapshot.nodes {
             let encoded_key = encode_jvt_key(key);
             let encoded_node = sbor::basic_encode(&VersionedStoredNode::from_latest(node.clone()))
                 .expect("JVT node encoding must succeed");
-            batch.put_cf(jvt_cf, encoded_key, encoded_node);
+            batch.put_cf(cf.jvt_nodes, encoded_key, encoded_node);
         }
 
         // Stale parts for deferred GC
         if !snapshot.stale_tree_parts.is_empty() {
-            let stale_cf = self
-                .db
-                .cf_handle(STALE_STATE_HASH_TREE_PARTS_CF)
-                .expect("stale_state_hash_tree_parts column family must exist");
             let version_key = new_version.to_be_bytes();
             let encoded_parts = sbor::basic_encode(&snapshot.stale_tree_parts)
                 .expect("encoding stale parts must succeed");
-            batch.put_cf(stale_cf, version_key, encoded_parts);
+            batch.put_cf(cf.stale_state_hash_tree_parts, version_key, encoded_parts);
         }
 
         // Historical associations (always enabled — required for cross-shard provisions)
-        let assoc_cf = self
-            .db
-            .cf_handle(ASSOCIATED_STATE_TREE_VALUES_CF)
-            .expect("associated_state_tree_values column family must exist");
         for assoc in &snapshot.leaf_substate_associations {
             let encoded_key = encode_jvt_key(&assoc.tree_node_key);
-            batch.put_cf(assoc_cf, encoded_key, &assoc.substate_value);
+            batch.put_cf(
+                cf.associated_state_tree_values,
+                encoded_key,
+                &assoc.substate_value,
+            );
         }
 
-        // JVT metadata (keys use legacy "jmt:" prefix for on-disk compatibility)
-        batch.put(b"jmt:version", new_version.to_be_bytes());
-        batch.put(b"jmt:root_hash", snapshot.result_root.to_bytes());
+        // JVT metadata — single key, atomic read.
+        batch.put(
+            b"jmt:metadata",
+            Self::encode_jvt_metadata(new_version, snapshot.result_root),
+        );
     }
 
     /// Append consensus metadata (committed_height, committed_hash, committed_qc)
@@ -304,11 +313,7 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
         start: &[u8],
         end: &[u8],
     ) -> impl Iterator<Item = (Box<[u8]>, Box<[u8]>)> + 'a {
-        let state_cf = self
-            .db
-            .cf_handle(STATE_CF)
-            .expect("state column family must exist");
-        let mut iter = self.db.raw_iterator_cf(state_cf);
+        let mut iter = self.db.raw_iterator_cf(self.cf().state);
         iter.seek(start);
         let end = end.to_vec();
         let mut done = false;
@@ -354,12 +359,9 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
         let mut batch = WriteBatch::default();
         let mut reset_old_keys = ResetOldKeys::new();
 
-        let state_cf = self
-            .db
-            .cf_handle(STATE_CF)
-            .expect("state column family must exist");
-
-        let versioned_cf = self.db.cf_handle(VERSIONED_SUBSTATES_CF);
+        let cf = self.cf();
+        let state_cf = cf.state;
+        let versioned_cf: Option<&rocksdb::ColumnFamily> = Some(cf.versioned_substates);
 
         // Reusable buffer for versioned keys — avoids a Vec allocation per substate write.
         let mut vkey_buf: Vec<u8> = Vec::with_capacity(256);
@@ -530,13 +532,9 @@ impl<D: Dispatch + 'static> SubstateDatabase for RocksDbStorage<D> {
     ) -> Option<DbSubstateValue> {
         let start = Instant::now();
         let key = keys::to_storage_key(partition_key, sort_key);
-        let state_cf = self
-            .db
-            .cf_handle(STATE_CF)
-            .expect("state column family must exist");
         let result = self
             .db
-            .get_cf(state_cf, &key)
+            .get_cf(self.cf().state, &key)
             .expect("RocksDB read failure on state CF");
         let elapsed = start.elapsed();
         metrics::record_storage_read(elapsed.as_secs_f64());
@@ -582,10 +580,9 @@ impl<D: Dispatch + 'static> SubstateDatabase for RocksDbStorage<D> {
 
 impl<D: Dispatch + 'static> ReadableTreeStore for RocksDbStorage<D> {
     fn get_node(&self, key: &StoredNodeKey) -> Option<StoredNode> {
-        let cf = self.db.cf_handle(JVT_NODES_CF)?;
         let encoded_key = encode_jvt_key(key);
         self.db
-            .get_cf(cf, &encoded_key)
+            .get_cf(self.cf().jvt_nodes, &encoded_key)
             .expect("RocksDB read failure on jmt_nodes CF")
             .map(|bytes| {
                 sbor::basic_decode::<VersionedStoredNode>(&bytes)

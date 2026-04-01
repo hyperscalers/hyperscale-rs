@@ -1,6 +1,6 @@
 //! RocksDB snapshot for consistent reads.
 
-use crate::config::STATE_CF;
+use crate::config::CfHandles;
 use hyperscale_storage::{
     keys, DbPartitionKey, DbSortKey, DbSubstateValue, PartitionEntry, SubstateDatabase,
 };
@@ -23,9 +23,8 @@ impl SubstateDatabase for RocksDbSnapshot<'_> {
         sort_key: &DbSortKey,
     ) -> Option<DbSubstateValue> {
         let key = keys::to_storage_key(partition_key, sort_key);
-        let state_cf = self.db.cf_handle(STATE_CF)?;
         self.snapshot
-            .get_cf(state_cf, &key)
+            .get_cf(CfHandles::resolve(self.db).state, &key)
             .expect("RocksDB snapshot read failure on state CF")
     }
 
@@ -47,10 +46,7 @@ impl SubstateDatabase for RocksDbSnapshot<'_> {
         };
         let end = keys::next_prefix(&prefix).expect("storage key prefix overflow");
 
-        let state_cf = self
-            .db
-            .cf_handle(STATE_CF)
-            .expect("state column family must exist");
+        let state_cf = CfHandles::resolve(self.db).state;
         let mut iter = self.snapshot.raw_iterator_cf(state_cf);
         iter.seek(&start);
 

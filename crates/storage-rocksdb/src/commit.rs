@@ -1,9 +1,6 @@
 //! `CommitStore` implementation for `RocksDbStorage`.
 
-use crate::config::{
-    ASSOCIATED_STATE_TREE_VALUES_CF, JVT_NODES_CF, STALE_STATE_HASH_TREE_PARTS_CF, STATE_CF,
-    VERSIONED_SUBSTATES_CF,
-};
+use crate::config::ALL_COLUMN_FAMILIES;
 use crate::core::RocksDbStorage;
 use crate::jvt_snapshot_store::SnapshotTreeStore;
 use hyperscale_dispatch::Dispatch;
@@ -67,10 +64,7 @@ impl<D: Dispatch + 'static> hyperscale_storage::CommitStore for RocksDbStorage<D
 
         // Append certificate storage to the write batch.
         let mut write_batch = prepared.write_batch;
-        let cert_cf = self
-            .db
-            .cf_handle("certificates")
-            .expect("certificates column family must exist");
+        let cert_cf = self.cf().certificates;
         for cert in certificates {
             let cert_bytes =
                 sbor::basic_encode(cert.as_ref()).expect("certificate encoding must succeed");
@@ -122,10 +116,7 @@ impl<D: Dispatch + 'static> hyperscale_storage::CommitStore for RocksDbStorage<D
 
         // Store certificates to the certificate CF.
         if !certificates.is_empty() {
-            let cert_cf = self
-                .db
-                .cf_handle("certificates")
-                .expect("certificates column family must exist");
+            let cert_cf = self.cf().certificates;
             for cert in certificates {
                 let cert_bytes =
                     sbor::basic_encode(cert.as_ref()).expect("certificate encoding must succeed");
@@ -172,22 +163,7 @@ impl<D: Dispatch + 'static> hyperscale_storage::CommitStore for RocksDbStorage<D
         let mut block_cache_usage = 0u64;
         let mut memtable_usage = 0u64;
 
-        const CF_NAMES: &[&str] = &[
-            "default",
-            "blocks",
-            "transactions",
-            STATE_CF,
-            "certificates",
-            "votes",
-            JVT_NODES_CF,
-            ASSOCIATED_STATE_TREE_VALUES_CF,
-            STALE_STATE_HASH_TREE_PARTS_CF,
-            VERSIONED_SUBSTATES_CF,
-            "ledger_receipts",
-            "local_executions",
-        ];
-
-        for cf_name in CF_NAMES {
+        for cf_name in ALL_COLUMN_FAMILIES {
             if let Some(cf) = self.db.cf_handle(cf_name) {
                 // Block cache is shared — reading from any CF gives the total.
                 // We read it once from the first CF we find.

@@ -29,10 +29,6 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
     ))]
     pub fn put_own_vote(&self, height: u64, round: u64, block_hash: Hash) {
         let start = std::time::Instant::now();
-        let cf = self
-            .db
-            .cf_handle("votes")
-            .expect("votes column family must exist");
 
         let key = height.to_be_bytes();
         let value = sbor::basic_encode(&(block_hash, round))
@@ -43,7 +39,7 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
         write_opts.set_sync(true);
 
         self.db
-            .put_cf_opt(cf, key, value, &write_opts)
+            .put_cf_opt(self.cf().votes, key, value, &write_opts)
             .expect("BFT SAFETY CRITICAL: vote persistence failed - cannot continue safely");
 
         let elapsed = start.elapsed();
@@ -59,10 +55,9 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
     ///
     /// Returns `Some((block_hash, round))` if we previously voted at this height.
     pub fn get_own_vote(&self, height: u64) -> Option<(Hash, u64)> {
-        let cf = self.db.cf_handle("votes")?;
         let key = height.to_be_bytes();
 
-        match self.db.get_cf(cf, key) {
+        match self.db.get_cf(self.cf().votes, key) {
             Ok(Some(value)) => sbor::basic_decode(&value).ok(),
             _ => None,
         }
@@ -72,10 +67,7 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
     ///
     /// Returns a map of height -> (block_hash, round).
     pub fn get_all_own_votes(&self) -> std::collections::HashMap<u64, (Hash, u64)> {
-        let cf = match self.db.cf_handle("votes") {
-            Some(cf) => cf,
-            None => return std::collections::HashMap::new(),
-        };
+        let cf = self.cf().votes;
 
         let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
 
@@ -95,10 +87,7 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
     /// Once a height is committed, we no longer need to track our vote for it.
     /// This prevents unbounded storage growth.
     pub fn prune_own_votes(&self, committed_height: u64) {
-        let cf = match self.db.cf_handle("votes") {
-            Some(cf) => cf,
-            None => return,
-        };
+        let cf = self.cf().votes;
 
         // Delete all votes at or below committed_height
         let mut batch = rocksdb::WriteBatch::default();

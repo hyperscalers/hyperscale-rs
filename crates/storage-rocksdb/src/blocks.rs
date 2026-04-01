@@ -1,7 +1,5 @@
 //! Denormalized block storage, transaction/certificate CRUD, and chain metadata.
 
-#[cfg(test)]
-use crate::config::STATE_CF;
 use crate::core::RocksDbStorage;
 use hyperscale_dispatch::Dispatch;
 use hyperscale_metrics as metrics;
@@ -46,27 +44,21 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
     /// This is idempotent - storing the same transaction twice is safe.
     /// Used by `put_block_denormalized` to store transactions separately from block metadata.
     pub fn put_transaction(&self, tx: &RoutableTransaction) {
-        let cf = self
-            .db
-            .cf_handle("transactions")
-            .expect("transactions column family must exist");
-
         let hash = tx.hash();
         let value = sbor::basic_encode(tx).expect("transaction encoding must succeed");
 
         self.db
-            .put_cf(cf, hash.as_bytes(), value)
+            .put_cf(self.cf().transactions, hash.as_bytes(), value)
             .expect("failed to persist transaction");
     }
 
     /// Get a transaction by hash.
     pub fn get_transaction(&self, hash: &Hash) -> Option<RoutableTransaction> {
         let start = Instant::now();
-        let cf = self.db.cf_handle("transactions")?;
 
         let result = self
             .db
-            .get_cf(cf, hash.as_bytes())
+            .get_cf(self.cf().transactions, hash.as_bytes())
             .ok()
             .flatten()
             .and_then(|v| sbor::basic_decode(&v).ok());
@@ -85,10 +77,7 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
         }
 
         let start = Instant::now();
-        let cf = match self.db.cf_handle("transactions") {
-            Some(cf) => cf,
-            None => return vec![],
-        };
+        let cf = self.cf().transactions;
 
         let keys: Vec<_> = hashes.iter().map(|h| (cf, h.as_bytes().to_vec())).collect();
         let results = self.db.multi_get_cf(keys);
@@ -127,40 +116,32 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
     pub(crate) fn put_block_denormalized(&self, block: &Block, qc: &QuorumCertificate) {
         let start = Instant::now();
         let mut batch = rocksdb::WriteBatch::default();
-
-        let blocks_cf = self
-            .db
-            .cf_handle("blocks")
-            .expect("blocks column family must exist");
-        let txs_cf = self
-            .db
-            .cf_handle("transactions")
-            .expect("transactions column family must exist");
-        let certs_cf = self
-            .db
-            .cf_handle("certificates")
-            .expect("certificates column family must exist");
+        let cf = self.cf();
 
         // 1. Store block metadata (header + hashes only)
         let metadata = BlockMetadata::from_block(block, qc.clone());
         let height_key = block.header.height.0.to_be_bytes();
         let metadata_value =
             sbor::basic_encode(&metadata).expect("block metadata encoding must succeed");
-        batch.put_cf(blocks_cf, height_key, metadata_value);
+        batch.put_cf(cf.blocks, height_key, metadata_value);
 
         // 2. Store transactions (deduplicated - RocksDB overwrites are idempotent)
         for tx in block.transactions.iter() {
             let tx_hash = tx.hash();
             let tx_value =
                 sbor::basic_encode(tx.as_ref()).expect("transaction encoding must succeed");
-            batch.put_cf(txs_cf, tx_hash.as_bytes(), tx_value);
+            batch.put_cf(cf.transactions, tx_hash.as_bytes(), tx_value);
         }
 
         // 3. Store certificates (deduplicated)
         for cert in &block.certificates {
             let cert_value =
                 sbor::basic_encode(cert.as_ref()).expect("certificate encoding must succeed");
-            batch.put_cf(certs_cf, cert.transaction_hash.as_bytes(), cert_value);
+            batch.put_cf(
+                cf.certificates,
+                cert.transaction_hash.as_bytes(),
+                cert_value,
+            );
         }
 
         // Atomic write with sync for crash safety
@@ -192,12 +173,11 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
         let start = Instant::now();
 
         // 1. Get block metadata
-        let blocks_cf = self.db.cf_handle("blocks")?;
         let key = height.0.to_be_bytes();
 
         let metadata: BlockMetadata = self
             .db
-            .get_cf(blocks_cf, key)
+            .get_cf(self.cf().blocks, key)
             .ok()
             .flatten()
             .and_then(|v| sbor::basic_decode(&v).ok())?;
@@ -257,12 +237,11 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
     pub fn get_block_metadata(&self, height: BlockHeight) -> Option<BlockMetadata> {
         let start = Instant::now();
 
-        let blocks_cf = self.db.cf_handle("blocks")?;
         let key = height.0.to_be_bytes();
 
         let metadata: BlockMetadata = self
             .db
-            .get_cf(blocks_cf, key)
+            .get_cf(self.cf().blocks, key)
             .ok()
             .flatten()
             .and_then(|v| sbor::basic_decode(&v).ok())?;
@@ -288,12 +267,11 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
         let start = Instant::now();
 
         // 1. Get block metadata
-        let blocks_cf = self.db.cf_handle("blocks")?;
         let key = height.0.to_be_bytes();
 
         let metadata: BlockMetadata = self
             .db
-            .get_cf(blocks_cf, key)
+            .get_cf(self.cf().blocks, key)
             .ok()
             .flatten()
             .and_then(|v| sbor::basic_decode(&v).ok())?;
@@ -356,10 +334,7 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
             return vec![];
         }
 
-        let cf = match self.db.cf_handle("transactions") {
-            Some(cf) => cf,
-            None => return vec![],
-        };
+        let cf = self.cf().transactions;
 
         let keys: Vec<_> = hashes.iter().map(|h| (cf, h.as_bytes().to_vec())).collect();
         let results = self.db.multi_get_cf(keys);
@@ -398,10 +373,7 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
             return vec![];
         }
 
-        let cf = match self.db.cf_handle("certificates") {
-            Some(cf) => cf,
-            None => return vec![],
-        };
+        let cf = self.cf().certificates;
 
         let keys: Vec<_> = hashes.iter().map(|h| (cf, h.as_bytes().to_vec())).collect();
         let results = self.db.multi_get_cf(keys);
@@ -513,23 +485,16 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
 
     /// Store a transaction certificate.
     pub fn put_certificate(&self, hash: &Hash, cert: &TransactionCertificate) {
-        let cf = self
-            .db
-            .cf_handle("certificates")
-            .expect("certificates column family must exist");
-
         let value = sbor::basic_encode(cert).expect("certificate encoding must succeed");
 
         self.db
-            .put_cf(cf, hash.as_bytes(), value)
+            .put_cf(self.cf().certificates, hash.as_bytes(), value)
             .expect("failed to persist certificate");
     }
 
     /// Get a transaction certificate by transaction hash.
     pub fn get_certificate(&self, hash: &Hash) -> Option<TransactionCertificate> {
-        let cf = self.db.cf_handle("certificates")?;
-
-        match self.db.get_cf(cf, hash.as_bytes()) {
+        match self.db.get_cf(self.cf().certificates, hash.as_bytes()) {
             Ok(Some(value)) => sbor::basic_decode(&value).ok(),
             _ => None,
         }
@@ -545,10 +510,7 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
         }
 
         let start = Instant::now();
-        let cf = match self.db.cf_handle("certificates") {
-            Some(cf) => cf,
-            None => return vec![],
-        };
+        let cf = self.cf().certificates;
 
         let keys: Vec<_> = hashes.iter().map(|h| (cf, h.as_bytes().to_vec())).collect();
         let results = self.db.multi_get_cf(keys);
@@ -592,22 +554,19 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
         let start = Instant::now();
         let mut batch = rocksdb::WriteBatch::default();
         let mut write_count = 0usize;
+        let cf = self.cf();
 
         // 1. Serialize and add certificate to batch
-        let cert_cf = self
-            .db
-            .cf_handle("certificates")
-            .expect("certificates column family must exist");
         let cert_bytes = sbor::basic_encode(certificate)
             .expect("certificate encoding must succeed - this is a bug if it fails");
-        batch.put_cf(cert_cf, certificate.transaction_hash.as_bytes(), cert_bytes);
+        batch.put_cf(
+            cf.certificates,
+            certificate.transaction_hash.as_bytes(),
+            cert_bytes,
+        );
         write_count += 1;
 
         // 2. Add state writes to batch
-        let state_cf = self
-            .db
-            .cf_handle(STATE_CF)
-            .expect("state column family must exist");
         for (db_node_key, node_updates) in &updates.node_updates {
             for (partition_num, partition_updates) in &node_updates.partition_updates {
                 if let hyperscale_storage::PartitionDatabaseUpdates::Delta { substate_updates } =
@@ -624,11 +583,11 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
 
                         match update {
                             hyperscale_storage::DatabaseUpdate::Set(value) => {
-                                batch.put_cf(state_cf, &storage_key, value);
+                                batch.put_cf(cf.state, &storage_key, value);
                                 write_count += 1;
                             }
                             hyperscale_storage::DatabaseUpdate::Delete => {
-                                batch.delete_cf(state_cf, &storage_key);
+                                batch.delete_cf(cf.state, &storage_key);
                                 write_count += 1;
                             }
                         }

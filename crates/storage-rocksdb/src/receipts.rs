@@ -41,10 +41,7 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
         batch: &mut WriteBatch,
         bundle: &hyperscale_types::ReceiptBundle,
     ) {
-        let receipts_cf = self
-            .db
-            .cf_handle("ledger_receipts")
-            .expect("ledger_receipts column family must exist");
+        let cf = self.cf();
         let receipt_bytes = if let Some(ref updates) = bundle.database_updates {
             let mut receipt = (*bundle.ledger_receipt).clone();
             receipt.state_changes = hyperscale_storage::extract_state_changes(updates);
@@ -53,16 +50,12 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
             sbor::basic_encode(bundle.ledger_receipt.as_ref())
                 .expect("ledger receipt encoding must succeed")
         };
-        batch.put_cf(receipts_cf, bundle.tx_hash.as_bytes(), receipt_bytes);
+        batch.put_cf(cf.ledger_receipts, bundle.tx_hash.as_bytes(), receipt_bytes);
 
         if let Some(ref local) = bundle.local_execution {
-            let local_cf = self
-                .db
-                .cf_handle("local_executions")
-                .expect("local_executions column family must exist");
             let local_bytes =
                 sbor::basic_encode(local).expect("local execution encoding must succeed");
-            batch.put_cf(local_cf, bundle.tx_hash.as_bytes(), local_bytes);
+            batch.put_cf(cf.local_executions, bundle.tx_hash.as_bytes(), local_bytes);
         }
     }
 
@@ -71,8 +64,10 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
         &self,
         tx_hash: &Hash,
     ) -> Option<Arc<hyperscale_types::LedgerTransactionReceipt>> {
-        let cf = self.db.cf_handle("ledger_receipts")?;
-        match self.db.get_cf(cf, tx_hash.as_bytes()) {
+        match self
+            .db
+            .get_cf(self.cf().ledger_receipts, tx_hash.as_bytes())
+        {
             Ok(Some(value)) => {
                 match sbor::basic_decode::<hyperscale_types::LedgerTransactionReceipt>(&value) {
                     Ok(receipt) => Some(Arc::new(receipt)),
@@ -96,8 +91,10 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
         &self,
         tx_hash: &Hash,
     ) -> Option<hyperscale_types::LocalTransactionExecution> {
-        let cf = self.db.cf_handle("local_executions")?;
-        match self.db.get_cf(cf, tx_hash.as_bytes()) {
+        match self
+            .db
+            .get_cf(self.cf().local_executions, tx_hash.as_bytes())
+        {
             Ok(Some(value)) => sbor::basic_decode(&value).ok(),
             _ => None,
         }

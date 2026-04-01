@@ -22,9 +22,93 @@ pub(crate) const STALE_STATE_HASH_TREE_PARTS_CF: &str = "stale_state_hash_tree_p
 /// Enables historical reads via prefix scan + version filtering.
 pub(crate) const VERSIONED_SUBSTATES_CF: &str = "versioned_substates";
 
+/// Column family name for the default CF (chain metadata, JVT metadata).
+pub(crate) const DEFAULT_CF: &str = "default";
+
+/// Column family name for block metadata (header + manifest) keyed by height.
+pub(crate) const BLOCKS_CF: &str = "blocks";
+
+/// Column family name for transactions keyed by hash.
+pub(crate) const TRANSACTIONS_CF: &str = "transactions";
+
+/// Column family name for transaction certificates keyed by hash.
+pub(crate) const CERTIFICATES_CF: &str = "certificates";
+
+/// Column family name for BFT votes keyed by height.
+pub(crate) const VOTES_CF: &str = "votes";
+
+/// Column family name for ledger receipts keyed by tx hash.
+pub(crate) const LEDGER_RECEIPTS_CF: &str = "ledger_receipts";
+
+/// Column family name for local execution details keyed by tx hash.
+pub(crate) const LOCAL_EXECUTIONS_CF: &str = "local_executions";
+
+/// All column families used by the storage layer.
+pub(crate) const ALL_COLUMN_FAMILIES: &[&str] = &[
+    DEFAULT_CF,
+    BLOCKS_CF,
+    TRANSACTIONS_CF,
+    STATE_CF,
+    CERTIFICATES_CF,
+    VOTES_CF,
+    JVT_NODES_CF,
+    ASSOCIATED_STATE_TREE_VALUES_CF,
+    STALE_STATE_HASH_TREE_PARTS_CF,
+    VERSIONED_SUBSTATES_CF,
+    LEDGER_RECEIPTS_CF,
+    LOCAL_EXECUTIONS_CF,
+];
+
 /// Old storage keys deleted by partition Reset operations, keyed by `(entity_key, partition_num)`.
 /// Passed to `put_at_version` so the JVT can generate deletes for the hashed keys.
 pub(crate) type ResetOldKeys = std::collections::HashMap<(Vec<u8>, u8), Vec<Vec<u8>>>;
+
+/// Column family handles resolved from a `DB` reference.
+///
+/// This is cheap to construct (HashMap lookups only) and provides typed access
+/// to all column families without repeating `.cf_handle(NAME).expect(...)`.
+///
+/// Call `CfHandles::resolve(&db)` at the start of any method that needs
+/// multiple CF handles, or use `RocksDbStorage::cf()` for convenience.
+pub(crate) struct CfHandles<'a> {
+    pub state: &'a rocksdb::ColumnFamily,
+    pub blocks: &'a rocksdb::ColumnFamily,
+    pub transactions: &'a rocksdb::ColumnFamily,
+    pub certificates: &'a rocksdb::ColumnFamily,
+    pub votes: &'a rocksdb::ColumnFamily,
+    pub jvt_nodes: &'a rocksdb::ColumnFamily,
+    pub associated_state_tree_values: &'a rocksdb::ColumnFamily,
+    pub stale_state_hash_tree_parts: &'a rocksdb::ColumnFamily,
+    pub versioned_substates: &'a rocksdb::ColumnFamily,
+    pub ledger_receipts: &'a rocksdb::ColumnFamily,
+    pub local_executions: &'a rocksdb::ColumnFamily,
+}
+
+impl<'a> CfHandles<'a> {
+    /// Resolve all column family handles from the database.
+    ///
+    /// # Panics
+    /// Panics if any expected column family is missing.
+    pub fn resolve(db: &'a rocksdb::DB) -> Self {
+        let resolve = |name: &str| -> &'a rocksdb::ColumnFamily {
+            db.cf_handle(name)
+                .unwrap_or_else(|| panic!("column family '{name}' must exist"))
+        };
+        Self {
+            state: resolve(STATE_CF),
+            blocks: resolve(BLOCKS_CF),
+            transactions: resolve(TRANSACTIONS_CF),
+            certificates: resolve(CERTIFICATES_CF),
+            votes: resolve(VOTES_CF),
+            jvt_nodes: resolve(JVT_NODES_CF),
+            associated_state_tree_values: resolve(ASSOCIATED_STATE_TREE_VALUES_CF),
+            stale_state_hash_tree_parts: resolve(STALE_STATE_HASH_TREE_PARTS_CF),
+            versioned_substates: resolve(VERSIONED_SUBSTATES_CF),
+            ledger_receipts: resolve(LEDGER_RECEIPTS_CF),
+            local_executions: resolve(LOCAL_EXECUTIONS_CF),
+        }
+    }
+}
 
 /// Compression type for RocksDB.
 #[derive(Debug, Clone, Copy, Default)]
@@ -94,20 +178,7 @@ impl Default for RocksDbConfig {
             bloom_filter_bits: 10.0,
             bytes_per_sync: 1024 * 1024, // 1MB
             keep_log_file_num: 10,
-            column_families: vec![
-                "default".to_string(),
-                "blocks".to_string(),
-                "transactions".to_string(),
-                "state".to_string(),
-                "certificates".to_string(),
-                "votes".to_string(),     // BFT safety critical - stores own votes
-                "jmt_nodes".to_string(), // JVT tree nodes for state commitment (legacy CF name)
-                "associated_state_tree_values".to_string(), // Historical substate values (leaf key -> value)
-                "stale_state_hash_tree_parts".to_string(),  // Deferred GC queue for stale JVT nodes
-                "versioned_substates".to_string(), // MVCC versioned substates for historical reads
-                "ledger_receipts".to_string(),     // Ledger receipts keyed by tx hash
-                "local_executions".to_string(),    // Local execution details keyed by tx hash
-            ],
+            column_families: ALL_COLUMN_FAMILIES.iter().map(|s| s.to_string()).collect(),
             jvt_history_length: 256,
         }
     }

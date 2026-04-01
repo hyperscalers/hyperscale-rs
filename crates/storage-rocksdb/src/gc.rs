@@ -1,8 +1,5 @@
 //! JVT garbage collection for RocksDB storage.
 
-use crate::config::{
-    ASSOCIATED_STATE_TREE_VALUES_CF, JVT_NODES_CF, STALE_STATE_HASH_TREE_PARTS_CF,
-};
 use crate::core::RocksDbStorage;
 use hyperscale_dispatch::Dispatch;
 use hyperscale_storage::jmt::{
@@ -39,17 +36,10 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
             return 0;
         }
 
-        let stale_cf = match self.db.cf_handle(STALE_STATE_HASH_TREE_PARTS_CF) {
-            Some(cf) => cf,
-            None => return 0,
-        };
-
-        let jvt_cf = match self.db.cf_handle(JVT_NODES_CF) {
-            Some(cf) => cf,
-            None => return 0,
-        };
-
-        let assoc_cf = self.db.cf_handle(ASSOCIATED_STATE_TREE_VALUES_CF);
+        let cf = self.cf();
+        let stale_cf = cf.stale_state_hash_tree_parts;
+        let jvt_cf = cf.jvt_nodes;
+        let assoc_cf = cf.associated_state_tree_values;
 
         // Iterate through stale parts older than the cutoff
         let mut iter = self.db.raw_iterator_cf(stale_cf);
@@ -83,9 +73,7 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
                             StaleTreePart::Node(key) => {
                                 let encoded_key = encode_jvt_key(&key);
                                 batch.delete_cf(jvt_cf, &encoded_key);
-                                if let Some(cf) = assoc_cf {
-                                    batch.delete_cf(cf, &encoded_key);
-                                }
+                                batch.delete_cf(assoc_cf, &encoded_key);
                                 deleted_nodes += 1;
                             }
                             StaleTreePart::Subtree(key) => {
@@ -94,7 +82,7 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
                                 self.delete_subtree_recursive(
                                     &key,
                                     jvt_cf,
-                                    assoc_cf,
+                                    Some(assoc_cf),
                                     &mut batch,
                                     &mut deleted_nodes,
                                 );

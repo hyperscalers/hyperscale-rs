@@ -1,6 +1,5 @@
 //! `SubstateStore` implementation for `RocksDbStorage`.
 
-use crate::config::VERSIONED_SUBSTATES_CF;
 use crate::core::RocksDbStorage;
 use crate::jvt_snapshot_store::SnapshotTreeStore;
 use crate::snapshot::RocksDbSnapshot;
@@ -64,7 +63,7 @@ impl<D: Dispatch + 'static> SubstateStore for RocksDbStorage<D> {
             return None;
         }
 
-        let versioned_cf = self.db.cf_handle(VERSIONED_SUBSTATES_CF)?;
+        let versioned_cf = self.cf().versioned_substates;
         let entity_prefix = keys::node_entity_key(node_id);
         let entity_len = entity_prefix.len();
         let end_prefix = keys::next_prefix(&entity_prefix)?;
