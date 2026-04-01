@@ -903,6 +903,15 @@ impl StateMachine for NodeStateMachine {
                     block.clone(),
                     block_hash,
                 );
+                // Trigger speculative execution for single-shard transactions.
+                // The proposer knows the block contents at build time — start
+                // execution now so results are cached by the time the block commits.
+                actions.extend(self.execution.trigger_speculative_execution(
+                    self.topology.snapshot(),
+                    block_hash,
+                    height.0,
+                    block.transactions.clone(),
+                ));
                 // Trigger speculative provision prep if we have certificate writes
                 if let Some(updates) = merged_updates {
                     actions.extend(self.execution.trigger_speculative_provisions(
