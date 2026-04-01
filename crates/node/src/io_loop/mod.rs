@@ -778,41 +778,7 @@ where
                 batches,
                 block_timestamp,
             } => {
-                for (shard, batch, recipients) in batches {
-                    // Convert ProvisionBatch back to Vec<StateProvision> for the notification.
-                    let block_height = batch.block_height;
-                    let source_shard = batch.source_shard;
-                    let proof = batch.proof.clone();
-                    let provisions: Vec<hyperscale_types::StateProvision> = batch
-                        .transactions
-                        .into_iter()
-                        .map(|tx| hyperscale_types::StateProvision {
-                            transaction_hash: tx.tx_hash,
-                            target_shard: shard,
-                            source_shard,
-                            block_height,
-                            block_timestamp,
-                            entries: std::sync::Arc::new(tx.entries),
-                        })
-                        .collect();
-                    if provisions.is_empty() {
-                        continue;
-                    }
-                    let msg = hyperscale_types::state_provision_batch_message(
-                        self.local_shard,
-                        shard,
-                        block_height,
-                        &provisions,
-                    );
-                    let sig = self.signing_key.sign_v1(&msg);
-                    let notification = hyperscale_messages::StateProvisionsNotification::new(
-                        provisions,
-                        proof,
-                        self.validator_id,
-                        sig,
-                    );
-                    self.network.notify(&recipients, &notification);
-                }
+                self.broadcast_provisions(batches, block_timestamp);
             }
 
             // ── Protocol events → state machine ────────────────────────
@@ -874,6 +840,57 @@ where
         .into_iter()
         .flatten()
         .min()
+    }
+
+    // ─── Provision Broadcasting ────────────────────────────────────────
+
+    /// Sign and broadcast provision batches to target shard committees.
+    ///
+    /// Used by both `ProvisionsReady` (from delegated action) and
+    /// `SendProvisions` (from speculative cache hit).
+    pub(crate) fn broadcast_provisions(
+        &self,
+        batches: Vec<(
+            hyperscale_types::ShardGroupId,
+            hyperscale_types::ProvisionBatch,
+            Vec<hyperscale_types::ValidatorId>,
+        )>,
+        block_timestamp: u64,
+    ) {
+        for (shard, batch, recipients) in batches {
+            let block_height = batch.block_height;
+            let source_shard = batch.source_shard;
+            let proof = batch.proof.clone();
+            let provisions: Vec<hyperscale_types::StateProvision> = batch
+                .transactions
+                .into_iter()
+                .map(|tx| hyperscale_types::StateProvision {
+                    transaction_hash: tx.tx_hash,
+                    target_shard: shard,
+                    source_shard,
+                    block_height,
+                    block_timestamp,
+                    entries: std::sync::Arc::new(tx.entries),
+                })
+                .collect();
+            if provisions.is_empty() {
+                continue;
+            }
+            let msg = hyperscale_types::state_provision_batch_message(
+                self.local_shard,
+                shard,
+                block_height,
+                &provisions,
+            );
+            let sig = self.signing_key.sign_v1(&msg);
+            let notification = hyperscale_messages::StateProvisionsNotification::new(
+                provisions,
+                proof,
+                self.validator_id,
+                sig,
+            );
+            self.network.notify(&recipients, &notification);
+        }
     }
 
     // ─── Metrics ────────────────────────────────────────────────────────
@@ -963,6 +980,9 @@ where
             exec_certificate_trackers: exec_mem.certificate_trackers,
             exec_speculative_results: exec_mem.speculative_results,
             exec_expected_exec_certs: exec_mem.expected_exec_certs,
+            exec_speculative_provision_in_flight: exec_mem.speculative_provision_in_flight,
+            exec_speculative_provision_results: exec_mem.speculative_provision_results,
+            exec_pending_provision_commits: exec_mem.pending_provision_commits,
             // Mempool
             mempool_pool: mempool_mem.pool,
             mempool_ready: mempool_mem.ready,

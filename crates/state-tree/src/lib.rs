@@ -346,6 +346,11 @@ pub fn put_at_version<S: ReadableTreeStore + Sync, D: Dispatch>(
                     StoredNodeKey::from_jvt(&new_root_key),
                     StoredNode::from_jvt(&root_node),
                 ));
+                // Populate node cache so speculative proof generation can find
+                // the root at the new version before the block is committed.
+                if let Some(nc) = node_cache {
+                    nc.insert(new_root_key, Arc::new(root_node.as_ref().clone()));
+                }
                 Some(commitment_to_hash(commitment))
             })
             .unwrap_or(Hash::ZERO);

@@ -1230,6 +1230,18 @@ impl MetricsRecorder for PrometheusRecorder {
             .memory_exec
             .with_label_values(&["expected_exec_certs"])
             .set(m.exec_expected_exec_certs as f64);
+        self.metrics
+            .memory_exec
+            .with_label_values(&["speculative_provision_in_flight"])
+            .set(m.exec_speculative_provision_in_flight as f64);
+        self.metrics
+            .memory_exec
+            .with_label_values(&["speculative_provision_results"])
+            .set(m.exec_speculative_provision_results as f64);
+        self.metrics
+            .memory_exec
+            .with_label_values(&["pending_provision_commits"])
+            .set(m.exec_pending_provision_commits as f64);
 
         // Mempool
         self.metrics

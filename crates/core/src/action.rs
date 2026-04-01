@@ -142,6 +142,33 @@ pub enum Action {
         shard_recipients: HashMap<ShardGroupId, Vec<ValidatorId>>,
     },
 
+    /// Speculatively prepare provisions before block commit.
+    ///
+    /// Emitted at proposal time (after `BuildProposal` completes). Runs on the
+    /// Provisions pool using `NodeCache` for tree reads and overlaying
+    /// `merged_updates` on parent-height substate reads. Results are cached
+    /// and used at commit time to skip `FetchAndBroadcastProvisions`.
+    SpeculativeProvisionPrep {
+        block_hash: Hash,
+        requests: Vec<ProvisionRequest>,
+        source_shard: ShardGroupId,
+        block_height: BlockHeight,
+        block_timestamp: u64,
+        shard_recipients: HashMap<ShardGroupId, Vec<ValidatorId>>,
+        /// Certificate writes to overlay on parent-height substate reads.
+        merged_updates: Arc<DatabaseUpdates>,
+        parent_height: u64,
+    },
+
+    /// Broadcast pre-built provision batches from speculative cache hit.
+    ///
+    /// Emitted by `on_block_committed` when speculative provisions are cached.
+    /// The io_loop handles this identically to `ProvisionsReady`.
+    SendProvisions {
+        batches: Vec<(ShardGroupId, ProvisionBatch, Vec<ValidatorId>)>,
+        block_timestamp: u64,
+    },
+
     /// Broadcast a committed block header globally to all shards.
     ///
     /// Used for the light-client provisions pattern. When a block commits,
@@ -828,6 +855,7 @@ impl Action {
                 | Action::CancelProvisionFetch { .. }
                 | Action::RequestTxInclusionProofs { .. }
                 | Action::RequestMissingCommittedBlockHeader { .. }
+                | Action::SendProvisions { .. }
         )
     }
 
@@ -851,6 +879,7 @@ impl Action {
                 | Action::SpeculativeExecute { .. }
                 | Action::ExecuteCrossShardTransactions { .. }
                 | Action::FetchAndBroadcastProvisions { .. }
+                | Action::SpeculativeProvisionPrep { .. }
                 | Action::FetchBlock { .. }
                 | Action::FetchChainMetadata
         )
@@ -906,6 +935,10 @@ impl Action {
             Action::SpeculativeExecute { .. } => "SpeculativeExecute",
             Action::ExecuteCrossShardTransactions { .. } => "ExecuteCrossShardTransactions",
             Action::FetchAndBroadcastProvisions { .. } => "FetchAndBroadcastProvisions",
+            Action::SpeculativeProvisionPrep { .. } => "SpeculativeProvisionPrep",
+
+            // Non-delegated provisions
+            Action::SendProvisions { .. } => "SendProvisions",
 
             // External Notifications
             Action::EmitCommittedBlock { .. } => "EmitCommittedBlock",

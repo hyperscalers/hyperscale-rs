@@ -62,6 +62,16 @@ where
             }
 
             // ═══════════════════════════════════════════════════════════
+            // Provision broadcasts (from speculative cache hit)
+            // ═══════════════════════════════════════════════════════════
+            Action::SendProvisions {
+                batches,
+                block_timestamp,
+            } => {
+                self.broadcast_provisions(batches, block_timestamp);
+            }
+
+            // ═══════════════════════════════════════════════════════════
             // Network broadcasts — batched
             // ═══════════════════════════════════════════════════════════
             Action::SignAndBroadcastExecutionVote {
@@ -183,7 +193,8 @@ where
             | Action::ExecuteTransactions { .. }
             | Action::SpeculativeExecute { .. }
             | Action::ExecuteCrossShardTransactions { .. }
-            | Action::FetchAndBroadcastProvisions { .. } => {
+            | Action::FetchAndBroadcastProvisions { .. }
+            | Action::SpeculativeProvisionPrep { .. } => {
                 self.dispatch_delegated_action(action);
             }
 

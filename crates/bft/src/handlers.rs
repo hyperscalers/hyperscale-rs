@@ -307,6 +307,10 @@ pub struct ProposalResult<P: Send> {
     pub block: Block,
     pub block_hash: Hash,
     pub prepared_commit: Option<P>,
+    /// Merged certificate writes included in this block's state root.
+    /// `Some` when certificates were included (JVT was ready), `None` otherwise.
+    /// Used by speculative provision preparation to overlay on parent-height reads.
+    pub merged_updates: Option<Arc<DatabaseUpdates>>,
 }
 
 /// Build a proposal block, computing the state root if the JVT is ready.
@@ -343,10 +347,15 @@ pub fn build_proposal<S: CommitStore + SubstateStore>(
     // Can include certificates only if JVT is ready
     let include_certs = jvt_ready && !certificates.is_empty();
 
-    let (state_root, certs_to_include, prepared) = if include_certs {
+    let updates_arc = if include_certs {
+        Some(Arc::new(merged_updates))
+    } else {
+        None
+    };
+
+    let (state_root, certs_to_include, prepared) = if let Some(ref updates) = updates_arc {
         // JVT ready - compute speculative root and get prepared commit handle
-        let (root, prepared) =
-            storage.prepare_block_commit(parent_state_root, &merged_updates, height.0);
+        let (root, prepared) = storage.prepare_block_commit(parent_state_root, updates, height.0);
         (root, certificates, Some(prepared))
     } else {
         // Either no certificates, or JVT not ready - inherit parent state
@@ -394,5 +403,6 @@ pub fn build_proposal<S: CommitStore + SubstateStore>(
         block,
         block_hash,
         prepared_commit: prepared,
+        merged_updates: updates_arc,
     }
 }

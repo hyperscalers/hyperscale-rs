@@ -70,6 +70,7 @@ pub(crate) fn dispatch_pool_for(action: &Action) -> Option<DispatchPool> {
         // Dedicated pool to avoid starving execution and crypto work.
         Action::VerifyProvisionBatch { .. } => Some(DispatchPool::Provisions),
         Action::FetchAndBroadcastProvisions { .. } => Some(DispatchPool::Provisions),
+        Action::SpeculativeProvisionPrep { .. } => Some(DispatchPool::Provisions),
 
         // Execution
         Action::ExecuteTransactions { .. } => Some(DispatchPool::Execution),
@@ -324,6 +325,7 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
                     round,
                     block: Arc::new(result.block),
                     block_hash: result.block_hash,
+                    merged_updates: result.merged_updates,
                 })],
                 prepared_commit: prepared,
             })
@@ -625,35 +627,8 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
             block_timestamp,
             shard_recipients,
         } => {
-            use std::collections::HashMap;
-
             // Phase 1: Fetch state entries for all transactions.
-            let mut per_tx: Vec<(
-                Hash,
-                Vec<ShardGroupId>,
-                Arc<Vec<hyperscale_types::StateEntry>>,
-            )> = Vec::with_capacity(requests.len());
-
-            for req in &requests {
-                let entries =
-                    match ctx
-                        .executor
-                        .fetch_state_entries(ctx.storage, &req.nodes, block_height.0)
-                    {
-                        Some(entries) => entries,
-                        None => {
-                            warn!(
-                                source_shard = source_shard.0,
-                                block_height = block_height.0,
-                                tx_hash = %req.tx_hash,
-                                node_count = req.nodes.len(),
-                                "fetch_state_entries returned None — JVT version unavailable"
-                            );
-                            continue;
-                        }
-                    };
-                per_tx.push((req.tx_hash, req.target_shards.clone(), Arc::new(entries)));
-            }
+            let per_tx = fetch_entries_for_requests(ctx, &requests, source_shard, block_height);
             if per_tx.is_empty() {
                 warn!(
                     source_shard = source_shard.0,
@@ -670,58 +645,9 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
                 });
             }
 
-            // Phase 2: Group entries per target shard, then generate a separate
-            // proof per shard. Verkle multipoint proofs are not subset-verifiable,
-            // so each batch must carry a proof covering exactly its own entries.
-            let mut shard_tx_entries: HashMap<ShardGroupId, Vec<TxEntries>> = HashMap::new();
-            for (tx_hash, target_shards, entries) in per_tx {
-                for &target_shard in &target_shards {
-                    shard_tx_entries
-                        .entry(target_shard)
-                        .or_default()
-                        .push(TxEntries {
-                            tx_hash,
-                            entries: (*entries).clone(),
-                        });
-                }
-            }
-
-            let mut batches: Vec<_> = Vec::with_capacity(shard_tx_entries.len());
-            for (shard, transactions) in shard_tx_entries {
-                // Collect deduplicated storage keys for this shard's entries only.
-                let mut shard_keys: Vec<Vec<u8>> = transactions
-                    .iter()
-                    .flat_map(|te| te.entries.iter().map(|e| e.storage_key.clone()))
-                    .collect();
-                shard_keys.sort();
-                shard_keys.dedup();
-
-                let proof = match ctx
-                    .storage
-                    .generate_verkle_proofs(&shard_keys, block_height.0)
-                {
-                    Some(p) => p,
-                    None => {
-                        warn!(
-                            source_shard = source_shard.0,
-                            block_height = block_height.0,
-                            target_shard = shard.0,
-                            key_count = shard_keys.len(),
-                            "generate_verkle_proofs returned None — JVT version unavailable"
-                        );
-                        continue;
-                    }
-                };
-
-                let recipients = shard_recipients.get(&shard).cloned().unwrap_or_default();
-                let batch = ProvisionBatch {
-                    source_shard,
-                    block_height,
-                    proof,
-                    transactions,
-                };
-                batches.push((shard, batch, recipients));
-            }
+            // Phase 2: Group by shard + generate proofs
+            let batches =
+                build_provision_batches(ctx, per_tx, source_shard, block_height, &shard_recipients);
             Some(DelegatedResult {
                 events: vec![NodeInput::ProvisionsReady {
                     batches,
@@ -731,6 +657,175 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
             })
         }
 
+        // --- Speculative provision preparation ---
+        Action::SpeculativeProvisionPrep {
+            block_hash,
+            requests,
+            source_shard,
+            block_height,
+            block_timestamp,
+            shard_recipients,
+            merged_updates,
+            parent_height,
+        } => {
+            // Phase 1: Fetch state entries using speculative overlay
+            let mut per_tx: Vec<(
+                Hash,
+                Vec<ShardGroupId>,
+                Arc<Vec<hyperscale_types::StateEntry>>,
+            )> = Vec::with_capacity(requests.len());
+
+            for req in &requests {
+                let entries = match hyperscale_engine::fetch_state_entries_speculative(
+                    ctx.storage,
+                    &req.nodes,
+                    parent_height,
+                    &merged_updates,
+                ) {
+                    Some(entries) => entries,
+                    None => {
+                        warn!(
+                            source_shard = source_shard.0,
+                            block_height = block_height.0,
+                            tx_hash = %req.tx_hash,
+                            parent_height = parent_height,
+                            "speculative fetch_state_entries returned None"
+                        );
+                        continue;
+                    }
+                };
+                per_tx.push((req.tx_hash, req.target_shards.clone(), Arc::new(entries)));
+            }
+
+            // Phase 2: Group by shard + generate proofs
+            // (generate_verkle_proofs at block_height works because NodeCache
+            // has the new tree nodes from BuildProposal)
+            tracing::debug!(
+                block_hash = %block_hash,
+                block_height = block_height.0,
+                per_tx_count = per_tx.len(),
+                node_cache_len = ctx.storage.node_cache_len(),
+                jvt_version = ctx.storage.jvt_version(),
+                "Speculative provision prep: generating proofs"
+            );
+            let batches =
+                build_provision_batches(ctx, per_tx, source_shard, block_height, &shard_recipients);
+            Some(DelegatedResult {
+                events: vec![NodeInput::Protocol(
+                    ProtocolEvent::SpeculativeProvisionsComplete {
+                        block_hash,
+                        batches,
+                        block_timestamp,
+                    },
+                )],
+                prepared_commit: None,
+            })
+        }
+
         _ => None,
     }
+}
+
+/// Fetch state entries for each provision request at committed block height.
+fn fetch_entries_for_requests<S: CommitStore + SubstateStore + ConsensusStore>(
+    ctx: &ActionContext<'_, S>,
+    requests: &[hyperscale_core::ProvisionRequest],
+    source_shard: ShardGroupId,
+    block_height: hyperscale_types::BlockHeight,
+) -> Vec<(
+    Hash,
+    Vec<ShardGroupId>,
+    Arc<Vec<hyperscale_types::StateEntry>>,
+)> {
+    let mut per_tx = Vec::with_capacity(requests.len());
+    for req in requests {
+        let entries =
+            match ctx
+                .executor
+                .fetch_state_entries(ctx.storage, &req.nodes, block_height.0)
+            {
+                Some(entries) => entries,
+                None => {
+                    warn!(
+                        source_shard = source_shard.0,
+                        block_height = block_height.0,
+                        tx_hash = %req.tx_hash,
+                        node_count = req.nodes.len(),
+                        "fetch_state_entries returned None — JVT version unavailable"
+                    );
+                    continue;
+                }
+            };
+        per_tx.push((req.tx_hash, req.target_shards.clone(), Arc::new(entries)));
+    }
+    per_tx
+}
+
+/// Group fetched entries by target shard and generate verkle proofs per shard.
+fn build_provision_batches<S: CommitStore + SubstateStore + ConsensusStore>(
+    ctx: &ActionContext<'_, S>,
+    per_tx: Vec<(
+        Hash,
+        Vec<ShardGroupId>,
+        Arc<Vec<hyperscale_types::StateEntry>>,
+    )>,
+    source_shard: ShardGroupId,
+    block_height: hyperscale_types::BlockHeight,
+    shard_recipients: &std::collections::HashMap<ShardGroupId, Vec<hyperscale_types::ValidatorId>>,
+) -> Vec<(
+    ShardGroupId,
+    ProvisionBatch,
+    Vec<hyperscale_types::ValidatorId>,
+)> {
+    use std::collections::HashMap;
+
+    let mut shard_tx_entries: HashMap<ShardGroupId, Vec<TxEntries>> = HashMap::new();
+    for (tx_hash, target_shards, entries) in per_tx {
+        for &target_shard in &target_shards {
+            shard_tx_entries
+                .entry(target_shard)
+                .or_default()
+                .push(TxEntries {
+                    tx_hash,
+                    entries: (*entries).clone(),
+                });
+        }
+    }
+
+    let mut batches = Vec::with_capacity(shard_tx_entries.len());
+    for (shard, transactions) in shard_tx_entries {
+        let mut shard_keys: Vec<Vec<u8>> = transactions
+            .iter()
+            .flat_map(|te| te.entries.iter().map(|e| e.storage_key.clone()))
+            .collect();
+        shard_keys.sort();
+        shard_keys.dedup();
+
+        let proof = match ctx
+            .storage
+            .generate_verkle_proofs(&shard_keys, block_height.0)
+        {
+            Some(p) => p,
+            None => {
+                warn!(
+                    source_shard = source_shard.0,
+                    block_height = block_height.0,
+                    target_shard = shard.0,
+                    key_count = shard_keys.len(),
+                    "generate_verkle_proofs returned None — JVT version unavailable"
+                );
+                continue;
+            }
+        };
+
+        let recipients = shard_recipients.get(&shard).cloned().unwrap_or_default();
+        let batch = ProvisionBatch {
+            source_shard,
+            block_height,
+            proof,
+            transactions,
+        };
+        batches.push((shard, batch, recipients));
+    }
+    batches
 }

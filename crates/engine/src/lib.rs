@@ -35,7 +35,7 @@ mod result;
 mod validation;
 
 pub use execution::ProvisionedSnapshot;
-pub use executor::{fetch_state_entries, RadixExecutor};
+pub use executor::{fetch_state_entries, fetch_state_entries_speculative, RadixExecutor};
 pub use genesis::GenesisConfig;
 pub use hyperscale_types::ExecutionResult;
 pub use result::SingleTxResult;

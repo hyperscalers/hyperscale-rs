@@ -37,7 +37,9 @@ use crate::execution::{
 use crate::genesis::{GenesisBuilder, GenesisConfig, GenesisError};
 use crate::result::{ExecutionOutput, SingleTxResult};
 use hyperscale_storage::{CommittableSubstateDatabase, SubstateDatabase, SubstateStore};
-use hyperscale_types::{Hash, NodeId, RoutableTransaction, StateEntry, StateProvision};
+use hyperscale_types::{
+    DatabaseUpdates, Hash, NodeId, RoutableTransaction, StateEntry, StateProvision,
+};
 use radix_common::network::NetworkDefinition;
 use radix_engine::transaction::{execute_transaction, ExecutionConfig, TransactionReceipt};
 use radix_engine::vm::DefaultVmModules;
@@ -79,6 +81,101 @@ pub fn fetch_state_entries<S: SubstateStore>(
             storage_key.extend_from_slice(&db_sort_key.0);
 
             entries.push(StateEntry::new(storage_key, Some(value)));
+        }
+    }
+
+    Some(entries)
+}
+
+/// Fetch state entries speculatively before block commit.
+///
+/// Reads substates at `parent_height` (which is committed and passes version
+/// guards), then overlays writes from `merged_updates` (certificate writes
+/// included in the proposer's block). This allows provision generation to
+/// start before the block commits.
+///
+/// Returns `None` if the parent height is unavailable. Returns `Some(entries)`
+/// on success, reflecting the post-certificate state that will exist once the
+/// block commits.
+pub fn fetch_state_entries_speculative<S: SubstateStore>(
+    storage: &S,
+    nodes: &[NodeId],
+    parent_height: u64,
+    merged_updates: &DatabaseUpdates,
+) -> Option<Vec<StateEntry>> {
+    use radix_common::prelude::DatabaseUpdate;
+    use radix_substate_store_interface::db_key_mapper::{DatabaseKeyMapper, SpreadPrefixKeyMapper};
+    use radix_substate_store_interface::interface::PartitionDatabaseUpdates;
+
+    let mut entries = Vec::new();
+
+    for node in nodes {
+        let radix_node_id = radix_common::types::NodeId(node.0);
+        let db_node_key = SpreadPrefixKeyMapper::to_db_node_key(&radix_node_id);
+
+        // Read substates at parent_height (committed, passes version guard)
+        let base_substates = storage.list_substates_for_node_at_height(node, parent_height)?;
+
+        // Check if merged_updates has writes for this node
+        let node_updates = merged_updates.node_updates.get(&db_node_key);
+
+        if let Some(node_updates) = node_updates {
+            // Build a map of (partition_num, sort_key) → value from base, then overlay
+            let mut substate_map: std::collections::BTreeMap<(u8, Vec<u8>), Vec<u8>> =
+                std::collections::BTreeMap::new();
+
+            for (partition_num, db_sort_key, value) in &base_substates {
+                substate_map.insert((*partition_num, db_sort_key.0.clone()), value.clone());
+            }
+
+            // Apply certificate writes on top
+            for (&partition_num, partition_updates) in &node_updates.partition_updates {
+                match partition_updates {
+                    PartitionDatabaseUpdates::Delta { substate_updates } => {
+                        for (sort_key, update) in substate_updates {
+                            let map_key = (partition_num, sort_key.0.clone());
+                            match update {
+                                DatabaseUpdate::Set(value) => {
+                                    substate_map.insert(map_key, value.clone());
+                                }
+                                DatabaseUpdate::Delete => {
+                                    substate_map.remove(&map_key);
+                                }
+                            }
+                        }
+                    }
+                    PartitionDatabaseUpdates::Reset {
+                        new_substate_values,
+                    } => {
+                        // Remove all existing entries for this partition
+                        substate_map.retain(|(p, _), _| *p != partition_num);
+                        // Insert new values
+                        for (sort_key, value) in new_substate_values {
+                            substate_map.insert((partition_num, sort_key.0.clone()), value.clone());
+                        }
+                    }
+                }
+            }
+
+            // Convert back to StateEntry list
+            for ((partition_num, sort_key_bytes), value) in substate_map {
+                let mut storage_key =
+                    Vec::with_capacity(db_node_key.len() + 1 + sort_key_bytes.len());
+                storage_key.extend_from_slice(&db_node_key);
+                storage_key.push(partition_num);
+                storage_key.extend_from_slice(&sort_key_bytes);
+                entries.push(StateEntry::new(storage_key, Some(value)));
+            }
+        } else {
+            // No updates for this node — use base substates directly
+            for (partition_num, db_sort_key, value) in base_substates {
+                let mut storage_key =
+                    Vec::with_capacity(db_node_key.len() + 1 + db_sort_key.0.len());
+                storage_key.extend_from_slice(&db_node_key);
+                storage_key.push(partition_num);
+                storage_key.extend_from_slice(&db_sort_key.0);
+                entries.push(StateEntry::new(storage_key, Some(value)));
+            }
         }
     }
 

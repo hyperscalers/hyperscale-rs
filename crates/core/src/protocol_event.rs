@@ -6,9 +6,10 @@
 //! boundary between protocol logic and I/O orchestration.
 
 use hyperscale_types::{
-    Block, BlockHeader, BlockHeight, BlockManifest, BlockVote, CommittedBlockHeader, EpochConfig,
-    EpochId, ExecutionCertificate, ExecutionVote, Hash, ProvisionBatch, QuorumCertificate,
-    RoutableTransaction, ShardGroupId, StateEntry, StateProvision, TxOutcome, ValidatorId, WaveId,
+    Block, BlockHeader, BlockHeight, BlockManifest, BlockVote, CommittedBlockHeader,
+    DatabaseUpdates, EpochConfig, EpochId, ExecutionCertificate, ExecutionVote, Hash,
+    ProvisionBatch, QuorumCertificate, RoutableTransaction, ShardGroupId, StateEntry,
+    StateProvision, TxOutcome, ValidatorId, WaveId,
 };
 use std::sync::Arc;
 
@@ -122,6 +123,9 @@ pub enum ProtocolEvent {
         round: u64,
         block: Arc<Block>,
         block_hash: Hash,
+        /// Merged certificate writes included in this block's state root.
+        /// Used by speculative provision preparation.
+        merged_updates: Option<Arc<DatabaseUpdates>>,
     },
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -134,6 +138,13 @@ pub enum ProtocolEvent {
     // ═══════════════════════════════════════════════════════════════════════
     // Provisions
     // ═══════════════════════════════════════════════════════════════════════
+    /// Speculative provision preparation completed (from Provisions pool).
+    SpeculativeProvisionsComplete {
+        block_hash: Hash,
+        batches: Vec<(ShardGroupId, ProvisionBatch, Vec<ValidatorId>)>,
+        block_timestamp: u64,
+    },
+
     /// Cross-shard transaction registered for provision tracking.
     CrossShardTxRegistered {
         tx_hash: Hash,
@@ -374,6 +385,7 @@ impl ProtocolEvent {
             ProtocolEvent::StateCommitComplete { .. } => "StateCommitComplete",
 
             // Provisions
+            ProtocolEvent::SpeculativeProvisionsComplete { .. } => "SpeculativeProvisionsComplete",
             ProtocolEvent::CrossShardTxRegistered { .. } => "CrossShardTxRegistered",
             ProtocolEvent::ProvisionAccepted { .. } => "ProvisionAccepted",
             ProtocolEvent::ProvisioningComplete { .. } => "ProvisioningComplete",

@@ -93,6 +93,12 @@ pub struct MemoryMetrics {
     pub exec_speculative_results: usize,
     /// Expected execution certificates from remote shards.
     pub exec_expected_exec_certs: usize,
+    /// Speculative provision preparations in-flight.
+    pub exec_speculative_provision_in_flight: usize,
+    /// Cached speculative provision results.
+    pub exec_speculative_provision_results: usize,
+    /// Blocks committed while speculative provisions were in-flight.
+    pub exec_pending_provision_commits: usize,
 
     // ── Mempool ──
     /// All transactions in the pool.

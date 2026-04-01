@@ -32,9 +32,10 @@
 
 use hyperscale_core::{Action, CrossShardExecutionRequest, ProtocolEvent, ProvisionRequest};
 use hyperscale_types::{
-    AbortReason, BlockHeight, Bls12381G1PublicKey, ExecutionVote, Hash, NodeId,
-    RoutableTransaction, ShardExecutionProof, ShardGroupId, StateProvision, TopologySnapshot,
-    TransactionCertificate, TransactionDecision, TxExecutionOutcome, ValidatorId, WaveId,
+    AbortReason, BlockHeight, Bls12381G1PublicKey, DatabaseUpdates, ExecutionVote, Hash, NodeId,
+    ProvisionBatch, RoutableTransaction, ShardExecutionProof, ShardGroupId, StateProvision,
+    TopologySnapshot, TransactionCertificate, TransactionDecision, TxExecutionOutcome, ValidatorId,
+    WaveId,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -114,6 +115,9 @@ pub struct ExecutionMemoryStats {
     pub certificate_trackers: usize,
     pub speculative_results: usize,
     pub expected_exec_certs: usize,
+    pub speculative_provision_in_flight: usize,
+    pub speculative_provision_results: usize,
+    pub pending_provision_commits: usize,
 }
 
 /// Execution state machine.
@@ -251,6 +255,17 @@ pub struct ExecutionState {
     /// Maps (source_shard, block_height, wave_id) → local_height_when_fulfilled
     /// for age-based pruning using local time.
     fulfilled_exec_certs: HashMap<(ShardGroupId, u64, WaveId), u64>,
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Speculative Provision State
+    // ═══════════════════════════════════════════════════════════════════════
+    /// Block hashes with in-flight speculative provision prep.
+    speculative_provision_in_flight: HashSet<Hash>,
+    /// Cached speculative provision results, keyed by block_hash.
+    speculative_provision_results: HashMap<Hash, CachedProvisions>,
+    /// When commit arrives while speculation is in-flight, store full context
+    /// so we can emit SendProvisions or fall back to FetchAndBroadcastProvisions.
+    pending_provision_commits: HashMap<Hash, PendingProvisionCommit>,
 }
 
 impl Default for ExecutionState {
@@ -270,6 +285,26 @@ struct ExpectedExecCert {
 
 /// Number of blocks to wait before requesting missing execution certificates.
 const EXEC_CERT_FALLBACK_TIMEOUT_BLOCKS: u64 = 10;
+
+/// Per-shard recipient lists for provision broadcasting.
+type ShardRecipients = HashMap<ShardGroupId, Vec<ValidatorId>>;
+
+/// Cached provision batches from speculative preparation.
+struct CachedProvisions {
+    batches: Vec<(ShardGroupId, ProvisionBatch, Vec<ValidatorId>)>,
+    block_timestamp: u64,
+}
+
+/// Context stored when a block commits while speculative provisions are in-flight.
+/// Contains everything needed to fall back to `FetchAndBroadcastProvisions` if
+/// speculation returns empty.
+struct PendingProvisionCommit {
+    block_timestamp: u64,
+    requests: Vec<ProvisionRequest>,
+    source_shard: ShardGroupId,
+    block_height: BlockHeight,
+    shard_recipients: ShardRecipients,
+}
 
 /// Default maximum transactions for speculative execution (in-flight + cached).
 pub const DEFAULT_SPECULATIVE_MAX_TXS: usize = 500;
@@ -322,6 +357,9 @@ impl ExecutionState {
             speculative_invalidated_count: 0,
             expected_exec_certs: HashMap::new(),
             fulfilled_exec_certs: HashMap::new(),
+            speculative_provision_in_flight: HashSet::new(),
+            speculative_provision_results: HashMap::new(),
+            pending_provision_commits: HashMap::new(),
         }
     }
 
@@ -991,60 +1029,52 @@ impl ExecutionState {
         let is_proposer = topology.local_validator_id() == proposer;
 
         if is_proposer {
-            let mut provision_requests = Vec::new();
-            for tx in &transactions {
-                if topology.is_single_shard_transaction(tx) {
-                    continue;
-                }
-                let mut owned_nodes: Vec<_> = tx
-                    .declared_reads
-                    .iter()
-                    .chain(tx.declared_writes.iter())
-                    .filter(|&node_id| topology.shard_for_node_id(node_id) == local_shard)
-                    .copied()
-                    .collect();
-                owned_nodes.sort();
-                owned_nodes.dedup();
-
-                if !owned_nodes.is_empty() {
-                    let target_shards: Vec<_> = topology
-                        .all_shards_for_transaction(tx)
-                        .into_iter()
-                        .filter(|&s| s != local_shard)
-                        .collect();
-
-                    if !target_shards.is_empty() {
-                        provision_requests.push(ProvisionRequest {
-                            tx_hash: tx.hash(),
-                            nodes: owned_nodes,
-                            target_shards,
-                        });
-                    }
-                }
-            }
-
-            if !provision_requests.is_empty() {
-                let local_vid = topology.local_validator_id();
-                let mut shard_recipients = HashMap::new();
-                for req in &provision_requests {
-                    for &target_shard in &req.target_shards {
-                        shard_recipients.entry(target_shard).or_insert_with(|| {
-                            topology
-                                .committee_for_shard(target_shard)
-                                .iter()
-                                .copied()
-                                .filter(|&v| v != local_vid)
-                                .collect()
-                        });
-                    }
-                }
-                actions.push(Action::FetchAndBroadcastProvisions {
-                    requests: provision_requests,
-                    source_shard: local_shard,
-                    block_height: BlockHeight(height),
-                    block_timestamp,
-                    shard_recipients,
+            if let Some(cached) = self.take_speculative_provisions(&block_hash) {
+                // Speculative provisions already built — send immediately
+                tracing::debug!(
+                    block_hash = ?block_hash,
+                    batch_count = cached.batches.len(),
+                    "Speculative provision cache HIT"
+                );
+                actions.push(Action::SendProvisions {
+                    batches: cached.batches,
+                    block_timestamp: cached.block_timestamp,
                 });
+            } else if self.speculative_provision_in_flight.remove(&block_hash) {
+                // Speculation in-flight — store full fallback context so we can
+                // either send cached results or fall back to FetchAndBroadcastProvisions
+                // if speculation returns empty.
+                tracing::debug!(
+                    block_hash = ?block_hash,
+                    "Speculative provisions in-flight — deferring to completion"
+                );
+                if let Some((requests, shard_recipients)) =
+                    Self::build_provision_requests(topology, &transactions, local_shard)
+                {
+                    self.pending_provision_commits.insert(
+                        block_hash,
+                        PendingProvisionCommit {
+                            block_timestamp,
+                            requests,
+                            source_shard: local_shard,
+                            block_height: BlockHeight(height),
+                            shard_recipients,
+                        },
+                    );
+                }
+            } else {
+                // No speculation — fall back to existing path
+                if let Some((requests, shard_recipients)) =
+                    Self::build_provision_requests(topology, &transactions, local_shard)
+                {
+                    actions.push(Action::FetchAndBroadcastProvisions {
+                        requests,
+                        source_shard: local_shard,
+                        block_height: BlockHeight(height),
+                        block_timestamp,
+                        shard_recipients,
+                    });
+                }
             }
         }
 
@@ -1070,6 +1100,7 @@ impl ExecutionState {
         self.prune_execution_cache();
         self.prune_pending_speculative();
         self.cleanup_stale_speculative(SPECULATIVE_MAX_AGE);
+        self.prune_speculative_provisions();
 
         if transactions.is_empty() {
             return actions;
@@ -1747,6 +1778,24 @@ impl ExecutionState {
         }
     }
 
+    /// Prune stale speculative provision state.
+    ///
+    /// Entries are normally consumed by `on_block_committed` (cache hit) or
+    /// `on_speculative_provisions_complete` (pending commit). This cleans up
+    /// orphans from proposals that never committed. Cap-based since we don't
+    /// track heights per hash — entries rarely accumulate beyond a handful.
+    fn prune_speculative_provisions(&mut self) {
+        if self.speculative_provision_results.len() > 10 {
+            self.speculative_provision_results.clear();
+        }
+        if self.speculative_provision_in_flight.len() > 5 {
+            self.speculative_provision_in_flight.clear();
+        }
+        if self.pending_provision_commits.len() > 5 {
+            self.pending_provision_commits.clear();
+        }
+    }
+
     /// Check if a transaction is finalized (TC created from all shard ECs).
     pub fn is_finalized(&self, tx_hash: &Hash) -> bool {
         self.finalized_certificates.contains_key(tx_hash)
@@ -2155,6 +2204,184 @@ impl ExecutionState {
         }
     }
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // Speculative Provision Preparation
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Build provision requests and shard recipients for cross-shard transactions.
+    ///
+    /// Returns `None` if there are no cross-shard transactions needing provisions.
+    fn build_provision_requests(
+        topology: &TopologySnapshot,
+        transactions: &[Arc<RoutableTransaction>],
+        local_shard: ShardGroupId,
+    ) -> Option<(Vec<ProvisionRequest>, ShardRecipients)> {
+        let local_vid = topology.local_validator_id();
+
+        let mut provision_requests = Vec::new();
+        for tx in transactions {
+            if topology.is_single_shard_transaction(tx) {
+                continue;
+            }
+            let mut owned_nodes: Vec<_> = tx
+                .declared_reads
+                .iter()
+                .chain(tx.declared_writes.iter())
+                .filter(|&node_id| topology.shard_for_node_id(node_id) == local_shard)
+                .copied()
+                .collect();
+            owned_nodes.sort();
+            owned_nodes.dedup();
+
+            if !owned_nodes.is_empty() {
+                let target_shards: Vec<_> = topology
+                    .all_shards_for_transaction(tx)
+                    .into_iter()
+                    .filter(|&s| s != local_shard)
+                    .collect();
+
+                if !target_shards.is_empty() {
+                    provision_requests.push(ProvisionRequest {
+                        tx_hash: tx.hash(),
+                        nodes: owned_nodes,
+                        target_shards,
+                    });
+                }
+            }
+        }
+
+        if provision_requests.is_empty() {
+            return None;
+        }
+
+        let mut shard_recipients = HashMap::new();
+        for req in &provision_requests {
+            for &target_shard in &req.target_shards {
+                shard_recipients.entry(target_shard).or_insert_with(|| {
+                    topology
+                        .committee_for_shard(target_shard)
+                        .iter()
+                        .copied()
+                        .filter(|&v| v != local_vid)
+                        .collect()
+                });
+            }
+        }
+
+        Some((provision_requests, shard_recipients))
+    }
+
+    /// Trigger speculative provision preparation at proposal time.
+    ///
+    /// Called after `ProposalBuilt` when the block includes certificates.
+    /// Builds the provision request list and emits `SpeculativeProvisionPrep`
+    /// to run on the Provisions pool while BFT voting proceeds.
+    pub fn trigger_speculative_provisions(
+        &mut self,
+        topology: &TopologySnapshot,
+        block_hash: Hash,
+        height: u64,
+        block_timestamp: u64,
+        transactions: &[Arc<RoutableTransaction>],
+        merged_updates: Arc<DatabaseUpdates>,
+    ) -> Vec<Action> {
+        let local_shard = topology.local_shard();
+
+        let (provision_requests, shard_recipients) =
+            match Self::build_provision_requests(topology, transactions, local_shard) {
+                Some(result) => result,
+                None => return vec![],
+            };
+
+        // parent_height = height - 1 (the last committed block)
+        let parent_height = self.committed_height;
+
+        self.speculative_provision_in_flight.insert(block_hash);
+
+        tracing::debug!(
+            block_hash = ?block_hash,
+            height = height,
+            request_count = provision_requests.len(),
+            parent_height = parent_height,
+            "Triggering speculative provision preparation"
+        );
+
+        vec![Action::SpeculativeProvisionPrep {
+            block_hash,
+            requests: provision_requests,
+            source_shard: local_shard,
+            block_height: BlockHeight(height),
+            block_timestamp,
+            shard_recipients,
+            merged_updates,
+            parent_height,
+        }]
+    }
+
+    /// Handle speculative provision preparation completion.
+    ///
+    /// Caches the result. If the block has already committed while speculation
+    /// was in-flight, immediately emits `SendProvisions`.
+    pub fn on_speculative_provisions_complete(
+        &mut self,
+        block_hash: Hash,
+        batches: Vec<(ShardGroupId, ProvisionBatch, Vec<ValidatorId>)>,
+        block_timestamp: u64,
+    ) -> Vec<Action> {
+        self.speculative_provision_in_flight.remove(&block_hash);
+
+        // If batches are empty (e.g., SimStorage fallback), fall back to
+        // FetchAndBroadcastProvisions if a commit is pending.
+        if batches.is_empty() {
+            if let Some(pending) = self.pending_provision_commits.remove(&block_hash) {
+                tracing::debug!(
+                    block_hash = ?block_hash,
+                    "Speculative provision prep returned empty — falling back to FetchAndBroadcastProvisions"
+                );
+                return vec![Action::FetchAndBroadcastProvisions {
+                    requests: pending.requests,
+                    source_shard: pending.source_shard,
+                    block_height: pending.block_height,
+                    block_timestamp: pending.block_timestamp,
+                    shard_recipients: pending.shard_recipients,
+                }];
+            }
+            tracing::debug!(
+                block_hash = ?block_hash,
+                "Speculative provision prep returned empty — no pending commit"
+            );
+            return vec![];
+        }
+
+        // If commit already happened while we were preparing
+        if let Some(pending) = self.pending_provision_commits.remove(&block_hash) {
+            tracing::debug!(
+                block_hash = ?block_hash,
+                "Speculative provisions complete — commit was pending, sending now"
+            );
+            return vec![Action::SendProvisions {
+                batches,
+                block_timestamp: pending.block_timestamp,
+            }];
+        }
+
+        // Cache for later use at commit time
+        self.speculative_provision_results.insert(
+            block_hash,
+            CachedProvisions {
+                batches,
+                block_timestamp,
+            },
+        );
+
+        vec![]
+    }
+
+    /// Take cached speculative provisions for a block, if available.
+    fn take_speculative_provisions(&mut self, block_hash: &Hash) -> Option<CachedProvisions> {
+        self.speculative_provision_results.remove(block_hash)
+    }
+
     /// Get the number of cached speculative results.
     pub fn speculative_cache_size(&self) -> usize {
         self.speculative_results.len()
@@ -2177,6 +2404,9 @@ impl ExecutionState {
             certificate_trackers: self.certificate_trackers.len(),
             speculative_results: self.speculative_results.len(),
             expected_exec_certs: self.expected_exec_certs.len(),
+            speculative_provision_in_flight: self.speculative_provision_in_flight.len(),
+            speculative_provision_results: self.speculative_provision_results.len(),
+            pending_provision_commits: self.pending_provision_commits.len(),
         }
     }
 

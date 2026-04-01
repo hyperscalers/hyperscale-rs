@@ -894,13 +894,28 @@ impl StateMachine for NodeStateMachine {
                 round,
                 block,
                 block_hash,
-            } => self.bft.on_proposal_built(
-                self.topology.snapshot(),
-                height,
-                round,
-                block,
-                block_hash,
-            ),
+                merged_updates,
+            } => {
+                let mut actions = self.bft.on_proposal_built(
+                    self.topology.snapshot(),
+                    height,
+                    round,
+                    block.clone(),
+                    block_hash,
+                );
+                // Trigger speculative provision prep if we have certificate writes
+                if let Some(updates) = merged_updates {
+                    actions.extend(self.execution.trigger_speculative_provisions(
+                        self.topology.snapshot(),
+                        block_hash,
+                        height.0,
+                        block.header.timestamp,
+                        &block.transactions,
+                        updates,
+                    ));
+                }
+                actions
+            }
 
             // ── State Commit ─────────────────────────────────────────────
             ProtocolEvent::StateCommitComplete { height, state_root } => {
@@ -915,6 +930,15 @@ impl StateMachine for NodeStateMachine {
             } => self.on_block_committed(block_hash, height, block),
 
             // ── Provisions ───────────────────────────────────────────────
+            ProtocolEvent::SpeculativeProvisionsComplete {
+                block_hash,
+                batches,
+                block_timestamp,
+            } => self.execution.on_speculative_provisions_complete(
+                block_hash,
+                batches,
+                block_timestamp,
+            ),
             ProtocolEvent::StateProvisionsReceived { batch } => self
                 .provisions
                 .on_state_provisions_received(self.topology.snapshot(), batch),
