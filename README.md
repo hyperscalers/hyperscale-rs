@@ -37,7 +37,6 @@ Rust implementation of Hyperscale consensus protocol.
 | `hyperscale-storage-rocksdb` | Production RocksDB storage with JVT state roots and snapshot isolation |
 | `hyperscale-storage-memory` | In-memory storage using persistent data structures for deterministic simulation |
 | `hyperscale-metrics` | Metrics facade with domain-specific trait and global singleton recorder |
-| `hyperscale-metrics-noop` | No-op metrics backend that silently discards all recorded metrics |
 | `hyperscale-metrics-prometheus` | Prometheus metrics backend with counters, gauges, and histograms |
 | `hyperscale-simulation` | Deterministic simulation runner with event queue and multi-node orchestration |
 | `hyperscale-simulator` | CLI tool for running simulations with metrics |
