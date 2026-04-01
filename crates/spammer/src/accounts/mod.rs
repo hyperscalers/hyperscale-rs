@@ -144,13 +144,11 @@ pub struct AccountPool {
     /// Number of shards.
     num_shards: u64,
 
-    /// Round-robin counters per shard.
-    /// Used by both RoundRobin and NoContention selection modes for same-shard pairs.
+    /// Per-shard account allocation counters.
+    /// Used by RoundRobin and NoContention selection modes. In NoContention mode,
+    /// both same-shard and cross-shard selections draw from the same per-shard
+    /// counter, ensuring no two transactions ever get the same account.
     round_robin_counters: HashMap<ShardGroupId, std::sync::atomic::AtomicUsize>,
-
-    /// Global counter for cross-shard NoContention mode.
-    /// Ensures cross-shard transactions use unique account pairs across all shards.
-    cross_shard_counter: std::sync::atomic::AtomicUsize,
 
     /// Usage tracking: total selections per account index per shard.
     usage_counts: HashMap<ShardGroupId, Vec<std::sync::atomic::AtomicU64>>,
@@ -168,11 +166,9 @@ pub struct AccountPartition {
     /// Number of shards.
     num_shards: u64,
 
-    /// Round-robin counter for same-shard pair selection.
-    round_robin_counter: usize,
-
-    /// Round-robin counter for cross-shard selection.
-    cross_shard_counter: usize,
+    /// Per-shard account allocation counters.
+    /// Both same-shard and cross-shard draw from these, preventing contention.
+    shard_counters: HashMap<ShardGroupId, usize>,
 }
 
 impl AccountPool {
@@ -195,7 +191,6 @@ impl AccountPool {
             by_shard,
             num_shards,
             round_robin_counters,
-            cross_shard_counter: AtomicUsize::new(0),
             usage_counts,
         }
     }
@@ -423,18 +418,14 @@ impl AccountPool {
 
         let (idx1, idx2) = match mode {
             SelectionMode::NoContention => {
-                // Use the global cross-shard counter which is independent from same-shard.
-                // This ensures cross-shard transactions don't conflict with each other.
-                //
-                // Note: This means cross-shard and same-shard use separate counter spaces,
-                // so they CAN potentially pick the same account. However, this is acceptable
-                // because in practice, same-shard and cross-shard transactions typically
-                // target different shard combinations, and the probability of conflict is low.
-                //
-                // The critical guarantee is: no two cross-shard transactions conflict with
-                // each other, and no two same-shard transactions conflict with each other.
-                let c = self.cross_shard_counter.fetch_add(1, Ordering::Relaxed);
-                (c % num_accounts1, c % num_accounts2)
+                // Allocate 1 slot from each shard's unified counter.
+                // Same-shard and cross-shard both draw from the same per-shard
+                // counters, so no two transactions ever get the same account.
+                let counter1 = self.round_robin_counters.get(&from_shard).unwrap();
+                let counter2 = self.round_robin_counters.get(&to_shard).unwrap();
+                let c1 = counter1.fetch_add(1, Ordering::Relaxed);
+                let c2 = counter2.fetch_add(1, Ordering::Relaxed);
+                (c1 % num_accounts1, c2 % num_accounts2)
             }
             _ => {
                 // For other modes, use per-shard selection
@@ -511,15 +502,13 @@ impl AccountPool {
                 (idx1, idx2)
             }
             SelectionMode::NoContention => {
-                // Use per-shard counter to ensure each shard cycles through its own
-                // accounts independently. This provides even distribution across shards
-                // while still avoiding contention within each shard.
-                // Relaxed ordering is sufficient - we just need unique values, not ordering guarantees
+                // Allocate 2 slots from the unified per-shard counter.
+                // Same-shard and cross-shard both draw from this counter,
+                // so they never pick the same account concurrently.
                 let counter = self.round_robin_counters.get(&shard).unwrap();
-                let c = counter.fetch_add(1, Ordering::Relaxed);
-                let pair_base = (c * 2) % num_accounts;
-                let idx1 = pair_base;
-                let idx2 = (pair_base + 1) % num_accounts;
+                let c = counter.fetch_add(2, Ordering::Relaxed);
+                let idx1 = c % num_accounts;
+                let idx2 = (c + 1) % num_accounts;
                 (idx1, idx2)
             }
         };
@@ -810,11 +799,14 @@ impl AccountPool {
 impl AccountPartition {
     /// Create an empty partition.
     fn new(num_shards: u64) -> Self {
+        let mut shard_counters = HashMap::new();
+        for shard in 0..num_shards {
+            shard_counters.insert(ShardGroupId(shard), 0usize);
+        }
         Self {
             by_shard: HashMap::new(),
             num_shards,
-            round_robin_counter: 0,
-            cross_shard_counter: 0,
+            shard_counters,
         }
     }
 
@@ -856,11 +848,12 @@ impl AccountPartition {
 
         let (idx1, idx2) = match mode {
             SelectionMode::NoContention | SelectionMode::RoundRobin => {
-                // Use local counter - no atomics needed since we own this partition
-                let c = self.round_robin_counter;
-                self.round_robin_counter = c.wrapping_add(1);
-                let pair_base = (c * 2) % num_accounts;
-                (pair_base, (pair_base + 1) % num_accounts)
+                // Allocate 2 slots from the per-shard counter.
+                // No atomics needed since we own this partition.
+                let c = self.shard_counters.get_mut(&shard).unwrap();
+                let val = *c;
+                *c = val.wrapping_add(2);
+                (val % num_accounts, (val + 1) % num_accounts)
             }
             SelectionMode::Random => {
                 let idx1 = rng.gen_range(0..num_accounts);
@@ -921,15 +914,16 @@ impl AccountPartition {
         }
 
         let (idx1, idx2) = match mode {
-            SelectionMode::NoContention => {
-                let c = self.cross_shard_counter;
-                self.cross_shard_counter = c.wrapping_add(1);
-                (c % num_accounts1, c % num_accounts2)
-            }
-            SelectionMode::RoundRobin => {
-                let c = self.cross_shard_counter;
-                self.cross_shard_counter = c.wrapping_add(1);
-                (c % num_accounts1, c % num_accounts2)
+            SelectionMode::NoContention | SelectionMode::RoundRobin => {
+                // Allocate 1 slot from each shard's counter.
+                // Same counter space as same-shard, preventing contention.
+                let c1 = self.shard_counters.get_mut(&from_shard).unwrap();
+                let v1 = *c1;
+                *c1 = v1.wrapping_add(1);
+                let c2 = self.shard_counters.get_mut(&to_shard).unwrap();
+                let v2 = *c2;
+                *c2 = v2.wrapping_add(1);
+                (v1 % num_accounts1, v2 % num_accounts2)
             }
             SelectionMode::Random => (
                 rng.gen_range(0..num_accounts1),
