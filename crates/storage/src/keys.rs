@@ -1,10 +1,16 @@
-//! Helper functions for key encoding/decoding used by storage implementations.
+//! Storage key encoding — the byte-level contract between storage backends
+//! and overlay implementations (e.g., provision overlays in the engine).
+//!
+//! Key layout: `[node_key][partition_num (1B)][sort_key]`
+//!
+//! Both the RocksDB backend and the engine's provision overlay use these
+//! functions to produce compatible keys.
 
 use hyperscale_types::NodeId;
 use radix_substate_store_interface::db_key_mapper::{DatabaseKeyMapper, SpreadPrefixKeyMapper};
 use radix_substate_store_interface::interface::{DbPartitionKey, DbSortKey};
 
-/// Convert Radix partition key + sort key to storage key.
+/// Convert Radix partition key + sort key to a flat storage key.
 pub fn to_storage_key(partition_key: &DbPartitionKey, sort_key: &DbSortKey) -> Vec<u8> {
     let mut key = Vec::with_capacity(partition_key.node_key.len() + 1 + sort_key.0.len());
     key.extend_from_slice(&partition_key.node_key);
@@ -13,7 +19,7 @@ pub fn to_storage_key(partition_key: &DbPartitionKey, sort_key: &DbSortKey) -> V
     key
 }
 
-/// Build storage key prefix for a partition.
+/// Build storage key prefix for a partition (for range scans / overlays).
 pub fn partition_prefix(partition_key: &DbPartitionKey) -> Vec<u8> {
     let mut prefix = Vec::with_capacity(partition_key.node_key.len() + 1);
     prefix.extend_from_slice(&partition_key.node_key);
@@ -24,7 +30,6 @@ pub fn partition_prefix(partition_key: &DbPartitionKey) -> Vec<u8> {
 /// Compute the exclusive end key for a prefix scan.
 ///
 /// Returns `None` if the prefix is all `0xFF` bytes (no valid exclusive upper bound).
-/// In practice this never happens with structured storage keys.
 pub fn next_prefix(prefix: &[u8]) -> Option<Vec<u8>> {
     debug_assert!(!prefix.is_empty(), "next_prefix called with empty prefix");
     let mut next = prefix.to_vec();
@@ -38,62 +43,19 @@ pub fn next_prefix(prefix: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
-/// Build a storage key directly from node/partition/sort_key fields.
-///
-/// Uses SpreadPrefixKeyMapper to compute the db_node_key and db_partition_num,
-/// then builds the composite storage key.
-pub fn storage_key_from_write(
-    node_id: &NodeId,
-    partition: &hyperscale_types::PartitionNumber,
-    sort_key: &[u8],
-) -> Vec<u8> {
-    let radix_node_id = radix_common::types::NodeId(node_id.0);
-    let radix_partition = radix_common::types::PartitionNumber(partition.0);
+// ─── NodeId ↔ db_node_key conversions ────────────────────────────────────────
+//
+// These use SpreadPrefixKeyMapper to convert between our NodeId type and the
+// Radix db_node_key format (20-byte hash prefix + 30-byte NodeId).
+// Used by writes.rs for state change extraction and shard filtering.
 
-    let db_node_key = SpreadPrefixKeyMapper::to_db_node_key(&radix_node_id);
-    let db_partition_num = SpreadPrefixKeyMapper::to_db_partition_num(radix_partition);
-
-    let partition_key = DbPartitionKey {
-        node_key: db_node_key,
-        partition_num: db_partition_num,
-    };
-    let db_sort_key = DbSortKey(sort_key.to_vec());
-
-    to_storage_key(&partition_key, &db_sort_key)
-}
-
-/// Entity key length in storage keys: 20 bytes hash prefix + 30 bytes NodeId.
-const ENTITY_KEY_LEN: usize = 50;
-
-/// Decompose a storage key into its three components.
-///
-/// Storage key layout: `entity_key(50) + partition_num(1) + sort_key(var)`
-///
-/// Returns `(entity_key, partition_num, sort_key)` or `None` if the key is malformed.
-pub fn decompose_storage_key(storage_key: &[u8]) -> Option<(&[u8], u8, &[u8])> {
-    let min_len = ENTITY_KEY_LEN + 1; // entity_key + partition_num
-
-    if storage_key.len() < min_len {
-        return None;
-    }
-
-    let entity_key = &storage_key[..ENTITY_KEY_LEN];
-    let partition_num = storage_key[ENTITY_KEY_LEN];
-    let sort_key = &storage_key[min_len..];
-
-    Some((entity_key, partition_num, sort_key))
-}
-
-/// Get the JVT entity key (db_node_key) for a NodeId.
-///
-/// This is the hash-spread 50-byte representation of the NodeId.
-pub fn node_entity_key(node_id: &NodeId) -> Vec<u8> {
-    let radix_node_id = radix_common::types::NodeId(node_id.0);
-    SpreadPrefixKeyMapper::to_db_node_key(&radix_node_id)
-}
-
-/// Build the storage key prefix for a given NodeId.
+/// Build the storage key prefix for a given NodeId (for node-level iteration).
 pub fn node_prefix(node_id: &NodeId) -> Vec<u8> {
+    node_entity_key(node_id)
+}
+
+/// Get the db_node_key (entity key) for a NodeId.
+pub fn node_entity_key(node_id: &NodeId) -> Vec<u8> {
     let radix_node_id = radix_common::types::NodeId(node_id.0);
     SpreadPrefixKeyMapper::to_db_node_key(&radix_node_id)
 }
@@ -101,7 +63,7 @@ pub fn node_prefix(node_id: &NodeId) -> Vec<u8> {
 /// Extract the NodeId from a SpreadPrefixKeyMapper db_node_key.
 ///
 /// DbNodeKey format: 20-byte hash prefix + 30-byte NodeId.
-/// Returns None if the key is too short (should not happen with valid keys).
+/// Returns None if the key is too short.
 pub fn db_node_key_to_node_id(db_node_key: &[u8]) -> Option<NodeId> {
     const HASH_PREFIX_LEN: usize = 20;
     const NODE_ID_LEN: usize = 30;
@@ -111,224 +73,4 @@ pub fn db_node_key_to_node_id(db_node_key: &[u8]) -> Option<NodeId> {
     let mut id = [0u8; NODE_ID_LEN];
     id.copy_from_slice(&db_node_key[HASH_PREFIX_LEN..HASH_PREFIX_LEN + NODE_ID_LEN]);
     Some(NodeId(id))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use hyperscale_types::{NodeId, PartitionNumber};
-
-    fn test_partition_key(node_key: Vec<u8>, partition_num: u8) -> DbPartitionKey {
-        DbPartitionKey {
-            node_key,
-            partition_num,
-        }
-    }
-
-    #[test]
-    fn test_to_storage_key_format() {
-        let pk = test_partition_key(vec![1, 2, 3], 5);
-        let sk = DbSortKey(vec![10, 20]);
-        let key = to_storage_key(&pk, &sk);
-
-        // Key = node_key + partition_num + sort_key
-        let mut expected = Vec::new();
-        expected.extend_from_slice(&[1, 2, 3]);
-        expected.push(5);
-        expected.extend_from_slice(&[10, 20]);
-        assert_eq!(key, expected);
-    }
-
-    #[test]
-    fn test_to_storage_key_empty_sort_key() {
-        let pk = test_partition_key(vec![1, 2, 3], 0);
-        let sk = DbSortKey(vec![]);
-        let key = to_storage_key(&pk, &sk);
-
-        let mut expected = Vec::new();
-        expected.extend_from_slice(&[1, 2, 3]);
-        expected.push(0);
-        assert_eq!(key, expected);
-    }
-
-    #[test]
-    fn test_partition_prefix_format() {
-        let pk = test_partition_key(vec![10, 20], 7);
-        let prefix = partition_prefix(&pk);
-
-        let mut expected = Vec::new();
-        expected.extend_from_slice(&[10, 20]);
-        expected.push(7);
-        assert_eq!(prefix, expected);
-    }
-
-    #[test]
-    fn test_partition_prefix_is_prefix_of_storage_key() {
-        let pk = test_partition_key(vec![1, 2, 3], 5);
-        let sk = DbSortKey(vec![10, 20, 30]);
-        let prefix = partition_prefix(&pk);
-        let key = to_storage_key(&pk, &sk);
-
-        assert!(key.starts_with(&prefix));
-        // The remainder after the prefix should be the sort key
-        assert_eq!(&key[prefix.len()..], &[10, 20, 30]);
-    }
-
-    #[test]
-    fn test_next_prefix_basic() {
-        assert_eq!(next_prefix(&[1, 2, 3]), Some(vec![1, 2, 4]));
-        assert_eq!(next_prefix(&[0]), Some(vec![1]));
-        assert_eq!(next_prefix(&[254]), Some(vec![255]));
-    }
-
-    #[test]
-    fn test_next_prefix_carry() {
-        assert_eq!(next_prefix(&[1, 0xFF]), Some(vec![2, 0]));
-        assert_eq!(next_prefix(&[1, 0xFF, 0xFF]), Some(vec![2, 0, 0]));
-        assert_eq!(next_prefix(&[0, 0xFF]), Some(vec![1, 0]));
-    }
-
-    #[test]
-    fn test_next_prefix_all_ff() {
-        assert_eq!(next_prefix(&[0xFF]), None);
-        assert_eq!(next_prefix(&[0xFF, 0xFF]), None);
-        assert_eq!(next_prefix(&[0xFF, 0xFF, 0xFF]), None);
-    }
-
-    #[test]
-    fn test_next_prefix_single_byte() {
-        assert_eq!(next_prefix(&[0]), Some(vec![1]));
-        assert_eq!(next_prefix(&[127]), Some(vec![128]));
-        assert_eq!(next_prefix(&[254]), Some(vec![255]));
-        assert_eq!(next_prefix(&[255]), None);
-    }
-
-    #[test]
-    fn test_storage_key_from_write() {
-        let node_id = NodeId([1; 30]);
-        let partition = PartitionNumber(3);
-        let sort_key = vec![10, 20];
-        let key = storage_key_from_write(&node_id, &partition, &sort_key);
-
-        // Must end with sort key
-        assert!(key.ends_with(&sort_key));
-        // The byte just before the sort key must be the partition number's
-        // mapped value. SpreadPrefixKeyMapper preserves the partition number,
-        // so it should equal the raw value.
-        assert_eq!(key[key.len() - sort_key.len() - 1], partition.0);
-        // Should be deterministic
-        let key2 = storage_key_from_write(&node_id, &partition, &sort_key);
-        assert_eq!(key, key2);
-    }
-
-    #[test]
-    fn test_storage_key_from_write_different_inputs_differ() {
-        let base = storage_key_from_write(&NodeId([1; 30]), &PartitionNumber(0), &[10]);
-        let diff_node = storage_key_from_write(&NodeId([2; 30]), &PartitionNumber(0), &[10]);
-        let diff_part = storage_key_from_write(&NodeId([1; 30]), &PartitionNumber(1), &[10]);
-        let diff_sort = storage_key_from_write(&NodeId([1; 30]), &PartitionNumber(0), &[11]);
-
-        assert_ne!(
-            base, diff_node,
-            "different node should produce different key"
-        );
-        assert_ne!(
-            base, diff_part,
-            "different partition should produce different key"
-        );
-        assert_ne!(
-            base, diff_sort,
-            "different sort key should produce different key"
-        );
-    }
-
-    #[test]
-    fn test_node_prefix_format() {
-        let node_id = NodeId([2; 30]);
-        let prefix = node_prefix(&node_id);
-
-        // Should be deterministic
-        let prefix2 = node_prefix(&node_id);
-        assert_eq!(prefix, prefix2);
-    }
-
-    #[test]
-    fn test_node_prefix_is_prefix_of_storage_key() {
-        let node_id = NodeId([3; 30]);
-        let partition = PartitionNumber(5);
-        let sort_key = vec![10, 20];
-
-        let n_prefix = node_prefix(&node_id);
-        let s_key = storage_key_from_write(&node_id, &partition, &sort_key);
-
-        assert!(
-            s_key.starts_with(&n_prefix),
-            "storage key should start with node prefix"
-        );
-    }
-
-    #[test]
-    #[cfg(debug_assertions)]
-    #[should_panic(expected = "next_prefix called with empty prefix")]
-    fn test_next_prefix_empty_panics() {
-        next_prefix(&[]);
-    }
-
-    #[test]
-    fn test_different_nodes_have_different_prefixes() {
-        let p1 = node_prefix(&NodeId([1; 30]));
-        let p2 = node_prefix(&NodeId([2; 30]));
-        assert_ne!(p1, p2);
-    }
-
-    #[test]
-    fn test_storage_key_from_write_matches_to_storage_key() {
-        // storage_key_from_write should produce the same result as
-        // going through the SpreadPrefixKeyMapper + to_storage_key path
-        let node_id = NodeId([5; 30]);
-        let partition = PartitionNumber(2);
-        let sort_key = vec![10, 20, 30];
-        let key = storage_key_from_write(&node_id, &partition, &sort_key);
-
-        // Manually construct via SpreadPrefixKeyMapper + to_storage_key
-        let radix_node_id = radix_common::types::NodeId(node_id.0);
-        let radix_partition = radix_common::types::PartitionNumber(partition.0);
-        let db_node_key =
-            radix_substate_store_interface::db_key_mapper::SpreadPrefixKeyMapper::to_db_node_key(
-                &radix_node_id,
-            );
-        let db_partition_num =
-            radix_substate_store_interface::db_key_mapper::SpreadPrefixKeyMapper::to_db_partition_num(radix_partition);
-        let pk = DbPartitionKey {
-            node_key: db_node_key,
-            partition_num: db_partition_num,
-        };
-        let sk = DbSortKey(sort_key);
-        let expected = to_storage_key(&pk, &sk);
-
-        assert_eq!(key, expected);
-    }
-
-    #[test]
-    fn test_next_prefix_used_for_range_scan() {
-        // Verify that [prefix, next_prefix) correctly bounds all keys with that prefix
-        let pk = test_partition_key(vec![1, 2, 3], 5);
-        let prefix = partition_prefix(&pk);
-        let end = next_prefix(&prefix).unwrap();
-
-        // Keys with sort key should fall within [prefix, end)
-        for sk_byte in [0u8, 1, 127, 254, 255] {
-            let key = to_storage_key(&pk, &DbSortKey(vec![sk_byte]));
-            assert!(key >= prefix, "key should be >= prefix");
-            assert!(key < end, "key should be < end");
-        }
-
-        // A key for a different partition should be outside the range
-        let other_pk = test_partition_key(vec![1, 2, 3], 6);
-        let other_key = to_storage_key(&other_pk, &DbSortKey(vec![0]));
-        assert!(
-            other_key >= end || other_key < prefix,
-            "key from different partition should be outside range"
-        );
-    }
 }

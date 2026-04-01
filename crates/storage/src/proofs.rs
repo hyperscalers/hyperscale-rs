@@ -4,9 +4,7 @@
 //! operations. This module provides the storage-layer API that consumers use.
 
 use crate::jmt::ReadableTreeStore;
-use crate::keys::to_storage_key;
 use hyperscale_types::{Hash, SubstateInclusionProof};
-use radix_substate_store_interface::interface::{DbPartitionKey, DbSortKey};
 
 /// Generate an aggregated verkle proof for a set of storage keys.
 ///
@@ -36,9 +34,4 @@ pub fn verify_all_verkle_proofs(
     hyperscale_state_tree::proofs::verify_proof(proof, entries, expected_state_root, |entry| {
         &entry.storage_key
     })
-}
-
-/// Build a storage key from partition key + sort key (for proof generation).
-pub fn build_storage_key(partition_key: &DbPartitionKey, sort_key: &DbSortKey) -> Vec<u8> {
-    to_storage_key(partition_key, sort_key)
 }

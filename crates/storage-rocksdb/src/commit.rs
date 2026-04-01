@@ -1,6 +1,7 @@
 //! `CommitStore` implementation for `RocksDbStorage`.
 
-use crate::config::ALL_COLUMN_FAMILIES;
+use crate::column_families::CertificatesCf;
+use crate::column_families::ALL_COLUMN_FAMILIES;
 use crate::core::RocksDbStorage;
 use crate::jvt_snapshot_store::SnapshotTreeStore;
 
@@ -64,11 +65,8 @@ impl hyperscale_storage::CommitStore for RocksDbStorage {
 
         // Append certificate storage to the write batch.
         let mut write_batch = prepared.write_batch;
-        let cert_cf = self.cf().certificates;
         for cert in certificates {
-            let cert_bytes =
-                sbor::basic_encode(cert.as_ref()).expect("certificate encoding must succeed");
-            write_batch.put_cf(cert_cf, cert.transaction_hash.as_bytes(), cert_bytes);
+            self.cf_put::<CertificatesCf>(&mut write_batch, &cert.transaction_hash, cert.as_ref());
         }
 
         let used_fast_path =
@@ -115,13 +113,8 @@ impl hyperscale_storage::CommitStore for RocksDbStorage {
             self.build_substate_write_batch(merged_updates, Some(block_height));
 
         // Store certificates to the certificate CF.
-        if !certificates.is_empty() {
-            let cert_cf = self.cf().certificates;
-            for cert in certificates {
-                let cert_bytes =
-                    sbor::basic_encode(cert.as_ref()).expect("certificate encoding must succeed");
-                batch.put_cf(cert_cf, cert.transaction_hash.as_bytes(), cert_bytes);
-            }
+        for cert in certificates {
+            self.cf_put::<CertificatesCf>(&mut batch, &cert.transaction_hash, cert.as_ref());
         }
 
         // Compute JVT update.

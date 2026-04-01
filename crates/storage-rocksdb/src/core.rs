@@ -11,19 +11,20 @@
 //! JVT data is stored in dedicated column families (`jmt_nodes`, `jmt_meta`).
 //! On each commit, the JVT is updated and a new state root hash is computed.
 
-use crate::config::{
-    CfHandles, ResetOldKeys, RocksDbConfig, ASSOCIATED_STATE_TREE_VALUES_CF, JVT_NODES_CF,
-    STATE_CF, VERSIONED_SUBSTATES_CF,
-};
+use crate::column_families::{CfHandles, HOT_WRITE_COLUMN_FAMILIES};
+use crate::config::RocksDbConfig;
 use crate::jvt_snapshot_store::SnapshotTreeStore;
+use crate::typed_cf::{DbCodec, TypedCf};
+
+/// Sort keys deleted by partition Reset operations, keyed by `(entity_key, partition_num)`.
+/// Passed to `put_at_version` so the JVT can reconstruct full storage keys and
+/// generate deletes for the hashed keys.
+pub(crate) type ResetOldKeys = std::collections::HashMap<(Vec<u8>, u8), Vec<DbSortKey>>;
 
 use hyperscale_metrics as metrics;
 use hyperscale_storage::{
-    jmt::{
-        encode_key as encode_jvt_key, ReadableTreeStore, StoredNode, StoredNodeKey,
-        VersionedStoredNode,
-    },
-    keys, DatabaseUpdate, DatabaseUpdates, DbPartitionKey, DbSortKey, DbSubstateValue, JvtSnapshot,
+    jmt::{ReadableTreeStore, StoredNode, StoredNodeKey, VersionedStoredNode},
+    DatabaseUpdate, DatabaseUpdates, DbPartitionKey, DbSortKey, DbSubstateValue, JvtSnapshot,
     PartitionDatabaseUpdates, PartitionEntry, StateRootHash, SubstateDatabase,
 };
 use rocksdb::{ColumnFamilyDescriptor, Options, WriteBatch, DB};
@@ -32,23 +33,6 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tracing::{instrument, Level};
-
-/// Decode JVT metadata from raw bytes.
-///
-/// Layout: `[version_BE_8B][root_hash_32B]` (40 bytes total).
-/// Returns `(0, ZERO)` for `None` (uninitialized DB).
-pub(crate) fn decode_jvt_metadata(raw: Option<impl AsRef<[u8]>>) -> (u64, StateRootHash) {
-    match raw {
-        Some(bytes) => {
-            let bytes = bytes.as_ref();
-            assert!(bytes.len() == 40, "jmt:metadata must be 40 bytes");
-            let version = u64::from_be_bytes(bytes[..8].try_into().unwrap());
-            let root_hash = StateRootHash::from_hash_bytes(&bytes[8..40]);
-            (version, root_hash)
-        }
-        None => (0, StateRootHash::ZERO),
-    }
-}
 
 /// RocksDB-based storage for production use.
 ///
@@ -145,19 +129,10 @@ impl RocksDbStorage {
         // Column families — all share the bounded block cache but get
         // per-CF tuning for write buffers and compression.
         //
-        // Hot-write CFs (state, jvt_nodes, versioned_substates,
-        // associated_state_tree_values) use larger write buffers and tiered
-        // compression: no compression at L0-L1 (fast flushes), LZ4 at
-        // mid-levels, Zstd at the bottom level (best ratio for cold data).
-        //
+        // Hot-write CFs get larger write buffers and tiered compression.
         // Cold/low-volume CFs use smaller write buffers (16MB) to free
         // memory for the hot CFs and block cache.
-        let hot_write_cfs: &[&str] = &[
-            STATE_CF,
-            JVT_NODES_CF,
-            VERSIONED_SUBSTATES_CF,
-            ASSOCIATED_STATE_TREE_VALUES_CF,
-        ];
+        let hot_write_cfs = HOT_WRITE_COLUMN_FAMILIES;
 
         // Tiered compression: L0-L1 uncompressed (fast flushes, data gets
         // compacted away quickly), L2-L4 LZ4, L5+ Zstd.
@@ -223,25 +198,65 @@ impl RocksDbStorage {
         CfHandles::resolve(&self.db)
     }
 
+    // ─── Typed CF helpers ────────────────────────────────────────────────
+    //
+    // Thin wrappers over the free functions in typed_cf.rs.
+    // These resolve CfHandles and pass &self.db as the ReadableStore.
+
+    /// Get a typed value from a column family.
+    pub(crate) fn cf_get<CF: crate::typed_cf::TypedCf>(&self, key: &CF::Key) -> Option<CF::Value> {
+        crate::typed_cf::get::<CF>(&*self.db, CF::handle(&self.cf()), key)
+    }
+
+    /// Put a typed key/value into a WriteBatch.
+    pub(crate) fn cf_put<CF: crate::typed_cf::TypedCf>(
+        &self,
+        batch: &mut WriteBatch,
+        key: &CF::Key,
+        value: &CF::Value,
+    ) {
+        crate::typed_cf::batch_put::<CF>(batch, CF::handle(&self.cf()), key, value);
+    }
+
+    /// Batch get typed values (RocksDB multi_get_cf).
+    pub(crate) fn cf_multi_get<CF: crate::typed_cf::TypedCf>(
+        &self,
+        keys: &[CF::Key],
+    ) -> Vec<Option<CF::Value>> {
+        crate::typed_cf::multi_get::<CF>(&*self.db, CF::handle(&self.cf()), keys)
+    }
+
+    /// Delete a typed key in a WriteBatch.
+    #[allow(dead_code)]
+    pub(crate) fn cf_delete<CF: crate::typed_cf::TypedCf>(
+        &self,
+        batch: &mut WriteBatch,
+        key: &CF::Key,
+    ) {
+        crate::typed_cf::batch_delete::<CF>(batch, CF::handle(&self.cf()), key);
+    }
+
+    /// Typed single put (immediate write, no batch).
+    pub(crate) fn cf_put_sync<CF: crate::typed_cf::TypedCf>(
+        &self,
+        key: &CF::Key,
+        value: &CF::Value,
+    ) {
+        let cf = CF::handle(&self.cf());
+        let key_bytes = CF::KeyCodec::default().encode(key);
+        let value_bytes = CF::ValueCodec::default().encode(value);
+        self.db
+            .put_cf(cf, &key_bytes, &value_bytes)
+            .expect("BFT CRITICAL: write failed");
+    }
+
     /// Read JVT version and root hash directly from RocksDB.
     ///
     /// These are stored as a single 40-byte value under `jmt:metadata`:
     /// `[version_BE_8B][root_hash_32B]`. Always hot in the memtable since
     /// they're written on every commit.
     pub(crate) fn read_jvt_metadata(&self) -> (u64, StateRootHash) {
-        decode_jvt_metadata(
-            self.db
-                .get(b"jmt:metadata")
-                .expect("BFT CRITICAL: failed to read jmt:metadata"),
-        )
-    }
-
-    /// Encode JVT metadata into a 40-byte value.
-    fn encode_jvt_metadata(version: u64, root: StateRootHash) -> [u8; 40] {
-        let mut buf = [0u8; 40];
-        buf[..8].copy_from_slice(&version.to_be_bytes());
-        buf[8..40].copy_from_slice(&root.to_bytes());
-        buf
+        crate::metadata::read_jvt_metadata(&*self.db)
     }
 
     /// Append JVT data from a snapshot to a WriteBatch.
@@ -259,35 +274,26 @@ impl RocksDbStorage {
         // JVT nodes
         let cf = self.cf();
         for (key, node) in &snapshot.nodes {
-            let encoded_key = encode_jvt_key(key);
-            let encoded_node = sbor::basic_encode(&VersionedStoredNode::from_latest(node.clone()))
-                .expect("JVT node encoding must succeed");
-            batch.put_cf(cf.jvt_nodes, encoded_key, encoded_node);
+            crate::typed_cf::batch_put::<crate::column_families::JvtNodesCf>(
+                batch,
+                crate::column_families::JvtNodesCf::handle(&cf),
+                key,
+                &VersionedStoredNode::from_latest(node.clone()),
+            );
         }
 
-        // Stale parts for deferred GC
+        // Stale nodes for deferred GC — keyed by the version at which they became stale.
         if !snapshot.stale_tree_parts.is_empty() {
-            let version_key = new_version.to_be_bytes();
-            let encoded_parts = sbor::basic_encode(&snapshot.stale_tree_parts)
-                .expect("encoding stale parts must succeed");
-            batch.put_cf(cf.stale_state_hash_tree_parts, version_key, encoded_parts);
-        }
-
-        // Historical associations (always enabled — required for cross-shard provisions)
-        for assoc in &snapshot.leaf_substate_associations {
-            let encoded_key = encode_jvt_key(&assoc.tree_node_key);
-            batch.put_cf(
-                cf.associated_state_tree_values,
-                encoded_key,
-                &assoc.substate_value,
+            crate::typed_cf::batch_put::<crate::column_families::StaleJvtNodesCf>(
+                batch,
+                crate::column_families::StaleJvtNodesCf::handle(&cf),
+                &new_version,
+                &snapshot.stale_tree_parts,
             );
         }
 
         // JVT metadata — single key, atomic read.
-        batch.put(
-            b"jmt:metadata",
-            Self::encode_jvt_metadata(new_version, snapshot.result_root),
-        );
+        crate::metadata::write_jvt_metadata(batch, new_version, snapshot.result_root);
     }
 
     /// Append consensus metadata (committed_height, committed_hash, committed_qc)
@@ -296,46 +302,9 @@ impl RocksDbStorage {
         batch: &mut WriteBatch,
         consensus: &hyperscale_storage::ConsensusCommitData,
     ) {
-        batch.put(b"chain:committed_height", consensus.height.0.to_be_bytes());
-        batch.put(b"chain:committed_hash", consensus.hash.as_bytes());
-        let encoded_qc = sbor::basic_encode(&consensus.qc).expect("QC encoding must succeed");
-        batch.put(b"chain:committed_qc", encoded_qc);
-    }
-
-    /// Internal: iterate over a key range in the state CF.
-    pub(crate) fn iter_range<'a>(
-        &'a self,
-        start: &[u8],
-        end: &[u8],
-    ) -> impl Iterator<Item = (Box<[u8]>, Box<[u8]>)> + 'a {
-        let mut iter = self.db.raw_iterator_cf(self.cf().state);
-        iter.seek(start);
-        let end = end.to_vec();
-        let mut done = false;
-
-        std::iter::from_fn(move || {
-            if done {
-                return None;
-            }
-            if iter.valid() {
-                let key = iter.key()?;
-                if key < end.as_slice() {
-                    let k: Box<[u8]> = Box::from(key);
-                    let v: Box<[u8]> = Box::from(iter.value()?);
-                    iter.next();
-                    Some((k, v))
-                } else {
-                    done = true;
-                    None
-                }
-            } else {
-                done = true;
-                if let Err(e) = iter.status() {
-                    panic!("RocksDB iterator error: {e}");
-                }
-                None
-            }
-        })
+        crate::metadata::write_committed_height(batch, consensus.height);
+        crate::metadata::write_committed_hash(batch, &consensus.hash);
+        crate::metadata::write_committed_qc(batch, &consensus.qc);
     }
 
     /// Build a `WriteBatch` containing all substate puts/deletes from `updates`.
@@ -354,12 +323,12 @@ impl RocksDbStorage {
         let mut batch = WriteBatch::default();
         let mut reset_old_keys = ResetOldKeys::new();
 
-        let cf = self.cf();
-        let state_cf = cf.state;
-        let versioned_cf: Option<&rocksdb::ColumnFamily> = Some(cf.versioned_substates);
+        use crate::column_families::{StateCf, VersionedSubstatesCf};
+        use crate::typed_cf::{batch_delete, batch_put};
 
-        // Reusable buffer for versioned keys — avoids a Vec allocation per substate write.
-        let mut vkey_buf: Vec<u8> = Vec::with_capacity(256);
+        let cf = self.cf();
+        let state_cf = StateCf::handle(&cf);
+        let versioned_cf = VersionedSubstatesCf::handle(&cf);
 
         for (node_key, node_updates) in &updates.node_updates {
             for (partition_num, partition_updates) in &node_updates.partition_updates {
@@ -371,25 +340,29 @@ impl RocksDbStorage {
                 match partition_updates {
                     PartitionDatabaseUpdates::Delta { substate_updates } => {
                         for (sort_key, update) in substate_updates {
-                            let key = keys::to_storage_key(&partition_key, sort_key);
+                            let key = (partition_key.clone(), sort_key.clone());
                             match update {
                                 DatabaseUpdate::Set(value) => {
-                                    batch.put_cf(state_cf, &key, value);
-                                    if let (Some(ver), Some(vcf)) = (version, versioned_cf) {
-                                        vkey_buf.clear();
-                                        vkey_buf.extend_from_slice(&key);
-                                        vkey_buf.extend_from_slice(&ver.to_be_bytes());
-                                        batch.put_cf(vcf, &vkey_buf, value);
+                                    batch_put::<StateCf>(&mut batch, state_cf, &key, value);
+                                    if let Some(ver) = version {
+                                        batch_put::<VersionedSubstatesCf>(
+                                            &mut batch,
+                                            versioned_cf,
+                                            &(key, ver),
+                                            value,
+                                        );
                                     }
                                 }
                                 DatabaseUpdate::Delete => {
-                                    batch.delete_cf(state_cf, &key);
-                                    if let (Some(ver), Some(vcf)) = (version, versioned_cf) {
-                                        vkey_buf.clear();
-                                        vkey_buf.extend_from_slice(&key);
-                                        vkey_buf.extend_from_slice(&ver.to_be_bytes());
+                                    batch_delete::<StateCf>(&mut batch, state_cf, &key);
+                                    if let Some(ver) = version {
                                         // Empty value = tombstone
-                                        batch.put_cf(vcf, &vkey_buf, []);
+                                        batch_put::<VersionedSubstatesCf>(
+                                            &mut batch,
+                                            versioned_cf,
+                                            &(key, ver),
+                                            &vec![],
+                                        );
                                     }
                                 }
                             }
@@ -398,46 +371,41 @@ impl RocksDbStorage {
                     PartitionDatabaseUpdates::Reset {
                         new_substate_values,
                     } => {
-                        let prefix = keys::partition_prefix(&partition_key);
-                        let end = keys::next_prefix(&prefix).expect("storage key prefix overflow");
-
+                        let prefix = crate::substate_key::partition_prefix(&partition_key);
                         let snap = self.db.snapshot();
-                        let mut iter = snap.raw_iterator_cf(state_cf);
-                        let mut old_keys_for_partition = Vec::new();
+                        let mut old_sort_keys = Vec::new();
 
-                        iter.seek(&prefix);
-                        while iter.valid() {
-                            if let Some(key) = iter.key() {
-                                if key >= end.as_slice() {
-                                    break;
-                                }
-                                batch.delete_cf(state_cf, key);
-                                old_keys_for_partition.push(key.to_vec());
-                                if let (Some(ver), Some(vcf)) = (version, versioned_cf) {
-                                    vkey_buf.clear();
-                                    vkey_buf.extend_from_slice(key);
-                                    vkey_buf.extend_from_slice(&ver.to_be_bytes());
-                                    batch.put_cf(vcf, &vkey_buf, []); // tombstone
-                                }
-                                iter.next();
-                            } else {
-                                break;
+                        for ((pk, sk), _value) in
+                            crate::typed_cf::prefix_iter_snap::<StateCf>(&snap, state_cf, &prefix)
+                        {
+                            let key = (pk, sk.clone());
+                            batch_delete::<StateCf>(&mut batch, state_cf, &key);
+                            old_sort_keys.push(sk);
+                            if let Some(ver) = version {
+                                batch_put::<VersionedSubstatesCf>(
+                                    &mut batch,
+                                    versioned_cf,
+                                    &(key, ver),
+                                    &vec![],
+                                );
                             }
                         }
 
-                        if !old_keys_for_partition.is_empty() {
+                        if !old_sort_keys.is_empty() {
                             reset_old_keys
-                                .insert((node_key.clone(), *partition_num), old_keys_for_partition);
+                                .insert((node_key.clone(), *partition_num), old_sort_keys);
                         }
 
                         for (sort_key, value) in new_substate_values {
-                            let key = keys::to_storage_key(&partition_key, sort_key);
-                            batch.put_cf(state_cf, &key, value);
-                            if let (Some(ver), Some(vcf)) = (version, versioned_cf) {
-                                vkey_buf.clear();
-                                vkey_buf.extend_from_slice(&key);
-                                vkey_buf.extend_from_slice(&ver.to_be_bytes());
-                                batch.put_cf(vcf, &vkey_buf, value);
+                            let key = (partition_key.clone(), sort_key.clone());
+                            batch_put::<StateCf>(&mut batch, state_cf, &key, value);
+                            if let Some(ver) = version {
+                                batch_put::<VersionedSubstatesCf>(
+                                    &mut batch,
+                                    versioned_cf,
+                                    &(key, ver),
+                                    value,
+                                );
                             }
                         }
                     }
@@ -525,11 +493,8 @@ impl SubstateDatabase for RocksDbStorage {
         sort_key: &DbSortKey,
     ) -> Option<DbSubstateValue> {
         let start = Instant::now();
-        let key = keys::to_storage_key(partition_key, sort_key);
         let result = self
-            .db
-            .get_cf(self.cf().state, &key)
-            .expect("RocksDB read failure on state CF");
+            .cf_get::<crate::column_families::StateCf>(&(partition_key.clone(), sort_key.clone()));
         let elapsed = start.elapsed();
         metrics::record_storage_read(elapsed.as_secs_f64());
 
@@ -546,9 +511,7 @@ impl SubstateDatabase for RocksDbStorage {
         partition_key: &DbPartitionKey,
         from_sort_key: Option<&DbSortKey>,
     ) -> Box<dyn Iterator<Item = PartitionEntry> + '_> {
-        let prefix = keys::partition_prefix(partition_key);
-        let prefix_len = prefix.len();
-
+        let prefix = crate::substate_key::partition_prefix(partition_key);
         let start = match from_sort_key {
             Some(sort_key) => {
                 let mut s = prefix.clone();
@@ -557,32 +520,21 @@ impl SubstateDatabase for RocksDbStorage {
             }
             None => prefix.clone(),
         };
-        let end = keys::next_prefix(&prefix).expect("storage key prefix overflow");
 
-        let items = self.iter_range(&start, &end);
-
-        Box::new(items.into_iter().filter_map(move |(full_key, value)| {
-            if full_key.len() > prefix_len {
-                let sort_key_bytes = full_key[prefix_len..].to_vec();
-                Some((DbSortKey(sort_key_bytes), value.into_vec()))
-            } else {
-                None
-            }
-        }))
+        let cf = crate::column_families::StateCf::handle(&self.cf());
+        Box::new(
+            crate::typed_cf::prefix_iter_from::<crate::column_families::StateCf>(
+                &self.db, cf, &prefix, &start,
+            )
+            .map(|((_pk, sk), value)| (sk, value)),
+        )
     }
 }
 
 impl ReadableTreeStore for RocksDbStorage {
     fn get_node(&self, key: &StoredNodeKey) -> Option<StoredNode> {
-        let encoded_key = encode_jvt_key(key);
-        self.db
-            .get_cf(self.cf().jvt_nodes, &encoded_key)
-            .expect("RocksDB read failure on jmt_nodes CF")
-            .map(|bytes| {
-                sbor::basic_decode::<VersionedStoredNode>(&bytes)
-                    .unwrap_or_else(|e| panic!("JVT node corruption detected: {e:?}"))
-                    .into_latest()
-            })
+        self.cf_get::<crate::column_families::JvtNodesCf>(key)
+            .map(|v| v.into_latest())
     }
 }
 

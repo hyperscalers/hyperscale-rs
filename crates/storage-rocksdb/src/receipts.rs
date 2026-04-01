@@ -1,6 +1,8 @@
 //! Receipt storage for RocksDB.
 
+use crate::column_families::{LedgerReceiptsCf, LocalExecutionsCf};
 use crate::core::RocksDbStorage;
+use crate::typed_cf::{self, TypedCf};
 
 use hyperscale_types::Hash;
 use rocksdb::WriteBatch;
@@ -42,20 +44,29 @@ impl RocksDbStorage {
         bundle: &hyperscale_types::ReceiptBundle,
     ) {
         let cf = self.cf();
-        let receipt_bytes = if let Some(ref updates) = bundle.database_updates {
+
+        // Encode receipt — optionally inject database_updates into state_changes.
+        let receipt_to_store = if let Some(ref updates) = bundle.database_updates {
             let mut receipt = (*bundle.ledger_receipt).clone();
             receipt.state_changes = hyperscale_storage::extract_state_changes(updates);
-            sbor::basic_encode(&receipt).expect("ledger receipt encoding must succeed")
+            receipt
         } else {
-            sbor::basic_encode(bundle.ledger_receipt.as_ref())
-                .expect("ledger receipt encoding must succeed")
+            (*bundle.ledger_receipt).clone()
         };
-        batch.put_cf(cf.ledger_receipts, bundle.tx_hash.as_bytes(), receipt_bytes);
+        typed_cf::batch_put::<LedgerReceiptsCf>(
+            batch,
+            LedgerReceiptsCf::handle(&cf),
+            &bundle.tx_hash,
+            &receipt_to_store,
+        );
 
         if let Some(ref local) = bundle.local_execution {
-            let local_bytes =
-                sbor::basic_encode(local).expect("local execution encoding must succeed");
-            batch.put_cf(cf.local_executions, bundle.tx_hash.as_bytes(), local_bytes);
+            typed_cf::batch_put::<LocalExecutionsCf>(
+                batch,
+                LocalExecutionsCf::handle(&cf),
+                &bundle.tx_hash,
+                local,
+            );
         }
     }
 
@@ -64,26 +75,7 @@ impl RocksDbStorage {
         &self,
         tx_hash: &Hash,
     ) -> Option<Arc<hyperscale_types::LedgerTransactionReceipt>> {
-        match self
-            .db
-            .get_cf(self.cf().ledger_receipts, tx_hash.as_bytes())
-        {
-            Ok(Some(value)) => {
-                match sbor::basic_decode::<hyperscale_types::LedgerTransactionReceipt>(&value) {
-                    Ok(receipt) => Some(Arc::new(receipt)),
-                    Err(e) => {
-                        tracing::error!(
-                            ?tx_hash,
-                            bytes_len = value.len(),
-                            error = ?e,
-                            "Ledger receipt exists in storage but SBOR decode failed"
-                        );
-                        None
-                    }
-                }
-            }
-            _ => None,
-        }
+        self.cf_get::<LedgerReceiptsCf>(tx_hash).map(Arc::new)
     }
 
     /// Retrieve local execution details for a transaction.
@@ -91,12 +83,6 @@ impl RocksDbStorage {
         &self,
         tx_hash: &Hash,
     ) -> Option<hyperscale_types::LocalTransactionExecution> {
-        match self
-            .db
-            .get_cf(self.cf().local_executions, tx_hash.as_bytes())
-        {
-            Ok(Some(value)) => sbor::basic_decode(&value).ok(),
-            _ => None,
-        }
+        self.cf_get::<LocalExecutionsCf>(tx_hash)
     }
 }

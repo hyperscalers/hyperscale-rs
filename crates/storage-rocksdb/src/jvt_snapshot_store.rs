@@ -1,12 +1,11 @@
 //! Snapshot-based tree store for concurrent JVT reads.
 
-use crate::config::CfHandles;
+use crate::column_families::{CfHandles, JvtNodesCf, StateCf};
+use crate::typed_cf::{self, TypedCf};
+
 use hyperscale_storage::{
-    jmt::{
-        encode_key as encode_jvt_key, ReadableTreeStore, StoredNode, StoredNodeKey,
-        VersionedStoredNode,
-    },
-    keys, DbPartitionKey, DbSortKey, StateRootHash, SubstateLookup,
+    jmt::{ReadableTreeStore, StoredNode, StoredNodeKey},
+    DbPartitionKey, DbSortKey, StateRootHash, SubstateLookup,
 };
 use rocksdb::{Snapshot, DB};
 
@@ -49,11 +48,12 @@ impl<'a> SnapshotTreeStore<'a> {
         partition_key: &DbPartitionKey,
         sort_key: &DbSortKey,
     ) -> Option<Vec<u8>> {
-        let key = keys::to_storage_key(partition_key, sort_key);
-        self.snapshot
-            .get_cf(CfHandles::resolve(self.db).state, &key)
-            .expect("RocksDB snapshot read failure on state CF")
-            .map(|v| v.to_vec())
+        let cf = CfHandles::resolve(self.db);
+        typed_cf::get::<StateCf>(
+            &self.snapshot,
+            StateCf::handle(&cf),
+            &(partition_key.clone(), sort_key.clone()),
+        )
     }
 
     /// Read the JVT version and root hash from this snapshot.
@@ -64,43 +64,22 @@ impl<'a> SnapshotTreeStore<'a> {
     ///
     /// Returns `(version, root_hash)`. For an empty/uninitialized JVT, returns `(0, [0; 32])`.
     pub fn read_jvt_metadata(&self) -> (u64, StateRootHash) {
-        crate::core::decode_jvt_metadata(
-            self.snapshot
-                .get(b"jmt:metadata")
-                .expect("BFT CRITICAL: failed to read jmt:metadata from snapshot"),
-        )
+        crate::metadata::read_jvt_metadata(&self.snapshot)
     }
 }
 
 impl ReadableTreeStore for SnapshotTreeStore<'_> {
     fn get_node(&self, key: &StoredNodeKey) -> Option<StoredNode> {
-        let encoded_key = encode_jvt_key(key);
-        self.snapshot
-            .get_cf(CfHandles::resolve(self.db).jvt_nodes, &encoded_key)
-            .expect("RocksDB snapshot read failure on jmt_nodes CF")
-            .map(|bytes| {
-                sbor::basic_decode::<VersionedStoredNode>(&bytes)
-                    .unwrap_or_else(|e| panic!("JVT node corruption detected: {e:?}"))
-                    .into_latest()
-            })
+        let cf = CfHandles::resolve(self.db);
+        typed_cf::get::<JvtNodesCf>(&self.snapshot, JvtNodesCf::handle(&cf), key)
+            .map(|v| v.into_latest())
     }
 
     fn get_nodes_batch(&self, keys: &[StoredNodeKey]) -> Vec<Option<StoredNode>> {
-        let cf = CfHandles::resolve(self.db).jvt_nodes;
-        let encoded_keys: Vec<Vec<u8>> = keys.iter().map(encode_jvt_key).collect();
-        let cf_keys: Vec<_> = encoded_keys.iter().map(|k| (cf, k.as_slice())).collect();
-        self.snapshot
-            .multi_get_cf(cf_keys)
+        let cf = CfHandles::resolve(self.db);
+        typed_cf::multi_get::<JvtNodesCf>(&self.snapshot, JvtNodesCf::handle(&cf), keys)
             .into_iter()
-            .map(|result| {
-                result
-                    .expect("RocksDB snapshot batch read failure on jmt_nodes CF")
-                    .map(|bytes| {
-                        sbor::basic_decode::<VersionedStoredNode>(&bytes)
-                            .unwrap_or_else(|e| panic!("JVT node corruption detected: {e:?}"))
-                            .into_latest()
-                    })
-            })
+            .map(|opt| opt.map(|v| v.into_latest()))
             .collect()
     }
 }

@@ -271,7 +271,10 @@ pub fn put_at_version<S: ReadableTreeStore + Sync>(
     parent_version: Option<Version>,
     new_version: Version,
     database_updates: &radix_substate_store_interface::interface::DatabaseUpdates,
-    reset_old_keys: &HashMap<(Vec<u8>, u8), Vec<Vec<u8>>>,
+    reset_old_keys: &HashMap<
+        (Vec<u8>, u8),
+        Vec<radix_substate_store_interface::interface::DbSortKey>,
+    >,
     node_cache: Option<&NodeCache>,
 ) -> (Hash, CollectedWrites) {
     assert!(
@@ -307,11 +310,15 @@ pub fn put_at_version<S: ReadableTreeStore + Sync>(
                 radix_substate_store_interface::interface::PartitionDatabaseUpdates::Reset {
                     new_substate_values,
                 } => {
-                    // Delete all existing substates in this partition via caller-provided keys.
-                    if let Some(old_keys) = reset_old_keys.get(&(entity_key.clone(), partition_num))
+                    // Delete all existing substates in this partition via caller-provided sort keys.
+                    // Reconstruct the full storage key from (entity_key, partition_num, sort_key).
+                    if let Some(old_sort_keys) =
+                        reset_old_keys.get(&(entity_key.clone(), partition_num))
                     {
-                        for old_sk in old_keys {
-                            let jvt_key = hash_storage_key(old_sk);
+                        for old_sk in old_sort_keys {
+                            let storage_key =
+                                make_storage_key(entity_key, partition_num, &old_sk.0);
+                            let jvt_key = hash_storage_key(&storage_key);
                             updates.insert(jvt_key, None);
                         }
                     }
@@ -392,7 +399,10 @@ pub fn put_at_version_and_apply<S: ReadableTreeStore + WriteableTreeStore + Sync
     parent_version: Option<Version>,
     new_version: Version,
     database_updates: &radix_substate_store_interface::interface::DatabaseUpdates,
-    reset_old_keys: &HashMap<(Vec<u8>, u8), Vec<Vec<u8>>>,
+    reset_old_keys: &HashMap<
+        (Vec<u8>, u8),
+        Vec<radix_substate_store_interface::interface::DbSortKey>,
+    >,
     node_cache: Option<&NodeCache>,
 ) -> Hash {
     let (root, collected) = put_at_version(

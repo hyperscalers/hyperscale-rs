@@ -1,8 +1,10 @@
 //! RocksDB snapshot for consistent reads.
 
-use crate::config::CfHandles;
+use crate::column_families::{CfHandles, StateCf};
+use crate::substate_key;
+use crate::typed_cf::{self, TypedCf};
 use hyperscale_storage::{
-    keys, DbPartitionKey, DbSortKey, DbSubstateValue, PartitionEntry, SubstateDatabase,
+    DbPartitionKey, DbSortKey, DbSubstateValue, PartitionEntry, SubstateDatabase,
 };
 use rocksdb::{Snapshot, DB};
 
@@ -22,10 +24,12 @@ impl SubstateDatabase for RocksDbSnapshot<'_> {
         partition_key: &DbPartitionKey,
         sort_key: &DbSortKey,
     ) -> Option<DbSubstateValue> {
-        let key = keys::to_storage_key(partition_key, sort_key);
-        self.snapshot
-            .get_cf(CfHandles::resolve(self.db).state, &key)
-            .expect("RocksDB snapshot read failure on state CF")
+        let cf = CfHandles::resolve(self.db);
+        typed_cf::get::<StateCf>(
+            &self.snapshot,
+            StateCf::handle(&cf),
+            &(partition_key.clone(), sort_key.clone()),
+        )
     }
 
     fn list_raw_values_from_db_key(
@@ -33,9 +37,7 @@ impl SubstateDatabase for RocksDbSnapshot<'_> {
         partition_key: &DbPartitionKey,
         from_sort_key: Option<&DbSortKey>,
     ) -> Box<dyn Iterator<Item = PartitionEntry> + '_> {
-        let prefix = keys::partition_prefix(partition_key);
-        let prefix_len = prefix.len();
-
+        let prefix = substate_key::partition_prefix(partition_key);
         let start = match from_sort_key {
             Some(sort_key) => {
                 let mut s = prefix.clone();
@@ -44,44 +46,11 @@ impl SubstateDatabase for RocksDbSnapshot<'_> {
             }
             None => prefix.clone(),
         };
-        let end = keys::next_prefix(&prefix).expect("storage key prefix overflow");
 
-        let state_cf = CfHandles::resolve(self.db).state;
-        let mut iter = self.snapshot.raw_iterator_cf(state_cf);
-        iter.seek(&start);
-
-        let mut done = false;
-        let raw_iter = std::iter::from_fn(move || {
-            if done {
-                return None;
-            }
-            if iter.valid() {
-                let key = iter.key()?;
-                if key < end.as_slice() {
-                    let k: Box<[u8]> = Box::from(key);
-                    let v: Box<[u8]> = Box::from(iter.value()?);
-                    iter.next();
-                    Some((k, v))
-                } else {
-                    done = true;
-                    None
-                }
-            } else {
-                done = true;
-                if let Err(e) = iter.status() {
-                    panic!("RocksDB snapshot iterator error: {e}");
-                }
-                None
-            }
-        });
-
-        Box::new(raw_iter.filter_map(move |(full_key, value)| {
-            if full_key.len() > prefix_len {
-                let sort_key_bytes = full_key[prefix_len..].to_vec();
-                Some((DbSortKey(sort_key_bytes), value.into_vec()))
-            } else {
-                None
-            }
-        }))
+        let state_cf = StateCf::handle(&CfHandles::resolve(self.db));
+        Box::new(
+            typed_cf::prefix_iter_from_snap::<StateCf>(&self.snapshot, state_cf, &prefix, &start)
+                .map(|((_pk, sk), value)| (sk, value)),
+        )
     }
 }

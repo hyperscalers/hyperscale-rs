@@ -1,23 +1,25 @@
 //! JVT garbage collection for RocksDB storage.
 
+use crate::column_families::{JvtNodesCf, StaleJvtNodesCf};
 use crate::core::RocksDbStorage;
+use crate::typed_cf::{self, TypedCf};
 
-use hyperscale_storage::jmt::{
-    encode_key as encode_jvt_key, StaleTreePart, StoredNode, StoredNodeKey, VersionedStoredNode,
-};
+use hyperscale_storage::jmt::{StaleTreePart, StoredNode, StoredNodeKey};
 use rocksdb::{ColumnFamily, WriteBatch};
 
 impl RocksDbStorage {
     /// Run garbage collection for stale JVT nodes.
     ///
-    /// This deletes JVT nodes (and their associations) that became stale at heights
-    /// older than `current_height - jvt_history_length`.
+    /// Deletes JVT nodes that became stale at heights older than
+    /// `current_height - jvt_history_length`, freeing disk space while
+    /// preserving the ability to generate historical proofs within the
+    /// retention window.
     ///
     /// # When to Call
     ///
     /// Call this periodically (e.g., after each block commit, or on a timer).
-    /// It's safe to call concurrently with commits - GC only touches old data
-    /// that's no longer reachable from the current state root.
+    /// It's safe to call concurrently with commits — GC only touches old data
+    /// that's no longer reachable from recent state roots.
     ///
     /// # Returns
     ///
@@ -28,78 +30,42 @@ impl RocksDbStorage {
 
         let (current_version, _) = self.read_jvt_metadata();
 
-        // Calculate the cutoff version - delete stale parts older than this
+        // Calculate the cutoff version — delete stale parts older than this.
         let cutoff_version = current_version.saturating_sub(self.jvt_history_length);
 
         if cutoff_version == 0 {
-            // Nothing to GC yet - we haven't accumulated enough history
             return 0;
         }
 
         let cf = self.cf();
-        let stale_cf = cf.stale_state_hash_tree_parts;
-        let jvt_cf = cf.jvt_nodes;
-        let assoc_cf = cf.associated_state_tree_values;
-
-        // Iterate through stale parts older than the cutoff
-        let mut iter = self.db.raw_iterator_cf(stale_cf);
-        iter.seek_to_first();
+        let stale_cf = StaleJvtNodesCf::handle(&cf);
+        let jvt_cf = JvtNodesCf::handle(&cf);
 
         let mut processed_count = 0;
         let mut deleted_nodes = 0;
         let mut batch = WriteBatch::default();
 
-        while iter.valid() {
-            let version_key = match iter.key() {
-                Some(k) if k.len() == 8 => k,
-                _ => {
-                    iter.next();
-                    continue;
-                }
-            };
-
-            let version = u64::from_be_bytes(version_key.try_into().unwrap());
-
-            // Stop if we've reached versions we want to keep
+        for (version, stale_parts) in typed_cf::iter_all::<StaleJvtNodesCf>(&self.db, stale_cf) {
             if version >= cutoff_version {
                 break;
             }
 
-            // Decode the stale parts
-            if let Some(value) = iter.value() {
-                if let Ok(stale_parts) = sbor::basic_decode::<Vec<StaleTreePart>>(value) {
-                    for stale_part in stale_parts {
-                        match stale_part {
-                            StaleTreePart::Node(key) => {
-                                let encoded_key = encode_jvt_key(&key);
-                                batch.delete_cf(jvt_cf, &encoded_key);
-                                batch.delete_cf(assoc_cf, &encoded_key);
-                                deleted_nodes += 1;
-                            }
-                            StaleTreePart::Subtree(key) => {
-                                // For subtrees, we recursively delete all nodes.
-                                // This is more expensive but ensures proper cleanup.
-                                self.delete_subtree_recursive(
-                                    &key,
-                                    jvt_cf,
-                                    Some(assoc_cf),
-                                    &mut batch,
-                                    &mut deleted_nodes,
-                                );
-                            }
-                        }
+            for stale_part in stale_parts {
+                match stale_part {
+                    StaleTreePart::Node(key) => {
+                        typed_cf::batch_delete::<JvtNodesCf>(&mut batch, jvt_cf, &key);
+                        deleted_nodes += 1;
+                    }
+                    StaleTreePart::Subtree(key) => {
+                        deleted_nodes += Self::delete_subtree(&self.db, jvt_cf, &key, &mut batch);
                     }
                 }
             }
 
-            // Delete the stale parts entry itself
-            batch.delete_cf(stale_cf, version_key);
+            typed_cf::batch_delete::<StaleJvtNodesCf>(&mut batch, stale_cf, &version);
             processed_count += 1;
-
-            iter.next();
         }
 
-        // Apply all deletions
         if !batch.is_empty() {
             if let Err(e) = self.db.write(batch) {
                 tracing::error!("JVT GC write failed: {}", e);
@@ -122,62 +88,34 @@ impl RocksDbStorage {
         processed_count
     }
 
-    /// Recursively delete a subtree and its associations.
-    fn delete_subtree_recursive(
-        &self,
-        root_key: &StoredNodeKey,
+    /// Delete a JVT subtree iteratively using an explicit stack.
+    ///
+    /// Avoids stack overflow on deep trees. Returns the number of nodes deleted.
+    fn delete_subtree(
+        db: &rocksdb::DB,
         jvt_cf: &ColumnFamily,
-        assoc_cf: Option<&ColumnFamily>,
+        root_key: &StoredNodeKey,
         batch: &mut WriteBatch,
-        deleted_count: &mut usize,
-    ) {
-        // Read the root node to find its children
-        let encoded_key = encode_jvt_key(root_key);
-        let node = match self.db.get_cf(jvt_cf, &encoded_key) {
-            Ok(Some(bytes)) => {
-                match sbor::basic_decode::<VersionedStoredNode>(&bytes) {
-                    Ok(versioned) => versioned.into_latest(),
-                    Err(_) => {
-                        // Can't decode - just delete the root
-                        batch.delete_cf(jvt_cf, &encoded_key);
-                        if let Some(cf) = assoc_cf {
-                            batch.delete_cf(cf, &encoded_key);
-                        }
-                        *deleted_count += 1;
-                        return;
-                    }
-                }
-            }
-            _ => {
-                // Node doesn't exist (already deleted in a previous GC run)
-                return;
-            }
-        };
+    ) -> usize {
+        let mut stack = vec![root_key.clone()];
+        let mut deleted = 0;
 
-        // Process children first (post-order traversal)
-        match &node {
-            StoredNode::Internal(internal) => {
+        while let Some(key) = stack.pop() {
+            let node = match typed_cf::get::<JvtNodesCf>(db, jvt_cf, &key) {
+                Some(versioned) => versioned.into_latest(),
+                None => continue, // Already deleted in a previous GC run.
+            };
+
+            if let StoredNode::Internal(internal) = &node {
                 for child in &internal.children {
-                    let child_key = root_key.child_key(child.version, child.index);
-                    self.delete_subtree_recursive(
-                        &child_key,
-                        jvt_cf,
-                        assoc_cf,
-                        batch,
-                        deleted_count,
-                    );
+                    stack.push(key.child_key(child.version, child.index));
                 }
             }
-            StoredNode::EaS(_) => {
-                // EaS nodes have no children
-            }
+
+            typed_cf::batch_delete::<JvtNodesCf>(batch, jvt_cf, &key);
+            deleted += 1;
         }
 
-        // Delete this node
-        batch.delete_cf(jvt_cf, &encoded_key);
-        if let Some(cf) = assoc_cf {
-            batch.delete_cf(cf, &encoded_key);
-        }
-        *deleted_count += 1;
+        deleted
     }
 }

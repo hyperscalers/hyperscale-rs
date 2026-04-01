@@ -1,6 +1,8 @@
 //! Vote storage (BFT Safety Critical).
 
+use crate::column_families::VotesCf;
 use crate::core::RocksDbStorage;
+use crate::typed_cf::{DbCodec, TypedCf};
 
 use hyperscale_metrics as metrics;
 use hyperscale_types::Hash;
@@ -30,16 +32,20 @@ impl RocksDbStorage {
     pub fn put_own_vote(&self, height: u64, round: u64, block_hash: Hash) {
         let start = std::time::Instant::now();
 
-        let key = height.to_be_bytes();
-        let value = sbor::basic_encode(&(block_hash, round))
-            .expect("vote encoding must succeed - this is a bug if it fails");
+        let key_bytes = <VotesCf as TypedCf>::KeyCodec::default().encode(&height);
+        let value_bytes = <VotesCf as TypedCf>::ValueCodec::default().encode(&(block_hash, round));
 
         // Use sync write for durability - this is safety critical
         let mut write_opts = rocksdb::WriteOptions::default();
         write_opts.set_sync(true);
 
         self.db
-            .put_cf_opt(self.cf().votes, key, value, &write_opts)
+            .put_cf_opt(
+                VotesCf::handle(&self.cf()),
+                key_bytes,
+                value_bytes,
+                &write_opts,
+            )
             .expect("BFT SAFETY CRITICAL: vote persistence failed - cannot continue safely");
 
         let elapsed = start.elapsed();
@@ -55,31 +61,15 @@ impl RocksDbStorage {
     ///
     /// Returns `Some((block_hash, round))` if we previously voted at this height.
     pub fn get_own_vote(&self, height: u64) -> Option<(Hash, u64)> {
-        let key = height.to_be_bytes();
-
-        match self.db.get_cf(self.cf().votes, key) {
-            Ok(Some(value)) => sbor::basic_decode(&value).ok(),
-            _ => None,
-        }
+        self.cf_get::<VotesCf>(&height)
     }
 
     /// Get all our own votes (for recovery on startup).
     ///
     /// Returns a map of height -> (block_hash, round).
     pub fn get_all_own_votes(&self) -> std::collections::HashMap<u64, (Hash, u64)> {
-        let cf = self.cf().votes;
-
-        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
-
-        iter.filter_map(|item| {
-            item.ok().and_then(|(key, value)| {
-                let height_bytes: [u8; 8] = key.as_ref().try_into().ok()?;
-                let height = u64::from_be_bytes(height_bytes);
-                let (hash, round): (Hash, u64) = sbor::basic_decode(&value).ok()?;
-                Some((height, (hash, round)))
-            })
-        })
-        .collect()
+        let cf = VotesCf::handle(&self.cf());
+        crate::typed_cf::iter_all::<VotesCf>(&self.db, cf).collect()
     }
 
     /// Remove votes at or below a committed height (cleanup).
@@ -87,18 +77,12 @@ impl RocksDbStorage {
     /// Once a height is committed, we no longer need to track our vote for it.
     /// This prevents unbounded storage growth.
     pub fn prune_own_votes(&self, committed_height: u64) {
-        let cf = self.cf().votes;
-
-        // Delete all votes at or below committed_height
+        let cf = VotesCf::handle(&self.cf());
         let mut batch = rocksdb::WriteBatch::default();
-        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
 
-        for (key, _) in iter.flatten() {
-            if let Ok(height_bytes) = <[u8; 8]>::try_from(key.as_ref()) {
-                let height = u64::from_be_bytes(height_bytes);
-                if height <= committed_height {
-                    batch.delete_cf(cf, key);
-                }
+        for (height, _) in crate::typed_cf::iter_all::<VotesCf>(&self.db, cf) {
+            if height <= committed_height {
+                crate::typed_cf::batch_delete::<VotesCf>(&mut batch, cf, &height);
             }
         }
 

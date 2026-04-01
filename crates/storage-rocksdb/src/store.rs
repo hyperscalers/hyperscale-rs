@@ -3,9 +3,11 @@
 use crate::core::RocksDbStorage;
 use crate::jvt_snapshot_store::SnapshotTreeStore;
 use crate::snapshot::RocksDbSnapshot;
+use crate::typed_cf::TypedCf;
 
+use crate::substate_key;
 use hyperscale_metrics as metrics;
-use hyperscale_storage::{keys, DatabaseUpdates, DbSortKey, JvtSnapshot, SubstateStore};
+use hyperscale_storage::{DatabaseUpdates, DbSortKey, JvtSnapshot, SubstateStore};
 use hyperscale_types::NodeId;
 use rocksdb::WriteBatch;
 use std::time::Instant;
@@ -27,21 +29,13 @@ impl SubstateStore for RocksDbStorage {
         &self,
         node_id: &NodeId,
     ) -> Box<dyn Iterator<Item = (u8, DbSortKey, Vec<u8>)> + '_> {
-        let prefix = keys::node_prefix(node_id);
-        let prefix_len = prefix.len();
-        let end = keys::next_prefix(&prefix).expect("storage key prefix overflow");
+        let prefix = substate_key::node_prefix(node_id);
+        let cf = crate::column_families::StateCf::handle(&self.cf());
 
-        let items = self.iter_range(&prefix, &end);
-
-        Box::new(items.into_iter().filter_map(move |(full_key, value)| {
-            if full_key.len() > prefix_len {
-                let partition_num = full_key[prefix_len];
-                let sort_key_bytes = full_key[prefix_len + 1..].to_vec();
-                Some((partition_num, DbSortKey(sort_key_bytes), value.into_vec()))
-            } else {
-                None
-            }
-        }))
+        Box::new(
+            crate::typed_cf::prefix_iter::<crate::column_families::StateCf>(&self.db, cf, &prefix)
+                .map(|((pk, sk), value)| (pk.partition_num, sk, value)),
+        )
     }
 
     fn jvt_version(&self) -> u64 {
@@ -63,76 +57,45 @@ impl SubstateStore for RocksDbStorage {
             return None;
         }
 
-        let versioned_cf = self.cf().versioned_substates;
-        let entity_prefix = keys::node_entity_key(node_id);
-        let entity_len = entity_prefix.len();
-        let end_prefix = keys::next_prefix(&entity_prefix)?;
+        let entity_prefix = substate_key::node_entity_key(node_id);
+        let versioned_cf = crate::column_families::VersionedSubstatesCf::handle(&self.cf());
+        let snap = self.db.snapshot();
 
         // MVCC scan: iterate versioned_substates for this entity prefix.
-        // Keys are storage_key ++ version_BE, sorted lexicographically.
-        // For each unique storage_key, take the latest version <= block_height.
-        let snap = self.db.snapshot();
-        let mut iter = snap.raw_iterator_cf(versioned_cf);
-        iter.seek(&entity_prefix);
+        // Keys are ((partition_key, sort_key), version), sorted lexicographically.
+        // For each unique (partition_key, sort_key), take the latest version <= block_height.
+        type SubstateKey = (hyperscale_storage::DbPartitionKey, DbSortKey);
 
         let mut results = Vec::new();
-        let mut current_sk: Option<Vec<u8>> = None;
+        let mut current_sk: Option<SubstateKey> = None;
         let mut current_best: Option<Vec<u8>> = None;
 
-        while iter.valid() {
-            let full_key = match iter.key() {
-                Some(k) => k,
-                None => break,
-            };
-
-            // Check we're still in the entity prefix (compare storage_key portion).
-            if full_key.len() < 8 {
-                iter.next();
-                continue;
-            }
-            let storage_key = &full_key[..full_key.len() - 8];
-            if !storage_key.starts_with(&entity_prefix) {
-                // Past the end prefix — check against the incremented prefix.
-                if storage_key >= end_prefix.as_slice() {
-                    break;
+        for ((substate_key, version), value) in crate::typed_cf::prefix_iter_snap::<
+            crate::column_families::VersionedSubstatesCf,
+        >(&snap, versioned_cf, &entity_prefix)
+        {
+            // Substate key changed — flush previous group.
+            if current_sk.as_ref() != Some(&substate_key) {
+                if let (Some((pk, sk)), Some(val)) = (current_sk.take(), current_best.take()) {
+                    results.push((pk.partition_num, sk, val));
                 }
-            }
-
-            let version = u64::from_be_bytes(full_key[full_key.len() - 8..].try_into().unwrap());
-
-            // Storage key changed — flush previous group.
-            if current_sk.as_deref() != Some(storage_key) {
-                if let (Some(ref sk), Some(val)) = (&current_sk, current_best.take()) {
-                    if sk.len() > entity_len {
-                        let partition_num = sk[entity_len];
-                        let sort_key = DbSortKey(sk[entity_len + 1..].to_vec());
-                        results.push((partition_num, sort_key, val));
-                    }
-                }
-                current_sk = Some(storage_key.to_vec());
+                current_sk = Some(substate_key);
                 current_best = None;
             }
 
             // Ascending version order: overwrite with each version <= height.
             if version <= block_height {
-                let val = iter.value().unwrap_or_default();
-                if val.is_empty() {
+                if value.is_empty() {
                     current_best = None; // tombstone
                 } else {
-                    current_best = Some(val.to_vec());
+                    current_best = Some(value);
                 }
             }
-
-            iter.next();
         }
 
         // Flush last group.
-        if let (Some(ref sk), Some(val)) = (&current_sk, current_best) {
-            if sk.len() > entity_len {
-                let partition_num = sk[entity_len];
-                let sort_key = DbSortKey(sk[entity_len + 1..].to_vec());
-                results.push((partition_num, sort_key, val.clone()));
-            }
+        if let (Some((pk, sk)), Some(val)) = (current_sk, current_best) {
+            results.push((pk.partition_num, sk, val));
         }
 
         Some(results)

@@ -12,17 +12,22 @@
 //! On each commit, the JVT is updated and a new state root hash is computed.
 
 mod blocks;
+pub(crate) mod column_families;
 mod commit;
 pub(crate) mod config;
 mod consensus;
 pub(crate) mod core;
 mod gc;
 pub(crate) mod jvt_snapshot_store;
+pub(crate) mod metadata;
 mod receipts;
 mod recovery;
 mod shared;
 pub(crate) mod snapshot;
 mod store;
+pub(crate) mod substate_key;
+pub(crate) mod typed_cf;
+pub(crate) mod versioned_key;
 mod votes;
 
 #[cfg(test)]
