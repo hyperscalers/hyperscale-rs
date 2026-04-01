@@ -2,7 +2,7 @@
 
 use crate::core::SimStorage;
 use crate::state::apply_updates_to_ordmap;
-use hyperscale_dispatch::Dispatch;
+
 use hyperscale_storage::{CommitStore, DatabaseUpdates, JvtSnapshot};
 use hyperscale_types::{Hash, TransactionCertificate};
 use im::OrdMap;
@@ -22,7 +22,7 @@ pub struct SimPreparedCommit {
     merged_updates: DatabaseUpdates,
 }
 
-impl<D: Dispatch + 'static> CommitStore for SimStorage<D> {
+impl CommitStore for SimStorage {
     type PreparedCommit = SimPreparedCommit;
 
     fn prepare_block_commit(
@@ -51,7 +51,6 @@ impl<D: Dispatch + 'static> CommitStore for SimStorage<D> {
             parent_version,
             block_height,
             merged_updates,
-            &self.dispatch,
             &Default::default(),
             None,
         );
@@ -176,7 +175,6 @@ impl<D: Dispatch + 'static> CommitStore for SimStorage<D> {
             parent_version,
             block_height,
             merged_updates,
-            &self.dispatch,
             &Default::default(),
             None,
         );

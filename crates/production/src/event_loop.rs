@@ -29,12 +29,11 @@ use tracing::{debug, info, warn};
 
 /// Concrete IoLoop type for the production runner.
 ///
-/// Storage is `SharedStorage<PooledDispatch>`, a newtype around
-/// `Arc<RocksDbStorage<PooledDispatch>>`. This allows the same underlying
-/// storage to be shared between the pinned IoLoop thread and async tasks
-/// (InboundRouter) via cheap Arc clones.
+/// Storage is `SharedStorage`, a newtype around `Arc<RocksDbStorage>`.
+/// This allows the same underlying storage to be shared between the pinned
+/// IoLoop thread and async tasks (InboundRouter) via cheap Arc clones.
 /// Certificate and transaction caches live inside IoLoop itself.
-pub type ProdIoLoop = IoLoop<SharedStorage<PooledDispatch>, Libp2pNetwork, PooledDispatch>;
+pub type ProdIoLoop = IoLoop<SharedStorage, Libp2pNetwork, PooledDispatch>;
 
 /// Configuration for the pinned event loop.
 pub struct PinnedLoopConfig {

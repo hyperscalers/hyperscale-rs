@@ -1,7 +1,7 @@
 //! `ConsensusStore` implementation for `SimStorage`.
 
 use crate::core::SimStorage;
-use hyperscale_dispatch::Dispatch;
+
 use hyperscale_storage::ConsensusStore;
 use hyperscale_types::{
     Block, BlockHeight, Hash, LedgerTransactionReceipt, LocalTransactionExecution,
@@ -10,7 +10,7 @@ use hyperscale_types::{
 use std::collections::HashMap;
 use std::sync::Arc;
 
-impl<D: Dispatch + 'static> ConsensusStore for SimStorage<D> {
+impl ConsensusStore for SimStorage {
     fn put_block(&self, height: BlockHeight, block: &Block, qc: &QuorumCertificate) {
         let mut c = self.consensus.write().unwrap();
         // Index all transactions by hash for batch lookups

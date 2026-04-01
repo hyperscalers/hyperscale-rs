@@ -70,7 +70,7 @@ use tokio::sync::oneshot;
 use tracing::{info, warn};
 
 /// Type alias for the production genesis wrapper.
-type GenesisMutWrapper<'a> = GenesisWrapper<'a, RocksDbStorage<PooledDispatch>>;
+type GenesisMutWrapper<'a> = GenesisWrapper<'a, RocksDbStorage>;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // RunnerError
@@ -139,7 +139,7 @@ pub struct ProductionRunnerBuilder {
     signing_key: Option<Bls12381G1PrivateKey>,
     bft_config: Option<BftConfig>,
     dispatch: Option<Arc<PooledDispatch>>,
-    storage: Option<Arc<RocksDbStorage<PooledDispatch>>>,
+    storage: Option<Arc<RocksDbStorage>>,
     network_config: Option<Libp2pConfig>,
     channel_capacity: usize,
     rpc_status: Option<Arc<ArcSwap<NodeStatusState>>>,
@@ -217,7 +217,7 @@ impl ProductionRunnerBuilder {
     }
 
     /// Set the RocksDB storage for persistence and crash recovery.
-    pub fn storage(mut self, storage: Arc<RocksDbStorage<PooledDispatch>>) -> Self {
+    pub fn storage(mut self, storage: Arc<RocksDbStorage>) -> Self {
         self.storage = Some(storage);
         self
     }
@@ -533,7 +533,7 @@ pub struct ProductionRunner {
     topology: SharedTopologySnapshot,
     /// RocksDB storage (for InboundRouter and genesis).
     #[allow(dead_code)]
-    storage: Arc<RocksDbStorage<PooledDispatch>>,
+    storage: Arc<RocksDbStorage>,
     /// Thread pool dispatch.
     dispatch: Arc<PooledDispatch>,
     /// Local shard for network broadcasts.

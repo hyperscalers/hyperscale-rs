@@ -3,14 +3,14 @@
 use crate::core::RocksDbStorage;
 use crate::jvt_snapshot_store::SnapshotTreeStore;
 use crate::snapshot::RocksDbSnapshot;
-use hyperscale_dispatch::Dispatch;
+
 use hyperscale_metrics as metrics;
 use hyperscale_storage::{keys, DatabaseUpdates, DbSortKey, JvtSnapshot, SubstateStore};
 use hyperscale_types::NodeId;
 use rocksdb::WriteBatch;
 use std::time::Instant;
 
-impl<D: Dispatch + 'static> SubstateStore for RocksDbStorage<D> {
+impl SubstateStore for RocksDbStorage {
     type Snapshot<'a> = RocksDbSnapshot<'a>;
 
     fn snapshot(&self) -> Self::Snapshot<'_> {
@@ -155,7 +155,7 @@ impl<D: Dispatch + 'static> SubstateStore for RocksDbStorage<D> {
     }
 }
 
-impl<D: Dispatch + 'static> RocksDbStorage<D> {
+impl RocksDbStorage {
     /// Compute speculative state root and capture a snapshot for later application.
     ///
     /// This is used for state root verification and proposal. The caller specifies
@@ -203,7 +203,6 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
             parent_version,
             block_height,
             &merged,
-            &self.dispatch,
             &Default::default(),
             Some(&self.node_cache),
         );

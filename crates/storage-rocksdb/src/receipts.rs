@@ -1,12 +1,12 @@
 //! Receipt storage for RocksDB.
 
 use crate::core::RocksDbStorage;
-use hyperscale_dispatch::Dispatch;
+
 use hyperscale_types::Hash;
 use rocksdb::WriteBatch;
 use std::sync::Arc;
 
-impl<D: Dispatch + 'static> RocksDbStorage<D> {
+impl RocksDbStorage {
     /// Store a receipt bundle (ledger receipt + optional local execution).
     pub fn store_receipt_bundle(&self, bundle: &hyperscale_types::ReceiptBundle) {
         let mut batch = WriteBatch::default();

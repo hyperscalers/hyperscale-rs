@@ -1,5 +1,5 @@
 use crate::core::SimStorage;
-use hyperscale_dispatch_sync::SyncDispatch;
+
 use hyperscale_storage::test_helpers::{
     make_database_update, make_mapped_database_update, make_test_block, make_test_certificate,
     make_test_qc,
@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 #[test]
 fn test_basic_substate_operations() {
-    let mut storage = SimStorage::new(SyncDispatch::new());
+    let mut storage = SimStorage::new();
 
     // Create a partition key and sort key
     let partition_key = DbPartitionKey {
@@ -56,7 +56,7 @@ fn test_basic_substate_operations() {
 
 #[test]
 fn test_snapshot_isolation() {
-    let mut storage = SimStorage::new(SyncDispatch::new());
+    let mut storage = SimStorage::new();
 
     let partition_key = DbPartitionKey {
         node_key: vec![1, 2, 3],
@@ -120,7 +120,7 @@ fn test_snapshot_isolation() {
 
 #[test]
 fn test_snapshot_structural_sharing_performance() {
-    let storage = SimStorage::new(SyncDispatch::new());
+    let storage = SimStorage::new();
 
     // Insert 10,000 items via substates-only (no JVT computation).
     // This test measures OrdMap snapshot performance, not tree commit speed.
@@ -174,7 +174,7 @@ fn test_snapshot_structural_sharing_performance() {
 
 #[test]
 fn test_block_storage_and_retrieval() {
-    let storage = SimStorage::new(SyncDispatch::new());
+    let storage = SimStorage::new();
     let block = make_test_block(42);
     let qc = make_test_qc(&block);
 
@@ -190,13 +190,13 @@ fn test_block_storage_and_retrieval() {
 
 #[test]
 fn test_block_get_nonexistent() {
-    let storage = SimStorage::new(SyncDispatch::new());
+    let storage = SimStorage::new();
     assert!(storage.get_block(BlockHeight(999)).is_none());
 }
 
 #[test]
 fn test_committed_state() {
-    let storage = SimStorage::new(SyncDispatch::new());
+    let storage = SimStorage::new();
     let hash = Hash::from_bytes(&[42; 32]);
     let qc = hyperscale_types::QuorumCertificate {
         block_hash: hash,
@@ -220,7 +220,7 @@ fn test_committed_state() {
 
 #[test]
 fn test_committed_height_default() {
-    let storage = SimStorage::new(SyncDispatch::new());
+    let storage = SimStorage::new();
     assert_eq!(storage.committed_height(), BlockHeight(0));
     assert!(storage.committed_hash().is_none());
     assert!(storage.latest_qc().is_none());
@@ -228,7 +228,7 @@ fn test_committed_height_default() {
 
 #[test]
 fn test_certificate_store_and_retrieve() {
-    let storage = SimStorage::new(SyncDispatch::new());
+    let storage = SimStorage::new();
     let cert = make_test_certificate(1, ShardGroupId(0));
     let tx_hash = cert.transaction_hash;
 
@@ -240,7 +240,7 @@ fn test_certificate_store_and_retrieve() {
 
 #[test]
 fn test_certificate_get_missing() {
-    let storage = SimStorage::new(SyncDispatch::new());
+    let storage = SimStorage::new();
     assert!(storage
         .get_certificate(&Hash::from_bytes(&[99; 32]))
         .is_none());
@@ -248,7 +248,7 @@ fn test_certificate_get_missing() {
 
 #[test]
 fn test_vote_persistence() {
-    let storage = SimStorage::new(SyncDispatch::new());
+    let storage = SimStorage::new();
     let block_hash = Hash::from_bytes(&[1; 32]);
 
     storage.put_own_vote(100, 5, block_hash);
@@ -259,13 +259,13 @@ fn test_vote_persistence() {
 
 #[test]
 fn test_vote_get_missing() {
-    let storage = SimStorage::new(SyncDispatch::new());
+    let storage = SimStorage::new();
     assert!(storage.get_own_vote(100).is_none());
 }
 
 #[test]
 fn test_vote_overwrite() {
-    let storage = SimStorage::new(SyncDispatch::new());
+    let storage = SimStorage::new();
     let hash_a = Hash::from_bytes(&[1; 32]);
     let hash_b = Hash::from_bytes(&[2; 32]);
 
@@ -281,7 +281,7 @@ fn test_vote_overwrite() {
 
 #[test]
 fn test_vote_pruning() {
-    let storage = SimStorage::new(SyncDispatch::new());
+    let storage = SimStorage::new();
     let hash = Hash::from_bytes(&[1; 32]);
 
     storage.put_own_vote(10, 0, hash);
@@ -297,7 +297,7 @@ fn test_vote_pruning() {
 
 #[test]
 fn test_get_all_own_votes() {
-    let storage = SimStorage::new(SyncDispatch::new());
+    let storage = SimStorage::new();
     let hash = Hash::from_bytes(&[1; 32]);
 
     storage.put_own_vote(10, 0, hash);
@@ -311,7 +311,7 @@ fn test_get_all_own_votes() {
 
 #[test]
 fn test_get_block_for_sync() {
-    let storage = SimStorage::new(SyncDispatch::new());
+    let storage = SimStorage::new();
     let block = make_test_block(5);
     let qc = make_test_qc(&block);
     storage.put_block(BlockHeight(5), &block, &qc);
@@ -325,14 +325,14 @@ fn test_get_block_for_sync() {
 
 #[test]
 fn test_transactions_batch_missing() {
-    let storage = SimStorage::new(SyncDispatch::new());
+    let storage = SimStorage::new();
     let result = storage.get_transactions_batch(&[Hash::from_bytes(&[1; 32])]);
     assert!(result.is_empty());
 }
 
 #[test]
 fn test_transactions_batch_with_indexed_block() {
-    let storage = SimStorage::new(SyncDispatch::new());
+    let storage = SimStorage::new();
     let mut block = make_test_block(1);
 
     let tx = Arc::new(hyperscale_types::test_utils::test_transaction(42));
@@ -354,7 +354,7 @@ fn test_transactions_batch_with_indexed_block() {
 
 #[test]
 fn test_certificates_batch() {
-    let storage = SimStorage::new(SyncDispatch::new());
+    let storage = SimStorage::new();
     let cert1 = make_test_certificate(1, ShardGroupId(0));
     let cert2 = make_test_certificate(2, ShardGroupId(0));
     let hash1 = cert1.transaction_hash;
@@ -369,7 +369,7 @@ fn test_certificates_batch() {
 
 #[test]
 fn test_certificates_batch_partial() {
-    let storage = SimStorage::new(SyncDispatch::new());
+    let storage = SimStorage::new();
     let cert = make_test_certificate(1, ShardGroupId(0));
     let hash = cert.transaction_hash;
     storage.store_certificate(&cert);
@@ -386,19 +386,19 @@ fn test_certificates_batch_partial() {
 
 #[test]
 fn test_initial_jvt_version_is_zero() {
-    let storage = SimStorage::new(SyncDispatch::new());
+    let storage = SimStorage::new();
     assert_eq!(storage.jvt_version(), 0);
 }
 
 #[test]
 fn test_initial_state_root_is_zero() {
-    let storage = SimStorage::new(SyncDispatch::new());
+    let storage = SimStorage::new();
     assert_eq!(storage.state_root_hash(), Hash::ZERO);
 }
 
 #[test]
 fn test_jvt_version_increments_on_commit() {
-    let storage = SimStorage::new(SyncDispatch::new());
+    let storage = SimStorage::new();
     assert_eq!(storage.jvt_version(), 0);
 
     storage.commit_shared(&make_database_update(vec![1, 2, 3], 0, vec![10], vec![1]));
@@ -410,7 +410,7 @@ fn test_jvt_version_increments_on_commit() {
 
 #[test]
 fn test_state_root_changes_on_commit() {
-    let storage = SimStorage::new(SyncDispatch::new());
+    let storage = SimStorage::new();
     let root0 = storage.state_root_hash();
 
     storage.commit_shared(&make_database_update(vec![1, 2, 3], 0, vec![10], vec![1]));
@@ -425,8 +425,8 @@ fn test_state_root_changes_on_commit() {
 #[test]
 fn test_state_root_deterministic() {
     // Two storage instances with identical commits should have identical roots
-    let s1 = SimStorage::new(SyncDispatch::new());
-    let s2 = SimStorage::new(SyncDispatch::new());
+    let s1 = SimStorage::new();
+    let s2 = SimStorage::new();
 
     let updates = make_database_update(vec![1, 2, 3], 0, vec![10], vec![42]);
     s1.commit_shared(&updates);
@@ -438,8 +438,8 @@ fn test_state_root_deterministic() {
 
 #[test]
 fn test_state_root_differs_for_different_data() {
-    let s1 = SimStorage::new(SyncDispatch::new());
-    let s2 = SimStorage::new(SyncDispatch::new());
+    let s1 = SimStorage::new();
+    let s2 = SimStorage::new();
 
     s1.commit_shared(&make_database_update(vec![1, 2, 3], 0, vec![10], vec![1]));
     s2.commit_shared(&make_database_update(vec![1, 2, 3], 0, vec![10], vec![2]));
@@ -449,7 +449,7 @@ fn test_state_root_differs_for_different_data() {
 
 #[test]
 fn test_empty_commit_still_advances_version() {
-    let storage = SimStorage::new(SyncDispatch::new());
+    let storage = SimStorage::new();
     let updates = DatabaseUpdates::default();
     storage.commit_shared(&updates);
     assert_eq!(storage.jvt_version(), 1);
@@ -461,7 +461,7 @@ fn test_empty_commit_still_advances_version() {
 
 #[test]
 fn test_commit_block_single_cert() {
-    let storage = SimStorage::new(SyncDispatch::new());
+    let storage = SimStorage::new();
     let shard = ShardGroupId(0);
     let updates = make_mapped_database_update(1, 0, vec![10], vec![42]);
     let cert = Arc::new(make_test_certificate(1, shard));
@@ -472,7 +472,7 @@ fn test_commit_block_single_cert() {
 
 #[test]
 fn test_commit_block_multiple_certs() {
-    let storage = SimStorage::new(SyncDispatch::new());
+    let storage = SimStorage::new();
     let shard = ShardGroupId(0);
     let updates1 = make_mapped_database_update(1, 0, vec![10], vec![1]);
     let updates2 = make_mapped_database_update(2, 0, vec![20], vec![2]);
@@ -487,7 +487,7 @@ fn test_commit_block_multiple_certs() {
 
 #[test]
 fn test_commit_block_empty_certs() {
-    let storage = SimStorage::new(SyncDispatch::new());
+    let storage = SimStorage::new();
     storage.commit_block(&DatabaseUpdates::default(), &[], 1, None);
     // Empty block: JVT version still advances to block_height
     assert_eq!(storage.jvt_version(), 1);
@@ -497,8 +497,8 @@ fn test_commit_block_empty_certs() {
 fn test_prepare_then_commit_fast_path() {
     // Two identical storage instances: one uses prepare+commit, other uses commit_block.
     // Both should produce the same result.
-    let s_prepared = SimStorage::new(SyncDispatch::new());
-    let s_direct = SimStorage::new(SyncDispatch::new());
+    let s_prepared = SimStorage::new();
+    let s_direct = SimStorage::new();
     let shard = ShardGroupId(0);
     let cert = Arc::new(make_test_certificate(1, shard));
 
@@ -523,7 +523,7 @@ fn test_prepare_then_commit_fast_path() {
 
 #[test]
 fn test_prepare_commit_state_root_matches() {
-    let storage = SimStorage::new(SyncDispatch::new());
+    let storage = SimStorage::new();
     let shard = ShardGroupId(0);
     let cert = Arc::new(make_test_certificate(1, shard));
 
@@ -537,7 +537,7 @@ fn test_prepare_commit_state_root_matches() {
 
 #[test]
 fn test_commit_certificate_individual() {
-    let storage = SimStorage::new(SyncDispatch::new());
+    let storage = SimStorage::new();
     let updates = make_mapped_database_update(1, 0, vec![10], vec![42]);
     let cert = make_test_certificate(1, ShardGroupId(0));
 
@@ -553,7 +553,7 @@ fn test_commit_certificate_individual() {
 
 #[test]
 fn test_commit_block_stores_certificates() {
-    let storage = SimStorage::new(SyncDispatch::new());
+    let storage = SimStorage::new();
     let shard = ShardGroupId(0);
     let cert = Arc::new(make_test_certificate(1, shard));
     let tx_hash = cert.transaction_hash;
@@ -569,7 +569,7 @@ fn test_commit_block_stores_certificates() {
 
 #[test]
 fn test_clear() {
-    let mut storage = SimStorage::new(SyncDispatch::new());
+    let mut storage = SimStorage::new();
 
     // Add some data
     storage.commit_shared(&make_database_update(vec![1, 2, 3], 0, vec![10], vec![1]));
@@ -588,7 +588,7 @@ fn test_clear() {
 
 #[test]
 fn test_len_and_is_empty() {
-    let storage = SimStorage::new(SyncDispatch::new());
+    let storage = SimStorage::new();
     assert!(storage.is_empty());
     assert_eq!(storage.len(), 0);
 
@@ -602,7 +602,7 @@ fn test_len_and_is_empty() {
 
 #[test]
 fn test_list_substates_for_node() {
-    let storage = SimStorage::new(SyncDispatch::new());
+    let storage = SimStorage::new();
     let node_id = NodeId([1; 30]);
 
     // Commit two substates for the same node
@@ -631,7 +631,7 @@ fn test_list_substates_for_node() {
 
 #[test]
 fn test_list_substates_for_node_at_height_returns_historical_data() {
-    let storage = SimStorage::new(SyncDispatch::new());
+    let storage = SimStorage::new();
     let node_id = NodeId([1; 30]);
     let shard = ShardGroupId(0);
 
@@ -683,24 +683,24 @@ fn test_list_substates_for_node_at_height_returns_historical_data() {
 
 #[test]
 fn test_receipt_storage_roundtrip() {
-    let storage = SimStorage::new(SyncDispatch::new());
+    let storage = SimStorage::new();
     hyperscale_storage::test_helpers::test_receipt_storage_roundtrip(&storage);
 }
 
 #[test]
 fn test_receipt_storage_synced() {
-    let storage = SimStorage::new(SyncDispatch::new());
+    let storage = SimStorage::new();
     hyperscale_storage::test_helpers::test_receipt_storage_synced(&storage);
 }
 
 #[test]
 fn test_receipt_batch_storage() {
-    let storage = SimStorage::new(SyncDispatch::new());
+    let storage = SimStorage::new();
     hyperscale_storage::test_helpers::test_receipt_batch_storage(&storage);
 }
 
 #[test]
 fn test_receipt_idempotent_overwrite() {
-    let storage = SimStorage::new(SyncDispatch::new());
+    let storage = SimStorage::new();
     hyperscale_storage::test_helpers::test_receipt_idempotent_overwrite(&storage);
 }

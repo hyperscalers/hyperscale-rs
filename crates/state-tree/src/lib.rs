@@ -18,7 +18,6 @@ pub mod tree_store;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use hyperscale_dispatch::Dispatch;
 use hyperscale_types::Hash;
 use jellyfish_verkle_tree as jvt;
 
@@ -267,12 +266,11 @@ impl jvt::TreeReader for CachingAdapter {
 /// before the reset. These are needed to generate JVT deletes because hashed keys
 /// prevent tree-based enumeration. The caller obtains these from the data store
 /// (OrdMap prefix scan or RocksDB range scan) before calling this function.
-pub fn put_at_version<S: ReadableTreeStore + Sync, D: Dispatch>(
+pub fn put_at_version<S: ReadableTreeStore + Sync>(
     tree_store: &S,
     parent_version: Option<Version>,
     new_version: Version,
     database_updates: &radix_substate_store_interface::interface::DatabaseUpdates,
-    _dispatch: &D,
     reset_old_keys: &HashMap<(Vec<u8>, u8), Vec<Vec<u8>>>,
     node_cache: Option<&NodeCache>,
 ) -> (Hash, CollectedWrites) {
@@ -389,12 +387,11 @@ pub fn put_at_version<S: ReadableTreeStore + Sync, D: Dispatch>(
 
 /// Compute and immediately apply state tree updates.
 /// Convenience for tests and direct commits.
-pub fn put_at_version_and_apply<S: ReadableTreeStore + WriteableTreeStore + Sync, D: Dispatch>(
+pub fn put_at_version_and_apply<S: ReadableTreeStore + WriteableTreeStore + Sync>(
     tree_store: &S,
     parent_version: Option<Version>,
     new_version: Version,
     database_updates: &radix_substate_store_interface::interface::DatabaseUpdates,
-    dispatch: &D,
     reset_old_keys: &HashMap<(Vec<u8>, u8), Vec<Vec<u8>>>,
     node_cache: Option<&NodeCache>,
 ) -> Hash {
@@ -403,7 +400,6 @@ pub fn put_at_version_and_apply<S: ReadableTreeStore + WriteableTreeStore + Sync
         parent_version,
         new_version,
         database_updates,
-        dispatch,
         reset_old_keys,
         node_cache,
     );

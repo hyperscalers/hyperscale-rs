@@ -1,13 +1,13 @@
 //! JVT garbage collection for RocksDB storage.
 
 use crate::core::RocksDbStorage;
-use hyperscale_dispatch::Dispatch;
+
 use hyperscale_storage::jmt::{
     encode_key as encode_jvt_key, StaleTreePart, StoredNode, StoredNodeKey, VersionedStoredNode,
 };
 use rocksdb::{ColumnFamily, WriteBatch};
 
-impl<D: Dispatch + 'static> RocksDbStorage<D> {
+impl RocksDbStorage {
     /// Run garbage collection for stale JVT nodes.
     ///
     /// This deletes JVT nodes (and their associations) that became stale at heights

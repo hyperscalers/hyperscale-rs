@@ -1,13 +1,13 @@
 //! `ConsensusStore` implementation for `RocksDbStorage`.
 
 use crate::core::RocksDbStorage;
-use hyperscale_dispatch::Dispatch;
+
 use hyperscale_types::{
     Block, BlockHeight, Hash, QuorumCertificate, RoutableTransaction, TransactionCertificate,
 };
 use std::sync::Arc;
 
-impl<D: Dispatch + 'static> hyperscale_storage::ConsensusStore for RocksDbStorage<D> {
+impl hyperscale_storage::ConsensusStore for RocksDbStorage {
     fn put_block(&self, height: BlockHeight, block: &Block, qc: &QuorumCertificate) {
         debug_assert_eq!(
             height, block.header.height,

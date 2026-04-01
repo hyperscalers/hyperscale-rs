@@ -1,7 +1,7 @@
 //! Denormalized block storage, transaction/certificate CRUD, and chain metadata.
 
 use crate::core::RocksDbStorage;
-use hyperscale_dispatch::Dispatch;
+
 use hyperscale_metrics as metrics;
 use hyperscale_types::{
     Block, BlockHeight, BlockMetadata, Hash, QuorumCertificate, RoutableTransaction,
@@ -13,7 +13,7 @@ use std::time::Instant;
 #[cfg(test)]
 use tracing::{instrument, Level};
 
-impl<D: Dispatch + 'static> RocksDbStorage<D> {
+impl RocksDbStorage {
     /// Get a range of committed blocks [from, to).
     ///
     /// Returns blocks in ascending height order. Uses `get_block_denormalized`

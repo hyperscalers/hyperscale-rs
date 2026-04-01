@@ -6,7 +6,6 @@ description = "Verkle-based state tree with 3-tier entity/partition/substate str
 
 [dependencies]
 hyperscale-types.workspace = true
-hyperscale-dispatch.workspace = true
 jellyfish-verkle-tree.workspace = true
 ark-ec.workspace = true
 ark-ed-on-bls12-381-bandersnatch.workspace = true
@@ -18,7 +17,3 @@ radix-substate-store-interface.workspace = true
 indexmap.workspace = true
 itertools.workspace = true
 quick_cache.workspace = true
-
-[dev-dependencies]
-hyperscale-dispatch-sync.workspace = true
-hyperscale-dispatch-pooled.workspace = true

@@ -1,10 +1,10 @@
 //! Crash recovery for RocksDB storage.
 
 use crate::core::RocksDbStorage;
-use hyperscale_dispatch::Dispatch;
+
 use hyperscale_metrics as metrics;
 
-impl<D: Dispatch + 'static> RocksDbStorage<D> {
+impl RocksDbStorage {
     /// Load recovered state from storage for crash recovery.
     ///
     /// This should be called on startup before creating the state machine.

@@ -2,11 +2,11 @@
 
 use crate::core::SimStorage;
 use crate::snapshot::SimSnapshot;
-use hyperscale_dispatch::Dispatch;
+
 use hyperscale_storage::{keys, DbSortKey, SubstateStore};
 use hyperscale_types::{Hash, NodeId};
 
-impl<D: Dispatch + 'static> SubstateStore for SimStorage<D> {
+impl SubstateStore for SimStorage {
     type Snapshot<'a> = SimSnapshot;
 
     fn snapshot(&self) -> Self::Snapshot<'_> {

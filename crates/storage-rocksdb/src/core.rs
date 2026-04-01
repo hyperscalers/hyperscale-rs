@@ -16,7 +16,7 @@ use crate::config::{
     STATE_CF, VERSIONED_SUBSTATES_CF,
 };
 use crate::jvt_snapshot_store::SnapshotTreeStore;
-use hyperscale_dispatch::Dispatch;
+
 use hyperscale_metrics as metrics;
 use hyperscale_storage::{
     jmt::{
@@ -66,7 +66,7 @@ pub(crate) fn decode_jvt_metadata(raw: Option<impl AsRef<[u8]>>) -> (u64, StateR
 /// (version and root hash) is in the default CF under well-known keys and read
 /// directly from RocksDB on demand — always hot in the memtable since they're
 /// written on every commit.
-pub struct RocksDbStorage<D: Dispatch + 'static> {
+pub struct RocksDbStorage {
     pub(crate) db: Arc<DB>,
 
     /// Serializes JVT-mutating commits to prevent interleaved read-modify-write
@@ -75,9 +75,6 @@ pub struct RocksDbStorage<D: Dispatch + 'static> {
 
     /// Number of block heights of JVT history to retain before garbage collection.
     pub(crate) jvt_history_length: u64,
-
-    /// Dispatch implementation for parallel JVT computation.
-    pub(crate) dispatch: D,
 
     /// Persistent cache of hydrated JVT tree nodes. Eliminates the expensive
     /// `StoredNode::to_jvt()` conversion on repeated proof generations.
@@ -94,20 +91,19 @@ pub enum StorageError {
     DatabaseError(String),
 }
 
-impl<D: Dispatch + 'static> RocksDbStorage<D> {
+impl RocksDbStorage {
     /// Open or create a RocksDB database at the given path.
     ///
     /// Creates default column families: default, blocks, transactions, state, certificates.
-    pub fn open<P: AsRef<Path>>(path: P, dispatch: D) -> Result<Self, StorageError> {
+    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, StorageError> {
         let config = RocksDbConfig::default();
-        Self::open_with_config(path, config, dispatch)
+        Self::open_with_config(path, config)
     }
 
     /// Open with custom configuration.
     pub fn open_with_config<P: AsRef<Path>>(
         path: P,
         config: RocksDbConfig,
-        dispatch: D,
     ) -> Result<Self, StorageError> {
         let mut opts = Options::default();
         opts.create_if_missing(true);
@@ -210,7 +206,6 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
             commit_lock: Mutex::new(()),
             jvt_history_length: config.jvt_history_length,
             node_cache: hyperscale_storage::jmt::NodeCache::new(50_000),
-            dispatch,
         })
     }
 
@@ -495,7 +490,6 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
             None,
             0,
             merged,
-            &self.dispatch,
             &Default::default(),
             Some(&self.node_cache),
         );
@@ -513,14 +507,14 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
     }
 }
 
-impl<D: Dispatch + 'static> hyperscale_storage::SubstatesOnlyCommit for RocksDbStorage<D> {
+impl hyperscale_storage::SubstatesOnlyCommit for RocksDbStorage {
     fn commit_substates_only(&self, updates: &DatabaseUpdates) {
         // Delegate to the inherent method.
         RocksDbStorage::commit_substates_only(self, updates);
     }
 }
 
-impl<D: Dispatch + 'static> SubstateDatabase for RocksDbStorage<D> {
+impl SubstateDatabase for RocksDbStorage {
     #[instrument(level = Level::DEBUG, skip_all, fields(
         found = tracing::field::Empty,
         latency_us = tracing::field::Empty,
@@ -578,7 +572,7 @@ impl<D: Dispatch + 'static> SubstateDatabase for RocksDbStorage<D> {
     }
 }
 
-impl<D: Dispatch + 'static> ReadableTreeStore for RocksDbStorage<D> {
+impl ReadableTreeStore for RocksDbStorage {
     fn get_node(&self, key: &StoredNodeKey) -> Option<StoredNode> {
         let encoded_key = encode_jvt_key(key);
         self.db
@@ -595,7 +589,7 @@ impl<D: Dispatch + 'static> ReadableTreeStore for RocksDbStorage<D> {
 /// Test-only methods with auto-incrementing JVT version logic.
 /// Production uses `commit_block` / `commit_prepared_block` instead.
 #[cfg(test)]
-impl<D: Dispatch + 'static> RocksDbStorage<D> {
+impl RocksDbStorage {
     /// Test helper: commits database updates with auto-incrementing JVT version.
     /// Not used in production (use commit_block instead).
     #[instrument(level = Level::DEBUG, skip_all, fields(
@@ -624,7 +618,6 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
             parent_version,
             new_version,
             updates,
-            &self.dispatch,
             &reset_old_keys,
             Some(&self.node_cache),
         );
@@ -655,7 +648,7 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
 }
 
 #[cfg(test)]
-impl<D: Dispatch + 'static> hyperscale_storage::CommittableSubstateDatabase for RocksDbStorage<D> {
+impl hyperscale_storage::CommittableSubstateDatabase for RocksDbStorage {
     fn commit(&mut self, updates: &DatabaseUpdates) {
         RocksDbStorage::commit(self, updates)
             .expect("Storage commit failed - cannot maintain consistent state")

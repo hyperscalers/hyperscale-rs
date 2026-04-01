@@ -33,10 +33,10 @@ use std::time::Duration;
 use tracing::{debug, info, trace, warn};
 
 /// Type alias for the simulation's concrete IoLoop.
-type SimIoLoop = IoLoop<SimStorage<SyncDispatch>, SimNetworkAdapter, SyncDispatch>;
+type SimIoLoop = IoLoop<SimStorage, SimNetworkAdapter, SyncDispatch>;
 
 /// Type alias for the simulation's genesis wrapper.
-type SimGenesisWrapper<'a> = GenesisWrapper<'a, SimStorage<SyncDispatch>>;
+type SimGenesisWrapper<'a> = GenesisWrapper<'a, SimStorage>;
 
 /// Deterministic simulation runner.
 ///
@@ -221,7 +221,7 @@ impl SimulationRunner {
 
                 let io_loop = IoLoop::new(
                     state,
-                    SimStorage::new(SyncDispatch),
+                    SimStorage::new(),
                     RadixExecutor::new(network_def),
                     network.create_adapter(node_index),
                     SyncDispatch,
@@ -296,7 +296,7 @@ impl SimulationRunner {
     // ═══════════════════════════════════════════════════════════════════════
 
     /// Get a reference to a node's storage.
-    pub fn node_storage(&self, node: NodeIndex) -> Option<&SimStorage<SyncDispatch>> {
+    pub fn node_storage(&self, node: NodeIndex) -> Option<&SimStorage> {
         self.io_loops.get(node as usize).map(|nl| nl.storage())
     }
 

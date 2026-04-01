@@ -1,12 +1,12 @@
 //! Vote storage (BFT Safety Critical).
 
 use crate::core::RocksDbStorage;
-use hyperscale_dispatch::Dispatch;
+
 use hyperscale_metrics as metrics;
 use hyperscale_types::Hash;
 use tracing::{instrument, Level};
 
-impl<D: Dispatch + 'static> RocksDbStorage<D> {
+impl RocksDbStorage {
     /// Store our own vote for a height.
     ///
     /// **BFT Safety Critical**: This MUST be called before broadcasting the vote.

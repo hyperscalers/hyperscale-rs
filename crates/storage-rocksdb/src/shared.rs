@@ -11,7 +11,7 @@
 use crate::commit::RocksDbPreparedCommit;
 use crate::core::RocksDbStorage;
 use crate::snapshot::RocksDbSnapshot;
-use hyperscale_dispatch::Dispatch;
+
 use hyperscale_storage::{
     DatabaseUpdates, DbPartitionKey, DbSortKey, DbSubstateValue, PartitionEntry, SubstateDatabase,
     SubstateStore,
@@ -34,28 +34,28 @@ use std::sync::Arc;
 /// `CommittableSubstateDatabase`) for `Arc<RocksDbStorage>`. This local newtype
 /// can implement all traits while `Arc::clone` keeps sharing cheap.
 #[derive(Clone)]
-pub struct SharedStorage<D: Dispatch + 'static>(pub Arc<RocksDbStorage<D>>);
+pub struct SharedStorage(pub Arc<RocksDbStorage>);
 
-impl<D: Dispatch + 'static> SharedStorage<D> {
+impl SharedStorage {
     /// Create a new shared storage handle.
-    pub fn new(storage: Arc<RocksDbStorage<D>>) -> Self {
+    pub fn new(storage: Arc<RocksDbStorage>) -> Self {
         Self(storage)
     }
 
-    /// Get a reference to the underlying `Arc<RocksDbStorage<D>>`.
-    pub fn arc(&self) -> &Arc<RocksDbStorage<D>> {
+    /// Get a reference to the underlying `Arc<RocksDbStorage>`.
+    pub fn arc(&self) -> &Arc<RocksDbStorage> {
         &self.0
     }
 }
 
-impl<D: Dispatch + 'static> std::ops::Deref for SharedStorage<D> {
-    type Target = RocksDbStorage<D>;
-    fn deref(&self) -> &RocksDbStorage<D> {
+impl std::ops::Deref for SharedStorage {
+    type Target = RocksDbStorage;
+    fn deref(&self) -> &RocksDbStorage {
         &self.0
     }
 }
 
-impl<D: Dispatch + 'static> SubstateDatabase for SharedStorage<D> {
+impl SubstateDatabase for SharedStorage {
     fn get_raw_substate_by_db_key(
         &self,
         partition_key: &DbPartitionKey,
@@ -75,14 +75,14 @@ impl<D: Dispatch + 'static> SubstateDatabase for SharedStorage<D> {
 }
 
 #[cfg(test)]
-impl<D: Dispatch + 'static> hyperscale_storage::CommittableSubstateDatabase for SharedStorage<D> {
+impl hyperscale_storage::CommittableSubstateDatabase for SharedStorage {
     fn commit(&mut self, updates: &DatabaseUpdates) {
         RocksDbStorage::commit(&self.0, updates)
             .expect("Storage commit failed - cannot maintain consistent state");
     }
 }
 
-impl<D: Dispatch + 'static> SubstateStore for SharedStorage<D> {
+impl SubstateStore for SharedStorage {
     type Snapshot<'a>
         = RocksDbSnapshot<'a>
     where
@@ -125,7 +125,7 @@ impl<D: Dispatch + 'static> SubstateStore for SharedStorage<D> {
     }
 }
 
-impl<D: Dispatch + 'static> hyperscale_storage::CommitStore for SharedStorage<D> {
+impl hyperscale_storage::CommitStore for SharedStorage {
     type PreparedCommit = RocksDbPreparedCommit;
 
     fn prepare_block_commit(
@@ -168,7 +168,7 @@ impl<D: Dispatch + 'static> hyperscale_storage::CommitStore for SharedStorage<D>
     }
 }
 
-impl<D: Dispatch + 'static> hyperscale_storage::ConsensusStore for SharedStorage<D> {
+impl hyperscale_storage::ConsensusStore for SharedStorage {
     fn put_block(&self, height: BlockHeight, block: &Block, qc: &QuorumCertificate) {
         self.0.put_block(height, block, qc)
     }

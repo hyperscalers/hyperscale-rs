@@ -4,7 +4,7 @@
 //! Uses `im::OrdMap` for O(1) structural-sharing clones.
 
 use crate::state::{apply_updates_to_ordmap, ConsensusState, SharedState};
-use hyperscale_dispatch::Dispatch;
+
 use hyperscale_storage::{
     keys, DatabaseUpdates, DbPartitionKey, DbSortKey, DbSubstateValue, PartitionEntry,
     SubstateDatabase,
@@ -35,23 +35,25 @@ use std::sync::{Arc, RwLock};
 ///   Write lock for commits (substate writes + JVT updates in one acquisition).
 /// - `consensus`: Block metadata, certificates, votes, committed state.
 ///   Separate because consensus metadata is independent of substate/JVT state.
-pub struct SimStorage<D: Dispatch + 'static> {
+pub struct SimStorage {
     /// Substate data + JVT state (single RwLock).
     pub(crate) state: Arc<RwLock<SharedState>>,
-
-    /// Dispatch implementation for parallel JVT computation.
-    pub(crate) dispatch: D,
 
     /// Consensus metadata (single RwLock).
     pub(crate) consensus: RwLock<ConsensusState>,
 }
 
-impl<D: Dispatch + 'static> SimStorage<D> {
-    /// Create a new empty simulated storage with the given dispatch implementation.
-    pub fn new(dispatch: D) -> Self {
+impl Default for SimStorage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SimStorage {
+    /// Create a new empty simulated storage.
+    pub fn new() -> Self {
         Self {
             state: Arc::new(RwLock::new(SharedState::new())),
-            dispatch,
             consensus: RwLock::new(ConsensusState::new()),
         }
     }
@@ -144,7 +146,6 @@ impl<D: Dispatch + 'static> SimStorage<D> {
             parent_version,
             new_version,
             updates,
-            &self.dispatch,
             &Default::default(),
             None,
         );
@@ -195,7 +196,6 @@ impl<D: Dispatch + 'static> SimStorage<D> {
             None,
             0,
             merged,
-            &self.dispatch,
             &Default::default(),
             None,
         );
@@ -209,13 +209,13 @@ impl<D: Dispatch + 'static> SimStorage<D> {
     }
 }
 
-impl<D: Dispatch + 'static> hyperscale_storage::SubstatesOnlyCommit for SimStorage<D> {
+impl hyperscale_storage::SubstatesOnlyCommit for SimStorage {
     fn commit_substates_only(&self, updates: &DatabaseUpdates) {
         SimStorage::commit_substates_only(self, updates);
     }
 }
 
-impl<D: Dispatch + 'static> SubstateDatabase for SimStorage<D> {
+impl SubstateDatabase for SimStorage {
     fn get_raw_substate_by_db_key(
         &self,
         partition_key: &DbPartitionKey,
@@ -258,7 +258,7 @@ impl<D: Dispatch + 'static> SubstateDatabase for SimStorage<D> {
 }
 
 #[cfg(test)]
-impl<D: Dispatch + 'static> hyperscale_storage::CommittableSubstateDatabase for SimStorage<D> {
+impl hyperscale_storage::CommittableSubstateDatabase for SimStorage {
     fn commit(&mut self, updates: &DatabaseUpdates) {
         self.commit_shared(updates);
     }

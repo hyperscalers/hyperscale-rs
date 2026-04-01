@@ -3,7 +3,7 @@
 use crate::config::ALL_COLUMN_FAMILIES;
 use crate::core::RocksDbStorage;
 use crate::jvt_snapshot_store::SnapshotTreeStore;
-use hyperscale_dispatch::Dispatch;
+
 use hyperscale_storage::{DatabaseUpdates, JvtSnapshot};
 use hyperscale_types::TransactionCertificate;
 use rocksdb::WriteBatch;
@@ -25,7 +25,7 @@ pub struct RocksDbPreparedCommit {
     pub(crate) merged_updates: DatabaseUpdates,
 }
 
-impl<D: Dispatch + 'static> hyperscale_storage::CommitStore for RocksDbStorage<D> {
+impl hyperscale_storage::CommitStore for RocksDbStorage {
     type PreparedCommit = RocksDbPreparedCommit;
 
     fn prepare_block_commit(
@@ -131,7 +131,6 @@ impl<D: Dispatch + 'static> hyperscale_storage::CommitStore for RocksDbStorage<D
             parent_version,
             block_height,
             merged_updates,
-            &self.dispatch,
             &reset_old_keys,
             Some(&self.node_cache),
         );

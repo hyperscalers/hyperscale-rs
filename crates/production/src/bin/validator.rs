@@ -1286,7 +1286,7 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
 
     // Open storage
     let db_path = config.node.data_dir.join("db");
-    let storage = RocksDbStorage::open_with_config(&db_path, rocksdb_config, (*dispatch).clone())
+    let storage = RocksDbStorage::open_with_config(&db_path, rocksdb_config)
         .with_context(|| format!("Failed to open database at {}", db_path.display()))?;
     let storage = Arc::new(storage);
     info!("Storage opened at {}", db_path.display());
