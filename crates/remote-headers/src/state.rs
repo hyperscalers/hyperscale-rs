@@ -46,6 +46,10 @@ struct ExpectedHeader {
     last_verified_height: BlockHeight,
     /// Whether we've already emitted a fallback request for the current gap.
     requested: bool,
+    /// Local committed height when we last emitted a fallback request.
+    /// Used as a cooldown to prevent re-requesting every block when the
+    /// gap remains open after a fetch completes or is dropped.
+    requested_at: BlockHeight,
 }
 
 /// Centralized remote block header coordination.
@@ -256,14 +260,18 @@ impl RemoteHeaderCoordinator {
         self.verified.insert(key, Arc::clone(&header));
         self.pending.remove(&key);
 
-        // Update liveness baseline and reset the request flag so future
-        // gaps can trigger new fallback requests. Without this reset,
-        // a shard that experienced one timeout would never be requested
-        // again — even if headers stop arriving after a later gap.
+        // Update liveness baseline. Only reset the request flag if we've
+        // caught up close enough that the timeout won't immediately re-fire.
+        // This prevents a verify → reset → timeout → request flood when the
+        // gap remains open (e.g. headers arrive sporadically but we're still
+        // far behind the local committed height).
         if let Some(expected) = self.expected.get_mut(&shard) {
             if height > expected.last_verified_height {
                 expected.last_verified_height = height;
-                expected.requested = false;
+                let gap = self.local_committed_height.0.saturating_sub(height.0);
+                if gap < HEADER_LIVENESS_TIMEOUT_BLOCKS {
+                    expected.requested = false;
+                }
             }
         }
 
@@ -299,6 +307,7 @@ impl RemoteHeaderCoordinator {
                     discovered_at: self.local_committed_height,
                     last_verified_height: BlockHeight(0),
                     requested: false,
+                    requested_at: BlockHeight(0),
                 });
         }
 
@@ -307,10 +316,6 @@ impl RemoteHeaderCoordinator {
         let current_height = self.local_committed_height.0;
 
         for (&shard, expected) in self.expected.iter_mut() {
-            if expected.requested {
-                continue;
-            }
-
             // If we've verified at least one header, measure from that.
             // Otherwise measure from when we first discovered the shard.
             let baseline = if expected.last_verified_height.0 > 0 {
@@ -322,6 +327,18 @@ impl RemoteHeaderCoordinator {
             let age = current_height.saturating_sub(baseline);
             if age < HEADER_LIVENESS_TIMEOUT_BLOCKS {
                 continue;
+            }
+
+            // If we already have a request in flight, only re-request after
+            // a full cooldown period. This prevents flooding when the gap
+            // remains open (e.g. fetch failed or returned a partial result
+            // that didn't close the gap).
+            if expected.requested {
+                let since_request = current_height.saturating_sub(expected.requested_at.0);
+                if since_request < HEADER_LIVENESS_TIMEOUT_BLOCKS {
+                    continue;
+                }
+                // Cooldown expired — allow a fresh request below.
             }
 
             // Request missing header from any validator in the source shard.
@@ -339,6 +356,7 @@ impl RemoteHeaderCoordinator {
             );
 
             expected.requested = true;
+            expected.requested_at = BlockHeight(current_height);
             actions.push(Action::RequestMissingCommittedBlockHeader {
                 source_shard: shard,
                 from_height,
