@@ -86,7 +86,7 @@ impl Default for BftConfig {
             transaction_fetch_timeout: Duration::from_millis(150),
             certificate_fetch_timeout: Duration::from_millis(500),
             cleanup_interval: Duration::from_secs(1),
-            min_block_interval: Duration::from_millis(800),
+            min_block_interval: Duration::from_millis(500),
         }
     }
 }

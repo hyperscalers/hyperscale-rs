@@ -7121,7 +7121,7 @@ mod tests {
         state.set_time(Duration::from_millis(1000));
         state.last_qc_time = Some(Duration::from_millis(950)); // 50ms ago
 
-        // min_block_interval is 800ms by default, so we're within the rate limit window
+        // min_block_interval is 500ms by default, so we're within the rate limit window
 
         // Create a QC at height 3 (so next height would be 4, which validator 0 proposes)
         let qc = QuorumCertificate {
@@ -7176,7 +7176,7 @@ mod tests {
         state.set_time(Duration::from_millis(1000));
         state.last_qc_time = Some(Duration::from_millis(100)); // 900ms ago
 
-        // min_block_interval is 800ms by default, so 900ms > 800ms - should be allowed
+        // min_block_interval is 500ms by default, so 900ms > 500ms - should be allowed
 
         // Create a QC at height 3 (so next height would be 4, which validator 0 proposes)
         let qc = QuorumCertificate {

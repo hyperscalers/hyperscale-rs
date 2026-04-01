@@ -1,6 +1,6 @@
 //! Mempool state.
 
-use hyperscale_core::{Action, TransactionStatus};
+use hyperscale_core::{Action, FinalizationPhaseTimes, TransactionStatus};
 use hyperscale_types::{
     AbortReason, Block, BlockHeight, Hash, NodeId, ReadyTransactions, RoutableTransaction,
     TopologySnapshot, TransactionAbort, TransactionDecision,
@@ -136,6 +136,10 @@ struct PoolEntry {
     /// Whether this transaction was submitted locally (via RPC) vs received via gossip/fetch.
     /// Only locally-submitted transactions should contribute to latency metrics.
     submitted_locally: bool,
+    /// Timestamp when the block containing this tx was committed.
+    committed_at_time: Option<Duration>,
+    /// Timestamp when the transaction certificate was created (execution + votes complete).
+    executed_at_time: Option<Duration>,
 }
 
 /// Entry in the ready set.
@@ -295,6 +299,7 @@ impl MempoolState {
                 added_at: entry.added_at,
                 cross_shard: entry.cross_shard,
                 submitted_locally: entry.submitted_locally,
+                phase_times: None,
             }];
         }
 
@@ -313,6 +318,8 @@ impl MempoolState {
                 added_at: self.now,
                 cross_shard,
                 submitted_locally: true, // Submitted via RPC
+                committed_at_time: None,
+                executed_at_time: None,
             },
         );
 
@@ -329,6 +336,7 @@ impl MempoolState {
             added_at: self.now,
             cross_shard,
             submitted_locally: true,
+            phase_times: None,
         }]
     }
 
@@ -361,6 +369,8 @@ impl MempoolState {
                 added_at: self.now,
                 cross_shard,
                 submitted_locally,
+                committed_at_time: None,
+                executed_at_time: None,
             },
         );
 
@@ -481,6 +491,8 @@ impl MempoolState {
                         added_at: self.now,
                         cross_shard,
                         submitted_locally: false, // Fetched for block processing
+                        committed_at_time: None,
+                        executed_at_time: None,
                     },
                 );
                 tracing::debug!(
@@ -503,6 +515,7 @@ impl MempoolState {
                     let cross_shard = entry.cross_shard;
                     let submitted_locally = entry.submitted_locally;
                     entry.status = TransactionStatus::Committed(height);
+                    entry.committed_at_time = Some(self.now);
                     // Remove from ready tracking (no longer Pending)
                     self.remove_from_ready_tracking(&hash);
                     // Add locks for committed transactions and update counter
@@ -518,6 +531,7 @@ impl MempoolState {
                         added_at,
                         cross_shard,
                         submitted_locally,
+                        phase_times: None,
                     });
                 }
             }
@@ -556,6 +570,12 @@ impl MempoolState {
             let added_at = entry.added_at;
             let cross_shard = entry.cross_shard;
             let submitted_locally = entry.submitted_locally;
+            let phase_times = Some(FinalizationPhaseTimes {
+                added_at: entry.added_at,
+                committed_at: entry.committed_at_time,
+                executed_at: entry.executed_at_time,
+                completed_at: self.now,
+            });
 
             let status = match decision {
                 TransactionDecision::Accept | TransactionDecision::Reject => {
@@ -572,6 +592,7 @@ impl MempoolState {
                 added_at,
                 cross_shard,
                 submitted_locally,
+                phase_times,
             });
 
             // Release locks and evict — same for all terminal states
@@ -650,6 +671,7 @@ impl MempoolState {
                 decision,
                 committed_at,
             };
+            entry.executed_at_time = Some(self.now);
             actions.push(Action::EmitTransactionStatus {
                 tx_hash,
                 status: TransactionStatus::Executed {
@@ -659,6 +681,7 @@ impl MempoolState {
                 added_at,
                 cross_shard,
                 submitted_locally,
+                phase_times: None,
             });
         }
 
@@ -673,6 +696,12 @@ impl MempoolState {
             let added_at = entry.added_at;
             let cross_shard = entry.cross_shard;
             let submitted_locally = entry.submitted_locally;
+            let phase_times = Some(FinalizationPhaseTimes {
+                added_at: entry.added_at,
+                committed_at: entry.committed_at_time,
+                executed_at: entry.executed_at_time,
+                completed_at: self.now,
+            });
             // Evict from pool and tombstone - terminal state
             self.evict_terminal(*tx_hash);
             return vec![Action::EmitTransactionStatus {
@@ -681,6 +710,7 @@ impl MempoolState {
                 added_at,
                 cross_shard,
                 submitted_locally,
+                phase_times,
             }];
         }
         vec![]
@@ -765,6 +795,16 @@ impl MempoolState {
                 let entry = self.pool.get_mut(tx_hash).unwrap();
                 let added_at = entry.added_at;
                 let submitted_locally = entry.submitted_locally;
+                let phase_times = if new_status.is_final() {
+                    Some(FinalizationPhaseTimes {
+                        added_at: entry.added_at,
+                        committed_at: entry.committed_at_time,
+                        executed_at: entry.executed_at_time,
+                        completed_at: self.now,
+                    })
+                } else {
+                    None
+                };
                 entry.status = new_status.clone();
                 return vec![Action::EmitTransactionStatus {
                     tx_hash: *tx_hash,
@@ -772,6 +812,7 @@ impl MempoolState {
                     added_at,
                     cross_shard,
                     submitted_locally,
+                    phase_times,
                 }];
             }
 

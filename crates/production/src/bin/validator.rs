@@ -32,7 +32,7 @@
 //!
 //! [consensus]
 //! proposal_interval_ms = 1000
-//! min_block_interval_ms = 800
+//! min_block_interval_ms = 500
 //! view_change_timeout_ms = 5000
 //!
 //! [threads]
@@ -337,7 +337,7 @@ fn default_view_change_cooldown_rounds() -> u64 {
 }
 
 fn default_min_block_interval_ms() -> u64 {
-    800
+    500
 }
 
 /// Thread pool configuration.

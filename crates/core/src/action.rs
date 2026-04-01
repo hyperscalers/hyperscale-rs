@@ -10,8 +10,61 @@ use hyperscale_types::{
     TxOutcome, ValidatorId, VotePower, WaveId,
 };
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
+
+/// Phase timing breakdown for transaction finalization.
+///
+/// Tracks wall-clock timestamps (as `Duration` since process start) at each
+/// phase transition, enabling diagnosis of slow finalization.
+#[derive(Debug, Clone)]
+pub struct FinalizationPhaseTimes {
+    /// When the transaction was first added to the mempool.
+    pub added_at: Duration,
+    /// When the block containing the transaction was committed.
+    pub committed_at: Option<Duration>,
+    /// When the transaction certificate was created (execution + vote collection complete).
+    pub executed_at: Option<Duration>,
+    /// When the transaction reached terminal state (TC committed in block).
+    pub completed_at: Duration,
+}
+
+impl fmt::Display for FinalizationPhaseTimes {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let total = self
+            .completed_at
+            .saturating_sub(self.added_at)
+            .as_secs_f64();
+        let mempool_to_commit = self
+            .committed_at
+            .map(|c| c.saturating_sub(self.added_at).as_secs_f64());
+        let commit_to_exec = match (self.committed_at, self.executed_at) {
+            (Some(c), Some(e)) => Some(e.saturating_sub(c).as_secs_f64()),
+            _ => None,
+        };
+        let exec_to_complete = self
+            .executed_at
+            .map(|e| self.completed_at.saturating_sub(e).as_secs_f64());
+
+        write!(f, "total={total:.3}s")?;
+        if let Some(v) = mempool_to_commit {
+            write!(f, " mempool={v:.3}s")?;
+        }
+        if let Some(v) = commit_to_exec {
+            write!(f, " execution={v:.3}s")?;
+        }
+        if let Some(v) = exec_to_complete {
+            write!(f, " tc_inclusion={v:.3}s")?;
+        }
+        // If we have committed_at but no executed_at, show the commit→complete span
+        if let (Some(c), None) = (self.committed_at, self.executed_at) {
+            let v = self.completed_at.saturating_sub(c).as_secs_f64();
+            write!(f, " commit_to_complete={v:.3}s")?;
+        }
+        Ok(())
+    }
+}
 
 /// Why a transaction inclusion proof is being fetched.
 #[derive(Debug, Clone)]
@@ -545,6 +598,8 @@ pub enum Action {
         /// Whether this transaction was submitted locally (via RPC) vs received via gossip/fetch.
         /// Only locally-submitted transactions should contribute to latency metrics.
         submitted_locally: bool,
+        /// Phase timing breakdown for finalized transactions (populated only for terminal statuses).
+        phase_times: Option<FinalizationPhaseTimes>,
     },
 
     // ═══════════════════════════════════════════════════════════════════════

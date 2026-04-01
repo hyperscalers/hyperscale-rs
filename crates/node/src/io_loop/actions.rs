@@ -15,7 +15,7 @@ use hyperscale_storage::{CommitStore, ConsensusStore, SubstateStore};
 use hyperscale_types::ValidatorId;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 impl<S, N, D> IoLoop<S, N, D>
 where
@@ -233,11 +233,28 @@ where
                 added_at,
                 cross_shard,
                 submitted_locally,
+                phase_times,
             } => {
                 debug!(?tx_hash, ?status, "Transaction status");
                 if status.is_final() && submitted_locally {
                     let now = self.state.now();
                     let latency_secs = now.saturating_sub(added_at).as_secs_f64();
+                    if latency_secs > 10.0 {
+                        if let Some(ref phases) = phase_times {
+                            warn!(
+                                ?tx_hash,
+                                latency_secs,
+                                cross_shard,
+                                %phases,
+                                "Transaction finalization exceeded 10s"
+                            );
+                        } else {
+                            warn!(
+                                ?tx_hash,
+                                latency_secs, cross_shard, "Transaction finalization exceeded 10s"
+                            );
+                        }
+                    }
                     metrics::record_transaction_finalized(latency_secs, cross_shard);
                 }
                 self.tx_status_cache.insert(tx_hash, status.clone());

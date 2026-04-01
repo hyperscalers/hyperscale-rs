@@ -59,7 +59,7 @@ proposal_interval_ms = 1000
 
 # Minimum time between block proposals (milliseconds)
 # Rate limits rapid block production even when QC forms immediately
-min_block_interval_ms = 800
+min_block_interval_ms = 500
 
 # View change timeout (milliseconds)
 # How long to wait before triggering leader rotation
