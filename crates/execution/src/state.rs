@@ -46,9 +46,10 @@ use crate::accumulator::ExecutionAccumulator;
 use crate::execution_cache::ExecutionCache;
 use crate::trackers::{CertificateTracker, VoteTracker};
 
-/// Number of blocks to retain wave state (accumulators, vote trackers) and
-/// speculative execution results before cleanup. Blocks older than this are
-/// assumed to have fully finalized or been abandoned.
+/// Minimum number of blocks to retain wave state (accumulators, vote trackers)
+/// and speculative execution results. After this many blocks, waves with no
+/// remaining active wave_assignments are eligible for pruning. Waves with
+/// active assignments are kept indefinitely until all transactions resolve.
 const WAVE_RETENTION_BLOCKS: u64 = 50;
 
 /// Number of blocks to retain early arrival votes/certificates before cleanup.
@@ -545,22 +546,20 @@ impl ExecutionState {
     /// If this was the last unresolved tx in the wave, returns completion data
     /// for execution vote signing.
     ///
-    /// NOTE: If the wave was already pruned (tx committed more than
-    /// `WAVE_RETENTION_BLOCKS` ago), this returns `None` and logs a warning.
-    /// Callers should ensure abort intents arrive well within that window.
+    /// NOTE: Wave assignments are retained as long as the transaction has not
+    /// reached terminal state, so this should always find the assignment.
+    /// A missing assignment indicates a bug (double-cleanup or missing setup).
     pub fn record_abort_intent(
         &mut self,
         tx_hash: Hash,
         reason: AbortReason,
     ) -> Option<CompletionData> {
         if !self.wave_assignments.contains_key(&tx_hash) {
-            tracing::warn!(
+            tracing::error!(
                 tx_hash = %tx_hash,
                 ?reason,
                 committed_height = self.committed_height,
-                "Abort intent for transaction with no active wave assignment \
-                 (wave may have been pruned after {} blocks)",
-                WAVE_RETENTION_BLOCKS,
+                "BUG: Abort intent for transaction with no active wave assignment"
             );
             return None;
         }
@@ -1533,7 +1532,8 @@ impl ExecutionState {
         // but we need to do it here for successful completions too.
         self.pending_provisioning.remove(tx_hash);
 
-        // Wave assignment cleanup (accumulator/tracker cleaned up by prune_execution_state)
+        // Wave assignment cleanup — once removed, the accumulator becomes
+        // eligible for pruning by prune_execution_state on the next cycle.
         self.wave_assignments.remove(tx_hash);
 
         self.certificate_trackers.remove(tx_hash);
@@ -1575,18 +1575,26 @@ impl ExecutionState {
     /// Prune stale wave state (accumulators, vote trackers, early votes).
     ///
     /// Execution accumulators and vote trackers are keyed by (block_hash, wave_id).
-    /// Once a block is old enough that all its txs must have finalized or been
-    /// cleaned up, the wave state can be removed.
+    /// Prune wave state that is no longer needed.
     ///
-    /// Also prunes wave_assignments for txs no longer in any active accumulator,
-    /// and early_votes for waves that were never set up.
+    /// Only prunes accumulators (and their vote trackers) when they are old
+    /// enough AND have no remaining wave_assignments pointing to them. Active
+    /// wave_assignments mean the transaction has not yet reached terminal state
+    /// (TC committed or abort completed), so the accumulator must stay alive to
+    /// allow abort intents and late-arriving votes to resolve the transaction.
+    ///
+    /// Also prunes early_votes for waves that were never set up.
     fn prune_execution_state(&mut self) {
         let cutoff = self.committed_height.saturating_sub(WAVE_RETENTION_BLOCKS);
 
-        // Prune accumulators by block height
+        // Build set of accumulator keys still referenced by active wave assignments.
+        let active_keys: std::collections::HashSet<&(Hash, WaveId)> =
+            self.wave_assignments.values().collect();
+
+        // Prune accumulators only when old enough AND no active assignments remain.
         let before_acc = self.accumulators.len();
         self.accumulators
-            .retain(|_, acc| acc.block_height() > cutoff);
+            .retain(|key, acc| acc.block_height() > cutoff || active_keys.contains(key));
         let pruned_acc = before_acc - self.accumulators.len();
 
         // Prune vote trackers — same keys as accumulators
@@ -1594,12 +1602,6 @@ impl ExecutionState {
         self.vote_trackers
             .retain(|key, _| self.accumulators.contains_key(key));
         let pruned_vt = before_vt - self.vote_trackers.len();
-
-        // Prune wave_assignments that point to removed accumulators
-        let before_wa = self.wave_assignments.len();
-        self.wave_assignments
-            .retain(|_, wave_key| self.accumulators.contains_key(wave_key));
-        let pruned_wa = before_wa - self.wave_assignments.len();
 
         // Prune early execution votes — votes for waves that were never set up
         // and are now too old to matter
@@ -1612,11 +1614,10 @@ impl ExecutionState {
         });
         let pruned_ev = before_ev - self.early_votes.len();
 
-        if pruned_acc > 0 || pruned_vt > 0 || pruned_wa > 0 || pruned_ev > 0 {
+        if pruned_acc > 0 || pruned_vt > 0 || pruned_ev > 0 {
             tracing::debug!(
                 pruned_acc,
                 pruned_vt,
-                pruned_wa,
                 pruned_ev,
                 cutoff_height = cutoff,
                 "Pruned stale wave state"
