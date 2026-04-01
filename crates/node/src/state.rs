@@ -1094,10 +1094,16 @@ impl StateMachine for NodeStateMachine {
                         "Emitting StoreReceiptBundles"
                     );
                     actions.push(Action::StoreReceiptBundles { bundles });
+                } else if speculative {
+                    // Expected after a view change: speculative_in_flight_txs
+                    // was cleared, so all results are dominated. Receipts from
+                    // canonical re-execution will be stored instead.
+                    tracing::debug!(
+                        "ExecutionBatchCompleted produced zero receipt bundles (speculative, post-view-change)"
+                    );
                 } else {
                     tracing::warn!(
-                        speculative,
-                        results_count = 0, // results already consumed
+                        results_count = 0,
                         "ExecutionBatchCompleted produced ZERO receipt bundles"
                     );
                 }

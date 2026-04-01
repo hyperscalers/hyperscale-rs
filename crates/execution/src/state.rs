@@ -1148,11 +1148,17 @@ impl ExecutionState {
                 actions.extend(self.start_single_shard_execution(topology, tx.clone()));
                 actions.extend(self.try_record_speculative_wave_result(tx_hash));
             } else if self.speculative_in_flight_txs.contains(&tx_hash) {
-                // Speculation in-flight - results will arrive when it completes
-                // This counts as a hit since we're skipping re-execution
+                // Speculation in-flight - results will arrive when it completes.
+                // This counts as a hit since we're skipping re-execution.
+                //
+                // Do NOT remove from speculative_in_flight_txs here — leaving
+                // the tx tracked ensures that when the speculative
+                // ExecutionBatchCompleted arrives, it passes the dominated
+                // check and its receipts are stored. Cleanup happens in
+                // on_speculative_execution_complete when SpeculativeExecutionComplete
+                // is processed (the next event in the same batch).
                 self.speculative_cache_hit_count += 1;
                 self.speculative_late_hit_count += 1;
-                self.speculative_in_flight_txs.remove(&tx_hash);
                 tracing::debug!(
                     tx_hash = ?tx_hash,
                     "SPECULATIVE IN-FLIGHT: Results will arrive soon, skipping execution"
@@ -2609,8 +2615,8 @@ mod tests {
             .iter()
             .any(|a| matches!(a, Action::ExecuteTransactions { .. })));
 
-        // In-flight cleaned up on commit — no lingering entries
-        assert!(!state.speculative_in_flight_txs.contains(&tx_hash));
+        // In-flight kept so ExecutionBatchCompleted can store receipts
+        assert!(state.speculative_in_flight_txs.contains(&tx_hash));
 
         // pending_speculative_executions removed on commit
         assert!(!state
