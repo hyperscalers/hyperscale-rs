@@ -31,6 +31,7 @@ use thiserror::Error;
 use tracing::instrument;
 
 use hyperscale_dispatch::Dispatch;
+use hyperscale_metrics as metrics;
 
 /// Errors from thread pool configuration.
 #[derive(Debug, Error)]
@@ -472,8 +473,10 @@ impl Dispatch for PooledDispatch {
         let pending = self.consensus_crypto_pending.clone();
         let pool = Arc::clone(&self.consensus_crypto_pool);
         self.consensus_crypto_pool.spawn_fifo(move || {
+            let start = std::time::Instant::now();
             pool.install(f);
             pending.fetch_sub(1, Ordering::Relaxed);
+            metrics::record_pool_task_completed("consensus_crypto", start.elapsed().as_secs_f64());
         });
     }
 
@@ -482,8 +485,10 @@ impl Dispatch for PooledDispatch {
         let pending = self.crypto_pending.clone();
         let pool = Arc::clone(&self.crypto_pool);
         self.crypto_pool.spawn_fifo(move || {
+            let start = std::time::Instant::now();
             pool.install(f);
             pending.fetch_sub(1, Ordering::Relaxed);
+            metrics::record_pool_task_completed("crypto", start.elapsed().as_secs_f64());
         });
     }
 
@@ -505,8 +510,10 @@ impl Dispatch for PooledDispatch {
         let pending = self.tx_validation_pending.clone();
         let pool = Arc::clone(&self.tx_validation_pool);
         self.tx_validation_pool.spawn_fifo(move || {
+            let start = std::time::Instant::now();
             pool.install(f);
             pending.fetch_sub(1, Ordering::Relaxed);
+            metrics::record_pool_task_completed("tx_validation", start.elapsed().as_secs_f64());
         });
     }
 
@@ -516,8 +523,10 @@ impl Dispatch for PooledDispatch {
         let pending = self.execution_pending.clone();
         let pool = Arc::clone(&self.execution_pool);
         self.execution_pool.spawn_fifo(move || {
+            let start = std::time::Instant::now();
             pool.install(f);
             pending.fetch_sub(1, Ordering::Relaxed);
+            metrics::record_pool_task_completed("execution", start.elapsed().as_secs_f64());
         });
     }
 
@@ -542,8 +551,10 @@ impl Dispatch for PooledDispatch {
         let pending = self.provisions_pending.clone();
         let pool = Arc::clone(&self.provisions_pool);
         self.provisions_pool.spawn_fifo(move || {
+            let start = std::time::Instant::now();
             pool.install(f);
             pending.fetch_sub(1, Ordering::Relaxed);
+            metrics::record_pool_task_completed("provisions", start.elapsed().as_secs_f64());
         });
     }
 

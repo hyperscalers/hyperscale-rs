@@ -55,6 +55,8 @@ pub struct Metrics {
     pub crypto_pool_queue_depth: Gauge,
     pub tx_validation_pool_queue_depth: Gauge,
     pub execution_pool_queue_depth: Gauge,
+    pub provisions_pool_queue_depth: Gauge,
+    pub pool_task_duration: HistogramVec,
 
     // === Event Channel Depths ===
     pub callback_channel_depth: Gauge,
@@ -311,6 +313,20 @@ impl Metrics {
             execution_pool_queue_depth: register_gauge!(
                 "hyperscale_execution_pool_queue_depth",
                 "Number of pending tasks in execution pool"
+            )
+            .unwrap(),
+
+            provisions_pool_queue_depth: register_gauge!(
+                "hyperscale_provisions_pool_queue_depth",
+                "Number of pending tasks in provisions pool (proof generation/verification)"
+            )
+            .unwrap(),
+
+            pool_task_duration: register_histogram_vec!(
+                "hyperscale_pool_task_duration_seconds",
+                "Time spent executing tasks in each dispatch pool",
+                &["pool"],
+                vec![0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0]
             )
             .unwrap(),
 
@@ -848,6 +864,7 @@ impl MetricsRecorder for PrometheusRecorder {
         crypto: usize,
         tx_validation: usize,
         execution: usize,
+        provisions: usize,
     ) {
         self.metrics
             .consensus_crypto_pool_queue_depth
@@ -859,6 +876,16 @@ impl MetricsRecorder for PrometheusRecorder {
         self.metrics
             .execution_pool_queue_depth
             .set(execution as f64);
+        self.metrics
+            .provisions_pool_queue_depth
+            .set(provisions as f64);
+    }
+
+    fn record_pool_task_completed(&self, pool: &str, latency_secs: f64) {
+        self.metrics
+            .pool_task_duration
+            .with_label_values(&[pool])
+            .observe(latency_secs);
     }
 
     fn set_channel_depths(&self, depths: &ChannelDepths) {

@@ -227,8 +227,15 @@ pub trait MetricsRecorder: Send + Sync + 'static {
         crypto: usize,
         tx_validation: usize,
         execution: usize,
+        provisions: usize,
     ) {
     }
+
+    /// Record a completed pool task with its duration.
+    ///
+    /// The histogram's `_count` gives throughput (tasks/sec via `rate()`),
+    /// and `_sum / threads` gives utilization per pool.
+    fn record_pool_task_completed(&self, pool: &str, latency_secs: f64) {}
 
     /// Set event channel depths.
     fn set_channel_depths(&self, depths: &ChannelDepths) {}
@@ -541,8 +548,21 @@ pub fn set_pool_queue_depths(
     crypto: usize,
     tx_validation: usize,
     execution: usize,
+    provisions: usize,
 ) {
-    recorder().set_pool_queue_depths(consensus_crypto, crypto, tx_validation, execution);
+    recorder().set_pool_queue_depths(
+        consensus_crypto,
+        crypto,
+        tx_validation,
+        execution,
+        provisions,
+    );
+}
+
+/// Record a completed pool task with its duration.
+#[inline]
+pub fn record_pool_task_completed(pool: &str, latency_secs: f64) {
+    recorder().record_pool_task_completed(pool, latency_secs);
 }
 
 /// Set event channel depths.

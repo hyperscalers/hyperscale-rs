@@ -7,6 +7,7 @@ description = "Rayon thread pool dispatch for production"
 [dependencies]
 core_affinity.workspace = true
 hyperscale-dispatch.workspace = true
+hyperscale-metrics.workspace = true
 rayon.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
