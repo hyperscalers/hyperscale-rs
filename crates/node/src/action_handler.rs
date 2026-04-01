@@ -398,56 +398,25 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
         }
 
         // --- State Provision Batch Verification ---
+        // QC was already verified by RemoteHeaderCoordinator; only verkle
+        // proofs need checking against the committed header's state root.
         Action::VerifyProvisionBatch {
             batch,
-            committed_headers,
-            committee_public_keys,
-            committee_voting_power,
-            quorum_threshold,
+            committed_header,
         } => {
-            // Try each candidate header until one passes QC verification.
-            // Prefer already-verified candidates (skip BLS).
-            let qc_start = std::time::Instant::now();
-            let verified_header = committed_headers.into_iter().find(|candidate| {
-                // Headers are pre-verified by RemoteHeaderCoordinator.
-                // Re-verify as a safety check (no OnceLock cache needed).
-                let qc_valid = hyperscale_bft::handlers::verify_qc_signature(
-                    &candidate.qc,
-                    &committee_public_keys,
-                );
-                if !qc_valid {
-                    return false;
-                }
-
-                // Compute total voting power from this QC's signers
-                let total_voting_power: u64 = candidate
-                    .qc
-                    .signers
-                    .set_indices()
-                    .filter_map(|idx| committee_voting_power.get(idx).copied())
-                    .sum();
-
-                total_voting_power >= quorum_threshold
-                    && candidate.qc.block_hash == candidate.header.hash()
-            });
-            metrics::record_signature_verification_latency(
-                "provision_qc",
-                qc_start.elapsed().as_secs_f64(),
-            );
-
-            // Verify merkle proofs against the verified header's state root.
             let merkle_start = std::time::Instant::now();
-            let all_valid = verified_header.as_ref().is_some_and(|header| {
+            let all_valid = {
                 let all_entries = batch.all_entries_deduped();
                 if all_entries.is_empty() {
-                    return true;
+                    true
+                } else {
+                    hyperscale_storage::proofs::verify_all_verkle_proofs(
+                        &all_entries,
+                        &batch.proof,
+                        committed_header.header.state_root,
+                    )
                 }
-                hyperscale_storage::proofs::verify_all_verkle_proofs(
-                    &all_entries,
-                    &batch.proof,
-                    header.header.state_root,
-                )
-            });
+            };
             metrics::record_signature_verification_latency(
                 "inclusion_proof",
                 merkle_start.elapsed().as_secs_f64(),
@@ -457,7 +426,7 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
                 events: vec![NodeInput::Protocol(
                     ProtocolEvent::StateProvisionsVerified {
                         batch,
-                        committed_header: verified_header,
+                        committed_header: Some(committed_header),
                         valid: all_valid,
                     },
                 )],

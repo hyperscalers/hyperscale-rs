@@ -293,27 +293,19 @@ pub enum Action {
         total_voting_power: u64,
     },
 
-    /// Verify a provision batch's QC and verkle inclusion proofs.
+    /// Verify a provision batch's verkle inclusion proofs.
     ///
-    /// The QC signature is verified once for the batch's attestation. Verkle
-    /// proofs are checked against the verified state root.
+    /// The QC was already verified by `RemoteHeaderCoordinator` when the header
+    /// was promoted to verified, so this only checks verkle proofs against the
+    /// committed header's state root.
     ///
     /// Delegated to a thread pool in production, instant in simulation.
     /// Returns `ProtocolEvent::StateProvisionsVerified` when complete.
     VerifyProvisionBatch {
         /// The provision batch to verify (all from the same source block).
         batch: ProvisionBatch,
-        /// Candidate committed block headers to try.
-        /// In normal operation there is one; with byzantine validators
-        /// there may be multiple (one per sender for the same (shard, height)).
-        committed_headers: Vec<Arc<CommittedBlockHeader>>,
-        /// Public keys for the source shard's committee (from topology).
-        committee_public_keys: Vec<Bls12381G1PublicKey>,
-        /// Voting power for each committee member (parallel to `committee_public_keys`).
-        /// Used to compute total voting power per-candidate from QC signer indices.
-        committee_voting_power: Vec<u64>,
-        /// Quorum threshold for the source shard.
-        quorum_threshold: u64,
+        /// The QC-verified committed block header from RemoteHeaderCoordinator.
+        committed_header: Arc<CommittedBlockHeader>,
     },
 
     /// Aggregate execution votes into an ExecutionCertificate (quorum reached).

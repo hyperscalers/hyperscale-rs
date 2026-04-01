@@ -297,11 +297,7 @@ impl ProvisionCoordinator {
                 "Found buffered provision batches for verified header"
             );
             for batch in batches {
-                actions.extend(self.emit_provision_verification(
-                    batch,
-                    vec![committed_header.clone()],
-                    topology,
-                ));
+                actions.extend(self.emit_provision_verification(batch, committed_header.clone()));
             }
         }
 
@@ -359,7 +355,7 @@ impl ProvisionCoordinator {
         // Look for matching verified remote header (pre-verified by RemoteHeaderCoordinator).
         let key = (source_shard, block_height);
         if let Some(verified_header) = self.verified_remote_headers.get(&key).cloned() {
-            return self.emit_provision_verification(batch, vec![verified_header], topology);
+            return self.emit_provision_verification(batch, verified_header);
         }
 
         // No verified header yet — buffer the batch
@@ -373,46 +369,18 @@ impl ProvisionCoordinator {
         vec![]
     }
 
-    /// Emit a `VerifyProvisionBatch` action for async batch verification.
+    /// Emit a `VerifyProvisionBatch` action for async verkle proof verification.
     ///
-    /// The QC is verified once across candidates; verkle proofs are checked
-    /// against the verified header's state root.
+    /// The QC was already verified by `RemoteHeaderCoordinator`, so only verkle
+    /// proofs need checking against the committed header's state root.
     fn emit_provision_verification(
         &self,
         batch: ProvisionBatch,
-        committed_headers: Vec<Arc<CommittedBlockHeader>>,
-        topology: &TopologySnapshot,
+        committed_header: Arc<CommittedBlockHeader>,
     ) -> Vec<Action> {
-        let source_shard = batch.source_shard;
-
-        // Resolve ALL committee public keys in order for QC verification.
-        // verify_qc_signature filters internally by the signer bitfield,
-        // so it needs the full committee array (matching BFT's collect_qc_signer_keys).
-        let committee = topology.committee_for_shard(source_shard);
-        let committee_public_keys: Vec<_> = committee
-            .iter()
-            .map(|&validator_id| {
-                topology
-                    .public_key(validator_id)
-                    .expect("committee member must have a public key")
-            })
-            .collect();
-
-        // Per-validator voting power (parallel to committee_public_keys).
-        // The action handler computes total_voting_power per-candidate from QC signer indices.
-        let committee_voting_power: Vec<u64> = committee
-            .iter()
-            .map(|&validator_id| topology.voting_power(validator_id).unwrap_or(0))
-            .collect();
-
-        let quorum_threshold = topology.quorum_threshold_for_shard(source_shard);
-
         vec![Action::VerifyProvisionBatch {
             batch,
-            committed_headers,
-            committee_public_keys,
-            committee_voting_power,
-            quorum_threshold,
+            committed_header,
         }]
     }
 
@@ -1150,14 +1118,11 @@ mod tests {
         let actions = coordinator.on_state_provisions_received(&topology, batch);
 
         assert_eq!(actions.len(), 1);
-        match &actions[0] {
-            Action::VerifyProvisionBatch {
-                committed_headers, ..
-            } => {
-                assert_eq!(committed_headers.len(), 1);
-            }
-            other => panic!("Expected VerifyProvisionBatch, got {:?}", other),
-        }
+        assert!(matches!(
+            &actions[0],
+            Action::VerifyProvisionBatch { committed_header, .. }
+                if committed_header.height() == BlockHeight(10)
+        ));
     }
 
     #[test]
@@ -1178,16 +1143,13 @@ mod tests {
         let batch2 = make_batch(Hash::from_bytes(b"tx2"), source_shard, ShardGroupId(0), 10);
         let actions = coordinator.on_state_provisions_received(&topology, batch2);
 
-        // Should send only the verified header (single candidate)
+        // Should send the verified header
         assert_eq!(actions.len(), 1);
-        match &actions[0] {
-            Action::VerifyProvisionBatch {
-                committed_headers, ..
-            } => {
-                assert_eq!(committed_headers.len(), 1);
-            }
-            other => panic!("Expected VerifyProvisionBatch, got {:?}", other),
-        }
+        assert!(matches!(
+            &actions[0],
+            Action::VerifyProvisionBatch { committed_header, .. }
+                if committed_header.height() == BlockHeight(10)
+        ));
     }
 
     #[test]
