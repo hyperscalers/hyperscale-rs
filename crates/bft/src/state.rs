@@ -327,6 +327,11 @@ impl BftState {
     /// Called when `RemoteHeaderVerified` is received. The header has already
     /// been QC-verified by the coordinator, so we just store it for deferral
     /// merkle proof validation.
+    /// Check if a remote header is available for a given shard and height.
+    pub fn has_remote_header(&self, shard: ShardGroupId, height: BlockHeight) -> bool {
+        self.remote_headers.contains_key(&(shard, height))
+    }
+
     pub fn on_verified_remote_header(&mut self, header: Arc<CommittedBlockHeader>) -> Vec<Action> {
         let shard = header.shard_group_id();
         let height = header.height();

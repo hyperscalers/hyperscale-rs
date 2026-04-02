@@ -9,7 +9,7 @@ use hyperscale_provisions::ProvisionCoordinator;
 use hyperscale_remote_headers::RemoteHeaderCoordinator;
 use hyperscale_topology::TopologyState;
 use hyperscale_types::{
-    AbortIntent, Block, BlockHeader, BlockHeight, BlockManifest, Bls12381G1PrivateKey,
+    AbortIntent, AbortReason, Block, BlockHeader, BlockHeight, BlockManifest, Bls12381G1PrivateKey,
     CommittedBlockHeader, Hash, ProvisionBatch, QuorumCertificate, ReadyTransactions,
     ReceiptBundle, RoutableTransaction, ShardGroupId, TopologySnapshot, TransactionCertificate,
 };
@@ -282,22 +282,39 @@ impl NodeStateMachine {
         let abort_intents: Vec<AbortIntent> = timed_out_intents.chain(livelock_intents).collect();
         let certificates = self.execution.get_finalized_certificates();
 
-        // Filter out abort intents for transactions that are already finalized
-        // (TC created). Once all participating shards have collected ECs and formed
-        // the TransactionCertificate, proposing an abort would cause split-brain:
-        // remote shards commit the TC while we discard it.
-        let abort_intents = abort_intents
+        // Filter out abort intents that can't be verified by voters.
+        let abort_intents: Vec<AbortIntent> = abort_intents
             .into_iter()
             .filter(|a| {
+                // Skip transactions that already have a TC.
                 if self.execution.is_finalized(&a.tx_hash) {
                     tracing::info!(
                         tx_hash = %a.tx_hash,
                         "Filtering abort intent from proposal: transaction already finalized (TC created)"
                     );
-                    false
-                } else {
-                    true
+                    return false;
                 }
+                // Skip livelock abort intents whose remote header hasn't arrived
+                // yet. Voters need the header to verify the inclusion proof. If
+                // the proposer doesn't have it, voters won't either. The abort
+                // will be proposed in a later block once the header arrives.
+                if let AbortReason::LivelockCycle {
+                    source_shard,
+                    source_block_height,
+                    ..
+                } = &a.reason
+                {
+                    if !self.bft.has_remote_header(*source_shard, *source_block_height) {
+                        tracing::debug!(
+                            tx_hash = %a.tx_hash,
+                            source_shard = source_shard.0,
+                            source_block_height = source_block_height.0,
+                            "Deferring livelock abort intent: remote header not yet available"
+                        );
+                        return false;
+                    }
+                }
+                true
             })
             .collect();
 
