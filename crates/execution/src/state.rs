@@ -541,31 +541,58 @@ impl ExecutionState {
 
     /// Record an abort intent into the appropriate execution accumulator.
     ///
-    /// The abort intent is treated as an execution outcome. First-write-wins:
-    /// if execution already completed for this tx, the abort intent is ignored.
-    /// If this was the last unresolved tx in the wave, returns completion data
-    /// for execution vote signing.
+    /// Abort intents are consensus-committed (deterministic) and ALWAYS override
+    /// async execution results. This ensures all validators converge to the same
+    /// receipt_root regardless of execution timing.
     ///
-    /// NOTE: Wave assignments are retained as long as the transaction has not
-    /// reached terminal state. A missing assignment means the transaction
-    /// already completed (TC committed and wave cleaned up) — the abort
-    /// intent is a harmless late arrival (e.g. livelock cycle detected after
-    /// normal execution finished).
+    /// Returns `Some(CompletionData)` when the abort completes the wave
+    /// (either first result or override of an existing result).
+    ///
+    /// A missing wave assignment means the transaction already reached terminal
+    /// state (TC committed) — the abort intent is a harmless late arrival.
     pub fn record_abort_intent(
         &mut self,
         tx_hash: Hash,
         reason: AbortReason,
     ) -> Option<CompletionData> {
-        if !self.wave_assignments.contains_key(&tx_hash) {
-            tracing::debug!(
-                tx_hash = %tx_hash,
-                ?reason,
-                committed_height = self.committed_height,
-                "Abort intent for already-completed transaction (wave cleaned up)"
-            );
+        let wave_key = match self.wave_assignments.get(&tx_hash) {
+            Some(key) => key.clone(),
+            None => {
+                tracing::debug!(
+                    tx_hash = %tx_hash,
+                    ?reason,
+                    committed_height = self.committed_height,
+                    "Abort intent for already-completed transaction (wave cleaned up)"
+                );
+                return None;
+            }
+        };
+
+        let accumulator = self.accumulators.get_mut(&wave_key)?;
+        let outcome = TxExecutionOutcome::Aborted { reason };
+
+        if !accumulator.record_abort(tx_hash, outcome) {
             return None;
         }
-        self.record_execution_result(tx_hash, TxExecutionOutcome::Aborted { reason })
+
+        // Wave complete — build receipt tree with the abort included
+        let (receipt_root, tx_outcomes) = accumulator
+            .build_data()
+            .expect("wave is complete but build_data returned None");
+
+        let block_hash = accumulator.block_hash();
+        let block_height = accumulator.block_height();
+        let wave_id = accumulator.wave_id().clone();
+        let participating_shards = accumulator.all_participating_shards();
+
+        Some(CompletionData {
+            block_hash,
+            block_height,
+            wave_id,
+            receipt_root,
+            tx_outcomes,
+            participating_shards,
+        })
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -701,13 +728,36 @@ impl ExecutionState {
         let votes = tracker.take_votes_for_receipt_root(&receipt_root);
         let committee = topology.local_committee().to_vec();
 
-        // Get tx_outcomes from the execution accumulator
-        let tx_outcomes = self
-            .accumulators
-            .get(&key)
-            .and_then(|acc| acc.build_data())
-            .map(|(_, outcomes)| outcomes)
-            .unwrap_or_default();
+        // Get tx_outcomes from the execution accumulator.
+        // SAFETY: the accumulator's outcomes MUST match the quorum receipt_root.
+        // Abort intents use override semantics (not first-write-wins) to ensure
+        // all validators converge to the same outcomes regardless of async
+        // execution timing. See ExecutionAccumulator::record_abort().
+        let tx_outcomes = self.accumulators.get(&key).and_then(|acc| acc.build_data());
+
+        let tx_outcomes = match tx_outcomes {
+            Some((local_root, outcomes)) => {
+                if local_root != receipt_root {
+                    tracing::error!(
+                        block_hash = ?key.0,
+                        wave = %key.1,
+                        ?receipt_root,
+                        ?local_root,
+                        "BUG: Local accumulator diverged from quorum receipt_root despite abort override"
+                    );
+                    return vec![];
+                }
+                outcomes
+            }
+            None => {
+                tracing::warn!(
+                    block_hash = ?key.0,
+                    wave = %key.1,
+                    "No accumulator data for wave — skipping EC aggregation"
+                );
+                return vec![];
+            }
+        };
 
         tracing::debug!(
             block_hash = ?key.0,

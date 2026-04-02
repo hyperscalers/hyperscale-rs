@@ -92,9 +92,8 @@ impl ExecutionAccumulator {
     /// Record a transaction's execution outcome.
     ///
     /// Returns `true` if the wave is now complete (all txs have results).
-    /// First-write-wins: ignores duplicate results for the same tx_hash.
-    /// This means if execution completes before an abort intent arrives,
-    /// the execution result stands (and vice versa).
+    /// First-write-wins: ignores duplicate execution results for the same tx_hash.
+    /// Use [`record_abort`] for abort intents, which override execution results.
     pub fn record_result(&mut self, tx_hash: Hash, outcome: TxExecutionOutcome) -> bool {
         // Only record if this tx is expected in this wave
         if !self.expected_txs.iter().any(|(h, _)| *h == tx_hash) {
@@ -104,6 +103,24 @@ impl ExecutionAccumulator {
         self.completed
             .entry(tx_hash)
             .or_insert(TxResult { outcome });
+
+        self.is_complete()
+    }
+
+    /// Record an abort for a transaction, overriding any existing result.
+    ///
+    /// Abort intents are committed in blocks (deterministic), so they take
+    /// precedence over async execution results. This ensures all validators
+    /// converge to the same receipt_root regardless of execution timing.
+    ///
+    /// Returns `true` if the wave is now complete (all txs have results).
+    pub fn record_abort(&mut self, tx_hash: Hash, outcome: TxExecutionOutcome) -> bool {
+        if !self.expected_txs.iter().any(|(h, _)| *h == tx_hash) {
+            return false;
+        }
+
+        // Unconditional insert — abort overrides any existing execution result
+        self.completed.insert(tx_hash, TxResult { outcome });
 
         self.is_complete()
     }
