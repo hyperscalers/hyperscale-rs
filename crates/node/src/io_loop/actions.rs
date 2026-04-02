@@ -3,10 +3,10 @@
 use super::{IoLoop, TimerOp};
 use crate::action_handler::{self, ActionContext, DispatchPool};
 use crate::protocol::execution_cert_fetch::ExecCertFetchInput;
-use crate::protocol::fetch::FetchInput;
 use crate::protocol::header_fetch::HeaderFetchInput;
 use crate::protocol::provision_fetch::ProvisionFetchInput;
 use crate::protocol::sync::SyncInput;
+use crate::protocol::transaction_fetch::TransactionFetchInput;
 use hyperscale_core::{Action, NodeInput, ProtocolEvent, StateMachine};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_metrics as metrics;
@@ -664,13 +664,17 @@ where
                 proposer,
                 tx_hashes,
             } => {
-                self.fetch_protocol.handle(FetchInput::RequestTransactions {
-                    block_hash,
-                    proposer,
-                    tx_hashes,
-                });
-                let outputs = self.fetch_protocol.handle(FetchInput::Tick);
-                self.process_fetch_outputs(outputs);
+                self.transaction_fetch_protocol.handle(
+                    TransactionFetchInput::RequestTransactions {
+                        block_hash,
+                        proposer,
+                        tx_hashes,
+                    },
+                );
+                let outputs = self
+                    .transaction_fetch_protocol
+                    .handle(TransactionFetchInput::Tick);
+                self.process_transaction_fetch_outputs(outputs);
                 self.update_fetch_tick_timer();
             }
             Action::FetchCertificates {
@@ -700,8 +704,8 @@ where
                 self.update_fetch_tick_timer();
             }
             Action::CancelFetch { block_hash } => {
-                self.fetch_protocol
-                    .handle(FetchInput::CancelFetch { block_hash });
+                self.transaction_fetch_protocol
+                    .handle(TransactionFetchInput::CancelFetch { block_hash });
             }
             Action::RequestMissingProvisions {
                 source_shard,

@@ -1,4 +1,4 @@
-//! Fetch protocol state machine.
+//! Transaction fetch protocol state machine.
 //!
 //! Pure synchronous state machine for transaction fetching.
 //! Tracks missing hashes per block and handles chunking. Does NOT handle
@@ -8,7 +8,7 @@
 //! # Usage
 //!
 //! ```text
-//! Runner ──► FetchProtocol::handle(FetchInput) ──► Vec<FetchOutput>
+//! Runner ──► TransactionFetchProtocol::handle(TransactionFetchInput) ──► Vec<TransactionFetchOutput>
 //! ```
 
 use hyperscale_messages::request::GetTransactionsRequest;
@@ -24,7 +24,7 @@ use tracing::{debug, info, trace};
 
 /// Configuration for the fetch protocol.
 #[derive(Debug, Clone)]
-pub struct FetchConfig {
+pub struct TransactionFetchConfig {
     /// Maximum number of concurrent fetch operations per block.
     pub max_concurrent_per_block: usize,
 
@@ -35,7 +35,7 @@ pub struct FetchConfig {
     pub parallel_fetches: usize,
 }
 
-impl Default for FetchConfig {
+impl Default for TransactionFetchConfig {
     fn default() -> Self {
         Self {
             max_concurrent_per_block: 8,
@@ -45,25 +45,9 @@ impl Default for FetchConfig {
     }
 }
 
-/// Type of fetch request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum FetchKind {
-    /// Fetching transactions.
-    Transaction,
-}
-
-impl FetchKind {
-    /// Returns a string representation for metrics/logging.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            FetchKind::Transaction => "transaction",
-        }
-    }
-}
-
 /// Fetch status for external APIs.
 #[derive(Debug, Clone, Serialize)]
-pub struct FetchStatus {
+pub struct TransactionFetchStatus {
     /// Number of blocks with pending transaction fetches.
     pub pending_tx_blocks: usize,
     /// Total in-flight fetch operations.
@@ -72,7 +56,7 @@ pub struct FetchStatus {
 
 /// Inputs to the fetch protocol state machine.
 #[derive(Debug)]
-pub enum FetchInput {
+pub enum TransactionFetchInput {
     /// Request transactions for a pending block.
     RequestTransactions {
         block_hash: Hash,
@@ -85,11 +69,7 @@ pub enum FetchInput {
         transactions: Vec<Arc<RoutableTransaction>>,
     },
     /// A fetch operation failed.
-    FetchFailed {
-        block_hash: Hash,
-        kind: FetchKind,
-        hashes: Vec<Hash>,
-    },
+    FetchFailed { block_hash: Hash, hashes: Vec<Hash> },
     /// Cancel fetch for a specific block.
     CancelFetch { block_hash: Hash },
     /// Tick: spawn pending fetch operations.
@@ -98,7 +78,7 @@ pub enum FetchInput {
 
 /// Outputs from the fetch protocol state machine.
 #[derive(Debug)]
-pub enum FetchOutput {
+pub enum TransactionFetchOutput {
     /// Request the runner to fetch transactions.
     FetchTransactions {
         block_hash: Hash,
@@ -176,14 +156,14 @@ impl BlockFetchState {
 }
 
 /// Fetch protocol state machine.
-pub struct FetchProtocol {
-    config: FetchConfig,
+pub struct TransactionFetchProtocol {
+    config: TransactionFetchConfig,
     tx_fetches: HashMap<Hash, BlockFetchState>,
 }
 
-impl FetchProtocol {
+impl TransactionFetchProtocol {
     /// Create a new fetch protocol state machine.
-    pub fn new(config: FetchConfig) -> Self {
+    pub fn new(config: TransactionFetchConfig) -> Self {
         Self {
             config,
             tx_fetches: HashMap::new(),
@@ -191,36 +171,34 @@ impl FetchProtocol {
     }
 
     /// Process an input and return outputs.
-    pub fn handle(&mut self, input: FetchInput) -> Vec<FetchOutput> {
+    pub fn handle(&mut self, input: TransactionFetchInput) -> Vec<TransactionFetchOutput> {
         match input {
-            FetchInput::RequestTransactions {
+            TransactionFetchInput::RequestTransactions {
                 block_hash,
                 proposer,
                 tx_hashes,
             } => self.handle_request_transactions(block_hash, proposer, tx_hashes),
-            FetchInput::TransactionsReceived {
+            TransactionFetchInput::TransactionsReceived {
                 block_hash,
                 transactions,
             } => self.handle_transactions_received(block_hash, transactions),
-            FetchInput::FetchFailed {
-                block_hash,
-                kind,
-                hashes,
-            } => self.handle_fetch_failed(block_hash, kind, hashes),
-            FetchInput::CancelFetch { block_hash } => {
+            TransactionFetchInput::FetchFailed { block_hash, hashes } => {
+                self.handle_fetch_failed(block_hash, hashes)
+            }
+            TransactionFetchInput::CancelFetch { block_hash } => {
                 self.tx_fetches.remove(&block_hash);
                 debug!(?block_hash, "Cancelled fetch");
                 vec![]
             }
-            FetchInput::Tick => self.spawn_pending_fetches(),
+            TransactionFetchInput::Tick => self.spawn_pending_fetches(),
         }
     }
 
     /// Get current fetch status.
-    pub fn status(&self) -> FetchStatus {
+    pub fn status(&self) -> TransactionFetchStatus {
         let in_flight: usize = self.tx_fetches.values().map(|s| s.in_flight_count).sum();
 
-        FetchStatus {
+        TransactionFetchStatus {
             pending_tx_blocks: self.tx_fetches.len(),
             in_flight_operations: in_flight,
         }
@@ -235,7 +213,7 @@ impl FetchProtocol {
         block_hash: Hash,
         proposer: ValidatorId,
         tx_hashes: Vec<Hash>,
-    ) -> Vec<FetchOutput> {
+    ) -> Vec<TransactionFetchOutput> {
         if tx_hashes.is_empty() {
             return vec![];
         }
@@ -266,7 +244,7 @@ impl FetchProtocol {
         &mut self,
         block_hash: Hash,
         transactions: Vec<Arc<RoutableTransaction>>,
-    ) -> Vec<FetchOutput> {
+    ) -> Vec<TransactionFetchOutput> {
         let Some(state) = self.tx_fetches.get_mut(&block_hash) else {
             trace!(?block_hash, "Transactions received for unknown fetch");
             return vec![];
@@ -289,7 +267,7 @@ impl FetchProtocol {
         let mut outputs = Vec::new();
 
         if !transactions.is_empty() {
-            outputs.push(FetchOutput::DeliverTransactions {
+            outputs.push(TransactionFetchOutput::DeliverTransactions {
                 block_hash,
                 transactions,
             });
@@ -307,23 +285,18 @@ impl FetchProtocol {
     fn handle_fetch_failed(
         &mut self,
         block_hash: Hash,
-        kind: FetchKind,
         hashes: Vec<Hash>,
-    ) -> Vec<FetchOutput> {
-        let state = match kind {
-            FetchKind::Transaction => self.tx_fetches.get_mut(&block_hash),
-        };
-
-        if let Some(state) = state {
+    ) -> Vec<TransactionFetchOutput> {
+        if let Some(state) = self.tx_fetches.get_mut(&block_hash) {
             state.mark_fetch_failed(&hashes);
-            metrics::record_fetch_failed(kind.as_str());
+            metrics::record_fetch_failed("transaction");
         }
 
         vec![]
     }
 
     /// Spawn pending fetch operations across all blocks.
-    fn spawn_pending_fetches(&mut self) -> Vec<FetchOutput> {
+    fn spawn_pending_fetches(&mut self) -> Vec<TransactionFetchOutput> {
         let mut outputs = Vec::new();
 
         // Transaction fetches
@@ -346,7 +319,7 @@ impl FetchProtocol {
             {
                 let chunk_vec = chunk.to_vec();
                 state.mark_in_flight(&chunk_vec);
-                outputs.push(FetchOutput::FetchTransactions {
+                outputs.push(TransactionFetchOutput::FetchTransactions {
                     block_hash: *block_hash,
                     proposer: state.proposer,
                     tx_hashes: chunk_vec,
@@ -422,7 +395,7 @@ mod tests {
 
     #[test]
     fn test_fetch_config_defaults() {
-        let config = FetchConfig::default();
+        let config = TransactionFetchConfig::default();
         assert_eq!(config.max_concurrent_per_block, 8);
         assert_eq!(config.parallel_fetches, 4);
         assert_eq!(config.max_hashes_per_request, 50);
@@ -430,29 +403,24 @@ mod tests {
 
     #[test]
     fn test_request_and_tick() {
-        let mut protocol = FetchProtocol::new(FetchConfig::default());
+        let mut protocol = TransactionFetchProtocol::new(TransactionFetchConfig::default());
         let block_hash = Hash::from_bytes(b"test_block");
         let hashes = vec![
             Hash::from_bytes(b"tx1_hash_data_here"),
             Hash::from_bytes(b"tx2_hash_data_here"),
         ];
 
-        protocol.handle(FetchInput::RequestTransactions {
+        protocol.handle(TransactionFetchInput::RequestTransactions {
             block_hash,
             proposer: ValidatorId(1),
             tx_hashes: hashes.clone(),
         });
 
         // Tick should emit FetchTransactions
-        let outputs = protocol.handle(FetchInput::Tick);
+        let outputs = protocol.handle(TransactionFetchInput::Tick);
         assert!(!outputs.is_empty());
         assert!(outputs
             .iter()
-            .any(|o| matches!(o, FetchOutput::FetchTransactions { .. })));
-    }
-
-    #[test]
-    fn test_fetch_kind_str() {
-        assert_eq!(FetchKind::Transaction.as_str(), "transaction");
+            .any(|o| matches!(o, TransactionFetchOutput::FetchTransactions { .. })));
     }
 }

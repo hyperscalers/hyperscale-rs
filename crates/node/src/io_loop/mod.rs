@@ -27,7 +27,6 @@ mod verify;
 use crate::batch_accumulator::BatchAccumulator;
 use crate::config::NodeConfig;
 use crate::protocol::execution_cert_fetch::{ExecCertFetchInput, ExecCertFetchProtocol};
-use crate::protocol::fetch::{FetchInput, FetchKind, FetchProtocol};
 use crate::protocol::header_fetch::{HeaderFetchInput, HeaderFetchProtocol};
 use crate::protocol::inclusion_proof_fetch::{
     InclusionProofFetchInput, InclusionProofFetchProtocol,
@@ -35,6 +34,7 @@ use crate::protocol::inclusion_proof_fetch::{
 use crate::protocol::provision_fetch::{ProvisionFetchInput, ProvisionFetchProtocol};
 use crate::protocol::sync::{SyncInput, SyncProtocol, SyncStatus};
 use crate::protocol::transaction_cert_fetch::{TxCertFetchInput, TxCertFetchProtocol};
+use crate::protocol::transaction_fetch::{TransactionFetchInput, TransactionFetchProtocol};
 use crate::NodeStateMachine;
 use arc_swap::ArcSwap;
 use hyperscale_core::{Action, NodeInput, ProtocolEvent, StateMachine, TimerId};
@@ -176,7 +176,7 @@ where
     sync_protocol: SyncProtocol,
 
     // Fetch protocol (transaction/certificate fetching with chunking and retry)
-    fetch_protocol: FetchProtocol,
+    transaction_fetch_protocol: TransactionFetchProtocol,
 
     // Provision fetch protocol (cross-shard provision fetching with peer rotation)
     provision_fetch_protocol: ProvisionFetchProtocol,
@@ -270,7 +270,8 @@ where
             .collect();
         let b = &config.batch;
         let sync_protocol = SyncProtocol::new(config.sync.clone());
-        let fetch_protocol = FetchProtocol::new(config.fetch.clone());
+        let transaction_fetch_protocol =
+            TransactionFetchProtocol::new(config.transaction_fetch.clone());
         let provision_fetch_protocol = ProvisionFetchProtocol::new(config.provision_fetch.clone());
         let inclusion_proof_fetch_protocol =
             InclusionProofFetchProtocol::new(config.inclusion_proof_fetch.clone());
@@ -299,7 +300,7 @@ where
             pending_validation: HashSet::new(),
             locally_submitted: HashSet::new(),
             sync_protocol,
-            fetch_protocol,
+            transaction_fetch_protocol,
             provision_fetch_protocol,
             inclusion_proof_fetch_protocol,
             exec_cert_fetch_protocol,
@@ -569,30 +570,32 @@ where
                 block_hash,
                 transactions,
             } => {
-                let outputs = self
-                    .fetch_protocol
-                    .handle(FetchInput::TransactionsReceived {
+                let outputs = self.transaction_fetch_protocol.handle(
+                    TransactionFetchInput::TransactionsReceived {
                         block_hash,
                         transactions,
-                    });
-                self.process_fetch_outputs(outputs);
+                    },
+                );
+                self.process_transaction_fetch_outputs(outputs);
             }
 
             NodeInput::FetchTransactionsFailed { block_hash, hashes } => {
-                let outputs = self.fetch_protocol.handle(FetchInput::FetchFailed {
-                    block_hash,
-                    kind: FetchKind::Transaction,
-                    hashes,
-                });
-                self.process_fetch_outputs(outputs);
+                let outputs = self
+                    .transaction_fetch_protocol
+                    .handle(TransactionFetchInput::FetchFailed { block_hash, hashes });
+                self.process_transaction_fetch_outputs(outputs);
                 // Tick to retry pending fetches.
-                let tick_outputs = self.fetch_protocol.handle(FetchInput::Tick);
-                self.process_fetch_outputs(tick_outputs);
+                let tick_outputs = self
+                    .transaction_fetch_protocol
+                    .handle(TransactionFetchInput::Tick);
+                self.process_transaction_fetch_outputs(tick_outputs);
             }
 
             NodeInput::FetchTick => {
-                let outputs = self.fetch_protocol.handle(FetchInput::Tick);
-                self.process_fetch_outputs(outputs);
+                let outputs = self
+                    .transaction_fetch_protocol
+                    .handle(TransactionFetchInput::Tick);
+                self.process_transaction_fetch_outputs(outputs);
                 // Also tick the provision fetch protocol.
                 let prov_outputs = self
                     .provision_fetch_protocol
@@ -981,7 +984,7 @@ where
         );
 
         // ── Fetch ──
-        let fetch_status = self.fetch_protocol.status();
+        let fetch_status = self.transaction_fetch_protocol.status();
         metrics::set_fetch_in_flight("transaction", fetch_status.in_flight_operations);
         metrics::set_fetch_in_flight("provision", self.provision_fetch_protocol.in_flight_count());
         metrics::set_fetch_in_flight("exec_cert", self.exec_cert_fetch_protocol.in_flight_count());

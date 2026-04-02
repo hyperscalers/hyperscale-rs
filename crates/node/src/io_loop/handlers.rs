@@ -23,9 +23,9 @@ where
     /// Each handler is a closure that captures shared state and delegates to
     /// the serving function in the corresponding protocol module.
     pub(super) fn register_request_handler(&self) {
-        use crate::protocol::fetch::serve_transaction_request;
         use crate::protocol::provision_fetch::serve_provision_request;
         use crate::protocol::sync::serve_block_request;
+        use crate::protocol::transaction_fetch::serve_transaction_request;
         use hyperscale_messages::request::{
             GetBlockRequest, GetProvisionsRequest, GetTransactionsRequest,
         };

@@ -12,10 +12,10 @@ mod transaction;
 mod tx_inclusion_proof;
 
 pub use block::GetBlockRequest;
-pub use certificate::{GetCertificatesRequest, FETCH_TYPE_CERTIFICATE};
+pub use certificate::GetCertificatesRequest;
 pub use committed_header::GetCommittedBlockHeaderRequest;
 pub use execution_cert::GetExecutionCertsRequest;
 pub use provision::GetProvisionsRequest;
 pub use sync::SyncCompleteAnnouncement;
-pub use transaction::{GetTransactionsRequest, FETCH_TYPE_TRANSACTION};
+pub use transaction::GetTransactionsRequest;
 pub use tx_inclusion_proof::GetTxInclusionProofRequest;

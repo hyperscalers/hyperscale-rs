@@ -1,10 +1,10 @@
 //! Consolidated configuration for IoLoop.
 
 use crate::protocol::execution_cert_fetch::ExecCertFetchConfig;
-use crate::protocol::fetch::FetchConfig;
 use crate::protocol::inclusion_proof_fetch::InclusionProofFetchConfig;
 use crate::protocol::provision_fetch::ProvisionFetchConfig;
 use crate::protocol::sync::SyncConfig;
+use crate::protocol::transaction_fetch::TransactionFetchConfig;
 use std::time::Duration;
 
 /// Configuration for [`IoLoop`](crate::io_loop::IoLoop).
@@ -13,7 +13,7 @@ use std::time::Duration;
 #[derive(Debug, Default, Clone)]
 pub struct NodeConfig {
     pub sync: SyncConfig,
-    pub fetch: FetchConfig,
+    pub transaction_fetch: TransactionFetchConfig,
     pub provision_fetch: ProvisionFetchConfig,
     pub inclusion_proof_fetch: InclusionProofFetchConfig,
     pub exec_cert_fetch: ExecCertFetchConfig,

@@ -2,11 +2,11 @@
 
 use super::{IoLoop, TimerOp};
 use crate::protocol::execution_cert_fetch::ExecCertFetchOutput;
-use crate::protocol::fetch::FetchOutput;
 use crate::protocol::inclusion_proof_fetch::InclusionProofFetchOutput;
 use crate::protocol::provision_fetch::ProvisionFetchOutput;
 use crate::protocol::sync::SyncOutput;
 use crate::protocol::transaction_cert_fetch::TxCertFetchOutput;
+use crate::protocol::transaction_fetch::TransactionFetchOutput;
 use hyperscale_core::{NodeInput, ProtocolEvent, TimerId};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_metrics as metrics;
@@ -98,14 +98,17 @@ where
         }
     }
 
-    /// Process FetchProtocol outputs.
+    /// Process TransactionFetchProtocol outputs.
     ///
     /// FetchTransactions uses the Network trait to make requests.
     /// DeliverTransactions feeds events directly to the state machine.
-    pub(super) fn process_fetch_outputs(&mut self, outputs: Vec<FetchOutput>) {
+    pub(super) fn process_transaction_fetch_outputs(
+        &mut self,
+        outputs: Vec<TransactionFetchOutput>,
+    ) {
         for output in outputs {
             match output {
-                FetchOutput::FetchTransactions {
+                TransactionFetchOutput::FetchTransactions {
                     block_hash,
                     proposer,
                     tx_hashes,
@@ -135,7 +138,7 @@ where
                         }),
                     );
                 }
-                FetchOutput::DeliverTransactions {
+                TransactionFetchOutput::DeliverTransactions {
                     block_hash,
                     transactions,
                 } => {
@@ -493,7 +496,7 @@ where
     /// `NodeInput::FetchTick` to retry deferred or failed fetch operations.
     /// When all fetches are complete, the timer is cancelled.
     pub(super) fn update_fetch_tick_timer(&mut self) {
-        let status = self.fetch_protocol.status();
+        let status = self.transaction_fetch_protocol.status();
         let has_fetch_work = status.pending_tx_blocks > 0;
         let has_provision_work = self.provision_fetch_protocol.has_pending();
         let has_inclusion_proof_work = self.inclusion_proof_fetch_protocol.has_pending();
