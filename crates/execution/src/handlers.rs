@@ -193,10 +193,12 @@ pub fn aggregate_execution_certificate(
 
     let block_hash = votes.first().map(|v| v.block_hash).unwrap_or(Hash::ZERO);
     let block_height = votes.first().map(|v| v.block_height).unwrap_or(0);
+    let vote_height = votes.first().map(|v| v.vote_height).unwrap_or(0);
 
     ExecutionCertificate {
         block_hash,
         block_height,
+        vote_height,
         wave_id: wave_id.clone(),
         shard_group_id: shard,
         receipt_root,
@@ -227,6 +229,7 @@ pub fn batch_verify_execution_votes(
         let msg = exec_vote_message(
             &vote.block_hash,
             vote.block_height,
+            vote.vote_height,
             &vote.wave_id,
             vote.shard_group_id,
             &vote.receipt_root,
@@ -277,6 +280,7 @@ pub fn verify_execution_certificate_signature(
     let msg = exec_vote_message(
         &certificate.block_hash,
         certificate.block_height,
+        certificate.vote_height,
         &certificate.wave_id,
         certificate.shard_group_id,
         &certificate.receipt_root,

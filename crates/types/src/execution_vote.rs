@@ -199,8 +199,15 @@ pub enum TxExecutionOutcome {
 pub struct ExecutionVote {
     /// Block this wave belongs to.
     pub block_hash: Hash,
-    /// Block height.
+    /// Block height (the block containing the wave's transactions).
     pub block_height: u64,
+    /// Consensus height at which this vote was cast.
+    ///
+    /// Validators vote at each block commit where the wave is complete.
+    /// Including `vote_height` in the BLS-signed message prevents
+    /// cross-height aggregation, ensuring that if an abort intent changes
+    /// the receipt_root between heights, stale votes cannot combine.
+    pub vote_height: u64,
     /// Which wave within the block.
     pub wave_id: WaveId,
     /// Which shard produced this vote.
@@ -227,8 +234,13 @@ pub struct ExecutionVote {
 pub struct ExecutionCertificate {
     /// Block this wave belongs to.
     pub block_hash: Hash,
-    /// Block height.
+    /// Block height (the block containing the wave's transactions).
     pub block_height: u64,
+    /// Consensus height at which quorum was reached.
+    ///
+    /// Must match the `vote_height` in the aggregated votes. Needed to
+    /// reconstruct the BLS signing message for signature verification.
+    pub vote_height: u64,
     /// Which wave within the block.
     pub wave_id: WaveId,
     /// Which shard produced this certificate.

@@ -3,6 +3,14 @@
 //! Tracks the collection of execution votes during the cross-shard
 //! atomic execution protocol.
 //!
+//! ## Round Voting
+//!
+//! Validators vote at each block commit where their wave is complete.
+//! Votes include `vote_height` in the BLS-signed message, so votes at
+//! different heights have different signatures and cannot be aggregated.
+//! The tracker groups by `(receipt_root, vote_height)` and checks quorum
+//! per group.
+//!
 //! ## Deferred Verification Optimization
 //!
 //! Votes are NOT verified when received. Instead, they are buffered until
@@ -10,7 +18,14 @@
 //! we'll never use.
 
 use hyperscale_types::{Bls12381G1PublicKey, ExecutionVote, Hash, ValidatorId, WaveId};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
+
+/// Key for grouping votes: `(receipt_root, vote_height)`.
+///
+/// Votes at different heights have different BLS signatures and cannot be
+/// aggregated together. This prevents stale votes from combining with new
+/// ones if an abort intent changes the receipt_root between heights.
+type VoteKey = (Hash, u64);
 
 /// Tracks execution votes for a specific wave within a block.
 ///
@@ -29,12 +44,10 @@ pub struct VoteTracker {
     // ═══════════════════════════════════════════════════════════════════════
     // Verified votes (passed signature verification)
     // ═══════════════════════════════════════════════════════════════════════
-    /// Verified votes grouped by receipt_root.
-    votes_by_receipt_root: BTreeMap<Hash, Vec<ExecutionVote>>,
-    /// Voting power per receipt root (verified votes only).
-    power_by_receipt_root: BTreeMap<Hash, u64>,
-    /// Per-validator voting power for verified votes (for accurate removal on re-vote).
-    verified_power: HashMap<ValidatorId, u64>,
+    /// Verified votes grouped by (receipt_root, vote_height).
+    votes_by_key: BTreeMap<VoteKey, Vec<ExecutionVote>>,
+    /// Voting power per (receipt_root, vote_height) (verified votes only).
+    power_by_key: BTreeMap<VoteKey, u64>,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Unverified votes (buffered until quorum possible)
@@ -44,8 +57,9 @@ pub struct VoteTracker {
     unverified_votes: Vec<(ExecutionVote, Bls12381G1PublicKey, u64)>,
     /// Total voting power of unverified votes.
     unverified_power: u64,
-    /// Validators we've already seen votes from (for deduplication).
-    seen_validators: HashSet<ValidatorId>,
+    /// Validators we've already seen votes from at each vote_height (dedup).
+    /// Key is (validator_id, vote_height).
+    seen: HashSet<(ValidatorId, u64)>,
     /// Whether a verification batch is currently in flight.
     pending_verification: bool,
 }
@@ -57,12 +71,11 @@ impl VoteTracker {
             wave_id,
             block_hash,
             quorum,
-            votes_by_receipt_root: BTreeMap::new(),
-            power_by_receipt_root: BTreeMap::new(),
-            verified_power: HashMap::new(),
+            votes_by_key: BTreeMap::new(),
+            power_by_key: BTreeMap::new(),
             unverified_votes: Vec::new(),
             unverified_power: 0,
-            seen_validators: HashSet::new(),
+            seen: HashSet::new(),
             pending_verification: false,
         }
     }
@@ -81,54 +94,24 @@ impl VoteTracker {
     // Deferred Verification Methods
     // ═══════════════════════════════════════════════════════════════════════
 
-    /// Check if we've already seen a vote from this validator.
-    pub fn has_seen_validator(&self, validator_id: ValidatorId) -> bool {
-        self.seen_validators.contains(&validator_id)
-    }
-
     /// Buffer an unverified vote for later batch verification.
     ///
     /// Returns `true` if the vote was buffered, `false` if it was a duplicate.
-    /// Re-votes (same validator, different receipt_root) are accepted — the old
-    /// vote is removed so the replacement can be verified. This supports abort
-    /// override convergence: when an abort intent overrides an execution result,
-    /// validators re-vote with the updated receipt_root.
+    /// Dedup is per (validator, vote_height) — the same validator can vote at
+    /// multiple heights (round voting), but only once per height.
     pub fn buffer_unverified_vote(
         &mut self,
         vote: ExecutionVote,
         public_key: Bls12381G1PublicKey,
         voting_power: u64,
     ) -> bool {
-        let validator_id = vote.validator;
+        let dedup_key = (vote.validator, vote.vote_height);
 
-        if self.seen_validators.contains(&validator_id) {
-            // Check if this is a re-vote (different receipt_root).
-            let is_revote_unverified = self.unverified_votes.iter().any(|(v, _, _)| {
-                v.validator == validator_id && v.receipt_root != vote.receipt_root
-            });
-            let is_revote_verified = self.votes_by_receipt_root.iter().any(|(root, votes)| {
-                *root != vote.receipt_root && votes.iter().any(|v| v.validator == validator_id)
-            });
-
-            if !is_revote_unverified && !is_revote_verified {
-                return false; // same receipt_root, genuine duplicate
-            }
-
-            // Remove old unverified vote if present
-            self.unverified_votes.retain(|(v, _, p)| {
-                if v.validator == validator_id {
-                    self.unverified_power = self.unverified_power.saturating_sub(*p);
-                    false
-                } else {
-                    true
-                }
-            });
-
-            // Remove old verified vote if present
-            self.remove_verified_vote(validator_id);
+        if self.seen.contains(&dedup_key) {
+            return false;
         }
 
-        self.seen_validators.insert(validator_id);
+        self.seen.insert(dedup_key);
         self.unverified_votes.push((vote, public_key, voting_power));
         self.unverified_power += voting_power;
         true
@@ -145,12 +128,7 @@ impl VoteTracker {
             return false;
         }
 
-        let best_verified_power = self
-            .power_by_receipt_root
-            .values()
-            .max()
-            .copied()
-            .unwrap_or(0);
+        let best_verified_power = self.power_by_key.values().max().copied().unwrap_or(0);
 
         let total_potential = best_verified_power + self.unverified_power;
         total_potential >= self.quorum
@@ -181,77 +159,43 @@ impl VoteTracker {
     // ═══════════════════════════════════════════════════════════════════════
 
     /// Add a verified vote and its voting power.
-    ///
-    /// If the validator already has a verified vote under a different
-    /// receipt_root (abort-override re-vote), the old vote is removed first.
     pub fn add_verified_vote(&mut self, vote: ExecutionVote, power: u64) {
-        let validator = vote.validator;
-        let receipt_root = vote.receipt_root;
-
-        // Remove any existing verified vote from a different receipt_root
-        self.remove_verified_vote(validator);
-
-        self.votes_by_receipt_root
-            .entry(receipt_root)
-            .or_default()
-            .push(vote);
-        *self.power_by_receipt_root.entry(receipt_root).or_insert(0) += power;
-        self.verified_power.insert(validator, power);
+        let key = (vote.receipt_root, vote.vote_height);
+        self.votes_by_key.entry(key).or_default().push(vote);
+        *self.power_by_key.entry(key).or_insert(0) += power;
     }
 
-    /// Remove a validator's verified vote from whatever receipt_root it's under.
-    fn remove_verified_vote(&mut self, validator: ValidatorId) {
-        let power = match self.verified_power.remove(&validator) {
-            Some(p) => p,
-            None => return, // no verified vote to remove
-        };
-
-        let mut empty_roots = Vec::new();
-        for (root, votes) in &mut self.votes_by_receipt_root {
-            let before = votes.len();
-            votes.retain(|v| v.validator != validator);
-            if votes.len() < before {
-                if let Some(p) = self.power_by_receipt_root.get_mut(root) {
-                    *p = p.saturating_sub(power);
-                }
-                if votes.is_empty() {
-                    empty_roots.push(*root);
-                }
-                break; // validator can only be under one root
-            }
-        }
-        for root in empty_roots {
-            self.votes_by_receipt_root.remove(&root);
-            self.power_by_receipt_root.remove(&root);
-        }
-    }
-
-    /// Check if quorum is reached for any receipt root (verified votes only).
+    /// Check if quorum is reached for any (receipt_root, vote_height) pair.
     ///
-    /// Returns `Some((receipt_root, total_power))` if quorum is reached.
-    pub fn check_quorum(&self) -> Option<(Hash, u64)> {
-        for (receipt_root, power) in &self.power_by_receipt_root {
-            if *power >= self.quorum {
-                return Some((*receipt_root, *power));
+    /// Returns `Some((receipt_root, vote_height, total_power))` if quorum reached.
+    /// If multiple pairs have quorum, returns the one with the lowest vote_height.
+    pub fn check_quorum(&self) -> Option<(Hash, u64, u64)> {
+        let mut best: Option<(Hash, u64, u64)> = None;
+        for (&(receipt_root, vote_height), &power) in &self.power_by_key {
+            if power >= self.quorum {
+                match &best {
+                    Some((_, best_height, _)) if vote_height >= *best_height => {}
+                    _ => best = Some((receipt_root, vote_height, power)),
+                }
             }
         }
-        None
+        best
     }
 
-    /// Take votes for a specific receipt root (ownership transfer).
-    pub fn take_votes_for_receipt_root(&mut self, receipt_root: &Hash) -> Vec<ExecutionVote> {
-        self.votes_by_receipt_root
-            .remove(receipt_root)
-            .unwrap_or_default()
+    /// Take votes for a specific (receipt_root, vote_height) pair.
+    pub fn take_votes(&mut self, receipt_root: &Hash, vote_height: u64) -> Vec<ExecutionVote> {
+        let key = (*receipt_root, vote_height);
+        self.votes_by_key.remove(&key).unwrap_or_default()
     }
 
-    /// Get votes for a specific receipt root (reference, for tests).
+    /// Get votes for a specific receipt root at any height (for tests).
     #[cfg(test)]
-    pub fn votes_for_receipt_root(&self, receipt_root: &Hash) -> &[ExecutionVote] {
-        self.votes_by_receipt_root
-            .get(receipt_root)
-            .map(|v| v.as_slice())
-            .unwrap_or(&[])
+    pub fn votes_for_receipt_root(&self, receipt_root: &Hash) -> Vec<&ExecutionVote> {
+        self.votes_by_key
+            .iter()
+            .filter(|((root, _), _)| root == receipt_root)
+            .flat_map(|(_, votes)| votes.iter())
+            .collect()
     }
 }
 
@@ -268,6 +212,7 @@ mod tests {
         ExecutionVote {
             block_hash: Hash::from_bytes(b"block"),
             block_height: 10,
+            vote_height: 11,
             wave_id: WaveId::zero(),
             shard_group_id: ShardGroupId(0),
             receipt_root,
@@ -292,8 +237,9 @@ mod tests {
         tracker.add_verified_vote(make_vote(2, root), 1);
         let result = tracker.check_quorum();
         assert!(result.is_some());
-        let (r, power) = result.unwrap();
+        let (r, vh, power) = result.unwrap();
         assert_eq!(r, root);
+        assert_eq!(vh, 11); // vote_height from make_vote
         assert_eq!(power, 3);
         assert_eq!(tracker.votes_for_receipt_root(&root).len(), 3);
     }

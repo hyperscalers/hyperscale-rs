@@ -560,24 +560,12 @@ impl NodeStateMachine {
         // Livelock: process abort intents/certs, add tombstones, cleanup tracking
         self.livelock.on_block_committed(&block);
 
-        // Abort intents feed the execution accumulator only — no cleanup,
-        // no mempool state change. The actual terminal state comes when the
-        // TC commits (via on_certificate_committed).
+        // Abort intents feed the execution accumulator with override semantics.
+        // Votes are NOT emitted here — the wave scan at the end of block commit
+        // will detect complete waves and emit votes deterministically.
         for intent in &block.abort_intents {
-            if let Some(completion) = self
-                .execution
-                .record_abort_intent(intent.tx_hash, intent.reason.clone())
-            {
-                actions.push(Action::SignAndBroadcastExecutionVote {
-                    block_hash: completion.block_hash,
-                    block_height: completion.block_height,
-                    wave_id: completion.wave_id,
-                    receipt_root: completion.receipt_root,
-                    tx_count: completion.tx_outcomes.len() as u32,
-                    tx_outcomes: completion.tx_outcomes,
-                    participating_shards: completion.participating_shards,
-                });
-            }
+            self.execution
+                .record_abort_intent(intent.tx_hash, intent.reason.clone());
         }
 
         // Remove committed certificates from execution state.
@@ -676,6 +664,24 @@ impl NodeStateMachine {
             }
         }
         actions.extend(provision_actions);
+
+        // Round voting: scan all incomplete waves and emit votes for complete ones.
+        // This is the SINGLE path to execution voting. Abort intents have already
+        // been processed above (with override semantics), so the accumulator state
+        // is deterministic at this height. All validators at this height produce
+        // the same votes.
+        for completion in self.execution.scan_complete_waves() {
+            actions.push(Action::SignAndBroadcastExecutionVote {
+                block_hash: completion.block_hash,
+                block_height: completion.block_height,
+                vote_height: height,
+                wave_id: completion.wave_id,
+                receipt_root: completion.receipt_root,
+                tx_count: completion.tx_outcomes.len() as u32,
+                tx_outcomes: completion.tx_outcomes,
+                participating_shards: completion.participating_shards,
+            });
+        }
 
         actions
     }
@@ -1092,24 +1098,11 @@ impl StateMachine for NodeStateMachine {
                     );
                 }
 
-                // Record outcomes into execution accumulators.
-                // Outcomes were extracted on the handler thread — no data
-                // munging needed here on the main thread.
+                // Record outcomes into execution accumulators silently.
+                // Votes are emitted during the block commit wave scan, not here.
                 for wr in tx_outcomes {
-                    if let Some(completion) = self
-                        .execution
-                        .record_execution_result(wr.tx_hash, wr.outcome)
-                    {
-                        actions.push(Action::SignAndBroadcastExecutionVote {
-                            block_hash: completion.block_hash,
-                            block_height: completion.block_height,
-                            wave_id: completion.wave_id,
-                            receipt_root: completion.receipt_root,
-                            tx_count: completion.tx_outcomes.len() as u32,
-                            tx_outcomes: completion.tx_outcomes,
-                            participating_shards: completion.participating_shards,
-                        });
-                    }
+                    self.execution
+                        .record_execution_result(wr.tx_hash, wr.outcome);
                 }
 
                 actions

@@ -191,6 +191,7 @@ pub const DOMAIN_EXEC_CERT_BATCH: &[u8] = b"EXEC_CERT_BATCH";
 pub fn exec_vote_message(
     block_hash: &Hash,
     block_height: u64,
+    vote_height: u64,
     wave_id: &WaveId,
     shard_group: ShardGroupId,
     receipt_root: &Hash,
@@ -200,6 +201,7 @@ pub fn exec_vote_message(
     message.extend_from_slice(DOMAIN_EXEC_VOTE);
     message.extend_from_slice(block_hash.as_bytes());
     message.extend_from_slice(&block_height.to_le_bytes());
+    message.extend_from_slice(&vote_height.to_le_bytes());
     // Serialize wave_id: length + sorted shard IDs
     message.extend_from_slice(&(wave_id.0.len() as u32).to_le_bytes());
     for shard in &wave_id.0 {

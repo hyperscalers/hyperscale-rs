@@ -494,105 +494,89 @@ impl ExecutionState {
 
     /// Record a transaction execution result into the appropriate execution accumulator.
     ///
-    /// If the wave becomes complete (all txs executed), returns the wave data
-    /// needed for signing. The caller (io_loop) handles signing since the state
-    /// machine doesn't hold the signing key.
-    ///
-    /// Returns `Some((wave_key, receipt_root, tx_outcomes))` if wave is complete.
-    pub fn record_execution_result(
-        &mut self,
-        tx_hash: Hash,
-        outcome: TxExecutionOutcome,
-    ) -> Option<CompletionData> {
-        let wave_key = self.wave_assignments.get(&tx_hash)?.clone();
+    /// Updates the accumulator silently. Votes are NOT emitted here — they are
+    /// emitted during the block commit wave scan (`scan_complete_waves`), ensuring
+    /// deterministic voting at each consensus height.
+    pub fn record_execution_result(&mut self, tx_hash: Hash, outcome: TxExecutionOutcome) {
+        let Some(wave_key) = self.wave_assignments.get(&tx_hash).cloned() else {
+            return;
+        };
 
-        let accumulator = self.accumulators.get_mut(&wave_key)?;
+        let Some(accumulator) = self.accumulators.get_mut(&wave_key) else {
+            return;
+        };
 
-        if !accumulator.record_result(tx_hash, outcome) {
-            return None;
-        }
-
-        // Wave complete — build receipt tree
-        let (receipt_root, tx_outcomes) = accumulator
-            .build_data()
-            .expect("wave is complete but build_data returned None");
-
-        let block_hash = accumulator.block_hash();
-        let block_height = accumulator.block_height();
-        let wave_id = accumulator.wave_id().clone();
-        let participating_shards = accumulator.all_participating_shards();
-
-        tracing::debug!(
-            ?block_hash,
-            wave = %wave_id,
-            tx_count = tx_outcomes.len(),
-            "Wave complete — ready for vote signing"
-        );
-
-        Some(CompletionData {
-            block_hash,
-            block_height,
-            wave_id,
-            receipt_root,
-            tx_outcomes,
-            participating_shards,
-        })
+        accumulator.record_result(tx_hash, outcome);
     }
 
+    /// Record an abort intent into the appropriate execution accumulator.
+    ///
     /// Record an abort intent into the appropriate execution accumulator.
     ///
     /// Abort intents are consensus-committed (deterministic) and ALWAYS override
     /// async execution results. This ensures all validators converge to the same
     /// receipt_root regardless of execution timing.
     ///
-    /// Returns `Some(CompletionData)` when the abort completes the wave
-    /// (either first result or override of an existing result).
+    /// Updates the accumulator silently. Votes are NOT emitted here — they are
+    /// emitted during the block commit wave scan (`scan_complete_waves`).
     ///
     /// A missing wave assignment means the transaction already reached terminal
     /// state (TC committed) — the abort intent is a harmless late arrival.
-    pub fn record_abort_intent(
-        &mut self,
-        tx_hash: Hash,
-        reason: AbortReason,
-    ) -> Option<CompletionData> {
-        let wave_key = match self.wave_assignments.get(&tx_hash) {
-            Some(key) => key.clone(),
-            None => {
-                tracing::debug!(
-                    tx_hash = %tx_hash,
-                    ?reason,
-                    committed_height = self.committed_height,
-                    "Abort intent for already-completed transaction (wave cleaned up)"
-                );
-                return None;
-            }
+    pub fn record_abort_intent(&mut self, tx_hash: Hash, reason: AbortReason) {
+        let Some(wave_key) = self.wave_assignments.get(&tx_hash).cloned() else {
+            tracing::debug!(
+                tx_hash = %tx_hash,
+                ?reason,
+                committed_height = self.committed_height,
+                "Abort intent for already-completed transaction (wave cleaned up)"
+            );
+            return;
         };
 
-        let accumulator = self.accumulators.get_mut(&wave_key)?;
-        let outcome = TxExecutionOutcome::Aborted { reason };
+        let Some(accumulator) = self.accumulators.get_mut(&wave_key) else {
+            return;
+        };
 
-        if !accumulator.record_abort(tx_hash, outcome) {
-            return None;
+        let outcome = TxExecutionOutcome::Aborted { reason };
+        accumulator.record_abort(tx_hash, outcome);
+    }
+
+    /// Scan all incomplete waves and return completion data for any that are ready.
+    ///
+    /// Called at each block commit AFTER abort intents have been processed.
+    /// This is the SINGLE path to voting — votes are never emitted from
+    /// `record_execution_result` or `record_abort_intent`.
+    ///
+    /// Returns a `CompletionData` for each wave that is complete at this height.
+    /// Waves that already had an EC formed (vote tracker removed) are skipped.
+    pub fn scan_complete_waves(&self) -> Vec<CompletionData> {
+        let mut completions = Vec::new();
+
+        for (key, accumulator) in &self.accumulators {
+            // Skip waves that already formed an EC (vote tracker removed)
+            if !self.vote_trackers.contains_key(key) {
+                continue;
+            }
+
+            if !accumulator.is_complete() {
+                continue;
+            }
+
+            let Some((receipt_root, tx_outcomes)) = accumulator.build_data() else {
+                continue;
+            };
+
+            completions.push(CompletionData {
+                block_hash: accumulator.block_hash(),
+                block_height: accumulator.block_height(),
+                wave_id: accumulator.wave_id().clone(),
+                receipt_root,
+                tx_outcomes,
+                participating_shards: accumulator.all_participating_shards(),
+            });
         }
 
-        // Wave complete — build receipt tree with the abort included
-        let (receipt_root, tx_outcomes) = accumulator
-            .build_data()
-            .expect("wave is complete but build_data returned None");
-
-        let block_hash = accumulator.block_hash();
-        let block_height = accumulator.block_height();
-        let wave_id = accumulator.wave_id().clone();
-        let participating_shards = accumulator.all_participating_shards();
-
-        Some(CompletionData {
-            block_hash,
-            block_height,
-            wave_id,
-            receipt_root,
-            tx_outcomes,
-            participating_shards,
-        })
+        completions
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -635,9 +619,8 @@ impl ExecutionState {
 
         let tracker = self.vote_trackers.get_mut(&key).unwrap();
 
-        // buffer_unverified_vote handles dedup internally — it rejects same
-        // receipt_root duplicates but accepts re-votes (different receipt_root)
-        // for abort override convergence.
+        // buffer_unverified_vote handles dedup per (validator, vote_height).
+        // Same validator can vote at multiple heights (round voting).
         if !tracker.buffer_unverified_vote(vote, public_key, voting_power) {
             return vec![];
         }
@@ -722,18 +705,14 @@ impl ExecutionState {
             return vec![];
         };
 
-        let Some((receipt_root, _total_power)) = tracker.check_quorum() else {
+        let Some((receipt_root, vote_height, _total_power)) = tracker.check_quorum() else {
             return vec![];
         };
 
-        let votes = tracker.take_votes_for_receipt_root(&receipt_root);
+        let votes = tracker.take_votes(&receipt_root, vote_height);
         let committee = topology.local_committee().to_vec();
 
         // Get tx_outcomes from the execution accumulator.
-        // SAFETY: the accumulator's outcomes MUST match the quorum receipt_root.
-        // Abort intents use override semantics (not first-write-wins) to ensure
-        // all validators converge to the same outcomes regardless of async
-        // execution timing. See ExecutionAccumulator::record_abort().
         let tx_outcomes = self.accumulators.get(&key).and_then(|acc| acc.build_data());
 
         let tx_outcomes = match tx_outcomes {
@@ -744,7 +723,7 @@ impl ExecutionState {
                         wave = %key.1,
                         ?receipt_root,
                         ?local_root,
-                        "BUG: Local accumulator diverged from quorum receipt_root despite abort override"
+                        "BUG: Local accumulator diverged from quorum receipt_root"
                     );
                     return vec![];
                 }
@@ -760,9 +739,7 @@ impl ExecutionState {
             }
         };
 
-        // Remove the vote tracker — this EC is the shard's final answer for
-        // the wave. Prevents a second EC from forming if abort-override re-votes
-        // arrive after the EC is already dispatched.
+        // Remove the vote tracker — this EC is the shard's final answer.
         self.vote_trackers.remove(&key);
 
         tracing::debug!(
@@ -2185,26 +2162,16 @@ impl ExecutionState {
             .get(&tx_hash)
             .map(|updates| crate::handlers::extract_write_nodes(updates))
             .unwrap_or_default();
-        if let Some(completion) = self.record_execution_result(
+        // Record silently — votes emitted during block commit wave scan.
+        self.record_execution_result(
             tx_hash,
             TxExecutionOutcome::Executed {
                 receipt_hash,
                 success: true,
                 write_nodes,
             },
-        ) {
-            vec![Action::SignAndBroadcastExecutionVote {
-                block_hash: completion.block_hash,
-                block_height: completion.block_height,
-                wave_id: completion.wave_id,
-                receipt_root: completion.receipt_root,
-                tx_count: completion.tx_outcomes.len() as u32,
-                tx_outcomes: completion.tx_outcomes,
-                participating_shards: completion.participating_shards,
-            }]
-        } else {
-            vec![]
-        }
+        );
+        vec![]
     }
 
     /// Try to use a cached speculative result for a transaction.
@@ -2766,9 +2733,9 @@ mod tests {
         let root2 = Hash::from_bytes(b"root2");
         let root3 = Hash::from_bytes(b"root3");
 
-        let msg1 = hyperscale_types::exec_vote_message(&block, 1, &wave_id, shard, &root1, 1);
-        let msg2 = hyperscale_types::exec_vote_message(&block, 1, &wave_id, shard, &root2, 1);
-        let msg3 = hyperscale_types::exec_vote_message(&block, 1, &wave_id, shard, &root3, 1);
+        let msg1 = hyperscale_types::exec_vote_message(&block, 1, 1, &wave_id, shard, &root1, 1);
+        let msg2 = hyperscale_types::exec_vote_message(&block, 1, 1, &wave_id, shard, &root2, 1);
+        let msg3 = hyperscale_types::exec_vote_message(&block, 1, 1, &wave_id, shard, &root3, 1);
 
         let sig1 = committee.keypair(0).sign_v1(&msg1);
         let sig2 = committee.keypair(1).sign_v1(&msg2);
@@ -2800,8 +2767,8 @@ mod tests {
         let root1 = Hash::from_bytes(b"root1");
         let root2 = Hash::from_bytes(b"root2");
 
-        let msg1 = hyperscale_types::exec_vote_message(&block, 1, &wave_id, shard, &root1, 1);
-        let msg2 = hyperscale_types::exec_vote_message(&block, 1, &wave_id, shard, &root2, 1);
+        let msg1 = hyperscale_types::exec_vote_message(&block, 1, 1, &wave_id, shard, &root1, 1);
+        let msg2 = hyperscale_types::exec_vote_message(&block, 1, 1, &wave_id, shard, &root2, 1);
 
         // First is valid, second is signed with wrong key
         let sig1 = committee.keypair(0).sign_v1(&msg1);

@@ -148,6 +148,8 @@ pub enum Action {
     SignAndBroadcastExecutionVote {
         block_hash: Hash,
         block_height: u64,
+        /// Consensus height at which this vote is being cast.
+        vote_height: u64,
         wave_id: WaveId,
         receipt_root: Hash,
         tx_count: u32,

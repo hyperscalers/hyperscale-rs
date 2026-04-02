@@ -77,6 +77,7 @@ where
             Action::SignAndBroadcastExecutionVote {
                 block_hash,
                 block_height,
+                vote_height,
                 wave_id,
                 receipt_root,
                 tx_count,
@@ -87,6 +88,7 @@ where
                 let msg = hyperscale_types::exec_vote_message(
                     &block_hash,
                     block_height,
+                    vote_height,
                     &wave_id,
                     self.local_shard,
                     &receipt_root,
@@ -96,6 +98,7 @@ where
                 let vote = hyperscale_types::ExecutionVote {
                     block_hash,
                     block_height,
+                    vote_height,
                     wave_id,
                     shard_group_id: self.local_shard,
                     receipt_root,
