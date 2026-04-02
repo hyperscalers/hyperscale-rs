@@ -3728,6 +3728,25 @@ impl BftState {
             "Advancing round locally (implicit view change)"
         );
 
+        // Log why any pending blocks at this height couldn't be verified in time.
+        for pending in self.pending_blocks.values() {
+            if pending.header().height.0 == height {
+                if let Some(block) = pending.block() {
+                    if !self.verification.is_block_verified(&block) {
+                        self.verification.log_incomplete_verification(&block);
+                    }
+                } else {
+                    warn!(
+                        block_hash = ?pending.header().hash(),
+                        height = height,
+                        missing_txs = pending.missing_transaction_count(),
+                        missing_certs = pending.missing_certificate_count(),
+                        "View change — block still incomplete (missing data)"
+                    );
+                }
+            }
+        }
+
         // Timeout-based unlock: If no QC has formed at this height, we clear our
         // vote lock to allow voting for a new proposal in the next round. Safety is
         // maintained by quorum intersection — even if a QC did form but we haven't

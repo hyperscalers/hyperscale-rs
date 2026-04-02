@@ -10,7 +10,7 @@ use hyperscale_types::{
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 use hyperscale_core::Action;
 
@@ -232,6 +232,87 @@ impl VerificationPipeline {
         };
 
         state_root_ok && transaction_root_ok && receipt_root_ok && abort_intents_ok
+    }
+
+    /// Log why a block's verification is incomplete. Called on view change
+    /// to explain why the current block couldn't be voted on in time.
+    pub fn log_incomplete_verification(&self, block: &Block) {
+        let block_hash = block.hash();
+
+        let state_root_status = if block.certificates.is_empty() {
+            "skipped(no_certs)"
+        } else if self.verified_state_roots.contains(&block_hash) {
+            "verified"
+        } else if self
+            .state_root_verifications_in_flight
+            .contains(&block_hash)
+        {
+            "in_flight"
+        } else if self
+            .pending_state_root_verifications
+            .contains_key(&block_hash)
+        {
+            "pending_jvt"
+        } else {
+            "NOT_STARTED"
+        };
+
+        let tx_root_status = if block.transaction_count() == 0 {
+            "skipped(no_txs)"
+        } else if self.verified_transaction_roots.contains(&block_hash) {
+            "verified"
+        } else if self
+            .transaction_root_verifications_in_flight
+            .contains(&block_hash)
+        {
+            "in_flight"
+        } else {
+            "NOT_STARTED"
+        };
+
+        let receipt_root_status = if block.certificates.is_empty() {
+            "skipped(no_certs)"
+        } else if self.verified_receipt_roots.contains(&block_hash) {
+            "verified"
+        } else if self
+            .receipt_root_verifications_in_flight
+            .contains(&block_hash)
+        {
+            "in_flight"
+        } else {
+            "NOT_STARTED"
+        };
+
+        let abort_status = if !Self::has_livelock_abort_intents(block) {
+            "skipped(no_livelock)"
+        } else if self.verified_abort_intents.contains(&block_hash) {
+            "verified"
+        } else if self
+            .abort_intent_verifications_in_flight
+            .contains(&block_hash)
+        {
+            "in_flight"
+        } else if self
+            .pending_abort_intent_verifications
+            .contains_key(&block_hash)
+        {
+            "pending_remote_headers"
+        } else {
+            "NOT_STARTED"
+        };
+
+        warn!(
+            block_hash = ?block_hash,
+            height = block.header.height.0,
+            proposer = ?block.header.proposer,
+            certs = block.certificates.len(),
+            txs = block.transaction_count(),
+            state_root = state_root_status,
+            tx_root = tx_root_status,
+            receipt_root = receipt_root_status,
+            abort_intents = abort_status,
+            "View change — block verification was incomplete"
+        );
     }
 
     // ─── State root ──────────────────────────────────────────────────────
