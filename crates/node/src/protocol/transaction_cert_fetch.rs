@@ -40,7 +40,7 @@ impl Default for TxCertFetchConfig {
         Self {
             max_concurrent: 4,
             max_rounds: 3,
-            max_hashes_per_request: 64,
+            max_hashes_per_request: 1024 * 8,
         }
     }
 }
@@ -383,7 +383,7 @@ mod tests {
         let config = TxCertFetchConfig::default();
         assert_eq!(config.max_concurrent, 4);
         assert_eq!(config.max_rounds, 3);
-        assert_eq!(config.max_hashes_per_request, 64);
+        assert_eq!(config.max_hashes_per_request, 1024 * 8);
     }
 
     #[test]

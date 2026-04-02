@@ -46,12 +46,6 @@ use crate::accumulator::ExecutionAccumulator;
 use crate::execution_cache::ExecutionCache;
 use crate::trackers::{CertificateTracker, VoteTracker};
 
-/// Minimum number of blocks to retain wave state (accumulators, vote trackers)
-/// and speculative execution results. After this many blocks, waves with no
-/// remaining active wave_assignments are eligible for pruning. Waves with
-/// active assignments are kept indefinitely until all transactions resolve.
-const WAVE_RETENTION_BLOCKS: u64 = 50;
-
 /// Number of blocks to retain early arrival votes/certificates before cleanup.
 /// If an early arrival hasn't been processed within this many blocks, it's
 /// likely stale and should be removed to prevent unbounded memory growth.
@@ -177,6 +171,12 @@ pub struct ExecutionState {
     // ═══════════════════════════════════════════════════════════════════════
     // Early arrivals (before tracking starts)
     // ═══════════════════════════════════════════════════════════════════════
+    /// Execution results that arrived before the wave was assigned.
+    /// This happens with speculative execution — results arrive before
+    /// on_block_committed creates the wave/accumulator.
+    /// Maps tx_hash -> TxExecutionOutcome. Replayed during assign_waves.
+    early_execution_results: HashMap<Hash, TxExecutionOutcome>,
+
     /// ProvisioningComplete events that arrived before the block was committed.
     /// This can happen when provisions reach quorum before we've seen the block.
     /// Maps tx_hash -> (provisions, first_arrival_height) for cleanup of stale entries.
@@ -342,6 +342,7 @@ impl ExecutionState {
             wave_assignments: HashMap::new(),
             early_votes: HashMap::new(),
             certificate_trackers: HashMap::new(),
+            early_execution_results: HashMap::new(),
             early_provisioning_complete: HashMap::new(),
             early_certificates: HashMap::new(),
             speculative_results: HashMap::new(),
@@ -481,6 +482,31 @@ impl ExecutionState {
             }
         }
 
+        // Replay any early execution results that arrived before wave setup
+        // (e.g. speculative execution completing before on_block_committed).
+        let early_tx_hashes: Vec<Hash> = self
+            .early_execution_results
+            .keys()
+            .filter(|h| self.wave_assignments.contains_key(h))
+            .copied()
+            .collect();
+        if !early_tx_hashes.is_empty() {
+            tracing::debug!(
+                block_hash = ?block_hash,
+                count = early_tx_hashes.len(),
+                "Replaying early execution results into accumulators"
+            );
+            for tx_hash in early_tx_hashes {
+                if let Some(outcome) = self.early_execution_results.remove(&tx_hash) {
+                    if let Some(wave_key) = self.wave_assignments.get(&tx_hash).cloned() {
+                        if let Some(acc) = self.accumulators.get_mut(&wave_key) {
+                            acc.record_result(tx_hash, outcome);
+                        }
+                    }
+                }
+            }
+        }
+
         tracing::debug!(
             block_hash = ?block_hash,
             wave_count = self.accumulators.iter()
@@ -499,6 +525,9 @@ impl ExecutionState {
     /// deterministic voting at each consensus height.
     pub fn record_execution_result(&mut self, tx_hash: Hash, outcome: TxExecutionOutcome) {
         let Some(wave_key) = self.wave_assignments.get(&tx_hash).cloned() else {
+            // Wave not assigned yet (e.g. speculative execution completed before
+            // on_block_committed created the wave). Buffer for replay.
+            self.early_execution_results.insert(tx_hash, outcome);
             return;
         };
 
@@ -1620,16 +1649,16 @@ impl ExecutionState {
     ///
     /// Also prunes early_votes for waves that were never set up.
     fn prune_execution_state(&mut self) {
-        let cutoff = self.committed_height.saturating_sub(WAVE_RETENTION_BLOCKS);
-
         // Build set of accumulator keys still referenced by active wave assignments.
         let active_keys: std::collections::HashSet<&(Hash, WaveId)> =
             self.wave_assignments.values().collect();
 
-        // Prune accumulators only when old enough AND no active assignments remain.
+        // Prune accumulators only when no active wave assignments reference them.
+        // Waves must be retained until they resolve (EC formed + TC committed),
+        // regardless of age. Time-based pruning would destroy accumulator state
+        // needed for abort intents to take effect.
         let before_acc = self.accumulators.len();
-        self.accumulators
-            .retain(|key, acc| acc.block_height() > cutoff || active_keys.contains(key));
+        self.accumulators.retain(|key, _| active_keys.contains(key));
         let pruned_acc = before_acc - self.accumulators.len();
 
         // Prune vote trackers — same keys as accumulators
@@ -1638,13 +1667,23 @@ impl ExecutionState {
             .retain(|key, _| self.accumulators.contains_key(key));
         let pruned_vt = before_vt - self.vote_trackers.len();
 
-        // Prune early execution votes — votes for waves that were never set up
-        // and are now too old to matter
+        // Prune early execution votes that have been consumed (accumulator exists
+        // and would have replayed them) or that are stale (50+ blocks old).
+        // We must NOT prune votes for blocks that haven't committed yet — those
+        // votes arrived before the accumulator was created and will be replayed
+        // when setup_execution_tracking runs during on_block_committed.
+        let ev_cutoff = self.committed_height.saturating_sub(50);
         let before_ev = self.early_votes.len();
-        self.early_votes.retain(|_, votes| {
+        self.early_votes.retain(|key, votes| {
+            // If the accumulator already exists, the votes were replayed during
+            // setup_execution_tracking — safe to prune any leftovers.
+            if self.accumulators.contains_key(key) {
+                return false;
+            }
+            // No accumulator yet — keep unless stale.
             votes
                 .first()
-                .map(|v| v.block_height > cutoff)
+                .map(|v| v.block_height > ev_cutoff)
                 .unwrap_or(false)
         });
         let pruned_ev = before_ev - self.early_votes.len();
@@ -1654,8 +1693,7 @@ impl ExecutionState {
                 pruned_acc,
                 pruned_vt,
                 pruned_ev,
-                cutoff_height = cutoff,
-                "Pruned stale wave state"
+                "Pruned resolved wave state"
             );
         }
     }
@@ -1769,7 +1807,7 @@ impl ExecutionState {
 
     /// Prune stale pending speculative executions whose callbacks never arrived.
     fn prune_pending_speculative(&mut self) {
-        let cutoff = self.committed_height.saturating_sub(WAVE_RETENTION_BLOCKS);
+        let cutoff = self.committed_height.saturating_sub(50);
 
         let before = self.pending_speculative_executions.len();
         self.pending_speculative_executions
