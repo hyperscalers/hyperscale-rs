@@ -635,11 +635,12 @@ impl ExecutionState {
 
         let tracker = self.vote_trackers.get_mut(&key).unwrap();
 
-        if tracker.has_seen_validator(validator_id) {
+        // buffer_unverified_vote handles dedup internally — it rejects same
+        // receipt_root duplicates but accepts re-votes (different receipt_root)
+        // for abort override convergence.
+        if !tracker.buffer_unverified_vote(vote, public_key, voting_power) {
             return vec![];
         }
-
-        tracker.buffer_unverified_vote(vote, public_key, voting_power);
 
         self.maybe_trigger_vote_verification(key)
     }
@@ -758,6 +759,11 @@ impl ExecutionState {
                 return vec![];
             }
         };
+
+        // Remove the vote tracker — this EC is the shard's final answer for
+        // the wave. Prevents a second EC from forming if abort-override re-votes
+        // arrive after the EC is already dispatched.
+        self.vote_trackers.remove(&key);
 
         tracing::debug!(
             block_hash = ?key.0,

@@ -10,7 +10,7 @@
 //! we'll never use.
 
 use hyperscale_types::{Bls12381G1PublicKey, ExecutionVote, Hash, ValidatorId, WaveId};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Tracks execution votes for a specific wave within a block.
 ///
@@ -33,6 +33,8 @@ pub struct VoteTracker {
     votes_by_receipt_root: BTreeMap<Hash, Vec<ExecutionVote>>,
     /// Voting power per receipt root (verified votes only).
     power_by_receipt_root: BTreeMap<Hash, u64>,
+    /// Per-validator voting power for verified votes (for accurate removal on re-vote).
+    verified_power: HashMap<ValidatorId, u64>,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Unverified votes (buffered until quorum possible)
@@ -57,6 +59,7 @@ impl VoteTracker {
             quorum,
             votes_by_receipt_root: BTreeMap::new(),
             power_by_receipt_root: BTreeMap::new(),
+            verified_power: HashMap::new(),
             unverified_votes: Vec::new(),
             unverified_power: 0,
             seen_validators: HashSet::new(),
@@ -86,6 +89,10 @@ impl VoteTracker {
     /// Buffer an unverified vote for later batch verification.
     ///
     /// Returns `true` if the vote was buffered, `false` if it was a duplicate.
+    /// Re-votes (same validator, different receipt_root) are accepted — the old
+    /// vote is removed so the replacement can be verified. This supports abort
+    /// override convergence: when an abort intent overrides an execution result,
+    /// validators re-vote with the updated receipt_root.
     pub fn buffer_unverified_vote(
         &mut self,
         vote: ExecutionVote,
@@ -95,7 +102,30 @@ impl VoteTracker {
         let validator_id = vote.validator;
 
         if self.seen_validators.contains(&validator_id) {
-            return false;
+            // Check if this is a re-vote (different receipt_root).
+            let is_revote_unverified = self.unverified_votes.iter().any(|(v, _, _)| {
+                v.validator == validator_id && v.receipt_root != vote.receipt_root
+            });
+            let is_revote_verified = self.votes_by_receipt_root.iter().any(|(root, votes)| {
+                *root != vote.receipt_root && votes.iter().any(|v| v.validator == validator_id)
+            });
+
+            if !is_revote_unverified && !is_revote_verified {
+                return false; // same receipt_root, genuine duplicate
+            }
+
+            // Remove old unverified vote if present
+            self.unverified_votes.retain(|(v, _, p)| {
+                if v.validator == validator_id {
+                    self.unverified_power = self.unverified_power.saturating_sub(*p);
+                    false
+                } else {
+                    true
+                }
+            });
+
+            // Remove old verified vote if present
+            self.remove_verified_vote(validator_id);
         }
 
         self.seen_validators.insert(validator_id);
@@ -151,13 +181,49 @@ impl VoteTracker {
     // ═══════════════════════════════════════════════════════════════════════
 
     /// Add a verified vote and its voting power.
+    ///
+    /// If the validator already has a verified vote under a different
+    /// receipt_root (abort-override re-vote), the old vote is removed first.
     pub fn add_verified_vote(&mut self, vote: ExecutionVote, power: u64) {
+        let validator = vote.validator;
         let receipt_root = vote.receipt_root;
+
+        // Remove any existing verified vote from a different receipt_root
+        self.remove_verified_vote(validator);
+
         self.votes_by_receipt_root
             .entry(receipt_root)
             .or_default()
             .push(vote);
         *self.power_by_receipt_root.entry(receipt_root).or_insert(0) += power;
+        self.verified_power.insert(validator, power);
+    }
+
+    /// Remove a validator's verified vote from whatever receipt_root it's under.
+    fn remove_verified_vote(&mut self, validator: ValidatorId) {
+        let power = match self.verified_power.remove(&validator) {
+            Some(p) => p,
+            None => return, // no verified vote to remove
+        };
+
+        let mut empty_roots = Vec::new();
+        for (root, votes) in &mut self.votes_by_receipt_root {
+            let before = votes.len();
+            votes.retain(|v| v.validator != validator);
+            if votes.len() < before {
+                if let Some(p) = self.power_by_receipt_root.get_mut(root) {
+                    *p = p.saturating_sub(power);
+                }
+                if votes.is_empty() {
+                    empty_roots.push(*root);
+                }
+                break; // validator can only be under one root
+            }
+        }
+        for root in empty_roots {
+            self.votes_by_receipt_root.remove(&root);
+            self.power_by_receipt_root.remove(&root);
+        }
     }
 
     /// Check if quorum is reached for any receipt root (verified votes only).
