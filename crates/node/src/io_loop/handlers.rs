@@ -181,6 +181,20 @@ where
                 response
             });
 
+        // ── certificate.request → tx cert fetch serving ─────────────
+
+        {
+            use crate::protocol::transaction_cert_fetch::serve_certificate_request;
+            use hyperscale_messages::request::GetCertificatesRequest;
+
+            let storage = Arc::clone(&self.storage);
+            let cert_cache = Arc::clone(&self.cert_cache);
+            self.network
+                .register_request_handler::<GetCertificatesRequest>(move |req| {
+                    serve_certificate_request(&*storage, &cert_cache, req)
+                });
+        }
+
         // ── execution_cert.request → cert cache lookup ────────────────
 
         let cert_cache = Arc::clone(&self.exec_cert_cache);

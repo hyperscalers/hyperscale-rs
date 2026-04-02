@@ -8,8 +8,8 @@
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, BlockManifest, BlockVote, CommittedBlockHeader,
     DatabaseUpdates, EpochConfig, EpochId, ExecutionCertificate, ExecutionVote, Hash,
-    ProvisionBatch, QuorumCertificate, RoutableTransaction, ShardGroupId, TxOutcome, ValidatorId,
-    WaveId,
+    ProvisionBatch, QuorumCertificate, RoutableTransaction, ShardGroupId, TransactionCertificate,
+    TxOutcome, ValidatorId, WaveId,
 };
 use std::sync::Arc;
 
@@ -253,6 +253,12 @@ pub enum ProtocolEvent {
         transactions: Vec<Arc<RoutableTransaction>>,
     },
 
+    /// Fetched transaction certificates delivered to state machine.
+    CertificateFetchDelivered {
+        block_hash: Hash,
+        certificates: Vec<Arc<TransactionCertificate>>,
+    },
+
     // ═══════════════════════════════════════════════════════════════════════
     // Storage Callbacks
     // ═══════════════════════════════════════════════════════════════════════
@@ -407,6 +413,7 @@ impl ProtocolEvent {
 
             // Fetch Delivery
             ProtocolEvent::TransactionFetchDelivered { .. } => "TransactionFetchDelivered",
+            ProtocolEvent::CertificateFetchDelivered { .. } => "CertificateFetchDelivered",
 
             // Storage Callbacks
             ProtocolEvent::BlockFetched { .. } => "BlockFetched",

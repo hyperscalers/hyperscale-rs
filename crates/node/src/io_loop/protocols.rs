@@ -6,6 +6,7 @@ use crate::protocol::fetch::FetchOutput;
 use crate::protocol::inclusion_proof_fetch::InclusionProofFetchOutput;
 use crate::protocol::provision_fetch::ProvisionFetchOutput;
 use crate::protocol::sync::SyncOutput;
+use crate::protocol::transaction_cert_fetch::TxCertFetchOutput;
 use hyperscale_core::{NodeInput, ProtocolEvent, TimerId};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_metrics as metrics;
@@ -438,6 +439,54 @@ where
         }
     }
 
+    /// Process TxCertFetchProtocol outputs.
+    ///
+    /// `Fetch` sends a single-peer network request for transaction certificates.
+    /// `Deliver` feeds certificates into the state machine via `CertificateFetchDelivered`.
+    pub(super) fn process_tx_cert_fetch_outputs(&mut self, outputs: Vec<TxCertFetchOutput>) {
+        for output in outputs {
+            match output {
+                TxCertFetchOutput::Fetch {
+                    block_hash,
+                    proposer: _,
+                    cert_hashes,
+                    peer,
+                } => {
+                    use hyperscale_messages::request::GetCertificatesRequest;
+                    let request = GetCertificatesRequest::new(block_hash, cert_hashes);
+                    let sender = self.event_sender.clone();
+                    self.network.request(
+                        &[peer],
+                        None,
+                        request,
+                        Box::new(move |result| match result {
+                            Ok(response) => {
+                                let certs = response.into_certificates();
+                                let _ = sender.send(NodeInput::CertificateReceived {
+                                    block_hash,
+                                    certificates: certs,
+                                });
+                            }
+                            Err(_) => {
+                                let _ =
+                                    sender.send(NodeInput::FetchCertificatesFailed { block_hash });
+                            }
+                        }),
+                    );
+                }
+                TxCertFetchOutput::Deliver {
+                    block_hash,
+                    certificates,
+                } => {
+                    self.feed_event(ProtocolEvent::CertificateFetchDelivered {
+                        block_hash,
+                        certificates,
+                    });
+                }
+            }
+        }
+    }
+
     /// Set or cancel the periodic fetch tick timer based on protocol state.
     ///
     /// When the fetch protocol has pending work, a recurring timer fires
@@ -449,11 +498,13 @@ where
         let has_provision_work = self.provision_fetch_protocol.has_pending();
         let has_inclusion_proof_work = self.inclusion_proof_fetch_protocol.has_pending();
         let has_exec_cert_work = self.exec_cert_fetch_protocol.has_pending();
+        let has_tx_cert_work = self.tx_cert_fetch_protocol.has_pending();
         let has_header_work = self.header_fetch_protocol.has_pending();
         if has_fetch_work
             || has_provision_work
             || has_inclusion_proof_work
             || has_exec_cert_work
+            || has_tx_cert_work
             || has_header_work
         {
             self.pending_timer_ops.push(TimerOp::Set {

@@ -811,6 +811,20 @@ pub enum Action {
         tx_hashes: Vec<Hash>,
     },
 
+    /// Request the runner to fetch missing transaction certificates for a pending block.
+    ///
+    /// Emitted when a block header arrives but certificates are missing from
+    /// the local cache. The runner fetches from the proposer or peers and delivers
+    /// results via `ProtocolEvent::CertificateFetchDelivered`.
+    FetchCertificates {
+        /// Hash of the block that needs these certificates.
+        block_hash: Hash,
+        /// The proposer of the block (preferred fetch target).
+        proposer: ValidatorId,
+        /// Hashes of the missing certificates.
+        cert_hashes: Vec<Hash>,
+    },
+
     /// Cancel any pending fetch operations for a block.
     ///
     /// Emitted when a pending block is removed from BFT state (committed, stale,
@@ -1026,6 +1040,7 @@ impl Action {
             // Runner I/O Requests
             Action::StartSync { .. } => "StartSync",
             Action::FetchTransactions { .. } => "FetchTransactions",
+            Action::FetchCertificates { .. } => "FetchCertificates",
             Action::CancelFetch { .. } => "CancelFetch",
             Action::RequestMissingProvisions { .. } => "RequestMissingProvisions",
             Action::RequestMissingExecutionCerts { .. } => "RequestMissingExecutionCerts",

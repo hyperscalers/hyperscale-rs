@@ -3,6 +3,7 @@
 //! These messages are sent in reply to request messages.
 
 mod block;
+mod certificate;
 mod committed_header;
 mod execution_cert;
 mod provision;
@@ -10,6 +11,7 @@ mod transaction;
 mod tx_inclusion_proof;
 
 pub use block::GetBlockResponse;
+pub use certificate::GetCertificatesResponse;
 pub use committed_header::GetCommittedBlockHeaderResponse;
 pub use execution_cert::GetExecutionCertsResponse;
 pub use provision::GetProvisionsResponse;

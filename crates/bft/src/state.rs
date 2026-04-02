@@ -3987,6 +3987,104 @@ impl BftState {
         actions
     }
 
+    /// Handle fetched transaction certificates being delivered.
+    ///
+    /// Called when the certificate fetch protocol delivers certificates for a
+    /// pending block. Adds certificates to the pending block, and if the block
+    /// is now complete, triggers QC verification.
+    pub fn on_certificate_fetch_received(
+        &mut self,
+        topology: &TopologySnapshot,
+        block_hash: Hash,
+        certificates: Vec<Arc<TransactionCertificate>>,
+    ) -> Vec<Action> {
+        let validator_id = topology.local_validator_id();
+
+        // First phase: add certificates and check state
+        let (added, still_missing, is_complete, needs_construct) = {
+            let Some(pending) = self.pending_blocks.get_mut(&block_hash) else {
+                warn!(
+                    block_hash = ?block_hash,
+                    "Received fetched certificates for unknown/completed block"
+                );
+                return vec![];
+            };
+
+            let mut added = 0;
+            for cert in certificates {
+                if pending.add_certificate(cert) {
+                    added += 1;
+                }
+            }
+
+            let still_missing = pending.missing_certificate_count();
+            let is_complete = pending.is_complete();
+            let needs_construct = is_complete && pending.block().is_none();
+
+            (added, still_missing, is_complete, needs_construct)
+        };
+
+        debug!(
+            validator = ?validator_id,
+            block_hash = ?block_hash,
+            added = added,
+            still_missing = still_missing,
+            "Added fetched certificates to pending block"
+        );
+
+        // Check if block is now complete
+        if !is_complete {
+            // Still missing data — re-request remaining certificates
+            let Some(pending) = self.pending_blocks.get(&block_hash) else {
+                return vec![];
+            };
+
+            let mut actions = Vec::new();
+            let proposer = pending.header().proposer;
+
+            let missing_certs = pending.missing_certificates();
+            if !missing_certs.is_empty() {
+                warn!(
+                    validator = ?validator_id,
+                    block_hash = ?block_hash,
+                    still_missing = missing_certs.len(),
+                    "Re-requesting remaining missing certificates"
+                );
+                actions.push(Action::FetchCertificates {
+                    block_hash,
+                    proposer,
+                    cert_hashes: missing_certs,
+                });
+            }
+
+            return actions;
+        }
+
+        // Second phase: construct block if needed
+        if needs_construct {
+            if let Some(pending) = self.pending_blocks.get_mut(&block_hash) {
+                if let Err(e) = pending.construct_block() {
+                    warn!("Failed to construct block after cert fetch: {}", e);
+                    return vec![];
+                }
+            }
+        }
+
+        info!(
+            validator = ?validator_id,
+            block_hash = ?block_hash,
+            "Pending block completed after certificate fetch"
+        );
+
+        // Trigger QC verification (for non-genesis) or vote directly (for genesis)
+        let mut actions = self.trigger_qc_verification_or_vote(topology, block_hash);
+
+        // Check if this block had a pending commit waiting for data
+        actions.extend(self.try_commit_pending_data(topology, block_hash));
+
+        actions
+    }
+
     // ═══════════════════════════════════════════════════════════════════════════
     // Transaction Monitoring
     // ═══════════════════════════════════════════════════════════════════════════
@@ -4231,6 +4329,7 @@ impl BftState {
 
         let now = self.now;
         let tx_timeout = self.config.transaction_fetch_timeout;
+        let cert_timeout = self.config.certificate_fetch_timeout;
         let mut actions = Vec::new();
 
         for (block_hash, pending) in &self.pending_blocks {
@@ -4261,6 +4360,24 @@ impl BftState {
                     block_hash: *block_hash,
                     proposer,
                     tx_hashes: missing_txs,
+                });
+            }
+
+            // Check if we should fetch missing certificates
+            let missing_certs = pending.missing_certificates();
+            if !missing_certs.is_empty() && age >= cert_timeout {
+                warn!(
+                    validator = ?topology.local_validator_id(),
+                    block_hash = ?block_hash,
+                    missing_cert_count = missing_certs.len(),
+                    age_ms = age.as_millis(),
+                    timeout_ms = cert_timeout.as_millis(),
+                    "Fetch timeout reached, requesting missing certificates"
+                );
+                actions.push(Action::FetchCertificates {
+                    block_hash: *block_hash,
+                    proposer,
+                    cert_hashes: missing_certs,
                 });
             }
         }

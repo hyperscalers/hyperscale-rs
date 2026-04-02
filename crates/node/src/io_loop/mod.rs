@@ -34,6 +34,7 @@ use crate::protocol::inclusion_proof_fetch::{
 };
 use crate::protocol::provision_fetch::{ProvisionFetchInput, ProvisionFetchProtocol};
 use crate::protocol::sync::{SyncInput, SyncProtocol, SyncStatus};
+use crate::protocol::transaction_cert_fetch::{TxCertFetchInput, TxCertFetchProtocol};
 use crate::NodeStateMachine;
 use arc_swap::ArcSwap;
 use hyperscale_core::{Action, NodeInput, ProtocolEvent, StateMachine, TimerId};
@@ -186,6 +187,9 @@ where
     // Execution certificate fetch protocol (cross-shard exec cert fetching with peer rotation)
     exec_cert_fetch_protocol: ExecCertFetchProtocol,
 
+    // Transaction certificate fetch protocol (local shard cert fetching with peer rotation)
+    tx_cert_fetch_protocol: TxCertFetchProtocol,
+
     // Committed block header fetch protocol (cross-shard header fetching with peer rotation)
     header_fetch_protocol: HeaderFetchProtocol,
 
@@ -271,6 +275,9 @@ where
         let inclusion_proof_fetch_protocol =
             InclusionProofFetchProtocol::new(config.inclusion_proof_fetch.clone());
         let exec_cert_fetch_protocol = ExecCertFetchProtocol::new(config.exec_cert_fetch.clone());
+        let tx_cert_fetch_protocol = TxCertFetchProtocol::new(
+            crate::protocol::transaction_cert_fetch::TxCertFetchConfig::default(),
+        );
         let header_fetch_protocol =
             HeaderFetchProtocol::new(crate::protocol::header_fetch::HeaderFetchConfig::default());
         Self {
@@ -296,6 +303,7 @@ where
             provision_fetch_protocol,
             inclusion_proof_fetch_protocol,
             exec_cert_fetch_protocol,
+            tx_cert_fetch_protocol,
             header_fetch_protocol,
             validation_batch: BatchAccumulator::new(b.tx_validation_max, b.tx_validation_window),
             committed_header_batch: BatchAccumulator::new(
@@ -600,6 +608,9 @@ where
                     .exec_cert_fetch_protocol
                     .handle(ExecCertFetchInput::Tick);
                 self.process_exec_cert_fetch_outputs(cert_outputs);
+                // Also tick the tx cert fetch protocol.
+                let tx_cert_outputs = self.tx_cert_fetch_protocol.handle(TxCertFetchInput::Tick);
+                self.process_tx_cert_fetch_outputs(tx_cert_outputs);
                 // Also tick the header fetch protocol.
                 let header_outputs = self.header_fetch_protocol.handle(HeaderFetchInput::Tick);
                 self.process_header_fetch_outputs(header_outputs);
@@ -707,6 +718,32 @@ where
                     .exec_cert_fetch_protocol
                     .handle(ExecCertFetchInput::Tick);
                 self.process_exec_cert_fetch_outputs(tick_outputs);
+                self.update_fetch_tick_timer();
+            }
+
+            // ── Transaction certificate fetch protocol ────────────────
+            NodeInput::CertificateReceived {
+                block_hash,
+                certificates,
+            } => {
+                let outputs = self
+                    .tx_cert_fetch_protocol
+                    .handle(TxCertFetchInput::Received {
+                        block_hash,
+                        certificates,
+                    });
+                self.process_tx_cert_fetch_outputs(outputs);
+                self.update_fetch_tick_timer();
+            }
+
+            NodeInput::FetchCertificatesFailed { block_hash } => {
+                let outputs = self
+                    .tx_cert_fetch_protocol
+                    .handle(TxCertFetchInput::Failed { block_hash });
+                self.process_tx_cert_fetch_outputs(outputs);
+                // Tick to retry with next peer immediately.
+                let tick_outputs = self.tx_cert_fetch_protocol.handle(TxCertFetchInput::Tick);
+                self.process_tx_cert_fetch_outputs(tick_outputs);
                 self.update_fetch_tick_timer();
             }
 

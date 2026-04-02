@@ -1167,6 +1167,14 @@ impl StateMachine for NodeStateMachine {
                 block_hash,
                 transactions,
             ),
+            ProtocolEvent::CertificateFetchDelivered {
+                block_hash,
+                certificates,
+            } => self.bft.on_certificate_fetch_received(
+                self.topology.snapshot(),
+                block_hash,
+                certificates,
+            ),
             // ── Storage / Sync ───────────────────────────────────────────
             ProtocolEvent::BlockFetched { .. } => vec![],
             ProtocolEvent::SyncBlockReadyToApply { block, qc } => self
