@@ -23,13 +23,6 @@
 ///
 /// Implementations schedule fire-and-forget closures on appropriate pools.
 /// Results are communicated back via channels captured in the closures.
-///
-/// # Parallelism Guarantee
-///
-/// Implementations must ensure that `rayon::par_iter()` and similar parallel
-/// primitives used inside spawned closures execute on the correct pool (not the
-/// global rayon pool). The pooled implementation achieves this by wrapping
-/// closures in `rayon::ThreadPool::install()`.
 pub trait Dispatch: Send + Sync + Clone {
     /// Spawn a consensus-critical crypto task.
     ///
@@ -77,17 +70,4 @@ pub trait Dispatch: Send + Sync + Clone {
 
     /// Current provisions pool queue depth.
     fn provisions_queue_depth(&self) -> usize;
-
-    /// Map a function over items in parallel on the current pool.
-    ///
-    /// Uses `rayon::par_iter` in production, sequential iteration in simulation.
-    /// This is a **blocking** call — it returns when all items are processed.
-    ///
-    /// **Contract**: Must be called from within a rayon pool context
-    /// (i.e., inside a `spawn_*` closure). If called from the main thread,
-    /// falls to the global rayon pool in production.
-    fn map_local<T, R>(&self, items: &[T], f: impl Fn(&T) -> R + Send + Sync) -> Vec<R>
-    where
-        T: Sync,
-        R: Send;
 }

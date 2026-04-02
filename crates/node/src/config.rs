@@ -60,8 +60,8 @@ impl Default for BatchConfig {
             broadcast_cert_max: 64,
             broadcast_cert_window: Duration::from_millis(15),
 
-            tx_validation_max: 128,
-            tx_validation_window: Duration::from_millis(20),
+            tx_validation_max: 512,
+            tx_validation_window: Duration::from_millis(50),
 
             committed_header_max: 32,
             committed_header_window: Duration::from_millis(15),

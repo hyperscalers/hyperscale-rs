@@ -561,15 +561,6 @@ impl Dispatch for PooledDispatch {
     fn provisions_queue_depth(&self) -> usize {
         self.provisions_pending.load(Ordering::Relaxed)
     }
-
-    fn map_local<T, R>(&self, items: &[T], f: impl Fn(&T) -> R + Send + Sync) -> Vec<R>
-    where
-        T: Sync,
-        R: Send,
-    {
-        use rayon::prelude::*;
-        items.par_iter().map(f).collect()
-    }
 }
 
 /// Pin the current thread to a specific CPU core.

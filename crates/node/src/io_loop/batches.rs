@@ -37,12 +37,11 @@ where
 
         let validator = self.tx_validator.clone();
         let event_tx = self.event_sender.clone();
-        let dispatch = self.dispatch.clone();
         self.dispatch.spawn_tx_validation(move || {
-            // Validate in parallel across all tx_validation pool threads,
-            // then send results sequentially to preserve ordering.
-            let results: Vec<bool> =
-                dispatch.map_local(&batch, |tx| validator.validate_transaction(tx).is_ok());
+            let results: Vec<bool> = batch
+                .iter()
+                .map(|tx| validator.validate_transaction(tx).is_ok())
+                .collect();
 
             let mut failed_hashes = Vec::new();
             for (tx, valid) in batch.into_iter().zip(results) {
