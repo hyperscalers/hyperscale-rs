@@ -814,18 +814,39 @@ impl TransactionCertificate {
     /// For single-shard transactions, returns the shard's receipt hash directly.
     /// For cross-shard transactions, computes a merkle root over each shard's
     /// receipt hash in shard ID order (deterministic via BTreeMap).
-    /// Aborted shards contribute `Hash::ZERO` to the merkle computation.
+    ///
+    /// Aborted transactions always return `Hash::ZERO` — the abort decision is
+    /// terminal and independent of which shard proofs have arrived. This ensures
+    /// deterministic receipt roots across validators even when abort fast-path
+    /// creates TCs with partial shard_proofs (some shards may not have reported
+    /// yet when the first abort proof triggers TC creation).
     pub fn receipt_hash(&self) -> Hash {
+        if self.decision == TransactionDecision::Aborted {
+            return Hash::ZERO;
+        }
         let hashes: Vec<Hash> = self
             .shard_proofs
             .values()
             .map(|proof| proof.receipt_hash_or_zero())
             .collect();
-        match hashes.len() {
+        let base = match hashes.len() {
             0 => Hash::ZERO,
             1 => hashes[0],
             _ => crate::compute_merkle_root(&hashes),
-        }
+        };
+        // Mix in the decision byte so that Accept and Reject produce
+        // distinct receipt hashes even when the shard proofs are identical.
+        // Without this, a byzantine proposer could swap Accept ↔ Reject
+        // without the receipt_root check detecting it.
+        let decision_byte = match self.decision {
+            TransactionDecision::Accept => 0x01,
+            TransactionDecision::Reject => 0x02,
+            TransactionDecision::Aborted => unreachable!(),
+        };
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(base.as_bytes());
+        hasher.update(&[decision_byte]);
+        Hash::from_hash_bytes(hasher.finalize().as_bytes())
     }
 }
 

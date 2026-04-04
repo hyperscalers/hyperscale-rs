@@ -280,12 +280,16 @@ impl Default for ExecutionState {
 struct ExpectedExecCert {
     /// Local committed height when we first learned about this expected cert.
     discovered_at: u64,
-    /// Whether we've already sent a fallback request for this cert.
-    requested: bool,
+    /// Local committed height when we last sent a fallback request, if any.
+    /// `None` means never requested. Allows periodic re-requests with cooldown.
+    last_requested_at: Option<u64>,
 }
 
-/// Number of blocks to wait before requesting missing execution certificates.
+/// Number of blocks to wait before the first fallback request.
 const EXEC_CERT_FALLBACK_TIMEOUT_BLOCKS: u64 = 10;
+
+/// Number of blocks between repeated fallback requests for the same cert.
+const EXEC_CERT_RETRY_INTERVAL_BLOCKS: u64 = 20;
 
 /// Per-shard recipient lists for provision broadcasting.
 type ShardRecipients = HashMap<ShardGroupId, Vec<ValidatorId>>;
@@ -474,9 +478,9 @@ impl ExecutionState {
             if let Some(early_votes) = self.early_votes.remove(&key) {
                 tracing::debug!(
                     block_hash = ?block_hash,
-                    wave = ?key.1,
+                    wave = %key.1,
                     count = early_votes.len(),
-                    "Collected early execution votes for replay"
+                    "Replaying early execution votes"
                 );
                 votes_to_replay.extend(early_votes);
             }
@@ -557,12 +561,17 @@ impl ExecutionState {
                 tx_hash = %tx_hash,
                 ?reason,
                 committed_height = self.committed_height,
-                "Abort intent for already-completed transaction (wave cleaned up)"
+                "Abort intent: no wave assignment (already cleaned up)"
             );
             return;
         };
 
         let Some(accumulator) = self.accumulators.get_mut(&wave_key) else {
+            tracing::debug!(
+                tx_hash = %tx_hash,
+                wave = %wave_key.1,
+                "Abort intent: no accumulator for wave"
+            );
             return;
         };
 
@@ -672,6 +681,12 @@ impl ExecutionState {
             return vec![];
         }
 
+        tracing::debug!(
+            block_hash = ?key.0,
+            wave = %key.1,
+            vote_count = votes.len(),
+            "Dispatching execution vote batch verification"
+        );
         vec![Action::VerifyAndAggregateExecutionVotes {
             wave_id: key.1,
             block_hash: key.0,
@@ -737,6 +752,13 @@ impl ExecutionState {
         let Some((receipt_root, vote_height, _total_power)) = tracker.check_quorum() else {
             return vec![];
         };
+
+        tracing::info!(
+            block_hash = ?key.0,
+            wave = %key.1,
+            vote_height,
+            "Execution vote quorum reached — aggregating certificate"
+        );
 
         let votes = tracker.take_votes(&receipt_root, vote_height);
         let committee = topology.local_committee().to_vec();
@@ -1013,7 +1035,7 @@ impl ExecutionState {
                     .entry(key)
                     .or_insert(ExpectedExecCert {
                         discovered_at: self.committed_height,
-                        requested: false,
+                        last_requested_at: None,
                     });
             }
         }
@@ -1025,19 +1047,29 @@ impl ExecutionState {
     /// that have exceeded the timeout.
     fn check_exec_cert_timeouts(&mut self, topology: &TopologySnapshot) -> Vec<Action> {
         let mut actions = Vec::new();
+        let current_height = self.committed_height;
         for ((source_shard, block_height, wave_id), expected) in &mut self.expected_exec_certs {
-            if expected.requested {
-                continue;
-            }
-            let age = self.committed_height.saturating_sub(expected.discovered_at);
-            if age >= EXEC_CERT_FALLBACK_TIMEOUT_BLOCKS {
-                expected.requested = true;
+            let age = current_height.saturating_sub(expected.discovered_at);
+
+            let should_request = match expected.last_requested_at {
+                // Never requested — use initial timeout
+                None => age >= EXEC_CERT_FALLBACK_TIMEOUT_BLOCKS,
+                // Previously requested — use retry interval
+                Some(last) => {
+                    current_height.saturating_sub(last) >= EXEC_CERT_RETRY_INTERVAL_BLOCKS
+                }
+            };
+
+            if should_request {
+                let is_retry = expected.last_requested_at.is_some();
+                expected.last_requested_at = Some(current_height);
                 let peers = topology.committee_for_shard(*source_shard).to_vec();
                 tracing::warn!(
                     source_shard = source_shard.0,
                     block_height = block_height,
                     wave = %wave_id,
                     age,
+                    retry = is_retry,
                     "Execution cert timeout — requesting fallback"
                 );
                 actions.push(Action::RequestMissingExecutionCerts {
@@ -1048,9 +1080,26 @@ impl ExecutionState {
                 });
             }
         }
-        // Prune old entries that have been requested and are very stale
-        self.expected_exec_certs
-            .retain(|_, e| self.committed_height.saturating_sub(e.discovered_at) < 100);
+        // Prune old entries that have been requested and are very stale,
+        // BUT keep entries whose transactions still have active certificate
+        // trackers waiting for the remote EC. Without this, txs whose local
+        // EC formed but remote EC never arrived stop retrying and are stuck
+        // permanently.
+        self.expected_exec_certs.retain(|(_, _, wave_id), e| {
+            let age = self.committed_height.saturating_sub(e.discovered_at);
+            if age < 100 {
+                return true;
+            }
+            // Check if any tx in a wave with this wave_id still has an active
+            // certificate tracker (waiting for remote proofs to form TC).
+            // If so, keep retrying the fetch.
+            let has_waiting_tracker = self.certificate_trackers.keys().any(|tx_hash| {
+                self.wave_assignments
+                    .get(tx_hash)
+                    .is_some_and(|(_, wid)| wid == wave_id)
+            });
+            has_waiting_tracker
+        });
 
         // Prune fulfilled set using local height when fulfilled (not remote
         // block height, which can differ significantly across shards).
@@ -1158,7 +1207,7 @@ impl ExecutionState {
         self.prune_early_arrivals();
         self.prune_execution_state();
         self.prune_finalized_certificates();
-        self.prune_certificate_trackers();
+        actions.extend(self.prune_certificate_trackers());
         self.prune_pending_provisioning();
         self.prune_execution_cache();
         self.prune_pending_speculative();
@@ -1585,7 +1634,7 @@ impl ExecutionState {
     ///
     /// Cleans up all transaction tracking state. The certificate itself is already
     /// persisted to storage by this point and can be fetched from there by peers.
-    pub fn remove_finalized_certificate(&mut self, tx_hash: &Hash) {
+    pub fn remove_finalized_certificate(&mut self, tx_hash: &Hash, decision: TransactionDecision) {
         self.finalized_certificates.remove(tx_hash);
 
         // Evict from execution cache — writes have been applied to JVT at this point.
@@ -1595,6 +1644,32 @@ impl ExecutionState {
         // This is the same cleanup done by cleanup_transaction() for aborts/deferrals,
         // but we need to do it here for successful completions too.
         self.pending_provisioning.remove(tx_hash);
+
+        // Remove this TX from the wave's expected set. The TC is canonical —
+        // this TX is done and should no longer block the wave from completing.
+        //
+        // All validators process committed blocks identically, so the reduced
+        // expected set is deterministic. The receipt_root will be computed over
+        // the remaining TXs only, and all validators will agree.
+        //
+        // If the TX already has a result in the accumulator (execution completed
+        // before the TC committed), remove_expected cleans it up. If not, the
+        // TX is simply removed from the expected set, unblocking the wave.
+        if let Some(wave_key) = self.wave_assignments.get(tx_hash).cloned() {
+            if let Some(accumulator) = self.accumulators.get_mut(&wave_key) {
+                let had_result = accumulator.has_result(tx_hash);
+                let complete = accumulator.remove_expected(tx_hash);
+                if !had_result {
+                    tracing::info!(
+                        tx_hash = %tx_hash,
+                        wave = %wave_key.1,
+                        ?decision,
+                        complete,
+                        "TC committed before local execution — removed from wave"
+                    );
+                }
+            }
+        }
 
         // Wave assignment cleanup — once removed, the accumulator becomes
         // eligible for pruning by prune_execution_state on the next cycle.
@@ -1725,7 +1800,7 @@ impl ExecutionState {
     ///
     /// Cross-shard transactions that stall (provisions never arrive, network
     /// partition) would otherwise leak trackers indefinitely.
-    fn prune_certificate_trackers(&mut self) {
+    fn prune_certificate_trackers(&mut self) -> Vec<Action> {
         let cutoff = self
             .committed_height
             .saturating_sub(STALE_TRACKING_RETENTION_BLOCKS);
@@ -1742,18 +1817,60 @@ impl ExecutionState {
         });
         let pruned = before - self.certificate_trackers.len();
 
-        // Also clean up associated execution cache entries for pruned trackers
+        // Clean up associated state for pruned trackers.
+        // Only create synthetic abort TCs for txs whose local EC was never
+        // formed (vote tracker still exists). If the EC was formed and
+        // broadcast, the remote shard may form a TC from it — aborting
+        // locally would create split-brain.
+        let mut actions = Vec::new();
         for tx_hash in &pruned_tx_hashes {
             self.execution_cache.remove(tx_hash);
+
+            // Check if the local EC was formed for this tx's wave.
+            // Vote tracker removed = EC was formed and broadcast.
+            let ec_was_formed = self
+                .wave_assignments
+                .get(tx_hash)
+                .is_some_and(|wave_key| !self.vote_trackers.contains_key(wave_key));
+
+            if ec_was_formed {
+                // EC was broadcast — we can't unilaterally abort. The remote
+                // shard may still form a TC. Keep the wave assignment so the
+                // expected_exec_certs retry stays alive.
+                tracing::info!(
+                    tx_hash = %tx_hash,
+                    "Stale certificate tracker pruned but EC was sent — cannot abort, will keep retrying remote EC"
+                );
+            } else {
+                // EC was never formed — safe to abort locally.
+                self.wave_assignments.remove(tx_hash);
+
+                let tx_cert = hyperscale_types::TransactionCertificate {
+                    transaction_hash: *tx_hash,
+                    decision: hyperscale_types::TransactionDecision::Aborted,
+                    shard_proofs: std::collections::BTreeMap::new(),
+                };
+                self.finalized_certificates.insert(
+                    *tx_hash,
+                    (std::sync::Arc::new(tx_cert), self.committed_height),
+                );
+
+                actions.push(Action::Continuation(ProtocolEvent::TransactionExecuted {
+                    tx_hash: *tx_hash,
+                    accepted: false,
+                }));
+            }
         }
 
         if pruned > 0 {
             tracing::warn!(
                 pruned,
                 cutoff_height = cutoff,
-                "Pruned stale certificate trackers for stuck transactions"
+                "Pruned stale certificate trackers — marking as failed"
             );
         }
+
+        actions
     }
 
     /// Prune stale pending provisioning entries for transactions whose

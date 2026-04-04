@@ -130,6 +130,20 @@ impl ExecutionAccumulator {
         self.completed.contains_key(tx_hash)
     }
 
+    /// Remove a transaction from the wave entirely.
+    ///
+    /// Called when a TC is committed for a transaction before local execution
+    /// completes. The TX is done (canonical decision made), so it should no
+    /// longer block the wave from completing. All validators process committed
+    /// blocks identically, so the reduced expected set is deterministic.
+    ///
+    /// Returns `true` if the wave is now complete after removal.
+    pub fn remove_expected(&mut self, tx_hash: &Hash) -> bool {
+        self.expected_txs.retain(|(h, _)| h != tx_hash);
+        self.completed.remove(tx_hash);
+        self.is_complete()
+    }
+
     /// Build the receipt data once all transactions are complete.
     ///
     /// Returns `(receipt_root, tx_outcomes)` where outcomes are in

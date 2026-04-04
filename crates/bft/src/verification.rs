@@ -355,9 +355,13 @@ impl VerificationPipeline {
         parent_state_root: Hash,
     ) {
         let current_root = self.last_committed_jvt_root;
+        // Only include non-Aborted certificates in the state root computation.
+        // Aborted TCs have no state changes — this matches the sync path which
+        // also excludes Aborted certificates when reconstructing DatabaseUpdates.
         let cert_tx_hashes: Vec<Hash> = block
             .certificates
             .iter()
+            .filter(|c| c.decision != hyperscale_types::TransactionDecision::Aborted)
             .map(|c| c.transaction_hash)
             .collect();
 

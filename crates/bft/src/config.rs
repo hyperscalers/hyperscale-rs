@@ -70,6 +70,15 @@ pub struct BftConfig {
     ///
     /// Set to Duration::ZERO to disable rate limiting (not recommended for production).
     pub min_block_interval: Duration,
+
+    /// Minimum number of blocks that must elapse before an ExecutionTimeout
+    /// abort intent is considered valid. Validators reject abort intents where
+    /// `block_height - committed_at < min_execution_timeout_blocks`.
+    ///
+    /// This prevents a byzantine proposer from aborting cross-shard transactions
+    /// prematurely. Must be <= the node's `EXECUTION_TIMEOUT_BLOCKS` constant
+    /// (the proposer-side threshold for generating timeout intents).
+    pub min_execution_timeout_blocks: u64,
 }
 
 impl Default for BftConfig {
@@ -87,6 +96,7 @@ impl Default for BftConfig {
             certificate_fetch_timeout: Duration::from_millis(500),
             cleanup_interval: Duration::from_secs(1),
             min_block_interval: Duration::from_millis(500),
+            min_execution_timeout_blocks: 30,
         }
     }
 }

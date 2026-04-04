@@ -160,14 +160,14 @@ where
                 let key = (certificate.block_hash, certificate.wave_id.clone());
                 if let Ok(mut cache) = self.exec_cert_cache.lock() {
                     cache.insert(key, certificate);
-                    // Prune entries older than 50 blocks if cache grows large
-                    if cache.len() > 500 {
+                    // Safety-net pruning: evict very old entries to bound memory.
+                    if cache.len() > 2000 {
                         let cutoff = cache
                             .values()
                             .map(|c| c.block_height)
                             .max()
                             .unwrap_or(0)
-                            .saturating_sub(50);
+                            .saturating_sub(500);
                         cache.retain(|_, c| c.block_height > cutoff);
                     }
                 }
@@ -563,24 +563,35 @@ where
                     storage.commit_prepared_block(prepared, &block.certificates, Some(consensus))
                 } else if !block.certificates.is_empty() {
                     // Sync path: no execution cache, reconstruct DatabaseUpdates
-                    // from receipts stored during sync. Aborted certificates have
-                    // no receipts (execution never ran) and no state changes.
+                    // from receipts stored during sync.
+                    //
+                    // Skip certificates where we have no local receipt:
+                    // - Aborted TCs: execution never ran, no state changes by design.
+                    // - Accept/Reject TCs where the TC was committed before local
+                    //   execution completed (removed from wave via remove_expected):
+                    //   we never produced a receipt, so we have no local writes.
+                    //   The state root was verified by 2f+1 validators; we trust
+                    //   the committed state and simply advance the JVT.
                     let per_cert: Vec<hyperscale_types::DatabaseUpdates> = block
                         .certificates
                         .iter()
                         .filter(|cert| {
                             cert.decision != hyperscale_types::TransactionDecision::Aborted
                         })
-                        .map(|cert| {
-                            let receipt = storage
-                                .get_ledger_receipt(&cert.transaction_hash)
-                                .unwrap_or_else(|| {
-                                    panic!(
-                                        "Missing receipt for certificate {} at height {} — \
-                                         sync response was incomplete and pre-storage failed",
-                                        cert.transaction_hash, height.0,
-                                    )
-                                });
+                        .filter_map(|cert| {
+                            let receipt = storage.get_ledger_receipt(&cert.transaction_hash);
+                            if receipt.is_none() {
+                                tracing::warn!(
+                                    tx_hash = %cert.transaction_hash,
+                                    height = height.0,
+                                    ?cert.decision,
+                                    "Sync path: no local receipt for certificate \
+                                     (TC committed before local execution) — skipping writes"
+                                );
+                            }
+                            receipt
+                        })
+                        .map(|receipt| {
                             let updates = hyperscale_storage::receipt_to_database_updates(&receipt);
                             hyperscale_storage::filter_updates_to_shard(
                                 &updates,

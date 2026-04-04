@@ -209,6 +209,11 @@ pub struct BftState {
     /// In-flight proposal awaiting `Event::ProposalBuilt` callback.
     pending_proposal: Option<PendingProposal>,
 
+    /// Lookup of committed tx hashes to their committed height.
+    /// Populated by the node state layer from the mempool on each block commit.
+    /// Used to validate execution timeout abort intents from proposers.
+    committed_tx_lookup: HashMap<Hash, BlockHeight>,
+
     /// Remote block headers for merkle inclusion proof validation in deferrals.
     /// Only headers with verified QCs (tracked in verification pipeline) are trusted.
     remote_headers: HashMap<(ShardGroupId, BlockHeight), Arc<CommittedBlockHeader>>,
@@ -309,6 +314,7 @@ impl BftState {
             pending_commits: std::collections::BTreeMap::new(),
             pending_commits_awaiting_data: HashMap::new(),
             pending_proposal: None,
+            committed_tx_lookup: HashMap::new(),
             remote_headers: HashMap::new(),
             remote_header_tips: HashMap::new(),
             config,
@@ -2009,9 +2015,32 @@ impl BftState {
                             abort.block_height.0, committed_at.0
                         ));
                     }
-                    // Note: We don't validate that enough blocks have passed - the proposer
-                    // determines the timeout threshold. If we disagree on thresholds, we'd
-                    // need configuration consensus, which is out of scope.
+                    // Reject premature timeouts: a minimum number of blocks must
+                    // elapse before an ExecutionTimeout is valid. Without this, a
+                    // byzantine proposer can abort any cross-shard TX immediately.
+                    let elapsed = abort.block_height.0.saturating_sub(committed_at.0);
+                    if elapsed < self.config.min_execution_timeout_blocks {
+                        return Err(format!(
+                            "Invalid abort: only {} blocks elapsed (min {}), tx {} committed at {}",
+                            elapsed,
+                            self.config.min_execution_timeout_blocks,
+                            abort.tx_hash,
+                            committed_at.0
+                        ));
+                    }
+                    // Verify the transaction was actually committed at the claimed height.
+                    // committed_tx_lookup is populated by the node state layer from the
+                    // mempool's in-flight tracking on each block commit.
+                    if let Some(&actual_height) = self.committed_tx_lookup.get(&abort.tx_hash) {
+                        if actual_height != *committed_at {
+                            return Err(format!(
+                                "Invalid abort: tx {} claimed committed at {} but was committed at {}",
+                                abort.tx_hash, committed_at.0, actual_height.0
+                            ));
+                        }
+                    }
+                    // If not in lookup, the tx may have already been finalized and
+                    // evicted, or committed before our tracking started. Allow it.
                 }
                 AbortReason::LivelockCycle { winner_tx_hash, .. } => {
                     // Verify hash ordering: loser (abort target) must have higher hash
@@ -4522,6 +4551,36 @@ impl BftState {
         &mut self,
     ) -> Vec<crate::verification::ReadyStateRootVerification> {
         self.verification.drain_ready_state_root_verifications()
+    }
+
+    /// Register committed transactions for execution timeout validation.
+    ///
+    /// Called by the node state layer after mempool processes a committed block.
+    /// Validators use this to verify that execution timeout abort intents
+    /// reference transactions that were actually committed at the claimed height.
+    pub fn register_committed_transactions(&mut self, tx_hashes: &[Hash], height: BlockHeight) {
+        for tx_hash in tx_hashes {
+            // A tx should only be committed once. Log if we see a duplicate.
+            if let Some(&existing) = self.committed_tx_lookup.get(tx_hash) {
+                if existing != height {
+                    tracing::warn!(
+                        tx_hash = %tx_hash,
+                        existing_height = existing.0,
+                        new_height = height.0,
+                        "Transaction committed at two different heights!"
+                    );
+                }
+            }
+            self.committed_tx_lookup.entry(*tx_hash).or_insert(height);
+        }
+    }
+
+    /// Remove a finalized transaction from the committed lookup.
+    ///
+    /// Called when a TC is committed, so the tx is no longer relevant for
+    /// timeout validation.
+    pub fn remove_committed_transaction(&mut self, tx_hash: &Hash) {
+        self.committed_tx_lookup.remove(tx_hash);
     }
 
     /// Get the current committed height.

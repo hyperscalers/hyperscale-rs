@@ -267,7 +267,10 @@ impl NodeStateMachine {
         let current_height = BlockHeight(self.bft.committed_height() + 1);
         // Livelock cycle abort intents (from cycle detection).
         let livelock_intents = self.livelock.get_pending_abort_intents().to_vec();
-        // Timed-out transactions from the mempool, converted to AbortIntent.
+        // Timed-out transactions from the mempool.
+        // The mempool tracks ALL committed transactions including those received
+        // via block sync (added by on_block_committed_full), so this covers
+        // cross-shard txs that weren't in the local mempool originally.
         let timed_out = self
             .mempool
             .get_timed_out_transactions(current_height, EXECUTION_TIMEOUT_BLOCKS);
@@ -403,11 +406,14 @@ impl NodeStateMachine {
         // The closure captures the cache; BftState calls it with the final
         // filtered certificate list after dedup. Returns cheap Arc clones —
         // merging is deferred to the thread pool.
+        // Aborted TCs are excluded — they have no state changes (matching the
+        // sync path in io_loop/actions.rs which also filters them out).
         let topology = self.topology.snapshot();
         let cache = self.execution.execution_cache();
         let collect_updates = |certs: &[Arc<TransactionCertificate>]| {
             certs
                 .iter()
+                .filter(|cert| cert.decision != hyperscale_types::TransactionDecision::Aborted)
                 .filter_map(|cert| cache.get(&cert.transaction_hash).cloned())
                 .collect::<Vec<Arc<hyperscale_types::DatabaseUpdates>>>()
         };
@@ -506,11 +512,13 @@ impl NodeStateMachine {
 
         // Collect per-certificate Arc<DatabaseUpdates> from execution cache.
         // Returns cheap Arc clones — merging is deferred to the thread pool.
+        // Aborted TCs excluded — no state changes (matches sync path).
         let topology = self.topology.snapshot();
         let cache = self.execution.execution_cache();
         let collect_updates = |certs: &[Arc<TransactionCertificate>]| {
             certs
                 .iter()
+                .filter(|cert| cert.decision != hyperscale_types::TransactionDecision::Aborted)
                 .filter_map(|cert| cache.get(&cert.transaction_hash).cloned())
                 .collect::<Vec<Arc<hyperscale_types::DatabaseUpdates>>>()
         };
@@ -577,6 +585,11 @@ impl NodeStateMachine {
         // Livelock: process abort intents/certs, add tombstones, cleanup tracking
         self.livelock.on_block_committed(&block);
 
+        // Register committed tx hashes with BFT for timeout abort validation.
+        let tx_hashes: Vec<Hash> = block.transactions.iter().map(|tx| tx.hash()).collect();
+        self.bft
+            .register_committed_transactions(&tx_hashes, block_height);
+
         // Abort intents feed the execution accumulator with override semantics.
         // Votes are NOT emitted here — the wave scan at the end of block commit
         // will detect complete waves and emit votes deterministically.
@@ -612,7 +625,9 @@ impl NodeStateMachine {
             }
 
             self.execution
-                .remove_finalized_certificate(&cert.transaction_hash);
+                .remove_finalized_certificate(&cert.transaction_hash, cert.decision);
+            self.bft
+                .remove_committed_transaction(&cert.transaction_hash);
             // Invalidate speculative results that read from nodes being written
             self.execution.invalidate_speculative_on_commit(cert);
         }
