@@ -183,10 +183,13 @@ fn test_e2e_single_shard_transaction() {
 
     // If status is None, the transaction completed and was evicted from mempool.
     // This is the expected behavior for completed transactions.
-    // Check execution state to confirm it was processed.
+    // Check tombstone or finalized_certificates to confirm it was processed.
     if initial_status.is_none() {
-        // Transaction was evicted - check if it was executed
-        let is_executed = node0.execution().is_finalized(&tx_hash);
+        // Transaction was evicted - check if it was executed.
+        // Note: is_finalized checks finalized_certificates which are also cleaned up
+        // after the TC is committed in a block. Use is_tombstoned as a fallback.
+        let is_executed =
+            node0.execution().is_finalized(&tx_hash) || node0.mempool().is_tombstoned(&tx_hash);
         if is_executed {
             println!("✓ Transaction already completed and evicted after initial consensus!\n");
 
@@ -205,8 +208,12 @@ fn test_e2e_single_shard_transaction() {
         // If not executed, it might just not have been processed yet - continue with polling
     }
 
-    // If already completed (but not yet evicted due to timing), we can skip the polling loop.
-    if matches!(initial_status, Some(TransactionStatus::Completed(_))) {
+    // If already completed or executed (but not yet evicted due to timing), we can skip the polling loop.
+    // Executed means the TC has been created — the transaction was committed and executed successfully.
+    if matches!(
+        initial_status,
+        Some(TransactionStatus::Completed(_)) | Some(TransactionStatus::Executed { .. })
+    ) {
         println!("✓ Transaction already completed after initial consensus!\n");
 
         // Print final state
@@ -246,7 +253,8 @@ fn test_e2e_single_shard_transaction() {
         let node0 = runner.node(0).expect("Node 0 should exist");
 
         // Check mempool status
-        // Transaction progresses: Pending -> Committed -> ... -> Finalized -> Completed
+        // Transaction progresses: Pending -> Committed -> Executed -> Completed -> evicted
+        // Once evicted, status() returns None but is_tombstoned() returns true.
         if let Some(status) = node0.mempool().status(&tx_hash) {
             if !committed && status.holds_state_lock() {
                 let elapsed = runner.now() - start_time;
@@ -255,6 +263,26 @@ fn test_e2e_single_shard_transaction() {
                     iteration, elapsed
                 );
                 committed = true;
+            }
+        } else if node0.mempool().is_tombstoned(&tx_hash) {
+            // Transaction was fully processed and evicted from the mempool.
+            // Both finalized_certificates and mempool entry are cleaned up at this point,
+            // but the tombstone confirms the transaction reached a terminal state.
+            if !committed {
+                let elapsed = runner.now() - start_time;
+                println!(
+                    "  ✓ Transaction committed and evicted (iteration {}, {:?})",
+                    iteration, elapsed
+                );
+                committed = true;
+            }
+            if !executed {
+                let elapsed = runner.now() - start_time;
+                println!(
+                    "  ✓ Transaction executed and evicted (iteration {}, {:?})",
+                    iteration, elapsed
+                );
+                executed = true;
             }
         }
 
