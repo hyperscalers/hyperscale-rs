@@ -790,7 +790,12 @@ impl TransactionCertificate {
         let hashes: Vec<Hash> = self
             .shard_proofs
             .values()
-            .map(|proof| proof.receipt_hash_or_zero())
+            .map(|proof| {
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(proof.receipt_hash_or_zero().as_bytes());
+                hasher.update(proof.ec_hash().as_bytes());
+                Hash::from_hash_bytes(hasher.finalize().as_bytes())
+            })
             .collect();
         let base = match hashes.len() {
             0 => Hash::ZERO,
@@ -1346,5 +1351,43 @@ mod tests {
     #[test]
     fn test_transaction_decision() {
         assert_ne!(TransactionDecision::Accept, TransactionDecision::Reject);
+    }
+
+    #[test]
+    fn test_receipt_hash_changes_when_ec_hash_changes() {
+        use std::collections::BTreeMap;
+
+        let make_tc = |ec_hash: Hash| -> TransactionCertificate {
+            let mut shard_proofs = BTreeMap::new();
+            shard_proofs.insert(
+                crate::ShardGroupId(0),
+                crate::ShardExecutionProof::Executed {
+                    receipt_hash: Hash::from_bytes(b"receipt"),
+                    success: true,
+                    write_nodes: vec![],
+                    ec_hash,
+                },
+            );
+            TransactionCertificate {
+                transaction_hash: Hash::from_bytes(b"tx"),
+                decision: TransactionDecision::Accept,
+                shard_proofs,
+            }
+        };
+
+        let tc_zero = make_tc(Hash::ZERO);
+        let tc_some = make_tc(Hash::from_bytes(b"some_ec_hash"));
+        assert_ne!(tc_zero.receipt_hash(), tc_some.receipt_hash());
+    }
+
+    #[test]
+    fn test_receipt_hash_aborted_ignores_ec_hash() {
+        // Aborted TCs always return Hash::ZERO regardless of ec_hash
+        let tc = TransactionCertificate {
+            transaction_hash: Hash::from_bytes(b"tx"),
+            decision: TransactionDecision::Aborted,
+            shard_proofs: std::collections::BTreeMap::new(),
+        };
+        assert_eq!(tc.receipt_hash(), Hash::ZERO);
     }
 }

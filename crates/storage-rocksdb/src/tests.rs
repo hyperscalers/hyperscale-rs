@@ -408,7 +408,7 @@ fn test_commit_block_applies_writes() {
     let updates = make_mapped_database_update(1, 0, vec![10], vec![42]);
     let cert = Arc::new(make_test_certificate(1, shard));
 
-    let result = storage.commit_block(&updates, &[cert], 1, None);
+    let result = storage.commit_block(&updates, &[cert], 1, None, &[]);
     assert_ne!(result, Hash::ZERO);
 }
 
@@ -424,7 +424,7 @@ fn test_commit_block_multiple_certs() {
     let cert1 = Arc::new(make_test_certificate(1, shard));
     let cert2 = Arc::new(make_test_certificate(2, shard));
 
-    let result = storage.commit_block(&merged, &[cert1, cert2], 1, None);
+    let result = storage.commit_block(&merged, &[cert1, cert2], 1, None, &[]);
     assert_ne!(result, Hash::ZERO);
 }
 
@@ -433,7 +433,7 @@ fn test_commit_block_empty_certs() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
 
-    storage.commit_block(&DatabaseUpdates::default(), &[], 1, None);
+    storage.commit_block(&DatabaseUpdates::default(), &[], 1, None, &[]);
     assert_eq!(storage.jvt_version(), 1);
 }
 
@@ -448,7 +448,7 @@ fn test_prepare_then_commit_matches_direct() {
     let (spec_root, prepared) =
         s_prepared.prepare_block_commit(parent_root, &DatabaseUpdates::default(), 1);
     let certs = std::slice::from_ref(&cert);
-    let result_prepared = s_prepared.commit_prepared_block(prepared, certs, None);
+    let result_prepared = s_prepared.commit_prepared_block(prepared, certs, None, &[]);
 
     let temp_dir2 = TempDir::new().unwrap();
     let s_direct = RocksDbStorage::open(temp_dir2.path()).unwrap();
@@ -457,6 +457,7 @@ fn test_prepare_then_commit_matches_direct() {
         std::slice::from_ref(&cert),
         1,
         None,
+        &[],
     );
 
     assert_eq!(result_prepared, result_direct);
@@ -472,7 +473,7 @@ fn test_commit_block_stores_certificates() {
     let cert = Arc::new(make_test_certificate(1, shard));
     let tx_hash = cert.transaction_hash;
 
-    let _ = storage.commit_block(&DatabaseUpdates::default(), &[cert], 1, None);
+    let _ = storage.commit_block(&DatabaseUpdates::default(), &[cert], 1, None, &[]);
 
     assert!(storage.get_certificate(&tx_hash).is_some());
 }

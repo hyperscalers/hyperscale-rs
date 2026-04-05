@@ -1063,8 +1063,9 @@ impl ExecutionState {
 
         // Feed each tx's outcome to per-tx CertificateTracker for finalization.
         // Deferred/aborted txs (Hash::ZERO) are filtered by handle_certificate_internal.
+        let ec_hash = certificate.canonical_hash();
         for outcome in &certificate.tx_outcomes {
-            let proof = outcome.to_shard_proof();
+            let proof = outcome.to_shard_proof(ec_hash);
 
             actions.extend(self.handle_certificate_internal(
                 topology,
@@ -1103,6 +1104,7 @@ impl ExecutionState {
         // Buffer proofs for txs that don't have trackers yet (block not committed).
         // Skip txs that are already finalized.
         // If ANY tx has a tracker, we need to verify the execution cert signature.
+        let ec_hash = cert.canonical_hash();
         let mut needs_verification = false;
         for outcome in &cert.tx_outcomes {
             if self.certificate_trackers.contains_key(&outcome.tx_hash) {
@@ -1113,7 +1115,7 @@ impl ExecutionState {
                     .entry(outcome.tx_hash)
                     .or_insert_with(|| (Vec::new(), current_height))
                     .0
-                    .push((shard, outcome.to_shard_proof()));
+                    .push((shard, outcome.to_shard_proof(ec_hash)));
             }
         }
 
@@ -1165,11 +1167,12 @@ impl ExecutionState {
 
         let shard = certificate.shard_group_id;
         let current_height = self.committed_height;
+        let ec_hash = certificate.canonical_hash();
         let mut actions = Vec::new();
 
         // Extract per-tx outcomes — feed to tracker if exists, buffer otherwise
         for outcome in &certificate.tx_outcomes {
-            let proof = outcome.to_shard_proof();
+            let proof = outcome.to_shard_proof(ec_hash);
 
             if self.certificate_trackers.contains_key(&outcome.tx_hash) {
                 actions.extend(self.handle_certificate_internal(
@@ -2450,7 +2453,7 @@ impl ExecutionState {
             .values()
             .flat_map(|proof| match proof {
                 ShardExecutionProof::Executed { write_nodes, .. } => write_nodes.iter().copied(),
-                ShardExecutionProof::Aborted => [].iter().copied(),
+                ShardExecutionProof::Aborted { .. } => [].iter().copied(),
             })
             .collect();
 
@@ -3076,6 +3079,7 @@ mod tests {
             receipt_hash,
             success: true,
             write_nodes: vec![],
+            ec_hash: Hash::ZERO,
         };
 
         assert!(proof.is_success());

@@ -206,6 +206,7 @@ mod tests {
             receipt_hash,
             success: true,
             write_nodes: vec![],
+            ec_hash: Hash::ZERO,
         }
     }
 

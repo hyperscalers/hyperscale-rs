@@ -4,8 +4,9 @@
 //! All methods take `&self` — implementations use interior mutability.
 
 use hyperscale_types::{
-    Block, BlockHeight, Hash, LedgerTransactionReceipt, LocalTransactionExecution,
-    QuorumCertificate, ReceiptBundle, RoutableTransaction, TransactionCertificate,
+    Block, BlockHeight, ExecutionCertificate, Hash, LedgerTransactionReceipt,
+    LocalTransactionExecution, QuorumCertificate, ReceiptBundle, RoutableTransaction,
+    TransactionCertificate,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -106,4 +107,26 @@ pub trait ConsensusStore: Send + Sync {
     fn has_receipt(&self, tx_hash: &Hash) -> bool {
         self.get_ledger_receipt(tx_hash).is_some()
     }
+
+    // ─── Execution Certificate Storage ───────────────────────────────────
+
+    /// Retrieve an execution certificate by its canonical hash.
+    fn get_execution_certificate(&self, _canonical_hash: &Hash) -> Option<ExecutionCertificate> {
+        None
+    }
+
+    /// Retrieve all execution certificates for a given block height.
+    fn get_execution_certificates_by_height(
+        &self,
+        _block_height: u64,
+    ) -> Vec<ExecutionCertificate> {
+        vec![]
+    }
+
+    /// Store execution certificates (standalone write, separate WriteBatch).
+    ///
+    /// Used for late-arriving ECs that complete after their block was already
+    /// committed. Not used on the primary commit path (D4 folds EC writes into
+    /// `commit_block`/`commit_prepared_block`).
+    fn store_execution_certificates(&self, _certs: &[ExecutionCertificate]) {}
 }
