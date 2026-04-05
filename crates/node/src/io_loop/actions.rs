@@ -457,13 +457,30 @@ where
 
         let commits = std::mem::take(&mut self.pending_block_commits);
         let pending_ecs = std::mem::take(&mut self.pending_ec_writes);
-        let sync_data = std::mem::take(&mut self.pending_sync_data);
+
+        // Only take sync data for blocks we're about to commit — not all
+        // buffered data. BFT may buffer sync blocks internally for sequential
+        // ordering, so sync data for future heights must stay in the map.
+        let mut sync_data = std::collections::HashMap::new();
+        for (block, _) in &commits {
+            if let Some(data) = self.pending_sync_data.remove(&block.header.height.0) {
+                sync_data.insert(block.header.height.0, data);
+            }
+        }
 
         let has_non_empty = commits.iter().any(|(b, _)| !b.certificates.is_empty());
 
         if !has_non_empty {
             // All empty blocks — synchronous fast path.
             // Still advance JVT version so it matches block height.
+
+            // Flush any pending ECs that were accumulated from previous
+            // non-empty blocks — empty blocks don't carry ECs themselves,
+            // but late-arriving ECs must still be persisted.
+            if !pending_ecs.is_empty() {
+                self.storage.store_execution_certificates(&pending_ecs);
+            }
+
             // Prune stale prepared_commits that outlived their blocks.
             let max_height = commits
                 .iter()

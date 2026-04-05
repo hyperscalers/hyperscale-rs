@@ -111,22 +111,15 @@ pub trait ConsensusStore: Send + Sync {
     // ─── Execution Certificate Storage ───────────────────────────────────
 
     /// Retrieve an execution certificate by its canonical hash.
-    fn get_execution_certificate(&self, _canonical_hash: &Hash) -> Option<ExecutionCertificate> {
-        None
-    }
+    fn get_execution_certificate(&self, canonical_hash: &Hash) -> Option<ExecutionCertificate>;
 
     /// Retrieve all execution certificates for a given block height.
-    fn get_execution_certificates_by_height(
-        &self,
-        _block_height: u64,
-    ) -> Vec<ExecutionCertificate> {
-        vec![]
-    }
+    fn get_execution_certificates_by_height(&self, block_height: u64) -> Vec<ExecutionCertificate>;
 
     /// Store execution certificates (standalone write, separate WriteBatch).
     ///
     /// Used for late-arriving ECs that complete after their block was already
     /// committed. Not used on the primary commit path (D4 folds EC writes into
     /// `commit_block`/`commit_prepared_block`).
-    fn store_execution_certificates(&self, _certs: &[ExecutionCertificate]) {}
+    fn store_execution_certificates(&self, certs: &[ExecutionCertificate]);
 }

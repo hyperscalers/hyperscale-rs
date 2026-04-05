@@ -417,27 +417,11 @@ pub fn serve_block_request(
             let execution_certificates =
                 storage.get_execution_certificates_by_height(block.header.height.0);
 
-            // Completeness check: for each non-aborted TC, verify that the
-            // EC set contains a matching EC for the local shard's proof.
-            let local_shard = block.header.shard_group_id;
-            for cert in &certs_needing_receipts {
-                if let Some(proof) = cert.shard_proofs.get(&local_shard) {
-                    let expected_ec_hash = proof.ec_hash();
-                    if expected_ec_hash != hyperscale_types::Hash::ZERO
-                        && !execution_certificates
-                            .iter()
-                            .any(|ec| ec.canonical_hash() == expected_ec_hash)
-                    {
-                        warn!(
-                            height = req.height.0,
-                            tx_hash = %cert.transaction_hash,
-                            "Missing EC for certificate — \
-                             returning not_found so requester tries another peer"
-                        );
-                        return GetBlockResponse::not_found();
-                    }
-                }
-            }
+            // Serve all local ECs for this height. The syncing node verifies
+            // EC integrity via the QC-attested receipt_root (which transitively
+            // commits to ec_hashes). No canonical_hash matching here — validators
+            // may aggregate at different vote_heights, producing genuinely
+            // different ECs for the same wave (D1 edge case).
 
             GetBlockResponse::found(block, qc, ledger_receipts, execution_certificates)
         }
