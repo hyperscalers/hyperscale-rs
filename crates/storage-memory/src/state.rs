@@ -8,8 +8,8 @@ use hyperscale_storage::{
     StateRootHash,
 };
 use hyperscale_types::{
-    Block, BlockHeight, Hash, LedgerTransactionReceipt, LocalTransactionExecution,
-    QuorumCertificate, RoutableTransaction, TransactionCertificate,
+    Block, BlockHeight, ExecutionCertificate, Hash, LedgerTransactionReceipt,
+    LocalTransactionExecution, QuorumCertificate, RoutableTransaction, TransactionCertificate,
 };
 use im::OrdMap;
 use std::collections::{BTreeMap, HashMap};
@@ -122,6 +122,10 @@ pub(crate) struct ConsensusState {
     pub local_executions: HashMap<Hash, LocalTransactionExecution>,
     /// Insertion height for each receipt, enabling height-based pruning.
     pub receipt_heights: HashMap<Hash, u64>,
+    /// Execution certificates keyed by canonical hash.
+    pub execution_certs: HashMap<Hash, ExecutionCertificate>,
+    /// Index: block_height → set of canonical hashes for that height.
+    pub execution_certs_by_height: HashMap<u64, Vec<Hash>>,
 }
 
 /// Maximum number of blocks worth of receipts to retain in simulation storage.
@@ -140,6 +144,8 @@ impl ConsensusState {
             ledger_receipts: HashMap::new(),
             local_executions: HashMap::new(),
             receipt_heights: HashMap::new(),
+            execution_certs: HashMap::new(),
+            execution_certs_by_height: HashMap::new(),
         }
     }
 

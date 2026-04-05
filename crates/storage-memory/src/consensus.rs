@@ -4,8 +4,9 @@ use crate::core::SimStorage;
 
 use hyperscale_storage::ConsensusStore;
 use hyperscale_types::{
-    Block, BlockHeight, Hash, LedgerTransactionReceipt, LocalTransactionExecution,
-    QuorumCertificate, ReceiptBundle, RoutableTransaction, TransactionCertificate,
+    Block, BlockHeight, ExecutionCertificate, Hash, LedgerTransactionReceipt,
+    LocalTransactionExecution, QuorumCertificate, ReceiptBundle, RoutableTransaction,
+    TransactionCertificate,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -146,5 +147,39 @@ impl ConsensusStore for SimStorage {
             .local_executions
             .get(tx_hash)
             .cloned()
+    }
+
+    fn get_execution_certificate(&self, canonical_hash: &Hash) -> Option<ExecutionCertificate> {
+        self.consensus
+            .read()
+            .unwrap()
+            .execution_certs
+            .get(canonical_hash)
+            .cloned()
+    }
+
+    fn get_execution_certificates_by_height(&self, block_height: u64) -> Vec<ExecutionCertificate> {
+        let c = self.consensus.read().unwrap();
+        c.execution_certs_by_height
+            .get(&block_height)
+            .map(|hashes| {
+                hashes
+                    .iter()
+                    .filter_map(|h| c.execution_certs.get(h).cloned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn store_execution_certificates(&self, certs: &[ExecutionCertificate]) {
+        let mut c = self.consensus.write().unwrap();
+        for cert in certs {
+            let canonical_hash = cert.canonical_hash();
+            c.execution_certs.insert(canonical_hash, cert.clone());
+            c.execution_certs_by_height
+                .entry(cert.block_height)
+                .or_default()
+                .push(canonical_hash);
+        }
     }
 }

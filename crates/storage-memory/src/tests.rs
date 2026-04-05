@@ -705,3 +705,19 @@ fn test_receipt_idempotent_overwrite() {
     let storage = SimStorage::new();
     hyperscale_storage::test_helpers::test_receipt_idempotent_overwrite(&storage);
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// Execution certificate storage
+// ═══════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_ec_storage_roundtrip() {
+    let storage = SimStorage::new();
+    hyperscale_storage::test_helpers::test_ec_storage_roundtrip(&storage);
+}
+
+#[test]
+fn test_ec_storage_batch() {
+    let storage = SimStorage::new();
+    hyperscale_storage::test_helpers::test_ec_storage_batch(&storage);
+}

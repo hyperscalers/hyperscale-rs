@@ -1,0 +1,35 @@
+//! Execution certificate persistence helpers.
+//!
+//! Writes ECs to two column families:
+//! - Primary: `EXECUTION_CERTS_CF` (key: canonical_hash, value: EC)
+//! - Index: `EXECUTION_CERTS_BY_HEIGHT_CF` (key: height_BE ++ canonical_hash, value: ())
+
+use crate::column_families::{ExecutionCertsByHeightCf, ExecutionCertsCf};
+use crate::core::RocksDbStorage;
+
+use hyperscale_types::ExecutionCertificate;
+use rocksdb::WriteBatch;
+
+/// Append execution certificate writes to an existing `WriteBatch`.
+///
+/// Called by `commit_block` and `commit_prepared_block` to fold EC writes
+/// into the same atomic batch as JVT + TCs (D4: one fsync per block).
+pub(crate) fn append_execution_certs_to_batch(
+    storage: &RocksDbStorage,
+    batch: &mut WriteBatch,
+    certs: &[ExecutionCertificate],
+) {
+    for cert in certs {
+        let canonical_hash = cert.canonical_hash();
+
+        // Primary: canonical_hash → EC
+        storage.cf_put::<ExecutionCertsCf>(batch, &canonical_hash, cert);
+
+        // Index: (block_height, canonical_hash) → ()
+        storage.cf_put::<ExecutionCertsByHeightCf>(
+            batch,
+            &(cert.block_height, canonical_hash),
+            &(),
+        );
+    }
+}
