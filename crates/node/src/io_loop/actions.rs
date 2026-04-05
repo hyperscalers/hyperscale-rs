@@ -156,8 +156,11 @@ where
                 );
                 self.network.notify(&recipients, &batch);
             }
-            Action::CacheExecutionCertificate { certificate } => {
+            Action::PersistExecutionCertificate { certificate } => {
                 let key = (certificate.block_hash, certificate.wave_id.clone());
+                // Queue for atomic persistence in the next block commit WriteBatch.
+                self.pending_ec_writes
+                    .push(std::sync::Arc::unwrap_or_clone(certificate.clone()));
                 if let Ok(mut cache) = self.exec_cert_cache.lock() {
                     cache.insert(key, certificate);
                     // Safety-net pruning: evict very old entries to bound memory.
@@ -434,9 +437,10 @@ where
     /// up the backlog.
     pub(super) fn flush_block_commits(&mut self) {
         if self.pending_block_commits.is_empty() {
-            // Also flush any receipt bundles that arrived after their
+            // Also flush any receipt/EC bundles that arrived after their
             // block was already committed.
             self.flush_pending_receipts();
+            self.flush_pending_ecs();
             return;
         }
 
@@ -447,6 +451,7 @@ where
 
         let commits = std::mem::take(&mut self.pending_block_commits);
         let pending_receipts = std::mem::take(&mut self.pending_receipt_bundles);
+        let pending_ecs = std::mem::take(&mut self.pending_ec_writes);
 
         let has_non_empty = commits.iter().any(|(b, _)| !b.certificates.is_empty());
 
@@ -545,6 +550,10 @@ where
                 storage.store_receipt_bundles(&pending_receipts);
             }
 
+            // Drain pending ECs into the first block commit for atomic persistence.
+            // Subsequent blocks in the batch (if any) pass an empty slice.
+            let mut remaining_ecs = pending_ecs;
+
             for (i, (block, qc)) in commits.into_iter().enumerate() {
                 let block_hash = block.hash();
                 let height = block.header.height;
@@ -554,6 +563,9 @@ where
                     hash: block_hash,
                     qc: qc.clone(),
                 };
+
+                // Take pending ECs for the first commit, empty for subsequent.
+                let ecs_for_this_block = std::mem::take(&mut remaining_ecs);
 
                 // Always commit — even empty blocks advance the JVT version
                 // to match block height, so provision lookups succeed.
@@ -565,7 +577,7 @@ where
                         prepared,
                         &block.certificates,
                         Some(consensus),
-                        &[],
+                        &ecs_for_this_block,
                     )
                 } else if !block.certificates.is_empty() {
                     // Sync path: no execution cache, reconstruct DatabaseUpdates
@@ -671,6 +683,19 @@ where
         }
         let bundles = std::mem::take(&mut self.pending_receipt_bundles);
         self.storage.store_receipt_bundles(&bundles);
+    }
+
+    /// Flush any pending EC writes that arrived after their block was already
+    /// committed (late-arriving ECs from async aggregation). Uses a standalone
+    /// `store_execution_certificates` (separate WriteBatch) since there's no
+    /// block commit to fold into. These ECs are already in the in-memory cache;
+    /// this flush just ensures durability for restart/sync serving.
+    pub(super) fn flush_pending_ecs(&mut self) {
+        if self.pending_ec_writes.is_empty() {
+            return;
+        }
+        let ecs = std::mem::take(&mut self.pending_ec_writes);
+        self.storage.store_execution_certificates(&ecs);
     }
 
     /// Process sync, fetch, and provision recovery actions.

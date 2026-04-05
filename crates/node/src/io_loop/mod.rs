@@ -230,6 +230,10 @@ where
     // Shared with request handler thread. Keyed by (block_hash, wave_id).
     exec_cert_cache: ExecCertCache,
 
+    // Pending EC writes — accumulated during a step, drained into the block
+    // commit WriteBatch for atomic persistence (D4: one fsync per block).
+    pending_ec_writes: Vec<hyperscale_types::ExecutionCertificate>,
+
     // Cached local shard peers (committee excluding self) — avoids per-call allocation.
     cached_local_peers: Vec<ValidatorId>,
 
@@ -315,6 +319,7 @@ where
             commit_in_flight: Arc::new(AtomicBool::new(false)),
             pending_receipt_bundles: Vec::new(),
             exec_cert_cache: Arc::new(Mutex::new(HashMap::new())),
+            pending_ec_writes: Vec::new(),
             cached_local_peers,
             tx_status_cache: Arc::new(QuickCache::new(DEFAULT_TX_STATUS_CACHE_SIZE)),
             emitted_statuses: Vec::new(),
@@ -1086,8 +1091,9 @@ where
         self.flush_block_commits();
 
         // When commit_in_flight is true, flush_block_commits returns
-        // without draining receipts — flush them independently here.
+        // without draining receipts/ECs — flush them independently here.
         self.flush_pending_receipts();
+        self.flush_pending_ecs();
 
         self.flush_validation_batch();
         self.flush_committed_header_verifications();

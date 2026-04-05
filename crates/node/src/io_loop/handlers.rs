@@ -198,6 +198,7 @@ where
         // ── execution_cert.request → cert cache lookup ────────────────
 
         let cert_cache = Arc::clone(&self.exec_cert_cache);
+        let storage = Arc::clone(&self.storage);
         self.network
             .register_request_handler::<hyperscale_messages::request::GetExecutionCertsRequest>(
                 move |req: hyperscale_messages::request::GetExecutionCertsRequest| {
@@ -213,6 +214,17 @@ where
                         for ((_, cached_wave), cert) in guard.iter() {
                             if cert.block_height == req.block_height && cached_wave == wave_id {
                                 certs.push(cert.as_ref().clone());
+                            }
+                        }
+                    }
+
+                    // Storage fallback: if cache miss, try durable storage.
+                    if certs.is_empty() {
+                        drop(guard); // Release lock before storage I/O
+                        let stored = storage.get_execution_certificates_by_height(req.block_height);
+                        for cert in stored {
+                            if req.wave_ids.contains(&cert.wave_id) {
+                                certs.push(cert);
                             }
                         }
                     }

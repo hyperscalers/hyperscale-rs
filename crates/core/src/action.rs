@@ -178,13 +178,13 @@ pub enum Action {
         recipients: Vec<ValidatorId>,
     },
 
-    /// Cache an aggregated execution certificate for fallback serving.
+    /// Persist an aggregated execution certificate for durable serving.
     ///
     /// Emitted by all validators after cert aggregation (not just the designated
-    /// broadcaster). The io_loop stores these in a shared cache so any node can
-    /// serve `GetExecutionCertsRequest` from remote shards whose designated
-    /// broadcaster failed.
-    CacheExecutionCertificate {
+    /// broadcaster). The io_loop stores these in the in-memory cache for
+    /// low-latency serving and accumulates them in `pending_ec_writes` for
+    /// atomic persistence in the next block commit's WriteBatch.
+    PersistExecutionCertificate {
         certificate: Arc<ExecutionCertificate>,
     },
 
@@ -915,7 +915,6 @@ impl Action {
                 | Action::SignAndBroadcastExecutionVote { .. }
                 | Action::BroadcastExecutionVote { .. }
                 | Action::BroadcastExecutionCertificate { .. }
-                | Action::CacheExecutionCertificate { .. }
                 | Action::BroadcastCommittedBlockHeader { .. }
                 | Action::PersistBlock { .. }
                 | Action::PersistAndBroadcastVote { .. }
@@ -974,7 +973,7 @@ impl Action {
             Action::SignAndBroadcastExecutionVote { .. } => "SignAndBroadcastExecutionVote",
             Action::BroadcastExecutionVote { .. } => "BroadcastExecutionVote",
             Action::BroadcastExecutionCertificate { .. } => "BroadcastExecutionCertificate",
-            Action::CacheExecutionCertificate { .. } => "CacheExecutionCertificate",
+            Action::PersistExecutionCertificate { .. } => "PersistExecutionCertificate",
             Action::BroadcastCommittedBlockHeader { .. } => "BroadcastCommittedBlockHeader",
 
             // Timers

@@ -1022,7 +1022,7 @@ impl ExecutionState {
 
         // Cache the cert in io_loop for fallback serving — any node can serve
         // requests from remote shards if the designated broadcaster fails.
-        actions.push(Action::CacheExecutionCertificate {
+        actions.push(Action::PersistExecutionCertificate {
             certificate: Arc::clone(&certificate),
         });
 
