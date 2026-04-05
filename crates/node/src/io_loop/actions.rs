@@ -214,6 +214,12 @@ where
                     "Receipt bundles queued for storage"
                 );
                 self.pending_receipt_bundles.extend(bundles);
+                // Mark that receipts need flushing. The actual deadline is set
+                // lazily in flush_expired_batches when we have a time source.
+                if self.receipt_flush_deadline.is_none() {
+                    // Sentinel: Duration::ZERO means "set the real deadline on next tick"
+                    self.receipt_flush_deadline = Some(std::time::Duration::ZERO);
+                }
             }
 
             // ═══════════════════════════════════════════════════════════
@@ -450,17 +456,21 @@ where
         }
 
         let commits = std::mem::take(&mut self.pending_block_commits);
-        let pending_receipts = std::mem::take(&mut self.pending_receipt_bundles);
         let pending_ecs = std::mem::take(&mut self.pending_ec_writes);
 
         let has_non_empty = commits.iter().any(|(b, _)| !b.certificates.is_empty());
 
+        // Flush any pending receipts synchronously — the sync path inside the
+        // commit closure reads receipts from storage to reconstruct
+        // DatabaseUpdates. Once Step 5 moves sync commits out of this path,
+        // this flush can be removed entirely.
+        if has_non_empty {
+            self.flush_pending_receipts();
+        }
+
         if !has_non_empty {
             // All empty blocks — synchronous fast path.
             // Still advance JVT version so it matches block height.
-            if !pending_receipts.is_empty() {
-                self.storage.store_receipt_bundles(&pending_receipts);
-            }
             // Prune stale prepared_commits that outlived their blocks.
             let max_height = commits
                 .iter()
@@ -544,12 +554,6 @@ where
         self.commit_in_flight.store(true, Ordering::Release);
 
         self.dispatch.spawn_execution(move || {
-            // Persist receipt bundles before committing — the sync path
-            // reconstructs DatabaseUpdates by reading these back.
-            if !pending_receipts.is_empty() {
-                storage.store_receipt_bundles(&pending_receipts);
-            }
-
             // Drain pending ECs into the first block commit for atomic persistence.
             // Subsequent blocks in the batch (if any) pass an empty slice.
             let mut remaining_ecs = pending_ecs;
@@ -683,6 +687,7 @@ where
         }
         let bundles = std::mem::take(&mut self.pending_receipt_bundles);
         self.storage.store_receipt_bundles(&bundles);
+        self.receipt_flush_deadline = None;
     }
 
     /// Flush any pending EC writes that arrived after their block was already
