@@ -32,10 +32,10 @@
 
 use hyperscale_core::{Action, CrossShardExecutionRequest, ProtocolEvent, ProvisionRequest};
 use hyperscale_types::{
-    AbortReason, BlockHeight, Bls12381G1PublicKey, DatabaseUpdates, ExecutionVote, Hash, NodeId,
-    ProvisionBatch, RoutableTransaction, ShardExecutionProof, ShardGroupId, StateProvision,
-    TopologySnapshot, TransactionCertificate, TransactionDecision, TxExecutionOutcome, ValidatorId,
-    WaveId,
+    AbortReason, BlockHeight, Bls12381G1PublicKey, DatabaseUpdates, ExecutionResult, ExecutionVote,
+    Hash, NodeId, ProvisionBatch, ReceiptBundle, RoutableTransaction, ShardExecutionProof,
+    ShardGroupId, StateProvision, TopologySnapshot, TransactionCertificate, TransactionDecision,
+    TxExecutionOutcome, TxOutcome, ValidatorId, WaveId,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -78,6 +78,31 @@ pub struct CompletionData {
     pub tx_outcomes: Vec<hyperscale_types::TxOutcome>,
     /// All participating shards (union across all txs in wave).
     pub participating_shards: Vec<ShardGroupId>,
+}
+
+/// A cross-shard transaction registration for provision tracking.
+///
+/// Returned by [`ExecutionState::on_block_committed`] as structured data
+/// instead of `Action::Continuation` events.
+#[derive(Debug, Clone)]
+pub struct CrossShardRegistration {
+    /// Hash of the cross-shard transaction.
+    pub tx_hash: Hash,
+    /// Remote shards this transaction needs provisions from.
+    pub required_shards: BTreeSet<ShardGroupId>,
+    /// Block height when the transaction was committed.
+    pub committed_height: BlockHeight,
+}
+
+/// Output from [`ExecutionState::on_block_committed`].
+///
+/// Separates actions from cross-shard registrations so the orchestrator
+/// can process registrations before forwarding actions.
+pub struct BlockCommittedOutput {
+    /// Actions to dispatch (execution, provisioning, etc.).
+    pub actions: Vec<Action>,
+    /// Cross-shard registrations for the provision coordinator.
+    pub cross_shard_registrations: Vec<CrossShardRegistration>,
 }
 
 /// Cached entry for speculative execution.
@@ -382,14 +407,35 @@ impl ExecutionState {
     // Execution Cache
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /// Read access to the execution cache (for block commit / state root verification).
-    pub fn execution_cache(&self) -> &ExecutionCache {
-        &self.execution_cache
+    /// Collect per-certificate database updates for proposal building.
+    ///
+    /// Filters out aborted certificates (they carry no state changes) and returns
+    /// only entries present in the execution cache. BFT uses this map after its
+    /// own QC-chain dedup filtering.
+    pub fn proposal_cert_updates(
+        &self,
+        certificates: &[Arc<TransactionCertificate>],
+    ) -> HashMap<Hash, Arc<DatabaseUpdates>> {
+        certificates
+            .iter()
+            .filter(|c| c.decision != TransactionDecision::Aborted)
+            .filter_map(|c| {
+                self.execution_cache
+                    .get(&c.transaction_hash)
+                    .map(|u| (c.transaction_hash, u.clone()))
+            })
+            .collect()
     }
 
-    /// Mutable access to the execution cache (for inserting results / evicting after commit).
-    pub fn execution_cache_mut(&mut self) -> &mut ExecutionCache {
-        &mut self.execution_cache
+    /// Collect database updates for a set of transaction hashes.
+    ///
+    /// Returns cheap `Arc` clones for entries present in the cache.
+    /// Used by state root verification to gather per-certificate write sets.
+    pub fn updates_for_tx_hashes(&self, tx_hashes: &[Hash]) -> Vec<Arc<DatabaseUpdates>> {
+        tx_hashes
+            .iter()
+            .filter_map(|h| self.execution_cache.get(h).cloned())
+            .collect()
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -615,6 +661,147 @@ impl ExecutionState {
         }
 
         completions
+    }
+
+    /// Process a completed execution batch: build receipt bundles, update cache, record outcomes.
+    ///
+    /// Moves receipt-bundle construction and cache insertion out of the node orchestrator.
+    /// `committed_height` is the current BFT committed height (used for cache eviction tracking).
+    pub fn on_execution_batch_completed(
+        &mut self,
+        results: Vec<ExecutionResult>,
+        tx_outcomes: Vec<TxOutcome>,
+        speculative: bool,
+        committed_height: u64,
+    ) -> Vec<Action> {
+        // Single pass: populate execution cache and build receipt bundles.
+        // Consumes results by value — no clones needed.
+        //
+        // Receipts are stored for BOTH speculative and canonical executions.
+        // The sync protocol requires ledger receipts to serve blocks; without
+        // them `serve_block_request` returns not_found, permanently blocking
+        // any peer that needs to sync past the affected height.
+        //
+        // For speculative batches, we only store receipts for transactions
+        // still tracked in `speculative_in_flight_txs`. After a view change,
+        // that set is cleared — so a slow speculative execution completing
+        // post-view-change won't overwrite a canonical receipt produced by
+        // the re-execution that the view-change path dispatches.
+        let mut bundles: Vec<ReceiptBundle> = Vec::with_capacity(results.len());
+
+        for result in results {
+            let tx_hash = result.tx_hash;
+            let receipt_hash = result.receipt_hash;
+            let db_updates = Arc::new(result.database_updates);
+
+            // For speculative batches, skip receipts for transactions that
+            // are no longer tracked (cleared by view change). Canonical
+            // execution will produce the correct receipt.
+            let dominated = speculative && !self.is_speculative_in_flight_for_tx(&tx_hash);
+            if !dominated {
+                bundles.push(ReceiptBundle {
+                    tx_hash,
+                    ledger_receipt: Arc::new(result.ledger_receipt),
+                    local_execution: Some(result.local_execution),
+                    database_updates: Some(Arc::clone(&db_updates)),
+                });
+            }
+
+            self.execution_cache
+                .insert(tx_hash, db_updates, receipt_hash, committed_height);
+        }
+
+        // Dispatch receipt storage (fire-and-forget, off main thread)
+        let mut actions: Vec<Action> = Vec::new();
+        if !bundles.is_empty() {
+            tracing::debug!(
+                speculative,
+                bundle_count = bundles.len(),
+                "Emitting StoreReceiptBundles"
+            );
+            actions.push(Action::StoreReceiptBundles { bundles });
+        } else if speculative {
+            // Expected after a view change: speculative_in_flight_txs
+            // was cleared, so all results are dominated. Receipts from
+            // canonical re-execution will be stored instead.
+            tracing::debug!(
+                "ExecutionBatchCompleted produced zero receipt bundles (speculative, post-view-change)"
+            );
+        } else {
+            tracing::warn!(
+                results_count = 0,
+                "ExecutionBatchCompleted produced ZERO receipt bundles"
+            );
+        }
+
+        // Record outcomes into execution accumulators silently.
+        // Votes are emitted during the block commit wave scan, not here.
+        for wr in tx_outcomes {
+            self.record_execution_result(wr.tx_hash, wr.outcome);
+        }
+
+        actions
+    }
+
+    /// Scan complete waves and emit `SignAndBroadcastExecutionVote` actions.
+    ///
+    /// This is the SINGLE path to execution voting. Call after abort intents
+    /// have been processed so accumulator state is deterministic at this height.
+    pub fn emit_vote_actions(&self, vote_height: u64) -> Vec<Action> {
+        self.scan_complete_waves()
+            .into_iter()
+            .map(|completion| Action::SignAndBroadcastExecutionVote {
+                block_hash: completion.block_hash,
+                block_height: completion.block_height,
+                vote_height,
+                wave_id: completion.wave_id,
+                receipt_root: completion.receipt_root,
+                tx_count: completion.tx_outcomes.len() as u32,
+                tx_outcomes: completion.tx_outcomes,
+                participating_shards: completion.participating_shards,
+            })
+            .collect()
+    }
+
+    /// Process committed certificates: cross-check receipt hashes, remove finalized state,
+    /// and invalidate conflicting speculative results.
+    ///
+    /// The caller is responsible for any BFT-side cleanup (e.g. `bft.remove_committed_transaction`).
+    pub fn on_certificates_committed(&mut self, certificates: &[Arc<TransactionCertificate>]) {
+        for cert in certificates {
+            // Debug cross-check: verify our local execution produced the same
+            // receipt_hash as the quorum-signed certificate. A mismatch indicates
+            // an engine determinism bug (different outcome/events for same input).
+            if let Some(local_receipt_hash) = self
+                .execution_cache
+                .get_receipt_hash(&cert.transaction_hash)
+            {
+                if let Some(ShardExecutionProof::Executed { receipt_hash, .. }) =
+                    cert.shard_proofs.values().next()
+                {
+                    debug_assert_eq!(
+                        local_receipt_hash,
+                        *receipt_hash,
+                        "receipt_hash mismatch for tx {}: local engine produced different \
+                         outcome/events than certificate. This indicates an engine determinism bug.",
+                        cert.transaction_hash,
+                    );
+                }
+            }
+
+            self.remove_finalized_certificate(&cert.transaction_hash, cert.decision);
+            // Invalidate speculative results that read from nodes being written
+            self.invalidate_speculative_on_commit(cert);
+        }
+    }
+
+    /// Record abort intents from a committed block into execution accumulators.
+    ///
+    /// Abort intents override async execution results to ensure validator convergence.
+    pub fn record_abort_intents(&mut self, intents: &[hyperscale_types::AbortIntent]) {
+        for intent in intents {
+            self.record_abort_intent(intent.tx_hash, intent.reason.clone());
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -1129,8 +1316,9 @@ impl ExecutionState {
         block_timestamp: u64,
         proposer: ValidatorId,
         transactions: Vec<Arc<RoutableTransaction>>,
-    ) -> Vec<Action> {
+    ) -> BlockCommittedOutput {
         let mut actions = Vec::new();
+        let mut cross_shard_registrations = Vec::new();
 
         // ── Provision broadcasting (proposer only) ─────────────────────
         //
@@ -1211,11 +1399,14 @@ impl ExecutionState {
         self.prune_pending_provisioning();
         self.prune_execution_cache();
         self.prune_pending_speculative();
-        self.cleanup_stale_speculative(SPECULATIVE_MAX_AGE);
+        self.cleanup_stale_speculative();
         self.prune_speculative_provisions();
 
         if transactions.is_empty() {
-            return actions;
+            return BlockCommittedOutput {
+                actions,
+                cross_shard_registrations,
+            };
         }
 
         tracing::debug!(
@@ -1322,6 +1513,7 @@ impl ExecutionState {
                 tx,
                 height,
                 &mut cross_shard_requests,
+                &mut cross_shard_registrations,
             ));
         }
         if !cross_shard_requests.is_empty() {
@@ -1330,7 +1522,10 @@ impl ExecutionState {
             });
         }
 
-        actions
+        BlockCommittedOutput {
+            actions,
+            cross_shard_registrations,
+        }
     }
 
     /// Start single-shard execution tracking.
@@ -1383,6 +1578,7 @@ impl ExecutionState {
         tx: Arc<RoutableTransaction>,
         height: u64,
         cross_shard_requests: &mut Vec<CrossShardExecutionRequest>,
+        registrations: &mut Vec<CrossShardRegistration>,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
         let tx_hash = tx.hash();
@@ -1414,15 +1610,12 @@ impl ExecutionState {
             // but handle gracefully
             tracing::warn!(tx_hash = ?tx_hash, "Cross-shard tx with no remote shards");
         } else {
-            // Emit registration event for ProvisionCoordinator
-            // The coordinator will handle provision tracking centrally
-            actions.push(Action::Continuation(
-                ProtocolEvent::CrossShardTxRegistered {
-                    tx_hash,
-                    required_shards: remote_shards,
-                    committed_height: BlockHeight(height),
-                },
-            ));
+            // Register with provision coordinator (via structured output).
+            registrations.push(CrossShardRegistration {
+                tx_hash,
+                required_shards: remote_shards,
+                committed_height: BlockHeight(height),
+            });
 
             // Store transaction for later execution (will execute when ProvisioningComplete arrives)
             self.pending_provisioning
@@ -1512,21 +1705,23 @@ impl ExecutionState {
 
     /// Handle batch provisioning complete for multiple transactions.
     ///
-    /// Returns execution requests for all transactions that are ready
-    /// (block already committed). Transactions whose blocks haven't
-    /// committed yet are buffered individually in `early_provisioning_complete`.
+    /// Returns an `ExecuteCrossShardTransactions` action for all transactions
+    /// that are ready (block already committed). Transactions whose blocks
+    /// haven't committed yet are buffered in `early_provisioning_complete`.
     pub fn on_batch_provisioning_complete(
         &mut self,
         topology: &TopologySnapshot,
         transactions: Vec<hyperscale_core::ProvisionedTransaction>,
-    ) -> Vec<CrossShardExecutionRequest> {
-        let mut requests = Vec::new();
-        for pt in transactions {
-            if let Some(req) = self.on_provisioning_complete(topology, pt.tx_hash, pt.provisions) {
-                requests.push(req);
-            }
+    ) -> Vec<Action> {
+        let requests: Vec<CrossShardExecutionRequest> = transactions
+            .into_iter()
+            .filter_map(|pt| self.on_provisioning_complete(topology, pt.tx_hash, pt.provisions))
+            .collect();
+        if requests.is_empty() {
+            vec![]
+        } else {
+            vec![Action::ExecuteCrossShardTransactions { requests }]
         }
-        requests
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -1963,6 +2158,13 @@ impl ExecutionState {
         self.finalized_certificates.contains_key(tx_hash)
     }
 
+    /// Returns the set of all finalized transaction hashes.
+    ///
+    /// Used by the node orchestrator to pass to BFT for abort intent filtering.
+    pub fn finalized_tx_hashes(&self) -> std::collections::HashSet<Hash> {
+        self.finalized_certificates.keys().copied().collect()
+    }
+
     /// Check if we're waiting for provisioning to complete for a transaction.
     ///
     /// Note: Actual provision tracking is handled by ProvisionCoordinator.
@@ -2383,12 +2585,12 @@ impl ExecutionState {
     ///
     /// Called periodically (e.g., on CleanupTimer) to prevent memory growth
     /// from speculative results that were never used.
-    pub fn cleanup_stale_speculative(&mut self, max_age: Duration) {
+    pub fn cleanup_stale_speculative(&mut self) {
         let now = self.now;
         let stale: Vec<Hash> = self
             .speculative_results
             .iter()
-            .filter(|(_, spec)| now.saturating_sub(spec.created_at) > max_age)
+            .filter(|(_, spec)| now.saturating_sub(spec.created_at) > SPECULATIVE_MAX_AGE)
             .map(|(hash, _)| *hash)
             .collect();
 
@@ -2710,14 +2912,16 @@ mod tests {
         let block_hash = Hash::from_bytes(b"block1");
 
         // Block committed with transaction
-        let actions = state.on_block_committed(
-            &topology,
-            block_hash,
-            1,
-            1000,
-            ValidatorId(0),
-            vec![Arc::new(tx.clone())],
-        );
+        let actions = state
+            .on_block_committed(
+                &topology,
+                block_hash,
+                1,
+                1000,
+                ValidatorId(0),
+                vec![Arc::new(tx.clone())],
+            )
+            .actions;
 
         // Should request execution (single-shard path) and set up wave tracking
         assert!(!actions.is_empty());
@@ -2761,14 +2965,16 @@ mod tests {
         assert!(!state.speculative_in_flight_txs.contains(&tx_hash));
 
         // Now block commits - should skip execution (votes already sent)
-        let actions = state.on_block_committed(
-            &topology,
-            block_hash,
-            height,
-            10000,
-            ValidatorId(0),
-            vec![tx],
-        );
+        let actions = state
+            .on_block_committed(
+                &topology,
+                block_hash,
+                height,
+                10000,
+                ValidatorId(0),
+                vec![tx],
+            )
+            .actions;
 
         // Should NOT emit ExecuteTransactions (speculation was used, votes already sent)
         assert!(!actions
@@ -2801,14 +3007,16 @@ mod tests {
         assert!(state.speculative_in_flight_txs.contains(&tx_hash));
 
         // Block commits WHILE speculation is in-flight
-        let commit_actions = state.on_block_committed(
-            &topology,
-            block_hash,
-            height,
-            10000,
-            ValidatorId(0),
-            vec![tx],
-        );
+        let commit_actions = state
+            .on_block_committed(
+                &topology,
+                block_hash,
+                height,
+                10000,
+                ValidatorId(0),
+                vec![tx],
+            )
+            .actions;
 
         // Should NOT emit ExecuteTransactions (votes will arrive from speculation)
         assert!(!commit_actions
@@ -2845,8 +3053,9 @@ mod tests {
         let block_hash = Hash::from_bytes(b"block1");
 
         // Block commits without any speculation
-        let actions =
-            state.on_block_committed(&topology, block_hash, 1, 1000, ValidatorId(0), vec![tx]);
+        let actions = state
+            .on_block_committed(&topology, block_hash, 1, 1000, ValidatorId(0), vec![tx])
+            .actions;
 
         // Should emit ExecuteTransactions (no speculation to use)
         assert!(actions

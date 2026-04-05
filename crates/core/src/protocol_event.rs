@@ -145,13 +145,6 @@ pub enum ProtocolEvent {
         block_timestamp: u64,
     },
 
-    /// Cross-shard transaction registered for provision tracking.
-    CrossShardTxRegistered {
-        tx_hash: Hash,
-        required_shards: std::collections::BTreeSet<ShardGroupId>,
-        committed_height: BlockHeight,
-    },
-
     /// A batch of provisions from a source shard has been verified and accepted.
     ProvisionsAccepted { batch: ProvisionBatch },
 
@@ -386,7 +379,6 @@ impl ProtocolEvent {
 
             // Provisions
             ProtocolEvent::SpeculativeProvisionsComplete { .. } => "SpeculativeProvisionsComplete",
-            ProtocolEvent::CrossShardTxRegistered { .. } => "CrossShardTxRegistered",
             ProtocolEvent::ProvisionsAccepted { .. } => "ProvisionsAccepted",
             ProtocolEvent::ProvisioningComplete { .. } => "ProvisioningComplete",
             ProtocolEvent::StateProvisionsReceived { .. } => "StateProvisionsReceived",

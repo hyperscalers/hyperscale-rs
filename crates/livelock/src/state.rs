@@ -4,6 +4,7 @@
 //! prevents bidirectional livelock in cross-shard transactions.
 
 use crate::tracker::{CommittedCrossShardTracker, ProvisionTracker, RemoteStateNeeds};
+use hyperscale_core::{Action, InclusionProofFetchReason};
 use hyperscale_types::{
     AbortIntent, AbortReason, BlockHeight, Hash, NodeId, RoutableTransaction, ShardGroupId,
     StateEntry, TopologySnapshot, TransactionInclusionProof,
@@ -136,36 +137,6 @@ impl LivelockState {
         self.now = now;
     }
 
-    /// Called when a cross-shard transaction is committed.
-    ///
-    /// Registers the transaction for cycle detection by tracking which
-    /// shards and specific nodes it needs provisions from.
-    pub fn on_cross_shard_committed(
-        &mut self,
-        topology: &TopologySnapshot,
-        tx: &RoutableTransaction,
-        height: BlockHeight,
-    ) {
-        let tx_hash = tx.hash();
-
-        // Determine which shards and nodes we need provisions from
-        let needs = self.compute_remote_state_needs(topology, tx);
-
-        if needs.shards.is_empty() {
-            // Not actually cross-shard, nothing to track
-            return;
-        }
-
-        debug!(
-            tx_hash = %tx_hash,
-            height = height.0,
-            shards = ?needs.shards,
-            "Tracking committed cross-shard TX for cycle detection"
-        );
-
-        self.committed_tracker.add(tx_hash, needs);
-    }
-
     /// Compute which remote shards and nodes a transaction needs provisions from.
     fn compute_remote_state_needs(
         &self,
@@ -275,6 +246,58 @@ impl LivelockState {
             ));
         }
         outputs
+    }
+
+    /// Process verified provisions and return network actions for inclusion proof fetches.
+    ///
+    /// Combines cycle detection with action construction: groups deferral proof
+    /// requests by (source_shard, block_height) and enriches with topology peers.
+    pub fn on_provisions_accepted_actions(
+        &mut self,
+        batch: &hyperscale_types::ProvisionBatch,
+        topology: &TopologySnapshot,
+    ) -> Vec<Action> {
+        let outputs = self.on_provisions_accepted(batch);
+        if outputs.is_empty() {
+            return vec![];
+        }
+
+        // Group deferral proof requests by (source_shard, block_height).
+        let mut grouped: HashMap<
+            (ShardGroupId, BlockHeight),
+            Vec<(Hash, InclusionProofFetchReason)>,
+        > = HashMap::new();
+        for output in outputs {
+            match output {
+                LivelockOutput::FetchInclusionProof {
+                    source_shard,
+                    source_block_height,
+                    winner_tx_hash,
+                    loser_tx_hash,
+                } => {
+                    grouped
+                        .entry((source_shard, source_block_height))
+                        .or_default()
+                        .push((
+                            winner_tx_hash,
+                            InclusionProofFetchReason::Deferral { loser_tx_hash },
+                        ));
+                }
+            }
+        }
+
+        grouped
+            .into_iter()
+            .map(|((source_shard, source_block_height), entries)| {
+                let peers = topology.committee_for_shard(source_shard).to_vec();
+                Action::RequestTxInclusionProofs {
+                    source_shard,
+                    source_block_height,
+                    entries,
+                    peers,
+                }
+            })
+            .collect()
     }
 
     /// Check for a bidirectional cycle with a remote transaction.
@@ -448,9 +471,31 @@ impl LivelockState {
 
     /// Called when a block is committed.
     ///
-    /// Processes abort intents and certificates to clean up tracking state.
-    pub fn on_block_committed(&mut self, block: &hyperscale_types::Block) {
+    /// First registers any cross-shard transactions for cycle detection,
+    /// then processes abort intents and certificates to clean up tracking state.
+    /// The registration must happen before processing to maintain ordering invariants.
+    pub fn on_block_committed(
+        &mut self,
+        topology: &TopologySnapshot,
+        block: &hyperscale_types::Block,
+    ) {
         let height = block.header.height;
+
+        // Register newly committed cross-shard TXs for cycle detection.
+        // Must happen BEFORE processing abort intents/certificates below.
+        for tx in block.transactions.iter() {
+            let needs = self.compute_remote_state_needs(topology, tx);
+            if !needs.shards.is_empty() {
+                let tx_hash = tx.hash();
+                debug!(
+                    tx_hash = %tx_hash,
+                    height = height.0,
+                    shards = ?needs.shards,
+                    "Tracking committed cross-shard TX for cycle detection"
+                );
+                self.committed_tracker.add(tx_hash, needs);
+            }
+        }
 
         // Process committed abort intents (covers both livelock deferrals and timeouts)
         for intent in &block.abort_intents {
@@ -563,14 +608,6 @@ impl LivelockState {
         }
     }
 
-    /// Check if a transaction is cross-shard (needs provisions from other shards).
-    pub fn is_cross_shard(&self, topology: &TopologySnapshot, tx: &RoutableTransaction) -> bool {
-        !self
-            .compute_remote_state_needs(topology, tx)
-            .shards
-            .is_empty()
-    }
-
     /// Get statistics for metrics.
     pub fn stats(&self) -> LivelockStats {
         LivelockStats {
@@ -598,7 +635,19 @@ pub struct LivelockStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hyperscale_types::{AbortReason, TransactionInclusionProof, ValidatorId};
+    use hyperscale_types::{
+        AbortReason, TransactionInclusionProof, ValidatorId, ValidatorInfo, ValidatorSet,
+    };
+
+    fn make_test_topology() -> TopologySnapshot {
+        let key = hyperscale_types::Bls12381G1PrivateKey::from_u64(1).unwrap();
+        let validators = vec![ValidatorInfo {
+            validator_id: ValidatorId(0),
+            public_key: key.public_key(),
+            voting_power: 1,
+        }];
+        TopologySnapshot::new(ValidatorId(0), 1, ValidatorSet::new(validators))
+    }
 
     fn make_test_node_id(id: u8) -> NodeId {
         // Create a simple NodeId from bytes
@@ -917,7 +966,7 @@ mod tests {
             abort_intents: vec![abort_intent],
         };
 
-        state.on_block_committed(&block);
+        state.on_block_committed(&make_test_topology(), &block);
 
         assert!(
             !state.committed_tracker.contains(&tx),
@@ -969,7 +1018,7 @@ mod tests {
             abort_intents: vec![],
         };
 
-        state.on_block_committed(&block);
+        state.on_block_committed(&make_test_topology(), &block);
 
         assert!(
             !state.committed_tracker.contains(&tx),
@@ -1043,7 +1092,7 @@ mod tests {
             abort_intents: vec![],
         };
 
-        state.on_block_committed(&block);
+        state.on_block_committed(&make_test_topology(), &block);
 
         assert!(
             state.tombstones.contains_key(&tx),
@@ -1098,7 +1147,7 @@ mod tests {
             abort_intents: vec![abort_intent],
         };
 
-        state.on_block_committed(&block);
+        state.on_block_committed(&make_test_topology(), &block);
 
         assert!(
             state.tombstones.contains_key(&tx),

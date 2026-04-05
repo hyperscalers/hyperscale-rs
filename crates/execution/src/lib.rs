@@ -18,7 +18,7 @@ mod trackers;
 pub use accumulator::ExecutionAccumulator;
 pub use execution_cache::ExecutionCache;
 pub use state::{
-    CompletionData, ExecutionMemoryStats, ExecutionState, DEFAULT_SPECULATIVE_MAX_TXS,
-    DEFAULT_VIEW_CHANGE_COOLDOWN_ROUNDS,
+    BlockCommittedOutput, CompletionData, CrossShardRegistration, ExecutionMemoryStats,
+    ExecutionState, DEFAULT_SPECULATIVE_MAX_TXS, DEFAULT_VIEW_CHANGE_COOLDOWN_ROUNDS,
 };
 pub use trackers::VoteTracker;

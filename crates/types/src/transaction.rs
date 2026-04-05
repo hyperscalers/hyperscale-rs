@@ -405,43 +405,6 @@ impl std::str::FromStr for AbortReason {
     }
 }
 
-/// A transaction abort included in a block.
-///
-/// When a transaction times out or is rejected, the proposer includes this
-/// abort record in a block. All validators process it identically, releasing
-/// locks and marking the transaction as terminally failed.
-#[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
-pub struct TransactionAbort {
-    /// Hash of the transaction being aborted.
-    pub tx_hash: Hash,
-
-    /// Why the transaction was aborted.
-    pub reason: AbortReason,
-
-    /// Block height where this abort is being committed.
-    pub block_height: BlockHeight,
-}
-
-impl TransactionAbort {
-    /// Create a new transaction abort for execution timeout.
-    pub fn execution_timeout(
-        tx_hash: Hash,
-        committed_at: BlockHeight,
-        timeout_at: BlockHeight,
-    ) -> Self {
-        Self {
-            tx_hash,
-            reason: AbortReason::ExecutionTimeout { committed_at },
-            block_height: timeout_at,
-        }
-    }
-
-    /// Check if this abort is due to a timeout.
-    pub fn is_timeout(&self) -> bool {
-        matches!(self.reason, AbortReason::ExecutionTimeout { .. })
-    }
-}
-
 /// An abort intent included in a block.
 ///
 /// Abort intents are proposals to the execution voting process. They feed into

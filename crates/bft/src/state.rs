@@ -408,7 +408,7 @@ impl BftState {
     /// Used by:
     /// - Verifiers to check if JVT is ready for state root verification
     /// - Fallback/sync blocks to get current root when no certs
-    fn get_local_jvt_root(&self) -> Hash {
+    pub fn jvt_root(&self) -> Hash {
         self.verification.jvt_root()
     }
 
@@ -806,23 +806,24 @@ impl BftState {
     ///
     /// Takes ready transactions from mempool (already sectioned and hash-sorted),
     /// plus deferrals, aborts, and certificates from execution.
-    #[instrument(skip(self, ready_txs, abort_intents, certificates, collect_updates), fields(
+    #[instrument(skip(self, ready_txs, abort_intents, certificates, cert_updates, finalized_tx_hashes), fields(
         tx_count = ready_txs.len(),
         abort_intent_count = abort_intents.len(),
         cert_count = certificates.len(),
     ))]
     #[allow(clippy::too_many_arguments)]
-    pub fn on_proposal_timer<F>(
+    pub fn on_proposal_timer(
         &mut self,
         topology: &TopologySnapshot,
         ready_txs: &ReadyTransactions,
         abort_intents: Vec<AbortIntent>,
         certificates: Vec<Arc<TransactionCertificate>>,
-        collect_updates: F,
-    ) -> Vec<Action>
-    where
-        F: FnOnce(&[Arc<TransactionCertificate>]) -> Vec<Arc<hyperscale_types::DatabaseUpdates>>,
-    {
+        cert_updates: &std::collections::HashMap<
+            hyperscale_types::Hash,
+            Arc<hyperscale_types::DatabaseUpdates>,
+        >,
+        finalized_tx_hashes: &std::collections::HashSet<Hash>,
+    ) -> Vec<Action> {
         // The next height to propose is one above the highest certified block,
         // NOT one above the committed block. This allows the chain to grow
         // while waiting for the two-chain commit rule to be satisfied.
@@ -925,13 +926,40 @@ impl BftState {
         let (qc_chain_cert_hashes, qc_chain_tx_hashes, qc_chain_abort_hashes) =
             self.collect_qc_chain_hashes(parent_hash);
 
-        // Filter abort intents already in the QC chain and deduplicate by
-        // tx_hash within this proposal (livelock + timeout can both fire for the
-        // same tx in the same round; keep the first intent, discard duplicates).
+        // Filter abort intents:
+        // 1. Skip transactions that already have a TC (finalized).
+        // 2. Skip livelock abort intents whose remote header hasn't arrived yet
+        //    (voters need the header to verify the inclusion proof).
+        // 3. Skip intents already in the QC chain.
+        // 4. Deduplicate by tx_hash within this proposal (livelock + timeout can
+        //    both fire for the same tx in the same round).
         let mut seen_abort_hashes = std::collections::HashSet::new();
         let abort_intents_with_height: Vec<AbortIntent> = abort_intents_with_height
             .into_iter()
             .filter(|a| {
+                if finalized_tx_hashes.contains(&a.tx_hash) {
+                    info!(
+                        tx_hash = %a.tx_hash,
+                        "Filtering abort intent from proposal: transaction already finalized (TC created)"
+                    );
+                    return false;
+                }
+                if let hyperscale_types::AbortReason::LivelockCycle {
+                    source_shard,
+                    source_block_height,
+                    ..
+                } = &a.reason
+                {
+                    if !self.has_remote_header(*source_shard, *source_block_height) {
+                        debug!(
+                            tx_hash = %a.tx_hash,
+                            source_shard = source_shard.0,
+                            source_block_height = source_block_height.0,
+                            "Deferring livelock abort intent: remote header not yet available"
+                        );
+                        return false;
+                    }
+                }
                 !qc_chain_abort_hashes.contains(&a.tx_hash) && seen_abort_hashes.insert(a.tx_hash)
             })
             .collect();
@@ -974,7 +1002,7 @@ impl BftState {
                 // Parent not found - use local JVT state as fallback.
                 // This handles genesis case and edge cases where the parent block
                 // is missing from pending_blocks (e.g., after recovery or sync).
-                self.get_local_jvt_root()
+                self.jvt_root()
             });
 
         // Track that we have a pending proposal (for correlation)
@@ -997,9 +1025,12 @@ impl BftState {
         // provisions (derived from wave union) and missing execution certificates.
         let waves = hyperscale_types::compute_waves(topology, &transactions);
 
-        // Collect per-certificate Arc<DatabaseUpdates> from execution cache.
+        // Collect per-certificate Arc<DatabaseUpdates> from pre-computed map.
         // Merging is deferred to the thread pool.
-        let per_cert_updates = collect_updates(&certificates_to_propose);
+        let per_cert_updates: Vec<Arc<hyperscale_types::DatabaseUpdates>> = certificates_to_propose
+            .iter()
+            .filter_map(|c| cert_updates.get(&c.transaction_hash).cloned())
+            .collect();
 
         // Always use BuildProposal - the runner handles JVT readiness and timeout.
         // This ensures transactions are always included regardless of certificate state.
@@ -1069,7 +1100,7 @@ impl BftState {
             .map(|b| b.header.state_root)
             .unwrap_or_else(|| {
                 // Genesis case - use local JVT state
-                self.get_local_jvt_root()
+                self.jvt_root()
             });
 
         let header = BlockHeader {
@@ -1188,7 +1219,7 @@ impl BftState {
             .map(|b| b.header.state_root)
             .unwrap_or_else(|| {
                 // Genesis case - use local JVT state
-                self.get_local_jvt_root()
+                self.jvt_root()
             });
 
         let header = BlockHeader {
@@ -1941,7 +1972,7 @@ impl BftState {
                     let parent_state_root = self
                         .get_block_by_hash(block.header.parent_hash)
                         .map(|parent| parent.header.state_root)
-                        .unwrap_or_else(|| self.get_local_jvt_root());
+                        .unwrap_or_else(|| self.jvt_root());
                     self.verification.initiate_state_root_verification(
                         block_hash,
                         &block,
@@ -2981,12 +3012,12 @@ impl BftState {
     ///
     /// `state_root` is the computed JVT root after applying writes from the certificates.
     /// If certificates is empty, parent state is inherited.
-    #[instrument(skip(self, qc, ready_txs, abort_intents, certificates, collect_updates), fields(
+    #[instrument(skip(self, qc, ready_txs, abort_intents, certificates, cert_updates, finalized_tx_hashes), fields(
         height = qc.height.0,
         block_hash = ?block_hash
     ))]
     #[allow(clippy::too_many_arguments)]
-    pub fn on_qc_formed<F>(
+    pub fn on_qc_formed(
         &mut self,
         topology: &TopologySnapshot,
         block_hash: Hash,
@@ -2994,11 +3025,12 @@ impl BftState {
         ready_txs: &ReadyTransactions,
         abort_intents: Vec<AbortIntent>,
         certificates: Vec<Arc<TransactionCertificate>>,
-        collect_updates: F,
-    ) -> Vec<Action>
-    where
-        F: FnOnce(&[Arc<TransactionCertificate>]) -> Vec<Arc<hyperscale_types::DatabaseUpdates>>,
-    {
+        cert_updates: &std::collections::HashMap<
+            hyperscale_types::Hash,
+            Arc<hyperscale_types::DatabaseUpdates>,
+        >,
+        finalized_tx_hashes: &std::collections::HashSet<Hash>,
+    ) -> Vec<Action> {
         let height = qc.height.0;
 
         info!(
@@ -3106,7 +3138,8 @@ impl BftState {
                 ready_txs,
                 abort_intents,
                 certificates,
-                collect_updates,
+                cert_updates,
+                finalized_tx_hashes,
             ));
         } else if should_try_proposal && rate_limited {
             // Schedule the proposal timer to fire exactly when the rate limit
@@ -4648,6 +4681,17 @@ impl BftState {
             .as_ref()
             .map(|qc| qc.block_hash)
             .unwrap_or(self.committed_hash)
+    }
+
+    /// Returns the number of transactions in the QC chain above committed height.
+    ///
+    /// Callers should request this many extra transactions from the mempool to
+    /// compensate for duplicates that will be filtered during proposal building.
+    /// This avoids the caller needing to call `collect_qc_chain_hashes` separately.
+    pub fn dedup_overhead(&self) -> usize {
+        let parent_hash = self.proposal_parent_hash();
+        let (_, tx_hashes, _) = self.collect_qc_chain_hashes(parent_hash);
+        tx_hashes.len()
     }
 
     /// Walk the QC chain from `parent_hash` back to committed height, collecting
@@ -6981,7 +7025,8 @@ mod tests {
             &ReadyTransactions::default(), // empty mempool
             vec![],                        // no abort intents
             vec![],                        // no certificates
-            |_certs| vec![],
+            &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
         );
 
         // Should NOT contain a BlockHeader broadcast (no proposal)
@@ -7031,7 +7076,8 @@ mod tests {
             &ReadyTransactions::default(), // empty mempool
             vec![abort_intent],            // has an abort intent
             vec![],                        // no certificates
-            |_certs| vec![],
+            &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
         );
 
         // Should contain a BuildProposal action (proposal triggered)
@@ -7351,7 +7397,8 @@ mod tests {
             &ReadyTransactions::default(), // empty mempool
             vec![abort_intent],            // has content
             vec![],
-            |_certs| vec![],
+            &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
         );
 
         // Should NOT contain a BlockHeader broadcast (rate limited)
@@ -7406,7 +7453,8 @@ mod tests {
             &ReadyTransactions::default(), // empty mempool
             vec![abort_intent],            // has content
             vec![],
-            |_certs| vec![],
+            &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
         );
 
         // Should contain a BuildProposal action (enough time passed)
@@ -7488,7 +7536,8 @@ mod tests {
             &ReadyTransactions::default(),
             vec![abort_intent],
             vec![],
-            |_certs| vec![],
+            &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
         );
 
         let has_block_header = actions
@@ -7565,7 +7614,8 @@ mod tests {
             &ReadyTransactions::default(),
             vec![abort_intent],
             vec![],
-            |_certs| vec![],
+            &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
         );
 
         // Should contain a BuildProposal action (rate limiting disabled)
@@ -7610,7 +7660,8 @@ mod tests {
             &ReadyTransactions::default(),
             vec![],
             vec![],
-            |_certs| vec![],
+            &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
         );
 
         // Verify last_qc_time was updated to current time
@@ -7830,8 +7881,14 @@ mod tests {
             transactions: vec![Arc::new(hyperscale_types::test_utils::test_transaction(1))],
         };
 
-        let actions =
-            state.on_proposal_timer(&topology, &ready_txs, vec![], vec![], |_certs| vec![]);
+        let actions = state.on_proposal_timer(
+            &topology,
+            &ready_txs,
+            vec![],
+            vec![],
+            &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
+        );
 
         // Should have broadcast a block header
         let has_block_header = actions
@@ -7896,7 +7953,8 @@ mod tests {
             &ReadyTransactions::default(),
             vec![],
             vec![],
-            |_certs| vec![],
+            &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
         );
 
         // Extract the block header
@@ -8180,7 +8238,8 @@ mod tests {
             &ReadyTransactions::default(),
             vec![],
             vec![],
-            |_certs| vec![],
+            &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
         );
 
         // Leader activity should be updated
@@ -8298,7 +8357,8 @@ mod tests {
             &ReadyTransactions::default(),
             vec![],
             vec![],
-            |_certs| vec![],
+            &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
         );
 
         // Verify we got a proposal (not skipped due to syncing)

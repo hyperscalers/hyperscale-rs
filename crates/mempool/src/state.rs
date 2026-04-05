@@ -2,8 +2,8 @@
 
 use hyperscale_core::{Action, FinalizationPhaseTimes, TransactionStatus};
 use hyperscale_types::{
-    AbortReason, Block, BlockHeight, Hash, NodeId, ReadyTransactions, RoutableTransaction,
-    TopologySnapshot, TransactionAbort, TransactionDecision,
+    AbortIntent, AbortReason, Block, BlockHeight, Hash, NodeId, ReadyTransactions,
+    RoutableTransaction, TopologySnapshot, TransactionDecision,
 };
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -21,6 +21,15 @@ pub const DEFAULT_MIN_DWELL_TIME: Duration = Duration::from_millis(150);
 /// This allows slow validators to catch up and fetch transactions from peers
 /// even after the transaction has been evicted from the active pool.
 const TRANSACTION_RETENTION_BLOCKS: u64 = 50;
+
+/// How many blocks a cross-shard transaction can wait before being aborted.
+/// Must be comfortably longer than the exec cert fallback fetch timeout (10 blocks)
+/// plus the fallback retry cycle (~15 blocks) to avoid aborting transactions that
+/// the fallback path would have recovered.
+const EXECUTION_TIMEOUT_BLOCKS: u64 = 50;
+
+/// How many blocks to retain tombstones in the mempool (gossip deduplication).
+const TOMBSTONE_RETENTION_BLOCKS: u64 = 500;
 
 /// Default backpressure limit.
 ///
@@ -1175,6 +1184,22 @@ impl MempoolState {
         self.in_flight() >= self.config.max_in_flight
     }
 
+    /// Check whether accepting a block would unacceptably increase in-flight load.
+    ///
+    /// Returns `true` if the block should be rejected. Blocks that reduce or
+    /// maintain the current in-flight count are always accepted, even when over
+    /// the limit — this prevents deadlock when certificate-heavy blocks would
+    /// relieve backpressure.
+    pub fn would_exceed_in_flight(&self, new_tx_count: usize, cert_count: usize) -> bool {
+        let current = self.in_flight();
+        let projected = current
+            .saturating_add(new_tx_count)
+            .saturating_sub(cert_count);
+        let would_exceed = projected > self.config.max_in_flight;
+        let would_increase = projected > current;
+        would_exceed && would_increase
+    }
+
     /// Get the number of pending transactions.
     ///
     /// Returns the count of transactions in Pending status (waiting to be
@@ -1270,7 +1295,7 @@ impl MempoolState {
     /// This is a safety net for N-way cycles that aren't detected by pairwise
     /// cycle detection.
     ///
-    /// Returns `TransactionAbort` entries ready for inclusion in a block.
+    /// Returns abort intents ready for inclusion in a block.
     ///
     /// # Parameters
     /// - `current_height`: The current block height
@@ -1279,7 +1304,7 @@ impl MempoolState {
         &mut self,
         current_height: BlockHeight,
         timeout_blocks: u64,
-    ) -> Vec<TransactionAbort> {
+    ) -> Vec<AbortIntent> {
         let mut aborts = Vec::new();
 
         // Scan only in-flight transactions at heights old enough to have timed out.
@@ -1303,7 +1328,7 @@ impl MempoolState {
                         status = status_name,
                         "Transaction timed out waiting for completion"
                     );
-                    aborts.push(TransactionAbort {
+                    aborts.push(AbortIntent {
                         tx_hash: *hash,
                         reason: AbortReason::ExecutionTimeout {
                             committed_at: *committed_at,
@@ -1315,6 +1340,19 @@ impl MempoolState {
         }
 
         aborts
+    }
+
+    /// Get timed-out cross-shard transactions using the default timeout.
+    pub fn get_default_timed_out_transactions(
+        &mut self,
+        current_height: BlockHeight,
+    ) -> Vec<AbortIntent> {
+        self.get_timed_out_transactions(current_height, EXECUTION_TIMEOUT_BLOCKS)
+    }
+
+    /// Clean up old tombstones using the default retention window.
+    pub fn cleanup_default_tombstones(&mut self, current_height: BlockHeight) -> usize {
+        self.cleanup_old_tombstones(current_height, TOMBSTONE_RETENTION_BLOCKS)
     }
 
     /// Clean up old tombstones and completed winners to prevent unbounded memory growth.
