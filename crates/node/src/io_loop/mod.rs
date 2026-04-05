@@ -217,9 +217,14 @@ where
     commit_in_flight: Arc<AtomicBool>,
 
     // Receipt bundle accumulator — collects StoreReceiptBundles within an
-    // event cycle, then spawns storage writes on the execution pool so
-    // SBOR-encoding + RocksDB writes don't block the IoLoop thread.
+    // event cycle. Flushed periodically via `receipt_flush_deadline` rather
+    // than on the commit critical path (receipts are for query/re-serving,
+    // not for state reconstruction).
     pending_receipt_bundles: Vec<hyperscale_types::ReceiptBundle>,
+
+    // Deadline for the next periodic receipt flush. Set when the first
+    // receipt arrives after a flush; reset to None after flushing.
+    receipt_flush_deadline: Option<std::time::Duration>,
 
     // Transaction status cache — retains the latest status for every transaction
     // that has emitted a status notification. Bounded LRU cache shared (via Arc)
@@ -318,6 +323,7 @@ where
             pending_block_commits: Vec::new(),
             commit_in_flight: Arc::new(AtomicBool::new(false)),
             pending_receipt_bundles: Vec::new(),
+            receipt_flush_deadline: None,
             exec_cert_cache: Arc::new(Mutex::new(HashMap::new())),
             pending_ec_writes: Vec::new(),
             cached_local_peers,
@@ -877,6 +883,16 @@ where
         if self.committed_header_batch.is_expired(now) {
             self.flush_committed_header_verifications();
         }
+        // Receipt flush: resolve sentinel deadline and check expiry.
+        if let Some(deadline) = self.receipt_flush_deadline {
+            if deadline == Duration::ZERO {
+                // First tick after receipts arrived — set real deadline (100ms from now).
+                self.receipt_flush_deadline = Some(now + Duration::from_millis(100));
+            } else if now >= deadline {
+                self.flush_pending_receipts();
+                self.receipt_flush_deadline = None;
+            }
+        }
     }
 
     /// Get the nearest batch deadline, if any.
@@ -887,6 +903,7 @@ where
         [
             self.validation_batch.deadline(),
             self.committed_header_batch.deadline(),
+            self.receipt_flush_deadline,
         ]
         .into_iter()
         .flatten()
