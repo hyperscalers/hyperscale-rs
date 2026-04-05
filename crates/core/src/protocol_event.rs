@@ -274,6 +274,9 @@ pub enum ProtocolEvent {
     /// A synced block is ready to be applied to local state.
     SyncBlockReadyToApply { block: Block, qc: QuorumCertificate },
 
+    /// Sync EC BLS verification completed (async callback from crypto pool).
+    SyncEcVerificationComplete { height: u64, valid: bool },
+
     /// Sync completed successfully.
     SyncComplete { height: u64 },
 
@@ -412,6 +415,7 @@ impl ProtocolEvent {
             ProtocolEvent::ChainMetadataFetched { .. } => "ChainMetadataFetched",
 
             // Sync Delivery
+            ProtocolEvent::SyncEcVerificationComplete { .. } => "SyncEcVerificationComplete",
             ProtocolEvent::SyncBlockReadyToApply { .. } => "SyncBlockReadyToApply",
             ProtocolEvent::SyncComplete { .. } => "SyncComplete",
 

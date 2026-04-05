@@ -373,8 +373,9 @@ impl SyncProtocol {
 
 /// Serve an inbound block sync request.
 ///
-/// Includes ledger receipts for each certificate in the block so the
-/// syncing peer can apply state changes without re-executing.
+/// Includes ledger receipts and execution certificates for each certificate
+/// in the block so the syncing peer can verify and apply state changes
+/// without re-executing. Returns not_found if any data is missing.
 pub fn serve_block_request(
     storage: &impl ConsensusStore,
     req: GetBlockRequest,
@@ -382,7 +383,7 @@ pub fn serve_block_request(
     trace!(height = req.height.0, "Handling block sync request");
     match storage.get_block_for_sync(req.height) {
         Some((block, qc)) => {
-            // Collect receipts for each certificate in the block.
+            // Collect receipts for each non-aborted certificate.
             // Aborted certificates have no receipts — execution never ran,
             // so there are no state changes or receipts to sync.
             let certs_needing_receipts: Vec<_> = block
@@ -412,7 +413,33 @@ pub fn serve_block_request(
                 return GetBlockResponse::not_found();
             }
 
-            GetBlockResponse::found(block, qc, ledger_receipts)
+            // Collect local ECs for this block height.
+            let execution_certificates =
+                storage.get_execution_certificates_by_height(block.header.height.0);
+
+            // Completeness check: for each non-aborted TC, verify that the
+            // EC set contains a matching EC for the local shard's proof.
+            let local_shard = block.header.shard_group_id;
+            for cert in &certs_needing_receipts {
+                if let Some(proof) = cert.shard_proofs.get(&local_shard) {
+                    let expected_ec_hash = proof.ec_hash();
+                    if expected_ec_hash != hyperscale_types::Hash::ZERO
+                        && !execution_certificates
+                            .iter()
+                            .any(|ec| ec.canonical_hash() == expected_ec_hash)
+                    {
+                        warn!(
+                            height = req.height.0,
+                            tx_hash = %cert.transaction_hash,
+                            "Missing EC for certificate — \
+                             returning not_found so requester tries another peer"
+                        );
+                        return GetBlockResponse::not_found();
+                    }
+                }
+            }
+
+            GetBlockResponse::found(block, qc, ledger_receipts, execution_certificates)
         }
         None => GetBlockResponse::not_found(),
     }

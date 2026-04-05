@@ -850,6 +850,8 @@ impl StateMachine for NodeStateMachine {
             ProtocolEvent::SyncBlockReadyToApply { block, qc } => self
                 .bft
                 .on_sync_block_ready_to_apply(self.topology.snapshot(), block, qc),
+            // Handled by IoLoop directly (sync verification pipeline).
+            ProtocolEvent::SyncEcVerificationComplete { .. } => vec![],
             ProtocolEvent::SyncComplete { .. } => self.on_sync_complete(),
             ProtocolEvent::ChainMetadataFetched { height, hash, qc } => self
                 .bft

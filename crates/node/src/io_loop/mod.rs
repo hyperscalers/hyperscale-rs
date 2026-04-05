@@ -64,6 +64,13 @@ pub type SharedTopologySnapshot = Arc<ArcSwap<TopologySnapshot>>;
 /// Shared execution certificate cache for fallback serving.
 type ExecCertCache = Arc<Mutex<HashMap<(Hash, WaveId), Arc<ExecutionCertificate>>>>;
 
+/// Buffered sync data (receipts + ECs) for a block height.
+/// Consumed by the sync commit path for verification and atomic persistence.
+pub(crate) struct BufferedSyncResponse {
+    pub ledger_receipts: Vec<hyperscale_types::LedgerReceiptEntry>,
+    pub execution_certificates: Vec<hyperscale_types::ExecutionCertificate>,
+}
+
 /// Default certificate cache capacity.
 const DEFAULT_CERT_CACHE_SIZE: usize = 10_000;
 /// Default transaction cache capacity.
@@ -239,6 +246,12 @@ where
     // commit WriteBatch for atomic persistence (D4: one fsync per block).
     pending_ec_writes: Vec<hyperscale_types::ExecutionCertificate>,
 
+    // Sync data buffer: holds receipts and ECs from sync responses, keyed
+    // by block height. Consumed by the sync path in flush_block_commits
+    // for verification + atomic commit. Not stored to pending_receipt_bundles
+    // (receipts go through the verification pipeline first).
+    pending_sync_data: std::collections::HashMap<u64, BufferedSyncResponse>,
+
     // Cached local shard peers (committee excluding self) — avoids per-call allocation.
     cached_local_peers: Vec<ValidatorId>,
 
@@ -326,6 +339,7 @@ where
             receipt_flush_deadline: None,
             exec_cert_cache: Arc::new(Mutex::new(HashMap::new())),
             pending_ec_writes: Vec::new(),
+            pending_sync_data: std::collections::HashMap::new(),
             cached_local_peers,
             tx_status_cache: Arc::new(QuickCache::new(DEFAULT_TX_STATUS_CACHE_SIZE)),
             emitted_statuses: Vec::new(),
@@ -549,24 +563,51 @@ where
                 height,
                 block,
                 ledger_receipts,
+                execution_certificates,
             } => {
-                // Store receipts from sync peer BEFORE processing the block.
-                // Syncing nodes didn't execute locally, so local_execution is None.
-                // state_changes already populated by remote peer.
-                let bundles: Vec<hyperscale_types::ReceiptBundle> = ledger_receipts
-                    .iter()
-                    .map(|entry| hyperscale_types::ReceiptBundle {
-                        tx_hash: entry.tx_hash,
-                        ledger_receipt: std::sync::Arc::new(entry.receipt.clone()),
-                        local_execution: None,
-                        database_updates: None,
-                    })
-                    .collect();
-                self.pending_receipt_bundles.extend(bundles);
-                let outputs = self
-                    .sync_protocol
-                    .handle(SyncInput::BlockResponseReceived { height, block });
-                self.process_sync_outputs(outputs);
+                // Check 1: receipt_root verification (synchronous).
+                // Verify block body matches the QC-attested header.
+                let receipt_root_valid = match *block {
+                    Some((ref b, _)) if !b.certificates.is_empty() => {
+                        let computed = hyperscale_types::compute_receipt_root(&b.certificates);
+                        if computed != b.header.receipt_root {
+                            tracing::warn!(
+                                height,
+                                ?computed,
+                                expected = ?b.header.receipt_root,
+                                "Sync: receipt_root mismatch — rejecting response"
+                            );
+                            false
+                        } else {
+                            true
+                        }
+                    }
+                    _ => true, // Empty block or no block — no root to check
+                };
+
+                if !receipt_root_valid {
+                    let _ = self
+                        .event_sender
+                        .send(NodeInput::SyncBlockFetchFailed { height });
+                } else {
+                    // Buffer receipts + ECs for the sync commit path.
+                    // The commit closure verifies EC BLS signatures,
+                    // cross-checks EC↔TC hashes, and verifies state_root.
+                    if block.is_some() {
+                        self.pending_sync_data.insert(
+                            height,
+                            BufferedSyncResponse {
+                                ledger_receipts,
+                                execution_certificates,
+                            },
+                        );
+                    }
+
+                    let outputs = self
+                        .sync_protocol
+                        .handle(SyncInput::BlockResponseReceived { height, block });
+                    self.process_sync_outputs(outputs);
+                }
             }
 
             NodeInput::SyncBlockFetchFailed { height } => {
