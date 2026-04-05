@@ -43,7 +43,8 @@ where
                         },
                         Box::new(move |result| match result {
                             Ok(resp) => {
-                                let (block_opt, qc_opt, ledger_receipts) = resp.into_parts();
+                                let (block_opt, qc_opt, ledger_receipts, execution_certificates) =
+                                    resp.into_parts();
                                 let block = match (block_opt, qc_opt) {
                                     (Some(b), Some(q)) => Some((b, q)),
                                     _ => None,
@@ -67,6 +68,7 @@ where
                                         height,
                                         block: Box::new(block),
                                         ledger_receipts,
+                                        execution_certificates,
                                     });
                                 } else {
                                     tracing::warn!(

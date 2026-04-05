@@ -57,6 +57,8 @@ pub enum NodeInput {
         block: Box<Option<(Block, QuorumCertificate)>>,
         /// Ledger receipts for the block's certificates (from sync peer).
         ledger_receipts: Vec<LedgerReceiptEntry>,
+        /// Execution certificates produced by the serving shard.
+        execution_certificates: Vec<ExecutionCertificate>,
     },
 
     /// Sync block fetch failed from network callback.
