@@ -614,7 +614,10 @@ where
                 // Also tick the exec cert fetch protocol.
                 let cert_outputs = self
                     .exec_cert_fetch_protocol
-                    .handle(ExecCertFetchInput::Tick);
+                    .handle(ExecCertFetchInput::Tick {
+                        now: std::time::Instant::now(),
+                        committed_height: self.state.bft().committed_height(),
+                    });
                 self.process_exec_cert_fetch_outputs(cert_outputs);
                 // Also tick the tx cert fetch protocol.
                 let tx_cert_outputs = self.tx_cert_fetch_protocol.handle(TxCertFetchInput::Tick);
@@ -724,7 +727,10 @@ where
                 // Tick to retry with next peer immediately.
                 let tick_outputs = self
                     .exec_cert_fetch_protocol
-                    .handle(ExecCertFetchInput::Tick);
+                    .handle(ExecCertFetchInput::Tick {
+                        now: std::time::Instant::now(),
+                        committed_height: self.state.bft().committed_height(),
+                    });
                 self.process_exec_cert_fetch_outputs(tick_outputs);
                 self.update_fetch_tick_timer();
             }
