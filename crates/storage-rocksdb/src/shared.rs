@@ -261,4 +261,22 @@ impl hyperscale_storage::ConsensusStore for SharedStorage {
     ) -> Option<hyperscale_types::LocalTransactionExecution> {
         self.0.get_local_execution(tx_hash)
     }
+
+    fn get_execution_certificate(
+        &self,
+        canonical_hash: &Hash,
+    ) -> Option<hyperscale_types::ExecutionCertificate> {
+        self.0.get_execution_certificate(canonical_hash)
+    }
+
+    fn get_execution_certificates_by_height(
+        &self,
+        block_height: u64,
+    ) -> Vec<hyperscale_types::ExecutionCertificate> {
+        self.0.get_execution_certificates_by_height(block_height)
+    }
+
+    fn store_execution_certificates(&self, certs: &[hyperscale_types::ExecutionCertificate]) {
+        self.0.store_execution_certificates(certs)
+    }
 }
