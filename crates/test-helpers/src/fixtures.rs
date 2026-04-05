@@ -137,6 +137,7 @@ pub fn make_shard_execution_proof(receipt_hash: Hash, success: bool) -> ShardExe
         receipt_hash,
         success,
         write_nodes: vec![],
+        ec_hash: Hash::ZERO,
     }
 }
 

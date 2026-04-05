@@ -689,6 +689,7 @@ mod tests {
                     receipt_hash: Hash::from_bytes(&[seed + 100; 32]),
                     success: true,
                     write_nodes: vec![],
+                    ec_hash: Hash::ZERO,
                 },
             );
             Arc::new(TransactionCertificate {
@@ -719,6 +720,7 @@ mod tests {
                 receipt_hash: Hash::from_bytes(b"receipt_hash_value"),
                 success: true,
                 write_nodes: vec![],
+                ec_hash: Hash::ZERO,
             },
         );
         let cert = Arc::new(TransactionCertificate {

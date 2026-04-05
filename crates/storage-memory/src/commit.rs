@@ -84,6 +84,7 @@ impl CommitStore for SimStorage {
         prepared: Self::PreparedCommit,
         certificates: &[Arc<TransactionCertificate>],
         consensus: Option<hyperscale_storage::ConsensusCommitData>,
+        _execution_certificates: &[hyperscale_types::ExecutionCertificate],
     ) -> Hash {
         let block_height = prepared.snapshot.new_version;
         let result_root = prepared.snapshot.result_root;
@@ -134,6 +135,7 @@ impl CommitStore for SimStorage {
             certificates,
             block_height,
             consensus,
+            &[],
         )
     }
 
@@ -143,6 +145,7 @@ impl CommitStore for SimStorage {
         certificates: &[Arc<TransactionCertificate>],
         block_height: u64,
         consensus: Option<hyperscale_storage::ConsensusCommitData>,
+        _execution_certificates: &[hyperscale_types::ExecutionCertificate],
     ) -> Hash {
         let mut s = self.state.write().unwrap();
 

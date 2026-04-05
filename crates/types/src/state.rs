@@ -111,9 +111,16 @@ pub enum ShardExecutionProof {
         success: bool,
         /// NodeIds written during execution.
         write_nodes: Vec<NodeId>,
+        /// Canonical hash of the ExecutionCertificate that carried this proof.
+        ec_hash: Hash,
     },
     /// Transaction was aborted on this shard before execution completed.
-    Aborted,
+    Aborted {
+        /// Canonical hash of the EC whose abort-intent triggered the abort.
+        /// `Hash::ZERO` for shards that didn't produce an EC for this tx
+        /// (partial shard_proofs on abort fast-path).
+        ec_hash: Hash,
+    },
 }
 
 impl ShardExecutionProof {
@@ -124,14 +131,22 @@ impl ShardExecutionProof {
 
     /// Whether this shard aborted.
     pub fn is_aborted(&self) -> bool {
-        matches!(self, ShardExecutionProof::Aborted)
+        matches!(self, ShardExecutionProof::Aborted { .. })
     }
 
     /// Get the receipt hash, or `Hash::ZERO` for aborted proofs.
     pub fn receipt_hash_or_zero(&self) -> Hash {
         match self {
             ShardExecutionProof::Executed { receipt_hash, .. } => *receipt_hash,
-            ShardExecutionProof::Aborted => Hash::ZERO,
+            ShardExecutionProof::Aborted { .. } => Hash::ZERO,
+        }
+    }
+
+    /// Get the canonical hash of the EC that carried this proof.
+    pub fn ec_hash(&self) -> Hash {
+        match self {
+            ShardExecutionProof::Executed { ec_hash, .. } => *ec_hash,
+            ShardExecutionProof::Aborted { ec_hash } => *ec_hash,
         }
     }
 }
@@ -272,6 +287,7 @@ mod tests {
             receipt_hash: Hash::from_bytes(b"receipt"),
             success: true,
             write_nodes: vec![],
+            ec_hash: Hash::ZERO,
         };
 
         assert!(proof.is_success());

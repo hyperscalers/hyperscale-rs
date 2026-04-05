@@ -481,6 +481,7 @@ where
                     &block.certificates,
                     height.0,
                     Some(consensus),
+                    &[],
                 );
                 ConsensusStore::prune_own_votes(&*self.storage, height.0);
                 let _ = self.event_sender.send(NodeInput::Protocol(
@@ -560,7 +561,12 @@ where
                 let prepared = prepared_map[i].take();
                 let result = if let Some(prepared) = prepared {
                     // Normal path: prepared commit from VerifyStateRoot.
-                    storage.commit_prepared_block(prepared, &block.certificates, Some(consensus))
+                    storage.commit_prepared_block(
+                        prepared,
+                        &block.certificates,
+                        Some(consensus),
+                        &[],
+                    )
                 } else if !block.certificates.is_empty() {
                     // Sync path: no execution cache, reconstruct DatabaseUpdates
                     // from receipts stored during sync.
@@ -601,7 +607,13 @@ where
                         })
                         .collect();
                     let merged = hyperscale_storage::merge_database_updates(&per_cert);
-                    storage.commit_block(&merged, &block.certificates, height.0, Some(consensus))
+                    storage.commit_block(
+                        &merged,
+                        &block.certificates,
+                        height.0,
+                        Some(consensus),
+                        &[],
+                    )
                 } else {
                     // Empty block: no updates needed.
                     let empty_updates = hyperscale_types::DatabaseUpdates::default();
@@ -610,6 +622,7 @@ where
                         &block.certificates,
                         height.0,
                         Some(consensus),
+                        &[],
                     )
                 };
 

@@ -143,9 +143,10 @@ impl hyperscale_storage::CommitStore for SharedStorage {
         prepared: Self::PreparedCommit,
         certificates: &[std::sync::Arc<TransactionCertificate>],
         consensus: Option<hyperscale_storage::ConsensusCommitData>,
+        execution_certificates: &[hyperscale_types::ExecutionCertificate],
     ) -> hyperscale_types::Hash {
         self.0
-            .commit_prepared_block(prepared, certificates, consensus)
+            .commit_prepared_block(prepared, certificates, consensus, execution_certificates)
     }
 
     fn commit_block(
@@ -154,9 +155,15 @@ impl hyperscale_storage::CommitStore for SharedStorage {
         certificates: &[std::sync::Arc<TransactionCertificate>],
         block_height: u64,
         consensus: Option<hyperscale_storage::ConsensusCommitData>,
+        execution_certificates: &[hyperscale_types::ExecutionCertificate],
     ) -> hyperscale_types::Hash {
-        self.0
-            .commit_block(merged_updates, certificates, block_height, consensus)
+        self.0.commit_block(
+            merged_updates,
+            certificates,
+            block_height,
+            consensus,
+            execution_certificates,
+        )
     }
 
     fn memory_usage_bytes(&self) -> (u64, u64) {

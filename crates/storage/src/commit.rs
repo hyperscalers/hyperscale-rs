@@ -4,7 +4,9 @@
 //! `prepare_block_commit` returns an opaque `PreparedCommit` handle that
 //! carries precomputed work; `commit_prepared_block` applies it efficiently.
 
-use hyperscale_types::{BlockHeight, Hash, QuorumCertificate, TransactionCertificate};
+use hyperscale_types::{
+    BlockHeight, ExecutionCertificate, Hash, QuorumCertificate, TransactionCertificate,
+};
 use radix_substate_store_interface::interface::DatabaseUpdates;
 use std::sync::Arc;
 
@@ -70,6 +72,7 @@ pub trait CommitStore: Send + Sync {
         prepared: Self::PreparedCommit,
         certificates: &[Arc<TransactionCertificate>],
         consensus: Option<ConsensusCommitData>,
+        execution_certificates: &[ExecutionCertificate],
     ) -> Hash;
 
     /// Commit a block's state writes from scratch (no prepared handle).
@@ -87,6 +90,7 @@ pub trait CommitStore: Send + Sync {
         certificates: &[Arc<TransactionCertificate>],
         block_height: u64,
         consensus: Option<ConsensusCommitData>,
+        execution_certificates: &[ExecutionCertificate],
     ) -> Hash;
 
     /// Memory usage of storage caches in bytes: `(block_cache, memtable)`.

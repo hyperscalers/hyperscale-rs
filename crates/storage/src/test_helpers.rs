@@ -82,6 +82,7 @@ pub fn make_test_certificate(tx_seed: u8, shard: ShardGroupId) -> TransactionCer
         receipt_hash: Hash::from_bytes(&[0; 32]),
         success: true,
         write_nodes: vec![],
+        ec_hash: Hash::ZERO,
     };
     let mut shard_proofs = BTreeMap::new();
     shard_proofs.insert(shard, proof);
@@ -130,6 +131,7 @@ pub fn make_multi_shard_certificate(
             receipt_hash: Hash::from_bytes(&[0; 32]),
             success: true,
             write_nodes: vec![],
+            ec_hash: Hash::ZERO,
         };
         shard_proofs.insert(shard, proof);
     }

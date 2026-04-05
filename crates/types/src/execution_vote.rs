@@ -149,7 +149,7 @@ pub struct TxOutcome {
 
 impl TxOutcome {
     /// Convert this outcome into a `ShardExecutionProof` for certificate tracking.
-    pub fn to_shard_proof(&self) -> crate::ShardExecutionProof {
+    pub fn to_shard_proof(&self, ec_hash: Hash) -> crate::ShardExecutionProof {
         match &self.outcome {
             TxExecutionOutcome::Executed {
                 receipt_hash,
@@ -159,8 +159,9 @@ impl TxOutcome {
                 receipt_hash: *receipt_hash,
                 success: *success,
                 write_nodes: write_nodes.clone(),
+                ec_hash,
             },
-            TxExecutionOutcome::Aborted { .. } => crate::ShardExecutionProof::Aborted,
+            TxExecutionOutcome::Aborted { .. } => crate::ShardExecutionProof::Aborted { ec_hash },
         }
     }
 
@@ -253,6 +254,27 @@ pub struct ExecutionCertificate {
     pub aggregated_signature: Bls12381G2Signature,
     /// Which validators signed (bitfield indexed by committee position).
     pub signers: SignerBitfield,
+}
+
+impl ExecutionCertificate {
+    /// Compute the canonical hash of this certificate.
+    ///
+    /// Hashes only the deterministic execution-result fields, **excluding**
+    /// `aggregated_signature` and `signers`. Different validators aggregate
+    /// different 2f+1 subsets of votes, producing different signatures for the
+    /// same wave — the canonical hash identifies the *logical* EC so that any
+    /// valid aggregation resolves to the same hash.
+    pub fn canonical_hash(&self) -> Hash {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(self.block_hash.as_bytes());
+        hasher.update(&self.block_height.to_le_bytes());
+        hasher.update(&self.vote_height.to_le_bytes());
+        hasher.update(&basic_encode(&self.wave_id).unwrap());
+        hasher.update(&basic_encode(&self.shard_group_id).unwrap());
+        hasher.update(self.receipt_root.as_bytes());
+        hasher.update(&basic_encode(&self.tx_outcomes).unwrap());
+        Hash::from_hash_bytes(hasher.finalize().as_bytes())
+    }
 }
 
 // ============================================================================
@@ -457,5 +479,75 @@ mod tests {
             },
         };
         assert_ne!(tx_outcome_leaf(&executed), tx_outcome_leaf(&aborted));
+    }
+
+    fn make_test_ec(
+        signers: SignerBitfield,
+        signature: Bls12381G2Signature,
+    ) -> ExecutionCertificate {
+        ExecutionCertificate {
+            block_hash: Hash::from_bytes(b"block"),
+            block_height: 10,
+            vote_height: 11,
+            wave_id: WaveId(BTreeSet::from([ShardGroupId(1)])),
+            shard_group_id: ShardGroupId(0),
+            receipt_root: Hash::from_bytes(b"receipt_root"),
+            tx_outcomes: vec![make_outcome(1), make_outcome(2)],
+            aggregated_signature: signature,
+            signers,
+        }
+    }
+
+    #[test]
+    fn test_canonical_hash_deterministic() {
+        let signers = SignerBitfield::new(4);
+        let sig = Bls12381G2Signature([0u8; 96]);
+        let ec1 = make_test_ec(signers.clone(), sig);
+        let ec2 = make_test_ec(signers, sig);
+        assert_eq!(ec1.canonical_hash(), ec2.canonical_hash());
+        assert_ne!(ec1.canonical_hash(), Hash::ZERO);
+    }
+
+    #[test]
+    fn test_canonical_hash_signer_independent() {
+        let mut signers_a = SignerBitfield::new(4);
+        signers_a.set(0);
+        signers_a.set(1);
+        let sig_a = Bls12381G2Signature([1u8; 96]);
+
+        let mut signers_b = SignerBitfield::new(4);
+        signers_b.set(2);
+        signers_b.set(3);
+        let sig_b = Bls12381G2Signature([2u8; 96]);
+
+        let ec_a = make_test_ec(signers_a, sig_a);
+        let ec_b = make_test_ec(signers_b, sig_b);
+
+        // Different signers + signatures → same canonical hash
+        assert_eq!(ec_a.canonical_hash(), ec_b.canonical_hash());
+    }
+
+    #[test]
+    fn test_to_shard_proof_embeds_ec_hash() {
+        let ec_hash = Hash::from_bytes(b"ec_hash_value");
+        let outcome = make_outcome(1);
+        let proof = outcome.to_shard_proof(ec_hash);
+        assert_eq!(proof.ec_hash(), ec_hash);
+    }
+
+    #[test]
+    fn test_to_shard_proof_aborted_embeds_ec_hash() {
+        let ec_hash = Hash::from_bytes(b"ec_hash_value");
+        let outcome = TxOutcome {
+            tx_hash: Hash::from_bytes(b"tx"),
+            outcome: TxExecutionOutcome::Aborted {
+                reason: crate::AbortReason::ExecutionTimeout {
+                    committed_at: crate::BlockHeight(10),
+                },
+            },
+        };
+        let proof = outcome.to_shard_proof(ec_hash);
+        assert!(proof.is_aborted());
+        assert_eq!(proof.ec_hash(), ec_hash);
     }
 }
