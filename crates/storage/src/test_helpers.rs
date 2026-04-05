@@ -8,11 +8,12 @@ use crate::{
     ConsensusStore, DatabaseUpdates, DbSortKey, NodeDatabaseUpdates, PartitionDatabaseUpdates,
 };
 use hyperscale_types::{
-    zero_bls_signature, ApplicationEvent, Block, BlockHeader, BlockHeight, FeeSummary, Hash,
-    LedgerTransactionOutcome, LedgerTransactionReceipt, LocalTransactionExecution, LogLevel,
-    NodeId, PartitionNumber, QuorumCertificate, ReceiptBundle, ShardExecutionProof, ShardGroupId,
-    SignerBitfield, SubstateChange, SubstateChangeAction, SubstateRef, TransactionCertificate,
-    TransactionDecision, ValidatorId,
+    zero_bls_signature, ApplicationEvent, Block, BlockHeader, BlockHeight, Bls12381G2Signature,
+    ExecutionCertificate, FeeSummary, Hash, LedgerTransactionOutcome, LedgerTransactionReceipt,
+    LocalTransactionExecution, LogLevel, NodeId, PartitionNumber, QuorumCertificate, ReceiptBundle,
+    ShardExecutionProof, ShardGroupId, SignerBitfield, SubstateChange, SubstateChangeAction,
+    SubstateRef, TransactionCertificate, TransactionDecision, TxExecutionOutcome, TxOutcome,
+    ValidatorId, WaveId,
 };
 use radix_common::prelude::DatabaseUpdate;
 use radix_substate_store_interface::db_key_mapper::{DatabaseKeyMapper, SpreadPrefixKeyMapper};
@@ -260,4 +261,84 @@ pub fn test_receipt_idempotent_overwrite(storage: &impl ConsensusStore) {
 
     let retrieved = storage.get_ledger_receipt(&tx_hash).unwrap();
     assert_eq!(*retrieved, *bundle.ledger_receipt);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Execution Certificate helpers
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Build a test `ExecutionCertificate` at the given block height with a
+/// deterministic outcome derived from `seed`.
+pub fn make_test_execution_certificate(seed: u8, block_height: u64) -> ExecutionCertificate {
+    ExecutionCertificate {
+        block_hash: Hash::from_bytes(&[seed; 32]),
+        block_height,
+        vote_height: block_height + 1,
+        wave_id: WaveId::zero(),
+        shard_group_id: ShardGroupId(0),
+        receipt_root: Hash::from_bytes(&[seed + 50; 32]),
+        tx_outcomes: vec![TxOutcome {
+            tx_hash: Hash::from_bytes(&[seed + 100; 32]),
+            outcome: TxExecutionOutcome::Executed {
+                receipt_hash: Hash::from_bytes(&[seed + 150; 32]),
+                success: true,
+                write_nodes: vec![],
+            },
+        }],
+        aggregated_signature: Bls12381G2Signature([0u8; 96]),
+        signers: SignerBitfield::new(4),
+    }
+}
+
+/// Shared EC roundtrip test: store → get by hash → get by height.
+pub fn test_ec_storage_roundtrip(storage: &impl ConsensusStore) {
+    let ec = make_test_execution_certificate(1, 10);
+    let canonical_hash = ec.canonical_hash();
+
+    // Initially empty
+    assert!(storage.get_execution_certificate(&canonical_hash).is_none());
+    assert!(storage.get_execution_certificates_by_height(10).is_empty());
+
+    // Store and verify by hash
+    storage.store_execution_certificates(std::slice::from_ref(&ec));
+    let retrieved = storage.get_execution_certificate(&canonical_hash).unwrap();
+    assert_eq!(retrieved.block_height, 10);
+    assert_eq!(retrieved.canonical_hash(), canonical_hash);
+
+    // Verify by height
+    let by_height = storage.get_execution_certificates_by_height(10);
+    assert_eq!(by_height.len(), 1);
+    assert_eq!(by_height[0].canonical_hash(), canonical_hash);
+
+    // Different height returns empty
+    assert!(storage.get_execution_certificates_by_height(11).is_empty());
+}
+
+/// Shared EC batch test: multiple ECs at same and different heights.
+pub fn test_ec_storage_batch(storage: &impl ConsensusStore) {
+    let ec1 = make_test_execution_certificate(1, 10);
+    let ec2 = make_test_execution_certificate(2, 10);
+    let ec3 = make_test_execution_certificate(3, 20);
+
+    storage.store_execution_certificates(&[ec1.clone(), ec2.clone(), ec3.clone()]);
+
+    // Both ECs at height 10
+    let at_10 = storage.get_execution_certificates_by_height(10);
+    assert_eq!(at_10.len(), 2);
+
+    // One EC at height 20
+    let at_20 = storage.get_execution_certificates_by_height(20);
+    assert_eq!(at_20.len(), 1);
+    assert_eq!(at_20[0].canonical_hash(), ec3.canonical_hash());
+
+    // All retrievable by hash
+    assert!(storage
+        .get_execution_certificate(&ec1.canonical_hash())
+        .is_some());
+    assert!(storage
+        .get_execution_certificate(&ec2.canonical_hash())
+        .is_some());
+    assert!(storage
+        .get_execution_certificate(&ec3.canonical_hash())
+        .is_some());
 }

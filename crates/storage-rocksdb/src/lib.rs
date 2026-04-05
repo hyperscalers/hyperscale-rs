@@ -17,6 +17,7 @@ mod commit;
 pub(crate) mod config;
 mod consensus;
 pub(crate) mod core;
+mod execution_certs;
 mod gc;
 pub(crate) mod jvt_snapshot_store;
 pub(crate) mod metadata;

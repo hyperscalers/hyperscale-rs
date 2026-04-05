@@ -1,9 +1,11 @@
 //! `ConsensusStore` implementation for `RocksDbStorage`.
 
 use crate::core::RocksDbStorage;
+use crate::typed_cf::TypedCf;
 
 use hyperscale_types::{
-    Block, BlockHeight, Hash, QuorumCertificate, RoutableTransaction, TransactionCertificate,
+    Block, BlockHeight, ExecutionCertificate, Hash, QuorumCertificate, RoutableTransaction,
+    TransactionCertificate,
 };
 use std::sync::Arc;
 
@@ -96,5 +98,34 @@ impl hyperscale_storage::ConsensusStore for RocksDbStorage {
         tx_hash: &Hash,
     ) -> Option<hyperscale_types::LocalTransactionExecution> {
         RocksDbStorage::get_local_execution(self, tx_hash)
+    }
+
+    fn get_execution_certificate(&self, canonical_hash: &Hash) -> Option<ExecutionCertificate> {
+        self.cf_get::<crate::column_families::ExecutionCertsCf>(canonical_hash)
+    }
+
+    fn get_execution_certificates_by_height(&self, block_height: u64) -> Vec<ExecutionCertificate> {
+        let cf = crate::column_families::ExecutionCertsByHeightCf::handle(&self.cf());
+        let prefix = block_height.to_be_bytes();
+        crate::typed_cf::prefix_iter::<crate::column_families::ExecutionCertsByHeightCf>(
+            &self.db, cf, &prefix,
+        )
+        .filter_map(|((_height, canonical_hash), ())| {
+            self.cf_get::<crate::column_families::ExecutionCertsCf>(&canonical_hash)
+        })
+        .collect()
+    }
+
+    fn store_execution_certificates(&self, certs: &[ExecutionCertificate]) {
+        if certs.is_empty() {
+            return;
+        }
+        let mut batch = rocksdb::WriteBatch::default();
+        crate::execution_certs::append_execution_certs_to_batch(self, &mut batch, certs);
+        let mut write_opts = rocksdb::WriteOptions::default();
+        write_opts.set_sync(true);
+        self.db
+            .write_opt(batch, &write_opts)
+            .expect("BFT SAFETY CRITICAL: EC write failed");
     }
 }

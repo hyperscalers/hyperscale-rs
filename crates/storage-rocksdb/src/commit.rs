@@ -69,7 +69,11 @@ impl hyperscale_storage::CommitStore for RocksDbStorage {
         for cert in certificates {
             self.cf_put::<CertificatesCf>(&mut write_batch, &cert.transaction_hash, cert.as_ref());
         }
-        let _ = execution_certificates; // TODO: Step 2 — append EC writes to batch
+        crate::execution_certs::append_execution_certs_to_batch(
+            self,
+            &mut write_batch,
+            execution_certificates,
+        );
 
         let used_fast_path =
             self.try_apply_prepared_commit(write_batch, prepared.jvt_snapshot, consensus.as_ref());
@@ -96,7 +100,7 @@ impl hyperscale_storage::CommitStore for RocksDbStorage {
         certificates: &[Arc<TransactionCertificate>],
         block_height: u64,
         consensus: Option<hyperscale_storage::ConsensusCommitData>,
-        _execution_certificates: &[hyperscale_types::ExecutionCertificate],
+        execution_certificates: &[hyperscale_types::ExecutionCertificate],
     ) -> hyperscale_types::Hash {
         let _commit_guard = self.commit_lock.lock().unwrap();
 
@@ -120,6 +124,13 @@ impl hyperscale_storage::CommitStore for RocksDbStorage {
         for cert in certificates {
             self.cf_put::<CertificatesCf>(&mut batch, &cert.transaction_hash, cert.as_ref());
         }
+
+        // Store execution certificates atomically in the same batch.
+        crate::execution_certs::append_execution_certs_to_batch(
+            self,
+            &mut batch,
+            execution_certificates,
+        );
 
         // Compute JVT update.
         let parent_version = hyperscale_storage::jvt_parent_height(base_version, base_root);

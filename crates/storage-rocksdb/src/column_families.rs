@@ -7,8 +7,8 @@ use crate::typed_cf::*;
 
 use hyperscale_storage::jmt::{StoredNodeKey, VersionedStoredNode};
 use hyperscale_types::{
-    BlockMetadata, Hash, LedgerTransactionReceipt, LocalTransactionExecution, RoutableTransaction,
-    TransactionCertificate,
+    BlockMetadata, ExecutionCertificate, Hash, LedgerTransactionReceipt, LocalTransactionExecution,
+    RoutableTransaction, TransactionCertificate,
 };
 
 // ─── CF name constants ───────────────────────────────────────────────────────
@@ -53,6 +53,13 @@ pub(crate) const LEDGER_RECEIPTS_CF: &str = "ledger_receipts";
 /// Column family name for local execution details keyed by tx hash.
 pub(crate) const LOCAL_EXECUTIONS_CF: &str = "local_executions";
 
+/// Column family for execution certificates keyed by canonical hash.
+pub(crate) const EXECUTION_CERTS_CF: &str = "execution_certs";
+
+/// Column family for execution certificate height index.
+/// Key: `block_height_BE_8B ++ canonical_hash_32B`, Value: `()`.
+pub(crate) const EXECUTION_CERTS_BY_HEIGHT_CF: &str = "execution_certs_by_height";
+
 // Default-CF metadata keys are defined as MetadataEntry types in typed_cf.rs.
 // See CommittedHeightEntry, CommittedHashEntry, CommittedQcEntry, JvtMetadataEntry.
 
@@ -75,6 +82,8 @@ pub(crate) const ALL_COLUMN_FAMILIES: &[&str] = &[
     VERSIONED_SUBSTATES_CF,
     LEDGER_RECEIPTS_CF,
     LOCAL_EXECUTIONS_CF,
+    EXECUTION_CERTS_CF,
+    EXECUTION_CERTS_BY_HEIGHT_CF,
 ];
 
 // ─── CfHandles ───────────────────────────────────────────────────────────────
@@ -96,6 +105,8 @@ pub(crate) struct CfHandles<'a> {
     versioned_substates: &'a rocksdb::ColumnFamily,
     ledger_receipts: &'a rocksdb::ColumnFamily,
     local_executions: &'a rocksdb::ColumnFamily,
+    execution_certs: &'a rocksdb::ColumnFamily,
+    execution_certs_by_height: &'a rocksdb::ColumnFamily,
 }
 
 impl<'a> CfHandles<'a> {
@@ -119,6 +130,8 @@ impl<'a> CfHandles<'a> {
             versioned_substates: resolve(VERSIONED_SUBSTATES_CF),
             ledger_receipts: resolve(LEDGER_RECEIPTS_CF),
             local_executions: resolve(LOCAL_EXECUTIONS_CF),
+            execution_certs: resolve(EXECUTION_CERTS_CF),
+            execution_certs_by_height: resolve(EXECUTION_CERTS_BY_HEIGHT_CF),
         }
     }
 }
@@ -262,4 +275,60 @@ impl TypedCf for LocalExecutionsCf {
     fn handle<'a>(cf: &CfHandles<'a>) -> &'a rocksdb::ColumnFamily {
         cf.local_executions
     }
+}
+
+// Execution Certificates
+
+pub(crate) struct ExecutionCertsCf;
+impl TypedCf for ExecutionCertsCf {
+    const NAME: &'static str = EXECUTION_CERTS_CF;
+    type Key = Hash; // canonical hash
+    type Value = ExecutionCertificate;
+    type KeyCodec = HashCodec;
+    type ValueCodec = SborCodec<ExecutionCertificate>;
+    fn handle<'a>(cf: &CfHandles<'a>) -> &'a rocksdb::ColumnFamily {
+        cf.execution_certs
+    }
+}
+
+/// Height index for execution certificates.
+/// Key: `(block_height, canonical_hash)`, Value: `()`.
+pub(crate) struct ExecutionCertsByHeightCf;
+impl TypedCf for ExecutionCertsByHeightCf {
+    const NAME: &'static str = EXECUTION_CERTS_BY_HEIGHT_CF;
+    type Key = (u64, Hash); // (block_height, canonical_hash)
+    type Value = ();
+    type KeyCodec = HeightHashCodec;
+    type ValueCodec = UnitCodec;
+    fn handle<'a>(cf: &CfHandles<'a>) -> &'a rocksdb::ColumnFamily {
+        cf.execution_certs_by_height
+    }
+}
+
+/// Codec for `(u64, Hash)` composite key: `height_BE_8B ++ hash_32B`.
+/// Big-endian height ensures lexicographic ordering by height.
+#[derive(Default)]
+pub(crate) struct HeightHashCodec;
+
+impl DbCodec<(u64, Hash)> for HeightHashCodec {
+    fn encode_to(&self, value: &(u64, Hash), buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&value.0.to_be_bytes());
+        buf.extend_from_slice(value.1.as_bytes());
+    }
+
+    fn decode(&self, bytes: &[u8]) -> (u64, Hash) {
+        assert!(bytes.len() == 40, "HeightHash key must be 40 bytes");
+        let height = u64::from_be_bytes(bytes[..8].try_into().unwrap());
+        let hash = Hash::from_hash_bytes(&bytes[8..40]);
+        (height, hash)
+    }
+}
+
+/// Codec for `()` — empty value.
+#[derive(Default)]
+pub(crate) struct UnitCodec;
+
+impl DbCodec<()> for UnitCodec {
+    fn encode_to(&self, _value: &(), _buf: &mut Vec<u8>) {}
+    fn decode(&self, _bytes: &[u8]) {}
 }

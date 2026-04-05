@@ -743,3 +743,60 @@ fn test_receipt_survives_reopen() {
         assert_eq!(local, bundle.local_execution.unwrap());
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// Execution certificate storage
+// ═══════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_ec_storage_roundtrip() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
+    hyperscale_storage::test_helpers::test_ec_storage_roundtrip(&storage);
+}
+
+#[test]
+fn test_ec_storage_batch() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
+    hyperscale_storage::test_helpers::test_ec_storage_batch(&storage);
+}
+
+#[test]
+fn test_ec_survives_reopen() {
+    let temp_dir = TempDir::new().unwrap();
+    let ec = hyperscale_storage::test_helpers::make_test_execution_certificate(1, 10);
+    let canonical_hash = ec.canonical_hash();
+
+    {
+        let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
+        storage.store_execution_certificates(std::slice::from_ref(&ec));
+    }
+
+    {
+        let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
+        let retrieved = storage.get_execution_certificate(&canonical_hash).unwrap();
+        assert_eq!(retrieved.block_height, 10);
+        assert_eq!(retrieved.canonical_hash(), canonical_hash);
+
+        let by_height = storage.get_execution_certificates_by_height(10);
+        assert_eq!(by_height.len(), 1);
+    }
+}
+
+#[test]
+fn test_ec_atomic_with_block_commit() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
+
+    let ec = hyperscale_storage::test_helpers::make_test_execution_certificate(1, 1);
+    let canonical_hash = ec.canonical_hash();
+    let cert = Arc::new(make_test_certificate(1, ShardGroupId(0)));
+
+    // Commit block with EC atomically
+    storage.commit_block(&DatabaseUpdates::default(), &[cert], 1, None, &[ec]);
+
+    // EC should be retrievable
+    let retrieved = storage.get_execution_certificate(&canonical_hash).unwrap();
+    assert_eq!(retrieved.block_height, 1);
+}
