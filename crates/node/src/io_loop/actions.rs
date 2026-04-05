@@ -859,7 +859,10 @@ where
                 self.process_exec_cert_fetch_outputs(outputs);
                 let tick_outputs = self
                     .exec_cert_fetch_protocol
-                    .handle(ExecCertFetchInput::Tick);
+                    .handle(ExecCertFetchInput::Tick {
+                        now: std::time::Instant::now(),
+                        committed_height: self.state.bft().committed_height(),
+                    });
                 self.process_exec_cert_fetch_outputs(tick_outputs);
                 self.update_fetch_tick_timer();
             }
