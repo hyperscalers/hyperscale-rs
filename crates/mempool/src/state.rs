@@ -233,6 +233,11 @@ pub struct MempoolState {
     /// Enables efficient timeout scanning: only entries at old heights are checked.
     in_flight_by_height: BTreeMap<BlockHeight, Vec<Hash>>,
 
+    /// Transaction hashes for which an abort intent has already been committed
+    /// in a block. Prevents re-generating the same timeout abort intent every
+    /// proposal cycle. Cleared when the tx reaches terminal state (TC committed).
+    committed_abort_intent_hashes: HashSet<Hash>,
+
     /// Current time.
     now: Duration,
 
@@ -280,6 +285,7 @@ impl MempoolState {
             txs_deferred_by_node: HashMap::new(),
             ready_txs_by_node: HashMap::new(),
             in_flight_by_height: BTreeMap::new(),
+            committed_abort_intent_hashes: HashSet::new(),
             now: Duration::ZERO,
             current_height: BlockHeight(0),
             config,
@@ -438,6 +444,9 @@ impl MempoolState {
         // Remove from ready tracking
         self.remove_from_ready_tracking(&tx_hash);
 
+        // Clean up committed abort intent tracking
+        self.committed_abort_intent_hashes.remove(&tx_hash);
+
         // Move transaction to recently_evicted cache instead of discarding
         if let Some(entry) = self.pool.remove(&tx_hash) {
             self.recently_evicted
@@ -546,9 +555,13 @@ impl MempoolState {
             }
         }
 
-        // Abort intents are NOT processed by the mempool — they feed the
-        // execution accumulator only (in node state machine). Terminal state
-        // is reached exclusively via TC commit below.
+        // Track committed abort intents so we stop re-proposing them.
+        // Terminal state is still reached exclusively via TC commit below —
+        // this just prevents the same timeout abort intent from being included
+        // in every subsequent block.
+        for intent in &block.abort_intents {
+            self.committed_abort_intent_hashes.insert(intent.tx_hash);
+        }
 
         // Process certificates — the ONLY terminal state trigger
         for cert in &block.certificates {
@@ -1314,6 +1327,11 @@ impl MempoolState {
                 if let Some(entry) = self.pool.get(hash) {
                     // Skip already-finalized transactions
                     if matches!(entry.status, TransactionStatus::Completed(_)) {
+                        continue;
+                    }
+                    // Skip transactions that already have a committed abort intent —
+                    // no need to re-propose the same intent every block.
+                    if self.committed_abort_intent_hashes.contains(hash) {
                         continue;
                     }
                     let status_name = match &entry.status {
