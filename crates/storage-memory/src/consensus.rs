@@ -118,7 +118,7 @@ impl ConsensusStore for SimStorage {
         let mut c = self.consensus.write().unwrap();
         let receipt = if let Some(ref updates) = bundle.database_updates {
             let mut r = (*bundle.ledger_receipt).clone();
-            r.state_changes = hyperscale_storage::extract_state_changes(updates);
+            r.state_changes = hyperscale_engine::sharding::extract_state_changes(updates);
             Arc::new(r)
         } else {
             Arc::clone(&bundle.ledger_receipt)

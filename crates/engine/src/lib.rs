@@ -34,6 +34,11 @@ mod genesis;
 mod result;
 mod validation;
 
+/// Transaction execution handlers with integrated shard filtering.
+pub mod handlers;
+/// Shard assignment and write filtering for Radix Engine DatabaseUpdates.
+pub mod sharding;
+
 pub use execution::ProvisionedSnapshot;
 pub use executor::{fetch_state_entries, fetch_state_entries_speculative, RadixExecutor};
 pub use genesis::GenesisConfig;

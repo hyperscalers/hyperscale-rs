@@ -48,10 +48,7 @@ pub use genesis::{GenesisWrapper, SubstatesOnlyCommit};
 pub use jvt_snapshot::{JvtSnapshot, LeafSubstateKeyAssociation};
 pub use overlay::{SubstateDbLookup, SubstateLookup};
 pub use store::SubstateStore;
-pub use writes::{
-    extract_state_changes, filter_updates_to_shard, merge_database_updates,
-    merge_database_updates_from_arcs, merge_into, receipt_to_database_updates,
-};
+pub use writes::{merge_database_updates, merge_database_updates_from_arcs, merge_into};
 
 /// Returns `None` when the JVT is truly empty (height 0 with zero root),
 /// indicating no parent node exists. Otherwise returns `Some(block_height)`.

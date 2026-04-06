@@ -441,36 +441,25 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
         } => {
             let local_shard = ctx.local_shard;
             let num_shards = ctx.num_shards;
+            // Engine handles execution + system/shard filtering internally.
             let raw_results: Vec<_> = transactions
                 .iter()
                 .map(|tx| {
-                    hyperscale_execution::handlers::execute_single_shard(
+                    hyperscale_engine::handlers::execute_single_shard(
                         ctx.executor,
                         ctx.storage,
                         tx,
+                        local_shard,
+                        num_shards,
                     )
                 })
                 .collect();
 
-            // Extract per-tx outcomes on handler thread (before consuming results)
             let tx_outcomes: Vec<_> = raw_results
                 .iter()
-                .map(hyperscale_execution::handlers::extract_execution_result)
+                .map(hyperscale_engine::handlers::extract_execution_result)
                 .collect();
-            let results = raw_results
-                .into_iter()
-                .map(|r| {
-                    let mut result = ExecutionResult::from(r);
-                    if num_shards > 1 {
-                        result.database_updates = hyperscale_storage::filter_updates_to_shard(
-                            &result.database_updates,
-                            local_shard,
-                            num_shards,
-                        );
-                    }
-                    result
-                })
-                .collect();
+            let results = raw_results.into_iter().map(ExecutionResult::from).collect();
 
             Some(DelegatedResult {
                 events: vec![NodeInput::Protocol(
@@ -493,34 +482,22 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
             let raw_results: Vec<_> = transactions
                 .iter()
                 .map(|tx| {
-                    hyperscale_execution::handlers::execute_single_shard(
+                    hyperscale_engine::handlers::execute_single_shard(
                         ctx.executor,
                         ctx.storage,
                         tx,
+                        local_shard,
+                        num_shards,
                     )
                 })
                 .collect();
 
-            // Extract per-tx outcomes on handler thread
             let tx_outcomes: Vec<_> = raw_results
                 .iter()
-                .map(hyperscale_execution::handlers::extract_execution_result)
+                .map(hyperscale_engine::handlers::extract_execution_result)
                 .collect();
             let tx_hashes: Vec<Hash> = raw_results.iter().map(|r| r.tx_hash).collect();
-            let results = raw_results
-                .into_iter()
-                .map(|r| {
-                    let mut result = ExecutionResult::from(r);
-                    if num_shards > 1 {
-                        result.database_updates = hyperscale_storage::filter_updates_to_shard(
-                            &result.database_updates,
-                            local_shard,
-                            num_shards,
-                        );
-                    }
-                    result
-                })
-                .collect();
+            let results = raw_results.into_iter().map(ExecutionResult::from).collect();
 
             Some(DelegatedResult {
                 events: vec![
@@ -545,34 +522,23 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
             let raw_results: Vec<_> = requests
                 .iter()
                 .map(|req| {
-                    hyperscale_execution::handlers::execute_cross_shard(
+                    hyperscale_engine::handlers::execute_cross_shard(
                         ctx.executor,
                         ctx.storage,
                         req.tx_hash,
                         &req.transaction,
                         &req.provisions,
+                        local_shard,
+                        num_shards,
                     )
                 })
                 .collect();
 
             let tx_outcomes: Vec<_> = raw_results
                 .iter()
-                .map(hyperscale_execution::handlers::extract_execution_result)
+                .map(hyperscale_engine::handlers::extract_execution_result)
                 .collect();
-            let results = raw_results
-                .into_iter()
-                .map(|r| {
-                    let mut result = ExecutionResult::from(r);
-                    if num_shards > 1 {
-                        result.database_updates = hyperscale_storage::filter_updates_to_shard(
-                            &result.database_updates,
-                            local_shard,
-                            num_shards,
-                        );
-                    }
-                    result
-                })
-                .collect();
+            let results = raw_results.into_iter().map(ExecutionResult::from).collect();
 
             Some(DelegatedResult {
                 events: vec![NodeInput::Protocol(

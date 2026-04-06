@@ -659,11 +659,14 @@ where
                                 .map(|entry| {
                                     let receipt = &entry.receipt;
                                     let updates =
-                                        hyperscale_storage::receipt_to_database_updates(receipt);
-                                    hyperscale_storage::filter_updates_to_shard(
+                                        hyperscale_engine::sharding::receipt_to_database_updates(
+                                            receipt,
+                                        );
+                                    hyperscale_engine::sharding::filter_updates_for_shard(
                                         &updates,
                                         local_shard,
                                         num_shards,
+                                        &*storage,
                                     )
                                 })
                                 .collect()
@@ -680,11 +683,14 @@ where
                                 })
                                 .map(|receipt| {
                                     let updates =
-                                        hyperscale_storage::receipt_to_database_updates(&receipt);
-                                    hyperscale_storage::filter_updates_to_shard(
+                                        hyperscale_engine::sharding::receipt_to_database_updates(
+                                            &receipt,
+                                        );
+                                    hyperscale_engine::sharding::filter_updates_for_shard(
                                         &updates,
                                         local_shard,
                                         num_shards,
+                                        &*storage,
                                     )
                                 })
                                 .collect()

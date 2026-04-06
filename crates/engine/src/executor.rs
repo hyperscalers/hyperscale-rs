@@ -408,6 +408,7 @@ impl RadixExecutor {
             let ledger_receipt = build_ledger_receipt(receipt);
             let local_execution = build_local_execution(receipt);
             let receipt_hash = ledger_receipt.receipt_hash();
+
             SingleTxResult::success(
                 tx_hash,
                 receipt_hash,

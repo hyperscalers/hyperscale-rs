@@ -5,6 +5,7 @@ edition.workspace = true
 description = "RocksDB storage implementation for production"
 
 [dependencies]
+hyperscale-engine.workspace = true
 hyperscale-storage.workspace = true
 hyperscale-metrics.workspace = true
 hyperscale-types.workspace = true
