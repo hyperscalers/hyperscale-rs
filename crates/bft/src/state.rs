@@ -214,6 +214,14 @@ pub struct BftState {
     /// Used to validate execution timeout abort intents from proposers.
     committed_tx_lookup: HashMap<Hash, BlockHeight>,
 
+    /// Hashes from recently committed blocks, held until the mempool
+    /// processes the async `BlockCommitted` event and purges them.
+    /// Populated synchronously at BFT commit time, cleared by
+    /// `register_committed_transactions()` called from `on_block_committed`.
+    recently_committed_txs: std::collections::HashSet<Hash>,
+    recently_committed_certs: std::collections::HashSet<Hash>,
+    recently_committed_abort_intents: std::collections::HashSet<Hash>,
+
     /// Remote block headers for merkle inclusion proof validation in deferrals.
     /// Only headers with verified QCs (tracked in verification pipeline) are trusted.
     remote_headers: HashMap<(ShardGroupId, BlockHeight), Arc<CommittedBlockHeader>>,
@@ -315,6 +323,9 @@ impl BftState {
             pending_commits_awaiting_data: HashMap::new(),
             pending_proposal: None,
             committed_tx_lookup: HashMap::new(),
+            recently_committed_txs: std::collections::HashSet::new(),
+            recently_committed_certs: std::collections::HashSet::new(),
+            recently_committed_abort_intents: std::collections::HashSet::new(),
             remote_headers: HashMap::new(),
             remote_header_tips: HashMap::new(),
             config,
@@ -3389,6 +3400,18 @@ impl BftState {
             self.committed_height = height;
             self.committed_hash = current_hash;
 
+            // Buffer committed hashes so collect_qc_chain_hashes can
+            // exclude them even after cleanup_old_state removes the block.
+            for tx in &block.transactions {
+                self.recently_committed_txs.insert(tx.hash());
+            }
+            for cert in &block.certificates {
+                self.recently_committed_certs.insert(cert.transaction_hash);
+            }
+            for intent in &block.abort_intents {
+                self.recently_committed_abort_intents.insert(intent.tx_hash);
+            }
+
             // Reset backoff tracking - new height means fresh round counting
             self.view_at_height_start = self.view;
 
@@ -3647,6 +3670,17 @@ impl BftState {
         // Update committed state
         self.committed_height = height;
         self.committed_hash = block_hash;
+
+        // Buffer committed hashes (same as normal commit path).
+        for tx in &block.transactions {
+            self.recently_committed_txs.insert(tx.hash());
+        }
+        for cert in &block.certificates {
+            self.recently_committed_certs.insert(cert.transaction_hash);
+        }
+        for intent in &block.abort_intents {
+            self.recently_committed_abort_intents.insert(intent.tx_hash);
+        }
 
         // Reset backoff tracking - new height means fresh round counting
         self.view_at_height_start = self.view;
@@ -4698,6 +4732,12 @@ impl BftState {
             }
             self.committed_tx_lookup.entry(*tx_hash).or_insert(height);
         }
+        // Remove only this block's tx hashes from the bridge buffer.
+        // Other blocks may have committed but not yet been processed by the
+        // mempool — their hashes must remain in the buffer.
+        for tx_hash in tx_hashes {
+            self.recently_committed_txs.remove(tx_hash);
+        }
     }
 
     /// Remove a finalized transaction from the committed lookup.
@@ -4706,6 +4746,8 @@ impl BftState {
     /// timeout validation.
     pub fn remove_committed_transaction(&mut self, tx_hash: &Hash) {
         self.committed_tx_lookup.remove(tx_hash);
+        self.recently_committed_certs.remove(tx_hash);
+        self.recently_committed_abort_intents.remove(tx_hash);
     }
 
     /// Get the current committed height.
@@ -4809,6 +4851,13 @@ impl BftState {
             std::collections::HashSet::new();
 
         // Walk full blocks (certified_blocks + assembled pending_blocks + genesis)
+        // Also include any recently committed hashes that the mempool
+        // hasn't purged yet (committed_height advanced but BlockCommitted
+        // event is still in the async channel).
+        tx_hashes.extend(self.recently_committed_txs.iter().copied());
+        cert_hashes.extend(self.recently_committed_certs.iter().copied());
+        abort_intent_hashes.extend(self.recently_committed_abort_intents.iter().copied());
+
         let mut current_hash = parent_hash;
         while let Some(block) = self.get_block_by_hash(current_hash) {
             if block.header.height.0 <= self.committed_height {
