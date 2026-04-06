@@ -432,10 +432,14 @@ impl ExecutionState {
         certificates
             .iter()
             .filter(|c| c.decision != TransactionDecision::Aborted)
-            .filter_map(|c| {
-                self.finalized_certificates
-                    .get(&c.transaction_hash)
-                    .map(|entry| (c.transaction_hash, Arc::clone(&entry.database_updates)))
+            .map(|c| {
+                let entry = self.finalized_certificates.get(&c.transaction_hash).unwrap_or_else(|| {
+                    panic!(
+                        "BUG: certificate {} not in finalized_certificates — cannot compute state root",
+                        c.transaction_hash
+                    )
+                });
+                (c.transaction_hash, Arc::clone(&entry.database_updates))
             })
             .collect()
     }
@@ -444,13 +448,19 @@ impl ExecutionState {
     ///
     /// Returns cheap `Arc` clones from `finalized_certificates`.
     /// Used by state root verification to gather per-certificate write sets.
+    /// Every tx_hash MUST have a finalized entry — a missing entry means the
+    /// state root will silently diverge.
     pub fn updates_for_tx_hashes(&self, tx_hashes: &[Hash]) -> Vec<Arc<DatabaseUpdates>> {
         tx_hashes
             .iter()
-            .filter_map(|h| {
-                self.finalized_certificates
-                    .get(h)
-                    .map(|entry| Arc::clone(&entry.database_updates))
+            .map(|h| {
+                let entry = self.finalized_certificates.get(h).unwrap_or_else(|| {
+                    panic!(
+                        "BUG: tx {} required for state root verification but not in finalized_certificates",
+                        h
+                    )
+                });
+                Arc::clone(&entry.database_updates)
             })
             .collect()
     }
@@ -1807,17 +1817,16 @@ impl ExecutionState {
 
                 // Co-locate DatabaseUpdates with the certificate. The updates were
                 // stored in pending_execution_updates when execution completed.
-                // If missing (shouldn't happen), log a warning and use empty updates.
+                // Missing updates means the state root will diverge — this is fatal.
                 let database_updates = self
                     .pending_execution_updates
                     .remove(&tx_hash)
                     .unwrap_or_else(|| {
-                        tracing::warn!(
-                            tx_hash = %tx_hash,
-                            "No pending execution updates at TC creation — state_root will not \
-                             reflect this certificate's writes. This indicates a timing bug."
-                        );
-                        Arc::new(DatabaseUpdates::default())
+                        panic!(
+                            "BUG: No pending execution updates for tx {} at TC creation — \
+                             execution must complete before a TC can be formed",
+                            tx_hash
+                        )
                     });
 
                 self.finalized_certificates.insert(

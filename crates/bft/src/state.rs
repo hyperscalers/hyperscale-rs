@@ -1027,9 +1027,19 @@ impl BftState {
 
         // Collect per-certificate Arc<DatabaseUpdates> from pre-computed map.
         // Merging is deferred to the thread pool.
+        // Every non-aborted certificate MUST have updates — a missing entry means
+        // the state root will silently diverge from verifiers.
         let per_cert_updates: Vec<Arc<hyperscale_types::DatabaseUpdates>> = certificates_to_propose
             .iter()
-            .filter_map(|c| cert_updates.get(&c.transaction_hash).cloned())
+            .filter(|c| c.decision != hyperscale_types::TransactionDecision::Aborted)
+            .map(|c| {
+                cert_updates.get(&c.transaction_hash).cloned().unwrap_or_else(|| {
+                    panic!(
+                        "BUG: certificate {} included in proposal but has no DatabaseUpdates in cert_updates map",
+                        c.transaction_hash
+                    )
+                })
+            })
             .collect();
 
         // Always use BuildProposal - the runner handles JVT readiness and timeout.
