@@ -984,28 +984,23 @@ impl ExecutionState {
         let votes = tracker.take_votes(&receipt_root, vote_height);
         let committee = topology.local_committee().to_vec();
 
-        // Get tx_outcomes from the execution accumulator.
-        let tx_outcomes = self.accumulators.get(&key).and_then(|acc| acc.build_data());
-
-        let tx_outcomes = match tx_outcomes {
-            Some((local_root, outcomes)) => {
-                if local_root != receipt_root {
-                    tracing::error!(
-                        block_hash = ?key.0,
-                        wave = %key.1,
-                        ?receipt_root,
-                        ?local_root,
-                        "BUG: Local accumulator diverged from quorum receipt_root"
-                    );
-                    return vec![];
-                }
-                outcomes
+        // Extract tx_outcomes from any quorum vote — all votes with matching
+        // receipt_root have identical outcomes. This avoids relying on the wave
+        // leader's local accumulator, which may have diverged due to different
+        // abort intent timing at a different vote_height.
+        let tx_outcomes = match votes.first() {
+            Some(vote) => {
+                debug_assert!(
+                    vote.receipt_root == receipt_root,
+                    "quorum vote receipt_root mismatch"
+                );
+                vote.tx_outcomes.clone()
             }
             None => {
-                tracing::warn!(
+                tracing::error!(
                     block_hash = ?key.0,
                     wave = %key.1,
-                    "No accumulator data for wave — skipping EC aggregation"
+                    "No votes available after take_votes — skipping EC aggregation"
                 );
                 return vec![];
             }

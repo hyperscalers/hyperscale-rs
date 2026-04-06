@@ -81,7 +81,7 @@ where
                 wave_id,
                 receipt_root,
                 tx_count,
-                tx_outcomes: _,          // TODO: stash for later cert aggregation
+                tx_outcomes,
                 participating_shards: _, // TODO: stash for later cert broadcast
                 target,
             } => {
@@ -104,6 +104,7 @@ where
                     shard_group_id: self.local_shard,
                     receipt_root,
                     tx_count,
+                    tx_outcomes,
                     validator: self.validator_id,
                     signature: sig,
                 };

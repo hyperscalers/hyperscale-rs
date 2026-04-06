@@ -214,6 +214,14 @@ pub struct ExecutionVote {
     pub receipt_root: Hash,
     /// Number of transactions in this wave.
     pub tx_count: u32,
+    /// Per-tx execution outcomes in wave order.
+    ///
+    /// Carried alongside the vote so the wave leader can extract tx_outcomes
+    /// directly from quorum votes when building the EC. Not included in the
+    /// BLS-signed message (receipt_root already commits to the content).
+    /// This avoids relying on the wave leader's local accumulator, which may
+    /// have diverged due to different abort intent timing.
+    pub tx_outcomes: Vec<TxOutcome>,
     /// Validator who cast this vote.
     pub validator: ValidatorId,
     /// BLS signature over the vote signing message.

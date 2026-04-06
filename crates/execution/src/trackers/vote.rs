@@ -217,6 +217,7 @@ mod tests {
             shard_group_id: ShardGroupId(0),
             receipt_root,
             tx_count: 5,
+            tx_outcomes: vec![],
             validator: ValidatorId(validator),
             signature: zero_bls_signature(),
         }
