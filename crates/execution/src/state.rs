@@ -46,16 +46,6 @@ use crate::accumulator::ExecutionAccumulator;
 use crate::execution_cache::ExecutionCache;
 use crate::trackers::{CertificateTracker, VoteTracker};
 
-/// Number of blocks to retain early arrival votes/certificates before cleanup.
-/// If an early arrival hasn't been processed within this many blocks, it's
-/// likely stale and should be removed to prevent unbounded memory growth.
-const EARLY_ARRIVAL_RETENTION_BLOCKS: u64 = 500;
-
-/// Number of blocks to retain stale cross-shard tracking state before cleanup.
-/// Covers finalized certificates not yet included in a block, certificate trackers
-/// for stalled transactions, pending provisioning, and orphaned execution cache entries.
-const STALE_TRACKING_RETENTION_BLOCKS: u64 = 500;
-
 /// Maximum age for speculative execution results before they're considered stale.
 /// Results older than this are pruned on each block commit to prevent unbounded growth.
 const SPECULATIVE_MAX_AGE: Duration = Duration::from_secs(30);
@@ -1307,15 +1297,16 @@ impl ExecutionState {
             if age < 100 {
                 return true;
             }
-            // Check if any tx in a wave with this wave_id still has an active
-            // certificate tracker (waiting for remote proofs to form TC).
-            // If so, keep retrying the fetch.
-            let has_waiting_tracker = self.certificate_trackers.keys().any(|tx_hash| {
-                self.wave_assignments
-                    .get(tx_hash)
-                    .is_some_and(|(_, wid)| wid == wave_id)
-            });
-            has_waiting_tracker
+            // Check if any tx still needs the remote EC for this wave.
+            // A tx needs it if it has either:
+            // - An active certificate tracker (waiting for remote proofs to form TC)
+            // - A wave assignment to a wave matching this wave_id (EC was sent,
+            //   cannot abort — still retrying to get the remote EC)
+            let has_waiting_tx = self
+                .wave_assignments
+                .iter()
+                .any(|(_, (_, wid))| wid == wave_id);
+            has_waiting_tx
         });
 
         // Prune fulfilled set using local height when fulfilled (not remote
@@ -1418,16 +1409,11 @@ impl ExecutionState {
         // Must run every block, not just when there are new transactions.
         actions.extend(self.check_exec_cert_timeouts(topology));
 
-        // Prune old entries to prevent unbounded growth.
-        // Must run every block — not just when there are transactions — otherwise
-        // stale finalized certificates accumulate during empty-block periods and
-        // poison every proposal we make (receivers can't assemble the block).
-        self.prune_early_arrivals();
+        // Prune ephemeral state (speculative execution, orphaned provisions).
+        // Cross-shard resolution state (certificate trackers, finalized certs,
+        // pending provisioning, execution cache, early arrivals) is only cleaned
+        // up on terminal state — never by block-count timeout.
         self.prune_execution_state();
-        self.prune_finalized_certificates();
-        actions.extend(self.prune_certificate_trackers());
-        self.prune_pending_provisioning();
-        self.prune_execution_cache();
         self.prune_pending_speculative();
         self.cleanup_stale_speculative();
         self.prune_speculative_provisions();
@@ -1905,37 +1891,6 @@ impl ExecutionState {
         self.early_certificates.remove(tx_hash);
     }
 
-    /// Prune stale early arrival entries to prevent unbounded growth.
-    ///
-    /// Early arrivals (votes, certificates, and provisioning events that arrive
-    /// before the transaction is being tracked) are kept for a generous window
-    /// to allow for block reordering and sync delays. After
-    /// EARLY_ARRIVAL_RETENTION_BLOCKS, they are considered stale and removed.
-    fn prune_early_arrivals(&mut self) {
-        let cutoff = self
-            .committed_height
-            .saturating_sub(EARLY_ARRIVAL_RETENTION_BLOCKS);
-
-        let before_provisions = self.early_provisioning_complete.len();
-        self.early_provisioning_complete
-            .retain(|_, (_, arrival_height)| *arrival_height > cutoff);
-        let pruned_provisions = before_provisions - self.early_provisioning_complete.len();
-
-        let before_certs = self.early_certificates.len();
-        self.early_certificates
-            .retain(|_, (_, arrival_height)| *arrival_height > cutoff);
-        let pruned_certs = before_certs - self.early_certificates.len();
-
-        if pruned_provisions > 0 || pruned_certs > 0 {
-            tracing::debug!(
-                pruned_provisions,
-                pruned_certs,
-                cutoff_height = cutoff,
-                "Pruned stale early arrivals"
-            );
-        }
-    }
-
     /// Prune stale wave state (accumulators, vote trackers, early votes).
     ///
     /// Execution accumulators and vote trackers are keyed by (block_hash, wave_id).
@@ -1996,156 +1951,6 @@ impl ExecutionState {
                 pruned_vt,
                 pruned_ev,
                 "Pruned resolved wave state"
-            );
-        }
-    }
-
-    /// Prune stale finalized certificates that haven't been included in a block.
-    ///
-    /// If a certificate isn't picked up within STALE_TRACKING_RETENTION_BLOCKS,
-    /// something is wrong and it should be cleaned up to prevent unbounded growth.
-    fn prune_finalized_certificates(&mut self) {
-        let cutoff = self
-            .committed_height
-            .saturating_sub(STALE_TRACKING_RETENTION_BLOCKS);
-
-        let before = self.finalized_certificates.len();
-        self.finalized_certificates
-            .retain(|_, (_, height)| *height > cutoff);
-        let pruned = before - self.finalized_certificates.len();
-
-        if pruned > 0 {
-            tracing::warn!(
-                pruned,
-                cutoff_height = cutoff,
-                "Pruned stale finalized certificates not included in any block"
-            );
-        }
-    }
-
-    /// Prune stale certificate trackers for transactions that never completed.
-    ///
-    /// Cross-shard transactions that stall (provisions never arrive, network
-    /// partition) would otherwise leak trackers indefinitely.
-    fn prune_certificate_trackers(&mut self) -> Vec<Action> {
-        let cutoff = self
-            .committed_height
-            .saturating_sub(STALE_TRACKING_RETENTION_BLOCKS);
-
-        let before = self.certificate_trackers.len();
-        let mut pruned_tx_hashes = Vec::new();
-        self.certificate_trackers.retain(|tx_hash, (_, height)| {
-            if *height > cutoff {
-                true
-            } else {
-                pruned_tx_hashes.push(*tx_hash);
-                false
-            }
-        });
-        let pruned = before - self.certificate_trackers.len();
-
-        // Clean up associated state for pruned trackers.
-        // Only create synthetic abort TCs for txs whose local EC was never
-        // formed (vote tracker still exists). If the EC was formed and
-        // broadcast, the remote shard may form a TC from it — aborting
-        // locally would create split-brain.
-        let mut actions = Vec::new();
-        for tx_hash in &pruned_tx_hashes {
-            self.execution_cache.remove(tx_hash);
-
-            // Check if the local EC was formed for this tx's wave.
-            // waves_with_ec is set when the wave leader aggregates OR when
-            // a non-leader receives the canonical EC from the wave leader.
-            let ec_was_formed = self
-                .wave_assignments
-                .get(tx_hash)
-                .is_some_and(|wave_key| self.waves_with_ec.contains(wave_key));
-
-            if ec_was_formed {
-                // EC was broadcast — we can't unilaterally abort. The remote
-                // shard may still form a TC. Keep the wave assignment so the
-                // expected_exec_certs retry stays alive.
-                tracing::info!(
-                    tx_hash = %tx_hash,
-                    "Stale certificate tracker pruned but EC was sent — cannot abort, will keep retrying remote EC"
-                );
-            } else {
-                // EC was never formed — safe to abort locally.
-                self.wave_assignments.remove(tx_hash);
-
-                let tx_cert = hyperscale_types::TransactionCertificate {
-                    transaction_hash: *tx_hash,
-                    decision: hyperscale_types::TransactionDecision::Aborted,
-                    shard_proofs: std::collections::BTreeMap::new(),
-                };
-                self.finalized_certificates.insert(
-                    *tx_hash,
-                    (std::sync::Arc::new(tx_cert), self.committed_height),
-                );
-
-                actions.push(Action::Continuation(ProtocolEvent::TransactionExecuted {
-                    tx_hash: *tx_hash,
-                    accepted: false,
-                }));
-            }
-        }
-
-        if pruned > 0 {
-            tracing::warn!(
-                pruned,
-                cutoff_height = cutoff,
-                "Pruned stale certificate trackers — marking as failed"
-            );
-        }
-
-        actions
-    }
-
-    /// Prune stale pending provisioning entries for transactions whose
-    /// provisions never arrived within the retention window.
-    fn prune_pending_provisioning(&mut self) {
-        let cutoff = self
-            .committed_height
-            .saturating_sub(STALE_TRACKING_RETENTION_BLOCKS);
-
-        let before = self.pending_provisioning.len();
-        let mut pruned_tx_hashes = Vec::new();
-        self.pending_provisioning.retain(|tx_hash, (_, height)| {
-            if *height > cutoff {
-                true
-            } else {
-                pruned_tx_hashes.push(*tx_hash);
-                false
-            }
-        });
-        let pruned = before - self.pending_provisioning.len();
-
-        // Also clean up associated execution cache entries
-        for tx_hash in &pruned_tx_hashes {
-            self.execution_cache.remove(tx_hash);
-        }
-
-        if pruned > 0 {
-            tracing::warn!(
-                pruned,
-                cutoff_height = cutoff,
-                "Pruned stale pending provisioning entries"
-            );
-        }
-    }
-
-    /// Prune stale execution cache entries not associated with any active tracking.
-    fn prune_execution_cache(&mut self) {
-        let cutoff = self
-            .committed_height
-            .saturating_sub(STALE_TRACKING_RETENTION_BLOCKS);
-
-        let pruned = self.execution_cache.prune_by_height(cutoff);
-        if pruned > 0 {
-            tracing::warn!(
-                pruned,
-                cutoff_height = cutoff,
-                "Pruned stale execution cache entries"
             );
         }
     }
