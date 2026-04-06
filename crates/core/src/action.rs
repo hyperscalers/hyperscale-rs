@@ -145,18 +145,17 @@ pub enum Action {
     /// Emitted by the state machine when a wave completes (all txs executed).
     /// The io_loop signs the vote (it owns the signing key) and sends it to
     /// the wave leader only (N→1 instead of N→N).
-    SignAndBroadcastExecutionVote {
+    SignAndSendExecutionVote {
         block_hash: Hash,
         block_height: u64,
         /// Consensus height at which this vote is being cast.
         vote_height: u64,
         wave_id: WaveId,
         receipt_root: Hash,
-        tx_count: u32,
-        /// Per-tx outcomes (needed later for cert aggregation).
+        /// Per-tx outcomes in wave order. Carried on the vote so the wave leader
+        /// can extract them directly when building the EC (avoids relying on the
+        /// leader's local accumulator which may have diverged).
         tx_outcomes: Vec<TxOutcome>,
-        /// All participating shards (for cert broadcast recipients).
-        participating_shards: Vec<ShardGroupId>,
         /// The wave leader for this wave — sole recipient of the vote.
         target: ValidatorId,
     },
@@ -312,16 +311,13 @@ pub enum Action {
     AggregateExecutionCertificate {
         /// Wave identifier.
         wave_id: WaveId,
-        /// Block hash for correlation.
-        block_hash: Hash,
         /// Shard group that executed.
         shard: ShardGroupId,
         /// Receipt root (merkle root over per-tx outcome leaves).
         receipt_root: Hash,
-        /// Votes to aggregate (with quorum).
+        /// Votes to aggregate (with quorum). The first vote's `tx_outcomes`
+        /// is used for the EC payload (all quorum votes have identical outcomes).
         votes: Vec<ExecutionVote>,
-        /// Per-tx outcomes in wave order (for the certificate payload).
-        tx_outcomes: Vec<TxOutcome>,
         /// Ordered committee for the shard (for SignerBitfield index mapping).
         committee: Vec<ValidatorId>,
     },
@@ -906,7 +902,7 @@ impl Action {
             Action::BroadcastBlockHeader { .. }
                 | Action::BroadcastBlockVote { .. }
                 | Action::BroadcastTransaction { .. }
-                | Action::SignAndBroadcastExecutionVote { .. }
+                | Action::SignAndSendExecutionVote { .. }
                 | Action::BroadcastExecutionCertificate { .. }
                 | Action::BroadcastCommittedBlockHeader { .. }
                 | Action::PersistBlock { .. }
@@ -963,7 +959,7 @@ impl Action {
             Action::BroadcastTransaction { .. } => "BroadcastTransaction",
 
             // Network - Execution Layer (batchable)
-            Action::SignAndBroadcastExecutionVote { .. } => "SignAndBroadcastExecutionVote",
+            Action::SignAndSendExecutionVote { .. } => "SignAndSendExecutionVote",
             Action::BroadcastExecutionCertificate { .. } => "BroadcastExecutionCertificate",
             Action::PersistExecutionCertificate { .. } => "PersistExecutionCertificate",
             Action::BroadcastCommittedBlockHeader { .. } => "BroadcastCommittedBlockHeader",

@@ -76,8 +76,6 @@ pub struct CompletionData {
     pub receipt_root: Hash,
     /// Per-tx outcomes in wave order.
     pub tx_outcomes: Vec<hyperscale_types::TxOutcome>,
-    /// All participating shards (union across all txs in wave).
-    pub participating_shards: Vec<ShardGroupId>,
 }
 
 /// A cross-shard transaction registration for provision tracking.
@@ -674,7 +672,6 @@ impl ExecutionState {
                 wave_id: accumulator.wave_id().clone(),
                 receipt_root,
                 tx_outcomes,
-                participating_shards: accumulator.all_participating_shards(),
             });
         }
 
@@ -761,7 +758,7 @@ impl ExecutionState {
         actions
     }
 
-    /// Scan complete waves and emit `SignAndBroadcastExecutionVote` actions.
+    /// Scan complete waves and emit `SignAndSendExecutionVote` actions.
     ///
     /// This is the SINGLE path to execution voting. Call after abort intents
     /// have been processed so accumulator state is deterministic at this height.
@@ -776,15 +773,13 @@ impl ExecutionState {
                     &completion.wave_id,
                     local_committee,
                 );
-                Action::SignAndBroadcastExecutionVote {
+                Action::SignAndSendExecutionVote {
                     block_hash: completion.block_hash,
                     block_height: completion.block_height,
                     vote_height,
                     wave_id: completion.wave_id,
                     receipt_root: completion.receipt_root,
-                    tx_count: completion.tx_outcomes.len() as u32,
                     tx_outcomes: completion.tx_outcomes,
-                    participating_shards: completion.participating_shards,
                     target,
                 }
             })
@@ -984,28 +979,6 @@ impl ExecutionState {
         let votes = tracker.take_votes(&receipt_root, vote_height);
         let committee = topology.local_committee().to_vec();
 
-        // Extract tx_outcomes from any quorum vote — all votes with matching
-        // receipt_root have identical outcomes. This avoids relying on the wave
-        // leader's local accumulator, which may have diverged due to different
-        // abort intent timing at a different vote_height.
-        let tx_outcomes = match votes.first() {
-            Some(vote) => {
-                debug_assert!(
-                    vote.receipt_root == receipt_root,
-                    "quorum vote receipt_root mismatch"
-                );
-                vote.tx_outcomes.clone()
-            }
-            None => {
-                tracing::error!(
-                    block_hash = ?key.0,
-                    wave = %key.1,
-                    "No votes available after take_votes — skipping EC aggregation"
-                );
-                return vec![];
-            }
-        };
-
         // Remove the vote tracker — this EC is the shard's final answer.
         // Mark wave as having an EC to stop re-voting in scan_complete_waves.
         self.vote_trackers.remove(&key);
@@ -1015,16 +988,16 @@ impl ExecutionState {
             block_hash = ?key.0,
             wave = %key.1,
             votes = votes.len(),
-            "Execution vote quorum reached — delegating BLS aggregation"
+            "Delegating BLS aggregation to crypto pool"
         );
 
+        // tx_outcomes are extracted from votes by the aggregation handler
+        // (all quorum votes carry identical outcomes).
         vec![Action::AggregateExecutionCertificate {
             wave_id: key.1,
-            block_hash: key.0,
             shard: topology.local_shard(),
             receipt_root,
             votes,
-            tx_outcomes,
             committee,
         }]
     }
@@ -2081,11 +2054,12 @@ impl ExecutionState {
             self.execution_cache.remove(tx_hash);
 
             // Check if the local EC was formed for this tx's wave.
-            // Vote tracker removed = EC was formed and broadcast.
+            // waves_with_ec is set when the wave leader aggregates OR when
+            // a non-leader receives the canonical EC from the wave leader.
             let ec_was_formed = self
                 .wave_assignments
                 .get(tx_hash)
-                .is_some_and(|wave_key| !self.vote_trackers.contains_key(wave_key));
+                .is_some_and(|wave_key| self.waves_with_ec.contains(wave_key));
 
             if ec_was_formed {
                 // EC was broadcast — we can't unilaterally abort. The remote
@@ -2566,7 +2540,7 @@ impl ExecutionState {
     /// tracking wasn't set up yet, so the result was dropped. This re-extracts
     /// the result from the execution cache now that wave tracking is ready.
     ///
-    /// Returns a `SignAndBroadcastExecutionVote` action if the cache had data
+    /// Returns a `SignAndSendExecutionVote` action if the cache had data
     /// and the wave was completed, or empty if execution hasn't finished yet
     /// (the later `ExecutionBatchCompleted` will record normally).
     fn try_record_speculative_wave_result(&mut self, tx_hash: Hash) -> Vec<Action> {

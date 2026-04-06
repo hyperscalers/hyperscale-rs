@@ -156,15 +156,20 @@ pub fn extract_write_nodes(updates: &hyperscale_storage::DatabaseUpdates) -> Vec
 ///
 /// Deduplicates votes by validator, aggregates BLS signatures, and builds a
 /// signer bitfield using the committee's indices.
-#[allow(clippy::too_many_arguments)]
+///
+/// `tx_outcomes` are extracted from the first vote — all quorum votes carry
+/// identical outcomes (they share the same receipt_root).
 pub fn aggregate_execution_certificate(
     wave_id: &WaveId,
     shard: ShardGroupId,
     receipt_root: Hash,
     votes: &[ExecutionVote],
-    tx_outcomes: Vec<TxOutcome>,
     committee: &[ValidatorId],
 ) -> ExecutionCertificate {
+    let tx_outcomes = votes
+        .first()
+        .map(|v| v.tx_outcomes.clone())
+        .unwrap_or_default();
     // Deduplicate votes by validator
     let mut seen_validators = HashSet::new();
     let unique_votes: Vec<_> = votes

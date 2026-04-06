@@ -334,20 +334,18 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
         // --- Execution Vote Aggregation and Verification ---
         Action::AggregateExecutionCertificate {
             wave_id,
-            block_hash: _,
             shard,
             receipt_root,
             votes,
-            tx_outcomes,
             committee,
         } => {
-            // Aggregate BLS signatures from execution votes into a execution certificate.
+            // Aggregate BLS signatures from execution votes into an execution certificate.
+            // tx_outcomes extracted from votes by the handler (all quorum votes carry identical outcomes).
             let certificate = hyperscale_execution::handlers::aggregate_execution_certificate(
                 &wave_id,
                 shard,
                 receipt_root,
                 &votes,
-                tx_outcomes,
                 &committee,
             );
             Some(DelegatedResult {
