@@ -223,6 +223,11 @@ pub struct ExecutionState {
     /// Tracks (shard_id, proof) pairs with first_arrival_height for cleanup of stale entries.
     early_certificates: HashMap<Hash, (Vec<(ShardGroupId, ShardExecutionProof)>, u64)>,
 
+    /// Transactions whose certificate tracker completed but local execution hasn't
+    /// finished yet. TC creation is deferred until `on_execution_batch_completed`
+    /// populates `pending_execution_updates` for these tx hashes.
+    deferred_tc_creations: HashSet<Hash>,
+
     // ═══════════════════════════════════════════════════════════════════════
     // Speculative Execution State
     // ═══════════════════════════════════════════════════════════════════════
@@ -387,6 +392,7 @@ impl ExecutionState {
             early_execution_results: HashMap::new(),
             early_provisioning_complete: HashMap::new(),
             early_certificates: HashMap::new(),
+            deferred_tc_creations: HashSet::new(),
             speculative_results: HashMap::new(),
             speculative_in_flight_txs: HashSet::new(),
             speculative_reads_index: HashMap::new(),
@@ -776,6 +782,56 @@ impl ExecutionState {
                 results_count = 0,
                 "ExecutionBatchCompleted produced ZERO receipt bundles"
             );
+        }
+
+        // Drain deferred TC creations now that execution updates are available.
+        // A deferred TC means the certificate tracker completed (all shard proofs
+        // collected) before local execution finished. Now we have the updates.
+        let deferred: Vec<Hash> = self
+            .deferred_tc_creations
+            .iter()
+            .filter(|h| self.pending_execution_updates.contains_key(h))
+            .copied()
+            .collect();
+        for tx_hash in deferred {
+            self.deferred_tc_creations.remove(&tx_hash);
+            let Some((tracker, _)) = self.certificate_trackers.get_mut(&tx_hash) else {
+                continue;
+            };
+            let Some(tx_cert) = tracker.create_tx_certificate() else {
+                continue;
+            };
+            let accepted = tx_cert.decision == TransactionDecision::Accept;
+            tracing::debug!(
+                tx_hash = %tx_hash,
+                accepted,
+                "Deferred TC creation — execution updates now available"
+            );
+
+            actions.push(Action::PersistTransactionCertificate {
+                certificate: tx_cert.clone(),
+            });
+
+            let database_updates = self
+                .pending_execution_updates
+                .remove(&tx_hash)
+                .expect("just checked contains_key");
+
+            self.finalized_certificates.insert(
+                tx_hash,
+                FinalizedCertEntry {
+                    certificate: Arc::new(tx_cert),
+                    database_updates,
+                    committed_height: self.committed_height,
+                },
+            );
+
+            self.certificate_trackers.remove(&tx_hash);
+
+            actions.push(Action::Continuation(ProtocolEvent::TransactionExecuted {
+                tx_hash,
+                accepted,
+            }));
         }
 
         // Record outcomes into execution accumulators silently.
@@ -1817,17 +1873,16 @@ impl ExecutionState {
 
                 // Co-locate DatabaseUpdates with the certificate. The updates were
                 // stored in pending_execution_updates when execution completed.
-                // Missing updates means the state root will diverge — this is fatal.
-                let database_updates = self
-                    .pending_execution_updates
-                    .remove(&tx_hash)
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "BUG: No pending execution updates for tx {} at TC creation — \
-                             execution must complete before a TC can be formed",
-                            tx_hash
-                        )
-                    });
+                // If local execution hasn't finished yet (we formed the TC from
+                // other validators' ECs), defer TC creation until execution completes.
+                let Some(database_updates) = self.pending_execution_updates.remove(&tx_hash) else {
+                    tracing::debug!(
+                        tx_hash = %tx_hash,
+                        "Certificate tracker complete but local execution not finished — deferring TC creation"
+                    );
+                    self.deferred_tc_creations.insert(tx_hash);
+                    return actions;
+                };
 
                 self.finalized_certificates.insert(
                     tx_hash,
