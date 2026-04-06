@@ -140,11 +140,11 @@ pub enum Action {
     // ═══════════════════════════════════════════════════════════════════════
     // Network: Execution Layer (domain-specific, batchable by runner)
     // ═══════════════════════════════════════════════════════════════════════
-    /// Sign and broadcast an execution vote to the local shard.
+    /// Sign and send an execution vote to the wave leader.
     ///
     /// Emitted by the state machine when a wave completes (all txs executed).
-    /// The io_loop signs the vote (it owns the signing key) and broadcasts.
-    /// Execution votes are sent immediately — no batch accumulator needed.
+    /// The io_loop signs the vote (it owns the signing key) and sends it to
+    /// the wave leader only (N→1 instead of N→N).
     SignAndBroadcastExecutionVote {
         block_hash: Hash,
         block_height: u64,
@@ -157,14 +157,8 @@ pub enum Action {
         tx_outcomes: Vec<TxOutcome>,
         /// All participating shards (for cert broadcast recipients).
         participating_shards: Vec<ShardGroupId>,
-    },
-
-    /// Broadcast an already-signed execution vote to the local shard.
-    ///
-    /// Used when re-broadcasting a received execution vote.
-    BroadcastExecutionVote {
-        shard: ShardGroupId,
-        vote: ExecutionVote,
+        /// The wave leader for this wave — sole recipient of the vote.
+        target: ValidatorId,
     },
 
     /// Broadcast an execution certificate to remote participating shards.
@@ -180,8 +174,8 @@ pub enum Action {
 
     /// Persist an aggregated execution certificate for durable serving.
     ///
-    /// Emitted by all validators after cert aggregation (not just the designated
-    /// broadcaster). The io_loop stores these in the in-memory cache for
+    /// Emitted by all validators after cert aggregation (not just the wave
+    /// leader). The io_loop stores these in the in-memory cache for
     /// low-latency serving and accumulates them in `pending_ec_writes` for
     /// atomic persistence in the next block commit's WriteBatch.
     PersistExecutionCertificate {
@@ -852,7 +846,7 @@ pub enum Action {
     /// Request missing execution certificates from a source shard.
     ///
     /// Emitted when expected execution certs haven't arrived within the timeout.
-    /// The designated broadcaster may be byzantine or slow, so we request from
+    /// The wave leader may be byzantine or slow, so we request from
     /// any peer in the source shard.
     RequestMissingExecutionCerts {
         /// The shard that should have sent the execution certs.
@@ -913,7 +907,6 @@ impl Action {
                 | Action::BroadcastBlockVote { .. }
                 | Action::BroadcastTransaction { .. }
                 | Action::SignAndBroadcastExecutionVote { .. }
-                | Action::BroadcastExecutionVote { .. }
                 | Action::BroadcastExecutionCertificate { .. }
                 | Action::BroadcastCommittedBlockHeader { .. }
                 | Action::PersistBlock { .. }
@@ -971,7 +964,6 @@ impl Action {
 
             // Network - Execution Layer (batchable)
             Action::SignAndBroadcastExecutionVote { .. } => "SignAndBroadcastExecutionVote",
-            Action::BroadcastExecutionVote { .. } => "BroadcastExecutionVote",
             Action::BroadcastExecutionCertificate { .. } => "BroadcastExecutionCertificate",
             Action::PersistExecutionCertificate { .. } => "PersistExecutionCertificate",
             Action::BroadcastCommittedBlockHeader { .. } => "BroadcastCommittedBlockHeader",

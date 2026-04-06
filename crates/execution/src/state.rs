@@ -175,15 +175,20 @@ pub struct ExecutionState {
     accumulators: HashMap<(Hash, WaveId), ExecutionAccumulator>,
 
     /// Execution vote trackers: collect execution votes from other validators.
-    /// Keyed by (block_hash, wave_id).
+    /// Keyed by (block_hash, wave_id). Only created on the wave leader.
     vote_trackers: HashMap<(Hash, WaveId), VoteTracker>,
+
+    /// Waves that have a canonical EC (aggregated by leader, or received from leader).
+    /// Used to stop re-voting in `scan_complete_waves`. Replaces the old check of
+    /// "VoteTracker absent" now that only wave leaders create VoteTrackers.
+    waves_with_ec: HashSet<(Hash, WaveId)>,
 
     /// Tx → wave assignment lookup for the current block.
     /// Maps tx_hash → (block_hash, wave_id).
     wave_assignments: HashMap<Hash, (Hash, WaveId)>,
 
     /// Early execution votes that arrived before tracking started.
-    /// Keyed by (block_hash, wave_id).
+    /// Keyed by (block_hash, wave_id). Only buffered for the wave leader.
     early_votes: HashMap<(Hash, WaveId), Vec<ExecutionVote>>,
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -368,6 +373,7 @@ impl ExecutionState {
             pending_provisioning: HashMap::new(),
             accumulators: HashMap::new(),
             vote_trackers: HashMap::new(),
+            waves_with_ec: HashSet::new(),
             wave_assignments: HashMap::new(),
             early_votes: HashMap::new(),
             certificate_trackers: HashMap::new(),
@@ -502,6 +508,9 @@ impl ExecutionState {
         let quorum = topology.local_quorum_threshold();
         let mut votes_to_replay = Vec::new();
 
+        let local_vid = topology.local_validator_id();
+        let local_committee = topology.local_committee();
+
         for (wave_id, txs) in waves {
             let key = (block_hash, wave_id.clone());
 
@@ -516,19 +525,27 @@ impl ExecutionState {
                 ExecutionAccumulator::new(wave_id.clone(), block_hash, block_height, txs);
             self.accumulators.insert(key.clone(), accumulator);
 
-            // Create vote tracker
-            let tracker = VoteTracker::new(wave_id, block_hash, quorum);
-            self.vote_trackers.insert(key.clone(), tracker);
+            // Only the wave leader creates a VoteTracker and aggregates votes.
+            // Non-leaders receive the canonical EC from the wave leader via
+            // on_wave_certificate → on_certificate_verified.
+            let leader = hyperscale_types::wave_leader(&block_hash, &wave_id, local_committee);
+            if local_vid == leader {
+                let tracker = VoteTracker::new(wave_id, block_hash, quorum);
+                self.vote_trackers.insert(key.clone(), tracker);
 
-            // Collect early execution votes for caller to replay through on_execution_vote()
-            if let Some(early_votes) = self.early_votes.remove(&key) {
-                tracing::debug!(
-                    block_hash = ?block_hash,
-                    wave = %key.1,
-                    count = early_votes.len(),
-                    "Replaying early execution votes"
-                );
-                votes_to_replay.extend(early_votes);
+                // Collect early execution votes for caller to replay through on_execution_vote()
+                if let Some(early_votes) = self.early_votes.remove(&key) {
+                    tracing::debug!(
+                        block_hash = ?block_hash,
+                        wave = %key.1,
+                        count = early_votes.len(),
+                        "Replaying early execution votes"
+                    );
+                    votes_to_replay.extend(early_votes);
+                }
+            } else {
+                // Non-leader: discard any buffered votes (we won't aggregate them)
+                self.early_votes.remove(&key);
             }
         }
 
@@ -637,8 +654,9 @@ impl ExecutionState {
         let mut completions = Vec::new();
 
         for (key, accumulator) in &self.accumulators {
-            // Skip waves that already formed an EC (vote tracker removed)
-            if !self.vote_trackers.contains_key(key) {
+            // Skip waves that already have a canonical EC (aggregated by
+            // wave leader, or received from wave leader).
+            if self.waves_with_ec.contains(key) {
                 continue;
             }
 
@@ -747,18 +765,28 @@ impl ExecutionState {
     ///
     /// This is the SINGLE path to execution voting. Call after abort intents
     /// have been processed so accumulator state is deterministic at this height.
-    pub fn emit_vote_actions(&self, vote_height: u64) -> Vec<Action> {
+    /// Each vote is targeted to the wave leader (N→1 routing).
+    pub fn emit_vote_actions(&self, topology: &TopologySnapshot, vote_height: u64) -> Vec<Action> {
+        let local_committee = topology.local_committee();
         self.scan_complete_waves()
             .into_iter()
-            .map(|completion| Action::SignAndBroadcastExecutionVote {
-                block_hash: completion.block_hash,
-                block_height: completion.block_height,
-                vote_height,
-                wave_id: completion.wave_id,
-                receipt_root: completion.receipt_root,
-                tx_count: completion.tx_outcomes.len() as u32,
-                tx_outcomes: completion.tx_outcomes,
-                participating_shards: completion.participating_shards,
+            .map(|completion| {
+                let target = hyperscale_types::wave_leader(
+                    &completion.block_hash,
+                    &completion.wave_id,
+                    local_committee,
+                );
+                Action::SignAndBroadcastExecutionVote {
+                    block_hash: completion.block_hash,
+                    block_height: completion.block_height,
+                    vote_height,
+                    wave_id: completion.wave_id,
+                    receipt_root: completion.receipt_root,
+                    tx_count: completion.tx_outcomes.len() as u32,
+                    tx_outcomes: completion.tx_outcomes,
+                    participating_shards: completion.participating_shards,
+                    target,
+                }
             })
             .collect()
     }
@@ -810,7 +838,7 @@ impl ExecutionState {
 
     /// Handle an execution vote received from another validator (or self).
     ///
-    /// Routes to the appropriate `VoteTracker` for deferred verification.
+    /// Only the wave leader aggregates votes. Non-leaders discard them.
     pub fn on_execution_vote(
         &mut self,
         topology: &TopologySnapshot,
@@ -819,9 +847,15 @@ impl ExecutionState {
         let key = (vote.block_hash, vote.wave_id.clone());
         let validator_id = vote.validator;
 
-        // Check if we're tracking this wave
+        // Check if we're tracking this wave (only wave leaders have VoteTrackers)
         if !self.vote_trackers.contains_key(&key) {
-            // Buffer for later
+            // If we have an accumulator for this wave but no VoteTracker,
+            // we're a non-leader — discard the vote.
+            if self.accumulators.contains_key(&key) {
+                return vec![];
+            }
+            // No accumulator yet — block hasn't committed. Buffer for the
+            // wave leader case (will be discarded in setup if non-leader).
             self.early_votes.entry(key).or_default().push(vote);
             return vec![];
         }
@@ -978,7 +1012,9 @@ impl ExecutionState {
         };
 
         // Remove the vote tracker — this EC is the shard's final answer.
+        // Mark wave as having an EC to stop re-voting in scan_complete_waves.
         self.vote_trackers.remove(&key);
+        self.waves_with_ec.insert(key.clone());
 
         tracing::debug!(
             block_hash = ?key.0,
@@ -1021,20 +1057,31 @@ impl ExecutionState {
         let certificate = Arc::new(certificate);
 
         // Cache the cert in io_loop for fallback serving — any node can serve
-        // requests from remote shards if the designated broadcaster fails.
+        // requests from remote shards if the wave leader fails.
         actions.push(Action::PersistExecutionCertificate {
             certificate: Arc::clone(&certificate),
         });
 
-        // Only the designated broadcaster sends execution certs to remote shards.
-        // This reduces N×N cert messages to 1×N per wave per shard-pair.
-        // All validators still aggregate locally (needed for CertificateTracker).
-        let local_committee = topology.local_committee();
-        let designated =
-            hyperscale_types::designated_broadcaster(&block_hash, &wave_id, local_committee);
-        let is_designated = local_vid == designated;
+        // The wave leader broadcasts the EC to:
+        // 1. Local peers — so they receive the canonical EC (same path as remote ECs)
+        // 2. Remote shard validators — for cross-shard finalization
+        {
+            // Broadcast to local peers (all local committee minus self)
+            let local_peers: Vec<ValidatorId> = topology
+                .local_committee()
+                .iter()
+                .copied()
+                .filter(|&v| v != local_vid)
+                .collect();
+            if !local_peers.is_empty() {
+                actions.push(Action::BroadcastExecutionCertificate {
+                    shard: topology.local_shard(),
+                    certificate: Arc::clone(&certificate),
+                    recipients: local_peers,
+                });
+            }
 
-        if is_designated {
+            // Broadcast to remote shard validators
             for target_shard in &remote_shards {
                 let recipients: Vec<ValidatorId> = topology
                     .committee_for_shard(*target_shard)
@@ -1055,10 +1102,7 @@ impl ExecutionState {
             wave = %wave_id,
             tx_count = certificate.tx_outcomes.len(),
             remote_shards = remote_shards.len(),
-            is_designated,
-            ?designated,
-            "Wave cert aggregated — feeding per-tx finalization{}",
-            if is_designated { ", broadcasting to remote shards" } else { "" }
+            "Wave leader broadcasting EC to local peers + remote shards"
         );
 
         // Feed each tx's outcome to per-tx CertificateTracker for finalization.
@@ -1078,7 +1122,11 @@ impl ExecutionState {
         actions
     }
 
-    /// Handle an execution certificate received from a remote shard.
+    /// Handle an execution certificate received from another validator.
+    ///
+    /// This handles ECs from both:
+    /// - The wave leader (local shard EC broadcast to local peers)
+    /// - Remote shards (cross-shard EC for finalization)
     ///
     /// A execution cert covers many txs. Each tx is handled independently:
     /// - If tracker exists → needs verification, then feed proof
@@ -1169,6 +1217,17 @@ impl ExecutionState {
         let current_height = self.committed_height;
         let ec_hash = certificate.canonical_hash();
         let mut actions = Vec::new();
+
+        // If this is a local shard EC from the wave leader, mark the wave as
+        // having an EC so non-leaders stop re-voting in scan_complete_waves,
+        // and persist it for fallback serving to remote shards.
+        if shard == topology.local_shard() {
+            let wave_key = (certificate.block_hash, certificate.wave_id.clone());
+            self.waves_with_ec.insert(wave_key);
+            actions.push(Action::PersistExecutionCertificate {
+                certificate: Arc::new(certificate.clone()),
+            });
+        }
 
         // Extract per-tx outcomes — feed to tracker if exists, buffer otherwise
         for outcome in &certificate.tx_outcomes {
@@ -1934,11 +1993,13 @@ impl ExecutionState {
         self.accumulators.retain(|key, _| active_keys.contains(key));
         let pruned_acc = before_acc - self.accumulators.len();
 
-        // Prune vote trackers — same keys as accumulators
+        // Prune vote trackers and waves_with_ec — same keys as accumulators
         let before_vt = self.vote_trackers.len();
         self.vote_trackers
             .retain(|key, _| self.accumulators.contains_key(key));
         let pruned_vt = before_vt - self.vote_trackers.len();
+        self.waves_with_ec
+            .retain(|key| self.accumulators.contains_key(key));
 
         // Prune early execution votes that have been consumed (accumulator exists
         // and would have replayed them) or that are stale (50+ blocks old).

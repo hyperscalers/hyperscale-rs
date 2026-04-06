@@ -6,7 +6,7 @@ use sbor::prelude::BasicSbor;
 
 /// Request to fetch missing execution certificates from a source shard.
 ///
-/// Sent by target shards when a remote block's designated broadcaster fails
+/// Sent by target shards when a remote block's wave leader fails
 /// to deliver execution certs within the timeout window. Any node in the
 /// source shard that has aggregated the cert can serve this request.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
