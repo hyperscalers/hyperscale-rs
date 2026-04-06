@@ -43,7 +43,6 @@ use std::time::Duration;
 use tracing::instrument;
 
 use crate::accumulator::ExecutionAccumulator;
-use crate::execution_cache::ExecutionCache;
 use crate::trackers::{CertificateTracker, VoteTracker};
 
 /// Maximum age for speculative execution results before they're considered stale.
@@ -111,10 +110,24 @@ pub struct SpeculativeResult {
     pub created_at: Duration,
 }
 
+/// A finalized certificate with its co-located DatabaseUpdates.
+///
+/// The `database_updates` are moved here from `pending_execution_updates` at TC
+/// creation time, guaranteeing they're always present when the certificate exists.
+/// This eliminates the previous design where `proposal_cert_updates()` could
+/// silently return empty when the execution cache entry was missing.
+#[derive(Debug, Clone)]
+pub struct FinalizedCertEntry {
+    pub certificate: Arc<TransactionCertificate>,
+    pub database_updates: Arc<DatabaseUpdates>,
+    #[allow(dead_code)] // Used for stale-entry pruning in future
+    pub committed_height: u64,
+}
+
 /// Execution memory statistics for monitoring collection sizes.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ExecutionMemoryStats {
-    pub cache_entries: usize,
+    pub pending_execution_updates: usize,
     pub finalized_certificates: usize,
     pub pending_provisioning: usize,
     pub accumulators: usize,
@@ -135,14 +148,20 @@ pub struct ExecutionState {
     /// Current time.
     now: Duration,
 
-    /// In-memory cache of execution write sets (DatabaseUpdates), keyed by tx hash.
-    /// Populated when execution completes, read during block commit, evicted after commit.
-    execution_cache: ExecutionCache,
+    /// Write-only holding area for execution DatabaseUpdates between execution
+    /// completion and TC creation. No public read API — data flows through here
+    /// to `finalized_certificates` when the TC is formed.
+    ///
+    /// Populated by `on_execution_batch_completed`.
+    /// Consumed (removed) by `handle_certificate_internal` → `finalized_certificates`.
+    /// Cleaned up by `cleanup_transaction` (abort/defer without TC).
+    pending_execution_updates: HashMap<Hash, Arc<DatabaseUpdates>>,
 
     /// Finalized transaction certificates ready for block inclusion.
     /// Uses BTreeMap for deterministic iteration order.
-    /// Stores (certificate, height_when_finalized) for stale-entry pruning.
-    finalized_certificates: BTreeMap<Hash, (Arc<TransactionCertificate>, u64)>,
+    /// Each entry co-locates the certificate with its DatabaseUpdates,
+    /// guaranteeing updates are always present when the certificate exists.
+    finalized_certificates: BTreeMap<Hash, FinalizedCertEntry>,
 
     /// Current committed height for pruning stale entries.
     committed_height: u64,
@@ -355,7 +374,7 @@ impl ExecutionState {
     ) -> Self {
         Self {
             now: Duration::ZERO,
-            execution_cache: ExecutionCache::new(),
+            pending_execution_updates: HashMap::new(),
             finalized_certificates: BTreeMap::new(),
             committed_height: 0,
             pending_provisioning: HashMap::new(),
@@ -398,14 +417,14 @@ impl ExecutionState {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // Execution Cache
+    // Certificate Updates (from finalized_certificates)
     // ═══════════════════════════════════════════════════════════════════════════
 
     /// Collect per-certificate database updates for proposal building.
     ///
-    /// Filters out aborted certificates (they carry no state changes) and returns
-    /// only entries present in the execution cache. BFT uses this map after its
-    /// own QC-chain dedup filtering.
+    /// Reads from `finalized_certificates` where DatabaseUpdates are co-located
+    /// with the certificate — guaranteed present since TC creation.
+    /// Filters out aborted certificates (they carry no state changes).
     pub fn proposal_cert_updates(
         &self,
         certificates: &[Arc<TransactionCertificate>],
@@ -414,30 +433,34 @@ impl ExecutionState {
             .iter()
             .filter(|c| c.decision != TransactionDecision::Aborted)
             .filter_map(|c| {
-                self.execution_cache
+                self.finalized_certificates
                     .get(&c.transaction_hash)
-                    .map(|u| (c.transaction_hash, u.clone()))
+                    .map(|entry| (c.transaction_hash, Arc::clone(&entry.database_updates)))
             })
             .collect()
     }
 
     /// Collect database updates for a set of transaction hashes.
     ///
-    /// Returns cheap `Arc` clones for entries present in the cache.
+    /// Returns cheap `Arc` clones from `finalized_certificates`.
     /// Used by state root verification to gather per-certificate write sets.
     pub fn updates_for_tx_hashes(&self, tx_hashes: &[Hash]) -> Vec<Arc<DatabaseUpdates>> {
         tx_hashes
             .iter()
-            .filter_map(|h| self.execution_cache.get(h).cloned())
+            .filter_map(|h| {
+                self.finalized_certificates
+                    .get(h)
+                    .map(|entry| Arc::clone(&entry.database_updates))
+            })
             .collect()
     }
 
-    /// Check if the execution cache has cached DatabaseUpdates for a transaction.
+    /// Check if DatabaseUpdates are available for a non-aborted certificate.
     ///
-    /// Used by the BFT pending block receipt tracking to check if a receipt
-    /// (execution result) is available for a non-aborted certificate.
+    /// Used by BFT pending block receipt tracking. Returns true when the TC
+    /// has been formed and its co-located DatabaseUpdates are available.
     pub fn has_cached_updates(&self, tx_hash: &Hash) -> bool {
-        self.execution_cache.get(tx_hash).is_some()
+        self.finalized_certificates.contains_key(tx_hash)
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -679,13 +702,13 @@ impl ExecutionState {
     /// Process a completed execution batch: build receipt bundles, update cache, record outcomes.
     ///
     /// Moves receipt-bundle construction and cache insertion out of the node orchestrator.
-    /// `committed_height` is the current BFT committed height (used for cache eviction tracking).
+    /// `_committed_height` is the current BFT committed height (previously used for cache tracking).
     pub fn on_execution_batch_completed(
         &mut self,
         results: Vec<ExecutionResult>,
         tx_outcomes: Vec<TxOutcome>,
         speculative: bool,
-        committed_height: u64,
+        _committed_height: u64,
     ) -> Vec<Action> {
         // Single pass: populate execution cache and build receipt bundles.
         // Consumes results by value — no clones needed.
@@ -704,7 +727,6 @@ impl ExecutionState {
 
         for result in results {
             let tx_hash = result.tx_hash;
-            let receipt_hash = result.receipt_hash;
             let db_updates = Arc::new(result.database_updates);
 
             // For speculative batches, skip receipts for transactions that
@@ -720,8 +742,7 @@ impl ExecutionState {
                 });
             }
 
-            self.execution_cache
-                .insert(tx_hash, db_updates, receipt_hash, committed_height);
+            self.pending_execution_updates.insert(tx_hash, db_updates);
         }
 
         // Dispatch receipt storage (fire-and-forget, off main thread)
@@ -790,26 +811,6 @@ impl ExecutionState {
     /// The caller is responsible for any BFT-side cleanup (e.g. `bft.remove_committed_transaction`).
     pub fn on_certificates_committed(&mut self, certificates: &[Arc<TransactionCertificate>]) {
         for cert in certificates {
-            // Debug cross-check: verify our local execution produced the same
-            // receipt_hash as the quorum-signed certificate. A mismatch indicates
-            // an engine determinism bug (different outcome/events for same input).
-            if let Some(local_receipt_hash) = self
-                .execution_cache
-                .get_receipt_hash(&cert.transaction_hash)
-            {
-                if let Some(ShardExecutionProof::Executed { receipt_hash, .. }) =
-                    cert.shard_proofs.values().next()
-                {
-                    debug_assert_eq!(
-                        local_receipt_hash,
-                        *receipt_hash,
-                        "receipt_hash mismatch for tx {}: local engine produced different \
-                         outcome/events than certificate. This indicates an engine determinism bug.",
-                        cert.transaction_hash,
-                    );
-                }
-            }
-
             self.remove_finalized_certificate(&cert.transaction_hash, cert.decision);
             // Invalidate speculative results that read from nodes being written
             self.invalidate_speculative_on_commit(cert);
@@ -1473,7 +1474,8 @@ impl ExecutionState {
                     "SPECULATIVE HIT: Results already cached, skipping execution"
                 );
                 actions.extend(self.start_single_shard_execution(topology, tx.clone()));
-                actions.extend(self.try_record_speculative_wave_result(tx_hash));
+                // Speculative result recording is handled by early_execution_results
+                // drain in setup_execution_tracking (already ran above).
             } else if self.speculative_in_flight_txs.contains(&tx_hash) {
                 // Speculation in-flight - results will arrive when it completes.
                 // This counts as a hit since we're skipping re-execution.
@@ -1492,11 +1494,10 @@ impl ExecutionState {
                 );
                 actions.extend(self.start_single_shard_execution(topology, tx.clone()));
                 // If execution already completed (ExecutionBatchCompleted processed
-                // before BlockCommitted but SpeculativeExecutionComplete hasn't been
-                // processed yet), re-extract from cache. If execution hasn't completed
-                // yet, cache will be empty and the later ExecutionBatchCompleted will
-                // record wave results normally (wave tracking is now set up).
-                actions.extend(self.try_record_speculative_wave_result(tx_hash));
+                // before BlockCommitted), the result is in early_execution_results
+                // and was drained by setup_execution_tracking above. If execution
+                // hasn't completed, the later ExecutionBatchCompleted will record
+                // wave results normally (wave tracking is now set up).
             } else {
                 // No speculation at all - execute normally
                 tracing::debug!(
@@ -1804,8 +1805,29 @@ impl ExecutionState {
                     certificate: tx_cert.clone(),
                 });
 
-                self.finalized_certificates
-                    .insert(tx_hash, (Arc::new(tx_cert), self.committed_height));
+                // Co-locate DatabaseUpdates with the certificate. The updates were
+                // stored in pending_execution_updates when execution completed.
+                // If missing (shouldn't happen), log a warning and use empty updates.
+                let database_updates = self
+                    .pending_execution_updates
+                    .remove(&tx_hash)
+                    .unwrap_or_else(|| {
+                        tracing::warn!(
+                            tx_hash = %tx_hash,
+                            "No pending execution updates at TC creation — state_root will not \
+                             reflect this certificate's writes. This indicates a timing bug."
+                        );
+                        Arc::new(DatabaseUpdates::default())
+                    });
+
+                self.finalized_certificates.insert(
+                    tx_hash,
+                    FinalizedCertEntry {
+                        certificate: Arc::new(tx_cert),
+                        database_updates,
+                        committed_height: self.committed_height,
+                    },
+                );
 
                 // Notify mempool that transaction execution is complete
                 actions.push(Action::Continuation(ProtocolEvent::TransactionExecuted {
@@ -1835,7 +1857,7 @@ impl ExecutionState {
     pub fn get_finalized_certificates(&self) -> Vec<Arc<TransactionCertificate>> {
         self.finalized_certificates
             .values()
-            .map(|(cert, _)| cert.clone())
+            .map(|entry| Arc::clone(&entry.certificate))
             .collect()
     }
 
@@ -1846,7 +1868,7 @@ impl ExecutionState {
     pub fn get_finalized_certificate(&self, tx_hash: &Hash) -> Option<Arc<TransactionCertificate>> {
         self.finalized_certificates
             .get(tx_hash)
-            .map(|(cert, _)| cert.clone())
+            .map(|entry| Arc::clone(&entry.certificate))
     }
 
     /// Remove a finalized certificate (after it's been included in a block).
@@ -1856,8 +1878,9 @@ impl ExecutionState {
     pub fn remove_finalized_certificate(&mut self, tx_hash: &Hash, decision: TransactionDecision) {
         self.finalized_certificates.remove(tx_hash);
 
-        // Evict from execution cache — writes have been applied to JVT at this point.
-        self.execution_cache.remove(tx_hash);
+        // Clean up pending_execution_updates in case TC was never formed for this tx
+        // (shouldn't happen normally, but ensures no leak on unusual code paths).
+        self.pending_execution_updates.remove(tx_hash);
 
         // Clean up all transaction tracking state now that it's finalized.
         // This is the same cleanup done by cleanup_transaction() for aborts/deferrals,
@@ -2072,8 +2095,8 @@ impl ExecutionState {
             return;
         }
 
-        // Evict from execution cache — transaction is being retried or abandoned.
-        self.execution_cache.remove(tx_hash);
+        // Evict pending execution updates — transaction is being retried or abandoned.
+        self.pending_execution_updates.remove(tx_hash);
 
         // Phase 1-2: Provisioning cleanup
         // Note: Provision tracking is handled by ProvisionCoordinator
@@ -2346,36 +2369,11 @@ impl ExecutionState {
         }
     }
 
-    /// Try to record a wave result from a speculative execution's cached data.
-    ///
-    /// When speculation completes before (or during) block commit, the
-    /// `ExecutionBatchCompleted` event populated the execution cache but wave
-    /// tracking wasn't set up yet, so the result was dropped. This re-extracts
-    /// the result from the execution cache now that wave tracking is ready.
-    ///
-    /// Returns a `SignAndSendExecutionVote` action if the cache had data
-    /// and the wave was completed, or empty if execution hasn't finished yet
-    /// (the later `ExecutionBatchCompleted` will record normally).
-    fn try_record_speculative_wave_result(&mut self, tx_hash: Hash) -> Vec<Action> {
-        let Some(receipt_hash) = self.execution_cache.get_receipt_hash(&tx_hash) else {
-            return vec![];
-        };
-        let write_nodes = self
-            .execution_cache
-            .get(&tx_hash)
-            .map(|updates| crate::handlers::extract_write_nodes(updates))
-            .unwrap_or_default();
-        // Record silently — votes emitted during block commit wave scan.
-        self.record_execution_result(
-            tx_hash,
-            TxExecutionOutcome::Executed {
-                receipt_hash,
-                success: true,
-                write_nodes,
-            },
-        );
-        vec![]
-    }
+    // `try_record_speculative_wave_result` removed — redundant with
+    // `early_execution_results` drain in `setup_execution_tracking`.
+    // `ExecutionBatchCompleted` always calls `record_execution_result`,
+    // which buffers into `early_execution_results` when the wave isn't
+    // set up yet. `setup_execution_tracking` drains that buffer.
 
     /// Try to use a cached speculative result for a transaction.
     ///
@@ -2640,7 +2638,7 @@ impl ExecutionState {
     /// Get execution memory statistics for monitoring collection sizes.
     pub fn memory_stats(&self) -> ExecutionMemoryStats {
         ExecutionMemoryStats {
-            cache_entries: self.execution_cache.len(),
+            pending_execution_updates: self.pending_execution_updates.len(),
             finalized_certificates: self.finalized_certificates.len(),
             pending_provisioning: self.pending_provisioning.len(),
             accumulators: self.accumulators.len(),

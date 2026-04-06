@@ -313,7 +313,7 @@ impl sbor::Describe<sbor::NoCustomTypeKind> for ReceiptBundle {
 /// determines outcome from the receipt's `outcome` field instead.
 ///
 /// The state machine uses this to:
-/// 1. Populate the ExecutionCache (in-memory, for block commit fast path)
+/// 1. Store pending execution updates (co-located with TC at finalization)
 /// 2. Dispatch receipt storage to disk (via StoreReceiptBundles action)
 #[derive(Debug, Clone)]
 pub struct ExecutionResult {

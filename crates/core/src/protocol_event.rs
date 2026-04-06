@@ -182,7 +182,7 @@ pub enum ProtocolEvent {
     /// Results carry the full execution output (DatabaseUpdates, receipts) — stays local.
     ///
     /// The state machine uses results to:
-    /// 1. Populate ExecutionCache (in-memory, for block commit fast path)
+    /// 1. Store pending execution updates (co-located with TC at finalization)
     /// 2. Dispatch StoreReceiptBundles action (for both speculative and canonical)
     ExecutionBatchCompleted {
         results: Vec<hyperscale_types::ExecutionResult>,

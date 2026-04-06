@@ -547,6 +547,15 @@ impl NodeStateMachine {
                 tx_hash,
                 &cert,
             ));
+
+            // TC formation means DatabaseUpdates are now co-located in
+            // finalized_certificates. Feed receipt availability to BFT
+            // pending blocks — a block waiting for this receipt may now
+            // be complete and ready for voting / state root verification.
+            actions.extend(
+                self.bft
+                    .on_receipts_available(self.topology.snapshot(), &[tx_hash]),
+            );
         }
 
         actions

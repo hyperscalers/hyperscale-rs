@@ -9,16 +9,15 @@
 //! - Vote aggregation and certificate formation
 
 pub mod accumulator;
-pub mod execution_cache;
 pub mod handlers;
 
 mod state;
 mod trackers;
 
 pub use accumulator::ExecutionAccumulator;
-pub use execution_cache::ExecutionCache;
 pub use state::{
     BlockCommittedOutput, CompletionData, CrossShardRegistration, ExecutionMemoryStats,
-    ExecutionState, DEFAULT_SPECULATIVE_MAX_TXS, DEFAULT_VIEW_CHANGE_COOLDOWN_ROUNDS,
+    ExecutionState, FinalizedCertEntry, DEFAULT_SPECULATIVE_MAX_TXS,
+    DEFAULT_VIEW_CHANGE_COOLDOWN_ROUNDS,
 };
 pub use trackers::VoteTracker;
