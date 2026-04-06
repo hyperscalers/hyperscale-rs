@@ -79,7 +79,7 @@ pub use block::{
     BlockHeader, BlockManifest, BlockMetadata, CommittedBlockHeader,
 };
 pub use execution_vote::{
-    compute_receipt_root_with_proof, compute_waves, designated_broadcaster, tx_outcome_leaf,
+    compute_receipt_root_with_proof, compute_waves, tx_outcome_leaf, wave_leader,
     ExecutionCertificate, ExecutionVote, TxExecutionOutcome, TxOutcome, WaveId,
 };
 pub use quorum_certificate::QuorumCertificate;

@@ -107,15 +107,12 @@ pub fn compute_waves(
     wave_set.into_iter().collect()
 }
 
-/// Deterministically select the designated cert broadcaster for a (block, wave).
+/// Deterministically select the wave leader for a (block, wave).
 ///
+/// The wave leader is the sole aggregator of execution votes into an EC.
 /// Uses `Hash(block_hash ++ wave_id_bytes) % committee_size` to pick one
 /// validator. All validators compute the same result from the same inputs.
-pub fn designated_broadcaster(
-    block_hash: &Hash,
-    wave_id: &WaveId,
-    committee: &[ValidatorId],
-) -> ValidatorId {
+pub fn wave_leader(block_hash: &Hash, wave_id: &WaveId, committee: &[ValidatorId]) -> ValidatorId {
     assert!(!committee.is_empty(), "committee must not be empty");
     let wave_bytes = basic_encode(wave_id).expect("WaveId serialization should never fail");
     let mut input = Vec::with_capacity(block_hash.as_bytes().len() + wave_bytes.len());

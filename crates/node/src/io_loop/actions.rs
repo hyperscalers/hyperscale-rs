@@ -83,6 +83,7 @@ where
                 tx_count,
                 tx_outcomes: _,          // TODO: stash for later cert aggregation
                 participating_shards: _, // TODO: stash for later cert broadcast
+                target,
             } => {
                 // Sign the execution vote inline (BLS signing is fast, ~1ms)
                 let msg = hyperscale_types::exec_vote_message(
@@ -107,35 +108,27 @@ where
                     signature: sig,
                 };
 
-                // Send immediately — each vote already covers a whole wave, no accumulator needed
-                let batch_msg = hyperscale_types::exec_vote_batch_message(
-                    self.local_shard,
-                    std::slice::from_ref(&vote),
-                );
-                let batch_sig = self.signing_key.sign_v1(&batch_msg);
-                let batch = hyperscale_messages::ExecutionVotesNotification::new(
-                    vec![vote.clone()],
-                    self.validator_id,
-                    batch_sig,
-                );
-                self.network.notify(&self.cached_local_peers, &batch);
+                // Send vote only to the wave leader (N→1 instead of N→N).
+                // If we ARE the wave leader, skip the network send — the
+                // loopback below feeds it directly to the state machine.
+                if target != self.validator_id {
+                    let batch_msg = hyperscale_types::exec_vote_batch_message(
+                        self.local_shard,
+                        std::slice::from_ref(&vote),
+                    );
+                    let batch_sig = self.signing_key.sign_v1(&batch_msg);
+                    let batch = hyperscale_messages::ExecutionVotesNotification::new(
+                        vec![vote.clone()],
+                        self.validator_id,
+                        batch_sig,
+                    );
+                    self.network.notify(std::slice::from_ref(&target), &batch);
+                }
 
-                // Also feed our own execution vote back to the state machine for tracking
+                // Feed our own execution vote back to the state machine for tracking
                 let _ = self.event_sender.send(hyperscale_core::NodeInput::Protocol(
                     hyperscale_core::ProtocolEvent::ExecutionVoteReceived { vote },
                 ));
-            }
-            Action::BroadcastExecutionVote { shard, vote } => {
-                // Each vote already covers a whole wave — send immediately, no accumulator.
-                let msg =
-                    hyperscale_types::exec_vote_batch_message(shard, std::slice::from_ref(&vote));
-                let sig = self.signing_key.sign_v1(&msg);
-                let batch = hyperscale_messages::ExecutionVotesNotification::new(
-                    vec![vote],
-                    self.validator_id,
-                    sig,
-                );
-                self.network.notify(&self.cached_local_peers, &batch);
             }
             Action::BroadcastExecutionCertificate {
                 shard: _,

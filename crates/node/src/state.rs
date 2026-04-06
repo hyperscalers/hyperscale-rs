@@ -502,7 +502,10 @@ impl NodeStateMachine {
         // been processed above (with override semantics), so the accumulator state
         // is deterministic at this height. All validators at this height produce
         // the same votes.
-        actions.extend(self.execution.emit_vote_actions(height));
+        actions.extend(
+            self.execution
+                .emit_vote_actions(self.topology.snapshot(), height),
+        );
 
         actions
     }
