@@ -1398,7 +1398,7 @@ impl BftState {
     /// Sender identity comes from the header's proposer field (ValidatorId),
     /// which is signed and verified. For sync detection, we don't need
     /// the network peer ID.
-    #[instrument(skip(self, header, manifest, lookup_tx, lookup_cert), fields(
+    #[instrument(skip(self, header, manifest, lookup_tx, lookup_cert, lookup_receipt), fields(
         height = header.height.0,
         round = header.round,
         proposer = ?header.proposer,
@@ -1411,6 +1411,7 @@ impl BftState {
         manifest: BlockManifest,
         lookup_tx: impl Fn(&Hash) -> Option<Arc<RoutableTransaction>>,
         lookup_cert: impl Fn(&Hash) -> Option<Arc<TransactionCertificate>>,
+        lookup_receipt: impl Fn(&Hash) -> bool,
     ) -> Vec<Action> {
         let block_hash = header.hash();
         let height = header.height.0;
@@ -1559,6 +1560,11 @@ impl BftState {
         for cert_hash in pending.manifest().cert_hashes.clone() {
             if let Some(cert) = lookup_cert(&cert_hash) {
                 pending.add_certificate(cert);
+            }
+        }
+        for receipt_hash in pending.manifest().receipt_hashes.clone() {
+            if lookup_receipt(&receipt_hash) {
+                pending.add_receipt(&receipt_hash);
             }
         }
 
@@ -4153,6 +4159,82 @@ impl BftState {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
+    // Receipt Availability
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// Handle receipts becoming available from execution.
+    ///
+    /// Called when `ExecutionBatchCompleted` fires — the execution cache now has
+    /// `DatabaseUpdates` for these transaction hashes. Any pending block that was
+    /// waiting for these receipts may now be complete.
+    ///
+    /// This is the receipt equivalent of `check_pending_blocks_for_transaction`:
+    /// it iterates pending blocks, marks receipts as available, and triggers
+    /// voting when a block becomes complete.
+    pub fn on_receipts_available(
+        &mut self,
+        topology: &TopologySnapshot,
+        tx_hashes: &[Hash],
+    ) -> Vec<Action> {
+        let mut actions = Vec::new();
+
+        // Find pending blocks that need any of these receipts.
+        // Build list first to avoid borrow conflicts.
+        let block_hashes: Vec<Hash> = self
+            .pending_blocks
+            .iter()
+            .filter(|(_, pending)| tx_hashes.iter().any(|h| pending.needs_receipt(h)))
+            .map(|(hash, _)| *hash)
+            .collect();
+
+        for block_hash in block_hashes {
+            let (is_complete, needs_construct, still_missing) = {
+                let Some(pending) = self.pending_blocks.get_mut(&block_hash) else {
+                    continue;
+                };
+
+                for tx_hash in tx_hashes {
+                    pending.add_receipt(tx_hash);
+                }
+
+                let still_missing = pending.missing_receipt_count();
+                let is_complete = pending.is_complete();
+                let needs_construct = is_complete && pending.block().is_none();
+                (is_complete, needs_construct, still_missing)
+            };
+
+            if !is_complete {
+                debug!(
+                    block_hash = ?block_hash,
+                    still_missing = still_missing,
+                    "Receipts arrived but block still incomplete"
+                );
+                continue;
+            }
+
+            if needs_construct {
+                if let Some(pending) = self.pending_blocks.get_mut(&block_hash) {
+                    if let Err(e) = pending.construct_block() {
+                        warn!("Failed to construct block after receipt arrival: {}", e);
+                        continue;
+                    }
+                }
+            }
+
+            debug!(
+                validator = ?topology.local_validator_id(),
+                block_hash = ?block_hash,
+                "Pending block completed after receipts arrived"
+            );
+
+            actions.extend(self.trigger_qc_verification_or_vote(topology, block_hash));
+            actions.extend(self.try_commit_pending_data(topology, block_hash));
+        }
+
+        actions
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
     // Transaction Monitoring
     // ═══════════════════════════════════════════════════════════════════════════
 
@@ -5149,8 +5231,9 @@ mod tests {
             &topology,
             header,
             BlockManifest::default(),
-            |_| None, // mempool lookup
-            |_| None, // certificate lookup
+            |_| None,  // mempool lookup
+            |_| None,  // certificate lookup
+            |_| false, // receipt lookup
         );
 
         // Should emit VerifyQcSignature action
@@ -5237,6 +5320,7 @@ mod tests {
             BlockManifest::default(),
             |_| None,
             |_| None,
+            |_| false,
         );
 
         // Now simulate QC signature verified successfully
@@ -5325,6 +5409,7 @@ mod tests {
             BlockManifest::default(),
             |_| None,
             |_| None,
+            |_| false,
         );
 
         // Verify block is pending
@@ -5398,6 +5483,7 @@ mod tests {
             BlockManifest::default(),
             |_| None,
             |_| None,
+            |_| false,
         );
 
         // Should NOT emit VerifyQcSignature (genesis QC)
@@ -7171,6 +7257,7 @@ mod tests {
             BlockManifest::default(),
             |_| None,
             |_| None,
+            |_| false,
         );
 
         // Should emit VerifyQcSignature for the first block
@@ -7206,6 +7293,7 @@ mod tests {
             BlockManifest::default(),
             |_| None,
             |_| None,
+            |_| false,
         );
 
         // Should NOT emit VerifyQcSignature since QC is already verified

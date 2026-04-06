@@ -483,6 +483,13 @@ pub struct BlockManifest {
 
     /// Abort intents (small, stored inline).
     pub abort_intents: Vec<AbortIntent>,
+
+    /// Transaction hashes of non-aborted certificates that require receipts.
+    ///
+    /// Validators must have receipt data (DatabaseUpdates) for these transactions
+    /// before voting on the block, because state_root verification requires it.
+    /// Populated by the proposer from non-aborted certificates.
+    pub receipt_hashes: Vec<Hash>,
 }
 
 impl BlockManifest {
@@ -501,6 +508,12 @@ impl BlockManifest {
                 .map(|c| c.transaction_hash)
                 .collect(),
             abort_intents: block.abort_intents.clone(),
+            receipt_hashes: block
+                .certificates
+                .iter()
+                .filter(|c| c.decision != crate::TransactionDecision::Aborted)
+                .map(|c| c.transaction_hash)
+                .collect(),
         }
     }
 }

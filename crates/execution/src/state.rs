@@ -432,6 +432,14 @@ impl ExecutionState {
             .collect()
     }
 
+    /// Check if the execution cache has cached DatabaseUpdates for a transaction.
+    ///
+    /// Used by the BFT pending block receipt tracking to check if a receipt
+    /// (execution result) is available for a non-aborted certificate.
+    pub fn has_cached_updates(&self, tx_hash: &Hash) -> bool {
+        self.execution_cache.get(tx_hash).is_some()
+    }
+
     // ═══════════════════════════════════════════════════════════════════════════
     // Wave Assignment
     // ═══════════════════════════════════════════════════════════════════════════

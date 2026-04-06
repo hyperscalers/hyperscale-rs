@@ -381,6 +381,7 @@ impl NodeStateMachine {
             manifest,
             |h| self.mempool.get_transaction(h),
             |h| self.execution.get_finalized_certificate(h),
+            |h| self.execution.has_cached_updates(h),
         );
         actions.extend(spec_actions);
         actions
@@ -781,12 +782,32 @@ impl StateMachine for NodeStateMachine {
                 results,
                 tx_outcomes,
                 speculative,
-            } => self.execution.on_execution_batch_completed(
-                results,
-                tx_outcomes,
-                speculative,
-                self.bft.committed_height(),
-            ),
+            } => {
+                // Extract tx_hashes before results are consumed — these receipts
+                // are now available in the execution cache for state root verification.
+                let receipt_tx_hashes: Vec<hyperscale_types::Hash> =
+                    results.iter().map(|r| r.tx_hash).collect();
+
+                let mut actions = self.execution.on_execution_batch_completed(
+                    results,
+                    tx_outcomes,
+                    speculative,
+                    self.bft.committed_height(),
+                );
+
+                // Feed receipt availability to BFT pending blocks. A pending block
+                // that was waiting for these receipts may now be complete and ready
+                // for voting. This prevents voting on blocks where state_root
+                // cannot be verified due to missing execution results.
+                if !receipt_tx_hashes.is_empty() {
+                    actions.extend(
+                        self.bft
+                            .on_receipts_available(self.topology.snapshot(), &receipt_tx_hashes),
+                    );
+                }
+
+                actions
+            }
             ProtocolEvent::SpeculativeExecutionComplete {
                 block_hash,
                 tx_hashes,

@@ -45,6 +45,14 @@ pub struct PendingBlock {
     /// Set of certificate hashes we're still waiting for (HashSet for O(1) lookup).
     missing_certificate_hashes: HashSet<Hash>,
 
+    /// Set of receipt tx_hashes we're still waiting for (HashSet for O(1) lookup).
+    ///
+    /// Populated from `BlockManifest::receipt_hashes` — the tx_hashes of non-aborted
+    /// certificates. A block with certificates is not complete until receipts
+    /// (DatabaseUpdates in the execution cache) are available for all non-aborted certs.
+    /// This prevents voting on blocks where state_root cannot be verified.
+    missing_receipt_hashes: HashSet<Hash>,
+
     /// The fully constructed block (None until all transactions/certs received).
     constructed_block: Option<Arc<Block>>,
 }
@@ -57,6 +65,8 @@ impl PendingBlock {
             manifest.tx_hashes.iter().copied().collect();
         let missing_certificate_hashes: HashSet<Hash> =
             manifest.cert_hashes.iter().copied().collect();
+        let missing_receipt_hashes: HashSet<Hash> =
+            manifest.receipt_hashes.iter().copied().collect();
 
         Self {
             header,
@@ -64,6 +74,7 @@ impl PendingBlock {
             missing_transaction_hashes,
             received_certificates: HashMap::with_capacity(manifest.cert_hashes.len()),
             missing_certificate_hashes,
+            missing_receipt_hashes,
             manifest,
             constructed_block: None,
         }
@@ -81,6 +92,7 @@ impl PendingBlock {
             missing_transaction_hashes: HashSet::new(),
             received_certificates: HashMap::new(),
             missing_certificate_hashes: HashSet::new(),
+            missing_receipt_hashes: HashSet::new(), // Proposer already has all receipts
             manifest,
             constructed_block: None,
         };
@@ -126,9 +138,18 @@ impl PendingBlock {
         }
     }
 
-    /// Check if all transactions and certificates have been received.
+    /// Add a receipt (mark as available by tx_hash).
+    ///
+    /// Returns true if this receipt was needed, false if duplicate or not in this block.
+    pub fn add_receipt(&mut self, tx_hash: &Hash) -> bool {
+        self.missing_receipt_hashes.remove(tx_hash)
+    }
+
+    /// Check if all transactions, certificates, and receipts have been received.
     pub fn is_complete(&self) -> bool {
-        self.missing_transaction_hashes.is_empty() && self.missing_certificate_hashes.is_empty()
+        self.missing_transaction_hashes.is_empty()
+            && self.missing_certificate_hashes.is_empty()
+            && self.missing_receipt_hashes.is_empty()
     }
 
     /// Check if all transactions have been received (certificates may still be pending).
@@ -162,6 +183,22 @@ impl PendingBlock {
         self.missing_certificate_hashes.iter().copied().collect()
     }
 
+    /// Get the number of missing receipt hashes.
+    pub fn missing_receipt_count(&self) -> usize {
+        self.missing_receipt_hashes.len()
+    }
+
+    /// Get the missing receipt hashes as a Vec (for fetch requests).
+    #[allow(dead_code)] // API parity with missing_transactions(); used when receipt fetch is added
+    pub fn missing_receipts(&self) -> Vec<Hash> {
+        self.missing_receipt_hashes.iter().copied().collect()
+    }
+
+    /// Check if this pending block needs a specific receipt.
+    pub fn needs_receipt(&self, tx_hash: &Hash) -> bool {
+        self.missing_receipt_hashes.contains(tx_hash)
+    }
+
     /// Construct the block from header + received transactions + received certificates.
     ///
     /// Should only be called when is_complete() returns true.
@@ -172,9 +209,10 @@ impl PendingBlock {
     pub fn construct_block(&mut self) -> Result<Arc<Block>, String> {
         if !self.is_complete() {
             return Err(format!(
-                "Cannot construct block: {} transactions and {} certificates still missing",
+                "Cannot construct block: {} transactions, {} certificates, {} receipts still missing",
                 self.missing_transaction_hashes.len(),
-                self.missing_certificate_hashes.len()
+                self.missing_certificate_hashes.len(),
+                self.missing_receipt_hashes.len()
             ));
         }
 
@@ -384,5 +422,120 @@ mod tests {
         pb.add_certificate(Arc::new(cert));
 
         assert!(pb.is_complete());
+    }
+
+    #[test]
+    fn test_pending_block_with_receipts() {
+        let receipt1 = Hash::from_bytes(b"receipt1");
+        let receipt2 = Hash::from_bytes(b"receipt2");
+        let header = make_header(1);
+
+        let pb = PendingBlock::from_manifest(
+            header,
+            BlockManifest {
+                receipt_hashes: vec![receipt1, receipt2],
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(pb.missing_receipt_count(), 2);
+        assert!(pb.needs_receipt(&receipt1));
+        assert!(pb.needs_receipt(&receipt2));
+        assert!(!pb.is_complete());
+    }
+
+    #[test]
+    fn test_add_receipt() {
+        let receipt_hash = Hash::from_bytes(b"receipt1");
+        let header = make_header(1);
+
+        let mut pb = PendingBlock::from_manifest(
+            header,
+            BlockManifest {
+                receipt_hashes: vec![receipt_hash],
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(pb.missing_receipt_count(), 1);
+        assert!(!pb.is_complete());
+
+        let added = pb.add_receipt(&receipt_hash);
+        assert!(added);
+
+        assert_eq!(pb.missing_receipt_count(), 0);
+        assert!(pb.is_complete());
+
+        // Duplicate add returns false
+        let added_again = pb.add_receipt(&receipt_hash);
+        assert!(!added_again);
+    }
+
+    #[test]
+    fn test_block_needs_transactions_certificates_and_receipts() {
+        use hyperscale_types::{
+            test_utils::test_transaction, TransactionCertificate, TransactionDecision,
+        };
+        use std::collections::BTreeMap;
+
+        let tx = Arc::new(test_transaction(1));
+        let tx_hash = tx.hash();
+        let cert_hash = Hash::from_bytes(b"cert1");
+        let receipt_hash = Hash::from_bytes(b"receipt1");
+        let header = make_header(1);
+
+        let mut pb = PendingBlock::from_manifest(
+            header,
+            BlockManifest {
+                tx_hashes: vec![tx_hash],
+                cert_hashes: vec![cert_hash],
+                receipt_hashes: vec![receipt_hash],
+                ..Default::default()
+            },
+        );
+
+        assert!(!pb.is_complete());
+
+        // Add transaction
+        pb.add_transaction_arc(tx);
+        assert!(!pb.is_complete()); // Still missing certificate + receipt
+
+        // Add certificate
+        let cert = TransactionCertificate {
+            transaction_hash: cert_hash,
+            decision: TransactionDecision::Accept,
+            shard_proofs: BTreeMap::new(),
+        };
+        pb.add_certificate(Arc::new(cert));
+        assert!(!pb.is_complete()); // Still missing receipt
+
+        // Add receipt
+        pb.add_receipt(&receipt_hash);
+        assert!(pb.is_complete());
+    }
+
+    #[test]
+    fn test_from_complete_block_has_no_missing_receipts() {
+        use hyperscale_types::{Block, TransactionCertificate, TransactionDecision};
+        use std::collections::BTreeMap;
+
+        let cert = Arc::new(TransactionCertificate {
+            transaction_hash: Hash::from_bytes(b"cert1"),
+            decision: TransactionDecision::Accept,
+            shard_proofs: BTreeMap::new(),
+        });
+
+        let block = Block {
+            header: make_header(1),
+            transactions: vec![],
+            certificates: vec![cert],
+            abort_intents: vec![],
+        };
+
+        let pending = PendingBlock::from_complete_block(&block);
+
+        // Proposer's own block: no missing receipts
+        assert_eq!(pending.missing_receipt_count(), 0);
+        assert!(pending.is_complete());
     }
 }
