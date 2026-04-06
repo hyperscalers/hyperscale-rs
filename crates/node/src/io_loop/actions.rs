@@ -74,17 +74,16 @@ where
             // ═══════════════════════════════════════════════════════════
             // Network broadcasts — batched
             // ═══════════════════════════════════════════════════════════
-            Action::SignAndBroadcastExecutionVote {
+            Action::SignAndSendExecutionVote {
                 block_hash,
                 block_height,
                 vote_height,
                 wave_id,
                 receipt_root,
-                tx_count,
                 tx_outcomes,
-                participating_shards: _, // TODO: stash for later cert broadcast
                 target,
             } => {
+                let tx_count = tx_outcomes.len() as u32;
                 // Sign the execution vote inline (BLS signing is fast, ~1ms)
                 let msg = hyperscale_types::exec_vote_message(
                     &block_hash,
