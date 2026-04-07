@@ -533,20 +533,69 @@ where
             .max()
             .unwrap_or(0);
 
-        let mut prepared_map = {
+        // Extract prepared commits and identify blocks that are NOT yet
+        // ready to commit. A block with certificates requires either a
+        // prepared commit (from VerifyStateRoot / BuildProposal) or buffered
+        // sync data (receipts from the sync peer). Without either, committing
+        // would apply empty state updates, permanently diverging the JVT.
+        //
+        // Deferred blocks are put back into pending_block_commits; they will
+        // be retried on the next flush (triggered when VerifyStateRoot or
+        // sync data arrives).
+        let mut ready_commits = Vec::with_capacity(commits.len());
+        let mut prepared_map = Vec::with_capacity(commits.len());
+        {
             let mut cache = self.prepared_commits.lock().unwrap();
-            let mut map = Vec::with_capacity(commits.len());
-            for (block, _) in &commits {
-                map.push(cache.remove(&block.hash()).map(|(_, p)| p));
+            let mut deferring = false;
+            for (block, qc) in commits {
+                let has_certs = !block.certificates.is_empty();
+                let prepared = if !deferring {
+                    cache.remove(&block.hash()).map(|(_, p)| p)
+                } else {
+                    None
+                };
+                let has_sync = sync_data.contains_key(&block.header.height.0);
+
+                if deferring || (has_certs && prepared.is_none() && !has_sync) {
+                    if !deferring {
+                        tracing::debug!(
+                            height = block.header.height.0,
+                            certs = block.certificates.len(),
+                            "Deferring block commit — awaiting state root verification"
+                        );
+                        deferring = true;
+                    }
+                    // Restore any sync data we extracted for this height.
+                    if let Some(data) = sync_data.remove(&block.header.height.0) {
+                        self.pending_sync_data.insert(block.header.height.0, data);
+                    }
+                    // Put back prepared commit if we extracted one (subsequent
+                    // blocks deferred due to ordering, not missing data).
+                    if let Some(p) = prepared {
+                        cache.insert(block.hash(), (block.header.height.0, p));
+                    }
+                    self.pending_block_commits.push((block, qc));
+                } else {
+                    prepared_map.push(prepared);
+                    ready_commits.push((block, qc));
+                }
             }
+            // Prune stale entries that outlived their blocks.
             let before = cache.len();
             cache.retain(|_, (h, _)| *h > max_committed_height);
             let pruned = before - cache.len();
             if pruned > 0 {
                 tracing::debug!(pruned, "Pruned stale prepared_commits entries");
             }
-            map
-        };
+        }
+
+        if ready_commits.is_empty() {
+            // All blocks were deferred — nothing to commit this round.
+            // Put back the ECs we took so they aren't lost.
+            self.pending_ec_writes = pending_ecs;
+            return;
+        }
+        let commits = ready_commits;
 
         let storage = Arc::clone(&self.storage);
         let event_tx = self.event_sender.clone();
@@ -591,21 +640,44 @@ where
                     // buffered receipts, verify EC signatures + state_root, and
                     // commit atomically with ECs.
                     let sync_entry = sync_data.get(&height.0);
-                    let (receipts, sync_ecs) = match sync_entry {
-                        Some(entry) => (&entry.ledger_receipts, &entry.execution_certificates),
-                        None => {
-                            // No buffered sync data — fall back to storage read
-                            // (pre-Step 5 compat: receipts already in storage).
-                            tracing::warn!(
-                                height = height.0,
-                                "Sync path: no buffered data, falling back to storage read"
-                            );
-                            (
-                                &Vec::new() as &Vec<hyperscale_types::LedgerReceiptEntry>,
-                                &Vec::new() as &Vec<hyperscale_types::ExecutionCertificate>,
-                            )
+                    let Some(entry) = sync_entry else {
+                        // This should not happen: flush_block_commits defers
+                        // blocks that have certificates but no prepared commit
+                        // and no sync data. If we reach here, it's a logic bug.
+                        tracing::error!(
+                            height = height.0,
+                            certs = block.certificates.len(),
+                            "BUG: block with certificates reached commit closure \
+                             without prepared commit or sync data — committing \
+                             without state updates to avoid stall"
+                        );
+                        let empty = hyperscale_types::DatabaseUpdates::default();
+                        let r = storage.commit_block(
+                            &empty,
+                            &block.certificates,
+                            height.0,
+                            Some(consensus),
+                            &ecs_for_this_block,
+                        );
+                        ConsensusStore::prune_own_votes(&*storage, height.0);
+                        if i == prepared_map.len() - 1 {
+                            in_flight.store(false, Ordering::Release);
                         }
+                        let _ = event_tx.send(NodeInput::Protocol(
+                            ProtocolEvent::StateCommitComplete {
+                                height: height.0,
+                                state_root: r,
+                            },
+                        ));
+                        let _ = event_tx.send(NodeInput::Protocol(ProtocolEvent::BlockCommitted {
+                            block_hash,
+                            height: height.0,
+                            block,
+                        }));
+                        continue;
                     };
+                    let (receipts, sync_ecs) =
+                        (&entry.ledger_receipts, &entry.execution_certificates);
 
                     // Check 2: Verify EC BLS signatures (synchronous in commit closure).
                     let ecs_valid = sync_ecs.iter().all(|ec| {
