@@ -16,7 +16,7 @@ use hyperscale_messages::response::GetProvisionsResponse;
 use hyperscale_metrics as metrics;
 use hyperscale_storage::{ConsensusStore, SubstateStore};
 use hyperscale_types::{BlockHeight, ProvisionBatch, ShardGroupId, StateProvision, ValidatorId};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use tracing::{debug, trace, warn};
 
@@ -106,7 +106,7 @@ struct PendingProvisionFetch {
 pub struct ProvisionFetchProtocol {
     config: ProvisionFetchConfig,
     /// Pending fetches keyed by (source_shard, block_height).
-    pending: HashMap<(ShardGroupId, BlockHeight), PendingProvisionFetch>,
+    pending: BTreeMap<(ShardGroupId, BlockHeight), PendingProvisionFetch>,
 }
 
 impl ProvisionFetchProtocol {
@@ -114,7 +114,7 @@ impl ProvisionFetchProtocol {
     pub fn new(config: ProvisionFetchConfig) -> Self {
         Self {
             config,
-            pending: HashMap::new(),
+            pending: BTreeMap::new(),
         }
     }
 

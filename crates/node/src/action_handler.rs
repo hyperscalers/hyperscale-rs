@@ -766,8 +766,10 @@ fn build_provision_batches<S: CommitStore + SubstateStore + ConsensusStore>(
         }
     }
 
-    let mut batches = Vec::with_capacity(shard_tx_entries.len());
-    for (shard, transactions) in shard_tx_entries {
+    let mut sorted_shard_entries: Vec<_> = shard_tx_entries.into_iter().collect();
+    sorted_shard_entries.sort_by_key(|(shard, _)| *shard);
+    let mut batches = Vec::with_capacity(sorted_shard_entries.len());
+    for (shard, transactions) in sorted_shard_entries {
         let mut shard_keys: Vec<Vec<u8>> = transactions
             .iter()
             .flat_map(|te| te.entries.iter().map(|e| e.storage_key.clone()))

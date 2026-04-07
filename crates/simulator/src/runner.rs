@@ -188,7 +188,10 @@ impl Simulator {
         let mut total_failed = 0u64;
 
         // Flatten into (shard, tx) pairs so we can batch across shards.
-        let all_txs: Vec<_> = txs_by_shard
+        // Sort by shard for deterministic submission order.
+        let mut shards: Vec<_> = txs_by_shard.into_iter().collect();
+        shards.sort_by_key(|(shard, _)| *shard);
+        let all_txs: Vec<_> = shards
             .into_iter()
             .flat_map(|(shard, txs)| txs.into_iter().map(move |tx| (shard, tx)))
             .collect();

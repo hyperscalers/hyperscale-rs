@@ -18,7 +18,7 @@ use hyperscale_storage::ConsensusStore;
 use hyperscale_types::{Hash, RoutableTransaction, ValidatorId};
 use quick_cache::sync::Cache as QuickCache;
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use tracing::{debug, info, trace};
 
@@ -158,7 +158,7 @@ impl BlockFetchState {
 /// Fetch protocol state machine.
 pub struct TransactionFetchProtocol {
     config: TransactionFetchConfig,
-    tx_fetches: HashMap<Hash, BlockFetchState>,
+    tx_fetches: BTreeMap<Hash, BlockFetchState>,
 }
 
 impl TransactionFetchProtocol {
@@ -166,7 +166,7 @@ impl TransactionFetchProtocol {
     pub fn new(config: TransactionFetchConfig) -> Self {
         Self {
             config,
-            tx_fetches: HashMap::new(),
+            tx_fetches: BTreeMap::new(),
         }
     }
 

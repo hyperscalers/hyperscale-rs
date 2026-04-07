@@ -1052,6 +1052,8 @@ impl MempoolState {
         // Collect transactions to promote (to avoid borrow checker issues)
         let mut to_promote: Vec<(Hash, Arc<RoutableTransaction>, bool, Duration)> = Vec::new();
 
+        let mut deferred_txs: Vec<Hash> = deferred_txs.into_iter().collect();
+        deferred_txs.sort();
         for tx_hash in deferred_txs {
             if let Some(blocking_nodes) = self.deferred_by_nodes.get_mut(&tx_hash) {
                 // Remove this node from the blocking set

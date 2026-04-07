@@ -16,7 +16,7 @@
 use hyperscale_metrics as metrics;
 use hyperscale_types::{Hash, TransactionCertificate, ValidatorId};
 use quick_cache::sync::Cache as QuickCache;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use tracing::{debug, trace, warn};
 
@@ -114,7 +114,7 @@ struct PendingTxCertFetch {
 pub struct TxCertFetchProtocol {
     config: TxCertFetchConfig,
     /// Pending fetches keyed by block_hash.
-    pending: HashMap<Hash, PendingTxCertFetch>,
+    pending: BTreeMap<Hash, PendingTxCertFetch>,
 }
 
 impl TxCertFetchProtocol {
@@ -122,7 +122,7 @@ impl TxCertFetchProtocol {
     pub fn new(config: TxCertFetchConfig) -> Self {
         Self {
             config,
-            pending: HashMap::new(),
+            pending: BTreeMap::new(),
         }
     }
 

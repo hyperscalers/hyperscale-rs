@@ -13,7 +13,7 @@
 
 use hyperscale_metrics as metrics;
 use hyperscale_types::{ExecutionCertificate, ShardGroupId, ValidatorId, WaveId};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::time::{Duration, Instant};
 use tracing::{debug, trace, warn};
 
@@ -106,7 +106,7 @@ struct PendingExecCertFetch {
 pub struct ExecCertFetchProtocol {
     config: ExecCertFetchConfig,
     /// Pending fetches keyed by (source_shard, block_height).
-    pending: HashMap<(ShardGroupId, u64), PendingExecCertFetch>,
+    pending: BTreeMap<(ShardGroupId, u64), PendingExecCertFetch>,
 }
 
 impl ExecCertFetchProtocol {
@@ -114,7 +114,7 @@ impl ExecCertFetchProtocol {
     pub fn new(config: ExecCertFetchConfig) -> Self {
         Self {
             config,
-            pending: HashMap::new(),
+            pending: BTreeMap::new(),
         }
     }
 

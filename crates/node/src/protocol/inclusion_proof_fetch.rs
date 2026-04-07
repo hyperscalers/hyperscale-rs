@@ -17,7 +17,7 @@
 use hyperscale_core::InclusionProofFetchReason;
 use hyperscale_metrics as metrics;
 use hyperscale_types::{BlockHeight, Hash, ShardGroupId, TransactionInclusionProof, ValidatorId};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use tracing::{debug, trace, warn};
 
 /// Configuration for the inclusion proof fetch protocol.
@@ -106,7 +106,7 @@ struct PendingInclusionProofFetch {
 pub struct InclusionProofFetchProtocol {
     config: InclusionProofFetchConfig,
     /// Pending fetches keyed by winner_tx_hash.
-    pending: HashMap<Hash, PendingInclusionProofFetch>,
+    pending: BTreeMap<Hash, PendingInclusionProofFetch>,
 }
 
 impl InclusionProofFetchProtocol {
@@ -114,7 +114,7 @@ impl InclusionProofFetchProtocol {
     pub fn new(config: InclusionProofFetchConfig) -> Self {
         Self {
             config,
-            pending: HashMap::new(),
+            pending: BTreeMap::new(),
         }
     }
 
@@ -352,10 +352,10 @@ impl InclusionProofFetchProtocol {
         }
 
         // Phase 2: group by (source_shard, block_height, peer) and build batch outputs.
-        let mut batches: HashMap<
+        let mut batches: BTreeMap<
             (ShardGroupId, BlockHeight, ValidatorId),
             Vec<(Hash, InclusionProofFetchReason)>,
-        > = HashMap::new();
+        > = BTreeMap::new();
 
         for (winner_tx_hash, peer) in &ready {
             let state = self.pending.get_mut(winner_tx_hash).unwrap();

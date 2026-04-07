@@ -9,7 +9,7 @@ use hyperscale_types::{
     AbortIntent, AbortReason, BlockHeight, Hash, NodeId, RoutableTransaction, ShardGroupId,
     StateEntry, TopologySnapshot, TransactionInclusionProof,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
 use tracing::{debug, trace};
 
@@ -263,10 +263,10 @@ impl LivelockState {
         }
 
         // Group deferral proof requests by (source_shard, block_height).
-        let mut grouped: HashMap<
+        let mut grouped: BTreeMap<
             (ShardGroupId, BlockHeight),
             Vec<(Hash, InclusionProofFetchReason)>,
-        > = HashMap::new();
+        > = BTreeMap::new();
         for output in outputs {
             match output {
                 LivelockOutput::FetchInclusionProof {

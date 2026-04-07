@@ -967,12 +967,16 @@ fn filter_and_deduplicate(
         .filter(|node_id| !is_system_entity(node_id))
         .collect();
 
-    let reads: Vec<NodeId> = reads
+    let mut reads: Vec<NodeId> = reads
         .into_iter()
         .filter(|node_id| !is_system_entity(node_id) && !writes.contains(node_id))
         .collect();
+    reads.sort();
 
-    (reads, writes.into_iter().collect())
+    let mut writes: Vec<NodeId> = writes.into_iter().collect();
+    writes.sort();
+
+    (reads, writes)
 }
 
 /// Extract NodeIds from a single V1 instruction.

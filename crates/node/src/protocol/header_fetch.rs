@@ -13,7 +13,7 @@
 
 use hyperscale_metrics as metrics;
 use hyperscale_types::{BlockHeight, CommittedBlockHeader, ShardGroupId, ValidatorId};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use tracing::{debug, trace, warn};
 
 /// Configuration for the header fetch protocol.
@@ -93,7 +93,7 @@ struct PendingHeaderFetch {
 pub struct HeaderFetchProtocol {
     config: HeaderFetchConfig,
     /// Pending fetches keyed by (source_shard, from_height).
-    pending: HashMap<(ShardGroupId, BlockHeight), PendingHeaderFetch>,
+    pending: BTreeMap<(ShardGroupId, BlockHeight), PendingHeaderFetch>,
 }
 
 impl HeaderFetchProtocol {
@@ -101,7 +101,7 @@ impl HeaderFetchProtocol {
     pub fn new(config: HeaderFetchConfig) -> Self {
         Self {
             config,
-            pending: HashMap::new(),
+            pending: BTreeMap::new(),
         }
     }
 

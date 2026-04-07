@@ -540,12 +540,13 @@ impl ExecutionState {
 
         // Replay any early execution results that arrived before wave setup
         // (e.g. speculative execution completing before on_block_committed).
-        let early_tx_hashes: Vec<Hash> = self
+        let mut early_tx_hashes: Vec<Hash> = self
             .early_execution_results
             .keys()
             .filter(|h| self.wave_assignments.contains_key(h))
             .copied()
             .collect();
+        early_tx_hashes.sort();
         if !early_tx_hashes.is_empty() {
             tracing::debug!(
                 block_hash = ?block_hash,
@@ -665,6 +666,9 @@ impl ExecutionState {
                 tx_outcomes,
             });
         }
+
+        // Sort for deterministic ordering (accumulators is a HashMap).
+        completions.sort_by(|a, b| (&a.block_hash, &a.wave_id).cmp(&(&b.block_hash, &b.wave_id)));
 
         completions
     }

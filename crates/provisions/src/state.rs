@@ -16,7 +16,7 @@ use hyperscale_types::{
     BlockHeight, CommittedBlockHeader, Hash, NodeId, ProvisionBatch, ShardGroupId, StateProvision,
     TopologySnapshot, ValidatorId,
 };
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, warn};
@@ -99,7 +99,7 @@ pub struct ProvisionCoordinator {
 
     /// Verified provision batches keyed by (source_shard, block_height).
     /// Stored whole after proof verification — no per-tx decomposition.
-    verified_batches: HashMap<(ShardGroupId, BlockHeight), ProvisionBatch>,
+    verified_batches: BTreeMap<(ShardGroupId, BlockHeight), ProvisionBatch>,
 
     // ═══════════════════════════════════════════════════════════════════
     // Expected Provision Tracking (fallback detection)
@@ -111,7 +111,7 @@ pub struct ProvisionCoordinator {
     /// Keyed by `(source_shard, block_height)`. Populated when a remote
     /// header's `waves` field targets our shard. Cleared when
     /// provisions are verified or the associated transactions are cleaned up.
-    expected_provisions: HashMap<(ShardGroupId, BlockHeight), ExpectedProvision>,
+    expected_provisions: BTreeMap<(ShardGroupId, BlockHeight), ExpectedProvision>,
 
     // ═══════════════════════════════════════════════════════════════════
     // Time
@@ -145,9 +145,9 @@ impl ProvisionCoordinator {
             registered_txs: HashMap::new(),
             verified_remote_headers: HashMap::new(),
             pending_provisions: HashMap::new(),
-            verified_batches: HashMap::new(),
+            verified_batches: BTreeMap::new(),
             local_committed_height: BlockHeight(0),
-            expected_provisions: HashMap::new(),
+            expected_provisions: BTreeMap::new(),
             now: Duration::ZERO,
         }
     }

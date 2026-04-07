@@ -4214,12 +4214,13 @@ impl BftState {
 
         // Find pending blocks that need any of these receipts.
         // Build list first to avoid borrow conflicts.
-        let block_hashes: Vec<Hash> = self
+        let mut block_hashes: Vec<Hash> = self
             .pending_blocks
             .iter()
             .filter(|(_, pending)| tx_hashes.iter().any(|h| pending.needs_receipt(h)))
             .map(|(hash, _)| *hash)
             .collect();
+        block_hashes.sort();
 
         for block_hash in block_hashes {
             let (is_complete, needs_construct, still_missing) = {
@@ -4286,12 +4287,13 @@ impl BftState {
         let mut actions = Vec::new();
 
         // Find pending blocks that need this transaction
-        let block_hashes: Vec<Hash> = self
+        let mut block_hashes: Vec<Hash> = self
             .pending_blocks
             .iter()
             .filter(|(_, pending)| pending.needs_transaction(&tx_hash))
             .map(|(hash, _)| *hash)
             .collect();
+        block_hashes.sort();
 
         for block_hash in block_hashes {
             if let Some(pending) = self.pending_blocks.get_mut(&block_hash) {
@@ -4343,12 +4345,13 @@ impl BftState {
         let mut actions = Vec::new();
 
         // Find pending blocks that need this certificate
-        let block_hashes: Vec<Hash> = self
+        let mut block_hashes: Vec<Hash> = self
             .pending_blocks
             .iter()
             .filter(|(_, pending)| pending.missing_certificates().contains(&cert_hash))
             .map(|(hash, _)| *hash)
             .collect();
+        block_hashes.sort();
 
         for block_hash in block_hashes {
             if let Some(pending) = self.pending_blocks.get_mut(&block_hash) {
