@@ -85,21 +85,44 @@ fn make_storage_key(entity_key: &[u8], partition_num: u8, sort_key: &[u8]) -> Ve
     key
 }
 
-/// Adapter that bridges `ReadableTreeStore` → JVT `TreeReader`.
+/// Adapter that bridges `ReadableTreeStore` → JVT `TreeReader`,
+/// with an optional in-memory `NodeCache` read layer. When a cache is
+/// provided, hot tree nodes (root, upper internal nodes) are served
+/// from memory, avoiding RocksDB point reads on the critical path.
 struct StoreAdapter<'a, S> {
     store: &'a S,
+    node_cache: Option<&'a NodeCache>,
 }
 
 impl<S: ReadableTreeStore> jvt::TreeReader for StoreAdapter<'_, S> {
     fn get_node(&self, key: &jvt::NodeKey) -> Option<Arc<jvt::Node>> {
+        // Fast path: serve from in-memory cache.
+        if let Some(nc) = self.node_cache {
+            if let Some(node) = nc.get(key) {
+                return Some(node);
+            }
+        }
+        // Slow path: RocksDB read + deserialize.
         let stored_key = StoredNodeKey::from_jvt(key);
-        self.store
+        let node = self
+            .store
             .get_node(&stored_key)
-            .map(|sn| Arc::new(sn.to_jvt()))
+            .map(|sn| Arc::new(sn.to_jvt()));
+        // Populate cache on miss so subsequent blocks benefit.
+        if let (Some(nc), Some(ref n)) = (self.node_cache, &node) {
+            nc.insert(key.clone(), Arc::clone(n));
+        }
+        node
     }
 
     fn get_root_key(&self, version: u64) -> Option<jvt::NodeKey> {
         let root = jvt::NodeKey::root(version);
+        // Check cache first for root node existence.
+        if let Some(nc) = self.node_cache {
+            if nc.get(&root).is_some() {
+                return Some(root);
+            }
+        }
         let stored_key = StoredNodeKey::from_jvt(&root);
         if self.store.get_node(&stored_key).is_some() {
             Some(root)
@@ -282,7 +305,10 @@ pub fn put_at_version<S: ReadableTreeStore + Sync>(
         "put_at_version: new_version ({new_version}) must be greater than parent_version ({parent_version:?})"
     );
 
-    let adapter = StoreAdapter { store: tree_store };
+    let adapter = StoreAdapter {
+        store: tree_store,
+        node_cache,
+    };
 
     // Flatten all database updates into JVT key-value pairs.
     // Key: BLAKE3(storage_key) → [u8; 32]
