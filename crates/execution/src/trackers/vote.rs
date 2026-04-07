@@ -188,6 +188,30 @@ impl VoteTracker {
         self.votes_by_key.remove(&key).unwrap_or_default()
     }
 
+    /// Return the total verified voting power across all (receipt_root, vote_height) groups.
+    pub fn total_verified_power(&self) -> u64 {
+        self.power_by_key.values().sum()
+    }
+
+    /// Return the number of distinct receipt roots across all verified vote groups.
+    pub fn distinct_receipt_root_count(&self) -> usize {
+        self.power_by_key
+            .keys()
+            .map(|(root, _)| root)
+            .collect::<HashSet<_>>()
+            .len()
+    }
+
+    /// Return a summary of verified voting power per receipt root (summed across vote heights).
+    /// Used for diagnostics when quorum cannot be reached.
+    pub fn receipt_root_power_summary(&self) -> Vec<(Hash, u64)> {
+        let mut by_root: BTreeMap<Hash, u64> = BTreeMap::new();
+        for (&(root, _), &power) in &self.power_by_key {
+            *by_root.entry(root).or_insert(0) += power;
+        }
+        by_root.into_iter().collect()
+    }
+
     /// Get votes for a specific receipt root at any height (for tests).
     #[cfg(test)]
     pub fn votes_for_receipt_root(&self, receipt_root: &Hash) -> Vec<&ExecutionVote> {

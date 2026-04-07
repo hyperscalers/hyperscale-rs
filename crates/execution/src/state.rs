@@ -33,9 +33,9 @@
 use hyperscale_core::{Action, CrossShardExecutionRequest, ProtocolEvent, ProvisionRequest};
 use hyperscale_types::{
     AbortReason, BlockHeight, Bls12381G1PublicKey, DatabaseUpdates, ExecutionResult, ExecutionVote,
-    Hash, NodeId, ProvisionBatch, ReceiptBundle, RoutableTransaction, ShardExecutionProof,
-    ShardGroupId, StateProvision, TopologySnapshot, TransactionCertificate, TransactionDecision,
-    TxExecutionOutcome, TxOutcome, ValidatorId, WaveId,
+    Hash, LedgerTransactionReceipt, NodeId, ProvisionBatch, ReceiptBundle, RoutableTransaction,
+    ShardExecutionProof, ShardGroupId, StateProvision, TopologySnapshot, TransactionCertificate,
+    TransactionDecision, TxExecutionOutcome, TxOutcome, ValidatorId, WaveId,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -795,6 +795,47 @@ impl ExecutionState {
         actions
     }
 
+    /// Overwrite stored receipts for transactions the EC declares as aborted.
+    ///
+    /// The EC is the canonical source of truth for abort decisions. Speculative
+    /// or canonical execution may have already stored a success receipt before
+    /// the abort was decided at the aggregated vote_height. This replaces those
+    /// stale receipts with `LedgerTransactionReceipt::failure()` so that any
+    /// downstream consumer (sync, RPC, state root) sees a consistent abort.
+    ///
+    /// Only processes the LOCAL shard's EC — remote shard ECs don't produce
+    /// local receipts.
+    fn overwrite_aborted_receipts(
+        &self,
+        certificate: &hyperscale_types::ExecutionCertificate,
+    ) -> Vec<Action> {
+        let abort_bundles: Vec<ReceiptBundle> = certificate
+            .tx_outcomes
+            .iter()
+            .filter(|o| o.is_aborted())
+            .map(|o| ReceiptBundle {
+                tx_hash: o.tx_hash,
+                ledger_receipt: Arc::new(LedgerTransactionReceipt::failure()),
+                local_execution: None,
+            })
+            .collect();
+
+        if abort_bundles.is_empty() {
+            return vec![];
+        }
+
+        tracing::debug!(
+            block_hash = ?certificate.block_hash,
+            wave = %certificate.wave_id,
+            abort_count = abort_bundles.len(),
+            "Overwriting receipts for EC-aborted transactions"
+        );
+
+        vec![Action::StoreReceiptBundles {
+            bundles: abort_bundles,
+        }]
+    }
+
     /// Scan complete waves and emit `SignAndSendExecutionVote` actions.
     ///
     /// This is the SINGLE path to execution voting. Call after abort intents
@@ -967,6 +1008,23 @@ impl ExecutionState {
             tracker.add_verified_vote(vote, power);
         }
 
+        // Warn if we have enough total power for quorum but it's split
+        // across multiple receipt roots — this means validators disagree
+        // on execution results.
+        if tracker.check_quorum().is_none()
+            && tracker.total_verified_power() >= topology.local_quorum_threshold()
+            && tracker.distinct_receipt_root_count() > 1
+        {
+            let summary = tracker.receipt_root_power_summary();
+            tracing::warn!(
+                block_hash = ?key.0,
+                wave = %key.1,
+                receipt_root_split = ?summary,
+                quorum = topology.local_quorum_threshold(),
+                "Execution vote quorum blocked: receipt roots are split across validators"
+            );
+        }
+
         let mut actions = self.check_vote_quorum(topology, key.clone());
         actions.extend(self.maybe_trigger_vote_verification(key));
         actions
@@ -1090,6 +1148,11 @@ impl ExecutionState {
             "Wave leader broadcasting EC to local peers + remote shards"
         );
 
+        // The EC is canonical — if it says a tx is aborted, the stored receipt
+        // must reflect that. Speculative or canonical execution may have stored
+        // a success receipt before the abort was decided. Overwrite now.
+        actions.extend(self.overwrite_aborted_receipts(&certificate));
+
         // Feed each tx's outcome to per-tx CertificateTracker for finalization.
         // Deferred/aborted txs (Hash::ZERO) are filtered by handle_certificate_internal.
         let ec_hash = certificate.canonical_hash();
@@ -1209,9 +1272,14 @@ impl ExecutionState {
         if shard == topology.local_shard() {
             let wave_key = (certificate.block_hash, certificate.wave_id.clone());
             self.waves_with_ec.insert(wave_key);
+            let cert_arc = Arc::new(certificate.clone());
             actions.push(Action::PersistExecutionCertificate {
-                certificate: Arc::new(certificate.clone()),
+                certificate: cert_arc.clone(),
             });
+
+            // The EC is canonical — overwrite any stale success receipts for
+            // transactions the EC declares as aborted.
+            actions.extend(self.overwrite_aborted_receipts(&cert_arc));
         }
 
         // Extract per-tx outcomes — feed to tracker if exists, buffer otherwise
@@ -1968,10 +2036,34 @@ impl ExecutionState {
         self.accumulators.retain(|key, _| active_keys.contains(key));
         let pruned_acc = before_acc - self.accumulators.len();
 
-        // Prune vote trackers and waves_with_ec — same keys as accumulators
+        // Prune vote trackers and waves_with_ec — same keys as accumulators.
+        // Warn about any vote trackers being pruned with split receipt roots
+        // (they never reached quorum, possibly due to non-deterministic execution).
         let before_vt = self.vote_trackers.len();
-        self.vote_trackers
-            .retain(|key, _| self.accumulators.contains_key(key));
+        self.vote_trackers.retain(|key, tracker| {
+            if self.accumulators.contains_key(key) {
+                return true;
+            }
+            // About to prune — log diagnostic if there was a receipt root split
+            let root_count = tracker.distinct_receipt_root_count();
+            if root_count > 1 {
+                let summary = tracker.receipt_root_power_summary();
+                tracing::warn!(
+                    block_hash = ?key.0,
+                    wave = %key.1,
+                    receipt_root_split = ?summary,
+                    "Pruning vote tracker that never reached quorum — receipt roots were split"
+                );
+            } else if tracker.total_verified_power() > 0 {
+                tracing::warn!(
+                    block_hash = ?key.0,
+                    wave = %key.1,
+                    verified_power = tracker.total_verified_power(),
+                    "Pruning vote tracker that never reached quorum — insufficient votes"
+                );
+            }
+            false
+        });
         let pruned_vt = before_vt - self.vote_trackers.len();
         self.waves_with_ec
             .retain(|key| self.accumulators.contains_key(key));
