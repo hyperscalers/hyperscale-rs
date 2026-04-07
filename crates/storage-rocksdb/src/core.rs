@@ -180,7 +180,6 @@ impl RocksDbStorage {
             db: Arc::new(db),
             commit_lock: Mutex::new(()),
             jvt_history_length: config.jvt_history_length,
-            node_cache: hyperscale_storage::jmt::NodeCache::new(50_000),
         })
     }
 
@@ -535,6 +534,13 @@ impl ReadableTreeStore for RocksDbStorage {
     fn get_node(&self, key: &StoredNodeKey) -> Option<StoredNode> {
         self.cf_get::<crate::column_families::JvtNodesCf>(key)
             .map(|v| v.into_latest())
+    }
+
+    fn get_nodes_batch(&self, keys: &[StoredNodeKey]) -> Vec<Option<StoredNode>> {
+        self.cf_multi_get::<crate::column_families::JvtNodesCf>(keys)
+            .into_iter()
+            .map(|opt| opt.map(|v| v.into_latest()))
+            .collect()
     }
 }
 
