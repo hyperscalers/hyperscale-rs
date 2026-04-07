@@ -891,6 +891,23 @@ impl BftState {
             }];
         }
 
+        // Skip if a BuildProposal is already in-flight for this height.
+        // The timer fires every proposal_interval (1s), but block building
+        // can take longer (especially with many certificates). Without this
+        // guard, each tick spawns a redundant build on the thread pool —
+        // wasting CPU and delaying the first build via thread contention.
+        if let Some(ref pending) = self.pending_proposal {
+            if pending.height.0 == next_height && pending.round == round {
+                trace!(
+                    validator = ?topology.local_validator_id(),
+                    height = next_height,
+                    round = round,
+                    "Proposal build already in-flight, skipping"
+                );
+                return actions;
+            }
+        }
+
         // Check if we've already voted at this height.
         // If we have, don't propose again - we're committed to that block.
         // Re-proposing would create a different block hash (due to timestamp)
