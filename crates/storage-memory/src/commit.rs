@@ -52,7 +52,7 @@ impl CommitStore for SimStorage {
             block_height,
             merged_updates,
             &Default::default(),
-            None,
+            &self.node_cache,
         );
 
         let snapshot = JvtSnapshot::from_collected_writes(
@@ -179,7 +179,7 @@ impl CommitStore for SimStorage {
             block_height,
             merged_updates,
             &Default::default(),
-            None,
+            &self.node_cache,
         );
 
         collected.apply_to(&s.tree_store);
@@ -205,5 +205,9 @@ impl CommitStore for SimStorage {
         }
 
         new_root
+    }
+
+    fn node_cache_len(&self) -> usize {
+        self.node_cache.len()
     }
 }

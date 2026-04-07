@@ -459,7 +459,7 @@ impl RocksDbStorage {
             0,
             merged,
             &Default::default(),
-            Some(&self.node_cache),
+            &self.node_cache,
         );
         let jvt_snapshot =
             JvtSnapshot::from_collected_writes(collected, StateRootHash::ZERO, 0, root, 0);
@@ -571,7 +571,7 @@ impl RocksDbStorage {
             new_version,
             updates,
             &reset_old_keys,
-            Some(&self.node_cache),
+            &self.node_cache,
         );
         let jvt_snapshot = JvtSnapshot::from_collected_writes(
             collected,

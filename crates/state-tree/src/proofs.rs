@@ -190,7 +190,7 @@ pub fn generate_proof<S: ReadableTreeStore>(
     tree_store: &S,
     storage_keys: &[Vec<u8>],
     block_height: u64,
-    node_cache: Option<&crate::NodeCache>,
+    node_cache: &crate::NodeCache,
 ) -> Option<SubstateInclusionProof> {
     let root_key = jvt::NodeKey::root(block_height);
 

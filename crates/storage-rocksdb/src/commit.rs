@@ -140,7 +140,7 @@ impl hyperscale_storage::CommitStore for RocksDbStorage {
             block_height,
             merged_updates,
             &reset_old_keys,
-            Some(&self.node_cache),
+            &self.node_cache,
         );
         let jvt_snapshot = JvtSnapshot::from_collected_writes(
             collected,

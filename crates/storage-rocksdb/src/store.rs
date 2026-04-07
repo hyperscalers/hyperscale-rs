@@ -113,7 +113,7 @@ impl SubstateStore for RocksDbStorage {
             &snapshot_store,
             storage_keys,
             block_height,
-            Some(&self.node_cache),
+            &self.node_cache,
         )
     }
 }
@@ -167,7 +167,7 @@ impl RocksDbStorage {
             block_height,
             &merged,
             &Default::default(),
-            Some(&self.node_cache),
+            &self.node_cache,
         );
 
         let snapshot = JvtSnapshot::from_collected_writes(

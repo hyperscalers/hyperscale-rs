@@ -6,8 +6,8 @@
 use crate::state::{apply_updates_to_ordmap, ConsensusState, SharedState};
 
 use hyperscale_storage::{
-    keys, DatabaseUpdates, DbPartitionKey, DbSortKey, DbSubstateValue, PartitionEntry,
-    SubstateDatabase,
+    jmt::NodeCache, keys, DatabaseUpdates, DbPartitionKey, DbSortKey, DbSubstateValue,
+    PartitionEntry, SubstateDatabase,
 };
 use hyperscale_types::Hash;
 #[cfg(test)]
@@ -41,6 +41,10 @@ pub struct SimStorage {
 
     /// Consensus metadata (single RwLock).
     pub(crate) consensus: RwLock<ConsensusState>,
+
+    /// JVT node cache — enables speculative proof generation at proposal time
+    /// (before the block is committed to the tree store).
+    pub(crate) node_cache: NodeCache,
 }
 
 impl Default for SimStorage {
@@ -55,6 +59,7 @@ impl SimStorage {
         Self {
             state: Arc::new(RwLock::new(SharedState::new())),
             consensus: RwLock::new(ConsensusState::new()),
+            node_cache: NodeCache::new(50_000),
         }
     }
 
@@ -67,6 +72,7 @@ impl SimStorage {
     pub fn clear(&mut self) {
         *self.state.write().unwrap() = SharedState::new();
         *self.consensus.write().unwrap() = ConsensusState::new();
+        self.node_cache = NodeCache::new(50_000);
     }
 
     /// Get number of substate keys stored.
@@ -147,7 +153,7 @@ impl SimStorage {
             new_version,
             updates,
             &Default::default(),
-            None,
+            &self.node_cache,
         );
 
         collected.apply_to(&s.tree_store);
@@ -197,7 +203,7 @@ impl SimStorage {
             0,
             merged,
             &Default::default(),
-            None,
+            &self.node_cache,
         );
 
         collected.apply_to(&s.tree_store);

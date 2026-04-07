@@ -13,7 +13,7 @@ pub fn generate_proof<S: ReadableTreeStore>(
     tree_store: &S,
     storage_keys: &[Vec<u8>],
     block_height: u64,
-    node_cache: Option<&hyperscale_state_tree::NodeCache>,
+    node_cache: &hyperscale_state_tree::NodeCache,
 ) -> Option<SubstateInclusionProof> {
     hyperscale_state_tree::proofs::generate_proof(
         tree_store,
