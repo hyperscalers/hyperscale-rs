@@ -78,9 +78,6 @@ struct ProposalInputs {
     ready_txs: ReadyTransactions,
     abort_intents: Vec<AbortIntent>,
     certificates: Vec<Arc<TransactionCertificate>>,
-    /// Pre-computed per-certificate database updates for proposal building.
-    /// Keyed by transaction hash; excludes aborted certificates (no state changes).
-    cert_updates: std::collections::HashMap<Hash, Arc<hyperscale_types::DatabaseUpdates>>,
 }
 
 impl NodeStateMachine {
@@ -252,13 +249,10 @@ impl NodeStateMachine {
             timed_out.into_iter().chain(livelock_intents).collect();
         let certificates = self.execution.get_finalized_certificates();
 
-        let cert_updates = self.execution.proposal_cert_updates(&certificates);
-
         ProposalInputs {
             ready_txs,
             abort_intents,
             certificates,
-            cert_updates,
         }
     }
 
@@ -326,7 +320,6 @@ impl NodeStateMachine {
             &inputs.ready_txs,
             inputs.abort_intents,
             inputs.certificates,
-            &inputs.cert_updates,
             &finalized,
         )
     }
@@ -381,7 +374,7 @@ impl NodeStateMachine {
             manifest,
             |h| self.mempool.get_transaction(h),
             |h| self.execution.get_finalized_certificate(h),
-            |h| self.execution.has_cached_updates(h),
+            |h| self.execution.has_finalized_certificate(h),
         );
         actions.extend(spec_actions);
         actions
@@ -407,7 +400,6 @@ impl NodeStateMachine {
             &inputs.ready_txs,
             inputs.abort_intents,
             inputs.certificates,
-            &inputs.cert_updates,
             &finalized,
         )
     }
@@ -913,15 +905,15 @@ impl StateMachine for NodeStateMachine {
         };
 
         // Drain any state root verifications that became ready during this event.
-        // The BFT verification pipeline queues these; we compute merged_updates
-        // from the execution cache and emit VerifyStateRoot actions.
+        // The BFT verification pipeline queues these; DatabaseUpdates are derived
+        // from receipts on the thread pool (not from the local execution cache).
         for ready in self.bft.drain_ready_state_root_verifications() {
-            let per_cert_updates = self.execution.updates_for_tx_hashes(&ready.cert_tx_hashes);
             actions.push(Action::VerifyStateRoot {
                 block_hash: ready.block_hash,
                 parent_state_root: ready.parent_state_root,
                 expected_root: ready.expected_root,
-                per_cert_updates,
+                cert_tx_hashes: ready.cert_tx_hashes,
+                per_cert_declared_nodes: ready.per_cert_declared_nodes,
                 block_height: ready.block_height,
             });
         }

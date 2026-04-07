@@ -253,11 +253,32 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
             block_hash,
             parent_state_root,
             expected_root,
-            per_cert_updates,
+            cert_tx_hashes,
+            per_cert_declared_nodes,
             block_height,
         } => {
             let start = std::time::Instant::now();
-            let merged = hyperscale_storage::merge_database_updates_from_arcs(&per_cert_updates);
+            // Derive DatabaseUpdates from receipts (the quorum-agreed artifact).
+            let per_cert: Vec<hyperscale_types::DatabaseUpdates> = cert_tx_hashes
+                .iter()
+                .zip(per_cert_declared_nodes.iter())
+                .map(|(tx_hash, declared_nodes)| {
+                    let receipt = ctx.storage.get_ledger_receipt(tx_hash).unwrap_or_else(|| {
+                        panic!(
+                            "BUG: receipt missing for {} during state root verification at height {}",
+                            tx_hash, block_height
+                        )
+                    });
+                    hyperscale_engine::sharding::derive_shard_updates_from_receipt(
+                        &receipt,
+                        ctx.local_shard,
+                        ctx.num_shards,
+                        ctx.storage,
+                        declared_nodes,
+                    )
+                })
+                .collect();
+            let merged = hyperscale_storage::merge_database_updates(&per_cert);
             let result = hyperscale_bft::handlers::verify_state_root(
                 ctx.storage,
                 parent_state_root,
@@ -293,12 +314,44 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
             parent_state_root,
             transactions,
             certificates,
-            per_cert_updates,
             abort_intents,
             waves,
         } => {
-            let merged_updates =
-                hyperscale_storage::merge_database_updates_from_arcs(&per_cert_updates);
+            // Derive DatabaseUpdates from receipts for non-aborted certificates.
+            let per_cert: Vec<hyperscale_types::DatabaseUpdates> = certificates
+                .iter()
+                .filter(|c| c.decision != hyperscale_types::TransactionDecision::Aborted)
+                .map(|c| {
+                    let declared_nodes: Vec<hyperscale_types::NodeId> = transactions
+                        .iter()
+                        .find(|tx| tx.hash() == c.transaction_hash)
+                        .map(|tx| {
+                            tx.declared_reads
+                                .iter()
+                                .chain(tx.declared_writes.iter())
+                                .copied()
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let receipt = ctx
+                        .storage
+                        .get_ledger_receipt(&c.transaction_hash)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "BUG: receipt missing for {} during proposal at height {}",
+                                c.transaction_hash, height.0
+                            )
+                        });
+                    hyperscale_engine::sharding::derive_shard_updates_from_receipt(
+                        &receipt,
+                        ctx.local_shard,
+                        ctx.num_shards,
+                        ctx.storage,
+                        &declared_nodes,
+                    )
+                })
+                .collect();
+            let merged_updates = hyperscale_storage::merge_database_updates(&per_cert);
             let result = hyperscale_bft::handlers::build_proposal(
                 ctx.storage,
                 proposer,

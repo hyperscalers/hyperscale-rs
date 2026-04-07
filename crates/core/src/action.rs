@@ -423,9 +423,12 @@ pub enum Action {
         parent_state_root: Hash,
         /// Expected state root after applying writes.
         expected_root: Hash,
-        /// Per-certificate DatabaseUpdates (pre-filtered to local shard).
-        /// Merged on the thread pool before verification.
-        per_cert_updates: Vec<Arc<DatabaseUpdates>>,
+        /// Transaction hashes of non-aborted certificates. Receipts are fetched
+        /// from storage on the thread pool to derive DatabaseUpdates.
+        cert_tx_hashes: Vec<Hash>,
+        /// Per-certificate declared nodes (parallel to cert_tx_hashes).
+        /// Used by filter_updates_for_shard for deterministic shard filtering.
+        per_cert_declared_nodes: Vec<Vec<NodeId>>,
         /// Block height (used as JVT version).
         block_height: u64,
     },
@@ -497,9 +500,6 @@ pub enum Action {
         parent_state_root: Hash,
         transactions: Vec<Arc<RoutableTransaction>>,
         certificates: Vec<Arc<TransactionCertificate>>,
-        /// Per-certificate DatabaseUpdates (pre-filtered to local shard).
-        /// Merged on the thread pool before proposal building.
-        per_cert_updates: Vec<Arc<DatabaseUpdates>>,
         abort_intents: Vec<AbortIntent>,
         /// Cross-shard execution waves in this block.
         waves: Vec<WaveId>,

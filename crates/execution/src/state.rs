@@ -112,14 +112,14 @@ pub struct SpeculativeResult {
 
 /// A finalized certificate with its co-located DatabaseUpdates.
 ///
-/// The `database_updates` are moved here from `pending_execution_updates` at TC
-/// creation time, guaranteeing they're always present when the certificate exists.
-/// This eliminates the previous design where `proposal_cert_updates()` could
-/// silently return empty when the execution cache entry was missing.
+/// A finalized transaction certificate ready for block inclusion.
+///
+/// DatabaseUpdates are NOT stored here — they are derived from the receipt
+/// (the quorum-agreed artifact) at state root computation time. This ensures
+/// all validators produce identical updates regardless of local execution timing.
 #[derive(Debug, Clone)]
 pub struct FinalizedCertEntry {
     pub certificate: Arc<TransactionCertificate>,
-    pub database_updates: Arc<DatabaseUpdates>,
     #[allow(dead_code)] // Used for stale-entry pruning in future
     pub committed_height: u64,
 }
@@ -127,7 +127,7 @@ pub struct FinalizedCertEntry {
 /// Execution memory statistics for monitoring collection sizes.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ExecutionMemoryStats {
-    pub pending_execution_updates: usize,
+    pub receipts_emitted: usize,
     pub finalized_certificates: usize,
     pub pending_provisioning: usize,
     pub accumulators: usize,
@@ -148,19 +148,14 @@ pub struct ExecutionState {
     /// Current time.
     now: Duration,
 
-    /// Write-only holding area for execution DatabaseUpdates between execution
-    /// completion and TC creation. No public read API — data flows through here
-    /// to `finalized_certificates` when the TC is formed.
-    ///
-    /// Populated by `on_execution_batch_completed`.
-    /// Consumed (removed) by `handle_certificate_internal` → `finalized_certificates`.
-    /// Cleaned up by `cleanup_transaction` (abort/defer without TC).
-    pending_execution_updates: HashMap<Hash, Arc<DatabaseUpdates>>,
+    /// Tracks transaction hashes whose receipts have been emitted via
+    /// `StoreReceiptBundles`. Used as a gate for deferred TC creation —
+    /// TC formation requires that the receipt exists so state root verification
+    /// can later derive DatabaseUpdates from it.
+    receipts_emitted: HashSet<Hash>,
 
     /// Finalized transaction certificates ready for block inclusion.
     /// Uses BTreeMap for deterministic iteration order.
-    /// Each entry co-locates the certificate with its DatabaseUpdates,
-    /// guaranteeing updates are always present when the certificate exists.
     finalized_certificates: BTreeMap<Hash, FinalizedCertEntry>,
 
     /// Current committed height for pruning stale entries.
@@ -225,7 +220,7 @@ pub struct ExecutionState {
 
     /// Transactions whose certificate tracker completed but local execution hasn't
     /// finished yet. TC creation is deferred until `on_execution_batch_completed`
-    /// populates `pending_execution_updates` for these tx hashes.
+    /// populates `receipts_emitted` for these tx hashes.
     deferred_tc_creations: HashSet<Hash>,
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -379,7 +374,7 @@ impl ExecutionState {
     ) -> Self {
         Self {
             now: Duration::ZERO,
-            pending_execution_updates: HashMap::new(),
+            receipts_emitted: HashSet::new(),
             finalized_certificates: BTreeMap::new(),
             committed_height: 0,
             pending_provisioning: HashMap::new(),
@@ -428,54 +423,10 @@ impl ExecutionState {
 
     /// Collect per-certificate database updates for proposal building.
     ///
-    /// Reads from `finalized_certificates` where DatabaseUpdates are co-located
-    /// with the certificate — guaranteed present since TC creation.
-    /// Filters out aborted certificates (they carry no state changes).
-    pub fn proposal_cert_updates(
-        &self,
-        certificates: &[Arc<TransactionCertificate>],
-    ) -> HashMap<Hash, Arc<DatabaseUpdates>> {
-        certificates
-            .iter()
-            .filter(|c| c.decision != TransactionDecision::Aborted)
-            .map(|c| {
-                let entry = self.finalized_certificates.get(&c.transaction_hash).unwrap_or_else(|| {
-                    panic!(
-                        "BUG: certificate {} not in finalized_certificates — cannot compute state root",
-                        c.transaction_hash
-                    )
-                });
-                (c.transaction_hash, Arc::clone(&entry.database_updates))
-            })
-            .collect()
-    }
-
-    /// Collect database updates for a set of transaction hashes.
+    /// Check if a finalized certificate exists for a transaction.
     ///
-    /// Returns cheap `Arc` clones from `finalized_certificates`.
-    /// Used by state root verification to gather per-certificate write sets.
-    /// Every tx_hash MUST have a finalized entry — a missing entry means the
-    /// state root will silently diverge.
-    pub fn updates_for_tx_hashes(&self, tx_hashes: &[Hash]) -> Vec<Arc<DatabaseUpdates>> {
-        tx_hashes
-            .iter()
-            .map(|h| {
-                let entry = self.finalized_certificates.get(h).unwrap_or_else(|| {
-                    panic!(
-                        "BUG: tx {} required for state root verification but not in finalized_certificates",
-                        h
-                    )
-                });
-                Arc::clone(&entry.database_updates)
-            })
-            .collect()
-    }
-
-    /// Check if DatabaseUpdates are available for a non-aborted certificate.
-    ///
-    /// Used by BFT pending block receipt tracking. Returns true when the TC
-    /// has been formed and its co-located DatabaseUpdates are available.
-    pub fn has_cached_updates(&self, tx_hash: &Hash) -> bool {
+    /// Used by BFT pending block receipt tracking.
+    pub fn has_finalized_certificate(&self, tx_hash: &Hash) -> bool {
         self.finalized_certificates.contains_key(tx_hash)
     }
 
@@ -758,7 +709,11 @@ impl ExecutionState {
                 });
             }
 
-            self.pending_execution_updates.insert(tx_hash, db_updates);
+            // Track that we've emitted a receipt for this tx.
+            // Used as a gate for deferred TC creation.
+            if !dominated {
+                self.receipts_emitted.insert(tx_hash);
+            }
         }
 
         // Dispatch receipt storage (fire-and-forget, off main thread)
@@ -784,13 +739,13 @@ impl ExecutionState {
             );
         }
 
-        // Drain deferred TC creations now that execution updates are available.
+        // Drain deferred TC creations now that receipts are available.
         // A deferred TC means the certificate tracker completed (all shard proofs
-        // collected) before local execution finished. Now we have the updates.
+        // collected) before local execution finished. Now the receipt is emitted.
         let deferred: Vec<Hash> = self
             .deferred_tc_creations
             .iter()
-            .filter(|h| self.pending_execution_updates.contains_key(h))
+            .filter(|h| self.receipts_emitted.contains(h))
             .copied()
             .collect();
         for tx_hash in deferred {
@@ -805,23 +760,18 @@ impl ExecutionState {
             tracing::debug!(
                 tx_hash = %tx_hash,
                 accepted,
-                "Deferred TC creation — execution updates now available"
+                "Deferred TC creation — receipt now available"
             );
 
             actions.push(Action::PersistTransactionCertificate {
                 certificate: tx_cert.clone(),
             });
 
-            let database_updates = self
-                .pending_execution_updates
-                .remove(&tx_hash)
-                .expect("just checked contains_key");
-
+            self.receipts_emitted.remove(&tx_hash);
             self.finalized_certificates.insert(
                 tx_hash,
                 FinalizedCertEntry {
                     certificate: Arc::new(tx_cert),
-                    database_updates,
                     committed_height: self.committed_height,
                 },
             );
@@ -1871,24 +1821,23 @@ impl ExecutionState {
                     certificate: tx_cert.clone(),
                 });
 
-                // Co-locate DatabaseUpdates with the certificate. The updates were
-                // stored in pending_execution_updates when execution completed.
-                // If local execution hasn't finished yet (we formed the TC from
-                // other validators' ECs), defer TC creation until execution completes.
-                let Some(database_updates) = self.pending_execution_updates.remove(&tx_hash) else {
+                // Gate on receipt availability: the receipt must have been emitted
+                // (via StoreReceiptBundles) so that state root verification can
+                // later derive DatabaseUpdates from it. If local execution hasn't
+                // finished yet, defer TC creation until the receipt is emitted.
+                if !self.receipts_emitted.remove(&tx_hash) {
                     tracing::debug!(
                         tx_hash = %tx_hash,
-                        "Certificate tracker complete but local execution not finished — deferring TC creation"
+                        "Certificate tracker complete but receipt not yet emitted — deferring TC creation"
                     );
                     self.deferred_tc_creations.insert(tx_hash);
                     return actions;
-                };
+                }
 
                 self.finalized_certificates.insert(
                     tx_hash,
                     FinalizedCertEntry {
                         certificate: Arc::new(tx_cert),
-                        database_updates,
                         committed_height: self.committed_height,
                     },
                 );
@@ -1942,9 +1891,8 @@ impl ExecutionState {
     pub fn remove_finalized_certificate(&mut self, tx_hash: &Hash, decision: TransactionDecision) {
         self.finalized_certificates.remove(tx_hash);
 
-        // Clean up pending_execution_updates in case TC was never formed for this tx
-        // (shouldn't happen normally, but ensures no leak on unusual code paths).
-        self.pending_execution_updates.remove(tx_hash);
+        // Clean up receipts_emitted in case TC was never formed for this tx.
+        self.receipts_emitted.remove(tx_hash);
 
         // Clean up all transaction tracking state now that it's finalized.
         // This is the same cleanup done by cleanup_transaction() for aborts/deferrals,
@@ -2159,8 +2107,8 @@ impl ExecutionState {
             return;
         }
 
-        // Evict pending execution updates — transaction is being retried or abandoned.
-        self.pending_execution_updates.remove(tx_hash);
+        // Evict receipt tracking — transaction is being retried or abandoned.
+        self.receipts_emitted.remove(tx_hash);
 
         // Phase 1-2: Provisioning cleanup
         // Note: Provision tracking is handled by ProvisionCoordinator
@@ -2702,7 +2650,7 @@ impl ExecutionState {
     /// Get execution memory statistics for monitoring collection sizes.
     pub fn memory_stats(&self) -> ExecutionMemoryStats {
         ExecutionMemoryStats {
-            pending_execution_updates: self.pending_execution_updates.len(),
+            receipts_emitted: self.receipts_emitted.len(),
             finalized_certificates: self.finalized_certificates.len(),
             pending_provisioning: self.pending_provisioning.len(),
             accumulators: self.accumulators.len(),

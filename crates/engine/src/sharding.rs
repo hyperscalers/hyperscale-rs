@@ -237,6 +237,25 @@ pub fn filter_updates_for_shard<S: SubstateDatabase>(
     filtered
 }
 
+/// Derive shard-filtered `DatabaseUpdates` from a ledger receipt.
+///
+/// Single entry point used by both the consensus path (state root verification,
+/// proposal building) and the sync path (block catch-up). Ensures all validators
+/// produce identical `DatabaseUpdates` from the same quorum-agreed receipt.
+///
+/// Steps: `receipt_to_database_updates` (pure) → `filter_updates_for_shard` (deterministic
+/// given the same committed storage state and declared nodes).
+pub fn derive_shard_updates_from_receipt<S: SubstateDatabase>(
+    receipt: &hyperscale_types::LedgerTransactionReceipt,
+    local_shard: ShardGroupId,
+    num_shards: u64,
+    storage: &S,
+    declared_nodes: &[NodeId],
+) -> DatabaseUpdates {
+    let updates = receipt_to_database_updates(receipt);
+    filter_updates_for_shard(&updates, local_shard, num_shards, storage, declared_nodes)
+}
+
 // ============================================================================
 // Utilities
 // ============================================================================

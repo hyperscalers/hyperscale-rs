@@ -1087,7 +1087,7 @@ where
             bft_pending_state_root_verifications: bft_mem.pending_state_root_verifications,
             bft_buffered_synced_blocks: bft_mem.buffered_synced_blocks,
             // Execution
-            exec_cache_entries: exec_mem.pending_execution_updates,
+            exec_cache_entries: exec_mem.receipts_emitted,
             exec_finalized_certificates: exec_mem.finalized_certificates,
             exec_pending_provisioning: exec_mem.pending_provisioning,
             exec_accumulators: exec_mem.accumulators,

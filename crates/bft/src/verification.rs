@@ -5,7 +5,7 @@
 //! retaining control-flow decisions (voting, block rejection).
 
 use hyperscale_types::{
-    AbortIntent, AbortReason, Block, BlockHeader, BlockHeight, CommittedBlockHeader, Hash,
+    AbortIntent, AbortReason, Block, BlockHeader, BlockHeight, CommittedBlockHeader, Hash, NodeId,
     ShardGroupId,
 };
 use std::collections::{HashMap, HashSet};
@@ -37,9 +37,10 @@ struct PendingStateRootVerification {
     required_root: Hash,
     /// The state root claimed by the proposer (to verify against).
     expected_root: Hash,
-    /// Transaction hashes of the certificates in the block. Used to look up
-    /// DatabaseUpdates from the execution cache when the JVT catches up.
+    /// Transaction hashes of the non-aborted certificates in the block.
     cert_tx_hashes: Vec<Hash>,
+    /// Per-certificate declared nodes (parallel to cert_tx_hashes).
+    per_cert_declared_nodes: Vec<Vec<NodeId>>,
     /// Block height (used as JVT version).
     block_height: u64,
 }
@@ -54,6 +55,7 @@ pub struct ReadyStateRootVerification {
     pub parent_state_root: Hash,
     pub expected_root: Hash,
     pub cert_tx_hashes: Vec<Hash>,
+    pub per_cert_declared_nodes: Vec<Vec<NodeId>>,
     pub block_height: u64,
 }
 
@@ -358,11 +360,33 @@ impl VerificationPipeline {
         // Only include non-Aborted certificates in the state root computation.
         // Aborted TCs have no state changes — this matches the sync path which
         // also excludes Aborted certificates when reconstructing DatabaseUpdates.
-        let cert_tx_hashes: Vec<Hash> = block
+        // Build parallel vectors: cert_tx_hashes + per_cert_declared_nodes.
+        // Only non-aborted certificates contribute to state root computation.
+        let non_aborted: Vec<_> = block
             .certificates
             .iter()
             .filter(|c| c.decision != hyperscale_types::TransactionDecision::Aborted)
-            .map(|c| c.transaction_hash)
+            .collect();
+
+        let cert_tx_hashes: Vec<Hash> = non_aborted.iter().map(|c| c.transaction_hash).collect();
+
+        // Extract declared nodes for each certificate from the block's transactions.
+        let per_cert_declared_nodes: Vec<Vec<NodeId>> = cert_tx_hashes
+            .iter()
+            .map(|tx_hash| {
+                block
+                    .transactions
+                    .iter()
+                    .find(|tx| &tx.hash() == tx_hash)
+                    .map(|tx| {
+                        tx.declared_reads
+                            .iter()
+                            .chain(tx.declared_writes.iter())
+                            .copied()
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            })
             .collect();
 
         if current_root == parent_state_root {
@@ -383,6 +407,7 @@ impl VerificationPipeline {
                     parent_state_root,
                     expected_root: block.header.state_root,
                     cert_tx_hashes,
+                    per_cert_declared_nodes,
                     block_height: block.header.height.0,
                 });
         } else {
@@ -402,6 +427,7 @@ impl VerificationPipeline {
                     required_root: parent_state_root,
                     expected_root: block.header.state_root,
                     cert_tx_hashes,
+                    per_cert_declared_nodes,
                     block_height: block.header.height.0,
                 },
             );
@@ -790,6 +816,7 @@ impl VerificationPipeline {
                         parent_state_root: pv.required_root,
                         expected_root: pv.expected_root,
                         cert_tx_hashes: pv.cert_tx_hashes,
+                        per_cert_declared_nodes: pv.per_cert_declared_nodes,
                         block_height: pv.block_height,
                     });
             }

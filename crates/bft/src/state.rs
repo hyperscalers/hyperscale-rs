@@ -817,22 +817,17 @@ impl BftState {
     ///
     /// Takes ready transactions from mempool (already sectioned and hash-sorted),
     /// plus deferrals, aborts, and certificates from execution.
-    #[instrument(skip(self, ready_txs, abort_intents, certificates, cert_updates, finalized_tx_hashes), fields(
+    #[instrument(skip(self, ready_txs, abort_intents, certificates, finalized_tx_hashes), fields(
         tx_count = ready_txs.len(),
         abort_intent_count = abort_intents.len(),
         cert_count = certificates.len(),
     ))]
-    #[allow(clippy::too_many_arguments)]
     pub fn on_proposal_timer(
         &mut self,
         topology: &TopologySnapshot,
         ready_txs: &ReadyTransactions,
         abort_intents: Vec<AbortIntent>,
         certificates: Vec<Arc<TransactionCertificate>>,
-        cert_updates: &std::collections::HashMap<
-            hyperscale_types::Hash,
-            Arc<hyperscale_types::DatabaseUpdates>,
-        >,
         finalized_tx_hashes: &std::collections::HashSet<Hash>,
     ) -> Vec<Action> {
         // The next height to propose is one above the highest certified block,
@@ -1053,25 +1048,9 @@ impl BftState {
         // provisions (derived from wave union) and missing execution certificates.
         let waves = hyperscale_types::compute_waves(topology, &transactions);
 
-        // Collect per-certificate Arc<DatabaseUpdates> from pre-computed map.
-        // Merging is deferred to the thread pool.
-        // Every non-aborted certificate MUST have updates — a missing entry means
-        // the state root will silently diverge from verifiers.
-        let per_cert_updates: Vec<Arc<hyperscale_types::DatabaseUpdates>> = certificates_to_propose
-            .iter()
-            .filter(|c| c.decision != hyperscale_types::TransactionDecision::Aborted)
-            .map(|c| {
-                cert_updates.get(&c.transaction_hash).cloned().unwrap_or_else(|| {
-                    panic!(
-                        "BUG: certificate {} included in proposal but has no DatabaseUpdates in cert_updates map",
-                        c.transaction_hash
-                    )
-                })
-            })
-            .collect();
-
         // Always use BuildProposal - the runner handles JVT readiness and timeout.
         // This ensures transactions are always included regardless of certificate state.
+        // DatabaseUpdates are derived from receipts on the thread pool (not from a local cache).
         // Include SetTimer to reschedule the proposal timer.
         vec![
             Action::SetTimer {
@@ -1090,7 +1069,6 @@ impl BftState {
                 parent_state_root,
                 transactions,
                 certificates: certificates_to_propose,
-                per_cert_updates,
                 abort_intents: abort_intents_with_height,
                 waves,
             },
@@ -3056,7 +3034,7 @@ impl BftState {
     ///
     /// `state_root` is the computed JVT root after applying writes from the certificates.
     /// If certificates is empty, parent state is inherited.
-    #[instrument(skip(self, qc, ready_txs, abort_intents, certificates, cert_updates, finalized_tx_hashes), fields(
+    #[instrument(skip(self, qc, ready_txs, abort_intents, certificates, finalized_tx_hashes), fields(
         height = qc.height.0,
         block_hash = ?block_hash
     ))]
@@ -3069,10 +3047,6 @@ impl BftState {
         ready_txs: &ReadyTransactions,
         abort_intents: Vec<AbortIntent>,
         certificates: Vec<Arc<TransactionCertificate>>,
-        cert_updates: &std::collections::HashMap<
-            hyperscale_types::Hash,
-            Arc<hyperscale_types::DatabaseUpdates>,
-        >,
         finalized_tx_hashes: &std::collections::HashSet<Hash>,
     ) -> Vec<Action> {
         let height = qc.height.0;
@@ -3182,7 +3156,6 @@ impl BftState {
                 ready_txs,
                 abort_intents,
                 certificates,
-                cert_updates,
                 finalized_tx_hashes,
             ));
         } else if should_try_proposal && rate_limited {
@@ -7187,7 +7160,6 @@ mod tests {
             &ReadyTransactions::default(), // empty mempool
             vec![],                        // no abort intents
             vec![],                        // no certificates
-            &std::collections::HashMap::new(),
             &std::collections::HashSet::new(),
         );
 
@@ -7238,7 +7210,6 @@ mod tests {
             &ReadyTransactions::default(), // empty mempool
             vec![abort_intent],            // has an abort intent
             vec![],                        // no certificates
-            &std::collections::HashMap::new(),
             &std::collections::HashSet::new(),
         );
 
@@ -7561,7 +7532,6 @@ mod tests {
             &ReadyTransactions::default(), // empty mempool
             vec![abort_intent],            // has content
             vec![],
-            &std::collections::HashMap::new(),
             &std::collections::HashSet::new(),
         );
 
@@ -7617,7 +7587,6 @@ mod tests {
             &ReadyTransactions::default(), // empty mempool
             vec![abort_intent],            // has content
             vec![],
-            &std::collections::HashMap::new(),
             &std::collections::HashSet::new(),
         );
 
@@ -7700,7 +7669,6 @@ mod tests {
             &ReadyTransactions::default(),
             vec![abort_intent],
             vec![],
-            &std::collections::HashMap::new(),
             &std::collections::HashSet::new(),
         );
 
@@ -7778,7 +7746,6 @@ mod tests {
             &ReadyTransactions::default(),
             vec![abort_intent],
             vec![],
-            &std::collections::HashMap::new(),
             &std::collections::HashSet::new(),
         );
 
@@ -7824,7 +7791,6 @@ mod tests {
             &ReadyTransactions::default(),
             vec![],
             vec![],
-            &std::collections::HashMap::new(),
             &std::collections::HashSet::new(),
         );
 
@@ -8050,7 +8016,6 @@ mod tests {
             &ready_txs,
             vec![],
             vec![],
-            &std::collections::HashMap::new(),
             &std::collections::HashSet::new(),
         );
 
@@ -8117,7 +8082,6 @@ mod tests {
             &ReadyTransactions::default(),
             vec![],
             vec![],
-            &std::collections::HashMap::new(),
             &std::collections::HashSet::new(),
         );
 
@@ -8402,7 +8366,6 @@ mod tests {
             &ReadyTransactions::default(),
             vec![],
             vec![],
-            &std::collections::HashMap::new(),
             &std::collections::HashSet::new(),
         );
 
@@ -8521,7 +8484,6 @@ mod tests {
             &ReadyTransactions::default(),
             vec![],
             vec![],
-            &std::collections::HashMap::new(),
             &std::collections::HashSet::new(),
         );
 
