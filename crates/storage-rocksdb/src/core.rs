@@ -180,6 +180,7 @@ impl RocksDbStorage {
             db: Arc::new(db),
             commit_lock: Mutex::new(()),
             jvt_history_length: config.jvt_history_length,
+            node_cache: hyperscale_storage::jmt::NodeCache::new(200_000),
         })
     }
 
