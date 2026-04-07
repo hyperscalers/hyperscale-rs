@@ -274,7 +274,7 @@ where
             | Action::FetchCertificates { .. }
             | Action::CancelFetch { .. }
             | Action::RequestMissingProvisions { .. }
-            | Action::RequestMissingExecutionCerts { .. }
+            | Action::RequestMissingExecutionCert { .. }
             | Action::CancelProvisionFetch { .. }
             | Action::RequestTxInclusionProofs { .. }
             | Action::RequestMissingCommittedBlockHeader { .. } => {
@@ -1032,25 +1032,27 @@ where
                 self.process_inclusion_proof_fetch_outputs(tick_outputs);
                 self.update_fetch_tick_timer();
             }
-            Action::RequestMissingExecutionCerts {
+            Action::RequestMissingExecutionCert {
                 source_shard,
                 block_height,
-                wave_ids,
+                wave_id,
+                wave_leader,
                 peers,
             } => {
                 debug!(
                     source_shard = source_shard.0,
                     block_height,
-                    wave_count = wave_ids.len(),
+                    wave = %wave_id,
                     peer_count = peers.len(),
-                    "Requesting missing execution certs from source shard"
+                    "Requesting missing execution cert from source shard"
                 );
                 let outputs = self
                     .exec_cert_fetch_protocol
                     .handle(ExecCertFetchInput::Request {
                         source_shard,
                         block_height,
-                        wave_ids,
+                        wave_id,
+                        wave_leader,
                         peers,
                     });
                 self.process_exec_cert_fetch_outputs(outputs);

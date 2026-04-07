@@ -839,18 +839,20 @@ pub enum Action {
         block_height: BlockHeight,
     },
 
-    /// Request missing execution certificates from a source shard.
+    /// Request a missing execution certificate from a source shard.
     ///
-    /// Emitted when expected execution certs haven't arrived within the timeout.
+    /// Emitted when an expected execution cert hasn't arrived within the timeout.
     /// The wave leader may be byzantine or slow, so we request from
-    /// any peer in the source shard.
-    RequestMissingExecutionCerts {
-        /// The shard that should have sent the execution certs.
+    /// any peer in the source shard, preferring the wave leader first.
+    RequestMissingExecutionCert {
+        /// The shard that should have sent the execution cert.
         source_shard: ShardGroupId,
-        /// The block height whose execution certs are missing.
+        /// The block height whose execution cert is missing.
         block_height: u64,
-        /// Which waves' certs are missing.
-        wave_ids: Vec<WaveId>,
+        /// Which wave's cert is missing.
+        wave_id: WaveId,
+        /// Wave leader for the missing wave (tried first as preferred peer).
+        wave_leader: ValidatorId,
         /// All validators in the source shard (candidate peers for the request).
         peers: Vec<ValidatorId>,
     },
@@ -909,7 +911,7 @@ impl Action {
                 | Action::PersistAndBroadcastVote { .. }
                 | Action::PersistTransactionCertificate { .. }
                 | Action::RequestMissingProvisions { .. }
-                | Action::RequestMissingExecutionCerts { .. }
+                | Action::RequestMissingExecutionCert { .. }
                 | Action::CancelProvisionFetch { .. }
                 | Action::RequestTxInclusionProofs { .. }
                 | Action::RequestMissingCommittedBlockHeader { .. }
@@ -1032,7 +1034,7 @@ impl Action {
             Action::FetchCertificates { .. } => "FetchCertificates",
             Action::CancelFetch { .. } => "CancelFetch",
             Action::RequestMissingProvisions { .. } => "RequestMissingProvisions",
-            Action::RequestMissingExecutionCerts { .. } => "RequestMissingExecutionCerts",
+            Action::RequestMissingExecutionCert { .. } => "RequestMissingExecutionCert",
             Action::CancelProvisionFetch { .. } => "CancelProvisionFetch",
             Action::RequestTxInclusionProofs { .. } => "RequestTxInclusionProof",
             Action::RequestMissingCommittedBlockHeader { .. } => {

@@ -2,7 +2,7 @@
 //!
 //! Pure synchronous state machine for cross-shard execution certificate
 //! fetching with per-peer rotation. Sits between the `ExecutionState`'s
-//! `RequestMissingExecutionCerts` action and the actual `network.request()`
+//! `RequestMissingExecutionCert` action and the actual `network.request()`
 //! call, rotating through available peers on failure before giving up.
 //!
 //! # Usage
@@ -46,7 +46,9 @@ pub enum ExecCertFetchInput {
     Request {
         source_shard: ShardGroupId,
         block_height: u64,
-        wave_ids: Vec<WaveId>,
+        wave_id: WaveId,
+        /// Wave leader for the missing wave (tried first as preferred peer).
+        wave_leader: ValidatorId,
         peers: Vec<ValidatorId>,
     },
     /// Execution certificates were successfully received.
@@ -90,6 +92,8 @@ pub enum ExecCertFetchOutput {
 #[derive(Debug)]
 struct PendingExecCertFetch {
     wave_ids: Vec<WaveId>,
+    /// Wave leaders for the missing waves (tried first as preferred peers).
+    wave_leaders: Vec<ValidatorId>,
     peers: Vec<ValidatorId>,
     tried: HashSet<ValidatorId>,
     in_flight: bool,
@@ -120,9 +124,10 @@ impl ExecCertFetchProtocol {
             ExecCertFetchInput::Request {
                 source_shard,
                 block_height,
-                wave_ids,
+                wave_id,
+                wave_leader,
                 peers,
-            } => self.handle_request(source_shard, block_height, wave_ids, peers),
+            } => self.handle_request(source_shard, block_height, wave_id, wave_leader, peers),
             ExecCertFetchInput::Received {
                 source_shard,
                 block_height,
@@ -173,17 +178,19 @@ impl ExecCertFetchProtocol {
         &mut self,
         source_shard: ShardGroupId,
         block_height: u64,
-        wave_ids: Vec<WaveId>,
+        wave_id: WaveId,
+        wave_leader: ValidatorId,
         peers: Vec<ValidatorId>,
     ) -> Vec<ExecCertFetchOutput> {
         let key = (source_shard, block_height);
 
         if let Some(existing) = self.pending.get_mut(&key) {
-            // Duplicate request: merge wave_ids, refresh peers, reset rounds.
-            for wid in &wave_ids {
-                if !existing.wave_ids.contains(wid) {
-                    existing.wave_ids.push(wid.clone());
-                }
+            // Duplicate request: merge wave_id + wave_leader, refresh peers, reset rounds.
+            if !existing.wave_ids.contains(&wave_id) {
+                existing.wave_ids.push(wave_id);
+            }
+            if !existing.wave_leaders.contains(&wave_leader) {
+                existing.wave_leaders.push(wave_leader);
             }
             existing.peers = peers;
             existing.rounds = 0;
@@ -210,7 +217,7 @@ impl ExecCertFetchProtocol {
         debug!(
             source_shard = source_shard.0,
             block_height,
-            wave_count = wave_ids.len(),
+            wave = %wave_id,
             peer_count = peers.len(),
             "Starting exec cert fetch"
         );
@@ -219,7 +226,8 @@ impl ExecCertFetchProtocol {
         self.pending.insert(
             key,
             PendingExecCertFetch {
-                wave_ids,
+                wave_ids: vec![wave_id],
+                wave_leaders: vec![wave_leader],
                 peers,
                 tried: HashSet::new(),
                 in_flight: false,
@@ -320,11 +328,12 @@ impl ExecCertFetchProtocol {
                 state.next_retry_at = None;
             }
 
-            // Pick the first untried peer (no preferred peer for exec certs).
+            // Prefer wave leaders first (if in peer list), then rotate through remaining peers.
             let peer = state
-                .peers
+                .wave_leaders
                 .iter()
-                .find(|p| !state.tried.contains(p))
+                .find(|p| !state.tried.contains(p) && state.peers.contains(p))
+                .or_else(|| state.peers.iter().find(|p| !state.tried.contains(p)))
                 .copied();
 
             match peer {
@@ -447,7 +456,8 @@ mod tests {
         let outputs = protocol.handle(ExecCertFetchInput::Request {
             source_shard: shard(1),
             block_height: 10,
-            wave_ids: vec![wave(&[0, 1])],
+            wave_id: wave(&[0, 1]),
+            wave_leader: vid(99),
             peers: vec![vid(1), vid(2), vid(3)],
         });
         assert!(outputs.is_empty());
@@ -479,7 +489,8 @@ mod tests {
         protocol.handle(ExecCertFetchInput::Request {
             source_shard: shard(1),
             block_height: 10,
-            wave_ids: vec![wave(&[0, 1])],
+            wave_id: wave(&[0, 1]),
+            wave_leader: vid(99),
             peers: vec![vid(1), vid(2), vid(3)],
         });
 
@@ -527,7 +538,8 @@ mod tests {
         protocol.handle(ExecCertFetchInput::Request {
             source_shard: shard(1),
             block_height: 10,
-            wave_ids: vec![wave(&[0, 1])],
+            wave_id: wave(&[0, 1]),
+            wave_leader: vid(99),
             peers: vec![vid(1), vid(2)],
         });
 
@@ -573,7 +585,8 @@ mod tests {
         protocol.handle(ExecCertFetchInput::Request {
             source_shard: shard(1),
             block_height: 10,
-            wave_ids: vec![wave(&[0, 1])],
+            wave_id: wave(&[0, 1]),
+            wave_leader: vid(99),
             peers: vec![vid(1)],
         });
 
@@ -619,7 +632,8 @@ mod tests {
         protocol.handle(ExecCertFetchInput::Request {
             source_shard: shard(1),
             block_height: 10,
-            wave_ids: vec![wave(&[0, 1])],
+            wave_id: wave(&[0, 1]),
+            wave_leader: vid(99),
             peers: vec![vid(1), vid(2)],
         });
 
@@ -648,15 +662,17 @@ mod tests {
         protocol.handle(ExecCertFetchInput::Request {
             source_shard: shard(1),
             block_height: 10,
-            wave_ids: vec![wave(&[0, 1])],
+            wave_id: wave(&[0, 1]),
+            wave_leader: vid(99),
             peers: vec![vid(1), vid(2)],
         });
 
-        // Duplicate request with additional wave_ids.
+        // Duplicate request with a different wave_id.
         protocol.handle(ExecCertFetchInput::Request {
             source_shard: shard(1),
             block_height: 10,
-            wave_ids: vec![wave(&[0, 1]), wave(&[0, 2])],
+            wave_id: wave(&[0, 2]),
+            wave_leader: vid(99),
             peers: vec![vid(1), vid(2), vid(3)],
         });
 
@@ -679,7 +695,8 @@ mod tests {
             protocol.handle(ExecCertFetchInput::Request {
                 source_shard: shard(1),
                 block_height: h,
-                wave_ids: vec![wave(&[0, 1])],
+                wave_id: wave(&[0, 1]),
+                wave_leader: vid(99),
                 peers: vec![vid(1)],
             });
         }
@@ -708,7 +725,8 @@ mod tests {
         protocol.handle(ExecCertFetchInput::Request {
             source_shard: shard(1),
             block_height: 10,
-            wave_ids: vec![wave(&[0, 1])],
+            wave_id: wave(&[0, 1]),
+            wave_leader: vid(99),
             peers: vec![vid(1), vid(2)],
         });
 
@@ -728,7 +746,8 @@ mod tests {
         protocol.handle(ExecCertFetchInput::Request {
             source_shard: shard(1),
             block_height: 10,
-            wave_ids: vec![wave(&[0, 1])],
+            wave_id: wave(&[0, 1]),
+            wave_leader: vid(99),
             peers: vec![vid(1), vid(2)],
         });
         assert!(protocol.has_pending());
@@ -762,7 +781,8 @@ mod tests {
         protocol.handle(ExecCertFetchInput::Request {
             source_shard: shard(1),
             block_height: 10,
-            wave_ids: vec![wave(&[0, 1])],
+            wave_id: wave(&[0, 1]),
+            wave_leader: vid(99),
             peers: vec![vid(1)],
         });
 
@@ -795,7 +815,8 @@ mod tests {
             protocol.handle(ExecCertFetchInput::Request {
                 source_shard: shard(1),
                 block_height: h,
-                wave_ids: vec![wave(&[0, 1])],
+                wave_id: wave(&[0, 1]),
+                wave_leader: vid(99),
                 peers: vec![vid(1), vid(2)],
             });
         }
@@ -806,7 +827,8 @@ mod tests {
         protocol.handle(ExecCertFetchInput::Request {
             source_shard: shard(1),
             block_height: 13,
-            wave_ids: vec![wave(&[0, 1])],
+            wave_id: wave(&[0, 1]),
+            wave_leader: vid(99),
             peers: vec![vid(1), vid(2)],
         });
         assert_eq!(
@@ -827,7 +849,8 @@ mod tests {
         protocol.handle(ExecCertFetchInput::Request {
             source_shard: shard(2),
             block_height: 10,
-            wave_ids: vec![wave(&[0, 2])],
+            wave_id: wave(&[0, 2]),
+            wave_leader: vid(99),
             peers: vec![vid(3)],
         });
         assert_eq!(protocol.pending_count_for_shard(shard(2)), 1);
@@ -846,7 +869,8 @@ mod tests {
             protocol.handle(ExecCertFetchInput::Request {
                 source_shard: shard(1),
                 block_height: h,
-                wave_ids: vec![wave(&[0, 1])],
+                wave_id: wave(&[0, 1]),
+                wave_leader: vid(99),
                 peers: vec![vid(1)],
             });
         }
@@ -864,7 +888,8 @@ mod tests {
         protocol.handle(ExecCertFetchInput::Request {
             source_shard: shard(1),
             block_height: 12,
-            wave_ids: vec![wave(&[0, 1])],
+            wave_id: wave(&[0, 1]),
+            wave_leader: vid(99),
             peers: vec![vid(1)],
         });
         assert_eq!(protocol.pending_count_for_shard(shard(1)), 2);
@@ -883,7 +908,8 @@ mod tests {
             protocol.handle(ExecCertFetchInput::Request {
                 source_shard: shard(1),
                 block_height: h,
-                wave_ids: vec![wave(&[0, 1])],
+                wave_id: wave(&[0, 1]),
+                wave_leader: vid(99),
                 peers: vec![vid(1)],
             });
         }
@@ -907,5 +933,71 @@ mod tests {
             protocol.pending.contains_key(&(shard(1), 25)),
             "Only height 25 should remain"
         );
+    }
+
+    #[test]
+    fn test_wave_leader_preferred_first() {
+        let mut protocol = ExecCertFetchProtocol::new(default_config());
+
+        // vid(5) is the wave leader, peers are vid(1)..vid(5).
+        protocol.handle(ExecCertFetchInput::Request {
+            source_shard: shard(1),
+            block_height: 10,
+            wave_id: wave(&[0, 1]),
+            wave_leader: vid(5),
+            peers: vec![vid(1), vid(2), vid(3), vid(4), vid(5)],
+        });
+
+        // First tick should prefer the wave leader vid(5).
+        let outputs = protocol.handle(tick());
+        assert_eq!(outputs.len(), 1);
+        assert!(matches!(
+            &outputs[0],
+            ExecCertFetchOutput::Fetch { peer, .. } if *peer == vid(5)
+        ));
+
+        // Fail → next tick should fall back to regular peer rotation.
+        protocol.handle(ExecCertFetchInput::Failed {
+            source_shard: shard(1),
+            block_height: 10,
+        });
+        let outputs = protocol.handle(tick());
+        assert_eq!(outputs.len(), 1);
+        assert!(matches!(
+            &outputs[0],
+            ExecCertFetchOutput::Fetch { peer, .. } if *peer == vid(1)
+        ));
+    }
+
+    #[test]
+    fn test_wave_leader_skipped_when_already_tried() {
+        let mut protocol = ExecCertFetchProtocol::new(default_config());
+
+        // Wave leader is vid(1), which is also the first regular peer.
+        protocol.handle(ExecCertFetchInput::Request {
+            source_shard: shard(1),
+            block_height: 10,
+            wave_id: wave(&[0, 1]),
+            wave_leader: vid(1),
+            peers: vec![vid(1), vid(2), vid(3)],
+        });
+
+        // First tick: wave leader vid(1).
+        let outputs = protocol.handle(tick());
+        assert!(matches!(
+            &outputs[0],
+            ExecCertFetchOutput::Fetch { peer, .. } if *peer == vid(1)
+        ));
+
+        // Fail → wave leader already tried, should go to vid(2).
+        protocol.handle(ExecCertFetchInput::Failed {
+            source_shard: shard(1),
+            block_height: 10,
+        });
+        let outputs = protocol.handle(tick());
+        assert!(matches!(
+            &outputs[0],
+            ExecCertFetchOutput::Fetch { peer, .. } if *peer == vid(2)
+        ));
     }
 }

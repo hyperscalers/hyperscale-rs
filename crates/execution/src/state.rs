@@ -285,7 +285,7 @@ pub struct ExecutionState {
     /// Expected execution certificates from remote shards.
     /// Populated when remote block headers with waves targeting our shard are seen.
     /// Cleared when the matching cert is received and verified.
-    /// After timeout, triggers `RequestMissingExecutionCerts` fallback.
+    /// After timeout, triggers `RequestMissingExecutionCert` fallback.
     expected_exec_certs: HashMap<(ShardGroupId, u64, WaveId), ExpectedExecCert>,
 
     /// Fulfilled execution cert keys — prevents late-arriving duplicate headers
@@ -315,6 +315,9 @@ impl Default for ExecutionState {
 /// Tracks an expected execution certificate that hasn't arrived yet.
 #[derive(Debug, Clone)]
 struct ExpectedExecCert {
+    /// Hash of the remote block that declared these waves.
+    /// Used to compute the wave leader for preferred-peer fetch ordering.
+    block_hash: Hash,
     /// Local committed height when we first learned about this expected cert.
     discovered_at: u64,
     /// Local committed height when we last sent a fallback request, if any.
@@ -1249,6 +1252,7 @@ impl ExecutionState {
         &mut self,
         topology: &TopologySnapshot,
         source_shard: ShardGroupId,
+        block_hash: Hash,
         block_height: u64,
         waves: &[WaveId],
     ) {
@@ -1266,6 +1270,7 @@ impl ExecutionState {
                 self.expected_exec_certs
                     .entry(key)
                     .or_insert(ExpectedExecCert {
+                        block_hash,
                         discovered_at: self.committed_height,
                         last_requested_at: None,
                     });
@@ -1295,19 +1300,24 @@ impl ExecutionState {
             if should_request {
                 let is_retry = expected.last_requested_at.is_some();
                 expected.last_requested_at = Some(current_height);
-                let peers = topology.committee_for_shard(*source_shard).to_vec();
+                let committee = topology.committee_for_shard(*source_shard);
+                let leader =
+                    hyperscale_types::wave_leader(&expected.block_hash, wave_id, committee);
+                let peers = committee.to_vec();
                 tracing::warn!(
                     source_shard = source_shard.0,
                     block_height = block_height,
                     wave = %wave_id,
+                    wave_leader = leader.0,
                     age,
                     retry = is_retry,
                     "Execution cert timeout — requesting fallback"
                 );
-                actions.push(Action::RequestMissingExecutionCerts {
+                actions.push(Action::RequestMissingExecutionCert {
                     source_shard: *source_shard,
                     block_height: *block_height,
-                    wave_ids: vec![wave_id.clone()],
+                    wave_id: wave_id.clone(),
+                    wave_leader: leader,
                     peers,
                 });
             }

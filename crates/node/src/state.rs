@@ -679,6 +679,7 @@ impl StateMachine for NodeStateMachine {
                 self.execution.on_verified_remote_header(
                     topology,
                     shard,
+                    committed_header.block_hash(),
                     committed_header.header.height.0,
                     &committed_header.header.waves,
                 );
