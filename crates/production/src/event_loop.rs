@@ -202,6 +202,7 @@ pub fn run_pinned_loop(mut io_loop: ProdIoLoop, mut config: PinnedLoopConfig) {
 
     let mut last_metrics = Instant::now();
     let mut last_gc = Instant::now();
+    let gc_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     loop {
         // ── Shutdown check ──
@@ -276,13 +277,21 @@ pub fn run_pinned_loop(mut io_loop: ProdIoLoop, mut config: PinnedLoopConfig) {
             update_rpc_state(&config, &io_loop.status_snapshot());
         }
 
-        // ── Periodic JVT GC ──
-        if last_gc.elapsed() >= GC_INTERVAL {
+        // ── Periodic JVT GC (off main thread) ──
+        if !gc_in_flight.load(std::sync::atomic::Ordering::Relaxed)
+            && last_gc.elapsed() >= GC_INTERVAL
+        {
             last_gc = Instant::now();
-            let deleted = io_loop.storage().run_jvt_gc();
-            if deleted > 0 {
-                debug!(deleted, "JVT garbage collection completed");
-            }
+            gc_in_flight.store(true, std::sync::atomic::Ordering::Relaxed);
+            let storage = io_loop.storage().clone();
+            let gc_flag = gc_in_flight.clone();
+            config.tokio_handle.spawn_blocking(move || {
+                let deleted = storage.run_jvt_gc();
+                if deleted > 0 {
+                    debug!(deleted, "JVT garbage collection completed");
+                }
+                gc_flag.store(false, std::sync::atomic::Ordering::Relaxed);
+            });
         }
     }
 
