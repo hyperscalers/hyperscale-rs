@@ -348,7 +348,6 @@ view_change_timeout_ms = 5000
 max_transactions_per_block = 4096
 max_certificates_per_block = 8192
 rpc_mempool_limit = 32768
-speculative_max_txs = 1000
 
 [threads]
 consensus_crypto_threads = 0

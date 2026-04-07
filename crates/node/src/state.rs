@@ -81,7 +81,7 @@ struct ProposalInputs {
 }
 
 impl NodeStateMachine {
-    /// Create a new node state machine with default speculative execution settings.
+    /// Create a new node state machine.
     ///
     /// # Arguments
     ///
@@ -90,35 +90,13 @@ impl NodeStateMachine {
     /// * `signing_key` - Key for signing votes and proposals
     /// * `bft_config` - BFT configuration
     /// * `recovered` - State recovered from storage. Use `RecoveredState::default()` for fresh start.
+    /// * `mempool_config` - Mempool configuration
     pub fn new(
         node_index: NodeIndex,
         topology: TopologyState,
         signing_key: Bls12381G1PrivateKey,
         bft_config: BftConfig,
         recovered: RecoveredState,
-    ) -> Self {
-        Self::with_speculative_config(
-            node_index,
-            topology,
-            signing_key,
-            bft_config,
-            recovered,
-            hyperscale_execution::DEFAULT_SPECULATIVE_MAX_TXS,
-            hyperscale_execution::DEFAULT_VIEW_CHANGE_COOLDOWN_ROUNDS,
-            MempoolConfig::default(),
-        )
-    }
-
-    /// Create a new node state machine with custom speculative execution config.
-    #[allow(clippy::too_many_arguments)]
-    pub fn with_speculative_config(
-        node_index: NodeIndex,
-        topology: TopologyState,
-        signing_key: Bls12381G1PrivateKey,
-        bft_config: BftConfig,
-        recovered: RecoveredState,
-        speculative_max_txs: usize,
-        view_change_cooldown_rounds: u64,
         mempool_config: MempoolConfig,
     ) -> Self {
         // Clone key bytes to create a new keypair since Bls12381G1PrivateKey doesn't impl Clone
@@ -135,10 +113,7 @@ impl NodeStateMachine {
                 bft_config.clone(),
                 recovered,
             ),
-            execution: ExecutionState::with_speculative_config(
-                speculative_max_txs,
-                view_change_cooldown_rounds,
-            ),
+            execution: ExecutionState::new(),
             mempool: MempoolState::with_config(mempool_config),
             provisions: ProvisionCoordinator::new(),
             remote_headers: RemoteHeaderCoordinator::new(),
@@ -178,11 +153,6 @@ impl NodeStateMachine {
     /// Get a reference to the execution state.
     pub fn execution(&self) -> &ExecutionState {
         &self.execution
-    }
-
-    /// Get a mutable reference to the execution state.
-    pub(crate) fn execution_mut(&mut self) -> &mut ExecutionState {
-        &mut self.execution
     }
 
     /// Get a reference to the livelock state.
@@ -287,9 +257,6 @@ impl NodeStateMachine {
         let current_height = BlockHeight(self.bft.committed_height());
         self.mempool.cleanup_default_tombstones(current_height);
 
-        // Clean up stale speculative execution results
-        self.execution.cleanup_stale_speculative();
-
         actions
     }
 
@@ -298,11 +265,6 @@ impl NodeStateMachine {
         // Check if we should advance the round due to timeout.
         // Delegated to BftState which owns timeout tracking.
         if let Some(actions) = self.bft.check_round_timeout(self.topology.snapshot()) {
-            let current_height = BlockHeight(self.bft.committed_height() + 1);
-
-            // Notify execution of view change to pause speculation temporarily
-            self.execution.on_view_change(current_height.0);
-
             return actions;
         }
 
@@ -324,7 +286,7 @@ impl NodeStateMachine {
         )
     }
 
-    /// Handle a received block header — validate in-flight limits and trigger speculative execution.
+    /// Handle a received block header — validate in-flight limits.
     fn on_block_header_received(
         &mut self,
         header: BlockHeader,
@@ -352,32 +314,14 @@ impl NodeStateMachine {
             return vec![];
         }
 
-        // Trigger speculative execution for single-shard transactions
-        // This hides execution latency behind consensus latency
-        let block_hash = header.hash();
-        let height = header.height.0;
-        let transactions: Vec<_> = manifest
-            .tx_hashes
-            .iter()
-            .filter_map(|h| self.mempool.get_transaction(h))
-            .collect();
-        let spec_actions = self.execution.trigger_speculative_execution(
-            self.topology.snapshot(),
-            block_hash,
-            height,
-            transactions,
-        );
-
-        let mut actions = self.bft.on_block_header(
+        self.bft.on_block_header(
             self.topology.snapshot(),
             header,
             manifest,
             |h| self.mempool.get_transaction(h),
             |h| self.execution.get_finalized_certificate(h),
             |h| self.execution.has_finalized_certificate(h),
-        );
-        actions.extend(spec_actions);
-        actions
+        )
     }
 
     /// Handle QC formed — may trigger immediate next proposal.
@@ -442,7 +386,6 @@ impl NodeStateMachine {
 
         // Remove committed certificates from execution state.
         // They've been included in this block, so don't need to be proposed again.
-        // Also invalidate any speculative results that conflict with these writes.
         self.execution
             .on_certificates_committed(&block.certificates);
         for cert in &block.certificates {
@@ -714,15 +657,6 @@ impl StateMachine for NodeStateMachine {
                     block.clone(),
                     block_hash,
                 );
-                // Trigger speculative execution for single-shard transactions.
-                // The proposer knows the block contents at build time — start
-                // execution now so results are cached by the time the block commits.
-                actions.extend(self.execution.trigger_speculative_execution(
-                    self.topology.snapshot(),
-                    block_hash,
-                    height.0,
-                    block.transactions.clone(),
-                ));
                 // Trigger speculative provision prep if we have certificate writes
                 if let Some(updates) = merged_updates {
                     actions.extend(self.execution.trigger_speculative_provisions(
@@ -783,19 +717,15 @@ impl StateMachine for NodeStateMachine {
             ProtocolEvent::ExecutionBatchCompleted {
                 results,
                 tx_outcomes,
-                speculative,
             } => {
                 // Extract tx_hashes before results are consumed — these receipts
                 // are now available in the execution cache for state root verification.
                 let receipt_tx_hashes: Vec<hyperscale_types::Hash> =
                     results.iter().map(|r| r.tx_hash).collect();
 
-                let mut actions = self.execution.on_execution_batch_completed(
-                    results,
-                    tx_outcomes,
-                    speculative,
-                    self.bft.committed_height(),
-                );
+                let mut actions = self
+                    .execution
+                    .on_execution_batch_completed(results, tx_outcomes);
 
                 // Feed receipt availability to BFT pending blocks. A pending block
                 // that was waiting for these receipts may now be complete and ready
@@ -810,12 +740,6 @@ impl StateMachine for NodeStateMachine {
 
                 actions
             }
-            ProtocolEvent::SpeculativeExecutionComplete {
-                block_hash,
-                tx_hashes,
-            } => self
-                .execution
-                .on_speculative_execution_complete(block_hash, tx_hashes),
 
             // ── Wave Execution (wave-based voting) ────────────────────────
             ProtocolEvent::ExecutionVoteReceived { vote } => self

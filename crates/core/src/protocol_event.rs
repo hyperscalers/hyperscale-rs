@@ -177,21 +177,17 @@ pub enum ProtocolEvent {
     // ═══════════════════════════════════════════════════════════════════════
     // Execution
     // ═══════════════════════════════════════════════════════════════════════
-    /// Batch of execution results from a single ExecuteTransactions or SpeculativeExecute dispatch.
+    /// Batch of execution results from an ExecuteTransactions dispatch.
     ///
     /// Results carry the full execution output (DatabaseUpdates, receipts) — stays local.
     ///
     /// The state machine uses results to:
     /// 1. Store pending execution updates (co-located with TC at finalization)
-    /// 2. Dispatch StoreReceiptBundles action (for both speculative and canonical)
+    /// 2. Dispatch StoreReceiptBundles action
     ExecutionBatchCompleted {
         results: Vec<hyperscale_types::ExecutionResult>,
         /// Per-tx outcomes extracted on the handler thread for vote signing.
         tx_outcomes: Vec<TxOutcome>,
-        /// True when this batch came from speculative execution.
-        /// Receipt bundles are persisted for both speculative and canonical execution
-        /// so that the sync protocol can always serve complete blocks.
-        speculative: bool,
     },
 
     /// Received an execution vote from another validator.
@@ -217,12 +213,6 @@ pub enum ProtocolEvent {
     ExecutionCertificateSignatureVerified {
         certificate: ExecutionCertificate,
         valid: bool,
-    },
-
-    /// Speculative execution of single-shard transactions completed.
-    SpeculativeExecutionComplete {
-        block_hash: Hash,
-        tx_hashes: Vec<Hash>,
     },
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -400,7 +390,6 @@ impl ProtocolEvent {
             ProtocolEvent::ExecutionCertificateSignatureVerified { .. } => {
                 "ExecutionCertificateSignatureVerified"
             }
-            ProtocolEvent::SpeculativeExecutionComplete { .. } => "SpeculativeExecutionComplete",
 
             // Mempool / Transactions
             ProtocolEvent::TransactionGossipReceived { .. } => "TransactionGossipReceived",

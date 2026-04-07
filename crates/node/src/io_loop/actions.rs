@@ -190,7 +190,6 @@ where
             | Action::BuildProposal { .. }
             | Action::VerifyProvisionBatch { .. }
             | Action::ExecuteTransactions { .. }
-            | Action::SpeculativeExecute { .. }
             | Action::ExecuteCrossShardTransactions { .. }
             | Action::FetchAndBroadcastProvisions { .. }
             | Action::SpeculativeProvisionPrep { .. } => {
@@ -1031,12 +1030,10 @@ where
     /// With `SyncDispatch` (simulation), `spawn_*` runs inline so events
     /// enter the channel immediately and are drained by the harness.
     fn dispatch_delegated_action(&mut self, action: Action) {
-        let is_speculative = matches!(action, Action::SpeculativeExecute { .. });
-        let is_execution = is_speculative
-            || matches!(
-                action,
-                Action::ExecuteTransactions { .. } | Action::ExecuteCrossShardTransactions { .. }
-            );
+        let is_execution = matches!(
+            action,
+            Action::ExecuteTransactions { .. } | Action::ExecuteCrossShardTransactions { .. }
+        );
         let pool = action_handler::dispatch_pool_for(&action)
             .expect("dispatch_delegated_action called for delegated actions only");
 
@@ -1059,11 +1056,7 @@ where
             if let Some(result) = action_handler::handle_delegated_action(action, &ctx) {
                 if is_execution {
                     let elapsed = start.elapsed().as_secs_f64();
-                    if is_speculative {
-                        metrics::record_speculative_execution_latency(elapsed);
-                    } else {
-                        metrics::record_execution_latency(elapsed);
-                    }
+                    metrics::record_execution_latency(elapsed);
                 }
                 if let Some((hash, height, prepared)) = result.prepared_commit {
                     prepared_commits

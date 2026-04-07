@@ -9,7 +9,6 @@ use hyperscale_bft::{BftConfig, RecoveredState};
 use hyperscale_core::{NodeInput, ProtocolEvent, TimerId};
 use hyperscale_dispatch_sync::SyncDispatch;
 use hyperscale_engine::RadixExecutor;
-use hyperscale_execution::{DEFAULT_SPECULATIVE_MAX_TXS, DEFAULT_VIEW_CHANGE_COOLDOWN_ROUNDS};
 use hyperscale_mempool::MempoolConfig;
 use hyperscale_network_memory::{
     NetworkConfig, NetworkTrafficAnalyzer, SimNetworkAdapter, SimulatedNetwork,
@@ -200,15 +199,13 @@ impl SimulationRunner {
                     topology_state.snapshot(),
                 )));
 
-                let state = NodeStateMachine::with_speculative_config(
+                let state = NodeStateMachine::new(
                     node_index as NodeIndex,
                     topology_state,
                     // Clone key for state machine (it needs its own copy)
                     Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes"),
                     BftConfig::default(),
                     RecoveredState::default(),
-                    DEFAULT_SPECULATIVE_MAX_TXS,
-                    DEFAULT_VIEW_CHANGE_COOLDOWN_ROUNDS,
                     MempoolConfig::default(),
                 );
 

@@ -515,23 +515,6 @@ pub enum Action {
         state_root: Hash,
     },
 
-    /// Speculatively execute single-shard transactions before block commit.
-    ///
-    /// Triggered when a block header is received, before the block commits via
-    /// the 2-chain rule. This hides execution latency behind consensus latency.
-    ///
-    /// If a speculative result is invalidated (due to committed writes to the
-    /// read set), the cached vote is discarded and the transaction falls back
-    /// to normal execution on commit.
-    ///
-    /// Returns `ProtocolEvent::SpeculativeExecutionComplete` when complete (for cache tracking).
-    SpeculativeExecute {
-        /// Block hash where these transactions appear.
-        block_hash: Hash,
-        /// Single-shard transactions to execute speculatively.
-        transactions: Vec<Arc<RoutableTransaction>>,
-    },
-
     /// Execute a batch of cross-shard transactions with provisioned state.
     ///
     /// Used after cross-shard provisioning completes. The state machine batches
@@ -936,7 +919,6 @@ impl Action {
                 | Action::VerifyAbortIntentProofs { .. }
                 | Action::BuildProposal { .. }
                 | Action::ExecuteTransactions { .. }
-                | Action::SpeculativeExecute { .. }
                 | Action::ExecuteCrossShardTransactions { .. }
                 | Action::FetchAndBroadcastProvisions { .. }
                 | Action::SpeculativeProvisionPrep { .. }
@@ -991,7 +973,6 @@ impl Action {
 
             // Delegated Work - Execution
             Action::ExecuteTransactions { .. } => "ExecuteTransactions",
-            Action::SpeculativeExecute { .. } => "SpeculativeExecute",
             Action::ExecuteCrossShardTransactions { .. } => "ExecuteCrossShardTransactions",
             Action::FetchAndBroadcastProvisions { .. } => "FetchAndBroadcastProvisions",
             Action::SpeculativeProvisionPrep { .. } => "SpeculativeProvisionPrep",

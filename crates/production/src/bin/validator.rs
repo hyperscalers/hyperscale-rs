@@ -280,16 +280,6 @@ pub struct ConsensusConfig {
     #[serde(default = "default_max_certificates_per_block")]
     pub max_certificates_per_block: usize,
 
-    /// Maximum transactions for speculative execution (in-flight + cached).
-    /// Higher values allow more aggressive speculation but use more memory.
-    #[serde(default = "default_speculative_max_txs")]
-    pub speculative_max_txs: usize,
-
-    /// Rounds to pause speculation after a view change.
-    /// Higher values reduce wasted work during instability but may reduce hit rate.
-    #[serde(default = "default_view_change_cooldown_rounds")]
-    pub view_change_cooldown_rounds: u64,
-
     /// Minimum time between block proposals in milliseconds (rate limiting).
     /// Even when a QC forms immediately, wait at least this long since the last
     /// proposal. Slower blocks accumulate more transactions for better verkle
@@ -305,8 +295,6 @@ impl Default for ConsensusConfig {
             view_change_timeout_ms: default_view_change_timeout_ms(),
             max_transactions_per_block: default_max_transactions_per_block(),
             max_certificates_per_block: default_max_certificates_per_block(),
-            speculative_max_txs: default_speculative_max_txs(),
-            view_change_cooldown_rounds: default_view_change_cooldown_rounds(),
             min_block_interval_ms: default_min_block_interval_ms(),
         }
     }
@@ -326,14 +314,6 @@ fn default_max_transactions_per_block() -> usize {
 
 fn default_max_certificates_per_block() -> usize {
     8192
-}
-
-fn default_speculative_max_txs() -> usize {
-    500 // Matches hyperscale_execution::DEFAULT_SPECULATIVE_MAX_TXS
-}
-
-fn default_view_change_cooldown_rounds() -> u64 {
-    3 // Matches hyperscale_execution::DEFAULT_VIEW_CHANGE_COOLDOWN_ROUNDS
 }
 
 fn default_min_block_interval_ms() -> u64 {
@@ -1323,8 +1303,6 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
         .rpc_status(rpc_node_status.clone())
         .mempool_snapshot(rpc_mempool_snapshot.clone())
         .sync_status(rpc_sync_status.clone())
-        .speculative_max_txs(config.consensus.speculative_max_txs)
-        .view_change_cooldown_rounds(config.consensus.view_change_cooldown_rounds)
         .mempool_config(config.mempool.clone());
 
     // Wire up genesis configuration if XRD balances are specified

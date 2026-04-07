@@ -89,8 +89,6 @@ pub struct MemoryMetrics {
     pub exec_early_votes: usize,
     /// Cross-shard finalization trackers.
     pub exec_certificate_trackers: usize,
-    /// Cached speculative execution results.
-    pub exec_speculative_results: usize,
     /// Expected execution certificates from remote shards.
     pub exec_expected_exec_certs: usize,
     /// Speculative provision preparations in-flight.
@@ -242,24 +240,6 @@ pub trait MetricsRecorder: Send + Sync + 'static {
 
     /// Record execution latency.
     fn record_execution_latency(&self, latency_secs: f64) {}
-
-    /// Record speculative execution latency.
-    fn record_speculative_execution_latency(&self, latency_secs: f64) {}
-
-    /// Record speculative executions started.
-    fn record_speculative_execution_started(&self, count: u64) {}
-
-    /// Record speculative execution cache hits.
-    fn record_speculative_execution_cache_hit(&self, count: u64) {}
-
-    /// Record speculative execution late hits.
-    fn record_speculative_execution_late_hit(&self, count: u64) {}
-
-    /// Record speculative execution cache misses.
-    fn record_speculative_execution_cache_miss(&self, count: u64) {}
-
-    /// Record speculative executions invalidated.
-    fn record_speculative_execution_invalidated(&self, count: u64) {}
 
     /// Record signature verification latency by type.
     fn record_signature_verification_latency(&self, sig_type: &str, latency_secs: f64) {}
@@ -575,42 +555,6 @@ pub fn set_channel_depths(depths: &ChannelDepths) {
 #[inline]
 pub fn record_execution_latency(latency_secs: f64) {
     recorder().record_execution_latency(latency_secs);
-}
-
-/// Record speculative execution latency.
-#[inline]
-pub fn record_speculative_execution_latency(latency_secs: f64) {
-    recorder().record_speculative_execution_latency(latency_secs);
-}
-
-/// Record speculative executions started.
-#[inline]
-pub fn record_speculative_execution_started(count: u64) {
-    recorder().record_speculative_execution_started(count);
-}
-
-/// Record speculative execution cache hits.
-#[inline]
-pub fn record_speculative_execution_cache_hit(count: u64) {
-    recorder().record_speculative_execution_cache_hit(count);
-}
-
-/// Record speculative execution late hits.
-#[inline]
-pub fn record_speculative_execution_late_hit(count: u64) {
-    recorder().record_speculative_execution_late_hit(count);
-}
-
-/// Record speculative execution cache misses.
-#[inline]
-pub fn record_speculative_execution_cache_miss(count: u64) {
-    recorder().record_speculative_execution_cache_miss(count);
-}
-
-/// Record speculative executions invalidated.
-#[inline]
-pub fn record_speculative_execution_invalidated(count: u64) {
-    recorder().record_speculative_execution_invalidated(count);
 }
 
 /// Record signature verification latency by type.

@@ -994,25 +994,6 @@ where
         metrics::set_bft_round(bft_stats.current_round);
         metrics::set_view_changes(bft_stats.view_changes);
 
-        // ── Speculative execution ──
-        let (started, hits, late_hits, misses, invalidated) =
-            self.state.execution_mut().take_speculative_metrics();
-        if started > 0 {
-            metrics::record_speculative_execution_started(started);
-        }
-        if hits > 0 {
-            metrics::record_speculative_execution_cache_hit(hits);
-        }
-        if late_hits > 0 {
-            metrics::record_speculative_execution_late_hit(late_hits);
-        }
-        if misses > 0 {
-            metrics::record_speculative_execution_cache_miss(misses);
-        }
-        if invalidated > 0 {
-            metrics::record_speculative_execution_invalidated(invalidated);
-        }
-
         // ── Mempool ──
         let mempool = self.state.mempool();
         let total = mempool.len();
@@ -1071,7 +1052,6 @@ where
             exec_vote_trackers: exec_mem.vote_trackers,
             exec_early_votes: exec_mem.early_votes,
             exec_certificate_trackers: exec_mem.certificate_trackers,
-            exec_speculative_results: exec_mem.speculative_results,
             exec_expected_exec_certs: exec_mem.expected_exec_certs,
             exec_speculative_provision_in_flight: exec_mem.speculative_provision_in_flight,
             exec_speculative_provision_results: exec_mem.speculative_provision_results,

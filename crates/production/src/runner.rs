@@ -150,10 +150,6 @@ pub struct ProductionRunnerBuilder {
     /// Radix network definition for transaction validation.
     /// Defaults to simulator network if not set.
     network_definition: Option<NetworkDefinition>,
-    /// Maximum transactions for speculative execution (in-flight + cached).
-    speculative_max_txs: usize,
-    /// Rounds to pause speculation after a view change.
-    view_change_cooldown_rounds: u64,
     /// Mempool configuration.
     mempool_config: MempoolConfig,
 }
@@ -180,8 +176,6 @@ impl ProductionRunnerBuilder {
             sync_status: None,
             genesis_config: None,
             network_definition: None,
-            speculative_max_txs: 500,
-            view_change_cooldown_rounds: 3,
             mempool_config: MempoolConfig::default(),
         }
     }
@@ -231,18 +225,6 @@ impl ProductionRunnerBuilder {
     /// Set the event channel capacity (default: 10,000).
     pub fn channel_capacity(mut self, capacity: usize) -> Self {
         self.channel_capacity = capacity;
-        self
-    }
-
-    /// Set the maximum transactions for speculative execution (in-flight + cached).
-    pub fn speculative_max_txs(mut self, max_txs: usize) -> Self {
-        self.speculative_max_txs = max_txs;
-        self
-    }
-
-    /// Set the number of rounds to pause speculation after a view change.
-    pub fn view_change_cooldown_rounds(mut self, rounds: u64) -> Self {
-        self.view_change_cooldown_rounds = rounds;
         self
     }
 
@@ -365,14 +347,12 @@ impl ProductionRunnerBuilder {
         let recovered = storage.load_recovered_state();
 
         // ── Create NodeStateMachine ──────────────────────────────────────
-        let state = NodeStateMachine::with_speculative_config(
+        let state = NodeStateMachine::new(
             0, // node_index not meaningful in production
             topology_state,
             signing_key,
             bft_config,
             recovered,
-            self.speculative_max_txs,
-            self.view_change_cooldown_rounds,
             self.mempool_config,
         );
 

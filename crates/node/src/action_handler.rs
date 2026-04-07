@@ -74,7 +74,6 @@ pub(crate) fn dispatch_pool_for(action: &Action) -> Option<DispatchPool> {
 
         // Execution
         Action::ExecuteTransactions { .. } => Some(DispatchPool::Execution),
-        Action::SpeculativeExecute { .. } => Some(DispatchPool::Execution),
         Action::ExecuteCrossShardTransactions { .. } => Some(DispatchPool::Execution),
         _ => None,
     }
@@ -85,7 +84,7 @@ pub(crate) fn dispatch_pool_for(action: &Action) -> Option<DispatchPool> {
 /// Returns `None` for non-delegated actions (timers, broadcasts, persist, etc.)
 /// that the runner must handle directly.
 ///
-/// For execution actions (`ExecuteTransactions`, `SpeculativeExecute`), the
+/// For execution actions (`ExecuteTransactions`), the
 /// returned events include `ProtocolEvent::ExecutionBatchCompleted`.
 /// The runner is responsible for additionally broadcasting votes to shard
 /// peers (network-specific).
@@ -497,51 +496,8 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
                     ProtocolEvent::ExecutionBatchCompleted {
                         results,
                         tx_outcomes,
-                        speculative: false,
                     },
                 )],
-                prepared_commit: None,
-            })
-        }
-
-        Action::SpeculativeExecute {
-            block_hash,
-            transactions,
-        } => {
-            let local_shard = ctx.local_shard;
-            let num_shards = ctx.num_shards;
-            let raw_results: Vec<_> = transactions
-                .iter()
-                .map(|tx| {
-                    hyperscale_engine::handlers::execute_single_shard(
-                        ctx.executor,
-                        ctx.storage,
-                        tx,
-                        local_shard,
-                        num_shards,
-                    )
-                })
-                .collect();
-
-            let tx_outcomes: Vec<_> = raw_results
-                .iter()
-                .map(hyperscale_engine::handlers::extract_execution_result)
-                .collect();
-            let tx_hashes: Vec<Hash> = raw_results.iter().map(|r| r.tx_hash).collect();
-            let results = raw_results.into_iter().map(ExecutionResult::from).collect();
-
-            Some(DelegatedResult {
-                events: vec![
-                    NodeInput::Protocol(ProtocolEvent::ExecutionBatchCompleted {
-                        results,
-                        tx_outcomes,
-                        speculative: true,
-                    }),
-                    NodeInput::Protocol(ProtocolEvent::SpeculativeExecutionComplete {
-                        block_hash,
-                        tx_hashes,
-                    }),
-                ],
                 prepared_commit: None,
             })
         }
@@ -576,7 +532,6 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
                     ProtocolEvent::ExecutionBatchCompleted {
                         results,
                         tx_outcomes,
-                        speculative: false,
                     },
                 )],
                 prepared_commit: None,

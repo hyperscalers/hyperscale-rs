@@ -41,15 +41,6 @@ pub struct Metrics {
     pub network_messages_received: Counter,
     pub signature_verification_latency: HistogramVec,
     pub execution_latency: Histogram,
-    pub speculative_execution_latency: Histogram,
-
-    // === Speculative Execution ===
-    pub speculative_execution_started: Counter,
-    pub speculative_execution_cache_hit: Counter,
-    pub speculative_execution_late_hit: Counter,
-    pub speculative_execution_cache_miss: Counter,
-    pub speculative_execution_invalidated: Counter,
-
     // === Thread Pools ===
     pub consensus_crypto_pool_queue_depth: Gauge,
     pub crypto_pool_queue_depth: Gauge,
@@ -250,44 +241,6 @@ impl Metrics {
                 "hyperscale_execution_latency_seconds",
                 "Transaction execution latency",
                 vec![0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0]
-            )
-            .unwrap(),
-
-            speculative_execution_latency: register_histogram!(
-                "hyperscale_speculative_execution_latency_seconds",
-                "Speculative transaction execution latency (before block commit)",
-                vec![0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0]
-            )
-            .unwrap(),
-
-            // Speculative Execution Counters
-            speculative_execution_started: register_counter!(
-                "hyperscale_speculative_execution_started_total",
-                "Total speculative executions triggered"
-            )
-            .unwrap(),
-
-            speculative_execution_cache_hit: register_counter!(
-                "hyperscale_speculative_execution_cache_hit_total",
-                "Speculative execution results used on block commit"
-            )
-            .unwrap(),
-
-            speculative_execution_late_hit: register_counter!(
-                "hyperscale_speculative_execution_late_hit_total",
-                "Speculative results used after commit (dedup optimization)"
-            )
-            .unwrap(),
-
-            speculative_execution_cache_miss: register_counter!(
-                "hyperscale_speculative_execution_cache_miss_total",
-                "Block commits requiring re-execution (no cached result)"
-            )
-            .unwrap(),
-
-            speculative_execution_invalidated: register_counter!(
-                "hyperscale_speculative_execution_invalidated_total",
-                "Speculative results invalidated due to state conflicts"
             )
             .unwrap(),
 
@@ -915,42 +868,6 @@ impl MetricsRecorder for PrometheusRecorder {
         self.metrics.execution_latency.observe(latency_secs);
     }
 
-    fn record_speculative_execution_latency(&self, latency_secs: f64) {
-        self.metrics
-            .speculative_execution_latency
-            .observe(latency_secs);
-    }
-
-    fn record_speculative_execution_started(&self, count: u64) {
-        self.metrics
-            .speculative_execution_started
-            .inc_by(count as f64);
-    }
-
-    fn record_speculative_execution_cache_hit(&self, count: u64) {
-        self.metrics
-            .speculative_execution_cache_hit
-            .inc_by(count as f64);
-    }
-
-    fn record_speculative_execution_late_hit(&self, count: u64) {
-        self.metrics
-            .speculative_execution_late_hit
-            .inc_by(count as f64);
-    }
-
-    fn record_speculative_execution_cache_miss(&self, count: u64) {
-        self.metrics
-            .speculative_execution_cache_miss
-            .inc_by(count as f64);
-    }
-
-    fn record_speculative_execution_invalidated(&self, count: u64) {
-        self.metrics
-            .speculative_execution_invalidated
-            .inc_by(count as f64);
-    }
-
     fn record_signature_verification_latency(&self, sig_type: &str, latency_secs: f64) {
         self.metrics
             .signature_verification_latency
@@ -1253,10 +1170,6 @@ impl MetricsRecorder for PrometheusRecorder {
             .memory_exec
             .with_label_values(&["certificate_trackers"])
             .set(m.exec_certificate_trackers as f64);
-        self.metrics
-            .memory_exec
-            .with_label_values(&["speculative_results"])
-            .set(m.exec_speculative_results as f64);
         self.metrics
             .memory_exec
             .with_label_values(&["expected_exec_certs"])
