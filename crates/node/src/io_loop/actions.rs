@@ -198,21 +198,15 @@ where
             }
 
             // ═══════════════════════════════════════════════════════════
-            // Receipt storage — accumulated and flushed async
+            // Receipt storage — written immediately
             // ═══════════════════════════════════════════════════════════
             Action::StoreReceiptBundles { bundles } => {
                 debug!(
                     count = bundles.len(),
                     tx_hashes = ?bundles.iter().map(|b| b.tx_hash).collect::<Vec<_>>(),
-                    "Receipt bundles queued for storage"
+                    "Storing receipt bundles"
                 );
-                self.pending_receipt_bundles.extend(bundles);
-                // Mark that receipts need flushing. The actual deadline is set
-                // lazily in flush_expired_batches when we have a time source.
-                if self.receipt_flush_deadline.is_none() {
-                    // Sentinel: Duration::ZERO means "set the real deadline on next tick"
-                    self.receipt_flush_deadline = Some(std::time::Duration::ZERO);
-                }
+                self.storage.store_receipt_bundles(&bundles);
             }
 
             // ═══════════════════════════════════════════════════════════
@@ -436,9 +430,8 @@ where
     /// up the backlog.
     pub(super) fn flush_block_commits(&mut self) {
         if self.pending_block_commits.is_empty() {
-            // Also flush any receipt/EC bundles that arrived after their
-            // block was already committed.
-            self.flush_pending_receipts();
+            // Also flush any EC bundles that arrived after their block was
+            // already committed.
             self.flush_pending_ecs();
             return;
         }
@@ -817,30 +810,6 @@ where
                 }));
             }
         });
-    }
-
-    /// Flush receipt bundles that are not associated with a pending block
-    /// commit. These arise when async execution (`ExecuteTransactions` /
-    /// `SpeculativeExecute`) completes *after* the block that references
-    /// those certificates was already committed and flushed. Storing them
-    /// promptly ensures the sync protocol can serve those blocks; without
-    /// this the sync protocol cannot reconstruct `DatabaseUpdates` for
-    /// those blocks, stalling recovery and preventing new commits that
-    /// would otherwise have drained the receipts.
-    ///
-    /// This is synchronous (not spawned on the execution pool) to avoid a
-    /// race with `flush_block_commits`: if receipts are written async and
-    /// a subsequent block commit runs before the write completes, the
-    /// commit closure panics on `get_ledger_receipt` returning `None`.
-    /// Receipt storage is a small RocksDB `WriteBatch`, so the main-thread
-    /// cost is negligible.
-    pub(super) fn flush_pending_receipts(&mut self) {
-        if self.pending_receipt_bundles.is_empty() {
-            return;
-        }
-        let bundles = std::mem::take(&mut self.pending_receipt_bundles);
-        self.storage.store_receipt_bundles(&bundles);
-        self.receipt_flush_deadline = None;
     }
 
     /// Flush any pending EC writes that arrived after their block was already
