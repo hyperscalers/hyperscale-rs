@@ -39,11 +39,18 @@ pub fn execute_single_shard<S: SubstateStore>(
 
     let mut result = result;
     if num_shards > 1 {
+        let declared_nodes: Vec<_> = tx
+            .declared_reads
+            .iter()
+            .chain(tx.declared_writes.iter())
+            .copied()
+            .collect();
         result.database_updates = sharding::filter_updates_for_shard(
             &result.database_updates,
             local_shard,
             num_shards,
             storage,
+            &declared_nodes,
         );
     }
     result
@@ -82,11 +89,18 @@ pub fn execute_cross_shard<S: SubstateStore>(
 
     let mut result = result;
     if num_shards > 1 {
+        let declared_nodes: Vec<_> = transaction
+            .declared_reads
+            .iter()
+            .chain(transaction.declared_writes.iter())
+            .copied()
+            .collect();
         result.database_updates = sharding::filter_updates_for_shard(
             &result.database_updates,
             local_shard,
             num_shards,
             storage,
+            &declared_nodes,
         );
     }
     result

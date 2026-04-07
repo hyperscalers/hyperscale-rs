@@ -650,6 +650,19 @@ where
                             );
                         }
 
+                        // Collect all declared nodes from block transactions
+                        // for filtering undeclared writes.
+                        let all_declared_nodes: Vec<hyperscale_types::NodeId> = block
+                            .transactions
+                            .iter()
+                            .flat_map(|tx| {
+                                tx.declared_reads
+                                    .iter()
+                                    .chain(tx.declared_writes.iter())
+                                    .copied()
+                            })
+                            .collect();
+
                         // Reconstruct DatabaseUpdates from buffered receipts.
                         let per_cert: Vec<hyperscale_types::DatabaseUpdates> = if !receipts
                             .is_empty()
@@ -667,6 +680,7 @@ where
                                         local_shard,
                                         num_shards,
                                         &*storage,
+                                        &all_declared_nodes,
                                     )
                                 })
                                 .collect()
@@ -691,6 +705,7 @@ where
                                         local_shard,
                                         num_shards,
                                         &*storage,
+                                        &all_declared_nodes,
                                     )
                                 })
                                 .collect()

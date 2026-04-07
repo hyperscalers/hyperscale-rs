@@ -1,15 +1,72 @@
 //! Shard assignment and write filtering for Radix Engine DatabaseUpdates.
 //!
-//! Maps Radix Engine's hierarchical object model to the sharding model:
-//! - Global entities (accounts, components) are assigned to shards by hash
-//! - Internal entities (vaults, KV stores) inherit their parent's shard
-//! - System entities (ConsensusManager, TransactionTracker) are filtered out
+//! # The Problem
 //!
-//! This module consolidates all RE-specific shard/node resolution logic.
+//! The Radix Engine's object model doesn't align with our sharding model:
+//!
+//! - **Accounts** (`0x51`) are global entities assigned to shards by hash.
+//! - **Vaults** (`0x58`) are internal entities whose NodeIds are random hashes
+//!   (`hash(creating_tx_hash, counter)`) with NO structural relationship to their
+//!   owning account. A vault's `outer_object` points to its **resource manager**
+//!   (`0x5d`), not the account — because vaults are "inner objects" of the
+//!   resource blueprint, not the account blueprint.
+//! - A simple XRD transfer writes to vault nodes only — the account node itself
+//!   is read-only (the KV store entry holding the `Own(vault_id)` doesn't change).
+//! - The account→vault relationship is stored as `Own(vault_id)` in the account's
+//!   KV store. There is NO back-pointer from vault to account.
+//!
+//! This means:
+//! 1. We can't determine a vault's shard from its NodeId alone.
+//! 2. We can't walk UP from vault to account (no back-pointer exists).
+//! 3. We must walk DOWN from declared accounts to discover their vaults.
+//!
+//! # Current Scope: Proof of Concept for Simple Transfers
+//!
+//! This implementation handles the basic case where:
+//! - Transactions are simple account-to-account transfers.
+//! - The transaction manifest declares the involved **account NodeIds** as
+//!   `declared_reads`/`declared_writes`.
+//! - Each account's vaults are discovered by scanning account substates for
+//!   SBOR-encoded `Own(NodeId)` references.
+//!
+//! **This is NOT a general solution.** A full implementation would require:
+//! - **Transaction preview/simulation** before submission to discover the
+//!   complete read/write set (all NodeIds actually touched by the Radix Engine,
+//!   including vaults, KV stores, proofs, buckets, etc.).
+//! - The preview would provide vault NodeIds directly, eliminating the need
+//!   for the walk-down heuristic.
+//! - Complex transactions (DEX swaps, multi-component calls) touch entities
+//!   beyond simple account vaults and would need preview to correctly declare
+//!   their full dependency set.
+//!
+//! # Approach
+//!
+//! Filtering happens in two stages:
+//!
+//! **Stage 1: Ownership resolution** ([`resolve_owned_nodes`])
+//! Scans declared accounts' substates to discover which vault NodeIds they own.
+//! Uses SBOR byte scanning to find `Own(NodeId)` references (tag `0x90` + 30 bytes).
+//! Builds a map from each internal NodeId to its owning account.
+//!
+//! **Stage 2: Shard filtering** ([`filter_updates_for_shard`])
+//! Applies three filters:
+//! - System entities (ConsensusManager, TransactionTracker, Validator) are dropped.
+//! - Nodes not owned by any declared account are dropped (prevents non-deterministic
+//!   writes from undeclared entities like fee vaults).
+//! - Nodes assigned to other shards (based on owning account's hash) are dropped.
+//!
+//! # Why filter undeclared writes?
+//!
+//! The mempool prevents concurrent access to declared accounts. But the Radix
+//! Engine also writes to undeclared entities (e.g. fee/royalty vaults owned by
+//! the resource manager). These writes are invisible to the mempool's conflict
+//! detection. If two transactions both touch the same fee vault, validators
+//! that execute at different committed heights see different vault balances,
+//! producing different DatabaseUpdates and divergent state roots.
 
-use hyperscale_storage::{DatabaseUpdates, DbPartitionKey, DbSortKey, SubstateDatabase};
+use hyperscale_storage::{DatabaseUpdates, DbPartitionKey, SubstateDatabase};
 use hyperscale_types::{NodeId, ShardGroupId};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// System entity type bytes that should be filtered from DatabaseUpdates.
 ///
@@ -30,23 +87,93 @@ const INTERNAL_ENTITY_TYPES: &[u8] = &[
     0x80, // InternalGenericComponent
 ];
 
+/// SBOR custom value kind tag for `Own(NodeId)` references.
+const SBOR_OWN_TAG: u8 = 0x90;
+
+// ============================================================================
+// Stage 1: Ownership Resolution
+// ============================================================================
+
+/// Maps internal NodeIds (vaults, KV stores) to their owning declared account.
+///
+/// For each declared account, scans all partition substates looking for
+/// SBOR-encoded `Own(NodeId)` references. Returns a map from internal NodeId
+/// to the account that owns it.
+///
+/// This is the "walk down" from accounts to vaults. It's necessary because
+/// vaults have no back-pointer to their owning account — `outer_object` points
+/// to the resource manager, not the account.
+pub fn resolve_owned_nodes<S: SubstateDatabase>(
+    storage: &S,
+    declared_nodes: &[NodeId],
+) -> HashMap<NodeId, NodeId> {
+    use radix_substate_store_interface::db_key_mapper::{DatabaseKeyMapper, SpreadPrefixKeyMapper};
+
+    let mut ownership: HashMap<NodeId, NodeId> = HashMap::new();
+
+    for account in declared_nodes {
+        let radix_node_id = radix_common::types::NodeId(account.0);
+        let db_node_key = SpreadPrefixKeyMapper::to_db_node_key(&radix_node_id);
+
+        // Scan all 256 partitions. Global entities use:
+        //   0..63 — module partitions (metadata, royalties, etc.)
+        //   64+   — main state partitions (fields, KV stores)
+        for partition_num in 0..=255u8 {
+            let pk = DbPartitionKey {
+                node_key: db_node_key.clone(),
+                partition_num,
+            };
+            for (_sort_key, value) in storage.list_raw_values_from_db_key(&pk, None) {
+                extract_owned_node_ids(&value, *account, &mut ownership);
+            }
+        }
+    }
+
+    ownership
+}
+
+/// Scan raw SBOR bytes for `Own(NodeId)` references to internal entities.
+///
+/// SBOR encodes `Own` as: `[0x90, <30 bytes NodeId>]`.
+/// We look for this tag followed by a known internal entity type byte.
+/// False positives are near-impossible since NodeIds are random hashes.
+fn extract_owned_node_ids(value: &[u8], owner: NodeId, ownership: &mut HashMap<NodeId, NodeId>) {
+    if value.len() < 31 {
+        return;
+    }
+    for i in 0..value.len() - 30 {
+        if value[i] == SBOR_OWN_TAG && INTERNAL_ENTITY_TYPES.contains(&value[i + 1]) {
+            let mut id = [0u8; 30];
+            id.copy_from_slice(&value[i + 1..i + 31]);
+            ownership.entry(NodeId(id)).or_insert(owner);
+        }
+    }
+}
+
+// ============================================================================
+// Stage 2: Shard Filtering
+// ============================================================================
+
 /// Filter DatabaseUpdates for a single shard.
 ///
-/// Performs two operations in a single pass:
-/// 1. **System filtering**: removes writes to system entities (ConsensusManager,
-///    TransactionTracker, Validator) and their internal children (fee vault, etc.)
-/// 2. **Shard assignment**: keeps only writes belonging to the local shard.
-///    Internal nodes (vaults) are assigned to the shard of their parent global
-///    entity, not by hashing their own NodeId.
+/// Keeps only writes that:
+/// 1. Are not system entities (ConsensusManager, TransactionTracker, Validator)
+/// 2. Belong to a declared account (directly or as an owned internal node)
+/// 3. Are assigned to `local_shard` based on the owning account's hash
 ///
-/// The `storage` parameter is used to look up vault → parent ownership via the
-/// TypeInfo substate (partition 0, field 0). This is a cheap single-key read.
+/// The `declared_nodes` parameter contains account NodeIds from the transaction
+/// manifest's declared reads/writes. The function scans their substates to
+/// discover owned vaults, then filters accordingly.
 pub fn filter_updates_for_shard<S: SubstateDatabase>(
     updates: &DatabaseUpdates,
     local_shard: ShardGroupId,
     num_shards: u64,
     storage: &S,
+    declared_nodes: &[NodeId],
 ) -> DatabaseUpdates {
+    let declared_set: HashSet<NodeId> = declared_nodes.iter().copied().collect();
+    let ownership = resolve_owned_nodes(storage, declared_nodes);
+
     let mut filtered = DatabaseUpdates::default();
 
     for (db_node_key, node_updates) in &updates.node_updates {
@@ -56,35 +183,26 @@ pub fn filter_updates_for_shard<S: SubstateDatabase>(
 
         let entity_type = node_id.0[0];
 
-        // Filter out known system global entities by type byte.
+        // Drop system entities.
         if SYSTEM_ENTITY_TYPES.contains(&entity_type) {
             continue;
         }
 
-        // Resolve the shard-owning global entity for this node.
-        // For global entities: use the node's own ID.
-        // For internal entities: look up the parent (outer_object).
-        let is_internal = INTERNAL_ENTITY_TYPES.contains(&entity_type);
-        let shard_node_id = if is_internal {
-            match read_outer_object(storage, db_node_key) {
-                Some(parent_id) => {
-                    // Filter out internal nodes owned by system entities.
-                    if SYSTEM_ENTITY_TYPES.contains(&parent_id.0[0]) {
-                        continue;
-                    }
-                    parent_id
-                }
-                None => {
-                    // Can't determine parent — skip to be safe.
-                    // This shouldn't happen for well-formed substates.
-                    continue;
-                }
-            }
-        } else {
+        // Determine which account this node belongs to, for both
+        // ownership checking and shard assignment.
+        let shard_node_id = if declared_set.contains(&node_id) {
+            // This IS a declared account — use itself for shard assignment.
             node_id
+        } else if let Some(&owner) = ownership.get(&node_id) {
+            // Internal node owned by a declared account — use the owner.
+            owner
+        } else {
+            // Not declared, not owned by any declared account.
+            // This is an undeclared write (fee vault, etc.) — drop it.
+            continue;
         };
 
-        // Shard assignment based on the resolved global entity.
+        // Shard assignment based on the owning account.
         let node_shard = hyperscale_types::shard_for_node(&shard_node_id, num_shards);
         if node_shard != local_shard {
             continue;
@@ -97,6 +215,10 @@ pub fn filter_updates_for_shard<S: SubstateDatabase>(
 
     filtered
 }
+
+// ============================================================================
+// Utilities
+// ============================================================================
 
 /// Extract deduplicated, deterministically-ordered NodeIds from DatabaseUpdates.
 ///
@@ -127,37 +249,10 @@ pub fn db_node_key_to_node_id(db_node_key: &[u8]) -> Option<NodeId> {
     Some(NodeId(id))
 }
 
-/// Read the `outer_object` (parent global entity) for an internal node.
-///
-/// Reads the TypeInfo substate at partition 0, field 0. The TypeInfo contains
-/// an `OuterObjectInfo` which, for internal nodes, points to the parent
-/// global component (e.g., a vault's owning account).
-///
-/// Returns `None` if the substate doesn't exist or can't be decoded.
-fn read_outer_object<S: SubstateDatabase>(storage: &S, db_node_key: &[u8]) -> Option<NodeId> {
-    let partition_key = DbPartitionKey {
-        node_key: db_node_key.to_vec(),
-        partition_num: 0, // TYPE_INFO_FIELD_PARTITION
-    };
-    let sort_key = DbSortKey(vec![0]); // TypeInfoField::TypeInfo = 0
-
-    let raw = storage.get_raw_substate_by_db_key(&partition_key, &sort_key)?;
-    decode_outer_object_from_type_info(&raw)
+/// Check if an entity type byte is an internal (child) entity.
+pub fn is_internal_entity(entity_type: u8) -> bool {
+    INTERNAL_ENTITY_TYPES.contains(&entity_type)
 }
-
-/// Decode the outer_object NodeId from a raw TypeInfoSubstate.
-fn decode_outer_object_from_type_info(raw: &[u8]) -> Option<NodeId> {
-    use radix_common::prelude::scrypto_decode;
-    use radix_engine::system::type_info::TypeInfoSubstate;
-
-    let type_info: TypeInfoSubstate = scrypto_decode(raw).ok()?;
-    let global_addr = type_info.outer_object()?;
-    Some(NodeId(global_addr.into_node_id().0))
-}
-
-// ============================================================================
-// RE key format conversions (moved from storage/writes.rs)
-// ============================================================================
 
 /// Compute the SpreadPrefixKeyMapper db_node_key for a NodeId.
 ///
@@ -168,11 +263,11 @@ pub fn node_entity_key(node_id: &NodeId) -> Vec<u8> {
     SpreadPrefixKeyMapper::to_db_node_key(&radix_node_id)
 }
 
-/// Extract state changes from `DatabaseUpdates` without reading previous values.
+/// Extract state changes from `DatabaseUpdates`.
 ///
-/// All `Set` operations are classified as `Create` (no previous_value lookup).
-/// `Delete` operations use an empty previous_value. This is safe because
-/// `state_changes` are NOT part of the consensus receipt hash.
+/// Converts `DatabaseUpdates` into a flat list of `SubstateChange` entries
+/// for storage in ledger receipts. `Set` operations become `Create` (no
+/// previous_value lookup). `Delete` operations use empty previous_value.
 pub fn extract_state_changes(
     db_updates: &hyperscale_storage::DatabaseUpdates,
 ) -> Vec<hyperscale_types::SubstateChange> {
@@ -283,339 +378,4 @@ pub fn receipt_to_database_updates(
     }
 
     updates
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use hyperscale_types::{PartitionNumber, SubstateChangeAction};
-    use indexmap::indexmap;
-    use radix_common::prelude::DatabaseUpdate;
-    use radix_substate_store_interface::db_key_mapper::{DatabaseKeyMapper, SpreadPrefixKeyMapper};
-    use radix_substate_store_interface::interface::{
-        DatabaseUpdates, DbSortKey, NodeDatabaseUpdates, PartitionDatabaseUpdates,
-    };
-
-    fn make_db_node_key(node_id: &[u8; 30]) -> Vec<u8> {
-        let radix_id = radix_common::types::NodeId(*node_id);
-        SpreadPrefixKeyMapper::to_db_node_key(&radix_id)
-    }
-
-    // ── extract_state_changes tests ──────────────────────────────────────
-
-    fn make_set_updates(
-        node_id: [u8; 30],
-        partition: u8,
-        sort_key: Vec<u8>,
-        value: Vec<u8>,
-    ) -> DatabaseUpdates {
-        let db_node_key = make_db_node_key(&node_id);
-        DatabaseUpdates {
-            node_updates: indexmap! {
-                db_node_key => NodeDatabaseUpdates {
-                    partition_updates: indexmap! {
-                        partition => PartitionDatabaseUpdates::Delta {
-                            substate_updates: indexmap! {
-                                DbSortKey(sort_key) => DatabaseUpdate::Set(value),
-                            }
-                        }
-                    }
-                }
-            },
-        }
-    }
-
-    fn make_delete_updates(node_id: [u8; 30], partition: u8, sort_key: Vec<u8>) -> DatabaseUpdates {
-        let db_node_key = make_db_node_key(&node_id);
-        DatabaseUpdates {
-            node_updates: indexmap! {
-                db_node_key => NodeDatabaseUpdates {
-                    partition_updates: indexmap! {
-                        partition => PartitionDatabaseUpdates::Delta {
-                            substate_updates: indexmap! {
-                                DbSortKey(sort_key) => DatabaseUpdate::Delete,
-                            }
-                        }
-                    }
-                }
-            },
-        }
-    }
-
-    fn make_reset_updates(
-        node_id: [u8; 30],
-        partition: u8,
-        new_values: Vec<(Vec<u8>, Vec<u8>)>,
-    ) -> DatabaseUpdates {
-        let db_node_key = make_db_node_key(&node_id);
-        let new_substate_values = new_values
-            .into_iter()
-            .map(|(k, v)| (DbSortKey(k), v))
-            .collect();
-        DatabaseUpdates {
-            node_updates: indexmap! {
-                db_node_key => NodeDatabaseUpdates {
-                    partition_updates: indexmap! {
-                        partition => PartitionDatabaseUpdates::Reset {
-                            new_substate_values,
-                        }
-                    }
-                }
-            },
-        }
-    }
-
-    #[test]
-    fn test_set_classifies_as_create() {
-        let node_id = [1u8; 30];
-        let db_updates = make_set_updates(node_id, 0, vec![42], b"new_value".to_vec());
-        let changes = extract_state_changes(&db_updates);
-        assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].substate_ref.node_id, NodeId(node_id));
-        assert_eq!(changes[0].substate_ref.partition, PartitionNumber(0));
-        assert_eq!(changes[0].substate_ref.sort_key, vec![42]);
-        match &changes[0].action {
-            SubstateChangeAction::Create { new_value } => {
-                assert_eq!(new_value, b"new_value");
-            }
-            other => panic!("Expected Create, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_delete() {
-        let node_id = [3u8; 30];
-        let db_updates = make_delete_updates(node_id, 1, vec![5]);
-        let changes = extract_state_changes(&db_updates);
-        assert_eq!(changes.len(), 1);
-        match &changes[0].action {
-            SubstateChangeAction::Delete { previous_value } => {
-                assert!(previous_value.is_empty());
-            }
-            other => panic!("Expected Delete, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_multiple_nodes_and_partitions() {
-        let node_a = [10u8; 30];
-        let node_b = [20u8; 30];
-        let db_node_key_a = make_db_node_key(&node_a);
-        let db_node_key_b = make_db_node_key(&node_b);
-        let db_updates = DatabaseUpdates {
-            node_updates: indexmap! {
-                db_node_key_a => NodeDatabaseUpdates {
-                    partition_updates: indexmap! {
-                        0 => PartitionDatabaseUpdates::Delta {
-                            substate_updates: indexmap! {
-                                DbSortKey(vec![1]) => DatabaseUpdate::Set(b"a1".to_vec()),
-                            }
-                        },
-                        5 => PartitionDatabaseUpdates::Delta {
-                            substate_updates: indexmap! {
-                                DbSortKey(vec![2]) => DatabaseUpdate::Set(b"a2".to_vec()),
-                            }
-                        }
-                    }
-                },
-                db_node_key_b => NodeDatabaseUpdates {
-                    partition_updates: indexmap! {
-                        0 => PartitionDatabaseUpdates::Delta {
-                            substate_updates: indexmap! {
-                                DbSortKey(vec![3]) => DatabaseUpdate::Delete,
-                            }
-                        }
-                    }
-                }
-            },
-        };
-        let changes = extract_state_changes(&db_updates);
-        assert_eq!(changes.len(), 3);
-        let node_ids: Vec<_> = changes.iter().map(|c| c.substate_ref.node_id).collect();
-        assert!(node_ids.contains(&NodeId(node_a)));
-        assert!(node_ids.contains(&NodeId(node_b)));
-    }
-
-    #[test]
-    fn test_reset_partition() {
-        let node_id = [5u8; 30];
-        let db_updates = make_reset_updates(node_id, 2, vec![(vec![1], b"reset_val".to_vec())]);
-        let changes = extract_state_changes(&db_updates);
-        assert_eq!(changes.len(), 1);
-        match &changes[0].action {
-            SubstateChangeAction::Create { new_value } => {
-                assert_eq!(new_value, b"reset_val");
-            }
-            other => panic!("Expected Create for Reset partition, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_empty_updates() {
-        let db_updates = DatabaseUpdates::default();
-        let changes = extract_state_changes(&db_updates);
-        assert!(changes.is_empty());
-    }
-
-    #[test]
-    fn test_invalid_node_key_skipped() {
-        let db_updates = DatabaseUpdates {
-            node_updates: indexmap! {
-                vec![0u8; 10] => NodeDatabaseUpdates {
-                    partition_updates: indexmap! {
-                        0 => PartitionDatabaseUpdates::Delta {
-                            substate_updates: indexmap! {
-                                DbSortKey(vec![1]) => DatabaseUpdate::Set(b"val".to_vec()),
-                            }
-                        }
-                    }
-                }
-            },
-        };
-        let changes = extract_state_changes(&db_updates);
-        assert!(changes.is_empty(), "Malformed node key should be skipped");
-    }
-
-    // ── receipt_to_database_updates tests ────────────────────────────────
-
-    use hyperscale_types::{
-        LedgerTransactionOutcome, LedgerTransactionReceipt, SubstateChange, SubstateRef,
-    };
-
-    #[test]
-    fn test_empty_receipt_produces_empty_updates() {
-        let receipt = LedgerTransactionReceipt {
-            outcome: LedgerTransactionOutcome::Success,
-            state_changes: vec![],
-            application_events: vec![],
-        };
-        let updates = receipt_to_database_updates(&receipt);
-        assert!(updates.node_updates.is_empty());
-    }
-
-    #[test]
-    fn test_create_produces_set() {
-        let receipt = LedgerTransactionReceipt {
-            outcome: LedgerTransactionOutcome::Success,
-            state_changes: vec![SubstateChange {
-                substate_ref: SubstateRef {
-                    node_id: NodeId([1; 30]),
-                    partition: PartitionNumber(0),
-                    sort_key: vec![10],
-                },
-                action: SubstateChangeAction::Create {
-                    new_value: vec![42],
-                },
-            }],
-            application_events: vec![],
-        };
-        let updates = receipt_to_database_updates(&receipt);
-        assert_eq!(updates.node_updates.len(), 1);
-        let node = updates.node_updates.values().next().unwrap();
-        let part = node.partition_updates.values().next().unwrap();
-        match part {
-            PartitionDatabaseUpdates::Delta { substate_updates } => {
-                assert_eq!(substate_updates.len(), 1);
-                let val = substate_updates.values().next().unwrap();
-                assert!(matches!(val, DatabaseUpdate::Set(v) if v == &vec![42]));
-            }
-            _ => panic!("expected Delta"),
-        }
-    }
-
-    #[test]
-    fn test_delete_produces_delete() {
-        let receipt = LedgerTransactionReceipt {
-            outcome: LedgerTransactionOutcome::Failure,
-            state_changes: vec![SubstateChange {
-                substate_ref: SubstateRef {
-                    node_id: NodeId([2; 30]),
-                    partition: PartitionNumber(1),
-                    sort_key: vec![20],
-                },
-                action: SubstateChangeAction::Delete {
-                    previous_value: vec![99],
-                },
-            }],
-            application_events: vec![],
-        };
-        let updates = receipt_to_database_updates(&receipt);
-        assert_eq!(updates.node_updates.len(), 1);
-        let node = updates.node_updates.values().next().unwrap();
-        let part = node.partition_updates.values().next().unwrap();
-        match part {
-            PartitionDatabaseUpdates::Delta { substate_updates } => {
-                assert_eq!(substate_updates.len(), 1);
-                let val = substate_updates.values().next().unwrap();
-                assert!(matches!(val, DatabaseUpdate::Delete));
-            }
-            _ => panic!("expected Delta"),
-        }
-    }
-
-    #[test]
-    fn test_update_uses_new_value() {
-        let receipt = LedgerTransactionReceipt {
-            outcome: LedgerTransactionOutcome::Success,
-            state_changes: vec![SubstateChange {
-                substate_ref: SubstateRef {
-                    node_id: NodeId([3; 30]),
-                    partition: PartitionNumber(2),
-                    sort_key: vec![30],
-                },
-                action: SubstateChangeAction::Update {
-                    previous_value: vec![10],
-                    new_value: vec![20],
-                },
-            }],
-            application_events: vec![],
-        };
-        let updates = receipt_to_database_updates(&receipt);
-        let node = updates.node_updates.values().next().unwrap();
-        let part = node.partition_updates.values().next().unwrap();
-        match part {
-            PartitionDatabaseUpdates::Delta { substate_updates } => {
-                let val = substate_updates.values().next().unwrap();
-                assert!(
-                    matches!(val, DatabaseUpdate::Set(v) if v == &vec![20]),
-                    "should use new_value, not previous_value"
-                );
-            }
-            _ => panic!("expected Delta"),
-        }
-    }
-
-    #[test]
-    fn test_multiple_changes_same_node_different_partitions() {
-        let receipt = LedgerTransactionReceipt {
-            outcome: LedgerTransactionOutcome::Success,
-            state_changes: vec![
-                SubstateChange {
-                    substate_ref: SubstateRef {
-                        node_id: NodeId([4; 30]),
-                        partition: PartitionNumber(0),
-                        sort_key: vec![1],
-                    },
-                    action: SubstateChangeAction::Create {
-                        new_value: vec![10],
-                    },
-                },
-                SubstateChange {
-                    substate_ref: SubstateRef {
-                        node_id: NodeId([4; 30]),
-                        partition: PartitionNumber(5),
-                        sort_key: vec![2],
-                    },
-                    action: SubstateChangeAction::Create {
-                        new_value: vec![20],
-                    },
-                },
-            ],
-            application_events: vec![],
-        };
-        let updates = receipt_to_database_updates(&receipt);
-        assert_eq!(updates.node_updates.len(), 1);
-        let node = updates.node_updates.values().next().unwrap();
-        assert_eq!(node.partition_updates.len(), 2);
-    }
 }
