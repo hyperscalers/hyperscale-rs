@@ -609,9 +609,12 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
             )> = Vec::with_capacity(requests.len());
 
             for req in &requests {
+                // Expand account NodeIds to include owned vaults.
+                let expanded_nodes =
+                    hyperscale_engine::sharding::expand_nodes_with_owned(ctx.storage, &req.nodes);
                 let entries = match hyperscale_engine::fetch_state_entries_speculative(
                     ctx.storage,
-                    &req.nodes,
+                    &expanded_nodes,
                     parent_height,
                     &merged_updates,
                 ) {
@@ -660,6 +663,10 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
 }
 
 /// Fetch state entries for each provision request at committed block height.
+///
+/// Expands declared account NodeIds to include their owned vaults before
+/// fetching. The remote shard needs vault substates (balances) to execute
+/// transfers, not just the account's own substates.
 fn fetch_entries_for_requests<S: CommitStore + SubstateStore + ConsensusStore>(
     ctx: &ActionContext<'_, S>,
     requests: &[hyperscale_core::ProvisionRequest],
@@ -672,10 +679,13 @@ fn fetch_entries_for_requests<S: CommitStore + SubstateStore + ConsensusStore>(
 )> {
     let mut per_tx = Vec::with_capacity(requests.len());
     for req in requests {
+        // Expand account NodeIds to include owned vaults.
+        let expanded_nodes =
+            hyperscale_engine::sharding::expand_nodes_with_owned(ctx.storage, &req.nodes);
         let entries =
             match ctx
                 .executor
-                .fetch_state_entries(ctx.storage, &req.nodes, block_height.0)
+                .fetch_state_entries(ctx.storage, &expanded_nodes, block_height.0)
             {
                 Some(entries) => entries,
                 None => {
@@ -683,7 +693,7 @@ fn fetch_entries_for_requests<S: CommitStore + SubstateStore + ConsensusStore>(
                         source_shard = source_shard.0,
                         block_height = block_height.0,
                         tx_hash = %req.tx_hash,
-                        node_count = req.nodes.len(),
+                        node_count = expanded_nodes.len(),
                         "fetch_state_entries returned None — JVT version unavailable"
                     );
                     continue;

@@ -150,6 +150,27 @@ fn extract_owned_node_ids(value: &[u8], owner: NodeId, ownership: &mut HashMap<N
     }
 }
 
+/// Expand a list of declared NodeIds to include owned internal nodes (vaults).
+///
+/// Used by the provision path: `build_provision_requests` only knows about
+/// declared account NodeIds, but `fetch_state_entries` needs the vault NodeIds
+/// too — the remote shard needs vault substates to execute the transaction.
+///
+/// Returns a new list containing both the original declared nodes and any
+/// internal nodes (vaults, KV stores) discovered in their substates.
+pub fn expand_nodes_with_owned<S: SubstateDatabase>(storage: &S, nodes: &[NodeId]) -> Vec<NodeId> {
+    let ownership = resolve_owned_nodes(storage, nodes);
+    let mut expanded: Vec<NodeId> = nodes.to_vec();
+    for internal_id in ownership.keys() {
+        if !expanded.contains(internal_id) {
+            expanded.push(*internal_id);
+        }
+    }
+    expanded.sort();
+    expanded.dedup();
+    expanded
+}
+
 // ============================================================================
 // Stage 2: Shard Filtering
 // ============================================================================
