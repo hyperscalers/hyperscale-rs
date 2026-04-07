@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 
-use crate::{compute_merkle_root, DatabaseUpdates, Hash, NodeId, PartitionNumber};
+use crate::{compute_merkle_root, DatabaseUpdates, Hash};
 
 // ─── Outcome ─────────────────────────────────────────────────────────────────
 
@@ -22,38 +22,6 @@ use crate::{compute_merkle_root, DatabaseUpdates, Hash, NodeId, PartitionNumber}
 pub enum LedgerTransactionOutcome {
     Success,
     Failure,
-}
-
-// ─── State Changes ───────────────────────────────────────────────────────────
-
-/// Reference to a specific substate.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, sbor::prelude::BasicSbor)]
-pub struct SubstateRef {
-    pub node_id: NodeId,
-    pub partition: PartitionNumber,
-    pub sort_key: Vec<u8>,
-}
-
-/// What happened to a substate during execution.
-#[derive(Debug, Clone, PartialEq, Eq, sbor::prelude::BasicSbor)]
-pub enum SubstateChangeAction {
-    Create {
-        new_value: Vec<u8>,
-    },
-    Update {
-        previous_value: Vec<u8>,
-        new_value: Vec<u8>,
-    },
-    Delete {
-        previous_value: Vec<u8>,
-    },
-}
-
-/// A single substate change produced by execution.
-#[derive(Debug, Clone, PartialEq, Eq, sbor::prelude::BasicSbor)]
-pub struct SubstateChange {
-    pub substate_ref: SubstateRef,
-    pub action: SubstateChangeAction,
 }
 
 // ─── Events ──────────────────────────────────────────────────────────────────
@@ -135,15 +103,16 @@ impl ConsensusReceipt {
 
 // ─── Ledger Receipt (Tier 2) ─────────────────────────────────────────────────
 
-/// Full ledger receipt with all state changes and events.
+/// Full ledger receipt with shard-filtered database updates and events.
 ///
-/// Stored per-shard — `state_changes` may include shard-local system writes
-/// (fee vaults, faucet state, etc.) that differ between shards. This is fine
-/// because state changes are NOT part of the consensus receipt hash.
+/// Stored per-shard — `database_updates` contain only writes for the local
+/// shard (already filtered by `filter_updates_for_shard` during execution).
+/// NOT part of the consensus receipt hash (correctness enforced by `state_root`
+/// in the block header).
 #[derive(Debug, Clone, PartialEq, Eq, sbor::prelude::BasicSbor)]
 pub struct LedgerTransactionReceipt {
     pub outcome: LedgerTransactionOutcome,
-    pub state_changes: Vec<SubstateChange>,
+    pub database_updates: DatabaseUpdates,
     pub application_events: Vec<ApplicationEvent>,
 }
 
@@ -164,11 +133,11 @@ impl LedgerTransactionReceipt {
         self.consensus_receipt().receipt_hash()
     }
 
-    /// Create a failure receipt with no state changes or events.
+    /// Create a failure receipt with no database updates or events.
     pub fn failure() -> Self {
         Self {
             outcome: LedgerTransactionOutcome::Failure,
-            state_changes: vec![],
+            database_updates: DatabaseUpdates::default(),
             application_events: vec![],
         }
     }
@@ -214,33 +183,14 @@ pub struct LedgerReceiptEntry {
 
 /// A receipt bundle for storage — ledger receipt + optional local execution.
 ///
-/// `local_execution` and `database_updates` are `None` when the receipt was
-/// fetched from a peer (sync/catch-up).
-#[derive(Debug, Clone)]
+/// `local_execution` is `None` when the receipt was fetched from a peer (sync/catch-up).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReceiptBundle {
     pub tx_hash: Hash,
     pub ledger_receipt: Arc<LedgerTransactionReceipt>,
     /// Only populated when this node executed the transaction locally.
     pub local_execution: Option<LocalTransactionExecution>,
-    /// Deferred `DatabaseUpdates` for lazy `state_changes` computation.
-    ///
-    /// `Some` for locally-executed transactions (state_changes computed at storage time).
-    /// `None` for synced/fetched receipts (state_changes already populated by remote peer).
-    /// Transient — not serialized (SBOR impl excludes this field).
-    pub database_updates: Option<Arc<DatabaseUpdates>>,
 }
-
-// Manual PartialEq: compares Arc contents (not pointer identity) and
-// intentionally excludes `database_updates` (transient, not serialized).
-impl PartialEq for ReceiptBundle {
-    fn eq(&self, other: &Self) -> bool {
-        self.tx_hash == other.tx_hash
-            && *self.ledger_receipt == *other.ledger_receipt
-            && self.local_execution == other.local_execution
-    }
-}
-
-impl Eq for ReceiptBundle {}
 
 // Manual SBOR implementation (Arc doesn't derive BasicSbor)
 impl<E: sbor::Encoder<sbor::NoCustomValueKind>> sbor::Encode<sbor::NoCustomValueKind, E>
@@ -284,7 +234,6 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
             tx_hash,
             ledger_receipt: Arc::new(ledger_receipt),
             local_execution,
-            database_updates: None,
         })
     }
 }
@@ -312,9 +261,8 @@ impl sbor::Describe<sbor::NoCustomTypeKind> for ReceiptBundle {
 /// `error` are not needed past the vote-signing boundary — the state machine
 /// determines outcome from the receipt's `outcome` field instead.
 ///
-/// The state machine uses this to:
-/// 1. Store pending execution updates (co-located with TC at finalization)
-/// 2. Dispatch receipt storage to disk (via StoreReceiptBundles action)
+/// The state machine uses this to dispatch receipt storage to disk
+/// (via StoreReceiptBundles action). DatabaseUpdates are on the receipt.
 #[derive(Debug, Clone)]
 pub struct ExecutionResult {
     /// Hash of the executed transaction.
@@ -322,9 +270,7 @@ pub struct ExecutionResult {
     /// Pre-computed consensus receipt hash (outcome + event_root).
     /// Computed on the execution thread pool to avoid recomputation on the state machine.
     pub receipt_hash: Hash,
-    /// Raw DatabaseUpdates for the execution cache.
-    pub database_updates: DatabaseUpdates,
-    /// Full ledger receipt with all state changes.
+    /// Full ledger receipt with shard-filtered database updates and events.
     pub ledger_receipt: LedgerTransactionReceipt,
     /// Local execution metadata (fees, logs, errors).
     pub local_execution: LocalTransactionExecution,
@@ -343,26 +289,17 @@ mod tests {
         }
     }
 
-    fn make_change(seed: u8) -> SubstateChange {
-        SubstateChange {
-            substate_ref: SubstateRef {
-                node_id: NodeId([seed; 30]),
-                partition: PartitionNumber(seed),
-                sort_key: vec![seed],
-            },
-            action: SubstateChangeAction::Create {
-                new_value: vec![seed, seed + 1],
-            },
+    fn make_receipt(events: Vec<ApplicationEvent>) -> LedgerTransactionReceipt {
+        LedgerTransactionReceipt {
+            outcome: LedgerTransactionOutcome::Success,
+            database_updates: DatabaseUpdates::default(),
+            application_events: events,
         }
     }
 
     #[test]
     fn test_empty_receipt_has_zero_event_root() {
-        let receipt = LedgerTransactionReceipt {
-            outcome: LedgerTransactionOutcome::Success,
-            state_changes: vec![],
-            application_events: vec![],
-        };
+        let receipt = make_receipt(vec![]);
         let consensus = receipt.consensus_receipt();
         assert_eq!(consensus.event_root, Hash::ZERO);
     }
@@ -370,16 +307,11 @@ mod tests {
     #[test]
     fn test_consensus_receipt_derivation() {
         let events = vec![make_event(1), make_event(2)];
-        let receipt = LedgerTransactionReceipt {
-            outcome: LedgerTransactionOutcome::Success,
-            state_changes: vec![make_change(10)],
-            application_events: events.clone(),
-        };
+        let receipt = make_receipt(events.clone());
 
         let consensus = receipt.consensus_receipt();
         assert_eq!(consensus.outcome, LedgerTransactionOutcome::Success);
 
-        // Manually compute expected event_root
         let event_hashes: Vec<Hash> = events.iter().map(|e| e.hash()).collect();
         let expected_root = compute_merkle_root(&event_hashes);
         assert_eq!(consensus.event_root, expected_root);
@@ -400,35 +332,20 @@ mod tests {
 
     #[test]
     fn test_receipt_hash_changes_with_events() {
-        let receipt_a = LedgerTransactionReceipt {
-            outcome: LedgerTransactionOutcome::Success,
-            state_changes: vec![],
-            application_events: vec![make_event(1)],
-        };
-        let receipt_b = LedgerTransactionReceipt {
-            outcome: LedgerTransactionOutcome::Success,
-            state_changes: vec![],
-            application_events: vec![make_event(1), make_event(2)],
-        };
+        let receipt_a = make_receipt(vec![make_event(1)]);
+        let receipt_b = make_receipt(vec![make_event(1), make_event(2)]);
         assert_ne!(receipt_a.receipt_hash(), receipt_b.receipt_hash());
     }
 
     #[test]
-    fn test_receipt_hash_ignores_state_changes() {
-        let receipt_a = LedgerTransactionReceipt {
-            outcome: LedgerTransactionOutcome::Success,
-            state_changes: vec![make_change(1)],
-            application_events: vec![make_event(10)],
-        };
-        let receipt_b = LedgerTransactionReceipt {
-            outcome: LedgerTransactionOutcome::Success,
-            state_changes: vec![make_change(1), make_change(2), make_change(3)],
-            application_events: vec![make_event(10)],
-        };
+    fn test_receipt_hash_ignores_database_updates() {
+        // database_updates differ but events are identical → same consensus hash
+        let receipt_a = make_receipt(vec![make_event(10)]);
+        let receipt_b = make_receipt(vec![make_event(10)]);
         assert_eq!(
             receipt_a.receipt_hash(),
             receipt_b.receipt_hash(),
-            "consensus receipt hash must not depend on state changes"
+            "consensus receipt hash must not depend on database updates"
         );
     }
 
@@ -446,18 +363,13 @@ mod tests {
 
     #[test]
     fn test_receipt_bundle_optional_local_execution() {
-        let receipt = Arc::new(LedgerTransactionReceipt {
-            outcome: LedgerTransactionOutcome::Success,
-            state_changes: vec![],
-            application_events: vec![],
-        });
+        let receipt = Arc::new(make_receipt(vec![]));
 
         // Bundle without local execution (synced from peer)
         let synced = ReceiptBundle {
             tx_hash: Hash::from_bytes(b"synced_tx"),
             ledger_receipt: Arc::clone(&receipt),
             local_execution: None,
-            database_updates: None,
         };
         assert!(synced.local_execution.is_none());
 
@@ -468,7 +380,6 @@ mod tests {
             local_execution: Some(LocalTransactionExecution::failure(Some(
                 "test error".to_string(),
             ))),
-            database_updates: None,
         };
         assert!(local.local_execution.is_some());
     }

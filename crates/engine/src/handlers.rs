@@ -23,7 +23,8 @@ pub fn execute_single_shard<S: SubstateStore>(
     local_shard: ShardGroupId,
     num_shards: u64,
 ) -> SingleTxResult {
-    let result = match executor.execute_single_shard(storage, std::slice::from_ref(tx)) {
+    match executor.execute_single_shard(storage, std::slice::from_ref(tx), local_shard, num_shards)
+    {
         Ok(output) => {
             if let Some(r) = output.results().first() {
                 r.clone()
@@ -35,31 +36,13 @@ pub fn execute_single_shard<S: SubstateStore>(
             tracing::warn!(tx_hash = ?tx.hash(), error = %e, "Transaction execution failed");
             SingleTxResult::failure(tx.hash(), e.to_string())
         }
-    };
-
-    let mut result = result;
-    if num_shards > 1 {
-        let declared_nodes: Vec<_> = tx
-            .declared_reads
-            .iter()
-            .chain(tx.declared_writes.iter())
-            .copied()
-            .collect();
-        result.database_updates = sharding::filter_updates_for_shard(
-            &result.database_updates,
-            local_shard,
-            num_shards,
-            storage,
-            &declared_nodes,
-        );
     }
-    result
 }
 
-/// Execute a cross-shard transaction with provisions and shard filtering.
+/// Execute a cross-shard transaction with provisions.
 ///
-/// Executes via the Radix Engine with the provisioned snapshot overlay,
-/// then filters the resulting `DatabaseUpdates` for the local shard.
+/// Executes via the Radix Engine with the provisioned snapshot overlay.
+/// The receipt's `database_updates` are shard-filtered by the executor.
 pub fn execute_cross_shard<S: SubstateStore>(
     executor: &RadixExecutor,
     storage: &S,
@@ -69,10 +52,12 @@ pub fn execute_cross_shard<S: SubstateStore>(
     local_shard: ShardGroupId,
     num_shards: u64,
 ) -> SingleTxResult {
-    let result = match executor.execute_cross_shard(
+    match executor.execute_cross_shard(
         storage,
         std::slice::from_ref(transaction),
         provisions,
+        local_shard,
+        num_shards,
     ) {
         Ok(output) => {
             if let Some(r) = output.results().first() {
@@ -85,25 +70,7 @@ pub fn execute_cross_shard<S: SubstateStore>(
             tracing::warn!(?tx_hash, error = %e, "Cross-shard execution failed");
             SingleTxResult::failure(tx_hash, e.to_string())
         }
-    };
-
-    let mut result = result;
-    if num_shards > 1 {
-        let declared_nodes: Vec<_> = transaction
-            .declared_reads
-            .iter()
-            .chain(transaction.declared_writes.iter())
-            .copied()
-            .collect();
-        result.database_updates = sharding::filter_updates_for_shard(
-            &result.database_updates,
-            local_shard,
-            num_shards,
-            storage,
-            &declared_nodes,
-        );
     }
-    result
 }
 
 /// Extract execution-ready result data from a SingleTxResult.
@@ -111,7 +78,7 @@ pub fn execute_cross_shard<S: SubstateStore>(
 /// Extracts write_nodes and builds a `TxOutcome` for the execution accumulator.
 /// Called on the handler thread (after execution, before returning to state machine).
 pub fn extract_execution_result(result: &SingleTxResult) -> TxOutcome {
-    let write_nodes = sharding::extract_write_nodes(&result.database_updates);
+    let write_nodes = sharding::extract_write_nodes(&result.ledger_receipt.database_updates);
     TxOutcome {
         tx_hash: result.tx_hash,
         outcome: TxExecutionOutcome::Executed {

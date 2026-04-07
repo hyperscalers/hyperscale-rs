@@ -45,19 +45,11 @@ impl RocksDbStorage {
     ) {
         let cf = self.cf();
 
-        // Encode receipt — optionally inject database_updates into state_changes.
-        let receipt_to_store = if let Some(ref updates) = bundle.database_updates {
-            let mut receipt = (*bundle.ledger_receipt).clone();
-            receipt.state_changes = hyperscale_engine::sharding::extract_state_changes(updates);
-            receipt
-        } else {
-            (*bundle.ledger_receipt).clone()
-        };
         typed_cf::batch_put::<LedgerReceiptsCf>(
             batch,
             LedgerReceiptsCf::handle(&cf),
             &bundle.tx_hash,
-            &receipt_to_store,
+            bundle.ledger_receipt.as_ref(),
         );
 
         if let Some(ref local) = bundle.local_execution {

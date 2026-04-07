@@ -10,10 +10,9 @@ use crate::{
 use hyperscale_types::{
     zero_bls_signature, ApplicationEvent, Block, BlockHeader, BlockHeight, Bls12381G2Signature,
     ExecutionCertificate, FeeSummary, Hash, LedgerTransactionOutcome, LedgerTransactionReceipt,
-    LocalTransactionExecution, LogLevel, NodeId, PartitionNumber, QuorumCertificate, ReceiptBundle,
-    ShardExecutionProof, ShardGroupId, SignerBitfield, SubstateChange, SubstateChangeAction,
-    SubstateRef, TransactionCertificate, TransactionDecision, TxExecutionOutcome, TxOutcome,
-    ValidatorId, WaveId,
+    LocalTransactionExecution, LogLevel, NodeId, QuorumCertificate, ReceiptBundle,
+    ShardExecutionProof, ShardGroupId, SignerBitfield, TransactionCertificate, TransactionDecision,
+    TxExecutionOutcome, TxOutcome, ValidatorId, WaveId,
 };
 use radix_common::prelude::DatabaseUpdate;
 use radix_substate_store_interface::db_key_mapper::{DatabaseKeyMapper, SpreadPrefixKeyMapper};
@@ -162,16 +161,7 @@ pub fn make_test_receipt_bundle(seed: u8) -> ReceiptBundle {
     let tx_hash = Hash::from_bytes(&[seed; 32]);
     let ledger_receipt = Arc::new(LedgerTransactionReceipt {
         outcome: LedgerTransactionOutcome::Success,
-        state_changes: vec![SubstateChange {
-            substate_ref: SubstateRef {
-                node_id: NodeId([seed; 30]),
-                partition: PartitionNumber(0),
-                sort_key: vec![seed],
-            },
-            action: SubstateChangeAction::Create {
-                new_value: vec![seed, seed + 1],
-            },
-        }],
+        database_updates: DatabaseUpdates::default(),
         application_events: vec![ApplicationEvent {
             type_id: vec![seed],
             data: vec![seed, seed + 1],
@@ -191,7 +181,6 @@ pub fn make_test_receipt_bundle(seed: u8) -> ReceiptBundle {
         tx_hash,
         ledger_receipt,
         local_execution,
-        database_updates: None,
     }
 }
 

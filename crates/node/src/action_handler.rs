@@ -254,28 +254,23 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
             parent_state_root,
             expected_root,
             cert_tx_hashes,
-            per_cert_declared_nodes,
             block_height,
+            ..
         } => {
             let start = std::time::Instant::now();
-            // Derive DatabaseUpdates from receipts (the quorum-agreed artifact).
+            // Read shard-filtered DatabaseUpdates directly from stored receipts.
+            // The receipt is the quorum-agreed artifact; its database_updates were
+            // shard-filtered at execution time by filter_updates_for_shard.
             let per_cert: Vec<hyperscale_types::DatabaseUpdates> = cert_tx_hashes
                 .iter()
-                .zip(per_cert_declared_nodes.iter())
-                .map(|(tx_hash, declared_nodes)| {
+                .map(|tx_hash| {
                     let receipt = ctx.storage.get_ledger_receipt(tx_hash).unwrap_or_else(|| {
                         panic!(
                             "BUG: receipt missing for {} during state root verification at height {}",
                             tx_hash, block_height
                         )
                     });
-                    hyperscale_engine::sharding::derive_shard_updates_from_receipt(
-                        &receipt,
-                        ctx.local_shard,
-                        ctx.num_shards,
-                        ctx.storage,
-                        declared_nodes,
-                    )
+                    receipt.database_updates.clone()
                 })
                 .collect();
             let merged = hyperscale_storage::merge_database_updates(&per_cert);
@@ -317,22 +312,11 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
             abort_intents,
             waves,
         } => {
-            // Derive DatabaseUpdates from receipts for non-aborted certificates.
+            // Read shard-filtered DatabaseUpdates directly from stored receipts.
             let per_cert: Vec<hyperscale_types::DatabaseUpdates> = certificates
                 .iter()
                 .filter(|c| c.decision != hyperscale_types::TransactionDecision::Aborted)
                 .map(|c| {
-                    let declared_nodes: Vec<hyperscale_types::NodeId> = transactions
-                        .iter()
-                        .find(|tx| tx.hash() == c.transaction_hash)
-                        .map(|tx| {
-                            tx.declared_reads
-                                .iter()
-                                .chain(tx.declared_writes.iter())
-                                .copied()
-                                .collect()
-                        })
-                        .unwrap_or_default();
                     let receipt = ctx
                         .storage
                         .get_ledger_receipt(&c.transaction_hash)
@@ -342,13 +326,7 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
                                 c.transaction_hash, height.0
                             )
                         });
-                    hyperscale_engine::sharding::derive_shard_updates_from_receipt(
-                        &receipt,
-                        ctx.local_shard,
-                        ctx.num_shards,
-                        ctx.storage,
-                        &declared_nodes,
-                    )
+                    receipt.database_updates.clone()
                 })
                 .collect();
             let merged_updates = hyperscale_storage::merge_database_updates(&per_cert);

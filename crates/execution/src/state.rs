@@ -697,26 +697,21 @@ impl ExecutionState {
 
         for result in results {
             let tx_hash = result.tx_hash;
-            let db_updates = Arc::new(result.database_updates);
 
             // For speculative batches, skip receipts for transactions that
             // are no longer tracked (cleared by view change). Canonical
             // execution will produce the correct receipt.
             let dominated = speculative && !self.is_speculative_in_flight_for_tx(&tx_hash);
-            if !dominated {
-                bundles.push(ReceiptBundle {
-                    tx_hash,
-                    ledger_receipt: Arc::new(result.ledger_receipt),
-                    local_execution: Some(result.local_execution),
-                    database_updates: Some(Arc::clone(&db_updates)),
-                });
+            if dominated {
+                continue;
             }
 
-            // Track that we've emitted a receipt for this tx.
-            // Used as a gate for deferred TC creation.
-            if !dominated {
-                self.receipts_emitted.insert(tx_hash);
-            }
+            bundles.push(ReceiptBundle {
+                tx_hash,
+                ledger_receipt: Arc::new(result.ledger_receipt),
+                local_execution: Some(result.local_execution),
+            });
+            self.receipts_emitted.insert(tx_hash);
         }
 
         // Dispatch receipt storage (fire-and-forget, off main thread)

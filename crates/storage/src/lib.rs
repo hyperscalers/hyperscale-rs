@@ -60,6 +60,29 @@ pub fn jvt_parent_height(block_height: u64, root: StateRootHash) -> Option<u64> 
     }
 }
 
+/// An empty SubstateDatabase for use in tests and single-shard contexts
+/// where no storage reads are needed.
+pub fn empty_substate_database() -> impl SubstateDatabase {
+    struct Empty;
+    impl SubstateDatabase for Empty {
+        fn get_raw_substate_by_db_key(
+            &self,
+            _partition_key: &DbPartitionKey,
+            _sort_key: &DbSortKey,
+        ) -> Option<Vec<u8>> {
+            None
+        }
+        fn list_raw_values_from_db_key(
+            &self,
+            _partition_key: &DbPartitionKey,
+            _from_sort_key: Option<&DbSortKey>,
+        ) -> Box<dyn Iterator<Item = (DbSortKey, Vec<u8>)> + '_> {
+            Box::new(std::iter::empty())
+        }
+    }
+    Empty
+}
+
 // Re-export commonly needed Radix types for storage implementations
 pub use hyperscale_types::Hash as StateRootHash;
 pub use radix_common::prelude::{DatabaseUpdate, DbSubstateValue};

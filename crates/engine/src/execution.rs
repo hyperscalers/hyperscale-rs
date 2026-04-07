@@ -51,11 +51,16 @@ pub fn extract_database_updates(receipt: &TransactionReceipt) -> DatabaseUpdates
 
 /// Build a `LedgerTransactionReceipt` from a Radix Engine receipt.
 ///
-/// State changes are derived purely from `DatabaseUpdates` without reading
-/// previous values from storage. The Create/Update/Delete classification is
-/// approximate (all Sets are classified as Create) — this is safe because
-/// `state_changes` are NOT part of the consensus receipt hash.
-pub fn build_ledger_receipt(receipt: &TransactionReceipt) -> LedgerTransactionReceipt {
+/// Shard filtering is applied here so the receipt is always born with
+/// shard-specific `database_updates`. Pass `None` for `shard_context` in
+/// single-shard deployments (no filtering needed).
+pub fn build_ledger_receipt<S: radix_substate_store_interface::interface::SubstateDatabase>(
+    receipt: &TransactionReceipt,
+    storage: &S,
+    declared_nodes: &[hyperscale_types::NodeId],
+    local_shard: hyperscale_types::ShardGroupId,
+    num_shards: u64,
+) -> LedgerTransactionReceipt {
     match &receipt.result {
         TransactionResult::Commit(commit) => {
             let application_events = extract_application_events(commit);
@@ -67,11 +72,19 @@ pub fn build_ledger_receipt(receipt: &TransactionReceipt) -> LedgerTransactionRe
                     LedgerTransactionOutcome::Failure
                 }
             };
-            // state_changes deferred to storage time (flush_receipt_storage).
-            // Safe because receipt_hash() only depends on outcome + event_root.
+            let mut database_updates = extract_database_updates(receipt);
+            if num_shards > 1 {
+                database_updates = crate::sharding::filter_updates_for_shard(
+                    &database_updates,
+                    local_shard,
+                    num_shards,
+                    storage,
+                    declared_nodes,
+                );
+            }
             LedgerTransactionReceipt {
                 outcome,
-                state_changes: vec![],
+                database_updates,
                 application_events,
             }
         }
@@ -425,13 +438,20 @@ mod tests {
 
     // ─── Tests: build_ledger_receipt ────────────────────────────────────
 
+    /// Test helper: build receipt with single-shard defaults (no filtering).
+    fn test_build_receipt(receipt: &TransactionReceipt) -> LedgerTransactionReceipt {
+        // num_shards=1 skips filter_updates_for_shard, so storage is never read.
+        let empty = hyperscale_storage::empty_substate_database();
+        build_ledger_receipt(receipt, &empty, &[], hyperscale_types::ShardGroupId(0), 1)
+    }
+
     #[test]
     fn test_build_ledger_receipt_commit_success() {
         let receipt = TransactionReceipt::empty_commit_success();
-        let ledger = build_ledger_receipt(&receipt);
+        let ledger = test_build_receipt(&receipt);
 
         assert_eq!(ledger.outcome, LedgerTransactionOutcome::Success);
-        assert!(ledger.state_changes.is_empty());
+        assert!(ledger.database_updates.node_updates.is_empty());
         assert!(ledger.application_events.is_empty());
     }
 
@@ -450,31 +470,30 @@ mod tests {
             (event_id.clone(), b"event_data_1".to_vec()),
             (event_id, b"event_data_2".to_vec()),
         ]);
-        let ledger = build_ledger_receipt(&receipt);
+        let ledger = test_build_receipt(&receipt);
 
         assert_eq!(ledger.outcome, LedgerTransactionOutcome::Success);
         assert_eq!(ledger.application_events.len(), 2);
         assert_eq!(ledger.application_events[0].data, b"event_data_1");
         assert_eq!(ledger.application_events[1].data, b"event_data_2");
-        // type_id should be SBOR-encoded EventTypeIdentifier (non-empty)
         assert!(!ledger.application_events[0].type_id.is_empty());
     }
 
     #[test]
     fn test_build_ledger_receipt_reject() {
         let receipt = make_reject_receipt();
-        let ledger = build_ledger_receipt(&receipt);
+        let ledger = test_build_receipt(&receipt);
 
         assert_eq!(ledger, LedgerTransactionReceipt::failure());
         assert_eq!(ledger.outcome, LedgerTransactionOutcome::Failure);
-        assert!(ledger.state_changes.is_empty());
+        assert!(ledger.database_updates.node_updates.is_empty());
         assert!(ledger.application_events.is_empty());
     }
 
     #[test]
     fn test_build_ledger_receipt_abort() {
         let receipt = make_abort_receipt();
-        let ledger = build_ledger_receipt(&receipt);
+        let ledger = test_build_receipt(&receipt);
 
         assert_eq!(ledger, LedgerTransactionReceipt::failure());
     }
@@ -482,8 +501,8 @@ mod tests {
     #[test]
     fn test_build_ledger_receipt_receipt_hash_deterministic() {
         let receipt = TransactionReceipt::empty_commit_success();
-        let ledger_a = build_ledger_receipt(&receipt);
-        let ledger_b = build_ledger_receipt(&receipt);
+        let ledger_a = test_build_receipt(&receipt);
+        let ledger_b = test_build_receipt(&receipt);
 
         assert_eq!(ledger_a.receipt_hash(), ledger_b.receipt_hash());
     }

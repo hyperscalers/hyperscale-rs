@@ -31,15 +31,12 @@
 
 use crate::error::ExecutionError;
 use crate::execution::{
-    build_ledger_receipt, build_local_execution, extract_database_updates, is_committed,
-    ProvisionedSnapshot,
+    build_ledger_receipt, build_local_execution, is_committed, ProvisionedSnapshot,
 };
 use crate::genesis::{GenesisBuilder, GenesisConfig, GenesisError};
 use crate::result::{ExecutionOutput, SingleTxResult};
 use hyperscale_storage::{CommittableSubstateDatabase, SubstateDatabase, SubstateStore};
-use hyperscale_types::{
-    DatabaseUpdates, Hash, NodeId, RoutableTransaction, StateEntry, StateProvision,
-};
+use hyperscale_types::{DatabaseUpdates, NodeId, RoutableTransaction, StateEntry, StateProvision};
 use radix_common::network::NetworkDefinition;
 use radix_engine::transaction::{execute_transaction, ExecutionConfig, TransactionReceipt};
 use radix_engine::vm::DefaultVmModules;
@@ -290,12 +287,14 @@ impl RadixExecutor {
         &self,
         storage: &S,
         transactions: &[Arc<RoutableTransaction>],
+        local_shard: hyperscale_types::ShardGroupId,
+        num_shards: u64,
     ) -> Result<ExecutionOutput, ExecutionError> {
         let start = Instant::now();
         let mut results = Vec::with_capacity(transactions.len());
 
         for tx in transactions {
-            let result = self.execute_one(storage, tx.as_ref())?;
+            let result = self.execute_one(storage, tx, local_shard, num_shards)?;
             results.push(result);
         }
 
@@ -327,6 +326,8 @@ impl RadixExecutor {
         storage: &S,
         transactions: &[Arc<RoutableTransaction>],
         provisions: &[StateProvision],
+        local_shard: hyperscale_types::ShardGroupId,
+        num_shards: u64,
     ) -> Result<ExecutionOutput, ExecutionError> {
         let start = Instant::now();
 
@@ -352,7 +353,7 @@ impl RadixExecutor {
                 &self.caches.exec_config,
             );
 
-            let result = self.receipt_to_result(tx.hash(), &receipt);
+            let result = self.receipt_to_result(storage, tx, &receipt, local_shard, num_shards);
 
             // NO COMMIT HERE - DatabaseUpdates are cached by the state machine
             // and applied when the TransactionCertificate is included in a block.
@@ -372,6 +373,8 @@ impl RadixExecutor {
         &self,
         storage: &S,
         tx: &RoutableTransaction,
+        local_shard: hyperscale_types::ShardGroupId,
+        num_shards: u64,
     ) -> Result<SingleTxResult, ExecutionError> {
         // Take a snapshot for isolated execution
         let snapshot = storage.snapshot();
@@ -391,7 +394,7 @@ impl RadixExecutor {
             &executable,
         );
 
-        let result = self.receipt_to_result(tx.hash(), &receipt);
+        let result = self.receipt_to_result(storage, tx, &receipt, local_shard, num_shards);
 
         // NO COMMIT HERE - DatabaseUpdates are cached by the state machine
         // and applied when the TransactionCertificate is included in a block.
@@ -400,25 +403,32 @@ impl RadixExecutor {
     }
 
     /// Convert a receipt to a result.
-    fn receipt_to_result(&self, tx_hash: Hash, receipt: &TransactionReceipt) -> SingleTxResult {
+    fn receipt_to_result<S: SubstateStore>(
+        &self,
+        storage: &S,
+        tx: &RoutableTransaction,
+        receipt: &TransactionReceipt,
+        local_shard: hyperscale_types::ShardGroupId,
+        num_shards: u64,
+    ) -> SingleTxResult {
         let success = is_committed(receipt);
 
         if success {
-            let database_updates = extract_database_updates(receipt);
-            let ledger_receipt = build_ledger_receipt(receipt);
+            let declared_nodes: Vec<NodeId> = tx
+                .declared_reads
+                .iter()
+                .chain(tx.declared_writes.iter())
+                .copied()
+                .collect();
+            let ledger_receipt =
+                build_ledger_receipt(receipt, storage, &declared_nodes, local_shard, num_shards);
             let local_execution = build_local_execution(receipt);
             let receipt_hash = ledger_receipt.receipt_hash();
 
-            SingleTxResult::success(
-                tx_hash,
-                receipt_hash,
-                ledger_receipt,
-                local_execution,
-                database_updates,
-            )
+            SingleTxResult::success(tx.hash(), receipt_hash, ledger_receipt, local_execution)
         } else {
             let error = format!("{:?}", receipt.result);
-            SingleTxResult::failure(tx_hash, error)
+            SingleTxResult::failure(tx.hash(), error)
         }
     }
 

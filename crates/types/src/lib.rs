@@ -86,7 +86,7 @@ pub use quorum_certificate::QuorumCertificate;
 pub use receipt::{
     ApplicationEvent, ConsensusReceipt, ExecutionResult, FeeSummary, LedgerReceiptEntry,
     LedgerTransactionOutcome, LedgerTransactionReceipt, LocalTransactionExecution, LogLevel,
-    ReceiptBundle, SubstateChange, SubstateChangeAction, SubstateRef,
+    ReceiptBundle,
 };
 pub use signer_bitfield::SignerBitfield;
 pub use state::{ShardExecutionProof, StateEntry, StateProvision};

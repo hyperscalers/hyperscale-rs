@@ -3,8 +3,6 @@
 use hyperscale_types::{
     ExecutionResult, Hash, LedgerTransactionReceipt, LocalTransactionExecution,
 };
-use radix_substate_store_interface::interface::DatabaseUpdates;
-
 /// Output from executing a batch of transactions.
 #[derive(Debug, Clone)]
 pub struct ExecutionOutput {
@@ -57,18 +55,11 @@ pub struct SingleTxResult {
     /// Hash of ConsensusReceipt (outcome + event_root).
     pub receipt_hash: Hash,
 
-    /// Full ledger receipt with all state changes.
+    /// Full ledger receipt with shard-filtered database updates and events.
     pub ledger_receipt: LedgerTransactionReceipt,
 
     /// Local execution metadata (fees, logs, errors).
     pub local_execution: LocalTransactionExecution,
-
-    /// Raw DatabaseUpdates for the execution cache.
-    ///
-    /// Kept separate from the receipt because the receipt has SubstateChange
-    /// format (with Create/Update/Delete + previous values), while
-    /// DatabaseUpdates is the raw format needed for JVT application.
-    pub database_updates: DatabaseUpdates,
 
     /// Error message if execution failed.
     pub error: Option<String>,
@@ -81,7 +72,6 @@ impl SingleTxResult {
         receipt_hash: Hash,
         ledger_receipt: LedgerTransactionReceipt,
         local_execution: LocalTransactionExecution,
-        database_updates: DatabaseUpdates,
     ) -> Self {
         Self {
             tx_hash,
@@ -89,7 +79,6 @@ impl SingleTxResult {
             receipt_hash,
             ledger_receipt,
             local_execution,
-            database_updates,
             error: None,
         }
     }
@@ -102,7 +91,6 @@ impl SingleTxResult {
             receipt_hash: LedgerTransactionReceipt::failure().receipt_hash(),
             ledger_receipt: LedgerTransactionReceipt::failure(),
             local_execution: LocalTransactionExecution::failure(None),
-            database_updates: DatabaseUpdates::default(),
             error: Some(error.into()),
         }
     }
@@ -126,7 +114,6 @@ impl From<SingleTxResult> for ExecutionResult {
         Self {
             tx_hash: r.tx_hash,
             receipt_hash: r.receipt_hash,
-            database_updates: r.database_updates,
             ledger_receipt: r.ledger_receipt,
             local_execution: r.local_execution,
         }

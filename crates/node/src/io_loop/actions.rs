@@ -599,8 +599,6 @@ where
 
         let storage = Arc::clone(&self.storage);
         let event_tx = self.event_sender.clone();
-        let local_shard = self.local_shard;
-        let num_shards = self.num_shards;
         let in_flight = self.commit_in_flight.clone();
 
         self.commit_in_flight.store(true, Ordering::Release);
@@ -722,42 +720,18 @@ where
                             );
                         }
 
-                        // Collect all declared nodes from block transactions
-                        // for filtering undeclared writes.
-                        let all_declared_nodes: Vec<hyperscale_types::NodeId> = block
-                            .transactions
-                            .iter()
-                            .flat_map(|tx| {
-                                tx.declared_reads
-                                    .iter()
-                                    .chain(tx.declared_writes.iter())
-                                    .copied()
-                            })
-                            .collect();
-
-                        // Reconstruct DatabaseUpdates from buffered receipts.
+                        // Read shard-filtered DatabaseUpdates from receipts.
+                        // Receipts carry database_updates that were already filtered
+                        // at execution time by filter_updates_for_shard.
                         let per_cert: Vec<hyperscale_types::DatabaseUpdates> = if !receipts
                             .is_empty()
                         {
                             receipts
                                 .iter()
-                                .map(|entry| {
-                                    let receipt = &entry.receipt;
-                                    let updates =
-                                        hyperscale_engine::sharding::receipt_to_database_updates(
-                                            receipt,
-                                        );
-                                    hyperscale_engine::sharding::filter_updates_for_shard(
-                                        &updates,
-                                        local_shard,
-                                        num_shards,
-                                        &*storage,
-                                        &all_declared_nodes,
-                                    )
-                                })
+                                .map(|entry| entry.receipt.database_updates.clone())
                                 .collect()
                         } else {
-                            // Fallback: read from storage (pre-Step 5 compat).
+                            // Fallback: read from storage.
                             block
                                 .certificates
                                 .iter()
@@ -767,19 +741,7 @@ where
                                 .filter_map(|cert| {
                                     storage.get_ledger_receipt(&cert.transaction_hash)
                                 })
-                                .map(|receipt| {
-                                    let updates =
-                                        hyperscale_engine::sharding::receipt_to_database_updates(
-                                            &receipt,
-                                        );
-                                    hyperscale_engine::sharding::filter_updates_for_shard(
-                                        &updates,
-                                        local_shard,
-                                        num_shards,
-                                        &*storage,
-                                        &all_declared_nodes,
-                                    )
-                                })
+                                .map(|receipt| receipt.database_updates.clone())
                                 .collect()
                         };
                         let merged = hyperscale_storage::merge_database_updates(&per_cert);
@@ -814,7 +776,6 @@ where
                                     tx_hash: entry.tx_hash,
                                     ledger_receipt: std::sync::Arc::new(entry.receipt.clone()),
                                     local_execution: None,
-                                    database_updates: None,
                                 })
                                 .collect();
                             storage.store_receipt_bundles(&bundles);
