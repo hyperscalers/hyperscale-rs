@@ -199,12 +199,12 @@ pub fn generate_proof<S: ReadableTreeStore>(
         .map(|sk| crate::hash_storage_key(sk))
         .collect();
 
-    // Prefetch all tree nodes needed for the proof via batch reads.
-    // When a NodeCache is provided, hydrated nodes are served from the
-    // persistent cache — avoiding RocksDB I/O and to_jvt() entirely.
-    let cached = crate::CachingAdapter::prefetch(tree_store, &root_key, &jvt_keys, node_cache);
+    let adapter = crate::StoreAdapter {
+        store: tree_store,
+        node_cache,
+    };
 
-    let proof = jvt::verkle_proof::prove(&cached, &root_key, &jvt_keys)?;
+    let proof = jvt::verkle_proof::prove(&adapter, &root_key, &jvt_keys)?;
 
     Some(VerkleInclusionProof::new(serialize_verkle_proof(&proof)))
 }
