@@ -405,7 +405,7 @@ impl NodeStateMachine {
                 block_height,
             ));
             self.livelock.on_certificate_committed(tx_hash);
-            self.provisions.cleanup_tx(tx_hash);
+            self.provisions.on_certificate_committed(tx_hash);
         }
 
         // Pass all transactions from block to execution (no need for mempool lookup).
@@ -640,21 +640,13 @@ impl StateMachine for NodeStateMachine {
                 self.provisions
                     .on_verified_remote_header(topology, committed_header)
             }
-            ProtocolEvent::StateRootVerified { block_hash, valid } => self
+            ProtocolEvent::BlockRootVerified {
+                kind,
+                block_hash,
+                valid,
+            } => self
                 .bft
-                .on_state_root_verified(self.topology.snapshot(), block_hash, valid),
-            ProtocolEvent::TransactionRootVerified { block_hash, valid } => self
-                .bft
-                .on_transaction_root_verified(self.topology.snapshot(), block_hash, valid),
-            ProtocolEvent::CertificateRootVerified { block_hash, valid } => self
-                .bft
-                .on_certificate_root_verified(self.topology.snapshot(), block_hash, valid),
-            ProtocolEvent::LocalReceiptRootVerified { block_hash, valid } => self
-                .bft
-                .on_local_receipt_root_verified(self.topology.snapshot(), block_hash, valid),
-            ProtocolEvent::AbortIntentProofsVerified { block_hash, valid } => self
-                .bft
-                .on_abort_intents_verified(self.topology.snapshot(), block_hash, valid),
+                .on_block_root_verified(self.topology.snapshot(), kind, block_hash, valid),
             ProtocolEvent::ProposalBuilt {
                 height,
                 round,
@@ -670,17 +662,18 @@ impl StateMachine for NodeStateMachine {
                 finalized_waves,
             ),
 
-            // ── State Commit ─────────────────────────────────────────────
-            ProtocolEvent::StateCommitComplete { height, state_root } => {
-                self.on_state_commit_complete(height, state_root)
-            }
-
             // ── Block Committed ──────────────────────────────────────────
             ProtocolEvent::BlockCommitted {
                 block_hash,
                 height,
                 block,
-            } => self.on_block_committed(block_hash, height, block),
+                state_root,
+            } => {
+                // JVT unblocking first — unblocks state root verifications for
+                // the next block before subsystem notifications run.
+                self.on_state_commit_complete(height, state_root);
+                self.on_block_committed(block_hash, height, block)
+            }
 
             // ── Provisions ───────────────────────────────────────────────
             ProtocolEvent::StateProvisionsReceived { batch } => self
@@ -771,7 +764,6 @@ impl StateMachine for NodeStateMachine {
                 transactions,
             ),
             // ── Storage / Sync ───────────────────────────────────────────
-            ProtocolEvent::BlockFetched { .. } => vec![],
             ProtocolEvent::SyncBlockReadyToApply { block, qc } => self
                 .bft
                 .on_sync_block_ready_to_apply(self.topology.snapshot(), block, qc),

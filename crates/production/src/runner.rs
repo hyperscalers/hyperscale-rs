@@ -680,7 +680,9 @@ impl ProductionRunner {
         );
 
         // Initialize state machine with genesis (this sets up proposal timer).
-        let actions = io_loop.state_mut().initialize_genesis(genesis_block);
+        let actions = io_loop
+            .state_mut()
+            .initialize_genesis(genesis_block.clone());
         info!(num_actions = actions.len(), "Genesis returned actions");
 
         // Process actions through IoLoop (timers, etc.).
@@ -696,8 +698,10 @@ impl ProductionRunner {
         // stale/zero state. We need to sync it with the actual JVT state from
         // genesis so future blocks compute state_root from the correct base.
         let genesis_commit_output = io_loop.step(NodeInput::Protocol(
-            hyperscale_core::ProtocolEvent::StateCommitComplete {
+            hyperscale_core::ProtocolEvent::BlockCommitted {
+                block_hash: genesis_block.hash(),
                 height: 0,
+                block: genesis_block,
                 state_root: genesis_jvt_root,
             },
         ));

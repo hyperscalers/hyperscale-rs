@@ -1504,24 +1504,6 @@ impl BftState {
                 self.latest_qc = Some(header.parent_qc.clone());
                 self.maybe_unlock_for_qc(topology, &header.parent_qc);
 
-                // Persist the now-certified parent block for sync availability.
-                // With targeted votes, only the next proposer forms the QC via
-                // on_qc_formed (which emits PersistBlock). Other validators
-                // learn about the QC here and must also persist so they can
-                // serve the certified block to syncing peers.
-                let parent_hash = header.parent_qc.block_hash;
-                let parent_block = if let Some(pending) = self.pending_blocks.get(&parent_hash) {
-                    pending.block().map(|b| (*b).clone())
-                } else {
-                    self.certified_blocks.get(&parent_hash).cloned()
-                };
-                if let Some(block) = parent_block {
-                    sync_actions.push(Action::PersistBlock {
-                        block,
-                        qc: header.parent_qc.clone(),
-                    });
-                }
-
                 // Two-chain commit: the parent_qc may allow committing an
                 // ancestor block. This is essential when votes are targeted
                 // to the next proposer only — non-proposers learn about QCs
@@ -2647,72 +2629,45 @@ impl BftState {
     /// Handle state root verification result.
     ///
     /// Called when the runner completes `Action::VerifyStateRoot`. If the state root
-    /// is invalid, the block is rejected (proposer included incorrect state commitment).
-    /// If valid, proceeds to vote for the block.
-    #[instrument(skip(self), fields(block_hash = ?block_hash, valid = valid))]
-    pub fn on_state_root_verified(
-        &mut self,
-        topology: &TopologySnapshot,
-        block_hash: Hash,
-        valid: bool,
-    ) -> Vec<Action> {
-        if !self.verification.on_state_root_verified(block_hash, valid) {
-            warn!(
-                block_hash = ?block_hash,
-                "State root verification FAILED - proposer included incorrect state_root!"
-            );
-            self.pending_blocks.remove(&block_hash);
-            return vec![];
-        }
-
-        let Some(pending_block) = self.pending_blocks.get(&block_hash) else {
-            warn!(
-                block_hash = ?block_hash,
-                "State root verification complete but pending block not found"
-            );
-            return vec![];
-        };
-
-        let block = match pending_block.block() {
-            Some(b) => b,
-            None => return vec![],
-        };
-
-        // Check if all verifications are complete (cycle proofs may still be pending)
-        if !self.verification.is_block_verified(&block) {
-            debug!(
-                block_hash = ?block_hash,
-                "State root done, waiting for other verifications"
-            );
-            return vec![];
-        }
-
-        let height = pending_block.header().height.0;
-        let round = pending_block.header().round;
-
-        // All verifications complete - vote
-        self.create_vote(topology, block_hash, height, round)
-    }
-
-    /// Handle transaction root verification result.
+    /// Handle a block root verification result (unified handler).
     ///
-    /// Called when the runner completes `Action::VerifyTransactionRoot`. If the
-    /// transaction root is invalid, the block is rejected. If valid, proceeds to
-    /// vote for the block (assuming other verifications are also complete).
-    #[instrument(skip(self), fields(block_hash = ?block_hash, valid = valid))]
-    pub fn on_transaction_root_verified(
+    /// Called when any of the 5 verification actions complete (state root,
+    /// transaction root, certificate root, local receipt root, abort intent proofs).
+    /// If invalid, the block is rejected. If valid and all other verifications are
+    /// also complete, proceeds to vote for the block.
+    #[instrument(skip(self), fields(block_hash = ?block_hash, ?kind, valid = valid))]
+    pub fn on_block_root_verified(
         &mut self,
         topology: &TopologySnapshot,
+        kind: hyperscale_core::VerificationKind,
         block_hash: Hash,
         valid: bool,
     ) -> Vec<Action> {
-        if !self
-            .verification
-            .on_transaction_root_verified(block_hash, valid)
-        {
+        use hyperscale_core::VerificationKind;
+
+        let pipeline_ok = match kind {
+            VerificationKind::StateRoot => {
+                self.verification.on_state_root_verified(block_hash, valid)
+            }
+            VerificationKind::TransactionRoot => self
+                .verification
+                .on_transaction_root_verified(block_hash, valid),
+            VerificationKind::CertificateRoot => self
+                .verification
+                .on_certificate_root_verified(block_hash, valid),
+            VerificationKind::LocalReceiptRoot => self
+                .verification
+                .on_local_receipt_root_verified(block_hash, valid),
+            VerificationKind::AbortIntentProofs => self
+                .verification
+                .on_abort_intents_verified(block_hash, valid),
+        };
+
+        if !pipeline_ok {
             warn!(
                 block_hash = ?block_hash,
-                "Transaction root verification FAILED - proposer included incorrect transaction_root!"
+                ?kind,
+                "Block root verification FAILED"
             );
             self.pending_blocks.remove(&block_hash);
             return vec![];
@@ -2721,166 +2676,8 @@ impl BftState {
         let Some(pending_block) = self.pending_blocks.get(&block_hash) else {
             warn!(
                 block_hash = ?block_hash,
-                "Transaction root verification complete but pending block not found"
-            );
-            return vec![];
-        };
-
-        let block = match pending_block.block() {
-            Some(b) => b,
-            None => return vec![],
-        };
-
-        // Check if all verifications are complete (state root, cycle proofs may still be pending)
-        if !self.verification.is_block_verified(&block) {
-            debug!(
-                block_hash = ?block_hash,
-                "Transaction root done, waiting for other verifications"
-            );
-            return vec![];
-        }
-
-        let height = pending_block.header().height.0;
-        let round = pending_block.header().round;
-
-        // All verifications complete - vote
-        self.create_vote(topology, block_hash, height, round)
-    }
-
-    /// Handle receipt root verification result.
-    ///
-    /// Called when the runner completes `Action::VerifyCertificateRoot`. If the
-    /// receipt root is invalid, the block is rejected. If valid, proceeds to
-    /// vote for the block (assuming other verifications are also complete).
-    #[instrument(skip(self), fields(block_hash = ?block_hash, valid = valid))]
-    pub fn on_certificate_root_verified(
-        &mut self,
-        topology: &TopologySnapshot,
-        block_hash: Hash,
-        valid: bool,
-    ) -> Vec<Action> {
-        if !self
-            .verification
-            .on_certificate_root_verified(block_hash, valid)
-        {
-            warn!(
-                block_hash = ?block_hash,
-                "Certificate root verification FAILED - proposer included incorrect certificate_root!"
-            );
-            self.pending_blocks.remove(&block_hash);
-            return vec![];
-        }
-
-        let Some(pending_block) = self.pending_blocks.get(&block_hash) else {
-            warn!(
-                block_hash = ?block_hash,
-                "Certificate root verification complete but pending block not found"
-            );
-            return vec![];
-        };
-
-        let block = match pending_block.block() {
-            Some(b) => b,
-            None => return vec![],
-        };
-
-        // Check if all verifications are complete (state root, tx root, etc. may still be pending)
-        if !self.verification.is_block_verified(&block) {
-            debug!(
-                block_hash = ?block_hash,
-                "Certificate root done, waiting for other verifications"
-            );
-            return vec![];
-        }
-
-        let height = pending_block.header().height.0;
-        let round = pending_block.header().round;
-
-        // All verifications complete - vote
-        self.create_vote(topology, block_hash, height, round)
-    }
-
-    /// Handle local receipt root verification result.
-    ///
-    /// Called when the runner completes `Action::VerifyLocalReceiptRoot`. If the
-    /// local receipt root is invalid, the block is rejected. If valid, proceeds to
-    /// vote for the block (assuming other verifications are also complete).
-    #[instrument(skip(self), fields(block_hash = ?block_hash, valid = valid))]
-    pub fn on_local_receipt_root_verified(
-        &mut self,
-        topology: &TopologySnapshot,
-        block_hash: Hash,
-        valid: bool,
-    ) -> Vec<Action> {
-        if !self
-            .verification
-            .on_local_receipt_root_verified(block_hash, valid)
-        {
-            warn!(
-                block_hash = ?block_hash,
-                "Local receipt root verification FAILED - proposer included incorrect local_receipt_root!"
-            );
-            self.pending_blocks.remove(&block_hash);
-            return vec![];
-        }
-
-        let Some(pending_block) = self.pending_blocks.get(&block_hash) else {
-            warn!(
-                block_hash = ?block_hash,
-                "Local receipt root verification complete but pending block not found"
-            );
-            return vec![];
-        };
-
-        let block = match pending_block.block() {
-            Some(b) => b,
-            None => return vec![],
-        };
-
-        // Check if all verifications are complete (state root, tx root, etc. may still be pending)
-        if !self.verification.is_block_verified(&block) {
-            debug!(
-                block_hash = ?block_hash,
-                "Local receipt root done, waiting for other verifications"
-            );
-            return vec![];
-        }
-
-        let height = pending_block.header().height.0;
-        let round = pending_block.header().round;
-
-        // All verifications complete - vote
-        self.create_vote(topology, block_hash, height, round)
-    }
-
-    /// Handle abort intent proof verification result.
-    ///
-    /// Called when the runner completes `Action::VerifyAbortIntentProofs`. If any
-    /// proof is invalid, the block is rejected. If valid, proceeds to vote for
-    /// the block (assuming other verifications are also complete).
-    #[instrument(skip(self), fields(block_hash = ?block_hash, valid = valid))]
-    pub fn on_abort_intents_verified(
-        &mut self,
-        topology: &TopologySnapshot,
-        block_hash: Hash,
-        valid: bool,
-    ) -> Vec<Action> {
-        if !self
-            .verification
-            .on_abort_intents_verified(block_hash, valid)
-        {
-            warn!(
-                block_hash = ?block_hash,
-                "Abort intent proof verification FAILED - block contains invalid inclusion proofs!"
-            );
-            self.pending_blocks.remove(&block_hash);
-            return vec![];
-        }
-
-        let Some(pending_block) = self.pending_blocks.get(&block_hash) else {
-            warn!(
-                block_hash = ?block_hash,
-                "Abort intent proof verification complete but pending block not found"
+                ?kind,
+                "Verification complete but pending block not found"
             );
             return vec![];
         };
@@ -2893,7 +2690,8 @@ impl BftState {
         if !self.verification.is_block_verified(&block) {
             debug!(
                 block_hash = ?block_hash,
-                "Abort intent proofs done, waiting for other verifications"
+                ?kind,
+                "Verification done, waiting for other verifications"
             );
             return vec![];
         }
@@ -3008,7 +2806,7 @@ impl BftState {
         // Only advance forward (avoid out-of-order updates).
         // Use strict `<` so that same-height updates are accepted: the BFT state
         // machine advances `committed_height` in `commit_block_and_buffered`
-        // *before* the IO loop commits the JVT and sends `StateCommitComplete`.
+        // *before* the IO loop commits the JVT and sends `BlockCommitted`.
         // With `<=` the root update would be silently dropped.
         if block_height < self.committed_height {
             return;
@@ -3151,39 +2949,6 @@ impl BftState {
         }
 
         let mut actions = vec![];
-
-        // Persist the certified block immediately so it's available for sync.
-        // In HotStuff-2, block N gets certified (QC formed) before it's committed
-        // (which happens when block N+1 gets certified). If we only persist on commit,
-        // there's a window where the QC exists but the block isn't in storage,
-        // causing sync failures when other validators try to fetch it.
-        let block = if let Some(pending) = self.pending_blocks.get(&block_hash) {
-            pending.block().map(|b| (*b).clone())
-        } else {
-            self.certified_blocks.get(&block_hash).cloned()
-        };
-
-        if let Some(block) = block {
-            debug!(
-                validator = ?topology.local_validator_id(),
-                height = height,
-                block_hash = ?block_hash,
-                "Persisting certified block for sync availability"
-            );
-            actions.push(Action::PersistBlock {
-                block,
-                qc: qc.clone(),
-            });
-        } else {
-            // Block not yet complete - this can happen if we're still fetching
-            // transactions/certificates. The block will be persisted when it commits.
-            warn!(
-                validator = ?topology.local_validator_id(),
-                height = height,
-                block_hash = ?block_hash,
-                "Cannot persist certified block - not yet complete"
-            );
-        }
 
         actions.extend(self.try_two_chain_commit(topology, &qc));
 
@@ -3413,6 +3178,36 @@ impl BftState {
 
     /// Commit a block and any buffered subsequent blocks that are now ready.
     ///
+    /// Common bookkeeping for committing a block (shared between consensus and sync paths).
+    ///
+    /// Updates committed_height/hash, buffers recently committed hashes for dedup,
+    /// resets backoff tracking, and cleans up old state. Returns removed block hashes
+    /// for fetch cancellation.
+    fn record_block_committed(&mut self, block: &Block, block_hash: Hash) -> Vec<Hash> {
+        let height = block.header.height.0;
+
+        self.committed_height = height;
+        self.committed_hash = block_hash;
+
+        // Buffer committed hashes so collect_qc_chain_hashes can
+        // exclude them even after cleanup_old_state removes the block.
+        for tx in &block.transactions {
+            self.recently_committed_txs.insert(tx.hash());
+        }
+        for cert in &block.certificates {
+            self.recently_committed_certs.insert(cert.wave_id.hash());
+        }
+        for intent in &block.abort_intents {
+            self.recently_committed_abort_intents.insert(intent.tx_hash);
+        }
+
+        // Reset backoff tracking — new height means fresh round counting.
+        self.view_at_height_start = self.view;
+
+        // Clean up old state, return removed block hashes.
+        self.cleanup_old_state(height)
+    }
+
     /// This is called when we have a block at the expected height (committed_height + 1).
     /// After committing, we check for buffered commits at the next height and process
     /// them in order.
@@ -3466,32 +3261,9 @@ impl BftState {
                 "Committing block"
             );
 
-            // Update committed state
-            self.committed_height = height;
-            self.committed_hash = current_hash;
-
-            // Buffer committed hashes so collect_qc_chain_hashes can
-            // exclude them even after cleanup_old_state removes the block.
-            for tx in &block.transactions {
-                self.recently_committed_txs.insert(tx.hash());
-            }
-            for cert in &block.certificates {
-                self.recently_committed_certs.insert(cert.wave_id.hash());
-            }
-            for intent in &block.abort_intents {
-                self.recently_committed_abort_intents.insert(intent.tx_hash);
-            }
-
-            // Reset backoff tracking - new height means fresh round counting
-            self.view_at_height_start = self.view;
-
-            // Record leader activity - block committing indicates progress
+            let removed_blocks = self.record_block_committed(&block, current_hash);
             self.record_leader_activity();
 
-            // Clean up old state
-            let removed_blocks = self.cleanup_old_state(height);
-
-            // Cancel any pending fetches for removed blocks
             for block_hash in removed_blocks {
                 actions.push(Action::CancelFetch { block_hash });
             }
@@ -3738,23 +3510,7 @@ impl BftState {
             "Applying synced block"
         );
 
-        // Update committed state
-        self.committed_height = height;
-        self.committed_hash = block_hash;
-
-        // Buffer committed hashes (same as normal commit path).
-        for tx in &block.transactions {
-            self.recently_committed_txs.insert(tx.hash());
-        }
-        for cert in &block.certificates {
-            self.recently_committed_certs.insert(cert.wave_id.hash());
-        }
-        for intent in &block.abort_intents {
-            self.recently_committed_abort_intents.insert(intent.tx_hash);
-        }
-
-        // Reset backoff tracking - new height means fresh round counting
-        self.view_at_height_start = self.view;
+        let removed_blocks = self.record_block_committed(&block, block_hash);
 
         // Update latest QC (this may help us catch up further)
         if self
@@ -3763,7 +3519,6 @@ impl BftState {
             .is_none_or(|existing| qc.height.0 > existing.height.0)
         {
             self.latest_qc = Some(qc.clone());
-            // HotStuff-2 unlock for synced QC
             self.maybe_unlock_for_qc(topology, &qc);
         }
 
@@ -3775,25 +3530,14 @@ impl BftState {
                 .is_none_or(|existing| block.header.parent_qc.height.0 > existing.height.0)
         {
             self.latest_qc = Some(block.header.parent_qc.clone());
-            // HotStuff-2 unlock for parent QC
             self.maybe_unlock_for_qc(topology, &block.header.parent_qc);
         }
 
-        // Clean up old state
-        let removed_blocks = self.cleanup_old_state(height);
-
         // Emit actions for the synced block
-        let mut actions = vec![
-            Action::PersistBlock {
-                block: block.clone(),
-                qc: qc.clone(),
-            },
-            Action::CommitBlock {
-                block: block.clone(),
-                qc,
-                finalized_waves: vec![], // Sync path — receipts come from sync data
-            },
-        ];
+        let mut actions = vec![Action::CommitSyncedBlock {
+            block: block.clone(),
+            qc,
+        }];
 
         // Synced blocks: do NOT gossip committed header — the original
         // proposer already did. Fallback recovery handles missing headers.

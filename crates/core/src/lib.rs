@@ -39,6 +39,6 @@ pub use action::{
     ProvisionRequest, ProvisionedTransaction, TransactionStatus,
 };
 pub use input::{EventPriority, NodeInput};
-pub use protocol_event::ProtocolEvent;
+pub use protocol_event::{ProtocolEvent, VerificationKind};
 pub use timer::{TimerId, TimerScheduler};
 pub use traits::StateMachine;

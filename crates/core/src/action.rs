@@ -122,12 +122,6 @@ pub enum Action {
         header: Box<BlockHeaderNotification>,
     },
 
-    /// Broadcast a block vote to the local shard.
-    BroadcastBlockVote {
-        shard: ShardGroupId,
-        vote: BlockVoteNotification,
-    },
-
     // ═══════════════════════════════════════════════════════════════════════
     // Network: Mempool & Certificates
     // ═══════════════════════════════════════════════════════════════════════
@@ -514,20 +508,30 @@ pub enum Action {
     // ═══════════════════════════════════════════════════════════════════════
     // Block Commit
     // ═══════════════════════════════════════════════════════════════════════
-    /// Commit a block's state atomically: JVT + substates + receipts + ECs + consensus metadata.
+    /// Commit a consensus block atomically: block data + JVT + substates +
+    /// receipts + ECs + consensus metadata.
     ///
-    /// Block data is already persisted via `PersistBlock` at certification time.
-    /// This action applies the state changes and writes receipts atomically.
-    ///
-    /// Normal path: `finalized_waves` carries receipts from local execution.
-    /// Sync path: `finalized_waves` is empty — receipts come from sync peer data
-    /// buffered in the io_loop.
+    /// Used for blocks this node participated in consensus for. The io_loop
+    /// uses the `PreparedCommit` from `VerifyStateRoot` and extracts receipts
+    /// from `finalized_waves`.
     CommitBlock {
         block: Block,
         /// The QC that certified this block.
         qc: QuorumCertificate,
-        /// Finalized waves for atomic receipt commit (empty for sync path).
+        /// Finalized waves carrying receipts from local execution.
         finalized_waves: Vec<Arc<FinalizedWave>>,
+    },
+
+    /// Commit a synced block atomically: block data + JVT + substates +
+    /// receipts + ECs + consensus metadata.
+    ///
+    /// Used for blocks fetched via sync protocol. The io_loop uses receipts
+    /// and ECs from `pending_sync_data` (buffered when the sync response
+    /// arrived) — no `PreparedCommit` or `finalized_waves` needed.
+    CommitSyncedBlock {
+        block: Block,
+        /// The QC that certified this block.
+        qc: QuorumCertificate,
     },
 
     /// Emit transaction status update for RPC status cache.
@@ -563,16 +567,6 @@ pub enum Action {
     // ═══════════════════════════════════════════════════════════════════════
     // Storage: Consensus
     // ═══════════════════════════════════════════════════════════════════════
-    /// Persist a certified block to storage for sync availability.
-    ///
-    /// This stores the block data only — it does NOT update committed metadata.
-    /// Committed metadata is persisted atomically with JVT state via CommitBlock.
-    PersistBlock {
-        block: Block,
-        /// The QC that certified this block (stored alongside block data).
-        qc: QuorumCertificate,
-    },
-
     /// Persist a vote and broadcast it as a single atomic action.
     ///
     /// **BFT Safety Critical**: The runner MUST persist the vote before broadcasting.
@@ -721,11 +715,6 @@ pub enum Action {
     // ═══════════════════════════════════════════════════════════════════════
     // Storage: Read Requests (returns callback ProtocolEvent)
     // ═══════════════════════════════════════════════════════════════════════
-    /// Fetch a block by height.
-    ///
-    /// Returns `ProtocolEvent::BlockFetched { height, block }`.
-    FetchBlock { height: BlockHeight },
-
     /// Fetch chain metadata (latest height, hash, QC).
     ///
     /// Returns `ProtocolEvent::ChainMetadataFetched { height, hash, qc }`.
@@ -843,51 +832,6 @@ pub enum Action {
 }
 
 impl Action {
-    /// Check if this action requires async I/O (network or storage writes).
-    pub fn is_async(&self) -> bool {
-        matches!(
-            self,
-            Action::BroadcastBlockHeader { .. }
-                | Action::BroadcastBlockVote { .. }
-                | Action::BroadcastTransaction { .. }
-                | Action::SignAndSendExecutionVote { .. }
-                | Action::BroadcastExecutionCertificate { .. }
-                | Action::BroadcastCommittedBlockHeader { .. }
-                | Action::PersistBlock { .. }
-                | Action::PersistAndBroadcastVote { .. }
-                | Action::RequestMissingProvisions { .. }
-                | Action::RequestMissingExecutionCert { .. }
-                | Action::CancelProvisionFetch { .. }
-                | Action::RequestTxInclusionProofs { .. }
-                | Action::RequestMissingCommittedBlockHeader { .. }
-        )
-    }
-
-    /// Check if this action is delegated work (runs on thread pool, returns callback).
-    pub fn is_delegated(&self) -> bool {
-        matches!(
-            self,
-            Action::VerifyAndBuildQuorumCertificate { .. }
-                | Action::VerifyProvisionBatch { .. }
-                | Action::AggregateExecutionCertificate { .. }
-                | Action::VerifyAndAggregateExecutionVotes { .. }
-                | Action::VerifyExecutionCertificateSignature { .. }
-                | Action::VerifyQcSignature { .. }
-                | Action::VerifyRemoteHeaderQc { .. }
-                | Action::VerifyStateRoot { .. }
-                | Action::VerifyTransactionRoot { .. }
-                | Action::VerifyCertificateRoot { .. }
-                | Action::VerifyLocalReceiptRoot { .. }
-                | Action::VerifyAbortIntentProofs { .. }
-                | Action::BuildProposal { .. }
-                | Action::ExecuteTransactions { .. }
-                | Action::ExecuteCrossShardTransactions { .. }
-                | Action::FetchAndBroadcastProvisions { .. }
-                | Action::FetchBlock { .. }
-                | Action::FetchChainMetadata
-        )
-    }
-
     /// Check if this is a continuation action.
     pub fn is_continuation(&self) -> bool {
         matches!(self, Action::Continuation(_))
@@ -898,7 +842,6 @@ impl Action {
         match self {
             // Network - BFT Consensus
             Action::BroadcastBlockHeader { .. } => "BroadcastBlockHeader",
-            Action::BroadcastBlockVote { .. } => "BroadcastBlockVote",
 
             // Network - Mempool
             Action::BroadcastTransaction { .. } => "BroadcastTransaction",
@@ -940,17 +883,16 @@ impl Action {
 
             // External Notifications
             Action::CommitBlock { .. } => "CommitBlock",
+            Action::CommitSyncedBlock { .. } => "CommitSyncedBlock",
             Action::EmitTransactionStatus { .. } => "EmitTransactionStatus",
 
             // Storage - Consensus
-            Action::PersistBlock { .. } => "PersistBlock",
             Action::PersistAndBroadcastVote { .. } => "PersistAndBroadcastVote",
 
             // Storage - Execution
             Action::CacheWaveCertificate { .. } => "CacheWaveCertificate",
 
             // Storage - Read Requests
-            Action::FetchBlock { .. } => "FetchBlock",
             Action::FetchChainMetadata => "FetchChainMetadata",
 
             // Global Consensus / Epoch Management

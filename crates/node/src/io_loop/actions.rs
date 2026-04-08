@@ -51,9 +51,6 @@ where
             Action::BroadcastBlockHeader { shard: _, header } => {
                 self.network.notify(&self.cached_local_peers, &*header);
             }
-            Action::BroadcastBlockVote { shard: _, vote } => {
-                self.network.notify(&self.cached_local_peers, &vote);
-            }
             Action::BroadcastTransaction { shard, gossip } => {
                 self.network.broadcast_to_shard(shard, &*gossip);
             }
@@ -189,10 +186,8 @@ where
             // ═══════════════════════════════════════════════════════════
             // Storage
             // ═══════════════════════════════════════════════════════════
-            Action::PersistBlock { .. }
-            | Action::CacheWaveCertificate { .. }
+            Action::CacheWaveCertificate { .. }
             | Action::PersistAndBroadcastVote { .. }
-            | Action::FetchBlock { .. }
             | Action::FetchChainMetadata => {
                 self.process_storage_action(action);
             }
@@ -205,7 +200,14 @@ where
                 qc,
                 finalized_waves,
             } => {
-                self.accumulate_block_commit(block, qc, finalized_waves);
+                self.accumulate_block_commit(super::PendingCommit::Consensus {
+                    block,
+                    qc,
+                    finalized_waves,
+                });
+            }
+            Action::CommitSyncedBlock { block, qc } => {
+                self.accumulate_block_commit(super::PendingCommit::Synced { block, qc });
             }
             Action::EmitTransactionStatus {
                 tx_hash,
@@ -307,10 +309,6 @@ where
     /// Process storage read/write actions.
     fn process_storage_action(&mut self, action: Action) {
         match action {
-            Action::PersistBlock { block, qc } => {
-                let height = block.header.height;
-                ConsensusStore::put_block(&*self.storage, height, &block, &qc);
-            }
             Action::CacheWaveCertificate { certificate } => {
                 // Populate cert cache keyed by wave_id.hash() — this matches
                 // the cert_hashes entries in BlockManifest that peers use to
@@ -336,15 +334,6 @@ where
                 );
                 self.network.notify(&recipients, &vote);
             }
-            Action::FetchBlock { height } => {
-                let block = self.storage.get_block(height);
-                let _ = self
-                    .event_sender
-                    .send(NodeInput::Protocol(ProtocolEvent::BlockFetched {
-                        height,
-                        block: block.map(|(b, _)| b),
-                    }));
-            }
             Action::FetchChainMetadata => {
                 let height = self.storage.committed_height();
                 let hash = self.storage.committed_hash();
@@ -360,15 +349,16 @@ where
     /// Accumulate a block commit for batched dispatch. Records metrics
     /// immediately (on the pinned thread) and feeds the sync protocol, then
     /// defers the heavy JVT/metadata writes to [`flush_block_commits`].
-    fn accumulate_block_commit(
-        &mut self,
-        block: hyperscale_types::Block,
-        qc: hyperscale_types::QuorumCertificate,
-        finalized_waves: Vec<Arc<hyperscale_types::FinalizedWave>>,
-    ) {
+    fn accumulate_block_commit(&mut self, commit: super::PendingCommit) {
+        let block = commit.block();
         let block_hash = block.hash();
         let height = block.header.height;
-        debug!(height = height.0, ?block_hash, "Block committed");
+        debug!(
+            height = height.0,
+            ?block_hash,
+            sync = commit.is_sync(),
+            "Block committed"
+        );
 
         // Block commit latency: time from proposal timestamp to now.
         let now_ms = self.state.now().as_millis() as u64;
@@ -396,8 +386,7 @@ where
             .handle(SyncInput::BlockCommitted { height: height.0 });
         self.process_sync_outputs(outputs);
 
-        self.pending_block_commits
-            .push((block, qc, finalized_waves));
+        self.pending_block_commits.push(commit);
     }
 
     /// Flush accumulated block commits and any pending receipt bundles.
@@ -405,7 +394,7 @@ where
     /// If all blocks are empty (no certificates), commits synchronously.
     /// Otherwise spawns a single closure on the execution pool that persists
     /// receipt bundles first, then commits all blocks sequentially, sending
-    /// `StateCommitComplete` and `BlockCommitted` events after each.
+    /// `BlockCommitted` events after each.
     ///
     /// Receipt bundles are drained into the same closure because the sync
     /// path reconstructs `DatabaseUpdates` by reading receipts back from
@@ -434,17 +423,20 @@ where
         let commits = std::mem::take(&mut self.pending_block_commits);
         let pending_ecs = std::mem::take(&mut self.pending_ec_writes);
 
-        // Only take sync data for blocks we're about to commit — not all
-        // buffered data. BFT may buffer sync blocks internally for sequential
-        // ordering, so sync data for future heights must stay in the map.
+        // Only take sync data for synced blocks we're about to commit.
+        // BFT may buffer sync blocks internally for sequential ordering,
+        // so sync data for future heights must stay in the map.
         let mut sync_data = std::collections::HashMap::new();
-        for (block, _, _) in &commits {
-            if let Some(data) = self.pending_sync_data.remove(&block.header.height.0) {
-                sync_data.insert(block.header.height.0, data);
+        for commit in &commits {
+            if commit.is_sync() {
+                let h = commit.block().header.height.0;
+                if let Some(data) = self.pending_sync_data.remove(&h) {
+                    sync_data.insert(h, data);
+                }
             }
         }
 
-        let has_non_empty = commits.iter().any(|(b, _, _)| !b.certificates.is_empty());
+        let has_non_empty = commits.iter().any(|c| !c.block().certificates.is_empty());
 
         if !has_non_empty {
             // All empty blocks — synchronous fast path.
@@ -460,22 +452,25 @@ where
             // Prune stale prepared_commits that outlived their blocks.
             let max_height = commits
                 .iter()
-                .map(|(b, _, _)| b.header.height.0)
+                .map(|c| c.block().header.height.0)
                 .max()
                 .unwrap_or(0);
             {
                 let mut cache = self.prepared_commits.lock().unwrap();
                 cache.retain(|_, (h, _)| *h > max_height);
             }
-            for (block, qc, _finalized_waves) in commits {
+            for commit in commits {
+                let (block, qc) = match commit {
+                    super::PendingCommit::Consensus { block, qc, .. }
+                    | super::PendingCommit::Synced { block, qc } => (block, qc),
+                };
                 let height = block.header.height;
                 let block_hash = block.hash();
                 let consensus = hyperscale_storage::ConsensusCommitData {
                     height,
                     hash: block_hash,
-                    qc: qc.clone(),
+                    qc,
                 };
-                // Empty blocks have no certificate writes — pass empty DatabaseUpdates.
                 let empty_updates = hyperscale_types::DatabaseUpdates::default();
                 let result = self.storage.commit_block(
                     &empty_updates,
@@ -486,18 +481,13 @@ where
                     &[],
                 );
                 ConsensusStore::prune_own_votes(&*self.storage, height.0);
-                let _ = self.event_sender.send(NodeInput::Protocol(
-                    ProtocolEvent::StateCommitComplete {
-                        height: height.0,
-                        state_root: result,
-                    },
-                ));
                 let _ =
                     self.event_sender
                         .send(NodeInput::Protocol(ProtocolEvent::BlockCommitted {
                             block_hash,
                             height: height.0,
                             block,
+                            state_root: result,
                         }));
             }
             return;
@@ -505,64 +495,65 @@ where
 
         // Extract prepared commit handles for each block in the batch,
         // then prune any stale entries at or below the highest committed
-        // height. Stale entries accumulate when VerifyStateRoot /
-        // BuildProposal complete on the crypto pool *after* the block they
-        // prepared has already been committed via the sync/receipt-
-        // reconstruction path. Without this prune, one orphaned
-        // PreparedCommit (WriteBatch + JvtSnapshot + DatabaseUpdates) leaks
-        // per block whenever the crypto pool is slower than commit dispatch.
+        // height.
         let max_committed_height = commits
             .iter()
-            .map(|(b, _, _)| b.header.height.0)
+            .map(|c| c.block().header.height.0)
             .max()
             .unwrap_or(0);
 
-        // Extract prepared commits and identify blocks that are NOT yet
-        // ready to commit. A block with certificates requires either a
-        // prepared commit (from VerifyStateRoot / BuildProposal) or buffered
-        // sync data (receipts from the sync peer). Without either, committing
+        // Identify blocks that are NOT yet ready to commit. A consensus
+        // block with certificates requires a prepared_commit; a sync block
+        // with certificates requires sync_data. Without either, committing
         // would apply empty state updates, permanently diverging the JVT.
         //
         // Deferred blocks are put back into pending_block_commits; they will
-        // be retried on the next flush (triggered when VerifyStateRoot or
-        // sync data arrives).
-        let mut ready_commits = Vec::with_capacity(commits.len());
+        // be retried on the next flush.
+        let mut ready_commits: Vec<super::PendingCommit> = Vec::with_capacity(commits.len());
         let mut prepared_map = Vec::with_capacity(commits.len());
         {
             let mut cache = self.prepared_commits.lock().unwrap();
             let mut deferring = false;
-            for (block, qc, finalized_waves) in commits {
-                let has_certs = !block.certificates.is_empty();
+            for commit in commits {
+                let has_certs = !commit.block().certificates.is_empty();
                 let prepared = if !deferring {
-                    cache.remove(&block.hash()).map(|(_, p)| p)
+                    cache.remove(&commit.block().hash()).map(|(_, p)| p)
                 } else {
                     None
                 };
-                let has_sync = sync_data.contains_key(&block.header.height.0);
 
-                if deferring || (has_certs && prepared.is_none() && !has_sync) {
+                let not_ready = has_certs
+                    && match &commit {
+                        super::PendingCommit::Consensus { .. } => prepared.is_none(),
+                        super::PendingCommit::Synced { block, .. } => {
+                            !sync_data.contains_key(&block.header.height.0)
+                        }
+                    };
+
+                if deferring || not_ready {
                     if !deferring {
                         tracing::debug!(
-                            height = block.header.height.0,
-                            certs = block.certificates.len(),
-                            "Deferring block commit — awaiting state root verification"
+                            height = commit.block().header.height.0,
+                            certs = commit.block().certificates.len(),
+                            sync = commit.is_sync(),
+                            "Deferring block commit — awaiting data"
                         );
                         deferring = true;
                     }
                     // Restore any sync data we extracted for this height.
-                    if let Some(data) = sync_data.remove(&block.header.height.0) {
-                        self.pending_sync_data.insert(block.header.height.0, data);
+                    let h = commit.block().header.height.0;
+                    if let Some(data) = sync_data.remove(&h) {
+                        self.pending_sync_data.insert(h, data);
                     }
-                    // Put back prepared commit if we extracted one (subsequent
-                    // blocks deferred due to ordering, not missing data).
+                    // Put back prepared commit if we extracted one.
                     if let Some(p) = prepared {
-                        cache.insert(block.hash(), (block.header.height.0, p));
+                        let bh = commit.block().hash();
+                        cache.insert(bh, (h, p));
                     }
-                    self.pending_block_commits
-                        .push((block, qc, finalized_waves));
+                    self.pending_block_commits.push(commit);
                 } else {
                     prepared_map.push(prepared);
-                    ready_commits.push((block, qc, finalized_waves));
+                    ready_commits.push(commit);
                 }
             }
             // Prune stale entries that outlived their blocks.
@@ -575,12 +566,11 @@ where
         }
 
         if ready_commits.is_empty() {
-            // All blocks were deferred — nothing to commit this round.
-            // Put back the ECs we took so they aren't lost.
             self.pending_ec_writes = pending_ecs;
             return;
         }
         let commits = ready_commits;
+        let commit_count = commits.len();
 
         let storage = Arc::clone(&self.storage);
         let topology = Arc::clone(&self.topology);
@@ -590,223 +580,190 @@ where
         self.commit_in_flight.store(true, Ordering::Release);
 
         self.dispatch.spawn_execution(move || {
-            // Drain pending ECs into the first block commit for atomic persistence.
-            // Subsequent blocks in the batch (if any) pass an empty slice.
             let mut remaining_ecs = pending_ecs;
 
-            for (i, (block, qc, finalized_waves)) in commits.into_iter().enumerate() {
-                let block_hash = block.hash();
-                let height = block.header.height;
+            for (i, commit) in commits.into_iter().enumerate() {
+                let block_hash = commit.block().hash();
+                let height = commit.block().header.height;
 
-                let consensus = hyperscale_storage::ConsensusCommitData {
-                    height,
-                    hash: block_hash,
-                    qc: qc.clone(),
-                };
-
-                // Take pending ECs for the first commit, empty for subsequent.
                 let ecs_for_this_block = std::mem::take(&mut remaining_ecs);
-
-                // Always commit — even empty blocks advance the JVT version
-                // to match block height, so provision lookups succeed.
-                // Consensus metadata is folded into the same atomic write.
                 let prepared = prepared_map[i].take();
-                // Extract receipts from finalized waves for atomic commit.
-                let wave_receipts: Vec<hyperscale_types::ReceiptBundle> = finalized_waves
-                    .iter()
-                    .flat_map(|fw| fw.receipts.iter().cloned())
-                    .collect();
 
-                let result = if let Some(prepared) = prepared {
-                    // Normal path: prepared commit from VerifyStateRoot.
-                    storage.commit_prepared_block(
-                        prepared,
-                        &block.certificates,
-                        Some(consensus),
-                        &ecs_for_this_block,
-                        &wave_receipts,
-                    )
-                } else if !block.certificates.is_empty() {
-                    // Full-fidelity sync path: reconstruct DatabaseUpdates from
-                    // buffered receipts, verify EC signatures + state_root, and
-                    // commit atomically with ECs.
-                    let sync_entry = sync_data.get(&height.0);
-                    let Some(entry) = sync_entry else {
-                        // This should not happen: flush_block_commits defers
-                        // blocks that have certificates but no prepared commit
-                        // and no sync data. If we reach here, it's a logic bug.
-                        tracing::error!(
-                            height = height.0,
-                            certs = block.certificates.len(),
-                            "BUG: block with certificates reached commit closure \
-                             without prepared commit or sync data — committing \
-                             without state updates to avoid stall"
-                        );
-                        let empty = hyperscale_types::DatabaseUpdates::default();
-                        let r = storage.commit_block(
-                            &empty,
-                            &block.certificates,
-                            height.0,
-                            Some(consensus),
-                            &ecs_for_this_block,
-                            &[],
-                        );
-                        ConsensusStore::prune_own_votes(&*storage, height.0);
-                        if i == prepared_map.len() - 1 {
-                            in_flight.store(false, Ordering::Release);
-                        }
-                        let _ = event_tx.send(NodeInput::Protocol(
-                            ProtocolEvent::StateCommitComplete {
-                                height: height.0,
-                                state_root: r,
-                            },
-                        ));
-                        let _ = event_tx.send(NodeInput::Protocol(ProtocolEvent::BlockCommitted {
-                            block_hash,
-                            height: height.0,
-                            block,
-                        }));
-                        continue;
-                    };
-                    let (receipts, sync_ecs) =
-                        (&entry.local_receipts, &entry.execution_certificates);
-
-                    // Check 2: Verify EC BLS signatures (synchronous in commit closure).
-                    let ecs_valid = sync_ecs.iter().all(|ec| {
-                        // Get the source shard's committee public keys from topology.
-                        // Since we're in the commit closure, we use the block's shard.
-                        let public_keys: Vec<hyperscale_types::Bls12381G1PublicKey> = vec![];
-                        // EC BLS verification is skipped when we don't have public keys
-                        // available in the commit closure. The QC-attested certificate_root
-                        // (check 1) transitively commits to ec_hashes via TC::receipt_hash(),
-                        // providing equivalent integrity assurance.
-                        let _ = (ec, public_keys);
-                        true
-                    });
-
-                    if !ecs_valid {
-                        tracing::warn!(height = height.0, "Sync: EC BLS verification failed");
-                        // Use empty updates so the block still commits (advancing JVT height).
-                        let empty = hyperscale_types::DatabaseUpdates::default();
-                        storage.commit_block(
-                            &empty,
-                            &block.certificates,
-                            height.0,
-                            Some(consensus),
-                            &[],
-                            &[],
-                        )
-                    } else {
-                        // Check 3: EC↔WaveCert cross-check via attestations.
-                        let cross_check_ok = sync_ecs.iter().all(|ec| {
-                            let ec_hash = ec.canonical_hash();
-                            // Find any wave cert whose attestations reference this EC
-                            block.certificates.iter().any(|wc| {
-                                if let hyperscale_types::WaveResolution::Completed { attestations } =
-                                    &wc.resolution
-                                {
-                                    attestations.iter().any(|a| a.ec_hash == ec_hash)
-                                } else {
-                                    false
-                                }
-                            })
-                        });
-
-                        if !cross_check_ok {
-                            tracing::warn!(
-                                height = height.0,
-                                "Sync: EC↔WaveCert cross-check failed — EC doesn't match any attestation"
-                            );
-                        }
-
-                        // Read shard-filtered DatabaseUpdates from receipts.
-                        // Receipts carry database_updates that were already filtered
-                        // at execution time by filter_updates_for_shard.
-                        let per_cert: Vec<hyperscale_types::DatabaseUpdates> = if !receipts
-                            .is_empty()
-                        {
-                            receipts
-                                .iter()
-                                .map(|entry| entry.receipt.database_updates.clone())
-                                .collect()
-                        } else {
-                            // Fallback: derive tx_hashes from wave certs' source blocks.
-                            // Same logic as the sync server and proposal builder.
-                            let topo = topology.load();
-                            let mut updates = Vec::new();
-                            for wc in &block.certificates {
-                                if !wc.is_completed() {
-                                    continue;
-                                }
-                                let source_height =
-                                    hyperscale_types::BlockHeight(wc.wave_id.block_height);
-                                if let Some((source_block, _)) =
-                                    storage.get_block(source_height)
-                                {
-                                    let tx_hashes =
-                                        hyperscale_types::derive_wave_tx_hashes(
-                                            &topo,
-                                            &wc.wave_id,
-                                            &source_block.transactions,
-                                        );
-                                    for tx_hash in tx_hashes {
-                                        if let Some(receipt) =
-                                            storage.get_local_receipt(&tx_hash)
-                                        {
-                                            updates
-                                                .push(receipt.database_updates.clone());
-                                        }
-                                    }
-                                }
-                            }
-                            updates
+                let result = match commit {
+                    super::PendingCommit::Consensus {
+                        ref block,
+                        ref qc,
+                        ref finalized_waves,
+                    } => {
+                        let consensus = hyperscale_storage::ConsensusCommitData {
+                            height,
+                            hash: block_hash,
+                            qc: qc.clone(),
                         };
-                        let merged = hyperscale_storage::merge_database_updates(&per_cert);
-
-                        // Check 4: state_root verification via prepare→verify→commit.
-                        let parent_root = storage.state_root_hash();
-                        let (computed_root, prepared) =
-                            storage.prepare_block_commit(parent_root, &merged, height.0);
-                        if computed_root != block.header.state_root {
-                            tracing::warn!(
-                                height = height.0,
-                                ?computed_root,
-                                expected = ?block.header.state_root,
-                                "Sync: state_root mismatch — committing anyway \
-                                 (QC-attested, 2f+1 validators verified)"
-                            );
-                        }
-
-                        // Convert sync receipts to ReceiptBundles for atomic commit.
-                        let sync_receipt_bundles: Vec<hyperscale_types::ReceiptBundle> = receipts
+                        // Extract receipts from finalized waves for atomic commit.
+                        let wave_receipts: Vec<hyperscale_types::ReceiptBundle> = finalized_waves
                             .iter()
-                            .map(|entry| hyperscale_types::ReceiptBundle {
-                                tx_hash: entry.tx_hash,
-                                local_receipt: std::sync::Arc::new(entry.receipt.clone()),
-                                execution_output: None,
-                            })
+                            .flat_map(|fw| fw.receipts.iter().cloned())
                             .collect();
 
-                        // Commit with verified ECs and receipts atomically.
-                        storage.commit_prepared_block(
-                            prepared,
-                            &block.certificates,
-                            Some(consensus),
-                            sync_ecs,
-                            &sync_receipt_bundles,
-                        )
+                        if let Some(prepared) = prepared {
+                            storage.commit_prepared_block(
+                                prepared,
+                                &block.certificates,
+                                Some(consensus),
+                                &ecs_for_this_block,
+                                &wave_receipts,
+                            )
+                        } else {
+                            // Empty block (no certificates) — advance JVT version.
+                            let empty = hyperscale_types::DatabaseUpdates::default();
+                            storage.commit_block(
+                                &empty,
+                                &block.certificates,
+                                height.0,
+                                Some(consensus),
+                                &ecs_for_this_block,
+                                &wave_receipts,
+                            )
+                        }
                     }
-                } else {
-                    // Empty block: no updates needed.
-                    let empty_updates = hyperscale_types::DatabaseUpdates::default();
-                    storage.commit_block(
-                        &empty_updates,
-                        &block.certificates,
-                        height.0,
-                        Some(consensus),
-                        &[],
-                        &[],
-                    )
+                    super::PendingCommit::Synced { ref block, ref qc } => {
+                        let consensus = hyperscale_storage::ConsensusCommitData {
+                            height,
+                            hash: block_hash,
+                            qc: qc.clone(),
+                        };
+
+                        if block.certificates.is_empty() {
+                            // Empty synced block — advance JVT version.
+                            let empty = hyperscale_types::DatabaseUpdates::default();
+                            storage.commit_block(
+                                &empty,
+                                &block.certificates,
+                                height.0,
+                                Some(consensus),
+                                &ecs_for_this_block,
+                                &[],
+                            )
+                        } else if let Some(entry) = sync_data.get(&height.0) {
+                            let (receipts, sync_ecs) =
+                                (&entry.local_receipts, &entry.execution_certificates);
+
+                            // EC↔WaveCert cross-check via attestations.
+                            let cross_check_ok = sync_ecs.iter().all(|ec| {
+                                let ec_hash = ec.canonical_hash();
+                                block.certificates.iter().any(|wc| {
+                                    if let hyperscale_types::WaveResolution::Completed {
+                                        attestations,
+                                    } = &wc.resolution
+                                    {
+                                        attestations.iter().any(|a| a.ec_hash == ec_hash)
+                                    } else {
+                                        false
+                                    }
+                                })
+                            });
+                            if !cross_check_ok {
+                                tracing::warn!(
+                                    height = height.0,
+                                    "Sync: EC↔WaveCert cross-check failed"
+                                );
+                            }
+
+                            // Read shard-filtered DatabaseUpdates from receipts.
+                            let per_cert: Vec<hyperscale_types::DatabaseUpdates> =
+                                if !receipts.is_empty() {
+                                    receipts
+                                        .iter()
+                                        .map(|entry| entry.receipt.database_updates.clone())
+                                        .collect()
+                                } else {
+                                    // Fallback: derive from wave certs' source blocks.
+                                    let topo = topology.load();
+                                    let mut updates = Vec::new();
+                                    for wc in &block.certificates {
+                                        if !wc.is_completed() {
+                                            continue;
+                                        }
+                                        let source_height =
+                                            hyperscale_types::BlockHeight(wc.wave_id.block_height);
+                                        if let Some((source_block, _)) =
+                                            storage.get_block(source_height)
+                                        {
+                                            let tx_hashes = hyperscale_types::derive_wave_tx_hashes(
+                                                &topo,
+                                                &wc.wave_id,
+                                                &source_block.transactions,
+                                            );
+                                            for tx_hash in tx_hashes {
+                                                if let Some(receipt) =
+                                                    storage.get_local_receipt(&tx_hash)
+                                                {
+                                                    updates.push(receipt.database_updates.clone());
+                                                }
+                                            }
+                                        }
+                                    }
+                                    updates
+                                };
+                            let merged = hyperscale_storage::merge_database_updates(&per_cert);
+
+                            // Verify state_root via prepare→verify→commit.
+                            let parent_root = storage.state_root_hash();
+                            let (computed_root, prepared) =
+                                storage.prepare_block_commit(parent_root, &merged, height.0);
+                            if computed_root != block.header.state_root {
+                                tracing::warn!(
+                                    height = height.0,
+                                    ?computed_root,
+                                    expected = ?block.header.state_root,
+                                    "Sync: state_root mismatch — committing anyway \
+                                     (QC-attested, 2f+1 validators verified)"
+                                );
+                            }
+
+                            // Convert sync receipts to ReceiptBundles.
+                            let sync_receipt_bundles: Vec<hyperscale_types::ReceiptBundle> =
+                                receipts
+                                    .iter()
+                                    .map(|entry| hyperscale_types::ReceiptBundle {
+                                        tx_hash: entry.tx_hash,
+                                        local_receipt: std::sync::Arc::new(entry.receipt.clone()),
+                                        execution_output: None,
+                                    })
+                                    .collect();
+
+                            storage.commit_prepared_block(
+                                prepared,
+                                &block.certificates,
+                                Some(consensus),
+                                sync_ecs,
+                                &sync_receipt_bundles,
+                            )
+                        } else {
+                            // BUG: sync block with certs but no sync data.
+                            // Should not happen — readiness check defers these.
+                            tracing::error!(
+                                height = height.0,
+                                "BUG: synced block with certs but no sync data"
+                            );
+                            let empty = hyperscale_types::DatabaseUpdates::default();
+                            storage.commit_block(
+                                &empty,
+                                &block.certificates,
+                                height.0,
+                                Some(consensus),
+                                &ecs_for_this_block,
+                                &[],
+                            )
+                        }
+                    }
+                };
+
+                // Extract the block from the commit for the event.
+                let block = match commit {
+                    super::PendingCommit::Consensus { block, .. }
+                    | super::PendingCommit::Synced { block, .. } => block,
                 };
 
                 ConsensusStore::prune_own_votes(&*storage, height.0);
@@ -815,19 +772,15 @@ where
                 // block. The channel send synchronizes-with recv on the main
                 // thread, so the flag is guaranteed visible when the resulting
                 // feed_event calls flush_block_commits to drain any backlog.
-                if i == prepared_map.len() - 1 {
+                if i == commit_count - 1 {
                     in_flight.store(false, Ordering::Release);
                 }
-
-                let _ = event_tx.send(NodeInput::Protocol(ProtocolEvent::StateCommitComplete {
-                    height: height.0,
-                    state_root: result,
-                }));
 
                 let _ = event_tx.send(NodeInput::Protocol(ProtocolEvent::BlockCommitted {
                     block_hash,
                     height: height.0,
                     block,
+                    state_root: result,
                 }));
             }
         });

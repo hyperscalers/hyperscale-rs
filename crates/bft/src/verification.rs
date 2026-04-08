@@ -28,7 +28,7 @@ pub(crate) struct PendingQcVerification {
 /// Pending state root verification waiting for JVT to be ready.
 ///
 /// When a block arrives but its parent block's state hasn't been committed to
-/// the JVT yet, we queue the verification here. Once StateCommitComplete arrives
+/// the JVT yet, we queue the verification here. Once BlockCommitted arrives
 /// with a root matching required_root, we can proceed with verification.
 #[derive(Debug, Clone)]
 struct PendingStateRootVerification {

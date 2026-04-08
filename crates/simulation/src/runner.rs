@@ -508,11 +508,12 @@ impl SimulationRunner {
                 self.process_step_output(node_index, output);
 
                 // Sync state machine with actual JVT state after genesis bootstrap
-                let genesis_commit_event =
-                    NodeInput::Protocol(ProtocolEvent::StateCommitComplete {
-                        height: 0,
-                        state_root: genesis_jvt_root,
-                    });
+                let genesis_commit_event = NodeInput::Protocol(ProtocolEvent::BlockCommitted {
+                    block_hash: genesis_block.hash(),
+                    height: 0,
+                    block: genesis_block.clone(),
+                    state_root: genesis_jvt_root,
+                });
                 self.schedule_event(node_index, self.now, genesis_commit_event);
             }
 

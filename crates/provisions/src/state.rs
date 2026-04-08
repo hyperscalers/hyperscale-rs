@@ -600,7 +600,7 @@ impl ProvisionCoordinator {
     /// Removes the registration and prunes verified_batches where no
     /// transactions remain registered. Orphaned verified_remote_headers
     /// (no batch, pending provisions, or expected provisions) are also removed.
-    pub fn cleanup_tx(&mut self, tx_hash: &Hash) {
+    pub fn on_certificate_committed(&mut self, tx_hash: &Hash) {
         if self.registered_txs.remove(tx_hash).is_none() {
             return;
         }
@@ -1404,7 +1404,7 @@ mod tests {
         assert_eq!(coordinator.verified_remote_header_count(), 1);
 
         // Cleanup via block commit (cleanup_tx is the relevant internal path)
-        coordinator.cleanup_tx(&tx_hash);
+        coordinator.on_certificate_committed(&tx_hash);
 
         // Registration, verified batch, and remote header all pruned
         assert!(!coordinator.is_registered(&tx_hash));
@@ -1432,7 +1432,7 @@ mod tests {
         assert!(coordinator.has_any_verified_provisions(&tx2));
 
         // Only commit tx1 — tx2 still registered
-        coordinator.cleanup_tx(&tx1);
+        coordinator.on_certificate_committed(&tx1);
 
         // Batch and header preserved because tx2 is still registered
         assert!(!coordinator.is_registered(&tx1));
@@ -1441,7 +1441,7 @@ mod tests {
         assert_eq!(coordinator.verified_remote_header_count(), 1);
 
         // Now commit tx2
-        coordinator.cleanup_tx(&tx2);
+        coordinator.on_certificate_committed(&tx2);
 
         // Now everything is pruned
         assert!(!coordinator.has_any_verified_provisions(&tx2));

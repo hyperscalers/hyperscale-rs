@@ -201,9 +201,11 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
                 start.elapsed().as_secs_f64(),
             );
             Some(DelegatedResult {
-                events: vec![NodeInput::Protocol(
-                    ProtocolEvent::TransactionRootVerified { block_hash, valid },
-                )],
+                events: vec![NodeInput::Protocol(ProtocolEvent::BlockRootVerified {
+                    kind: hyperscale_core::VerificationKind::TransactionRoot,
+                    block_hash,
+                    valid,
+                })],
                 prepared_commit: None,
             })
         }
@@ -221,9 +223,11 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
                 start.elapsed().as_secs_f64(),
             );
             Some(DelegatedResult {
-                events: vec![NodeInput::Protocol(
-                    ProtocolEvent::CertificateRootVerified { block_hash, valid },
-                )],
+                events: vec![NodeInput::Protocol(ProtocolEvent::BlockRootVerified {
+                    kind: hyperscale_core::VerificationKind::CertificateRoot,
+                    block_hash,
+                    valid,
+                })],
                 prepared_commit: None,
             })
         }
@@ -241,9 +245,11 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
                 start.elapsed().as_secs_f64(),
             );
             Some(DelegatedResult {
-                events: vec![NodeInput::Protocol(
-                    ProtocolEvent::LocalReceiptRootVerified { block_hash, valid },
-                )],
+                events: vec![NodeInput::Protocol(ProtocolEvent::BlockRootVerified {
+                    kind: hyperscale_core::VerificationKind::LocalReceiptRoot,
+                    block_hash,
+                    valid,
+                })],
                 prepared_commit: None,
             })
         }
@@ -259,9 +265,11 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
                 start.elapsed().as_secs_f64(),
             );
             Some(DelegatedResult {
-                events: vec![NodeInput::Protocol(
-                    ProtocolEvent::AbortIntentProofsVerified { block_hash, valid },
-                )],
+                events: vec![NodeInput::Protocol(ProtocolEvent::BlockRootVerified {
+                    kind: hyperscale_core::VerificationKind::AbortIntentProofs,
+                    block_hash,
+                    valid,
+                })],
                 prepared_commit: None,
             })
         }
@@ -298,7 +306,8 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
                 .prepared_commit
                 .map(|p| (block_hash, block_height, p));
             Some(DelegatedResult {
-                events: vec![NodeInput::Protocol(ProtocolEvent::StateRootVerified {
+                events: vec![NodeInput::Protocol(ProtocolEvent::BlockRootVerified {
+                    kind: hyperscale_core::VerificationKind::StateRoot,
                     block_hash,
                     valid: result.valid,
                 })],

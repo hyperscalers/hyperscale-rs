@@ -54,6 +54,34 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+/// A block commit waiting to be flushed to storage.
+///
+/// Explicitly distinguishes consensus and sync paths so `flush_block_commits`
+/// knows which data source to use without side-channel sniffing.
+pub(crate) enum PendingCommit {
+    /// Consensus path: receipts come from locally-executed finalized waves.
+    /// The io_loop uses the `PreparedCommit` from `VerifyStateRoot`.
+    Consensus {
+        block: Block,
+        qc: QuorumCertificate,
+        finalized_waves: Vec<Arc<FinalizedWave>>,
+    },
+    /// Sync path: receipts and ECs come from `pending_sync_data`.
+    Synced { block: Block, qc: QuorumCertificate },
+}
+
+impl PendingCommit {
+    fn block(&self) -> &Block {
+        match self {
+            PendingCommit::Consensus { block, .. } | PendingCommit::Synced { block, .. } => block,
+        }
+    }
+
+    fn is_sync(&self) -> bool {
+        matches!(self, PendingCommit::Synced { .. })
+    }
+}
+
 /// Lock-free shared topology snapshot for handler closures and dispatch.
 ///
 /// Updated by the io_loop when `Action::TopologyChanged` is processed.
@@ -205,11 +233,12 @@ where
     validation_batch: BatchAccumulator<Arc<RoutableTransaction>>,
     committed_header_batch: BatchAccumulator<CommittedHeaderVerificationItem>,
 
-    // Block commit accumulator — collects CommitBlock actions within a
-    // single feed_event/handle_actions batch, then spawns a single closure on
-    // the execution pool to commit them sequentially. This keeps JVT writes
-    // off the pinned IoLoop thread while preserving commit ordering.
-    pending_block_commits: Vec<(Block, QuorumCertificate, Vec<Arc<FinalizedWave>>)>,
+    // Block commit accumulator — collects CommitBlock / CommitSyncedBlock
+    // actions within a single feed_event/handle_actions batch, then spawns
+    // a single closure on the execution pool to commit them sequentially.
+    // This keeps JVT writes off the pinned IoLoop thread while preserving
+    // commit ordering.
+    pending_block_commits: Vec<PendingCommit>,
 
     // Guard against out-of-order block commits across separate flushes.
     // When an async commit closure is in flight on the execution pool, new
@@ -385,7 +414,7 @@ where
     /// 1. **Engine genesis** via `with_storage_and_executor()` — requires sole Arc
     ///    ownership, then registers the inbound handler automatically
     /// 2. **State-machine genesis** via `state_mut().initialize_genesis()` followed by
-    ///    `handle_actions()`, `flush_all_batches()`, and a `StateCommitComplete` event
+    ///    `handle_actions()`, `flush_all_batches()`, and a `BlockCommitted` event
     ///
     /// # Panics
     ///

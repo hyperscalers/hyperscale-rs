@@ -13,6 +13,22 @@ use hyperscale_types::{
 };
 use std::sync::Arc;
 
+/// Which block root verification completed.
+///
+/// Used with `ProtocolEvent::BlockRootVerified` to identify which
+/// verification finished. The actions that produce these results
+/// remain separate (they have different input types), but the
+/// callback event is unified because the handler logic is identical:
+/// record result → check if all verifications complete → vote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerificationKind {
+    StateRoot,
+    TransactionRoot,
+    CertificateRoot,
+    LocalReceiptRoot,
+    AbortIntentProofs,
+}
+
 /// Events that the state machine processes.
 ///
 /// These are the typed protocol events that [`NodeStateMachine::handle()`]
@@ -71,11 +87,16 @@ pub enum ProtocolEvent {
         qc: QuorumCertificate,
     },
 
-    /// A block was committed to storage.
+    /// A block was committed to storage (state + block data atomically).
+    ///
+    /// The handler calls JVT unblocking first (via state_root),
+    /// then subsystem notifications.
     BlockCommitted {
         block_hash: Hash,
         height: u64,
         block: Block,
+        /// JVT state root after committing this block's state changes.
+        state_root: Hash,
     },
 
     /// Quorum Certificate verification and building result.
@@ -105,20 +126,17 @@ pub enum ProtocolEvent {
         committed_header: Arc<CommittedBlockHeader>,
     },
 
-    /// State root verification completed.
-    StateRootVerified { block_hash: Hash, valid: bool },
-
-    /// Transaction root verification completed.
-    TransactionRootVerified { block_hash: Hash, valid: bool },
-
-    /// Receipt root verification completed.
-    CertificateRootVerified { block_hash: Hash, valid: bool },
-
-    /// Local receipt root verification completed.
-    LocalReceiptRootVerified { block_hash: Hash, valid: bool },
-
-    /// Abort intent inclusion proof verification completed.
-    AbortIntentProofsVerified { block_hash: Hash, valid: bool },
+    /// A block root verification completed (state, transaction, certificate,
+    /// local receipt, or abort intent proofs).
+    ///
+    /// The handler logic is identical for all kinds: record the result in the
+    /// verification pipeline, check if all verifications are complete, and
+    /// vote if so. The `kind` field distinguishes which verification finished.
+    BlockRootVerified {
+        kind: VerificationKind,
+        block_hash: Hash,
+        valid: bool,
+    },
 
     /// Proposal block built by the runner.
     ProposalBuilt {
@@ -129,13 +147,6 @@ pub enum ProtocolEvent {
         /// Finalized waves included in this block (carries receipts for atomic commit).
         finalized_waves: Vec<Arc<FinalizedWave>>,
     },
-
-    // ═══════════════════════════════════════════════════════════════════════
-    // State Commit
-    // ═══════════════════════════════════════════════════════════════════════
-    /// JVT state commit completed for a block.
-    /// The JVT version always equals the block height.
-    StateCommitComplete { height: u64, state_root: Hash },
 
     // ═══════════════════════════════════════════════════════════════════════
     // Provisions
@@ -243,12 +254,6 @@ pub enum ProtocolEvent {
     // ═══════════════════════════════════════════════════════════════════════
     // Storage Callbacks
     // ═══════════════════════════════════════════════════════════════════════
-    /// Block fetched from storage.
-    BlockFetched {
-        height: BlockHeight,
-        block: Option<Block>,
-    },
-
     /// Chain metadata fetched from storage.
     ChainMetadataFetched {
         height: BlockHeight,
@@ -359,15 +364,14 @@ impl ProtocolEvent {
             ProtocolEvent::QcSignatureVerified { .. } => "QcSignatureVerified",
             ProtocolEvent::RemoteHeaderQcVerified { .. } => "RemoteHeaderQcVerified",
             ProtocolEvent::RemoteHeaderVerified { .. } => "RemoteHeaderVerified",
-            ProtocolEvent::StateRootVerified { .. } => "StateRootVerified",
-            ProtocolEvent::TransactionRootVerified { .. } => "TransactionRootVerified",
-            ProtocolEvent::CertificateRootVerified { .. } => "CertificateRootVerified",
-            ProtocolEvent::LocalReceiptRootVerified { .. } => "LocalReceiptRootVerified",
-            ProtocolEvent::AbortIntentProofsVerified { .. } => "AbortIntentProofsVerified",
+            ProtocolEvent::BlockRootVerified { kind, .. } => match kind {
+                VerificationKind::StateRoot => "BlockRootVerified::StateRoot",
+                VerificationKind::TransactionRoot => "BlockRootVerified::TransactionRoot",
+                VerificationKind::CertificateRoot => "BlockRootVerified::CertificateRoot",
+                VerificationKind::LocalReceiptRoot => "BlockRootVerified::LocalReceiptRoot",
+                VerificationKind::AbortIntentProofs => "BlockRootVerified::AbortIntentProofs",
+            },
             ProtocolEvent::ProposalBuilt { .. } => "ProposalBuilt",
-
-            // State Commit
-            ProtocolEvent::StateCommitComplete { .. } => "StateCommitComplete",
 
             // Provisions
             ProtocolEvent::ProvisionsAccepted { .. } => "ProvisionsAccepted",
@@ -397,7 +401,6 @@ impl ProtocolEvent {
             // Fetch Delivery
             ProtocolEvent::TransactionFetchDelivered { .. } => "TransactionFetchDelivered",
             // Storage Callbacks
-            ProtocolEvent::BlockFetched { .. } => "BlockFetched",
             ProtocolEvent::ChainMetadataFetched { .. } => "ChainMetadataFetched",
 
             // Sync Delivery
