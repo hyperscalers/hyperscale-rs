@@ -649,6 +649,9 @@ impl StateMachine for NodeStateMachine {
             ProtocolEvent::CertificateRootVerified { block_hash, valid } => self
                 .bft
                 .on_certificate_root_verified(self.topology.snapshot(), block_hash, valid),
+            ProtocolEvent::LocalReceiptRootVerified { block_hash, valid } => self
+                .bft
+                .on_local_receipt_root_verified(self.topology.snapshot(), block_hash, valid),
             ProtocolEvent::AbortIntentProofsVerified { block_hash, valid } => self
                 .bft
                 .on_abort_intents_verified(self.topology.snapshot(), block_hash, valid),

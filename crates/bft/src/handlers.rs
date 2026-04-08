@@ -6,10 +6,11 @@
 
 use hyperscale_storage::{CommitStore, DatabaseUpdates, SubstateStore};
 use hyperscale_types::{
-    batch_verify_bls_same_message, compute_certificate_root, compute_transaction_root,
-    verify_bls12381_v1, AbortIntent, Block, BlockHeader, BlockHeight, BlockVote,
-    Bls12381G1PublicKey, Bls12381G2Signature, Hash, QuorumCertificate, RoutableTransaction,
-    ShardGroupId, SignerBitfield, ValidatorId, VotePower, WaveCertificate, WaveId,
+    batch_verify_bls_same_message, compute_certificate_root, compute_local_receipt_root,
+    compute_transaction_root, verify_bls12381_v1, AbortIntent, Block, BlockHeader, BlockHeight,
+    BlockVote, Bls12381G1PublicKey, Bls12381G2Signature, Hash, QuorumCertificate, ReceiptBundle,
+    RoutableTransaction, ShardGroupId, SignerBitfield, ValidatorId, VotePower, WaveCertificate,
+    WaveId,
 };
 use std::sync::Arc;
 
@@ -224,6 +225,25 @@ pub fn verify_certificate_root(expected_root: Hash, certificates: &[Arc<WaveCert
     valid
 }
 
+/// Verify a block's local receipt root against its receipt bundles.
+///
+/// Pure computation over the receipts' `receipt_hash()` values.
+pub fn verify_local_receipt_root(expected_root: Hash, receipts: &[ReceiptBundle]) -> bool {
+    let computed_root = compute_local_receipt_root(receipts);
+    let valid = computed_root == expected_root;
+
+    if !valid {
+        tracing::warn!(
+            ?expected_root,
+            ?computed_root,
+            receipt_count = receipts.len(),
+            "Local receipt root verification FAILED"
+        );
+    }
+
+    valid
+}
+
 /// Verify abort intent inclusion proofs.
 ///
 /// For each `(AbortIntent, transaction_root)` pair, verifies the merkle
@@ -328,6 +348,7 @@ pub fn build_proposal<S: CommitStore + SubstateStore>(
     parent_state_root: Hash,
     transactions: Vec<Arc<RoutableTransaction>>,
     certificates: Vec<Arc<WaveCertificate>>,
+    receipts: &[ReceiptBundle],
     merged_updates: DatabaseUpdates,
     abort_intents: Vec<AbortIntent>,
     local_shard: ShardGroupId,
@@ -362,6 +383,7 @@ pub fn build_proposal<S: CommitStore + SubstateStore>(
 
     let transaction_root = compute_transaction_root(&transactions);
     let certificate_root = compute_certificate_root(&certs_to_include);
+    let local_receipt_root = compute_local_receipt_root(receipts);
 
     let header = BlockHeader {
         shard_group_id: local_shard,
@@ -375,7 +397,7 @@ pub fn build_proposal<S: CommitStore + SubstateStore>(
         state_root,
         transaction_root,
         certificate_root,
-        local_receipt_root: Hash::ZERO,
+        local_receipt_root,
         waves,
     };
 

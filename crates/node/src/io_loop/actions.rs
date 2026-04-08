@@ -176,6 +176,7 @@ where
             | Action::VerifyStateRoot { .. }
             | Action::VerifyTransactionRoot { .. }
             | Action::VerifyCertificateRoot { .. }
+            | Action::VerifyLocalReceiptRoot { .. }
             | Action::VerifyAbortIntentProofs { .. }
             | Action::BuildProposal { .. }
             | Action::VerifyProvisionBatch { .. }

@@ -5,9 +5,9 @@ use hyperscale_messages::{BlockHeaderNotification, BlockVoteNotification, Transa
 use hyperscale_types::{
     AbortIntent, Block, BlockHeight, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature,
     CommittedBlockHeader, EpochConfig, EpochId, ExecutionCertificate, ExecutionVote, FinalizedWave,
-    Hash, NodeId, ProvisionBatch, QuorumCertificate, RoutableTransaction, ShardGroupId,
-    SignerBitfield, StateProvision, TopologySnapshot, TxOutcome, ValidatorId, VotePower,
-    WaveCertificate, WaveId,
+    Hash, NodeId, ProvisionBatch, QuorumCertificate, ReceiptBundle, RoutableTransaction,
+    ShardGroupId, SignerBitfield, StateProvision, TopologySnapshot, TxOutcome, ValidatorId,
+    VotePower, WaveCertificate, WaveId,
 };
 use std::collections::HashMap;
 use std::fmt;
@@ -432,6 +432,21 @@ pub enum Action {
         expected_root: Hash,
         /// Wave certificates whose receipt_hash values form the merkle leaves.
         certificates: Vec<Arc<WaveCertificate>>,
+    },
+
+    /// Verify a block's local receipt root.
+    ///
+    /// Computes the merkle root from each receipt's `receipt_hash()` and
+    /// compares against the block header's claimed `local_receipt_root`.
+    /// Returns `ProtocolEvent::LocalReceiptRootVerified`.
+    ///
+    /// Pure CPU operation — verified in parallel with other root verifications.
+    VerifyLocalReceiptRoot {
+        block_hash: Hash,
+        /// Expected local receipt root from block header.
+        expected_root: Hash,
+        /// Receipt bundles from finalized waves on the pending block.
+        receipts: Vec<ReceiptBundle>,
     },
 
     /// Verify abort intent inclusion proofs off-thread.
@@ -877,6 +892,7 @@ impl Action {
                 | Action::VerifyStateRoot { .. }
                 | Action::VerifyTransactionRoot { .. }
                 | Action::VerifyCertificateRoot { .. }
+                | Action::VerifyLocalReceiptRoot { .. }
                 | Action::VerifyAbortIntentProofs { .. }
                 | Action::BuildProposal { .. }
                 | Action::ExecuteTransactions { .. }
@@ -928,6 +944,7 @@ impl Action {
             Action::VerifyStateRoot { .. } => "VerifyStateRoot",
             Action::VerifyTransactionRoot { .. } => "VerifyTransactionRoot",
             Action::VerifyCertificateRoot { .. } => "VerifyCertificateRoot",
+            Action::VerifyLocalReceiptRoot { .. } => "VerifyLocalReceiptRoot",
             Action::VerifyAbortIntentProofs { .. } => "VerifyAbortIntentProofs",
             Action::BuildProposal { .. } => "BuildProposal",
 
