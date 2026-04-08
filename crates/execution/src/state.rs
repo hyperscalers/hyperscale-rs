@@ -1788,6 +1788,14 @@ impl ExecutionState {
             .collect()
     }
 
+    /// Get all finalized waves (for proposal building).
+    pub fn get_finalized_waves(&self) -> Vec<Arc<FinalizedWave>> {
+        self.finalized_wave_certificates
+            .values()
+            .map(|fw| Arc::new(fw.clone()))
+            .collect()
+    }
+
     /// Get a finalized wave by its wave_id hash (returns Arc for sharing).
     pub fn get_finalized_wave_by_hash(&self, wave_id_hash: &Hash) -> Option<Arc<FinalizedWave>> {
         self.finalized_wave_certificates

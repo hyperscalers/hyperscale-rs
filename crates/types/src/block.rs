@@ -452,18 +452,12 @@ pub struct BlockManifest {
     /// Transaction hashes in block order.
     pub tx_hashes: Vec<Hash>,
 
-    /// Certificate hashes in block order.
+    /// Certificate hashes (wave_id hashes) in block order.
+    /// Validators use these to match against their locally finalized waves.
     pub cert_hashes: Vec<Hash>,
 
     /// Abort intents (small, stored inline).
     pub abort_intents: Vec<AbortIntent>,
-
-    /// Transaction hashes of non-aborted certificates that require receipts.
-    ///
-    /// Validators must have receipt data (DatabaseUpdates) for these transactions
-    /// before voting on the block, because state_root verification requires it.
-    /// Populated by the proposer from non-aborted certificates.
-    pub receipt_hashes: Vec<Hash>,
 }
 
 impl BlockManifest {
@@ -475,8 +469,6 @@ impl BlockManifest {
     /// Build a manifest from a full block (extracting hashes).
     ///
     /// `cert_hashes` uses wave_id identity hashes (computable without EC knowledge).
-    /// `receipt_hashes` must be populated separately by the proposer from
-    /// FinalizedWave tx_hashes (the block alone doesn't carry per-tx info).
     pub fn from_block(block: &Block) -> Self {
         Self {
             tx_hashes: block.transactions.iter().map(|tx| tx.hash()).collect(),
@@ -486,26 +478,6 @@ impl BlockManifest {
                 .map(|c| c.wave_id.hash())
                 .collect(),
             abort_intents: block.abort_intents.clone(),
-            // receipt_hashes is empty here — must be populated by the proposer
-            // from FinalizedWave data, since wave certs don't carry per-tx info.
-            receipt_hashes: vec![],
-        }
-    }
-
-    /// Build a manifest from a full block with explicit receipt hashes.
-    ///
-    /// The proposer provides `receipt_hashes` (tx hashes of non-aborted txs
-    /// across all wave certs) since the lean wave cert doesn't embed per-tx data.
-    pub fn from_block_with_receipts(block: &Block, receipt_hashes: Vec<Hash>) -> Self {
-        Self {
-            tx_hashes: block.transactions.iter().map(|tx| tx.hash()).collect(),
-            cert_hashes: block
-                .certificates
-                .iter()
-                .map(|c| c.wave_id.hash())
-                .collect(),
-            abort_intents: block.abort_intents.clone(),
-            receipt_hashes,
         }
     }
 }

@@ -106,7 +106,6 @@ fn test_recovered_votes_prevent_equivocation() {
         hyperscale_types::BlockManifest::default(),
         |_| None,
         |_| None,
-        |_| false,
     );
 
     // Check that no vote was broadcast

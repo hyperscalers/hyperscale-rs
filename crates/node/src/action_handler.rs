@@ -21,8 +21,6 @@ pub(crate) struct ActionContext<'a, S: CommitStore + SubstateStore + ConsensusSt
     pub storage: &'a S,
     pub executor: &'a RadixExecutor,
     pub topology: &'a hyperscale_types::TopologySnapshot,
-    pub local_shard: ShardGroupId,
-    pub num_shards: u64,
 }
 
 /// Result of handling a delegated action.
@@ -298,51 +296,24 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
             is_fallback,
             parent_state_root,
             transactions,
-            certificates,
+            finalized_waves,
             abort_intents,
             waves,
         } => {
-            // Derive per-tx receipt hashes from wave certs' WaveIds.
-            // Each wave cert's WaveId references a source block (by block_height).
-            // We look up that source block's transactions from storage and use
-            // derive_wave_tx_hashes to identify which txs belong to each wave.
-            // Derive per-tx receipt hashes from wave certs' WaveIds.
-            // Each wave cert references a source block (by block_height). Look up
-            // that block's transactions to identify which txs the wave covers.
-            let mut per_cert: Vec<hyperscale_types::DatabaseUpdates> = Vec::new();
-            let mut receipt_tx_hashes: Vec<hyperscale_types::Hash> = Vec::new();
-            for wc in &certificates {
-                if !wc.is_completed() {
-                    continue;
-                }
-                let source_height = hyperscale_types::BlockHeight(wc.wave_id.block_height);
-                let source_txs = match ctx.storage.get_block(source_height) {
-                    Some((source_block, _)) => source_block.transactions,
-                    None => {
-                        tracing::warn!(
-                            wave = %wc.wave_id,
-                            height = source_height.0,
-                            "Source block not found for wave cert — skipping receipts"
-                        );
-                        continue;
-                    }
-                };
-                let tx_hashes =
-                    hyperscale_types::derive_wave_tx_hashes(ctx.topology, &wc.wave_id, &source_txs);
-                for tx_hash in tx_hashes {
-                    if let Some(receipt) = ctx.storage.get_local_receipt(&tx_hash) {
-                        per_cert.push(receipt.database_updates.clone());
-                        receipt_tx_hashes.push(tx_hash);
-                    } else {
-                        tracing::warn!(
-                            %tx_hash,
-                            height = height.0,
-                            "Receipt missing for tx during proposal — skipping"
-                        );
-                    }
-                }
-            }
-            let merged_updates = hyperscale_storage::merge_database_updates(&per_cert);
+            // Extract certificates and merge DatabaseUpdates from finalized waves.
+            // No storage reads needed — everything flows through Arc<FinalizedWave>.
+            let certificates: Vec<Arc<hyperscale_types::WaveCertificate>> = finalized_waves
+                .iter()
+                .map(|fw| Arc::clone(&fw.certificate))
+                .collect();
+
+            let per_receipt: Vec<hyperscale_types::DatabaseUpdates> = finalized_waves
+                .iter()
+                .flat_map(|fw| &fw.receipts)
+                .map(|bundle| bundle.local_receipt.database_updates.clone())
+                .collect();
+            let merged_updates = hyperscale_storage::merge_database_updates(&per_receipt);
+
             let result = hyperscale_bft::handlers::build_proposal(
                 ctx.storage,
                 proposer,
@@ -369,7 +340,7 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
                     round,
                     block: Arc::new(result.block),
                     block_hash: result.block_hash,
-                    receipt_tx_hashes,
+                    finalized_waves,
                 })],
                 prepared_commit: prepared,
             })
@@ -485,8 +456,8 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
             transactions,
             state_root: _,
         } => {
-            let local_shard = ctx.local_shard;
-            let num_shards = ctx.num_shards;
+            let local_shard = ctx.topology.local_shard();
+            let num_shards = ctx.topology.num_shards();
             // Engine handles execution + system/shard filtering internally.
             let raw_results: Vec<_> = transactions
                 .iter()
@@ -520,8 +491,8 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
 
         // --- Cross-shard transaction execution ---
         Action::ExecuteCrossShardTransactions { requests } => {
-            let local_shard = ctx.local_shard;
-            let num_shards = ctx.num_shards;
+            let local_shard = ctx.topology.local_shard();
+            let num_shards = ctx.topology.num_shards();
             let raw_results: Vec<_> = requests
                 .iter()
                 .map(|req| {

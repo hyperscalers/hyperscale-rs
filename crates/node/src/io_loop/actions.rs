@@ -1063,8 +1063,6 @@ where
         let storage = Arc::clone(&self.storage);
         let executor = self.executor.clone();
         let topology_snapshot = self.topology.load_full();
-        let local_shard = self.local_shard;
-        let num_shards = self.num_shards;
         let prepared_commits = Arc::clone(&self.prepared_commits);
         let event_tx = self.event_sender.clone();
 
@@ -1074,8 +1072,6 @@ where
                 storage: &*storage,
                 executor: &executor,
                 topology: &topology_snapshot,
-                local_shard,
-                num_shards,
             };
             if let Some(result) = action_handler::handle_delegated_action(action, &ctx) {
                 if is_execution {
