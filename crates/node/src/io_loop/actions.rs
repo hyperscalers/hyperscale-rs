@@ -199,8 +199,12 @@ where
             // ═══════════════════════════════════════════════════════════
             // Block commit + notifications
             // ═══════════════════════════════════════════════════════════
-            Action::EmitCommittedBlock { block, qc } => {
-                self.accumulate_block_commit(block, qc);
+            Action::CommitBlock {
+                block,
+                qc,
+                finalized_waves,
+            } => {
+                self.accumulate_block_commit(block, qc, finalized_waves);
             }
             Action::EmitTransactionStatus {
                 tx_hash,
@@ -360,6 +364,7 @@ where
         &mut self,
         block: hyperscale_types::Block,
         qc: hyperscale_types::QuorumCertificate,
+        finalized_waves: Vec<Arc<hyperscale_types::FinalizedWave>>,
     ) {
         let block_hash = block.hash();
         let height = block.header.height;
@@ -391,7 +396,8 @@ where
             .handle(SyncInput::BlockCommitted { height: height.0 });
         self.process_sync_outputs(outputs);
 
-        self.pending_block_commits.push((block, qc));
+        self.pending_block_commits
+            .push((block, qc, finalized_waves));
     }
 
     /// Flush accumulated block commits and any pending receipt bundles.
@@ -432,13 +438,13 @@ where
         // buffered data. BFT may buffer sync blocks internally for sequential
         // ordering, so sync data for future heights must stay in the map.
         let mut sync_data = std::collections::HashMap::new();
-        for (block, _) in &commits {
+        for (block, _, _) in &commits {
             if let Some(data) = self.pending_sync_data.remove(&block.header.height.0) {
                 sync_data.insert(block.header.height.0, data);
             }
         }
 
-        let has_non_empty = commits.iter().any(|(b, _)| !b.certificates.is_empty());
+        let has_non_empty = commits.iter().any(|(b, _, _)| !b.certificates.is_empty());
 
         if !has_non_empty {
             // All empty blocks — synchronous fast path.
@@ -454,14 +460,14 @@ where
             // Prune stale prepared_commits that outlived their blocks.
             let max_height = commits
                 .iter()
-                .map(|(b, _)| b.header.height.0)
+                .map(|(b, _, _)| b.header.height.0)
                 .max()
                 .unwrap_or(0);
             {
                 let mut cache = self.prepared_commits.lock().unwrap();
                 cache.retain(|_, (h, _)| *h > max_height);
             }
-            for (block, qc) in commits {
+            for (block, qc, _finalized_waves) in commits {
                 let height = block.header.height;
                 let block_hash = block.hash();
                 let consensus = hyperscale_storage::ConsensusCommitData {
@@ -476,6 +482,7 @@ where
                     &block.certificates,
                     height.0,
                     Some(consensus),
+                    &[],
                     &[],
                 );
                 ConsensusStore::prune_own_votes(&*self.storage, height.0);
@@ -506,7 +513,7 @@ where
         // per block whenever the crypto pool is slower than commit dispatch.
         let max_committed_height = commits
             .iter()
-            .map(|(b, _)| b.header.height.0)
+            .map(|(b, _, _)| b.header.height.0)
             .max()
             .unwrap_or(0);
 
@@ -524,7 +531,7 @@ where
         {
             let mut cache = self.prepared_commits.lock().unwrap();
             let mut deferring = false;
-            for (block, qc) in commits {
+            for (block, qc, finalized_waves) in commits {
                 let has_certs = !block.certificates.is_empty();
                 let prepared = if !deferring {
                     cache.remove(&block.hash()).map(|(_, p)| p)
@@ -551,10 +558,11 @@ where
                     if let Some(p) = prepared {
                         cache.insert(block.hash(), (block.header.height.0, p));
                     }
-                    self.pending_block_commits.push((block, qc));
+                    self.pending_block_commits
+                        .push((block, qc, finalized_waves));
                 } else {
                     prepared_map.push(prepared);
-                    ready_commits.push((block, qc));
+                    ready_commits.push((block, qc, finalized_waves));
                 }
             }
             // Prune stale entries that outlived their blocks.
@@ -586,7 +594,7 @@ where
             // Subsequent blocks in the batch (if any) pass an empty slice.
             let mut remaining_ecs = pending_ecs;
 
-            for (i, (block, qc)) in commits.into_iter().enumerate() {
+            for (i, (block, qc, finalized_waves)) in commits.into_iter().enumerate() {
                 let block_hash = block.hash();
                 let height = block.header.height;
 
@@ -603,6 +611,12 @@ where
                 // to match block height, so provision lookups succeed.
                 // Consensus metadata is folded into the same atomic write.
                 let prepared = prepared_map[i].take();
+                // Extract receipts from finalized waves for atomic commit.
+                let wave_receipts: Vec<hyperscale_types::ReceiptBundle> = finalized_waves
+                    .iter()
+                    .flat_map(|fw| fw.receipts.iter().cloned())
+                    .collect();
+
                 let result = if let Some(prepared) = prepared {
                     // Normal path: prepared commit from VerifyStateRoot.
                     storage.commit_prepared_block(
@@ -610,6 +624,7 @@ where
                         &block.certificates,
                         Some(consensus),
                         &ecs_for_this_block,
+                        &wave_receipts,
                     )
                 } else if !block.certificates.is_empty() {
                     // Full-fidelity sync path: reconstruct DatabaseUpdates from
@@ -634,6 +649,7 @@ where
                             height.0,
                             Some(consensus),
                             &ecs_for_this_block,
+                            &[],
                         );
                         ConsensusStore::prune_own_votes(&*storage, height.0);
                         if i == prepared_map.len() - 1 {
@@ -677,6 +693,7 @@ where
                             &block.certificates,
                             height.0,
                             Some(consensus),
+                            &[],
                             &[],
                         )
                     } else {
@@ -760,28 +777,24 @@ where
                             );
                         }
 
-                        // Commit with verified ECs atomically.
-                        let result = storage.commit_prepared_block(
+                        // Convert sync receipts to ReceiptBundles for atomic commit.
+                        let sync_receipt_bundles: Vec<hyperscale_types::ReceiptBundle> = receipts
+                            .iter()
+                            .map(|entry| hyperscale_types::ReceiptBundle {
+                                tx_hash: entry.tx_hash,
+                                local_receipt: std::sync::Arc::new(entry.receipt.clone()),
+                                execution_output: None,
+                            })
+                            .collect();
+
+                        // Commit with verified ECs and receipts atomically.
+                        storage.commit_prepared_block(
                             prepared,
                             &block.certificates,
                             Some(consensus),
                             sync_ecs,
-                        );
-
-                        // Persist receipts (separate write — not on commit critical path).
-                        if !receipts.is_empty() {
-                            let bundles: Vec<hyperscale_types::ReceiptBundle> = receipts
-                                .iter()
-                                .map(|entry| hyperscale_types::ReceiptBundle {
-                                    tx_hash: entry.tx_hash,
-                                    local_receipt: std::sync::Arc::new(entry.receipt.clone()),
-                                    execution_output: None,
-                                })
-                                .collect();
-                            storage.store_receipt_bundles(&bundles);
-                        }
-
-                        result
+                            &sync_receipt_bundles,
+                        )
                     }
                 } else {
                     // Empty block: no updates needed.
@@ -791,6 +804,7 @@ where
                         &block.certificates,
                         height.0,
                         Some(consensus),
+                        &[],
                         &[],
                     )
                 };

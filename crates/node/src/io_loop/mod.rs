@@ -46,8 +46,8 @@ use hyperscale_network::Network;
 use hyperscale_storage::{CommitStore, ConsensusStore, SubstateStore};
 use hyperscale_types::{
     Block, Bls12381G1PrivateKey, Bls12381G1PublicKey, CommittedBlockHeader, ExecutionCertificate,
-    Hash, QuorumCertificate, RoutableTransaction, ShardGroupId, TopologySnapshot, ValidatorId,
-    WaveCertificate, WaveId,
+    FinalizedWave, Hash, QuorumCertificate, RoutableTransaction, ShardGroupId, TopologySnapshot,
+    ValidatorId, WaveCertificate, WaveId,
 };
 use quick_cache::sync::Cache as QuickCache;
 use std::collections::{HashMap, HashSet};
@@ -209,11 +209,11 @@ where
     validation_batch: BatchAccumulator<Arc<RoutableTransaction>>,
     committed_header_batch: BatchAccumulator<CommittedHeaderVerificationItem>,
 
-    // Block commit accumulator — collects EmitCommittedBlock actions within a
+    // Block commit accumulator — collects CommitBlock actions within a
     // single feed_event/handle_actions batch, then spawns a single closure on
     // the execution pool to commit them sequentially. This keeps JVT writes
     // off the pinned IoLoop thread while preserving commit ordering.
-    pending_block_commits: Vec<(Block, QuorumCertificate)>,
+    pending_block_commits: Vec<(Block, QuorumCertificate, Vec<Arc<FinalizedWave>>)>,
 
     // Guard against out-of-order block commits across separate flushes.
     // When an async commit closure is in flight on the execution pool, new
@@ -1051,7 +1051,7 @@ where
             bft_pending_state_root_verifications: bft_mem.pending_state_root_verifications,
             bft_buffered_synced_blocks: bft_mem.buffered_synced_blocks,
             // Execution
-            exec_cache_entries: exec_mem.receipts_emitted,
+            exec_cache_entries: exec_mem.receipt_cache,
             exec_finalized_wave_certificates: exec_mem.finalized_wave_certificates,
             exec_pending_provisioning: exec_mem.pending_provisioning,
             exec_accumulators: exec_mem.accumulators,

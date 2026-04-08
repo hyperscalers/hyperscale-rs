@@ -94,7 +94,7 @@ use hyperscale_types::FinalizedWave;
 /// Execution memory statistics for monitoring collection sizes.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ExecutionMemoryStats {
-    pub receipts_emitted: usize,
+    pub receipt_cache: usize,
     pub finalized_wave_certificates: usize,
     pub pending_provisioning: usize,
     pub accumulators: usize,
@@ -110,12 +110,6 @@ pub struct ExecutionMemoryStats {
 pub struct ExecutionState {
     /// Current time.
     now: Duration,
-
-    /// Tracks transaction hashes whose receipts have been produced by execution.
-    /// NOT cleared until `remove_finalized_wave` (after block commit).
-    /// Used by BFT `lookup_receipt` to determine receipt availability for
-    /// pending block voting — independent of wave cert finalization status.
-    receipts_emitted: HashSet<Hash>,
 
     /// In-memory receipt cache — holds ReceiptBundles from execution until
     /// they are consumed by `finalize_wave` (moved into `FinalizedWave.receipts`)
@@ -242,7 +236,6 @@ impl ExecutionState {
     pub fn new() -> Self {
         Self {
             now: Duration::ZERO,
-            receipts_emitted: HashSet::new(),
             receipt_cache: HashMap::new(),
             finalized_wave_certificates: BTreeMap::new(),
             committed_height: 0,
@@ -274,22 +267,6 @@ impl ExecutionState {
     // ═══════════════════════════════════════════════════════════════════════════
     // Certificate Updates (from finalized_certificates)
     // ═══════════════════════════════════════════════════════════════════════════
-
-    /// Check if a receipt exists for a transaction (in receipt_cache or finalized waves).
-    ///
-    /// Used by BFT pending block receipt tracking (lookup_receipt).
-    /// This is the correct check for receipt availability — independent of
-    /// wave cert finalization status (P1 fix).
-    pub fn has_receipt(&self, tx_hash: &Hash) -> bool {
-        self.receipts_emitted.contains(tx_hash)
-    }
-
-    /// Check if a finalized certificate exists for a transaction.
-    pub fn has_finalized_certificate(&self, tx_hash: &Hash) -> bool {
-        self.finalized_wave_certificates
-            .values()
-            .any(|fw| fw.tx_hashes.contains(tx_hash))
-    }
 
     // ═══════════════════════════════════════════════════════════════════════════
     // Wave Assignment
@@ -574,7 +551,6 @@ impl ExecutionState {
                 execution_output: Some(result.execution_output),
             };
             self.receipt_cache.insert(tx_hash, bundle);
-            self.receipts_emitted.insert(tx_hash);
             newly_emitted.insert(tx_hash);
         }
 
@@ -601,7 +577,7 @@ impl ExecutionState {
             .collect();
         for wave_id in waves_to_check {
             if let Some(missing) = self.pending_wave_receipts.get_mut(&wave_id) {
-                missing.retain(|h| !self.receipts_emitted.contains(h));
+                missing.retain(|h| !self.receipt_cache.contains_key(h));
                 if missing.is_empty() {
                     // All receipts emitted — finalize this wave.
                     // Need topology for finalize_wave, but we don't have it here.
@@ -1659,7 +1635,7 @@ impl ExecutionState {
             let missing: HashSet<Hash> = tracker
                 .tx_hashes()
                 .iter()
-                .filter(|h| !self.receipts_emitted.contains(h))
+                .filter(|h| !self.receipt_cache.contains_key(h))
                 .copied()
                 .collect();
             if !missing.is_empty() {
@@ -1690,10 +1666,6 @@ impl ExecutionState {
         let tx_decisions = tracker.tx_decisions();
         let tx_hashes = tracker.tx_hashes().to_vec();
         let ecs = tracker.take_execution_certificates();
-
-        // DO NOT clear receipts_emitted here — they must remain set until
-        // remove_finalized_wave (after block commit) so that BFT lookup_receipt
-        // can find them for pending block voting (P2 fix).
 
         // Move receipts from cache into FinalizedWave for atomic commit.
         let receipts: Vec<ReceiptBundle> = tx_hashes
@@ -1739,45 +1711,9 @@ impl ExecutionState {
     // Query Methods
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /// Compatibility shim — wave-level finalization replaces per-tx certificates.
-    /// Use `get_finalized_wave_certificates()` instead.
-    pub fn get_finalized_certificates(&self) -> Vec<Arc<WaveCertificate>> {
-        self.finalized_wave_certificates
-            .values()
-            .map(|fw| Arc::clone(&fw.certificate))
-            .collect()
-    }
-
     /// Get the local wave assignment for a transaction.
     pub fn get_wave_assignment(&self, tx_hash: &Hash) -> Option<WaveId> {
         self.wave_assignments.get(tx_hash).cloned()
-    }
-
-    /// Look up a finalized wave certificate by wave_id hash.
-    ///
-    /// Used by the BFT layer when receiving a block header — if the validator
-    /// already finalized this wave locally, it doesn't need to fetch it.
-    pub fn get_finalized_wave_cert_by_hash(
-        &self,
-        wave_id_hash: &Hash,
-    ) -> Option<Arc<hyperscale_types::WaveCertificate>> {
-        self.finalized_wave_certificates
-            .values()
-            .find(|fw| fw.certificate.wave_id.hash() == *wave_id_hash)
-            .map(|fw| Arc::clone(&fw.certificate))
-    }
-
-    /// Get finalized wave certificates for block inclusion.
-    ///
-    /// Returns finalized wave certificates with their per-wave tx_hashes
-    /// for receipt_hashes population in BlockManifest.
-    pub fn get_finalized_wave_certificates(
-        &self,
-    ) -> Vec<(Arc<hyperscale_types::WaveCertificate>, Vec<Hash>)> {
-        self.finalized_wave_certificates
-            .values()
-            .map(|fw| (Arc::clone(&fw.certificate), fw.tx_hashes.clone()))
-            .collect()
     }
 
     /// Get all finalized waves (for proposal building).
@@ -1822,7 +1758,6 @@ impl ExecutionState {
         // They're drained on block commit replay.
 
         for tx_hash in &tx_hashes {
-            self.receipts_emitted.remove(tx_hash);
             self.receipt_cache.remove(tx_hash);
             self.pending_provisioning.remove(tx_hash);
 
@@ -2003,8 +1938,7 @@ impl ExecutionState {
             return;
         }
 
-        // Evict receipt tracking — transaction is being retried or abandoned.
-        self.receipts_emitted.remove(tx_hash);
+        // Evict receipt from cache — transaction is being retried or abandoned.
         self.receipt_cache.remove(tx_hash);
 
         // Phase 1-2: Provisioning cleanup
@@ -2096,7 +2030,7 @@ impl ExecutionState {
     /// Get execution memory statistics for monitoring collection sizes.
     pub fn memory_stats(&self) -> ExecutionMemoryStats {
         ExecutionMemoryStats {
-            receipts_emitted: self.receipts_emitted.len(),
+            receipt_cache: self.receipt_cache.len(),
             finalized_wave_certificates: self.finalized_wave_certificates.len(),
             pending_provisioning: self.pending_provisioning.len(),
             accumulators: self.accumulators.len(),

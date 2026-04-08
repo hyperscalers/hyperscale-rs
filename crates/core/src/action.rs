@@ -497,17 +497,22 @@ pub enum Action {
     },
 
     // ═══════════════════════════════════════════════════════════════════════
-    // External Notifications
+    // Block Commit
     // ═══════════════════════════════════════════════════════════════════════
-    /// Emit a committed block for external observers.
+    /// Commit a block's state atomically: JVT + substates + receipts + ECs + consensus metadata.
     ///
-    /// Carries the certifying QC so the runner can persist committed metadata
-    /// (`set_committed_state`) after JVT state has been applied, not at
-    /// certification time.
-    EmitCommittedBlock {
+    /// Block data is already persisted via `PersistBlock` at certification time.
+    /// This action applies the state changes and writes receipts atomically.
+    ///
+    /// Normal path: `finalized_waves` carries receipts from local execution.
+    /// Sync path: `finalized_waves` is empty — receipts come from sync peer data
+    /// buffered in the io_loop.
+    CommitBlock {
         block: Block,
         /// The QC that certified this block.
         qc: QuorumCertificate,
+        /// Finalized waves for atomic receipt commit (empty for sync path).
+        finalized_waves: Vec<Arc<FinalizedWave>>,
     },
 
     /// Emit transaction status update for RPC status cache.
@@ -546,9 +551,7 @@ pub enum Action {
     /// Persist a certified block to storage for sync availability.
     ///
     /// This stores the block data only — it does NOT update committed metadata.
-    /// Committed metadata (`set_committed_state`) is persisted by the runner
-    /// after JVT state has been applied, to prevent committed_height from
-    /// getting ahead of actual JVT state on crash recovery.
+    /// Committed metadata is persisted atomically with JVT state via CommitBlock.
     PersistBlock {
         block: Block,
         /// The QC that certified this block (stored alongside block data).
@@ -934,7 +937,7 @@ impl Action {
             Action::FetchAndBroadcastProvisions { .. } => "FetchAndBroadcastProvisions",
 
             // External Notifications
-            Action::EmitCommittedBlock { .. } => "EmitCommittedBlock",
+            Action::CommitBlock { .. } => "CommitBlock",
             Action::EmitTransactionStatus { .. } => "EmitTransactionStatus",
 
             // Storage - Consensus

@@ -144,9 +144,15 @@ impl hyperscale_storage::CommitStore for SharedStorage {
         certificates: &[std::sync::Arc<WaveCertificate>],
         consensus: Option<hyperscale_storage::ConsensusCommitData>,
         execution_certificates: &[hyperscale_types::ExecutionCertificate],
+        receipts: &[hyperscale_types::ReceiptBundle],
     ) -> hyperscale_types::Hash {
-        self.0
-            .commit_prepared_block(prepared, certificates, consensus, execution_certificates)
+        self.0.commit_prepared_block(
+            prepared,
+            certificates,
+            consensus,
+            execution_certificates,
+            receipts,
+        )
     }
 
     fn commit_block(
@@ -156,6 +162,7 @@ impl hyperscale_storage::CommitStore for SharedStorage {
         block_height: u64,
         consensus: Option<hyperscale_storage::ConsensusCommitData>,
         execution_certificates: &[hyperscale_types::ExecutionCertificate],
+        receipts: &[hyperscale_types::ReceiptBundle],
     ) -> hyperscale_types::Hash {
         self.0.commit_block(
             merged_updates,
@@ -163,6 +170,7 @@ impl hyperscale_storage::CommitStore for SharedStorage {
             block_height,
             consensus,
             execution_certificates,
+            receipts,
         )
     }
 
@@ -238,14 +246,6 @@ impl hyperscale_storage::ConsensusStore for SharedStorage {
 
     fn get_certificates_batch(&self, hashes: &[Hash]) -> Vec<WaveCertificate> {
         self.0.get_certificates_batch(hashes)
-    }
-
-    fn store_receipt_bundle(&self, bundle: &hyperscale_types::ReceiptBundle) {
-        self.0.store_receipt_bundle(bundle)
-    }
-
-    fn store_receipt_bundles(&self, bundles: &[hyperscale_types::ReceiptBundle]) {
-        self.0.store_receipt_bundles(bundles)
     }
 
     fn get_local_receipt(&self, tx_hash: &Hash) -> Option<Arc<hyperscale_types::LocalReceipt>> {

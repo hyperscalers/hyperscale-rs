@@ -5,7 +5,7 @@ use crate::core::RocksDbStorage;
 use crate::jvt_snapshot_store::SnapshotTreeStore;
 
 use hyperscale_storage::{DatabaseUpdates, JvtSnapshot};
-use hyperscale_types::WaveCertificate;
+use hyperscale_types::{ReceiptBundle, WaveCertificate};
 use rocksdb::WriteBatch;
 use std::sync::Arc;
 
@@ -59,6 +59,7 @@ impl hyperscale_storage::CommitStore for RocksDbStorage {
         certificates: &[Arc<WaveCertificate>],
         consensus: Option<hyperscale_storage::ConsensusCommitData>,
         execution_certificates: &[hyperscale_types::ExecutionCertificate],
+        receipts: &[ReceiptBundle],
     ) -> hyperscale_types::Hash {
         let block_height = prepared.jvt_snapshot.new_version;
         let result_root = prepared.jvt_snapshot.result_root;
@@ -78,6 +79,11 @@ impl hyperscale_storage::CommitStore for RocksDbStorage {
             execution_certificates,
         );
 
+        // Add receipts to the batch atomically.
+        for bundle in receipts {
+            self.add_receipt_bundle_to_batch(&mut write_batch, bundle);
+        }
+
         let used_fast_path =
             self.try_apply_prepared_commit(write_batch, prepared.jvt_snapshot, consensus.as_ref());
 
@@ -93,6 +99,7 @@ impl hyperscale_storage::CommitStore for RocksDbStorage {
                 block_height,
                 consensus,
                 execution_certificates,
+                receipts,
             )
         }
     }
@@ -104,6 +111,7 @@ impl hyperscale_storage::CommitStore for RocksDbStorage {
         block_height: u64,
         consensus: Option<hyperscale_storage::ConsensusCommitData>,
         execution_certificates: &[hyperscale_types::ExecutionCertificate],
+        receipts: &[ReceiptBundle],
     ) -> hyperscale_types::Hash {
         let _commit_guard = self.commit_lock.lock().unwrap();
 
@@ -138,6 +146,11 @@ impl hyperscale_storage::CommitStore for RocksDbStorage {
             &mut batch,
             execution_certificates,
         );
+
+        // Add receipts to the batch atomically.
+        for bundle in receipts {
+            self.add_receipt_bundle_to_batch(&mut batch, bundle);
+        }
 
         // Compute JVT update.
         let parent_version = hyperscale_storage::tree::jvt_parent_height(base_version, base_root);

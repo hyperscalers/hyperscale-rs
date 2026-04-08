@@ -5,7 +5,7 @@
 
 use hyperscale_types::{
     Block, BlockHeight, ExecutionCertificate, ExecutionOutput, Hash, LocalReceipt,
-    QuorumCertificate, ReceiptBundle, RoutableTransaction, ShardGroupId, WaveCertificate,
+    QuorumCertificate, RoutableTransaction, ShardGroupId, WaveCertificate,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -78,20 +78,8 @@ pub trait ConsensusStore: Send + Sync {
 
     // ─── Receipt Storage ──────────────────────────────────────────────────
 
-    /// Store a receipt bundle (local receipt + optional execution output) for a transaction.
-    ///
-    /// If `bundle.execution_output` is `None` (e.g., receipt fetched during sync),
-    /// only the local receipt is persisted.
-    fn store_receipt_bundle(&self, bundle: &ReceiptBundle);
-
-    /// Store multiple receipt bundles atomically.
-    ///
-    /// Default implementation loops, but RocksDB overrides for atomic batch write.
-    fn store_receipt_bundles(&self, bundles: &[ReceiptBundle]) {
-        for bundle in bundles {
-            self.store_receipt_bundle(bundle);
-        }
-    }
+    // Receipt writes are now atomic with block commit via CommitStore.
+    // Standalone store_receipt_bundle(s) removed from trait.
 
     /// Retrieve the local receipt for a transaction.
     fn get_local_receipt(&self, tx_hash: &Hash) -> Option<Arc<LocalReceipt>>;

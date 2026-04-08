@@ -466,7 +466,7 @@ fn test_commit_block_single_cert() {
     let updates = make_mapped_database_update(1, 0, vec![10], vec![42]);
     let cert = Arc::new(make_test_wave_certificate(1, shard));
 
-    let result = storage.commit_block(&updates, &[cert], 1, None, &[]);
+    let result = storage.commit_block(&updates, &[cert], 1, None, &[], &[]);
     assert_ne!(result, Hash::ZERO);
 }
 
@@ -480,7 +480,7 @@ fn test_commit_block_multiple_certs() {
     let cert1 = Arc::new(make_test_wave_certificate(1, shard));
     let cert2 = Arc::new(make_test_wave_certificate(2, shard));
 
-    let result = storage.commit_block(&merged, &[cert1, cert2], 1, None, &[]);
+    let result = storage.commit_block(&merged, &[cert1, cert2], 1, None, &[], &[]);
     // Certificate merging: all certs applied as single JVT version = block_height
     assert_ne!(result, Hash::ZERO);
 }
@@ -488,7 +488,7 @@ fn test_commit_block_multiple_certs() {
 #[test]
 fn test_commit_block_empty_certs() {
     let storage = SimStorage::new();
-    storage.commit_block(&DatabaseUpdates::default(), &[], 1, None, &[]);
+    storage.commit_block(&DatabaseUpdates::default(), &[], 1, None, &[], &[]);
     // Empty block: JVT version still advances to block_height
     assert_eq!(storage.jvt_version(), 1);
 }
@@ -507,7 +507,7 @@ fn test_prepare_then_commit_fast_path() {
     let (spec_root, prepared) =
         s_prepared.prepare_block_commit(parent_root, &DatabaseUpdates::default(), 1);
     let certs = std::slice::from_ref(&cert);
-    let result_prepared = s_prepared.commit_prepared_block(prepared, certs, None, &[]);
+    let result_prepared = s_prepared.commit_prepared_block(prepared, certs, None, &[], &[]);
 
     // Direct path
     let result_direct = s_direct.commit_block(
@@ -515,6 +515,7 @@ fn test_prepare_then_commit_fast_path() {
         std::slice::from_ref(&cert),
         1,
         None,
+        &[],
         &[],
     );
 
@@ -531,7 +532,7 @@ fn test_prepare_commit_state_root_matches() {
     let parent_root = storage.state_root_hash();
     let (spec_root, prepared) =
         storage.prepare_block_commit(parent_root, &DatabaseUpdates::default(), 1);
-    let result = storage.commit_prepared_block(prepared, &[cert], None, &[]);
+    let result = storage.commit_prepared_block(prepared, &[cert], None, &[], &[]);
 
     assert_eq!(spec_root, result);
 }
@@ -559,7 +560,7 @@ fn test_commit_block_stores_certificates() {
     let cert = Arc::new(make_test_wave_certificate(1, shard));
     let wave_hash = cert.wave_id.hash();
 
-    let _ = storage.commit_block(&DatabaseUpdates::default(), &[cert], 1, None, &[]);
+    let _ = storage.commit_block(&DatabaseUpdates::default(), &[cert], 1, None, &[], &[]);
 
     assert!(storage.get_certificate(&wave_hash).is_some());
 }
@@ -639,13 +640,13 @@ fn test_list_substates_for_node_at_height_returns_historical_data() {
     // Block height 1: commit value [100] for node 1
     let updates1 = make_mapped_database_update(1, 0, vec![10], vec![100]);
     let cert1 = Arc::new(make_test_wave_certificate(1, shard));
-    let result1 = storage.commit_block(&updates1, &[cert1], 1, None, &[]);
+    let result1 = storage.commit_block(&updates1, &[cert1], 1, None, &[], &[]);
     let root_v1 = result1;
 
     // Block height 2: overwrite with value [200]
     let updates2 = make_mapped_database_update(1, 0, vec![10], vec![200]);
     let cert2 = Arc::new(make_test_wave_certificate(2, shard));
-    let result2 = storage.commit_block(&updates2, &[cert2], 2, None, &[]);
+    let result2 = storage.commit_block(&updates2, &[cert2], 2, None, &[], &[]);
     let root_v2 = result2;
     assert_ne!(root_v1, root_v2, "roots must differ after overwrite");
 
@@ -676,34 +677,6 @@ fn test_list_substates_for_node_at_height_returns_historical_data() {
             .is_none(),
         "future version should return None"
     );
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-// Receipt storage
-// ═══════════════════════════════════════════════════════════════════════
-
-#[test]
-fn test_receipt_storage_roundtrip() {
-    let storage = SimStorage::new();
-    hyperscale_storage::test_helpers::test_receipt_storage_roundtrip(&storage);
-}
-
-#[test]
-fn test_receipt_storage_synced() {
-    let storage = SimStorage::new();
-    hyperscale_storage::test_helpers::test_receipt_storage_synced(&storage);
-}
-
-#[test]
-fn test_receipt_batch_storage() {
-    let storage = SimStorage::new();
-    hyperscale_storage::test_helpers::test_receipt_batch_storage(&storage);
-}
-
-#[test]
-fn test_receipt_idempotent_overwrite() {
-    let storage = SimStorage::new();
-    hyperscale_storage::test_helpers::test_receipt_idempotent_overwrite(&storage);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
