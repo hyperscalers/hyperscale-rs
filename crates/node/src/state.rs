@@ -11,7 +11,7 @@ use hyperscale_topology::TopologyState;
 use hyperscale_types::{
     AbortIntent, Block, BlockHeader, BlockHeight, BlockManifest, Bls12381G1PrivateKey,
     FinalizedWave, Hash, QuorumCertificate, ReadyTransactions, RoutableTransaction, ShardGroupId,
-    TopologySnapshot, WaveCertificate,
+    TopologySnapshot,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -77,7 +77,7 @@ impl std::fmt::Debug for NodeStateMachine {
 struct ProposalInputs {
     ready_txs: ReadyTransactions,
     abort_intents: Vec<AbortIntent>,
-    certificates: Vec<Arc<WaveCertificate>>,
+    finalized_waves: Vec<Arc<FinalizedWave>>,
 }
 
 impl NodeStateMachine {
@@ -217,12 +217,12 @@ impl NodeStateMachine {
         // dedup keeps the first intent per tx_hash, so timeouts take priority.
         let abort_intents: Vec<AbortIntent> =
             timed_out.into_iter().chain(livelock_intents).collect();
-        let certificates = self.execution.get_finalized_certificates();
+        let finalized_waves = self.execution.get_finalized_waves();
 
         ProposalInputs {
             ready_txs,
             abort_intents,
-            certificates,
+            finalized_waves,
         }
     }
 
@@ -281,7 +281,7 @@ impl NodeStateMachine {
             self.topology.snapshot(),
             &inputs.ready_txs,
             inputs.abort_intents,
-            inputs.certificates,
+            inputs.finalized_waves,
             &finalized,
         )
     }
@@ -319,8 +319,7 @@ impl NodeStateMachine {
             header,
             manifest,
             |h| self.mempool.get_transaction(h),
-            |h| self.execution.get_finalized_wave_cert_by_hash(h),
-            |h| self.execution.has_receipt(h),
+            |h| self.execution.get_finalized_wave_by_hash(h),
         )
     }
 
@@ -343,7 +342,7 @@ impl NodeStateMachine {
             qc,
             &inputs.ready_txs,
             inputs.abort_intents,
-            inputs.certificates,
+            inputs.finalized_waves,
             &finalized,
         )
     }
@@ -491,28 +490,15 @@ impl NodeStateMachine {
             self.mempool
                 .on_transaction_executed(self.topology.snapshot(), tx_hash, accepted);
 
-        // Feed receipt availability for pending blocks.
-        // Always notify — receipt exists if execution completed, regardless of
-        // wave cert finalization status (P3 fix).
-        if self.execution.has_receipt(&tx_hash) {
-            actions.extend(
-                self.bft
-                    .on_receipts_available(self.topology.snapshot(), &[tx_hash]),
-            );
-        }
-
-        // Check if any pending blocks are waiting for a wave cert that
-        // contains this tx. Look up the finalized wave cert and feed it.
+        // Check if any pending blocks are waiting for the finalized wave
+        // that contains this tx.
         if let Some(wave_id) = self.execution.get_wave_assignment(&tx_hash) {
             let wave_id_hash = wave_id.hash();
-            if let Some(wc) = self
-                .execution
-                .get_finalized_wave_cert_by_hash(&wave_id_hash)
-            {
-                actions.extend(self.bft.check_pending_blocks_for_certificate(
+            if let Some(fw) = self.execution.get_finalized_wave_by_hash(&wave_id_hash) {
+                actions.extend(self.bft.check_pending_blocks_for_finalized_wave(
                     self.topology.snapshot(),
                     wave_id_hash,
-                    &wc,
+                    &fw,
                 ));
             }
         }
@@ -671,14 +657,14 @@ impl StateMachine for NodeStateMachine {
                 round,
                 block,
                 block_hash,
-                receipt_tx_hashes,
+                finalized_waves,
             } => self.bft.on_proposal_built(
                 self.topology.snapshot(),
                 height,
                 round,
                 block.clone(),
                 block_hash,
-                receipt_tx_hashes,
+                finalized_waves,
             ),
 
             // ── State Commit ─────────────────────────────────────────────
@@ -719,27 +705,10 @@ impl StateMachine for NodeStateMachine {
                 results,
                 tx_outcomes,
             } => {
-                // Extract tx_hashes before results are consumed — these receipts
-                // are now available in the execution cache for state root verification.
-                let receipt_tx_hashes: Vec<hyperscale_types::Hash> =
-                    results.iter().map(|r| r.tx_hash).collect();
-
-                let mut actions = self
-                    .execution
-                    .on_execution_batch_completed(results, tx_outcomes);
-
-                // Feed receipt availability to BFT pending blocks. A pending block
-                // that was waiting for these receipts may now be complete and ready
-                // for voting. This prevents voting on blocks where state_root
-                // cannot be verified due to missing execution results.
-                if !receipt_tx_hashes.is_empty() {
-                    actions.extend(
-                        self.bft
-                            .on_receipts_available(self.topology.snapshot(), &receipt_tx_hashes),
-                    );
-                }
-
-                actions
+                // Receipt availability is now tracked via finalized waves (not per-tx).
+                // Pending blocks wait for Arc<FinalizedWave> from WaveCompleted events.
+                self.execution
+                    .on_execution_batch_completed(results, tx_outcomes)
             }
 
             // ── Wave Execution (wave-based voting) ────────────────────────
@@ -801,11 +770,23 @@ impl StateMachine for NodeStateMachine {
             ProtocolEvent::CertificateFetchDelivered {
                 block_hash,
                 certificates,
-            } => self.bft.on_certificate_fetch_received(
-                self.topology.snapshot(),
-                block_hash,
-                certificates,
-            ),
+            } => {
+                // Convert fetched wave certs to FinalizedWaves from local execution state.
+                // If we haven't finalized a wave locally, we can't use the fetched cert
+                // (we need the receipts too). This path will be removed entirely soon.
+                let finalized_waves: Vec<Arc<FinalizedWave>> = certificates
+                    .iter()
+                    .filter_map(|wc| {
+                        self.execution
+                            .get_finalized_wave_by_hash(&wc.wave_id.hash())
+                    })
+                    .collect();
+                self.bft.on_certificate_fetch_received(
+                    self.topology.snapshot(),
+                    block_hash,
+                    finalized_waves,
+                )
+            }
             // ── Storage / Sync ───────────────────────────────────────────
             ProtocolEvent::BlockFetched { .. } => vec![],
             ProtocolEvent::SyncBlockReadyToApply { block, qc } => self

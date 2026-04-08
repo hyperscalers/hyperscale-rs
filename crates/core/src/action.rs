@@ -469,7 +469,8 @@ pub enum Action {
         /// Parent's state root. Certs included only if local JVT matches this.
         parent_state_root: Hash,
         transactions: Vec<Arc<RoutableTransaction>>,
-        certificates: Vec<Arc<WaveCertificate>>,
+        /// Finalized waves to include in the block (carries certs + receipts + ECs).
+        finalized_waves: Vec<Arc<FinalizedWave>>,
         abort_intents: Vec<AbortIntent>,
         /// Cross-shard execution waves in this block.
         waves: Vec<WaveId>,

@@ -7,8 +7,9 @@
 
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, BlockManifest, BlockVote, CommittedBlockHeader, EpochConfig,
-    EpochId, ExecutionCertificate, ExecutionVote, Hash, ProvisionBatch, QuorumCertificate,
-    RoutableTransaction, ShardGroupId, TxOutcome, ValidatorId, WaveCertificate, WaveId,
+    EpochId, ExecutionCertificate, ExecutionVote, FinalizedWave, Hash, ProvisionBatch,
+    QuorumCertificate, RoutableTransaction, ShardGroupId, TxOutcome, ValidatorId, WaveCertificate,
+    WaveId,
 };
 use std::sync::Arc;
 
@@ -122,10 +123,8 @@ pub enum ProtocolEvent {
         round: u64,
         block: Arc<Block>,
         block_hash: Hash,
-        /// Transaction hashes that have receipts (derived from wave certs' source blocks).
-        /// Used to populate BlockManifest.receipt_hashes for gossip to other validators.
-        /// Computed by the action handler which has storage access to look up source blocks.
-        receipt_tx_hashes: Vec<Hash>,
+        /// Finalized waves included in this block (carries receipts for atomic commit).
+        finalized_waves: Vec<Arc<FinalizedWave>>,
     },
 
     // ═══════════════════════════════════════════════════════════════════════

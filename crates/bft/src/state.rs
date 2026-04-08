@@ -48,8 +48,8 @@ pub type NodeIndex = u32;
 use hyperscale_types::{
     block_header_message, committed_block_header_message, AbortIntent, Block, BlockHeader,
     BlockHeight, BlockManifest, BlockVote, Bls12381G1PrivateKey, Bls12381G1PublicKey,
-    CommittedBlockHeader, Hash, QuorumCertificate, ReadyTransactions, RoutableTransaction,
-    ShardGroupId, TopologySnapshot, ValidatorId, VotePower, WaveCertificate,
+    CommittedBlockHeader, FinalizedWave, Hash, QuorumCertificate, ReadyTransactions,
+    RoutableTransaction, ShardGroupId, TopologySnapshot, ValidatorId, VotePower,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -817,17 +817,17 @@ impl BftState {
     ///
     /// Takes ready transactions from mempool (already sectioned and hash-sorted),
     /// plus deferrals, aborts, and certificates from execution.
-    #[instrument(skip(self, ready_txs, abort_intents, certificates, finalized_tx_hashes), fields(
+    #[instrument(skip(self, ready_txs, abort_intents, finalized_waves, finalized_tx_hashes), fields(
         tx_count = ready_txs.len(),
         abort_intent_count = abort_intents.len(),
-        cert_count = certificates.len(),
+        cert_count = finalized_waves.len(),
     ))]
     pub fn on_proposal_timer(
         &mut self,
         topology: &TopologySnapshot,
         ready_txs: &ReadyTransactions,
         abort_intents: Vec<AbortIntent>,
-        certificates: Vec<Arc<WaveCertificate>>,
+        finalized_waves: Vec<Arc<FinalizedWave>>,
         finalized_tx_hashes: &std::collections::HashSet<Hash>,
     ) -> Vec<Action> {
         // The next height to propose is one above the highest certified block,
@@ -1010,9 +1010,9 @@ impl BftState {
             filtered
         };
 
-        let certificates_to_propose: Vec<_> = certificates
+        let waves_to_propose: Vec<_> = finalized_waves
             .into_iter()
-            .filter(|c| !qc_chain_cert_hashes.contains(&c.wave_id.hash()))
+            .filter(|fw| !qc_chain_cert_hashes.contains(&fw.wave_id_hash()))
             .take(self.config.max_certificates_per_block)
             .collect();
 
@@ -1039,7 +1039,7 @@ impl BftState {
             height = next_height,
             round = round,
             transactions = transactions.len(),
-            certificates = certificates_to_propose.len(),
+            waves = waves_to_propose.len(),
             "Requesting block build for proposal"
         );
 
@@ -1068,7 +1068,7 @@ impl BftState {
                 is_fallback: false,
                 parent_state_root,
                 transactions,
-                certificates: certificates_to_propose,
+                finalized_waves: waves_to_propose,
                 abort_intents: abort_intents_with_height,
                 waves,
             },
@@ -1416,7 +1416,7 @@ impl BftState {
     /// Sender identity comes from the header's proposer field (ValidatorId),
     /// which is signed and verified. For sync detection, we don't need
     /// the network peer ID.
-    #[instrument(skip(self, header, manifest, lookup_tx, lookup_cert, lookup_receipt), fields(
+    #[instrument(skip(self, header, manifest, lookup_tx, lookup_finalized_wave), fields(
         height = header.height.0,
         round = header.round,
         proposer = ?header.proposer,
@@ -1428,8 +1428,7 @@ impl BftState {
         header: BlockHeader,
         manifest: BlockManifest,
         lookup_tx: impl Fn(&Hash) -> Option<Arc<RoutableTransaction>>,
-        lookup_cert: impl Fn(&Hash) -> Option<Arc<WaveCertificate>>,
-        lookup_receipt: impl Fn(&Hash) -> bool,
+        lookup_finalized_wave: impl Fn(&Hash) -> Option<Arc<FinalizedWave>>,
     ) -> Vec<Action> {
         let block_hash = header.hash();
         let height = header.height.0;
@@ -1575,14 +1574,9 @@ impl BftState {
                 pending.add_transaction_arc(tx);
             }
         }
-        for cert_hash in pending.manifest().cert_hashes.clone() {
-            if let Some(cert) = lookup_cert(&cert_hash) {
-                pending.add_certificate(cert);
-            }
-        }
-        for receipt_hash in pending.manifest().receipt_hashes.clone() {
-            if lookup_receipt(&receipt_hash) {
-                pending.add_receipt(&receipt_hash);
+        for wave_hash in pending.manifest().cert_hashes.clone() {
+            if let Some(fw) = lookup_finalized_wave(&wave_hash) {
+                pending.add_finalized_wave(fw);
             }
         }
 
@@ -1651,7 +1645,7 @@ impl BftState {
                 validator = ?topology.local_validator_id(),
                 block_hash = ?block_hash,
                 missing_txs = pending.missing_transaction_count(),
-                missing_certs = pending.missing_certificate_count(),
+                missing_waves = pending.missing_wave_count(),
                 "Block incomplete, will fetch after timeout if still missing"
             );
         }
@@ -2841,7 +2835,7 @@ impl BftState {
     /// Called when the runner completes `Action::BuildProposal`. The runner has
     /// computed the state root, built the complete block, and cached the WriteBatch
     /// for efficient commit later.
-    #[instrument(skip(self, block, receipt_tx_hashes), fields(height = %height.0, round = round))]
+    #[instrument(skip(self, block, finalized_waves), fields(height = %height.0, round = round))]
     pub fn on_proposal_built(
         &mut self,
         topology: &TopologySnapshot,
@@ -2849,7 +2843,7 @@ impl BftState {
         round: u64,
         block: Arc<Block>,
         block_hash: Hash,
-        receipt_tx_hashes: Vec<Hash>,
+        finalized_waves: Vec<Arc<FinalizedWave>>,
     ) -> Vec<Action> {
         // Take the pending proposal - if it doesn't match (height, round), something is wrong
         let Some(pending) = self.pending_proposal.take() else {
@@ -2876,8 +2870,8 @@ impl BftState {
 
         let has_certificates = !block.certificates.is_empty();
 
-        // Store our own block as pending
-        let mut pending_block = PendingBlock::from_complete_block(&block, receipt_tx_hashes);
+        // Store our own block as pending (with all finalized waves)
+        let mut pending_block = PendingBlock::from_complete_block(&block, finalized_waves);
 
         let total_tx_count = pending_block.transaction_count();
         info!(
@@ -3041,7 +3035,7 @@ impl BftState {
     ///
     /// `state_root` is the computed JVT root after applying writes from the certificates.
     /// If certificates is empty, parent state is inherited.
-    #[instrument(skip(self, qc, ready_txs, abort_intents, certificates, finalized_tx_hashes), fields(
+    #[instrument(skip(self, qc, ready_txs, abort_intents, finalized_waves, finalized_tx_hashes), fields(
         height = qc.height.0,
         block_hash = ?block_hash
     ))]
@@ -3053,7 +3047,7 @@ impl BftState {
         qc: QuorumCertificate,
         ready_txs: &ReadyTransactions,
         abort_intents: Vec<AbortIntent>,
-        certificates: Vec<Arc<WaveCertificate>>,
+        finalized_waves: Vec<Arc<FinalizedWave>>,
         finalized_tx_hashes: &std::collections::HashSet<Hash>,
     ) -> Vec<Action> {
         let height = qc.height.0;
@@ -3135,7 +3129,7 @@ impl BftState {
         let next_height = height + 1;
 
         let has_content =
-            !ready_txs.is_empty() || !abort_intents.is_empty() || !certificates.is_empty();
+            !ready_txs.is_empty() || !abort_intents.is_empty() || !finalized_waves.is_empty();
 
         // Rate limit against the latest QC time (any proposer), not just our own
         // last proposal. With rotating proposers, per-validator tracking doesn't
@@ -3162,7 +3156,7 @@ impl BftState {
                 topology,
                 ready_txs,
                 abort_intents,
-                certificates,
+                finalized_waves,
                 finalized_tx_hashes,
             ));
         } else if should_try_proposal && rate_limited {
@@ -3268,7 +3262,7 @@ impl BftState {
                         block_hash = ?block_hash,
                         height = height,
                         missing_txs = pending.missing_transaction_count(),
-                        missing_certs = pending.missing_certificate_count(),
+                        missing_waves = pending.missing_wave_count(),
                         "Block not yet complete, buffering commit until data arrives"
                     );
                     self.pending_commits_awaiting_data
@@ -3854,8 +3848,7 @@ impl BftState {
                         block_hash = ?pending.header().hash(),
                         height = height,
                         missing_txs = pending.missing_transaction_count(),
-                        missing_certs = pending.missing_certificate_count(),
-                        missing_receipts = pending.missing_receipt_count(),
+                        missing_waves = pending.missing_wave_count(),
                         "View change — block still incomplete (missing data)"
                     );
                 }
@@ -4111,28 +4104,28 @@ impl BftState {
         &mut self,
         topology: &TopologySnapshot,
         block_hash: Hash,
-        certificates: Vec<Arc<WaveCertificate>>,
+        finalized_waves: Vec<Arc<FinalizedWave>>,
     ) -> Vec<Action> {
         let validator_id = topology.local_validator_id();
 
-        // First phase: add certificates and check state
+        // First phase: add finalized waves and check state
         let (added, still_missing, is_complete, needs_construct) = {
             let Some(pending) = self.pending_blocks.get_mut(&block_hash) else {
                 warn!(
                     block_hash = ?block_hash,
-                    "Received fetched certificates for unknown/completed block"
+                    "Received fetched finalized waves for unknown/completed block"
                 );
                 return vec![];
             };
 
             let mut added = 0;
-            for cert in certificates {
-                if pending.add_certificate(cert) {
+            for fw in finalized_waves {
+                if pending.add_finalized_wave(fw) {
                     added += 1;
                 }
             }
 
-            let still_missing = pending.missing_certificate_count();
+            let still_missing = pending.missing_wave_count();
             let is_complete = pending.is_complete();
             let needs_construct = is_complete && pending.block().is_none();
 
@@ -4144,12 +4137,12 @@ impl BftState {
             block_hash = ?block_hash,
             added = added,
             still_missing = still_missing,
-            "Added fetched certificates to pending block"
+            "Added fetched finalized waves to pending block"
         );
 
         // Check if block is now complete
         if !is_complete {
-            // Still missing data — re-request remaining certificates
+            // Still missing data — re-request remaining waves
             let Some(pending) = self.pending_blocks.get(&block_hash) else {
                 return vec![];
             };
@@ -4157,18 +4150,18 @@ impl BftState {
             let mut actions = Vec::new();
             let proposer = pending.header().proposer;
 
-            let missing_certs = pending.missing_certificates();
-            if !missing_certs.is_empty() {
+            let missing_waves = pending.missing_waves();
+            if !missing_waves.is_empty() {
                 warn!(
                     validator = ?validator_id,
                     block_hash = ?block_hash,
-                    still_missing = missing_certs.len(),
-                    "Re-requesting remaining missing certificates"
+                    still_missing = missing_waves.len(),
+                    "Re-requesting remaining missing waves"
                 );
                 actions.push(Action::FetchCertificates {
                     block_hash,
                     proposer,
-                    cert_hashes: missing_certs,
+                    cert_hashes: missing_waves,
                 });
             }
 
@@ -4179,7 +4172,7 @@ impl BftState {
         if needs_construct {
             if let Some(pending) = self.pending_blocks.get_mut(&block_hash) {
                 if let Err(e) = pending.construct_block() {
-                    warn!("Failed to construct block after cert fetch: {}", e);
+                    warn!("Failed to construct block after wave fetch: {}", e);
                     return vec![];
                 }
             }
@@ -4188,7 +4181,7 @@ impl BftState {
         info!(
             validator = ?validator_id,
             block_hash = ?block_hash,
-            "Pending block completed after certificate fetch"
+            "Pending block completed after finalized wave fetch"
         );
 
         // Trigger QC verification (for non-genesis) or vote directly (for genesis)
@@ -4206,75 +4199,15 @@ impl BftState {
 
     /// Handle receipts becoming available from execution.
     ///
-    /// Called when `ExecutionBatchCompleted` fires — the execution cache now has
-    /// `DatabaseUpdates` for these transaction hashes. Any pending block that was
-    /// waiting for these receipts may now be complete.
-    ///
-    /// This is the receipt equivalent of `check_pending_blocks_for_transaction`:
-    /// it iterates pending blocks, marks receipts as available, and triggers
-    /// voting when a block becomes complete.
+    /// DEPRECATED: Receipt availability is now tracked via finalized waves.
+    /// This method is kept as a no-op for API compatibility and will be removed
+    /// once all callers are updated.
     pub fn on_receipts_available(
         &mut self,
-        topology: &TopologySnapshot,
-        tx_hashes: &[Hash],
+        _topology: &TopologySnapshot,
+        _tx_hashes: &[Hash],
     ) -> Vec<Action> {
-        let mut actions = Vec::new();
-
-        // Find pending blocks that need any of these receipts.
-        // Build list first to avoid borrow conflicts.
-        let mut block_hashes: Vec<Hash> = self
-            .pending_blocks
-            .iter()
-            .filter(|(_, pending)| tx_hashes.iter().any(|h| pending.needs_receipt(h)))
-            .map(|(hash, _)| *hash)
-            .collect();
-        block_hashes.sort();
-
-        for block_hash in block_hashes {
-            let (is_complete, needs_construct, still_missing) = {
-                let Some(pending) = self.pending_blocks.get_mut(&block_hash) else {
-                    continue;
-                };
-
-                for tx_hash in tx_hashes {
-                    pending.add_receipt(tx_hash);
-                }
-
-                let still_missing = pending.missing_receipt_count();
-                let is_complete = pending.is_complete();
-                let needs_construct = is_complete && pending.block().is_none();
-                (is_complete, needs_construct, still_missing)
-            };
-
-            if !is_complete {
-                debug!(
-                    block_hash = ?block_hash,
-                    still_missing = still_missing,
-                    "Receipts arrived but block still incomplete"
-                );
-                continue;
-            }
-
-            if needs_construct {
-                if let Some(pending) = self.pending_blocks.get_mut(&block_hash) {
-                    if let Err(e) = pending.construct_block() {
-                        warn!("Failed to construct block after receipt arrival: {}", e);
-                        continue;
-                    }
-                }
-            }
-
-            debug!(
-                validator = ?topology.local_validator_id(),
-                block_hash = ?block_hash,
-                "Pending block completed after receipts arrived"
-            );
-
-            actions.extend(self.trigger_qc_verification_or_vote(topology, block_hash));
-            actions.extend(self.try_commit_pending_data(topology, block_hash));
-        }
-
-        actions
+        vec![]
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -4339,38 +4272,41 @@ impl BftState {
         actions
     }
 
-    /// Check if any pending blocks are now complete after a certificate was finalized.
+    /// Check if any pending blocks are now complete after a finalized wave arrived.
     ///
-    /// When a WaveCertificate is finalized locally, it might complete a pending block
-    /// that was waiting for that certificate. This method checks all pending blocks and
+    /// When a FinalizedWave is produced locally, it might complete a pending block
+    /// that was waiting for that wave. This method checks all pending blocks and
     /// triggers voting if any are now complete.
-    pub fn check_pending_blocks_for_certificate(
+    pub fn check_pending_blocks_for_finalized_wave(
         &mut self,
         topology: &TopologySnapshot,
-        cert_hash: Hash,
-        cert: &Arc<WaveCertificate>,
+        wave_id_hash: Hash,
+        fw: &Arc<FinalizedWave>,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
 
-        // Find pending blocks that need this certificate
+        // Find pending blocks that need this finalized wave
         let mut block_hashes: Vec<Hash> = self
             .pending_blocks
             .iter()
-            .filter(|(_, pending)| pending.missing_certificates().contains(&cert_hash))
+            .filter(|(_, pending)| pending.needs_wave(&wave_id_hash))
             .map(|(hash, _)| *hash)
             .collect();
         block_hashes.sort();
 
         for block_hash in block_hashes {
             if let Some(pending) = self.pending_blocks.get_mut(&block_hash) {
-                pending.add_certificate(Arc::clone(cert));
+                pending.add_finalized_wave(Arc::clone(fw));
 
                 // Check if block is now complete
                 if pending.is_complete() {
                     // Construct block if needed
                     if pending.block().is_none() {
                         if let Err(e) = pending.construct_block() {
-                            warn!("Failed to construct block after cert arrival: {}", e);
+                            warn!(
+                                "Failed to construct block after finalized wave arrival: {}",
+                                e
+                            );
                             continue;
                         }
                     }
@@ -4378,13 +4314,13 @@ impl BftState {
                     debug!(
                         validator = ?topology.local_validator_id(),
                         block_hash = ?block_hash,
-                        cert_hash = ?cert_hash,
-                        "Pending block completed after certificate finalized"
+                        wave_id_hash = ?wave_id_hash,
+                        "Pending block completed after finalized wave arrived"
                     );
 
                     // Trigger QC verification (for non-genesis) or vote directly (for genesis)
                     // This is CRITICAL: we must verify QC signatures before voting, even when
-                    // certificates arrive late. Previously this called try_vote_on_block directly,
+                    // waves arrive late. Previously this called try_vote_on_block directly,
                     // which skipped QC verification - a safety bug.
                     actions.extend(self.trigger_qc_verification_or_vote(topology, block_hash));
 
@@ -4557,21 +4493,21 @@ impl BftState {
                 });
             }
 
-            // Check if we should fetch missing certificates
-            let missing_certs = pending.missing_certificates();
-            if !missing_certs.is_empty() && age >= cert_timeout {
+            // Check if we should fetch missing waves
+            let missing_waves = pending.missing_waves();
+            if !missing_waves.is_empty() && age >= cert_timeout {
                 debug!(
                     validator = ?topology.local_validator_id(),
                     block_hash = ?block_hash,
-                    missing_cert_count = missing_certs.len(),
+                    missing_wave_count = missing_waves.len(),
                     age_ms = age.as_millis(),
                     timeout_ms = cert_timeout.as_millis(),
-                    "Fetch timeout reached, requesting missing certificates"
+                    "Fetch timeout reached, requesting missing waves"
                 );
                 actions.push(Action::FetchCertificates {
                     block_hash: *block_hash,
                     proposer,
-                    cert_hashes: missing_certs,
+                    cert_hashes: missing_waves,
                 });
             }
         }
@@ -5296,9 +5232,8 @@ mod tests {
             &topology,
             header,
             BlockManifest::default(),
-            |_| None,  // mempool lookup
-            |_| None,  // certificate lookup
-            |_| false, // receipt lookup
+            |_| None, // mempool lookup
+            |_| None, // lookup_finalized_wave
         );
 
         // Should emit VerifyQcSignature action
@@ -5386,7 +5321,6 @@ mod tests {
             BlockManifest::default(),
             |_| None,
             |_| None,
-            |_| false,
         );
 
         // Now simulate QC signature verified successfully
@@ -5476,7 +5410,6 @@ mod tests {
             BlockManifest::default(),
             |_| None,
             |_| None,
-            |_| false,
         );
 
         // Verify block is pending
@@ -5551,7 +5484,6 @@ mod tests {
             BlockManifest::default(),
             |_| None,
             |_| None,
-            |_| false,
         );
 
         // Should NOT emit VerifyQcSignature (genesis QC)
@@ -7336,7 +7268,6 @@ mod tests {
             BlockManifest::default(),
             |_| None,
             |_| None,
-            |_| false,
         );
 
         // Should emit VerifyQcSignature for the first block
@@ -7373,7 +7304,6 @@ mod tests {
             BlockManifest::default(),
             |_| None,
             |_| None,
-            |_| false,
         );
 
         // Should NOT emit VerifyQcSignature since QC is already verified

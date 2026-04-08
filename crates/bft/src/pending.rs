@@ -1,36 +1,30 @@
 //! Pending block assembly.
 //!
-//! Tracks blocks being assembled from headers + gossiped transactions.
+//! Tracks blocks being assembled from headers + gossiped transactions + finalized waves.
 
 use hyperscale_types::{
-    Block, BlockHeader, BlockManifest, Hash, RoutableTransaction, WaveCertificate,
+    Block, BlockHeader, BlockManifest, FinalizedWave, Hash, RoutableTransaction, WaveCertificate,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-/// Tracks a block being assembled from header + gossiped transactions + certificates.
+/// Tracks a block being assembled from header + gossiped transactions + finalized waves.
 ///
 /// # Lifecycle
 ///
-/// 1. Created from BlockHeader (all transactions/certificates marked as absent by hash)
+/// 1. Created from BlockHeader (all transactions/waves marked as absent by hash)
 /// 2. Full Transaction objects arrive via gossip (stored in received_transactions map)
-/// 3. Certificates are fetched from local CertificateProvider
-/// 4. When all transactions and certificates received, block can be constructed
+/// 3. FinalizedWaves arrive when verifier independently finalizes each wave
+///    (carries certificate + receipts + ECs)
+/// 4. When all transactions and finalized waves received, block can be constructed
 /// 5. Block stored to storage
 /// 6. Block ready for voting
-///
-/// # Transaction Sections
-///
-/// Transactions are organized into three priority sections:
-/// - **Retry**: Retry transactions (highest priority, critical for liveness)
-/// - **Priority**: Cross-shard transactions with commitment proofs
-/// - **Other**: Fresh transactions with no special priority
 #[derive(Debug, Clone)]
 pub struct PendingBlock {
     /// Block header (received first).
     header: BlockHeader,
 
-    /// Block contents manifest (transaction hashes, certificates, deferrals, etc.)
+    /// Block contents manifest (transaction hashes, certificates, etc.)
     manifest: BlockManifest,
 
     /// Map of transaction hash -> Arc<RoutableTransaction> (for received transactions).
@@ -39,21 +33,16 @@ pub struct PendingBlock {
     /// Set of transaction hashes we're still waiting for (HashSet for O(1) lookup).
     missing_transaction_hashes: HashSet<Hash>,
 
-    /// Map of wave_id hash -> Arc<WaveCertificate> (for received certificates).
-    received_certificates: HashMap<Hash, Arc<WaveCertificate>>,
-
-    /// Set of certificate hashes we're still waiting for (HashSet for O(1) lookup).
-    missing_certificate_hashes: HashSet<Hash>,
-
-    /// Set of receipt tx_hashes we're still waiting for (HashSet for O(1) lookup).
+    /// Map of wave_id hash -> Arc<FinalizedWave> (carries cert + receipts + ECs).
     ///
-    /// Populated from `BlockManifest::receipt_hashes` — the tx_hashes of non-aborted
-    /// certificates. A block with certificates is not complete until receipts
-    /// (DatabaseUpdates in the execution cache) are available for all non-aborted certs.
-    /// This prevents voting on blocks where state_root cannot be verified.
-    missing_receipt_hashes: HashSet<Hash>,
+    /// Replaces separate certificate + receipt tracking. A block is complete once
+    /// all its waves have been independently finalized by this validator.
+    received_waves: HashMap<Hash, Arc<FinalizedWave>>,
 
-    /// The fully constructed block (None until all transactions/certs received).
+    /// Set of wave_id hashes we're still waiting for.
+    missing_wave_hashes: HashSet<Hash>,
+
+    /// The fully constructed block (None until all transactions/waves received).
     constructed_block: Option<Arc<Block>>,
 }
 
@@ -63,18 +52,14 @@ impl PendingBlock {
         let total_tx_count = manifest.transaction_count();
         let missing_transaction_hashes: HashSet<Hash> =
             manifest.tx_hashes.iter().copied().collect();
-        let missing_certificate_hashes: HashSet<Hash> =
-            manifest.cert_hashes.iter().copied().collect();
-        let missing_receipt_hashes: HashSet<Hash> =
-            manifest.receipt_hashes.iter().copied().collect();
+        let missing_wave_hashes: HashSet<Hash> = manifest.cert_hashes.iter().copied().collect();
 
         Self {
             header,
             received_transactions: HashMap::with_capacity(total_tx_count),
             missing_transaction_hashes,
-            received_certificates: HashMap::with_capacity(manifest.cert_hashes.len()),
-            missing_certificate_hashes,
-            missing_receipt_hashes,
+            received_waves: HashMap::with_capacity(manifest.cert_hashes.len()),
+            missing_wave_hashes,
             manifest,
             constructed_block: None,
         }
@@ -82,32 +67,27 @@ impl PendingBlock {
 
     /// Create a pending block from a complete block (proposer's own block).
     ///
-    /// Skips the hash-extraction → re-fill round-trip since we already have
-    /// all transactions and certificates. `receipt_tx_hashes` are the tx hashes
-    /// with available receipts, pre-computed by the action handler which has
-    /// storage access to look up each wave cert's source block.
-    pub fn from_complete_block(block: &Block, receipt_tx_hashes: Vec<Hash>) -> Self {
-        let manifest = BlockManifest::from_block_with_receipts(block, receipt_tx_hashes);
+    /// The proposer already has all transactions and finalized waves.
+    pub fn from_complete_block(block: &Block, finalized_waves: Vec<Arc<FinalizedWave>>) -> Self {
+        let manifest = BlockManifest::from_block(block);
         let mut pending = Self {
             header: block.header.clone(),
             received_transactions: HashMap::new(),
             missing_transaction_hashes: HashSet::new(),
-            received_certificates: HashMap::new(),
-            missing_certificate_hashes: HashSet::new(),
-            missing_receipt_hashes: HashSet::new(), // Proposer already has all receipts
+            received_waves: HashMap::new(),
+            missing_wave_hashes: HashSet::new(),
             manifest,
             constructed_block: None,
         };
-        // Fill in all transactions and certificates so construct_block works
+        // Fill in all transactions
         for tx in &block.transactions {
             pending
                 .received_transactions
                 .insert(tx.hash(), Arc::clone(tx));
         }
-        for cert in &block.certificates {
-            pending
-                .received_certificates
-                .insert(cert.wave_id.hash(), Arc::clone(cert));
+        // Fill in all finalized waves
+        for fw in finalized_waves {
+            pending.received_waves.insert(fw.wave_id_hash(), fw);
         }
         pending
     }
@@ -117,7 +97,6 @@ impl PendingBlock {
     /// Returns true if this transaction was needed, false if duplicate or not in this block.
     pub fn add_transaction_arc(&mut self, tx: Arc<RoutableTransaction>) -> bool {
         let hash = tx.hash();
-        // O(1) lookup and removal with HashSet
         if self.missing_transaction_hashes.remove(&hash) {
             self.received_transactions.insert(hash, tx);
             true
@@ -126,35 +105,25 @@ impl PendingBlock {
         }
     }
 
-    /// Add a received certificate.
+    /// Add a finalized wave (carries certificate + receipts + ECs).
     ///
-    /// Returns true if this certificate was needed, false if duplicate or not in this block.
-    pub fn add_certificate(&mut self, cert: Arc<WaveCertificate>) -> bool {
-        let cert_hash = cert.wave_id.hash();
-        // O(1) lookup and removal with HashSet
-        if self.missing_certificate_hashes.remove(&cert_hash) {
-            self.received_certificates.insert(cert_hash, cert);
+    /// Returns true if this wave was needed, false if duplicate or not in this block.
+    pub fn add_finalized_wave(&mut self, fw: Arc<FinalizedWave>) -> bool {
+        let wave_hash = fw.wave_id_hash();
+        if self.missing_wave_hashes.remove(&wave_hash) {
+            self.received_waves.insert(wave_hash, fw);
             true
         } else {
             false
         }
     }
 
-    /// Add a receipt (mark as available by tx_hash).
-    ///
-    /// Returns true if this receipt was needed, false if duplicate or not in this block.
-    pub fn add_receipt(&mut self, tx_hash: &Hash) -> bool {
-        self.missing_receipt_hashes.remove(tx_hash)
-    }
-
-    /// Check if all transactions, certificates, and receipts have been received.
+    /// Check if all transactions and finalized waves have been received.
     pub fn is_complete(&self) -> bool {
-        self.missing_transaction_hashes.is_empty()
-            && self.missing_certificate_hashes.is_empty()
-            && self.missing_receipt_hashes.is_empty()
+        self.missing_transaction_hashes.is_empty() && self.missing_wave_hashes.is_empty()
     }
 
-    /// Check if all transactions have been received (certificates may still be pending).
+    /// Check if all transactions have been received (waves may still be pending).
     #[cfg(test)]
     pub fn has_all_transactions(&self) -> bool {
         self.missing_transaction_hashes.is_empty()
@@ -175,46 +144,30 @@ impl PendingBlock {
         self.missing_transaction_hashes.contains(tx_hash)
     }
 
-    /// Get the number of missing certificate hashes.
-    pub fn missing_certificate_count(&self) -> usize {
-        self.missing_certificate_hashes.len()
+    /// Get the number of missing wave hashes.
+    pub fn missing_wave_count(&self) -> usize {
+        self.missing_wave_hashes.len()
     }
 
-    /// Get the missing certificate hashes as a Vec (for iteration/display).
-    pub fn missing_certificates(&self) -> Vec<Hash> {
-        self.missing_certificate_hashes.iter().copied().collect()
+    /// Get the missing wave hashes as a Vec (for display).
+    pub fn missing_waves(&self) -> Vec<Hash> {
+        self.missing_wave_hashes.iter().copied().collect()
     }
 
-    /// Get the number of missing receipt hashes.
-    pub fn missing_receipt_count(&self) -> usize {
-        self.missing_receipt_hashes.len()
+    /// Check if this pending block needs a specific finalized wave.
+    pub fn needs_wave(&self, wave_id_hash: &Hash) -> bool {
+        self.missing_wave_hashes.contains(wave_id_hash)
     }
 
-    /// Get the missing receipt hashes as a Vec (for fetch requests).
-    #[allow(dead_code)] // API parity with missing_transactions(); used when receipt fetch is added
-    pub fn missing_receipts(&self) -> Vec<Hash> {
-        self.missing_receipt_hashes.iter().copied().collect()
-    }
-
-    /// Check if this pending block needs a specific receipt.
-    pub fn needs_receipt(&self, tx_hash: &Hash) -> bool {
-        self.missing_receipt_hashes.contains(tx_hash)
-    }
-
-    /// Construct the block from header + received transactions + received certificates.
+    /// Construct the block from header + received transactions + received waves.
     ///
     /// Should only be called when is_complete() returns true.
-    ///
-    /// # Errors
-    ///
-    /// Returns error if block is not yet complete.
     pub fn construct_block(&mut self) -> Result<Arc<Block>, String> {
         if !self.is_complete() {
             return Err(format!(
-                "Cannot construct block: {} transactions, {} certificates, {} receipts still missing",
+                "Cannot construct block: {} transactions, {} waves still missing",
                 self.missing_transaction_hashes.len(),
-                self.missing_certificate_hashes.len(),
-                self.missing_receipt_hashes.len()
+                self.missing_wave_hashes.len()
             ));
         }
 
@@ -230,12 +183,16 @@ impl PendingBlock {
             .filter_map(|hash| self.received_transactions.remove(hash))
             .collect();
 
-        // Build certificates in the original order from the gossip message.
+        // Build certificates from finalized waves in the original order.
         let certificates: Vec<Arc<WaveCertificate>> = self
             .manifest
             .cert_hashes
             .iter()
-            .filter_map(|hash| self.received_certificates.remove(hash))
+            .filter_map(|hash| {
+                self.received_waves
+                    .get(hash)
+                    .map(|fw| Arc::clone(&fw.certificate))
+            })
             .collect();
 
         let abort_intents = self.manifest.abort_intents.clone();
@@ -330,210 +287,136 @@ mod tests {
     }
 
     #[test]
-    fn test_pending_block_with_certificates() {
+    fn test_pending_block_with_waves() {
         let tx1 = Hash::from_bytes(b"tx1");
-        let cert1 = Hash::from_bytes(b"cert1");
-        let cert2 = Hash::from_bytes(b"cert2");
+        let wave1 = Hash::from_bytes(b"wave1");
+        let wave2 = Hash::from_bytes(b"wave2");
         let header = make_header(1);
 
         let pb = PendingBlock::from_manifest(
             header,
             BlockManifest {
                 tx_hashes: vec![tx1],
-                cert_hashes: vec![cert1, cert2],
+                cert_hashes: vec![wave1, wave2],
                 ..Default::default()
             },
         );
 
         assert_eq!(pb.missing_transaction_count(), 1);
-        assert_eq!(pb.missing_certificate_count(), 2);
+        assert_eq!(pb.missing_wave_count(), 2);
+        assert!(pb.needs_wave(&wave1));
+        assert!(pb.needs_wave(&wave2));
         assert!(!pb.is_complete());
     }
 
     #[test]
-    fn test_add_certificate() {
+    fn test_add_finalized_wave() {
         use hyperscale_types::{WaveCertificate, WaveId, WaveResolution};
 
         let wave_id = WaveId::new(ShardGroupId(0), 1, Default::default());
-        let cert_hash = wave_id.hash();
+        let wave_hash = wave_id.hash();
         let header = make_header(1);
 
         let mut pb = PendingBlock::from_manifest(
             header,
             BlockManifest {
-                cert_hashes: vec![cert_hash],
+                cert_hashes: vec![wave_hash],
                 ..Default::default()
             },
         );
 
-        assert_eq!(pb.missing_certificate_count(), 1);
+        assert_eq!(pb.missing_wave_count(), 1);
         assert!(!pb.is_complete());
 
-        // Create a test wave certificate
-        let cert = WaveCertificate {
-            wave_id,
-            resolution: WaveResolution::Aborted,
-        };
+        let fw = Arc::new(FinalizedWave {
+            certificate: Arc::new(WaveCertificate {
+                wave_id,
+                resolution: WaveResolution::Aborted,
+            }),
+            tx_hashes: vec![],
+            execution_certificates: vec![],
+            tx_decisions: vec![],
+            receipts: vec![],
+            finalized_height: 1,
+        });
 
-        // Add the certificate
-        let added = pb.add_certificate(Arc::new(cert));
+        let added = pb.add_finalized_wave(fw);
         assert!(added);
-
-        assert_eq!(pb.missing_certificate_count(), 0);
+        assert_eq!(pb.missing_wave_count(), 0);
         assert!(pb.is_complete());
     }
 
     #[test]
-    fn test_block_needs_both_transactions_and_certificates() {
+    fn test_block_needs_transactions_and_waves() {
         use hyperscale_types::{
             test_utils::test_transaction, WaveCertificate, WaveId, WaveResolution,
         };
 
-        // Create a test transaction
         let tx = Arc::new(test_transaction(1));
         let tx_hash = tx.hash();
-
         let wave_id = WaveId::new(ShardGroupId(0), 1, Default::default());
-        let cert_hash = wave_id.hash();
+        let wave_hash = wave_id.hash();
         let header = make_header(1);
 
         let mut pb = PendingBlock::from_manifest(
             header,
             BlockManifest {
                 tx_hashes: vec![tx_hash],
-                cert_hashes: vec![cert_hash],
+                cert_hashes: vec![wave_hash],
                 ..Default::default()
             },
         );
 
-        assert!(!pb.has_all_transactions());
         assert!(!pb.is_complete());
 
         // Add transaction
         pb.add_transaction_arc(tx);
-
         assert!(pb.has_all_transactions());
-        assert!(!pb.is_complete()); // Still missing certificate
+        assert!(!pb.is_complete()); // Still missing wave
 
-        // Add certificate
-        let cert = WaveCertificate {
-            wave_id,
-            resolution: WaveResolution::Aborted,
-        };
-        pb.add_certificate(Arc::new(cert));
-
+        // Add finalized wave
+        let fw = Arc::new(FinalizedWave {
+            certificate: Arc::new(WaveCertificate {
+                wave_id,
+                resolution: WaveResolution::Aborted,
+            }),
+            tx_hashes: vec![],
+            execution_certificates: vec![],
+            tx_decisions: vec![],
+            receipts: vec![],
+            finalized_height: 1,
+        });
+        pb.add_finalized_wave(fw);
         assert!(pb.is_complete());
     }
 
     #[test]
-    fn test_pending_block_with_receipts() {
-        let receipt1 = Hash::from_bytes(b"receipt1");
-        let receipt2 = Hash::from_bytes(b"receipt2");
-        let header = make_header(1);
-
-        let pb = PendingBlock::from_manifest(
-            header,
-            BlockManifest {
-                receipt_hashes: vec![receipt1, receipt2],
-                ..Default::default()
-            },
-        );
-
-        assert_eq!(pb.missing_receipt_count(), 2);
-        assert!(pb.needs_receipt(&receipt1));
-        assert!(pb.needs_receipt(&receipt2));
-        assert!(!pb.is_complete());
-    }
-
-    #[test]
-    fn test_add_receipt() {
-        let receipt_hash = Hash::from_bytes(b"receipt1");
-        let header = make_header(1);
-
-        let mut pb = PendingBlock::from_manifest(
-            header,
-            BlockManifest {
-                receipt_hashes: vec![receipt_hash],
-                ..Default::default()
-            },
-        );
-
-        assert_eq!(pb.missing_receipt_count(), 1);
-        assert!(!pb.is_complete());
-
-        let added = pb.add_receipt(&receipt_hash);
-        assert!(added);
-
-        assert_eq!(pb.missing_receipt_count(), 0);
-        assert!(pb.is_complete());
-
-        // Duplicate add returns false
-        let added_again = pb.add_receipt(&receipt_hash);
-        assert!(!added_again);
-    }
-
-    #[test]
-    fn test_block_needs_transactions_certificates_and_receipts() {
-        use hyperscale_types::{
-            test_utils::test_transaction, WaveCertificate, WaveId, WaveResolution,
-        };
-
-        let tx = Arc::new(test_transaction(1));
-        let tx_hash = tx.hash();
-        let wave_id = WaveId::new(ShardGroupId(0), 1, Default::default());
-        let cert_hash = wave_id.hash();
-        let receipt_hash = Hash::from_bytes(b"receipt1");
-        let header = make_header(1);
-
-        let mut pb = PendingBlock::from_manifest(
-            header,
-            BlockManifest {
-                tx_hashes: vec![tx_hash],
-                cert_hashes: vec![cert_hash],
-                receipt_hashes: vec![receipt_hash],
-                ..Default::default()
-            },
-        );
-
-        assert!(!pb.is_complete());
-
-        // Add transaction
-        pb.add_transaction_arc(tx);
-        assert!(!pb.is_complete()); // Still missing certificate + receipt
-
-        // Add certificate
-        let cert = WaveCertificate {
-            wave_id,
-            resolution: WaveResolution::Aborted,
-        };
-        pb.add_certificate(Arc::new(cert));
-        assert!(!pb.is_complete()); // Still missing receipt
-
-        // Add receipt
-        pb.add_receipt(&receipt_hash);
-        assert!(pb.is_complete());
-    }
-
-    #[test]
-    fn test_from_complete_block_has_no_missing_receipts() {
+    fn test_from_complete_block_is_complete() {
         use hyperscale_types::{Block, WaveCertificate, WaveId, WaveResolution};
 
+        let wave_id = WaveId::new(ShardGroupId(0), 1, Default::default());
         let cert = Arc::new(WaveCertificate {
-            wave_id: WaveId::new(ShardGroupId(0), 1, Default::default()),
+            wave_id: wave_id.clone(),
             resolution: WaveResolution::Aborted,
         });
 
         let block = Block {
             header: make_header(1),
             transactions: vec![],
-            certificates: vec![cert],
+            certificates: vec![cert.clone()],
             abort_intents: vec![],
         };
 
-        let pending = PendingBlock::from_complete_block(&block, vec![]);
+        let fw = Arc::new(FinalizedWave {
+            certificate: cert,
+            tx_hashes: vec![],
+            execution_certificates: vec![],
+            tx_decisions: vec![],
+            receipts: vec![],
+            finalized_height: 1,
+        });
 
-        // Proposer's own block: no missing receipts
-        assert_eq!(pending.missing_receipt_count(), 0);
+        let pending = PendingBlock::from_complete_block(&block, vec![fw]);
         assert!(pending.is_complete());
     }
 }
