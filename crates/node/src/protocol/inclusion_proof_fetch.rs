@@ -277,7 +277,7 @@ impl InclusionProofFetchProtocol {
                 state.retries_on_current = 0;
             }
 
-            warn!(
+            debug!(
                 winner_tx = %winner_tx_hash,
                 tried = state.tried.len(),
                 retries_on_current = state.retries_on_current,
