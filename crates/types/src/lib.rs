@@ -24,6 +24,7 @@ mod signing;
 // Consensus types
 mod block;
 mod epoch;
+mod finalized_wave;
 mod quorum_certificate;
 mod receipt;
 mod signer_bitfield;
@@ -80,14 +81,14 @@ pub use block::{
     Block, BlockHeader, BlockManifest, BlockMetadata, CommittedBlockHeader,
 };
 pub use execution_vote::{
-    compute_receipt_root_with_proof, compute_waves, derive_wave_tx_hashes, tx_outcome_leaf,
+    compute_global_receipt_root_with_proof, compute_waves, derive_wave_tx_hashes, tx_outcome_leaf,
     wave_leader, ExecutionCertificate, ExecutionVote, TxExecutionOutcome, TxOutcome, WaveId,
 };
+pub use finalized_wave::{FinalizedWave, TxDecision};
 pub use quorum_certificate::QuorumCertificate;
 pub use receipt::{
-    ApplicationEvent, ConsensusReceipt, ExecutionResult, FeeSummary, LedgerReceiptEntry,
-    LedgerTransactionOutcome, LedgerTransactionReceipt, LocalTransactionExecution, LogLevel,
-    ReceiptBundle,
+    ApplicationEvent, ExecutionOutput, ExecutionResult, FeeSummary, GlobalReceipt, LocalReceipt,
+    LocalReceiptEntry, LogLevel, ReceiptBundle, TransactionOutcome,
 };
 pub use signer_bitfield::SignerBitfield;
 pub use state::{ShardExecutionProof, StateEntry, StateProvision};
@@ -101,8 +102,8 @@ pub use validator::{ValidatorInfo, ValidatorSet};
 pub use wave_certificate::{
     decode_wave_cert_vec, encode_wave_cert_vec, ShardAttestation, WaveCertificate, WaveResolution,
 };
-// Re-export as compute_receipt_root would conflict with block::compute_receipt_root
-pub use execution_vote::compute_receipt_root as compute_execution_receipt_root;
+// Re-export with legacy alias for cross-crate use
+pub use execution_vote::compute_global_receipt_root as compute_execution_receipt_root;
 
 // Re-export DatabaseUpdates from radix for cross-crate use (execution cache, block commit)
 pub use radix_substate_store_interface::interface::DatabaseUpdates;

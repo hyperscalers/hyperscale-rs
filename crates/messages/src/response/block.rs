@@ -1,7 +1,7 @@
 //! Block fetch response.
 
 use hyperscale_types::{
-    Block, ExecutionCertificate, LedgerReceiptEntry, MessagePriority, NetworkMessage,
+    Block, ExecutionCertificate, LocalReceiptEntry, MessagePriority, NetworkMessage,
     QuorumCertificate,
 };
 use sbor::prelude::BasicSbor;
@@ -13,8 +13,8 @@ pub struct GetBlockResponse {
     pub block: Option<Block>,
     /// The QC that certifies this block (None if block not found or at tip).
     pub qc: Option<QuorumCertificate>,
-    /// Ledger receipts for the block's certificates. Empty if block not found.
-    pub ledger_receipts: Vec<LedgerReceiptEntry>,
+    /// Local receipts for the block's certificates. Empty if block not found.
+    pub local_receipts: Vec<LocalReceiptEntry>,
     /// Execution certificates produced by the serving shard for this block.
     /// Remote shard ECs are available from those remote shards.
     pub execution_certificates: Vec<ExecutionCertificate>,
@@ -25,13 +25,13 @@ impl GetBlockResponse {
     pub fn found(
         block: Block,
         qc: QuorumCertificate,
-        ledger_receipts: Vec<LedgerReceiptEntry>,
+        local_receipts: Vec<LocalReceiptEntry>,
         execution_certificates: Vec<ExecutionCertificate>,
     ) -> Self {
         Self {
             block: Some(block),
             qc: Some(qc),
-            ledger_receipts,
+            local_receipts,
             execution_certificates,
         }
     }
@@ -41,7 +41,7 @@ impl GetBlockResponse {
         Self {
             block: None,
             qc: None,
-            ledger_receipts: vec![],
+            local_receipts: vec![],
             execution_certificates: vec![],
         }
     }
@@ -67,13 +67,13 @@ impl GetBlockResponse {
     ) -> (
         Option<Block>,
         Option<QuorumCertificate>,
-        Vec<LedgerReceiptEntry>,
+        Vec<LocalReceiptEntry>,
         Vec<ExecutionCertificate>,
     ) {
         (
             self.block,
             self.qc,
-            self.ledger_receipts,
+            self.local_receipts,
             self.execution_certificates,
         )
     }
@@ -114,6 +114,7 @@ mod tests {
                 state_root: Hash::ZERO,
                 transaction_root: Hash::ZERO,
                 certificate_root: Hash::ZERO,
+                local_receipt_root: Hash::ZERO,
                 waves: vec![],
             },
             transactions: vec![std::sync::Arc::new(tx)],
@@ -144,7 +145,7 @@ mod tests {
         assert!(response.has_block());
         assert_eq!(response.block(), Some(&block));
         assert_eq!(response.qc(), Some(&qc));
-        assert!(response.ledger_receipts.is_empty());
+        assert!(response.local_receipts.is_empty());
     }
 
     #[test]
@@ -154,7 +155,7 @@ mod tests {
         assert!(!response.has_block());
         assert_eq!(response.block(), None);
         assert_eq!(response.qc(), None);
-        assert!(response.ledger_receipts.is_empty());
+        assert!(response.local_receipts.is_empty());
     }
 
     #[test]

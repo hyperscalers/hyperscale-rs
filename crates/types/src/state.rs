@@ -105,7 +105,7 @@ pub enum ShardExecutionProof {
     /// `success=true` means writes were applied; `success=false` means the
     /// transaction's logic failed (rejection) but execution completed.
     Executed {
-        /// Hash of the ConsensusReceipt (outcome + event_root).
+        /// Hash of the GlobalReceipt (outcome + event_root).
         receipt_hash: Hash,
         /// Whether execution succeeded.
         success: bool,

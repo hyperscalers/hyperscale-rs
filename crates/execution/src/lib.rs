@@ -15,8 +15,9 @@ mod state;
 mod trackers;
 
 pub use accumulator::ExecutionAccumulator;
+pub use hyperscale_types::{FinalizedWave, TxDecision};
 pub use state::{
     BlockCommittedOutput, CompletionData, CrossShardRegistration, ExecutionMemoryStats,
-    ExecutionState, FinalizedWave,
+    ExecutionState,
 };
 pub use trackers::{VoteTracker, WaveCertificateTracker};

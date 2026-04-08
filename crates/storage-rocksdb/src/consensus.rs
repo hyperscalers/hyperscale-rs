@@ -86,18 +86,12 @@ impl hyperscale_storage::ConsensusStore for RocksDbStorage {
         RocksDbStorage::store_receipt_bundles(self, bundles)
     }
 
-    fn get_ledger_receipt(
-        &self,
-        tx_hash: &Hash,
-    ) -> Option<Arc<hyperscale_types::LedgerTransactionReceipt>> {
-        RocksDbStorage::get_ledger_receipt(self, tx_hash)
+    fn get_local_receipt(&self, tx_hash: &Hash) -> Option<Arc<hyperscale_types::LocalReceipt>> {
+        RocksDbStorage::get_local_receipt(self, tx_hash)
     }
 
-    fn get_local_execution(
-        &self,
-        tx_hash: &Hash,
-    ) -> Option<hyperscale_types::LocalTransactionExecution> {
-        RocksDbStorage::get_local_execution(self, tx_hash)
+    fn get_execution_output(&self, tx_hash: &Hash) -> Option<hyperscale_types::ExecutionOutput> {
+        RocksDbStorage::get_execution_output(self, tx_hash)
     }
 
     fn get_execution_certificate(&self, canonical_hash: &Hash) -> Option<ExecutionCertificate> {

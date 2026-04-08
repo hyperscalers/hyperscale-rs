@@ -248,18 +248,12 @@ impl hyperscale_storage::ConsensusStore for SharedStorage {
         self.0.store_receipt_bundles(bundles)
     }
 
-    fn get_ledger_receipt(
-        &self,
-        tx_hash: &Hash,
-    ) -> Option<Arc<hyperscale_types::LedgerTransactionReceipt>> {
-        self.0.get_ledger_receipt(tx_hash)
+    fn get_local_receipt(&self, tx_hash: &Hash) -> Option<Arc<hyperscale_types::LocalReceipt>> {
+        self.0.get_local_receipt(tx_hash)
     }
 
-    fn get_local_execution(
-        &self,
-        tx_hash: &Hash,
-    ) -> Option<hyperscale_types::LocalTransactionExecution> {
-        self.0.get_local_execution(tx_hash)
+    fn get_execution_output(&self, tx_hash: &Hash) -> Option<hyperscale_types::ExecutionOutput> {
+        self.0.get_execution_output(tx_hash)
     }
 
     fn get_execution_certificate(

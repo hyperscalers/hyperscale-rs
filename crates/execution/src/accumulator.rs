@@ -111,7 +111,7 @@ impl ExecutionAccumulator {
     ///
     /// Abort intents are committed in blocks (deterministic), so they take
     /// precedence over async execution results. This ensures all validators
-    /// converge to the same receipt_root regardless of execution timing.
+    /// converge to the same global_receipt_root regardless of execution timing.
     ///
     /// Returns `true` if the wave is now complete (all txs have results).
     pub fn record_abort(&mut self, tx_hash: Hash, outcome: TxExecutionOutcome) -> bool {
@@ -146,7 +146,7 @@ impl ExecutionAccumulator {
 
     /// Build the receipt data once all transactions are complete.
     ///
-    /// Returns `(receipt_root, tx_outcomes)` where outcomes are in
+    /// Returns `(global_receipt_root, tx_outcomes)` where outcomes are in
     /// wave order (block order within the wave).
     ///
     /// Returns `None` if not all transactions have completed.

@@ -33,9 +33,9 @@
 use hyperscale_core::{Action, CrossShardExecutionRequest, ProtocolEvent, ProvisionRequest};
 use hyperscale_types::{
     AbortReason, BlockHeight, Bls12381G1PublicKey, ExecutionCertificate, ExecutionResult,
-    ExecutionVote, Hash, LedgerTransactionReceipt, ReceiptBundle, RoutableTransaction,
-    ShardGroupId, StateProvision, TopologySnapshot, TransactionDecision, TxExecutionOutcome,
-    TxOutcome, ValidatorId, WaveCertificate, WaveId,
+    ExecutionVote, Hash, LocalReceipt, ReceiptBundle, RoutableTransaction, ShardGroupId,
+    StateProvision, TopologySnapshot, TransactionDecision, TxExecutionOutcome, TxOutcome,
+    ValidatorId, WaveCertificate, WaveId,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -43,7 +43,7 @@ use std::time::Duration;
 use tracing::instrument;
 
 use crate::accumulator::ExecutionAccumulator;
-use crate::trackers::{TxDecision, VoteTracker, WaveCertificateTracker};
+use crate::trackers::{VoteTracker, WaveCertificateTracker};
 
 /// Data returned when a wave completes (all txs executed).
 ///
@@ -57,8 +57,8 @@ pub struct CompletionData {
     pub block_height: u64,
     /// Wave identifier.
     pub wave_id: WaveId,
-    /// Merkle root over per-tx outcome leaves.
-    pub receipt_root: Hash,
+    /// Merkle root over per-tx outcome leaves (cross-shard agreement).
+    pub global_receipt_root: Hash,
     /// Per-tx outcomes in wave order.
     pub tx_outcomes: Vec<hyperscale_types::TxOutcome>,
 }
@@ -88,18 +88,8 @@ pub struct BlockCommittedOutput {
     pub cross_shard_registrations: Vec<CrossShardRegistration>,
 }
 
-/// A finalized wave — all participating shards have reported, WaveCertificate created.
-///
-/// Held in-memory until the wave cert is committed in a block. Not eagerly persisted
-/// (design decision D9 — wave certs are not eagerly persisted).
-#[derive(Debug, Clone)]
-pub struct FinalizedWave {
-    pub certificate: Arc<WaveCertificate>,
-    pub tx_hashes: Vec<Hash>,
-    pub execution_certificates: Vec<Arc<ExecutionCertificate>>,
-    pub tx_decisions: Vec<TxDecision>,
-    pub finalized_height: u64,
-}
+// FinalizedWave is defined in hyperscale_types (TxDecision comes via crate::trackers).
+use hyperscale_types::FinalizedWave;
 
 /// Execution memory statistics for monitoring collection sizes.
 #[derive(Clone, Copy, Debug, Default)]
@@ -121,11 +111,16 @@ pub struct ExecutionState {
     /// Current time.
     now: Duration,
 
-    /// Tracks transaction hashes whose receipts have been emitted via
-    /// `StoreReceiptBundles`. Used as a gate for deferred TC creation —
-    /// TC formation requires that the receipt exists so state root verification
-    /// can later derive DatabaseUpdates from it.
+    /// Tracks transaction hashes whose receipts have been produced by execution.
+    /// NOT cleared until `remove_finalized_wave` (after block commit).
+    /// Used by BFT `lookup_receipt` to determine receipt availability for
+    /// pending block voting — independent of wave cert finalization status.
     receipts_emitted: HashSet<Hash>,
+
+    /// In-memory receipt cache — holds ReceiptBundles from execution until
+    /// they are consumed by `finalize_wave` (moved into `FinalizedWave.receipts`)
+    /// or cleaned up on abort/deferral.
+    receipt_cache: HashMap<Hash, ReceiptBundle>,
 
     /// Finalized wave certificates ready for block inclusion.
     /// Uses BTreeMap for deterministic iteration order (keyed by WaveId).
@@ -197,9 +192,6 @@ pub struct ExecutionState {
     pending_wave_receipts: HashMap<WaveId, HashSet<Hash>>,
 
     // ═══════════════════════════════════════════════════════════════════════
-    // Execution Certificate Cache (for fallback serving)
-    // ═══════════════════════════════════════════════════════════════════════
-    // ═══════════════════════════════════════════════════════════════════════
     // Expected Execution Certificate Tracking (Fallback Detection)
     // ═══════════════════════════════════════════════════════════════════════
     /// Expected execution certificates from remote shards.
@@ -251,6 +243,7 @@ impl ExecutionState {
         Self {
             now: Duration::ZERO,
             receipts_emitted: HashSet::new(),
+            receipt_cache: HashMap::new(),
             finalized_wave_certificates: BTreeMap::new(),
             committed_height: 0,
             pending_provisioning: HashMap::new(),
@@ -282,11 +275,16 @@ impl ExecutionState {
     // Certificate Updates (from finalized_certificates)
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /// Collect per-certificate database updates for proposal building.
+    /// Check if a receipt exists for a transaction (in receipt_cache or finalized waves).
     ///
+    /// Used by BFT pending block receipt tracking (lookup_receipt).
+    /// This is the correct check for receipt availability — independent of
+    /// wave cert finalization status (P1 fix).
+    pub fn has_receipt(&self, tx_hash: &Hash) -> bool {
+        self.receipts_emitted.contains(tx_hash)
+    }
+
     /// Check if a finalized certificate exists for a transaction.
-    ///
-    /// Used by BFT pending block receipt tracking.
     pub fn has_finalized_certificate(&self, tx_hash: &Hash) -> bool {
         self.finalized_wave_certificates
             .values()
@@ -486,7 +484,7 @@ impl ExecutionState {
     ///
     /// Abort intents are consensus-committed (deterministic) and ALWAYS override
     /// async execution results. This ensures all validators converge to the same
-    /// receipt_root regardless of execution timing.
+    /// global_receipt_root regardless of execution timing.
     ///
     /// Updates the accumulator silently. Votes are NOT emitted here — they are
     /// emitted during the block commit wave scan (`scan_complete_waves`).
@@ -539,7 +537,7 @@ impl ExecutionState {
                 continue;
             }
 
-            let Some((receipt_root, tx_outcomes)) = accumulator.build_data() else {
+            let Some((global_receipt_root, tx_outcomes)) = accumulator.build_data() else {
                 continue;
             };
 
@@ -547,7 +545,7 @@ impl ExecutionState {
                 block_hash: accumulator.block_hash(),
                 block_height: accumulator.block_height(),
                 wave_id: accumulator.wave_id().clone(),
-                receipt_root,
+                global_receipt_root,
                 tx_outcomes,
             });
         }
@@ -566,30 +564,37 @@ impl ExecutionState {
         results: Vec<ExecutionResult>,
         tx_outcomes: Vec<TxOutcome>,
     ) -> Vec<Action> {
-        let mut bundles: Vec<ReceiptBundle> = Vec::with_capacity(results.len());
+        let mut newly_emitted: HashSet<Hash> = HashSet::with_capacity(results.len());
 
         for result in results {
             let tx_hash = result.tx_hash;
-            bundles.push(ReceiptBundle {
+            let bundle = ReceiptBundle {
                 tx_hash,
-                ledger_receipt: Arc::new(result.ledger_receipt),
-                local_execution: Some(result.local_execution),
-            });
+                local_receipt: Arc::new(result.local_receipt),
+                execution_output: Some(result.execution_output),
+            };
+            self.receipt_cache.insert(tx_hash, bundle);
             self.receipts_emitted.insert(tx_hash);
+            newly_emitted.insert(tx_hash);
         }
 
-        // Collect newly emitted tx hashes before bundles are moved.
-        let newly_emitted: HashSet<Hash> = bundles.iter().map(|b| b.tx_hash).collect();
-
-        // Dispatch receipt storage (fire-and-forget, off main thread)
+        // Also write receipts to storage eagerly for read access by
+        // VerifyStateRoot and BuildProposal action handlers (which run on
+        // the io_loop thread and read from storage). Receipts are ALSO held
+        // in receipt_cache → FinalizedWave.receipts for atomic commit.
         let mut actions: Vec<Action> = Vec::new();
-        if !bundles.is_empty() {
-            tracing::debug!(bundle_count = bundles.len(), "Emitting StoreReceiptBundles");
-            actions.push(Action::StoreReceiptBundles { bundles });
+        if !newly_emitted.is_empty() {
+            let bundles: Vec<ReceiptBundle> = newly_emitted
+                .iter()
+                .filter_map(|h| self.receipt_cache.get(h).cloned())
+                .collect();
+            if !bundles.is_empty() {
+                actions.push(Action::StoreReceiptBundles { bundles });
+            }
         } else {
             tracing::warn!(
                 results_count = 0,
-                "ExecutionBatchCompleted produced ZERO receipt bundles"
+                "ExecutionBatchCompleted produced ZERO receipts"
             );
         }
 
@@ -626,44 +631,39 @@ impl ExecutionState {
         actions
     }
 
-    /// Overwrite stored receipts for transactions the EC declares as aborted.
+    /// Overwrite cached receipts for transactions the EC declares as aborted.
     ///
     /// The EC is the canonical source of truth for abort decisions. Canonical
-    /// execution may have already stored a success receipt before
+    /// execution may have already cached a success receipt before
     /// the abort was decided at the aggregated vote_height. This replaces those
-    /// stale receipts with `LedgerTransactionReceipt::failure()` so that any
+    /// stale receipts with `LocalReceipt::failure()` so that any
     /// downstream consumer (sync, RPC, state root) sees a consistent abort.
     ///
     /// Only processes the LOCAL shard's EC — remote shard ECs don't produce
     /// local receipts.
-    fn overwrite_aborted_receipts(
-        &self,
-        certificate: &hyperscale_types::ExecutionCertificate,
-    ) -> Vec<Action> {
-        let abort_bundles: Vec<ReceiptBundle> = certificate
-            .tx_outcomes
-            .iter()
-            .filter(|o| o.is_aborted())
-            .map(|o| ReceiptBundle {
-                tx_hash: o.tx_hash,
-                ledger_receipt: Arc::new(LedgerTransactionReceipt::failure()),
-                local_execution: None,
-            })
-            .collect();
-
-        if abort_bundles.is_empty() {
-            return vec![];
+    fn overwrite_aborted_receipts(&mut self, certificate: &hyperscale_types::ExecutionCertificate) {
+        let mut count = 0;
+        for outcome in &certificate.tx_outcomes {
+            if outcome.is_aborted() {
+                self.receipt_cache.insert(
+                    outcome.tx_hash,
+                    ReceiptBundle {
+                        tx_hash: outcome.tx_hash,
+                        local_receipt: Arc::new(LocalReceipt::failure()),
+                        execution_output: None,
+                    },
+                );
+                count += 1;
+            }
         }
 
-        tracing::debug!(
-            wave = %certificate.wave_id,
-            abort_count = abort_bundles.len(),
-            "Overwriting receipts for EC-aborted transactions"
-        );
-
-        vec![Action::StoreReceiptBundles {
-            bundles: abort_bundles,
-        }]
+        if count > 0 {
+            tracing::debug!(
+                wave = %certificate.wave_id,
+                abort_count = count,
+                "Overwrote cached receipts for EC-aborted transactions"
+            );
+        }
     }
 
     /// Scan complete waves and emit `SignAndSendExecutionVote` actions.
@@ -682,7 +682,7 @@ impl ExecutionState {
                     block_height: completion.block_height,
                     vote_height,
                     wave_id: completion.wave_id,
-                    receipt_root: completion.receipt_root,
+                    global_receipt_root: completion.global_receipt_root,
                     tx_outcomes: completion.tx_outcomes,
                     target,
                 }
@@ -857,19 +857,19 @@ impl ExecutionState {
         }
 
         // Warn if we have enough total power for quorum but it's split
-        // across multiple receipt roots — this means validators disagree
+        // across multiple global receipt roots — this means validators disagree
         // on execution results.
         if tracker.check_quorum().is_none()
             && tracker.total_verified_power() >= topology.local_quorum_threshold()
-            && tracker.distinct_receipt_root_count() > 1
+            && tracker.distinct_global_receipt_root_count() > 1
         {
-            let summary = tracker.receipt_root_power_summary();
+            let summary = tracker.global_receipt_root_power_summary();
             tracing::warn!(
                 block_hash = ?block_hash,
                 wave = %wave_id,
-                receipt_root_split = ?summary,
+                global_receipt_root_split = ?summary,
                 quorum = topology.local_quorum_threshold(),
-                "Execution vote quorum blocked: receipt roots are split across validators"
+                "Execution vote quorum blocked: global receipt roots are split across validators"
             );
         }
 
@@ -884,7 +884,7 @@ impl ExecutionState {
             return vec![];
         };
 
-        let Some((receipt_root, vote_height, _total_power)) = tracker.check_quorum() else {
+        let Some((global_receipt_root, vote_height, _total_power)) = tracker.check_quorum() else {
             return vec![];
         };
 
@@ -897,7 +897,7 @@ impl ExecutionState {
             "Execution vote quorum reached — aggregating certificate"
         );
 
-        let votes = tracker.take_votes(&receipt_root, vote_height);
+        let votes = tracker.take_votes(&global_receipt_root, vote_height);
         let committee = topology.local_committee().to_vec();
 
         // Remove the vote tracker — this EC is the shard's final answer.
@@ -917,7 +917,7 @@ impl ExecutionState {
         vec![Action::AggregateExecutionCertificate {
             wave_id,
             shard: topology.local_shard(),
-            receipt_root,
+            global_receipt_root,
             votes,
             committee,
         }]
@@ -995,7 +995,7 @@ impl ExecutionState {
         // The EC is canonical — if it says a tx is aborted, the stored receipt
         // must reflect that. Canonical execution may have stored
         // a success receipt before the abort was decided. Overwrite now.
-        actions.extend(self.overwrite_aborted_receipts(&certificate));
+        self.overwrite_aborted_receipts(&certificate);
 
         // Feed the EC to the wave-level certificate tracker for finalization.
         actions.extend(self.handle_wave_attestation(topology, certificate));
@@ -1104,7 +1104,7 @@ impl ExecutionState {
 
             // The EC is canonical — overwrite any stale success receipts for
             // transactions the EC declares as aborted.
-            actions.extend(self.overwrite_aborted_receipts(&cert_arc));
+            self.overwrite_aborted_receipts(&cert_arc);
         }
 
         // Feed EC to wave-level certificate tracker via tx-hash routing,
@@ -1275,9 +1275,9 @@ impl ExecutionState {
                     })
                     .collect();
 
-                // Remove receipts_emitted for these txs
+                // Clean up receipt_cache for aborted txs (receipts not needed).
                 for h in &tx_hashes {
-                    self.receipts_emitted.remove(h);
+                    self.receipt_cache.remove(h);
                 }
 
                 let finalized = FinalizedWave {
@@ -1285,6 +1285,7 @@ impl ExecutionState {
                     tx_hashes: tx_hashes.clone(),
                     execution_certificates: vec![],
                     tx_decisions: tx_decisions.clone(),
+                    receipts: vec![], // Aborted waves have no receipts
                     finalized_height: current_height,
                 };
                 self.finalized_wave_certificates
@@ -1698,10 +1699,15 @@ impl ExecutionState {
         let tx_hashes = tracker.tx_hashes().to_vec();
         let ecs = tracker.take_execution_certificates();
 
-        // Remove receipts_emitted for these txs — they are now finalized.
-        for h in &tx_hashes {
-            self.receipts_emitted.remove(h);
-        }
+        // DO NOT clear receipts_emitted here — they must remain set until
+        // remove_finalized_wave (after block commit) so that BFT lookup_receipt
+        // can find them for pending block voting (P2 fix).
+
+        // Move receipts from cache into FinalizedWave for atomic commit.
+        let receipts: Vec<ReceiptBundle> = tx_hashes
+            .iter()
+            .filter_map(|h| self.receipt_cache.remove(h))
+            .collect();
 
         let cert_arc = Arc::new(wc);
         let finalized = FinalizedWave {
@@ -1709,6 +1715,7 @@ impl ExecutionState {
             tx_hashes: tx_hashes.clone(),
             execution_certificates: ecs.clone(),
             tx_decisions: tx_decisions.clone(),
+            receipts,
             finalized_height: self.committed_height,
         };
         self.finalized_wave_certificates
@@ -1781,6 +1788,14 @@ impl ExecutionState {
             .collect()
     }
 
+    /// Get a finalized wave by its wave_id hash (returns Arc for sharing).
+    pub fn get_finalized_wave_by_hash(&self, wave_id_hash: &Hash) -> Option<Arc<FinalizedWave>> {
+        self.finalized_wave_certificates
+            .values()
+            .find(|fw| fw.certificate.wave_id.hash() == *wave_id_hash)
+            .map(|fw| Arc::new(fw.clone()))
+    }
+
     /// Get the finalized wave certificate containing a specific transaction.
     ///
     /// Returns the wave certificate if the tx is part of a finalized wave.
@@ -1808,6 +1823,7 @@ impl ExecutionState {
 
         for tx_hash in &tx_hashes {
             self.receipts_emitted.remove(tx_hash);
+            self.receipt_cache.remove(tx_hash);
             self.pending_provisioning.remove(tx_hash);
 
             // Remove this TX from the wave's expected set in the accumulator.
@@ -1848,21 +1864,21 @@ impl ExecutionState {
         let pruned_acc = before_acc - self.accumulators.len();
 
         // Prune vote trackers and waves_with_ec — same keys as accumulators.
-        // Warn about any vote trackers being pruned with split receipt roots
+        // Warn about any vote trackers being pruned with split global receipt roots
         // (they never reached quorum, possibly due to non-deterministic execution).
         let before_vt = self.vote_trackers.len();
         self.vote_trackers.retain(|key, tracker| {
             if self.accumulators.contains_key(key) {
                 return true;
             }
-            // About to prune — log diagnostic if there was a receipt root split
-            let root_count = tracker.distinct_receipt_root_count();
+            // About to prune — log diagnostic if there was a global receipt root split
+            let root_count = tracker.distinct_global_receipt_root_count();
             if root_count > 1 {
-                let summary = tracker.receipt_root_power_summary();
+                let summary = tracker.global_receipt_root_power_summary();
                 tracing::warn!(
                     wave = %key,
-                    receipt_root_split = ?summary,
-                    "Pruning vote tracker that never reached quorum — receipt roots were split"
+                    global_receipt_root_split = ?summary,
+                    "Pruning vote tracker that never reached quorum — global receipt roots were split"
                 );
             } else if tracker.total_verified_power() > 0 {
                 tracing::warn!(
@@ -1989,6 +2005,7 @@ impl ExecutionState {
 
         // Evict receipt tracking — transaction is being retried or abandoned.
         self.receipts_emitted.remove(tx_hash);
+        self.receipt_cache.remove(tx_hash);
 
         // Phase 1-2: Provisioning cleanup
         // Note: Provision tracking is handled by ProvisionCoordinator

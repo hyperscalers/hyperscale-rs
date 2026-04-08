@@ -375,6 +375,7 @@ pub fn build_proposal<S: CommitStore + SubstateStore>(
         state_root,
         transaction_root,
         certificate_root,
+        local_receipt_root: Hash::ZERO,
         waves,
     };
 

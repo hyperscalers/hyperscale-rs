@@ -5,18 +5,11 @@
 //! the same provision dependency set within a block).
 
 use hyperscale_types::{
-    ExecutionCertificate, Hash, ShardAttestation, ShardGroupId, TransactionDecision,
+    ExecutionCertificate, Hash, ShardAttestation, ShardGroupId, TransactionDecision, TxDecision,
     TxExecutionOutcome, WaveCertificate, WaveId, WaveResolution,
 };
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
-
-/// Per-transaction decision derived from EC outcomes across shards.
-#[derive(Debug, Clone)]
-pub struct TxDecision {
-    pub tx_hash: Hash,
-    pub decision: TransactionDecision,
-}
 
 /// Tracks execution certificates for wave-level finalization.
 ///
@@ -105,7 +98,7 @@ impl WaveCertificateTracker {
             shard_group_id: shard,
             ec_hash: ec.canonical_hash(),
             vote_height: ec.vote_height,
-            receipt_root: ec.receipt_root,
+            global_receipt_root: ec.global_receipt_root,
             aggregated_signature: ec.aggregated_signature,
             signers: ec.signers.clone(),
         };
@@ -254,7 +247,7 @@ mod tests {
         Arc::new(ExecutionCertificate {
             wave_id: ec_wave_id,
             vote_height: 11,
-            receipt_root: Hash::from_bytes(b"receipt_root"),
+            global_receipt_root: Hash::from_bytes(b"receipt_root"),
             tx_outcomes: outcomes,
             aggregated_signature: Bls12381G2Signature([0u8; 96]),
             signers: SignerBitfield::new(4),

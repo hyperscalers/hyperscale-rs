@@ -249,7 +249,7 @@ pub enum TxExecutionOutcome {
 /// A validator's vote on all transactions in an execution wave.
 ///
 /// One vote covers all transactions sharing the same provision dependency set,
-/// with `receipt_root` being a padded merkle root over per-tx leaf hashes
+/// with `global_receipt_root` being a padded merkle root over per-tx leaf hashes
 /// where each leaf = H(tx_hash || receipt_hash || success_byte).
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct ExecutionVote {
@@ -262,21 +262,21 @@ pub struct ExecutionVote {
     /// Validators vote at each block commit where the wave is complete.
     /// Including `vote_height` in the BLS-signed message prevents
     /// cross-height aggregation, ensuring that if an abort intent changes
-    /// the receipt_root between heights, stale votes cannot combine.
+    /// the global_receipt_root between heights, stale votes cannot combine.
     pub vote_height: u64,
     /// Which wave within the block.
     pub wave_id: WaveId,
     /// Which shard produced this vote.
     pub shard_group_id: ShardGroupId,
     /// Merkle root over per-tx outcome leaves.
-    pub receipt_root: Hash,
+    pub global_receipt_root: Hash,
     /// Number of transactions in this wave.
     pub tx_count: u32,
     /// Per-tx execution outcomes in wave order.
     ///
     /// Carried alongside the vote so the wave leader can extract tx_outcomes
     /// directly from quorum votes when building the EC. Not included in the
-    /// BLS-signed message (receipt_root already commits to the content).
+    /// BLS-signed message (global_receipt_root already commits to the content).
     /// This avoids relying on the wave leader's local accumulator, which may
     /// have diverged due to different abort intent timing.
     pub tx_outcomes: Vec<TxOutcome>,
@@ -304,7 +304,7 @@ pub struct ExecutionCertificate {
     /// reconstruct the BLS signing message for signature verification.
     pub vote_height: u64,
     /// Merkle root over per-tx outcome leaves.
-    pub receipt_root: Hash,
+    pub global_receipt_root: Hash,
     /// Per-transaction outcomes (in wave order = block order).
     pub tx_outcomes: Vec<TxOutcome>,
     /// BLS aggregated signature from 2f+1 validators.
@@ -335,7 +335,7 @@ impl ExecutionCertificate {
         let mut hasher = blake3::Hasher::new();
         hasher.update(&basic_encode(&self.wave_id).unwrap());
         hasher.update(&self.vote_height.to_le_bytes());
-        hasher.update(self.receipt_root.as_bytes());
+        hasher.update(self.global_receipt_root.as_bytes());
         hasher.update(&basic_encode(&self.tx_outcomes).unwrap());
         Hash::from_hash_bytes(hasher.finalize().as_bytes())
     }
@@ -381,7 +381,7 @@ pub fn tx_outcome_leaf(outcome: &TxOutcome) -> Hash {
 /// merkle inclusion proofs have a fixed `ceil(log2(N))` siblings.
 ///
 /// Outcomes must be in wave order (= block order within the wave).
-pub fn compute_receipt_root(outcomes: &[TxOutcome]) -> Hash {
+pub fn compute_global_receipt_root(outcomes: &[TxOutcome]) -> Hash {
     let leaves: Vec<Hash> = outcomes.iter().map(tx_outcome_leaf).collect();
     compute_padded_merkle_root(&leaves)
 }
@@ -393,7 +393,7 @@ pub fn compute_receipt_root(outcomes: &[TxOutcome]) -> Hash {
 /// # Panics
 ///
 /// Panics if `tx_index >= outcomes.len()` or `outcomes` is empty.
-pub fn compute_receipt_root_with_proof(
+pub fn compute_global_receipt_root_with_proof(
     outcomes: &[TxOutcome],
     tx_index: usize,
 ) -> (Hash, Vec<Hash>, u32, Hash) {
@@ -463,35 +463,35 @@ mod tests {
     }
 
     #[test]
-    fn test_receipt_root_deterministic() {
+    fn test_global_receipt_root_deterministic() {
         let outcomes = vec![make_outcome(1), make_outcome(2), make_outcome(3)];
-        let root1 = compute_receipt_root(&outcomes);
-        let root2 = compute_receipt_root(&outcomes);
+        let root1 = compute_global_receipt_root(&outcomes);
+        let root2 = compute_global_receipt_root(&outcomes);
         assert_eq!(root1, root2);
         assert_ne!(root1, Hash::ZERO);
     }
 
     #[test]
-    fn test_receipt_root_single_tx() {
+    fn test_global_receipt_root_single_tx() {
         let outcomes = vec![make_outcome(1)];
-        let root = compute_receipt_root(&outcomes);
+        let root = compute_global_receipt_root(&outcomes);
         let expected = tx_outcome_leaf(&outcomes[0]);
         assert_eq!(root, expected);
     }
 
     #[test]
-    fn test_receipt_root_empty() {
-        let root = compute_receipt_root(&[]);
+    fn test_global_receipt_root_empty() {
+        let root = compute_global_receipt_root(&[]);
         assert_eq!(root, Hash::ZERO);
     }
 
     #[test]
-    fn test_receipt_root_order_matters() {
+    fn test_global_receipt_root_order_matters() {
         let o1 = make_outcome(1);
         let o2 = make_outcome(2);
 
-        let root_12 = compute_receipt_root(&[o1.clone(), o2.clone()]);
-        let root_21 = compute_receipt_root(&[o2, o1]);
+        let root_12 = compute_global_receipt_root(&[o1.clone(), o2.clone()]);
+        let root_21 = compute_global_receipt_root(&[o2, o1]);
         assert_ne!(root_12, root_21);
     }
 
@@ -505,11 +505,11 @@ mod tests {
             make_outcome(5),
         ];
 
-        let root = compute_receipt_root(&outcomes);
+        let root = compute_global_receipt_root(&outcomes);
 
         for i in 0..outcomes.len() {
             let (proof_root, siblings, leaf_index, leaf_hash) =
-                compute_receipt_root_with_proof(&outcomes, i);
+                compute_global_receipt_root_with_proof(&outcomes, i);
 
             assert_eq!(proof_root, root, "Root mismatch for index {i}");
 
@@ -576,7 +576,7 @@ mod tests {
         ExecutionCertificate {
             wave_id: make_wave_id(0, 10, &[1]),
             vote_height: 11,
-            receipt_root: Hash::from_bytes(b"receipt_root"),
+            global_receipt_root: Hash::from_bytes(b"global_receipt_root"),
             tx_outcomes: vec![make_outcome(1), make_outcome(2)],
             aggregated_signature: signature,
             signers,

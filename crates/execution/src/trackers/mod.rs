@@ -6,5 +6,6 @@
 mod certificate;
 mod vote;
 
-pub use certificate::{create_abort_wave_certificate, TxDecision, WaveCertificateTracker};
+pub use certificate::{create_abort_wave_certificate, WaveCertificateTracker};
+pub use hyperscale_types::TxDecision;
 pub use vote::VoteTracker;

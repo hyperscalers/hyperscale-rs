@@ -238,6 +238,76 @@ pub fn filter_updates_for_shard<S: SubstateDatabase>(
 }
 
 // ============================================================================
+// Stage 3: Global Receipt Filtering
+// ============================================================================
+
+/// Filter DatabaseUpdates for cross-shard agreement (GlobalReceipt).
+///
+/// Like [`filter_updates_for_shard`] but WITHOUT shard assignment — keeps
+/// declared writes across ALL shards. This produces a deterministic set of
+/// writes that is identical on every shard executing the same transaction,
+/// enabling cross-shard agreement via `writes_root` in the GlobalReceipt.
+///
+/// Filters applied:
+/// 1. Drop system entities (ConsensusManager, TransactionTracker, Validator)
+/// 2. Drop undeclared writes (not in declared_reads/declared_writes or their owned vaults)
+/// 3. [OMITTED] No shard filtering — keep writes for all shards
+pub fn filter_updates_for_global_receipt<S: SubstateDatabase>(
+    updates: &DatabaseUpdates,
+    storage: &S,
+    declared_nodes: &[NodeId],
+) -> DatabaseUpdates {
+    let declared_set: HashSet<NodeId> = declared_nodes.iter().copied().collect();
+    let ownership = resolve_owned_nodes(storage, declared_nodes);
+
+    let mut filtered = DatabaseUpdates::default();
+
+    for (db_node_key, node_updates) in &updates.node_updates {
+        let Some(node_id) = db_node_key_to_node_id(db_node_key) else {
+            continue;
+        };
+
+        let entity_type = node_id.0[0];
+
+        // Drop system entities.
+        if SYSTEM_ENTITY_TYPES.contains(&entity_type) {
+            continue;
+        }
+
+        // Drop undeclared writes.
+        if !declared_set.contains(&node_id) && !ownership.contains_key(&node_id) {
+            continue;
+        }
+
+        // No shard filtering — keep writes for all shards.
+        filtered
+            .node_updates
+            .insert(db_node_key.clone(), node_updates.clone());
+    }
+
+    filtered
+}
+
+/// Compute the `writes_root` for a GlobalReceipt from filtered DatabaseUpdates.
+///
+/// SBOR-encodes the entire DatabaseUpdates (which uses BTreeMap for deterministic
+/// iteration order) and hashes to produce a single root. All validators executing
+/// the same transaction with the same declared nodes will produce identical output.
+pub fn compute_writes_root(updates: &DatabaseUpdates) -> hyperscale_types::Hash {
+    use hyperscale_types::Hash;
+
+    if updates.node_updates.is_empty() {
+        return Hash::ZERO;
+    }
+
+    // DatabaseUpdates uses BTreeMap internally, so SBOR encoding is
+    // deterministic across validators.
+    let encoded = radix_common::prelude::basic_encode(updates)
+        .expect("DatabaseUpdates encoding should not fail");
+    Hash::from_bytes(&encoded)
+}
+
+// ============================================================================
 // Utilities
 // ============================================================================
 

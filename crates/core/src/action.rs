@@ -4,9 +4,10 @@ use crate::{ProtocolEvent, TimerId};
 use hyperscale_messages::{BlockHeaderNotification, BlockVoteNotification, TransactionGossip};
 use hyperscale_types::{
     AbortIntent, Block, BlockHeight, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature,
-    CommittedBlockHeader, EpochConfig, EpochId, ExecutionCertificate, ExecutionVote, Hash, NodeId,
-    ProvisionBatch, QuorumCertificate, RoutableTransaction, ShardGroupId, SignerBitfield,
-    StateProvision, TopologySnapshot, TxOutcome, ValidatorId, VotePower, WaveCertificate, WaveId,
+    CommittedBlockHeader, EpochConfig, EpochId, ExecutionCertificate, ExecutionVote, FinalizedWave,
+    Hash, NodeId, ProvisionBatch, QuorumCertificate, RoutableTransaction, ShardGroupId,
+    SignerBitfield, StateProvision, TopologySnapshot, TxOutcome, ValidatorId, VotePower,
+    WaveCertificate, WaveId,
 };
 use std::collections::HashMap;
 use std::fmt;
@@ -150,7 +151,7 @@ pub enum Action {
         /// Consensus height at which this vote is being cast.
         vote_height: u64,
         wave_id: WaveId,
-        receipt_root: Hash,
+        global_receipt_root: Hash,
         /// Per-tx outcomes in wave order. Carried on the vote so the wave leader
         /// can extract them directly when building the EC (avoids relying on the
         /// leader's local accumulator which may have diverged).
@@ -285,8 +286,8 @@ pub enum Action {
         wave_id: WaveId,
         /// Shard group that executed.
         shard: ShardGroupId,
-        /// Receipt root (merkle root over per-tx outcome leaves).
-        receipt_root: Hash,
+        /// Global receipt root (merkle root over per-tx outcome leaves).
+        global_receipt_root: Hash,
         /// Votes to aggregate (with quorum). The first vote's `tx_outcomes`
         /// is used for the EC payload (all quorum votes have identical outcomes).
         votes: Vec<ExecutionVote>,
@@ -395,12 +396,9 @@ pub enum Action {
         parent_state_root: Hash,
         /// Expected state root after applying writes.
         expected_root: Hash,
-        /// Transaction hashes of non-aborted certificates. Receipts are fetched
-        /// from storage on the thread pool to derive DatabaseUpdates.
-        cert_tx_hashes: Vec<Hash>,
-        /// Per-certificate declared nodes (parallel to cert_tx_hashes).
-        /// Used by filter_updates_for_shard for deterministic shard filtering.
-        per_cert_declared_nodes: Vec<Vec<NodeId>>,
+        /// Finalized waves whose receipts contribute to the state root.
+        /// The thread pool merges DatabaseUpdates from these.
+        finalized_waves: Vec<Arc<FinalizedWave>>,
         /// Block height (used as JVT version).
         block_height: u64,
     },

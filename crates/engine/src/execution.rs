@@ -8,8 +8,8 @@
 
 use hyperscale_storage::keys;
 use hyperscale_types::{
-    ApplicationEvent, FeeSummary, LedgerTransactionOutcome, LedgerTransactionReceipt,
-    LocalTransactionExecution, LogLevel, StateEntry,
+    ApplicationEvent, ExecutionOutput, FeeSummary, LocalReceipt, LogLevel, StateEntry,
+    TransactionOutcome,
 };
 use radix_engine::transaction::{
     execute_transaction, ExecutionConfig, TransactionReceipt, TransactionResult,
@@ -49,27 +49,27 @@ pub fn extract_database_updates(receipt: &TransactionReceipt) -> DatabaseUpdates
     extract_state_updates(receipt).unwrap_or_default()
 }
 
-/// Build a `LedgerTransactionReceipt` from a Radix Engine receipt.
+/// Build a `LocalReceipt` from a Radix Engine receipt.
 ///
 /// Shard filtering is applied here so the receipt is always born with
 /// shard-specific `database_updates`. Pass `None` for `shard_context` in
 /// single-shard deployments (no filtering needed).
-pub fn build_ledger_receipt<S: radix_substate_store_interface::interface::SubstateDatabase>(
+pub fn build_local_receipt<S: radix_substate_store_interface::interface::SubstateDatabase>(
     receipt: &TransactionReceipt,
     storage: &S,
     declared_nodes: &[hyperscale_types::NodeId],
     local_shard: hyperscale_types::ShardGroupId,
     num_shards: u64,
-) -> LedgerTransactionReceipt {
+) -> LocalReceipt {
     match &receipt.result {
         TransactionResult::Commit(commit) => {
             let application_events = extract_application_events(commit);
             let outcome = match &commit.outcome {
                 radix_engine::transaction::TransactionOutcome::Success(_) => {
-                    LedgerTransactionOutcome::Success
+                    TransactionOutcome::Success
                 }
                 radix_engine::transaction::TransactionOutcome::Failure(_) => {
-                    LedgerTransactionOutcome::Failure
+                    TransactionOutcome::Failure
                 }
             };
             let mut database_updates = extract_database_updates(receipt);
@@ -82,20 +82,18 @@ pub fn build_ledger_receipt<S: radix_substate_store_interface::interface::Substa
                     declared_nodes,
                 );
             }
-            LedgerTransactionReceipt {
+            LocalReceipt {
                 outcome,
                 database_updates,
                 application_events,
             }
         }
-        TransactionResult::Reject(_) | TransactionResult::Abort(_) => {
-            LedgerTransactionReceipt::failure()
-        }
+        TransactionResult::Reject(_) | TransactionResult::Abort(_) => LocalReceipt::failure(),
     }
 }
 
-/// Build `LocalTransactionExecution` from a Radix Engine receipt.
-pub fn build_local_execution(receipt: &TransactionReceipt) -> LocalTransactionExecution {
+/// Build `ExecutionOutput` from a Radix Engine receipt.
+pub fn build_execution_output(receipt: &TransactionReceipt) -> ExecutionOutput {
     let fee_summary = build_fee_summary(receipt);
 
     let (log_messages, error_message) = match &receipt.result {
@@ -117,7 +115,7 @@ pub fn build_local_execution(receipt: &TransactionReceipt) -> LocalTransactionEx
         TransactionResult::Abort(abort) => (vec![], Some(format!("{:?}", abort.reason))),
     };
 
-    LocalTransactionExecution {
+    ExecutionOutput {
         fee_summary,
         log_messages,
         error_message,
@@ -394,10 +392,10 @@ impl Iterator for MergedPartitionIterator<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hyperscale_types::{LedgerTransactionOutcome, LogLevel};
+    use hyperscale_types::LogLevel;
     use radix_engine::transaction::{
-        AbortResult, CommitResult, RejectResult, TransactionOutcome, TransactionReceipt,
-        TransactionResult,
+        AbortResult, CommitResult, RejectResult, TransactionOutcome as RadixTransactionOutcome,
+        TransactionReceipt, TransactionResult,
     };
 
     // ─── Helpers ────────────────────────────────────────────────────────
@@ -405,7 +403,7 @@ mod tests {
     fn make_success_receipt_with_logs(
         logs: Vec<(radix_engine_interface::types::Level, String)>,
     ) -> TransactionReceipt {
-        let mut commit = CommitResult::empty_with_outcome(TransactionOutcome::Success(vec![]));
+        let mut commit = CommitResult::empty_with_outcome(RadixTransactionOutcome::Success(vec![]));
         commit.application_logs = logs;
         TransactionReceipt::empty_with_commit(commit)
     }
@@ -413,7 +411,7 @@ mod tests {
     fn make_success_receipt_with_events(
         events: Vec<(radix_engine_interface::types::EventTypeIdentifier, Vec<u8>)>,
     ) -> TransactionReceipt {
-        let mut commit = CommitResult::empty_with_outcome(TransactionOutcome::Success(vec![]));
+        let mut commit = CommitResult::empty_with_outcome(RadixTransactionOutcome::Success(vec![]));
         commit.application_events = events;
         TransactionReceipt::empty_with_commit(commit)
     }
@@ -436,27 +434,27 @@ mod tests {
         }
     }
 
-    // ─── Tests: build_ledger_receipt ────────────────────────────────────
+    // ─── Tests: build_local_receipt ────────────────────────────────────
 
     /// Test helper: build receipt with single-shard defaults (no filtering).
-    fn test_build_receipt(receipt: &TransactionReceipt) -> LedgerTransactionReceipt {
+    fn test_build_receipt(receipt: &TransactionReceipt) -> LocalReceipt {
         // num_shards=1 skips filter_updates_for_shard, so storage is never read.
         let empty = hyperscale_storage::empty_substate_database();
-        build_ledger_receipt(receipt, &empty, &[], hyperscale_types::ShardGroupId(0), 1)
+        build_local_receipt(receipt, &empty, &[], hyperscale_types::ShardGroupId(0), 1)
     }
 
     #[test]
-    fn test_build_ledger_receipt_commit_success() {
+    fn test_build_local_receipt_commit_success() {
         let receipt = TransactionReceipt::empty_commit_success();
         let ledger = test_build_receipt(&receipt);
 
-        assert_eq!(ledger.outcome, LedgerTransactionOutcome::Success);
+        assert_eq!(ledger.outcome, TransactionOutcome::Success);
         assert!(ledger.database_updates.node_updates.is_empty());
         assert!(ledger.application_events.is_empty());
     }
 
     #[test]
-    fn test_build_ledger_receipt_with_events() {
+    fn test_build_local_receipt_with_events() {
         use radix_engine_interface::types::{Emitter, EventTypeIdentifier};
         let radix_node_id = radix_common::types::NodeId([1u8; 30]);
         let event_id = EventTypeIdentifier(
@@ -472,7 +470,7 @@ mod tests {
         ]);
         let ledger = test_build_receipt(&receipt);
 
-        assert_eq!(ledger.outcome, LedgerTransactionOutcome::Success);
+        assert_eq!(ledger.outcome, TransactionOutcome::Success);
         assert_eq!(ledger.application_events.len(), 2);
         assert_eq!(ledger.application_events[0].data, b"event_data_1");
         assert_eq!(ledger.application_events[1].data, b"event_data_2");
@@ -480,26 +478,26 @@ mod tests {
     }
 
     #[test]
-    fn test_build_ledger_receipt_reject() {
+    fn test_build_local_receipt_reject() {
         let receipt = make_reject_receipt();
         let ledger = test_build_receipt(&receipt);
 
-        assert_eq!(ledger, LedgerTransactionReceipt::failure());
-        assert_eq!(ledger.outcome, LedgerTransactionOutcome::Failure);
+        assert_eq!(ledger, LocalReceipt::failure());
+        assert_eq!(ledger.outcome, TransactionOutcome::Failure);
         assert!(ledger.database_updates.node_updates.is_empty());
         assert!(ledger.application_events.is_empty());
     }
 
     #[test]
-    fn test_build_ledger_receipt_abort() {
+    fn test_build_local_receipt_abort() {
         let receipt = make_abort_receipt();
         let ledger = test_build_receipt(&receipt);
 
-        assert_eq!(ledger, LedgerTransactionReceipt::failure());
+        assert_eq!(ledger, LocalReceipt::failure());
     }
 
     #[test]
-    fn test_build_ledger_receipt_receipt_hash_deterministic() {
+    fn test_build_local_receipt_receipt_hash_deterministic() {
         let receipt = TransactionReceipt::empty_commit_success();
         let ledger_a = test_build_receipt(&receipt);
         let ledger_b = test_build_receipt(&receipt);
@@ -507,26 +505,26 @@ mod tests {
         assert_eq!(ledger_a.receipt_hash(), ledger_b.receipt_hash());
     }
 
-    // ─── Tests: build_local_execution ───────────────────────────────────
+    // ─── Tests: build_execution_output ───────────────────────────────────
 
     #[test]
-    fn test_build_local_execution_success_no_error() {
+    fn test_build_execution_output_success_no_error() {
         let receipt = TransactionReceipt::empty_commit_success();
-        let local = build_local_execution(&receipt);
+        let local = build_execution_output(&receipt);
 
         assert!(local.error_message.is_none());
         assert!(local.log_messages.is_empty());
     }
 
     #[test]
-    fn test_build_local_execution_with_logs() {
+    fn test_build_execution_output_with_logs() {
         use radix_engine_interface::types::Level;
         let receipt = make_success_receipt_with_logs(vec![
             (Level::Info, "hello world".to_string()),
             (Level::Error, "something broke".to_string()),
             (Level::Debug, "debug info".to_string()),
         ]);
-        let local = build_local_execution(&receipt);
+        let local = build_execution_output(&receipt);
 
         assert_eq!(local.log_messages.len(), 3);
         assert_eq!(
@@ -545,27 +543,27 @@ mod tests {
     }
 
     #[test]
-    fn test_build_local_execution_reject_has_error() {
+    fn test_build_execution_output_reject_has_error() {
         let receipt = make_reject_receipt();
-        let local = build_local_execution(&receipt);
+        let local = build_execution_output(&receipt);
 
         assert!(local.error_message.is_some());
         assert!(local.log_messages.is_empty());
     }
 
     #[test]
-    fn test_build_local_execution_abort_has_error() {
+    fn test_build_execution_output_abort_has_error() {
         let receipt = make_abort_receipt();
-        let local = build_local_execution(&receipt);
+        let local = build_execution_output(&receipt);
 
         assert!(local.error_message.is_some());
         assert!(local.log_messages.is_empty());
     }
 
     #[test]
-    fn test_build_local_execution_fees_are_encoded() {
+    fn test_build_execution_output_fees_are_encoded() {
         let receipt = TransactionReceipt::empty_commit_success();
-        let local = build_local_execution(&receipt);
+        let local = build_execution_output(&receipt);
 
         // Default fee summary has zero Decimals, which still SBOR-encode to non-empty bytes.
         assert!(

@@ -33,7 +33,7 @@ pub enum WaveResolution {
     Completed { attestations: Vec<ShardAttestation> },
     /// Wave leader timed out. All transactions in this wave are aborted.
     /// Deterministic — every validator produces the same all-abort cert.
-    /// No BLS signatures; BFT consensus authenticates via receipt_root.
+    /// No BLS signatures; BFT consensus authenticates via global_receipt_root.
     Aborted,
 }
 
@@ -47,7 +47,7 @@ pub struct ShardAttestation {
     /// Vote height at which the EC was aggregated.
     pub vote_height: u64,
     /// Merkle root over per-tx outcome leaves in the EC.
-    pub receipt_root: Hash,
+    pub global_receipt_root: Hash,
     /// BLS aggregated signature from 2f+1 validators on this shard.
     pub aggregated_signature: Bls12381G2Signature,
     /// Which validators signed (bitfield indexed by committee position).
@@ -66,7 +66,7 @@ impl WaveCertificate {
                 // Vec is pre-sorted by (shard_group_id, ec_hash) at construction
                 // time for deterministic ordering.
                 // ec_hash already encodes the WaveId (shard + height + remote_shards),
-                // vote_height, receipt_root, and all tx_outcomes — so this
+                // vote_height, global_receipt_root, and all tx_outcomes — so this
                 // commits to the full content of every contributing EC.
                 for att in attestations {
                     hasher.update(&basic_encode(&att.shard_group_id).unwrap());
@@ -215,7 +215,7 @@ mod tests {
             shard_group_id: ShardGroupId(shard),
             ec_hash: Hash::from_bytes(&[ec_hash_seed; 4]),
             vote_height: 43,
-            receipt_root: Hash::from_bytes(&[ec_hash_seed + 100; 4]),
+            global_receipt_root: Hash::from_bytes(&[ec_hash_seed + 100; 4]),
             aggregated_signature: Bls12381G2Signature([0u8; 96]),
             signers: SignerBitfield::new(4),
         }

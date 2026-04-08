@@ -737,10 +737,10 @@ fn test_receipt_survives_reopen() {
     {
         let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
         assert!(storage.has_receipt(&tx_hash));
-        let retrieved = storage.get_ledger_receipt(&tx_hash).unwrap();
-        assert_eq!(*retrieved, *bundle.ledger_receipt);
-        let local = storage.get_local_execution(&tx_hash).unwrap();
-        assert_eq!(local, bundle.local_execution.unwrap());
+        let retrieved = storage.get_local_receipt(&tx_hash).unwrap();
+        assert_eq!(*retrieved, *bundle.local_receipt);
+        let local = storage.get_execution_output(&tx_hash).unwrap();
+        assert_eq!(local, bundle.execution_output.unwrap());
     }
 }
 

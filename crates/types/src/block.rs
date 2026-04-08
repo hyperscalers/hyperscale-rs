@@ -139,6 +139,16 @@ pub struct BlockHeader {
     /// For empty blocks (genesis, fallback, no certificates), this is `Hash::ZERO`.
     pub certificate_root: Hash,
 
+    /// Merkle root of per-tx `LocalReceipt` hashes for all transactions
+    /// covered by this block's wave certificates.
+    ///
+    /// Commits to the specific per-tx state deltas (shard-filtered DatabaseUpdates)
+    /// that were applied to produce `state_root`. Enables per-tx delta attribution
+    /// and receipt integrity verification by sync nodes.
+    ///
+    /// For empty blocks (genesis, fallback, no certificates), this is `Hash::ZERO`.
+    pub local_receipt_root: Hash,
+
     /// Cross-shard execution waves in this block.
     ///
     /// Each `WaveId` is the set of remote shards that a group of transactions
@@ -172,6 +182,7 @@ impl BlockHeader {
             state_root,
             transaction_root: Hash::ZERO,
             certificate_root: Hash::ZERO,
+            local_receipt_root: Hash::ZERO,
             waves: vec![],
         }
     }
@@ -619,6 +630,7 @@ mod tests {
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
             certificate_root: Hash::ZERO,
+            local_receipt_root: Hash::ZERO,
             waves: vec![],
         };
 
@@ -688,7 +700,7 @@ mod tests {
                         shard_group_id: ShardGroupId(0),
                         ec_hash: Hash::from_bytes(&[seed; 4]),
                         vote_height: 11,
-                        receipt_root: Hash::from_bytes(&[seed + 100; 4]),
+                        global_receipt_root: Hash::from_bytes(&[seed + 100; 4]),
                         aggregated_signature: Bls12381G2Signature([0u8; 96]),
                         signers: SignerBitfield::new(4),
                     }],
@@ -722,7 +734,7 @@ mod tests {
                     shard_group_id: ShardGroupId(0),
                     ec_hash: Hash::from_bytes(b"ec1"),
                     vote_height: 11,
-                    receipt_root: Hash::from_bytes(b"receipt"),
+                    global_receipt_root: Hash::from_bytes(b"receipt"),
                     aggregated_signature: Bls12381G2Signature([0u8; 96]),
                     signers: SignerBitfield::new(4),
                 }],

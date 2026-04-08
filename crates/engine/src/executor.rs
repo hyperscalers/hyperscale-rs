@@ -31,7 +31,7 @@
 
 use crate::error::ExecutionError;
 use crate::execution::{
-    build_ledger_receipt, build_local_execution, is_committed, ProvisionedSnapshot,
+    build_execution_output, build_local_receipt, is_committed, ProvisionedSnapshot,
 };
 use crate::genesis::{GenesisBuilder, GenesisConfig, GenesisError};
 use crate::result::{ExecutionOutput, SingleTxResult};
@@ -325,12 +325,22 @@ impl RadixExecutor {
                 .chain(tx.declared_writes.iter())
                 .copied()
                 .collect();
-            let ledger_receipt =
-                build_ledger_receipt(receipt, storage, &declared_nodes, local_shard, num_shards);
-            let local_execution = build_local_execution(receipt);
-            let receipt_hash = ledger_receipt.receipt_hash();
+            let local_receipt =
+                build_local_receipt(receipt, storage, &declared_nodes, local_shard, num_shards);
+            let execution_output = build_execution_output(receipt);
 
-            SingleTxResult::success(tx.hash(), receipt_hash, ledger_receipt, local_execution)
+            // Compute writes_root for GlobalReceipt from global-filtered updates
+            // (declared-only, system-filtered, NOT shard-filtered).
+            let raw_updates = crate::execution::extract_database_updates(receipt);
+            let global_updates = crate::sharding::filter_updates_for_global_receipt(
+                &raw_updates,
+                storage,
+                &declared_nodes,
+            );
+            let writes_root = crate::sharding::compute_writes_root(&global_updates);
+            let receipt_hash = local_receipt.global_receipt(writes_root).receipt_hash();
+
+            SingleTxResult::success(tx.hash(), receipt_hash, local_receipt, execution_output)
         } else {
             let error = format!("{:?}", receipt.result);
             SingleTxResult::failure(tx.hash(), error)
