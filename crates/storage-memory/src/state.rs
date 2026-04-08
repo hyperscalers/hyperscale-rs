@@ -80,11 +80,14 @@ impl SharedState {
             );
         }
 
-        for (key, node) in snapshot.nodes {
-            self.tree_store.insert_node(key, node);
+        for (jvt_key, jvt_node) in &snapshot.nodes {
+            let stored_key = hyperscale_storage::jmt::StoredNodeKey::from_jvt(jvt_key);
+            let stored_node = hyperscale_storage::jmt::StoredNode::from_jvt(jvt_node);
+            self.tree_store.insert_node(stored_key, stored_node);
         }
-        for stale_part in snapshot.stale_tree_parts {
-            self.tree_store.record_stale_tree_part(stale_part);
+        for stale_key in snapshot.stale_node_keys {
+            self.tree_store
+                .record_stale_tree_part(hyperscale_storage::jmt::StaleTreePart::Node(stale_key));
         }
         for a in snapshot.leaf_substate_associations {
             self.associations.insert(a.tree_node_key, a.substate_value);

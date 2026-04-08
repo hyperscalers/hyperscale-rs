@@ -54,7 +54,7 @@ impl RocksDbStorage {
                 match stale_part {
                     StaleTreePart::Node(key) => {
                         typed_cf::batch_delete::<JvtNodesCf>(&mut batch, jvt_cf, &key);
-                        self.node_cache.remove(&key);
+                        self.node_cache.remove(&key.to_jvt());
                         deleted_nodes += 1;
                     }
                     StaleTreePart::Subtree(key) => {
@@ -121,7 +121,7 @@ impl RocksDbStorage {
             }
 
             typed_cf::batch_delete::<JvtNodesCf>(batch, jvt_cf, &key);
-            node_cache.remove(&key);
+            node_cache.remove(&key.to_jvt());
             deleted += 1;
         }
 

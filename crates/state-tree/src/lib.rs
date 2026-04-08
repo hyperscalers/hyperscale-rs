@@ -16,6 +16,8 @@ mod node_cache;
 pub mod proofs;
 pub mod tree_store;
 
+pub use jellyfish_verkle_tree::Node as JvtNode;
+pub use jellyfish_verkle_tree::NodeKey as JvtNodeKey;
 pub use node_cache::NodeCache;
 
 use std::collections::{BTreeMap, HashMap};
@@ -26,23 +28,6 @@ use jellyfish_verkle_tree as jvt;
 
 use jvt::TreeReader as _;
 use tree_store::*;
-
-/// Hash a storage key to a 32-byte JVT key.
-///
-/// Storage keys are variable-length (`entity_key || partition_num || sort_key`).
-/// BLAKE3 hashing produces a fixed 32-byte key for optimal JVT tree depth (~4 levels).
-pub fn hash_storage_key(storage_key: &[u8]) -> jvt::Key {
-    blake3::hash(storage_key).into()
-}
-
-/// Build a storage key from entity_key + partition_num + sort_key.
-fn make_storage_key(entity_key: &[u8], partition_num: u8, sort_key: &[u8]) -> Vec<u8> {
-    let mut key = Vec::with_capacity(entity_key.len() + 1 + sort_key.len());
-    key.extend_from_slice(entity_key);
-    key.push(partition_num);
-    key.extend_from_slice(sort_key);
-    key
-}
 
 /// Adapter that bridges `ReadableTreeStore` → JVT `TreeReader`,
 /// with an in-memory `NodeCache` read layer. Hot tree nodes (root,
@@ -87,6 +72,31 @@ impl<S: ReadableTreeStore> jvt::TreeReader for StoreAdapter<'_, S> {
     }
 }
 
+/// Hash a storage key to a 32-byte JVT key.
+///
+/// Storage keys are variable-length (`entity_key || partition_num || sort_key`).
+/// BLAKE3 hashing produces a fixed 32-byte key for optimal JVT tree depth (~4 levels).
+pub fn hash_storage_key(storage_key: &[u8]) -> jvt::Key {
+    blake3::hash(storage_key).into()
+}
+
+/// Build a storage key from entity_key + partition_num + sort_key.
+fn make_storage_key(entity_key: &[u8], partition_num: u8, sort_key: &[u8]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(entity_key.len() + 1 + sort_key.len());
+    key.extend_from_slice(entity_key);
+    key.push(partition_num);
+    key.extend_from_slice(sort_key);
+    key
+}
+
+fn commitment_to_hash(c: jvt::Commitment) -> Hash {
+    use ark_serialize::CanonicalSerialize;
+    let mut buf = [0u8; 32];
+    c.0.serialize_compressed(&mut buf[..])
+        .expect("Bandersnatch point serialization should never fail");
+    Hash::from_hash_bytes(&buf)
+}
+
 /// Computes new state tree nodes for the given database updates, returning
 /// the new root hash and all collected writes.
 ///
@@ -100,6 +110,10 @@ impl<S: ReadableTreeStore> jvt::TreeReader for StoreAdapter<'_, S> {
 /// before the reset. These are needed to generate JVT deletes because hashed keys
 /// prevent tree-based enumeration. The caller obtains these from the data store
 /// (OrdMap prefix scan or RocksDB range scan) before calling this function.
+///
+/// The shared `node_cache` is used for reads only. New nodes are returned in
+/// `CollectedWrites` — the caller populates the cache at commit time via
+/// [`NodeCache::populate`].
 pub fn put_at_version<S: ReadableTreeStore + Sync>(
     tree_store: &S,
     parent_version: Option<Version>,
@@ -182,12 +196,8 @@ pub fn put_at_version<S: ReadableTreeStore + Sync>(
                 if commitment == jvt::zero_commitment() {
                     return None;
                 }
-                // Write a copy of the root node at the new version
                 let new_root_key = jvt::NodeKey::root(new_version);
-                collected.nodes.push((
-                    StoredNodeKey::from_jvt(&new_root_key),
-                    StoredNode::from_jvt(&root_node),
-                ));
+                collected.nodes.push((new_root_key, root_node));
                 Some(commitment_to_hash(commitment))
             })
             .unwrap_or(Hash::ZERO);
@@ -202,22 +212,16 @@ pub fn put_at_version<S: ReadableTreeStore + Sync>(
         commitment_to_hash(result.root_commitment)
     };
 
-    // Collect writes — cache population happens at commit time via
-    // NodeCache::populate(), not here. This keeps put_at_version safe
-    // for both speculative and committed callers.
     let mut collected = CollectedWrites::default();
     for (node_key, node) in &result.batch.new_nodes {
-        collected.nodes.push((
-            StoredNodeKey::from_jvt(node_key),
-            StoredNode::from_jvt(node),
-        ));
+        collected
+            .nodes
+            .push((node_key.clone(), Arc::new(node.clone())));
     }
     for stale in &result.batch.stale_nodes {
         collected
-            .stale_tree_parts
-            .push(StaleTreePart::Node(StoredNodeKey::from_jvt(
-                &stale.node_key,
-            )));
+            .stale_node_keys
+            .push(StoredNodeKey::from_jvt(&stale.node_key));
     }
 
     (root_hash, collected)
@@ -248,21 +252,31 @@ pub fn put_at_version_and_apply<S: ReadableTreeStore + WriteableTreeStore + Sync
     root
 }
 
-/// Writes collected during state tree computation, to be applied atomically.
+/// Writes collected during state tree computation.
+///
+/// Nodes are stored in hydrated form `(jvt::NodeKey, Arc<jvt::Node>)` — the
+/// canonical output of `put_at_version`. Storage backends serialize to
+/// `StoredNodeKey`/`StoredNode` at write time. The cache takes the hydrated
+/// form directly via [`NodeCache::populate`].
 #[derive(Default)]
 pub struct CollectedWrites {
-    pub nodes: Vec<(StoredNodeKey, StoredNode)>,
-    pub stale_tree_parts: Vec<StaleTreePart>,
+    /// Hydrated nodes — canonical form from the JVT computation.
+    pub nodes: Vec<(jvt::NodeKey, Arc<jvt::Node>)>,
+    /// Stale node keys for GC tracking. Stored in serialized form because
+    /// they're persisted to RocksDB and read back during GC.
+    pub stale_node_keys: Vec<StoredNodeKey>,
 }
 
 impl CollectedWrites {
-    /// Apply collected nodes and stale parts to a store.
+    /// Apply collected nodes and stale parts to a writable tree store.
+    ///
+    /// Converts hydrated nodes to stored form at write time.
     pub fn apply_to(self, store: &(impl WriteableTreeStore + ?Sized)) {
-        for (key, node) in self.nodes {
-            store.insert_node(key, node);
+        for (key, node) in &self.nodes {
+            store.insert_node(StoredNodeKey::from_jvt(key), StoredNode::from_jvt(node));
         }
-        for part in self.stale_tree_parts {
-            store.record_stale_tree_part(part);
+        for key in self.stale_node_keys {
+            store.record_stale_tree_part(StaleTreePart::Node(key));
         }
     }
 }

@@ -271,24 +271,32 @@ impl RocksDbStorage {
         snapshot: &JvtSnapshot,
         new_version: u64,
     ) {
-        // JVT nodes
+        // JVT nodes — serialize hydrated nodes to stored form at write time.
         let cf = self.cf();
-        for (key, node) in &snapshot.nodes {
+        for (jvt_key, jvt_node) in &snapshot.nodes {
+            let stored_key = hyperscale_storage::jmt::StoredNodeKey::from_jvt(jvt_key);
+            let stored_node = hyperscale_storage::jmt::StoredNode::from_jvt(jvt_node);
             crate::typed_cf::batch_put::<crate::column_families::JvtNodesCf>(
                 batch,
                 crate::column_families::JvtNodesCf::handle(&cf),
-                key,
-                &VersionedStoredNode::from_latest(node.clone()),
+                &stored_key,
+                &VersionedStoredNode::from_latest(stored_node),
             );
         }
 
         // Stale nodes for deferred GC — keyed by the version at which they became stale.
-        if !snapshot.stale_tree_parts.is_empty() {
+        if !snapshot.stale_node_keys.is_empty() {
+            // Wrap keys as StaleTreePart::Node for SBOR serialization.
+            let stale_parts: Vec<hyperscale_storage::jmt::StaleTreePart> = snapshot
+                .stale_node_keys
+                .iter()
+                .map(|k| hyperscale_storage::jmt::StaleTreePart::Node(k.clone()))
+                .collect();
             crate::typed_cf::batch_put::<crate::column_families::StaleJvtNodesCf>(
                 batch,
                 crate::column_families::StaleJvtNodesCf::handle(&cf),
                 &new_version,
-                &snapshot.stale_tree_parts,
+                &stale_parts,
             );
         }
 

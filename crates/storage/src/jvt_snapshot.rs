@@ -3,15 +3,10 @@
 //! This module provides [`JvtSnapshot`], which captures JVT nodes computed during
 //! speculative state root computation. The snapshot can be cached and applied
 //! during block commit, avoiding redundant recomputation.
-//!
-//! # Historical State Support
-//!
-//! When historical substate queries are enabled, the snapshot also captures
-//! [`LeafSubstateKeyAssociation`] records that link JVT leaf nodes to their
-//! substate values. These associations are persisted to enable querying
-//! historical state at any past version (within the retention window).
 
-use crate::jmt::{CollectedWrites, StaleTreePart, StoredNode, StoredNodeKey};
+use std::sync::Arc;
+
+use crate::jmt::{CollectedWrites, JvtNode, JvtNodeKey, StoredNodeKey};
 use crate::StateRootHash;
 
 /// Associates a JVT leaf node with the substate value it represents.
@@ -19,13 +14,6 @@ use crate::StateRootHash;
 /// This enables historical state queries by linking the JVT structure
 /// (which is versioned) to actual substate values. Without this association,
 /// the JVT only contains hashes, not the actual values.
-///
-/// # When Used
-///
-/// These associations are collected during JVT updates when historical
-/// substate values are enabled. They are persisted to a dedicated column
-/// family (`associated_state_tree_values` in production) and can be used
-/// to retrieve the value of any substate at any historical state version.
 #[derive(Debug, Clone)]
 pub struct LeafSubstateKeyAssociation {
     /// The JVT leaf node key. This uniquely identifies the leaf in the
@@ -42,24 +30,9 @@ pub struct LeafSubstateKeyAssociation {
 /// Created during speculative state root computation (e.g., block verification).
 /// Can be applied to the real JVT during block commit, avoiding redundant computation.
 ///
-/// # Usage
-///
-/// ```ignore
-/// // During verification (speculative computation)
-/// let (root, collected) = put_at_version(&store, parent_version, height, &updates, dispatch);
-/// let snapshot = JvtSnapshot::from_collected_writes(collected, base_root, base_ver, root, height, Some(&lookup));
-/// cache.insert(block_hash, snapshot);
-///
-/// // During commit
-/// let snapshot = cache.remove(&block_hash);
-/// storage.apply_jvt_snapshot(snapshot);
-/// ```
-///
-/// # Historical State Support
-///
-/// When `leaf_substate_associations` is non-empty, the snapshot includes
-/// associations between JVT leaf nodes and their substate values. These
-/// should be persisted alongside the JVT nodes to enable historical queries.
+/// Nodes are stored in hydrated form `(JvtNodeKey, Arc<JvtNode>)` — the canonical
+/// output of `put_at_version`. Storage backends serialize to `StoredNodeKey`/`StoredNode`
+/// at write time. The cache takes the hydrated form directly.
 #[derive(Debug, Clone)]
 #[must_use]
 pub struct JvtSnapshot {
@@ -77,12 +50,12 @@ pub struct JvtSnapshot {
     /// The new JVT version (= block height) after applying this snapshot.
     pub new_version: u64,
 
-    /// Nodes created during speculative computation.
-    /// These are inserted directly into the real JVT on apply.
-    pub nodes: Vec<(StoredNodeKey, StoredNode)>,
+    /// Hydrated nodes — canonical form from the JVT computation.
+    pub nodes: Vec<(JvtNodeKey, Arc<JvtNode>)>,
 
-    /// Stale tree parts to prune when applying the snapshot.
-    pub stale_tree_parts: Vec<StaleTreePart>,
+    /// Stale node keys for GC tracking. Stored in serialized form because
+    /// they're persisted to RocksDB and read back during GC.
+    pub stale_node_keys: Vec<StoredNodeKey>,
 
     /// Associations between JVT leaf nodes and their substate values.
     ///
@@ -106,7 +79,7 @@ impl JvtSnapshot {
             result_root,
             new_version,
             nodes: collected.nodes,
-            stale_tree_parts: collected.stale_tree_parts,
+            stale_node_keys: collected.stale_node_keys,
             leaf_substate_associations: Vec::new(),
         }
     }

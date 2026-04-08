@@ -223,7 +223,7 @@ impl RocksDbStorage {
         }
 
         let nodes_count = jvt_snapshot.nodes.len();
-        let stale_count = jvt_snapshot.stale_tree_parts.len();
+        let stale_count = jvt_snapshot.stale_node_keys.len();
         let associations_count = jvt_snapshot.leaf_substate_associations.len();
         let new_version = jvt_snapshot.new_version;
         let new_root = jvt_snapshot.result_root;

@@ -104,4 +104,9 @@ pub mod jmt {
     };
     pub use hyperscale_state_tree::CollectedWrites;
     pub use hyperscale_state_tree::NodeCache;
+
+    // Re-export JVT node types used by CollectedWrites and NodeCache.
+    // and NodeCache::populate.
+    pub use hyperscale_state_tree::JvtNode;
+    pub use hyperscale_state_tree::JvtNodeKey;
 }

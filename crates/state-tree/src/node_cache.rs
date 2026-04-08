@@ -22,8 +22,6 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use jellyfish_verkle_tree as jvt;
 
-use crate::tree_store::{StoredNode, StoredNodeKey};
-
 /// Shared node cache for hydrated JVT nodes.
 ///
 /// Thread-safe (`Send + Sync`). Populated only during block commits and
@@ -56,22 +54,19 @@ impl NodeCache {
 
     /// Bulk-insert nodes after a committed block.
     ///
-    /// Called after `put_at_version` + RocksDB write to populate the cache
-    /// with the newly created nodes. Re-hydrates from `StoredNode` since
-    /// the serialized form is what survives in `CollectedWrites`/`JvtSnapshot`.
-    pub fn populate(&self, nodes: &[(StoredNodeKey, StoredNode)]) {
-        for (stored_key, stored_node) in nodes {
-            let jvt_key = stored_key.to_jvt();
-            let jvt_node = Arc::new(stored_node.to_jvt());
-            self.inner.insert(jvt_key, jvt_node);
+    /// Takes `(NodeKey, Arc<Node>)` pairs directly from
+    /// `CollectedWrites::nodes` — no conversion needed.
+    pub fn populate(&self, nodes: &[(jvt::NodeKey, Arc<jvt::Node>)]) {
+        for (key, node) in nodes {
+            self.inner.insert(key.clone(), Arc::clone(node));
         }
     }
 
     /// Remove a node from the cache.
     ///
     /// Called during JVT GC when stale nodes are deleted from RocksDB.
-    pub fn remove(&self, key: &StoredNodeKey) {
-        self.inner.remove(&key.to_jvt());
+    pub fn remove(&self, key: &jvt::NodeKey) {
+        self.inner.remove(key);
     }
 
     /// Number of entries currently in the cache.
