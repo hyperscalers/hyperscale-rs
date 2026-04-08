@@ -381,7 +381,7 @@ impl Simulator {
                                 );
                             }
                             TransactionStatus::Completed(TransactionDecision::Reject)
-                            | TransactionStatus::Aborted { .. } => {
+                            | TransactionStatus::Completed(TransactionDecision::Aborted) => {
                                 // Transaction was rejected or aborted
                                 self.metrics.record_rejection();
                                 debug!(?hash, %status, "Transaction rejected/aborted");

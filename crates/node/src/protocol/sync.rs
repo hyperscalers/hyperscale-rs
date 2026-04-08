@@ -17,7 +17,7 @@ use hyperscale_messages::request::GetBlockRequest;
 use hyperscale_messages::response::GetBlockResponse;
 use hyperscale_metrics as metrics;
 use hyperscale_storage::ConsensusStore;
-use hyperscale_types::{Block, Hash, QuorumCertificate, TransactionDecision};
+use hyperscale_types::{Block, BlockHeight, Hash, QuorumCertificate, TopologySnapshot};
 use serde::Serialize;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
@@ -378,39 +378,37 @@ impl SyncProtocol {
 /// without re-executing. Returns not_found if any data is missing.
 pub fn serve_block_request(
     storage: &impl ConsensusStore,
+    topology: &TopologySnapshot,
     req: GetBlockRequest,
 ) -> GetBlockResponse {
     trace!(height = req.height.0, "Handling block sync request");
     match storage.get_block_for_sync(req.height) {
         Some((block, qc)) => {
-            // Collect receipts for each non-aborted certificate.
-            // Aborted certificates have no receipts — execution never ran,
-            // so there are no state changes or receipts to sync.
-            let certs_needing_receipts: Vec<_> = block
-                .certificates
-                .iter()
-                .filter(|c| c.decision != TransactionDecision::Aborted)
-                .collect();
-            let mut ledger_receipts = Vec::with_capacity(certs_needing_receipts.len());
-            for cert in &certs_needing_receipts {
-                let tx_hash = cert.transaction_hash;
-                if let Some(receipt) = storage.get_ledger_receipt(&tx_hash) {
-                    ledger_receipts.push(hyperscale_types::LedgerReceiptEntry {
-                        tx_hash,
-                        receipt: (*receipt).clone(),
-                    });
+            // Collect receipts for transactions covered by wave certs in this block.
+            // Wave certs are lean (no per-tx data). For each completed wave cert,
+            // look up the source block (at wave_id.block_height) and derive which
+            // txs the wave covers via derive_wave_tx_hashes. Then look up receipts
+            // for those txs. This matches the proposer's state_root computation.
+            let mut ledger_receipts = Vec::new();
+            for wc in &block.certificates {
+                if !wc.is_completed() {
+                    continue;
                 }
-            }
-
-            if ledger_receipts.len() != certs_needing_receipts.len() {
-                warn!(
-                    height = req.height.0,
-                    expected = certs_needing_receipts.len(),
-                    found = ledger_receipts.len(),
-                    "Missing receipts for block certificates — \
-                     returning not_found so requester tries another peer"
-                );
-                return GetBlockResponse::not_found();
+                let source_height = BlockHeight(wc.wave_id.block_height);
+                let source_txs = match storage.get_block(source_height) {
+                    Some((source_block, _)) => source_block.transactions,
+                    None => continue,
+                };
+                let tx_hashes =
+                    hyperscale_types::derive_wave_tx_hashes(topology, &wc.wave_id, &source_txs);
+                for tx_hash in tx_hashes {
+                    if let Some(receipt) = storage.get_ledger_receipt(&tx_hash) {
+                        ledger_receipts.push(hyperscale_types::LedgerReceiptEntry {
+                            tx_hash,
+                            receipt: (*receipt).clone(),
+                        });
+                    }
+                }
             }
 
             // Collect local ECs for this block height.
@@ -418,7 +416,7 @@ pub fn serve_block_request(
                 storage.get_execution_certificates_by_height(block.header.height.0);
 
             // Serve all local ECs for this height. The syncing node verifies
-            // EC integrity via the QC-attested receipt_root (which transitively
+            // EC integrity via the QC-attested certificate_root (which transitively
             // commits to ec_hashes). No canonical_hash matching here — validators
             // may aggregate at different vote_heights, producing genuinely
             // different ECs for the same wave (D1 edge case).

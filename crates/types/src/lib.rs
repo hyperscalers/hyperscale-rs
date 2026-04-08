@@ -31,6 +31,7 @@ mod state;
 mod topology;
 mod transaction;
 mod validator;
+mod wave_certificate;
 
 // Re-export crypto types and helpers
 pub use crypto::{
@@ -75,12 +76,12 @@ pub use signing::{
 };
 
 pub use block::{
-    compute_receipt_root, compute_transaction_root, tx_inclusion_proof, tx_inclusion_proofs, Block,
-    BlockHeader, BlockManifest, BlockMetadata, CommittedBlockHeader,
+    compute_certificate_root, compute_transaction_root, tx_inclusion_proof, tx_inclusion_proofs,
+    Block, BlockHeader, BlockManifest, BlockMetadata, CommittedBlockHeader,
 };
 pub use execution_vote::{
-    compute_receipt_root_with_proof, compute_waves, tx_outcome_leaf, wave_leader,
-    ExecutionCertificate, ExecutionVote, TxExecutionOutcome, TxOutcome, WaveId,
+    compute_receipt_root_with_proof, compute_waves, derive_wave_tx_hashes, tx_outcome_leaf,
+    wave_leader, ExecutionCertificate, ExecutionVote, TxExecutionOutcome, TxOutcome, WaveId,
 };
 pub use quorum_certificate::QuorumCertificate;
 pub use receipt::{
@@ -93,10 +94,13 @@ pub use state::{ShardExecutionProof, StateEntry, StateProvision};
 pub use topology::{node_id_hash_u64, shard_for_node, TopologySnapshot, TopologySnapshotError};
 pub use transaction::{
     sign_and_notarize, sign_and_notarize_with_options, AbortIntent, AbortReason, ReadyTransactions,
-    RoutableTransaction, TransactionCertificate, TransactionDecision, TransactionError,
-    TransactionStatus, TransactionStatusParseError,
+    RoutableTransaction, TransactionDecision, TransactionError, TransactionStatus,
+    TransactionStatusParseError,
 };
 pub use validator::{ValidatorInfo, ValidatorSet};
+pub use wave_certificate::{
+    decode_wave_cert_vec, encode_wave_cert_vec, ShardAttestation, WaveCertificate, WaveResolution,
+};
 // Re-export as compute_receipt_root would conflict with block::compute_receipt_root
 pub use execution_vote::compute_receipt_root as compute_execution_receipt_root;
 

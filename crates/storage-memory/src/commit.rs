@@ -4,7 +4,7 @@ use crate::core::SimStorage;
 use crate::state::apply_updates_to_ordmap;
 
 use hyperscale_storage::{CommitStore, DatabaseUpdates, JvtSnapshot};
-use hyperscale_types::{Hash, TransactionCertificate};
+use hyperscale_types::{Hash, WaveCertificate};
 use im::OrdMap;
 use std::sync::Arc;
 
@@ -81,7 +81,7 @@ impl CommitStore for SimStorage {
     fn commit_prepared_block(
         &self,
         prepared: Self::PreparedCommit,
-        certificates: &[Arc<TransactionCertificate>],
+        certificates: &[Arc<WaveCertificate>],
         consensus: Option<hyperscale_storage::ConsensusCommitData>,
         _execution_certificates: &[hyperscale_types::ExecutionCertificate],
     ) -> Hash {
@@ -113,8 +113,12 @@ impl CommitStore for SimStorage {
                 // Store certificates + consensus metadata atomically in consensus lock.
                 let mut c = self.consensus.write().unwrap();
                 for cert in certificates {
-                    c.certificates
-                        .insert(cert.transaction_hash, (**cert).clone());
+                    let wave_id_hash = cert.wave_id.hash();
+                    c.certificates.insert(wave_id_hash, (**cert).clone());
+                    c.wave_certs_by_height
+                        .entry(cert.wave_id.block_height)
+                        .or_default()
+                        .push(wave_id_hash);
                 }
                 if let Some(consensus) = consensus {
                     c.committed_height = consensus.height;
@@ -141,7 +145,7 @@ impl CommitStore for SimStorage {
     fn commit_block(
         &self,
         merged_updates: &DatabaseUpdates,
-        certificates: &[Arc<TransactionCertificate>],
+        certificates: &[Arc<WaveCertificate>],
         block_height: u64,
         consensus: Option<hyperscale_storage::ConsensusCommitData>,
         _execution_certificates: &[hyperscale_types::ExecutionCertificate],
@@ -186,9 +190,9 @@ impl CommitStore for SimStorage {
             s.tree_store
                 .insert(key.clone(), std::sync::Arc::clone(node));
         }
-        for stale_key in &collected.stale_node_keys {
-            s.tree_store.remove(stale_key);
-        }
+        // NOTE: stale JVT nodes are NOT deleted — see apply_jvt_snapshot comment.
+        // Historical roots must be retained for provision proof generation at
+        // past block heights. RocksDB GC handles pruning in production.
 
         s.current_block_height = block_height;
         s.current_root_hash = new_root;
@@ -199,8 +203,12 @@ impl CommitStore for SimStorage {
         {
             let mut c = self.consensus.write().unwrap();
             for cert in certificates {
-                c.certificates
-                    .insert(cert.transaction_hash, (**cert).clone());
+                let wave_id_hash = cert.wave_id.hash();
+                c.certificates.insert(wave_id_hash, (**cert).clone());
+                c.wave_certs_by_height
+                    .entry(cert.wave_id.block_height)
+                    .or_default()
+                    .push(wave_id_hash);
             }
             if let Some(consensus) = consensus {
                 c.committed_height = consensus.height;

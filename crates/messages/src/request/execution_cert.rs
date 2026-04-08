@@ -41,7 +41,11 @@ mod tests {
     fn test_sbor_roundtrip() {
         let request = GetExecutionCertsRequest {
             block_height: 42,
-            wave_ids: vec![WaveId(BTreeSet::from([ShardGroupId(1), ShardGroupId(2)]))],
+            wave_ids: vec![WaveId::new(
+                ShardGroupId(0),
+                42,
+                BTreeSet::from([ShardGroupId(1), ShardGroupId(2)]),
+            )],
         };
 
         let encoded = sbor::basic_encode(&request).unwrap();

@@ -76,8 +76,6 @@ where
                 let tx_count = tx_outcomes.len() as u32;
                 // Sign the execution vote inline (BLS signing is fast, ~1ms)
                 let msg = hyperscale_types::exec_vote_message(
-                    &block_hash,
-                    block_height,
                     vote_height,
                     &wave_id,
                     self.local_shard,
@@ -128,7 +126,7 @@ where
                 // Each cert already covers a whole wave — send immediately, no accumulator.
                 let cert = std::sync::Arc::unwrap_or_clone(certificate);
                 let msg = hyperscale_types::exec_cert_batch_message(
-                    cert.shard_group_id,
+                    cert.shard_group_id(),
                     std::slice::from_ref(&cert),
                 );
                 let sig = self.signing_key.sign_v1(&msg);
@@ -140,7 +138,8 @@ where
                 self.network.notify(&recipients, &batch);
             }
             Action::PersistExecutionCertificate { certificate } => {
-                let key = (certificate.block_hash, certificate.wave_id.clone());
+                let block_height = certificate.block_height();
+                let key = (certificate.wave_id.hash(), certificate.wave_id.clone());
                 // Queue for atomic persistence in the next block commit WriteBatch.
                 self.pending_ec_writes
                     .push(std::sync::Arc::unwrap_or_clone(certificate.clone()));
@@ -150,13 +149,14 @@ where
                     if cache.len() > 2000 {
                         let cutoff = cache
                             .values()
-                            .map(|c| c.block_height)
+                            .map(|c| c.block_height())
                             .max()
                             .unwrap_or(0)
                             .saturating_sub(500);
-                        cache.retain(|_, c| c.block_height > cutoff);
+                        cache.retain(|_, c| c.block_height() > cutoff);
                     }
                 }
+                let _ = block_height;
             }
             // ═══════════════════════════════════════════════════════════
             // Delegated work — batched (accumulated for batch dispatch)
@@ -175,7 +175,7 @@ where
             | Action::VerifyRemoteHeaderQc { .. }
             | Action::VerifyStateRoot { .. }
             | Action::VerifyTransactionRoot { .. }
-            | Action::VerifyReceiptRoot { .. }
+            | Action::VerifyCertificateRoot { .. }
             | Action::VerifyAbortIntentProofs { .. }
             | Action::BuildProposal { .. }
             | Action::VerifyProvisionBatch { .. }
@@ -201,7 +201,7 @@ where
             // Storage
             // ═══════════════════════════════════════════════════════════
             Action::PersistBlock { .. }
-            | Action::PersistTransactionCertificate { .. }
+            | Action::CacheWaveCertificate { .. }
             | Action::PersistAndBroadcastVote { .. }
             | Action::FetchBlock { .. }
             | Action::FetchChainMetadata => {
@@ -227,19 +227,27 @@ where
                     let now = self.state.now();
                     let latency_secs = now.saturating_sub(added_at).as_secs_f64();
                     if latency_secs > 10.0 {
-                        if let Some(ref phases) = phase_times {
-                            warn!(
-                                ?tx_hash,
-                                latency_secs,
-                                cross_shard,
-                                %phases,
-                                "Transaction finalization exceeded 10s"
-                            );
-                        } else {
-                            warn!(
-                                ?tx_hash,
-                                latency_secs, cross_shard, "Transaction finalization exceeded 10s"
-                            );
+                        // Rate-limit slow tx warnings to avoid log floods during
+                        // cross-shard latency spikes.
+                        let since_last_warn = now.saturating_sub(self.last_slow_tx_warn);
+                        if since_last_warn >= std::time::Duration::from_secs(30) {
+                            self.last_slow_tx_warn = now;
+                            if let Some(ref phases) = phase_times {
+                                warn!(
+                                    ?tx_hash,
+                                    latency_secs,
+                                    cross_shard,
+                                    %phases,
+                                    "Transaction finalization exceeded 10s"
+                                );
+                            } else {
+                                warn!(
+                                    ?tx_hash,
+                                    latency_secs,
+                                    cross_shard,
+                                    "Transaction finalization exceeded 10s"
+                                );
+                            }
                         }
                     }
                     metrics::record_transaction_finalized(latency_secs, cross_shard);
@@ -311,12 +319,12 @@ where
                 let height = block.header.height;
                 ConsensusStore::put_block(&*self.storage, height, &block, &qc);
             }
-            Action::PersistTransactionCertificate { certificate } => {
-                // Populate cert cache before persisting — serves peer fetch requests
-                // from memory even if storage write hasn't completed.
+            Action::CacheWaveCertificate { certificate } => {
+                // Populate cert cache keyed by wave_id.hash() — this matches
+                // the cert_hashes entries in BlockManifest that peers use to
+                // request missing wave certificates before voting.
                 self.cert_cache
-                    .insert(certificate.transaction_hash, Arc::new(certificate.clone()));
-                self.storage.store_certificate(&certificate);
+                    .insert(certificate.wave_id.hash(), certificate);
             }
             Action::PersistAndBroadcastVote {
                 height,
@@ -579,6 +587,7 @@ where
         let commits = ready_commits;
 
         let storage = Arc::clone(&self.storage);
+        let topology = Arc::clone(&self.topology);
         let event_tx = self.event_sender.clone();
         let in_flight = self.commit_in_flight.clone();
 
@@ -664,7 +673,7 @@ where
                         // Since we're in the commit closure, we use the block's shard.
                         let public_keys: Vec<hyperscale_types::Bls12381G1PublicKey> = vec![];
                         // EC BLS verification is skipped when we don't have public keys
-                        // available in the commit closure. The QC-attested receipt_root
+                        // available in the commit closure. The QC-attested certificate_root
                         // (check 1) transitively commits to ec_hashes via TC::receipt_hash(),
                         // providing equivalent integrity assurance.
                         let _ = (ec, public_keys);
@@ -683,21 +692,25 @@ where
                             &[],
                         )
                     } else {
-                        // Check 3: EC↔TC canonical hash cross-check.
+                        // Check 3: EC↔WaveCert cross-check via attestations.
                         let cross_check_ok = sync_ecs.iter().all(|ec| {
                             let ec_hash = ec.canonical_hash();
-                            // Find any TC that references this EC's hash
-                            block.certificates.iter().any(|tc| {
-                                tc.shard_proofs
-                                    .values()
-                                    .any(|proof| proof.ec_hash() == ec_hash)
+                            // Find any wave cert whose attestations reference this EC
+                            block.certificates.iter().any(|wc| {
+                                if let hyperscale_types::WaveResolution::Completed { attestations } =
+                                    &wc.resolution
+                                {
+                                    attestations.iter().any(|a| a.ec_hash == ec_hash)
+                                } else {
+                                    false
+                                }
                             })
                         });
 
                         if !cross_check_ok {
                             tracing::warn!(
                                 height = height.0,
-                                "Sync: EC↔TC cross-check failed — EC doesn't match any TC"
+                                "Sync: EC↔WaveCert cross-check failed — EC doesn't match any attestation"
                             );
                         }
 
@@ -712,18 +725,36 @@ where
                                 .map(|entry| entry.receipt.database_updates.clone())
                                 .collect()
                         } else {
-                            // Fallback: read from storage.
-                            block
-                                .certificates
-                                .iter()
-                                .filter(|cert| {
-                                    cert.decision != hyperscale_types::TransactionDecision::Aborted
-                                })
-                                .filter_map(|cert| {
-                                    storage.get_ledger_receipt(&cert.transaction_hash)
-                                })
-                                .map(|receipt| receipt.database_updates.clone())
-                                .collect()
+                            // Fallback: derive tx_hashes from wave certs' source blocks.
+                            // Same logic as the sync server and proposal builder.
+                            let topo = topology.load();
+                            let mut updates = Vec::new();
+                            for wc in &block.certificates {
+                                if !wc.is_completed() {
+                                    continue;
+                                }
+                                let source_height =
+                                    hyperscale_types::BlockHeight(wc.wave_id.block_height);
+                                if let Some((source_block, _)) =
+                                    storage.get_block(source_height)
+                                {
+                                    let tx_hashes =
+                                        hyperscale_types::derive_wave_tx_hashes(
+                                            &topo,
+                                            &wc.wave_id,
+                                            &source_block.transactions,
+                                        );
+                                    for tx_hash in tx_hashes {
+                                        if let Some(receipt) =
+                                            storage.get_ledger_receipt(&tx_hash)
+                                        {
+                                            updates
+                                                .push(receipt.database_updates.clone());
+                                        }
+                                    }
+                                }
+                            }
+                            updates
                         };
                         let merged = hyperscale_storage::merge_database_updates(&per_cert);
 
@@ -1029,6 +1060,7 @@ where
         // Clone cheap shared state for the 'static spawn closure.
         let storage = Arc::clone(&self.storage);
         let executor = self.executor.clone();
+        let topology_snapshot = self.topology.load_full();
         let local_shard = self.local_shard;
         let num_shards = self.num_shards;
         let prepared_commits = Arc::clone(&self.prepared_commits);
@@ -1039,6 +1071,7 @@ where
             let ctx = ActionContext {
                 storage: &*storage,
                 executor: &executor,
+                topology: &topology_snapshot,
                 local_shard,
                 num_shards,
             };

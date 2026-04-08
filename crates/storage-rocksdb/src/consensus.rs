@@ -5,7 +5,7 @@ use crate::typed_cf::TypedCf;
 
 use hyperscale_types::{
     Block, BlockHeight, ExecutionCertificate, Hash, QuorumCertificate, RoutableTransaction,
-    TransactionCertificate,
+    ShardGroupId, WaveCertificate,
 };
 use std::sync::Arc;
 
@@ -42,11 +42,11 @@ impl hyperscale_storage::ConsensusStore for RocksDbStorage {
         self.read_latest_qc()
     }
 
-    fn store_certificate(&self, certificate: &TransactionCertificate) {
-        self.put_certificate(&certificate.transaction_hash, certificate);
+    fn store_certificate(&self, certificate: &WaveCertificate) {
+        RocksDbStorage::put_certificate(self, &certificate.wave_id.hash(), certificate);
     }
 
-    fn get_certificate(&self, hash: &Hash) -> Option<TransactionCertificate> {
+    fn get_certificate(&self, hash: &Hash) -> Option<WaveCertificate> {
         RocksDbStorage::get_certificate(self, hash)
     }
 
@@ -74,7 +74,7 @@ impl hyperscale_storage::ConsensusStore for RocksDbStorage {
         RocksDbStorage::get_transactions_batch(self, hashes)
     }
 
-    fn get_certificates_batch(&self, hashes: &[Hash]) -> Vec<TransactionCertificate> {
+    fn get_certificates_batch(&self, hashes: &[Hash]) -> Vec<WaveCertificate> {
         RocksDbStorage::get_certificates_batch(self, hashes)
     }
 
@@ -127,5 +127,31 @@ impl hyperscale_storage::ConsensusStore for RocksDbStorage {
         self.db
             .write_opt(batch, &write_opts)
             .expect("BFT SAFETY CRITICAL: EC write failed");
+    }
+
+    fn get_wave_certificates_by_height(&self, block_height: u64) -> Vec<WaveCertificate> {
+        // TODO: add a dedicated `wave_certs_by_height` CF for O(1) lookup.
+        // For now, scan all certificates and filter by wave_id.block_height.
+        let cf = crate::column_families::CertificatesCf::handle(&self.cf());
+        let mut result = Vec::new();
+        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+        for (_key, value) in iter.flatten() {
+            if let Ok(cert) = sbor::basic_decode::<WaveCertificate>(&value) {
+                if cert.wave_id.block_height == block_height {
+                    result.push(cert);
+                }
+            }
+        }
+        result
+    }
+
+    fn get_wave_certificate_for_tx(&self, _tx_hash: &Hash) -> Option<WaveCertificate> {
+        // TODO: populate and read a `tx_to_wave` CF at block commit time.
+        None
+    }
+
+    fn get_ec_hashes_for_tx(&self, _tx_hash: &Hash) -> Option<Vec<(ShardGroupId, Hash)>> {
+        // TODO: populate and read a `tx_to_ec` CF at block commit time.
+        None
     }
 }

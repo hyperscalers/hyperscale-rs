@@ -46,8 +46,8 @@ use hyperscale_network::Network;
 use hyperscale_storage::{CommitStore, ConsensusStore, SubstateStore};
 use hyperscale_types::{
     Block, Bls12381G1PrivateKey, Bls12381G1PublicKey, CommittedBlockHeader, ExecutionCertificate,
-    Hash, QuorumCertificate, RoutableTransaction, ShardGroupId, TopologySnapshot,
-    TransactionCertificate, ValidatorId, WaveId,
+    Hash, QuorumCertificate, RoutableTransaction, ShardGroupId, TopologySnapshot, ValidatorId,
+    WaveCertificate, WaveId,
 };
 use quick_cache::sync::Cache as QuickCache;
 use std::collections::{HashMap, HashSet};
@@ -176,7 +176,7 @@ where
     prepared_commits: Arc<Mutex<HashMap<Hash, (u64, S::PreparedCommit)>>>,
 
     // In-memory caches (shared with inbound router in production)
-    cert_cache: Arc<QuickCache<Hash, Arc<TransactionCertificate>>>,
+    cert_cache: Arc<QuickCache<Hash, Arc<WaveCertificate>>>,
     tx_cache: Arc<QuickCache<Hash, Arc<RoutableTransaction>>>,
 
     // Sync protocol
@@ -227,6 +227,10 @@ where
     // that has emitted a status notification. Bounded LRU cache shared (via Arc)
     // with external consumers (e.g. RPC handlers in production).
     tx_status_cache: Arc<QuickCache<Hash, hyperscale_types::TransactionStatus>>,
+
+    /// Last time a "transaction finalization exceeded 10s" warning was emitted.
+    /// Rate-limited to avoid flooding logs during cross-shard latency spikes.
+    last_slow_tx_warn: std::time::Duration,
 
     // Execution certificate cache for fallback serving.
     // Shared with request handler thread. Keyed by (block_hash, wave_id).
@@ -330,6 +334,7 @@ where
             pending_sync_data: std::collections::HashMap::new(),
             cached_local_peers,
             tx_status_cache: Arc::new(QuickCache::new(DEFAULT_TX_STATUS_CACHE_SIZE)),
+            last_slow_tx_warn: std::time::Duration::ZERO,
             emitted_statuses: Vec::new(),
             actions_generated: 0,
             pending_timer_ops: Vec::new(),
@@ -555,15 +560,15 @@ where
             } => {
                 // Check 1: receipt_root verification (synchronous).
                 // Verify block body matches the QC-attested header.
-                let receipt_root_valid = match *block {
+                let certificate_root_valid = match *block {
                     Some((ref b, _)) if !b.certificates.is_empty() => {
-                        let computed = hyperscale_types::compute_receipt_root(&b.certificates);
-                        if computed != b.header.receipt_root {
+                        let computed = hyperscale_types::compute_certificate_root(&b.certificates);
+                        if computed != b.header.certificate_root {
                             tracing::warn!(
                                 height,
                                 ?computed,
-                                expected = ?b.header.receipt_root,
-                                "Sync: receipt_root mismatch — rejecting response"
+                                expected = ?b.header.certificate_root,
+                                "Sync: certificate_root mismatch — rejecting response"
                             );
                             false
                         } else {
@@ -573,7 +578,7 @@ where
                     _ => true, // Empty block or no block — no root to check
                 };
 
-                if !receipt_root_valid {
+                if !certificate_root_valid {
                     let _ = self
                         .event_sender
                         .send(NodeInput::SyncBlockFetchFailed { height });
@@ -1043,12 +1048,12 @@ where
             bft_buffered_synced_blocks: bft_mem.buffered_synced_blocks,
             // Execution
             exec_cache_entries: exec_mem.receipts_emitted,
-            exec_finalized_certificates: exec_mem.finalized_certificates,
+            exec_finalized_wave_certificates: exec_mem.finalized_wave_certificates,
             exec_pending_provisioning: exec_mem.pending_provisioning,
             exec_accumulators: exec_mem.accumulators,
             exec_vote_trackers: exec_mem.vote_trackers,
             exec_early_votes: exec_mem.early_votes,
-            exec_certificate_trackers: exec_mem.certificate_trackers,
+            exec_wave_certificate_trackers: exec_mem.wave_certificate_trackers,
             exec_expected_exec_certs: exec_mem.expected_exec_certs,
             // Mempool
             mempool_pool: mempool_mem.pool,

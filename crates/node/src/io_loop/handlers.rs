@@ -34,9 +34,11 @@ where
         // ── block.request → sync protocol ────────────────────────────
 
         let storage = Arc::clone(&self.storage);
+        let topology = Arc::clone(&self.topology);
         self.network
             .register_request_handler::<GetBlockRequest>(move |req| {
-                serve_block_request(&*storage, req)
+                let topo = topology.load();
+                serve_block_request(&*storage, &topo, req)
             });
 
         // ── transaction.request → fetch protocol ─────────────────────
@@ -212,7 +214,7 @@ where
                     let mut certs = Vec::new();
                     for wave_id in &req.wave_ids {
                         for ((_, cached_wave), cert) in guard.iter() {
-                            if cert.block_height == req.block_height && cached_wave == wave_id {
+                            if cert.block_height() == req.block_height && cached_wave == wave_id {
                                 certs.push(cert.as_ref().clone());
                             }
                         }
@@ -475,11 +477,11 @@ where
 
                     let topo = topology.load();
                     let sender = batch.sender;
-                    let source_shard = batch.certificates[0].shard_group_id;
+                    let source_shard = batch.certificates[0].shard_group_id();
                     if batch
                         .certificates
                         .iter()
-                        .any(|c| c.shard_group_id != source_shard)
+                        .any(|c| c.shard_group_id() != source_shard)
                     {
                         warn!(
                             sender = sender.0,

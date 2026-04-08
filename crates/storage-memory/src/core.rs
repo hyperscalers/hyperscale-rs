@@ -11,7 +11,7 @@ use hyperscale_storage::{
 };
 use hyperscale_types::Hash;
 #[cfg(test)]
-use hyperscale_types::TransactionCertificate;
+use hyperscale_types::WaveCertificate;
 use std::sync::{Arc, RwLock};
 
 /// In-memory storage for simulation and testing.
@@ -98,7 +98,7 @@ impl SimStorage {
     #[cfg(test)]
     pub fn commit_certificate_with_writes(
         &self,
-        certificate: &TransactionCertificate,
+        certificate: &WaveCertificate,
         updates: &hyperscale_storage::DatabaseUpdates,
     ) {
         {
@@ -115,7 +115,7 @@ impl SimStorage {
             .write()
             .unwrap()
             .certificates
-            .insert(certificate.transaction_hash, certificate.clone());
+            .insert(certificate.wave_id.hash(), certificate.clone());
     }
 
     /// Test helper: commits database updates with auto-incrementing JVT version.

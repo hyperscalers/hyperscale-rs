@@ -1,12 +1,11 @@
 //! `CommitStore` implementation for `RocksDbStorage`.
 
-use crate::column_families::CertificatesCf;
 use crate::column_families::ALL_COLUMN_FAMILIES;
 use crate::core::RocksDbStorage;
 use crate::jvt_snapshot_store::SnapshotTreeStore;
 
 use hyperscale_storage::{DatabaseUpdates, JvtSnapshot};
-use hyperscale_types::TransactionCertificate;
+use hyperscale_types::WaveCertificate;
 use rocksdb::WriteBatch;
 use std::sync::Arc;
 
@@ -57,17 +56,21 @@ impl hyperscale_storage::CommitStore for RocksDbStorage {
     fn commit_prepared_block(
         &self,
         prepared: Self::PreparedCommit,
-        certificates: &[Arc<TransactionCertificate>],
+        certificates: &[Arc<WaveCertificate>],
         consensus: Option<hyperscale_storage::ConsensusCommitData>,
         execution_certificates: &[hyperscale_types::ExecutionCertificate],
     ) -> hyperscale_types::Hash {
         let block_height = prepared.jvt_snapshot.new_version;
         let result_root = prepared.jvt_snapshot.result_root;
 
-        // Append certificate storage to the write batch.
+        // Append wave certificates + execution certificates to the write batch.
         let mut write_batch = prepared.write_batch;
         for cert in certificates {
-            self.cf_put::<CertificatesCf>(&mut write_batch, &cert.transaction_hash, cert.as_ref());
+            self.cf_put::<crate::column_families::CertificatesCf>(
+                &mut write_batch,
+                &cert.wave_id.hash(),
+                cert.as_ref(),
+            );
         }
         crate::execution_certs::append_execution_certs_to_batch(
             self,
@@ -97,7 +100,7 @@ impl hyperscale_storage::CommitStore for RocksDbStorage {
     fn commit_block(
         &self,
         merged_updates: &DatabaseUpdates,
-        certificates: &[Arc<TransactionCertificate>],
+        certificates: &[Arc<WaveCertificate>],
         block_height: u64,
         consensus: Option<hyperscale_storage::ConsensusCommitData>,
         execution_certificates: &[hyperscale_types::ExecutionCertificate],
@@ -120,9 +123,13 @@ impl hyperscale_storage::CommitStore for RocksDbStorage {
         let (mut batch, reset_old_keys) =
             self.build_substate_write_batch(merged_updates, Some(block_height));
 
-        // Store certificates to the certificate CF.
+        // Store wave certificates atomically in the same batch.
         for cert in certificates {
-            self.cf_put::<CertificatesCf>(&mut batch, &cert.transaction_hash, cert.as_ref());
+            self.cf_put::<crate::column_families::CertificatesCf>(
+                &mut batch,
+                &cert.wave_id.hash(),
+                cert.as_ref(),
+            );
         }
 
         // Store execution certificates atomically in the same batch.

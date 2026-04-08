@@ -5,8 +5,8 @@
 
 use hyperscale_types::{
     Block, BlockHeight, ExecutionCertificate, Hash, LedgerTransactionReceipt,
-    LocalTransactionExecution, QuorumCertificate, ReceiptBundle, RoutableTransaction,
-    TransactionCertificate,
+    LocalTransactionExecution, QuorumCertificate, ReceiptBundle, RoutableTransaction, ShardGroupId,
+    WaveCertificate,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -37,11 +37,11 @@ pub trait ConsensusStore: Send + Sync {
     /// Get the latest quorum certificate.
     fn latest_qc(&self) -> Option<QuorumCertificate>;
 
-    /// Store a transaction certificate (extracts hash internally).
-    fn store_certificate(&self, certificate: &TransactionCertificate);
+    /// Store a wave certificate (keyed by wave_id hash).
+    fn store_certificate(&self, certificate: &WaveCertificate);
 
-    /// Get a transaction certificate by transaction hash.
-    fn get_certificate(&self, hash: &Hash) -> Option<TransactionCertificate>;
+    /// Get a wave certificate by wave_id hash.
+    fn get_certificate(&self, hash: &Hash) -> Option<WaveCertificate>;
 
     /// Store our own vote for a height.
     ///
@@ -75,7 +75,7 @@ pub trait ConsensusStore: Send + Sync {
     /// Get multiple certificates by hash (batch read).
     ///
     /// Returns only certificates that were found (missing hashes are skipped).
-    fn get_certificates_batch(&self, hashes: &[Hash]) -> Vec<TransactionCertificate>;
+    fn get_certificates_batch(&self, hashes: &[Hash]) -> Vec<WaveCertificate>;
 
     // ─── Receipt Storage ──────────────────────────────────────────────────
 
@@ -122,4 +122,24 @@ pub trait ConsensusStore: Send + Sync {
     /// committed. Not used on the primary commit path (D4 folds EC writes into
     /// `commit_block`/`commit_prepared_block`).
     fn store_execution_certificates(&self, certs: &[ExecutionCertificate]);
+
+    // ─── Wave Certificate Indexes ─────────────────────────────────────────
+
+    /// Get all wave certificates at a given block height.
+    ///
+    /// Used for sync serving — callers retrieve all certs committed at a
+    /// height without knowing their wave_id hashes upfront.
+    fn get_wave_certificates_by_height(&self, height: u64) -> Vec<WaveCertificate>;
+
+    /// Get the wave certificate that finalized a given transaction.
+    ///
+    /// Returns `None` if no wave cert has been recorded for this tx.
+    fn get_wave_certificate_for_tx(&self, tx_hash: &Hash) -> Option<WaveCertificate>;
+
+    /// Get the execution certificate hashes associated with a transaction.
+    ///
+    /// Returns the `(ShardGroupId, ec_hash)` pairs from every shard that
+    /// produced an EC covering this transaction. Returns `None` if no
+    /// index entry exists for this tx.
+    fn get_ec_hashes_for_tx(&self, tx_hash: &Hash) -> Option<Vec<(ShardGroupId, Hash)>>;
 }

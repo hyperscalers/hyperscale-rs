@@ -20,6 +20,7 @@ use tracing::warn;
 pub(crate) struct ActionContext<'a, S: CommitStore + SubstateStore + ConsensusStore> {
     pub storage: &'a S,
     pub executor: &'a RadixExecutor,
+    pub topology: &'a hyperscale_types::TopologySnapshot,
     pub local_shard: ShardGroupId,
     pub num_shards: u64,
 }
@@ -57,7 +58,7 @@ pub(crate) fn dispatch_pool_for(action: &Action) -> Option<DispatchPool> {
         Action::VerifyRemoteHeaderQc { .. } => Some(DispatchPool::ConsensusCrypto),
         Action::VerifyStateRoot { .. } => Some(DispatchPool::ConsensusCrypto),
         Action::VerifyTransactionRoot { .. } => Some(DispatchPool::ConsensusCrypto),
-        Action::VerifyReceiptRoot { .. } => Some(DispatchPool::ConsensusCrypto),
+        Action::VerifyCertificateRoot { .. } => Some(DispatchPool::ConsensusCrypto),
         Action::VerifyAbortIntentProofs { .. } => Some(DispatchPool::ConsensusCrypto),
         Action::BuildProposal { .. } => Some(DispatchPool::ConsensusCrypto),
 
@@ -208,22 +209,22 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
             })
         }
 
-        Action::VerifyReceiptRoot {
+        Action::VerifyCertificateRoot {
             block_hash,
             expected_root,
             certificates,
         } => {
             let start = std::time::Instant::now();
-            let valid = hyperscale_bft::handlers::verify_receipt_root(expected_root, &certificates);
+            let valid =
+                hyperscale_bft::handlers::verify_certificate_root(expected_root, &certificates);
             metrics::record_signature_verification_latency(
-                "receipt_root",
+                "certificate_root",
                 start.elapsed().as_secs_f64(),
             );
             Some(DelegatedResult {
-                events: vec![NodeInput::Protocol(ProtocolEvent::ReceiptRootVerified {
-                    block_hash,
-                    valid,
-                })],
+                events: vec![NodeInput::Protocol(
+                    ProtocolEvent::CertificateRootVerified { block_hash, valid },
+                )],
                 prepared_commit: None,
             })
         }
@@ -310,23 +311,46 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
             abort_intents,
             waves,
         } => {
-            // Read shard-filtered DatabaseUpdates directly from stored receipts.
-            let per_cert: Vec<hyperscale_types::DatabaseUpdates> = certificates
-                .iter()
-                .filter(|c| c.decision != hyperscale_types::TransactionDecision::Aborted)
-                .map(|c| {
-                    let receipt = ctx
-                        .storage
-                        .get_ledger_receipt(&c.transaction_hash)
-                        .unwrap_or_else(|| {
-                            panic!(
-                                "BUG: receipt missing for {} during proposal at height {}",
-                                c.transaction_hash, height.0
-                            )
-                        });
-                    receipt.database_updates.clone()
-                })
-                .collect();
+            // Derive per-tx receipt hashes from wave certs' WaveIds.
+            // Each wave cert's WaveId references a source block (by block_height).
+            // We look up that source block's transactions from storage and use
+            // derive_wave_tx_hashes to identify which txs belong to each wave.
+            // Derive per-tx receipt hashes from wave certs' WaveIds.
+            // Each wave cert references a source block (by block_height). Look up
+            // that block's transactions to identify which txs the wave covers.
+            let mut per_cert: Vec<hyperscale_types::DatabaseUpdates> = Vec::new();
+            let mut receipt_tx_hashes: Vec<hyperscale_types::Hash> = Vec::new();
+            for wc in &certificates {
+                if !wc.is_completed() {
+                    continue;
+                }
+                let source_height = hyperscale_types::BlockHeight(wc.wave_id.block_height);
+                let source_txs = match ctx.storage.get_block(source_height) {
+                    Some((source_block, _)) => source_block.transactions,
+                    None => {
+                        tracing::warn!(
+                            wave = %wc.wave_id,
+                            height = source_height.0,
+                            "Source block not found for wave cert — skipping receipts"
+                        );
+                        continue;
+                    }
+                };
+                let tx_hashes =
+                    hyperscale_types::derive_wave_tx_hashes(ctx.topology, &wc.wave_id, &source_txs);
+                for tx_hash in tx_hashes {
+                    if let Some(receipt) = ctx.storage.get_ledger_receipt(&tx_hash) {
+                        per_cert.push(receipt.database_updates.clone());
+                        receipt_tx_hashes.push(tx_hash);
+                    } else {
+                        tracing::warn!(
+                            %tx_hash,
+                            height = height.0,
+                            "Receipt missing for tx during proposal — skipping"
+                        );
+                    }
+                }
+            }
             let merged_updates = hyperscale_storage::merge_database_updates(&per_cert);
             let result = hyperscale_bft::handlers::build_proposal(
                 ctx.storage,
@@ -354,6 +378,7 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
                     round,
                     block: Arc::new(result.block),
                     block_hash: result.block_hash,
+                    receipt_tx_hashes,
                 })],
                 prepared_commit: prepared,
             })
@@ -410,6 +435,7 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
         Action::VerifyExecutionCertificateSignature {
             certificate,
             public_keys,
+            ..
         } => {
             let valid = hyperscale_execution::handlers::verify_execution_certificate_signature(
                 &certificate,

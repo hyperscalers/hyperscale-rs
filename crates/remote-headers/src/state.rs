@@ -17,7 +17,7 @@ use hyperscale_types::{
 };
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 /// Number of block heights to retain remote headers below each shard's tip.
 const REMOTE_HEADER_RETENTION_BLOCKS: u64 = 50;
@@ -353,7 +353,7 @@ impl RemoteHeaderCoordinator {
                 continue;
             }
 
-            warn!(
+            info!(
                 source_shard = shard.0,
                 from_height = from_height.0,
                 age_blocks = age,
@@ -517,7 +517,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
-            receipt_root: Hash::ZERO,
+            certificate_root: Hash::ZERO,
             waves: vec![],
         };
         let mut qc = QuorumCertificate::genesis();

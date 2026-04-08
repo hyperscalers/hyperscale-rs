@@ -1,6 +1,6 @@
 //! Certificate fetch response.
 
-use hyperscale_types::{MessagePriority, NetworkMessage, TransactionCertificate};
+use hyperscale_types::{MessagePriority, NetworkMessage, WaveCertificate};
 use std::sync::Arc;
 
 /// Response to a certificate fetch request.
@@ -11,12 +11,12 @@ use std::sync::Arc;
 pub struct GetCertificatesResponse {
     /// The requested certificates that were found.
     /// Uses Arc to avoid copying certificate data.
-    pub certificates: Vec<Arc<TransactionCertificate>>,
+    pub certificates: Vec<Arc<WaveCertificate>>,
 }
 
 impl GetCertificatesResponse {
     /// Create a response with found certificates.
-    pub fn new(certificates: Vec<Arc<TransactionCertificate>>) -> Self {
+    pub fn new(certificates: Vec<Arc<WaveCertificate>>) -> Self {
         Self { certificates }
     }
 
@@ -38,7 +38,7 @@ impl GetCertificatesResponse {
     }
 
     /// Consume and return the certificates.
-    pub fn into_certificates(self) -> Vec<Arc<TransactionCertificate>> {
+    pub fn into_certificates(self) -> Vec<Arc<WaveCertificate>> {
         self.certificates
     }
 }
@@ -52,7 +52,7 @@ impl PartialEq for GetCertificatesResponse {
         self.certificates
             .iter()
             .zip(other.certificates.iter())
-            .all(|(a, b)| a.transaction_hash == b.transaction_hash)
+            .all(|(a, b)| a.wave_id == b.wave_id)
     }
 }
 
@@ -113,7 +113,7 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
         }
         let mut certificates = Vec::with_capacity(cert_count);
         for _ in 0..cert_count {
-            let cert: TransactionCertificate =
+            let cert: WaveCertificate =
                 decoder.decode_deeper_body_with_value_kind(sbor::ValueKind::Tuple)?;
             certificates.push(Arc::new(cert));
         }

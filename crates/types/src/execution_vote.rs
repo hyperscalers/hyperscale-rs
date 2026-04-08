@@ -26,46 +26,82 @@ use std::sync::Arc;
 // WaveId
 // ============================================================================
 
-/// Deterministic wave identifier = frozen provision dependency set.
+/// Self-contained wave identifier.
+///
+/// Globally unique: includes the local shard, block height, and the provision
+/// dependency set (remote shards). This eliminates composite `(block_hash, wave_id)`
+/// keys throughout the codebase.
 ///
 /// The provision dependency set for a transaction is the set of remote shards
 /// it needs state provisions from before execution. Transactions with identical
 /// dependency sets belong to the same wave and can be voted on together.
 ///
-/// `WaveId::ZERO` (empty set) represents single-shard transactions.
+/// A wave with empty `remote_shards` represents single-shard transactions.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, BasicSbor)]
-pub struct WaveId(pub BTreeSet<ShardGroupId>);
+pub struct WaveId {
+    /// The shard that committed the block containing this wave's transactions.
+    pub shard_group_id: ShardGroupId,
+    /// Block height at which the wave's transactions were committed.
+    pub block_height: u64,
+    /// Set of remote shards the transactions depend on (empty for single-shard waves).
+    pub remote_shards: BTreeSet<ShardGroupId>,
+}
 
 impl WaveId {
-    /// Wave zero: single-shard transactions with no provision dependencies.
-    pub fn zero() -> Self {
-        Self(BTreeSet::new())
+    /// Create a new WaveId.
+    pub fn new(
+        shard_group_id: ShardGroupId,
+        block_height: u64,
+        remote_shards: BTreeSet<ShardGroupId>,
+    ) -> Self {
+        Self {
+            shard_group_id,
+            block_height,
+            remote_shards,
+        }
     }
 
-    /// Whether this is wave zero (single-shard, no provisions).
+    /// Whether this is a single-shard wave (no remote dependencies).
     pub fn is_zero(&self) -> bool {
-        self.0.is_empty()
+        self.remote_shards.is_empty()
     }
 
     /// Number of provision source shards.
     pub fn dependency_count(&self) -> usize {
-        self.0.len()
+        self.remote_shards.len()
+    }
+
+    /// Compute a deterministic identity hash for this wave.
+    ///
+    /// Used for: BlockManifest cert_hashes, PendingBlock matching, storage keys,
+    /// wave cert fetch requests. Computable without knowing EC content.
+    pub fn hash(&self) -> Hash {
+        let bytes = basic_encode(self).expect("WaveId serialization should never fail");
+        Hash::from_bytes(&bytes)
     }
 }
 
 impl std::fmt::Display for WaveId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.is_zero() {
-            write!(f, "Wave(∅)")
+            write!(
+                f,
+                "Wave(shard={}, h={}, ∅)",
+                self.shard_group_id.0, self.block_height
+            )
         } else {
-            write!(f, "Wave{{")?;
-            for (i, shard) in self.0.iter().enumerate() {
+            write!(
+                f,
+                "Wave(shard={}, h={}, {{",
+                self.shard_group_id.0, self.block_height
+            )?;
+            for (i, shard) in self.remote_shards.iter().enumerate() {
                 if i > 0 {
                     write!(f, ",")?;
                 }
                 write!(f, "{}", shard.0)?;
             }
-            write!(f, "}}")
+            write!(f, "}})")
         }
     }
 }
@@ -80,15 +116,17 @@ impl std::fmt::Display for WaveId {
 /// defines its wave. Transactions with identical remote shard sets belong to
 /// the same wave. Wave-zero (single-shard txs) is excluded.
 ///
-/// Returns a sorted `Vec<WaveId>` (deterministic via BTreeSet ordering).
+/// Returns a sorted `Vec<WaveId>` with fully populated shard + height fields.
+/// (Deterministic via BTreeSet ordering.)
 /// Used in both block proposal (to populate `BlockHeader::waves`) and
 /// validation (to verify the header's waves field).
 pub fn compute_waves(
     topology: &TopologySnapshot,
+    block_height: u64,
     transactions: &[Arc<RoutableTransaction>],
 ) -> Vec<WaveId> {
     let local_shard = topology.local_shard();
-    let mut wave_set: BTreeSet<WaveId> = BTreeSet::new();
+    let mut remote_shard_sets: BTreeSet<BTreeSet<ShardGroupId>> = BTreeSet::new();
 
     for tx in transactions {
         if topology.is_single_shard_transaction(tx) {
@@ -100,25 +138,62 @@ pub fn compute_waves(
             .filter(|&s| s != local_shard)
             .collect();
         if !remote_shards.is_empty() {
-            wave_set.insert(WaveId(remote_shards));
+            remote_shard_sets.insert(remote_shards);
         }
     }
 
-    wave_set.into_iter().collect()
+    remote_shard_sets
+        .into_iter()
+        .map(|remote_shards| WaveId {
+            shard_group_id: local_shard,
+            block_height,
+            remote_shards,
+        })
+        .collect()
 }
 
-/// Deterministically select the wave leader for a (block, wave).
+/// Derive the transaction hashes belonging to a wave, given the source block's transactions.
+///
+/// This is the inverse of `compute_waves`: given a `WaveId` and the block's transactions,
+/// return the tx_hashes that belong to that wave. Deterministic — any node with the
+/// source block can re-derive the same result.
+///
+/// The WaveId is self-contained (`shard_group_id` + `block_height` + `remote_shards`),
+/// so no separate block hash is needed. The caller is responsible for providing the
+/// correct block's transactions (the block at `wave_id.block_height` on
+/// `wave_id.shard_group_id`'s chain).
+pub fn derive_wave_tx_hashes(
+    topology: &TopologySnapshot,
+    wave_id: &WaveId,
+    transactions: &[Arc<RoutableTransaction>],
+) -> Vec<Hash> {
+    let local_shard = wave_id.shard_group_id;
+    transactions
+        .iter()
+        .filter(|tx| {
+            let remote_shards: BTreeSet<ShardGroupId> = topology
+                .all_shards_for_transaction(tx)
+                .into_iter()
+                .filter(|&s| s != local_shard)
+                .collect();
+            remote_shards == wave_id.remote_shards
+        })
+        .map(|tx| tx.hash())
+        .collect()
+}
+
+/// Deterministically select the wave leader for a wave.
 ///
 /// The wave leader is the sole aggregator of execution votes into an EC.
-/// Uses `Hash(block_hash ++ wave_id_bytes) % committee_size` to pick one
+/// Uses `Hash(sbor_encode(wave_id)) % committee_size` to pick one
 /// validator. All validators compute the same result from the same inputs.
-pub fn wave_leader(block_hash: &Hash, wave_id: &WaveId, committee: &[ValidatorId]) -> ValidatorId {
+///
+/// Since WaveId is self-contained (includes shard + height + remote shards),
+/// no separate block_hash is needed.
+pub fn wave_leader(wave_id: &WaveId, committee: &[ValidatorId]) -> ValidatorId {
     assert!(!committee.is_empty(), "committee must not be empty");
     let wave_bytes = basic_encode(wave_id).expect("WaveId serialization should never fail");
-    let mut input = Vec::with_capacity(block_hash.as_bytes().len() + wave_bytes.len());
-    input.extend_from_slice(block_hash.as_bytes());
-    input.extend_from_slice(&wave_bytes);
-    let selection_hash = Hash::from_bytes(&input);
+    let selection_hash = Hash::from_bytes(&wave_bytes);
     // Use first 8 bytes as u64 for index selection
     let bytes = selection_hash.as_bytes();
     let index_val = u64::from_le_bytes([
@@ -145,23 +220,6 @@ pub struct TxOutcome {
 }
 
 impl TxOutcome {
-    /// Convert this outcome into a `ShardExecutionProof` for certificate tracking.
-    pub fn to_shard_proof(&self, ec_hash: Hash) -> crate::ShardExecutionProof {
-        match &self.outcome {
-            TxExecutionOutcome::Executed {
-                receipt_hash,
-                success,
-                write_nodes,
-            } => crate::ShardExecutionProof::Executed {
-                receipt_hash: *receipt_hash,
-                success: *success,
-                write_nodes: write_nodes.clone(),
-                ec_hash,
-            },
-            TxExecutionOutcome::Aborted { .. } => crate::ShardExecutionProof::Aborted { ec_hash },
-        }
-    }
-
     /// Whether this outcome is an abort.
     pub fn is_aborted(&self) -> bool {
         matches!(self.outcome, TxExecutionOutcome::Aborted { .. })
@@ -238,19 +296,13 @@ pub struct ExecutionVote {
 /// outcomes so remote shards can extract individual transaction results.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct ExecutionCertificate {
-    /// Block this wave belongs to.
-    pub block_hash: Hash,
-    /// Block height (the block containing the wave's transactions).
-    pub block_height: u64,
+    /// Self-contained wave identifier (shard + height + remote dependencies).
+    pub wave_id: WaveId,
     /// Consensus height at which quorum was reached.
     ///
     /// Must match the `vote_height` in the aggregated votes. Needed to
     /// reconstruct the BLS signing message for signature verification.
     pub vote_height: u64,
-    /// Which wave within the block.
-    pub wave_id: WaveId,
-    /// Which shard produced this certificate.
-    pub shard_group_id: ShardGroupId,
     /// Merkle root over per-tx outcome leaves.
     pub receipt_root: Hash,
     /// Per-transaction outcomes (in wave order = block order).
@@ -262,6 +314,16 @@ pub struct ExecutionCertificate {
 }
 
 impl ExecutionCertificate {
+    /// The shard that produced this certificate.
+    pub fn shard_group_id(&self) -> ShardGroupId {
+        self.wave_id.shard_group_id
+    }
+
+    /// Block height (the block containing the wave's transactions).
+    pub fn block_height(&self) -> u64 {
+        self.wave_id.block_height
+    }
+
     /// Compute the canonical hash of this certificate.
     ///
     /// Hashes only the deterministic execution-result fields, **excluding**
@@ -271,11 +333,8 @@ impl ExecutionCertificate {
     /// valid aggregation resolves to the same hash.
     pub fn canonical_hash(&self) -> Hash {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(self.block_hash.as_bytes());
-        hasher.update(&self.block_height.to_le_bytes());
-        hasher.update(&self.vote_height.to_le_bytes());
         hasher.update(&basic_encode(&self.wave_id).unwrap());
-        hasher.update(&basic_encode(&self.shard_group_id).unwrap());
+        hasher.update(&self.vote_height.to_le_bytes());
         hasher.update(self.receipt_root.as_bytes());
         hasher.update(&basic_encode(&self.tx_outcomes).unwrap());
         Hash::from_hash_bytes(hasher.finalize().as_bytes())
@@ -359,24 +418,48 @@ mod tests {
         }
     }
 
+    fn make_wave_id(shard: u64, height: u64, remote: &[u64]) -> WaveId {
+        WaveId {
+            shard_group_id: ShardGroupId(shard),
+            block_height: height,
+            remote_shards: remote.iter().map(|&s| ShardGroupId(s)).collect(),
+        }
+    }
+
     #[test]
     fn test_wave_id_display() {
-        assert_eq!(WaveId::zero().to_string(), "Wave(∅)");
+        let zero = make_wave_id(0, 42, &[]);
+        assert_eq!(zero.to_string(), "Wave(shard=0, h=42, ∅)");
 
-        let wave = WaveId(BTreeSet::from([ShardGroupId(2), ShardGroupId(5)]));
-        assert_eq!(wave.to_string(), "Wave{2,5}");
+        let wave = make_wave_id(0, 42, &[2, 5]);
+        assert_eq!(wave.to_string(), "Wave(shard=0, h=42, {2,5})");
     }
 
     #[test]
     fn test_wave_id_ordering() {
-        let zero = WaveId::zero();
-        let wave_a = WaveId(BTreeSet::from([ShardGroupId(1)]));
-        let wave_b = WaveId(BTreeSet::from([ShardGroupId(2)]));
-        let wave_ab = WaveId(BTreeSet::from([ShardGroupId(1), ShardGroupId(2)]));
+        let zero = make_wave_id(0, 42, &[]);
+        let wave_a = make_wave_id(0, 42, &[1]);
+        let wave_b = make_wave_id(0, 42, &[2]);
+        let wave_ab = make_wave_id(0, 42, &[1, 2]);
 
         assert!(zero < wave_a);
         assert!(wave_a < wave_b);
         assert!(wave_a < wave_ab);
+    }
+
+    #[test]
+    fn test_wave_id_hash_deterministic() {
+        let w1 = make_wave_id(0, 42, &[1]);
+        let w2 = make_wave_id(0, 42, &[1]);
+        assert_eq!(w1.hash(), w2.hash());
+        assert_ne!(w1.hash(), Hash::ZERO);
+    }
+
+    #[test]
+    fn test_wave_id_hash_differs_by_height() {
+        let w1 = make_wave_id(0, 42, &[1]);
+        let w2 = make_wave_id(0, 43, &[1]);
+        assert_ne!(w1.hash(), w2.hash());
     }
 
     #[test]
@@ -491,11 +574,8 @@ mod tests {
         signature: Bls12381G2Signature,
     ) -> ExecutionCertificate {
         ExecutionCertificate {
-            block_hash: Hash::from_bytes(b"block"),
-            block_height: 10,
+            wave_id: make_wave_id(0, 10, &[1]),
             vote_height: 11,
-            wave_id: WaveId(BTreeSet::from([ShardGroupId(1)])),
-            shard_group_id: ShardGroupId(0),
             receipt_root: Hash::from_bytes(b"receipt_root"),
             tx_outcomes: vec![make_outcome(1), make_outcome(2)],
             aggregated_signature: signature,
@@ -530,29 +610,5 @@ mod tests {
 
         // Different signers + signatures → same canonical hash
         assert_eq!(ec_a.canonical_hash(), ec_b.canonical_hash());
-    }
-
-    #[test]
-    fn test_to_shard_proof_embeds_ec_hash() {
-        let ec_hash = Hash::from_bytes(b"ec_hash_value");
-        let outcome = make_outcome(1);
-        let proof = outcome.to_shard_proof(ec_hash);
-        assert_eq!(proof.ec_hash(), ec_hash);
-    }
-
-    #[test]
-    fn test_to_shard_proof_aborted_embeds_ec_hash() {
-        let ec_hash = Hash::from_bytes(b"ec_hash_value");
-        let outcome = TxOutcome {
-            tx_hash: Hash::from_bytes(b"tx"),
-            outcome: TxExecutionOutcome::Aborted {
-                reason: crate::AbortReason::ExecutionTimeout {
-                    committed_at: crate::BlockHeight(10),
-                },
-            },
-        };
-        let proof = outcome.to_shard_proof(ec_hash);
-        assert!(proof.is_aborted());
-        assert_eq!(proof.ec_hash(), ec_hash);
     }
 }

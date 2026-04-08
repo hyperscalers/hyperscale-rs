@@ -1,8 +1,8 @@
 use crate::core::RocksDbStorage;
 
 use hyperscale_storage::test_helpers::{
-    make_database_update, make_mapped_database_update, make_test_block, make_test_certificate,
-    make_test_qc,
+    make_database_update, make_mapped_database_update, make_test_block, make_test_qc,
+    make_test_wave_certificate,
 };
 use hyperscale_storage::{
     CommitStore, ConsensusStore, DatabaseUpdate, DatabaseUpdates, DbPartitionKey, DbSortKey,
@@ -196,14 +196,14 @@ fn test_commit_certificate_with_writes_persists_both() {
     let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
 
     let updates = make_mapped_database_update(1, 0, vec![10, 20], vec![99, 88, 77]);
-    let cert = make_test_certificate(42, ShardGroupId(0));
-    let tx_hash = cert.transaction_hash;
+    let cert = make_test_wave_certificate(42, ShardGroupId(0));
+    let wave_hash = cert.wave_id.hash();
 
     storage.commit_certificate_with_writes(&cert, &updates);
 
-    let stored_cert = storage.get_certificate(&tx_hash);
+    let stored_cert = storage.get_certificate(&wave_hash);
     assert!(stored_cert.is_some());
-    assert_eq!(stored_cert.unwrap().transaction_hash, tx_hash);
+    assert_eq!(stored_cert.unwrap().wave_id.hash(), wave_hash);
 
     let node_id = hyperscale_types::NodeId([1; 30]);
     let substates: Vec<_> = storage.list_substates_for_node(&node_id).collect();
@@ -310,15 +310,15 @@ fn test_certificate_idempotency() {
     let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
 
     let updates = make_mapped_database_update(1, 0, vec![10, 20], vec![99, 88, 77]);
-    let cert = make_test_certificate(42, ShardGroupId(0));
-    let tx_hash = cert.transaction_hash;
+    let cert = make_test_wave_certificate(42, ShardGroupId(0));
+    let wave_hash = cert.wave_id.hash();
 
     storage.commit_certificate_with_writes(&cert, &updates);
     storage.commit_certificate_with_writes(&cert, &updates);
 
-    let stored = storage.get_certificate(&tx_hash);
+    let stored = storage.get_certificate(&wave_hash);
     assert!(stored.is_some());
-    assert_eq!(stored.unwrap().transaction_hash, tx_hash);
+    assert_eq!(stored.unwrap().wave_id.hash(), wave_hash);
 }
 
 #[test]
@@ -406,7 +406,7 @@ fn test_commit_block_applies_writes() {
 
     let shard = ShardGroupId(0);
     let updates = make_mapped_database_update(1, 0, vec![10], vec![42]);
-    let cert = Arc::new(make_test_certificate(1, shard));
+    let cert = Arc::new(make_test_wave_certificate(1, shard));
 
     let result = storage.commit_block(&updates, &[cert], 1, None, &[]);
     assert_ne!(result, Hash::ZERO);
@@ -421,8 +421,8 @@ fn test_commit_block_multiple_certs() {
     let updates1 = make_mapped_database_update(1, 0, vec![10], vec![1]);
     let updates2 = make_mapped_database_update(2, 0, vec![20], vec![2]);
     let merged = hyperscale_storage::merge_database_updates(&[updates1, updates2]);
-    let cert1 = Arc::new(make_test_certificate(1, shard));
-    let cert2 = Arc::new(make_test_certificate(2, shard));
+    let cert1 = Arc::new(make_test_wave_certificate(1, shard));
+    let cert2 = Arc::new(make_test_wave_certificate(2, shard));
 
     let result = storage.commit_block(&merged, &[cert1, cert2], 1, None, &[]);
     assert_ne!(result, Hash::ZERO);
@@ -440,7 +440,7 @@ fn test_commit_block_empty_certs() {
 #[test]
 fn test_prepare_then_commit_matches_direct() {
     let shard = ShardGroupId(0);
-    let cert = Arc::new(make_test_certificate(1, shard));
+    let cert = Arc::new(make_test_wave_certificate(1, shard));
 
     let temp_dir1 = TempDir::new().unwrap();
     let s_prepared = RocksDbStorage::open(temp_dir1.path()).unwrap();
@@ -470,12 +470,12 @@ fn test_commit_block_stores_certificates() {
     let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
 
     let shard = ShardGroupId(0);
-    let cert = Arc::new(make_test_certificate(1, shard));
-    let tx_hash = cert.transaction_hash;
+    let cert = Arc::new(make_test_wave_certificate(1, shard));
+    let wave_hash = cert.wave_id.hash();
 
     let _ = storage.commit_block(&DatabaseUpdates::default(), &[cert], 1, None, &[]);
 
-    assert!(storage.get_certificate(&tx_hash).is_some());
+    assert!(storage.get_certificate(&wave_hash).is_some());
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -496,10 +496,10 @@ fn test_certificates_batch() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
 
-    let cert1 = make_test_certificate(1, ShardGroupId(0));
-    let cert2 = make_test_certificate(2, ShardGroupId(0));
-    let hash1 = cert1.transaction_hash;
-    let hash2 = cert2.transaction_hash;
+    let cert1 = make_test_wave_certificate(1, ShardGroupId(0));
+    let cert2 = make_test_wave_certificate(2, ShardGroupId(0));
+    let hash1 = cert1.wave_id.hash();
+    let hash2 = cert2.wave_id.hash();
 
     storage.store_certificate(&cert1);
     storage.store_certificate(&cert2);
@@ -510,7 +510,7 @@ fn test_certificates_batch() {
     let missing = Hash::from_bytes(&[99; 32]);
     let partial = storage.get_certificates_batch(&[hash1, missing]);
     assert_eq!(partial.len(), 1);
-    assert_eq!(partial[0].transaction_hash, hash1);
+    assert_eq!(partial[0].wave_id.hash(), hash1);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -567,13 +567,13 @@ fn test_certificate_store_and_retrieve() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
 
-    let cert = make_test_certificate(1, ShardGroupId(0));
-    let tx_hash = cert.transaction_hash;
+    let cert = make_test_wave_certificate(1, ShardGroupId(0));
+    let wave_hash = cert.wave_id.hash();
 
     storage.store_certificate(&cert);
 
-    let stored = storage.get_certificate(&tx_hash).unwrap();
-    assert_eq!(stored.transaction_hash, tx_hash);
+    let stored = storage.get_certificate(&wave_hash).unwrap();
+    assert_eq!(stored.wave_id.hash(), wave_hash);
 }
 
 #[test]
@@ -607,13 +607,13 @@ fn test_commit_certificate_via_commit_store() {
     let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
 
     let updates = make_mapped_database_update(1, 0, vec![10], vec![42]);
-    let cert = make_test_certificate(1, ShardGroupId(0));
+    let cert = make_test_wave_certificate(1, ShardGroupId(0));
 
     storage.commit_certificate_with_writes(&cert, &updates);
 
     assert_eq!(storage.jvt_version(), 0);
     assert_eq!(storage.state_root_hash(), Hash::ZERO);
-    assert!(storage.get_certificate(&cert.transaction_hash).is_some());
+    assert!(storage.get_certificate(&cert.wave_id.hash()).is_some());
 }
 
 #[test]
@@ -641,8 +641,8 @@ fn test_substates_survive_reopen() {
     {
         let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
         let updates = make_mapped_database_update(1, 0, vec![10], vec![42]);
-        let cert = make_test_certificate(1, ShardGroupId(0));
-        cert_hash = cert.transaction_hash;
+        let cert = make_test_wave_certificate(1, ShardGroupId(0));
+        cert_hash = cert.wave_id.hash();
         storage.commit_certificate_with_writes(&cert, &updates);
         root_after_write = storage.state_root_hash();
         version_after_write = storage.jvt_version();
@@ -656,7 +656,7 @@ fn test_substates_survive_reopen() {
 
         let cert = storage.get_certificate(&cert_hash);
         assert!(cert.is_some(), "certificate should survive reopen");
-        assert_eq!(cert.unwrap().transaction_hash, cert_hash);
+        assert_eq!(cert.unwrap().wave_id.hash(), cert_hash);
 
         let substates: Vec<_> = storage.list_substates_for_node(&node_id).collect();
         assert_eq!(substates.len(), 1, "substate should survive reopen");
@@ -776,7 +776,7 @@ fn test_ec_survives_reopen() {
     {
         let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
         let retrieved = storage.get_execution_certificate(&canonical_hash).unwrap();
-        assert_eq!(retrieved.block_height, 10);
+        assert_eq!(retrieved.block_height(), 10);
         assert_eq!(retrieved.canonical_hash(), canonical_hash);
 
         let by_height = storage.get_execution_certificates_by_height(10);
@@ -791,12 +791,12 @@ fn test_ec_atomic_with_block_commit() {
 
     let ec = hyperscale_storage::test_helpers::make_test_execution_certificate(1, 1);
     let canonical_hash = ec.canonical_hash();
-    let cert = Arc::new(make_test_certificate(1, ShardGroupId(0)));
+    let cert = Arc::new(make_test_wave_certificate(1, ShardGroupId(0)));
 
     // Commit block with EC atomically
     storage.commit_block(&DatabaseUpdates::default(), &[cert], 1, None, &[ec]);
 
     // EC should be retrievable
     let retrieved = storage.get_execution_certificate(&canonical_hash).unwrap();
-    assert_eq!(retrieved.block_height, 1);
+    assert_eq!(retrieved.block_height(), 1);
 }

@@ -4,8 +4,7 @@ use crate::ProtocolEvent;
 use hyperscale_types::{
     Block, BlockHeight, Bls12381G1PublicKey, Bls12381G2Signature, CommittedBlockHeader,
     ExecutionCertificate, Hash, LedgerReceiptEntry, ProvisionBatch, QuorumCertificate,
-    RoutableTransaction, ShardGroupId, TransactionCertificate, TransactionInclusionProof,
-    ValidatorId,
+    RoutableTransaction, ShardGroupId, TransactionInclusionProof, ValidatorId, WaveCertificate,
 };
 use std::sync::Arc;
 
@@ -149,10 +148,10 @@ pub enum NodeInput {
         block_height: u64,
     },
 
-    /// Transaction certificates successfully fetched for a pending block.
+    /// Wave certificates successfully fetched for a pending block.
     CertificateReceived {
         block_hash: Hash,
-        certificates: Vec<Arc<TransactionCertificate>>,
+        certificates: Vec<Arc<WaveCertificate>>,
     },
 
     /// A transaction certificate fetch request failed.

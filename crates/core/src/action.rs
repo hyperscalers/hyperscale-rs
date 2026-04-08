@@ -6,8 +6,7 @@ use hyperscale_types::{
     AbortIntent, Block, BlockHeight, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature,
     CommittedBlockHeader, EpochConfig, EpochId, ExecutionCertificate, ExecutionVote, Hash, NodeId,
     ProvisionBatch, QuorumCertificate, RoutableTransaction, ShardGroupId, SignerBitfield,
-    StateProvision, TopologySnapshot, TransactionCertificate, TxOutcome, ValidatorId, VotePower,
-    WaveId,
+    StateProvision, TopologySnapshot, TxOutcome, ValidatorId, VotePower, WaveCertificate, WaveId,
 };
 use std::collections::HashMap;
 use std::fmt;
@@ -425,16 +424,16 @@ pub enum Action {
     /// Verify a block's receipt root.
     ///
     /// Computes the merkle root from the certificates' `receipt_hash` values
-    /// and compares against the block header's claimed `receipt_root`.
-    /// Returns `ProtocolEvent::ReceiptRootVerified`.
+    /// and compares against the block header's claimed `certificate_root`.
+    /// Returns `ProtocolEvent::CertificateRootVerified`.
     ///
     /// Pure CPU operation — verified in parallel with state root and transaction root.
-    VerifyReceiptRoot {
+    VerifyCertificateRoot {
         block_hash: Hash,
         /// Expected receipt root from block header.
         expected_root: Hash,
-        /// Certificates whose receipt_hash values form the merkle leaves.
-        certificates: Vec<Arc<TransactionCertificate>>,
+        /// Wave certificates whose receipt_hash values form the merkle leaves.
+        certificates: Vec<Arc<WaveCertificate>>,
     },
 
     /// Verify abort intent inclusion proofs off-thread.
@@ -472,7 +471,7 @@ pub enum Action {
         /// Parent's state root. Certs included only if local JVT matches this.
         parent_state_root: Hash,
         transactions: Vec<Arc<RoutableTransaction>>,
-        certificates: Vec<Arc<TransactionCertificate>>,
+        certificates: Vec<Arc<WaveCertificate>>,
         abort_intents: Vec<AbortIntent>,
         /// Cross-shard execution waves in this block.
         waves: Vec<WaveId>,
@@ -579,15 +578,14 @@ pub enum Action {
     // ═══════════════════════════════════════════════════════════════════════
     // Storage: Execution
     // ═══════════════════════════════════════════════════════════════════════
-    /// Persist a finalized transaction certificate with its state writes.
+    /// Cache a finalized wave certificate so peers can fetch it.
     ///
-    /// This is the deferred commit operation - state writes are only applied when
-    /// a `TransactionCertificate` is included in a committed block. The runner
-    /// extracts writes from `certificate.shard_proofs[local_shard]` and commits
-    /// them atomically with the certificate.
-    ///
-    /// Stored so we don't re-execute if we crash and recover.
-    PersistTransactionCertificate { certificate: TransactionCertificate },
+    /// Emitted by `finalize_wave` in `ExecutionState` when a wave completes.
+    /// The io_loop inserts the certificate into `cert_cache` keyed by
+    /// `wave_id.hash()`, which matches the `cert_hashes` entries in
+    /// `BlockManifest`. Peers fetch wave certificates via
+    /// `GetCertificatesRequest` before they can vote on the block.
+    CacheWaveCertificate { certificate: Arc<WaveCertificate> },
 
     /// Persist receipt bundles to disk. Fire-and-forget — no ProtocolEvent response.
     ///
@@ -865,7 +863,6 @@ impl Action {
                 | Action::BroadcastCommittedBlockHeader { .. }
                 | Action::PersistBlock { .. }
                 | Action::PersistAndBroadcastVote { .. }
-                | Action::PersistTransactionCertificate { .. }
                 | Action::RequestMissingProvisions { .. }
                 | Action::RequestMissingExecutionCert { .. }
                 | Action::CancelProvisionFetch { .. }
@@ -887,7 +884,7 @@ impl Action {
                 | Action::VerifyRemoteHeaderQc { .. }
                 | Action::VerifyStateRoot { .. }
                 | Action::VerifyTransactionRoot { .. }
-                | Action::VerifyReceiptRoot { .. }
+                | Action::VerifyCertificateRoot { .. }
                 | Action::VerifyAbortIntentProofs { .. }
                 | Action::BuildProposal { .. }
                 | Action::ExecuteTransactions { .. }
@@ -938,7 +935,7 @@ impl Action {
             Action::VerifyRemoteHeaderQc { .. } => "VerifyRemoteHeaderQc",
             Action::VerifyStateRoot { .. } => "VerifyStateRoot",
             Action::VerifyTransactionRoot { .. } => "VerifyTransactionRoot",
-            Action::VerifyReceiptRoot { .. } => "VerifyReceiptRoot",
+            Action::VerifyCertificateRoot { .. } => "VerifyCertificateRoot",
             Action::VerifyAbortIntentProofs { .. } => "VerifyAbortIntentProofs",
             Action::BuildProposal { .. } => "BuildProposal",
 
@@ -956,7 +953,7 @@ impl Action {
             Action::PersistAndBroadcastVote { .. } => "PersistAndBroadcastVote",
 
             // Storage - Execution
-            Action::PersistTransactionCertificate { .. } => "PersistTransactionCertificate",
+            Action::CacheWaveCertificate { .. } => "CacheWaveCertificate",
             Action::StoreReceiptBundles { .. } => "StoreReceiptBundles",
 
             // Storage - Read Requests

@@ -5,8 +5,8 @@ use crate::core::SimStorage;
 use hyperscale_storage::ConsensusStore;
 use hyperscale_types::{
     Block, BlockHeight, ExecutionCertificate, Hash, LedgerTransactionReceipt,
-    LocalTransactionExecution, QuorumCertificate, ReceiptBundle, RoutableTransaction,
-    TransactionCertificate,
+    LocalTransactionExecution, QuorumCertificate, ReceiptBundle, RoutableTransaction, ShardGroupId,
+    WaveCertificate,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -48,15 +48,17 @@ impl ConsensusStore for SimStorage {
         self.consensus.read().unwrap().committed_qc.clone()
     }
 
-    fn store_certificate(&self, certificate: &TransactionCertificate) {
-        self.consensus
-            .write()
-            .unwrap()
-            .certificates
-            .insert(certificate.transaction_hash, certificate.clone());
+    fn store_certificate(&self, certificate: &WaveCertificate) {
+        let mut c = self.consensus.write().unwrap();
+        let wave_id_hash = certificate.wave_id.hash();
+        c.certificates.insert(wave_id_hash, certificate.clone());
+        c.wave_certs_by_height
+            .entry(certificate.wave_id.block_height)
+            .or_default()
+            .push(wave_id_hash);
     }
 
-    fn get_certificate(&self, hash: &Hash) -> Option<TransactionCertificate> {
+    fn get_certificate(&self, hash: &Hash) -> Option<WaveCertificate> {
         self.consensus
             .read()
             .unwrap()
@@ -106,7 +108,7 @@ impl ConsensusStore for SimStorage {
             .collect()
     }
 
-    fn get_certificates_batch(&self, hashes: &[Hash]) -> Vec<TransactionCertificate> {
+    fn get_certificates_batch(&self, hashes: &[Hash]) -> Vec<WaveCertificate> {
         let c = self.consensus.read().unwrap();
         hashes
             .iter()
@@ -171,9 +173,37 @@ impl ConsensusStore for SimStorage {
             let canonical_hash = cert.canonical_hash();
             c.execution_certs.insert(canonical_hash, cert.clone());
             c.execution_certs_by_height
-                .entry(cert.block_height)
+                .entry(cert.block_height())
                 .or_default()
                 .push(canonical_hash);
         }
+    }
+
+    fn get_wave_certificates_by_height(&self, height: u64) -> Vec<WaveCertificate> {
+        let c = self.consensus.read().unwrap();
+        c.wave_certs_by_height
+            .get(&height)
+            .map(|hashes| {
+                hashes
+                    .iter()
+                    .filter_map(|h| c.certificates.get(h).cloned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn get_wave_certificate_for_tx(&self, tx_hash: &Hash) -> Option<WaveCertificate> {
+        let c = self.consensus.read().unwrap();
+        let wave_id_hash = c.tx_to_wave.get(tx_hash)?;
+        c.certificates.get(wave_id_hash).cloned()
+    }
+
+    fn get_ec_hashes_for_tx(&self, tx_hash: &Hash) -> Option<Vec<(ShardGroupId, Hash)>> {
+        self.consensus
+            .read()
+            .unwrap()
+            .tx_to_ec
+            .get(tx_hash)
+            .cloned()
     }
 }

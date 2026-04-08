@@ -20,7 +20,7 @@ use std::collections::{HashMap, HashSet};
 /// identical outcomes (they share the same receipt_root).
 pub fn aggregate_execution_certificate(
     wave_id: &WaveId,
-    shard: ShardGroupId,
+    _shard: ShardGroupId,
     receipt_root: Hash,
     votes: &[ExecutionVote],
     committee: &[ValidatorId],
@@ -55,16 +55,11 @@ pub fn aggregate_execution_certificate(
         }
     }
 
-    let block_hash = votes.first().map(|v| v.block_hash).unwrap_or(Hash::ZERO);
-    let block_height = votes.first().map(|v| v.block_height).unwrap_or(0);
     let vote_height = votes.first().map(|v| v.vote_height).unwrap_or(0);
 
     ExecutionCertificate {
-        block_hash,
-        block_height,
         vote_height,
         wave_id: wave_id.clone(),
-        shard_group_id: shard,
         receipt_root,
         tx_outcomes,
         aggregated_signature,
@@ -91,8 +86,6 @@ pub fn batch_verify_execution_votes(
         HashMap::new();
     for (vote, pk, power) in votes {
         let msg = exec_vote_message(
-            &vote.block_hash,
-            vote.block_height,
             vote.vote_height,
             &vote.wave_id,
             vote.shard_group_id,
@@ -135,16 +128,16 @@ pub fn batch_verify_execution_votes(
 }
 
 /// Verify an execution certificate's aggregated signature.
+///
+/// Verify an execution certificate's aggregated BLS signature.
 pub fn verify_execution_certificate_signature(
     certificate: &ExecutionCertificate,
     public_keys: &[Bls12381G1PublicKey],
 ) -> bool {
     let msg = exec_vote_message(
-        &certificate.block_hash,
-        certificate.block_height,
         certificate.vote_height,
         &certificate.wave_id,
-        certificate.shard_group_id,
+        certificate.shard_group_id(),
         &certificate.receipt_root,
         certificate.tx_outcomes.len() as u32,
     );

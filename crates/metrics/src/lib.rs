@@ -77,8 +77,8 @@ pub struct MemoryMetrics {
     // ── Execution ──
     /// In-memory write sets per transaction.
     pub exec_cache_entries: usize,
-    /// Certificates ready for block inclusion.
-    pub exec_finalized_certificates: usize,
+    /// Wave certificates ready for block inclusion.
+    pub exec_finalized_wave_certificates: usize,
     /// Transactions waiting for provisioning.
     pub exec_pending_provisioning: usize,
     /// Per-tx results collection per wave.
@@ -87,8 +87,8 @@ pub struct MemoryMetrics {
     pub exec_vote_trackers: usize,
     /// Votes that arrived before tracking started.
     pub exec_early_votes: usize,
-    /// Cross-shard finalization trackers.
-    pub exec_certificate_trackers: usize,
+    /// Wave-level finalization trackers.
+    pub exec_wave_certificate_trackers: usize,
     /// Expected execution certificates from remote shards.
     pub exec_expected_exec_certs: usize,
     // ── Mempool ──

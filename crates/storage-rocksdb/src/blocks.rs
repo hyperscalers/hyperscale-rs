@@ -8,7 +8,7 @@ use crate::typed_cf::TypedCf;
 use hyperscale_metrics as metrics;
 use hyperscale_types::{
     Block, BlockHeight, BlockMetadata, Hash, QuorumCertificate, RoutableTransaction,
-    TransactionCertificate,
+    WaveCertificate,
 };
 use rocksdb::{WriteBatch, WriteOptions};
 use std::sync::Arc;
@@ -112,7 +112,7 @@ impl RocksDbStorage {
 
         // 3. Store certificates (deduplicated)
         for cert in &block.certificates {
-            self.cf_put::<CertificatesCf>(&mut batch, &cert.transaction_hash, cert.as_ref());
+            self.cf_put::<CertificatesCf>(&mut batch, &cert.wave_id.hash(), cert.as_ref());
         }
 
         // Atomic write with sync for crash safety
@@ -301,7 +301,7 @@ impl RocksDbStorage {
     /// Unlike `get_certificates_batch`, this returns results in the same order
     /// as the input hashes, with missing entries causing the result to be shorter.
     /// Callers should check that the result length matches the input length.
-    fn get_certificates_batch_ordered(&self, hashes: &[Hash]) -> Vec<Arc<TransactionCertificate>> {
+    fn get_certificates_batch_ordered(&self, hashes: &[Hash]) -> Vec<Arc<WaveCertificate>> {
         if hashes.is_empty() {
             return vec![];
         }
@@ -385,13 +385,13 @@ impl RocksDbStorage {
     // Certificate storage
     // ═══════════════════════════════════════════════════════════════════════
 
-    /// Store a transaction certificate.
-    pub fn put_certificate(&self, hash: &Hash, cert: &TransactionCertificate) {
+    /// Store a wave certificate.
+    pub fn put_certificate(&self, hash: &Hash, cert: &WaveCertificate) {
         self.cf_put_sync::<CertificatesCf>(hash, cert);
     }
 
-    /// Get a transaction certificate by transaction hash.
-    pub fn get_certificate(&self, hash: &Hash) -> Option<TransactionCertificate> {
+    /// Get a wave certificate by wave_id hash.
+    pub fn get_certificate(&self, hash: &Hash) -> Option<WaveCertificate> {
         self.cf_get::<CertificatesCf>(hash)
     }
 
@@ -399,7 +399,7 @@ impl RocksDbStorage {
     ///
     /// Uses RocksDB's `multi_get_cf` for efficient batch retrieval.
     /// Returns only certificates that were found (missing hashes are skipped).
-    pub fn get_certificates_batch(&self, hashes: &[Hash]) -> Vec<TransactionCertificate> {
+    pub fn get_certificates_batch(&self, hashes: &[Hash]) -> Vec<WaveCertificate> {
         if hashes.is_empty() {
             return vec![];
         }
@@ -415,10 +415,10 @@ impl RocksDbStorage {
         certs
     }
 
-    /// Atomically commit a certificate and its state writes.
+    /// Atomically commit a wave certificate and its state writes.
     ///
     /// This is the deferred commit operation that applies state writes when
-    /// a `TransactionCertificate` is included in a committed block.
+    /// a `WaveCertificate` is included in a committed block.
     ///
     /// Uses a RocksDB WriteBatch for atomicity - either both the certificate
     /// and state writes are persisted, or neither is.
@@ -429,13 +429,13 @@ impl RocksDbStorage {
     /// certificate and state writes, the node's state will diverge from the network.
     #[cfg(test)]
     #[instrument(level = Level::DEBUG, skip_all, fields(
-        tx_hash = %certificate.transaction_hash,
+        wave_hash = %certificate.wave_id.hash(),
         latency_us = tracing::field::Empty,
         otel.kind = "INTERNAL",
     ))]
     pub fn commit_certificate_with_writes(
         &self,
-        certificate: &TransactionCertificate,
+        certificate: &WaveCertificate,
         updates: &hyperscale_storage::DatabaseUpdates,
     ) {
         let start = Instant::now();
@@ -444,7 +444,7 @@ impl RocksDbStorage {
         let cf = self.cf();
 
         // 1. Serialize and add certificate to batch
-        self.cf_put::<CertificatesCf>(&mut batch, &certificate.transaction_hash, certificate);
+        self.cf_put::<CertificatesCf>(&mut batch, &certificate.wave_id.hash(), certificate);
         write_count += 1;
 
         // 2. Add state writes to batch
@@ -489,7 +489,7 @@ impl RocksDbStorage {
         );
 
         tracing::debug!(
-            tx_hash = %certificate.transaction_hash,
+            wave_hash = %certificate.wave_id.hash(),
             write_count,
             "Certificate state writes committed (JVT deferred to block commit)"
         );

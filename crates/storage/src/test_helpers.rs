@@ -1,7 +1,7 @@
 //! Shared test helpers for storage crate tests.
 //!
 //! Provides reusable builder functions for `DatabaseUpdates`,
-//! `TransactionCertificate`, `Block`, and `QuorumCertificate` so that
+//! `WaveCertificate`, `Block`, and `QuorumCertificate` so that
 //! storage-memory and storage-rocksdb tests can share a single source of truth.
 
 use crate::{
@@ -10,13 +10,13 @@ use crate::{
 use hyperscale_types::{
     zero_bls_signature, ApplicationEvent, Block, BlockHeader, BlockHeight, Bls12381G2Signature,
     ExecutionCertificate, FeeSummary, Hash, LedgerTransactionOutcome, LedgerTransactionReceipt,
-    LocalTransactionExecution, LogLevel, NodeId, QuorumCertificate, ReceiptBundle,
-    ShardExecutionProof, ShardGroupId, SignerBitfield, TransactionCertificate, TransactionDecision,
-    TxExecutionOutcome, TxOutcome, ValidatorId, WaveId,
+    LocalTransactionExecution, LogLevel, NodeId, QuorumCertificate, ReceiptBundle, ShardGroupId,
+    SignerBitfield, TxExecutionOutcome, TxOutcome, ValidatorId, WaveCertificate, WaveId,
+    WaveResolution,
 };
 use radix_common::prelude::DatabaseUpdate;
 use radix_substate_store_interface::db_key_mapper::{DatabaseKeyMapper, SpreadPrefixKeyMapper};
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 /// Build a `DatabaseUpdates` containing a single `Set` operation.
@@ -75,21 +75,13 @@ pub fn make_mapped_database_update(
     updates
 }
 
-/// Build a `TransactionCertificate` with a deterministic hash derived from `tx_seed`.
-pub fn make_test_certificate(tx_seed: u8, shard: ShardGroupId) -> TransactionCertificate {
-    let tx_hash = Hash::from_bytes(&[tx_seed; 32]);
-    let proof = ShardExecutionProof::Executed {
-        receipt_hash: Hash::from_bytes(&[0; 32]),
-        success: true,
-        write_nodes: vec![],
-        ec_hash: Hash::ZERO,
-    };
-    let mut shard_proofs = BTreeMap::new();
-    shard_proofs.insert(shard, proof);
-    TransactionCertificate {
-        transaction_hash: tx_hash,
-        decision: TransactionDecision::Accept,
-        shard_proofs,
+/// Build a test `WaveCertificate` at the given height.
+pub fn make_test_wave_certificate(height: u64, shard: ShardGroupId) -> WaveCertificate {
+    WaveCertificate {
+        wave_id: WaveId::new(shard, height, BTreeSet::new()),
+        resolution: WaveResolution::Completed {
+            attestations: vec![],
+        },
     }
 }
 
@@ -110,35 +102,12 @@ pub fn make_test_block(height: u64) -> Block {
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
-            receipt_root: Hash::ZERO,
+            certificate_root: Hash::ZERO,
             waves: vec![],
         },
         transactions: vec![],
         certificates: vec![],
         abort_intents: vec![],
-    }
-}
-
-/// Build a `TransactionCertificate` with proofs for multiple shards.
-pub fn make_multi_shard_certificate(
-    tx_seed: u8,
-    shards: Vec<ShardGroupId>,
-) -> TransactionCertificate {
-    let tx_hash = Hash::from_bytes(&[tx_seed; 32]);
-    let mut shard_proofs = BTreeMap::new();
-    for shard in shards {
-        let proof = ShardExecutionProof::Executed {
-            receipt_hash: Hash::from_bytes(&[0; 32]),
-            success: true,
-            write_nodes: vec![],
-            ec_hash: Hash::ZERO,
-        };
-        shard_proofs.insert(shard, proof);
-    }
-    TransactionCertificate {
-        transaction_hash: tx_hash,
-        decision: TransactionDecision::Accept,
-        shard_proofs,
     }
 }
 
@@ -260,11 +229,8 @@ pub fn test_receipt_idempotent_overwrite(storage: &impl ConsensusStore) {
 /// deterministic outcome derived from `seed`.
 pub fn make_test_execution_certificate(seed: u8, block_height: u64) -> ExecutionCertificate {
     ExecutionCertificate {
-        block_hash: Hash::from_bytes(&[seed; 32]),
-        block_height,
+        wave_id: WaveId::new(ShardGroupId(0), block_height, BTreeSet::new()),
         vote_height: block_height + 1,
-        wave_id: WaveId::zero(),
-        shard_group_id: ShardGroupId(0),
         receipt_root: Hash::from_bytes(&[seed + 50; 32]),
         tx_outcomes: vec![TxOutcome {
             tx_hash: Hash::from_bytes(&[seed + 100; 32]),
@@ -291,7 +257,7 @@ pub fn test_ec_storage_roundtrip(storage: &impl ConsensusStore) {
     // Store and verify by hash
     storage.store_execution_certificates(std::slice::from_ref(&ec));
     let retrieved = storage.get_execution_certificate(&canonical_hash).unwrap();
-    assert_eq!(retrieved.block_height, 10);
+    assert_eq!(retrieved.block_height(), 10);
     assert_eq!(retrieved.canonical_hash(), canonical_hash);
 
     // Verify by height

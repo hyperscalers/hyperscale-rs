@@ -15,7 +15,7 @@ use hyperscale_metrics as metrics;
 use hyperscale_types::{ExecutionCertificate, ShardGroupId, ValidatorId, WaveId};
 use std::collections::{BTreeMap, HashSet};
 use std::time::{Duration, Instant};
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 /// Configuration for the execution certificate fetch protocol.
 #[derive(Debug, Clone)]
@@ -288,7 +288,7 @@ impl ExecCertFetchProtocol {
         if let Some(state) = self.pending.get_mut(&key) {
             state.in_flight = false;
             metrics::record_fetch_failed("exec_cert");
-            warn!(
+            debug!(
                 source_shard = source_shard.0,
                 block_height,
                 tried = state.tried.len(),
@@ -362,7 +362,7 @@ impl ExecCertFetchProtocol {
                         (500u64 * 2u64.saturating_pow(state.rounds)).min(30_000),
                     );
                     state.next_retry_at = Some(now + backoff);
-                    warn!(
+                    info!(
                         source_shard = source_shard.0,
                         block_height,
                         round = state.rounds,
@@ -438,7 +438,11 @@ mod tests {
     }
 
     fn wave(shards: &[u64]) -> WaveId {
-        WaveId(shards.iter().map(|&s| ShardGroupId(s)).collect())
+        WaveId::new(
+            ShardGroupId(0),
+            1,
+            shards.iter().map(|&s| ShardGroupId(s)).collect(),
+        )
     }
 
     #[test]

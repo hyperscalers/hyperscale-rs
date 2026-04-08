@@ -502,22 +502,14 @@ impl LivelockState {
             self.on_abort_intent_committed(&intent.tx_hash);
         }
 
-        // Process committed certificates (transactions completed)
-        for cert in &block.certificates {
-            self.on_certificate_committed(&cert.transaction_hash);
-        }
+        // NOTE: Certificate-committed cleanup (tombstones, tracker removal) is NOT
+        // done here. Wave certificates are lean — they don't carry per-tx hashes.
+        // The node state machine calls on_certificate_committed() per tx_hash after
+        // extracting decisions from FinalizedWave data.
 
         // Remove abort intents that were included in this block from both Vec and HashSet
         for intent in &block.abort_intents {
             self.pending_abort_intent_hashes.remove(&intent.tx_hash);
-        }
-
-        // Remove pending abort intents for transactions that committed via
-        // certificate. Once a TC is committed the abort is moot — the QC chain
-        // dedup covers the 1-2 block window before the certificate lands.
-        for cert in &block.certificates {
-            self.pending_abort_intent_hashes
-                .remove(&cert.transaction_hash);
         }
 
         // Also remove pending abort intents whose winner transaction was aborted in this block.
@@ -576,7 +568,7 @@ impl LivelockState {
     }
 
     /// Called when a certificate commits.
-    fn on_certificate_committed(&mut self, tx_hash: &Hash) {
+    pub fn on_certificate_committed(&mut self, tx_hash: &Hash) {
         // Add tombstone to prevent late provisions from re-populating state
         let expiry = self.now + self.config.tombstone_ttl;
         self.tombstones.insert(*tx_hash, expiry);
@@ -585,6 +577,10 @@ impl LivelockState {
         self.committed_tracker.remove(tx_hash);
         self.provision_tracker.remove_tx(tx_hash);
         self.pending_proof_fetches.remove(tx_hash);
+
+        // Remove pending abort intents for this transaction — once the certificate
+        // commits, the abort is moot.
+        self.pending_abort_intent_hashes.remove(tx_hash);
 
         trace!(tx = %tx_hash, "Certificate committed - added tombstone");
     }
@@ -958,7 +954,7 @@ mod tests {
                 is_fallback: false,
                 state_root: Hash::ZERO,
                 transaction_root: Hash::ZERO,
-                receipt_root: Hash::ZERO,
+                certificate_root: Hash::ZERO,
                 waves: vec![],
             },
             transactions: vec![],
@@ -992,33 +988,8 @@ mod tests {
 
         assert!(state.committed_tracker.contains(&tx));
 
-        let cert = hyperscale_types::TransactionCertificate {
-            transaction_hash: tx,
-            decision: hyperscale_types::TransactionDecision::Accept,
-            shard_proofs: std::collections::BTreeMap::new(),
-        };
-
-        let block = hyperscale_types::Block {
-            header: hyperscale_types::BlockHeader {
-                shard_group_id: hyperscale_types::ShardGroupId(0),
-                height: BlockHeight(5),
-                parent_hash: Hash::from_bytes(b"parent"),
-                parent_qc: hyperscale_types::QuorumCertificate::genesis(),
-                proposer: ValidatorId(0),
-                timestamp: 1234567890,
-                round: 0,
-                is_fallback: false,
-                state_root: Hash::ZERO,
-                transaction_root: Hash::ZERO,
-                receipt_root: Hash::ZERO,
-                waves: vec![],
-            },
-            transactions: vec![],
-            certificates: vec![std::sync::Arc::new(cert)],
-            abort_intents: vec![],
-        };
-
-        state.on_block_committed(&make_test_topology(), &block);
+        // Simulate certificate commit for this synthetic tx hash directly.
+        state.on_certificate_committed(&tx);
 
         assert!(
             !state.committed_tracker.contains(&tx),
@@ -1066,33 +1037,8 @@ mod tests {
             make_remote_state_needs(&[ShardGroupId(1)], vec![(ShardGroupId(1), vec![node])]);
         state.committed_tracker.add(tx, needs);
 
-        let cert = hyperscale_types::TransactionCertificate {
-            transaction_hash: tx,
-            decision: hyperscale_types::TransactionDecision::Accept,
-            shard_proofs: std::collections::BTreeMap::new(),
-        };
-
-        let block = hyperscale_types::Block {
-            header: hyperscale_types::BlockHeader {
-                shard_group_id: ShardGroupId(0),
-                height: BlockHeight(5),
-                parent_hash: Hash::from_bytes(b"parent"),
-                parent_qc: hyperscale_types::QuorumCertificate::genesis(),
-                proposer: ValidatorId(0),
-                timestamp: 1234567890,
-                round: 0,
-                is_fallback: false,
-                state_root: Hash::ZERO,
-                transaction_root: Hash::ZERO,
-                receipt_root: Hash::ZERO,
-                waves: vec![],
-            },
-            transactions: vec![],
-            certificates: vec![std::sync::Arc::new(cert)],
-            abort_intents: vec![],
-        };
-
-        state.on_block_committed(&make_test_topology(), &block);
+        // Simulate certificate commit for this synthetic tx hash directly.
+        state.on_certificate_committed(&tx);
 
         assert!(
             state.tombstones.contains_key(&tx),
@@ -1139,7 +1085,7 @@ mod tests {
                 is_fallback: false,
                 state_root: Hash::ZERO,
                 transaction_root: Hash::ZERO,
-                receipt_root: Hash::ZERO,
+                certificate_root: Hash::ZERO,
                 waves: vec![],
             },
             transactions: vec![],

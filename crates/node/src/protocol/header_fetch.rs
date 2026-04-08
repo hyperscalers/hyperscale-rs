@@ -575,7 +575,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
-            receipt_root: Hash::ZERO,
+            certificate_root: Hash::ZERO,
             waves: vec![],
         };
         let mut qc = QuorumCertificate::genesis();

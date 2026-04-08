@@ -58,7 +58,7 @@ pub enum MessagePriority {
     /// Finalization messages.
     ///
     /// Includes:
-    /// - `TransactionCertificateNotification` - certificates for committed txs
+    /// - `WaveCertificateNotification` - wave certificates for committed waves
     ///
     /// Important for progress but not liveness-critical.
     Finalization = 2,

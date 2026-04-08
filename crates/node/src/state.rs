@@ -11,7 +11,7 @@ use hyperscale_topology::TopologyState;
 use hyperscale_types::{
     AbortIntent, Block, BlockHeader, BlockHeight, BlockManifest, Bls12381G1PrivateKey, Hash,
     QuorumCertificate, ReadyTransactions, RoutableTransaction, ShardGroupId, TopologySnapshot,
-    TransactionCertificate,
+    WaveCertificate,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -77,7 +77,7 @@ impl std::fmt::Debug for NodeStateMachine {
 struct ProposalInputs {
     ready_txs: ReadyTransactions,
     abort_intents: Vec<AbortIntent>,
-    certificates: Vec<Arc<TransactionCertificate>>,
+    certificates: Vec<Arc<WaveCertificate>>,
 }
 
 impl NodeStateMachine {
@@ -319,7 +319,7 @@ impl NodeStateMachine {
             header,
             manifest,
             |h| self.mempool.get_transaction(h),
-            |h| self.execution.get_finalized_certificate(h),
+            |h| self.execution.get_finalized_wave_cert_by_hash(h),
             |h| self.execution.has_finalized_certificate(h),
         )
     }
@@ -384,13 +384,29 @@ impl NodeStateMachine {
         // will detect complete waves and emit votes deterministically.
         self.execution.record_abort_intents(&block.abort_intents);
 
-        // Remove committed certificates from execution state.
+        // Remove committed wave certificates from execution state.
         // They've been included in this block, so don't need to be proposed again.
-        self.execution
+        // Returns per-tx (tx_hash, decision) pairs for mempool terminal state updates.
+        let committed_txs = self
+            .execution
             .on_certificates_committed(&block.certificates);
         for cert in &block.certificates {
-            self.bft
-                .remove_committed_transaction(&cert.transaction_hash);
+            let cert_hash = cert.wave_id.hash();
+            self.bft.remove_committed_transaction(&cert_hash);
+        }
+
+        // Notify mempool, livelock, and provisions of per-tx terminal states
+        // from committed wave certificates. Wave certs are lean (no per-tx data),
+        // so we use the decisions extracted from FinalizedWave above.
+        for (tx_hash, decision) in &committed_txs {
+            actions.extend(self.mempool.on_certificate_committed(
+                self.topology.snapshot(),
+                *tx_hash,
+                *decision,
+                block_height,
+            ));
+            self.livelock.on_certificate_committed(tx_hash);
+            self.provisions.cleanup_tx(tx_hash);
         }
 
         // Pass all transactions from block to execution (no need for mempool lookup).
@@ -475,22 +491,28 @@ impl NodeStateMachine {
             self.mempool
                 .on_transaction_executed(self.topology.snapshot(), tx_hash, accepted);
 
-        // Check if any pending blocks are now complete with this certificate
-        if let Some(cert) = self.execution.get_finalized_certificate(&tx_hash) {
-            actions.extend(self.bft.check_pending_blocks_for_certificate(
-                self.topology.snapshot(),
-                tx_hash,
-                &cert,
-            ));
-
-            // TC formation means DatabaseUpdates are now co-located in
-            // finalized_certificates. Feed receipt availability to BFT
-            // pending blocks — a block waiting for this receipt may now
-            // be complete and ready for voting / state root verification.
+        // Feed receipt availability for pending blocks.
+        if self.execution.has_finalized_certificate(&tx_hash) {
             actions.extend(
                 self.bft
                     .on_receipts_available(self.topology.snapshot(), &[tx_hash]),
             );
+        }
+
+        // Check if any pending blocks are waiting for a wave cert that
+        // contains this tx. Look up the finalized wave cert and feed it.
+        if let Some(wave_id) = self.execution.get_wave_assignment(&tx_hash) {
+            let wave_id_hash = wave_id.hash();
+            if let Some(wc) = self
+                .execution
+                .get_finalized_wave_cert_by_hash(&wave_id_hash)
+            {
+                actions.extend(self.bft.check_pending_blocks_for_certificate(
+                    self.topology.snapshot(),
+                    wave_id_hash,
+                    &wc,
+                ));
+            }
         }
 
         actions
@@ -622,7 +644,6 @@ impl StateMachine for NodeStateMachine {
                 self.execution.on_verified_remote_header(
                     topology,
                     shard,
-                    committed_header.block_hash(),
                     committed_header.header.height.0,
                     &committed_header.header.waves,
                 );
@@ -637,9 +658,9 @@ impl StateMachine for NodeStateMachine {
             ProtocolEvent::TransactionRootVerified { block_hash, valid } => self
                 .bft
                 .on_transaction_root_verified(self.topology.snapshot(), block_hash, valid),
-            ProtocolEvent::ReceiptRootVerified { block_hash, valid } => self
+            ProtocolEvent::CertificateRootVerified { block_hash, valid } => self
                 .bft
-                .on_receipt_root_verified(self.topology.snapshot(), block_hash, valid),
+                .on_certificate_root_verified(self.topology.snapshot(), block_hash, valid),
             ProtocolEvent::AbortIntentProofsVerified { block_hash, valid } => self
                 .bft
                 .on_abort_intents_verified(self.topology.snapshot(), block_hash, valid),
@@ -648,13 +669,14 @@ impl StateMachine for NodeStateMachine {
                 round,
                 block,
                 block_hash,
-                ..
+                receipt_tx_hashes,
             } => self.bft.on_proposal_built(
                 self.topology.snapshot(),
                 height,
                 round,
                 block.clone(),
                 block_hash,
+                receipt_tx_hashes,
             ),
 
             // ── State Commit ─────────────────────────────────────────────
@@ -750,6 +772,16 @@ impl StateMachine for NodeStateMachine {
             // ── Transactions ─────────────────────────────────────────────
             ProtocolEvent::TransactionExecuted { tx_hash, accepted } => {
                 self.on_transaction_executed(tx_hash, accepted)
+            }
+            ProtocolEvent::WaveCompleted {
+                wave_cert: _,
+                tx_hashes: _,
+                execution_certificates: _,
+            } => {
+                // Wave-level finalization event. Per-tx handling is done via
+                // TransactionExecuted events emitted alongside WaveCompleted.
+                // Future: use this for wave-level mempool notifications.
+                vec![]
             }
             ProtocolEvent::TransactionGossipReceived {
                 tx,

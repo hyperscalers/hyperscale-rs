@@ -3,7 +3,7 @@
 //! Tracks blocks being assembled from headers + gossiped transactions.
 
 use hyperscale_types::{
-    Block, BlockHeader, BlockManifest, Hash, RoutableTransaction, TransactionCertificate,
+    Block, BlockHeader, BlockManifest, Hash, RoutableTransaction, WaveCertificate,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -39,8 +39,8 @@ pub struct PendingBlock {
     /// Set of transaction hashes we're still waiting for (HashSet for O(1) lookup).
     missing_transaction_hashes: HashSet<Hash>,
 
-    /// Map of transaction hash -> Arc<TransactionCertificate> (for received certificates).
-    received_certificates: HashMap<Hash, Arc<TransactionCertificate>>,
+    /// Map of wave_id hash -> Arc<WaveCertificate> (for received certificates).
+    received_certificates: HashMap<Hash, Arc<WaveCertificate>>,
 
     /// Set of certificate hashes we're still waiting for (HashSet for O(1) lookup).
     missing_certificate_hashes: HashSet<Hash>,
@@ -83,9 +83,11 @@ impl PendingBlock {
     /// Create a pending block from a complete block (proposer's own block).
     ///
     /// Skips the hash-extraction → re-fill round-trip since we already have
-    /// all transactions and certificates.
-    pub fn from_complete_block(block: &Block) -> Self {
-        let manifest = BlockManifest::from_block(block);
+    /// all transactions and certificates. `receipt_tx_hashes` are the tx hashes
+    /// with available receipts, pre-computed by the action handler which has
+    /// storage access to look up each wave cert's source block.
+    pub fn from_complete_block(block: &Block, receipt_tx_hashes: Vec<Hash>) -> Self {
+        let manifest = BlockManifest::from_block_with_receipts(block, receipt_tx_hashes);
         let mut pending = Self {
             header: block.header.clone(),
             received_transactions: HashMap::new(),
@@ -105,7 +107,7 @@ impl PendingBlock {
         for cert in &block.certificates {
             pending
                 .received_certificates
-                .insert(cert.transaction_hash, Arc::clone(cert));
+                .insert(cert.wave_id.hash(), Arc::clone(cert));
         }
         pending
     }
@@ -127,8 +129,8 @@ impl PendingBlock {
     /// Add a received certificate.
     ///
     /// Returns true if this certificate was needed, false if duplicate or not in this block.
-    pub fn add_certificate(&mut self, cert: Arc<TransactionCertificate>) -> bool {
-        let cert_hash = cert.transaction_hash;
+    pub fn add_certificate(&mut self, cert: Arc<WaveCertificate>) -> bool {
+        let cert_hash = cert.wave_id.hash();
         // O(1) lookup and removal with HashSet
         if self.missing_certificate_hashes.remove(&cert_hash) {
             self.received_certificates.insert(cert_hash, cert);
@@ -229,7 +231,7 @@ impl PendingBlock {
             .collect();
 
         // Build certificates in the original order from the gossip message.
-        let certificates: Vec<Arc<TransactionCertificate>> = self
+        let certificates: Vec<Arc<WaveCertificate>> = self
             .manifest
             .cert_hashes
             .iter()
@@ -292,7 +294,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
-            receipt_root: Hash::ZERO,
+            certificate_root: Hash::ZERO,
             waves: vec![],
         }
     }
@@ -349,10 +351,10 @@ mod tests {
 
     #[test]
     fn test_add_certificate() {
-        use hyperscale_types::{TransactionCertificate, TransactionDecision};
-        use std::collections::BTreeMap;
+        use hyperscale_types::{WaveCertificate, WaveId, WaveResolution};
 
-        let cert_hash = Hash::from_bytes(b"cert1");
+        let wave_id = WaveId::new(ShardGroupId(0), 1, Default::default());
+        let cert_hash = wave_id.hash();
         let header = make_header(1);
 
         let mut pb = PendingBlock::from_manifest(
@@ -366,11 +368,10 @@ mod tests {
         assert_eq!(pb.missing_certificate_count(), 1);
         assert!(!pb.is_complete());
 
-        // Create a test certificate
-        let cert = TransactionCertificate {
-            transaction_hash: cert_hash,
-            decision: TransactionDecision::Accept,
-            shard_proofs: BTreeMap::new(),
+        // Create a test wave certificate
+        let cert = WaveCertificate {
+            wave_id,
+            resolution: WaveResolution::Aborted,
         };
 
         // Add the certificate
@@ -384,15 +385,15 @@ mod tests {
     #[test]
     fn test_block_needs_both_transactions_and_certificates() {
         use hyperscale_types::{
-            test_utils::test_transaction, TransactionCertificate, TransactionDecision,
+            test_utils::test_transaction, WaveCertificate, WaveId, WaveResolution,
         };
-        use std::collections::BTreeMap;
 
         // Create a test transaction
         let tx = Arc::new(test_transaction(1));
         let tx_hash = tx.hash();
 
-        let cert_hash = Hash::from_bytes(b"cert1");
+        let wave_id = WaveId::new(ShardGroupId(0), 1, Default::default());
+        let cert_hash = wave_id.hash();
         let header = make_header(1);
 
         let mut pb = PendingBlock::from_manifest(
@@ -414,10 +415,9 @@ mod tests {
         assert!(!pb.is_complete()); // Still missing certificate
 
         // Add certificate
-        let cert = TransactionCertificate {
-            transaction_hash: cert_hash,
-            decision: TransactionDecision::Accept,
-            shard_proofs: BTreeMap::new(),
+        let cert = WaveCertificate {
+            wave_id,
+            resolution: WaveResolution::Aborted,
         };
         pb.add_certificate(Arc::new(cert));
 
@@ -474,13 +474,13 @@ mod tests {
     #[test]
     fn test_block_needs_transactions_certificates_and_receipts() {
         use hyperscale_types::{
-            test_utils::test_transaction, TransactionCertificate, TransactionDecision,
+            test_utils::test_transaction, WaveCertificate, WaveId, WaveResolution,
         };
-        use std::collections::BTreeMap;
 
         let tx = Arc::new(test_transaction(1));
         let tx_hash = tx.hash();
-        let cert_hash = Hash::from_bytes(b"cert1");
+        let wave_id = WaveId::new(ShardGroupId(0), 1, Default::default());
+        let cert_hash = wave_id.hash();
         let receipt_hash = Hash::from_bytes(b"receipt1");
         let header = make_header(1);
 
@@ -501,10 +501,9 @@ mod tests {
         assert!(!pb.is_complete()); // Still missing certificate + receipt
 
         // Add certificate
-        let cert = TransactionCertificate {
-            transaction_hash: cert_hash,
-            decision: TransactionDecision::Accept,
-            shard_proofs: BTreeMap::new(),
+        let cert = WaveCertificate {
+            wave_id,
+            resolution: WaveResolution::Aborted,
         };
         pb.add_certificate(Arc::new(cert));
         assert!(!pb.is_complete()); // Still missing receipt
@@ -516,13 +515,11 @@ mod tests {
 
     #[test]
     fn test_from_complete_block_has_no_missing_receipts() {
-        use hyperscale_types::{Block, TransactionCertificate, TransactionDecision};
-        use std::collections::BTreeMap;
+        use hyperscale_types::{Block, WaveCertificate, WaveId, WaveResolution};
 
-        let cert = Arc::new(TransactionCertificate {
-            transaction_hash: Hash::from_bytes(b"cert1"),
-            decision: TransactionDecision::Accept,
-            shard_proofs: BTreeMap::new(),
+        let cert = Arc::new(WaveCertificate {
+            wave_id: WaveId::new(ShardGroupId(0), 1, Default::default()),
+            resolution: WaveResolution::Aborted,
         });
 
         let block = Block {
@@ -532,7 +529,7 @@ mod tests {
             abort_intents: vec![],
         };
 
-        let pending = PendingBlock::from_complete_block(&block);
+        let pending = PendingBlock::from_complete_block(&block, vec![]);
 
         // Proposer's own block: no missing receipts
         assert_eq!(pending.missing_receipt_count(), 0);

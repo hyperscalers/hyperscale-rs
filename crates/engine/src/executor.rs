@@ -12,7 +12,7 @@
 //!
 //! **IMPORTANT**: The executor is READ-ONLY. It does NOT commit state changes
 //! to storage. `DatabaseUpdates` from execution are cached by the state machine
-//! and applied when a `TransactionCertificate` is included in a committed block.
+//! and applied when a `WaveCertificate` is included in a committed block.
 //! This ensures all validators agree on the state before it's persisted.
 //!
 //! ```text
@@ -183,7 +183,7 @@ impl RadixExecutor {
     ///
     /// **IMPORTANT**: This method does NOT commit state changes. The writes
     /// are returned in the `ExecutionOutput` and should be committed later
-    /// when the `TransactionCertificate` is included in a committed block.
+    /// when the `WaveCertificate` is included in a committed block.
     #[instrument(level = Level::DEBUG, skip_all, fields(
         tx_count = transactions.len(),
         latency_us = tracing::field::Empty,
@@ -214,7 +214,7 @@ impl RadixExecutor {
     ///
     /// **IMPORTANT**: This method does NOT commit state changes. The writes
     /// are returned in the `ExecutionOutput` and should be committed later
-    /// when the `TransactionCertificate` is included in a committed block.
+    /// when the `WaveCertificate` is included in a committed block.
     ///
     /// # Performance
     ///
@@ -261,7 +261,7 @@ impl RadixExecutor {
             let result = self.receipt_to_result(storage, tx, &receipt, local_shard, num_shards);
 
             // NO COMMIT HERE - DatabaseUpdates are cached by the state machine
-            // and applied when the TransactionCertificate is included in a block.
+            // and applied when the WaveCertificate is included in a block.
 
             results.push(result);
         }
@@ -302,7 +302,7 @@ impl RadixExecutor {
         let result = self.receipt_to_result(storage, tx, &receipt, local_shard, num_shards);
 
         // NO COMMIT HERE - DatabaseUpdates are cached by the state machine
-        // and applied when the TransactionCertificate is included in a block.
+        // and applied when the WaveCertificate is included in a block.
 
         Ok(result)
     }

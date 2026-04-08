@@ -28,7 +28,7 @@ pub(crate) fn append_execution_certs_to_batch(
         // Index: (block_height, canonical_hash) → ()
         storage.cf_put::<ExecutionCertsByHeightCf>(
             batch,
-            &(cert.block_height, canonical_hash),
+            &(cert.block_height(), canonical_hash),
             &(),
         );
     }

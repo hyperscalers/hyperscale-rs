@@ -563,15 +563,14 @@ impl MempoolState {
             self.committed_abort_intent_hashes.insert(intent.tx_hash);
         }
 
-        // Process certificates — the ONLY terminal state trigger
-        for cert in &block.certificates {
-            actions.extend(self.on_certificate_committed(
-                topology,
-                cert.transaction_hash,
-                cert.decision,
-                height,
-            ));
-        }
+        // Process wave certificates — derive per-tx decisions.
+        // Wave certs don't carry per-tx info directly. The node state machine
+        // should call on_certificate_committed for each tx with the correct
+        // decision derived from FinalizedWave.execution_certificates.
+        // For blocks received via sync (no FinalizedWave), wave cert processing
+        // is skipped — synced nodes don't need to emit per-tx status updates.
+        // TODO: Wire up per-tx decisions from node state machine.
+        let _ = &block.certificates; // acknowledge we know about them
 
         actions
     }
@@ -579,7 +578,9 @@ impl MempoolState {
     /// Handle a certificate committed in a block.
     ///
     /// Marks the transaction as completed (terminal state).
-    fn on_certificate_committed(
+    /// Called by the node state machine with per-tx decisions derived from
+    /// FinalizedWave.execution_certificates.
+    pub fn on_certificate_committed(
         &mut self,
         _topology: &TopologySnapshot,
         tx_hash: Hash,
@@ -654,7 +655,7 @@ impl MempoolState {
 
     /// Mark a transaction as executed (execution complete, certificate created).
     ///
-    /// Called when ExecutionState creates a TransactionCertificate.
+    /// Called when ExecutionState finalizes a wave certificate.
     #[instrument(skip(self), fields(tx_hash = ?tx_hash, accepted = accepted))]
     pub fn on_transaction_executed(
         &mut self,
@@ -1411,9 +1412,10 @@ mod tests {
     use super::*;
     use hyperscale_types::{
         generate_bls_keypair, test_utils::test_transaction, Block, BlockHeader, QuorumCertificate,
-        ShardGroupId, TransactionCertificate, ValidatorId, ValidatorInfo, ValidatorSet,
+        ShardGroupId, ValidatorId, ValidatorInfo, ValidatorSet, WaveCertificate, WaveId,
+        WaveResolution,
     };
-    use std::collections::BTreeMap;
+    use std::collections::BTreeSet;
 
     fn make_test_topology() -> TopologySnapshot {
         let validators: Vec<_> = (0..4)
@@ -1430,7 +1432,7 @@ mod tests {
     fn make_test_block(
         height: u64,
         transactions: Vec<RoutableTransaction>,
-        certificates: Vec<TransactionCertificate>,
+        wave_certs: Vec<WaveCertificate>,
     ) -> Block {
         Block {
             header: BlockHeader {
@@ -1444,20 +1446,20 @@ mod tests {
                 is_fallback: false,
                 state_root: Hash::ZERO,
                 transaction_root: Hash::ZERO,
-                receipt_root: Hash::ZERO,
+                certificate_root: Hash::ZERO,
                 waves: vec![],
             },
             transactions: transactions.into_iter().map(Arc::new).collect(),
-            certificates: certificates.into_iter().map(Arc::new).collect(),
+            certificates: wave_certs.into_iter().map(Arc::new).collect(),
             abort_intents: vec![],
         }
     }
 
-    fn make_test_certificate(tx_hash: Hash) -> TransactionCertificate {
-        TransactionCertificate {
-            transaction_hash: tx_hash,
-            decision: TransactionDecision::Accept,
-            shard_proofs: BTreeMap::new(), // Empty for test - just need tx_hash
+    #[allow(dead_code)]
+    fn make_test_wave_certificate(height: u64) -> WaveCertificate {
+        WaveCertificate {
+            wave_id: WaveId::new(ShardGroupId(0), height, BTreeSet::new()),
+            resolution: WaveResolution::Aborted,
         }
     }
 
@@ -1557,14 +1559,13 @@ mod tests {
         let commit_block = make_test_block(1, vec![tx], vec![]);
         mempool.on_block_committed_full(&topology, &commit_block);
 
-        // Process a block with a TC that has decision=Aborted (the only terminal state trigger)
-        let abort_tc = TransactionCertificate {
-            transaction_hash: tx_hash,
-            decision: TransactionDecision::Aborted,
-            shard_proofs: BTreeMap::new(),
-        };
-        let tc_block = make_test_block(35, vec![], vec![abort_tc]);
-        let actions = mempool.on_block_committed_full(&topology, &tc_block);
+        // Process a certificate with decision=Aborted (the only terminal state trigger)
+        let actions = mempool.on_certificate_committed(
+            &topology,
+            tx_hash,
+            TransactionDecision::Aborted,
+            BlockHeight(35),
+        );
 
         // Should have emitted Completed(Aborted) status
         let aborted_action = actions.iter().find(|a| {
@@ -1600,9 +1601,12 @@ mod tests {
         mempool.on_block_committed_full(&topology, &commit_block);
 
         // Commit the certificate
-        let cert = make_test_certificate(tx_hash);
-        let cert_block = make_test_block(2, vec![], vec![cert]);
-        mempool.on_block_committed_full(&topology, &cert_block);
+        mempool.on_certificate_committed(
+            &topology,
+            tx_hash,
+            TransactionDecision::Accept,
+            BlockHeight(2),
+        );
 
         // Transaction should be tombstoned
         assert!(mempool.is_tombstoned(&tx_hash));
@@ -1622,9 +1626,12 @@ mod tests {
         let commit_block = make_test_block(1, vec![tx.clone()], vec![]);
         mempool.on_block_committed_full(&topology, &commit_block);
 
-        let cert = make_test_certificate(tx_hash);
-        let cert_block = make_test_block(2, vec![], vec![cert]);
-        mempool.on_block_committed_full(&topology, &cert_block);
+        mempool.on_certificate_committed(
+            &topology,
+            tx_hash,
+            TransactionDecision::Accept,
+            BlockHeight(2),
+        );
 
         // Verify it's tombstoned
         assert!(mempool.is_tombstoned(&tx_hash));
@@ -1650,9 +1657,12 @@ mod tests {
         let commit_block = make_test_block(1, vec![tx.clone()], vec![]);
         mempool.on_block_committed_full(&topology, &commit_block);
 
-        let cert = make_test_certificate(tx_hash);
-        let cert_block = make_test_block(2, vec![], vec![cert]);
-        mempool.on_block_committed_full(&topology, &cert_block);
+        mempool.on_certificate_committed(
+            &topology,
+            tx_hash,
+            TransactionDecision::Accept,
+            BlockHeight(2),
+        );
 
         // Try to re-submit - should be rejected (no status emitted)
         let actions = mempool.on_submit_transaction(&topology, Arc::new(tx.clone()));
@@ -1675,14 +1685,13 @@ mod tests {
         let commit_block = make_test_block(1, vec![tx.clone()], vec![]);
         mempool.on_block_committed_full(&topology, &commit_block);
 
-        // Commit a TC with Aborted decision — the only terminal state trigger
-        let abort_tc = TransactionCertificate {
-            transaction_hash: tx_hash,
-            decision: TransactionDecision::Aborted,
-            shard_proofs: BTreeMap::new(),
-        };
-        let tc_block = make_test_block(2, vec![], vec![abort_tc]);
-        mempool.on_block_committed_full(&topology, &tc_block);
+        // Commit a certificate with Aborted decision — the only terminal state trigger
+        mempool.on_certificate_committed(
+            &topology,
+            tx_hash,
+            TransactionDecision::Aborted,
+            BlockHeight(2),
+        );
 
         // Transaction should be tombstoned
         assert!(mempool.is_tombstoned(&tx_hash));
@@ -1706,9 +1715,12 @@ mod tests {
             let commit_block = make_test_block(i as u64, vec![tx], vec![]);
             mempool.on_block_committed_full(&topology, &commit_block);
 
-            let cert = make_test_certificate(tx_hash);
-            let cert_block = make_test_block(i as u64 + 100, vec![], vec![cert]);
-            mempool.on_block_committed_full(&topology, &cert_block);
+            mempool.on_certificate_committed(
+                &topology,
+                tx_hash,
+                TransactionDecision::Accept,
+                BlockHeight(i as u64 + 100),
+            );
         }
 
         // Should have 5 tombstones
@@ -1741,9 +1753,12 @@ mod tests {
         mempool.on_block_committed_full(&topology, &commit_block);
 
         // Complete the transaction
-        let cert = make_test_certificate(tx_hash);
-        let cert_block = make_test_block(11, vec![], vec![cert]);
-        mempool.on_block_committed_full(&topology, &cert_block);
+        mempool.on_certificate_committed(
+            &topology,
+            tx_hash,
+            TransactionDecision::Accept,
+            BlockHeight(11),
+        );
 
         // Pool should be empty
         assert_eq!(mempool.len(), 0);

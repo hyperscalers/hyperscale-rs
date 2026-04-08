@@ -49,7 +49,7 @@ use hyperscale_types::{
     block_header_message, committed_block_header_message, AbortIntent, Block, BlockHeader,
     BlockHeight, BlockManifest, BlockVote, Bls12381G1PrivateKey, Bls12381G1PublicKey,
     CommittedBlockHeader, Hash, QuorumCertificate, ReadyTransactions, RoutableTransaction,
-    ShardGroupId, TopologySnapshot, TransactionCertificate, ValidatorId, VotePower,
+    ShardGroupId, TopologySnapshot, ValidatorId, VotePower, WaveCertificate,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -827,7 +827,7 @@ impl BftState {
         topology: &TopologySnapshot,
         ready_txs: &ReadyTransactions,
         abort_intents: Vec<AbortIntent>,
-        certificates: Vec<Arc<TransactionCertificate>>,
+        certificates: Vec<Arc<WaveCertificate>>,
         finalized_tx_hashes: &std::collections::HashSet<Hash>,
     ) -> Vec<Action> {
         // The next height to propose is one above the highest certified block,
@@ -1012,7 +1012,7 @@ impl BftState {
 
         let certificates_to_propose: Vec<_> = certificates
             .into_iter()
-            .filter(|c| !qc_chain_cert_hashes.contains(&c.transaction_hash))
+            .filter(|c| !qc_chain_cert_hashes.contains(&c.wave_id.hash()))
             .take(self.config.max_certificates_per_block)
             .collect();
 
@@ -1046,7 +1046,7 @@ impl BftState {
         // Compute waves: which cross-shard execution waves exist in this block.
         // QC-attested (part of block hash). Used by remote shards to detect missing
         // provisions (derived from wave union) and missing execution certificates.
-        let waves = hyperscale_types::compute_waves(topology, &transactions);
+        let waves = hyperscale_types::compute_waves(topology, next_height, &transactions);
 
         // Always use BuildProposal - the runner handles JVT readiness and timeout.
         // This ensures transactions are always included regardless of certificate state.
@@ -1130,7 +1130,7 @@ impl BftState {
             is_fallback: true,
             state_root: parent_state_root,
             transaction_root: Hash::ZERO, // Fallback blocks have no transactions
-            receipt_root: Hash::ZERO,     // No certificates
+            certificate_root: Hash::ZERO, // No certificates
             waves: vec![],                // Empty - fallback blocks have no transactions
         };
 
@@ -1249,7 +1249,7 @@ impl BftState {
             is_fallback: false, // Not a fallback - just empty due to sync
             state_root: parent_state_root,
             transaction_root: Hash::ZERO, // Sync blocks have no transactions
-            receipt_root: Hash::ZERO,     // No certificates
+            certificate_root: Hash::ZERO, // No certificates
             waves: vec![],                // Empty - sync blocks have no transactions
         };
 
@@ -1426,7 +1426,7 @@ impl BftState {
         header: BlockHeader,
         manifest: BlockManifest,
         lookup_tx: impl Fn(&Hash) -> Option<Arc<RoutableTransaction>>,
-        lookup_cert: impl Fn(&Hash) -> Option<Arc<TransactionCertificate>>,
+        lookup_cert: impl Fn(&Hash) -> Option<Arc<WaveCertificate>>,
         lookup_receipt: impl Fn(&Hash) -> bool,
     ) -> Vec<Action> {
         let block_hash = header.hash();
@@ -1984,7 +1984,7 @@ impl BftState {
                 }
 
                 // Initiate all async verifications in parallel.
-                // StateRoot, TransactionRoot, and ReceiptRoot verifications run concurrently.
+                // StateRoot, TransactionRoot, and CertificateRoot verifications run concurrently.
                 let mut verification_actions = Vec::new();
 
                 // Verify state root if block has committed certificates.
@@ -1995,10 +1995,16 @@ impl BftState {
                         .get_block_by_hash(block.header.parent_hash)
                         .map(|parent| parent.header.state_root)
                         .unwrap_or_else(|| self.jvt_root());
+                    let receipt_hashes = self
+                        .pending_blocks
+                        .get(&block_hash)
+                        .map(|pb| pb.manifest().receipt_hashes.clone())
+                        .unwrap_or_default();
                     self.verification.initiate_state_root_verification(
                         block_hash,
                         &block,
                         parent_state_root,
+                        &receipt_hashes,
                     );
                 }
 
@@ -2014,10 +2020,13 @@ impl BftState {
                 }
 
                 // Verify receipt root if block has certificates.
-                if self.verification.needs_receipt_root_verification(&block) {
+                if self
+                    .verification
+                    .needs_certificate_root_verification(&block)
+                {
                     verification_actions.extend(
                         self.verification
-                            .initiate_receipt_root_verification(block_hash, &block),
+                            .initiate_certificate_root_verification(block_hash, &block),
                     );
                 }
 
@@ -2127,7 +2136,8 @@ impl BftState {
     /// compares with the header's claimed value. This prevents a byzantine
     /// proposer from lying about which waves exist.
     fn validate_waves(&self, topology: &TopologySnapshot, block: &Block) -> Result<(), String> {
-        let expected = hyperscale_types::compute_waves(topology, &block.transactions);
+        let expected =
+            hyperscale_types::compute_waves(topology, block.header.height.0, &block.transactions);
 
         if block.header.waves != expected {
             return Err(format!(
@@ -2728,11 +2738,11 @@ impl BftState {
 
     /// Handle receipt root verification result.
     ///
-    /// Called when the runner completes `Action::VerifyReceiptRoot`. If the
+    /// Called when the runner completes `Action::VerifyCertificateRoot`. If the
     /// receipt root is invalid, the block is rejected. If valid, proceeds to
     /// vote for the block (assuming other verifications are also complete).
     #[instrument(skip(self), fields(block_hash = ?block_hash, valid = valid))]
-    pub fn on_receipt_root_verified(
+    pub fn on_certificate_root_verified(
         &mut self,
         topology: &TopologySnapshot,
         block_hash: Hash,
@@ -2740,11 +2750,11 @@ impl BftState {
     ) -> Vec<Action> {
         if !self
             .verification
-            .on_receipt_root_verified(block_hash, valid)
+            .on_certificate_root_verified(block_hash, valid)
         {
             warn!(
                 block_hash = ?block_hash,
-                "Receipt root verification FAILED - proposer included incorrect receipt_root!"
+                "Certificate root verification FAILED - proposer included incorrect certificate_root!"
             );
             self.pending_blocks.remove(&block_hash);
             return vec![];
@@ -2753,7 +2763,7 @@ impl BftState {
         let Some(pending_block) = self.pending_blocks.get(&block_hash) else {
             warn!(
                 block_hash = ?block_hash,
-                "Receipt root verification complete but pending block not found"
+                "Certificate root verification complete but pending block not found"
             );
             return vec![];
         };
@@ -2767,7 +2777,7 @@ impl BftState {
         if !self.verification.is_block_verified(&block) {
             debug!(
                 block_hash = ?block_hash,
-                "Receipt root done, waiting for other verifications"
+                "Certificate root done, waiting for other verifications"
             );
             return vec![];
         }
@@ -2835,7 +2845,7 @@ impl BftState {
     /// Called when the runner completes `Action::BuildProposal`. The runner has
     /// computed the state root, built the complete block, and cached the WriteBatch
     /// for efficient commit later.
-    #[instrument(skip(self, block), fields(height = %height.0, round = round))]
+    #[instrument(skip(self, block, receipt_tx_hashes), fields(height = %height.0, round = round))]
     pub fn on_proposal_built(
         &mut self,
         topology: &TopologySnapshot,
@@ -2843,6 +2853,7 @@ impl BftState {
         round: u64,
         block: Arc<Block>,
         block_hash: Hash,
+        receipt_tx_hashes: Vec<Hash>,
     ) -> Vec<Action> {
         // Take the pending proposal - if it doesn't match (height, round), something is wrong
         let Some(pending) = self.pending_proposal.take() else {
@@ -2870,7 +2881,7 @@ impl BftState {
         let has_certificates = !block.certificates.is_empty();
 
         // Store our own block as pending
-        let mut pending_block = PendingBlock::from_complete_block(&block);
+        let mut pending_block = PendingBlock::from_complete_block(&block, receipt_tx_hashes);
 
         let total_tx_count = pending_block.transaction_count();
         info!(
@@ -3046,7 +3057,7 @@ impl BftState {
         qc: QuorumCertificate,
         ready_txs: &ReadyTransactions,
         abort_intents: Vec<AbortIntent>,
-        certificates: Vec<Arc<TransactionCertificate>>,
+        certificates: Vec<Arc<WaveCertificate>>,
         finalized_tx_hashes: &std::collections::HashSet<Hash>,
     ) -> Vec<Action> {
         let height = qc.height.0;
@@ -3396,7 +3407,7 @@ impl BftState {
                 self.recently_committed_txs.insert(tx.hash());
             }
             for cert in &block.certificates {
-                self.recently_committed_certs.insert(cert.transaction_hash);
+                self.recently_committed_certs.insert(cert.wave_id.hash());
             }
             for intent in &block.abort_intents {
                 self.recently_committed_abort_intents.insert(intent.tx_hash);
@@ -3666,7 +3677,7 @@ impl BftState {
             self.recently_committed_txs.insert(tx.hash());
         }
         for cert in &block.certificates {
-            self.recently_committed_certs.insert(cert.transaction_hash);
+            self.recently_committed_certs.insert(cert.wave_id.hash());
         }
         for intent in &block.abort_intents {
             self.recently_committed_abort_intents.insert(intent.tx_hash);
@@ -3848,6 +3859,7 @@ impl BftState {
                         height = height,
                         missing_txs = pending.missing_transaction_count(),
                         missing_certs = pending.missing_certificate_count(),
+                        missing_receipts = pending.missing_receipt_count(),
                         "View change — block still incomplete (missing data)"
                     );
                 }
@@ -4103,7 +4115,7 @@ impl BftState {
         &mut self,
         topology: &TopologySnapshot,
         block_hash: Hash,
-        certificates: Vec<Arc<TransactionCertificate>>,
+        certificates: Vec<Arc<WaveCertificate>>,
     ) -> Vec<Action> {
         let validator_id = topology.local_validator_id();
 
@@ -4333,14 +4345,14 @@ impl BftState {
 
     /// Check if any pending blocks are now complete after a certificate was finalized.
     ///
-    /// When a TransactionCertificate is finalized locally, it might complete a pending block
+    /// When a WaveCertificate is finalized locally, it might complete a pending block
     /// that was waiting for that certificate. This method checks all pending blocks and
     /// triggers voting if any are now complete.
     pub fn check_pending_blocks_for_certificate(
         &mut self,
         topology: &TopologySnapshot,
         cert_hash: Hash,
-        cert: &Arc<TransactionCertificate>,
+        cert: &Arc<WaveCertificate>,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
 
@@ -4534,7 +4546,7 @@ impl BftState {
             // Check if we should fetch missing transactions
             let missing_txs = pending.missing_transactions();
             if !missing_txs.is_empty() && age >= tx_timeout {
-                warn!(
+                debug!(
                     validator = ?topology.local_validator_id(),
                     block_hash = ?block_hash,
                     missing_tx_count = missing_txs.len(),
@@ -4552,7 +4564,7 @@ impl BftState {
             // Check if we should fetch missing certificates
             let missing_certs = pending.missing_certificates();
             if !missing_certs.is_empty() && age >= cert_timeout {
-                warn!(
+                debug!(
                     validator = ?topology.local_validator_id(),
                     block_hash = ?block_hash,
                     missing_cert_count = missing_certs.len(),
@@ -4857,7 +4869,7 @@ impl BftState {
                 break;
             }
             for cert in &block.certificates {
-                cert_hashes.insert(cert.transaction_hash);
+                cert_hashes.insert(cert.wave_id.hash());
             }
             for tx in &block.transactions {
                 tx_hashes.insert(tx.hash());
@@ -5056,7 +5068,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
-            receipt_root: Hash::ZERO,
+            certificate_root: Hash::ZERO,
             waves: vec![],
         }
     }
@@ -5078,7 +5090,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
-            receipt_root: Hash::ZERO,
+            certificate_root: Hash::ZERO,
             waves: vec![],
         };
 
@@ -5174,7 +5186,7 @@ mod tests {
             is_fallback: true,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
-            receipt_root: Hash::ZERO,
+            certificate_root: Hash::ZERO,
             waves: vec![],
         };
 
@@ -5196,7 +5208,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
-            receipt_root: Hash::ZERO,
+            certificate_root: Hash::ZERO,
             waves: vec![],
         };
         assert!(
@@ -5274,7 +5286,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
-            receipt_root: Hash::ZERO,
+            certificate_root: Hash::ZERO,
             waves: vec![],
         };
 
@@ -5359,7 +5371,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
-            receipt_root: Hash::ZERO,
+            certificate_root: Hash::ZERO,
             waves: vec![],
         };
 
@@ -5448,7 +5460,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
-            receipt_root: Hash::ZERO,
+            certificate_root: Hash::ZERO,
             waves: vec![],
         };
 
@@ -5524,7 +5536,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
-            receipt_root: Hash::ZERO,
+            certificate_root: Hash::ZERO,
             waves: vec![],
         };
 
@@ -5743,7 +5755,7 @@ mod tests {
     fn make_test_block(
         height: u64,
         abort_intents: Vec<AbortIntent>,
-        certificates: Vec<hyperscale_types::TransactionCertificate>,
+        certificates: Vec<hyperscale_types::WaveCertificate>,
     ) -> Block {
         Block {
             header: make_header_at_height(height, 100_000),
@@ -5878,7 +5890,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
-            receipt_root: Hash::ZERO,
+            certificate_root: Hash::ZERO,
             waves: vec![],
         };
         let block_a_hash = block_a.hash();
@@ -5894,7 +5906,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
-            receipt_root: Hash::ZERO,
+            certificate_root: Hash::ZERO,
             waves: vec![],
         };
         let block_b_hash = block_b.hash();
@@ -5939,7 +5951,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
-            receipt_root: Hash::ZERO,
+            certificate_root: Hash::ZERO,
             waves: vec![],
         };
         let block_hash = block.hash();
@@ -5978,7 +5990,7 @@ mod tests {
                 is_fallback: false,
                 state_root: Hash::ZERO,
                 transaction_root: Hash::ZERO,
-                receipt_root: Hash::ZERO,
+                certificate_root: Hash::ZERO,
                 waves: vec![],
             };
             state.try_vote_on_block(&topology, block.hash(), height, 0);
@@ -6276,7 +6288,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
-            receipt_root: Hash::ZERO,
+            certificate_root: Hash::ZERO,
             waves: vec![],
         };
         let original_block_hash = original_header.hash();
@@ -6353,7 +6365,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
-            receipt_root: Hash::ZERO,
+            certificate_root: Hash::ZERO,
             waves: vec![],
         };
 
@@ -6389,7 +6401,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
-            receipt_root: Hash::ZERO,
+            certificate_root: Hash::ZERO,
             waves: vec![],
         };
 
@@ -6720,7 +6732,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
-            receipt_root: Hash::ZERO,
+            certificate_root: Hash::ZERO,
             waves: vec![],
         };
         let original_block_hash = original_header.hash();
@@ -6969,7 +6981,7 @@ mod tests {
             is_fallback: true,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
-            receipt_root: Hash::ZERO,
+            certificate_root: Hash::ZERO,
             waves: vec![],
         };
         let block_hash_r1 = header_round1.hash();
@@ -6985,7 +6997,7 @@ mod tests {
             is_fallback: true,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
-            receipt_root: Hash::ZERO,
+            certificate_root: Hash::ZERO,
             waves: vec![],
         };
         let block_hash_r2 = header_round2.hash();
@@ -7001,7 +7013,7 @@ mod tests {
             is_fallback: true,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
-            receipt_root: Hash::ZERO,
+            certificate_root: Hash::ZERO,
             waves: vec![],
         };
         let block_hash_r3 = header_round3.hash();
@@ -7018,7 +7030,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
-            receipt_root: Hash::ZERO,
+            certificate_root: Hash::ZERO,
             waves: vec![],
         };
         let block_hash_h6 = header_height6.hash();
@@ -7296,7 +7308,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
-            receipt_root: Hash::ZERO,
+            certificate_root: Hash::ZERO,
             waves: vec![],
         };
 
@@ -7332,7 +7344,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
-            receipt_root: Hash::ZERO,
+            certificate_root: Hash::ZERO,
             waves: vec![],
         };
 
@@ -8311,7 +8323,7 @@ mod tests {
                 is_fallback: false,
                 state_root: Hash::ZERO,
                 transaction_root: Hash::ZERO,
-                receipt_root: Hash::ZERO,
+                certificate_root: Hash::ZERO,
                 waves: vec![],
             },
             transactions: vec![],
@@ -8905,7 +8917,7 @@ mod tests {
                 is_fallback: false,
                 state_root: Hash::ZERO,
                 transaction_root: Hash::ZERO,
-                receipt_root: Hash::ZERO,
+                certificate_root: Hash::ZERO,
                 waves: vec![],
             },
             transactions: vec![tx1.clone()],
@@ -8930,7 +8942,7 @@ mod tests {
                 is_fallback: false,
                 state_root: Hash::ZERO,
                 transaction_root: Hash::ZERO,
-                receipt_root: Hash::ZERO,
+                certificate_root: Hash::ZERO,
                 waves: vec![],
             },
             transactions: txs,
@@ -8963,7 +8975,7 @@ mod tests {
                 is_fallback: false,
                 state_root: Hash::ZERO,
                 transaction_root: Hash::ZERO,
-                receipt_root: Hash::ZERO,
+                certificate_root: Hash::ZERO,
                 waves: vec![],
             },
             transactions: vec![tx1.clone()],
@@ -8987,7 +8999,7 @@ mod tests {
                 is_fallback: false,
                 state_root: Hash::ZERO,
                 transaction_root: Hash::ZERO,
-                receipt_root: Hash::ZERO,
+                certificate_root: Hash::ZERO,
                 waves: vec![],
             },
             transactions: vec![tx1],

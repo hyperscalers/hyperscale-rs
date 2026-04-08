@@ -193,6 +193,7 @@ impl ExecutionAccumulator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     fn make_accumulator(n: usize) -> ExecutionAccumulator {
         let txs: Vec<(Hash, Vec<ShardGroupId>)> = (0..n)
@@ -204,7 +205,12 @@ mod tests {
             })
             .collect();
 
-        ExecutionAccumulator::new(WaveId::zero(), Hash::from_bytes(b"block"), 10, txs)
+        ExecutionAccumulator::new(
+            WaveId::new(ShardGroupId(0), 0, BTreeSet::new()),
+            Hash::from_bytes(b"block"),
+            10,
+            txs,
+        )
     }
 
     fn executed(receipt: Hash) -> TxExecutionOutcome {
@@ -383,7 +389,12 @@ mod tests {
                 vec![ShardGroupId(1), ShardGroupId(2)],
             ),
         ];
-        let acc = ExecutionAccumulator::new(WaveId::zero(), Hash::from_bytes(b"b"), 1, txs);
+        let acc = ExecutionAccumulator::new(
+            WaveId::new(ShardGroupId(0), 0, BTreeSet::new()),
+            Hash::from_bytes(b"b"),
+            1,
+            txs,
+        );
 
         let shards = acc.all_participating_shards();
         assert_eq!(

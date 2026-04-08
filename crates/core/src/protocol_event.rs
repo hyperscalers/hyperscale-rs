@@ -8,7 +8,7 @@
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, BlockManifest, BlockVote, CommittedBlockHeader, EpochConfig,
     EpochId, ExecutionCertificate, ExecutionVote, Hash, ProvisionBatch, QuorumCertificate,
-    RoutableTransaction, ShardGroupId, TransactionCertificate, TxOutcome, ValidatorId, WaveId,
+    RoutableTransaction, ShardGroupId, TxOutcome, ValidatorId, WaveCertificate, WaveId,
 };
 use std::sync::Arc;
 
@@ -111,7 +111,7 @@ pub enum ProtocolEvent {
     TransactionRootVerified { block_hash: Hash, valid: bool },
 
     /// Receipt root verification completed.
-    ReceiptRootVerified { block_hash: Hash, valid: bool },
+    CertificateRootVerified { block_hash: Hash, valid: bool },
 
     /// Abort intent inclusion proof verification completed.
     AbortIntentProofsVerified { block_hash: Hash, valid: bool },
@@ -122,6 +122,10 @@ pub enum ProtocolEvent {
         round: u64,
         block: Arc<Block>,
         block_hash: Hash,
+        /// Transaction hashes that have receipts (derived from wave certs' source blocks).
+        /// Used to populate BlockManifest.receipt_hashes for gossip to other validators.
+        /// Computed by the action handler which has storage access to look up source blocks.
+        receipt_tx_hashes: Vec<Hash>,
     },
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -214,7 +218,16 @@ pub enum ProtocolEvent {
     },
 
     /// A transaction's execution outcome has been resolved and certificate finalized.
+    /// Kept for per-tx mempool status updates until WaveCompleted fully replaces it.
     TransactionExecuted { tx_hash: Hash, accepted: bool },
+
+    /// A wave's execution has been finalized (all shards reported or all-abort).
+    /// Carries the wave cert, per-tx hashes, and contributing ECs.
+    WaveCompleted {
+        wave_cert: Arc<WaveCertificate>,
+        tx_hashes: Vec<Hash>,
+        execution_certificates: Vec<Arc<ExecutionCertificate>>,
+    },
 
     // ═══════════════════════════════════════════════════════════════════════
     // Fetch Delivery (from IoLoop after fetch protocol processing)
@@ -225,10 +238,10 @@ pub enum ProtocolEvent {
         transactions: Vec<Arc<RoutableTransaction>>,
     },
 
-    /// Fetched transaction certificates delivered to state machine.
+    /// Fetched wave certificates delivered to state machine.
     CertificateFetchDelivered {
         block_hash: Hash,
-        certificates: Vec<Arc<TransactionCertificate>>,
+        certificates: Vec<Arc<WaveCertificate>>,
     },
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -352,7 +365,7 @@ impl ProtocolEvent {
             ProtocolEvent::RemoteHeaderVerified { .. } => "RemoteHeaderVerified",
             ProtocolEvent::StateRootVerified { .. } => "StateRootVerified",
             ProtocolEvent::TransactionRootVerified { .. } => "TransactionRootVerified",
-            ProtocolEvent::ReceiptRootVerified { .. } => "ReceiptRootVerified",
+            ProtocolEvent::CertificateRootVerified { .. } => "CertificateRootVerified",
             ProtocolEvent::AbortIntentProofsVerified { .. } => "AbortIntentProofsVerified",
             ProtocolEvent::ProposalBuilt { .. } => "ProposalBuilt",
 
@@ -382,6 +395,7 @@ impl ProtocolEvent {
             // Mempool / Transactions
             ProtocolEvent::TransactionGossipReceived { .. } => "TransactionGossipReceived",
             ProtocolEvent::TransactionExecuted { .. } => "TransactionExecuted",
+            ProtocolEvent::WaveCompleted { .. } => "WaveCompleted",
 
             // Fetch Delivery
             ProtocolEvent::TransactionFetchDelivered { .. } => "TransactionFetchDelivered",

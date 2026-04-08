@@ -227,6 +227,7 @@ impl VoteTracker {
 mod tests {
     use super::*;
     use hyperscale_types::{generate_bls_keypair, zero_bls_signature, ShardGroupId};
+    use std::collections::BTreeSet;
 
     fn make_test_public_key() -> Bls12381G1PublicKey {
         generate_bls_keypair().public_key()
@@ -237,7 +238,7 @@ mod tests {
             block_hash: Hash::from_bytes(b"block"),
             block_height: 10,
             vote_height: 11,
-            wave_id: WaveId::zero(),
+            wave_id: WaveId::new(ShardGroupId(0), 0, BTreeSet::new()),
             shard_group_id: ShardGroupId(0),
             receipt_root,
             tx_count: 5,
@@ -249,7 +250,11 @@ mod tests {
 
     #[test]
     fn test_vote_tracker_quorum() {
-        let mut tracker = VoteTracker::new(WaveId::zero(), Hash::from_bytes(b"block"), 3);
+        let mut tracker = VoteTracker::new(
+            WaveId::new(ShardGroupId(0), 0, BTreeSet::new()),
+            Hash::from_bytes(b"block"),
+            3,
+        );
 
         let root = Hash::from_bytes(b"receipt_root");
 
@@ -271,7 +276,11 @@ mod tests {
 
     #[test]
     fn test_vote_tracker_conflicting_roots() {
-        let mut tracker = VoteTracker::new(WaveId::zero(), Hash::from_bytes(b"block"), 3);
+        let mut tracker = VoteTracker::new(
+            WaveId::new(ShardGroupId(0), 0, BTreeSet::new()),
+            Hash::from_bytes(b"block"),
+            3,
+        );
 
         let root_a = Hash::from_bytes(b"root_a");
         let root_b = Hash::from_bytes(b"root_b");
@@ -291,7 +300,11 @@ mod tests {
     fn test_deferred_verification_flow() {
         let pk = make_test_public_key();
         let root = Hash::from_bytes(b"root");
-        let mut tracker = VoteTracker::new(WaveId::zero(), Hash::from_bytes(b"block"), 3);
+        let mut tracker = VoteTracker::new(
+            WaveId::new(ShardGroupId(0), 0, BTreeSet::new()),
+            Hash::from_bytes(b"block"),
+            3,
+        );
 
         // Buffer 2 votes — not enough for quorum
         assert!(tracker.buffer_unverified_vote(make_vote(0, root), pk, 1));
@@ -317,7 +330,11 @@ mod tests {
     fn test_duplicate_validator_rejected() {
         let pk = make_test_public_key();
         let root = Hash::from_bytes(b"root");
-        let mut tracker = VoteTracker::new(WaveId::zero(), Hash::from_bytes(b"block"), 3);
+        let mut tracker = VoteTracker::new(
+            WaveId::new(ShardGroupId(0), 0, BTreeSet::new()),
+            Hash::from_bytes(b"block"),
+            3,
+        );
 
         assert!(tracker.buffer_unverified_vote(make_vote(0, root), pk, 1));
         assert!(!tracker.buffer_unverified_vote(make_vote(0, root), pk, 1));
@@ -327,7 +344,11 @@ mod tests {
     fn test_combined_verified_and_unverified_power() {
         let pk = make_test_public_key();
         let root = Hash::from_bytes(b"root");
-        let mut tracker = VoteTracker::new(WaveId::zero(), Hash::from_bytes(b"block"), 3);
+        let mut tracker = VoteTracker::new(
+            WaveId::new(ShardGroupId(0), 0, BTreeSet::new()),
+            Hash::from_bytes(b"block"),
+            3,
+        );
 
         // 1 verified + 2 unverified = 3 → should trigger
         tracker.add_verified_vote(make_vote(0, root), 1);

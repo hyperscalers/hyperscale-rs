@@ -345,9 +345,6 @@ fn format_transaction_status(
                 None,
             )
         }
-        TransactionStatus::Aborted { reason } => {
-            ("aborted".to_string(), None, None, Some(reason.to_string()))
-        }
     }
 }
 

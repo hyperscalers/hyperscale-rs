@@ -190,13 +190,9 @@ impl ProvisionCoordinator {
         topology: &TopologySnapshot,
         block: &hyperscale_types::Block,
     ) -> Vec<Action> {
-        // Clean up completed/aborted transactions (certificates committed).
-        // All terminal states flow through TC commit — abort intents are NOT
-        // terminal (they feed the execution accumulator). The TC with
-        // decision=Aborted is the actual terminal event.
-        for cert in &block.certificates {
-            self.cleanup_tx(&cert.transaction_hash);
-        }
+        // NOTE: Certificate-committed cleanup is NOT done here. Wave certificates
+        // are lean — they don't carry per-tx hashes. The node state machine calls
+        // cleanup_tx() per tx_hash after extracting decisions from FinalizedWave data.
 
         // Update local committed height
         self.local_committed_height = block.header.height;
@@ -264,7 +260,7 @@ impl ProvisionCoordinator {
             .header
             .waves
             .iter()
-            .any(|w| w.0.contains(&local_shard));
+            .any(|w| w.remote_shards.contains(&local_shard));
 
         if targets_us {
             // Store as verified (QC already checked by coordinator).
@@ -604,7 +600,7 @@ impl ProvisionCoordinator {
     /// Removes the registration and prunes verified_batches where no
     /// transactions remain registered. Orphaned verified_remote_headers
     /// (no batch, pending provisions, or expected provisions) are also removed.
-    fn cleanup_tx(&mut self, tx_hash: &Hash) {
+    pub fn cleanup_tx(&mut self, tx_hash: &Hash) {
         if self.registered_txs.remove(tx_hash).is_none() {
             return;
         }
@@ -1208,7 +1204,11 @@ mod tests {
         // (provision_targets() returns the same set).
         let waves: Vec<WaveId> = provision_targets
             .into_iter()
-            .map(|s| WaveId(std::collections::BTreeSet::from([s])))
+            .map(|s| WaveId {
+                shard_group_id: shard,
+                block_height: height,
+                remote_shards: std::collections::BTreeSet::from([s]),
+            })
             .collect();
         let header = BlockHeader {
             shard_group_id: shard,
@@ -1221,7 +1221,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::from_bytes(format!("root_{shard}_{height}").as_bytes()),
             transaction_root: Hash::ZERO,
-            receipt_root: Hash::ZERO,
+            certificate_root: Hash::ZERO,
             waves,
         };
         let header_hash = header.hash();
@@ -1402,16 +1402,8 @@ mod tests {
         assert!(coordinator.has_any_verified_provisions(&tx_hash));
         assert_eq!(coordinator.verified_remote_header_count(), 1);
 
-        // Cleanup via block commit
-        let mut block = make_block(1);
-        block.certificates.push(std::sync::Arc::new(
-            hyperscale_types::TransactionCertificate {
-                transaction_hash: tx_hash,
-                decision: hyperscale_types::TransactionDecision::Accept,
-                shard_proofs: std::collections::BTreeMap::new(),
-            },
-        ));
-        coordinator.on_block_committed(&topology, &block);
+        // Cleanup via block commit (cleanup_tx is the relevant internal path)
+        coordinator.cleanup_tx(&tx_hash);
 
         // Registration, verified batch, and remote header all pruned
         assert!(!coordinator.is_registered(&tx_hash));
@@ -1439,15 +1431,7 @@ mod tests {
         assert!(coordinator.has_any_verified_provisions(&tx2));
 
         // Only commit tx1 — tx2 still registered
-        let mut block = make_block(1);
-        block.certificates.push(std::sync::Arc::new(
-            hyperscale_types::TransactionCertificate {
-                transaction_hash: tx1,
-                decision: hyperscale_types::TransactionDecision::Accept,
-                shard_proofs: std::collections::BTreeMap::new(),
-            },
-        ));
-        coordinator.on_block_committed(&topology, &block);
+        coordinator.cleanup_tx(&tx1);
 
         // Batch and header preserved because tx2 is still registered
         assert!(!coordinator.is_registered(&tx1));
@@ -1456,15 +1440,7 @@ mod tests {
         assert_eq!(coordinator.verified_remote_header_count(), 1);
 
         // Now commit tx2
-        let mut block2 = make_block(2);
-        block2.certificates.push(std::sync::Arc::new(
-            hyperscale_types::TransactionCertificate {
-                transaction_hash: tx2,
-                decision: hyperscale_types::TransactionDecision::Accept,
-                shard_proofs: std::collections::BTreeMap::new(),
-            },
-        ));
-        coordinator.on_block_committed(&topology, &block2);
+        coordinator.cleanup_tx(&tx2);
 
         // Now everything is pruned
         assert!(!coordinator.has_any_verified_provisions(&tx2));

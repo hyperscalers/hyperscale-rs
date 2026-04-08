@@ -1,290 +1,341 @@
-//! Certificate tracker for cross-shard finalization.
+//! Wave certificate tracker for wave-level finalization.
 //!
-//! Tracks the collection of execution certificates from all participating shards
-//! during Phase 5 of the cross-shard atomic execution protocol.
+//! Replaces the per-tx CertificateTracker. Tracks the collection of execution
+//! certificates from all participating shards for an entire wave (all txs sharing
+//! the same provision dependency set within a block).
 
 use hyperscale_types::{
-    Hash, ShardExecutionProof, ShardGroupId, TransactionCertificate, TransactionDecision,
+    ExecutionCertificate, Hash, ShardAttestation, ShardGroupId, TransactionDecision,
+    TxExecutionOutcome, WaveCertificate, WaveId, WaveResolution,
 };
-use std::collections::{BTreeMap, BTreeSet};
-use tracing::instrument;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::sync::Arc;
 
-/// Tracks certificates for cross-shard finalization.
-///
-/// After each shard creates an execution certificate (aggregated vote), validators
-/// collect certificates from all participating shards. Once all certificates
-/// are received, a final `TransactionCertificate` can be created.
-#[derive(Debug)]
-pub struct CertificateTracker {
-    /// Transaction hash.
-    tx_hash: Hash,
-    /// Shards we expect certificates from.
-    expected_shards: BTreeSet<ShardGroupId>,
-    /// Proofs received per shard.
-    certificates: BTreeMap<ShardGroupId, ShardExecutionProof>,
+/// Per-transaction decision derived from EC outcomes across shards.
+#[derive(Debug, Clone)]
+pub struct TxDecision {
+    pub tx_hash: Hash,
+    pub decision: TransactionDecision,
 }
 
-impl CertificateTracker {
-    /// Create a new certificate tracker.
+/// Tracks execution certificates for wave-level finalization.
+///
+/// Collects ShardAttestations from ECs. A single remote shard may contribute
+/// multiple ECs (when it committed the wave's txs across multiple blocks),
+/// so we track per-tx coverage rather than per-shard.
+///
+/// Completion = every tx in the wave has all participating shards covered.
+#[derive(Debug)]
+pub struct WaveCertificateTracker {
+    /// The wave being tracked.
+    wave_id: WaveId,
+    /// Transaction hashes in this wave (from accumulator).
+    tx_hashes: Vec<Hash>,
+    /// Participating shards for each tx (local + remote).
+    participating_shards: BTreeMap<Hash, BTreeSet<ShardGroupId>>,
+    /// Per-tx, which shards have reported.
+    covered: BTreeMap<Hash, BTreeSet<ShardGroupId>>,
+    /// Per-tx, whether any shard reported an abort.
+    aborted: BTreeSet<Hash>,
+    /// All contributing ECs (held as Arc for cheap sharing).
+    execution_certificates: Vec<Arc<ExecutionCertificate>>,
+    /// ShardAttestations built from ECs (for WaveCertificate construction).
+    attestations: Vec<ShardAttestation>,
+    /// Canonical hashes of ECs already processed (dedup guard).
+    /// Prevents duplicate attestations from network re-delivery.
+    seen_ec_hashes: HashSet<Hash>,
+    /// Height when this tracker was created.
+    created_at: u64,
+}
+
+impl WaveCertificateTracker {
+    /// Create a new tracker for a wave.
     ///
-    /// # Arguments
-    ///
-    /// * `tx_hash` - The transaction being tracked
-    /// * `expected_shards` - Set of shards we need certificates from
-    pub fn new(tx_hash: Hash, expected_shards: BTreeSet<ShardGroupId>) -> Self {
+    /// `tx_participating_shards` maps each tx_hash to the set of shards that
+    /// participate in its execution (local shard + remote provision sources).
+    pub fn new(
+        wave_id: WaveId,
+        tx_participating_shards: BTreeMap<Hash, BTreeSet<ShardGroupId>>,
+        created_at: u64,
+    ) -> Self {
+        let tx_hashes: Vec<Hash> = tx_participating_shards.keys().copied().collect();
+        let covered: BTreeMap<Hash, BTreeSet<ShardGroupId>> =
+            tx_hashes.iter().map(|h| (*h, BTreeSet::new())).collect();
         Self {
-            tx_hash,
-            expected_shards,
-            certificates: BTreeMap::new(),
+            wave_id,
+            tx_hashes,
+            participating_shards: tx_participating_shards,
+            covered,
+            aborted: BTreeSet::new(),
+            execution_certificates: Vec::new(),
+            attestations: Vec::new(),
+            seen_ec_hashes: HashSet::new(),
+            created_at,
         }
     }
 
-    /// Get the number of certificates collected.
-    pub fn certificate_count(&self) -> usize {
-        self.certificates.len()
+    pub fn wave_id(&self) -> &WaveId {
+        &self.wave_id
     }
 
-    /// Get the number of expected certificates.
-    pub fn expected_count(&self) -> usize {
-        self.expected_shards.len()
+    pub fn tx_hashes(&self) -> &[Hash] {
+        &self.tx_hashes
     }
 
-    /// Add a proof for a shard. Returns true if ready to form a TC.
+    pub fn created_at(&self) -> u64 {
+        self.created_at
+    }
+
+    /// Feed an EC into the tracker. Returns true if the wave is now complete.
     ///
-    /// Ready means either:
-    /// - All expected shards have reported (normal case)
-    /// - Any shard reported an abort (abort takes unconditional priority)
-    #[instrument(level = "debug", skip(self, proof), fields(
-        tx_hash = %self.tx_hash,
-        shard = shard.0,
-        collected = self.certificates.len(),
-        expected = self.expected_shards.len(),
-    ))]
-    pub fn add_proof(&mut self, shard: ShardGroupId, proof: ShardExecutionProof) -> bool {
-        if !self.expected_shards.contains(&shard) {
-            tracing::debug!(
-                tx_hash = ?self.tx_hash,
-                shard = shard.0,
-                expected = ?self.expected_shards,
-                "Proof from unexpected shard, ignoring"
-            );
-            return false;
+    /// Builds a ShardAttestation from the EC and updates per-tx coverage.
+    /// Duplicate ECs (same canonical_hash) are silently ignored to prevent
+    /// non-deterministic attestation lists from network re-delivery.
+    pub fn add_execution_certificate(&mut self, ec: Arc<ExecutionCertificate>) -> bool {
+        let ec_hash = ec.canonical_hash();
+        if !self.seen_ec_hashes.insert(ec_hash) {
+            // Already processed this EC — skip to avoid duplicate attestations.
+            return self.is_complete();
         }
 
-        // Don't overwrite existing proof
-        if self.certificates.contains_key(&shard) {
-            tracing::debug!(
-                tx_hash = ?self.tx_hash,
-                shard = shard.0,
-                "Duplicate proof from shard, ignoring"
-            );
-            return self.is_ready();
-        }
+        let shard = ec.shard_group_id();
 
-        let is_abort = proof.is_aborted();
-        self.certificates.insert(shard, proof);
-        let ready = self.is_ready();
-        tracing::debug!(
-            tx_hash = ?self.tx_hash,
-            shard = shard.0,
-            collected = self.certificates.len(),
-            expected = self.expected_shards.len(),
-            is_abort = is_abort,
-            ready = ready,
-            "Added proof from shard"
-        );
-        ready
-    }
-
-    /// Check if we have all expected certificates.
-    pub fn is_complete(&self) -> bool {
-        self.certificates.len() == self.expected_shards.len()
-    }
-
-    /// Check if we're ready to form a TC.
-    ///
-    /// Ready if all shards reported, OR if any shard aborted (abort is
-    /// unconditionally terminal — waiting for other shards adds no information).
-    pub fn is_ready(&self) -> bool {
-        self.is_complete() || self.has_abort()
-    }
-
-    /// Check if any shard reported an abort.
-    fn has_abort(&self) -> bool {
-        self.certificates.values().any(|c| c.is_aborted())
-    }
-
-    /// Create a `TransactionCertificate` from collected certificates.
-    ///
-    /// Takes ownership of collected certificates to avoid cloning.
-    ///
-    /// Decision priority: `Aborted > Reject > Accept`.
-    /// - If any shard has `receipt_hash == Hash::ZERO` (aborted), decision is `Aborted`
-    /// - Otherwise, receipt hashes must agree across all shards
-    /// - If all shards succeeded, decision is `Accept`; otherwise `Reject`
-    ///
-    /// Returns `None` if:
-    /// - Not ready (no abort and not all certificates collected)
-    /// - Non-aborted certificates have mismatched receipt hashes (Byzantine behavior)
-    #[instrument(level = "debug", skip(self), fields(
-        tx_hash = %self.tx_hash,
-        shard_count = self.certificates.len(),
-    ))]
-    pub fn create_tx_certificate(&mut self) -> Option<TransactionCertificate> {
-        if !self.is_ready() {
-            tracing::debug!(
-                tx_hash = ?self.tx_hash,
-                collected = self.certificates.len(),
-                expected = self.expected_shards.len(),
-                "Cannot create TX certificate - not ready"
-            );
-            return None;
-        }
-
-        // Abort takes unconditional priority — if any shard aborted, the TC
-        // decision is Aborted regardless of what other shards reported.
-        let any_aborted = self.has_abort();
-
-        let decision = if any_aborted {
-            tracing::debug!(
-                tx_hash = ?self.tx_hash,
-                shards = ?self.certificates.keys().collect::<Vec<_>>(),
-                "Creating TX certificate with Aborted decision - at least one shard aborted"
-            );
-            TransactionDecision::Aborted
-        } else {
-            // All shards executed — verify receipt hash agreement
-            let per_shard: Vec<_> = self
-                .certificates
-                .iter()
-                .map(|(s, c)| (*s, c.receipt_hash_or_zero()))
-                .collect();
-            let first_hash = per_shard[0].1;
-            if !per_shard.iter().all(|(_, h)| *h == first_hash) {
-                tracing::warn!(
-                    tx_hash = ?self.tx_hash,
-                    per_shard = ?per_shard,
-                    "Receipt hash mismatch across shards - aborting transaction"
-                );
-                TransactionDecision::Aborted
-            } else {
-                let all_succeeded = self.certificates.values().all(|c| c.is_success());
-                if all_succeeded {
-                    tracing::debug!(
-                        tx_hash = ?self.tx_hash,
-                        shards = ?self.certificates.keys().collect::<Vec<_>>(),
-                        "Creating TX certificate - all shards accepted"
-                    );
-                    TransactionDecision::Accept
-                } else {
-                    tracing::debug!(
-                        tx_hash = ?self.tx_hash,
-                        shards = ?self.certificates.keys().collect::<Vec<_>>(),
-                        "Creating TX certificate - at least one shard rejected"
-                    );
-                    TransactionDecision::Reject
-                }
-            }
+        // Build attestation from EC
+        let attestation = ShardAttestation {
+            shard_group_id: shard,
+            ec_hash: ec.canonical_hash(),
+            vote_height: ec.vote_height,
+            receipt_root: ec.receipt_root,
+            aggregated_signature: ec.aggregated_signature,
+            signers: ec.signers.clone(),
         };
 
-        let shard_proofs = std::mem::take(&mut self.certificates);
+        // Update per-tx coverage
+        for outcome in &ec.tx_outcomes {
+            if let Some(covered_shards) = self.covered.get_mut(&outcome.tx_hash) {
+                covered_shards.insert(shard);
+                if outcome.is_aborted() {
+                    self.aborted.insert(outcome.tx_hash);
+                }
+            }
+            // Outcomes for unknown tx_hashes are silently ignored — they may
+            // belong to a different wave on the remote shard.
+        }
 
-        Some(TransactionCertificate {
-            transaction_hash: self.tx_hash,
-            decision,
-            shard_proofs,
-        })
+        self.attestations.push(attestation);
+        self.execution_certificates.push(ec);
+
+        self.is_complete()
+    }
+
+    /// Whether every tx in the wave has all participating shards covered.
+    pub fn is_complete(&self) -> bool {
+        for (tx_hash, expected) in &self.participating_shards {
+            if let Some(covered) = self.covered.get(tx_hash) {
+                if !expected.is_subset(covered) {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Create a WaveCertificate from collected attestations.
+    ///
+    /// Call only when `is_complete()` returns true.
+    /// Attestations are sorted by (shard_group_id, ec_hash) for deterministic receipt_hash.
+    pub fn create_wave_certificate(&mut self) -> WaveCertificate {
+        // Sort attestations for deterministic receipt_hash
+        self.attestations
+            .sort_by(|a, b| (&a.shard_group_id, &a.ec_hash).cmp(&(&b.shard_group_id, &b.ec_hash)));
+
+        WaveCertificate {
+            wave_id: self.wave_id.clone(),
+            resolution: WaveResolution::Completed {
+                attestations: self.attestations.clone(),
+            },
+        }
+    }
+
+    /// Derive per-tx decisions from the collected ECs.
+    ///
+    /// Decision priority: Aborted > Reject > Accept (same as old CertificateTracker).
+    /// Only ECs that actually contain an outcome for a given tx are considered —
+    /// a remote shard may produce multiple ECs (D8), and each only covers a subset.
+    pub fn tx_decisions(&self) -> Vec<TxDecision> {
+        self.tx_hashes
+            .iter()
+            .map(|tx_hash| {
+                let decision = if self.aborted.contains(tx_hash) {
+                    TransactionDecision::Aborted
+                } else {
+                    // Only check ECs that contain an outcome for this tx.
+                    // A remote shard may split the wave's txs across multiple
+                    // blocks → multiple ECs, each covering a subset of txs.
+                    let all_succeeded = self
+                        .execution_certificates
+                        .iter()
+                        .filter_map(|ec| ec.tx_outcomes.iter().find(|o| o.tx_hash == *tx_hash))
+                        .all(|o| {
+                            matches!(
+                                o.outcome,
+                                TxExecutionOutcome::Executed { success: true, .. }
+                            )
+                        });
+                    if all_succeeded {
+                        TransactionDecision::Accept
+                    } else {
+                        TransactionDecision::Reject
+                    }
+                };
+                TxDecision {
+                    tx_hash: *tx_hash,
+                    decision,
+                }
+            })
+            .collect()
+    }
+
+    /// Take the collected execution certificates (for FinalizedWave).
+    pub fn take_execution_certificates(&mut self) -> Vec<Arc<ExecutionCertificate>> {
+        std::mem::take(&mut self.execution_certificates)
+    }
+}
+
+/// Create an all-abort wave certificate for a timed-out wave.
+pub fn create_abort_wave_certificate(wave_id: WaveId) -> WaveCertificate {
+    WaveCertificate {
+        wave_id,
+        resolution: WaveResolution::Aborted,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hyperscale_types::{Bls12381G2Signature, SignerBitfield, TxOutcome, WaveId};
+    use std::collections::BTreeSet;
 
-    fn make_proof(receipt_hash: Hash) -> ShardExecutionProof {
-        ShardExecutionProof::Executed {
-            receipt_hash,
-            success: true,
-            write_nodes: vec![],
-            ec_hash: Hash::ZERO,
-        }
+    fn make_wave_id() -> WaveId {
+        WaveId::new(ShardGroupId(0), 10, BTreeSet::from([ShardGroupId(1)]))
+    }
+
+    fn make_ec(
+        shard: ShardGroupId,
+        _wave_id: &WaveId,
+        tx_hashes: &[Hash],
+        success: bool,
+    ) -> Arc<ExecutionCertificate> {
+        let outcomes: Vec<TxOutcome> = tx_hashes
+            .iter()
+            .map(|h| TxOutcome {
+                tx_hash: *h,
+                outcome: if success {
+                    TxExecutionOutcome::Executed {
+                        receipt_hash: Hash::from_bytes(b"receipt"),
+                        success: true,
+                        write_nodes: vec![],
+                    }
+                } else {
+                    TxExecutionOutcome::Aborted {
+                        reason: hyperscale_types::AbortReason::ExecutionTimeout {
+                            committed_at: hyperscale_types::BlockHeight(5),
+                        },
+                    }
+                },
+            })
+            .collect();
+        // Build the EC's wave_id with the source shard's shard_group_id,
+        // since ec.shard_group_id() is derived from wave_id.shard_group_id.
+        // Each shard creates its own wave_id reflecting itself as origin.
+        let ec_wave_id = WaveId::new(shard, _wave_id.block_height, _wave_id.remote_shards.clone());
+        Arc::new(ExecutionCertificate {
+            wave_id: ec_wave_id,
+            vote_height: 11,
+            receipt_root: Hash::from_bytes(b"receipt_root"),
+            tx_outcomes: outcomes,
+            aggregated_signature: Bls12381G2Signature([0u8; 96]),
+            signers: SignerBitfield::new(4),
+        })
     }
 
     #[test]
-    fn test_certificate_tracker_basic() {
-        let tx_hash = Hash::from_bytes(b"test_tx");
-        let shard0 = ShardGroupId(0);
-        let shard1 = ShardGroupId(1);
-        let commitment = Hash::from_bytes(b"commitment");
+    fn test_single_shard_wave() {
+        let wave_id = WaveId::new(ShardGroupId(0), 10, BTreeSet::new());
+        let tx1 = Hash::from_bytes(b"tx1");
 
-        let expected = [shard0, shard1].into_iter().collect();
-        let mut tracker = CertificateTracker::new(tx_hash, expected);
+        let mut participating = BTreeMap::new();
+        participating.insert(tx1, BTreeSet::from([ShardGroupId(0)]));
 
+        let mut tracker = WaveCertificateTracker::new(wave_id.clone(), participating, 10);
         assert!(!tracker.is_complete());
 
-        assert!(!tracker.add_proof(shard0, make_proof(commitment)));
-        assert!(tracker.add_proof(shard1, make_proof(commitment)));
-
+        let ec = make_ec(ShardGroupId(0), &wave_id, &[tx1], true);
+        assert!(tracker.add_execution_certificate(ec));
         assert!(tracker.is_complete());
 
-        let tx_cert = tracker.create_tx_certificate();
-        assert!(tx_cert.is_some());
-        let tx_cert = tx_cert.unwrap();
-        assert_eq!(tx_cert.transaction_hash, tx_hash);
-        assert!(tx_cert.is_accepted());
-        assert_eq!(tx_cert.shard_count(), 2);
+        let wc = tracker.create_wave_certificate();
+        assert!(wc.is_completed());
+        assert_eq!(wc.attestations().len(), 1);
     }
 
     #[test]
-    fn test_certificate_tracker_merkle_mismatch() {
-        let tx_hash = Hash::from_bytes(b"test_tx");
-        let shard0 = ShardGroupId(0);
-        let shard1 = ShardGroupId(1);
-        let root_a = Hash::from_bytes(b"root_a");
-        let root_b = Hash::from_bytes(b"root_b");
+    fn test_cross_shard_wave() {
+        let wave_id = make_wave_id();
+        let tx1 = Hash::from_bytes(b"tx1");
+        let tx2 = Hash::from_bytes(b"tx2");
 
-        let expected = [shard0, shard1].into_iter().collect();
-        let mut tracker = CertificateTracker::new(tx_hash, expected);
+        let both_shards = BTreeSet::from([ShardGroupId(0), ShardGroupId(1)]);
+        let mut participating = BTreeMap::new();
+        participating.insert(tx1, both_shards.clone());
+        participating.insert(tx2, both_shards);
 
-        tracker.add_proof(shard0, make_proof(root_a));
-        tracker.add_proof(shard1, make_proof(root_b));
+        let mut tracker = WaveCertificateTracker::new(wave_id.clone(), participating, 10);
 
-        assert!(tracker.is_complete());
-        // Mismatch produces an Aborted TC so the mempool can clean up
-        let tc = tracker
-            .create_tx_certificate()
-            .expect("should produce TC on mismatch");
-        assert_eq!(tc.decision, TransactionDecision::Aborted);
+        // Local shard EC
+        let ec_local = make_ec(ShardGroupId(0), &wave_id, &[tx1, tx2], true);
+        assert!(!tracker.add_execution_certificate(ec_local));
+
+        // Remote shard EC
+        let ec_remote = make_ec(ShardGroupId(1), &wave_id, &[tx1, tx2], true);
+        assert!(tracker.add_execution_certificate(ec_remote));
+
+        let decisions = tracker.tx_decisions();
+        assert_eq!(decisions.len(), 2);
+        assert!(decisions
+            .iter()
+            .all(|d| d.decision == TransactionDecision::Accept));
     }
 
     #[test]
-    fn test_certificate_tracker_ignores_unknown_shard() {
-        let tx_hash = Hash::from_bytes(b"test_tx");
-        let shard0 = ShardGroupId(0);
-        let commitment = Hash::from_bytes(b"commitment");
+    fn test_abort_decision() {
+        let wave_id = make_wave_id();
+        let tx1 = Hash::from_bytes(b"tx1");
 
-        let expected = [shard0].into_iter().collect();
-        let mut tracker = CertificateTracker::new(tx_hash, expected);
+        let both_shards = BTreeSet::from([ShardGroupId(0), ShardGroupId(1)]);
+        let mut participating = BTreeMap::new();
+        participating.insert(tx1, both_shards);
 
-        // Proof from unknown shard
-        assert!(!tracker.add_proof(ShardGroupId(99), make_proof(commitment)));
-        assert!(!tracker.is_complete());
+        let mut tracker = WaveCertificateTracker::new(wave_id.clone(), participating, 10);
+
+        // Local shard says success
+        let ec_local = make_ec(ShardGroupId(0), &wave_id, &[tx1], true);
+        tracker.add_execution_certificate(ec_local);
+
+        // Remote shard says abort
+        let ec_remote = make_ec(ShardGroupId(1), &wave_id, &[tx1], false);
+        tracker.add_execution_certificate(ec_remote);
+
+        let decisions = tracker.tx_decisions();
+        assert_eq!(decisions[0].decision, TransactionDecision::Aborted);
     }
 
     #[test]
-    fn test_certificate_tracker_no_duplicate() {
-        let tx_hash = Hash::from_bytes(b"test_tx");
-        let shard0 = ShardGroupId(0);
-        let commitment = Hash::from_bytes(b"commitment");
-
-        let expected = [shard0].into_iter().collect();
-        let mut tracker = CertificateTracker::new(tx_hash, expected);
-
-        assert!(tracker.add_proof(shard0, make_proof(commitment)));
-
-        // Duplicate should not change state
-        assert_eq!(tracker.certificate_count(), 1);
-        tracker.add_proof(shard0, make_proof(commitment));
-        assert_eq!(tracker.certificate_count(), 1);
+    fn test_abort_wave_certificate() {
+        let wave_id = make_wave_id();
+        let wc = create_abort_wave_certificate(wave_id);
+        assert!(wc.is_aborted());
     }
 }

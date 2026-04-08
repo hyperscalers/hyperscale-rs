@@ -5,7 +5,7 @@
 //! carries precomputed work; `commit_prepared_block` applies it efficiently.
 
 use hyperscale_types::{
-    BlockHeight, ExecutionCertificate, Hash, QuorumCertificate, TransactionCertificate,
+    BlockHeight, ExecutionCertificate, Hash, QuorumCertificate, WaveCertificate,
 };
 use radix_substate_store_interface::interface::DatabaseUpdates;
 use std::sync::Arc;
@@ -70,7 +70,7 @@ pub trait CommitStore: Send + Sync {
     fn commit_prepared_block(
         &self,
         prepared: Self::PreparedCommit,
-        certificates: &[Arc<TransactionCertificate>],
+        certificates: &[Arc<WaveCertificate>],
         consensus: Option<ConsensusCommitData>,
         execution_certificates: &[ExecutionCertificate],
     ) -> Hash;
@@ -87,7 +87,7 @@ pub trait CommitStore: Send + Sync {
     fn commit_block(
         &self,
         merged_updates: &DatabaseUpdates,
-        certificates: &[Arc<TransactionCertificate>],
+        certificates: &[Arc<WaveCertificate>],
         block_height: u64,
         consensus: Option<ConsensusCommitData>,
         execution_certificates: &[ExecutionCertificate],

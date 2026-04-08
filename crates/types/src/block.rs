@@ -1,18 +1,19 @@
 //! Block and BlockHeader types for consensus.
 
 use crate::{
-    compute_merkle_root, compute_merkle_root_with_proof, compute_padded_merkle_root, AbortIntent,
-    BlockHeight, Hash, QuorumCertificate, RoutableTransaction, ShardGroupId,
-    TransactionCertificate, TransactionInclusionProof, ValidatorId, WaveId,
+    compute_merkle_root, compute_merkle_root_with_proof, compute_padded_merkle_root,
+    decode_wave_cert_vec, encode_wave_cert_vec, AbortIntent, BlockHeight, Hash, QuorumCertificate,
+    RoutableTransaction, ShardGroupId, TransactionInclusionProof, ValidatorId, WaveCertificate,
+    WaveId,
 };
 use sbor::prelude::*;
 use std::sync::Arc;
 
-/// Compute the receipt merkle root for a block's certificates.
+/// Compute the receipt merkle root for a block's wave certificates.
 ///
-/// Each certificate's `receipt_hash` (hash of outcome + event_root) becomes a leaf.
+/// Each wave certificate's `receipt_hash` becomes a leaf.
 /// Returns `Hash::ZERO` if there are no certificates.
-pub fn compute_receipt_root(certificates: &[Arc<TransactionCertificate>]) -> Hash {
+pub fn compute_certificate_root(certificates: &[Arc<WaveCertificate>]) -> Hash {
     if certificates.is_empty() {
         return Hash::ZERO;
     }
@@ -136,7 +137,7 @@ pub struct BlockHeader {
     /// X succeed/fail in block N?" without replaying the block.
     ///
     /// For empty blocks (genesis, fallback, no certificates), this is `Hash::ZERO`.
-    pub receipt_root: Hash,
+    pub certificate_root: Hash,
 
     /// Cross-shard execution waves in this block.
     ///
@@ -170,7 +171,7 @@ impl BlockHeader {
             is_fallback: false,
             state_root,
             transaction_root: Hash::ZERO,
-            receipt_root: Hash::ZERO,
+            certificate_root: Hash::ZERO,
             waves: vec![],
         }
     }
@@ -181,7 +182,7 @@ impl BlockHeader {
     pub fn provision_targets(&self) -> Vec<ShardGroupId> {
         let mut set = std::collections::BTreeSet::new();
         for wave in &self.waves {
-            set.extend(wave.0.iter().copied());
+            set.extend(wave.remote_shards.iter().copied());
         }
         set.into_iter().collect()
     }
@@ -208,7 +209,7 @@ impl BlockHeader {
 /// Transactions are stored in a single flat list, sorted by hash for deterministic ordering.
 ///
 /// Additional block contents:
-/// - **certificates**: Finalized transaction certificates (Accept/Reject/Aborted decisions)
+/// - **certificates**: Wave certificates (per-wave finalization proofs)
 /// - **abort_intents**: Proposals to abort transactions (timeout, livelock cycle)
 ///
 /// Transactions and certificates are stored as `Arc` for efficient cloning
@@ -222,8 +223,8 @@ pub struct Block {
     /// All transactions in this block, sorted by hash.
     pub transactions: Vec<Arc<RoutableTransaction>>,
 
-    /// Transaction certificates for finalized transactions.
-    pub certificates: Vec<Arc<TransactionCertificate>>,
+    /// Wave certificates for finalized waves.
+    pub certificates: Vec<Arc<WaveCertificate>>,
 
     /// Abort intents — proposals to the execution voting process.
     pub abort_intents: Vec<AbortIntent>,
@@ -252,7 +253,7 @@ impl Eq for Block {}
 
 // ============================================================================
 // Manual SBOR implementation (since Arc doesn't derive BasicSbor)
-// We serialize/deserialize the inner RoutableTransaction directly.
+// We serialize/deserialize the inner types directly.
 // ============================================================================
 
 /// Helper to encode a Vec<Arc<RoutableTransaction>> as an SBOR array.
@@ -278,13 +279,7 @@ impl<E: sbor::Encoder<sbor::NoCustomValueKind>> sbor::Encode<sbor::NoCustomValue
         encoder.write_size(4)?;
         encoder.encode(&self.header)?;
         encode_tx_vec(encoder, &self.transactions)?;
-        // Certificates (manual encoding to unwrap Arc)
-        encoder.write_value_kind(sbor::ValueKind::Array)?;
-        encoder.write_value_kind(sbor::ValueKind::Tuple)?;
-        encoder.write_size(self.certificates.len())?;
-        for cert in &self.certificates {
-            encoder.encode_deeper_body(cert.as_ref())?;
-        }
+        encode_wave_cert_vec(encoder, &self.certificates)?;
         encoder.encode(&self.abort_intents)?;
         Ok(())
     }
@@ -338,24 +333,7 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
 
         let header: BlockHeader = decoder.decode()?;
         let transactions = decode_tx_vec(decoder)?;
-
-        // Certificates (manual decoding to wrap in Arc)
-        decoder.read_and_check_value_kind(sbor::ValueKind::Array)?;
-        decoder.read_and_check_value_kind(sbor::ValueKind::Tuple)?;
-        let cert_count = decoder.read_size()?;
-        if cert_count > MAX_SBOR_COLLECTION_SIZE {
-            return Err(sbor::DecodeError::UnexpectedSize {
-                expected: MAX_SBOR_COLLECTION_SIZE,
-                actual: cert_count,
-            });
-        }
-        let mut certificates = Vec::with_capacity(cert_count);
-        for _ in 0..cert_count {
-            let cert: TransactionCertificate =
-                decoder.decode_deeper_body_with_value_kind(sbor::ValueKind::Tuple)?;
-            certificates.push(Arc::new(cert));
-        }
-
+        let certificates = decode_wave_cert_vec(decoder, MAX_SBOR_COLLECTION_SIZE)?;
         let abort_intents: Vec<AbortIntent> = decoder.decode()?;
 
         Ok(Self {
@@ -422,24 +400,9 @@ impl Block {
         self.header.is_genesis()
     }
 
-    /// Get number of committed certificates in this block.
+    /// Get number of wave certificates in this block.
     pub fn certificate_count(&self) -> usize {
         self.certificates.len()
-    }
-
-    /// Get transaction hashes from committed certificates.
-    pub fn committed_transaction_hashes(&self) -> Vec<Hash> {
-        self.certificates
-            .iter()
-            .map(|cert| cert.transaction_hash)
-            .collect()
-    }
-
-    /// Check if this block contains a certificate for a specific transaction.
-    pub fn contains_certificate(&self, tx_hash: &Hash) -> bool {
-        self.certificates
-            .iter()
-            .any(|cert| &cert.transaction_hash == tx_hash)
     }
 
     /// Get number of abort intents in this block.
@@ -499,21 +462,39 @@ impl BlockManifest {
     }
 
     /// Build a manifest from a full block (extracting hashes).
+    ///
+    /// `cert_hashes` uses wave_id identity hashes (computable without EC knowledge).
+    /// `receipt_hashes` must be populated separately by the proposer from
+    /// FinalizedWave tx_hashes (the block alone doesn't carry per-tx info).
     pub fn from_block(block: &Block) -> Self {
         Self {
             tx_hashes: block.transactions.iter().map(|tx| tx.hash()).collect(),
             cert_hashes: block
                 .certificates
                 .iter()
-                .map(|c| c.transaction_hash)
+                .map(|c| c.wave_id.hash())
                 .collect(),
             abort_intents: block.abort_intents.clone(),
-            receipt_hashes: block
+            // receipt_hashes is empty here — must be populated by the proposer
+            // from FinalizedWave data, since wave certs don't carry per-tx info.
+            receipt_hashes: vec![],
+        }
+    }
+
+    /// Build a manifest from a full block with explicit receipt hashes.
+    ///
+    /// The proposer provides `receipt_hashes` (tx hashes of non-aborted txs
+    /// across all wave certs) since the lean wave cert doesn't embed per-tx data.
+    pub fn from_block_with_receipts(block: &Block, receipt_hashes: Vec<Hash>) -> Self {
+        Self {
+            tx_hashes: block.transactions.iter().map(|tx| tx.hash()).collect(),
+            cert_hashes: block
                 .certificates
                 .iter()
-                .filter(|c| c.decision != crate::TransactionDecision::Aborted)
-                .map(|c| c.transaction_hash)
+                .map(|c| c.wave_id.hash())
                 .collect(),
+            abort_intents: block.abort_intents.clone(),
+            receipt_hashes,
         }
     }
 }
@@ -532,7 +513,7 @@ impl BlockManifest {
 ///
 /// - `"blocks"` CF: `BlockMetadata` (this struct) keyed by height
 /// - `"transactions"` CF: `RoutableTransaction` keyed by tx_hash
-/// - `"certificates"` CF: `TransactionCertificate` keyed by tx_hash
+/// - `"wave_certificates"` CF: `WaveCertificate` keyed by wave_id hash
 ///
 /// To reconstruct a full `Block`, fetch the metadata, then batch-fetch
 /// transactions and certificates using the stored hashes.
@@ -637,7 +618,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
-            receipt_root: Hash::ZERO,
+            certificate_root: Hash::ZERO,
             waves: vec![],
         };
 
@@ -682,74 +663,80 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_receipt_root_empty() {
-        let root = compute_receipt_root(&[]);
+    fn test_compute_certificate_root_empty() {
+        let root = compute_certificate_root(&[]);
         assert_eq!(root, Hash::ZERO);
     }
 
     #[test]
-    fn test_compute_receipt_root_deterministic() {
+    fn test_compute_certificate_root_deterministic() {
         use crate::{
-            ShardExecutionProof, ShardGroupId, TransactionCertificate, TransactionDecision,
+            Bls12381G2Signature, ShardAttestation, ShardGroupId, SignerBitfield, WaveCertificate,
+            WaveId, WaveResolution,
         };
-        use std::collections::BTreeMap;
+        use std::collections::BTreeSet;
 
-        let make_cert = |seed: u8| -> Arc<TransactionCertificate> {
-            let mut shard_proofs = BTreeMap::new();
-            shard_proofs.insert(
-                ShardGroupId(0),
-                ShardExecutionProof::Executed {
-                    receipt_hash: Hash::from_bytes(&[seed + 100; 32]),
-                    success: true,
-                    write_nodes: vec![],
-                    ec_hash: Hash::ZERO,
+        let make_wave_cert = |seed: u8| -> Arc<WaveCertificate> {
+            Arc::new(WaveCertificate {
+                wave_id: WaveId {
+                    shard_group_id: ShardGroupId(0),
+                    block_height: 10,
+                    remote_shards: BTreeSet::from([ShardGroupId(1)]),
                 },
-            );
-            Arc::new(TransactionCertificate {
-                transaction_hash: Hash::from_bytes(&[seed; 32]),
-                decision: TransactionDecision::Accept,
-                shard_proofs,
+                resolution: WaveResolution::Completed {
+                    attestations: vec![ShardAttestation {
+                        shard_group_id: ShardGroupId(0),
+                        ec_hash: Hash::from_bytes(&[seed; 4]),
+                        vote_height: 11,
+                        receipt_root: Hash::from_bytes(&[seed + 100; 4]),
+                        aggregated_signature: Bls12381G2Signature([0u8; 96]),
+                        signers: SignerBitfield::new(4),
+                    }],
+                },
             })
         };
 
-        let certs = vec![make_cert(1), make_cert(2)];
-        let root1 = compute_receipt_root(&certs);
-        let root2 = compute_receipt_root(&certs);
+        let certs = vec![make_wave_cert(1), make_wave_cert(2)];
+        let root1 = compute_certificate_root(&certs);
+        let root2 = compute_certificate_root(&certs);
         assert_eq!(root1, root2);
         assert_ne!(root1, Hash::ZERO);
     }
 
     #[test]
-    fn test_compute_receipt_root_single_cert() {
+    fn test_compute_certificate_root_single_cert() {
         use crate::{
-            ShardExecutionProof, ShardGroupId, TransactionCertificate, TransactionDecision,
+            Bls12381G2Signature, ShardAttestation, ShardGroupId, SignerBitfield, WaveCertificate,
+            WaveId, WaveResolution,
         };
-        use std::collections::BTreeMap;
+        use std::collections::BTreeSet;
 
-        let mut shard_proofs = BTreeMap::new();
-        shard_proofs.insert(
-            ShardGroupId(0),
-            ShardExecutionProof::Executed {
-                receipt_hash: Hash::from_bytes(b"receipt_hash_value"),
-                success: true,
-                write_nodes: vec![],
-                ec_hash: Hash::ZERO,
+        let cert = Arc::new(WaveCertificate {
+            wave_id: WaveId {
+                shard_group_id: ShardGroupId(0),
+                block_height: 10,
+                remote_shards: BTreeSet::new(),
             },
-        );
-        let cert = Arc::new(TransactionCertificate {
-            transaction_hash: Hash::from_bytes(&[1; 32]),
-            decision: TransactionDecision::Accept,
-            shard_proofs,
+            resolution: WaveResolution::Completed {
+                attestations: vec![ShardAttestation {
+                    shard_group_id: ShardGroupId(0),
+                    ec_hash: Hash::from_bytes(b"ec1"),
+                    vote_height: 11,
+                    receipt_root: Hash::from_bytes(b"receipt"),
+                    aggregated_signature: Bls12381G2Signature([0u8; 96]),
+                    signers: SignerBitfield::new(4),
+                }],
+            },
         });
 
-        let root = compute_receipt_root(std::slice::from_ref(&cert));
-        // Single cert: receipt_root should equal the cert's receipt_hash
+        let root = compute_certificate_root(std::slice::from_ref(&cert));
+        // Single cert: certificate_root should equal the cert's receipt_hash
         assert_eq!(root, cert.receipt_hash());
     }
 
     #[test]
-    fn test_genesis_receipt_root_is_zero() {
+    fn test_genesis_certificate_root_is_zero() {
         let genesis = Block::genesis(ShardGroupId(0), ValidatorId(0), Hash::ZERO);
-        assert_eq!(genesis.header.receipt_root, Hash::ZERO);
+        assert_eq!(genesis.header.certificate_root, Hash::ZERO);
     }
 }

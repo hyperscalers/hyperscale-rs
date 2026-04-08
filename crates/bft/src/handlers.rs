@@ -6,10 +6,10 @@
 
 use hyperscale_storage::{CommitStore, DatabaseUpdates, SubstateStore};
 use hyperscale_types::{
-    batch_verify_bls_same_message, compute_receipt_root, compute_transaction_root,
+    batch_verify_bls_same_message, compute_certificate_root, compute_transaction_root,
     verify_bls12381_v1, AbortIntent, Block, BlockHeader, BlockHeight, BlockVote,
     Bls12381G1PublicKey, Bls12381G2Signature, Hash, QuorumCertificate, RoutableTransaction,
-    ShardGroupId, SignerBitfield, TransactionCertificate, ValidatorId, VotePower, WaveId,
+    ShardGroupId, SignerBitfield, ValidatorId, VotePower, WaveCertificate, WaveId,
 };
 use std::sync::Arc;
 
@@ -205,14 +205,11 @@ pub fn verify_transaction_root(
     valid
 }
 
-/// Verify a block's receipt root against its certificates.
+/// Verify a block's receipt root against its wave certificates.
 ///
 /// Pure computation over the certificates' `receipt_hash` values.
-pub fn verify_receipt_root(
-    expected_root: Hash,
-    certificates: &[Arc<TransactionCertificate>],
-) -> bool {
-    let computed_root = compute_receipt_root(certificates);
+pub fn verify_certificate_root(expected_root: Hash, certificates: &[Arc<WaveCertificate>]) -> bool {
+    let computed_root = compute_certificate_root(certificates);
     let valid = computed_root == expected_root;
 
     if !valid {
@@ -220,7 +217,7 @@ pub fn verify_receipt_root(
             ?expected_root,
             ?computed_root,
             cert_count = certificates.len(),
-            "Receipt root verification FAILED"
+            "Certificate root verification FAILED"
         );
     }
 
@@ -330,7 +327,7 @@ pub fn build_proposal<S: CommitStore + SubstateStore>(
     is_fallback: bool,
     parent_state_root: Hash,
     transactions: Vec<Arc<RoutableTransaction>>,
-    certificates: Vec<Arc<TransactionCertificate>>,
+    certificates: Vec<Arc<WaveCertificate>>,
     merged_updates: DatabaseUpdates,
     abort_intents: Vec<AbortIntent>,
     local_shard: ShardGroupId,
@@ -364,7 +361,7 @@ pub fn build_proposal<S: CommitStore + SubstateStore>(
     };
 
     let transaction_root = compute_transaction_root(&transactions);
-    let receipt_root = compute_receipt_root(&certs_to_include);
+    let certificate_root = compute_certificate_root(&certs_to_include);
 
     let header = BlockHeader {
         shard_group_id: local_shard,
@@ -377,7 +374,7 @@ pub fn build_proposal<S: CommitStore + SubstateStore>(
         is_fallback,
         state_root,
         transaction_root,
-        receipt_root,
+        certificate_root,
         waves,
     };
 

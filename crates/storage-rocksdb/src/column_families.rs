@@ -8,7 +8,7 @@ use crate::typed_cf::*;
 use crate::jvt_stored::{StoredNodeKey, VersionedStoredNode};
 use hyperscale_types::{
     BlockMetadata, ExecutionCertificate, Hash, LedgerTransactionReceipt, LocalTransactionExecution,
-    RoutableTransaction, TransactionCertificate,
+    RoutableTransaction, WaveCertificate,
 };
 
 // ─── CF name constants ───────────────────────────────────────────────────────
@@ -168,9 +168,9 @@ pub(crate) struct CertificatesCf;
 impl TypedCf for CertificatesCf {
     const NAME: &'static str = CERTIFICATES_CF;
     type Key = Hash;
-    type Value = TransactionCertificate;
+    type Value = WaveCertificate;
     type KeyCodec = HashCodec;
-    type ValueCodec = SborCodec<TransactionCertificate>;
+    type ValueCodec = SborCodec<WaveCertificate>;
     fn handle<'a>(cf: &CfHandles<'a>) -> &'a rocksdb::ColumnFamily {
         cf.certificates
     }

@@ -1,13 +1,10 @@
 //! Transaction types for consensus.
 
-use crate::{
-    BlockHeight, Hash, NodeId, ShardExecutionProof, ShardGroupId, TransactionInclusionProof,
-};
+use crate::{BlockHeight, Hash, NodeId, ShardGroupId, TransactionInclusionProof};
 use radix_common::data::manifest::{manifest_decode, manifest_encode};
 use radix_transactions::model::{UserTransaction, ValidatedUserTransaction};
 use radix_transactions::validation::TransactionValidator;
 use sbor::prelude::*;
-use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
 /// A transaction with routing information.
@@ -462,14 +459,14 @@ pub enum TransactionStatus {
     /// - Certificate collection (gathering certificates from all shards)
     Committed(BlockHeight),
 
-    /// Execution complete, TransactionCertificate has been created.
+    /// Execution complete, wave certificate has been finalized.
     ///
-    /// All shard execution proofs have been collected and aggregated into a
-    /// TransactionCertificate with Accept or Reject decision.
+    /// All shard execution proofs have been collected and the wave certificate
+    /// has been created with per-tx Accept or Reject decisions.
     ///
-    /// **Important**: State is NOT yet updated at this point. The certificate
+    /// **Important**: State is NOT yet updated at this point. The wave certificate
     /// must be included in a block before state changes are applied. The
-    /// transaction is waiting for the certificate to be committed.
+    /// transaction is waiting for its wave certificate to be committed.
     ///
     /// Still holds state locks until Completed.
     Executed {
@@ -483,21 +480,12 @@ pub enum TransactionStatus {
 
     /// Transaction has been fully processed and can be evicted.
     ///
-    /// The TransactionCertificate has been committed in a block. State changes
+    /// The wave certificate has been committed in a block. State changes
     /// have been applied (if accepted). This is the terminal state - the
     /// transaction can now be safely removed from the mempool.
     ///
     /// Contains the final decision (Accept/Reject/Aborted) from execution.
     Completed(TransactionDecision),
-
-    /// Transaction was aborted due to timeout or livelock.
-    ///
-    /// This is a terminal state - the transaction will not be retried again.
-    /// This status does NOT hold state locks.
-    Aborted {
-        /// The reason for the abort.
-        reason: AbortReason,
-    },
 }
 
 impl TransactionStatus {
@@ -505,12 +493,8 @@ impl TransactionStatus {
     ///
     /// Terminal states:
     /// - `Completed`: Transaction executed and certificate committed
-    /// - `Aborted`: Transaction was aborted due to timeout or livelock
     pub fn is_final(&self) -> bool {
-        matches!(
-            self,
-            TransactionStatus::Completed(_) | TransactionStatus::Aborted { .. }
-        )
+        matches!(self, TransactionStatus::Completed(_))
     }
 
     /// Check if transaction is ready to be included in a block.
@@ -523,8 +507,7 @@ impl TransactionStatus {
     /// Check if this status means the transaction holds state locks.
     ///
     /// State locks are acquired when a transaction is committed in a block and
-    /// released when the TransactionCertificate is committed in a block (Completed),
-    /// or when the transaction is aborted.
+    /// released when the wave certificate is committed in a block (Completed).
     ///
     /// The lock prevents conflicting transactions from being selected for blocks
     /// while this transaction is being executed.
@@ -532,7 +515,6 @@ impl TransactionStatus {
     /// The following statuses do NOT hold locks:
     /// - Pending: not yet committed into a block
     /// - Completed: certificate committed, transaction done
-    /// - Aborted: transaction aborted, locks released
     pub fn holds_state_lock(&self) -> bool {
         matches!(
             self,
@@ -547,15 +529,12 @@ impl TransactionStatus {
     /// but it helps identify clearly stale updates.
     ///
     /// Ordering: Pending(0) < Committed(1) < Executed(2) < Completed(3)
-    ///
-    /// Aborted is a terminal side-branch and gets a high ordinal (4).
     pub fn ordinal(&self) -> u8 {
         match self {
             TransactionStatus::Pending => 0,
             TransactionStatus::Committed(_) => 1,
             TransactionStatus::Executed { .. } => 2,
             TransactionStatus::Completed(_) => 3,
-            TransactionStatus::Aborted { .. } => 4,
         }
     }
 
@@ -570,14 +549,8 @@ impl TransactionStatus {
             // Committed → Executed (execution complete, certificate created)
             (Committed(_), Executed { .. }) => true,
 
-            // Committed → Aborted (timeout or livelock)
-            (Committed(_), Aborted { .. }) => true,
-
             // Executed → Completed (certificate committed in block)
             (Executed { .. }, Completed(_)) => true,
-
-            // Executed → Aborted (timeout, livelock, or receipt mismatch)
-            (Executed { .. }, Aborted { .. }) => true,
 
             // No other transitions are valid
             _ => false,
@@ -617,7 +590,6 @@ impl std::fmt::Display for TransactionStatus {
             TransactionStatus::Completed(TransactionDecision::Aborted) => {
                 write!(f, "completed(aborted)")
             }
-            TransactionStatus::Aborted { reason } => write!(f, "aborted({})", reason),
         }
     }
 }
@@ -670,13 +642,6 @@ impl std::str::FromStr for TransactionStatus {
                 })?)?;
                 Ok(TransactionStatus::Completed(decision))
             }
-            "aborted" => {
-                let reason_str = inner
-                    .ok_or_else(|| TransactionStatusParseError::MissingValue("aborted".into()))?;
-                let reason = AbortReason::from_str(reason_str)
-                    .map_err(|_| TransactionStatusParseError::InvalidValue("reason".into()))?;
-                Ok(TransactionStatus::Aborted { reason })
-            }
             _ => Err(TransactionStatusParseError::UnknownStatus(name.to_string())),
         }
     }
@@ -716,107 +681,6 @@ impl std::fmt::Display for TransactionStatusParseError {
 }
 
 impl std::error::Error for TransactionStatusParseError {}
-
-/// Certificate proving transaction execution across all required shards.
-#[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
-pub struct TransactionCertificate {
-    /// Hash of the transaction this certificate finalizes.
-    pub transaction_hash: Hash,
-
-    /// Final decision: ACCEPT if all shards succeeded, REJECT otherwise.
-    pub decision: TransactionDecision,
-
-    /// Execution proofs from all participating shards, keyed by shard ID.
-    /// Each proof contains receipt_hash, success, and write_nodes.
-    pub shard_proofs: BTreeMap<ShardGroupId, ShardExecutionProof>,
-}
-
-impl TransactionCertificate {
-    /// Check if transaction was accepted.
-    pub fn is_accepted(&self) -> bool {
-        self.decision == TransactionDecision::Accept
-    }
-
-    /// Check if transaction was rejected.
-    pub fn is_rejected(&self) -> bool {
-        self.decision == TransactionDecision::Reject
-    }
-
-    /// Get number of shards involved.
-    pub fn shard_count(&self) -> usize {
-        self.shard_proofs.len()
-    }
-
-    /// Check if this is a single-shard transaction.
-    pub fn is_single_shard(&self) -> bool {
-        self.shard_proofs.len() <= 1
-    }
-
-    /// Check if this is a cross-shard transaction.
-    pub fn is_cross_shard(&self) -> bool {
-        self.shard_proofs.len() > 1
-    }
-
-    /// Get all shard IDs involved in this transaction.
-    pub fn shard_ids(&self) -> Vec<ShardGroupId> {
-        self.shard_proofs.keys().copied().collect()
-    }
-
-    /// Get proof for a specific shard.
-    pub fn proof_for_shard(&self, shard_id: ShardGroupId) -> Option<&ShardExecutionProof> {
-        self.shard_proofs.get(&shard_id)
-    }
-
-    /// Check if all shards succeeded.
-    pub fn all_shards_succeeded(&self) -> bool {
-        self.shard_proofs.values().all(|proof| proof.is_success())
-    }
-
-    /// Combined receipt hash across all shards.
-    ///
-    /// For single-shard transactions, returns the shard's receipt hash directly.
-    /// For cross-shard transactions, computes a merkle root over each shard's
-    /// receipt hash in shard ID order (deterministic via BTreeMap).
-    ///
-    /// Aborted transactions always return `Hash::ZERO` — the abort decision is
-    /// terminal and independent of which shard proofs have arrived. This ensures
-    /// deterministic receipt roots across validators even when abort fast-path
-    /// creates TCs with partial shard_proofs (some shards may not have reported
-    /// yet when the first abort proof triggers TC creation).
-    pub fn receipt_hash(&self) -> Hash {
-        if self.decision == TransactionDecision::Aborted {
-            return Hash::ZERO;
-        }
-        let hashes: Vec<Hash> = self
-            .shard_proofs
-            .values()
-            .map(|proof| {
-                let mut hasher = blake3::Hasher::new();
-                hasher.update(proof.receipt_hash_or_zero().as_bytes());
-                hasher.update(proof.ec_hash().as_bytes());
-                Hash::from_hash_bytes(hasher.finalize().as_bytes())
-            })
-            .collect();
-        let base = match hashes.len() {
-            0 => Hash::ZERO,
-            1 => hashes[0],
-            _ => crate::compute_merkle_root(&hashes),
-        };
-        // Mix in the decision byte so that Accept and Reject produce
-        // distinct receipt hashes even when the shard proofs are identical.
-        // Without this, a byzantine proposer could swap Accept ↔ Reject
-        // without the receipt_root check detecting it.
-        let decision_byte = match self.decision {
-            TransactionDecision::Accept => 0x01,
-            TransactionDecision::Reject => 0x02,
-            TransactionDecision::Aborted => unreachable!(),
-        };
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(base.as_bytes());
-        hasher.update(&[decision_byte]);
-        Hash::from_hash_bytes(hasher.finalize().as_bytes())
-    }
-}
 
 // ============================================================================
 // Transaction Signing Utilities
@@ -1355,43 +1219,5 @@ mod tests {
     #[test]
     fn test_transaction_decision() {
         assert_ne!(TransactionDecision::Accept, TransactionDecision::Reject);
-    }
-
-    #[test]
-    fn test_receipt_hash_changes_when_ec_hash_changes() {
-        use std::collections::BTreeMap;
-
-        let make_tc = |ec_hash: Hash| -> TransactionCertificate {
-            let mut shard_proofs = BTreeMap::new();
-            shard_proofs.insert(
-                crate::ShardGroupId(0),
-                crate::ShardExecutionProof::Executed {
-                    receipt_hash: Hash::from_bytes(b"receipt"),
-                    success: true,
-                    write_nodes: vec![],
-                    ec_hash,
-                },
-            );
-            TransactionCertificate {
-                transaction_hash: Hash::from_bytes(b"tx"),
-                decision: TransactionDecision::Accept,
-                shard_proofs,
-            }
-        };
-
-        let tc_zero = make_tc(Hash::ZERO);
-        let tc_some = make_tc(Hash::from_bytes(b"some_ec_hash"));
-        assert_ne!(tc_zero.receipt_hash(), tc_some.receipt_hash());
-    }
-
-    #[test]
-    fn test_receipt_hash_aborted_ignores_ec_hash() {
-        // Aborted TCs always return Hash::ZERO regardless of ec_hash
-        let tc = TransactionCertificate {
-            transaction_hash: Hash::from_bytes(b"tx"),
-            decision: TransactionDecision::Aborted,
-            shard_proofs: std::collections::BTreeMap::new(),
-        };
-        assert_eq!(tc.receipt_hash(), Hash::ZERO);
     }
 }

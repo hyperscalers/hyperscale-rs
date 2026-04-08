@@ -1,6 +1,6 @@
 //! Transaction certificate fetch protocol state machine.
 //!
-//! Pure synchronous state machine for fetching missing `TransactionCertificate`s
+//! Pure synchronous state machine for fetching missing `WaveCertificate`s
 //! needed by pending blocks.  Sits between the `BftState`'s `FetchCertificates`
 //! action and the actual `network.request()` call, rotating through available
 //! peers on failure before giving up.
@@ -14,7 +14,7 @@
 //! ```
 
 use hyperscale_metrics as metrics;
-use hyperscale_types::{Hash, TransactionCertificate, ValidatorId};
+use hyperscale_types::{Hash, ValidatorId, WaveCertificate};
 use quick_cache::sync::Cache as QuickCache;
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
@@ -62,7 +62,7 @@ pub enum TxCertFetchInput {
     /// Certificates were successfully received from a peer.
     Received {
         block_hash: Hash,
-        certificates: Vec<Arc<TransactionCertificate>>,
+        certificates: Vec<Arc<WaveCertificate>>,
     },
     /// A fetch attempt failed (network error or peer returned empty).
     Failed { block_hash: Hash },
@@ -87,7 +87,7 @@ pub enum TxCertFetchOutput {
     /// Deliver fetched certificates to the state machine.
     Deliver {
         block_hash: Hash,
-        certificates: Vec<Arc<TransactionCertificate>>,
+        certificates: Vec<Arc<WaveCertificate>>,
     },
 }
 
@@ -202,7 +202,7 @@ impl TxCertFetchProtocol {
     fn handle_received(
         &mut self,
         block_hash: Hash,
-        certificates: Vec<Arc<TransactionCertificate>>,
+        certificates: Vec<Arc<WaveCertificate>>,
     ) -> Vec<TxCertFetchOutput> {
         if self.pending.remove(&block_hash).is_some() {
             debug!(
@@ -331,12 +331,13 @@ impl TxCertFetchProtocol {
 // Serving function
 // ═══════════════════════════════════════════════════════════════════════
 
-/// Serve a certificate fetch request using cache + storage fallback.
+/// Serve a wave certificate fetch request using cache + storage fallback.
 ///
 /// Called by the network request handler on the handler thread pool.
+/// Keys are `wave_id.hash()` values from `BlockManifest::cert_hashes`.
 pub fn serve_certificate_request<S: hyperscale_storage::ConsensusStore>(
     storage: &S,
-    cert_cache: &QuickCache<Hash, Arc<TransactionCertificate>>,
+    cert_cache: &QuickCache<Hash, Arc<WaveCertificate>>,
     req: hyperscale_messages::request::GetCertificatesRequest,
 ) -> hyperscale_messages::response::GetCertificatesResponse {
     let mut found = Vec::with_capacity(req.cert_hashes.len());
@@ -351,11 +352,11 @@ pub fn serve_certificate_request<S: hyperscale_storage::ConsensusStore>(
         }
     }
 
-    // Fall back to storage for cache misses.
+    // Storage fallback: look up wave certificates by their identity hash.
     if !cache_misses.is_empty() {
         let from_storage = storage.get_certificates_batch(&cache_misses);
-        for cert in from_storage {
-            found.push(Arc::new(cert));
+        for wc in from_storage {
+            found.push(Arc::new(wc));
         }
     }
 

@@ -10,7 +10,8 @@ use hyperscale_storage::{
 };
 use hyperscale_types::{
     Block, BlockHeight, ExecutionCertificate, Hash, LedgerTransactionReceipt,
-    LocalTransactionExecution, QuorumCertificate, RoutableTransaction, TransactionCertificate,
+    LocalTransactionExecution, QuorumCertificate, RoutableTransaction, ShardGroupId,
+    WaveCertificate,
 };
 use im::OrdMap;
 use jellyfish_verkle_tree as jvt;
@@ -84,9 +85,15 @@ impl SharedState {
             self.tree_store
                 .insert(jvt_key.clone(), Arc::clone(jvt_node));
         }
-        for stale_key in &snapshot.stale_node_keys {
-            self.tree_store.remove(stale_key);
-        }
+        // NOTE: stale JVT nodes are NOT deleted here. Historical JVT nodes
+        // must be retained so that provision fetch (generate_verkle_proofs) can
+        // read the tree at past block heights. In production, RocksDB GC handles
+        // pruning after `jvt_history_length` blocks (default 256). In simulation,
+        // we retain all nodes (tests are short-lived).
+        //
+        // Previously this deleted stale nodes immediately, causing a race: the
+        // delegated FetchAndBroadcastProvisions action would run after the next
+        // block committed, finding the proof-generation root already pruned.
         for a in snapshot.leaf_substate_associations {
             self.associations.insert(a.tree_node_key, a.substate_value);
         }
@@ -113,7 +120,7 @@ pub(crate) struct ConsensusState {
     /// Transactions indexed by hash.
     pub transactions: HashMap<Hash, RoutableTransaction>,
     /// Transaction certificates indexed by transaction hash.
-    pub certificates: HashMap<Hash, TransactionCertificate>,
+    pub certificates: HashMap<Hash, WaveCertificate>,
     /// Our own votes indexed by height.
     /// **BFT Safety Critical**: Used to prevent equivocation after restart.
     pub own_votes: HashMap<u64, (Hash, u64)>,
@@ -127,6 +134,12 @@ pub(crate) struct ConsensusState {
     pub execution_certs: HashMap<Hash, ExecutionCertificate>,
     /// Index: block_height → set of canonical hashes for that height.
     pub execution_certs_by_height: HashMap<u64, Vec<Hash>>,
+    /// Index: block_height → wave_id hashes at that height.
+    pub wave_certs_by_height: HashMap<u64, Vec<Hash>>,
+    /// Index: tx_hash → wave_id hash of the wave cert that finalized it.
+    pub tx_to_wave: HashMap<Hash, Hash>,
+    /// Index: tx_hash → vec of (shard_group_id, ec_hash) pairs covering it.
+    pub tx_to_ec: HashMap<Hash, Vec<(ShardGroupId, Hash)>>,
 }
 
 /// Maximum number of blocks worth of receipts to retain in simulation storage.
@@ -147,6 +160,9 @@ impl ConsensusState {
             receipt_heights: HashMap::new(),
             execution_certs: HashMap::new(),
             execution_certs_by_height: HashMap::new(),
+            wave_certs_by_height: HashMap::new(),
+            tx_to_wave: HashMap::new(),
+            tx_to_ec: HashMap::new(),
         }
     }
 

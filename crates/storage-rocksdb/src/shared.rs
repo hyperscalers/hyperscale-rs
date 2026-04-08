@@ -17,8 +17,8 @@ use hyperscale_storage::{
     SubstateStore,
 };
 use hyperscale_types::{
-    Block, BlockHeight, Hash, NodeId, QuorumCertificate, RoutableTransaction,
-    TransactionCertificate,
+    Block, BlockHeight, Hash, NodeId, QuorumCertificate, RoutableTransaction, ShardGroupId,
+    WaveCertificate,
 };
 use std::sync::Arc;
 
@@ -141,7 +141,7 @@ impl hyperscale_storage::CommitStore for SharedStorage {
     fn commit_prepared_block(
         &self,
         prepared: Self::PreparedCommit,
-        certificates: &[std::sync::Arc<TransactionCertificate>],
+        certificates: &[std::sync::Arc<WaveCertificate>],
         consensus: Option<hyperscale_storage::ConsensusCommitData>,
         execution_certificates: &[hyperscale_types::ExecutionCertificate],
     ) -> hyperscale_types::Hash {
@@ -152,7 +152,7 @@ impl hyperscale_storage::CommitStore for SharedStorage {
     fn commit_block(
         &self,
         merged_updates: &DatabaseUpdates,
-        certificates: &[std::sync::Arc<TransactionCertificate>],
+        certificates: &[std::sync::Arc<WaveCertificate>],
         block_height: u64,
         consensus: Option<hyperscale_storage::ConsensusCommitData>,
         execution_certificates: &[hyperscale_types::ExecutionCertificate],
@@ -204,11 +204,11 @@ impl hyperscale_storage::ConsensusStore for SharedStorage {
         self.0.latest_qc()
     }
 
-    fn store_certificate(&self, certificate: &TransactionCertificate) {
+    fn store_certificate(&self, certificate: &WaveCertificate) {
         self.0.store_certificate(certificate)
     }
 
-    fn get_certificate(&self, hash: &Hash) -> Option<TransactionCertificate> {
+    fn get_certificate(&self, hash: &Hash) -> Option<WaveCertificate> {
         self.0.get_certificate(hash)
     }
 
@@ -236,7 +236,7 @@ impl hyperscale_storage::ConsensusStore for SharedStorage {
         self.0.get_transactions_batch(hashes)
     }
 
-    fn get_certificates_batch(&self, hashes: &[Hash]) -> Vec<TransactionCertificate> {
+    fn get_certificates_batch(&self, hashes: &[Hash]) -> Vec<WaveCertificate> {
         self.0.get_certificates_batch(hashes)
     }
 
@@ -278,5 +278,17 @@ impl hyperscale_storage::ConsensusStore for SharedStorage {
 
     fn store_execution_certificates(&self, certs: &[hyperscale_types::ExecutionCertificate]) {
         self.0.store_execution_certificates(certs)
+    }
+
+    fn get_wave_certificates_by_height(&self, height: u64) -> Vec<WaveCertificate> {
+        self.0.get_wave_certificates_by_height(height)
+    }
+
+    fn get_wave_certificate_for_tx(&self, tx_hash: &Hash) -> Option<WaveCertificate> {
+        self.0.get_wave_certificate_for_tx(tx_hash)
+    }
+
+    fn get_ec_hashes_for_tx(&self, tx_hash: &Hash) -> Option<Vec<(ShardGroupId, Hash)>> {
+        self.0.get_ec_hashes_for_tx(tx_hash)
     }
 }

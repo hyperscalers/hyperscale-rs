@@ -189,8 +189,6 @@ pub const DOMAIN_EXEC_CERT_BATCH: &[u8] = b"EXEC_CERT_BATCH";
 /// The wave_id is serialized as length-prefixed sorted shard IDs, making
 /// the message deterministic regardless of construction order.
 pub fn exec_vote_message(
-    block_hash: &Hash,
-    block_height: u64,
     vote_height: u64,
     wave_id: &WaveId,
     shard_group: ShardGroupId,
@@ -199,12 +197,13 @@ pub fn exec_vote_message(
 ) -> Vec<u8> {
     let mut message = Vec::with_capacity(128);
     message.extend_from_slice(DOMAIN_EXEC_VOTE);
-    message.extend_from_slice(block_hash.as_bytes());
-    message.extend_from_slice(&block_height.to_le_bytes());
     message.extend_from_slice(&vote_height.to_le_bytes());
-    // Serialize wave_id: length + sorted shard IDs
-    message.extend_from_slice(&(wave_id.0.len() as u32).to_le_bytes());
-    for shard in &wave_id.0 {
+    // WaveId is self-contained (shard + block_height + remote_shards),
+    // so no separate block_hash needed in the signing message.
+    message.extend_from_slice(&wave_id.shard_group_id.0.to_le_bytes());
+    message.extend_from_slice(&wave_id.block_height.to_le_bytes());
+    message.extend_from_slice(&(wave_id.remote_shards.len() as u32).to_le_bytes());
+    for shard in &wave_id.remote_shards {
         message.extend_from_slice(&shard.0.to_le_bytes());
     }
     message.extend_from_slice(&shard_group.0.to_le_bytes());

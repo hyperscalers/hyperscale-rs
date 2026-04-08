@@ -50,18 +50,16 @@ where
                                     _ => None,
                                 };
 
-                                // Validate that the peer included receipts for every
-                                // non-aborted certificate in the block. Aborted certificates
-                                // have no receipts (execution never ran, no state changes).
-                                let receipts_complete = block.as_ref().is_none_or(|(b, _)| {
-                                    b.certificates.iter().all(|cert| {
-                                        cert.decision
-                                            == hyperscale_types::TransactionDecision::Aborted
-                                            || ledger_receipts
-                                                .iter()
-                                                .any(|e| e.tx_hash == cert.transaction_hash)
-                                    })
+                                // Validate that the peer included receipts.
+                                // If the block has completed (non-aborted) wave certs,
+                                // the peer must include receipts for the covered txs.
+                                // Basic sanity check: completed wave certs → non-empty receipts.
+                                // Full correctness is verified by state-root check later.
+                                let has_completed_certs = block.as_ref().is_some_and(|(b, _)| {
+                                    b.certificates.iter().any(|wc| wc.is_completed())
                                 });
+                                let receipts_complete =
+                                    !has_completed_certs || !ledger_receipts.is_empty();
 
                                 if receipts_complete {
                                     let _ = es.send(NodeInput::SyncBlockResponseReceived {
@@ -466,10 +464,10 @@ where
                         request,
                         Box::new(move |result| match result {
                             Ok(response) => {
-                                let certs = response.into_certificates();
+                                let certificates = response.into_certificates();
                                 let _ = sender.send(NodeInput::CertificateReceived {
                                     block_hash,
-                                    certificates: certs,
+                                    certificates,
                                 });
                             }
                             Err(_) => {

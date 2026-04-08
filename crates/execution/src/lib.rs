@@ -17,6 +17,6 @@ mod trackers;
 pub use accumulator::ExecutionAccumulator;
 pub use state::{
     BlockCommittedOutput, CompletionData, CrossShardRegistration, ExecutionMemoryStats,
-    ExecutionState, FinalizedCertEntry,
+    ExecutionState, FinalizedWave,
 };
-pub use trackers::VoteTracker;
+pub use trackers::{VoteTracker, WaveCertificateTracker};

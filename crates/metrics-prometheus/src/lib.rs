@@ -1148,8 +1148,8 @@ impl MetricsRecorder for PrometheusRecorder {
             .set(m.exec_cache_entries as f64);
         self.metrics
             .memory_exec
-            .with_label_values(&["finalized_certificates"])
-            .set(m.exec_finalized_certificates as f64);
+            .with_label_values(&["finalized_wave_certificates"])
+            .set(m.exec_finalized_wave_certificates as f64);
         self.metrics
             .memory_exec
             .with_label_values(&["pending_provisioning"])
@@ -1168,8 +1168,8 @@ impl MetricsRecorder for PrometheusRecorder {
             .set(m.exec_early_votes as f64);
         self.metrics
             .memory_exec
-            .with_label_values(&["certificate_trackers"])
-            .set(m.exec_certificate_trackers as f64);
+            .with_label_values(&["wave_certificate_trackers"])
+            .set(m.exec_wave_certificate_trackers as f64);
         self.metrics
             .memory_exec
             .with_label_values(&["expected_exec_certs"])

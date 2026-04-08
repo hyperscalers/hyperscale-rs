@@ -1,6 +1,6 @@
 //! Types for RPC client communication.
 
-use hyperscale_types::{AbortReason, BlockHeight, TransactionDecision, TransactionStatus};
+use hyperscale_types::{BlockHeight, TransactionDecision, TransactionStatus};
 use serde::{Deserialize, Serialize};
 
 /// Request to submit a transaction.
@@ -107,18 +107,6 @@ impl TransactionStatusResponse {
                 committed_at: BlockHeight(self.committed_height.unwrap_or(0)),
             }),
             "completed" => Some(TransactionStatus::Completed(decision()?)),
-            "aborted" => {
-                // For aborted, we store the reason in error field as a string
-                // Parse it back if possible, otherwise use a generic rejected reason
-                let reason = self
-                    .error
-                    .as_deref()
-                    .and_then(|s| s.parse::<AbortReason>().ok())
-                    .unwrap_or(AbortReason::ExecutionTimeout {
-                        committed_at: BlockHeight(0),
-                    });
-                Some(TransactionStatus::Aborted { reason })
-            }
             _ => None,
         }
     }

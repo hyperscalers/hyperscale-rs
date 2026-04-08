@@ -117,12 +117,12 @@ pub(crate) struct VerificationPipeline {
     /// Blocks with verified transaction roots.
     verified_transaction_roots: HashSet<Hash>,
 
-    // === Receipt root verification ===
+    // === Certificate root verification ===
     /// Blocks where receipt root verification is currently in-flight.
-    receipt_root_verifications_in_flight: HashSet<Hash>,
+    certificate_root_verifications_in_flight: HashSet<Hash>,
 
     /// Blocks with verified receipt roots.
-    verified_receipt_roots: HashSet<Hash>,
+    verified_certificate_roots: HashSet<Hash>,
 
     // === Abort intent proof verification ===
     /// Blocks where abort intent proof verification is currently in-flight.
@@ -149,8 +149,8 @@ impl VerificationPipeline {
             ready_state_root_verifications: Vec::new(),
             transaction_root_verifications_in_flight: HashSet::new(),
             verified_transaction_roots: HashSet::new(),
-            receipt_root_verifications_in_flight: HashSet::new(),
-            verified_receipt_roots: HashSet::new(),
+            certificate_root_verifications_in_flight: HashSet::new(),
+            verified_certificate_roots: HashSet::new(),
             abort_intent_verifications_in_flight: HashSet::new(),
             verified_abort_intents: HashSet::new(),
             pending_abort_intent_verifications: HashMap::new(),
@@ -221,10 +221,10 @@ impl VerificationPipeline {
             self.verified_transaction_roots.contains(&block_hash)
         };
 
-        let receipt_root_ok = if block.certificates.is_empty() {
+        let certificate_root_ok = if block.certificates.is_empty() {
             true
         } else {
-            self.verified_receipt_roots.contains(&block_hash)
+            self.verified_certificate_roots.contains(&block_hash)
         };
 
         let abort_intents_ok = if !Self::has_livelock_abort_intents(block) {
@@ -233,7 +233,7 @@ impl VerificationPipeline {
             self.verified_abort_intents.contains(&block_hash)
         };
 
-        state_root_ok && transaction_root_ok && receipt_root_ok && abort_intents_ok
+        state_root_ok && transaction_root_ok && certificate_root_ok && abort_intents_ok
     }
 
     /// Log why a block's verification is incomplete. Called on view change
@@ -272,12 +272,12 @@ impl VerificationPipeline {
             "NOT_STARTED"
         };
 
-        let receipt_root_status = if block.certificates.is_empty() {
+        let certificate_root_status = if block.certificates.is_empty() {
             "skipped(no_certs)"
-        } else if self.verified_receipt_roots.contains(&block_hash) {
+        } else if self.verified_certificate_roots.contains(&block_hash) {
             "verified"
         } else if self
-            .receipt_root_verifications_in_flight
+            .certificate_root_verifications_in_flight
             .contains(&block_hash)
         {
             "in_flight"
@@ -311,7 +311,7 @@ impl VerificationPipeline {
             txs = block.transaction_count(),
             state_root = state_root_status,
             tx_root = tx_root_status,
-            receipt_root = receipt_root_status,
+            certificate_root = certificate_root_status,
             abort_intents = abort_status,
             "View change — block verification was incomplete"
         );
@@ -355,20 +355,14 @@ impl VerificationPipeline {
         block_hash: Hash,
         block: &Block,
         parent_state_root: Hash,
+        receipt_hashes: &[Hash],
     ) {
         let current_root = self.last_committed_jvt_root;
-        // Only include non-Aborted certificates in the state root computation.
-        // Aborted TCs have no state changes — this matches the sync path which
-        // also excludes Aborted certificates when reconstructing DatabaseUpdates.
-        // Build parallel vectors: cert_tx_hashes + per_cert_declared_nodes.
-        // Only non-aborted certificates contribute to state root computation.
-        let non_aborted: Vec<_> = block
-            .certificates
-            .iter()
-            .filter(|c| c.decision != hyperscale_types::TransactionDecision::Aborted)
-            .collect();
-
-        let cert_tx_hashes: Vec<Hash> = non_aborted.iter().map(|c| c.transaction_hash).collect();
+        // receipt_hashes are the tx_hashes of non-aborted transactions from the
+        // block manifest. These identify which execution results contribute to
+        // the state root computation. With lean wave certs the block itself
+        // doesn't carry per-tx info, so the manifest provides it.
+        let cert_tx_hashes: Vec<Hash> = receipt_hashes.to_vec();
 
         // Extract declared nodes for each certificate from the block's transactions.
         let per_cert_declared_nodes: Vec<Vec<NodeId>> = cert_tx_hashes
@@ -509,19 +503,19 @@ impl VerificationPipeline {
         valid
     }
 
-    // ─── Receipt root ─────────────────────────────────────────────────────
+    // ─── Certificate root ─────────────────────────────────────────────────────
 
     /// Check if a block needs receipt root verification before voting.
-    pub fn needs_receipt_root_verification(&self, block: &Block) -> bool {
+    pub fn needs_certificate_root_verification(&self, block: &Block) -> bool {
         if block.certificates.is_empty() {
             return false;
         }
 
         let block_hash = block.hash();
 
-        if self.verified_receipt_roots.contains(&block_hash)
+        if self.verified_certificate_roots.contains(&block_hash)
             || self
-                .receipt_root_verifications_in_flight
+                .certificate_root_verifications_in_flight
                 .contains(&block_hash)
         {
             return false;
@@ -531,7 +525,7 @@ impl VerificationPipeline {
     }
 
     /// Initiate receipt root verification for a block.
-    pub fn initiate_receipt_root_verification(
+    pub fn initiate_certificate_root_verification(
         &mut self,
         block_hash: Hash,
         block: &Block,
@@ -539,29 +533,30 @@ impl VerificationPipeline {
         debug!(
             block_hash = ?block_hash,
             cert_count = block.certificates.len(),
-            expected_root = ?block.header.receipt_root,
+            expected_root = ?block.header.certificate_root,
             "Initiating receipt root verification"
         );
 
-        self.receipt_root_verifications_in_flight.insert(block_hash);
+        self.certificate_root_verifications_in_flight
+            .insert(block_hash);
 
-        vec![Action::VerifyReceiptRoot {
+        vec![Action::VerifyCertificateRoot {
             block_hash,
-            expected_root: block.header.receipt_root,
+            expected_root: block.header.certificate_root,
             certificates: block.certificates.clone(),
         }]
     }
 
     /// Record a receipt root verification result. Returns whether the verification passed.
-    pub fn on_receipt_root_verified(&mut self, block_hash: Hash, valid: bool) -> bool {
-        self.receipt_root_verifications_in_flight
+    pub fn on_certificate_root_verified(&mut self, block_hash: Hash, valid: bool) -> bool {
+        self.certificate_root_verifications_in_flight
             .remove(&block_hash);
 
         if valid {
-            self.verified_receipt_roots.insert(block_hash);
+            self.verified_certificate_roots.insert(block_hash);
             debug!(
                 block_hash = ?block_hash,
-                "Receipt root verified successfully"
+                "Certificate root verified successfully"
             );
         }
 
@@ -878,10 +873,10 @@ impl VerificationPipeline {
         self.verified_transaction_roots
             .retain(|hash| pending_blocks.contains_key(hash));
 
-        self.receipt_root_verifications_in_flight
+        self.certificate_root_verifications_in_flight
             .retain(|hash| pending_blocks.contains_key(hash));
 
-        self.verified_receipt_roots
+        self.verified_certificate_roots
             .retain(|hash| pending_blocks.contains_key(hash));
 
         self.abort_intent_verifications_in_flight
