@@ -12,11 +12,7 @@ mod fixtures;
 use fixtures::TestFixtures;
 use hyperscale_bft::BftConfig;
 use hyperscale_production::{ProductionRunner, RocksDbStorage};
-use hyperscale_storage::ConsensusStore;
-use hyperscale_types::{
-    generate_bls_keypair, validator_bind_message, Block, BlockHeader, BlockHeight, Hash,
-    QuorumCertificate, ShardGroupId, ValidatorId,
-};
+use hyperscale_types::{generate_bls_keypair, validator_bind_message, ShardGroupId, ValidatorId};
 use serial_test::serial;
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,58 +32,6 @@ const OVERALL_TEST_TIMEOUT: Duration = Duration::from_secs(60);
 // ============================================================================
 // Storage Tests (no runner needed)
 // ============================================================================
-
-#[tokio::test]
-#[serial]
-async fn test_storage_operations() {
-    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
-
-    let temp_dir = TempDir::new().unwrap();
-    let db_path = temp_dir.path().join("test_db");
-
-    let storage = RocksDbStorage::open(&db_path).unwrap();
-
-    // Test block storage
-    let header = BlockHeader {
-        shard_group_id: ShardGroupId(0),
-        height: BlockHeight(1),
-        parent_hash: Hash::from_bytes(&[0u8; 32]),
-        parent_qc: QuorumCertificate::genesis(),
-        proposer: ValidatorId(0),
-        timestamp: 1000,
-        round: 1,
-        is_fallback: false,
-        state_root: Hash::ZERO,
-        transaction_root: Hash::ZERO,
-        certificate_root: Hash::ZERO,
-        local_receipt_root: Hash::ZERO,
-        waves: vec![],
-    };
-
-    let block = Block {
-        header: header.clone(),
-        transactions: vec![],
-        certificates: vec![],
-        abort_intents: vec![],
-    };
-
-    let qc = QuorumCertificate::genesis();
-
-    storage.put_block(BlockHeight(1), &block, &qc);
-
-    // Retrieve the block
-    let retrieved = storage.get_block(BlockHeight(1));
-    assert!(retrieved.is_some());
-    let (retrieved_block, _retrieved_qc) = retrieved.unwrap();
-    assert_eq!(retrieved_block.header.height, BlockHeight(1));
-
-    // Test chain metadata
-    storage.set_committed_state(BlockHeight(1), Hash::from_bytes(&[1u8; 32]), &qc);
-    assert_eq!(storage.committed_height(), BlockHeight(1));
-    assert!(storage.committed_hash().is_some());
-
-    info!("Storage operations verified");
-}
 
 // ============================================================================
 // Network Tests (localhost QUIC)

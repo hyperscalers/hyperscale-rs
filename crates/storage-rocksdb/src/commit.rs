@@ -5,9 +5,8 @@ use crate::core::RocksDbStorage;
 use crate::jvt_snapshot_store::SnapshotTreeStore;
 
 use hyperscale_storage::{DatabaseUpdates, JvtSnapshot};
-use hyperscale_types::{ReceiptBundle, WaveCertificate};
+use hyperscale_types::ReceiptBundle;
 use rocksdb::WriteBatch;
-use std::sync::Arc;
 
 /// Precomputed commit work for a RocksDB block commit.
 ///
@@ -56,48 +55,38 @@ impl hyperscale_storage::CommitStore for RocksDbStorage {
     fn commit_prepared_block(
         &self,
         prepared: Self::PreparedCommit,
-        certificates: &[Arc<WaveCertificate>],
-        consensus: Option<hyperscale_storage::ConsensusCommitData>,
+        block: &hyperscale_types::Block,
+        qc: &hyperscale_types::QuorumCertificate,
         execution_certificates: &[hyperscale_types::ExecutionCertificate],
         receipts: &[ReceiptBundle],
     ) -> hyperscale_types::Hash {
-        let block_height = prepared.jvt_snapshot.new_version;
         let result_root = prepared.jvt_snapshot.result_root;
 
-        // Append wave certificates + execution certificates to the write batch.
         let mut write_batch = prepared.write_batch;
-        for cert in certificates {
-            self.cf_put::<crate::column_families::CertificatesCf>(
-                &mut write_batch,
-                &cert.wave_id.hash(),
-                cert.as_ref(),
-            );
-        }
+
+        // Persist block data (header, transactions, certificates) atomically.
+        self.append_block_to_batch(&mut write_batch, block, qc);
+
         crate::execution_certs::append_execution_certs_to_batch(
             self,
             &mut write_batch,
             execution_certificates,
         );
 
-        // Add receipts to the batch atomically.
         for bundle in receipts {
             self.add_receipt_bundle_to_batch(&mut write_batch, bundle);
         }
 
         let used_fast_path =
-            self.try_apply_prepared_commit(write_batch, prepared.jvt_snapshot, consensus.as_ref());
+            self.try_apply_prepared_commit(write_batch, prepared.jvt_snapshot, block, qc);
 
         if used_fast_path {
             result_root
         } else {
-            // Stale cache: fall back to recompute from scratch.
-            // The JVT base root changed, so the prepared snapshot is invalid.
-            // Use the stored merged_updates to ensure substate writes aren't lost.
             self.commit_block(
                 &prepared.merged_updates,
-                certificates,
-                block_height,
-                consensus,
+                block,
+                qc,
                 execution_certificates,
                 receipts,
             )
@@ -107,40 +96,29 @@ impl hyperscale_storage::CommitStore for RocksDbStorage {
     fn commit_block(
         &self,
         merged_updates: &DatabaseUpdates,
-        certificates: &[Arc<WaveCertificate>],
-        block_height: u64,
-        consensus: Option<hyperscale_storage::ConsensusCommitData>,
+        block: &hyperscale_types::Block,
+        qc: &hyperscale_types::QuorumCertificate,
         execution_certificates: &[hyperscale_types::ExecutionCertificate],
         receipts: &[ReceiptBundle],
     ) -> hyperscale_types::Hash {
+        let block_height = block.header.height.0;
         let _commit_guard = self.commit_lock.lock().unwrap();
 
-        // Single snapshot for both validation and JVT computation.
         let snapshot_store = SnapshotTreeStore::new(&self.db, &self.node_cache);
         let (base_version, base_root) = snapshot_store.read_jvt_metadata();
 
-        // Validate block_height is strictly greater than current version.
-        // This catches accidental version gaps or duplicate commits.
         assert!(
             block_height == base_version + 1 || (block_height == 0 && base_version == 0),
             "commit_block: block_height ({block_height}) must be exactly current_version + 1 ({})",
             base_version
         );
 
-        // Build a WriteBatch for certificates + substate writes.
         let (mut batch, reset_old_keys) =
             self.build_substate_write_batch(merged_updates, Some(block_height));
 
-        // Store wave certificates atomically in the same batch.
-        for cert in certificates {
-            self.cf_put::<crate::column_families::CertificatesCf>(
-                &mut batch,
-                &cert.wave_id.hash(),
-                cert.as_ref(),
-            );
-        }
+        // Persist block data (header, transactions, certificates) atomically.
+        self.append_block_to_batch(&mut batch, block, qc);
 
-        // Store execution certificates atomically in the same batch.
         crate::execution_certs::append_execution_certs_to_batch(
             self,
             &mut batch,
@@ -171,9 +149,7 @@ impl hyperscale_storage::CommitStore for RocksDbStorage {
         self.append_jvt_to_batch(&mut batch, &jvt_snapshot, block_height);
 
         // Fold consensus metadata into the same batch for crash-safe atomicity.
-        if let Some(ref consensus) = consensus {
-            Self::append_consensus_to_batch(&mut batch, consensus);
-        }
+        Self::append_consensus_to_batch(&mut batch, block, qc);
 
         // Single atomic write with sync — one fsync instead of N.
         let mut write_opts = rocksdb::WriteOptions::default();

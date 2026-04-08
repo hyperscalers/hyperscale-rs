@@ -177,24 +177,19 @@ pub fn make_test_execution_certificate(seed: u8, block_height: u64) -> Execution
     }
 }
 
-/// Shared EC roundtrip test: store → get by hash → get by height.
+/// Shared EC roundtrip test: store → get by height.
 pub fn test_ec_storage_roundtrip(storage: &impl ConsensusStore) {
     let ec = make_test_execution_certificate(1, 10);
     let canonical_hash = ec.canonical_hash();
 
     // Initially empty
-    assert!(storage.get_execution_certificate(&canonical_hash).is_none());
     assert!(storage.get_execution_certificates_by_height(10).is_empty());
 
-    // Store and verify by hash
+    // Store and verify by height
     storage.store_execution_certificates(std::slice::from_ref(&ec));
-    let retrieved = storage.get_execution_certificate(&canonical_hash).unwrap();
-    assert_eq!(retrieved.block_height(), 10);
-    assert_eq!(retrieved.canonical_hash(), canonical_hash);
-
-    // Verify by height
     let by_height = storage.get_execution_certificates_by_height(10);
     assert_eq!(by_height.len(), 1);
+    assert_eq!(by_height[0].block_height(), 10);
     assert_eq!(by_height[0].canonical_hash(), canonical_hash);
 
     // Different height returns empty
@@ -217,15 +212,4 @@ pub fn test_ec_storage_batch(storage: &impl ConsensusStore) {
     let at_20 = storage.get_execution_certificates_by_height(20);
     assert_eq!(at_20.len(), 1);
     assert_eq!(at_20[0].canonical_hash(), ec3.canonical_hash());
-
-    // All retrievable by hash
-    assert!(storage
-        .get_execution_certificate(&ec1.canonical_hash())
-        .is_some());
-    assert!(storage
-        .get_execution_certificate(&ec2.canonical_hash())
-        .is_some());
-    assert!(storage
-        .get_execution_certificate(&ec3.canonical_hash())
-        .is_some());
 }

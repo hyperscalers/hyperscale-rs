@@ -565,21 +565,12 @@ pub enum Action {
     },
 
     // ═══════════════════════════════════════════════════════════════════════
-    // Storage: Consensus
+    // Network: BFT Votes
     // ═══════════════════════════════════════════════════════════════════════
-    /// Persist a vote and broadcast it as a single atomic action.
+    /// Broadcast a block vote to targeted recipients.
     ///
-    /// **BFT Safety Critical**: The runner MUST persist the vote before broadcasting.
-    /// This action combines `PersistOwnVote` and `BroadcastToShard` into a single
-    /// action, allowing the runner to:
-    /// 1. Start persistence (potentially async with fsync)
-    /// 2. Wait for persistence to complete
-    /// 3. Then broadcast the vote
-    PersistAndBroadcastVote {
-        height: BlockHeight,
-        round: u64,
-        block_hash: Hash,
-        shard: ShardGroupId,
+    /// Sent to the next proposer who needs this vote to build the QC.
+    BroadcastVote {
         vote: BlockVoteNotification,
         /// Targeted vote recipients — the next proposer who needs this vote
         /// to build the QC for the next block.
@@ -887,7 +878,7 @@ impl Action {
             Action::EmitTransactionStatus { .. } => "EmitTransactionStatus",
 
             // Storage - Consensus
-            Action::PersistAndBroadcastVote { .. } => "PersistAndBroadcastVote",
+            Action::BroadcastVote { .. } => "BroadcastVote",
 
             // Storage - Execution
             Action::CacheWaveCertificate { .. } => "CacheWaveCertificate",

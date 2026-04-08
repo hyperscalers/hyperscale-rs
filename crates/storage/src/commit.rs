@@ -4,25 +4,8 @@
 //! `prepare_block_commit` returns an opaque `PreparedCommit` handle that
 //! carries precomputed work; `commit_prepared_block` applies it efficiently.
 
-use hyperscale_types::{
-    BlockHeight, ExecutionCertificate, Hash, QuorumCertificate, ReceiptBundle, WaveCertificate,
-};
+use hyperscale_types::{Block, ExecutionCertificate, Hash, QuorumCertificate, ReceiptBundle};
 use radix_substate_store_interface::interface::DatabaseUpdates;
-use std::sync::Arc;
-
-/// Consensus metadata to be committed atomically with JVT + substate writes.
-///
-/// When provided, the storage backend folds this into the same atomic write
-/// as the JVT and substate data, preventing crash-recovery inconsistencies
-/// where JVT advances to height H but consensus metadata is still at H-1.
-pub struct ConsensusCommitData {
-    /// The committed block height.
-    pub height: BlockHeight,
-    /// The committed block hash.
-    pub hash: Hash,
-    /// The quorum certificate for this block.
-    pub qc: QuorumCertificate,
-}
 
 /// Abstracts state commitment for both simulation and production storage.
 ///
@@ -70,8 +53,8 @@ pub trait CommitStore: Send + Sync {
     fn commit_prepared_block(
         &self,
         prepared: Self::PreparedCommit,
-        certificates: &[Arc<WaveCertificate>],
-        consensus: Option<ConsensusCommitData>,
+        block: &Block,
+        qc: &QuorumCertificate,
         execution_certificates: &[ExecutionCertificate],
         receipts: &[ReceiptBundle],
     ) -> Hash;
@@ -82,15 +65,11 @@ pub trait CommitStore: Send + Sync {
     /// cache eviction, or proposer fast-path not applicable).
     ///
     /// `block_height` is the height of the block being committed (used as JVT version).
-    ///
-    /// When `consensus` is provided, the consensus metadata is written
-    /// atomically in the same batch as the JVT + substate data.
     fn commit_block(
         &self,
         merged_updates: &DatabaseUpdates,
-        certificates: &[Arc<WaveCertificate>],
-        block_height: u64,
-        consensus: Option<ConsensusCommitData>,
+        block: &Block,
+        qc: &QuorumCertificate,
         execution_certificates: &[ExecutionCertificate],
         receipts: &[ReceiptBundle],
     ) -> Hash;

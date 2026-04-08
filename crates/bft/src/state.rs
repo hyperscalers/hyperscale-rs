@@ -69,10 +69,6 @@ use crate::vote_set::VoteSet;
 /// For a fresh start, use `RecoveredState::default()`.
 #[derive(Debug, Clone, Default)]
 pub struct RecoveredState {
-    /// Our own votes, indexed by height → (block_hash, round).
-    /// **BFT Safety Critical**: Prevents equivocation after restart.
-    pub voted_heights: HashMap<u64, (Hash, u64)>,
-
     /// Last committed block height.
     pub committed_height: u64,
 
@@ -293,13 +289,6 @@ impl BftState {
         config: BftConfig,
         recovered: RecoveredState,
     ) -> Self {
-        // Filter out votes for heights at or below committed height (stale votes from storage)
-        let voted_heights: HashMap<u64, (Hash, u64)> = recovered
-            .voted_heights
-            .into_iter()
-            .filter(|(height, _)| *height > recovered.committed_height)
-            .collect();
-
         Self {
             node_index,
             signing_key,
@@ -314,7 +303,7 @@ impl BftState {
             pending_blocks: HashMap::new(),
             fetch: FetchCoordinator::new(),
             vote_sets: HashMap::new(),
-            voted_heights,
+            voted_heights: HashMap::new(),
             received_votes_by_height: HashMap::new(),
             certified_blocks: HashMap::new(),
             verification: VerificationPipeline::new(recovered.jvt_root.unwrap_or(Hash::ZERO)),
@@ -2224,18 +2213,9 @@ impl BftState {
         // Broadcast vote
         let gossip = hyperscale_messages::BlockVoteNotification { vote: vote.clone() };
 
-        // **BFT Safety Critical**: Persist the vote BEFORE broadcasting.
-        // If we crash after broadcasting but before persisting, we could vote
-        // for a different block at this height after restart (equivocation).
-        // Using the combined action allows the runner to optimize the flow
-        // while guaranteeing persist-before-broadcast ordering.
         let recipients = self.vote_recipients(topology, height, round);
 
-        let mut actions = vec![Action::PersistAndBroadcastVote {
-            height: BlockHeight(height),
-            round,
-            block_hash,
-            shard: topology.local_shard(),
+        let mut actions = vec![Action::BroadcastVote {
             vote: gossip,
             recipients,
         }];
@@ -5023,10 +5003,10 @@ mod tests {
         // Now simulate QC signature verified successfully
         let actions = state.on_qc_signature_verified(&topology, block_hash, true);
 
-        // Should produce a vote (PersistAndBroadcastVote)
+        // Should produce a vote (BroadcastVote)
         let has_vote = actions
             .iter()
-            .any(|a| matches!(a, Action::PersistAndBroadcastVote { .. }));
+            .any(|a| matches!(a, Action::BroadcastVote { .. }));
         assert!(has_vote, "Should broadcast vote after QC verified");
     }
 
@@ -5189,10 +5169,10 @@ mod tests {
             .any(|a| matches!(a, Action::VerifyQcSignature { .. }));
         assert!(!has_verify_qc, "Genesis QC should skip verification");
 
-        // Should directly vote (PersistAndBroadcastVote)
+        // Should directly vote (BroadcastVote)
         let has_vote = actions
             .iter()
-            .any(|a| matches!(a, Action::PersistAndBroadcastVote { .. }));
+            .any(|a| matches!(a, Action::BroadcastVote { .. }));
         assert!(has_vote, "Should vote directly for genesis QC block");
     }
 
@@ -6434,7 +6414,7 @@ mod tests {
         // Should have vote action (we vote for our own fallback)
         let has_vote = actions
             .iter()
-            .any(|a| matches!(a, Action::PersistAndBroadcastVote { .. }));
+            .any(|a| matches!(a, Action::BroadcastVote { .. }));
         assert!(has_vote, "Should vote for own fallback block");
     }
 
@@ -6496,7 +6476,7 @@ mod tests {
         // Should also have a vote action (we vote for our own fallback block)
         let has_vote = actions
             .iter()
-            .any(|a| matches!(a, Action::PersistAndBroadcastVote { .. }));
+            .any(|a| matches!(a, Action::BroadcastVote { .. }));
         assert!(has_vote, "Should create vote for own fallback block");
     }
 
@@ -7012,10 +6992,10 @@ mod tests {
             "Second block with same parent QC should skip verification"
         );
 
-        // Should emit vote-related actions instead (PersistAndBroadcastVote)
+        // Should emit vote-related actions instead (BroadcastVote)
         let has_vote = actions2
             .iter()
-            .any(|a| matches!(a, Action::PersistAndBroadcastVote { .. }));
+            .any(|a| matches!(a, Action::BroadcastVote { .. }));
         assert!(
             has_vote,
             "Should proceed directly to voting when QC already verified"
@@ -7808,7 +7788,7 @@ mod tests {
         // Should have created a vote
         let has_vote = actions
             .iter()
-            .any(|a| matches!(a, Action::PersistAndBroadcastVote { .. }));
+            .any(|a| matches!(a, Action::BroadcastVote { .. }));
         assert!(
             has_vote,
             "Syncing validator should still be able to vote for others' blocks"
@@ -7892,7 +7872,7 @@ mod tests {
         assert!(
             actions
                 .iter()
-                .any(|a| matches!(a, Action::PersistAndBroadcastVote { .. })),
+                .any(|a| matches!(a, Action::BroadcastVote { .. })),
             "Should vote for block A"
         );
 
@@ -7901,7 +7881,7 @@ mod tests {
         assert!(
             !actions
                 .iter()
-                .any(|a| matches!(a, Action::PersistAndBroadcastVote { .. })),
+                .any(|a| matches!(a, Action::BroadcastVote { .. })),
             "Should NOT vote for block B (vote locked to A)"
         );
 
@@ -8160,7 +8140,7 @@ mod tests {
         // Verify we also voted for our own block
         let has_vote = actions1
             .iter()
-            .any(|a| matches!(a, Action::PersistAndBroadcastVote { .. }));
+            .any(|a| matches!(a, Action::BroadcastVote { .. }));
         assert!(
             has_vote,
             "Syncing validator should vote for their own sync block"

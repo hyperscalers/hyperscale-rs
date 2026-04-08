@@ -12,7 +12,6 @@ impl RocksDbStorage {
     pub fn load_recovered_state(&self) -> hyperscale_bft::RecoveredState {
         let start = std::time::Instant::now();
         let (committed_height, committed_hash, latest_qc) = self.get_chain_metadata();
-        let voted_heights = self.get_all_own_votes();
 
         // Get current JVT state from storage - critical for correct state root computation.
         // Without this, the state machine would start with Hash::ZERO which causes
@@ -46,7 +45,6 @@ impl RocksDbStorage {
             committed_height = committed_height.0,
             has_committed_hash = committed_hash.is_some(),
             has_latest_qc = latest_qc.is_some(),
-            vote_count = voted_heights.len(),
             jvt_block_height,
             jvt_root = ?jvt_root,
             load_time_ms = elapsed * 1000.0,
@@ -54,7 +52,6 @@ impl RocksDbStorage {
         );
 
         hyperscale_bft::RecoveredState {
-            voted_heights,
             committed_height: committed_height.0,
             committed_hash,
             latest_qc,

@@ -120,9 +120,6 @@ pub(crate) struct ConsensusState {
     pub transactions: HashMap<Hash, RoutableTransaction>,
     /// Wave certificates indexed by identity hash.
     pub certificates: HashMap<Hash, WaveCertificate>,
-    /// Our own votes indexed by height.
-    /// **BFT Safety Critical**: Used to prevent equivocation after restart.
-    pub own_votes: HashMap<u64, (Hash, u64)>,
     /// Local receipts keyed by transaction hash.
     pub local_receipts: HashMap<Hash, Arc<LocalReceipt>>,
     /// Execution output details keyed by transaction hash.
@@ -153,7 +150,6 @@ impl ConsensusState {
             committed_qc: None,
             transactions: HashMap::new(),
             certificates: HashMap::new(),
-            own_votes: HashMap::new(),
             local_receipts: HashMap::new(),
             execution_outputs: HashMap::new(),
             receipt_heights: HashMap::new(),

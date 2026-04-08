@@ -4,61 +4,31 @@
 //! All methods take `&self` — implementations use interior mutability.
 
 use hyperscale_types::{
-    Block, BlockHeight, ExecutionCertificate, ExecutionOutput, Hash, LocalReceipt,
-    QuorumCertificate, RoutableTransaction, ShardGroupId, WaveCertificate,
+    Block, BlockHeight, ExecutionCertificate, Hash, LocalReceipt, QuorumCertificate,
+    RoutableTransaction, ShardGroupId, WaveCertificate,
 };
-use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Abstracts consensus-related storage for both simulation and production.
 ///
-/// Provides a uniform interface for storing blocks, certificates, votes,
+/// Provides a uniform interface for reading blocks, certificates, receipts,
 /// and chain metadata across different storage backends.
+///
+/// Block and certificate writes happen atomically via `CommitStore`.
+/// Vote persistence is not needed — in-memory tracking in BFT state
+/// is sufficient (nodes sync past voted heights on restart).
 pub trait ConsensusStore: Send + Sync {
-    /// Store a committed block with its quorum certificate.
-    fn put_block(&self, height: BlockHeight, block: &Block, qc: &QuorumCertificate);
-
     /// Get a committed block by height.
     fn get_block(&self, height: BlockHeight) -> Option<(Block, QuorumCertificate)>;
 
-    /// Set the highest committed block height.
-    fn set_committed_height(&self, height: BlockHeight);
-
     /// Get the highest committed block height.
     fn committed_height(&self) -> BlockHeight;
-
-    /// Set committed state (height + hash + QC) atomically.
-    fn set_committed_state(&self, height: BlockHeight, hash: Hash, qc: &QuorumCertificate);
 
     /// Get the latest committed block hash.
     fn committed_hash(&self) -> Option<Hash>;
 
     /// Get the latest quorum certificate.
     fn latest_qc(&self) -> Option<QuorumCertificate>;
-
-    /// Store a wave certificate (keyed by wave_id hash).
-    fn store_certificate(&self, certificate: &WaveCertificate);
-
-    /// Get a wave certificate by wave_id hash.
-    fn get_certificate(&self, hash: &Hash) -> Option<WaveCertificate>;
-
-    /// Store our own vote for a height.
-    ///
-    /// **BFT Safety Critical**: Must be called before broadcasting the vote.
-    fn put_own_vote(&self, height: u64, round: u64, block_hash: Hash);
-
-    /// Get our own vote for a height (if any).
-    ///
-    /// Returns `Some((block_hash, round))` if we previously voted at this height.
-    fn get_own_vote(&self, height: u64) -> Option<(Hash, u64)>;
-
-    /// Get all our own votes (for recovery on startup).
-    ///
-    /// Returns a map of height → (block_hash, round).
-    fn get_all_own_votes(&self) -> HashMap<u64, (Hash, u64)>;
-
-    /// Remove votes at or below a committed height (cleanup).
-    fn prune_own_votes(&self, committed_height: u64);
 
     /// Get a complete block for serving sync requests.
     ///
@@ -78,27 +48,10 @@ pub trait ConsensusStore: Send + Sync {
 
     // ─── Receipt Storage ──────────────────────────────────────────────────
 
-    // Receipt writes are now atomic with block commit via CommitStore.
-    // Standalone store_receipt_bundle(s) removed from trait.
-
     /// Retrieve the local receipt for a transaction.
     fn get_local_receipt(&self, tx_hash: &Hash) -> Option<Arc<LocalReceipt>>;
 
-    /// Retrieve execution output details for a transaction.
-    ///
-    /// Returns `None` both when the tx doesn't exist AND when it was synced
-    /// (not executed locally). Use `has_receipt()` to distinguish.
-    fn get_execution_output(&self, tx_hash: &Hash) -> Option<ExecutionOutput>;
-
-    /// Check if a local receipt exists for a transaction.
-    fn has_receipt(&self, tx_hash: &Hash) -> bool {
-        self.get_local_receipt(tx_hash).is_some()
-    }
-
     // ─── Execution Certificate Storage ───────────────────────────────────
-
-    /// Retrieve an execution certificate by its canonical hash.
-    fn get_execution_certificate(&self, canonical_hash: &Hash) -> Option<ExecutionCertificate>;
 
     /// Retrieve all execution certificates for a given block height.
     fn get_execution_certificates_by_height(&self, block_height: u64) -> Vec<ExecutionCertificate>;
@@ -106,17 +59,11 @@ pub trait ConsensusStore: Send + Sync {
     /// Store execution certificates (standalone write, separate WriteBatch).
     ///
     /// Used for late-arriving ECs that complete after their block was already
-    /// committed. Not used on the primary commit path (D4 folds EC writes into
+    /// committed. Not used on the primary commit path (which folds EC writes into
     /// `commit_block`/`commit_prepared_block`).
     fn store_execution_certificates(&self, certs: &[ExecutionCertificate]);
 
     // ─── Wave Certificate Indexes ─────────────────────────────────────────
-
-    /// Get all wave certificates at a given block height.
-    ///
-    /// Used for sync serving — callers retrieve all certs committed at a
-    /// height without knowing their wave_id hashes upfront.
-    fn get_wave_certificates_by_height(&self, height: u64) -> Vec<WaveCertificate>;
 
     /// Get the wave certificate that finalized a given transaction.
     ///

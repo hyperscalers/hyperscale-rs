@@ -93,84 +93,6 @@ fn test_snapshot() {
 }
 
 #[test]
-fn test_vote_persistence_and_recovery() {
-    let temp_dir = TempDir::new().unwrap();
-
-    // Write votes in first session
-    {
-        let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
-        storage.put_own_vote(100, 0, Hash::from_bytes(&[1; 32]));
-        storage.put_own_vote(101, 1, Hash::from_bytes(&[2; 32]));
-        storage.put_own_vote(102, 0, Hash::from_bytes(&[3; 32]));
-    }
-
-    // Reopen and verify recovery
-    {
-        let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
-        let recovered = storage.load_recovered_state();
-
-        assert_eq!(recovered.voted_heights.len(), 3);
-        assert_eq!(
-            recovered.voted_heights.get(&100),
-            Some(&(Hash::from_bytes(&[1; 32]), 0))
-        );
-        assert_eq!(
-            recovered.voted_heights.get(&101),
-            Some(&(Hash::from_bytes(&[2; 32]), 1))
-        );
-        assert_eq!(
-            recovered.voted_heights.get(&102),
-            Some(&(Hash::from_bytes(&[3; 32]), 0))
-        );
-    }
-}
-
-#[test]
-fn test_vote_pruning() {
-    let temp_dir = TempDir::new().unwrap();
-    let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
-
-    for h in 100..=105 {
-        storage.put_own_vote(h, 0, Hash::from_bytes(&[h as u8; 32]));
-    }
-
-    let votes = storage.get_all_own_votes();
-    assert_eq!(votes.len(), 6);
-
-    storage.prune_own_votes(102);
-
-    let votes = storage.get_all_own_votes();
-    assert_eq!(votes.len(), 3);
-    assert!(votes.contains_key(&103));
-    assert!(votes.contains_key(&104));
-    assert!(votes.contains_key(&105));
-    assert!(!votes.contains_key(&100));
-    assert!(!votes.contains_key(&101));
-    assert!(!votes.contains_key(&102));
-}
-
-#[test]
-fn test_vote_equivocation_prevention_after_recovery() {
-    let temp_dir = TempDir::new().unwrap();
-
-    let block_a = Hash::from_bytes(&[1; 32]);
-    {
-        let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
-        storage.put_own_vote(100, 0, block_a);
-    }
-
-    {
-        let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
-        let recovered = storage.load_recovered_state();
-
-        assert_eq!(recovered.voted_heights.get(&100), Some(&(block_a, 0)));
-
-        let block_b = Hash::from_bytes(&[2; 32]);
-        assert_ne!(recovered.voted_heights.get(&100), Some(&(block_b, 0)));
-    }
-}
-
-#[test]
 fn test_recovery_resumes_at_correct_height() {
     let temp_dir = TempDir::new().unwrap();
 
@@ -205,30 +127,22 @@ fn test_commit_certificate_with_writes_persists_both() {
     assert!(stored_cert.is_some());
     assert_eq!(stored_cert.unwrap().wave_id.hash(), wave_hash);
 
-    let node_id = hyperscale_types::NodeId([1; 30]);
-    let substates: Vec<_> = storage.list_substates_for_node(&node_id).collect();
-    assert_eq!(substates.len(), 1, "should find the committed substate");
+    // Verify the substate was written to the state CF via direct key lookup.
+    // make_mapped_database_update uses SpreadPrefixKeyMapper, so extract the
+    // mapped key from the updates struct.
+    let (db_node_key, node_upd) = updates.node_updates.iter().next().unwrap();
+    let (db_part_num, _) = node_upd.partition_updates.iter().next().unwrap();
+    let partition_key = DbPartitionKey {
+        node_key: db_node_key.clone(),
+        partition_num: *db_part_num,
+    };
+    let sort_key = DbSortKey(vec![10, 20]);
+    let value = storage.get_raw_substate_by_db_key(&partition_key, &sort_key);
     assert_eq!(
-        substates[0].2,
-        vec![99, 88, 77],
+        value,
+        Some(vec![99, 88, 77]),
         "value should match what was written"
     );
-}
-
-#[test]
-fn test_get_own_vote() {
-    let temp_dir = TempDir::new().unwrap();
-    let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
-
-    assert!(storage.get_own_vote(100).is_none());
-
-    let block_hash = Hash::from_bytes(&[1; 32]);
-    storage.put_own_vote(100, 5, block_hash);
-
-    let vote = storage.get_own_vote(100);
-    assert_eq!(vote, Some((block_hash, 5)));
-
-    assert!(storage.get_own_vote(101).is_none());
 }
 
 #[test]
@@ -236,16 +150,16 @@ fn test_block_storage_and_retrieval() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
 
-    let block = make_test_block(42);
+    let block = make_test_block(1);
     let qc = make_test_qc(&block);
 
-    assert!(storage.get_block(BlockHeight(42)).is_none());
+    assert!(storage.get_block(BlockHeight(1)).is_none());
 
-    storage.put_block(BlockHeight(42), &block, &qc);
+    storage.commit_block(&Default::default(), &block, &qc, &[], &[]);
 
-    let (stored_block, stored_qc) = storage.get_block(BlockHeight(42)).unwrap();
-    assert_eq!(stored_block.header.height, BlockHeight(42));
-    assert_eq!(stored_block.header.timestamp, 42_000);
+    let (stored_block, stored_qc) = storage.get_block(BlockHeight(1)).unwrap();
+    assert_eq!(stored_block.header.height, BlockHeight(1));
+    assert_eq!(stored_block.header.timestamp, 1_000);
     assert_eq!(stored_qc.block_hash, block.hash());
 }
 
@@ -254,17 +168,17 @@ fn test_block_range_retrieval() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
 
-    for h in 10..15u64 {
+    for h in 1..=5u64 {
         let block = make_test_block(h);
         let qc = make_test_qc(&block);
-        storage.put_block(BlockHeight(h), &block, &qc);
+        storage.commit_block(&Default::default(), &block, &qc, &[], &[]);
     }
 
-    let blocks = storage.get_blocks_range(BlockHeight(11), BlockHeight(14));
+    let blocks = storage.get_blocks_range(BlockHeight(2), BlockHeight(5));
     assert_eq!(blocks.len(), 3);
-    assert_eq!(blocks[0].0.header.height, BlockHeight(11));
-    assert_eq!(blocks[1].0.header.height, BlockHeight(12));
-    assert_eq!(blocks[2].0.header.height, BlockHeight(13));
+    assert_eq!(blocks[0].0.header.height, BlockHeight(2));
+    assert_eq!(blocks[1].0.header.height, BlockHeight(3));
+    assert_eq!(blocks[2].0.header.height, BlockHeight(4));
 }
 
 #[test]
@@ -322,25 +236,6 @@ fn test_certificate_idempotency() {
 }
 
 #[test]
-fn test_vote_overwrite_same_height() {
-    let temp_dir = TempDir::new().unwrap();
-    let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
-
-    let block_a = Hash::from_bytes(&[1; 32]);
-    let block_b = Hash::from_bytes(&[2; 32]);
-
-    storage.put_own_vote(100, 0, block_a);
-    assert_eq!(storage.get_own_vote(100), Some((block_a, 0)));
-
-    storage.put_own_vote(100, 1, block_b);
-    assert_eq!(storage.get_own_vote(100), Some((block_b, 1)));
-
-    let all_votes = storage.get_all_own_votes();
-    assert_eq!(all_votes.len(), 1);
-    assert_eq!(all_votes.get(&100), Some(&(block_b, 1)));
-}
-
-#[test]
 fn test_empty_state_on_fresh_database() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
@@ -350,7 +245,6 @@ fn test_empty_state_on_fresh_database() {
     assert_eq!(recovered.committed_height, 0);
     assert!(recovered.committed_hash.is_none());
     assert!(recovered.latest_qc.is_none());
-    assert!(recovered.voted_heights.is_empty());
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -404,11 +298,11 @@ fn test_commit_block_applies_writes() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
 
-    let shard = ShardGroupId(0);
     let updates = make_mapped_database_update(1, 0, vec![10], vec![42]);
-    let cert = Arc::new(make_test_wave_certificate(1, shard));
+    let block = make_test_block(1);
+    let qc = make_test_qc(&block);
 
-    let result = storage.commit_block(&updates, &[cert], 1, None, &[], &[]);
+    let result = storage.commit_block(&updates, &block, &qc, &[], &[]);
     assert_ne!(result, Hash::ZERO);
 }
 
@@ -417,14 +311,13 @@ fn test_commit_block_multiple_certs() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
 
-    let shard = ShardGroupId(0);
     let updates1 = make_mapped_database_update(1, 0, vec![10], vec![1]);
     let updates2 = make_mapped_database_update(2, 0, vec![20], vec![2]);
     let merged = hyperscale_storage::merge_database_updates(&[updates1, updates2]);
-    let cert1 = Arc::new(make_test_wave_certificate(1, shard));
-    let cert2 = Arc::new(make_test_wave_certificate(2, shard));
+    let block = make_test_block(1);
+    let qc = make_test_qc(&block);
 
-    let result = storage.commit_block(&merged, &[cert1, cert2], 1, None, &[], &[]);
+    let result = storage.commit_block(&merged, &block, &qc, &[], &[]);
     assert_ne!(result, Hash::ZERO);
 }
 
@@ -433,33 +326,29 @@ fn test_commit_block_empty_certs() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
 
-    storage.commit_block(&DatabaseUpdates::default(), &[], 1, None, &[], &[]);
+    let block = make_test_block(1);
+    let qc = make_test_qc(&block);
+
+    storage.commit_block(&DatabaseUpdates::default(), &block, &qc, &[], &[]);
     assert_eq!(storage.jvt_version(), 1);
 }
 
 #[test]
 fn test_prepare_then_commit_matches_direct() {
-    let shard = ShardGroupId(0);
-    let cert = Arc::new(make_test_wave_certificate(1, shard));
-
     let temp_dir1 = TempDir::new().unwrap();
     let s_prepared = RocksDbStorage::open(temp_dir1.path()).unwrap();
     let parent_root = s_prepared.state_root_hash();
     let (spec_root, prepared) =
         s_prepared.prepare_block_commit(parent_root, &DatabaseUpdates::default(), 1);
-    let certs = std::slice::from_ref(&cert);
-    let result_prepared = s_prepared.commit_prepared_block(prepared, certs, None, &[], &[]);
+    let block = make_test_block(1);
+    let qc = make_test_qc(&block);
+    let result_prepared = s_prepared.commit_prepared_block(prepared, &block, &qc, &[], &[]);
 
     let temp_dir2 = TempDir::new().unwrap();
     let s_direct = RocksDbStorage::open(temp_dir2.path()).unwrap();
-    let result_direct = s_direct.commit_block(
-        &DatabaseUpdates::default(),
-        std::slice::from_ref(&cert),
-        1,
-        None,
-        &[],
-        &[],
-    );
+    let block2 = make_test_block(1);
+    let qc2 = make_test_qc(&block2);
+    let result_direct = s_direct.commit_block(&DatabaseUpdates::default(), &block2, &qc2, &[], &[]);
 
     assert_eq!(result_prepared, result_direct);
     assert_eq!(spec_root, result_prepared);
@@ -474,7 +363,12 @@ fn test_commit_block_stores_certificates() {
     let cert = Arc::new(make_test_wave_certificate(1, shard));
     let wave_hash = cert.wave_id.hash();
 
-    let _ = storage.commit_block(&DatabaseUpdates::default(), &[cert], 1, None, &[], &[]);
+    // Create a block that includes this certificate
+    let mut block = make_test_block(1);
+    block.certificates = vec![cert];
+    let qc = make_test_qc(&block);
+
+    let _ = storage.commit_block(&DatabaseUpdates::default(), &block, &qc, &[], &[]);
 
     assert!(storage.get_certificate(&wave_hash).is_some());
 }
@@ -502,8 +396,8 @@ fn test_certificates_batch() {
     let hash1 = cert1.wave_id.hash();
     let hash2 = cert2.wave_id.hash();
 
-    storage.store_certificate(&cert1);
-    storage.store_certificate(&cert2);
+    storage.put_certificate(&hash1, &cert1);
+    storage.put_certificate(&hash2, &cert2);
 
     let result = storage.get_certificates_batch(&[hash1, hash2]);
     assert_eq!(result.len(), 2);
@@ -571,7 +465,7 @@ fn test_certificate_store_and_retrieve() {
     let cert = make_test_wave_certificate(1, ShardGroupId(0));
     let wave_hash = cert.wave_id.hash();
 
-    storage.store_certificate(&cert);
+    storage.put_certificate(&wave_hash, &cert);
 
     let stored = storage.get_certificate(&wave_hash).unwrap();
     assert_eq!(stored.wave_id.hash(), wave_hash);
@@ -591,13 +485,13 @@ fn test_get_block_for_sync() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
 
-    let block = make_test_block(5);
+    let block = make_test_block(1);
     let qc = make_test_qc(&block);
-    storage.put_block(BlockHeight(5), &block, &qc);
+    storage.commit_block(&Default::default(), &block, &qc, &[], &[]);
 
-    let result = storage.get_block_for_sync(BlockHeight(5));
+    let result = storage.get_block_for_sync(BlockHeight(1));
     assert!(result.is_some());
-    assert_eq!(result.unwrap().0.header.height, BlockHeight(5));
+    assert_eq!(result.unwrap().0.header.height, BlockHeight(1));
 
     assert!(storage.get_block_for_sync(BlockHeight(999)).is_none());
 }
@@ -634,7 +528,6 @@ fn test_empty_commit_still_advances_version() {
 #[test]
 fn test_substates_survive_reopen() {
     let temp_dir = TempDir::new().unwrap();
-    let node_id = hyperscale_types::NodeId([1; 30]);
 
     let root_after_write;
     let version_after_write;
@@ -659,36 +552,41 @@ fn test_substates_survive_reopen() {
         assert!(cert.is_some(), "certificate should survive reopen");
         assert_eq!(cert.unwrap().wave_id.hash(), cert_hash);
 
-        let substates: Vec<_> = storage.list_substates_for_node(&node_id).collect();
-        assert_eq!(substates.len(), 1, "substate should survive reopen");
-        assert_eq!(substates[0].2, vec![42]);
+        // Verify the substate was written via direct key lookup.
+        // make_mapped_database_update uses SpreadPrefixKeyMapper, so use the
+        // same helper to reconstruct the mapped key.
+        let mapped_updates = make_mapped_database_update(1, 0, vec![10], vec![42]);
+        let (db_node_key, node_upd) = mapped_updates.node_updates.iter().next().unwrap();
+        let (db_part_num, _) = node_upd.partition_updates.iter().next().unwrap();
+        let partition_key = DbPartitionKey {
+            node_key: db_node_key.clone(),
+            partition_num: *db_part_num,
+        };
+        let sort_key = DbSortKey(vec![10]);
+        let value = storage.get_raw_substate_by_db_key(&partition_key, &sort_key);
+        assert_eq!(value, Some(vec![42]), "substate should survive reopen");
     }
 }
 
 #[test]
-fn test_blocks_and_votes_survive_reopen() {
+fn test_blocks_survive_reopen() {
     let temp_dir = TempDir::new().unwrap();
-    let vote_hash = Hash::from_bytes(&[7; 32]);
 
     {
         let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
-        let block = make_test_block(10);
+        let block = make_test_block(1);
         let qc = make_test_qc(&block);
-        storage.put_block(BlockHeight(10), &block, &qc);
-        storage.put_own_vote(10, 3, vote_hash);
+        storage.commit_block(&Default::default(), &block, &qc, &[], &[]);
     }
 
     {
         let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
 
         let (block, qc) = storage
-            .get_block(BlockHeight(10))
+            .get_block(BlockHeight(1))
             .expect("block should survive reopen");
-        assert_eq!(block.header.height, BlockHeight(10));
-        assert_eq!(qc.height, BlockHeight(10));
-
-        let vote = storage.get_own_vote(10);
-        assert_eq!(vote, Some((vote_hash, 3)), "vote should survive reopen");
+        assert_eq!(block.header.height, BlockHeight(1));
+        assert_eq!(qc.height, BlockHeight(1));
     }
 }
 
@@ -709,7 +607,7 @@ fn test_receipt_survives_reopen() {
 
     {
         let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
-        assert!(storage.has_receipt(&tx_hash));
+        assert!(storage.get_local_receipt(&tx_hash).is_some());
         let retrieved = storage.get_local_receipt(&tx_hash).unwrap();
         assert_eq!(*retrieved, *bundle.local_receipt);
         let local = storage.get_execution_output(&tx_hash).unwrap();
@@ -739,7 +637,6 @@ fn test_ec_storage_batch() {
 fn test_ec_survives_reopen() {
     let temp_dir = TempDir::new().unwrap();
     let ec = hyperscale_storage::test_helpers::make_test_execution_certificate(1, 10);
-    let canonical_hash = ec.canonical_hash();
 
     {
         let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
@@ -748,12 +645,9 @@ fn test_ec_survives_reopen() {
 
     {
         let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
-        let retrieved = storage.get_execution_certificate(&canonical_hash).unwrap();
-        assert_eq!(retrieved.block_height(), 10);
-        assert_eq!(retrieved.canonical_hash(), canonical_hash);
-
         let by_height = storage.get_execution_certificates_by_height(10);
         assert_eq!(by_height.len(), 1);
+        assert_eq!(by_height[0].block_height(), 10);
     }
 }
 
@@ -763,13 +657,14 @@ fn test_ec_atomic_with_block_commit() {
     let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
 
     let ec = hyperscale_storage::test_helpers::make_test_execution_certificate(1, 1);
-    let canonical_hash = ec.canonical_hash();
-    let cert = Arc::new(make_test_wave_certificate(1, ShardGroupId(0)));
+    let block = make_test_block(1);
+    let qc = make_test_qc(&block);
 
     // Commit block with EC atomically
-    storage.commit_block(&DatabaseUpdates::default(), &[cert], 1, None, &[ec], &[]);
+    storage.commit_block(&DatabaseUpdates::default(), &block, &qc, &[ec], &[]);
 
-    // EC should be retrievable
-    let retrieved = storage.get_execution_certificate(&canonical_hash).unwrap();
-    assert_eq!(retrieved.block_height(), 1);
+    // EC should be retrievable by height
+    let by_height = storage.get_execution_certificates_by_height(1);
+    assert_eq!(by_height.len(), 1);
+    assert_eq!(by_height[0].block_height(), 1);
 }

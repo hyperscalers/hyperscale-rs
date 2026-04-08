@@ -2,16 +2,13 @@ use crate::core::SimStorage;
 
 use hyperscale_storage::test_helpers::{
     make_database_update, make_mapped_database_update, make_test_block, make_test_qc,
-    make_test_wave_certificate,
 };
 use hyperscale_storage::{
     CommitStore, CommittableSubstateDatabase, ConsensusStore, DatabaseUpdate, DatabaseUpdates,
     DbPartitionKey, DbSortKey, NodeDatabaseUpdates, PartitionDatabaseUpdates, SubstateDatabase,
     SubstateStore,
 };
-use hyperscale_types::{
-    zero_bls_signature, BlockHeight, Hash, NodeId, ShardGroupId, SignerBitfield,
-};
+use hyperscale_types::{BlockHeight, Hash, NodeId};
 use std::sync::Arc;
 
 #[test]
@@ -175,16 +172,16 @@ fn test_snapshot_structural_sharing_performance() {
 #[test]
 fn test_block_storage_and_retrieval() {
     let storage = SimStorage::new();
-    let block = make_test_block(42);
+    let block = make_test_block(1);
     let qc = make_test_qc(&block);
 
-    assert!(storage.get_block(BlockHeight(42)).is_none());
+    assert!(storage.get_block(BlockHeight(1)).is_none());
 
-    storage.put_block(BlockHeight(42), &block, &qc);
+    storage.commit_block(&DatabaseUpdates::default(), &block, &qc, &[], &[]);
 
-    let (stored_block, stored_qc) = storage.get_block(BlockHeight(42)).unwrap();
-    assert_eq!(stored_block.header.height, BlockHeight(42));
-    assert_eq!(stored_block.header.timestamp, 42_000);
+    let (stored_block, stored_qc) = storage.get_block(BlockHeight(1)).unwrap();
+    assert_eq!(stored_block.header.height, BlockHeight(1));
+    assert_eq!(stored_block.header.timestamp, 1_000);
     assert_eq!(stored_qc.block_hash, block.hash());
 }
 
@@ -192,30 +189,6 @@ fn test_block_storage_and_retrieval() {
 fn test_block_get_nonexistent() {
     let storage = SimStorage::new();
     assert!(storage.get_block(BlockHeight(999)).is_none());
-}
-
-#[test]
-fn test_committed_state() {
-    let storage = SimStorage::new();
-    let hash = Hash::from_bytes(&[42; 32]);
-    let qc = hyperscale_types::QuorumCertificate {
-        block_hash: hash,
-        shard_group_id: ShardGroupId(0),
-        height: BlockHeight(10),
-        parent_block_hash: Hash::ZERO,
-        round: 3,
-        aggregated_signature: zero_bls_signature(),
-        signers: SignerBitfield::new(4),
-        weighted_timestamp_ms: 10_000,
-    };
-
-    storage.set_committed_state(BlockHeight(10), hash, &qc);
-
-    assert_eq!(storage.committed_height(), BlockHeight(10));
-    assert_eq!(storage.committed_hash(), Some(hash));
-    let stored_qc = storage.latest_qc().unwrap();
-    assert_eq!(stored_qc.height, BlockHeight(10));
-    assert_eq!(stored_qc.round, 3);
 }
 
 #[test]
@@ -227,98 +200,15 @@ fn test_committed_height_default() {
 }
 
 #[test]
-fn test_certificate_store_and_retrieve() {
-    let storage = SimStorage::new();
-    let cert = make_test_wave_certificate(1, ShardGroupId(0));
-    let wave_hash = cert.wave_id.hash();
-
-    storage.store_certificate(&cert);
-
-    let stored = storage.get_certificate(&wave_hash).unwrap();
-    assert_eq!(stored.wave_id.hash(), wave_hash);
-}
-
-#[test]
-fn test_certificate_get_missing() {
-    let storage = SimStorage::new();
-    assert!(storage
-        .get_certificate(&Hash::from_bytes(&[99; 32]))
-        .is_none());
-}
-
-#[test]
-fn test_vote_persistence() {
-    let storage = SimStorage::new();
-    let block_hash = Hash::from_bytes(&[1; 32]);
-
-    storage.put_own_vote(100, 5, block_hash);
-
-    let vote = storage.get_own_vote(100);
-    assert_eq!(vote, Some((block_hash, 5)));
-}
-
-#[test]
-fn test_vote_get_missing() {
-    let storage = SimStorage::new();
-    assert!(storage.get_own_vote(100).is_none());
-}
-
-#[test]
-fn test_vote_overwrite() {
-    let storage = SimStorage::new();
-    let hash_a = Hash::from_bytes(&[1; 32]);
-    let hash_b = Hash::from_bytes(&[2; 32]);
-
-    storage.put_own_vote(100, 0, hash_a);
-    assert_eq!(storage.get_own_vote(100), Some((hash_a, 0)));
-
-    storage.put_own_vote(100, 1, hash_b);
-    assert_eq!(storage.get_own_vote(100), Some((hash_b, 1)));
-
-    let all = storage.get_all_own_votes();
-    assert_eq!(all.len(), 1);
-}
-
-#[test]
-fn test_vote_pruning() {
-    let storage = SimStorage::new();
-    let hash = Hash::from_bytes(&[1; 32]);
-
-    storage.put_own_vote(10, 0, hash);
-    storage.put_own_vote(20, 0, hash);
-    storage.put_own_vote(30, 0, hash);
-
-    storage.prune_own_votes(20);
-
-    assert!(storage.get_own_vote(10).is_none());
-    assert!(storage.get_own_vote(20).is_none());
-    assert!(storage.get_own_vote(30).is_some());
-}
-
-#[test]
-fn test_get_all_own_votes() {
-    let storage = SimStorage::new();
-    let hash = Hash::from_bytes(&[1; 32]);
-
-    storage.put_own_vote(10, 0, hash);
-    storage.put_own_vote(20, 1, hash);
-
-    let all = storage.get_all_own_votes();
-    assert_eq!(all.len(), 2);
-    assert_eq!(all.get(&10), Some(&(hash, 0)));
-    assert_eq!(all.get(&20), Some(&(hash, 1)));
-}
-
-#[test]
 fn test_get_block_for_sync() {
     let storage = SimStorage::new();
-    let block = make_test_block(5);
+    let block = make_test_block(1);
     let qc = make_test_qc(&block);
-    storage.put_block(BlockHeight(5), &block, &qc);
+    storage.commit_block(&DatabaseUpdates::default(), &block, &qc, &[], &[]);
 
-    let result = storage.get_block_for_sync(BlockHeight(5));
+    let result = storage.get_block_for_sync(BlockHeight(1));
     assert!(result.is_some());
-    assert_eq!(result.unwrap().0.header.height, BlockHeight(5));
+    assert_eq!(result.unwrap().0.header.height, BlockHeight(1));
 
     assert!(storage.get_block_for_sync(BlockHeight(999)).is_none());
 }
@@ -340,7 +230,7 @@ fn test_transactions_batch_with_indexed_block() {
     block.transactions = vec![tx];
 
     let qc = make_test_qc(&block);
-    storage.put_block(BlockHeight(1), &block, &qc);
+    storage.commit_block(&DatabaseUpdates::default(), &block, &qc, &[], &[]);
 
     let result = storage.get_transactions_batch(&[tx_hash]);
     assert_eq!(result.len(), 1);
@@ -350,34 +240,6 @@ fn test_transactions_batch_with_indexed_block() {
     let missing = Hash::from_bytes(&[99; 32]);
     let partial = storage.get_transactions_batch(&[tx_hash, missing]);
     assert_eq!(partial.len(), 1);
-}
-
-#[test]
-fn test_certificates_batch() {
-    let storage = SimStorage::new();
-    let cert1 = make_test_wave_certificate(1, ShardGroupId(0));
-    let cert2 = make_test_wave_certificate(2, ShardGroupId(0));
-    let hash1 = cert1.wave_id.hash();
-    let hash2 = cert2.wave_id.hash();
-
-    storage.store_certificate(&cert1);
-    storage.store_certificate(&cert2);
-
-    let result = storage.get_certificates_batch(&[hash1, hash2]);
-    assert_eq!(result.len(), 2);
-}
-
-#[test]
-fn test_certificates_batch_partial() {
-    let storage = SimStorage::new();
-    let cert = make_test_wave_certificate(1, ShardGroupId(0));
-    let hash = cert.wave_id.hash();
-    storage.store_certificate(&cert);
-
-    let missing = Hash::from_bytes(&[99; 32]);
-    let result = storage.get_certificates_batch(&[hash, missing]);
-    assert_eq!(result.len(), 1);
-    assert_eq!(result[0].wave_id.hash(), hash);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -460,35 +322,35 @@ fn test_empty_commit_still_advances_version() {
 // ═══════════════════════════════════════════════════════════════════════
 
 #[test]
-fn test_commit_block_single_cert() {
+fn test_commit_block_single() {
     let storage = SimStorage::new();
-    let shard = ShardGroupId(0);
     let updates = make_mapped_database_update(1, 0, vec![10], vec![42]);
-    let cert = Arc::new(make_test_wave_certificate(1, shard));
+    let block = make_test_block(1);
+    let qc = make_test_qc(&block);
 
-    let result = storage.commit_block(&updates, &[cert], 1, None, &[], &[]);
+    let result = storage.commit_block(&updates, &block, &qc, &[], &[]);
     assert_ne!(result, Hash::ZERO);
 }
 
 #[test]
-fn test_commit_block_multiple_certs() {
+fn test_commit_block_multiple_updates() {
     let storage = SimStorage::new();
-    let shard = ShardGroupId(0);
     let updates1 = make_mapped_database_update(1, 0, vec![10], vec![1]);
     let updates2 = make_mapped_database_update(2, 0, vec![20], vec![2]);
     let merged = hyperscale_storage::merge_database_updates(&[updates1, updates2]);
-    let cert1 = Arc::new(make_test_wave_certificate(1, shard));
-    let cert2 = Arc::new(make_test_wave_certificate(2, shard));
+    let block = make_test_block(1);
+    let qc = make_test_qc(&block);
 
-    let result = storage.commit_block(&merged, &[cert1, cert2], 1, None, &[], &[]);
-    // Certificate merging: all certs applied as single JVT version = block_height
+    let result = storage.commit_block(&merged, &block, &qc, &[], &[]);
     assert_ne!(result, Hash::ZERO);
 }
 
 #[test]
-fn test_commit_block_empty_certs() {
+fn test_commit_block_empty() {
     let storage = SimStorage::new();
-    storage.commit_block(&DatabaseUpdates::default(), &[], 1, None, &[], &[]);
+    let block = make_test_block(1);
+    let qc = make_test_qc(&block);
+    storage.commit_block(&DatabaseUpdates::default(), &block, &qc, &[], &[]);
     // Empty block: JVT version still advances to block_height
     assert_eq!(storage.jvt_version(), 1);
 }
@@ -499,25 +361,17 @@ fn test_prepare_then_commit_fast_path() {
     // Both should produce the same result.
     let s_prepared = SimStorage::new();
     let s_direct = SimStorage::new();
-    let shard = ShardGroupId(0);
-    let cert = Arc::new(make_test_wave_certificate(1, shard));
+    let block = make_test_block(1);
+    let qc = make_test_qc(&block);
 
     // Prepare path
     let parent_root = s_prepared.state_root_hash();
     let (spec_root, prepared) =
         s_prepared.prepare_block_commit(parent_root, &DatabaseUpdates::default(), 1);
-    let certs = std::slice::from_ref(&cert);
-    let result_prepared = s_prepared.commit_prepared_block(prepared, certs, None, &[], &[]);
+    let result_prepared = s_prepared.commit_prepared_block(prepared, &block, &qc, &[], &[]);
 
     // Direct path
-    let result_direct = s_direct.commit_block(
-        &DatabaseUpdates::default(),
-        std::slice::from_ref(&cert),
-        1,
-        None,
-        &[],
-        &[],
-    );
+    let result_direct = s_direct.commit_block(&DatabaseUpdates::default(), &block, &qc, &[], &[]);
 
     assert_eq!(result_prepared, result_direct);
     assert_eq!(spec_root, result_prepared);
@@ -526,43 +380,15 @@ fn test_prepare_then_commit_fast_path() {
 #[test]
 fn test_prepare_commit_state_root_matches() {
     let storage = SimStorage::new();
-    let shard = ShardGroupId(0);
-    let cert = Arc::new(make_test_wave_certificate(1, shard));
+    let block = make_test_block(1);
+    let qc = make_test_qc(&block);
 
     let parent_root = storage.state_root_hash();
     let (spec_root, prepared) =
         storage.prepare_block_commit(parent_root, &DatabaseUpdates::default(), 1);
-    let result = storage.commit_prepared_block(prepared, &[cert], None, &[], &[]);
+    let result = storage.commit_prepared_block(prepared, &block, &qc, &[], &[]);
 
     assert_eq!(spec_root, result);
-}
-
-#[test]
-fn test_commit_certificate_individual() {
-    let storage = SimStorage::new();
-    let updates = make_mapped_database_update(1, 0, vec![10], vec![42]);
-    let cert = make_test_wave_certificate(1, ShardGroupId(0));
-
-    storage.commit_certificate_with_writes(&cert, &updates);
-
-    // Individual cert commits persist substate data + certificate metadata,
-    // but JVT is deferred to block commit.
-    assert_eq!(storage.jvt_version(), 0);
-    assert_eq!(storage.state_root_hash(), Hash::ZERO);
-    // Certificate should be stored
-    assert!(storage.get_certificate(&cert.wave_id.hash()).is_some());
-}
-
-#[test]
-fn test_commit_block_stores_certificates() {
-    let storage = SimStorage::new();
-    let shard = ShardGroupId(0);
-    let cert = Arc::new(make_test_wave_certificate(1, shard));
-    let wave_hash = cert.wave_id.hash();
-
-    let _ = storage.commit_block(&DatabaseUpdates::default(), &[cert], 1, None, &[], &[]);
-
-    assert!(storage.get_certificate(&wave_hash).is_some());
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -575,8 +401,6 @@ fn test_clear() {
 
     // Add some data
     storage.commit_shared(&make_database_update(vec![1, 2, 3], 0, vec![10], vec![1]));
-    let hash = Hash::from_bytes(&[1; 32]);
-    storage.put_own_vote(10, 0, hash);
     assert!(storage.jvt_version() > 0);
     assert!(!storage.is_empty());
 
@@ -585,7 +409,6 @@ fn test_clear() {
     assert_eq!(storage.jvt_version(), 0);
     assert_eq!(storage.state_root_hash(), Hash::ZERO);
     assert!(storage.is_empty());
-    assert!(storage.get_own_vote(10).is_none());
 }
 
 #[test]
@@ -603,50 +426,22 @@ fn test_len_and_is_empty() {
 }
 
 #[test]
-fn test_list_substates_for_node() {
-    let storage = SimStorage::new();
-    let node_id = NodeId([1; 30]);
-
-    // Commit two substates for the same node
-    let updates1 = make_mapped_database_update(1, 0, vec![10], vec![100]);
-    let updates2 = make_mapped_database_update(1, 0, vec![20], vec![200]);
-    let merged = hyperscale_storage::merge_database_updates(&[updates1, updates2]);
-    let cert = make_test_wave_certificate(1, ShardGroupId(0));
-    storage.commit_certificate_with_writes(&cert, &merged);
-
-    let substates: Vec<_> = storage.list_substates_for_node(&node_id).collect();
-    assert_eq!(substates.len(), 2, "should find exactly 2 substates");
-
-    // Verify actual values
-    let values: Vec<&Vec<u8>> = substates.iter().map(|(_, _, v)| v).collect();
-    assert!(values.contains(&&vec![100u8]), "should contain first value");
-    assert!(
-        values.contains(&&vec![200u8]),
-        "should contain second value"
-    );
-
-    // Different node should have no substates
-    let other_node = NodeId([99; 30]);
-    let other_substates: Vec<_> = storage.list_substates_for_node(&other_node).collect();
-    assert!(other_substates.is_empty());
-}
-
-#[test]
 fn test_list_substates_for_node_at_height_returns_historical_data() {
     let storage = SimStorage::new();
     let node_id = NodeId([1; 30]);
-    let shard = ShardGroupId(0);
 
     // Block height 1: commit value [100] for node 1
     let updates1 = make_mapped_database_update(1, 0, vec![10], vec![100]);
-    let cert1 = Arc::new(make_test_wave_certificate(1, shard));
-    let result1 = storage.commit_block(&updates1, &[cert1], 1, None, &[], &[]);
+    let block1 = make_test_block(1);
+    let qc1 = make_test_qc(&block1);
+    let result1 = storage.commit_block(&updates1, &block1, &qc1, &[], &[]);
     let root_v1 = result1;
 
     // Block height 2: overwrite with value [200]
     let updates2 = make_mapped_database_update(1, 0, vec![10], vec![200]);
-    let cert2 = Arc::new(make_test_wave_certificate(2, shard));
-    let result2 = storage.commit_block(&updates2, &[cert2], 2, None, &[], &[]);
+    let block2 = make_test_block(2);
+    let qc2 = make_test_qc(&block2);
+    let result2 = storage.commit_block(&updates2, &block2, &qc2, &[], &[]);
     let root_v2 = result2;
     assert_ne!(root_v1, root_v2, "roots must differ after overwrite");
 

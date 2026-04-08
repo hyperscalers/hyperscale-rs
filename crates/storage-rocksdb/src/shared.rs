@@ -92,13 +92,6 @@ impl SubstateStore for SharedStorage {
         self.0.snapshot()
     }
 
-    fn list_substates_for_node(
-        &self,
-        node_id: &NodeId,
-    ) -> Box<dyn Iterator<Item = (u8, DbSortKey, Vec<u8>)> + '_> {
-        self.0.list_substates_for_node(node_id)
-    }
-
     fn jvt_version(&self) -> u64 {
         self.0.jvt_version()
     }
@@ -141,37 +134,25 @@ impl hyperscale_storage::CommitStore for SharedStorage {
     fn commit_prepared_block(
         &self,
         prepared: Self::PreparedCommit,
-        certificates: &[std::sync::Arc<WaveCertificate>],
-        consensus: Option<hyperscale_storage::ConsensusCommitData>,
+        block: &hyperscale_types::Block,
+        qc: &hyperscale_types::QuorumCertificate,
         execution_certificates: &[hyperscale_types::ExecutionCertificate],
         receipts: &[hyperscale_types::ReceiptBundle],
     ) -> hyperscale_types::Hash {
-        self.0.commit_prepared_block(
-            prepared,
-            certificates,
-            consensus,
-            execution_certificates,
-            receipts,
-        )
+        self.0
+            .commit_prepared_block(prepared, block, qc, execution_certificates, receipts)
     }
 
     fn commit_block(
         &self,
         merged_updates: &DatabaseUpdates,
-        certificates: &[std::sync::Arc<WaveCertificate>],
-        block_height: u64,
-        consensus: Option<hyperscale_storage::ConsensusCommitData>,
+        block: &hyperscale_types::Block,
+        qc: &hyperscale_types::QuorumCertificate,
         execution_certificates: &[hyperscale_types::ExecutionCertificate],
         receipts: &[hyperscale_types::ReceiptBundle],
     ) -> hyperscale_types::Hash {
-        self.0.commit_block(
-            merged_updates,
-            certificates,
-            block_height,
-            consensus,
-            execution_certificates,
-            receipts,
-        )
+        self.0
+            .commit_block(merged_updates, block, qc, execution_certificates, receipts)
     }
 
     fn memory_usage_bytes(&self) -> (u64, u64) {
@@ -184,24 +165,12 @@ impl hyperscale_storage::CommitStore for SharedStorage {
 }
 
 impl hyperscale_storage::ConsensusStore for SharedStorage {
-    fn put_block(&self, height: BlockHeight, block: &Block, qc: &QuorumCertificate) {
-        self.0.put_block(height, block, qc)
-    }
-
     fn get_block(&self, height: BlockHeight) -> Option<(Block, QuorumCertificate)> {
         self.0.get_block(height)
     }
 
-    fn set_committed_height(&self, height: BlockHeight) {
-        self.0.set_committed_height(height)
-    }
-
     fn committed_height(&self) -> BlockHeight {
         self.0.committed_height()
-    }
-
-    fn set_committed_state(&self, height: BlockHeight, hash: Hash, qc: &QuorumCertificate) {
-        self.0.set_committed_state(height, hash, qc)
     }
 
     fn committed_hash(&self) -> Option<Hash> {
@@ -210,30 +179,6 @@ impl hyperscale_storage::ConsensusStore for SharedStorage {
 
     fn latest_qc(&self) -> Option<QuorumCertificate> {
         self.0.latest_qc()
-    }
-
-    fn store_certificate(&self, certificate: &WaveCertificate) {
-        self.0.store_certificate(certificate)
-    }
-
-    fn get_certificate(&self, hash: &Hash) -> Option<WaveCertificate> {
-        self.0.get_certificate(hash)
-    }
-
-    fn put_own_vote(&self, height: u64, round: u64, block_hash: Hash) {
-        self.0.put_own_vote(height, round, block_hash)
-    }
-
-    fn get_own_vote(&self, height: u64) -> Option<(Hash, u64)> {
-        self.0.get_own_vote(height)
-    }
-
-    fn get_all_own_votes(&self) -> std::collections::HashMap<u64, (Hash, u64)> {
-        self.0.get_all_own_votes()
-    }
-
-    fn prune_own_votes(&self, committed_height: u64) {
-        self.0.prune_own_votes(committed_height)
     }
 
     fn get_block_for_sync(&self, height: BlockHeight) -> Option<(Block, QuorumCertificate)> {
@@ -252,17 +197,6 @@ impl hyperscale_storage::ConsensusStore for SharedStorage {
         self.0.get_local_receipt(tx_hash)
     }
 
-    fn get_execution_output(&self, tx_hash: &Hash) -> Option<hyperscale_types::ExecutionOutput> {
-        self.0.get_execution_output(tx_hash)
-    }
-
-    fn get_execution_certificate(
-        &self,
-        canonical_hash: &Hash,
-    ) -> Option<hyperscale_types::ExecutionCertificate> {
-        self.0.get_execution_certificate(canonical_hash)
-    }
-
     fn get_execution_certificates_by_height(
         &self,
         block_height: u64,
@@ -272,10 +206,6 @@ impl hyperscale_storage::ConsensusStore for SharedStorage {
 
     fn store_execution_certificates(&self, certs: &[hyperscale_types::ExecutionCertificate]) {
         self.0.store_execution_certificates(certs)
-    }
-
-    fn get_wave_certificates_by_height(&self, height: u64) -> Vec<WaveCertificate> {
-        self.0.get_wave_certificates_by_height(height)
     }
 
     fn get_wave_certificate_for_tx(&self, tx_hash: &Hash) -> Option<WaveCertificate> {

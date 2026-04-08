@@ -97,36 +97,21 @@ impl RocksDbStorage {
     ///
     /// Panics if the block cannot be persisted. This is intentional: committed blocks
     /// are essential for crash recovery.
-    pub(crate) fn put_block_denormalized(&self, block: &Block, qc: &QuorumCertificate) {
-        let start = Instant::now();
-        let mut batch = rocksdb::WriteBatch::default();
-
-        // 1. Store block metadata (header + hashes only)
+    /// Append block data to an existing WriteBatch (for atomic commit).
+    pub(crate) fn append_block_to_batch(
+        &self,
+        batch: &mut rocksdb::WriteBatch,
+        block: &Block,
+        qc: &QuorumCertificate,
+    ) {
         let metadata = BlockMetadata::from_block(block, qc.clone());
-        self.cf_put::<BlocksCf>(&mut batch, &block.header.height.0, &metadata);
-
-        // 2. Store transactions (deduplicated - RocksDB overwrites are idempotent)
+        self.cf_put::<BlocksCf>(batch, &block.header.height.0, &metadata);
         for tx in block.transactions.iter() {
-            self.cf_put::<TransactionsCf>(&mut batch, &tx.hash(), tx.as_ref());
+            self.cf_put::<TransactionsCf>(batch, &tx.hash(), tx.as_ref());
         }
-
-        // 3. Store certificates (deduplicated)
         for cert in &block.certificates {
-            self.cf_put::<CertificatesCf>(&mut batch, &cert.wave_id.hash(), cert.as_ref());
+            self.cf_put::<CertificatesCf>(batch, &cert.wave_id.hash(), cert.as_ref());
         }
-
-        // Atomic write with sync for crash safety
-        let mut write_opts = WriteOptions::default();
-        write_opts.set_sync(true);
-        self.db
-            .write_opt(batch, &write_opts)
-            .expect("block persistence failed - cannot maintain chain state");
-
-        let elapsed = start.elapsed().as_secs_f64();
-        metrics::record_storage_write(elapsed);
-        metrics::record_storage_operation("put_block_denormalized", elapsed);
-        metrics::record_block_persisted();
-        metrics::record_transactions_persisted(block.transaction_count());
     }
 
     /// Get a committed block by height (reconstructs from denormalized storage).

@@ -10,7 +10,6 @@ use radix_substate_store_interface::interface::{DbSortKey, SubstateDatabase};
 /// This trait extends Radix's `SubstateDatabase` with additional methods needed
 /// for deterministic simulation and state commitment:
 /// - `snapshot()` - Create isolated views for parallel execution
-/// - `list_substates_for_node()` - Enumerate substates for cross-shard provisioning
 /// - `jvt_version()` / `state_root_hash()` - JVT state commitment
 ///
 /// All implementations use Jellyfish Verkle Tree (JVT) internally to maintain
@@ -34,15 +33,6 @@ pub trait SubstateStore: SubstateDatabase + Send + Sync {
     /// the snapshot. This enables RocksDB's native snapshot feature which
     /// provides true point-in-time isolation from concurrent writes.
     fn snapshot(&self) -> Self::Snapshot<'_>;
-
-    /// List all substates for a given NodeId.
-    ///
-    /// Returns an iterator of (partition_num, sort_key, value) tuples.
-    /// Used by cross-shard provisioning to collect state for other shards.
-    fn list_substates_for_node(
-        &self,
-        node_id: &NodeId,
-    ) -> Box<dyn Iterator<Item = (u8, DbSortKey, Vec<u8>)> + '_>;
 
     /// Returns the block height of the last committed JVT state.
     ///

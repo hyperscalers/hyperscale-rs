@@ -15,7 +15,7 @@ use hyperscale_storage::{CommitStore, ConsensusStore, SubstateStore};
 use hyperscale_types::ValidatorId;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use tracing::{debug, trace, warn};
+use tracing::{debug, warn};
 
 impl<S, N, D> IoLoop<S, N, D>
 where
@@ -50,6 +50,9 @@ where
             // ═══════════════════════════════════════════════════════════
             Action::BroadcastBlockHeader { shard: _, header } => {
                 self.network.notify(&self.cached_local_peers, &*header);
+            }
+            Action::BroadcastVote { vote, recipients } => {
+                self.network.notify(&recipients, &vote);
             }
             Action::BroadcastTransaction { shard, gossip } => {
                 self.network.broadcast_to_shard(shard, &*gossip);
@@ -186,9 +189,7 @@ where
             // ═══════════════════════════════════════════════════════════
             // Storage
             // ═══════════════════════════════════════════════════════════
-            Action::CacheWaveCertificate { .. }
-            | Action::PersistAndBroadcastVote { .. }
-            | Action::FetchChainMetadata => {
+            Action::CacheWaveCertificate { .. } | Action::FetchChainMetadata => {
                 self.process_storage_action(action);
             }
 
@@ -315,24 +316,6 @@ where
                 // request missing wave certificates before voting.
                 self.cert_cache
                     .insert(certificate.wave_id.hash(), certificate);
-            }
-            Action::PersistAndBroadcastVote {
-                height,
-                round,
-                block_hash,
-                shard: _,
-                vote,
-                recipients,
-            } => {
-                // BFT Safety: persist vote BEFORE broadcasting.
-                self.storage.put_own_vote(height.0, round, block_hash);
-                trace!(
-                    height = height.0,
-                    round,
-                    block_hash = ?block_hash,
-                    "Persisted own vote"
-                );
-                self.network.notify(&recipients, &vote);
             }
             Action::FetchChainMetadata => {
                 let height = self.storage.committed_height();
@@ -464,28 +447,17 @@ where
                     super::PendingCommit::Consensus { block, qc, .. }
                     | super::PendingCommit::Synced { block, qc } => (block, qc),
                 };
-                let height = block.header.height;
                 let block_hash = block.hash();
-                let consensus = hyperscale_storage::ConsensusCommitData {
-                    height,
-                    hash: block_hash,
-                    qc,
-                };
+                let height = block.header.height.0;
                 let empty_updates = hyperscale_types::DatabaseUpdates::default();
-                let result = self.storage.commit_block(
-                    &empty_updates,
-                    &block.certificates,
-                    height.0,
-                    Some(consensus),
-                    &[],
-                    &[],
-                );
-                ConsensusStore::prune_own_votes(&*self.storage, height.0);
+                let result = self
+                    .storage
+                    .commit_block(&empty_updates, &block, &qc, &[], &[]);
                 let _ =
                     self.event_sender
                         .send(NodeInput::Protocol(ProtocolEvent::BlockCommitted {
                             block_hash,
-                            height: height.0,
+                            height,
                             block,
                             state_root: result,
                         }));
@@ -595,12 +567,6 @@ where
                         ref qc,
                         ref finalized_waves,
                     } => {
-                        let consensus = hyperscale_storage::ConsensusCommitData {
-                            height,
-                            hash: block_hash,
-                            qc: qc.clone(),
-                        };
-                        // Extract receipts from finalized waves for atomic commit.
                         let wave_receipts: Vec<hyperscale_types::ReceiptBundle> = finalized_waves
                             .iter()
                             .flat_map(|fw| fw.receipts.iter().cloned())
@@ -609,42 +575,26 @@ where
                         if let Some(prepared) = prepared {
                             storage.commit_prepared_block(
                                 prepared,
-                                &block.certificates,
-                                Some(consensus),
+                                block,
+                                qc,
                                 &ecs_for_this_block,
                                 &wave_receipts,
                             )
                         } else {
-                            // Empty block (no certificates) — advance JVT version.
                             let empty = hyperscale_types::DatabaseUpdates::default();
                             storage.commit_block(
                                 &empty,
-                                &block.certificates,
-                                height.0,
-                                Some(consensus),
+                                block,
+                                qc,
                                 &ecs_for_this_block,
                                 &wave_receipts,
                             )
                         }
                     }
                     super::PendingCommit::Synced { ref block, ref qc } => {
-                        let consensus = hyperscale_storage::ConsensusCommitData {
-                            height,
-                            hash: block_hash,
-                            qc: qc.clone(),
-                        };
-
                         if block.certificates.is_empty() {
-                            // Empty synced block — advance JVT version.
                             let empty = hyperscale_types::DatabaseUpdates::default();
-                            storage.commit_block(
-                                &empty,
-                                &block.certificates,
-                                height.0,
-                                Some(consensus),
-                                &ecs_for_this_block,
-                                &[],
-                            )
+                            storage.commit_block(&empty, block, qc, &ecs_for_this_block, &[])
                         } else if let Some(entry) = sync_data.get(&height.0) {
                             let (receipts, sync_ecs) =
                                 (&entry.local_receipts, &entry.execution_certificates);
@@ -735,27 +685,18 @@ where
 
                             storage.commit_prepared_block(
                                 prepared,
-                                &block.certificates,
-                                Some(consensus),
+                                block,
+                                qc,
                                 sync_ecs,
                                 &sync_receipt_bundles,
                             )
                         } else {
-                            // BUG: sync block with certs but no sync data.
-                            // Should not happen — readiness check defers these.
                             tracing::error!(
                                 height = height.0,
                                 "BUG: synced block with certs but no sync data"
                             );
                             let empty = hyperscale_types::DatabaseUpdates::default();
-                            storage.commit_block(
-                                &empty,
-                                &block.certificates,
-                                height.0,
-                                Some(consensus),
-                                &ecs_for_this_block,
-                                &[],
-                            )
+                            storage.commit_block(&empty, block, qc, &ecs_for_this_block, &[])
                         }
                     }
                 };
@@ -765,8 +706,6 @@ where
                     super::PendingCommit::Consensus { block, .. }
                     | super::PendingCommit::Synced { block, .. } => block,
                 };
-
-                ConsensusStore::prune_own_votes(&*storage, height.0);
 
                 // Clear the in-flight flag before sending events for the last
                 // block. The channel send synchronizes-with recv on the main

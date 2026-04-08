@@ -310,11 +310,12 @@ impl RocksDbStorage {
     /// to a `WriteBatch` so it is persisted atomically with JVT + substate data.
     pub(crate) fn append_consensus_to_batch(
         batch: &mut WriteBatch,
-        consensus: &hyperscale_storage::ConsensusCommitData,
+        block: &hyperscale_types::Block,
+        qc: &hyperscale_types::QuorumCertificate,
     ) {
-        crate::metadata::write_committed_height(batch, consensus.height);
-        crate::metadata::write_committed_hash(batch, &consensus.hash);
-        crate::metadata::write_committed_qc(batch, &consensus.qc);
+        crate::metadata::write_committed_height(batch, block.header.height);
+        crate::metadata::write_committed_hash(batch, &block.hash());
+        crate::metadata::write_committed_qc(batch, qc);
     }
 
     /// Build a `WriteBatch` containing all substate puts/deletes from `updates`.

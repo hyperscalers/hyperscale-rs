@@ -34,7 +34,7 @@ mod writes;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_helpers;
 
-pub use commit::{CommitStore, ConsensusCommitData};
+pub use commit::CommitStore;
 pub use consensus::ConsensusStore;
 pub use genesis::{GenesisWrapper, SubstatesOnlyCommit};
 pub use overlay::{SubstateDbLookup, SubstateLookup};

@@ -25,19 +25,6 @@ impl SubstateStore for RocksDbStorage {
         }
     }
 
-    fn list_substates_for_node(
-        &self,
-        node_id: &NodeId,
-    ) -> Box<dyn Iterator<Item = (u8, DbSortKey, Vec<u8>)> + '_> {
-        let prefix = substate_key::node_prefix(node_id);
-        let cf = crate::column_families::StateCf::handle(&self.cf());
-
-        Box::new(
-            crate::typed_cf::prefix_iter::<crate::column_families::StateCf>(&self.db, cf, &prefix)
-                .map(|((pk, sk), value)| (pk.partition_num, sk, value)),
-        )
-    }
-
     fn jvt_version(&self) -> u64 {
         self.read_jvt_metadata().0
     }
@@ -194,7 +181,8 @@ impl RocksDbStorage {
         &self,
         mut write_batch: WriteBatch,
         jvt_snapshot: JvtSnapshot,
-        consensus: Option<&hyperscale_storage::ConsensusCommitData>,
+        block: &hyperscale_types::Block,
+        qc: &hyperscale_types::QuorumCertificate,
     ) -> bool {
         let _commit_guard = self.commit_lock.lock().unwrap();
         let start = Instant::now();
@@ -229,9 +217,7 @@ impl RocksDbStorage {
         self.append_jvt_to_batch(&mut write_batch, &jvt_snapshot, new_version);
 
         // Fold consensus metadata into the same batch for crash-safe atomicity.
-        if let Some(consensus) = consensus {
-            Self::append_consensus_to_batch(&mut write_batch, consensus);
-        }
+        Self::append_consensus_to_batch(&mut write_batch, block, qc);
 
         // Apply everything atomically with a single fsync
         let mut write_opts = rocksdb::WriteOptions::default();

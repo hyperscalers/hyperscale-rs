@@ -15,27 +15,6 @@ impl SubstateStore for SimStorage {
         SimSnapshot { data }
     }
 
-    fn list_substates_for_node(
-        &self,
-        node_id: &NodeId,
-    ) -> Box<dyn Iterator<Item = (u8, DbSortKey, Vec<u8>)> + '_> {
-        let prefix = keys::node_prefix(node_id);
-        let prefix_len = prefix.len();
-        let end = keys::next_prefix(&prefix).expect("storage key prefix overflow");
-
-        let items = self.iter_range(&prefix, &end);
-
-        Box::new(items.into_iter().filter_map(move |(full_key, value)| {
-            if full_key.len() > prefix_len {
-                let partition_num = full_key[prefix_len];
-                let sort_key_bytes = full_key[prefix_len + 1..].to_vec();
-                Some((partition_num, DbSortKey(sort_key_bytes), value))
-            } else {
-                None
-            }
-        }))
-    }
-
     fn jvt_version(&self) -> u64 {
         self.state.read().unwrap().current_block_height
     }

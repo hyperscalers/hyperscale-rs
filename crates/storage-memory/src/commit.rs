@@ -4,9 +4,8 @@ use crate::core::SimStorage;
 use crate::state::apply_updates_to_ordmap;
 
 use hyperscale_storage::{CommitStore, DatabaseUpdates, JvtSnapshot};
-use hyperscale_types::{Hash, ReceiptBundle, WaveCertificate};
+use hyperscale_types::{Hash, ReceiptBundle};
 use im::OrdMap;
-use std::sync::Arc;
 
 /// Precomputed commit work for a SimStorage block commit.
 ///
@@ -81,8 +80,8 @@ impl CommitStore for SimStorage {
     fn commit_prepared_block(
         &self,
         prepared: Self::PreparedCommit,
-        certificates: &[Arc<WaveCertificate>],
-        consensus: Option<hyperscale_storage::ConsensusCommitData>,
+        block: &hyperscale_types::Block,
+        qc: &hyperscale_types::QuorumCertificate,
         _execution_certificates: &[hyperscale_types::ExecutionCertificate],
         receipts: &[ReceiptBundle],
     ) -> Hash {
@@ -113,7 +112,13 @@ impl CommitStore for SimStorage {
 
                 // Store certificates + consensus metadata atomically in consensus lock.
                 let mut c = self.consensus.write().unwrap();
-                for cert in certificates {
+                // Store block data for sync serving.
+                for tx in block.transactions.iter() {
+                    c.transactions.insert(tx.hash(), tx.as_ref().clone());
+                }
+                c.blocks
+                    .insert(block.header.height, (block.clone(), qc.clone()));
+                for cert in &block.certificates {
                     let wave_id_hash = cert.wave_id.hash();
                     c.certificates.insert(wave_id_hash, (**cert).clone());
                     c.wave_certs_by_height
@@ -121,7 +126,6 @@ impl CommitStore for SimStorage {
                         .or_default()
                         .push(wave_id_hash);
                 }
-                // Store receipts atomically with block commit.
                 for bundle in receipts {
                     c.local_receipts
                         .insert(bundle.tx_hash, bundle.local_receipt.clone());
@@ -130,38 +134,27 @@ impl CommitStore for SimStorage {
                             .insert(bundle.tx_hash, exec_output.clone());
                     }
                 }
-                if let Some(consensus) = consensus {
-                    c.committed_height = consensus.height;
-                    c.committed_hash = Some(consensus.hash);
-                    c.committed_qc = Some(consensus.qc);
-                    c.prune_receipts(consensus.height.0);
-                }
+                c.committed_height = block.header.height;
+                c.committed_hash = Some(block.hash());
+                c.committed_qc = Some(qc.clone());
+                c.prune_receipts(block.header.height.0);
 
                 return result_root;
             }
         }
 
-        // Stale cache: fall back to full block commit which recomputes JVT.
-        // Use the stored merged_updates to ensure substate writes aren't lost.
-        self.commit_block(
-            &prepared.merged_updates,
-            certificates,
-            block_height,
-            consensus,
-            &[],
-            receipts,
-        )
+        self.commit_block(&prepared.merged_updates, block, qc, &[], receipts)
     }
 
     fn commit_block(
         &self,
         merged_updates: &DatabaseUpdates,
-        certificates: &[Arc<WaveCertificate>],
-        block_height: u64,
-        consensus: Option<hyperscale_storage::ConsensusCommitData>,
+        block: &hyperscale_types::Block,
+        qc: &hyperscale_types::QuorumCertificate,
         _execution_certificates: &[hyperscale_types::ExecutionCertificate],
         receipts: &[ReceiptBundle],
     ) -> Hash {
+        let block_height = block.header.height.0;
         let mut s = self.state.write().unwrap();
 
         assert!(
@@ -211,10 +204,15 @@ impl CommitStore for SimStorage {
 
         drop(s);
 
-        // Store certificate metadata + consensus state atomically in consensus lock.
+        // Store block + certificate + consensus state atomically.
         {
             let mut c = self.consensus.write().unwrap();
-            for cert in certificates {
+            for tx in block.transactions.iter() {
+                c.transactions.insert(tx.hash(), tx.as_ref().clone());
+            }
+            c.blocks
+                .insert(block.header.height, (block.clone(), qc.clone()));
+            for cert in &block.certificates {
                 let wave_id_hash = cert.wave_id.hash();
                 c.certificates.insert(wave_id_hash, (**cert).clone());
                 c.wave_certs_by_height
@@ -231,12 +229,10 @@ impl CommitStore for SimStorage {
                         .insert(bundle.tx_hash, exec_output.clone());
                 }
             }
-            if let Some(consensus) = consensus {
-                c.committed_height = consensus.height;
-                c.committed_hash = Some(consensus.hash);
-                c.committed_qc = Some(consensus.qc);
-                c.prune_receipts(consensus.height.0);
-            }
+            c.committed_height = block.header.height;
+            c.committed_hash = Some(block.hash());
+            c.committed_qc = Some(qc.clone());
+            c.prune_receipts(block.header.height.0);
         }
 
         new_root
