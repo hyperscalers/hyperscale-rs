@@ -6,7 +6,7 @@
 
 use hyperscale_types::{
     AbortIntent, AbortReason, Block, BlockHeader, BlockHeight, CommittedBlockHeader, Hash,
-    ShardGroupId,
+    ReceiptBundle, ShardGroupId,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -123,6 +123,13 @@ pub(crate) struct VerificationPipeline {
     /// Blocks with verified receipt roots.
     verified_certificate_roots: HashSet<Hash>,
 
+    // === Local receipt root verification ===
+    /// Blocks where local receipt root verification is currently in-flight.
+    local_receipt_root_verifications_in_flight: HashSet<Hash>,
+
+    /// Blocks with verified local receipt roots.
+    verified_local_receipt_roots: HashSet<Hash>,
+
     // === Abort intent proof verification ===
     /// Blocks where abort intent proof verification is currently in-flight.
     abort_intent_verifications_in_flight: HashSet<Hash>,
@@ -150,6 +157,8 @@ impl VerificationPipeline {
             verified_transaction_roots: HashSet::new(),
             certificate_root_verifications_in_flight: HashSet::new(),
             verified_certificate_roots: HashSet::new(),
+            local_receipt_root_verifications_in_flight: HashSet::new(),
+            verified_local_receipt_roots: HashSet::new(),
             abort_intent_verifications_in_flight: HashSet::new(),
             verified_abort_intents: HashSet::new(),
             pending_abort_intent_verifications: HashMap::new(),
@@ -226,13 +235,23 @@ impl VerificationPipeline {
             self.verified_certificate_roots.contains(&block_hash)
         };
 
+        let local_receipt_root_ok = if block.certificates.is_empty() {
+            true
+        } else {
+            self.verified_local_receipt_roots.contains(&block_hash)
+        };
+
         let abort_intents_ok = if !Self::has_livelock_abort_intents(block) {
             true
         } else {
             self.verified_abort_intents.contains(&block_hash)
         };
 
-        state_root_ok && transaction_root_ok && certificate_root_ok && abort_intents_ok
+        state_root_ok
+            && transaction_root_ok
+            && certificate_root_ok
+            && local_receipt_root_ok
+            && abort_intents_ok
     }
 
     /// Log why a block's verification is incomplete. Called on view change
@@ -284,6 +303,19 @@ impl VerificationPipeline {
             "NOT_STARTED"
         };
 
+        let local_receipt_root_status = if block.certificates.is_empty() {
+            "skipped(no_certs)"
+        } else if self.verified_local_receipt_roots.contains(&block_hash) {
+            "verified"
+        } else if self
+            .local_receipt_root_verifications_in_flight
+            .contains(&block_hash)
+        {
+            "in_flight"
+        } else {
+            "NOT_STARTED"
+        };
+
         let abort_status = if !Self::has_livelock_abort_intents(block) {
             "skipped(no_livelock)"
         } else if self.verified_abort_intents.contains(&block_hash) {
@@ -311,6 +343,7 @@ impl VerificationPipeline {
             state_root = state_root_status,
             tx_root = tx_root_status,
             certificate_root = certificate_root_status,
+            local_receipt_root = local_receipt_root_status,
             abort_intents = abort_status,
             "View change — block verification was incomplete"
         );
@@ -536,6 +569,67 @@ impl VerificationPipeline {
             debug!(
                 block_hash = ?block_hash,
                 "Certificate root verified successfully"
+            );
+        }
+
+        valid
+    }
+
+    // ─── Local receipt root ─────────────────────────────────────────────
+
+    /// Check if a block needs local receipt root verification before voting.
+    pub fn needs_local_receipt_root_verification(&self, block: &Block) -> bool {
+        if block.certificates.is_empty() {
+            return false;
+        }
+
+        let block_hash = block.hash();
+
+        if self.verified_local_receipt_roots.contains(&block_hash)
+            || self
+                .local_receipt_root_verifications_in_flight
+                .contains(&block_hash)
+        {
+            return false;
+        }
+
+        true
+    }
+
+    /// Initiate local receipt root verification for a block.
+    pub fn initiate_local_receipt_root_verification(
+        &mut self,
+        block_hash: Hash,
+        block: &Block,
+        receipts: Vec<ReceiptBundle>,
+    ) -> Vec<Action> {
+        debug!(
+            block_hash = ?block_hash,
+            receipt_count = receipts.len(),
+            expected_root = ?block.header.local_receipt_root,
+            "Initiating local receipt root verification"
+        );
+
+        self.local_receipt_root_verifications_in_flight
+            .insert(block_hash);
+
+        vec![Action::VerifyLocalReceiptRoot {
+            block_hash,
+            expected_root: block.header.local_receipt_root,
+            receipts,
+        }]
+    }
+
+    /// Record a local receipt root verification result. Returns whether the verification passed.
+    pub fn on_local_receipt_root_verified(&mut self, block_hash: Hash, valid: bool) -> bool {
+        self.local_receipt_root_verifications_in_flight
+            .remove(&block_hash);
+
+        if valid {
+            self.verified_local_receipt_roots.insert(block_hash);
+            debug!(
+                block_hash = ?block_hash,
+                "Local receipt root verified successfully"
             );
         }
 
@@ -855,6 +949,12 @@ impl VerificationPipeline {
             .retain(|hash| pending_blocks.contains_key(hash));
 
         self.verified_certificate_roots
+            .retain(|hash| pending_blocks.contains_key(hash));
+
+        self.local_receipt_root_verifications_in_flight
+            .retain(|hash| pending_blocks.contains_key(hash));
+
+        self.verified_local_receipt_roots
             .retain(|hash| pending_blocks.contains_key(hash));
 
         self.abort_intent_verifications_in_flight

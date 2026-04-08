@@ -2020,6 +2020,27 @@ impl BftState {
                     );
                 }
 
+                // Verify local receipt root if block has certificates.
+                if self
+                    .verification
+                    .needs_local_receipt_root_verification(&block)
+                {
+                    let receipts = self
+                        .pending_blocks
+                        .get(&block_hash)
+                        .map(|p| {
+                            p.finalized_waves()
+                                .iter()
+                                .flat_map(|fw| fw.receipts.iter().cloned())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    verification_actions
+                        .extend(self.verification.initiate_local_receipt_root_verification(
+                            block_hash, &block, receipts,
+                        ));
+                }
+
                 // Verify abort intent inclusion proofs if block has livelock intents.
                 // Resolves remote headers directly and either dispatches
                 // verification or parks until missing headers arrive.
@@ -2768,6 +2789,59 @@ impl BftState {
             debug!(
                 block_hash = ?block_hash,
                 "Certificate root done, waiting for other verifications"
+            );
+            return vec![];
+        }
+
+        let height = pending_block.header().height.0;
+        let round = pending_block.header().round;
+
+        // All verifications complete - vote
+        self.create_vote(topology, block_hash, height, round)
+    }
+
+    /// Handle local receipt root verification result.
+    ///
+    /// Called when the runner completes `Action::VerifyLocalReceiptRoot`. If the
+    /// local receipt root is invalid, the block is rejected. If valid, proceeds to
+    /// vote for the block (assuming other verifications are also complete).
+    #[instrument(skip(self), fields(block_hash = ?block_hash, valid = valid))]
+    pub fn on_local_receipt_root_verified(
+        &mut self,
+        topology: &TopologySnapshot,
+        block_hash: Hash,
+        valid: bool,
+    ) -> Vec<Action> {
+        if !self
+            .verification
+            .on_local_receipt_root_verified(block_hash, valid)
+        {
+            warn!(
+                block_hash = ?block_hash,
+                "Local receipt root verification FAILED - proposer included incorrect local_receipt_root!"
+            );
+            self.pending_blocks.remove(&block_hash);
+            return vec![];
+        }
+
+        let Some(pending_block) = self.pending_blocks.get(&block_hash) else {
+            warn!(
+                block_hash = ?block_hash,
+                "Local receipt root verification complete but pending block not found"
+            );
+            return vec![];
+        };
+
+        let block = match pending_block.block() {
+            Some(b) => b,
+            None => return vec![],
+        };
+
+        // Check if all verifications are complete (state root, tx root, etc. may still be pending)
+        if !self.verification.is_block_verified(&block) {
+            debug!(
+                block_hash = ?block_hash,
+                "Local receipt root done, waiting for other verifications"
             );
             return vec![];
         }

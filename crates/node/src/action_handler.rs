@@ -57,6 +57,7 @@ pub(crate) fn dispatch_pool_for(action: &Action) -> Option<DispatchPool> {
         Action::VerifyStateRoot { .. } => Some(DispatchPool::ConsensusCrypto),
         Action::VerifyTransactionRoot { .. } => Some(DispatchPool::ConsensusCrypto),
         Action::VerifyCertificateRoot { .. } => Some(DispatchPool::ConsensusCrypto),
+        Action::VerifyLocalReceiptRoot { .. } => Some(DispatchPool::ConsensusCrypto),
         Action::VerifyAbortIntentProofs { .. } => Some(DispatchPool::ConsensusCrypto),
         Action::BuildProposal { .. } => Some(DispatchPool::ConsensusCrypto),
 
@@ -227,6 +228,26 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
             })
         }
 
+        Action::VerifyLocalReceiptRoot {
+            block_hash,
+            expected_root,
+            receipts,
+        } => {
+            let start = std::time::Instant::now();
+            let valid =
+                hyperscale_bft::handlers::verify_local_receipt_root(expected_root, &receipts);
+            metrics::record_signature_verification_latency(
+                "local_receipt_root",
+                start.elapsed().as_secs_f64(),
+            );
+            Some(DelegatedResult {
+                events: vec![NodeInput::Protocol(
+                    ProtocolEvent::LocalReceiptRootVerified { block_hash, valid },
+                )],
+                prepared_commit: None,
+            })
+        }
+
         Action::VerifyAbortIntentProofs {
             block_hash,
             proof_inputs,
@@ -314,6 +335,12 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
                 .collect();
             let merged_updates = hyperscale_storage::merge_database_updates(&per_receipt);
 
+            // Collect all receipts from finalized waves for local_receipt_root computation.
+            let all_receipts: Vec<hyperscale_types::ReceiptBundle> = finalized_waves
+                .iter()
+                .flat_map(|fw| fw.receipts.iter().cloned())
+                .collect();
+
             let result = hyperscale_bft::handlers::build_proposal(
                 ctx.storage,
                 proposer,
@@ -326,6 +353,7 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
                 parent_state_root,
                 transactions,
                 certificates,
+                &all_receipts,
                 merged_updates,
                 abort_intents,
                 shard_group_id,

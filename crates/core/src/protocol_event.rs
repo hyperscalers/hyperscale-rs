@@ -114,6 +114,9 @@ pub enum ProtocolEvent {
     /// Receipt root verification completed.
     CertificateRootVerified { block_hash: Hash, valid: bool },
 
+    /// Local receipt root verification completed.
+    LocalReceiptRootVerified { block_hash: Hash, valid: bool },
+
     /// Abort intent inclusion proof verification completed.
     AbortIntentProofsVerified { block_hash: Hash, valid: bool },
 
@@ -365,6 +368,7 @@ impl ProtocolEvent {
             ProtocolEvent::StateRootVerified { .. } => "StateRootVerified",
             ProtocolEvent::TransactionRootVerified { .. } => "TransactionRootVerified",
             ProtocolEvent::CertificateRootVerified { .. } => "CertificateRootVerified",
+            ProtocolEvent::LocalReceiptRootVerified { .. } => "LocalReceiptRootVerified",
             ProtocolEvent::AbortIntentProofsVerified { .. } => "AbortIntentProofsVerified",
             ProtocolEvent::ProposalBuilt { .. } => "ProposalBuilt",
 
