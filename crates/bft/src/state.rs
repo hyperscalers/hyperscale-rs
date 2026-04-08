@@ -3353,14 +3353,19 @@ impl BftState {
         let mut current_qc = certifying_qc;
 
         loop {
-            // Get the block to commit.
-            let block = if let Some(block) = self.certified_blocks.get(&current_hash) {
-                Some(block.clone())
-            } else if let Some(pending) = self.pending_blocks.get(&current_hash) {
-                pending.block().map(|b| (*b).clone())
-            } else {
-                None
-            };
+            // Get the block and its finalized waves to commit.
+            let (block, commit_waves) =
+                if let Some(block) = self.certified_blocks.get(&current_hash) {
+                    // Certified blocks don't carry finalized waves (they were committed via sync).
+                    (Some(block.clone()), vec![])
+                } else if let Some(pending) = self.pending_blocks.get(&current_hash) {
+                    (
+                        pending.block().map(|b| (*b).clone()),
+                        pending.finalized_waves(),
+                    )
+                } else {
+                    (None, vec![])
+                };
 
             let Some(block) = block else {
                 warn!("Block {} not found for commit", current_hash);
@@ -3417,9 +3422,10 @@ impl BftState {
                 actions.push(Action::CancelFetch { block_hash });
             }
 
-            actions.push(Action::EmitCommittedBlock {
+            actions.push(Action::CommitBlock {
                 block: block.clone(),
                 qc: current_qc.clone(),
+                finalized_waves: commit_waves,
             });
             // Only the block proposer gossips the committed header globally.
             // Other validators rely on receiving it via gossip propagation.
@@ -3708,9 +3714,10 @@ impl BftState {
                 block: block.clone(),
                 qc: qc.clone(),
             },
-            Action::EmitCommittedBlock {
+            Action::CommitBlock {
                 block: block.clone(),
                 qc,
+                finalized_waves: vec![], // Sync path — receipts come from sync data
             },
         ];
 
@@ -4196,19 +4203,6 @@ impl BftState {
     // ═══════════════════════════════════════════════════════════════════════════
     // Receipt Availability
     // ═══════════════════════════════════════════════════════════════════════════
-
-    /// Handle receipts becoming available from execution.
-    ///
-    /// DEPRECATED: Receipt availability is now tracked via finalized waves.
-    /// This method is kept as a no-op for API compatibility and will be removed
-    /// once all callers are updated.
-    pub fn on_receipts_available(
-        &mut self,
-        _topology: &TopologySnapshot,
-        _tx_hashes: &[Hash],
-    ) -> Vec<Action> {
-        vec![]
-    }
 
     // ═══════════════════════════════════════════════════════════════════════════
     // Transaction Monitoring

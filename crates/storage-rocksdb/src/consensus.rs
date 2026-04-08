@@ -78,14 +78,6 @@ impl hyperscale_storage::ConsensusStore for RocksDbStorage {
         RocksDbStorage::get_certificates_batch(self, hashes)
     }
 
-    fn store_receipt_bundle(&self, bundle: &hyperscale_types::ReceiptBundle) {
-        RocksDbStorage::store_receipt_bundle(self, bundle)
-    }
-
-    fn store_receipt_bundles(&self, bundles: &[hyperscale_types::ReceiptBundle]) {
-        RocksDbStorage::store_receipt_bundles(self, bundles)
-    }
-
     fn get_local_receipt(&self, tx_hash: &Hash) -> Option<Arc<hyperscale_types::LocalReceipt>> {
         RocksDbStorage::get_local_receipt(self, tx_hash)
     }

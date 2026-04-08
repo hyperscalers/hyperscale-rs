@@ -159,6 +159,11 @@ impl PendingBlock {
         self.missing_wave_hashes.contains(wave_id_hash)
     }
 
+    /// Get all received finalized waves.
+    pub fn finalized_waves(&self) -> Vec<Arc<FinalizedWave>> {
+        self.received_waves.values().cloned().collect()
+    }
+
     /// Construct the block from header + received transactions + received waves.
     ///
     /// Should only be called when is_complete() returns true.

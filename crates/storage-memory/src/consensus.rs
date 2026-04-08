@@ -5,7 +5,7 @@ use crate::core::SimStorage;
 use hyperscale_storage::ConsensusStore;
 use hyperscale_types::{
     Block, BlockHeight, ExecutionCertificate, ExecutionOutput, Hash, LocalReceipt,
-    QuorumCertificate, ReceiptBundle, RoutableTransaction, ShardGroupId, WaveCertificate,
+    QuorumCertificate, RoutableTransaction, ShardGroupId, WaveCertificate,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -113,17 +113,6 @@ impl ConsensusStore for SimStorage {
             .iter()
             .filter_map(|h| c.certificates.get(h).cloned())
             .collect()
-    }
-
-    fn store_receipt_bundle(&self, bundle: &ReceiptBundle) {
-        let mut c = self.consensus.write().unwrap();
-        let height = c.committed_height.0;
-        c.local_receipts
-            .insert(bundle.tx_hash, Arc::clone(&bundle.local_receipt));
-        c.receipt_heights.insert(bundle.tx_hash, height);
-        if let Some(ref local) = bundle.execution_output {
-            c.execution_outputs.insert(bundle.tx_hash, local.clone());
-        }
     }
 
     fn get_local_receipt(&self, tx_hash: &Hash) -> Option<Arc<LocalReceipt>> {

@@ -408,7 +408,7 @@ fn test_commit_block_applies_writes() {
     let updates = make_mapped_database_update(1, 0, vec![10], vec![42]);
     let cert = Arc::new(make_test_wave_certificate(1, shard));
 
-    let result = storage.commit_block(&updates, &[cert], 1, None, &[]);
+    let result = storage.commit_block(&updates, &[cert], 1, None, &[], &[]);
     assert_ne!(result, Hash::ZERO);
 }
 
@@ -424,7 +424,7 @@ fn test_commit_block_multiple_certs() {
     let cert1 = Arc::new(make_test_wave_certificate(1, shard));
     let cert2 = Arc::new(make_test_wave_certificate(2, shard));
 
-    let result = storage.commit_block(&merged, &[cert1, cert2], 1, None, &[]);
+    let result = storage.commit_block(&merged, &[cert1, cert2], 1, None, &[], &[]);
     assert_ne!(result, Hash::ZERO);
 }
 
@@ -433,7 +433,7 @@ fn test_commit_block_empty_certs() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
 
-    storage.commit_block(&DatabaseUpdates::default(), &[], 1, None, &[]);
+    storage.commit_block(&DatabaseUpdates::default(), &[], 1, None, &[], &[]);
     assert_eq!(storage.jvt_version(), 1);
 }
 
@@ -448,7 +448,7 @@ fn test_prepare_then_commit_matches_direct() {
     let (spec_root, prepared) =
         s_prepared.prepare_block_commit(parent_root, &DatabaseUpdates::default(), 1);
     let certs = std::slice::from_ref(&cert);
-    let result_prepared = s_prepared.commit_prepared_block(prepared, certs, None, &[]);
+    let result_prepared = s_prepared.commit_prepared_block(prepared, certs, None, &[], &[]);
 
     let temp_dir2 = TempDir::new().unwrap();
     let s_direct = RocksDbStorage::open(temp_dir2.path()).unwrap();
@@ -457,6 +457,7 @@ fn test_prepare_then_commit_matches_direct() {
         std::slice::from_ref(&cert),
         1,
         None,
+        &[],
         &[],
     );
 
@@ -473,7 +474,7 @@ fn test_commit_block_stores_certificates() {
     let cert = Arc::new(make_test_wave_certificate(1, shard));
     let wave_hash = cert.wave_id.hash();
 
-    let _ = storage.commit_block(&DatabaseUpdates::default(), &[cert], 1, None, &[]);
+    let _ = storage.commit_block(&DatabaseUpdates::default(), &[cert], 1, None, &[], &[]);
 
     assert!(storage.get_certificate(&wave_hash).is_some());
 }
@@ -696,34 +697,6 @@ fn test_blocks_and_votes_survive_reopen() {
 // ═══════════════════════════════════════════════════════════════════════
 
 #[test]
-fn test_receipt_storage_roundtrip() {
-    let temp_dir = TempDir::new().unwrap();
-    let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
-    hyperscale_storage::test_helpers::test_receipt_storage_roundtrip(&storage);
-}
-
-#[test]
-fn test_receipt_storage_synced() {
-    let temp_dir = TempDir::new().unwrap();
-    let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
-    hyperscale_storage::test_helpers::test_receipt_storage_synced(&storage);
-}
-
-#[test]
-fn test_receipt_batch_storage() {
-    let temp_dir = TempDir::new().unwrap();
-    let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
-    hyperscale_storage::test_helpers::test_receipt_batch_storage(&storage);
-}
-
-#[test]
-fn test_receipt_idempotent_overwrite() {
-    let temp_dir = TempDir::new().unwrap();
-    let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
-    hyperscale_storage::test_helpers::test_receipt_idempotent_overwrite(&storage);
-}
-
-#[test]
 fn test_receipt_survives_reopen() {
     let temp_dir = TempDir::new().unwrap();
     let bundle = hyperscale_storage::test_helpers::make_test_receipt_bundle(55);
@@ -794,7 +767,7 @@ fn test_ec_atomic_with_block_commit() {
     let cert = Arc::new(make_test_wave_certificate(1, ShardGroupId(0)));
 
     // Commit block with EC atomically
-    storage.commit_block(&DatabaseUpdates::default(), &[cert], 1, None, &[ec]);
+    storage.commit_block(&DatabaseUpdates::default(), &[cert], 1, None, &[ec], &[]);
 
     // EC should be retrievable
     let retrieved = storage.get_execution_certificate(&canonical_hash).unwrap();

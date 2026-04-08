@@ -4,7 +4,7 @@ use crate::core::SimStorage;
 use crate::state::apply_updates_to_ordmap;
 
 use hyperscale_storage::{CommitStore, DatabaseUpdates, JvtSnapshot};
-use hyperscale_types::{Hash, WaveCertificate};
+use hyperscale_types::{Hash, ReceiptBundle, WaveCertificate};
 use im::OrdMap;
 use std::sync::Arc;
 
@@ -84,6 +84,7 @@ impl CommitStore for SimStorage {
         certificates: &[Arc<WaveCertificate>],
         consensus: Option<hyperscale_storage::ConsensusCommitData>,
         _execution_certificates: &[hyperscale_types::ExecutionCertificate],
+        receipts: &[ReceiptBundle],
     ) -> Hash {
         let block_height = prepared.snapshot.new_version;
         let result_root = prepared.snapshot.result_root;
@@ -120,6 +121,15 @@ impl CommitStore for SimStorage {
                         .or_default()
                         .push(wave_id_hash);
                 }
+                // Store receipts atomically with block commit.
+                for bundle in receipts {
+                    c.local_receipts
+                        .insert(bundle.tx_hash, bundle.local_receipt.clone());
+                    if let Some(ref exec_output) = bundle.execution_output {
+                        c.execution_outputs
+                            .insert(bundle.tx_hash, exec_output.clone());
+                    }
+                }
                 if let Some(consensus) = consensus {
                     c.committed_height = consensus.height;
                     c.committed_hash = Some(consensus.hash);
@@ -139,6 +149,7 @@ impl CommitStore for SimStorage {
             block_height,
             consensus,
             &[],
+            receipts,
         )
     }
 
@@ -149,6 +160,7 @@ impl CommitStore for SimStorage {
         block_height: u64,
         consensus: Option<hyperscale_storage::ConsensusCommitData>,
         _execution_certificates: &[hyperscale_types::ExecutionCertificate],
+        receipts: &[ReceiptBundle],
     ) -> Hash {
         let mut s = self.state.write().unwrap();
 
@@ -209,6 +221,15 @@ impl CommitStore for SimStorage {
                     .entry(cert.wave_id.block_height)
                     .or_default()
                     .push(wave_id_hash);
+            }
+            // Store receipts atomically with block commit.
+            for bundle in receipts {
+                c.local_receipts
+                    .insert(bundle.tx_hash, bundle.local_receipt.clone());
+                if let Some(ref exec_output) = bundle.execution_output {
+                    c.execution_outputs
+                        .insert(bundle.tx_hash, exec_output.clone());
+                }
             }
             if let Some(consensus) = consensus {
                 c.committed_height = consensus.height;
