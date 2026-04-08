@@ -32,10 +32,10 @@
 
 use hyperscale_core::{Action, CrossShardExecutionRequest, ProtocolEvent, ProvisionRequest};
 use hyperscale_types::{
-    AbortReason, BlockHeight, Bls12381G1PublicKey, DatabaseUpdates, ExecutionResult, ExecutionVote,
-    Hash, LedgerTransactionReceipt, ProvisionBatch, ReceiptBundle, RoutableTransaction,
-    ShardExecutionProof, ShardGroupId, StateProvision, TopologySnapshot, TransactionCertificate,
-    TransactionDecision, TxExecutionOutcome, TxOutcome, ValidatorId, WaveId,
+    AbortReason, BlockHeight, Bls12381G1PublicKey, ExecutionResult, ExecutionVote, Hash,
+    LedgerTransactionReceipt, ReceiptBundle, RoutableTransaction, ShardExecutionProof,
+    ShardGroupId, StateProvision, TopologySnapshot, TransactionCertificate, TransactionDecision,
+    TxExecutionOutcome, TxOutcome, ValidatorId, WaveId,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -113,12 +113,6 @@ pub struct ExecutionMemoryStats {
     pub early_votes: usize,
     pub certificate_trackers: usize,
     pub expected_exec_certs: usize,
-    /// Speculative provision preparations in-flight.
-    pub speculative_provision_in_flight: usize,
-    /// Cached speculative provision results.
-    pub speculative_provision_results: usize,
-    /// Blocks committed while speculative provisions were in-flight.
-    pub pending_provision_commits: usize,
 }
 
 /// Execution state machine.
@@ -218,17 +212,6 @@ pub struct ExecutionState {
     /// Maps (source_shard, block_height, wave_id) → local_height_when_fulfilled
     /// for age-based pruning using local time.
     fulfilled_exec_certs: HashMap<(ShardGroupId, u64, WaveId), u64>,
-
-    // ═══════════════════════════════════════════════════════════════════════
-    // Speculative Provision State
-    // ═══════════════════════════════════════════════════════════════════════
-    /// Block hashes with in-flight speculative provision prep.
-    speculative_provision_in_flight: HashSet<Hash>,
-    /// Cached speculative provision results, keyed by block_hash.
-    speculative_provision_results: HashMap<Hash, CachedProvisions>,
-    /// When commit arrives while speculation is in-flight, store full context
-    /// so we can emit SendProvisions or fall back to FetchAndBroadcastProvisions.
-    pending_provision_commits: HashMap<Hash, PendingProvisionCommit>,
 }
 
 impl Default for ExecutionState {
@@ -259,23 +242,6 @@ const EXEC_CERT_RETRY_INTERVAL_BLOCKS: u64 = 20;
 /// Per-shard recipient lists for provision broadcasting.
 type ShardRecipients = HashMap<ShardGroupId, Vec<ValidatorId>>;
 
-/// Cached provision batches from speculative preparation.
-struct CachedProvisions {
-    batches: Vec<(ShardGroupId, ProvisionBatch, Vec<ValidatorId>)>,
-    block_timestamp: u64,
-}
-
-/// Context stored when a block commits while speculative provisions are in-flight.
-/// Contains everything needed to fall back to `FetchAndBroadcastProvisions` if
-/// speculation returns empty.
-struct PendingProvisionCommit {
-    block_timestamp: u64,
-    requests: Vec<ProvisionRequest>,
-    source_shard: ShardGroupId,
-    block_height: BlockHeight,
-    shard_recipients: ShardRecipients,
-}
-
 impl ExecutionState {
     /// Create a new execution state machine.
     pub fn new() -> Self {
@@ -297,9 +263,6 @@ impl ExecutionState {
             deferred_tc_creations: HashSet::new(),
             expected_exec_certs: HashMap::new(),
             fulfilled_exec_certs: HashMap::new(),
-            speculative_provision_in_flight: HashSet::new(),
-            speculative_provision_results: HashMap::new(),
-            pending_provision_commits: HashMap::new(),
         }
     }
 
@@ -1304,52 +1267,16 @@ impl ExecutionState {
         let is_proposer = topology.local_validator_id() == proposer;
 
         if is_proposer {
-            if let Some(cached) = self.take_speculative_provisions(&block_hash) {
-                // Speculative provisions already built — send immediately
-                tracing::debug!(
-                    block_hash = ?block_hash,
-                    batch_count = cached.batches.len(),
-                    "Speculative provision cache HIT"
-                );
-                actions.push(Action::SendProvisions {
-                    batches: cached.batches,
-                    block_timestamp: cached.block_timestamp,
+            if let Some((requests, shard_recipients)) =
+                Self::build_provision_requests(topology, &transactions, local_shard)
+            {
+                actions.push(Action::FetchAndBroadcastProvisions {
+                    requests,
+                    source_shard: local_shard,
+                    block_height: BlockHeight(height),
+                    block_timestamp,
+                    shard_recipients,
                 });
-            } else if self.speculative_provision_in_flight.remove(&block_hash) {
-                // Speculation in-flight — store full fallback context so we can
-                // either send cached results or fall back to FetchAndBroadcastProvisions
-                // if speculation returns empty.
-                tracing::debug!(
-                    block_hash = ?block_hash,
-                    "Speculative provisions in-flight — deferring to completion"
-                );
-                if let Some((requests, shard_recipients)) =
-                    Self::build_provision_requests(topology, &transactions, local_shard)
-                {
-                    self.pending_provision_commits.insert(
-                        block_hash,
-                        PendingProvisionCommit {
-                            block_timestamp,
-                            requests,
-                            source_shard: local_shard,
-                            block_height: BlockHeight(height),
-                            shard_recipients,
-                        },
-                    );
-                }
-            } else {
-                // No speculation — fall back to existing path
-                if let Some((requests, shard_recipients)) =
-                    Self::build_provision_requests(topology, &transactions, local_shard)
-                {
-                    actions.push(Action::FetchAndBroadcastProvisions {
-                        requests,
-                        source_shard: local_shard,
-                        block_height: BlockHeight(height),
-                        block_timestamp,
-                        shard_recipients,
-                    });
-                }
             }
         }
 
@@ -1368,7 +1295,6 @@ impl ExecutionState {
         // pending provisioning, execution cache, early arrivals) is only cleaned
         // up on terminal state — never by block-count timeout.
         self.prune_execution_state();
-        self.prune_speculative_provisions();
 
         if transactions.is_empty() {
             return BlockCommittedOutput {
@@ -2051,139 +1977,6 @@ impl ExecutionState {
         Some((provision_requests, shard_recipients))
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // Speculative Provision Preparation
-    // ═══════════════════════════════════════════════════════════════════════
-
-    /// Trigger speculative provision preparation at proposal time.
-    ///
-    /// Called after `ProposalBuilt` when the block includes certificates.
-    /// Builds the provision request list and emits `SpeculativeProvisionPrep`
-    /// to run on the Provisions pool while BFT voting proceeds.
-    pub fn trigger_speculative_provisions(
-        &mut self,
-        topology: &TopologySnapshot,
-        block_hash: Hash,
-        height: u64,
-        block_timestamp: u64,
-        transactions: &[Arc<RoutableTransaction>],
-        merged_updates: Arc<DatabaseUpdates>,
-    ) -> Vec<Action> {
-        let local_shard = topology.local_shard();
-
-        let (provision_requests, shard_recipients) =
-            match Self::build_provision_requests(topology, transactions, local_shard) {
-                Some(result) => result,
-                None => return vec![],
-            };
-
-        // parent_height = height - 1 (the last committed block)
-        let parent_height = self.committed_height;
-
-        self.speculative_provision_in_flight.insert(block_hash);
-
-        tracing::debug!(
-            block_hash = ?block_hash,
-            height = height,
-            request_count = provision_requests.len(),
-            parent_height = parent_height,
-            "Triggering speculative provision preparation"
-        );
-
-        vec![Action::SpeculativeProvisionPrep {
-            block_hash,
-            requests: provision_requests,
-            source_shard: local_shard,
-            block_height: BlockHeight(height),
-            block_timestamp,
-            shard_recipients,
-            merged_updates,
-            parent_height,
-        }]
-    }
-
-    /// Handle speculative provision preparation completion.
-    ///
-    /// Caches the result. If the block has already committed while speculation
-    /// was in-flight, immediately emits `SendProvisions`.
-    pub fn on_speculative_provisions_complete(
-        &mut self,
-        block_hash: Hash,
-        batches: Vec<(ShardGroupId, ProvisionBatch, Vec<ValidatorId>)>,
-        block_timestamp: u64,
-    ) -> Vec<Action> {
-        self.speculative_provision_in_flight.remove(&block_hash);
-
-        // If batches are empty (e.g., SimStorage fallback), fall back to
-        // FetchAndBroadcastProvisions if a commit is pending.
-        if batches.is_empty() {
-            if let Some(pending) = self.pending_provision_commits.remove(&block_hash) {
-                tracing::debug!(
-                    block_hash = ?block_hash,
-                    "Speculative provision prep returned empty — falling back to FetchAndBroadcastProvisions"
-                );
-                return vec![Action::FetchAndBroadcastProvisions {
-                    requests: pending.requests,
-                    source_shard: pending.source_shard,
-                    block_height: pending.block_height,
-                    block_timestamp: pending.block_timestamp,
-                    shard_recipients: pending.shard_recipients,
-                }];
-            }
-            tracing::debug!(
-                block_hash = ?block_hash,
-                "Speculative provision prep returned empty — no pending commit"
-            );
-            return vec![];
-        }
-
-        // If commit already happened while we were preparing
-        if let Some(pending) = self.pending_provision_commits.remove(&block_hash) {
-            tracing::debug!(
-                block_hash = ?block_hash,
-                "Speculative provisions complete — commit was pending, sending now"
-            );
-            return vec![Action::SendProvisions {
-                batches,
-                block_timestamp: pending.block_timestamp,
-            }];
-        }
-
-        // Cache for later use at commit time
-        self.speculative_provision_results.insert(
-            block_hash,
-            CachedProvisions {
-                batches,
-                block_timestamp,
-            },
-        );
-
-        vec![]
-    }
-
-    /// Take cached speculative provisions for a block, if available.
-    fn take_speculative_provisions(&mut self, block_hash: &Hash) -> Option<CachedProvisions> {
-        self.speculative_provision_results.remove(block_hash)
-    }
-
-    /// Prune stale speculative provision state.
-    ///
-    /// Entries are normally consumed by `on_block_committed` (cache hit) or
-    /// `on_speculative_provisions_complete` (pending commit). This cleans up
-    /// orphans from proposals that never committed. Cap-based since we don't
-    /// track heights per hash — entries rarely accumulate beyond a handful.
-    fn prune_speculative_provisions(&mut self) {
-        if self.speculative_provision_results.len() > 10 {
-            self.speculative_provision_results.clear();
-        }
-        if self.speculative_provision_in_flight.len() > 5 {
-            self.speculative_provision_in_flight.clear();
-        }
-        if self.pending_provision_commits.len() > 5 {
-            self.pending_provision_commits.clear();
-        }
-    }
-
     /// Get execution memory statistics for monitoring collection sizes.
     pub fn memory_stats(&self) -> ExecutionMemoryStats {
         ExecutionMemoryStats {
@@ -2195,9 +1988,6 @@ impl ExecutionState {
             early_votes: self.early_votes.len(),
             certificate_trackers: self.certificate_trackers.len(),
             expected_exec_certs: self.expected_exec_certs.len(),
-            speculative_provision_in_flight: self.speculative_provision_in_flight.len(),
-            speculative_provision_results: self.speculative_provision_results.len(),
-            pending_provision_commits: self.pending_provision_commits.len(),
         }
     }
 

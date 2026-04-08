@@ -4,10 +4,10 @@ use crate::{ProtocolEvent, TimerId};
 use hyperscale_messages::{BlockHeaderNotification, BlockVoteNotification, TransactionGossip};
 use hyperscale_types::{
     AbortIntent, Block, BlockHeight, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature,
-    CommittedBlockHeader, DatabaseUpdates, EpochConfig, EpochId, ExecutionCertificate,
-    ExecutionVote, Hash, NodeId, ProvisionBatch, QuorumCertificate, RoutableTransaction,
-    ShardGroupId, SignerBitfield, StateProvision, TopologySnapshot, TransactionCertificate,
-    TxOutcome, ValidatorId, VotePower, WaveId,
+    CommittedBlockHeader, EpochConfig, EpochId, ExecutionCertificate, ExecutionVote, Hash, NodeId,
+    ProvisionBatch, QuorumCertificate, RoutableTransaction, ShardGroupId, SignerBitfield,
+    StateProvision, TopologySnapshot, TransactionCertificate, TxOutcome, ValidatorId, VotePower,
+    WaveId,
 };
 use std::collections::HashMap;
 use std::fmt;
@@ -195,33 +195,6 @@ pub enum Action {
         block_timestamp: u64,
         /// Per-shard recipients for provision broadcasts (excluding self).
         shard_recipients: HashMap<ShardGroupId, Vec<ValidatorId>>,
-    },
-
-    /// Speculatively prepare provisions before block commit.
-    ///
-    /// Emitted at proposal time (after `BuildProposal` completes). Runs on the
-    /// Provisions pool using `NodeCache` for tree reads and overlaying
-    /// `merged_updates` on parent-height substate reads. Results are cached
-    /// and used at commit time to skip `FetchAndBroadcastProvisions`.
-    SpeculativeProvisionPrep {
-        block_hash: Hash,
-        requests: Vec<ProvisionRequest>,
-        source_shard: ShardGroupId,
-        block_height: BlockHeight,
-        block_timestamp: u64,
-        shard_recipients: HashMap<ShardGroupId, Vec<ValidatorId>>,
-        /// Certificate writes to overlay on parent-height substate reads.
-        merged_updates: Arc<DatabaseUpdates>,
-        parent_height: u64,
-    },
-
-    /// Broadcast pre-built provision batches from speculative cache hit.
-    ///
-    /// Emitted by `on_block_committed` when speculative provisions are cached.
-    /// The io_loop handles this identically to `ProvisionsReady`.
-    SendProvisions {
-        batches: Vec<(ShardGroupId, ProvisionBatch, Vec<ValidatorId>)>,
-        block_timestamp: u64,
     },
 
     /// Broadcast a committed block header globally to all shards.
@@ -898,7 +871,6 @@ impl Action {
                 | Action::CancelProvisionFetch { .. }
                 | Action::RequestTxInclusionProofs { .. }
                 | Action::RequestMissingCommittedBlockHeader { .. }
-                | Action::SendProvisions { .. }
         )
     }
 
@@ -921,7 +893,6 @@ impl Action {
                 | Action::ExecuteTransactions { .. }
                 | Action::ExecuteCrossShardTransactions { .. }
                 | Action::FetchAndBroadcastProvisions { .. }
-                | Action::SpeculativeProvisionPrep { .. }
                 | Action::FetchBlock { .. }
                 | Action::FetchChainMetadata
         )
@@ -975,10 +946,6 @@ impl Action {
             Action::ExecuteTransactions { .. } => "ExecuteTransactions",
             Action::ExecuteCrossShardTransactions { .. } => "ExecuteCrossShardTransactions",
             Action::FetchAndBroadcastProvisions { .. } => "FetchAndBroadcastProvisions",
-            Action::SpeculativeProvisionPrep { .. } => "SpeculativeProvisionPrep",
-
-            // Non-delegated provisions
-            Action::SendProvisions { .. } => "SendProvisions",
 
             // External Notifications
             Action::EmitCommittedBlock { .. } => "EmitCommittedBlock",

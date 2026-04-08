@@ -70,7 +70,6 @@ pub(crate) fn dispatch_pool_for(action: &Action) -> Option<DispatchPool> {
         // Dedicated pool to avoid starving execution and crypto work.
         Action::VerifyProvisionBatch { .. } => Some(DispatchPool::Provisions),
         Action::FetchAndBroadcastProvisions { .. } => Some(DispatchPool::Provisions),
-        Action::SpeculativeProvisionPrep { .. } => Some(DispatchPool::Provisions),
 
         // Execution
         Action::ExecuteTransactions { .. } => Some(DispatchPool::Execution),
@@ -355,7 +354,6 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
                     round,
                     block: Arc::new(result.block),
                     block_hash: result.block_hash,
-                    merged_updates: result.merged_updates,
                 })],
                 prepared_commit: prepared,
             })
@@ -573,74 +571,6 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
                     batches,
                     block_timestamp,
                 }],
-                prepared_commit: None,
-            })
-        }
-
-        // --- Speculative provision preparation ---
-        Action::SpeculativeProvisionPrep {
-            block_hash,
-            requests,
-            source_shard,
-            block_height,
-            block_timestamp,
-            shard_recipients,
-            merged_updates,
-            parent_height,
-        } => {
-            // Phase 1: Fetch state entries using speculative overlay
-            let mut per_tx: Vec<(
-                Hash,
-                Vec<ShardGroupId>,
-                Arc<Vec<hyperscale_types::StateEntry>>,
-            )> = Vec::with_capacity(requests.len());
-
-            for req in &requests {
-                // Expand account NodeIds to include owned vaults.
-                let expanded_nodes =
-                    hyperscale_engine::sharding::expand_nodes_with_owned(ctx.storage, &req.nodes);
-                let entries = match hyperscale_engine::fetch_state_entries_speculative(
-                    ctx.storage,
-                    &expanded_nodes,
-                    parent_height,
-                    &merged_updates,
-                ) {
-                    Some(entries) => entries,
-                    None => {
-                        warn!(
-                            source_shard = source_shard.0,
-                            block_height = block_height.0,
-                            tx_hash = %req.tx_hash,
-                            parent_height = parent_height,
-                            "speculative fetch_state_entries returned None"
-                        );
-                        continue;
-                    }
-                };
-                per_tx.push((req.tx_hash, req.target_shards.clone(), Arc::new(entries)));
-            }
-
-            // Phase 2: Group by shard + generate proofs
-            // (generate_verkle_proofs at block_height works because NodeCache
-            // has the new tree nodes from BuildProposal)
-            tracing::debug!(
-                block_hash = %block_hash,
-                block_height = block_height.0,
-                per_tx_count = per_tx.len(),
-                node_cache_len = ctx.storage.node_cache_len(),
-                jvt_version = ctx.storage.jvt_version(),
-                "Speculative provision prep: generating proofs"
-            );
-            let batches =
-                build_provision_batches(ctx, per_tx, source_shard, block_height, &shard_recipients);
-            Some(DelegatedResult {
-                events: vec![NodeInput::Protocol(
-                    ProtocolEvent::SpeculativeProvisionsComplete {
-                        block_hash,
-                        batches,
-                        block_timestamp,
-                    },
-                )],
                 prepared_commit: None,
             })
         }

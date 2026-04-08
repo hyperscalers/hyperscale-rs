@@ -931,9 +931,6 @@ where
     // ─── Provision Broadcasting ────────────────────────────────────────
 
     /// Sign and broadcast provision batches to target shard committees.
-    ///
-    /// Used by both `ProvisionsReady` (from delegated action) and
-    /// `SendProvisions` (from speculative cache hit).
     pub(crate) fn broadcast_provisions(
         &self,
         batches: Vec<(
@@ -1053,9 +1050,6 @@ where
             exec_early_votes: exec_mem.early_votes,
             exec_certificate_trackers: exec_mem.certificate_trackers,
             exec_expected_exec_certs: exec_mem.expected_exec_certs,
-            exec_speculative_provision_in_flight: exec_mem.speculative_provision_in_flight,
-            exec_speculative_provision_results: exec_mem.speculative_provision_results,
-            exec_pending_provision_commits: exec_mem.pending_provision_commits,
             // Mempool
             mempool_pool: mempool_mem.pool,
             mempool_ready: mempool_mem.ready,
