@@ -12,7 +12,7 @@
 //! 2. **Coordination** - Cross-shard execution messages (StateProvision, ExecutionVote,
 //!    ExecutionCertificate). High priority, may be batched for efficiency.
 //!
-//! 3. **Finalization** - Transaction certificate gossip. Important for progress
+//! 3. **Finalization** - Wave certificate gossip. Important for progress
 //!    but not liveness-critical.
 //!
 //! 4. **Propagation** - Transaction gossip for mempool dissemination.

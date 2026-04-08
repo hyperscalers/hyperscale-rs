@@ -147,7 +147,7 @@ struct PoolEntry {
     submitted_locally: bool,
     /// Timestamp when the block containing this tx was committed.
     committed_at_time: Option<Duration>,
-    /// Timestamp when the transaction certificate was created (execution + votes complete).
+    /// Timestamp when the wave certificate was created (execution + votes complete).
     executed_at_time: Option<Duration>,
 }
 

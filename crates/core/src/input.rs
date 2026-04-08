@@ -154,7 +154,7 @@ pub enum NodeInput {
         certificates: Vec<Arc<WaveCertificate>>,
     },
 
-    /// A transaction certificate fetch request failed.
+    /// A wave certificate fetch request failed.
     FetchCertificatesFailed { block_hash: Hash },
 
     /// Committed block header successfully fetched from a source shard.

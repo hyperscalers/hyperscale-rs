@@ -4,7 +4,7 @@ use crate::response::GetCertificatesResponse;
 use hyperscale_types::{Hash, MessagePriority, NetworkMessage, Request};
 use sbor::prelude::BasicSbor;
 
-/// Request to fetch transaction certificates by hash for a pending block.
+/// Request to fetch wave certificates by hash for a pending block.
 ///
 /// Used when a validator receives a block header but is missing some
 /// certificates that weren't in their cache or didn't arrive via gossip.

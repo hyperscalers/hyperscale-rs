@@ -25,7 +25,7 @@ pub(crate) const BLOCKS_CF: &str = "blocks";
 /// Column family name for transactions keyed by hash.
 pub(crate) const TRANSACTIONS_CF: &str = "transactions";
 
-/// Column family name for transaction certificates keyed by hash.
+/// Column family name for wave certificates keyed by hash.
 pub(crate) const CERTIFICATES_CF: &str = "certificates";
 
 /// Column family name for BFT votes keyed by height.

@@ -1,4 +1,4 @@
-//! Transaction certificate fetch protocol state machine.
+//! Wave certificate fetch protocol state machine.
 //!
 //! Pure synchronous state machine for fetching missing `WaveCertificate`s
 //! needed by pending blocks.  Sits between the `BftState`'s `FetchCertificates`
@@ -10,7 +10,7 @@
 //! # Usage
 //!
 //! ```text
-//! Runner ──► TxCertFetchProtocol::handle(Input) ──► Vec<Output>
+//! Runner ──► WaveCertFetchProtocol::handle(Input) ──► Vec<Output>
 //! ```
 
 use hyperscale_metrics as metrics;
@@ -24,9 +24,9 @@ use tracing::{debug, trace, warn};
 // Configuration
 // ═══════════════════════════════════════════════════════════════════════
 
-/// Configuration for the transaction certificate fetch protocol.
+/// Configuration for the wave certificate fetch protocol.
 #[derive(Debug, Clone)]
-pub struct TxCertFetchConfig {
+pub struct WaveCertFetchConfig {
     /// Maximum number of concurrent fetch operations.
     pub max_concurrent: usize,
     /// Maximum full rounds through all peers before giving up.
@@ -35,7 +35,7 @@ pub struct TxCertFetchConfig {
     pub max_hashes_per_request: usize,
 }
 
-impl Default for TxCertFetchConfig {
+impl Default for WaveCertFetchConfig {
     fn default() -> Self {
         Self {
             max_concurrent: 4,
@@ -49,9 +49,9 @@ impl Default for TxCertFetchConfig {
 // Input / Output
 // ═══════════════════════════════════════════════════════════════════════
 
-/// Inputs to the transaction certificate fetch protocol state machine.
+/// Inputs to the wave certificate fetch protocol state machine.
 #[derive(Debug)]
-pub enum TxCertFetchInput {
+pub enum WaveCertFetchInput {
     /// A new fetch request from the BFT state machine.
     Request {
         block_hash: Hash,
@@ -73,10 +73,10 @@ pub enum TxCertFetchInput {
     Tick,
 }
 
-/// Outputs from the transaction certificate fetch protocol state machine.
+/// Outputs from the wave certificate fetch protocol state machine.
 #[derive(Debug)]
 #[allow(dead_code)]
-pub enum TxCertFetchOutput {
+pub enum WaveCertFetchOutput {
     /// Request the runner to fetch certificates from a specific peer.
     Fetch {
         block_hash: Hash,
@@ -97,7 +97,7 @@ pub enum TxCertFetchOutput {
 
 /// State for a single pending certificate fetch.
 #[derive(Debug)]
-struct PendingTxCertFetch {
+struct PendingWaveCertFetch {
     proposer: ValidatorId,
     cert_hashes: Vec<Hash>,
     peers: Vec<ValidatorId>,
@@ -110,16 +110,16 @@ struct PendingTxCertFetch {
 // Protocol state machine
 // ═══════════════════════════════════════════════════════════════════════
 
-/// Transaction certificate fetch protocol state machine.
-pub struct TxCertFetchProtocol {
-    config: TxCertFetchConfig,
+/// Wave certificate fetch protocol state machine.
+pub struct WaveCertFetchProtocol {
+    config: WaveCertFetchConfig,
     /// Pending fetches keyed by block_hash.
-    pending: BTreeMap<Hash, PendingTxCertFetch>,
+    pending: BTreeMap<Hash, PendingWaveCertFetch>,
 }
 
-impl TxCertFetchProtocol {
-    /// Create a new transaction certificate fetch protocol state machine.
-    pub fn new(config: TxCertFetchConfig) -> Self {
+impl WaveCertFetchProtocol {
+    /// Create a new wave certificate fetch protocol state machine.
+    pub fn new(config: WaveCertFetchConfig) -> Self {
         Self {
             config,
             pending: BTreeMap::new(),
@@ -127,21 +127,21 @@ impl TxCertFetchProtocol {
     }
 
     /// Process an input and return outputs.
-    pub fn handle(&mut self, input: TxCertFetchInput) -> Vec<TxCertFetchOutput> {
+    pub fn handle(&mut self, input: WaveCertFetchInput) -> Vec<WaveCertFetchOutput> {
         match input {
-            TxCertFetchInput::Request {
+            WaveCertFetchInput::Request {
                 block_hash,
                 proposer,
                 cert_hashes,
                 peers,
             } => self.handle_request(block_hash, proposer, cert_hashes, peers),
-            TxCertFetchInput::Received {
+            WaveCertFetchInput::Received {
                 block_hash,
                 certificates,
             } => self.handle_received(block_hash, certificates),
-            TxCertFetchInput::Failed { block_hash } => self.handle_failed(block_hash),
-            TxCertFetchInput::Cancel { block_hash } => self.handle_cancel(block_hash),
-            TxCertFetchInput::Tick => self.spawn_pending_fetches(),
+            WaveCertFetchInput::Failed { block_hash } => self.handle_failed(block_hash),
+            WaveCertFetchInput::Cancel { block_hash } => self.handle_cancel(block_hash),
+            WaveCertFetchInput::Tick => self.spawn_pending_fetches(),
         }
     }
 
@@ -166,14 +166,17 @@ impl TxCertFetchProtocol {
         proposer: ValidatorId,
         cert_hashes: Vec<Hash>,
         peers: Vec<ValidatorId>,
-    ) -> Vec<TxCertFetchOutput> {
+    ) -> Vec<WaveCertFetchOutput> {
         if let Some(existing) = self.pending.get_mut(&block_hash) {
             // Duplicate request: refresh cert_hashes, peers, reset rounds.
             existing.cert_hashes = cert_hashes;
             existing.peers = peers;
             existing.proposer = proposer;
             existing.rounds = 0;
-            trace!(?block_hash, "Refreshed peer list for pending tx cert fetch");
+            trace!(
+                ?block_hash,
+                "Refreshed peer list for pending wave cert fetch"
+            );
             return vec![];
         }
 
@@ -181,13 +184,13 @@ impl TxCertFetchProtocol {
             ?block_hash,
             cert_count = cert_hashes.len(),
             peer_count = peers.len(),
-            "Starting tx cert fetch"
+            "Starting wave cert fetch"
         );
-        metrics::record_fetch_started("tx_cert");
+        metrics::record_fetch_started("wave_cert");
 
         self.pending.insert(
             block_hash,
-            PendingTxCertFetch {
+            PendingWaveCertFetch {
                 proposer,
                 cert_hashes,
                 peers,
@@ -203,47 +206,47 @@ impl TxCertFetchProtocol {
         &mut self,
         block_hash: Hash,
         certificates: Vec<Arc<WaveCertificate>>,
-    ) -> Vec<TxCertFetchOutput> {
+    ) -> Vec<WaveCertFetchOutput> {
         if self.pending.remove(&block_hash).is_some() {
             debug!(
                 ?block_hash,
                 count = certificates.len(),
-                "Tx cert fetch complete"
+                "Wave cert fetch complete"
             );
-            metrics::record_fetch_completed("tx_cert");
-            vec![TxCertFetchOutput::Deliver {
+            metrics::record_fetch_completed("wave_cert");
+            vec![WaveCertFetchOutput::Deliver {
                 block_hash,
                 certificates,
             }]
         } else {
-            trace!(?block_hash, "Tx certs received for unknown fetch");
+            trace!(?block_hash, "Wave certs received for unknown fetch");
             vec![]
         }
     }
 
-    fn handle_failed(&mut self, block_hash: Hash) -> Vec<TxCertFetchOutput> {
+    fn handle_failed(&mut self, block_hash: Hash) -> Vec<WaveCertFetchOutput> {
         if let Some(state) = self.pending.get_mut(&block_hash) {
             state.in_flight = false;
-            metrics::record_fetch_failed("tx_cert");
+            metrics::record_fetch_failed("wave_cert");
             warn!(
                 ?block_hash,
                 tried = state.tried.len(),
                 remaining = state.peers.len().saturating_sub(state.tried.len()),
-                "Tx cert fetch failed, will try next peer"
+                "Wave cert fetch failed, will try next peer"
             );
         }
         vec![]
     }
 
-    fn handle_cancel(&mut self, block_hash: Hash) -> Vec<TxCertFetchOutput> {
+    fn handle_cancel(&mut self, block_hash: Hash) -> Vec<WaveCertFetchOutput> {
         if self.pending.remove(&block_hash).is_some() {
-            debug!(?block_hash, "Tx cert fetch cancelled");
+            debug!(?block_hash, "Wave cert fetch cancelled");
         }
         vec![]
     }
 
     /// Spawn pending fetch operations (called on Tick).
-    fn spawn_pending_fetches(&mut self) -> Vec<TxCertFetchOutput> {
+    fn spawn_pending_fetches(&mut self) -> Vec<WaveCertFetchOutput> {
         let mut outputs = Vec::new();
         let mut to_remove = Vec::new();
 
@@ -289,9 +292,9 @@ impl TxCertFetchProtocol {
                         ?block_hash,
                         peer = peer.0,
                         cert_count = hashes.len(),
-                        "Fetching tx certs from peer"
+                        "Fetching wave certs from peer"
                     );
-                    outputs.push(TxCertFetchOutput::Fetch {
+                    outputs.push(WaveCertFetchOutput::Fetch {
                         block_hash,
                         proposer: state.proposer,
                         cert_hashes: hashes,
@@ -304,14 +307,14 @@ impl TxCertFetchProtocol {
                         warn!(
                             ?block_hash,
                             rounds = state.rounds,
-                            "Tx cert fetch exhausted all rounds, dropping"
+                            "Wave cert fetch exhausted all rounds, dropping"
                         );
                         to_remove.push(block_hash);
                     } else {
                         warn!(
                             ?block_hash,
                             round = state.rounds,
-                            "Tx cert fetch starting new round"
+                            "Wave cert fetch starting new round"
                         );
                         state.tried.clear();
                     }
@@ -367,8 +370,8 @@ pub fn serve_certificate_request<S: hyperscale_storage::ConsensusStore>(
 mod tests {
     use super::*;
 
-    fn default_config() -> TxCertFetchConfig {
-        TxCertFetchConfig::default()
+    fn default_config() -> WaveCertFetchConfig {
+        WaveCertFetchConfig::default()
     }
 
     fn vid(id: u64) -> ValidatorId {
@@ -381,7 +384,7 @@ mod tests {
 
     #[test]
     fn test_config_defaults() {
-        let config = TxCertFetchConfig::default();
+        let config = WaveCertFetchConfig::default();
         assert_eq!(config.max_concurrent, 4);
         assert_eq!(config.max_rounds, 3);
         assert_eq!(config.max_hashes_per_request, 1024 * 8);
@@ -389,9 +392,9 @@ mod tests {
 
     #[test]
     fn test_request_and_tick() {
-        let mut protocol = TxCertFetchProtocol::new(default_config());
+        let mut protocol = WaveCertFetchProtocol::new(default_config());
 
-        let outputs = protocol.handle(TxCertFetchInput::Request {
+        let outputs = protocol.handle(WaveCertFetchInput::Request {
             block_hash: hash(b"block1"),
             proposer: vid(1),
             cert_hashes: vec![hash(b"cert1"), hash(b"cert2")],
@@ -401,10 +404,10 @@ mod tests {
         assert!(protocol.has_pending());
 
         // Tick should emit a Fetch with the proposer (preferred peer).
-        let outputs = protocol.handle(TxCertFetchInput::Tick);
+        let outputs = protocol.handle(WaveCertFetchInput::Tick);
         assert_eq!(outputs.len(), 1);
         match &outputs[0] {
-            TxCertFetchOutput::Fetch {
+            WaveCertFetchOutput::Fetch {
                 block_hash,
                 proposer,
                 cert_hashes,
@@ -421,9 +424,9 @@ mod tests {
 
     #[test]
     fn test_peer_rotation_on_failure() {
-        let mut protocol = TxCertFetchProtocol::new(default_config());
+        let mut protocol = WaveCertFetchProtocol::new(default_config());
 
-        protocol.handle(TxCertFetchInput::Request {
+        protocol.handle(WaveCertFetchInput::Request {
             block_hash: hash(b"block1"),
             proposer: vid(1),
             cert_hashes: vec![hash(b"cert1")],
@@ -431,49 +434,49 @@ mod tests {
         });
 
         // Tick 1: proposer vid(1).
-        let outputs = protocol.handle(TxCertFetchInput::Tick);
+        let outputs = protocol.handle(WaveCertFetchInput::Tick);
         assert_eq!(outputs.len(), 1);
         assert!(matches!(
             &outputs[0],
-            TxCertFetchOutput::Fetch { peer, .. } if *peer == vid(1)
+            WaveCertFetchOutput::Fetch { peer, .. } if *peer == vid(1)
         ));
 
         // Fail → frees in_flight.
-        protocol.handle(TxCertFetchInput::Failed {
+        protocol.handle(WaveCertFetchInput::Failed {
             block_hash: hash(b"block1"),
         });
 
         // Tick 2: next untried peer (vid(2)).
-        let outputs = protocol.handle(TxCertFetchInput::Tick);
+        let outputs = protocol.handle(WaveCertFetchInput::Tick);
         assert_eq!(outputs.len(), 1);
         assert!(matches!(
             &outputs[0],
-            TxCertFetchOutput::Fetch { peer, .. } if *peer == vid(2)
+            WaveCertFetchOutput::Fetch { peer, .. } if *peer == vid(2)
         ));
 
         // Fail again.
-        protocol.handle(TxCertFetchInput::Failed {
+        protocol.handle(WaveCertFetchInput::Failed {
             block_hash: hash(b"block1"),
         });
 
         // Tick 3: last peer (vid(3)).
-        let outputs = protocol.handle(TxCertFetchInput::Tick);
+        let outputs = protocol.handle(WaveCertFetchInput::Tick);
         assert_eq!(outputs.len(), 1);
         assert!(matches!(
             &outputs[0],
-            TxCertFetchOutput::Fetch { peer, .. } if *peer == vid(3)
+            WaveCertFetchOutput::Fetch { peer, .. } if *peer == vid(3)
         ));
     }
 
     #[test]
     fn test_all_peers_exhausted_after_max_rounds() {
-        let config = TxCertFetchConfig {
+        let config = WaveCertFetchConfig {
             max_rounds: 2,
             ..default_config()
         };
-        let mut protocol = TxCertFetchProtocol::new(config);
+        let mut protocol = WaveCertFetchProtocol::new(config);
 
-        protocol.handle(TxCertFetchInput::Request {
+        protocol.handle(WaveCertFetchInput::Request {
             block_hash: hash(b"block1"),
             proposer: vid(1),
             cert_hashes: vec![hash(b"cert1")],
@@ -481,16 +484,16 @@ mod tests {
         });
 
         // --- Round 0 ---
-        protocol.handle(TxCertFetchInput::Tick);
-        protocol.handle(TxCertFetchInput::Failed {
+        protocol.handle(WaveCertFetchInput::Tick);
+        protocol.handle(WaveCertFetchInput::Failed {
             block_hash: hash(b"block1"),
         });
-        protocol.handle(TxCertFetchInput::Tick);
-        protocol.handle(TxCertFetchInput::Failed {
+        protocol.handle(WaveCertFetchInput::Tick);
+        protocol.handle(WaveCertFetchInput::Failed {
             block_hash: hash(b"block1"),
         });
         // All peers exhausted → round 0→1, tried reset.
-        let outputs = protocol.handle(TxCertFetchInput::Tick);
+        let outputs = protocol.handle(WaveCertFetchInput::Tick);
         assert!(outputs.is_empty());
         assert!(
             protocol.has_pending(),
@@ -498,17 +501,17 @@ mod tests {
         );
 
         // --- Round 1 ---
-        let outputs = protocol.handle(TxCertFetchInput::Tick);
+        let outputs = protocol.handle(WaveCertFetchInput::Tick);
         assert_eq!(outputs.len(), 1, "Should retry vid(1) in round 1");
-        protocol.handle(TxCertFetchInput::Failed {
+        protocol.handle(WaveCertFetchInput::Failed {
             block_hash: hash(b"block1"),
         });
-        protocol.handle(TxCertFetchInput::Tick);
-        protocol.handle(TxCertFetchInput::Failed {
+        protocol.handle(WaveCertFetchInput::Tick);
+        protocol.handle(WaveCertFetchInput::Failed {
             block_hash: hash(b"block1"),
         });
         // All peers exhausted → round 1→2, but max_rounds=2 → drop.
-        let outputs = protocol.handle(TxCertFetchInput::Tick);
+        let outputs = protocol.handle(WaveCertFetchInput::Tick);
         assert!(outputs.is_empty());
         assert!(
             !protocol.has_pending(),
@@ -518,9 +521,9 @@ mod tests {
 
     #[test]
     fn test_successful_receive() {
-        let mut protocol = TxCertFetchProtocol::new(default_config());
+        let mut protocol = WaveCertFetchProtocol::new(default_config());
 
-        protocol.handle(TxCertFetchInput::Request {
+        protocol.handle(WaveCertFetchInput::Request {
             block_hash: hash(b"block1"),
             proposer: vid(1),
             cert_hashes: vec![hash(b"cert1")],
@@ -528,10 +531,10 @@ mod tests {
         });
 
         // Tick → fetch from proposer.
-        protocol.handle(TxCertFetchInput::Tick);
+        protocol.handle(WaveCertFetchInput::Tick);
 
         // Receive certificates.
-        let outputs = protocol.handle(TxCertFetchInput::Received {
+        let outputs = protocol.handle(WaveCertFetchInput::Received {
             block_hash: hash(b"block1"),
             certificates: vec![],
         });
@@ -539,16 +542,16 @@ mod tests {
         assert_eq!(outputs.len(), 1);
         assert!(matches!(
             &outputs[0],
-            TxCertFetchOutput::Deliver { certificates, .. } if certificates.is_empty()
+            WaveCertFetchOutput::Deliver { certificates, .. } if certificates.is_empty()
         ));
         assert!(!protocol.has_pending());
     }
 
     #[test]
     fn test_cancel_removes_pending() {
-        let mut protocol = TxCertFetchProtocol::new(default_config());
+        let mut protocol = WaveCertFetchProtocol::new(default_config());
 
-        protocol.handle(TxCertFetchInput::Request {
+        protocol.handle(WaveCertFetchInput::Request {
             block_hash: hash(b"block1"),
             proposer: vid(1),
             cert_hashes: vec![hash(b"cert1")],
@@ -556,7 +559,7 @@ mod tests {
         });
         assert!(protocol.has_pending());
 
-        protocol.handle(TxCertFetchInput::Cancel {
+        protocol.handle(WaveCertFetchInput::Cancel {
             block_hash: hash(b"block1"),
         });
         assert!(!protocol.has_pending());
@@ -564,14 +567,14 @@ mod tests {
 
     #[test]
     fn test_max_concurrent_respected() {
-        let config = TxCertFetchConfig {
+        let config = WaveCertFetchConfig {
             max_concurrent: 2,
             ..default_config()
         };
-        let mut protocol = TxCertFetchProtocol::new(config);
+        let mut protocol = WaveCertFetchProtocol::new(config);
 
         for i in 0..3u8 {
-            protocol.handle(TxCertFetchInput::Request {
+            protocol.handle(WaveCertFetchInput::Request {
                 block_hash: hash(&[i]),
                 proposer: vid(1),
                 cert_hashes: vec![hash(b"cert1")],
@@ -579,34 +582,34 @@ mod tests {
             });
         }
 
-        let outputs = protocol.handle(TxCertFetchInput::Tick);
+        let outputs = protocol.handle(WaveCertFetchInput::Tick);
         assert_eq!(outputs.len(), 2);
     }
 
     #[test]
     fn test_in_flight_not_double_dispatched() {
-        let mut protocol = TxCertFetchProtocol::new(default_config());
+        let mut protocol = WaveCertFetchProtocol::new(default_config());
 
-        protocol.handle(TxCertFetchInput::Request {
+        protocol.handle(WaveCertFetchInput::Request {
             block_hash: hash(b"block1"),
             proposer: vid(1),
             cert_hashes: vec![hash(b"cert1")],
             peers: vec![vid(1), vid(2)],
         });
 
-        let outputs = protocol.handle(TxCertFetchInput::Tick);
+        let outputs = protocol.handle(WaveCertFetchInput::Tick);
         assert_eq!(outputs.len(), 1);
 
         // Second tick while still in-flight: no new dispatch.
-        let outputs = protocol.handle(TxCertFetchInput::Tick);
+        let outputs = protocol.handle(WaveCertFetchInput::Tick);
         assert!(outputs.is_empty());
     }
 
     #[test]
     fn test_receive_for_unknown_fetch_ignored() {
-        let mut protocol = TxCertFetchProtocol::new(default_config());
+        let mut protocol = WaveCertFetchProtocol::new(default_config());
 
-        let outputs = protocol.handle(TxCertFetchInput::Received {
+        let outputs = protocol.handle(WaveCertFetchInput::Received {
             block_hash: hash(b"unknown"),
             certificates: vec![],
         });

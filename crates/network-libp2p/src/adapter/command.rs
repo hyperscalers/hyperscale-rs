@@ -66,7 +66,7 @@ pub(super) struct PriorityCommandChannels {
     /// High priority, may be batched.
     coordination: mpsc::UnboundedSender<SwarmCommand>,
 
-    /// Finalization priority - Transaction certificate gossip.
+    /// Finalization priority - Wave certificate gossip.
     /// Important but not liveness-critical.
     finalization: mpsc::UnboundedSender<SwarmCommand>,
 

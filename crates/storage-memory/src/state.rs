@@ -119,7 +119,7 @@ pub(crate) struct ConsensusState {
     pub committed_qc: Option<QuorumCertificate>,
     /// Transactions indexed by hash.
     pub transactions: HashMap<Hash, RoutableTransaction>,
-    /// Transaction certificates indexed by transaction hash.
+    /// Wave certificates indexed by identity hash.
     pub certificates: HashMap<Hash, WaveCertificate>,
     /// Our own votes indexed by height.
     /// **BFT Safety Critical**: Used to prevent equivocation after restart.

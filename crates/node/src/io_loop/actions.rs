@@ -880,7 +880,7 @@ where
                 proposer,
                 cert_hashes,
             } => {
-                use crate::protocol::transaction_cert_fetch::TxCertFetchInput;
+                use crate::protocol::wave_cert_fetch::WaveCertFetchInput;
                 debug!(
                     ?block_hash,
                     proposer = proposer.0,
@@ -889,16 +889,18 @@ where
                 );
                 let peers = self.cached_local_peers.clone();
                 let outputs = self
-                    .tx_cert_fetch_protocol
-                    .handle(TxCertFetchInput::Request {
+                    .wave_cert_fetch_protocol
+                    .handle(WaveCertFetchInput::Request {
                         block_hash,
                         proposer,
                         cert_hashes,
                         peers,
                     });
-                self.process_tx_cert_fetch_outputs(outputs);
-                let tick_outputs = self.tx_cert_fetch_protocol.handle(TxCertFetchInput::Tick);
-                self.process_tx_cert_fetch_outputs(tick_outputs);
+                self.process_wave_cert_fetch_outputs(outputs);
+                let tick_outputs = self
+                    .wave_cert_fetch_protocol
+                    .handle(WaveCertFetchInput::Tick);
+                self.process_wave_cert_fetch_outputs(tick_outputs);
                 self.update_fetch_tick_timer();
             }
             Action::CancelFetch { block_hash } => {

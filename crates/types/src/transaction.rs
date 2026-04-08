@@ -406,7 +406,7 @@ impl std::str::FromStr for AbortReason {
 ///
 /// Abort intents are proposals to the execution voting process. They feed into
 /// the execution accumulator but do not directly change mempool state. The
-/// actual abort takes effect only when a Transaction Certificate confirms it.
+/// actual abort takes effect only when a Wave Certificate confirms it.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct AbortIntent {
     /// Hash of the transaction to abort.

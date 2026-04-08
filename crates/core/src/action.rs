@@ -23,7 +23,7 @@ pub struct FinalizationPhaseTimes {
     pub added_at: Duration,
     /// When the block containing the transaction was committed.
     pub committed_at: Option<Duration>,
-    /// When the transaction certificate was created (execution + vote collection complete).
+    /// When the wave certificate was created (execution + vote collection complete).
     pub executed_at: Option<Duration>,
     /// When the transaction reached terminal state (TC committed in block).
     pub completed_at: Duration,
@@ -517,7 +517,7 @@ pub enum Action {
     /// - Pending: Transaction accepted into mempool
     /// - Committed: Transaction included in a committed block
     /// - Executed: Transaction execution complete (accept/reject decision made)
-    /// - Completed: Transaction certificate committed, can be evicted
+    /// - Completed: Wave certificate committed, can be evicted
     /// - Deferred: Transaction deferred due to cross-shard livelock
     /// - Retried: Transaction superseded by retry transaction
     ///
@@ -757,7 +757,7 @@ pub enum Action {
         tx_hashes: Vec<Hash>,
     },
 
-    /// Request the runner to fetch missing transaction certificates for a pending block.
+    /// Request the runner to fetch missing wave certificates for a pending block.
     ///
     /// Emitted when a block header arrives but certificates are missing from
     /// the local cache. The runner fetches from the proposer or peers and delivers

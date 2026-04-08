@@ -183,10 +183,10 @@ where
                 response
             });
 
-        // ── certificate.request → tx cert fetch serving ─────────────
+        // ── certificate.request → wave cert fetch serving ────────────
 
         {
-            use crate::protocol::transaction_cert_fetch::serve_certificate_request;
+            use crate::protocol::wave_cert_fetch::serve_certificate_request;
             use hyperscale_messages::request::GetCertificatesRequest;
 
             let storage = Arc::clone(&self.storage);

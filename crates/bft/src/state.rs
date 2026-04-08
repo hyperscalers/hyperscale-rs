@@ -3015,7 +3015,7 @@ impl BftState {
     /// in-flight.
     ///
     /// Returns (total_tx_count, total_cert_count) across all pending blocks.
-    pub fn pending_block_tx_cert_counts(&self) -> (usize, usize) {
+    pub fn pending_block_counts(&self) -> (usize, usize) {
         let mut total_txs = 0;
         let mut total_certs = 0;
 
@@ -4106,7 +4106,7 @@ impl BftState {
         actions
     }
 
-    /// Handle fetched transaction certificates being delivered.
+    /// Handle fetched wave certificates being delivered.
     ///
     /// Called when the certificate fetch protocol delivers certificates for a
     /// pending block. Adds certificates to the pending block, and if the block

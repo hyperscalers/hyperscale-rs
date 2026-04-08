@@ -272,7 +272,7 @@ impl NodeStateMachine {
         //
         // Account for pipelining: multiple blocks can be proposed before any commit.
         // We must count txs/certs in ALL pending blocks to avoid exceeding in-flight limits.
-        let (pending_txs, pending_certs) = self.bft.pending_block_tx_cert_counts();
+        let (pending_txs, pending_certs) = self.bft.pending_block_counts();
 
         let inputs = self.gather_proposal_inputs(pending_txs, pending_certs);
 

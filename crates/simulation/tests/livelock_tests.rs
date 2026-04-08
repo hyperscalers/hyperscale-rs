@@ -1,10 +1,10 @@
 //! Abort safety integration tests.
 //!
 //! These tests verify that cross-shard transactions reach terminal state
-//! exclusively through Transaction Certificates (TCs), including:
-//! - Livelock cycle detection → abort intent → TC(Aborted)
-//! - Normal cross-shard execution → TC(Accept)
-//! - Execution timeout → abort intent → TC(Aborted)
+//! exclusively through Wave Certificates (WCs), including:
+//! - Livelock cycle detection → abort intent → WC(Aborted)
+//! - Normal cross-shard execution → WC(Accept)
+//! - Execution timeout → abort intent → WC(Aborted)
 
 use hyperscale_core::{NodeInput, TransactionStatus};
 use hyperscale_simulation::{NetworkConfig, SimulationRunner};

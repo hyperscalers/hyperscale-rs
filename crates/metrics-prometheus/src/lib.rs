@@ -383,7 +383,7 @@ impl Metrics {
 
             storage_certificates_persisted: register_counter!(
                 "hyperscale_storage_certificates_persisted_total",
-                "Total number of transaction certificates persisted"
+                "Total number of wave certificates persisted"
             )
             .unwrap(),
 
