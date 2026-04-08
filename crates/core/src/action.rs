@@ -601,7 +601,6 @@ pub enum Action {
     /// The io_loop inserts the certificate into `cert_cache` keyed by
     /// `wave_id.hash()`, which matches the `cert_hashes` entries in
     /// `BlockManifest`. Peers fetch wave certificates via
-    /// `GetCertificatesRequest` before they can vote on the block.
     CacheWaveCertificate { certificate: Arc<WaveCertificate> },
 
     /// Persist receipt bundles to disk. Fire-and-forget — no ProtocolEvent response.
@@ -762,20 +761,6 @@ pub enum Action {
         proposer: ValidatorId,
         /// Hashes of the missing transactions.
         tx_hashes: Vec<Hash>,
-    },
-
-    /// Request the runner to fetch missing wave certificates for a pending block.
-    ///
-    /// Emitted when a block header arrives but certificates are missing from
-    /// the local cache. The runner fetches from the proposer or peers and delivers
-    /// results via `ProtocolEvent::CertificateFetchDelivered`.
-    FetchCertificates {
-        /// Hash of the block that needs these certificates.
-        block_hash: Hash,
-        /// The proposer of the block (preferred fetch target).
-        proposer: ValidatorId,
-        /// Hashes of the missing certificates.
-        cert_hashes: Vec<Hash>,
     },
 
     /// Cancel any pending fetch operations for a block.
@@ -984,7 +969,6 @@ impl Action {
             // Runner I/O Requests
             Action::StartSync { .. } => "StartSync",
             Action::FetchTransactions { .. } => "FetchTransactions",
-            Action::FetchCertificates { .. } => "FetchCertificates",
             Action::CancelFetch { .. } => "CancelFetch",
             Action::RequestMissingProvisions { .. } => "RequestMissingProvisions",
             Action::RequestMissingExecutionCert { .. } => "RequestMissingExecutionCert",

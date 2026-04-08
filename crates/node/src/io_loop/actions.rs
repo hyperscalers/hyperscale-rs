@@ -254,7 +254,6 @@ where
             // ═══════════════════════════════════════════════════════════
             Action::StartSync { .. }
             | Action::FetchTransactions { .. }
-            | Action::FetchCertificates { .. }
             | Action::CancelFetch { .. }
             | Action::RequestMissingProvisions { .. }
             | Action::RequestMissingExecutionCert { .. }
@@ -876,34 +875,6 @@ where
                     .transaction_fetch_protocol
                     .handle(TransactionFetchInput::Tick);
                 self.process_transaction_fetch_outputs(outputs);
-                self.update_fetch_tick_timer();
-            }
-            Action::FetchCertificates {
-                block_hash,
-                proposer,
-                cert_hashes,
-            } => {
-                use crate::protocol::wave_cert_fetch::WaveCertFetchInput;
-                debug!(
-                    ?block_hash,
-                    proposer = proposer.0,
-                    cert_count = cert_hashes.len(),
-                    "Requesting missing certificates for pending block"
-                );
-                let peers = self.cached_local_peers.clone();
-                let outputs = self
-                    .wave_cert_fetch_protocol
-                    .handle(WaveCertFetchInput::Request {
-                        block_hash,
-                        proposer,
-                        cert_hashes,
-                        peers,
-                    });
-                self.process_wave_cert_fetch_outputs(outputs);
-                let tick_outputs = self
-                    .wave_cert_fetch_protocol
-                    .handle(WaveCertFetchInput::Tick);
-                self.process_wave_cert_fetch_outputs(tick_outputs);
                 self.update_fetch_tick_timer();
             }
             Action::CancelFetch { block_hash } => {

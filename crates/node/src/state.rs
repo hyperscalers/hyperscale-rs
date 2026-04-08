@@ -770,26 +770,6 @@ impl StateMachine for NodeStateMachine {
                 block_hash,
                 transactions,
             ),
-            ProtocolEvent::CertificateFetchDelivered {
-                block_hash,
-                certificates,
-            } => {
-                // Convert fetched wave certs to FinalizedWaves from local execution state.
-                // If we haven't finalized a wave locally, we can't use the fetched cert
-                // (we need the receipts too). This path will be removed entirely soon.
-                let finalized_waves: Vec<Arc<FinalizedWave>> = certificates
-                    .iter()
-                    .filter_map(|wc| {
-                        self.execution
-                            .get_finalized_wave_by_hash(&wc.wave_id.hash())
-                    })
-                    .collect();
-                self.bft.on_certificate_fetch_received(
-                    self.topology.snapshot(),
-                    block_hash,
-                    finalized_waves,
-                )
-            }
             // ── Storage / Sync ───────────────────────────────────────────
             ProtocolEvent::BlockFetched { .. } => vec![],
             ProtocolEvent::SyncBlockReadyToApply { block, qc } => self

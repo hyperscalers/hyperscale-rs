@@ -240,12 +240,6 @@ pub enum ProtocolEvent {
         transactions: Vec<Arc<RoutableTransaction>>,
     },
 
-    /// Fetched wave certificates delivered to state machine.
-    CertificateFetchDelivered {
-        block_hash: Hash,
-        certificates: Vec<Arc<WaveCertificate>>,
-    },
-
     // ═══════════════════════════════════════════════════════════════════════
     // Storage Callbacks
     // ═══════════════════════════════════════════════════════════════════════
@@ -402,8 +396,6 @@ impl ProtocolEvent {
 
             // Fetch Delivery
             ProtocolEvent::TransactionFetchDelivered { .. } => "TransactionFetchDelivered",
-            ProtocolEvent::CertificateFetchDelivered { .. } => "CertificateFetchDelivered",
-
             // Storage Callbacks
             ProtocolEvent::BlockFetched { .. } => "BlockFetched",
             ProtocolEvent::ChainMetadataFetched { .. } => "ChainMetadataFetched",
