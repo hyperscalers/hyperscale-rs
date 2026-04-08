@@ -186,18 +186,6 @@ where
             }
 
             // ═══════════════════════════════════════════════════════════
-            // Receipt storage — written immediately
-            // ═══════════════════════════════════════════════════════════
-            Action::StoreReceiptBundles { bundles } => {
-                debug!(
-                    count = bundles.len(),
-                    tx_hashes = ?bundles.iter().map(|b| b.tx_hash).collect::<Vec<_>>(),
-                    "Storing receipt bundles"
-                );
-                self.storage.store_receipt_bundles(&bundles);
-            }
-
-            // ═══════════════════════════════════════════════════════════
             // Storage
             // ═══════════════════════════════════════════════════════════
             Action::PersistBlock { .. }

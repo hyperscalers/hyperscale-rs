@@ -580,18 +580,10 @@ impl ExecutionState {
 
         // Also write receipts to storage eagerly for read access by
         // VerifyStateRoot and BuildProposal action handlers (which run on
-        // the io_loop thread and read from storage). Receipts are ALSO held
-        // in receipt_cache → FinalizedWave.receipts for atomic commit.
+        // Receipts are held in receipt_cache → FinalizedWave.receipts → atomic
+        // block commit. No eager storage writes needed.
         let mut actions: Vec<Action> = Vec::new();
-        if !newly_emitted.is_empty() {
-            let bundles: Vec<ReceiptBundle> = newly_emitted
-                .iter()
-                .filter_map(|h| self.receipt_cache.get(h).cloned())
-                .collect();
-            if !bundles.is_empty() {
-                actions.push(Action::StoreReceiptBundles { bundles });
-            }
-        } else {
+        if newly_emitted.is_empty() {
             tracing::warn!(
                 results_count = 0,
                 "ExecutionBatchCompleted produced ZERO receipts"

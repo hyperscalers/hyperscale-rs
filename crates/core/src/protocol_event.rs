@@ -175,7 +175,7 @@ pub enum ProtocolEvent {
     ///
     /// The state machine uses results to:
     /// 1. Store pending execution updates (co-located with TC at finalization)
-    /// 2. Dispatch StoreReceiptBundles action
+    /// 2. Store receipts in receipt_cache for later finalized wave assembly
     ExecutionBatchCompleted {
         results: Vec<hyperscale_types::ExecutionResult>,
         /// Per-tx outcomes extracted on the handler thread for vote signing.

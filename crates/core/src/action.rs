@@ -587,16 +587,6 @@ pub enum Action {
     CacheWaveCertificate { certificate: Arc<WaveCertificate> },
 
     /// Persist receipt bundles to disk. Fire-and-forget — no ProtocolEvent response.
-    ///
-    /// Dispatched by the state machine after populating the execution cache.
-    /// Only for canonical execution (not speculative).
-    ///
-    /// Bundles with `database_updates: Some(...)` have deferred state_changes —
-    /// the storage layer computes them at persist time.
-    StoreReceiptBundles {
-        bundles: Vec<hyperscale_types::ReceiptBundle>,
-    },
-
     // ═══════════════════════════════════════════════════════════════════════
     // Global Consensus / Epoch Management
     // ═══════════════════════════════════════════════════════════════════════
@@ -953,7 +943,6 @@ impl Action {
 
             // Storage - Execution
             Action::CacheWaveCertificate { .. } => "CacheWaveCertificate",
-            Action::StoreReceiptBundles { .. } => "StoreReceiptBundles",
 
             // Storage - Read Requests
             Action::FetchBlock { .. } => "FetchBlock",
