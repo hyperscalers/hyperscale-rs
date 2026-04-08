@@ -54,10 +54,17 @@ impl RocksDbStorage {
                 match stale_part {
                     StaleTreePart::Node(key) => {
                         typed_cf::batch_delete::<JvtNodesCf>(&mut batch, jvt_cf, &key);
+                        self.node_cache.remove(&key);
                         deleted_nodes += 1;
                     }
                     StaleTreePart::Subtree(key) => {
-                        deleted_nodes += Self::delete_subtree(&self.db, jvt_cf, &key, &mut batch);
+                        deleted_nodes += Self::delete_subtree(
+                            &self.db,
+                            jvt_cf,
+                            &key,
+                            &mut batch,
+                            &self.node_cache,
+                        );
                     }
                 }
             }
@@ -96,6 +103,7 @@ impl RocksDbStorage {
         jvt_cf: &ColumnFamily,
         root_key: &StoredNodeKey,
         batch: &mut WriteBatch,
+        node_cache: &hyperscale_storage::jmt::NodeCache,
     ) -> usize {
         let mut stack = vec![root_key.clone()];
         let mut deleted = 0;
@@ -113,6 +121,7 @@ impl RocksDbStorage {
             }
 
             typed_cf::batch_delete::<JvtNodesCf>(batch, jvt_cf, &key);
+            node_cache.remove(&key);
             deleted += 1;
         }
 

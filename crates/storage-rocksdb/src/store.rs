@@ -243,6 +243,11 @@ impl RocksDbStorage {
             "BFT SAFETY CRITICAL: block commit failed - node state would diverge from network",
         );
 
+        // Populate the node cache with the newly committed nodes so that
+        // subsequent reads (proof generation, next block's state root
+        // verification) hit the cache instead of deserializing from RocksDB.
+        self.node_cache.populate(&jvt_snapshot.nodes);
+
         let elapsed = start.elapsed();
         metrics::record_storage_write(elapsed.as_secs_f64());
         metrics::record_storage_operation("apply_prepared_commit", elapsed.as_secs_f64());

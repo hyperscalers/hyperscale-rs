@@ -59,7 +59,7 @@ impl SimStorage {
         Self {
             state: Arc::new(RwLock::new(SharedState::new())),
             consensus: RwLock::new(ConsensusState::new()),
-            node_cache: NodeCache::new(50_000),
+            node_cache: NodeCache::new(),
         }
     }
 
@@ -72,7 +72,7 @@ impl SimStorage {
     pub fn clear(&mut self) {
         *self.state.write().unwrap() = SharedState::new();
         *self.consensus.write().unwrap() = ConsensusState::new();
-        self.node_cache = NodeCache::new(50_000);
+        self.node_cache = NodeCache::new();
     }
 
     /// Get number of substate keys stored.
@@ -156,6 +156,7 @@ impl SimStorage {
             &self.node_cache,
         );
 
+        self.node_cache.populate(&collected.nodes);
         collected.apply_to(&s.tree_store);
 
         s.current_block_height = new_version;
@@ -206,6 +207,7 @@ impl SimStorage {
             &self.node_cache,
         );
 
+        self.node_cache.populate(&collected.nodes);
         collected.apply_to(&s.tree_store);
 
         s.current_block_height = 0;

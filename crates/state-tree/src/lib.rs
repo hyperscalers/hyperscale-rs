@@ -12,8 +12,11 @@
 //! JVT values are field elements (`value_to_field(raw_bytes)`). Raw substate
 //! bytes are stored separately in the versioned data store (MVCC), not in the tree.
 
+mod node_cache;
 pub mod proofs;
 pub mod tree_store;
+
+pub use node_cache::NodeCache;
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -23,50 +26,6 @@ use jellyfish_verkle_tree as jvt;
 
 use jvt::TreeReader as _;
 use tree_store::*;
-
-/// Persistent cache of hydrated JVT nodes keyed by `(version, path)`.
-///
-/// Eliminates the expensive `StoredNode::to_jvt()` conversion (commitment
-/// deserialization, `commitment_to_field`, HashMap construction) on repeated
-/// proof generations. Nodes are cached on first read and eagerly populated
-/// during `put_at_version` (write-through).
-///
-/// Thread-safe (`Send + Sync`) — safe to share across proof generation and
-/// commit threads.
-pub struct NodeCache {
-    inner: quick_cache::sync::Cache<jvt::NodeKey, Arc<jvt::Node>>,
-}
-
-impl NodeCache {
-    /// Create a new node cache with the given capacity.
-    ///
-    /// 50,000 entries covers a typical live tree (~100MB at ~2KB/node).
-    pub fn new(capacity: usize) -> Self {
-        Self {
-            inner: quick_cache::sync::Cache::new(capacity),
-        }
-    }
-
-    /// Get a cached node.
-    pub fn get(&self, key: &jvt::NodeKey) -> Option<Arc<jvt::Node>> {
-        self.inner.get(key)
-    }
-
-    /// Insert a node into the cache.
-    pub fn insert(&self, key: jvt::NodeKey, node: Arc<jvt::Node>) {
-        self.inner.insert(key, node);
-    }
-
-    /// Number of entries currently in the cache.
-    pub fn len(&self) -> usize {
-        self.inner.len()
-    }
-
-    /// Whether the cache is empty.
-    pub fn is_empty(&self) -> bool {
-        self.inner.len() == 0
-    }
-}
 
 /// Hash a storage key to a 32-byte JVT key.
 ///
@@ -365,9 +324,6 @@ pub fn put_at_version<S: ReadableTreeStore + Sync>(
                     StoredNodeKey::from_jvt(&new_root_key),
                     StoredNode::from_jvt(&root_node),
                 ));
-                // Populate node cache so speculative proof generation can find
-                // the root at the new version before the block is committed.
-                node_cache.insert(new_root_key, Arc::new(root_node.as_ref().clone()));
                 Some(commitment_to_hash(commitment))
             })
             .unwrap_or(Hash::ZERO);
@@ -382,14 +338,15 @@ pub fn put_at_version<S: ReadableTreeStore + Sync>(
         commitment_to_hash(result.root_commitment)
     };
 
-    // Collect writes and populate node cache with hydrated nodes
+    // Collect writes — cache population happens at commit time via
+    // NodeCache::populate(), not here. This keeps put_at_version safe
+    // for both speculative and committed callers.
     let mut collected = CollectedWrites::default();
     for (node_key, node) in &result.batch.new_nodes {
         collected.nodes.push((
             StoredNodeKey::from_jvt(node_key),
             StoredNode::from_jvt(node),
         ));
-        node_cache.insert(node_key.clone(), Arc::new(node.clone()));
     }
     for stale in &result.batch.stale_nodes {
         collected

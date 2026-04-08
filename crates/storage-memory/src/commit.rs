@@ -96,6 +96,7 @@ impl CommitStore for SimStorage {
             if use_fast_path {
                 // Fast path: apply precomputed JVT snapshot + swap OrdMap.
                 // Write MVCC entries from the merged updates.
+                self.node_cache.populate(&prepared.snapshot.nodes);
                 s.apply_jvt_snapshot(prepared.snapshot);
                 s.data = prepared.resulting_data;
                 // The OrdMap was pre-built, but we still need MVCC entries.
@@ -182,6 +183,7 @@ impl CommitStore for SimStorage {
             &self.node_cache,
         );
 
+        self.node_cache.populate(&collected.nodes);
         collected.apply_to(&s.tree_store);
 
         s.current_block_height = block_height;

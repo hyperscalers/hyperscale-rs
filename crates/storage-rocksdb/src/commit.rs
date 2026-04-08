@@ -163,6 +163,9 @@ impl hyperscale_storage::CommitStore for RocksDbStorage {
             "BFT SAFETY CRITICAL: block commit failed - node state would diverge from network",
         );
 
+        // Populate cache with newly committed nodes.
+        self.node_cache.populate(&jvt_snapshot.nodes);
+
         new_root
     }
 

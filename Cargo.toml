@@ -119,7 +119,6 @@ hdrhistogram = "7.5"
 hex = { version = "0.4.3", default-features = false }
 im = "15.1"
 indexmap = "2.13.0"
-itertools = "0.14.0"
 jellyfish-verkle-tree = { git = "https://github.com/flightofthefox/jellyfish-verkle-tree", rev = "228547f", features = ["parallel"]}
 libp2p = { version = "0.56.0", features = ["gossipsub", "kad", "quic", "tcp", "noise", "yamux", "tokio", "macros", "identify"] }
 libp2p-stream = "0.4.0-alpha"

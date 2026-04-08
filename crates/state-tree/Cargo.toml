@@ -5,15 +5,13 @@ edition.workspace = true
 description = "Verkle-based state tree with 3-tier entity/partition/substate structure"
 
 [dependencies]
-hyperscale-types.workspace = true
-jellyfish-verkle-tree.workspace = true
-ark-ec.workspace = true
 ark-ed-on-bls12-381-bandersnatch.workspace = true
+ark-ec.workspace = true
 ark-serialize.workspace = true
 blake3.workspace = true
-sbor.workspace = true
+dashmap.workspace = true
+hyperscale-types.workspace = true
+jellyfish-verkle-tree.workspace = true
 radix-common.workspace = true
 radix-substate-store-interface.workspace = true
-indexmap.workspace = true
-itertools.workspace = true
-quick_cache.workspace = true
+sbor.workspace = true

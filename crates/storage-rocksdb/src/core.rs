@@ -180,7 +180,7 @@ impl RocksDbStorage {
             db: Arc::new(db),
             commit_lock: Mutex::new(()),
             jvt_history_length: config.jvt_history_length,
-            node_cache: hyperscale_storage::jmt::NodeCache::new(200_000),
+            node_cache: hyperscale_storage::jmt::NodeCache::new(),
         })
     }
 
@@ -471,6 +471,8 @@ impl RocksDbStorage {
             .write(batch)
             .expect("genesis JVT finalization failed");
 
+        self.node_cache.populate(&jvt_snapshot.nodes);
+
         root
     }
 }
@@ -593,6 +595,8 @@ impl RocksDbStorage {
         self.db
             .write(batch)
             .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+
+        self.node_cache.populate(&jvt_snapshot.nodes);
 
         let elapsed = start.elapsed();
         metrics::record_storage_write(elapsed.as_secs_f64());

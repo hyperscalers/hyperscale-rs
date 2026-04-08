@@ -42,6 +42,11 @@ impl StoredNodeKey {
         }
     }
 
+    /// Convert back to a JVT NodeKey.
+    pub fn to_jvt(&self) -> jvt::NodeKey {
+        jvt::NodeKey::new(self.version, &self.full_path)
+    }
+
     pub fn version(&self) -> Version {
         self.version
     }
