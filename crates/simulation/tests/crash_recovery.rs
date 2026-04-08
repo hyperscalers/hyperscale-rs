@@ -92,6 +92,7 @@ fn test_recovered_votes_prevent_equivocation() {
         state_root: Hash::ZERO,
         transaction_root: Hash::ZERO,
         certificate_root: Hash::ZERO,
+        local_receipt_root: Hash::ZERO,
         waves: vec![],
     };
 

@@ -1,6 +1,6 @@
 //! Receipt storage for RocksDB.
 
-use crate::column_families::{LedgerReceiptsCf, LocalExecutionsCf};
+use crate::column_families::{ExecutionOutputsCf, LocalReceiptsCf};
 use crate::core::RocksDbStorage;
 use crate::typed_cf::{self, TypedCf};
 
@@ -9,7 +9,7 @@ use rocksdb::WriteBatch;
 use std::sync::Arc;
 
 impl RocksDbStorage {
-    /// Store a receipt bundle (ledger receipt + optional local execution).
+    /// Store a receipt bundle (local receipt + optional execution output).
     pub fn store_receipt_bundle(&self, bundle: &hyperscale_types::ReceiptBundle) {
         let mut batch = WriteBatch::default();
         self.add_receipt_bundle_to_batch(&mut batch, bundle);
@@ -45,36 +45,33 @@ impl RocksDbStorage {
     ) {
         let cf = self.cf();
 
-        typed_cf::batch_put::<LedgerReceiptsCf>(
+        typed_cf::batch_put::<LocalReceiptsCf>(
             batch,
-            LedgerReceiptsCf::handle(&cf),
+            LocalReceiptsCf::handle(&cf),
             &bundle.tx_hash,
-            bundle.ledger_receipt.as_ref(),
+            bundle.local_receipt.as_ref(),
         );
 
-        if let Some(ref local) = bundle.local_execution {
-            typed_cf::batch_put::<LocalExecutionsCf>(
+        if let Some(ref local) = bundle.execution_output {
+            typed_cf::batch_put::<ExecutionOutputsCf>(
                 batch,
-                LocalExecutionsCf::handle(&cf),
+                ExecutionOutputsCf::handle(&cf),
                 &bundle.tx_hash,
                 local,
             );
         }
     }
 
-    /// Retrieve the ledger receipt for a transaction.
-    pub fn get_ledger_receipt(
-        &self,
-        tx_hash: &Hash,
-    ) -> Option<Arc<hyperscale_types::LedgerTransactionReceipt>> {
-        self.cf_get::<LedgerReceiptsCf>(tx_hash).map(Arc::new)
+    /// Retrieve the local receipt for a transaction.
+    pub fn get_local_receipt(&self, tx_hash: &Hash) -> Option<Arc<hyperscale_types::LocalReceipt>> {
+        self.cf_get::<LocalReceiptsCf>(tx_hash).map(Arc::new)
     }
 
-    /// Retrieve local execution details for a transaction.
-    pub fn get_local_execution(
+    /// Retrieve execution output details for a transaction.
+    pub fn get_execution_output(
         &self,
         tx_hash: &Hash,
-    ) -> Option<hyperscale_types::LocalTransactionExecution> {
-        self.cf_get::<LocalExecutionsCf>(tx_hash)
+    ) -> Option<hyperscale_types::ExecutionOutput> {
+        self.cf_get::<ExecutionOutputsCf>(tx_hash)
     }
 }

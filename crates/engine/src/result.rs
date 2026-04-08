@@ -1,8 +1,6 @@
 //! Execution result types.
 
-use hyperscale_types::{
-    ExecutionResult, Hash, LedgerTransactionReceipt, LocalTransactionExecution,
-};
+use hyperscale_types::{ExecutionResult, Hash, LocalReceipt};
 /// Output from executing a batch of transactions.
 #[derive(Debug, Clone)]
 pub struct ExecutionOutput {
@@ -52,14 +50,14 @@ pub struct SingleTxResult {
     pub success: bool,
 
     // ─── Receipt fields ──────────────────────────────────────────────────
-    /// Hash of ConsensusReceipt (outcome + event_root).
+    /// Hash of GlobalReceipt (outcome + event_root).
     pub receipt_hash: Hash,
 
-    /// Full ledger receipt with shard-filtered database updates and events.
-    pub ledger_receipt: LedgerTransactionReceipt,
+    /// Full local receipt with shard-filtered database updates and events.
+    pub local_receipt: LocalReceipt,
 
     /// Local execution metadata (fees, logs, errors).
-    pub local_execution: LocalTransactionExecution,
+    pub execution_output: hyperscale_types::ExecutionOutput,
 
     /// Error message if execution failed.
     pub error: Option<String>,
@@ -70,27 +68,32 @@ impl SingleTxResult {
     pub fn success(
         tx_hash: Hash,
         receipt_hash: Hash,
-        ledger_receipt: LedgerTransactionReceipt,
-        local_execution: LocalTransactionExecution,
+        local_receipt: LocalReceipt,
+        execution_output: hyperscale_types::ExecutionOutput,
     ) -> Self {
         Self {
             tx_hash,
             success: true,
             receipt_hash,
-            ledger_receipt,
-            local_execution,
+            local_receipt,
+            execution_output,
             error: None,
         }
     }
 
     /// Create a failed result.
     pub fn failure(tx_hash: Hash, error: impl Into<String>) -> Self {
+        let local_receipt = LocalReceipt::failure();
+        // Failures have no writes, so writes_root is ZERO.
+        let receipt_hash = local_receipt
+            .global_receipt(Hash::from_bytes(&[0u8; 32]))
+            .receipt_hash();
         Self {
             tx_hash,
             success: false,
-            receipt_hash: LedgerTransactionReceipt::failure().receipt_hash(),
-            ledger_receipt: LedgerTransactionReceipt::failure(),
-            local_execution: LocalTransactionExecution::failure(None),
+            receipt_hash,
+            local_receipt,
+            execution_output: hyperscale_types::ExecutionOutput::failure(None),
             error: Some(error.into()),
         }
     }
@@ -114,8 +117,8 @@ impl From<SingleTxResult> for ExecutionResult {
         Self {
             tx_hash: r.tx_hash,
             receipt_hash: r.receipt_hash,
-            ledger_receipt: r.ledger_receipt,
-            local_execution: r.local_execution,
+            local_receipt: r.local_receipt,
+            execution_output: r.execution_output,
         }
     }
 }

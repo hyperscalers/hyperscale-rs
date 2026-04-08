@@ -78,7 +78,7 @@ pub fn execute_cross_shard<S: SubstateStore>(
 /// Extracts write_nodes and builds a `TxOutcome` for the execution accumulator.
 /// Called on the handler thread (after execution, before returning to state machine).
 pub fn extract_execution_result(result: &SingleTxResult) -> TxOutcome {
-    let write_nodes = sharding::extract_write_nodes(&result.ledger_receipt.database_updates);
+    let write_nodes = sharding::extract_write_nodes(&result.local_receipt.database_updates);
     TxOutcome {
         tx_hash: result.tx_hash,
         outcome: TxExecutionOutcome::Executed {

@@ -252,27 +252,18 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
             block_hash,
             parent_state_root,
             expected_root,
-            cert_tx_hashes,
+            finalized_waves,
             block_height,
-            ..
         } => {
             let start = std::time::Instant::now();
-            // Read shard-filtered DatabaseUpdates directly from stored receipts.
-            // The receipt is the quorum-agreed artifact; its database_updates were
-            // shard-filtered at execution time by filter_updates_for_shard.
-            let per_cert: Vec<hyperscale_types::DatabaseUpdates> = cert_tx_hashes
+            // Merge DatabaseUpdates from all finalized waves' receipts.
+            // This runs on the thread pool — no state machine time spent merging.
+            let per_receipt: Vec<hyperscale_types::DatabaseUpdates> = finalized_waves
                 .iter()
-                .map(|tx_hash| {
-                    let receipt = ctx.storage.get_ledger_receipt(tx_hash).unwrap_or_else(|| {
-                        panic!(
-                            "BUG: receipt missing for {} during state root verification at height {}",
-                            tx_hash, block_height
-                        )
-                    });
-                    receipt.database_updates.clone()
-                })
+                .flat_map(|fw| &fw.receipts)
+                .map(|bundle| bundle.local_receipt.database_updates.clone())
                 .collect();
-            let merged = hyperscale_storage::merge_database_updates(&per_cert);
+            let merged = hyperscale_storage::merge_database_updates(&per_receipt);
             let result = hyperscale_bft::handlers::verify_state_root(
                 ctx.storage,
                 parent_state_root,
@@ -339,7 +330,7 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
                 let tx_hashes =
                     hyperscale_types::derive_wave_tx_hashes(ctx.topology, &wc.wave_id, &source_txs);
                 for tx_hash in tx_hashes {
-                    if let Some(receipt) = ctx.storage.get_ledger_receipt(&tx_hash) {
+                    if let Some(receipt) = ctx.storage.get_local_receipt(&tx_hash) {
                         per_cert.push(receipt.database_updates.clone());
                         receipt_tx_hashes.push(tx_hash);
                     } else {
@@ -388,7 +379,7 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
         Action::AggregateExecutionCertificate {
             wave_id,
             shard,
-            receipt_root,
+            global_receipt_root,
             votes,
             committee,
         } => {
@@ -397,7 +388,7 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
             let certificate = hyperscale_execution::handlers::aggregate_execution_certificate(
                 &wave_id,
                 shard,
-                receipt_root,
+                global_receipt_root,
                 &votes,
                 &committee,
             );

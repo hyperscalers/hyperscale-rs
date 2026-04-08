@@ -164,7 +164,7 @@ pub fn validator_bind_message(peer_id_bytes: &[u8]) -> Vec<u8> {
 
 /// Domain tag for execution votes.
 ///
-/// Format: `EXEC_VOTE` || block_hash || block_height || wave_id_len || wave_id_shards... || shard_group || receipt_root || tx_count
+/// Format: `EXEC_VOTE` || block_hash || block_height || wave_id_len || wave_id_shards... || shard_group || global_receipt_root || tx_count
 ///
 /// Used for both individual `ExecutionVote` signatures and
 /// `ExecutionCertificate` aggregated signature verification.
@@ -172,12 +172,12 @@ pub const DOMAIN_EXEC_VOTE: &[u8] = b"EXEC_VOTE";
 
 /// Domain tag for execution vote batch gossip.
 ///
-/// Format: `EXEC_VOTE_BATCH` || shard_group_id || H(receipt_roots)
+/// Format: `EXEC_VOTE_BATCH` || shard_group_id || H(global_receipt_roots)
 pub const DOMAIN_EXEC_VOTE_BATCH: &[u8] = b"EXEC_VOTE_BATCH";
 
 /// Domain tag for execution certificate batch gossip.
 ///
-/// Format: `EXEC_CERT_BATCH` || shard_group_id || H(receipt_roots)
+/// Format: `EXEC_CERT_BATCH` || shard_group_id || H(global_receipt_roots)
 pub const DOMAIN_EXEC_CERT_BATCH: &[u8] = b"EXEC_CERT_BATCH";
 
 /// Build the signing message for an execution vote.
@@ -192,7 +192,7 @@ pub fn exec_vote_message(
     vote_height: u64,
     wave_id: &WaveId,
     shard_group: ShardGroupId,
-    receipt_root: &Hash,
+    global_receipt_root: &Hash,
     tx_count: u32,
 ) -> Vec<u8> {
     let mut message = Vec::with_capacity(128);
@@ -207,7 +207,7 @@ pub fn exec_vote_message(
         message.extend_from_slice(&shard.0.to_le_bytes());
     }
     message.extend_from_slice(&shard_group.0.to_le_bytes());
-    message.extend_from_slice(receipt_root.as_bytes());
+    message.extend_from_slice(global_receipt_root.as_bytes());
     message.extend_from_slice(&tx_count.to_le_bytes());
     message
 }
@@ -219,7 +219,7 @@ pub fn exec_vote_batch_message(
 ) -> Vec<u8> {
     let mut hasher = blake3::Hasher::new();
     for v in votes {
-        hasher.update(v.receipt_root.as_bytes());
+        hasher.update(v.global_receipt_root.as_bytes());
     }
     let digest = hasher.finalize();
 
@@ -237,7 +237,7 @@ pub fn exec_cert_batch_message(
 ) -> Vec<u8> {
     let mut hasher = blake3::Hasher::new();
     for c in certificates {
-        hasher.update(c.receipt_root.as_bytes());
+        hasher.update(c.global_receipt_root.as_bytes());
     }
     let digest = hasher.finalize();
 

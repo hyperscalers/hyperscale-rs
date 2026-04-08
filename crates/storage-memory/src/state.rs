@@ -9,9 +9,8 @@ use hyperscale_storage::{
     StateRootHash,
 };
 use hyperscale_types::{
-    Block, BlockHeight, ExecutionCertificate, Hash, LedgerTransactionReceipt,
-    LocalTransactionExecution, QuorumCertificate, RoutableTransaction, ShardGroupId,
-    WaveCertificate,
+    Block, BlockHeight, ExecutionCertificate, ExecutionOutput, Hash, LocalReceipt,
+    QuorumCertificate, RoutableTransaction, ShardGroupId, WaveCertificate,
 };
 use im::OrdMap;
 use jellyfish_verkle_tree as jvt;
@@ -124,10 +123,10 @@ pub(crate) struct ConsensusState {
     /// Our own votes indexed by height.
     /// **BFT Safety Critical**: Used to prevent equivocation after restart.
     pub own_votes: HashMap<u64, (Hash, u64)>,
-    /// Ledger receipts keyed by transaction hash.
-    pub ledger_receipts: HashMap<Hash, Arc<LedgerTransactionReceipt>>,
-    /// Local execution details keyed by transaction hash.
-    pub local_executions: HashMap<Hash, LocalTransactionExecution>,
+    /// Local receipts keyed by transaction hash.
+    pub local_receipts: HashMap<Hash, Arc<LocalReceipt>>,
+    /// Execution output details keyed by transaction hash.
+    pub execution_outputs: HashMap<Hash, ExecutionOutput>,
     /// Insertion height for each receipt, enabling height-based pruning.
     pub receipt_heights: HashMap<Hash, u64>,
     /// Execution certificates keyed by canonical hash.
@@ -155,8 +154,8 @@ impl ConsensusState {
             transactions: HashMap::new(),
             certificates: HashMap::new(),
             own_votes: HashMap::new(),
-            ledger_receipts: HashMap::new(),
-            local_executions: HashMap::new(),
+            local_receipts: HashMap::new(),
+            execution_outputs: HashMap::new(),
             receipt_heights: HashMap::new(),
             execution_certs: HashMap::new(),
             execution_certs_by_height: HashMap::new(),
@@ -174,8 +173,8 @@ impl ConsensusState {
         }
         self.receipt_heights.retain(|tx_hash, height| {
             if *height <= cutoff {
-                self.ledger_receipts.remove(tx_hash);
-                self.local_executions.remove(tx_hash);
+                self.local_receipts.remove(tx_hash);
+                self.execution_outputs.remove(tx_hash);
                 false
             } else {
                 true

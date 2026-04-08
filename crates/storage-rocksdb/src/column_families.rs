@@ -7,8 +7,8 @@ use crate::typed_cf::*;
 
 use crate::jvt_stored::{StoredNodeKey, VersionedStoredNode};
 use hyperscale_types::{
-    BlockMetadata, ExecutionCertificate, Hash, LedgerTransactionReceipt, LocalTransactionExecution,
-    RoutableTransaction, WaveCertificate,
+    BlockMetadata, ExecutionCertificate, ExecutionOutput, Hash, LocalReceipt, RoutableTransaction,
+    WaveCertificate,
 };
 
 // ─── CF name constants ───────────────────────────────────────────────────────
@@ -47,11 +47,11 @@ pub(crate) const STALE_JVT_NODES_CF: &str = "stale_jvt_nodes";
 /// Enables historical reads via prefix scan + version filtering.
 pub(crate) const VERSIONED_SUBSTATES_CF: &str = "versioned_substates";
 
-/// Column family name for ledger receipts keyed by tx hash.
-pub(crate) const LEDGER_RECEIPTS_CF: &str = "ledger_receipts";
+/// Column family name for local receipts keyed by tx hash.
+pub(crate) const LOCAL_RECEIPTS_CF: &str = "local_receipts";
 
-/// Column family name for local execution details keyed by tx hash.
-pub(crate) const LOCAL_EXECUTIONS_CF: &str = "local_executions";
+/// Column family name for execution output details keyed by tx hash.
+pub(crate) const EXECUTION_OUTPUTS_CF: &str = "execution_outputs";
 
 /// Column family for execution certificates keyed by canonical hash.
 pub(crate) const EXECUTION_CERTS_CF: &str = "execution_certs";
@@ -80,8 +80,8 @@ pub(crate) const ALL_COLUMN_FAMILIES: &[&str] = &[
     JVT_NODES_CF,
     STALE_JVT_NODES_CF,
     VERSIONED_SUBSTATES_CF,
-    LEDGER_RECEIPTS_CF,
-    LOCAL_EXECUTIONS_CF,
+    LOCAL_RECEIPTS_CF,
+    EXECUTION_OUTPUTS_CF,
     EXECUTION_CERTS_CF,
     EXECUTION_CERTS_BY_HEIGHT_CF,
 ];
@@ -103,8 +103,8 @@ pub(crate) struct CfHandles<'a> {
     jvt_nodes: &'a rocksdb::ColumnFamily,
     stale_jvt_nodes: &'a rocksdb::ColumnFamily,
     versioned_substates: &'a rocksdb::ColumnFamily,
-    ledger_receipts: &'a rocksdb::ColumnFamily,
-    local_executions: &'a rocksdb::ColumnFamily,
+    local_receipts: &'a rocksdb::ColumnFamily,
+    execution_outputs: &'a rocksdb::ColumnFamily,
     execution_certs: &'a rocksdb::ColumnFamily,
     execution_certs_by_height: &'a rocksdb::ColumnFamily,
 }
@@ -128,8 +128,8 @@ impl<'a> CfHandles<'a> {
             jvt_nodes: resolve(JVT_NODES_CF),
             stale_jvt_nodes: resolve(STALE_JVT_NODES_CF),
             versioned_substates: resolve(VERSIONED_SUBSTATES_CF),
-            ledger_receipts: resolve(LEDGER_RECEIPTS_CF),
-            local_executions: resolve(LOCAL_EXECUTIONS_CF),
+            local_receipts: resolve(LOCAL_RECEIPTS_CF),
+            execution_outputs: resolve(EXECUTION_OUTPUTS_CF),
             execution_certs: resolve(EXECUTION_CERTS_CF),
             execution_certs_by_height: resolve(EXECUTION_CERTS_BY_HEIGHT_CF),
         }
@@ -253,27 +253,27 @@ impl TypedCf for VersionedSubstatesCf {
 
 // Receipts
 
-pub(crate) struct LedgerReceiptsCf;
-impl TypedCf for LedgerReceiptsCf {
-    const NAME: &'static str = LEDGER_RECEIPTS_CF;
+pub(crate) struct LocalReceiptsCf;
+impl TypedCf for LocalReceiptsCf {
+    const NAME: &'static str = LOCAL_RECEIPTS_CF;
     type Key = Hash;
-    type Value = LedgerTransactionReceipt;
+    type Value = LocalReceipt;
     type KeyCodec = HashCodec;
-    type ValueCodec = SborCodec<LedgerTransactionReceipt>;
+    type ValueCodec = SborCodec<LocalReceipt>;
     fn handle<'a>(cf: &CfHandles<'a>) -> &'a rocksdb::ColumnFamily {
-        cf.ledger_receipts
+        cf.local_receipts
     }
 }
 
-pub(crate) struct LocalExecutionsCf;
-impl TypedCf for LocalExecutionsCf {
-    const NAME: &'static str = LOCAL_EXECUTIONS_CF;
+pub(crate) struct ExecutionOutputsCf;
+impl TypedCf for ExecutionOutputsCf {
+    const NAME: &'static str = EXECUTION_OUTPUTS_CF;
     type Key = Hash;
-    type Value = LocalTransactionExecution;
+    type Value = ExecutionOutput;
     type KeyCodec = HashCodec;
-    type ValueCodec = SborCodec<LocalTransactionExecution>;
+    type ValueCodec = SborCodec<ExecutionOutput>;
     fn handle<'a>(cf: &CfHandles<'a>) -> &'a rocksdb::ColumnFamily {
-        cf.local_executions
+        cf.execution_outputs
     }
 }
 

@@ -1222,6 +1222,7 @@ mod tests {
             state_root: Hash::from_bytes(format!("root_{shard}_{height}").as_bytes()),
             transaction_root: Hash::ZERO,
             certificate_root: Hash::ZERO,
+            local_receipt_root: Hash::ZERO,
             waves,
         };
         let header_hash = header.hash();

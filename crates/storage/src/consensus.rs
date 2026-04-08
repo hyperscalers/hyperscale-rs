@@ -4,9 +4,8 @@
 //! All methods take `&self` — implementations use interior mutability.
 
 use hyperscale_types::{
-    Block, BlockHeight, ExecutionCertificate, Hash, LedgerTransactionReceipt,
-    LocalTransactionExecution, QuorumCertificate, ReceiptBundle, RoutableTransaction, ShardGroupId,
-    WaveCertificate,
+    Block, BlockHeight, ExecutionCertificate, ExecutionOutput, Hash, LocalReceipt,
+    QuorumCertificate, ReceiptBundle, RoutableTransaction, ShardGroupId, WaveCertificate,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -79,10 +78,10 @@ pub trait ConsensusStore: Send + Sync {
 
     // ─── Receipt Storage ──────────────────────────────────────────────────
 
-    /// Store a receipt bundle (ledger receipt + optional local execution) for a transaction.
+    /// Store a receipt bundle (local receipt + optional execution output) for a transaction.
     ///
-    /// If `bundle.local_execution` is `None` (e.g., receipt fetched during sync),
-    /// only the ledger receipt is persisted.
+    /// If `bundle.execution_output` is `None` (e.g., receipt fetched during sync),
+    /// only the local receipt is persisted.
     fn store_receipt_bundle(&self, bundle: &ReceiptBundle);
 
     /// Store multiple receipt bundles atomically.
@@ -94,18 +93,18 @@ pub trait ConsensusStore: Send + Sync {
         }
     }
 
-    /// Retrieve the ledger receipt for a transaction.
-    fn get_ledger_receipt(&self, tx_hash: &Hash) -> Option<Arc<LedgerTransactionReceipt>>;
+    /// Retrieve the local receipt for a transaction.
+    fn get_local_receipt(&self, tx_hash: &Hash) -> Option<Arc<LocalReceipt>>;
 
-    /// Retrieve local execution details for a transaction.
+    /// Retrieve execution output details for a transaction.
     ///
     /// Returns `None` both when the tx doesn't exist AND when it was synced
     /// (not executed locally). Use `has_receipt()` to distinguish.
-    fn get_local_execution(&self, tx_hash: &Hash) -> Option<LocalTransactionExecution>;
+    fn get_execution_output(&self, tx_hash: &Hash) -> Option<ExecutionOutput>;
 
-    /// Check if a ledger receipt exists for a transaction.
+    /// Check if a local receipt exists for a transaction.
     fn has_receipt(&self, tx_hash: &Hash) -> bool {
-        self.get_ledger_receipt(tx_hash).is_some()
+        self.get_local_receipt(tx_hash).is_some()
     }
 
     // ─── Execution Certificate Storage ───────────────────────────────────

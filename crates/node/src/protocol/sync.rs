@@ -373,7 +373,7 @@ impl SyncProtocol {
 
 /// Serve an inbound block sync request.
 ///
-/// Includes ledger receipts and execution certificates for each certificate
+/// Includes local receipts and execution certificates for each certificate
 /// in the block so the syncing peer can verify and apply state changes
 /// without re-executing. Returns not_found if any data is missing.
 pub fn serve_block_request(
@@ -389,7 +389,7 @@ pub fn serve_block_request(
             // look up the source block (at wave_id.block_height) and derive which
             // txs the wave covers via derive_wave_tx_hashes. Then look up receipts
             // for those txs. This matches the proposer's state_root computation.
-            let mut ledger_receipts = Vec::new();
+            let mut local_receipts = Vec::new();
             for wc in &block.certificates {
                 if !wc.is_completed() {
                     continue;
@@ -402,8 +402,8 @@ pub fn serve_block_request(
                 let tx_hashes =
                     hyperscale_types::derive_wave_tx_hashes(topology, &wc.wave_id, &source_txs);
                 for tx_hash in tx_hashes {
-                    if let Some(receipt) = storage.get_ledger_receipt(&tx_hash) {
-                        ledger_receipts.push(hyperscale_types::LedgerReceiptEntry {
+                    if let Some(receipt) = storage.get_local_receipt(&tx_hash) {
+                        local_receipts.push(hyperscale_types::LocalReceiptEntry {
                             tx_hash,
                             receipt: (*receipt).clone(),
                         });
@@ -421,7 +421,7 @@ pub fn serve_block_request(
             // may aggregate at different vote_heights, producing genuinely
             // different ECs for the same wave (D1 edge case).
 
-            GetBlockResponse::found(block, qc, ledger_receipts, execution_certificates)
+            GetBlockResponse::found(block, qc, local_receipts, execution_certificates)
         }
         None => GetBlockResponse::not_found(),
     }

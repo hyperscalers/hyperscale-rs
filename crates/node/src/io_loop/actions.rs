@@ -69,7 +69,7 @@ where
                 block_height,
                 vote_height,
                 wave_id,
-                receipt_root,
+                global_receipt_root,
                 tx_outcomes,
                 target,
             } => {
@@ -79,7 +79,7 @@ where
                     vote_height,
                     &wave_id,
                     self.local_shard,
-                    &receipt_root,
+                    &global_receipt_root,
                     tx_count,
                 );
                 let sig = self.signing_key.sign_v1(&msg);
@@ -89,7 +89,7 @@ where
                     vote_height,
                     wave_id,
                     shard_group_id: self.local_shard,
-                    receipt_root,
+                    global_receipt_root,
                     tx_count,
                     tx_outcomes,
                     validator: self.validator_id,
@@ -665,7 +665,7 @@ where
                         continue;
                     };
                     let (receipts, sync_ecs) =
-                        (&entry.ledger_receipts, &entry.execution_certificates);
+                        (&entry.local_receipts, &entry.execution_certificates);
 
                     // Check 2: Verify EC BLS signatures (synchronous in commit closure).
                     let ecs_valid = sync_ecs.iter().all(|ec| {
@@ -746,7 +746,7 @@ where
                                         );
                                     for tx_hash in tx_hashes {
                                         if let Some(receipt) =
-                                            storage.get_ledger_receipt(&tx_hash)
+                                            storage.get_local_receipt(&tx_hash)
                                         {
                                             updates
                                                 .push(receipt.database_updates.clone());
@@ -786,8 +786,8 @@ where
                                 .iter()
                                 .map(|entry| hyperscale_types::ReceiptBundle {
                                     tx_hash: entry.tx_hash,
-                                    ledger_receipt: std::sync::Arc::new(entry.receipt.clone()),
-                                    local_execution: None,
+                                    local_receipt: std::sync::Arc::new(entry.receipt.clone()),
+                                    execution_output: None,
                                 })
                                 .collect();
                             storage.store_receipt_bundles(&bundles);

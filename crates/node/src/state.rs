@@ -9,9 +9,9 @@ use hyperscale_provisions::ProvisionCoordinator;
 use hyperscale_remote_headers::RemoteHeaderCoordinator;
 use hyperscale_topology::TopologyState;
 use hyperscale_types::{
-    AbortIntent, Block, BlockHeader, BlockHeight, BlockManifest, Bls12381G1PrivateKey, Hash,
-    QuorumCertificate, ReadyTransactions, RoutableTransaction, ShardGroupId, TopologySnapshot,
-    WaveCertificate,
+    AbortIntent, Block, BlockHeader, BlockHeight, BlockManifest, Bls12381G1PrivateKey,
+    FinalizedWave, Hash, QuorumCertificate, ReadyTransactions, RoutableTransaction, ShardGroupId,
+    TopologySnapshot, WaveCertificate,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -320,7 +320,7 @@ impl NodeStateMachine {
             manifest,
             |h| self.mempool.get_transaction(h),
             |h| self.execution.get_finalized_wave_cert_by_hash(h),
-            |h| self.execution.has_finalized_certificate(h),
+            |h| self.execution.has_receipt(h),
         )
     }
 
@@ -492,7 +492,9 @@ impl NodeStateMachine {
                 .on_transaction_executed(self.topology.snapshot(), tx_hash, accepted);
 
         // Feed receipt availability for pending blocks.
-        if self.execution.has_finalized_certificate(&tx_hash) {
+        // Always notify — receipt exists if execution completed, regardless of
+        // wave cert finalization status (P3 fix).
+        if self.execution.has_receipt(&tx_hash) {
             actions.extend(
                 self.bft
                     .on_receipts_available(self.topology.snapshot(), &[tx_hash]),
@@ -839,15 +841,19 @@ impl StateMachine for NodeStateMachine {
         };
 
         // Drain any state root verifications that became ready during this event.
-        // The BFT verification pipeline queues these; DatabaseUpdates are derived
-        // from receipts on the thread pool (not from the local execution cache).
+        // Look up Arc<FinalizedWave> from execution state for each wave_id_hash.
+        // The thread pool merges DatabaseUpdates from these on the action handler.
         for ready in self.bft.drain_ready_state_root_verifications() {
+            let finalized_waves: Vec<Arc<FinalizedWave>> = ready
+                .wave_id_hashes
+                .iter()
+                .filter_map(|wid_hash| self.execution.get_finalized_wave_by_hash(wid_hash))
+                .collect();
             actions.push(Action::VerifyStateRoot {
                 block_hash: ready.block_hash,
                 parent_state_root: ready.parent_state_root,
                 expected_root: ready.expected_root,
-                cert_tx_hashes: ready.cert_tx_hashes,
-                per_cert_declared_nodes: ready.per_cert_declared_nodes,
+                finalized_waves,
                 block_height: ready.block_height,
             });
         }

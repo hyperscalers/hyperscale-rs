@@ -8,7 +8,7 @@
 //! Validators vote at each block commit where their wave is complete.
 //! Votes include `vote_height` in the BLS-signed message, so votes at
 //! different heights have different signatures and cannot be aggregated.
-//! The tracker groups by `(receipt_root, vote_height)` and checks quorum
+//! The tracker groups by `(global_receipt_root, vote_height)` and checks quorum
 //! per group.
 //!
 //! ## Deferred Verification Optimization
@@ -20,11 +20,11 @@
 use hyperscale_types::{Bls12381G1PublicKey, ExecutionVote, Hash, ValidatorId, WaveId};
 use std::collections::{BTreeMap, HashSet};
 
-/// Key for grouping votes: `(receipt_root, vote_height)`.
+/// Key for grouping votes: `(global_receipt_root, vote_height)`.
 ///
 /// Votes at different heights have different BLS signatures and cannot be
 /// aggregated together. This prevents stale votes from combining with new
-/// ones if an abort intent changes the receipt_root between heights.
+/// ones if an abort intent changes the global_receipt_root between heights.
 type VoteKey = (Hash, u64);
 
 /// Tracks execution votes for a specific wave within a block.
@@ -44,9 +44,9 @@ pub struct VoteTracker {
     // ═══════════════════════════════════════════════════════════════════════
     // Verified votes (passed signature verification)
     // ═══════════════════════════════════════════════════════════════════════
-    /// Verified votes grouped by (receipt_root, vote_height).
+    /// Verified votes grouped by (global_receipt_root, vote_height).
     votes_by_key: BTreeMap<VoteKey, Vec<ExecutionVote>>,
-    /// Voting power per (receipt_root, vote_height) (verified votes only).
+    /// Voting power per (global_receipt_root, vote_height) (verified votes only).
     power_by_key: BTreeMap<VoteKey, u64>,
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -160,41 +160,45 @@ impl VoteTracker {
 
     /// Add a verified vote and its voting power.
     pub fn add_verified_vote(&mut self, vote: ExecutionVote, power: u64) {
-        let key = (vote.receipt_root, vote.vote_height);
+        let key = (vote.global_receipt_root, vote.vote_height);
         self.votes_by_key.entry(key).or_default().push(vote);
         *self.power_by_key.entry(key).or_insert(0) += power;
     }
 
-    /// Check if quorum is reached for any (receipt_root, vote_height) pair.
+    /// Check if quorum is reached for any (global_receipt_root, vote_height) pair.
     ///
-    /// Returns `Some((receipt_root, vote_height, total_power))` if quorum reached.
+    /// Returns `Some((global_receipt_root, vote_height, total_power))` if quorum reached.
     /// If multiple pairs have quorum, returns the one with the lowest vote_height.
     pub fn check_quorum(&self) -> Option<(Hash, u64, u64)> {
         let mut best: Option<(Hash, u64, u64)> = None;
-        for (&(receipt_root, vote_height), &power) in &self.power_by_key {
+        for (&(global_receipt_root, vote_height), &power) in &self.power_by_key {
             if power >= self.quorum {
                 match &best {
                     Some((_, best_height, _)) if vote_height >= *best_height => {}
-                    _ => best = Some((receipt_root, vote_height, power)),
+                    _ => best = Some((global_receipt_root, vote_height, power)),
                 }
             }
         }
         best
     }
 
-    /// Take votes for a specific (receipt_root, vote_height) pair.
-    pub fn take_votes(&mut self, receipt_root: &Hash, vote_height: u64) -> Vec<ExecutionVote> {
-        let key = (*receipt_root, vote_height);
+    /// Take votes for a specific (global_receipt_root, vote_height) pair.
+    pub fn take_votes(
+        &mut self,
+        global_receipt_root: &Hash,
+        vote_height: u64,
+    ) -> Vec<ExecutionVote> {
+        let key = (*global_receipt_root, vote_height);
         self.votes_by_key.remove(&key).unwrap_or_default()
     }
 
-    /// Return the total verified voting power across all (receipt_root, vote_height) groups.
+    /// Return the total verified voting power across all (global_receipt_root, vote_height) groups.
     pub fn total_verified_power(&self) -> u64 {
         self.power_by_key.values().sum()
     }
 
     /// Return the number of distinct receipt roots across all verified vote groups.
-    pub fn distinct_receipt_root_count(&self) -> usize {
+    pub fn distinct_global_receipt_root_count(&self) -> usize {
         self.power_by_key
             .keys()
             .map(|(root, _)| root)
@@ -202,9 +206,9 @@ impl VoteTracker {
             .len()
     }
 
-    /// Return a summary of verified voting power per receipt root (summed across vote heights).
+    /// Return a summary of verified voting power per global receipt root (summed across vote heights).
     /// Used for diagnostics when quorum cannot be reached.
-    pub fn receipt_root_power_summary(&self) -> Vec<(Hash, u64)> {
+    pub fn global_receipt_root_power_summary(&self) -> Vec<(Hash, u64)> {
         let mut by_root: BTreeMap<Hash, u64> = BTreeMap::new();
         for (&(root, _), &power) in &self.power_by_key {
             *by_root.entry(root).or_insert(0) += power;
@@ -212,12 +216,12 @@ impl VoteTracker {
         by_root.into_iter().collect()
     }
 
-    /// Get votes for a specific receipt root at any height (for tests).
+    /// Get votes for a specific global receipt root at any height (for tests).
     #[cfg(test)]
-    pub fn votes_for_receipt_root(&self, receipt_root: &Hash) -> Vec<&ExecutionVote> {
+    pub fn votes_for_global_receipt_root(&self, global_receipt_root: &Hash) -> Vec<&ExecutionVote> {
         self.votes_by_key
             .iter()
-            .filter(|((root, _), _)| root == receipt_root)
+            .filter(|((root, _), _)| root == global_receipt_root)
             .flat_map(|(_, votes)| votes.iter())
             .collect()
     }
@@ -233,14 +237,14 @@ mod tests {
         generate_bls_keypair().public_key()
     }
 
-    fn make_vote(validator: u64, receipt_root: Hash) -> ExecutionVote {
+    fn make_vote(validator: u64, global_receipt_root: Hash) -> ExecutionVote {
         ExecutionVote {
             block_hash: Hash::from_bytes(b"block"),
             block_height: 10,
             vote_height: 11,
             wave_id: WaveId::new(ShardGroupId(0), 0, BTreeSet::new()),
             shard_group_id: ShardGroupId(0),
-            receipt_root,
+            global_receipt_root,
             tx_count: 5,
             tx_outcomes: vec![],
             validator: ValidatorId(validator),
@@ -271,7 +275,7 @@ mod tests {
         assert_eq!(r, root);
         assert_eq!(vh, 11); // vote_height from make_vote
         assert_eq!(power, 3);
-        assert_eq!(tracker.votes_for_receipt_root(&root).len(), 3);
+        assert_eq!(tracker.votes_for_global_receipt_root(&root).len(), 3);
     }
 
     #[test]

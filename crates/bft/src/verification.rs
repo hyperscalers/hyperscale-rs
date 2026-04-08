@@ -5,7 +5,7 @@
 //! retaining control-flow decisions (voting, block rejection).
 
 use hyperscale_types::{
-    AbortIntent, AbortReason, Block, BlockHeader, BlockHeight, CommittedBlockHeader, Hash, NodeId,
+    AbortIntent, AbortReason, Block, BlockHeader, BlockHeight, CommittedBlockHeader, Hash,
     ShardGroupId,
 };
 use std::collections::{HashMap, HashSet};
@@ -37,25 +37,24 @@ struct PendingStateRootVerification {
     required_root: Hash,
     /// The state root claimed by the proposer (to verify against).
     expected_root: Hash,
-    /// Transaction hashes of the non-aborted certificates in the block.
-    cert_tx_hashes: Vec<Hash>,
-    /// Per-certificate declared nodes (parallel to cert_tx_hashes).
-    per_cert_declared_nodes: Vec<Vec<NodeId>>,
+    /// Wave ID hashes — the node state machine uses these to look up FinalizedWaves.
+    wave_id_hashes: Vec<Hash>,
     /// Block height (used as JVT version).
     block_height: u64,
 }
 
 /// State root verification that is ready to dispatch (JVT is at the correct root).
 ///
-/// The `NodeStateMachine` drains these after each BFT call, computes the
-/// `merged_updates` from the execution cache, and emits `VerifyStateRoot` actions.
+/// The `NodeStateMachine` drains these after each BFT call, attaches the
+/// `Arc<FinalizedWave>` data from execution state, and emits `VerifyStateRoot` actions.
 #[derive(Debug)]
 pub struct ReadyStateRootVerification {
     pub block_hash: Hash,
     pub parent_state_root: Hash,
     pub expected_root: Hash,
-    pub cert_tx_hashes: Vec<Hash>,
-    pub per_cert_declared_nodes: Vec<Vec<NodeId>>,
+    /// Wave ID hashes for this block's certificates — the node state machine
+    /// uses these to look up the corresponding `Arc<FinalizedWave>` from execution state.
+    pub wave_id_hashes: Vec<Hash>,
     pub block_height: u64,
 }
 
@@ -355,36 +354,19 @@ impl VerificationPipeline {
         block_hash: Hash,
         block: &Block,
         parent_state_root: Hash,
-        receipt_hashes: &[Hash],
     ) {
         let current_root = self.last_committed_jvt_root;
-        // receipt_hashes are the tx_hashes of non-aborted transactions from the
-        // block manifest. These identify which execution results contribute to
-        // the state root computation. With lean wave certs the block itself
-        // doesn't carry per-tx info, so the manifest provides it.
-        let cert_tx_hashes: Vec<Hash> = receipt_hashes.to_vec();
 
-        // Extract declared nodes for each certificate from the block's transactions.
-        let per_cert_declared_nodes: Vec<Vec<NodeId>> = cert_tx_hashes
+        // Collect wave_id hashes from the block's certificates. The node state
+        // machine uses these to look up Arc<FinalizedWave> from execution state
+        // when constructing the VerifyStateRoot action.
+        let wave_id_hashes: Vec<Hash> = block
+            .certificates
             .iter()
-            .map(|tx_hash| {
-                block
-                    .transactions
-                    .iter()
-                    .find(|tx| &tx.hash() == tx_hash)
-                    .map(|tx| {
-                        tx.declared_reads
-                            .iter()
-                            .chain(tx.declared_writes.iter())
-                            .copied()
-                            .collect()
-                    })
-                    .unwrap_or_default()
-            })
+            .map(|c| c.wave_id.hash())
             .collect();
 
         if current_root == parent_state_root {
-            // JVT is ready - mark as ready for dispatch
             debug!(
                 block_hash = ?block_hash,
                 certificate_count = block.certificates.len(),
@@ -400,12 +382,10 @@ impl VerificationPipeline {
                     block_hash,
                     parent_state_root,
                     expected_root: block.header.state_root,
-                    cert_tx_hashes,
-                    per_cert_declared_nodes,
+                    wave_id_hashes,
                     block_height: block.header.height.0,
                 });
         } else {
-            // JVT not ready - queue for later
             debug!(
                 block_hash = ?block_hash,
                 certificate_count = block.certificates.len(),
@@ -420,8 +400,7 @@ impl VerificationPipeline {
                 PendingStateRootVerification {
                     required_root: parent_state_root,
                     expected_root: block.header.state_root,
-                    cert_tx_hashes,
-                    per_cert_declared_nodes,
+                    wave_id_hashes,
                     block_height: block.header.height.0,
                 },
             );
@@ -810,8 +789,7 @@ impl VerificationPipeline {
                         block_hash,
                         parent_state_root: pv.required_root,
                         expected_root: pv.expected_root,
-                        cert_tx_hashes: pv.cert_tx_hashes,
-                        per_cert_declared_nodes: pv.per_cert_declared_nodes,
+                        wave_id_hashes: pv.wave_id_hashes,
                         block_height: pv.block_height,
                     });
             }

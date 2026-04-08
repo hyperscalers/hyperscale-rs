@@ -43,7 +43,7 @@ where
                         },
                         Box::new(move |result| match result {
                             Ok(resp) => {
-                                let (block_opt, qc_opt, ledger_receipts, execution_certificates) =
+                                let (block_opt, qc_opt, local_receipts, execution_certificates) =
                                     resp.into_parts();
                                 let block = match (block_opt, qc_opt) {
                                     (Some(b), Some(q)) => Some((b, q)),
@@ -59,13 +59,13 @@ where
                                     b.certificates.iter().any(|wc| wc.is_completed())
                                 });
                                 let receipts_complete =
-                                    !has_completed_certs || !ledger_receipts.is_empty();
+                                    !has_completed_certs || !local_receipts.is_empty();
 
                                 if receipts_complete {
                                     let _ = es.send(NodeInput::SyncBlockResponseReceived {
                                         height,
                                         block: Box::new(block),
-                                        ledger_receipts,
+                                        local_receipts,
                                         execution_certificates,
                                     });
                                 } else {

@@ -67,7 +67,7 @@ type ExecCertCache = Arc<Mutex<HashMap<(Hash, WaveId), Arc<ExecutionCertificate>
 /// Buffered sync data (receipts + ECs) for a block height.
 /// Consumed by the sync commit path for verification and atomic persistence.
 pub(crate) struct BufferedSyncResponse {
-    pub ledger_receipts: Vec<hyperscale_types::LedgerReceiptEntry>,
+    pub local_receipts: Vec<hyperscale_types::LocalReceiptEntry>,
     pub execution_certificates: Vec<hyperscale_types::ExecutionCertificate>,
 }
 
@@ -555,7 +555,7 @@ where
             NodeInput::SyncBlockResponseReceived {
                 height,
                 block,
-                ledger_receipts,
+                local_receipts,
                 execution_certificates,
             } => {
                 // Check 1: receipt_root verification (synchronous).
@@ -590,7 +590,7 @@ where
                         self.pending_sync_data.insert(
                             height,
                             BufferedSyncResponse {
-                                ledger_receipts,
+                                local_receipts,
                                 execution_certificates,
                             },
                         );

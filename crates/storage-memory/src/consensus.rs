@@ -4,9 +4,8 @@ use crate::core::SimStorage;
 
 use hyperscale_storage::ConsensusStore;
 use hyperscale_types::{
-    Block, BlockHeight, ExecutionCertificate, Hash, LedgerTransactionReceipt,
-    LocalTransactionExecution, QuorumCertificate, ReceiptBundle, RoutableTransaction, ShardGroupId,
-    WaveCertificate,
+    Block, BlockHeight, ExecutionCertificate, ExecutionOutput, Hash, LocalReceipt,
+    QuorumCertificate, ReceiptBundle, RoutableTransaction, ShardGroupId, WaveCertificate,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -119,28 +118,28 @@ impl ConsensusStore for SimStorage {
     fn store_receipt_bundle(&self, bundle: &ReceiptBundle) {
         let mut c = self.consensus.write().unwrap();
         let height = c.committed_height.0;
-        c.ledger_receipts
-            .insert(bundle.tx_hash, Arc::clone(&bundle.ledger_receipt));
+        c.local_receipts
+            .insert(bundle.tx_hash, Arc::clone(&bundle.local_receipt));
         c.receipt_heights.insert(bundle.tx_hash, height);
-        if let Some(ref local) = bundle.local_execution {
-            c.local_executions.insert(bundle.tx_hash, local.clone());
+        if let Some(ref local) = bundle.execution_output {
+            c.execution_outputs.insert(bundle.tx_hash, local.clone());
         }
     }
 
-    fn get_ledger_receipt(&self, tx_hash: &Hash) -> Option<Arc<LedgerTransactionReceipt>> {
+    fn get_local_receipt(&self, tx_hash: &Hash) -> Option<Arc<LocalReceipt>> {
         self.consensus
             .read()
             .unwrap()
-            .ledger_receipts
+            .local_receipts
             .get(tx_hash)
             .cloned()
     }
 
-    fn get_local_execution(&self, tx_hash: &Hash) -> Option<LocalTransactionExecution> {
+    fn get_execution_output(&self, tx_hash: &Hash) -> Option<ExecutionOutput> {
         self.consensus
             .read()
             .unwrap()
-            .local_executions
+            .execution_outputs
             .get(tx_hash)
             .cloned()
     }

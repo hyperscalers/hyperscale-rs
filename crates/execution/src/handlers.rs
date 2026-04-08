@@ -17,11 +17,11 @@ use std::collections::{HashMap, HashSet};
 /// signer bitfield using the committee's indices.
 ///
 /// `tx_outcomes` are extracted from the first vote — all quorum votes carry
-/// identical outcomes (they share the same receipt_root).
+/// identical outcomes (they share the same global_receipt_root).
 pub fn aggregate_execution_certificate(
     wave_id: &WaveId,
     _shard: ShardGroupId,
-    receipt_root: Hash,
+    global_receipt_root: Hash,
     votes: &[ExecutionVote],
     committee: &[ValidatorId],
 ) -> ExecutionCertificate {
@@ -60,7 +60,7 @@ pub fn aggregate_execution_certificate(
     ExecutionCertificate {
         vote_height,
         wave_id: wave_id.clone(),
-        receipt_root,
+        global_receipt_root,
         tx_outcomes,
         aggregated_signature,
         signers,
@@ -70,7 +70,7 @@ pub fn aggregate_execution_certificate(
 /// Batch verify execution votes.
 ///
 /// Uses BLS same-message batch verification since all votes in a wave
-/// should sign the same message (same receipt_root). Falls back to
+/// should sign the same message (same global_receipt_root). Falls back to
 /// individual verification on batch failure.
 ///
 /// Returns an iterator of `(vote, voting_power)` for verified votes.
@@ -89,7 +89,7 @@ pub fn batch_verify_execution_votes(
             vote.vote_height,
             &vote.wave_id,
             vote.shard_group_id,
-            &vote.receipt_root,
+            &vote.global_receipt_root,
             vote.tx_count,
         );
         by_message.entry(msg).or_default().push((vote, pk, power));
@@ -138,7 +138,7 @@ pub fn verify_execution_certificate_signature(
         certificate.vote_height,
         &certificate.wave_id,
         certificate.shard_group_id(),
-        &certificate.receipt_root,
+        &certificate.global_receipt_root,
         certificate.tx_outcomes.len() as u32,
     );
 
