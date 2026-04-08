@@ -12,10 +12,10 @@
 //! On each commit, the JVT is updated and a new state root hash is computed.
 
 mod blocks;
+mod chain_reader;
+mod chain_writer;
 pub(crate) mod column_families;
-mod commit;
 pub(crate) mod config;
-mod consensus;
 pub(crate) mod core;
 mod execution_certs;
 mod gc;

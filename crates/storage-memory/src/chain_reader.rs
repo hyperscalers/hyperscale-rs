@@ -1,15 +1,15 @@
-//! `ConsensusStore` implementation for `SimStorage`.
+//! `ChainReader` implementation for `SimStorage`.
 
 use crate::core::SimStorage;
 
-use hyperscale_storage::ConsensusStore;
+use hyperscale_storage::ChainReader;
 use hyperscale_types::{
     Block, BlockHeight, ExecutionCertificate, Hash, LocalReceipt, QuorumCertificate,
     RoutableTransaction, ShardGroupId, WaveCertificate,
 };
 use std::sync::Arc;
 
-impl ConsensusStore for SimStorage {
+impl ChainReader for SimStorage {
     fn get_block(&self, height: BlockHeight) -> Option<(Block, QuorumCertificate)> {
         self.consensus.read().unwrap().blocks.get(&height).cloned()
     }
@@ -66,18 +66,6 @@ impl ConsensusStore for SimStorage {
                     .collect()
             })
             .unwrap_or_default()
-    }
-
-    fn store_execution_certificates(&self, certs: &[ExecutionCertificate]) {
-        let mut c = self.consensus.write().unwrap();
-        for cert in certs {
-            let canonical_hash = cert.canonical_hash();
-            c.execution_certs.insert(canonical_hash, cert.clone());
-            c.execution_certs_by_height
-                .entry(cert.block_height())
-                .or_default()
-                .push(canonical_hash);
-        }
     }
 
     fn get_wave_certificate_for_tx(&self, tx_hash: &Hash) -> Option<WaveCertificate> {

@@ -12,8 +12,8 @@
 //! `jvt_version()` and `state_root_hash()` for state commitment. This ensures
 //! simulation has identical JVT behavior to production.
 
-mod commit;
-mod consensus;
+mod chain_reader;
+mod chain_writer;
 pub(crate) mod core;
 mod snapshot;
 mod state;

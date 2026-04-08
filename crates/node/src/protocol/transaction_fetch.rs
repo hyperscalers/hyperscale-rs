@@ -14,7 +14,7 @@
 use hyperscale_messages::request::GetTransactionsRequest;
 use hyperscale_messages::response::GetTransactionsResponse;
 use hyperscale_metrics as metrics;
-use hyperscale_storage::ConsensusStore;
+use hyperscale_storage::ChainReader;
 use hyperscale_types::{Hash, RoutableTransaction, ValidatorId};
 use quick_cache::sync::Cache as QuickCache;
 use serde::Serialize;
@@ -343,7 +343,7 @@ const MAX_ITEMS_PER_RESPONSE: usize = 500;
 /// Checks the in-memory cache first (for recently received but not yet
 /// committed transactions), then falls back to storage.
 pub fn serve_transaction_request(
-    storage: &impl ConsensusStore,
+    storage: &impl ChainReader,
     tx_cache: &QuickCache<Hash, Arc<RoutableTransaction>>,
     req: GetTransactionsRequest,
 ) -> GetTransactionsResponse {

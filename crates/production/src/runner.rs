@@ -53,7 +53,7 @@ use hyperscale_network_libp2p::Libp2pNetwork;
 use hyperscale_network_libp2p::{
     generate_random_keypair, Libp2pAdapter, Libp2pConfig, NetworkError,
 };
-use hyperscale_storage::{ConsensusStore, GenesisWrapper};
+use hyperscale_storage::{ChainReader, GenesisWrapper};
 use hyperscale_storage_rocksdb::{RocksDbStorage, SharedStorage};
 use quick_cache::sync::Cache as QuickCache;
 

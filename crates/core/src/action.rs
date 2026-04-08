@@ -165,13 +165,13 @@ pub enum Action {
         recipients: Vec<ValidatorId>,
     },
 
-    /// Persist an aggregated execution certificate for durable serving.
+    /// Track an aggregated execution certificate for serving and eventual commit.
     ///
     /// Emitted by all validators after cert aggregation (not just the wave
     /// leader). The io_loop stores these in the in-memory cache for
-    /// low-latency serving and accumulates them in `pending_ec_writes` for
+    /// low-latency serving and queues them in `pending_ec_writes` for
     /// atomic persistence in the next block commit's WriteBatch.
-    PersistExecutionCertificate {
+    TrackExecutionCertificate {
         certificate: Arc<ExecutionCertificate>,
     },
 
@@ -840,7 +840,7 @@ impl Action {
             // Network - Execution Layer (batchable)
             Action::SignAndSendExecutionVote { .. } => "SignAndSendExecutionVote",
             Action::BroadcastExecutionCertificate { .. } => "BroadcastExecutionCertificate",
-            Action::PersistExecutionCertificate { .. } => "PersistExecutionCertificate",
+            Action::TrackExecutionCertificate { .. } => "TrackExecutionCertificate",
             Action::BroadcastCommittedBlockHeader { .. } => "BroadcastCommittedBlockHeader",
 
             // Timers

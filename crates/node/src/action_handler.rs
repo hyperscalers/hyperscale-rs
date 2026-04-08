@@ -11,13 +11,13 @@
 use hyperscale_core::{Action, NodeInput, ProtocolEvent};
 use hyperscale_engine::RadixExecutor;
 use hyperscale_metrics as metrics;
-use hyperscale_storage::{CommitStore, ConsensusStore, SubstateStore};
+use hyperscale_storage::{ChainReader, ChainWriter, SubstateStore};
 use hyperscale_types::{ExecutionResult, Hash, ProvisionBatch, ShardGroupId, TxEntries};
 use std::sync::Arc;
 use tracing::warn;
 
 /// Context for executing delegated actions.
-pub(crate) struct ActionContext<'a, S: CommitStore + SubstateStore + ConsensusStore> {
+pub(crate) struct ActionContext<'a, S: ChainWriter + SubstateStore + ChainReader> {
     pub storage: &'a S,
     pub executor: &'a RadixExecutor,
     pub topology: &'a hyperscale_types::TopologySnapshot,
@@ -88,7 +88,7 @@ pub(crate) fn dispatch_pool_for(action: &Action) -> Option<DispatchPool> {
 /// The runner is responsible for additionally broadcasting votes to shard
 /// peers (network-specific).
 #[allow(clippy::too_many_lines)]
-pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + ConsensusStore>(
+pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainReader>(
     action: Action,
     ctx: &ActionContext<'_, S>,
 ) -> Option<DelegatedResult<S::PreparedCommit>> {
@@ -609,7 +609,7 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
 /// Expands declared account NodeIds to include their owned vaults before
 /// fetching. The remote shard needs vault substates (balances) to execute
 /// transfers, not just the account's own substates.
-fn fetch_entries_for_requests<S: CommitStore + SubstateStore + ConsensusStore>(
+fn fetch_entries_for_requests<S: ChainWriter + SubstateStore + ChainReader>(
     ctx: &ActionContext<'_, S>,
     requests: &[hyperscale_core::ProvisionRequest],
     source_shard: ShardGroupId,
@@ -647,7 +647,7 @@ fn fetch_entries_for_requests<S: CommitStore + SubstateStore + ConsensusStore>(
 }
 
 /// Group fetched entries by target shard and generate verkle proofs per shard.
-fn build_provision_batches<S: CommitStore + SubstateStore + ConsensusStore>(
+fn build_provision_batches<S: ChainWriter + SubstateStore + ChainReader>(
     ctx: &ActionContext<'_, S>,
     per_tx: Vec<(
         Hash,

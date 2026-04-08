@@ -11,7 +11,7 @@ use hyperscale_core::{Action, NodeInput, ProtocolEvent, StateMachine};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_metrics as metrics;
 use hyperscale_network::Network;
-use hyperscale_storage::{CommitStore, ConsensusStore, SubstateStore};
+use hyperscale_storage::{ChainReader, ChainWriter, SubstateStore};
 use hyperscale_types::ValidatorId;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -19,7 +19,7 @@ use tracing::{debug, warn};
 
 impl<S, N, D> IoLoop<S, N, D>
 where
-    S: CommitStore + SubstateStore + ConsensusStore + Send + Sync + 'static,
+    S: ChainWriter + SubstateStore + ChainReader + Send + Sync + 'static,
     N: Network,
     D: Dispatch + 'static,
 {
@@ -137,14 +137,12 @@ where
                 );
                 self.network.notify(&recipients, &batch);
             }
-            Action::PersistExecutionCertificate { certificate } => {
+            Action::TrackExecutionCertificate { certificate } => {
                 let block_height = certificate.block_height();
                 let key = (certificate.wave_id.hash(), certificate.wave_id.clone());
-                // Queue for atomic persistence in the next block commit WriteBatch.
-                self.pending_ec_writes
-                    .push(std::sync::Arc::unwrap_or_clone(certificate.clone()));
+                // Cache first (cheap Arc clone), then unwrap_or_clone for pending writes.
                 if let Ok(mut cache) = self.exec_cert_cache.lock() {
-                    cache.insert(key, certificate);
+                    cache.insert(key, Arc::clone(&certificate));
                     // Safety-net pruning: evict very old entries to bound memory.
                     if cache.len() > 2000 {
                         let cutoff = cache
@@ -156,6 +154,8 @@ where
                         cache.retain(|_, c| c.block_height() > cutoff);
                     }
                 }
+                // Queue for atomic persistence in the next block commit WriteBatch.
+                self.pending_ec_writes.push(certificate);
                 let _ = block_height;
             }
             // ═══════════════════════════════════════════════════════════
@@ -202,13 +202,16 @@ where
                 finalized_waves,
             } => {
                 self.accumulate_block_commit(super::PendingCommit::Consensus {
-                    block,
-                    qc,
+                    block: Arc::new(block),
+                    qc: Arc::new(qc),
                     finalized_waves,
                 });
             }
             Action::CommitSyncedBlock { block, qc } => {
-                self.accumulate_block_commit(super::PendingCommit::Synced { block, qc });
+                self.accumulate_block_commit(super::PendingCommit::Synced {
+                    block: Arc::new(block),
+                    qc: Arc::new(qc),
+                });
             }
             Action::EmitTransactionStatus {
                 tx_hash,
@@ -392,9 +395,6 @@ where
     /// up the backlog.
     pub(super) fn flush_block_commits(&mut self) {
         if self.pending_block_commits.is_empty() {
-            // Also flush any EC bundles that arrived after their block was
-            // already committed.
-            self.flush_pending_ecs();
             return;
         }
 
@@ -424,13 +424,8 @@ where
         if !has_non_empty {
             // All empty blocks — synchronous fast path.
             // Still advance JVT version so it matches block height.
-
-            // Flush any pending ECs that were accumulated from previous
-            // non-empty blocks — empty blocks don't carry ECs themselves,
-            // but late-arriving ECs must still be persisted.
-            if !pending_ecs.is_empty() {
-                self.storage.store_execution_certificates(&pending_ecs);
-            }
+            // Any pending ECs ride along with the first block's commit.
+            let mut remaining_ecs = pending_ecs;
 
             // Prune stale prepared_commits that outlived their blocks.
             let max_height = commits
@@ -450,15 +445,20 @@ where
                 let block_hash = block.hash();
                 let height = block.header.height.0;
                 let empty_updates = hyperscale_types::DatabaseUpdates::default();
-                let result = self
-                    .storage
-                    .commit_block(&empty_updates, &block, &qc, &[], &[]);
+                let ecs_for_this_block = std::mem::take(&mut remaining_ecs);
+                let result = self.storage.commit_block(
+                    &empty_updates,
+                    &block,
+                    &qc,
+                    &ecs_for_this_block,
+                    &[],
+                );
                 let _ =
                     self.event_sender
                         .send(NodeInput::Protocol(ProtocolEvent::BlockCommitted {
                             block_hash,
                             height,
-                            block,
+                            block: Arc::unwrap_or_clone(block),
                             state_root: result,
                         }));
             }
@@ -718,24 +718,11 @@ where
                 let _ = event_tx.send(NodeInput::Protocol(ProtocolEvent::BlockCommitted {
                     block_hash,
                     height: height.0,
-                    block,
+                    block: Arc::unwrap_or_clone(block),
                     state_root: result,
                 }));
             }
         });
-    }
-
-    /// Flush any pending EC writes that arrived after their block was already
-    /// committed (late-arriving ECs from async aggregation). Uses a standalone
-    /// `store_execution_certificates` (separate WriteBatch) since there's no
-    /// block commit to fold into. These ECs are already in the in-memory cache;
-    /// this flush just ensures durability for restart/sync serving.
-    pub(super) fn flush_pending_ecs(&mut self) {
-        if self.pending_ec_writes.is_empty() {
-            return;
-        }
-        let ecs = std::mem::take(&mut self.pending_ec_writes);
-        self.storage.store_execution_certificates(&ecs);
     }
 
     /// Process sync, fetch, and provision recovery actions.

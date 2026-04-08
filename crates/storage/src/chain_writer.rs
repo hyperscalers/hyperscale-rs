@@ -1,4 +1,4 @@
-//! Commit storage trait.
+//! Chain writer trait.
 //!
 //! Abstracts the prepare-then-commit pattern used by both runners.
 //! `prepare_block_commit` returns an opaque `PreparedCommit` handle that
@@ -6,6 +6,7 @@
 
 use hyperscale_types::{Block, ExecutionCertificate, Hash, QuorumCertificate, ReceiptBundle};
 use radix_substate_store_interface::interface::DatabaseUpdates;
+use std::sync::Arc;
 
 /// Abstracts state commitment for both simulation and production storage.
 ///
@@ -17,7 +18,7 @@ use radix_substate_store_interface::interface::DatabaseUpdates;
 ///    If no handle is available, `commit_block` recomputes from scratch.
 ///
 /// All methods take `&self` — implementations use interior mutability.
-pub trait CommitStore: Send + Sync {
+pub trait ChainWriter: Send + Sync {
     /// Opaque handle carrying precomputed commit work.
     ///
     /// For RocksDB this contains a `WriteBatch` + `JvtSnapshot`.
@@ -53,9 +54,9 @@ pub trait CommitStore: Send + Sync {
     fn commit_prepared_block(
         &self,
         prepared: Self::PreparedCommit,
-        block: &Block,
-        qc: &QuorumCertificate,
-        execution_certificates: &[ExecutionCertificate],
+        block: &Arc<Block>,
+        qc: &Arc<QuorumCertificate>,
+        execution_certificates: &[Arc<ExecutionCertificate>],
         receipts: &[ReceiptBundle],
     ) -> Hash;
 
@@ -68,9 +69,9 @@ pub trait CommitStore: Send + Sync {
     fn commit_block(
         &self,
         merged_updates: &DatabaseUpdates,
-        block: &Block,
-        qc: &QuorumCertificate,
-        execution_certificates: &[ExecutionCertificate],
+        block: &Arc<Block>,
+        qc: &Arc<QuorumCertificate>,
+        execution_certificates: &[Arc<ExecutionCertificate>],
         receipts: &[ReceiptBundle],
     ) -> Hash;
 

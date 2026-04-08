@@ -4,7 +4,7 @@
 //! algorithms, separated from dispatch (thread pool vs inline) and result
 //! delivery (channel vs event queue) concerns.
 
-use hyperscale_storage::{CommitStore, DatabaseUpdates, SubstateStore};
+use hyperscale_storage::{ChainWriter, DatabaseUpdates, SubstateStore};
 use hyperscale_types::{
     batch_verify_bls_same_message, compute_certificate_root, compute_local_receipt_root,
     compute_transaction_root, verify_bls12381_v1, AbortIntent, Block, BlockHeader, BlockHeight,
@@ -292,7 +292,7 @@ pub struct StateRootResult<P: Send> {
 /// Calls `storage.prepare_block_commit()` to compute the speculative state root
 /// from the certificates, then compares against the expected root. Returns the
 /// prepared commit handle for caching on success.
-pub fn verify_state_root<S: CommitStore>(
+pub fn verify_state_root<S: ChainWriter>(
     storage: &S,
     parent_state_root: Hash,
     expected_root: Hash,
@@ -336,7 +336,7 @@ pub struct ProposalResult<P: Send> {
 /// 5. Build BlockHeader + Block, hash it
 /// 6. Return block, hash, optional prepared commit handle
 #[allow(clippy::too_many_arguments)]
-pub fn build_proposal<S: CommitStore + SubstateStore>(
+pub fn build_proposal<S: ChainWriter + SubstateStore>(
     storage: &S,
     proposer: ValidatorId,
     height: BlockHeight,

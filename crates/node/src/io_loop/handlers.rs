@@ -9,12 +9,12 @@ use hyperscale_messages::{
     ExecutionVotesNotification, TransactionGossip,
 };
 use hyperscale_network::Network;
-use hyperscale_storage::{CommitStore, ConsensusStore, SubstateStore};
+use hyperscale_storage::{ChainReader, ChainWriter, SubstateStore};
 use tracing::warn;
 
 impl<S, N, D> IoLoop<S, N, D>
 where
-    S: CommitStore + SubstateStore + ConsensusStore + Send + Sync + 'static,
+    S: ChainWriter + SubstateStore + ChainReader + Send + Sync + 'static,
     N: Network,
     D: Dispatch + 'static,
 {

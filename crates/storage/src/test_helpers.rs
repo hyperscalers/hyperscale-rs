@@ -5,7 +5,8 @@
 //! storage-memory and storage-rocksdb tests can share a single source of truth.
 
 use crate::{
-    ConsensusStore, DatabaseUpdates, DbSortKey, NodeDatabaseUpdates, PartitionDatabaseUpdates,
+    ChainReader, ChainWriter, DatabaseUpdates, DbSortKey, NodeDatabaseUpdates,
+    PartitionDatabaseUpdates,
 };
 use hyperscale_types::{
     zero_bls_signature, ApplicationEvent, Block, BlockHeader, BlockHeight, Bls12381G2Signature,
@@ -177,16 +178,37 @@ pub fn make_test_execution_certificate(seed: u8, block_height: u64) -> Execution
     }
 }
 
-/// Shared EC roundtrip test: store → get by height.
-pub fn test_ec_storage_roundtrip(storage: &impl ConsensusStore) {
+/// Helper to commit empty blocks up to (but not including) the target height.
+fn commit_empty_blocks_up_to(storage: &(impl ChainReader + ChainWriter), target: u64) {
+    let empty = DatabaseUpdates::default();
+    for h in 0..target {
+        let b = make_test_block(h);
+        let q = make_test_qc(&b);
+        storage.commit_block(&empty, &Arc::new(b), &Arc::new(q), &[], &[]);
+    }
+}
+
+/// Shared EC roundtrip test: commit block with ECs → get by height.
+pub fn test_ec_storage_roundtrip(storage: &(impl ChainReader + ChainWriter)) {
     let ec = make_test_execution_certificate(1, 10);
     let canonical_hash = ec.canonical_hash();
 
     // Initially empty
     assert!(storage.get_execution_certificates_by_height(10).is_empty());
 
-    // Store and verify by height
-    storage.store_execution_certificates(std::slice::from_ref(&ec));
+    // Commit intermediate blocks, then block at height 10 carrying the EC
+    let empty = DatabaseUpdates::default();
+    commit_empty_blocks_up_to(storage, 10);
+    let block = make_test_block(10);
+    let qc = make_test_qc(&block);
+    storage.commit_block(
+        &empty,
+        &Arc::new(block),
+        &Arc::new(qc),
+        &[Arc::new(ec)],
+        &[],
+    );
+
     let by_height = storage.get_execution_certificates_by_height(10);
     assert_eq!(by_height.len(), 1);
     assert_eq!(by_height[0].block_height(), 10);
@@ -197,12 +219,39 @@ pub fn test_ec_storage_roundtrip(storage: &impl ConsensusStore) {
 }
 
 /// Shared EC batch test: multiple ECs at same and different heights.
-pub fn test_ec_storage_batch(storage: &impl ConsensusStore) {
+pub fn test_ec_storage_batch(storage: &(impl ChainReader + ChainWriter)) {
     let ec1 = make_test_execution_certificate(1, 10);
     let ec2 = make_test_execution_certificate(2, 10);
     let ec3 = make_test_execution_certificate(3, 20);
 
-    storage.store_execution_certificates(&[ec1.clone(), ec2.clone(), ec3.clone()]);
+    // Commit intermediate blocks, then block at height 10 with two ECs
+    let empty = DatabaseUpdates::default();
+    commit_empty_blocks_up_to(storage, 10);
+    let block10 = make_test_block(10);
+    let qc10 = make_test_qc(&block10);
+    storage.commit_block(
+        &empty,
+        &Arc::new(block10),
+        &Arc::new(qc10),
+        &[Arc::new(ec1), Arc::new(ec2)],
+        &[],
+    );
+
+    // Commit blocks 11-19, then block 20 with one EC
+    for h in 11..20 {
+        let b = make_test_block(h);
+        let q = make_test_qc(&b);
+        storage.commit_block(&empty, &Arc::new(b), &Arc::new(q), &[], &[]);
+    }
+    let block20 = make_test_block(20);
+    let qc20 = make_test_qc(&block20);
+    storage.commit_block(
+        &empty,
+        &Arc::new(block20),
+        &Arc::new(qc20),
+        &[Arc::new(ec3.clone())],
+        &[],
+    );
 
     // Both ECs at height 10
     let at_10 = storage.get_execution_certificates_by_height(10);

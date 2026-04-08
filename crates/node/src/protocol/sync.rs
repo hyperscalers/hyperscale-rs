@@ -16,7 +16,7 @@
 use hyperscale_messages::request::GetBlockRequest;
 use hyperscale_messages::response::GetBlockResponse;
 use hyperscale_metrics as metrics;
-use hyperscale_storage::ConsensusStore;
+use hyperscale_storage::ChainReader;
 use hyperscale_types::{Block, BlockHeight, Hash, QuorumCertificate, TopologySnapshot};
 use serde::Serialize;
 use std::cmp::Reverse;
@@ -377,7 +377,7 @@ impl SyncProtocol {
 /// in the block so the syncing peer can verify and apply state changes
 /// without re-executing. Returns not_found if any data is missing.
 pub fn serve_block_request(
-    storage: &impl ConsensusStore,
+    storage: &impl ChainReader,
     topology: &TopologySnapshot,
     req: GetBlockRequest,
 ) -> GetBlockResponse {

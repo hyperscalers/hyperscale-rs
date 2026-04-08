@@ -1,6 +1,6 @@
-//! Consensus storage trait.
+//! Chain reader trait.
 //!
-//! Abstracts block, certificate, vote, and metadata storage.
+//! Abstracts block, certificate, vote, and metadata reads.
 //! All methods take `&self` — implementations use interior mutability.
 
 use hyperscale_types::{
@@ -14,10 +14,10 @@ use std::sync::Arc;
 /// Provides a uniform interface for reading blocks, certificates, receipts,
 /// and chain metadata across different storage backends.
 ///
-/// Block and certificate writes happen atomically via `CommitStore`.
+/// Block and certificate writes happen atomically via `ChainWriter`.
 /// Vote persistence is not needed — in-memory tracking in BFT state
 /// is sufficient (nodes sync past voted heights on restart).
-pub trait ConsensusStore: Send + Sync {
+pub trait ChainReader: Send + Sync {
     /// Get a committed block by height.
     fn get_block(&self, height: BlockHeight) -> Option<(Block, QuorumCertificate)>;
 
@@ -51,17 +51,10 @@ pub trait ConsensusStore: Send + Sync {
     /// Retrieve the local receipt for a transaction.
     fn get_local_receipt(&self, tx_hash: &Hash) -> Option<Arc<LocalReceipt>>;
 
-    // ─── Execution Certificate Storage ───────────────────────────────────
+    // ─── Execution Certificate Reads ────────────────────────────────────
 
     /// Retrieve all execution certificates for a given block height.
     fn get_execution_certificates_by_height(&self, block_height: u64) -> Vec<ExecutionCertificate>;
-
-    /// Store execution certificates (standalone write, separate WriteBatch).
-    ///
-    /// Used for late-arriving ECs that complete after their block was already
-    /// committed. Not used on the primary commit path (which folds EC writes into
-    /// `commit_block`/`commit_prepared_block`).
-    fn store_execution_certificates(&self, certs: &[ExecutionCertificate]);
 
     // ─── Wave Certificate Indexes ─────────────────────────────────────────
 

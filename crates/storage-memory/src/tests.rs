@@ -4,12 +4,37 @@ use hyperscale_storage::test_helpers::{
     make_database_update, make_mapped_database_update, make_test_block, make_test_qc,
 };
 use hyperscale_storage::{
-    CommitStore, CommittableSubstateDatabase, ConsensusStore, DatabaseUpdate, DatabaseUpdates,
+    ChainReader, ChainWriter, CommittableSubstateDatabase, DatabaseUpdate, DatabaseUpdates,
     DbPartitionKey, DbSortKey, NodeDatabaseUpdates, PartitionDatabaseUpdates, SubstateDatabase,
     SubstateStore,
 };
 use hyperscale_types::{BlockHeight, Hash, NodeId};
 use std::sync::Arc;
+
+/// Helper: commit a block with given updates and no ECs/receipts.
+fn commit_with(
+    storage: &SimStorage,
+    updates: &DatabaseUpdates,
+    block: &hyperscale_types::Block,
+    qc: &hyperscale_types::QuorumCertificate,
+) -> Hash {
+    storage.commit_block(
+        updates,
+        &Arc::new(block.clone()),
+        &Arc::new(qc.clone()),
+        &[],
+        &[],
+    )
+}
+
+/// Helper: commit a block with empty updates and no ECs/receipts.
+fn commit_empty(
+    storage: &SimStorage,
+    block: &hyperscale_types::Block,
+    qc: &hyperscale_types::QuorumCertificate,
+) -> Hash {
+    commit_with(storage, &DatabaseUpdates::default(), block, qc)
+}
 
 #[test]
 fn test_basic_substate_operations() {
@@ -177,7 +202,7 @@ fn test_block_storage_and_retrieval() {
 
     assert!(storage.get_block(BlockHeight(1)).is_none());
 
-    storage.commit_block(&DatabaseUpdates::default(), &block, &qc, &[], &[]);
+    commit_empty(&storage, &block, &qc);
 
     let (stored_block, stored_qc) = storage.get_block(BlockHeight(1)).unwrap();
     assert_eq!(stored_block.header.height, BlockHeight(1));
@@ -204,7 +229,7 @@ fn test_get_block_for_sync() {
     let storage = SimStorage::new();
     let block = make_test_block(1);
     let qc = make_test_qc(&block);
-    storage.commit_block(&DatabaseUpdates::default(), &block, &qc, &[], &[]);
+    commit_empty(&storage, &block, &qc);
 
     let result = storage.get_block_for_sync(BlockHeight(1));
     assert!(result.is_some());
@@ -230,7 +255,7 @@ fn test_transactions_batch_with_indexed_block() {
     block.transactions = vec![tx];
 
     let qc = make_test_qc(&block);
-    storage.commit_block(&DatabaseUpdates::default(), &block, &qc, &[], &[]);
+    commit_empty(&storage, &block, &qc);
 
     let result = storage.get_transactions_batch(&[tx_hash]);
     assert_eq!(result.len(), 1);
@@ -318,7 +343,7 @@ fn test_empty_commit_still_advances_version() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// CommitStore
+// ChainWriter
 // ═══════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -328,7 +353,7 @@ fn test_commit_block_single() {
     let block = make_test_block(1);
     let qc = make_test_qc(&block);
 
-    let result = storage.commit_block(&updates, &block, &qc, &[], &[]);
+    let result = commit_with(&storage, &updates, &block, &qc);
     assert_ne!(result, Hash::ZERO);
 }
 
@@ -341,7 +366,7 @@ fn test_commit_block_multiple_updates() {
     let block = make_test_block(1);
     let qc = make_test_qc(&block);
 
-    let result = storage.commit_block(&merged, &block, &qc, &[], &[]);
+    let result = commit_with(&storage, &merged, &block, &qc);
     assert_ne!(result, Hash::ZERO);
 }
 
@@ -350,7 +375,7 @@ fn test_commit_block_empty() {
     let storage = SimStorage::new();
     let block = make_test_block(1);
     let qc = make_test_qc(&block);
-    storage.commit_block(&DatabaseUpdates::default(), &block, &qc, &[], &[]);
+    commit_empty(&storage, &block, &qc);
     // Empty block: JVT version still advances to block_height
     assert_eq!(storage.jvt_version(), 1);
 }
@@ -368,10 +393,16 @@ fn test_prepare_then_commit_fast_path() {
     let parent_root = s_prepared.state_root_hash();
     let (spec_root, prepared) =
         s_prepared.prepare_block_commit(parent_root, &DatabaseUpdates::default(), 1);
-    let result_prepared = s_prepared.commit_prepared_block(prepared, &block, &qc, &[], &[]);
+    let result_prepared = s_prepared.commit_prepared_block(
+        prepared,
+        &Arc::new(block.clone()),
+        &Arc::new(qc.clone()),
+        &[],
+        &[],
+    );
 
     // Direct path
-    let result_direct = s_direct.commit_block(&DatabaseUpdates::default(), &block, &qc, &[], &[]);
+    let result_direct = commit_empty(&s_direct, &block, &qc);
 
     assert_eq!(result_prepared, result_direct);
     assert_eq!(spec_root, result_prepared);
@@ -386,7 +417,7 @@ fn test_prepare_commit_state_root_matches() {
     let parent_root = storage.state_root_hash();
     let (spec_root, prepared) =
         storage.prepare_block_commit(parent_root, &DatabaseUpdates::default(), 1);
-    let result = storage.commit_prepared_block(prepared, &block, &qc, &[], &[]);
+    let result = storage.commit_prepared_block(prepared, &Arc::new(block), &Arc::new(qc), &[], &[]);
 
     assert_eq!(spec_root, result);
 }
@@ -434,15 +465,13 @@ fn test_list_substates_for_node_at_height_returns_historical_data() {
     let updates1 = make_mapped_database_update(1, 0, vec![10], vec![100]);
     let block1 = make_test_block(1);
     let qc1 = make_test_qc(&block1);
-    let result1 = storage.commit_block(&updates1, &block1, &qc1, &[], &[]);
-    let root_v1 = result1;
+    let root_v1 = commit_with(&storage, &updates1, &block1, &qc1);
 
     // Block height 2: overwrite with value [200]
     let updates2 = make_mapped_database_update(1, 0, vec![10], vec![200]);
     let block2 = make_test_block(2);
     let qc2 = make_test_qc(&block2);
-    let result2 = storage.commit_block(&updates2, &block2, &qc2, &[], &[]);
-    let root_v2 = result2;
+    let root_v2 = commit_with(&storage, &updates2, &block2, &qc2);
     assert_ne!(root_v1, root_v2, "roots must differ after overwrite");
 
     // Read at version 1: should get the original value [100]

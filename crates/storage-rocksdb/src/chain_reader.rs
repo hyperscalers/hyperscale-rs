@@ -1,4 +1,4 @@
-//! `ConsensusStore` implementation for `RocksDbStorage`.
+//! `ChainReader` implementation for `RocksDbStorage`.
 
 use crate::core::RocksDbStorage;
 use crate::typed_cf::TypedCf;
@@ -9,7 +9,7 @@ use hyperscale_types::{
 };
 use std::sync::Arc;
 
-impl hyperscale_storage::ConsensusStore for RocksDbStorage {
+impl hyperscale_storage::ChainReader for RocksDbStorage {
     fn get_block(&self, height: BlockHeight) -> Option<(Block, QuorumCertificate)> {
         self.get_block_denormalized(height)
     }
@@ -52,19 +52,6 @@ impl hyperscale_storage::ConsensusStore for RocksDbStorage {
             self.cf_get::<crate::column_families::ExecutionCertsCf>(&canonical_hash)
         })
         .collect()
-    }
-
-    fn store_execution_certificates(&self, certs: &[ExecutionCertificate]) {
-        if certs.is_empty() {
-            return;
-        }
-        let mut batch = rocksdb::WriteBatch::default();
-        crate::execution_certs::append_execution_certs_to_batch(self, &mut batch, certs);
-        let mut write_opts = rocksdb::WriteOptions::default();
-        write_opts.set_sync(true);
-        self.db
-            .write_opt(batch, &write_opts)
-            .expect("BFT SAFETY CRITICAL: EC write failed");
     }
 
     fn get_wave_certificate_for_tx(&self, _tx_hash: &Hash) -> Option<WaveCertificate> {

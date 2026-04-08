@@ -914,7 +914,7 @@ impl ExecutionState {
 
         // Cache the cert in io_loop for fallback serving — any node can serve
         // requests from remote shards if the wave leader fails.
-        actions.push(Action::PersistExecutionCertificate {
+        actions.push(Action::TrackExecutionCertificate {
             certificate: Arc::clone(&certificate),
         });
 
@@ -1066,7 +1066,7 @@ impl ExecutionState {
         if shard == topology.local_shard() {
             self.waves_with_ec.insert(certificate.wave_id.clone());
             let cert_arc = Arc::new(certificate.clone());
-            actions.push(Action::PersistExecutionCertificate {
+            actions.push(Action::TrackExecutionCertificate {
                 certificate: cert_arc.clone(),
             });
 

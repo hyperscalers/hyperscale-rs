@@ -5,12 +5,23 @@ use hyperscale_storage::test_helpers::{
     make_test_wave_certificate,
 };
 use hyperscale_storage::{
-    CommitStore, ConsensusStore, DatabaseUpdate, DatabaseUpdates, DbPartitionKey, DbSortKey,
+    ChainReader, ChainWriter, DatabaseUpdate, DatabaseUpdates, DbPartitionKey, DbSortKey,
     NodeDatabaseUpdates, PartitionDatabaseUpdates, SubstateDatabase, SubstateStore,
 };
 use hyperscale_types::{BlockHeight, Hash, QuorumCertificate, ShardGroupId};
 use std::sync::Arc;
 use tempfile::TempDir;
+
+/// Helper: commit a block with empty updates and no ECs/receipts.
+fn commit_empty(storage: &RocksDbStorage, block: &hyperscale_types::Block, qc: &QuorumCertificate) {
+    storage.commit_block(
+        &Default::default(),
+        &Arc::new(block.clone()),
+        &Arc::new(qc.clone()),
+        &[],
+        &[],
+    );
+}
 
 #[test]
 fn test_basic_substate_operations() {
@@ -155,7 +166,7 @@ fn test_block_storage_and_retrieval() {
 
     assert!(storage.get_block(BlockHeight(1)).is_none());
 
-    storage.commit_block(&Default::default(), &block, &qc, &[], &[]);
+    commit_empty(&storage, &block, &qc);
 
     let (stored_block, stored_qc) = storage.get_block(BlockHeight(1)).unwrap();
     assert_eq!(stored_block.header.height, BlockHeight(1));
@@ -171,7 +182,7 @@ fn test_block_range_retrieval() {
     for h in 1..=5u64 {
         let block = make_test_block(h);
         let qc = make_test_qc(&block);
-        storage.commit_block(&Default::default(), &block, &qc, &[], &[]);
+        commit_empty(&storage, &block, &qc);
     }
 
     let blocks = storage.get_blocks_range(BlockHeight(2), BlockHeight(5));
@@ -290,7 +301,7 @@ fn test_state_root_changes_on_commit() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// CommitStore
+// ChainWriter
 // ═══════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -302,7 +313,7 @@ fn test_commit_block_applies_writes() {
     let block = make_test_block(1);
     let qc = make_test_qc(&block);
 
-    let result = storage.commit_block(&updates, &block, &qc, &[], &[]);
+    let result = storage.commit_block(&updates, &Arc::new(block), &Arc::new(qc), &[], &[]);
     assert_ne!(result, Hash::ZERO);
 }
 
@@ -317,7 +328,7 @@ fn test_commit_block_multiple_certs() {
     let block = make_test_block(1);
     let qc = make_test_qc(&block);
 
-    let result = storage.commit_block(&merged, &block, &qc, &[], &[]);
+    let result = storage.commit_block(&merged, &Arc::new(block), &Arc::new(qc), &[], &[]);
     assert_ne!(result, Hash::ZERO);
 }
 
@@ -329,7 +340,13 @@ fn test_commit_block_empty_certs() {
     let block = make_test_block(1);
     let qc = make_test_qc(&block);
 
-    storage.commit_block(&DatabaseUpdates::default(), &block, &qc, &[], &[]);
+    storage.commit_block(
+        &DatabaseUpdates::default(),
+        &Arc::new(block),
+        &Arc::new(qc),
+        &[],
+        &[],
+    );
     assert_eq!(storage.jvt_version(), 1);
 }
 
@@ -342,13 +359,20 @@ fn test_prepare_then_commit_matches_direct() {
         s_prepared.prepare_block_commit(parent_root, &DatabaseUpdates::default(), 1);
     let block = make_test_block(1);
     let qc = make_test_qc(&block);
-    let result_prepared = s_prepared.commit_prepared_block(prepared, &block, &qc, &[], &[]);
+    let result_prepared =
+        s_prepared.commit_prepared_block(prepared, &Arc::new(block), &Arc::new(qc), &[], &[]);
 
     let temp_dir2 = TempDir::new().unwrap();
     let s_direct = RocksDbStorage::open(temp_dir2.path()).unwrap();
     let block2 = make_test_block(1);
     let qc2 = make_test_qc(&block2);
-    let result_direct = s_direct.commit_block(&DatabaseUpdates::default(), &block2, &qc2, &[], &[]);
+    let result_direct = s_direct.commit_block(
+        &DatabaseUpdates::default(),
+        &Arc::new(block2),
+        &Arc::new(qc2),
+        &[],
+        &[],
+    );
 
     assert_eq!(result_prepared, result_direct);
     assert_eq!(spec_root, result_prepared);
@@ -368,7 +392,13 @@ fn test_commit_block_stores_certificates() {
     block.certificates = vec![cert];
     let qc = make_test_qc(&block);
 
-    let _ = storage.commit_block(&DatabaseUpdates::default(), &block, &qc, &[], &[]);
+    let _ = storage.commit_block(
+        &DatabaseUpdates::default(),
+        &Arc::new(block),
+        &Arc::new(qc),
+        &[],
+        &[],
+    );
 
     assert!(storage.get_certificate(&wave_hash).is_some());
 }
@@ -487,7 +517,7 @@ fn test_get_block_for_sync() {
 
     let block = make_test_block(1);
     let qc = make_test_qc(&block);
-    storage.commit_block(&Default::default(), &block, &qc, &[], &[]);
+    commit_empty(&storage, &block, &qc);
 
     let result = storage.get_block_for_sync(BlockHeight(1));
     assert!(result.is_some());
@@ -576,7 +606,7 @@ fn test_blocks_survive_reopen() {
         let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
         let block = make_test_block(1);
         let qc = make_test_qc(&block);
-        storage.commit_block(&Default::default(), &block, &qc, &[], &[]);
+        commit_empty(&storage, &block, &qc);
     }
 
     {
@@ -636,18 +666,30 @@ fn test_ec_storage_batch() {
 #[test]
 fn test_ec_survives_reopen() {
     let temp_dir = TempDir::new().unwrap();
-    let ec = hyperscale_storage::test_helpers::make_test_execution_certificate(1, 10);
+    let ec = hyperscale_storage::test_helpers::make_test_execution_certificate(1, 1);
 
     {
         let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
-        storage.store_execution_certificates(std::slice::from_ref(&ec));
+        let empty = DatabaseUpdates::default();
+        let block = hyperscale_storage::test_helpers::make_test_block(0);
+        let qc = hyperscale_storage::test_helpers::make_test_qc(&block);
+        storage.commit_block(&empty, &Arc::new(block), &Arc::new(qc), &[], &[]);
+        let block = hyperscale_storage::test_helpers::make_test_block(1);
+        let qc = hyperscale_storage::test_helpers::make_test_qc(&block);
+        storage.commit_block(
+            &empty,
+            &Arc::new(block),
+            &Arc::new(qc),
+            &[Arc::new(ec)],
+            &[],
+        );
     }
 
     {
         let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
-        let by_height = storage.get_execution_certificates_by_height(10);
+        let by_height = storage.get_execution_certificates_by_height(1);
         assert_eq!(by_height.len(), 1);
-        assert_eq!(by_height[0].block_height(), 10);
+        assert_eq!(by_height[0].block_height(), 1);
     }
 }
 
@@ -661,7 +703,13 @@ fn test_ec_atomic_with_block_commit() {
     let qc = make_test_qc(&block);
 
     // Commit block with EC atomically
-    storage.commit_block(&DatabaseUpdates::default(), &block, &qc, &[ec], &[]);
+    storage.commit_block(
+        &DatabaseUpdates::default(),
+        &Arc::new(block),
+        &Arc::new(qc),
+        &[Arc::new(ec)],
+        &[],
+    );
 
     // EC should be retrievable by height
     let by_height = storage.get_execution_certificates_by_height(1);

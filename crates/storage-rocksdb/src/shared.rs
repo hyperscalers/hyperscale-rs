@@ -8,7 +8,7 @@
 //! CommittableSubstateDatabase) for `Arc<RocksDbStorage>` directly.
 //! This newtype sidesteps that while providing zero-cost delegation.
 
-use crate::commit::RocksDbPreparedCommit;
+use crate::chain_writer::RocksDbPreparedCommit;
 use crate::core::RocksDbStorage;
 use crate::snapshot::RocksDbSnapshot;
 
@@ -118,7 +118,7 @@ impl SubstateStore for SharedStorage {
     }
 }
 
-impl hyperscale_storage::CommitStore for SharedStorage {
+impl hyperscale_storage::ChainWriter for SharedStorage {
     type PreparedCommit = RocksDbPreparedCommit;
 
     fn prepare_block_commit(
@@ -134,9 +134,9 @@ impl hyperscale_storage::CommitStore for SharedStorage {
     fn commit_prepared_block(
         &self,
         prepared: Self::PreparedCommit,
-        block: &hyperscale_types::Block,
-        qc: &hyperscale_types::QuorumCertificate,
-        execution_certificates: &[hyperscale_types::ExecutionCertificate],
+        block: &Arc<hyperscale_types::Block>,
+        qc: &Arc<hyperscale_types::QuorumCertificate>,
+        execution_certificates: &[Arc<hyperscale_types::ExecutionCertificate>],
         receipts: &[hyperscale_types::ReceiptBundle],
     ) -> hyperscale_types::Hash {
         self.0
@@ -146,9 +146,9 @@ impl hyperscale_storage::CommitStore for SharedStorage {
     fn commit_block(
         &self,
         merged_updates: &DatabaseUpdates,
-        block: &hyperscale_types::Block,
-        qc: &hyperscale_types::QuorumCertificate,
-        execution_certificates: &[hyperscale_types::ExecutionCertificate],
+        block: &Arc<hyperscale_types::Block>,
+        qc: &Arc<hyperscale_types::QuorumCertificate>,
+        execution_certificates: &[Arc<hyperscale_types::ExecutionCertificate>],
         receipts: &[hyperscale_types::ReceiptBundle],
     ) -> hyperscale_types::Hash {
         self.0
@@ -164,7 +164,7 @@ impl hyperscale_storage::CommitStore for SharedStorage {
     }
 }
 
-impl hyperscale_storage::ConsensusStore for SharedStorage {
+impl hyperscale_storage::ChainReader for SharedStorage {
     fn get_block(&self, height: BlockHeight) -> Option<(Block, QuorumCertificate)> {
         self.0.get_block(height)
     }
@@ -202,10 +202,6 @@ impl hyperscale_storage::ConsensusStore for SharedStorage {
         block_height: u64,
     ) -> Vec<hyperscale_types::ExecutionCertificate> {
         self.0.get_execution_certificates_by_height(block_height)
-    }
-
-    fn store_execution_certificates(&self, certs: &[hyperscale_types::ExecutionCertificate]) {
-        self.0.store_execution_certificates(certs)
     }
 
     fn get_wave_certificate_for_tx(&self, tx_hash: &Hash) -> Option<WaveCertificate> {

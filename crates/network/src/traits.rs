@@ -114,7 +114,7 @@ impl<R: Request, F: Fn(R) -> R::Response + Send + Sync + 'static> RequestHandler
 ///
 /// Generic methods make this NOT object-safe — use `N: Network` bounds.
 /// This is consistent with how storage and dispatch are already used:
-/// `ActionContext<S: CommitStore + SubstateStore, D: Dispatch>`.
+/// `ActionContext<S: ChainWriter + SubstateStore, D: Dispatch>`.
 ///
 /// All sends are fire-and-forget. Responses to requests arrive via callback.
 pub trait Network: Send + Sync {

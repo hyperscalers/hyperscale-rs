@@ -9,6 +9,7 @@ use crate::core::RocksDbStorage;
 
 use hyperscale_types::ExecutionCertificate;
 use rocksdb::WriteBatch;
+use std::sync::Arc;
 
 /// Append execution certificate writes to an existing `WriteBatch`.
 ///
@@ -17,7 +18,7 @@ use rocksdb::WriteBatch;
 pub(crate) fn append_execution_certs_to_batch(
     storage: &RocksDbStorage,
     batch: &mut WriteBatch,
-    certs: &[ExecutionCertificate],
+    certs: &[Arc<ExecutionCertificate>],
 ) {
     for cert in certs {
         let canonical_hash = cert.canonical_hash();

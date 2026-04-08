@@ -42,7 +42,7 @@ use hyperscale_engine::{RadixExecutor, TransactionValidation};
 use hyperscale_messages::TransactionGossip;
 use hyperscale_metrics as metrics;
 use hyperscale_network::Network;
-use hyperscale_storage::{CommitStore, ConsensusStore, SubstateStore};
+use hyperscale_storage::{ChainReader, ChainWriter, SubstateStore};
 use hyperscale_types::{
     Block, Bls12381G1PrivateKey, Bls12381G1PublicKey, CommittedBlockHeader, ExecutionCertificate,
     FinalizedWave, Hash, QuorumCertificate, RoutableTransaction, ShardGroupId, TopologySnapshot,
@@ -62,12 +62,15 @@ pub(crate) enum PendingCommit {
     /// Consensus path: receipts come from locally-executed finalized waves.
     /// The io_loop uses the `PreparedCommit` from `VerifyStateRoot`.
     Consensus {
-        block: Block,
-        qc: QuorumCertificate,
+        block: Arc<Block>,
+        qc: Arc<QuorumCertificate>,
         finalized_waves: Vec<Arc<FinalizedWave>>,
     },
     /// Sync path: receipts and ECs come from `pending_sync_data`.
-    Synced { block: Block, qc: QuorumCertificate },
+    Synced {
+        block: Arc<Block>,
+        qc: Arc<QuorumCertificate>,
+    },
 }
 
 impl PendingCommit {
@@ -95,7 +98,7 @@ type ExecCertCache = Arc<Mutex<HashMap<(Hash, WaveId), Arc<ExecutionCertificate>
 /// Consumed by the sync commit path for verification and atomic persistence.
 pub(crate) struct BufferedSyncResponse {
     pub local_receipts: Vec<hyperscale_types::LocalReceiptEntry>,
-    pub execution_certificates: Vec<hyperscale_types::ExecutionCertificate>,
+    pub execution_certificates: Vec<Arc<hyperscale_types::ExecutionCertificate>>,
 }
 
 /// Default certificate cache capacity.
@@ -173,12 +176,12 @@ pub struct NodeStatusSnapshot {
 /// Unified I/O loop that processes all actions from the state machine.
 ///
 /// Generic over:
-/// - `S`: Storage (CommitStore + SubstateStore + ConsensusStore)
+/// - `S`: Storage (ChainWriter + SubstateStore + ChainReader)
 /// - `N`: Network (message sending)
 /// - `D`: Dispatch (thread pool work scheduling)
 pub struct IoLoop<S, N, D>
 where
-    S: CommitStore + SubstateStore + ConsensusStore,
+    S: ChainWriter + SubstateStore + ChainReader,
     D: Dispatch,
 {
     // Core components
@@ -263,7 +266,7 @@ where
 
     // Pending EC writes — accumulated during a step, drained into the block
     // commit WriteBatch for atomic persistence (D4: one fsync per block).
-    pending_ec_writes: Vec<hyperscale_types::ExecutionCertificate>,
+    pending_ec_writes: Vec<Arc<hyperscale_types::ExecutionCertificate>>,
 
     // Sync data buffer: holds receipts and ECs from sync responses, keyed
     // by block height. Consumed by the sync path in flush_block_commits
@@ -282,7 +285,7 @@ where
 
 impl<S, N, D> IoLoop<S, N, D>
 where
-    S: CommitStore + SubstateStore + ConsensusStore + Send + Sync + 'static,
+    S: ChainWriter + SubstateStore + ChainReader + Send + Sync + 'static,
     N: Network,
     D: Dispatch + 'static,
 {
@@ -612,7 +615,10 @@ where
                             height,
                             BufferedSyncResponse {
                                 local_receipts,
-                                execution_certificates,
+                                execution_certificates: execution_certificates
+                                    .into_iter()
+                                    .map(Arc::new)
+                                    .collect(),
                             },
                         );
                     }
@@ -1101,11 +1107,6 @@ where
     /// Called during shutdown or when immediate delivery is needed.
     pub fn flush_all_batches(&mut self) {
         self.flush_block_commits();
-
-        // When commit_in_flight is true, flush_block_commits returns
-        // without draining ECs — flush them independently here.
-        self.flush_pending_ecs();
-
         self.flush_validation_batch();
         self.flush_committed_header_verifications();
     }

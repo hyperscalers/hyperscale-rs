@@ -1,11 +1,12 @@
-//! `CommitStore` implementation for `SimStorage`.
+//! `ChainWriter` implementation for `SimStorage`.
 
 use crate::core::SimStorage;
 use crate::state::apply_updates_to_ordmap;
 
-use hyperscale_storage::{CommitStore, DatabaseUpdates, JvtSnapshot};
+use hyperscale_storage::{ChainWriter, DatabaseUpdates, JvtSnapshot};
 use hyperscale_types::{Hash, ReceiptBundle};
 use im::OrdMap;
+use std::sync::Arc;
 
 /// Precomputed commit work for a SimStorage block commit.
 ///
@@ -21,7 +22,7 @@ pub struct SimPreparedCommit {
     merged_updates: DatabaseUpdates,
 }
 
-impl CommitStore for SimStorage {
+impl ChainWriter for SimStorage {
     type PreparedCommit = SimPreparedCommit;
 
     fn prepare_block_commit(
@@ -80,9 +81,9 @@ impl CommitStore for SimStorage {
     fn commit_prepared_block(
         &self,
         prepared: Self::PreparedCommit,
-        block: &hyperscale_types::Block,
-        qc: &hyperscale_types::QuorumCertificate,
-        _execution_certificates: &[hyperscale_types::ExecutionCertificate],
+        block: &Arc<hyperscale_types::Block>,
+        qc: &Arc<hyperscale_types::QuorumCertificate>,
+        execution_certificates: &[Arc<hyperscale_types::ExecutionCertificate>],
         receipts: &[ReceiptBundle],
     ) -> Hash {
         let block_height = prepared.snapshot.new_version;
@@ -117,7 +118,7 @@ impl CommitStore for SimStorage {
                     c.transactions.insert(tx.hash(), tx.as_ref().clone());
                 }
                 c.blocks
-                    .insert(block.header.height, (block.clone(), qc.clone()));
+                    .insert(block.header.height, ((**block).clone(), (**qc).clone()));
                 for cert in &block.certificates {
                     let wave_id_hash = cert.wave_id.hash();
                     c.certificates.insert(wave_id_hash, (**cert).clone());
@@ -134,24 +135,38 @@ impl CommitStore for SimStorage {
                             .insert(bundle.tx_hash, exec_output.clone());
                     }
                 }
+                for cert in execution_certificates {
+                    let canonical_hash = cert.canonical_hash();
+                    c.execution_certs.insert(canonical_hash, (**cert).clone());
+                    c.execution_certs_by_height
+                        .entry(cert.block_height())
+                        .or_default()
+                        .push(canonical_hash);
+                }
                 c.committed_height = block.header.height;
                 c.committed_hash = Some(block.hash());
-                c.committed_qc = Some(qc.clone());
+                c.committed_qc = Some((**qc).clone());
                 c.prune_receipts(block.header.height.0);
 
                 return result_root;
             }
         }
 
-        self.commit_block(&prepared.merged_updates, block, qc, &[], receipts)
+        self.commit_block(
+            &prepared.merged_updates,
+            block,
+            qc,
+            execution_certificates,
+            receipts,
+        )
     }
 
     fn commit_block(
         &self,
         merged_updates: &DatabaseUpdates,
-        block: &hyperscale_types::Block,
-        qc: &hyperscale_types::QuorumCertificate,
-        _execution_certificates: &[hyperscale_types::ExecutionCertificate],
+        block: &Arc<hyperscale_types::Block>,
+        qc: &Arc<hyperscale_types::QuorumCertificate>,
+        execution_certificates: &[Arc<hyperscale_types::ExecutionCertificate>],
         receipts: &[ReceiptBundle],
     ) -> Hash {
         let block_height = block.header.height.0;
@@ -211,7 +226,7 @@ impl CommitStore for SimStorage {
                 c.transactions.insert(tx.hash(), tx.as_ref().clone());
             }
             c.blocks
-                .insert(block.header.height, (block.clone(), qc.clone()));
+                .insert(block.header.height, ((**block).clone(), (**qc).clone()));
             for cert in &block.certificates {
                 let wave_id_hash = cert.wave_id.hash();
                 c.certificates.insert(wave_id_hash, (**cert).clone());
@@ -229,9 +244,18 @@ impl CommitStore for SimStorage {
                         .insert(bundle.tx_hash, exec_output.clone());
                 }
             }
+            // Store execution certificates atomically with block commit.
+            for cert in execution_certificates {
+                let canonical_hash = cert.canonical_hash();
+                c.execution_certs.insert(canonical_hash, (**cert).clone());
+                c.execution_certs_by_height
+                    .entry(cert.block_height())
+                    .or_default()
+                    .push(canonical_hash);
+            }
             c.committed_height = block.header.height;
             c.committed_hash = Some(block.hash());
-            c.committed_qc = Some(qc.clone());
+            c.committed_qc = Some((**qc).clone());
             c.prune_receipts(block.header.height.0);
         }
 

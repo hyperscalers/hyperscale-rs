@@ -15,7 +15,7 @@ use hyperscale_network_memory::{
 };
 use hyperscale_node::io_loop::{IoLoop, StepOutput};
 use hyperscale_node::{NodeConfig, NodeStateMachine, TimerOp};
-use hyperscale_storage::{ConsensusStore, GenesisWrapper};
+use hyperscale_storage::{ChainReader, GenesisWrapper};
 use hyperscale_storage_memory::SimStorage;
 use hyperscale_topology::TopologyState;
 use hyperscale_types::{

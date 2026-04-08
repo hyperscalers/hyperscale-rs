@@ -14,7 +14,7 @@
 use hyperscale_messages::request::GetProvisionsRequest;
 use hyperscale_messages::response::GetProvisionsResponse;
 use hyperscale_metrics as metrics;
-use hyperscale_storage::{ConsensusStore, SubstateStore};
+use hyperscale_storage::{ChainReader, SubstateStore};
 use hyperscale_types::{BlockHeight, ProvisionBatch, ShardGroupId, StateProvision, ValidatorId};
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
@@ -404,7 +404,7 @@ impl ProvisionFetchProtocol {
 /// Takes `local_shard` and `num_shards` instead of `&TopologyState`
 /// to avoid topology dependency in the I/O layer.
 pub fn serve_provision_request(
-    storage: &(impl ConsensusStore + SubstateStore),
+    storage: &(impl ChainReader + SubstateStore),
     local_shard: ShardGroupId,
     num_shards: u64,
     req: GetProvisionsRequest,

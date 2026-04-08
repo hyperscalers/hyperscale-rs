@@ -10,13 +10,13 @@ use hyperscale_core::{NodeInput, ProtocolEvent, TimerId};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_metrics as metrics;
 use hyperscale_network::Network;
-use hyperscale_storage::{CommitStore, ConsensusStore, SubstateStore};
+use hyperscale_storage::{ChainReader, ChainWriter, SubstateStore};
 use hyperscale_types::{BlockHeight, ValidatorId};
 use std::time::Duration;
 
 impl<S, N, D> IoLoop<S, N, D>
 where
-    S: CommitStore + SubstateStore + ConsensusStore + Send + Sync + 'static,
+    S: ChainWriter + SubstateStore + ChainReader + Send + Sync + 'static,
     N: Network,
     D: Dispatch + 'static,
 {

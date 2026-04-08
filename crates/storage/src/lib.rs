@@ -22,8 +22,8 @@
 
 #![warn(missing_docs)]
 
-mod commit;
-mod consensus;
+mod chain_reader;
+mod chain_writer;
 mod genesis;
 pub mod keys;
 mod overlay;
@@ -34,8 +34,8 @@ mod writes;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_helpers;
 
-pub use commit::CommitStore;
-pub use consensus::ConsensusStore;
+pub use chain_reader::ChainReader;
+pub use chain_writer::ChainWriter;
 pub use genesis::{GenesisWrapper, SubstatesOnlyCommit};
 pub use overlay::{SubstateDbLookup, SubstateLookup};
 pub use store::SubstateStore;

@@ -1,4 +1,4 @@
-//! `CommitStore` implementation for `RocksDbStorage`.
+//! `ChainWriter` implementation for `RocksDbStorage`.
 
 use crate::column_families::ALL_COLUMN_FAMILIES;
 use crate::core::RocksDbStorage;
@@ -7,6 +7,7 @@ use crate::jvt_snapshot_store::SnapshotTreeStore;
 use hyperscale_storage::{DatabaseUpdates, JvtSnapshot};
 use hyperscale_types::ReceiptBundle;
 use rocksdb::WriteBatch;
+use std::sync::Arc;
 
 /// Precomputed commit work for a RocksDB block commit.
 ///
@@ -24,7 +25,7 @@ pub struct RocksDbPreparedCommit {
     pub(crate) merged_updates: DatabaseUpdates,
 }
 
-impl hyperscale_storage::CommitStore for RocksDbStorage {
+impl hyperscale_storage::ChainWriter for RocksDbStorage {
     type PreparedCommit = RocksDbPreparedCommit;
 
     fn prepare_block_commit(
@@ -55,9 +56,9 @@ impl hyperscale_storage::CommitStore for RocksDbStorage {
     fn commit_prepared_block(
         &self,
         prepared: Self::PreparedCommit,
-        block: &hyperscale_types::Block,
-        qc: &hyperscale_types::QuorumCertificate,
-        execution_certificates: &[hyperscale_types::ExecutionCertificate],
+        block: &Arc<hyperscale_types::Block>,
+        qc: &Arc<hyperscale_types::QuorumCertificate>,
+        execution_certificates: &[Arc<hyperscale_types::ExecutionCertificate>],
         receipts: &[ReceiptBundle],
     ) -> hyperscale_types::Hash {
         let result_root = prepared.jvt_snapshot.result_root;
@@ -96,9 +97,9 @@ impl hyperscale_storage::CommitStore for RocksDbStorage {
     fn commit_block(
         &self,
         merged_updates: &DatabaseUpdates,
-        block: &hyperscale_types::Block,
-        qc: &hyperscale_types::QuorumCertificate,
-        execution_certificates: &[hyperscale_types::ExecutionCertificate],
+        block: &Arc<hyperscale_types::Block>,
+        qc: &Arc<hyperscale_types::QuorumCertificate>,
+        execution_certificates: &[Arc<hyperscale_types::ExecutionCertificate>],
         receipts: &[ReceiptBundle],
     ) -> hyperscale_types::Hash {
         let block_height = block.header.height.0;
