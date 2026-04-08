@@ -6,8 +6,8 @@
 use crate::state::{apply_updates_to_ordmap, ConsensusState, SharedState};
 
 use hyperscale_storage::{
-    jmt::NodeCache, keys, DatabaseUpdates, DbPartitionKey, DbSortKey, DbSubstateValue,
-    PartitionEntry, SubstateDatabase,
+    keys, DatabaseUpdates, DbPartitionKey, DbSortKey, DbSubstateValue, PartitionEntry,
+    SubstateDatabase,
 };
 use hyperscale_types::Hash;
 #[cfg(test)]
@@ -41,10 +41,6 @@ pub struct SimStorage {
 
     /// Consensus metadata (single RwLock).
     pub(crate) consensus: RwLock<ConsensusState>,
-
-    /// JVT node cache — enables speculative proof generation at proposal time
-    /// (before the block is committed to the tree store).
-    pub(crate) node_cache: NodeCache,
 }
 
 impl Default for SimStorage {
@@ -59,7 +55,6 @@ impl SimStorage {
         Self {
             state: Arc::new(RwLock::new(SharedState::new())),
             consensus: RwLock::new(ConsensusState::new()),
-            node_cache: NodeCache::new(),
         }
     }
 
@@ -72,7 +67,6 @@ impl SimStorage {
     pub fn clear(&mut self) {
         *self.state.write().unwrap() = SharedState::new();
         *self.consensus.write().unwrap() = ConsensusState::new();
-        self.node_cache = NodeCache::new();
     }
 
     /// Get number of substate keys stored.
@@ -145,19 +139,24 @@ impl SimStorage {
             apply_updates_to_ordmap(data, updates, Some((new_version, versioned_substates)));
         }
 
-        let parent_version =
-            hyperscale_storage::jvt_parent_height(s.current_block_height, s.current_root_hash);
-        let (new_root, collected) = hyperscale_storage::jmt::put_at_version(
+        let parent_version = hyperscale_storage::tree::jvt_parent_height(
+            s.current_block_height,
+            s.current_root_hash,
+        );
+        let (new_root, collected) = hyperscale_storage::tree::put_at_version(
             &s.tree_store,
             parent_version,
             new_version,
             updates,
             &Default::default(),
-            &self.node_cache,
         );
 
-        self.node_cache.populate(&collected.nodes);
-        collected.apply_to(&s.tree_store);
+        for (key, node) in &collected.nodes {
+            s.tree_store.insert(key.clone(), Arc::clone(node));
+        }
+        for stale_key in &collected.stale_node_keys {
+            s.tree_store.remove(stale_key);
+        }
 
         s.current_block_height = new_version;
         s.current_root_hash = new_root;
@@ -198,17 +197,20 @@ impl SimStorage {
         );
 
         // parent=None, version=0: genesis is the first JVT state.
-        let (root, collected) = hyperscale_storage::jmt::put_at_version(
+        let (root, collected) = hyperscale_storage::tree::put_at_version(
             &s.tree_store,
             None,
             0,
             merged,
             &Default::default(),
-            &self.node_cache,
         );
 
-        self.node_cache.populate(&collected.nodes);
-        collected.apply_to(&s.tree_store);
+        for (key, node) in &collected.nodes {
+            s.tree_store.insert(key.clone(), Arc::clone(node));
+        }
+        for stale_key in &collected.stale_node_keys {
+            s.tree_store.remove(stale_key);
+        }
 
         s.current_block_height = 0;
         s.current_root_hash = root;

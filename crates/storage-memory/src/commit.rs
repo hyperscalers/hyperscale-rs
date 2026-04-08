@@ -45,14 +45,13 @@ impl CommitStore for SimStorage {
             );
         }
 
-        let parent_version = hyperscale_storage::jvt_parent_height(base_version, base_root);
-        let (result_root, collected) = hyperscale_storage::jmt::put_at_version(
+        let parent_version = hyperscale_storage::tree::jvt_parent_height(base_version, base_root);
+        let (result_root, collected) = hyperscale_storage::tree::put_at_version(
             &s.tree_store,
             parent_version,
             block_height,
             merged_updates,
             &Default::default(),
-            &self.node_cache,
         );
 
         let snapshot = JvtSnapshot::from_collected_writes(
@@ -96,7 +95,6 @@ impl CommitStore for SimStorage {
             if use_fast_path {
                 // Fast path: apply precomputed JVT snapshot + swap OrdMap.
                 // Write MVCC entries from the merged updates.
-                self.node_cache.populate(&prepared.snapshot.nodes);
                 s.apply_jvt_snapshot(prepared.snapshot);
                 s.data = prepared.resulting_data;
                 // The OrdMap was pre-built, but we still need MVCC entries.
@@ -171,20 +169,26 @@ impl CommitStore for SimStorage {
             );
         }
 
-        let parent_version =
-            hyperscale_storage::jvt_parent_height(s.current_block_height, s.current_root_hash);
+        let parent_version = hyperscale_storage::tree::jvt_parent_height(
+            s.current_block_height,
+            s.current_root_hash,
+        );
 
-        let (new_root, collected) = hyperscale_storage::jmt::put_at_version(
+        let (new_root, collected) = hyperscale_storage::tree::put_at_version(
             &s.tree_store,
             parent_version,
             block_height,
             merged_updates,
             &Default::default(),
-            &self.node_cache,
         );
 
-        self.node_cache.populate(&collected.nodes);
-        collected.apply_to(&s.tree_store);
+        for (key, node) in &collected.nodes {
+            s.tree_store
+                .insert(key.clone(), std::sync::Arc::clone(node));
+        }
+        for stale_key in &collected.stale_node_keys {
+            s.tree_store.remove(stale_key);
+        }
 
         s.current_block_height = block_height;
         s.current_root_hash = new_root;
@@ -210,6 +214,6 @@ impl CommitStore for SimStorage {
     }
 
     fn node_cache_len(&self) -> usize {
-        self.node_cache.len()
+        0
     }
 }

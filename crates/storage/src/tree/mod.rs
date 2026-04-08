@@ -1,4 +1,4 @@
-//! Verkle-based state tree — flat single-tree design.
+//! Verkle state tree — flat single-tree design.
 //!
 //! All substates across all entities and partitions live in a single JVT tree.
 //! Storage keys are BLAKE3-hashed to 32-byte JVT keys for optimal tree depth.
@@ -12,13 +12,12 @@
 //! JVT values are field elements (`value_to_field(raw_bytes)`). Raw substate
 //! bytes are stored separately in the versioned data store (MVCC), not in the tree.
 
-mod node_cache;
+mod collected_writes;
 pub mod proofs;
-pub mod tree_store;
+mod snapshot;
 
-pub use jellyfish_verkle_tree::Node as JvtNode;
-pub use jellyfish_verkle_tree::NodeKey as JvtNodeKey;
-pub use node_cache::NodeCache;
+pub use collected_writes::CollectedWrites;
+pub use snapshot::{JvtSnapshot, LeafSubstateKeyAssociation};
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -26,51 +25,9 @@ use std::sync::Arc;
 use hyperscale_types::Hash;
 use jellyfish_verkle_tree as jvt;
 
-use jvt::TreeReader as _;
-use tree_store::*;
-
-/// Adapter that bridges `ReadableTreeStore` → JVT `TreeReader`,
-/// with an in-memory `NodeCache` read layer. Hot tree nodes (root,
-/// upper internal nodes) are served from memory, avoiding storage
-/// reads on the critical path.
-pub(crate) struct StoreAdapter<'a, S> {
-    pub(crate) store: &'a S,
-    pub(crate) node_cache: &'a NodeCache,
-}
-
-impl<S: ReadableTreeStore> jvt::TreeReader for StoreAdapter<'_, S> {
-    fn get_node(&self, key: &jvt::NodeKey) -> Option<Arc<jvt::Node>> {
-        // Fast path: serve from in-memory cache.
-        if let Some(node) = self.node_cache.get(key) {
-            return Some(node);
-        }
-        // Slow path: storage read + deserialize.
-        let stored_key = StoredNodeKey::from_jvt(key);
-        let node = self
-            .store
-            .get_node(&stored_key)
-            .map(|sn| Arc::new(sn.to_jvt()));
-        // Populate cache on miss so subsequent blocks benefit.
-        if let Some(ref n) = node {
-            self.node_cache.insert(key.clone(), Arc::clone(n));
-        }
-        node
-    }
-
-    fn get_root_key(&self, version: u64) -> Option<jvt::NodeKey> {
-        let root = jvt::NodeKey::root(version);
-        // Check cache first for root node existence.
-        if self.node_cache.get(&root).is_some() {
-            return Some(root);
-        }
-        let stored_key = StoredNodeKey::from_jvt(&root);
-        if self.store.get_node(&stored_key).is_some() {
-            Some(root)
-        } else {
-            None
-        }
-    }
-}
+// Re-export JVT types used in public APIs (CollectedWrites, NodeCache, etc.)
+pub use jvt::Node as JvtNode;
+pub use jvt::NodeKey as JvtNodeKey;
 
 /// Hash a storage key to a 32-byte JVT key.
 ///
@@ -78,6 +35,27 @@ impl<S: ReadableTreeStore> jvt::TreeReader for StoreAdapter<'_, S> {
 /// BLAKE3 hashing produces a fixed 32-byte key for optimal JVT tree depth (~4 levels).
 pub fn hash_storage_key(storage_key: &[u8]) -> jvt::Key {
     blake3::hash(storage_key).into()
+}
+
+/// Returns `None` when the JVT is truly empty (height 0 with zero root),
+/// indicating no parent node exists. Otherwise returns `Some(block_height)`.
+pub fn jvt_parent_height(block_height: u64, root: Hash) -> Option<u64> {
+    if block_height == 0 && root == Hash::ZERO {
+        None
+    } else {
+        Some(block_height)
+    }
+}
+
+/// Convert a JVT commitment to a Hash (for state root, value hashes).
+///
+/// Uses compressed serialization (32 bytes) for the consensus-visible identity.
+pub fn commitment_to_hash(c: jvt::Commitment) -> Hash {
+    use ark_serialize::CanonicalSerialize;
+    let mut buf = [0u8; 32];
+    c.0.serialize_compressed(&mut buf[..])
+        .expect("Bandersnatch point serialization should never fail");
+    Hash::from_hash_bytes(&buf)
 }
 
 /// Build a storage key from entity_key + partition_num + sort_key.
@@ -89,55 +67,36 @@ fn make_storage_key(entity_key: &[u8], partition_num: u8, sort_key: &[u8]) -> Ve
     key
 }
 
-fn commitment_to_hash(c: jvt::Commitment) -> Hash {
-    use ark_serialize::CanonicalSerialize;
-    let mut buf = [0u8; 32];
-    c.0.serialize_compressed(&mut buf[..])
-        .expect("Bandersnatch point serialization should never fail");
-    Hash::from_hash_bytes(&buf)
-}
-
 /// Computes new state tree nodes for the given database updates, returning
 /// the new root hash and all collected writes.
 ///
-/// The store only needs `ReadableTreeStore + Sync` — no writes are performed.
-/// The caller applies the returned `CollectedWrites`.
+/// Takes any `jvt::TreeReader` — the caller is responsible for providing
+/// a reader appropriate to its storage backend (e.g. cache-backed for RocksDB,
+/// direct HashMap for in-memory). `put_at_version` is agnostic to caching
+/// and serialization.
 ///
 /// `parent_version` is the version of the existing root (`None` for initial state).
 /// `new_version` is the version to stamp on new nodes (typically block height).
 ///
 /// `reset_old_keys` provides the storage keys that existed in Reset partitions
 /// before the reset. These are needed to generate JVT deletes because hashed keys
-/// prevent tree-based enumeration. The caller obtains these from the data store
-/// (OrdMap prefix scan or RocksDB range scan) before calling this function.
-///
-/// The shared `node_cache` is used for reads only. New nodes are returned in
-/// `CollectedWrites` — the caller populates the cache at commit time via
-/// [`NodeCache::populate`].
-pub fn put_at_version<S: ReadableTreeStore + Sync>(
-    tree_store: &S,
-    parent_version: Option<Version>,
-    new_version: Version,
+/// prevent tree-based enumeration.
+pub fn put_at_version<S: jvt::TreeReader + Sync>(
+    store: &S,
+    parent_version: Option<u64>,
+    new_version: u64,
     database_updates: &radix_substate_store_interface::interface::DatabaseUpdates,
     reset_old_keys: &HashMap<
         (Vec<u8>, u8),
         Vec<radix_substate_store_interface::interface::DbSortKey>,
     >,
-    node_cache: &NodeCache,
 ) -> (Hash, CollectedWrites) {
     assert!(
         parent_version.is_none_or(|pv| new_version > pv),
         "put_at_version: new_version ({new_version}) must be greater than parent_version ({parent_version:?})"
     );
 
-    let adapter = StoreAdapter {
-        store: tree_store,
-        node_cache,
-    };
-
     // Flatten all database updates into JVT key-value pairs.
-    // Key: BLAKE3(storage_key) → [u8; 32]
-    // Value: value_to_field(raw_bytes) → FieldElement
     let mut updates: BTreeMap<jvt::Key, Option<jvt::Value>> = BTreeMap::new();
 
     for (entity_key, node_updates) in &database_updates.node_updates {
@@ -161,8 +120,6 @@ pub fn put_at_version<S: ReadableTreeStore + Sync>(
                 radix_substate_store_interface::interface::PartitionDatabaseUpdates::Reset {
                     new_substate_values,
                 } => {
-                    // Delete all existing substates in this partition via caller-provided sort keys.
-                    // Reconstruct the full storage key from (entity_key, partition_num, sort_key).
                     if let Some(old_sort_keys) =
                         reset_old_keys.get(&(entity_key.clone(), partition_num))
                     {
@@ -173,7 +130,6 @@ pub fn put_at_version<S: ReadableTreeStore + Sync>(
                             updates.insert(jvt_key, None);
                         }
                     }
-                    // Insert the new values (overwrites any deletes for keys that reappear).
                     for (sort_key, value) in new_substate_values {
                         let storage_key = make_storage_key(entity_key, partition_num, &sort_key.0);
                         let jvt_key = hash_storage_key(&storage_key);
@@ -191,7 +147,7 @@ pub fn put_at_version<S: ReadableTreeStore + Sync>(
         let root_hash = parent_version
             .and_then(|v| {
                 let root_key = jvt::NodeKey::root(v);
-                let root_node = adapter.get_node(&root_key)?;
+                let root_node = store.get_node(&root_key)?;
                 let commitment = root_node.commitment();
                 if commitment == jvt::zero_commitment() {
                     return None;
@@ -204,7 +160,7 @@ pub fn put_at_version<S: ReadableTreeStore + Sync>(
         return (root_hash, collected);
     }
 
-    let result = jvt::apply_updates(&adapter, parent_version, new_version, updates);
+    let result = jvt::apply_updates(store, parent_version, new_version, updates);
 
     let root_hash = if result.root_commitment == jvt::zero_commitment() {
         Hash::ZERO
@@ -219,64 +175,8 @@ pub fn put_at_version<S: ReadableTreeStore + Sync>(
             .push((node_key.clone(), Arc::new(node.clone())));
     }
     for stale in &result.batch.stale_nodes {
-        collected
-            .stale_node_keys
-            .push(StoredNodeKey::from_jvt(&stale.node_key));
+        collected.stale_node_keys.push(stale.node_key.clone());
     }
 
     (root_hash, collected)
-}
-
-/// Compute and immediately apply state tree updates.
-/// Convenience for tests and direct commits.
-pub fn put_at_version_and_apply<S: ReadableTreeStore + WriteableTreeStore + Sync>(
-    tree_store: &S,
-    parent_version: Option<Version>,
-    new_version: Version,
-    database_updates: &radix_substate_store_interface::interface::DatabaseUpdates,
-    reset_old_keys: &HashMap<
-        (Vec<u8>, u8),
-        Vec<radix_substate_store_interface::interface::DbSortKey>,
-    >,
-    node_cache: &NodeCache,
-) -> Hash {
-    let (root, collected) = put_at_version(
-        tree_store,
-        parent_version,
-        new_version,
-        database_updates,
-        reset_old_keys,
-        node_cache,
-    );
-    collected.apply_to(tree_store);
-    root
-}
-
-/// Writes collected during state tree computation.
-///
-/// Nodes are stored in hydrated form `(jvt::NodeKey, Arc<jvt::Node>)` — the
-/// canonical output of `put_at_version`. Storage backends serialize to
-/// `StoredNodeKey`/`StoredNode` at write time. The cache takes the hydrated
-/// form directly via [`NodeCache::populate`].
-#[derive(Default)]
-pub struct CollectedWrites {
-    /// Hydrated nodes — canonical form from the JVT computation.
-    pub nodes: Vec<(jvt::NodeKey, Arc<jvt::Node>)>,
-    /// Stale node keys for GC tracking. Stored in serialized form because
-    /// they're persisted to RocksDB and read back during GC.
-    pub stale_node_keys: Vec<StoredNodeKey>,
-}
-
-impl CollectedWrites {
-    /// Apply collected nodes and stale parts to a writable tree store.
-    ///
-    /// Converts hydrated nodes to stored form at write time.
-    pub fn apply_to(self, store: &(impl WriteableTreeStore + ?Sized)) {
-        for (key, node) in &self.nodes {
-            store.insert_node(StoredNodeKey::from_jvt(key), StoredNode::from_jvt(node));
-        }
-        for key in self.stale_node_keys {
-            store.record_stale_tree_part(StaleTreePart::Node(key));
-        }
-    }
 }

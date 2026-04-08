@@ -108,12 +108,11 @@ impl SubstateStore for RocksDbStorage {
     ) -> Option<hyperscale_types::SubstateInclusionProof> {
         // Use a RocksDB snapshot for all reads so concurrent JVT GC cannot
         // delete nodes mid-proof-generation.
-        let snapshot_store = SnapshotTreeStore::new(&self.db);
-        hyperscale_storage::proofs::generate_proof(
+        let snapshot_store = SnapshotTreeStore::new(&self.db, &self.node_cache);
+        hyperscale_storage::tree::proofs::generate_proof(
             &snapshot_store,
             storage_keys,
             block_height,
-            &self.node_cache,
         )
     }
 }
@@ -143,7 +142,7 @@ impl RocksDbStorage {
         // another thread deletes nodes, our reads through the snapshot still see them.
         // The snapshot is lightweight (just a version marker) and automatically releases
         // when dropped at the end of this function.
-        let snapshot_store = SnapshotTreeStore::new(&self.db);
+        let snapshot_store = SnapshotTreeStore::new(&self.db, &self.node_cache);
         let (base_version, base_root) = snapshot_store.read_jvt_metadata();
 
         // Verify the JVT root matches the expected base root.
@@ -160,14 +159,13 @@ impl RocksDbStorage {
         // Merge all certificates into a single update — later cert wins for conflicts.
         let merged = hyperscale_storage::merge_database_updates(updates_per_cert);
 
-        let parent_version = hyperscale_storage::jvt_parent_height(base_version, base_root);
-        let (root, collected) = hyperscale_storage::jmt::put_at_version(
+        let parent_version = hyperscale_storage::tree::jvt_parent_height(base_version, base_root);
+        let (root, collected) = hyperscale_storage::tree::put_at_version(
             &snapshot_store,
             parent_version,
             block_height,
             &merged,
             &Default::default(),
-            &self.node_cache,
         );
 
         let snapshot = JvtSnapshot::from_collected_writes(

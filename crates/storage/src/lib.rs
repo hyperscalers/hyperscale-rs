@@ -14,29 +14,21 @@
 //! - `SimulationRunner` uses in-memory storage (`SimStorage`)
 //! - `ProductionRunner` uses RocksDB (`RocksDbStorage`)
 //!
-//! # Architecture
-//!
-//! Rather than having our own `Storage` trait that we adapt to Radix's `SubstateDatabase`,
-//! runner storage types implement `SubstateDatabase` directly, plus our `SubstateStore`
-//! extension trait for snapshots, node listing, and JVT state roots.
-//!
 //! # Jellyfish Verkle Tree (JVT)
 //!
-//! All `SubstateStore` implementations use JVT internally to maintain a cryptographic
-//! commitment to the entire state. This provides:
-//! - `jvt_version()` - Block height of last committed JVT state
-//! - `state_root_hash()` - Verkle root of all substates at current version
+//! The `tree` module provides the verkle state tree implementation. Storage
+//! backends implement `jvt::TreeReader` to provide tree access — RocksDB uses
+//! a cache-backed adapter, SimStorage uses a direct HashMap lookup.
 
 #![warn(missing_docs)]
 
 mod commit;
 mod consensus;
 mod genesis;
-mod jvt_snapshot;
 pub mod keys;
 mod overlay;
-pub mod proofs;
 mod store;
+pub mod tree;
 mod writes;
 
 #[cfg(any(test, feature = "test-utils"))]
@@ -45,20 +37,10 @@ pub mod test_helpers;
 pub use commit::{CommitStore, ConsensusCommitData};
 pub use consensus::ConsensusStore;
 pub use genesis::{GenesisWrapper, SubstatesOnlyCommit};
-pub use jvt_snapshot::{JvtSnapshot, LeafSubstateKeyAssociation};
 pub use overlay::{SubstateDbLookup, SubstateLookup};
 pub use store::SubstateStore;
+pub use tree::{CollectedWrites, JvtNodeKey, JvtSnapshot, LeafSubstateKeyAssociation};
 pub use writes::{merge_database_updates, merge_database_updates_from_arcs, merge_into};
-
-/// Returns `None` when the JVT is truly empty (height 0 with zero root),
-/// indicating no parent node exists. Otherwise returns `Some(block_height)`.
-pub fn jvt_parent_height(block_height: u64, root: StateRootHash) -> Option<u64> {
-    if block_height == 0 && root == StateRootHash::ZERO {
-        None
-    } else {
-        Some(block_height)
-    }
-}
 
 /// An empty SubstateDatabase for use in tests and single-shard contexts
 /// where no storage reads are needed.
@@ -90,23 +72,3 @@ pub use radix_substate_store_interface::interface::{
     CommittableSubstateDatabase, DatabaseUpdates, DbPartitionKey, DbSortKey, NodeDatabaseUpdates,
     PartitionDatabaseUpdates, PartitionEntry, SubstateDatabase,
 };
-
-/// State tree implementation types re-exported for storage backends.
-///
-/// These are implementation details needed by `storage-memory` and `storage-rocksdb`.
-/// They are not part of the abstract storage interface.
-pub mod jmt {
-    pub use hyperscale_state_tree::put_at_version;
-    pub use hyperscale_state_tree::put_at_version_and_apply;
-    pub use hyperscale_state_tree::tree_store::{
-        encode_key, ReadableTreeStore, StaleTreePart, StoredNode, StoredNodeKey,
-        TypedInMemoryTreeStore, Version, VersionedStoredNode, WriteableTreeStore,
-    };
-    pub use hyperscale_state_tree::CollectedWrites;
-    pub use hyperscale_state_tree::NodeCache;
-
-    // Re-export JVT node types used by CollectedWrites and NodeCache.
-    // and NodeCache::populate.
-    pub use hyperscale_state_tree::JvtNode;
-    pub use hyperscale_state_tree::JvtNodeKey;
-}

@@ -5,18 +5,21 @@ edition.workspace = true
 description = "RocksDB storage implementation for production"
 
 [dependencies]
-hyperscale-engine.workspace = true
+ark-ed-on-bls12-381-bandersnatch.workspace = true
+ark-serialize.workspace = true
+dashmap.workspace = true
+hex.workspace = true
 hyperscale-storage.workspace = true
 hyperscale-metrics.workspace = true
 hyperscale-types.workspace = true
 hyperscale-bft.workspace = true
+jellyfish-verkle-tree.workspace = true
 radix-common.workspace = true
 radix-substate-store-interface.workspace = true
 rocksdb.workspace = true
 sbor.workspace = true
-hex.workspace = true
-tracing.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 hyperscale-storage = { workspace = true, features = ["test-utils"] }

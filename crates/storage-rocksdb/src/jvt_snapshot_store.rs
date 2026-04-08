@@ -1,12 +1,14 @@
 //! Snapshot-based tree store for concurrent JVT reads.
 
+use std::sync::Arc;
+
 use crate::column_families::{CfHandles, JvtNodesCf, StateCf};
+use crate::jvt_stored::StoredNodeKey;
+use crate::node_cache::NodeCache;
 use crate::typed_cf::{self, TypedCf};
 
-use hyperscale_storage::{
-    jmt::{ReadableTreeStore, StoredNode, StoredNodeKey},
-    DbPartitionKey, DbSortKey, StateRootHash, SubstateLookup,
-};
+use hyperscale_storage::{DbPartitionKey, DbSortKey, StateRootHash, SubstateLookup};
+use jellyfish_verkle_tree as jvt;
 use rocksdb::{Snapshot, DB};
 
 /// A tree store that reads JVT nodes from a RocksDB snapshot.
@@ -24,6 +26,8 @@ pub(crate) struct SnapshotTreeStore<'a> {
     snapshot: Snapshot<'a>,
     /// Reference to the DB for column family handles.
     db: &'a DB,
+    /// Shared node cache for hydrated JVT nodes.
+    node_cache: &'a NodeCache,
 }
 
 impl<'a> SnapshotTreeStore<'a> {
@@ -32,10 +36,11 @@ impl<'a> SnapshotTreeStore<'a> {
     /// Takes a RocksDB snapshot at the current point in time. All reads through
     /// this store will see the database state as of this moment, regardless of
     /// any concurrent writes.
-    pub fn new(db: &'a DB) -> Self {
+    pub fn new(db: &'a DB, node_cache: &'a NodeCache) -> Self {
         Self {
             snapshot: db.snapshot(),
             db,
+            node_cache,
         }
     }
 
@@ -68,19 +73,39 @@ impl<'a> SnapshotTreeStore<'a> {
     }
 }
 
-impl ReadableTreeStore for SnapshotTreeStore<'_> {
-    fn get_node(&self, key: &StoredNodeKey) -> Option<StoredNode> {
+impl jvt::TreeReader for SnapshotTreeStore<'_> {
+    fn get_node(&self, key: &jvt::NodeKey) -> Option<Arc<jvt::Node>> {
+        // Fast path: serve from in-memory cache.
+        if let Some(node) = self.node_cache.get(key) {
+            return Some(node);
+        }
+        // Slow path: snapshot read + deserialize.
+        let stored_key = StoredNodeKey::from_jvt(key);
         let cf = CfHandles::resolve(self.db);
-        typed_cf::get::<JvtNodesCf>(&self.snapshot, JvtNodesCf::handle(&cf), key)
-            .map(|v| v.into_latest())
+        let node =
+            typed_cf::get::<JvtNodesCf>(&self.snapshot, JvtNodesCf::handle(&cf), &stored_key)
+                .map(|v| Arc::new(v.into_latest().to_jvt()));
+        // Populate cache on miss so subsequent reads benefit.
+        if let Some(ref n) = node {
+            self.node_cache.insert(key.clone(), Arc::clone(n));
+        }
+        node
     }
 
-    fn get_nodes_batch(&self, keys: &[StoredNodeKey]) -> Vec<Option<StoredNode>> {
+    fn get_root_key(&self, version: u64) -> Option<jvt::NodeKey> {
+        let root = jvt::NodeKey::root(version);
+        if self.node_cache.get(&root).is_some() {
+            return Some(root);
+        }
+        let stored_key = StoredNodeKey::from_jvt(&root);
         let cf = CfHandles::resolve(self.db);
-        typed_cf::multi_get::<JvtNodesCf>(&self.snapshot, JvtNodesCf::handle(&cf), keys)
-            .into_iter()
-            .map(|opt| opt.map(|v| v.into_latest()))
-            .collect()
+        if typed_cf::get::<JvtNodesCf>(&self.snapshot, JvtNodesCf::handle(&cf), &stored_key)
+            .is_some()
+        {
+            Some(root)
+        } else {
+            None
+        }
     }
 }
 

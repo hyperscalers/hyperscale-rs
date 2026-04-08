@@ -2,8 +2,9 @@
 //!
 //! Contains the internal state structures protected by RwLocks in `SimStorage`.
 
+use crate::tree_store::SimTreeStore;
+
 use hyperscale_storage::{
-    jmt::{StoredNodeKey, TypedInMemoryTreeStore},
     keys, DatabaseUpdate, DatabaseUpdates, DbPartitionKey, JvtSnapshot, PartitionDatabaseUpdates,
     StateRootHash,
 };
@@ -12,6 +13,7 @@ use hyperscale_types::{
     LocalTransactionExecution, QuorumCertificate, RoutableTransaction, TransactionCertificate,
 };
 use im::OrdMap;
+use jellyfish_verkle_tree as jvt;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
@@ -30,11 +32,11 @@ use std::sync::Arc;
 pub(crate) struct SharedState {
     /// Radix substate data. `im::OrdMap` for O(1) structural-sharing clones.
     pub data: OrdMap<Vec<u8>, Vec<u8>>,
-    pub tree_store: TypedInMemoryTreeStore,
+    pub tree_store: SimTreeStore,
     pub current_block_height: u64,
     pub current_root_hash: StateRootHash,
     /// Leaf-key → substate-value associations for historical queries.
-    pub associations: HashMap<StoredNodeKey, Vec<u8>>,
+    pub associations: HashMap<jvt::NodeKey, Vec<u8>>,
     /// MVCC versioned substate store: `(storage_key, version) → Option<value>`.
     /// BTreeMap ordering gives prefix scans and version ordering for free.
     /// A `None` value is a tombstone (deleted substate).
@@ -49,7 +51,7 @@ impl SharedState {
             // past heights and need old nodes to still exist. In production,
             // RocksDB GC respects `jvt_history_length` (default 256).
             // In simulation, tests are short-lived so retaining all nodes is fine.
-            tree_store: TypedInMemoryTreeStore::new(),
+            tree_store: SimTreeStore::new(),
             current_block_height: 0,
             current_root_hash: Hash::ZERO,
             versioned_substates: BTreeMap::new(),
@@ -63,8 +65,6 @@ impl SharedState {
     /// from verification. Also stores leaf-to-substate associations for
     /// historical queries.
     pub(crate) fn apply_jvt_snapshot(&mut self, snapshot: JvtSnapshot) {
-        use hyperscale_storage::jmt::WriteableTreeStore;
-
         if self.current_root_hash != snapshot.base_root {
             panic!(
                 "JVT snapshot base ROOT mismatch: expected {:?}, got {:?}.",
@@ -81,13 +81,11 @@ impl SharedState {
         }
 
         for (jvt_key, jvt_node) in &snapshot.nodes {
-            let stored_key = hyperscale_storage::jmt::StoredNodeKey::from_jvt(jvt_key);
-            let stored_node = hyperscale_storage::jmt::StoredNode::from_jvt(jvt_node);
-            self.tree_store.insert_node(stored_key, stored_node);
-        }
-        for stale_key in snapshot.stale_node_keys {
             self.tree_store
-                .record_stale_tree_part(hyperscale_storage::jmt::StaleTreePart::Node(stale_key));
+                .insert(jvt_key.clone(), Arc::clone(jvt_node));
+        }
+        for stale_key in &snapshot.stale_node_keys {
+            self.tree_store.remove(stale_key);
         }
         for a in snapshot.leaf_substate_associations {
             self.associations.insert(a.tree_node_key, a.substate_value);

@@ -4,7 +4,7 @@ use crate::column_families::{JvtNodesCf, StaleJvtNodesCf};
 use crate::core::RocksDbStorage;
 use crate::typed_cf::{self, TypedCf};
 
-use hyperscale_storage::jmt::{StaleTreePart, StoredNode, StoredNodeKey};
+use crate::jvt_stored::{StaleTreePart, StoredNode, StoredNodeKey};
 use rocksdb::{ColumnFamily, WriteBatch};
 
 impl RocksDbStorage {
@@ -103,7 +103,7 @@ impl RocksDbStorage {
         jvt_cf: &ColumnFamily,
         root_key: &StoredNodeKey,
         batch: &mut WriteBatch,
-        node_cache: &hyperscale_storage::jmt::NodeCache,
+        node_cache: &crate::node_cache::NodeCache,
     ) -> usize {
         let mut stack = vec![root_key.clone()];
         let mut deleted = 0;

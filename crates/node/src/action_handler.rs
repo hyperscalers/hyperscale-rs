@@ -438,10 +438,11 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
                 if all_entries.is_empty() {
                     true
                 } else {
-                    hyperscale_storage::proofs::verify_all_verkle_proofs(
-                        &all_entries,
+                    hyperscale_storage::tree::proofs::verify_proof(
                         &batch.proof,
+                        &all_entries,
                         committed_header.header.state_root,
+                        |e| &e.storage_key,
                     )
                 }
             };

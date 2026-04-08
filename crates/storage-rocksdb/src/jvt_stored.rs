@@ -1,12 +1,11 @@
-//! Storage traits and types for the verkle state tree.
+//! Serialization types for verkle state tree persistence.
 //!
-//! Defines the physical representation of tree nodes (SBOR-serializable newtypes
-//! wrapping JVT types), storage traits, and key encoding for RocksDB.
+//! These are the SBOR-serializable newtypes wrapping JVT types, plus key
+//! encoding for RocksDB. Moved here from `hyperscale_state_tree::tree_store`
+//! so that `storage-rocksdb` owns its serialization format directly.
 
 use std::collections::HashMap;
-use std::sync::RwLock;
 
-use hyperscale_types::Hash;
 use jellyfish_verkle_tree as jvt;
 use jvt::commitment::commitment_to_field;
 use sbor::prelude::*;
@@ -14,7 +13,7 @@ use sbor::prelude::*;
 /// Version = block height.
 pub type Version = u64;
 
-// ─── Stored node key ────────────────────────────────────────────────────
+// --- Stored node key --------------------------------------------------------
 
 /// A globally unique key for a tree node, combining a tier prefix with
 /// the JVT node's version and byte path.
@@ -34,7 +33,7 @@ pub struct StoredNodeKey {
 }
 
 impl StoredNodeKey {
-    /// Create from a JVT NodeKey (no prefix — flat tree).
+    /// Create from a JVT NodeKey (no prefix -- flat tree).
     pub fn from_jvt(node_key: &jvt::NodeKey) -> Self {
         Self {
             version: node_key.version,
@@ -80,7 +79,7 @@ pub fn encode_key(key: &StoredNodeKey) -> Vec<u8> {
     buf
 }
 
-// ─── Stored node types (SBOR-serializable) ──────────────────────────────
+// --- Stored node types (SBOR-serializable) ----------------------------------
 
 /// Versioned wrapper for schema evolution.
 #[derive(Clone, PartialEq, Eq, Hash, Debug, BasicCategorize, BasicEncode, BasicDecode)]
@@ -151,14 +150,14 @@ pub enum StaleTreePart {
     Subtree(StoredNodeKey),
 }
 
-// ─── Commitment serialization helpers ───────────────────────────────────
+// --- Commitment serialization helpers ---------------------------------------
 
 use ark_ed_on_bls12_381_bandersnatch::{EdwardsAffine, Fr};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 
 /// Serialize a commitment as uncompressed (64 bytes: x || y).
-/// No field inversion — just two coordinate writes.
-fn commitment_to_bytes(c: jvt::Commitment) -> Vec<u8> {
+/// No field inversion -- just two coordinate writes.
+pub fn commitment_to_bytes(c: jvt::Commitment) -> Vec<u8> {
     let mut buf = Vec::with_capacity(64);
     c.0.serialize_uncompressed(&mut buf)
         .expect("Bandersnatch point serialization should never fail");
@@ -166,8 +165,8 @@ fn commitment_to_bytes(c: jvt::Commitment) -> Vec<u8> {
 }
 
 /// Deserialize a commitment from uncompressed bytes (64 bytes: x || y).
-/// No field inversion or square root — just two coordinate reads + on-curve check.
-fn bytes_to_commitment(bytes: &[u8]) -> jvt::Commitment {
+/// No field inversion or square root -- just two coordinate reads + on-curve check.
+pub fn bytes_to_commitment(bytes: &[u8]) -> jvt::Commitment {
     jvt::Commitment(
         EdwardsAffine::deserialize_uncompressed(bytes)
             .expect("stored commitment bytes should be valid"),
@@ -175,8 +174,7 @@ fn bytes_to_commitment(bytes: &[u8]) -> jvt::Commitment {
 }
 
 /// Serialize a field element to 32 bytes.
-fn field_element_to_bytes(fe: jvt::commitment::FieldElement) -> Vec<u8> {
-    use ark_serialize::CanonicalSerialize;
+pub fn field_element_to_bytes(fe: jvt::commitment::FieldElement) -> Vec<u8> {
     let mut buf = vec![0u8; 32];
     fe.0.serialize_compressed(&mut buf[..])
         .expect("field element serialization should never fail");
@@ -188,25 +186,13 @@ fn field_element_to_bytes(fe: jvt::commitment::FieldElement) -> Vec<u8> {
 /// Must use `deserialize_compressed` to match `field_element_to_bytes` which uses
 /// `serialize_compressed`. Using `from_le_bytes_mod_order` would silently corrupt
 /// the value (it reduces mod p, which is not the inverse of canonical serialization).
-fn bytes_to_field_element(bytes: &[u8]) -> jvt::commitment::FieldElement {
+pub fn bytes_to_field_element(bytes: &[u8]) -> jvt::commitment::FieldElement {
     jvt::commitment::FieldElement(
         Fr::deserialize_compressed(bytes).expect("stored field element bytes should be valid"),
     )
 }
 
-/// Convert a JVT commitment to a hyperscale Hash (for state root, value hashes).
-///
-/// Uses compressed serialization (32 bytes) for the consensus-visible identity.
-/// This is separate from the storage format (uncompressed) — the hash is what
-/// goes into block headers and QCs.
-pub fn commitment_to_hash(c: jvt::Commitment) -> Hash {
-    let mut buf = [0u8; 32];
-    c.0.serialize_compressed(&mut buf[..])
-        .expect("Bandersnatch point serialization should never fail");
-    Hash::from_hash_bytes(&buf)
-}
-
-// ─── JVT ↔ Stored conversions ──────────────────────────────────────────
+// --- JVT <-> Stored conversions ---------------------------------------------
 
 impl StoredNode {
     /// Convert from a JVT node.
@@ -250,7 +236,7 @@ impl StoredNode {
     /// Convert back to a JVT node.
     ///
     /// Constructs nodes directly from stored commitments and cached field elements.
-    /// No `commitment_to_field` calls for internal node children — the field values
+    /// No `commitment_to_field` calls for internal node children -- the field values
     /// are pre-stored.
     pub fn to_jvt(&self) -> jvt::Node {
         match self {
@@ -290,87 +276,6 @@ impl StoredNode {
                     extension_commitment: bytes_to_commitment(&eas.extension_commitment),
                 }))
             }
-        }
-    }
-}
-
-// ─── Storage traits ─────────────────────────────────────────────────────
-
-/// Read-only access to stored tree nodes.
-pub trait ReadableTreeStore {
-    fn get_node(&self, key: &StoredNodeKey) -> Option<StoredNode>;
-
-    /// Batch-fetch multiple nodes at once. Default falls back to individual gets.
-    /// Override this for storage backends that support batch reads (e.g. RocksDB multi_get).
-    fn get_nodes_batch(&self, keys: &[StoredNodeKey]) -> Vec<Option<StoredNode>> {
-        keys.iter().map(|k| self.get_node(k)).collect()
-    }
-}
-
-/// Write access to stored tree nodes.
-pub trait WriteableTreeStore {
-    fn insert_node(&self, key: StoredNodeKey, node: StoredNode);
-    fn record_stale_tree_part(&self, part: StaleTreePart);
-}
-
-// ─── In-memory implementation ───────────────────────────────────────────
-
-/// In-memory tree store for tests and simulation.
-#[derive(Debug)]
-pub struct TypedInMemoryTreeStore {
-    pub tree_nodes: RwLock<HashMap<StoredNodeKey, StoredNode>>,
-    pub stale_part_buffer: RwLock<Vec<StaleTreePart>>,
-    pub pruning_enabled: bool,
-}
-
-impl TypedInMemoryTreeStore {
-    pub fn new() -> Self {
-        Self {
-            tree_nodes: RwLock::new(HashMap::new()),
-            stale_part_buffer: RwLock::new(Vec::new()),
-            pruning_enabled: false,
-        }
-    }
-
-    pub fn with_pruning_enabled(self) -> Self {
-        Self {
-            pruning_enabled: true,
-            ..self
-        }
-    }
-}
-
-impl Default for TypedInMemoryTreeStore {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl ReadableTreeStore for TypedInMemoryTreeStore {
-    fn get_node(&self, key: &StoredNodeKey) -> Option<StoredNode> {
-        self.tree_nodes.read().unwrap().get(key).cloned()
-    }
-}
-
-impl WriteableTreeStore for TypedInMemoryTreeStore {
-    fn insert_node(&self, key: StoredNodeKey, node: StoredNode) {
-        self.tree_nodes.write().unwrap().insert(key, node);
-    }
-
-    fn record_stale_tree_part(&self, part: StaleTreePart) {
-        if self.pruning_enabled {
-            match part {
-                StaleTreePart::Node(node_key) => {
-                    self.tree_nodes.write().unwrap().remove(&node_key);
-                }
-                StaleTreePart::Subtree(node_key) => {
-                    // For pruning, just remove the root. A more thorough impl
-                    // would walk the subtree, but for now this is sufficient.
-                    self.tree_nodes.write().unwrap().remove(&node_key);
-                }
-            }
-        } else {
-            self.stale_part_buffer.write().unwrap().push(part);
         }
     }
 }

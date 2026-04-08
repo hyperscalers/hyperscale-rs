@@ -2,12 +2,21 @@
 name = "hyperscale-storage"
 version.workspace = true
 edition.workspace = true
-description = "Storage traits and shared types"
+description = "Storage traits, verkle state tree, and shared types"
 
 [dependencies]
 # Internal crates
 hyperscale-types.workspace = true
-hyperscale-state-tree.workspace = true
+
+# JVT (Jellyfish Verkle Tree)
+jellyfish-verkle-tree.workspace = true
+
+# Cryptography (for proof serialization and commitment conversion)
+ark-ed-on-bls12-381-bandersnatch.workspace = true
+ark-serialize.workspace = true
+
+# Hashing
+blake3.workspace = true
 
 # Radix dependencies (for SubstateDatabase, DatabaseUpdates, etc.)
 radix-common.workspace = true

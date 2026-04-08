@@ -5,7 +5,7 @@
 
 use crate::typed_cf::*;
 
-use hyperscale_storage::jmt::{StoredNodeKey, VersionedStoredNode};
+use crate::jvt_stored::{StoredNodeKey, VersionedStoredNode};
 use hyperscale_types::{
     BlockMetadata, ExecutionCertificate, Hash, LedgerTransactionReceipt, LocalTransactionExecution,
     RoutableTransaction, TransactionCertificate,
@@ -208,9 +208,9 @@ pub(crate) struct StaleJvtNodesCf;
 impl TypedCf for StaleJvtNodesCf {
     const NAME: &'static str = STALE_JVT_NODES_CF;
     type Key = u64; // version at which nodes became stale
-    type Value = Vec<hyperscale_storage::jmt::StaleTreePart>;
+    type Value = Vec<crate::jvt_stored::StaleTreePart>;
     type KeyCodec = BeU64Codec;
-    type ValueCodec = SborCodec<Vec<hyperscale_storage::jmt::StaleTreePart>>;
+    type ValueCodec = SborCodec<Vec<crate::jvt_stored::StaleTreePart>>;
     fn handle<'a>(cf: &CfHandles<'a>) -> &'a rocksdb::ColumnFamily {
         cf.stale_jvt_nodes
     }

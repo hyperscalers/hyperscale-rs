@@ -8,7 +8,7 @@
 //!
 //! # JVT Integration
 //!
-//! Uses `TypedInMemoryTreeStore` for Jellyfish Verkle Tree tracking, providing
+//! Uses `SimTreeStore` for Jellyfish Verkle Tree tracking, providing
 //! `jvt_version()` and `state_root_hash()` for state commitment. This ensures
 //! simulation has identical JVT behavior to production.
 
@@ -18,6 +18,7 @@ pub(crate) mod core;
 mod snapshot;
 mod state;
 mod store;
+mod tree_store;
 
 #[cfg(test)]
 mod tests;

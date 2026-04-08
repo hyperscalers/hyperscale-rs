@@ -14,6 +14,8 @@
 use crate::column_families::{CfHandles, HOT_WRITE_COLUMN_FAMILIES};
 use crate::config::RocksDbConfig;
 use crate::jvt_snapshot_store::SnapshotTreeStore;
+use crate::jvt_stored::{StoredNode, StoredNodeKey, VersionedStoredNode};
+use crate::node_cache::NodeCache;
 use crate::typed_cf::{DbCodec, TypedCf};
 
 /// Sort keys deleted by partition Reset operations, keyed by `(entity_key, partition_num)`.
@@ -23,10 +25,10 @@ pub(crate) type ResetOldKeys = std::collections::HashMap<(Vec<u8>, u8), Vec<DbSo
 
 use hyperscale_metrics as metrics;
 use hyperscale_storage::{
-    jmt::{ReadableTreeStore, StoredNode, StoredNodeKey, VersionedStoredNode},
     DatabaseUpdate, DatabaseUpdates, DbPartitionKey, DbSortKey, DbSubstateValue, JvtSnapshot,
     PartitionDatabaseUpdates, PartitionEntry, StateRootHash, SubstateDatabase,
 };
+use jellyfish_verkle_tree as jvt;
 use rocksdb::{ColumnFamilyDescriptor, Options, WriteBatch, DB};
 use sbor::prelude::*;
 use std::path::Path;
@@ -64,7 +66,7 @@ pub struct RocksDbStorage {
     /// `StoredNode::to_jvt()` conversion on repeated proof generations.
     /// Populated eagerly during `put_at_version` (commit path) and lazily
     /// during proof prefetch (read path).
-    pub(crate) node_cache: hyperscale_storage::jmt::NodeCache,
+    pub(crate) node_cache: NodeCache,
 }
 
 /// Error type for storage operations.
@@ -180,7 +182,7 @@ impl RocksDbStorage {
             db: Arc::new(db),
             commit_lock: Mutex::new(()),
             jvt_history_length: config.jvt_history_length,
-            node_cache: hyperscale_storage::jmt::NodeCache::new(),
+            node_cache: NodeCache::new(),
         })
     }
 
@@ -274,8 +276,8 @@ impl RocksDbStorage {
         // JVT nodes — serialize hydrated nodes to stored form at write time.
         let cf = self.cf();
         for (jvt_key, jvt_node) in &snapshot.nodes {
-            let stored_key = hyperscale_storage::jmt::StoredNodeKey::from_jvt(jvt_key);
-            let stored_node = hyperscale_storage::jmt::StoredNode::from_jvt(jvt_node);
+            let stored_key = StoredNodeKey::from_jvt(jvt_key);
+            let stored_node = StoredNode::from_jvt(jvt_node);
             crate::typed_cf::batch_put::<crate::column_families::JvtNodesCf>(
                 batch,
                 crate::column_families::JvtNodesCf::handle(&cf),
@@ -287,10 +289,10 @@ impl RocksDbStorage {
         // Stale nodes for deferred GC — keyed by the version at which they became stale.
         if !snapshot.stale_node_keys.is_empty() {
             // Wrap keys as StaleTreePart::Node for SBOR serialization.
-            let stale_parts: Vec<hyperscale_storage::jmt::StaleTreePart> = snapshot
+            let stale_parts: Vec<crate::jvt_stored::StaleTreePart> = snapshot
                 .stale_node_keys
                 .iter()
-                .map(|k| hyperscale_storage::jmt::StaleTreePart::Node(k.clone()))
+                .map(|k| crate::jvt_stored::StaleTreePart::Node(StoredNodeKey::from_jvt(k)))
                 .collect();
             crate::typed_cf::batch_put::<crate::column_families::StaleJvtNodesCf>(
                 batch,
@@ -458,16 +460,15 @@ impl RocksDbStorage {
             "finalize_genesis_jvt called but JVT already initialized (version={current_version})"
         );
 
-        let snapshot_store = SnapshotTreeStore::new(&self.db);
+        let snapshot_store = SnapshotTreeStore::new(&self.db, &self.node_cache);
 
         // parent=None, version=0: genesis is the first JVT state.
-        let (root, collected) = hyperscale_storage::jmt::put_at_version(
+        let (root, collected) = hyperscale_storage::tree::put_at_version(
             &snapshot_store,
             None,
             0,
             merged,
             &Default::default(),
-            &self.node_cache,
         );
         let jvt_snapshot =
             JvtSnapshot::from_collected_writes(collected, StateRootHash::ZERO, 0, root, 0);
@@ -541,17 +542,38 @@ impl SubstateDatabase for RocksDbStorage {
     }
 }
 
-impl ReadableTreeStore for RocksDbStorage {
-    fn get_node(&self, key: &StoredNodeKey) -> Option<StoredNode> {
-        self.cf_get::<crate::column_families::JvtNodesCf>(key)
-            .map(|v| v.into_latest())
+impl jvt::TreeReader for RocksDbStorage {
+    fn get_node(&self, key: &jvt::NodeKey) -> Option<Arc<jvt::Node>> {
+        // Fast path: serve from in-memory cache.
+        if let Some(node) = self.node_cache.get(key) {
+            return Some(node);
+        }
+        // Slow path: storage read + deserialize.
+        let stored_key = StoredNodeKey::from_jvt(key);
+        let node = self
+            .cf_get::<crate::column_families::JvtNodesCf>(&stored_key)
+            .map(|v| Arc::new(v.into_latest().to_jvt()));
+        // Populate cache on miss so subsequent reads benefit.
+        if let Some(ref n) = node {
+            self.node_cache.insert(key.clone(), Arc::clone(n));
+        }
+        node
     }
 
-    fn get_nodes_batch(&self, keys: &[StoredNodeKey]) -> Vec<Option<StoredNode>> {
-        self.cf_multi_get::<crate::column_families::JvtNodesCf>(keys)
-            .into_iter()
-            .map(|opt| opt.map(|v| v.into_latest()))
-            .collect()
+    fn get_root_key(&self, version: u64) -> Option<jvt::NodeKey> {
+        let root = jvt::NodeKey::root(version);
+        if self.node_cache.get(&root).is_some() {
+            return Some(root);
+        }
+        let stored_key = StoredNodeKey::from_jvt(&root);
+        if self
+            .cf_get::<crate::column_families::JvtNodesCf>(&stored_key)
+            .is_some()
+        {
+            Some(root)
+        } else {
+            None
+        }
     }
 }
 
@@ -571,24 +593,23 @@ impl RocksDbStorage {
         let start = Instant::now();
 
         // Compute JVT updates using a snapshot-based store for isolation
-        let snapshot_store = SnapshotTreeStore::new(&self.db);
+        let snapshot_store = SnapshotTreeStore::new(&self.db, &self.node_cache);
         let (base_version, base_root) = snapshot_store.read_jvt_metadata();
 
         // Version 0 with a non-zero root means genesis has been computed at version 0.
         // Only treat as "no parent" when the JVT is truly empty.
-        let parent_version = hyperscale_storage::jvt_parent_height(base_version, base_root);
+        let parent_version = hyperscale_storage::tree::jvt_parent_height(base_version, base_root);
         let new_version = base_version + 1;
 
         let (mut batch, reset_old_keys) =
             self.build_substate_write_batch(updates, Some(new_version));
 
-        let (new_root, collected) = hyperscale_storage::jmt::put_at_version(
+        let (new_root, collected) = hyperscale_storage::tree::put_at_version(
             &snapshot_store,
             parent_version,
             new_version,
             updates,
             &reset_old_keys,
-            &self.node_cache,
         );
         let jvt_snapshot = JvtSnapshot::from_collected_writes(
             collected,

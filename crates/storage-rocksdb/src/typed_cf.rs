@@ -95,13 +95,13 @@ impl DbCodec<Vec<u8>> for RawCodec {
 #[derive(Default)]
 pub(crate) struct JvtKeyCodec;
 
-impl DbCodec<hyperscale_storage::jmt::StoredNodeKey> for JvtKeyCodec {
-    fn encode_to(&self, value: &hyperscale_storage::jmt::StoredNodeKey, buf: &mut Vec<u8>) {
-        let encoded = hyperscale_storage::jmt::encode_key(value);
+impl DbCodec<crate::jvt_stored::StoredNodeKey> for JvtKeyCodec {
+    fn encode_to(&self, value: &crate::jvt_stored::StoredNodeKey, buf: &mut Vec<u8>) {
+        let encoded = crate::jvt_stored::encode_key(value);
         buf.extend_from_slice(&encoded);
     }
 
-    fn decode(&self, _bytes: &[u8]) -> hyperscale_storage::jmt::StoredNodeKey {
+    fn decode(&self, _bytes: &[u8]) -> crate::jvt_stored::StoredNodeKey {
         // JVT keys are only encoded for writes/lookups, never decoded from raw bytes
         // in our codebase (the decode path goes through SBOR for the node values).
         unimplemented!("JVT key decoding not needed — keys are write-only in RocksDB")

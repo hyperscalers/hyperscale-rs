@@ -105,7 +105,7 @@ impl hyperscale_storage::CommitStore for RocksDbStorage {
         let _commit_guard = self.commit_lock.lock().unwrap();
 
         // Single snapshot for both validation and JVT computation.
-        let snapshot_store = SnapshotTreeStore::new(&self.db);
+        let snapshot_store = SnapshotTreeStore::new(&self.db, &self.node_cache);
         let (base_version, base_root) = snapshot_store.read_jvt_metadata();
 
         // Validate block_height is strictly greater than current version.
@@ -133,14 +133,13 @@ impl hyperscale_storage::CommitStore for RocksDbStorage {
         );
 
         // Compute JVT update.
-        let parent_version = hyperscale_storage::jvt_parent_height(base_version, base_root);
-        let (new_root, collected) = hyperscale_storage::jmt::put_at_version(
+        let parent_version = hyperscale_storage::tree::jvt_parent_height(base_version, base_root);
+        let (new_root, collected) = hyperscale_storage::tree::put_at_version(
             &snapshot_store,
             parent_version,
             block_height,
             merged_updates,
             &reset_old_keys,
-            &self.node_cache,
         );
         let jvt_snapshot = JvtSnapshot::from_collected_writes(
             collected,

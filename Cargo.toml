@@ -23,7 +23,7 @@ members = [
     "crates/simulation",
     "crates/simulator",
     "crates/spammer",
-    "crates/state-tree",
+
     "crates/storage",
     "crates/storage-memory",
     "crates/storage-rocksdb",
@@ -55,7 +55,7 @@ default-members = [
     "crates/simulation",
     "crates/simulator",
     "crates/spammer",
-    "crates/state-tree",
+
     "crates/storage",
     "crates/storage-memory",
     "crates/storage-rocksdb",
@@ -93,7 +93,6 @@ hyperscale-remote-headers = { path = "crates/remote-headers" }
 hyperscale-simulation = { path = "crates/simulation" }
 hyperscale-simulator = { path = "crates/simulator" }
 hyperscale-spammer = { path = "crates/spammer" }
-hyperscale-state-tree = { path = "crates/state-tree" }
 hyperscale-storage = { path = "crates/storage" }
 hyperscale-storage-memory = { path = "crates/storage-memory" }
 hyperscale-storage-rocksdb = { path = "crates/storage-rocksdb" }

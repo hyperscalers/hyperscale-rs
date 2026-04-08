@@ -45,7 +45,7 @@ impl NodeCache {
 
     /// Insert a single node.
     ///
-    /// Used by `StoreAdapter` to populate the cache on read-miss (committed
+    /// Used by `TreeReader` impls to populate the cache on read-miss (committed
     /// data read from storage). For bulk insertion after block commit, use
     /// [`populate`] instead.
     pub fn insert(&self, key: jvt::NodeKey, node: Arc<jvt::Node>) {
@@ -75,6 +75,7 @@ impl NodeCache {
     }
 
     /// Whether the cache is empty.
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }

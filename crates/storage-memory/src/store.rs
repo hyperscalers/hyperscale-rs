@@ -107,11 +107,6 @@ impl SubstateStore for SimStorage {
         block_height: u64,
     ) -> Option<hyperscale_types::SubstateInclusionProof> {
         let s = self.state.read().unwrap();
-        hyperscale_storage::proofs::generate_proof(
-            &s.tree_store,
-            storage_keys,
-            block_height,
-            &self.node_cache,
-        )
+        hyperscale_storage::tree::proofs::generate_proof(&s.tree_store, storage_keys, block_height)
     }
 }

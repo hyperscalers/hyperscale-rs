@@ -32,7 +32,6 @@ Rust implementation of Hyperscale consensus protocol.
 | `hyperscale-network` | Shared network protocol logic: Network trait, handler registry, wire framing |
 | `hyperscale-network-libp2p` | Production libp2p transport with gossipsub broadcast and QUIC/TCP streams |
 | `hyperscale-network-memory` | Deterministic in-memory network for simulation with configurable latency and partitions |
-| `hyperscale-state-tree` | Jellyfish Verkle Tree implementation with Blake3 hashing and parallel dispatch |
 | `hyperscale-storage` | Storage trait abstractions (SubstateStore, CommitStore, ConsensusStore) and JVT integration |
 | `hyperscale-storage-rocksdb` | Production RocksDB storage with JVT state roots and snapshot isolation |
 | `hyperscale-storage-memory` | In-memory storage using persistent data structures for deterministic simulation |
