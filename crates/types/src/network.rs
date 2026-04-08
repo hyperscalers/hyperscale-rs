@@ -40,7 +40,6 @@ pub enum MessagePriority {
     /// - `BlockHeaderNotification` - block proposals
     /// - `BlockVoteNotification` - votes on proposals
     /// - `GetTransactionsRequest/Response` - unblock pending blocks
-    /// - `GetCertificatesRequest/Response` - unblock pending blocks
     ///
     /// Never dropped, processed immediately.
     Critical = 0,

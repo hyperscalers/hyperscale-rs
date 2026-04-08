@@ -4,7 +4,7 @@ use crate::ProtocolEvent;
 use hyperscale_types::{
     Block, BlockHeight, Bls12381G1PublicKey, Bls12381G2Signature, CommittedBlockHeader,
     ExecutionCertificate, Hash, LocalReceiptEntry, ProvisionBatch, QuorumCertificate,
-    RoutableTransaction, ShardGroupId, TransactionInclusionProof, ValidatorId, WaveCertificate,
+    RoutableTransaction, ShardGroupId, TransactionInclusionProof, ValidatorId,
 };
 use std::sync::Arc;
 
@@ -148,15 +148,6 @@ pub enum NodeInput {
         block_height: u64,
     },
 
-    /// Wave certificates successfully fetched for a pending block.
-    CertificateReceived {
-        block_hash: Hash,
-        certificates: Vec<Arc<WaveCertificate>>,
-    },
-
-    /// A wave certificate fetch request failed.
-    FetchCertificatesFailed { block_hash: Hash },
-
     /// Committed block header successfully fetched from a source shard.
     HeaderFetchReceived {
         source_shard: ShardGroupId,
@@ -216,8 +207,6 @@ impl NodeInput {
             NodeInput::InclusionProofFetchFailed { .. } => EventPriority::Internal,
             NodeInput::ExecCertFetchReceived { .. } => EventPriority::Internal,
             NodeInput::ExecCertFetchFailed { .. } => EventPriority::Internal,
-            NodeInput::CertificateReceived { .. } => EventPriority::Internal,
-            NodeInput::FetchCertificatesFailed { .. } => EventPriority::Internal,
             NodeInput::HeaderFetchReceived { .. } => EventPriority::Internal,
             NodeInput::HeaderFetchFailed { .. } => EventPriority::Internal,
         }
@@ -259,8 +248,6 @@ impl NodeInput {
             NodeInput::InclusionProofFetchFailed { .. } => "InclusionProofFetchFailed",
             NodeInput::ExecCertFetchReceived { .. } => "ExecCertFetchReceived",
             NodeInput::ExecCertFetchFailed { .. } => "ExecCertFetchFailed",
-            NodeInput::CertificateReceived { .. } => "CertificateReceived",
-            NodeInput::FetchCertificatesFailed { .. } => "FetchCertificatesFailed",
             NodeInput::HeaderFetchReceived { .. } => "HeaderFetchReceived",
             NodeInput::HeaderFetchFailed { .. } => "HeaderFetchFailed",
         }

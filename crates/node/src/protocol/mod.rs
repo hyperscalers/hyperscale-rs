@@ -4,4 +4,3 @@ pub mod inclusion_proof_fetch;
 pub mod provision_fetch;
 pub mod sync;
 pub mod transaction_fetch;
-pub mod wave_cert_fetch;

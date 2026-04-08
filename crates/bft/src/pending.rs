@@ -149,11 +149,6 @@ impl PendingBlock {
         self.missing_wave_hashes.len()
     }
 
-    /// Get the missing wave hashes as a Vec (for display).
-    pub fn missing_waves(&self) -> Vec<Hash> {
-        self.missing_wave_hashes.iter().copied().collect()
-    }
-
     /// Check if this pending block needs a specific finalized wave.
     pub fn needs_wave(&self, wave_id_hash: &Hash) -> bool {
         self.missing_wave_hashes.contains(wave_id_hash)
