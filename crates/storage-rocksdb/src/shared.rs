@@ -13,8 +13,7 @@ use crate::core::RocksDbStorage;
 use crate::snapshot::RocksDbSnapshot;
 
 use hyperscale_storage::{
-    DatabaseUpdates, DbPartitionKey, DbSortKey, DbSubstateValue, PartitionEntry, SubstateDatabase,
-    SubstateStore,
+    DbPartitionKey, DbSortKey, DbSubstateValue, PartitionEntry, SubstateDatabase, SubstateStore,
 };
 use hyperscale_types::{
     Block, BlockHeight, Hash, NodeId, QuorumCertificate, RoutableTransaction, ShardGroupId,
@@ -76,7 +75,7 @@ impl SubstateDatabase for SharedStorage {
 
 #[cfg(test)]
 impl hyperscale_storage::CommittableSubstateDatabase for SharedStorage {
-    fn commit(&mut self, updates: &DatabaseUpdates) {
+    fn commit(&mut self, updates: &hyperscale_storage::DatabaseUpdates) {
         RocksDbStorage::commit(&self.0, updates)
             .expect("Storage commit failed - cannot maintain consistent state");
     }
@@ -124,11 +123,11 @@ impl hyperscale_storage::ChainWriter for SharedStorage {
     fn prepare_block_commit(
         &self,
         parent_state_root: Hash,
-        merged_updates: &DatabaseUpdates,
+        receipts: &[hyperscale_types::ReceiptBundle],
         block_height: u64,
     ) -> (Hash, Self::PreparedCommit) {
         self.0
-            .prepare_block_commit(parent_state_root, merged_updates, block_height)
+            .prepare_block_commit(parent_state_root, receipts, block_height)
     }
 
     fn commit_prepared_block(
@@ -137,22 +136,20 @@ impl hyperscale_storage::ChainWriter for SharedStorage {
         block: &Arc<hyperscale_types::Block>,
         qc: &Arc<hyperscale_types::QuorumCertificate>,
         execution_certificates: &[Arc<hyperscale_types::ExecutionCertificate>],
-        receipts: &[hyperscale_types::ReceiptBundle],
     ) -> hyperscale_types::Hash {
         self.0
-            .commit_prepared_block(prepared, block, qc, execution_certificates, receipts)
+            .commit_prepared_block(prepared, block, qc, execution_certificates)
     }
 
     fn commit_block(
         &self,
-        merged_updates: &DatabaseUpdates,
         block: &Arc<hyperscale_types::Block>,
         qc: &Arc<hyperscale_types::QuorumCertificate>,
         execution_certificates: &[Arc<hyperscale_types::ExecutionCertificate>],
         receipts: &[hyperscale_types::ReceiptBundle],
     ) -> hyperscale_types::Hash {
         self.0
-            .commit_block(merged_updates, block, qc, execution_certificates, receipts)
+            .commit_block(block, qc, execution_certificates, receipts)
     }
 
     fn memory_usage_bytes(&self) -> (u64, u64) {

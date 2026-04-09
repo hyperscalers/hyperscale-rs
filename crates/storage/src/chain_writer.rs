@@ -5,7 +5,6 @@
 //! carries precomputed work; `commit_prepared_block` applies it efficiently.
 
 use hyperscale_types::{Block, ExecutionCertificate, Hash, QuorumCertificate, ReceiptBundle};
-use radix_substate_store_interface::interface::DatabaseUpdates;
 use std::sync::Arc;
 
 /// Abstracts state commitment for both simulation and production storage.
@@ -27,9 +26,8 @@ pub trait ChainWriter: Send + Sync {
 
     /// Compute speculative state root and return precomputed commit work.
     ///
-    /// Receives pre-merged `DatabaseUpdates` (already filtered to local shard)
-    /// and computes the speculative JVT root. The caller is responsible for
-    /// sourcing the writes (from execution cache or receipt storage) and merging.
+    /// Extracts and merges `DatabaseUpdates` from the receipts internally,
+    /// then computes the speculative JVT root.
     ///
     /// `block_height` is the height of the block being prepared (used as JVT version).
     ///
@@ -37,38 +35,34 @@ pub trait ChainWriter: Send + Sync {
     fn prepare_block_commit(
         &self,
         parent_state_root: Hash,
-        merged_updates: &DatabaseUpdates,
+        receipts: &[ReceiptBundle],
         block_height: u64,
     ) -> (Hash, Self::PreparedCommit);
 
     /// Commit a block using precomputed work from `prepare_block_commit`.
     ///
     /// This is the fast path: applies the cached `WriteBatch`/`JvtSnapshot`
-    /// directly. Falls back to per-certificate recompute if the prepared
-    /// data is stale (base root/version mismatch).
+    /// directly. Falls back to recompute from the receipts baked into the
+    /// prepared handle if the prepared data is stale (base root/version mismatch).
     ///
-    /// `certificates` are stored to the certificate column family for querying.
-    ///
-    /// When `consensus` is provided, the consensus metadata is written
-    /// atomically in the same batch as the JVT + substate data.
+    /// Receipt writes are already included in the prepared handle — callers
+    /// only need to supply data that wasn't known at prepare time (block, QC,
+    /// execution certificates).
     fn commit_prepared_block(
         &self,
         prepared: Self::PreparedCommit,
         block: &Arc<Block>,
         qc: &Arc<QuorumCertificate>,
         execution_certificates: &[Arc<ExecutionCertificate>],
-        receipts: &[ReceiptBundle],
     ) -> Hash;
 
     /// Commit a block's state writes from scratch (no prepared handle).
     ///
+    /// Extracts and merges `DatabaseUpdates` from the receipts internally.
     /// Used when no `PreparedCommit` is available (e.g., sync blocks,
     /// cache eviction, or proposer fast-path not applicable).
-    ///
-    /// `block_height` is the height of the block being committed (used as JVT version).
     fn commit_block(
         &self,
-        merged_updates: &DatabaseUpdates,
         block: &Arc<Block>,
         qc: &Arc<QuorumCertificate>,
         execution_certificates: &[Arc<ExecutionCertificate>],

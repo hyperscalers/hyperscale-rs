@@ -444,15 +444,10 @@ where
                 };
                 let block_hash = block.hash();
                 let height = block.header.height.0;
-                let empty_updates = hyperscale_types::DatabaseUpdates::default();
                 let ecs_for_this_block = std::mem::take(&mut remaining_ecs);
-                let result = self.storage.commit_block(
-                    &empty_updates,
-                    &block,
-                    &qc,
-                    &ecs_for_this_block,
-                    &[],
-                );
+                let result = self
+                    .storage
+                    .commit_block(&block, &qc, &ecs_for_this_block, &[]);
                 let _ =
                     self.event_sender
                         .send(NodeInput::Protocol(ProtocolEvent::BlockCommitted {
@@ -573,28 +568,14 @@ where
                             .collect();
 
                         if let Some(prepared) = prepared {
-                            storage.commit_prepared_block(
-                                prepared,
-                                block,
-                                qc,
-                                &ecs_for_this_block,
-                                &wave_receipts,
-                            )
+                            storage.commit_prepared_block(prepared, block, qc, &ecs_for_this_block)
                         } else {
-                            let empty = hyperscale_types::DatabaseUpdates::default();
-                            storage.commit_block(
-                                &empty,
-                                block,
-                                qc,
-                                &ecs_for_this_block,
-                                &wave_receipts,
-                            )
+                            storage.commit_block(block, qc, &ecs_for_this_block, &wave_receipts)
                         }
                     }
                     super::PendingCommit::Synced { ref block, ref qc } => {
                         if block.certificates.is_empty() {
-                            let empty = hyperscale_types::DatabaseUpdates::default();
-                            storage.commit_block(&empty, block, qc, &ecs_for_this_block, &[])
+                            storage.commit_block(block, qc, &ecs_for_this_block, &[])
                         } else if let Some(entry) = sync_data.get(&height.0) {
                             let (receipts, sync_ecs) =
                                 (&entry.local_receipts, &entry.execution_certificates);
@@ -614,17 +595,23 @@ where
                                 );
                             }
 
-                            // Read shard-filtered DatabaseUpdates from receipts.
-                            let per_cert: Vec<hyperscale_types::DatabaseUpdates> =
+                            // Convert sync receipts to ReceiptBundles.
+                            let sync_receipt_bundles: Vec<hyperscale_types::ReceiptBundle> =
                                 if !receipts.is_empty() {
                                     receipts
                                         .iter()
-                                        .map(|entry| entry.receipt.database_updates.clone())
+                                        .map(|entry| hyperscale_types::ReceiptBundle {
+                                            tx_hash: entry.tx_hash,
+                                            local_receipt: std::sync::Arc::new(
+                                                entry.receipt.clone(),
+                                            ),
+                                            execution_output: None,
+                                        })
                                         .collect()
                                 } else {
                                     // Fallback: derive from wave certs' source blocks.
                                     let topo = topology.load();
-                                    let mut updates = Vec::new();
+                                    let mut bundles = Vec::new();
                                     for wc in &block.certificates {
                                         let source_height =
                                             hyperscale_types::BlockHeight(wc.wave_id.block_height);
@@ -640,19 +627,25 @@ where
                                                 if let Some(receipt) =
                                                     storage.get_local_receipt(&tx_hash)
                                                 {
-                                                    updates.push(receipt.database_updates.clone());
+                                                    bundles.push(hyperscale_types::ReceiptBundle {
+                                                        tx_hash,
+                                                        local_receipt: receipt,
+                                                        execution_output: None,
+                                                    });
                                                 }
                                             }
                                         }
                                     }
-                                    updates
+                                    bundles
                                 };
-                            let merged = hyperscale_storage::merge_database_updates(&per_cert);
 
                             // Verify state_root via prepare→verify→commit.
                             let parent_root = storage.state_root_hash();
-                            let (computed_root, prepared) =
-                                storage.prepare_block_commit(parent_root, &merged, height.0);
+                            let (computed_root, prepared) = storage.prepare_block_commit(
+                                parent_root,
+                                &sync_receipt_bundles,
+                                height.0,
+                            );
                             if computed_root != block.header.state_root {
                                 tracing::warn!(
                                     height = height.0,
@@ -663,31 +656,13 @@ where
                                 );
                             }
 
-                            // Convert sync receipts to ReceiptBundles.
-                            let sync_receipt_bundles: Vec<hyperscale_types::ReceiptBundle> =
-                                receipts
-                                    .iter()
-                                    .map(|entry| hyperscale_types::ReceiptBundle {
-                                        tx_hash: entry.tx_hash,
-                                        local_receipt: std::sync::Arc::new(entry.receipt.clone()),
-                                        execution_output: None,
-                                    })
-                                    .collect();
-
-                            storage.commit_prepared_block(
-                                prepared,
-                                block,
-                                qc,
-                                sync_ecs,
-                                &sync_receipt_bundles,
-                            )
+                            storage.commit_prepared_block(prepared, block, qc, sync_ecs)
                         } else {
                             tracing::error!(
                                 height = height.0,
                                 "BUG: synced block with certs but no sync data"
                             );
-                            let empty = hyperscale_types::DatabaseUpdates::default();
-                            storage.commit_block(&empty, block, qc, &ecs_for_this_block, &[])
+                            storage.commit_block(block, qc, &ecs_for_this_block, &[])
                         }
                     }
                 };

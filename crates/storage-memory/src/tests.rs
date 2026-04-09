@@ -18,12 +18,20 @@ fn commit_with(
     block: &hyperscale_types::Block,
     qc: &hyperscale_types::QuorumCertificate,
 ) -> Hash {
+    let receipts = vec![hyperscale_types::ReceiptBundle {
+        tx_hash: Hash::ZERO,
+        local_receipt: Arc::new(hyperscale_types::LocalReceipt {
+            outcome: hyperscale_types::TransactionOutcome::Success,
+            database_updates: updates.clone(),
+            application_events: vec![],
+        }),
+        execution_output: None,
+    }];
     storage.commit_block(
-        updates,
         &Arc::new(block.clone()),
         &Arc::new(qc.clone()),
         &[],
-        &[],
+        &receipts,
     )
 }
 
@@ -391,13 +399,11 @@ fn test_prepare_then_commit_fast_path() {
 
     // Prepare path
     let parent_root = s_prepared.state_root_hash();
-    let (spec_root, prepared) =
-        s_prepared.prepare_block_commit(parent_root, &DatabaseUpdates::default(), 1);
+    let (spec_root, prepared) = s_prepared.prepare_block_commit(parent_root, &[], 1);
     let result_prepared = s_prepared.commit_prepared_block(
         prepared,
         &Arc::new(block.clone()),
         &Arc::new(qc.clone()),
-        &[],
         &[],
     );
 
@@ -415,9 +421,8 @@ fn test_prepare_commit_state_root_matches() {
     let qc = make_test_qc(&block);
 
     let parent_root = storage.state_root_hash();
-    let (spec_root, prepared) =
-        storage.prepare_block_commit(parent_root, &DatabaseUpdates::default(), 1);
-    let result = storage.commit_prepared_block(prepared, &Arc::new(block), &Arc::new(qc), &[], &[]);
+    let (spec_root, prepared) = storage.prepare_block_commit(parent_root, &[], 1);
+    let result = storage.commit_prepared_block(prepared, &Arc::new(block), &Arc::new(qc), &[]);
 
     assert_eq!(spec_root, result);
 }

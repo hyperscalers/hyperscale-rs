@@ -40,7 +40,10 @@ pub use genesis::{GenesisWrapper, SubstatesOnlyCommit};
 pub use overlay::{SubstateDbLookup, SubstateLookup};
 pub use store::SubstateStore;
 pub use tree::{CollectedWrites, JvtNodeKey, JvtSnapshot, LeafSubstateKeyAssociation};
-pub use writes::{merge_database_updates, merge_database_updates_from_arcs, merge_into};
+pub use writes::{
+    merge_database_updates, merge_database_updates_from_arcs, merge_into,
+    merge_updates_from_receipts,
+};
 
 /// An empty SubstateDatabase for use in tests and single-shard contexts
 /// where no storage reads are needed.

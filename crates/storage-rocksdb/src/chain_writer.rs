@@ -4,16 +4,18 @@ use crate::column_families::ALL_COLUMN_FAMILIES;
 use crate::core::RocksDbStorage;
 use crate::jvt_snapshot_store::SnapshotTreeStore;
 
-use hyperscale_storage::{DatabaseUpdates, JvtSnapshot};
+use hyperscale_storage::JvtSnapshot;
 use hyperscale_types::ReceiptBundle;
+use radix_substate_store_interface::interface::DatabaseUpdates;
 use rocksdb::WriteBatch;
 use std::sync::Arc;
 
 /// Precomputed commit work for a RocksDB block commit.
 ///
-/// Contains a pre-built `WriteBatch` (all certificate + state writes) and a
-/// `JvtSnapshot` (precomputed Verkle tree nodes). Also carries the certificates
-/// and shard for fallback recompute if the prepared data is stale.
+/// Contains a pre-built `WriteBatch` (substate + receipt writes) and a
+/// `JvtSnapshot` (precomputed Verkle tree nodes). Also carries the merged
+/// `DatabaseUpdates` and receipts for fallback recompute if the prepared
+/// data is stale.
 ///
 /// # Performance
 ///
@@ -23,6 +25,7 @@ pub struct RocksDbPreparedCommit {
     pub(crate) write_batch: WriteBatch,
     pub(crate) jvt_snapshot: JvtSnapshot,
     pub(crate) merged_updates: DatabaseUpdates,
+    pub(crate) receipts: Vec<ReceiptBundle>,
 }
 
 impl hyperscale_storage::ChainWriter for RocksDbStorage {
@@ -31,23 +34,30 @@ impl hyperscale_storage::ChainWriter for RocksDbStorage {
     fn prepare_block_commit(
         &self,
         parent_state_root: hyperscale_types::Hash,
-        merged_updates: &DatabaseUpdates,
+        receipts: &[ReceiptBundle],
         block_height: u64,
     ) -> (hyperscale_types::Hash, Self::PreparedCommit) {
+        let merged_updates = hyperscale_storage::merge_updates_from_receipts(receipts);
+
         let (computed_root, jvt_snapshot) = self.compute_speculative_root_from_base(
             parent_state_root,
-            std::slice::from_ref(merged_updates),
+            std::slice::from_ref(&merged_updates),
             block_height,
         );
 
-        // Pre-build substate writes into a WriteBatch for efficient commit.
-        let (write_batch, _reset_old_keys) =
-            self.build_substate_write_batch(merged_updates, Some(block_height));
+        // Pre-build substate + receipt writes into a WriteBatch for efficient commit.
+        let (mut write_batch, _reset_old_keys) =
+            self.build_substate_write_batch(&merged_updates, Some(block_height));
+
+        for bundle in receipts {
+            self.add_receipt_bundle_to_batch(&mut write_batch, bundle);
+        }
 
         let prepared = RocksDbPreparedCommit {
             write_batch,
             jvt_snapshot,
-            merged_updates: merged_updates.clone(),
+            merged_updates,
+            receipts: receipts.to_vec(),
         };
 
         (computed_root, prepared)
@@ -59,13 +69,13 @@ impl hyperscale_storage::ChainWriter for RocksDbStorage {
         block: &Arc<hyperscale_types::Block>,
         qc: &Arc<hyperscale_types::QuorumCertificate>,
         execution_certificates: &[Arc<hyperscale_types::ExecutionCertificate>],
-        receipts: &[ReceiptBundle],
     ) -> hyperscale_types::Hash {
         let result_root = prepared.jvt_snapshot.result_root;
 
         let mut write_batch = prepared.write_batch;
 
         // Persist block data (header, transactions, certificates) atomically.
+        // Receipt writes are already in the write_batch from prepare time.
         self.append_block_to_batch(&mut write_batch, block, qc);
 
         crate::execution_certs::append_execution_certs_to_batch(
@@ -74,27 +84,68 @@ impl hyperscale_storage::ChainWriter for RocksDbStorage {
             execution_certificates,
         );
 
-        for bundle in receipts {
-            self.add_receipt_bundle_to_batch(&mut write_batch, bundle);
-        }
-
         let used_fast_path =
             self.try_apply_prepared_commit(write_batch, prepared.jvt_snapshot, block, qc);
 
         if used_fast_path {
             result_root
         } else {
-            self.commit_block(
+            self.commit_block_inner(
                 &prepared.merged_updates,
                 block,
                 qc,
                 execution_certificates,
-                receipts,
+                &prepared.receipts,
             )
         }
     }
 
     fn commit_block(
+        &self,
+        block: &Arc<hyperscale_types::Block>,
+        qc: &Arc<hyperscale_types::QuorumCertificate>,
+        execution_certificates: &[Arc<hyperscale_types::ExecutionCertificate>],
+        receipts: &[ReceiptBundle],
+    ) -> hyperscale_types::Hash {
+        let merged_updates = hyperscale_storage::merge_updates_from_receipts(receipts);
+        self.commit_block_inner(&merged_updates, block, qc, execution_certificates, receipts)
+    }
+
+    fn memory_usage_bytes(&self) -> (u64, u64) {
+        let mut block_cache_usage = 0u64;
+        let mut memtable_usage = 0u64;
+
+        for cf_name in ALL_COLUMN_FAMILIES {
+            if let Some(cf) = self.db.cf_handle(cf_name) {
+                // Block cache is shared — reading from any CF gives the total.
+                // We read it once from the first CF we find.
+                if block_cache_usage == 0 {
+                    if let Ok(Some(val)) = self
+                        .db
+                        .property_int_value_cf(&cf, "rocksdb.block-cache-usage")
+                    {
+                        block_cache_usage = val;
+                    }
+                }
+                if let Ok(Some(val)) = self
+                    .db
+                    .property_int_value_cf(&cf, "rocksdb.cur-size-all-mem-tables")
+                {
+                    memtable_usage += val;
+                }
+            }
+        }
+        (block_cache_usage, memtable_usage)
+    }
+
+    fn node_cache_len(&self) -> usize {
+        self.node_cache.len()
+    }
+}
+
+impl RocksDbStorage {
+    /// Internal commit path used by both `commit_block` and `commit_prepared_block` fallback.
+    fn commit_block_inner(
         &self,
         merged_updates: &DatabaseUpdates,
         block: &Arc<hyperscale_types::Block>,
@@ -163,36 +214,5 @@ impl hyperscale_storage::ChainWriter for RocksDbStorage {
         self.node_cache.populate(&jvt_snapshot.nodes);
 
         new_root
-    }
-
-    fn memory_usage_bytes(&self) -> (u64, u64) {
-        let mut block_cache_usage = 0u64;
-        let mut memtable_usage = 0u64;
-
-        for cf_name in ALL_COLUMN_FAMILIES {
-            if let Some(cf) = self.db.cf_handle(cf_name) {
-                // Block cache is shared — reading from any CF gives the total.
-                // We read it once from the first CF we find.
-                if block_cache_usage == 0 {
-                    if let Ok(Some(val)) = self
-                        .db
-                        .property_int_value_cf(&cf, "rocksdb.block-cache-usage")
-                    {
-                        block_cache_usage = val;
-                    }
-                }
-                if let Ok(Some(val)) = self
-                    .db
-                    .property_int_value_cf(&cf, "rocksdb.cur-size-all-mem-tables")
-                {
-                    memtable_usage += val;
-                }
-            }
-        }
-        (block_cache_usage, memtable_usage)
-    }
-
-    fn node_cache_len(&self) -> usize {
-        self.node_cache.len()
     }
 }

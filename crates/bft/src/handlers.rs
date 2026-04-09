@@ -4,7 +4,7 @@
 //! algorithms, separated from dispatch (thread pool vs inline) and result
 //! delivery (channel vs event queue) concerns.
 
-use hyperscale_storage::{ChainWriter, DatabaseUpdates, SubstateStore};
+use hyperscale_storage::{ChainWriter, SubstateStore};
 use hyperscale_types::{
     batch_verify_bls_same_message, compute_certificate_root, compute_local_receipt_root,
     compute_transaction_root, verify_bls12381_v1, AbortIntent, Block, BlockHeader, BlockHeight,
@@ -290,17 +290,17 @@ pub struct StateRootResult<P: Send> {
 /// Verify that the computed state root matches the expected root.
 ///
 /// Calls `storage.prepare_block_commit()` to compute the speculative state root
-/// from the certificates, then compares against the expected root. Returns the
+/// from the receipts, then compares against the expected root. Returns the
 /// prepared commit handle for caching on success.
 pub fn verify_state_root<S: ChainWriter>(
     storage: &S,
     parent_state_root: Hash,
     expected_root: Hash,
-    merged_updates: &DatabaseUpdates,
+    receipts: &[ReceiptBundle],
     block_height: u64,
 ) -> StateRootResult<S::PreparedCommit> {
     let (computed_root, prepared) =
-        storage.prepare_block_commit(parent_state_root, merged_updates, block_height);
+        storage.prepare_block_commit(parent_state_root, receipts, block_height);
 
     let valid = computed_root == expected_root;
 
@@ -349,7 +349,6 @@ pub fn build_proposal<S: ChainWriter + SubstateStore>(
     transactions: Vec<Arc<RoutableTransaction>>,
     certificates: Vec<Arc<WaveCertificate>>,
     receipts: &[ReceiptBundle],
-    merged_updates: DatabaseUpdates,
     abort_intents: Vec<AbortIntent>,
     local_shard: ShardGroupId,
     waves: Vec<WaveId>,
@@ -363,8 +362,7 @@ pub fn build_proposal<S: ChainWriter + SubstateStore>(
 
     let (state_root, certs_to_include, prepared) = if include_certs {
         // JVT ready - compute speculative root and get prepared commit handle
-        let (root, prepared) =
-            storage.prepare_block_commit(parent_state_root, &merged_updates, height.0);
+        let (root, prepared) = storage.prepare_block_commit(parent_state_root, receipts, height.0);
         (root, certificates, Some(prepared))
     } else {
         // Either no certificates, or JVT not ready - inherit parent state

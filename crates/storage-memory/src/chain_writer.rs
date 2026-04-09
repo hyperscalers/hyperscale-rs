@@ -12,14 +12,15 @@ use std::sync::Arc;
 ///
 /// Contains a `JvtSnapshot` (precomputed verkle tree nodes), a pre-built
 /// `OrdMap` with all certificate substate writes already applied (for O(1)
-/// swap at commit time), plus the certificates and shard needed for
-/// `store_certificate` calls and fallback recompute.
+/// swap at commit time), plus the merged updates and receipts for fallback
+/// recompute.
 pub struct SimPreparedCommit {
     snapshot: JvtSnapshot,
     /// Pre-built OrdMap with all certificate substate writes already applied.
     /// O(1) clone from base at prepare time; O(1) swap at commit time.
     resulting_data: OrdMap<Vec<u8>, Vec<u8>>,
     merged_updates: DatabaseUpdates,
+    receipts: Vec<ReceiptBundle>,
 }
 
 impl ChainWriter for SimStorage {
@@ -28,9 +29,11 @@ impl ChainWriter for SimStorage {
     fn prepare_block_commit(
         &self,
         parent_state_root: Hash,
-        merged_updates: &DatabaseUpdates,
+        receipts: &[ReceiptBundle],
         block_height: u64,
     ) -> (Hash, Self::PreparedCommit) {
+        let merged_updates = hyperscale_storage::merge_updates_from_receipts(receipts);
+
         // Read lock: clone data + compute speculative JVT root concurrently.
         let s = self.state.read().unwrap();
         let base_data = s.data.clone();
@@ -50,7 +53,7 @@ impl ChainWriter for SimStorage {
             &s.tree_store,
             parent_version,
             block_height,
-            merged_updates,
+            &merged_updates,
             &Default::default(),
         );
 
@@ -67,12 +70,13 @@ impl ChainWriter for SimStorage {
         // Pre-apply all substate writes to a cloned OrdMap (O(1) clone).
         // No MVCC writes here — those happen at commit time.
         let mut resulting_data = base_data;
-        apply_updates_to_ordmap(&mut resulting_data, merged_updates, None);
+        apply_updates_to_ordmap(&mut resulting_data, &merged_updates, None);
 
         let prepared = SimPreparedCommit {
             snapshot,
             resulting_data,
-            merged_updates: merged_updates.clone(),
+            merged_updates,
+            receipts: receipts.to_vec(),
         };
 
         (result_root, prepared)
@@ -84,7 +88,6 @@ impl ChainWriter for SimStorage {
         block: &Arc<hyperscale_types::Block>,
         qc: &Arc<hyperscale_types::QuorumCertificate>,
         execution_certificates: &[Arc<hyperscale_types::ExecutionCertificate>],
-        receipts: &[ReceiptBundle],
     ) -> Hash {
         let block_height = prepared.snapshot.new_version;
         let result_root = prepared.snapshot.result_root;
@@ -127,7 +130,7 @@ impl ChainWriter for SimStorage {
                         .or_default()
                         .push(wave_id_hash);
                 }
-                for bundle in receipts {
+                for bundle in &prepared.receipts {
                     c.local_receipts
                         .insert(bundle.tx_hash, bundle.local_receipt.clone());
                     if let Some(ref exec_output) = bundle.execution_output {
@@ -152,16 +155,34 @@ impl ChainWriter for SimStorage {
             }
         }
 
-        self.commit_block(
+        self.commit_block_inner(
             &prepared.merged_updates,
             block,
             qc,
             execution_certificates,
-            receipts,
+            &prepared.receipts,
         )
     }
 
     fn commit_block(
+        &self,
+        block: &Arc<hyperscale_types::Block>,
+        qc: &Arc<hyperscale_types::QuorumCertificate>,
+        execution_certificates: &[Arc<hyperscale_types::ExecutionCertificate>],
+        receipts: &[ReceiptBundle],
+    ) -> Hash {
+        let merged_updates = hyperscale_storage::merge_updates_from_receipts(receipts);
+        self.commit_block_inner(&merged_updates, block, qc, execution_certificates, receipts)
+    }
+
+    fn node_cache_len(&self) -> usize {
+        0
+    }
+}
+
+impl SimStorage {
+    /// Internal commit path used by both `commit_block` and `commit_prepared_block` fallback.
+    fn commit_block_inner(
         &self,
         merged_updates: &DatabaseUpdates,
         block: &Arc<hyperscale_types::Block>,
@@ -260,9 +281,5 @@ impl ChainWriter for SimStorage {
         }
 
         new_root
-    }
-
-    fn node_cache_len(&self) -> usize {
-        0
     }
 }

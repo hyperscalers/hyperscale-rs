@@ -283,19 +283,17 @@ pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainRead
             block_height,
         } => {
             let start = std::time::Instant::now();
-            // Merge DatabaseUpdates from all finalized waves' receipts.
-            // This runs on the thread pool — no state machine time spent merging.
-            let per_receipt: Vec<hyperscale_types::DatabaseUpdates> = finalized_waves
+            // Collect receipts from all finalized waves.
+            // Merging happens inside prepare_block_commit on the thread pool.
+            let all_receipts: Vec<hyperscale_types::ReceiptBundle> = finalized_waves
                 .iter()
-                .flat_map(|fw| &fw.receipts)
-                .map(|bundle| bundle.local_receipt.database_updates.clone())
+                .flat_map(|fw| fw.receipts.iter().cloned())
                 .collect();
-            let merged = hyperscale_storage::merge_database_updates(&per_receipt);
             let result = hyperscale_bft::handlers::verify_state_root(
                 ctx.storage,
                 parent_state_root,
                 expected_root,
-                &merged,
+                &all_receipts,
                 block_height,
             );
             metrics::record_signature_verification_latency(
@@ -330,21 +328,15 @@ pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainRead
             abort_intents,
             waves,
         } => {
-            // Extract certificates and merge DatabaseUpdates from finalized waves.
+            // Extract certificates from finalized waves.
             // No storage reads needed — everything flows through Arc<FinalizedWave>.
             let certificates: Vec<Arc<hyperscale_types::WaveCertificate>> = finalized_waves
                 .iter()
                 .map(|fw| Arc::clone(&fw.certificate))
                 .collect();
 
-            let per_receipt: Vec<hyperscale_types::DatabaseUpdates> = finalized_waves
-                .iter()
-                .flat_map(|fw| &fw.receipts)
-                .map(|bundle| bundle.local_receipt.database_updates.clone())
-                .collect();
-            let merged_updates = hyperscale_storage::merge_database_updates(&per_receipt);
-
-            // Collect all receipts from finalized waves for local_receipt_root computation.
+            // Collect all receipts from finalized waves.
+            // DatabaseUpdates merging happens inside prepare_block_commit.
             let all_receipts: Vec<hyperscale_types::ReceiptBundle> = finalized_waves
                 .iter()
                 .flat_map(|fw| fw.receipts.iter().cloned())
@@ -363,7 +355,6 @@ pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainRead
                 transactions,
                 certificates,
                 &all_receipts,
-                merged_updates,
                 abort_intents,
                 shard_group_id,
                 waves,

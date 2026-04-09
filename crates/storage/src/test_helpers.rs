@@ -178,11 +178,10 @@ pub fn make_test_execution_certificate(seed: u8, block_height: u64) -> Execution
 
 /// Helper to commit empty blocks up to (but not including) the target height.
 fn commit_empty_blocks_up_to(storage: &(impl ChainReader + ChainWriter), target: u64) {
-    let empty = DatabaseUpdates::default();
     for h in 0..target {
         let b = make_test_block(h);
         let q = make_test_qc(&b);
-        storage.commit_block(&empty, &Arc::new(b), &Arc::new(q), &[], &[]);
+        storage.commit_block(&Arc::new(b), &Arc::new(q), &[], &[]);
     }
 }
 
@@ -195,17 +194,10 @@ pub fn test_ec_storage_roundtrip(storage: &(impl ChainReader + ChainWriter)) {
     assert!(storage.get_execution_certificates_by_height(10).is_empty());
 
     // Commit intermediate blocks, then block at height 10 carrying the EC
-    let empty = DatabaseUpdates::default();
     commit_empty_blocks_up_to(storage, 10);
     let block = make_test_block(10);
     let qc = make_test_qc(&block);
-    storage.commit_block(
-        &empty,
-        &Arc::new(block),
-        &Arc::new(qc),
-        &[Arc::new(ec)],
-        &[],
-    );
+    storage.commit_block(&Arc::new(block), &Arc::new(qc), &[Arc::new(ec)], &[]);
 
     let by_height = storage.get_execution_certificates_by_height(10);
     assert_eq!(by_height.len(), 1);
@@ -223,12 +215,10 @@ pub fn test_ec_storage_batch(storage: &(impl ChainReader + ChainWriter)) {
     let ec3 = make_test_execution_certificate(3, 20);
 
     // Commit intermediate blocks, then block at height 10 with two ECs
-    let empty = DatabaseUpdates::default();
     commit_empty_blocks_up_to(storage, 10);
     let block10 = make_test_block(10);
     let qc10 = make_test_qc(&block10);
     storage.commit_block(
-        &empty,
         &Arc::new(block10),
         &Arc::new(qc10),
         &[Arc::new(ec1), Arc::new(ec2)],
@@ -239,12 +229,11 @@ pub fn test_ec_storage_batch(storage: &(impl ChainReader + ChainWriter)) {
     for h in 11..20 {
         let b = make_test_block(h);
         let q = make_test_qc(&b);
-        storage.commit_block(&empty, &Arc::new(b), &Arc::new(q), &[], &[]);
+        storage.commit_block(&Arc::new(b), &Arc::new(q), &[], &[]);
     }
     let block20 = make_test_block(20);
     let qc20 = make_test_qc(&block20);
     storage.commit_block(
-        &empty,
         &Arc::new(block20),
         &Arc::new(qc20),
         &[Arc::new(ec3.clone())],

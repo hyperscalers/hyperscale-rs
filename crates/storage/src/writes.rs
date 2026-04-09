@@ -1,10 +1,30 @@
 //! Utilities for merging, filtering, and reconstructing `DatabaseUpdates`.
 
+use hyperscale_types::ReceiptBundle;
 use radix_common::prelude::DatabaseUpdate;
 use radix_substate_store_interface::interface::{
     DatabaseUpdates, NodeDatabaseUpdates, PartitionDatabaseUpdates,
 };
 use std::sync::Arc;
+
+/// Extract and merge `DatabaseUpdates` from receipt bundles.
+///
+/// This is the canonical way to derive state updates from receipts for
+/// JVT computation and substate writes. Used internally by `ChainWriter`
+/// implementations.
+pub fn merge_updates_from_receipts(receipts: &[ReceiptBundle]) -> DatabaseUpdates {
+    if receipts.is_empty() {
+        return DatabaseUpdates::default();
+    }
+    if receipts.len() == 1 {
+        return receipts[0].local_receipt.database_updates.clone();
+    }
+    let mut merged = DatabaseUpdates::default();
+    for bundle in receipts {
+        merge_into(&mut merged, &bundle.local_receipt.database_updates);
+    }
+    merged
+}
 
 /// Merge a slice of per-certificate `DatabaseUpdates` into a single combined update.
 ///
