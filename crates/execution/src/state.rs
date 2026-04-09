@@ -45,7 +45,7 @@ use tracing::instrument;
 use crate::accumulator::ExecutionAccumulator;
 use crate::trackers::{VoteTracker, WaveCertificateTracker};
 
-/// Data returned when a wave completes (all txs executed).
+/// Data returned when a wave is ready for voting.
 ///
 /// The state machine produces this; the io_loop uses it to sign the execution vote
 /// and broadcast (since the state machine doesn't hold the signing key).
@@ -53,8 +53,10 @@ use crate::trackers::{VoteTracker, WaveCertificateTracker};
 pub struct CompletionData {
     /// Block this wave belongs to.
     pub block_hash: Hash,
-    /// Block height.
+    /// Block height (= wave_starting_height).
     pub block_height: u64,
+    /// Relative vote height (blocks since wave started).
+    pub vote_height: u64,
     /// Wave identifier.
     pub wave_id: WaveId,
     /// Merkle root over per-tx outcome leaves (cross-shard agreement).
@@ -366,8 +368,16 @@ impl ExecutionState {
             }
 
             // Create accumulator
-            let accumulator =
+            let mut accumulator =
                 ExecutionAccumulator::new(wave_id.clone(), block_hash, block_height, txs);
+
+            // Single-shard txs are always provisioned (no remote state needed).
+            if wave_id.is_zero() {
+                for tx_hash in accumulator.tx_hashes() {
+                    accumulator.mark_provisioned(tx_hash);
+                }
+            }
+
             self.accumulators.insert(wave_id.clone(), accumulator);
 
             // Only the wave leader creates a VoteTracker and aggregates votes.
@@ -463,7 +473,12 @@ impl ExecutionState {
     ///
     /// A missing wave assignment means the transaction already reached terminal
     /// state (TC committed) — the abort intent is a harmless late arrival.
-    pub fn record_abort_intent(&mut self, tx_hash: Hash, reason: AbortReason) {
+    pub fn record_abort_intent(
+        &mut self,
+        tx_hash: Hash,
+        reason: AbortReason,
+        committed_at_height: u64,
+    ) {
         let Some(wave_key) = self.wave_assignments.get(&tx_hash).cloned() else {
             tracing::debug!(
                 tx_hash = %tx_hash,
@@ -483,39 +498,53 @@ impl ExecutionState {
             return;
         };
 
-        let outcome = TxExecutionOutcome::Aborted { reason };
-        accumulator.record_abort(tx_hash, outcome);
+        accumulator.record_abort(tx_hash, committed_at_height, reason);
     }
 
-    /// Scan all incomplete waves and return completion data for any that are ready.
+    /// Scan all waves and return completion data for any that can emit a vote.
     ///
-    /// Called at each block commit AFTER abort intents have been processed.
-    /// This is the SINGLE path to voting — votes are never emitted from
-    /// `record_execution_result` or `record_abort_intent`.
+    /// Called at each block commit AFTER abort intents have been processed,
+    /// and also when provisions arrive or execution results complete.
     ///
-    /// Returns a `CompletionData` for each wave that is complete at this height.
-    /// Waves that already had an EC formed (vote tracker removed) are skipped.
-    pub fn scan_complete_waves(&self) -> Vec<CompletionData> {
+    /// A wave can emit a vote when:
+    /// 1. A target vote height exists (all txs coverable)
+    /// 2. All execution-covered txs at that height have results
+    /// 3. The target height is lower than any previous vote (re-vote downward only)
+    ///
+    /// Waves that already had an EC formed are skipped.
+    pub fn scan_complete_waves(&mut self) -> Vec<CompletionData> {
+        // Two-pass: first identify votable waves, then build data.
+        // Split borrow: check waves_with_ec first, then mutably iterate accumulators.
+        let waves_with_ec = &self.waves_with_ec;
+        let candidate_ids: Vec<WaveId> = self
+            .accumulators
+            .keys()
+            .filter(|wid| !waves_with_ec.contains(*wid))
+            .cloned()
+            .collect();
+
+        let mut votable_wave_ids = Vec::new();
+        for wave_id in &candidate_ids {
+            if let Some(acc) = self.accumulators.get_mut(wave_id) {
+                if acc.can_emit_vote() {
+                    votable_wave_ids.push(wave_id.clone());
+                }
+            }
+        }
+
         let mut completions = Vec::new();
-
-        for (wave_id, accumulator) in &self.accumulators {
-            // Skip waves that already have a canonical EC (aggregated by
-            // wave leader, or received from wave leader).
-            if self.waves_with_ec.contains(wave_id) {
-                continue;
-            }
-
-            if !accumulator.is_complete() {
-                continue;
-            }
-
-            let Some((global_receipt_root, tx_outcomes)) = accumulator.build_data() else {
+        for wave_id in votable_wave_ids {
+            let accumulator = self.accumulators.get_mut(&wave_id).unwrap();
+            let Some((vote_height, global_receipt_root, tx_outcomes)) =
+                accumulator.build_vote_data()
+            else {
                 continue;
             };
 
             completions.push(CompletionData {
                 block_hash: accumulator.block_hash(),
                 block_height: accumulator.block_height(),
+                vote_height,
                 wave_id: accumulator.wave_id().clone(),
                 global_receipt_root,
                 tx_outcomes,
@@ -634,7 +663,10 @@ impl ExecutionState {
     /// This is the SINGLE path to execution voting. Call after abort intents
     /// have been processed so accumulator state is deterministic at this height.
     /// Each vote is targeted to the wave leader (N→1 routing).
-    pub fn emit_vote_actions(&self, topology: &TopologySnapshot, vote_height: u64) -> Vec<Action> {
+    ///
+    /// The vote_height is now a relative offset determined by the accumulator
+    /// (lowest height where all txs are coverable), not passed in externally.
+    pub fn emit_vote_actions(&mut self, topology: &TopologySnapshot) -> Vec<Action> {
         let local_committee = topology.local_committee();
         self.scan_complete_waves()
             .into_iter()
@@ -643,7 +675,7 @@ impl ExecutionState {
                 Action::SignAndSendExecutionVote {
                     block_hash: completion.block_hash,
                     block_height: completion.block_height,
-                    vote_height,
+                    vote_height: completion.vote_height,
                     wave_id: completion.wave_id,
                     global_receipt_root: completion.global_receipt_root,
                     tx_outcomes: completion.tx_outcomes,
@@ -689,10 +721,16 @@ impl ExecutionState {
 
     /// Record abort intents from a committed block into execution accumulators.
     ///
-    /// Abort intents override async execution results to ensure validator convergence.
-    pub fn record_abort_intents(&mut self, intents: &[hyperscale_types::AbortIntent]) {
+    /// `committed_at_height` is the local block height at which these intents
+    /// were committed. Used for height-indexed abort tracking in the re-voting
+    /// protocol.
+    pub fn record_abort_intents(
+        &mut self,
+        intents: &[hyperscale_types::AbortIntent],
+        committed_at_height: u64,
+    ) {
         for intent in intents {
-            self.record_abort_intent(intent.tx_hash, intent.reason.clone());
+            self.record_abort_intent(intent.tx_hash, intent.reason.clone(), committed_at_height);
         }
     }
 
@@ -1473,6 +1511,13 @@ impl ExecutionState {
             provision_count = provisions.len(),
             "Provisioning complete, executing cross-shard transaction"
         );
+
+        // Mark as provisioned in accumulator for vote height tracking
+        if let Some(wave_key) = self.wave_assignments.get(&tx_hash) {
+            if let Some(acc) = self.accumulators.get_mut(wave_key) {
+                acc.mark_provisioned(tx_hash);
+            }
+        }
 
         Some(CrossShardExecutionRequest {
             tx_hash,

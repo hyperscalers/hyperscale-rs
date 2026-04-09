@@ -381,7 +381,8 @@ impl NodeStateMachine {
         // Abort intents feed the execution accumulator with override semantics.
         // Votes are NOT emitted here — the wave scan at the end of block commit
         // will detect complete waves and emit votes deterministically.
-        self.execution.record_abort_intents(&block.abort_intents);
+        self.execution
+            .record_abort_intents(&block.abort_intents, height);
 
         // Remove committed wave certificates from execution state.
         // They've been included in this block, so don't need to be proposed again.
@@ -453,10 +454,7 @@ impl NodeStateMachine {
         // been processed above (with override semantics), so the accumulator state
         // is deterministic at this height. All validators at this height produce
         // the same votes.
-        actions.extend(
-            self.execution
-                .emit_vote_actions(self.topology.snapshot(), height),
-        );
+        actions.extend(self.execution.emit_vote_actions(self.topology.snapshot()));
 
         actions
     }
@@ -692,19 +690,26 @@ impl StateMachine for NodeStateMachine {
             ProtocolEvent::ProvisionsAccepted { batch } => self
                 .livelock
                 .on_provisions_accepted_actions(&batch, self.topology.snapshot()),
-            ProtocolEvent::ProvisioningComplete { transactions } => self
-                .execution
-                .on_batch_provisioning_complete(self.topology.snapshot(), transactions),
+            ProtocolEvent::ProvisioningComplete { transactions } => {
+                let mut actions = self
+                    .execution
+                    .on_batch_provisioning_complete(self.topology.snapshot(), transactions);
+                // Provision arrival may lower the target vote height — re-scan.
+                actions.extend(self.execution.emit_vote_actions(self.topology.snapshot()));
+                actions
+            }
 
             // ── Execution ────────────────────────────────────────────────
             ProtocolEvent::ExecutionBatchCompleted {
                 results,
                 tx_outcomes,
             } => {
-                // Receipt availability is now tracked via finalized waves (not per-tx).
-                // Pending blocks wait for Arc<FinalizedWave> from WaveCompleted events.
-                self.execution
-                    .on_execution_batch_completed(results, tx_outcomes)
+                let mut actions = self
+                    .execution
+                    .on_execution_batch_completed(results, tx_outcomes);
+                // Execution results gate vote emission — re-scan.
+                actions.extend(self.execution.emit_vote_actions(self.topology.snapshot()));
+                actions
             }
 
             // ── Wave Execution (wave-based voting) ────────────────────────
