@@ -101,7 +101,7 @@ pub use transaction::{
 };
 pub use validator::{ValidatorInfo, ValidatorSet};
 pub use wave_certificate::{
-    decode_wave_cert_vec, encode_wave_cert_vec, ShardAttestation, WaveCertificate, WaveResolution,
+    decode_wave_cert_vec, encode_wave_cert_vec, ShardAttestation, WaveCertificate,
 };
 // Re-export with legacy alias for cross-crate use
 pub use execution_vote::compute_global_receipt_root as compute_execution_receipt_root;

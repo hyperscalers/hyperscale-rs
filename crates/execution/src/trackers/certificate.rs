@@ -6,7 +6,7 @@
 
 use hyperscale_types::{
     ExecutionCertificate, Hash, ShardAttestation, ShardGroupId, TransactionDecision, TxDecision,
-    TxExecutionOutcome, WaveCertificate, WaveId, WaveResolution,
+    TxExecutionOutcome, WaveCertificate, WaveId,
 };
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
@@ -122,8 +122,17 @@ impl WaveCertificateTracker {
     }
 
     /// Whether every tx in the wave has all participating shards covered.
+    ///
+    /// Aborted txs are treated as fully covered: the local shard's abort
+    /// decision is terminal and doesn't require remote shard confirmation.
+    /// This avoids a deadlock where the remote shard never committed the tx
+    /// (e.g. livelock — the tx was only committed on the local shard).
     pub fn is_complete(&self) -> bool {
         for (tx_hash, expected) in &self.participating_shards {
+            // Aborted txs don't need remote EC coverage — abort is terminal.
+            if self.aborted.contains(tx_hash) {
+                continue;
+            }
             if let Some(covered) = self.covered.get(tx_hash) {
                 if !expected.is_subset(covered) {
                     return false;
@@ -146,9 +155,7 @@ impl WaveCertificateTracker {
 
         WaveCertificate {
             wave_id: self.wave_id.clone(),
-            resolution: WaveResolution::Completed {
-                attestations: self.attestations.clone(),
-            },
+            attestations: self.attestations.clone(),
         }
     }
 
@@ -194,14 +201,6 @@ impl WaveCertificateTracker {
     /// Take the collected execution certificates (for FinalizedWave).
     pub fn take_execution_certificates(&mut self) -> Vec<Arc<ExecutionCertificate>> {
         std::mem::take(&mut self.execution_certificates)
-    }
-}
-
-/// Create an all-abort wave certificate for a timed-out wave.
-pub fn create_abort_wave_certificate(wave_id: WaveId) -> WaveCertificate {
-    WaveCertificate {
-        wave_id,
-        resolution: WaveResolution::Aborted,
     }
 }
 
@@ -270,7 +269,6 @@ mod tests {
         assert!(tracker.is_complete());
 
         let wc = tracker.create_wave_certificate();
-        assert!(wc.is_completed());
         assert_eq!(wc.attestations().len(), 1);
     }
 
@@ -323,12 +321,5 @@ mod tests {
 
         let decisions = tracker.tx_decisions();
         assert_eq!(decisions[0].decision, TransactionDecision::Aborted);
-    }
-
-    #[test]
-    fn test_abort_wave_certificate() {
-        let wave_id = make_wave_id();
-        let wc = create_abort_wave_certificate(wave_id);
-        assert!(wc.is_aborted());
     }
 }

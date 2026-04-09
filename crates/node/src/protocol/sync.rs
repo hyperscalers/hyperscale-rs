@@ -391,9 +391,6 @@ pub fn serve_block_request(
             // for those txs. This matches the proposer's state_root computation.
             let mut local_receipts = Vec::new();
             for wc in &block.certificates {
-                if !wc.is_completed() {
-                    continue;
-                }
                 let source_height = BlockHeight(wc.wave_id.block_height);
                 let source_txs = match storage.get_block(source_height) {
                     Some((source_block, _)) => source_block.transactions,

@@ -311,7 +311,7 @@ mod tests {
 
     #[test]
     fn test_add_finalized_wave() {
-        use hyperscale_types::{WaveCertificate, WaveId, WaveResolution};
+        use hyperscale_types::{WaveCertificate, WaveId};
 
         let wave_id = WaveId::new(ShardGroupId(0), 1, Default::default());
         let wave_hash = wave_id.hash();
@@ -331,7 +331,7 @@ mod tests {
         let fw = Arc::new(FinalizedWave {
             certificate: Arc::new(WaveCertificate {
                 wave_id,
-                resolution: WaveResolution::Aborted,
+                attestations: vec![],
             }),
             tx_hashes: vec![],
             execution_certificates: vec![],
@@ -348,9 +348,7 @@ mod tests {
 
     #[test]
     fn test_block_needs_transactions_and_waves() {
-        use hyperscale_types::{
-            test_utils::test_transaction, WaveCertificate, WaveId, WaveResolution,
-        };
+        use hyperscale_types::{test_utils::test_transaction, WaveCertificate, WaveId};
 
         let tx = Arc::new(test_transaction(1));
         let tx_hash = tx.hash();
@@ -378,7 +376,7 @@ mod tests {
         let fw = Arc::new(FinalizedWave {
             certificate: Arc::new(WaveCertificate {
                 wave_id,
-                resolution: WaveResolution::Aborted,
+                attestations: vec![],
             }),
             tx_hashes: vec![],
             execution_certificates: vec![],
@@ -392,12 +390,12 @@ mod tests {
 
     #[test]
     fn test_from_complete_block_is_complete() {
-        use hyperscale_types::{Block, WaveCertificate, WaveId, WaveResolution};
+        use hyperscale_types::{Block, WaveCertificate, WaveId};
 
         let wave_id = WaveId::new(ShardGroupId(0), 1, Default::default());
         let cert = Arc::new(WaveCertificate {
             wave_id: wave_id.clone(),
-            resolution: WaveResolution::Aborted,
+            attestations: vec![],
         });
 
         let block = Block {

@@ -54,11 +54,10 @@ where
                                 // the peer must include receipts for the covered txs.
                                 // Basic sanity check: completed wave certs → non-empty receipts.
                                 // Full correctness is verified by state-root check later.
-                                let has_completed_certs = block.as_ref().is_some_and(|(b, _)| {
-                                    b.certificates.iter().any(|wc| wc.is_completed())
-                                });
-                                let receipts_complete =
-                                    !has_completed_certs || !local_receipts.is_empty();
+                                let has_certs = block
+                                    .as_ref()
+                                    .is_some_and(|(b, _)| !b.certificates.is_empty());
+                                let receipts_complete = !has_certs || !local_receipts.is_empty();
 
                                 if receipts_complete {
                                     let _ = es.send(NodeInput::SyncBlockResponseReceived {

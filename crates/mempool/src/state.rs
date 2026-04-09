@@ -1413,7 +1413,6 @@ mod tests {
     use hyperscale_types::{
         generate_bls_keypair, test_utils::test_transaction, Block, BlockHeader, QuorumCertificate,
         ShardGroupId, ValidatorId, ValidatorInfo, ValidatorSet, WaveCertificate, WaveId,
-        WaveResolution,
     };
     use std::collections::BTreeSet;
 
@@ -1460,7 +1459,7 @@ mod tests {
     fn make_test_wave_certificate(height: u64) -> WaveCertificate {
         WaveCertificate {
             wave_id: WaveId::new(ShardGroupId(0), height, BTreeSet::new()),
-            resolution: WaveResolution::Aborted,
+            attestations: vec![],
         }
     }
 

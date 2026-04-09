@@ -12,7 +12,7 @@ use hyperscale_types::{
     zero_bls_signature, ApplicationEvent, Block, BlockHeader, BlockHeight, Bls12381G2Signature,
     ExecutionCertificate, ExecutionOutput, FeeSummary, Hash, LocalReceipt, LogLevel, NodeId,
     QuorumCertificate, ReceiptBundle, ShardGroupId, SignerBitfield, TransactionOutcome,
-    TxExecutionOutcome, TxOutcome, ValidatorId, WaveCertificate, WaveId, WaveResolution,
+    TxExecutionOutcome, TxOutcome, ValidatorId, WaveCertificate, WaveId,
 };
 use radix_common::prelude::DatabaseUpdate;
 use radix_substate_store_interface::db_key_mapper::{DatabaseKeyMapper, SpreadPrefixKeyMapper};
@@ -79,9 +79,7 @@ pub fn make_mapped_database_update(
 pub fn make_test_wave_certificate(height: u64, shard: ShardGroupId) -> WaveCertificate {
     WaveCertificate {
         wave_id: WaveId::new(shard, height, BTreeSet::new()),
-        resolution: WaveResolution::Completed {
-            attestations: vec![],
-        },
+        attestations: vec![],
     }
 }
 

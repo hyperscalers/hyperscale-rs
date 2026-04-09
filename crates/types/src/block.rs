@@ -681,7 +681,7 @@ mod tests {
     fn test_compute_certificate_root_deterministic() {
         use crate::{
             Bls12381G2Signature, ShardAttestation, ShardGroupId, SignerBitfield, WaveCertificate,
-            WaveId, WaveResolution,
+            WaveId,
         };
         use std::collections::BTreeSet;
 
@@ -692,16 +692,14 @@ mod tests {
                     block_height: 10,
                     remote_shards: BTreeSet::from([ShardGroupId(1)]),
                 },
-                resolution: WaveResolution::Completed {
-                    attestations: vec![ShardAttestation {
-                        shard_group_id: ShardGroupId(0),
-                        ec_hash: Hash::from_bytes(&[seed; 4]),
-                        vote_height: 11,
-                        global_receipt_root: Hash::from_bytes(&[seed + 100; 4]),
-                        aggregated_signature: Bls12381G2Signature([0u8; 96]),
-                        signers: SignerBitfield::new(4),
-                    }],
-                },
+                attestations: vec![ShardAttestation {
+                    shard_group_id: ShardGroupId(0),
+                    ec_hash: Hash::from_bytes(&[seed; 4]),
+                    vote_height: 11,
+                    global_receipt_root: Hash::from_bytes(&[seed + 100; 4]),
+                    aggregated_signature: Bls12381G2Signature([0u8; 96]),
+                    signers: SignerBitfield::new(4),
+                }],
             })
         };
 
@@ -716,7 +714,7 @@ mod tests {
     fn test_compute_certificate_root_single_cert() {
         use crate::{
             Bls12381G2Signature, ShardAttestation, ShardGroupId, SignerBitfield, WaveCertificate,
-            WaveId, WaveResolution,
+            WaveId,
         };
         use std::collections::BTreeSet;
 
@@ -726,16 +724,14 @@ mod tests {
                 block_height: 10,
                 remote_shards: BTreeSet::new(),
             },
-            resolution: WaveResolution::Completed {
-                attestations: vec![ShardAttestation {
-                    shard_group_id: ShardGroupId(0),
-                    ec_hash: Hash::from_bytes(b"ec1"),
-                    vote_height: 11,
-                    global_receipt_root: Hash::from_bytes(b"receipt"),
-                    aggregated_signature: Bls12381G2Signature([0u8; 96]),
-                    signers: SignerBitfield::new(4),
-                }],
-            },
+            attestations: vec![ShardAttestation {
+                shard_group_id: ShardGroupId(0),
+                ec_hash: Hash::from_bytes(b"ec1"),
+                vote_height: 11,
+                global_receipt_root: Hash::from_bytes(b"receipt"),
+                aggregated_signature: Bls12381G2Signature([0u8; 96]),
+                signers: SignerBitfield::new(4),
+            }],
         });
 
         let root = compute_certificate_root(std::slice::from_ref(&cert));

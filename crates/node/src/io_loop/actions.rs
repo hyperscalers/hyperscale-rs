@@ -602,16 +602,10 @@ where
                             // EC↔WaveCert cross-check via attestations.
                             let cross_check_ok = sync_ecs.iter().all(|ec| {
                                 let ec_hash = ec.canonical_hash();
-                                block.certificates.iter().any(|wc| {
-                                    if let hyperscale_types::WaveResolution::Completed {
-                                        attestations,
-                                    } = &wc.resolution
-                                    {
-                                        attestations.iter().any(|a| a.ec_hash == ec_hash)
-                                    } else {
-                                        false
-                                    }
-                                })
+                                block
+                                    .certificates
+                                    .iter()
+                                    .any(|wc| wc.attestations.iter().any(|a| a.ec_hash == ec_hash))
                             });
                             if !cross_check_ok {
                                 tracing::warn!(
@@ -632,9 +626,6 @@ where
                                     let topo = topology.load();
                                     let mut updates = Vec::new();
                                     for wc in &block.certificates {
-                                        if !wc.is_completed() {
-                                            continue;
-                                        }
                                         let source_height =
                                             hyperscale_types::BlockHeight(wc.wave_id.block_height);
                                         if let Some((source_block, _)) =

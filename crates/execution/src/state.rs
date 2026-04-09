@@ -223,11 +223,6 @@ const EXEC_CERT_FALLBACK_TIMEOUT_BLOCKS: u64 = 10;
 /// Number of blocks between repeated fallback requests for the same cert.
 const EXEC_CERT_RETRY_INTERVAL_BLOCKS: u64 = 20;
 
-/// Number of blocks to wait before producing an all-abort wave certificate
-/// for a wave whose wave leader has failed (no EC arrived at all).
-/// Much longer than per-tx abort intents (20-30 blocks) — this is a last resort.
-const WAVE_ABORT_TIMEOUT_BLOCKS: u64 = 50;
-
 /// Per-shard recipient lists for provision broadcasting.
 type ShardRecipients = HashMap<ShardGroupId, Vec<ValidatorId>>;
 
@@ -1202,81 +1197,6 @@ impl ExecutionState {
         actions
     }
 
-    /// Check for waves whose wave leader has completely failed.
-    ///
-    /// If a wave has been tracked for more than WAVE_ABORT_TIMEOUT_BLOCKS without
-    /// completing, produce an all-abort wave cert. This is deterministic: every
-    /// validator produces the same all-abort cert at the same height.
-    ///
-    /// This is a last resort — per-tx abort intents handle individual tx issues
-    /// on much shorter timeouts. The wave-level abort fires only when the wave
-    /// leader itself is dead.
-    fn check_wave_abort_timeouts(&mut self) -> Vec<Action> {
-        let current_height = self.committed_height;
-        let mut timed_out_waves: Vec<WaveId> = Vec::new();
-
-        for (wave_id, tracker) in &self.wave_certificate_trackers {
-            let age = current_height.saturating_sub(tracker.created_at());
-            if age >= WAVE_ABORT_TIMEOUT_BLOCKS && !tracker.is_complete() {
-                tracing::warn!(
-                    wave = %wave_id,
-                    age = age,
-                    "Wave leader timeout — producing all-abort wave certificate"
-                );
-                timed_out_waves.push(wave_id.clone());
-            }
-        }
-
-        let mut actions = Vec::new();
-        for wave_id in timed_out_waves {
-            let tracker = self.wave_certificate_trackers.remove(&wave_id);
-            if let Some(tracker) = tracker {
-                let abort_cert = crate::trackers::create_abort_wave_certificate(wave_id.clone());
-                let tx_hashes = tracker.tx_hashes().to_vec();
-
-                // Build abort decisions for all txs
-                let tx_decisions: Vec<crate::trackers::TxDecision> = tx_hashes
-                    .iter()
-                    .map(|h| crate::trackers::TxDecision {
-                        tx_hash: *h,
-                        decision: hyperscale_types::TransactionDecision::Aborted,
-                    })
-                    .collect();
-
-                // Clean up receipt_cache for aborted txs (receipts not needed).
-                for h in &tx_hashes {
-                    self.receipt_cache.remove(h);
-                }
-
-                let finalized = FinalizedWave {
-                    certificate: Arc::new(abort_cert.clone()),
-                    tx_hashes: tx_hashes.clone(),
-                    execution_certificates: vec![],
-                    tx_decisions: tx_decisions.clone(),
-                    receipts: vec![], // Aborted waves have no receipts
-                    finalized_height: current_height,
-                };
-                self.finalized_wave_certificates
-                    .insert(wave_id.clone(), finalized);
-                self.pending_wave_receipts.remove(&wave_id);
-
-                // Cache the abort wave cert for peer fetch
-                actions.push(Action::CacheWaveCertificate {
-                    certificate: Arc::new(abort_cert),
-                });
-
-                // Emit TransactionExecuted for each tx (abort)
-                for d in &tx_decisions {
-                    actions.push(Action::Continuation(ProtocolEvent::TransactionExecuted {
-                        tx_hash: d.tx_hash,
-                        accepted: false,
-                    }));
-                }
-            }
-        }
-        actions
-    }
-
     // ═══════════════════════════════════════════════════════════════════════════
     // Block Commit Handling
     // ═══════════════════════════════════════════════════════════════════════════
@@ -1333,10 +1253,6 @@ impl ExecutionState {
         actions.extend(self.check_exec_cert_timeouts(topology));
 
         // Check for waves whose wave leader has completely failed (no EC at all).
-        // This is the last-resort all-abort fallback — much longer timeout than
-        // per-tx abort intents, which handle individual tx issues.
-        actions.extend(self.check_wave_abort_timeouts());
-
         // Prune ephemeral state (orphaned provisions).
         // Cross-shard resolution state (certificate trackers, finalized certs,
         // pending provisioning, execution cache, early arrivals) is only cleaned

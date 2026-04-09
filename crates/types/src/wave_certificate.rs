@@ -12,29 +12,19 @@ use std::sync::Arc;
 ///
 /// Contains only shard attestations (proof half). Per-tx decisions
 /// (Accept/Reject/Aborted) are derived from the ECs referenced by
-/// the attestations. This enforces a clean proof-vs-data separation.
+/// the attestations. Every wave resolves through the EC path — there
+/// is no all-abort fallback.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WaveCertificate {
     /// Self-contained wave identifier (shard + height + remote dependencies).
     /// Globally unique. `hash(wave_id)` = identity key for manifest/storage.
     pub wave_id: WaveId,
-    /// Resolution: completed with attestations, or all-abort.
-    pub resolution: WaveResolution,
-}
-
-/// Resolution of a wave's execution.
-#[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
-pub enum WaveResolution {
-    /// All transactions in the wave have outcomes from every participating shard.
+    /// Shard attestations proving execution finalization.
     /// May contain multiple attestations from the same shard — this happens when
     /// a remote shard committed this wave's transactions across multiple blocks,
     /// producing separate ECs.
     /// Sorted by (shard_group_id, ec_hash) for deterministic receipt_hash.
-    Completed { attestations: Vec<ShardAttestation> },
-    /// Wave leader timed out. All transactions in this wave are aborted.
-    /// Deterministic — every validator produces the same all-abort cert.
-    /// No BLS signatures; BFT consensus authenticates via global_receipt_root.
-    Aborted,
+    pub attestations: Vec<ShardAttestation>,
 }
 
 /// Proof half of an execution certificate from a single shard.
@@ -57,48 +47,22 @@ pub struct ShardAttestation {
 impl WaveCertificate {
     /// Compute the receipt hash for this wave certificate.
     ///
-    /// For completed waves: hashes sorted (shard_group_id, ec_hash) pairs.
-    /// For aborted waves: deterministic hash from wave identity + abort marker.
+    /// Hashes sorted (shard_group_id, ec_hash) pairs. The vec is pre-sorted
+    /// at construction time for deterministic ordering. ec_hash already encodes
+    /// the WaveId, vote_height, global_receipt_root, and all tx_outcomes — so
+    /// this commits to the full content of every contributing EC.
     pub fn receipt_hash(&self) -> Hash {
         let mut hasher = blake3::Hasher::new();
-        match &self.resolution {
-            WaveResolution::Completed { attestations } => {
-                // Vec is pre-sorted by (shard_group_id, ec_hash) at construction
-                // time for deterministic ordering.
-                // ec_hash already encodes the WaveId (shard + height + remote_shards),
-                // vote_height, global_receipt_root, and all tx_outcomes — so this
-                // commits to the full content of every contributing EC.
-                for att in attestations {
-                    hasher.update(&basic_encode(&att.shard_group_id).unwrap());
-                    hasher.update(att.ec_hash.as_bytes());
-                }
-            }
-            WaveResolution::Aborted => {
-                // Deterministic: every validator computes the same hash.
-                // WaveId is self-contained (shard + height + remote_shards).
-                hasher.update(&basic_encode(&self.wave_id).unwrap());
-                hasher.update(b"abort");
-            }
+        for att in &self.attestations {
+            hasher.update(&basic_encode(&att.shard_group_id).unwrap());
+            hasher.update(att.ec_hash.as_bytes());
         }
         Hash::from_hash_bytes(hasher.finalize().as_bytes())
     }
 
-    /// Whether this wave was aborted (wave leader timeout).
-    pub fn is_aborted(&self) -> bool {
-        matches!(self.resolution, WaveResolution::Aborted)
-    }
-
-    /// Whether this wave completed normally.
-    pub fn is_completed(&self) -> bool {
-        matches!(self.resolution, WaveResolution::Completed { .. })
-    }
-
-    /// Get attestations (empty slice for aborted waves).
+    /// Get attestations.
     pub fn attestations(&self) -> &[ShardAttestation] {
-        match &self.resolution {
-            WaveResolution::Completed { attestations } => attestations,
-            WaveResolution::Aborted => &[],
-        }
+        &self.attestations
     }
 }
 
@@ -116,7 +80,7 @@ impl<E: sbor::Encoder<sbor::NoCustomValueKind>> sbor::Encode<sbor::NoCustomValue
     fn encode_body(&self, encoder: &mut E) -> Result<(), sbor::EncodeError> {
         encoder.write_size(2)?;
         encoder.encode(&self.wave_id)?;
-        encoder.encode(&self.resolution)?;
+        encoder.encode(&self.attestations)?;
         Ok(())
     }
 }
@@ -137,10 +101,10 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
             });
         }
         let wave_id: WaveId = decoder.decode()?;
-        let resolution: WaveResolution = decoder.decode()?;
+        let attestations: Vec<ShardAttestation> = decoder.decode()?;
         Ok(Self {
             wave_id,
-            resolution,
+            attestations,
         })
     }
 }
@@ -225,28 +189,10 @@ mod tests {
     fn test_receipt_hash_deterministic() {
         let wc = WaveCertificate {
             wave_id: make_test_wave_id(),
-            resolution: WaveResolution::Completed {
-                attestations: vec![make_test_attestation(0, 1), make_test_attestation(1, 2)],
-            },
+            attestations: vec![make_test_attestation(0, 1), make_test_attestation(1, 2)],
         };
         assert_eq!(wc.receipt_hash(), wc.receipt_hash());
         assert_ne!(wc.receipt_hash(), Hash::ZERO);
-    }
-
-    #[test]
-    fn test_receipt_hash_differs_completed_vs_aborted() {
-        let wave_id = make_test_wave_id();
-        let completed = WaveCertificate {
-            wave_id: wave_id.clone(),
-            resolution: WaveResolution::Completed {
-                attestations: vec![make_test_attestation(0, 1)],
-            },
-        };
-        let aborted = WaveCertificate {
-            wave_id,
-            resolution: WaveResolution::Aborted,
-        };
-        assert_ne!(completed.receipt_hash(), aborted.receipt_hash());
     }
 
     #[test]
@@ -254,50 +200,20 @@ mod tests {
         let wave_id = make_test_wave_id();
         let wc1 = WaveCertificate {
             wave_id: wave_id.clone(),
-            resolution: WaveResolution::Completed {
-                attestations: vec![make_test_attestation(0, 1)],
-            },
+            attestations: vec![make_test_attestation(0, 1)],
         };
         let wc2 = WaveCertificate {
             wave_id,
-            resolution: WaveResolution::Completed {
-                attestations: vec![make_test_attestation(0, 2)],
-            },
+            attestations: vec![make_test_attestation(0, 2)],
         };
         assert_ne!(wc1.receipt_hash(), wc2.receipt_hash());
     }
 
     #[test]
-    fn test_aborted_receipt_hash_deterministic() {
-        let wc1 = WaveCertificate {
-            wave_id: make_test_wave_id(),
-            resolution: WaveResolution::Aborted,
-        };
-        let wc2 = WaveCertificate {
-            wave_id: make_test_wave_id(),
-            resolution: WaveResolution::Aborted,
-        };
-        assert_eq!(wc1.receipt_hash(), wc2.receipt_hash());
-    }
-
-    #[test]
-    fn test_sbor_roundtrip_completed() {
+    fn test_sbor_roundtrip() {
         let wc = WaveCertificate {
             wave_id: make_test_wave_id(),
-            resolution: WaveResolution::Completed {
-                attestations: vec![make_test_attestation(0, 1), make_test_attestation(1, 2)],
-            },
-        };
-        let encoded = basic_encode(&wc).unwrap();
-        let decoded: WaveCertificate = basic_decode(&encoded).unwrap();
-        assert_eq!(wc, decoded);
-    }
-
-    #[test]
-    fn test_sbor_roundtrip_aborted() {
-        let wc = WaveCertificate {
-            wave_id: make_test_wave_id(),
-            resolution: WaveResolution::Aborted,
+            attestations: vec![make_test_attestation(0, 1), make_test_attestation(1, 2)],
         };
         let encoded = basic_encode(&wc).unwrap();
         let decoded: WaveCertificate = basic_decode(&encoded).unwrap();
@@ -309,9 +225,7 @@ mod tests {
         let certs = vec![
             Arc::new(WaveCertificate {
                 wave_id: make_test_wave_id(),
-                resolution: WaveResolution::Completed {
-                    attestations: vec![make_test_attestation(0, 1)],
-                },
+                attestations: vec![make_test_attestation(0, 1)],
             }),
             Arc::new(WaveCertificate {
                 wave_id: WaveId {
@@ -319,7 +233,7 @@ mod tests {
                     block_height: 42,
                     remote_shards: BTreeSet::new(),
                 },
-                resolution: WaveResolution::Aborted,
+                attestations: vec![make_test_attestation(1, 3)],
             }),
         ];
 
