@@ -138,6 +138,15 @@ pub struct BftState {
     /// Hash of the latest committed block.
     committed_hash: Hash,
 
+    /// State root from the latest committed block header.
+    /// Updated synchronously at commit time (not dependent on async JVT).
+    committed_state_root: Hash,
+
+    /// State root from the latest certified block header.
+    /// Updated synchronously when a QC forms. This is the correct
+    /// parent_state_root for the next proposal (certified tip = parent).
+    certified_state_root: Hash,
+
     /// Latest QC (certifies the latest certified block).
     latest_qc: Option<QuorumCertificate>,
 
@@ -298,6 +307,8 @@ impl BftState {
             committed_hash: recovered
                 .committed_hash
                 .unwrap_or(Hash::from_bytes(&[0u8; 32])),
+            committed_state_root: recovered.jvt_root.unwrap_or(Hash::ZERO),
+            certified_state_root: recovered.jvt_root.unwrap_or(Hash::ZERO),
             latest_qc: recovered.latest_qc,
             genesis_block: None,
             pending_blocks: HashMap::new(),
@@ -400,16 +411,12 @@ impl BftState {
         recipients
     }
 
-    /// Get the local JVT state (version, root).
+    /// Get the committed state root from the latest committed block header.
     ///
-    /// This returns the actual JVT state from local async certificate commits.
-    /// Different validators may have different values due to commit timing.
-    ///
-    /// Used by:
-    /// - Verifiers to check if JVT is ready for state root verification
-    /// - Fallback/sync blocks to get current root when no certs
+    /// This is the QC-attested value, updated synchronously at commit time.
+    /// Used by the status API and as the canonical "current state root".
     pub fn jvt_root(&self) -> Hash {
-        self.verification.jvt_root()
+        self.committed_state_root
     }
 
     /// Get a block by its hash.
@@ -704,6 +711,8 @@ impl BftState {
 
         self.genesis_block = Some(genesis.clone());
         self.committed_hash = hash;
+        self.committed_state_root = genesis.header.state_root;
+        self.certified_state_root = genesis.header.state_root;
 
         info!(
             validator = ?topology.local_validator_id(),
@@ -1005,17 +1014,11 @@ impl BftState {
             .take(self.config.max_certificates_per_block)
             .collect();
 
-        // Get parent's state from its block header.
-        // This is the base state that verifiers will use.
-        let parent_state_root = self
-            .get_block_by_hash(parent_hash)
-            .map(|b| b.header.state_root)
-            .unwrap_or_else(|| {
-                // Parent not found - use local JVT state as fallback.
-                // This handles genesis case and edge cases where the parent block
-                // is missing from pending_blocks (e.g., after recovery or sync).
-                self.jvt_root()
-            });
+        // Use the certified tip's state_root as the base.
+        // In HotStuff-2, the parent is the certified (not committed) block.
+        // certified_state_root tracks the QC-attested chain of state_roots,
+        // independent of in-memory block headers which may carry stale values.
+        let parent_state_root = self.certified_state_root;
 
         // Track that we have a pending proposal (for correlation)
         self.pending_proposal = Some(PendingProposal {
@@ -1099,14 +1102,7 @@ impl BftState {
         let timestamp = parent_qc.weighted_timestamp_ms;
 
         // Fallback blocks have no certificates, so state doesn't change.
-        // We inherit state_root from the parent block's header.
-        let parent_state_root = self
-            .get_block_by_hash(parent_hash)
-            .map(|b| b.header.state_root)
-            .unwrap_or_else(|| {
-                // Genesis case - use local JVT state
-                self.jvt_root()
-            });
+        let parent_state_root = self.certified_state_root;
 
         let header = BlockHeader {
             shard_group_id: topology.local_shard(),
@@ -1219,14 +1215,7 @@ impl BftState {
         let timestamp = self.now.as_millis() as u64;
 
         // Sync blocks have no certificates, so state doesn't change.
-        // We inherit state_root from the parent block's header.
-        let parent_state_root = self
-            .get_block_by_hash(parent_hash)
-            .map(|b| b.header.state_root)
-            .unwrap_or_else(|| {
-                // Genesis case - use local JVT state
-                self.jvt_root()
-            });
+        let parent_state_root = self.certified_state_root;
 
         let header = BlockHeader {
             shard_group_id: topology.local_shard(),
@@ -1958,10 +1947,9 @@ impl BftState {
                 // The verification pipeline queues the request; NodeStateMachine
                 // will drain and enrich with merged_updates from the execution cache.
                 if self.verification.needs_state_root_verification(&block) {
-                    let parent_state_root = self
-                        .get_block_by_hash(block.header.parent_hash)
-                        .map(|parent| parent.header.state_root)
-                        .unwrap_or_else(|| self.jvt_root());
+                    // Use certified_state_root — tracks the QC-attested chain.
+                    // In HotStuff-2, the parent is the certified tip.
+                    let parent_state_root = self.certified_state_root;
                     self.verification.initiate_state_root_verification(
                         block_hash,
                         &block,
@@ -2923,6 +2911,12 @@ impl BftState {
         if should_update {
             self.latest_qc = Some(qc.clone());
 
+            // Track the certified block's state_root — this is the correct
+            // parent_state_root for the next proposal.
+            if let Some(block) = self.get_block_by_hash(block_hash) {
+                self.certified_state_root = block.header.state_root;
+            }
+
             // HotStuff-2 unlock: when a QC forms, we can safely unlock
             // our vote locks at or below that QC's height
             self.maybe_unlock_for_qc(topology, &qc);
@@ -3168,6 +3162,7 @@ impl BftState {
 
         self.committed_height = height;
         self.committed_hash = block_hash;
+        self.committed_state_root = block.header.state_root;
 
         // Buffer committed hashes so collect_qc_chain_hashes can
         // exclude them even after cleanup_old_state removes the block.

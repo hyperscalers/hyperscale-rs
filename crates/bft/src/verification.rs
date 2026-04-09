@@ -846,11 +846,6 @@ impl VerificationPipeline {
     // JVT state tracking
     // ═══════════════════════════════════════════════════════════════════════
 
-    /// Get the current JVT root.
-    pub fn jvt_root(&self) -> Hash {
-        self.last_committed_jvt_root
-    }
-
     /// JVT advanced — update root and unblock any waiting state root verifications.
     ///
     /// Unblocked verifications are pushed to the ready queue for
