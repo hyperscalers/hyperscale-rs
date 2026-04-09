@@ -126,66 +126,56 @@ pub struct ExecutionState {
     committed_height: u64,
 
     // ═══════════════════════════════════════════════════════════════════════
-    // Cross-shard state (Phase 1-2: Provisioning)
+    // Provisioning
     // ═══════════════════════════════════════════════════════════════════════
-    /// Transactions waiting for provisioning to complete before execution.
-    /// Maps tx_hash -> (transaction, block_height)
-    /// Note: Provision tracking is handled by ProvisionCoordinator.
+    /// Verified provisions stored by tx_hash. Written when provisions are
+    /// verified (regardless of block commit timing). Read when cross-shard
+    /// execution starts. Cleaned up only when WC is committed (terminal state).
+    verified_provisions: HashMap<Hash, Vec<StateProvision>>,
+
+    /// Transactions waiting for provisions before execution can start.
+    /// Maps tx_hash -> (transaction, block_height). Populated at block commit
+    /// for cross-shard txs whose provisions haven't arrived yet.
     pending_provisioning: HashMap<Hash, (Arc<RoutableTransaction>, u64)>,
 
     // ═══════════════════════════════════════════════════════════════════════
-    // Wave-based voting state
+    // Wave voting
     // ═══════════════════════════════════════════════════════════════════════
     /// Execution accumulators: collect per-tx execution results within each wave.
-    /// Keyed by WaveId (globally unique: shard_group_id + block_height + remote_shards).
+    /// Tracks provision coverage and abort intents for vote height determination.
     accumulators: HashMap<WaveId, ExecutionAccumulator>,
 
     /// Execution vote trackers: collect execution votes from other validators.
-    /// Keyed by WaveId. Only created on the wave leader.
+    /// Only created on the wave leader.
     vote_trackers: HashMap<WaveId, VoteTracker>,
 
-    /// Waves that have a canonical EC (aggregated by leader, or received from leader).
-    /// Used to stop re-voting in `scan_complete_waves`. Replaces the old check of
-    /// "VoteTracker absent" now that only wave leaders create VoteTrackers.
+    /// Waves that have a canonical EC (aggregated or received from wave leader).
+    /// Used to stop re-voting in `scan_complete_waves`.
     waves_with_ec: HashSet<WaveId>,
 
-    /// Tx → wave assignment lookup for the current block.
-    /// Maps tx_hash → WaveId.
+    /// Tx → wave assignment. Maps tx_hash → WaveId.
     wave_assignments: HashMap<Hash, WaveId>,
 
-    /// Early execution votes that arrived before tracking started.
-    /// Keyed by WaveId. Only buffered for the wave leader.
-    early_votes: HashMap<WaveId, Vec<ExecutionVote>>,
-
     // ═══════════════════════════════════════════════════════════════════════
-    // Cross-shard state (Phase 5: Finalization)
+    // Finalization
     // ═══════════════════════════════════════════════════════════════════════
-    /// Wave certificate trackers for wave-level finalization.
-    /// Maps WaveId -> WaveCertificateTracker. One tracker per wave.
+    /// Wave certificate trackers: collect ECs from all participating shards.
     wave_certificate_trackers: HashMap<WaveId, WaveCertificateTracker>,
 
+    /// Waves whose WC tracker completed but receipts aren't emitted yet.
+    pending_wave_receipts: HashMap<WaveId, HashSet<Hash>>,
+
     // ═══════════════════════════════════════════════════════════════════════
-    // Early arrivals (before tracking starts)
+    // Early arrivals (buffered until tracking starts at block commit)
     // ═══════════════════════════════════════════════════════════════════════
     /// Execution results that arrived before the wave was assigned.
-    /// Maps tx_hash -> TxExecutionOutcome. Replayed during assign_waves.
     early_execution_results: HashMap<Hash, TxExecutionOutcome>,
 
-    /// ProvisioningComplete events that arrived before the block was committed.
-    /// This can happen when provisions reach quorum before we've seen the block.
-    /// Maps tx_hash -> (provisions, first_arrival_height) for cleanup of stale entries.
-    early_provisioning_complete: HashMap<Hash, (Vec<StateProvision>, u64)>,
+    /// Execution votes that arrived before tracking started (wave leader only).
+    early_votes: HashMap<WaveId, Vec<ExecutionVote>>,
 
-    /// Execution certificates that arrived before the wave tracker was created.
-    /// Keyed by WaveId, storing Arc<ExecutionCertificate> with first_arrival_height.
-    /// ECs that arrived before their local wave tracker was created.
-    /// Replayed through handle_wave_attestation after setup_execution_tracking.
+    /// ECs that arrived before the wave tracker was created.
     early_wave_attestations: Vec<(Arc<ExecutionCertificate>, u64)>,
-
-    /// Waves whose tracker completed but some txs still need receipts emitted.
-    /// Maps WaveId -> set of tx_hashes still missing receipts. When the set
-    /// becomes empty, `finalize_wave` is called.
-    pending_wave_receipts: HashMap<WaveId, HashSet<Hash>>,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Expected Execution Certificate Tracking (Fallback Detection)
@@ -244,7 +234,7 @@ impl ExecutionState {
             early_votes: HashMap::new(),
             wave_certificate_trackers: HashMap::new(),
             early_execution_results: HashMap::new(),
-            early_provisioning_complete: HashMap::new(),
+            verified_provisions: HashMap::new(),
             early_wave_attestations: Vec::new(),
             pending_wave_receipts: HashMap::new(),
             expected_exec_certs: HashMap::new(),
@@ -1445,22 +1435,24 @@ impl ExecutionState {
                 committed_height: BlockHeight(height),
             });
 
-            // Store transaction for later execution (will execute when ProvisioningComplete arrives)
-            self.pending_provisioning
-                .insert(tx_hash, (tx.clone(), height));
-
-            // Check if ProvisioningComplete arrived before the block committed
-            if let Some((provisions, _arrival_height)) =
-                self.early_provisioning_complete.remove(&tx_hash)
-            {
-                tracing::debug!(
-                    tx_hash = ?tx_hash,
-                    count = provisions.len(),
-                    "Replaying early ProvisioningComplete"
-                );
-                if let Some(req) = self.on_provisioning_complete(topology, tx_hash, provisions) {
-                    cross_shard_requests.push(req);
+            // Check if provisions already arrived (before block commit).
+            if let Some(provisions) = self.verified_provisions.get(&tx_hash).cloned() {
+                // Provisions ready — execute immediately.
+                cross_shard_requests.push(CrossShardExecutionRequest {
+                    tx_hash,
+                    transaction: tx.clone(),
+                    provisions,
+                });
+                // Mark as provisioned in the accumulator
+                if let Some(wid) = self.wave_assignments.get(&tx_hash) {
+                    if let Some(acc) = self.accumulators.get_mut(wid) {
+                        acc.mark_provisioned(tx_hash);
+                    }
                 }
+            } else {
+                // Store transaction for later execution (when ProvisioningComplete arrives)
+                self.pending_provisioning
+                    .insert(tx_hash, (tx.clone(), height));
             }
         }
 
@@ -1474,13 +1466,9 @@ impl ExecutionState {
 
     /// Handle provisioning complete (all source shards have reached quorum).
     ///
-    /// Called when ProvisionCoordinator emits `ProvisioningComplete`, meaning
-    /// all required source shards have provided a quorum of verified provisions.
-    /// This triggers cross-shard execution.
-    ///
-    /// If the block hasn't been committed yet (i.e., tx not in pending_provisioning),
-    /// we buffer the provisions and replay when the block commits.
-    /// Returns `Some(request)` if execution is ready, `None` if buffered.
+    /// Always stores provisions in `verified_provisions`. If the block has
+    /// already committed (tx in `pending_provisioning`), also returns an
+    /// execution request. Otherwise the provisions wait until block commit.
     #[instrument(skip(self, provisions), fields(tx_hash = ?tx_hash))]
     pub fn on_provisioning_complete(
         &mut self,
@@ -1488,29 +1476,11 @@ impl ExecutionState {
         tx_hash: Hash,
         provisions: Vec<StateProvision>,
     ) -> Option<CrossShardExecutionRequest> {
-        let local_shard = topology.local_shard();
-
-        // Get the transaction waiting for provisions
-        let Some((tx, _height)) = self.pending_provisioning.remove(&tx_hash) else {
-            // Block hasn't committed yet - buffer for later
-            tracing::info!(
-                tx_hash = ?tx_hash,
-                shard = local_shard.0,
-                "Provisioning complete before block committed, buffering"
-            );
-            // Track arrival height for cleanup of stale entries
-            let current_height = self.committed_height;
-            self.early_provisioning_complete
-                .insert(tx_hash, (provisions, current_height));
-            return None;
-        };
-
-        tracing::debug!(
-            tx_hash = ?tx_hash,
-            shard = local_shard.0,
-            provision_count = provisions.len(),
-            "Provisioning complete, executing cross-shard transaction"
-        );
+        // Accumulate provisions — different shards may arrive in separate batches.
+        self.verified_provisions
+            .entry(tx_hash)
+            .or_default()
+            .extend(provisions);
 
         // Mark as provisioned in accumulator for vote height tracking
         if let Some(wave_key) = self.wave_assignments.get(&tx_hash) {
@@ -1519,6 +1489,11 @@ impl ExecutionState {
             }
         }
 
+        // If the block has committed, start execution now.
+        // Otherwise, start_cross_shard_execution will pick it up on block commit.
+        let (tx, _height) = self.pending_provisioning.remove(&tx_hash)?;
+
+        let provisions = self.verified_provisions.get(&tx_hash)?.clone();
         Some(CrossShardExecutionRequest {
             tx_hash,
             transaction: tx,
@@ -1730,7 +1705,7 @@ impl ExecutionState {
             }
 
             self.wave_assignments.remove(tx_hash);
-            self.early_provisioning_complete.remove(tx_hash);
+            self.verified_provisions.remove(tx_hash);
         }
     }
 
@@ -1866,63 +1841,6 @@ impl ExecutionState {
             .count();
 
         format!("{}, early_wave_attestations={}", wave_info, early_count)
-    }
-
-    /// Cleanup all tracking state for a deferred or aborted transaction.
-    ///
-    /// Called when a transaction is deferred (livelock cycle) or aborted (timeout).
-    /// This releases all resources associated with the transaction so it doesn't
-    /// continue consuming memory or processing.
-    ///
-    /// IMPORTANT: If a finalized WaveCertificate exists, we preserve it.
-    /// The TC represents cross-shard consensus (all participating shards agreed on
-    /// the execution result). A local deferral/abort cannot override that — the TC
-    /// must be committed in the next block to supersede the deferral. Removing it
-    /// here would cause split-brain: remote shards commit the TC while we discard it.
-    ///
-    /// Stale TCs (where execution happened locally but was never committed) are
-    /// handled by `prune_finalized_certificates()` which runs on every block commit.
-    pub fn cleanup_transaction(&mut self, tx_hash: &Hash) {
-        // If the transaction is part of a finalized wave, we must preserve ALL tracking state.
-        // Removing the wave_assignment or finalized_wave_certificate would prevent us from
-        // completing the wave — causing split-brain with remote shards.
-        let is_finalized = self
-            .finalized_wave_certificates
-            .values()
-            .any(|fw| fw.tx_hashes.contains(tx_hash));
-        if is_finalized {
-            tracing::info!(
-                tx_hash = %tx_hash,
-                "Skipping cleanup for finalized transaction \
-                 (must complete wave to avoid split-brain with remote shards)"
-            );
-            return;
-        }
-
-        // Evict receipt from cache — transaction is being retried or abandoned.
-        self.receipt_cache.remove(tx_hash);
-
-        // Phase 1-2: Provisioning cleanup
-        // Note: Provision tracking is handled by ProvisionCoordinator
-        self.pending_provisioning.remove(tx_hash);
-
-        // Phase 3-4: Vote cleanup
-
-        // Wave voting cleanup
-        if let Some(wave_key) = self.wave_assignments.remove(tx_hash) {
-            // Don't remove the execution accumulator/tracker — other txs in the wave may still be active.
-            // The execution accumulator will be cleaned up when all its txs are cleaned up or the block is abandoned.
-            // Just remove this tx's assignment.
-            let _ = wave_key;
-        }
-
-        // Early arrivals cleanup
-        self.early_provisioning_complete.remove(tx_hash);
-
-        tracing::debug!(
-            tx_hash = %tx_hash,
-            "Cleaned up execution state for deferred/aborted transaction"
-        );
     }
 
     /// Build provision requests and shard recipients for cross-shard transactions.
