@@ -276,13 +276,11 @@ impl NodeStateMachine {
 
         let inputs = self.gather_proposal_inputs(pending_txs, pending_certs);
 
-        let finalized = self.execution.finalized_tx_hashes();
         self.bft.on_proposal_timer(
             self.topology.snapshot(),
             &inputs.ready_txs,
             inputs.abort_intents,
             inputs.finalized_waves,
-            &finalized,
         )
     }
 
@@ -335,7 +333,6 @@ impl NodeStateMachine {
 
         let inputs = self.gather_proposal_inputs(pending_tx_count, pending_cert_count);
 
-        let finalized = self.execution.finalized_tx_hashes();
         self.bft.on_qc_formed(
             self.topology.snapshot(),
             block_hash,
@@ -343,7 +340,6 @@ impl NodeStateMachine {
             &inputs.ready_txs,
             inputs.abort_intents,
             inputs.finalized_waves,
-            &finalized,
         )
     }
 
@@ -737,9 +733,16 @@ impl StateMachine for NodeStateMachine {
             ProtocolEvent::ExecutionCertificateReceived { cert } => self
                 .execution
                 .on_wave_certificate(self.topology.snapshot(), cert),
-            ProtocolEvent::ExecutionCertificateSignatureVerified { certificate, valid } => self
-                .execution
-                .on_certificate_verified(self.topology.snapshot(), certificate, valid),
+            ProtocolEvent::ExecutionCertificateSignatureVerified { certificate, valid } => {
+                let mut actions = self.execution.on_certificate_verified(
+                    self.topology.snapshot(),
+                    certificate,
+                    valid,
+                );
+                // Remote EC abort propagation may unlock local accumulators — re-scan.
+                actions.extend(self.execution.emit_vote_actions(self.topology.snapshot()));
+                actions
+            }
 
             // ── Transactions ─────────────────────────────────────────────
             ProtocolEvent::TransactionExecuted { tx_hash, accepted } => {

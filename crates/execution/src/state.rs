@@ -1539,12 +1539,48 @@ impl ExecutionState {
         _topology: &TopologySnapshot,
         ec: Arc<ExecutionCertificate>,
     ) -> Vec<Action> {
+        // Propagate remote abort decisions into local accumulators.
+        //
+        // If a remote shard's EC says a tx is aborted, the local shard should
+        // also treat it as aborted. This prevents a deadlock where:
+        // - Shard A aborted a tx (livelock) and produced an EC with abort
+        // - Shard B never got provisions for that tx and has no local abort intent
+        // - Shard B's accumulator is stuck (tx uncoverable) → can never vote → no EC
+        // - Shard A's wave cert tracker waits for Shard B's EC forever
+        //
+        // The remote EC is BFT-agreed, so all local validators see the same
+        // abort reason → deterministic vote data.
+        for outcome in &ec.tx_outcomes {
+            if let TxExecutionOutcome::Aborted { reason } = &outcome.outcome {
+                if let Some(wave_id) = self.wave_assignments.get(&outcome.tx_hash).cloned() {
+                    if let Some(acc) = self.accumulators.get_mut(&wave_id) {
+                        let committed_at = self.committed_height;
+                        acc.record_abort(outcome.tx_hash, committed_at, reason.clone());
+                    }
+                }
+            }
+        }
+
         // Find all local waves affected by this EC's tx_outcomes.
         let mut affected_waves: BTreeSet<WaveId> = BTreeSet::new();
+        let mut has_unrouted = false;
         for outcome in &ec.tx_outcomes {
             if let Some(local_wave_id) = self.wave_assignments.get(&outcome.tx_hash) {
                 affected_waves.insert(local_wave_id.clone());
+            } else {
+                // This tx doesn't have a wave assignment yet — its block hasn't
+                // committed. Re-buffer the EC so it can be replayed later.
+                has_unrouted = true;
             }
+        }
+
+        // If some txs in this EC don't have wave assignments yet (block not
+        // committed), re-buffer the EC for later replay. The EC covers txs
+        // across multiple local waves, and we can't drop it just because
+        // some waves are ready — the others still need it.
+        if has_unrouted {
+            self.early_wave_attestations
+                .push((Arc::clone(&ec), self.committed_height));
         }
 
         if affected_waves.is_empty() {

@@ -815,7 +815,7 @@ impl BftState {
     ///
     /// Takes ready transactions from mempool (already sectioned and hash-sorted),
     /// plus deferrals, aborts, and certificates from execution.
-    #[instrument(skip(self, ready_txs, abort_intents, finalized_waves, finalized_tx_hashes), fields(
+    #[instrument(skip(self, ready_txs, abort_intents, finalized_waves), fields(
         tx_count = ready_txs.len(),
         abort_intent_count = abort_intents.len(),
         cert_count = finalized_waves.len(),
@@ -826,7 +826,6 @@ impl BftState {
         ready_txs: &ReadyTransactions,
         abort_intents: Vec<AbortIntent>,
         finalized_waves: Vec<Arc<FinalizedWave>>,
-        finalized_tx_hashes: &std::collections::HashSet<Hash>,
     ) -> Vec<Action> {
         // The next height to propose is one above the highest certified block,
         // NOT one above the committed block. This allows the chain to grow
@@ -948,23 +947,21 @@ impl BftState {
             self.collect_qc_chain_hashes(parent_hash);
 
         // Filter abort intents:
-        // 1. Skip transactions that already have a TC (finalized).
-        // 2. Skip livelock abort intents whose remote header hasn't arrived yet
+        // 1. Skip livelock abort intents whose remote header hasn't arrived yet
         //    (voters need the header to verify the inclusion proof).
-        // 3. Skip intents already in the QC chain.
-        // 4. Deduplicate by tx_hash within this proposal (livelock + timeout can
+        // 2. Skip intents already in the QC chain.
+        // 3. Deduplicate by tx_hash within this proposal (livelock + timeout can
         //    both fire for the same tx in the same round).
+        //
+        // Abort intents are NOT filtered by finalized status. They are just
+        // inputs to the execution accumulator — if the tx already resolved at a
+        // lower vote height, the abort is harmlessly ignored. Filtering here
+        // would prevent abort intents from reaching accumulators on other waves
+        // that still need them.
         let mut seen_abort_hashes = std::collections::HashSet::new();
         let abort_intents_with_height: Vec<AbortIntent> = abort_intents_with_height
             .into_iter()
             .filter(|a| {
-                if finalized_tx_hashes.contains(&a.tx_hash) {
-                    info!(
-                        tx_hash = %a.tx_hash,
-                        "Filtering abort intent from proposal: transaction already finalized (TC created)"
-                    );
-                    return false;
-                }
                 if let hyperscale_types::AbortReason::LivelockCycle {
                     source_shard,
                     source_block_height,
@@ -2875,7 +2872,7 @@ impl BftState {
     ///
     /// `state_root` is the computed JVT root after applying writes from the certificates.
     /// If certificates is empty, parent state is inherited.
-    #[instrument(skip(self, qc, ready_txs, abort_intents, finalized_waves, finalized_tx_hashes), fields(
+    #[instrument(skip(self, qc, ready_txs, abort_intents, finalized_waves), fields(
         height = qc.height.0,
         block_hash = ?block_hash
     ))]
@@ -2888,7 +2885,6 @@ impl BftState {
         ready_txs: &ReadyTransactions,
         abort_intents: Vec<AbortIntent>,
         finalized_waves: Vec<Arc<FinalizedWave>>,
-        finalized_tx_hashes: &std::collections::HashSet<Hash>,
     ) -> Vec<Action> {
         let height = qc.height.0;
 
@@ -2970,7 +2966,6 @@ impl BftState {
                 ready_txs,
                 abort_intents,
                 finalized_waves,
-                finalized_tx_hashes,
             ));
         } else if should_try_proposal && rate_limited {
             // Schedule the proposal timer to fire exactly when the rate limit
@@ -6795,7 +6790,6 @@ mod tests {
             &ReadyTransactions::default(), // empty mempool
             vec![],                        // no abort intents
             vec![],                        // no certificates
-            &std::collections::HashSet::new(),
         );
 
         // Should NOT contain a BlockHeader broadcast (no proposal)
@@ -6845,7 +6839,6 @@ mod tests {
             &ReadyTransactions::default(), // empty mempool
             vec![abort_intent],            // has an abort intent
             vec![],                        // no certificates
-            &std::collections::HashSet::new(),
         );
 
         // Should contain a BuildProposal action (proposal triggered)
@@ -7167,7 +7160,6 @@ mod tests {
             &ReadyTransactions::default(), // empty mempool
             vec![abort_intent],            // has content
             vec![],
-            &std::collections::HashSet::new(),
         );
 
         // Should NOT contain a BlockHeader broadcast (rate limited)
@@ -7222,7 +7214,6 @@ mod tests {
             &ReadyTransactions::default(), // empty mempool
             vec![abort_intent],            // has content
             vec![],
-            &std::collections::HashSet::new(),
         );
 
         // Should contain a BuildProposal action (enough time passed)
@@ -7304,7 +7295,6 @@ mod tests {
             &ReadyTransactions::default(),
             vec![abort_intent],
             vec![],
-            &std::collections::HashSet::new(),
         );
 
         let has_block_header = actions
@@ -7381,7 +7371,6 @@ mod tests {
             &ReadyTransactions::default(),
             vec![abort_intent],
             vec![],
-            &std::collections::HashSet::new(),
         );
 
         // Should contain a BuildProposal action (rate limiting disabled)
@@ -7426,7 +7415,6 @@ mod tests {
             &ReadyTransactions::default(),
             vec![],
             vec![],
-            &std::collections::HashSet::new(),
         );
 
         // Verify last_qc_time was updated to current time
@@ -7646,13 +7634,7 @@ mod tests {
             transactions: vec![Arc::new(hyperscale_types::test_utils::test_transaction(1))],
         };
 
-        let actions = state.on_proposal_timer(
-            &topology,
-            &ready_txs,
-            vec![],
-            vec![],
-            &std::collections::HashSet::new(),
-        );
+        let actions = state.on_proposal_timer(&topology, &ready_txs, vec![], vec![]);
 
         // Should have broadcast a block header
         let has_block_header = actions
@@ -7712,13 +7694,8 @@ mod tests {
         // Enter sync mode
         state.set_syncing(&topology, true);
 
-        let actions = state.on_proposal_timer(
-            &topology,
-            &ReadyTransactions::default(),
-            vec![],
-            vec![],
-            &std::collections::HashSet::new(),
-        );
+        let actions =
+            state.on_proposal_timer(&topology, &ReadyTransactions::default(), vec![], vec![]);
 
         // Extract the block header
         let gossip = actions.iter().find_map(|a| {
@@ -7997,13 +7974,8 @@ mod tests {
         state.set_syncing(&topology, true);
 
         // Propose (which builds sync block)
-        let _actions = state.on_proposal_timer(
-            &topology,
-            &ReadyTransactions::default(),
-            vec![],
-            vec![],
-            &std::collections::HashSet::new(),
-        );
+        let _actions =
+            state.on_proposal_timer(&topology, &ReadyTransactions::default(), vec![], vec![]);
 
         // Leader activity should be updated
         assert_eq!(
@@ -8115,13 +8087,8 @@ mod tests {
         state.set_syncing(&topology, true);
 
         // Propose first sync block
-        let actions1 = state.on_proposal_timer(
-            &topology,
-            &ReadyTransactions::default(),
-            vec![],
-            vec![],
-            &std::collections::HashSet::new(),
-        );
+        let actions1 =
+            state.on_proposal_timer(&topology, &ReadyTransactions::default(), vec![], vec![]);
 
         // Verify we got a proposal (not skipped due to syncing)
         let has_proposal = actions1
