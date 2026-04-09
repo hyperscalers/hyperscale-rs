@@ -1150,6 +1150,10 @@ impl MetricsRecorder for PrometheusRecorder {
             .set(m.mempool_pool as f64);
         self.metrics
             .memory_mempool
+            .with_label_values(&["max_pool_size"])
+            .set(m.mempool_max_pool_size as f64);
+        self.metrics
+            .memory_mempool
             .with_label_values(&["ready"])
             .set(m.mempool_ready as f64);
         self.metrics
