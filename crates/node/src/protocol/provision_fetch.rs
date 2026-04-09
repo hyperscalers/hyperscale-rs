@@ -18,21 +18,18 @@ use hyperscale_storage::{ChainReader, SubstateStore};
 use hyperscale_types::{BlockHeight, ProvisionBatch, ShardGroupId, StateProvision, ValidatorId};
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
-use tracing::{debug, trace, warn};
+use std::time::Instant;
+use tracing::{debug, info, trace, warn};
 
 /// Configuration for the provision fetch protocol.
 #[derive(Debug, Clone)]
 pub struct ProvisionFetchConfig {
     /// Maximum number of concurrent provision fetch operations.
     pub max_concurrent: usize,
-    /// Maximum full rounds through all peers before giving up.
-    pub max_rounds: u32,
     /// Maximum number of pending fetch entries per source shard.
     ///
-    /// Prevents unbounded accumulation when a remote shard is down: without
-    /// this cap, every timed-out block height adds a new entry, each of which
-    /// goes through max_rounds × peers × RequestManager retries before draining.
-    /// When the cap is reached, new requests for that shard are dropped.
+    /// Prevents unbounded accumulation when a remote shard is down. When the
+    /// cap is reached, the oldest entry for that shard is evicted.
     pub max_pending_per_shard: usize,
 }
 
@@ -40,7 +37,6 @@ impl Default for ProvisionFetchConfig {
     fn default() -> Self {
         Self {
             max_concurrent: 4,
-            max_rounds: 3,
             max_pending_per_shard: 8,
         }
     }
@@ -74,7 +70,7 @@ pub enum ProvisionFetchInput {
         block_height: BlockHeight,
     },
     /// Periodic tick — spawn pending fetch operations.
-    Tick,
+    Tick { now: Instant },
 }
 
 /// Outputs from the provision fetch protocol state machine.
@@ -100,6 +96,7 @@ struct PendingProvisionFetch {
     tried: HashSet<ValidatorId>,
     in_flight: bool,
     rounds: u32,
+    next_retry_at: Option<Instant>,
 }
 
 /// Provision fetch protocol state machine.
@@ -147,7 +144,7 @@ impl ProvisionFetchProtocol {
                 source_shard,
                 block_height,
             } => self.handle_cancel(source_shard, block_height),
-            ProvisionFetchInput::Tick => self.spawn_pending_fetches(),
+            ProvisionFetchInput::Tick { now } => self.spawn_pending_fetches(now),
         }
     }
 
@@ -188,10 +185,11 @@ impl ProvisionFetchProtocol {
         let key = (source_shard, block_height);
 
         if let Some(existing) = self.pending.get_mut(&key) {
-            // Duplicate request: refresh peer list, reset rounds for fresh retry cycle.
+            // Duplicate request: refresh peer list, reset rounds and backoff.
             existing.peers = peers;
             existing.preferred_peer = preferred_peer;
             existing.rounds = 0;
+            existing.next_retry_at = None;
             trace!(
                 source_shard = source_shard.0,
                 block_height = block_height.0,
@@ -245,6 +243,7 @@ impl ProvisionFetchProtocol {
                 tried: HashSet::new(),
                 in_flight: false,
                 rounds: 0,
+                next_retry_at: None,
             },
         );
         vec![]
@@ -313,11 +312,9 @@ impl ProvisionFetchProtocol {
     }
 
     /// Spawn pending fetch operations (called on Tick).
-    fn spawn_pending_fetches(&mut self) -> Vec<ProvisionFetchOutput> {
+    fn spawn_pending_fetches(&mut self, now: Instant) -> Vec<ProvisionFetchOutput> {
         let mut outputs = Vec::new();
-        let mut to_remove = Vec::new();
 
-        // Count current in-flight to respect max_concurrent.
         let in_flight_count = self.pending.values().filter(|s| s.in_flight).count();
         let mut available_slots = self.config.max_concurrent.saturating_sub(in_flight_count);
 
@@ -328,13 +325,16 @@ impl ProvisionFetchProtocol {
             if state.in_flight {
                 continue;
             }
+            if let Some(retry_at) = state.next_retry_at {
+                if now < retry_at {
+                    continue;
+                }
+                state.next_retry_at = None;
+            }
 
-            // Pick the next peer to try.
             let peer = if !state.tried.contains(&state.preferred_peer) {
-                // Prefer the proposer if not yet tried.
                 Some(state.preferred_peer)
             } else {
-                // Pick the first untried peer.
                 state
                     .peers
                     .iter()
@@ -362,29 +362,20 @@ impl ProvisionFetchProtocol {
                 }
                 None => {
                     state.rounds += 1;
-                    if state.rounds >= self.config.max_rounds {
-                        warn!(
-                            source_shard = source_shard.0,
-                            block_height = block_height.0,
-                            rounds = state.rounds,
-                            "Provision fetch exhausted all rounds, dropping"
-                        );
-                        to_remove.push((source_shard, block_height));
-                    } else {
-                        warn!(
-                            source_shard = source_shard.0,
-                            block_height = block_height.0,
-                            round = state.rounds,
-                            "Provision fetch starting new round"
-                        );
-                        state.tried.clear();
-                    }
+                    state.tried.clear();
+                    let backoff = std::time::Duration::from_millis(
+                        (500u64 * 2u64.saturating_pow(state.rounds)).min(30_000),
+                    );
+                    state.next_retry_at = Some(now + backoff);
+                    info!(
+                        source_shard = source_shard.0,
+                        block_height = block_height.0,
+                        round = state.rounds,
+                        backoff_ms = backoff.as_millis(),
+                        "Provision fetch exhausted peers, backing off"
+                    );
                 }
             }
-        }
-
-        for key in to_remove {
-            self.pending.remove(&key);
         }
 
         outputs
@@ -527,6 +518,7 @@ pub fn serve_provision_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn default_config() -> ProvisionFetchConfig {
         ProvisionFetchConfig::default()
@@ -544,11 +536,14 @@ mod tests {
         ValidatorId(id)
     }
 
+    fn tick(now: Instant) -> ProvisionFetchInput {
+        ProvisionFetchInput::Tick { now }
+    }
+
     #[test]
     fn test_config_defaults() {
         let config = ProvisionFetchConfig::default();
         assert_eq!(config.max_concurrent, 4);
-        assert_eq!(config.max_rounds, 3);
         assert_eq!(config.max_pending_per_shard, 8);
     }
 
@@ -568,7 +563,8 @@ mod tests {
         assert!(protocol.has_pending());
 
         // Tick should emit a Fetch with the preferred peer.
-        let outputs = protocol.handle(ProvisionFetchInput::Tick);
+        let now = Instant::now();
+        let outputs = protocol.handle(tick(now));
         assert_eq!(outputs.len(), 1);
         match &outputs[0] {
             ProvisionFetchOutput::Fetch {
@@ -588,6 +584,7 @@ mod tests {
 
     #[test]
     fn test_peer_rotation_on_failure() {
+        let now = Instant::now();
         let mut protocol = ProvisionFetchProtocol::new(default_config());
 
         protocol.handle(ProvisionFetchInput::Request {
@@ -599,7 +596,7 @@ mod tests {
         });
 
         // Tick 1: preferred peer (vid(1)).
-        let outputs = protocol.handle(ProvisionFetchInput::Tick);
+        let outputs = protocol.handle(tick(now));
         assert_eq!(outputs.len(), 1);
         assert!(matches!(
             &outputs[0],
@@ -613,7 +610,7 @@ mod tests {
         });
 
         // Tick 2: next untried peer (vid(2)).
-        let outputs = protocol.handle(ProvisionFetchInput::Tick);
+        let outputs = protocol.handle(tick(now));
         assert_eq!(outputs.len(), 1);
         assert!(matches!(
             &outputs[0],
@@ -627,7 +624,7 @@ mod tests {
         });
 
         // Tick 3: last peer (vid(3)).
-        let outputs = protocol.handle(ProvisionFetchInput::Tick);
+        let outputs = protocol.handle(tick(now));
         assert_eq!(outputs.len(), 1);
         assert!(matches!(
             &outputs[0],
@@ -636,70 +633,42 @@ mod tests {
     }
 
     #[test]
-    fn test_all_peers_exhausted_after_max_rounds() {
-        let config = ProvisionFetchConfig {
-            max_rounds: 2,
-            ..default_config()
-        };
-        let mut protocol = ProvisionFetchProtocol::new(config);
+    fn test_all_peers_exhausted_backs_off_and_retries() {
+        let now = Instant::now();
+        let mut protocol = ProvisionFetchProtocol::new(default_config());
 
         protocol.handle(ProvisionFetchInput::Request {
             source_shard: shard(1),
             block_height: height(10),
             target_shard: shard(0),
-            peers: vec![vid(1), vid(2)],
+            peers: vec![vid(1)],
             preferred_peer: vid(1),
         });
 
-        // --- Round 0 ---
-        // Try vid(1).
-        protocol.handle(ProvisionFetchInput::Tick);
+        // Try vid(1), fail.
+        protocol.handle(tick(now));
         protocol.handle(ProvisionFetchInput::Failed {
             source_shard: shard(1),
             block_height: height(10),
         });
-        // Try vid(2).
-        protocol.handle(ProvisionFetchInput::Tick);
-        protocol.handle(ProvisionFetchInput::Failed {
-            source_shard: shard(1),
-            block_height: height(10),
-        });
-        // All peers exhausted → round 0→1, tried reset, still pending.
-        let outputs = protocol.handle(ProvisionFetchInput::Tick);
-        assert!(outputs.is_empty()); // No fetch yet (just reset)
-        assert!(
-            protocol.has_pending(),
-            "Should still be pending after round 0"
-        );
 
-        // --- Round 1: peers are retried from scratch ---
-        let outputs = protocol.handle(ProvisionFetchInput::Tick);
-        assert_eq!(outputs.len(), 1, "Should retry vid(1) in round 1");
+        // All peers exhausted → backoff. Tick during backoff: no fetch.
+        let outputs = protocol.handle(tick(now));
+        assert!(outputs.is_empty());
+        assert!(protocol.has_pending(), "Should NOT be dropped");
+
+        // Tick after backoff expires: should retry.
+        let outputs = protocol.handle(tick(now + Duration::from_secs(2)));
+        assert_eq!(outputs.len(), 1);
         assert!(matches!(
             &outputs[0],
             ProvisionFetchOutput::Fetch { peer, .. } if *peer == vid(1)
         ));
-        protocol.handle(ProvisionFetchInput::Failed {
-            source_shard: shard(1),
-            block_height: height(10),
-        });
-        // Try vid(2) again.
-        protocol.handle(ProvisionFetchInput::Tick);
-        protocol.handle(ProvisionFetchInput::Failed {
-            source_shard: shard(1),
-            block_height: height(10),
-        });
-        // All peers exhausted → round 1→2, but max_rounds=2 → drop.
-        let outputs = protocol.handle(ProvisionFetchInput::Tick);
-        assert!(outputs.is_empty());
-        assert!(
-            !protocol.has_pending(),
-            "Should be dropped after max_rounds"
-        );
     }
 
     #[test]
     fn test_successful_receive() {
+        let now = Instant::now();
         let mut protocol = ProvisionFetchProtocol::new(default_config());
 
         protocol.handle(ProvisionFetchInput::Request {
@@ -711,7 +680,7 @@ mod tests {
         });
 
         // Tick → fetch from vid(1).
-        protocol.handle(ProvisionFetchInput::Tick);
+        protocol.handle(tick(now));
 
         // Receive provisions.
         let outputs = protocol.handle(ProvisionFetchInput::Received {
@@ -730,6 +699,7 @@ mod tests {
 
     #[test]
     fn test_duplicate_request_refreshes_peers() {
+        let now = Instant::now();
         let mut protocol = ProvisionFetchProtocol::new(default_config());
 
         protocol.handle(ProvisionFetchInput::Request {
@@ -741,7 +711,7 @@ mod tests {
         });
 
         // Try vid(1) and fail.
-        protocol.handle(ProvisionFetchInput::Tick);
+        protocol.handle(tick(now));
         protocol.handle(ProvisionFetchInput::Failed {
             source_shard: shard(1),
             block_height: height(10),
@@ -757,7 +727,7 @@ mod tests {
         });
 
         // vid(1) already tried, so should try vid(2).
-        let outputs = protocol.handle(ProvisionFetchInput::Tick);
+        let outputs = protocol.handle(tick(now));
         assert_eq!(outputs.len(), 1);
         assert!(matches!(
             &outputs[0],
@@ -767,6 +737,7 @@ mod tests {
 
     #[test]
     fn test_max_concurrent_respected() {
+        let now = Instant::now();
         let config = ProvisionFetchConfig {
             max_concurrent: 2,
             ..default_config()
@@ -785,7 +756,7 @@ mod tests {
         }
 
         // Tick should only emit 2 fetches (max_concurrent = 2).
-        let outputs = protocol.handle(ProvisionFetchInput::Tick);
+        let outputs = protocol.handle(tick(now));
         assert_eq!(outputs.len(), 2);
     }
 
@@ -803,6 +774,7 @@ mod tests {
 
     #[test]
     fn test_in_flight_not_double_dispatched() {
+        let now = Instant::now();
         let mut protocol = ProvisionFetchProtocol::new(default_config());
 
         protocol.handle(ProvisionFetchInput::Request {
@@ -814,16 +786,17 @@ mod tests {
         });
 
         // First tick dispatches.
-        let outputs = protocol.handle(ProvisionFetchInput::Tick);
+        let outputs = protocol.handle(tick(now));
         assert_eq!(outputs.len(), 1);
 
         // Second tick while still in-flight: no new dispatch.
-        let outputs = protocol.handle(ProvisionFetchInput::Tick);
+        let outputs = protocol.handle(tick(now));
         assert!(outputs.is_empty());
     }
 
     #[test]
     fn test_cancel_removes_pending_fetch() {
+        let now = Instant::now();
         let mut protocol = ProvisionFetchProtocol::new(default_config());
 
         // Submit a request.
@@ -848,7 +821,7 @@ mod tests {
         );
 
         // Tick should have nothing to dispatch.
-        let outputs = protocol.handle(ProvisionFetchInput::Tick);
+        let outputs = protocol.handle(tick(now));
         assert!(outputs.is_empty());
     }
 
@@ -866,6 +839,7 @@ mod tests {
 
     #[test]
     fn test_cancel_in_flight_fetch() {
+        let now = Instant::now();
         let mut protocol = ProvisionFetchProtocol::new(default_config());
 
         protocol.handle(ProvisionFetchInput::Request {
@@ -877,7 +851,7 @@ mod tests {
         });
 
         // Tick dispatches the fetch (in-flight).
-        let outputs = protocol.handle(ProvisionFetchInput::Tick);
+        let outputs = protocol.handle(tick(now));
         assert_eq!(outputs.len(), 1);
         assert!(protocol.has_pending());
 

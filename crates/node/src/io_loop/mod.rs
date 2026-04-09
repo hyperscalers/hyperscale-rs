@@ -669,14 +669,18 @@ where
                     .handle(TransactionFetchInput::Tick);
                 self.process_transaction_fetch_outputs(outputs);
                 // Also tick the provision fetch protocol.
-                let prov_outputs = self
-                    .provision_fetch_protocol
-                    .handle(ProvisionFetchInput::Tick);
+                let prov_outputs =
+                    self.provision_fetch_protocol
+                        .handle(ProvisionFetchInput::Tick {
+                            now: std::time::Instant::now(),
+                        });
                 self.process_provision_fetch_outputs(prov_outputs);
                 // Also tick the inclusion proof fetch protocol.
-                let proof_outputs = self
-                    .inclusion_proof_fetch_protocol
-                    .handle(InclusionProofFetchInput::Tick);
+                let proof_outputs =
+                    self.inclusion_proof_fetch_protocol
+                        .handle(InclusionProofFetchInput::Tick {
+                            now: std::time::Instant::now(),
+                        });
                 self.process_inclusion_proof_fetch_outputs(proof_outputs);
                 // Also tick the exec cert fetch protocol.
                 let cert_outputs = self
@@ -687,7 +691,9 @@ where
                     });
                 self.process_exec_cert_fetch_outputs(cert_outputs);
                 // Also tick the header fetch protocol.
-                let header_outputs = self.header_fetch_protocol.handle(HeaderFetchInput::Tick);
+                let header_outputs = self.header_fetch_protocol.handle(HeaderFetchInput::Tick {
+                    now: std::time::Instant::now(),
+                });
                 self.process_header_fetch_outputs(header_outputs);
                 self.update_fetch_tick_timer();
             }
@@ -734,9 +740,11 @@ where
                     .handle(InclusionProofFetchInput::Failed { winner_tx_hash });
                 self.process_inclusion_proof_fetch_outputs(outputs);
                 // Tick to retry immediately.
-                let tick_outputs = self
-                    .inclusion_proof_fetch_protocol
-                    .handle(InclusionProofFetchInput::Tick);
+                let tick_outputs =
+                    self.inclusion_proof_fetch_protocol
+                        .handle(InclusionProofFetchInput::Tick {
+                            now: std::time::Instant::now(),
+                        });
                 self.process_inclusion_proof_fetch_outputs(tick_outputs);
                 self.update_fetch_tick_timer();
             }
@@ -753,9 +761,11 @@ where
                     });
                 self.process_provision_fetch_outputs(outputs);
                 // Tick to retry with next peer immediately.
-                let tick_outputs = self
-                    .provision_fetch_protocol
-                    .handle(ProvisionFetchInput::Tick);
+                let tick_outputs =
+                    self.provision_fetch_protocol
+                        .handle(ProvisionFetchInput::Tick {
+                            now: std::time::Instant::now(),
+                        });
                 self.process_provision_fetch_outputs(tick_outputs);
                 self.update_fetch_tick_timer();
             }
@@ -826,7 +836,9 @@ where
                 });
                 self.process_header_fetch_outputs(outputs);
                 // Tick to retry with next peer immediately.
-                let tick_outputs = self.header_fetch_protocol.handle(HeaderFetchInput::Tick);
+                let tick_outputs = self.header_fetch_protocol.handle(HeaderFetchInput::Tick {
+                    now: std::time::Instant::now(),
+                });
                 self.process_header_fetch_outputs(tick_outputs);
                 self.update_fetch_tick_timer();
             }

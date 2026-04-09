@@ -781,9 +781,11 @@ where
                         preferred_peer: proposer,
                     });
                 self.process_provision_fetch_outputs(outputs);
-                let tick_outputs = self
-                    .provision_fetch_protocol
-                    .handle(ProvisionFetchInput::Tick);
+                let tick_outputs =
+                    self.provision_fetch_protocol
+                        .handle(ProvisionFetchInput::Tick {
+                            now: std::time::Instant::now(),
+                        });
                 self.process_provision_fetch_outputs(tick_outputs);
                 self.update_fetch_tick_timer();
             }
@@ -821,9 +823,11 @@ where
                     self.process_inclusion_proof_fetch_outputs(outputs);
                 }
                 // Single tick dispatches all entries as one batch.
-                let tick_outputs = self
-                    .inclusion_proof_fetch_protocol
-                    .handle(InclusionProofFetchInput::Tick);
+                let tick_outputs =
+                    self.inclusion_proof_fetch_protocol
+                        .handle(InclusionProofFetchInput::Tick {
+                            now: std::time::Instant::now(),
+                        });
                 self.process_inclusion_proof_fetch_outputs(tick_outputs);
                 self.update_fetch_tick_timer();
             }
@@ -879,7 +883,9 @@ where
                         peers,
                     });
                 self.process_header_fetch_outputs(outputs);
-                let tick_outputs = self.header_fetch_protocol.handle(HeaderFetchInput::Tick);
+                let tick_outputs = self.header_fetch_protocol.handle(HeaderFetchInput::Tick {
+                    now: std::time::Instant::now(),
+                });
                 self.process_header_fetch_outputs(tick_outputs);
                 self.update_fetch_tick_timer();
             }

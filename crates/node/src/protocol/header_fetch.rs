@@ -14,15 +14,14 @@
 use hyperscale_metrics as metrics;
 use hyperscale_types::{BlockHeight, CommittedBlockHeader, ShardGroupId, ValidatorId};
 use std::collections::{BTreeMap, HashSet};
-use tracing::{debug, trace, warn};
+use std::time::Instant;
+use tracing::{debug, info, trace, warn};
 
 /// Configuration for the header fetch protocol.
 #[derive(Debug, Clone)]
 pub struct HeaderFetchConfig {
     /// Maximum number of concurrent fetch operations.
     pub max_concurrent: usize,
-    /// Maximum full rounds through all peers before giving up.
-    pub max_rounds: u32,
     /// Maximum number of pending fetch entries per source shard.
     pub max_pending_per_shard: usize,
 }
@@ -31,7 +30,6 @@ impl Default for HeaderFetchConfig {
     fn default() -> Self {
         Self {
             max_concurrent: 4,
-            max_rounds: 3,
             max_pending_per_shard: 8,
         }
     }
@@ -64,7 +62,7 @@ pub enum HeaderFetchInput {
         from_height: BlockHeight,
     },
     /// Periodic tick — spawn pending fetch operations.
-    Tick,
+    Tick { now: Instant },
 }
 
 /// Outputs from the header fetch protocol state machine.
@@ -87,6 +85,7 @@ struct PendingHeaderFetch {
     tried: HashSet<ValidatorId>,
     in_flight: bool,
     rounds: u32,
+    next_retry_at: Option<Instant>,
 }
 
 /// Committed block header fetch protocol state machine.
@@ -126,7 +125,7 @@ impl HeaderFetchProtocol {
                 source_shard,
                 from_height,
             } => self.handle_cancel(source_shard, from_height),
-            HeaderFetchInput::Tick => self.spawn_pending_fetches(),
+            HeaderFetchInput::Tick { now } => self.spawn_pending_fetches(now),
         }
     }
 
@@ -162,6 +161,7 @@ impl HeaderFetchProtocol {
             // Duplicate request: refresh peers, reset rounds.
             existing.peers = peers;
             existing.rounds = 0;
+            existing.next_retry_at = None;
             trace!(
                 source_shard = source_shard.0,
                 from_height = from_height.0,
@@ -210,6 +210,7 @@ impl HeaderFetchProtocol {
                 tried: HashSet::new(),
                 in_flight: false,
                 rounds: 0,
+                next_retry_at: None,
             },
         );
         vec![]
@@ -277,9 +278,8 @@ impl HeaderFetchProtocol {
     }
 
     /// Spawn pending fetch operations (called on Tick).
-    fn spawn_pending_fetches(&mut self) -> Vec<HeaderFetchOutput> {
+    fn spawn_pending_fetches(&mut self, now: Instant) -> Vec<HeaderFetchOutput> {
         let mut outputs = Vec::new();
-        let mut to_remove = Vec::new();
 
         // Count current in-flight to respect max_concurrent.
         let in_flight_count = self.pending.values().filter(|s| s.in_flight).count();
@@ -291,6 +291,14 @@ impl HeaderFetchProtocol {
             }
             if state.in_flight {
                 continue;
+            }
+
+            // Respect backoff timer.
+            if let Some(retry_at) = state.next_retry_at {
+                if now < retry_at {
+                    continue;
+                }
+                state.next_retry_at = None;
             }
 
             // Pick the first untried peer.
@@ -318,30 +326,22 @@ impl HeaderFetchProtocol {
                     });
                 }
                 None => {
+                    // All peers exhausted — start new round with exponential backoff.
                     state.rounds += 1;
-                    if state.rounds >= self.config.max_rounds {
-                        warn!(
-                            source_shard = source_shard.0,
-                            from_height = from_height.0,
-                            rounds = state.rounds,
-                            "Header fetch exhausted all rounds, dropping"
-                        );
-                        to_remove.push((source_shard, from_height));
-                    } else {
-                        warn!(
-                            source_shard = source_shard.0,
-                            from_height = from_height.0,
-                            round = state.rounds,
-                            "Header fetch starting new round"
-                        );
-                        state.tried.clear();
-                    }
+                    state.tried.clear();
+                    let backoff = std::time::Duration::from_millis(
+                        (500u64 * 2u64.saturating_pow(state.rounds)).min(30_000),
+                    );
+                    state.next_retry_at = Some(now + backoff);
+                    info!(
+                        source_shard = source_shard.0,
+                        from_height = from_height.0,
+                        round = state.rounds,
+                        backoff_ms = backoff.as_millis(),
+                        "Header fetch exhausted peers, backing off"
+                    );
                 }
             }
-        }
-
-        for key in to_remove {
-            self.pending.remove(&key);
         }
 
         outputs
@@ -368,11 +368,14 @@ mod tests {
         BlockHeight(h)
     }
 
+    fn now() -> Instant {
+        Instant::now()
+    }
+
     #[test]
     fn test_config_defaults() {
         let config = HeaderFetchConfig::default();
         assert_eq!(config.max_concurrent, 4);
-        assert_eq!(config.max_rounds, 3);
         assert_eq!(config.max_pending_per_shard, 8);
     }
 
@@ -389,7 +392,7 @@ mod tests {
         assert!(protocol.has_pending());
 
         // Tick should emit a Fetch with the first peer.
-        let outputs = protocol.handle(HeaderFetchInput::Tick);
+        let outputs = protocol.handle(HeaderFetchInput::Tick { now: now() });
         assert_eq!(outputs.len(), 1);
         match &outputs[0] {
             HeaderFetchOutput::Fetch {
@@ -416,7 +419,7 @@ mod tests {
         });
 
         // Tick 1: vid(1).
-        let outputs = protocol.handle(HeaderFetchInput::Tick);
+        let outputs = protocol.handle(HeaderFetchInput::Tick { now: now() });
         assert!(matches!(
             &outputs[0],
             HeaderFetchOutput::Fetch { peer, .. } if *peer == vid(1)
@@ -429,7 +432,7 @@ mod tests {
         });
 
         // Tick 2: next untried peer (vid(2)).
-        let outputs = protocol.handle(HeaderFetchInput::Tick);
+        let outputs = protocol.handle(HeaderFetchInput::Tick { now: now() });
         assert!(matches!(
             &outputs[0],
             HeaderFetchOutput::Fetch { peer, .. } if *peer == vid(2)
@@ -437,12 +440,8 @@ mod tests {
     }
 
     #[test]
-    fn test_all_peers_exhausted_after_max_rounds() {
-        let config = HeaderFetchConfig {
-            max_rounds: 2,
-            ..default_config()
-        };
-        let mut protocol = HeaderFetchProtocol::new(config);
+    fn test_all_peers_exhausted_uses_exponential_backoff() {
+        let mut protocol = HeaderFetchProtocol::new(default_config());
 
         protocol.handle(HeaderFetchInput::Request {
             source_shard: shard(1),
@@ -450,25 +449,56 @@ mod tests {
             peers: vec![vid(1)],
         });
 
-        // Round 0: try vid(1), fail.
-        protocol.handle(HeaderFetchInput::Tick);
-        protocol.handle(HeaderFetchInput::Failed {
-            source_shard: shard(1),
-            from_height: height(10),
-        });
-        // All peers exhausted → round 0→1, reset tried.
-        protocol.handle(HeaderFetchInput::Tick);
+        let t0 = Instant::now();
 
-        // Round 1: try vid(1) again, fail.
-        let outputs = protocol.handle(HeaderFetchInput::Tick);
-        assert_eq!(outputs.len(), 1);
+        // Round 0: try vid(1), fail.
+        protocol.handle(HeaderFetchInput::Tick { now: t0 });
         protocol.handle(HeaderFetchInput::Failed {
             source_shard: shard(1),
             from_height: height(10),
         });
-        // All peers exhausted → round 1→2, but max_rounds=2 → drop.
-        protocol.handle(HeaderFetchInput::Tick);
-        assert!(!protocol.has_pending());
+
+        // All peers exhausted → sets backoff (round 1 = 500ms * 2^1 = 1s).
+        protocol.handle(HeaderFetchInput::Tick { now: t0 });
+        // Entry should still be pending (not dropped).
+        assert!(protocol.has_pending());
+
+        // Tick before backoff expires — should NOT spawn a fetch.
+        let outputs = protocol.handle(HeaderFetchInput::Tick {
+            now: t0 + std::time::Duration::from_millis(500),
+        });
+        assert!(outputs.is_empty());
+
+        // Tick after backoff expires — should retry vid(1).
+        let outputs = protocol.handle(HeaderFetchInput::Tick {
+            now: t0 + std::time::Duration::from_secs(2),
+        });
+        assert_eq!(outputs.len(), 1);
+        assert!(matches!(
+            &outputs[0],
+            HeaderFetchOutput::Fetch { peer, .. } if *peer == vid(1)
+        ));
+
+        // Fail again → next backoff is 500ms * 2^2 = 2s.
+        protocol.handle(HeaderFetchInput::Failed {
+            source_shard: shard(1),
+            from_height: height(10),
+        });
+        let t1 = t0 + std::time::Duration::from_secs(2);
+        protocol.handle(HeaderFetchInput::Tick { now: t1 });
+        assert!(protocol.has_pending());
+
+        // Still within 2s backoff — no fetch.
+        let outputs = protocol.handle(HeaderFetchInput::Tick {
+            now: t1 + std::time::Duration::from_secs(1),
+        });
+        assert!(outputs.is_empty());
+
+        // Past 2s backoff — fetch again.
+        let outputs = protocol.handle(HeaderFetchInput::Tick {
+            now: t1 + std::time::Duration::from_secs(3),
+        });
+        assert_eq!(outputs.len(), 1);
     }
 
     #[test]
@@ -481,7 +511,7 @@ mod tests {
             peers: vec![vid(1)],
         });
 
-        protocol.handle(HeaderFetchInput::Tick);
+        protocol.handle(HeaderFetchInput::Tick { now: now() });
 
         let header = make_test_header(1, 10);
         let outputs = protocol.handle(HeaderFetchInput::Received {
@@ -557,7 +587,7 @@ mod tests {
             });
         }
 
-        let outputs = protocol.handle(HeaderFetchInput::Tick);
+        let outputs = protocol.handle(HeaderFetchInput::Tick { now: now() });
         assert_eq!(outputs.len(), 2);
     }
 
