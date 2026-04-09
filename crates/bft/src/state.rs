@@ -982,15 +982,19 @@ impl BftState {
             })
             .collect();
 
-        // Filter transactions and certificates already in the QC chain.
-        let transactions: Vec<Arc<RoutableTransaction>> = if qc_chain_tx_hashes.is_empty() {
-            ready_txs.transactions.clone()
-        } else {
+        // Filter transactions already in the QC chain or previously committed.
+        // The QC chain walk covers pending/certified blocks + recently_committed_txs.
+        // committed_tx_lookup covers all historically committed txs (survives the
+        // recently_committed_txs cleanup after BlockCommitted events, critical after sync).
+        let transactions: Vec<Arc<RoutableTransaction>> = {
             let before = ready_txs.transactions.len();
             let filtered: Vec<_> = ready_txs
                 .transactions
                 .iter()
-                .filter(|tx| !qc_chain_tx_hashes.contains(&tx.hash()))
+                .filter(|tx| {
+                    let h = tx.hash();
+                    !qc_chain_tx_hashes.contains(&h) && !self.committed_tx_lookup.contains_key(&h)
+                })
                 .cloned()
                 .collect();
             let deduped = before - filtered.len();
@@ -999,7 +1003,7 @@ impl BftState {
                     deduped,
                     before,
                     after = filtered.len(),
-                    "Filtered transactions already in QC chain"
+                    "Filtered transactions already in QC chain or committed"
                 );
             }
             filtered
@@ -2116,12 +2120,14 @@ impl BftState {
         Ok(())
     }
 
-    /// Validate that no transaction in the block also appears in an ancestor
-    /// block above committed height (the QC chain). Intra-block duplicates are
-    /// already prevented by the strict hash-ordering check.
+    /// Validate that no transaction in the block has already been committed
+    /// or appears in an ancestor block above committed height (the QC chain).
+    /// Intra-block duplicates are already prevented by the strict hash-ordering check.
     ///
     /// Uses the same unified QC-chain walk as the proposer, including the
-    /// pending-block manifest fallback for unassembled ancestors.
+    /// pending-block manifest fallback for unassembled ancestors. Also checks
+    /// the committed_tx_lookup which tracks all historically committed txs
+    /// (survives recently_committed_txs cleanup after BlockCommitted events).
     fn validate_no_duplicate_transactions(&self, block: &Block) -> Result<(), String> {
         if block.transactions.is_empty() {
             return Ok(());
@@ -2130,10 +2136,17 @@ impl BftState {
         let (_, qc_chain_tx_hashes, _) = self.collect_qc_chain_hashes(block.header.parent_hash);
 
         for tx in &block.transactions {
-            if qc_chain_tx_hashes.contains(&tx.hash()) {
+            let tx_hash = tx.hash();
+            if qc_chain_tx_hashes.contains(&tx_hash) {
                 return Err(format!(
                     "transaction {} already in QC chain ancestor",
-                    tx.hash(),
+                    tx_hash,
+                ));
+            }
+            if self.committed_tx_lookup.contains_key(&tx_hash) {
+                return Err(format!(
+                    "transaction {} already committed at height {}",
+                    tx_hash, self.committed_tx_lookup[&tx_hash].0,
                 ));
             }
         }
