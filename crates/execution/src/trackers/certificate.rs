@@ -192,6 +192,11 @@ impl WaveCertificateTracker {
     /// Decision priority: Aborted > Reject > Accept (same as old CertificateTracker).
     /// Only ECs that actually contain an outcome for a given tx are considered —
     /// a remote shard may produce multiple ECs (D8), and each only covers a subset.
+    /// Check if a specific transaction was aborted.
+    pub fn is_tx_aborted(&self, tx_hash: &Hash) -> bool {
+        self.aborted.contains(tx_hash)
+    }
+
     pub fn tx_decisions(&self) -> Vec<TxDecision> {
         self.tx_hashes
             .iter()

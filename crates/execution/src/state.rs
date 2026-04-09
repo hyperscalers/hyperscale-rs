@@ -1555,6 +1555,8 @@ impl ExecutionState {
         }
 
         // For each completed wave, check receipt availability and finalize.
+        // Only defer for txs that are genuinely missing receipts (not aborted).
+        // Aborted txs get failure receipts synthesized in finalize_wave.
         let mut actions = Vec::new();
         for wave_id in completed_waves {
             let Some(tracker) = self.wave_certificate_trackers.get(&wave_id) else {
@@ -1563,7 +1565,7 @@ impl ExecutionState {
             let missing: HashSet<Hash> = tracker
                 .tx_hashes()
                 .iter()
-                .filter(|h| !self.receipt_cache.contains_key(h))
+                .filter(|h| !self.receipt_cache.contains_key(h) && !tracker.is_tx_aborted(h))
                 .copied()
                 .collect();
             if !missing.is_empty() {
@@ -1595,22 +1597,23 @@ impl ExecutionState {
         let tx_hashes = tracker.tx_hashes().to_vec();
         let ecs = tracker.take_execution_certificates();
 
-        // Ensure receipts match the canonical EC decisions. A non-quorum
-        // validator may have executed a tx successfully but the EC (from
-        // quorum) says abort. Overwrite stale success receipts with failure
-        // receipts so the local_receipt_root matches what the proposer built.
-        for ec in &ecs {
-            for outcome in &ec.tx_outcomes {
-                if outcome.is_aborted() && self.receipt_cache.contains_key(&outcome.tx_hash) {
-                    self.receipt_cache.insert(
-                        outcome.tx_hash,
-                        ReceiptBundle {
-                            tx_hash: outcome.tx_hash,
-                            local_receipt: Arc::new(LocalReceipt::failure()),
-                            execution_output: None,
-                        },
-                    );
-                }
+        // Ensure aborted txs have failure receipts. This handles two cases:
+        // 1. Overwrite: a non-quorum validator executed successfully but the EC
+        //    (from quorum) says abort — replace the stale success receipt.
+        // 2. Synthesize: a tx was never executed (pure timeout abort, no
+        //    provisions arrived) — no receipt exists at all. Without this,
+        //    finalize_wave would produce an incomplete receipt list and the
+        //    wave would be stuck in pending_wave_receipts forever.
+        for tx_hash in &tx_hashes {
+            if tracker.is_tx_aborted(tx_hash) {
+                self.receipt_cache.insert(
+                    *tx_hash,
+                    ReceiptBundle {
+                        tx_hash: *tx_hash,
+                        local_receipt: Arc::new(LocalReceipt::failure()),
+                        execution_output: None,
+                    },
+                );
             }
         }
 
