@@ -488,7 +488,7 @@ impl ExecutionState {
             return;
         };
 
-        accumulator.record_abort(tx_hash, committed_at_height, reason);
+        accumulator.record_abort(tx_hash, committed_at_height);
     }
 
     /// Scan all waves and return completion data for any that can emit a vote.
@@ -1551,11 +1551,11 @@ impl ExecutionState {
         // The remote EC is BFT-agreed, so all local validators see the same
         // abort reason → deterministic vote data.
         for outcome in &ec.tx_outcomes {
-            if let TxExecutionOutcome::Aborted { reason } = &outcome.outcome {
+            if outcome.is_aborted() {
                 if let Some(wave_id) = self.wave_assignments.get(&outcome.tx_hash).cloned() {
                     if let Some(acc) = self.accumulators.get_mut(&wave_id) {
                         let committed_at = self.committed_height;
-                        acc.record_abort(outcome.tx_hash, committed_at, reason.clone());
+                        acc.record_abort(outcome.tx_hash, committed_at);
                     }
                 }
             }

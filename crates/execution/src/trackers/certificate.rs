@@ -259,11 +259,7 @@ mod tests {
                         write_nodes: vec![],
                     }
                 } else {
-                    TxExecutionOutcome::Aborted {
-                        reason: hyperscale_types::AbortReason::ExecutionTimeout {
-                            committed_at: hyperscale_types::BlockHeight(5),
-                        },
-                    }
+                    TxExecutionOutcome::Aborted
                 },
             })
             .collect();

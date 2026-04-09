@@ -15,8 +15,8 @@
 //! Tx ordering within a wave preserves block ordering (stable partition).
 
 use crate::{
-    compute_padded_merkle_root, AbortReason, Bls12381G2Signature, Hash, NodeId,
-    RoutableTransaction, ShardGroupId, SignerBitfield, TopologySnapshot, ValidatorId,
+    compute_padded_merkle_root, Bls12381G2Signature, Hash, NodeId, RoutableTransaction,
+    ShardGroupId, SignerBitfield, TopologySnapshot, ValidatorId,
 };
 use sbor::prelude::*;
 use std::collections::BTreeSet;
@@ -222,7 +222,7 @@ pub struct TxOutcome {
 impl TxOutcome {
     /// Whether this outcome is an abort.
     pub fn is_aborted(&self) -> bool {
-        matches!(self.outcome, TxExecutionOutcome::Aborted { .. })
+        matches!(self.outcome, TxExecutionOutcome::Aborted)
     }
 }
 
@@ -238,8 +238,7 @@ pub enum TxExecutionOutcome {
         write_nodes: Vec<NodeId>,
     },
     /// Transaction aborted before execution could complete.
-    /// Carries the reason so the TC can propagate it to all shards.
-    Aborted { reason: AbortReason },
+    Aborted,
 }
 
 // ============================================================================
@@ -363,15 +362,7 @@ pub fn tx_outcome_leaf(outcome: &TxOutcome) -> Hash {
             receipt_hash.as_bytes(),
             &[if *success { 1u8 } else { 0u8 }],
         ]),
-        TxExecutionOutcome::Aborted { reason } => {
-            let reason_bytes = basic_encode(reason).expect("SBOR encode of AbortReason");
-            let mut parts =
-                Vec::with_capacity(outcome.tx_hash.as_bytes().len() + 8 + reason_bytes.len());
-            parts.extend_from_slice(outcome.tx_hash.as_bytes());
-            parts.extend_from_slice(b"ABORTED:");
-            parts.extend_from_slice(&reason_bytes);
-            Hash::from_bytes(&parts)
-        }
+        TxExecutionOutcome::Aborted => Hash::from_parts(&[outcome.tx_hash.as_bytes(), b"ABORTED:"]),
     }
 }
 
@@ -560,11 +551,7 @@ mod tests {
         };
         let aborted = TxOutcome {
             tx_hash: Hash::from_bytes(b"tx"),
-            outcome: TxExecutionOutcome::Aborted {
-                reason: crate::AbortReason::ExecutionTimeout {
-                    committed_at: crate::BlockHeight(10),
-                },
-            },
+            outcome: TxExecutionOutcome::Aborted,
         };
         assert_ne!(tx_outcome_leaf(&executed), tx_outcome_leaf(&aborted));
     }

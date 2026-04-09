@@ -17,8 +17,7 @@
 //!    async work to complete.
 
 use hyperscale_types::{
-    compute_execution_receipt_root, AbortReason, Hash, ShardGroupId, TxExecutionOutcome, TxOutcome,
-    WaveId,
+    compute_execution_receipt_root, Hash, ShardGroupId, TxExecutionOutcome, TxOutcome, WaveId,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -67,8 +66,6 @@ struct TxResult {
 struct AbortEntry {
     /// The local block height at which this abort intent was committed.
     committed_at_height: u64,
-    /// The abort reason.
-    reason: AbortReason,
 }
 
 impl ExecutionAccumulator {
@@ -156,12 +153,7 @@ impl ExecutionAccumulator {
     /// At vote emission time, the appropriate outcome (abort or execution) is
     /// chosen based on the target vote height.
     /// Returns `true` if the wave is now complete (all txs have some outcome).
-    pub fn record_abort(
-        &mut self,
-        tx_hash: Hash,
-        committed_at_height: u64,
-        reason: AbortReason,
-    ) -> bool {
+    pub fn record_abort(&mut self, tx_hash: Hash, committed_at_height: u64) -> bool {
         if !self.expected_txs.iter().any(|(h, _)| *h == tx_hash) {
             return false;
         }
@@ -170,7 +162,6 @@ impl ExecutionAccumulator {
             tx_hash,
             AbortEntry {
                 committed_at_height,
-                reason,
             },
         );
 
@@ -319,9 +310,7 @@ impl ExecutionAccumulator {
                 let outcome = if let Some(abort) = self.aborts.get(tx_hash) {
                     if abort.committed_at_height <= wave_start + target {
                         // Use abort outcome at this height
-                        TxExecutionOutcome::Aborted {
-                            reason: abort.reason.clone(),
-                        }
+                        TxExecutionOutcome::Aborted
                     } else {
                         // Abort exists but at a higher height — use execution result
                         self.execution_results[tx_hash].outcome.clone()
@@ -367,10 +356,8 @@ impl ExecutionAccumulator {
             .expected_txs
             .iter()
             .map(|(tx_hash, _)| {
-                let outcome = if let Some(abort) = self.aborts.get(tx_hash) {
-                    TxExecutionOutcome::Aborted {
-                        reason: abort.reason.clone(),
-                    }
+                let outcome = if self.aborts.contains_key(tx_hash) {
+                    TxExecutionOutcome::Aborted
                 } else {
                     self.execution_results[tx_hash].outcome.clone()
                 };
@@ -457,12 +444,6 @@ mod tests {
         }
     }
 
-    fn timeout_reason(height: u64) -> AbortReason {
-        AbortReason::ExecutionTimeout {
-            committed_at: hyperscale_types::BlockHeight(height),
-        }
-    }
-
     #[test]
     fn test_empty_accumulator() {
         let mut acc = make_accumulator(0);
@@ -509,7 +490,7 @@ mod tests {
         assert_eq!(acc.target_vote_height(), None);
 
         // Abort committed at height 15 (wave starts at 10)
-        acc.record_abort(tx_hash, 15, timeout_reason(15));
+        acc.record_abort(tx_hash, 15);
 
         // Target vote height = 15 - 10 = 5
         assert_eq!(acc.target_vote_height(), Some(5));
@@ -530,7 +511,7 @@ mod tests {
 
         // tx0 gets provisions, tx1 gets abort at height 12
         acc.mark_provisioned(tx0);
-        acc.record_abort(tx1, 12, timeout_reason(12));
+        acc.record_abort(tx1, 12);
 
         // Target = max(0, 12-10) = 2
         assert_eq!(acc.target_vote_height(), Some(2));
@@ -556,7 +537,7 @@ mod tests {
 
         // tx0 provisioned, tx1 has abort at height 15
         acc.mark_provisioned(tx0);
-        acc.record_abort(tx1, 15, timeout_reason(15));
+        acc.record_abort(tx1, 15);
         acc.record_result(tx0, executed(Hash::from_bytes(b"r0")));
 
         // Vote at height 5 (15-10)
@@ -684,7 +665,7 @@ mod tests {
         acc.record_result(tx, executed(Hash::from_bytes(b"exec")));
 
         // Abort intent arrives later — overrides
-        acc.record_abort(tx, 12, timeout_reason(12));
+        acc.record_abort(tx, 12);
 
         let (_, outcomes) = acc.build_data().unwrap();
         assert!(outcomes[0].is_aborted());
