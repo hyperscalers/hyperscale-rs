@@ -613,41 +613,6 @@ impl ExecutionState {
         actions
     }
 
-    /// Overwrite cached receipts for transactions the EC declares as aborted.
-    ///
-    /// The EC is the canonical source of truth for abort decisions. Canonical
-    /// execution may have already cached a success receipt before
-    /// the abort was decided at the aggregated vote_height. This replaces those
-    /// stale receipts with `LocalReceipt::failure()` so that any
-    /// downstream consumer (sync, RPC, state root) sees a consistent abort.
-    ///
-    /// Only processes the LOCAL shard's EC — remote shard ECs don't produce
-    /// local receipts.
-    fn overwrite_aborted_receipts(&mut self, certificate: &hyperscale_types::ExecutionCertificate) {
-        let mut count = 0;
-        for outcome in &certificate.tx_outcomes {
-            if outcome.is_aborted() {
-                self.receipt_cache.insert(
-                    outcome.tx_hash,
-                    ReceiptBundle {
-                        tx_hash: outcome.tx_hash,
-                        local_receipt: Arc::new(LocalReceipt::failure()),
-                        execution_output: None,
-                    },
-                );
-                count += 1;
-            }
-        }
-
-        if count > 0 {
-            tracing::debug!(
-                wave = %certificate.wave_id,
-                abort_count = count,
-                "Overwrote cached receipts for EC-aborted transactions"
-            );
-        }
-    }
-
     /// Scan complete waves and emit `SignAndSendExecutionVote` actions.
     ///
     /// This is the SINGLE path to execution voting. Call after abort intents
@@ -983,11 +948,6 @@ impl ExecutionState {
             "Wave leader broadcasting EC to local peers + remote shards"
         );
 
-        // The EC is canonical — if it says a tx is aborted, the stored receipt
-        // must reflect that. Canonical execution may have stored
-        // a success receipt before the abort was decided. Overwrite now.
-        self.overwrite_aborted_receipts(&certificate);
-
         // Feed the EC to the wave-level certificate tracker for finalization.
         actions.extend(self.handle_wave_attestation(topology, certificate));
 
@@ -1092,10 +1052,6 @@ impl ExecutionState {
             actions.push(Action::TrackExecutionCertificate {
                 certificate: cert_arc.clone(),
             });
-
-            // The EC is canonical — overwrite any stale success receipts for
-            // transactions the EC declares as aborted.
-            self.overwrite_aborted_receipts(&cert_arc);
         }
 
         // Feed EC to wave-level certificate tracker via tx-hash routing,
@@ -1638,6 +1594,25 @@ impl ExecutionState {
         let tx_decisions = tracker.tx_decisions();
         let tx_hashes = tracker.tx_hashes().to_vec();
         let ecs = tracker.take_execution_certificates();
+
+        // Ensure receipts match the canonical EC decisions. A non-quorum
+        // validator may have executed a tx successfully but the EC (from
+        // quorum) says abort. Overwrite stale success receipts with failure
+        // receipts so the local_receipt_root matches what the proposer built.
+        for ec in &ecs {
+            for outcome in &ec.tx_outcomes {
+                if outcome.is_aborted() && self.receipt_cache.contains_key(&outcome.tx_hash) {
+                    self.receipt_cache.insert(
+                        outcome.tx_hash,
+                        ReceiptBundle {
+                            tx_hash: outcome.tx_hash,
+                            local_receipt: Arc::new(LocalReceipt::failure()),
+                            execution_output: None,
+                        },
+                    );
+                }
+            }
+        }
 
         // Move receipts from cache into FinalizedWave for atomic commit.
         let receipts: Vec<ReceiptBundle> = tx_hashes
