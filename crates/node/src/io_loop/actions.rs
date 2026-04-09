@@ -485,9 +485,10 @@ where
             .unwrap_or(0);
 
         // Identify blocks that are NOT yet ready to commit. A consensus
-        // block with certificates requires a prepared_commit; a sync block
-        // with certificates requires sync_data. Without either, committing
-        // would apply empty state updates, permanently diverging the JVT.
+        // block with certificates can commit via prepared_commit (proposer)
+        // or finalized_waves receipts (non-proposer fallback). A sync block
+        // with certificates requires sync_data. Without the appropriate
+        // data, committing would apply empty state updates, diverging the JVT.
         //
         // Deferred blocks are put back into pending_block_commits; they will
         // be retried on the next flush.
@@ -506,7 +507,15 @@ where
 
                 let not_ready = has_certs
                     && match &commit {
-                        super::PendingCommit::Consensus { .. } => prepared.is_none(),
+                        super::PendingCommit::Consensus {
+                            finalized_waves, ..
+                        } => {
+                            // Only defer if we have neither a prepared commit nor
+                            // finalized waves with receipts. The proposer provides
+                            // a PreparedCommit; non-proposers use the commit_block
+                            // fallback path which recomputes state from receipts.
+                            prepared.is_none() && finalized_waves.is_empty()
+                        }
                         super::PendingCommit::Synced { block, .. } => {
                             !sync_data.contains_key(&block.header.height.0)
                         }
