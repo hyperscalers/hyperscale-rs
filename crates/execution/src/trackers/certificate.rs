@@ -147,15 +147,43 @@ impl WaveCertificateTracker {
     /// Create a WaveCertificate from collected attestations.
     ///
     /// Call only when `is_complete()` returns true.
+    ///
+    /// Only includes attestations from ECs that cover at least one non-aborted tx
+    /// in this wave. ECs that only cover aborted txs are excluded — since aborted
+    /// txs don't require remote confirmation, including those ECs would make the
+    /// attestation list non-deterministic (depends on EC arrival order/timing).
+    ///
     /// Attestations are sorted by (shard_group_id, ec_hash) for deterministic receipt_hash.
     pub fn create_wave_certificate(&mut self) -> WaveCertificate {
-        // Sort attestations for deterministic receipt_hash
-        self.attestations
+        // Build set of ec_hashes that cover at least one non-aborted tx in this wave.
+        let required_ec_hashes: HashSet<Hash> = self
+            .execution_certificates
+            .iter()
+            .filter(|ec| {
+                ec.tx_outcomes.iter().any(|outcome| {
+                    // Must be a tx in this wave AND not aborted
+                    self.participating_shards.contains_key(&outcome.tx_hash)
+                        && !self.aborted.contains(&outcome.tx_hash)
+                })
+            })
+            .map(|ec| ec.canonical_hash())
+            .collect();
+
+        // Filter attestations to only required ECs
+        let mut attestations: Vec<ShardAttestation> = self
+            .attestations
+            .iter()
+            .filter(|att| required_ec_hashes.contains(&att.ec_hash))
+            .cloned()
+            .collect();
+
+        // Sort for deterministic receipt_hash
+        attestations
             .sort_by(|a, b| (&a.shard_group_id, &a.ec_hash).cmp(&(&b.shard_group_id, &b.ec_hash)));
 
         WaveCertificate {
             wave_id: self.wave_id.clone(),
-            attestations: self.attestations.clone(),
+            attestations,
         }
     }
 
