@@ -767,8 +767,8 @@ pub enum Action {
     /// Request a missing execution certificate from a source shard.
     ///
     /// Emitted when an expected execution cert hasn't arrived within the timeout.
-    /// The wave leader may be byzantine or slow, so we request from
-    /// any peer in the source shard, preferring the wave leader first.
+    /// The designated broadcaster may be byzantine or slow, so we request from
+    /// any peer in the source shard, preferring the designated broadcaster first.
     RequestMissingExecutionCert {
         /// The shard that should have sent the execution cert.
         source_shard: ShardGroupId,
@@ -776,8 +776,8 @@ pub enum Action {
         block_height: u64,
         /// Which wave's cert is missing.
         wave_id: WaveId,
-        /// Wave leader for the missing wave (tried first as preferred peer).
-        wave_leader: ValidatorId,
+        /// Designated broadcaster for the missing wave (tried first as preferred peer).
+        designated_broadcaster: ValidatorId,
         /// All validators in the source shard (candidate peers for the request).
         peers: Vec<ValidatorId>,
     },

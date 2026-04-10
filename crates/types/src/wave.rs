@@ -191,15 +191,15 @@ pub fn derive_wave_tx_hashes(
         .collect()
 }
 
-/// Deterministically select the wave leader for a wave.
+/// Deterministically select the designated broadcaster for a wave.
 ///
-/// The wave leader is the sole aggregator of execution votes into an EC.
+/// The designated broadcaster sends the aggregated EC to remote shards.
 /// Uses `Hash(sbor_encode(wave_id)) % committee_size` to pick one
 /// validator. All validators compute the same result from the same inputs.
 ///
 /// Since WaveId is self-contained (includes shard + height + remote shards),
 /// no separate block_hash is needed.
-pub fn wave_leader(wave_id: &WaveId, committee: &[ValidatorId]) -> ValidatorId {
+pub fn designated_broadcaster(wave_id: &WaveId, committee: &[ValidatorId]) -> ValidatorId {
     assert!(!committee.is_empty(), "committee must not be empty");
     let wave_bytes = basic_encode(wave_id).expect("WaveId serialization should never fail");
     let selection_hash = Hash::from_bytes(&wave_bytes);

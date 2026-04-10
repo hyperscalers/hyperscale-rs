@@ -48,7 +48,7 @@ pub enum ExecCertFetchInput {
         block_height: u64,
         wave_id: WaveId,
         /// Wave leader for the missing wave (tried first as preferred peer).
-        wave_leader: ValidatorId,
+        designated_broadcaster: ValidatorId,
         peers: Vec<ValidatorId>,
     },
     /// Execution certificates were successfully received.
@@ -93,7 +93,7 @@ pub enum ExecCertFetchOutput {
 struct PendingExecCertFetch {
     wave_ids: Vec<WaveId>,
     /// Wave leaders for the missing waves (tried first as preferred peers).
-    wave_leaders: Vec<ValidatorId>,
+    designated_broadcasters: Vec<ValidatorId>,
     peers: Vec<ValidatorId>,
     tried: HashSet<ValidatorId>,
     in_flight: bool,
@@ -125,9 +125,15 @@ impl ExecCertFetchProtocol {
                 source_shard,
                 block_height,
                 wave_id,
-                wave_leader,
+                designated_broadcaster,
                 peers,
-            } => self.handle_request(source_shard, block_height, wave_id, wave_leader, peers),
+            } => self.handle_request(
+                source_shard,
+                block_height,
+                wave_id,
+                designated_broadcaster,
+                peers,
+            ),
             ExecCertFetchInput::Received {
                 source_shard,
                 block_height,
@@ -179,18 +185,23 @@ impl ExecCertFetchProtocol {
         source_shard: ShardGroupId,
         block_height: u64,
         wave_id: WaveId,
-        wave_leader: ValidatorId,
+        designated_broadcaster: ValidatorId,
         peers: Vec<ValidatorId>,
     ) -> Vec<ExecCertFetchOutput> {
         let key = (source_shard, block_height);
 
         if let Some(existing) = self.pending.get_mut(&key) {
-            // Duplicate request: merge wave_id + wave_leader, refresh peers, reset rounds.
+            // Duplicate request: merge wave_id + designated_broadcaster, refresh peers, reset rounds.
             if !existing.wave_ids.contains(&wave_id) {
                 existing.wave_ids.push(wave_id);
             }
-            if !existing.wave_leaders.contains(&wave_leader) {
-                existing.wave_leaders.push(wave_leader);
+            if !existing
+                .designated_broadcasters
+                .contains(&designated_broadcaster)
+            {
+                existing
+                    .designated_broadcasters
+                    .push(designated_broadcaster);
             }
             existing.peers = peers;
             existing.rounds = 0;
@@ -227,7 +238,7 @@ impl ExecCertFetchProtocol {
             key,
             PendingExecCertFetch {
                 wave_ids: vec![wave_id],
-                wave_leaders: vec![wave_leader],
+                designated_broadcasters: vec![designated_broadcaster],
                 peers,
                 tried: HashSet::new(),
                 in_flight: false,
@@ -330,7 +341,7 @@ impl ExecCertFetchProtocol {
 
             // Prefer wave leaders first (if in peer list), then rotate through remaining peers.
             let peer = state
-                .wave_leaders
+                .designated_broadcasters
                 .iter()
                 .find(|p| !state.tried.contains(p) && state.peers.contains(p))
                 .or_else(|| state.peers.iter().find(|p| !state.tried.contains(p)))
@@ -461,7 +472,7 @@ mod tests {
             source_shard: shard(1),
             block_height: 10,
             wave_id: wave(&[0, 1]),
-            wave_leader: vid(99),
+            designated_broadcaster: vid(99),
             peers: vec![vid(1), vid(2), vid(3)],
         });
         assert!(outputs.is_empty());
@@ -494,7 +505,7 @@ mod tests {
             source_shard: shard(1),
             block_height: 10,
             wave_id: wave(&[0, 1]),
-            wave_leader: vid(99),
+            designated_broadcaster: vid(99),
             peers: vec![vid(1), vid(2), vid(3)],
         });
 
@@ -543,7 +554,7 @@ mod tests {
             source_shard: shard(1),
             block_height: 10,
             wave_id: wave(&[0, 1]),
-            wave_leader: vid(99),
+            designated_broadcaster: vid(99),
             peers: vec![vid(1), vid(2)],
         });
 
@@ -590,7 +601,7 @@ mod tests {
             source_shard: shard(1),
             block_height: 10,
             wave_id: wave(&[0, 1]),
-            wave_leader: vid(99),
+            designated_broadcaster: vid(99),
             peers: vec![vid(1)],
         });
 
@@ -637,7 +648,7 @@ mod tests {
             source_shard: shard(1),
             block_height: 10,
             wave_id: wave(&[0, 1]),
-            wave_leader: vid(99),
+            designated_broadcaster: vid(99),
             peers: vec![vid(1), vid(2)],
         });
 
@@ -667,7 +678,7 @@ mod tests {
             source_shard: shard(1),
             block_height: 10,
             wave_id: wave(&[0, 1]),
-            wave_leader: vid(99),
+            designated_broadcaster: vid(99),
             peers: vec![vid(1), vid(2)],
         });
 
@@ -676,7 +687,7 @@ mod tests {
             source_shard: shard(1),
             block_height: 10,
             wave_id: wave(&[0, 2]),
-            wave_leader: vid(99),
+            designated_broadcaster: vid(99),
             peers: vec![vid(1), vid(2), vid(3)],
         });
 
@@ -700,7 +711,7 @@ mod tests {
                 source_shard: shard(1),
                 block_height: h,
                 wave_id: wave(&[0, 1]),
-                wave_leader: vid(99),
+                designated_broadcaster: vid(99),
                 peers: vec![vid(1)],
             });
         }
@@ -730,7 +741,7 @@ mod tests {
             source_shard: shard(1),
             block_height: 10,
             wave_id: wave(&[0, 1]),
-            wave_leader: vid(99),
+            designated_broadcaster: vid(99),
             peers: vec![vid(1), vid(2)],
         });
 
@@ -751,7 +762,7 @@ mod tests {
             source_shard: shard(1),
             block_height: 10,
             wave_id: wave(&[0, 1]),
-            wave_leader: vid(99),
+            designated_broadcaster: vid(99),
             peers: vec![vid(1), vid(2)],
         });
         assert!(protocol.has_pending());
@@ -786,7 +797,7 @@ mod tests {
             source_shard: shard(1),
             block_height: 10,
             wave_id: wave(&[0, 1]),
-            wave_leader: vid(99),
+            designated_broadcaster: vid(99),
             peers: vec![vid(1)],
         });
 
@@ -820,7 +831,7 @@ mod tests {
                 source_shard: shard(1),
                 block_height: h,
                 wave_id: wave(&[0, 1]),
-                wave_leader: vid(99),
+                designated_broadcaster: vid(99),
                 peers: vec![vid(1), vid(2)],
             });
         }
@@ -832,7 +843,7 @@ mod tests {
             source_shard: shard(1),
             block_height: 13,
             wave_id: wave(&[0, 1]),
-            wave_leader: vid(99),
+            designated_broadcaster: vid(99),
             peers: vec![vid(1), vid(2)],
         });
         assert_eq!(
@@ -854,7 +865,7 @@ mod tests {
             source_shard: shard(2),
             block_height: 10,
             wave_id: wave(&[0, 2]),
-            wave_leader: vid(99),
+            designated_broadcaster: vid(99),
             peers: vec![vid(3)],
         });
         assert_eq!(protocol.pending_count_for_shard(shard(2)), 1);
@@ -874,7 +885,7 @@ mod tests {
                 source_shard: shard(1),
                 block_height: h,
                 wave_id: wave(&[0, 1]),
-                wave_leader: vid(99),
+                designated_broadcaster: vid(99),
                 peers: vec![vid(1)],
             });
         }
@@ -893,7 +904,7 @@ mod tests {
             source_shard: shard(1),
             block_height: 12,
             wave_id: wave(&[0, 1]),
-            wave_leader: vid(99),
+            designated_broadcaster: vid(99),
             peers: vec![vid(1)],
         });
         assert_eq!(protocol.pending_count_for_shard(shard(1)), 2);
@@ -913,7 +924,7 @@ mod tests {
                 source_shard: shard(1),
                 block_height: h,
                 wave_id: wave(&[0, 1]),
-                wave_leader: vid(99),
+                designated_broadcaster: vid(99),
                 peers: vec![vid(1)],
             });
         }
@@ -940,7 +951,7 @@ mod tests {
     }
 
     #[test]
-    fn test_wave_leader_preferred_first() {
+    fn test_designated_broadcaster_preferred_first() {
         let mut protocol = ExecCertFetchProtocol::new(default_config());
 
         // vid(5) is the wave leader, peers are vid(1)..vid(5).
@@ -948,7 +959,7 @@ mod tests {
             source_shard: shard(1),
             block_height: 10,
             wave_id: wave(&[0, 1]),
-            wave_leader: vid(5),
+            designated_broadcaster: vid(5),
             peers: vec![vid(1), vid(2), vid(3), vid(4), vid(5)],
         });
 
@@ -974,7 +985,7 @@ mod tests {
     }
 
     #[test]
-    fn test_wave_leader_skipped_when_already_tried() {
+    fn test_designated_broadcaster_skipped_when_already_tried() {
         let mut protocol = ExecCertFetchProtocol::new(default_config());
 
         // Wave leader is vid(1), which is also the first regular peer.
@@ -982,7 +993,7 @@ mod tests {
             source_shard: shard(1),
             block_height: 10,
             wave_id: wave(&[0, 1]),
-            wave_leader: vid(1),
+            designated_broadcaster: vid(1),
             peers: vec![vid(1), vid(2), vid(3)],
         });
 
