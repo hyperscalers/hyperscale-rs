@@ -320,9 +320,6 @@ impl ExecutionState {
         let quorum = topology.local_quorum_threshold();
         let mut votes_to_replay = Vec::new();
 
-        let local_vid = topology.local_validator_id();
-        let local_committee = topology.local_committee();
-
         for (wave_id, txs) in waves {
             // Record tx → wave assignments
             for (tx_hash, _) in &txs {
@@ -370,27 +367,21 @@ impl ExecutionState {
 
             self.accumulators.insert(wave_id.clone(), accumulator);
 
-            // Only the wave leader creates a VoteTracker and aggregates votes.
-            // Non-leaders receive the canonical EC from the wave leader via
-            // on_wave_certificate → on_certificate_verified.
-            let leader = hyperscale_types::designated_broadcaster(&wave_id, local_committee);
-            if local_vid == leader {
-                let tracker = VoteTracker::new(wave_id.clone(), block_hash, quorum);
-                self.vote_trackers.insert(wave_id.clone(), tracker);
+            // All validators create a VoteTracker and aggregate votes locally.
+            // N→N voting: every validator receives votes from all peers and
+            // aggregates the EC independently when 2f+1 votes arrive.
+            let tracker = VoteTracker::new(wave_id.clone(), block_hash, quorum);
+            self.vote_trackers.insert(wave_id.clone(), tracker);
 
-                // Collect early execution votes for caller to replay through on_execution_vote()
-                if let Some(early_votes) = self.early_votes.remove(&wave_id) {
-                    tracing::debug!(
-                        block_hash = ?block_hash,
-                        wave = %wave_id,
-                        count = early_votes.len(),
-                        "Replaying early execution votes"
-                    );
-                    votes_to_replay.extend(early_votes);
-                }
-            } else {
-                // Non-leader: discard any buffered votes (we won't aggregate them)
-                self.early_votes.remove(&wave_id);
+            // Replay early execution votes that arrived before tracking started.
+            if let Some(early_votes) = self.early_votes.remove(&wave_id) {
+                tracing::debug!(
+                    block_hash = ?block_hash,
+                    wave = %wave_id,
+                    count = early_votes.len(),
+                    "Replaying early execution votes"
+                );
+                votes_to_replay.extend(early_votes);
             }
         }
 
@@ -615,21 +606,17 @@ impl ExecutionState {
     /// The vote_height is now a relative offset determined by the accumulator
     /// (lowest height where all txs are coverable), not passed in externally.
     pub fn emit_vote_actions(&mut self, topology: &TopologySnapshot) -> Vec<Action> {
-        let local_committee = topology.local_committee();
+        let local_committee = topology.local_committee().to_vec();
         self.scan_complete_waves()
             .into_iter()
-            .map(|completion| {
-                let target =
-                    hyperscale_types::designated_broadcaster(&completion.wave_id, local_committee);
-                Action::SignAndSendExecutionVote {
-                    block_hash: completion.block_hash,
-                    block_height: completion.block_height,
-                    vote_height: completion.vote_height,
-                    wave_id: completion.wave_id,
-                    global_receipt_root: completion.global_receipt_root,
-                    tx_outcomes: completion.tx_outcomes,
-                    target,
-                }
+            .map(|completion| Action::SignAndSendExecutionVote {
+                block_hash: completion.block_hash,
+                block_height: completion.block_height,
+                vote_height: completion.vote_height,
+                wave_id: completion.wave_id,
+                global_receipt_root: completion.global_receipt_root,
+                tx_outcomes: completion.tx_outcomes,
+                recipients: local_committee.clone(),
             })
             .collect()
     }
@@ -685,7 +672,7 @@ impl ExecutionState {
 
     /// Handle an execution vote received from another validator (or self).
     ///
-    /// Only the wave leader aggregates votes. Non-leaders discard them.
+    /// All validators aggregate votes (N→N voting).
     pub fn on_execution_vote(
         &mut self,
         topology: &TopologySnapshot,
@@ -694,16 +681,15 @@ impl ExecutionState {
         let wave_id = vote.wave_id.clone();
         let validator_id = vote.validator;
 
-        // Check if we're tracking this wave (only wave leaders have VoteTrackers)
+        // Check if we're tracking this wave (all validators have VoteTrackers)
         if !self.vote_trackers.contains_key(&wave_id) {
-            // If we have an accumulator for this wave but no VoteTracker,
-            // we're a non-leader — discard the vote.
-            if self.accumulators.contains_key(&wave_id) {
+            // No accumulator yet — block hasn't committed. Buffer for replay.
+            if !self.accumulators.contains_key(&wave_id) {
+                self.early_votes.entry(wave_id).or_default().push(vote);
                 return vec![];
             }
-            // No accumulator yet — block hasn't committed. Buffer for the
-            // wave leader case (will be discarded in setup if non-leader).
-            self.early_votes.entry(wave_id).or_default().push(vote);
+            // Accumulator exists but no VoteTracker — wave already completed
+            // (EC aggregated and tracker removed). Discard late vote.
             return vec![];
         }
 
@@ -891,52 +877,33 @@ impl ExecutionState {
         let certificate = Arc::new(certificate);
 
         // Cache the cert in io_loop for fallback serving — any node can serve
-        // requests from remote shards if the wave leader fails.
+        // requests from remote shards if the designated broadcaster fails.
         actions.push(Action::TrackExecutionCertificate {
             certificate: Arc::clone(&certificate),
         });
 
-        // The wave leader broadcasts the EC to:
-        // 1. Local peers — so they receive the canonical EC (same path as remote ECs)
-        // 2. Remote shard validators — for cross-shard finalization
-        {
-            // Broadcast to local peers (all local committee minus self)
-            let local_peers: Vec<ValidatorId> = topology
-                .local_committee()
-                .iter()
-                .copied()
-                .filter(|&v| v != local_vid)
-                .collect();
-            if !local_peers.is_empty() {
-                actions.push(Action::BroadcastExecutionCertificate {
-                    shard: topology.local_shard(),
-                    certificate: Arc::clone(&certificate),
-                    recipients: local_peers,
-                });
-            }
-
-            // Broadcast to remote shard validators
+        // Only the designated broadcaster sends the EC to remote shards.
+        // No local broadcast needed — every validator aggregated locally.
+        let broadcaster =
+            hyperscale_types::designated_broadcaster(&wave_id, topology.local_committee());
+        if local_vid == broadcaster {
             for target_shard in &remote_shards {
-                let recipients: Vec<ValidatorId> = topology
-                    .committee_for_shard(*target_shard)
-                    .iter()
-                    .copied()
-                    .filter(|&v| v != local_vid)
-                    .collect();
+                let recipients: Vec<ValidatorId> =
+                    topology.committee_for_shard(*target_shard).to_vec();
                 actions.push(Action::BroadcastExecutionCertificate {
                     shard: *target_shard,
                     certificate: Arc::clone(&certificate),
                     recipients,
                 });
             }
-        }
 
-        tracing::debug!(
-            wave = %wave_id,
-            tx_count = certificate.tx_outcomes.len(),
-            remote_shards = remote_shards.len(),
-            "Wave leader broadcasting EC to local peers + remote shards"
-        );
+            tracing::debug!(
+                wave = %wave_id,
+                tx_count = certificate.tx_outcomes.len(),
+                remote_shards = remote_shards.len(),
+                "Designated broadcaster sending EC to remote shards"
+            );
+        }
 
         // Feed the EC to the wave-level certificate tracker for finalization.
         actions.extend(self.handle_wave_attestation(topology, certificate));

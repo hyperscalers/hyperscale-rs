@@ -138,7 +138,7 @@ pub enum Action {
     ///
     /// Emitted by the state machine when a wave completes (all txs executed).
     /// The io_loop signs the vote (it owns the signing key) and sends it to
-    /// the wave leader only (N→1 instead of N→N).
+    /// all local committee members (N→N).
     SignAndSendExecutionVote {
         block_hash: Hash,
         block_height: u64,
@@ -146,12 +146,11 @@ pub enum Action {
         vote_height: u64,
         wave_id: WaveId,
         global_receipt_root: Hash,
-        /// Per-tx outcomes in wave order. Carried on the vote so the wave leader
-        /// can extract them directly when building the EC (avoids relying on the
-        /// leader's local accumulator which may have diverged).
+        /// Per-tx outcomes in wave order. Carried on the vote so every
+        /// aggregator can extract them directly when building the EC.
         tx_outcomes: Vec<TxOutcome>,
-        /// The wave leader for this wave — sole recipient of the vote.
-        target: ValidatorId,
+        /// All local committee members — every validator aggregates locally.
+        recipients: Vec<ValidatorId>,
     },
 
     /// Broadcast an execution certificate to remote participating shards.
