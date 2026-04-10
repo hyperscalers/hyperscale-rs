@@ -2922,8 +2922,13 @@ impl BftState {
 
             // Track the certified block's state_root — this is the correct
             // parent_state_root for the next proposal.
+            // Use the header directly from pending_blocks if the full block
+            // isn't constructed yet — the header (with state_root) is always
+            // available from the gossip message.
             if let Some(block) = self.get_block_by_hash(block_hash) {
                 self.certified_state_root = block.header.state_root;
+            } else if let Some(pending) = self.pending_blocks.get(&block_hash) {
+                self.certified_state_root = pending.header().state_root;
             }
 
             // HotStuff-2 unlock: when a QC forms, we can safely unlock
