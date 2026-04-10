@@ -1089,14 +1089,11 @@ impl ExecutionState {
             if should_request {
                 let is_retry = expected.last_requested_at.is_some();
                 expected.last_requested_at = Some(current_height);
-                let committee = topology.committee_for_shard(*source_shard);
-                let leader = hyperscale_types::designated_broadcaster(wave_id, committee);
-                let peers = committee.to_vec();
+                let peers = topology.committee_for_shard(*source_shard).to_vec();
                 tracing::info!(
                     source_shard = source_shard.0,
                     block_height = block_height,
                     wave = %wave_id,
-                    designated_broadcaster = leader.0,
                     age,
                     retry = is_retry,
                     "Execution cert timeout — requesting fallback"
@@ -1105,7 +1102,6 @@ impl ExecutionState {
                     source_shard: *source_shard,
                     block_height: *block_height,
                     wave_id: wave_id.clone(),
-                    designated_broadcaster: leader,
                     peers,
                 });
             }
