@@ -80,6 +80,7 @@ pub struct ExecutionMemoryStats {
     pub accumulators: usize,
     pub vote_trackers: usize,
     pub early_votes: usize,
+    pub early_execution_results: usize,
     pub wave_certificate_trackers: usize,
     pub expected_exec_certs: usize,
 }
@@ -168,7 +169,8 @@ pub struct ExecutionState {
     // Early arrivals (buffered until tracking starts at block commit)
     // ═══════════════════════════════════════════════════════════════════════
     /// Execution results that arrived before the wave was assigned.
-    early_execution_results: HashMap<Hash, ExecutionOutcome>,
+    /// Stored with the `committed_height` at insertion time for age-based pruning.
+    early_execution_results: HashMap<Hash, (ExecutionOutcome, u64)>,
 
     /// Execution votes that arrived before tracking started.
     early_votes: HashMap<WaveId, Vec<ExecutionVote>>,
@@ -427,7 +429,7 @@ impl ExecutionState {
                 "Replaying early execution results into accumulators"
             );
             for tx_hash in early_tx_hashes {
-                if let Some(outcome) = self.early_execution_results.remove(&tx_hash) {
+                if let Some((outcome, _)) = self.early_execution_results.remove(&tx_hash) {
                     if let Some(wave_key) = self.wave_assignments.get(&tx_hash).cloned() {
                         if let Some(acc) = self.accumulators.get_mut(&wave_key) {
                             acc.record_result(tx_hash, outcome);
@@ -457,7 +459,8 @@ impl ExecutionState {
         let Some(wave_key) = self.wave_assignments.get(&tx_hash).cloned() else {
             // Wave not assigned yet (e.g. execution completed before
             // on_block_committed created the wave). Buffer for replay.
-            self.early_execution_results.insert(tx_hash, outcome);
+            self.early_execution_results
+                .insert(tx_hash, (outcome, self.committed_height));
             return;
         };
 
@@ -1798,7 +1801,7 @@ impl ExecutionState {
         // We must NOT prune votes for blocks that haven't committed yet — those
         // votes arrived before the accumulator was created and will be replayed
         // when setup_execution_tracking runs during on_block_committed.
-        let ev_cutoff = self.committed_height.saturating_sub(50);
+        let staleness_cutoff = self.committed_height.saturating_sub(50);
         let before_ev = self.early_votes.len();
         self.early_votes.retain(|key, votes| {
             // If the accumulator already exists, the votes were replayed during
@@ -1809,16 +1812,34 @@ impl ExecutionState {
             // No accumulator yet — keep unless stale.
             votes
                 .first()
-                .map(|v| v.block_height > ev_cutoff)
+                .map(|v| v.block_height > staleness_cutoff)
                 .unwrap_or(false)
         });
         let pruned_ev = before_ev - self.early_votes.len();
 
-        if pruned_acc > 0 || pruned_vt > 0 || pruned_ev > 0 {
+        // Prune stale early execution results that were never consumed.
+        // Results are consumed during setup_execution_tracking when a wave
+        // assignment exists. Orphaned results (no wave assignment after 50+
+        // blocks) are pruned to prevent unbounded growth.
+        let before_er = self.early_execution_results.len();
+        self.early_execution_results
+            .retain(|tx_hash, (_, insertion_height)| {
+                // Keep if wave_assignments contains this hash — it will be
+                // consumed by the next setup_execution_tracking() call.
+                if self.wave_assignments.contains_key(tx_hash) {
+                    return true;
+                }
+                // No wave assignment — keep only if younger than cutoff.
+                *insertion_height > staleness_cutoff
+            });
+        let pruned_er = before_er - self.early_execution_results.len();
+
+        if pruned_acc > 0 || pruned_vt > 0 || pruned_ev > 0 || pruned_er > 0 {
             tracing::debug!(
                 pruned_acc,
                 pruned_vt,
                 pruned_ev,
+                pruned_er,
                 "Pruned resolved wave state"
             );
         }
@@ -1960,6 +1981,7 @@ impl ExecutionState {
             accumulators: self.accumulators.len(),
             vote_trackers: self.vote_trackers.len(),
             early_votes: self.early_votes.len(),
+            early_execution_results: self.early_execution_results.len(),
             wave_certificate_trackers: self.wave_certificate_trackers.len(),
             expected_exec_certs: self.expected_exec_certs.len(),
         }
@@ -2166,6 +2188,108 @@ mod tests {
             results,
             vec![true, false],
             "Second signature should fail verification"
+        );
+    }
+
+    // ========================================================================
+    // Early Execution Results Cleanup Tests
+    // ========================================================================
+
+    #[test]
+    fn test_early_execution_results_pruned_when_stale() {
+        let mut state = make_test_state();
+
+        // Insert an early result at height 40.
+        state.committed_height = 40;
+        let tx = test_transaction(1);
+        let tx_hash = tx.hash();
+        let outcome = ExecutionOutcome::Executed {
+            receipt_hash: Hash::from_bytes(b"receipt1"),
+            success: true,
+        };
+        state.record_execution_result(tx_hash, outcome);
+        assert_eq!(state.early_execution_results.len(), 1);
+
+        // Advance to height 100 and prune (cutoff = 50, entry at 40 is stale).
+        state.committed_height = 100;
+        state.prune_execution_state();
+
+        assert_eq!(
+            state.early_execution_results.len(),
+            0,
+            "Stale early result should be pruned"
+        );
+    }
+
+    #[test]
+    fn test_early_execution_results_kept_when_fresh() {
+        let mut state = make_test_state();
+
+        // Insert an early result at height 80.
+        state.committed_height = 80;
+        let tx = test_transaction(2);
+        let tx_hash = tx.hash();
+        let outcome = ExecutionOutcome::Executed {
+            receipt_hash: Hash::from_bytes(b"receipt2"),
+            success: true,
+        };
+        state.record_execution_result(tx_hash, outcome);
+
+        // Advance to height 100 and prune (cutoff = 50, entry at 80 > 50).
+        state.committed_height = 100;
+        state.prune_execution_state();
+
+        assert_eq!(
+            state.early_execution_results.len(),
+            1,
+            "Fresh early result should be kept"
+        );
+    }
+
+    #[test]
+    fn test_early_execution_results_kept_when_wave_assigned() {
+        let mut state = make_test_state();
+
+        // Insert an early result at height 10 (very stale).
+        state.committed_height = 10;
+        let tx = test_transaction(3);
+        let tx_hash = tx.hash();
+        let outcome = ExecutionOutcome::Executed {
+            receipt_hash: Hash::from_bytes(b"receipt3"),
+            success: true,
+        };
+        state.record_execution_result(tx_hash, outcome);
+
+        // Add a wave assignment for this tx (simulating block commit).
+        let wave_id = WaveId::new(ShardGroupId(0), 10, BTreeSet::new());
+        state.wave_assignments.insert(tx_hash, wave_id);
+
+        // Advance to height 100 and prune (entry is stale but has wave assignment).
+        state.committed_height = 100;
+        state.prune_execution_state();
+
+        assert_eq!(
+            state.early_execution_results.len(),
+            1,
+            "Early result with wave assignment must be kept for replay"
+        );
+    }
+
+    #[test]
+    fn test_memory_stats_includes_early_execution_results() {
+        let mut state = make_test_state();
+
+        // Insert 3 early results.
+        for i in 0..3u8 {
+            let tx = test_transaction(10 + i);
+            let outcome = ExecutionOutcome::Aborted;
+            state.record_execution_result(tx.hash(), outcome);
+        }
+
+        let stats = state.memory_stats();
+        assert_eq!(
+            stats.early_execution_results, 3,
+            "memory_stats should report early_execution_results count"
         );
     }
 }
