@@ -79,16 +79,25 @@ impl PendingBlock {
     /// Create a pending block from a complete block (proposer's own block).
     ///
     /// The proposer already has all transactions and finalized waves.
-    pub fn from_complete_block(block: &Block, finalized_waves: Vec<Arc<FinalizedWave>>) -> Self {
-        let manifest = BlockManifest::from_block(block);
+    pub fn from_complete_block(
+        block: &Block,
+        finalized_waves: Vec<Arc<FinalizedWave>>,
+        provision_batches: Vec<Arc<ProvisionBatch>>,
+    ) -> Self {
+        let mut manifest = BlockManifest::from_block(block);
+        // Set provision_batch_hashes from actual batches (from_block can't compute
+        // these since Block doesn't carry provision data — it's ephemeral).
+        manifest.provision_batch_hashes = provision_batches.iter().map(|b| b.hash()).collect();
+        let missing_provision_hashes: HashSet<Hash> =
+            manifest.provision_batch_hashes.iter().copied().collect();
         let mut pending = Self {
             header: block.header.clone(),
             received_transactions: HashMap::new(),
             missing_transaction_hashes: HashSet::new(),
             received_waves: HashMap::new(),
             missing_wave_hashes: HashSet::new(),
-            received_provisions: HashMap::new(),
-            missing_provision_hashes: HashSet::new(),
+            received_provisions: HashMap::with_capacity(manifest.provision_batch_hashes.len()),
+            missing_provision_hashes,
             manifest,
             constructed_block: None,
         };
@@ -101,6 +110,10 @@ impl PendingBlock {
         // Fill in all finalized waves
         for fw in finalized_waves {
             pending.received_waves.insert(fw.wave_id_hash(), fw);
+        }
+        // Fill in all provision batches
+        for batch in provision_batches {
+            pending.add_provision(batch);
         }
         pending
     }
@@ -172,7 +185,6 @@ impl PendingBlock {
     /// Add a received provision batch.
     ///
     /// Returns true if this provision was needed, false if duplicate or not in this block.
-    #[allow(dead_code)]
     pub fn add_provision(&mut self, batch: Arc<ProvisionBatch>) -> bool {
         let hash = batch.hash();
         if self.missing_provision_hashes.remove(&hash) {
@@ -203,6 +215,11 @@ impl PendingBlock {
     /// Get all received finalized waves.
     pub fn finalized_waves(&self) -> Vec<Arc<FinalizedWave>> {
         self.received_waves.values().cloned().collect()
+    }
+
+    /// Get all received provision batches.
+    pub fn provision_batches(&self) -> Vec<Arc<ProvisionBatch>> {
+        self.received_provisions.values().cloned().collect()
     }
 
     /// Construct the block from header + received transactions + received waves.
@@ -457,7 +474,7 @@ mod tests {
             finalized_height: 1,
         });
 
-        let pending = PendingBlock::from_complete_block(&block, vec![fw]);
+        let pending = PendingBlock::from_complete_block(&block, vec![fw], vec![]);
         assert!(pending.is_complete());
     }
 }

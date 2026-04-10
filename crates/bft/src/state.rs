@@ -1343,7 +1343,7 @@ impl BftState {
     /// Sender identity comes from the header's proposer field (ValidatorId),
     /// which is signed and verified. For sync detection, we don't need
     /// the network peer ID.
-    #[instrument(skip(self, header, manifest, lookup_tx, lookup_finalized_wave), fields(
+    #[instrument(skip(self, header, manifest, lookup_tx, lookup_finalized_wave, lookup_provision), fields(
         height = header.height.0,
         round = header.round,
         proposer = ?header.proposer,
@@ -1356,6 +1356,7 @@ impl BftState {
         manifest: BlockManifest,
         lookup_tx: impl Fn(&Hash) -> Option<Arc<RoutableTransaction>>,
         lookup_finalized_wave: impl Fn(&Hash) -> Option<Arc<FinalizedWave>>,
+        lookup_provision: impl Fn(&Hash) -> Option<Arc<ProvisionBatch>>,
     ) -> Vec<Action> {
         let block_hash = header.hash();
         let height = header.height.0;
@@ -1486,6 +1487,11 @@ impl BftState {
         for wave_hash in pending.manifest().cert_hashes.clone() {
             if let Some(fw) = lookup_finalized_wave(&wave_hash) {
                 pending.add_finalized_wave(fw);
+            }
+        }
+        for batch_hash in pending.manifest().provision_batch_hashes.clone() {
+            if let Some(batch) = lookup_provision(&batch_hash) {
+                pending.add_provision(batch);
             }
         }
 
@@ -2540,6 +2546,7 @@ impl BftState {
     /// computed the state root, built the complete block, and cached the WriteBatch
     /// for efficient commit later.
     #[instrument(skip(self, block, finalized_waves), fields(height = %height.0, round = round))]
+    #[allow(clippy::too_many_arguments)]
     pub fn on_proposal_built(
         &mut self,
         topology: &TopologySnapshot,
@@ -2548,6 +2555,7 @@ impl BftState {
         block: Arc<Block>,
         block_hash: Hash,
         finalized_waves: Vec<Arc<FinalizedWave>>,
+        provision_batches: Vec<Arc<ProvisionBatch>>,
     ) -> Vec<Action> {
         // Take the pending proposal - if it doesn't match (height, round), something is wrong
         let Some(pending) = self.pending_proposal.take() else {
@@ -2575,7 +2583,8 @@ impl BftState {
         let has_certificates = !block.certificates.is_empty();
 
         // Store our own block as pending (with all finalized waves)
-        let mut pending_block = PendingBlock::from_complete_block(&block, finalized_waves);
+        let mut pending_block =
+            PendingBlock::from_complete_block(&block, finalized_waves, provision_batches);
 
         let total_tx_count = pending_block.transaction_count();
         info!(
@@ -3061,17 +3070,19 @@ impl BftState {
 
         loop {
             // Get the block and its finalized waves to commit.
-            let (block, commit_waves) =
+            let (block, commit_waves, commit_provisions) =
                 if let Some(block) = self.certified_blocks.get(&current_hash) {
-                    // Certified blocks don't carry finalized waves (they were committed via sync).
-                    (Some(block.clone()), vec![])
+                    // Certified blocks don't carry finalized waves (committed via sync)
+                    // or provisions (ephemeral).
+                    (Some(block.clone()), vec![], vec![])
                 } else if let Some(pending) = self.pending_blocks.get(&current_hash) {
                     (
                         pending.block().map(|b| (*b).clone()),
                         pending.finalized_waves(),
+                        pending.provision_batches(),
                     )
                 } else {
-                    (None, vec![])
+                    (None, vec![], vec![])
                 };
 
             let Some(block) = block else {
@@ -3110,6 +3121,7 @@ impl BftState {
                 block: block.clone(),
                 qc: current_qc.clone(),
                 finalized_waves: commit_waves,
+                provision_batches: commit_provisions,
             });
             // Only the block proposer gossips the committed header globally.
             // Other validators rely on receiving it via gossip propagation.
@@ -3893,6 +3905,53 @@ impl BftState {
                     actions.extend(self.trigger_qc_verification_or_vote(topology, block_hash));
 
                     // Check if this block had a pending commit waiting for data
+                    actions.extend(self.try_commit_pending_data(topology, block_hash));
+                }
+            }
+        }
+
+        actions
+    }
+
+    /// Check if any pending blocks are now complete after a provision batch arrived.
+    ///
+    /// Same pattern as `check_pending_blocks_for_transaction`.
+    pub fn check_pending_blocks_for_provision(
+        &mut self,
+        topology: &TopologySnapshot,
+        batch: &Arc<ProvisionBatch>,
+    ) -> Vec<Action> {
+        let mut actions = Vec::new();
+        let batch_hash = batch.hash();
+
+        let mut block_hashes: Vec<Hash> = self
+            .pending_blocks
+            .iter()
+            .filter(|(_, pending)| pending.needs_provision(&batch_hash))
+            .map(|(hash, _)| *hash)
+            .collect();
+        block_hashes.sort();
+
+        for block_hash in block_hashes {
+            if let Some(pending) = self.pending_blocks.get_mut(&block_hash) {
+                pending.add_provision(Arc::clone(batch));
+
+                if pending.is_complete() {
+                    if pending.block().is_none() {
+                        if let Err(e) = pending.construct_block() {
+                            warn!("Failed to construct block after provision arrival: {}", e);
+                            continue;
+                        }
+                    }
+
+                    debug!(
+                        validator = ?topology.local_validator_id(),
+                        block_hash = ?block_hash,
+                        batch_hash = ?batch_hash,
+                        "Pending block completed after provision batch arrived"
+                    );
+
+                    actions.extend(self.trigger_qc_verification_or_vote(topology, block_hash));
                     actions.extend(self.try_commit_pending_data(topology, block_hash));
                 }
             }
@@ -4796,6 +4855,7 @@ mod tests {
             BlockManifest::default(),
             |_| None, // mempool lookup
             |_| None, // lookup_finalized_wave
+            |_| None, // lookup_provision
         );
 
         // Should emit VerifyQcSignature action
@@ -4882,6 +4942,7 @@ mod tests {
             &topology,
             header,
             BlockManifest::default(),
+            |_| None,
             |_| None,
             |_| None,
         );
@@ -4974,6 +5035,7 @@ mod tests {
             BlockManifest::default(),
             |_| None,
             |_| None,
+            |_| None,
         );
 
         // Verify block is pending
@@ -5047,6 +5109,7 @@ mod tests {
             &topology,
             header,
             BlockManifest::default(),
+            |_| None,
             |_| None,
             |_| None,
         );
@@ -6703,6 +6766,7 @@ mod tests {
             BlockManifest::default(),
             |_| None,
             |_| None,
+            |_| None,
         );
 
         // Should emit VerifyQcSignature for the first block
@@ -6738,6 +6802,7 @@ mod tests {
             &topology,
             header2,
             BlockManifest::default(),
+            |_| None,
             |_| None,
             |_| None,
         );

@@ -676,10 +676,32 @@ impl ExecutionState {
     /// Called during `on_block_committed` with the provision batches from the
     /// committed block. All validators have this data (fetched before BFT vote).
     /// Marks transactions as provisioned deterministically at commit time.
-    pub fn apply_committed_provisions(&mut self, batches: &[Arc<ProvisionBatch>]) {
+    pub fn apply_committed_provisions(
+        &mut self,
+        topology: &TopologySnapshot,
+        batches: &[Arc<ProvisionBatch>],
+    ) -> Vec<Action> {
+        let mut requests = Vec::new();
+
         for batch in batches {
             for tx_entry in &batch.transactions {
                 let tx_hash = tx_entry.tx_hash;
+
+                // Store provisions for execution (same as on_provisioning_complete).
+                let provisions = vec![StateProvision {
+                    transaction_hash: tx_hash,
+                    target_shard: topology.local_shard(),
+                    source_shard: batch.source_shard,
+                    block_height: batch.block_height,
+                    block_timestamp: 0,
+                    entries: Arc::new(tx_entry.entries.clone()),
+                }];
+                self.verified_provisions
+                    .entry(tx_hash)
+                    .or_default()
+                    .extend(provisions);
+
+                // Mark provisioned in accumulator for vote height tracking.
                 if let Some(wave_key) = self.wave_assignments.get(&tx_hash).cloned() {
                     if let Some(acc) = self.accumulators.get_mut(&wave_key) {
                         acc.mark_provisioned(tx_hash);
@@ -688,7 +710,24 @@ impl ExecutionState {
                     // Tx not committed yet — buffer for replay when accumulator is created.
                     self.early_committed_provisions.insert(tx_hash);
                 }
+
+                // Start execution if tx block already committed and waiting on provisions.
+                if let Some((tx, _height)) = self.pending_provisioning.remove(&tx_hash) {
+                    if let Some(all_provisions) = self.verified_provisions.get(&tx_hash) {
+                        requests.push(CrossShardExecutionRequest {
+                            tx_hash,
+                            transaction: tx,
+                            provisions: all_provisions.clone(),
+                        });
+                    }
+                }
             }
+        }
+
+        if requests.is_empty() {
+            vec![]
+        } else {
+            vec![Action::ExecuteCrossShardTransactions { requests }]
         }
     }
 
@@ -1434,6 +1473,39 @@ impl ExecutionState {
             transaction: tx,
             provisions,
         })
+    }
+
+    /// Handle a verified provision batch from a single source shard.
+    ///
+    /// Stores provisions per-tx and starts execution for any pending txs.
+    /// Unlike the old `on_batch_provisioning_complete`, this processes a single
+    /// shard's batch (not all-shards-complete per tx). A single shard's
+    /// provisions may be enough to detect conflicts for early abort.
+    pub fn on_provisions_verified(
+        &mut self,
+        topology: &TopologySnapshot,
+        batch: &ProvisionBatch,
+    ) -> Vec<Action> {
+        let mut requests = Vec::new();
+        for tx_entry in &batch.transactions {
+            let tx_hash = tx_entry.tx_hash;
+            let provisions = vec![StateProvision {
+                transaction_hash: tx_hash,
+                target_shard: topology.local_shard(),
+                source_shard: batch.source_shard,
+                block_height: batch.block_height,
+                block_timestamp: 0, // Not needed for execution
+                entries: Arc::new(tx_entry.entries.clone()),
+            }];
+            if let Some(req) = self.on_provisioning_complete(topology, tx_hash, provisions) {
+                requests.push(req);
+            }
+        }
+        if requests.is_empty() {
+            vec![]
+        } else {
+            vec![Action::ExecuteCrossShardTransactions { requests }]
+        }
     }
 
     /// Handle batch provisioning complete for multiple transactions.

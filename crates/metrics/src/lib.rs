@@ -114,8 +114,6 @@ pub struct MemoryMetrics {
     pub rh_expected_headers: usize,
 
     // ── Provisions ──
-    /// Cross-shard transactions being tracked.
-    pub prov_registered_txs: usize,
     /// Verified remote shard headers (provisions local cache).
     pub prov_verified_remote_headers: usize,
     /// Provision batches waiting for corresponding header.

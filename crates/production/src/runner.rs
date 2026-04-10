@@ -703,6 +703,7 @@ impl ProductionRunner {
                 height: 0,
                 block: genesis_block,
                 state_root: genesis_jvt_root,
+                provision_batches: vec![],
             },
         ));
 

@@ -96,6 +96,8 @@ pub enum ProtocolEvent {
         block: Block,
         /// JVT state root after committing this block's state changes.
         state_root: Hash,
+        /// Provision batches included in this block (ephemeral, for deterministic execution application).
+        provision_batches: Vec<Arc<ProvisionBatch>>,
     },
 
     /// Quorum Certificate verification and building result.
@@ -145,15 +147,15 @@ pub enum ProtocolEvent {
         block_hash: Hash,
         /// Finalized waves included in this block (carries receipts for atomic commit).
         finalized_waves: Vec<Arc<FinalizedWave>>,
+        /// Provision batches included in this block (for PendingBlock DA tracking).
+        provision_batches: Vec<Arc<ProvisionBatch>>,
     },
 
     // ═══════════════════════════════════════════════════════════════════════
     // Provisions
     // ═══════════════════════════════════════════════════════════════════════
-    /// One or more transactions have all required provisions — ready for execution.
-    ProvisioningComplete {
-        transactions: Vec<crate::ProvisionedTransaction>,
-    },
+    /// A provision batch has been verified — ready for downstream consumption.
+    ProvisionsVerified { batch: Arc<ProvisionBatch> },
 
     /// Received a provision batch from a source shard (light-client path).
     ///
@@ -369,7 +371,7 @@ impl ProtocolEvent {
             ProtocolEvent::ProposalBuilt { .. } => "ProposalBuilt",
 
             // Provisions
-            ProtocolEvent::ProvisioningComplete { .. } => "ProvisioningComplete",
+            ProtocolEvent::ProvisionsVerified { .. } => "ProvisionsVerified",
             ProtocolEvent::StateProvisionsReceived { .. } => "StateProvisionsReceived",
             ProtocolEvent::StateProvisionsVerified { .. } => "StateProvisionsVerified",
 
