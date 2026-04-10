@@ -42,8 +42,8 @@ use hyperscale_network::Network;
 use hyperscale_storage::{ChainReader, ChainWriter, SubstateStore};
 use hyperscale_types::{
     Block, Bls12381G1PrivateKey, Bls12381G1PublicKey, CommittedBlockHeader, ExecutionCertificate,
-    FinalizedWave, Hash, QuorumCertificate, RoutableTransaction, ShardGroupId, TopologySnapshot,
-    ValidatorId, WaveCertificate, WaveId,
+    FinalizedWave, Hash, ProvisionBatch, QuorumCertificate, RoutableTransaction, ShardGroupId,
+    TopologySnapshot, ValidatorId, WaveCertificate, WaveId,
 };
 use quick_cache::sync::Cache as QuickCache;
 use std::collections::{HashMap, HashSet};
@@ -62,6 +62,7 @@ pub(crate) enum PendingCommit {
         block: Arc<Block>,
         qc: Arc<QuorumCertificate>,
         finalized_waves: Vec<Arc<FinalizedWave>>,
+        provision_batches: Vec<Arc<ProvisionBatch>>,
     },
     /// Sync path: receipts and ECs come from `pending_sync_data`.
     Synced {
@@ -1017,7 +1018,6 @@ where
             rh_verified_headers: rh_mem.verified_headers,
             rh_expected_headers: rh_mem.expected_headers,
             // Provisions
-            prov_registered_txs: prov_mem.registered_txs,
             prov_verified_remote_headers: prov_mem.verified_remote_headers,
             prov_pending_provisions: prov_mem.pending_provisions,
             prov_verified_batches: prov_mem.verified_batches,

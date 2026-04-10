@@ -218,11 +218,13 @@ where
                 block,
                 qc,
                 finalized_waves,
+                provision_batches,
             } => {
                 self.accumulate_block_commit(super::PendingCommit::Consensus {
                     block: Arc::new(block),
                     qc: Arc::new(qc),
                     finalized_waves,
+                    provision_batches,
                 });
             }
             Action::CommitSyncedBlock { block, qc } => {
@@ -442,9 +444,14 @@ where
                 cache.retain(|_, (h, _)| *h > max_height);
             }
             for commit in commits {
-                let (block, qc) = match commit {
-                    super::PendingCommit::Consensus { block, qc, .. }
-                    | super::PendingCommit::Synced { block, qc } => (block, qc),
+                let (block, qc, provision_batches) = match commit {
+                    super::PendingCommit::Consensus {
+                        block,
+                        qc,
+                        provision_batches,
+                        ..
+                    } => (block, qc, provision_batches),
+                    super::PendingCommit::Synced { block, qc } => (block, qc, vec![]),
                 };
                 let block_hash = block.hash();
                 let height = block.header.height.0;
@@ -459,6 +466,7 @@ where
                             height,
                             block: Arc::unwrap_or_clone(block),
                             state_root: result,
+                            provision_batches,
                         }));
             }
             return;
@@ -574,6 +582,7 @@ where
                         ref block,
                         ref qc,
                         ref finalized_waves,
+                        ..
                     } => {
                         let wave_receipts: Vec<hyperscale_types::ReceiptBundle> = finalized_waves
                             .iter()
@@ -680,10 +689,14 @@ where
                     }
                 };
 
-                // Extract the block from the commit for the event.
-                let block = match commit {
-                    super::PendingCommit::Consensus { block, .. }
-                    | super::PendingCommit::Synced { block, .. } => block,
+                // Extract the block and provisions from the commit for the event.
+                let (block, provision_batches) = match commit {
+                    super::PendingCommit::Consensus {
+                        block,
+                        provision_batches,
+                        ..
+                    } => (block, provision_batches),
+                    super::PendingCommit::Synced { block, .. } => (block, vec![]),
                 };
 
                 assert_state_root_consistent(&block, result);
@@ -701,6 +714,7 @@ where
                     height: height.0,
                     block: Arc::unwrap_or_clone(block),
                     state_root: result,
+                    provision_batches,
                 }));
             }
         });

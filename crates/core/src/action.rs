@@ -478,6 +478,8 @@ pub enum Action {
         qc: QuorumCertificate,
         /// Finalized waves carrying receipts from local execution.
         finalized_waves: Vec<Arc<FinalizedWave>>,
+        /// Provision batches included in this block (ephemeral, for deterministic execution application).
+        provision_batches: Vec<Arc<ProvisionBatch>>,
     },
 
     /// Commit a synced block atomically: block data + JVT + substates +

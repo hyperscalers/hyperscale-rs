@@ -193,7 +193,7 @@ impl NodeStateMachine {
             .mempool
             .ready_transactions(max_txs, pending_txs, pending_certs);
         let finalized_waves = self.execution.get_finalized_waves();
-        let provision_batches = self.provisions.drain_queued_provisions();
+        let provision_batches = self.provisions.queued_provisions();
 
         ProposalInputs {
             ready_txs,
@@ -291,6 +291,7 @@ impl NodeStateMachine {
             manifest,
             |h| self.mempool.get_transaction(h),
             |h| self.execution.get_finalized_wave_by_hash(h),
+            |h| self.provisions.get_batch_by_hash(h),
         )
     }
 
@@ -332,7 +333,13 @@ impl NodeStateMachine {
     /// Order invariants:
     /// 1. Process abort intents BEFORE passing new TXs to execution
     /// 2. Process CrossShardTxRegistered continuations BEFORE other exec actions
-    fn on_block_committed(&mut self, block_hash: Hash, height: u64, block: Block) -> Vec<Action> {
+    fn on_block_committed(
+        &mut self,
+        block_hash: Hash,
+        height: u64,
+        block: Block,
+        provision_batches: Vec<Arc<ProvisionBatch>>,
+    ) -> Vec<Action> {
         let mut actions = Vec::new();
         let block_height = BlockHeight(height);
 
@@ -362,7 +369,6 @@ impl NodeStateMachine {
                 *decision,
                 block_height,
             ));
-            self.provisions.on_certificate_committed(tx_hash);
         }
 
         // Pass all transactions from block to execution (no need for mempool lookup).
@@ -376,15 +382,6 @@ impl NodeStateMachine {
             all_txs,
         );
 
-        // Register cross-shard transactions with provisions BEFORE extending
-        // actions, so coordinator has registrations before provisions arrive.
-        for reg in exec_output.cross_shard_registrations {
-            let registration = hyperscale_provisions::TxRegistration {
-                required_shards: reg.required_shards,
-                registered_at: reg.committed_height,
-            };
-            actions.extend(self.provisions.on_tx_registered(reg.tx_hash, registration));
-        }
         actions.extend(exec_output.actions);
 
         // Also let mempool handle it (marks transactions as committed, processes deferrals/aborts)
@@ -399,23 +396,24 @@ impl NodeStateMachine {
                 .on_block_committed(self.topology.snapshot()),
         );
 
-        // Let provisions coordinator handle cleanup (certificates, aborts, deferrals).
-        actions.extend(
-            self.provisions
-                .on_block_committed(self.topology.snapshot(), &block),
-        );
-
-        // Apply committed provisions deterministically. All validators process
-        // the same provision batches at the same height, making target_vote_height
-        // a pure function of committed chain state.
-        let manifest = BlockManifest::from_block(&block);
-        if !manifest.provision_batch_hashes.is_empty() {
-            let committed_provisions = self
-                .provisions
-                .get_batches_by_hash(&manifest.provision_batch_hashes);
-            self.execution
-                .apply_committed_provisions(&committed_provisions);
+        // Apply committed provisions deterministically. Provisions flow with the
+        // block through the commit pipeline — all validators process the same
+        // batches at the same height, making target_vote_height deterministic.
+        let committed_provision_hashes: Vec<Hash> =
+            provision_batches.iter().map(|b| b.hash()).collect();
+        if !provision_batches.is_empty() {
+            actions.extend(
+                self.execution
+                    .apply_committed_provisions(self.topology.snapshot(), &provision_batches),
+            );
         }
+
+        // Let provisions coordinator handle cleanup + fallback timeouts.
+        actions.extend(self.provisions.on_block_committed(
+            self.topology.snapshot(),
+            &block,
+            &committed_provision_hashes,
+        ));
 
         // Round voting: scan all incomplete waves and emit votes for complete ones.
         // This is the SINGLE path to execution voting. Abort intents have already
@@ -597,6 +595,7 @@ impl StateMachine for NodeStateMachine {
                 block,
                 block_hash,
                 finalized_waves,
+                provision_batches,
             } => self.bft.on_proposal_built(
                 self.topology.snapshot(),
                 height,
@@ -604,6 +603,7 @@ impl StateMachine for NodeStateMachine {
                 block.clone(),
                 block_hash,
                 finalized_waves,
+                provision_batches,
             ),
 
             // ── Block Committed ──────────────────────────────────────────
@@ -612,11 +612,12 @@ impl StateMachine for NodeStateMachine {
                 height,
                 block,
                 state_root,
+                provision_batches,
             } => {
                 // JVT unblocking first — unblocks state root verifications for
                 // the next block before subsystem notifications run.
                 self.on_state_commit_complete(height, state_root);
-                self.on_block_committed(block_hash, height, block)
+                self.on_block_committed(block_hash, height, block, provision_batches)
             }
 
             // ── Provisions ───────────────────────────────────────────────
@@ -633,14 +634,9 @@ impl StateMachine for NodeStateMachine {
                 committed_header,
                 valid,
             ),
-            ProtocolEvent::ProvisioningComplete { transactions } => {
-                let mut actions = self
-                    .execution
-                    .on_batch_provisioning_complete(self.topology.snapshot(), transactions);
-                // Provision arrival may lower the target vote height — re-scan.
-                actions.extend(self.execution.emit_vote_actions(self.topology.snapshot()));
-                actions
-            }
+            ProtocolEvent::ProvisionsVerified { batch } => self
+                .bft
+                .check_pending_blocks_for_provision(self.topology.snapshot(), &batch),
 
             // ── Execution ────────────────────────────────────────────────
             ProtocolEvent::ExecutionBatchCompleted {

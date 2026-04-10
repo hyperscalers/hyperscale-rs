@@ -17,8 +17,7 @@
 //! # Components
 //!
 //! - [`ProvisionCoordinator`] - Main sub-state machine
-//! - [`TxRegistration`] - Registration info for cross-shard transactions
 
 mod state;
 
-pub use state::{ProvisionCoordinator, ProvisionMemoryStats, TxRegistration};
+pub use state::{ProvisionCoordinator, ProvisionMemoryStats};

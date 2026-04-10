@@ -1216,10 +1216,6 @@ impl MetricsRecorder for PrometheusRecorder {
         // Provisions
         self.metrics
             .memory_provisions
-            .with_label_values(&["registered_txs"])
-            .set(m.prov_registered_txs as f64);
-        self.metrics
-            .memory_provisions
             .with_label_values(&["verified_remote_headers"])
             .set(m.prov_verified_remote_headers as f64);
         self.metrics
