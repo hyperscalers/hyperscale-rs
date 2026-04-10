@@ -175,6 +175,13 @@ pub struct BlockHeader {
     /// For empty blocks (genesis, fallback, no certificates), this is `Hash::ZERO`.
     pub local_receipt_root: Hash,
 
+    /// Merkle root of provision batches included in this block.
+    ///
+    /// Commits to which remote-shard provisions are available at this height.
+    /// Validators who voted for the BFT proposal have this data locally.
+    /// `Hash::ZERO` when no provisions are included (single-shard or empty block).
+    pub provisions_root: Hash,
+
     /// Cross-shard execution waves in this block.
     ///
     /// Each `WaveId` is the set of remote shards that a group of transactions
@@ -208,6 +215,7 @@ impl BlockHeader {
             transaction_root: Hash::ZERO,
             certificate_root: Hash::ZERO,
             local_receipt_root: Hash::ZERO,
+            provisions_root: Hash::ZERO,
             waves: vec![],
         }
     }
@@ -483,6 +491,10 @@ pub struct BlockManifest {
 
     /// Abort intents (small, stored inline).
     pub conflicts: Vec<Conflict>,
+
+    /// Hashes of provision batches included in this block.
+    /// Used for provision data availability — validators fetch missing batches by hash.
+    pub provision_batch_hashes: Vec<Hash>,
 }
 
 impl BlockManifest {
@@ -503,6 +515,7 @@ impl BlockManifest {
                 .map(|c| c.wave_id.hash())
                 .collect(),
             conflicts: block.conflicts.clone(),
+            provision_batch_hashes: vec![],
         }
     }
 }
@@ -628,6 +641,7 @@ mod tests {
             transaction_root: Hash::ZERO,
             certificate_root: Hash::ZERO,
             local_receipt_root: Hash::ZERO,
+            provisions_root: Hash::ZERO,
             waves: vec![],
         };
 

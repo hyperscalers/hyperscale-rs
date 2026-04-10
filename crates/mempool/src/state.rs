@@ -1360,6 +1360,7 @@ mod tests {
                 transaction_root: Hash::ZERO,
                 certificate_root: Hash::ZERO,
                 local_receipt_root: Hash::ZERO,
+                provisions_root: Hash::ZERO,
                 waves: vec![],
             },
             transactions: transactions.into_iter().map(Arc::new).collect(),

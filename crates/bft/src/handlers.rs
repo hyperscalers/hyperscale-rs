@@ -390,6 +390,7 @@ pub fn build_proposal<S: ChainWriter + SubstateStore>(
         transaction_root,
         certificate_root,
         local_receipt_root,
+        provisions_root: Hash::ZERO,
         waves,
     };
 
