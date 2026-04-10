@@ -4,12 +4,8 @@
 //! verifications. BftState delegates verification bookkeeping here while
 //! retaining control-flow decisions (voting, block rejection).
 
-use hyperscale_types::{
-    Block, BlockHeader, BlockHeight, CommittedBlockHeader, Conflict, Hash, ReceiptBundle,
-    ShardGroupId,
-};
+use hyperscale_types::{Block, BlockHeader, Hash, ReceiptBundle};
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use tracing::{debug, trace, warn};
 
 use hyperscale_core::Action;
@@ -56,22 +52,6 @@ pub struct ReadyStateRootVerification {
     /// uses these to look up the corresponding `Arc<FinalizedWave>` from execution state.
     pub wave_id_hashes: Vec<Hash>,
     pub block_height: u64,
-}
-
-/// Conflict proof verification waiting for remote headers to arrive.
-///
-/// When a block has conflicts but the remote committed header for the
-/// source shard/height hasn't been received yet, the verification is
-/// parked here. Once `on_remote_header_arrived` is called with the
-/// matching key, the verification is unblocked and dispatched.
-#[derive(Debug, Clone)]
-struct PendingConflictVerification {
-    /// The conflicts that need proof verification.
-    conflicts: Vec<Conflict>,
-    /// Proof inputs already resolved (conflict, transaction_root).
-    resolved: Vec<(Conflict, Hash)>,
-    /// Remote header keys still needed before dispatch.
-    waiting_on: HashSet<(ShardGroupId, BlockHeight)>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -129,17 +109,6 @@ pub(crate) struct VerificationPipeline {
 
     /// Blocks with verified local receipt roots.
     verified_local_receipt_roots: HashSet<Hash>,
-
-    // === Conflict proof verification ===
-    /// Blocks where conflict proof verification is currently in-flight.
-    conflict_verifications_in_flight: HashSet<Hash>,
-
-    /// Blocks with verified conflict proofs.
-    verified_conflicts: HashSet<Hash>,
-
-    /// Conflict verifications waiting for remote headers.
-    /// Keyed by block_hash. Unblocked by `on_remote_header_arrived`.
-    pending_conflict_verifications: HashMap<Hash, PendingConflictVerification>,
 }
 
 impl VerificationPipeline {
@@ -159,9 +128,6 @@ impl VerificationPipeline {
             verified_certificate_roots: HashSet::new(),
             local_receipt_root_verifications_in_flight: HashSet::new(),
             verified_local_receipt_roots: HashSet::new(),
-            conflict_verifications_in_flight: HashSet::new(),
-            verified_conflicts: HashSet::new(),
-            pending_conflict_verifications: HashMap::new(),
         }
     }
 
@@ -241,17 +207,7 @@ impl VerificationPipeline {
             self.verified_local_receipt_roots.contains(&block_hash)
         };
 
-        let conflicts_ok = if block.conflicts.is_empty() {
-            true
-        } else {
-            self.verified_conflicts.contains(&block_hash)
-        };
-
-        state_root_ok
-            && transaction_root_ok
-            && certificate_root_ok
-            && local_receipt_root_ok
-            && conflicts_ok
+        state_root_ok && transaction_root_ok && certificate_root_ok && local_receipt_root_ok
     }
 
     /// Log why a block's verification is incomplete. Called on view change
@@ -316,21 +272,6 @@ impl VerificationPipeline {
             "NOT_STARTED"
         };
 
-        let conflicts_status = if block.conflicts.is_empty() {
-            "skipped(no_conflicts)"
-        } else if self.verified_conflicts.contains(&block_hash) {
-            "verified"
-        } else if self.conflict_verifications_in_flight.contains(&block_hash) {
-            "in_flight"
-        } else if self
-            .pending_conflict_verifications
-            .contains_key(&block_hash)
-        {
-            "pending_remote_headers"
-        } else {
-            "NOT_STARTED"
-        };
-
         warn!(
             block_hash = ?block_hash,
             height = block.header.height.0,
@@ -341,7 +282,6 @@ impl VerificationPipeline {
             tx_root = tx_root_status,
             certificate_root = certificate_root_status,
             local_receipt_root = local_receipt_root_status,
-            conflicts = conflicts_status,
             "View change — block verification was incomplete"
         );
     }
@@ -633,177 +573,6 @@ impl VerificationPipeline {
         valid
     }
 
-    // ─── Conflict proofs ─────────────────────────────────────────────────
-
-    /// Check if a block needs conflict proof verification before voting.
-    pub fn needs_conflict_verification(&self, block: &Block) -> bool {
-        if block.conflicts.is_empty() {
-            return false;
-        }
-
-        let block_hash = block.hash();
-
-        if self.verified_conflicts.contains(&block_hash)
-            || self.conflict_verifications_in_flight.contains(&block_hash)
-        {
-            return false;
-        }
-
-        true
-    }
-
-    /// Initiate conflict proof verification for a block.
-    ///
-    /// Resolves remote header `transaction_root` values from `remote_headers`.
-    /// If all headers are available, emits `Action::VerifyConflictProofs`
-    /// immediately. If any are missing, parks the verification in
-    /// `pending_conflict_verifications` until `on_remote_header_arrived`
-    /// supplies the missing header.
-    pub fn initiate_conflict_verification(
-        &mut self,
-        block_hash: Hash,
-        block: &Block,
-        remote_headers: &HashMap<(ShardGroupId, BlockHeight), Arc<CommittedBlockHeader>>,
-    ) -> Vec<Action> {
-        let conflicts: Vec<Conflict> = block.conflicts.clone();
-
-        if conflicts.is_empty() {
-            return vec![];
-        }
-
-        debug!(
-            block_hash = ?block_hash,
-            conflict_count = conflicts.len(),
-            "Initiating conflict proof verification"
-        );
-
-        self.try_resolve_conflicts(block_hash, conflicts, remote_headers)
-    }
-
-    /// Try to resolve all conflicts against available remote headers.
-    ///
-    /// Returns `Action::VerifyConflictProofs` if all headers are present,
-    /// otherwise parks in `pending_conflict_verifications`.
-    fn try_resolve_conflicts(
-        &mut self,
-        block_hash: Hash,
-        conflicts: Vec<Conflict>,
-        remote_headers: &HashMap<(ShardGroupId, BlockHeight), Arc<CommittedBlockHeader>>,
-    ) -> Vec<Action> {
-        let mut resolved = Vec::new();
-        let mut waiting_on = HashSet::new();
-
-        for conflict in &conflicts {
-            let key = (conflict.source_shard, conflict.source_block_height);
-            if let Some(header) = remote_headers.get(&key) {
-                resolved.push((conflict.clone(), header.header.transaction_root));
-            } else {
-                waiting_on.insert(key);
-            }
-        }
-
-        if waiting_on.is_empty() {
-            // All headers available — dispatch immediately.
-            self.conflict_verifications_in_flight.insert(block_hash);
-            vec![Action::VerifyConflictProofs {
-                block_hash,
-                proof_inputs: resolved,
-            }]
-        } else {
-            // Park until missing headers arrive.
-            debug!(
-                block_hash = ?block_hash,
-                missing = waiting_on.len(),
-                "Conflict verification waiting for remote headers"
-            );
-            self.pending_conflict_verifications.insert(
-                block_hash,
-                PendingConflictVerification {
-                    conflicts,
-                    resolved,
-                    waiting_on,
-                },
-            );
-            vec![]
-        }
-    }
-
-    /// A remote header has arrived — unblock any pending conflict verifications
-    /// that were waiting for it.
-    pub fn on_remote_header_arrived(
-        &mut self,
-        shard: ShardGroupId,
-        height: BlockHeight,
-        header: &CommittedBlockHeader,
-    ) -> Vec<Action> {
-        let key = (shard, height);
-        let transaction_root = header.header.transaction_root;
-
-        // Find all pending verifications waiting on this key.
-        let unblocked: Vec<Hash> = self
-            .pending_conflict_verifications
-            .iter()
-            .filter(|(_, pv)| pv.waiting_on.contains(&key))
-            .map(|(block_hash, _)| *block_hash)
-            .collect();
-
-        if unblocked.is_empty() {
-            return vec![];
-        }
-
-        let mut actions = Vec::new();
-
-        for block_hash in unblocked {
-            let pv = self
-                .pending_conflict_verifications
-                .get_mut(&block_hash)
-                .unwrap();
-
-            // Resolve the conflicts that were waiting on this header.
-            for conflict in &pv.conflicts {
-                if (conflict.source_shard, conflict.source_block_height) == key {
-                    pv.resolved.push((conflict.clone(), transaction_root));
-                }
-            }
-            pv.waiting_on.remove(&key);
-
-            if pv.waiting_on.is_empty() {
-                // Fully resolved — dispatch.
-                let pv = self
-                    .pending_conflict_verifications
-                    .remove(&block_hash)
-                    .unwrap();
-                self.conflict_verifications_in_flight.insert(block_hash);
-                debug!(
-                    block_hash = ?block_hash,
-                    "Conflict verification unblocked by remote header"
-                );
-                actions.push(Action::VerifyConflictProofs {
-                    block_hash,
-                    proof_inputs: pv.resolved,
-                });
-            }
-        }
-
-        actions
-    }
-
-    /// Record a conflict proof verification result.
-    /// Returns whether the verification passed.
-    pub fn on_conflicts_verified(&mut self, block_hash: Hash, valid: bool) -> bool {
-        self.conflict_verifications_in_flight.remove(&block_hash);
-
-        if valid {
-            self.verified_conflicts.insert(block_hash);
-            debug!(
-                block_hash = ?block_hash,
-                "Conflict proofs verified successfully"
-            );
-        }
-
-        valid
-    }
-
     // ═══════════════════════════════════════════════════════════════════════
     // Remote header QC verification
     // ═══════════════════════════════════════════════════════════════════════
@@ -917,15 +686,6 @@ impl VerificationPipeline {
 
         self.verified_local_receipt_roots
             .retain(|hash| pending_blocks.contains_key(hash));
-
-        self.conflict_verifications_in_flight
-            .retain(|hash| pending_blocks.contains_key(hash));
-
-        self.verified_conflicts
-            .retain(|hash| pending_blocks.contains_key(hash));
-
-        self.pending_conflict_verifications
-            .retain(|hash, _| pending_blocks.contains_key(hash));
 
         // verified_qcs uses height-based retention (not pending_blocks membership)
         // because QC cache entries are keyed by the certified block's hash, which

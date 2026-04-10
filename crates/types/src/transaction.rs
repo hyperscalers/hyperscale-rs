@@ -1,6 +1,6 @@
 //! Transaction types for consensus.
 
-use crate::{BlockHeight, Hash, NodeId, ShardGroupId};
+use crate::{BlockHeight, Hash, NodeId};
 use radix_common::data::manifest::{manifest_decode, manifest_encode};
 use radix_transactions::model::{UserTransaction, ValidatedUserTransaction};
 use radix_transactions::validation::TransactionValidator;
@@ -290,42 +290,6 @@ pub enum TransactionDecision {
 // ============================================================================
 
 /// Reason a transaction was aborted.
-///
-/// Aborts are terminal - the transaction will not be retried and any held
-/// A livelock conflict resolution included in a block.
-///
-/// When two transactions form a bidirectional cross-shard cycle (livelock),
-/// the transaction with the higher hash is the loser and must be aborted.
-/// Conflicts feed into the execution accumulator as abort entries. The
-/// actual abort takes effect only when a Wave Certificate confirms it.
-#[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
-pub struct Conflict {
-    /// Hash of the losing transaction (will be aborted — higher hash).
-    pub tx_hash: Hash,
-
-    /// Block height where this conflict is being committed.
-    pub block_height: BlockHeight,
-
-    /// Hash of the winning transaction (lower hash wins, keeps executing).
-    pub winner_tx_hash: Hash,
-
-    /// Source shard where the cycle was detected.
-    pub source_shard: ShardGroupId,
-
-    /// Block height on the source shard that proves the cycle.
-    pub source_block_height: BlockHeight,
-}
-
-impl std::fmt::Display for Conflict {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "conflict(loser: {}, winner: {}, source: {})",
-            self.tx_hash, self.winner_tx_hash, self.source_shard.0
-        )
-    }
-}
-
 /// Transaction status for lifecycle tracking.
 ///
 /// Transactions progress through these states:

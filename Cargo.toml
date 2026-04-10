@@ -8,7 +8,6 @@ members = [
     "crates/dispatch-sync",
     "crates/engine",
     "crates/execution",
-    "crates/livelock",
     "crates/mempool",
     "crates/messages",
     "crates/metrics",
@@ -40,7 +39,6 @@ default-members = [
     "crates/dispatch-sync",
     "crates/engine",
     "crates/execution",
-    "crates/livelock",
     "crates/mempool",
     "crates/messages",
     "crates/metrics",
@@ -80,7 +78,6 @@ hyperscale-dispatch-pooled = { path = "crates/dispatch-pooled" }
 hyperscale-dispatch-sync = { path = "crates/dispatch-sync" }
 hyperscale-engine = { path = "crates/engine" }
 hyperscale-execution = { path = "crates/execution" }
-hyperscale-livelock = { path = "crates/livelock" }
 hyperscale-mempool = { path = "crates/mempool" }
 hyperscale-messages = { path = "crates/messages" }
 hyperscale-network = { path = "crates/network" }

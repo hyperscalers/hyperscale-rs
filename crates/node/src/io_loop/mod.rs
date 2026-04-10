@@ -28,9 +28,6 @@ use crate::batch_accumulator::BatchAccumulator;
 use crate::config::NodeConfig;
 use crate::protocol::execution_cert_fetch::{ExecCertFetchInput, ExecCertFetchProtocol};
 use crate::protocol::header_fetch::{HeaderFetchInput, HeaderFetchProtocol};
-use crate::protocol::inclusion_proof_fetch::{
-    InclusionProofFetchInput, InclusionProofFetchProtocol,
-};
 use crate::protocol::provision_fetch::{ProvisionFetchInput, ProvisionFetchProtocol};
 use crate::protocol::sync::{SyncInput, SyncProtocol, SyncStatus};
 use crate::protocol::transaction_fetch::{TransactionFetchInput, TransactionFetchProtocol};
@@ -218,9 +215,6 @@ where
     // Provision fetch protocol (cross-shard provision fetching with peer rotation)
     provision_fetch_protocol: ProvisionFetchProtocol,
 
-    // Inclusion proof fetch protocol (livelock tx inclusion proof fetching with peer rotation)
-    inclusion_proof_fetch_protocol: InclusionProofFetchProtocol,
-
     // Execution certificate fetch protocol (cross-shard exec cert fetching with peer rotation)
     exec_cert_fetch_protocol: ExecCertFetchProtocol,
 
@@ -317,8 +311,6 @@ where
         let transaction_fetch_protocol =
             TransactionFetchProtocol::new(config.transaction_fetch.clone());
         let provision_fetch_protocol = ProvisionFetchProtocol::new(config.provision_fetch.clone());
-        let inclusion_proof_fetch_protocol =
-            InclusionProofFetchProtocol::new(config.inclusion_proof_fetch.clone());
         let exec_cert_fetch_protocol = ExecCertFetchProtocol::new(config.exec_cert_fetch.clone());
         let header_fetch_protocol =
             HeaderFetchProtocol::new(crate::protocol::header_fetch::HeaderFetchConfig::default());
@@ -343,7 +335,6 @@ where
             sync_protocol,
             transaction_fetch_protocol,
             provision_fetch_protocol,
-            inclusion_proof_fetch_protocol,
             exec_cert_fetch_protocol,
             header_fetch_protocol,
             validation_batch: BatchAccumulator::new(b.tx_validation_max, b.tx_validation_window),
@@ -675,13 +666,6 @@ where
                             now: std::time::Instant::now(),
                         });
                 self.process_provision_fetch_outputs(prov_outputs);
-                // Also tick the inclusion proof fetch protocol.
-                let proof_outputs =
-                    self.inclusion_proof_fetch_protocol
-                        .handle(InclusionProofFetchInput::Tick {
-                            now: std::time::Instant::now(),
-                        });
-                self.process_inclusion_proof_fetch_outputs(proof_outputs);
                 // Also tick the exec cert fetch protocol.
                 let cert_outputs = self
                     .exec_cert_fetch_protocol
@@ -710,42 +694,6 @@ where
                         batch,
                     });
                 self.process_provision_fetch_outputs(outputs);
-                self.update_fetch_tick_timer();
-            }
-
-            // ── Inclusion proof fetch protocol (livelock) ─────────────
-            NodeInput::InclusionProofFetchReceived {
-                winner_tx_hash,
-                reason,
-                source_shard,
-                source_block_height,
-                proof,
-            } => {
-                let outputs = self.inclusion_proof_fetch_protocol.handle(
-                    InclusionProofFetchInput::Received {
-                        winner_tx_hash,
-                        reason,
-                        source_shard,
-                        source_block_height,
-                        proof,
-                    },
-                );
-                self.process_inclusion_proof_fetch_outputs(outputs);
-                self.update_fetch_tick_timer();
-            }
-
-            NodeInput::InclusionProofFetchFailed { winner_tx_hash } => {
-                let outputs = self
-                    .inclusion_proof_fetch_protocol
-                    .handle(InclusionProofFetchInput::Failed { winner_tx_hash });
-                self.process_inclusion_proof_fetch_outputs(outputs);
-                // Tick to retry immediately.
-                let tick_outputs =
-                    self.inclusion_proof_fetch_protocol
-                        .handle(InclusionProofFetchInput::Tick {
-                            now: std::time::Instant::now(),
-                        });
-                self.process_inclusion_proof_fetch_outputs(tick_outputs);
                 self.update_fetch_tick_timer();
             }
 
@@ -996,7 +944,7 @@ where
     /// Collect and export metrics from the state machine.
     ///
     /// Called periodically (every ~1s) by the driving loop. Reads state from
-    /// BFT, mempool, execution, livelock, sync, and fetch subsystems and
+    /// BFT, mempool, execution, sync, and fetch subsystems and
     /// emits them via the `hyperscale_metrics` facade. In production the
     /// Prometheus backend records them; in simulation the no-op backend
     /// discards them at zero cost.
@@ -1027,15 +975,7 @@ where
         metrics::set_fetch_in_flight("transaction", fetch_status.in_flight_operations);
         metrics::set_fetch_in_flight("provision", self.provision_fetch_protocol.in_flight_count());
         metrics::set_fetch_in_flight("exec_cert", self.exec_cert_fetch_protocol.in_flight_count());
-        metrics::set_fetch_in_flight(
-            "inclusion_proof",
-            self.inclusion_proof_fetch_protocol.in_flight_count(),
-        );
         metrics::set_fetch_in_flight("header", self.header_fetch_protocol.in_flight_count());
-
-        // ── Livelock ──
-        let livelock_stats = self.state.livelock().stats();
-        metrics::set_livelock_pending_conflicts(livelock_stats.pending_conflicts);
 
         // ── Memory ──
         let bft_mem = self.state.bft().memory_stats();
@@ -1082,11 +1022,11 @@ where
             prov_pending_provisions: prov_mem.pending_provisions,
             prov_verified_batches: prov_mem.verified_batches,
             prov_expected_provisions: prov_mem.expected_provisions,
-            // Livelock
-            livelock_tombstones: livelock_stats.active_tombstones,
-            livelock_pending_proof_fetches: livelock_stats.pending_proof_fetches,
-            livelock_pending_conflicts: livelock_stats.pending_conflicts,
-            livelock_tracked_txs: livelock_stats.tracked_transactions,
+            // Livelock (removed — zeroed for metric schema stability)
+            livelock_tombstones: 0,
+            livelock_pending_proof_fetches: 0,
+            livelock_pending_conflicts: 0,
+            livelock_tracked_txs: 0,
             // Storage
             jvt_node_cache_entries: self.storage.node_cache_len(),
             rocksdb_block_cache_usage_bytes: rocksdb_bc,

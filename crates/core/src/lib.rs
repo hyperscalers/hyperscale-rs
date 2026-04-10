@@ -35,8 +35,8 @@ mod timer;
 mod traits;
 
 pub use action::{
-    Action, CrossShardExecutionRequest, FinalizationPhaseTimes, InclusionProofFetchReason,
-    ProvisionRequest, ProvisionedTransaction, TransactionStatus,
+    Action, CrossShardExecutionRequest, FinalizationPhaseTimes, ProvisionRequest,
+    ProvisionedTransaction, TransactionStatus,
 };
 pub use input::{EventPriority, NodeInput};
 pub use protocol_event::{ProtocolEvent, VerificationKind};

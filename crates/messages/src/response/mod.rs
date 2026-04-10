@@ -7,11 +7,9 @@ mod committed_header;
 mod execution_cert;
 mod provision;
 mod transaction;
-mod tx_inclusion_proof;
 
 pub use block::GetBlockResponse;
 pub use committed_header::GetCommittedBlockHeaderResponse;
 pub use execution_cert::GetExecutionCertsResponse;
 pub use provision::GetProvisionsResponse;
 pub use transaction::GetTransactionsResponse;
-pub use tx_inclusion_proof::{GetTxInclusionProofResponse, TxInclusionProofEntry};

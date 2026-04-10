@@ -1365,7 +1365,6 @@ mod tests {
             },
             transactions: transactions.into_iter().map(Arc::new).collect(),
             certificates: wave_certs.into_iter().map(Arc::new).collect(),
-            conflicts: vec![],
         }
     }
 

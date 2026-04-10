@@ -196,7 +196,6 @@ where
             | Action::VerifyTransactionRoot { .. }
             | Action::VerifyCertificateRoot { .. }
             | Action::VerifyLocalReceiptRoot { .. }
-            | Action::VerifyConflictProofs { .. }
             | Action::BuildProposal { .. }
             | Action::VerifyProvisionBatch { .. }
             | Action::ExecuteTransactions { .. }
@@ -284,7 +283,6 @@ where
             | Action::RequestMissingProvisions { .. }
             | Action::RequestMissingExecutionCert { .. }
             | Action::CancelProvisionFetch { .. }
-            | Action::RequestTxInclusionProofs { .. }
             | Action::RequestMissingCommittedBlockHeader { .. } => {
                 self.process_sync_fetch_action(action);
             }
@@ -371,13 +369,6 @@ where
         let commit_latency_secs = (now_ms.saturating_sub(block.header.timestamp)) as f64 / 1000.0;
         metrics::record_block_committed(height.0, commit_latency_secs);
         metrics::set_block_height(height.0);
-        // Livelock metrics for conflicts in this block.
-        for _conflict in &block.conflicts {
-            metrics::record_livelock_conflict();
-            metrics::record_livelock_cycle_detected();
-        }
-        metrics::set_livelock_pending_conflicts(self.state.livelock().stats().pending_conflicts);
-
         // Feed committed height to sync protocol (just tracks progress,
         // doesn't need JVT state).
         let outputs = self
@@ -812,38 +803,6 @@ where
                         source_shard,
                         block_height,
                     });
-            }
-            Action::RequestTxInclusionProofs {
-                source_shard,
-                source_block_height,
-                entries,
-                peers,
-            } => {
-                use crate::protocol::inclusion_proof_fetch::InclusionProofFetchInput;
-                let preferred_peer = peers.first().copied().unwrap_or(ValidatorId(0));
-                // Feed all entries into the protocol before ticking, so the
-                // tick can batch them into a single FetchBatch output.
-                for (winner_tx_hash, reason) in entries {
-                    let outputs = self.inclusion_proof_fetch_protocol.handle(
-                        InclusionProofFetchInput::Request {
-                            source_shard,
-                            source_block_height,
-                            winner_tx_hash,
-                            reason,
-                            peers: peers.clone(),
-                            preferred_peer,
-                        },
-                    );
-                    self.process_inclusion_proof_fetch_outputs(outputs);
-                }
-                // Single tick dispatches all entries as one batch.
-                let tick_outputs =
-                    self.inclusion_proof_fetch_protocol
-                        .handle(InclusionProofFetchInput::Tick {
-                            now: std::time::Instant::now(),
-                        });
-                self.process_inclusion_proof_fetch_outputs(tick_outputs);
-                self.update_fetch_tick_timer();
             }
             Action::RequestMissingExecutionCert {
                 source_shard,

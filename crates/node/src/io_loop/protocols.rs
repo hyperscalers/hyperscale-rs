@@ -2,7 +2,6 @@
 
 use super::{IoLoop, TimerOp};
 use crate::protocol::execution_cert_fetch::ExecCertFetchOutput;
-use crate::protocol::inclusion_proof_fetch::InclusionProofFetchOutput;
 use crate::protocol::provision_fetch::ProvisionFetchOutput;
 use crate::protocol::sync::SyncOutput;
 use crate::protocol::transaction_fetch::TransactionFetchOutput;
@@ -222,102 +221,6 @@ where
         }
     }
 
-    /// Process InclusionProofFetchProtocol outputs.
-    ///
-    /// `FetchBatch` sends a batched network request for multiple proofs from the same block.
-    /// `Deliver` forwards the proof to the state machine for livelock processing.
-    pub(super) fn process_inclusion_proof_fetch_outputs(
-        &mut self,
-        outputs: Vec<InclusionProofFetchOutput>,
-    ) {
-        for output in outputs {
-            match output {
-                InclusionProofFetchOutput::FetchBatch {
-                    source_shard,
-                    block_height,
-                    entries,
-                    peer,
-                } => {
-                    use hyperscale_messages::request::GetTxInclusionProofRequest;
-                    let tx_hashes: Vec<_> = entries.iter().map(|(h, _)| *h).collect();
-                    let request = GetTxInclusionProofRequest {
-                        block_height,
-                        tx_hashes,
-                    };
-                    let sender = self.event_sender.clone();
-                    self.network.request(
-                        &[peer],
-                        None,
-                        request,
-                        Box::new(move |result| match result {
-                            Ok(response) => {
-                                // Build lookup map from response.
-                                let proof_map: std::collections::HashMap<_, _> = response
-                                    .proofs
-                                    .into_iter()
-                                    .map(|e| (e.tx_hash, e.proof))
-                                    .collect();
-
-                                // Fan out per-tx events.
-                                for (winner_tx_hash, reason) in entries {
-                                    match proof_map.get(&winner_tx_hash).and_then(|p| p.clone()) {
-                                        Some(proof) => {
-                                            let _ = sender.send(
-                                                NodeInput::InclusionProofFetchReceived {
-                                                    winner_tx_hash,
-                                                    reason,
-                                                    source_shard,
-                                                    source_block_height: block_height,
-                                                    proof,
-                                                },
-                                            );
-                                        }
-                                        None => {
-                                            let _ =
-                                                sender.send(NodeInput::InclusionProofFetchFailed {
-                                                    winner_tx_hash,
-                                                });
-                                        }
-                                    }
-                                }
-                            }
-                            Err(_) => {
-                                for (winner_tx_hash, _) in entries {
-                                    let _ = sender.send(NodeInput::InclusionProofFetchFailed {
-                                        winner_tx_hash,
-                                    });
-                                }
-                            }
-                        }),
-                    );
-                }
-                InclusionProofFetchOutput::Deliver {
-                    winner_tx_hash,
-                    reason,
-                    source_shard,
-                    source_block_height,
-                    proof,
-                } => {
-                    use hyperscale_core::InclusionProofFetchReason;
-                    let actions = match reason {
-                        InclusionProofFetchReason::Deferral { loser_tx_hash } => {
-                            self.state.on_inclusion_proof_received(
-                                winner_tx_hash,
-                                loser_tx_hash,
-                                source_shard,
-                                source_block_height,
-                                proof,
-                            )
-                        }
-                    };
-                    for action in actions {
-                        self.process_action(action);
-                    }
-                }
-            }
-        }
-    }
-
     /// Process ExecCertFetchProtocol outputs.
     ///
     /// `Fetch` sends a single-peer network request for execution certificates.
@@ -449,15 +352,9 @@ where
         let status = self.transaction_fetch_protocol.status();
         let has_fetch_work = status.pending_tx_blocks > 0;
         let has_provision_work = self.provision_fetch_protocol.has_pending();
-        let has_inclusion_proof_work = self.inclusion_proof_fetch_protocol.has_pending();
         let has_exec_cert_work = self.exec_cert_fetch_protocol.has_pending();
         let has_header_work = self.header_fetch_protocol.has_pending();
-        if has_fetch_work
-            || has_provision_work
-            || has_inclusion_proof_work
-            || has_exec_cert_work
-            || has_header_work
-        {
+        if has_fetch_work || has_provision_work || has_exec_cert_work || has_header_work {
             self.pending_timer_ops.push(TimerOp::Set {
                 id: TimerId::FetchTick,
                 duration: Self::FETCH_TICK_INTERVAL,

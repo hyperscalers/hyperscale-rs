@@ -420,8 +420,8 @@ pub fn compute_global_receipt_root_with_proof(
     let leaves: Vec<Hash> = outcomes.iter().map(tx_outcome_leaf).collect();
 
     let leaf_hash = leaves[tx_index];
-    let (root, proof) = crate::compute_merkle_root_with_proof(&leaves, tx_index);
-    (root, proof.siblings, proof.leaf_index, leaf_hash)
+    let (root, siblings, leaf_index) = crate::compute_merkle_root_with_proof(&leaves, tx_index);
+    (root, siblings, leaf_index, leaf_hash)
 }
 
 // ============================================================================
@@ -733,12 +733,8 @@ mod tests {
             let expected_leaf = tx_outcome_leaf(&outcomes[i]);
             assert_eq!(leaf_hash, expected_leaf, "Leaf hash mismatch for index {i}");
 
-            let inclusion = crate::TransactionInclusionProof {
-                siblings,
-                leaf_index,
-            };
             assert!(
-                crate::verify_merkle_inclusion(root, leaf_hash, &inclusion),
+                crate::verify_merkle_inclusion(root, leaf_hash, &siblings, leaf_index),
                 "Proof failed for index {i}"
             );
         }

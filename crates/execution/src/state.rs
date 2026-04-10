@@ -32,10 +32,10 @@
 
 use hyperscale_core::{Action, CrossShardExecutionRequest, ProtocolEvent, ProvisionRequest};
 use hyperscale_types::{
-    BlockHeight, Bls12381G1PublicKey, Conflict, ExecutionCertificate, ExecutionOutcome,
-    ExecutionVote, Hash, LocalExecutionEntry, LocalReceipt, ProvisionBatch, ReceiptBundle,
-    RoutableTransaction, ShardGroupId, StateProvision, TopologySnapshot, TransactionDecision,
-    TxOutcome, ValidatorId, WaveCertificate, WaveId,
+    BlockHeight, Bls12381G1PublicKey, ExecutionCertificate, ExecutionOutcome, ExecutionVote, Hash,
+    LocalExecutionEntry, LocalReceipt, ProvisionBatch, ReceiptBundle, RoutableTransaction,
+    ShardGroupId, StateProvision, TopologySnapshot, TransactionDecision, TxOutcome, ValidatorId,
+    WaveCertificate, WaveId,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -671,15 +671,6 @@ impl ExecutionState {
 
     /// Record conflicts from a committed block into execution accumulators.
     ///
-    /// `committed_at_height` is the local block height at which these conflicts
-    /// were committed. Used for height-indexed abort tracking in the re-voting
-    /// protocol.
-    pub fn record_conflicts(&mut self, conflicts: &[Conflict], committed_at_height: u64) {
-        for conflict in conflicts {
-            self.record_conflict(conflict.tx_hash, committed_at_height);
-        }
-    }
-
     /// Apply provisions committed in a block to execution accumulators.
     ///
     /// Called during `on_block_committed` with the provision batches from the
