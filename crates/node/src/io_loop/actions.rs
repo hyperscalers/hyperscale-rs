@@ -833,7 +833,6 @@ where
                 source_shard,
                 block_height,
                 wave_id,
-                designated_broadcaster,
                 peers,
             } => {
                 debug!(
@@ -849,7 +848,6 @@ where
                         source_shard,
                         block_height,
                         wave_id,
-                        designated_broadcaster,
                         peers,
                     });
                 self.process_exec_cert_fetch_outputs(outputs);
