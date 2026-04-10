@@ -252,26 +252,10 @@ pub fn verify_local_receipt_root(expected_root: Hash, receipts: &[ReceiptBundle]
 ///
 /// Returns `true` only if ALL proofs are valid.
 pub fn verify_conflict_proofs(proof_inputs: &[(Conflict, Hash)]) -> bool {
-    use hyperscale_types::verify_merkle_inclusion;
-
-    for (conflict, transaction_root) in proof_inputs {
-        // The winner_tx_hash is used directly as the leaf hash in the
-        // transaction merkle tree (see compute_transaction_root).
-        if !verify_merkle_inclusion(
-            *transaction_root,
-            conflict.winner_tx_hash,
-            &conflict.tx_inclusion_proof,
-        ) {
-            tracing::warn!(
-                loser_tx = %conflict.tx_hash,
-                winner_tx = %conflict.winner_tx_hash,
-                transaction_root = ?transaction_root,
-                "Conflict inclusion proof verification FAILED"
-            );
-            return false;
-        }
-    }
-
+    // Inclusion proof verification removed — conflicts are now derived
+    // deterministically from committed provisions. All validators derive
+    // the same conflicts from the same committed chain state.
+    let _ = proof_inputs;
     true
 }
 

@@ -436,6 +436,18 @@ impl NodeStateMachine {
                 .on_block_committed(self.topology.snapshot(), &block),
         );
 
+        // Apply committed provisions deterministically. All validators process
+        // the same provision batches at the same height, making target_vote_height
+        // a pure function of committed chain state.
+        let manifest = BlockManifest::from_block(&block);
+        if !manifest.provision_batch_hashes.is_empty() {
+            let committed_provisions = self
+                .provisions
+                .get_batches_by_hash(&manifest.provision_batch_hashes);
+            self.execution
+                .apply_committed_provisions(&committed_provisions);
+        }
+
         // Round voting: scan all incomplete waves and emit votes for complete ones.
         // This is the SINGLE path to execution voting. Abort intents have already
         // been processed above (with override semantics), so the accumulator state
