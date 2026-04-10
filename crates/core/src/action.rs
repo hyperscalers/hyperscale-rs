@@ -743,6 +743,19 @@ pub enum Action {
         tx_hashes: Vec<Hash>,
     },
 
+    /// Fetch missing provision data for a pending block (pre-BFT-vote).
+    ///
+    /// Same pattern as FetchTransactions: block header arrives, some provision
+    /// batch hashes aren't in the local cache, fetch from proposer or local peers.
+    FetchCommittedProvisions {
+        /// Hash of the block that needs these provisions.
+        block_hash: Hash,
+        /// The proposer of the block (preferred fetch target).
+        proposer: ValidatorId,
+        /// Hashes of the missing provision batches.
+        batch_hashes: Vec<Hash>,
+    },
+
     /// Cancel any pending fetch operations for a block.
     ///
     /// Emitted when a pending block is removed from BFT state (committed, stale,
@@ -899,6 +912,7 @@ impl Action {
             // Runner I/O Requests
             Action::StartSync { .. } => "StartSync",
             Action::FetchTransactions { .. } => "FetchTransactions",
+            Action::FetchCommittedProvisions { .. } => "FetchCommittedProvisions",
             Action::CancelFetch { .. } => "CancelFetch",
             Action::RequestMissingProvisions { .. } => "RequestMissingProvisions",
             Action::RequestMissingExecutionCert { .. } => "RequestMissingExecutionCert",
