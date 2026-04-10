@@ -488,7 +488,7 @@ impl ExecutionState {
             return;
         };
 
-        accumulator.record_abort(tx_hash, committed_at_height, true);
+        accumulator.record_abort(tx_hash, committed_at_height);
     }
 
     /// Scan all waves and return completion data for any that can emit a vote.
@@ -1495,28 +1495,6 @@ impl ExecutionState {
         _topology: &TopologySnapshot,
         ec: Arc<ExecutionCertificate>,
     ) -> Vec<Action> {
-        // Propagate remote abort decisions into local accumulators.
-        //
-        // If a remote shard's EC says a tx is aborted, the local shard should
-        // also treat it as aborted. This prevents a deadlock where:
-        // - Shard A aborted a tx (livelock) and produced an EC with abort
-        // - Shard B never got provisions for that tx and has no local abort intent
-        // - Shard B's accumulator is stuck (tx uncoverable) → can never vote → no EC
-        // - Shard A's wave cert tracker waits for Shard B's EC forever
-        //
-        // The remote EC is BFT-agreed, so all local validators see the same
-        // abort reason → deterministic vote data.
-        for outcome in &ec.tx_outcomes {
-            if outcome.is_aborted() {
-                if let Some(wave_id) = self.wave_assignments.get(&outcome.tx_hash).cloned() {
-                    if let Some(acc) = self.accumulators.get_mut(&wave_id) {
-                        let committed_at = acc.block_height();
-                        acc.record_abort(outcome.tx_hash, committed_at, false);
-                    }
-                }
-            }
-        }
-
         // Find all local waves affected by this EC's tx_outcomes.
         let mut affected_waves: BTreeSet<WaveId> = BTreeSet::new();
         let mut has_unrouted = false;
