@@ -3834,6 +3834,22 @@ impl BftState {
                 });
             }
 
+            // Re-request still-missing provisions
+            let missing_provisions = pending.missing_provisions();
+            if !missing_provisions.is_empty() {
+                warn!(
+                    validator = ?validator_id,
+                    block_hash = ?block_hash,
+                    still_missing = missing_provisions.len(),
+                    "Re-requesting remaining missing provisions"
+                );
+                actions.push(Action::FetchCommittedProvisions {
+                    block_hash,
+                    proposer,
+                    batch_hashes: missing_provisions,
+                });
+            }
+
             return actions;
         }
 
@@ -4144,6 +4160,23 @@ impl BftState {
                     block_hash: *block_hash,
                     proposer,
                     tx_hashes: missing_txs,
+                });
+            }
+
+            // Check if we should fetch missing provisions
+            let missing_provisions = pending.missing_provisions();
+            if !missing_provisions.is_empty() && age >= tx_timeout {
+                debug!(
+                    validator = ?topology.local_validator_id(),
+                    block_hash = ?block_hash,
+                    missing_provision_count = missing_provisions.len(),
+                    age_ms = age.as_millis(),
+                    "Fetch timeout reached, requesting missing provisions"
+                );
+                actions.push(Action::FetchCommittedProvisions {
+                    block_hash: *block_hash,
+                    proposer,
+                    batch_hashes: missing_provisions,
                 });
             }
 

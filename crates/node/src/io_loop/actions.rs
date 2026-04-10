@@ -279,6 +279,7 @@ where
             // ═══════════════════════════════════════════════════════════
             Action::StartSync { .. }
             | Action::FetchTransactions { .. }
+            | Action::FetchCommittedProvisions { .. }
             | Action::CancelFetch { .. }
             | Action::RequestMissingProvisions { .. }
             | Action::RequestMissingExecutionCert { .. }
@@ -744,6 +745,21 @@ where
                     .handle(TransactionFetchInput::Tick);
                 self.process_transaction_fetch_outputs(outputs);
                 self.update_fetch_tick_timer();
+            }
+            Action::FetchCommittedProvisions {
+                block_hash,
+                proposer,
+                batch_hashes,
+            } => {
+                debug!(
+                    block_hash = ?block_hash,
+                    proposer = proposer.0,
+                    batch_count = batch_hashes.len(),
+                    "Fetching committed provisions for pending block (TODO: wire protocol)"
+                );
+                // TODO: Wire up CommittedProvisionFetchProtocol (mirrors TransactionFetchProtocol).
+                // For now, provisions arrive via normal gossip flow before the block.
+                let _ = (block_hash, proposer, batch_hashes);
             }
             Action::CancelFetch { block_hash } => {
                 self.transaction_fetch_protocol
