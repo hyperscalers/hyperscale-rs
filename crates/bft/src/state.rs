@@ -5393,10 +5393,6 @@ mod tests {
             winner_tx_hash: winner_hash,
             source_shard: hyperscale_types::ShardGroupId(1),
             source_block_height: BlockHeight(5),
-            tx_inclusion_proof: hyperscale_types::TransactionInclusionProof {
-                siblings: vec![Hash::from_bytes(b"sib1")],
-                leaf_index: 0,
-            },
             block_height: BlockHeight(10),
         };
         let block = make_test_block(10, vec![valid_conflict], vec![]);
@@ -5408,10 +5404,6 @@ mod tests {
             winner_tx_hash: loser_hash,
             source_shard: hyperscale_types::ShardGroupId(1),
             source_block_height: BlockHeight(5),
-            tx_inclusion_proof: hyperscale_types::TransactionInclusionProof {
-                siblings: vec![Hash::from_bytes(b"sib1")],
-                leaf_index: 0,
-            },
             block_height: BlockHeight(10),
         };
         let block = make_test_block(10, vec![invalid_conflict], vec![]);
@@ -6820,10 +6812,6 @@ mod tests {
             winner_tx_hash: Hash::from_bytes(b"aaawinner"),
             source_shard: ShardGroupId(1),
             source_block_height: BlockHeight(1),
-            tx_inclusion_proof: hyperscale_types::TransactionInclusionProof {
-                siblings: vec![],
-                leaf_index: 0,
-            },
             block_height: BlockHeight(0),
         };
 

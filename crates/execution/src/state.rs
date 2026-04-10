@@ -33,9 +33,9 @@
 use hyperscale_core::{Action, CrossShardExecutionRequest, ProtocolEvent, ProvisionRequest};
 use hyperscale_types::{
     BlockHeight, Bls12381G1PublicKey, Conflict, ExecutionCertificate, ExecutionOutcome,
-    ExecutionVote, Hash, LocalExecutionEntry, LocalReceipt, ReceiptBundle, RoutableTransaction,
-    ShardGroupId, StateProvision, TopologySnapshot, TransactionDecision, TxOutcome, ValidatorId,
-    WaveCertificate, WaveId,
+    ExecutionVote, Hash, LocalExecutionEntry, LocalReceipt, ProvisionBatch, ReceiptBundle,
+    RoutableTransaction, ShardGroupId, StateProvision, TopologySnapshot, TransactionDecision,
+    TxOutcome, ValidatorId, WaveCertificate, WaveId,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -177,6 +177,11 @@ pub struct ExecutionState {
     /// ECs that arrived before the wave tracker was created.
     early_wave_attestations: Vec<(Arc<ExecutionCertificate>, u64)>,
 
+    /// Tx hashes from committed provision batches whose transactions haven't
+    /// been committed yet (no wave assignment). Replayed in setup_execution_tracking
+    /// to mark provisioned when the accumulator is created.
+    early_committed_provisions: HashSet<Hash>,
+
     // ═══════════════════════════════════════════════════════════════════════
     // Expected Execution Certificate Tracking (Fallback Detection)
     // ═══════════════════════════════════════════════════════════════════════
@@ -236,6 +241,7 @@ impl ExecutionState {
             early_execution_results: HashMap::new(),
             verified_provisions: HashMap::new(),
             early_wave_attestations: Vec::new(),
+            early_committed_provisions: HashSet::new(),
             pending_wave_receipts: HashMap::new(),
             expected_exec_certs: HashMap::new(),
             fulfilled_exec_certs: HashMap::new(),
@@ -361,6 +367,14 @@ impl ExecutionState {
             // Single-shard txs are always provisioned (no remote state needed).
             if wave_id.is_zero() {
                 for tx_hash in accumulator.tx_hashes() {
+                    accumulator.mark_provisioned(tx_hash);
+                }
+            }
+
+            // Replay early committed provisions: provisions committed in a previous
+            // block whose tx wasn't committed yet at that time.
+            for tx_hash in accumulator.tx_hashes() {
+                if self.early_committed_provisions.remove(&tx_hash) {
                     accumulator.mark_provisioned(tx_hash);
                 }
             }
@@ -663,6 +677,27 @@ impl ExecutionState {
     pub fn record_conflicts(&mut self, conflicts: &[Conflict], committed_at_height: u64) {
         for conflict in conflicts {
             self.record_conflict(conflict.tx_hash, committed_at_height);
+        }
+    }
+
+    /// Apply provisions committed in a block to execution accumulators.
+    ///
+    /// Called during `on_block_committed` with the provision batches from the
+    /// committed block. All validators have this data (fetched before BFT vote).
+    /// Marks transactions as provisioned deterministically at commit time.
+    pub fn apply_committed_provisions(&mut self, batches: &[Arc<ProvisionBatch>]) {
+        for batch in batches {
+            for tx_entry in &batch.transactions {
+                let tx_hash = tx_entry.tx_hash;
+                if let Some(wave_key) = self.wave_assignments.get(&tx_hash).cloned() {
+                    if let Some(acc) = self.accumulators.get_mut(&wave_key) {
+                        acc.mark_provisioned(tx_hash);
+                    }
+                } else {
+                    // Tx not committed yet — buffer for replay when accumulator is created.
+                    self.early_committed_provisions.insert(tx_hash);
+                }
+            }
         }
     }
 

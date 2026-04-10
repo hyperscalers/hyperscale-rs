@@ -101,6 +101,10 @@ pub struct ProvisionCoordinator {
     /// Stored whole after proof verification — no per-tx decomposition.
     verified_batches: BTreeMap<(ShardGroupId, BlockHeight), Arc<ProvisionBatch>>,
 
+    /// Hash-keyed cache of verified batches for DA lookups at commit time.
+    /// Populated alongside verified_batches. Used by `get_batches_by_hash()`.
+    batches_by_hash: HashMap<Hash, Arc<ProvisionBatch>>,
+
     // ═══════════════════════════════════════════════════════════════════
     // Expected Provision Tracking (fallback detection)
     // ═══════════════════════════════════════════════════════════════════
@@ -151,6 +155,7 @@ impl ProvisionCoordinator {
             verified_remote_headers: HashMap::new(),
             pending_provisions: HashMap::new(),
             verified_batches: BTreeMap::new(),
+            batches_by_hash: HashMap::new(),
             local_committed_height: BlockHeight(0),
             expected_provisions: BTreeMap::new(),
             queued_provision_batches: Vec::new(),
@@ -443,6 +448,8 @@ impl ProvisionCoordinator {
         let batch_key = (source_shard, batch.block_height);
         let batch = Arc::new(batch);
         self.verified_batches.insert(batch_key, Arc::clone(&batch));
+        self.batches_by_hash
+            .insert(batch.hash(), Arc::clone(&batch));
 
         // Queue for inclusion in the next block proposal.
         self.queued_provision_batches.push(Arc::clone(&batch));
@@ -495,6 +502,17 @@ impl ProvisionCoordinator {
     // ═══════════════════════════════════════════════════════════════════════
     // Query Methods (for other modules)
     // ═══════════════════════════════════════════════════════════════════════
+
+    /// Look up provision batches by their content hashes.
+    ///
+    /// Used at block commit time to retrieve the provision data committed in a block.
+    /// Returns only batches found in the cache (all should be present due to DA guarantee).
+    pub fn get_batches_by_hash(&self, batch_hashes: &[Hash]) -> Vec<Arc<ProvisionBatch>> {
+        batch_hashes
+            .iter()
+            .filter_map(|h| self.batches_by_hash.get(h).cloned())
+            .collect()
+    }
 
     /// Drain queued provision batches for inclusion in the next block proposal.
     pub fn drain_queued_provisions(&mut self) -> Vec<Arc<ProvisionBatch>> {

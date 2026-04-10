@@ -1,6 +1,6 @@
 //! Transaction types for consensus.
 
-use crate::{BlockHeight, Hash, NodeId, ShardGroupId, TransactionInclusionProof};
+use crate::{BlockHeight, Hash, NodeId, ShardGroupId};
 use radix_common::data::manifest::{manifest_decode, manifest_encode};
 use radix_transactions::model::{UserTransaction, ValidatedUserTransaction};
 use radix_transactions::validation::TransactionValidator;
@@ -314,9 +314,6 @@ pub struct Conflict {
 
     /// Block height on the source shard that proves the cycle.
     pub source_block_height: BlockHeight,
-
-    /// Merkle inclusion proof for the winner transaction in the source block.
-    pub tx_inclusion_proof: TransactionInclusionProof,
 }
 
 impl std::fmt::Display for Conflict {

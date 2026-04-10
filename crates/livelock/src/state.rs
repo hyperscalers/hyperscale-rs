@@ -427,7 +427,7 @@ impl LivelockState {
         winner_tx: Hash,
         source_shard: ShardGroupId,
         source_block_height: BlockHeight,
-        proof: TransactionInclusionProof,
+        _proof: TransactionInclusionProof,
     ) {
         // Check if already queued
         if self.pending_conflict_hashes.contains(&loser_tx) {
@@ -441,7 +441,6 @@ impl LivelockState {
             winner_tx_hash: winner_tx,
             source_shard,
             source_block_height,
-            tx_inclusion_proof: proof,
         };
 
         debug!(
@@ -719,7 +718,6 @@ mod tests {
             winner_tx_hash: winner,
             source_shard: ShardGroupId(1),
             source_block_height: BlockHeight(1),
-            tx_inclusion_proof: dummy_proof(),
         }
     }
 
@@ -1058,7 +1056,6 @@ mod tests {
             winner_tx_hash: Hash::from_bytes(b"dummy_winner"),
             source_shard: ShardGroupId(1),
             source_block_height: BlockHeight(1),
-            tx_inclusion_proof: dummy_proof(),
         };
 
         let block = hyperscale_types::Block {
