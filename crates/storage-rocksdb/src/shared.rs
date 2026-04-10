@@ -112,7 +112,7 @@ impl SubstateStore for SharedStorage {
         &self,
         storage_keys: &[Vec<u8>],
         block_height: u64,
-    ) -> Option<hyperscale_types::SubstateInclusionProof> {
+    ) -> Option<hyperscale_types::VerkleInclusionProof> {
         self.0.generate_verkle_proofs(storage_keys, block_height)
     }
 }

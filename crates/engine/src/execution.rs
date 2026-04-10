@@ -8,7 +8,7 @@
 
 use hyperscale_storage::keys;
 use hyperscale_types::{
-    ApplicationEvent, ExecutionOutput, FeeSummary, LocalReceipt, LogLevel, StateEntry,
+    ApplicationEvent, ExecutionMetadata, FeeSummary, LocalReceipt, LogLevel, StateEntry,
     TransactionOutcome,
 };
 use radix_engine::transaction::{
@@ -92,8 +92,8 @@ pub fn build_local_receipt<S: radix_substate_store_interface::interface::Substat
     }
 }
 
-/// Build `ExecutionOutput` from a Radix Engine receipt.
-pub fn build_execution_output(receipt: &TransactionReceipt) -> ExecutionOutput {
+/// Build `ExecutionMetadata` from a Radix Engine receipt.
+pub fn build_execution_metadata(receipt: &TransactionReceipt) -> ExecutionMetadata {
     let fee_summary = build_fee_summary(receipt);
 
     let (log_messages, error_message) = match &receipt.result {
@@ -115,7 +115,7 @@ pub fn build_execution_output(receipt: &TransactionReceipt) -> ExecutionOutput {
         TransactionResult::Abort(abort) => (vec![], Some(format!("{:?}", abort.reason))),
     };
 
-    ExecutionOutput {
+    ExecutionMetadata {
         fee_summary,
         log_messages,
         error_message,
@@ -505,26 +505,26 @@ mod tests {
         assert_eq!(ledger_a.receipt_hash(), ledger_b.receipt_hash());
     }
 
-    // ─── Tests: build_execution_output ───────────────────────────────────
+    // ─── Tests: build_execution_metadata ───────────────────────────────────
 
     #[test]
-    fn test_build_execution_output_success_no_error() {
+    fn test_build_execution_metadata_success_no_error() {
         let receipt = TransactionReceipt::empty_commit_success();
-        let local = build_execution_output(&receipt);
+        let local = build_execution_metadata(&receipt);
 
         assert!(local.error_message.is_none());
         assert!(local.log_messages.is_empty());
     }
 
     #[test]
-    fn test_build_execution_output_with_logs() {
+    fn test_build_execution_metadata_with_logs() {
         use radix_engine_interface::types::Level;
         let receipt = make_success_receipt_with_logs(vec![
             (Level::Info, "hello world".to_string()),
             (Level::Error, "something broke".to_string()),
             (Level::Debug, "debug info".to_string()),
         ]);
-        let local = build_execution_output(&receipt);
+        let local = build_execution_metadata(&receipt);
 
         assert_eq!(local.log_messages.len(), 3);
         assert_eq!(
@@ -543,27 +543,27 @@ mod tests {
     }
 
     #[test]
-    fn test_build_execution_output_reject_has_error() {
+    fn test_build_execution_metadata_reject_has_error() {
         let receipt = make_reject_receipt();
-        let local = build_execution_output(&receipt);
+        let local = build_execution_metadata(&receipt);
 
         assert!(local.error_message.is_some());
         assert!(local.log_messages.is_empty());
     }
 
     #[test]
-    fn test_build_execution_output_abort_has_error() {
+    fn test_build_execution_metadata_abort_has_error() {
         let receipt = make_abort_receipt();
-        let local = build_execution_output(&receipt);
+        let local = build_execution_metadata(&receipt);
 
         assert!(local.error_message.is_some());
         assert!(local.log_messages.is_empty());
     }
 
     #[test]
-    fn test_build_execution_output_fees_are_encoded() {
+    fn test_build_execution_metadata_fees_are_encoded() {
         let receipt = TransactionReceipt::empty_commit_success();
-        let local = build_execution_output(&receipt);
+        let local = build_execution_metadata(&receipt);
 
         // Default fee summary has zero Decimals, which still SBOR-encode to non-empty bytes.
         assert!(

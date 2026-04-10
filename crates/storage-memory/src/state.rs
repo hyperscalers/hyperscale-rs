@@ -9,7 +9,7 @@ use hyperscale_storage::{
     StateRootHash,
 };
 use hyperscale_types::{
-    Block, BlockHeight, ExecutionCertificate, ExecutionOutput, Hash, LocalReceipt,
+    Block, BlockHeight, ExecutionCertificate, ExecutionMetadata, Hash, LocalReceipt,
     QuorumCertificate, RoutableTransaction, ShardGroupId, WaveCertificate,
 };
 use im::OrdMap;
@@ -123,7 +123,7 @@ pub(crate) struct ConsensusState {
     /// Local receipts keyed by transaction hash.
     pub local_receipts: HashMap<Hash, Arc<LocalReceipt>>,
     /// Execution output details keyed by transaction hash.
-    pub execution_outputs: HashMap<Hash, ExecutionOutput>,
+    pub execution_outputs: HashMap<Hash, ExecutionMetadata>,
     /// Insertion height for each receipt, enabling height-based pruning.
     pub receipt_heights: HashMap<Hash, u64>,
     /// Execution certificates keyed by canonical hash.

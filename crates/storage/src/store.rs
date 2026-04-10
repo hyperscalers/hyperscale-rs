@@ -2,7 +2,7 @@
 //!
 //! This module defines the storage abstraction used by runners to persist Radix state.
 
-use hyperscale_types::{Hash, NodeId, SubstateInclusionProof};
+use hyperscale_types::{Hash, NodeId, VerkleInclusionProof};
 use radix_substate_store_interface::interface::{DbSortKey, SubstateDatabase};
 
 /// Extension trait for substate storage with snapshots, node listing, and JVT state roots.
@@ -72,5 +72,5 @@ pub trait SubstateStore: SubstateDatabase + Send + Sync {
         &self,
         storage_keys: &[Vec<u8>],
         block_height: u64,
-    ) -> Option<SubstateInclusionProof>;
+    ) -> Option<VerkleInclusionProof>;
 }

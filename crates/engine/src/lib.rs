@@ -42,7 +42,7 @@ pub mod sharding;
 pub use execution::ProvisionedSnapshot;
 pub use executor::{fetch_state_entries, RadixExecutor};
 pub use genesis::GenesisConfig;
-pub use hyperscale_types::ExecutionResult;
+pub use hyperscale_types::LocalExecutionEntry;
 pub use result::SingleTxResult;
 pub use validation::TransactionValidation;
 

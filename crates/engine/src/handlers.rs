@@ -9,7 +9,7 @@
 use crate::sharding;
 use crate::{RadixExecutor, SingleTxResult};
 use hyperscale_storage::SubstateStore;
-use hyperscale_types::{Hash, RoutableTransaction, ShardGroupId, TxExecutionOutcome, TxOutcome};
+use hyperscale_types::{ExecutionOutcome, Hash, RoutableTransaction, ShardGroupId, TxOutcome};
 use std::sync::Arc;
 
 /// Execute a single-shard transaction with shard filtering.
@@ -81,7 +81,7 @@ pub fn extract_execution_result(result: &SingleTxResult) -> TxOutcome {
     let write_nodes = sharding::extract_write_nodes(&result.local_receipt.database_updates);
     TxOutcome {
         tx_hash: result.tx_hash,
-        outcome: TxExecutionOutcome::Executed {
+        outcome: ExecutionOutcome::Executed {
             receipt_hash: result.receipt_hash,
             success: result.success,
             write_nodes,

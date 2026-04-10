@@ -71,7 +71,7 @@ impl RocksDbStorage {
     pub fn get_execution_output(
         &self,
         tx_hash: &Hash,
-    ) -> Option<hyperscale_types::ExecutionOutput> {
+    ) -> Option<hyperscale_types::ExecutionMetadata> {
         self.cf_get::<ExecutionOutputsCf>(tx_hash)
     }
 }

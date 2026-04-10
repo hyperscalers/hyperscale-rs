@@ -10,9 +10,9 @@ use crate::{
 };
 use hyperscale_types::{
     zero_bls_signature, ApplicationEvent, Block, BlockHeader, BlockHeight, Bls12381G2Signature,
-    ExecutionCertificate, ExecutionOutput, FeeSummary, Hash, LocalReceipt, LogLevel, NodeId,
-    QuorumCertificate, ReceiptBundle, ShardGroupId, SignerBitfield, TransactionOutcome,
-    TxExecutionOutcome, TxOutcome, ValidatorId, WaveCertificate, WaveId,
+    ExecutionCertificate, ExecutionMetadata, ExecutionOutcome, FeeSummary, Hash, LocalReceipt,
+    LogLevel, NodeId, QuorumCertificate, ReceiptBundle, ShardGroupId, SignerBitfield,
+    TransactionOutcome, TxOutcome, ValidatorId, WaveCertificate, WaveId,
 };
 use radix_common::prelude::DatabaseUpdate;
 use radix_substate_store_interface::db_key_mapper::{DatabaseKeyMapper, SpreadPrefixKeyMapper};
@@ -135,7 +135,7 @@ pub fn make_test_receipt_bundle(seed: u8) -> ReceiptBundle {
             data: vec![seed, seed + 1],
         }],
     });
-    let execution_output = Some(ExecutionOutput {
+    let execution_output = Some(ExecutionMetadata {
         fee_summary: FeeSummary {
             total_execution_cost: vec![seed],
             total_royalty_cost: vec![],
@@ -165,7 +165,7 @@ pub fn make_test_execution_certificate(seed: u8, block_height: u64) -> Execution
         global_receipt_root: Hash::from_bytes(&[seed + 50; 32]),
         tx_outcomes: vec![TxOutcome {
             tx_hash: Hash::from_bytes(&[seed + 100; 32]),
-            outcome: TxExecutionOutcome::Executed {
+            outcome: ExecutionOutcome::Executed {
                 receipt_hash: Hash::from_bytes(&[seed + 150; 32]),
                 success: true,
                 write_nodes: vec![],

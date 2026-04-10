@@ -1,6 +1,6 @@
 //! Execution result types.
 
-use hyperscale_types::{ExecutionResult, Hash, LocalReceipt};
+use hyperscale_types::{Hash, LocalExecutionEntry, LocalReceipt};
 /// Output from executing a batch of transactions.
 #[derive(Debug, Clone)]
 pub struct ExecutionOutput {
@@ -57,7 +57,7 @@ pub struct SingleTxResult {
     pub local_receipt: LocalReceipt,
 
     /// Local execution metadata (fees, logs, errors).
-    pub execution_output: hyperscale_types::ExecutionOutput,
+    pub execution_output: hyperscale_types::ExecutionMetadata,
 
     /// Error message if execution failed.
     pub error: Option<String>,
@@ -69,7 +69,7 @@ impl SingleTxResult {
         tx_hash: Hash,
         receipt_hash: Hash,
         local_receipt: LocalReceipt,
-        execution_output: hyperscale_types::ExecutionOutput,
+        execution_output: hyperscale_types::ExecutionMetadata,
     ) -> Self {
         Self {
             tx_hash,
@@ -93,7 +93,7 @@ impl SingleTxResult {
             success: false,
             receipt_hash,
             local_receipt,
-            execution_output: hyperscale_types::ExecutionOutput::failure(None),
+            execution_output: hyperscale_types::ExecutionMetadata::failure(None),
             error: Some(error.into()),
         }
     }
@@ -109,10 +109,10 @@ impl SingleTxResult {
     }
 }
 
-// ExecutionResult is defined in hyperscale_types::receipt and re-exported
+// LocalExecutionEntry is defined in hyperscale_types::receipt and re-exported
 // from hyperscale_types. The engine crate re-exports it from lib.rs.
 
-impl From<SingleTxResult> for ExecutionResult {
+impl From<SingleTxResult> for LocalExecutionEntry {
     fn from(r: SingleTxResult) -> Self {
         Self {
             tx_hash: r.tx_hash,

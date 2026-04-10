@@ -191,7 +191,7 @@ pub enum ProtocolEvent {
     /// 1. Store pending execution updates (co-located with TC at finalization)
     /// 2. Store receipts in receipt_cache for later finalized wave assembly
     ExecutionBatchCompleted {
-        results: Vec<hyperscale_types::ExecutionResult>,
+        results: Vec<hyperscale_types::LocalExecutionEntry>,
         /// Per-tx outcomes extracted on the handler thread for vote signing.
         tx_outcomes: Vec<TxOutcome>,
     },

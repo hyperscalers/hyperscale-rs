@@ -177,7 +177,7 @@ where
                                 Some(provisions) => {
                                     // Build a ProvisionBatch from the response.
                                     let proof = response.proof.unwrap_or_else(
-                                        hyperscale_types::SubstateInclusionProof::dummy,
+                                        hyperscale_types::VerkleInclusionProof::dummy,
                                     );
                                     let transactions: Vec<hyperscale_types::TxEntries> = provisions
                                         .into_iter()

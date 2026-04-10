@@ -92,7 +92,7 @@ impl SubstateStore for RocksDbStorage {
         &self,
         storage_keys: &[Vec<u8>],
         block_height: u64,
-    ) -> Option<hyperscale_types::SubstateInclusionProof> {
+    ) -> Option<hyperscale_types::VerkleInclusionProof> {
         // Use a RocksDB snapshot for all reads so concurrent JVT GC cannot
         // delete nodes mid-proof-generation.
         let snapshot_store = SnapshotTreeStore::new(&self.db, &self.node_cache);

@@ -5,8 +5,8 @@
 //! the same provision dependency set within a block).
 
 use hyperscale_types::{
-    ExecutionCertificate, Hash, ShardAttestation, ShardGroupId, TransactionDecision, TxDecision,
-    TxExecutionOutcome, WaveCertificate, WaveId,
+    ExecutionCertificate, ExecutionOutcome, Hash, ShardAttestation, ShardGroupId,
+    TransactionDecision, WaveCertificate, WaveId,
 };
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
@@ -197,7 +197,7 @@ impl WaveCertificateTracker {
         self.aborted.contains(tx_hash)
     }
 
-    pub fn tx_decisions(&self) -> Vec<TxDecision> {
+    pub fn tx_decisions(&self) -> Vec<(Hash, TransactionDecision)> {
         self.tx_hashes
             .iter()
             .map(|tx_hash| {
@@ -212,10 +212,7 @@ impl WaveCertificateTracker {
                         .iter()
                         .filter_map(|ec| ec.tx_outcomes.iter().find(|o| o.tx_hash == *tx_hash))
                         .all(|o| {
-                            matches!(
-                                o.outcome,
-                                TxExecutionOutcome::Executed { success: true, .. }
-                            )
+                            matches!(o.outcome, ExecutionOutcome::Executed { success: true, .. })
                         });
                     if all_succeeded {
                         TransactionDecision::Accept
@@ -223,10 +220,7 @@ impl WaveCertificateTracker {
                         TransactionDecision::Reject
                     }
                 };
-                TxDecision {
-                    tx_hash: *tx_hash,
-                    decision,
-                }
+                (*tx_hash, decision)
             })
             .collect()
     }
@@ -258,13 +252,13 @@ mod tests {
             .map(|h| TxOutcome {
                 tx_hash: *h,
                 outcome: if success {
-                    TxExecutionOutcome::Executed {
+                    ExecutionOutcome::Executed {
                         receipt_hash: Hash::from_bytes(b"receipt"),
                         success: true,
                         write_nodes: vec![],
                     }
                 } else {
-                    TxExecutionOutcome::Aborted
+                    ExecutionOutcome::Aborted
                 },
             })
             .collect();
@@ -324,9 +318,7 @@ mod tests {
 
         let decisions = tracker.tx_decisions();
         assert_eq!(decisions.len(), 2);
-        assert!(decisions
-            .iter()
-            .all(|d| d.decision == TransactionDecision::Accept));
+        assert!(decisions.iter().all(|d| d.1 == TransactionDecision::Accept));
     }
 
     #[test]
@@ -349,6 +341,6 @@ mod tests {
         tracker.add_execution_certificate(ec_remote);
 
         let decisions = tracker.tx_decisions();
-        assert_eq!(decisions[0].decision, TransactionDecision::Aborted);
+        assert_eq!(decisions[0].1, TransactionDecision::Aborted);
     }
 }

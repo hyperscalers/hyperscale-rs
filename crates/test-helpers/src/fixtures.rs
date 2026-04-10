@@ -6,8 +6,7 @@
 use crate::TestCommittee;
 use hyperscale_types::{
     block_vote_message, verify_bls12381_v1, BlockHeight, BlockVote, Bls12381G1PublicKey,
-    Bls12381G2Signature, Hash, QuorumCertificate, ShardExecutionProof, ShardGroupId,
-    SignerBitfield,
+    Bls12381G2Signature, ExecutionOutcome, Hash, QuorumCertificate, ShardGroupId, SignerBitfield,
 };
 
 /// Create a properly-signed block vote.
@@ -132,8 +131,8 @@ pub fn make_signed_qc(
 /// Create a shard execution proof for testing.
 ///
 /// Simple proof with no BLS signatures (execution certificates handle signatures).
-pub fn make_shard_execution_proof(receipt_hash: Hash, success: bool) -> ShardExecutionProof {
-    ShardExecutionProof::Executed {
+pub fn make_shard_execution_proof(receipt_hash: Hash, success: bool) -> ExecutionOutcome {
+    ExecutionOutcome::Executed {
         receipt_hash,
         success,
         write_nodes: vec![],

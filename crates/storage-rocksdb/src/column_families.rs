@@ -7,8 +7,8 @@ use crate::typed_cf::*;
 
 use crate::jvt_stored::{StoredNodeKey, VersionedStoredNode};
 use hyperscale_types::{
-    BlockMetadata, ExecutionCertificate, ExecutionOutput, Hash, LocalReceipt, RoutableTransaction,
-    WaveCertificate,
+    BlockMetadata, ExecutionCertificate, ExecutionMetadata, Hash, LocalReceipt,
+    RoutableTransaction, WaveCertificate,
 };
 
 // ─── CF name constants ───────────────────────────────────────────────────────
@@ -269,9 +269,9 @@ pub(crate) struct ExecutionOutputsCf;
 impl TypedCf for ExecutionOutputsCf {
     const NAME: &'static str = EXECUTION_OUTPUTS_CF;
     type Key = Hash;
-    type Value = ExecutionOutput;
+    type Value = ExecutionMetadata;
     type KeyCodec = HashCodec;
-    type ValueCodec = SborCodec<ExecutionOutput>;
+    type ValueCodec = SborCodec<ExecutionMetadata>;
     fn handle<'a>(cf: &CfHandles<'a>) -> &'a rocksdb::ColumnFamily {
         cf.execution_outputs
     }

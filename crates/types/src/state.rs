@@ -94,48 +94,6 @@ impl StateEntry {
     }
 }
 
-/// Per-shard execution proof for a transaction.
-///
-/// Contains the execution outcome for a transaction on a single shard.
-/// Used internally during certificate tracking. BLS signatures and ec_hash
-/// live at the ShardAttestation level on wave certificates.
-#[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
-pub enum ShardExecutionProof {
-    /// Transaction executed on this shard.
-    /// `success=true` means writes were applied; `success=false` means the
-    /// transaction's logic failed (rejection) but execution completed.
-    Executed {
-        /// Hash of the GlobalReceipt (outcome + event_root).
-        receipt_hash: Hash,
-        /// Whether execution succeeded.
-        success: bool,
-        /// NodeIds written during execution.
-        write_nodes: Vec<NodeId>,
-    },
-    /// Transaction was aborted on this shard before execution completed.
-    Aborted,
-}
-
-impl ShardExecutionProof {
-    /// Whether this shard executed successfully.
-    pub fn is_success(&self) -> bool {
-        matches!(self, ShardExecutionProof::Executed { success: true, .. })
-    }
-
-    /// Whether this shard aborted.
-    pub fn is_aborted(&self) -> bool {
-        matches!(self, ShardExecutionProof::Aborted)
-    }
-
-    /// Get the receipt hash, or `Hash::ZERO` for aborted proofs.
-    pub fn receipt_hash_or_zero(&self) -> Hash {
-        match self {
-            ShardExecutionProof::Executed { receipt_hash, .. } => *receipt_hash,
-            ShardExecutionProof::Aborted => Hash::ZERO,
-        }
-    }
-}
-
 /// State provision from a source shard to a target shard.
 ///
 /// Only the block proposer sends these. Provisions are always transported
@@ -264,17 +222,5 @@ mod tests {
         let hash1 = entry.hash();
         let hash2 = entry.hash();
         assert_eq!(hash1, hash2);
-    }
-
-    #[test]
-    fn test_shard_execution_proof() {
-        let proof = ShardExecutionProof::Executed {
-            receipt_hash: Hash::from_bytes(b"receipt"),
-            success: true,
-            write_nodes: vec![],
-        };
-
-        assert!(proof.is_success());
-        assert!(!proof.is_aborted());
     }
 }

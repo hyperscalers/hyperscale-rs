@@ -12,7 +12,7 @@ use hyperscale_core::{Action, NodeInput, ProtocolEvent};
 use hyperscale_engine::RadixExecutor;
 use hyperscale_metrics as metrics;
 use hyperscale_storage::{ChainReader, ChainWriter, SubstateStore};
-use hyperscale_types::{ExecutionResult, Hash, ProvisionBatch, ShardGroupId, TxEntries};
+use hyperscale_types::{Hash, LocalExecutionEntry, ProvisionBatch, ShardGroupId, TxEntries};
 use std::sync::Arc;
 use tracing::warn;
 
@@ -504,7 +504,10 @@ pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainRead
                 .iter()
                 .map(hyperscale_engine::handlers::extract_execution_result)
                 .collect();
-            let results = raw_results.into_iter().map(ExecutionResult::from).collect();
+            let results = raw_results
+                .into_iter()
+                .map(LocalExecutionEntry::from)
+                .collect();
 
             Some(DelegatedResult {
                 events: vec![NodeInput::Protocol(
@@ -540,7 +543,10 @@ pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainRead
                 .iter()
                 .map(hyperscale_engine::handlers::extract_execution_result)
                 .collect();
-            let results = raw_results.into_iter().map(ExecutionResult::from).collect();
+            let results = raw_results
+                .into_iter()
+                .map(LocalExecutionEntry::from)
+                .collect();
 
             Some(DelegatedResult {
                 events: vec![NodeInput::Protocol(

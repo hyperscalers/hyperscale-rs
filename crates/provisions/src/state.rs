@@ -637,7 +637,7 @@ mod tests {
     use super::*;
     use hyperscale_types::{
         bls_keypair_from_seed, BlockHeader, Bls12381G1PrivateKey, QuorumCertificate,
-        SubstateInclusionProof, TopologySnapshot, TxEntries, ValidatorInfo, ValidatorSet, WaveId,
+        TopologySnapshot, TxEntries, ValidatorInfo, ValidatorSet, VerkleInclusionProof, WaveId,
     };
 
     fn make_test_topology(local_shard: ShardGroupId) -> TopologySnapshot {
@@ -795,7 +795,7 @@ mod tests {
         ProvisionBatch {
             source_shard,
             block_height: BlockHeight(height),
-            proof: SubstateInclusionProof::dummy(),
+            proof: VerkleInclusionProof::dummy(),
             transactions,
         }
     }
@@ -1024,7 +1024,7 @@ mod tests {
         let batch = ProvisionBatch {
             source_shard,
             block_height: BlockHeight(10),
-            proof: SubstateInclusionProof::dummy(),
+            proof: VerkleInclusionProof::dummy(),
             transactions: vec![TxEntries {
                 tx_hash,
                 entries: vec![entry],

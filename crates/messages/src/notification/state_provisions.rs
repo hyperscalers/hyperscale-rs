@@ -2,7 +2,7 @@
 
 use crate::trace_context::TraceContext;
 use hyperscale_types::{
-    Bls12381G2Signature, MessagePriority, NetworkMessage, SubstateInclusionProof, ValidatorId,
+    Bls12381G2Signature, MessagePriority, NetworkMessage, ValidatorId, VerkleInclusionProof,
 };
 use sbor::prelude::BasicSbor;
 
@@ -20,7 +20,7 @@ pub struct StateProvisionsNotification {
     /// The state provisions being sent.
     pub provisions: Vec<hyperscale_types::StateProvision>,
     /// Aggregated verkle proof covering all entries across all provisions.
-    pub proof: SubstateInclusionProof,
+    pub proof: VerkleInclusionProof,
     /// The validator who sent this batch.
     pub sender: ValidatorId,
     /// BLS signature over the domain-separated signing message, by the sender.
@@ -33,7 +33,7 @@ impl StateProvisionsNotification {
     /// Create a new signed state provision batch.
     pub fn new(
         provisions: Vec<hyperscale_types::StateProvision>,
-        proof: SubstateInclusionProof,
+        proof: VerkleInclusionProof,
         sender: ValidatorId,
         sender_signature: Bls12381G2Signature,
     ) -> Self {
@@ -65,12 +65,7 @@ impl StateProvisionsNotification {
     }
 
     /// Consume and return the provisions and their shared proof.
-    pub fn into_parts(
-        self,
-    ) -> (
-        Vec<hyperscale_types::StateProvision>,
-        SubstateInclusionProof,
-    ) {
+    pub fn into_parts(self) -> (Vec<hyperscale_types::StateProvision>, VerkleInclusionProof) {
         (self.provisions, self.proof)
     }
 

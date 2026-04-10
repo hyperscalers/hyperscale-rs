@@ -56,9 +56,6 @@ impl VerkleInclusionProof {
     }
 }
 
-/// Aggregated verkle inclusion proof covering multiple substates in a flat tree.
-pub type SubstateInclusionProof = VerkleInclusionProof;
-
 // ============================================================================
 // TxEntries
 // ============================================================================
@@ -102,7 +99,7 @@ pub struct ProvisionBatch {
     pub block_height: BlockHeight,
 
     /// Aggregated verkle proof covering all entries for this block.
-    pub proof: SubstateInclusionProof,
+    pub proof: VerkleInclusionProof,
 
     /// Per-transaction entries.
     pub transactions: Vec<TxEntries>,
@@ -140,7 +137,7 @@ impl ProvisionBatch {
         Self {
             source_shard,
             block_height,
-            proof: SubstateInclusionProof::dummy(),
+            proof: VerkleInclusionProof::dummy(),
             transactions: vec![],
         }
     }

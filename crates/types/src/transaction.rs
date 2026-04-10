@@ -293,7 +293,7 @@ pub enum TransactionDecision {
 ///
 /// Aborts are terminal - the transaction will not be retried and any held
 /// resources are released. Abort reasons are carried in `AbortIntent` (block
-/// level) and `TxExecutionOutcome::Aborted` (EC level). By TC level, the
+/// level) and `ExecutionOutcome::Aborted` (EC level). By TC level, the
 /// reason has served its purpose — `TransactionDecision::Aborted` carries
 /// no reason.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, BasicSbor)]

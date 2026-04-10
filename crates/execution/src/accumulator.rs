@@ -17,7 +17,7 @@
 //!    async work to complete.
 
 use hyperscale_types::{
-    compute_execution_receipt_root, Hash, ShardGroupId, TxExecutionOutcome, TxOutcome, WaveId,
+    compute_execution_receipt_root, ExecutionOutcome, Hash, ShardGroupId, TxOutcome, WaveId,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -58,7 +58,7 @@ pub struct ExecutionAccumulator {
 /// Execution result for a single transaction.
 #[derive(Debug, Clone)]
 struct TxResult {
-    outcome: TxExecutionOutcome,
+    outcome: ExecutionOutcome,
 }
 
 /// An abort intent with its commit height.
@@ -174,7 +174,7 @@ impl ExecutionAccumulator {
     /// Returns `true` if the wave is now complete (all txs have results).
     /// First-write-wins: ignores duplicate execution results for the same tx_hash.
     /// Use [`record_abort`] for abort intents, which override execution results.
-    pub fn record_result(&mut self, tx_hash: Hash, outcome: TxExecutionOutcome) -> bool {
+    pub fn record_result(&mut self, tx_hash: Hash, outcome: ExecutionOutcome) -> bool {
         // Only record if this tx is expected in this wave
         if !self.expected_txs.iter().any(|(h, _)| *h == tx_hash) {
             return false;
@@ -310,7 +310,7 @@ impl ExecutionAccumulator {
                 let outcome = if let Some(abort) = self.aborts.get(tx_hash) {
                     if abort.committed_at_height <= wave_start + target {
                         // Use abort outcome at this height
-                        TxExecutionOutcome::Aborted
+                        ExecutionOutcome::Aborted
                     } else {
                         // Abort exists but at a higher height — use execution result
                         self.execution_results[tx_hash].outcome.clone()
@@ -357,7 +357,7 @@ impl ExecutionAccumulator {
             .iter()
             .map(|(tx_hash, _)| {
                 let outcome = if self.aborts.contains_key(tx_hash) {
-                    TxExecutionOutcome::Aborted
+                    ExecutionOutcome::Aborted
                 } else {
                     self.execution_results[tx_hash].outcome.clone()
                 };
@@ -428,16 +428,16 @@ mod tests {
         )
     }
 
-    fn executed(receipt: Hash) -> TxExecutionOutcome {
-        TxExecutionOutcome::Executed {
+    fn executed(receipt: Hash) -> ExecutionOutcome {
+        ExecutionOutcome::Executed {
             receipt_hash: receipt,
             success: true,
             write_nodes: vec![],
         }
     }
 
-    fn executed_fail(receipt: Hash) -> TxExecutionOutcome {
-        TxExecutionOutcome::Executed {
+    fn executed_fail(receipt: Hash) -> ExecutionOutcome {
+        ExecutionOutcome::Executed {
             receipt_hash: receipt,
             success: false,
             write_nodes: vec![],
@@ -626,7 +626,7 @@ mod tests {
 
         let (_, outcomes) = acc.build_data().unwrap();
         match &outcomes[0].outcome {
-            TxExecutionOutcome::Executed {
+            ExecutionOutcome::Executed {
                 receipt_hash,
                 success,
                 ..

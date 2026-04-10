@@ -5,7 +5,7 @@
 use ark_ed_on_bls12_381_bandersnatch::{EdwardsAffine, Fr};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 
-use hyperscale_types::{Hash, SubstateInclusionProof, VerkleInclusionProof};
+use hyperscale_types::{Hash, VerkleInclusionProof};
 use jellyfish_verkle_tree as jvt;
 
 // ============================================================================
@@ -20,7 +20,7 @@ pub fn generate_proof<S: jvt::TreeReader>(
     store: &S,
     storage_keys: &[Vec<u8>],
     block_height: u64,
-) -> Option<SubstateInclusionProof> {
+) -> Option<VerkleInclusionProof> {
     let root_key = jvt::NodeKey::root(block_height);
 
     let jvt_keys: Vec<jvt::Key> = storage_keys
@@ -35,7 +35,7 @@ pub fn generate_proof<S: jvt::TreeReader>(
 
 /// Verify an aggregated verkle proof against a state root.
 pub fn verify_proof(
-    proof: &SubstateInclusionProof,
+    proof: &VerkleInclusionProof,
     entries: &[hyperscale_types::StateEntry],
     state_root: Hash,
     storage_key_for_entry: impl Fn(&hyperscale_types::StateEntry) -> &[u8],

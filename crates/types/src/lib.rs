@@ -6,6 +6,7 @@
 //! - **Primitives**: Hash, cryptographic keys and signatures
 //! - **Identifiers**: ValidatorId, ShardGroupId, BlockHeight, etc.
 //! - **Consensus types**: Block, BlockHeader, QuorumCertificate, etc.
+//! - **Wave types**: WaveId, ExecutionVote, ExecutionCertificate, WaveCertificate, etc.
 //! - **Network traits**: Message markers for serialization
 //!
 //! # Design Philosophy
@@ -14,7 +15,6 @@
 //! any other workspace crates, making it the foundation layer.
 
 mod crypto;
-mod execution_vote;
 mod hash;
 mod identifiers;
 mod network;
@@ -24,7 +24,6 @@ mod signing;
 // Consensus types
 mod block;
 mod epoch;
-mod finalized_wave;
 mod quorum_certificate;
 mod receipt;
 mod signer_bitfield;
@@ -32,7 +31,7 @@ mod state;
 mod topology;
 mod transaction;
 mod validator;
-mod wave_certificate;
+mod wave;
 
 // Re-export crypto types and helpers
 pub use crypto::{
@@ -67,7 +66,7 @@ pub use hash::{
 };
 pub use identifiers::{BlockHeight, NodeId, PartitionNumber, ShardGroupId, ValidatorId, VotePower};
 pub use network::{MessagePriority, NetworkMessage, Request, ShardMessage};
-pub use proofs::{ProvisionBatch, SubstateInclusionProof, TxEntries, VerkleInclusionProof};
+pub use proofs::{ProvisionBatch, TxEntries, VerkleInclusionProof};
 pub use signing::{
     block_header_message, block_vote_message, committed_block_header_message,
     exec_cert_batch_message, exec_vote_batch_message, exec_vote_message,
@@ -79,20 +78,15 @@ pub use signing::{
 pub use block::{
     compute_certificate_root, compute_local_receipt_root, compute_transaction_root,
     tx_inclusion_proof, tx_inclusion_proofs, Block, BlockHeader, BlockManifest, BlockMetadata,
-    CommittedBlockHeader,
+    BlockVote, CommittedBlockHeader,
 };
-pub use execution_vote::{
-    compute_global_receipt_root_with_proof, compute_waves, derive_wave_tx_hashes, tx_outcome_leaf,
-    wave_leader, ExecutionCertificate, ExecutionVote, TxExecutionOutcome, TxOutcome, WaveId,
-};
-pub use finalized_wave::{FinalizedWave, TxDecision};
 pub use quorum_certificate::QuorumCertificate;
 pub use receipt::{
-    ApplicationEvent, ExecutionOutput, ExecutionResult, FeeSummary, GlobalReceipt, LocalReceipt,
-    LocalReceiptEntry, LogLevel, ReceiptBundle, TransactionOutcome,
+    ApplicationEvent, ExecutionMetadata, FeeSummary, GlobalReceipt, LocalExecutionEntry,
+    LocalReceipt, LocalReceiptEntry, LogLevel, ReceiptBundle, TransactionOutcome,
 };
 pub use signer_bitfield::SignerBitfield;
-pub use state::{ShardExecutionProof, StateEntry, StateProvision};
+pub use state::{StateEntry, StateProvision};
 pub use topology::{node_id_hash_u64, shard_for_node, TopologySnapshot, TopologySnapshotError};
 pub use transaction::{
     sign_and_notarize, sign_and_notarize_with_options, AbortIntent, AbortReason, ReadyTransactions,
@@ -100,71 +94,17 @@ pub use transaction::{
     TransactionStatusParseError,
 };
 pub use validator::{ValidatorInfo, ValidatorSet};
-pub use wave_certificate::{
-    decode_wave_cert_vec, encode_wave_cert_vec, ShardAttestation, WaveCertificate,
+pub use wave::{
+    compute_global_receipt_root_with_proof, compute_waves, decode_wave_cert_vec,
+    derive_wave_tx_hashes, encode_wave_cert_vec, tx_outcome_leaf, wave_leader,
+    ExecutionCertificate, ExecutionOutcome, ExecutionVote, FinalizedWave, ShardAttestation,
+    TxOutcome, WaveCertificate, WaveId,
 };
 // Re-export with legacy alias for cross-crate use
-pub use execution_vote::compute_global_receipt_root as compute_execution_receipt_root;
+pub use wave::compute_global_receipt_root as compute_execution_receipt_root;
 
 // Re-export DatabaseUpdates from radix for cross-crate use (execution cache, block commit)
 pub use radix_substate_store_interface::interface::DatabaseUpdates;
-
-/// Block vote for BFT consensus.
-#[derive(Debug, Clone, PartialEq, Eq, sbor::prelude::BasicSbor)]
-pub struct BlockVote {
-    /// Hash of the block being voted on.
-    pub block_hash: Hash,
-    /// Shard group this vote belongs to (prevents cross-shard replay).
-    pub shard_group_id: ShardGroupId,
-    /// Height of the block.
-    pub height: BlockHeight,
-    /// Round number (for view change).
-    pub round: u64,
-    /// Validator who cast this vote.
-    pub voter: ValidatorId,
-    /// BLS signature over the domain-separated signing message.
-    pub signature: Bls12381G2Signature,
-    /// Timestamp when this vote was created (milliseconds since epoch).
-    pub timestamp: u64,
-}
-
-impl BlockVote {
-    /// Create a new block vote with domain-separated signing.
-    pub fn new(
-        block_hash: Hash,
-        shard_group_id: ShardGroupId,
-        height: BlockHeight,
-        round: u64,
-        voter: ValidatorId,
-        signing_key: &Bls12381G1PrivateKey,
-        timestamp: u64,
-    ) -> Self {
-        let message = block_vote_message(shard_group_id, height.0, round, &block_hash);
-        let signature = signing_key.sign_v1(&message);
-        Self {
-            block_hash,
-            shard_group_id,
-            height,
-            round,
-            voter,
-            signature,
-            timestamp,
-        }
-    }
-
-    /// Build the canonical signing message for this vote.
-    ///
-    /// Uses `DOMAIN_BLOCK_VOTE` tag for domain separation.
-    /// This is the same message used for QC aggregated signature verification.
-    pub fn signing_message(&self) -> Vec<u8> {
-        block_vote_message(
-            self.shard_group_id,
-            self.height.0,
-            self.round,
-            &self.block_hash,
-        )
-    }
-}
 
 /// Test utilities.
 #[cfg(any(test, feature = "test-utils"))]

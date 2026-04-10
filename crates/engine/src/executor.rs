@@ -31,7 +31,7 @@
 
 use crate::error::ExecutionError;
 use crate::execution::{
-    build_execution_output, build_local_receipt, is_committed, ProvisionedSnapshot,
+    build_execution_metadata, build_local_receipt, is_committed, ProvisionedSnapshot,
 };
 use crate::genesis::{GenesisBuilder, GenesisConfig, GenesisError};
 use crate::result::{ExecutionOutput, SingleTxResult};
@@ -327,7 +327,7 @@ impl RadixExecutor {
                 .collect();
             let local_receipt =
                 build_local_receipt(receipt, storage, &declared_nodes, local_shard, num_shards);
-            let execution_output = build_execution_output(receipt);
+            let execution_output = build_execution_metadata(receipt);
 
             // Compute writes_root for GlobalReceipt from global-filtered updates
             // (declared-only, system-filtered, NOT shard-filtered).

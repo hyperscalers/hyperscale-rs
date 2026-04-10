@@ -84,7 +84,7 @@ impl SubstateStore for SimStorage {
         &self,
         storage_keys: &[Vec<u8>],
         block_height: u64,
-    ) -> Option<hyperscale_types::SubstateInclusionProof> {
+    ) -> Option<hyperscale_types::VerkleInclusionProof> {
         let s = self.state.read().unwrap();
         hyperscale_storage::tree::proofs::generate_proof(&s.tree_store, storage_keys, block_height)
     }

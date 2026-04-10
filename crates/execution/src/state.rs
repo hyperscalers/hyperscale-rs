@@ -32,10 +32,10 @@
 
 use hyperscale_core::{Action, CrossShardExecutionRequest, ProtocolEvent, ProvisionRequest};
 use hyperscale_types::{
-    AbortReason, BlockHeight, Bls12381G1PublicKey, ExecutionCertificate, ExecutionResult,
-    ExecutionVote, Hash, LocalReceipt, ReceiptBundle, RoutableTransaction, ShardGroupId,
-    StateProvision, TopologySnapshot, TransactionDecision, TxExecutionOutcome, TxOutcome,
-    ValidatorId, WaveCertificate, WaveId,
+    AbortReason, BlockHeight, Bls12381G1PublicKey, ExecutionCertificate, ExecutionOutcome,
+    ExecutionVote, Hash, LocalExecutionEntry, LocalReceipt, ReceiptBundle, RoutableTransaction,
+    ShardGroupId, StateProvision, TopologySnapshot, TransactionDecision, TxOutcome, ValidatorId,
+    WaveCertificate, WaveId,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -90,7 +90,7 @@ pub struct BlockCommittedOutput {
     pub cross_shard_registrations: Vec<CrossShardRegistration>,
 }
 
-// FinalizedWave is defined in hyperscale_types (TxDecision comes via crate::trackers).
+// FinalizedWave is defined in hyperscale_types.
 use hyperscale_types::FinalizedWave;
 
 /// Execution memory statistics for monitoring collection sizes.
@@ -169,7 +169,7 @@ pub struct ExecutionState {
     // Early arrivals (buffered until tracking starts at block commit)
     // ═══════════════════════════════════════════════════════════════════════
     /// Execution results that arrived before the wave was assigned.
-    early_execution_results: HashMap<Hash, TxExecutionOutcome>,
+    early_execution_results: HashMap<Hash, ExecutionOutcome>,
 
     /// Execution votes that arrived before tracking started (wave leader only).
     early_votes: HashMap<WaveId, Vec<ExecutionVote>>,
@@ -435,7 +435,7 @@ impl ExecutionState {
     /// Updates the accumulator silently. Votes are NOT emitted here — they are
     /// emitted during the block commit wave scan (`scan_complete_waves`), ensuring
     /// deterministic voting at each consensus height.
-    pub fn record_execution_result(&mut self, tx_hash: Hash, outcome: TxExecutionOutcome) {
+    pub fn record_execution_result(&mut self, tx_hash: Hash, outcome: ExecutionOutcome) {
         let Some(wave_key) = self.wave_assignments.get(&tx_hash).cloned() else {
             // Wave not assigned yet (e.g. execution completed before
             // on_block_committed created the wave). Buffer for replay.
@@ -552,7 +552,7 @@ impl ExecutionState {
     /// Moves receipt-bundle construction and cache insertion out of the node orchestrator.
     pub fn on_execution_batch_completed(
         &mut self,
-        results: Vec<ExecutionResult>,
+        results: Vec<LocalExecutionEntry>,
         tx_outcomes: Vec<TxOutcome>,
     ) -> Vec<Action> {
         let mut newly_emitted: HashSet<Hash> = HashSet::with_capacity(results.len());
@@ -663,8 +663,8 @@ impl ExecutionState {
             let wave_id = &wc.wave_id;
             if let Some(finalized) = self.finalized_wave_certificates.get(wave_id) {
                 // Extract per-tx decisions from the finalized wave
-                for d in &finalized.tx_decisions {
-                    committed_txs.push((d.tx_hash, d.decision));
+                for (tx_hash, decision) in &finalized.tx_decisions {
+                    committed_txs.push((*tx_hash, *decision));
                 }
             }
             // Clean up all state associated with this wave
@@ -1648,10 +1648,10 @@ impl ExecutionState {
         }));
 
         // Emit TransactionExecuted for each tx (per-tx mempool status updates)
-        for d in &tx_decisions {
+        for (tx_hash, decision) in &tx_decisions {
             actions.push(Action::Continuation(ProtocolEvent::TransactionExecuted {
-                tx_hash: d.tx_hash,
-                accepted: d.decision == TransactionDecision::Accept,
+                tx_hash: *tx_hash,
+                accepted: *decision == TransactionDecision::Accept,
             }));
         }
         actions
@@ -2057,10 +2057,10 @@ mod tests {
 
     #[test]
     fn test_shard_execution_proof_basic() {
-        use hyperscale_types::ShardExecutionProof;
+        use hyperscale_types::ExecutionOutcome;
 
         let receipt_hash = Hash::from_bytes(b"commitment");
-        let proof = ShardExecutionProof::Executed {
+        let proof = ExecutionOutcome::Executed {
             receipt_hash,
             success: true,
             write_nodes: vec![],

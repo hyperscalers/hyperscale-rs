@@ -1,10 +1,11 @@
 //! Block and BlockHeader types for consensus.
 
 use crate::{
-    compute_merkle_root, compute_merkle_root_with_proof, compute_padded_merkle_root,
-    decode_wave_cert_vec, encode_wave_cert_vec, AbortIntent, BlockHeight, Hash, QuorumCertificate,
-    ReceiptBundle, RoutableTransaction, ShardGroupId, TransactionInclusionProof, ValidatorId,
-    WaveCertificate, WaveId,
+    block_vote_message, compute_merkle_root, compute_merkle_root_with_proof,
+    compute_padded_merkle_root, decode_wave_cert_vec, encode_wave_cert_vec, AbortIntent,
+    BlockHeight, Bls12381G1PrivateKey, Bls12381G2Signature, Hash, QuorumCertificate, ReceiptBundle,
+    RoutableTransaction, ShardGroupId, TransactionInclusionProof, ValidatorId, WaveCertificate,
+    WaveId,
 };
 use sbor::prelude::*;
 use std::sync::Arc;
@@ -743,5 +744,66 @@ mod tests {
     fn test_genesis_certificate_root_is_zero() {
         let genesis = Block::genesis(ShardGroupId(0), ValidatorId(0), Hash::ZERO);
         assert_eq!(genesis.header.certificate_root, Hash::ZERO);
+    }
+}
+
+// ============================================================================
+// BlockVote
+// ============================================================================
+
+/// Block vote for BFT consensus.
+#[derive(Debug, Clone, PartialEq, Eq, sbor::prelude::BasicSbor)]
+pub struct BlockVote {
+    /// Hash of the block being voted on.
+    pub block_hash: Hash,
+    /// Shard group this vote belongs to (prevents cross-shard replay).
+    pub shard_group_id: ShardGroupId,
+    /// Height of the block.
+    pub height: BlockHeight,
+    /// Round number (for view change).
+    pub round: u64,
+    /// Validator who cast this vote.
+    pub voter: ValidatorId,
+    /// BLS signature over the domain-separated signing message.
+    pub signature: Bls12381G2Signature,
+    /// Timestamp when this vote was created (milliseconds since epoch).
+    pub timestamp: u64,
+}
+
+impl BlockVote {
+    /// Create a new block vote with domain-separated signing.
+    pub fn new(
+        block_hash: Hash,
+        shard_group_id: ShardGroupId,
+        height: BlockHeight,
+        round: u64,
+        voter: ValidatorId,
+        signing_key: &Bls12381G1PrivateKey,
+        timestamp: u64,
+    ) -> Self {
+        let message = block_vote_message(shard_group_id, height.0, round, &block_hash);
+        let signature = signing_key.sign_v1(&message);
+        Self {
+            block_hash,
+            shard_group_id,
+            height,
+            round,
+            voter,
+            signature,
+            timestamp,
+        }
+    }
+
+    /// Build the canonical signing message for this vote.
+    ///
+    /// Uses `DOMAIN_BLOCK_VOTE` tag for domain separation.
+    /// This is the same message used for QC aggregated signature verification.
+    pub fn signing_message(&self) -> Vec<u8> {
+        block_vote_message(
+            self.shard_group_id,
+            self.height.0,
+            self.round,
+            &self.block_hash,
+        )
     }
 }

@@ -1,6 +1,6 @@
 //! Provision fetch response for fallback recovery.
 
-use hyperscale_types::{MessagePriority, NetworkMessage, StateProvision, SubstateInclusionProof};
+use hyperscale_types::{MessagePriority, NetworkMessage, StateProvision, VerkleInclusionProof};
 use sbor::prelude::BasicSbor;
 
 /// Response to a provision fetch request containing the state provisions.
@@ -26,7 +26,7 @@ pub struct GetProvisionsResponse {
     /// Aggregated verkle proof covering all entries across all provisions.
     ///
     /// `None` when `provisions` is `None` or `Some(empty)`.
-    pub proof: Option<SubstateInclusionProof>,
+    pub proof: Option<VerkleInclusionProof>,
 }
 
 impl NetworkMessage for GetProvisionsResponse {

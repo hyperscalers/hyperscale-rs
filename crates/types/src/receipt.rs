@@ -6,7 +6,7 @@
 //! |------|------|----------|------------------------|
 //! | **Global** | [`GlobalReceipt`] | outcome + event_root + writes_root | Yes |
 //! | **Local** | [`LocalReceipt`] | outcome + shard-filtered state changes + events | No |
-//! | **Output** | [`ExecutionOutput`] | fees, logs, errors | No |
+//! | **Output** | [`ExecutionMetadata`] | fees, logs, errors | No |
 //!
 //! The global receipt hash is signed over in execution votes/certificates.
 //! Per-shard state correctness is enforced by `state_root` in the block header,
@@ -187,13 +187,13 @@ impl LocalReceipt {
 /// Written atomically with block commit but on a separate pruning cycle
 /// (can be pruned earlier than LocalReceipts since not needed for state verification).
 #[derive(Debug, Clone, PartialEq, Eq, sbor::prelude::BasicSbor)]
-pub struct ExecutionOutput {
+pub struct ExecutionMetadata {
     pub fee_summary: FeeSummary,
     pub log_messages: Vec<(LogLevel, String)>,
     pub error_message: Option<String>,
 }
 
-impl ExecutionOutput {
+impl ExecutionMetadata {
     /// Create a failure execution output.
     pub fn failure(error: Option<String>) -> Self {
         Self {
@@ -226,7 +226,7 @@ pub struct ReceiptBundle {
     pub tx_hash: Hash,
     pub local_receipt: Arc<LocalReceipt>,
     /// Only populated when this node executed the transaction locally.
-    pub execution_output: Option<ExecutionOutput>,
+    pub execution_output: Option<ExecutionMetadata>,
 }
 
 // Manual SBOR implementation (Arc doesn't derive BasicSbor)
@@ -265,7 +265,7 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
 
         let tx_hash: Hash = decoder.decode()?;
         let local_receipt: LocalReceipt = decoder.decode()?;
-        let execution_output: Option<ExecutionOutput> = decoder.decode()?;
+        let execution_output: Option<ExecutionMetadata> = decoder.decode()?;
 
         Ok(Self {
             tx_hash,
@@ -301,7 +301,7 @@ impl sbor::Describe<sbor::NoCustomTypeKind> for ReceiptBundle {
 /// The state machine holds receipts in-memory until block commit.
 /// DatabaseUpdates are on the local receipt.
 #[derive(Debug, Clone)]
-pub struct ExecutionResult {
+pub struct LocalExecutionEntry {
     /// Hash of the executed transaction.
     pub tx_hash: Hash,
     /// Pre-computed global receipt hash (outcome + event_root + writes_root).
@@ -310,7 +310,7 @@ pub struct ExecutionResult {
     /// Full local receipt with shard-filtered database updates and events.
     pub local_receipt: LocalReceipt,
     /// Local execution metadata (fees, logs, errors).
-    pub execution_output: ExecutionOutput,
+    pub execution_output: ExecutionMetadata,
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -422,7 +422,7 @@ mod tests {
         let local = ReceiptBundle {
             tx_hash: Hash::from_bytes(b"local_tx"),
             local_receipt: receipt,
-            execution_output: Some(ExecutionOutput::failure(Some("test error".to_string()))),
+            execution_output: Some(ExecutionMetadata::failure(Some("test error".to_string()))),
         };
         assert!(local.execution_output.is_some());
     }
