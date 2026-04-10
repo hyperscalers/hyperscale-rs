@@ -53,8 +53,8 @@ pub struct ExecutionAccumulator {
     aborts: HashMap<Hash, AbortEntry>,
     /// Cached target vote height. Recomputed when inputs change (provisions or aborts).
     cached_target_vote_height: Option<u64>,
-    /// The vote height at which we last emitted a vote. Only re-vote downward.
-    last_voted_height: Option<u64>,
+    /// Whether we've emitted a vote for this wave. Once true, no more votes.
+    voted: bool,
 }
 
 /// Execution result for a single transaction.
@@ -90,7 +90,7 @@ impl ExecutionAccumulator {
             provisioned: HashSet::new(),
             aborts: HashMap::new(),
             cached_target_vote_height: None,
-            last_voted_height: None,
+            voted: false,
         }
     }
 
@@ -252,23 +252,19 @@ impl ExecutionAccumulator {
     /// Whether a vote can be emitted at the current target height.
     ///
     /// Requires:
-    /// 1. The committed chain has reached the target height
-    /// 2. All txs covered by execution (not abort/timeout) at that height have results
-    /// 3. The target height is lower than (or equal to) any previous vote
-    ///    (only re-vote downward), OR no previous vote exists
+    /// 1. We haven't voted yet
+    /// 2. The committed chain has reached the target height
+    /// 3. All txs covered by execution (not abort/timeout) at that height have results
     pub fn can_emit_vote(&mut self, committed_height: u64) -> bool {
+        if self.voted {
+            return false;
+        }
+
         let target = self.target_vote_height();
 
         // Gate: committed chain must have reached the target height
         if committed_height < self.block_height + target {
             return false;
-        }
-
-        // Only re-vote downward
-        if let Some(last) = self.last_voted_height {
-            if target >= last {
-                return false;
-            }
         }
 
         // Check that all execution-covered txs at this height have results.
@@ -334,15 +330,10 @@ impl ExecutionAccumulator {
 
         let root = compute_execution_receipt_root(&outcomes);
 
-        // Record that we voted at this height
-        self.last_voted_height = Some(target);
+        // Mark as voted — no more votes for this wave.
+        self.voted = true;
 
         Some((target, root, outcomes))
-    }
-
-    /// Record that we voted at a specific height (set by external caller).
-    pub fn set_last_voted_height(&mut self, height: u64) {
-        self.last_voted_height = Some(height);
     }
 
     /// Get the union of all participating shards across all txs in this wave.
@@ -508,40 +499,7 @@ mod tests {
     }
 
     #[test]
-    fn test_revote_downward_on_provision_arrival() {
-        let mut acc = make_accumulator(2);
-        let tx0 = Hash::from_bytes(&[0u8; 4]);
-        let tx1 = Hash::from_bytes(&[1u8; 4]);
-
-        // tx0 provisioned, tx1 has abort at height 15
-        acc.mark_provisioned(tx0);
-        acc.record_abort(tx1, 15);
-        acc.record_result(tx0, executed(Hash::from_bytes(b"r0")));
-
-        // Vote at height 5 (15-10)
-        let (vh, _, _) = acc.build_vote_data(15).unwrap();
-        assert_eq!(vh, 5);
-
-        // Now tx1 provisions arrive → target drops to 0
-        acc.mark_provisioned(tx1);
-        assert_eq!(acc.target_vote_height(), 0);
-
-        // Can't emit at height 0 yet — tx1 has no execution result
-        assert!(!acc.can_emit_vote(WAVE_START));
-
-        // tx1 execution completes
-        acc.record_result(tx1, executed(Hash::from_bytes(b"r1")));
-        assert!(acc.can_emit_vote(WAVE_START));
-
-        let (vh, _, outcomes) = acc.build_vote_data(WAVE_START).unwrap();
-        assert_eq!(vh, 0);
-        // At height 0, both txs use execution results (no aborts at height 0)
-        assert!(!outcomes[0].is_aborted());
-        assert!(!outcomes[1].is_aborted());
-    }
-
-    #[test]
-    fn test_no_revote_upward() {
+    fn test_vote_exactly_once() {
         let mut acc = make_accumulator(1);
         let tx0 = Hash::from_bytes(&[0u8; 4]);
 
@@ -552,7 +510,7 @@ mod tests {
         let (vh, _, _) = acc.build_vote_data(WAVE_START).unwrap();
         assert_eq!(vh, 0);
 
-        // Can't emit again at height 0 (already voted there)
+        // Can't emit again — already voted once
         assert!(!acc.can_emit_vote(HIGH));
     }
 
@@ -703,7 +661,7 @@ mod tests {
     }
 
     #[test]
-    fn test_provisions_after_timeout_revote_downward() {
+    fn test_no_revote_after_timeout() {
         let mut acc = make_accumulator(1);
         let tx0 = Hash::from_bytes(&[0u8; 4]);
 
@@ -712,19 +670,10 @@ mod tests {
         assert_eq!(vh, WAVE_TIMEOUT_BLOCKS);
         assert!(outcomes[0].is_aborted());
 
-        // Provisions arrive → target drops to 0
+        // Provisions arrive later — but we already voted, no re-vote allowed
         acc.mark_provisioned(tx0);
-        assert_eq!(acc.target_vote_height(), 0);
-
-        // Need execution result to re-vote
-        assert!(!acc.can_emit_vote(HIGH));
-
         acc.record_result(tx0, executed(Hash::from_bytes(b"r")));
-        assert!(acc.can_emit_vote(HIGH));
-
-        let (vh, _, outcomes) = acc.build_vote_data(HIGH).unwrap();
-        assert_eq!(vh, 0);
-        assert!(!outcomes[0].is_aborted());
+        assert!(!acc.can_emit_vote(HIGH));
     }
 
     #[test]
