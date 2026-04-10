@@ -106,6 +106,13 @@ pub struct ProvisionBatch {
 }
 
 impl ProvisionBatch {
+    /// Compute a content hash of this provision batch (SBOR-encode then hash).
+    pub fn hash(&self) -> Hash {
+        let bytes =
+            sbor::basic_encode(self).expect("ProvisionBatch serialization should never fail");
+        Hash::from_bytes(&bytes)
+    }
+
     /// Get all node IDs across all transactions.
     pub fn all_node_ids(&self) -> HashSet<NodeId> {
         self.transactions

@@ -7,10 +7,10 @@
 use hyperscale_storage::{ChainWriter, SubstateStore};
 use hyperscale_types::{
     batch_verify_bls_same_message, compute_certificate_root, compute_local_receipt_root,
-    compute_transaction_root, verify_bls12381_v1, Block, BlockHeader, BlockHeight, BlockVote,
-    Bls12381G1PublicKey, Bls12381G2Signature, Conflict, Hash, QuorumCertificate, ReceiptBundle,
-    RoutableTransaction, ShardGroupId, SignerBitfield, ValidatorId, VotePower, WaveCertificate,
-    WaveId,
+    compute_provisions_root, compute_transaction_root, verify_bls12381_v1, Block, BlockHeader,
+    BlockHeight, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature, Conflict, Hash,
+    QuorumCertificate, ReceiptBundle, RoutableTransaction, ShardGroupId, SignerBitfield,
+    ValidatorId, VotePower, WaveCertificate, WaveId,
 };
 use std::sync::Arc;
 
@@ -346,6 +346,7 @@ pub fn build_proposal<S: ChainWriter + SubstateStore>(
     conflicts: Vec<Conflict>,
     local_shard: ShardGroupId,
     waves: Vec<WaveId>,
+    provision_batch_hashes: Vec<Hash>,
 ) -> ProposalResult<S::PreparedCommit> {
     // Check if JVT is at parent_state_root (no waiting - instant check)
     let current_root = storage.state_root_hash();
@@ -376,6 +377,7 @@ pub fn build_proposal<S: ChainWriter + SubstateStore>(
     let transaction_root = compute_transaction_root(&transactions);
     let certificate_root = compute_certificate_root(&certs_to_include);
     let local_receipt_root = compute_local_receipt_root(receipts);
+    let provisions_root = compute_provisions_root(&provision_batch_hashes);
 
     let header = BlockHeader {
         shard_group_id: local_shard,
@@ -390,7 +392,7 @@ pub fn build_proposal<S: ChainWriter + SubstateStore>(
         transaction_root,
         certificate_root,
         local_receipt_root,
-        provisions_root: Hash::ZERO,
+        provisions_root,
         waves,
     };
 

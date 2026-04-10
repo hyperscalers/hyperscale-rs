@@ -99,7 +99,7 @@ pub struct ProvisionCoordinator {
 
     /// Verified provision batches keyed by (source_shard, block_height).
     /// Stored whole after proof verification — no per-tx decomposition.
-    verified_batches: BTreeMap<(ShardGroupId, BlockHeight), ProvisionBatch>,
+    verified_batches: BTreeMap<(ShardGroupId, BlockHeight), Arc<ProvisionBatch>>,
 
     // ═══════════════════════════════════════════════════════════════════
     // Expected Provision Tracking (fallback detection)
@@ -116,6 +116,11 @@ pub struct ProvisionCoordinator {
     // ═══════════════════════════════════════════════════════════════════
     // Time
     // ═══════════════════════════════════════════════════════════════════
+    /// Provision batches received from remote shards, queued for inclusion
+    /// in the next block proposal. Proposer drains this queue when building
+    /// a proposal. Every validator queues (any might become next proposer).
+    queued_provision_batches: Vec<Arc<ProvisionBatch>>,
+
     /// Current time.
     now: Duration,
 }
@@ -148,6 +153,7 @@ impl ProvisionCoordinator {
             verified_batches: BTreeMap::new(),
             local_committed_height: BlockHeight(0),
             expected_provisions: BTreeMap::new(),
+            queued_provision_batches: Vec::new(),
             now: Duration::ZERO,
         }
     }
@@ -435,11 +441,15 @@ impl ProvisionCoordinator {
 
         // Store the verified batch whole
         let batch_key = (source_shard, batch.block_height);
-        self.verified_batches.insert(batch_key, batch.clone());
+        let batch = Arc::new(batch);
+        self.verified_batches.insert(batch_key, Arc::clone(&batch));
+
+        // Queue for inclusion in the next block proposal.
+        self.queued_provision_batches.push(Arc::clone(&batch));
 
         // Emit batch-level accepted event (used by livelock for cycle detection).
         actions.push(Action::Continuation(ProtocolEvent::ProvisionsAccepted {
-            batch: batch.clone(),
+            batch: (*batch).clone(),
         }));
 
         // Collect any transactions that are now fully provisioned across all shards.
@@ -485,6 +495,11 @@ impl ProvisionCoordinator {
     // ═══════════════════════════════════════════════════════════════════════
     // Query Methods (for other modules)
     // ═══════════════════════════════════════════════════════════════════════
+
+    /// Drain queued provision batches for inclusion in the next block proposal.
+    pub fn drain_queued_provisions(&mut self) -> Vec<Arc<ProvisionBatch>> {
+        std::mem::take(&mut self.queued_provision_batches)
+    }
 
     /// Check if a transaction has any verified provisions.
     ///

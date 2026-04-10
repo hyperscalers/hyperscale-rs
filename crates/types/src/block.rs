@@ -48,6 +48,16 @@ pub fn compute_local_receipt_root(receipts: &[ReceiptBundle]) -> Hash {
     compute_merkle_root(&leaves)
 }
 
+/// Compute the provisions merkle root for a block.
+///
+/// Each provision batch's hash becomes a leaf. Returns `Hash::ZERO` if empty.
+pub fn compute_provisions_root(batch_hashes: &[Hash]) -> Hash {
+    if batch_hashes.is_empty() {
+        return Hash::ZERO;
+    }
+    compute_padded_merkle_root(batch_hashes)
+}
+
 /// Compute the transaction merkle root for a block.
 ///
 /// Each transaction's hash becomes a leaf directly. Returns `Hash::ZERO` if empty.
