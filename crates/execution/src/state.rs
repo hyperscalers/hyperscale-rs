@@ -488,7 +488,7 @@ impl ExecutionState {
             return;
         };
 
-        accumulator.record_abort(tx_hash, committed_at_height);
+        accumulator.record_abort(tx_hash, committed_at_height, true);
     }
 
     /// Scan all waves and return completion data for any that can emit a vote.
@@ -1510,8 +1510,8 @@ impl ExecutionState {
             if outcome.is_aborted() {
                 if let Some(wave_id) = self.wave_assignments.get(&outcome.tx_hash).cloned() {
                     if let Some(acc) = self.accumulators.get_mut(&wave_id) {
-                        let committed_at = self.committed_height;
-                        acc.record_abort(outcome.tx_hash, committed_at);
+                        let committed_at = acc.block_height();
+                        acc.record_abort(outcome.tx_hash, committed_at, false);
                     }
                 }
             }

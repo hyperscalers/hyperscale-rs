@@ -66,6 +66,9 @@ struct TxResult {
 struct AbortEntry {
     /// The local block height at which this abort intent was committed.
     committed_at_height: u64,
+    /// Whether this abort was consensus-committed (deterministic) or
+    /// propagated from a remote EC (async, used only for coverability).
+    consensus: bool,
 }
 
 impl ExecutionAccumulator {
@@ -153,7 +156,12 @@ impl ExecutionAccumulator {
     /// At vote emission time, the appropriate outcome (abort or execution) is
     /// chosen based on the target vote height.
     /// Returns `true` if the wave is now complete (all txs have some outcome).
-    pub fn record_abort(&mut self, tx_hash: Hash, committed_at_height: u64) -> bool {
+    pub fn record_abort(
+        &mut self,
+        tx_hash: Hash,
+        committed_at_height: u64,
+        consensus: bool,
+    ) -> bool {
         if !self.expected_txs.iter().any(|(h, _)| *h == tx_hash) {
             return false;
         }
@@ -162,6 +170,7 @@ impl ExecutionAccumulator {
             tx_hash,
             AbortEntry {
                 committed_at_height,
+                consensus,
             },
         );
 
@@ -190,6 +199,11 @@ impl ExecutionAccumulator {
     /// Check if a specific transaction has an execution result or abort.
     pub fn has_result(&self, tx_hash: &Hash) -> bool {
         self.execution_results.contains_key(tx_hash) || self.aborts.contains_key(tx_hash)
+    }
+
+    /// Check if a specific transaction has an execution result (not just an abort).
+    pub fn has_executed(&self, tx_hash: &Hash) -> bool {
+        self.execution_results.contains_key(tx_hash)
     }
 
     /// Remove a transaction from the wave entirely.
@@ -308,11 +322,19 @@ impl ExecutionAccumulator {
             .iter()
             .map(|(tx_hash, _)| {
                 let outcome = if let Some(abort) = self.aborts.get(tx_hash) {
-                    if abort.committed_at_height <= wave_start + target {
-                        // Use abort outcome at this height
+                    if abort.consensus && abort.committed_at_height <= wave_start + target {
+                        // Consensus-committed abort — deterministic, overrides execution.
+                        ExecutionOutcome::Aborted
+                    } else if !abort.consensus
+                        && !self.execution_results.contains_key(tx_hash)
+                        && abort.committed_at_height <= wave_start + target
+                    {
+                        // Async abort (remote EC) — only use if no execution result.
+                        // If the tx executed, ignore the async abort; the consensus
+                        // timeout will produce a deterministic abort later if needed.
                         ExecutionOutcome::Aborted
                     } else {
-                        // Abort exists but at a higher height — use execution result
+                        // Abort doesn't apply — use execution result
                         self.execution_results[tx_hash].outcome.clone()
                     }
                 } else {
@@ -490,7 +512,7 @@ mod tests {
         assert_eq!(acc.target_vote_height(), None);
 
         // Abort committed at height 15 (wave starts at 10)
-        acc.record_abort(tx_hash, 15);
+        acc.record_abort(tx_hash, 15, true);
 
         // Target vote height = 15 - 10 = 5
         assert_eq!(acc.target_vote_height(), Some(5));
@@ -511,7 +533,7 @@ mod tests {
 
         // tx0 gets provisions, tx1 gets abort at height 12
         acc.mark_provisioned(tx0);
-        acc.record_abort(tx1, 12);
+        acc.record_abort(tx1, 12, true);
 
         // Target = max(0, 12-10) = 2
         assert_eq!(acc.target_vote_height(), Some(2));
@@ -537,7 +559,7 @@ mod tests {
 
         // tx0 provisioned, tx1 has abort at height 15
         acc.mark_provisioned(tx0);
-        acc.record_abort(tx1, 15);
+        acc.record_abort(tx1, 15, true);
         acc.record_result(tx0, executed(Hash::from_bytes(b"r0")));
 
         // Vote at height 5 (15-10)
@@ -665,7 +687,7 @@ mod tests {
         acc.record_result(tx, executed(Hash::from_bytes(b"exec")));
 
         // Abort intent arrives later — overrides
-        acc.record_abort(tx, 12);
+        acc.record_abort(tx, 12, true);
 
         let (_, outcomes) = acc.build_data().unwrap();
         assert!(outcomes[0].is_aborted());
