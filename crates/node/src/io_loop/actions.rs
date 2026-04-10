@@ -86,7 +86,7 @@ where
                 wave_id,
                 global_receipt_root,
                 tx_outcomes,
-                target,
+                recipients,
             } => {
                 let tx_count = tx_outcomes.len() as u32;
                 // Sign the execution vote inline (BLS signing is fast, ~1ms)
@@ -111,10 +111,14 @@ where
                     signature: sig,
                 };
 
-                // Send vote only to the wave leader (N→1 instead of N→N).
-                // If we ARE the wave leader, skip the network send — the
-                // loopback below feeds it directly to the state machine.
-                if target != self.validator_id {
+                // Send vote to all local committee members (N→N).
+                // Skip self — the loopback below feeds it directly.
+                let peers: Vec<ValidatorId> = recipients
+                    .iter()
+                    .copied()
+                    .filter(|&v| v != self.validator_id)
+                    .collect();
+                if !peers.is_empty() {
                     let batch_msg = hyperscale_types::exec_vote_batch_message(
                         self.local_shard,
                         std::slice::from_ref(&vote),
@@ -125,7 +129,7 @@ where
                         self.validator_id,
                         batch_sig,
                     );
-                    self.network.notify(std::slice::from_ref(&target), &batch);
+                    self.network.notify(&peers, &batch);
                 }
 
                 // Feed our own execution vote back to the state machine for tracking
