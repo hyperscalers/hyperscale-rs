@@ -106,7 +106,7 @@ pub fn make_test_block(height: u64) -> Block {
         },
         transactions: vec![],
         certificates: vec![],
-        abort_intents: vec![],
+        conflicts: vec![],
     }
 }
 

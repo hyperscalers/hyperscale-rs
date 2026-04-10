@@ -9,8 +9,8 @@ use hyperscale_provisions::ProvisionCoordinator;
 use hyperscale_remote_headers::RemoteHeaderCoordinator;
 use hyperscale_topology::TopologyState;
 use hyperscale_types::{
-    AbortIntent, Block, BlockHeader, BlockHeight, BlockManifest, Bls12381G1PrivateKey,
-    FinalizedWave, Hash, QuorumCertificate, ReadyTransactions, RoutableTransaction, ShardGroupId,
+    Block, BlockHeader, BlockHeight, BlockManifest, Bls12381G1PrivateKey, Conflict, FinalizedWave,
+    Hash, QuorumCertificate, ReadyTransactions, RoutableTransaction, ShardGroupId,
     TopologySnapshot,
 };
 use std::sync::Arc;
@@ -76,7 +76,7 @@ impl std::fmt::Debug for NodeStateMachine {
 /// to avoid duplicating the ready-transaction gathering logic.
 struct ProposalInputs {
     ready_txs: ReadyTransactions,
-    abort_intents: Vec<AbortIntent>,
+    conflicts: Vec<Conflict>,
     finalized_waves: Vec<Arc<FinalizedWave>>,
 }
 
@@ -202,26 +202,13 @@ impl NodeStateMachine {
         let ready_txs = self
             .mempool
             .ready_transactions(max_txs, pending_txs, pending_certs);
-        let current_height = BlockHeight(self.bft.committed_height() + 1);
-        // Livelock cycle abort intents (from cycle detection).
-        let livelock_intents = self.livelock.get_pending_abort_intents().to_vec();
-        // Timed-out transactions from the mempool.
-        // The mempool tracks ALL committed transactions including those received
-        // via block sync (added by on_block_committed_full), so this covers
-        // cross-shard txs that weren't in the local mempool originally.
-        let timed_out = self
-            .mempool
-            .get_default_timed_out_transactions(current_height);
-        // Combine both sources into a single abort_intents list.
-        // Timeouts first: they are cheaper to verify (no inclusion proof) and BFT
-        // dedup keeps the first intent per tx_hash, so timeouts take priority.
-        let abort_intents: Vec<AbortIntent> =
-            timed_out.into_iter().chain(livelock_intents).collect();
+        // Livelock cycle conflicts (from cycle detection).
+        let conflicts = self.livelock.get_pending_conflicts().to_vec();
         let finalized_waves = self.execution.get_finalized_waves();
 
         ProposalInputs {
             ready_txs,
-            abort_intents,
+            conflicts,
             finalized_waves,
         }
     }
@@ -279,7 +266,7 @@ impl NodeStateMachine {
         self.bft.on_proposal_timer(
             self.topology.snapshot(),
             &inputs.ready_txs,
-            inputs.abort_intents,
+            inputs.conflicts,
             inputs.finalized_waves,
         )
     }
@@ -338,7 +325,7 @@ impl NodeStateMachine {
             block_hash,
             qc,
             &inputs.ready_txs,
-            inputs.abort_intents,
+            inputs.conflicts,
             inputs.finalized_waves,
         )
     }
@@ -377,8 +364,7 @@ impl NodeStateMachine {
         // Abort intents feed the execution accumulator with override semantics.
         // Votes are NOT emitted here — the wave scan at the end of block commit
         // will detect complete waves and emit votes deterministically.
-        self.execution
-            .record_abort_intents(&block.abort_intents, height);
+        self.execution.record_conflicts(&block.conflicts, height);
 
         // Remove committed wave certificates from execution state.
         // They've been included in this block, so don't need to be proposed again.

@@ -104,8 +104,8 @@ pub struct Metrics {
 
     // === Livelock ===
     pub livelock_cycles_detected: Counter,
-    pub livelock_abort_intents: Counter,
-    pub livelock_pending_abort_intents: Gauge,
+    pub livelock_conflicts: Counter,
+    pub livelock_pending_conflicts: Gauge,
 
     // === Lock Contention ===
     pub lock_contention_ratio: Gauge,
@@ -557,14 +557,14 @@ impl Metrics {
             )
             .unwrap(),
 
-            livelock_abort_intents: register_counter!(
-                "hyperscale_livelock_abort_intents_total",
+            livelock_conflicts: register_counter!(
+                "hyperscale_livelock_conflicts_total",
                 "Total number of abort intents committed (livelock cycle or timeout)"
             )
             .unwrap(),
 
-            livelock_pending_abort_intents: register_gauge!(
-                "hyperscale_livelock_pending_abort_intents",
+            livelock_pending_conflicts: register_gauge!(
+                "hyperscale_livelock_pending_conflicts",
                 "Current number of abort intents queued for next block proposal"
             )
             .unwrap(),
@@ -1084,14 +1084,12 @@ impl MetricsRecorder for PrometheusRecorder {
         self.metrics.livelock_cycles_detected.inc();
     }
 
-    fn record_livelock_abort_intent(&self) {
-        self.metrics.livelock_abort_intents.inc();
+    fn record_livelock_conflict(&self) {
+        self.metrics.livelock_conflicts.inc();
     }
 
-    fn set_livelock_pending_abort_intents(&self, count: usize) {
-        self.metrics
-            .livelock_pending_abort_intents
-            .set(count as f64);
+    fn set_livelock_pending_conflicts(&self, count: usize) {
+        self.metrics.livelock_pending_conflicts.set(count as f64);
     }
 
     // ── Lock Contention ──────────────────────────────────────────────
@@ -1248,8 +1246,8 @@ impl MetricsRecorder for PrometheusRecorder {
             .set(m.livelock_pending_proof_fetches as f64);
         self.metrics
             .memory_livelock
-            .with_label_values(&["pending_abort_intents"])
-            .set(m.livelock_pending_abort_intents as f64);
+            .with_label_values(&["pending_conflicts"])
+            .set(m.livelock_pending_conflicts as f64);
         self.metrics
             .memory_livelock
             .with_label_values(&["tracked_txs"])

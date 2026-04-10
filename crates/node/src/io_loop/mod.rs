@@ -1035,7 +1035,7 @@ where
 
         // ── Livelock ──
         let livelock_stats = self.state.livelock().stats();
-        metrics::set_livelock_pending_abort_intents(livelock_stats.pending_abort_intents);
+        metrics::set_livelock_pending_conflicts(livelock_stats.pending_conflicts);
 
         // ── Memory ──
         let bft_mem = self.state.bft().memory_stats();
@@ -1085,7 +1085,7 @@ where
             // Livelock
             livelock_tombstones: livelock_stats.active_tombstones,
             livelock_pending_proof_fetches: livelock_stats.pending_proof_fetches,
-            livelock_pending_abort_intents: livelock_stats.pending_abort_intents,
+            livelock_pending_conflicts: livelock_stats.pending_conflicts,
             livelock_tracked_txs: livelock_stats.tracked_transactions,
             // Storage
             jvt_node_cache_entries: self.storage.node_cache_len(),

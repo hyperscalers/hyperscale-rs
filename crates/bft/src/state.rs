@@ -46,10 +46,10 @@ pub struct BftMemoryStats {
 /// Production uses ValidatorId (from message signatures) and PeerId (libp2p).
 pub type NodeIndex = u32;
 use hyperscale_types::{
-    block_header_message, committed_block_header_message, AbortIntent, Block, BlockHeader,
-    BlockHeight, BlockManifest, BlockVote, Bls12381G1PrivateKey, Bls12381G1PublicKey,
-    CommittedBlockHeader, FinalizedWave, Hash, QuorumCertificate, ReadyTransactions,
-    RoutableTransaction, ShardGroupId, TopologySnapshot, ValidatorId, VotePower,
+    block_header_message, committed_block_header_message, Block, BlockHeader, BlockHeight,
+    BlockManifest, BlockVote, Bls12381G1PrivateKey, Bls12381G1PublicKey, CommittedBlockHeader,
+    Conflict, FinalizedWave, Hash, QuorumCertificate, ReadyTransactions, RoutableTransaction,
+    ShardGroupId, TopologySnapshot, ValidatorId, VotePower,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -216,7 +216,7 @@ pub struct BftState {
 
     /// Lookup of committed tx hashes to their committed height.
     /// Populated by the node state layer from the mempool on each block commit.
-    /// Used to validate execution timeout abort intents from proposers.
+    /// Used to validate conflicts from proposers.
     committed_tx_lookup: HashMap<Hash, BlockHeight>,
 
     /// Hashes from recently committed blocks, held until the mempool
@@ -225,9 +225,9 @@ pub struct BftState {
     /// `register_committed_transactions()` called from `on_block_committed`.
     recently_committed_txs: std::collections::HashSet<Hash>,
     recently_committed_certs: std::collections::HashSet<Hash>,
-    recently_committed_abort_intents: std::collections::HashSet<Hash>,
+    recently_committed_conflicts: std::collections::HashSet<Hash>,
 
-    /// Remote block headers for merkle inclusion proof validation in deferrals.
+    /// Remote block headers for merkle inclusion proof validation in conflicts.
     /// Only headers with verified QCs (tracked in verification pipeline) are trusted.
     remote_headers: HashMap<(ShardGroupId, BlockHeight), Arc<CommittedBlockHeader>>,
 
@@ -325,7 +325,7 @@ impl BftState {
             committed_tx_lookup: HashMap::new(),
             recently_committed_txs: std::collections::HashSet::new(),
             recently_committed_certs: std::collections::HashSet::new(),
-            recently_committed_abort_intents: std::collections::HashSet::new(),
+            recently_committed_conflicts: std::collections::HashSet::new(),
             remote_headers: HashMap::new(),
             remote_header_tips: HashMap::new(),
             config,
@@ -375,7 +375,7 @@ impl BftState {
                 .retain(|&(s, h), _| s != shard || h.0 >= cutoff);
         }
 
-        // Unblock any pending abort intent verifications waiting on this header.
+        // Unblock any pending conflict verifications waiting on this header.
         self.verification
             .on_remote_header_arrived(shard, height, &header)
     }
@@ -814,17 +814,17 @@ impl BftState {
     /// Handle proposal timer - build and broadcast a new block.
     ///
     /// Takes ready transactions from mempool (already sectioned and hash-sorted),
-    /// plus deferrals, aborts, and certificates from execution.
-    #[instrument(skip(self, ready_txs, abort_intents, finalized_waves), fields(
+    /// plus conflicts and certificates from execution.
+    #[instrument(skip(self, ready_txs, conflicts, finalized_waves), fields(
         tx_count = ready_txs.len(),
-        abort_intent_count = abort_intents.len(),
+        conflict_count = conflicts.len(),
         cert_count = finalized_waves.len(),
     ))]
     pub fn on_proposal_timer(
         &mut self,
         topology: &TopologySnapshot,
         ready_txs: &ReadyTransactions,
-        abort_intents: Vec<AbortIntent>,
+        conflicts: Vec<Conflict>,
         finalized_waves: Vec<Arc<FinalizedWave>>,
     ) -> Vec<Action> {
         // The next height to propose is one above the highest certified block,
@@ -930,12 +930,12 @@ impl BftState {
         let timestamp = self.now.as_millis() as u64;
         let block_height = BlockHeight(next_height);
 
-        // Set block_height on each abort intent
-        let abort_intents_with_height: Vec<AbortIntent> = abort_intents
+        // Set block_height on each conflict
+        let conflicts_with_height: Vec<Conflict> = conflicts
             .into_iter()
-            .map(|mut a| {
-                a.block_height = block_height;
-                a
+            .map(|mut c| {
+                c.block_height = block_height;
+                c
             })
             .collect();
 
@@ -943,42 +943,35 @@ impl BftState {
         // pending/certified blocks above committed height. Excluding these
         // prevents the same item appearing in consecutive blocks during the
         // two-chain commit window (mempool ready-set is only cleared on commit).
-        let (qc_chain_cert_hashes, qc_chain_tx_hashes, qc_chain_abort_hashes) =
+        let (qc_chain_cert_hashes, qc_chain_tx_hashes, qc_chain_conflict_hashes) =
             self.collect_qc_chain_hashes(parent_hash);
 
-        // Filter abort intents:
-        // 1. Skip livelock abort intents whose remote header hasn't arrived yet
+        // Filter conflicts:
+        // 1. Skip conflicts whose remote header hasn't arrived yet
         //    (voters need the header to verify the inclusion proof).
-        // 2. Skip intents already in the QC chain.
-        // 3. Deduplicate by tx_hash within this proposal (livelock + timeout can
-        //    both fire for the same tx in the same round).
+        // 2. Skip conflicts already in the QC chain.
+        // 3. Deduplicate by tx_hash within this proposal.
         //
-        // Abort intents are NOT filtered by finalized status. They are just
+        // Conflicts are NOT filtered by finalized status. They are just
         // inputs to the execution accumulator — if the tx already resolved at a
-        // lower vote height, the abort is harmlessly ignored. Filtering here
-        // would prevent abort intents from reaching accumulators on other waves
+        // lower vote height, the conflict is harmlessly ignored. Filtering here
+        // would prevent conflicts from reaching accumulators on other waves
         // that still need them.
-        let mut seen_abort_hashes = std::collections::HashSet::new();
-        let abort_intents_with_height: Vec<AbortIntent> = abort_intents_with_height
+        let mut seen_conflict_hashes = std::collections::HashSet::new();
+        let conflicts_with_height: Vec<Conflict> = conflicts_with_height
             .into_iter()
-            .filter(|a| {
-                if let hyperscale_types::AbortReason::LivelockCycle {
-                    source_shard,
-                    source_block_height,
-                    ..
-                } = &a.reason
-                {
-                    if !self.has_remote_header(*source_shard, *source_block_height) {
-                        debug!(
-                            tx_hash = %a.tx_hash,
-                            source_shard = source_shard.0,
-                            source_block_height = source_block_height.0,
-                            "Deferring livelock abort intent: remote header not yet available"
-                        );
-                        return false;
-                    }
+            .filter(|c| {
+                if !self.has_remote_header(c.source_shard, c.source_block_height) {
+                    debug!(
+                        tx_hash = %c.tx_hash,
+                        source_shard = c.source_shard.0,
+                        source_block_height = c.source_block_height.0,
+                        "Deferring conflict: remote header not yet available"
+                    );
+                    return false;
                 }
-                !qc_chain_abort_hashes.contains(&a.tx_hash) && seen_abort_hashes.insert(a.tx_hash)
+                !qc_chain_conflict_hashes.contains(&c.tx_hash)
+                    && seen_conflict_hashes.insert(c.tx_hash)
             })
             .collect();
 
@@ -1062,7 +1055,7 @@ impl BftState {
                 parent_state_root,
                 transactions,
                 finalized_waves: waves_to_propose,
-                abort_intents: abort_intents_with_height,
+                conflicts: conflicts_with_height,
                 waves,
             },
         ]
@@ -1076,7 +1069,7 @@ impl BftState {
     ///
     /// # Important Properties
     ///
-    /// - **Empty payload**: No transactions, certificates, or aborts
+    /// - **Empty payload**: No transactions, certificates, or conflicts
     /// - **Timestamp inheritance**: Uses parent's weighted timestamp (prevents time manipulation)
     /// - **is_fallback: true**: Marks this as a fallback block
     ///
@@ -1125,7 +1118,7 @@ impl BftState {
             header: header.clone(),
             transactions: vec![], // Empty - fallback blocks have no transactions
             certificates: vec![], // Empty
-            abort_intents: vec![],
+            conflicts: vec![],
         };
 
         let block_hash = block.hash();
@@ -1147,7 +1140,7 @@ impl BftState {
                 .insert(block_hash, (*constructed).clone());
         }
 
-        // Create gossip message (fallback blocks have no transactions, deferrals, or aborts)
+        // Create gossip message (fallback blocks have no transactions or conflicts)
         let sig = self.sign_block_header(&header, block_hash);
         let gossip = hyperscale_messages::BlockHeaderNotification::new(
             header,
@@ -1238,7 +1231,7 @@ impl BftState {
             header: header.clone(),
             transactions: vec![],
             certificates: vec![],
-            abort_intents: vec![],
+            conflicts: vec![],
         };
 
         let block_hash = block.hash();
@@ -1260,7 +1253,7 @@ impl BftState {
                 .insert(block_hash, (*constructed).clone());
         }
 
-        // Create gossip message (sync blocks have no transactions, deferrals, or aborts)
+        // Create gossip message (sync blocks have no transactions or conflicts)
         let sig = self.sign_block_header(&header, block_hash);
         let gossip = hyperscale_messages::BlockHeaderNotification::new(
             header,
@@ -1896,13 +1889,13 @@ impl BftState {
         // Validate block contents before voting
         if let Some(pending) = self.pending_blocks.get(&block_hash) {
             if let Some(block) = pending.block() {
-                // Validate abort intents
-                if let Err(e) = self.validate_abort_intents(&block) {
+                // Validate conflicts
+                if let Err(e) = self.validate_conflicts(&block) {
                     warn!(
                         validator = ?topology.local_validator_id(),
                         block_hash = ?block_hash,
                         error = %e,
-                        "Block has invalid abort intents - not voting"
+                        "Block has invalid conflicts - not voting"
                     );
                     return vec![];
                 }
@@ -2001,20 +1994,18 @@ impl BftState {
                         ));
                 }
 
-                // Verify abort intent inclusion proofs if block has livelock intents.
+                // Verify conflict inclusion proofs if block has conflicts.
                 // Resolves remote headers directly and either dispatches
                 // verification or parks until missing headers arrive.
-                if self.verification.needs_abort_intent_verification(&block) {
-                    verification_actions.extend(
-                        self.verification.initiate_abort_intent_verification(
-                            block_hash,
-                            &block,
-                            &self.remote_headers,
-                        ),
-                    );
+                if self.verification.needs_conflict_verification(&block) {
+                    verification_actions.extend(self.verification.initiate_conflict_verification(
+                        block_hash,
+                        &block,
+                        &self.remote_headers,
+                    ));
                 }
 
-                // If any verifications were initiated or abort intent verification
+                // If any verifications were initiated or conflict verification
                 // is pending (via ready queue), wait for them to complete.
                 if !verification_actions.is_empty() || !self.verification.is_block_verified(&block)
                 {
@@ -2027,67 +2018,24 @@ impl BftState {
         self.create_vote(topology, block_hash, height, round)
     }
 
-    /// Validate abort intents in a proposed block (structural validation).
+    /// Validate conflicts in a proposed block (structural validation).
     ///
     /// # Validation Rules
     ///
-    /// ## Abort Intents (AbortIntent)
-    /// - ExecutionTimeout: Structural rules only (timeout threshold is proposer's call)
-    /// - LivelockCycle: Hash ordering only (merkle proof verified off-thread)
-    fn validate_abort_intents(&self, block: &Block) -> Result<(), String> {
-        use hyperscale_types::AbortReason;
-
-        // Validate each abort intent
-        for abort in &block.abort_intents {
-            match &abort.reason {
-                AbortReason::ExecutionTimeout { committed_at } => {
-                    // Basic sanity: abort block_height must be after committed_at
-                    if abort.block_height.0 < committed_at.0 {
-                        return Err(format!(
-                            "Invalid abort: block_height {} < committed_at {} for timeout",
-                            abort.block_height.0, committed_at.0
-                        ));
-                    }
-                    // Reject premature timeouts: a minimum number of blocks must
-                    // elapse before an ExecutionTimeout is valid. Without this, a
-                    // byzantine proposer can abort any cross-shard TX immediately.
-                    let elapsed = abort.block_height.0.saturating_sub(committed_at.0);
-                    if elapsed < self.config.min_execution_timeout_blocks {
-                        return Err(format!(
-                            "Invalid abort: only {} blocks elapsed (min {}), tx {} committed at {}",
-                            elapsed,
-                            self.config.min_execution_timeout_blocks,
-                            abort.tx_hash,
-                            committed_at.0
-                        ));
-                    }
-                    // Verify the transaction was actually committed at the claimed height.
-                    // committed_tx_lookup is populated by the node state layer from the
-                    // mempool's in-flight tracking on each block commit.
-                    if let Some(&actual_height) = self.committed_tx_lookup.get(&abort.tx_hash) {
-                        if actual_height != *committed_at {
-                            return Err(format!(
-                                "Invalid abort: tx {} claimed committed at {} but was committed at {}",
-                                abort.tx_hash, committed_at.0, actual_height.0
-                            ));
-                        }
-                    }
-                    // If not in lookup, the tx may have already been finalized and
-                    // evicted, or committed before our tracking started. Allow it.
-                }
-                AbortReason::LivelockCycle { winner_tx_hash, .. } => {
-                    // Verify hash ordering: loser (abort target) must have higher hash
-                    if abort.tx_hash <= *winner_tx_hash {
-                        return Err(format!(
-                            "Invalid abort: livelock loser hash {} <= winner hash {}",
-                            abort.tx_hash, winner_tx_hash
-                        ));
-                    }
-                    // Merkle inclusion proof verification is dispatched off-thread
-                    // via VerifyAbortIntentProofs (initiated in try_vote_on_block,
-                    // enriched by NodeStateMachine with remote header data).
-                }
+    /// - Hash ordering: loser tx_hash must be greater than winner_tx_hash
+    /// - Merkle inclusion proof verified off-thread via VerifyConflictProofs
+    fn validate_conflicts(&self, block: &Block) -> Result<(), String> {
+        for conflict in &block.conflicts {
+            // Verify hash ordering: loser (conflict target) must have higher hash
+            if conflict.tx_hash <= conflict.winner_tx_hash {
+                return Err(format!(
+                    "Invalid conflict: livelock loser hash {} <= winner hash {}",
+                    conflict.tx_hash, conflict.winner_tx_hash
+                ));
             }
+            // Merkle inclusion proof verification is dispatched off-thread
+            // via VerifyConflictProofs (initiated in try_vote_on_block,
+            // enriched by NodeStateMachine with remote header data).
         }
 
         Ok(())
@@ -2610,7 +2558,7 @@ impl BftState {
     /// Handle a block root verification result (unified handler).
     ///
     /// Called when any of the 5 verification actions complete (state root,
-    /// transaction root, certificate root, local receipt root, abort intent proofs).
+    /// transaction root, certificate root, local receipt root, conflict proofs).
     /// If invalid, the block is rejected. If valid and all other verifications are
     /// also complete, proceeds to vote for the block.
     #[instrument(skip(self), fields(block_hash = ?block_hash, ?kind, valid = valid))]
@@ -2636,9 +2584,9 @@ impl BftState {
             VerificationKind::LocalReceiptRoot => self
                 .verification
                 .on_local_receipt_root_verified(block_hash, valid),
-            VerificationKind::AbortIntentProofs => self
-                .verification
-                .on_abort_intents_verified(block_hash, valid),
+            VerificationKind::ConflictProofs => {
+                self.verification.on_conflicts_verified(block_hash, valid)
+            }
         };
 
         if !pipeline_ok {
@@ -2885,7 +2833,7 @@ impl BftState {
     ///
     /// `state_root` is the computed JVT root after applying writes from the certificates.
     /// If certificates is empty, parent state is inherited.
-    #[instrument(skip(self, qc, ready_txs, abort_intents, finalized_waves), fields(
+    #[instrument(skip(self, qc, ready_txs, conflicts, finalized_waves), fields(
         height = qc.height.0,
         block_hash = ?block_hash
     ))]
@@ -2896,7 +2844,7 @@ impl BftState {
         block_hash: Hash,
         qc: QuorumCertificate,
         ready_txs: &ReadyTransactions,
-        abort_intents: Vec<AbortIntent>,
+        conflicts: Vec<Conflict>,
         finalized_waves: Vec<Arc<FinalizedWave>>,
     ) -> Vec<Action> {
         let height = qc.height.0;
@@ -2945,7 +2893,7 @@ impl BftState {
         // header will include this QC as parent_qc.
         //
         // We only propose immediately if there's actual content (transactions,
-        // deferrals, aborts, or certificates). Empty blocks provide no value and
+        // conflicts, or certificates). Empty blocks provide no value and
         // just waste resources on signature verification and storage. If there's
         // nothing to include, the regular proposal timer will fire and propagate
         // the QC then.
@@ -2956,7 +2904,7 @@ impl BftState {
         let next_height = height + 1;
 
         let has_content =
-            !ready_txs.is_empty() || !abort_intents.is_empty() || !finalized_waves.is_empty();
+            !ready_txs.is_empty() || !conflicts.is_empty() || !finalized_waves.is_empty();
 
         // Rate limit against the latest QC time (any proposer), not just our own
         // last proposal. With rotating proposers, per-validator tracking doesn't
@@ -2979,12 +2927,7 @@ impl BftState {
             // on_proposal_timer will check if we're the proposer, backpressure, etc.
             // State root is computed by NodeStateMachine and passed in.
             // If certificates is empty, on_proposal_timer will inherit parent state.
-            actions.extend(self.on_proposal_timer(
-                topology,
-                ready_txs,
-                abort_intents,
-                finalized_waves,
-            ));
+            actions.extend(self.on_proposal_timer(topology, ready_txs, conflicts, finalized_waves));
         } else if should_try_proposal && rate_limited {
             // Schedule the proposal timer to fire exactly when the rate limit
             // expires, rather than waiting for the next periodic timer fire.
@@ -3185,8 +3128,8 @@ impl BftState {
         for cert in &block.certificates {
             self.recently_committed_certs.insert(cert.wave_id.hash());
         }
-        for intent in &block.abort_intents {
-            self.recently_committed_abort_intents.insert(intent.tx_hash);
+        for conflict in &block.conflicts {
+            self.recently_committed_conflicts.insert(conflict.tx_hash);
         }
 
         // Reset backoff tracking — new height means fresh round counting.
@@ -4337,7 +4280,7 @@ impl BftState {
     /// Register committed transactions for execution timeout validation.
     ///
     /// Called by the node state layer after mempool processes a committed block.
-    /// Validators use this to verify that execution timeout abort intents
+    /// Validators use this to verify that conflicts
     /// reference transactions that were actually committed at the claimed height.
     pub fn register_committed_transactions(&mut self, tx_hashes: &[Hash], height: BlockHeight) {
         for tx_hash in tx_hashes {
@@ -4369,7 +4312,7 @@ impl BftState {
     pub fn remove_committed_transaction(&mut self, tx_hash: &Hash) {
         self.committed_tx_lookup.remove(tx_hash);
         self.recently_committed_certs.remove(tx_hash);
-        self.recently_committed_abort_intents.remove(tx_hash);
+        self.recently_committed_conflicts.remove(tx_hash);
     }
 
     /// Get the current committed height.
@@ -4469,8 +4412,7 @@ impl BftState {
     ) {
         let mut cert_hashes: std::collections::HashSet<Hash> = std::collections::HashSet::new();
         let mut tx_hashes: std::collections::HashSet<Hash> = std::collections::HashSet::new();
-        let mut abort_intent_hashes: std::collections::HashSet<Hash> =
-            std::collections::HashSet::new();
+        let mut conflict_hashes: std::collections::HashSet<Hash> = std::collections::HashSet::new();
 
         // Walk full blocks (certified_blocks + assembled pending_blocks + genesis)
         // Also include any recently committed hashes that the mempool
@@ -4478,7 +4420,7 @@ impl BftState {
         // event is still in the async channel).
         tx_hashes.extend(self.recently_committed_txs.iter().copied());
         cert_hashes.extend(self.recently_committed_certs.iter().copied());
-        abort_intent_hashes.extend(self.recently_committed_abort_intents.iter().copied());
+        conflict_hashes.extend(self.recently_committed_conflicts.iter().copied());
 
         let mut current_hash = parent_hash;
         while let Some(block) = self.get_block_by_hash(current_hash) {
@@ -4491,8 +4433,8 @@ impl BftState {
             for tx in &block.transactions {
                 tx_hashes.insert(tx.hash());
             }
-            for intent in &block.abort_intents {
-                abort_intent_hashes.insert(intent.tx_hash);
+            for conflict in &block.conflicts {
+                conflict_hashes.insert(conflict.tx_hash);
             }
             current_hash = block.header.parent_hash;
         }
@@ -4511,15 +4453,15 @@ impl BftState {
                     for tx_hash in &pending.manifest().tx_hashes {
                         tx_hashes.insert(*tx_hash);
                     }
-                    for intent in &pending.manifest().abort_intents {
-                        abort_intent_hashes.insert(intent.tx_hash);
+                    for conflict in &pending.manifest().conflicts {
+                        conflict_hashes.insert(conflict.tx_hash);
                     }
                 }
                 current_hash = pending.header().parent_hash;
             }
         }
 
-        (cert_hashes, tx_hashes, abort_intent_hashes)
+        (cert_hashes, tx_hashes, conflict_hashes)
     }
 
     /// Get the BFT configuration.
@@ -5370,91 +5312,58 @@ mod tests {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // Abort Intent Validation Tests
+    // Conflict Validation Tests
     // ═══════════════════════════════════════════════════════════════════════════
 
     fn make_test_block(
         height: u64,
-        abort_intents: Vec<AbortIntent>,
+        conflicts: Vec<Conflict>,
         certificates: Vec<hyperscale_types::WaveCertificate>,
     ) -> Block {
         Block {
             header: make_header_at_height(height, 100_000),
             transactions: vec![],
             certificates: certificates.into_iter().map(Arc::new).collect(),
-            abort_intents,
+            conflicts,
         }
     }
 
     #[test]
-    fn test_validate_abort_execution_timeout() {
-        let (state, _topology) = make_test_state();
-
-        // Valid: timeout at block 35 for TX committed at block 1
-        let valid_abort = AbortIntent {
-            tx_hash: Hash::from_bytes(b"tx1"),
-            reason: hyperscale_types::AbortReason::ExecutionTimeout {
-                committed_at: BlockHeight(1),
-            },
-            block_height: BlockHeight(35),
-        };
-        let block = make_test_block(35, vec![valid_abort], vec![]);
-        assert!(state.validate_abort_intents(&block).is_ok());
-
-        // Invalid: block_height < committed_at
-        let invalid_abort = AbortIntent {
-            tx_hash: Hash::from_bytes(b"tx2"),
-            reason: hyperscale_types::AbortReason::ExecutionTimeout {
-                committed_at: BlockHeight(100),
-            },
-            block_height: BlockHeight(50),
-        };
-        let block = make_test_block(50, vec![invalid_abort], vec![]);
-        let result = state.validate_abort_intents(&block);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("block_height"));
-    }
-
-    #[test]
-    fn test_validate_abort_livelock_cycle() {
+    fn test_validate_conflict_livelock_cycle() {
         let (state, _topology) = make_test_state();
 
         let winner_hash = Hash::from_bytes(b"winner");
         let loser_hash = Hash::from_bytes(b"zzzloser"); // must be > winner
 
         // Valid: loser hash > winner hash, non-empty proof
-        let valid_abort = AbortIntent {
+        let valid_conflict = Conflict {
             tx_hash: loser_hash,
-            reason: hyperscale_types::AbortReason::LivelockCycle {
-                winner_tx_hash: winner_hash,
-                source_shard: hyperscale_types::ShardGroupId(1),
-                source_block_height: BlockHeight(5),
-                tx_inclusion_proof: hyperscale_types::TransactionInclusionProof {
-                    siblings: vec![Hash::from_bytes(b"sib1")],
-                    leaf_index: 0,
-                },
+            winner_tx_hash: winner_hash,
+            source_shard: hyperscale_types::ShardGroupId(1),
+            source_block_height: BlockHeight(5),
+            tx_inclusion_proof: hyperscale_types::TransactionInclusionProof {
+                siblings: vec![Hash::from_bytes(b"sib1")],
+                leaf_index: 0,
             },
             block_height: BlockHeight(10),
         };
-        let block = make_test_block(10, vec![valid_abort], vec![]);
-        assert!(state.validate_abort_intents(&block).is_ok());
+        let block = make_test_block(10, vec![valid_conflict], vec![]);
+        assert!(state.validate_conflicts(&block).is_ok());
 
         // Invalid: loser hash <= winner hash
-        let invalid_abort = AbortIntent {
+        let invalid_conflict = Conflict {
             tx_hash: winner_hash,
-            reason: hyperscale_types::AbortReason::LivelockCycle {
-                winner_tx_hash: loser_hash,
-                source_shard: hyperscale_types::ShardGroupId(1),
-                source_block_height: BlockHeight(5),
-                tx_inclusion_proof: hyperscale_types::TransactionInclusionProof {
-                    siblings: vec![Hash::from_bytes(b"sib1")],
-                    leaf_index: 0,
-                },
+            winner_tx_hash: loser_hash,
+            source_shard: hyperscale_types::ShardGroupId(1),
+            source_block_height: BlockHeight(5),
+            tx_inclusion_proof: hyperscale_types::TransactionInclusionProof {
+                siblings: vec![Hash::from_bytes(b"sib1")],
+                leaf_index: 0,
             },
             block_height: BlockHeight(10),
         };
-        let block = make_test_block(10, vec![invalid_abort], vec![]);
-        let result = state.validate_abort_intents(&block);
+        let block = make_test_block(10, vec![invalid_conflict], vec![]);
+        let result = state.validate_conflicts(&block);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("livelock loser hash"));
     }
@@ -6782,8 +6691,8 @@ mod tests {
 
     #[test]
     fn test_qc_formed_does_not_propose_empty_block() {
-        // When a QC forms and there's no content (empty mempool, no deferrals,
-        // no aborts, no certificates), we should NOT immediately propose.
+        // When a QC forms and there's no content (empty mempool,
+        // no conflicts, no certificates), we should NOT immediately propose.
         // This avoids wasting resources on empty block pipelining.
         let (mut state, topology) = make_test_state();
         state.set_time(Duration::from_secs(100));
@@ -6806,7 +6715,7 @@ mod tests {
             qc.block_hash,
             qc,
             &ReadyTransactions::default(), // empty mempool
-            vec![],                        // no abort intents
+            vec![],                        // no conflicts
             vec![],                        // no certificates
         );
 
@@ -6822,8 +6731,8 @@ mod tests {
     }
 
     #[test]
-    fn test_qc_formed_proposes_when_has_abort_intents() {
-        // When a QC forms and there IS content (e.g., abort intents), we SHOULD
+    fn test_qc_formed_proposes_when_has_conflicts() {
+        // When a QC forms and there IS content (e.g., conflicts), we SHOULD
         // immediately propose to pipeline block production.
         let (mut state, topology) = make_test_state();
         state.set_time(Duration::from_secs(100));
@@ -6840,22 +6749,47 @@ mod tests {
             weighted_timestamp_ms: 100_000,
         };
 
-        // Create an abort intent to include
-        let abort_intent = AbortIntent {
+        // Create a conflict to include — need remote header for source shard
+        let conflict = Conflict {
             tx_hash: Hash::from_bytes(b"timeout_tx"),
-            reason: hyperscale_types::AbortReason::ExecutionTimeout {
-                committed_at: BlockHeight(1),
+            winner_tx_hash: Hash::from_bytes(b"aaawinner"),
+            source_shard: ShardGroupId(1),
+            source_block_height: BlockHeight(1),
+            tx_inclusion_proof: hyperscale_types::TransactionInclusionProof {
+                siblings: vec![],
+                leaf_index: 0,
             },
             block_height: BlockHeight(0),
         };
 
-        // Call on_qc_formed with an abort intent
+        // Add the remote header so the conflict passes the filter
+        let remote_header = Arc::new(CommittedBlockHeader {
+            header: BlockHeader {
+                shard_group_id: ShardGroupId(1),
+                height: BlockHeight(1),
+                parent_hash: Hash::ZERO,
+                parent_qc: QuorumCertificate::genesis(),
+                proposer: ValidatorId(0),
+                timestamp: 0,
+                round: 0,
+                is_fallback: false,
+                state_root: Hash::ZERO,
+                transaction_root: Hash::ZERO,
+                certificate_root: Hash::ZERO,
+                local_receipt_root: Hash::ZERO,
+                waves: vec![],
+            },
+            qc: QuorumCertificate::genesis(),
+        });
+        state.on_verified_remote_header(remote_header);
+
+        // Call on_qc_formed with a conflict
         let actions = state.on_qc_formed(
             &topology,
             qc.block_hash,
             qc,
             &ReadyTransactions::default(), // empty mempool
-            vec![abort_intent],            // has an abort intent
+            vec![conflict],                // has a conflict
             vec![],                        // no certificates
         );
 
@@ -6868,7 +6802,7 @@ mod tests {
 
         assert!(
             has_build_proposal,
-            "Should trigger proposal build after QC formation when has abort intents"
+            "Should trigger proposal build after QC formation when has conflicts"
         );
     }
 
@@ -7020,7 +6954,7 @@ mod tests {
             header: make_header_at_height(height, 100_000),
             transactions,
             certificates: vec![],
-            abort_intents: vec![],
+            conflicts: vec![],
         }
     }
 
@@ -7033,7 +6967,7 @@ mod tests {
             header: make_header_at_height(height, 100_000),
             transactions,
             certificates: vec![],
-            abort_intents: vec![],
+            conflicts: vec![],
         }
     }
 
@@ -7162,21 +7096,17 @@ mod tests {
             weighted_timestamp_ms: 1000,
         };
 
-        // Create an abort intent so there's content to propose
-        let abort_intent = AbortIntent {
-            tx_hash: Hash::from_bytes(b"timeout_tx"),
-            reason: hyperscale_types::AbortReason::ExecutionTimeout {
-                committed_at: BlockHeight(1),
-            },
-            block_height: BlockHeight(0),
+        // Create a ready transaction so there's content to propose
+        let ready_txs = ReadyTransactions {
+            transactions: vec![make_test_tx_with_seed(42)],
         };
 
         let actions = state.on_qc_formed(
             &topology,
             qc.block_hash,
             qc,
-            &ReadyTransactions::default(), // empty mempool
-            vec![abort_intent],            // has content
+            &ready_txs, // has content
+            vec![],     // no conflicts
             vec![],
         );
 
@@ -7216,21 +7146,17 @@ mod tests {
             weighted_timestamp_ms: 1000,
         };
 
-        // Create an abort intent so there's content to propose
-        let abort_intent = AbortIntent {
-            tx_hash: Hash::from_bytes(b"timeout_tx"),
-            reason: hyperscale_types::AbortReason::ExecutionTimeout {
-                committed_at: BlockHeight(1),
-            },
-            block_height: BlockHeight(0),
+        // Create a ready transaction so there's content to propose
+        let ready_txs = ReadyTransactions {
+            transactions: vec![make_test_tx_with_seed(42)],
         };
 
         let actions = state.on_qc_formed(
             &topology,
             qc.block_hash,
             qc,
-            &ReadyTransactions::default(), // empty mempool
-            vec![abort_intent],            // has content
+            &ready_txs, // has content
+            vec![],     // no conflicts
             vec![],
         );
 
@@ -7298,22 +7224,11 @@ mod tests {
             weighted_timestamp_ms: 1000,
         };
 
-        let abort_intent = AbortIntent {
-            tx_hash: Hash::from_bytes(b"timeout_tx"),
-            reason: hyperscale_types::AbortReason::ExecutionTimeout {
-                committed_at: BlockHeight(1),
-            },
-            block_height: BlockHeight(0),
+        let ready_txs = ReadyTransactions {
+            transactions: vec![make_test_tx_with_seed(42)],
         };
 
-        let actions = state.on_qc_formed(
-            &topology,
-            qc.block_hash,
-            qc,
-            &ReadyTransactions::default(),
-            vec![abort_intent],
-            vec![],
-        );
+        let actions = state.on_qc_formed(&topology, qc.block_hash, qc, &ready_txs, vec![], vec![]);
 
         let has_block_header = actions
             .iter()
@@ -7374,22 +7289,11 @@ mod tests {
             weighted_timestamp_ms: 1000,
         };
 
-        let abort_intent = AbortIntent {
-            tx_hash: Hash::from_bytes(b"timeout_tx"),
-            reason: hyperscale_types::AbortReason::ExecutionTimeout {
-                committed_at: BlockHeight(1),
-            },
-            block_height: BlockHeight(0),
+        let ready_txs = ReadyTransactions {
+            transactions: vec![make_test_tx_with_seed(42)],
         };
 
-        let actions = state.on_qc_formed(
-            &topology,
-            qc.block_hash,
-            qc,
-            &ReadyTransactions::default(),
-            vec![abort_intent],
-            vec![],
-        );
+        let actions = state.on_qc_formed(&topology, qc.block_hash, qc, &ready_txs, vec![], vec![]);
 
         // Should contain a BuildProposal action (rate limiting disabled)
         // After the refactor, proposal building is async - we emit BuildProposal
@@ -7944,7 +7848,7 @@ mod tests {
             },
             transactions: vec![],
             certificates: vec![],
-            abort_intents: vec![],
+            conflicts: vec![],
         };
 
         let qc = QuorumCertificate {
@@ -8529,7 +8433,7 @@ mod tests {
             },
             transactions: vec![tx1.clone()],
             certificates: vec![],
-            abort_intents: vec![],
+            conflicts: vec![],
         };
         let ancestor_hash = ancestor_block.hash();
         state.certified_blocks.insert(ancestor_hash, ancestor_block);
@@ -8555,7 +8459,7 @@ mod tests {
             },
             transactions: txs,
             certificates: vec![],
-            abort_intents: vec![],
+            conflicts: vec![],
         };
 
         let result = state.validate_no_duplicate_transactions(&block);
@@ -8589,7 +8493,7 @@ mod tests {
             },
             transactions: vec![tx1.clone()],
             certificates: vec![],
-            abort_intents: vec![],
+            conflicts: vec![],
         };
         let ancestor_hash = ancestor_block.hash();
         state.certified_blocks.insert(ancestor_hash, ancestor_block);
@@ -8614,7 +8518,7 @@ mod tests {
             },
             transactions: vec![tx1],
             certificates: vec![],
-            abort_intents: vec![],
+            conflicts: vec![],
         };
 
         // Ancestor is at committed height, so walk stops before checking it

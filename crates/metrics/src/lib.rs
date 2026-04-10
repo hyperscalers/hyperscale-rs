@@ -130,8 +130,8 @@ pub struct MemoryMetrics {
     pub livelock_tombstones: usize,
     /// Loser txs awaiting inclusion proof.
     pub livelock_pending_proof_fetches: usize,
-    /// Abort intents ready for next block proposal.
-    pub livelock_pending_abort_intents: usize,
+    /// Conflicts ready for next block proposal.
+    pub livelock_pending_conflicts: usize,
     /// Cross-shard transactions being tracked for cycle detection.
     pub livelock_tracked_txs: usize,
 
@@ -362,10 +362,10 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     fn record_livelock_cycle_detected(&self) {}
 
     /// Record an abort intent committed.
-    fn record_livelock_abort_intent(&self) {}
+    fn record_livelock_conflict(&self) {}
 
     /// Set the pending abort intents gauge.
-    fn set_livelock_pending_abort_intents(&self, count: usize) {}
+    fn set_livelock_pending_conflicts(&self, count: usize) {}
 
     // ── Lock Contention ──────────────────────────────────────────────
 
@@ -796,14 +796,14 @@ pub fn record_livelock_cycle_detected() {
 
 /// Record an abort intent committed.
 #[inline]
-pub fn record_livelock_abort_intent() {
-    recorder().record_livelock_abort_intent();
+pub fn record_livelock_conflict() {
+    recorder().record_livelock_conflict();
 }
 
 /// Set the pending abort intents gauge.
 #[inline]
-pub fn set_livelock_pending_abort_intents(count: usize) {
-    recorder().set_livelock_pending_abort_intents(count);
+pub fn set_livelock_pending_conflicts(count: usize) {
+    recorder().set_livelock_pending_conflicts(count);
 }
 
 // ── Lock Contention ──────────────────────────────────────────────────

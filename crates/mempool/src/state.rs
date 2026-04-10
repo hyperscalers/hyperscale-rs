@@ -2,8 +2,8 @@
 
 use hyperscale_core::{Action, FinalizationPhaseTimes, TransactionStatus};
 use hyperscale_types::{
-    AbortIntent, AbortReason, Block, BlockHeight, Hash, NodeId, ReadyTransactions,
-    RoutableTransaction, TopologySnapshot, TransactionDecision,
+    Block, BlockHeight, Hash, NodeId, ReadyTransactions, RoutableTransaction, TopologySnapshot,
+    TransactionDecision,
 };
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -21,12 +21,6 @@ pub const DEFAULT_MIN_DWELL_TIME: Duration = Duration::from_millis(150);
 /// This allows slow validators to catch up and fetch transactions from peers
 /// even after the transaction has been evicted from the active pool.
 const TRANSACTION_RETENTION_BLOCKS: u64 = 50;
-
-/// How many blocks a cross-shard transaction can wait before being aborted.
-/// Must be comfortably longer than the exec cert fallback fetch timeout (10 blocks)
-/// plus the fallback retry cycle (~15 blocks) to avoid aborting transactions that
-/// the fallback path would have recovered.
-const EXECUTION_TIMEOUT_BLOCKS: u64 = 32;
 
 /// How many blocks to retain tombstones in the mempool (gossip deduplication).
 const TOMBSTONE_RETENTION_BLOCKS: u64 = 500;
@@ -233,11 +227,6 @@ pub struct MempoolState {
     /// Enables efficient timeout scanning: only entries at old heights are checked.
     in_flight_by_height: BTreeMap<BlockHeight, Vec<Hash>>,
 
-    /// Transaction hashes for which an abort intent has already been committed
-    /// in a block. Prevents re-generating the same timeout abort intent every
-    /// proposal cycle. Cleared when the tx reaches terminal state (TC committed).
-    committed_abort_intent_hashes: HashSet<Hash>,
-
     /// Current time.
     now: Duration,
 
@@ -285,7 +274,6 @@ impl MempoolState {
             txs_deferred_by_node: HashMap::new(),
             ready_txs_by_node: HashMap::new(),
             in_flight_by_height: BTreeMap::new(),
-            committed_abort_intent_hashes: HashSet::new(),
             now: Duration::ZERO,
             current_height: BlockHeight(0),
             config,
@@ -444,9 +432,6 @@ impl MempoolState {
         // Remove from ready tracking
         self.remove_from_ready_tracking(&tx_hash);
 
-        // Clean up committed abort intent tracking
-        self.committed_abort_intent_hashes.remove(&tx_hash);
-
         // Move transaction to recently_evicted cache instead of discarding
         if let Some(entry) = self.pool.remove(&tx_hash) {
             self.recently_evicted
@@ -557,12 +542,6 @@ impl MempoolState {
 
         // Track committed abort intents so we stop re-proposing them.
         // Terminal state is still reached exclusively via TC commit below —
-        // this just prevents the same timeout abort intent from being included
-        // in every subsequent block.
-        for intent in &block.abort_intents {
-            self.committed_abort_intent_hashes.insert(intent.tx_hash);
-        }
-
         // Process wave certificates — derive per-tx decisions.
         // Wave certs don't carry per-tx info directly. The node state machine
         // should call on_certificate_committed for each tx with the correct
@@ -1305,72 +1284,6 @@ impl MempoolState {
             .collect()
     }
 
-    /// Get transactions that have timed out waiting for execution.
-    ///
-    /// Transactions timeout if they've been holding state locks for too long.
-    /// This is a safety net for N-way cycles that aren't detected by pairwise
-    /// cycle detection.
-    ///
-    /// Returns abort intents ready for inclusion in a block.
-    ///
-    /// # Parameters
-    /// - `current_height`: The current block height
-    /// - `timeout_blocks`: Number of blocks after which a TX is considered timed out
-    pub fn get_timed_out_transactions(
-        &mut self,
-        current_height: BlockHeight,
-        timeout_blocks: u64,
-    ) -> Vec<AbortIntent> {
-        let mut aborts = Vec::new();
-
-        // Scan only in-flight transactions at heights old enough to have timed out.
-        let cutoff = BlockHeight(current_height.0.saturating_sub(timeout_blocks));
-        for (committed_at, hashes) in self.in_flight_by_height.range(..=cutoff) {
-            for hash in hashes {
-                if let Some(entry) = self.pool.get(hash) {
-                    // Skip already-finalized transactions
-                    if matches!(entry.status, TransactionStatus::Completed(_)) {
-                        continue;
-                    }
-                    // Skip transactions that already have a committed abort intent —
-                    // no need to re-propose the same intent every block.
-                    if self.committed_abort_intent_hashes.contains(hash) {
-                        continue;
-                    }
-                    let status_name = match &entry.status {
-                        TransactionStatus::Committed(_) => "Committed",
-                        TransactionStatus::Executed { .. } => "Executed",
-                        _ => continue, // Not in-flight
-                    };
-                    tracing::debug!(
-                        tx_hash = %hash,
-                        committed_at = committed_at.0,
-                        current_height = current_height.0,
-                        status = status_name,
-                        "Transaction timed out waiting for completion"
-                    );
-                    aborts.push(AbortIntent {
-                        tx_hash: *hash,
-                        reason: AbortReason::ExecutionTimeout {
-                            committed_at: *committed_at,
-                        },
-                        block_height: BlockHeight(0), // Filled in by proposer
-                    });
-                }
-            }
-        }
-
-        aborts
-    }
-
-    /// Get timed-out cross-shard transactions using the default timeout.
-    pub fn get_default_timed_out_transactions(
-        &mut self,
-        current_height: BlockHeight,
-    ) -> Vec<AbortIntent> {
-        self.get_timed_out_transactions(current_height, EXECUTION_TIMEOUT_BLOCKS)
-    }
-
     /// Clean up old tombstones using the default retention window.
     pub fn cleanup_default_tombstones(&mut self, current_height: BlockHeight) -> usize {
         self.cleanup_old_tombstones(current_height, TOMBSTONE_RETENTION_BLOCKS)
@@ -1451,7 +1364,7 @@ mod tests {
             },
             transactions: transactions.into_iter().map(Arc::new).collect(),
             certificates: wave_certs.into_iter().map(Arc::new).collect(),
-            abort_intents: vec![],
+            conflicts: vec![],
         }
     }
 
@@ -1461,89 +1374,6 @@ mod tests {
             wave_id: WaveId::new(ShardGroupId(0), height, BTreeSet::new()),
             attestations: vec![],
         }
-    }
-
-    #[test]
-    fn test_timeout_detection() {
-        let topology = make_test_topology();
-        let mut mempool = MempoolState::new();
-
-        // Create and commit a TX
-        let tx = test_transaction(1);
-        let tx_hash = tx.hash();
-        mempool.on_submit_transaction(&topology, Arc::new(tx.clone()));
-
-        let commit_block = make_test_block(1, vec![tx], vec![]);
-        mempool.on_block_committed_full(&topology, &commit_block);
-
-        // Simulate the TransactionStatusChanged event from execution
-        mempool.update_status(&tx_hash, TransactionStatus::Committed(BlockHeight(1)));
-
-        // Check for timeouts - not enough blocks elapsed
-        let aborts = mempool.get_timed_out_transactions(BlockHeight(20), 30);
-        assert!(aborts.is_empty(), "Should not timeout yet");
-
-        // Check for timeouts - now enough blocks
-        let aborts = mempool.get_timed_out_transactions(BlockHeight(35), 30);
-        assert_eq!(aborts.len(), 1);
-        assert_eq!(aborts[0].tx_hash, tx_hash);
-        assert!(matches!(
-            aborts[0].reason,
-            AbortReason::ExecutionTimeout { .. }
-        ));
-    }
-
-    #[test]
-    fn test_executed_transaction_timeout() {
-        // Tests that transactions in Executed state can also timeout.
-        // This is critical for cross-shard transactions that get stuck when
-        // certificate inclusion fails on another shard.
-        let topology = make_test_topology();
-        let mut mempool = MempoolState::new();
-
-        // Create and commit a TX
-        let tx = test_transaction(1);
-        let tx_hash = tx.hash();
-        mempool.on_submit_transaction(&topology, Arc::new(tx.clone()));
-
-        let commit_block = make_test_block(1, vec![tx], vec![]);
-        mempool.on_block_committed_full(&topology, &commit_block);
-
-        // Simulate committed status from execution
-        mempool.update_status(&tx_hash, TransactionStatus::Committed(BlockHeight(1)));
-
-        // Now simulate execution completing (moves to Executed status)
-        // This preserves the committed_at height for timeout tracking
-        let _actions = mempool.on_transaction_executed(&topology, tx_hash, true);
-
-        // Verify it's in Executed state with preserved committed_at
-        let status = mempool.status(&tx_hash).unwrap();
-        assert!(
-            matches!(
-                status,
-                TransactionStatus::Executed {
-                    decision: TransactionDecision::Accept,
-                    committed_at: BlockHeight(1)
-                }
-            ),
-            "Expected Executed status with committed_at=1, got {:?}",
-            status
-        );
-
-        // Check for timeouts - not enough blocks elapsed
-        let aborts = mempool.get_timed_out_transactions(BlockHeight(20), 30);
-        assert!(aborts.is_empty(), "Should not timeout yet");
-
-        // Check for timeouts - now enough blocks (31 blocks since committed at height 1)
-        let aborts = mempool.get_timed_out_transactions(BlockHeight(35), 30);
-        assert_eq!(aborts.len(), 1, "Executed transaction should timeout");
-        assert_eq!(aborts[0].tx_hash, tx_hash);
-        assert!(matches!(
-            aborts[0].reason,
-            AbortReason::ExecutionTimeout {
-                committed_at: BlockHeight(1)
-            }
-        ));
     }
 
     #[test]

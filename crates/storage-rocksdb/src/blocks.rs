@@ -165,7 +165,7 @@ impl RocksDbStorage {
             header: metadata.header,
             transactions,
             certificates,
-            abort_intents: metadata.manifest.abort_intents,
+            conflicts: metadata.manifest.conflicts,
         };
 
         let elapsed = start.elapsed().as_secs_f64();
@@ -246,7 +246,7 @@ impl RocksDbStorage {
             header: metadata.header,
             transactions,
             certificates,
-            abort_intents: metadata.manifest.abort_intents,
+            conflicts: metadata.manifest.conflicts,
         };
 
         let elapsed = start.elapsed().as_secs_f64();

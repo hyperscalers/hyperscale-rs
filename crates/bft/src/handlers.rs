@@ -7,8 +7,8 @@
 use hyperscale_storage::{ChainWriter, SubstateStore};
 use hyperscale_types::{
     batch_verify_bls_same_message, compute_certificate_root, compute_local_receipt_root,
-    compute_transaction_root, verify_bls12381_v1, AbortIntent, Block, BlockHeader, BlockHeight,
-    BlockVote, Bls12381G1PublicKey, Bls12381G2Signature, Hash, QuorumCertificate, ReceiptBundle,
+    compute_transaction_root, verify_bls12381_v1, Block, BlockHeader, BlockHeight, BlockVote,
+    Bls12381G1PublicKey, Bls12381G2Signature, Conflict, Hash, QuorumCertificate, ReceiptBundle,
     RoutableTransaction, ShardGroupId, SignerBitfield, ValidatorId, VotePower, WaveCertificate,
     WaveId,
 };
@@ -244,35 +244,29 @@ pub fn verify_local_receipt_root(expected_root: Hash, receipts: &[ReceiptBundle]
     valid
 }
 
-/// Verify abort intent inclusion proofs.
+/// Verify conflict inclusion proofs.
 ///
-/// For each `(AbortIntent, transaction_root)` pair, verifies the merkle
+/// For each `(Conflict, transaction_root)` pair, verifies the merkle
 /// inclusion proof for the winner transaction against the QC-attested
 /// `transaction_root` from the remote committed block header.
 ///
 /// Returns `true` only if ALL proofs are valid.
-pub fn verify_abort_intent_proofs(proof_inputs: &[(AbortIntent, Hash)]) -> bool {
-    use hyperscale_types::{verify_merkle_inclusion, AbortReason};
+pub fn verify_conflict_proofs(proof_inputs: &[(Conflict, Hash)]) -> bool {
+    use hyperscale_types::verify_merkle_inclusion;
 
-    for (intent, transaction_root) in proof_inputs {
-        let AbortReason::LivelockCycle {
-            winner_tx_hash,
-            tx_inclusion_proof,
-            ..
-        } = &intent.reason
-        else {
-            // Only LivelockCycle intents have proofs to verify
-            continue;
-        };
-
+    for (conflict, transaction_root) in proof_inputs {
         // The winner_tx_hash is used directly as the leaf hash in the
         // transaction merkle tree (see compute_transaction_root).
-        if !verify_merkle_inclusion(*transaction_root, *winner_tx_hash, tx_inclusion_proof) {
+        if !verify_merkle_inclusion(
+            *transaction_root,
+            conflict.winner_tx_hash,
+            &conflict.tx_inclusion_proof,
+        ) {
             tracing::warn!(
-                loser_tx = %intent.tx_hash,
-                winner_tx = %winner_tx_hash,
+                loser_tx = %conflict.tx_hash,
+                winner_tx = %conflict.winner_tx_hash,
                 transaction_root = ?transaction_root,
-                "Abort intent inclusion proof verification FAILED"
+                "Conflict inclusion proof verification FAILED"
             );
             return false;
         }
@@ -349,7 +343,7 @@ pub fn build_proposal<S: ChainWriter + SubstateStore>(
     transactions: Vec<Arc<RoutableTransaction>>,
     certificates: Vec<Arc<WaveCertificate>>,
     receipts: &[ReceiptBundle],
-    abort_intents: Vec<AbortIntent>,
+    conflicts: Vec<Conflict>,
     local_shard: ShardGroupId,
     waves: Vec<WaveId>,
 ) -> ProposalResult<S::PreparedCommit> {
@@ -403,7 +397,7 @@ pub fn build_proposal<S: ChainWriter + SubstateStore>(
         header,
         transactions,
         certificates: certs_to_include,
-        abort_intents,
+        conflicts,
     };
 
     let block_hash = block.hash();

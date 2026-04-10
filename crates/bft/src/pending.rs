@@ -195,13 +195,13 @@ impl PendingBlock {
             })
             .collect();
 
-        let abort_intents = self.manifest.abort_intents.clone();
+        let conflicts = self.manifest.conflicts.clone();
 
         let block = Arc::new(Block {
             header: self.header.clone(),
             transactions,
             certificates,
-            abort_intents,
+            conflicts,
         });
 
         self.constructed_block = Some(Arc::clone(&block));
@@ -402,7 +402,7 @@ mod tests {
             header: make_header(1),
             transactions: vec![],
             certificates: vec![cert.clone()],
-            abort_intents: vec![],
+            conflicts: vec![],
         };
 
         let fw = Arc::new(FinalizedWave {

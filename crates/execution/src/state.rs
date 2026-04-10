@@ -32,7 +32,7 @@
 
 use hyperscale_core::{Action, CrossShardExecutionRequest, ProtocolEvent, ProvisionRequest};
 use hyperscale_types::{
-    AbortReason, BlockHeight, Bls12381G1PublicKey, ExecutionCertificate, ExecutionOutcome,
+    BlockHeight, Bls12381G1PublicKey, Conflict, ExecutionCertificate, ExecutionOutcome,
     ExecutionVote, Hash, LocalExecutionEntry, LocalReceipt, ReceiptBundle, RoutableTransaction,
     ShardGroupId, StateProvision, TopologySnapshot, TransactionDecision, TxOutcome, ValidatorId,
     WaveCertificate, WaveId,
@@ -142,7 +142,7 @@ pub struct ExecutionState {
     // Wave voting
     // ═══════════════════════════════════════════════════════════════════════
     /// Execution accumulators: collect per-tx execution results within each wave.
-    /// Tracks provision coverage and abort intents for vote height determination.
+    /// Tracks provision coverage and conflicts for vote height determination.
     accumulators: HashMap<WaveId, ExecutionAccumulator>,
 
     /// Execution vote trackers: collect execution votes from other validators.
@@ -450,11 +450,9 @@ impl ExecutionState {
         accumulator.record_result(tx_hash, outcome);
     }
 
-    /// Record an abort intent into the appropriate execution accumulator.
+    /// Record a conflict into the appropriate execution accumulator.
     ///
-    /// Record an abort intent into the appropriate execution accumulator.
-    ///
-    /// Abort intents are consensus-committed (deterministic) and ALWAYS override
+    /// Conflicts are consensus-committed (deterministic) and ALWAYS override
     /// async execution results. This ensures all validators converge to the same
     /// global_receipt_root regardless of execution timing.
     ///
@@ -462,19 +460,13 @@ impl ExecutionState {
     /// emitted during the block commit wave scan (`scan_complete_waves`).
     ///
     /// A missing wave assignment means the transaction already reached terminal
-    /// state (TC committed) — the abort intent is a harmless late arrival.
-    pub fn record_abort_intent(
-        &mut self,
-        tx_hash: Hash,
-        reason: AbortReason,
-        committed_at_height: u64,
-    ) {
+    /// state (TC committed) — the conflict is a harmless late arrival.
+    pub fn record_conflict(&mut self, tx_hash: Hash, committed_at_height: u64) {
         let Some(wave_key) = self.wave_assignments.get(&tx_hash).cloned() else {
             tracing::debug!(
                 tx_hash = %tx_hash,
-                ?reason,
                 committed_height = self.committed_height,
-                "Abort intent: no wave assignment (already cleaned up)"
+                "Conflict: no wave assignment (already cleaned up)"
             );
             return;
         };
@@ -483,7 +475,7 @@ impl ExecutionState {
             tracing::debug!(
                 tx_hash = %tx_hash,
                 wave = %wave_key,
-                "Abort intent: no accumulator for wave"
+                "Conflict: no accumulator for wave"
             );
             return;
         };
@@ -493,7 +485,7 @@ impl ExecutionState {
 
     /// Scan all waves and return completion data for any that can emit a vote.
     ///
-    /// Called at each block commit AFTER abort intents have been processed,
+    /// Called at each block commit AFTER conflicts have been processed,
     /// and also when provisions arrive or execution results complete.
     ///
     /// A wave can emit a vote when:
@@ -513,10 +505,11 @@ impl ExecutionState {
             .cloned()
             .collect();
 
+        let committed_height = self.committed_height;
         let mut votable_wave_ids = Vec::new();
         for wave_id in &candidate_ids {
             if let Some(acc) = self.accumulators.get_mut(wave_id) {
-                if acc.can_emit_vote() {
+                if acc.can_emit_vote(committed_height) {
                     votable_wave_ids.push(wave_id.clone());
                 }
             }
@@ -526,7 +519,7 @@ impl ExecutionState {
         for wave_id in votable_wave_ids {
             let accumulator = self.accumulators.get_mut(&wave_id).unwrap();
             let Some((vote_height, global_receipt_root, tx_outcomes)) =
-                accumulator.build_vote_data()
+                accumulator.build_vote_data(committed_height)
             else {
                 continue;
             };
@@ -615,7 +608,7 @@ impl ExecutionState {
 
     /// Scan complete waves and emit `SignAndSendExecutionVote` actions.
     ///
-    /// This is the SINGLE path to execution voting. Call after abort intents
+    /// This is the SINGLE path to execution voting. Call after conflicts
     /// have been processed so accumulator state is deterministic at this height.
     /// Each vote is targeted to the wave leader (N→1 routing).
     ///
@@ -674,18 +667,14 @@ impl ExecutionState {
         committed_txs
     }
 
-    /// Record abort intents from a committed block into execution accumulators.
+    /// Record conflicts from a committed block into execution accumulators.
     ///
-    /// `committed_at_height` is the local block height at which these intents
+    /// `committed_at_height` is the local block height at which these conflicts
     /// were committed. Used for height-indexed abort tracking in the re-voting
     /// protocol.
-    pub fn record_abort_intents(
-        &mut self,
-        intents: &[hyperscale_types::AbortIntent],
-        committed_at_height: u64,
-    ) {
-        for intent in intents {
-            self.record_abort_intent(intent.tx_hash, intent.reason.clone(), committed_at_height);
+    pub fn record_conflicts(&mut self, conflicts: &[Conflict], committed_at_height: u64) {
+        for conflict in conflicts {
+            self.record_conflict(conflict.tx_hash, committed_at_height);
         }
     }
 
@@ -1710,7 +1699,7 @@ impl ExecutionState {
     /// enough AND have no remaining wave_assignments pointing to them. Active
     /// wave_assignments mean the transaction has not yet reached terminal state
     /// (TC committed or abort completed), so the accumulator must stay alive to
-    /// allow abort intents and late-arriving votes to resolve the transaction.
+    /// allow conflicts and late-arriving votes to resolve the transaction.
     ///
     /// Also prunes early_votes for waves that were never set up.
     fn prune_execution_state(&mut self) {
@@ -1721,7 +1710,7 @@ impl ExecutionState {
         // Prune accumulators only when no active wave assignments reference them.
         // Waves must be retained until they resolve (EC formed + wave cert committed),
         // regardless of age. Time-based pruning would destroy accumulator state
-        // needed for abort intents to take effect.
+        // needed for conflicts to take effect.
         let before_acc = self.accumulators.len();
         self.accumulators.retain(|key, _| active_keys.contains(key));
         let pruned_acc = before_acc - self.accumulators.len();
@@ -1796,7 +1785,7 @@ impl ExecutionState {
 
     /// Returns the set of all finalized transaction hashes.
     ///
-    /// Used by the node orchestrator to pass to BFT for abort intent filtering.
+    /// Used by the node orchestrator to pass to BFT for conflict filtering.
     pub fn finalized_tx_hashes(&self) -> std::collections::HashSet<Hash> {
         self.finalized_wave_certificates
             .values()

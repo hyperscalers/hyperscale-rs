@@ -89,7 +89,7 @@ pub use signer_bitfield::SignerBitfield;
 pub use state::{StateEntry, StateProvision};
 pub use topology::{node_id_hash_u64, shard_for_node, TopologySnapshot, TopologySnapshotError};
 pub use transaction::{
-    sign_and_notarize, sign_and_notarize_with_options, AbortIntent, AbortReason, ReadyTransactions,
+    sign_and_notarize, sign_and_notarize_with_options, Conflict, ReadyTransactions,
     RoutableTransaction, TransactionDecision, TransactionError, TransactionStatus,
     TransactionStatusParseError,
 };

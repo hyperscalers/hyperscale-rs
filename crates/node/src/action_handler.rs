@@ -58,7 +58,7 @@ pub(crate) fn dispatch_pool_for(action: &Action) -> Option<DispatchPool> {
         Action::VerifyTransactionRoot { .. } => Some(DispatchPool::ConsensusCrypto),
         Action::VerifyCertificateRoot { .. } => Some(DispatchPool::ConsensusCrypto),
         Action::VerifyLocalReceiptRoot { .. } => Some(DispatchPool::ConsensusCrypto),
-        Action::VerifyAbortIntentProofs { .. } => Some(DispatchPool::ConsensusCrypto),
+        Action::VerifyConflictProofs { .. } => Some(DispatchPool::ConsensusCrypto),
         Action::BuildProposal { .. } => Some(DispatchPool::ConsensusCrypto),
 
         // General crypto
@@ -254,19 +254,19 @@ pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainRead
             })
         }
 
-        Action::VerifyAbortIntentProofs {
+        Action::VerifyConflictProofs {
             block_hash,
             proof_inputs,
         } => {
             let start = std::time::Instant::now();
-            let valid = hyperscale_bft::handlers::verify_abort_intent_proofs(&proof_inputs);
+            let valid = hyperscale_bft::handlers::verify_conflict_proofs(&proof_inputs);
             metrics::record_signature_verification_latency(
-                "abort_intent_proofs",
+                "conflict_proofs",
                 start.elapsed().as_secs_f64(),
             );
             Some(DelegatedResult {
                 events: vec![NodeInput::Protocol(ProtocolEvent::BlockRootVerified {
-                    kind: hyperscale_core::VerificationKind::AbortIntentProofs,
+                    kind: hyperscale_core::VerificationKind::ConflictProofs,
                     block_hash,
                     valid,
                 })],
@@ -325,7 +325,7 @@ pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainRead
             parent_state_root,
             transactions,
             finalized_waves,
-            abort_intents,
+            conflicts,
             waves,
         } => {
             // Extract certificates from finalized waves.
@@ -355,7 +355,7 @@ pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainRead
                 transactions,
                 certificates,
                 &all_receipts,
-                abort_intents,
+                conflicts,
                 shard_group_id,
                 waves,
             );

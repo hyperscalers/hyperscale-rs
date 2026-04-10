@@ -2,8 +2,8 @@
 
 use crate::{
     block_vote_message, compute_merkle_root, compute_merkle_root_with_proof,
-    compute_padded_merkle_root, decode_wave_cert_vec, encode_wave_cert_vec, AbortIntent,
-    BlockHeight, Bls12381G1PrivateKey, Bls12381G2Signature, Hash, QuorumCertificate, ReceiptBundle,
+    compute_padded_merkle_root, decode_wave_cert_vec, encode_wave_cert_vec, BlockHeight,
+    Bls12381G1PrivateKey, Bls12381G2Signature, Conflict, Hash, QuorumCertificate, ReceiptBundle,
     RoutableTransaction, ShardGroupId, TransactionInclusionProof, ValidatorId, WaveCertificate,
     WaveId,
 };
@@ -247,7 +247,7 @@ impl BlockHeader {
 ///
 /// Additional block contents:
 /// - **certificates**: Wave certificates (per-wave finalization proofs)
-/// - **abort_intents**: Proposals to abort transactions (timeout, livelock cycle)
+/// - **conflicts**: Livelock conflict resolutions
 ///
 /// Transactions and certificates are stored as `Arc` for efficient cloning
 /// and sharing across the system. When serialized (for storage or network),
@@ -264,7 +264,7 @@ pub struct Block {
     pub certificates: Vec<Arc<WaveCertificate>>,
 
     /// Abort intents — proposals to the execution voting process.
-    pub abort_intents: Vec<AbortIntent>,
+    pub conflicts: Vec<Conflict>,
 }
 
 // Manual PartialEq - compare transaction/certificate content, not Arc pointers
@@ -282,7 +282,7 @@ impl PartialEq for Block {
                 .iter()
                 .zip(other.certificates.iter())
                 .all(|(a, b)| a.as_ref() == b.as_ref())
-            && self.abort_intents == other.abort_intents
+            && self.conflicts == other.conflicts
     }
 }
 
@@ -317,7 +317,7 @@ impl<E: sbor::Encoder<sbor::NoCustomValueKind>> sbor::Encode<sbor::NoCustomValue
         encoder.encode(&self.header)?;
         encode_tx_vec(encoder, &self.transactions)?;
         encode_wave_cert_vec(encoder, &self.certificates)?;
-        encoder.encode(&self.abort_intents)?;
+        encoder.encode(&self.conflicts)?;
         Ok(())
     }
 }
@@ -371,13 +371,13 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
         let header: BlockHeader = decoder.decode()?;
         let transactions = decode_tx_vec(decoder)?;
         let certificates = decode_wave_cert_vec(decoder, MAX_SBOR_COLLECTION_SIZE)?;
-        let abort_intents: Vec<AbortIntent> = decoder.decode()?;
+        let conflicts: Vec<Conflict> = decoder.decode()?;
 
         Ok(Self {
             header,
             transactions,
             certificates,
-            abort_intents,
+            conflicts,
         })
     }
 }
@@ -403,7 +403,7 @@ impl Block {
             header: BlockHeader::genesis(shard_group_id, proposer, state_root),
             transactions: vec![],
             certificates: vec![],
-            abort_intents: vec![],
+            conflicts: vec![],
         }
     }
 
@@ -442,24 +442,24 @@ impl Block {
         self.certificates.len()
     }
 
-    /// Get number of abort intents in this block.
-    pub fn abort_intent_count(&self) -> usize {
-        self.abort_intents.len()
+    /// Get number of conflicts in this block.
+    pub fn conflict_count(&self) -> usize {
+        self.conflicts.len()
     }
 
-    /// Get transaction hashes of abort intents.
-    pub fn abort_intent_hashes(&self) -> Vec<Hash> {
-        self.abort_intents.iter().map(|a| a.tx_hash).collect()
+    /// Get transaction hashes targeted by conflicts.
+    pub fn conflict_hashes(&self) -> Vec<Hash> {
+        self.conflicts.iter().map(|c| c.tx_hash).collect()
     }
 
-    /// Check if this block contains an abort intent for a specific transaction.
-    pub fn contains_abort_intent(&self, tx_hash: &Hash) -> bool {
-        self.abort_intents.iter().any(|a| &a.tx_hash == tx_hash)
+    /// Check if this block contains a conflict for a specific transaction.
+    pub fn contains_conflict(&self, tx_hash: &Hash) -> bool {
+        self.conflicts.iter().any(|c| &c.tx_hash == tx_hash)
     }
 
     /// Check if this block has any livelock-related content.
     pub fn has_livelock_content(&self) -> bool {
-        !self.abort_intents.is_empty()
+        !self.conflicts.is_empty()
     }
 }
 
@@ -483,7 +483,7 @@ pub struct BlockManifest {
     pub cert_hashes: Vec<Hash>,
 
     /// Abort intents (small, stored inline).
-    pub abort_intents: Vec<AbortIntent>,
+    pub conflicts: Vec<Conflict>,
 }
 
 impl BlockManifest {
@@ -503,7 +503,7 @@ impl BlockManifest {
                 .iter()
                 .map(|c| c.wave_id.hash())
                 .collect(),
-            abort_intents: block.abort_intents.clone(),
+            conflicts: block.conflicts.clone(),
         }
     }
 }

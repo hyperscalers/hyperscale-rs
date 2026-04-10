@@ -3,11 +3,11 @@
 use crate::{ProtocolEvent, TimerId};
 use hyperscale_messages::{BlockHeaderNotification, BlockVoteNotification, TransactionGossip};
 use hyperscale_types::{
-    AbortIntent, Block, BlockHeight, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature,
-    CommittedBlockHeader, EpochConfig, EpochId, ExecutionCertificate, ExecutionVote, FinalizedWave,
-    Hash, NodeId, ProvisionBatch, QuorumCertificate, ReceiptBundle, RoutableTransaction,
-    ShardGroupId, SignerBitfield, StateProvision, TopologySnapshot, TxOutcome, ValidatorId,
-    VotePower, WaveCertificate, WaveId,
+    Block, BlockHeight, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature, CommittedBlockHeader,
+    Conflict, EpochConfig, EpochId, ExecutionCertificate, ExecutionVote, FinalizedWave, Hash,
+    NodeId, ProvisionBatch, QuorumCertificate, ReceiptBundle, RoutableTransaction, ShardGroupId,
+    SignerBitfield, StateProvision, TopologySnapshot, TxOutcome, ValidatorId, VotePower,
+    WaveCertificate, WaveId,
 };
 use std::collections::HashMap;
 use std::fmt;
@@ -443,18 +443,17 @@ pub enum Action {
         receipts: Vec<ReceiptBundle>,
     },
 
-    /// Verify abort intent inclusion proofs off-thread.
+    /// Verify conflict inclusion proofs off-thread.
     ///
-    /// For each livelock cycle abort intent, verifies the merkle inclusion
-    /// proof for the winner transaction against the source block's
-    /// QC-attested `transaction_root`.
-    /// Returns `ProtocolEvent::AbortIntentProofsVerified`.
-    VerifyAbortIntentProofs {
+    /// For each livelock conflict, verifies the merkle inclusion proof for the
+    /// winner transaction against the source block's QC-attested `transaction_root`.
+    /// Returns `ProtocolEvent::ConflictProofsVerified`.
+    VerifyConflictProofs {
         block_hash: Hash,
-        /// Pairs of (abort_intent, transaction_root from remote committed header).
+        /// Pairs of (conflict, transaction_root from remote committed header).
         /// The transaction_root is QC-attested — looked up by NodeStateMachine
         /// from the ProvisionCoordinator's verified remote headers.
-        proof_inputs: Vec<(AbortIntent, Hash)>,
+        proof_inputs: Vec<(Conflict, Hash)>,
     },
 
     /// Build a complete block proposal.
@@ -480,7 +479,7 @@ pub enum Action {
         transactions: Vec<Arc<RoutableTransaction>>,
         /// Finalized waves to include in the block (carries certs + receipts + ECs).
         finalized_waves: Vec<Arc<FinalizedWave>>,
-        abort_intents: Vec<AbortIntent>,
+        conflicts: Vec<Conflict>,
         /// Cross-shard execution waves in this block.
         waves: Vec<WaveId>,
     },
@@ -864,7 +863,7 @@ impl Action {
             Action::VerifyTransactionRoot { .. } => "VerifyTransactionRoot",
             Action::VerifyCertificateRoot { .. } => "VerifyCertificateRoot",
             Action::VerifyLocalReceiptRoot { .. } => "VerifyLocalReceiptRoot",
-            Action::VerifyAbortIntentProofs { .. } => "VerifyAbortIntentProofs",
+            Action::VerifyConflictProofs { .. } => "VerifyConflictProofs",
             Action::BuildProposal { .. } => "BuildProposal",
 
             // Delegated Work - Execution

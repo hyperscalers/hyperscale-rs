@@ -119,7 +119,7 @@ mod tests {
             },
             transactions: vec![std::sync::Arc::new(tx)],
             certificates: vec![],
-            abort_intents: vec![],
+            conflicts: vec![],
         }
     }
 

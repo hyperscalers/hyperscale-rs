@@ -6,20 +6,22 @@
 //!
 //! ## Vote Height Determination
 //!
-//! The accumulator separates two concerns:
+//! The target vote height is the lowest height at which every tx is *coverable*:
+//! - Provisioned txs are covered at height 0 (execution possible)
+//! - Conflict-aborted txs are covered at the height the conflict was committed
+//! - Unprovisioned txs are implicitly covered at `WAVE_TIMEOUT_BLOCKS` (deterministic timeout)
 //!
-//! 1. **Target vote height** — the lowest height at which every tx is *coverable*
-//!    (has provisions OR has an abort intent at that height). This changes only
-//!    when provisions arrive or abort intents are committed.
-//!
-//! 2. **Vote emission** — requires all covered-by-execution txs at the target
-//!    height to have their execution results back. This is just waiting for
-//!    async work to complete.
+//! Vote emission requires all execution-covered txs at the target height to have
+//! their results back. Aborted/timed-out txs have known outcomes immediately.
 
 use hyperscale_types::{
     compute_execution_receipt_root, ExecutionOutcome, Hash, ShardGroupId, TxOutcome, WaveId,
 };
 use std::collections::{HashMap, HashSet};
+
+/// Number of blocks after wave start before unprovisioned txs are implicitly aborted.
+/// Deterministic: all validators compute the same timeout from the same wave start height.
+pub const WAVE_TIMEOUT_BLOCKS: u64 = 32;
 
 /// Tracks execution progress for a single wave within a block.
 ///
@@ -28,8 +30,8 @@ use std::collections::{HashMap, HashSet};
 /// txs complete when provisions arrive and execution finishes).
 ///
 /// Supports height-indexed abort tracking for the re-voting protocol:
-/// a tx is "coverable" at vote_height N if it has provisions (execution
-/// possible) OR has an abort intent committed at or before wave_start + N.
+/// a tx is "coverable" at vote_height N if it has provisions, has a
+/// conflict committed at or before wave_start + N, or N >= WAVE_TIMEOUT_BLOCKS.
 #[derive(Debug)]
 pub struct ExecutionAccumulator {
     /// Wave identifier (provision dependency set).
@@ -46,8 +48,8 @@ pub struct ExecutionAccumulator {
     execution_results: HashMap<Hash, TxResult>,
     /// Txs that have received provisions (execution is possible/in-flight).
     provisioned: HashSet<Hash>,
-    /// Abort intents indexed by the local block height at which they were committed.
-    /// Key: tx_hash, Value: committed_at_height (absolute).
+    /// Explicit aborts (from livelock conflicts) indexed by tx_hash.
+    /// Value: the local block height at which the conflict was committed.
     aborts: HashMap<Hash, AbortEntry>,
     /// Cached target vote height. Recomputed when inputs change (provisions or aborts).
     cached_target_vote_height: Option<u64>,
@@ -61,10 +63,10 @@ struct TxResult {
     outcome: ExecutionOutcome,
 }
 
-/// An abort intent with its commit height.
+/// An explicit abort (from a livelock conflict) with its commit height.
 #[derive(Debug, Clone)]
 struct AbortEntry {
-    /// The local block height at which this abort intent was committed.
+    /// The local block height at which the conflict was committed.
     committed_at_height: u64,
 }
 
@@ -124,8 +126,8 @@ impl ExecutionAccumulator {
         count
     }
 
-    /// Whether all expected transactions have some outcome (execution result or abort).
-    /// This is the legacy check — all txs resolved regardless of vote height.
+    /// Whether all expected transactions have a stored outcome (execution result or
+    /// explicit abort). Does not account for implicit timeouts.
     pub fn is_complete(&self) -> bool {
         self.expected_txs
             .iter()
@@ -147,12 +149,12 @@ impl ExecutionAccumulator {
         }
     }
 
-    /// Record an abort intent with the local block height at which it was committed.
+    /// Record an explicit abort (from a livelock conflict) at the given commit height.
     ///
-    /// Abort intents are tracked separately from execution results.
-    /// At vote emission time, the appropriate outcome (abort or execution) is
-    /// chosen based on the target vote height.
-    /// Returns `true` if the wave is now complete (all txs have some outcome).
+    /// Aborts are tracked separately from execution results. At vote emission
+    /// time, the appropriate outcome (abort or execution) is chosen based on
+    /// the target vote height.
+    /// Returns `true` if the wave is now complete (all txs have some stored outcome).
     pub fn record_abort(&mut self, tx_hash: Hash, committed_at_height: u64) -> bool {
         if !self.expected_txs.iter().any(|(h, _)| *h == tx_hash) {
             return false;
@@ -173,7 +175,7 @@ impl ExecutionAccumulator {
     ///
     /// Returns `true` if the wave is now complete (all txs have results).
     /// First-write-wins: ignores duplicate execution results for the same tx_hash.
-    /// Use [`record_abort`] for abort intents, which override execution results.
+    /// Use [`record_abort`] for conflict aborts, which take priority at the abort height.
     pub fn record_result(&mut self, tx_hash: Hash, outcome: ExecutionOutcome) -> bool {
         // Only record if this tx is expected in this wave
         if !self.expected_txs.iter().any(|(h, _)| *h == tx_hash) {
@@ -217,54 +219,50 @@ impl ExecutionAccumulator {
     /// in the wave is *coverable*.
     ///
     /// A tx is coverable at vote_height N if:
-    /// - It has provisions (execution possible), OR
-    /// - It has an abort intent committed at block height ≤ wave_start + N
+    /// - It has provisions (execution possible) → covered at height 0
+    /// - It has an explicit abort (livelock) committed at height H → covered at H - wave_start
+    /// - Neither → implicitly covered at WAVE_TIMEOUT_BLOCKS (deterministic timeout)
     ///
-    /// Returns `None` if no vote height is coverable (some txs have neither
-    /// provisions nor any abort intent).
-    pub fn target_vote_height(&mut self) -> Option<u64> {
+    /// Always returns a value — every tx is coverable at worst by timeout.
+    pub fn target_vote_height(&mut self) -> u64 {
         if let Some(cached) = self.cached_target_vote_height {
-            return Some(cached);
+            return cached;
         }
 
         let wave_start = self.block_height;
-
-        // For each tx, determine the minimum vote_height at which it's covered.
-        // - If provisioned: covered at height 0 (no abort needed)
-        // - If aborted: covered at height (committed_at - wave_start)
-        // - If neither: not coverable at any height → return None
         let mut max_required_height: u64 = 0;
 
         for (tx_hash, _) in &self.expected_txs {
             if self.provisioned.contains(tx_hash) {
-                // Covered at height 0
                 continue;
             }
             if let Some(abort) = self.aborts.get(tx_hash) {
-                // Covered at the height when the abort was committed
                 let required = abort.committed_at_height.saturating_sub(wave_start);
                 max_required_height = max_required_height.max(required);
             } else {
-                // Not coverable at any height
-                return None;
+                // Implicit timeout — coverable at WAVE_TIMEOUT_BLOCKS
+                max_required_height = max_required_height.max(WAVE_TIMEOUT_BLOCKS);
             }
         }
 
         self.cached_target_vote_height = Some(max_required_height);
-        Some(max_required_height)
+        max_required_height
     }
 
     /// Whether a vote can be emitted at the current target height.
     ///
     /// Requires:
-    /// 1. A target vote height exists (all txs coverable)
-    /// 2. All txs covered by execution (not abort) at that height have results
+    /// 1. The committed chain has reached the target height
+    /// 2. All txs covered by execution (not abort/timeout) at that height have results
     /// 3. The target height is lower than (or equal to) any previous vote
     ///    (only re-vote downward), OR no previous vote exists
-    pub fn can_emit_vote(&mut self) -> bool {
-        let Some(target) = self.target_vote_height() else {
+    pub fn can_emit_vote(&mut self, committed_height: u64) -> bool {
+        let target = self.target_vote_height();
+
+        // Gate: committed chain must have reached the target height
+        if committed_height < self.block_height + target {
             return false;
-        };
+        }
 
         // Only re-vote downward
         if let Some(last) = self.last_voted_height {
@@ -273,13 +271,17 @@ impl ExecutionAccumulator {
             }
         }
 
-        // Check that all execution-covered txs at this height have results
+        // Check that all execution-covered txs at this height have results.
+        // Timed-out txs (not provisioned, no explicit abort, target >= TIMEOUT) and
+        // explicitly aborted txs have known outcomes — no execution result needed.
         let wave_start = self.block_height;
         for (tx_hash, _) in &self.expected_txs {
             if self.is_covered_by_abort_at(tx_hash, wave_start + target) {
-                continue; // Abort outcome is known immediately
+                continue;
             }
-            // Must be covered by execution — check if result is available
+            if !self.provisioned.contains(tx_hash) && target >= WAVE_TIMEOUT_BLOCKS {
+                continue; // Implicit timeout — abort outcome known
+            }
             if !self.execution_results.contains_key(tx_hash) {
                 return false;
             }
@@ -290,13 +292,17 @@ impl ExecutionAccumulator {
     /// Build the receipt data at the target vote height.
     ///
     /// At the target height, each tx's outcome is:
-    /// - Abort intent outcome (if abort committed at ≤ wave_start + target)
+    /// - Abort (if explicit abort committed at ≤ wave_start + target)
+    /// - Abort (if implicit timeout: not provisioned and target ≥ WAVE_TIMEOUT_BLOCKS)
     /// - Execution result (otherwise — must exist since can_emit_vote() passed)
     ///
     /// Returns `(vote_height, global_receipt_root, tx_outcomes)`.
     /// Returns `None` if the vote cannot be emitted.
-    pub fn build_vote_data(&mut self) -> Option<(u64, Hash, Vec<TxOutcome>)> {
-        if !self.can_emit_vote() {
+    pub fn build_vote_data(
+        &mut self,
+        committed_height: u64,
+    ) -> Option<(u64, Hash, Vec<TxOutcome>)> {
+        if !self.can_emit_vote(committed_height) {
             return None;
         }
 
@@ -309,14 +315,14 @@ impl ExecutionAccumulator {
             .map(|(tx_hash, _)| {
                 let outcome = if let Some(abort) = self.aborts.get(tx_hash) {
                     if abort.committed_at_height <= wave_start + target {
-                        // Use abort outcome at this height
                         ExecutionOutcome::Aborted
                     } else {
-                        // Abort exists but at a higher height — use execution result
                         self.execution_results[tx_hash].outcome.clone()
                     }
+                } else if !self.provisioned.contains(tx_hash) && target >= WAVE_TIMEOUT_BLOCKS {
+                    // Implicit timeout — no provisions, no explicit abort
+                    ExecutionOutcome::Aborted
                 } else {
-                    // No abort — use execution result
                     self.execution_results[tx_hash].outcome.clone()
                 };
                 TxOutcome {
@@ -337,39 +343,6 @@ impl ExecutionAccumulator {
     /// Record that we voted at a specific height (set by external caller).
     pub fn set_last_voted_height(&mut self, height: u64) {
         self.last_voted_height = Some(height);
-    }
-
-    /// Build the receipt data once all transactions are complete (legacy path).
-    ///
-    /// Returns `(global_receipt_root, tx_outcomes)` where outcomes are in
-    /// wave order (block order within the wave).
-    ///
-    /// Returns `None` if not all transactions have completed.
-    pub fn build_data(&self) -> Option<(Hash, Vec<TxOutcome>)> {
-        if !self.is_complete() {
-            return None;
-        }
-
-        // Build outcomes in wave order (same as expected_txs order).
-        // Abort outcomes take priority over execution results.
-        let outcomes: Vec<TxOutcome> = self
-            .expected_txs
-            .iter()
-            .map(|(tx_hash, _)| {
-                let outcome = if self.aborts.contains_key(tx_hash) {
-                    ExecutionOutcome::Aborted
-                } else {
-                    self.execution_results[tx_hash].outcome.clone()
-                };
-                TxOutcome {
-                    tx_hash: *tx_hash,
-                    outcome,
-                }
-            })
-            .collect();
-
-        let root = compute_execution_receipt_root(&outcomes);
-        Some((root, outcomes))
     }
 
     /// Get the union of all participating shards across all txs in this wave.
@@ -397,7 +370,7 @@ impl ExecutionAccumulator {
         self.cached_target_vote_height = None;
     }
 
-    /// Check if a tx is covered by an abort intent at or before the given absolute height.
+    /// Check if a tx is covered by an explicit abort at or before the given absolute height.
     fn is_covered_by_abort_at(&self, tx_hash: &Hash, abs_height: u64) -> bool {
         self.aborts
             .get(tx_hash)
@@ -409,6 +382,11 @@ impl ExecutionAccumulator {
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    /// Wave starts at height 10. Use committed_height >= 10 + target to gate votes.
+    const WAVE_START: u64 = 10;
+    /// A committed_height high enough that timeout has elapsed.
+    const HIGH: u64 = WAVE_START + WAVE_TIMEOUT_BLOCKS + 10;
 
     fn make_accumulator(n: usize) -> ExecutionAccumulator {
         let txs: Vec<(Hash, Vec<ShardGroupId>)> = (0..n)
@@ -423,7 +401,7 @@ mod tests {
         ExecutionAccumulator::new(
             WaveId::new(ShardGroupId(0), 0, BTreeSet::new()),
             Hash::from_bytes(b"block"),
-            10,
+            WAVE_START,
             txs,
         )
     }
@@ -448,11 +426,12 @@ mod tests {
     fn test_empty_accumulator() {
         let mut acc = make_accumulator(0);
         assert!(acc.is_complete());
-        let (root, outcomes) = acc.build_data().unwrap();
+        assert_eq!(acc.target_vote_height(), 0);
+        assert!(acc.can_emit_vote(WAVE_START));
+        let (vh, root, outcomes) = acc.build_vote_data(WAVE_START).unwrap();
+        assert_eq!(vh, 0);
         assert_eq!(root, Hash::ZERO);
         assert!(outcomes.is_empty());
-        // Empty wave: target vote height is 0, can emit immediately
-        assert_eq!(acc.target_vote_height(), Some(0));
     }
 
     #[test]
@@ -461,21 +440,21 @@ mod tests {
         let tx_hash = Hash::from_bytes(&[0u8; 4]);
         let receipt = Hash::from_bytes(b"receipt");
 
-        // Not coverable yet — no provisions, no abort
-        assert_eq!(acc.target_vote_height(), None);
+        // No provisions — target is WAVE_TIMEOUT_BLOCKS (implicit timeout)
+        assert_eq!(acc.target_vote_height(), WAVE_TIMEOUT_BLOCKS);
 
-        // Provisions arrive
+        // Provisions arrive → target drops to 0
         acc.mark_provisioned(tx_hash);
-        assert_eq!(acc.target_vote_height(), Some(0));
+        assert_eq!(acc.target_vote_height(), 0);
 
         // Can't emit yet — no execution result
-        assert!(!acc.can_emit_vote());
+        assert!(!acc.can_emit_vote(WAVE_START));
 
         // Execution completes
         acc.record_result(tx_hash, executed(receipt));
-        assert!(acc.can_emit_vote());
+        assert!(acc.can_emit_vote(WAVE_START));
 
-        let (vh, root, outcomes) = acc.build_vote_data().unwrap();
+        let (vh, root, outcomes) = acc.build_vote_data(WAVE_START).unwrap();
         assert_eq!(vh, 0);
         assert_ne!(root, Hash::ZERO);
         assert_eq!(outcomes.len(), 1);
@@ -486,19 +465,18 @@ mod tests {
         let mut acc = make_accumulator(1);
         let tx_hash = Hash::from_bytes(&[0u8; 4]);
 
-        // No provisions, no abort — not coverable
-        assert_eq!(acc.target_vote_height(), None);
+        // No provisions, no abort — target is WAVE_TIMEOUT_BLOCKS
+        assert_eq!(acc.target_vote_height(), WAVE_TIMEOUT_BLOCKS);
 
-        // Abort committed at height 15 (wave starts at 10)
+        // Abort committed at height 15 (wave starts at 10) → target = 5
         acc.record_abort(tx_hash, 15);
+        assert_eq!(acc.target_vote_height(), 5);
 
-        // Target vote height = 15 - 10 = 5
-        assert_eq!(acc.target_vote_height(), Some(5));
+        // Can emit once committed_height >= 15
+        assert!(!acc.can_emit_vote(14));
+        assert!(acc.can_emit_vote(15));
 
-        // Can emit immediately (abort outcome is known)
-        assert!(acc.can_emit_vote());
-
-        let (vh, _, outcomes) = acc.build_vote_data().unwrap();
+        let (vh, _, outcomes) = acc.build_vote_data(15).unwrap();
         assert_eq!(vh, 5);
         assert!(outcomes[0].is_aborted());
     }
@@ -514,16 +492,16 @@ mod tests {
         acc.record_abort(tx1, 12);
 
         // Target = max(0, 12-10) = 2
-        assert_eq!(acc.target_vote_height(), Some(2));
+        assert_eq!(acc.target_vote_height(), 2);
 
         // Can't emit yet — tx0 has provisions but no execution result
-        assert!(!acc.can_emit_vote());
+        assert!(!acc.can_emit_vote(12));
 
         // tx0 execution completes
         acc.record_result(tx0, executed(Hash::from_bytes(b"r0")));
-        assert!(acc.can_emit_vote());
+        assert!(acc.can_emit_vote(12));
 
-        let (vh, _, outcomes) = acc.build_vote_data().unwrap();
+        let (vh, _, outcomes) = acc.build_vote_data(12).unwrap();
         assert_eq!(vh, 2);
         assert!(!outcomes[0].is_aborted()); // tx0 executed
         assert!(outcomes[1].is_aborted()); // tx1 aborted
@@ -541,22 +519,21 @@ mod tests {
         acc.record_result(tx0, executed(Hash::from_bytes(b"r0")));
 
         // Vote at height 5 (15-10)
-        let (vh, _, _) = acc.build_vote_data().unwrap();
+        let (vh, _, _) = acc.build_vote_data(15).unwrap();
         assert_eq!(vh, 5);
 
         // Now tx1 provisions arrive → target drops to 0
         acc.mark_provisioned(tx1);
-        assert_eq!(acc.target_vote_height(), Some(0));
+        assert_eq!(acc.target_vote_height(), 0);
 
         // Can't emit at height 0 yet — tx1 has no execution result
-        // (abort is at height 5, but at height 0 there's no abort, so we need execution)
-        assert!(!acc.can_emit_vote());
+        assert!(!acc.can_emit_vote(WAVE_START));
 
         // tx1 execution completes
         acc.record_result(tx1, executed(Hash::from_bytes(b"r1")));
-        assert!(acc.can_emit_vote());
+        assert!(acc.can_emit_vote(WAVE_START));
 
-        let (vh, _, outcomes) = acc.build_vote_data().unwrap();
+        let (vh, _, outcomes) = acc.build_vote_data(WAVE_START).unwrap();
         assert_eq!(vh, 0);
         // At height 0, both txs use execution results (no aborts at height 0)
         assert!(!outcomes[0].is_aborted());
@@ -572,11 +549,11 @@ mod tests {
         acc.mark_provisioned(tx0);
         acc.record_result(tx0, executed(Hash::from_bytes(b"r")));
 
-        let (vh, _, _) = acc.build_vote_data().unwrap();
+        let (vh, _, _) = acc.build_vote_data(WAVE_START).unwrap();
         assert_eq!(vh, 0);
 
         // Can't emit again at height 0 (already voted there)
-        assert!(!acc.can_emit_vote());
+        assert!(!acc.can_emit_vote(HIGH));
     }
 
     #[test]
@@ -604,11 +581,12 @@ mod tests {
 
         for i in (0..3).rev() {
             let tx = Hash::from_bytes(&[i as u8; 4]);
+            acc.mark_provisioned(tx);
             let receipt = Hash::from_bytes(&[i as u8 + 100; 4]);
             acc.record_result(tx, executed(receipt));
         }
 
-        let (_, outcomes) = acc.build_data().unwrap();
+        let (_, _, outcomes) = acc.build_vote_data(WAVE_START).unwrap();
 
         // Outcomes should be in wave order (0, 1, 2), not completion order (2, 1, 0)
         for (i, outcome) in outcomes.iter().enumerate().take(3) {
@@ -621,10 +599,11 @@ mod tests {
         let mut acc = make_accumulator(1);
         let tx = Hash::from_bytes(&[0u8; 4]);
 
+        acc.mark_provisioned(tx);
         acc.record_result(tx, executed(Hash::from_bytes(b"first")));
         acc.record_result(tx, executed_fail(Hash::from_bytes(b"second")));
 
-        let (_, outcomes) = acc.build_data().unwrap();
+        let (_, _, outcomes) = acc.build_vote_data(WAVE_START).unwrap();
         match &outcomes[0].outcome {
             ExecutionOutcome::Executed {
                 receipt_hash,
@@ -648,27 +627,22 @@ mod tests {
     }
 
     #[test]
-    fn test_build_returns_none_when_incomplete() {
-        let mut acc = make_accumulator(2);
-        let tx0 = Hash::from_bytes(&[0u8; 4]);
-        acc.record_result(tx0, executed(Hash::from_bytes(b"r")));
-
-        assert!(acc.build_data().is_none());
-    }
-
-    #[test]
-    fn test_abort_overrides_execution() {
+    fn test_abort_overrides_execution_at_abort_height() {
         let mut acc = make_accumulator(1);
         let tx = Hash::from_bytes(&[0u8; 4]);
 
         // Execution result arrives first
+        acc.mark_provisioned(tx);
         acc.record_result(tx, executed(Hash::from_bytes(b"exec")));
 
-        // Abort intent arrives later — overrides
+        // Conflict abort arrives later at height 12 — overrides at target >= 2
         acc.record_abort(tx, 12);
 
-        let (_, outcomes) = acc.build_data().unwrap();
-        assert!(outcomes[0].is_aborted());
+        // Target is still 0 (provisioned), but abort exists at height 2
+        // At target 0, abort doesn't apply (committed_at 12 > wave_start + 0)
+        let (vh, _, outcomes) = acc.build_vote_data(WAVE_START).unwrap();
+        assert_eq!(vh, 0);
+        assert!(!outcomes[0].is_aborted()); // execution result used at height 0
     }
 
     #[test]
@@ -698,12 +672,71 @@ mod tests {
     }
 
     #[test]
-    fn test_partially_coverable() {
+    fn test_implicit_timeout_coverable() {
         let mut acc = make_accumulator(2);
         let tx0 = Hash::from_bytes(&[0u8; 4]);
 
-        // Only tx0 has provisions — tx1 has nothing
+        // Only tx0 has provisions — tx1 falls back to implicit timeout
         acc.mark_provisioned(tx0);
-        assert_eq!(acc.target_vote_height(), None); // tx1 uncoverable
+        assert_eq!(acc.target_vote_height(), WAVE_TIMEOUT_BLOCKS);
+    }
+
+    #[test]
+    fn test_implicit_timeout_emits_all_abort() {
+        let mut acc = make_accumulator(2);
+
+        // Neither tx has provisions — both timeout
+        assert_eq!(acc.target_vote_height(), WAVE_TIMEOUT_BLOCKS);
+
+        // Not yet at timeout height
+        assert!(!acc.can_emit_vote(WAVE_START + WAVE_TIMEOUT_BLOCKS - 1));
+
+        // At timeout height — can emit, all aborted
+        assert!(acc.can_emit_vote(WAVE_START + WAVE_TIMEOUT_BLOCKS));
+
+        let (vh, _, outcomes) = acc
+            .build_vote_data(WAVE_START + WAVE_TIMEOUT_BLOCKS)
+            .unwrap();
+        assert_eq!(vh, WAVE_TIMEOUT_BLOCKS);
+        assert!(outcomes[0].is_aborted());
+        assert!(outcomes[1].is_aborted());
+    }
+
+    #[test]
+    fn test_provisions_after_timeout_revote_downward() {
+        let mut acc = make_accumulator(1);
+        let tx0 = Hash::from_bytes(&[0u8; 4]);
+
+        // No provisions → timeout at WAVE_TIMEOUT_BLOCKS
+        let (vh, _, outcomes) = acc.build_vote_data(HIGH).unwrap();
+        assert_eq!(vh, WAVE_TIMEOUT_BLOCKS);
+        assert!(outcomes[0].is_aborted());
+
+        // Provisions arrive → target drops to 0
+        acc.mark_provisioned(tx0);
+        assert_eq!(acc.target_vote_height(), 0);
+
+        // Need execution result to re-vote
+        assert!(!acc.can_emit_vote(HIGH));
+
+        acc.record_result(tx0, executed(Hash::from_bytes(b"r")));
+        assert!(acc.can_emit_vote(HIGH));
+
+        let (vh, _, outcomes) = acc.build_vote_data(HIGH).unwrap();
+        assert_eq!(vh, 0);
+        assert!(!outcomes[0].is_aborted());
+    }
+
+    #[test]
+    fn test_committed_height_gates_vote() {
+        let mut acc = make_accumulator(1);
+        let tx0 = Hash::from_bytes(&[0u8; 4]);
+
+        acc.mark_provisioned(tx0);
+        acc.record_result(tx0, executed(Hash::from_bytes(b"r")));
+
+        // target = 0, so need committed_height >= WAVE_START + 0 = 10
+        assert!(!acc.can_emit_vote(WAVE_START - 1));
+        assert!(acc.can_emit_vote(WAVE_START));
     }
 }

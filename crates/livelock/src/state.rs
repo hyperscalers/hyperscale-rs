@@ -1,4 +1,4 @@
-//! LivelockState sub-state machine for cycle detection and abort intent management.
+//! LivelockState sub-state machine for cycle detection and conflict management.
 //!
 //! This module implements the provision-based cycle detection system that
 //! prevents bidirectional livelock in cross-shard transactions.
@@ -6,8 +6,8 @@
 use crate::tracker::{CommittedCrossShardTracker, ProvisionTracker, RemoteStateNeeds};
 use hyperscale_core::{Action, InclusionProofFetchReason};
 use hyperscale_types::{
-    AbortIntent, AbortReason, BlockHeight, Hash, NodeId, RoutableTransaction, ShardGroupId,
-    StateEntry, TopologySnapshot, TransactionInclusionProof,
+    BlockHeight, Conflict, Hash, NodeId, RoutableTransaction, ShardGroupId, StateEntry,
+    TopologySnapshot, TransactionInclusionProof,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
@@ -16,11 +16,11 @@ use tracing::{debug, trace};
 /// Output produced by the livelock state machine when a cycle is detected.
 ///
 /// The caller must fetch the inclusion proof from the source shard and then
-/// call `on_inclusion_proof_received` to complete the abort intent queuing.
+/// call `on_inclusion_proof_received` to complete the conflict queuing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LivelockOutput {
     /// A cycle was detected; fetch the merkle inclusion proof for the winner TX
-    /// from its source shard before we can queue the abort intent.
+    /// from its source shard before we can queue the conflict.
     FetchInclusionProof {
         source_shard: ShardGroupId,
         source_block_height: BlockHeight,
@@ -78,12 +78,12 @@ pub struct LivelockState {
     /// haven't received them yet.
     pending_proof_fetches: HashSet<Hash>,
 
-    /// Abort intents ready to be included in next block proposal.
+    /// Conflicts ready to be included in next block proposal.
     /// Kept until they appear in a committed block.
-    pending_abort_intents: Vec<AbortIntent>,
+    pending_conflicts: Vec<Conflict>,
 
-    /// Hash set tracking queued abort intent tx_hashes for deduplication.
-    pending_abort_intent_hashes: HashSet<Hash>,
+    /// Hash set tracking queued conflict tx_hashes for deduplication.
+    pending_conflict_hashes: HashSet<Hash>,
 
     /// Current time.
     now: Duration,
@@ -98,10 +98,7 @@ impl std::fmt::Debug for LivelockState {
             .field("committed_tracker_len", &self.committed_tracker.len())
             .field("provision_tracker_len", &self.provision_tracker.len())
             .field("tombstones_len", &self.tombstones.len())
-            .field(
-                "pending_abort_intents_len",
-                &self.pending_abort_intents.len(),
-            )
+            .field("pending_conflicts_len", &self.pending_conflicts.len())
             .finish()
     }
 }
@@ -125,8 +122,8 @@ impl LivelockState {
             provision_tracker: ProvisionTracker::new(),
             tombstones: HashMap::new(),
             pending_proof_fetches: HashSet::new(),
-            pending_abort_intents: Vec::new(),
-            pending_abort_intent_hashes: HashSet::new(),
+            pending_conflicts: Vec::new(),
+            pending_conflict_hashes: HashSet::new(),
             now: Duration::ZERO,
             config,
         }
@@ -372,9 +369,9 @@ impl LivelockState {
                     "TRUE cycle detected with overlapping nodes - requesting inclusion proof"
                 );
 
-                // Don't queue the abort intent yet — we need the inclusion proof first.
+                // Don't queue the conflict yet — we need the inclusion proof first.
                 // Track that we have an in-flight fetch for this loser.
-                if !self.pending_abort_intent_hashes.contains(&loser)
+                if !self.pending_conflict_hashes.contains(&loser)
                     && !self.pending_proof_fetches.contains(&loser)
                 {
                     self.pending_proof_fetches.insert(loser);
@@ -400,8 +397,8 @@ impl LivelockState {
 
     /// Called when the inclusion proof for a winner transaction has been fetched.
     ///
-    /// Completes the two-phase abort intent: the proof is attached to the
-    /// `AbortIntent` which is then queued for block inclusion.
+    /// Completes the two-phase conflict: the proof is attached to the
+    /// `Conflict` which is then queued for block inclusion.
     pub fn on_inclusion_proof_received(
         &mut self,
         winner_tx_hash: Hash,
@@ -411,7 +408,7 @@ impl LivelockState {
         source_block_height: BlockHeight,
     ) {
         self.pending_proof_fetches.remove(&loser_tx_hash);
-        self.queue_abort_intent(
+        self.queue_conflict(
             loser_tx_hash,
             winner_tx_hash,
             source_shard,
@@ -420,11 +417,11 @@ impl LivelockState {
         );
     }
 
-    /// Queue an abort intent for inclusion in the next block.
+    /// Queue a conflict for inclusion in the next block.
     ///
-    /// The abort intent carries a merkle inclusion proof for the winner transaction.
-    /// BFT validation rejects abort intents without valid proofs.
-    fn queue_abort_intent(
+    /// The conflict carries a merkle inclusion proof for the winner transaction.
+    /// BFT validation rejects conflicts without valid proofs.
+    fn queue_conflict(
         &mut self,
         loser_tx: Hash,
         winner_tx: Hash,
@@ -433,46 +430,44 @@ impl LivelockState {
         proof: TransactionInclusionProof,
     ) {
         // Check if already queued
-        if self.pending_abort_intent_hashes.contains(&loser_tx) {
-            trace!(tx = %loser_tx, "Abort intent already queued");
+        if self.pending_conflict_hashes.contains(&loser_tx) {
+            trace!(tx = %loser_tx, "Conflict already queued");
             return;
         }
 
-        let abort_intent = AbortIntent {
+        let conflict = Conflict {
             tx_hash: loser_tx,
-            reason: AbortReason::LivelockCycle {
-                winner_tx_hash: winner_tx,
-                source_shard,
-                source_block_height,
-                tx_inclusion_proof: proof,
-            },
             block_height: BlockHeight(0), // Will be filled in when included in block
+            winner_tx_hash: winner_tx,
+            source_shard,
+            source_block_height,
+            tx_inclusion_proof: proof,
         };
 
         debug!(
             loser_tx = %loser_tx,
             winner_tx = %winner_tx,
             source_shard = source_shard.0,
-            "Queuing abort intent with inclusion proof"
+            "Queuing conflict with inclusion proof"
         );
 
-        self.pending_abort_intent_hashes.insert(loser_tx);
-        self.pending_abort_intents.push(abort_intent);
+        self.pending_conflict_hashes.insert(loser_tx);
+        self.pending_conflicts.push(conflict);
     }
 
-    /// Get pending abort intents for block inclusion.
+    /// Get pending conflicts for block inclusion.
     ///
-    /// Returns a reference to the pending abort intents. Abort intents are only
+    /// Returns a reference to the pending conflicts. Conflicts are only
     /// removed when they appear in a committed block or are explicitly purged
-    /// via [`remove_abort_intents`].
-    pub fn get_pending_abort_intents(&self) -> &[AbortIntent] {
-        &self.pending_abort_intents
+    /// via [`remove_conflicts`].
+    pub fn get_pending_conflicts(&self) -> &[Conflict] {
+        &self.pending_conflicts
     }
 
     /// Called when a block is committed.
     ///
     /// First registers any cross-shard transactions for cycle detection,
-    /// then processes abort intents and certificates to clean up tracking state.
+    /// then processes conflicts and certificates to clean up tracking state.
     /// The registration must happen before processing to maintain ordering invariants.
     pub fn on_block_committed(
         &mut self,
@@ -482,7 +477,7 @@ impl LivelockState {
         let height = block.header.height;
 
         // Register newly committed cross-shard TXs for cycle detection.
-        // Must happen BEFORE processing abort intents/certificates below.
+        // Must happen BEFORE processing conflicts/certificates below.
         for tx in block.transactions.iter() {
             let needs = self.compute_remote_state_needs(topology, tx);
             if !needs.shards.is_empty() {
@@ -497,9 +492,9 @@ impl LivelockState {
             }
         }
 
-        // Process committed abort intents (covers both livelock deferrals and timeouts)
-        for intent in &block.abort_intents {
-            self.on_abort_intent_committed(&intent.tx_hash);
+        // Process committed conflicts (covers livelock deferrals)
+        for conflict in &block.conflicts {
+            self.on_conflict_committed(&conflict.tx_hash);
         }
 
         // NOTE: Certificate-committed cleanup (tombstones, tracker removal) is NOT
@@ -507,50 +502,48 @@ impl LivelockState {
         // The node state machine calls on_certificate_committed() per tx_hash after
         // extracting decisions from FinalizedWave data.
 
-        // Remove abort intents that were included in this block from both Vec and HashSet
-        for intent in &block.abort_intents {
-            self.pending_abort_intent_hashes.remove(&intent.tx_hash);
+        // Remove conflicts that were included in this block from both Vec and HashSet
+        for conflict in &block.conflicts {
+            self.pending_conflict_hashes.remove(&conflict.tx_hash);
         }
 
-        // Also remove pending abort intents whose winner transaction was aborted in this block.
-        // If the winner is gone, the abort intent can never complete (the loser was
+        // Also remove pending conflicts whose winner transaction was aborted in this block.
+        // If the winner is gone, the conflict can never complete (the loser was
         // waiting for the winner to finish). The mempool handles creating a retry
-        // via on_winner_aborted; we just need to stop proposing the stale intent.
+        // via on_winner_aborted; we just need to stop proposing the stale conflict.
         {
             let aborted_hashes: std::collections::HashSet<_> =
-                block.abort_intents.iter().map(|a| a.tx_hash).collect();
+                block.conflicts.iter().map(|c| c.tx_hash).collect();
             let mut removed_for_winner_abort = Vec::new();
-            for intent in &self.pending_abort_intents {
-                if let AbortReason::LivelockCycle { winner_tx_hash, .. } = &intent.reason {
-                    if aborted_hashes.contains(winner_tx_hash) {
-                        removed_for_winner_abort.push(intent.tx_hash);
-                        tracing::info!(
-                            loser = %intent.tx_hash,
-                            winner = %winner_tx_hash,
-                            "Removed pending abort intent: winner was aborted"
-                        );
-                    }
+            for conflict in &self.pending_conflicts {
+                if aborted_hashes.contains(&conflict.winner_tx_hash) {
+                    removed_for_winner_abort.push(conflict.tx_hash);
+                    tracing::info!(
+                        loser = %conflict.tx_hash,
+                        winner = %conflict.winner_tx_hash,
+                        "Removed pending conflict: winner was aborted"
+                    );
                 }
             }
             for tx_hash in &removed_for_winner_abort {
-                self.pending_abort_intent_hashes.remove(tx_hash);
+                self.pending_conflict_hashes.remove(tx_hash);
             }
         }
 
-        // Keep only abort intents still in our hash set (those not in this block)
-        self.pending_abort_intents
-            .retain(|d| self.pending_abort_intent_hashes.contains(&d.tx_hash));
+        // Keep only conflicts still in our hash set (those not in this block)
+        self.pending_conflicts
+            .retain(|c| self.pending_conflict_hashes.contains(&c.tx_hash));
 
         trace!(
             height = height.0,
-            abort_intents = block.abort_intents.len(),
+            conflicts = block.conflicts.len(),
             certificates = block.certificates.len(),
             "Processed block commit for livelock state"
         );
     }
 
-    /// Called when an abort intent commits.
-    fn on_abort_intent_committed(&mut self, tx_hash: &Hash) {
+    /// Called when a conflict commits.
+    fn on_conflict_committed(&mut self, tx_hash: &Hash) {
         // Add tombstone with TTL
         let expiry = self.now + self.config.tombstone_ttl;
         self.tombstones.insert(*tx_hash, expiry);
@@ -563,7 +556,7 @@ impl LivelockState {
         debug!(
             tx = %tx_hash,
             tombstone_expiry = ?expiry,
-            "Abort intent committed - added tombstone"
+            "Conflict committed - added tombstone"
         );
     }
 
@@ -578,9 +571,9 @@ impl LivelockState {
         self.provision_tracker.remove_tx(tx_hash);
         self.pending_proof_fetches.remove(tx_hash);
 
-        // Remove pending abort intents for this transaction — once the certificate
-        // commits, the abort is moot.
-        self.pending_abort_intent_hashes.remove(tx_hash);
+        // Remove pending conflicts for this transaction — once the certificate
+        // commits, the conflict is moot.
+        self.pending_conflict_hashes.remove(tx_hash);
 
         trace!(tx = %tx_hash, "Certificate committed - added tombstone");
     }
@@ -607,7 +600,7 @@ impl LivelockState {
     /// Get statistics for metrics.
     pub fn stats(&self) -> LivelockStats {
         LivelockStats {
-            pending_abort_intents: self.pending_abort_intents.len(),
+            pending_conflicts: self.pending_conflicts.len(),
             active_tombstones: self.tombstones.len(),
             tracked_transactions: self.committed_tracker.len(),
             pending_proof_fetches: self.pending_proof_fetches.len(),
@@ -618,8 +611,8 @@ impl LivelockState {
 /// Statistics from the livelock state machine for metrics.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct LivelockStats {
-    /// Number of abort intents queued for next block.
-    pub pending_abort_intents: usize,
+    /// Number of conflicts queued for next block.
+    pub pending_conflicts: usize,
     /// Number of active tombstones (recently completed transactions).
     pub active_tombstones: usize,
     /// Number of transactions being tracked for cycle detection.
@@ -631,9 +624,7 @@ pub struct LivelockStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hyperscale_types::{
-        AbortReason, TransactionInclusionProof, ValidatorId, ValidatorInfo, ValidatorSet,
-    };
+    use hyperscale_types::{TransactionInclusionProof, ValidatorId, ValidatorInfo, ValidatorSet};
 
     fn make_test_topology() -> TopologySnapshot {
         let key = hyperscale_types::Bls12381G1PrivateKey::from_u64(1).unwrap();
@@ -721,16 +712,14 @@ mod tests {
         outputs
     }
 
-    fn make_test_abort_intent(loser: Hash, winner: Hash) -> AbortIntent {
-        AbortIntent {
+    fn make_test_conflict(loser: Hash, winner: Hash) -> Conflict {
+        Conflict {
             tx_hash: loser,
-            reason: AbortReason::LivelockCycle {
-                winner_tx_hash: winner,
-                source_shard: ShardGroupId(1),
-                source_block_height: BlockHeight(1),
-                tx_inclusion_proof: dummy_proof(),
-            },
             block_height: BlockHeight(5),
+            winner_tx_hash: winner,
+            source_shard: ShardGroupId(1),
+            source_block_height: BlockHeight(1),
+            tx_inclusion_proof: dummy_proof(),
         }
     }
 
@@ -766,8 +755,8 @@ mod tests {
             }
         }
 
-        // No abort intent queued yet
-        assert!(state.get_pending_abort_intents().is_empty());
+        // No conflict queued yet
+        assert!(state.get_pending_conflicts().is_empty());
 
         // Phase 2: simulate proof received
         state.on_inclusion_proof_received(
@@ -778,15 +767,11 @@ mod tests {
             BlockHeight(1),
         );
 
-        // Now the abort intent should be queued
-        let abort_intents = state.get_pending_abort_intents();
-        assert_eq!(abort_intents.len(), 1);
-        assert_eq!(abort_intents[0].tx_hash, local_tx);
-
-        let AbortReason::LivelockCycle { winner_tx_hash, .. } = &abort_intents[0].reason else {
-            panic!("Expected LivelockCycle reason");
-        };
-        assert_eq!(*winner_tx_hash, remote_tx);
+        // Now the conflict should be queued
+        let conflicts = state.get_pending_conflicts();
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].tx_hash, local_tx);
+        assert_eq!(conflicts[0].winner_tx_hash, remote_tx);
     }
 
     #[test]
@@ -809,7 +794,7 @@ mod tests {
             state.on_provision_accepted(remote_tx, ShardGroupId(1), BlockHeight(1), &entries);
 
         assert!(outputs.is_empty());
-        assert!(state.get_pending_abort_intents().is_empty());
+        assert!(state.get_pending_conflicts().is_empty());
     }
 
     #[test]
@@ -833,7 +818,7 @@ mod tests {
             state.on_provision_accepted(remote_tx, ShardGroupId(1), BlockHeight(1), &entries);
 
         assert!(outputs.is_empty());
-        assert!(state.get_pending_abort_intents().is_empty());
+        assert!(state.get_pending_conflicts().is_empty());
     }
 
     #[test]
@@ -899,7 +884,7 @@ mod tests {
             &entries,
         );
 
-        assert_eq!(state.get_pending_abort_intents().len(), 1);
+        assert_eq!(state.get_pending_conflicts().len(), 1);
 
         // Receive same quorum again - should NOT queue duplicate
         let entries = make_test_entries_with_nodes(vec![conflicting_node]);
@@ -908,9 +893,9 @@ mod tests {
         assert!(outputs.is_empty());
 
         assert_eq!(
-            state.get_pending_abort_intents().len(),
+            state.get_pending_conflicts().len(),
             1,
-            "Should not queue duplicate abort intent"
+            "Should not queue duplicate conflict"
         );
 
         // Receive quorum from different shard for same cycle - still no duplicate
@@ -920,14 +905,14 @@ mod tests {
         assert!(outputs.is_empty());
 
         assert_eq!(
-            state.get_pending_abort_intents().len(),
+            state.get_pending_conflicts().len(),
             1,
-            "Should still have only one abort intent for same tx"
+            "Should still have only one conflict for same tx"
         );
     }
 
     #[test]
-    fn test_committed_tracker_cleanup_on_abort_intent() {
+    fn test_committed_tracker_cleanup_on_conflict() {
         let mut state = LivelockState::new();
 
         let tx = hash_with_prefix(0xFF);
@@ -940,7 +925,7 @@ mod tests {
         assert!(state.committed_tracker.contains(&tx));
 
         let winner = hash_with_prefix(0x00);
-        let abort_intent = make_test_abort_intent(tx, winner);
+        let conflict = make_test_conflict(tx, winner);
 
         let block = hyperscale_types::Block {
             header: hyperscale_types::BlockHeader {
@@ -960,19 +945,19 @@ mod tests {
             },
             transactions: vec![],
             certificates: vec![],
-            abort_intents: vec![abort_intent],
+            conflicts: vec![conflict],
         };
 
         state.on_block_committed(&make_test_topology(), &block);
 
         assert!(
             !state.committed_tracker.contains(&tx),
-            "TX with committed abort intent should be removed from committed tracker"
+            "TX with committed conflict should be removed from committed tracker"
         );
 
         assert!(
             state.tombstones.contains_key(&tx),
-            "Tombstone should be added for TX with committed abort intent"
+            "Tombstone should be added for TX with committed conflict"
         );
     }
 
@@ -1018,8 +1003,8 @@ mod tests {
 
         assert!(outputs.is_empty());
         assert!(
-            state.get_pending_abort_intents().is_empty(),
-            "Unidirectional dependency should not cause abort intent"
+            state.get_pending_conflicts().is_empty(),
+            "Unidirectional dependency should not cause conflict"
         );
     }
 
@@ -1056,7 +1041,7 @@ mod tests {
     }
 
     #[test]
-    fn test_abort_commit_adds_tombstone() {
+    fn test_conflict_commit_adds_tombstone() {
         let mut state = LivelockState::new();
 
         let tx = hash_with_prefix(0xBB);
@@ -1066,12 +1051,13 @@ mod tests {
             make_remote_state_needs(&[ShardGroupId(1)], vec![(ShardGroupId(1), vec![node])]);
         state.committed_tracker.add(tx, needs);
 
-        let abort_intent = hyperscale_types::AbortIntent {
+        let conflict = Conflict {
             tx_hash: tx,
-            reason: hyperscale_types::AbortReason::ExecutionTimeout {
-                committed_at: BlockHeight(1),
-            },
             block_height: BlockHeight(5),
+            winner_tx_hash: Hash::from_bytes(b"dummy_winner"),
+            source_shard: ShardGroupId(1),
+            source_block_height: BlockHeight(1),
+            tx_inclusion_proof: dummy_proof(),
         };
 
         let block = hyperscale_types::Block {
@@ -1092,14 +1078,14 @@ mod tests {
             },
             transactions: vec![],
             certificates: vec![],
-            abort_intents: vec![abort_intent],
+            conflicts: vec![conflict],
         };
 
         state.on_block_committed(&make_test_topology(), &block);
 
         assert!(
             state.tombstones.contains_key(&tx),
-            "Abort commit should add tombstone"
+            "Conflict commit should add tombstone"
         );
 
         // Late provision should be rejected
@@ -1107,7 +1093,7 @@ mod tests {
         let outputs = state.on_provision_accepted(tx, ShardGroupId(1), BlockHeight(1), &entries);
         assert!(
             outputs.is_empty(),
-            "Late provision after abort should be rejected by tombstone"
+            "Late provision after conflict should be rejected by tombstone"
         );
     }
 }

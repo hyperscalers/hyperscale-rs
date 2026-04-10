@@ -292,131 +292,41 @@ pub enum TransactionDecision {
 /// Reason a transaction was aborted.
 ///
 /// Aborts are terminal - the transaction will not be retried and any held
-/// resources are released. Abort reasons are carried in `AbortIntent` (block
-/// level) and `ExecutionOutcome::Aborted` (EC level). By TC level, the
-/// reason has served its purpose — `TransactionDecision::Aborted` carries
-/// no reason.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, BasicSbor)]
-pub enum AbortReason {
-    /// Transaction timed out waiting for execution to complete.
-    ///
-    /// Cross-shard transactions have a timeout period after which they are
-    /// aborted if not finalized. This prevents transactions from holding
-    /// locks indefinitely in N-way cycle scenarios.
-    ExecutionTimeout {
-        /// Block height when the transaction was originally committed.
-        committed_at: BlockHeight,
-    },
-
-    /// Livelock cycle detected — this transaction is the loser (higher hash).
-    ///
-    /// When two transactions form a bidirectional cross-shard cycle, the
-    /// transaction with the higher hash loses and is aborted. The winner
-    /// (lower hash) continues normally.
-    LivelockCycle {
-        /// Hash of the transaction that won the cycle (lower hash wins).
-        winner_tx_hash: Hash,
-        /// Source shard where the winner transaction was committed.
-        source_shard: ShardGroupId,
-        /// Block height on the source shard where the winner was committed.
-        source_block_height: BlockHeight,
-        /// Merkle inclusion proof for the winner transaction in the source block.
-        tx_inclusion_proof: TransactionInclusionProof,
-    },
-}
-
-impl std::fmt::Display for AbortReason {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            AbortReason::ExecutionTimeout { committed_at } => {
-                write!(f, "timeout({})", committed_at.0)
-            }
-            AbortReason::LivelockCycle {
-                winner_tx_hash,
-                source_shard,
-                ..
-            } => {
-                write!(
-                    f,
-                    "livelock(winner: {}, source: {})",
-                    winner_tx_hash, source_shard.0
-                )
-            }
-        }
-    }
-}
-
-impl std::str::FromStr for AbortReason {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let (name, inner) = if let Some(paren_start) = s.find('(') {
-            if !s.ends_with(')') {
-                return Err(format!("invalid abort reason format: {}", s));
-            }
-            let name = &s[..paren_start];
-            let inner = &s[paren_start + 1..s.len() - 1];
-            (name, inner)
-        } else {
-            return Err(format!("invalid abort reason format: {}", s));
-        };
-
-        match name {
-            "timeout" => {
-                let height = inner
-                    .parse::<u64>()
-                    .map_err(|_| format!("invalid height: {}", inner))?;
-                Ok(AbortReason::ExecutionTimeout {
-                    committed_at: BlockHeight(height),
-                })
-            }
-            "livelock" => {
-                // Display format is "livelock(winner: <hash>, source: <shard>)"
-                // Best-effort parse: recovers winner_tx_hash and source_shard.
-                // The inclusion proof is not round-trippable through strings, so we
-                // use a dummy proof. This is sufficient for status display / logging.
-                let parts: Vec<&str> = inner.splitn(2, ", source: ").collect();
-                if parts.len() != 2 {
-                    return Err(format!("invalid livelock format: {}", inner));
-                }
-                let winner_str = parts[0].strip_prefix("winner: ").ok_or_else(|| {
-                    format!("missing 'winner: ' prefix in livelock reason: {}", inner)
-                })?;
-                let winner_tx_hash = Hash::from_hex(winner_str)
-                    .map_err(|e| format!("invalid winner hash: {}", e))?;
-                let source_shard = parts[1]
-                    .parse::<u64>()
-                    .map_err(|_| format!("invalid source shard: {}", parts[1]))?;
-                Ok(AbortReason::LivelockCycle {
-                    winner_tx_hash,
-                    source_shard: ShardGroupId(source_shard),
-                    source_block_height: BlockHeight(0),
-                    tx_inclusion_proof: TransactionInclusionProof {
-                        siblings: vec![],
-                        leaf_index: 0,
-                    },
-                })
-            }
-            _ => Err(format!("unknown abort reason: {}", name)),
-        }
-    }
-}
-
-/// An abort intent included in a block.
+/// A livelock conflict resolution included in a block.
 ///
-/// Abort intents are proposals to the execution voting process. They feed into
-/// the execution accumulator but do not directly change mempool state. The
+/// When two transactions form a bidirectional cross-shard cycle (livelock),
+/// the transaction with the higher hash is the loser and must be aborted.
+/// Conflicts feed into the execution accumulator as abort entries. The
 /// actual abort takes effect only when a Wave Certificate confirms it.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
-pub struct AbortIntent {
-    /// Hash of the transaction to abort.
+pub struct Conflict {
+    /// Hash of the losing transaction (will be aborted — higher hash).
     pub tx_hash: Hash,
 
-    /// Why the transaction should be aborted.
-    pub reason: AbortReason,
-
-    /// Block height where this intent is being committed.
+    /// Block height where this conflict is being committed.
     pub block_height: BlockHeight,
+
+    /// Hash of the winning transaction (lower hash wins, keeps executing).
+    pub winner_tx_hash: Hash,
+
+    /// Source shard where the cycle was detected.
+    pub source_shard: ShardGroupId,
+
+    /// Block height on the source shard that proves the cycle.
+    pub source_block_height: BlockHeight,
+
+    /// Merkle inclusion proof for the winner transaction in the source block.
+    pub tx_inclusion_proof: TransactionInclusionProof,
+}
+
+impl std::fmt::Display for Conflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "conflict(loser: {}, winner: {}, source: {})",
+            self.tx_hash, self.winner_tx_hash, self.source_shard.0
+        )
+    }
 }
 
 /// Transaction status for lifecycle tracking.

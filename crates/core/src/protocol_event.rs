@@ -26,7 +26,7 @@ pub enum VerificationKind {
     TransactionRoot,
     CertificateRoot,
     LocalReceiptRoot,
-    AbortIntentProofs,
+    ConflictProofs,
 }
 
 /// Events that the state machine processes.
@@ -369,7 +369,7 @@ impl ProtocolEvent {
                 VerificationKind::TransactionRoot => "BlockRootVerified::TransactionRoot",
                 VerificationKind::CertificateRoot => "BlockRootVerified::CertificateRoot",
                 VerificationKind::LocalReceiptRoot => "BlockRootVerified::LocalReceiptRoot",
-                VerificationKind::AbortIntentProofs => "BlockRootVerified::AbortIntentProofs",
+                VerificationKind::ConflictProofs => "BlockRootVerified::ConflictProofs",
             },
             ProtocolEvent::ProposalBuilt { .. } => "ProposalBuilt",
 
