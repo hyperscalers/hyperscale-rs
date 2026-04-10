@@ -3,14 +3,13 @@
 use hyperscale_bft::{BftConfig, BftState, RecoveredState};
 use hyperscale_core::{Action, ProtocolEvent, StateMachine, TimerId};
 use hyperscale_execution::ExecutionState;
-use hyperscale_livelock::LivelockState;
 use hyperscale_mempool::{MempoolConfig, MempoolState};
 use hyperscale_provisions::ProvisionCoordinator;
 use hyperscale_remote_headers::RemoteHeaderCoordinator;
 use hyperscale_topology::TopologyState;
 use hyperscale_types::{
-    Block, BlockHeader, BlockHeight, BlockManifest, Bls12381G1PrivateKey, Conflict, FinalizedWave,
-    Hash, ProvisionBatch, QuorumCertificate, ReadyTransactions, RoutableTransaction, ShardGroupId,
+    Block, BlockHeader, BlockHeight, BlockManifest, Bls12381G1PrivateKey, FinalizedWave, Hash,
+    ProvisionBatch, QuorumCertificate, ReadyTransactions, RoutableTransaction, ShardGroupId,
     TopologySnapshot,
 };
 use std::sync::Arc;
@@ -25,7 +24,7 @@ pub type NodeIndex = u32;
 
 /// Combined node state machine.
 ///
-/// Composes BFT, execution, mempool, provisions, and livelock into a single state machine.
+/// Composes BFT, execution, mempool, and provisions into a single state machine.
 /// View changes are handled implicitly via local round advancement in BftState (HotStuff-2 style).
 ///
 /// Note: Sync is handled entirely by the runner (production: SyncManager, simulation: runner logic).
@@ -52,9 +51,6 @@ pub struct NodeStateMachine {
     /// Remote block header coordination (single source of truth).
     remote_headers: RemoteHeaderCoordinator,
 
-    /// Livelock prevention state (cycle detection for cross-shard TXs).
-    livelock: LivelockState,
-
     /// Current time.
     now: Duration,
 }
@@ -76,7 +72,6 @@ impl std::fmt::Debug for NodeStateMachine {
 /// to avoid duplicating the ready-transaction gathering logic.
 struct ProposalInputs {
     ready_txs: ReadyTransactions,
-    conflicts: Vec<Conflict>,
     finalized_waves: Vec<Arc<FinalizedWave>>,
     provision_batches: Vec<Arc<ProvisionBatch>>,
 }
@@ -118,7 +113,6 @@ impl NodeStateMachine {
             mempool: MempoolState::with_config(mempool_config),
             provisions: ProvisionCoordinator::new(),
             remote_headers: RemoteHeaderCoordinator::new(),
-            livelock: LivelockState::new(),
             topology,
             now: Duration::ZERO,
         }
@@ -154,11 +148,6 @@ impl NodeStateMachine {
     /// Get a reference to the execution state.
     pub fn execution(&self) -> &ExecutionState {
         &self.execution
-    }
-
-    /// Get a reference to the livelock state.
-    pub fn livelock(&self) -> &LivelockState {
-        &self.livelock
     }
 
     /// Get a reference to the provision coordinator.
@@ -203,14 +192,11 @@ impl NodeStateMachine {
         let ready_txs = self
             .mempool
             .ready_transactions(max_txs, pending_txs, pending_certs);
-        // Livelock cycle conflicts (from cycle detection).
-        let conflicts = self.livelock.get_pending_conflicts().to_vec();
         let finalized_waves = self.execution.get_finalized_waves();
         let provision_batches = self.provisions.drain_queued_provisions();
 
         ProposalInputs {
             ready_txs,
-            conflicts,
             finalized_waves,
             provision_batches,
         }
@@ -226,9 +212,6 @@ impl NodeStateMachine {
             id: TimerId::Cleanup,
             duration: self.bft.config().cleanup_interval,
         }];
-
-        // Clean up expired tombstones in livelock state
-        self.livelock.cleanup();
 
         // Check pending blocks that need fetch requests.
         // We delay fetching to give gossip and local certificate creation
@@ -269,7 +252,6 @@ impl NodeStateMachine {
         self.bft.on_proposal_timer(
             self.topology.snapshot(),
             &inputs.ready_txs,
-            inputs.conflicts,
             inputs.finalized_waves,
             inputs.provision_batches,
         )
@@ -329,7 +311,6 @@ impl NodeStateMachine {
             block_hash,
             qc,
             &inputs.ready_txs,
-            inputs.conflicts,
             inputs.finalized_waves,
             inputs.provision_batches,
         )
@@ -349,27 +330,16 @@ impl NodeStateMachine {
     /// Handle block committed — notify all subsystems in the correct order.
     ///
     /// Order invariants:
-    /// 1. Register cross-shard TXs with livelock BEFORE processing abort intents
-    /// 2. Process abort intents BEFORE passing new TXs to execution
-    /// 3. Process CrossShardTxRegistered continuations BEFORE other exec actions
+    /// 1. Process abort intents BEFORE passing new TXs to execution
+    /// 2. Process CrossShardTxRegistered continuations BEFORE other exec actions
     fn on_block_committed(&mut self, block_hash: Hash, height: u64, block: Block) -> Vec<Action> {
         let mut actions = Vec::new();
         let block_height = BlockHeight(height);
-
-        // Livelock: register cross-shard TXs for cycle detection, then process
-        // abort intents/certs, add tombstones, cleanup tracking.
-        self.livelock
-            .on_block_committed(self.topology.snapshot(), &block);
 
         // Register committed tx hashes with BFT for timeout abort validation.
         let tx_hashes: Vec<Hash> = block.transactions.iter().map(|tx| tx.hash()).collect();
         self.bft
             .register_committed_transactions(&tx_hashes, block_height);
-
-        // Abort intents feed the execution accumulator with override semantics.
-        // Votes are NOT emitted here — the wave scan at the end of block commit
-        // will detect complete waves and emit votes deterministically.
-        self.execution.record_conflicts(&block.conflicts, height);
 
         // Remove committed wave certificates from execution state.
         // They've been included in this block, so don't need to be proposed again.
@@ -382,7 +352,7 @@ impl NodeStateMachine {
             self.bft.remove_committed_transaction(&cert_hash);
         }
 
-        // Notify mempool, livelock, and provisions of per-tx terminal states
+        // Notify mempool and provisions of per-tx terminal states
         // from committed wave certificates. Wave certs are lean (no per-tx data),
         // so we use the decisions extracted from FinalizedWave above.
         for (tx_hash, decision) in &committed_txs {
@@ -392,7 +362,6 @@ impl NodeStateMachine {
                 *decision,
                 block_height,
             ));
-            self.livelock.on_certificate_committed(tx_hash);
             self.provisions.on_certificate_committed(tx_hash);
         }
 
@@ -456,28 +425,6 @@ impl NodeStateMachine {
         actions.extend(self.execution.emit_vote_actions(self.topology.snapshot()));
 
         actions
-    }
-
-    /// Handle an inclusion proof received from a source shard (livelock deferral).
-    ///
-    /// Called by the I/O loop when a `GetTxInclusionProofResponse` is received.
-    /// Forwards to the livelock state machine to finalize the deferral.
-    pub(crate) fn on_inclusion_proof_received(
-        &mut self,
-        winner_tx_hash: Hash,
-        loser_tx_hash: Hash,
-        source_shard: ShardGroupId,
-        source_block_height: BlockHeight,
-        proof: hyperscale_types::TransactionInclusionProof,
-    ) -> Vec<Action> {
-        self.livelock.on_inclusion_proof_received(
-            winner_tx_hash,
-            loser_tx_hash,
-            proof,
-            source_shard,
-            source_block_height,
-        );
-        vec![]
     }
 
     /// Handle transaction executed — notify mempool and check pending blocks.
@@ -686,9 +633,6 @@ impl StateMachine for NodeStateMachine {
                 committed_header,
                 valid,
             ),
-            ProtocolEvent::ProvisionsAccepted { batch } => self
-                .livelock
-                .on_provisions_accepted_actions(&batch, self.topology.snapshot()),
             ProtocolEvent::ProvisioningComplete { transactions } => {
                 let mut actions = self
                     .execution
@@ -834,7 +778,6 @@ impl StateMachine for NodeStateMachine {
         self.execution.set_time(now);
         self.mempool.set_time(now);
         self.provisions.set_time(now);
-        self.livelock.set_time(now);
     }
 
     fn now(&self) -> Duration {

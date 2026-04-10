@@ -26,7 +26,6 @@ pub enum VerificationKind {
     TransactionRoot,
     CertificateRoot,
     LocalReceiptRoot,
-    ConflictProofs,
 }
 
 /// Events that the state machine processes.
@@ -151,9 +150,6 @@ pub enum ProtocolEvent {
     // ═══════════════════════════════════════════════════════════════════════
     // Provisions
     // ═══════════════════════════════════════════════════════════════════════
-    /// A batch of provisions from a source shard has been verified and accepted.
-    ProvisionsAccepted { batch: ProvisionBatch },
-
     /// One or more transactions have all required provisions — ready for execution.
     ProvisioningComplete {
         transactions: Vec<crate::ProvisionedTransaction>,
@@ -369,12 +365,10 @@ impl ProtocolEvent {
                 VerificationKind::TransactionRoot => "BlockRootVerified::TransactionRoot",
                 VerificationKind::CertificateRoot => "BlockRootVerified::CertificateRoot",
                 VerificationKind::LocalReceiptRoot => "BlockRootVerified::LocalReceiptRoot",
-                VerificationKind::ConflictProofs => "BlockRootVerified::ConflictProofs",
             },
             ProtocolEvent::ProposalBuilt { .. } => "ProposalBuilt",
 
             // Provisions
-            ProtocolEvent::ProvisionsAccepted { .. } => "ProvisionsAccepted",
             ProtocolEvent::ProvisioningComplete { .. } => "ProvisioningComplete",
             ProtocolEvent::StateProvisionsReceived { .. } => "StateProvisionsReceived",
             ProtocolEvent::StateProvisionsVerified { .. } => "StateProvisionsVerified",

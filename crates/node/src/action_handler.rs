@@ -58,7 +58,6 @@ pub(crate) fn dispatch_pool_for(action: &Action) -> Option<DispatchPool> {
         Action::VerifyTransactionRoot { .. } => Some(DispatchPool::ConsensusCrypto),
         Action::VerifyCertificateRoot { .. } => Some(DispatchPool::ConsensusCrypto),
         Action::VerifyLocalReceiptRoot { .. } => Some(DispatchPool::ConsensusCrypto),
-        Action::VerifyConflictProofs { .. } => Some(DispatchPool::ConsensusCrypto),
         Action::BuildProposal { .. } => Some(DispatchPool::ConsensusCrypto),
 
         // General crypto
@@ -254,26 +253,6 @@ pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainRead
             })
         }
 
-        Action::VerifyConflictProofs {
-            block_hash,
-            proof_inputs,
-        } => {
-            let start = std::time::Instant::now();
-            let valid = hyperscale_bft::handlers::verify_conflict_proofs(&proof_inputs);
-            metrics::record_signature_verification_latency(
-                "conflict_proofs",
-                start.elapsed().as_secs_f64(),
-            );
-            Some(DelegatedResult {
-                events: vec![NodeInput::Protocol(ProtocolEvent::BlockRootVerified {
-                    kind: hyperscale_core::VerificationKind::ConflictProofs,
-                    block_hash,
-                    valid,
-                })],
-                prepared_commit: None,
-            })
-        }
-
         // --- BFT state root and proposal ---
         Action::VerifyStateRoot {
             block_hash,
@@ -325,7 +304,6 @@ pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainRead
             parent_state_root,
             transactions,
             finalized_waves,
-            conflicts,
             waves,
             provision_batches,
         } => {
@@ -359,7 +337,6 @@ pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainRead
                 transactions,
                 certificates,
                 &all_receipts,
-                conflicts,
                 shard_group_id,
                 waves,
                 provision_batch_hashes,

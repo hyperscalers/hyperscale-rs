@@ -8,7 +8,6 @@ mod execution_cert;
 mod provision;
 mod sync;
 mod transaction;
-mod tx_inclusion_proof;
 
 pub use block::GetBlockRequest;
 pub use committed_header::GetCommittedBlockHeaderRequest;
@@ -16,4 +15,3 @@ pub use execution_cert::GetExecutionCertsRequest;
 pub use provision::GetProvisionsRequest;
 pub use sync::SyncCompleteAnnouncement;
 pub use transaction::GetTransactionsRequest;
-pub use tx_inclusion_proof::GetTxInclusionProofRequest;

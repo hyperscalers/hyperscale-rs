@@ -4,7 +4,7 @@ use crate::ProtocolEvent;
 use hyperscale_types::{
     Block, BlockHeight, Bls12381G1PublicKey, Bls12381G2Signature, CommittedBlockHeader,
     ExecutionCertificate, Hash, LocalReceiptEntry, ProvisionBatch, QuorumCertificate,
-    RoutableTransaction, ShardGroupId, TransactionInclusionProof, ValidatorId,
+    RoutableTransaction, ShardGroupId, ValidatorId,
 };
 use std::sync::Arc;
 
@@ -123,18 +123,6 @@ pub enum NodeInput {
         block_height: BlockHeight,
     },
 
-    /// Transaction inclusion proof fetched successfully from a source shard.
-    InclusionProofFetchReceived {
-        winner_tx_hash: Hash,
-        reason: crate::InclusionProofFetchReason,
-        source_shard: ShardGroupId,
-        source_block_height: BlockHeight,
-        proof: TransactionInclusionProof,
-    },
-
-    /// Transaction inclusion proof fetch failed (network error or peer returned None).
-    InclusionProofFetchFailed { winner_tx_hash: Hash },
-
     /// Execution certificates successfully fetched from a source shard.
     ExecCertFetchReceived {
         source_shard: ShardGroupId,
@@ -203,8 +191,6 @@ impl NodeInput {
             NodeInput::ProvisionsReady { .. } => EventPriority::Internal,
             NodeInput::ProvisionFetchReceived { .. } => EventPriority::Internal,
             NodeInput::ProvisionFetchFailed { .. } => EventPriority::Internal,
-            NodeInput::InclusionProofFetchReceived { .. } => EventPriority::Internal,
-            NodeInput::InclusionProofFetchFailed { .. } => EventPriority::Internal,
             NodeInput::ExecCertFetchReceived { .. } => EventPriority::Internal,
             NodeInput::ExecCertFetchFailed { .. } => EventPriority::Internal,
             NodeInput::HeaderFetchReceived { .. } => EventPriority::Internal,
@@ -244,8 +230,6 @@ impl NodeInput {
             NodeInput::ProvisionsReady { .. } => "ProvisionsReady",
             NodeInput::ProvisionFetchReceived { .. } => "ProvisionFetchReceived",
             NodeInput::ProvisionFetchFailed { .. } => "ProvisionFetchFailed",
-            NodeInput::InclusionProofFetchReceived { .. } => "InclusionProofFetchReceived",
-            NodeInput::InclusionProofFetchFailed { .. } => "InclusionProofFetchFailed",
             NodeInput::ExecCertFetchReceived { .. } => "ExecCertFetchReceived",
             NodeInput::ExecCertFetchFailed { .. } => "ExecCertFetchFailed",
             NodeInput::HeaderFetchReceived { .. } => "HeaderFetchReceived",

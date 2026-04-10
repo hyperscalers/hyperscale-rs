@@ -454,11 +454,6 @@ impl ProvisionCoordinator {
         // Queue for inclusion in the next block proposal.
         self.queued_provision_batches.push(Arc::clone(&batch));
 
-        // Emit batch-level accepted event (used by livelock for cycle detection).
-        actions.push(Action::Continuation(ProtocolEvent::ProvisionsAccepted {
-            batch: (*batch).clone(),
-        }));
-
         // Collect any transactions that are now fully provisioned across all shards.
         let mut completed = Vec::new();
         for tx_entries in &batch.transactions {
@@ -959,14 +954,8 @@ mod tests {
         coordinator.on_state_provisions_received(&topology, batch.clone());
 
         // Verify
-        let actions =
+        let _actions =
             coordinator.on_state_provisions_verified(&topology, batch, Some(header), true);
-
-        // Should emit ProvisionsAccepted with the batch
-        assert!(actions.iter().any(|a| matches!(
-            a,
-            Action::Continuation(ProtocolEvent::ProvisionsAccepted { .. })
-        )));
 
         // Should have verified provisions
         assert!(coordinator.has_any_verified_provisions(&tx_hash));
@@ -986,12 +975,8 @@ mod tests {
         coordinator.on_state_provisions_received(&topology, batch.clone());
 
         // Verification fails — no committed_header returned
-        let actions = coordinator.on_state_provisions_verified(&topology, batch, None, false);
+        let _actions = coordinator.on_state_provisions_verified(&topology, batch, None, false);
 
-        assert!(actions.iter().all(|a| !matches!(
-            a,
-            Action::Continuation(ProtocolEvent::ProvisionsAccepted { .. })
-        )));
         assert!(!coordinator.has_any_verified_provisions(&tx_hash));
     }
 
@@ -1202,25 +1187,17 @@ mod tests {
         let actions =
             coordinator.on_state_provisions_verified(&topology, batch, Some(header), false);
 
-        // No ProvisionsAccepted should be emitted
-        let accepted_count = actions
-            .iter()
-            .filter(|a| {
-                matches!(
-                    a,
-                    Action::Continuation(ProtocolEvent::ProvisionsAccepted { .. })
-                )
-            })
-            .count();
-        assert_eq!(accepted_count, 0);
+        // Verification failed — no provisions stored
+        assert!(
+            actions.is_empty()
+                || actions
+                    .iter()
+                    .all(|a| !matches!(a, Action::Continuation(..)))
+        );
 
         assert!(!coordinator.has_any_verified_provisions(&Hash::from_bytes(b"tx_ok")));
         assert!(!coordinator.has_any_verified_provisions(&Hash::from_bytes(b"tx_bad")));
     }
-
-    // ═══════════════════════════════════════════════════════════════════════
-    // Unverified Buffer Tests
-    // ═══════════════════════════════════════════════════════════════════════
 
     // ═══════════════════════════════════════════════════════════════════════
     // Expected Provision Tracking (Fallback Detection) Tests

@@ -8,9 +8,9 @@ use hyperscale_storage::{ChainWriter, SubstateStore};
 use hyperscale_types::{
     batch_verify_bls_same_message, compute_certificate_root, compute_local_receipt_root,
     compute_provisions_root, compute_transaction_root, verify_bls12381_v1, Block, BlockHeader,
-    BlockHeight, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature, Conflict, Hash,
-    QuorumCertificate, ReceiptBundle, RoutableTransaction, ShardGroupId, SignerBitfield,
-    ValidatorId, VotePower, WaveCertificate, WaveId,
+    BlockHeight, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature, Hash, QuorumCertificate,
+    ReceiptBundle, RoutableTransaction, ShardGroupId, SignerBitfield, ValidatorId, VotePower,
+    WaveCertificate, WaveId,
 };
 use std::sync::Arc;
 
@@ -244,21 +244,6 @@ pub fn verify_local_receipt_root(expected_root: Hash, receipts: &[ReceiptBundle]
     valid
 }
 
-/// Verify conflict inclusion proofs.
-///
-/// For each `(Conflict, transaction_root)` pair, verifies the merkle
-/// inclusion proof for the winner transaction against the QC-attested
-/// `transaction_root` from the remote committed block header.
-///
-/// Returns `true` only if ALL proofs are valid.
-pub fn verify_conflict_proofs(proof_inputs: &[(Conflict, Hash)]) -> bool {
-    // Inclusion proof verification removed — conflicts are now derived
-    // deterministically from committed provisions. All validators derive
-    // the same conflicts from the same committed chain state.
-    let _ = proof_inputs;
-    true
-}
-
 /// Result of state root verification.
 pub struct StateRootResult<P: Send> {
     pub valid: bool,
@@ -327,7 +312,6 @@ pub fn build_proposal<S: ChainWriter + SubstateStore>(
     transactions: Vec<Arc<RoutableTransaction>>,
     certificates: Vec<Arc<WaveCertificate>>,
     receipts: &[ReceiptBundle],
-    conflicts: Vec<Conflict>,
     local_shard: ShardGroupId,
     waves: Vec<WaveId>,
     provision_batch_hashes: Vec<Hash>,
@@ -384,7 +368,6 @@ pub fn build_proposal<S: ChainWriter + SubstateStore>(
         header,
         transactions,
         certificates: certs_to_include,
-        conflicts,
     };
 
     let block_hash = block.hash();

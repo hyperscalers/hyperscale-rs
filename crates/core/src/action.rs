@@ -4,8 +4,8 @@ use crate::{ProtocolEvent, TimerId};
 use hyperscale_messages::{BlockHeaderNotification, BlockVoteNotification, TransactionGossip};
 use hyperscale_types::{
     Block, BlockHeight, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature, CommittedBlockHeader,
-    Conflict, EpochConfig, EpochId, ExecutionCertificate, ExecutionVote, FinalizedWave, Hash,
-    NodeId, ProvisionBatch, QuorumCertificate, ReceiptBundle, RoutableTransaction, ShardGroupId,
+    EpochConfig, EpochId, ExecutionCertificate, ExecutionVote, FinalizedWave, Hash, NodeId,
+    ProvisionBatch, QuorumCertificate, ReceiptBundle, RoutableTransaction, ShardGroupId,
     SignerBitfield, StateProvision, TopologySnapshot, TxOutcome, ValidatorId, VotePower,
     WaveCertificate, WaveId,
 };
@@ -64,16 +64,6 @@ impl fmt::Display for FinalizationPhaseTimes {
         }
         Ok(())
     }
-}
-
-/// Why a transaction inclusion proof is being fetched.
-#[derive(Debug, Clone)]
-pub enum InclusionProofFetchReason {
-    /// Livelock deferral — deliver proof to livelock state machine.
-    Deferral {
-        /// The transaction being deferred (loser in cycle detection).
-        loser_tx_hash: Hash,
-    },
 }
 
 /// A request to execute a cross-shard transaction with its provisions.
@@ -351,24 +341,6 @@ pub enum Action {
         height: BlockHeight,
     },
 
-    /// Request a transaction inclusion proof from a source shard for livelock deferral.
-    ///
-    /// Request a transaction inclusion proof from a source shard.
-    ///
-    /// Used for both livelock deferrals and priority tx proofs under backpressure.
-    /// The I/O loop sends this as a network request; the response is delivered
-    /// back as `NodeInput::InclusionProofFetchReceived`.
-    RequestTxInclusionProofs {
-        /// Source shard to fetch proofs from.
-        source_shard: ShardGroupId,
-        /// Block height on the source shard.
-        source_block_height: BlockHeight,
-        /// Transactions to prove inclusion for, with the reason for each.
-        entries: Vec<(Hash, InclusionProofFetchReason)>,
-        /// Peers in the source shard to send the request to.
-        peers: Vec<ValidatorId>,
-    },
-
     /// Verify a block's state root against the JVT.
     ///
     /// Applies the block's shard-local state changes to the JVT and compares the
@@ -442,19 +414,6 @@ pub enum Action {
         receipts: Vec<ReceiptBundle>,
     },
 
-    /// Verify conflict inclusion proofs off-thread.
-    ///
-    /// For each livelock conflict, verifies the merkle inclusion proof for the
-    /// winner transaction against the source block's QC-attested `transaction_root`.
-    /// Returns `ProtocolEvent::ConflictProofsVerified`.
-    VerifyConflictProofs {
-        block_hash: Hash,
-        /// Pairs of (conflict, transaction_root from remote committed header).
-        /// The transaction_root is QC-attested — looked up by NodeStateMachine
-        /// from the ProvisionCoordinator's verified remote headers.
-        proof_inputs: Vec<(Conflict, Hash)>,
-    },
-
     /// Build a complete block proposal.
     ///
     /// Computes the new state root from certificates, builds the complete block,
@@ -478,7 +437,6 @@ pub enum Action {
         transactions: Vec<Arc<RoutableTransaction>>,
         /// Finalized waves to include in the block (carries certs + receipts + ECs).
         finalized_waves: Vec<Arc<FinalizedWave>>,
-        conflicts: Vec<Conflict>,
         /// Cross-shard execution waves in this block.
         waves: Vec<WaveId>,
         /// Provision batches from remote shards, included in this block.
@@ -874,7 +832,6 @@ impl Action {
             Action::VerifyTransactionRoot { .. } => "VerifyTransactionRoot",
             Action::VerifyCertificateRoot { .. } => "VerifyCertificateRoot",
             Action::VerifyLocalReceiptRoot { .. } => "VerifyLocalReceiptRoot",
-            Action::VerifyConflictProofs { .. } => "VerifyConflictProofs",
             Action::BuildProposal { .. } => "BuildProposal",
 
             // Delegated Work - Execution
@@ -917,7 +874,6 @@ impl Action {
             Action::RequestMissingProvisions { .. } => "RequestMissingProvisions",
             Action::RequestMissingExecutionCert { .. } => "RequestMissingExecutionCert",
             Action::CancelProvisionFetch { .. } => "CancelProvisionFetch",
-            Action::RequestTxInclusionProofs { .. } => "RequestTxInclusionProof",
             Action::RequestMissingCommittedBlockHeader { .. } => {
                 "RequestMissingCommittedBlockHeader"
             }

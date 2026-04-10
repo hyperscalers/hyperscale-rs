@@ -1,11 +1,10 @@
 //! Block and BlockHeader types for consensus.
 
 use crate::{
-    block_vote_message, compute_merkle_root, compute_merkle_root_with_proof,
-    compute_padded_merkle_root, decode_wave_cert_vec, encode_wave_cert_vec, BlockHeight,
-    Bls12381G1PrivateKey, Bls12381G2Signature, Conflict, Hash, QuorumCertificate, ReceiptBundle,
-    RoutableTransaction, ShardGroupId, TransactionInclusionProof, ValidatorId, WaveCertificate,
-    WaveId,
+    block_vote_message, compute_merkle_root, compute_padded_merkle_root, decode_wave_cert_vec,
+    encode_wave_cert_vec, BlockHeight, Bls12381G1PrivateKey, Bls12381G2Signature, Hash,
+    QuorumCertificate, ReceiptBundle, RoutableTransaction, ShardGroupId, ValidatorId,
+    WaveCertificate, WaveId,
 };
 use sbor::prelude::*;
 use std::sync::Arc;
@@ -71,53 +70,6 @@ pub fn compute_transaction_root(transactions: &[Arc<RoutableTransaction>]) -> Ha
     // Use padded merkle root (power-of-2 padding with Hash::ZERO) so that
     // merkle inclusion proofs can be generated and verified for any leaf.
     compute_padded_merkle_root(&leaves)
-}
-
-/// Compute a transaction inclusion proof for a specific transaction in a block.
-///
-/// Reconstructs the leaf list in the same order as `compute_transaction_root`,
-/// finds the leaf matching `tx_hash`, and returns a merkle inclusion proof.
-///
-/// Returns `None` if the transaction is not in the block.
-pub fn tx_inclusion_proof(block: &Block, tx_hash: &Hash) -> Option<TransactionInclusionProof> {
-    if block.transactions.is_empty() {
-        return None;
-    }
-
-    let leaves: Vec<Hash> = block.transactions.iter().map(|tx| tx.hash()).collect();
-
-    let index = leaves.iter().position(|leaf| leaf == tx_hash)?;
-
-    let (_root, proof) = compute_merkle_root_with_proof(&leaves, index);
-    Some(proof)
-}
-
-/// Batch version of [`tx_inclusion_proof`] — generates proofs for multiple
-/// transactions from the same block, building the leaf list only once.
-pub fn tx_inclusion_proofs(
-    block: &Block,
-    tx_hashes: &[Hash],
-) -> Vec<(Hash, Option<TransactionInclusionProof>)> {
-    if block.transactions.is_empty() {
-        return tx_hashes.iter().map(|h| (*h, None)).collect();
-    }
-
-    let leaves: Vec<Hash> = block.transactions.iter().map(|tx| tx.hash()).collect();
-
-    tx_hashes
-        .iter()
-        .map(|tx_hash| {
-            let index = leaves.iter().position(|leaf| leaf == tx_hash);
-
-            match index {
-                Some(idx) => {
-                    let (_root, proof) = compute_merkle_root_with_proof(&leaves, idx);
-                    (*tx_hash, Some(proof))
-                }
-                None => (*tx_hash, None),
-            }
-        })
-        .collect()
 }
 
 /// Block header containing consensus metadata.
@@ -264,7 +216,6 @@ impl BlockHeader {
 ///
 /// Additional block contents:
 /// - **certificates**: Wave certificates (per-wave finalization proofs)
-/// - **conflicts**: Livelock conflict resolutions
 ///
 /// Transactions and certificates are stored as `Arc` for efficient cloning
 /// and sharing across the system. When serialized (for storage or network),
@@ -279,9 +230,6 @@ pub struct Block {
 
     /// Wave certificates for finalized waves.
     pub certificates: Vec<Arc<WaveCertificate>>,
-
-    /// Abort intents — proposals to the execution voting process.
-    pub conflicts: Vec<Conflict>,
 }
 
 // Manual PartialEq - compare transaction/certificate content, not Arc pointers
@@ -299,7 +247,6 @@ impl PartialEq for Block {
                 .iter()
                 .zip(other.certificates.iter())
                 .all(|(a, b)| a.as_ref() == b.as_ref())
-            && self.conflicts == other.conflicts
     }
 }
 
@@ -330,11 +277,10 @@ impl<E: sbor::Encoder<sbor::NoCustomValueKind>> sbor::Encode<sbor::NoCustomValue
     }
 
     fn encode_body(&self, encoder: &mut E) -> Result<(), sbor::EncodeError> {
-        encoder.write_size(4)?;
+        encoder.write_size(3)?;
         encoder.encode(&self.header)?;
         encode_tx_vec(encoder, &self.transactions)?;
         encode_wave_cert_vec(encoder, &self.certificates)?;
-        encoder.encode(&self.conflicts)?;
         Ok(())
     }
 }
@@ -378,9 +324,9 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
         decoder.check_preloaded_value_kind(value_kind, sbor::ValueKind::Tuple)?;
         let length = decoder.read_size()?;
 
-        if length != 4 {
+        if length != 3 {
             return Err(sbor::DecodeError::UnexpectedSize {
-                expected: 4,
+                expected: 3,
                 actual: length,
             });
         }
@@ -388,13 +334,11 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
         let header: BlockHeader = decoder.decode()?;
         let transactions = decode_tx_vec(decoder)?;
         let certificates = decode_wave_cert_vec(decoder, MAX_SBOR_COLLECTION_SIZE)?;
-        let conflicts: Vec<Conflict> = decoder.decode()?;
 
         Ok(Self {
             header,
             transactions,
             certificates,
-            conflicts,
         })
     }
 }
@@ -420,7 +364,6 @@ impl Block {
             header: BlockHeader::genesis(shard_group_id, proposer, state_root),
             transactions: vec![],
             certificates: vec![],
-            conflicts: vec![],
         }
     }
 
@@ -458,34 +401,13 @@ impl Block {
     pub fn certificate_count(&self) -> usize {
         self.certificates.len()
     }
-
-    /// Get number of conflicts in this block.
-    pub fn conflict_count(&self) -> usize {
-        self.conflicts.len()
-    }
-
-    /// Get transaction hashes targeted by conflicts.
-    pub fn conflict_hashes(&self) -> Vec<Hash> {
-        self.conflicts.iter().map(|c| c.tx_hash).collect()
-    }
-
-    /// Check if this block contains a conflict for a specific transaction.
-    pub fn contains_conflict(&self, tx_hash: &Hash) -> bool {
-        self.conflicts.iter().any(|c| &c.tx_hash == tx_hash)
-    }
-
-    /// Check if this block has any livelock-related content.
-    pub fn has_livelock_content(&self) -> bool {
-        !self.conflicts.is_empty()
-    }
 }
 
 // ============================================================================
 // BlockManifest - Hash-level block contents
 // ============================================================================
 
-/// Hash-level description of a block's contents (transactions, certificates,
-/// and abort intents).
+/// Hash-level description of a block's contents (transactions and certificates).
 ///
 /// This is the common denominator shared by `BlockHeaderNotification`, `BlockMetadata`,
 /// and `ProtocolEvent::BlockHeaderReceived`. Extracting it into a standalone type
@@ -498,9 +420,6 @@ pub struct BlockManifest {
     /// Certificate hashes (wave_id hashes) in block order.
     /// Validators use these to match against their locally finalized waves.
     pub cert_hashes: Vec<Hash>,
-
-    /// Abort intents (small, stored inline).
-    pub conflicts: Vec<Conflict>,
 
     /// Hashes of provision batches included in this block.
     /// Used for provision data availability — validators fetch missing batches by hash.
@@ -524,7 +443,6 @@ impl BlockManifest {
                 .iter()
                 .map(|c| c.wave_id.hash())
                 .collect(),
-            conflicts: block.conflicts.clone(),
             provision_batch_hashes: vec![],
         }
     }

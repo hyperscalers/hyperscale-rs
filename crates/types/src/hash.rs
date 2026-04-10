@@ -157,24 +157,10 @@ pub fn compute_merkle_root(hashes: &[Hash]) -> Hash {
 }
 
 // ============================================================================
-// Transaction Inclusion Proof
+// Merkle Proof Helpers
 // ============================================================================
 
-/// Merkle inclusion proof for a leaf in a binary merkle tree.
-///
-/// Used to prove a transaction was included in a committed block by verifying
-/// against the block header's `transaction_root` (which is QC-attested).
-///
-/// ~320 bytes for a typical block (10 levels × 32 bytes).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, BasicSbor)]
-pub struct TransactionInclusionProof {
-    /// Sibling hashes from leaf to root, one per tree level.
-    pub siblings: Vec<Hash>,
-    /// Index of the leaf in the bottom level of the tree.
-    pub leaf_index: u32,
-}
-
-/// Compute a binary merkle root AND an inclusion proof for a specific leaf.
+/// Compute a binary merkle root AND a proof (siblings + leaf index) for a specific leaf.
 ///
 /// **Important**: This does NOT use the same odd-node-promotion rule as
 /// [`compute_merkle_root`]. Instead, it pads the leaf list to the next power
@@ -185,13 +171,12 @@ pub struct TransactionInclusionProof {
 /// leaf counts. Callers must use this function (or [`compute_padded_merkle_root`])
 /// consistently when both generating and verifying proofs.
 ///
+/// Returns `(root, siblings, leaf_index)`.
+///
 /// # Panics
 ///
 /// Panics if `index >= hashes.len()` or `hashes` is empty.
-pub fn compute_merkle_root_with_proof(
-    hashes: &[Hash],
-    index: usize,
-) -> (Hash, TransactionInclusionProof) {
+pub fn compute_merkle_root_with_proof(hashes: &[Hash], index: usize) -> (Hash, Vec<Hash>, u32) {
     assert!(!hashes.is_empty(), "cannot prove in empty tree");
     assert!(index < hashes.len(), "index out of bounds");
 
@@ -221,13 +206,7 @@ pub fn compute_merkle_root_with_proof(
         level = next_level;
     }
 
-    (
-        level[0],
-        TransactionInclusionProof {
-            siblings,
-            leaf_index: index as u32,
-        },
-    )
+    (level[0], siblings, index as u32)
 }
 
 /// Compute a padded merkle root (power-of-2 padding with Hash::ZERO).
@@ -264,12 +243,13 @@ pub fn compute_padded_merkle_root(hashes: &[Hash]) -> Hash {
 pub fn verify_merkle_inclusion(
     root: Hash,
     leaf_hash: Hash,
-    proof: &TransactionInclusionProof,
+    siblings: &[Hash],
+    leaf_index: u32,
 ) -> bool {
     let mut current = leaf_hash;
-    let mut index = proof.leaf_index as usize;
+    let mut index = leaf_index as usize;
 
-    for sibling in &proof.siblings {
+    for sibling in siblings {
         if index.is_multiple_of(2) {
             current = Hash::from_parts(&[current.as_bytes(), sibling.as_bytes()]);
         } else {
@@ -394,19 +374,24 @@ mod tests {
         let expected_root = compute_merkle_root(&hashes);
 
         for idx in 0..2 {
-            let (root, proof) = compute_merkle_root_with_proof(&hashes, idx);
+            let (root, siblings, leaf_index) = compute_merkle_root_with_proof(&hashes, idx);
             assert_eq!(root, expected_root);
-            assert!(verify_merkle_inclusion(root, hashes[idx], &proof));
+            assert!(verify_merkle_inclusion(
+                root,
+                hashes[idx],
+                &siblings,
+                leaf_index
+            ));
         }
     }
 
     #[test]
     fn test_inclusion_proof_single_leaf() {
         let h = Hash::from_bytes(b"only");
-        let (root, proof) = compute_merkle_root_with_proof(&[h], 0);
+        let (root, siblings, leaf_index) = compute_merkle_root_with_proof(&[h], 0);
         assert_eq!(root, h);
-        assert!(proof.siblings.is_empty());
-        assert!(verify_merkle_inclusion(root, h, &proof));
+        assert!(siblings.is_empty());
+        assert!(verify_merkle_inclusion(root, h, &siblings, leaf_index));
     }
 
     #[test]
@@ -416,10 +401,10 @@ mod tests {
         let padded_root = compute_padded_merkle_root(&hashes);
 
         for idx in 0..5 {
-            let (proof_root, proof) = compute_merkle_root_with_proof(&hashes, idx);
+            let (proof_root, siblings, leaf_index) = compute_merkle_root_with_proof(&hashes, idx);
             assert_eq!(proof_root, padded_root);
             assert!(
-                verify_merkle_inclusion(padded_root, hashes[idx], &proof),
+                verify_merkle_inclusion(padded_root, hashes[idx], &siblings, leaf_index),
                 "proof failed for index {idx}"
             );
         }
@@ -432,10 +417,10 @@ mod tests {
 
         // Verify every leaf
         for idx in 0..100 {
-            let (proof_root, proof) = compute_merkle_root_with_proof(&hashes, idx);
+            let (proof_root, siblings, leaf_index) = compute_merkle_root_with_proof(&hashes, idx);
             assert_eq!(proof_root, padded_root);
             assert!(
-                verify_merkle_inclusion(padded_root, hashes[idx], &proof),
+                verify_merkle_inclusion(padded_root, hashes[idx], &siblings, leaf_index),
                 "proof failed for index {idx}"
             );
         }
@@ -444,15 +429,19 @@ mod tests {
     #[test]
     fn test_inclusion_proof_tampered_rejected() {
         let hashes: Vec<Hash> = (0..8u8).map(|i| Hash::from_bytes(&[i])).collect();
-        let (root, proof) = compute_merkle_root_with_proof(&hashes, 3);
+        let (root, siblings, leaf_index) = compute_merkle_root_with_proof(&hashes, 3);
 
         // Wrong leaf hash should fail
         let wrong_leaf = Hash::from_bytes(b"wrong");
-        assert!(!verify_merkle_inclusion(root, wrong_leaf, &proof));
+        assert!(!verify_merkle_inclusion(
+            root, wrong_leaf, &siblings, leaf_index
+        ));
 
         // Wrong root should fail
         let wrong_root = Hash::from_bytes(b"bad_root");
-        assert!(!verify_merkle_inclusion(wrong_root, hashes[3], &proof));
+        assert!(!verify_merkle_inclusion(
+            wrong_root, hashes[3], &siblings, leaf_index
+        ));
     }
 
     #[test]
@@ -462,21 +451,16 @@ mod tests {
         let root = compute_merkle_root(&hashes);
 
         for idx in 0..8 {
-            let (proof_root, proof) = compute_merkle_root_with_proof(&hashes, idx);
+            let (proof_root, siblings, leaf_index) = compute_merkle_root_with_proof(&hashes, idx);
             assert_eq!(proof_root, root);
-            assert_eq!(proof.siblings.len(), 3); // log2(8) = 3
-            assert!(verify_merkle_inclusion(root, hashes[idx], &proof));
+            assert_eq!(siblings.len(), 3); // log2(8) = 3
+            assert!(verify_merkle_inclusion(
+                root,
+                hashes[idx],
+                &siblings,
+                leaf_index
+            ));
         }
-    }
-
-    #[test]
-    fn test_inclusion_proof_serialization_roundtrip() {
-        let hashes: Vec<Hash> = (0..10u8).map(|i| Hash::from_bytes(&[i])).collect();
-        let (_, proof) = compute_merkle_root_with_proof(&hashes, 5);
-
-        let bytes = sbor::basic_encode(&proof).unwrap();
-        let decoded: TransactionInclusionProof = sbor::basic_decode(&bytes).unwrap();
-        assert_eq!(proof, decoded);
     }
 
     // ── Original merkle root tests ──────────────────────────────────

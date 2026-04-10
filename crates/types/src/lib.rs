@@ -62,7 +62,7 @@ pub use epoch::{
 };
 pub use hash::{
     compute_merkle_root, compute_merkle_root_with_proof, compute_padded_merkle_root,
-    verify_merkle_inclusion, Hash, TransactionInclusionProof,
+    verify_merkle_inclusion, Hash,
 };
 pub use identifiers::{BlockHeight, NodeId, PartitionNumber, ShardGroupId, ValidatorId, VotePower};
 pub use network::{MessagePriority, NetworkMessage, Request, ShardMessage};
@@ -77,8 +77,8 @@ pub use signing::{
 
 pub use block::{
     compute_certificate_root, compute_local_receipt_root, compute_provisions_root,
-    compute_transaction_root, tx_inclusion_proof, tx_inclusion_proofs, Block, BlockHeader,
-    BlockManifest, BlockMetadata, BlockVote, CommittedBlockHeader,
+    compute_transaction_root, Block, BlockHeader, BlockManifest, BlockMetadata, BlockVote,
+    CommittedBlockHeader,
 };
 pub use quorum_certificate::QuorumCertificate;
 pub use receipt::{
@@ -89,9 +89,8 @@ pub use signer_bitfield::SignerBitfield;
 pub use state::{StateEntry, StateProvision};
 pub use topology::{node_id_hash_u64, shard_for_node, TopologySnapshot, TopologySnapshotError};
 pub use transaction::{
-    sign_and_notarize, sign_and_notarize_with_options, Conflict, ReadyTransactions,
-    RoutableTransaction, TransactionDecision, TransactionError, TransactionStatus,
-    TransactionStatusParseError,
+    sign_and_notarize, sign_and_notarize_with_options, ReadyTransactions, RoutableTransaction,
+    TransactionDecision, TransactionError, TransactionStatus, TransactionStatusParseError,
 };
 pub use validator::{ValidatorInfo, ValidatorSet};
 pub use wave::{

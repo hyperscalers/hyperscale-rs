@@ -1,7 +1,6 @@
 //! Consolidated configuration for IoLoop.
 
 use crate::protocol::execution_cert_fetch::ExecCertFetchConfig;
-use crate::protocol::inclusion_proof_fetch::InclusionProofFetchConfig;
 use crate::protocol::provision_fetch::ProvisionFetchConfig;
 use crate::protocol::sync::SyncConfig;
 use crate::protocol::transaction_fetch::TransactionFetchConfig;
@@ -15,7 +14,6 @@ pub struct NodeConfig {
     pub sync: SyncConfig,
     pub transaction_fetch: TransactionFetchConfig,
     pub provision_fetch: ProvisionFetchConfig,
-    pub inclusion_proof_fetch: InclusionProofFetchConfig,
     pub exec_cert_fetch: ExecCertFetchConfig,
     pub batch: BatchConfig,
 }
