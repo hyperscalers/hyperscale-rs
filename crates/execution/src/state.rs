@@ -373,7 +373,7 @@ impl ExecutionState {
             // Only the wave leader creates a VoteTracker and aggregates votes.
             // Non-leaders receive the canonical EC from the wave leader via
             // on_wave_certificate → on_certificate_verified.
-            let leader = hyperscale_types::wave_leader(&wave_id, local_committee);
+            let leader = hyperscale_types::designated_broadcaster(&wave_id, local_committee);
             if local_vid == leader {
                 let tracker = VoteTracker::new(wave_id.clone(), block_hash, quorum);
                 self.vote_trackers.insert(wave_id.clone(), tracker);
@@ -619,7 +619,8 @@ impl ExecutionState {
         self.scan_complete_waves()
             .into_iter()
             .map(|completion| {
-                let target = hyperscale_types::wave_leader(&completion.wave_id, local_committee);
+                let target =
+                    hyperscale_types::designated_broadcaster(&completion.wave_id, local_committee);
                 Action::SignAndSendExecutionVote {
                     block_hash: completion.block_hash,
                     block_height: completion.block_height,
@@ -1122,13 +1123,13 @@ impl ExecutionState {
                 let is_retry = expected.last_requested_at.is_some();
                 expected.last_requested_at = Some(current_height);
                 let committee = topology.committee_for_shard(*source_shard);
-                let leader = hyperscale_types::wave_leader(wave_id, committee);
+                let leader = hyperscale_types::designated_broadcaster(wave_id, committee);
                 let peers = committee.to_vec();
                 tracing::info!(
                     source_shard = source_shard.0,
                     block_height = block_height,
                     wave = %wave_id,
-                    wave_leader = leader.0,
+                    designated_broadcaster = leader.0,
                     age,
                     retry = is_retry,
                     "Execution cert timeout — requesting fallback"
@@ -1137,7 +1138,7 @@ impl ExecutionState {
                     source_shard: *source_shard,
                     block_height: *block_height,
                     wave_id: wave_id.clone(),
-                    wave_leader: leader,
+                    designated_broadcaster: leader,
                     peers,
                 });
             }

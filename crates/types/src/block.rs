@@ -187,7 +187,6 @@ pub struct BlockHeader {
     /// Used by remote shards to:
     /// 1. Detect missing provisions (derive provision targets from wave union)
     /// 2. Detect missing execution certificates (know which certs to expect)
-    /// 3. Assign wave leaders per wave
     ///
     /// Empty for genesis, fallback, and sync blocks (no transactions).
     pub waves: Vec<WaveId>,
