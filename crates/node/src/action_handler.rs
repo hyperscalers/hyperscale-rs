@@ -327,6 +327,7 @@ pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainRead
             finalized_waves,
             conflicts,
             waves,
+            provision_batches,
         } => {
             // Extract certificates from finalized waves.
             // No storage reads needed — everything flows through Arc<FinalizedWave>.
@@ -341,6 +342,9 @@ pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainRead
                 .iter()
                 .flat_map(|fw| fw.receipts.iter().cloned())
                 .collect();
+
+            let provision_batch_hashes: Vec<hyperscale_types::Hash> =
+                provision_batches.iter().map(|b| b.hash()).collect();
 
             let result = hyperscale_bft::handlers::build_proposal(
                 ctx.storage,
@@ -358,6 +362,7 @@ pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainRead
                 conflicts,
                 shard_group_id,
                 waves,
+                provision_batch_hashes,
             );
             let prepared = result
                 .prepared_commit

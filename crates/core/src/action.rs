@@ -481,6 +481,8 @@ pub enum Action {
         conflicts: Vec<Conflict>,
         /// Cross-shard execution waves in this block.
         waves: Vec<WaveId>,
+        /// Provision batches from remote shards, included in this block.
+        provision_batches: Vec<Arc<ProvisionBatch>>,
     },
 
     /// Execute a batch of single-shard transactions.

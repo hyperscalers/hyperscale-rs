@@ -10,7 +10,7 @@ use hyperscale_remote_headers::RemoteHeaderCoordinator;
 use hyperscale_topology::TopologyState;
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, BlockManifest, Bls12381G1PrivateKey, Conflict, FinalizedWave,
-    Hash, QuorumCertificate, ReadyTransactions, RoutableTransaction, ShardGroupId,
+    Hash, ProvisionBatch, QuorumCertificate, ReadyTransactions, RoutableTransaction, ShardGroupId,
     TopologySnapshot,
 };
 use std::sync::Arc;
@@ -78,6 +78,7 @@ struct ProposalInputs {
     ready_txs: ReadyTransactions,
     conflicts: Vec<Conflict>,
     finalized_waves: Vec<Arc<FinalizedWave>>,
+    provision_batches: Vec<Arc<ProvisionBatch>>,
 }
 
 impl NodeStateMachine {
@@ -205,11 +206,13 @@ impl NodeStateMachine {
         // Livelock cycle conflicts (from cycle detection).
         let conflicts = self.livelock.get_pending_conflicts().to_vec();
         let finalized_waves = self.execution.get_finalized_waves();
+        let provision_batches = self.provisions.drain_queued_provisions();
 
         ProposalInputs {
             ready_txs,
             conflicts,
             finalized_waves,
+            provision_batches,
         }
     }
 
@@ -268,6 +271,7 @@ impl NodeStateMachine {
             &inputs.ready_txs,
             inputs.conflicts,
             inputs.finalized_waves,
+            inputs.provision_batches,
         )
     }
 
@@ -327,6 +331,7 @@ impl NodeStateMachine {
             &inputs.ready_txs,
             inputs.conflicts,
             inputs.finalized_waves,
+            inputs.provision_batches,
         )
     }
 

@@ -48,8 +48,8 @@ pub type NodeIndex = u32;
 use hyperscale_types::{
     block_header_message, committed_block_header_message, Block, BlockHeader, BlockHeight,
     BlockManifest, BlockVote, Bls12381G1PrivateKey, Bls12381G1PublicKey, CommittedBlockHeader,
-    Conflict, FinalizedWave, Hash, QuorumCertificate, ReadyTransactions, RoutableTransaction,
-    ShardGroupId, TopologySnapshot, ValidatorId, VotePower,
+    Conflict, FinalizedWave, Hash, ProvisionBatch, QuorumCertificate, ReadyTransactions,
+    RoutableTransaction, ShardGroupId, TopologySnapshot, ValidatorId, VotePower,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -826,6 +826,7 @@ impl BftState {
         ready_txs: &ReadyTransactions,
         conflicts: Vec<Conflict>,
         finalized_waves: Vec<Arc<FinalizedWave>>,
+        provision_batches: Vec<Arc<ProvisionBatch>>,
     ) -> Vec<Action> {
         // The next height to propose is one above the highest certified block,
         // NOT one above the committed block. This allows the chain to grow
@@ -1057,6 +1058,7 @@ impl BftState {
                 finalized_waves: waves_to_propose,
                 conflicts: conflicts_with_height,
                 waves,
+                provision_batches,
             },
         ]
     }
@@ -2848,6 +2850,7 @@ impl BftState {
         ready_txs: &ReadyTransactions,
         conflicts: Vec<Conflict>,
         finalized_waves: Vec<Arc<FinalizedWave>>,
+        provision_batches: Vec<Arc<ProvisionBatch>>,
     ) -> Vec<Action> {
         let height = qc.height.0;
 
@@ -2929,7 +2932,13 @@ impl BftState {
             // on_proposal_timer will check if we're the proposer, backpressure, etc.
             // State root is computed by NodeStateMachine and passed in.
             // If certificates is empty, on_proposal_timer will inherit parent state.
-            actions.extend(self.on_proposal_timer(topology, ready_txs, conflicts, finalized_waves));
+            actions.extend(self.on_proposal_timer(
+                topology,
+                ready_txs,
+                conflicts,
+                finalized_waves,
+                provision_batches,
+            ));
         } else if should_try_proposal && rate_limited {
             // Schedule the proposal timer to fire exactly when the rate limit
             // expires, rather than waiting for the next periodic timer fire.
@@ -6739,6 +6748,7 @@ mod tests {
             &ReadyTransactions::default(), // empty mempool
             vec![],                        // no conflicts
             vec![],                        // no certificates
+            vec![],
         );
 
         // Should NOT contain a BlockHeader broadcast (no proposal)
@@ -6814,6 +6824,7 @@ mod tests {
             &ReadyTransactions::default(), // empty mempool
             vec![conflict],                // has a conflict
             vec![],                        // no certificates
+            vec![],
         );
 
         // Should contain a BuildProposal action (proposal triggered)
@@ -7133,6 +7144,7 @@ mod tests {
             &ready_txs, // has content
             vec![],     // no conflicts
             vec![],
+            vec![],
         );
 
         // Should NOT contain a BlockHeader broadcast (rate limited)
@@ -7182,6 +7194,7 @@ mod tests {
             qc,
             &ready_txs, // has content
             vec![],     // no conflicts
+            vec![],
             vec![],
         );
 
@@ -7253,7 +7266,15 @@ mod tests {
             transactions: vec![make_test_tx_with_seed(42)],
         };
 
-        let actions = state.on_qc_formed(&topology, qc.block_hash, qc, &ready_txs, vec![], vec![]);
+        let actions = state.on_qc_formed(
+            &topology,
+            qc.block_hash,
+            qc,
+            &ready_txs,
+            vec![],
+            vec![],
+            vec![],
+        );
 
         let has_block_header = actions
             .iter()
@@ -7318,7 +7339,15 @@ mod tests {
             transactions: vec![make_test_tx_with_seed(42)],
         };
 
-        let actions = state.on_qc_formed(&topology, qc.block_hash, qc, &ready_txs, vec![], vec![]);
+        let actions = state.on_qc_formed(
+            &topology,
+            qc.block_hash,
+            qc,
+            &ready_txs,
+            vec![],
+            vec![],
+            vec![],
+        );
 
         // Should contain a BuildProposal action (rate limiting disabled)
         // After the refactor, proposal building is async - we emit BuildProposal
@@ -7360,6 +7389,7 @@ mod tests {
             qc.block_hash,
             qc,
             &ReadyTransactions::default(),
+            vec![],
             vec![],
             vec![],
         );
@@ -7581,7 +7611,7 @@ mod tests {
             transactions: vec![Arc::new(hyperscale_types::test_utils::test_transaction(1))],
         };
 
-        let actions = state.on_proposal_timer(&topology, &ready_txs, vec![], vec![]);
+        let actions = state.on_proposal_timer(&topology, &ready_txs, vec![], vec![], vec![]);
 
         // Should have broadcast a block header
         let has_block_header = actions
@@ -7641,8 +7671,13 @@ mod tests {
         // Enter sync mode
         state.set_syncing(&topology, true);
 
-        let actions =
-            state.on_proposal_timer(&topology, &ReadyTransactions::default(), vec![], vec![]);
+        let actions = state.on_proposal_timer(
+            &topology,
+            &ReadyTransactions::default(),
+            vec![],
+            vec![],
+            vec![],
+        );
 
         // Extract the block header
         let gossip = actions.iter().find_map(|a| {
@@ -7922,8 +7957,13 @@ mod tests {
         state.set_syncing(&topology, true);
 
         // Propose (which builds sync block)
-        let _actions =
-            state.on_proposal_timer(&topology, &ReadyTransactions::default(), vec![], vec![]);
+        let _actions = state.on_proposal_timer(
+            &topology,
+            &ReadyTransactions::default(),
+            vec![],
+            vec![],
+            vec![],
+        );
 
         // Leader activity should be updated
         assert_eq!(
@@ -8035,8 +8075,13 @@ mod tests {
         state.set_syncing(&topology, true);
 
         // Propose first sync block
-        let actions1 =
-            state.on_proposal_timer(&topology, &ReadyTransactions::default(), vec![], vec![]);
+        let actions1 = state.on_proposal_timer(
+            &topology,
+            &ReadyTransactions::default(),
+            vec![],
+            vec![],
+            vec![],
+        );
 
         // Verify we got a proposal (not skipped due to syncing)
         let has_proposal = actions1
