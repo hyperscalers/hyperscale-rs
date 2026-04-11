@@ -87,7 +87,9 @@ impl PendingBlock {
         let mut manifest = BlockManifest::from_block(block);
         // Set provision_batch_hashes from actual batches (from_block can't compute
         // these since Block doesn't carry provision data — it's ephemeral).
-        manifest.provision_batch_hashes = provision_batches.iter().map(|b| b.hash()).collect();
+        let mut batch_hashes: Vec<Hash> = provision_batches.iter().map(|b| b.hash()).collect();
+        batch_hashes.sort();
+        manifest.provision_batch_hashes = batch_hashes;
         let missing_provision_hashes: HashSet<Hash> =
             manifest.provision_batch_hashes.iter().copied().collect();
         let mut pending = Self {
