@@ -102,6 +102,7 @@ pub struct ExecutionMemoryStats {
     pub accumulators: usize,
     pub vote_trackers: usize,
     pub early_votes: usize,
+    pub early_wave_attestations: usize,
     pub wave_certificate_trackers: usize,
     pub expected_exec_certs: usize,
 }
@@ -1766,11 +1767,22 @@ impl ExecutionState {
         });
         let pruned_ev = before_ev - self.early_votes.len();
 
-        if pruned_acc > 0 || pruned_vt > 0 || pruned_ev > 0 {
+        // Prune stale early wave attestations that were never consumed.
+        // Attestations are consumed during setup_execution_tracking when wave
+        // trackers exist. Attestations may also be re-buffered if some waves
+        // are unrouted (handle_wave_attestation). Entries 50 or more blocks
+        // old (insertion_height <= cutoff) are pruned to prevent unbounded growth.
+        let before_ewa = self.early_wave_attestations.len();
+        self.early_wave_attestations
+            .retain(|(_, insertion_height)| *insertion_height > ev_cutoff);
+        let pruned_ewa = before_ewa - self.early_wave_attestations.len();
+
+        if pruned_acc > 0 || pruned_vt > 0 || pruned_ev > 0 || pruned_ewa > 0 {
             tracing::debug!(
                 pruned_acc,
                 pruned_vt,
                 pruned_ev,
+                pruned_ewa,
                 "Pruned resolved wave state"
             );
         }
@@ -1896,6 +1908,7 @@ impl ExecutionState {
             accumulators: self.accumulators.len(),
             vote_trackers: self.vote_trackers.len(),
             early_votes: self.early_votes.len(),
+            early_wave_attestations: self.early_wave_attestations.len(),
             wave_certificate_trackers: self.wave_certificate_trackers.len(),
             expected_exec_certs: self.expected_exec_certs.len(),
         }
@@ -2105,6 +2118,122 @@ mod tests {
             results,
             vec![true, false],
             "Second signature should fail verification"
+        );
+    }
+
+    // ========================================================================
+    // Early Wave Attestations Cleanup Tests
+    // ========================================================================
+
+    /// Create a dummy ExecutionCertificate for testing.
+    fn make_test_ec(tx_seed: u8) -> Arc<ExecutionCertificate> {
+        use hyperscale_types::{zero_bls_signature, SignerBitfield, TxOutcome};
+        let tx = test_transaction(tx_seed);
+        Arc::new(ExecutionCertificate {
+            wave_id: WaveId::new(ShardGroupId(0), 0, BTreeSet::new()),
+            vote_height: 0,
+            global_receipt_root: Hash::ZERO,
+            tx_outcomes: vec![TxOutcome {
+                tx_hash: tx.hash(),
+                outcome: ExecutionOutcome::Aborted,
+            }],
+            aggregated_signature: zero_bls_signature(),
+            signers: SignerBitfield::new(1),
+        })
+    }
+
+    #[test]
+    fn test_early_wave_attestations_pruned_when_stale() {
+        let mut state = make_test_state();
+
+        // Buffer an attestation at height 40.
+        state.committed_height = 40;
+        let ec = make_test_ec(1);
+        state
+            .early_wave_attestations
+            .push((ec, state.committed_height));
+        assert_eq!(state.early_wave_attestations.len(), 1);
+
+        // Advance to height 100 and prune (cutoff = 50, entry at 40 is stale).
+        state.committed_height = 100;
+        state.prune_execution_state();
+
+        assert_eq!(
+            state.early_wave_attestations.len(),
+            0,
+            "Stale early wave attestation should be pruned"
+        );
+    }
+
+    #[test]
+    fn test_early_wave_attestations_kept_when_fresh() {
+        let mut state = make_test_state();
+
+        // Buffer an attestation at height 80.
+        state.committed_height = 80;
+        let ec = make_test_ec(2);
+        state
+            .early_wave_attestations
+            .push((ec, state.committed_height));
+
+        // Advance to height 100 and prune (cutoff = 50, entry at 80 > 50).
+        state.committed_height = 100;
+        state.prune_execution_state();
+
+        assert_eq!(
+            state.early_wave_attestations.len(),
+            1,
+            "Fresh early wave attestation should be kept"
+        );
+    }
+
+    #[test]
+    fn test_early_wave_attestations_mixed_ages() {
+        let mut state = make_test_state();
+
+        // Buffer attestations at different heights.
+        state.committed_height = 10;
+        state
+            .early_wave_attestations
+            .push((make_test_ec(1), state.committed_height));
+
+        state.committed_height = 60;
+        state
+            .early_wave_attestations
+            .push((make_test_ec(2), state.committed_height));
+
+        state.committed_height = 90;
+        state
+            .early_wave_attestations
+            .push((make_test_ec(3), state.committed_height));
+
+        assert_eq!(state.early_wave_attestations.len(), 3);
+
+        // Advance to height 100 (cutoff = 50). Entry at 10 is stale, 60 and 90 are fresh.
+        state.committed_height = 100;
+        state.prune_execution_state();
+
+        assert_eq!(
+            state.early_wave_attestations.len(),
+            2,
+            "Only the stale attestation (height 10) should be pruned"
+        );
+    }
+
+    #[test]
+    fn test_memory_stats_includes_early_wave_attestations() {
+        let mut state = make_test_state();
+
+        for i in 0..3u8 {
+            state
+                .early_wave_attestations
+                .push((make_test_ec(10 + i), 50));
+        }
+
+        let stats = state.memory_stats();
+        assert_eq!(
+            stats.early_wave_attestations, 3,
+            "memory_stats should report early_wave_attestations count"
         );
     }
 }

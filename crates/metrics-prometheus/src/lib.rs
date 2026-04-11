@@ -1166,6 +1166,10 @@ impl MetricsRecorder for PrometheusRecorder {
             .set(m.exec_early_votes as f64);
         self.metrics
             .memory_exec
+            .with_label_values(&["early_wave_attestations"])
+            .set(m.exec_early_wave_attestations as f64);
+        self.metrics
+            .memory_exec
             .with_label_values(&["wave_certificate_trackers"])
             .set(m.exec_wave_certificate_trackers as f64);
         self.metrics

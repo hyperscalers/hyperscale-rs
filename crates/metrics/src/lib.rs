@@ -87,6 +87,8 @@ pub struct MemoryMetrics {
     pub exec_vote_trackers: usize,
     /// Votes that arrived before tracking started.
     pub exec_early_votes: usize,
+    /// Execution certificates that arrived before wave tracker creation.
+    pub exec_early_wave_attestations: usize,
     /// Wave-level finalization trackers.
     pub exec_wave_certificate_trackers: usize,
     /// Expected execution certificates from remote shards.
