@@ -123,16 +123,6 @@ pub struct MemoryMetrics {
     /// Expected provisions that haven't arrived yet.
     pub prov_expected_provisions: usize,
 
-    // ── Livelock ──
-    /// Completed transactions (for late-arrival filtering).
-    pub livelock_tombstones: usize,
-    /// Loser txs awaiting inclusion proof.
-    pub livelock_pending_proof_fetches: usize,
-    /// Conflicts ready for next block proposal.
-    pub livelock_pending_conflicts: usize,
-    /// Cross-shard transactions being tracked for cycle detection.
-    pub livelock_tracked_txs: usize,
-
     // ── Storage (byte-level where available) ──
     /// JVT node hydration cache entries.
     pub jvt_node_cache_entries: usize,
@@ -356,14 +346,8 @@ pub trait MetricsRecorder: Send + Sync + 'static {
 
     // ── Livelock ─────────────────────────────────────────────────────
 
-    /// Record a livelock cycle detected.
-    fn record_livelock_cycle_detected(&self) {}
-
-    /// Record an abort intent committed.
-    fn record_livelock_conflict(&self) {}
-
-    /// Set the pending abort intents gauge.
-    fn set_livelock_pending_conflicts(&self, count: usize) {}
+    /// Record a cross-shard transaction abort (timeout or conflict).
+    fn record_transaction_aborted(&self) {}
 
     // ── Lock Contention ──────────────────────────────────────────────
 
@@ -784,24 +768,12 @@ pub fn record_invalid_message() {
     recorder().record_invalid_message();
 }
 
-// ── Livelock ─────────────────────────────────────────────────────────
+// ── Aborted Transactions ─────────────────────────────────────────────
 
-/// Record a livelock cycle detected.
+/// Record a cross-shard transaction abort (timeout or conflict).
 #[inline]
-pub fn record_livelock_cycle_detected() {
-    recorder().record_livelock_cycle_detected();
-}
-
-/// Record an abort intent committed.
-#[inline]
-pub fn record_livelock_conflict() {
-    recorder().record_livelock_conflict();
-}
-
-/// Set the pending abort intents gauge.
-#[inline]
-pub fn set_livelock_pending_conflicts(count: usize) {
-    recorder().set_livelock_pending_conflicts(count);
+pub fn record_transaction_aborted() {
+    recorder().record_transaction_aborted();
 }
 
 // ── Lock Contention ──────────────────────────────────────────────────

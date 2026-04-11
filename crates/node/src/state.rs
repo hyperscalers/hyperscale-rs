@@ -359,6 +359,9 @@ impl NodeStateMachine {
         // from committed wave certificates. Wave certs are lean (no per-tx data),
         // so we use the decisions extracted from FinalizedWave above.
         for (tx_hash, decision) in &committed_txs {
+            if *decision == hyperscale_types::TransactionDecision::Aborted {
+                hyperscale_metrics::record_transaction_aborted();
+            }
             actions.extend(self.mempool.on_certificate_committed(
                 self.topology.snapshot(),
                 *tx_hash,

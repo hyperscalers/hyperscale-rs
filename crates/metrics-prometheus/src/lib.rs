@@ -102,10 +102,8 @@ pub struct Metrics {
     pub fetch_latency: HistogramVec,
     pub fetch_in_flight: GaugeVec,
 
-    // === Livelock ===
-    pub livelock_cycles_detected: Counter,
-    pub livelock_conflicts: Counter,
-    pub livelock_pending_conflicts: Gauge,
+    // === Aborted Transactions ===
+    pub transactions_aborted: Counter,
 
     // === Lock Contention ===
     pub lock_contention_ratio: Gauge,
@@ -121,7 +119,6 @@ pub struct Metrics {
     pub memory_mempool: GaugeVec,
     pub memory_remote_headers: GaugeVec,
     pub memory_provisions: GaugeVec,
-    pub memory_livelock: GaugeVec,
     pub memory_storage: GaugeVec,
 
     // === Cross-Shard Message Delivery ===
@@ -550,22 +547,10 @@ impl Metrics {
             )
             .unwrap(),
 
-            // Livelock
-            livelock_cycles_detected: register_counter!(
-                "hyperscale_livelock_cycles_detected_total",
-                "Total number of cross-shard cycles detected"
-            )
-            .unwrap(),
-
-            livelock_conflicts: register_counter!(
-                "hyperscale_livelock_conflicts_total",
-                "Total number of abort intents committed (livelock cycle or timeout)"
-            )
-            .unwrap(),
-
-            livelock_pending_conflicts: register_gauge!(
-                "hyperscale_livelock_pending_conflicts",
-                "Current number of abort intents queued for next block proposal"
+            // Aborted Transactions
+            transactions_aborted: register_counter!(
+                "hyperscale_transactions_aborted_total",
+                "Total cross-shard transactions aborted (timeout or node-ID conflict)"
             )
             .unwrap(),
 
@@ -628,13 +613,6 @@ impl Metrics {
             memory_provisions: register_gauge_vec!(
                 "hyperscale_memory_provisions_collections",
                 "Provisions coordinator collection sizes (entry count)",
-                &["collection"]
-            )
-            .unwrap(),
-
-            memory_livelock: register_gauge_vec!(
-                "hyperscale_memory_livelock_collections",
-                "Livelock state machine collection sizes (entry count)",
                 &["collection"]
             )
             .unwrap(),
@@ -1078,18 +1056,10 @@ impl MetricsRecorder for PrometheusRecorder {
         self.metrics.invalid_messages_received.inc();
     }
 
-    // ── Livelock ─────────────────────────────────────────────────────
+    // ── Aborted Transactions ─────────────────────────────────────────
 
-    fn record_livelock_cycle_detected(&self) {
-        self.metrics.livelock_cycles_detected.inc();
-    }
-
-    fn record_livelock_conflict(&self) {
-        self.metrics.livelock_conflicts.inc();
-    }
-
-    fn set_livelock_pending_conflicts(&self, count: usize) {
-        self.metrics.livelock_pending_conflicts.set(count as f64);
+    fn record_transaction_aborted(&self) {
+        self.metrics.transactions_aborted.inc();
     }
 
     // ── Lock Contention ──────────────────────────────────────────────
@@ -1230,24 +1200,6 @@ impl MetricsRecorder for PrometheusRecorder {
             .memory_provisions
             .with_label_values(&["expected_provisions"])
             .set(m.prov_expected_provisions as f64);
-
-        // Livelock
-        self.metrics
-            .memory_livelock
-            .with_label_values(&["tombstones"])
-            .set(m.livelock_tombstones as f64);
-        self.metrics
-            .memory_livelock
-            .with_label_values(&["pending_proof_fetches"])
-            .set(m.livelock_pending_proof_fetches as f64);
-        self.metrics
-            .memory_livelock
-            .with_label_values(&["pending_conflicts"])
-            .set(m.livelock_pending_conflicts as f64);
-        self.metrics
-            .memory_livelock
-            .with_label_values(&["tracked_txs"])
-            .set(m.livelock_tracked_txs as f64);
 
         // Storage
         self.metrics
