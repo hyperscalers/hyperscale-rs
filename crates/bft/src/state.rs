@@ -3758,7 +3758,7 @@ impl BftState {
                     still_missing = missing_provisions.len(),
                     "Re-requesting remaining missing provisions"
                 );
-                actions.push(Action::FetchCommittedProvisions {
+                actions.push(Action::FetchProvisionsLocal {
                     block_hash,
                     proposer,
                     batch_hashes: missing_provisions,
@@ -4135,7 +4135,7 @@ impl BftState {
                     age_ms = age.as_millis(),
                     "Fetch timeout reached, requesting missing provisions"
                 );
-                actions.push(Action::FetchCommittedProvisions {
+                actions.push(Action::FetchProvisionsLocal {
                     block_hash: *block_hash,
                     proposer,
                     batch_hashes: missing_provisions,

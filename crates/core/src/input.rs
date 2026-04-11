@@ -75,6 +75,15 @@ pub enum NodeInput {
         transactions: Vec<Arc<RoutableTransaction>>,
     },
 
+    /// Local provision batches received from a fetch request.
+    LocalProvisionsReceived {
+        block_hash: Hash,
+        batches: Vec<Arc<ProvisionBatch>>,
+    },
+
+    /// Local provision fetch failed.
+    LocalProvisionsFetchFailed { block_hash: Hash, hashes: Vec<Hash> },
+
     /// Transaction validated by the validation pipeline.
     TransactionValidated {
         tx: Arc<RoutableTransaction>,
@@ -195,6 +204,8 @@ impl NodeInput {
             NodeInput::ExecCertFetchFailed { .. } => EventPriority::Internal,
             NodeInput::HeaderFetchReceived { .. } => EventPriority::Internal,
             NodeInput::HeaderFetchFailed { .. } => EventPriority::Internal,
+            NodeInput::LocalProvisionsReceived { .. } => EventPriority::Internal,
+            NodeInput::LocalProvisionsFetchFailed { .. } => EventPriority::Internal,
         }
     }
 
@@ -234,6 +245,8 @@ impl NodeInput {
             NodeInput::ExecCertFetchFailed { .. } => "ExecCertFetchFailed",
             NodeInput::HeaderFetchReceived { .. } => "HeaderFetchReceived",
             NodeInput::HeaderFetchFailed { .. } => "HeaderFetchFailed",
+            NodeInput::LocalProvisionsReceived { .. } => "LocalProvisionsReceived",
+            NodeInput::LocalProvisionsFetchFailed { .. } => "LocalProvisionsFetchFailed",
         }
     }
 }

@@ -2,7 +2,7 @@
 //!
 //! Pure synchronous state machine for cross-shard provision fetching with
 //! per-peer rotation. Sits between the `ProvisionCoordinator`'s
-//! `RequestMissingProvisions` action and the actual `network.request()` call,
+//! `FetchProvisionsRemote` action and the actual `network.request()` call,
 //! rotating through available peers on failure before giving up.
 //!
 //! # Usage
