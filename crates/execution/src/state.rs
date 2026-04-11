@@ -640,7 +640,10 @@ impl ExecutionState {
     ///
     /// Called during `on_block_committed` with the provision batches from the
     /// committed block. All validators have this data (fetched before BFT vote).
-    /// Detects node-ID overlap conflicts and marks transactions as provisioned.
+    ///
+    /// Order: (1) store provisions and unblock execution for ready txs,
+    /// (2) detect node-ID overlap conflicts only for txs still waiting on
+    /// provisions — if a provision unblocks a tx, there's no deadlock.
     pub fn apply_committed_provisions(
         &mut self,
         topology: &TopologySnapshot,
@@ -652,25 +655,7 @@ impl ExecutionState {
         for batch in batches {
             let source_shard = batch.source_shard;
 
-            // Detect node-ID overlap conflicts between this batch and local txs.
-            // Must run before marking provisioned — conflicts abort at commit height.
-            for conflict in self
-                .conflict_detector
-                .detect_conflicts(batch, committed_height)
-            {
-                if let Some(wave_key) = self.wave_assignments.get(&conflict.loser_tx).cloned() {
-                    if let Some(acc) = self.accumulators.get_mut(&wave_key) {
-                        acc.record_abort(conflict.loser_tx, conflict.committed_at_height);
-                    }
-                }
-                tracing::debug!(
-                    loser_tx = %conflict.loser_tx,
-                    source_shard = source_shard.0,
-                    committed_at = committed_height,
-                    "Node-ID overlap conflict detected — aborting loser"
-                );
-            }
-
+            // Step 1: Store provisions and start execution for newly-ready txs.
             for tx_entry in &batch.transactions {
                 let tx_hash = tx_entry.tx_hash;
 
@@ -730,6 +715,31 @@ impl ExecutionState {
                         }
                     }
                 }
+            }
+
+            // Step 2: Detect conflicts only for txs still blocked on provisions.
+            // If a provision unblocked a tx (removed from pending_provisioning above),
+            // there's no deadlock — both sides can execute. Only truly stuck txs
+            // (still in pending_provisioning) need conflict-based abort.
+            for conflict in self
+                .conflict_detector
+                .detect_conflicts(batch, committed_height)
+            {
+                // Skip if the tx was unblocked by these provisions (no deadlock).
+                if !self.pending_provisioning.contains_key(&conflict.loser_tx) {
+                    continue;
+                }
+                if let Some(wave_key) = self.wave_assignments.get(&conflict.loser_tx).cloned() {
+                    if let Some(acc) = self.accumulators.get_mut(&wave_key) {
+                        acc.record_abort(conflict.loser_tx, conflict.committed_at_height);
+                    }
+                }
+                tracing::debug!(
+                    loser_tx = %conflict.loser_tx,
+                    source_shard = source_shard.0,
+                    committed_at = committed_height,
+                    "Node-ID overlap conflict — tx still blocked, aborting loser"
+                );
             }
         }
 
@@ -1379,25 +1389,12 @@ impl ExecutionState {
                 .insert(tx_hash, remote_shards.clone());
 
             // Register for conflict detection (node-ID overlap with remote provisions).
-            // Returns conflicts if provisions committed before this tx (reverse detection).
             let reverse_conflicts = self.conflict_detector.register_tx(
                 tx_hash,
                 topology,
                 &tx.declared_reads,
                 &tx.declared_writes,
             );
-            for conflict in reverse_conflicts {
-                if let Some(wave_key) = self.wave_assignments.get(&conflict.loser_tx).cloned() {
-                    if let Some(acc) = self.accumulators.get_mut(&wave_key) {
-                        acc.record_abort(conflict.loser_tx, conflict.committed_at_height);
-                    }
-                }
-                tracing::debug!(
-                    loser_tx = %conflict.loser_tx,
-                    committed_at = conflict.committed_at_height,
-                    "Reverse conflict detected — provisions committed before local tx"
-                );
-            }
 
             // Check if all required provisions already arrived (before tx block commit).
             let received = self
@@ -1408,6 +1405,7 @@ impl ExecutionState {
             let all_ready = remote_shards.is_subset(&received);
 
             if all_ready {
+                // Provisions unblocked this tx — no deadlock, execute normally.
                 if let Some(provisions) = self.verified_provisions.get(&tx_hash).cloned() {
                     cross_shard_requests.push(CrossShardExecutionRequest {
                         tx_hash,
@@ -1424,6 +1422,20 @@ impl ExecutionState {
                 // Not all provisions yet — wait for remaining shards.
                 self.pending_provisioning
                     .insert(tx_hash, (tx.clone(), height));
+
+                // Apply reverse conflicts only for txs still blocked.
+                for conflict in reverse_conflicts {
+                    if let Some(wave_key) = self.wave_assignments.get(&conflict.loser_tx).cloned() {
+                        if let Some(acc) = self.accumulators.get_mut(&wave_key) {
+                            acc.record_abort(conflict.loser_tx, conflict.committed_at_height);
+                        }
+                    }
+                    tracing::debug!(
+                        loser_tx = %conflict.loser_tx,
+                        committed_at = conflict.committed_at_height,
+                        "Reverse conflict — tx still blocked, aborting loser"
+                    );
+                }
             }
         }
 
