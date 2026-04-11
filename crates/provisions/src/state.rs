@@ -94,13 +94,21 @@ pub struct ProvisionCoordinator {
     expected_provisions: BTreeMap<(ShardGroupId, BlockHeight), ExpectedProvision>,
 
     // ═══════════════════════════════════════════════════════════════════
-    // Time
+    // Proposal Queue + Tombstones
     // ═══════════════════════════════════════════════════════════════════
     /// Provision batches received from remote shards, queued for inclusion
     /// in the next block proposal. Proposer drains this queue when building
     /// a proposal. Every validator queues (any might become next proposer).
     queued_provision_batches: Vec<Arc<ProvisionBatch>>,
 
+    /// Tombstone set: hashes of provision batches that have been committed.
+    /// Prevents re-queueing if a duplicate batch arrives via gossip after commit.
+    /// Maps hash → commit height for age-based pruning.
+    committed_batch_tombstones: HashMap<Hash, BlockHeight>,
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Time
+    // ═══════════════════════════════════════════════════════════════════
     /// Current time.
     now: Duration,
 }
@@ -134,6 +142,7 @@ impl ProvisionCoordinator {
             local_committed_height: BlockHeight(0),
             expected_provisions: BTreeMap::new(),
             queued_provision_batches: Vec::new(),
+            committed_batch_tombstones: HashMap::new(),
             now: Duration::ZERO,
         }
     }
@@ -173,16 +182,21 @@ impl ProvisionCoordinator {
                 if let Some(batch) = self.batches_by_hash.remove(h) {
                     keys_to_remove.push((batch.source_shard, batch.block_height));
                 }
+                // Tombstone: prevent re-queueing if duplicate gossip arrives later.
+                self.committed_batch_tombstones
+                    .insert(*h, self.local_committed_height);
             }
             for key in keys_to_remove {
                 self.verified_batches.remove(&key);
             }
-            // queued_provision_batches: use Arc::ptr_eq against removed batches
-            // since we already have the committed set. Fall back to hash for any
-            // batches not in batches_by_hash (shouldn't happen but safe).
             self.queued_provision_batches
                 .retain(|b| !committed.contains(&b.hash()));
         }
+
+        // Prune old tombstones (committed more than 100 blocks ago).
+        let tombstone_cutoff = self.local_committed_height.0.saturating_sub(100);
+        self.committed_batch_tombstones
+            .retain(|_, height| height.0 > tombstone_cutoff);
 
         // Check for timed-out expected provisions and emit fallback requests
         let mut actions = vec![];
@@ -411,6 +425,17 @@ impl ProvisionCoordinator {
         let batch_key = (source_shard, batch.block_height);
         let batch = Arc::new(batch);
         let batch_hash = batch.hash();
+
+        // Skip if this batch was already committed (duplicate gossip after commit).
+        if self.committed_batch_tombstones.contains_key(&batch_hash) {
+            debug!(
+                source_shard = source_shard.0,
+                batch_hash = ?batch_hash,
+                "Skipping already-committed provision batch (tombstoned)"
+            );
+            return actions;
+        }
+
         self.verified_batches.insert(batch_key, Arc::clone(&batch));
         self.batches_by_hash.insert(batch_hash, Arc::clone(&batch));
 
