@@ -77,13 +77,6 @@ pub struct CrossShardExecutionRequest {
     pub provisions: Vec<StateProvision>,
 }
 
-/// A transaction whose provisioning is complete, with all collected provisions.
-#[derive(Debug, Clone)]
-pub struct ProvisionedTransaction {
-    pub tx_hash: Hash,
-    pub provisions: Vec<StateProvision>,
-}
-
 /// A single cross-shard transaction's provisioning needs.
 ///
 /// Collected per-block and sent as a batch in [`Action::FetchAndBroadcastProvisions`].
