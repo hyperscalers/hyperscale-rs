@@ -37,7 +37,7 @@ pub struct ProvisionMemoryStats {
 /// Tracks an expected provision that hasn't arrived yet.
 ///
 /// Created when a remote block header's `waves` field targets our shard.
-/// Emits a single `RequestMissingProvisions` after the timeout; the fetch
+/// Emits a single `FetchProvisionsRemote` after the timeout; the fetch
 /// protocol owns retries from that point.
 #[derive(Debug, Clone)]
 struct ExpectedProvision {
@@ -189,7 +189,7 @@ impl ProvisionCoordinator {
             );
 
             expected.requested = true;
-            actions.push(Action::RequestMissingProvisions {
+            actions.push(Action::FetchProvisionsRemote {
                 source_shard,
                 block_height,
                 proposer: expected.proposer,
@@ -994,7 +994,7 @@ mod tests {
         assert_eq!(actions.len(), 1);
         assert!(matches!(
             &actions[0],
-            Action::RequestMissingProvisions {
+            Action::FetchProvisionsRemote {
                 source_shard,
                 block_height,
                 proposer,

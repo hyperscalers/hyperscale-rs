@@ -700,7 +700,7 @@ pub enum Action {
     ///
     /// Same pattern as FetchTransactions: block header arrives, some provision
     /// batch hashes aren't in the local cache, fetch from proposer or local peers.
-    FetchCommittedProvisions {
+    FetchProvisionsLocal {
         /// Hash of the block that needs these provisions.
         block_hash: Hash,
         /// The proposer of the block (preferred fetch target).
@@ -755,7 +755,7 @@ pub enum Action {
     ///
     /// The runner sends a `GetProvisionsRequest` to the source shard, and the
     /// response is fed back as `StateProvisionsReceived` for normal verification.
-    RequestMissingProvisions {
+    FetchProvisionsRemote {
         /// The shard that should have sent provisions.
         source_shard: ShardGroupId,
         /// The block height whose provisions are missing.
@@ -864,9 +864,9 @@ impl Action {
             // Runner I/O Requests
             Action::StartSync { .. } => "StartSync",
             Action::FetchTransactions { .. } => "FetchTransactions",
-            Action::FetchCommittedProvisions { .. } => "FetchCommittedProvisions",
+            Action::FetchProvisionsLocal { .. } => "FetchProvisionsLocal",
             Action::CancelFetch { .. } => "CancelFetch",
-            Action::RequestMissingProvisions { .. } => "RequestMissingProvisions",
+            Action::FetchProvisionsRemote { .. } => "FetchProvisionsRemote",
             Action::RequestMissingExecutionCert { .. } => "RequestMissingExecutionCert",
             Action::CancelProvisionFetch { .. } => "CancelProvisionFetch",
             Action::RequestMissingCommittedBlockHeader { .. } => {

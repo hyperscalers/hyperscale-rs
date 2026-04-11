@@ -4,6 +4,7 @@ use super::{IoLoop, TimerOp};
 use crate::action_handler::{self, ActionContext, DispatchPool};
 use crate::protocol::execution_cert_fetch::ExecCertFetchInput;
 use crate::protocol::header_fetch::HeaderFetchInput;
+use crate::protocol::local_provision_fetch::LocalProvisionFetchInput;
 use crate::protocol::provision_fetch::ProvisionFetchInput;
 use crate::protocol::sync::SyncInput;
 use crate::protocol::transaction_fetch::TransactionFetchInput;
@@ -57,6 +58,10 @@ where
             // Internal events
             // ═══════════════════════════════════════════════════════════
             Action::Continuation(pe) => {
+                // Populate provision cache for request handler serving.
+                if let ProtocolEvent::ProvisionsVerified { ref batch } = pe {
+                    self.provision_cache.insert(batch.hash(), Arc::clone(batch));
+                }
                 let _ = self.event_sender.send(NodeInput::Protocol(pe));
             }
 
@@ -280,9 +285,9 @@ where
             // ═══════════════════════════════════════════════════════════
             Action::StartSync { .. }
             | Action::FetchTransactions { .. }
-            | Action::FetchCommittedProvisions { .. }
+            | Action::FetchProvisionsLocal { .. }
             | Action::CancelFetch { .. }
-            | Action::RequestMissingProvisions { .. }
+            | Action::FetchProvisionsRemote { .. }
             | Action::RequestMissingExecutionCert { .. }
             | Action::CancelProvisionFetch { .. }
             | Action::RequestMissingCommittedBlockHeader { .. } => {
@@ -751,26 +756,30 @@ where
                 self.process_transaction_fetch_outputs(outputs);
                 self.update_fetch_tick_timer();
             }
-            Action::FetchCommittedProvisions {
+            Action::FetchProvisionsLocal {
                 block_hash,
                 proposer,
                 batch_hashes,
             } => {
-                debug!(
-                    block_hash = ?block_hash,
-                    proposer = proposer.0,
-                    batch_count = batch_hashes.len(),
-                    "Fetching committed provisions for pending block (TODO: wire protocol)"
-                );
-                // TODO: Wire up CommittedProvisionFetchProtocol (mirrors TransactionFetchProtocol).
-                // For now, provisions arrive via normal gossip flow before the block.
-                let _ = (block_hash, proposer, batch_hashes);
+                self.local_provision_fetch_protocol
+                    .handle(LocalProvisionFetchInput::Request {
+                        block_hash,
+                        proposer,
+                        batch_hashes,
+                    });
+                let tick_outputs = self
+                    .local_provision_fetch_protocol
+                    .handle(LocalProvisionFetchInput::Tick);
+                self.process_local_provision_fetch_outputs(tick_outputs);
+                self.update_fetch_tick_timer();
             }
             Action::CancelFetch { block_hash } => {
                 self.transaction_fetch_protocol
                     .handle(TransactionFetchInput::CancelFetch { block_hash });
+                self.local_provision_fetch_protocol
+                    .handle(LocalProvisionFetchInput::CancelFetch { block_hash });
             }
-            Action::RequestMissingProvisions {
+            Action::FetchProvisionsRemote {
                 source_shard,
                 block_height,
                 proposer,
@@ -778,7 +787,7 @@ where
             } => {
                 debug_assert!(
                     !peers.is_empty(),
-                    "RequestMissingProvisions for shard {} height {} has no peers — \
+                    "FetchProvisionsRemote for shard {} height {} has no peers — \
                      was the action enriched by NodeStateMachine?",
                     source_shard.0,
                     block_height.0,

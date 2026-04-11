@@ -2,6 +2,7 @@
 
 use super::{IoLoop, TimerOp};
 use crate::protocol::execution_cert_fetch::ExecCertFetchOutput;
+use crate::protocol::local_provision_fetch::LocalProvisionFetchOutput;
 use crate::protocol::provision_fetch::ProvisionFetchOutput;
 use crate::protocol::sync::SyncOutput;
 use crate::protocol::transaction_fetch::TransactionFetchOutput;
@@ -11,6 +12,7 @@ use hyperscale_metrics as metrics;
 use hyperscale_network::Network;
 use hyperscale_storage::{ChainReader, ChainWriter, SubstateStore};
 use hyperscale_types::{BlockHeight, ValidatorId};
+use std::sync::Arc;
 use std::time::Duration;
 
 impl<S, N, D> IoLoop<S, N, D>
@@ -143,6 +145,56 @@ where
                         block_hash,
                         transactions,
                     });
+                }
+            }
+        }
+    }
+
+    /// Process LocalProvisionFetchProtocol outputs.
+    ///
+    /// `Fetch` uses the Network trait to request batches from the proposer/local peers.
+    /// `Deliver` feeds each batch into the state machine via `ProvisionsVerified`.
+    pub(super) fn process_local_provision_fetch_outputs(
+        &mut self,
+        outputs: Vec<LocalProvisionFetchOutput>,
+    ) {
+        for output in outputs {
+            match output {
+                LocalProvisionFetchOutput::Fetch {
+                    block_hash,
+                    proposer,
+                    batch_hashes,
+                } => {
+                    use hyperscale_messages::request::GetLocalProvisionsRequest;
+                    let es = self.event_sender.clone();
+                    let bh = block_hash;
+                    let hs = batch_hashes.clone();
+                    let peers = self.local_peers();
+                    self.network.request(
+                        peers,
+                        Some(proposer),
+                        GetLocalProvisionsRequest::new(block_hash, batch_hashes),
+                        Box::new(move |result| match result {
+                            Ok(resp) => {
+                                let batches = resp.batches.into_iter().map(Arc::new).collect();
+                                let _ = es.send(NodeInput::LocalProvisionsReceived {
+                                    block_hash: bh,
+                                    batches,
+                                });
+                            }
+                            Err(_) => {
+                                let _ = es.send(NodeInput::LocalProvisionsFetchFailed {
+                                    block_hash: bh,
+                                    hashes: hs,
+                                });
+                            }
+                        }),
+                    );
+                }
+                LocalProvisionFetchOutput::Deliver { batches } => {
+                    for batch in batches {
+                        self.feed_event(ProtocolEvent::ProvisionsVerified { batch });
+                    }
                 }
             }
         }
@@ -351,10 +403,16 @@ where
     pub(super) fn update_fetch_tick_timer(&mut self) {
         let status = self.transaction_fetch_protocol.status();
         let has_fetch_work = status.pending_tx_blocks > 0;
+        let has_local_provision_work = self.local_provision_fetch_protocol.has_pending();
         let has_provision_work = self.provision_fetch_protocol.has_pending();
         let has_exec_cert_work = self.exec_cert_fetch_protocol.has_pending();
         let has_header_work = self.header_fetch_protocol.has_pending();
-        if has_fetch_work || has_provision_work || has_exec_cert_work || has_header_work {
+        if has_fetch_work
+            || has_local_provision_work
+            || has_provision_work
+            || has_exec_cert_work
+            || has_header_work
+        {
             self.pending_timer_ops.push(TimerOp::Set {
                 id: TimerId::FetchTick,
                 duration: Self::FETCH_TICK_INTERVAL,

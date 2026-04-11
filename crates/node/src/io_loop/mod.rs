@@ -28,6 +28,9 @@ use crate::batch_accumulator::BatchAccumulator;
 use crate::config::NodeConfig;
 use crate::protocol::execution_cert_fetch::{ExecCertFetchInput, ExecCertFetchProtocol};
 use crate::protocol::header_fetch::{HeaderFetchInput, HeaderFetchProtocol};
+use crate::protocol::local_provision_fetch::{
+    LocalProvisionFetchInput, LocalProvisionFetchProtocol,
+};
 use crate::protocol::provision_fetch::{ProvisionFetchInput, ProvisionFetchProtocol};
 use crate::protocol::sync::{SyncInput, SyncProtocol, SyncStatus};
 use crate::protocol::transaction_fetch::{TransactionFetchInput, TransactionFetchProtocol};
@@ -206,12 +209,16 @@ where
     // In-memory caches (shared with inbound router in production)
     cert_cache: Arc<QuickCache<Hash, Arc<WaveCertificate>>>,
     tx_cache: Arc<QuickCache<Hash, Arc<RoutableTransaction>>>,
+    provision_cache: Arc<QuickCache<Hash, Arc<ProvisionBatch>>>,
 
     // Sync protocol
     sync_protocol: SyncProtocol,
 
     // Fetch protocol (transaction/certificate fetching with chunking and retry)
     transaction_fetch_protocol: TransactionFetchProtocol,
+
+    // Local provision fetch protocol (intra-shard provision batch fetching)
+    local_provision_fetch_protocol: LocalProvisionFetchProtocol,
 
     // Provision fetch protocol (cross-shard provision fetching with peer rotation)
     provision_fetch_protocol: ProvisionFetchProtocol,
@@ -311,6 +318,7 @@ where
         let sync_protocol = SyncProtocol::new(config.sync.clone());
         let transaction_fetch_protocol =
             TransactionFetchProtocol::new(config.transaction_fetch.clone());
+        let local_provision_fetch_protocol = LocalProvisionFetchProtocol::new(Default::default());
         let provision_fetch_protocol = ProvisionFetchProtocol::new(config.provision_fetch.clone());
         let exec_cert_fetch_protocol = ExecCertFetchProtocol::new(config.exec_cert_fetch.clone());
         let header_fetch_protocol =
@@ -330,11 +338,13 @@ where
             prepared_commits: Arc::new(Mutex::new(HashMap::new())),
             cert_cache: Arc::new(QuickCache::new(DEFAULT_CERT_CACHE_SIZE)),
             tx_cache: Arc::new(QuickCache::new(DEFAULT_TX_CACHE_SIZE)),
+            provision_cache: Arc::new(QuickCache::new(256)),
             tx_validator,
             pending_validation: HashSet::new(),
             locally_submitted: HashSet::new(),
             sync_protocol,
             transaction_fetch_protocol,
+            local_provision_fetch_protocol,
             provision_fetch_protocol,
             exec_cert_fetch_protocol,
             header_fetch_protocol,
@@ -660,6 +670,11 @@ where
                     .transaction_fetch_protocol
                     .handle(TransactionFetchInput::Tick);
                 self.process_transaction_fetch_outputs(outputs);
+                // Also tick the local provision fetch protocol.
+                let local_prov_outputs = self
+                    .local_provision_fetch_protocol
+                    .handle(LocalProvisionFetchInput::Tick);
+                self.process_local_provision_fetch_outputs(local_prov_outputs);
                 // Also tick the provision fetch protocol.
                 let prov_outputs =
                     self.provision_fetch_protocol
@@ -820,6 +835,34 @@ where
                 }
             }
 
+            // ── Local provision fetch protocol ────────────────────────
+            NodeInput::LocalProvisionsReceived {
+                block_hash,
+                batches,
+            } => {
+                let outputs = self.local_provision_fetch_protocol.handle(
+                    LocalProvisionFetchInput::Received {
+                        block_hash,
+                        batches,
+                    },
+                );
+                self.process_local_provision_fetch_outputs(outputs);
+                self.update_fetch_tick_timer();
+            }
+
+            NodeInput::LocalProvisionsFetchFailed { block_hash, hashes } => {
+                let outputs = self
+                    .local_provision_fetch_protocol
+                    .handle(LocalProvisionFetchInput::Failed { block_hash, hashes });
+                self.process_local_provision_fetch_outputs(outputs);
+                // Tick to retry pending fetches.
+                let tick_outputs = self
+                    .local_provision_fetch_protocol
+                    .handle(LocalProvisionFetchInput::Tick);
+                self.process_local_provision_fetch_outputs(tick_outputs);
+                self.update_fetch_tick_timer();
+            }
+
             // ── Provisions ready (from execution pool) ─────────────────
             //
             // The FetchAndBroadcastProvisions delegated action built provisions
@@ -975,6 +1018,10 @@ where
         let fetch_status = self.transaction_fetch_protocol.status();
         metrics::set_fetch_in_flight("transaction", fetch_status.in_flight_operations);
         metrics::set_fetch_in_flight("provision", self.provision_fetch_protocol.in_flight_count());
+        metrics::set_fetch_in_flight(
+            "local_provision",
+            self.local_provision_fetch_protocol.in_flight_count(),
+        );
         metrics::set_fetch_in_flight("exec_cert", self.exec_cert_fetch_protocol.in_flight_count());
         metrics::set_fetch_in_flight("header", self.header_fetch_protocol.in_flight_count());
 
