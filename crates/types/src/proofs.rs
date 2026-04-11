@@ -90,7 +90,9 @@ impl TxEntries {
 /// and carries the verkle proof plus per-transaction state entries.
 /// The QC and state_root are obtained from `CommittedBlockHeader` received
 /// via gossip — they don't travel with the provision batch.
-#[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
+///
+/// The content hash is computed eagerly at construction and included in the
+/// SBOR encoding, so deserialization restores it without recomputation.
 pub struct ProvisionBatch {
     /// Source shard that committed this block.
     pub source_shard: ShardGroupId,
@@ -103,13 +105,154 @@ pub struct ProvisionBatch {
 
     /// Per-transaction entries.
     pub transactions: Vec<TxEntries>,
+
+    /// Cached content hash (SBOR-encode of content fields, then blake3).
+    hash: Hash,
+}
+
+impl std::fmt::Debug for ProvisionBatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProvisionBatch")
+            .field("hash", &self.hash)
+            .field("source_shard", &self.source_shard)
+            .field("block_height", &self.block_height)
+            .field("transactions", &self.transactions.len())
+            .finish()
+    }
+}
+
+impl Clone for ProvisionBatch {
+    fn clone(&self) -> Self {
+        Self {
+            source_shard: self.source_shard,
+            block_height: self.block_height,
+            proof: self.proof.clone(),
+            transactions: self.transactions.clone(),
+            hash: self.hash,
+        }
+    }
+}
+
+impl PartialEq for ProvisionBatch {
+    fn eq(&self, other: &Self) -> bool {
+        self.hash == other.hash
+    }
+}
+
+impl Eq for ProvisionBatch {}
+
+// Manual SBOR: includes the cached hash in the encoding so deserialization
+// restores it without recomputation.
+impl<E: sbor::Encoder<sbor::NoCustomValueKind>> sbor::Encode<sbor::NoCustomValueKind, E>
+    for ProvisionBatch
+{
+    fn encode_value_kind(&self, encoder: &mut E) -> Result<(), sbor::EncodeError> {
+        encoder.write_value_kind(sbor::ValueKind::Tuple)
+    }
+
+    fn encode_body(&self, encoder: &mut E) -> Result<(), sbor::EncodeError> {
+        encoder.write_size(5)?;
+        encoder.encode(&self.source_shard)?;
+        encoder.encode(&self.block_height)?;
+        encoder.encode(&self.proof)?;
+        encoder.encode(&self.transactions)?;
+        let hash_bytes: [u8; 32] = *self.hash.as_bytes();
+        encoder.encode(&hash_bytes)?;
+        Ok(())
+    }
+}
+
+impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValueKind, D>
+    for ProvisionBatch
+{
+    fn decode_body_with_value_kind(
+        decoder: &mut D,
+        value_kind: sbor::ValueKind<sbor::NoCustomValueKind>,
+    ) -> Result<Self, sbor::DecodeError> {
+        decoder.check_preloaded_value_kind(value_kind, sbor::ValueKind::Tuple)?;
+        let length = decoder.read_size()?;
+        if length != 5 {
+            return Err(sbor::DecodeError::UnexpectedSize {
+                expected: 5,
+                actual: length,
+            });
+        }
+        let source_shard: ShardGroupId = decoder.decode()?;
+        let block_height: BlockHeight = decoder.decode()?;
+        let proof: VerkleInclusionProof = decoder.decode()?;
+        let transactions: Vec<TxEntries> = decoder.decode()?;
+        let hash_bytes: [u8; 32] = decoder.decode()?;
+        let hash = Hash::from_hash_bytes(&hash_bytes);
+        Ok(Self {
+            source_shard,
+            block_height,
+            proof,
+            transactions,
+            hash,
+        })
+    }
+}
+
+impl sbor::Categorize<sbor::NoCustomValueKind> for ProvisionBatch {
+    fn value_kind() -> sbor::ValueKind<sbor::NoCustomValueKind> {
+        sbor::ValueKind::Tuple
+    }
+}
+
+impl sbor::Describe<sbor::NoCustomTypeKind> for ProvisionBatch {
+    const TYPE_ID: sbor::RustTypeId = sbor::RustTypeId::novel_with_code("ProvisionBatch", &[], &[]);
+
+    fn type_data() -> sbor::TypeData<sbor::NoCustomTypeKind, sbor::RustTypeId> {
+        sbor::TypeData::unnamed(sbor::TypeKind::Any)
+    }
 }
 
 impl ProvisionBatch {
-    /// Compute a content hash of this provision batch (SBOR-encode then hash).
+    /// Create a new provision batch, computing the content hash eagerly.
+    pub fn new(
+        source_shard: ShardGroupId,
+        block_height: BlockHeight,
+        proof: VerkleInclusionProof,
+        transactions: Vec<TxEntries>,
+    ) -> Self {
+        let hash = Self::compute_hash(source_shard, &block_height, &proof, &transactions);
+        Self {
+            source_shard,
+            block_height,
+            proof,
+            transactions,
+            hash,
+        }
+    }
+
+    /// Content hash (precomputed at construction / deserialization).
     pub fn hash(&self) -> Hash {
-        let bytes =
-            sbor::basic_encode(self).expect("ProvisionBatch serialization should never fail");
+        self.hash
+    }
+
+    fn compute_hash(
+        source_shard: ShardGroupId,
+        block_height: &BlockHeight,
+        proof: &VerkleInclusionProof,
+        transactions: &[TxEntries],
+    ) -> Hash {
+        // Encode the content fields (excluding the hash itself) for hashing.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(
+            &sbor::basic_encode(&source_shard)
+                .expect("ShardGroupId serialization should never fail"),
+        );
+        bytes.extend_from_slice(
+            &sbor::basic_encode(block_height).expect("BlockHeight serialization should never fail"),
+        );
+        bytes.extend_from_slice(
+            &sbor::basic_encode(proof)
+                .expect("VerkleInclusionProof serialization should never fail"),
+        );
+        bytes.extend_from_slice(
+            &sbor::basic_encode(transactions)
+                .expect("Vec<TxEntries> serialization should never fail"),
+        );
         Hash::from_bytes(&bytes)
     }
 
@@ -141,12 +284,12 @@ impl ProvisionBatch {
     /// Create a dummy batch for testing.
     #[cfg(any(test, feature = "test-utils"))]
     pub fn dummy(source_shard: ShardGroupId, block_height: BlockHeight) -> Self {
-        Self {
+        Self::new(
             source_shard,
             block_height,
-            proof: VerkleInclusionProof::dummy(),
-            transactions: vec![],
-        }
+            VerkleInclusionProof::dummy(),
+            vec![],
+        )
     }
 }
 
@@ -165,12 +308,12 @@ mod tests {
 
     #[test]
     fn test_provision_batch_fields_roundtrip() {
-        let original = ProvisionBatch {
-            source_shard: ShardGroupId(1),
-            block_height: BlockHeight(42),
-            proof: VerkleInclusionProof::new(vec![1, 2, 3]),
-            transactions: vec![],
-        };
+        let original = ProvisionBatch::new(
+            ShardGroupId(1),
+            BlockHeight(42),
+            VerkleInclusionProof::new(vec![1, 2, 3]),
+            vec![],
+        );
 
         let bytes = sbor::basic_encode(&original).unwrap();
         let decoded: ProvisionBatch = sbor::basic_decode(&bytes).unwrap();

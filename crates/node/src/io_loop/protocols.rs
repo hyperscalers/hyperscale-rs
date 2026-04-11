@@ -237,12 +237,12 @@ where
                                             entries: (*p.entries).clone(),
                                         })
                                         .collect();
-                                    let batch = hyperscale_types::ProvisionBatch {
+                                    let batch = hyperscale_types::ProvisionBatch::new(
                                         source_shard,
                                         block_height,
                                         proof,
                                         transactions,
-                                    };
+                                    );
                                     let _ =
                                         sender.send(NodeInput::ProvisionFetchReceived { batch });
                                 }

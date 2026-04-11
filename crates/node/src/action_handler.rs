@@ -710,12 +710,7 @@ fn build_provision_batches<S: ChainWriter + SubstateStore + ChainReader>(
         };
 
         let recipients = shard_recipients.get(&shard).cloned().unwrap_or_default();
-        let batch = ProvisionBatch {
-            source_shard,
-            block_height,
-            proof,
-            transactions,
-        };
+        let batch = ProvisionBatch::new(source_shard, block_height, proof, transactions);
         batches.push((shard, batch, recipients));
     }
     batches

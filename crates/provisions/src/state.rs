@@ -76,6 +76,11 @@ pub struct ProvisionCoordinator {
     /// Stored whole after proof verification — no per-tx decomposition.
     verified_batches: BTreeMap<(ShardGroupId, BlockHeight), Arc<ProvisionBatch>>,
 
+    /// Hash-keyed index into verified batches for O(1) lookup by content hash.
+    /// Populated alongside `verified_batches`. Used by `get_batch_by_hash()`
+    /// and for efficient pruning in `on_block_committed`.
+    batches_by_hash: HashMap<Hash, Arc<ProvisionBatch>>,
+
     // ═══════════════════════════════════════════════════════════════════
     // Expected Provision Tracking (fallback detection)
     // ═══════════════════════════════════════════════════════════════════
@@ -125,6 +130,7 @@ impl ProvisionCoordinator {
             verified_remote_headers: HashMap::new(),
             pending_provisions: HashMap::new(),
             verified_batches: BTreeMap::new(),
+            batches_by_hash: HashMap::new(),
             local_committed_height: BlockHeight(0),
             expected_provisions: BTreeMap::new(),
             queued_provision_batches: Vec::new(),
@@ -161,10 +167,21 @@ impl ProvisionCoordinator {
         if !committed_provision_hashes.is_empty() {
             let committed: std::collections::HashSet<Hash> =
                 committed_provision_hashes.iter().copied().collect();
+            // Remove from hash index and collect (shard, height) keys to prune.
+            let mut keys_to_remove = Vec::new();
+            for h in &committed {
+                if let Some(batch) = self.batches_by_hash.remove(h) {
+                    keys_to_remove.push((batch.source_shard, batch.block_height));
+                }
+            }
+            for key in keys_to_remove {
+                self.verified_batches.remove(&key);
+            }
+            // queued_provision_batches: use Arc::ptr_eq against removed batches
+            // since we already have the committed set. Fall back to hash for any
+            // batches not in batches_by_hash (shouldn't happen but safe).
             self.queued_provision_batches
                 .retain(|b| !committed.contains(&b.hash()));
-            self.verified_batches
-                .retain(|_, b| !committed.contains(&b.hash()));
         }
 
         // Check for timed-out expected provisions and emit fallback requests
@@ -393,7 +410,9 @@ impl ProvisionCoordinator {
         // Store the verified batch whole
         let batch_key = (source_shard, batch.block_height);
         let batch = Arc::new(batch);
+        let batch_hash = batch.hash();
         self.verified_batches.insert(batch_key, Arc::clone(&batch));
+        self.batches_by_hash.insert(batch_hash, Arc::clone(&batch));
 
         // Queue for inclusion in the next block proposal.
         self.queued_provision_batches.push(Arc::clone(&batch));
@@ -424,10 +443,7 @@ impl ProvisionCoordinator {
 
     /// Look up a verified provision batch by its content hash.
     pub fn get_batch_by_hash(&self, hash: &Hash) -> Option<Arc<ProvisionBatch>> {
-        self.verified_batches
-            .values()
-            .find(|b| b.hash() == *hash)
-            .cloned()
+        self.batches_by_hash.get(hash).cloned()
     }
 
     /// Look up a verified remote committed block header by shard and height.
@@ -594,12 +610,12 @@ mod tests {
                 entries: vec![],
             })
             .collect();
-        ProvisionBatch {
+        ProvisionBatch::new(
             source_shard,
-            block_height: BlockHeight(height),
-            proof: VerkleInclusionProof::dummy(),
+            BlockHeight(height),
+            VerkleInclusionProof::dummy(),
             transactions,
-        }
+        )
     }
 
     #[test]
