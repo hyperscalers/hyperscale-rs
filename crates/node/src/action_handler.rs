@@ -321,8 +321,9 @@ pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainRead
                 .flat_map(|fw| fw.receipts.iter().cloned())
                 .collect();
 
-            let provision_batch_hashes: Vec<hyperscale_types::Hash> =
+            let mut provision_batch_hashes: Vec<hyperscale_types::Hash> =
                 provision_batches.iter().map(|b| b.hash()).collect();
+            provision_batch_hashes.sort();
 
             let result = hyperscale_bft::handlers::build_proposal(
                 ctx.storage,
