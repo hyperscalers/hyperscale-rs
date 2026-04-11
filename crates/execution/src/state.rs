@@ -43,6 +43,7 @@ use std::time::Duration;
 use tracing::instrument;
 
 use crate::accumulator::ExecutionAccumulator;
+use crate::conflict::ConflictDetector;
 use crate::trackers::{VoteTracker, WaveCertificateTracker};
 
 /// Data returned when a wave is ready for voting.
@@ -145,6 +146,11 @@ pub struct ExecutionState {
     /// Remote shards whose provisions have been received for each tx.
     /// Populated in `apply_committed_provisions` from batch source shard.
     received_provision_shards: HashMap<Hash, BTreeSet<ShardGroupId>>,
+
+    /// Detects node-ID overlap conflicts between local cross-shard txs and
+    /// committed remote provisions. Replaces the old livelock crate — now
+    /// deterministic because provisions are consensus-committed.
+    conflict_detector: ConflictDetector,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Wave voting
@@ -252,6 +258,7 @@ impl ExecutionState {
             early_committed_provisions: HashMap::new(),
             required_provision_shards: HashMap::new(),
             received_provision_shards: HashMap::new(),
+            conflict_detector: ConflictDetector::new(),
             pending_wave_receipts: HashMap::new(),
             expected_exec_certs: HashMap::new(),
             fulfilled_exec_certs: HashMap::new(),
@@ -696,11 +703,31 @@ impl ExecutionState {
         &mut self,
         topology: &TopologySnapshot,
         batches: &[Arc<ProvisionBatch>],
+        committed_height: u64,
     ) -> Vec<Action> {
         let mut requests = Vec::new();
 
         for batch in batches {
             let source_shard = batch.source_shard;
+
+            // Detect node-ID overlap conflicts between this batch and local txs.
+            // Must run before marking provisioned — conflicts abort at commit height.
+            for conflict in self
+                .conflict_detector
+                .detect_conflicts(batch, committed_height)
+            {
+                if let Some(wave_key) = self.wave_assignments.get(&conflict.loser_tx).cloned() {
+                    if let Some(acc) = self.accumulators.get_mut(&wave_key) {
+                        acc.record_abort(conflict.loser_tx, conflict.committed_at_height);
+                    }
+                }
+                tracing::debug!(
+                    loser_tx = %conflict.loser_tx,
+                    source_shard = source_shard.0,
+                    committed_at = committed_height,
+                    "Node-ID overlap conflict detected — aborting loser"
+                );
+            }
 
             for tx_entry in &batch.transactions {
                 let tx_hash = tx_entry.tx_hash;
@@ -1446,6 +1473,27 @@ impl ExecutionState {
             self.required_provision_shards
                 .insert(tx_hash, remote_shards.clone());
 
+            // Register for conflict detection (node-ID overlap with remote provisions).
+            // Returns conflicts if provisions committed before this tx (reverse detection).
+            let reverse_conflicts = self.conflict_detector.register_tx(
+                tx_hash,
+                topology,
+                &tx.declared_reads,
+                &tx.declared_writes,
+            );
+            for conflict in reverse_conflicts {
+                if let Some(wave_key) = self.wave_assignments.get(&conflict.loser_tx).cloned() {
+                    if let Some(acc) = self.accumulators.get_mut(&wave_key) {
+                        acc.record_abort(conflict.loser_tx, conflict.committed_at_height);
+                    }
+                }
+                tracing::debug!(
+                    loser_tx = %conflict.loser_tx,
+                    committed_at = conflict.committed_at_height,
+                    "Reverse conflict detected — provisions committed before local tx"
+                );
+            }
+
             // Register with provision coordinator (via structured output).
             registrations.push(CrossShardRegistration {
                 tx_hash,
@@ -1708,6 +1756,7 @@ impl ExecutionState {
             self.required_provision_shards.remove(tx_hash);
             self.received_provision_shards.remove(tx_hash);
             self.early_committed_provisions.remove(tx_hash);
+            self.conflict_detector.remove_tx(tx_hash);
         }
     }
 

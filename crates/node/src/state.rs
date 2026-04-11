@@ -402,10 +402,11 @@ impl NodeStateMachine {
         let committed_provision_hashes: Vec<Hash> =
             provision_batches.iter().map(|b| b.hash()).collect();
         if !provision_batches.is_empty() {
-            actions.extend(
-                self.execution
-                    .apply_committed_provisions(self.topology.snapshot(), &provision_batches),
-            );
+            actions.extend(self.execution.apply_committed_provisions(
+                self.topology.snapshot(),
+                &provision_batches,
+                height,
+            ));
         }
 
         // Let provisions coordinator handle cleanup + fallback timeouts.
