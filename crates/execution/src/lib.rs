@@ -9,6 +9,7 @@
 //! - Vote aggregation and certificate formation
 
 pub mod accumulator;
+pub mod conflict;
 pub mod handlers;
 
 mod state;
