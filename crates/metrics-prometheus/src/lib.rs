@@ -612,7 +612,7 @@ impl Metrics {
 
             memory_provisions: register_gauge_vec!(
                 "hyperscale_memory_provisions_collections",
-                "Provisions coordinator collection sizes (entry count)",
+                "Provision coordinator collection sizes (entry count)",
                 &["collection"]
             )
             .unwrap(),
@@ -1183,7 +1183,7 @@ impl MetricsRecorder for PrometheusRecorder {
             .with_label_values(&["expected_headers"])
             .set(m.rh_expected_headers as f64);
 
-        // Provisions
+        // Provision
         self.metrics
             .memory_provisions
             .with_label_values(&["verified_remote_headers"])

@@ -14,6 +14,6 @@ pub use block::GetBlockRequest;
 pub use committed_header::GetCommittedBlockHeaderRequest;
 pub use execution_cert::GetExecutionCertsRequest;
 pub use local_provision::GetLocalProvisionsRequest;
-pub use provision::GetProvisionsRequest;
+pub use provision::GetProvisionRequest;
 pub use sync::SyncCompleteAnnouncement;
 pub use transaction::GetTransactionsRequest;

@@ -7,7 +7,7 @@
 use hyperscale_storage::{ChainWriter, SubstateStore};
 use hyperscale_types::{
     batch_verify_bls_same_message, compute_certificate_root, compute_local_receipt_root,
-    compute_provisions_root, compute_transaction_root, verify_bls12381_v1, Block, BlockHeader,
+    compute_provision_root, compute_transaction_root, verify_bls12381_v1, Block, BlockHeader,
     BlockHeight, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature, Hash, QuorumCertificate,
     ReceiptBundle, RoutableTransaction, ShardGroupId, SignerBitfield, ValidatorId, VotePower,
     WaveCertificate, WaveId,
@@ -187,8 +187,8 @@ pub fn verify_qc_signature(qc: &QuorumCertificate, public_keys: &[Bls12381G1Publ
 }
 
 /// Verify that the computed transaction merkle root matches the expected root.
-pub fn verify_provisions_root(expected_root: Hash, batch_hashes: &[Hash]) -> bool {
-    let computed_root = compute_provisions_root(batch_hashes);
+pub fn verify_provision_root(expected_root: Hash, batch_hashes: &[Hash]) -> bool {
+    let computed_root = compute_provision_root(batch_hashes);
     let valid = computed_root == expected_root;
 
     if !valid {
@@ -196,7 +196,7 @@ pub fn verify_provisions_root(expected_root: Hash, batch_hashes: &[Hash]) -> boo
             ?expected_root,
             ?computed_root,
             batch_count = batch_hashes.len(),
-            "Provisions root verification FAILED"
+            "Provision root verification FAILED"
         );
     }
 
@@ -330,7 +330,7 @@ pub fn build_proposal<S: ChainWriter + SubstateStore>(
     receipts: &[ReceiptBundle],
     local_shard: ShardGroupId,
     waves: Vec<WaveId>,
-    provision_batch_hashes: Vec<Hash>,
+    provision_hashes: Vec<Hash>,
 ) -> ProposalResult<S::PreparedCommit> {
     // Check if JVT is at parent_state_root (no waiting - instant check)
     let current_root = storage.state_root_hash();
@@ -361,7 +361,7 @@ pub fn build_proposal<S: ChainWriter + SubstateStore>(
     let transaction_root = compute_transaction_root(&transactions);
     let certificate_root = compute_certificate_root(&certs_to_include);
     let local_receipt_root = compute_local_receipt_root(receipts);
-    let provisions_root = compute_provisions_root(&provision_batch_hashes);
+    let provision_root = compute_provision_root(&provision_hashes);
 
     let header = BlockHeader {
         shard_group_id: local_shard,
@@ -376,7 +376,7 @@ pub fn build_proposal<S: ChainWriter + SubstateStore>(
         transaction_root,
         certificate_root,
         local_receipt_root,
-        provisions_root,
+        provision_root,
         waves,
     };
 

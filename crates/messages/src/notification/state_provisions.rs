@@ -1,4 +1,4 @@
-//! StateProvisionsNotification message for cross-shard provisions.
+//! StateProvisionNotification message for cross-shard provisions.
 
 use crate::trace_context::TraceContext;
 use hyperscale_types::{
@@ -16,7 +16,7 @@ use sbor::prelude::BasicSbor;
 /// per-provision, avoiding redundant serialization of the (potentially large)
 /// proof across N provisions.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
-pub struct StateProvisionsNotification {
+pub struct StateProvisionNotification {
     /// The state provisions being sent.
     pub provisions: Vec<hyperscale_types::StateProvision>,
     /// Aggregated verkle proof covering all entries across all provisions.
@@ -29,7 +29,7 @@ pub struct StateProvisionsNotification {
     pub trace_context: TraceContext,
 }
 
-impl StateProvisionsNotification {
+impl StateProvisionNotification {
     /// Create a new signed state provision batch.
     pub fn new(
         provisions: Vec<hyperscale_types::StateProvision>,
@@ -85,7 +85,7 @@ impl StateProvisionsNotification {
     }
 }
 
-impl NetworkMessage for StateProvisionsNotification {
+impl NetworkMessage for StateProvisionNotification {
     fn message_type_id() -> &'static str {
         "state.provision.batch"
     }

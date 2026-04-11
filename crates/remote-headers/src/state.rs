@@ -3,7 +3,7 @@
 //! This module is the single source of truth for remote committed block headers.
 //! It receives raw headers from gossip (or fallback fetch), dispatches QC
 //! verification, stores verified headers, and emits `RemoteHeaderVerified`
-//! continuations for downstream consumers (BFT, Provisions, Execution).
+//! continuations for downstream consumers (BFT, Provision, Execution).
 //!
 //! It also tracks per-shard liveness and emits
 //! `Action::RequestMissingCommittedBlockHeader` when a remote shard hasn't
@@ -70,7 +70,7 @@ struct ExpectedHeader {
 ///
 /// Downstream consumers:
 /// - **BFT**: Uses verified `transaction_root` for deferral merkle proofs
-/// - **Provisions**: Uses verified `state_root` for verkle proof verification;
+/// - **Provision**: Uses verified `state_root` for verkle proof verification;
 ///   `waves` field to register expected provisions
 /// - **Execution**: Uses `waves` field to register expected execution certs
 pub struct RemoteHeaderCoordinator {
@@ -378,7 +378,7 @@ impl RemoteHeaderCoordinator {
 
     /// Get a verified remote header by (shard, height).
     ///
-    /// Used by BFT for deferral merkle proof validation and by Provisions
+    /// Used by BFT for deferral merkle proof validation and by Provision
     /// for state root verification.
     pub fn get_verified(
         &self,
@@ -390,8 +390,8 @@ impl RemoteHeaderCoordinator {
 
     /// Get all pending (unverified) headers for a (shard, height).
     ///
-    /// Used by Provisions when a provision arrives before QC verification
-    /// completes — it can pass these as candidates to `VerifyProvisionBatch`.
+    /// Used by Provision when a provision arrives before QC verification
+    /// completes — it can pass these as candidates to `VerifyProvision`.
     pub fn get_pending(
         &self,
         shard: ShardGroupId,
@@ -519,7 +519,7 @@ mod tests {
             transaction_root: Hash::ZERO,
             certificate_root: Hash::ZERO,
             local_receipt_root: Hash::ZERO,
-            provisions_root: Hash::ZERO,
+            provision_root: Hash::ZERO,
             waves: vec![],
         };
         let mut qc = QuorumCertificate::genesis();

@@ -115,7 +115,7 @@ mod tests {
                 transaction_root: Hash::ZERO,
                 certificate_root: Hash::ZERO,
                 local_receipt_root: Hash::ZERO,
-                provisions_root: Hash::ZERO,
+                provision_root: Hash::ZERO,
                 waves: vec![],
             },
             transactions: vec![std::sync::Arc::new(tx)],

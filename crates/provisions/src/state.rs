@@ -8,13 +8,12 @@
 //!
 //! The source shard proposer broadcasts a `StateProvision` batch containing JVT
 //! inclusion proofs. The target shard joins with remote block headers, then
-//! dispatches `VerifyStateProvisions` to verify the QC signature once and
+//! dispatches `VerifyStateProvision` to verify the QC signature once and
 //! merkle proofs per provision against the committed state root.
 
 use hyperscale_core::{Action, ProtocolEvent};
 use hyperscale_types::{
-    BlockHeight, CommittedBlockHeader, Hash, ProvisionBatch, ShardGroupId, TopologySnapshot,
-    ValidatorId,
+    BlockHeight, CommittedBlockHeader, Hash, Provision, ShardGroupId, TopologySnapshot, ValidatorId,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -37,7 +36,7 @@ pub struct ProvisionMemoryStats {
 /// Tracks an expected provision that hasn't arrived yet.
 ///
 /// Created when a remote block header's `waves` field targets our shard.
-/// Emits a single `FetchProvisionsRemote` after the timeout; the fetch
+/// Emits a single `FetchProvisionRemote` after the timeout; the fetch
 /// protocol owns retries from that point.
 #[derive(Debug, Clone)]
 struct ExpectedProvision {
@@ -66,20 +65,20 @@ pub struct ProvisionCoordinator {
     verified_remote_headers: HashMap<(ShardGroupId, BlockHeight), Arc<CommittedBlockHeader>>,
 
     // ═══════════════════════════════════════════════════════════════════
-    // Verified Provisions
+    // Verified Provision
     // ═══════════════════════════════════════════════════════════════════
     /// Provision batches waiting for their corresponding remote block header.
     /// Keyed by (source_shard, block_height) since that's how we match to headers.
-    pending_provisions: HashMap<(ShardGroupId, BlockHeight), Vec<ProvisionBatch>>,
+    pending_provisions: HashMap<(ShardGroupId, BlockHeight), Vec<Provision>>,
 
     /// Verified provision batches keyed by (source_shard, block_height).
     /// Stored whole after proof verification — no per-tx decomposition.
-    verified_batches: BTreeMap<(ShardGroupId, BlockHeight), Arc<ProvisionBatch>>,
+    verified_batches: BTreeMap<(ShardGroupId, BlockHeight), Arc<Provision>>,
 
     /// Hash-keyed index into verified batches for O(1) lookup by content hash.
     /// Populated alongside `verified_batches`. Used by `get_batch_by_hash()`
     /// and for efficient pruning in `on_block_committed`.
-    batches_by_hash: HashMap<Hash, Arc<ProvisionBatch>>,
+    batches_by_hash: HashMap<Hash, Arc<Provision>>,
 
     // ═══════════════════════════════════════════════════════════════════
     // Expected Provision Tracking (fallback detection)
@@ -99,7 +98,7 @@ pub struct ProvisionCoordinator {
     /// Provision batches received from remote shards, queued for inclusion
     /// in the next block proposal. Proposer drains this queue when building
     /// a proposal. Every validator queues (any might become next proposer).
-    queued_provision_batches: Vec<Arc<ProvisionBatch>>,
+    queued_provision_batches: Vec<Arc<Provision>>,
 
     /// Tombstone set: hashes of provision batches that have been committed.
     /// Prevents re-queueing if a duplicate batch arrives via gossip after commit.
@@ -220,7 +219,7 @@ impl ProvisionCoordinator {
             );
 
             expected.requested = true;
-            actions.push(Action::FetchProvisionsRemote {
+            actions.push(Action::FetchProvisionRemote {
                 source_shard,
                 block_height,
                 proposer: expected.proposer,
@@ -315,7 +314,7 @@ impl ProvisionCoordinator {
     pub fn on_state_provisions_received(
         &mut self,
         topology: &TopologySnapshot,
-        batch: ProvisionBatch,
+        batch: Provision,
     ) -> Vec<Action> {
         if batch.transactions.is_empty() {
             return vec![];
@@ -353,16 +352,16 @@ impl ProvisionCoordinator {
         vec![]
     }
 
-    /// Emit a `VerifyProvisionBatch` action for async verkle proof verification.
+    /// Emit a `VerifyProvision` action for async verkle proof verification.
     ///
     /// The QC was already verified by `RemoteHeaderCoordinator`, so only verkle
     /// proofs need checking against the committed header's state root.
     fn emit_provision_verification(
         &self,
-        batch: ProvisionBatch,
+        batch: Provision,
         committed_header: Arc<CommittedBlockHeader>,
     ) -> Vec<Action> {
-        vec![Action::VerifyProvisionBatch {
+        vec![Action::VerifyProvision {
             batch,
             committed_header,
         }]
@@ -375,7 +374,7 @@ impl ProvisionCoordinator {
     pub fn on_state_provisions_verified(
         &mut self,
         _topology: &TopologySnapshot,
-        batch: ProvisionBatch,
+        batch: Provision,
         committed_header: Option<Arc<CommittedBlockHeader>>,
         valid: bool,
     ) -> Vec<Action> {
@@ -448,8 +447,8 @@ impl ProvisionCoordinator {
             "Provision batch verified and queued"
         );
 
-        // Emit ProvisionsVerified for downstream consumption.
-        actions.push(Action::Continuation(ProtocolEvent::ProvisionsVerified {
+        // Emit ProvisionVerified for downstream consumption.
+        actions.push(Action::Continuation(ProtocolEvent::ProvisionVerified {
             batch: Arc::clone(&batch),
         }));
 
@@ -462,12 +461,12 @@ impl ProvisionCoordinator {
 
     /// Get queued provision batches for inclusion in a block proposal.
     /// Batches remain in the queue until pruned on block commit.
-    pub fn queued_provisions(&self) -> Vec<Arc<ProvisionBatch>> {
+    pub fn queued_provisions(&self) -> Vec<Arc<Provision>> {
         self.queued_provision_batches.clone()
     }
 
     /// Look up a verified provision batch by its content hash.
-    pub fn get_batch_by_hash(&self, hash: &Hash) -> Option<Arc<ProvisionBatch>> {
+    pub fn get_batch_by_hash(&self, hash: &Hash) -> Option<Arc<Provision>> {
         self.batches_by_hash.get(hash).cloned()
     }
 
@@ -612,22 +611,22 @@ mod tests {
     // Provision Lifecycle Tests
     // ═══════════════════════════════════════════════════════════════════════
 
-    /// Build a ProvisionBatch for testing with a single transaction.
+    /// Build a Provision for testing with a single transaction.
     fn make_batch(
         tx_hash: Hash,
         source_shard: ShardGroupId,
         _target_shard: ShardGroupId,
         height: u64,
-    ) -> ProvisionBatch {
+    ) -> Provision {
         make_batch_multi(vec![tx_hash], source_shard, height)
     }
 
-    /// Build a ProvisionBatch for testing with multiple transactions.
+    /// Build a Provision for testing with multiple transactions.
     fn make_batch_multi(
         tx_hashes: Vec<Hash>,
         source_shard: ShardGroupId,
         height: u64,
-    ) -> ProvisionBatch {
+    ) -> Provision {
         let transactions = tx_hashes
             .into_iter()
             .map(|tx_hash| TxEntries {
@@ -635,7 +634,7 @@ mod tests {
                 entries: vec![],
             })
             .collect();
-        ProvisionBatch::new(
+        Provision::new(
             source_shard,
             BlockHeight(height),
             VerkleInclusionProof::dummy(),
@@ -655,14 +654,14 @@ mod tests {
         let header = make_committed_header(source_shard, 10);
         coordinator.on_verified_remote_header(&topology, header);
 
-        // Then: batch arrives — should emit VerifyProvisionBatch
+        // Then: batch arrives — should emit VerifyProvision
         let batch = make_batch(tx_hash, source_shard, ShardGroupId(0), 10);
         let actions = coordinator.on_state_provisions_received(&topology, batch);
 
         assert_eq!(actions.len(), 1);
         assert!(matches!(
             &actions[0],
-            Action::VerifyProvisionBatch { batch, .. } if batch.transactions[0].tx_hash == tx_hash
+            Action::VerifyProvision { batch, .. } if batch.transactions[0].tx_hash == tx_hash
         ));
     }
 
@@ -700,7 +699,7 @@ mod tests {
         assert_eq!(actions.len(), 1);
         assert!(matches!(
             &actions[0],
-            Action::VerifyProvisionBatch { batch, .. } if batch.transactions[0].tx_hash == tx_hash
+            Action::VerifyProvision { batch, .. } if batch.transactions[0].tx_hash == tx_hash
         ));
     }
 
@@ -744,7 +743,7 @@ mod tests {
         let actions = coordinator.on_state_provisions_received(&topology, batch2);
         assert!(actions
             .iter()
-            .any(|a| matches!(a, Action::VerifyProvisionBatch { .. })));
+            .any(|a| matches!(a, Action::VerifyProvision { .. })));
     }
 
     #[test]
@@ -765,10 +764,10 @@ mod tests {
         let actions =
             coordinator.on_state_provisions_verified(&topology, batch, Some(header), true);
 
-        // Should emit ProvisionsVerified
+        // Should emit ProvisionVerified
         assert!(actions.iter().any(|a| matches!(
             a,
-            Action::Continuation(ProtocolEvent::ProvisionsVerified { batch })
+            Action::Continuation(ProtocolEvent::ProvisionVerified { batch })
             if batch.transactions[0].tx_hash == tx_hash
         )));
     }
@@ -789,10 +788,10 @@ mod tests {
         // Verification fails — no committed_header returned
         let actions = coordinator.on_state_provisions_verified(&topology, batch, None, false);
 
-        // Should NOT emit ProvisionsVerified
+        // Should NOT emit ProvisionVerified
         assert!(!actions.iter().any(|a| matches!(
             a,
-            Action::Continuation(ProtocolEvent::ProvisionsVerified { .. })
+            Action::Continuation(ProtocolEvent::ProvisionVerified { .. })
         )));
     }
 
@@ -817,13 +816,13 @@ mod tests {
 
         let actions = coordinator.on_state_provisions_received(&topology, batch);
 
-        // Should emit exactly ONE VerifyProvisionBatch action with all 3 transactions
+        // Should emit exactly ONE VerifyProvision action with all 3 transactions
         assert_eq!(actions.len(), 1);
         match &actions[0] {
-            Action::VerifyProvisionBatch { batch, .. } => {
+            Action::VerifyProvision { batch, .. } => {
                 assert_eq!(batch.transactions.len(), 3);
             }
-            other => panic!("Expected VerifyProvisionBatch, got {:?}", other),
+            other => panic!("Expected VerifyProvision, got {:?}", other),
         }
     }
 
@@ -846,7 +845,7 @@ mod tests {
         assert_eq!(actions.len(), 1);
         assert!(matches!(
             &actions[0],
-            Action::VerifyProvisionBatch { committed_header, .. }
+            Action::VerifyProvision { committed_header, .. }
                 if committed_header.height() == BlockHeight(10)
         ));
     }
@@ -873,7 +872,7 @@ mod tests {
         assert_eq!(actions.len(), 1);
         assert!(matches!(
             &actions[0],
-            Action::VerifyProvisionBatch { committed_header, .. }
+            Action::VerifyProvision { committed_header, .. }
                 if committed_header.height() == BlockHeight(10)
         ));
     }
@@ -899,10 +898,10 @@ mod tests {
         let actions =
             coordinator.on_state_provisions_verified(&topology, batch, Some(header), false);
 
-        // Verification failed — no ProvisionsVerified emitted
+        // Verification failed — no ProvisionVerified emitted
         assert!(!actions.iter().any(|a| matches!(
             a,
-            Action::Continuation(ProtocolEvent::ProvisionsVerified { .. })
+            Action::Continuation(ProtocolEvent::ProvisionVerified { .. })
         )));
     }
 
@@ -940,7 +939,7 @@ mod tests {
             transaction_root: Hash::ZERO,
             certificate_root: Hash::ZERO,
             local_receipt_root: Hash::ZERO,
-            provisions_root: Hash::ZERO,
+            provision_root: Hash::ZERO,
             waves,
         };
         let header_hash = header.hash();
@@ -1035,7 +1034,7 @@ mod tests {
         assert_eq!(actions.len(), 1);
         assert!(matches!(
             &actions[0],
-            Action::FetchProvisionsRemote {
+            Action::FetchProvisionRemote {
                 source_shard,
                 block_height,
                 proposer,

@@ -437,7 +437,7 @@ mod tests {
         // No provisions — target is WAVE_TIMEOUT_BLOCKS (implicit timeout)
         assert_eq!(acc.target_vote_height(), WAVE_TIMEOUT_BLOCKS);
 
-        // Provisions arrive → target drops to 0
+        // Provision arrive → target drops to 0
         acc.mark_provisioned(tx_hash);
         assert_eq!(acc.target_vote_height(), 0);
 
@@ -673,7 +673,7 @@ mod tests {
         assert_eq!(vh, WAVE_TIMEOUT_BLOCKS);
         assert!(outcomes[0].is_aborted());
 
-        // Provisions arrive later — but we already voted, no re-vote allowed
+        // Provision arrive later — but we already voted, no re-vote allowed
         acc.mark_provisioned(tx0);
         acc.record_result(tx0, executed(Hash::from_bytes(b"r")));
         assert!(!acc.can_emit_vote(HIGH));

@@ -11,8 +11,8 @@
 //!
 //! ## Phase 1: State Provisioning
 //! When a block commits with cross-shard transactions, the block proposer broadcasts
-//! state provisions (with merkle inclusion proofs) to target shards. Provisions are
-//! committed in blocks via `provisions_root` — all validators have the same data.
+//! state provisions (with merkle inclusion proofs) to target shards. Provision are
+//! committed in blocks via `provision_root` — all validators have the same data.
 //!
 //! ## Phase 2: Conflict Detection
 //! At commit time, the [`ConflictDetector`](crate::conflict::ConflictDetector) checks
@@ -35,9 +35,9 @@
 use hyperscale_core::{Action, CrossShardExecutionRequest, ProtocolEvent, ProvisionRequest};
 use hyperscale_types::{
     BlockHeight, Bls12381G1PublicKey, ExecutionCertificate, ExecutionOutcome, ExecutionVote, Hash,
-    LocalExecutionEntry, LocalReceipt, ProvisionBatch, ReceiptBundle, RoutableTransaction,
-    ShardGroupId, StateProvision, TopologySnapshot, TransactionDecision, TxOutcome, ValidatorId,
-    WaveCertificate, WaveId,
+    LocalExecutionEntry, LocalReceipt, Provision, ReceiptBundle, RoutableTransaction, ShardGroupId,
+    StateProvision, TopologySnapshot, TransactionDecision, TxOutcome, ValidatorId, WaveCertificate,
+    WaveId,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -168,7 +168,7 @@ pub struct ExecutionState {
     /// ECs that arrived before the wave tracker was created.
     early_wave_attestations: Vec<(Arc<ExecutionCertificate>, u64)>,
 
-    /// Provisions from committed batches whose transactions haven't been committed yet.
+    /// Provision from committed batches whose transactions haven't been committed yet.
     /// Maps tx_hash -> set of source shards that have sent provisions.
     /// Replayed in `start_cross_shard_execution` when the tx block commits.
     early_committed_provisions: HashMap<Hash, BTreeSet<ShardGroupId>>,
@@ -647,7 +647,7 @@ impl ExecutionState {
     pub fn apply_committed_provisions(
         &mut self,
         topology: &TopologySnapshot,
-        batches: &[Arc<ProvisionBatch>],
+        batches: &[Arc<Provision>],
         committed_height: u64,
     ) -> Vec<Action> {
         let mut requests = Vec::new();
@@ -1252,7 +1252,7 @@ impl ExecutionState {
             if let Some((requests, shard_recipients)) =
                 Self::build_provision_requests(topology, &transactions, local_shard)
             {
-                actions.push(Action::FetchAndBroadcastProvisions {
+                actions.push(Action::FetchAndBroadcastProvision {
                     requests,
                     source_shard: local_shard,
                     block_height: BlockHeight(height),
@@ -1405,7 +1405,7 @@ impl ExecutionState {
             let all_ready = remote_shards.is_subset(&received);
 
             if all_ready {
-                // Provisions unblocked this tx — no deadlock, execute normally.
+                // Provision unblocked this tx — no deadlock, execute normally.
                 if let Some(provisions) = self.verified_provisions.get(&tx_hash).cloned() {
                     cross_shard_requests.push(CrossShardExecutionRequest {
                         tx_hash,

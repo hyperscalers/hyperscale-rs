@@ -210,7 +210,7 @@ impl RadixExecutor {
     /// Execute cross-shard transactions with provisions (READ-ONLY).
     ///
     /// Layers provisions on top of local storage and executes transactions.
-    /// Provisions contain pre-computed storage keys from other shards.
+    /// Provision contain pre-computed storage keys from other shards.
     ///
     /// **IMPORTANT**: This method does NOT commit state changes. The writes
     /// are returned in the `ExecutionOutput` and should be committed later

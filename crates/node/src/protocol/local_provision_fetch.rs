@@ -5,7 +5,7 @@
 //! through peers on failure.
 
 use hyperscale_metrics as metrics;
-use hyperscale_types::{Hash, ProvisionBatch, ValidatorId};
+use hyperscale_types::{Hash, Provision, ValidatorId};
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use tracing::{debug, info, trace};
@@ -40,7 +40,7 @@ pub enum LocalProvisionFetchInput {
     /// Provision batches were received.
     Received {
         block_hash: Hash,
-        batches: Vec<Arc<ProvisionBatch>>,
+        batches: Vec<Arc<Provision>>,
     },
     /// A fetch operation failed.
     Failed { block_hash: Hash, hashes: Vec<Hash> },
@@ -60,7 +60,7 @@ pub enum LocalProvisionFetchOutput {
         batch_hashes: Vec<Hash>,
     },
     /// Deliver fetched provision batches to BFT.
-    Deliver { batches: Vec<Arc<ProvisionBatch>> },
+    Deliver { batches: Vec<Arc<Provision>> },
 }
 
 /// Per-block fetch state.
@@ -206,10 +206,10 @@ impl LocalProvisionFetchProtocol {
     fn handle_received(
         &mut self,
         block_hash: Hash,
-        batches: Vec<Arc<ProvisionBatch>>,
+        batches: Vec<Arc<Provision>>,
     ) -> Vec<LocalProvisionFetchOutput> {
         let Some(state) = self.fetches.get_mut(&block_hash) else {
-            trace!(?block_hash, "Provisions received for unknown fetch");
+            trace!(?block_hash, "Provision received for unknown fetch");
             return vec![];
         };
 

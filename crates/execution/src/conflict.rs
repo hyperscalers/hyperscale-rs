@@ -1,12 +1,12 @@
 //! Deterministic conflict detection from committed provisions.
 //!
 //! Detects node-ID overlap between local cross-shard transactions and remote
-//! provision batches committed via `provisions_root`. A bidirectional cycle
+//! provision batches committed via `provision_root`. A bidirectional cycle
 //! exists when a local tx needs nodes from shard S, and a remote tx from S
 //! touches overlapping nodes.
 //!
 //! Detection is bidirectional — works regardless of commit ordering:
-//! - **Provisions commit after local tx**: `detect_conflicts` finds the overlap.
+//! - **Provision commit after local tx**: `detect_conflicts` finds the overlap.
 //! - **Local tx commits after provisions**: `register_tx` checks against stored
 //!   provision node-IDs and returns any conflicts.
 //!
@@ -14,7 +14,7 @@
 //! commit height. All validators derive the same conflicts from the same
 //! committed chain state.
 
-use hyperscale_types::{Hash, NodeId, ProvisionBatch, ShardGroupId, TopologySnapshot};
+use hyperscale_types::{Hash, NodeId, Provision, ShardGroupId, TopologySnapshot};
 use std::collections::{HashMap, HashSet};
 
 /// A detected conflict: the loser tx should be aborted at the given height.
@@ -117,7 +117,7 @@ impl ConflictDetector {
     /// from the batch's source shard.
     pub fn detect_conflicts(
         &mut self,
-        batch: &ProvisionBatch,
+        batch: &Provision,
         committed_at_height: u64,
     ) -> Vec<DetectedConflict> {
         let source_shard = batch.source_shard;
@@ -279,8 +279,8 @@ mod tests {
         source_shard: ShardGroupId,
         height: u64,
         txs: Vec<(Hash, Vec<NodeId>)>,
-    ) -> ProvisionBatch {
-        ProvisionBatch::new(
+    ) -> Provision {
+        Provision::new(
             source_shard,
             BlockHeight(height),
             VerkleInclusionProof::dummy(),
@@ -365,7 +365,7 @@ mod tests {
 
         let (higher, lower) = ordered_hashes(b"tx_local", b"tx_remote");
 
-        // Provisions commit FIRST (local tx not registered yet)
+        // Provision commit FIRST (local tx not registered yet)
         let batch = make_batch(ShardGroupId(1), 5, vec![(lower, vec![node])]);
         let fwd_conflicts = detector.detect_conflicts(&batch, 5);
         assert!(fwd_conflicts.is_empty()); // No local txs registered yet
@@ -385,7 +385,7 @@ mod tests {
 
         let (higher, lower) = ordered_hashes(b"tx_local", b"tx_remote");
 
-        // Provisions commit first with the higher hash
+        // Provision commit first with the higher hash
         let batch = make_batch(ShardGroupId(1), 5, vec![(higher, vec![node])]);
         detector.detect_conflicts(&batch, 5);
 

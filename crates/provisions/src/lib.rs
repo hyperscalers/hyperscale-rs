@@ -9,7 +9,7 @@
 //!    Jellyfish Verkle Tree (JVT) inclusion proofs.
 //! 2. The target shard receives the batch and associates the provisions with
 //!    the corresponding remote block headers.
-//! 3. `VerifyStateProvisions` validates the quorum certificate (QC) signature
+//! 3. `VerifyStateProvision` validates the quorum certificate (QC) signature
 //!    once per batch and verifies the Merkle inclusion proof for each provision.
 //! 4. Verified provisions are persisted and emit completion events for downstream
 //!    transaction execution.

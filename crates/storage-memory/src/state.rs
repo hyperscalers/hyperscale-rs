@@ -91,7 +91,7 @@ impl SharedState {
         // we retain all nodes (tests are short-lived).
         //
         // Previously this deleted stale nodes immediately, causing a race: the
-        // delegated FetchAndBroadcastProvisions action would run after the next
+        // delegated FetchAndBroadcastProvision action would run after the next
         // block committed, finding the proof-generation root already pruned.
         for a in snapshot.leaf_substate_associations {
             self.associations.insert(a.tree_node_key, a.substate_value);

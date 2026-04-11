@@ -153,7 +153,7 @@ where
     /// Process LocalProvisionFetchProtocol outputs.
     ///
     /// `Fetch` uses the Network trait to request batches from the proposer/local peers.
-    /// `Deliver` feeds each batch into the state machine via `ProvisionsVerified`.
+    /// `Deliver` feeds each batch into the state machine via `ProvisionVerified`.
     pub(super) fn process_local_provision_fetch_outputs(
         &mut self,
         outputs: Vec<LocalProvisionFetchOutput>,
@@ -177,13 +177,13 @@ where
                         Box::new(move |result| match result {
                             Ok(resp) => {
                                 let batches = resp.batches.into_iter().map(Arc::new).collect();
-                                let _ = es.send(NodeInput::LocalProvisionsReceived {
+                                let _ = es.send(NodeInput::LocalProvisionReceived {
                                     block_hash: bh,
                                     batches,
                                 });
                             }
                             Err(_) => {
-                                let _ = es.send(NodeInput::LocalProvisionsFetchFailed {
+                                let _ = es.send(NodeInput::LocalProvisionFetchFailed {
                                     block_hash: bh,
                                     hashes: hs,
                                 });
@@ -193,7 +193,7 @@ where
                 }
                 LocalProvisionFetchOutput::Deliver { batches } => {
                     for batch in batches {
-                        self.feed_event(ProtocolEvent::ProvisionsVerified { batch });
+                        self.feed_event(ProtocolEvent::ProvisionVerified { batch });
                     }
                 }
             }
@@ -203,7 +203,7 @@ where
     /// Process ProvisionFetchProtocol outputs.
     ///
     /// `Fetch` uses the Network trait to send a single-peer request.
-    /// `Deliver` feeds provisions into the state machine via `StateProvisionsReceived`.
+    /// `Deliver` feeds provisions into the state machine via `StateProvisionReceived`.
     pub(super) fn process_provision_fetch_outputs(&mut self, outputs: Vec<ProvisionFetchOutput>) {
         for output in outputs {
             match output {
@@ -213,8 +213,8 @@ where
                     target_shard,
                     peer,
                 } => {
-                    use hyperscale_messages::request::GetProvisionsRequest;
-                    let request = GetProvisionsRequest {
+                    use hyperscale_messages::request::GetProvisionRequest;
+                    let request = GetProvisionRequest {
                         block_height,
                         target_shard,
                     };
@@ -226,7 +226,7 @@ where
                         Box::new(move |result| match result {
                             Ok(response) => match response.provisions {
                                 Some(provisions) => {
-                                    // Build a ProvisionBatch from the response.
+                                    // Build a Provision from the response.
                                     let proof = response.proof.unwrap_or_else(
                                         hyperscale_types::VerkleInclusionProof::dummy,
                                     );
@@ -237,7 +237,7 @@ where
                                             entries: (*p.entries).clone(),
                                         })
                                         .collect();
-                                    let batch = hyperscale_types::ProvisionBatch::new(
+                                    let batch = hyperscale_types::Provision::new(
                                         source_shard,
                                         block_height,
                                         proof,
@@ -266,7 +266,7 @@ where
                 }
                 ProvisionFetchOutput::Deliver { batch } => {
                     if !batch.transactions.is_empty() {
-                        self.feed_event(ProtocolEvent::StateProvisionsReceived { batch });
+                        self.feed_event(ProtocolEvent::StateProvisionReceived { batch });
                     }
                 }
             }

@@ -12,7 +12,7 @@
 //!
 //! 3. **Routing**: Target shard, recipients. Handled at the network layer.
 //!
-//! [`ProvisionBatch`] bundles level 1 + level 2 together as the natural unit
+//! [`Provision`] bundles level 1 + level 2 together as the natural unit
 //! of work. This eliminates the N× proof duplication that occurs when the
 //! proof is flattened into each per-transaction struct.
 
@@ -81,7 +81,7 @@ impl TxEntries {
 }
 
 // ============================================================================
-// ProvisionBatch
+// Provision
 // ============================================================================
 
 /// A batch of provisions from a single source block.
@@ -93,7 +93,7 @@ impl TxEntries {
 ///
 /// The content hash is computed eagerly at construction and included in the
 /// SBOR encoding, so deserialization restores it without recomputation.
-pub struct ProvisionBatch {
+pub struct Provision {
     /// Source shard that committed this block.
     pub source_shard: ShardGroupId,
 
@@ -110,9 +110,9 @@ pub struct ProvisionBatch {
     hash: Hash,
 }
 
-impl std::fmt::Debug for ProvisionBatch {
+impl std::fmt::Debug for Provision {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ProvisionBatch")
+        f.debug_struct("Provision")
             .field("hash", &self.hash)
             .field("source_shard", &self.source_shard)
             .field("block_height", &self.block_height)
@@ -121,7 +121,7 @@ impl std::fmt::Debug for ProvisionBatch {
     }
 }
 
-impl Clone for ProvisionBatch {
+impl Clone for Provision {
     fn clone(&self) -> Self {
         Self {
             source_shard: self.source_shard,
@@ -133,18 +133,18 @@ impl Clone for ProvisionBatch {
     }
 }
 
-impl PartialEq for ProvisionBatch {
+impl PartialEq for Provision {
     fn eq(&self, other: &Self) -> bool {
         self.hash == other.hash
     }
 }
 
-impl Eq for ProvisionBatch {}
+impl Eq for Provision {}
 
 // Manual SBOR: includes the cached hash in the encoding so deserialization
 // restores it without recomputation.
 impl<E: sbor::Encoder<sbor::NoCustomValueKind>> sbor::Encode<sbor::NoCustomValueKind, E>
-    for ProvisionBatch
+    for Provision
 {
     fn encode_value_kind(&self, encoder: &mut E) -> Result<(), sbor::EncodeError> {
         encoder.write_value_kind(sbor::ValueKind::Tuple)
@@ -163,7 +163,7 @@ impl<E: sbor::Encoder<sbor::NoCustomValueKind>> sbor::Encode<sbor::NoCustomValue
 }
 
 impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValueKind, D>
-    for ProvisionBatch
+    for Provision
 {
     fn decode_body_with_value_kind(
         decoder: &mut D,
@@ -193,21 +193,21 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
     }
 }
 
-impl sbor::Categorize<sbor::NoCustomValueKind> for ProvisionBatch {
+impl sbor::Categorize<sbor::NoCustomValueKind> for Provision {
     fn value_kind() -> sbor::ValueKind<sbor::NoCustomValueKind> {
         sbor::ValueKind::Tuple
     }
 }
 
-impl sbor::Describe<sbor::NoCustomTypeKind> for ProvisionBatch {
-    const TYPE_ID: sbor::RustTypeId = sbor::RustTypeId::novel_with_code("ProvisionBatch", &[], &[]);
+impl sbor::Describe<sbor::NoCustomTypeKind> for Provision {
+    const TYPE_ID: sbor::RustTypeId = sbor::RustTypeId::novel_with_code("Provision", &[], &[]);
 
     fn type_data() -> sbor::TypeData<sbor::NoCustomTypeKind, sbor::RustTypeId> {
         sbor::TypeData::unnamed(sbor::TypeKind::Any)
     }
 }
 
-impl ProvisionBatch {
+impl Provision {
     /// Create a new provision batch, computing the content hash eagerly.
     pub fn new(
         source_shard: ShardGroupId,
@@ -308,7 +308,7 @@ mod tests {
 
     #[test]
     fn test_provision_batch_fields_roundtrip() {
-        let original = ProvisionBatch::new(
+        let original = Provision::new(
             ShardGroupId(1),
             BlockHeight(42),
             VerkleInclusionProof::new(vec![1, 2, 3]),
@@ -316,7 +316,7 @@ mod tests {
         );
 
         let bytes = sbor::basic_encode(&original).unwrap();
-        let decoded: ProvisionBatch = sbor::basic_decode(&bytes).unwrap();
+        let decoded: Provision = sbor::basic_decode(&bytes).unwrap();
         assert_eq!(original, decoded);
     }
 
@@ -334,21 +334,21 @@ mod tests {
 
     #[test]
     fn test_provision_batch_roundtrip() {
-        let mut batch = ProvisionBatch::dummy(ShardGroupId(0), BlockHeight(10));
+        let mut batch = Provision::dummy(ShardGroupId(0), BlockHeight(10));
         batch.transactions = vec![TxEntries {
             tx_hash: Hash::from_bytes(b"tx1"),
             entries: vec![test_entry(1)],
         }];
 
         let bytes = sbor::basic_encode(&batch).unwrap();
-        let decoded: ProvisionBatch = sbor::basic_decode(&bytes).unwrap();
+        let decoded: Provision = sbor::basic_decode(&bytes).unwrap();
         assert_eq!(batch, decoded);
     }
 
     #[test]
     fn test_provision_batch_all_entries_deduped() {
         let entry = test_entry(1);
-        let mut batch = ProvisionBatch::dummy(ShardGroupId(0), BlockHeight(10));
+        let mut batch = Provision::dummy(ShardGroupId(0), BlockHeight(10));
         batch.transactions = vec![
             TxEntries {
                 tx_hash: Hash::from_bytes(b"tx1"),

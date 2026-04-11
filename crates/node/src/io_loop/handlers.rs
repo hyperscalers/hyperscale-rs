@@ -27,7 +27,7 @@ where
         use crate::protocol::sync::serve_block_request;
         use crate::protocol::transaction_fetch::serve_transaction_request;
         use hyperscale_messages::request::{
-            GetBlockRequest, GetProvisionsRequest, GetTransactionsRequest,
+            GetBlockRequest, GetProvisionRequest, GetTransactionsRequest,
         };
         use std::sync::Arc;
 
@@ -67,7 +67,7 @@ where
 
         use std::collections::HashMap;
 
-        type ProvisionResponse = hyperscale_messages::response::GetProvisionsResponse;
+        type ProvisionResponse = hyperscale_messages::response::GetProvisionResponse;
         type ProvisionWaiter = Arc<(
             std::sync::Mutex<Option<ProvisionResponse>>,
             std::sync::Condvar,
@@ -85,7 +85,7 @@ where
             }));
 
         self.network
-            .register_request_handler::<GetProvisionsRequest>(move |req: GetProvisionsRequest| {
+            .register_request_handler::<GetProvisionRequest>(move |req: GetProvisionRequest| {
                 let cache_key = (req.block_height.0, req.target_shard.0);
 
                 // Fast path: check cache
@@ -109,7 +109,7 @@ where
                 // We're the first — register as in-flight
                 let waiter = Arc::new((
                     std::sync::Mutex::new(
-                        None::<hyperscale_messages::response::GetProvisionsResponse>,
+                        None::<hyperscale_messages::response::GetProvisionResponse>,
                     ),
                     std::sync::Condvar::new(),
                 ));
@@ -154,7 +154,7 @@ where
                 move |req: hyperscale_messages::request::GetLocalProvisionsRequest| {
                     use hyperscale_messages::response::GetLocalProvisionsResponse;
 
-                    let batches: Vec<hyperscale_types::ProvisionBatch> = req
+                    let batches: Vec<hyperscale_types::Provision> = req
                         .batch_hashes
                         .iter()
                         .filter_map(|h| provision_cache.get(h).map(|b| (*b).clone()))
@@ -343,13 +343,13 @@ where
                 },
             );
 
-        // ── state.provision.batch → verify sender sig, then ProtocolEvent::StateProvisionsReceived ─
+        // ── state.provision.batch → verify sender sig, then ProtocolEvent::StateProvisionReceived ─
 
         let tx = self.event_sender.clone();
         let topology = self.topology.clone();
         self.network
-            .register_notification_handler::<hyperscale_messages::StateProvisionsNotification>(
-                move |batch: hyperscale_messages::StateProvisionsNotification| {
+            .register_notification_handler::<hyperscale_messages::StateProvisionNotification>(
+                move |batch: hyperscale_messages::StateProvisionNotification| {
                     if batch.provisions.is_empty() {
                         return;
                     }
@@ -383,15 +383,15 @@ where
                             entries: (*p.entries).clone(),
                         })
                         .collect();
-                    let batch = hyperscale_types::ProvisionBatch::new(
+                    let batch = hyperscale_types::Provision::new(
                         source_shard,
                         block_height,
                         proof,
                         transactions,
                     );
-                    let _ = tx.send(NodeInput::Protocol(
-                        ProtocolEvent::StateProvisionsReceived { batch },
-                    ));
+                    let _ = tx.send(NodeInput::Protocol(ProtocolEvent::StateProvisionReceived {
+                        batch,
+                    }));
                 },
             );
 

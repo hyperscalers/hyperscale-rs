@@ -113,7 +113,7 @@ pub struct MemoryMetrics {
     /// Remote shards being tracked for liveness.
     pub rh_expected_headers: usize,
 
-    // ── Provisions ──
+    // ── Provision ──
     /// Verified remote shard headers (provisions local cache).
     pub prov_verified_remote_headers: usize,
     /// Provision batches waiting for corresponding header.

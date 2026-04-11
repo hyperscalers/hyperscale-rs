@@ -12,7 +12,7 @@ use hyperscale_core::{Action, NodeInput, ProtocolEvent};
 use hyperscale_engine::RadixExecutor;
 use hyperscale_metrics as metrics;
 use hyperscale_storage::{ChainReader, ChainWriter, SubstateStore};
-use hyperscale_types::{Hash, LocalExecutionEntry, ProvisionBatch, ShardGroupId, TxEntries};
+use hyperscale_types::{Hash, LocalExecutionEntry, Provision, ShardGroupId, TxEntries};
 use std::sync::Arc;
 use tracing::warn;
 
@@ -41,7 +41,7 @@ pub(crate) enum DispatchPool {
     /// Transaction execution (single-shard, merkle).
     Execution,
     /// Provision proof generation and verification (IPA math).
-    Provisions,
+    Provision,
 }
 
 /// Map a delegated action to its execution pool.
@@ -56,7 +56,7 @@ pub(crate) fn dispatch_pool_for(action: &Action) -> Option<DispatchPool> {
         Action::VerifyRemoteHeaderQc { .. } => Some(DispatchPool::ConsensusCrypto),
         Action::VerifyStateRoot { .. } => Some(DispatchPool::ConsensusCrypto),
         Action::VerifyTransactionRoot { .. } => Some(DispatchPool::ConsensusCrypto),
-        Action::VerifyProvisionsRoot { .. } => Some(DispatchPool::ConsensusCrypto),
+        Action::VerifyProvisionRoot { .. } => Some(DispatchPool::ConsensusCrypto),
         Action::VerifyCertificateRoot { .. } => Some(DispatchPool::ConsensusCrypto),
         Action::VerifyLocalReceiptRoot { .. } => Some(DispatchPool::ConsensusCrypto),
         Action::BuildProposal { .. } => Some(DispatchPool::ConsensusCrypto),
@@ -68,8 +68,8 @@ pub(crate) fn dispatch_pool_for(action: &Action) -> Option<DispatchPool> {
 
         // Provision work: IPA proof generation and verification.
         // Dedicated pool to avoid starving execution and crypto work.
-        Action::VerifyProvisionBatch { .. } => Some(DispatchPool::Provisions),
-        Action::FetchAndBroadcastProvisions { .. } => Some(DispatchPool::Provisions),
+        Action::VerifyProvision { .. } => Some(DispatchPool::Provision),
+        Action::FetchAndBroadcastProvision { .. } => Some(DispatchPool::Provision),
 
         // Execution
         Action::ExecuteTransactions { .. } => Some(DispatchPool::Execution),
@@ -210,21 +210,21 @@ pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainRead
             })
         }
 
-        Action::VerifyProvisionsRoot {
+        Action::VerifyProvisionRoot {
             block_hash,
             expected_root,
             batch_hashes,
         } => {
             let start = std::time::Instant::now();
             let valid =
-                hyperscale_bft::handlers::verify_provisions_root(expected_root, &batch_hashes);
+                hyperscale_bft::handlers::verify_provision_root(expected_root, &batch_hashes);
             metrics::record_signature_verification_latency(
-                "provisions_root",
+                "provision_root",
                 start.elapsed().as_secs_f64(),
             );
             Some(DelegatedResult {
                 events: vec![NodeInput::Protocol(ProtocolEvent::BlockRootVerified {
-                    kind: hyperscale_core::VerificationKind::ProvisionsRoot,
+                    kind: hyperscale_core::VerificationKind::ProvisionRoot,
                     block_hash,
                     valid,
                 })],
@@ -344,9 +344,9 @@ pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainRead
                 .flat_map(|fw| fw.receipts.iter().cloned())
                 .collect();
 
-            let mut provision_batch_hashes: Vec<hyperscale_types::Hash> =
+            let mut provision_hashes: Vec<hyperscale_types::Hash> =
                 provision_batches.iter().map(|b| b.hash()).collect();
-            provision_batch_hashes.sort();
+            provision_hashes.sort();
 
             let result = hyperscale_bft::handlers::build_proposal(
                 ctx.storage,
@@ -363,7 +363,7 @@ pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainRead
                 &all_receipts,
                 shard_group_id,
                 waves,
-                provision_batch_hashes,
+                provision_hashes,
             );
             let prepared = result
                 .prepared_commit
@@ -449,7 +449,7 @@ pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainRead
         // --- State Provision Batch Verification ---
         // QC was already verified by RemoteHeaderCoordinator; only verkle
         // proofs need checking against the committed header's state root.
-        Action::VerifyProvisionBatch {
+        Action::VerifyProvision {
             batch,
             committed_header,
         } => {
@@ -473,13 +473,11 @@ pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainRead
             );
 
             Some(DelegatedResult {
-                events: vec![NodeInput::Protocol(
-                    ProtocolEvent::StateProvisionsVerified {
-                        batch,
-                        committed_header: Some(committed_header),
-                        valid: all_valid,
-                    },
-                )],
+                events: vec![NodeInput::Protocol(ProtocolEvent::StateProvisionVerified {
+                    batch,
+                    committed_header: Some(committed_header),
+                    valid: all_valid,
+                })],
                 prepared_commit: None,
             })
         }
@@ -567,7 +565,7 @@ pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainRead
         }
 
         // --- Provision fetch + broadcast ---
-        Action::FetchAndBroadcastProvisions {
+        Action::FetchAndBroadcastProvision {
             requests,
             source_shard,
             block_height,
@@ -584,7 +582,7 @@ pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainRead
                     "All fetch_state_entries failed — no provisions to broadcast"
                 );
                 return Some(DelegatedResult {
-                    events: vec![NodeInput::ProvisionsReady {
+                    events: vec![NodeInput::ProvisionReady {
                         batches: vec![],
                         block_timestamp: 0,
                     }],
@@ -596,7 +594,7 @@ pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainRead
             let batches =
                 build_provision_batches(ctx, per_tx, source_shard, block_height, &shard_recipients);
             Some(DelegatedResult {
-                events: vec![NodeInput::ProvisionsReady {
+                events: vec![NodeInput::ProvisionReady {
                     batches,
                     block_timestamp,
                 }],
@@ -661,11 +659,7 @@ fn build_provision_batches<S: ChainWriter + SubstateStore + ChainReader>(
     source_shard: ShardGroupId,
     block_height: hyperscale_types::BlockHeight,
     shard_recipients: &std::collections::HashMap<ShardGroupId, Vec<hyperscale_types::ValidatorId>>,
-) -> Vec<(
-    ShardGroupId,
-    ProvisionBatch,
-    Vec<hyperscale_types::ValidatorId>,
-)> {
+) -> Vec<(ShardGroupId, Provision, Vec<hyperscale_types::ValidatorId>)> {
     use std::collections::HashMap;
 
     let mut shard_tx_entries: HashMap<ShardGroupId, Vec<TxEntries>> = HashMap::new();
@@ -710,7 +704,7 @@ fn build_provision_batches<S: ChainWriter + SubstateStore + ChainReader>(
         };
 
         let recipients = shard_recipients.get(&shard).cloned().unwrap_or_default();
-        let batch = ProvisionBatch::new(source_shard, block_height, proof, transactions);
+        let batch = Provision::new(source_shard, block_height, proof, transactions);
         batches.push((shard, batch, recipients));
     }
     batches

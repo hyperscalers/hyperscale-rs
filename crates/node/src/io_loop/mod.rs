@@ -45,7 +45,7 @@ use hyperscale_network::Network;
 use hyperscale_storage::{ChainReader, ChainWriter, SubstateStore};
 use hyperscale_types::{
     Block, Bls12381G1PrivateKey, Bls12381G1PublicKey, CommittedBlockHeader, ExecutionCertificate,
-    FinalizedWave, Hash, ProvisionBatch, QuorumCertificate, RoutableTransaction, ShardGroupId,
+    FinalizedWave, Hash, Provision, QuorumCertificate, RoutableTransaction, ShardGroupId,
     TopologySnapshot, ValidatorId, WaveCertificate, WaveId,
 };
 use quick_cache::sync::Cache as QuickCache;
@@ -65,7 +65,7 @@ pub(crate) enum PendingCommit {
         block: Arc<Block>,
         qc: Arc<QuorumCertificate>,
         finalized_waves: Vec<Arc<FinalizedWave>>,
-        provision_batches: Vec<Arc<ProvisionBatch>>,
+        provision_batches: Vec<Arc<Provision>>,
     },
     /// Sync path: receipts and ECs come from `pending_sync_data`.
     Synced {
@@ -106,6 +106,8 @@ pub(crate) struct BufferedSyncResponse {
 const DEFAULT_CERT_CACHE_SIZE: usize = 10_000;
 /// Default transaction cache capacity.
 const DEFAULT_TX_CACHE_SIZE: usize = 50_000;
+/// Default provision batch cache capacity (for serving fetch requests).
+const DEFAULT_PROVISION_CACHE_SIZE: usize = 256;
 /// Default transaction status cache capacity.
 const DEFAULT_TX_STATUS_CACHE_SIZE: usize = 100_000;
 /// A committed header pending sender-signature verification.
@@ -209,7 +211,7 @@ where
     // In-memory caches (shared with inbound router in production)
     cert_cache: Arc<QuickCache<Hash, Arc<WaveCertificate>>>,
     tx_cache: Arc<QuickCache<Hash, Arc<RoutableTransaction>>>,
-    provision_cache: Arc<QuickCache<Hash, Arc<ProvisionBatch>>>,
+    provision_cache: Arc<QuickCache<Hash, Arc<Provision>>>,
 
     // Sync protocol
     sync_protocol: SyncProtocol,
@@ -338,7 +340,7 @@ where
             prepared_commits: Arc::new(Mutex::new(HashMap::new())),
             cert_cache: Arc::new(QuickCache::new(DEFAULT_CERT_CACHE_SIZE)),
             tx_cache: Arc::new(QuickCache::new(DEFAULT_TX_CACHE_SIZE)),
-            provision_cache: Arc::new(QuickCache::new(256)),
+            provision_cache: Arc::new(QuickCache::new(DEFAULT_PROVISION_CACHE_SIZE)),
             tx_validator,
             pending_validation: HashSet::new(),
             locally_submitted: HashSet::new(),
@@ -836,7 +838,7 @@ where
             }
 
             // ── Local provision fetch protocol ────────────────────────
-            NodeInput::LocalProvisionsReceived {
+            NodeInput::LocalProvisionReceived {
                 block_hash,
                 batches,
             } => {
@@ -850,7 +852,7 @@ where
                 self.update_fetch_tick_timer();
             }
 
-            NodeInput::LocalProvisionsFetchFailed { block_hash, hashes } => {
+            NodeInput::LocalProvisionFetchFailed { block_hash, hashes } => {
                 let outputs = self
                     .local_provision_fetch_protocol
                     .handle(LocalProvisionFetchInput::Failed { block_hash, hashes });
@@ -863,11 +865,11 @@ where
                 self.update_fetch_tick_timer();
             }
 
-            // ── Provisions ready (from execution pool) ─────────────────
+            // ── Provision ready (from execution pool) ─────────────────
             //
-            // The FetchAndBroadcastProvisions delegated action built provisions
+            // The FetchAndBroadcastProvision delegated action built provisions
             // grouped by target shard. Broadcast one batch per shard.
-            NodeInput::ProvisionsReady {
+            NodeInput::ProvisionReady {
                 batches,
                 block_timestamp,
             } => {
@@ -942,7 +944,7 @@ where
         &self,
         batches: Vec<(
             hyperscale_types::ShardGroupId,
-            hyperscale_types::ProvisionBatch,
+            hyperscale_types::Provision,
             Vec<hyperscale_types::ValidatorId>,
         )>,
         block_timestamp: u64,
@@ -973,7 +975,7 @@ where
                 &provisions,
             );
             let sig = self.signing_key.sign_v1(&msg);
-            let notification = hyperscale_messages::StateProvisionsNotification::new(
+            let notification = hyperscale_messages::StateProvisionNotification::new(
                 provisions,
                 proof,
                 self.validator_id,
@@ -1064,7 +1066,7 @@ where
             rh_pending_headers: rh_mem.pending_headers,
             rh_verified_headers: rh_mem.verified_headers,
             rh_expected_headers: rh_mem.expected_headers,
-            // Provisions
+            // Provision
             prov_verified_remote_headers: prov_mem.verified_remote_headers,
             prov_pending_provisions: prov_mem.pending_provisions,
             prov_verified_batches: prov_mem.verified_batches,

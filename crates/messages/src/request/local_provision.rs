@@ -6,7 +6,7 @@ use sbor::prelude::BasicSbor;
 
 /// Request to fetch provision batch data for a pending block.
 ///
-/// Used when a validator receives a block header with `provision_batch_hashes`
+/// Used when a validator receives a block header with `provision_hashes`
 /// but doesn't have the batch data locally (missed the gossip from the source shard).
 /// Same pattern as `GetTransactionsRequest` — tries the proposer first, rotates to peers.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]

@@ -7,7 +7,7 @@
 
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, BlockManifest, BlockVote, CommittedBlockHeader, EpochConfig,
-    EpochId, ExecutionCertificate, ExecutionVote, FinalizedWave, Hash, ProvisionBatch,
+    EpochId, ExecutionCertificate, ExecutionVote, FinalizedWave, Hash, Provision,
     QuorumCertificate, RoutableTransaction, ShardGroupId, TxOutcome, ValidatorId, WaveCertificate,
     WaveId,
 };
@@ -26,7 +26,7 @@ pub enum VerificationKind {
     TransactionRoot,
     CertificateRoot,
     LocalReceiptRoot,
-    ProvisionsRoot,
+    ProvisionRoot,
 }
 
 /// Events that the state machine processes.
@@ -98,7 +98,7 @@ pub enum ProtocolEvent {
         /// JVT state root after committing this block's state changes.
         state_root: Hash,
         /// Provision batches included in this block (ephemeral, for deterministic execution application).
-        provision_batches: Vec<Arc<ProvisionBatch>>,
+        provision_batches: Vec<Arc<Provision>>,
     },
 
     /// Quorum Certificate verification and building result.
@@ -122,7 +122,7 @@ pub enum ProtocolEvent {
     /// A remote committed block header has been fully verified (QC + structural checks).
     ///
     /// Emitted by `RemoteHeaderCoordinator` as a continuation after QC verification.
-    /// Downstream consumers (BFT, Provisions, Execution) use this as their single
+    /// Downstream consumers (BFT, Provision, Execution) use this as their single
     /// source of verified remote headers.
     RemoteHeaderVerified {
         committed_header: Arc<CommittedBlockHeader>,
@@ -149,29 +149,29 @@ pub enum ProtocolEvent {
         /// Finalized waves included in this block (carries receipts for atomic commit).
         finalized_waves: Vec<Arc<FinalizedWave>>,
         /// Provision batches included in this block (for PendingBlock DA tracking).
-        provision_batches: Vec<Arc<ProvisionBatch>>,
+        provision_batches: Vec<Arc<Provision>>,
     },
 
     // ═══════════════════════════════════════════════════════════════════════
-    // Provisions
+    // Provision
     // ═══════════════════════════════════════════════════════════════════════
     /// A provision batch has been verified — ready for downstream consumption.
-    ProvisionsVerified { batch: Arc<ProvisionBatch> },
+    ProvisionVerified { batch: Arc<Provision> },
 
     /// Received a provision batch from a source shard (light-client path).
     ///
     /// All provisions in a batch share the same `(source_shard, block_height)`
-    /// because they originate from a single `FetchAndBroadcastProvisions` action.
-    StateProvisionsReceived { batch: ProvisionBatch },
+    /// because they originate from a single `FetchAndBroadcastProvision` action.
+    StateProvisionReceived { batch: Provision },
 
     /// Batch-level provision verification completed.
     ///
     /// The QC is verified once for the batch's attestation; verkle proofs are
     /// checked against the verified state root. The committed header is returned
     /// so the state machine can promote it without re-lookup.
-    StateProvisionsVerified {
+    StateProvisionVerified {
         /// The verified provision batch.
-        batch: ProvisionBatch,
+        batch: Provision,
         /// The committed header whose QC passed verification.
         /// `None` if no candidate header passed QC verification.
         committed_header: Option<Arc<CommittedBlockHeader>>,
@@ -368,14 +368,14 @@ impl ProtocolEvent {
                 VerificationKind::TransactionRoot => "BlockRootVerified::TransactionRoot",
                 VerificationKind::CertificateRoot => "BlockRootVerified::CertificateRoot",
                 VerificationKind::LocalReceiptRoot => "BlockRootVerified::LocalReceiptRoot",
-                VerificationKind::ProvisionsRoot => "BlockRootVerified::ProvisionsRoot",
+                VerificationKind::ProvisionRoot => "BlockRootVerified::ProvisionRoot",
             },
             ProtocolEvent::ProposalBuilt { .. } => "ProposalBuilt",
 
-            // Provisions
-            ProtocolEvent::ProvisionsVerified { .. } => "ProvisionsVerified",
-            ProtocolEvent::StateProvisionsReceived { .. } => "StateProvisionsReceived",
-            ProtocolEvent::StateProvisionsVerified { .. } => "StateProvisionsVerified",
+            // Provision
+            ProtocolEvent::ProvisionVerified { .. } => "ProvisionVerified",
+            ProtocolEvent::StateProvisionReceived { .. } => "StateProvisionReceived",
+            ProtocolEvent::StateProvisionVerified { .. } => "StateProvisionVerified",
 
             // Execution
             ProtocolEvent::ExecutionBatchCompleted { .. } => "ExecutionBatchCompleted",
