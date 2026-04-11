@@ -85,8 +85,9 @@ pub struct ProvisionRequest {
     pub tx_hash: Hash,
     /// Nodes owned by our shard whose state we need to provision.
     pub nodes: Vec<NodeId>,
-    /// Shards that need this state.
-    pub target_shards: Vec<ShardGroupId>,
+    /// Target shards and the nodes this tx needs from each.
+    /// Used to populate `TxEntries::target_nodes` for conflict detection.
+    pub targets: Vec<(ShardGroupId, Vec<NodeId>)>,
 }
 
 /// Actions the state machine wants to perform.
