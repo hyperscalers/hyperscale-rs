@@ -138,6 +138,14 @@ pub struct ExecutionState {
     /// for cross-shard txs whose provisions haven't arrived yet.
     pending_provisioning: HashMap<Hash, (Arc<RoutableTransaction>, u64)>,
 
+    /// Remote shards each cross-shard tx requires provisions from.
+    /// Populated in `start_cross_shard_execution` from topology.
+    required_provision_shards: HashMap<Hash, BTreeSet<ShardGroupId>>,
+
+    /// Remote shards whose provisions have been received for each tx.
+    /// Populated in `apply_committed_provisions` from batch source shard.
+    received_provision_shards: HashMap<Hash, BTreeSet<ShardGroupId>>,
+
     // ═══════════════════════════════════════════════════════════════════════
     // Wave voting
     // ═══════════════════════════════════════════════════════════════════════
@@ -177,10 +185,10 @@ pub struct ExecutionState {
     /// ECs that arrived before the wave tracker was created.
     early_wave_attestations: Vec<(Arc<ExecutionCertificate>, u64)>,
 
-    /// Tx hashes from committed provision batches whose transactions haven't
-    /// been committed yet (no wave assignment). Replayed in setup_execution_tracking
-    /// to mark provisioned when the accumulator is created.
-    early_committed_provisions: HashSet<Hash>,
+    /// Provisions from committed batches whose transactions haven't been committed yet.
+    /// Maps tx_hash -> set of source shards that have sent provisions.
+    /// Replayed in `start_cross_shard_execution` when the tx block commits.
+    early_committed_provisions: HashMap<Hash, BTreeSet<ShardGroupId>>,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Expected Execution Certificate Tracking (Fallback Detection)
@@ -241,7 +249,9 @@ impl ExecutionState {
             early_execution_results: HashMap::new(),
             verified_provisions: HashMap::new(),
             early_wave_attestations: Vec::new(),
-            early_committed_provisions: HashSet::new(),
+            early_committed_provisions: HashMap::new(),
+            required_provision_shards: HashMap::new(),
+            received_provision_shards: HashMap::new(),
             pending_wave_receipts: HashMap::new(),
             expected_exec_certs: HashMap::new(),
             fulfilled_exec_certs: HashMap::new(),
@@ -372,9 +382,15 @@ impl ExecutionState {
             }
 
             // Replay early committed provisions: provisions committed in a previous
-            // block whose tx wasn't committed yet at that time.
+            // block whose tx wasn't committed yet at that time. Transfer the
+            // received source shards into received_provision_shards and mark
+            // provisioned in the accumulator.
             for tx_hash in accumulator.tx_hashes() {
-                if self.early_committed_provisions.remove(&tx_hash) {
+                if let Some(source_shards) = self.early_committed_provisions.remove(&tx_hash) {
+                    self.received_provision_shards
+                        .entry(tx_hash)
+                        .or_default()
+                        .extend(source_shards);
                     accumulator.mark_provisioned(tx_hash);
                 }
             }
@@ -684,14 +700,16 @@ impl ExecutionState {
         let mut requests = Vec::new();
 
         for batch in batches {
+            let source_shard = batch.source_shard;
+
             for tx_entry in &batch.transactions {
                 let tx_hash = tx_entry.tx_hash;
 
-                // Store provisions for execution (same as on_provisioning_complete).
+                // Store provisions for execution.
                 let provisions = vec![StateProvision {
                     transaction_hash: tx_hash,
                     target_shard: topology.local_shard(),
-                    source_shard: batch.source_shard,
+                    source_shard,
                     block_height: batch.block_height,
                     block_timestamp: 0,
                     entries: Arc::new(tx_entry.entries.clone()),
@@ -701,6 +719,12 @@ impl ExecutionState {
                     .or_default()
                     .extend(provisions);
 
+                // Track which source shard's provisions arrived.
+                self.received_provision_shards
+                    .entry(tx_hash)
+                    .or_default()
+                    .insert(source_shard);
+
                 // Mark provisioned in accumulator for vote height tracking.
                 if let Some(wave_key) = self.wave_assignments.get(&tx_hash).cloned() {
                     if let Some(acc) = self.accumulators.get_mut(&wave_key) {
@@ -708,17 +732,33 @@ impl ExecutionState {
                     }
                 } else {
                     // Tx not committed yet — buffer for replay when accumulator is created.
-                    self.early_committed_provisions.insert(tx_hash);
+                    self.early_committed_provisions
+                        .entry(tx_hash)
+                        .or_default()
+                        .insert(source_shard);
                 }
 
-                // Start execution if tx block already committed and waiting on provisions.
-                if let Some((tx, _height)) = self.pending_provisioning.remove(&tx_hash) {
-                    if let Some(all_provisions) = self.verified_provisions.get(&tx_hash) {
-                        requests.push(CrossShardExecutionRequest {
-                            tx_hash,
-                            transaction: tx,
-                            provisions: all_provisions.clone(),
+                // Check if all required shards have now sent provisions.
+                let all_shards_ready =
+                    self.required_provision_shards
+                        .get(&tx_hash)
+                        .is_some_and(|required| {
+                            self.received_provision_shards
+                                .get(&tx_hash)
+                                .is_some_and(|received| required.is_subset(received))
                         });
+
+                // Start execution if tx block already committed, waiting on provisions,
+                // and ALL required shards have provided their state.
+                if all_shards_ready {
+                    if let Some((tx, _height)) = self.pending_provisioning.remove(&tx_hash) {
+                        if let Some(all_provisions) = self.verified_provisions.get(&tx_hash) {
+                            requests.push(CrossShardExecutionRequest {
+                                tx_hash,
+                                transaction: tx,
+                                provisions: all_provisions.clone(),
+                            });
+                        }
                     }
                 }
             }
@@ -1402,29 +1442,40 @@ impl ExecutionState {
             // but handle gracefully
             tracing::warn!(tx_hash = ?tx_hash, "Cross-shard tx with no remote shards");
         } else {
+            // Track required provision shards for this tx.
+            self.required_provision_shards
+                .insert(tx_hash, remote_shards.clone());
+
             // Register with provision coordinator (via structured output).
             registrations.push(CrossShardRegistration {
                 tx_hash,
-                required_shards: remote_shards,
+                required_shards: remote_shards.clone(),
                 committed_height: BlockHeight(height),
             });
 
-            // Check if provisions already arrived (before block commit).
-            if let Some(provisions) = self.verified_provisions.get(&tx_hash).cloned() {
-                // Provisions ready — execute immediately.
-                cross_shard_requests.push(CrossShardExecutionRequest {
-                    tx_hash,
-                    transaction: tx.clone(),
-                    provisions,
-                });
-                // Mark as provisioned in the accumulator
-                if let Some(wid) = self.wave_assignments.get(&tx_hash) {
-                    if let Some(acc) = self.accumulators.get_mut(wid) {
-                        acc.mark_provisioned(tx_hash);
+            // Check if all required provisions already arrived (before tx block commit).
+            let received = self
+                .received_provision_shards
+                .get(&tx_hash)
+                .cloned()
+                .unwrap_or_default();
+            let all_ready = remote_shards.is_subset(&received);
+
+            if all_ready {
+                if let Some(provisions) = self.verified_provisions.get(&tx_hash).cloned() {
+                    cross_shard_requests.push(CrossShardExecutionRequest {
+                        tx_hash,
+                        transaction: tx.clone(),
+                        provisions,
+                    });
+                    if let Some(wid) = self.wave_assignments.get(&tx_hash) {
+                        if let Some(acc) = self.accumulators.get_mut(wid) {
+                            acc.mark_provisioned(tx_hash);
+                        }
                     }
                 }
             } else {
-                // Store transaction for later execution (when ProvisioningComplete arrives)
+                // Not all provisions yet — wait for remaining shards.
                 self.pending_provisioning
                     .insert(tx_hash, (tx.clone(), height));
             }
@@ -1654,6 +1705,9 @@ impl ExecutionState {
 
             self.wave_assignments.remove(tx_hash);
             self.verified_provisions.remove(tx_hash);
+            self.required_provision_shards.remove(tx_hash);
+            self.received_provision_shards.remove(tx_hash);
+            self.early_committed_provisions.remove(tx_hash);
         }
     }
 
