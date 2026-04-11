@@ -6,7 +6,7 @@ use hyperscale_types::{
     Block, BlockHeader, BlockManifest, FinalizedWave, Hash, Provision, RoutableTransaction,
     WaveCertificate,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 /// Tracks a block being assembled from header + gossiped transactions + finalized waves.
@@ -38,7 +38,7 @@ pub struct PendingBlock {
     ///
     /// Replaces separate certificate + receipt tracking. A block is complete once
     /// all its waves have been independently finalized by this validator.
-    received_waves: HashMap<Hash, Arc<FinalizedWave>>,
+    received_waves: BTreeMap<Hash, Arc<FinalizedWave>>,
 
     /// Set of wave_id hashes we're still waiting for.
     missing_wave_hashes: HashSet<Hash>,
@@ -67,7 +67,7 @@ impl PendingBlock {
             header,
             received_transactions: HashMap::with_capacity(total_tx_count),
             missing_transaction_hashes,
-            received_waves: HashMap::with_capacity(manifest.cert_hashes.len()),
+            received_waves: BTreeMap::new(),
             missing_wave_hashes,
             received_provisions: HashMap::with_capacity(manifest.provision_hashes.len()),
             missing_provision_hashes,
@@ -96,7 +96,7 @@ impl PendingBlock {
             header: block.header.clone(),
             received_transactions: HashMap::new(),
             missing_transaction_hashes: HashSet::new(),
-            received_waves: HashMap::new(),
+            received_waves: BTreeMap::new(),
             missing_wave_hashes: HashSet::new(),
             received_provisions: HashMap::with_capacity(manifest.provision_hashes.len()),
             missing_provision_hashes,
