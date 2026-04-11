@@ -13,7 +13,7 @@ use sbor::prelude::BasicSbor;
 /// The aggregated verkle proof is stored once at the response level,
 /// not per-provision.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
-pub struct GetProvisionsResponse {
+pub struct GetProvisionResponse {
     /// The provisions for the requested block and target shard.
     ///
     /// - `Some(provisions)` — successfully built provisions (may be empty if no
@@ -29,7 +29,7 @@ pub struct GetProvisionsResponse {
     pub proof: Option<VerkleInclusionProof>,
 }
 
-impl NetworkMessage for GetProvisionsResponse {
+impl NetworkMessage for GetProvisionResponse {
     fn message_type_id() -> &'static str {
         "provision.response"
     }
@@ -45,25 +45,25 @@ mod tests {
 
     #[test]
     fn test_sbor_roundtrip_empty() {
-        let response = GetProvisionsResponse {
+        let response = GetProvisionResponse {
             provisions: Some(vec![]),
             proof: None,
         };
 
         let encoded = sbor::basic_encode(&response).unwrap();
-        let decoded: GetProvisionsResponse = sbor::basic_decode(&encoded).unwrap();
+        let decoded: GetProvisionResponse = sbor::basic_decode(&encoded).unwrap();
         assert_eq!(response, decoded);
     }
 
     #[test]
     fn test_sbor_roundtrip_unavailable() {
-        let response = GetProvisionsResponse {
+        let response = GetProvisionResponse {
             provisions: None,
             proof: None,
         };
 
         let encoded = sbor::basic_encode(&response).unwrap();
-        let decoded: GetProvisionsResponse = sbor::basic_decode(&encoded).unwrap();
+        let decoded: GetProvisionResponse = sbor::basic_decode(&encoded).unwrap();
         assert_eq!(response, decoded);
     }
 }

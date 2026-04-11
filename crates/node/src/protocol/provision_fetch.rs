@@ -2,7 +2,7 @@
 //!
 //! Pure synchronous state machine for cross-shard provision fetching with
 //! per-peer rotation. Sits between the `ProvisionCoordinator`'s
-//! `FetchProvisionsRemote` action and the actual `network.request()` call,
+//! `FetchProvisionRemote` action and the actual `network.request()` call,
 //! rotating through available peers on failure before giving up.
 //!
 //! # Usage
@@ -11,11 +11,11 @@
 //! Runner ──► ProvisionFetchProtocol::handle(Input) ──► Vec<Output>
 //! ```
 
-use hyperscale_messages::request::GetProvisionsRequest;
-use hyperscale_messages::response::GetProvisionsResponse;
+use hyperscale_messages::request::GetProvisionRequest;
+use hyperscale_messages::response::GetProvisionResponse;
 use hyperscale_metrics as metrics;
 use hyperscale_storage::{ChainReader, SubstateStore};
-use hyperscale_types::{BlockHeight, ProvisionBatch, ShardGroupId, StateProvision, ValidatorId};
+use hyperscale_types::{BlockHeight, Provision, ShardGroupId, StateProvision, ValidatorId};
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
@@ -53,11 +53,11 @@ pub enum ProvisionFetchInput {
         peers: Vec<ValidatorId>,
         preferred_peer: ValidatorId,
     },
-    /// Provisions were successfully received for a request.
+    /// Provision were successfully received for a request.
     Received {
         source_shard: ShardGroupId,
         block_height: BlockHeight,
-        batch: ProvisionBatch,
+        batch: Provision,
     },
     /// A fetch attempt failed (network error or peer returned None).
     Failed {
@@ -84,7 +84,7 @@ pub enum ProvisionFetchOutput {
         peer: ValidatorId,
     },
     /// Deliver fetched provisions to the state machine.
-    Deliver { batch: ProvisionBatch },
+    Deliver { batch: Provision },
 }
 
 /// State for a single pending provision fetch.
@@ -253,7 +253,7 @@ impl ProvisionFetchProtocol {
         &mut self,
         source_shard: ShardGroupId,
         block_height: BlockHeight,
-        batch: ProvisionBatch,
+        batch: Provision,
     ) -> Vec<ProvisionFetchOutput> {
         let key = (source_shard, block_height);
         if self.pending.remove(&key).is_some() {
@@ -269,7 +269,7 @@ impl ProvisionFetchProtocol {
             trace!(
                 source_shard = source_shard.0,
                 block_height = block_height.0,
-                "Provisions received for unknown fetch"
+                "Provision received for unknown fetch"
             );
             vec![]
         }
@@ -398,8 +398,8 @@ pub fn serve_provision_request(
     storage: &(impl ChainReader + SubstateStore),
     local_shard: ShardGroupId,
     num_shards: u64,
-    req: GetProvisionsRequest,
-) -> GetProvisionsResponse {
+    req: GetProvisionRequest,
+) -> GetProvisionResponse {
     let (block, _qc) = match storage.get_block(req.block_height) {
         Some(pair) => pair,
         None => {
@@ -407,7 +407,7 @@ pub fn serve_provision_request(
                 block_height = req.block_height.0,
                 "Provision request: block not found"
             );
-            return GetProvisionsResponse {
+            return GetProvisionResponse {
                 provisions: None,
                 proof: None,
             };
@@ -460,7 +460,7 @@ pub fn serve_provision_request(
                         block_height = req.block_height.0,
                         jvt_version, "Provision request: historical JVT version unavailable"
                     );
-                    return GetProvisionsResponse {
+                    return GetProvisionResponse {
                         provisions: None,
                         proof: None,
                     };
@@ -473,7 +473,7 @@ pub fn serve_provision_request(
     }
 
     if per_tx.is_empty() {
-        return GetProvisionsResponse {
+        return GetProvisionResponse {
             provisions: Some(vec![]),
             proof: None,
         };
@@ -489,7 +489,7 @@ pub fn serve_provision_request(
                 block_height = req.block_height.0,
                 "Fallback provision: batched proof generation failed (version unavailable)"
             );
-            return GetProvisionsResponse {
+            return GetProvisionResponse {
                 provisions: None,
                 proof: None,
             };
@@ -509,7 +509,7 @@ pub fn serve_provision_request(
         });
     }
 
-    GetProvisionsResponse {
+    GetProvisionResponse {
         provisions: Some(provisions),
         proof: Some((*proof).clone()),
     }
@@ -686,7 +686,7 @@ mod tests {
         let outputs = protocol.handle(ProvisionFetchInput::Received {
             source_shard: shard(1),
             block_height: height(10),
-            batch: ProvisionBatch::dummy(shard(1), height(10)),
+            batch: Provision::dummy(shard(1), height(10)),
         });
 
         assert_eq!(outputs.len(), 1);
@@ -767,7 +767,7 @@ mod tests {
         let outputs = protocol.handle(ProvisionFetchInput::Received {
             source_shard: shard(99),
             block_height: height(999),
-            batch: ProvisionBatch::dummy(shard(99), height(999)),
+            batch: Provision::dummy(shard(99), height(999)),
         });
         assert!(outputs.is_empty());
     }
@@ -945,7 +945,7 @@ mod tests {
         protocol.handle(ProvisionFetchInput::Received {
             source_shard: shard(1),
             block_height: height(10),
-            batch: ProvisionBatch::dummy(shard(1), height(10)),
+            batch: Provision::dummy(shard(1), height(10)),
         });
         assert!(!protocol.is_shard_saturated(shard(1)));
 

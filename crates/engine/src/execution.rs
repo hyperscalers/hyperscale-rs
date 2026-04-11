@@ -198,7 +198,7 @@ fn convert_log_level(level: &radix_engine_interface::types::Level) -> LogLevel {
 /// ```
 pub struct ProvisionedSnapshot<'a, S> {
     base: &'a S,
-    /// Provisions keyed by full storage key.
+    /// Provision keyed by full storage key.
     /// Value is None for deletions, Some(bytes) for sets.
     provisions: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
 }
@@ -315,7 +315,7 @@ impl<S: SubstateDatabase> SubstateDatabase for ProvisionedSnapshot<'_, S> {
 
 /// Iterator that merges base storage entries with provision overrides.
 ///
-/// Both inputs must be sorted by sort key. Provisions take precedence.
+/// Both inputs must be sorted by sort key. Provision take precedence.
 struct MergedPartitionIterator<'a> {
     base: std::iter::Peekable<Box<dyn Iterator<Item = (DbSortKey, Vec<u8>)> + 'a>>,
     provisions: std::iter::Peekable<std::vec::IntoIter<(DbSortKey, Option<Vec<u8>>)>>,

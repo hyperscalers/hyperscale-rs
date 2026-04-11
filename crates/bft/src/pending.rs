@@ -3,7 +3,7 @@
 //! Tracks blocks being assembled from headers + gossiped transactions + finalized waves.
 
 use hyperscale_types::{
-    Block, BlockHeader, BlockManifest, FinalizedWave, Hash, ProvisionBatch, RoutableTransaction,
+    Block, BlockHeader, BlockManifest, FinalizedWave, Hash, Provision, RoutableTransaction,
     WaveCertificate,
 };
 use std::collections::{HashMap, HashSet};
@@ -44,7 +44,7 @@ pub struct PendingBlock {
     missing_wave_hashes: HashSet<Hash>,
 
     /// Received provision batches keyed by batch hash.
-    received_provisions: HashMap<Hash, Arc<ProvisionBatch>>,
+    received_provisions: HashMap<Hash, Arc<Provision>>,
 
     /// Set of provision batch hashes we're still waiting for.
     missing_provision_hashes: HashSet<Hash>,
@@ -61,7 +61,7 @@ impl PendingBlock {
             manifest.tx_hashes.iter().copied().collect();
         let missing_wave_hashes: HashSet<Hash> = manifest.cert_hashes.iter().copied().collect();
         let missing_provision_hashes: HashSet<Hash> =
-            manifest.provision_batch_hashes.iter().copied().collect();
+            manifest.provision_hashes.iter().copied().collect();
 
         Self {
             header,
@@ -69,7 +69,7 @@ impl PendingBlock {
             missing_transaction_hashes,
             received_waves: HashMap::with_capacity(manifest.cert_hashes.len()),
             missing_wave_hashes,
-            received_provisions: HashMap::with_capacity(manifest.provision_batch_hashes.len()),
+            received_provisions: HashMap::with_capacity(manifest.provision_hashes.len()),
             missing_provision_hashes,
             manifest,
             constructed_block: None,
@@ -82,23 +82,23 @@ impl PendingBlock {
     pub fn from_complete_block(
         block: &Block,
         finalized_waves: Vec<Arc<FinalizedWave>>,
-        provision_batches: Vec<Arc<ProvisionBatch>>,
+        provision_batches: Vec<Arc<Provision>>,
     ) -> Self {
         let mut manifest = BlockManifest::from_block(block);
-        // Set provision_batch_hashes from actual batches (from_block can't compute
+        // Set provision_hashes from actual batches (from_block can't compute
         // these since Block doesn't carry provision data — it's ephemeral).
         let mut batch_hashes: Vec<Hash> = provision_batches.iter().map(|b| b.hash()).collect();
         batch_hashes.sort();
-        manifest.provision_batch_hashes = batch_hashes;
+        manifest.provision_hashes = batch_hashes;
         let missing_provision_hashes: HashSet<Hash> =
-            manifest.provision_batch_hashes.iter().copied().collect();
+            manifest.provision_hashes.iter().copied().collect();
         let mut pending = Self {
             header: block.header.clone(),
             received_transactions: HashMap::new(),
             missing_transaction_hashes: HashSet::new(),
             received_waves: HashMap::new(),
             missing_wave_hashes: HashSet::new(),
-            received_provisions: HashMap::with_capacity(manifest.provision_batch_hashes.len()),
+            received_provisions: HashMap::with_capacity(manifest.provision_hashes.len()),
             missing_provision_hashes,
             manifest,
             constructed_block: None,
@@ -187,7 +187,7 @@ impl PendingBlock {
     /// Add a received provision batch.
     ///
     /// Returns true if this provision was needed, false if duplicate or not in this block.
-    pub fn add_provision(&mut self, batch: Arc<ProvisionBatch>) -> bool {
+    pub fn add_provision(&mut self, batch: Arc<Provision>) -> bool {
         let hash = batch.hash();
         if self.missing_provision_hashes.remove(&hash) {
             self.received_provisions.insert(hash, batch);
@@ -197,19 +197,12 @@ impl PendingBlock {
         }
     }
 
-    /// Get the number of missing provision batch hashes.
-    #[allow(dead_code)]
-    pub fn missing_provision_count(&self) -> usize {
-        self.missing_provision_hashes.len()
-    }
-
     /// Get the missing provision batch hashes as a Vec.
     pub fn missing_provisions(&self) -> Vec<Hash> {
         self.missing_provision_hashes.iter().copied().collect()
     }
 
     /// Check if this pending block needs a specific provision batch.
-    #[allow(dead_code)]
     pub fn needs_provision(&self, batch_hash: &Hash) -> bool {
         self.missing_provision_hashes.contains(batch_hash)
     }
@@ -220,7 +213,7 @@ impl PendingBlock {
     }
 
     /// Get all received provision batches.
-    pub fn provision_batches(&self) -> Vec<Arc<ProvisionBatch>> {
+    pub fn provision_batches(&self) -> Vec<Arc<Provision>> {
         self.received_provisions.values().cloned().collect()
     }
 
@@ -315,7 +308,7 @@ mod tests {
             transaction_root: Hash::ZERO,
             certificate_root: Hash::ZERO,
             local_receipt_root: Hash::ZERO,
-            provisions_root: Hash::ZERO,
+            provision_root: Hash::ZERO,
             waves: vec![],
         }
     }

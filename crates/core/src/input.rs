@@ -3,7 +3,7 @@
 use crate::ProtocolEvent;
 use hyperscale_types::{
     Block, BlockHeight, Bls12381G1PublicKey, Bls12381G2Signature, CommittedBlockHeader,
-    ExecutionCertificate, Hash, LocalReceiptEntry, ProvisionBatch, QuorumCertificate,
+    ExecutionCertificate, Hash, LocalReceiptEntry, Provision, QuorumCertificate,
     RoutableTransaction, ShardGroupId, ValidatorId,
 };
 use std::sync::Arc;
@@ -76,13 +76,13 @@ pub enum NodeInput {
     },
 
     /// Local provision batches received from a fetch request.
-    LocalProvisionsReceived {
+    LocalProvisionReceived {
         block_hash: Hash,
-        batches: Vec<Arc<ProvisionBatch>>,
+        batches: Vec<Arc<Provision>>,
     },
 
     /// Local provision fetch failed.
-    LocalProvisionsFetchFailed { block_hash: Hash, hashes: Vec<Hash> },
+    LocalProvisionFetchFailed { block_hash: Hash, hashes: Vec<Hash> },
 
     /// Transaction validated by the validation pipeline.
     TransactionValidated {
@@ -111,20 +111,20 @@ pub enum NodeInput {
         sender_signature: Bls12381G2Signature,
     },
 
-    /// Provisions built by the execution pool, ready for network broadcast.
+    /// Provision built by the execution pool, ready for network broadcast.
     ///
-    /// Returned from delegated `FetchAndBroadcastProvisions` action.
-    /// The I/O loop sends one `StateProvisionsNotification` per target shard,
+    /// Returned from delegated `FetchAndBroadcastProvision` action.
+    /// The I/O loop sends one `StateProvisionNotification` per target shard,
     /// targeted to the specific recipients embedded in each batch tuple.
-    ProvisionsReady {
+    ProvisionReady {
         /// (target_shard, provision_batch, recipients) per target shard.
-        batches: Vec<(ShardGroupId, ProvisionBatch, Vec<ValidatorId>)>,
+        batches: Vec<(ShardGroupId, Provision, Vec<ValidatorId>)>,
         /// Block timestamp from the source block (for wire format).
         block_timestamp: u64,
     },
 
-    /// Provisions successfully received from a provision fetch request.
-    ProvisionFetchReceived { batch: ProvisionBatch },
+    /// Provision successfully received from a provision fetch request.
+    ProvisionFetchReceived { batch: Provision },
 
     /// A provision fetch request failed (network error or peer returned None).
     ProvisionFetchFailed {
@@ -180,7 +180,7 @@ impl NodeInput {
                 | ProtocolEvent::TransactionGossipReceived { .. }
                 | ProtocolEvent::GlobalBlockReceived { .. }
                 | ProtocolEvent::GlobalBlockVoteReceived { .. }
-                | ProtocolEvent::StateProvisionsReceived { .. } => EventPriority::Network,
+                | ProtocolEvent::StateProvisionReceived { .. } => EventPriority::Network,
 
                 // Fetch delivery events are processed callbacks from the fetch
                 // protocol, not raw network messages (analogous to
@@ -197,15 +197,15 @@ impl NodeInput {
             NodeInput::TransactionValidationsFailed { .. } => EventPriority::Internal,
             NodeInput::CommittedHeaderValidated { .. } => EventPriority::Internal,
             NodeInput::CommittedBlockGossipReceived { .. } => EventPriority::Network,
-            NodeInput::ProvisionsReady { .. } => EventPriority::Internal,
+            NodeInput::ProvisionReady { .. } => EventPriority::Internal,
             NodeInput::ProvisionFetchReceived { .. } => EventPriority::Internal,
             NodeInput::ProvisionFetchFailed { .. } => EventPriority::Internal,
             NodeInput::ExecCertFetchReceived { .. } => EventPriority::Internal,
             NodeInput::ExecCertFetchFailed { .. } => EventPriority::Internal,
             NodeInput::HeaderFetchReceived { .. } => EventPriority::Internal,
             NodeInput::HeaderFetchFailed { .. } => EventPriority::Internal,
-            NodeInput::LocalProvisionsReceived { .. } => EventPriority::Internal,
-            NodeInput::LocalProvisionsFetchFailed { .. } => EventPriority::Internal,
+            NodeInput::LocalProvisionReceived { .. } => EventPriority::Internal,
+            NodeInput::LocalProvisionFetchFailed { .. } => EventPriority::Internal,
         }
     }
 
@@ -238,15 +238,15 @@ impl NodeInput {
             NodeInput::TransactionValidationsFailed { .. } => "TransactionValidationsFailed",
             NodeInput::CommittedHeaderValidated { .. } => "CommittedHeaderValidated",
             NodeInput::CommittedBlockGossipReceived { .. } => "CommittedBlockGossipReceived",
-            NodeInput::ProvisionsReady { .. } => "ProvisionsReady",
+            NodeInput::ProvisionReady { .. } => "ProvisionReady",
             NodeInput::ProvisionFetchReceived { .. } => "ProvisionFetchReceived",
             NodeInput::ProvisionFetchFailed { .. } => "ProvisionFetchFailed",
             NodeInput::ExecCertFetchReceived { .. } => "ExecCertFetchReceived",
             NodeInput::ExecCertFetchFailed { .. } => "ExecCertFetchFailed",
             NodeInput::HeaderFetchReceived { .. } => "HeaderFetchReceived",
             NodeInput::HeaderFetchFailed { .. } => "HeaderFetchFailed",
-            NodeInput::LocalProvisionsReceived { .. } => "LocalProvisionsReceived",
-            NodeInput::LocalProvisionsFetchFailed { .. } => "LocalProvisionsFetchFailed",
+            NodeInput::LocalProvisionReceived { .. } => "LocalProvisionReceived",
+            NodeInput::LocalProvisionFetchFailed { .. } => "LocalProvisionFetchFailed",
         }
     }
 }

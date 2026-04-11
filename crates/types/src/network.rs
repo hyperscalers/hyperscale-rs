@@ -47,7 +47,7 @@ pub enum MessagePriority {
     /// Cross-shard coordination messages.
     ///
     /// Includes:
-    /// - `StateProvisionsNotification` - cross-shard state delivery with merkle proofs
+    /// - `StateProvisionNotification` - cross-shard state delivery with merkle proofs
     /// - `ExecutionVotesNotification` - execution votes
     /// - `ExecutionCertificatesNotification` - execution certificates
     ///

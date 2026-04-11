@@ -59,7 +59,7 @@ where
             // ═══════════════════════════════════════════════════════════
             Action::Continuation(pe) => {
                 // Populate provision cache for request handler serving.
-                if let ProtocolEvent::ProvisionsVerified { ref batch } = pe {
+                if let ProtocolEvent::ProvisionVerified { ref batch } = pe {
                     self.provision_cache.insert(batch.hash(), Arc::clone(batch));
                 }
                 let _ = self.event_sender.send(NodeInput::Protocol(pe));
@@ -199,14 +199,14 @@ where
             | Action::VerifyRemoteHeaderQc { .. }
             | Action::VerifyStateRoot { .. }
             | Action::VerifyTransactionRoot { .. }
-            | Action::VerifyProvisionsRoot { .. }
+            | Action::VerifyProvisionRoot { .. }
             | Action::VerifyCertificateRoot { .. }
             | Action::VerifyLocalReceiptRoot { .. }
             | Action::BuildProposal { .. }
-            | Action::VerifyProvisionBatch { .. }
+            | Action::VerifyProvision { .. }
             | Action::ExecuteTransactions { .. }
             | Action::ExecuteCrossShardTransactions { .. }
-            | Action::FetchAndBroadcastProvisions { .. } => {
+            | Action::FetchAndBroadcastProvision { .. } => {
                 self.dispatch_delegated_action(action);
             }
 
@@ -286,9 +286,9 @@ where
             // ═══════════════════════════════════════════════════════════
             Action::StartSync { .. }
             | Action::FetchTransactions { .. }
-            | Action::FetchProvisionsLocal { .. }
+            | Action::FetchProvisionLocal { .. }
             | Action::CancelFetch { .. }
-            | Action::FetchProvisionsRemote { .. }
+            | Action::FetchProvisionRemote { .. }
             | Action::RequestMissingExecutionCert { .. }
             | Action::CancelProvisionFetch { .. }
             | Action::RequestMissingCommittedBlockHeader { .. } => {
@@ -757,7 +757,7 @@ where
                 self.process_transaction_fetch_outputs(outputs);
                 self.update_fetch_tick_timer();
             }
-            Action::FetchProvisionsLocal {
+            Action::FetchProvisionLocal {
                 block_hash,
                 proposer,
                 batch_hashes,
@@ -780,7 +780,7 @@ where
                 self.local_provision_fetch_protocol
                     .handle(LocalProvisionFetchInput::CancelFetch { block_hash });
             }
-            Action::FetchProvisionsRemote {
+            Action::FetchProvisionRemote {
                 source_shard,
                 block_height,
                 proposer,
@@ -788,7 +788,7 @@ where
             } => {
                 debug_assert!(
                     !peers.is_empty(),
-                    "FetchProvisionsRemote for shard {} height {} has no peers — \
+                    "FetchProvisionRemote for shard {} height {} has no peers — \
                      was the action enriched by NodeStateMachine?",
                     source_shard.0,
                     block_height.0,
@@ -939,7 +939,7 @@ where
             DispatchPool::ConsensusCrypto => self.dispatch.spawn_consensus_crypto(spawn_fn),
             DispatchPool::Crypto => self.dispatch.spawn_crypto(spawn_fn),
             DispatchPool::Execution => self.dispatch.spawn_execution(spawn_fn),
-            DispatchPool::Provisions => self.dispatch.spawn_provisions(spawn_fn),
+            DispatchPool::Provision => self.dispatch.spawn_provisions(spawn_fn),
         }
     }
 

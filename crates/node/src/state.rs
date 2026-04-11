@@ -9,7 +9,7 @@ use hyperscale_remote_headers::RemoteHeaderCoordinator;
 use hyperscale_topology::TopologyState;
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, BlockManifest, Bls12381G1PrivateKey, FinalizedWave, Hash,
-    ProvisionBatch, QuorumCertificate, ReadyTransactions, RoutableTransaction, ShardGroupId,
+    Provision, QuorumCertificate, ReadyTransactions, RoutableTransaction, ShardGroupId,
     TopologySnapshot,
 };
 use std::sync::Arc;
@@ -73,7 +73,7 @@ impl std::fmt::Debug for NodeStateMachine {
 struct ProposalInputs {
     ready_txs: ReadyTransactions,
     finalized_waves: Vec<Arc<FinalizedWave>>,
-    provision_batches: Vec<Arc<ProvisionBatch>>,
+    provision_batches: Vec<Arc<Provision>>,
 }
 
 impl NodeStateMachine {
@@ -334,7 +334,7 @@ impl NodeStateMachine {
         block_hash: Hash,
         height: u64,
         block: Block,
-        provision_batches: Vec<Arc<ProvisionBatch>>,
+        provision_batches: Vec<Arc<Provision>>,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
         let block_height = BlockHeight(height);
@@ -393,7 +393,7 @@ impl NodeStateMachine {
                 .on_block_committed(self.topology.snapshot()),
         );
 
-        // Apply committed provisions deterministically. Provisions flow with the
+        // Apply committed provisions deterministically. Provision flow with the
         // block through the commit pipeline — all validators process the same
         // batches at the same height, making target_vote_height deterministic.
         let committed_provision_hashes: Vec<Hash> =
@@ -576,7 +576,7 @@ impl StateMachine for NodeStateMachine {
                     &committed_header.header.waves,
                 );
 
-                // Provisions: register expected provisions and join with buffered batches.
+                // Provision: register expected provisions and join with buffered batches.
                 self.provisions
                     .on_verified_remote_header(topology, committed_header)
             }
@@ -618,11 +618,11 @@ impl StateMachine for NodeStateMachine {
                 self.on_block_committed(block_hash, height, block, provision_batches)
             }
 
-            // ── Provisions ───────────────────────────────────────────────
-            ProtocolEvent::StateProvisionsReceived { batch } => self
+            // ── Provision ───────────────────────────────────────────────
+            ProtocolEvent::StateProvisionReceived { batch } => self
                 .provisions
                 .on_state_provisions_received(self.topology.snapshot(), batch),
-            ProtocolEvent::StateProvisionsVerified {
+            ProtocolEvent::StateProvisionVerified {
                 batch,
                 committed_header,
                 valid,
@@ -632,7 +632,7 @@ impl StateMachine for NodeStateMachine {
                 committed_header,
                 valid,
             ),
-            ProtocolEvent::ProvisionsVerified { batch } => self
+            ProtocolEvent::ProvisionVerified { batch } => self
                 .bft
                 .check_pending_blocks_for_provision(self.topology.snapshot(), &batch),
 

@@ -48,7 +48,7 @@ pub type NodeIndex = u32;
 use hyperscale_types::{
     block_header_message, committed_block_header_message, Block, BlockHeader, BlockHeight,
     BlockManifest, BlockVote, Bls12381G1PrivateKey, Bls12381G1PublicKey, CommittedBlockHeader,
-    FinalizedWave, Hash, ProvisionBatch, QuorumCertificate, ReadyTransactions, RoutableTransaction,
+    FinalizedWave, Hash, Provision, QuorumCertificate, ReadyTransactions, RoutableTransaction,
     ShardGroupId, TopologySnapshot, ValidatorId, VotePower,
 };
 use std::collections::HashMap;
@@ -819,7 +819,7 @@ impl BftState {
         topology: &TopologySnapshot,
         ready_txs: &ReadyTransactions,
         finalized_waves: Vec<Arc<FinalizedWave>>,
-        provision_batches: Vec<Arc<ProvisionBatch>>,
+        provision_batches: Vec<Arc<Provision>>,
     ) -> Vec<Action> {
         // The next height to propose is one above the highest certified block,
         // NOT one above the committed block. This allows the chain to grow
@@ -1073,7 +1073,7 @@ impl BftState {
             transaction_root: Hash::ZERO, // Fallback blocks have no transactions
             certificate_root: Hash::ZERO, // No certificates
             local_receipt_root: Hash::ZERO,
-            provisions_root: Hash::ZERO,
+            provision_root: Hash::ZERO,
             waves: vec![], // Empty - fallback blocks have no transactions
         };
 
@@ -1186,7 +1186,7 @@ impl BftState {
             transaction_root: Hash::ZERO, // Sync blocks have no transactions
             certificate_root: Hash::ZERO, // No certificates
             local_receipt_root: Hash::ZERO,
-            provisions_root: Hash::ZERO,
+            provision_root: Hash::ZERO,
             waves: vec![], // Empty - sync blocks have no transactions
         };
 
@@ -1363,7 +1363,7 @@ impl BftState {
         manifest: BlockManifest,
         lookup_tx: impl Fn(&Hash) -> Option<Arc<RoutableTransaction>>,
         lookup_finalized_wave: impl Fn(&Hash) -> Option<Arc<FinalizedWave>>,
-        lookup_provision: impl Fn(&Hash) -> Option<Arc<ProvisionBatch>>,
+        lookup_provision: impl Fn(&Hash) -> Option<Arc<Provision>>,
     ) -> Vec<Action> {
         let block_hash = header.hash();
         let height = header.height.0;
@@ -1496,7 +1496,7 @@ impl BftState {
                 pending.add_finalized_wave(fw);
             }
         }
-        for batch_hash in pending.manifest().provision_batch_hashes.clone() {
+        for batch_hash in pending.manifest().provision_hashes.clone() {
             if let Some(batch) = lookup_provision(&batch_hash) {
                 pending.add_provision(batch);
             }
@@ -1920,10 +1920,10 @@ impl BftState {
                 }
 
                 // Verify provisions root if block has provisions.
-                if self.verification.needs_provisions_root_verification(&block) {
+                if self.verification.needs_provision_root_verification(&block) {
                     if let Some(pending) = self.pending_blocks.get(&block_hash) {
                         verification_actions.extend(
-                            self.verification.initiate_provisions_root_verification(
+                            self.verification.initiate_provision_root_verification(
                                 block_hash,
                                 &block,
                                 pending.manifest(),
@@ -2519,9 +2519,9 @@ impl BftState {
             VerificationKind::LocalReceiptRoot => self
                 .verification
                 .on_local_receipt_root_verified(block_hash, valid),
-            VerificationKind::ProvisionsRoot => self
+            VerificationKind::ProvisionRoot => self
                 .verification
-                .on_provisions_root_verified(block_hash, valid),
+                .on_provision_root_verified(block_hash, valid),
         };
 
         if !pipeline_ok {
@@ -2578,7 +2578,7 @@ impl BftState {
         block: Arc<Block>,
         block_hash: Hash,
         finalized_waves: Vec<Arc<FinalizedWave>>,
-        provision_batches: Vec<Arc<ProvisionBatch>>,
+        provision_batches: Vec<Arc<Provision>>,
     ) -> Vec<Action> {
         // Take the pending proposal - if it doesn't match (height, round), something is wrong
         let Some(pending) = self.pending_proposal.take() else {
@@ -2783,7 +2783,7 @@ impl BftState {
         qc: QuorumCertificate,
         ready_txs: &ReadyTransactions,
         finalized_waves: Vec<Arc<FinalizedWave>>,
-        provision_batches: Vec<Arc<ProvisionBatch>>,
+        provision_batches: Vec<Arc<Provision>>,
     ) -> Vec<Action> {
         let height = qc.height.0;
 
@@ -3774,7 +3774,7 @@ impl BftState {
                     still_missing = missing_provisions.len(),
                     "Re-requesting remaining missing provisions"
                 );
-                actions.push(Action::FetchProvisionsLocal {
+                actions.push(Action::FetchProvisionLocal {
                     block_hash,
                     proposer,
                     batch_hashes: missing_provisions,
@@ -3942,7 +3942,7 @@ impl BftState {
     pub fn check_pending_blocks_for_provision(
         &mut self,
         topology: &TopologySnapshot,
-        batch: &Arc<ProvisionBatch>,
+        batch: &Arc<Provision>,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
         let batch_hash = batch.hash();
@@ -4151,7 +4151,7 @@ impl BftState {
                     age_ms = age.as_millis(),
                     "Fetch timeout reached, requesting missing provisions"
                 );
-                actions.push(Action::FetchProvisionsLocal {
+                actions.push(Action::FetchProvisionLocal {
                     block_hash: *block_hash,
                     proposer,
                     batch_hashes: missing_provisions,
@@ -4473,7 +4473,7 @@ impl BftState {
                     }
                 }
                 // Provision batch hashes are always on the manifest (never on Block).
-                for batch_hash in &manifest.provision_batch_hashes {
+                for batch_hash in &manifest.provision_hashes {
                     provision_hashes.insert(*batch_hash);
                 }
                 current_hash = pending.header().parent_hash;
@@ -4648,7 +4648,7 @@ mod tests {
             transaction_root: Hash::ZERO,
             certificate_root: Hash::ZERO,
             local_receipt_root: Hash::ZERO,
-            provisions_root: Hash::ZERO,
+            provision_root: Hash::ZERO,
             waves: vec![],
         }
     }
@@ -4672,7 +4672,7 @@ mod tests {
             transaction_root: Hash::ZERO,
             certificate_root: Hash::ZERO,
             local_receipt_root: Hash::ZERO,
-            provisions_root: Hash::ZERO,
+            provision_root: Hash::ZERO,
             waves: vec![],
         };
 
@@ -4770,7 +4770,7 @@ mod tests {
             transaction_root: Hash::ZERO,
             certificate_root: Hash::ZERO,
             local_receipt_root: Hash::ZERO,
-            provisions_root: Hash::ZERO,
+            provision_root: Hash::ZERO,
             waves: vec![],
         };
 
@@ -4794,7 +4794,7 @@ mod tests {
             transaction_root: Hash::ZERO,
             certificate_root: Hash::ZERO,
             local_receipt_root: Hash::ZERO,
-            provisions_root: Hash::ZERO,
+            provision_root: Hash::ZERO,
             waves: vec![],
         };
         assert!(
@@ -4874,7 +4874,7 @@ mod tests {
             transaction_root: Hash::ZERO,
             certificate_root: Hash::ZERO,
             local_receipt_root: Hash::ZERO,
-            provisions_root: Hash::ZERO,
+            provision_root: Hash::ZERO,
             waves: vec![],
         };
 
@@ -4961,7 +4961,7 @@ mod tests {
             transaction_root: Hash::ZERO,
             certificate_root: Hash::ZERO,
             local_receipt_root: Hash::ZERO,
-            provisions_root: Hash::ZERO,
+            provision_root: Hash::ZERO,
             waves: vec![],
         };
 
@@ -5052,7 +5052,7 @@ mod tests {
             transaction_root: Hash::ZERO,
             certificate_root: Hash::ZERO,
             local_receipt_root: Hash::ZERO,
-            provisions_root: Hash::ZERO,
+            provision_root: Hash::ZERO,
             waves: vec![],
         };
 
@@ -5130,7 +5130,7 @@ mod tests {
             transaction_root: Hash::ZERO,
             certificate_root: Hash::ZERO,
             local_receipt_root: Hash::ZERO,
-            provisions_root: Hash::ZERO,
+            provision_root: Hash::ZERO,
             waves: vec![],
         };
 
@@ -5396,7 +5396,7 @@ mod tests {
             transaction_root: Hash::ZERO,
             certificate_root: Hash::ZERO,
             local_receipt_root: Hash::ZERO,
-            provisions_root: Hash::ZERO,
+            provision_root: Hash::ZERO,
             waves: vec![],
         };
         let block_a_hash = block_a.hash();
@@ -5414,7 +5414,7 @@ mod tests {
             transaction_root: Hash::ZERO,
             certificate_root: Hash::ZERO,
             local_receipt_root: Hash::ZERO,
-            provisions_root: Hash::ZERO,
+            provision_root: Hash::ZERO,
             waves: vec![],
         };
         let block_b_hash = block_b.hash();
@@ -5461,7 +5461,7 @@ mod tests {
             transaction_root: Hash::ZERO,
             certificate_root: Hash::ZERO,
             local_receipt_root: Hash::ZERO,
-            provisions_root: Hash::ZERO,
+            provision_root: Hash::ZERO,
             waves: vec![],
         };
         let block_hash = block.hash();
@@ -5502,7 +5502,7 @@ mod tests {
                 transaction_root: Hash::ZERO,
                 certificate_root: Hash::ZERO,
                 local_receipt_root: Hash::ZERO,
-                provisions_root: Hash::ZERO,
+                provision_root: Hash::ZERO,
                 waves: vec![],
             };
             state.try_vote_on_block(&topology, block.hash(), height, 0);
@@ -5802,7 +5802,7 @@ mod tests {
             transaction_root: Hash::ZERO,
             certificate_root: Hash::ZERO,
             local_receipt_root: Hash::ZERO,
-            provisions_root: Hash::ZERO,
+            provision_root: Hash::ZERO,
             waves: vec![],
         };
         let original_block_hash = original_header.hash();
@@ -5881,7 +5881,7 @@ mod tests {
             transaction_root: Hash::ZERO,
             certificate_root: Hash::ZERO,
             local_receipt_root: Hash::ZERO,
-            provisions_root: Hash::ZERO,
+            provision_root: Hash::ZERO,
             waves: vec![],
         };
 
@@ -5919,7 +5919,7 @@ mod tests {
             transaction_root: Hash::ZERO,
             certificate_root: Hash::ZERO,
             local_receipt_root: Hash::ZERO,
-            provisions_root: Hash::ZERO,
+            provision_root: Hash::ZERO,
             waves: vec![],
         };
 
@@ -6252,7 +6252,7 @@ mod tests {
             transaction_root: Hash::ZERO,
             certificate_root: Hash::ZERO,
             local_receipt_root: Hash::ZERO,
-            provisions_root: Hash::ZERO,
+            provision_root: Hash::ZERO,
             waves: vec![],
         };
         let original_block_hash = original_header.hash();
@@ -6503,7 +6503,7 @@ mod tests {
             transaction_root: Hash::ZERO,
             certificate_root: Hash::ZERO,
             local_receipt_root: Hash::ZERO,
-            provisions_root: Hash::ZERO,
+            provision_root: Hash::ZERO,
             waves: vec![],
         };
         let block_hash_r1 = header_round1.hash();
@@ -6521,7 +6521,7 @@ mod tests {
             transaction_root: Hash::ZERO,
             certificate_root: Hash::ZERO,
             local_receipt_root: Hash::ZERO,
-            provisions_root: Hash::ZERO,
+            provision_root: Hash::ZERO,
             waves: vec![],
         };
         let block_hash_r2 = header_round2.hash();
@@ -6539,7 +6539,7 @@ mod tests {
             transaction_root: Hash::ZERO,
             certificate_root: Hash::ZERO,
             local_receipt_root: Hash::ZERO,
-            provisions_root: Hash::ZERO,
+            provision_root: Hash::ZERO,
             waves: vec![],
         };
         let block_hash_r3 = header_round3.hash();
@@ -6558,7 +6558,7 @@ mod tests {
             transaction_root: Hash::ZERO,
             certificate_root: Hash::ZERO,
             local_receipt_root: Hash::ZERO,
-            provisions_root: Hash::ZERO,
+            provision_root: Hash::ZERO,
             waves: vec![],
         };
         let block_hash_h6 = header_height6.hash();
@@ -6785,7 +6785,7 @@ mod tests {
             transaction_root: Hash::ZERO,
             certificate_root: Hash::ZERO,
             local_receipt_root: Hash::ZERO,
-            provisions_root: Hash::ZERO,
+            provision_root: Hash::ZERO,
             waves: vec![],
         };
 
@@ -6823,7 +6823,7 @@ mod tests {
             transaction_root: Hash::ZERO,
             certificate_root: Hash::ZERO,
             local_receipt_root: Hash::ZERO,
-            provisions_root: Hash::ZERO,
+            provision_root: Hash::ZERO,
             waves: vec![],
         };
 
@@ -7756,7 +7756,7 @@ mod tests {
                 transaction_root: Hash::ZERO,
                 certificate_root: Hash::ZERO,
                 local_receipt_root: Hash::ZERO,
-                provisions_root: Hash::ZERO,
+                provision_root: Hash::ZERO,
                 waves: vec![],
             },
             transactions: vec![],
@@ -8341,7 +8341,7 @@ mod tests {
                 transaction_root: Hash::ZERO,
                 certificate_root: Hash::ZERO,
                 local_receipt_root: Hash::ZERO,
-                provisions_root: Hash::ZERO,
+                provision_root: Hash::ZERO,
                 waves: vec![],
             },
             transactions: vec![tx1.clone()],
@@ -8367,7 +8367,7 @@ mod tests {
                 transaction_root: Hash::ZERO,
                 certificate_root: Hash::ZERO,
                 local_receipt_root: Hash::ZERO,
-                provisions_root: Hash::ZERO,
+                provision_root: Hash::ZERO,
                 waves: vec![],
             },
             transactions: txs,
@@ -8401,7 +8401,7 @@ mod tests {
                 transaction_root: Hash::ZERO,
                 certificate_root: Hash::ZERO,
                 local_receipt_root: Hash::ZERO,
-                provisions_root: Hash::ZERO,
+                provision_root: Hash::ZERO,
                 waves: vec![],
             },
             transactions: vec![tx1.clone()],
@@ -8426,7 +8426,7 @@ mod tests {
                 transaction_root: Hash::ZERO,
                 certificate_root: Hash::ZERO,
                 local_receipt_root: Hash::ZERO,
-                provisions_root: Hash::ZERO,
+                provision_root: Hash::ZERO,
                 waves: vec![],
             },
             transactions: vec![tx1],

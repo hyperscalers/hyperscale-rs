@@ -13,4 +13,4 @@ pub use block_header::BlockHeaderNotification;
 pub use block_vote::BlockVoteNotification;
 pub use execution_certificates::ExecutionCertificatesNotification;
 pub use execution_votes::ExecutionVotesNotification;
-pub use state_provisions::StateProvisionsNotification;
+pub use state_provisions::StateProvisionNotification;

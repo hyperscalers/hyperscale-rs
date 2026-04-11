@@ -110,12 +110,12 @@ pub(crate) struct VerificationPipeline {
     /// Blocks with verified local receipt roots.
     verified_local_receipt_roots: HashSet<Hash>,
 
-    // === Provisions root verification ===
+    // === Provision root verification ===
     /// Blocks where provisions root verification is currently in-flight.
-    provisions_root_verifications_in_flight: HashSet<Hash>,
+    provision_root_verifications_in_flight: HashSet<Hash>,
 
     /// Blocks with verified provisions roots.
-    verified_provisions_roots: HashSet<Hash>,
+    verified_provision_roots: HashSet<Hash>,
 }
 
 impl VerificationPipeline {
@@ -135,8 +135,8 @@ impl VerificationPipeline {
             verified_certificate_roots: HashSet::new(),
             local_receipt_root_verifications_in_flight: HashSet::new(),
             verified_local_receipt_roots: HashSet::new(),
-            provisions_root_verifications_in_flight: HashSet::new(),
-            verified_provisions_roots: HashSet::new(),
+            provision_root_verifications_in_flight: HashSet::new(),
+            verified_provision_roots: HashSet::new(),
         }
     }
 
@@ -216,17 +216,17 @@ impl VerificationPipeline {
             self.verified_local_receipt_roots.contains(&block_hash)
         };
 
-        let provisions_root_ok = if block.header.provisions_root == Hash::ZERO {
+        let provision_root_ok = if block.header.provision_root == Hash::ZERO {
             true
         } else {
-            self.verified_provisions_roots.contains(&block_hash)
+            self.verified_provision_roots.contains(&block_hash)
         };
 
         state_root_ok
             && transaction_root_ok
             && certificate_root_ok
             && local_receipt_root_ok
-            && provisions_root_ok
+            && provision_root_ok
     }
 
     /// Log why a block's verification is incomplete. Called on view change
@@ -291,12 +291,12 @@ impl VerificationPipeline {
             "NOT_STARTED"
         };
 
-        let provisions_root_status = if block.header.provisions_root == Hash::ZERO {
+        let provision_root_status = if block.header.provision_root == Hash::ZERO {
             "skipped(no_provisions)"
-        } else if self.verified_provisions_roots.contains(&block_hash) {
+        } else if self.verified_provision_roots.contains(&block_hash) {
             "verified"
         } else if self
-            .provisions_root_verifications_in_flight
+            .provision_root_verifications_in_flight
             .contains(&block_hash)
         {
             "in_flight"
@@ -314,7 +314,7 @@ impl VerificationPipeline {
             tx_root = tx_root_status,
             certificate_root = certificate_root_status,
             local_receipt_root = local_receipt_root_status,
-            provisions_root = provisions_root_status,
+            provision_root = provision_root_status,
             "View change — block verification was incomplete"
         );
     }
@@ -606,19 +606,19 @@ impl VerificationPipeline {
         valid
     }
 
-    // ─── Provisions root ─────────────────────────────────────────────────
+    // ─── Provision root ─────────────────────────────────────────────────
 
     /// Check if a block needs provisions root verification before voting.
-    pub fn needs_provisions_root_verification(&self, block: &Block) -> bool {
-        if block.header.provisions_root == Hash::ZERO {
+    pub fn needs_provision_root_verification(&self, block: &Block) -> bool {
+        if block.header.provision_root == Hash::ZERO {
             return false;
         }
 
         let block_hash = block.hash();
 
-        if self.verified_provisions_roots.contains(&block_hash)
+        if self.verified_provision_roots.contains(&block_hash)
             || self
-                .provisions_root_verifications_in_flight
+                .provision_root_verifications_in_flight
                 .contains(&block_hash)
         {
             return false;
@@ -628,7 +628,7 @@ impl VerificationPipeline {
     }
 
     /// Initiate provisions root verification for a block.
-    pub fn initiate_provisions_root_verification(
+    pub fn initiate_provision_root_verification(
         &mut self,
         block_hash: Hash,
         block: &Block,
@@ -636,31 +636,31 @@ impl VerificationPipeline {
     ) -> Vec<Action> {
         debug!(
             block_hash = ?block_hash,
-            batch_count = manifest.provision_batch_hashes.len(),
-            expected_root = ?block.header.provisions_root,
+            batch_count = manifest.provision_hashes.len(),
+            expected_root = ?block.header.provision_root,
             "Initiating provisions root verification"
         );
 
-        self.provisions_root_verifications_in_flight
+        self.provision_root_verifications_in_flight
             .insert(block_hash);
 
-        vec![Action::VerifyProvisionsRoot {
+        vec![Action::VerifyProvisionRoot {
             block_hash,
-            expected_root: block.header.provisions_root,
-            batch_hashes: manifest.provision_batch_hashes.clone(),
+            expected_root: block.header.provision_root,
+            batch_hashes: manifest.provision_hashes.clone(),
         }]
     }
 
     /// Record a provisions root verification result.
-    pub fn on_provisions_root_verified(&mut self, block_hash: Hash, valid: bool) -> bool {
-        self.provisions_root_verifications_in_flight
+    pub fn on_provision_root_verified(&mut self, block_hash: Hash, valid: bool) -> bool {
+        self.provision_root_verifications_in_flight
             .remove(&block_hash);
 
         if valid {
-            self.verified_provisions_roots.insert(block_hash);
+            self.verified_provision_roots.insert(block_hash);
             debug!(
                 block_hash = ?block_hash,
-                "Provisions root verified successfully"
+                "Provision root verified successfully"
             );
         }
 
@@ -781,10 +781,10 @@ impl VerificationPipeline {
         self.verified_local_receipt_roots
             .retain(|hash| pending_blocks.contains_key(hash));
 
-        self.provisions_root_verifications_in_flight
+        self.provision_root_verifications_in_flight
             .retain(|hash| pending_blocks.contains_key(hash));
 
-        self.verified_provisions_roots
+        self.verified_provision_roots
             .retain(|hash| pending_blocks.contains_key(hash));
 
         // verified_qcs uses height-based retention (not pending_blocks membership)

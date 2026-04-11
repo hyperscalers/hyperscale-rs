@@ -13,5 +13,5 @@ pub use block::GetBlockResponse;
 pub use committed_header::GetCommittedBlockHeaderResponse;
 pub use execution_cert::GetExecutionCertsResponse;
 pub use local_provision::GetLocalProvisionsResponse;
-pub use provision::GetProvisionsResponse;
+pub use provision::GetProvisionResponse;
 pub use transaction::GetTransactionsResponse;

@@ -50,7 +50,7 @@ pub fn compute_local_receipt_root(receipts: &[ReceiptBundle]) -> Hash {
 /// Compute the provisions merkle root for a block.
 ///
 /// Each provision batch's hash becomes a leaf. Returns `Hash::ZERO` if empty.
-pub fn compute_provisions_root(batch_hashes: &[Hash]) -> Hash {
+pub fn compute_provision_root(batch_hashes: &[Hash]) -> Hash {
     if batch_hashes.is_empty() {
         return Hash::ZERO;
     }
@@ -142,7 +142,7 @@ pub struct BlockHeader {
     /// Commits to which remote-shard provisions are available at this height.
     /// Validators who voted for the BFT proposal have this data locally.
     /// `Hash::ZERO` when no provisions are included (single-shard or empty block).
-    pub provisions_root: Hash,
+    pub provision_root: Hash,
 
     /// Cross-shard execution waves in this block.
     ///
@@ -177,7 +177,7 @@ impl BlockHeader {
             transaction_root: Hash::ZERO,
             certificate_root: Hash::ZERO,
             local_receipt_root: Hash::ZERO,
-            provisions_root: Hash::ZERO,
+            provision_root: Hash::ZERO,
             waves: vec![],
         }
     }
@@ -423,7 +423,7 @@ pub struct BlockManifest {
 
     /// Hashes of provision batches included in this block.
     /// Used for provision data availability — validators fetch missing batches by hash.
-    pub provision_batch_hashes: Vec<Hash>,
+    pub provision_hashes: Vec<Hash>,
 }
 
 impl BlockManifest {
@@ -443,7 +443,7 @@ impl BlockManifest {
                 .iter()
                 .map(|c| c.wave_id.hash())
                 .collect(),
-            provision_batch_hashes: vec![],
+            provision_hashes: vec![],
         }
     }
 }
@@ -569,7 +569,7 @@ mod tests {
             transaction_root: Hash::ZERO,
             certificate_root: Hash::ZERO,
             local_receipt_root: Hash::ZERO,
-            provisions_root: Hash::ZERO,
+            provision_root: Hash::ZERO,
             waves: vec![],
         };
 

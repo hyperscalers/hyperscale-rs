@@ -66,7 +66,7 @@ pub use hash::{
 };
 pub use identifiers::{BlockHeight, NodeId, PartitionNumber, ShardGroupId, ValidatorId, VotePower};
 pub use network::{MessagePriority, NetworkMessage, Request, ShardMessage};
-pub use proofs::{ProvisionBatch, TxEntries, VerkleInclusionProof};
+pub use proofs::{Provision, TxEntries, VerkleInclusionProof};
 pub use signing::{
     block_header_message, block_vote_message, committed_block_header_message,
     exec_cert_batch_message, exec_vote_batch_message, exec_vote_message,
@@ -76,7 +76,7 @@ pub use signing::{
 };
 
 pub use block::{
-    compute_certificate_root, compute_local_receipt_root, compute_provisions_root,
+    compute_certificate_root, compute_local_receipt_root, compute_provision_root,
     compute_transaction_root, Block, BlockHeader, BlockManifest, BlockMetadata, BlockVote,
     CommittedBlockHeader,
 };

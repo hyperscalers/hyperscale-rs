@@ -1,6 +1,6 @@
 //! Local provision batch fetch response (intra-shard DA).
 
-use hyperscale_types::{MessagePriority, NetworkMessage, ProvisionBatch};
+use hyperscale_types::{MessagePriority, NetworkMessage, Provision};
 use sbor::prelude::BasicSbor;
 
 /// Response to a local provision batch fetch request.
@@ -10,11 +10,11 @@ use sbor::prelude::BasicSbor;
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct GetLocalProvisionsResponse {
     /// The requested provision batches that were found.
-    pub batches: Vec<ProvisionBatch>,
+    pub batches: Vec<Provision>,
 }
 
 impl GetLocalProvisionsResponse {
-    pub fn new(batches: Vec<ProvisionBatch>) -> Self {
+    pub fn new(batches: Vec<Provision>) -> Self {
         Self { batches }
     }
 

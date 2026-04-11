@@ -96,10 +96,10 @@ impl StateEntry {
 
 /// State provision from a source shard to a target shard.
 ///
-/// Only the block proposer sends these. Provisions are always transported
+/// Only the block proposer sends these. Provision are always transported
 /// in a batch (per block) alongside a single aggregated verkle proof that
 /// covers all entries across all provisions in that batch. The proof lives
-/// at the batch level (e.g. `StateProvisionsNotification`) to avoid
+/// at the batch level (e.g. `StateProvisionNotification`) to avoid
 /// duplicating it per provision during serialization.
 #[derive(Debug, Clone)]
 pub struct StateProvision {

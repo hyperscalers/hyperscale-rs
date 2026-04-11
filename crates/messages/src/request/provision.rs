@@ -1,6 +1,6 @@
 //! Provision fetch request for fallback recovery.
 
-use crate::response::GetProvisionsResponse;
+use crate::response::GetProvisionResponse;
 use hyperscale_types::{BlockHeight, MessagePriority, NetworkMessage, Request, ShardGroupId};
 use sbor::prelude::BasicSbor;
 
@@ -11,7 +11,7 @@ use sbor::prelude::BasicSbor;
 /// This is the fallback recovery mechanism for byzantine proposers that
 /// silently drop provisions.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
-pub struct GetProvisionsRequest {
+pub struct GetProvisionRequest {
     /// Height of the source block whose provisions are needed.
     pub block_height: BlockHeight,
     /// The shard requesting provisions (so the source knows which
@@ -19,7 +19,7 @@ pub struct GetProvisionsRequest {
     pub target_shard: ShardGroupId,
 }
 
-impl NetworkMessage for GetProvisionsRequest {
+impl NetworkMessage for GetProvisionRequest {
     fn message_type_id() -> &'static str {
         "provision.request"
     }
@@ -29,8 +29,8 @@ impl NetworkMessage for GetProvisionsRequest {
     }
 }
 
-impl Request for GetProvisionsRequest {
-    type Response = GetProvisionsResponse;
+impl Request for GetProvisionRequest {
+    type Response = GetProvisionResponse;
 }
 
 #[cfg(test)]
@@ -39,13 +39,13 @@ mod tests {
 
     #[test]
     fn test_sbor_roundtrip() {
-        let request = GetProvisionsRequest {
+        let request = GetProvisionRequest {
             block_height: BlockHeight(42),
             target_shard: ShardGroupId(1),
         };
 
         let encoded = sbor::basic_encode(&request).unwrap();
-        let decoded: GetProvisionsRequest = sbor::basic_decode(&encoded).unwrap();
+        let decoded: GetProvisionRequest = sbor::basic_decode(&encoded).unwrap();
         assert_eq!(request, decoded);
     }
 }
