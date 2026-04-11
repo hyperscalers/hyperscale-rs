@@ -329,10 +329,6 @@ impl NodeStateMachine {
     }
 
     /// Handle block committed — notify all subsystems in the correct order.
-    ///
-    /// Order invariants:
-    /// 1. Process abort intents BEFORE passing new TXs to execution
-    /// 2. Process CrossShardTxRegistered continuations BEFORE other exec actions
     fn on_block_committed(
         &mut self,
         block_hash: Hash,
@@ -373,16 +369,14 @@ impl NodeStateMachine {
 
         // Pass all transactions from block to execution (no need for mempool lookup).
         let all_txs = block.transactions.clone();
-        let exec_output = self.execution.on_block_committed(
+        actions.extend(self.execution.on_block_committed(
             self.topology.snapshot(),
             block_hash,
             height,
             block.header.timestamp,
             block.header.proposer,
             all_txs,
-        );
-
-        actions.extend(exec_output.actions);
+        ));
 
         // Also let mempool handle it (marks transactions as committed, processes deferrals/aborts)
         actions.extend(

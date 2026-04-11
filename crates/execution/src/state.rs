@@ -66,31 +66,6 @@ pub struct CompletionData {
     pub tx_outcomes: Vec<hyperscale_types::TxOutcome>,
 }
 
-/// A cross-shard transaction registration for provision tracking.
-///
-/// Returned by [`ExecutionState::on_block_committed`] as structured data
-/// instead of `Action::Continuation` events.
-#[derive(Debug, Clone)]
-pub struct CrossShardRegistration {
-    /// Hash of the cross-shard transaction.
-    pub tx_hash: Hash,
-    /// Remote shards this transaction needs provisions from.
-    pub required_shards: BTreeSet<ShardGroupId>,
-    /// Block height when the transaction was committed.
-    pub committed_height: BlockHeight,
-}
-
-/// Output from [`ExecutionState::on_block_committed`].
-///
-/// Separates actions from cross-shard registrations so the orchestrator
-/// can process registrations before forwarding actions.
-pub struct BlockCommittedOutput {
-    /// Actions to dispatch (execution, provisioning, etc.).
-    pub actions: Vec<Action>,
-    /// Cross-shard registrations for the provision coordinator.
-    pub cross_shard_registrations: Vec<CrossShardRegistration>,
-}
-
 // FinalizedWave is defined in hyperscale_types.
 use hyperscale_types::FinalizedWave;
 
@@ -476,39 +451,6 @@ impl ExecutionState {
         };
 
         accumulator.record_result(tx_hash, outcome);
-    }
-
-    /// Record a conflict into the appropriate execution accumulator.
-    ///
-    /// Conflicts are consensus-committed (deterministic) and ALWAYS override
-    /// async execution results. This ensures all validators converge to the same
-    /// global_receipt_root regardless of execution timing.
-    ///
-    /// Updates the accumulator silently. Votes are NOT emitted here — they are
-    /// emitted during the block commit wave scan (`scan_complete_waves`).
-    ///
-    /// A missing wave assignment means the transaction already reached terminal
-    /// state (TC committed) — the conflict is a harmless late arrival.
-    pub fn record_conflict(&mut self, tx_hash: Hash, committed_at_height: u64) {
-        let Some(wave_key) = self.wave_assignments.get(&tx_hash).cloned() else {
-            tracing::debug!(
-                tx_hash = %tx_hash,
-                committed_height = self.committed_height,
-                "Conflict: no wave assignment (already cleaned up)"
-            );
-            return;
-        };
-
-        let Some(accumulator) = self.accumulators.get_mut(&wave_key) else {
-            tracing::debug!(
-                tx_hash = %tx_hash,
-                wave = %wave_key,
-                "Conflict: no accumulator for wave"
-            );
-            return;
-        };
-
-        accumulator.record_abort(tx_hash, committed_at_height);
     }
 
     /// Scan all waves and return completion data for any that can emit a vote.
@@ -1285,9 +1227,8 @@ impl ExecutionState {
         block_timestamp: u64,
         proposer: ValidatorId,
         transactions: Vec<Arc<RoutableTransaction>>,
-    ) -> BlockCommittedOutput {
+    ) -> Vec<Action> {
         let mut actions = Vec::new();
-        let mut cross_shard_registrations = Vec::new();
 
         // ── Provision broadcasting (proposer only) ─────────────────────
         //
@@ -1329,10 +1270,7 @@ impl ExecutionState {
         self.prune_execution_state();
 
         if transactions.is_empty() {
-            return BlockCommittedOutput {
-                actions,
-                cross_shard_registrations,
-            };
+            return actions;
         }
 
         tracing::debug!(
@@ -1354,11 +1292,6 @@ impl ExecutionState {
             .into_iter()
             .partition(|tx| topology.is_single_shard_transaction(tx));
 
-        // Handle single-shard transactions — set up tracking and execute
-        for tx in &single_shard {
-            actions.extend(self.start_single_shard_execution(topology, tx.clone()));
-        }
-
         if !single_shard.is_empty() {
             actions.push(Action::ExecuteTransactions {
                 block_hash,
@@ -1375,7 +1308,6 @@ impl ExecutionState {
                 tx,
                 height,
                 &mut cross_shard_requests,
-                &mut cross_shard_registrations,
             ));
         }
         if !cross_shard_requests.is_empty() {
@@ -1398,46 +1330,19 @@ impl ExecutionState {
             }
         }
 
-        BlockCommittedOutput {
-            actions,
-            cross_shard_registrations,
-        }
-    }
-
-    /// Start single-shard execution tracking.
-    ///
-    /// Sets up certificate tracking for finalization. Voting is handled by
-    /// the wave path — no per-tx vote tracking needed.
-    fn start_single_shard_execution(
-        &mut self,
-        topology: &TopologySnapshot,
-        tx: Arc<RoutableTransaction>,
-    ) -> Vec<Action> {
-        let actions = Vec::new();
-        let tx_hash = tx.hash();
-        let local_shard = topology.local_shard();
-
-        tracing::debug!(
-            tx_hash = ?tx_hash,
-            shard = local_shard.0,
-            "Starting single-shard execution tracking"
-        );
-
-        // Early EC replay is handled in on_block_committed after all trackers are created.
         actions
     }
 
-    /// Start cross-shard execution (Phase 1: State Provisioning).
+    /// Start cross-shard execution tracking.
     ///
-    /// Provision broadcasting is handled at the block level via
-    /// `FetchAndBroadcastProvisions` — this method only sets up tracking.
+    /// Registers the tx for conflict detection, checks if provisions are
+    /// already available, and either starts execution or buffers for later.
     fn start_cross_shard_execution(
         &mut self,
         topology: &TopologySnapshot,
         tx: Arc<RoutableTransaction>,
         height: u64,
         cross_shard_requests: &mut Vec<CrossShardExecutionRequest>,
-        registrations: &mut Vec<CrossShardRegistration>,
     ) -> Vec<Action> {
         let actions = Vec::new();
         let tx_hash = tx.hash();
@@ -1493,13 +1398,6 @@ impl ExecutionState {
                     "Reverse conflict detected — provisions committed before local tx"
                 );
             }
-
-            // Register with provision coordinator (via structured output).
-            registrations.push(CrossShardRegistration {
-                tx_hash,
-                required_shards: remote_shards.clone(),
-                committed_height: BlockHeight(height),
-            });
 
             // Check if all required provisions already arrived (before tx block commit).
             let received = self
@@ -2062,16 +1960,14 @@ mod tests {
         let block_hash = Hash::from_bytes(b"block1");
 
         // Block committed with transaction
-        let actions = state
-            .on_block_committed(
-                &topology,
-                block_hash,
-                1,
-                1000,
-                ValidatorId(0),
-                vec![Arc::new(tx.clone())],
-            )
-            .actions;
+        let actions = state.on_block_committed(
+            &topology,
+            block_hash,
+            1,
+            1000,
+            ValidatorId(0),
+            vec![Arc::new(tx.clone())],
+        );
 
         // Should request execution (single-shard path) and set up wave tracking
         assert!(!actions.is_empty());
