@@ -38,6 +38,13 @@ pub struct LivelockConfig {
     pub execution_timeout_blocks: u64,
     /// Maximum retry attempts before permanent abort.
     pub max_retries: u32,
+    /// How long to wait for an inclusion proof fetch before giving up.
+    ///
+    /// When a cycle is detected, we request an inclusion proof from the
+    /// remote shard. If the proof never arrives (remote shard down, network
+    /// partition), the `pending_proof_fetches` entry is removed after this
+    /// timeout so the cycle can be re-detected on the next provision.
+    pub proof_fetch_timeout: Duration,
 }
 
 impl Default for LivelockConfig {
@@ -46,6 +53,7 @@ impl Default for LivelockConfig {
             tombstone_ttl: Duration::from_secs(30),
             execution_timeout_blocks: 30,
             max_retries: 3,
+            proof_fetch_timeout: Duration::from_secs(60),
         }
     }
 }
@@ -75,8 +83,10 @@ pub struct LivelockState {
     tombstones: HashMap<Hash, Duration>,
 
     /// Loser tx hashes for which we've requested inclusion proofs but
-    /// haven't received them yet.
-    pending_proof_fetches: HashSet<Hash>,
+    /// haven't received them yet. Maps tx_hash → expiry time.
+    /// Entries that exceed `proof_fetch_timeout` are removed so the
+    /// cycle can be re-detected on the next provision.
+    pending_proof_fetches: HashMap<Hash, Duration>,
 
     /// Conflicts ready to be included in next block proposal.
     /// Kept until they appear in a committed block.
@@ -121,7 +131,7 @@ impl LivelockState {
             committed_tracker: CommittedCrossShardTracker::new(),
             provision_tracker: ProvisionTracker::new(),
             tombstones: HashMap::new(),
-            pending_proof_fetches: HashSet::new(),
+            pending_proof_fetches: HashMap::new(),
             pending_conflicts: Vec::new(),
             pending_conflict_hashes: HashSet::new(),
             now: Duration::ZERO,
@@ -372,9 +382,10 @@ impl LivelockState {
                 // Don't queue the conflict yet — we need the inclusion proof first.
                 // Track that we have an in-flight fetch for this loser.
                 if !self.pending_conflict_hashes.contains(&loser)
-                    && !self.pending_proof_fetches.contains(&loser)
+                    && !self.pending_proof_fetches.contains_key(&loser)
                 {
-                    self.pending_proof_fetches.insert(loser);
+                    let expiry = self.now + self.config.proof_fetch_timeout;
+                    self.pending_proof_fetches.insert(loser, expiry);
                     outputs.push(LivelockOutput::FetchInclusionProof {
                         source_shard,
                         source_block_height,
@@ -407,7 +418,16 @@ impl LivelockState {
         source_shard: ShardGroupId,
         source_block_height: BlockHeight,
     ) {
-        self.pending_proof_fetches.remove(&loser_tx_hash);
+        // Guard: ignore stale proof arrivals whose fetch already expired.
+        // queue_conflict also deduplicates via pending_conflict_hashes,
+        // but this early return avoids unnecessary processing and logging.
+        if self.pending_proof_fetches.remove(&loser_tx_hash).is_none() {
+            trace!(
+                loser = %loser_tx_hash,
+                "Ignoring inclusion proof: no pending fetch (expired or already received)"
+            );
+            return;
+        }
         self.queue_conflict(
             loser_tx_hash,
             winner_tx_hash,
@@ -578,21 +598,35 @@ impl LivelockState {
         trace!(tx = %tx_hash, "Certificate committed - added tombstone");
     }
 
-    /// Cleanup expired tombstones.
+    /// Cleanup expired tombstones and stale proof fetches.
     ///
     /// Called periodically by the cleanup timer.
     pub fn cleanup(&mut self) {
         let now = self.now;
-        let before = self.tombstones.len();
+        let before_ts = self.tombstones.len();
 
         self.tombstones.retain(|_, expiry| *expiry > now);
 
-        let removed = before - self.tombstones.len();
-        if removed > 0 {
+        let removed_ts = before_ts - self.tombstones.len();
+        if removed_ts > 0 {
             debug!(
-                removed,
+                removed_ts,
                 remaining = self.tombstones.len(),
                 "Cleaned up expired tombstones"
+            );
+        }
+
+        // Clean up stale proof fetches. If the remote shard never responds,
+        // removing the entry allows the cycle to be re-detected on the next
+        // provision arrival (since the pending_proof_fetches guard is cleared).
+        let before_pf = self.pending_proof_fetches.len();
+        self.pending_proof_fetches.retain(|_, expiry| *expiry > now);
+        let removed_pf = before_pf - self.pending_proof_fetches.len();
+        if removed_pf > 0 {
+            debug!(
+                removed_pf,
+                remaining = self.pending_proof_fetches.len(),
+                "Cleaned up stale proof fetches"
             );
         }
     }
@@ -1094,6 +1128,167 @@ mod tests {
         assert!(
             outputs.is_empty(),
             "Late provision after conflict should be rejected by tombstone"
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Proof Fetch Timeout Tests
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_stale_proof_fetch_cleaned_up() {
+        let mut state = LivelockState::with_config(LivelockConfig {
+            proof_fetch_timeout: Duration::from_secs(60),
+            ..LivelockConfig::default()
+        });
+
+        // Detect a cycle at time=10s to trigger a proof fetch.
+        state.set_time(Duration::from_secs(10));
+        let local_tx = hash_with_prefix(0xFF);
+        let remote_tx = hash_with_prefix(0x00);
+        let node = make_test_node_id(42);
+
+        let needs =
+            make_remote_state_needs(&[ShardGroupId(1)], vec![(ShardGroupId(1), vec![node])]);
+        state.committed_tracker.add(local_tx, needs);
+
+        let entries = make_test_entries_with_nodes(vec![node]);
+        let outputs =
+            state.on_provision_accepted(remote_tx, ShardGroupId(1), BlockHeight(1), &entries);
+        assert_eq!(outputs.len(), 1, "Should request inclusion proof");
+        assert_eq!(state.pending_proof_fetches.len(), 1);
+
+        // Advance time past the timeout (10 + 60 = 70s expiry).
+        state.set_time(Duration::from_secs(80));
+        state.cleanup();
+
+        assert_eq!(
+            state.pending_proof_fetches.len(),
+            0,
+            "Stale proof fetch should be cleaned up after timeout"
+        );
+    }
+
+    #[test]
+    fn test_fresh_proof_fetch_kept() {
+        let mut state = LivelockState::with_config(LivelockConfig {
+            proof_fetch_timeout: Duration::from_secs(60),
+            ..LivelockConfig::default()
+        });
+
+        state.set_time(Duration::from_secs(10));
+        let local_tx = hash_with_prefix(0xFF);
+        let remote_tx = hash_with_prefix(0x00);
+        let node = make_test_node_id(42);
+
+        let needs =
+            make_remote_state_needs(&[ShardGroupId(1)], vec![(ShardGroupId(1), vec![node])]);
+        state.committed_tracker.add(local_tx, needs);
+
+        let entries = make_test_entries_with_nodes(vec![node]);
+        state.on_provision_accepted(remote_tx, ShardGroupId(1), BlockHeight(1), &entries);
+        assert_eq!(state.pending_proof_fetches.len(), 1);
+
+        // Advance time but NOT past the timeout (10 + 60 = 70s expiry, now=50).
+        state.set_time(Duration::from_secs(50));
+        state.cleanup();
+
+        assert_eq!(
+            state.pending_proof_fetches.len(),
+            1,
+            "Fresh proof fetch should not be cleaned up"
+        );
+    }
+
+    #[test]
+    fn test_stale_proof_fetch_allows_redetection() {
+        let mut state = LivelockState::with_config(LivelockConfig {
+            proof_fetch_timeout: Duration::from_secs(60),
+            ..LivelockConfig::default()
+        });
+
+        // Detect cycle at time=10s.
+        state.set_time(Duration::from_secs(10));
+        let local_tx = hash_with_prefix(0xFF);
+        let remote_tx = hash_with_prefix(0x00);
+        let node = make_test_node_id(42);
+
+        let needs =
+            make_remote_state_needs(&[ShardGroupId(1)], vec![(ShardGroupId(1), vec![node])]);
+        state.committed_tracker.add(local_tx, needs);
+
+        let entries = make_test_entries_with_nodes(vec![node]);
+        state.on_provision_accepted(remote_tx, ShardGroupId(1), BlockHeight(1), &entries);
+        assert_eq!(state.pending_proof_fetches.len(), 1);
+
+        // Expire the proof fetch.
+        state.set_time(Duration::from_secs(80));
+        state.cleanup();
+        assert_eq!(state.pending_proof_fetches.len(), 0);
+
+        // Re-detect the cycle via a new provision from a different shard height.
+        // The provision_tracker already has (remote_tx, shard1), so we need a
+        // different source shard to trigger a new cycle check. Re-add the
+        // committed tracker entry since it was consumed.
+        let needs2 =
+            make_remote_state_needs(&[ShardGroupId(2)], vec![(ShardGroupId(2), vec![node])]);
+        state.committed_tracker.add(local_tx, needs2);
+
+        let entries2 = make_test_entries_with_nodes(vec![node]);
+        let outputs =
+            state.on_provision_accepted(remote_tx, ShardGroupId(2), BlockHeight(5), &entries2);
+
+        assert_eq!(
+            outputs.len(),
+            1,
+            "Cycle should be re-detected after stale proof fetch expires"
+        );
+        assert_eq!(
+            state.pending_proof_fetches.len(),
+            1,
+            "New proof fetch should be tracked"
+        );
+    }
+
+    #[test]
+    fn test_stale_proof_ignored_after_expiry() {
+        // Scenario: fetch requested → fetch expires → proof arrives late.
+        // The late proof should be ignored (no abort intent queued).
+        let mut state = LivelockState::with_config(LivelockConfig {
+            proof_fetch_timeout: Duration::from_secs(60),
+            ..LivelockConfig::default()
+        });
+
+        state.set_time(Duration::from_secs(10));
+        let local_tx = hash_with_prefix(0xFF);
+        let remote_tx = hash_with_prefix(0x00);
+        let node = make_test_node_id(42);
+
+        let needs =
+            make_remote_state_needs(&[ShardGroupId(1)], vec![(ShardGroupId(1), vec![node])]);
+        state.committed_tracker.add(local_tx, needs);
+
+        let entries = make_test_entries_with_nodes(vec![node]);
+        state.on_provision_accepted(remote_tx, ShardGroupId(1), BlockHeight(1), &entries);
+        assert_eq!(state.pending_proof_fetches.len(), 1);
+
+        // Expire the fetch.
+        state.set_time(Duration::from_secs(80));
+        state.cleanup();
+        assert_eq!(state.pending_proof_fetches.len(), 0);
+
+        // Late proof arrives — should be ignored.
+        state.on_inclusion_proof_received(
+            remote_tx,
+            local_tx,
+            dummy_proof(),
+            ShardGroupId(1),
+            BlockHeight(1),
+        );
+
+        assert!(
+            state.get_pending_conflicts().is_empty(),
+            "Late proof after expiry should not queue an abort intent"
         );
     }
 }
