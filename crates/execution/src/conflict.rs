@@ -280,18 +280,17 @@ mod tests {
         height: u64,
         txs: Vec<(Hash, Vec<NodeId>)>,
     ) -> ProvisionBatch {
-        ProvisionBatch {
+        ProvisionBatch::new(
             source_shard,
-            block_height: BlockHeight(height),
-            proof: VerkleInclusionProof::dummy(),
-            transactions: txs
-                .into_iter()
+            BlockHeight(height),
+            VerkleInclusionProof::dummy(),
+            txs.into_iter()
                 .map(|(hash, nodes)| TxEntries {
                     tx_hash: hash,
                     entries: nodes.into_iter().map(make_entry).collect(),
                 })
                 .collect(),
-        }
+        )
     }
 
     /// Determine which hash is higher/lower (blake3 output order).

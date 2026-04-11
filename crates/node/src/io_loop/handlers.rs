@@ -383,12 +383,12 @@ where
                             entries: (*p.entries).clone(),
                         })
                         .collect();
-                    let batch = hyperscale_types::ProvisionBatch {
+                    let batch = hyperscale_types::ProvisionBatch::new(
                         source_shard,
                         block_height,
                         proof,
                         transactions,
-                    };
+                    );
                     let _ = tx.send(NodeInput::Protocol(
                         ProtocolEvent::StateProvisionsReceived { batch },
                     ));
