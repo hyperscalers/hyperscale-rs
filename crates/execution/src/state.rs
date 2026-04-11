@@ -48,6 +48,13 @@ use crate::accumulator::ExecutionAccumulator;
 use crate::conflict::ConflictDetector;
 use crate::trackers::{VoteTracker, WaveCertificateTracker};
 
+/// Maximum number of unique validators whose votes are buffered per wave
+/// before the accumulator is created. The buffer is keyed by `ValidatorId`
+/// to prevent Byzantine vote stuffing (one validator cannot displace others).
+/// In an honest network this cannot exceed the committee size (typically
+/// 100–300). The generous cap provides headroom while bounding memory.
+const MAX_EARLY_VOTES_PER_WAVE: usize = 500;
+
 /// Data returned when a wave is ready for voting.
 ///
 /// The state machine produces this; the io_loop uses it to sign the execution vote
@@ -171,7 +178,9 @@ pub struct ExecutionState {
     early_execution_results: HashMap<Hash, ExecutionOutcome>,
 
     /// Execution votes that arrived before tracking started.
-    early_votes: HashMap<WaveId, Vec<ExecutionVote>>,
+    /// Keyed by (WaveId, ValidatorId) to prevent Byzantine vote stuffing —
+    /// an attacker cannot fill the buffer with duplicate votes from one validator.
+    early_votes: HashMap<WaveId, HashMap<ValidatorId, ExecutionVote>>,
 
     /// ECs that arrived before the tx's wave assignment was created.
     /// Keyed by tx_hash for efficient lookup when wave assignments are created.
@@ -408,7 +417,7 @@ impl ExecutionState {
                     count = early_votes.len(),
                     "Replaying early execution votes"
                 );
-                votes_to_replay.extend(early_votes);
+                votes_to_replay.extend(early_votes.into_values());
             }
         }
 
@@ -811,8 +820,18 @@ impl ExecutionState {
         // Check if we're tracking this wave (all validators have VoteTrackers)
         if !self.vote_trackers.contains_key(&wave_id) {
             // No accumulator yet — block hasn't committed. Buffer for replay.
+            // Keyed by ValidatorId to prevent Byzantine vote stuffing.
             if !self.accumulators.contains_key(&wave_id) {
-                self.early_votes.entry(wave_id).or_default().push(vote);
+                let buf = self.early_votes.entry(wave_id).or_default();
+                if buf.len() >= MAX_EARLY_VOTES_PER_WAVE {
+                    tracing::debug!(
+                        wave = %vote.wave_id,
+                        limit = MAX_EARLY_VOTES_PER_WAVE,
+                        "Dropping early vote: per-wave buffer full"
+                    );
+                    return vec![];
+                }
+                buf.insert(validator_id, vote);
                 return vec![];
             }
             // Accumulator exists but no VoteTracker — wave already completed
@@ -1808,7 +1827,8 @@ impl ExecutionState {
             }
             // No accumulator yet — keep unless stale.
             votes
-                .first()
+                .values()
+                .next()
                 .map(|v| v.block_height > ev_cutoff)
                 .unwrap_or(false)
         });
@@ -2166,6 +2186,119 @@ mod tests {
             results,
             vec![true, false],
             "Second signature should fail verification"
+        );
+    }
+
+    // ========================================================================
+    // Early Votes Per-Wave Bounds Tests
+    // ========================================================================
+
+    /// Create a dummy ExecutionVote for testing with a specific validator ID.
+    fn make_test_vote(wave_id: &WaveId, validator: u64) -> ExecutionVote {
+        use hyperscale_types::zero_bls_signature;
+        ExecutionVote {
+            block_hash: Hash::from_bytes(b"block"),
+            block_height: 10,
+            vote_height: 10,
+            wave_id: wave_id.clone(),
+            shard_group_id: ShardGroupId(0),
+            global_receipt_root: Hash::ZERO,
+            tx_count: 1,
+            tx_outcomes: vec![],
+            validator: ValidatorId(validator),
+            signature: zero_bls_signature(),
+        }
+    }
+
+    #[test]
+    fn test_early_votes_per_wave_cap() {
+        let mut state = make_test_state();
+        let topology = make_test_topology();
+        let wave_id = WaveId::new(ShardGroupId(0), 10, BTreeSet::new());
+
+        // Fill the early votes buffer to the cap.
+        for i in 0..MAX_EARLY_VOTES_PER_WAVE {
+            let vote = make_test_vote(&wave_id, i as u64 + 100);
+            state.on_execution_vote(&topology, vote);
+        }
+
+        assert_eq!(
+            state.early_votes.get(&wave_id).map(|v| v.len()),
+            Some(MAX_EARLY_VOTES_PER_WAVE),
+            "Buffer should be full at cap"
+        );
+
+        // One more vote should be dropped.
+        let overflow_vote = make_test_vote(&wave_id, 9999);
+        let actions = state.on_execution_vote(&topology, overflow_vote);
+        assert!(
+            actions.is_empty(),
+            "Overflow vote should be silently dropped"
+        );
+
+        assert_eq!(
+            state.early_votes.get(&wave_id).map(|v| v.len()),
+            Some(MAX_EARLY_VOTES_PER_WAVE),
+            "Buffer should not exceed cap"
+        );
+    }
+
+    #[test]
+    fn test_early_votes_cap_per_wave_independent() {
+        let mut state = make_test_state();
+        let topology = make_test_topology();
+        let wave_a = WaveId::new(ShardGroupId(0), 10, BTreeSet::new());
+        let wave_b = WaveId::new(ShardGroupId(1), 10, BTreeSet::new());
+
+        // Fill wave_a to cap.
+        for i in 0..MAX_EARLY_VOTES_PER_WAVE {
+            state.on_execution_vote(&topology, make_test_vote(&wave_a, i as u64 + 100));
+        }
+
+        // wave_b should still accept votes independently.
+        state.on_execution_vote(&topology, make_test_vote(&wave_b, 1));
+        assert_eq!(
+            state.early_votes.get(&wave_b).map(|v| v.len()),
+            Some(1),
+            "Different wave should have independent buffer"
+        );
+        assert_eq!(
+            state.early_votes.get(&wave_a).map(|v| v.len()),
+            Some(MAX_EARLY_VOTES_PER_WAVE),
+            "First wave should still be at cap"
+        );
+    }
+
+    #[test]
+    fn test_early_votes_byzantine_dedup() {
+        // A Byzantine validator sending many votes for the same wave should
+        // only occupy one slot in the buffer, not displace honest validators.
+        let mut state = make_test_state();
+        let topology = make_test_topology();
+        let wave_id = WaveId::new(ShardGroupId(0), 10, BTreeSet::new());
+
+        let byzantine_vid = 999;
+
+        // Byzantine validator sends 100 duplicate votes.
+        for _ in 0..100 {
+            state.on_execution_vote(&topology, make_test_vote(&wave_id, byzantine_vid));
+        }
+
+        // Buffer should only have 1 entry (deduped by ValidatorId).
+        assert_eq!(
+            state.early_votes.get(&wave_id).map(|v| v.len()),
+            Some(1),
+            "Duplicate votes from same validator should be deduped"
+        );
+
+        // Honest validators can still add their votes.
+        for i in 0..10u64 {
+            state.on_execution_vote(&topology, make_test_vote(&wave_id, i + 100));
+        }
+        assert_eq!(
+            state.early_votes.get(&wave_id).map(|v| v.len()),
+            Some(11), // 1 byzantine + 10 honest
+            "Honest validators should not be displaced by Byzantine spam"
         );
     }
 }
