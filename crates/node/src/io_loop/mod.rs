@@ -1069,11 +1069,6 @@ where
             prov_pending_provisions: prov_mem.pending_provisions,
             prov_verified_batches: prov_mem.verified_batches,
             prov_expected_provisions: prov_mem.expected_provisions,
-            // Livelock (removed — zeroed for metric schema stability)
-            livelock_tombstones: 0,
-            livelock_pending_proof_fetches: 0,
-            livelock_pending_conflicts: 0,
-            livelock_tracked_txs: 0,
             // Storage
             jvt_node_cache_entries: self.storage.node_cache_len(),
             rocksdb_block_cache_usage_bytes: rocksdb_bc,

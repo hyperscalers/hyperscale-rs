@@ -3363,7 +3363,7 @@
       },
       "id": 106,
       "panels": [],
-      "title": "Livelock & Errors",
+      "title": "Cross-Shard & Errors",
       "type": "row"
     },
     {
@@ -3371,7 +3371,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Livelock detection metrics (summed across shards, divided to avoid double-counting)",
+      "description": "Cross-shard abort metrics (summed across shards, divided to avoid double-counting)",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -3449,21 +3449,12 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(hyperscale_livelock_deferred_transactions) / count(count by (shard) (up{job=\"hyperscale\"}))",
-          "legendFormat": "Deferred Txns",
+          "expr": "sum(rate(hyperscale_transactions_aborted_total[1m])) / count(count by (shard) (up{job=\"hyperscale\"}))",
+          "legendFormat": "Aborts/sec",
           "refId": "A"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "sum(rate(hyperscale_livelock_cycles_detected_total[1m])) / count(count by (shard) (up{job=\"hyperscale\"}))",
-          "legendFormat": "Cycles/sec",
-          "refId": "B"
         }
       ],
-      "title": "Livelock Detection",
+      "title": "Aborted Transactions",
       "type": "timeseries"
     },
     {
@@ -5141,7 +5132,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Livelock subsystem memory usage by collection",
+      "description": "Conflict detector memory usage (tracked txs and stored provisions)",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -5219,12 +5210,12 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "avg by (collection) (hyperscale_memory_livelock_collections)",
+          "expr": "avg by (collection) (hyperscale_memory_exec_collections{collection=~\"conflict_detector_.*\"})",
           "legendFormat": "{{collection}}",
           "refId": "A"
         }
       ],
-      "title": "Livelock Memory (avg)",
+      "title": "Conflict Detector Memory (avg)",
       "type": "timeseries"
     },
     {
