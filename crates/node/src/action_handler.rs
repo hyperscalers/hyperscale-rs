@@ -611,16 +611,19 @@ pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainRead
 /// Expands declared account NodeIds to include their owned vaults before
 /// fetching. The remote shard needs vault substates (balances) to execute
 /// transfers, not just the account's own substates.
+/// Per-tx fetched entries: (tx_hash, target_shards_with_nodes, state_entries).
+type FetchedTxEntries = (
+    Hash,
+    Vec<(ShardGroupId, Vec<hyperscale_types::NodeId>)>,
+    Arc<Vec<hyperscale_types::StateEntry>>,
+);
+
 fn fetch_entries_for_requests<S: ChainWriter + SubstateStore + ChainReader>(
     ctx: &ActionContext<'_, S>,
     requests: &[hyperscale_core::ProvisionRequest],
     source_shard: ShardGroupId,
     block_height: hyperscale_types::BlockHeight,
-) -> Vec<(
-    Hash,
-    Vec<ShardGroupId>,
-    Arc<Vec<hyperscale_types::StateEntry>>,
-)> {
+) -> Vec<FetchedTxEntries> {
     let mut per_tx = Vec::with_capacity(requests.len());
     for req in requests {
         // Expand account NodeIds to include owned vaults.
@@ -643,7 +646,7 @@ fn fetch_entries_for_requests<S: ChainWriter + SubstateStore + ChainReader>(
                     continue;
                 }
             };
-        per_tx.push((req.tx_hash, req.target_shards.clone(), Arc::new(entries)));
+        per_tx.push((req.tx_hash, req.targets.clone(), Arc::new(entries)));
     }
     per_tx
 }
@@ -651,11 +654,7 @@ fn fetch_entries_for_requests<S: ChainWriter + SubstateStore + ChainReader>(
 /// Group fetched entries by target shard and generate verkle proofs per shard.
 fn build_provision_batches<S: ChainWriter + SubstateStore + ChainReader>(
     ctx: &ActionContext<'_, S>,
-    per_tx: Vec<(
-        Hash,
-        Vec<ShardGroupId>,
-        Arc<Vec<hyperscale_types::StateEntry>>,
-    )>,
+    per_tx: Vec<FetchedTxEntries>,
     source_shard: ShardGroupId,
     block_height: hyperscale_types::BlockHeight,
     shard_recipients: &std::collections::HashMap<ShardGroupId, Vec<hyperscale_types::ValidatorId>>,
@@ -663,14 +662,15 @@ fn build_provision_batches<S: ChainWriter + SubstateStore + ChainReader>(
     use std::collections::HashMap;
 
     let mut shard_tx_entries: HashMap<ShardGroupId, Vec<TxEntries>> = HashMap::new();
-    for (tx_hash, target_shards, entries) in per_tx {
-        for &target_shard in &target_shards {
+    for (tx_hash, targets, entries) in per_tx {
+        for (target_shard, target_nodes) in targets {
             shard_tx_entries
                 .entry(target_shard)
                 .or_default()
                 .push(TxEntries {
                     tx_hash,
                     entries: (*entries).clone(),
+                    target_nodes,
                 });
         }
     }

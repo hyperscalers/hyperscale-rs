@@ -35,9 +35,9 @@
 use hyperscale_core::{Action, CrossShardExecutionRequest, ProtocolEvent, ProvisionRequest};
 use hyperscale_types::{
     BlockHeight, Bls12381G1PublicKey, ExecutionCertificate, ExecutionOutcome, ExecutionVote, Hash,
-    LocalExecutionEntry, LocalReceipt, Provision, ReceiptBundle, RoutableTransaction, ShardGroupId,
-    StateProvision, TopologySnapshot, TransactionDecision, TxOutcome, ValidatorId, WaveCertificate,
-    WaveId,
+    LocalExecutionEntry, LocalReceipt, NodeId, Provision, ReceiptBundle, RoutableTransaction,
+    ShardGroupId, StateProvision, TopologySnapshot, TransactionDecision, TxOutcome, ValidatorId,
+    WaveCertificate, WaveId,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -1830,17 +1830,33 @@ impl ExecutionState {
             owned_nodes.dedup();
 
             if !owned_nodes.is_empty() {
-                let target_shards: Vec<_> = topology
+                // Build per-target-shard node needs for conflict detection.
+                let mut targets: Vec<(ShardGroupId, Vec<NodeId>)> = Vec::new();
+                let all_nodes: Vec<&NodeId> = tx
+                    .declared_reads
+                    .iter()
+                    .chain(tx.declared_writes.iter())
+                    .collect();
+                for &target_shard in &topology
                     .all_shards_for_transaction(tx)
                     .into_iter()
                     .filter(|&s| s != local_shard)
-                    .collect();
+                    .collect::<Vec<_>>()
+                {
+                    let needed: Vec<NodeId> = all_nodes
+                        .iter()
+                        .filter(|&&n| topology.shard_for_node_id(n) == target_shard)
+                        .copied()
+                        .copied()
+                        .collect();
+                    targets.push((target_shard, needed));
+                }
 
-                if !target_shards.is_empty() {
+                if !targets.is_empty() {
                     provision_requests.push(ProvisionRequest {
                         tx_hash: tx.hash(),
                         nodes: owned_nodes,
-                        target_shards,
+                        targets,
                     });
                 }
             }
@@ -1852,7 +1868,7 @@ impl ExecutionState {
 
         let mut shard_recipients = HashMap::new();
         for req in &provision_requests {
-            for &target_shard in &req.target_shards {
+            for &(target_shard, _) in &req.targets {
                 shard_recipients.entry(target_shard).or_insert_with(|| {
                     topology
                         .committee_for_shard(target_shard)

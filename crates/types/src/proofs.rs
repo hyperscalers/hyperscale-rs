@@ -60,10 +60,10 @@ impl VerkleInclusionProof {
 // TxEntries
 // ============================================================================
 
-/// Per-transaction state entries within a provision batch.
+/// Per-transaction state entries within a provision.
 ///
-/// Lightweight: just identifies which transaction and what state it touched
-/// on the source shard.
+/// Identifies which transaction, what state it touched on the source shard,
+/// and what nodes it needs from the target shard (for conflict detection).
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct TxEntries {
     /// Hash of the transaction.
@@ -71,6 +71,13 @@ pub struct TxEntries {
 
     /// The state entries this transaction touched on the source shard.
     pub entries: Vec<StateEntry>,
+
+    /// Node IDs this transaction needs from the target shard.
+    ///
+    /// Used for bidirectional conflict detection: a true deadlock requires
+    /// overlap in both directions (source nodes vs local needs, AND target
+    /// nodes vs local owns).
+    pub target_nodes: Vec<NodeId>,
 }
 
 impl TxEntries {
@@ -325,6 +332,7 @@ mod tests {
         let tx = TxEntries {
             tx_hash: Hash::from_bytes(b"tx"),
             entries: vec![test_entry(1), test_entry(2)],
+            target_nodes: vec![],
         };
         let nodes = tx.node_ids();
         assert_eq!(nodes.len(), 2);
@@ -338,6 +346,7 @@ mod tests {
         batch.transactions = vec![TxEntries {
             tx_hash: Hash::from_bytes(b"tx1"),
             entries: vec![test_entry(1)],
+            target_nodes: vec![],
         }];
 
         let bytes = sbor::basic_encode(&batch).unwrap();
@@ -353,10 +362,12 @@ mod tests {
             TxEntries {
                 tx_hash: Hash::from_bytes(b"tx1"),
                 entries: vec![entry.clone()],
+                target_nodes: vec![],
             },
             TxEntries {
                 tx_hash: Hash::from_bytes(b"tx2"),
                 entries: vec![entry, test_entry(2)],
+                target_nodes: vec![],
             },
         ];
 

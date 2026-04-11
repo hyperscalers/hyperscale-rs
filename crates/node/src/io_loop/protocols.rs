@@ -235,6 +235,7 @@ where
                                         .map(|p| hyperscale_types::TxEntries {
                                             tx_hash: p.transaction_hash,
                                             entries: (*p.entries).clone(),
+                                            target_nodes: vec![],
                                         })
                                         .collect();
                                     let batch = hyperscale_types::Provision::new(

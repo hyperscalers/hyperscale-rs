@@ -632,6 +632,7 @@ mod tests {
             .map(|tx_hash| TxEntries {
                 tx_hash,
                 entries: vec![],
+                target_nodes: vec![],
             })
             .collect();
         Provision::new(
