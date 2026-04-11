@@ -377,6 +377,17 @@ pub enum Action {
         transactions: Vec<Arc<RoutableTransaction>>,
     },
 
+    /// Verify a block's provisions root.
+    ///
+    /// Recomputes the merkle root from the provision batch hashes in the manifest
+    /// and compares against the block header's `provisions_root`.
+    VerifyProvisionsRoot {
+        block_hash: Hash,
+        expected_root: Hash,
+        /// Provision batch hashes from the block manifest.
+        batch_hashes: Vec<Hash>,
+    },
+
     /// Verify a block's receipt root.
     ///
     /// Computes the merkle root from the certificates' `receipt_hash` values
@@ -825,6 +836,7 @@ impl Action {
             Action::VerifyRemoteHeaderQc { .. } => "VerifyRemoteHeaderQc",
             Action::VerifyStateRoot { .. } => "VerifyStateRoot",
             Action::VerifyTransactionRoot { .. } => "VerifyTransactionRoot",
+            Action::VerifyProvisionsRoot { .. } => "VerifyProvisionsRoot",
             Action::VerifyCertificateRoot { .. } => "VerifyCertificateRoot",
             Action::VerifyLocalReceiptRoot { .. } => "VerifyLocalReceiptRoot",
             Action::BuildProposal { .. } => "BuildProposal",

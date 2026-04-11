@@ -199,6 +199,7 @@ where
             | Action::VerifyRemoteHeaderQc { .. }
             | Action::VerifyStateRoot { .. }
             | Action::VerifyTransactionRoot { .. }
+            | Action::VerifyProvisionsRoot { .. }
             | Action::VerifyCertificateRoot { .. }
             | Action::VerifyLocalReceiptRoot { .. }
             | Action::BuildProposal { .. }

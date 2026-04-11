@@ -187,6 +187,22 @@ pub fn verify_qc_signature(qc: &QuorumCertificate, public_keys: &[Bls12381G1Publ
 }
 
 /// Verify that the computed transaction merkle root matches the expected root.
+pub fn verify_provisions_root(expected_root: Hash, batch_hashes: &[Hash]) -> bool {
+    let computed_root = compute_provisions_root(batch_hashes);
+    let valid = computed_root == expected_root;
+
+    if !valid {
+        tracing::warn!(
+            ?expected_root,
+            ?computed_root,
+            batch_count = batch_hashes.len(),
+            "Provisions root verification FAILED"
+        );
+    }
+
+    valid
+}
+
 pub fn verify_transaction_root(
     expected_root: Hash,
     transactions: &[Arc<RoutableTransaction>],

@@ -1919,6 +1919,19 @@ impl BftState {
                     );
                 }
 
+                // Verify provisions root if block has provisions.
+                if self.verification.needs_provisions_root_verification(&block) {
+                    if let Some(pending) = self.pending_blocks.get(&block_hash) {
+                        verification_actions.extend(
+                            self.verification.initiate_provisions_root_verification(
+                                block_hash,
+                                &block,
+                                pending.manifest(),
+                            ),
+                        );
+                    }
+                }
+
                 // Verify receipt root if block has certificates.
                 if self
                     .verification
@@ -2506,6 +2519,9 @@ impl BftState {
             VerificationKind::LocalReceiptRoot => self
                 .verification
                 .on_local_receipt_root_verified(block_hash, valid),
+            VerificationKind::ProvisionsRoot => self
+                .verification
+                .on_provisions_root_verified(block_hash, valid),
         };
 
         if !pipeline_ok {
