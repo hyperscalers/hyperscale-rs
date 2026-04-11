@@ -8,11 +8,13 @@
 //!
 //! The target vote height is the lowest height at which every tx is *coverable*:
 //! - Provisioned txs are covered at height 0 (execution possible)
-//! - Conflict-aborted txs are covered at the height the conflict was committed
+//! - Conflict-aborted txs (node-ID overlap from committed provisions) are covered
+//!   at the height the conflict was committed
 //! - Unprovisioned txs are implicitly covered at `WAVE_TIMEOUT_BLOCKS` (deterministic timeout)
 //!
-//! Vote emission requires all execution-covered txs at the target height to have
-//! their results back. Aborted/timed-out txs have known outcomes immediately.
+//! Validators vote exactly once per wave. Vote emission requires all
+//! execution-covered txs at the target height to have their results back.
+//! Aborted/timed-out txs have known outcomes immediately.
 
 use hyperscale_types::{
     compute_execution_receipt_root, ExecutionOutcome, Hash, ShardGroupId, TxOutcome, WaveId,
@@ -29,9 +31,9 @@ pub const WAVE_TIMEOUT_BLOCKS: u64 = 32;
 /// results as they complete (single-shard txs complete immediately, cross-shard
 /// txs complete when provisions arrive and execution finishes).
 ///
-/// Supports height-indexed abort tracking for the re-voting protocol:
-/// a tx is "coverable" at vote_height N if it has provisions, has a
-/// conflict committed at or before wave_start + N, or N >= WAVE_TIMEOUT_BLOCKS.
+/// Supports height-indexed abort tracking: a tx is "coverable" at vote_height N
+/// if it has provisions, has a conflict committed at or before wave_start + N,
+/// or N >= WAVE_TIMEOUT_BLOCKS.
 #[derive(Debug)]
 pub struct ExecutionAccumulator {
     /// Wave identifier (provision dependency set).
@@ -48,8 +50,9 @@ pub struct ExecutionAccumulator {
     execution_results: HashMap<Hash, TxResult>,
     /// Txs that have received provisions (execution is possible/in-flight).
     provisioned: HashSet<Hash>,
-    /// Explicit aborts (from livelock conflicts) indexed by tx_hash.
-    /// Value: the local block height at which the conflict was committed.
+    /// Explicit aborts (node-ID overlap conflicts from committed provisions)
+    /// indexed by tx_hash. Value: the local block height at which the conflict
+    /// was committed.
     aborts: HashMap<Hash, AbortEntry>,
     /// Cached target vote height. Recomputed when inputs change (provisions or aborts).
     cached_target_vote_height: Option<u64>,
@@ -63,7 +66,7 @@ struct TxResult {
     outcome: ExecutionOutcome,
 }
 
-/// An explicit abort (from a livelock conflict) with its commit height.
+/// An explicit abort (from a node-ID overlap conflict) with its commit height.
 #[derive(Debug, Clone)]
 struct AbortEntry {
     /// The local block height at which the conflict was committed.
@@ -149,7 +152,7 @@ impl ExecutionAccumulator {
         }
     }
 
-    /// Record an explicit abort (from a livelock conflict) at the given commit height.
+    /// Record an explicit abort (from a node-ID overlap conflict) at the given commit height.
     ///
     /// Aborts are tracked separately from execution results. At vote emission
     /// time, the appropriate outcome (abort or execution) is chosen based on
@@ -220,7 +223,7 @@ impl ExecutionAccumulator {
     ///
     /// A tx is coverable at vote_height N if:
     /// - It has provisions (execution possible) → covered at height 0
-    /// - It has an explicit abort (livelock) committed at height H → covered at H - wave_start
+    /// - It has an explicit abort (conflict) committed at height H → covered at H - wave_start
     /// - Neither → implicitly covered at WAVE_TIMEOUT_BLOCKS (deterministic timeout)
     ///
     /// Always returns a value — every tx is coverable at worst by timeout.

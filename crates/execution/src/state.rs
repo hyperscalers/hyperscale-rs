@@ -11,20 +11,22 @@
 //!
 //! ## Phase 1: State Provisioning
 //! When a block commits with cross-shard transactions, the block proposer broadcasts
-//! state provisions (with merkle inclusion proofs) to target shards.
+//! state provisions (with merkle inclusion proofs) to target shards. Provisions are
+//! committed in blocks via `provisions_root` — all validators have the same data.
 //!
-//! ## Phase 2: Provision Verification
-//! Target shards receive provisions, verify the QC signature and merkle proofs
-//! against the committed state root, then mark provisioning complete.
+//! ## Phase 2: Conflict Detection
+//! At commit time, the [`ConflictDetector`](crate::conflict::ConflictDetector) checks
+//! committed provisions for node-ID overlap with local cross-shard transactions.
+//! Overlapping transactions are aborted (lower hash wins) deterministically.
 //!
 //! ## Phase 3: Deterministic Execution
 //! With provisioned state, validators execute the transaction and create
 //! an ExecutionVote with the receipt hash of execution results.
 //!
 //! ## Phase 4: Vote Aggregation
-//! Validators broadcast votes to their local shard. When 2f+1 voting power agrees
-//! on the same receipt hash, an execution certificate is created and broadcast to
-//! remote participating shards (local peers form it independently).
+//! All validators broadcast votes to their local shard (N→N). When 2f+1 voting
+//! power agrees on the same receipt hash, an execution certificate is formed.
+//! The designated broadcaster sends the EC to remote participating shards.
 //!
 //! ## Phase 5: Finalization
 //! Validators collect shard execution proofs from all participating shards. When all
@@ -135,10 +137,10 @@ pub struct ExecutionState {
     accumulators: HashMap<WaveId, ExecutionAccumulator>,
 
     /// Execution vote trackers: collect execution votes from other validators.
-    /// Only created on the wave leader.
+    /// Created by all validators (N→N voting).
     vote_trackers: HashMap<WaveId, VoteTracker>,
 
-    /// Waves that have a canonical EC (aggregated or received from wave leader).
+    /// Waves that have a canonical EC (aggregated or received from designated broadcaster).
     /// Used to stop re-voting in `scan_complete_waves`.
     waves_with_ec: HashSet<WaveId>,
 
@@ -160,7 +162,7 @@ pub struct ExecutionState {
     /// Execution results that arrived before the wave was assigned.
     early_execution_results: HashMap<Hash, ExecutionOutcome>,
 
-    /// Execution votes that arrived before tracking started (wave leader only).
+    /// Execution votes that arrived before tracking started.
     early_votes: HashMap<WaveId, Vec<ExecutionVote>>,
 
     /// ECs that arrived before the wave tracker was created.
@@ -634,13 +636,11 @@ impl ExecutionState {
         committed_txs
     }
 
-    /// Record conflicts from a committed block into execution accumulators.
-    ///
     /// Apply provisions committed in a block to execution accumulators.
     ///
     /// Called during `on_block_committed` with the provision batches from the
     /// committed block. All validators have this data (fetched before BFT vote).
-    /// Marks transactions as provisioned deterministically at commit time.
+    /// Detects node-ID overlap conflicts and marks transactions as provisioned.
     pub fn apply_committed_provisions(
         &mut self,
         topology: &TopologySnapshot,
@@ -1882,10 +1882,10 @@ impl ExecutionState {
         // Use a HashSet to count unique transactions since a tx might be in multiple phases
         let mut pending_txs = HashSet::new();
 
-        // Phase 1-2: Waiting for provisioning (tracked by ProvisionCoordinator)
+        // Waiting for provisions
         pending_txs.extend(self.pending_provisioning.keys());
 
-        // Phase 3-5: Vote aggregation and certificate collection
+        // Vote aggregation and certificate collection
         // Cross-shard waves have non-zero wave IDs (remote_shards is non-empty).
         for (wave_id, tracker) in &self.wave_certificate_trackers {
             if !wave_id.is_zero() {
