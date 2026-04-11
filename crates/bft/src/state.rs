@@ -928,7 +928,8 @@ impl BftState {
         // pending/certified blocks above committed height. Excluding these
         // prevents the same item appearing in consecutive blocks during the
         // two-chain commit window (mempool ready-set is only cleared on commit).
-        let (qc_chain_cert_hashes, qc_chain_tx_hashes) = self.collect_qc_chain_hashes(parent_hash);
+        let (qc_chain_cert_hashes, qc_chain_tx_hashes, qc_chain_provision_hashes) =
+            self.collect_qc_chain_hashes(parent_hash);
 
         // Filter transactions already in the QC chain or previously committed.
         // The QC chain walk covers pending/certified blocks + recently_committed_txs.
@@ -961,6 +962,12 @@ impl BftState {
             .into_iter()
             .filter(|fw| !qc_chain_cert_hashes.contains(&fw.wave_id_hash()))
             .take(self.config.max_certificates_per_block)
+            .collect();
+
+        // Filter provision batches already in the QC chain.
+        let provision_batches: Vec<_> = provision_batches
+            .into_iter()
+            .filter(|b| !qc_chain_provision_hashes.contains(&b.hash()))
             .collect();
 
         // Use the certified tip's state_root as the base.
@@ -1996,7 +2003,7 @@ impl BftState {
             return Ok(());
         }
 
-        let (_, qc_chain_tx_hashes) = self.collect_qc_chain_hashes(block.header.parent_hash);
+        let (_, qc_chain_tx_hashes, _) = self.collect_qc_chain_hashes(block.header.parent_hash);
 
         for tx in &block.transactions {
             let tx_hash = tx.hash();
@@ -4387,7 +4394,7 @@ impl BftState {
     /// This avoids the caller needing to call `collect_qc_chain_hashes` separately.
     pub fn dedup_overhead(&self) -> usize {
         let parent_hash = self.proposal_parent_hash();
-        let (_, tx_hashes) = self.collect_qc_chain_hashes(parent_hash);
+        let (_, tx_hashes, _) = self.collect_qc_chain_hashes(parent_hash);
         tx_hashes.len()
     }
 
@@ -4406,9 +4413,12 @@ impl BftState {
     ) -> (
         std::collections::HashSet<Hash>,
         std::collections::HashSet<Hash>,
+        std::collections::HashSet<Hash>,
     ) {
         let mut cert_hashes: std::collections::HashSet<Hash> = std::collections::HashSet::new();
         let mut tx_hashes: std::collections::HashSet<Hash> = std::collections::HashSet::new();
+        let mut provision_hashes: std::collections::HashSet<Hash> =
+            std::collections::HashSet::new();
 
         // Walk full blocks (certified_blocks + assembled pending_blocks + genesis)
         // Also include any recently committed hashes that the mempool
@@ -4432,8 +4442,7 @@ impl BftState {
         }
 
         // Fallback: walk pending blocks whose full block data hasn't been
-        // assembled yet. The manifest tx_hashes are always available from
-        // the header.
+        // assembled yet. The manifest is always available from the header.
         {
             let mut current_hash = parent_hash;
             while let Some(pending) = self.pending_blocks.get(&current_hash) {
@@ -4441,16 +4450,21 @@ impl BftState {
                 if h <= self.committed_height {
                     break;
                 }
+                let manifest = pending.manifest();
                 if pending.block().is_none() {
-                    for tx_hash in &pending.manifest().tx_hashes {
+                    for tx_hash in &manifest.tx_hashes {
                         tx_hashes.insert(*tx_hash);
                     }
+                }
+                // Provision batch hashes are always on the manifest (never on Block).
+                for batch_hash in &manifest.provision_batch_hashes {
+                    provision_hashes.insert(*batch_hash);
                 }
                 current_hash = pending.header().parent_hash;
             }
         }
 
-        (cert_hashes, tx_hashes)
+        (cert_hashes, tx_hashes, provision_hashes)
     }
 
     /// Get the BFT configuration.
