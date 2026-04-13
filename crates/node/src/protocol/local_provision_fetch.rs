@@ -124,6 +124,23 @@ impl BlockFetchState {
     fn mark_fetch_complete(&mut self) {
         self.in_flight_count = self.in_flight_count.saturating_sub(1);
     }
+
+    /// Move any in-flight hashes that weren't received back to missing.
+    /// Called after marking received items to handle partial/empty responses.
+    fn reclaim_unreceived(&mut self) {
+        if self.in_flight_count == 0 && !self.in_flight_hashes.is_empty() {
+            let stuck: Vec<Hash> = self
+                .in_flight_hashes
+                .iter()
+                .filter(|h| !self.received_hashes.contains(h))
+                .copied()
+                .collect();
+            for h in stuck {
+                self.in_flight_hashes.remove(&h);
+                self.missing_hashes.insert(h);
+            }
+        }
+    }
 }
 
 /// Local provision fetch protocol state machine.
@@ -218,6 +235,8 @@ impl LocalProvisionFetchProtocol {
         let received_hashes: Vec<Hash> = batches.iter().map(|b| b.hash()).collect();
         let received_count = received_hashes.len();
         state.mark_received(received_hashes);
+        // Move any in-flight hashes not in the response back to missing for retry.
+        state.reclaim_unreceived();
         metrics::record_fetch_items_received("local_provision", received_count);
 
         info!(
