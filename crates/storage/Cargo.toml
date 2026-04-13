@@ -18,6 +18,9 @@ ark-serialize.workspace = true
 # Hashing
 blake3.workspace = true
 
+# Parallelism
+rayon.workspace = true
+
 # Radix dependencies (for SubstateDatabase, DatabaseUpdates, etc.)
 radix-common.workspace = true
 radix-substate-store-interface.workspace = true

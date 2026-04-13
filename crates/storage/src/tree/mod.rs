@@ -24,6 +24,7 @@ use std::sync::Arc;
 
 use hyperscale_types::Hash;
 use jellyfish_verkle_tree as jvt;
+use rayon::prelude::*;
 
 // Re-export JVT types used in public APIs (CollectedWrites, NodeCache, etc.)
 pub use jvt::Node as JvtNode;
@@ -96,8 +97,10 @@ pub fn put_at_version<S: jvt::TreeReader + Sync>(
         "put_at_version: new_version ({new_version}) must be greater than parent_version ({parent_version:?})"
     );
 
-    // Flatten all database updates into JVT key-value pairs.
-    let mut updates: BTreeMap<jvt::Key, Option<jvt::Value>> = BTreeMap::new();
+    // Flatten all database updates into (storage_key_bytes, jvt_value) work items,
+    // then parallel-hash and convert to JVT key-value pairs.
+    // Each work item is (entity_key, partition_num, sort_key_bytes, value_option).
+    let mut work_items: Vec<(Vec<u8>, Option<&[u8]>)> = Vec::new();
 
     for (entity_key, node_updates) in &database_updates.node_updates {
         for (&partition_num, partition_updates) in &node_updates.partition_updates {
@@ -107,14 +110,13 @@ pub fn put_at_version<S: jvt::TreeReader + Sync>(
                 } => {
                     for (sort_key, update) in substate_updates {
                         let storage_key = make_storage_key(entity_key, partition_num, &sort_key.0);
-                        let jvt_key = hash_storage_key(&storage_key);
-                        let jvt_value = match update {
+                        let value_ref = match update {
                             radix_common::prelude::DatabaseUpdate::Set(value) => {
-                                Some(jvt::commitment::value_to_field(value))
+                                Some(value.as_slice())
                             }
                             radix_common::prelude::DatabaseUpdate::Delete => None,
                         };
-                        updates.insert(jvt_key, jvt_value);
+                        work_items.push((storage_key, value_ref));
                     }
                 }
                 radix_substate_store_interface::interface::PartitionDatabaseUpdates::Reset {
@@ -126,21 +128,19 @@ pub fn put_at_version<S: jvt::TreeReader + Sync>(
                         for old_sk in old_sort_keys {
                             let storage_key =
                                 make_storage_key(entity_key, partition_num, &old_sk.0);
-                            let jvt_key = hash_storage_key(&storage_key);
-                            updates.insert(jvt_key, None);
+                            work_items.push((storage_key, None));
                         }
                     }
                     for (sort_key, value) in new_substate_values {
                         let storage_key = make_storage_key(entity_key, partition_num, &sort_key.0);
-                        let jvt_key = hash_storage_key(&storage_key);
-                        updates.insert(jvt_key, Some(jvt::commitment::value_to_field(value)));
+                        work_items.push((storage_key, Some(value.as_slice())));
                     }
                 }
             };
         }
     }
 
-    if updates.is_empty() {
+    if work_items.is_empty() {
         // No updates — carry the existing root forward to the new version.
         // We must write a root node at new_version so the next block can find it.
         let mut collected = CollectedWrites::default();
@@ -160,7 +160,34 @@ pub fn put_at_version<S: jvt::TreeReader + Sync>(
         return (root_hash, collected);
     }
 
-    let result = jvt::apply_updates(store, parent_version, new_version, updates);
+    // Parallel phase: BLAKE3 hash each storage key and convert values to field
+    // elements. Each item is independent — this parallelizes the most expensive
+    // per-entry work (two BLAKE3 hashes + field conversion for Set operations).
+    let mut updates: Vec<(jvt::Key, Option<jvt::Value>)> = work_items
+        .par_iter()
+        .map(|(storage_key, value_ref)| {
+            let jvt_key = hash_storage_key(storage_key);
+            let jvt_value = value_ref.map(jvt::commitment::value_to_field);
+            (jvt_key, jvt_value)
+        })
+        .collect();
+
+    // Sort by key for the BTreeMap-equivalent ordering that apply_updates expects.
+    updates.par_sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+    // Dedup: last writer wins (same semantics as BTreeMap::insert overwrite).
+    updates.dedup_by(|b, a| {
+        if a.0 == b.0 {
+            a.1 = b.1;
+            true
+        } else {
+            false
+        }
+    });
+
+    let updates_btree: BTreeMap<jvt::Key, Option<jvt::Value>> = updates.into_iter().collect();
+
+    let result = jvt::apply_updates(store, parent_version, new_version, updates_btree);
 
     let root_hash = if result.root_commitment == jvt::zero_commitment() {
         Hash::ZERO
