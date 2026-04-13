@@ -3513,23 +3513,36 @@ impl BftState {
 
         let removed_blocks = self.record_block_committed(&block, block_hash);
 
-        // Update latest QC (this may help us catch up further)
+        // Update latest QC and certified tracking (this may help us catch up further)
         if self
             .latest_qc
             .as_ref()
             .is_none_or(|existing| qc.height.0 > existing.height.0)
         {
             self.latest_qc = Some(qc.clone());
+            self.certified_state_root = block.header.state_root;
+            self.certified_in_flight = block.header.in_flight;
             self.maybe_unlock_for_qc(topology, &qc);
         }
 
-        // Also cache the parent_qc from the block header if it's newer
+        // Also cache the parent_qc from the block header if it's newer.
+        // Look up the parent block's certified fields from the current block's
+        // parent — during sync we have the full block, so parent_qc.block_hash
+        // may be in pending_blocks or certified_blocks.
         if !block.header.parent_qc.is_genesis()
             && self
                 .latest_qc
                 .as_ref()
                 .is_none_or(|existing| block.header.parent_qc.height.0 > existing.height.0)
         {
+            let parent_hash = block.header.parent_qc.block_hash;
+            if let Some(parent) = self.get_block_by_hash(parent_hash) {
+                self.certified_state_root = parent.header.state_root;
+                self.certified_in_flight = parent.header.in_flight;
+            } else if let Some(pending) = self.pending_blocks.get(&parent_hash) {
+                self.certified_state_root = pending.header().state_root;
+                self.certified_in_flight = pending.header().in_flight;
+            }
             self.latest_qc = Some(block.header.parent_qc.clone());
             self.maybe_unlock_for_qc(topology, &block.header.parent_qc);
         }
