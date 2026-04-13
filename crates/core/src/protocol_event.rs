@@ -231,7 +231,7 @@ pub enum ProtocolEvent {
     },
 
     /// A transaction's execution outcome has been resolved and certificate finalized.
-    /// Kept for per-tx mempool status updates until WaveCompleted fully replaces it.
+    /// Used for per-tx mempool status updates.
     TransactionExecuted { tx_hash: Hash, accepted: bool },
 
     /// A wave's execution has been finalized (all shards reported or all-abort).

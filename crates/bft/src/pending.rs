@@ -36,7 +36,7 @@ pub struct PendingBlock {
 
     /// Map of wave_id hash -> Arc<FinalizedWave> (carries cert + receipts + ECs).
     ///
-    /// Replaces separate certificate + receipt tracking. A block is complete once
+    /// A block is complete once
     /// all its waves have been independently finalized by this validator.
     received_waves: BTreeMap<Hash, Arc<FinalizedWave>>,
 
