@@ -125,6 +125,22 @@ impl BlockFetchState {
     fn mark_fetch_complete(&mut self) {
         self.in_flight_count = self.in_flight_count.saturating_sub(1);
     }
+
+    /// Move any in-flight hashes that weren't received back to missing.
+    fn reclaim_unreceived(&mut self) {
+        if self.in_flight_count == 0 && !self.in_flight_hashes.is_empty() {
+            let stuck: Vec<Hash> = self
+                .in_flight_hashes
+                .iter()
+                .filter(|h| !self.received_hashes.contains(h))
+                .copied()
+                .collect();
+            for h in stuck {
+                self.in_flight_hashes.remove(&h);
+                self.missing_hashes.insert(h);
+            }
+        }
+    }
 }
 
 /// Finalized wave fetch protocol state machine.
@@ -218,6 +234,7 @@ impl FinalizedWaveFetchProtocol {
         let received_hashes: Vec<Hash> = waves.iter().map(|fw| fw.wave_id_hash()).collect();
         let received_count = received_hashes.len();
         state.mark_received(received_hashes);
+        state.reclaim_unreceived();
         metrics::record_fetch_items_received("finalized_wave", received_count);
 
         info!(
