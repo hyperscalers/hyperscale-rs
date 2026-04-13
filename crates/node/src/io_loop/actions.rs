@@ -149,12 +149,11 @@ where
                 self.network.notify(&recipients, &batch);
             }
             Action::TrackExecutionCertificate { certificate } => {
-                let block_height = certificate.block_height();
                 let key = (certificate.wave_id.hash(), certificate.wave_id.clone());
-                // Cache first (cheap Arc clone), then unwrap_or_clone for pending writes.
+                // Cache for serving EC fetch requests from remote shards.
+                // Persistence is handled via wave certificates in block.certificates.
                 if let Ok(mut cache) = self.exec_cert_cache.lock() {
                     cache.insert(key, Arc::clone(&certificate));
-                    // Safety-net pruning: evict very old entries to bound memory.
                     if cache.len() > 2000 {
                         let cutoff = cache
                             .values()
@@ -165,9 +164,6 @@ where
                         cache.retain(|_, c| c.block_height() > cutoff);
                     }
                 }
-                // Queue for atomic persistence in the next block commit WriteBatch.
-                self.pending_ec_writes.push(certificate);
-                let _ = block_height;
             }
             // ═══════════════════════════════════════════════════════════
             // Delegated work — batched (accumulated for batch dispatch)
@@ -417,7 +413,6 @@ where
         }
 
         let commits = std::mem::take(&mut self.pending_block_commits);
-        let pending_ecs = std::mem::take(&mut self.pending_ec_writes);
 
         // Only take sync data for synced blocks we're about to commit.
         // BFT may buffer sync blocks internally for sequential ordering,
@@ -437,8 +432,6 @@ where
         if !has_non_empty {
             // All empty blocks — synchronous fast path.
             // Still advance JVT version so it matches block height.
-            // Any pending ECs ride along with the first block's commit.
-            let mut remaining_ecs = pending_ecs;
 
             // Prune stale prepared_commits that outlived their blocks.
             let max_height = commits
@@ -466,10 +459,7 @@ where
                 };
                 let block_hash = block.hash();
                 let height = block.header.height.0;
-                let ecs_for_this_block = std::mem::take(&mut remaining_ecs);
-                let result = self
-                    .storage
-                    .commit_block(&block, &qc, &ecs_for_this_block, &[]);
+                let result = self.storage.commit_block(&block, &qc, &[]);
                 let _ =
                     self.event_sender
                         .send(NodeInput::Protocol(ProtocolEvent::BlockCommitted {
@@ -565,7 +555,6 @@ where
         }
 
         if ready_commits.is_empty() {
-            self.pending_ec_writes = pending_ecs;
             return;
         }
         let commits = ready_commits;
@@ -579,13 +568,10 @@ where
         self.commit_in_flight.store(true, Ordering::Release);
 
         self.dispatch.spawn_execution(move || {
-            let mut remaining_ecs = pending_ecs;
-
             for (i, commit) in commits.into_iter().enumerate() {
                 let block_hash = commit.block().hash();
                 let height = commit.block().header.height;
 
-                let ecs_for_this_block = std::mem::take(&mut remaining_ecs);
                 let prepared = prepared_map[i].take();
 
                 let result = match commit {
@@ -601,34 +587,18 @@ where
                             .collect();
 
                         if let Some(prepared) = prepared {
-                            storage.commit_prepared_block(prepared, block, qc, &ecs_for_this_block)
+                            storage.commit_prepared_block(prepared, block, qc)
                         } else {
-                            storage.commit_block(block, qc, &ecs_for_this_block, &wave_receipts)
+                            storage.commit_block(block, qc, &wave_receipts)
                         }
                     }
                     super::PendingCommit::Synced {
                         ref block, ref qc, ..
                     } => {
                         if block.certificates.is_empty() {
-                            storage.commit_block(block, qc, &ecs_for_this_block, &[])
+                            storage.commit_block(block, qc, &[])
                         } else if let Some(entry) = sync_data.get(&height.0) {
-                            let (receipts, sync_ecs) =
-                                (&entry.local_receipts, &entry.execution_certificates);
-
-                            // EC↔WaveCert cross-check via attestations.
-                            let cross_check_ok = sync_ecs.iter().all(|ec| {
-                                let ec_hash = ec.canonical_hash();
-                                block
-                                    .certificates
-                                    .iter()
-                                    .any(|wc| wc.attestations.iter().any(|a| a.ec_hash == ec_hash))
-                            });
-                            if !cross_check_ok {
-                                tracing::warn!(
-                                    height = height.0,
-                                    "Sync: EC↔WaveCert cross-check failed"
-                                );
-                            }
+                            let receipts = &entry.local_receipts;
 
                             // Convert sync receipts to ReceiptBundles.
                             let sync_receipt_bundles: Vec<hyperscale_types::ReceiptBundle> =
@@ -675,8 +645,6 @@ where
                                 };
 
                             // Verify state_root via prepare→verify→commit.
-                            // Sync runs sequentially on the IO thread — no race
-                            // with concurrent commits, so current state is correct.
                             let parent_root = storage.state_root_hash();
                             let parent_height = if height.0 > 0 { height.0 - 1 } else { 0 };
                             let (computed_root, prepared) = storage.prepare_block_commit(
@@ -695,13 +663,13 @@ where
                                 );
                             }
 
-                            storage.commit_prepared_block(prepared, block, qc, sync_ecs)
+                            storage.commit_prepared_block(prepared, block, qc)
                         } else {
                             tracing::error!(
                                 height = height.0,
                                 "BUG: synced block with certs but no sync data"
                             );
-                            storage.commit_block(block, qc, &ecs_for_this_block, &[])
+                            storage.commit_block(block, qc, &[])
                         }
                     }
                 };

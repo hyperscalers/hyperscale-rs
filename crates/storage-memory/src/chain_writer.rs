@@ -79,7 +79,6 @@ impl ChainWriter for SimStorage {
         prepared: Self::PreparedCommit,
         block: &Arc<hyperscale_types::Block>,
         qc: &Arc<hyperscale_types::QuorumCertificate>,
-        execution_certificates: &[Arc<hyperscale_types::ExecutionCertificate>],
     ) -> Hash {
         let block_height = prepared.snapshot.new_version;
         let result_root = prepared.snapshot.result_root;
@@ -130,13 +129,15 @@ impl ChainWriter for SimStorage {
                             .insert(bundle.tx_hash, exec_output.clone());
                     }
                 }
-                for cert in execution_certificates {
-                    let canonical_hash = cert.canonical_hash();
-                    c.execution_certs.insert(canonical_hash, (**cert).clone());
-                    c.execution_certs_by_height
-                        .entry(cert.block_height())
-                        .or_default()
-                        .push(canonical_hash);
+                for wc in &block.certificates {
+                    for ec in &wc.execution_certificates {
+                        let canonical_hash = ec.canonical_hash();
+                        c.execution_certs.insert(canonical_hash, (**ec).clone());
+                        c.execution_certs_by_height
+                            .entry(ec.block_height())
+                            .or_default()
+                            .push(canonical_hash);
+                    }
                 }
                 c.committed_height = block.header.height;
                 c.committed_hash = Some(block.hash());
@@ -147,24 +148,17 @@ impl ChainWriter for SimStorage {
             }
         }
 
-        self.commit_block_inner(
-            &prepared.merged_updates,
-            block,
-            qc,
-            execution_certificates,
-            &prepared.receipts,
-        )
+        self.commit_block_inner(&prepared.merged_updates, block, qc, &prepared.receipts)
     }
 
     fn commit_block(
         &self,
         block: &Arc<hyperscale_types::Block>,
         qc: &Arc<hyperscale_types::QuorumCertificate>,
-        execution_certificates: &[Arc<hyperscale_types::ExecutionCertificate>],
         receipts: &[ReceiptBundle],
     ) -> Hash {
         let merged_updates = hyperscale_storage::merge_updates_from_receipts(receipts);
-        self.commit_block_inner(&merged_updates, block, qc, execution_certificates, receipts)
+        self.commit_block_inner(&merged_updates, block, qc, receipts)
     }
 
     fn node_cache_len(&self) -> usize {
@@ -179,7 +173,6 @@ impl SimStorage {
         merged_updates: &DatabaseUpdates,
         block: &Arc<hyperscale_types::Block>,
         qc: &Arc<hyperscale_types::QuorumCertificate>,
-        execution_certificates: &[Arc<hyperscale_types::ExecutionCertificate>],
         receipts: &[ReceiptBundle],
     ) -> Hash {
         let block_height = block.header.height.0;
@@ -257,14 +250,16 @@ impl SimStorage {
                         .insert(bundle.tx_hash, exec_output.clone());
                 }
             }
-            // Store execution certificates atomically with block commit.
-            for cert in execution_certificates {
-                let canonical_hash = cert.canonical_hash();
-                c.execution_certs.insert(canonical_hash, (**cert).clone());
-                c.execution_certs_by_height
-                    .entry(cert.block_height())
-                    .or_default()
-                    .push(canonical_hash);
+            // Store execution certificates (extracted from wave certs) atomically.
+            for wc in &block.certificates {
+                for ec in &wc.execution_certificates {
+                    let canonical_hash = ec.canonical_hash();
+                    c.execution_certs.insert(canonical_hash, (**ec).clone());
+                    c.execution_certs_by_height
+                        .entry(ec.block_height())
+                        .or_default()
+                        .push(canonical_hash);
+                }
             }
             c.committed_height = block.header.height;
             c.committed_hash = Some(block.hash());

@@ -1538,8 +1538,6 @@ impl ExecutionState {
         let wc = tracker.create_wave_certificate();
         let tx_decisions = tracker.tx_decisions();
         let tx_hashes = tracker.tx_hashes().to_vec();
-        let ecs = tracker.take_execution_certificates();
-
         // Ensure aborted txs have failure receipts. This handles two cases:
         // 1. Overwrite: a non-quorum validator executed successfully but the EC
         //    (from quorum) says abort — replace the stale success receipt.
@@ -1570,7 +1568,6 @@ impl ExecutionState {
         let finalized = FinalizedWave {
             certificate: Arc::clone(&cert_arc),
             tx_hashes: tx_hashes.clone(),
-            execution_certificates: ecs.clone(),
             tx_decisions: tx_decisions.clone(),
             receipts,
             finalized_height: self.committed_height,
@@ -1589,7 +1586,6 @@ impl ExecutionState {
         actions.push(Action::Continuation(ProtocolEvent::WaveCompleted {
             wave_cert: cert_arc,
             tx_hashes: tx_hashes.clone(),
-            execution_certificates: ecs,
         }));
 
         // Emit TransactionExecuted for each tx (per-tx mempool status updates)

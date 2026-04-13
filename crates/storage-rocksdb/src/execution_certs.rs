@@ -7,30 +7,36 @@
 use crate::column_families::{ExecutionCertsByHeightCf, ExecutionCertsCf};
 use crate::core::RocksDbStorage;
 
-use hyperscale_types::ExecutionCertificate;
+use hyperscale_types::{Block, ExecutionCertificate};
 use rocksdb::WriteBatch;
 use std::sync::Arc;
 
-/// Append execution certificate writes to an existing `WriteBatch`.
+/// Append execution certificate writes for a block to an existing `WriteBatch`.
 ///
-/// Called by `commit_block` and `commit_prepared_block` to fold EC writes
-/// into the same atomic batch as JVT + TCs (D4: one fsync per block).
-pub(crate) fn append_execution_certs_to_batch(
+/// Extracts ECs from the block's wave certificates and folds them into the
+/// same atomic batch as JVT + block data (one fsync per block).
+pub(crate) fn append_block_certs_to_batch(
     storage: &RocksDbStorage,
     batch: &mut WriteBatch,
-    certs: &[Arc<ExecutionCertificate>],
+    block: &Arc<Block>,
 ) {
-    for cert in certs {
-        let canonical_hash = cert.canonical_hash();
-
-        // Primary: canonical_hash → EC
-        storage.cf_put::<ExecutionCertsCf>(batch, &canonical_hash, cert);
-
-        // Index: (block_height, canonical_hash) → ()
-        storage.cf_put::<ExecutionCertsByHeightCf>(
-            batch,
-            &(cert.block_height(), canonical_hash),
-            &(),
-        );
+    for wc in &block.certificates {
+        for ec in &wc.execution_certificates {
+            append_ec_to_batch(storage, batch, ec);
+        }
     }
+}
+
+fn append_ec_to_batch(
+    storage: &RocksDbStorage,
+    batch: &mut WriteBatch,
+    cert: &Arc<ExecutionCertificate>,
+) {
+    let canonical_hash = cert.canonical_hash();
+
+    // Primary: canonical_hash → EC
+    storage.cf_put::<ExecutionCertsCf>(batch, &canonical_hash, cert);
+
+    // Index: (block_height, canonical_hash) → ()
+    storage.cf_put::<ExecutionCertsByHeightCf>(batch, &(cert.block_height(), canonical_hash), &());
 }

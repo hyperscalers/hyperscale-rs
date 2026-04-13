@@ -234,12 +234,11 @@ pub enum ProtocolEvent {
     /// Used for per-tx mempool status updates.
     TransactionExecuted { tx_hash: Hash, accepted: bool },
 
-    /// A wave's execution has been finalized (all shards reported or all-abort).
-    /// Carries the wave cert, per-tx hashes, and contributing ECs.
+    /// A wave's execution has been finalized (all shards reported).
+    /// Carries the wave cert (which contains the ECs) and per-tx hashes.
     WaveCompleted {
         wave_cert: Arc<WaveCertificate>,
         tx_hashes: Vec<Hash>,
-        execution_certificates: Vec<Arc<ExecutionCertificate>>,
     },
 
     // ═══════════════════════════════════════════════════════════════════════

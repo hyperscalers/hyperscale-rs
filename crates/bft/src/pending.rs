@@ -381,10 +381,9 @@ mod tests {
         let fw = Arc::new(FinalizedWave {
             certificate: Arc::new(WaveCertificate {
                 wave_id,
-                attestations: vec![],
+                execution_certificates: vec![],
             }),
             tx_hashes: vec![],
-            execution_certificates: vec![],
             tx_decisions: vec![],
             receipts: vec![],
             finalized_height: 1,
@@ -426,10 +425,9 @@ mod tests {
         let fw = Arc::new(FinalizedWave {
             certificate: Arc::new(WaveCertificate {
                 wave_id,
-                attestations: vec![],
+                execution_certificates: vec![],
             }),
             tx_hashes: vec![],
-            execution_certificates: vec![],
             tx_decisions: vec![],
             receipts: vec![],
             finalized_height: 1,
@@ -445,7 +443,7 @@ mod tests {
         let wave_id = WaveId::new(ShardGroupId(0), 1, Default::default());
         let cert = Arc::new(WaveCertificate {
             wave_id: wave_id.clone(),
-            attestations: vec![],
+            execution_certificates: vec![],
         });
 
         let block = Block {
@@ -457,7 +455,6 @@ mod tests {
         let fw = Arc::new(FinalizedWave {
             certificate: cert,
             tx_hashes: vec![],
-            execution_certificates: vec![],
             tx_decisions: vec![],
             receipts: vec![],
             finalized_height: 1,

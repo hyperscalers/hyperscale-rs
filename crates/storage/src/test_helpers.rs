@@ -79,7 +79,7 @@ pub fn make_mapped_database_update(
 pub fn make_test_wave_certificate(height: u64, shard: ShardGroupId) -> WaveCertificate {
     WaveCertificate {
         wave_id: WaveId::new(shard, height, BTreeSet::new()),
-        attestations: vec![],
+        execution_certificates: vec![],
     }
 }
 
@@ -160,20 +160,32 @@ pub fn make_test_receipt_bundle(seed: u8) -> ReceiptBundle {
 /// Build a test `ExecutionCertificate` at the given block height with a
 /// deterministic outcome derived from `seed`.
 pub fn make_test_execution_certificate(seed: u8, block_height: u64) -> ExecutionCertificate {
-    ExecutionCertificate {
-        wave_id: WaveId::new(ShardGroupId(0), block_height, BTreeSet::new()),
-        vote_height: block_height + 1,
-        global_receipt_root: Hash::from_bytes(&[seed + 50; 32]),
-        tx_outcomes: vec![TxOutcome {
+    ExecutionCertificate::new(
+        WaveId::new(ShardGroupId(0), block_height, BTreeSet::new()),
+        block_height + 1,
+        Hash::from_bytes(&[seed + 50; 32]),
+        vec![TxOutcome {
             tx_hash: Hash::from_bytes(&[seed + 100; 32]),
             outcome: ExecutionOutcome::Executed {
                 receipt_hash: Hash::from_bytes(&[seed + 150; 32]),
                 success: true,
             },
         }],
-        aggregated_signature: Bls12381G2Signature([0u8; 96]),
-        signers: SignerBitfield::new(4),
+        Bls12381G2Signature([0u8; 96]),
+        SignerBitfield::new(4),
+    )
+}
+
+/// Build a test block that carries ECs inside its wave certificates.
+fn make_test_block_with_ecs(height: u64, ecs: Vec<Arc<ExecutionCertificate>>) -> Block {
+    let mut block = make_test_block(height);
+    if !ecs.is_empty() {
+        block.certificates.push(Arc::new(WaveCertificate {
+            wave_id: WaveId::new(ShardGroupId(0), height, BTreeSet::new()),
+            execution_certificates: ecs,
+        }));
     }
+    block
 }
 
 /// Helper to commit empty blocks up to (but not including) the target height.
@@ -181,7 +193,7 @@ fn commit_empty_blocks_up_to(storage: &(impl ChainReader + ChainWriter), target:
     for h in 0..target {
         let b = make_test_block(h);
         let q = make_test_qc(&b);
-        storage.commit_block(&Arc::new(b), &Arc::new(q), &[], &[]);
+        storage.commit_block(&Arc::new(b), &Arc::new(q), &[]);
     }
 }
 
@@ -195,9 +207,9 @@ pub fn test_ec_storage_roundtrip(storage: &(impl ChainReader + ChainWriter)) {
 
     // Commit intermediate blocks, then block at height 10 carrying the EC
     commit_empty_blocks_up_to(storage, 10);
-    let block = make_test_block(10);
+    let block = make_test_block_with_ecs(10, vec![Arc::new(ec)]);
     let qc = make_test_qc(&block);
-    storage.commit_block(&Arc::new(block), &Arc::new(qc), &[Arc::new(ec)], &[]);
+    storage.commit_block(&Arc::new(block), &Arc::new(qc), &[]);
 
     let by_height = storage.get_execution_certificates_by_height(10);
     assert_eq!(by_height.len(), 1);
@@ -216,29 +228,19 @@ pub fn test_ec_storage_batch(storage: &(impl ChainReader + ChainWriter)) {
 
     // Commit intermediate blocks, then block at height 10 with two ECs
     commit_empty_blocks_up_to(storage, 10);
-    let block10 = make_test_block(10);
+    let block10 = make_test_block_with_ecs(10, vec![Arc::new(ec1), Arc::new(ec2)]);
     let qc10 = make_test_qc(&block10);
-    storage.commit_block(
-        &Arc::new(block10),
-        &Arc::new(qc10),
-        &[Arc::new(ec1), Arc::new(ec2)],
-        &[],
-    );
+    storage.commit_block(&Arc::new(block10), &Arc::new(qc10), &[]);
 
     // Commit blocks 11-19, then block 20 with one EC
     for h in 11..20 {
         let b = make_test_block(h);
         let q = make_test_qc(&b);
-        storage.commit_block(&Arc::new(b), &Arc::new(q), &[], &[]);
+        storage.commit_block(&Arc::new(b), &Arc::new(q), &[]);
     }
-    let block20 = make_test_block(20);
+    let block20 = make_test_block_with_ecs(20, vec![Arc::new(ec3.clone())]);
     let qc20 = make_test_qc(&block20);
-    storage.commit_block(
-        &Arc::new(block20),
-        &Arc::new(qc20),
-        &[Arc::new(ec3.clone())],
-        &[],
-    );
+    storage.commit_block(&Arc::new(block20), &Arc::new(qc20), &[]);
 
     // Both ECs at height 10
     let at_10 = storage.get_execution_certificates_by_height(10);

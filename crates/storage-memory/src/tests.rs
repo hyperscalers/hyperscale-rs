@@ -27,12 +27,7 @@ fn commit_with(
         }),
         execution_output: None,
     }];
-    storage.commit_block(
-        &Arc::new(block.clone()),
-        &Arc::new(qc.clone()),
-        &[],
-        &receipts,
-    )
+    storage.commit_block(&Arc::new(block.clone()), &Arc::new(qc.clone()), &receipts)
 }
 
 /// Helper: commit a block with empty updates and no ECs/receipts.
@@ -400,12 +395,8 @@ fn test_prepare_then_commit_fast_path() {
     // Prepare path
     let parent_root = s_prepared.state_root_hash();
     let (spec_root, prepared) = s_prepared.prepare_block_commit(parent_root, 0, &[], 1);
-    let result_prepared = s_prepared.commit_prepared_block(
-        prepared,
-        &Arc::new(block.clone()),
-        &Arc::new(qc.clone()),
-        &[],
-    );
+    let result_prepared =
+        s_prepared.commit_prepared_block(prepared, &Arc::new(block.clone()), &Arc::new(qc.clone()));
 
     // Direct path
     let result_direct = commit_empty(&s_direct, &block, &qc);
@@ -422,7 +413,7 @@ fn test_prepare_commit_state_root_matches() {
 
     let parent_root = storage.state_root_hash();
     let (spec_root, prepared) = storage.prepare_block_commit(parent_root, 0, &[], 1);
-    let result = storage.commit_prepared_block(prepared, &Arc::new(block), &Arc::new(qc), &[]);
+    let result = storage.commit_prepared_block(prepared, &Arc::new(block), &Arc::new(qc));
 
     assert_eq!(spec_root, result);
 }

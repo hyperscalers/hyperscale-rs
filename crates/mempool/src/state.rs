@@ -545,7 +545,7 @@ impl MempoolState {
         // Process wave certificates — derive per-tx decisions.
         // Wave certs don't carry per-tx info directly. The node state machine
         // should call on_certificate_committed for each tx with the correct
-        // decision derived from FinalizedWave.execution_certificates.
+        // decision derived from wave certificate execution certificates.
         // For blocks received via sync (no FinalizedWave), wave cert processing
         // is skipped — synced nodes don't need to emit per-tx status updates.
         // TODO: Wire up per-tx decisions from node state machine.
@@ -558,7 +558,7 @@ impl MempoolState {
     ///
     /// Marks the transaction as completed (terminal state).
     /// Called by the node state machine with per-tx decisions derived from
-    /// FinalizedWave.execution_certificates.
+    /// the wave certificate's execution certificates.
     pub fn on_certificate_committed(
         &mut self,
         _topology: &TopologySnapshot,
@@ -1373,7 +1373,7 @@ mod tests {
     fn make_test_wave_certificate(height: u64) -> WaveCertificate {
         WaveCertificate {
             wave_id: WaveId::new(ShardGroupId(0), height, BTreeSet::new()),
-            attestations: vec![],
+            execution_certificates: vec![],
         }
     }
 

@@ -4,7 +4,7 @@
 //! `prepare_block_commit` returns an opaque `PreparedCommit` handle that
 //! carries precomputed work; `commit_prepared_block` applies it efficiently.
 
-use hyperscale_types::{Block, ExecutionCertificate, Hash, QuorumCertificate, ReceiptBundle};
+use hyperscale_types::{Block, Hash, QuorumCertificate, ReceiptBundle};
 use std::sync::Arc;
 
 /// Abstracts state commitment for both simulation and production storage.
@@ -15,6 +15,9 @@ use std::sync::Arc;
 /// 2. The runner stores the handle (keyed by block hash or however it likes).
 /// 3. At commit time, `commit_prepared_block` applies the handle (fast path).
 ///    If no handle is available, `commit_block` recomputes from scratch.
+///
+/// Execution certificates are extracted from `block.certificates` (wave certs
+/// contain the ECs directly) — no separate parameter needed.
 ///
 /// All methods take `&self` — implementations use interior mutability.
 pub trait ChainWriter: Send + Sync {
@@ -52,26 +55,25 @@ pub trait ChainWriter: Send + Sync {
     /// prepared handle if the prepared data is stale (base root/version mismatch).
     ///
     /// Receipt writes are already included in the prepared handle — callers
-    /// only need to supply data that wasn't known at prepare time (block, QC,
-    /// execution certificates).
+    /// only need to supply data that wasn't known at prepare time (block, QC).
+    /// Execution certificates are extracted from `block.certificates`.
     fn commit_prepared_block(
         &self,
         prepared: Self::PreparedCommit,
         block: &Arc<Block>,
         qc: &Arc<QuorumCertificate>,
-        execution_certificates: &[Arc<ExecutionCertificate>],
     ) -> Hash;
 
     /// Commit a block's state writes from scratch (no prepared handle).
     ///
     /// Extracts and merges `DatabaseUpdates` from the receipts internally.
+    /// Execution certificates are extracted from `block.certificates`.
     /// Used when no `PreparedCommit` is available (e.g., sync blocks,
     /// cache eviction, or proposer fast-path not applicable).
     fn commit_block(
         &self,
         block: &Arc<Block>,
         qc: &Arc<QuorumCertificate>,
-        execution_certificates: &[Arc<ExecutionCertificate>],
         receipts: &[ReceiptBundle],
     ) -> Hash;
 

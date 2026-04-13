@@ -147,12 +147,12 @@ pub enum Action {
         recipients: Vec<ValidatorId>,
     },
 
-    /// Track an aggregated execution certificate for serving and eventual commit.
+    /// Cache an aggregated execution certificate for serving fetch requests.
     ///
-    /// Emitted by all validators after cert aggregation (not just the wave
-    /// leader). The io_loop stores these in the in-memory cache for
-    /// low-latency serving and queues them in `pending_ec_writes` for
-    /// atomic persistence in the next block commit's WriteBatch.
+    /// Emitted by all validators after cert aggregation. The io_loop stores
+    /// these in the in-memory cache so remote shards can fetch ECs before
+    /// the wave cert is built. Persistence is handled via wave certificates
+    /// in `block.certificates` at commit time.
     TrackExecutionCertificate {
         certificate: Arc<ExecutionCertificate>,
     },

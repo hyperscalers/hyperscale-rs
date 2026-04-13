@@ -97,11 +97,10 @@ pub type SharedTopologySnapshot = Arc<ArcSwap<TopologySnapshot>>;
 /// Shared execution certificate cache for fallback serving.
 type ExecCertCache = Arc<Mutex<HashMap<(Hash, WaveId), Arc<ExecutionCertificate>>>>;
 
-/// Buffered sync data (receipts + ECs) for a block height.
+/// Buffered sync data (receipts) for a block height.
 /// Consumed by the sync commit path for verification and atomic persistence.
 pub(crate) struct BufferedSyncResponse {
     pub local_receipts: Vec<hyperscale_types::LocalReceiptEntry>,
-    pub execution_certificates: Vec<Arc<hyperscale_types::ExecutionCertificate>>,
 }
 
 /// Default certificate cache capacity.
@@ -276,12 +275,8 @@ where
     last_slow_tx_warn: std::time::Duration,
 
     // Execution certificate cache for fallback serving.
-    // Shared with request handler thread. Keyed by (block_hash, wave_id).
+    // Shared with request handler thread. Keyed by (wave_id_hash, wave_id).
     exec_cert_cache: ExecCertCache,
-
-    // Pending EC writes — accumulated during a step, drained into the block
-    // commit WriteBatch for atomic persistence (D4: one fsync per block).
-    pending_ec_writes: Vec<Arc<hyperscale_types::ExecutionCertificate>>,
 
     // Sync data buffer: holds receipts and ECs from sync responses, keyed
     // by block height. Consumed by the sync path in flush_block_commits
@@ -373,7 +368,6 @@ where
             pending_block_commits: Vec::new(),
             commit_in_flight: Arc::new(AtomicBool::new(false)),
             exec_cert_cache: Arc::new(Mutex::new(HashMap::new())),
-            pending_ec_writes: Vec::new(),
             pending_sync_data: std::collections::HashMap::new(),
             cached_local_peers,
             tx_status_cache: Arc::new(QuickCache::new(DEFAULT_TX_STATUS_CACHE_SIZE)),
@@ -596,7 +590,7 @@ where
                 height,
                 block,
                 local_receipts,
-                execution_certificates,
+                execution_certificates: _,
             } => {
                 // Check 1: receipt_root verification (synchronous).
                 // Verify block body matches the QC-attested header.
@@ -627,16 +621,8 @@ where
                     // The commit closure verifies EC BLS signatures,
                     // cross-checks EC↔TC hashes, and verifies state_root.
                     if block.is_some() {
-                        self.pending_sync_data.insert(
-                            height,
-                            BufferedSyncResponse {
-                                local_receipts,
-                                execution_certificates: execution_certificates
-                                    .into_iter()
-                                    .map(Arc::new)
-                                    .collect(),
-                            },
-                        );
+                        self.pending_sync_data
+                            .insert(height, BufferedSyncResponse { local_receipts });
                     }
 
                     let outputs = self

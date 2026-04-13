@@ -30,7 +30,7 @@ fn updates_to_receipts(updates: &DatabaseUpdates) -> Vec<ReceiptBundle> {
 
 /// Helper: commit a block with empty updates and no ECs/receipts.
 fn commit_empty(storage: &RocksDbStorage, block: &hyperscale_types::Block, qc: &QuorumCertificate) {
-    storage.commit_block(&Arc::new(block.clone()), &Arc::new(qc.clone()), &[], &[]);
+    storage.commit_block(&Arc::new(block.clone()), &Arc::new(qc.clone()), &[]);
 }
 
 #[test]
@@ -324,7 +324,7 @@ fn test_commit_block_applies_writes() {
     let qc = make_test_qc(&block);
 
     let receipts = updates_to_receipts(&updates);
-    let result = storage.commit_block(&Arc::new(block), &Arc::new(qc), &[], &receipts);
+    let result = storage.commit_block(&Arc::new(block), &Arc::new(qc), &receipts);
     assert_ne!(result, Hash::ZERO);
 }
 
@@ -340,7 +340,7 @@ fn test_commit_block_multiple_certs() {
     let qc = make_test_qc(&block);
 
     let receipts = updates_to_receipts(&merged);
-    let result = storage.commit_block(&Arc::new(block), &Arc::new(qc), &[], &receipts);
+    let result = storage.commit_block(&Arc::new(block), &Arc::new(qc), &receipts);
     assert_ne!(result, Hash::ZERO);
 }
 
@@ -352,7 +352,7 @@ fn test_commit_block_empty_certs() {
     let block = make_test_block(1);
     let qc = make_test_qc(&block);
 
-    storage.commit_block(&Arc::new(block), &Arc::new(qc), &[], &[]);
+    storage.commit_block(&Arc::new(block), &Arc::new(qc), &[]);
     assert_eq!(storage.jvt_version(), 1);
 }
 
@@ -365,13 +365,13 @@ fn test_prepare_then_commit_matches_direct() {
     let block = make_test_block(1);
     let qc = make_test_qc(&block);
     let result_prepared =
-        s_prepared.commit_prepared_block(prepared, &Arc::new(block), &Arc::new(qc), &[]);
+        s_prepared.commit_prepared_block(prepared, &Arc::new(block), &Arc::new(qc));
 
     let temp_dir2 = TempDir::new().unwrap();
     let s_direct = RocksDbStorage::open(temp_dir2.path()).unwrap();
     let block2 = make_test_block(1);
     let qc2 = make_test_qc(&block2);
-    let result_direct = s_direct.commit_block(&Arc::new(block2), &Arc::new(qc2), &[], &[]);
+    let result_direct = s_direct.commit_block(&Arc::new(block2), &Arc::new(qc2), &[]);
 
     assert_eq!(result_prepared, result_direct);
     assert_eq!(spec_root, result_prepared);
@@ -391,7 +391,7 @@ fn test_commit_block_stores_certificates() {
     block.certificates = vec![cert];
     let qc = make_test_qc(&block);
 
-    let _ = storage.commit_block(&Arc::new(block), &Arc::new(qc), &[], &[]);
+    let _ = storage.commit_block(&Arc::new(block), &Arc::new(qc), &[]);
 
     assert!(storage.get_certificate(&wave_hash).is_some());
 }
@@ -665,10 +665,20 @@ fn test_ec_survives_reopen() {
         let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
         let block = hyperscale_storage::test_helpers::make_test_block(0);
         let qc = hyperscale_storage::test_helpers::make_test_qc(&block);
-        storage.commit_block(&Arc::new(block), &Arc::new(qc), &[], &[]);
-        let block = hyperscale_storage::test_helpers::make_test_block(1);
+        storage.commit_block(&Arc::new(block), &Arc::new(qc), &[]);
+        let mut block = hyperscale_storage::test_helpers::make_test_block(1);
+        block
+            .certificates
+            .push(Arc::new(hyperscale_types::WaveCertificate {
+                wave_id: hyperscale_types::WaveId::new(
+                    ShardGroupId(0),
+                    1,
+                    std::collections::BTreeSet::new(),
+                ),
+                execution_certificates: vec![Arc::new(ec)],
+            }));
         let qc = hyperscale_storage::test_helpers::make_test_qc(&block);
-        storage.commit_block(&Arc::new(block), &Arc::new(qc), &[Arc::new(ec)], &[]);
+        storage.commit_block(&Arc::new(block), &Arc::new(qc), &[]);
     }
 
     {
@@ -685,11 +695,21 @@ fn test_ec_atomic_with_block_commit() {
     let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
 
     let ec = hyperscale_storage::test_helpers::make_test_execution_certificate(1, 1);
-    let block = make_test_block(1);
+    let mut block = make_test_block(1);
+    block
+        .certificates
+        .push(Arc::new(hyperscale_types::WaveCertificate {
+            wave_id: hyperscale_types::WaveId::new(
+                ShardGroupId(0),
+                1,
+                std::collections::BTreeSet::new(),
+            ),
+            execution_certificates: vec![Arc::new(ec)],
+        }));
     let qc = make_test_qc(&block);
 
     // Commit block with EC atomically
-    storage.commit_block(&Arc::new(block), &Arc::new(qc), &[Arc::new(ec)], &[]);
+    storage.commit_block(&Arc::new(block), &Arc::new(qc), &[]);
 
     // EC should be retrievable by height
     let by_height = storage.get_execution_certificates_by_height(1);

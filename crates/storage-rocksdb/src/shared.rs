@@ -140,21 +140,17 @@ impl hyperscale_storage::ChainWriter for SharedStorage {
         prepared: Self::PreparedCommit,
         block: &Arc<hyperscale_types::Block>,
         qc: &Arc<hyperscale_types::QuorumCertificate>,
-        execution_certificates: &[Arc<hyperscale_types::ExecutionCertificate>],
     ) -> hyperscale_types::Hash {
-        self.0
-            .commit_prepared_block(prepared, block, qc, execution_certificates)
+        self.0.commit_prepared_block(prepared, block, qc)
     }
 
     fn commit_block(
         &self,
         block: &Arc<hyperscale_types::Block>,
         qc: &Arc<hyperscale_types::QuorumCertificate>,
-        execution_certificates: &[Arc<hyperscale_types::ExecutionCertificate>],
         receipts: &[hyperscale_types::ReceiptBundle],
     ) -> hyperscale_types::Hash {
-        self.0
-            .commit_block(block, qc, execution_certificates, receipts)
+        self.0.commit_block(block, qc, receipts)
     }
 
     fn memory_usage_bytes(&self) -> (u64, u64) {

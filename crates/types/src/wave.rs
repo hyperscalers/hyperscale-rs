@@ -19,7 +19,7 @@
 //! 1. [`WaveId`] — identity, computed from block contents
 //! 2. [`ExecutionVote`] — per-validator BLS vote on wave outcomes
 //! 3. [`ExecutionCertificate`] — aggregated 2f+1 shard-local certificate
-//! 4. [`ShardAttestation`] / [`WaveCertificate`] — cross-shard proof of finalization
+//! 4. [`WaveCertificate`] — cross-shard proof of finalization (holds ECs directly)
 //! 5. [`FinalizedWave`] — all data needed for block commit
 
 use crate::{
@@ -334,9 +334,34 @@ pub struct ExecutionCertificate {
     pub aggregated_signature: Bls12381G2Signature,
     /// Which validators signed (bitfield indexed by committee position).
     pub signers: SignerBitfield,
+    /// Cached canonical hash — precomputed at construction, serialized so
+    /// deserialization restores it without recomputation.
+    canonical_hash: Hash,
 }
 
 impl ExecutionCertificate {
+    /// Create a new execution certificate, computing the canonical hash eagerly.
+    pub fn new(
+        wave_id: WaveId,
+        vote_height: u64,
+        global_receipt_root: Hash,
+        tx_outcomes: Vec<TxOutcome>,
+        aggregated_signature: Bls12381G2Signature,
+        signers: SignerBitfield,
+    ) -> Self {
+        let canonical_hash =
+            Self::compute_canonical_hash(&wave_id, vote_height, &global_receipt_root, &tx_outcomes);
+        Self {
+            wave_id,
+            vote_height,
+            global_receipt_root,
+            tx_outcomes,
+            aggregated_signature,
+            signers,
+            canonical_hash,
+        }
+    }
+
     /// The shard that produced this certificate.
     pub fn shard_group_id(&self) -> ShardGroupId {
         self.wave_id.shard_group_id
@@ -347,7 +372,7 @@ impl ExecutionCertificate {
         self.wave_id.block_height
     }
 
-    /// Compute the canonical hash of this certificate.
+    /// Return the cached canonical hash.
     ///
     /// Hashes only the deterministic execution-result fields, **excluding**
     /// `aggregated_signature` and `signers`. Different validators aggregate
@@ -355,11 +380,20 @@ impl ExecutionCertificate {
     /// same wave — the canonical hash identifies the *logical* EC so that any
     /// valid aggregation resolves to the same hash.
     pub fn canonical_hash(&self) -> Hash {
+        self.canonical_hash
+    }
+
+    fn compute_canonical_hash(
+        wave_id: &WaveId,
+        vote_height: u64,
+        global_receipt_root: &Hash,
+        tx_outcomes: &[TxOutcome],
+    ) -> Hash {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(&basic_encode(&self.wave_id).unwrap());
-        hasher.update(&self.vote_height.to_le_bytes());
-        hasher.update(self.global_receipt_root.as_bytes());
-        hasher.update(&basic_encode(&self.tx_outcomes).unwrap());
+        hasher.update(&basic_encode(wave_id).unwrap());
+        hasher.update(&vote_height.to_le_bytes());
+        hasher.update(global_receipt_root.as_bytes());
+        hasher.update(&basic_encode(tx_outcomes).unwrap());
         Hash::from_hash_bytes(hasher.finalize().as_bytes())
     }
 }
@@ -425,59 +459,42 @@ pub fn compute_global_receipt_root_with_proof(
 
 /// Wave certificate — proof of execution finalization for a wave.
 ///
-/// Contains only shard attestations (proof half). Per-tx decisions
-/// (Accept/Reject/Aborted) are derived from the ECs referenced by
-/// the attestations. Every wave resolves through the EC path — there
-/// is no all-abort fallback.
+/// Contains the execution certificates from all participating shards.
+/// Per-tx decisions (Accept/Reject/Aborted) are derived from the ECs.
+/// Every wave resolves through the EC path — there is no all-abort fallback.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WaveCertificate {
     /// Self-contained wave identifier (shard + height + remote dependencies).
     /// Globally unique. `hash(wave_id)` = identity key for manifest/storage.
     pub wave_id: WaveId,
-    /// Shard attestations proving execution finalization.
-    /// May contain multiple attestations from the same shard — this happens when
+    /// Execution certificates from all participating shards.
+    /// May contain multiple ECs from the same shard — this happens when
     /// a remote shard committed this wave's transactions across multiple blocks,
     /// producing separate ECs.
-    /// Sorted by (shard_group_id, ec_hash) for deterministic receipt_hash.
-    pub attestations: Vec<ShardAttestation>,
-}
-
-/// Proof half of an execution certificate from a single shard.
-#[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
-pub struct ShardAttestation {
-    /// Which shard produced this EC.
-    pub shard_group_id: ShardGroupId,
-    /// Canonical hash of the EC this attestation came from.
-    pub ec_hash: Hash,
-    /// Vote height at which the EC was aggregated.
-    pub vote_height: u64,
-    /// Merkle root over per-tx outcome leaves in the EC.
-    pub global_receipt_root: Hash,
-    /// BLS aggregated signature from 2f+1 validators on this shard.
-    pub aggregated_signature: Bls12381G2Signature,
-    /// Which validators signed (bitfield indexed by committee position).
-    pub signers: SignerBitfield,
+    /// Sorted by (shard_group_id, canonical_hash) for deterministic receipt_hash.
+    pub execution_certificates: Vec<Arc<ExecutionCertificate>>,
 }
 
 impl WaveCertificate {
     /// Compute the receipt hash for this wave certificate.
     ///
-    /// Hashes sorted (shard_group_id, ec_hash) pairs. The vec is pre-sorted
-    /// at construction time for deterministic ordering. ec_hash already encodes
-    /// the WaveId, vote_height, global_receipt_root, and all tx_outcomes — so
-    /// this commits to the full content of every contributing EC.
+    /// Hashes sorted (shard_group_id, canonical_hash) pairs. The vec is
+    /// pre-sorted at construction time for deterministic ordering.
+    /// canonical_hash already encodes the WaveId, vote_height,
+    /// global_receipt_root, and all tx_outcomes — so this commits to
+    /// the full content of every contributing EC.
     pub fn receipt_hash(&self) -> Hash {
         let mut hasher = blake3::Hasher::new();
-        for att in &self.attestations {
-            hasher.update(&basic_encode(&att.shard_group_id).unwrap());
-            hasher.update(att.ec_hash.as_bytes());
+        for ec in &self.execution_certificates {
+            hasher.update(&basic_encode(&ec.shard_group_id()).unwrap());
+            hasher.update(ec.canonical_hash().as_bytes());
         }
         Hash::from_hash_bytes(hasher.finalize().as_bytes())
     }
 
-    /// Get attestations.
-    pub fn attestations(&self) -> &[ShardAttestation] {
-        &self.attestations
+    /// Get the execution certificates.
+    pub fn execution_certificates(&self) -> &[Arc<ExecutionCertificate>] {
+        &self.execution_certificates
     }
 }
 
@@ -493,7 +510,13 @@ impl<E: sbor::Encoder<sbor::NoCustomValueKind>> sbor::Encode<sbor::NoCustomValue
     fn encode_body(&self, encoder: &mut E) -> Result<(), sbor::EncodeError> {
         encoder.write_size(2)?;
         encoder.encode(&self.wave_id)?;
-        encoder.encode(&self.attestations)?;
+        // Encode Vec<Arc<ExecutionCertificate>> as Vec<ExecutionCertificate>
+        encoder.write_value_kind(sbor::ValueKind::Array)?;
+        encoder.write_value_kind(sbor::ValueKind::Tuple)?;
+        encoder.write_size(self.execution_certificates.len())?;
+        for ec in &self.execution_certificates {
+            encoder.encode_deeper_body(ec.as_ref())?;
+        }
         Ok(())
     }
 }
@@ -514,10 +537,19 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
             });
         }
         let wave_id: WaveId = decoder.decode()?;
-        let attestations: Vec<ShardAttestation> = decoder.decode()?;
+        // Decode Vec<ExecutionCertificate> into Vec<Arc<ExecutionCertificate>>
+        decoder.read_and_check_value_kind(sbor::ValueKind::Array)?;
+        decoder.read_and_check_value_kind(sbor::ValueKind::Tuple)?;
+        let count = decoder.read_size()?;
+        let mut execution_certificates = Vec::with_capacity(count);
+        for _ in 0..count {
+            let ec: ExecutionCertificate =
+                decoder.decode_deeper_body_with_value_kind(sbor::ValueKind::Tuple)?;
+            execution_certificates.push(Arc::new(ec));
+        }
         Ok(Self {
             wave_id,
-            attestations,
+            execution_certificates,
         })
     }
 }
@@ -580,9 +612,9 @@ pub fn decode_wave_cert_vec<D: sbor::Decoder<sbor::NoCustomValueKind>>(
 
 /// A finalized wave — all participating shards have reported, WaveCertificate created.
 ///
-/// Holds all data needed for block commit: the wave certificate, execution certificates,
-/// per-tx decisions, and receipt bundles. Receipts are written atomically with the
-/// block at commit time (not fire-and-forget).
+/// Holds all data needed for block commit: the wave certificate (which contains the
+/// execution certificates), per-tx decisions, and receipt bundles. Receipts are
+/// written atomically with the block at commit time (not fire-and-forget).
 ///
 /// Shared via `Arc` across the system — flows from execution state through
 /// pending blocks, actions, and into the commit path.
@@ -590,7 +622,6 @@ pub fn decode_wave_cert_vec<D: sbor::Decoder<sbor::NoCustomValueKind>>(
 pub struct FinalizedWave {
     pub certificate: Arc<WaveCertificate>,
     pub tx_hashes: Vec<Hash>,
-    pub execution_certificates: Vec<Arc<ExecutionCertificate>>,
     /// Per-transaction decisions: (tx_hash, decision).
     pub tx_decisions: Vec<(Hash, TransactionDecision)>,
     /// Receipt bundles for all transactions in this wave.
@@ -609,6 +640,11 @@ impl FinalizedWave {
     pub fn wave_id_hash(&self) -> Hash {
         self.certificate.wave_id.hash()
     }
+
+    /// Get the execution certificates (from the wave certificate).
+    pub fn execution_certificates(&self) -> &[Arc<ExecutionCertificate>] {
+        &self.certificate.execution_certificates
+    }
 }
 
 // Manual SBOR implementation for FinalizedWave (Arc fields prevent BasicSbor derive).
@@ -622,14 +658,9 @@ impl<E: sbor::Encoder<sbor::NoCustomValueKind>> sbor::Encode<sbor::NoCustomValue
     }
 
     fn encode_body(&self, encoder: &mut E) -> Result<(), sbor::EncodeError> {
-        encoder.write_size(6)?;
+        encoder.write_size(5)?;
         encoder.encode(self.certificate.as_ref())?;
         encoder.encode(&self.tx_hashes)?;
-        // Encode Vec<Arc<ExecutionCertificate>> as Vec<ExecutionCertificate>
-        encoder.encode(&self.execution_certificates.len())?;
-        for ec in &self.execution_certificates {
-            encoder.encode(ec.as_ref())?;
-        }
         encoder.encode(&self.tx_decisions)?;
         encoder.encode(&self.receipts)?;
         encoder.encode(&self.finalized_height)?;
@@ -646,27 +677,20 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
     ) -> Result<Self, sbor::DecodeError> {
         decoder.check_preloaded_value_kind(value_kind, sbor::ValueKind::Tuple)?;
         let length = decoder.read_size()?;
-        if length != 6 {
+        if length != 5 {
             return Err(sbor::DecodeError::UnexpectedSize {
-                expected: 6,
+                expected: 5,
                 actual: length,
             });
         }
         let certificate: WaveCertificate = decoder.decode()?;
         let tx_hashes: Vec<Hash> = decoder.decode()?;
-        let ec_count: usize = decoder.decode()?;
-        let mut execution_certificates = Vec::with_capacity(ec_count);
-        for _ in 0..ec_count {
-            let ec: ExecutionCertificate = decoder.decode()?;
-            execution_certificates.push(Arc::new(ec));
-        }
         let tx_decisions: Vec<(Hash, TransactionDecision)> = decoder.decode()?;
         let receipts: Vec<ReceiptBundle> = decoder.decode()?;
         let finalized_height: u64 = decoder.decode()?;
         Ok(Self {
             certificate: Arc::new(certificate),
             tx_hashes,
-            execution_certificates,
             tx_decisions,
             receipts,
             finalized_height,
@@ -850,14 +874,14 @@ mod tests {
         signers: SignerBitfield,
         signature: Bls12381G2Signature,
     ) -> ExecutionCertificate {
-        ExecutionCertificate {
-            wave_id: make_wave_id(0, 10, &[1]),
-            vote_height: 11,
-            global_receipt_root: Hash::from_bytes(b"global_receipt_root"),
-            tx_outcomes: vec![make_outcome(1), make_outcome(2)],
-            aggregated_signature: signature,
+        ExecutionCertificate::new(
+            make_wave_id(0, 10, &[1]),
+            11,
+            Hash::from_bytes(b"global_receipt_root"),
+            vec![make_outcome(1), make_outcome(2)],
+            signature,
             signers,
-        }
+        )
     }
 
     #[test]
@@ -889,37 +913,37 @@ mod tests {
         assert_eq!(ec_a.canonical_hash(), ec_b.canonical_hash());
     }
 
-    fn make_test_attestation(shard: u64, ec_hash_seed: u8) -> ShardAttestation {
-        ShardAttestation {
-            shard_group_id: ShardGroupId(shard),
-            ec_hash: Hash::from_bytes(&[ec_hash_seed; 4]),
-            vote_height: 43,
-            global_receipt_root: Hash::from_bytes(&[ec_hash_seed + 100; 4]),
-            aggregated_signature: Bls12381G2Signature([0u8; 96]),
-            signers: SignerBitfield::new(4),
-        }
+    fn make_test_wave_ec(shard: u64, seed: u8) -> Arc<ExecutionCertificate> {
+        Arc::new(ExecutionCertificate::new(
+            make_wave_id(shard, 42, &[1]),
+            43,
+            Hash::from_bytes(&[seed + 100; 4]),
+            vec![make_outcome(seed)],
+            Bls12381G2Signature([0u8; 96]),
+            SignerBitfield::new(4),
+        ))
     }
 
     #[test]
     fn test_receipt_hash_deterministic() {
         let wc = WaveCertificate {
             wave_id: make_wave_id(0, 42, &[1]),
-            attestations: vec![make_test_attestation(0, 1), make_test_attestation(1, 2)],
+            execution_certificates: vec![make_test_wave_ec(0, 1), make_test_wave_ec(1, 2)],
         };
         assert_eq!(wc.receipt_hash(), wc.receipt_hash());
         assert_ne!(wc.receipt_hash(), Hash::ZERO);
     }
 
     #[test]
-    fn test_receipt_hash_changes_with_ec_hash() {
+    fn test_receipt_hash_changes_with_ec() {
         let wave_id = make_wave_id(0, 42, &[1]);
         let wc1 = WaveCertificate {
             wave_id: wave_id.clone(),
-            attestations: vec![make_test_attestation(0, 1)],
+            execution_certificates: vec![make_test_wave_ec(0, 1)],
         };
         let wc2 = WaveCertificate {
             wave_id,
-            attestations: vec![make_test_attestation(0, 2)],
+            execution_certificates: vec![make_test_wave_ec(0, 2)],
         };
         assert_ne!(wc1.receipt_hash(), wc2.receipt_hash());
     }
@@ -928,7 +952,7 @@ mod tests {
     fn test_wave_cert_sbor_roundtrip() {
         let wc = WaveCertificate {
             wave_id: make_wave_id(0, 42, &[1]),
-            attestations: vec![make_test_attestation(0, 1), make_test_attestation(1, 2)],
+            execution_certificates: vec![make_test_wave_ec(0, 1), make_test_wave_ec(1, 2)],
         };
         let encoded = basic_encode(&wc).unwrap();
         let decoded: WaveCertificate = basic_decode(&encoded).unwrap();
@@ -940,7 +964,7 @@ mod tests {
         let certs = vec![
             Arc::new(WaveCertificate {
                 wave_id: make_wave_id(0, 42, &[1]),
-                attestations: vec![make_test_attestation(0, 1)],
+                execution_certificates: vec![make_test_wave_ec(0, 1)],
             }),
             Arc::new(WaveCertificate {
                 wave_id: WaveId {
@@ -948,7 +972,7 @@ mod tests {
                     block_height: 42,
                     remote_shards: BTreeSet::new(),
                 },
-                attestations: vec![make_test_attestation(1, 3)],
+                execution_certificates: vec![make_test_wave_ec(1, 3)],
             }),
         ];
 

@@ -57,14 +57,14 @@ pub fn aggregate_execution_certificate(
 
     let vote_height = votes.first().map(|v| v.vote_height).unwrap_or(0);
 
-    ExecutionCertificate {
+    ExecutionCertificate::new(
+        wave_id.clone(),
         vote_height,
-        wave_id: wave_id.clone(),
         global_receipt_root,
         tx_outcomes,
         aggregated_signature,
         signers,
-    }
+    )
 }
 
 /// Batch verify execution votes.

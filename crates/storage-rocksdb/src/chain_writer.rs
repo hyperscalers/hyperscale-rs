@@ -70,7 +70,6 @@ impl hyperscale_storage::ChainWriter for RocksDbStorage {
         prepared: Self::PreparedCommit,
         block: &Arc<hyperscale_types::Block>,
         qc: &Arc<hyperscale_types::QuorumCertificate>,
-        execution_certificates: &[Arc<hyperscale_types::ExecutionCertificate>],
     ) -> hyperscale_types::Hash {
         let result_root = prepared.jvt_snapshot.result_root;
 
@@ -80,11 +79,7 @@ impl hyperscale_storage::ChainWriter for RocksDbStorage {
         // Receipt writes are already in the write_batch from prepare time.
         self.append_block_to_batch(&mut write_batch, block, qc);
 
-        crate::execution_certs::append_execution_certs_to_batch(
-            self,
-            &mut write_batch,
-            execution_certificates,
-        );
+        crate::execution_certs::append_block_certs_to_batch(self, &mut write_batch, block);
 
         let used_fast_path =
             self.try_apply_prepared_commit(write_batch, prepared.jvt_snapshot, block, qc);
@@ -92,13 +87,7 @@ impl hyperscale_storage::ChainWriter for RocksDbStorage {
         if used_fast_path {
             result_root
         } else {
-            self.commit_block_inner(
-                &prepared.merged_updates,
-                block,
-                qc,
-                execution_certificates,
-                &prepared.receipts,
-            )
+            self.commit_block_inner(&prepared.merged_updates, block, qc, &prepared.receipts)
         }
     }
 
@@ -106,11 +95,10 @@ impl hyperscale_storage::ChainWriter for RocksDbStorage {
         &self,
         block: &Arc<hyperscale_types::Block>,
         qc: &Arc<hyperscale_types::QuorumCertificate>,
-        execution_certificates: &[Arc<hyperscale_types::ExecutionCertificate>],
         receipts: &[ReceiptBundle],
     ) -> hyperscale_types::Hash {
         let merged_updates = hyperscale_storage::merge_updates_from_receipts(receipts);
-        self.commit_block_inner(&merged_updates, block, qc, execution_certificates, receipts)
+        self.commit_block_inner(&merged_updates, block, qc, receipts)
     }
 
     fn memory_usage_bytes(&self) -> (u64, u64) {
@@ -152,7 +140,6 @@ impl RocksDbStorage {
         merged_updates: &DatabaseUpdates,
         block: &Arc<hyperscale_types::Block>,
         qc: &Arc<hyperscale_types::QuorumCertificate>,
-        execution_certificates: &[Arc<hyperscale_types::ExecutionCertificate>],
         receipts: &[ReceiptBundle],
     ) -> hyperscale_types::Hash {
         let block_height = block.header.height.0;
@@ -173,11 +160,7 @@ impl RocksDbStorage {
         // Persist block data (header, transactions, certificates) atomically.
         self.append_block_to_batch(&mut batch, block, qc);
 
-        crate::execution_certs::append_execution_certs_to_batch(
-            self,
-            &mut batch,
-            execution_certificates,
-        );
+        crate::execution_certs::append_block_certs_to_batch(self, &mut batch, block);
 
         // Add receipts to the batch atomically.
         for bundle in receipts {

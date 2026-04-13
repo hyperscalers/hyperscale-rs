@@ -5,17 +5,17 @@
 //! the same provision dependency set within a block).
 
 use hyperscale_types::{
-    ExecutionCertificate, ExecutionOutcome, Hash, ShardAttestation, ShardGroupId,
-    TransactionDecision, WaveCertificate, WaveId,
+    ExecutionCertificate, ExecutionOutcome, Hash, ShardGroupId, TransactionDecision,
+    WaveCertificate, WaveId,
 };
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 
 /// Tracks execution certificates for wave-level finalization.
 ///
-/// Collects ShardAttestations from ECs. A single remote shard may contribute
-/// multiple ECs (when it committed the wave's txs across multiple blocks),
-/// so we track per-tx coverage rather than per-shard.
+/// Collects ECs from all participating shards. A single remote shard may
+/// contribute multiple ECs (when it committed the wave's txs across multiple
+/// blocks), so we track per-tx coverage rather than per-shard.
 ///
 /// Completion = every tx in the wave has all participating shards covered.
 #[derive(Debug)]
@@ -32,10 +32,8 @@ pub struct WaveCertificateTracker {
     aborted: BTreeSet<Hash>,
     /// All contributing ECs (held as Arc for cheap sharing).
     execution_certificates: Vec<Arc<ExecutionCertificate>>,
-    /// ShardAttestations built from ECs (for WaveCertificate construction).
-    attestations: Vec<ShardAttestation>,
     /// Canonical hashes of ECs already processed (dedup guard).
-    /// Prevents duplicate attestations from network re-delivery.
+    /// Prevents duplicate ECs from network re-delivery.
     seen_ec_hashes: HashSet<Hash>,
     /// Height when this tracker was created.
     created_at: u64,
@@ -61,7 +59,6 @@ impl WaveCertificateTracker {
             covered,
             aborted: BTreeSet::new(),
             execution_certificates: Vec::new(),
-            attestations: Vec::new(),
             seen_ec_hashes: HashSet::new(),
             created_at,
         }
@@ -81,27 +78,16 @@ impl WaveCertificateTracker {
 
     /// Feed an EC into the tracker. Returns true if the wave is now complete.
     ///
-    /// Builds a ShardAttestation from the EC and updates per-tx coverage.
-    /// Duplicate ECs (same canonical_hash) are silently ignored to prevent
-    /// non-deterministic attestation lists from network re-delivery.
+    /// Updates per-tx coverage from the EC's outcomes. Duplicate ECs (same
+    /// canonical_hash) are silently ignored to prevent non-deterministic
+    /// certificate lists from network re-delivery.
     pub fn add_execution_certificate(&mut self, ec: Arc<ExecutionCertificate>) -> bool {
         let ec_hash = ec.canonical_hash();
         if !self.seen_ec_hashes.insert(ec_hash) {
-            // Already processed this EC — skip to avoid duplicate attestations.
             return self.is_complete();
         }
 
         let shard = ec.shard_group_id();
-
-        // Build attestation from EC
-        let attestation = ShardAttestation {
-            shard_group_id: shard,
-            ec_hash: ec.canonical_hash(),
-            vote_height: ec.vote_height,
-            global_receipt_root: ec.global_receipt_root,
-            aggregated_signature: ec.aggregated_signature,
-            signers: ec.signers.clone(),
-        };
 
         // Update per-tx coverage
         for outcome in &ec.tx_outcomes {
@@ -111,11 +97,8 @@ impl WaveCertificateTracker {
                     self.aborted.insert(outcome.tx_hash);
                 }
             }
-            // Outcomes for unknown tx_hashes are silently ignored — they may
-            // belong to a different wave on the remote shard.
         }
 
-        self.attestations.push(attestation);
         self.execution_certificates.push(ec);
 
         self.is_complete()
@@ -144,16 +127,16 @@ impl WaveCertificateTracker {
         true
     }
 
-    /// Create a WaveCertificate from collected attestations.
+    /// Create a WaveCertificate from collected execution certificates.
     ///
     /// Call only when `is_complete()` returns true.
     ///
-    /// Only includes attestations from ECs that cover at least one non-aborted tx
-    /// in this wave. ECs that only cover aborted txs are excluded — since aborted
-    /// txs don't require remote confirmation, including those ECs would make the
-    /// attestation list non-deterministic (depends on EC arrival order/timing).
+    /// Only includes ECs that cover at least one non-aborted tx in this wave.
+    /// ECs that only cover aborted txs are excluded — since aborted txs don't
+    /// require remote confirmation, including those ECs would make the
+    /// certificate list non-deterministic (depends on EC arrival order/timing).
     ///
-    /// Attestations are sorted by (shard_group_id, ec_hash) for deterministic receipt_hash.
+    /// ECs are sorted by (shard_group_id, canonical_hash) for deterministic receipt_hash.
     pub fn create_wave_certificate(&mut self) -> WaveCertificate {
         // Build set of ec_hashes that cover at least one non-aborted tx in this wave.
         let required_ec_hashes: HashSet<Hash> = self
@@ -161,7 +144,6 @@ impl WaveCertificateTracker {
             .iter()
             .filter(|ec| {
                 ec.tx_outcomes.iter().any(|outcome| {
-                    // Must be a tx in this wave AND not aborted
                     self.participating_shards.contains_key(&outcome.tx_hash)
                         && !self.aborted.contains(&outcome.tx_hash)
                 })
@@ -169,21 +151,23 @@ impl WaveCertificateTracker {
             .map(|ec| ec.canonical_hash())
             .collect();
 
-        // Filter attestations to only required ECs
-        let mut attestations: Vec<ShardAttestation> = self
-            .attestations
+        // Filter to only required ECs
+        let mut ecs: Vec<Arc<ExecutionCertificate>> = self
+            .execution_certificates
             .iter()
-            .filter(|att| required_ec_hashes.contains(&att.ec_hash))
+            .filter(|ec| required_ec_hashes.contains(&ec.canonical_hash()))
             .cloned()
             .collect();
 
         // Sort for deterministic receipt_hash
-        attestations
-            .sort_by(|a, b| (&a.shard_group_id, &a.ec_hash).cmp(&(&b.shard_group_id, &b.ec_hash)));
+        ecs.sort_by(|a, b| {
+            (&a.shard_group_id(), &a.canonical_hash())
+                .cmp(&(&b.shard_group_id(), &b.canonical_hash()))
+        });
 
         WaveCertificate {
             wave_id: self.wave_id.clone(),
-            attestations,
+            execution_certificates: ecs,
         }
     }
 
@@ -224,11 +208,6 @@ impl WaveCertificateTracker {
             })
             .collect()
     }
-
-    /// Take the collected execution certificates (for FinalizedWave).
-    pub fn take_execution_certificates(&mut self) -> Vec<Arc<ExecutionCertificate>> {
-        std::mem::take(&mut self.execution_certificates)
-    }
 }
 
 #[cfg(test)]
@@ -265,14 +244,14 @@ mod tests {
         // since ec.shard_group_id() is derived from wave_id.shard_group_id.
         // Each shard creates its own wave_id reflecting itself as origin.
         let ec_wave_id = WaveId::new(shard, _wave_id.block_height, _wave_id.remote_shards.clone());
-        Arc::new(ExecutionCertificate {
-            wave_id: ec_wave_id,
-            vote_height: 11,
-            global_receipt_root: Hash::from_bytes(b"receipt_root"),
-            tx_outcomes: outcomes,
-            aggregated_signature: Bls12381G2Signature([0u8; 96]),
-            signers: SignerBitfield::new(4),
-        })
+        Arc::new(ExecutionCertificate::new(
+            ec_wave_id,
+            11,
+            Hash::from_bytes(b"receipt_root"),
+            outcomes,
+            Bls12381G2Signature([0u8; 96]),
+            SignerBitfield::new(4),
+        ))
     }
 
     #[test]
@@ -291,7 +270,7 @@ mod tests {
         assert!(tracker.is_complete());
 
         let wc = tracker.create_wave_certificate();
-        assert_eq!(wc.attestations().len(), 1);
+        assert_eq!(wc.execution_certificates().len(), 1);
     }
 
     #[test]

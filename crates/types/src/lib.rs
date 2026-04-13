@@ -96,8 +96,8 @@ pub use validator::{ValidatorInfo, ValidatorSet};
 pub use wave::{
     compute_global_receipt_root_with_proof, compute_waves, decode_wave_cert_vec,
     derive_wave_tx_hashes, designated_broadcaster, encode_wave_cert_vec, tx_outcome_leaf,
-    ExecutionCertificate, ExecutionOutcome, ExecutionVote, FinalizedWave, ShardAttestation,
-    TxOutcome, WaveCertificate, WaveId,
+    ExecutionCertificate, ExecutionOutcome, ExecutionVote, FinalizedWave, TxOutcome,
+    WaveCertificate, WaveId,
 };
 // Re-export with legacy alias for cross-crate use
 pub use wave::compute_global_receipt_root as compute_execution_receipt_root;

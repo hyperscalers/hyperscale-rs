@@ -694,7 +694,6 @@ impl StateMachine for NodeStateMachine {
             ProtocolEvent::WaveCompleted {
                 wave_cert: _,
                 tx_hashes: _,
-                execution_certificates: _,
             } => {
                 // Wave-level finalization event. Per-tx handling is done via
                 // TransactionExecuted events emitted alongside WaveCompleted.

@@ -635,26 +635,29 @@ mod tests {
     #[test]
     fn test_compute_certificate_root_deterministic() {
         use crate::{
-            Bls12381G2Signature, ShardAttestation, ShardGroupId, SignerBitfield, WaveCertificate,
-            WaveId,
+            Bls12381G2Signature, ExecutionCertificate, ExecutionOutcome, ShardGroupId,
+            SignerBitfield, TxOutcome, WaveCertificate, WaveId,
         };
         use std::collections::BTreeSet;
 
         let make_wave_cert = |seed: u8| -> Arc<WaveCertificate> {
-            Arc::new(WaveCertificate {
-                wave_id: WaveId {
-                    shard_group_id: ShardGroupId(0),
-                    block_height: 10,
-                    remote_shards: BTreeSet::from([ShardGroupId(1)]),
-                },
-                attestations: vec![ShardAttestation {
-                    shard_group_id: ShardGroupId(0),
-                    ec_hash: Hash::from_bytes(&[seed; 4]),
-                    vote_height: 11,
-                    global_receipt_root: Hash::from_bytes(&[seed + 100; 4]),
-                    aggregated_signature: Bls12381G2Signature([0u8; 96]),
-                    signers: SignerBitfield::new(4),
+            let ec = Arc::new(ExecutionCertificate::new(
+                WaveId::new(ShardGroupId(0), 10, BTreeSet::from([ShardGroupId(1)])),
+                11,
+                Hash::from_bytes(&[seed + 100; 4]),
+                vec![TxOutcome {
+                    tx_hash: Hash::from_bytes(&[seed; 4]),
+                    outcome: ExecutionOutcome::Executed {
+                        receipt_hash: Hash::from_bytes(&[seed + 50; 4]),
+                        success: true,
+                    },
                 }],
+                Bls12381G2Signature([0u8; 96]),
+                SignerBitfield::new(4),
+            ));
+            Arc::new(WaveCertificate {
+                wave_id: WaveId::new(ShardGroupId(0), 10, BTreeSet::from([ShardGroupId(1)])),
+                execution_certificates: vec![ec],
             })
         };
 
@@ -668,25 +671,28 @@ mod tests {
     #[test]
     fn test_compute_certificate_root_single_cert() {
         use crate::{
-            Bls12381G2Signature, ShardAttestation, ShardGroupId, SignerBitfield, WaveCertificate,
-            WaveId,
+            Bls12381G2Signature, ExecutionCertificate, ExecutionOutcome, ShardGroupId,
+            SignerBitfield, TxOutcome, WaveCertificate, WaveId,
         };
         use std::collections::BTreeSet;
 
-        let cert = Arc::new(WaveCertificate {
-            wave_id: WaveId {
-                shard_group_id: ShardGroupId(0),
-                block_height: 10,
-                remote_shards: BTreeSet::new(),
-            },
-            attestations: vec![ShardAttestation {
-                shard_group_id: ShardGroupId(0),
-                ec_hash: Hash::from_bytes(b"ec1"),
-                vote_height: 11,
-                global_receipt_root: Hash::from_bytes(b"receipt"),
-                aggregated_signature: Bls12381G2Signature([0u8; 96]),
-                signers: SignerBitfield::new(4),
+        let ec = Arc::new(ExecutionCertificate::new(
+            WaveId::new(ShardGroupId(0), 10, BTreeSet::new()),
+            11,
+            Hash::from_bytes(b"receipt"),
+            vec![TxOutcome {
+                tx_hash: Hash::from_bytes(b"tx1"),
+                outcome: ExecutionOutcome::Executed {
+                    receipt_hash: Hash::from_bytes(b"rh"),
+                    success: true,
+                },
             }],
+            Bls12381G2Signature([0u8; 96]),
+            SignerBitfield::new(4),
+        ));
+        let cert = Arc::new(WaveCertificate {
+            wave_id: WaveId::new(ShardGroupId(0), 10, BTreeSet::new()),
+            execution_certificates: vec![ec],
         });
 
         let root = compute_certificate_root(std::slice::from_ref(&cert));
