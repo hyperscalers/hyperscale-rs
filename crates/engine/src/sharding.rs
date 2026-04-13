@@ -66,7 +66,7 @@
 
 use hyperscale_storage::{DatabaseUpdates, DbPartitionKey, SubstateDatabase};
 use hyperscale_types::{NodeId, ShardGroupId};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
 /// System entity type bytes that should be filtered from DatabaseUpdates.
 ///
@@ -335,20 +335,6 @@ pub fn compute_writes_root(updates: &DatabaseUpdates) -> hyperscale_types::Hash 
 // ============================================================================
 // Utilities
 // ============================================================================
-
-/// Extract deduplicated, deterministically-ordered NodeIds from DatabaseUpdates.
-///
-/// Uses BTreeSet to ensure all validators within a shard produce identical
-/// write_nodes vectors (deterministic ordering from identical execution).
-pub fn extract_write_nodes(updates: &DatabaseUpdates) -> Vec<NodeId> {
-    updates
-        .node_updates
-        .keys()
-        .filter_map(|db_node_key| db_node_key_to_node_id(db_node_key))
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect()
-}
 
 /// Extract the NodeId from a SpreadPrefixKeyMapper db_node_key.
 ///

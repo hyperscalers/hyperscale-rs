@@ -255,7 +255,6 @@ mod tests {
                     ExecutionOutcome::Executed {
                         receipt_hash: Hash::from_bytes(b"receipt"),
                         success: true,
-                        write_nodes: vec![],
                     }
                 } else {
                     ExecutionOutcome::Aborted

@@ -2026,7 +2026,6 @@ mod tests {
         let proof = ExecutionOutcome::Executed {
             receipt_hash,
             success: true,
-            write_nodes: vec![],
         };
 
         assert!(proof.is_success());

@@ -169,7 +169,6 @@ pub fn make_test_execution_certificate(seed: u8, block_height: u64) -> Execution
             outcome: ExecutionOutcome::Executed {
                 receipt_hash: Hash::from_bytes(&[seed + 150; 32]),
                 success: true,
-                write_nodes: vec![],
             },
         }],
         aggregated_signature: Bls12381G2Signature([0u8; 96]),

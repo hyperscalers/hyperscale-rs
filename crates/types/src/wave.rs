@@ -23,9 +23,8 @@
 //! 5. [`FinalizedWave`] — all data needed for block commit
 
 use crate::{
-    compute_padded_merkle_root, Bls12381G2Signature, Hash, NodeId, ReceiptBundle,
-    RoutableTransaction, ShardGroupId, SignerBitfield, TopologySnapshot, TransactionDecision,
-    ValidatorId,
+    compute_padded_merkle_root, Bls12381G2Signature, Hash, ReceiptBundle, RoutableTransaction,
+    ShardGroupId, SignerBitfield, TopologySnapshot, TransactionDecision, ValidatorId,
 };
 use sbor::prelude::*;
 use std::collections::BTreeSet;
@@ -241,11 +240,7 @@ pub enum ExecutionOutcome {
     /// Transaction executed. `receipt_hash` is the hash of the execution receipt.
     /// `success=true` means the transaction's logic succeeded (writes applied).
     /// `success=false` means the transaction's logic failed (no writes).
-    Executed {
-        receipt_hash: Hash,
-        success: bool,
-        write_nodes: Vec<NodeId>,
-    },
+    Executed { receipt_hash: Hash, success: bool },
     /// Transaction aborted before execution could complete.
     Aborted,
 }
@@ -707,7 +702,6 @@ mod tests {
             outcome: ExecutionOutcome::Executed {
                 receipt_hash: Hash::from_bytes(&[seed + 100; 4]),
                 success: true,
-                write_nodes: vec![],
             },
         }
     }
@@ -824,7 +818,6 @@ mod tests {
             outcome: ExecutionOutcome::Executed {
                 receipt_hash: Hash::from_bytes(b"receipt"),
                 success: true,
-                write_nodes: vec![],
             },
         };
         let failure = TxOutcome {
@@ -832,7 +825,6 @@ mod tests {
             outcome: ExecutionOutcome::Executed {
                 receipt_hash: Hash::from_bytes(b"receipt"),
                 success: false,
-                write_nodes: vec![],
             },
         };
         assert_ne!(tx_outcome_leaf(&success), tx_outcome_leaf(&failure));
@@ -845,7 +837,6 @@ mod tests {
             outcome: ExecutionOutcome::Executed {
                 receipt_hash: Hash::from_bytes(b"receipt"),
                 success: true,
-                write_nodes: vec![],
             },
         };
         let aborted = TxOutcome {

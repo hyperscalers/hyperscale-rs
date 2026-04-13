@@ -135,7 +135,6 @@ pub fn make_shard_execution_proof(receipt_hash: Hash, success: bool) -> Executio
     ExecutionOutcome::Executed {
         receipt_hash,
         success,
-        write_nodes: vec![],
     }
 }
 

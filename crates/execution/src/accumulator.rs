@@ -408,7 +408,6 @@ mod tests {
         ExecutionOutcome::Executed {
             receipt_hash: receipt,
             success: true,
-            write_nodes: vec![],
         }
     }
 
@@ -416,7 +415,6 @@ mod tests {
         ExecutionOutcome::Executed {
             receipt_hash: receipt,
             success: false,
-            write_nodes: vec![],
         }
     }
 

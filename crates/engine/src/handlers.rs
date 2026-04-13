@@ -7,7 +7,6 @@
 //! The `execution` crate's handlers delegate to these functions.
 
 use crate::executor::Engine;
-use crate::sharding;
 use crate::SingleTxResult;
 use hyperscale_storage::SubstateStore;
 use hyperscale_types::{ExecutionOutcome, Hash, RoutableTransaction, ShardGroupId, TxOutcome};
@@ -76,16 +75,14 @@ pub fn execute_cross_shard<S: SubstateStore, E: Engine>(
 
 /// Extract execution-ready result data from a SingleTxResult.
 ///
-/// Extracts write_nodes and builds a `TxOutcome` for the execution accumulator.
+/// Builds a `TxOutcome` for the execution accumulator.
 /// Called on the handler thread (after execution, before returning to state machine).
 pub fn extract_execution_result(result: &SingleTxResult) -> TxOutcome {
-    let write_nodes = sharding::extract_write_nodes(&result.local_receipt.database_updates);
     TxOutcome {
         tx_hash: result.tx_hash,
         outcome: ExecutionOutcome::Executed {
             receipt_hash: result.receipt_hash,
             success: result.success,
-            write_nodes,
         },
     }
 }
