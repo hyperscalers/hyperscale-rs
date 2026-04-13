@@ -1575,12 +1575,14 @@ impl ExecutionState {
             receipts,
             finalized_height: self.committed_height,
         };
+        let finalized_arc = Arc::new(finalized.clone());
         self.finalized_wave_certificates
             .insert(wave_id.clone(), finalized);
 
-        // Cache the wave certificate so peers can fetch it before voting.
-        let mut actions = vec![Action::CacheWaveCertificate {
-            certificate: Arc::clone(&cert_arc),
+        // Cache the finalized wave so peers can fetch the complete data they
+        // need to vote on blocks containing this wave.
+        let mut actions = vec![Action::CacheFinalizedWave {
+            wave: finalized_arc,
         }];
 
         // Emit WaveCompleted (wave-level event)

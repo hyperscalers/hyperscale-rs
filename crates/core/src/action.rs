@@ -549,13 +549,13 @@ pub enum Action {
     // ═══════════════════════════════════════════════════════════════════════
     // Storage: Execution
     // ═══════════════════════════════════════════════════════════════════════
-    /// Cache a finalized wave certificate so peers can fetch it.
+    /// Cache a finalized wave so peers can fetch it.
     ///
     /// Emitted by `finalize_wave` in `ExecutionState` when a wave completes.
-    /// The io_loop inserts the certificate into `cert_cache` keyed by
-    /// `wave_id.hash()`, which matches the `cert_hashes` entries in
-    /// `BlockManifest`. Peers fetch wave certificates via
-    CacheWaveCertificate { certificate: Arc<WaveCertificate> },
+    /// The io_loop inserts the wave certificate into `cert_cache` and the
+    /// full `FinalizedWave` into `finalized_wave_cache`, both keyed by
+    /// `wave_id.hash()` (matches `BlockManifest.cert_hashes`).
+    CacheFinalizedWave { wave: Arc<FinalizedWave> },
 
     /// Persist receipt bundles to disk. Fire-and-forget — no ProtocolEvent response.
     // ═══════════════════════════════════════════════════════════════════════
@@ -725,6 +725,20 @@ pub enum Action {
         batch_hashes: Vec<Hash>,
     },
 
+    /// Fetch missing finalized wave data for a pending block.
+    ///
+    /// Emitted by `check_pending_block_fetches()` when a pending block has
+    /// missing waves past the fetch timeout. The runner sends a
+    /// `GetFinalizedWavesRequest` to the proposer or local peers.
+    FetchFinalizedWave {
+        /// Hash of the block that needs these finalized waves.
+        block_hash: Hash,
+        /// The proposer of the block (preferred fetch target).
+        proposer: ValidatorId,
+        /// Wave ID hashes (from `BlockManifest.cert_hashes`) of missing waves.
+        wave_id_hashes: Vec<Hash>,
+    },
+
     /// Cancel any pending fetch operations for a block.
     ///
     /// Emitted when a pending block is removed from BFT state (committed, stale,
@@ -860,7 +874,7 @@ impl Action {
             Action::BroadcastVote { .. } => "BroadcastVote",
 
             // Storage - Execution
-            Action::CacheWaveCertificate { .. } => "CacheWaveCertificate",
+            Action::CacheFinalizedWave { .. } => "CacheFinalizedWave",
 
             // Storage - Read Requests
             Action::FetchChainMetadata => "FetchChainMetadata",
@@ -882,6 +896,7 @@ impl Action {
             Action::StartSync { .. } => "StartSync",
             Action::FetchTransactions { .. } => "FetchTransactions",
             Action::FetchProvisionLocal { .. } => "FetchProvisionLocal",
+            Action::FetchFinalizedWave { .. } => "FetchFinalizedWave",
             Action::CancelFetch { .. } => "CancelFetch",
             Action::FetchProvisionRemote { .. } => "FetchProvisionRemote",
             Action::RequestMissingExecutionCert { .. } => "RequestMissingExecutionCert",

@@ -27,6 +27,7 @@ mod verify;
 use crate::batch_accumulator::BatchAccumulator;
 use crate::config::NodeConfig;
 use crate::protocol::execution_cert_fetch::{ExecCertFetchInput, ExecCertFetchProtocol};
+use crate::protocol::finalized_wave_fetch::{FinalizedWaveFetchInput, FinalizedWaveFetchProtocol};
 use crate::protocol::header_fetch::{HeaderFetchInput, HeaderFetchProtocol};
 use crate::protocol::local_provision_fetch::{
     LocalProvisionFetchInput, LocalProvisionFetchProtocol,
@@ -213,6 +214,7 @@ where
     cert_cache: Arc<QuickCache<Hash, Arc<WaveCertificate>>>,
     tx_cache: Arc<QuickCache<Hash, Arc<RoutableTransaction>>>,
     provision_cache: Arc<QuickCache<Hash, Arc<Provision>>>,
+    finalized_wave_cache: Arc<QuickCache<Hash, Arc<FinalizedWave>>>,
 
     // Sync protocol
     sync_protocol: SyncProtocol,
@@ -222,6 +224,9 @@ where
 
     // Local provision fetch protocol (intra-shard provision batch fetching)
     local_provision_fetch_protocol: LocalProvisionFetchProtocol,
+
+    // Finalized wave fetch protocol (intra-shard wave data fetching)
+    finalized_wave_fetch_protocol: FinalizedWaveFetchProtocol,
 
     // Provision fetch protocol (cross-shard provision fetching with peer rotation)
     provision_fetch_protocol: ProvisionFetchProtocol,
@@ -322,6 +327,7 @@ where
         let transaction_fetch_protocol =
             TransactionFetchProtocol::new(config.transaction_fetch.clone());
         let local_provision_fetch_protocol = LocalProvisionFetchProtocol::new(Default::default());
+        let finalized_wave_fetch_protocol = FinalizedWaveFetchProtocol::new(Default::default());
         let provision_fetch_protocol = ProvisionFetchProtocol::new(config.provision_fetch.clone());
         let exec_cert_fetch_protocol = ExecCertFetchProtocol::new(config.exec_cert_fetch.clone());
         let header_fetch_protocol =
@@ -342,12 +348,14 @@ where
             cert_cache: Arc::new(QuickCache::new(DEFAULT_CERT_CACHE_SIZE)),
             tx_cache: Arc::new(QuickCache::new(DEFAULT_TX_CACHE_SIZE)),
             provision_cache: Arc::new(QuickCache::new(DEFAULT_PROVISION_CACHE_SIZE)),
+            finalized_wave_cache: Arc::new(QuickCache::new(DEFAULT_CERT_CACHE_SIZE)),
             tx_validator,
             pending_validation: HashSet::new(),
             locally_submitted: HashSet::new(),
             sync_protocol,
             transaction_fetch_protocol,
             local_provision_fetch_protocol,
+            finalized_wave_fetch_protocol,
             provision_fetch_protocol,
             exec_cert_fetch_protocol,
             header_fetch_protocol,
@@ -678,6 +686,11 @@ where
                     .local_provision_fetch_protocol
                     .handle(LocalProvisionFetchInput::Tick);
                 self.process_local_provision_fetch_outputs(local_prov_outputs);
+                // Also tick the finalized wave fetch protocol.
+                let wave_outputs = self
+                    .finalized_wave_fetch_protocol
+                    .handle(FinalizedWaveFetchInput::Tick);
+                self.process_finalized_wave_fetch_outputs(wave_outputs);
                 // Also tick the provision fetch protocol.
                 let prov_outputs =
                     self.provision_fetch_protocol
@@ -877,6 +890,28 @@ where
                 self.broadcast_provisions(batches, block_timestamp);
             }
 
+            // ── Finalized wave fetch ─────────────────────────────────
+            NodeInput::FinalizedWaveReceived { block_hash, waves } => {
+                let outputs = self
+                    .finalized_wave_fetch_protocol
+                    .handle(FinalizedWaveFetchInput::Received { block_hash, waves });
+                self.process_finalized_wave_fetch_outputs(outputs);
+                self.update_fetch_tick_timer();
+            }
+
+            NodeInput::FinalizedWaveFetchFailed { block_hash, hashes } => {
+                let outputs = self
+                    .finalized_wave_fetch_protocol
+                    .handle(FinalizedWaveFetchInput::Failed { block_hash, hashes });
+                self.process_finalized_wave_fetch_outputs(outputs);
+                // Tick to retry pending fetches.
+                let tick_outputs = self
+                    .finalized_wave_fetch_protocol
+                    .handle(FinalizedWaveFetchInput::Tick);
+                self.process_finalized_wave_fetch_outputs(tick_outputs);
+                self.update_fetch_tick_timer();
+            }
+
             // ── Protocol events → state machine ────────────────────────
             NodeInput::Protocol(pe) => {
                 self.feed_event(pe);
@@ -1027,6 +1062,10 @@ where
         );
         metrics::set_fetch_in_flight("exec_cert", self.exec_cert_fetch_protocol.in_flight_count());
         metrics::set_fetch_in_flight("header", self.header_fetch_protocol.in_flight_count());
+        metrics::set_fetch_in_flight(
+            "finalized_wave",
+            self.finalized_wave_fetch_protocol.in_flight_count(),
+        );
 
         // ── Memory ──
         let bft_mem = self.state.bft().memory_stats();

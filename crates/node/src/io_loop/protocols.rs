@@ -2,6 +2,7 @@
 
 use super::{IoLoop, TimerOp};
 use crate::protocol::execution_cert_fetch::ExecCertFetchOutput;
+use crate::protocol::finalized_wave_fetch::FinalizedWaveFetchOutput;
 use crate::protocol::local_provision_fetch::LocalProvisionFetchOutput;
 use crate::protocol::provision_fetch::ProvisionFetchOutput;
 use crate::protocol::sync::SyncOutput;
@@ -401,15 +402,67 @@ where
     /// When the fetch protocol has pending work, a recurring timer fires
     /// `NodeInput::FetchTick` to retry deferred or failed fetch operations.
     /// When all fetches are complete, the timer is cancelled.
+    /// Process FinalizedWaveFetchProtocol outputs.
+    ///
+    /// `Fetch` uses the Network trait to request finalized waves from the proposer/local peers.
+    /// `Deliver` feeds each wave into the state machine for pending block completion.
+    pub(super) fn process_finalized_wave_fetch_outputs(
+        &mut self,
+        outputs: Vec<FinalizedWaveFetchOutput>,
+    ) {
+        for output in outputs {
+            match output {
+                FinalizedWaveFetchOutput::Fetch {
+                    block_hash,
+                    proposer,
+                    wave_id_hashes,
+                } => {
+                    use hyperscale_messages::request::GetFinalizedWavesRequest;
+                    let es = self.event_sender.clone();
+                    let bh = block_hash;
+                    let hs = wave_id_hashes.clone();
+                    let peers = self.local_peers();
+                    self.network.request(
+                        peers,
+                        Some(proposer),
+                        GetFinalizedWavesRequest::new(block_hash, wave_id_hashes),
+                        Box::new(move |result| match result {
+                            Ok(resp) => {
+                                let waves = resp.waves.into_iter().map(Arc::new).collect();
+                                let _ = es.send(NodeInput::FinalizedWaveReceived {
+                                    block_hash: bh,
+                                    waves,
+                                });
+                            }
+                            Err(_) => {
+                                let _ = es.send(NodeInput::FinalizedWaveFetchFailed {
+                                    block_hash: bh,
+                                    hashes: hs,
+                                });
+                            }
+                        }),
+                    );
+                }
+                FinalizedWaveFetchOutput::Deliver { waves } => {
+                    for wave in waves {
+                        self.feed_event(ProtocolEvent::FinalizedWaveFetchDelivered { wave });
+                    }
+                }
+            }
+        }
+    }
+
     pub(super) fn update_fetch_tick_timer(&mut self) {
         let status = self.transaction_fetch_protocol.status();
         let has_fetch_work = status.pending_tx_blocks > 0;
         let has_local_provision_work = self.local_provision_fetch_protocol.has_pending();
+        let has_finalized_wave_work = self.finalized_wave_fetch_protocol.has_pending();
         let has_provision_work = self.provision_fetch_protocol.has_pending();
         let has_exec_cert_work = self.exec_cert_fetch_protocol.has_pending();
         let has_header_work = self.header_fetch_protocol.has_pending();
         if has_fetch_work
             || has_local_provision_work
+            || has_finalized_wave_work
             || has_provision_work
             || has_exec_cert_work
             || has_header_work

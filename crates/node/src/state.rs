@@ -745,6 +745,16 @@ impl StateMachine for NodeStateMachine {
             | ProtocolEvent::ShardSplitComplete { .. }
             | ProtocolEvent::ShardMergeInitiated { .. }
             | ProtocolEvent::ShardMergeComplete { .. } => vec![],
+
+            // ── Finalized Wave Fetch Delivery ────────────────────────────
+            ProtocolEvent::FinalizedWaveFetchDelivered { wave } => {
+                let wave_id_hash = wave.wave_id_hash();
+                self.bft.check_pending_blocks_for_finalized_wave(
+                    self.topology.snapshot(),
+                    wave_id_hash,
+                    &wave,
+                )
+            }
         };
 
         // Drain any state root verifications that became ready during this event.

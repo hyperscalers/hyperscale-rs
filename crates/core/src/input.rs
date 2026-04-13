@@ -3,7 +3,7 @@
 use crate::ProtocolEvent;
 use hyperscale_types::{
     Block, BlockHeight, Bls12381G1PublicKey, Bls12381G2Signature, CommittedBlockHeader,
-    ExecutionCertificate, Hash, LocalReceiptEntry, Provision, QuorumCertificate,
+    ExecutionCertificate, FinalizedWave, Hash, LocalReceiptEntry, Provision, QuorumCertificate,
     RoutableTransaction, ShardGroupId, ValidatorId,
 };
 use std::sync::Arc;
@@ -83,6 +83,15 @@ pub enum NodeInput {
 
     /// Local provision fetch failed.
     LocalProvisionFetchFailed { block_hash: Hash, hashes: Vec<Hash> },
+
+    /// Finalized waves received from a peer in response to a fetch request.
+    FinalizedWaveReceived {
+        block_hash: Hash,
+        waves: Vec<Arc<FinalizedWave>>,
+    },
+
+    /// A finalized wave fetch request failed.
+    FinalizedWaveFetchFailed { block_hash: Hash, hashes: Vec<Hash> },
 
     /// Transaction validated by the validation pipeline.
     TransactionValidated {
@@ -206,6 +215,8 @@ impl NodeInput {
             NodeInput::HeaderFetchFailed { .. } => EventPriority::Internal,
             NodeInput::LocalProvisionReceived { .. } => EventPriority::Internal,
             NodeInput::LocalProvisionFetchFailed { .. } => EventPriority::Internal,
+            NodeInput::FinalizedWaveReceived { .. } => EventPriority::Internal,
+            NodeInput::FinalizedWaveFetchFailed { .. } => EventPriority::Internal,
         }
     }
 
@@ -247,6 +258,8 @@ impl NodeInput {
             NodeInput::HeaderFetchFailed { .. } => "HeaderFetchFailed",
             NodeInput::LocalProvisionReceived { .. } => "LocalProvisionReceived",
             NodeInput::LocalProvisionFetchFailed { .. } => "LocalProvisionFetchFailed",
+            NodeInput::FinalizedWaveReceived { .. } => "FinalizedWaveReceived",
+            NodeInput::FinalizedWaveFetchFailed { .. } => "FinalizedWaveFetchFailed",
         }
     }
 }

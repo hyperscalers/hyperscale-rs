@@ -4174,8 +4174,22 @@ impl BftState {
                 });
             }
 
-            // Wave certificate fetching removed — validators form their own
-            // finalized waves and use sync to catch up if they fall behind.
+            // Fetch missing finalized waves from the proposer or local peers.
+            let missing_waves = pending.missing_waves();
+            if !missing_waves.is_empty() && age >= tx_timeout {
+                debug!(
+                    validator = ?topology.local_validator_id(),
+                    block_hash = ?block_hash,
+                    missing_wave_count = missing_waves.len(),
+                    age_ms = age.as_millis(),
+                    "Fetch timeout reached, requesting missing finalized waves"
+                );
+                actions.push(Action::FetchFinalizedWave {
+                    block_hash: *block_hash,
+                    proposer,
+                    wave_id_hashes: missing_waves,
+                });
+            }
         }
 
         actions

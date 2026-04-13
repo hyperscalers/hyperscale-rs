@@ -3,6 +3,7 @@
 use super::{IoLoop, TimerOp};
 use crate::action_handler::{self, ActionContext, DispatchPool};
 use crate::protocol::execution_cert_fetch::ExecCertFetchInput;
+use crate::protocol::finalized_wave_fetch::FinalizedWaveFetchInput;
 use crate::protocol::header_fetch::HeaderFetchInput;
 use crate::protocol::local_provision_fetch::LocalProvisionFetchInput;
 use crate::protocol::provision_fetch::ProvisionFetchInput;
@@ -213,7 +214,7 @@ where
             // ═══════════════════════════════════════════════════════════
             // Storage
             // ═══════════════════════════════════════════════════════════
-            Action::CacheWaveCertificate { .. } | Action::FetchChainMetadata => {
+            Action::CacheFinalizedWave { .. } | Action::FetchChainMetadata => {
                 self.process_storage_action(action);
             }
 
@@ -292,6 +293,7 @@ where
             Action::StartSync { .. }
             | Action::FetchTransactions { .. }
             | Action::FetchProvisionLocal { .. }
+            | Action::FetchFinalizedWave { .. }
             | Action::CancelFetch { .. }
             | Action::FetchProvisionRemote { .. }
             | Action::RequestMissingExecutionCert { .. }
@@ -344,12 +346,11 @@ where
     /// Process storage read/write actions.
     fn process_storage_action(&mut self, action: Action) {
         match action {
-            Action::CacheWaveCertificate { certificate } => {
-                // Populate cert cache keyed by wave_id.hash() — this matches
-                // the cert_hashes entries in BlockManifest that peers use to
-                // request missing wave certificates before voting.
+            Action::CacheFinalizedWave { wave } => {
+                let wave_id_hash = wave.wave_id_hash();
                 self.cert_cache
-                    .insert(certificate.wave_id.hash(), certificate);
+                    .insert(wave_id_hash, Arc::clone(&wave.certificate));
+                self.finalized_wave_cache.insert(wave_id_hash, wave);
             }
             Action::FetchChainMetadata => {
                 let height = self.storage.committed_height();
@@ -789,11 +790,30 @@ where
                 self.process_local_provision_fetch_outputs(tick_outputs);
                 self.update_fetch_tick_timer();
             }
+            Action::FetchFinalizedWave {
+                block_hash,
+                proposer,
+                wave_id_hashes,
+            } => {
+                self.finalized_wave_fetch_protocol
+                    .handle(FinalizedWaveFetchInput::Request {
+                        block_hash,
+                        proposer,
+                        wave_id_hashes,
+                    });
+                let tick_outputs = self
+                    .finalized_wave_fetch_protocol
+                    .handle(FinalizedWaveFetchInput::Tick);
+                self.process_finalized_wave_fetch_outputs(tick_outputs);
+                self.update_fetch_tick_timer();
+            }
             Action::CancelFetch { block_hash } => {
                 self.transaction_fetch_protocol
                     .handle(TransactionFetchInput::CancelFetch { block_hash });
                 self.local_provision_fetch_protocol
                     .handle(LocalProvisionFetchInput::CancelFetch { block_hash });
+                self.finalized_wave_fetch_protocol
+                    .handle(FinalizedWaveFetchInput::CancelFetch { block_hash });
             }
             Action::FetchProvisionRemote {
                 source_shard,

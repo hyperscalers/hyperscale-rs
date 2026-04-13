@@ -200,6 +200,11 @@ impl PendingBlock {
         self.missing_provision_hashes.contains(batch_hash)
     }
 
+    /// Get the missing wave ID hashes as a Vec.
+    pub fn missing_waves(&self) -> Vec<Hash> {
+        self.missing_wave_hashes.iter().copied().collect()
+    }
+
     /// Get all received finalized waves.
     pub fn finalized_waves(&self) -> Vec<Arc<FinalizedWave>> {
         self.received_waves.values().cloned().collect()
