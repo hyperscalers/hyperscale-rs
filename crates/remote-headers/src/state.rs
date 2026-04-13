@@ -405,6 +405,21 @@ impl RemoteHeaderCoordinator {
         self.verified.contains_key(&(shard, height))
     }
 
+    /// Get the in-flight count from the tip header of each remote shard.
+    ///
+    /// Used for cross-shard backpressure: RPC nodes can reject transactions
+    /// targeting congested remote shards.
+    pub fn remote_shard_in_flight(&self) -> HashMap<ShardGroupId, u32> {
+        self.tips
+            .iter()
+            .filter_map(|(&shard, &tip)| {
+                self.verified
+                    .get(&(shard, tip))
+                    .map(|h| (shard, h.header.in_flight))
+            })
+            .collect()
+    }
+
     /// Get memory statistics for monitoring.
     pub fn memory_stats(&self) -> RemoteHeaderMemoryStats {
         RemoteHeaderMemoryStats {
@@ -521,6 +536,7 @@ mod tests {
             local_receipt_root: Hash::ZERO,
             provision_root: Hash::ZERO,
             waves: vec![],
+            in_flight: 0,
         };
         let mut qc = QuorumCertificate::genesis();
         // Deliberately set wrong block_hash

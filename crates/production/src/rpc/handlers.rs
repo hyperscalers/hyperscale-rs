@@ -185,6 +185,30 @@ pub async fn submit_transaction_handler(
                 }),
             );
         }
+
+        // Check cross-shard congestion from remote block headers.
+        // Reject if any remote shard reports high in-flight counts, preventing
+        // transactions from being committed locally only to stall on remote execution.
+        // Threshold is 80% of max_in_flight, derived from mempool config.
+        let threshold = snapshot.remote_congestion_threshold;
+        if let Some((&congested_shard, &count)) = snapshot
+            .remote_shard_in_flight
+            .iter()
+            .find(|(_, &count)| threshold > 0 && count >= threshold)
+        {
+            metrics::record_transaction_rejected("remote_shard_congestion");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(SubmitTransactionResponse {
+                    accepted: false,
+                    hash: String::new(),
+                    error: Some(format!(
+                        "Remote shard {} is congested ({} in-flight). Try again later.",
+                        congested_shard.0, count
+                    )),
+                }),
+            );
+        }
     }
 
     // Decode hex - structural validation, return error immediately

@@ -126,6 +126,10 @@ pub(crate) struct VerificationPipeline {
 
     /// Blocks with verified provisions roots.
     verified_provision_roots: HashSet<Hash>,
+
+    // === In-flight count verification ===
+    /// Blocks with verified in-flight counts (synchronous tolerance check).
+    verified_in_flight: HashSet<Hash>,
 }
 
 impl VerificationPipeline {
@@ -149,6 +153,7 @@ impl VerificationPipeline {
             verified_local_receipt_roots: HashSet::new(),
             provision_root_verifications_in_flight: HashSet::new(),
             verified_provision_roots: HashSet::new(),
+            verified_in_flight: HashSet::new(),
         }
     }
 
@@ -234,11 +239,14 @@ impl VerificationPipeline {
             self.verified_provision_roots.contains(&block_hash)
         };
 
+        let in_flight_ok = self.verified_in_flight.contains(&block_hash);
+
         state_root_ok
             && transaction_root_ok
             && certificate_root_ok
             && local_receipt_root_ok
             && provision_root_ok
+            && in_flight_ok
     }
 
     /// Log why a block's verification is incomplete. Called on view change
@@ -316,6 +324,12 @@ impl VerificationPipeline {
             "NOT_STARTED"
         };
 
+        let in_flight_status = if self.verified_in_flight.contains(&block_hash) {
+            "verified"
+        } else {
+            "NOT_STARTED"
+        };
+
         warn!(
             block_hash = ?block_hash,
             height = block.header.height.0,
@@ -327,6 +341,7 @@ impl VerificationPipeline {
             certificate_root = certificate_root_status,
             local_receipt_root = local_receipt_root_status,
             provision_root = provision_root_status,
+            in_flight = in_flight_status,
             "View change — block verification was incomplete"
         );
     }
@@ -699,6 +714,53 @@ impl VerificationPipeline {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
+    // In-flight count verification (synchronous)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Verify the proposed in-flight count is deterministically correct.
+    ///
+    /// in_flight = parent.in_flight + new_txs - finalized_txs
+    ///
+    /// All validators can compute this from chain state, so it must be exact.
+    /// Certificates are only counted when actually included (JVT was ready).
+    pub fn verify_in_flight(
+        &mut self,
+        block_hash: Hash,
+        block: &Block,
+        parent_in_flight: u32,
+        finalized_tx_count: u32,
+    ) -> bool {
+        let proposed = block.header.in_flight;
+
+        // Compute expected: only subtract finalized txs when certs are actually included.
+        let certs_finalized = if block.certificates.is_empty() {
+            0
+        } else {
+            finalized_tx_count
+        };
+        let expected = parent_in_flight
+            .saturating_add(block.transaction_count() as u32)
+            .saturating_sub(certs_finalized);
+
+        if proposed == expected {
+            self.verified_in_flight.insert(block_hash);
+            true
+        } else {
+            warn!(
+                block_hash = ?block_hash,
+                height = block.header.height.0,
+                proposed = proposed,
+                expected = expected,
+                parent_in_flight = parent_in_flight,
+                new_txs = block.transaction_count(),
+                finalized_txs = certs_finalized,
+                "In-flight count verification failed — proposed value does not match expected"
+            );
+            false
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
     // Remote header QC verification
     // ═══════════════════════════════════════════════════════════════════════
 
@@ -822,6 +884,9 @@ impl VerificationPipeline {
             .retain(|hash| pending_blocks.contains_key(hash));
 
         self.verified_provision_roots
+            .retain(|hash| pending_blocks.contains_key(hash));
+
+        self.verified_in_flight
             .retain(|hash| pending_blocks.contains_key(hash));
 
         // verified_qcs uses height-based retention (not pending_blocks membership)

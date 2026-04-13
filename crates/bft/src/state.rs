@@ -993,6 +993,12 @@ impl BftState {
         let parent_state_root = self.certified_state_root;
         let parent_block_height = parent_qc.height.0;
 
+        // Parent's in-flight count for deterministic computation in build_proposal.
+        let parent_in_flight = self
+            .get_block_by_hash(parent_hash)
+            .map(|b| b.header.in_flight)
+            .unwrap_or(0);
+
         // Track that we have a pending proposal (for correlation)
         self.pending_proposal = Some(PendingProposal {
             height: block_height,
@@ -1037,6 +1043,8 @@ impl BftState {
                 finalized_waves: waves_to_propose,
                 waves,
                 provision_batches,
+                parent_in_flight,
+                finalized_tx_count: finalized_tx_count as u32,
             },
         ]
     }
@@ -1093,6 +1101,7 @@ impl BftState {
             local_receipt_root: Hash::ZERO,
             provision_root: Hash::ZERO,
             waves: vec![], // Empty - fallback blocks have no transactions
+            in_flight: 0,
         };
 
         let block = Block {
@@ -1206,6 +1215,7 @@ impl BftState {
             local_receipt_root: Hash::ZERO,
             provision_root: Hash::ZERO,
             waves: vec![], // Empty - sync blocks have no transactions
+            in_flight: 0,
         };
 
         let block = Block {
@@ -1374,6 +1384,7 @@ impl BftState {
         proposer = ?header.proposer,
         tx_count = manifest.transaction_count()
     ))]
+    #[allow(clippy::too_many_arguments)]
     pub fn on_block_header(
         &mut self,
         topology: &TopologySnapshot,
@@ -1906,6 +1917,28 @@ impl BftState {
                         "Block has duplicate transactions from QC chain - not voting"
                     );
                     return vec![];
+                }
+
+                // Synchronous in-flight count verification — deterministic from chain state.
+                // expected = parent.in_flight + new_txs - finalized_txs
+                {
+                    let parent_in_flight = self
+                        .get_block_by_hash(block.header.parent_hash)
+                        .map(|b| b.header.in_flight)
+                        .unwrap_or(0);
+                    let finalized_tx_count: u32 = pending
+                        .finalized_waves()
+                        .iter()
+                        .map(|fw| fw.tx_hashes.len() as u32)
+                        .sum();
+                    if !self.verification.verify_in_flight(
+                        block_hash,
+                        &block,
+                        parent_in_flight,
+                        finalized_tx_count,
+                    ) {
+                        return vec![];
+                    }
                 }
 
                 // Initiate all async verifications in parallel.
@@ -4728,6 +4761,7 @@ mod tests {
             local_receipt_root: Hash::ZERO,
             provision_root: Hash::ZERO,
             waves: vec![],
+            in_flight: 0,
         }
     }
 
@@ -4752,6 +4786,7 @@ mod tests {
             local_receipt_root: Hash::ZERO,
             provision_root: Hash::ZERO,
             waves: vec![],
+            in_flight: 0,
         };
 
         // Should pass - genesis blocks skip timestamp validation
@@ -4850,6 +4885,7 @@ mod tests {
             local_receipt_root: Hash::ZERO,
             provision_root: Hash::ZERO,
             waves: vec![],
+            in_flight: 0,
         };
 
         // Should pass - fallback blocks skip timestamp validation
@@ -4874,6 +4910,7 @@ mod tests {
             local_receipt_root: Hash::ZERO,
             provision_root: Hash::ZERO,
             waves: vec![],
+            in_flight: 0,
         };
         assert!(
             state.validate_timestamp(&normal_header).is_err(),
@@ -4954,6 +4991,7 @@ mod tests {
             local_receipt_root: Hash::ZERO,
             provision_root: Hash::ZERO,
             waves: vec![],
+            in_flight: 0,
         };
 
         // Process the block header
@@ -5041,6 +5079,7 @@ mod tests {
             local_receipt_root: Hash::ZERO,
             provision_root: Hash::ZERO,
             waves: vec![],
+            in_flight: 0,
         };
 
         let block_hash = header.hash();
@@ -5132,6 +5171,7 @@ mod tests {
             local_receipt_root: Hash::ZERO,
             provision_root: Hash::ZERO,
             waves: vec![],
+            in_flight: 0,
         };
 
         let block_hash = header.hash();
@@ -5210,6 +5250,7 @@ mod tests {
             local_receipt_root: Hash::ZERO,
             provision_root: Hash::ZERO,
             waves: vec![],
+            in_flight: 0,
         };
 
         // Process header
@@ -5476,6 +5517,7 @@ mod tests {
             local_receipt_root: Hash::ZERO,
             provision_root: Hash::ZERO,
             waves: vec![],
+            in_flight: 0,
         };
         let block_a_hash = block_a.hash();
 
@@ -5494,6 +5536,7 @@ mod tests {
             local_receipt_root: Hash::ZERO,
             provision_root: Hash::ZERO,
             waves: vec![],
+            in_flight: 0,
         };
         let block_b_hash = block_b.hash();
 
@@ -5541,6 +5584,7 @@ mod tests {
             local_receipt_root: Hash::ZERO,
             provision_root: Hash::ZERO,
             waves: vec![],
+            in_flight: 0,
         };
         let block_hash = block.hash();
 
@@ -5582,6 +5626,7 @@ mod tests {
                 local_receipt_root: Hash::ZERO,
                 provision_root: Hash::ZERO,
                 waves: vec![],
+                in_flight: 0,
             };
             state.try_vote_on_block(&topology, block.hash(), height, 0);
         }
@@ -5882,6 +5927,7 @@ mod tests {
             local_receipt_root: Hash::ZERO,
             provision_root: Hash::ZERO,
             waves: vec![],
+            in_flight: 0,
         };
         let original_block_hash = original_header.hash();
 
@@ -5961,6 +6007,7 @@ mod tests {
             local_receipt_root: Hash::ZERO,
             provision_root: Hash::ZERO,
             waves: vec![],
+            in_flight: 0,
         };
 
         // Even though the receiving validator might be at view=31,
@@ -5999,6 +6046,7 @@ mod tests {
             local_receipt_root: Hash::ZERO,
             provision_root: Hash::ZERO,
             waves: vec![],
+            in_flight: 0,
         };
 
         let result = state.validate_header(&topology, &header);
@@ -6332,6 +6380,7 @@ mod tests {
             local_receipt_root: Hash::ZERO,
             provision_root: Hash::ZERO,
             waves: vec![],
+            in_flight: 0,
         };
         let original_block_hash = original_header.hash();
 
@@ -6583,6 +6632,7 @@ mod tests {
             local_receipt_root: Hash::ZERO,
             provision_root: Hash::ZERO,
             waves: vec![],
+            in_flight: 0,
         };
         let block_hash_r1 = header_round1.hash();
 
@@ -6601,6 +6651,7 @@ mod tests {
             local_receipt_root: Hash::ZERO,
             provision_root: Hash::ZERO,
             waves: vec![],
+            in_flight: 0,
         };
         let block_hash_r2 = header_round2.hash();
 
@@ -6619,6 +6670,7 @@ mod tests {
             local_receipt_root: Hash::ZERO,
             provision_root: Hash::ZERO,
             waves: vec![],
+            in_flight: 0,
         };
         let block_hash_r3 = header_round3.hash();
 
@@ -6638,6 +6690,7 @@ mod tests {
             local_receipt_root: Hash::ZERO,
             provision_root: Hash::ZERO,
             waves: vec![],
+            in_flight: 0,
         };
         let block_hash_h6 = header_height6.hash();
 
@@ -6865,6 +6918,7 @@ mod tests {
             local_receipt_root: Hash::ZERO,
             provision_root: Hash::ZERO,
             waves: vec![],
+            in_flight: 0,
         };
 
         // Process first block header
@@ -6903,6 +6957,7 @@ mod tests {
             local_receipt_root: Hash::ZERO,
             provision_root: Hash::ZERO,
             waves: vec![],
+            in_flight: 0,
         };
 
         // Process second block header
@@ -7836,6 +7891,7 @@ mod tests {
                 local_receipt_root: Hash::ZERO,
                 provision_root: Hash::ZERO,
                 waves: vec![],
+                in_flight: 0,
             },
             transactions: vec![],
             certificates: vec![],
@@ -8421,6 +8477,7 @@ mod tests {
                 local_receipt_root: Hash::ZERO,
                 provision_root: Hash::ZERO,
                 waves: vec![],
+                in_flight: 0,
             },
             transactions: vec![tx1.clone()],
             certificates: vec![],
@@ -8447,6 +8504,7 @@ mod tests {
                 local_receipt_root: Hash::ZERO,
                 provision_root: Hash::ZERO,
                 waves: vec![],
+                in_flight: 0,
             },
             transactions: txs,
             certificates: vec![],
@@ -8481,6 +8539,7 @@ mod tests {
                 local_receipt_root: Hash::ZERO,
                 provision_root: Hash::ZERO,
                 waves: vec![],
+                in_flight: 0,
             },
             transactions: vec![tx1.clone()],
             certificates: vec![],
@@ -8506,6 +8565,7 @@ mod tests {
                 local_receipt_root: Hash::ZERO,
                 provision_root: Hash::ZERO,
                 waves: vec![],
+                in_flight: 0,
             },
             transactions: vec![tx1],
             certificates: vec![],

@@ -104,6 +104,7 @@ pub fn make_test_block(height: u64) -> Block {
             local_receipt_root: Hash::ZERO,
             provision_root: Hash::ZERO,
             waves: vec![],
+            in_flight: 0,
         },
         transactions: vec![],
         certificates: vec![],

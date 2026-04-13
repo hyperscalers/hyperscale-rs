@@ -335,6 +335,8 @@ pub fn build_proposal<S: ChainWriter + SubstateStore>(
     local_shard: ShardGroupId,
     waves: Vec<WaveId>,
     provision_hashes: Vec<Hash>,
+    parent_in_flight: u32,
+    finalized_tx_count: u32,
 ) -> ProposalResult<S::PreparedCommit> {
     let current_root = storage.state_root_hash();
     let jvt_ready = current_root == parent_state_root;
@@ -365,6 +367,14 @@ pub fn build_proposal<S: ChainWriter + SubstateStore>(
     let local_receipt_root = compute_local_receipt_root(receipts);
     let provision_root = compute_provision_root(&provision_hashes);
 
+    // in_flight is deterministic from chain state:
+    // parent's in_flight + new transactions committed - transactions finalized by certificates.
+    // Only count finalized txs when certificates are actually included (JVT was ready).
+    let certs_finalized = if include_certs { finalized_tx_count } else { 0 };
+    let in_flight = parent_in_flight
+        .saturating_add(transactions.len() as u32)
+        .saturating_sub(certs_finalized);
+
     let header = BlockHeader {
         shard_group_id: local_shard,
         height,
@@ -380,6 +390,7 @@ pub fn build_proposal<S: ChainWriter + SubstateStore>(
         local_receipt_root,
         provision_root,
         waves,
+        in_flight,
     };
 
     let block = Block {

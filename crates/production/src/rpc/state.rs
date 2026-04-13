@@ -79,6 +79,11 @@ pub struct MempoolSnapshot {
     /// Defaults to `false` so transactions can be accepted before the first
     /// snapshot update from the runner.
     pub at_pending_limit: bool,
+    /// Per-remote-shard in-flight counts from latest verified block headers.
+    /// Used for cross-shard backpressure: reject transactions targeting congested shards.
+    pub remote_shard_in_flight: std::collections::HashMap<hyperscale_types::ShardGroupId, u32>,
+    /// Threshold for rejecting transactions due to remote shard congestion (80% of max_in_flight).
+    pub remote_congestion_threshold: u32,
 }
 
 impl Default for MempoolSnapshot {
@@ -91,6 +96,8 @@ impl Default for MempoolSnapshot {
             updated_at: None,
             accepting_rpc_transactions: true, // Default to accepting until we know otherwise
             at_pending_limit: false,          // Default to not at limit until we know otherwise
+            remote_shard_in_flight: std::collections::HashMap::new(),
+            remote_congestion_threshold: 0,
         }
     }
 }

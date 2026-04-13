@@ -159,6 +159,17 @@ pub struct BlockHeader {
     ///
     /// Empty for genesis, fallback, and sync blocks (no transactions).
     pub waves: Vec<WaveId>,
+
+    /// Approximate number of in-flight transactions on this shard at proposal time.
+    ///
+    /// "In-flight" = committed + executed transactions in the proposer's mempool,
+    /// i.e. transactions actively holding state locks. Gossiped cross-shard via
+    /// `CommittedBlockHeaderGossip` so RPC nodes can reject transactions targeting
+    /// congested remote shards.
+    ///
+    /// BFT-verified within tolerance (validators may differ slightly due to
+    /// execution timing). Zero for genesis, fallback, and sync blocks.
+    pub in_flight: u32,
 }
 
 impl BlockHeader {
@@ -179,6 +190,7 @@ impl BlockHeader {
             local_receipt_root: Hash::ZERO,
             provision_root: Hash::ZERO,
             waves: vec![],
+            in_flight: 0,
         }
     }
 
@@ -571,6 +583,7 @@ mod tests {
             local_receipt_root: Hash::ZERO,
             provision_root: Hash::ZERO,
             waves: vec![],
+            in_flight: 0,
         };
 
         let hash1 = header.hash();

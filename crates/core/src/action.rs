@@ -449,6 +449,10 @@ pub enum Action {
         waves: Vec<WaveId>,
         /// Provision batches from remote shards, included in this block.
         provision_batches: Vec<Arc<Provision>>,
+        /// Parent block's in-flight count (for deterministic computation).
+        parent_in_flight: u32,
+        /// Number of transactions finalized by wave certificates in this block.
+        finalized_tx_count: u32,
     },
 
     /// Execute a batch of single-shard transactions.

@@ -330,6 +330,8 @@ pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainRead
             finalized_waves,
             waves,
             provision_batches,
+            parent_in_flight,
+            finalized_tx_count,
             ..
         } => {
             // Extract certificates from finalized waves.
@@ -366,6 +368,8 @@ pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainRead
                 shard_group_id,
                 waves,
                 provision_hashes.clone(),
+                parent_in_flight,
+                finalized_tx_count,
             );
             let prepared = result
                 .prepared_commit

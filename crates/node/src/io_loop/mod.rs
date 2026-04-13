@@ -172,6 +172,10 @@ pub struct NodeStatusSnapshot {
     pub mempool_total: usize,
     pub accepting_rpc_transactions: bool,
     pub at_pending_limit: bool,
+    /// Per-remote-shard in-flight counts from latest verified headers.
+    pub remote_shard_in_flight: HashMap<ShardGroupId, u32>,
+    /// Threshold for rejecting transactions due to remote shard congestion (80% of max_in_flight).
+    pub remote_congestion_threshold: u32,
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1134,6 +1138,8 @@ where
             mempool_total: mempool.len(),
             accepting_rpc_transactions: !mempool.at_in_flight_limit(),
             at_pending_limit: mempool.at_pending_limit(),
+            remote_shard_in_flight: self.state.remote_headers().remote_shard_in_flight(),
+            remote_congestion_threshold: (mempool.config().max_in_flight as f64 * 0.8) as u32,
         }
     }
 

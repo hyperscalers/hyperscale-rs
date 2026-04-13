@@ -942,6 +942,7 @@ mod tests {
             local_receipt_root: Hash::ZERO,
             provision_root: Hash::ZERO,
             waves,
+            in_flight: 0,
         };
         let header_hash = header.hash();
         let mut qc = QuorumCertificate::genesis();

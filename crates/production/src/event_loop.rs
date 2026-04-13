@@ -171,6 +171,8 @@ fn update_rpc_state(config: &PinnedLoopConfig, snapshot: &NodeStatusSnapshot) {
             total_count: snapshot.mempool_total,
             accepting_rpc_transactions: snapshot.accepting_rpc_transactions,
             at_pending_limit: snapshot.at_pending_limit,
+            remote_shard_in_flight: snapshot.remote_shard_in_flight.clone(),
+            remote_congestion_threshold: snapshot.remote_congestion_threshold,
             updated_at: Some(Instant::now()),
         }));
     }
