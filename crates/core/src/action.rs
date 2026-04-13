@@ -117,7 +117,7 @@ pub enum Action {
     // ═══════════════════════════════════════════════════════════════════════
     // Network: Execution Layer (domain-specific, batchable by runner)
     // ═══════════════════════════════════════════════════════════════════════
-    /// Sign and send an execution vote to the wave leader.
+    /// Sign and send an execution vote to all local committee members.
     ///
     /// Emitted by the state machine when a wave completes (all txs executed).
     /// The io_loop signs the vote (it owns the signing key) and sends it to

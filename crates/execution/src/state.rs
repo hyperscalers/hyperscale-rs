@@ -11,7 +11,7 @@
 //!
 //! ## Phase 1: State Provisioning
 //! When a block commits with cross-shard transactions, the block proposer broadcasts
-//! state provisions (with merkle inclusion proofs) to target shards. Provision are
+//! state provisions (with merkle inclusion proofs) to target shards. Provisions are
 //! committed in blocks via `provision_root` — all validators have the same data.
 //!
 //! ## Phase 2: Conflict Detection
@@ -125,8 +125,8 @@ pub struct ExecutionState {
     received_provision_shards: HashMap<Hash, BTreeSet<ShardGroupId>>,
 
     /// Detects node-ID overlap conflicts between local cross-shard txs and
-    /// committed remote provisions. Replaces the old livelock crate — now
-    /// deterministic because provisions are consensus-committed.
+    /// committed remote provisions. Deterministic because provisions are
+    /// consensus-committed via `provision_root`.
     conflict_detector: ConflictDetector,
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -141,7 +141,7 @@ pub struct ExecutionState {
     vote_trackers: HashMap<WaveId, VoteTracker>,
 
     /// Waves that have a canonical EC (aggregated or received from designated broadcaster).
-    /// Used to stop re-voting in `scan_complete_waves`.
+    /// Used to skip completed waves in `scan_complete_waves`.
     waves_with_ec: HashSet<WaveId>,
 
     /// Tx → wave assignment. Maps tx_hash → WaveId.
@@ -168,7 +168,7 @@ pub struct ExecutionState {
     /// ECs that arrived before the wave tracker was created.
     early_wave_attestations: Vec<(Arc<ExecutionCertificate>, u64)>,
 
-    /// Provision from committed batches whose transactions haven't been committed yet.
+    /// Provisions from committed batches whose transactions haven't been committed yet.
     /// Maps tx_hash -> set of source shards that have sent provisions.
     /// Replayed in `start_cross_shard_execution` when the tx block commits.
     early_committed_provisions: HashMap<Hash, BTreeSet<ShardGroupId>>,
@@ -463,7 +463,7 @@ impl ExecutionState {
     /// A wave can emit a vote when:
     /// 1. A target vote height exists (all txs coverable)
     /// 2. All execution-covered txs at that height have results
-    /// 3. The target height is lower than any previous vote (re-vote downward only)
+    /// 3. This wave hasn't voted yet (each wave votes exactly once)
     ///
     /// Waves that already had an EC formed are skipped.
     pub fn scan_complete_waves(&mut self) -> Vec<CompletionData> {
@@ -582,7 +582,7 @@ impl ExecutionState {
     ///
     /// This is the SINGLE path to execution voting. Call after conflicts
     /// have been processed so accumulator state is deterministic at this height.
-    /// Each vote is targeted to the wave leader (N→1 routing).
+    /// Each vote is sent to all local committee members (N→N).
     ///
     /// The vote_height is now a relative offset determined by the accumulator
     /// (lowest height where all txs are coverable), not passed in externally.
@@ -917,7 +917,7 @@ impl ExecutionState {
         let committee = topology.local_committee().to_vec();
 
         // Remove the vote tracker — this EC is the shard's final answer.
-        // Mark wave as having an EC to stop re-voting in scan_complete_waves.
+        // Mark wave as having an EC to skip it in scan_complete_waves.
         self.vote_trackers.remove(&wave_id);
         self.waves_with_ec.insert(wave_id.clone());
 
@@ -998,8 +998,8 @@ impl ExecutionState {
     /// Handle an execution certificate received from another validator.
     ///
     /// This handles ECs from both:
-    /// - The wave leader (local shard EC broadcast to local peers)
-    /// - Remote shards (cross-shard EC for finalization)
+    /// - The designated broadcaster (remote shard EC for finalization)
+    /// - Local aggregation (local shard EC formed independently)
     ///
     /// A execution cert covers many txs. Each tx is handled independently:
     /// - If tracker exists → needs verification, then feed proof
@@ -1084,9 +1084,9 @@ impl ExecutionState {
         let current_height = self.committed_height;
         let mut actions = Vec::new();
 
-        // If this is a local shard EC from the wave leader, mark the wave as
-        // having an EC so non-leaders stop re-voting in scan_complete_waves,
-        // and persist it for fallback serving to remote shards.
+        // If this is a local shard EC, mark the wave as having an EC to skip
+        // it in scan_complete_waves, and persist it for fallback serving to
+        // remote shards.
         if shard == topology.local_shard() {
             self.waves_with_ec.insert(certificate.wave_id.clone());
             let cert_arc = Arc::new(certificate.clone());
@@ -1272,7 +1272,7 @@ impl ExecutionState {
         // Must run every block, not just when there are new transactions.
         actions.extend(self.check_exec_cert_timeouts(topology));
 
-        // Check for waves whose wave leader has completely failed (no EC at all).
+        // Check for waves whose designated broadcaster has completely failed (no EC at all).
         // Prune ephemeral state (orphaned provisions).
         // Cross-shard resolution state (certificate trackers, finalized certs,
         // pending provisioning, execution cache, early arrivals) is only cleaned
