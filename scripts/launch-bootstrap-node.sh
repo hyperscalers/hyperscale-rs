@@ -134,7 +134,7 @@ proposal_interval_ms = 1000
 min_block_interval_ms = 500
 view_change_timeout_ms = 5000
 max_transactions_per_block = 4096
-max_certificates_per_block = 8192
+max_finalized_transactions_per_block = 8192
 rpc_mempool_limit = 16384
 
 [threads]

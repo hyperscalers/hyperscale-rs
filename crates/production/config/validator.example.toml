@@ -68,8 +68,8 @@ view_change_timeout_ms = 5000
 # Maximum transactions per block
 max_transactions_per_block = 4096
 
-# Maximum certificates per block
-max_certificates_per_block = 8192
+# Maximum finalized transactions per block (across all wave certificates)
+max_finalized_transactions_per_block = 8192
 
 # Maximum transactions in mempool before rejecting RPC submissions (backpressure)
 # When the pool reaches this size, new RPC submissions return 503 Service Unavailable.

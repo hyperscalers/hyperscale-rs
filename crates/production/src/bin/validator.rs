@@ -276,9 +276,9 @@ pub struct ConsensusConfig {
     #[serde(default = "default_max_transactions_per_block")]
     pub max_transactions_per_block: usize,
 
-    /// Maximum certificates per block
-    #[serde(default = "default_max_certificates_per_block")]
-    pub max_certificates_per_block: usize,
+    /// Maximum finalized transactions per block (across all wave certificates)
+    #[serde(default = "default_max_finalized_transactions_per_block")]
+    pub max_finalized_transactions_per_block: usize,
 
     /// Minimum time between block proposals in milliseconds (rate limiting).
     /// Even when a QC forms immediately, wait at least this long since the last
@@ -294,7 +294,7 @@ impl Default for ConsensusConfig {
             proposal_interval_ms: default_proposal_interval_ms(),
             view_change_timeout_ms: default_view_change_timeout_ms(),
             max_transactions_per_block: default_max_transactions_per_block(),
-            max_certificates_per_block: default_max_certificates_per_block(),
+            max_finalized_transactions_per_block: default_max_finalized_transactions_per_block(),
             min_block_interval_ms: default_min_block_interval_ms(),
         }
     }
@@ -312,7 +312,7 @@ fn default_max_transactions_per_block() -> usize {
     4096
 }
 
-fn default_max_certificates_per_block() -> usize {
+fn default_max_finalized_transactions_per_block() -> usize {
     8192
 }
 
@@ -907,6 +907,7 @@ fn build_bft_config(config: &ConsensusConfig) -> BftConfig {
         .with_proposal_interval(Duration::from_millis(config.proposal_interval_ms))
         .with_view_change_timeout(Duration::from_millis(config.view_change_timeout_ms))
         .with_max_transactions(config.max_transactions_per_block)
+        .with_max_finalized_transactions(config.max_finalized_transactions_per_block)
         .with_min_block_interval(Duration::from_millis(config.min_block_interval_ms))
 }
 

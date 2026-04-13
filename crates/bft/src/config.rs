@@ -35,8 +35,9 @@ pub struct BftConfig {
     /// Maximum transactions per block.
     pub max_transactions_per_block: usize,
 
-    /// Maximum certificates per block.
-    pub max_certificates_per_block: usize,
+    /// Maximum finalized transactions per block (across all wave certificates).
+    /// Older waves (by kickoff block_height) are prioritized over newer ones.
+    pub max_finalized_transactions_per_block: usize,
 
     /// Maximum acceptable delay for proposer timestamp behind our clock (ms).
     pub max_timestamp_delay_ms: u64,
@@ -89,7 +90,7 @@ impl Default for BftConfig {
             view_change_timeout_increment: Duration::from_millis(1000),
             view_change_timeout_max: Some(Duration::from_secs(30)),
             max_transactions_per_block: 4096,
-            max_certificates_per_block: 8192,
+            max_finalized_transactions_per_block: 8192,
             max_timestamp_delay_ms: 30_000,
             max_timestamp_rush_ms: 2_000,
             transaction_fetch_timeout: Duration::from_millis(150),
@@ -136,6 +137,12 @@ impl BftConfig {
     /// Set the maximum transactions per block.
     pub fn with_max_transactions(mut self, max: usize) -> Self {
         self.max_transactions_per_block = max;
+        self
+    }
+
+    /// Set the maximum finalized transactions per block.
+    pub fn with_max_finalized_transactions(mut self, max: usize) -> Self {
+        self.max_finalized_transactions_per_block = max;
         self
     }
 

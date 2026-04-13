@@ -958,10 +958,23 @@ impl BftState {
             filtered
         };
 
-        let waves_to_propose: Vec<_> = finalized_waves
+        // Sort oldest waves first (by kickoff block_height) so older waves are
+        // committed before newer ones when we hit the per-block tx limit.
+        let mut candidate_waves: Vec<_> = finalized_waves
             .into_iter()
             .filter(|fw| !qc_chain_cert_hashes.contains(&fw.wave_id_hash()))
-            .take(self.config.max_certificates_per_block)
+            .collect();
+        candidate_waves.sort_by_key(|fw| fw.wave_id().block_height);
+
+        // Limit by total finalized transaction count across all included waves.
+        let max_finalized_txs = self.config.max_finalized_transactions_per_block;
+        let mut finalized_tx_count = 0usize;
+        let waves_to_propose: Vec<_> = candidate_waves
+            .into_iter()
+            .take_while(|fw| {
+                finalized_tx_count = finalized_tx_count.saturating_add(fw.tx_hashes.len());
+                finalized_tx_count <= max_finalized_txs
+            })
             .collect();
 
         // Filter provision batches already in the QC chain.
