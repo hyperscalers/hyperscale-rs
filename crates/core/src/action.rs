@@ -482,8 +482,11 @@ pub enum Action {
         qc: QuorumCertificate,
         /// Finalized waves carrying receipts from local execution.
         finalized_waves: Vec<Arc<FinalizedWave>>,
-        /// Provision batches included in this block (ephemeral, for deterministic execution application).
-        provision_batches: Vec<Arc<Provision>>,
+        /// Provision batch hashes from the block manifest. Resolved to actual
+        /// batch data by the consumer (NodeStateMachine) via the ProvisionCoordinator.
+        /// Using hashes instead of batch data ensures both consensus and sync
+        /// commit paths carry identical information — the manifest is always available.
+        provision_hashes: Vec<Hash>,
     },
 
     /// Commit a synced block atomically: block data + JVT + substates +
@@ -496,6 +499,8 @@ pub enum Action {
         block: Block,
         /// The QC that certified this block.
         qc: QuorumCertificate,
+        /// Provision batch hashes from the block manifest (same as CommitBlock).
+        provision_hashes: Vec<Hash>,
     },
 
     /// Emit transaction status update for RPC status cache.

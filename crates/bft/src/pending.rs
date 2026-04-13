@@ -79,27 +79,24 @@ impl PendingBlock {
     /// Create a pending block from a complete block (proposer's own block).
     ///
     /// The proposer already has all transactions and finalized waves.
+    /// Provision hashes are pre-computed and sorted by the action handler.
     pub fn from_complete_block(
         block: &Block,
         finalized_waves: Vec<Arc<FinalizedWave>>,
-        provision_batches: Vec<Arc<Provision>>,
+        provision_hashes: Vec<Hash>,
     ) -> Self {
         let mut manifest = BlockManifest::from_block(block);
-        // Set provision_hashes from actual batches (from_block can't compute
-        // these since Block doesn't carry provision data — it's ephemeral).
-        let mut batch_hashes: Vec<Hash> = provision_batches.iter().map(|b| b.hash()).collect();
-        batch_hashes.sort();
-        manifest.provision_hashes = batch_hashes;
-        let missing_provision_hashes: HashSet<Hash> =
-            manifest.provision_hashes.iter().copied().collect();
+        manifest.provision_hashes = provision_hashes;
+        // Proposer already has all provision data in the ProvisionCoordinator —
+        // no missing hashes, so is_complete() returns true immediately.
         let mut pending = Self {
             header: block.header.clone(),
             received_transactions: HashMap::new(),
             missing_transaction_hashes: HashSet::new(),
             received_waves: BTreeMap::new(),
             missing_wave_hashes: HashSet::new(),
-            received_provisions: HashMap::with_capacity(manifest.provision_hashes.len()),
-            missing_provision_hashes,
+            received_provisions: HashMap::new(),
+            missing_provision_hashes: HashSet::new(),
             manifest,
             constructed_block: None,
         };
@@ -112,10 +109,6 @@ impl PendingBlock {
         // Fill in all finalized waves
         for fw in finalized_waves {
             pending.received_waves.insert(fw.wave_id_hash(), fw);
-        }
-        // Fill in all provision batches
-        for batch in provision_batches {
-            pending.add_provision(batch);
         }
         pending
     }
@@ -210,11 +203,6 @@ impl PendingBlock {
     /// Get all received finalized waves.
     pub fn finalized_waves(&self) -> Vec<Arc<FinalizedWave>> {
         self.received_waves.values().cloned().collect()
-    }
-
-    /// Get all received provision batches.
-    pub fn provision_batches(&self) -> Vec<Arc<Provision>> {
-        self.received_provisions.values().cloned().collect()
     }
 
     /// Construct the block from header + received transactions + received waves.

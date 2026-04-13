@@ -224,19 +224,24 @@ where
                 block,
                 qc,
                 finalized_waves,
-                provision_batches,
+                provision_hashes,
             } => {
                 self.accumulate_block_commit(super::PendingCommit::Consensus {
                     block: Arc::new(block),
                     qc: Arc::new(qc),
                     finalized_waves,
-                    provision_batches,
+                    provision_hashes,
                 });
             }
-            Action::CommitSyncedBlock { block, qc } => {
+            Action::CommitSyncedBlock {
+                block,
+                qc,
+                provision_hashes,
+            } => {
                 self.accumulate_block_commit(super::PendingCommit::Synced {
                     block: Arc::new(block),
                     qc: Arc::new(qc),
+                    provision_hashes,
                 });
             }
             Action::EmitTransactionStatus {
@@ -450,14 +455,18 @@ where
                 cache.retain(|_, (h, _)| *h > max_height);
             }
             for commit in commits {
-                let (block, qc, provision_batches) = match commit {
+                let (block, qc, provision_hashes) = match commit {
                     super::PendingCommit::Consensus {
                         block,
                         qc,
-                        provision_batches,
+                        provision_hashes,
                         ..
-                    } => (block, qc, provision_batches),
-                    super::PendingCommit::Synced { block, qc } => (block, qc, vec![]),
+                    } => (block, qc, provision_hashes),
+                    super::PendingCommit::Synced {
+                        block,
+                        qc,
+                        provision_hashes,
+                    } => (block, qc, provision_hashes),
                 };
                 let block_hash = block.hash();
                 let height = block.header.height.0;
@@ -472,7 +481,7 @@ where
                             height,
                             block: Arc::unwrap_or_clone(block),
                             state_root: result,
-                            provision_batches,
+                            provision_hashes,
                         }));
             }
             return;
@@ -601,7 +610,9 @@ where
                             storage.commit_block(block, qc, &ecs_for_this_block, &wave_receipts)
                         }
                     }
-                    super::PendingCommit::Synced { ref block, ref qc } => {
+                    super::PendingCommit::Synced {
+                        ref block, ref qc, ..
+                    } => {
                         if block.certificates.is_empty() {
                             storage.commit_block(block, qc, &ecs_for_this_block, &[])
                         } else if let Some(entry) = sync_data.get(&height.0) {
@@ -695,14 +706,18 @@ where
                     }
                 };
 
-                // Extract the block and provisions from the commit for the event.
-                let (block, provision_batches) = match commit {
+                // Extract the block and provision hashes from the commit for the event.
+                let (block, provision_hashes) = match commit {
                     super::PendingCommit::Consensus {
                         block,
-                        provision_batches,
+                        provision_hashes,
                         ..
-                    } => (block, provision_batches),
-                    super::PendingCommit::Synced { block, .. } => (block, vec![]),
+                    } => (block, provision_hashes),
+                    super::PendingCommit::Synced {
+                        block,
+                        provision_hashes,
+                        ..
+                    } => (block, provision_hashes),
                 };
 
                 assert_state_root_consistent(&block, result);
@@ -720,7 +735,7 @@ where
                     height: height.0,
                     block: Arc::unwrap_or_clone(block),
                     state_root: result,
-                    provision_batches,
+                    provision_hashes,
                 }));
             }
         });
