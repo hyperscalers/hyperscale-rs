@@ -4,8 +4,9 @@
 //! verifications. BftState delegates verification bookkeeping here while
 //! retaining control-flow decisions (voting, block rejection).
 
-use hyperscale_types::{Block, BlockHeader, BlockManifest, Hash, ReceiptBundle};
+use hyperscale_types::{Block, BlockHeader, BlockManifest, FinalizedWave, Hash, ReceiptBundle};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use tracing::{debug, trace, warn};
 
 use hyperscale_core::Action;
@@ -33,24 +34,24 @@ struct PendingStateRootVerification {
     required_root: Hash,
     /// The state root claimed by the proposer (to verify against).
     expected_root: Hash,
-    /// Wave ID hashes — the node state machine uses these to look up FinalizedWaves.
-    wave_id_hashes: Vec<Hash>,
+    /// Finalized waves from the PendingBlock — carry the proposer's receipts.
+    finalized_waves: Vec<Arc<FinalizedWave>>,
     /// Block height (used as JVT version).
     block_height: u64,
 }
 
 /// State root verification that is ready to dispatch (JVT is at the correct root).
 ///
-/// The `NodeStateMachine` drains these after each BFT call, attaches the
-/// `Arc<FinalizedWave>` data from execution state, and emits `VerifyStateRoot` actions.
+/// The `NodeStateMachine` drains these after each BFT call and emits
+/// `VerifyStateRoot` actions using the attached `FinalizedWave` data.
 #[derive(Debug)]
 pub struct ReadyStateRootVerification {
     pub block_hash: Hash,
     pub parent_state_root: Hash,
     pub expected_root: Hash,
-    /// Wave ID hashes for this block's certificates — the node state machine
-    /// uses these to look up the corresponding `Arc<FinalizedWave>` from execution state.
-    pub wave_id_hashes: Vec<Hash>,
+    /// Finalized waves from the PendingBlock — these carry the proposer's receipts,
+    /// ensuring all validators verify against the same execution outputs.
+    pub finalized_waves: Vec<Arc<FinalizedWave>>,
     pub block_height: u64,
 }
 
@@ -357,17 +358,9 @@ impl VerificationPipeline {
         block_hash: Hash,
         block: &Block,
         parent_state_root: Hash,
+        finalized_waves: Vec<Arc<FinalizedWave>>,
     ) {
         let current_root = self.last_committed_jvt_root;
-
-        // Collect wave_id hashes from the block's certificates. The node state
-        // machine uses these to look up Arc<FinalizedWave> from execution state
-        // when constructing the VerifyStateRoot action.
-        let wave_id_hashes: Vec<Hash> = block
-            .certificates
-            .iter()
-            .map(|c| c.wave_id.hash())
-            .collect();
 
         if current_root == parent_state_root {
             debug!(
@@ -385,7 +378,7 @@ impl VerificationPipeline {
                     block_hash,
                     parent_state_root,
                     expected_root: block.header.state_root,
-                    wave_id_hashes,
+                    finalized_waves,
                     block_height: block.header.height.0,
                 });
         } else {
@@ -403,7 +396,7 @@ impl VerificationPipeline {
                 PendingStateRootVerification {
                     required_root: parent_state_root,
                     expected_root: block.header.state_root,
-                    wave_id_hashes,
+                    finalized_waves,
                     block_height: block.header.height.0,
                 },
             );
@@ -707,7 +700,7 @@ impl VerificationPipeline {
                         block_hash,
                         parent_state_root: pv.required_root,
                         expected_root: pv.expected_root,
-                        wave_id_hashes: pv.wave_id_hashes,
+                        finalized_waves: pv.finalized_waves,
                         block_height: pv.block_height,
                     });
             }

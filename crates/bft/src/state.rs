@@ -1909,15 +1909,20 @@ impl BftState {
 
                 // Verify state root if block has committed certificates.
                 // The verification pipeline queues the request; NodeStateMachine
-                // will drain and enrich with merged_updates from the execution cache.
+                // will drain and emit VerifyStateRoot actions.
                 if self.verification.needs_state_root_verification(&block) {
                     // Use certified_state_root — tracks the QC-attested chain.
                     // In HotStuff-2, the parent is the certified tip.
                     let parent_state_root = self.certified_state_root;
+                    // Pass the PendingBlock's finalized waves directly — these carry
+                    // the proposer's receipts (fetched via FinalizedWaveFetch), ensuring
+                    // all validators verify against the same execution outputs.
+                    let finalized_waves = pending.finalized_waves();
                     self.verification.initiate_state_root_verification(
                         block_hash,
                         &block,
                         parent_state_root,
+                        finalized_waves,
                     );
                 }
 

@@ -758,19 +758,13 @@ impl StateMachine for NodeStateMachine {
         };
 
         // Drain any state root verifications that became ready during this event.
-        // Look up Arc<FinalizedWave> from execution state for each wave_id_hash.
-        // The thread pool merges DatabaseUpdates from these on the action handler.
+        // Finalized waves are carried directly from the PendingBlock (proposer's receipts).
         for ready in self.bft.drain_ready_state_root_verifications() {
-            let finalized_waves: Vec<Arc<FinalizedWave>> = ready
-                .wave_id_hashes
-                .iter()
-                .filter_map(|wid_hash| self.execution.get_finalized_wave_by_hash(wid_hash))
-                .collect();
             actions.push(Action::VerifyStateRoot {
                 block_hash: ready.block_hash,
                 parent_state_root: ready.parent_state_root,
                 expected_root: ready.expected_root,
-                finalized_waves,
+                finalized_waves: ready.finalized_waves,
                 block_height: ready.block_height,
             });
         }
