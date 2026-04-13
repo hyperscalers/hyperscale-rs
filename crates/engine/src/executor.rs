@@ -258,7 +258,8 @@ impl RadixExecutor {
                 &self.caches.exec_config,
             );
 
-            let result = self.receipt_to_result(storage, tx, &receipt, local_shard, num_shards);
+            // Use snapshot for filtering — same rationale as execute_one.
+            let result = self.receipt_to_result(&snapshot, tx, &receipt, local_shard, num_shards);
 
             // NO COMMIT HERE - DatabaseUpdates are cached by the state machine
             // and applied when the WaveCertificate is included in a block.
@@ -299,7 +300,11 @@ impl RadixExecutor {
             &executable,
         );
 
-        let result = self.receipt_to_result(storage, tx, &receipt, local_shard, num_shards);
+        // Use the same snapshot for receipt filtering — resolve_owned_nodes must
+        // see the same ownership state as the execution. Using shared storage
+        // would race with concurrent cert commits, producing different filtered
+        // DatabaseUpdates and receipt_hash divergence across validators.
+        let result = self.receipt_to_result(&snapshot, tx, &receipt, local_shard, num_shards);
 
         // NO COMMIT HERE - DatabaseUpdates are cached by the state machine
         // and applied when the WaveCertificate is included in a block.
@@ -308,7 +313,11 @@ impl RadixExecutor {
     }
 
     /// Convert a receipt to a result.
-    fn receipt_to_result<S: SubstateStore>(
+    ///
+    /// Takes `SubstateDatabase` (not `SubstateStore`) so callers can pass either
+    /// shared storage or an execution snapshot. Using the same snapshot as
+    /// execution ensures `resolve_owned_nodes` sees consistent ownership state.
+    fn receipt_to_result<S: SubstateDatabase>(
         &self,
         storage: &S,
         tx: &RoutableTransaction,

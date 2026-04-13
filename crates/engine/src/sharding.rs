@@ -103,7 +103,7 @@ const SBOR_OWN_TAG: u8 = 0x90;
 /// This is the "walk down" from accounts to vaults. It's necessary because
 /// vaults have no back-pointer to their owning account — `outer_object` points
 /// to the resource manager, not the account.
-pub fn resolve_owned_nodes<S: SubstateDatabase>(
+fn resolve_owned_nodes<S: SubstateDatabase>(
     storage: &S,
     declared_nodes: &[NodeId],
 ) -> HashMap<NodeId, NodeId> {
@@ -150,16 +150,20 @@ fn extract_owned_node_ids(value: &[u8], owner: NodeId, ownership: &mut HashMap<N
     }
 }
 
-/// Expand a list of declared NodeIds to include owned internal nodes (vaults).
+/// Expand declared NodeIds to include owned internal nodes (vaults) at a
+/// specific block height.
 ///
-/// Used by the provision path: `build_provision_requests` only knows about
-/// declared account NodeIds, but `fetch_state_entries` needs the vault NodeIds
-/// too — the remote shard needs vault substates to execute the transaction.
-///
-/// Returns a new list containing both the original declared nodes and any
-/// internal nodes (vaults, KV stores) discovered in their substates.
-pub fn expand_nodes_with_owned<S: SubstateDatabase>(storage: &S, nodes: &[NodeId]) -> Vec<NodeId> {
-    let ownership = resolve_owned_nodes(storage, nodes);
+/// Reads substates via JVT historical traversal. This is critical for provision
+/// generation:
+/// the expanded node list must match the state at the committed block height,
+/// not the current tip, otherwise the verkle proof will cover keys that don't
+/// exist at the proof's version and verification will fail on the remote shard.
+pub fn expand_nodes_with_owned_at_height<S: hyperscale_storage::SubstateStore>(
+    storage: &S,
+    nodes: &[NodeId],
+    block_height: u64,
+) -> Option<Vec<NodeId>> {
+    let ownership = resolve_owned_nodes_at_height(storage, nodes, block_height)?;
     let mut expanded: Vec<NodeId> = nodes.to_vec();
     for internal_id in ownership.keys() {
         if !expanded.contains(internal_id) {
@@ -168,7 +172,28 @@ pub fn expand_nodes_with_owned<S: SubstateDatabase>(storage: &S, nodes: &[NodeId
     }
     expanded.sort();
     expanded.dedup();
-    expanded
+    Some(expanded)
+}
+
+/// Historical version of [`resolve_owned_nodes`].
+///
+/// Reads substates at `block_height` using `list_substates_for_node_at_height`.
+/// Returns `None` if the version is unavailable (GC'd or not yet committed).
+fn resolve_owned_nodes_at_height<S: hyperscale_storage::SubstateStore>(
+    storage: &S,
+    declared_nodes: &[NodeId],
+    block_height: u64,
+) -> Option<HashMap<NodeId, NodeId>> {
+    let mut ownership: HashMap<NodeId, NodeId> = HashMap::new();
+
+    for account in declared_nodes {
+        let substates = storage.list_substates_for_node_at_height(account, block_height)?;
+        for (_partition_num, _sort_key, value) in substates {
+            extract_owned_node_ids(&value, *account, &mut ownership);
+        }
+    }
+
+    Some(ownership)
 }
 
 // ============================================================================

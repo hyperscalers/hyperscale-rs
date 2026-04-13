@@ -459,12 +459,24 @@ pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainRead
                 if all_entries.is_empty() {
                     true
                 } else {
-                    hyperscale_storage::tree::proofs::verify_proof(
+                    let valid = hyperscale_storage::tree::proofs::verify_proof(
                         &batch.proof,
                         &all_entries,
                         committed_header.header.state_root,
                         |e| &e.storage_key,
-                    )
+                    );
+                    if !valid {
+                        tracing::warn!(
+                            source_shard = batch.source_shard.0,
+                            block_height = batch.block_height.0,
+                            header_height = committed_header.header.height.0,
+                            header_state_root = ?committed_header.header.state_root,
+                            entry_count = all_entries.len(),
+                            proof_len = batch.proof.as_bytes().len(),
+                            "Provision verkle proof verification failed"
+                        );
+                    }
+                    valid
                 }
             };
             metrics::record_signature_verification_latency(
@@ -626,9 +638,25 @@ fn fetch_entries_for_requests<S: ChainWriter + SubstateStore + ChainReader>(
 ) -> Vec<FetchedTxEntries> {
     let mut per_tx = Vec::with_capacity(requests.len());
     for req in requests {
-        // Expand account NodeIds to include owned vaults.
-        let expanded_nodes =
-            hyperscale_engine::sharding::expand_nodes_with_owned(ctx.storage, &req.nodes);
+        // Expand account NodeIds to include owned vaults at the committed block height.
+        // Must use historical reads — current state may have new vaults that don't
+        // exist at block_height, causing the verkle proof to fail on the remote shard.
+        let expanded_nodes = match hyperscale_engine::sharding::expand_nodes_with_owned_at_height(
+            ctx.storage,
+            &req.nodes,
+            block_height.0,
+        ) {
+            Some(nodes) => nodes,
+            None => {
+                warn!(
+                    source_shard = source_shard.0,
+                    block_height = block_height.0,
+                    tx_hash = %req.tx_hash,
+                    "expand_nodes_with_owned_at_height: JVT version unavailable"
+                );
+                continue;
+            }
+        };
         let entries =
             match ctx
                 .executor
