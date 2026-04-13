@@ -157,6 +157,10 @@ pub struct BftState {
     /// Latest QC (certifies the latest certified block).
     latest_qc: Option<QuorumCertificate>,
 
+    /// QC deferred because the block header wasn't in memory when it formed.
+    /// Adopted in on_block_header when the header arrives.
+    deferred_qc: Option<(Hash, QuorumCertificate)>,
+
     /// Genesis block (needed for bootstrapping).
     genesis_block: Option<Block>,
 
@@ -316,6 +320,7 @@ impl BftState {
             certified_state_root: recovered.jvt_root.unwrap_or(Hash::ZERO),
             certified_in_flight: 0,
             latest_qc: recovered.latest_qc,
+            deferred_qc: None,
             genesis_block: None,
             pending_blocks: HashMap::new(),
             fetch: FetchCoordinator::new(),
@@ -442,6 +447,29 @@ impl BftState {
         if let Some(genesis) = &self.genesis_block {
             if genesis.hash() == block_hash {
                 return Some(genesis.clone());
+            }
+        }
+
+        None
+    }
+
+    /// Get a block header by hash without cloning the full block.
+    ///
+    /// Checks certified_blocks, pending_blocks (header always available),
+    /// and genesis. More efficient than `get_block_by_hash` when only
+    /// header fields (state_root, in_flight) are needed.
+    fn get_header_by_hash(&self, block_hash: Hash) -> Option<BlockHeader> {
+        if let Some(block) = self.certified_blocks.get(&block_hash) {
+            return Some(block.header.clone());
+        }
+
+        if let Some(pending) = self.pending_blocks.get(&block_hash) {
+            return Some(pending.header().clone());
+        }
+
+        if let Some(genesis) = &self.genesis_block {
+            if genesis.hash() == block_hash {
+                return Some(genesis.header.clone());
             }
         }
 
@@ -1007,16 +1035,7 @@ impl BftState {
         let parent_state_root = self.certified_state_root;
         let parent_block_height = parent_qc.height.0;
 
-        // Parent's in-flight count: look up by hash, fall back to certified_in_flight.
-        let parent_in_flight = self
-            .get_block_by_hash(parent_hash)
-            .map(|b| b.header.in_flight)
-            .or_else(|| {
-                self.pending_blocks
-                    .get(&parent_hash)
-                    .map(|p| p.header().in_flight)
-            })
-            .unwrap_or(self.certified_in_flight);
+        let parent_in_flight = self.certified_in_flight;
 
         // Track that we have a pending proposal (for correlation)
         self.pending_proposal = Some(PendingProposal {
@@ -1116,25 +1135,17 @@ impl BftState {
             is_fallback: true,
             state_root: parent_state_root,
             transaction_root: Hash::ZERO, // Fallback blocks have no transactions
-            certificate_root: Hash::ZERO, // No certificates
+            certificate_root: Hash::ZERO,
             local_receipt_root: Hash::ZERO,
             provision_root: Hash::ZERO,
-            waves: vec![], // Empty - fallback blocks have no transactions
-            in_flight: self
-                .get_block_by_hash(parent_hash)
-                .map(|b| b.header.in_flight)
-                .or_else(|| {
-                    self.pending_blocks
-                        .get(&parent_hash)
-                        .map(|p| p.header().in_flight)
-                })
-                .unwrap_or(self.certified_in_flight),
+            waves: vec![],
+            in_flight: self.certified_in_flight,
         };
 
         let block = Block {
             header: header.clone(),
-            transactions: vec![], // Empty - fallback blocks have no transactions
-            certificates: vec![], // Empty
+            transactions: vec![],
+            certificates: vec![],
         };
 
         let block_hash = block.hash();
@@ -1241,16 +1252,8 @@ impl BftState {
             certificate_root: Hash::ZERO, // No certificates
             local_receipt_root: Hash::ZERO,
             provision_root: Hash::ZERO,
-            waves: vec![], // Empty - sync blocks have no transactions
-            in_flight: self
-                .get_block_by_hash(parent_hash)
-                .map(|b| b.header.in_flight)
-                .or_else(|| {
-                    self.pending_blocks
-                        .get(&parent_hash)
-                        .map(|p| p.header().in_flight)
-                })
-                .unwrap_or(self.certified_in_flight),
+            waves: vec![],
+            in_flight: self.certified_in_flight,
         };
 
         let block = Block {
@@ -1503,19 +1506,10 @@ impl BftState {
                 self.latest_qc = Some(header.parent_qc.clone());
                 self.maybe_unlock_for_qc(topology, &header.parent_qc);
 
-                // Update certified block tracking — mirrors on_qc_formed logic.
-                // When we learn about a QC via a block header (rather than building
-                // it locally from votes), we must still track the certified block's
-                // state_root and in_flight count. Without this, validators that
-                // receive QCs via headers (e.g., non-proposers) would have stale
-                // certified_in_flight, causing in-flight count divergence.
-                let qc_block_hash = header.parent_qc.block_hash;
-                if let Some(block) = self.get_block_by_hash(qc_block_hash) {
-                    self.certified_state_root = block.header.state_root;
-                    self.certified_in_flight = block.header.in_flight;
-                } else if let Some(pending) = self.pending_blocks.get(&qc_block_hash) {
-                    self.certified_state_root = pending.header().state_root;
-                    self.certified_in_flight = pending.header().in_flight;
+                // Update certified tracking from the QC'd block if available.
+                if let Some(ch) = self.get_header_by_hash(header.parent_qc.block_hash) {
+                    self.certified_state_root = ch.state_root;
+                    self.certified_in_flight = ch.in_flight;
                 }
 
                 // Two-chain commit: the parent_qc may allow committing an
@@ -1585,17 +1579,24 @@ impl BftState {
         self.pending_blocks.insert(block_hash, pending);
         self.fetch.track(block_hash, self.now);
 
-        // Late header reconciliation: if we already formed a QC for this block
-        // (from votes arriving before the header), certified_in_flight wasn't
-        // updated at QC formation time because the block wasn't in pending_blocks
-        // yet. Now that we have the header, update the certified tracking fields.
-        if self
-            .latest_qc
-            .as_ref()
-            .is_some_and(|qc| qc.block_hash == block_hash)
-        {
-            self.certified_state_root = header.state_root;
-            self.certified_in_flight = header.in_flight;
+        // Late QC adoption: if a QC was deferred because this block's header
+        // wasn't in memory (votes arrived before header), adopt it now.
+        if let Some((deferred_hash, deferred_qc)) = self.deferred_qc.take() {
+            if deferred_hash == block_hash {
+                let should_adopt = self
+                    .latest_qc
+                    .as_ref()
+                    .is_none_or(|existing| deferred_qc.height.0 > existing.height.0);
+                if should_adopt {
+                    self.latest_qc = Some(deferred_qc.clone());
+                    self.certified_state_root = header.state_root;
+                    self.certified_in_flight = header.in_flight;
+                    self.maybe_unlock_for_qc(topology, &deferred_qc);
+                }
+            } else {
+                // Not for this block — put it back
+                self.deferred_qc = Some((deferred_hash, deferred_qc));
+            }
         }
 
         // Check if we have buffered votes for this block that can now trigger verification
@@ -1982,19 +1983,14 @@ impl BftState {
                     return vec![];
                 }
 
-                // In-flight verification: look up parent by hash first (certified_in_flight
-                // may already reflect THIS block if its QC formed before we verified).
-                // Fall back to certified_in_flight if parent was pruned on commit.
+                // In-flight verification: look up parent by hash because
+                // certified_in_flight may reflect THIS block's value if its
+                // QC formed before we got here. Fall back to certified_in_flight
+                // only if parent was pruned (committed and cleaned up).
                 {
-                    let parent_hash = block.header.parent_hash;
                     let parent_in_flight = self
-                        .get_block_by_hash(parent_hash)
-                        .map(|b| b.header.in_flight)
-                        .or_else(|| {
-                            self.pending_blocks
-                                .get(&parent_hash)
-                                .map(|p| p.header().in_flight)
-                        })
+                        .get_header_by_hash(block.header.parent_hash)
+                        .map(|h| h.in_flight)
                         .unwrap_or(self.certified_in_flight);
                     let finalized_tx_count: u32 = pending
                         .finalized_waves()
@@ -2955,24 +2951,26 @@ impl BftState {
             .is_none_or(|existing| qc.height.0 > existing.height.0);
 
         if should_update {
-            self.latest_qc = Some(qc.clone());
+            // Read the certified block's header fields before adopting the QC.
+            // If the block isn't in memory (votes arrived before header), defer
+            // QC adoption — the late reconciliation in on_block_header will
+            // adopt it when the header arrives. This prevents proposing with
+            // stale certified_in_flight which causes deterministic rejection.
+            let certified_header = self.get_header_by_hash(block_hash);
 
-            // Track the certified block's state_root and in_flight count —
-            // these are the correct parent values for the next proposal.
-            // Use the header directly from pending_blocks if the full block
-            // isn't constructed yet — the header (with state_root, in_flight)
-            // is always available from the gossip message.
-            if let Some(block) = self.get_block_by_hash(block_hash) {
-                self.certified_state_root = block.header.state_root;
-                self.certified_in_flight = block.header.in_flight;
-            } else if let Some(pending) = self.pending_blocks.get(&block_hash) {
-                self.certified_state_root = pending.header().state_root;
-                self.certified_in_flight = pending.header().in_flight;
+            if let Some(header) = certified_header {
+                self.latest_qc = Some(qc.clone());
+                self.certified_state_root = header.state_root;
+                self.certified_in_flight = header.in_flight;
+                self.maybe_unlock_for_qc(topology, &qc);
+            } else {
+                debug!(
+                    block_hash = ?block_hash,
+                    height = height,
+                    "Deferring QC adoption — block header not yet in memory"
+                );
+                self.deferred_qc = Some((block_hash, qc.clone()));
             }
-
-            // HotStuff-2 unlock: when a QC forms, we can safely unlock
-            // our vote locks at or below that QC's height
-            self.maybe_unlock_for_qc(topology, &qc);
         }
 
         let mut actions = vec![];
@@ -3557,25 +3555,20 @@ impl BftState {
         }
 
         // Also cache the parent_qc from the block header if it's newer.
-        // Look up the parent block's certified fields from the current block's
-        // parent — during sync we have the full block, so parent_qc.block_hash
-        // may be in pending_blocks or certified_blocks.
         if !block.header.parent_qc.is_genesis()
             && self
                 .latest_qc
                 .as_ref()
                 .is_none_or(|existing| block.header.parent_qc.height.0 > existing.height.0)
         {
-            let parent_hash = block.header.parent_qc.block_hash;
-            if let Some(parent) = self.get_block_by_hash(parent_hash) {
-                self.certified_state_root = parent.header.state_root;
-                self.certified_in_flight = parent.header.in_flight;
-            } else if let Some(pending) = self.pending_blocks.get(&parent_hash) {
-                self.certified_state_root = pending.header().state_root;
-                self.certified_in_flight = pending.header().in_flight;
-            }
             self.latest_qc = Some(block.header.parent_qc.clone());
             self.maybe_unlock_for_qc(topology, &block.header.parent_qc);
+
+            // Best-effort certified field update from the QC'd block.
+            if let Some(ph) = self.get_header_by_hash(block.header.parent_qc.block_hash) {
+                self.certified_state_root = ph.state_root;
+                self.certified_in_flight = ph.in_flight;
+            }
         }
 
         // Get provision hashes from the pending block manifest if available,
@@ -4847,6 +4840,14 @@ mod tests {
             provision_root: Hash::ZERO,
             waves: vec![],
             in_flight: 0,
+        }
+    }
+
+    fn make_empty_block(height: u64) -> Block {
+        Block {
+            header: make_header_at_height(height, 1000),
+            transactions: vec![],
+            certificates: vec![],
         }
     }
 
@@ -7265,8 +7266,9 @@ mod tests {
         // min_block_interval is 500ms by default, so 900ms > 500ms - should be allowed
 
         // Create a QC at height 3 (so next height would be 4, which validator 0 proposes)
+        let block_3_hash = Hash::from_bytes(b"block_3");
         let qc = QuorumCertificate {
-            block_hash: Hash::from_bytes(b"block_3"),
+            block_hash: block_3_hash,
             shard_group_id: ShardGroupId(0),
             height: BlockHeight(3),
             parent_block_hash: Hash::from_bytes(b"block_2"),
@@ -7276,19 +7278,17 @@ mod tests {
             weighted_timestamp_ms: 1000,
         };
 
+        // Insert the certified block so on_qc_formed can read its header
+        state
+            .certified_blocks
+            .insert(block_3_hash, make_empty_block(3));
+
         // Create a ready transaction so there's content to propose
         let ready_txs = ReadyTransactions {
             transactions: vec![make_test_tx_with_seed(42)],
         };
 
-        let actions = state.on_qc_formed(
-            &topology,
-            qc.block_hash,
-            qc,
-            &ready_txs, // has content
-            vec![],
-            vec![],
-        );
+        let actions = state.on_qc_formed(&topology, block_3_hash, qc, &ready_txs, vec![], vec![]);
 
         // Should contain a BuildProposal action (enough time passed)
         // After the refactor, proposal building is async - we emit BuildProposal
@@ -7408,8 +7408,14 @@ mod tests {
         state.set_time(Duration::from_millis(1000));
         state.last_qc_time = Some(Duration::from_millis(1000));
 
+        // Insert the certified block so on_qc_formed can read its header
+        let block_3_hash = Hash::from_bytes(b"block_3");
+        state
+            .certified_blocks
+            .insert(block_3_hash, make_empty_block(3));
+
         let qc = QuorumCertificate {
-            block_hash: Hash::from_bytes(b"block_3"),
+            block_hash: block_3_hash,
             shard_group_id: ShardGroupId(0),
             height: BlockHeight(3),
             parent_block_hash: Hash::from_bytes(b"block_2"),
