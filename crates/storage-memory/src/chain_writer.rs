@@ -29,26 +29,18 @@ impl ChainWriter for SimStorage {
     fn prepare_block_commit(
         &self,
         parent_state_root: Hash,
+        parent_block_height: u64,
         receipts: &[ReceiptBundle],
         block_height: u64,
     ) -> (Hash, Self::PreparedCommit) {
         let merged_updates = hyperscale_storage::merge_updates_from_receipts(receipts);
 
-        // Read lock: clone data + compute speculative JVT root concurrently.
+        // Read lock: clone data + compute speculative JVT root.
         let s = self.state.read().unwrap();
         let base_data = s.data.clone();
-        let base_root = s.current_root_hash;
-        let base_version = s.current_block_height;
 
-        if base_root != parent_state_root {
-            tracing::warn!(
-                ?base_root,
-                ?parent_state_root,
-                "JVT root mismatch - verification will likely fail"
-            );
-        }
-
-        let parent_version = hyperscale_storage::tree::jvt_parent_height(base_version, base_root);
+        let parent_version =
+            hyperscale_storage::tree::jvt_parent_height(parent_block_height, parent_state_root);
         let (result_root, collected) = hyperscale_storage::tree::put_at_version(
             &s.tree_store,
             parent_version,
@@ -59,8 +51,8 @@ impl ChainWriter for SimStorage {
 
         let snapshot = JvtSnapshot::from_collected_writes(
             collected,
-            base_root,
-            base_version,
+            parent_state_root,
+            parent_block_height,
             result_root,
             block_height,
         );

@@ -675,9 +675,13 @@ where
                                 };
 
                             // Verify state_root via prepare→verify→commit.
+                            // Sync runs sequentially on the IO thread — no race
+                            // with concurrent commits, so current state is correct.
                             let parent_root = storage.state_root_hash();
+                            let parent_height = if height.0 > 0 { height.0 - 1 } else { 0 };
                             let (computed_root, prepared) = storage.prepare_block_commit(
                                 parent_root,
+                                parent_height,
                                 &sync_receipt_bundles,
                                 height.0,
                             );

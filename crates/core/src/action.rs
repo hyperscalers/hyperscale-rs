@@ -352,6 +352,8 @@ pub enum Action {
         block_hash: Hash,
         /// Base state root to verify from (must match local JVT before computing).
         parent_state_root: Hash,
+        /// Height of the parent block (stable JVT version for computation).
+        parent_block_height: u64,
         /// Expected state root after applying writes.
         expected_root: Hash,
         /// Finalized waves whose receipts contribute to the state root.
@@ -438,6 +440,8 @@ pub enum Action {
         is_fallback: bool,
         /// Parent's state root. Certs included only if local JVT matches this.
         parent_state_root: Hash,
+        /// Height of the parent block (stable JVT version for computation).
+        parent_block_height: u64,
         transactions: Vec<Arc<RoutableTransaction>>,
         /// Finalized waves to include in the block (carries certs + receipts + ECs).
         finalized_waves: Vec<Arc<FinalizedWave>>,

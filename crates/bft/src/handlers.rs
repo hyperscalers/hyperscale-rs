@@ -271,15 +271,17 @@ pub struct StateRootResult<P: Send> {
 /// Calls `storage.prepare_block_commit()` to compute the speculative state root
 /// from the receipts, then compares against the expected root. Returns the
 /// prepared commit handle for caching on success.
-pub fn verify_state_root<S: ChainWriter>(
+pub fn verify_state_root<S: ChainWriter + SubstateStore>(
     storage: &S,
     parent_state_root: Hash,
     expected_root: Hash,
     receipts: &[ReceiptBundle],
     block_height: u64,
 ) -> StateRootResult<S::PreparedCommit> {
+    // Both proposer and verifier must use the same JVT version to get matching results.
+    let actual_version = storage.jvt_version();
     let (computed_root, prepared) =
-        storage.prepare_block_commit(parent_state_root, receipts, block_height);
+        storage.prepare_block_commit(parent_state_root, actual_version, receipts, block_height);
 
     let valid = computed_root == expected_root;
 
@@ -288,6 +290,8 @@ pub fn verify_state_root<S: ChainWriter>(
             ?expected_root,
             ?computed_root,
             ?parent_state_root,
+            block_height,
+            jvt_version = actual_version,
             "State root verification FAILED"
         );
     }
@@ -332,16 +336,14 @@ pub fn build_proposal<S: ChainWriter + SubstateStore>(
     waves: Vec<WaveId>,
     provision_hashes: Vec<Hash>,
 ) -> ProposalResult<S::PreparedCommit> {
-    // Check if JVT is at parent_state_root (no waiting - instant check)
     let current_root = storage.state_root_hash();
     let jvt_ready = current_root == parent_state_root;
-
-    // Can include certificates only if JVT is ready
     let include_certs = jvt_ready && !certificates.is_empty();
 
     let (state_root, certs_to_include, prepared) = if include_certs {
-        // JVT ready - compute speculative root and get prepared commit handle
-        let (root, prepared) = storage.prepare_block_commit(parent_state_root, receipts, height.0);
+        let actual_version = storage.jvt_version();
+        let (root, prepared) =
+            storage.prepare_block_commit(parent_state_root, actual_version, receipts, height.0);
         (root, certificates, Some(prepared))
     } else {
         // Either no certificates, or JVT not ready - inherit parent state

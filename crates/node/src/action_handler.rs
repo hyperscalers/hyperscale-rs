@@ -283,6 +283,7 @@ pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainRead
             expected_root,
             finalized_waves,
             block_height,
+            ..
         } => {
             let start = std::time::Instant::now();
             // Collect receipts from all finalized waves.
@@ -329,6 +330,7 @@ pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainRead
             finalized_waves,
             waves,
             provision_batches,
+            ..
         } => {
             // Extract certificates from finalized waves.
             // No storage reads needed — everything flows through Arc<FinalizedWave>.

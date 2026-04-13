@@ -361,7 +361,7 @@ fn test_prepare_then_commit_matches_direct() {
     let temp_dir1 = TempDir::new().unwrap();
     let s_prepared = RocksDbStorage::open(temp_dir1.path()).unwrap();
     let parent_root = s_prepared.state_root_hash();
-    let (spec_root, prepared) = s_prepared.prepare_block_commit(parent_root, &[], 1);
+    let (spec_root, prepared) = s_prepared.prepare_block_commit(parent_root, 0, &[], 1);
     let block = make_test_block(1);
     let qc = make_test_qc(&block);
     let result_prepared =

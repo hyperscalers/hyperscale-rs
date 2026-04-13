@@ -315,7 +315,10 @@ impl BftState {
             voted_heights: HashMap::new(),
             received_votes_by_height: HashMap::new(),
             certified_blocks: HashMap::new(),
-            verification: VerificationPipeline::new(recovered.jvt_root.unwrap_or(Hash::ZERO)),
+            verification: VerificationPipeline::new(
+                recovered.jvt_root.unwrap_or(Hash::ZERO),
+                recovered.committed_height,
+            ),
             sync: SyncManager::new(),
             pending_commits: std::collections::BTreeMap::new(),
             pending_commits_awaiting_data: HashMap::new(),
@@ -988,6 +991,7 @@ impl BftState {
         // certified_state_root tracks the QC-attested chain of state_roots,
         // independent of in-memory block headers which may carry stale values.
         let parent_state_root = self.certified_state_root;
+        let parent_block_height = parent_qc.height.0;
 
         // Track that we have a pending proposal (for correlation)
         self.pending_proposal = Some(PendingProposal {
@@ -1028,6 +1032,7 @@ impl BftState {
                 timestamp,
                 is_fallback: false,
                 parent_state_root,
+                parent_block_height,
                 transactions,
                 finalized_waves: waves_to_propose,
                 waves,
@@ -1914,6 +1919,7 @@ impl BftState {
                     // Use certified_state_root — tracks the QC-attested chain.
                     // In HotStuff-2, the parent is the certified tip.
                     let parent_state_root = self.certified_state_root;
+                    let parent_block_height = block.header.parent_qc.height.0;
                     // Pass the PendingBlock's finalized waves directly — these carry
                     // the proposer's receipts (fetched via FinalizedWaveFetch), ensuring
                     // all validators verify against the same execution outputs.
@@ -1922,6 +1928,7 @@ impl BftState {
                         block_hash,
                         &block,
                         parent_state_root,
+                        parent_block_height,
                         finalized_waves,
                     );
                 }

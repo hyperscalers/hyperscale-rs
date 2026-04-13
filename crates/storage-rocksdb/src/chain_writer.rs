@@ -34,6 +34,7 @@ impl hyperscale_storage::ChainWriter for RocksDbStorage {
     fn prepare_block_commit(
         &self,
         parent_state_root: hyperscale_types::Hash,
+        parent_block_height: u64,
         receipts: &[ReceiptBundle],
         block_height: u64,
     ) -> (hyperscale_types::Hash, Self::PreparedCommit) {
@@ -41,6 +42,7 @@ impl hyperscale_storage::ChainWriter for RocksDbStorage {
 
         let (computed_root, jvt_snapshot) = self.compute_speculative_root_from_base(
             parent_state_root,
+            parent_block_height,
             std::slice::from_ref(&merged_updates),
             block_height,
         );

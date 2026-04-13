@@ -763,6 +763,7 @@ impl StateMachine for NodeStateMachine {
             actions.push(Action::VerifyStateRoot {
                 block_hash: ready.block_hash,
                 parent_state_root: ready.parent_state_root,
+                parent_block_height: ready.parent_block_height,
                 expected_root: ready.expected_root,
                 finalized_waves: ready.finalized_waves,
                 block_height: ready.block_height,

@@ -15,7 +15,7 @@ use hyperscale_metrics as metrics;
 use hyperscale_types::{ExecutionCertificate, ShardGroupId, ValidatorId, WaveId};
 use std::collections::{BTreeMap, HashSet};
 use std::time::{Duration, Instant};
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, info, trace};
 
 /// Configuration for the execution certificate fetch protocol.
 #[derive(Debug, Clone)]
@@ -385,7 +385,7 @@ impl ExecCertFetchProtocol {
                 .copied()
         });
         if let Some(key) = target {
-            warn!(
+            debug!(
                 source_shard = source_shard.0,
                 evicted_height = key.1,
                 committed_height,

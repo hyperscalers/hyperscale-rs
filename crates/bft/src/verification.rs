@@ -48,6 +48,8 @@ struct PendingStateRootVerification {
 pub struct ReadyStateRootVerification {
     pub block_hash: Hash,
     pub parent_state_root: Hash,
+    /// The committed height of the parent block (stable JVT version for computation).
+    pub parent_block_height: u64,
     pub expected_root: Hash,
     /// Finalized waves from the PendingBlock — these carry the proposer's receipts,
     /// ensuring all validators verify against the same execution outputs.
@@ -80,8 +82,15 @@ pub(crate) struct VerificationPipeline {
     /// Blocks waiting for JVT to reach the required version before verification.
     pending_state_root_verifications: HashMap<Hash, PendingStateRootVerification>,
 
+    /// Stashed data for in-flight verifications, used to re-queue on transient
+    /// failure (JVT root advanced between dispatch and crypto-thread execution).
+    in_flight_verification_data: HashMap<Hash, PendingStateRootVerification>,
+
     /// Last committed JVT root hash.
     last_committed_jvt_root: Hash,
+
+    /// Last committed JVT block height.
+    last_committed_height: u64,
 
     /// Blocks with verified state roots.
     verified_state_roots: HashSet<Hash>,
@@ -121,13 +130,15 @@ pub(crate) struct VerificationPipeline {
 
 impl VerificationPipeline {
     /// Create a new verification pipeline.
-    pub fn new(jvt_root: Hash) -> Self {
+    pub fn new(jvt_root: Hash, committed_height: u64) -> Self {
         Self {
             pending_qc_verifications: HashMap::new(),
             verified_qcs: HashMap::new(),
             state_root_verifications_in_flight: HashSet::new(),
             pending_state_root_verifications: HashMap::new(),
+            in_flight_verification_data: HashMap::new(),
             last_committed_jvt_root: jvt_root,
+            last_committed_height: committed_height,
             verified_state_roots: HashSet::new(),
             ready_state_root_verifications: Vec::new(),
             transaction_root_verifications_in_flight: HashSet::new(),
@@ -358,6 +369,7 @@ impl VerificationPipeline {
         block_hash: Hash,
         block: &Block,
         parent_state_root: Hash,
+        parent_block_height: u64,
         finalized_waves: Vec<Arc<FinalizedWave>>,
     ) {
         let current_root = self.last_committed_jvt_root;
@@ -368,15 +380,25 @@ impl VerificationPipeline {
                 certificate_count = block.certificates.len(),
                 expected_root = ?block.header.state_root,
                 parent_state_root = ?parent_state_root,
-                current_jvt_root = ?current_root,
+                committed_height = self.last_committed_height,
                 "JVT ready - state root verification ready for dispatch"
             );
 
             self.state_root_verifications_in_flight.insert(block_hash);
+            self.in_flight_verification_data.insert(
+                block_hash,
+                PendingStateRootVerification {
+                    required_root: parent_state_root,
+                    expected_root: block.header.state_root,
+                    finalized_waves: finalized_waves.clone(),
+                    block_height: block.header.height.0,
+                },
+            );
             self.ready_state_root_verifications
                 .push(ReadyStateRootVerification {
                     block_hash,
                     parent_state_root,
+                    parent_block_height: self.last_committed_height,
                     expected_root: block.header.state_root,
                     finalized_waves,
                     block_height: block.header.height.0,
@@ -387,7 +409,9 @@ impl VerificationPipeline {
                 certificate_count = block.certificates.len(),
                 expected_root = ?block.header.state_root,
                 parent_state_root = ?parent_state_root,
+                parent_block_height,
                 current_jvt_root = ?current_root,
+                committed_height = self.last_committed_height,
                 "JVT not ready - queueing state root verification"
             );
 
@@ -404,15 +428,29 @@ impl VerificationPipeline {
     }
 
     /// Record a state root verification result. Returns whether the verification passed.
+    ///
+    /// On failure, re-queues the verification as pending. The JVT root may have
+    /// advanced between dispatch and crypto-thread execution (transient race).
+    /// The next `on_jvt_advanced` call will re-evaluate and re-dispatch.
     pub fn on_state_root_verified(&mut self, block_hash: Hash, valid: bool) -> bool {
         self.state_root_verifications_in_flight.remove(&block_hash);
 
         if valid {
+            self.in_flight_verification_data.remove(&block_hash);
             self.verified_state_roots.insert(block_hash);
             debug!(
                 block_hash = ?block_hash,
                 "State root verified successfully"
             );
+        } else if let Some(stashed) = self.in_flight_verification_data.remove(&block_hash) {
+            // Re-queue: the failure is likely transient (JVT advanced between
+            // dispatch and execution). The next on_jvt_advanced will retry.
+            debug!(
+                block_hash = ?block_hash,
+                "State root verification failed — re-queuing for retry"
+            );
+            self.pending_state_root_verifications
+                .insert(block_hash, stashed);
         }
 
         valid
@@ -674,8 +712,10 @@ impl VerificationPipeline {
     /// `NodeStateMachine` to drain and enrich with `merged_updates`.
     pub fn on_jvt_advanced(&mut self, block_height: u64, new_root: Hash) {
         self.last_committed_jvt_root = new_root;
+        self.last_committed_height = block_height;
 
-        // Find all pending verifications where the JVT now has the required base root.
+        // Find all pending verifications where the JVT now has the required
+        // base root. The height is implicitly satisfied since the root matches.
         let unblocked: Vec<Hash> = self
             .pending_state_root_verifications
             .iter()
@@ -695,10 +735,14 @@ impl VerificationPipeline {
         for block_hash in unblocked {
             if let Some(pv) = self.pending_state_root_verifications.remove(&block_hash) {
                 self.state_root_verifications_in_flight.insert(block_hash);
+                // Stash data so we can re-queue on transient failure.
+                self.in_flight_verification_data
+                    .insert(block_hash, pv.clone());
                 self.ready_state_root_verifications
                     .push(ReadyStateRootVerification {
                         block_hash,
                         parent_state_root: pv.required_root,
+                        parent_block_height: self.last_committed_height,
                         expected_root: pv.expected_root,
                         finalized_waves: pv.finalized_waves,
                         block_height: pv.block_height,

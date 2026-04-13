@@ -29,12 +29,18 @@ pub trait ChainWriter: Send + Sync {
     /// Extracts and merges `DatabaseUpdates` from the receipts internally,
     /// then computes the speculative JVT root.
     ///
-    /// `block_height` is the height of the block being prepared (used as JVT version).
+    /// `parent_block_height` is the height of the parent block whose state we
+    /// build on. Used as the JVT parent version for `put_at_version`. This
+    /// must be a committed height (tree nodes exist at this version).
+    ///
+    /// `block_height` is the height of the block being prepared (used as JVT
+    /// new version).
     ///
     /// Returns `(computed_state_root, prepared_commit_handle)`.
     fn prepare_block_commit(
         &self,
         parent_state_root: Hash,
+        parent_block_height: u64,
         receipts: &[ReceiptBundle],
         block_height: u64,
     ) -> (Hash, Self::PreparedCommit);

@@ -123,11 +123,16 @@ impl hyperscale_storage::ChainWriter for SharedStorage {
     fn prepare_block_commit(
         &self,
         parent_state_root: Hash,
+        parent_block_height: u64,
         receipts: &[hyperscale_types::ReceiptBundle],
         block_height: u64,
     ) -> (Hash, Self::PreparedCommit) {
-        self.0
-            .prepare_block_commit(parent_state_root, receipts, block_height)
+        self.0.prepare_block_commit(
+            parent_state_root,
+            parent_block_height,
+            receipts,
+            block_height,
+        )
     }
 
     fn commit_prepared_block(

@@ -117,36 +117,19 @@ impl RocksDbStorage {
     pub(crate) fn compute_speculative_root_from_base(
         &self,
         expected_base_root: hyperscale_types::Hash,
+        parent_block_height: u64,
         updates_per_cert: &[DatabaseUpdates],
         block_height: u64,
     ) -> (hyperscale_types::Hash, JvtSnapshot) {
-        // This computation runs on the consensus-crypto thread pool, concurrent with
-        // block commits on the tokio runtime threads. Block commits delete stale JVT
-        // nodes from RocksDB. Without a snapshot, this computation could read nodes
-        // that are deleted mid-computation, causing a panic in the Radix JVT code.
-        //
-        // The snapshot provides a consistent view of RocksDB at this moment. Even if
-        // another thread deletes nodes, our reads through the snapshot still see them.
-        // The snapshot is lightweight (just a version marker) and automatically releases
-        // when dropped at the end of this function.
+        // Use a RocksDB snapshot for consistent reads during JVT computation.
+        // This prevents stale node deletions mid-computation from panicking.
         let snapshot_store = SnapshotTreeStore::new(&self.db, &self.node_cache);
-        let (base_version, base_root) = snapshot_store.read_jvt_metadata();
-
-        // Verify the JVT root matches the expected base root.
-        // We don't short-circuit on empty updates because even empty blocks
-        // need a root node at the new version (JVT version = block height).
-        if base_root != expected_base_root {
-            tracing::warn!(
-                ?base_root,
-                ?expected_base_root,
-                "JVT root mismatch - verification will likely fail"
-            );
-        }
 
         // Merge all certificates into a single update — later cert wins for conflicts.
         let merged = hyperscale_storage::merge_database_updates(updates_per_cert);
 
-        let parent_version = hyperscale_storage::tree::jvt_parent_height(base_version, base_root);
+        let parent_version =
+            hyperscale_storage::tree::jvt_parent_height(parent_block_height, expected_base_root);
         let (root, collected) = hyperscale_storage::tree::put_at_version(
             &snapshot_store,
             parent_version,
@@ -157,8 +140,8 @@ impl RocksDbStorage {
 
         let snapshot = JvtSnapshot::from_collected_writes(
             collected,
-            base_root,
-            base_version,
+            expected_base_root,
+            parent_block_height,
             root,
             block_height,
         );
