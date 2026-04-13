@@ -1007,10 +1007,16 @@ impl BftState {
         let parent_state_root = self.certified_state_root;
         let parent_block_height = parent_qc.height.0;
 
-        // Parent's in-flight count — tracked like certified_state_root, updated
-        // when a QC forms. Avoids fragile hash lookups that silently default to 0
-        // when the parent block has been pruned from memory.
-        let parent_in_flight = self.certified_in_flight;
+        // Parent's in-flight count: look up by hash, fall back to certified_in_flight.
+        let parent_in_flight = self
+            .get_block_by_hash(parent_hash)
+            .map(|b| b.header.in_flight)
+            .or_else(|| {
+                self.pending_blocks
+                    .get(&parent_hash)
+                    .map(|p| p.header().in_flight)
+            })
+            .unwrap_or(self.certified_in_flight);
 
         // Track that we have a pending proposal (for correlation)
         self.pending_proposal = Some(PendingProposal {
@@ -1114,11 +1120,15 @@ impl BftState {
             local_receipt_root: Hash::ZERO,
             provision_root: Hash::ZERO,
             waves: vec![], // Empty - fallback blocks have no transactions
-            // Fallback blocks add 0 txs and finalize 0 txs, so in_flight
-            // must equal the parent's value. Hardcoding 0 here caused a
-            // permanent livelock: verification computes parent_in_flight + 0 - 0
-            // which never equals 0 when there are in-flight transactions.
-            in_flight: self.certified_in_flight,
+            in_flight: self
+                .get_block_by_hash(parent_hash)
+                .map(|b| b.header.in_flight)
+                .or_else(|| {
+                    self.pending_blocks
+                        .get(&parent_hash)
+                        .map(|p| p.header().in_flight)
+                })
+                .unwrap_or(self.certified_in_flight),
         };
 
         let block = Block {
@@ -1232,7 +1242,15 @@ impl BftState {
             local_receipt_root: Hash::ZERO,
             provision_root: Hash::ZERO,
             waves: vec![], // Empty - sync blocks have no transactions
-            in_flight: self.certified_in_flight, // Inherit parent's in-flight (no new txs, no finalized txs)
+            in_flight: self
+                .get_block_by_hash(parent_hash)
+                .map(|b| b.header.in_flight)
+                .or_else(|| {
+                    self.pending_blocks
+                        .get(&parent_hash)
+                        .map(|p| p.header().in_flight)
+                })
+                .unwrap_or(self.certified_in_flight),
         };
 
         let block = Block {
@@ -1964,12 +1982,20 @@ impl BftState {
                     return vec![];
                 }
 
-                // Synchronous in-flight count verification — deterministic from chain state.
-                // expected = parent.in_flight + new_txs - finalized_txs
-                // Use certified_in_flight (tracked like certified_state_root) instead
-                // of a hash lookup that can silently default to 0 when pruned.
+                // In-flight verification: look up parent by hash first (certified_in_flight
+                // may already reflect THIS block if its QC formed before we verified).
+                // Fall back to certified_in_flight if parent was pruned on commit.
                 {
-                    let parent_in_flight = self.certified_in_flight;
+                    let parent_hash = block.header.parent_hash;
+                    let parent_in_flight = self
+                        .get_block_by_hash(parent_hash)
+                        .map(|b| b.header.in_flight)
+                        .or_else(|| {
+                            self.pending_blocks
+                                .get(&parent_hash)
+                                .map(|p| p.header().in_flight)
+                        })
+                        .unwrap_or(self.certified_in_flight);
                     let finalized_tx_count: u32 = pending
                         .finalized_waves()
                         .iter()
