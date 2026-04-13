@@ -65,12 +65,13 @@ pub(crate) enum PendingCommit {
         block: Arc<Block>,
         qc: Arc<QuorumCertificate>,
         finalized_waves: Vec<Arc<FinalizedWave>>,
-        provision_batches: Vec<Arc<Provision>>,
+        provision_hashes: Vec<Hash>,
     },
     /// Sync path: receipts and ECs come from `pending_sync_data`.
     Synced {
         block: Arc<Block>,
         qc: Arc<QuorumCertificate>,
+        provision_hashes: Vec<Hash>,
     },
 }
 

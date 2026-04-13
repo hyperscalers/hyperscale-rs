@@ -363,7 +363,7 @@ pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainRead
                 &all_receipts,
                 shard_group_id,
                 waves,
-                provision_hashes,
+                provision_hashes.clone(),
             );
             let prepared = result
                 .prepared_commit
@@ -375,7 +375,7 @@ pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainRead
                     block: Arc::new(result.block),
                     block_hash: result.block_hash,
                     finalized_waves,
-                    provision_batches,
+                    provision_hashes,
                 })],
                 prepared_commit: prepared,
             })

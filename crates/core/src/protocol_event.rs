@@ -97,8 +97,9 @@ pub enum ProtocolEvent {
         block: Block,
         /// JVT state root after committing this block's state changes.
         state_root: Hash,
-        /// Provision batches included in this block (ephemeral, for deterministic execution application).
-        provision_batches: Vec<Arc<Provision>>,
+        /// Provision batch hashes from the block manifest. Resolved to actual
+        /// batch data by the consumer via the ProvisionCoordinator.
+        provision_hashes: Vec<Hash>,
     },
 
     /// Quorum Certificate verification and building result.
@@ -148,8 +149,8 @@ pub enum ProtocolEvent {
         block_hash: Hash,
         /// Finalized waves included in this block (carries receipts for atomic commit).
         finalized_waves: Vec<Arc<FinalizedWave>>,
-        /// Provision batches included in this block (for PendingBlock DA tracking).
-        provision_batches: Vec<Arc<Provision>>,
+        /// Provision batch hashes included in this block (for PendingBlock DA tracking).
+        provision_hashes: Vec<Hash>,
     },
 
     // ═══════════════════════════════════════════════════════════════════════

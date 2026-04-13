@@ -334,7 +334,7 @@ impl NodeStateMachine {
         block_hash: Hash,
         height: u64,
         block: Block,
-        provision_batches: Vec<Arc<Provision>>,
+        provision_hashes: Vec<Hash>,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
         let block_height = BlockHeight(height);
@@ -393,11 +393,13 @@ impl NodeStateMachine {
                 .on_block_committed(self.topology.snapshot()),
         );
 
-        // Apply committed provisions deterministically. Provision flow with the
-        // block through the commit pipeline — all validators process the same
-        // batches at the same height, making target_vote_height deterministic.
-        let committed_provision_hashes: Vec<Hash> =
-            provision_batches.iter().map(|b| b.hash()).collect();
+        // Apply committed provisions deterministically. Resolve provision hashes
+        // to batch data via the ProvisionCoordinator — this works identically for
+        // both consensus and sync commit paths since hashes come from the manifest.
+        let provision_batches: Vec<Arc<Provision>> = provision_hashes
+            .iter()
+            .filter_map(|h| self.provisions.get_batch_by_hash(h))
+            .collect();
         if !provision_batches.is_empty() {
             actions.extend(self.execution.apply_committed_provisions(
                 self.topology.snapshot(),
@@ -410,7 +412,7 @@ impl NodeStateMachine {
         actions.extend(self.provisions.on_block_committed(
             self.topology.snapshot(),
             &block,
-            &committed_provision_hashes,
+            &provision_hashes,
         ));
 
         // Round voting: scan all incomplete waves and emit votes for complete ones.
@@ -593,7 +595,7 @@ impl StateMachine for NodeStateMachine {
                 block,
                 block_hash,
                 finalized_waves,
-                provision_batches,
+                provision_hashes,
             } => self.bft.on_proposal_built(
                 self.topology.snapshot(),
                 height,
@@ -601,7 +603,7 @@ impl StateMachine for NodeStateMachine {
                 block.clone(),
                 block_hash,
                 finalized_waves,
-                provision_batches,
+                provision_hashes,
             ),
 
             // ── Block Committed ──────────────────────────────────────────
@@ -610,12 +612,12 @@ impl StateMachine for NodeStateMachine {
                 height,
                 block,
                 state_root,
-                provision_batches,
+                provision_hashes,
             } => {
                 // JVT unblocking first — unblocks state root verifications for
                 // the next block before subsystem notifications run.
                 self.on_state_commit_complete(height, state_root);
-                self.on_block_committed(block_hash, height, block, provision_batches)
+                self.on_block_committed(block_hash, height, block, provision_hashes)
             }
 
             // ── Provision ───────────────────────────────────────────────
