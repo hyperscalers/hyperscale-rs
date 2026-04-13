@@ -195,6 +195,16 @@ where
             // ═══════════════════════════════════════════════════════════
             // Delegated work — immediate dispatch
             // ═══════════════════════════════════════════════════════════
+            Action::BuildProposal {
+                ref provision_batches,
+                ..
+            } => {
+                // Ensure provision data is serveable before the header reaches peers.
+                for batch in provision_batches {
+                    self.provision_cache.insert(batch.hash(), Arc::clone(batch));
+                }
+                self.dispatch_delegated_action(action);
+            }
             Action::VerifyAndBuildQuorumCertificate { .. }
             | Action::VerifyQcSignature { .. }
             | Action::VerifyRemoteHeaderQc { .. }
@@ -203,7 +213,6 @@ where
             | Action::VerifyProvisionRoot { .. }
             | Action::VerifyCertificateRoot { .. }
             | Action::VerifyLocalReceiptRoot { .. }
-            | Action::BuildProposal { .. }
             | Action::VerifyProvision { .. }
             | Action::ExecuteTransactions { .. }
             | Action::ExecuteCrossShardTransactions { .. }
