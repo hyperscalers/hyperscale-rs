@@ -147,6 +147,13 @@ pub struct BftState {
     /// parent_state_root for the next proposal (certified tip = parent).
     certified_state_root: Hash,
 
+    /// In-flight transaction count from the latest certified block header.
+    /// Updated synchronously when a QC forms, mirroring certified_state_root.
+    /// Used for deterministic in-flight computation in proposals and fallback
+    /// blocks — avoids fragile hash lookups that can silently default to 0
+    /// when the parent block has been pruned from memory.
+    certified_in_flight: u32,
+
     /// Latest QC (certifies the latest certified block).
     latest_qc: Option<QuorumCertificate>,
 
@@ -307,6 +314,7 @@ impl BftState {
                 .unwrap_or(Hash::from_bytes(&[0u8; 32])),
             committed_state_root: recovered.jvt_root.unwrap_or(Hash::ZERO),
             certified_state_root: recovered.jvt_root.unwrap_or(Hash::ZERO),
+            certified_in_flight: 0,
             latest_qc: recovered.latest_qc,
             genesis_block: None,
             pending_blocks: HashMap::new(),
@@ -711,6 +719,7 @@ impl BftState {
         self.committed_hash = hash;
         self.committed_state_root = genesis.header.state_root;
         self.certified_state_root = genesis.header.state_root;
+        self.certified_in_flight = genesis.header.in_flight;
 
         info!(
             validator = ?topology.local_validator_id(),
@@ -993,11 +1002,10 @@ impl BftState {
         let parent_state_root = self.certified_state_root;
         let parent_block_height = parent_qc.height.0;
 
-        // Parent's in-flight count for deterministic computation in build_proposal.
-        let parent_in_flight = self
-            .get_block_by_hash(parent_hash)
-            .map(|b| b.header.in_flight)
-            .unwrap_or(0);
+        // Parent's in-flight count — tracked like certified_state_root, updated
+        // when a QC forms. Avoids fragile hash lookups that silently default to 0
+        // when the parent block has been pruned from memory.
+        let parent_in_flight = self.certified_in_flight;
 
         // Track that we have a pending proposal (for correlation)
         self.pending_proposal = Some(PendingProposal {
@@ -1101,7 +1109,11 @@ impl BftState {
             local_receipt_root: Hash::ZERO,
             provision_root: Hash::ZERO,
             waves: vec![], // Empty - fallback blocks have no transactions
-            in_flight: 0,
+            // Fallback blocks add 0 txs and finalize 0 txs, so in_flight
+            // must equal the parent's value. Hardcoding 0 here caused a
+            // permanent livelock: verification computes parent_in_flight + 0 - 0
+            // which never equals 0 when there are in-flight transactions.
+            in_flight: self.certified_in_flight,
         };
 
         let block = Block {
@@ -1215,7 +1227,7 @@ impl BftState {
             local_receipt_root: Hash::ZERO,
             provision_root: Hash::ZERO,
             waves: vec![], // Empty - sync blocks have no transactions
-            in_flight: 0,
+            in_flight: self.certified_in_flight, // Inherit parent's in-flight (no new txs, no finalized txs)
         };
 
         let block = Block {
@@ -1468,6 +1480,21 @@ impl BftState {
                 self.latest_qc = Some(header.parent_qc.clone());
                 self.maybe_unlock_for_qc(topology, &header.parent_qc);
 
+                // Update certified block tracking — mirrors on_qc_formed logic.
+                // When we learn about a QC via a block header (rather than building
+                // it locally from votes), we must still track the certified block's
+                // state_root and in_flight count. Without this, validators that
+                // receive QCs via headers (e.g., non-proposers) would have stale
+                // certified_in_flight, causing in-flight count divergence.
+                let qc_block_hash = header.parent_qc.block_hash;
+                if let Some(block) = self.get_block_by_hash(qc_block_hash) {
+                    self.certified_state_root = block.header.state_root;
+                    self.certified_in_flight = block.header.in_flight;
+                } else if let Some(pending) = self.pending_blocks.get(&qc_block_hash) {
+                    self.certified_state_root = pending.header().state_root;
+                    self.certified_in_flight = pending.header().in_flight;
+                }
+
                 // Two-chain commit: the parent_qc may allow committing an
                 // ancestor block. This is essential when votes are targeted
                 // to the next proposer only — non-proposers learn about QCs
@@ -1534,6 +1561,19 @@ impl BftState {
         // Store pending block with creation timestamp for stale detection
         self.pending_blocks.insert(block_hash, pending);
         self.fetch.track(block_hash, self.now);
+
+        // Late header reconciliation: if we already formed a QC for this block
+        // (from votes arriving before the header), certified_in_flight wasn't
+        // updated at QC formation time because the block wasn't in pending_blocks
+        // yet. Now that we have the header, update the certified tracking fields.
+        if self
+            .latest_qc
+            .as_ref()
+            .is_some_and(|qc| qc.block_hash == block_hash)
+        {
+            self.certified_state_root = header.state_root;
+            self.certified_in_flight = header.in_flight;
+        }
 
         // Check if we have buffered votes for this block that can now trigger verification
         // (Votes may arrive before the header due to network timing)
@@ -1921,11 +1961,10 @@ impl BftState {
 
                 // Synchronous in-flight count verification — deterministic from chain state.
                 // expected = parent.in_flight + new_txs - finalized_txs
+                // Use certified_in_flight (tracked like certified_state_root) instead
+                // of a hash lookup that can silently default to 0 when pruned.
                 {
-                    let parent_in_flight = self
-                        .get_block_by_hash(block.header.parent_hash)
-                        .map(|b| b.header.in_flight)
-                        .unwrap_or(0);
+                    let parent_in_flight = self.certified_in_flight;
                     let finalized_tx_count: u32 = pending
                         .finalized_waves()
                         .iter()
@@ -2887,15 +2926,17 @@ impl BftState {
         if should_update {
             self.latest_qc = Some(qc.clone());
 
-            // Track the certified block's state_root — this is the correct
-            // parent_state_root for the next proposal.
+            // Track the certified block's state_root and in_flight count —
+            // these are the correct parent values for the next proposal.
             // Use the header directly from pending_blocks if the full block
-            // isn't constructed yet — the header (with state_root) is always
-            // available from the gossip message.
+            // isn't constructed yet — the header (with state_root, in_flight)
+            // is always available from the gossip message.
             if let Some(block) = self.get_block_by_hash(block_hash) {
                 self.certified_state_root = block.header.state_root;
+                self.certified_in_flight = block.header.in_flight;
             } else if let Some(pending) = self.pending_blocks.get(&block_hash) {
                 self.certified_state_root = pending.header().state_root;
+                self.certified_in_flight = pending.header().in_flight;
             }
 
             // HotStuff-2 unlock: when a QC forms, we can safely unlock
