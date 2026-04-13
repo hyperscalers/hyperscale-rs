@@ -984,8 +984,13 @@ impl BftState {
         let waves_to_propose: Vec<_> = candidate_waves
             .into_iter()
             .take_while(|fw| {
-                finalized_tx_count = finalized_tx_count.saturating_add(fw.tx_hashes.len());
-                finalized_tx_count <= max_finalized_txs
+                let new_total = finalized_tx_count.saturating_add(fw.tx_hashes.len());
+                if new_total <= max_finalized_txs {
+                    finalized_tx_count = new_total;
+                    true
+                } else {
+                    false
+                }
             })
             .collect();
 
