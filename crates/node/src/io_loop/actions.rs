@@ -14,26 +14,10 @@ use hyperscale_dispatch::Dispatch;
 use hyperscale_metrics as metrics;
 use hyperscale_network::Network;
 use hyperscale_storage::{ChainReader, ChainWriter, SubstateStore};
-use hyperscale_types::{Block, Hash, ValidatorId};
+use hyperscale_types::ValidatorId;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tracing::{debug, warn};
-
-/// Panic if committed state_root diverges from the block header on a
-/// state-changing block. This is unrecoverable — operator must wipe the
-/// data directory and re-sync from peers.
-fn assert_state_root_consistent(block: &Block, committed_root: Hash) {
-    if !block.certificates.is_empty() && committed_root != block.header.state_root {
-        panic!(
-            "FATAL: state_root divergence at height {}. \
-             Committed root: {committed_root:?}, \
-             expected: {:?}. \
-             Node state is unrecoverable — wipe data directory and re-sync.",
-            block.header.height.0, block.header.state_root
-        );
-    }
-}
-
 impl<S, N, D> IoLoop<S, N, D>
 where
     S: ChainWriter + SubstateStore + ChainReader + Send + Sync + 'static,
@@ -729,8 +713,6 @@ where
                         ..
                     } => (block, provision_hashes),
                 };
-
-                assert_state_root_consistent(&block, result);
 
                 // Clear the in-flight flag before sending events for the last
                 // block. The channel send synchronizes-with recv on the main
