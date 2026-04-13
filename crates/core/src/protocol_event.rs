@@ -251,6 +251,9 @@ pub enum ProtocolEvent {
         transactions: Vec<Arc<RoutableTransaction>>,
     },
 
+    /// Fetched finalized wave delivered to state machine for pending block completion.
+    FinalizedWaveFetchDelivered { wave: Arc<FinalizedWave> },
+
     // ═══════════════════════════════════════════════════════════════════════
     // Storage Callbacks
     // ═══════════════════════════════════════════════════════════════════════
@@ -399,6 +402,7 @@ impl ProtocolEvent {
 
             // Fetch Delivery
             ProtocolEvent::TransactionFetchDelivered { .. } => "TransactionFetchDelivered",
+            ProtocolEvent::FinalizedWaveFetchDelivered { .. } => "FinalizedWaveFetchDelivered",
             // Storage Callbacks
             ProtocolEvent::ChainMetadataFetched { .. } => "ChainMetadataFetched",
 

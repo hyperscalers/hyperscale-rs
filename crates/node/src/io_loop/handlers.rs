@@ -164,6 +164,24 @@ where
                 },
             );
 
+        // ── finalized_wave.request → finalized wave cache lookup ─────
+
+        let fw_cache = Arc::clone(&self.finalized_wave_cache);
+        self.network
+            .register_request_handler::<hyperscale_messages::request::GetFinalizedWavesRequest>(
+                move |req: hyperscale_messages::request::GetFinalizedWavesRequest| {
+                    use hyperscale_messages::response::GetFinalizedWavesResponse;
+
+                    let waves: Vec<hyperscale_types::FinalizedWave> = req
+                        .wave_id_hashes
+                        .iter()
+                        .filter_map(|h| fw_cache.get(h).map(|fw| (*fw).clone()))
+                        .collect();
+
+                    GetFinalizedWavesResponse::new(waves)
+                },
+            );
+
         // ── execution_cert.request → cert cache lookup ────────────────
 
         let cert_cache = Arc::clone(&self.exec_cert_cache);

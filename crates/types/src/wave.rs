@@ -616,6 +616,83 @@ impl FinalizedWave {
     }
 }
 
+// Manual SBOR implementation for FinalizedWave (Arc fields prevent BasicSbor derive).
+// Encodes Arc<T> as T, decodes T and wraps in Arc.
+
+impl<E: sbor::Encoder<sbor::NoCustomValueKind>> sbor::Encode<sbor::NoCustomValueKind, E>
+    for FinalizedWave
+{
+    fn encode_value_kind(&self, encoder: &mut E) -> Result<(), sbor::EncodeError> {
+        encoder.write_value_kind(sbor::ValueKind::Tuple)
+    }
+
+    fn encode_body(&self, encoder: &mut E) -> Result<(), sbor::EncodeError> {
+        encoder.write_size(6)?;
+        encoder.encode(self.certificate.as_ref())?;
+        encoder.encode(&self.tx_hashes)?;
+        // Encode Vec<Arc<ExecutionCertificate>> as Vec<ExecutionCertificate>
+        encoder.encode(&self.execution_certificates.len())?;
+        for ec in &self.execution_certificates {
+            encoder.encode(ec.as_ref())?;
+        }
+        encoder.encode(&self.tx_decisions)?;
+        encoder.encode(&self.receipts)?;
+        encoder.encode(&self.finalized_height)?;
+        Ok(())
+    }
+}
+
+impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValueKind, D>
+    for FinalizedWave
+{
+    fn decode_body_with_value_kind(
+        decoder: &mut D,
+        value_kind: sbor::ValueKind<sbor::NoCustomValueKind>,
+    ) -> Result<Self, sbor::DecodeError> {
+        decoder.check_preloaded_value_kind(value_kind, sbor::ValueKind::Tuple)?;
+        let length = decoder.read_size()?;
+        if length != 6 {
+            return Err(sbor::DecodeError::UnexpectedSize {
+                expected: 6,
+                actual: length,
+            });
+        }
+        let certificate: WaveCertificate = decoder.decode()?;
+        let tx_hashes: Vec<Hash> = decoder.decode()?;
+        let ec_count: usize = decoder.decode()?;
+        let mut execution_certificates = Vec::with_capacity(ec_count);
+        for _ in 0..ec_count {
+            let ec: ExecutionCertificate = decoder.decode()?;
+            execution_certificates.push(Arc::new(ec));
+        }
+        let tx_decisions: Vec<(Hash, TransactionDecision)> = decoder.decode()?;
+        let receipts: Vec<ReceiptBundle> = decoder.decode()?;
+        let finalized_height: u64 = decoder.decode()?;
+        Ok(Self {
+            certificate: Arc::new(certificate),
+            tx_hashes,
+            execution_certificates,
+            tx_decisions,
+            receipts,
+            finalized_height,
+        })
+    }
+}
+
+impl sbor::Categorize<sbor::NoCustomValueKind> for FinalizedWave {
+    fn value_kind() -> sbor::ValueKind<sbor::NoCustomValueKind> {
+        sbor::ValueKind::Tuple
+    }
+}
+
+impl sbor::Describe<sbor::NoCustomTypeKind> for FinalizedWave {
+    const TYPE_ID: sbor::RustTypeId = sbor::RustTypeId::novel_with_code("FinalizedWave", &[], &[]);
+
+    fn type_data() -> sbor::TypeData<sbor::NoCustomTypeKind, sbor::RustTypeId> {
+        sbor::TypeData::unnamed(sbor::TypeKind::Any)
+    }
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
