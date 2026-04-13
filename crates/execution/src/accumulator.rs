@@ -163,12 +163,16 @@ impl ExecutionAccumulator {
             return false;
         }
 
-        self.aborts.insert(
-            tx_hash,
-            AbortEntry {
+        self.aborts
+            .entry(tx_hash)
+            .and_modify(|e| {
+                // Keep the earliest abort — deterministic regardless of
+                // conflict discovery order (HashMap/HashSet iteration).
+                e.committed_at_height = e.committed_at_height.min(committed_at_height);
+            })
+            .or_insert(AbortEntry {
                 committed_at_height,
-            },
-        );
+            });
 
         self.invalidate_cached_target();
         self.is_complete()
@@ -690,5 +694,26 @@ mod tests {
         // target = 0, so need committed_height >= WAVE_START + 0 = 10
         assert!(!acc.can_emit_vote(WAVE_START - 1));
         assert!(acc.can_emit_vote(WAVE_START));
+    }
+
+    #[test]
+    fn test_multiple_aborts_keep_earliest() {
+        let mut acc = make_accumulator(1);
+        let tx0 = Hash::from_bytes(&[0u8; 4]);
+
+        // Two conflicts for the same tx at different heights.
+        // Must keep the earliest regardless of call order.
+        acc.record_abort(tx0, 20); // committed_at_height = 20
+        acc.record_abort(tx0, 15); // committed_at_height = 15 (earlier)
+
+        // target = min(20, 15) - WAVE_START = 15 - 10 = 5
+        assert_eq!(acc.target_vote_height(), 5);
+
+        // Reverse order should produce the same result.
+        let mut acc2 = make_accumulator(1);
+        let tx0 = Hash::from_bytes(&[0u8; 4]);
+        acc2.record_abort(tx0, 15);
+        acc2.record_abort(tx0, 20);
+        assert_eq!(acc2.target_vote_height(), 5);
     }
 }
