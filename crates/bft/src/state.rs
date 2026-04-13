@@ -2676,6 +2676,29 @@ impl BftState {
             return;
         }
 
+        // Reconcile certified/committed state roots with the JVT's actual root.
+        //
+        // Divergence occurs when a block with certificates gets a QC (setting
+        // certified_state_root to the speculative state_root) but is then
+        // view-changed away before committing. Subsequent cert-free blocks
+        // inherit the stale certified_state_root into their headers. The JVT
+        // never applied those cert changes, so its actual root differs.
+        //
+        // The JVT is the source of truth — it reports the root it actually
+        // computed for this height. Overwrite both tracking roots to match.
+        if state_root != self.certified_state_root {
+            debug!(
+                block_height,
+                jvt_root = ?state_root,
+                certified = ?self.certified_state_root,
+                "Reconciling certified_state_root with JVT actual root"
+            );
+            self.certified_state_root = state_root;
+        }
+        if state_root != self.committed_state_root {
+            self.committed_state_root = state_root;
+        }
+
         debug!(
             old_height = self.committed_height,
             new_height = block_height,
