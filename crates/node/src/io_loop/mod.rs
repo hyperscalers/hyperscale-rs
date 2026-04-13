@@ -39,7 +39,7 @@ use crate::NodeStateMachine;
 use arc_swap::ArcSwap;
 use hyperscale_core::{Action, NodeInput, ProtocolEvent, StateMachine, TimerId};
 use hyperscale_dispatch::Dispatch;
-use hyperscale_engine::{RadixExecutor, TransactionValidation};
+use hyperscale_engine::{Engine, RadixExecutor, TransactionValidation};
 use hyperscale_messages::TransactionGossip;
 use hyperscale_metrics as metrics;
 use hyperscale_network::Network;
@@ -184,7 +184,8 @@ pub struct NodeStatusSnapshot {
 /// - `S`: Storage (ChainWriter + SubstateStore + ChainReader)
 /// - `N`: Network (message sending)
 /// - `D`: Dispatch (thread pool work scheduling)
-pub struct IoLoop<S, N, D>
+/// - `E`: Engine (transaction execution — defaults to `RadixExecutor`)
+pub struct IoLoop<S, N, D, E: Engine = RadixExecutor>
 where
     S: ChainWriter + SubstateStore + ChainReader,
     D: Dispatch,
@@ -192,7 +193,7 @@ where
     // Core components
     state: NodeStateMachine,
     storage: Arc<S>,
-    executor: RadixExecutor,
+    executor: E,
     network: N,
     dispatch: D,
     event_sender: crossbeam::channel::Sender<NodeInput>,
@@ -293,18 +294,19 @@ where
     pending_timer_ops: Vec<TimerOp>,
 }
 
-impl<S, N, D> IoLoop<S, N, D>
+impl<S, N, D, E> IoLoop<S, N, D, E>
 where
     S: ChainWriter + SubstateStore + ChainReader + Send + Sync + 'static,
     N: Network,
     D: Dispatch + 'static,
+    E: Engine + 'static,
 {
     /// Create a new IoLoop.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         state: NodeStateMachine,
         storage: S,
-        executor: RadixExecutor,
+        executor: E,
         network: N,
         dispatch: D,
         event_sender: crossbeam::channel::Sender<NodeInput>,
@@ -436,10 +438,7 @@ where
     ///
     /// Panics if the storage `Arc` has been cloned (e.g., by handler registration
     /// or dispatch closures), since `Arc::get_mut` requires sole ownership.
-    pub fn with_storage_and_executor<R>(
-        &mut self,
-        f: impl FnOnce(&mut S, &RadixExecutor) -> R,
-    ) -> R {
+    pub fn with_storage_and_executor<R>(&mut self, f: impl FnOnce(&mut S, &E) -> R) -> R {
         let storage = Arc::get_mut(&mut self.storage).expect(
             "with_storage_and_executor must be called before any spawned closures clone the Arc",
         );

@@ -9,7 +9,7 @@
 //! handled inline by the I/O loop's flush closures.
 
 use hyperscale_core::{Action, NodeInput, ProtocolEvent};
-use hyperscale_engine::RadixExecutor;
+use hyperscale_engine::Engine;
 use hyperscale_metrics as metrics;
 use hyperscale_storage::{ChainReader, ChainWriter, SubstateStore};
 use hyperscale_types::{Hash, LocalExecutionEntry, Provision, ShardGroupId, TxEntries};
@@ -17,9 +17,9 @@ use std::sync::Arc;
 use tracing::warn;
 
 /// Context for executing delegated actions.
-pub(crate) struct ActionContext<'a, S: ChainWriter + SubstateStore + ChainReader> {
+pub(crate) struct ActionContext<'a, S: ChainWriter + SubstateStore + ChainReader, E: Engine> {
     pub storage: &'a S,
-    pub executor: &'a RadixExecutor,
+    pub executor: &'a E,
     pub topology: &'a hyperscale_types::TopologySnapshot,
 }
 
@@ -88,9 +88,9 @@ pub(crate) fn dispatch_pool_for(action: &Action) -> Option<DispatchPool> {
 /// The runner is responsible for additionally broadcasting votes to shard
 /// peers (network-specific).
 #[allow(clippy::too_many_lines)]
-pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainReader>(
+pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainReader, E: Engine>(
     action: Action,
-    ctx: &ActionContext<'_, S>,
+    ctx: &ActionContext<'_, S, E>,
 ) -> Option<DelegatedResult<S::PreparedCommit>> {
     match action {
         // --- BFT crypto verification ---
@@ -630,8 +630,8 @@ type FetchedTxEntries = (
     Arc<Vec<hyperscale_types::StateEntry>>,
 );
 
-fn fetch_entries_for_requests<S: ChainWriter + SubstateStore + ChainReader>(
-    ctx: &ActionContext<'_, S>,
+fn fetch_entries_for_requests<S: ChainWriter + SubstateStore + ChainReader, E: Engine>(
+    ctx: &ActionContext<'_, S, E>,
     requests: &[hyperscale_core::ProvisionRequest],
     source_shard: ShardGroupId,
     block_height: hyperscale_types::BlockHeight,
@@ -680,8 +680,8 @@ fn fetch_entries_for_requests<S: ChainWriter + SubstateStore + ChainReader>(
 }
 
 /// Group fetched entries by target shard and generate verkle proofs per shard.
-fn build_provision_batches<S: ChainWriter + SubstateStore + ChainReader>(
-    ctx: &ActionContext<'_, S>,
+fn build_provision_batches<S: ChainWriter + SubstateStore + ChainReader, E: Engine>(
+    ctx: &ActionContext<'_, S, E>,
     per_tx: Vec<FetchedTxEntries>,
     source_shard: ShardGroupId,
     block_height: hyperscale_types::BlockHeight,

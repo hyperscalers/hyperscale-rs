@@ -96,6 +96,57 @@ struct ExecutorCaches {
     validator: TransactionValidator,
 }
 
+/// Trait abstracting transaction execution.
+///
+/// Production uses [`RadixExecutor`] directly. Simulation uses
+/// [`SimulationEngine`](crate::SimulationEngine) which wraps `RadixExecutor`
+/// with per-transaction result caching so identical executions across
+/// validators in the same shard only run once.
+pub trait Engine: Clone + Send + Sync {
+    /// Execute single-shard transactions (READ-ONLY).
+    fn execute_single_shard<S: SubstateStore>(
+        &self,
+        storage: &S,
+        transactions: &[Arc<RoutableTransaction>],
+        local_shard: hyperscale_types::ShardGroupId,
+        num_shards: u64,
+    ) -> Result<ExecutionOutput, ExecutionError>;
+
+    /// Execute cross-shard transactions with provisions (READ-ONLY).
+    fn execute_cross_shard<S: SubstateStore>(
+        &self,
+        storage: &S,
+        transactions: &[Arc<RoutableTransaction>],
+        provisions: &[hyperscale_types::StateProvision],
+        local_shard: hyperscale_types::ShardGroupId,
+        num_shards: u64,
+    ) -> Result<ExecutionOutput, ExecutionError>;
+
+    /// Fetch state entries for the given nodes at a specific block height.
+    fn fetch_state_entries<S: SubstateStore>(
+        &self,
+        storage: &S,
+        nodes: &[hyperscale_types::NodeId],
+        block_height: u64,
+    ) -> Option<Vec<hyperscale_types::StateEntry>>;
+
+    /// Run genesis bootstrapping on the given storage.
+    fn run_genesis<S: SubstateDatabase + CommittableSubstateDatabase>(
+        &self,
+        storage: &mut S,
+    ) -> Result<(), GenesisError>;
+
+    /// Run genesis with custom configuration.
+    fn run_genesis_with_config<S: SubstateDatabase + CommittableSubstateDatabase>(
+        &self,
+        storage: &mut S,
+        config: GenesisConfig,
+    ) -> Result<(), GenesisError>;
+
+    /// Get reference to the network definition.
+    fn network(&self) -> &NetworkDefinition;
+}
+
 /// Synchronous Radix Engine executor for deterministic simulation.
 ///
 /// This executor does NOT own storage. Instead, storage is passed to each
@@ -383,5 +434,56 @@ impl Clone for RadixExecutor {
             network: self.network.clone(),
             caches: Arc::clone(&self.caches),
         }
+    }
+}
+
+impl Engine for RadixExecutor {
+    fn execute_single_shard<S: SubstateStore>(
+        &self,
+        storage: &S,
+        transactions: &[Arc<RoutableTransaction>],
+        local_shard: hyperscale_types::ShardGroupId,
+        num_shards: u64,
+    ) -> Result<ExecutionOutput, ExecutionError> {
+        self.execute_single_shard(storage, transactions, local_shard, num_shards)
+    }
+
+    fn execute_cross_shard<S: SubstateStore>(
+        &self,
+        storage: &S,
+        transactions: &[Arc<RoutableTransaction>],
+        provisions: &[hyperscale_types::StateProvision],
+        local_shard: hyperscale_types::ShardGroupId,
+        num_shards: u64,
+    ) -> Result<ExecutionOutput, ExecutionError> {
+        self.execute_cross_shard(storage, transactions, provisions, local_shard, num_shards)
+    }
+
+    fn fetch_state_entries<S: SubstateStore>(
+        &self,
+        storage: &S,
+        nodes: &[hyperscale_types::NodeId],
+        block_height: u64,
+    ) -> Option<Vec<hyperscale_types::StateEntry>> {
+        self.fetch_state_entries(storage, nodes, block_height)
+    }
+
+    fn run_genesis<S: SubstateDatabase + CommittableSubstateDatabase>(
+        &self,
+        storage: &mut S,
+    ) -> Result<(), GenesisError> {
+        RadixExecutor::run_genesis(self, storage)
+    }
+
+    fn run_genesis_with_config<S: SubstateDatabase + CommittableSubstateDatabase>(
+        &self,
+        storage: &mut S,
+        config: GenesisConfig,
+    ) -> Result<(), GenesisError> {
+        RadixExecutor::run_genesis_with_config(self, storage, config)
+    }
+
+    fn network(&self) -> &NetworkDefinition {
+        RadixExecutor::network(self)
     }
 }

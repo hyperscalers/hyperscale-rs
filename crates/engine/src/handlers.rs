@@ -6,18 +6,19 @@
 //!
 //! The `execution` crate's handlers delegate to these functions.
 
+use crate::executor::Engine;
 use crate::sharding;
-use crate::{RadixExecutor, SingleTxResult};
+use crate::SingleTxResult;
 use hyperscale_storage::SubstateStore;
 use hyperscale_types::{ExecutionOutcome, Hash, RoutableTransaction, ShardGroupId, TxOutcome};
 use std::sync::Arc;
 
 /// Execute a single-shard transaction with shard filtering.
 ///
-/// Executes via the Radix Engine, then filters the resulting `DatabaseUpdates`
+/// Executes via the engine, then filters the resulting `DatabaseUpdates`
 /// to remove system writes and keep only writes belonging to `local_shard`.
-pub fn execute_single_shard<S: SubstateStore>(
-    executor: &RadixExecutor,
+pub fn execute_single_shard<S: SubstateStore, E: Engine>(
+    executor: &E,
     storage: &S,
     tx: &Arc<RoutableTransaction>,
     local_shard: ShardGroupId,
@@ -41,10 +42,10 @@ pub fn execute_single_shard<S: SubstateStore>(
 
 /// Execute a cross-shard transaction with provisions.
 ///
-/// Executes via the Radix Engine with the provisioned snapshot overlay.
+/// Executes via the engine with the provisioned snapshot overlay.
 /// The receipt's `database_updates` are shard-filtered by the executor.
-pub fn execute_cross_shard<S: SubstateStore>(
-    executor: &RadixExecutor,
+pub fn execute_cross_shard<S: SubstateStore, E: Engine>(
+    executor: &E,
     storage: &S,
     tx_hash: Hash,
     transaction: &Arc<RoutableTransaction>,

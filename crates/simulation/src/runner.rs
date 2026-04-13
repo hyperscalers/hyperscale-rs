@@ -8,7 +8,7 @@ use crate::NodeIndex;
 use hyperscale_bft::{BftConfig, RecoveredState};
 use hyperscale_core::{NodeInput, ProtocolEvent, TimerId};
 use hyperscale_dispatch_sync::SyncDispatch;
-use hyperscale_engine::RadixExecutor;
+use hyperscale_engine::{Engine, RadixExecutor, SimExecutionCache, SimulationEngine};
 use hyperscale_mempool::MempoolConfig;
 use hyperscale_network_memory::{
     NetworkConfig, NetworkTrafficAnalyzer, SimNetworkAdapter, SimulatedNetwork,
@@ -32,7 +32,7 @@ use std::time::Duration;
 use tracing::{debug, info, trace, warn};
 
 /// Type alias for the simulation's concrete IoLoop.
-type SimIoLoop = IoLoop<SimStorage, SimNetworkAdapter, SyncDispatch>;
+type SimIoLoop = IoLoop<SimStorage, SimNetworkAdapter, SyncDispatch, SimulationEngine>;
 
 /// Type alias for the simulation's genesis wrapper.
 type SimGenesisWrapper<'a> = GenesisWrapper<'a, SimStorage>;
@@ -178,6 +178,11 @@ impl SimulationRunner {
             let shard = ShardGroupId(shard_id as u64);
             let shard_start = shard_id * network_config.validators_per_shard;
 
+            // Shared execution cache for all validators in this shard.
+            // Identical transactions against identical state produce identical
+            // results — only the first validator computes; others get the cache.
+            let shard_cache: SimExecutionCache = Default::default();
+
             for v in 0..network_config.validators_per_shard {
                 let node_index = shard_start + v;
                 let validator_id = ValidatorId(node_index as u64);
@@ -216,10 +221,13 @@ impl SimulationRunner {
                     network_def.clone(),
                 ));
 
+                let sim_engine =
+                    SimulationEngine::new(RadixExecutor::new(network_def), shard_cache.clone());
+
                 let io_loop = IoLoop::new(
                     state,
                     SimStorage::new(),
-                    RadixExecutor::new(network_def),
+                    sim_engine,
                     network.create_adapter(node_index),
                     SyncDispatch,
                     event_tx,

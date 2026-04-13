@@ -11,6 +11,7 @@ use crate::protocol::sync::SyncInput;
 use crate::protocol::transaction_fetch::TransactionFetchInput;
 use hyperscale_core::{Action, NodeInput, ProtocolEvent, StateMachine};
 use hyperscale_dispatch::Dispatch;
+use hyperscale_engine::Engine;
 use hyperscale_metrics as metrics;
 use hyperscale_network::Network;
 use hyperscale_storage::{ChainReader, ChainWriter, SubstateStore};
@@ -18,11 +19,12 @@ use hyperscale_types::ValidatorId;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tracing::{debug, warn};
-impl<S, N, D> IoLoop<S, N, D>
+impl<S, N, D, E> IoLoop<S, N, D, E>
 where
     S: ChainWriter + SubstateStore + ChainReader + Send + Sync + 'static,
     N: Network,
     D: Dispatch + 'static,
+    E: Engine + 'static,
 {
     // ─── Action Processing ──────────────────────────────────────────────
 

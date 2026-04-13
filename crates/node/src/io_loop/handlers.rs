@@ -4,6 +4,7 @@ use super::verify::{resolve_sender_key, verify_bls_with_metrics, verify_sender_s
 use super::IoLoop;
 use hyperscale_core::{NodeInput, ProtocolEvent};
 use hyperscale_dispatch::Dispatch;
+use hyperscale_engine::Engine;
 use hyperscale_messages::{
     BlockHeaderNotification, BlockVoteNotification, ExecutionCertificatesNotification,
     ExecutionVotesNotification, TransactionGossip,
@@ -12,11 +13,12 @@ use hyperscale_network::Network;
 use hyperscale_storage::{ChainReader, ChainWriter, SubstateStore};
 use tracing::warn;
 
-impl<S, N, D> IoLoop<S, N, D>
+impl<S, N, D, E> IoLoop<S, N, D, E>
 where
     S: ChainWriter + SubstateStore + ChainReader + Send + Sync + 'static,
     N: Network,
     D: Dispatch + 'static,
+    E: Engine + 'static,
 {
     /// Register per-type request handlers with the network.
     ///

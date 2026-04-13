@@ -4,16 +4,18 @@ use super::verify::verify_bls_with_metrics;
 use super::IoLoop;
 use hyperscale_core::{NodeInput, StateMachine};
 use hyperscale_dispatch::Dispatch;
+use hyperscale_engine::Engine;
 use hyperscale_network::Network;
 use hyperscale_storage::{ChainReader, ChainWriter, SubstateStore};
 use hyperscale_types::RoutableTransaction;
 use std::sync::Arc;
 
-impl<S, N, D> IoLoop<S, N, D>
+impl<S, N, D, E> IoLoop<S, N, D, E>
 where
     S: ChainWriter + SubstateStore + ChainReader + Send + Sync + 'static,
     N: Network,
     D: Dispatch + 'static,
+    E: Engine + 'static,
 {
     // ─── Transaction Validation Batching ──────────────────────────────
 

@@ -9,6 +9,7 @@ use crate::protocol::sync::SyncOutput;
 use crate::protocol::transaction_fetch::TransactionFetchOutput;
 use hyperscale_core::{NodeInput, ProtocolEvent, TimerId};
 use hyperscale_dispatch::Dispatch;
+use hyperscale_engine::Engine;
 use hyperscale_metrics as metrics;
 use hyperscale_network::Network;
 use hyperscale_storage::{ChainReader, ChainWriter, SubstateStore};
@@ -16,11 +17,12 @@ use hyperscale_types::{BlockHeight, ValidatorId};
 use std::sync::Arc;
 use std::time::Duration;
 
-impl<S, N, D> IoLoop<S, N, D>
+impl<S, N, D, E> IoLoop<S, N, D, E>
 where
     S: ChainWriter + SubstateStore + ChainReader + Send + Sync + 'static,
     N: Network,
     D: Dispatch + 'static,
+    E: Engine + 'static,
 {
     /// Interval for the periodic fetch tick timer.
     const FETCH_TICK_INTERVAL: Duration = Duration::from_millis(200);

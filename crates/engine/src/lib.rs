@@ -32,6 +32,7 @@ mod execution;
 mod executor;
 mod genesis;
 mod result;
+mod simulation_engine;
 mod validation;
 
 /// Transaction execution handlers with integrated shard filtering.
@@ -40,10 +41,11 @@ pub mod handlers;
 pub mod sharding;
 
 pub use execution::ProvisionedSnapshot;
-pub use executor::{fetch_state_entries, RadixExecutor};
+pub use executor::{fetch_state_entries, Engine, RadixExecutor};
 pub use genesis::GenesisConfig;
 pub use hyperscale_types::LocalExecutionEntry;
 pub use result::SingleTxResult;
+pub use simulation_engine::{SimExecutionCache, SimulationEngine};
 pub use validation::TransactionValidation;
 
 // Re-export Radix types needed by engine callers (not storage-related)
