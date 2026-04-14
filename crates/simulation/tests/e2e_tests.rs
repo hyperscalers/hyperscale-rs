@@ -925,3 +925,116 @@ fn test_e2e_transaction_throughput() {
 
     println!("\n✅ Throughput Test PASSED!");
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Wave Leader Failure Recovery
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Test that transactions complete when one validator is isolated.
+///
+/// With 4 validators and quorum=3, isolating one validator still allows BFT
+/// progress. If the isolated node is the wave leader for a wave, the vote
+/// retry rotation mechanism should recover: non-leaders timeout, re-send
+/// to a rotated leader, and the EC is formed by the fallback leader.
+///
+/// We isolate each node in turn (4 runs) to ensure at least one run hits
+/// the case where the isolated node is the wave leader.
+#[traced_test]
+#[test]
+fn test_wave_leader_failure_recovers_via_rotation() {
+    for isolated_node in 0..4u32 {
+        println!(
+            "\n=== Wave Leader Failure Test: isolating node {} ===\n",
+            isolated_node
+        );
+
+        let config = single_shard_config();
+        let mut runner = SimulationRunner::new(config, 42 + isolated_node as u64);
+        runner.initialize_genesis();
+
+        // Let consensus establish first.
+        runner.run_until(Duration::from_secs(1));
+
+        // Isolate one node — it can neither send nor receive.
+        runner.network_mut().isolate_node(isolated_node);
+        println!("Node {} isolated", isolated_node);
+
+        // Submit a transaction to a non-isolated node.
+        let submit_node = if isolated_node == 0 { 1 } else { 0 };
+        let signer = test_keypair_from_seed(50 + isolated_node as u8);
+        let to_account = test_account(100 + isolated_node as u8);
+
+        let manifest = ManifestBuilder::new()
+            .lock_fee_from_faucet()
+            .get_free_xrd_from_faucet()
+            .try_deposit_entire_worktop_or_abort(to_account, None)
+            .build();
+        let notarized = sign_and_notarize(
+            manifest,
+            &simulator_network(),
+            300 + isolated_node as u32,
+            &signer,
+        )
+        .expect("should sign");
+        let transaction: RoutableTransaction = notarized.try_into().expect("valid transaction");
+        let tx_hash = transaction.hash();
+
+        runner.schedule_initial_event(
+            submit_node,
+            Duration::ZERO,
+            NodeInput::SubmitTransaction {
+                tx: Arc::new(transaction),
+            },
+        );
+
+        // Run long enough for:
+        // - Transaction to be committed in a block
+        // - Vote retry timeout (VOTE_RETRY_BLOCKS = 5 blocks)
+        // - Fallback leader to aggregate and broadcast EC
+        // - Wave certificate to be finalized
+        // With 3/4 nodes active, blocks commit ~every 200ms.
+        // 5 block retry = ~1s, plus aggregation + wave cert = ~2-3s more.
+        // 30 seconds (300 iterations) gives ample margin.
+        let mut reached_terminal = false;
+        for _ in 0..300 {
+            runner.run_until(runner.now() + Duration::from_millis(100));
+            let status = runner.node(submit_node).unwrap().mempool().status(&tx_hash);
+            match &status {
+                Some(s) if s.is_final() => {
+                    println!("Transaction reached terminal state: {:?}", s);
+                    reached_terminal = true;
+                    break;
+                }
+                None => {
+                    // Evicted = terminal (completed and cleaned up).
+                    println!("Transaction evicted (terminal)");
+                    reached_terminal = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        let max_height: u64 = (0..4)
+            .map(|i| runner.node(i).unwrap().bft().committed_height())
+            .max()
+            .unwrap();
+        println!(
+            "Max committed height: {}, isolated node {} height: {}",
+            max_height,
+            isolated_node,
+            runner.node(isolated_node).unwrap().bft().committed_height()
+        );
+
+        assert!(
+            reached_terminal,
+            "Transaction should reach terminal state even with node {} isolated (max_height={})",
+            isolated_node, max_height
+        );
+
+        println!(
+            "✅ Node {} isolated — transaction completed via fallback\n",
+            isolated_node
+        );
+    }
+}
