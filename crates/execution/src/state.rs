@@ -1926,18 +1926,29 @@ impl ExecutionState {
         self.pending_vote_retries
             .retain(|key, _| active_keys.contains(key));
 
-        // Prune early execution votes that have been consumed (accumulator exists
-        // and would have replayed them) or that are stale (50+ blocks old).
-        // We must NOT prune votes for blocks that haven't committed yet — those
-        // votes arrived before the accumulator was created and will be replayed
-        // when setup_execution_tracking runs during on_block_committed.
+        // Prune early execution votes:
+        // - Wave resolved (EC formed) → votes no longer needed
+        // - Leader replayed them (VoteTracker exists) → already consumed
+        // - No accumulator and stale (50+ blocks) → block never committed, BFT broken
+        //
+        // Non-leaders with an accumulator but no VoteTracker KEEP early votes.
+        // They may become fallback leaders via rotation and need to replay them
+        // into the on-demand VoteTracker created in on_execution_vote().
         let ev_cutoff = self.committed_height.saturating_sub(50);
         let before_ev = self.early_votes.len();
         self.early_votes.retain(|key, votes| {
-            // If the accumulator already exists, the votes were replayed during
-            // setup_execution_tracking — safe to prune any leftovers.
-            if self.accumulators.contains_key(key) {
+            // Wave has an EC — votes are no longer useful.
+            if self.waves_with_ec.contains(key) {
                 return false;
+            }
+            // Leader replayed these into its VoteTracker — consumed.
+            if self.vote_trackers.contains_key(key) {
+                return false;
+            }
+            // Accumulator exists but no tracker (non-leader) — keep for
+            // potential fallback replay.
+            if self.accumulators.contains_key(key) {
+                return true;
             }
             // No accumulator yet — keep unless stale.
             votes
