@@ -229,6 +229,11 @@ const EXEC_CERT_RETRY_INTERVAL_BLOCKS: u64 = 20;
 const VOTE_RETRY_BLOCKS: u64 = 5;
 
 /// Tracks a pending vote sent to a wave leader, for retry on timeout.
+///
+/// Retries are unbounded — the loop self-terminates when a working leader
+/// aggregates the EC and broadcasts it back. Capping retries would stall
+/// waves that haven't resolved yet (including timeout-abort waves, which
+/// still need a leader to aggregate the timeout votes).
 #[derive(Debug, Clone)]
 struct PendingVoteRetry {
     sent_at_height: u64,
@@ -237,7 +242,7 @@ struct PendingVoteRetry {
     block_height: u64,
     vote_height: u64,
     global_receipt_root: Hash,
-    tx_outcomes: Vec<TxOutcome>,
+    tx_outcomes: Arc<Vec<TxOutcome>>,
 }
 
 /// Per-shard recipient lists for provision broadcasting.
@@ -431,9 +436,6 @@ impl ExecutionState {
                     );
                     votes_to_replay.extend(early_votes);
                 }
-            } else {
-                // Non-leader: discard any early votes.
-                self.early_votes.remove(&wave_id);
             }
         }
 
@@ -654,6 +656,7 @@ impl ExecutionState {
             let leader = hyperscale_types::wave_leader(&completion.wave_id, &committee);
             // Track retry state for non-leaders so we can re-send to a
             // rotated leader if this one doesn't produce an EC.
+            let tx_outcomes = Arc::new(completion.tx_outcomes);
             if local_vid != leader {
                 self.pending_vote_retries.insert(
                     completion.wave_id.clone(),
@@ -664,7 +667,7 @@ impl ExecutionState {
                         block_height: completion.block_height,
                         vote_height: completion.vote_height,
                         global_receipt_root: completion.global_receipt_root,
-                        tx_outcomes: completion.tx_outcomes.clone(),
+                        tx_outcomes: Arc::clone(&tx_outcomes),
                     },
                 );
             }
@@ -674,7 +677,7 @@ impl ExecutionState {
                 vote_height: completion.vote_height,
                 wave_id: completion.wave_id,
                 global_receipt_root: completion.global_receipt_root,
-                tx_outcomes: completion.tx_outcomes,
+                tx_outcomes: (*tx_outcomes).clone(),
                 leader,
             });
         }
@@ -874,6 +877,24 @@ impl ExecutionState {
             );
             let tracker = VoteTracker::new(wave_id.clone(), block_hash, quorum);
             self.vote_trackers.insert(wave_id.clone(), tracker);
+
+            // Replay any early votes that were buffered before block commit.
+            // These may include retried votes from other validators who
+            // committed faster and rotated to us before our block committed.
+            if let Some(early) = self.early_votes.remove(&wave_id) {
+                tracing::debug!(
+                    wave = %wave_id,
+                    count = early.len(),
+                    "Replaying early votes into fallback VoteTracker"
+                );
+                let mut actions = Vec::new();
+                for ev in early {
+                    actions.extend(self.on_execution_vote(topology, ev));
+                }
+                // Process the current vote that triggered fallback creation.
+                actions.extend(self.on_execution_vote(topology, vote));
+                return actions;
+            }
         }
 
         // Skip verification for our own vote
@@ -1377,7 +1398,7 @@ impl ExecutionState {
                 vote_height: pending.vote_height,
                 wave_id: wave_id.clone(),
                 global_receipt_root: pending.global_receipt_root,
-                tx_outcomes: pending.tx_outcomes.clone(),
+                tx_outcomes: (*pending.tx_outcomes).clone(),
                 leader: new_leader,
             });
 
@@ -2443,7 +2464,7 @@ mod tests {
                 block_height: 1,
                 vote_height: 0,
                 global_receipt_root: Hash::ZERO,
-                tx_outcomes: vec![],
+                tx_outcomes: Arc::new(vec![]),
             },
         );
 
@@ -2489,7 +2510,7 @@ mod tests {
                 block_height: 1,
                 vote_height: 0,
                 global_receipt_root: Hash::ZERO,
-                tx_outcomes: vec![],
+                tx_outcomes: Arc::new(vec![]),
             },
         );
 
