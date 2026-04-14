@@ -2287,4 +2287,274 @@ mod tests {
             "Second signature should fail verification"
         );
     }
+
+    // ========================================================================
+    // Wave Leader Tests
+    // ========================================================================
+
+    /// Build a topology where the given validator_id is the local validator.
+    fn make_topology_for(local_vid: u64) -> TopologySnapshot {
+        let keys: Vec<Bls12381G1PrivateKey> = (0..4).map(|_| generate_bls_keypair()).collect();
+        let validators: Vec<ValidatorInfo> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| ValidatorInfo {
+                validator_id: ValidatorId(i as u64),
+                public_key: k.public_key(),
+                voting_power: 1,
+            })
+            .collect();
+        let validator_set = ValidatorSet::new(validators);
+        TopologySnapshot::new(ValidatorId(local_vid), 1, validator_set)
+    }
+
+    #[test]
+    fn test_only_leader_gets_vote_tracker() {
+        let tx = test_transaction(1);
+        let block_hash = Hash::from_bytes(b"block1");
+
+        // Determine who the wave leader will be for this block's wave.
+        let topo0 = make_topology_for(0);
+        let committee = topo0.local_committee().to_vec();
+
+        // Commit the block as validator 0 to discover the wave_id.
+        let mut state0 = make_test_state();
+        state0.on_block_committed(
+            &topo0,
+            block_hash,
+            1,
+            1000,
+            ValidatorId(0),
+            vec![Arc::new(tx.clone())],
+        );
+        let wave_id = state0.wave_assignments.values().next().unwrap().clone();
+
+        let leader = hyperscale_types::wave_leader(&wave_id, &committee);
+
+        // Leader should have a VoteTracker.
+        let topo_leader = make_topology_for(leader.0);
+        let mut state_leader = make_test_state();
+        state_leader.on_block_committed(
+            &topo_leader,
+            block_hash,
+            1,
+            1000,
+            ValidatorId(0),
+            vec![Arc::new(tx.clone())],
+        );
+        assert!(
+            state_leader.vote_trackers.contains_key(&wave_id),
+            "Leader should have VoteTracker"
+        );
+
+        // A non-leader should NOT have a VoteTracker.
+        let non_leader_id = committee.iter().find(|&&v| v != leader).unwrap();
+        let topo_non = make_topology_for(non_leader_id.0);
+        let mut state_non = make_test_state();
+        state_non.on_block_committed(
+            &topo_non,
+            block_hash,
+            1,
+            1000,
+            ValidatorId(0),
+            vec![Arc::new(tx.clone())],
+        );
+        assert!(
+            !state_non.vote_trackers.contains_key(&wave_id),
+            "Non-leader should NOT have VoteTracker"
+        );
+    }
+
+    #[test]
+    fn test_fallback_tracker_created_on_vote() {
+        let tx = test_transaction(1);
+        let block_hash = Hash::from_bytes(b"block1");
+        let topo = make_topology_for(0);
+        let committee = topo.local_committee().to_vec();
+
+        let mut state = make_test_state();
+        state.on_block_committed(
+            &topo,
+            block_hash,
+            1,
+            1000,
+            ValidatorId(0),
+            vec![Arc::new(tx.clone())],
+        );
+
+        let wave_id = state.wave_assignments.values().next().unwrap().clone();
+        let leader = hyperscale_types::wave_leader(&wave_id, &committee);
+
+        // If we're the leader, this test doesn't apply — find a non-leader topology.
+        let non_leader_id = committee.iter().find(|&&v| v != leader).unwrap();
+        let topo_non = make_topology_for(non_leader_id.0);
+        let mut state_non = make_test_state();
+        state_non.on_block_committed(
+            &topo_non,
+            block_hash,
+            1,
+            1000,
+            ValidatorId(0),
+            vec![Arc::new(tx.clone())],
+        );
+
+        assert!(!state_non.vote_trackers.contains_key(&wave_id));
+        assert!(state_non.accumulators.contains_key(&wave_id));
+
+        // Simulate receiving a vote (as if we're a fallback leader).
+        let fake_vote = ExecutionVote {
+            block_hash,
+            block_height: 1,
+            vote_height: 0,
+            wave_id: wave_id.clone(),
+            shard_group_id: ShardGroupId(0),
+            global_receipt_root: Hash::ZERO,
+            tx_count: 1,
+            tx_outcomes: vec![],
+            validator: leader, // vote from the original leader
+            signature: hyperscale_types::zero_bls_signature(),
+        };
+
+        state_non.on_execution_vote(&topo_non, fake_vote);
+
+        // Should have created a fallback VoteTracker.
+        assert!(
+            state_non.vote_trackers.contains_key(&wave_id),
+            "Fallback VoteTracker should be created"
+        );
+    }
+
+    #[test]
+    fn test_vote_retry_timeout_emits_rotated_action() {
+        let wave_id = WaveId::new(ShardGroupId(0), 1, BTreeSet::new());
+        let topo = make_test_topology();
+        let committee = topo.local_committee().to_vec();
+
+        let mut state = make_test_state();
+        state.committed_height = 10;
+
+        // Manually insert a pending retry as if we'd sent a vote at height 5.
+        state.pending_vote_retries.insert(
+            wave_id.clone(),
+            PendingVoteRetry {
+                sent_at_height: 5,
+                attempt: 0,
+                block_hash: Hash::from_bytes(b"block1"),
+                block_height: 1,
+                vote_height: 0,
+                global_receipt_root: Hash::ZERO,
+                tx_outcomes: vec![],
+            },
+        );
+
+        let actions = state.check_vote_retry_timeouts(&topo);
+
+        // Height 10 - 5 = 5 >= VOTE_RETRY_BLOCKS (5), so should emit retry.
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            Action::SignAndSendExecutionVote {
+                leader,
+                wave_id: wid,
+                ..
+            } => {
+                assert_eq!(wid, &wave_id);
+                let expected_leader = hyperscale_types::wave_leader_at(&wave_id, 1, &committee);
+                assert_eq!(*leader, expected_leader, "Should rotate to attempt 1");
+            }
+            other => panic!(
+                "Expected SignAndSendExecutionVote, got {:?}",
+                other.type_name()
+            ),
+        }
+
+        // Pending retry should be updated to attempt 1.
+        let retry = state.pending_vote_retries.get(&wave_id).unwrap();
+        assert_eq!(retry.attempt, 1);
+        assert_eq!(retry.sent_at_height, 10);
+    }
+
+    #[test]
+    fn test_vote_retry_cancelled_on_ec_receipt() {
+        let wave_id = WaveId::new(ShardGroupId(0), 1, BTreeSet::new());
+        let topo = make_test_topology();
+
+        let mut state = make_test_state();
+        state.committed_height = 10;
+        state.pending_vote_retries.insert(
+            wave_id.clone(),
+            PendingVoteRetry {
+                sent_at_height: 5,
+                attempt: 0,
+                block_hash: Hash::from_bytes(b"block1"),
+                block_height: 1,
+                vote_height: 0,
+                global_receipt_root: Hash::ZERO,
+                tx_outcomes: vec![],
+            },
+        );
+
+        assert!(state.pending_vote_retries.contains_key(&wave_id));
+
+        // Simulate receiving a verified local shard EC.
+        let cert = hyperscale_types::ExecutionCertificate::new(
+            wave_id.clone(),
+            0,
+            Hash::ZERO,
+            vec![],
+            hyperscale_types::zero_bls_signature(),
+            hyperscale_types::SignerBitfield::new(4),
+        );
+        state.on_certificate_verified(&topo, cert, true);
+
+        // Retry should be cancelled.
+        assert!(
+            !state.pending_vote_retries.contains_key(&wave_id),
+            "Retry should be cancelled on EC receipt"
+        );
+    }
+
+    #[test]
+    fn test_leader_broadcasts_ec_locally() {
+        let wave_id = WaveId::new(ShardGroupId(0), 1, [ShardGroupId(1)].into_iter().collect());
+        let topo = make_test_topology();
+
+        let mut state = make_test_state();
+
+        let cert = hyperscale_types::ExecutionCertificate::new(
+            wave_id.clone(),
+            0,
+            Hash::ZERO,
+            vec![],
+            hyperscale_types::zero_bls_signature(),
+            hyperscale_types::SignerBitfield::new(4),
+        );
+
+        let actions = state.on_certificate_aggregated(&topo, wave_id, cert);
+
+        // Should have: TrackExecutionCertificate + BroadcastEC(local) + BroadcastEC(remote shard 1)
+        let broadcast_actions: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, Action::BroadcastExecutionCertificate { .. }))
+            .collect();
+
+        assert!(
+            broadcast_actions.len() >= 2,
+            "Should broadcast to local peers AND remote shards, got {}",
+            broadcast_actions.len()
+        );
+
+        // One should be for the local shard (shard 0).
+        let has_local = broadcast_actions.iter().any(|a| match a {
+            Action::BroadcastExecutionCertificate { shard, .. } => *shard == ShardGroupId(0),
+            _ => false,
+        });
+        assert!(has_local, "Should include local shard broadcast");
+
+        // One should be for the remote shard (shard 1).
+        let has_remote = broadcast_actions.iter().any(|a| match a {
+            Action::BroadcastExecutionCertificate { shard, .. } => *shard == ShardGroupId(1),
+            _ => false,
+        });
+        assert!(has_remote, "Should include remote shard broadcast");
+    }
 }
