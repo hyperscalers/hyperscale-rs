@@ -1983,15 +1983,23 @@ impl BftState {
                     return vec![];
                 }
 
-                // In-flight verification: look up parent by hash because
-                // certified_in_flight may reflect THIS block's value if its
-                // QC formed before we got here. Fall back to certified_in_flight
-                // only if parent was pruned (committed and cleaned up).
+                // In-flight verification: must look up parent by hash.
+                // certified_in_flight is unreliable here — it may reflect THIS
+                // block's value (QC formed first) and the parent may have been
+                // pruned by the commit that QC triggered. If parent is gone,
+                // skip the vote; the block will be committed via sync.
                 {
-                    let parent_in_flight = self
-                        .get_header_by_hash(block.header.parent_hash)
-                        .map(|h| h.in_flight)
-                        .unwrap_or(self.certified_in_flight);
+                    let parent_in_flight = if block.header.parent_qc.is_genesis() {
+                        0
+                    } else if let Some(h) = self.get_header_by_hash(block.header.parent_hash) {
+                        h.in_flight
+                    } else {
+                        trace!(
+                            block_hash = ?block_hash,
+                            "Skipping vote — parent pruned, block will commit via sync"
+                        );
+                        return vec![];
+                    };
                     let finalized_tx_count: u32 = pending
                         .finalized_waves()
                         .iter()
@@ -5131,6 +5139,10 @@ mod tests {
         let parent_hash = Hash::from_bytes(b"parent_block");
         state.committed_height = 1;
         state.committed_hash = parent_hash;
+        // Parent block must be in memory for in-flight verification
+        state
+            .certified_blocks
+            .insert(parent_hash, make_empty_block(1));
 
         // Create block header with non-genesis QC
         let mut signers = SignerBitfield::new(4);
@@ -6969,6 +6981,9 @@ mod tests {
         let parent_hash = Hash::from_bytes(b"parent_block");
         state.committed_height = 1;
         state.committed_hash = parent_hash;
+        state
+            .certified_blocks
+            .insert(parent_hash, make_empty_block(1));
 
         // Create a parent QC that will be shared by multiple blocks
         let mut signers = SignerBitfield::new(4);
