@@ -190,19 +190,29 @@ pub fn derive_wave_tx_hashes(
         .collect()
 }
 
-/// Deterministically select the designated broadcaster for a wave.
+/// Deterministically select the wave leader for a wave (attempt 0).
 ///
-/// The designated broadcaster sends the aggregated EC to remote shards.
-/// Uses `Hash(sbor_encode(wave_id)) % committee_size` to pick one
-/// validator. All validators compute the same result from the same inputs.
+/// The wave leader collects execution votes, aggregates the EC, and
+/// broadcasts it to local peers and remote shards. Convenience wrapper
+/// for `wave_leader_at(wave_id, 0, committee)`.
+pub fn wave_leader(wave_id: &WaveId, committee: &[ValidatorId]) -> ValidatorId {
+    wave_leader_at(wave_id, 0, committee)
+}
+
+/// Deterministically select the wave leader with rotation for fallback.
 ///
-/// Since WaveId is self-contained (includes shard + height + remote shards),
-/// no separate block_hash is needed.
-pub fn designated_broadcaster(wave_id: &WaveId, committee: &[ValidatorId]) -> ValidatorId {
+/// Each `attempt` selects a different validator from the committee, enabling
+/// leader rotation when the primary leader (attempt=0) fails. Validators
+/// re-send their vote to `wave_leader_at(wave_id, attempt+1, committee)`
+/// after a timeout.
+///
+/// Uses `Hash(sbor_encode(wave_id) ++ attempt.to_le_bytes()) % committee_size`
+/// for deterministic selection. All validators compute the same result.
+pub fn wave_leader_at(wave_id: &WaveId, attempt: u32, committee: &[ValidatorId]) -> ValidatorId {
     assert!(!committee.is_empty(), "committee must not be empty");
-    let wave_bytes = basic_encode(wave_id).expect("WaveId serialization should never fail");
-    let selection_hash = Hash::from_bytes(&wave_bytes);
-    // Use first 8 bytes as u64 for index selection
+    let mut buf = basic_encode(wave_id).expect("WaveId serialization should never fail");
+    buf.extend_from_slice(&attempt.to_le_bytes());
+    let selection_hash = Hash::from_bytes(&buf);
     let bytes = selection_hash.as_bytes();
     let index_val = u64::from_le_bytes([
         bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
@@ -988,5 +998,63 @@ mod tests {
         assert_eq!(decoded.len(), 2);
         assert_eq!(decoded[0].as_ref(), certs[0].as_ref());
         assert_eq!(decoded[1].as_ref(), certs[1].as_ref());
+    }
+
+    #[test]
+    fn test_wave_leader_is_attempt_zero() {
+        let committee = vec![
+            ValidatorId(1),
+            ValidatorId(2),
+            ValidatorId(3),
+            ValidatorId(4),
+        ];
+        let wave_id = make_wave_id(0, 100, &[1]);
+        assert_eq!(
+            wave_leader(&wave_id, &committee),
+            wave_leader_at(&wave_id, 0, &committee)
+        );
+    }
+
+    #[test]
+    fn test_wave_leader_at_rotates() {
+        let committee = vec![
+            ValidatorId(1),
+            ValidatorId(2),
+            ValidatorId(3),
+            ValidatorId(4),
+        ];
+        let wave_id = make_wave_id(0, 100, &[1]);
+        let mut leaders: std::collections::HashSet<ValidatorId> = std::collections::HashSet::new();
+        for attempt in 0..4 {
+            leaders.insert(wave_leader_at(&wave_id, attempt, &committee));
+        }
+        // With 4 attempts and 4 committee members, we should get multiple distinct leaders.
+        // (Not guaranteed to be all 4 due to hash collisions, but at least 2.)
+        assert!(
+            leaders.len() >= 2,
+            "Expected rotation to produce distinct leaders"
+        );
+    }
+
+    #[test]
+    fn test_wave_leader_at_wraps() {
+        let committee = vec![ValidatorId(1), ValidatorId(2), ValidatorId(3)];
+        let wave_id = make_wave_id(0, 100, &[1]);
+        // Large attempt values should not panic — they wrap via modulo.
+        let _ = wave_leader_at(&wave_id, 1000, &committee);
+    }
+
+    #[test]
+    fn test_wave_leader_deterministic() {
+        let committee = vec![
+            ValidatorId(1),
+            ValidatorId(2),
+            ValidatorId(3),
+            ValidatorId(4),
+        ];
+        let wave_id = make_wave_id(0, 100, &[1]);
+        let leader1 = wave_leader_at(&wave_id, 2, &committee);
+        let leader2 = wave_leader_at(&wave_id, 2, &committee);
+        assert_eq!(leader1, leader2);
     }
 }

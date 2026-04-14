@@ -24,9 +24,9 @@
 //! an ExecutionVote with the receipt hash of execution results.
 //!
 //! ## Phase 4: Vote Aggregation
-//! All validators broadcast votes to their local shard (N→N). When 2f+1 voting
-//! power agrees on the same receipt hash, an execution certificate is formed.
-//! The designated broadcaster sends the EC to remote participating shards.
+//! Validators send execution votes to the wave leader. When the leader collects
+//! 2f+1 voting power agreeing on the same receipt hash, it aggregates an
+//! execution certificate and broadcasts it to local peers and remote shards.
 //!
 //! ## Phase 5: Finalization
 //! Validators collect shard execution proofs from all participating shards. When all
@@ -140,7 +140,7 @@ pub struct ExecutionState {
     /// Created by all validators (N→N voting).
     vote_trackers: HashMap<WaveId, VoteTracker>,
 
-    /// Waves that have a canonical EC (aggregated or received from designated broadcaster).
+    /// Waves that have a canonical EC (aggregated by wave leader or received via broadcast).
     /// Used to skip completed waves in `scan_complete_waves`.
     waves_with_ec: HashSet<WaveId>,
 
@@ -1016,16 +1016,15 @@ impl ExecutionState {
         let certificate = Arc::new(certificate);
 
         // Cache the cert in io_loop for fallback serving — any node can serve
-        // requests from remote shards if the designated broadcaster fails.
+        // requests from remote shards if the wave leader fails.
         actions.push(Action::TrackExecutionCertificate {
             certificate: Arc::clone(&certificate),
         });
 
-        // Only the designated broadcaster sends the EC to remote shards.
+        // Only the wave leader sends the EC to remote shards.
         // No local broadcast needed — every validator aggregated locally.
-        let broadcaster =
-            hyperscale_types::designated_broadcaster(&wave_id, topology.local_committee());
-        if local_vid == broadcaster {
+        let leader = hyperscale_types::wave_leader(&wave_id, topology.local_committee());
+        if local_vid == leader {
             for target_shard in &remote_shards {
                 let recipients: Vec<ValidatorId> =
                     topology.committee_for_shard(*target_shard).to_vec();
@@ -1040,7 +1039,7 @@ impl ExecutionState {
                 wave = %wave_id,
                 tx_count = certificate.tx_outcomes.len(),
                 remote_shards = remote_shards.len(),
-                "Designated broadcaster sending EC to remote shards"
+                "Wave leader sending EC to remote shards"
             );
         }
 
@@ -1053,8 +1052,8 @@ impl ExecutionState {
     /// Handle an execution certificate received from another validator.
     ///
     /// This handles ECs from both:
-    /// - The designated broadcaster (remote shard EC for finalization)
-    /// - Local aggregation (local shard EC formed independently)
+    /// - The wave leader (local shard EC broadcast, or remote shard EC for finalization)
+    /// - Fallback fetch (when wave leader or remote broadcast fails)
     ///
     /// A execution cert covers many txs. Each tx is handled independently:
     /// - If tracker exists → needs verification, then feed proof
@@ -1327,7 +1326,7 @@ impl ExecutionState {
         // Must run every block, not just when there are new transactions.
         actions.extend(self.check_exec_cert_timeouts(topology));
 
-        // Check for waves whose designated broadcaster has completely failed (no EC at all).
+        // Check for waves whose wave leader has completely failed (no EC at all).
         // Prune ephemeral state (orphaned provisions).
         // Cross-shard resolution state (certificate trackers, finalized certs,
         // pending provisioning, execution cache, early arrivals) is only cleaned
