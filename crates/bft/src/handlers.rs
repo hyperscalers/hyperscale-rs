@@ -274,14 +274,21 @@ pub struct StateRootResult<P: Send> {
 pub fn verify_state_root<S: ChainWriter + SubstateStore>(
     storage: &S,
     parent_state_root: Hash,
+    parent_block_height: u64,
     expected_root: Hash,
     receipts: &[ReceiptBundle],
     block_height: u64,
 ) -> StateRootResult<S::PreparedCommit> {
-    // Both proposer and verifier must use the same JVT version to get matching results.
-    let actual_version = storage.jvt_version();
-    let (computed_root, prepared) =
-        storage.prepare_block_commit(parent_state_root, actual_version, receipts, block_height);
+    // Use the stable parent_block_height from the verification pipeline, not
+    // storage.jvt_version() which is racy — by the time this runs on the
+    // ConsensusCrypto pool, other blocks may have committed and advanced the
+    // JVT past the parent version.
+    let (computed_root, prepared) = storage.prepare_block_commit(
+        parent_state_root,
+        parent_block_height,
+        receipts,
+        block_height,
+    );
 
     let valid = computed_root == expected_root;
 
@@ -291,7 +298,7 @@ pub fn verify_state_root<S: ChainWriter + SubstateStore>(
             ?computed_root,
             ?parent_state_root,
             block_height,
-            jvt_version = actual_version,
+            parent_block_height,
             "State root verification FAILED"
         );
     }

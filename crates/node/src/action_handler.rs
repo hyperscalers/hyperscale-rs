@@ -280,10 +280,10 @@ pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainRead
         Action::VerifyStateRoot {
             block_hash,
             parent_state_root,
+            parent_block_height,
             expected_root,
             finalized_waves,
             block_height,
-            ..
         } => {
             let start = std::time::Instant::now();
             // Collect receipts from all finalized waves.
@@ -295,6 +295,7 @@ pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainRead
             let result = hyperscale_bft::handlers::verify_state_root(
                 ctx.storage,
                 parent_state_root,
+                parent_block_height,
                 expected_root,
                 &all_receipts,
                 block_height,
