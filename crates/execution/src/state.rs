@@ -144,6 +144,10 @@ pub struct ExecutionState {
     /// Used to skip completed waves in `scan_complete_waves`.
     waves_with_ec: HashSet<WaveId>,
 
+    /// Pending vote retries for waves where the leader hasn't produced an EC.
+    /// Populated by non-leaders in emit_vote_actions(). Cleared on EC receipt.
+    pending_vote_retries: HashMap<WaveId, PendingVoteRetry>,
+
     /// Wave-ready events to emit as actions after scan_complete_waves.
     /// Drained by take_wave_ready_actions().
     pending_wave_ready_events: Vec<Vec<Hash>>,
@@ -221,6 +225,21 @@ const EXEC_CERT_FALLBACK_TIMEOUT_BLOCKS: u64 = 10;
 /// Number of blocks between repeated fallback requests for the same cert.
 const EXEC_CERT_RETRY_INTERVAL_BLOCKS: u64 = 20;
 
+/// Blocks to wait before retrying a vote with the next rotated wave leader.
+const VOTE_RETRY_BLOCKS: u64 = 5;
+
+/// Tracks a pending vote sent to a wave leader, for retry on timeout.
+#[derive(Debug, Clone)]
+struct PendingVoteRetry {
+    sent_at_height: u64,
+    attempt: u32,
+    block_hash: Hash,
+    block_height: u64,
+    vote_height: u64,
+    global_receipt_root: Hash,
+    tx_outcomes: Vec<TxOutcome>,
+}
+
 /// Per-shard recipient lists for provision broadcasting.
 type ShardRecipients = HashMap<ShardGroupId, Vec<ValidatorId>>;
 
@@ -236,6 +255,7 @@ impl ExecutionState {
             accumulators: HashMap::new(),
             vote_trackers: HashMap::new(),
             waves_with_ec: HashSet::new(),
+            pending_vote_retries: HashMap::new(),
             pending_wave_ready_events: Vec::new(),
             early_provisioned_tx_hashes: Vec::new(),
             wave_assignments: HashMap::new(),
@@ -627,22 +647,37 @@ impl ExecutionState {
     /// (lowest height where all txs are coverable), not passed in externally.
     pub fn emit_vote_actions(&mut self, topology: &TopologySnapshot) -> Vec<Action> {
         let committee = topology.local_committee().to_vec();
-        let mut actions: Vec<Action> = self
-            .scan_complete_waves()
-            .into_iter()
-            .map(|completion| {
-                let leader = hyperscale_types::wave_leader(&completion.wave_id, &committee);
-                Action::SignAndSendExecutionVote {
-                    block_hash: completion.block_hash,
-                    block_height: completion.block_height,
-                    vote_height: completion.vote_height,
-                    wave_id: completion.wave_id,
-                    global_receipt_root: completion.global_receipt_root,
-                    tx_outcomes: completion.tx_outcomes,
-                    leader,
-                }
-            })
-            .collect();
+        let local_vid = topology.local_validator_id();
+        let completions = self.scan_complete_waves();
+        let mut actions = Vec::with_capacity(completions.len());
+        for completion in completions {
+            let leader = hyperscale_types::wave_leader(&completion.wave_id, &committee);
+            // Track retry state for non-leaders so we can re-send to a
+            // rotated leader if this one doesn't produce an EC.
+            if local_vid != leader {
+                self.pending_vote_retries.insert(
+                    completion.wave_id.clone(),
+                    PendingVoteRetry {
+                        sent_at_height: self.committed_height,
+                        attempt: 0,
+                        block_hash: completion.block_hash,
+                        block_height: completion.block_height,
+                        vote_height: completion.vote_height,
+                        global_receipt_root: completion.global_receipt_root,
+                        tx_outcomes: completion.tx_outcomes.clone(),
+                    },
+                );
+            }
+            actions.push(Action::SignAndSendExecutionVote {
+                block_hash: completion.block_hash,
+                block_height: completion.block_height,
+                vote_height: completion.vote_height,
+                wave_id: completion.wave_id,
+                global_receipt_root: completion.global_receipt_root,
+                tx_outcomes: completion.tx_outcomes,
+                leader,
+            });
+        }
         // Emit wave-ready notifications (buffered during scan_complete_waves).
         actions.extend(self.take_wave_ready_actions());
         actions
@@ -1177,6 +1212,8 @@ impl ExecutionState {
         // remote shards.
         if shard == topology.local_shard() {
             self.waves_with_ec.insert(certificate.wave_id.clone());
+            // EC received from wave leader — cancel any pending vote retry.
+            self.pending_vote_retries.remove(&certificate.wave_id);
             let cert_arc = Arc::new(certificate.clone());
             actions.push(Action::TrackExecutionCertificate {
                 certificate: cert_arc.clone(),
@@ -1303,6 +1340,52 @@ impl ExecutionState {
         actions
     }
 
+    /// Re-send votes to rotated leaders for waves that haven't produced an EC.
+    ///
+    /// Called during block commit processing. If VOTE_RETRY_BLOCKS have elapsed
+    /// since a vote was sent and no EC has been received, re-send the same vote
+    /// to the next deterministically-rotated leader.
+    fn check_vote_retry_timeouts(&mut self, topology: &TopologySnapshot) -> Vec<Action> {
+        let mut actions = Vec::new();
+        let current_height = self.committed_height;
+        let committee = topology.local_committee().to_vec();
+
+        // Collect retries first to avoid borrow conflict.
+        let retries: Vec<(WaveId, PendingVoteRetry)> = self
+            .pending_vote_retries
+            .iter()
+            .filter(|(_, p)| current_height.saturating_sub(p.sent_at_height) >= VOTE_RETRY_BLOCKS)
+            .map(|(w, p)| (w.clone(), p.clone()))
+            .collect();
+
+        for (wave_id, mut pending) in retries {
+            pending.attempt += 1;
+            pending.sent_at_height = current_height;
+            let new_leader =
+                hyperscale_types::wave_leader_at(&wave_id, pending.attempt, &committee);
+
+            tracing::info!(
+                wave = %wave_id,
+                attempt = pending.attempt,
+                new_leader = new_leader.0,
+                "Vote retry timeout — re-sending to rotated leader"
+            );
+
+            actions.push(Action::SignAndSendExecutionVote {
+                block_hash: pending.block_hash,
+                block_height: pending.block_height,
+                vote_height: pending.vote_height,
+                wave_id: wave_id.clone(),
+                global_receipt_root: pending.global_receipt_root,
+                tx_outcomes: pending.tx_outcomes.clone(),
+                leader: new_leader,
+            });
+
+            self.pending_vote_retries.insert(wave_id, pending);
+        }
+        actions
+    }
+
     // ═══════════════════════════════════════════════════════════════════════════
     // Block Commit Handling
     // ═══════════════════════════════════════════════════════════════════════════
@@ -1356,6 +1439,10 @@ impl ExecutionState {
         // Check for timed-out expected execution certs and prune stale entries.
         // Must run every block, not just when there are new transactions.
         actions.extend(self.check_exec_cert_timeouts(topology));
+
+        // Re-send votes to rotated leaders for waves where the leader hasn't
+        // produced an EC within VOTE_RETRY_BLOCKS.
+        actions.extend(self.check_vote_retry_timeouts(topology));
 
         // Check for waves whose wave leader has completely failed (no EC at all).
         // Prune ephemeral state (orphaned provisions).
@@ -1815,6 +1902,8 @@ impl ExecutionState {
         let pruned_vt = before_vt - self.vote_trackers.len();
         self.waves_with_ec
             .retain(|key| self.accumulators.contains_key(key));
+        self.pending_vote_retries
+            .retain(|key, _| active_keys.contains(key));
 
         // Prune early execution votes that have been consumed (accumulator exists
         // and would have replayed them) or that are stale (50+ blocks old).
