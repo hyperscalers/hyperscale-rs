@@ -1089,8 +1089,6 @@ impl BftState {
         height: u64,
         round: u64,
     ) -> Vec<Action> {
-        let mut actions = vec![];
-
         // Get parent info from latest QC
         let (parent_hash, parent_qc) = if let Some(qc) = &self.latest_qc {
             (qc.block_hash, qc.clone())
@@ -1102,71 +1100,58 @@ impl BftState {
         // during view changes where a Byzantine proposer might try to advance consensus time
         let timestamp = parent_qc.weighted_timestamp_ms;
 
-        // Fallback blocks have no certificates, so state doesn't change.
         let parent_state_root = self.certified_state_root;
-
-        let header = BlockHeader {
-            shard_group_id: topology.local_shard(),
-            height: BlockHeight(height),
-            parent_hash,
-            parent_qc: parent_qc.clone(),
-            proposer: topology.local_validator_id(),
-            timestamp,
-            round,
-            is_fallback: true,
-            state_root: parent_state_root,
-            transaction_root: Hash::ZERO, // Fallback blocks have no transactions
-            certificate_root: Hash::ZERO,
-            local_receipt_root: Hash::ZERO,
-            provision_root: Hash::ZERO,
-            waves: vec![],
-            in_flight: self.certified_in_flight,
-        };
-
-        let block = Block {
-            header: header.clone(),
-            transactions: vec![],
-            certificates: vec![],
-        };
-
-        let block_hash = block.hash();
+        let parent_block_height = parent_qc.height.0;
+        let block_height = BlockHeight(height);
 
         info!(
             validator = ?topology.local_validator_id(),
             height = height,
             round = round,
-            block_hash = ?block_hash,
             "Building fallback block (leader timeout)"
         );
 
-        // Store our own block as pending (already complete since it's empty)
-        let mut pending = PendingBlock::from_manifest(header.clone(), BlockManifest::default());
-        if let Ok(constructed) = pending.construct_block() {
-            self.pending_blocks.insert(block_hash, pending);
-            self.fetch.track(block_hash, self.now);
-            self.certified_blocks
-                .insert(block_hash, (*constructed).clone());
-        }
-
-        // Track proposal time for rate limiting
-
-        // Record leader activity - we are producing blocks
         self.record_leader_activity();
 
-        actions.push(Action::BroadcastBlockHeader {
-            header: Box::new(header),
-            manifest: Box::new(BlockManifest::default()),
+        // Track pending proposal for correlation with ProposalBuilt callback.
+        self.pending_proposal = Some(PendingProposal {
+            height: block_height,
+            round,
         });
 
-        // Vote for our own fallback block
-        actions.extend(self.create_vote(topology, block_hash, height, round));
+        let proposal_action = Action::BuildProposal {
+            shard_group_id: topology.local_shard(),
+            proposer: topology.local_validator_id(),
+            height: block_height,
+            round,
+            parent_hash,
+            parent_qc,
+            timestamp,
+            is_fallback: true,
+            parent_state_root,
+            parent_block_height,
+            transactions: vec![],
+            finalized_waves: vec![],
+            waves: vec![],
+            provision_batches: vec![],
+            parent_in_flight: self.certified_in_flight,
+            finalized_tx_count: 0,
+        };
 
-        // Set proposal timer in case this fallback block doesn't get quorum.
-        // Without this timer, consensus could stall if the block doesn't reach quorum.
-        actions.push(Action::SetTimer {
+        let mut actions = vec![Action::SetTimer {
             id: TimerId::Proposal,
             duration: self.config.proposal_interval,
-        });
+        }];
+
+        if self
+            .verification
+            .parent_tree_available(parent_block_height, parent_hash)
+        {
+            actions.push(proposal_action);
+        } else {
+            self.verification
+                .defer_proposal(parent_hash, proposal_action);
+        }
 
         actions
     }
@@ -1194,8 +1179,6 @@ impl BftState {
         height: u64,
         round: u64,
     ) -> Vec<Action> {
-        let mut actions = vec![];
-
         // Get parent info from latest QC
         let (parent_hash, parent_qc) = if let Some(qc) = &self.latest_qc {
             (qc.block_hash, qc.clone())
@@ -1208,70 +1191,58 @@ impl BftState {
         // inherit the parent timestamp (proposed after timeout, clock may have drifted).
         let timestamp = self.now.as_millis() as u64;
 
-        // Sync blocks have no certificates, so state doesn't change.
         let parent_state_root = self.certified_state_root;
-
-        let header = BlockHeader {
-            shard_group_id: topology.local_shard(),
-            height: BlockHeight(height),
-            parent_hash,
-            parent_qc: parent_qc.clone(),
-            proposer: topology.local_validator_id(),
-            timestamp,
-            round,
-            is_fallback: false, // Not a fallback - just empty due to sync
-            state_root: parent_state_root,
-            transaction_root: Hash::ZERO, // Sync blocks have no transactions
-            certificate_root: Hash::ZERO, // No certificates
-            local_receipt_root: Hash::ZERO,
-            provision_root: Hash::ZERO,
-            waves: vec![],
-            in_flight: self.certified_in_flight,
-        };
-
-        let block = Block {
-            header: header.clone(),
-            transactions: vec![],
-            certificates: vec![],
-        };
-
-        let block_hash = block.hash();
+        let parent_block_height = parent_qc.height.0;
+        let block_height = BlockHeight(height);
 
         info!(
             validator = ?topology.local_validator_id(),
             height = height,
             round = round,
-            block_hash = ?block_hash,
             "Building sync block (syncing, empty payload)"
         );
 
-        // Store our own block as pending (already complete since it's empty)
-        let mut pending = PendingBlock::from_manifest(header.clone(), BlockManifest::default());
-        if let Ok(constructed) = pending.construct_block() {
-            self.pending_blocks.insert(block_hash, pending);
-            self.fetch.track(block_hash, self.now);
-            self.certified_blocks
-                .insert(block_hash, (*constructed).clone());
-        }
-
-        // Track proposal time for rate limiting
-
-        // Record leader activity - we are producing blocks
         self.record_leader_activity();
 
-        actions.push(Action::BroadcastBlockHeader {
-            header: Box::new(header),
-            manifest: Box::new(BlockManifest::default()),
+        // Track pending proposal for correlation with ProposalBuilt callback.
+        self.pending_proposal = Some(PendingProposal {
+            height: block_height,
+            round,
         });
 
-        // Vote for our own sync block
-        actions.extend(self.create_vote(topology, block_hash, height, round));
+        let proposal_action = Action::BuildProposal {
+            shard_group_id: topology.local_shard(),
+            proposer: topology.local_validator_id(),
+            height: block_height,
+            round,
+            parent_hash,
+            parent_qc,
+            timestamp,
+            is_fallback: false,
+            parent_state_root,
+            parent_block_height,
+            transactions: vec![],
+            finalized_waves: vec![],
+            waves: vec![],
+            provision_batches: vec![],
+            parent_in_flight: self.certified_in_flight,
+            finalized_tx_count: 0,
+        };
 
-        // Set proposal timer for next round
-        actions.push(Action::SetTimer {
+        let mut actions = vec![Action::SetTimer {
             id: TimerId::Proposal,
             duration: self.config.proposal_interval,
-        });
+        }];
+
+        if self
+            .verification
+            .parent_tree_available(parent_block_height, parent_hash)
+        {
+            actions.push(proposal_action);
+        } else {
+            self.verification
+                .defer_proposal(parent_hash, proposal_action);
+        }
 
         actions
     }
@@ -5295,13 +5266,19 @@ mod tests {
         // Advance to round 1 - validator 2 becomes proposer
         let actions = state.advance_round(&topology);
 
-        // Should broadcast a fallback block
-        let has_broadcast = actions
-            .iter()
-            .any(|a| matches!(a, Action::BroadcastBlockHeader { .. }));
+        // Should emit BuildProposal for the fallback block
+        let has_proposal = actions.iter().any(|a| {
+            matches!(
+                a,
+                Action::BuildProposal {
+                    is_fallback: true,
+                    ..
+                }
+            )
+        });
         assert!(
-            has_broadcast,
-            "Proposer should broadcast after round advance"
+            has_proposal,
+            "Proposer should emit BuildProposal after round advance"
         );
     }
 
@@ -6089,24 +6066,25 @@ mod tests {
         // proposer_for(1, 3) = (1+3)%4 = 0 = ValidatorId(0) - WE ARE THE PROPOSER!
         let actions = state.advance_round(&topology);
         assert_eq!(state.view, 3);
-        // Since we're the proposer, we create a fallback block and vote for it
-        // So there WILL be a vote at height 1 (for the new fallback block)
+        // Since we're the proposer, we emit BuildProposal for a fallback block.
+        // The actual vote happens later in on_proposal_built (async).
+        // Vote lock was cleared by advance_round (no QC at height 1).
         assert!(
-            state.voted_heights.contains_key(&height),
-            "Should have a new vote at height 1 (we're the proposer, voted for fallback)"
-        );
-        let (new_hash, new_round) = state.voted_heights.get(&height).unwrap();
-        assert_eq!(*new_round, 3, "Vote should be at round 3");
-        assert_ne!(
-            *new_hash, block_c,
-            "Vote should be for new fallback, not block C"
+            !state.voted_heights.contains_key(&height),
+            "Vote lock should be cleared — vote happens async via on_proposal_built"
         );
 
-        // Verify we broadcast a fallback block
-        let has_broadcast = actions
-            .iter()
-            .any(|a| matches!(a, Action::BroadcastBlockHeader { .. }));
-        assert!(has_broadcast, "Should broadcast fallback block");
+        // Verify we emit BuildProposal for the fallback
+        let has_proposal = actions.iter().any(|a| {
+            matches!(
+                a,
+                Action::BuildProposal {
+                    is_fallback: true,
+                    ..
+                }
+            )
+        });
+        assert!(has_proposal, "Should emit BuildProposal for fallback block");
     }
 
     #[test]
@@ -6357,50 +6335,36 @@ mod tests {
 
         let actions = state.advance_round(&topology);
 
-        // The old vote should be replaced with a vote for the new fallback block.
-        // advance_round: 1) unlocks at height 1, 2) creates fallback, 3) votes for it
+        // Vote lock was cleared by advance_round (no QC at height 1).
+        // The actual vote happens async in on_proposal_built.
         assert!(
-            state.voted_heights.contains_key(&1),
-            "Should have a new vote at height 1 (for the fallback block)"
-        );
-        let (new_block_hash, new_round) = state.voted_heights.get(&1).unwrap();
-        assert_ne!(
-            *new_block_hash, original_block_hash,
-            "Vote should be for the new fallback block, not the original"
-        );
-        assert_eq!(*new_round, 3, "Vote should be at round 3");
-
-        // Should have broadcast action (fallback block)
-        let broadcast_action = actions
-            .iter()
-            .find(|a| matches!(a, Action::BroadcastBlockHeader { .. }));
-        assert!(
-            broadcast_action.is_some(),
-            "Should broadcast fallback block when becoming proposer after view change"
+            !state.voted_heights.contains_key(&1),
+            "Vote lock should be cleared — vote happens async via on_proposal_built"
         );
 
-        // Verify it's a fallback block (not the original)
-        if let Some(Action::BroadcastBlockHeader { header: gossip, .. }) = broadcast_action {
-            assert!(gossip.is_fallback, "Should be a fallback block");
-            assert_eq!(gossip.round, 3, "Fallback block should be at new round");
-            assert_ne!(
-                gossip.hash(),
-                original_block_hash,
-                "Fallback block should be different from original"
-            );
-            // Verify the fallback block hash matches what we voted for
-            assert_eq!(
-                gossip.hash(),
-                *new_block_hash,
-                "Fallback block hash should match our vote"
-            );
+        // Should emit BuildProposal for the fallback
+        let proposal_action = actions.iter().find(|a| {
+            matches!(
+                a,
+                Action::BuildProposal {
+                    is_fallback: true,
+                    ..
+                }
+            )
+        });
+        assert!(
+            proposal_action.is_some(),
+            "Should emit BuildProposal for fallback block when becoming proposer after view change"
+        );
+
+        // Verify the proposal fields
+        if let Some(Action::BuildProposal {
+            round, is_fallback, ..
+        }) = proposal_action
+        {
+            assert!(*is_fallback, "Should be a fallback block");
+            assert_eq!(*round, 3, "Fallback proposal should be at new round");
         }
-
-        // Should have vote action (we vote for our own fallback)
-        let has_vote = actions
-            .iter()
-            .any(|a| matches!(a, Action::SignAndBroadcastBlockVote { .. }));
-        assert!(has_vote, "Should vote for own fallback block");
     }
 
     #[test]
@@ -6436,26 +6400,28 @@ mod tests {
         state.view = 2;
         let actions = state.advance_round(&topology);
 
-        // Should create and broadcast a fallback block
-        let broadcast_action = actions
-            .iter()
-            .find(|a| matches!(a, Action::BroadcastBlockHeader { .. }));
+        // Should emit BuildProposal for the fallback block
+        let proposal_action = actions.iter().find(|a| {
+            matches!(
+                a,
+                Action::BuildProposal {
+                    is_fallback: true,
+                    ..
+                }
+            )
+        });
         assert!(
-            broadcast_action.is_some(),
-            "Should broadcast fallback block"
+            proposal_action.is_some(),
+            "Should emit BuildProposal for fallback block"
         );
 
-        // Extract and verify it's a fallback block
-        if let Some(Action::BroadcastBlockHeader { header: gossip, .. }) = broadcast_action {
-            assert!(gossip.is_fallback, "Block should be marked as fallback");
-            assert_eq!(gossip.round, 3, "Block should be at round 3");
+        if let Some(Action::BuildProposal {
+            round, is_fallback, ..
+        }) = proposal_action
+        {
+            assert!(*is_fallback, "Block should be marked as fallback");
+            assert_eq!(*round, 3, "Block should be at round 3");
         }
-
-        // Should also have a vote action (we vote for our own fallback block)
-        let has_vote = actions
-            .iter()
-            .any(|a| matches!(a, Action::SignAndBroadcastBlockVote { .. }));
-        assert!(has_vote, "Should create vote for own fallback block");
     }
 
     #[test]
@@ -7514,6 +7480,9 @@ mod tests {
     fn test_syncing_validator_proposes_empty_block() {
         let (mut state, topology) = make_test_state();
         state.set_time(Duration::from_secs(100));
+        // Simulate committed state so parent tree is available for BuildProposal.
+        state.committed_height = 3;
+        state.verification.on_jvt_committed(3);
 
         // Set up a QC so we propose for height 4 (validator 0's turn: (4+0)%4=0)
         let qc = QuorumCertificate {
@@ -7540,39 +7509,33 @@ mod tests {
 
         let actions = state.on_proposal_timer(&topology, &ready_txs, vec![], vec![]);
 
-        // Should have broadcast a block header
-        let has_block_header = actions
+        // Should emit BuildProposal (sync block goes through proposal pipeline)
+        let proposal = actions
             .iter()
-            .any(|a| matches!(a, Action::BroadcastBlockHeader { .. }));
+            .find(|a| matches!(a, Action::BuildProposal { .. }));
         assert!(
-            has_block_header,
-            "Should broadcast a block header while syncing"
+            proposal.is_some(),
+            "Should emit BuildProposal while syncing"
         );
 
-        // Verify the block is empty (sync block)
-        let block_gossip = actions.iter().find_map(|a| {
-            if let Action::BroadcastBlockHeader { header, manifest } = a {
-                Some((header, manifest))
-            } else {
-                None
-            }
-        });
-
-        let (header, manifest) = block_gossip.expect("Should have block header gossip");
-        assert!(
-            manifest.tx_hashes.is_empty(),
-            "Sync block should have no transactions"
-        );
-        assert!(
-            manifest.cert_hashes.is_empty(),
-            "Sync block should have no certificates"
-        );
-
-        // Verify is_fallback is false (sync blocks are not fallback blocks)
-        assert!(
-            !header.is_fallback,
-            "Sync block should not be marked as fallback"
-        );
+        // Verify it's a sync block (not fallback), with empty data
+        if let Some(Action::BuildProposal {
+            is_fallback,
+            transactions,
+            finalized_waves,
+            ..
+        }) = proposal
+        {
+            assert!(!is_fallback, "Sync block should not be marked as fallback");
+            assert!(
+                transactions.is_empty(),
+                "Sync block should have no transactions"
+            );
+            assert!(
+                finalized_waves.is_empty(),
+                "Sync block should have no finalized waves"
+            );
+        }
     }
 
     #[test]
@@ -7580,6 +7543,8 @@ mod tests {
         let (mut state, topology) = make_test_state();
         let current_time = Duration::from_secs(12345);
         state.set_time(current_time);
+        state.committed_height = 3;
+        state.verification.on_jvt_committed(3);
 
         // Set up QC with old timestamp
         let old_timestamp = 1000u64;
@@ -7601,27 +7566,24 @@ mod tests {
         let actions =
             state.on_proposal_timer(&topology, &ReadyTransactions::default(), vec![], vec![]);
 
-        // Extract the block header
-        let gossip = actions.iter().find_map(|a| {
-            if let Action::BroadcastBlockHeader { header: gossip, .. } = a {
-                Some(gossip)
-            } else {
-                None
-            }
-        });
+        // Extract the BuildProposal and check timestamp
+        let proposal = actions
+            .iter()
+            .find(|a| matches!(a, Action::BuildProposal { .. }));
+        let proposal = proposal.expect("Should emit BuildProposal for sync block");
 
-        let gossip = gossip.expect("Should have block header");
-
-        // Sync blocks use current time, NOT inherited timestamp
-        assert_eq!(
-            gossip.timestamp,
-            current_time.as_millis() as u64,
-            "Sync block should use current timestamp, not parent's"
-        );
-        assert_ne!(
-            gossip.timestamp, old_timestamp,
-            "Sync block should NOT inherit parent timestamp like fallback blocks"
-        );
+        if let Action::BuildProposal { timestamp, .. } = proposal {
+            // Sync blocks use current time, NOT inherited timestamp
+            assert_eq!(
+                *timestamp,
+                current_time.as_millis() as u64,
+                "Sync block should use current timestamp, not parent's"
+            );
+            assert_ne!(
+                *timestamp, old_timestamp,
+                "Sync block should NOT inherit parent timestamp like fallback blocks"
+            );
+        }
     }
 
     #[test]
@@ -7895,6 +7857,8 @@ mod tests {
         // This test verifies the key differences between sync blocks and fallback blocks
         let (mut state, topology) = make_test_state();
         state.set_time(Duration::from_secs(100));
+        state.committed_height = 3;
+        state.verification.on_jvt_committed(3);
 
         // Set up QC with specific timestamp
         let parent_timestamp = 50_000u64;
@@ -7924,49 +7888,47 @@ mod tests {
         // Test 2: Build fallback block
         let fallback_actions = state.build_and_broadcast_fallback_block(&topology, 4, 1);
 
-        // Extract headers
-        let sync_header = sync_actions
+        // Extract BuildProposal actions
+        let sync_proposal = sync_actions
             .iter()
-            .find_map(|a| {
-                if let Action::BroadcastBlockHeader { header, .. } = a {
-                    Some(header.as_ref())
-                } else {
-                    None
-                }
-            })
-            .expect("Should have sync block header");
+            .find(|a| matches!(a, Action::BuildProposal { .. }))
+            .expect("Should have sync BuildProposal");
 
-        let fallback_header = fallback_actions
+        let fallback_proposal = fallback_actions
             .iter()
-            .find_map(|a| {
-                if let Action::BroadcastBlockHeader { header, .. } = a {
-                    Some(header.as_ref())
-                } else {
-                    None
-                }
-            })
-            .expect("Should have fallback block header");
+            .find(|a| matches!(a, Action::BuildProposal { .. }))
+            .expect("Should have fallback BuildProposal");
 
         // Difference 1: is_fallback flag
-        assert!(
-            !sync_header.is_fallback,
-            "Sync block should have is_fallback=false"
-        );
-        assert!(
-            fallback_header.is_fallback,
-            "Fallback block should have is_fallback=true"
-        );
+        if let (
+            Action::BuildProposal {
+                is_fallback: sync_fb,
+                timestamp: sync_ts,
+                ..
+            },
+            Action::BuildProposal {
+                is_fallback: fb_fb,
+                timestamp: fb_ts,
+                ..
+            },
+        ) = (sync_proposal, fallback_proposal)
+        {
+            assert!(!sync_fb, "Sync block should have is_fallback=false");
+            assert!(fb_fb, "Fallback block should have is_fallback=true");
 
-        // Difference 2: timestamp handling
-        assert_eq!(
-            sync_header.timestamp,
-            Duration::from_secs(100).as_millis() as u64,
-            "Sync block uses current timestamp"
-        );
-        assert_eq!(
-            fallback_header.timestamp, parent_timestamp,
-            "Fallback block inherits parent timestamp"
-        );
+            // Difference 2: timestamp handling
+            assert_eq!(
+                *sync_ts,
+                Duration::from_secs(100).as_millis() as u64,
+                "Sync block uses current timestamp"
+            );
+            assert_eq!(
+                *fb_ts, parent_timestamp,
+                "Fallback block inherits parent timestamp"
+            );
+        } else {
+            unreachable!();
+        }
     }
 
     #[test]
@@ -7974,6 +7936,8 @@ mod tests {
         // Simulate a scenario where a syncing proposer keeps the chain advancing
         let (mut state, topology) = make_test_state();
         state.set_time(Duration::from_secs(100));
+        state.committed_height = 3;
+        state.verification.on_jvt_committed(3);
 
         // Set up initial QC
         let qc = QuorumCertificate {
@@ -7995,22 +7959,13 @@ mod tests {
         let actions1 =
             state.on_proposal_timer(&topology, &ReadyTransactions::default(), vec![], vec![]);
 
-        // Verify we got a proposal (not skipped due to syncing)
+        // Verify we got a BuildProposal (not skipped due to syncing)
         let has_proposal = actions1
             .iter()
-            .any(|a| matches!(a, Action::BroadcastBlockHeader { .. }));
+            .any(|a| matches!(a, Action::BuildProposal { .. }));
         assert!(
             has_proposal,
-            "Syncing validator should still propose (empty blocks)"
-        );
-
-        // Verify we also voted for our own block
-        let has_vote = actions1
-            .iter()
-            .any(|a| matches!(a, Action::SignAndBroadcastBlockVote { .. }));
-        assert!(
-            has_vote,
-            "Syncing validator should vote for their own sync block"
+            "Syncing validator should still propose (empty blocks via BuildProposal)"
         );
     }
 
