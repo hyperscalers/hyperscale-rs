@@ -234,6 +234,15 @@ pub enum ProtocolEvent {
     /// Used for per-tx mempool status updates.
     TransactionExecuted { tx_hash: Hash, accepted: bool },
 
+    /// A cross-shard transaction's provisions have arrived.
+    TransactionProvisioned { tx_hash: Hash },
+
+    /// All transactions in a wave are ready (all provisioned or timed out).
+    WaveReady { tx_hashes: Vec<Hash> },
+
+    /// Local execution certificate created for a wave (local votes aggregated).
+    ExecutionCertificateCreated { tx_hashes: Vec<Hash> },
+
     /// A wave's execution has been finalized (all shards reported).
     /// Carries the wave cert (which contains the ECs) and per-tx hashes.
     WaveCompleted {
@@ -397,6 +406,9 @@ impl ProtocolEvent {
             // Mempool / Transactions
             ProtocolEvent::TransactionGossipReceived { .. } => "TransactionGossipReceived",
             ProtocolEvent::TransactionExecuted { .. } => "TransactionExecuted",
+            ProtocolEvent::TransactionProvisioned { .. } => "TransactionProvisioned",
+            ProtocolEvent::WaveReady { .. } => "WaveReady",
+            ProtocolEvent::ExecutionCertificateCreated { .. } => "ExecutionCertificateCreated",
             ProtocolEvent::WaveCompleted { .. } => "WaveCompleted",
 
             // Fetch Delivery

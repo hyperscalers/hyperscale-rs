@@ -448,6 +448,21 @@ impl NodeStateMachine {
         actions
     }
 
+    fn on_transaction_provisioned(&mut self, tx_hash: Hash) -> Vec<Action> {
+        self.mempool.on_transaction_provisioned(tx_hash);
+        vec![]
+    }
+
+    fn on_wave_ready(&mut self, tx_hashes: Vec<Hash>) -> Vec<Action> {
+        self.mempool.on_wave_ready(&tx_hashes);
+        vec![]
+    }
+
+    fn on_ec_created(&mut self, tx_hashes: Vec<Hash>) -> Vec<Action> {
+        self.mempool.on_ec_created(&tx_hashes);
+        vec![]
+    }
+
     /// Handle transaction gossip received — add to mempool and check pending blocks.
     fn on_transaction_gossip_received(
         &mut self,
@@ -690,6 +705,13 @@ impl StateMachine for NodeStateMachine {
             // ── Transactions ─────────────────────────────────────────────
             ProtocolEvent::TransactionExecuted { tx_hash, accepted } => {
                 self.on_transaction_executed(tx_hash, accepted)
+            }
+            ProtocolEvent::TransactionProvisioned { tx_hash } => {
+                self.on_transaction_provisioned(tx_hash)
+            }
+            ProtocolEvent::WaveReady { tx_hashes } => self.on_wave_ready(tx_hashes),
+            ProtocolEvent::ExecutionCertificateCreated { tx_hashes } => {
+                self.on_ec_created(tx_hashes)
             }
             ProtocolEvent::WaveCompleted {
                 wave_cert: _,

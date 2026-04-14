@@ -144,6 +144,14 @@ pub struct ExecutionState {
     /// Used to skip completed waves in `scan_complete_waves`.
     waves_with_ec: HashSet<WaveId>,
 
+    /// Wave-ready events to emit as actions after scan_complete_waves.
+    /// Drained by take_wave_ready_actions().
+    pending_wave_ready_events: Vec<Vec<Hash>>,
+
+    /// Tx hashes provisioned via early provision replay (provisions arrived before block commit).
+    /// Drained by take_early_provisioned_actions().
+    early_provisioned_tx_hashes: Vec<Hash>,
+
     /// Tx → wave assignment. Maps tx_hash → WaveId.
     wave_assignments: HashMap<Hash, WaveId>,
 
@@ -226,6 +234,8 @@ impl ExecutionState {
             accumulators: HashMap::new(),
             vote_trackers: HashMap::new(),
             waves_with_ec: HashSet::new(),
+            pending_wave_ready_events: Vec::new(),
+            early_provisioned_tx_hashes: Vec::new(),
             wave_assignments: HashMap::new(),
             early_votes: HashMap::new(),
             wave_certificate_trackers: HashMap::new(),
@@ -376,6 +386,7 @@ impl ExecutionState {
                         .or_default()
                         .extend(source_shards);
                     accumulator.mark_provisioned(tx_hash);
+                    self.early_provisioned_tx_hashes.push(tx_hash);
                 }
             }
 
@@ -479,13 +490,18 @@ impl ExecutionState {
 
         let committed_height = self.committed_height;
         let mut votable_wave_ids = Vec::new();
+        let mut wave_ready_events = Vec::new();
         for wave_id in &candidate_ids {
             if let Some(acc) = self.accumulators.get_mut(wave_id) {
                 if acc.can_emit_vote(committed_height) {
+                    wave_ready_events.push(acc.tx_hashes());
                     votable_wave_ids.push(wave_id.clone());
                 }
             }
         }
+
+        // Stash wave-ready tx hashes — caller collects them via take_wave_ready_events().
+        self.pending_wave_ready_events.extend(wave_ready_events);
 
         let mut completions = Vec::new();
         for wave_id in votable_wave_ids {
@@ -510,6 +526,22 @@ impl ExecutionState {
         completions.sort_by(|a, b| a.wave_id.cmp(&b.wave_id));
 
         completions
+    }
+
+    /// Drain buffered early-provisioned tx notifications as actions.
+    pub fn take_early_provisioned_actions(&mut self) -> Vec<Action> {
+        self.early_provisioned_tx_hashes
+            .drain(..)
+            .map(|tx_hash| Action::Continuation(ProtocolEvent::TransactionProvisioned { tx_hash }))
+            .collect()
+    }
+
+    /// Drain buffered wave-ready events as actions.
+    pub fn take_wave_ready_actions(&mut self) -> Vec<Action> {
+        self.pending_wave_ready_events
+            .drain(..)
+            .map(|tx_hashes| Action::Continuation(ProtocolEvent::WaveReady { tx_hashes }))
+            .collect()
     }
 
     /// Process a completed execution batch: build receipt bundles, update cache, record outcomes.
@@ -588,7 +620,8 @@ impl ExecutionState {
     /// (lowest height where all txs are coverable), not passed in externally.
     pub fn emit_vote_actions(&mut self, topology: &TopologySnapshot) -> Vec<Action> {
         let local_committee = topology.local_committee().to_vec();
-        self.scan_complete_waves()
+        let mut actions: Vec<Action> = self
+            .scan_complete_waves()
             .into_iter()
             .map(|completion| Action::SignAndSendExecutionVote {
                 block_hash: completion.block_hash,
@@ -599,7 +632,10 @@ impl ExecutionState {
                 tx_outcomes: completion.tx_outcomes,
                 recipients: local_committee.clone(),
             })
-            .collect()
+            .collect();
+        // Emit wave-ready notifications (buffered during scan_complete_waves).
+        actions.extend(self.take_wave_ready_actions());
+        actions
     }
 
     /// Process committed wave certificates: remove finalized per-tx state for all
@@ -743,11 +779,16 @@ impl ExecutionState {
             }
         }
 
-        if requests.is_empty() {
-            vec![]
-        } else {
-            vec![Action::ExecuteCrossShardTransactions { requests }]
+        let mut actions: Vec<Action> = requests
+            .iter()
+            .map(|r| {
+                Action::Continuation(ProtocolEvent::TransactionProvisioned { tx_hash: r.tx_hash })
+            })
+            .collect();
+        if !requests.is_empty() {
+            actions.push(Action::ExecuteCrossShardTransactions { requests });
         }
+        actions
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -928,15 +969,27 @@ impl ExecutionState {
             "Delegating BLS aggregation to crypto pool"
         );
 
+        // Notify mempool that the local EC was created for these txs.
+        let ec_tx_hashes = self
+            .accumulators
+            .get(&wave_id)
+            .map(|acc| acc.tx_hashes())
+            .unwrap_or_default();
+
         // tx_outcomes are extracted from votes by the aggregation handler
         // (all quorum votes carry identical outcomes).
-        vec![Action::AggregateExecutionCertificate {
-            wave_id,
-            shard: topology.local_shard(),
-            global_receipt_root,
-            votes,
-            committee,
-        }]
+        vec![
+            Action::AggregateExecutionCertificate {
+                wave_id,
+                shard: topology.local_shard(),
+                global_receipt_root,
+                votes,
+                committee,
+            },
+            Action::Continuation(ProtocolEvent::ExecutionCertificateCreated {
+                tx_hashes: ec_tx_hashes,
+            }),
+        ]
     }
 
     /// Handle execution certificate aggregation completed.
@@ -1293,6 +1346,8 @@ impl ExecutionState {
         // Returns any early execution votes that arrived before tracking was ready.
         let early_votes =
             self.setup_execution_tracking(topology, block_hash, height, &transactions);
+        // Emit provisioned notifications for txs whose provisions arrived early.
+        actions.extend(self.take_early_provisioned_actions());
         for vote in early_votes {
             actions.extend(self.on_execution_vote(topology, vote));
         }

@@ -23,7 +23,15 @@ pub struct FinalizationPhaseTimes {
     pub added_at: Duration,
     /// When the block containing the transaction was committed.
     pub committed_at: Option<Duration>,
-    /// When the wave certificate was created (execution + vote collection complete).
+    /// When cross-shard provisions arrived for this transaction.
+    /// None for single-shard transactions (provisioned immediately).
+    pub provisioned_at: Option<Duration>,
+    /// When all transactions in the wave became ready (all provisioned/aborted).
+    /// Captures time spent waiting for other transactions in the same batch.
+    pub wave_ready_at: Option<Duration>,
+    /// When the local execution certificate was created (local votes aggregated).
+    pub ec_created_at: Option<Duration>,
+    /// When the wave certificate was created (all shards reported ECs).
     pub executed_at: Option<Duration>,
     /// When the transaction reached terminal state (TC committed in block).
     pub completed_at: Duration,
@@ -38,9 +46,41 @@ impl fmt::Display for FinalizationPhaseTimes {
         let mempool_to_commit = self
             .committed_at
             .map(|c| c.saturating_sub(self.added_at).as_secs_f64());
-        let commit_to_exec = match (self.committed_at, self.executed_at) {
-            (Some(c), Some(e)) => Some(e.saturating_sub(c).as_secs_f64()),
+
+        // Break the old "execution" phase into: provisioning → batch_wait → execution
+        let commit_to_provision = match (self.committed_at, self.provisioned_at) {
+            (Some(c), Some(p)) => Some(p.saturating_sub(c).as_secs_f64()),
             _ => None,
+        };
+        let provision_to_wave_ready = match (self.provisioned_at, self.wave_ready_at) {
+            (Some(p), Some(w)) => Some(w.saturating_sub(p).as_secs_f64()),
+            _ => None,
+        };
+        let wave_ready_to_ec = match (self.wave_ready_at, self.ec_created_at) {
+            (Some(w), Some(e)) => Some(e.saturating_sub(w).as_secs_f64()),
+            _ => None,
+        };
+        let ec_to_exec = match (self.ec_created_at, self.executed_at) {
+            (Some(e), Some(x)) => Some(x.saturating_sub(e).as_secs_f64()),
+            _ => None,
+        };
+        // Fallback: if no ec_created_at, show wave_ready→executed as "voting"
+        let wave_ready_to_exec = if wave_ready_to_ec.is_none() {
+            match (self.wave_ready_at, self.executed_at) {
+                (Some(w), Some(e)) => Some(e.saturating_sub(w).as_secs_f64()),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        // Fallback: if we have committed_at and executed_at but no intermediate timestamps
+        let commit_to_exec = if commit_to_provision.is_none() {
+            match (self.committed_at, self.executed_at) {
+                (Some(c), Some(e)) => Some(e.saturating_sub(c).as_secs_f64()),
+                _ => None,
+            }
+        } else {
+            None
         };
         let exec_to_complete = self
             .executed_at
@@ -49,6 +89,21 @@ impl fmt::Display for FinalizationPhaseTimes {
         write!(f, "total={total:.3}s")?;
         if let Some(v) = mempool_to_commit {
             write!(f, " mempool={v:.3}s")?;
+        }
+        if let Some(v) = commit_to_provision {
+            write!(f, " provisioning={v:.3}s")?;
+        }
+        if let Some(v) = provision_to_wave_ready {
+            write!(f, " batch_wait={v:.3}s")?;
+        }
+        if let Some(v) = wave_ready_to_ec {
+            write!(f, " voting={v:.3}s")?;
+        }
+        if let Some(v) = ec_to_exec {
+            write!(f, " ec_collection={v:.3}s")?;
+        }
+        if let Some(v) = wave_ready_to_exec {
+            write!(f, " voting={v:.3}s")?;
         }
         if let Some(v) = commit_to_exec {
             write!(f, " execution={v:.3}s")?;

@@ -141,7 +141,13 @@ struct PoolEntry {
     submitted_locally: bool,
     /// Timestamp when the block containing this tx was committed.
     committed_at_time: Option<Duration>,
-    /// Timestamp when the wave certificate was created (execution + votes complete).
+    /// Timestamp when cross-shard provisions arrived for this tx.
+    provisioned_at_time: Option<Duration>,
+    /// Timestamp when all txs in the wave became ready (all provisioned/aborted).
+    wave_ready_at_time: Option<Duration>,
+    /// Timestamp when the local execution certificate was created.
+    ec_created_at_time: Option<Duration>,
+    /// Timestamp when the wave certificate was created (all shards reported ECs).
     executed_at_time: Option<Duration>,
 }
 
@@ -322,6 +328,9 @@ impl MempoolState {
                 cross_shard,
                 submitted_locally: true, // Submitted via RPC
                 committed_at_time: None,
+                provisioned_at_time: None,
+                wave_ready_at_time: None,
+                ec_created_at_time: None,
                 executed_at_time: None,
             },
         );
@@ -373,6 +382,9 @@ impl MempoolState {
                 cross_shard,
                 submitted_locally,
                 committed_at_time: None,
+                provisioned_at_time: None,
+                wave_ready_at_time: None,
+                ec_created_at_time: None,
                 executed_at_time: None,
             },
         );
@@ -495,6 +507,9 @@ impl MempoolState {
                         cross_shard,
                         submitted_locally: false, // Fetched for block processing
                         committed_at_time: None,
+                        provisioned_at_time: None,
+                        wave_ready_at_time: None,
+                        ec_created_at_time: None,
                         executed_at_time: None,
                     },
                 );
@@ -575,6 +590,9 @@ impl MempoolState {
             let phase_times = Some(FinalizationPhaseTimes {
                 added_at: entry.added_at,
                 committed_at: entry.committed_at_time,
+                provisioned_at: entry.provisioned_at_time,
+                wave_ready_at: entry.wave_ready_at_time,
+                ec_created_at: entry.ec_created_at_time,
                 executed_at: entry.executed_at_time,
                 completed_at: self.now,
             });
@@ -628,6 +646,31 @@ impl MempoolState {
 
             if let Some(entry) = self.pool.get_mut(hash) {
                 entry.status = TransactionStatus::Committed(height);
+            }
+        }
+    }
+
+    /// Record when a cross-shard transaction's provisions arrived.
+    pub fn on_transaction_provisioned(&mut self, tx_hash: Hash) {
+        if let Some(entry) = self.pool.get_mut(&tx_hash) {
+            entry.provisioned_at_time = Some(self.now);
+        }
+    }
+
+    /// Record when the local execution certificate was created for a wave's txs.
+    pub fn on_ec_created(&mut self, tx_hashes: &[Hash]) {
+        for tx_hash in tx_hashes {
+            if let Some(entry) = self.pool.get_mut(tx_hash) {
+                entry.ec_created_at_time = Some(self.now);
+            }
+        }
+    }
+
+    /// Record when all transactions in a wave became ready.
+    pub fn on_wave_ready(&mut self, tx_hashes: &[Hash]) {
+        for tx_hash in tx_hashes {
+            if let Some(entry) = self.pool.get_mut(tx_hash) {
+                entry.wave_ready_at_time = Some(self.now);
             }
         }
     }
@@ -701,6 +744,9 @@ impl MempoolState {
             let phase_times = Some(FinalizationPhaseTimes {
                 added_at: entry.added_at,
                 committed_at: entry.committed_at_time,
+                provisioned_at: entry.provisioned_at_time,
+                wave_ready_at: entry.wave_ready_at_time,
+                ec_created_at: entry.ec_created_at_time,
                 executed_at: entry.executed_at_time,
                 completed_at: self.now,
             });
@@ -801,6 +847,9 @@ impl MempoolState {
                     Some(FinalizationPhaseTimes {
                         added_at: entry.added_at,
                         committed_at: entry.committed_at_time,
+                        provisioned_at: entry.provisioned_at_time,
+                        wave_ready_at: entry.wave_ready_at_time,
+                        ec_created_at: entry.ec_created_at_time,
                         executed_at: entry.executed_at_time,
                         completed_at: self.now,
                     })
