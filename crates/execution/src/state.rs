@@ -1018,8 +1018,9 @@ impl ExecutionState {
     /// Handle execution certificate aggregation completed.
     ///
     /// Called when the crypto pool finishes BLS aggregation for a wave's votes.
-    /// Broadcasts the execution cert to remote shards, then extracts per-tx outcomes
-    /// and feeds them to per-tx CertificateTrackers for finalization.
+    /// Only the wave leader (primary or fallback) reaches this path.
+    /// Broadcasts the EC to all local peers and remote participating shards,
+    /// then feeds it to the wave-level certificate tracker for finalization.
     pub fn on_certificate_aggregated(
         &mut self,
         topology: &TopologySnapshot,
@@ -1036,33 +1037,42 @@ impl ExecutionState {
 
         let certificate = Arc::new(certificate);
 
-        // Cache the cert in io_loop for fallback serving — any node can serve
-        // requests from remote shards if the wave leader fails.
+        // Cache the cert in io_loop for fallback serving.
         actions.push(Action::TrackExecutionCertificate {
             certificate: Arc::clone(&certificate),
         });
 
-        // Only the wave leader sends the EC to remote shards.
-        // No local broadcast needed — every validator aggregated locally.
-        let leader = hyperscale_types::wave_leader(&wave_id, topology.local_committee());
-        if local_vid == leader {
-            for target_shard in &remote_shards {
-                let recipients: Vec<ValidatorId> =
-                    topology.committee_for_shard(*target_shard).to_vec();
-                actions.push(Action::BroadcastExecutionCertificate {
-                    shard: *target_shard,
-                    certificate: Arc::clone(&certificate),
-                    recipients,
-                });
-            }
-
-            tracing::debug!(
-                wave = %wave_id,
-                tx_count = certificate.tx_outcomes.len(),
-                remote_shards = remote_shards.len(),
-                "Wave leader sending EC to remote shards"
-            );
+        // Broadcast EC to all local peers (they don't aggregate — they need it).
+        let local_peers: Vec<ValidatorId> = topology
+            .local_committee()
+            .iter()
+            .copied()
+            .filter(|&v| v != local_vid)
+            .collect();
+        if !local_peers.is_empty() {
+            actions.push(Action::BroadcastExecutionCertificate {
+                shard: topology.local_shard(),
+                certificate: Arc::clone(&certificate),
+                recipients: local_peers,
+            });
         }
+
+        // Broadcast EC to remote participating shards.
+        for target_shard in &remote_shards {
+            let recipients: Vec<ValidatorId> = topology.committee_for_shard(*target_shard).to_vec();
+            actions.push(Action::BroadcastExecutionCertificate {
+                shard: *target_shard,
+                certificate: Arc::clone(&certificate),
+                recipients,
+            });
+        }
+
+        tracing::debug!(
+            wave = %wave_id,
+            tx_count = certificate.tx_outcomes.len(),
+            remote_shards = remote_shards.len(),
+            "Wave leader broadcasting EC to local peers and remote shards"
+        );
 
         // Feed the EC to the wave-level certificate tracker for finalization.
         actions.extend(self.handle_wave_attestation(topology, certificate));
