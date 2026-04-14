@@ -117,7 +117,7 @@ impl<R: Request, F: Fn(R) -> R::Response + Send + Sync + 'static> RequestHandler
 /// `ActionContext<S: ChainWriter + SubstateStore, D: Dispatch>`.
 ///
 /// All sends are fire-and-forget. Responses to requests arrive via callback.
-pub trait Network: Send + Sync {
+pub trait Network: Send + Sync + 'static {
     // ── Pub/sub messaging ──
 
     /// Broadcast a shard-scoped message to all peers subscribed to that shard's topic.

@@ -1,12 +1,13 @@
 //! Action types for the deterministic state machine.
 
 use crate::{ProtocolEvent, TimerId};
-use hyperscale_messages::{BlockHeaderNotification, BlockVoteNotification, TransactionGossip};
+use hyperscale_messages::TransactionGossip;
 use hyperscale_types::{
-    Block, BlockHeight, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature, CommittedBlockHeader,
-    EpochConfig, EpochId, ExecutionCertificate, ExecutionVote, FinalizedWave, Hash, NodeId,
-    Provision, QuorumCertificate, ReceiptBundle, RoutableTransaction, ShardGroupId, SignerBitfield,
-    StateProvision, TopologySnapshot, TxOutcome, ValidatorId, VotePower, WaveCertificate, WaveId,
+    Block, BlockHeader, BlockHeight, BlockManifest, BlockVote, Bls12381G1PublicKey,
+    Bls12381G2Signature, CommittedBlockHeader, EpochConfig, EpochId, ExecutionCertificate,
+    ExecutionVote, FinalizedWave, Hash, NodeId, Provision, QuorumCertificate, ReceiptBundle,
+    RoutableTransaction, ShardGroupId, SignerBitfield, StateProvision, TopologySnapshot, TxOutcome,
+    ValidatorId, VotePower, WaveCertificate, WaveId,
 };
 use std::collections::HashMap;
 use std::fmt;
@@ -154,10 +155,12 @@ pub enum Action {
     // ═══════════════════════════════════════════════════════════════════════
     // Network: BFT Consensus
     // ═══════════════════════════════════════════════════════════════════════
-    /// Broadcast a block header (proposal) to the local shard.
+    /// Sign and broadcast a block header (proposal) to the local shard.
+    ///
+    /// The io_loop signs the header on the consensus crypto pool before sending.
     BroadcastBlockHeader {
-        shard: ShardGroupId,
-        header: Box<BlockHeaderNotification>,
+        header: Box<BlockHeader>,
+        manifest: Box<BlockManifest>,
     },
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -229,12 +232,13 @@ pub enum Action {
         shard_recipients: HashMap<ShardGroupId, Vec<ValidatorId>>,
     },
 
-    /// Broadcast a committed block header globally to all shards.
+    /// Sign and broadcast a committed block header globally to all shards.
     ///
     /// Used for the light-client provisions pattern. When a block commits,
     /// this broadcasts the header + QC so remote shards can verify state roots.
+    /// The io_loop signs on the consensus crypto pool before sending.
     BroadcastCommittedBlockHeader {
-        gossip: hyperscale_messages::CommittedBlockHeaderGossip,
+        committed_header: CommittedBlockHeader,
     },
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -600,11 +604,16 @@ pub enum Action {
     // ═══════════════════════════════════════════════════════════════════════
     // Network: BFT Votes
     // ═══════════════════════════════════════════════════════════════════════
-    /// Broadcast a block vote to targeted recipients.
+    /// Sign and broadcast a block vote to targeted recipients.
     ///
-    /// Sent to the next proposer who needs this vote to build the QC.
-    BroadcastVote {
-        vote: BlockVoteNotification,
+    /// The io_loop signs the vote on the consensus crypto pool, then
+    /// broadcasts to the next proposer and feeds the signed vote back
+    /// to the state machine for local VoteSet tracking.
+    SignAndBroadcastBlockVote {
+        block_hash: Hash,
+        height: BlockHeight,
+        round: u64,
+        timestamp: u64,
         /// Targeted vote recipients — the next proposer who needs this vote
         /// to build the QC for the next block.
         recipients: Vec<ValidatorId>,
@@ -935,7 +944,7 @@ impl Action {
             Action::EmitTransactionStatus { .. } => "EmitTransactionStatus",
 
             // Storage - Consensus
-            Action::BroadcastVote { .. } => "BroadcastVote",
+            Action::SignAndBroadcastBlockVote { .. } => "SignAndBroadcastBlockVote",
 
             // Storage - Execution
             Action::CacheFinalizedWave { .. } => "CacheFinalizedWave",

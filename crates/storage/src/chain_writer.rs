@@ -20,7 +20,7 @@ use std::sync::Arc;
 /// contain the ECs directly) — no separate parameter needed.
 ///
 /// All methods take `&self` — implementations use interior mutability.
-pub trait ChainWriter: Send + Sync {
+pub trait ChainWriter: Send + Sync + 'static {
     /// Opaque handle carrying precomputed commit work.
     ///
     /// For RocksDB this contains a `WriteBatch` + `JvtSnapshot`.

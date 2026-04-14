@@ -46,10 +46,9 @@ pub struct BftMemoryStats {
 /// Production uses ValidatorId (from message signatures) and PeerId (libp2p).
 pub type NodeIndex = u32;
 use hyperscale_types::{
-    block_header_message, committed_block_header_message, Block, BlockHeader, BlockHeight,
-    BlockManifest, BlockVote, Bls12381G1PrivateKey, Bls12381G1PublicKey, CommittedBlockHeader,
-    FinalizedWave, Hash, Provision, QuorumCertificate, ReadyTransactions, RoutableTransaction,
-    ShardGroupId, TopologySnapshot, ValidatorId, VotePower,
+    Block, BlockHeader, BlockHeight, BlockManifest, BlockVote, Bls12381G1PublicKey,
+    CommittedBlockHeader, FinalizedWave, Hash, Provision, QuorumCertificate, ReadyTransactions,
+    RoutableTransaction, ShardGroupId, TopologySnapshot, ValidatorId, VotePower,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -112,9 +111,6 @@ pub struct BftState {
     // ═══════════════════════════════════════════════════════════════════════════
     /// This node's index (deterministic ordering).
     node_index: NodeIndex,
-
-    /// Signing key for votes and proposals.
-    signing_key: Bls12381G1PrivateKey,
 
     // ═══════════════════════════════════════════════════════════════════════════
     // Chain State
@@ -296,20 +292,17 @@ impl BftState {
     /// # Arguments
     ///
     /// * `node_index` - Deterministic node index for ordering
-    /// * `signing_key` - Key for signing votes and proposals
     /// * `topology` - Network topology
     /// * `config` - BFT configuration
     /// * `recovered` - State recovered from storage. Use `RecoveredState::default()` for fresh start.
     pub fn new(
         node_index: NodeIndex,
-        signing_key: Bls12381G1PrivateKey,
         _topology: &TopologySnapshot,
         config: BftConfig,
         recovered: RecoveredState,
     ) -> Self {
         Self {
             node_index,
-            signing_key,
             view: 0,
             view_at_height_start: 0,
             committed_height: recovered.committed_height,
@@ -618,25 +611,6 @@ impl BftState {
     /// - We receive a valid header (rate-limited per height/round)
     fn record_leader_activity(&mut self) {
         self.last_leader_activity = Some(self.now);
-    }
-
-    /// Sign a block header for gossip broadcast.
-    ///
-    /// Produces a BLS signature over the domain-separated block header message,
-    /// enabling receivers to verify the proposal came from the claimed proposer
-    /// without relying on transport-level identity.
-    fn sign_block_header(
-        &self,
-        header: &BlockHeader,
-        block_hash: Hash,
-    ) -> hyperscale_types::Bls12381G2Signature {
-        let msg = block_header_message(
-            header.shard_group_id,
-            header.height.0,
-            header.round,
-            &block_hash,
-        );
-        self.signing_key.sign_v1(&msg)
     }
 
     /// Record leader activity from receiving a block header.
@@ -1167,22 +1141,14 @@ impl BftState {
                 .insert(block_hash, (*constructed).clone());
         }
 
-        // Create gossip message (fallback blocks have no transactions)
-        let sig = self.sign_block_header(&header, block_hash);
-        let gossip = hyperscale_messages::BlockHeaderNotification::new(
-            header,
-            BlockManifest::default(),
-            sig,
-        );
-
         // Track proposal time for rate limiting
 
         // Record leader activity - we are producing blocks
         self.record_leader_activity();
 
         actions.push(Action::BroadcastBlockHeader {
-            shard: topology.local_shard(),
-            header: Box::new(gossip),
+            header: Box::new(header),
+            manifest: Box::new(BlockManifest::default()),
         });
 
         // Vote for our own fallback block
@@ -1281,22 +1247,14 @@ impl BftState {
                 .insert(block_hash, (*constructed).clone());
         }
 
-        // Create gossip message (sync blocks have no transactions)
-        let sig = self.sign_block_header(&header, block_hash);
-        let gossip = hyperscale_messages::BlockHeaderNotification::new(
-            header,
-            BlockManifest::default(),
-            sig,
-        );
-
         // Track proposal time for rate limiting
 
         // Record leader activity - we are producing blocks
         self.record_leader_activity();
 
         actions.push(Action::BroadcastBlockHeader {
-            shard: topology.local_shard(),
-            header: Box::new(gossip),
+            header: Box::new(header),
+            manifest: Box::new(BlockManifest::default()),
         });
 
         // Vote for our own sync block
@@ -1379,13 +1337,10 @@ impl BftState {
             "Re-proposing vote-locked block after view change (keeping original round)"
         );
 
-        // Create and broadcast the gossip message - include commitment proofs for ordering validation
-        let sig = self.sign_block_header(&header, block_hash);
-        let gossip = hyperscale_messages::BlockHeaderNotification::new(header, manifest, sig);
-
+        // Broadcast the block header and manifest
         actions.push(Action::BroadcastBlockHeader {
-            shard: topology.local_shard(),
-            header: Box::new(gossip),
+            header: Box::new(header),
+            manifest: Box::new(manifest),
         });
 
         // Note: We do NOT create a new vote here - we already voted for this block
@@ -2203,40 +2158,27 @@ impl BftState {
         self.voted_heights.insert(height, (block_hash, round));
 
         let timestamp = self.now.as_millis() as u64;
-        let sign_start = std::time::Instant::now();
-        let vote = BlockVote::new(
-            block_hash,
-            topology.local_shard(),
-            BlockHeight(height),
-            round,
-            topology.local_validator_id(),
-            &self.signing_key,
-            timestamp,
-        );
-        tracing::Span::current().record("sign_us", sign_start.elapsed().as_micros() as u64);
 
         debug!(
             validator = ?topology.local_validator_id(),
             height = height,
             round = round,
             block_hash = ?block_hash,
-            "Created vote"
+            "Emitting vote (signing delegated to crypto pool)"
         );
-
-        // Broadcast vote
-        let gossip = hyperscale_messages::BlockVoteNotification { vote: vote.clone() };
 
         let recipients = self.vote_recipients(topology, height, round);
 
-        let mut actions = vec![Action::BroadcastVote {
-            vote: gossip,
+        // Emit SignAndBroadcastBlockVote — the io_loop signs on the consensus
+        // crypto pool, broadcasts, and feeds the signed vote back for local
+        // VoteSet tracking via BlockVoteReceived.
+        vec![Action::SignAndBroadcastBlockVote {
+            block_hash,
+            height: BlockHeight(height),
+            round,
+            timestamp,
             recipients,
-        }];
-
-        // Also process our own vote locally
-        actions.extend(self.on_block_vote_internal(topology, vote));
-
-        actions
+        }]
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -2758,20 +2700,15 @@ impl BftState {
             return vec![];
         }
 
-        let sig = self.sign_block_header(&block.header, block_hash);
-        let gossip = hyperscale_messages::BlockHeaderNotification::new(
-            block.header.clone(),
-            pending_block.manifest().clone(),
-            sig,
-        );
+        let manifest = pending_block.manifest().clone();
 
         self.pending_blocks.insert(block_hash, pending_block);
         self.fetch.track(block_hash, self.now);
         self.record_leader_activity();
 
         let mut actions = vec![Action::BroadcastBlockHeader {
-            shard: topology.local_shard(),
-            header: Box::new(gossip),
+            header: Box::new(block.header.clone()),
+            manifest: Box::new(manifest),
         }];
 
         // Vote for our own block
@@ -3320,19 +3257,7 @@ impl BftState {
                     block.header.clone(),
                     current_qc.clone(),
                 );
-                let cbh_msg = committed_block_header_message(
-                    committed_header.header.shard_group_id,
-                    committed_header.header.height.0,
-                    &committed_header.header.hash(),
-                );
-                let cbh_sig = self.signing_key.sign_v1(&cbh_msg);
-                actions.push(Action::BroadcastCommittedBlockHeader {
-                    gossip: hyperscale_messages::CommittedBlockHeaderGossip {
-                        committed_header,
-                        sender: topology.local_validator_id(),
-                        sender_signature: cbh_sig,
-                    },
-                });
+                actions.push(Action::BroadcastCommittedBlockHeader { committed_header });
             }
 
             // Check if the next height is buffered
@@ -4763,11 +4688,11 @@ impl BftState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hyperscale_types::TopologySnapshot;
     use hyperscale_types::{
         batch_verify_bls_same_message, generate_bls_keypair, verify_bls12381_v1,
         zero_bls_signature, Bls12381G2Signature, SignerBitfield, ValidatorInfo, ValidatorSet,
     };
+    use hyperscale_types::{Bls12381G1PrivateKey, TopologySnapshot};
 
     fn make_test_state() -> (BftState, TopologySnapshot) {
         make_test_state_with_validators(4)
@@ -4791,13 +4716,8 @@ mod tests {
         // Create topology
         let topology = TopologySnapshot::new(ValidatorId(0), 1, validator_set);
 
-        // Clone key bytes to create a new keypair since Bls12381G1PrivateKey doesn't impl Clone
-        let key_bytes = keys[0].to_bytes();
-        let signing_key = Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes");
-
         let state = BftState::new(
             0,
-            signing_key,
             &topology,
             BftConfig::default(),
             RecoveredState::default(),
@@ -5035,10 +4955,6 @@ mod tests {
         let topology = TopologySnapshot::new(ValidatorId(1), 1, validator_set);
         let mut state = BftState::new(
             1,
-            {
-                let key_bytes = keys[1].to_bytes();
-                Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes")
-            },
             &topology,
             BftConfig::default(),
             RecoveredState::default(),
@@ -5124,10 +5040,6 @@ mod tests {
         let topology = TopologySnapshot::new(ValidatorId(1), 1, validator_set);
         let mut state = BftState::new(
             1,
-            {
-                let key_bytes = keys[1].to_bytes();
-                Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes")
-            },
             &topology,
             BftConfig::default(),
             RecoveredState::default(),
@@ -5198,7 +5110,7 @@ mod tests {
         // Should produce a vote (BroadcastVote)
         let has_vote = actions
             .iter()
-            .any(|a| matches!(a, Action::BroadcastVote { .. }));
+            .any(|a| matches!(a, Action::SignAndBroadcastBlockVote { .. }));
         assert!(has_vote, "Should broadcast vote after QC verified");
     }
 
@@ -5220,10 +5132,6 @@ mod tests {
         let topology = TopologySnapshot::new(ValidatorId(1), 1, validator_set);
         let mut state = BftState::new(
             1,
-            {
-                let key_bytes = keys[1].to_bytes();
-                Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes")
-            },
             &topology,
             BftConfig::default(),
             RecoveredState::default(),
@@ -5321,10 +5229,6 @@ mod tests {
         let topology = TopologySnapshot::new(ValidatorId(1), 1, validator_set);
         let mut state = BftState::new(
             1,
-            {
-                let key_bytes = keys[1].to_bytes();
-                Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes")
-            },
             &topology,
             BftConfig::default(),
             RecoveredState::default(),
@@ -5370,7 +5274,7 @@ mod tests {
         // Should directly vote (BroadcastVote)
         let has_vote = actions
             .iter()
-            .any(|a| matches!(a, Action::BroadcastVote { .. }));
+            .any(|a| matches!(a, Action::SignAndBroadcastBlockVote { .. }));
         assert!(has_vote, "Should vote directly for genesis QC block");
     }
 
@@ -5409,10 +5313,6 @@ mod tests {
         let topology = TopologySnapshot::new(ValidatorId(2), 1, validator_set);
         let mut state = BftState::new(
             2,
-            {
-                let key_bytes = keys[2].to_bytes();
-                Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes")
-            },
             &topology,
             BftConfig::default(),
             RecoveredState::default(),
@@ -5579,10 +5479,6 @@ mod tests {
         let topology = TopologySnapshot::new(ValidatorId(0), 1, validator_set);
         let state = BftState::new(
             0,
-            {
-                let key_bytes = keys[0].to_bytes();
-                Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes")
-            },
             &topology,
             BftConfig::default(),
             RecoveredState::default(),
@@ -6053,7 +5949,7 @@ mod tests {
 
         // Extract the header from the broadcast
         if let Some(Action::BroadcastBlockHeader { header: gossip, .. }) = broadcast_action {
-            let reproposed_header = &gossip.header;
+            let reproposed_header = gossip.as_ref();
 
             // CRITICAL: The round should be the ORIGINAL round, not the view change round
             assert_eq!(
@@ -6452,10 +6348,6 @@ mod tests {
         let topology = TopologySnapshot::new(ValidatorId(0), 1, validator_set);
         let mut state = BftState::new(
             0,
-            {
-                let key_bytes = keys[0].to_bytes();
-                Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes")
-            },
             &topology,
             BftConfig::default(),
             RecoveredState::default(),
@@ -6517,19 +6409,16 @@ mod tests {
 
         // Verify it's a fallback block (not the original)
         if let Some(Action::BroadcastBlockHeader { header: gossip, .. }) = broadcast_action {
-            assert!(gossip.header.is_fallback, "Should be a fallback block");
-            assert_eq!(
-                gossip.header.round, 3,
-                "Fallback block should be at new round"
-            );
+            assert!(gossip.is_fallback, "Should be a fallback block");
+            assert_eq!(gossip.round, 3, "Fallback block should be at new round");
             assert_ne!(
-                gossip.header.hash(),
+                gossip.hash(),
                 original_block_hash,
                 "Fallback block should be different from original"
             );
             // Verify the fallback block hash matches what we voted for
             assert_eq!(
-                gossip.header.hash(),
+                gossip.hash(),
                 *new_block_hash,
                 "Fallback block hash should match our vote"
             );
@@ -6538,7 +6427,7 @@ mod tests {
         // Should have vote action (we vote for our own fallback)
         let has_vote = actions
             .iter()
-            .any(|a| matches!(a, Action::BroadcastVote { .. }));
+            .any(|a| matches!(a, Action::SignAndBroadcastBlockVote { .. }));
         assert!(has_vote, "Should vote for own fallback block");
     }
 
@@ -6562,10 +6451,6 @@ mod tests {
         let topology = TopologySnapshot::new(ValidatorId(0), 1, validator_set);
         let mut state = BftState::new(
             0,
-            {
-                let key_bytes = keys[0].to_bytes();
-                Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes")
-            },
             &topology,
             BftConfig::default(),
             RecoveredState::default(),
@@ -6590,17 +6475,14 @@ mod tests {
 
         // Extract and verify it's a fallback block
         if let Some(Action::BroadcastBlockHeader { header: gossip, .. }) = broadcast_action {
-            assert!(
-                gossip.header.is_fallback,
-                "Block should be marked as fallback"
-            );
-            assert_eq!(gossip.header.round, 3, "Block should be at round 3");
+            assert!(gossip.is_fallback, "Block should be marked as fallback");
+            assert_eq!(gossip.round, 3, "Block should be at round 3");
         }
 
         // Should also have a vote action (we vote for our own fallback block)
         let has_vote = actions
             .iter()
-            .any(|a| matches!(a, Action::BroadcastVote { .. }));
+            .any(|a| matches!(a, Action::SignAndBroadcastBlockVote { .. }));
         assert!(has_vote, "Should create vote for own fallback block");
     }
 
@@ -6966,10 +6848,6 @@ mod tests {
         let topology = TopologySnapshot::new(ValidatorId(0), 1, validator_set);
         let mut state = BftState::new(
             1,
-            {
-                let key_bytes = keys[0].to_bytes();
-                Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes")
-            },
             &topology,
             BftConfig::default(),
             RecoveredState::default(),
@@ -7083,7 +6961,7 @@ mod tests {
         // Should emit vote-related actions instead (BroadcastVote)
         let has_vote = actions2
             .iter()
-            .any(|a| matches!(a, Action::BroadcastVote { .. }));
+            .any(|a| matches!(a, Action::SignAndBroadcastBlockVote { .. }));
         assert!(
             has_vote,
             "Should proceed directly to voting when QC already verified"
@@ -7341,16 +7219,7 @@ mod tests {
             ..BftConfig::default()
         };
 
-        let mut state = BftState::new(
-            0,
-            {
-                let key_bytes = keys[0].to_bytes();
-                Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes")
-            },
-            &topology,
-            config,
-            RecoveredState::default(),
-        );
+        let mut state = BftState::new(0, &topology, config, RecoveredState::default());
 
         // Set current time and simulate that QC formed 200ms ago
         state.set_time(Duration::from_millis(1000));
@@ -7408,16 +7277,7 @@ mod tests {
             ..BftConfig::default()
         };
 
-        let mut state = BftState::new(
-            0,
-            {
-                let key_bytes = keys[0].to_bytes();
-                Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes")
-            },
-            &topology,
-            config,
-            RecoveredState::default(),
-        );
+        let mut state = BftState::new(0, &topology, config, RecoveredState::default());
 
         // QC just now (0ms ago) - normally would be rate limited
         state.set_time(Duration::from_millis(1000));
@@ -7720,26 +7580,26 @@ mod tests {
 
         // Verify the block is empty (sync block)
         let block_gossip = actions.iter().find_map(|a| {
-            if let Action::BroadcastBlockHeader { header: gossip, .. } = a {
-                Some(gossip)
+            if let Action::BroadcastBlockHeader { header, manifest } = a {
+                Some((header, manifest))
             } else {
                 None
             }
         });
 
-        let gossip = block_gossip.expect("Should have block header gossip");
+        let (header, manifest) = block_gossip.expect("Should have block header gossip");
         assert!(
-            gossip.manifest.tx_hashes.is_empty(),
+            manifest.tx_hashes.is_empty(),
             "Sync block should have no transactions"
         );
         assert!(
-            gossip.manifest.cert_hashes.is_empty(),
+            manifest.cert_hashes.is_empty(),
             "Sync block should have no certificates"
         );
 
         // Verify is_fallback is false (sync blocks are not fallback blocks)
         assert!(
-            !gossip.header.is_fallback,
+            !header.is_fallback,
             "Sync block should not be marked as fallback"
         );
     }
@@ -7783,12 +7643,12 @@ mod tests {
 
         // Sync blocks use current time, NOT inherited timestamp
         assert_eq!(
-            gossip.header.timestamp,
+            gossip.timestamp,
             current_time.as_millis() as u64,
             "Sync block should use current timestamp, not parent's"
         );
         assert_ne!(
-            gossip.header.timestamp, old_timestamp,
+            gossip.timestamp, old_timestamp,
             "Sync block should NOT inherit parent timestamp like fallback blocks"
         );
     }
@@ -7833,7 +7693,7 @@ mod tests {
         // Should have created a vote
         let has_vote = actions
             .iter()
-            .any(|a| matches!(a, Action::BroadcastVote { .. }));
+            .any(|a| matches!(a, Action::SignAndBroadcastBlockVote { .. }));
         assert!(
             has_vote,
             "Syncing validator should still be able to vote for others' blocks"
@@ -7917,7 +7777,7 @@ mod tests {
         assert!(
             actions
                 .iter()
-                .any(|a| matches!(a, Action::BroadcastVote { .. })),
+                .any(|a| matches!(a, Action::SignAndBroadcastBlockVote { .. })),
             "Should vote for block A"
         );
 
@@ -7926,7 +7786,7 @@ mod tests {
         assert!(
             !actions
                 .iter()
-                .any(|a| matches!(a, Action::BroadcastVote { .. })),
+                .any(|a| matches!(a, Action::SignAndBroadcastBlockVote { .. })),
             "Should NOT vote for block B (vote locked to A)"
         );
 
@@ -8097,8 +7957,8 @@ mod tests {
         let sync_header = sync_actions
             .iter()
             .find_map(|a| {
-                if let Action::BroadcastBlockHeader { header: gossip, .. } = a {
-                    Some(&gossip.header)
+                if let Action::BroadcastBlockHeader { header, .. } = a {
+                    Some(header.as_ref())
                 } else {
                     None
                 }
@@ -8108,8 +7968,8 @@ mod tests {
         let fallback_header = fallback_actions
             .iter()
             .find_map(|a| {
-                if let Action::BroadcastBlockHeader { header: gossip, .. } = a {
-                    Some(&gossip.header)
+                if let Action::BroadcastBlockHeader { header, .. } = a {
+                    Some(header.as_ref())
                 } else {
                     None
                 }
@@ -8176,7 +8036,7 @@ mod tests {
         // Verify we also voted for our own block
         let has_vote = actions1
             .iter()
-            .any(|a| matches!(a, Action::BroadcastVote { .. }));
+            .any(|a| matches!(a, Action::SignAndBroadcastBlockVote { .. }));
         assert!(
             has_vote,
             "Syncing validator should vote for their own sync block"
@@ -8280,16 +8140,7 @@ mod tests {
 
         let config = BftConfig::default().with_view_change_timeout_increment(Duration::ZERO);
 
-        let mut state = BftState::new(
-            0,
-            {
-                let key_bytes = keys[0].to_bytes();
-                Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes")
-            },
-            &topology,
-            config,
-            RecoveredState::default(),
-        );
+        let mut state = BftState::new(0, &topology, config, RecoveredState::default());
 
         state.set_time(Duration::from_secs(100));
         let base_timeout = Duration::from_secs(5);
@@ -8386,16 +8237,7 @@ mod tests {
         let config =
             BftConfig::default().with_view_change_timeout_max(Some(Duration::from_secs(10)));
 
-        let mut state = BftState::new(
-            0,
-            {
-                let key_bytes = keys[0].to_bytes();
-                Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes")
-            },
-            &topology,
-            config,
-            RecoveredState::default(),
-        );
+        let mut state = BftState::new(0, &topology, config, RecoveredState::default());
 
         state.set_time(Duration::from_secs(100));
 
@@ -8454,16 +8296,7 @@ mod tests {
         // Configure with no cap (Tendermint behavior)
         let config = BftConfig::default().with_view_change_timeout_max(None);
 
-        let mut state = BftState::new(
-            0,
-            {
-                let key_bytes = keys[0].to_bytes();
-                Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes")
-            },
-            &topology,
-            config,
-            RecoveredState::default(),
-        );
+        let mut state = BftState::new(0, &topology, config, RecoveredState::default());
 
         state.set_time(Duration::from_secs(100));
 

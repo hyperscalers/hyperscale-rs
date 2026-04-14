@@ -350,7 +350,6 @@ impl ProductionRunnerBuilder {
         let state = NodeStateMachine::new(
             0, // node_index not meaningful in production
             topology_state,
-            signing_key,
             bft_config,
             recovered,
             self.mempool_config,

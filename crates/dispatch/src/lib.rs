@@ -23,7 +23,7 @@
 ///
 /// Implementations schedule fire-and-forget closures on appropriate pools.
 /// Results are communicated back via channels captured in the closures.
-pub trait Dispatch: Send + Sync + Clone {
+pub trait Dispatch: Send + Sync + Clone + 'static {
     /// Spawn a consensus-critical crypto task.
     ///
     /// Use for block vote and QC signature verification. These are liveness-critical

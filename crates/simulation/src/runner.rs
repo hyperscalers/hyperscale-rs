@@ -207,8 +207,6 @@ impl SimulationRunner {
                 let state = NodeStateMachine::new(
                     node_index as NodeIndex,
                     topology_state,
-                    // Clone key for state machine (it needs its own copy)
-                    Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes"),
                     BftConfig::default(),
                     RecoveredState::default(),
                     MempoolConfig::default(),

@@ -17,7 +17,7 @@ use std::sync::Arc;
 /// Block and certificate writes happen atomically via `ChainWriter`.
 /// Vote persistence is not needed — in-memory tracking in BFT state
 /// is sufficient (nodes sync past voted heights on restart).
-pub trait ChainReader: Send + Sync {
+pub trait ChainReader: Send + Sync + 'static {
     /// Get a committed block by height.
     fn get_block(&self, height: BlockHeight) -> Option<(Block, QuorumCertificate)>;
 

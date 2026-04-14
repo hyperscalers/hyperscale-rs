@@ -21,10 +21,10 @@ use std::sync::Arc;
 use tracing::{debug, warn};
 impl<S, N, D, E> IoLoop<S, N, D, E>
 where
-    S: ChainWriter + SubstateStore + ChainReader + Send + Sync + 'static,
+    S: ChainWriter + SubstateStore + ChainReader + Send + Sync,
     N: Network,
-    D: Dispatch + 'static,
-    E: Engine + 'static,
+    D: Dispatch,
+    E: Engine,
 {
     // ─── Action Processing ──────────────────────────────────────────────
 
@@ -55,17 +55,82 @@ where
             // ═══════════════════════════════════════════════════════════
             // Network broadcasts — immediate (non-batched)
             // ═══════════════════════════════════════════════════════════
-            Action::BroadcastBlockHeader { shard: _, header } => {
-                self.network.notify(&self.cached_local_peers, &*header);
+            Action::BroadcastBlockHeader { header, manifest } => {
+                // Sign proposal on consensus crypto pool, then broadcast.
+                let signing_key = Arc::clone(&self.signing_key);
+                let network = Arc::clone(&self.network);
+                let local_peers = self.cached_local_peers.clone();
+
+                self.dispatch.spawn_consensus_crypto(move || {
+                    let block_hash = header.hash();
+                    let msg = hyperscale_types::block_header_message(
+                        header.shard_group_id,
+                        header.height.0,
+                        header.round,
+                        &block_hash,
+                    );
+                    let sig = signing_key.sign_v1(&msg);
+                    let gossip =
+                        hyperscale_messages::BlockHeaderNotification::new(*header, *manifest, sig);
+                    network.notify(&local_peers, &gossip);
+                });
             }
-            Action::BroadcastVote { vote, recipients } => {
-                self.network.notify(&recipients, &vote);
+            Action::SignAndBroadcastBlockVote {
+                block_hash,
+                height,
+                round,
+                timestamp,
+                recipients,
+            } => {
+                // Sign vote on consensus crypto pool, then broadcast + loopback.
+                let signing_key = Arc::clone(&self.signing_key);
+                let network = Arc::clone(&self.network);
+                let event_tx = self.event_sender.clone();
+                let local_shard = self.local_shard;
+                let validator_id = self.validator_id;
+
+                self.dispatch.spawn_consensus_crypto(move || {
+                    let vote = hyperscale_types::BlockVote::new(
+                        block_hash,
+                        local_shard,
+                        height,
+                        round,
+                        validator_id,
+                        &signing_key,
+                        timestamp,
+                    );
+                    let gossip = hyperscale_messages::BlockVoteNotification { vote: vote.clone() };
+                    network.notify(&recipients, &gossip);
+
+                    // Feed our own signed vote back for local VoteSet tracking.
+                    let _ = event_tx.send(hyperscale_core::NodeInput::Protocol(
+                        hyperscale_core::ProtocolEvent::BlockVoteReceived { vote },
+                    ));
+                });
             }
             Action::BroadcastTransaction { shard, gossip } => {
                 self.network.broadcast_to_shard(shard, &*gossip);
             }
-            Action::BroadcastCommittedBlockHeader { gossip } => {
-                self.network.broadcast_global(&gossip);
+            Action::BroadcastCommittedBlockHeader { committed_header } => {
+                // Sign committed header on consensus crypto pool, then broadcast.
+                let signing_key = Arc::clone(&self.signing_key);
+                let network = Arc::clone(&self.network);
+                let validator_id = self.validator_id;
+
+                self.dispatch.spawn_consensus_crypto(move || {
+                    let msg = hyperscale_types::committed_block_header_message(
+                        committed_header.header.shard_group_id,
+                        committed_header.header.height.0,
+                        &committed_header.header.hash(),
+                    );
+                    let sig = signing_key.sign_v1(&msg);
+                    let gossip = hyperscale_messages::CommittedBlockHeaderGossip {
+                        committed_header,
+                        sender: validator_id,
+                        sender_signature: sig,
+                    };
+                    network.broadcast_global(&gossip);
+                });
             }
 
             // ═══════════════════════════════════════════════════════════
@@ -80,71 +145,85 @@ where
                 tx_outcomes,
                 leader,
             } => {
-                let tx_count = tx_outcomes.len() as u32;
-                // Sign the execution vote inline (BLS signing is fast, ~1ms)
-                let msg = hyperscale_types::exec_vote_message(
-                    vote_height,
-                    &wave_id,
-                    self.local_shard,
-                    &global_receipt_root,
-                    tx_count,
-                );
-                let sig = self.signing_key.sign_v1(&msg);
-                let vote = hyperscale_types::ExecutionVote {
-                    block_hash,
-                    block_height,
-                    vote_height,
-                    wave_id,
-                    shard_group_id: self.local_shard,
-                    global_receipt_root,
-                    tx_count,
-                    tx_outcomes,
-                    validator: self.validator_id,
-                    signature: sig,
-                };
+                // Spawn BLS signing + network send on crypto pool to avoid
+                // blocking the io_loop. The closure owns Arc-cloned handles
+                // to the signing key, network, and event sender.
+                let signing_key = Arc::clone(&self.signing_key);
+                let network = Arc::clone(&self.network);
+                let event_tx = self.event_sender.clone();
+                let local_shard = self.local_shard;
+                let validator_id = self.validator_id;
 
-                // Send vote to the wave leader (unicast).
-                if leader != self.validator_id {
-                    let batch_msg = hyperscale_types::exec_vote_batch_message(
-                        self.local_shard,
-                        std::slice::from_ref(&vote),
+                self.dispatch.spawn_crypto(move || {
+                    let tx_count = tx_outcomes.len() as u32;
+                    let msg = hyperscale_types::exec_vote_message(
+                        vote_height,
+                        &wave_id,
+                        local_shard,
+                        &global_receipt_root,
+                        tx_count,
                     );
-                    let batch_sig = self.signing_key.sign_v1(&batch_msg);
-                    let batch = hyperscale_messages::ExecutionVotesNotification::new(
-                        vec![vote.clone()],
-                        self.validator_id,
-                        batch_sig,
-                    );
-                    self.network.notify(&[leader], &batch);
-                }
+                    let sig = signing_key.sign_v1(&msg);
+                    let vote = hyperscale_types::ExecutionVote {
+                        block_hash,
+                        block_height,
+                        vote_height,
+                        wave_id,
+                        shard_group_id: local_shard,
+                        global_receipt_root,
+                        tx_count,
+                        tx_outcomes,
+                        validator: validator_id,
+                        signature: sig,
+                    };
 
-                // Feed own vote to state machine only if we are the leader.
-                // The leader needs its own vote in the VoteTracker for aggregation.
-                // Non-leaders track retries via PendingVoteRetry in the state machine.
-                if leader == self.validator_id {
-                    let _ = self.event_sender.send(hyperscale_core::NodeInput::Protocol(
-                        hyperscale_core::ProtocolEvent::ExecutionVoteReceived { vote },
-                    ));
-                }
+                    // Send vote to the wave leader (unicast).
+                    if leader != validator_id {
+                        let batch_msg = hyperscale_types::exec_vote_batch_message(
+                            local_shard,
+                            std::slice::from_ref(&vote),
+                        );
+                        let batch_sig = signing_key.sign_v1(&batch_msg);
+                        let batch = hyperscale_messages::ExecutionVotesNotification::new(
+                            vec![vote.clone()],
+                            validator_id,
+                            batch_sig,
+                        );
+                        network.notify(&[leader], &batch);
+                    }
+
+                    // Feed own vote to state machine only if we are the leader.
+                    if leader == validator_id {
+                        let _ = event_tx.send(hyperscale_core::NodeInput::Protocol(
+                            hyperscale_core::ProtocolEvent::ExecutionVoteReceived { vote },
+                        ));
+                    }
+                });
             }
             Action::BroadcastExecutionCertificate {
                 shard: _,
                 certificate,
                 recipients,
             } => {
-                // Each cert already covers a whole wave — send immediately, no accumulator.
-                let cert = std::sync::Arc::unwrap_or_clone(certificate);
-                let msg = hyperscale_types::exec_cert_batch_message(
-                    cert.shard_group_id(),
-                    std::slice::from_ref(&cert),
-                );
-                let sig = self.signing_key.sign_v1(&msg);
-                let batch = hyperscale_messages::ExecutionCertificatesNotification::new(
-                    vec![cert],
-                    self.validator_id,
-                    sig,
-                );
-                self.network.notify(&recipients, &batch);
+                // Spawn BLS signing + network send on crypto pool.
+                let signing_key = Arc::clone(&self.signing_key);
+                let network = Arc::clone(&self.network);
+                let validator_id = self.validator_id;
+
+                self.dispatch.spawn_crypto(move || {
+                    let cert = std::sync::Arc::unwrap_or_clone(certificate);
+                    let msg = hyperscale_types::exec_cert_batch_message(
+                        cert.shard_group_id(),
+                        std::slice::from_ref(&cert),
+                    );
+                    let sig = signing_key.sign_v1(&msg);
+                    let batch = hyperscale_messages::ExecutionCertificatesNotification::new(
+                        vec![cert],
+                        validator_id,
+                        sig,
+                    );
+                    network.notify(&recipients, &batch);
+                });
             }
             Action::TrackExecutionCertificate { certificate } => {
                 let key = (certificate.wave_id.hash(), certificate.wave_id.clone());

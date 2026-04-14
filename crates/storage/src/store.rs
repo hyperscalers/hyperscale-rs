@@ -17,7 +17,7 @@ use radix_substate_store_interface::interface::{DbSortKey, SubstateDatabase};
 ///
 /// Runner storage types (`SimStorage`, `RocksDbStorage`) implement this trait
 /// along with `SubstateDatabase`.
-pub trait SubstateStore: SubstateDatabase + Send + Sync {
+pub trait SubstateStore: SubstateDatabase + Send + Sync + 'static {
     /// The snapshot type returned by this storage.
     type Snapshot<'a>: SubstateDatabase + Send + Sync
     where

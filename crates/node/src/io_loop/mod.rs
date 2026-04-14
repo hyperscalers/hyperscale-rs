@@ -197,7 +197,7 @@ where
     state: NodeStateMachine,
     storage: Arc<S>,
     executor: E,
-    network: N,
+    network: Arc<N>,
     dispatch: D,
     event_sender: crossbeam::channel::Sender<NodeInput>,
 
@@ -295,10 +295,10 @@ where
 
 impl<S, N, D, E> IoLoop<S, N, D, E>
 where
-    S: ChainWriter + SubstateStore + ChainReader + Send + Sync + 'static,
+    S: ChainWriter + SubstateStore + ChainReader + Send + Sync,
     N: Network,
-    D: Dispatch + 'static,
-    E: Engine + 'static,
+    D: Dispatch,
+    E: Engine,
 {
     /// Create a new IoLoop.
     #[allow(clippy::too_many_arguments)]
@@ -337,7 +337,7 @@ where
             state,
             storage: Arc::new(storage),
             executor,
-            network,
+            network: Arc::new(network),
             dispatch,
             event_sender,
             signing_key: Arc::new(signing_key),
@@ -965,6 +965,8 @@ where
     // ─── Provision Broadcasting ────────────────────────────────────────
 
     /// Sign and broadcast provision batches to target shard committees.
+    ///
+    /// Signing is dispatched to the crypto pool to avoid blocking the io_loop.
     pub(crate) fn broadcast_provisions(
         &self,
         batches: Vec<(
@@ -974,40 +976,47 @@ where
         )>,
         block_timestamp: u64,
     ) {
-        for (shard, batch, recipients) in batches {
-            let block_height = batch.block_height;
-            let source_shard = batch.source_shard;
-            let proof = batch.proof.clone();
-            let provisions: Vec<hyperscale_types::StateProvision> = batch
-                .transactions
-                .into_iter()
-                .map(|tx| hyperscale_types::StateProvision {
-                    transaction_hash: tx.tx_hash,
-                    target_shard: shard,
-                    source_shard,
+        let signing_key = Arc::clone(&self.signing_key);
+        let network = Arc::clone(&self.network);
+        let local_shard = self.local_shard;
+        let validator_id = self.validator_id;
+
+        self.dispatch.spawn_crypto(move || {
+            for (shard, batch, recipients) in batches {
+                let block_height = batch.block_height;
+                let source_shard = batch.source_shard;
+                let proof = batch.proof.clone();
+                let provisions: Vec<hyperscale_types::StateProvision> = batch
+                    .transactions
+                    .into_iter()
+                    .map(|tx| hyperscale_types::StateProvision {
+                        transaction_hash: tx.tx_hash,
+                        target_shard: shard,
+                        source_shard,
+                        block_height,
+                        block_timestamp,
+                        entries: std::sync::Arc::new(tx.entries),
+                    })
+                    .collect();
+                if provisions.is_empty() {
+                    continue;
+                }
+                let msg = hyperscale_types::state_provision_batch_message(
+                    local_shard,
+                    shard,
                     block_height,
-                    block_timestamp,
-                    entries: std::sync::Arc::new(tx.entries),
-                })
-                .collect();
-            if provisions.is_empty() {
-                continue;
+                    &provisions,
+                );
+                let sig = signing_key.sign_v1(&msg);
+                let notification = hyperscale_messages::StateProvisionNotification::new(
+                    provisions,
+                    proof,
+                    validator_id,
+                    sig,
+                );
+                network.notify(&recipients, &notification);
             }
-            let msg = hyperscale_types::state_provision_batch_message(
-                self.local_shard,
-                shard,
-                block_height,
-                &provisions,
-            );
-            let sig = self.signing_key.sign_v1(&msg);
-            let notification = hyperscale_messages::StateProvisionNotification::new(
-                provisions,
-                proof,
-                self.validator_id,
-                sig,
-            );
-            self.network.notify(&recipients, &notification);
-        }
+        });
     }
 
     // ─── Metrics ────────────────────────────────────────────────────────

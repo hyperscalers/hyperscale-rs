@@ -102,7 +102,7 @@ struct ExecutorCaches {
 /// [`SimulationEngine`](crate::SimulationEngine) which wraps `RadixExecutor`
 /// with per-transaction result caching so identical executions across
 /// validators in the same shard only run once.
-pub trait Engine: Clone + Send + Sync {
+pub trait Engine: Clone + Send + Sync + 'static {
     /// Execute single-shard transactions (READ-ONLY).
     fn execute_single_shard<S: SubstateStore>(
         &self,

@@ -12,10 +12,10 @@ use std::sync::Arc;
 
 impl<S, N, D, E> IoLoop<S, N, D, E>
 where
-    S: ChainWriter + SubstateStore + ChainReader + Send + Sync + 'static,
+    S: ChainWriter + SubstateStore + ChainReader + Send + Sync,
     N: Network,
-    D: Dispatch + 'static,
-    E: Engine + 'static,
+    D: Dispatch,
+    E: Engine,
 {
     // ─── Transaction Validation Batching ──────────────────────────────
 

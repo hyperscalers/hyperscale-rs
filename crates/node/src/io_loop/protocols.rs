@@ -19,10 +19,10 @@ use std::time::Duration;
 
 impl<S, N, D, E> IoLoop<S, N, D, E>
 where
-    S: ChainWriter + SubstateStore + ChainReader + Send + Sync + 'static,
+    S: ChainWriter + SubstateStore + ChainReader + Send + Sync,
     N: Network,
-    D: Dispatch + 'static,
-    E: Engine + 'static,
+    D: Dispatch,
+    E: Engine,
 {
     /// Interval for the periodic fetch tick timer.
     const FETCH_TICK_INTERVAL: Duration = Duration::from_millis(200);

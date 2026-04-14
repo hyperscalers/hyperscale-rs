@@ -8,9 +8,8 @@ use hyperscale_provisions::ProvisionCoordinator;
 use hyperscale_remote_headers::RemoteHeaderCoordinator;
 use hyperscale_topology::TopologyState;
 use hyperscale_types::{
-    Block, BlockHeader, BlockHeight, BlockManifest, Bls12381G1PrivateKey, FinalizedWave, Hash,
-    Provision, QuorumCertificate, ReadyTransactions, RoutableTransaction, ShardGroupId,
-    TopologySnapshot,
+    Block, BlockHeader, BlockHeight, BlockManifest, FinalizedWave, Hash, Provision,
+    QuorumCertificate, ReadyTransactions, RoutableTransaction, ShardGroupId, TopologySnapshot,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -90,21 +89,14 @@ impl NodeStateMachine {
     pub fn new(
         node_index: NodeIndex,
         topology: TopologyState,
-        signing_key: Bls12381G1PrivateKey,
         bft_config: BftConfig,
         recovered: RecoveredState,
         mempool_config: MempoolConfig,
     ) -> Self {
-        // Clone key bytes to create a new keypair since Bls12381G1PrivateKey doesn't impl Clone
-        let key_bytes = signing_key.to_bytes();
-        let bft_signing_key =
-            Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes");
-
         Self {
             node_index,
             bft: BftState::new(
                 node_index,
-                bft_signing_key,
                 topology.snapshot(),
                 bft_config.clone(),
                 recovered,
