@@ -969,13 +969,9 @@ fn test_wave_leader_failure_recovers_via_rotation() {
             .get_free_xrd_from_faucet()
             .try_deposit_entire_worktop_or_abort(to_account, None)
             .build();
-        let notarized = sign_and_notarize(
-            manifest,
-            &simulator_network(),
-            300 + isolated_node as u32,
-            &signer,
-        )
-        .expect("should sign");
+        let notarized =
+            sign_and_notarize(manifest, &simulator_network(), 300 + isolated_node, &signer)
+                .expect("should sign");
         let transaction: RoutableTransaction = notarized.try_into().expect("valid transaction");
         let tx_hash = transaction.hash();
 
