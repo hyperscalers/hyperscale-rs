@@ -616,23 +616,26 @@ impl ExecutionState {
     ///
     /// This is the SINGLE path to execution voting. Call after conflicts
     /// have been processed so accumulator state is deterministic at this height.
-    /// Each vote is sent to all local committee members (N→N).
+    /// Each vote is sent to the wave leader (unicast).
     ///
     /// The vote_height is now a relative offset determined by the accumulator
     /// (lowest height where all txs are coverable), not passed in externally.
     pub fn emit_vote_actions(&mut self, topology: &TopologySnapshot) -> Vec<Action> {
-        let local_committee = topology.local_committee().to_vec();
+        let committee = topology.local_committee().to_vec();
         let mut actions: Vec<Action> = self
             .scan_complete_waves()
             .into_iter()
-            .map(|completion| Action::SignAndSendExecutionVote {
-                block_hash: completion.block_hash,
-                block_height: completion.block_height,
-                vote_height: completion.vote_height,
-                wave_id: completion.wave_id,
-                global_receipt_root: completion.global_receipt_root,
-                tx_outcomes: completion.tx_outcomes,
-                recipients: local_committee.clone(),
+            .map(|completion| {
+                let leader = hyperscale_types::wave_leader(&completion.wave_id, &committee);
+                Action::SignAndSendExecutionVote {
+                    block_hash: completion.block_hash,
+                    block_height: completion.block_height,
+                    vote_height: completion.vote_height,
+                    wave_id: completion.wave_id,
+                    global_receipt_root: completion.global_receipt_root,
+                    tx_outcomes: completion.tx_outcomes,
+                    leader,
+                }
             })
             .collect();
         // Emit wave-ready notifications (buffered during scan_complete_waves).

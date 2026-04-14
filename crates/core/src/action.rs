@@ -172,11 +172,11 @@ pub enum Action {
     // ═══════════════════════════════════════════════════════════════════════
     // Network: Execution Layer (domain-specific, batchable by runner)
     // ═══════════════════════════════════════════════════════════════════════
-    /// Sign and send an execution vote to all local committee members.
+    /// Sign and send an execution vote to the wave leader for aggregation.
     ///
     /// Emitted by the state machine when a wave completes (all txs executed).
     /// The io_loop signs the vote (it owns the signing key) and sends it to
-    /// all local committee members (N→N).
+    /// the wave leader (unicast). The leader aggregates 2f+1 votes into an EC.
     SignAndSendExecutionVote {
         block_hash: Hash,
         block_height: u64,
@@ -184,11 +184,11 @@ pub enum Action {
         vote_height: u64,
         wave_id: WaveId,
         global_receipt_root: Hash,
-        /// Per-tx outcomes in wave order. Carried on the vote so every
-        /// aggregator can extract them directly when building the EC.
+        /// Per-tx outcomes in wave order. Carried on the vote so the
+        /// leader can extract them directly when building the EC.
         tx_outcomes: Vec<TxOutcome>,
-        /// All local committee members — every validator aggregates locally.
-        recipients: Vec<ValidatorId>,
+        /// The wave leader who collects and aggregates votes for this wave.
+        leader: ValidatorId,
     },
 
     /// Broadcast an execution certificate to remote participating shards.
