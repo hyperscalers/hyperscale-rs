@@ -80,6 +80,7 @@ pub struct ExecutionMemoryStats {
     pub accumulators: usize,
     pub vote_trackers: usize,
     pub early_votes: usize,
+    pub early_wave_attestations: usize,
     pub wave_certificate_trackers: usize,
     pub expected_exec_certs: usize,
 }
@@ -1814,11 +1815,37 @@ impl ExecutionState {
         });
         let pruned_ev = before_ev - self.early_votes.len();
 
-        if pruned_acc > 0 || pruned_vt > 0 || pruned_ev > 0 {
+        // Prune orphaned early wave attestations.
+        // Entries are keyed by tx_hash. A tx_hash with a wave_assignment has
+        // been committed and should have been consumed during replay — any
+        // lingering entries are stale leftovers. Entries without a
+        // wave_assignment belong to transactions whose block was never committed
+        // (orphaned blocks, sync gaps); prune those too since they cannot be
+        // replayed.
+        //
+        // We keep entries where the tx_hash is NOT yet in wave_assignments AND
+        // the block hasn't had a chance to commit. Since we don't track
+        // insertion time for the new HashMap type, we use a conservative
+        // heuristic: if any EC in the entry references a wave whose
+        // block_height is within 50 blocks of committed_height, keep it.
+        let before_ewa = self.early_wave_attestations.len();
+        self.early_wave_attestations.retain(|tx_hash, ecs| {
+            // If this tx has a wave assignment, the attestation should have
+            // been consumed during on_block_committed replay. Safe to prune.
+            if self.wave_assignments.contains_key(tx_hash) {
+                return false;
+            }
+            // No wave assignment — keep if any referenced EC is recent enough.
+            ecs.iter().any(|ec| ec.wave_id.block_height > ev_cutoff)
+        });
+        let pruned_ewa = before_ewa - self.early_wave_attestations.len();
+
+        if pruned_acc > 0 || pruned_vt > 0 || pruned_ev > 0 || pruned_ewa > 0 {
             tracing::debug!(
                 pruned_acc,
                 pruned_vt,
                 pruned_ev,
+                pruned_ewa,
                 "Pruned resolved wave state"
             );
         }
@@ -1960,6 +1987,7 @@ impl ExecutionState {
             accumulators: self.accumulators.len(),
             vote_trackers: self.vote_trackers.len(),
             early_votes: self.early_votes.len(),
+            early_wave_attestations: self.early_wave_attestations.len(),
             wave_certificate_trackers: self.wave_certificate_trackers.len(),
             expected_exec_certs: self.expected_exec_certs.len(),
         }
@@ -2166,6 +2194,126 @@ mod tests {
             results,
             vec![true, false],
             "Second signature should fail verification"
+        );
+    }
+
+    // ========================================================================
+    // Early Wave Attestations Cleanup Tests
+    // ========================================================================
+
+    /// Create a dummy ExecutionCertificate keyed to a specific tx_hash and block height.
+    fn make_test_ec_for_tx(tx_seed: u8, block_height: u64) -> Arc<ExecutionCertificate> {
+        use hyperscale_types::{zero_bls_signature, SignerBitfield, TxOutcome};
+        let tx = test_transaction(tx_seed);
+        Arc::new(ExecutionCertificate::new(
+            WaveId::new(ShardGroupId(0), block_height, BTreeSet::new()),
+            block_height,
+            Hash::ZERO,
+            vec![TxOutcome {
+                tx_hash: tx.hash(),
+                outcome: ExecutionOutcome::Aborted,
+            }],
+            zero_bls_signature(),
+            SignerBitfield::new(1),
+        ))
+    }
+
+    #[test]
+    fn test_early_wave_attestations_pruned_when_stale() {
+        let mut state = make_test_state();
+
+        // Buffer an attestation for a tx at block height 40.
+        let tx = test_transaction(1);
+        let ec = make_test_ec_for_tx(1, 40);
+        state
+            .early_wave_attestations
+            .entry(tx.hash())
+            .or_default()
+            .push(ec);
+        assert_eq!(state.early_wave_attestations.len(), 1);
+
+        // Advance to height 100 (cutoff = 50, EC at height 40 is stale).
+        state.committed_height = 100;
+        state.prune_execution_state();
+
+        assert_eq!(
+            state.early_wave_attestations.len(),
+            0,
+            "Stale early wave attestation should be pruned"
+        );
+    }
+
+    #[test]
+    fn test_early_wave_attestations_kept_when_fresh() {
+        let mut state = make_test_state();
+
+        // Buffer an attestation at block height 80.
+        let tx = test_transaction(2);
+        let ec = make_test_ec_for_tx(2, 80);
+        state
+            .early_wave_attestations
+            .entry(tx.hash())
+            .or_default()
+            .push(ec);
+
+        // Advance to height 100 (cutoff = 50, EC at height 80 > 50).
+        state.committed_height = 100;
+        state.prune_execution_state();
+
+        assert_eq!(
+            state.early_wave_attestations.len(),
+            1,
+            "Fresh early wave attestation should be kept"
+        );
+    }
+
+    #[test]
+    fn test_early_wave_attestations_pruned_when_wave_assigned() {
+        let mut state = make_test_state();
+
+        // Buffer an attestation with a recent height (should normally be kept).
+        let tx = test_transaction(3);
+        let tx_hash = tx.hash();
+        let ec = make_test_ec_for_tx(3, 90);
+        state
+            .early_wave_attestations
+            .entry(tx_hash)
+            .or_default()
+            .push(ec);
+
+        // Add a wave assignment for this tx — the attestation should have been
+        // consumed during replay but wasn't (stale leftover).
+        let wave_id = WaveId::new(ShardGroupId(0), 90, BTreeSet::new());
+        state.wave_assignments.insert(tx_hash, wave_id);
+
+        state.committed_height = 100;
+        state.prune_execution_state();
+
+        assert_eq!(
+            state.early_wave_attestations.len(),
+            0,
+            "Attestation for wave-assigned tx should be pruned (stale leftover)"
+        );
+    }
+
+    #[test]
+    fn test_memory_stats_includes_early_wave_attestations() {
+        let mut state = make_test_state();
+
+        for i in 0..3u8 {
+            let tx = test_transaction(10 + i);
+            let ec = make_test_ec_for_tx(10 + i, 50);
+            state
+                .early_wave_attestations
+                .entry(tx.hash())
+                .or_default()
+                .push(ec);
+        }
+
+        let stats = state.memory_stats();
+        assert_eq!(
+            stats.early_wave_attestations, 3,
+            "memory_stats should report early_wave_attestations count"
         );
     }
 }

@@ -1082,6 +1082,7 @@ where
             exec_accumulators: exec_mem.accumulators,
             exec_vote_trackers: exec_mem.vote_trackers,
             exec_early_votes: exec_mem.early_votes,
+            exec_early_wave_attestations: exec_mem.early_wave_attestations,
             exec_wave_certificate_trackers: exec_mem.wave_certificate_trackers,
             exec_expected_exec_certs: exec_mem.expected_exec_certs,
             // Mempool
