@@ -191,10 +191,10 @@ pub enum Action {
         leader: ValidatorId,
     },
 
-    /// Broadcast an execution certificate to remote participating shards.
+    /// Broadcast an execution certificate to local peers or remote shards.
     ///
-    /// Execution certificates cover all transactions in a wave. Recipients are
-    /// the union of all participating shards across all txs in the wave.
+    /// The wave leader broadcasts to both local committee peers (who need the
+    /// EC since they don't aggregate) and remote participating shard committees.
     BroadcastExecutionCertificate {
         shard: ShardGroupId,
         certificate: Arc<ExecutionCertificate>,
@@ -204,10 +204,11 @@ pub enum Action {
 
     /// Cache an aggregated execution certificate for serving fetch requests.
     ///
-    /// Emitted by all validators after cert aggregation. The io_loop stores
-    /// these in the in-memory cache so remote shards can fetch ECs before
-    /// the wave cert is built. Persistence is handled via wave certificates
-    /// in `block.certificates` at commit time.
+    /// Emitted by the wave leader after aggregation and by non-leaders after
+    /// receiving and verifying the EC broadcast. The io_loop stores these in
+    /// the in-memory cache so remote shards can fetch ECs via fallback.
+    /// Persistence is handled via wave certificates in `block.certificates`
+    /// at commit time.
     TrackExecutionCertificate {
         certificate: Arc<ExecutionCertificate>,
     },
@@ -827,7 +828,7 @@ pub enum Action {
     /// Request a missing execution certificate from a source shard.
     ///
     /// Emitted when an expected execution cert hasn't arrived within the timeout.
-    /// Any peer in the source shard can serve the EC (all validators aggregate locally).
+    /// Any peer in the source shard that received the wave leader's EC broadcast can serve it.
     RequestMissingExecutionCert {
         /// The shard that should have sent the execution cert.
         source_shard: ShardGroupId,

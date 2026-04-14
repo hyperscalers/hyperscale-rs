@@ -318,7 +318,8 @@ impl ExecCertFetchProtocol {
                 state.next_retry_at = None;
             }
 
-            // Rotate through peers (all validators have the EC with N→N voting).
+            // Rotate through peers (the wave leader and peers that received the
+            // EC broadcast have it cached via TrackExecutionCertificate).
             let peer = state
                 .peers
                 .iter()
