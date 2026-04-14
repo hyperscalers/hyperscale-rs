@@ -278,6 +278,7 @@ pub fn verify_state_root<S: ChainWriter + SubstateStore>(
     expected_root: Hash,
     receipts: &[ReceiptBundle],
     block_height: u64,
+    pending_snapshots: &[Arc<hyperscale_storage::JvtSnapshot>],
 ) -> StateRootResult<S::PreparedCommit> {
     // Use the stable parent_block_height from the verification pipeline, not
     // storage.jvt_version() which is racy — by the time this runs on the
@@ -288,6 +289,7 @@ pub fn verify_state_root<S: ChainWriter + SubstateStore>(
         parent_block_height,
         receipts,
         block_height,
+        pending_snapshots,
     );
 
     let valid = computed_root == expected_root;
@@ -316,15 +318,16 @@ pub struct ProposalResult<P: Send> {
     pub prepared_commit: Option<P>,
 }
 
-/// Build a proposal block, computing the state root if the JVT is ready.
+/// Build a proposal block, always computing the state root via `prepare_block_commit`.
+///
+/// Uses the overlay (`pending_snapshots`) when the JVT hasn't committed the
+/// parent yet, so certificates are always included when available.
 ///
 /// Algorithm:
-/// 1. Check JVT ready: `storage.state_root_hash() == parent_state_root`
-/// 2. If ready + certs non-empty: `prepare_block_commit()` for certs, get state_root + handle
-/// 3. Else: inherit parent_state_root, empty certs, no handle
-/// 4. Compute tx root: `compute_transaction_root(transactions)`
-/// 5. Build BlockHeader + Block, hash it
-/// 6. Return block, hash, optional prepared commit handle
+/// 1. `prepare_block_commit()` with overlay snapshots → state_root + handle
+/// 2. Compute tx/cert/receipt/provision roots
+/// 3. Build BlockHeader + Block, hash it
+/// 4. Return block, hash, prepared commit handle
 #[allow(clippy::too_many_arguments)]
 pub fn build_proposal<S: ChainWriter + SubstateStore>(
     storage: &S,
@@ -336,6 +339,7 @@ pub fn build_proposal<S: ChainWriter + SubstateStore>(
     timestamp: u64,
     is_fallback: bool,
     parent_state_root: Hash,
+    parent_block_height: u64,
     transactions: Vec<Arc<RoutableTransaction>>,
     certificates: Vec<Arc<WaveCertificate>>,
     receipts: &[ReceiptBundle],
@@ -344,43 +348,26 @@ pub fn build_proposal<S: ChainWriter + SubstateStore>(
     provision_hashes: Vec<Hash>,
     parent_in_flight: u32,
     finalized_tx_count: u32,
+    pending_snapshots: &[Arc<hyperscale_storage::JvtSnapshot>],
 ) -> ProposalResult<S::PreparedCommit> {
-    let current_root = storage.state_root_hash();
-    let jvt_ready = current_root == parent_state_root;
-    let include_certs = jvt_ready && !certificates.is_empty();
-
-    let (state_root, certs_to_include, prepared) = if include_certs {
-        let actual_version = storage.jvt_version();
-        let (root, prepared) =
-            storage.prepare_block_commit(parent_state_root, actual_version, receipts, height.0);
-        (root, certificates, Some(prepared))
-    } else {
-        // Either no certificates, or JVT not ready - inherit parent state
-        if !certificates.is_empty() {
-            tracing::debug!(
-                height = height.0,
-                round = round,
-                skipped_certs = certificates.len(),
-                ?current_root,
-                ?parent_state_root,
-                "JVT not ready - proposing without certificates"
-            );
-        }
-        (parent_state_root, vec![], None)
-    };
+    let (state_root, prepared) = storage.prepare_block_commit(
+        parent_state_root,
+        parent_block_height,
+        receipts,
+        height.0,
+        pending_snapshots,
+    );
 
     let transaction_root = compute_transaction_root(&transactions);
-    let certificate_root = compute_certificate_root(&certs_to_include);
+    let certificate_root = compute_certificate_root(&certificates);
     let local_receipt_root = compute_local_receipt_root(receipts);
     let provision_root = compute_provision_root(&provision_hashes);
 
     // in_flight is deterministic from chain state:
     // parent's in_flight + new transactions committed - transactions finalized by certificates.
-    // Only count finalized txs when certificates are actually included (JVT was ready).
-    let certs_finalized = if include_certs { finalized_tx_count } else { 0 };
     let in_flight = parent_in_flight
         .saturating_add(transactions.len() as u32)
-        .saturating_sub(certs_finalized);
+        .saturating_sub(finalized_tx_count);
 
     let header = BlockHeader {
         shard_group_id: local_shard,
@@ -403,7 +390,7 @@ pub fn build_proposal<S: ChainWriter + SubstateStore>(
     let block = Block {
         header,
         transactions,
-        certificates: certs_to_include,
+        certificates,
     };
 
     let block_hash = block.hash();
@@ -411,6 +398,6 @@ pub fn build_proposal<S: ChainWriter + SubstateStore>(
     ProposalResult {
         block,
         block_hash,
-        prepared_commit: prepared,
+        prepared_commit: Some(prepared),
     }
 }

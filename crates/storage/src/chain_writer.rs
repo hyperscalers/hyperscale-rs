@@ -4,6 +4,7 @@
 //! `prepare_block_commit` returns an opaque `PreparedCommit` handle that
 //! carries precomputed work; `commit_prepared_block` applies it efficiently.
 
+use crate::JvtSnapshot;
 use hyperscale_types::{Block, Hash, QuorumCertificate, ReceiptBundle};
 use std::sync::Arc;
 
@@ -34,10 +35,15 @@ pub trait ChainWriter: Send + Sync + 'static {
     ///
     /// `parent_block_height` is the height of the parent block whose state we
     /// build on. Used as the JVT parent version for `put_at_version`. This
-    /// must be a committed height (tree nodes exist at this version).
+    /// must be a committed height or have its tree nodes provided via
+    /// `pending_snapshots`.
     ///
     /// `block_height` is the height of the block being prepared (used as JVT
     /// new version).
+    ///
+    /// `pending_snapshots` contains JVT snapshots from prior verifications
+    /// that haven't been committed yet. Their tree nodes are overlaid on the
+    /// base store so chained verifications can find parent nodes.
     ///
     /// Returns `(computed_state_root, prepared_commit_handle)`.
     fn prepare_block_commit(
@@ -46,6 +52,7 @@ pub trait ChainWriter: Send + Sync + 'static {
         parent_block_height: u64,
         receipts: &[ReceiptBundle],
         block_height: u64,
+        pending_snapshots: &[Arc<JvtSnapshot>],
     ) -> (Hash, Self::PreparedCommit);
 
     /// Commit a block using precomputed work from `prepare_block_commit`.
@@ -76,6 +83,12 @@ pub trait ChainWriter: Send + Sync + 'static {
         qc: &Arc<QuorumCertificate>,
         receipts: &[ReceiptBundle],
     ) -> Hash;
+
+    /// Extract the JVT snapshot from a prepared commit.
+    ///
+    /// Used by the action handler to collect pending tree nodes from prior
+    /// verifications when dispatching chained `VerifyStateRoot` actions.
+    fn jvt_snapshot(prepared: &Self::PreparedCommit) -> &JvtSnapshot;
 
     /// Memory usage of storage caches in bytes: `(block_cache, memtable)`.
     ///

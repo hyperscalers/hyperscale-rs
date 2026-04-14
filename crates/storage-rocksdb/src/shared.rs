@@ -120,18 +120,24 @@ impl SubstateStore for SharedStorage {
 impl hyperscale_storage::ChainWriter for SharedStorage {
     type PreparedCommit = RocksDbPreparedCommit;
 
+    fn jvt_snapshot(prepared: &Self::PreparedCommit) -> &hyperscale_storage::JvtSnapshot {
+        &prepared.jvt_snapshot
+    }
+
     fn prepare_block_commit(
         &self,
         parent_state_root: Hash,
         parent_block_height: u64,
         receipts: &[hyperscale_types::ReceiptBundle],
         block_height: u64,
+        pending_snapshots: &[std::sync::Arc<hyperscale_storage::JvtSnapshot>],
     ) -> (Hash, Self::PreparedCommit) {
         self.0.prepare_block_commit(
             parent_state_root,
             parent_block_height,
             receipts,
             block_height,
+            pending_snapshots,
         )
     }
 

@@ -309,17 +309,6 @@ impl NodeStateMachine {
         )
     }
 
-    /// Handle JVT state commit completion — forward to BFT.
-    ///
-    /// BFT's verification pipeline tracks the committed JVT root internally.
-    /// Unblocked state root verifications are pushed to the ready queue
-    /// and drained by handle() via drain_ready_state_root_verifications().
-    fn on_state_commit_complete(&mut self, height: u64, state_root: Hash) -> Vec<Action> {
-        self.bft
-            .on_state_commit_complete(self.topology.snapshot(), height, state_root);
-        vec![]
-    }
-
     /// Handle block committed — notify all subsystems in the correct order.
     fn on_block_committed(
         &mut self,
@@ -618,12 +607,11 @@ impl StateMachine for NodeStateMachine {
                 block_hash,
                 height,
                 block,
-                state_root,
                 provision_hashes,
             } => {
-                // JVT unblocking first — unblocks state root verifications for
-                // the next block before subsystem notifications run.
-                self.on_state_commit_complete(height, state_root);
+                // Unblock deferred state root verifications whose parent's
+                // tree nodes are now in the store (needed for sync blocks).
+                self.bft.on_jvt_committed(height);
                 self.on_block_committed(block_hash, height, block, provision_hashes)
             }
 
@@ -771,10 +759,10 @@ impl StateMachine for NodeStateMachine {
         };
 
         // Drain any state root verifications that became ready during this event.
-        // Finalized waves are carried directly from the PendingBlock (proposer's receipts).
         for ready in self.bft.drain_ready_state_root_verifications() {
             actions.push(Action::VerifyStateRoot {
                 block_hash: ready.block_hash,
+                parent_block_hash: ready.parent_block_hash,
                 parent_state_root: ready.parent_state_root,
                 parent_block_height: ready.parent_block_height,
                 expected_root: ready.expected_root,
@@ -782,6 +770,9 @@ impl StateMachine for NodeStateMachine {
                 block_height: ready.block_height,
             });
         }
+
+        // Emit deferred BuildProposal if its parent tree became available.
+        actions.extend(self.bft.take_ready_proposal());
 
         actions
     }

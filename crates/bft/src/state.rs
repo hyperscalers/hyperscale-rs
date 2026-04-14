@@ -321,10 +321,7 @@ impl BftState {
             voted_heights: HashMap::new(),
             received_votes_by_height: HashMap::new(),
             certified_blocks: HashMap::new(),
-            verification: VerificationPipeline::new(
-                recovered.jvt_root.unwrap_or(Hash::ZERO),
-                recovered.committed_height,
-            ),
+            verification: VerificationPipeline::new(recovered.committed_height),
             sync: SyncManager::new(),
             pending_commits: std::collections::BTreeMap::new(),
             pending_commits_awaiting_data: HashMap::new(),
@@ -1031,34 +1028,44 @@ impl BftState {
         // provisions (derived from wave union) and missing execution certificates.
         let waves = hyperscale_types::compute_waves(topology, next_height, &transactions);
 
-        // Always use BuildProposal - the runner handles JVT readiness and timeout.
-        // This ensures transactions are always included regardless of certificate state.
-        // DatabaseUpdates are derived from receipts on the thread pool (not from a local cache).
-        // Include SetTimer to reschedule the proposal timer.
-        vec![
-            Action::SetTimer {
-                id: TimerId::Proposal,
-                duration: self.config.proposal_interval,
-            },
-            Action::BuildProposal {
-                shard_group_id: topology.local_shard(),
-                proposer: topology.local_validator_id(),
-                height: block_height,
-                round,
-                parent_hash,
-                parent_qc: parent_qc.clone(),
-                timestamp,
-                is_fallback: false,
-                parent_state_root,
-                parent_block_height,
-                transactions,
-                finalized_waves: waves_to_propose,
-                waves,
-                provision_batches,
-                parent_in_flight,
-                finalized_tx_count: finalized_tx_count as u32,
-            },
-        ]
+        let proposal_action = Action::BuildProposal {
+            shard_group_id: topology.local_shard(),
+            proposer: topology.local_validator_id(),
+            height: block_height,
+            round,
+            parent_hash,
+            parent_qc: parent_qc.clone(),
+            timestamp,
+            is_fallback: false,
+            parent_state_root,
+            parent_block_height,
+            transactions,
+            finalized_waves: waves_to_propose,
+            waves,
+            provision_batches,
+            parent_in_flight,
+            finalized_tx_count: finalized_tx_count as u32,
+        };
+
+        let mut actions = vec![Action::SetTimer {
+            id: TimerId::Proposal,
+            duration: self.config.proposal_interval,
+        }];
+
+        // Defer BuildProposal if the parent's tree nodes aren't available yet.
+        // The verification pipeline will emit it once the parent is verified
+        // or committed to the tree store.
+        if self
+            .verification
+            .parent_tree_available(parent_block_height, parent_hash)
+        {
+            actions.push(proposal_action);
+        } else {
+            self.verification
+                .defer_proposal(parent_hash, proposal_action);
+        }
+
+        actions
     }
 
     /// Build and broadcast a fallback block during view change.
@@ -2726,57 +2733,9 @@ impl BftState {
     /// Unblocked verifications are pushed to the ready queue; the caller
     /// (`NodeStateMachine`) drains them and computes `merged_updates`.
     ///
-    /// # Arguments
-    /// * `block_height` - The block height (= JVT version) after the commit
-    /// * `state_root` - The JVT root hash after the commit
-    #[instrument(skip(self, _topology), fields(block_height, state_root = ?state_root))]
-    pub fn on_state_commit_complete(
-        &mut self,
-        _topology: &TopologySnapshot,
-        block_height: u64,
-        state_root: Hash,
-    ) {
-        // Only advance forward (avoid out-of-order updates).
-        // Use strict `<` so that same-height updates are accepted: the BFT state
-        // machine advances `committed_height` in `commit_block_and_buffered`
-        // *before* the IO loop commits the JVT and sends `BlockCommitted`.
-        // With `<=` the root update would be silently dropped.
-        if block_height < self.committed_height {
-            return;
-        }
-
-        // Reconcile certified/committed state roots with the JVT's actual root.
-        //
-        // Divergence occurs when a block with certificates gets a QC (setting
-        // certified_state_root to the speculative state_root) but is then
-        // view-changed away before committing. Subsequent cert-free blocks
-        // inherit the stale certified_state_root into their headers. The JVT
-        // never applied those cert changes, so its actual root differs.
-        //
-        // The JVT is the source of truth — it reports the root it actually
-        // computed for this height. Overwrite both tracking roots to match.
-        if state_root != self.certified_state_root {
-            debug!(
-                block_height,
-                jvt_root = ?state_root,
-                certified = ?self.certified_state_root,
-                "Reconciling certified_state_root with JVT actual root"
-            );
-            self.certified_state_root = state_root;
-        }
-        if state_root != self.committed_state_root {
-            self.committed_state_root = state_root;
-        }
-
-        debug!(
-            old_height = self.committed_height,
-            new_height = block_height,
-            new_root = ?state_root,
-            pending_verifications = self.verification.pending_state_root_count(),
-            "JVT state commit complete, checking for unblocked verifications"
-        );
-
-        self.verification.on_jvt_advanced(block_height, state_root);
+    /// A block committed to the tree store — unblock deferred verifications.
+    pub fn on_jvt_committed(&mut self, block_height: u64) {
+        self.verification.on_jvt_committed(block_height);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -3193,21 +3152,14 @@ impl BftState {
             // on PendingBlock) rather than batch data (which may not be fetched
             // for sync/certified blocks). The consumer resolves hashes to batch
             // data via the ProvisionCoordinator.
-            let (block, commit_waves, provision_hashes) =
+            let (block, provision_hashes) =
                 if let Some(block) = self.certified_blocks.get(&current_hash) {
-                    // Certified blocks don't carry finalized waves (committed via sync).
-                    // No manifest available — but certified_blocks are only fallback/sync
-                    // empty blocks which have no provisions.
-                    (Some(block.clone()), vec![], vec![])
+                    (Some(block.clone()), vec![])
                 } else if let Some(pending) = self.pending_blocks.get(&current_hash) {
                     let prov_hashes = pending.manifest().provision_hashes.clone();
-                    (
-                        pending.block().map(|b| (*b).clone()),
-                        pending.finalized_waves(),
-                        prov_hashes,
-                    )
+                    (pending.block().map(|b| (*b).clone()), prov_hashes)
                 } else {
-                    (None, vec![], vec![])
+                    (None, vec![])
                 };
 
             let Some(block) = block else {
@@ -3245,7 +3197,6 @@ impl BftState {
             actions.push(Action::CommitBlock {
                 block: block.clone(),
                 qc: current_qc.clone(),
-                finalized_waves: commit_waves,
                 provision_hashes,
             });
             // Only the block proposer gossips the committed header globally.
@@ -4411,14 +4362,15 @@ impl BftState {
     // ═══════════════════════════════════════════════════════════════════════════
 
     /// Drain state root verifications that are ready to dispatch.
-    ///
-    /// Called by `NodeStateMachine` after each BFT method call. The caller
-    /// computes `merged_updates` from the execution cache for each entry
-    /// and emits `VerifyStateRoot` actions.
     pub fn drain_ready_state_root_verifications(
         &mut self,
     ) -> Vec<crate::verification::ReadyStateRootVerification> {
         self.verification.drain_ready_state_root_verifications()
+    }
+
+    /// Take the ready BuildProposal action if one was unblocked.
+    pub fn take_ready_proposal(&mut self) -> Option<Action> {
+        self.verification.take_ready_proposal()
     }
 
     /// Register committed transactions for execution timeout validation.
@@ -5107,11 +5059,30 @@ mod tests {
         // Now simulate QC signature verified successfully
         let actions = state.on_qc_signature_verified(&topology, block_hash, true);
 
-        // Should produce a vote (BroadcastVote)
+        // QC verified, but state root verification is still pending.
+        // Vote only happens after ALL verifications complete.
         let has_vote = actions
             .iter()
             .any(|a| matches!(a, Action::SignAndBroadcastBlockVote { .. }));
-        assert!(has_vote, "Should broadcast vote after QC verified");
+        assert!(
+            !has_vote,
+            "Should not vote yet — state root verification pending"
+        );
+
+        // Simulate state root verification completing.
+        let vote_actions = state.on_block_root_verified(
+            &topology,
+            hyperscale_core::VerificationKind::StateRoot,
+            block_hash,
+            true,
+        );
+        let has_vote = vote_actions
+            .iter()
+            .any(|a| matches!(a, Action::SignAndBroadcastBlockVote { .. }));
+        assert!(
+            has_vote,
+            "Should broadcast vote after all verifications complete"
+        );
     }
 
     #[test]
@@ -5265,17 +5236,18 @@ mod tests {
             |_| None,
         );
 
-        // Should NOT emit VerifyQcSignature (genesis QC)
+        // Should NOT emit VerifyQcSignature (genesis QC skips signature check)
         let has_verify_qc = actions
             .iter()
             .any(|a| matches!(a, Action::VerifyQcSignature { .. }));
-        assert!(!has_verify_qc, "Genesis QC should skip verification");
+        assert!(
+            !has_verify_qc,
+            "Genesis QC should skip signature verification"
+        );
 
-        // Should directly vote (BroadcastVote)
-        let has_vote = actions
-            .iter()
-            .any(|a| matches!(a, Action::SignAndBroadcastBlockVote { .. }));
-        assert!(has_vote, "Should vote directly for genesis QC block");
+        // Vote is deferred until state root verification completes (handled
+        // by NodeStateMachine draining ready verifications). The test's purpose
+        // is verifying the QC skip — vote flow is covered by integration tests.
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -6949,22 +6921,13 @@ mod tests {
             |_| None,
         );
 
-        // Should NOT emit VerifyQcSignature since QC is already verified
+        // Should NOT emit VerifyQcSignature — QC is cached from first block
         let has_verify_qc2 = actions2
             .iter()
             .any(|a| matches!(a, Action::VerifyQcSignature { .. }));
         assert!(
             !has_verify_qc2,
-            "Second block with same parent QC should skip verification"
-        );
-
-        // Should emit vote-related actions instead (BroadcastVote)
-        let has_vote = actions2
-            .iter()
-            .any(|a| matches!(a, Action::SignAndBroadcastBlockVote { .. }));
-        assert!(
-            has_vote,
-            "Should proceed directly to voting when QC already verified"
+            "Second block with same parent QC should use cached QC verification"
         );
     }
 
@@ -7151,6 +7114,10 @@ mod tests {
         // immediate proposals should be allowed.
 
         let (mut state, topology) = make_test_state();
+        // Simulate committed state up to height 3 so the parent tree is available
+        // for BuildProposal (which defers if parent tree nodes aren't in the store).
+        state.committed_height = 3;
+        state.verification.on_jvt_committed(3);
 
         // Set current time and simulate that enough time passed since last QC
         state.set_time(Duration::from_millis(1000));
@@ -7278,6 +7245,10 @@ mod tests {
         };
 
         let mut state = BftState::new(0, &topology, config, RecoveredState::default());
+        // Simulate committed state up to height 3 so the parent tree is available
+        // for BuildProposal (which defers if parent tree nodes aren't in the store).
+        state.committed_height = 3;
+        state.verification.on_jvt_committed(3);
 
         // QC just now (0ms ago) - normally would be rate limited
         state.set_time(Duration::from_millis(1000));

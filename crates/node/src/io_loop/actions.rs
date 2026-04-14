@@ -292,13 +292,11 @@ where
             Action::CommitBlock {
                 block,
                 qc,
-                finalized_waves,
                 provision_hashes,
             } => {
                 self.accumulate_block_commit(super::PendingCommit::Consensus {
                     block: Arc::new(block),
                     qc: Arc::new(qc),
-                    finalized_waves,
                     provision_hashes,
                 });
             }
@@ -463,9 +461,8 @@ where
 
     /// Flush accumulated block commits and any pending receipt bundles.
     ///
-    /// If all blocks are empty (no certificates), commits synchronously.
-    /// Otherwise spawns a single closure on the execution pool that persists
-    /// receipt bundles first, then commits all blocks sequentially, sending
+    /// Spawns a single closure on the execution pool that persists receipt
+    /// bundles first, then commits all blocks sequentially, sending
     /// `BlockCommitted` events after each.
     ///
     /// Receipt bundles are drained into the same closure because the sync
@@ -504,52 +501,6 @@ where
             }
         }
 
-        let has_non_empty = commits.iter().any(|c| !c.block().certificates.is_empty());
-
-        if !has_non_empty {
-            // All empty blocks — synchronous fast path.
-            // Still advance JVT version so it matches block height.
-
-            // Prune stale prepared_commits that outlived their blocks.
-            let max_height = commits
-                .iter()
-                .map(|c| c.block().header.height.0)
-                .max()
-                .unwrap_or(0);
-            {
-                let mut cache = self.prepared_commits.lock().unwrap();
-                cache.retain(|_, (h, _)| *h > max_height);
-            }
-            for commit in commits {
-                let (block, qc, provision_hashes) = match commit {
-                    super::PendingCommit::Consensus {
-                        block,
-                        qc,
-                        provision_hashes,
-                        ..
-                    } => (block, qc, provision_hashes),
-                    super::PendingCommit::Synced {
-                        block,
-                        qc,
-                        provision_hashes,
-                    } => (block, qc, provision_hashes),
-                };
-                let block_hash = block.hash();
-                let height = block.header.height.0;
-                let result = self.storage.commit_block(&block, &qc, &[]);
-                let _ =
-                    self.event_sender
-                        .send(NodeInput::Protocol(ProtocolEvent::BlockCommitted {
-                            block_hash,
-                            height,
-                            block: Arc::unwrap_or_clone(block),
-                            state_root: result,
-                            provision_hashes,
-                        }));
-            }
-            return;
-        }
-
         // Extract prepared commit handles for each block in the batch,
         // then prune any stale entries at or below the highest committed
         // height.
@@ -559,42 +510,37 @@ where
             .max()
             .unwrap_or(0);
 
-        // Identify blocks that are NOT yet ready to commit. A consensus
-        // block with certificates can commit via prepared_commit (proposer)
-        // or finalized_waves receipts (non-proposer fallback). A sync block
-        // with certificates requires sync_data. Without the appropriate
-        // data, committing would apply empty state updates, diverging the JVT.
+        // Separate consensus and sync commits. Consensus blocks always have
+        // a PreparedCommit (from BuildProposal or VerifyStateRoot). Sync blocks
+        // use commit_block which recomputes state from receipts.
         //
-        // Deferred blocks are put back into pending_block_commits; they will
-        // be retried on the next flush.
+        // Blocks that aren't ready (missing data) are deferred: put back into
+        // pending_block_commits for the next flush. Once any block defers, all
+        // subsequent blocks in the batch defer too (preserves height ordering).
         let mut ready_commits: Vec<super::PendingCommit> = Vec::with_capacity(commits.len());
         let mut prepared_map = Vec::with_capacity(commits.len());
         {
             let mut cache = self.prepared_commits.lock().unwrap();
             let mut deferring = false;
             for commit in commits {
-                let has_certs = !commit.block().certificates.is_empty();
                 let prepared = if !deferring {
                     cache.remove(&commit.block().hash()).map(|(_, p)| p)
                 } else {
                     None
                 };
 
-                let not_ready = has_certs
-                    && match &commit {
-                        super::PendingCommit::Consensus {
-                            finalized_waves, ..
-                        } => {
-                            // Only defer if we have neither a prepared commit nor
-                            // finalized waves with receipts. The proposer provides
-                            // a PreparedCommit; non-proposers use the commit_block
-                            // fallback path which recomputes state from receipts.
-                            prepared.is_none() && finalized_waves.is_empty()
-                        }
-                        super::PendingCommit::Synced { block, .. } => {
-                            !sync_data.contains_key(&block.header.height.0)
-                        }
-                    };
+                let not_ready = match &commit {
+                    // Consensus: need PreparedCommit (always present in normal
+                    // operation — proposer caches from BuildProposal, verifiers
+                    // cache from VerifyStateRoot).
+                    super::PendingCommit::Consensus { .. } => prepared.is_none(),
+                    // Sync: cert-less blocks are always ready. Cert-ful blocks
+                    // need sync_data with receipts.
+                    super::PendingCommit::Synced { block, .. } => {
+                        !block.certificates.is_empty()
+                            && !sync_data.contains_key(&block.header.height.0)
+                    }
+                };
 
                 if deferring || not_ready {
                     if !deferring {
@@ -651,23 +597,17 @@ where
 
                 let prepared = prepared_map[i].take();
 
-                let result = match commit {
+                let _result = match commit {
                     super::PendingCommit::Consensus {
-                        ref block,
-                        ref qc,
-                        ref finalized_waves,
-                        ..
+                        ref block, ref qc, ..
                     } => {
-                        let wave_receipts: Vec<hyperscale_types::ReceiptBundle> = finalized_waves
-                            .iter()
-                            .flat_map(|fw| fw.receipts.iter().cloned())
-                            .collect();
-
-                        if let Some(prepared) = prepared {
-                            storage.commit_prepared_block(prepared, block, qc)
-                        } else {
-                            storage.commit_block(block, qc, &wave_receipts)
-                        }
+                        // Consensus blocks always have a PreparedCommit from
+                        // BuildProposal (proposer) or VerifyStateRoot (verifier).
+                        let prepared = prepared.expect(
+                            "BUG: consensus block without PreparedCommit — \
+                             BuildProposal and VerifyStateRoot should always cache one",
+                        );
+                        storage.commit_prepared_block(prepared, block, qc)
                     }
                     super::PendingCommit::Synced {
                         ref block, ref qc, ..
@@ -758,7 +698,6 @@ where
                     block_hash,
                     height: height.0,
                     block: Arc::unwrap_or_clone(block),
-                    state_root: result,
                     provision_hashes,
                 }));
             }
@@ -962,11 +901,21 @@ where
         let pool = action_handler::dispatch_pool_for(&action)
             .expect("dispatch_delegated_action called for delegated actions only");
 
+        // Extract parent_block_hash for snapshot cache keying (before action moves).
+        let action_parent_block_hash = match &action {
+            Action::VerifyStateRoot {
+                parent_block_hash, ..
+            } => Some(*parent_block_hash),
+            Action::BuildProposal { parent_hash, .. } => Some(*parent_hash),
+            _ => None,
+        };
+
         // Clone cheap shared state for the 'static spawn closure.
         let storage = Arc::clone(&self.storage);
         let executor = self.executor.clone();
         let topology_snapshot = self.topology.load_full();
         let prepared_commits = Arc::clone(&self.prepared_commits);
+        let jvt_snapshot_cache = Arc::clone(&self.jvt_snapshot_cache);
         let event_tx = self.event_sender.clone();
 
         let spawn_fn = move || {
@@ -975,6 +924,7 @@ where
                 storage: &*storage,
                 executor: &executor,
                 topology: &topology_snapshot,
+                jvt_snapshot_cache: &jvt_snapshot_cache,
             };
             if let Some(result) = action_handler::handle_delegated_action(action, &ctx) {
                 if is_execution {
@@ -982,6 +932,15 @@ where
                     metrics::record_execution_latency(elapsed);
                 }
                 if let Some((hash, height, prepared)) = result.prepared_commit {
+                    // Cache the JvtSnapshot with its parent_block_hash so the
+                    // overlay chain can be walked by following parent hashes.
+                    if let Some(parent_hash) = action_parent_block_hash {
+                        let snapshot = Arc::new(S::jvt_snapshot(&prepared).clone());
+                        jvt_snapshot_cache
+                            .lock()
+                            .unwrap()
+                            .insert(hash, (parent_hash, snapshot));
+                    }
                     prepared_commits
                         .lock()
                         .unwrap()

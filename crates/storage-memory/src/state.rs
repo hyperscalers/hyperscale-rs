@@ -61,25 +61,11 @@ impl SharedState {
 
     /// Apply a JVT snapshot directly, inserting precomputed nodes.
     ///
-    /// This is the fast path for block commit when we have a cached snapshot
-    /// from verification. Also stores leaf-to-substate associations for
-    /// historical queries.
+    /// The snapshot's tree nodes are consensus-verified (2f+1 validators
+    /// agreed on the resulting state root). We apply unconditionally —
+    /// the overlay may have computed from a base state ahead of the
+    /// tree store, so base_root mismatches are expected and safe.
     pub(crate) fn apply_jvt_snapshot(&mut self, snapshot: JvtSnapshot) {
-        if self.current_root_hash != snapshot.base_root {
-            panic!(
-                "JVT snapshot base ROOT mismatch: expected {:?}, got {:?}.",
-                snapshot.base_root, self.current_root_hash
-            );
-        }
-        if self.current_block_height != snapshot.base_version {
-            tracing::debug!(
-                expected_version = snapshot.base_version,
-                actual_version = self.current_block_height,
-                "JVT snapshot base VERSION mismatch (root matches) - proceeding. \
-                 This is expected when empty commits advance the version counter."
-            );
-        }
-
         for (jvt_key, jvt_node) in &snapshot.nodes {
             self.tree_store
                 .insert(jvt_key.clone(), Arc::clone(jvt_node));

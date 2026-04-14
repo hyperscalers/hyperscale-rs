@@ -7,7 +7,7 @@ use crate::typed_cf::TypedCf;
 
 use crate::substate_key;
 use hyperscale_metrics as metrics;
-use hyperscale_storage::{DatabaseUpdates, DbSortKey, JvtSnapshot, SubstateStore};
+use hyperscale_storage::{DbSortKey, JvtSnapshot, SubstateStore};
 use hyperscale_types::NodeId;
 use rocksdb::WriteBatch;
 use std::time::Instant;
@@ -105,50 +105,6 @@ impl SubstateStore for RocksDbStorage {
 }
 
 impl RocksDbStorage {
-    /// Compute speculative state root and capture a snapshot for later application.
-    ///
-    /// This is used for state root verification and proposal. The caller specifies
-    /// the expected base root (parent block's state_root), and we verify the JVT
-    /// matches before computing the new root after applying certificate writes.
-    ///
-    /// Returns both the computed state root AND a [`JvtSnapshot`] containing the
-    /// tree nodes created during computation. The snapshot can be cached and applied
-    /// during block commit, avoiding redundant recomputation.
-    pub(crate) fn compute_speculative_root_from_base(
-        &self,
-        expected_base_root: hyperscale_types::Hash,
-        parent_block_height: u64,
-        updates_per_cert: &[DatabaseUpdates],
-        block_height: u64,
-    ) -> (hyperscale_types::Hash, JvtSnapshot) {
-        // Use a RocksDB snapshot for consistent reads during JVT computation.
-        // This prevents stale node deletions mid-computation from panicking.
-        let snapshot_store = SnapshotTreeStore::new(&self.db, &self.node_cache);
-
-        // Merge all certificates into a single update — later cert wins for conflicts.
-        let merged = hyperscale_storage::merge_database_updates(updates_per_cert);
-
-        let parent_version =
-            hyperscale_storage::tree::jvt_parent_height(parent_block_height, expected_base_root);
-        let (root, collected) = hyperscale_storage::tree::put_at_version(
-            &snapshot_store,
-            parent_version,
-            block_height,
-            &merged,
-            &Default::default(),
-        );
-
-        let snapshot = JvtSnapshot::from_collected_writes(
-            collected,
-            expected_base_root,
-            parent_block_height,
-            root,
-            block_height,
-        );
-
-        (root, snapshot)
-    }
-
     /// Try to apply a prepared block commit with a single fsync.
     ///
     /// This is the fast path for block commit. Applies the pre-built WriteBatch

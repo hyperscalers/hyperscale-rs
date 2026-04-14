@@ -398,19 +398,17 @@ pub enum Action {
     ///
     /// Applies the block's shard-local state changes to the JVT and compares the
     /// resulting root against the header's `state_root`.
-    /// Returns `ProtocolEvent::StateRootVerified`.
+    /// Returns `ProtocolEvent::BlockRootVerified`.
     ///
-    /// The verification flow:
-    /// 1. Runner checks if local JVT root matches `parent_state_root`
-    /// 2. Applies per-certificate updates to compute new JVT root
-    /// 3. Compares computed root against `expected_root`
-    /// 4. If valid, builds and caches a WriteBatch for efficient commit later
-    ///
-    /// The caller (state machine) is responsible for sourcing writes from the
-    /// execution cache, filtering to local shard, and merging.
+    /// The action handler walks the snapshot chain from `parent_block_hash`
+    /// to build an overlay of uncommitted tree nodes, then calls
+    /// `prepare_block_commit` which computes the JVT root and caches a
+    /// `PreparedCommit` for efficient commit later.
     VerifyStateRoot {
         block_hash: Hash,
-        /// Base state root to verify from (must match local JVT before computing).
+        /// Parent block hash — used to walk the snapshot chain for the overlay.
+        parent_block_hash: Hash,
+        /// Base state root (parent block's state_root).
         parent_state_root: Hash,
         /// Height of the parent block (stable JVT version for computation).
         parent_block_height: u64,
@@ -498,7 +496,7 @@ pub enum Action {
         parent_qc: QuorumCertificate,
         timestamp: u64,
         is_fallback: bool,
-        /// Parent's state root. Certs included only if local JVT matches this.
+        /// Parent's state root (base for state root computation via overlay).
         parent_state_root: Hash,
         /// Height of the parent block (stable JVT version for computation).
         parent_block_height: u64,
@@ -538,18 +536,13 @@ pub enum Action {
     // ═══════════════════════════════════════════════════════════════════════
     // Block Commit
     // ═══════════════════════════════════════════════════════════════════════
-    /// Commit a consensus block atomically: block data + JVT + substates +
-    /// receipts + ECs + consensus metadata.
-    ///
-    /// Used for blocks this node participated in consensus for. The io_loop
-    /// uses the `PreparedCommit` from `VerifyStateRoot` and extracts receipts
-    /// from `finalized_waves`.
+    /// Commit a consensus block via its PreparedCommit (from BuildProposal
+    /// or VerifyStateRoot). Block data + JVT + substates + receipts + ECs +
+    /// consensus metadata are written atomically.
     CommitBlock {
         block: Block,
         /// The QC that certified this block.
         qc: QuorumCertificate,
-        /// Finalized waves carrying receipts from local execution.
-        finalized_waves: Vec<Arc<FinalizedWave>>,
         /// Provision batch hashes from the block manifest. Resolved to actual
         /// batch data by the consumer (NodeStateMachine) via the ProvisionCoordinator.
         /// Using hashes instead of batch data ensures both consensus and sync
@@ -557,12 +550,9 @@ pub enum Action {
         provision_hashes: Vec<Hash>,
     },
 
-    /// Commit a synced block atomically: block data + JVT + substates +
-    /// receipts + ECs + consensus metadata.
-    ///
-    /// Used for blocks fetched via sync protocol. The io_loop uses receipts
-    /// and ECs from `pending_sync_data` (buffered when the sync response
-    /// arrived) — no `PreparedCommit` or `finalized_waves` needed.
+    /// Commit a synced block via `commit_block` (recomputes state from
+    /// sync_data receipts). No PreparedCommit — sync blocks don't go
+    /// through the verification pipeline.
     CommitSyncedBlock {
         block: Block,
         /// The QC that certified this block.

@@ -88,15 +88,10 @@ pub enum ProtocolEvent {
     },
 
     /// A block was committed to storage (state + block data atomically).
-    ///
-    /// The handler calls JVT unblocking first (via state_root),
-    /// then subsystem notifications.
     BlockCommitted {
         block_hash: Hash,
         height: u64,
         block: Block,
-        /// JVT state root after committing this block's state changes.
-        state_root: Hash,
         /// Provision batch hashes from the block manifest. Resolved to actual
         /// batch data by the consumer via the ProvisionCoordinator.
         provision_hashes: Vec<Hash>,

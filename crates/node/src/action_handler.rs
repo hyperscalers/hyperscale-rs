@@ -16,11 +16,44 @@ use hyperscale_types::{Hash, LocalExecutionEntry, Provision, ShardGroupId, TxEnt
 use std::sync::Arc;
 use tracing::warn;
 
+/// Walk the JVT snapshot chain from `parent_hash` backwards, collecting
+/// snapshots for blocks that haven't committed to the tree store yet.
+fn collect_pending_snapshots(
+    cache: &std::sync::Mutex<
+        std::collections::HashMap<Hash, (Hash, Arc<hyperscale_storage::JvtSnapshot>)>,
+    >,
+    committed_version: u64,
+    parent_hash: Hash,
+) -> Vec<Arc<hyperscale_storage::JvtSnapshot>> {
+    let mut cache = cache.lock().unwrap();
+    let mut chain = Vec::new();
+    let mut cursor = parent_hash;
+    loop {
+        match cache.get(&cursor) {
+            Some((grandparent, snap)) if snap.new_version > committed_version => {
+                chain.push(Arc::clone(snap));
+                cursor = *grandparent;
+            }
+            _ => break,
+        }
+    }
+    // Lazy prune: remove snapshots whose blocks are now committed to the
+    // tree store. Safe here because the walk above already skipped them.
+    cache.retain(|_, (_, snap)| snap.new_version > committed_version);
+    chain
+}
+
 /// Context for executing delegated actions.
 pub(crate) struct ActionContext<'a, S: ChainWriter + SubstateStore + ChainReader, E: Engine> {
     pub storage: &'a S,
     pub executor: &'a E,
     pub topology: &'a hyperscale_types::TopologySnapshot,
+    pub jvt_snapshot_cache: &'a std::sync::Mutex<
+        std::collections::HashMap<
+            hyperscale_types::Hash,
+            (hyperscale_types::Hash, Arc<hyperscale_storage::JvtSnapshot>),
+        >,
+    >,
 }
 
 /// Result of handling a delegated action.
@@ -279,6 +312,7 @@ pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainRead
         // --- BFT state root and proposal ---
         Action::VerifyStateRoot {
             block_hash,
+            parent_block_hash,
             parent_state_root,
             parent_block_height,
             expected_root,
@@ -292,6 +326,11 @@ pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainRead
                 .iter()
                 .flat_map(|fw| fw.receipts.iter().cloned())
                 .collect();
+            let pending_snapshots = collect_pending_snapshots(
+                ctx.jvt_snapshot_cache,
+                ctx.storage.jvt_version(),
+                parent_block_hash,
+            );
             let result = hyperscale_bft::handlers::verify_state_root(
                 ctx.storage,
                 parent_state_root,
@@ -299,6 +338,7 @@ pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainRead
                 expected_root,
                 &all_receipts,
                 block_height,
+                &pending_snapshots,
             );
             metrics::record_signature_verification_latency(
                 "state_root",
@@ -327,13 +367,13 @@ pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainRead
             timestamp,
             is_fallback,
             parent_state_root,
+            parent_block_height,
             transactions,
             finalized_waves,
             waves,
             provision_batches,
             parent_in_flight,
             finalized_tx_count,
-            ..
         } => {
             // Extract certificates from finalized waves.
             // No storage reads needed — everything flows through Arc<FinalizedWave>.
@@ -353,6 +393,12 @@ pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainRead
                 provision_batches.iter().map(|b| b.hash()).collect();
             provision_hashes.sort();
 
+            let pending_snapshots = collect_pending_snapshots(
+                ctx.jvt_snapshot_cache,
+                ctx.storage.jvt_version(),
+                parent_hash,
+            );
+
             let result = hyperscale_bft::handlers::build_proposal(
                 ctx.storage,
                 proposer,
@@ -363,6 +409,7 @@ pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainRead
                 timestamp,
                 is_fallback,
                 parent_state_root,
+                parent_block_height,
                 transactions,
                 certificates,
                 &all_receipts,
@@ -371,6 +418,7 @@ pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainRead
                 provision_hashes.clone(),
                 parent_in_flight,
                 finalized_tx_count,
+                &pending_snapshots,
             );
             let prepared = result
                 .prepared_commit

@@ -701,7 +701,6 @@ impl ProductionRunner {
                 block_hash: genesis_block.hash(),
                 height: 0,
                 block: genesis_block,
-                state_root: genesis_jvt_root,
                 provision_hashes: vec![],
             },
         ));

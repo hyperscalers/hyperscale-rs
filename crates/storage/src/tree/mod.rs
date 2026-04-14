@@ -22,6 +22,51 @@ pub use snapshot::{JvtSnapshot, LeafSubstateKeyAssociation};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
+/// Layered tree reader that overlays pending JVT snapshots on a base store.
+///
+/// Used during chained verification: block N+1's `prepare_block_commit` needs
+/// tree nodes from block N's verification, which hasn't committed yet. The
+/// overlay provides those nodes without mutating the shared tree store —
+/// avoiding corruption from abandoned blocks (view changes / forks).
+pub struct OverlayTreeReader<'a, S> {
+    base: &'a S,
+    /// Overlay nodes indexed by NodeKey for O(1) lookup.
+    nodes: HashMap<jvt::NodeKey, Arc<jvt::Node>>,
+}
+
+impl<'a, S> OverlayTreeReader<'a, S> {
+    /// Create a new OverlayTreeReader.
+    pub fn new(base: &'a S, snapshots: &[Arc<JvtSnapshot>]) -> Self {
+        let mut nodes = HashMap::new();
+        for snapshot in snapshots.iter() {
+            for (key, node) in &snapshot.nodes {
+                nodes.insert(key.clone(), Arc::clone(node));
+            }
+        }
+        Self { base, nodes }
+    }
+}
+
+impl<S: jvt::TreeReader + Sync> jvt::TreeReader for OverlayTreeReader<'_, S> {
+    fn get_node(&self, key: &jvt::NodeKey) -> Option<Arc<jvt::Node>> {
+        self.nodes
+            .get(key)
+            .cloned()
+            .or_else(|| self.base.get_node(key))
+    }
+
+    fn get_root_key(&self, version: u64) -> Option<jvt::NodeKey> {
+        // Check if any overlay snapshot wrote a root at this version.
+        // Root keys follow the convention NodeKey::root(version).
+        let root_key = jvt::NodeKey::root(version);
+        if self.nodes.contains_key(&root_key) {
+            Some(root_key)
+        } else {
+            self.base.get_root_key(version)
+        }
+    }
+}
+
 use hyperscale_types::Hash;
 use jellyfish_verkle_tree as jvt;
 use rayon::prelude::*;

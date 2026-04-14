@@ -22,24 +22,6 @@ pub(crate) struct PendingQcVerification {
     pub header: BlockHeader,
 }
 
-/// Pending state root verification waiting for JVT to be ready.
-///
-/// When a block arrives but its parent block's state hasn't been committed to
-/// the JVT yet, we queue the verification here. Once BlockCommitted arrives
-/// with a root matching required_root, we can proceed with verification.
-#[derive(Debug, Clone)]
-struct PendingStateRootVerification {
-    /// The state root of the parent block. Verification waits until local JVT
-    /// reaches this root, ensuring proposer and verifier compute from same base.
-    required_root: Hash,
-    /// The state root claimed by the proposer (to verify against).
-    expected_root: Hash,
-    /// Finalized waves from the PendingBlock — carry the proposer's receipts.
-    finalized_waves: Vec<Arc<FinalizedWave>>,
-    /// Block height (used as JVT version).
-    block_height: u64,
-}
-
 /// State root verification that is ready to dispatch (JVT is at the correct root).
 ///
 /// The `NodeStateMachine` drains these after each BFT call and emits
@@ -47,6 +29,7 @@ struct PendingStateRootVerification {
 #[derive(Debug)]
 pub struct ReadyStateRootVerification {
     pub block_hash: Hash,
+    pub parent_block_hash: Hash,
     pub parent_state_root: Hash,
     /// The committed height of the parent block (stable JVT version for computation).
     pub parent_block_height: u64,
@@ -79,25 +62,31 @@ pub(crate) struct VerificationPipeline {
     /// Blocks where state root verification is currently in-flight.
     state_root_verifications_in_flight: HashSet<Hash>,
 
-    /// Blocks waiting for JVT to reach the required version before verification.
-    pending_state_root_verifications: HashMap<Hash, PendingStateRootVerification>,
-
-    /// Stashed data for in-flight verifications, used to re-queue on transient
-    /// failure (JVT root advanced between dispatch and crypto-thread execution).
-    in_flight_verification_data: HashMap<Hash, PendingStateRootVerification>,
-
-    /// Last committed JVT root hash.
-    last_committed_jvt_root: Hash,
-
-    /// Last committed JVT block height.
-    last_committed_height: u64,
-
     /// Blocks with verified state roots.
     verified_state_roots: HashSet<Hash>,
 
-    /// State root verifications ready to dispatch (JVT root matches).
-    /// Drained by NodeStateMachine which computes merged_updates from execution cache.
+    /// Blocks waiting for their parent's tree nodes to become available (via
+    /// commit or prior verification). Keyed by parent_block_hash.
+    deferred_state_root_verifications: HashMap<Hash, Vec<ReadyStateRootVerification>>,
+
+    /// BuildProposal action waiting for the parent's tree nodes to become
+    /// available. At most one pending at a time (new proposals replace old).
+    /// Keyed by parent_block_hash for unblocking.
+    deferred_proposal: Option<(Hash, Action)>,
+
+    /// Last committed JVT height — used only to decide whether to defer
+    /// verification (parent's tree nodes need to be in the store or overlay).
+    last_committed_height: u64,
+
+    /// State root verifications ready to dispatch.
+    /// Drained by NodeStateMachine which emits `VerifyStateRoot` actions.
+    /// The action handler builds an `OverlayTreeReader` from cached
+    /// `PreparedCommit`s so verification can chain from prior results
+    /// without waiting for actual JVT commits.
     ready_state_root_verifications: Vec<ReadyStateRootVerification>,
+
+    /// BuildProposal action ready to dispatch (parent tree became available).
+    ready_proposal: Option<Action>,
 
     // === Transaction root verification ===
     /// Blocks where transaction root verification is currently in-flight.
@@ -134,17 +123,17 @@ pub(crate) struct VerificationPipeline {
 
 impl VerificationPipeline {
     /// Create a new verification pipeline.
-    pub fn new(jvt_root: Hash, committed_height: u64) -> Self {
+    pub fn new(committed_height: u64) -> Self {
         Self {
             pending_qc_verifications: HashMap::new(),
             verified_qcs: HashMap::new(),
             state_root_verifications_in_flight: HashSet::new(),
-            pending_state_root_verifications: HashMap::new(),
-            in_flight_verification_data: HashMap::new(),
-            last_committed_jvt_root: jvt_root,
-            last_committed_height: committed_height,
             verified_state_roots: HashSet::new(),
+            deferred_state_root_verifications: HashMap::new(),
+            deferred_proposal: None,
             ready_state_root_verifications: Vec::new(),
+            ready_proposal: None,
+            last_committed_height: committed_height,
             transaction_root_verifications_in_flight: HashSet::new(),
             verified_transaction_roots: HashSet::new(),
             certificate_root_verifications_in_flight: HashSet::new(),
@@ -209,11 +198,7 @@ impl VerificationPipeline {
     pub fn is_block_verified(&self, block: &Block) -> bool {
         let block_hash = block.hash();
 
-        let state_root_ok = if block.certificates.is_empty() {
-            true
-        } else {
-            self.verified_state_roots.contains(&block_hash)
-        };
+        let state_root_ok = self.verified_state_roots.contains(&block_hash);
 
         let transaction_root_ok = if block.transaction_count() == 0 {
             true
@@ -254,9 +239,7 @@ impl VerificationPipeline {
     pub fn log_incomplete_verification(&self, block: &Block) {
         let block_hash = block.hash();
 
-        let state_root_status = if block.certificates.is_empty() {
-            "skipped(no_certs)"
-        } else if self.verified_state_roots.contains(&block_hash) {
+        let state_root_status = if self.verified_state_roots.contains(&block_hash) {
             "verified"
         } else if self
             .state_root_verifications_in_flight
@@ -264,10 +247,11 @@ impl VerificationPipeline {
         {
             "in_flight"
         } else if self
-            .pending_state_root_verifications
-            .contains_key(&block_hash)
+            .deferred_state_root_verifications
+            .values()
+            .any(|v| v.iter().any(|r| r.block_hash == block_hash))
         {
-            "pending_jvt"
+            "deferred(parent)"
         } else {
             "NOT_STARTED"
         };
@@ -349,11 +333,11 @@ impl VerificationPipeline {
     // ─── State root ──────────────────────────────────────────────────────
 
     /// Check if a block needs state root verification before voting.
+    ///
+    /// Always returns true for blocks that haven't been verified yet —
+    /// even cert-less blocks verify (trivially) so their PreparedCommit
+    /// populates the overlay for child block verifications.
     pub fn needs_state_root_verification(&self, block: &Block) -> bool {
-        if block.certificates.is_empty() {
-            return false;
-        }
-
         let block_hash = block.hash();
 
         if self.verified_state_roots.contains(&block_hash)
@@ -361,8 +345,9 @@ impl VerificationPipeline {
                 .state_root_verifications_in_flight
                 .contains(&block_hash)
             || self
-                .pending_state_root_verifications
-                .contains_key(&block_hash)
+                .deferred_state_root_verifications
+                .values()
+                .any(|v| v.iter().any(|r| r.block_hash == block_hash))
         {
             return false;
         }
@@ -387,85 +372,69 @@ impl VerificationPipeline {
         parent_block_height: u64,
         finalized_waves: Vec<Arc<FinalizedWave>>,
     ) {
-        let current_root = self.last_committed_jvt_root;
+        let parent_hash = block.header.parent_hash;
+        let ready = ReadyStateRootVerification {
+            block_hash,
+            parent_block_hash: parent_hash,
+            parent_state_root,
+            parent_block_height,
+            expected_root: block.header.state_root,
+            finalized_waves,
+            block_height: block.header.height.0,
+        };
 
-        if current_root == parent_state_root {
+        // The parent's tree nodes must be available — either committed to
+        // the tree store or in the snapshot cache (from a prior verification).
+        // Defer if: parent height exceeds committed JVT AND parent hasn't
+        // been verified (no snapshot in the overlay).
+        let parent_tree_available = parent_block_height <= self.last_committed_height
+            || self.verified_state_roots.contains(&parent_hash);
+
+        if !parent_tree_available {
             debug!(
                 block_hash = ?block_hash,
-                certificate_count = block.certificates.len(),
-                expected_root = ?block.header.state_root,
-                parent_state_root = ?parent_state_root,
-                committed_height = self.last_committed_height,
-                "JVT ready - state root verification ready for dispatch"
+                parent_hash = ?parent_hash,
+                "Deferring state root verification — parent not yet verified"
             );
-
-            self.state_root_verifications_in_flight.insert(block_hash);
-            self.in_flight_verification_data.insert(
-                block_hash,
-                PendingStateRootVerification {
-                    required_root: parent_state_root,
-                    expected_root: block.header.state_root,
-                    finalized_waves: finalized_waves.clone(),
-                    block_height: block.header.height.0,
-                },
-            );
-            self.ready_state_root_verifications
-                .push(ReadyStateRootVerification {
-                    block_hash,
-                    parent_state_root,
-                    parent_block_height: self.last_committed_height,
-                    expected_root: block.header.state_root,
-                    finalized_waves,
-                    block_height: block.header.height.0,
-                });
+            self.deferred_state_root_verifications
+                .entry(parent_hash)
+                .or_default()
+                .push(ready);
         } else {
-            debug!(
-                block_hash = ?block_hash,
-                certificate_count = block.certificates.len(),
-                expected_root = ?block.header.state_root,
-                parent_state_root = ?parent_state_root,
-                parent_block_height,
-                current_jvt_root = ?current_root,
-                committed_height = self.last_committed_height,
-                "JVT not ready - queueing state root verification"
-            );
-
-            self.pending_state_root_verifications.insert(
-                block_hash,
-                PendingStateRootVerification {
-                    required_root: parent_state_root,
-                    expected_root: block.header.state_root,
-                    finalized_waves,
-                    block_height: block.header.height.0,
-                },
-            );
+            self.state_root_verifications_in_flight.insert(block_hash);
+            self.ready_state_root_verifications.push(ready);
         }
     }
 
     /// Record a state root verification result. Returns whether the verification passed.
     ///
-    /// On failure, re-queues the verification as pending. The JVT root may have
-    /// advanced between dispatch and crypto-thread execution (transient race).
-    /// The next `on_jvt_advanced` call will re-evaluate and re-dispatch.
+    /// On success, unblocks any child blocks that were deferred waiting for
+    /// this parent's verification to complete.
     pub fn on_state_root_verified(&mut self, block_hash: Hash, valid: bool) -> bool {
         self.state_root_verifications_in_flight.remove(&block_hash);
 
         if valid {
-            self.in_flight_verification_data.remove(&block_hash);
             self.verified_state_roots.insert(block_hash);
-            debug!(
-                block_hash = ?block_hash,
-                "State root verified successfully"
-            );
-        } else if let Some(stashed) = self.in_flight_verification_data.remove(&block_hash) {
-            // Re-queue: the failure is likely transient (JVT advanced between
-            // dispatch and execution). The next on_jvt_advanced will retry.
-            debug!(
-                block_hash = ?block_hash,
-                "State root verification failed — re-queuing for retry"
-            );
-            self.pending_state_root_verifications
-                .insert(block_hash, stashed);
+            debug!(block_hash = ?block_hash, "State root verified successfully");
+
+            // Unblock children that were waiting for this parent.
+            if let Some(deferred) = self.deferred_state_root_verifications.remove(&block_hash) {
+                for ready in deferred {
+                    debug!(
+                        child = ?ready.block_hash,
+                        parent = ?block_hash,
+                        "Unblocking deferred state root verification"
+                    );
+                    self.state_root_verifications_in_flight
+                        .insert(ready.block_hash);
+                    self.ready_state_root_verifications.push(ready);
+                }
+            }
+
+            // Unblock deferred proposal if it was waiting for this parent.
+            self.try_unblock_proposal(block_hash);
+        } else {
+            warn!(block_hash = ?block_hash, "State root verification FAILED");
         }
 
         valid
@@ -764,58 +733,6 @@ impl VerificationPipeline {
     // Remote header QC verification
     // ═══════════════════════════════════════════════════════════════════════
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // JVT state tracking
-    // ═══════════════════════════════════════════════════════════════════════
-
-    /// JVT advanced — update root and unblock any waiting state root verifications.
-    ///
-    /// Unblocked verifications are pushed to the ready queue for
-    /// `NodeStateMachine` to drain and enrich with `merged_updates`.
-    pub fn on_jvt_advanced(&mut self, block_height: u64, new_root: Hash) {
-        self.last_committed_jvt_root = new_root;
-        self.last_committed_height = block_height;
-
-        // Find the lowest-height pending verification matching the new root.
-        // Only unblock one at a time so the prepared commit is fresh when the
-        // block commits — unblocking multiple lets later blocks race ahead and
-        // produce stale snapshots that miss the fast commit path.
-        let next = self
-            .pending_state_root_verifications
-            .iter()
-            .filter(|(_, pv)| pv.required_root == new_root)
-            .min_by_key(|(_, pv)| pv.block_height)
-            .map(|(hash, _)| *hash);
-        let unblocked: Vec<Hash> = next.into_iter().collect();
-
-        if unblocked.is_empty() {
-            return;
-        }
-
-        debug!(
-            unblocked_count = unblocked.len(),
-            block_height, "Unblocking pending state root verifications"
-        );
-
-        for block_hash in unblocked {
-            if let Some(pv) = self.pending_state_root_verifications.remove(&block_hash) {
-                self.state_root_verifications_in_flight.insert(block_hash);
-                // Stash data so we can re-queue on transient failure.
-                self.in_flight_verification_data
-                    .insert(block_hash, pv.clone());
-                self.ready_state_root_verifications
-                    .push(ReadyStateRootVerification {
-                        block_hash,
-                        parent_state_root: pv.required_root,
-                        parent_block_height: self.last_committed_height,
-                        expected_root: pv.expected_root,
-                        finalized_waves: pv.finalized_waves,
-                        block_height: pv.block_height,
-                    });
-            }
-        }
-    }
-
     /// Drain state root verifications that are ready to dispatch.
     ///
     /// The caller (`NodeStateMachine`) computes `merged_updates` from the
@@ -824,9 +741,86 @@ impl VerificationPipeline {
         std::mem::take(&mut self.ready_state_root_verifications)
     }
 
-    /// Number of pending state root verifications (for logging).
-    pub fn pending_state_root_count(&self) -> usize {
-        self.pending_state_root_verifications.len()
+    /// Take the ready BuildProposal action if one was unblocked.
+    pub fn take_ready_proposal(&mut self) -> Option<Action> {
+        self.ready_proposal.take()
+    }
+
+    /// Check if a parent's tree nodes are available (committed or verified).
+    pub fn parent_tree_available(&self, parent_block_height: u64, parent_hash: Hash) -> bool {
+        parent_block_height <= self.last_committed_height
+            || self.verified_state_roots.contains(&parent_hash)
+    }
+
+    /// Defer a BuildProposal action until its parent's tree nodes are available.
+    /// Replaces any previously deferred proposal (only one active at a time).
+    pub fn defer_proposal(&mut self, parent_hash: Hash, action: Action) {
+        debug!(
+            parent_hash = ?parent_hash,
+            "Deferring BuildProposal — parent tree not yet available"
+        );
+        self.deferred_proposal = Some((parent_hash, action));
+    }
+
+    /// If the deferred proposal was waiting for `unblocked_hash`, make it ready.
+    fn try_unblock_proposal(&mut self, unblocked_hash: Hash) {
+        if matches!(&self.deferred_proposal, Some((parent, _)) if *parent == unblocked_hash) {
+            let (_, action) = self.deferred_proposal.take().unwrap();
+            debug!(parent_hash = ?unblocked_hash, "Unblocking deferred BuildProposal");
+            self.ready_proposal = Some(action);
+        }
+    }
+
+    /// A block committed to the tree store. Unblock any deferred
+    /// verifications and proposals whose parent's tree nodes are now available.
+    pub fn on_jvt_committed(&mut self, block_height: u64) {
+        if block_height <= self.last_committed_height {
+            return;
+        }
+        self.last_committed_height = block_height;
+
+        // Unblock deferred verifications whose parent height is now committed.
+        let unblocked_parents: Vec<Hash> = self
+            .deferred_state_root_verifications
+            .iter()
+            .filter(|(_, entries)| {
+                entries
+                    .iter()
+                    .any(|r| r.parent_block_height <= block_height)
+            })
+            .map(|(parent_hash, _)| *parent_hash)
+            .collect();
+
+        for parent_hash in unblocked_parents {
+            if let Some(entries) = self.deferred_state_root_verifications.remove(&parent_hash) {
+                for ready in entries {
+                    if ready.parent_block_height <= block_height {
+                        self.state_root_verifications_in_flight
+                            .insert(ready.block_hash);
+                        self.ready_state_root_verifications.push(ready);
+                    } else {
+                        self.deferred_state_root_verifications
+                            .entry(parent_hash)
+                            .or_default()
+                            .push(ready);
+                    }
+                }
+            }
+        }
+
+        // Unblock deferred proposal if its parent height is now committed.
+        if let Some((_, action)) = &self.deferred_proposal {
+            let ready = matches!(
+                action,
+                Action::BuildProposal { parent_block_height, .. }
+                    if *parent_block_height <= block_height
+            );
+            if ready {
+                let (_, action) = self.deferred_proposal.take().unwrap();
+                debug!("Unblocking deferred BuildProposal — parent committed");
+                self.ready_proposal = Some(action);
+            }
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -853,9 +847,6 @@ impl VerificationPipeline {
         self.pending_qc_verifications
             .retain(|hash, _| pending_blocks.contains_key(hash));
 
-        self.pending_state_root_verifications
-            .retain(|hash, _| pending_blocks.contains_key(hash));
-
         self.state_root_verifications_in_flight
             .retain(|hash| pending_blocks.contains_key(hash));
 
@@ -864,6 +855,27 @@ impl VerificationPipeline {
 
         self.ready_state_root_verifications
             .retain(|r| pending_blocks.contains_key(&r.block_hash));
+
+        // Clean up deferred verifications: remove entries whose child blocks
+        // are no longer pending, and remove parent keys with empty lists.
+        for entries in self.deferred_state_root_verifications.values_mut() {
+            entries.retain(|r| pending_blocks.contains_key(&r.block_hash));
+        }
+        self.deferred_state_root_verifications
+            .retain(|_, entries| !entries.is_empty());
+
+        // Clear deferred proposal if its parent is at or below committed height
+        // (the proposal is stale — a new round/view will generate a fresh one).
+        if let Some((_, action)) = &self.deferred_proposal {
+            let stale = matches!(
+                action,
+                Action::BuildProposal { parent_block_height, .. }
+                    if *parent_block_height <= committed_height
+            );
+            if stale {
+                self.deferred_proposal = None;
+            }
+        }
 
         self.transaction_root_verifications_in_flight
             .retain(|hash| pending_blocks.contains_key(hash));
@@ -911,8 +923,11 @@ impl VerificationPipeline {
         self.verified_qcs.len()
     }
 
-    /// Number of pending state root verifications.
+    /// Number of deferred state root verifications (waiting for parent).
     pub(crate) fn pending_state_root_verifications_len(&self) -> usize {
-        self.pending_state_root_verifications.len()
+        self.deferred_state_root_verifications
+            .values()
+            .map(|v| v.len())
+            .sum()
     }
 }

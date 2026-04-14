@@ -27,19 +27,51 @@ pub struct RocksDbPreparedCommit {
 impl hyperscale_storage::ChainWriter for RocksDbStorage {
     type PreparedCommit = RocksDbPreparedCommit;
 
+    fn jvt_snapshot(prepared: &Self::PreparedCommit) -> &hyperscale_storage::JvtSnapshot {
+        &prepared.jvt_snapshot
+    }
+
     fn prepare_block_commit(
         &self,
         parent_state_root: hyperscale_types::Hash,
         parent_block_height: u64,
         receipts: &[ReceiptBundle],
         block_height: u64,
+        pending_snapshots: &[std::sync::Arc<hyperscale_storage::JvtSnapshot>],
     ) -> (hyperscale_types::Hash, Self::PreparedCommit) {
         let merged_updates = hyperscale_storage::merge_updates_from_receipts(receipts);
 
-        let (computed_root, jvt_snapshot) = self.compute_speculative_root_from_base(
+        let snapshot_store = SnapshotTreeStore::new(&self.db, &self.node_cache);
+        let parent_version =
+            hyperscale_storage::tree::jvt_parent_height(parent_block_height, parent_state_root);
+
+        let (computed_root, collected) = if pending_snapshots.is_empty() {
+            hyperscale_storage::tree::put_at_version(
+                &snapshot_store,
+                parent_version,
+                block_height,
+                &merged_updates,
+                &Default::default(),
+            )
+        } else {
+            let overlay = hyperscale_storage::tree::OverlayTreeReader::new(
+                &snapshot_store,
+                pending_snapshots,
+            );
+            hyperscale_storage::tree::put_at_version(
+                &overlay,
+                parent_version,
+                block_height,
+                &merged_updates,
+                &Default::default(),
+            )
+        };
+
+        let jvt_snapshot = JvtSnapshot::from_collected_writes(
+            collected,
             parent_state_root,
             parent_block_height,
-            std::slice::from_ref(&merged_updates),
+            computed_root,
             block_height,
         );
 
@@ -128,7 +160,7 @@ impl hyperscale_storage::ChainWriter for RocksDbStorage {
 }
 
 impl RocksDbStorage {
-    /// Internal commit path used by both `commit_block` and `commit_prepared_block` fallback.
+    /// Internal commit path used by `commit_block` (sync blocks without a PreparedCommit).
     fn commit_block_inner(
         &self,
         merged_updates: &DatabaseUpdates,

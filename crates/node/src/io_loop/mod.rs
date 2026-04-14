@@ -55,17 +55,23 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+/// Snapshot cache: `block_hash → (parent_block_hash, snapshot)`.
+type JvtSnapshotMap = HashMap<Hash, (Hash, Arc<hyperscale_storage::JvtSnapshot>)>;
+
+/// Prepared commit cache: `block_hash → (block_height, prepared_commit)`.
+type PreparedCommitMap<S> =
+    HashMap<Hash, (u64, <S as hyperscale_storage::ChainWriter>::PreparedCommit)>;
+
 /// A block commit waiting to be flushed to storage.
 ///
 /// Explicitly distinguishes consensus and sync paths so `flush_block_commits`
 /// knows which data source to use without side-channel sniffing.
 pub(crate) enum PendingCommit {
-    /// Consensus path: receipts come from locally-executed finalized waves.
-    /// The io_loop uses the `PreparedCommit` from `VerifyStateRoot`.
+    /// Consensus path: committed via PreparedCommit from BuildProposal
+    /// (proposer) or VerifyStateRoot (verifier).
     Consensus {
         block: Arc<Block>,
         qc: Arc<QuorumCertificate>,
-        finalized_waves: Vec<Arc<FinalizedWave>>,
         provision_hashes: Vec<Hash>,
     },
     /// Sync path: receipts and ECs come from `pending_sync_data`.
@@ -215,8 +221,13 @@ where
     // Prepared commit cache (shared with dispatch closures).
     // Stores (block_height, prepared_commit) so stale entries can be pruned
     // when they outlive the block they were prepared for.
-    #[allow(clippy::type_complexity)]
-    prepared_commits: Arc<Mutex<HashMap<Hash, (u64, S::PreparedCommit)>>>,
+    prepared_commits: Arc<Mutex<PreparedCommitMap<S>>>,
+
+    /// JVT snapshots from successful verifications, keyed by block hash.
+    /// Value is `(parent_block_hash, snapshot)` so the chain can be walked
+    /// by following parent hashes. Arc-wrapped to avoid cloning node vecs
+    /// during chain walks. Pruned when blocks commit to the tree store.
+    jvt_snapshot_cache: Arc<Mutex<JvtSnapshotMap>>,
 
     // In-memory caches (shared with inbound router in production)
     cert_cache: Arc<QuickCache<Hash, Arc<WaveCertificate>>>,
@@ -354,6 +365,7 @@ where
             validator_id,
             num_shards: topo.num_shards(),
             prepared_commits: Arc::new(Mutex::new(HashMap::new())),
+            jvt_snapshot_cache: Arc::new(Mutex::new(HashMap::new())),
             cert_cache: Arc::new(QuickCache::new(DEFAULT_CERT_CACHE_SIZE)),
             tx_cache: Arc::new(QuickCache::new(DEFAULT_TX_CACHE_SIZE)),
             provision_cache: Arc::new(QuickCache::new(DEFAULT_PROVISION_CACHE_SIZE)),
