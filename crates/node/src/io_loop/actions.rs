@@ -78,7 +78,7 @@ where
                 wave_id,
                 global_receipt_root,
                 tx_outcomes,
-                recipients,
+                leader,
             } => {
                 let tx_count = tx_outcomes.len() as u32;
                 // Sign the execution vote inline (BLS signing is fast, ~1ms)
@@ -103,14 +103,8 @@ where
                     signature: sig,
                 };
 
-                // Send vote to all local committee members (N→N).
-                // Skip self — the loopback below feeds it directly.
-                let peers: Vec<ValidatorId> = recipients
-                    .iter()
-                    .copied()
-                    .filter(|&v| v != self.validator_id)
-                    .collect();
-                if !peers.is_empty() {
+                // Send vote to the wave leader (unicast).
+                if leader != self.validator_id {
                     let batch_msg = hyperscale_types::exec_vote_batch_message(
                         self.local_shard,
                         std::slice::from_ref(&vote),
@@ -121,13 +115,17 @@ where
                         self.validator_id,
                         batch_sig,
                     );
-                    self.network.notify(&peers, &batch);
+                    self.network.notify(&[leader], &batch);
                 }
 
-                // Feed our own execution vote back to the state machine for tracking
-                let _ = self.event_sender.send(hyperscale_core::NodeInput::Protocol(
-                    hyperscale_core::ProtocolEvent::ExecutionVoteReceived { vote },
-                ));
+                // Feed own vote to state machine only if we are the leader.
+                // The leader needs its own vote in the VoteTracker for aggregation.
+                // Non-leaders track retries via PendingVoteRetry in the state machine.
+                if leader == self.validator_id {
+                    let _ = self.event_sender.send(hyperscale_core::NodeInput::Protocol(
+                        hyperscale_core::ProtocolEvent::ExecutionVoteReceived { vote },
+                    ));
+                }
             }
             Action::BroadcastExecutionCertificate {
                 shard: _,
