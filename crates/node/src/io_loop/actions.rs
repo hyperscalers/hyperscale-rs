@@ -644,7 +644,7 @@ where
 
         self.commit_in_flight.store(true, Ordering::Release);
 
-        self.dispatch.spawn_execution(move || {
+        self.pending_commit_task = Some(Box::new(move || {
             for (i, commit) in commits.into_iter().enumerate() {
                 let block_hash = commit.block().hash();
                 let height = commit.block().header.height;
@@ -721,26 +721,7 @@ where
                                     bundles
                                 };
 
-                            // Verify state_root via prepare→verify→commit.
-                            let parent_root = storage.state_root_hash();
-                            let parent_height = if height.0 > 0 { height.0 - 1 } else { 0 };
-                            let (computed_root, prepared) = storage.prepare_block_commit(
-                                parent_root,
-                                parent_height,
-                                &sync_receipt_bundles,
-                                height.0,
-                            );
-                            if computed_root != block.header.state_root {
-                                tracing::warn!(
-                                    height = height.0,
-                                    ?computed_root,
-                                    expected = ?block.header.state_root,
-                                    "Sync: state_root mismatch — committing anyway \
-                                     (QC-attested, 2f+1 validators verified)"
-                                );
-                            }
-
-                            storage.commit_prepared_block(prepared, block, qc)
+                            storage.commit_block(block, qc, &sync_receipt_bundles)
                         } else {
                             tracing::error!(
                                 height = height.0,
@@ -781,7 +762,7 @@ where
                     provision_hashes,
                 }));
             }
-        });
+        }));
     }
 
     /// Process sync, fetch, and provision recovery actions.

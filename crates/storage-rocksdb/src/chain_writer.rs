@@ -13,9 +13,7 @@ use std::sync::Arc;
 /// Precomputed commit work for a RocksDB block commit.
 ///
 /// Contains a pre-built `WriteBatch` (substate + receipt writes) and a
-/// `JvtSnapshot` (precomputed Verkle tree nodes). Also carries the merged
-/// `DatabaseUpdates` and receipts for fallback recompute if the prepared
-/// data is stale.
+/// `JvtSnapshot` (precomputed Verkle tree nodes).
 ///
 /// # Performance
 ///
@@ -24,8 +22,6 @@ use std::sync::Arc;
 pub struct RocksDbPreparedCommit {
     pub(crate) write_batch: WriteBatch,
     pub(crate) jvt_snapshot: JvtSnapshot,
-    pub(crate) merged_updates: DatabaseUpdates,
-    pub(crate) receipts: Vec<ReceiptBundle>,
 }
 
 impl hyperscale_storage::ChainWriter for RocksDbStorage {
@@ -58,8 +54,6 @@ impl hyperscale_storage::ChainWriter for RocksDbStorage {
         let prepared = RocksDbPreparedCommit {
             write_batch,
             jvt_snapshot,
-            merged_updates,
-            receipts: receipts.to_vec(),
         };
 
         (computed_root, prepared)
@@ -81,14 +75,14 @@ impl hyperscale_storage::ChainWriter for RocksDbStorage {
 
         crate::execution_certs::append_block_certs_to_batch(self, &mut write_batch, block);
 
-        let used_fast_path =
-            self.try_apply_prepared_commit(write_batch, prepared.jvt_snapshot, block, qc);
-
-        if used_fast_path {
-            result_root
-        } else {
-            self.commit_block_inner(&prepared.merged_updates, block, qc, &prepared.receipts)
-        }
+        let applied = self.try_apply_prepared_commit(write_batch, prepared.jvt_snapshot, block, qc);
+        assert!(
+            applied,
+            "BUG: prepared commit fast path failed at height {} — \
+             serialized verification should guarantee freshness",
+            block.header.height.0
+        );
+        result_root
     }
 
     fn commit_block(

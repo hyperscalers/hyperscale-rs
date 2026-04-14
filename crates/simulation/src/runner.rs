@@ -692,6 +692,9 @@ impl SimulationRunner {
     /// Process StepOutput: stats and timer ops.
     fn process_step_output(&mut self, node: NodeIndex, output: StepOutput) {
         self.stats.actions_generated += output.actions_generated as u64;
+        if let Some(task) = output.commit_task {
+            task();
+        }
         for op in output.timer_ops {
             self.process_timer_op(node, op);
         }

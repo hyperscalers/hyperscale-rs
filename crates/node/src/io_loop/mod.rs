@@ -147,6 +147,10 @@ pub struct StepOutput {
     pub actions_generated: usize,
     /// Timer operations (set/cancel) to be processed by the runner.
     pub timer_ops: Vec<TimerOp>,
+    /// Block commit task prepared by `flush_block_commits`. The runner decides
+    /// where to execute: production uses `tokio::spawn_blocking`, simulation
+    /// runs inline.
+    pub commit_task: Option<Box<dyn FnOnce() + Send>>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -287,6 +291,10 @@ where
     // Cached local shard peers (committee excluding self) — avoids per-call allocation.
     cached_local_peers: Vec<ValidatorId>,
 
+    // Pending commit task — prepared by flush_block_commits, spawned by the runner.
+    // Production uses tokio::spawn_blocking; simulation runs inline.
+    pending_commit_task: Option<Box<dyn FnOnce() + Send>>,
+
     // Accumulated outputs from this step (for caller to drain)
     emitted_statuses: Vec<(Hash, hyperscale_types::TransactionStatus)>,
     actions_generated: usize,
@@ -372,6 +380,7 @@ where
             cached_local_peers,
             tx_status_cache: Arc::new(QuickCache::new(DEFAULT_TX_STATUS_CACHE_SIZE)),
             last_slow_tx_warn: std::time::Duration::ZERO,
+            pending_commit_task: None,
             emitted_statuses: Vec::new(),
             actions_generated: 0,
             pending_timer_ops: Vec::new(),
@@ -918,6 +927,7 @@ where
             emitted_statuses: std::mem::take(&mut self.emitted_statuses),
             actions_generated: self.actions_generated,
             timer_ops: std::mem::take(&mut self.pending_timer_ops),
+            commit_task: self.pending_commit_task.take(),
         }
     }
 

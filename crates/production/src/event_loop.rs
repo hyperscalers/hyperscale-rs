@@ -251,6 +251,11 @@ pub fn run_pinned_loop(mut io_loop: ProdIoLoop, mut config: PinnedLoopConfig) {
         if let Some(event) = event {
             let output = io_loop.step(event);
 
+            // Spawn block commit on tokio's blocking pool (pure I/O).
+            if let Some(task) = output.commit_task {
+                config.tokio_handle.spawn_blocking(task);
+            }
+
             // Process timer operations from this step.
             for op in output.timer_ops {
                 timer_mgr.process_op(op);
