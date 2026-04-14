@@ -45,6 +45,8 @@ pub struct ExecutionAccumulator {
     /// Expected transactions in wave order (block order within the wave).
     /// Each entry is (tx_hash, participating_shards for that tx).
     expected_txs: Vec<(Hash, Vec<ShardGroupId>)>,
+    /// O(1) membership check for expected tx hashes (mirrors expected_txs keys).
+    expected_tx_set: HashSet<Hash>,
     /// Execution results from the engine, keyed by tx_hash. Does NOT include
     /// abort outcomes — those are tracked separately in `aborts`.
     execution_results: HashMap<Hash, TxResult>,
@@ -84,11 +86,13 @@ impl ExecutionAccumulator {
         block_height: u64,
         expected_txs: Vec<(Hash, Vec<ShardGroupId>)>,
     ) -> Self {
+        let expected_tx_set: HashSet<Hash> = expected_txs.iter().map(|(h, _)| *h).collect();
         Self {
             wave_id,
             block_hash,
             block_height,
             expected_txs,
+            expected_tx_set,
             execution_results: HashMap::new(),
             provisioned: HashSet::new(),
             aborts: HashMap::new(),
@@ -146,8 +150,7 @@ impl ExecutionAccumulator {
     /// This means execution is possible/in-flight. Changes the target vote
     /// height because a previously uncovered tx becomes covered.
     pub fn mark_provisioned(&mut self, tx_hash: Hash) {
-        if self.expected_txs.iter().any(|(h, _)| *h == tx_hash) && self.provisioned.insert(tx_hash)
-        {
+        if self.expected_tx_set.contains(&tx_hash) && self.provisioned.insert(tx_hash) {
             self.invalidate_cached_target();
         }
     }
@@ -159,7 +162,7 @@ impl ExecutionAccumulator {
     /// the target vote height.
     /// Returns `true` if the wave is now complete (all txs have some stored outcome).
     pub fn record_abort(&mut self, tx_hash: Hash, committed_at_height: u64) -> bool {
-        if !self.expected_txs.iter().any(|(h, _)| *h == tx_hash) {
+        if !self.expected_tx_set.contains(&tx_hash) {
             return false;
         }
 
@@ -185,7 +188,7 @@ impl ExecutionAccumulator {
     /// Use [`record_abort`] for conflict aborts, which take priority at the abort height.
     pub fn record_result(&mut self, tx_hash: Hash, outcome: ExecutionOutcome) -> bool {
         // Only record if this tx is expected in this wave
-        if !self.expected_txs.iter().any(|(h, _)| *h == tx_hash) {
+        if !self.expected_tx_set.contains(&tx_hash) {
             return false;
         }
 
@@ -211,6 +214,7 @@ impl ExecutionAccumulator {
     /// Returns `true` if the wave is now complete after removal.
     pub fn remove_expected(&mut self, tx_hash: &Hash) -> bool {
         self.expected_txs.retain(|(h, _)| h != tx_hash);
+        self.expected_tx_set.remove(tx_hash);
         self.execution_results.remove(tx_hash);
         self.provisioned.remove(tx_hash);
         self.aborts.remove(tx_hash);

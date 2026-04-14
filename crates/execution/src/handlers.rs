@@ -48,9 +48,14 @@ pub fn aggregate_execution_certificate(
     };
 
     // Create signer bitfield using committee ordering
+    let committee_index: HashMap<ValidatorId, usize> = committee
+        .iter()
+        .enumerate()
+        .map(|(idx, &vid)| (vid, idx))
+        .collect();
     let mut signers = SignerBitfield::new(committee.len());
     for vote in &unique_votes {
-        if let Some(idx) = committee.iter().position(|&v| v == vote.validator) {
+        if let Some(&idx) = committee_index.get(&vote.validator) {
             signers.set(idx);
         }
     }

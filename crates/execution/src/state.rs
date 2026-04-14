@@ -173,8 +173,10 @@ pub struct ExecutionState {
     /// Execution votes that arrived before tracking started.
     early_votes: HashMap<WaveId, Vec<ExecutionVote>>,
 
-    /// ECs that arrived before the wave tracker was created.
-    early_wave_attestations: Vec<(Arc<ExecutionCertificate>, u64)>,
+    /// ECs that arrived before the tx's wave assignment was created.
+    /// Keyed by tx_hash for efficient lookup when wave assignments are created.
+    /// Multiple tx_hash entries may reference the same Arc<EC> (one EC covers many txs).
+    early_wave_attestations: HashMap<Hash, Vec<Arc<ExecutionCertificate>>>,
 
     /// Provisions from committed batches whose transactions haven't been committed yet.
     /// Maps tx_hash -> set of source shards that have sent provisions.
@@ -241,7 +243,7 @@ impl ExecutionState {
             wave_certificate_trackers: HashMap::new(),
             early_execution_results: HashMap::new(),
             verified_provisions: HashMap::new(),
-            early_wave_attestations: Vec::new(),
+            early_wave_attestations: HashMap::new(),
             early_committed_provisions: HashMap::new(),
             required_provision_shards: HashMap::new(),
             received_provision_shards: HashMap::new(),
@@ -1067,7 +1069,6 @@ impl ExecutionState {
         cert: hyperscale_types::ExecutionCertificate,
     ) -> Vec<Action> {
         let shard = cert.shard_group_id();
-        let current_height = self.committed_height;
 
         // Clear expected cert tracking and mark as fulfilled so late-arriving
         // duplicate headers don't re-register the expectation.
@@ -1085,9 +1086,14 @@ impl ExecutionState {
         });
 
         if !has_any_tracker {
-            // No tracker yet — buffer entire EC for later replay when block commits
+            // No tracker yet — buffer by tx_hash for targeted replay when block commits
             let ec_arc = Arc::new(cert);
-            self.early_wave_attestations.push((ec_arc, current_height));
+            for outcome in &ec_arc.tx_outcomes {
+                self.early_wave_attestations
+                    .entry(outcome.tx_hash)
+                    .or_default()
+                    .push(Arc::clone(&ec_arc));
+            }
             return vec![];
         }
 
@@ -1134,7 +1140,6 @@ impl ExecutionState {
         }
 
         let shard = certificate.shard_group_id();
-        let current_height = self.committed_height;
         let mut actions = Vec::new();
 
         // If this is a local shard EC, mark the wave as having an EC to skip
@@ -1160,8 +1165,13 @@ impl ExecutionState {
         if has_any_tracker {
             actions.extend(self.handle_wave_attestation(topology, ec_arc));
         } else {
-            // Buffer for later replay when block commits and tracker is created
-            self.early_wave_attestations.push((ec_arc, current_height));
+            // Buffer by tx_hash for targeted replay when block commits
+            for outcome in &ec_arc.tx_outcomes {
+                self.early_wave_attestations
+                    .entry(outcome.tx_hash)
+                    .or_default()
+                    .push(Arc::clone(&ec_arc));
+            }
         }
 
         actions
@@ -1248,18 +1258,10 @@ impl ExecutionState {
         // trackers waiting for the remote EC. Without this, txs whose local
         // EC formed but remote EC never arrived stop retrying and are stuck
         // permanently.
+        let active_wave_ids: HashSet<&WaveId> = self.wave_assignments.values().collect();
         self.expected_exec_certs.retain(|(_, _, wave_id), e| {
             let age = self.committed_height.saturating_sub(e.discovered_at);
-            if age < 100 {
-                return true;
-            }
-            // Check if any tx still needs the remote EC for this wave.
-            // A tx needs it if it has either:
-            // - An active certificate tracker (waiting for remote proofs to form TC)
-            // - A wave assignment to a wave matching this wave_id (EC was sent,
-            //   cannot abort — still retrying to get the remote EC)
-            let has_waiting_tx = self.wave_assignments.iter().any(|(_, wid)| wid == wave_id);
-            has_waiting_tx
+            age < 100 || active_wave_ids.contains(wave_id)
         });
 
         // Prune fulfilled set using local height when fulfilled (not remote
@@ -1352,6 +1354,9 @@ impl ExecutionState {
             actions.extend(self.on_execution_vote(topology, vote));
         }
 
+        // Collect tx hashes before consuming the Vec (needed for early EC replay below).
+        let block_tx_hashes: Vec<Hash> = transactions.iter().map(|tx| tx.hash()).collect();
+
         // Separate single-shard and cross-shard transactions
         let (single_shard, cross_shard): (Vec<_>, Vec<_>) = transactions
             .into_iter()
@@ -1381,16 +1386,26 @@ impl ExecutionState {
             });
         }
 
-        // Replay ALL buffered early ECs now that wave trackers exist.
-        // handle_wave_attestation routes each EC to the correct local wave(s)
-        // via tx_hash → wave_assignments lookup.
-        let early_ecs: Vec<_> = std::mem::take(&mut self.early_wave_attestations);
-        if !early_ecs.is_empty() {
+        // Replay buffered early ECs for txs that now have wave assignments.
+        // Only look up tx_hashes from this block's transactions (targeted, not full drain).
+        let mut ecs_to_replay: Vec<Arc<ExecutionCertificate>> = Vec::new();
+        let mut seen_ec_ptrs: HashSet<usize> = HashSet::new();
+        for tx_hash in &block_tx_hashes {
+            if let Some(ecs) = self.early_wave_attestations.remove(tx_hash) {
+                for ec in ecs {
+                    let ptr = Arc::as_ptr(&ec) as usize;
+                    if seen_ec_ptrs.insert(ptr) {
+                        ecs_to_replay.push(ec);
+                    }
+                }
+            }
+        }
+        if !ecs_to_replay.is_empty() {
             tracing::debug!(
-                count = early_ecs.len(),
-                "Replaying early wave attestations after tracker creation"
+                count = ecs_to_replay.len(),
+                "Replaying early wave attestations for newly committed txs"
             );
-            for (ec, _arrival_height) in early_ecs {
+            for ec in ecs_to_replay {
                 actions.extend(self.handle_wave_attestation(topology, ec));
             }
         }
@@ -1516,25 +1531,18 @@ impl ExecutionState {
         ec: Arc<ExecutionCertificate>,
     ) -> Vec<Action> {
         // Find all local waves affected by this EC's tx_outcomes.
+        // Buffer EC under unrouted tx_hashes so it's replayed when their blocks commit.
         let mut affected_waves: BTreeSet<WaveId> = BTreeSet::new();
-        let mut has_unrouted = false;
         for outcome in &ec.tx_outcomes {
             if let Some(local_wave_id) = self.wave_assignments.get(&outcome.tx_hash) {
                 affected_waves.insert(local_wave_id.clone());
             } else {
-                // This tx doesn't have a wave assignment yet — its block hasn't
-                // committed. Re-buffer the EC so it can be replayed later.
-                has_unrouted = true;
+                // Tx doesn't have a wave assignment yet — buffer for replay.
+                self.early_wave_attestations
+                    .entry(outcome.tx_hash)
+                    .or_default()
+                    .push(Arc::clone(&ec));
             }
-        }
-
-        // If some txs in this EC don't have wave assignments yet (block not
-        // committed), re-buffer the EC for later replay. The EC covers txs
-        // across multiple local waves, and we can't drop it just because
-        // some waves are ready — the others still need it.
-        if has_unrouted {
-            self.early_wave_attestations
-                .push((Arc::clone(&ec), self.committed_height));
         }
 
         if affected_waves.is_empty() {
@@ -1799,11 +1807,18 @@ impl ExecutionState {
         });
         let pruned_ev = before_ev - self.early_votes.len();
 
-        if pruned_acc > 0 || pruned_vt > 0 || pruned_ev > 0 {
+        // Prune wave_assignments for waves that no longer have accumulators.
+        let before_wa = self.wave_assignments.len();
+        self.wave_assignments
+            .retain(|_, wave_id| self.accumulators.contains_key(wave_id));
+        let pruned_wa = before_wa - self.wave_assignments.len();
+
+        if pruned_acc > 0 || pruned_vt > 0 || pruned_ev > 0 || pruned_wa > 0 {
             tracing::debug!(
                 pruned_acc,
                 pruned_vt,
                 pruned_ev,
+                pruned_wa,
                 "Pruned resolved wave state"
             );
         }
@@ -1850,9 +1865,9 @@ impl ExecutionState {
 
         let early_count = self
             .early_wave_attestations
-            .iter()
-            .filter(|(ec, _)| ec.tx_outcomes.iter().any(|o| o.tx_hash == *tx_hash))
-            .count();
+            .get(tx_hash)
+            .map(|v| v.len())
+            .unwrap_or(0);
 
         format!("{}, early_wave_attestations={}", wave_info, early_count)
     }

@@ -35,6 +35,9 @@ pub struct WaveCertificateTracker {
     /// Canonical hashes of ECs already processed (dedup guard).
     /// Prevents duplicate ECs from network re-delivery.
     seen_ec_hashes: HashSet<Hash>,
+    /// Per-tx: whether any EC reported a non-success outcome. Built incrementally
+    /// during add_execution_certificate to avoid O(txs × ecs × outcomes) in tx_decisions.
+    tx_has_failure: HashSet<Hash>,
     /// Height when this tracker was created.
     created_at: u64,
 }
@@ -60,6 +63,7 @@ impl WaveCertificateTracker {
             aborted: BTreeSet::new(),
             execution_certificates: Vec::new(),
             seen_ec_hashes: HashSet::new(),
+            tx_has_failure: HashSet::new(),
             created_at,
         }
     }
@@ -89,12 +93,18 @@ impl WaveCertificateTracker {
 
         let shard = ec.shard_group_id();
 
-        // Update per-tx coverage
+        // Update per-tx coverage and failure tracking
         for outcome in &ec.tx_outcomes {
             if let Some(covered_shards) = self.covered.get_mut(&outcome.tx_hash) {
                 covered_shards.insert(shard);
                 if outcome.is_aborted() {
                     self.aborted.insert(outcome.tx_hash);
+                }
+                if !matches!(
+                    outcome.outcome,
+                    ExecutionOutcome::Executed { success: true, .. }
+                ) {
+                    self.tx_has_failure.insert(outcome.tx_hash);
                 }
             }
         }
@@ -187,22 +197,10 @@ impl WaveCertificateTracker {
             .map(|tx_hash| {
                 let decision = if self.aborted.contains(tx_hash) {
                     TransactionDecision::Aborted
+                } else if self.tx_has_failure.contains(tx_hash) {
+                    TransactionDecision::Reject
                 } else {
-                    // Only check ECs that contain an outcome for this tx.
-                    // A remote shard may split the wave's txs across multiple
-                    // blocks → multiple ECs, each covering a subset of txs.
-                    let all_succeeded = self
-                        .execution_certificates
-                        .iter()
-                        .filter_map(|ec| ec.tx_outcomes.iter().find(|o| o.tx_hash == *tx_hash))
-                        .all(|o| {
-                            matches!(o.outcome, ExecutionOutcome::Executed { success: true, .. })
-                        });
-                    if all_succeeded {
-                        TransactionDecision::Accept
-                    } else {
-                        TransactionDecision::Reject
-                    }
+                    TransactionDecision::Accept
                 };
                 (*tx_hash, decision)
             })
