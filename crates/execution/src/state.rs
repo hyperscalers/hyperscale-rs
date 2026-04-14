@@ -136,8 +136,8 @@ pub struct ExecutionState {
     /// Tracks provision coverage and conflicts for vote height determination.
     accumulators: HashMap<WaveId, ExecutionAccumulator>,
 
-    /// Execution vote trackers: collect execution votes from other validators.
-    /// Created by all validators (N→N voting).
+    /// Execution vote trackers: collect execution votes for EC aggregation.
+    /// Only created by wave leaders (primary or fallback via rotation).
     vote_trackers: HashMap<WaveId, VoteTracker>,
 
     /// Waves that have a canonical EC (aggregated by wave leader or received via broadcast).
@@ -394,21 +394,26 @@ impl ExecutionState {
 
             self.accumulators.insert(wave_id.clone(), accumulator);
 
-            // All validators create a VoteTracker and aggregate votes locally.
-            // N→N voting: every validator receives votes from all peers and
-            // aggregates the EC independently when 2f+1 votes arrive.
-            let tracker = VoteTracker::new(wave_id.clone(), block_hash, quorum);
-            self.vote_trackers.insert(wave_id.clone(), tracker);
+            // Only the wave leader creates a VoteTracker for aggregation.
+            // Non-leaders send their vote to the leader and wait for the EC broadcast.
+            let leader = hyperscale_types::wave_leader(&wave_id, topology.local_committee());
+            if topology.local_validator_id() == leader {
+                let tracker = VoteTracker::new(wave_id.clone(), block_hash, quorum);
+                self.vote_trackers.insert(wave_id.clone(), tracker);
 
-            // Replay early execution votes that arrived before tracking started.
-            if let Some(early_votes) = self.early_votes.remove(&wave_id) {
-                tracing::debug!(
-                    block_hash = ?block_hash,
-                    wave = %wave_id,
-                    count = early_votes.len(),
-                    "Replaying early execution votes"
-                );
-                votes_to_replay.extend(early_votes);
+                // Replay early execution votes that arrived before tracking started.
+                if let Some(early_votes) = self.early_votes.remove(&wave_id) {
+                    tracing::debug!(
+                        block_hash = ?block_hash,
+                        wave = %wave_id,
+                        count = early_votes.len(),
+                        "Replaying early execution votes"
+                    );
+                    votes_to_replay.extend(early_votes);
+                }
+            } else {
+                // Non-leader: discard any early votes.
+                self.early_votes.remove(&wave_id);
             }
         }
 
@@ -802,7 +807,10 @@ impl ExecutionState {
 
     /// Handle an execution vote received from another validator (or self).
     ///
-    /// All validators aggregate votes (N→N voting).
+    /// Only the wave leader (or a fallback leader via rotation) aggregates votes.
+    /// If a vote arrives at a non-leader that has the accumulator but no tracker,
+    /// a fallback VoteTracker is created on-demand (the sender determined this
+    /// validator is the rotated leader for their retry attempt).
     pub fn on_execution_vote(
         &mut self,
         topology: &TopologySnapshot,
@@ -811,16 +819,26 @@ impl ExecutionState {
         let wave_id = vote.wave_id.clone();
         let validator_id = vote.validator;
 
-        // Check if we're tracking this wave (all validators have VoteTrackers)
         if !self.vote_trackers.contains_key(&wave_id) {
-            // No accumulator yet — block hasn't committed. Buffer for replay.
             if !self.accumulators.contains_key(&wave_id) {
+                // Block hasn't committed yet — buffer as early vote.
                 self.early_votes.entry(wave_id).or_default().push(vote);
                 return vec![];
             }
-            // Accumulator exists but no VoteTracker — wave already completed
-            // (EC aggregated and tracker removed). Discard late vote.
-            return vec![];
+            if self.waves_with_ec.contains(&wave_id) {
+                // Already have EC for this wave — discard late vote.
+                return vec![];
+            }
+            // Accumulator exists but no VoteTracker and no EC yet. This validator
+            // was targeted as a fallback leader (rotated attempt). Create tracker.
+            let quorum = topology.local_quorum_threshold();
+            let block_hash = self.accumulators.get(&wave_id).unwrap().block_hash();
+            tracing::info!(
+                wave = %wave_id,
+                "Creating fallback VoteTracker — receiving votes as rotated leader"
+            );
+            let tracker = VoteTracker::new(wave_id.clone(), block_hash, quorum);
+            self.vote_trackers.insert(wave_id.clone(), tracker);
         }
 
         // Skip verification for our own vote
