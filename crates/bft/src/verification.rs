@@ -776,14 +776,17 @@ impl VerificationPipeline {
         self.last_committed_jvt_root = new_root;
         self.last_committed_height = block_height;
 
-        // Find all pending verifications where the JVT now has the required
-        // base root. The height is implicitly satisfied since the root matches.
-        let unblocked: Vec<Hash> = self
+        // Find the lowest-height pending verification matching the new root.
+        // Only unblock one at a time so the prepared commit is fresh when the
+        // block commits — unblocking multiple lets later blocks race ahead and
+        // produce stale snapshots that miss the fast commit path.
+        let next = self
             .pending_state_root_verifications
             .iter()
             .filter(|(_, pv)| pv.required_root == new_root)
-            .map(|(hash, _)| *hash)
-            .collect();
+            .min_by_key(|(_, pv)| pv.block_height)
+            .map(|(hash, _)| *hash);
+        let unblocked: Vec<Hash> = next.into_iter().collect();
 
         if unblocked.is_empty() {
             return;
