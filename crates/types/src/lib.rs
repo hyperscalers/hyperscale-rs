@@ -95,7 +95,7 @@ pub use transaction::{
 pub use validator::{ValidatorInfo, ValidatorSet};
 pub use wave::{
     compute_global_receipt_root_with_proof, compute_waves, decode_wave_cert_vec,
-    derive_wave_tx_hashes, designated_broadcaster, encode_wave_cert_vec, tx_outcome_leaf,
+    derive_wave_tx_hashes, encode_wave_cert_vec, tx_outcome_leaf, wave_leader, wave_leader_at,
     ExecutionCertificate, ExecutionOutcome, ExecutionVote, FinalizedWave, TxOutcome,
     WaveCertificate, WaveId,
 };
