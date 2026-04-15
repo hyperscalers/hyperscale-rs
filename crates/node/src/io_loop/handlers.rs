@@ -76,13 +76,13 @@ where
         )>;
 
         struct ProvisionRequestDedup {
-            cache: HashMap<(u64, u64), ProvisionResponse>,
+            cache: std::collections::BTreeMap<(u64, u64), ProvisionResponse>,
             in_flight: HashMap<(u64, u64), ProvisionWaiter>,
         }
 
         let dedup: Arc<std::sync::Mutex<ProvisionRequestDedup>> =
             Arc::new(std::sync::Mutex::new(ProvisionRequestDedup {
-                cache: HashMap::new(),
+                cache: std::collections::BTreeMap::new(),
                 in_flight: HashMap::new(),
             }));
 
@@ -131,9 +131,9 @@ where
                     let mut guard = dedup.lock().unwrap();
                     if response.provisions.is_some() {
                         guard.cache.insert(cache_key, response.clone());
-                        // Evict old entries (keep last 256)
+                        // Evict oldest entry (keep last 256)
                         if guard.cache.len() > 256 {
-                            let min_key = *guard.cache.keys().min().unwrap();
+                            let min_key = *guard.cache.first_key_value().unwrap().0;
                             guard.cache.remove(&min_key);
                         }
                     }
