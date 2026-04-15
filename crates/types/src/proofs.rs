@@ -98,8 +98,7 @@ impl TxEntries {
 /// The QC and state_root are obtained from `CommittedBlockHeader` received
 /// via gossip — they don't travel with the provision batch.
 ///
-/// The content hash is computed eagerly at construction and included in the
-/// SBOR encoding, so deserialization restores it without recomputation.
+/// The content hash is computed eagerly at construction and on deserialization.
 pub struct Provision {
     /// Source shard that committed this block.
     pub source_shard: ShardGroupId,
@@ -113,7 +112,7 @@ pub struct Provision {
     /// Per-transaction entries.
     pub transactions: Vec<TxEntries>,
 
-    /// Cached content hash (SBOR-encode of content fields, then blake3).
+    /// Cached content hash (blake3 over SBOR-encoded content fields).
     hash: Hash,
 }
 
@@ -148,8 +147,7 @@ impl PartialEq for Provision {
 
 impl Eq for Provision {}
 
-// Manual SBOR: includes the cached hash in the encoding so deserialization
-// restores it without recomputation.
+// Manual SBOR: the cached hash is derived, not serialized.
 impl<E: sbor::Encoder<sbor::NoCustomValueKind>> sbor::Encode<sbor::NoCustomValueKind, E>
     for Provision
 {
@@ -158,13 +156,11 @@ impl<E: sbor::Encoder<sbor::NoCustomValueKind>> sbor::Encode<sbor::NoCustomValue
     }
 
     fn encode_body(&self, encoder: &mut E) -> Result<(), sbor::EncodeError> {
-        encoder.write_size(5)?;
+        encoder.write_size(4)?;
         encoder.encode(&self.source_shard)?;
         encoder.encode(&self.block_height)?;
         encoder.encode(&self.proof)?;
         encoder.encode(&self.transactions)?;
-        let hash_bytes: [u8; 32] = *self.hash.as_bytes();
-        encoder.encode(&hash_bytes)?;
         Ok(())
     }
 }
@@ -178,9 +174,9 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
     ) -> Result<Self, sbor::DecodeError> {
         decoder.check_preloaded_value_kind(value_kind, sbor::ValueKind::Tuple)?;
         let length = decoder.read_size()?;
-        if length != 5 {
+        if length != 4 {
             return Err(sbor::DecodeError::UnexpectedSize {
-                expected: 5,
+                expected: 4,
                 actual: length,
             });
         }
@@ -188,8 +184,7 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
         let block_height: BlockHeight = decoder.decode()?;
         let proof: VerkleInclusionProof = decoder.decode()?;
         let transactions: Vec<TxEntries> = decoder.decode()?;
-        let hash_bytes: [u8; 32] = decoder.decode()?;
-        let hash = Hash::from_hash_bytes(&hash_bytes);
+        let hash = Self::compute_hash(source_shard, &block_height, &proof, &transactions);
         Ok(Self {
             source_shard,
             block_height,
@@ -342,12 +337,16 @@ mod tests {
 
     #[test]
     fn test_provision_batch_roundtrip() {
-        let mut batch = Provision::dummy(ShardGroupId(0), BlockHeight(10));
-        batch.transactions = vec![TxEntries {
-            tx_hash: Hash::from_bytes(b"tx1"),
-            entries: vec![test_entry(1)],
-            target_nodes: vec![],
-        }];
+        let batch = Provision::new(
+            ShardGroupId(0),
+            BlockHeight(10),
+            VerkleInclusionProof::dummy(),
+            vec![TxEntries {
+                tx_hash: Hash::from_bytes(b"tx1"),
+                entries: vec![test_entry(1)],
+                target_nodes: vec![],
+            }],
+        );
 
         let bytes = sbor::basic_encode(&batch).unwrap();
         let decoded: Provision = sbor::basic_decode(&bytes).unwrap();
