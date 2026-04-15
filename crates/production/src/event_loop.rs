@@ -268,8 +268,11 @@ pub fn run_pinned_loop(mut io_loop: ProdIoLoop, mut config: PinnedLoopConfig) {
         // ── Periodic metrics + RPC status snapshot ──
         if last_metrics.elapsed() >= METRICS_INTERVAL {
             last_metrics = Instant::now();
-            io_loop.collect_metrics();
-            metrics::set_channel_depths(&hyperscale_metrics::ChannelDepths {
+
+            // Capture cheap snapshot on pinned thread, dispatch expensive
+            // recording (RocksDB queries + prometheus calls) off-thread.
+            let snapshot = io_loop.metrics_snapshot();
+            let channel_depths = hyperscale_metrics::ChannelDepths {
                 callback: config.callback_rx.len(),
                 consensus: config.consensus_rx.len(),
                 validated_tx: 0,
@@ -278,6 +281,11 @@ pub fn run_pinned_loop(mut io_loop: ProdIoLoop, mut config: PinnedLoopConfig) {
                 sync_request: 0,
                 tx_request: 0,
                 cert_request: 0,
+            };
+            let storage = io_loop.storage().clone();
+            config.tokio_handle.spawn_blocking(move || {
+                hyperscale_node::io_loop::record_metrics(snapshot, &*storage);
+                metrics::set_channel_depths(&channel_depths);
             });
 
             // Push status snapshot to shared RPC state.

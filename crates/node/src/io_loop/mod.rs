@@ -214,6 +214,62 @@ pub struct NodeStatusSnapshot {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// MetricsSnapshot — cheap state capture for off-thread recording
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Lightweight snapshot of io_loop state for metrics recording.
+///
+/// All fields are plain integers collected via `.len()` calls on the pinned
+/// thread. The expensive work (RocksDB property queries, prometheus recording)
+/// happens off-thread via [`record_metrics`].
+pub struct MetricsSnapshot {
+    pub bft_round: u64,
+    pub view_changes: u64,
+    pub mempool_size: usize,
+    pub contention_ratio: f64,
+    pub in_flight: usize,
+    pub backpressure_active: bool,
+    pub blocks_behind: u64,
+    pub is_syncing: bool,
+    pub fetch_transaction: usize,
+    pub fetch_provision: usize,
+    pub fetch_local_provision: usize,
+    pub fetch_exec_cert: usize,
+    pub fetch_header: usize,
+    pub fetch_finalized_wave: usize,
+    pub memory: metrics::MemoryMetrics,
+}
+
+/// Record a [`MetricsSnapshot`] to the metrics backend.
+///
+/// This performs the prometheus `set_*` calls (76 label lookups) plus
+/// the RocksDB property queries for storage memory usage. Designed to
+/// run off the pinned thread via `spawn_blocking`.
+pub fn record_metrics<S: ChainWriter>(snapshot: MetricsSnapshot, storage: &S) {
+    metrics::set_bft_round(snapshot.bft_round);
+    metrics::set_view_changes(snapshot.view_changes);
+    metrics::set_mempool_size(snapshot.mempool_size);
+    metrics::set_lock_contention(snapshot.contention_ratio);
+    metrics::set_in_flight(snapshot.in_flight);
+    metrics::set_backpressure_active(snapshot.backpressure_active);
+    metrics::set_sync_status(snapshot.blocks_behind, snapshot.is_syncing);
+    metrics::set_fetch_in_flight("transaction", snapshot.fetch_transaction);
+    metrics::set_fetch_in_flight("provision", snapshot.fetch_provision);
+    metrics::set_fetch_in_flight("local_provision", snapshot.fetch_local_provision);
+    metrics::set_fetch_in_flight("exec_cert", snapshot.fetch_exec_cert);
+    metrics::set_fetch_in_flight("header", snapshot.fetch_header);
+    metrics::set_fetch_in_flight("finalized_wave", snapshot.fetch_finalized_wave);
+
+    // RocksDB property queries — potentially slow under compaction pressure.
+    let (rocksdb_bc, rocksdb_mt) = storage.memory_usage_bytes();
+    let mut memory = snapshot.memory;
+    memory.jvt_node_cache_entries = storage.node_cache_len();
+    memory.rocksdb_block_cache_usage_bytes = rocksdb_bc;
+    memory.rocksdb_memtable_usage_bytes = rocksdb_mt;
+    metrics::set_memory_metrics(&memory);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // IoLoop
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -1091,121 +1147,104 @@ where
 
     /// Collect and export metrics from the state machine.
     ///
-    /// Called periodically (every ~1s) by the driving loop. Reads state from
-    /// BFT, mempool, execution, sync, and fetch subsystems and
-    /// emits them via the `hyperscale_metrics` facade. In production the
-    /// Prometheus backend records them; in simulation the no-op backend
-    /// discards them at zero cost.
-    pub fn collect_metrics(&mut self) {
-        // ── BFT ──
+    /// Capture a lightweight metrics snapshot from state machine internals.
+    ///
+    /// Only reads `.len()` / `.stats()` from subsystems — no locks, no I/O,
+    /// no prometheus calls. The caller dispatches [`record_metrics`] off-thread
+    /// to do the expensive work (RocksDB queries, prometheus recording).
+    pub fn metrics_snapshot(&self) -> MetricsSnapshot {
         let bft_stats = self.state.bft().stats();
-        metrics::set_bft_round(bft_stats.current_round);
-        metrics::set_view_changes(bft_stats.view_changes);
-
-        // ── Mempool ──
         let mempool = self.state.mempool();
-        let total = mempool.len();
         let contention = mempool.lock_contention_stats();
-        metrics::set_mempool_size(total);
-        metrics::set_lock_contention(contention.contention_ratio());
-        let in_flight = mempool.in_flight();
-        metrics::set_in_flight(in_flight);
-        metrics::set_backpressure_active(mempool.at_in_flight_limit());
-
-        // ── Sync ──
-        metrics::set_sync_status(
-            self.sync_protocol.blocks_behind(),
-            self.sync_protocol.is_syncing(),
-        );
-
-        // ── Fetch ──
         let fetch_status = self.transaction_fetch_protocol.status();
-        metrics::set_fetch_in_flight("transaction", fetch_status.in_flight_operations);
-        metrics::set_fetch_in_flight("provision", self.provision_fetch_protocol.in_flight_count());
-        metrics::set_fetch_in_flight(
-            "local_provision",
-            self.local_provision_fetch_protocol.in_flight_count(),
-        );
-        metrics::set_fetch_in_flight("exec_cert", self.exec_cert_fetch_protocol.in_flight_count());
-        metrics::set_fetch_in_flight("header", self.header_fetch_protocol.in_flight_count());
-        metrics::set_fetch_in_flight(
-            "finalized_wave",
-            self.finalized_wave_fetch_protocol.in_flight_count(),
-        );
 
-        // ── Memory ──
         let bft_mem = self.state.bft().memory_stats();
         let exec_mem = self.state.execution().memory_stats();
         let mempool_mem = self.state.mempool().memory_stats();
         let prov_mem = self.state.provisions().memory_stats();
         let rh_mem = self.state.remote_headers().memory_stats();
-        let (rocksdb_bc, rocksdb_mt) = self.storage.memory_usage_bytes();
 
-        metrics::set_memory_metrics(&metrics::MemoryMetrics {
-            // BFT
-            bft_pending_blocks: bft_mem.pending_blocks,
-            bft_vote_sets: bft_mem.vote_sets,
-            bft_certified_blocks: bft_mem.certified_blocks,
-            bft_pending_commits: bft_mem.pending_commits,
-            bft_pending_commits_awaiting_data: bft_mem.pending_commits_awaiting_data,
-            bft_remote_headers: bft_mem.remote_headers,
-            bft_voted_heights: bft_mem.voted_heights,
-            bft_received_votes_by_height: bft_mem.received_votes_by_height,
-            bft_committed_tx_lookup: bft_mem.committed_tx_lookup,
-            bft_recently_committed_txs: bft_mem.recently_committed_txs,
-            bft_recently_committed_certs: bft_mem.recently_committed_certs,
-            bft_pending_qc_verifications: bft_mem.pending_qc_verifications,
-            bft_verified_qcs: bft_mem.verified_qcs,
-            bft_pending_state_root_verifications: bft_mem.pending_state_root_verifications,
-            bft_buffered_synced_blocks: bft_mem.buffered_synced_blocks,
-            bft_pending_synced_block_verifications: bft_mem.pending_synced_block_verifications,
-            // Execution
-            exec_cache_entries: exec_mem.receipt_cache,
-            exec_finalized_wave_certificates: exec_mem.finalized_wave_certificates,
-            exec_pending_provisioning: exec_mem.pending_provisioning,
-            exec_accumulators: exec_mem.accumulators,
-            exec_vote_trackers: exec_mem.vote_trackers,
-            exec_early_votes: exec_mem.early_votes,
-            exec_wave_certificate_trackers: exec_mem.wave_certificate_trackers,
-            exec_expected_exec_certs: exec_mem.expected_exec_certs,
-            exec_verified_provisions: exec_mem.verified_provisions,
-            exec_required_provision_shards: exec_mem.required_provision_shards,
-            exec_received_provision_shards: exec_mem.received_provision_shards,
-            exec_waves_with_ec: exec_mem.waves_with_ec,
-            exec_pending_vote_retries: exec_mem.pending_vote_retries,
-            exec_wave_assignments: exec_mem.wave_assignments,
-            exec_pending_wave_receipts: exec_mem.pending_wave_receipts,
-            exec_early_execution_results: exec_mem.early_execution_results,
-            exec_early_wave_attestations: exec_mem.early_wave_attestations,
-            exec_early_committed_provisions: exec_mem.early_committed_provisions,
-            exec_fulfilled_exec_certs: exec_mem.fulfilled_exec_certs,
-            // Mempool
-            mempool_pool: mempool_mem.pool,
-            mempool_ready: mempool_mem.ready,
-            mempool_tombstones: mempool_mem.tombstones,
-            mempool_recently_evicted: mempool_mem.recently_evicted,
-            mempool_locked_nodes: mempool_mem.locked_nodes,
-            mempool_in_flight_heights: mempool_mem.in_flight_heights,
-            mempool_deferred_by_nodes: mempool_mem.deferred_by_nodes,
-            mempool_txs_deferred_by_node: mempool_mem.txs_deferred_by_node,
-            mempool_ready_txs_by_node: mempool_mem.ready_txs_by_node,
-            // Remote Headers
-            rh_pending_headers: rh_mem.pending_headers,
-            rh_verified_headers: rh_mem.verified_headers,
-            rh_expected_headers: rh_mem.expected_headers,
-            // Provision
-            prov_verified_remote_headers: prov_mem.verified_remote_headers,
-            prov_pending_provisions: prov_mem.pending_provisions,
-            prov_verified_batches: prov_mem.verified_batches,
-            prov_expected_provisions: prov_mem.expected_provisions,
-            prov_batches_by_hash: prov_mem.batches_by_hash,
-            prov_queued_provision_batches: prov_mem.queued_provision_batches,
-            prov_committed_batch_tombstones: prov_mem.committed_batch_tombstones,
-            // Storage
-            jvt_node_cache_entries: self.storage.node_cache_len(),
-            rocksdb_block_cache_usage_bytes: rocksdb_bc,
-            rocksdb_memtable_usage_bytes: rocksdb_mt,
-        });
+        MetricsSnapshot {
+            bft_round: bft_stats.current_round,
+            view_changes: bft_stats.view_changes,
+            mempool_size: mempool.len(),
+            contention_ratio: contention.contention_ratio(),
+            in_flight: mempool.in_flight(),
+            backpressure_active: mempool.at_in_flight_limit(),
+            blocks_behind: self.sync_protocol.blocks_behind(),
+            is_syncing: self.sync_protocol.is_syncing(),
+            fetch_transaction: fetch_status.in_flight_operations,
+            fetch_provision: self.provision_fetch_protocol.in_flight_count(),
+            fetch_local_provision: self.local_provision_fetch_protocol.in_flight_count(),
+            fetch_exec_cert: self.exec_cert_fetch_protocol.in_flight_count(),
+            fetch_header: self.header_fetch_protocol.in_flight_count(),
+            fetch_finalized_wave: self.finalized_wave_fetch_protocol.in_flight_count(),
+            memory: metrics::MemoryMetrics {
+                // BFT
+                bft_pending_blocks: bft_mem.pending_blocks,
+                bft_vote_sets: bft_mem.vote_sets,
+                bft_certified_blocks: bft_mem.certified_blocks,
+                bft_pending_commits: bft_mem.pending_commits,
+                bft_pending_commits_awaiting_data: bft_mem.pending_commits_awaiting_data,
+                bft_remote_headers: bft_mem.remote_headers,
+                bft_voted_heights: bft_mem.voted_heights,
+                bft_received_votes_by_height: bft_mem.received_votes_by_height,
+                bft_committed_tx_lookup: bft_mem.committed_tx_lookup,
+                bft_recently_committed_txs: bft_mem.recently_committed_txs,
+                bft_recently_committed_certs: bft_mem.recently_committed_certs,
+                bft_pending_qc_verifications: bft_mem.pending_qc_verifications,
+                bft_verified_qcs: bft_mem.verified_qcs,
+                bft_pending_state_root_verifications: bft_mem.pending_state_root_verifications,
+                bft_buffered_synced_blocks: bft_mem.buffered_synced_blocks,
+                bft_pending_synced_block_verifications: bft_mem.pending_synced_block_verifications,
+                // Execution
+                exec_cache_entries: exec_mem.receipt_cache,
+                exec_finalized_wave_certificates: exec_mem.finalized_wave_certificates,
+                exec_pending_provisioning: exec_mem.pending_provisioning,
+                exec_accumulators: exec_mem.accumulators,
+                exec_vote_trackers: exec_mem.vote_trackers,
+                exec_early_votes: exec_mem.early_votes,
+                exec_wave_certificate_trackers: exec_mem.wave_certificate_trackers,
+                exec_expected_exec_certs: exec_mem.expected_exec_certs,
+                exec_verified_provisions: exec_mem.verified_provisions,
+                exec_required_provision_shards: exec_mem.required_provision_shards,
+                exec_received_provision_shards: exec_mem.received_provision_shards,
+                exec_waves_with_ec: exec_mem.waves_with_ec,
+                exec_pending_vote_retries: exec_mem.pending_vote_retries,
+                exec_wave_assignments: exec_mem.wave_assignments,
+                exec_pending_wave_receipts: exec_mem.pending_wave_receipts,
+                exec_early_execution_results: exec_mem.early_execution_results,
+                exec_early_wave_attestations: exec_mem.early_wave_attestations,
+                exec_early_committed_provisions: exec_mem.early_committed_provisions,
+                exec_fulfilled_exec_certs: exec_mem.fulfilled_exec_certs,
+                // Mempool
+                mempool_pool: mempool_mem.pool,
+                mempool_ready: mempool_mem.ready,
+                mempool_tombstones: mempool_mem.tombstones,
+                mempool_recently_evicted: mempool_mem.recently_evicted,
+                mempool_locked_nodes: mempool_mem.locked_nodes,
+                mempool_in_flight_heights: mempool_mem.in_flight_heights,
+                mempool_deferred_by_nodes: mempool_mem.deferred_by_nodes,
+                mempool_txs_deferred_by_node: mempool_mem.txs_deferred_by_node,
+                mempool_ready_txs_by_node: mempool_mem.ready_txs_by_node,
+                // Remote Headers
+                rh_pending_headers: rh_mem.pending_headers,
+                rh_verified_headers: rh_mem.verified_headers,
+                rh_expected_headers: rh_mem.expected_headers,
+                // Provision
+                prov_verified_remote_headers: prov_mem.verified_remote_headers,
+                prov_pending_provisions: prov_mem.pending_provisions,
+                prov_verified_batches: prov_mem.verified_batches,
+                prov_expected_provisions: prov_mem.expected_provisions,
+                prov_batches_by_hash: prov_mem.batches_by_hash,
+                prov_queued_provision_batches: prov_mem.queued_provision_batches,
+                prov_committed_batch_tombstones: prov_mem.committed_batch_tombstones,
+                // Storage — filled in by record_metrics off-thread.
+                jvt_node_cache_entries: 0,
+                rocksdb_block_cache_usage_bytes: 0,
+                rocksdb_memtable_usage_bytes: 0,
+            },
+        }
     }
 
     /// Capture a snapshot of node state for external status APIs.
