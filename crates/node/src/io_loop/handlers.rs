@@ -195,15 +195,11 @@ where
 
                     let guard = cert_cache.lock().unwrap();
 
-                    // Find all cached certs matching the requested height + wave IDs.
-                    // We scan the cache since keys are (block_hash, wave_id) and we
-                    // only know block_height. This is fine for a bounded cache.
                     let mut certs = Vec::new();
                     for wave_id in &req.wave_ids {
-                        for ((_, cached_wave), cert) in guard.iter() {
-                            if cert.block_height() == req.block_height && cached_wave == wave_id {
-                                certs.push(cert.as_ref().clone());
-                            }
+                        let key = (wave_id.hash(), wave_id.clone());
+                        if let Some(cert) = guard.get(&key) {
+                            certs.push(cert.as_ref().clone());
                         }
                     }
 
