@@ -608,16 +608,22 @@ impl StateMachine for NodeStateMachine {
                 height,
                 block,
                 provision_hashes,
-            } => {
-                // Unblock deferred state root verifications whose parent's
-                // tree nodes are now in the store (needed for sync blocks).
-                self.bft.on_jvt_committed(height);
-                self.on_block_committed(block_hash, height, block, provision_hashes)
-            }
+            } => self.on_block_committed(block_hash, height, block, provision_hashes),
 
             // ── Block Persisted (RocksDB write complete) ───────────────
-            // Bookkeeping only — consensus already advanced on BlockCommitted.
-            ProtocolEvent::BlockPersisted { .. } => vec![],
+            // Unblock deferred state root verifications whose parent's
+            // tree nodes are now in the tree store. This MUST happen on
+            // BlockPersisted (not BlockCommitted) because sync blocks
+            // skip VerifyStateRoot — their JVT snapshots are never cached
+            // in jvt_snapshot_cache, so the tree nodes only become
+            // available once commit_block writes them to storage.
+            // Consensus blocks are unaffected: their parents' tree nodes
+            // are available via verified_state_roots (from prior
+            // VerifyStateRoot), so the deferral gate already passes.
+            ProtocolEvent::BlockPersisted { height } => {
+                self.bft.on_jvt_committed(height);
+                vec![]
+            }
 
             // ── Provision ───────────────────────────────────────────────
             ProtocolEvent::StateProvisionReceived { batch } => self
