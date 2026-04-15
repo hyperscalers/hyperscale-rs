@@ -2940,6 +2940,16 @@ impl BftState {
                 id: TimerId::Proposal,
                 duration: remaining,
             });
+        } else if !should_try_proposal && topology.should_propose(next_height, self.view) {
+            // We're the next proposer but have no content yet. Reschedule the
+            // proposal timer to fire promptly so we don't wait for a stale
+            // periodic tick (which may be delayed by event queue depth).
+            // This gives the mempool a brief window to accumulate transactions
+            // while ensuring we propose quickly even without content.
+            actions.push(Action::SetTimer {
+                id: TimerId::Proposal,
+                duration: self.config.min_block_interval,
+            });
         }
 
         // Update last_qc_time AFTER the rate limit check so this QC's time
