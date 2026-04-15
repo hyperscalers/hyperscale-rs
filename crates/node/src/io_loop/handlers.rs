@@ -15,7 +15,7 @@ use tracing::warn;
 
 impl<S, N, D, E> IoLoop<S, N, D, E>
 where
-    S: ChainWriter + SubstateStore + ChainReader + Send + Sync,
+    S: ChainWriter + SubstateStore + ChainReader + hyperscale_storage::JvtTreeReader + Send + Sync,
     N: Network,
     D: Dispatch,
     E: Engine,

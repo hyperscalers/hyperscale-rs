@@ -28,6 +28,7 @@ mod genesis;
 pub mod keys;
 mod overlay;
 mod store;
+pub mod substate_overlay;
 pub mod tree;
 mod writes;
 
@@ -37,8 +38,10 @@ pub mod test_helpers;
 pub use chain_reader::ChainReader;
 pub use chain_writer::ChainWriter;
 pub use genesis::{GenesisWrapper, SubstatesOnlyCommit};
+pub use jellyfish_verkle_tree::TreeReader as JvtTreeReader;
 pub use overlay::{SubstateDbLookup, SubstateLookup};
 pub use store::SubstateStore;
+pub use substate_overlay::SubstateOverlay;
 pub use tree::{CollectedWrites, JvtNodeKey, JvtSnapshot, LeafSubstateKeyAssociation};
 pub use writes::{
     merge_database_updates, merge_database_updates_from_arcs, merge_into,

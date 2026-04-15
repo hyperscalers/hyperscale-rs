@@ -43,9 +43,36 @@ fn collect_pending_snapshots(
     chain
 }
 
+/// Collect pending `DatabaseUpdates` from unpersisted blocks, sorted by height.
+///
+/// Returns `(height, updates)` pairs sorted ascending so the overlay applies them
+/// in commit order.
+/// Build a `SubstateOverlay` wrapping the given storage with pending updates.
+pub(crate) fn build_overlay<S: ChainWriter + SubstateStore + ChainReader>(
+    storage_arc: &Arc<S>,
+    pending_db_updates: &std::sync::Mutex<
+        std::collections::HashMap<Hash, (u64, Arc<hyperscale_storage::DatabaseUpdates>)>,
+    >,
+    jvt_snapshot_cache: &std::sync::Mutex<
+        std::collections::HashMap<Hash, (Hash, Arc<hyperscale_storage::JvtSnapshot>)>,
+    >,
+) -> hyperscale_storage::SubstateOverlay<S> {
+    let cache = pending_db_updates.lock().unwrap();
+    let mut updates: Vec<(u64, Arc<hyperscale_storage::DatabaseUpdates>)> =
+        cache.values().map(|(h, u)| (*h, Arc::clone(u))).collect();
+    updates.sort_by_key(|(h, _)| *h);
+
+    let jvt_cache = jvt_snapshot_cache.lock().unwrap();
+    let jvt_snapshots: Vec<Arc<hyperscale_storage::JvtSnapshot>> = jvt_cache
+        .values()
+        .map(|(_, snap)| Arc::clone(snap))
+        .collect();
+
+    hyperscale_storage::SubstateOverlay::new(Arc::clone(storage_arc), updates, jvt_snapshots)
+}
+
 /// Context for executing delegated actions.
 pub(crate) struct ActionContext<'a, S: ChainWriter + SubstateStore + ChainReader, E: Engine> {
-    pub storage: &'a S,
     pub executor: &'a E,
     pub topology: &'a hyperscale_types::TopologySnapshot,
     pub jvt_snapshot_cache: &'a std::sync::Mutex<
@@ -54,6 +81,10 @@ pub(crate) struct ActionContext<'a, S: ChainWriter + SubstateStore + ChainReader
             (hyperscale_types::Hash, Arc<hyperscale_storage::JvtSnapshot>),
         >,
     >,
+    /// Substate overlay: layers unpersisted block state over base storage.
+    /// Used by execution and provision handlers to read substates from
+    /// blocks committed by consensus but not yet written to RocksDB.
+    pub overlay: hyperscale_storage::SubstateOverlay<S>,
 }
 
 /// Result of handling a delegated action.
@@ -63,6 +94,10 @@ pub(crate) struct DelegatedResult<P: Send> {
     /// Prepared commit handle to cache: (block_hash, block_height, handle).
     /// Height is stored alongside the handle so stale entries can be pruned.
     pub prepared_commit: Option<(Hash, u64, P)>,
+    /// Database updates from this block's receipts, for `SubstateOverlay`.
+    /// Populated alongside `prepared_commit` so delegated action handlers
+    /// can read substates from unpersisted blocks.
+    pub db_updates: Option<(Hash, u64, Arc<hyperscale_storage::DatabaseUpdates>)>,
 }
 
 /// Which dispatch pool an action should run on in production.
@@ -121,7 +156,10 @@ pub(crate) fn dispatch_pool_for(action: &Action) -> Option<DispatchPool> {
 /// The runner is responsible for additionally broadcasting votes to shard
 /// peers (network-specific).
 #[allow(clippy::too_many_lines)]
-pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainReader, E: Engine>(
+pub(crate) fn handle_delegated_action<
+    S: ChainWriter + SubstateStore + ChainReader + hyperscale_storage::JvtTreeReader + Sync,
+    E: Engine,
+>(
     action: Action,
     ctx: &ActionContext<'_, S, E>,
 ) -> Option<DelegatedResult<S::PreparedCommit>> {
@@ -158,6 +196,7 @@ pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainRead
                     },
                 )],
                 prepared_commit: None,
+                db_updates: None,
             })
         }
 
@@ -175,6 +214,7 @@ pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainRead
                     valid,
                 })],
                 prepared_commit: None,
+                db_updates: None,
             })
         }
 
@@ -218,6 +258,7 @@ pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainRead
                     valid,
                 })],
                 prepared_commit: None,
+                db_updates: None,
             })
         }
 
@@ -240,6 +281,7 @@ pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainRead
                     valid,
                 })],
                 prepared_commit: None,
+                db_updates: None,
             })
         }
 
@@ -262,6 +304,7 @@ pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainRead
                     valid,
                 })],
                 prepared_commit: None,
+                db_updates: None,
             })
         }
 
@@ -284,6 +327,7 @@ pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainRead
                     valid,
                 })],
                 prepared_commit: None,
+                db_updates: None,
             })
         }
 
@@ -306,6 +350,7 @@ pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainRead
                     valid,
                 })],
                 prepared_commit: None,
+                db_updates: None,
             })
         }
 
@@ -328,11 +373,11 @@ pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainRead
                 .collect();
             let pending_snapshots = collect_pending_snapshots(
                 ctx.jvt_snapshot_cache,
-                ctx.storage.jvt_version(),
+                ctx.overlay.jvt_version(),
                 parent_block_hash,
             );
             let result = hyperscale_bft::handlers::verify_state_root(
-                ctx.storage,
+                &ctx.overlay,
                 parent_state_root,
                 parent_block_height,
                 expected_root,
@@ -347,6 +392,15 @@ pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainRead
             let prepared = result
                 .prepared_commit
                 .map(|p| (block_hash, block_height, p));
+            let db_updates = prepared.as_ref().map(|_| {
+                (
+                    block_hash,
+                    block_height,
+                    Arc::new(hyperscale_storage::merge_updates_from_receipts(
+                        &all_receipts,
+                    )),
+                )
+            });
             Some(DelegatedResult {
                 events: vec![NodeInput::Protocol(ProtocolEvent::BlockRootVerified {
                     kind: hyperscale_core::VerificationKind::StateRoot,
@@ -354,6 +408,7 @@ pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainRead
                     valid: result.valid,
                 })],
                 prepared_commit: prepared,
+                db_updates,
             })
         }
 
@@ -395,12 +450,12 @@ pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainRead
 
             let pending_snapshots = collect_pending_snapshots(
                 ctx.jvt_snapshot_cache,
-                ctx.storage.jvt_version(),
+                ctx.overlay.jvt_version(),
                 parent_hash,
             );
 
             let result = hyperscale_bft::handlers::build_proposal(
-                ctx.storage,
+                &ctx.overlay,
                 proposer,
                 height,
                 round,
@@ -423,6 +478,15 @@ pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainRead
             let prepared = result
                 .prepared_commit
                 .map(|p| (result.block_hash, height.0, p));
+            let db_updates = prepared.as_ref().map(|_| {
+                (
+                    result.block_hash,
+                    height.0,
+                    Arc::new(hyperscale_storage::merge_updates_from_receipts(
+                        &all_receipts,
+                    )),
+                )
+            });
             Some(DelegatedResult {
                 events: vec![NodeInput::Protocol(ProtocolEvent::ProposalBuilt {
                     height,
@@ -433,6 +497,7 @@ pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainRead
                     provision_hashes,
                 })],
                 prepared_commit: prepared,
+                db_updates,
             })
         }
 
@@ -461,6 +526,7 @@ pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainRead
                     },
                 )],
                 prepared_commit: None,
+                db_updates: None,
             })
         }
 
@@ -481,6 +547,7 @@ pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainRead
                     },
                 )],
                 prepared_commit: None,
+                db_updates: None,
             })
         }
 
@@ -498,6 +565,7 @@ pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainRead
                     ProtocolEvent::ExecutionCertificateSignatureVerified { certificate, valid },
                 )],
                 prepared_commit: None,
+                db_updates: None,
             })
         }
 
@@ -546,6 +614,7 @@ pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainRead
                     valid: all_valid,
                 })],
                 prepared_commit: None,
+                db_updates: None,
             })
         }
 
@@ -559,12 +628,13 @@ pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainRead
             let local_shard = ctx.topology.local_shard();
             let num_shards = ctx.topology.num_shards();
             // Engine handles execution + system/shard filtering internally.
+            // Use overlay so execution sees state from unpersisted blocks.
             let raw_results: Vec<_> = transactions
                 .iter()
                 .map(|tx| {
                     hyperscale_engine::handlers::execute_single_shard(
                         ctx.executor,
-                        ctx.storage,
+                        &ctx.overlay,
                         tx,
                         local_shard,
                         num_shards,
@@ -589,6 +659,7 @@ pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainRead
                     },
                 )],
                 prepared_commit: None,
+                db_updates: None,
             })
         }
 
@@ -601,7 +672,7 @@ pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainRead
                 .map(|req| {
                     hyperscale_engine::handlers::execute_cross_shard(
                         ctx.executor,
-                        ctx.storage,
+                        &ctx.overlay,
                         req.tx_hash,
                         &req.transaction,
                         &req.provisions,
@@ -628,6 +699,7 @@ pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainRead
                     },
                 )],
                 prepared_commit: None,
+                db_updates: None,
             })
         }
 
@@ -654,6 +726,7 @@ pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainRead
                         block_timestamp: 0,
                     }],
                     prepared_commit: None,
+                    db_updates: None,
                 });
             }
 
@@ -666,6 +739,7 @@ pub(crate) fn handle_delegated_action<S: ChainWriter + SubstateStore + ChainRead
                     block_timestamp,
                 }],
                 prepared_commit: None,
+                db_updates: None,
             })
         }
 
@@ -697,7 +771,7 @@ fn fetch_entries_for_requests<S: ChainWriter + SubstateStore + ChainReader, E: E
         // Must use historical reads — current state may have new vaults that don't
         // exist at block_height, causing the verkle proof to fail on the remote shard.
         let expanded_nodes = match hyperscale_engine::sharding::expand_nodes_with_owned_at_height(
-            ctx.storage,
+            &ctx.overlay,
             &req.nodes,
             block_height.0,
         ) {
@@ -715,7 +789,7 @@ fn fetch_entries_for_requests<S: ChainWriter + SubstateStore + ChainReader, E: E
         let entries =
             match ctx
                 .executor
-                .fetch_state_entries(ctx.storage, &expanded_nodes, block_height.0)
+                .fetch_state_entries(&ctx.overlay, &expanded_nodes, block_height.0)
             {
                 Some(entries) => entries,
                 None => {
@@ -735,7 +809,10 @@ fn fetch_entries_for_requests<S: ChainWriter + SubstateStore + ChainReader, E: E
 }
 
 /// Group fetched entries by target shard and generate verkle proofs per shard.
-fn build_provision_batches<S: ChainWriter + SubstateStore + ChainReader, E: Engine>(
+fn build_provision_batches<
+    S: ChainWriter + SubstateStore + ChainReader + hyperscale_storage::JvtTreeReader + Sync,
+    E: Engine,
+>(
     ctx: &ActionContext<'_, S, E>,
     per_tx: Vec<FetchedTxEntries>,
     source_shard: ShardGroupId,
@@ -770,8 +847,8 @@ fn build_provision_batches<S: ChainWriter + SubstateStore + ChainReader, E: Engi
         shard_keys.dedup();
 
         let proof = match ctx
-            .storage
-            .generate_verkle_proofs(&shard_keys, block_height.0)
+            .overlay
+            .generate_verkle_proofs_overlay(&shard_keys, block_height.0)
         {
             Some(p) => p,
             None => {

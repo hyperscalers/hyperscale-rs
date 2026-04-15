@@ -89,3 +89,16 @@ impl SubstateStore for SimStorage {
         hyperscale_storage::tree::proofs::generate_proof(&s.tree_store, storage_keys, block_height)
     }
 }
+
+impl jellyfish_verkle_tree::TreeReader for SimStorage {
+    fn get_node(
+        &self,
+        key: &jellyfish_verkle_tree::NodeKey,
+    ) -> Option<std::sync::Arc<jellyfish_verkle_tree::Node>> {
+        self.state.read().unwrap().tree_store.get_node(key)
+    }
+
+    fn get_root_key(&self, version: u64) -> Option<jellyfish_verkle_tree::NodeKey> {
+        self.state.read().unwrap().tree_store.get_root_key(version)
+    }
+}

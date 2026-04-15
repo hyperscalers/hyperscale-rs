@@ -62,6 +62,13 @@ type JvtSnapshotMap = HashMap<Hash, (Hash, Arc<hyperscale_storage::JvtSnapshot>)
 type PreparedCommitMap<S> =
     HashMap<Hash, (u64, <S as hyperscale_storage::ChainWriter>::PreparedCommit)>;
 
+/// Pending database updates cache: `block_hash → (block_height, updates)`.
+///
+/// Populated alongside `PreparedCommitMap` when `prepare_block_commit` runs.
+/// Used by `SubstateOverlay` to serve substate reads for blocks that have been
+/// committed by consensus but not yet persisted to RocksDB.
+type PendingDbUpdatesMap = HashMap<Hash, (u64, Arc<hyperscale_storage::DatabaseUpdates>)>;
+
 /// A block commit waiting to be flushed to storage.
 ///
 /// Explicitly distinguishes consensus and sync paths so `flush_block_commits`
@@ -73,12 +80,19 @@ pub(crate) enum PendingCommit {
         block: Arc<Block>,
         qc: Arc<QuorumCertificate>,
         provision_hashes: Vec<Hash>,
+        /// Whether `BlockCommitted` was already fired immediately
+        /// in `accumulate_block_commit` (true) or deferred due to
+        /// backpressure (false). The flush closure uses this to
+        /// decide whether to send `BlockCommitted` after persistence.
+        committed_notified: bool,
     },
     /// Sync path: receipts and ECs come from `pending_sync_data`.
     Synced {
         block: Arc<Block>,
         qc: Arc<QuorumCertificate>,
         provision_hashes: Vec<Hash>,
+        /// See `Consensus::committed_notified`.
+        committed_notified: bool,
     },
 }
 
@@ -91,6 +105,17 @@ impl PendingCommit {
 
     fn is_sync(&self) -> bool {
         matches!(self, PendingCommit::Synced { .. })
+    }
+
+    fn committed_notified(&self) -> bool {
+        match self {
+            PendingCommit::Consensus {
+                committed_notified, ..
+            }
+            | PendingCommit::Synced {
+                committed_notified, ..
+            } => *committed_notified,
+        }
     }
 }
 
@@ -229,6 +254,11 @@ where
     /// during chain walks. Pruned when blocks commit to the tree store.
     jvt_snapshot_cache: Arc<Mutex<JvtSnapshotMap>>,
 
+    /// Pending database updates from unpersisted blocks (shared with dispatch closures).
+    /// Populated alongside `prepared_commits` when `prepare_block_commit` runs.
+    /// Used by `SubstateOverlay` in delegated action handlers.
+    pending_db_updates: Arc<Mutex<PendingDbUpdatesMap>>,
+
     // In-memory caches (shared with inbound router in production)
     cert_cache: Arc<QuickCache<Hash, Arc<WaveCertificate>>>,
     tx_cache: Arc<QuickCache<Hash, Arc<RoutableTransaction>>>,
@@ -320,7 +350,7 @@ where
 
 impl<S, N, D, E> IoLoop<S, N, D, E>
 where
-    S: ChainWriter + SubstateStore + ChainReader + Send + Sync,
+    S: ChainWriter + SubstateStore + ChainReader + hyperscale_storage::JvtTreeReader + Send + Sync,
     N: Network,
     D: Dispatch,
     E: Engine,
@@ -373,6 +403,7 @@ where
             num_shards: topo.num_shards(),
             prepared_commits: Arc::new(Mutex::new(HashMap::new())),
             jvt_snapshot_cache: Arc::new(Mutex::new(HashMap::new())),
+            pending_db_updates: Arc::new(Mutex::new(HashMap::new())),
             cert_cache: Arc::new(QuickCache::new(DEFAULT_CERT_CACHE_SIZE)),
             tx_cache: Arc::new(QuickCache::new(DEFAULT_TX_CACHE_SIZE)),
             provision_cache: Arc::new(QuickCache::new(DEFAULT_PROVISION_CACHE_SIZE)),
@@ -937,6 +968,11 @@ where
                 if height > self.persisted_height {
                     self.persisted_height = height;
                 }
+                // Prune pending_db_updates — these blocks are now in RocksDB.
+                self.pending_db_updates
+                    .lock()
+                    .unwrap()
+                    .retain(|_, (h, _)| *h > height);
                 self.feed_event(ProtocolEvent::BlockPersisted { height });
             }
             NodeInput::Protocol(pe) => {

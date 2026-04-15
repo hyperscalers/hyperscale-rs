@@ -21,7 +21,7 @@ use std::sync::Arc;
 use tracing::{debug, warn};
 impl<S, N, D, E> IoLoop<S, N, D, E>
 where
-    S: ChainWriter + SubstateStore + ChainReader + Send + Sync,
+    S: ChainWriter + SubstateStore + ChainReader + hyperscale_storage::JvtTreeReader + Send + Sync,
     N: Network,
     D: Dispatch,
     E: Engine,
@@ -298,6 +298,7 @@ where
                     block: Arc::new(block),
                     qc: Arc::new(qc),
                     provision_hashes,
+                    committed_notified: false, // set by accumulate_block_commit
                 });
             }
             Action::CommitSyncedBlock {
@@ -309,6 +310,7 @@ where
                     block: Arc::new(block),
                     qc: Arc::new(qc),
                     provision_hashes,
+                    committed_notified: false, // set by accumulate_block_commit
                 });
             }
             Action::EmitTransactionStatus {
@@ -445,7 +447,7 @@ where
     /// suppressed and instead fires after the disk write (falling back to
     /// the pre-decoupling behaviour). This bounds memory usage and the
     /// crash-recovery window.
-    fn accumulate_block_commit(&mut self, commit: super::PendingCommit) {
+    fn accumulate_block_commit(&mut self, mut commit: super::PendingCommit) {
         let block = commit.block();
         let block_hash = block.hash();
         let height = block.header.height;
@@ -472,7 +474,8 @@ where
         // too far behind (backpressure). When deferred, flush_block_commits
         // sends BlockCommitted after the disk write instead.
         let persistence_lag = height.0.saturating_sub(self.persisted_height);
-        if persistence_lag <= Self::MAX_PERSISTENCE_LAG {
+        let notify_now = persistence_lag <= Self::MAX_PERSISTENCE_LAG;
+        if notify_now {
             let block_clone = commit.block().clone();
             let provision_hashes = match &commit {
                 super::PendingCommit::Consensus {
@@ -497,6 +500,16 @@ where
             );
         }
 
+        // Record the actual notification decision on the commit so the
+        // flush closure knows whether to send BlockCommitted after persist.
+        match &mut commit {
+            super::PendingCommit::Consensus {
+                committed_notified, ..
+            }
+            | super::PendingCommit::Synced {
+                committed_notified, ..
+            } => *committed_notified = notify_now,
+        }
         self.pending_block_commits.push(commit);
     }
 
@@ -626,18 +639,11 @@ where
             return;
         }
 
-        // Track which blocks already had BlockCommitted fired immediately
-        // (not deferred by backpressure). Those only need BlockPersisted.
+        // Use the actual notification decision recorded at accumulation time,
+        // not a re-derived value that could disagree due to persisted_height drift.
         let already_notified: Vec<bool> = ready_commits
             .iter()
-            .map(|c| {
-                c.block()
-                    .header
-                    .height
-                    .0
-                    .saturating_sub(self.persisted_height)
-                    <= Self::MAX_PERSISTENCE_LAG
-            })
+            .map(|c| c.committed_notified())
             .collect();
 
         let commits = ready_commits;
@@ -985,15 +991,18 @@ where
         let topology_snapshot = self.topology.load_full();
         let prepared_commits = Arc::clone(&self.prepared_commits);
         let jvt_snapshot_cache = Arc::clone(&self.jvt_snapshot_cache);
+        let pending_db_updates = Arc::clone(&self.pending_db_updates);
         let event_tx = self.event_sender.clone();
 
         let spawn_fn = move || {
             let start = std::time::Instant::now();
+            let overlay =
+                action_handler::build_overlay(&storage, &pending_db_updates, &jvt_snapshot_cache);
             let ctx = ActionContext {
-                storage: &*storage,
                 executor: &executor,
                 topology: &topology_snapshot,
                 jvt_snapshot_cache: &jvt_snapshot_cache,
+                overlay,
             };
             if let Some(result) = action_handler::handle_delegated_action(action, &ctx) {
                 if is_execution {
@@ -1014,6 +1023,12 @@ where
                         .lock()
                         .unwrap()
                         .insert(hash, (height, prepared));
+                }
+                if let Some((hash, height, updates)) = result.db_updates {
+                    pending_db_updates
+                        .lock()
+                        .unwrap()
+                        .insert(hash, (height, updates));
                 }
                 for event in result.events {
                     let _ = event_tx.send(event);

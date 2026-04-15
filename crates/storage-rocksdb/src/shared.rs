@@ -117,6 +117,19 @@ impl SubstateStore for SharedStorage {
     }
 }
 
+impl jellyfish_verkle_tree::TreeReader for SharedStorage {
+    fn get_node(
+        &self,
+        key: &jellyfish_verkle_tree::NodeKey,
+    ) -> Option<std::sync::Arc<jellyfish_verkle_tree::Node>> {
+        self.0.get_node(key)
+    }
+
+    fn get_root_key(&self, version: u64) -> Option<jellyfish_verkle_tree::NodeKey> {
+        self.0.get_root_key(version)
+    }
+}
+
 impl hyperscale_storage::ChainWriter for SharedStorage {
     type PreparedCommit = RocksDbPreparedCommit;
 
