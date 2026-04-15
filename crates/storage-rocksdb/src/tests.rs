@@ -364,8 +364,9 @@ fn test_prepare_then_commit_matches_direct() {
     let (spec_root, prepared) = s_prepared.prepare_block_commit(parent_root, 0, &[], 1, &[]);
     let block = make_test_block(1);
     let qc = make_test_qc(&block);
-    let result_prepared =
-        s_prepared.commit_prepared_block(prepared, &Arc::new(block), &Arc::new(qc));
+    let result_prepared = s_prepared
+        .commit_prepared_blocks(vec![(prepared, Arc::new(block), Arc::new(qc))])
+        .remove(0);
 
     let temp_dir2 = TempDir::new().unwrap();
     let s_direct = RocksDbStorage::open(temp_dir2.path()).unwrap();

@@ -122,6 +122,7 @@ impl RocksDbStorage {
         jvt_snapshot: JvtSnapshot,
         block: &hyperscale_types::Block,
         qc: &hyperscale_types::QuorumCertificate,
+        sync: bool,
     ) -> bool {
         let _commit_guard = self.commit_lock.lock().unwrap();
         let start = Instant::now();
@@ -158,9 +159,10 @@ impl RocksDbStorage {
         // Fold consensus metadata into the same batch for crash-safe atomicity.
         Self::append_consensus_to_batch(&mut write_batch, block, qc);
 
-        // Apply everything atomically with a single fsync
+        // Apply everything atomically. When batching multiple blocks, only
+        // the final block sets sync=true — its fsync covers all prior WAL entries.
         let mut write_opts = rocksdb::WriteOptions::default();
-        write_opts.set_sync(true);
+        write_opts.set_sync(sync);
 
         self.db.write_opt(write_batch, &write_opts).expect(
             "BFT SAFETY CRITICAL: block commit failed - node state would diverge from network",

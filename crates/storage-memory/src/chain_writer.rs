@@ -83,77 +83,79 @@ impl ChainWriter for SimStorage {
         (result_root, prepared)
     }
 
-    fn commit_prepared_block(
+    fn commit_prepared_blocks(
         &self,
-        prepared: Self::PreparedCommit,
-        block: &Arc<hyperscale_types::Block>,
-        qc: &Arc<hyperscale_types::QuorumCertificate>,
-    ) -> Hash {
-        let block_height = prepared.snapshot.new_version;
-        let result_root = prepared.snapshot.result_root;
+        blocks: Vec<(
+            Self::PreparedCommit,
+            Arc<hyperscale_types::Block>,
+            Arc<hyperscale_types::QuorumCertificate>,
+        )>,
+    ) -> Vec<Hash> {
+        blocks
+            .into_iter()
+            .map(|(prepared, block, qc)| {
+                let block_height = prepared.snapshot.new_version;
+                let result_root = prepared.snapshot.result_root;
 
-        {
-            let mut s = self.state.write().unwrap();
+                {
+                    let mut s = self.state.write().unwrap();
 
-            // Always apply the precomputed JVT snapshot — its tree nodes are
-            // consensus-verified and correct regardless of tree store state.
-            // The overlay may have computed ahead of the tree store.
-            s.apply_jvt_snapshot(prepared.snapshot);
+                    s.apply_jvt_snapshot(prepared.snapshot);
 
-            // Apply substate updates to current data + MVCC versioned store.
-            {
-                let crate::state::SharedState {
-                    ref mut data,
-                    ref mut versioned_substates,
-                    ..
-                } = *s;
-                apply_updates_to_ordmap(
-                    data,
-                    &prepared.merged_updates,
-                    Some((block_height, versioned_substates)),
-                );
-            }
-        }
+                    {
+                        let crate::state::SharedState {
+                            ref mut data,
+                            ref mut versioned_substates,
+                            ..
+                        } = *s;
+                        apply_updates_to_ordmap(
+                            data,
+                            &prepared.merged_updates,
+                            Some((block_height, versioned_substates)),
+                        );
+                    }
+                }
 
-        // Store certificates + consensus metadata atomically in consensus lock.
-        let mut c = self.consensus.write().unwrap();
-        for tx in block.transactions.iter() {
-            c.transactions.insert(tx.hash(), tx.as_ref().clone());
-        }
-        c.blocks
-            .insert(block.header.height, ((**block).clone(), (**qc).clone()));
-        for cert in &block.certificates {
-            let wave_id_hash = cert.wave_id.hash();
-            c.certificates.insert(wave_id_hash, (**cert).clone());
-            c.wave_certs_by_height
-                .entry(cert.wave_id.block_height)
-                .or_default()
-                .push(wave_id_hash);
-        }
-        for bundle in &prepared.receipts {
-            c.local_receipts
-                .insert(bundle.tx_hash, bundle.local_receipt.clone());
-            if let Some(ref exec_output) = bundle.execution_output {
-                c.execution_outputs
-                    .insert(bundle.tx_hash, exec_output.clone());
-            }
-        }
-        for wc in &block.certificates {
-            for ec in &wc.execution_certificates {
-                let canonical_hash = ec.canonical_hash();
-                c.execution_certs.insert(canonical_hash, (**ec).clone());
-                c.execution_certs_by_height
-                    .entry(ec.block_height())
-                    .or_default()
-                    .push(canonical_hash);
-            }
-        }
-        c.committed_height = block.header.height;
-        c.committed_hash = Some(block.hash());
-        c.committed_qc = Some((**qc).clone());
-        c.prune_receipts(block.header.height.0);
+                let mut c = self.consensus.write().unwrap();
+                for tx in block.transactions.iter() {
+                    c.transactions.insert(tx.hash(), tx.as_ref().clone());
+                }
+                c.blocks
+                    .insert(block.header.height, ((*block).clone(), (*qc).clone()));
+                for cert in &block.certificates {
+                    let wave_id_hash = cert.wave_id.hash();
+                    c.certificates.insert(wave_id_hash, (**cert).clone());
+                    c.wave_certs_by_height
+                        .entry(cert.wave_id.block_height)
+                        .or_default()
+                        .push(wave_id_hash);
+                }
+                for bundle in &prepared.receipts {
+                    c.local_receipts
+                        .insert(bundle.tx_hash, bundle.local_receipt.clone());
+                    if let Some(ref exec_output) = bundle.execution_output {
+                        c.execution_outputs
+                            .insert(bundle.tx_hash, exec_output.clone());
+                    }
+                }
+                for wc in &block.certificates {
+                    for ec in &wc.execution_certificates {
+                        let canonical_hash = ec.canonical_hash();
+                        c.execution_certs.insert(canonical_hash, (**ec).clone());
+                        c.execution_certs_by_height
+                            .entry(ec.block_height())
+                            .or_default()
+                            .push(canonical_hash);
+                    }
+                }
+                c.committed_height = block.header.height;
+                c.committed_hash = Some(block.hash());
+                c.committed_qc = Some((*qc).clone());
+                c.prune_receipts(block.header.height.0);
 
-        result_root
+                result_root
+            })
+            .collect()
     }
 
     fn commit_block(

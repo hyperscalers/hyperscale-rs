@@ -658,114 +658,209 @@ where
         self.pending_commit_task = Some(Box::new(move || {
             let mut max_persisted = 0u64;
 
-            for (i, commit) in commits.into_iter().enumerate() {
-                let block_hash = commit.block().hash();
-                let height = commit.block().header.height;
+            // Collect consensus blocks into a batch for commit_prepared_blocks.
+            // Sync blocks are committed individually (they recompute state and
+            // are not on the hot path). We process in order, flushing the
+            // consensus batch whenever we hit a sync block or the end.
+            let mut consensus_batch: Vec<(
+                S::PreparedCommit,
+                Arc<hyperscale_types::Block>,
+                Arc<hyperscale_types::QuorumCertificate>,
+            )> = Vec::new();
+            // Indices into `commits` for blocks in the current consensus batch,
+            // so we can send deferred BlockCommitted events after persistence.
+            let mut batch_indices: Vec<usize> = Vec::new();
 
-                let prepared = prepared_map[i].take();
+            // Commit the accumulated consensus batch via commit_prepared_blocks
+            // (single fsync for all blocks in the batch).
+            let flush_consensus_batch = |batch: &mut Vec<(
+                S::PreparedCommit,
+                Arc<hyperscale_types::Block>,
+                Arc<hyperscale_types::QuorumCertificate>,
+            )>,
+                                         indices: &mut Vec<usize>,
+                                         commits: &mut Vec<Option<super::PendingCommit>>,
+                                         max_persisted: &mut u64,
+                                         already_notified: &[bool],
+                                         event_tx: &crossbeam::channel::Sender<NodeInput>,
+                                         storage: &S| {
+                if batch.is_empty() {
+                    return;
+                }
+                let batch_blocks = std::mem::take(batch);
+                let idx = std::mem::take(indices);
 
-                let _result = match commit {
-                    super::PendingCommit::Consensus {
-                        ref block, ref qc, ..
-                    } => {
-                        // Consensus blocks always have a PreparedCommit from
-                        // BuildProposal (proposer) or VerifyStateRoot (verifier).
-                        let prepared = prepared.expect(
-                            "BUG: consensus block without PreparedCommit — \
-                             BuildProposal and VerifyStateRoot should always cache one",
-                        );
-                        storage.commit_prepared_block(prepared, block, qc)
+                // Track heights before we move blocks into the storage call.
+                let heights: Vec<u64> = batch_blocks
+                    .iter()
+                    .map(|(_, b, _)| b.header.height.0)
+                    .collect();
+                let block_hashes: Vec<hyperscale_types::Hash> =
+                    batch_blocks.iter().map(|(_, b, _)| b.hash()).collect();
+
+                let _roots = storage.commit_prepared_blocks(batch_blocks);
+
+                for (j, &ci) in idx.iter().enumerate() {
+                    *max_persisted = (*max_persisted).max(heights[j]);
+                    if !already_notified[ci] {
+                        let commit = commits[ci].take().unwrap();
+                        let (block, provision_hashes) = match commit {
+                            super::PendingCommit::Consensus {
+                                block,
+                                provision_hashes,
+                                ..
+                            } => (block, provision_hashes),
+                            super::PendingCommit::Synced {
+                                block,
+                                provision_hashes,
+                                ..
+                            } => (block, provision_hashes),
+                        };
+                        let _ = event_tx.send(NodeInput::Protocol(ProtocolEvent::BlockCommitted {
+                            block_hash: block_hashes[j],
+                            height: heights[j],
+                            block: Arc::unwrap_or_clone(block),
+                            provision_hashes,
+                        }));
                     }
-                    super::PendingCommit::Synced {
-                        ref block, ref qc, ..
-                    } => {
-                        if block.certificates.is_empty() {
-                            storage.commit_block(block, qc, &[])
-                        } else if let Some(entry) = sync_data.get(&height.0) {
-                            let receipts = &entry.local_receipts;
+                }
+            };
 
-                            // Convert sync receipts to ReceiptBundles.
-                            let sync_receipt_bundles: Vec<hyperscale_types::ReceiptBundle> =
-                                if !receipts.is_empty() {
-                                    receipts
-                                        .iter()
-                                        .map(|entry| hyperscale_types::ReceiptBundle {
-                                            tx_hash: entry.tx_hash,
-                                            local_receipt: std::sync::Arc::new(
-                                                entry.receipt.clone(),
-                                            ),
-                                            execution_output: None,
-                                        })
-                                        .collect()
-                                } else {
-                                    // Fallback: derive from wave certs' source blocks.
-                                    let topo = topology.load();
-                                    let mut bundles = Vec::new();
-                                    for wc in &block.certificates {
-                                        let source_height =
-                                            hyperscale_types::BlockHeight(wc.wave_id.block_height);
-                                        if let Some((source_block, _)) =
-                                            storage.get_block(source_height)
-                                        {
-                                            let tx_hashes = hyperscale_types::derive_wave_tx_hashes(
-                                                &topo,
-                                                &wc.wave_id,
-                                                &source_block.transactions,
-                                            );
-                                            for tx_hash in tx_hashes {
-                                                if let Some(receipt) =
-                                                    storage.get_local_receipt(&tx_hash)
-                                                {
-                                                    bundles.push(hyperscale_types::ReceiptBundle {
-                                                        tx_hash,
-                                                        local_receipt: receipt,
-                                                        execution_output: None,
-                                                    });
-                                                }
+            // Wrap commits in Option so we can take() them for deferred notifications.
+            let mut commit_slots: Vec<Option<super::PendingCommit>> =
+                commits.into_iter().map(Some).collect();
+
+            for i in 0..commit_slots.len() {
+                let is_consensus = matches!(
+                    commit_slots[i].as_ref().unwrap(),
+                    super::PendingCommit::Consensus { .. }
+                );
+
+                if is_consensus {
+                    let commit = commit_slots[i].as_ref().unwrap();
+                    let (block, qc) = match commit {
+                        super::PendingCommit::Consensus { block, qc, .. } => {
+                            (Arc::clone(block), Arc::clone(qc))
+                        }
+                        _ => unreachable!(),
+                    };
+                    let prepared = prepared_map[i].take().expect(
+                        "BUG: consensus block without PreparedCommit — \
+                         BuildProposal and VerifyStateRoot should always cache one",
+                    );
+                    consensus_batch.push((prepared, block, qc));
+                    batch_indices.push(i);
+                } else {
+                    // Flush any pending consensus batch before the sync block.
+                    flush_consensus_batch(
+                        &mut consensus_batch,
+                        &mut batch_indices,
+                        &mut commit_slots,
+                        &mut max_persisted,
+                        &already_notified,
+                        &event_tx,
+                        &storage,
+                    );
+
+                    let commit = commit_slots[i].as_ref().unwrap();
+                    let height = commit.block().header.height;
+                    let (block, qc) = match commit {
+                        super::PendingCommit::Synced { block, qc, .. } => (block, qc),
+                        _ => unreachable!(),
+                    };
+
+                    // Commit sync block individually.
+                    if block.certificates.is_empty() {
+                        storage.commit_block(block, qc, &[]);
+                    } else if let Some(entry) = sync_data.get(&height.0) {
+                        let receipts = &entry.local_receipts;
+
+                        let sync_receipt_bundles: Vec<hyperscale_types::ReceiptBundle> =
+                            if !receipts.is_empty() {
+                                receipts
+                                    .iter()
+                                    .map(|entry| hyperscale_types::ReceiptBundle {
+                                        tx_hash: entry.tx_hash,
+                                        local_receipt: std::sync::Arc::new(entry.receipt.clone()),
+                                        execution_output: None,
+                                    })
+                                    .collect()
+                            } else {
+                                let topo = topology.load();
+                                let mut bundles = Vec::new();
+                                for wc in &block.certificates {
+                                    let source_height =
+                                        hyperscale_types::BlockHeight(wc.wave_id.block_height);
+                                    if let Some((source_block, _)) =
+                                        storage.get_block(source_height)
+                                    {
+                                        let tx_hashes = hyperscale_types::derive_wave_tx_hashes(
+                                            &topo,
+                                            &wc.wave_id,
+                                            &source_block.transactions,
+                                        );
+                                        for tx_hash in tx_hashes {
+                                            if let Some(receipt) =
+                                                storage.get_local_receipt(&tx_hash)
+                                            {
+                                                bundles.push(hyperscale_types::ReceiptBundle {
+                                                    tx_hash,
+                                                    local_receipt: receipt,
+                                                    execution_output: None,
+                                                });
                                             }
                                         }
                                     }
-                                    bundles
-                                };
+                                }
+                                bundles
+                            };
 
-                            storage.commit_block(block, qc, &sync_receipt_bundles)
-                        } else {
-                            tracing::error!(
-                                height = height.0,
-                                "BUG: synced block with certs but no sync data"
-                            );
-                            storage.commit_block(block, qc, &[])
-                        }
+                        storage.commit_block(block, qc, &sync_receipt_bundles);
+                    } else {
+                        tracing::error!(
+                            height = height.0,
+                            "BUG: synced block with certs but no sync data"
+                        );
+                        storage.commit_block(block, qc, &[]);
                     }
-                };
 
-                max_persisted = max_persisted.max(height.0);
+                    max_persisted = max_persisted.max(height.0);
 
-                // For blocks deferred by backpressure, send BlockCommitted
-                // now that the disk write is done. For blocks already
-                // notified immediately, skip — they don't need a repeat.
-                if !already_notified[i] {
-                    let (block, provision_hashes) = match commit {
-                        super::PendingCommit::Consensus {
-                            block,
+                    if !already_notified[i] {
+                        let block_hash = block.hash();
+                        let commit = commit_slots[i].take().unwrap();
+                        let (block, provision_hashes) = match commit {
+                            super::PendingCommit::Consensus {
+                                block,
+                                provision_hashes,
+                                ..
+                            } => (block, provision_hashes),
+                            super::PendingCommit::Synced {
+                                block,
+                                provision_hashes,
+                                ..
+                            } => (block, provision_hashes),
+                        };
+                        let _ = event_tx.send(NodeInput::Protocol(ProtocolEvent::BlockCommitted {
+                            block_hash,
+                            height: height.0,
+                            block: Arc::unwrap_or_clone(block),
                             provision_hashes,
-                            ..
-                        } => (block, provision_hashes),
-                        super::PendingCommit::Synced {
-                            block,
-                            provision_hashes,
-                            ..
-                        } => (block, provision_hashes),
-                    };
-
-                    let _ = event_tx.send(NodeInput::Protocol(ProtocolEvent::BlockCommitted {
-                        block_hash,
-                        height: height.0,
-                        block: Arc::unwrap_or_clone(block),
-                        provision_hashes,
-                    }));
+                        }));
+                    }
                 }
             }
+
+            // Flush any remaining consensus batch.
+            flush_consensus_batch(
+                &mut consensus_batch,
+                &mut batch_indices,
+                &mut commit_slots,
+                &mut max_persisted,
+                &already_notified,
+                &event_tx,
+                &storage,
+            );
 
             // Clear the in-flight flag before sending BlockPersisted.
             // The channel send synchronizes-with recv on the main thread,

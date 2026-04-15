@@ -91,30 +91,48 @@ impl hyperscale_storage::ChainWriter for RocksDbStorage {
         (computed_root, prepared)
     }
 
-    fn commit_prepared_block(
+    fn commit_prepared_blocks(
         &self,
-        prepared: Self::PreparedCommit,
-        block: &Arc<hyperscale_types::Block>,
-        qc: &Arc<hyperscale_types::QuorumCertificate>,
-    ) -> hyperscale_types::Hash {
-        let result_root = prepared.jvt_snapshot.result_root;
+        blocks: Vec<(
+            Self::PreparedCommit,
+            Arc<hyperscale_types::Block>,
+            Arc<hyperscale_types::QuorumCertificate>,
+        )>,
+    ) -> Vec<hyperscale_types::Hash> {
+        let total = blocks.len();
+        let mut roots = Vec::with_capacity(total);
 
-        let mut write_batch = prepared.write_batch;
+        for (i, (prepared, block, qc)) in blocks.into_iter().enumerate() {
+            let result_root = prepared.jvt_snapshot.result_root;
 
-        // Persist block data (header, transactions, certificates) atomically.
-        // Receipt writes are already in the write_batch from prepare time.
-        self.append_block_to_batch(&mut write_batch, block, qc);
+            let mut write_batch = prepared.write_batch;
 
-        crate::execution_certs::append_block_certs_to_batch(self, &mut write_batch, block);
+            // Persist block data (header, transactions, certificates) atomically.
+            // Receipt writes are already in the write_batch from prepare time.
+            self.append_block_to_batch(&mut write_batch, &block, &qc);
 
-        let applied = self.try_apply_prepared_commit(write_batch, prepared.jvt_snapshot, block, qc);
-        assert!(
-            applied,
-            "BUG: prepared commit fast path failed at height {} — \
-             serialized verification should guarantee freshness",
-            block.header.height.0
-        );
-        result_root
+            crate::execution_certs::append_block_certs_to_batch(self, &mut write_batch, &block);
+
+            // Defer fsync for all blocks except the last. The final sync=true
+            // flushes the entire WAL, covering all prior deferred writes.
+            let sync = i == total - 1;
+            let applied = self.try_apply_prepared_commit(
+                write_batch,
+                prepared.jvt_snapshot,
+                &block,
+                &qc,
+                sync,
+            );
+            assert!(
+                applied,
+                "BUG: prepared commit fast path failed at height {} — \
+                 serialized verification should guarantee freshness",
+                block.header.height.0
+            );
+            roots.push(result_root);
+        }
+
+        roots
     }
 
     fn commit_block(

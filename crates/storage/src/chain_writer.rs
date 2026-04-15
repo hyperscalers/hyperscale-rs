@@ -55,21 +55,23 @@ pub trait ChainWriter: Send + Sync + 'static {
         pending_snapshots: &[Arc<JvtSnapshot>],
     ) -> (Hash, Self::PreparedCommit);
 
-    /// Commit a block using precomputed work from `prepare_block_commit`.
+    /// Commit one or more blocks using precomputed work from `prepare_block_commit`.
     ///
-    /// This is the fast path: applies the cached `WriteBatch`/`JvtSnapshot`
-    /// directly. Falls back to recompute from the receipts baked into the
-    /// prepared handle if the prepared data is stale (base root/version mismatch).
+    /// This is the fast path: applies cached `WriteBatch`/`JvtSnapshot` handles
+    /// directly. When multiple blocks are provided, the implementation may
+    /// batch I/O (e.g. deferring fsync until the final block) to amortize
+    /// the per-block sync cost.
     ///
-    /// Receipt writes are already included in the prepared handle — callers
-    /// only need to supply data that wasn't known at prepare time (block, QC).
+    /// Blocks must be in height-ascending order. Receipt writes are already
+    /// included in each prepared handle — callers only need to supply data
+    /// that wasn't known at prepare time (block, QC).
     /// Execution certificates are extracted from `block.certificates`.
-    fn commit_prepared_block(
+    ///
+    /// Returns the state root hash for each committed block, in the same order.
+    fn commit_prepared_blocks(
         &self,
-        prepared: Self::PreparedCommit,
-        block: &Arc<Block>,
-        qc: &Arc<QuorumCertificate>,
-    ) -> Hash;
+        blocks: Vec<(Self::PreparedCommit, Arc<Block>, Arc<QuorumCertificate>)>,
+    ) -> Vec<Hash>;
 
     /// Commit a block's state writes from scratch (no prepared handle).
     ///

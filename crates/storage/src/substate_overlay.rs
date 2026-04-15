@@ -375,13 +375,15 @@ impl<S: crate::ChainWriter> crate::ChainWriter for SubstateOverlay<S> {
         )
     }
 
-    fn commit_prepared_block(
+    fn commit_prepared_blocks(
         &self,
-        prepared: Self::PreparedCommit,
-        block: &Arc<hyperscale_types::Block>,
-        qc: &Arc<hyperscale_types::QuorumCertificate>,
-    ) -> Hash {
-        (*self.base).commit_prepared_block(prepared, block, qc)
+        blocks: Vec<(
+            Self::PreparedCommit,
+            Arc<hyperscale_types::Block>,
+            Arc<hyperscale_types::QuorumCertificate>,
+        )>,
+    ) -> Vec<Hash> {
+        (*self.base).commit_prepared_blocks(blocks)
     }
 
     fn commit_block(
