@@ -1187,6 +1187,7 @@ where
             exec_fulfilled_exec_certs: exec_mem.fulfilled_exec_certs,
             // Mempool
             mempool_pool: mempool_mem.pool,
+            mempool_max_pool_size: mempool_mem.max_pool_size,
             mempool_ready: mempool_mem.ready,
             mempool_tombstones: mempool_mem.tombstones,
             mempool_recently_evicted: mempool_mem.recently_evicted,

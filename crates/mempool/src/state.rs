@@ -42,6 +42,13 @@ pub const DEFAULT_IN_FLIGHT_LIMIT: usize = 12288;
 /// exceeds processing capacity.
 pub const DEFAULT_MAX_PENDING: usize = 8192;
 
+/// Default maximum pool size (all statuses combined).
+///
+/// When exceeded, the oldest Pending transactions are evicted (FIFO) down
+/// to 90% of the cap. Committed and Executed transactions are never evicted
+/// since they hold state locks.
+pub const DEFAULT_MAX_POOL_SIZE: usize = 50_000;
+
 /// Mempool configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct MempoolConfig {
@@ -67,6 +74,14 @@ pub struct MempoolConfig {
     /// Set to zero to disable (default).
     #[serde(default = "default_min_dwell_time")]
     pub min_dwell_time: Duration,
+
+    /// Maximum transactions in the pool (all statuses combined).
+    ///
+    /// When exceeded, the oldest Pending transactions are evicted (FIFO) down
+    /// to 90% of this limit. Committed and Executed transactions are never
+    /// evicted since they hold state locks.
+    #[serde(default = "default_max_pool_size")]
+    pub max_pool_size: usize,
 }
 
 fn default_max_in_flight() -> usize {
@@ -81,12 +96,17 @@ fn default_min_dwell_time() -> Duration {
     DEFAULT_MIN_DWELL_TIME
 }
 
+fn default_max_pool_size() -> usize {
+    DEFAULT_MAX_POOL_SIZE
+}
+
 impl Default for MempoolConfig {
     fn default() -> Self {
         Self {
             max_in_flight: DEFAULT_IN_FLIGHT_LIMIT,
             max_pending: DEFAULT_MAX_PENDING,
             min_dwell_time: DEFAULT_MIN_DWELL_TIME,
+            max_pool_size: DEFAULT_MAX_POOL_SIZE,
         }
     }
 }
@@ -121,6 +141,7 @@ impl LockContentionStats {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MempoolMemoryStats {
     pub pool: usize,
+    pub max_pool_size: usize,
     pub ready: usize,
     pub tombstones: usize,
     pub recently_evicted: usize,
@@ -341,6 +362,8 @@ impl MempoolState {
         // Add to ready tracking
         self.add_to_ready_tracking(hash, &tx, cross_shard, self.now);
 
+        self.evict_for_capacity();
+
         tracing::info!(tx_hash = ?hash, pool_size = self.pool.len(), "Transaction added to mempool via submit");
 
         // Note: Broadcasting is handled by NodeStateMachine which broadcasts to all
@@ -394,6 +417,8 @@ impl MempoolState {
 
         // Add to ready tracking
         self.add_to_ready_tracking(hash, &tx, cross_shard, self.now);
+
+        self.evict_for_capacity();
 
         tracing::debug!(tx_hash = ?hash, pool_size = self.pool.len(), "Transaction added to mempool via gossip");
 
@@ -453,6 +478,54 @@ impl MempoolState {
                 .insert(tx_hash, (entry.tx, self.current_height));
         }
         self.tombstones.insert(tx_hash, self.current_height);
+    }
+
+    /// Evict the oldest Pending transactions when pool exceeds `max_pool_size`.
+    ///
+    /// Evicts down to 90% of the cap to avoid thrashing under sustained load.
+    /// Only Pending transactions are eligible — Committed and Executed hold
+    /// state locks and are never evicted. Capacity eviction does NOT tombstone,
+    /// allowing re-entry via gossip. Evicted transactions are added to
+    /// `recently_evicted` so peers can still fetch them.
+    fn evict_for_capacity(&mut self) {
+        if self.config.max_pool_size == 0 || self.pool.len() <= self.config.max_pool_size {
+            return;
+        }
+
+        let target = self.config.max_pool_size * 9 / 10;
+        let to_remove = self.pool.len().saturating_sub(target);
+
+        let mut candidates: Vec<(Hash, Duration)> = self
+            .pool
+            .iter()
+            .filter(|(_, entry)| matches!(entry.status, TransactionStatus::Pending))
+            .map(|(hash, entry)| (*hash, entry.added_at))
+            .collect();
+        candidates.sort_by_key(|(_, added_at)| *added_at);
+
+        let evict_hashes: Vec<Hash> = candidates
+            .into_iter()
+            .take(to_remove)
+            .map(|(hash, _)| hash)
+            .collect();
+
+        let evicted_count = evict_hashes.len();
+        for tx_hash in evict_hashes {
+            self.remove_from_ready_tracking(&tx_hash);
+            if let Some(entry) = self.pool.remove(&tx_hash) {
+                self.recently_evicted
+                    .insert(tx_hash, (entry.tx, self.current_height));
+            }
+        }
+
+        if evicted_count > 0 {
+            tracing::warn!(
+                evicted = evicted_count,
+                pool_size = self.pool.len(),
+                max_pool_size = self.config.max_pool_size,
+                "Evicted oldest pending transactions due to pool capacity limit"
+            );
+        }
     }
 
     /// Check if a transaction hash is tombstoned (reached terminal state).
@@ -557,6 +630,11 @@ impl MempoolState {
                 }
             }
         }
+
+        // Evict oldest pending transactions if pool exceeds capacity.
+        // Safe here because all block transactions were transitioned to
+        // Committed status above, so they won't be eviction candidates.
+        self.evict_for_capacity();
 
         // Track committed abort intents so we stop re-proposing them.
         // Terminal state is still reached exclusively via TC commit below —
@@ -1300,6 +1378,7 @@ impl MempoolState {
     pub fn memory_stats(&self) -> MempoolMemoryStats {
         MempoolMemoryStats {
             pool: self.pool.len(),
+            max_pool_size: self.config.max_pool_size,
             ready: self.ready.len(),
             tombstones: self.tombstones.len(),
             recently_evicted: self.recently_evicted.len(),
@@ -1700,6 +1779,7 @@ mod tests {
             max_in_flight: limit,
             max_pending: DEFAULT_MAX_PENDING,
             min_dwell_time: Duration::ZERO,
+            max_pool_size: DEFAULT_MAX_POOL_SIZE,
         }
     }
 
@@ -2028,5 +2108,134 @@ mod tests {
         mempool.set_time(Duration::from_millis(1_500));
         let ready = mempool.ready_transactions(10, 0, 0);
         assert_eq!(ready.transactions.len(), 2, "Both should be eligible");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Pool Capacity Eviction Tests
+    // ═══════════════════════════════════════════════════════════════════════
+
+    fn make_pool_limit_config(max_pool_size: usize) -> MempoolConfig {
+        MempoolConfig {
+            max_pool_size,
+            ..MempoolConfig::default()
+        }
+    }
+
+    #[test]
+    fn test_pool_eviction_at_capacity() {
+        let config = make_pool_limit_config(10);
+        let mut mempool = MempoolState::with_config(config);
+        let topology = make_test_topology();
+
+        for i in 0..12u8 {
+            mempool.set_time(Duration::from_millis(i as u64 * 100));
+            let tx = test_transaction(i);
+            mempool.on_submit_transaction(&topology, Arc::new(tx));
+        }
+
+        assert_eq!(mempool.len(), 10, "Pool should be at cap after eviction");
+        assert!(
+            !mempool.has_transaction(&test_transaction(0).hash()),
+            "Oldest transaction should be evicted"
+        );
+        assert!(
+            mempool.has_transaction(&test_transaction(11).hash()),
+            "Newest transaction should remain"
+        );
+    }
+
+    #[test]
+    fn test_pool_eviction_preserves_committed() {
+        let config = make_pool_limit_config(5);
+        let mut mempool = MempoolState::with_config(config);
+        let topology = make_test_topology();
+
+        // Submit 3, commit 2.
+        for i in 0..3u8 {
+            mempool.set_time(Duration::from_millis(i as u64 * 100));
+            mempool.on_submit_transaction(&topology, Arc::new(test_transaction(i)));
+        }
+        let hash_0 = test_transaction(0).hash();
+        let hash_1 = test_transaction(1).hash();
+        mempool.update_status(&hash_0, TransactionStatus::Committed(BlockHeight(1)));
+        mempool.update_status(&hash_1, TransactionStatus::Committed(BlockHeight(1)));
+
+        // Add 4 more Pending (pool goes to 7, exceeds cap of 5).
+        for i in 3..7u8 {
+            mempool.set_time(Duration::from_millis(i as u64 * 100));
+            mempool.on_submit_transaction(&topology, Arc::new(test_transaction(i)));
+        }
+
+        assert!(
+            mempool.has_transaction(&hash_0),
+            "Committed tx must not be evicted"
+        );
+        assert!(
+            mempool.has_transaction(&hash_1),
+            "Committed tx must not be evicted"
+        );
+    }
+
+    #[test]
+    fn test_pool_eviction_no_tombstone() {
+        let config = make_pool_limit_config(3);
+        let mut mempool = MempoolState::with_config(config);
+        let topology = make_test_topology();
+
+        for i in 0..5u8 {
+            mempool.set_time(Duration::from_millis(i as u64 * 100));
+            mempool.on_submit_transaction(&topology, Arc::new(test_transaction(i)));
+        }
+
+        let evicted_hash = test_transaction(0).hash();
+        assert!(
+            !mempool.is_tombstoned(&evicted_hash),
+            "Capacity-evicted tx should not be tombstoned"
+        );
+
+        // Re-add via gossip should succeed.
+        let tx = test_transaction(0);
+        mempool.on_transaction_gossip(&topology, Arc::new(tx), false);
+        assert!(
+            mempool.has_transaction(&evicted_hash),
+            "Re-gossiped tx should be accepted"
+        );
+    }
+
+    #[test]
+    fn test_pool_eviction_headroom() {
+        let config = make_pool_limit_config(20);
+        let mut mempool = MempoolState::with_config(config);
+        let topology = make_test_topology();
+
+        for i in 0..21u8 {
+            mempool.set_time(Duration::from_millis(i as u64 * 100));
+            mempool.on_submit_transaction(&topology, Arc::new(test_transaction(i)));
+        }
+
+        assert_eq!(
+            mempool.len(),
+            18,
+            "Pool should be at 90% headroom (18) after single overflow"
+        );
+    }
+
+    #[test]
+    fn test_pool_eviction_zero_disables() {
+        let config = make_pool_limit_config(0);
+        let mut mempool = MempoolState::with_config(config);
+        let topology = make_test_topology();
+
+        for i in 0..5u8 {
+            mempool.on_submit_transaction(&topology, Arc::new(test_transaction(i)));
+        }
+
+        assert_eq!(mempool.len(), 5, "All txs should remain when cap is 0");
+    }
+
+    #[test]
+    fn test_config_defaults_include_max_pool_size() {
+        let config = MempoolConfig::default();
+        assert_eq!(config.max_pool_size, DEFAULT_MAX_POOL_SIZE);
     }
 }
