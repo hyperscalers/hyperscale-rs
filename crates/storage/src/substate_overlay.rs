@@ -116,8 +116,6 @@ type JvtNodeIndex = HashMap<jvt::NodeKey, Arc<jvt::Node>>;
 /// committed by consensus but not yet persisted to RocksDB. Implements
 /// `SubstateStore`, `ChainWriter`, `ChainReader`, and `TreeReader` so
 /// it can substitute for the base storage in all delegated action handlers.
-///
-/// Uses `Arc` internally so snapshots share overlay entries cheaply.
 pub struct SubstateOverlay<S> {
     base: Arc<S>,
     /// Flattened overlay for current-state `SubstateDatabase` reads.
@@ -129,6 +127,18 @@ pub struct SubstateOverlay<S> {
     /// Pre-built JVT node index from unpersisted snapshots.
     /// O(1) lookup instead of linear scan through snapshot vecs.
     jvt_nodes: Arc<JvtNodeIndex>,
+}
+
+// Manual Clone: all fields are Arc, so S doesn't need to be Clone.
+impl<S> Clone for SubstateOverlay<S> {
+    fn clone(&self) -> Self {
+        Self {
+            base: Arc::clone(&self.base),
+            entries: Arc::clone(&self.entries),
+            versioned_updates: Arc::clone(&self.versioned_updates),
+            jvt_nodes: Arc::clone(&self.jvt_nodes),
+        }
+    }
 }
 
 impl<S> SubstateOverlay<S> {

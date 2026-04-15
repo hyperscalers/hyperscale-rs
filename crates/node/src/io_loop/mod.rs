@@ -259,6 +259,11 @@ where
     /// Used by `SubstateOverlay` in delegated action handlers.
     pending_db_updates: Arc<Mutex<PendingDbUpdatesMap>>,
 
+    /// Cached overlay built from `pending_db_updates` and `jvt_snapshot_cache`.
+    /// Dispatch closures clone from this instead of rebuilding per-action.
+    /// Invalidated (rebuilt + swapped) when the underlying caches change.
+    overlay_cache: Arc<ArcSwap<hyperscale_storage::SubstateOverlay<S>>>,
+
     // In-memory caches (shared with inbound router in production)
     cert_cache: Arc<QuickCache<Hash, Arc<WaveCertificate>>>,
     tx_cache: Arc<QuickCache<Hash, Arc<RoutableTransaction>>>,
@@ -389,9 +394,12 @@ where
         let exec_cert_fetch_protocol = ExecCertFetchProtocol::new(config.exec_cert_fetch.clone());
         let header_fetch_protocol =
             HeaderFetchProtocol::new(crate::protocol::header_fetch::HeaderFetchConfig::default());
+        let storage = Arc::new(storage);
+        let initial_overlay =
+            hyperscale_storage::SubstateOverlay::new(Arc::clone(&storage), Vec::new(), Vec::new());
         Self {
             state,
-            storage: Arc::new(storage),
+            storage,
             executor,
             network: Arc::new(network),
             dispatch,
@@ -404,6 +412,7 @@ where
             prepared_commits: Arc::new(Mutex::new(HashMap::new())),
             jvt_snapshot_cache: Arc::new(Mutex::new(HashMap::new())),
             pending_db_updates: Arc::new(Mutex::new(HashMap::new())),
+            overlay_cache: Arc::new(ArcSwap::from_pointee(initial_overlay)),
             cert_cache: Arc::new(QuickCache::new(DEFAULT_CERT_CACHE_SIZE)),
             tx_cache: Arc::new(QuickCache::new(DEFAULT_TX_CACHE_SIZE)),
             provision_cache: Arc::new(QuickCache::new(DEFAULT_PROVISION_CACHE_SIZE)),
@@ -493,17 +502,10 @@ where
     /// 2. **State-machine genesis** via `state_mut().initialize_genesis()` followed by
     ///    `handle_actions()`, `flush_all_batches()`, and a `BlockCommitted` event
     ///
-    /// # Panics
-    ///
-    /// Panics if the storage `Arc` has been cloned (e.g., by handler registration
-    /// or dispatch closures), since `Arc::get_mut` requires sole ownership.
-    pub fn with_storage_and_executor<R>(&mut self, f: impl FnOnce(&mut S, &E) -> R) -> R {
-        let storage = Arc::get_mut(&mut self.storage).expect(
-            "with_storage_and_executor must be called before any spawned closures clone the Arc",
-        );
-        let result = f(storage, &self.executor);
+    pub fn with_storage_and_executor<R>(&mut self, f: impl FnOnce(&S, &E) -> R) -> R {
+        let result = f(&self.storage, &self.executor);
 
-        // Now sole ownership is released — register handlers.
+        // Register handlers after genesis so the network layer can serve requests.
         self.register_request_handler();
         self.register_gossip_handlers();
         self.register_notification_handlers();
@@ -526,12 +528,6 @@ where
     /// Access the storage.
     pub fn storage(&self) -> &S {
         &self.storage
-    }
-
-    /// Mutably access the storage (for initialization/setup).
-    pub fn storage_mut(&mut self) -> &mut S {
-        Arc::get_mut(&mut self.storage)
-            .expect("storage_mut must be called before any spawned closures clone the Arc")
     }
 
     /// Access the network.
@@ -980,6 +976,13 @@ where
                     .lock()
                     .unwrap()
                     .retain(|_, (_, snap)| snap.new_version > height);
+                // Rebuild cached overlay with pruned data.
+                let new_overlay = crate::action_handler::build_overlay(
+                    &self.storage,
+                    &self.pending_db_updates,
+                    &self.jvt_snapshot_cache,
+                );
+                self.overlay_cache.store(Arc::new(new_overlay));
                 self.feed_event(ProtocolEvent::BlockPersisted { height });
             }
             NodeInput::Protocol(pe) => {

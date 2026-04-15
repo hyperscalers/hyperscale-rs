@@ -1087,12 +1087,14 @@ where
         let prepared_commits = Arc::clone(&self.prepared_commits);
         let jvt_snapshot_cache = Arc::clone(&self.jvt_snapshot_cache);
         let pending_db_updates = Arc::clone(&self.pending_db_updates);
+        let overlay_cache = Arc::clone(&self.overlay_cache);
         let event_tx = self.event_sender.clone();
 
         let spawn_fn = move || {
             let start = std::time::Instant::now();
-            let overlay =
-                action_handler::build_overlay(&storage, &pending_db_updates, &jvt_snapshot_cache);
+            // Clone cached overlay (cheap — 4 Arc bumps) instead of
+            // rebuilding from scratch on every dispatch.
+            let overlay = (**overlay_cache.load()).clone();
             let ctx = ActionContext {
                 executor: &executor,
                 topology: &topology_snapshot,
@@ -1104,6 +1106,7 @@ where
                     let elapsed = start.elapsed().as_secs_f64();
                     metrics::record_execution_latency(elapsed);
                 }
+                let mut caches_changed = false;
                 if let Some((hash, height, prepared)) = result.prepared_commit {
                     // Cache the JvtSnapshot with its parent_block_hash so the
                     // overlay chain can be walked by following parent hashes.
@@ -1113,6 +1116,7 @@ where
                             .lock()
                             .unwrap()
                             .insert(hash, (parent_hash, snapshot));
+                        caches_changed = true;
                     }
                     prepared_commits
                         .lock()
@@ -1124,6 +1128,17 @@ where
                         .lock()
                         .unwrap()
                         .insert(hash, (height, updates));
+                    caches_changed = true;
+                }
+                // Rebuild the cached overlay so subsequent dispatches
+                // see the new entries without rebuilding from scratch.
+                if caches_changed {
+                    let new_overlay = action_handler::build_overlay(
+                        &storage,
+                        &pending_db_updates,
+                        &jvt_snapshot_cache,
+                    );
+                    overlay_cache.store(Arc::new(new_overlay));
                 }
                 for event in result.events {
                     let _ = event_tx.send(event);
