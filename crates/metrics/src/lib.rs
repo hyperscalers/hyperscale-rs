@@ -131,6 +131,8 @@ pub struct MemoryMetrics {
     // ── Mempool ──
     /// All transactions in the pool.
     pub mempool_pool: usize,
+    /// Configured maximum pool size (capacity utilization monitoring).
+    pub mempool_max_pool_size: usize,
     /// Ready transactions (no node conflicts).
     pub mempool_ready: usize,
     /// Terminal state transactions (for dedup).
