@@ -222,18 +222,10 @@ pub fn put_at_version<S: jvt::TreeReader + Sync>(
         })
         .collect();
 
-    // Sort by key for the BTreeMap-equivalent ordering that apply_updates expects.
+    // Sort by key for the BTreeMap ordering that apply_updates expects.
+    // No dedup needed — state locking guarantees no key conflicts between
+    // transactions, so each key appears at most once.
     updates.par_sort_unstable_by(|a, b| a.0.cmp(&b.0));
-
-    // Dedup: last writer wins (same semantics as BTreeMap::insert overwrite).
-    updates.dedup_by(|b, a| {
-        if a.0 == b.0 {
-            a.1 = b.1;
-            true
-        } else {
-            false
-        }
-    });
 
     let updates_btree: BTreeMap<jvt::Key, Option<jvt::Value>> = updates.into_iter().collect();
 
