@@ -44,35 +44,30 @@ fn collect_pending_snapshots(
     chain
 }
 
-/// Collect pending `DatabaseUpdates` from unpersisted blocks, sorted by height.
+/// Build a `SubstateOverlay` from already-locked maps.
 ///
-/// Returns `(height, updates)` pairs sorted ascending so the overlay applies them
-/// in commit order.
-/// Build a `SubstateOverlay` wrapping the given storage with pending updates.
-pub(crate) fn build_overlay<S: ChainWriter + SubstateStore + ChainReader>(
+/// Avoids re-acquiring mutexes when the caller already holds the guards.
+/// `pending_db_updates` entries are sorted by height ascending so the overlay
+/// applies them in commit order.
+pub(crate) fn build_overlay_from_maps<S: ChainWriter + SubstateStore + ChainReader>(
     storage_arc: &Arc<S>,
-    pending_db_updates: &std::sync::Mutex<PendingDbUpdatesMap>,
-    jvt_snapshot_cache: &std::sync::Mutex<JvtSnapshotMap>,
+    pending_db_updates: &PendingDbUpdatesMap,
+    jvt_snapshot_cache: &JvtSnapshotMap,
 ) -> hyperscale_storage::SubstateOverlay<S> {
-    let cache = pending_db_updates.lock().unwrap();
-    // Collect (height, &DatabaseUpdates) pairs from all receipts across all
-    // unpersisted blocks. No merge — the overlay flattens them directly.
     let mut updates: Vec<(u64, &hyperscale_storage::DatabaseUpdates)> = Vec::new();
-    for (h, receipts) in cache.values() {
+    for (h, receipts) in pending_db_updates.values() {
         for receipt in receipts {
             updates.push((*h, &receipt.database_updates));
         }
     }
     updates.sort_by_key(|(h, _)| *h);
 
-    let jvt_cache = jvt_snapshot_cache.lock().unwrap();
-    let jvt_snapshots: Vec<Arc<hyperscale_storage::JvtSnapshot>> = jvt_cache
+    let jvt_snapshots: Vec<Arc<hyperscale_storage::JvtSnapshot>> = jvt_snapshot_cache
         .values()
         .map(|(_, snap)| Arc::clone(snap))
         .collect();
 
-    // Collect receipt Arcs for versioned historical reads.
-    let receipts: Vec<(u64, Arc<hyperscale_types::LocalReceipt>)> = cache
+    let receipts: Vec<(u64, Arc<hyperscale_types::LocalReceipt>)> = pending_db_updates
         .values()
         .flat_map(|(h, recs)| recs.iter().map(move |r| (*h, Arc::clone(r))))
         .collect();

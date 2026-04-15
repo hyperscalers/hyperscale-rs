@@ -1106,16 +1106,15 @@ where
                     let elapsed = start.elapsed().as_secs_f64();
                     metrics::record_execution_latency(elapsed);
                 }
+                // Hold both overlay-relevant guards up front so we can
+                // insert and rebuild without re-locking.
+                let mut db_guard = pending_db_updates.lock().unwrap();
+                let mut jvt_guard = jvt_snapshot_cache.lock().unwrap();
                 let mut caches_changed = false;
                 if let Some((hash, height, prepared)) = result.prepared_commit {
-                    // Cache the JvtSnapshot with its parent_block_hash so the
-                    // overlay chain can be walked by following parent hashes.
                     if let Some(parent_hash) = action_parent_block_hash {
                         let snapshot = Arc::new(S::jvt_snapshot(&prepared).clone());
-                        jvt_snapshot_cache
-                            .lock()
-                            .unwrap()
-                            .insert(hash, (parent_hash, snapshot));
+                        jvt_guard.insert(hash, (parent_hash, snapshot));
                         caches_changed = true;
                     }
                     prepared_commits
@@ -1124,22 +1123,16 @@ where
                         .insert(hash, (height, prepared));
                 }
                 if let Some((hash, height, updates)) = result.db_updates {
-                    pending_db_updates
-                        .lock()
-                        .unwrap()
-                        .insert(hash, (height, updates));
+                    db_guard.insert(hash, (height, updates));
                     caches_changed = true;
                 }
-                // Rebuild the cached overlay so subsequent dispatches
-                // see the new entries without rebuilding from scratch.
                 if caches_changed {
-                    let new_overlay = action_handler::build_overlay(
-                        &storage,
-                        &pending_db_updates,
-                        &jvt_snapshot_cache,
-                    );
+                    let new_overlay =
+                        action_handler::build_overlay_from_maps(&storage, &db_guard, &jvt_guard);
                     overlay_cache.store(Arc::new(new_overlay));
                 }
+                drop(db_guard);
+                drop(jvt_guard);
                 for event in result.events {
                     let _ = event_tx.send(event);
                 }

@@ -970,24 +970,20 @@ where
                     self.persisted_height = height;
                 }
                 // Prune pending_db_updates and jvt_snapshot_cache — these
-                // blocks are now in RocksDB. Without this, build_overlay
-                // re-indexes committed JVT nodes into the overlay HashMap on
-                // every dispatched action.
-                self.pending_db_updates
-                    .lock()
-                    .unwrap()
-                    .retain(|_, (h, _)| *h > height);
-                self.jvt_snapshot_cache
-                    .lock()
-                    .unwrap()
-                    .retain(|_, (_, snap)| snap.new_version > height);
-                // Rebuild cached overlay with pruned data.
-                let new_overlay = crate::action_handler::build_overlay(
-                    &self.storage,
-                    &self.pending_db_updates,
-                    &self.jvt_snapshot_cache,
-                );
-                self.overlay_cache.store(Arc::new(new_overlay));
+                // blocks are now in RocksDB. Hold guards to avoid re-locking
+                // inside build_overlay_from_maps.
+                {
+                    let mut db_guard = self.pending_db_updates.lock().unwrap();
+                    let mut jvt_guard = self.jvt_snapshot_cache.lock().unwrap();
+                    db_guard.retain(|_, (h, _)| *h > height);
+                    jvt_guard.retain(|_, (_, snap)| snap.new_version > height);
+                    let new_overlay = crate::action_handler::build_overlay_from_maps(
+                        &self.storage,
+                        &db_guard,
+                        &jvt_guard,
+                    );
+                    self.overlay_cache.store(Arc::new(new_overlay));
+                }
                 self.feed_event(ProtocolEvent::BlockPersisted { height });
             }
             NodeInput::Protocol(pe) => {
