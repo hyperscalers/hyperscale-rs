@@ -127,11 +127,15 @@ fn make_storage_key(entity_key: &[u8], partition_num: u8, sort_key: &[u8]) -> Ve
 /// `reset_old_keys` provides the storage keys that existed in Reset partitions
 /// before the reset. These are needed to generate JVT deletes because hashed keys
 /// prevent tree-based enumeration.
+///
+/// Accepts multiple `DatabaseUpdates` slices — all are flattened directly
+/// into JVT work items without merging. Since transactions hold exclusive
+/// state locks, there are no key conflicts between updates.
 pub fn put_at_version<S: jvt::TreeReader + Sync>(
     store: &S,
     parent_version: Option<u64>,
     new_version: u64,
-    database_updates: &radix_substate_store_interface::interface::DatabaseUpdates,
+    database_updates_list: &[&radix_substate_store_interface::interface::DatabaseUpdates],
     reset_old_keys: &HashMap<
         (Vec<u8>, u8),
         Vec<radix_substate_store_interface::interface::DbSortKey>,
@@ -144,44 +148,45 @@ pub fn put_at_version<S: jvt::TreeReader + Sync>(
 
     // Flatten all database updates into (storage_key_bytes, jvt_value) work items,
     // then parallel-hash and convert to JVT key-value pairs.
-    // Each work item is (entity_key, partition_num, sort_key_bytes, value_option).
     let mut work_items: Vec<(Vec<u8>, Option<&[u8]>)> = Vec::new();
 
-    for (entity_key, node_updates) in &database_updates.node_updates {
-        for (&partition_num, partition_updates) in &node_updates.partition_updates {
-            match partition_updates {
-                radix_substate_store_interface::interface::PartitionDatabaseUpdates::Delta {
-                    substate_updates,
-                } => {
-                    for (sort_key, update) in substate_updates {
-                        let storage_key = make_storage_key(entity_key, partition_num, &sort_key.0);
-                        let value_ref = match update {
-                            radix_common::prelude::DatabaseUpdate::Set(value) => {
-                                Some(value.as_slice())
-                            }
-                            radix_common::prelude::DatabaseUpdate::Delete => None,
-                        };
-                        work_items.push((storage_key, value_ref));
-                    }
-                }
-                radix_substate_store_interface::interface::PartitionDatabaseUpdates::Reset {
-                    new_substate_values,
-                } => {
-                    if let Some(old_sort_keys) =
-                        reset_old_keys.get(&(entity_key.clone(), partition_num))
-                    {
-                        for old_sk in old_sort_keys {
-                            let storage_key =
-                                make_storage_key(entity_key, partition_num, &old_sk.0);
-                            work_items.push((storage_key, None));
+    for database_updates in database_updates_list {
+        for (entity_key, node_updates) in &database_updates.node_updates {
+            for (&partition_num, partition_updates) in &node_updates.partition_updates {
+                match partition_updates {
+                    radix_substate_store_interface::interface::PartitionDatabaseUpdates::Delta {
+                        substate_updates,
+                    } => {
+                        for (sort_key, update) in substate_updates {
+                            let storage_key = make_storage_key(entity_key, partition_num, &sort_key.0);
+                            let value_ref = match update {
+                                radix_common::prelude::DatabaseUpdate::Set(value) => {
+                                    Some(value.as_slice())
+                                }
+                                radix_common::prelude::DatabaseUpdate::Delete => None,
+                            };
+                            work_items.push((storage_key, value_ref));
                         }
                     }
-                    for (sort_key, value) in new_substate_values {
-                        let storage_key = make_storage_key(entity_key, partition_num, &sort_key.0);
-                        work_items.push((storage_key, Some(value.as_slice())));
+                    radix_substate_store_interface::interface::PartitionDatabaseUpdates::Reset {
+                        new_substate_values,
+                    } => {
+                        if let Some(old_sort_keys) =
+                            reset_old_keys.get(&(entity_key.clone(), partition_num))
+                        {
+                            for old_sk in old_sort_keys {
+                                let storage_key =
+                                    make_storage_key(entity_key, partition_num, &old_sk.0);
+                                work_items.push((storage_key, None));
+                            }
+                        }
+                        for (sort_key, value) in new_substate_values {
+                            let storage_key = make_storage_key(entity_key, partition_num, &sort_key.0);
+                            work_items.push((storage_key, Some(value.as_slice())));
+                        }
                     }
-                }
-            };
+                };
+            }
         }
     }
 

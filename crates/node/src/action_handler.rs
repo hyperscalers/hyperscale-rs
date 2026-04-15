@@ -8,6 +8,7 @@
 //! Batched work (execution votes, execution certs) and block commits are
 //! handled inline by the I/O loop's flush closures.
 
+use crate::io_loop::{JvtSnapshotMap, PendingDbUpdatesMap};
 use hyperscale_core::{Action, NodeInput, ProtocolEvent};
 use hyperscale_engine::Engine;
 use hyperscale_metrics as metrics;
@@ -50,16 +51,18 @@ fn collect_pending_snapshots(
 /// Build a `SubstateOverlay` wrapping the given storage with pending updates.
 pub(crate) fn build_overlay<S: ChainWriter + SubstateStore + ChainReader>(
     storage_arc: &Arc<S>,
-    pending_db_updates: &std::sync::Mutex<
-        std::collections::HashMap<Hash, (u64, Arc<hyperscale_storage::DatabaseUpdates>)>,
-    >,
-    jvt_snapshot_cache: &std::sync::Mutex<
-        std::collections::HashMap<Hash, (Hash, Arc<hyperscale_storage::JvtSnapshot>)>,
-    >,
+    pending_db_updates: &std::sync::Mutex<PendingDbUpdatesMap>,
+    jvt_snapshot_cache: &std::sync::Mutex<JvtSnapshotMap>,
 ) -> hyperscale_storage::SubstateOverlay<S> {
     let cache = pending_db_updates.lock().unwrap();
-    let mut updates: Vec<(u64, Arc<hyperscale_storage::DatabaseUpdates>)> =
-        cache.values().map(|(h, u)| (*h, Arc::clone(u))).collect();
+    // Collect (height, &DatabaseUpdates) pairs from all receipts across all
+    // unpersisted blocks. No merge — the overlay flattens them directly.
+    let mut updates: Vec<(u64, &hyperscale_storage::DatabaseUpdates)> = Vec::new();
+    for (h, receipts) in cache.values() {
+        for receipt in receipts {
+            updates.push((*h, &receipt.database_updates));
+        }
+    }
     updates.sort_by_key(|(h, _)| *h);
 
     let jvt_cache = jvt_snapshot_cache.lock().unwrap();
@@ -68,7 +71,18 @@ pub(crate) fn build_overlay<S: ChainWriter + SubstateStore + ChainReader>(
         .map(|(_, snap)| Arc::clone(snap))
         .collect();
 
-    hyperscale_storage::SubstateOverlay::new(Arc::clone(storage_arc), updates, jvt_snapshots)
+    // Collect receipt Arcs for versioned historical reads.
+    let receipts: Vec<(u64, Arc<hyperscale_types::LocalReceipt>)> = cache
+        .values()
+        .flat_map(|(h, recs)| recs.iter().map(move |r| (*h, Arc::clone(r))))
+        .collect();
+
+    hyperscale_storage::SubstateOverlay::new(
+        Arc::clone(storage_arc),
+        updates,
+        receipts,
+        jvt_snapshots,
+    )
 }
 
 /// Context for executing delegated actions.
@@ -94,10 +108,9 @@ pub(crate) struct DelegatedResult<P: Send> {
     /// Prepared commit handle to cache: (block_hash, block_height, handle).
     /// Height is stored alongside the handle so stale entries can be pruned.
     pub prepared_commit: Option<(Hash, u64, P)>,
-    /// Database updates from this block's receipts, for `SubstateOverlay`.
-    /// Populated alongside `prepared_commit` so delegated action handlers
-    /// can read substates from unpersisted blocks.
-    pub db_updates: Option<(Hash, u64, Arc<hyperscale_storage::DatabaseUpdates>)>,
+    /// Per-receipt references for `SubstateOverlay`. Stored without merging —
+    /// the overlay iterates `database_updates` from each receipt directly.
+    pub db_updates: Option<(Hash, u64, Vec<Arc<hyperscale_types::LocalReceipt>>)>,
 }
 
 /// Which dispatch pool an action should run on in production.
@@ -393,13 +406,11 @@ pub(crate) fn handle_delegated_action<
                 .prepared_commit
                 .map(|p| (block_hash, block_height, p));
             let db_updates = prepared.as_ref().map(|_| {
-                (
-                    block_hash,
-                    block_height,
-                    Arc::new(hyperscale_storage::merge_updates_from_receipts(
-                        &all_receipts,
-                    )),
-                )
+                let receipts: Vec<Arc<hyperscale_types::LocalReceipt>> = all_receipts
+                    .iter()
+                    .map(|b| Arc::clone(&b.local_receipt))
+                    .collect();
+                (block_hash, block_height, receipts)
             });
             Some(DelegatedResult {
                 events: vec![NodeInput::Protocol(ProtocolEvent::BlockRootVerified {
@@ -479,13 +490,11 @@ pub(crate) fn handle_delegated_action<
                 .prepared_commit
                 .map(|p| (result.block_hash, height.0, p));
             let db_updates = prepared.as_ref().map(|_| {
-                (
-                    result.block_hash,
-                    height.0,
-                    Arc::new(hyperscale_storage::merge_updates_from_receipts(
-                        &all_receipts,
-                    )),
-                )
+                let receipts: Vec<Arc<hyperscale_types::LocalReceipt>> = all_receipts
+                    .iter()
+                    .map(|b| Arc::clone(&b.local_receipt))
+                    .collect();
+                (result.block_hash, height.0, receipts)
             });
             Some(DelegatedResult {
                 events: vec![NodeInput::Protocol(ProtocolEvent::ProposalBuilt {

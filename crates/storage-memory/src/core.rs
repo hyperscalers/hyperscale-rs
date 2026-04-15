@@ -147,7 +147,7 @@ impl SimStorage {
             &s.tree_store,
             parent_version,
             new_version,
-            updates,
+            &[updates],
             &Default::default(),
         );
 
@@ -201,7 +201,7 @@ impl SimStorage {
             &s.tree_store,
             None,
             0,
-            merged,
+            &[merged],
             &Default::default(),
         );
 

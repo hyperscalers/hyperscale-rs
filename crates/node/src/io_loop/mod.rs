@@ -56,7 +56,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Snapshot cache: `block_hash → (parent_block_hash, snapshot)`.
-type JvtSnapshotMap = HashMap<Hash, (Hash, Arc<hyperscale_storage::JvtSnapshot>)>;
+pub(crate) type JvtSnapshotMap = HashMap<Hash, (Hash, Arc<hyperscale_storage::JvtSnapshot>)>;
 
 /// Prepared commit cache: `block_hash → (block_height, prepared_commit)`.
 type PreparedCommitMap<S> =
@@ -67,7 +67,8 @@ type PreparedCommitMap<S> =
 /// Populated alongside `PreparedCommitMap` when `prepare_block_commit` runs.
 /// Used by `SubstateOverlay` to serve substate reads for blocks that have been
 /// committed by consensus but not yet persisted to RocksDB.
-type PendingDbUpdatesMap = HashMap<Hash, (u64, Arc<hyperscale_storage::DatabaseUpdates>)>;
+pub(crate) type PendingDbUpdatesMap =
+    HashMap<Hash, (u64, Vec<Arc<hyperscale_types::LocalReceipt>>)>;
 
 /// A block commit waiting to be flushed to storage.
 ///
@@ -395,8 +396,12 @@ where
         let header_fetch_protocol =
             HeaderFetchProtocol::new(crate::protocol::header_fetch::HeaderFetchConfig::default());
         let storage = Arc::new(storage);
-        let initial_overlay =
-            hyperscale_storage::SubstateOverlay::new(Arc::clone(&storage), Vec::new(), Vec::new());
+        let initial_overlay = hyperscale_storage::SubstateOverlay::new(
+            Arc::clone(&storage),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
         Self {
             state,
             storage,

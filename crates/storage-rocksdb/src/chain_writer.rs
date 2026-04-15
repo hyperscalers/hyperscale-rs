@@ -39,18 +39,24 @@ impl hyperscale_storage::ChainWriter for RocksDbStorage {
         block_height: u64,
         pending_snapshots: &[std::sync::Arc<hyperscale_storage::JvtSnapshot>],
     ) -> (hyperscale_types::Hash, Self::PreparedCommit) {
-        let merged_updates = hyperscale_storage::merge_updates_from_receipts(receipts);
-
         let snapshot_store = SnapshotTreeStore::new(&self.db, &self.node_cache);
         let parent_version =
             hyperscale_storage::tree::jvt_parent_height(parent_block_height, parent_state_root);
+
+        // Collect per-receipt DatabaseUpdates references — no merge needed.
+        // State locking guarantees no key conflicts between receipts, so
+        // put_at_version can flatten them directly into JVT work items.
+        let per_receipt_updates: Vec<&DatabaseUpdates> = receipts
+            .iter()
+            .map(|b| &b.local_receipt.database_updates)
+            .collect();
 
         let (computed_root, collected) = if pending_snapshots.is_empty() {
             hyperscale_storage::tree::put_at_version(
                 &snapshot_store,
                 parent_version,
                 block_height,
-                &merged_updates,
+                &per_receipt_updates,
                 &Default::default(),
             )
         } else {
@@ -62,7 +68,7 @@ impl hyperscale_storage::ChainWriter for RocksDbStorage {
                 &overlay,
                 parent_version,
                 block_height,
-                &merged_updates,
+                &per_receipt_updates,
                 &Default::default(),
             )
         };
@@ -74,6 +80,9 @@ impl hyperscale_storage::ChainWriter for RocksDbStorage {
             computed_root,
             block_height,
         );
+
+        // Merge updates for the substate WriteBatch (off the state_root critical path).
+        let merged_updates = hyperscale_storage::merge_updates_from_receipts(receipts);
 
         // Pre-build substate + receipt writes into a WriteBatch for efficient commit.
         let (mut write_batch, _reset_old_keys) =
@@ -217,7 +226,7 @@ impl RocksDbStorage {
             &snapshot_store,
             parent_version,
             block_height,
-            merged_updates,
+            &[merged_updates],
             &reset_old_keys,
         );
         let jvt_snapshot = JvtSnapshot::from_collected_writes(

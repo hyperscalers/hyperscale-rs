@@ -120,10 +120,10 @@ pub struct SubstateOverlay<S> {
     base: Arc<S>,
     /// Flattened overlay for current-state `SubstateDatabase` reads.
     entries: Arc<OverlayEntries>,
-    /// Height-keyed updates for historical `list_substates_for_node_at_height`.
-    /// Sorted by height ascending. Used to layer unpersisted changes on top
-    /// of the base's MVCC scan result.
-    versioned_updates: Arc<Vec<(u64, Arc<DatabaseUpdates>)>>,
+    /// Per-receipt references for historical `list_substates_for_node_at_height`.
+    /// Sorted by height ascending. Each receipt's `database_updates` is applied
+    /// sequentially — no merge needed since state locking prevents conflicts.
+    versioned_receipts: Arc<Vec<(u64, Arc<hyperscale_types::LocalReceipt>)>>,
     /// Pre-built JVT node index from unpersisted snapshots.
     /// O(1) lookup instead of linear scan through snapshot vecs.
     jvt_nodes: Arc<JvtNodeIndex>,
@@ -135,28 +135,28 @@ impl<S> Clone for SubstateOverlay<S> {
         Self {
             base: Arc::clone(&self.base),
             entries: Arc::clone(&self.entries),
-            versioned_updates: Arc::clone(&self.versioned_updates),
+            versioned_receipts: Arc::clone(&self.versioned_receipts),
             jvt_nodes: Arc::clone(&self.jvt_nodes),
         }
     }
 }
 
 impl<S> SubstateOverlay<S> {
-    /// Build an overlay from an `Arc`-wrapped base store, height-keyed
-    /// database updates, and pending JVT snapshots.
+    /// Build an overlay from per-receipt references and pending JVT snapshots.
     ///
-    /// `updates` should be `(block_height, Arc<DatabaseUpdates>)` sorted by
-    /// height ascending. No cloning of `DatabaseUpdates` — only `Arc` bumps.
+    /// `receipt_updates` should be `(block_height, &DatabaseUpdates)` sorted by
+    /// height ascending. No merging — each receipt's updates are flattened
+    /// directly into the overlay. State locking guarantees no key conflicts.
     ///
-    /// `jvt_snapshots` are pending tree snapshots from unpersisted blocks.
-    /// Their nodes are indexed into a HashMap for O(1) lookup during proof
-    /// generation (same approach as `OverlayTreeReader`).
+    /// `receipts` are the `Arc<LocalReceipt>` references stored for historical
+    /// reads via `list_substates_for_node_at_height`.
     pub fn new(
         base: Arc<S>,
-        updates: Vec<(u64, Arc<DatabaseUpdates>)>,
+        receipt_updates: Vec<(u64, &DatabaseUpdates)>,
+        receipts: Vec<(u64, Arc<hyperscale_types::LocalReceipt>)>,
         jvt_snapshots: Vec<Arc<crate::JvtSnapshot>>,
     ) -> Self {
-        let refs: Vec<&DatabaseUpdates> = updates.iter().map(|(_, u)| u.as_ref()).collect();
+        let refs: Vec<&DatabaseUpdates> = receipt_updates.iter().map(|(_, u)| *u).collect();
 
         // Build JVT node index from all snapshots (same as OverlayTreeReader::new).
         let mut jvt_nodes = HashMap::new();
@@ -169,7 +169,7 @@ impl<S> SubstateOverlay<S> {
         Self {
             base,
             entries: Arc::new(flatten_updates(&refs)),
-            versioned_updates: Arc::new(updates),
+            versioned_receipts: Arc::new(receipts),
             jvt_nodes: Arc::new(jvt_nodes),
         }
     }
@@ -271,8 +271,9 @@ impl<S: SubstateStore> SubstateStore for SubstateOverlay<S> {
             .map(|(part, sk, v)| ((part, sk), v))
             .collect();
 
-        // Apply each unpersisted block's updates up to the requested height.
-        for (h, updates) in self.versioned_updates.iter() {
+        // Apply each unpersisted receipt's updates up to the requested height.
+        for (h, receipt) in self.versioned_receipts.iter() {
+            let updates = &receipt.database_updates;
             if *h > block_height {
                 break;
             }
@@ -488,6 +489,11 @@ mod tests {
     use crate::empty_substate_database;
     use radix_substate_store_interface::interface::{DatabaseUpdates, PartitionDatabaseUpdates};
 
+    /// Test helper: build an overlay from `(height, &DatabaseUpdates)` pairs.
+    fn test_overlay<S>(base: S, updates: Vec<(u64, &DatabaseUpdates)>) -> SubstateOverlay<S> {
+        SubstateOverlay::new(Arc::new(base), updates, vec![], vec![])
+    }
+
     fn make_delta(
         node_key: &[u8],
         partition: u8,
@@ -525,7 +531,7 @@ mod tests {
     fn test_overlay_get_returns_overlay_value() {
         let base = empty_substate_database();
         let updates = make_delta(b"node1", 0, vec![1], vec![42]);
-        let overlay = SubstateOverlay::new(Arc::new(base), vec![(0, Arc::new(updates))], vec![]);
+        let overlay = test_overlay(base, vec![(0, &updates)]);
 
         let pk = DbPartitionKey {
             node_key: b"node1".to_vec(),
@@ -539,7 +545,7 @@ mod tests {
     fn test_overlay_get_falls_through_to_base() {
         let base = empty_substate_database();
         let updates = make_delta(b"node1", 0, vec![1], vec![42]);
-        let overlay = SubstateOverlay::new(Arc::new(base), vec![(0, Arc::new(updates))], vec![]);
+        let overlay = test_overlay(base, vec![(0, &updates)]);
 
         let pk = DbPartitionKey {
             node_key: b"node1".to_vec(),
@@ -570,7 +576,7 @@ mod tests {
         }
 
         let delete = make_delete(b"node1", 0, vec![1]);
-        let overlay = SubstateOverlay::new(Arc::new(FakeBase), vec![(0, Arc::new(delete))], vec![]);
+        let overlay = test_overlay(FakeBase, vec![(0, &delete)]);
 
         let pk = DbPartitionKey {
             node_key: b"node1".to_vec(),
@@ -585,11 +591,7 @@ mod tests {
         let base = empty_substate_database();
         let u1 = make_delta(b"node1", 0, vec![1], vec![10]);
         let u2 = make_delta(b"node1", 0, vec![1], vec![20]);
-        let overlay = SubstateOverlay::new(
-            Arc::new(base),
-            vec![(0, Arc::new(u1)), (1, Arc::new(u2))],
-            vec![],
-        );
+        let overlay = test_overlay(base, vec![(0, &u1), (1, &u2)]);
 
         let pk = DbPartitionKey {
             node_key: b"node1".to_vec(),
@@ -626,8 +628,7 @@ mod tests {
         }
 
         let updates = make_delta(b"node1", 0, vec![2], vec![20]);
-        let overlay =
-            SubstateOverlay::new(Arc::new(FakeBase), vec![(0, Arc::new(updates))], vec![]);
+        let overlay = test_overlay(FakeBase, vec![(0, &updates)]);
 
         let pk = DbPartitionKey {
             node_key: b"node1".to_vec(),

@@ -479,7 +479,7 @@ impl RocksDbStorage {
             &snapshot_store,
             None,
             0,
-            merged,
+            &[merged],
             &Default::default(),
         );
         let jvt_snapshot =
@@ -620,7 +620,7 @@ impl RocksDbStorage {
             &snapshot_store,
             parent_version,
             new_version,
-            updates,
+            &[updates],
             &reset_old_keys,
         );
         let jvt_snapshot = JvtSnapshot::from_collected_writes(

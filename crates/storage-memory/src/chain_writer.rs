@@ -32,24 +32,24 @@ impl ChainWriter for SimStorage {
         block_height: u64,
         pending_snapshots: &[Arc<hyperscale_storage::JvtSnapshot>],
     ) -> (Hash, Self::PreparedCommit) {
-        let merged_updates = hyperscale_storage::merge_updates_from_receipts(receipts);
-
         // Read lock: compute speculative JVT root.
         let s = self.state.read().unwrap();
 
         let parent_version =
             hyperscale_storage::tree::jvt_parent_height(parent_block_height, parent_state_root);
 
-        // Use a layered reader if there are pending snapshots from prior
-        // uncommitted verifications. This avoids mutating the shared tree
-        // store — orphaned nodes from abandoned blocks (view changes) would
-        // corrupt subsequent computations if written directly.
+        // Collect per-receipt DatabaseUpdates references — no merge needed.
+        let per_receipt_updates: Vec<&hyperscale_storage::DatabaseUpdates> = receipts
+            .iter()
+            .map(|b| &b.local_receipt.database_updates)
+            .collect();
+
         let (result_root, collected) = if pending_snapshots.is_empty() {
             hyperscale_storage::tree::put_at_version(
                 &s.tree_store,
                 parent_version,
                 block_height,
-                &merged_updates,
+                &per_receipt_updates,
                 &Default::default(),
             )
         } else {
@@ -59,7 +59,7 @@ impl ChainWriter for SimStorage {
                 &overlay,
                 parent_version,
                 block_height,
-                &merged_updates,
+                &per_receipt_updates,
                 &Default::default(),
             )
         };
@@ -73,6 +73,9 @@ impl ChainWriter for SimStorage {
         );
 
         drop(s); // Release read lock
+
+        // Merge for commit-time substate writes (off the state_root critical path).
+        let merged_updates = hyperscale_storage::merge_updates_from_receipts(receipts);
 
         let prepared = SimPreparedCommit {
             snapshot,
@@ -215,7 +218,7 @@ impl SimStorage {
             &s.tree_store,
             parent_version,
             block_height,
-            merged_updates,
+            &[merged_updates],
             &Default::default(),
         );
 
