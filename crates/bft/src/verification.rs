@@ -440,6 +440,32 @@ impl VerificationPipeline {
         valid
     }
 
+    /// Mark a block's state root as verified because the proposer built it.
+    ///
+    /// The proposer computed the state root during `BuildProposal`, so it is
+    /// inherently correct. This populates the overlay chain so that child
+    /// blocks can verify without waiting for the block to be committed.
+    pub fn mark_proposal_state_root_verified(&mut self, block_hash: Hash) {
+        self.verified_state_roots.insert(block_hash);
+
+        // Unblock children deferred on this parent.
+        if let Some(deferred) = self.deferred_state_root_verifications.remove(&block_hash) {
+            for ready in deferred {
+                debug!(
+                    child = ?ready.block_hash,
+                    parent = ?block_hash,
+                    "Unblocking deferred state root verification (proposer verified)"
+                );
+                self.state_root_verifications_in_flight
+                    .insert(ready.block_hash);
+                self.ready_state_root_verifications.push(ready);
+            }
+        }
+
+        // Unblock deferred proposal if it was waiting for this parent.
+        self.try_unblock_proposal(block_hash);
+    }
+
     // ─── Transaction root ────────────────────────────────────────────────
 
     /// Check if a block needs transaction root verification before voting.
