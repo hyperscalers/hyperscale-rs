@@ -2695,11 +2695,11 @@ impl BftState {
         self.fetch.track(block_hash, self.now);
         self.record_leader_activity();
 
-        // The proposer computed the state root during BuildProposal, so mark
-        // it as verified. This unblocks child block verifications that need
-        // the overlay from this block's PreparedCommit.
-        self.verification
-            .mark_proposal_state_root_verified(block_hash);
+        // The proposer built the block, so all roots are inherently correct.
+        // Mark everything verified so the pipeline is complete. This also
+        // unblocks child block verifications that need the overlay from this
+        // block's PreparedCommit.
+        self.verification.mark_proposal_fully_verified(block_hash);
 
         let mut actions = vec![Action::BroadcastBlockHeader {
             header: Box::new(block.header.clone()),

@@ -445,7 +445,7 @@ impl VerificationPipeline {
     /// The proposer computed the state root during `BuildProposal`, so it is
     /// inherently correct. This populates the overlay chain so that child
     /// blocks can verify without waiting for the block to be committed.
-    pub fn mark_proposal_state_root_verified(&mut self, block_hash: Hash) {
+    fn mark_proposal_state_root_verified(&mut self, block_hash: Hash) {
         self.verified_state_roots.insert(block_hash);
 
         // Unblock children deferred on this parent.
@@ -464,6 +464,23 @@ impl VerificationPipeline {
 
         // Unblock deferred proposal if it was waiting for this parent.
         self.try_unblock_proposal(block_hash);
+    }
+
+    /// Mark all roots as verified for the proposer's own block.
+    ///
+    /// The proposer built the block, so all merkle roots are inherently
+    /// correct. This marks state root, transaction root, certificate root,
+    /// local receipt root, provision root, and in-flight as verified so
+    /// the verification pipeline is complete. Without this, a view change
+    /// would report these as NOT_STARTED since the proposer path bypasses
+    /// `try_vote_on_block`.
+    pub fn mark_proposal_fully_verified(&mut self, block_hash: Hash) {
+        self.mark_proposal_state_root_verified(block_hash);
+        self.verified_transaction_roots.insert(block_hash);
+        self.verified_certificate_roots.insert(block_hash);
+        self.verified_local_receipt_roots.insert(block_hash);
+        self.verified_provision_roots.insert(block_hash);
+        self.verified_in_flight.insert(block_hash);
     }
 
     // ─── Transaction root ────────────────────────────────────────────────
