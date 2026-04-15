@@ -187,6 +187,22 @@ impl VerificationPipeline {
         self.pending_qc_verifications.len()
     }
 
+    /// Whether any block verification is currently in-flight.
+    ///
+    /// Used by `should_advance_round` to suppress view changes while
+    /// verification is running — the leader proposed, we received the block,
+    /// the timeout should detect leader failure, not slow verification.
+    pub fn has_verification_in_flight(&self) -> bool {
+        !self.state_root_verifications_in_flight.is_empty()
+            || !self.deferred_state_root_verifications.is_empty()
+            || self.deferred_proposal.is_some()
+            || !self.transaction_root_verifications_in_flight.is_empty()
+            || !self.certificate_root_verifications_in_flight.is_empty()
+            || !self.local_receipt_root_verifications_in_flight.is_empty()
+            || !self.provision_root_verifications_in_flight.is_empty()
+            || !self.pending_qc_verifications.is_empty()
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
     // Block verification (state root, tx root, receipt root)
     // ═══════════════════════════════════════════════════════════════════════

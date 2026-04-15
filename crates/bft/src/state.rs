@@ -688,6 +688,26 @@ impl BftState {
     /// the view if the leader fails. When a syncing node becomes the proposer
     /// after a view change, they propose an empty sync block.
     fn should_advance_round(&self) -> bool {
+        // Don't view-change while we're actively processing the leader's
+        // block — either assembling it (pending) or verifying it. The
+        // timeout should detect leader failure, not slow processing.
+        //
+        // Only suppress for blocks at the current proposal height — pending
+        // blocks at future heights (received early) are irrelevant to
+        // whether the current leader proposed.
+        let next_height = self
+            .latest_qc
+            .as_ref()
+            .map(|qc| qc.height.0 + 1)
+            .unwrap_or(self.committed_height + 1);
+        let has_incomplete_block_at_tip = self
+            .pending_blocks
+            .values()
+            .any(|pb| pb.header().height.0 == next_height && !pb.is_complete());
+        if self.verification.has_verification_in_flight() || has_incomplete_block_at_tip {
+            return false;
+        }
+
         let Some(last_activity) = self.last_leader_activity else {
             // No leader activity recorded yet — don't view-change before
             // the first proposal has had a chance to arrive.
