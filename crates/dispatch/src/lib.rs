@@ -17,6 +17,7 @@
 //! - **Consensus Crypto**: Liveness-critical (block votes, QC verification)
 //! - **Crypto**: General signature verification (provisions, execution votes)
 //! - **TX Validation**: Transaction signature verification (isolated from crypto)
+//! - **State Root**: JVT state root computation and proposal building
 //! - **Execution**: Radix Engine transaction execution
 
 /// Trait for dispatching CPU-intensive work to priority-isolated pools.
@@ -50,6 +51,13 @@ pub trait Dispatch: Send + Sync + Clone + 'static {
     /// Spawn an execution task (Radix Engine).
     fn spawn_execution(&self, f: impl FnOnce() + Send + 'static);
 
+    /// Spawn a state root computation task (JVT updates, proposal building).
+    ///
+    /// Isolated from consensus crypto so that state root computation
+    /// (which touches the Jellyfish Merkle Tree) does not block liveness-critical
+    /// QC and block vote verification.
+    fn spawn_state_root(&self, f: impl FnOnce() + Send + 'static);
+
     /// Spawn a provision task (IPA proof generation/verification).
     ///
     /// Isolated from execution to prevent transaction floods from starving
@@ -67,6 +75,9 @@ pub trait Dispatch: Send + Sync + Clone + 'static {
 
     /// Current execution pool queue depth.
     fn execution_queue_depth(&self) -> usize;
+
+    /// Current state root pool queue depth.
+    fn state_root_queue_depth(&self) -> usize;
 
     /// Current provisions pool queue depth.
     fn provisions_queue_depth(&self) -> usize;

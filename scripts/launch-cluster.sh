@@ -441,6 +441,7 @@ rpc_mempool_limit = 16384
 consensus_crypto_threads = 0
 crypto_threads = 0
 tx_validation_threads = 0
+state_root_threads = 0
 execution_threads = 0
 provisions_threads = 0
 io_threads = 0

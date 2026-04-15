@@ -1149,6 +1149,7 @@ where
         match pool {
             DispatchPool::ConsensusCrypto => self.dispatch.spawn_consensus_crypto(spawn_fn),
             DispatchPool::Crypto => self.dispatch.spawn_crypto(spawn_fn),
+            DispatchPool::StateRoot => self.dispatch.spawn_state_root(spawn_fn),
             DispatchPool::Execution => self.dispatch.spawn_execution(spawn_fn),
             DispatchPool::Provision => self.dispatch.spawn_provisions(spawn_fn),
         }

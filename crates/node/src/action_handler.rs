@@ -115,10 +115,12 @@ pub(crate) struct DelegatedResult<P: Send> {
 
 /// Which dispatch pool an action should run on in production.
 pub(crate) enum DispatchPool {
-    /// Liveness-critical consensus crypto (QC, state root, proposal).
+    /// Liveness-critical consensus crypto (QC verification, block votes).
     ConsensusCrypto,
     /// General crypto verification (cert aggregation).
     Crypto,
+    /// State root computation (JVT updates, proposal building).
+    StateRoot,
     /// Transaction execution (single-shard, merkle).
     Execution,
     /// Provision proof generation and verification (IPA math).
@@ -135,12 +137,15 @@ pub(crate) fn dispatch_pool_for(action: &Action) -> Option<DispatchPool> {
         Action::VerifyAndBuildQuorumCertificate { .. } => Some(DispatchPool::ConsensusCrypto),
         Action::VerifyQcSignature { .. } => Some(DispatchPool::ConsensusCrypto),
         Action::VerifyRemoteHeaderQc { .. } => Some(DispatchPool::ConsensusCrypto),
-        Action::VerifyStateRoot { .. } => Some(DispatchPool::ConsensusCrypto),
         Action::VerifyTransactionRoot { .. } => Some(DispatchPool::ConsensusCrypto),
         Action::VerifyProvisionRoot { .. } => Some(DispatchPool::ConsensusCrypto),
         Action::VerifyCertificateRoot { .. } => Some(DispatchPool::ConsensusCrypto),
         Action::VerifyLocalReceiptRoot { .. } => Some(DispatchPool::ConsensusCrypto),
-        Action::BuildProposal { .. } => Some(DispatchPool::ConsensusCrypto),
+
+        // State root computation — JVT traversal, isolated from consensus crypto
+        // so that slow tree updates don't block liveness-critical QC verification.
+        Action::VerifyStateRoot { .. } => Some(DispatchPool::StateRoot),
+        Action::BuildProposal { .. } => Some(DispatchPool::StateRoot),
 
         // General crypto
         Action::AggregateExecutionCertificate { .. } => Some(DispatchPool::Crypto),

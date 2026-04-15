@@ -736,6 +736,7 @@ impl ProductionRunner {
         info!(
             shard = ?self.local_shard,
             crypto_threads = config.crypto_threads,
+            state_root_threads = config.state_root_threads,
             execution_threads = config.execution_threads,
             pin_cores = config.pin_cores,
             "Starting production runner (IoLoop architecture)"
@@ -820,6 +821,7 @@ impl ProductionRunner {
             self.dispatch.consensus_crypto_queue_depth(),
             self.dispatch.crypto_queue_depth(),
             self.dispatch.tx_validation_queue_depth(),
+            self.dispatch.state_root_queue_depth(),
             self.dispatch.execution_queue_depth(),
             self.dispatch.provisions_queue_depth(),
         );

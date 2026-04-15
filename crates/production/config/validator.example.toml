@@ -91,6 +91,9 @@ crypto_threads = 0
 # Threads for transaction signature validation (0 = auto-detect)
 tx_validation_threads = 0
 
+# Threads for state root computation — JVT updates, proposal building (0 = auto-detect)
+state_root_threads = 0
+
 # Threads for transaction execution (0 = auto-detect)
 execution_threads = 0
 

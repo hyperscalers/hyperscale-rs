@@ -4131,6 +4131,15 @@
           "expr": "avg(hyperscale_provisions_pool_queue_depth)",
           "legendFormat": "Provisions Pool (avg/validator)",
           "refId": "E"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "avg(hyperscale_state_root_pool_queue_depth)",
+          "legendFormat": "State Root Pool (avg/validator)",
+          "refId": "F"
         }
       ],
       "title": "Avg Thread Pool Queue Depth",

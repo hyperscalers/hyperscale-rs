@@ -45,6 +45,7 @@ pub struct Metrics {
     pub consensus_crypto_pool_queue_depth: Gauge,
     pub crypto_pool_queue_depth: Gauge,
     pub tx_validation_pool_queue_depth: Gauge,
+    pub state_root_pool_queue_depth: Gauge,
     pub execution_pool_queue_depth: Gauge,
     pub provisions_pool_queue_depth: Gauge,
     pub pool_task_duration: HistogramVec,
@@ -256,6 +257,12 @@ impl Metrics {
             tx_validation_pool_queue_depth: register_gauge!(
                 "hyperscale_tx_validation_pool_queue_depth",
                 "Number of pending tasks in tx validation pool (transaction signature verification)"
+            )
+            .unwrap(),
+
+            state_root_pool_queue_depth: register_gauge!(
+                "hyperscale_state_root_pool_queue_depth",
+                "Number of pending tasks in state root pool (JVT updates, proposal building)"
             )
             .unwrap(),
 
@@ -783,6 +790,7 @@ impl MetricsRecorder for PrometheusRecorder {
         consensus_crypto: usize,
         crypto: usize,
         tx_validation: usize,
+        state_root: usize,
         execution: usize,
         provisions: usize,
     ) {
@@ -793,6 +801,9 @@ impl MetricsRecorder for PrometheusRecorder {
         self.metrics
             .tx_validation_pool_queue_depth
             .set(tx_validation as f64);
+        self.metrics
+            .state_root_pool_queue_depth
+            .set(state_root as f64);
         self.metrics
             .execution_pool_queue_depth
             .set(execution as f64);
