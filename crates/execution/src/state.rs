@@ -1975,12 +1975,59 @@ impl ExecutionState {
             .retain(|_, wave_id| self.accumulators.contains_key(wave_id));
         let pruned_wa = before_wa - self.wave_assignments.len();
 
-        if pruned_acc > 0 || pruned_vt > 0 || pruned_ev > 0 || pruned_wa > 0 {
+        // Prune orphaned early_* maps.
+        //
+        // Entries in early_execution_results, early_wave_attestations, and
+        // early_committed_provisions are keyed by tx_hash. They are consumed
+        // during on_block_committed when wave assignments are created.
+        //
+        // After wave_assignments pruning (above), any tx_hash that:
+        // 1. Has a wave_assignment → should have been consumed during replay
+        //    (stale leftover, safe to prune)
+        // 2. Has no wave_assignment → block was never committed (orphaned)
+        //
+        // For case 2, we keep entries if ANY accumulator still exists (the block
+        // might still be in-flight). If no accumulators reference this tx_hash
+        // and no wave_assignment exists, the block was dropped.
+        let has_active_wave =
+            |tx_hash: &Hash| -> bool { self.wave_assignments.contains_key(tx_hash) };
+
+        let before_er = self.early_execution_results.len();
+        self.early_execution_results
+            .retain(|tx_hash, _| !has_active_wave(tx_hash));
+        let pruned_er = before_er - self.early_execution_results.len();
+
+        let before_ewa = self.early_wave_attestations.len();
+        self.early_wave_attestations.retain(|tx_hash, ecs| {
+            if has_active_wave(tx_hash) {
+                return false;
+            }
+            // No wave assignment — keep if any referenced EC is recent.
+            ecs.iter().any(|ec| ec.wave_id.block_height > ev_cutoff)
+        });
+        let pruned_ewa = before_ewa - self.early_wave_attestations.len();
+
+        let before_ecp = self.early_committed_provisions.len();
+        self.early_committed_provisions
+            .retain(|tx_hash, _| !has_active_wave(tx_hash));
+        let pruned_ecp = before_ecp - self.early_committed_provisions.len();
+
+        if pruned_acc > 0
+            || pruned_vt > 0
+            || pruned_ev > 0
+            || pruned_wa > 0
+            || pruned_er > 0
+            || pruned_ewa > 0
+            || pruned_ecp > 0
+        {
             tracing::debug!(
                 pruned_acc,
                 pruned_vt,
                 pruned_ev,
                 pruned_wa,
+                pruned_er,
+                pruned_ewa,
+                pruned_ecp,
                 "Pruned resolved wave state"
             );
         }
@@ -2610,5 +2657,162 @@ mod tests {
             _ => false,
         });
         assert!(has_remote, "Should include remote shard broadcast");
+    }
+
+    // ========================================================================
+    // Early State Cleanup Tests
+    // ========================================================================
+
+    #[test]
+    fn test_early_execution_results_pruned_when_wave_assigned() {
+        let mut state = make_test_state();
+        let tx = test_transaction(1);
+        let tx_hash = tx.hash();
+
+        // Buffer an early result (no wave assignment yet).
+        state
+            .early_execution_results
+            .insert(tx_hash, ExecutionOutcome::Aborted);
+        assert_eq!(state.early_execution_results.len(), 1);
+
+        // Simulate wave assignment (block committed).
+        let wave_id = WaveId::new(ShardGroupId(0), 10, BTreeSet::new());
+        state.wave_assignments.insert(tx_hash, wave_id.clone());
+        // Also need an accumulator for the wave to survive its own pruning.
+        state.accumulators.insert(
+            wave_id.clone(),
+            crate::accumulator::ExecutionAccumulator::new(
+                wave_id,
+                Hash::from_bytes(b"block"),
+                10,
+                vec![],
+            ),
+        );
+
+        state.committed_height = 100;
+        state.prune_execution_state();
+
+        assert_eq!(
+            state.early_execution_results.len(),
+            0,
+            "Early result with wave assignment should be pruned (stale leftover)"
+        );
+    }
+
+    #[test]
+    fn test_early_execution_results_kept_without_wave_assignment() {
+        let mut state = make_test_state();
+        let tx = test_transaction(2);
+
+        // Buffer an early result — no wave assignment.
+        state
+            .early_execution_results
+            .insert(tx.hash(), ExecutionOutcome::Aborted);
+
+        state.committed_height = 100;
+        state.prune_execution_state();
+
+        assert_eq!(
+            state.early_execution_results.len(),
+            1,
+            "Early result without wave assignment should be kept (block may not have committed yet)"
+        );
+    }
+
+    #[test]
+    fn test_early_committed_provisions_pruned_when_wave_assigned() {
+        let mut state = make_test_state();
+        let tx = test_transaction(3);
+        let tx_hash = tx.hash();
+
+        state
+            .early_committed_provisions
+            .insert(tx_hash, BTreeSet::from([ShardGroupId(1)]));
+
+        let wave_id = WaveId::new(ShardGroupId(0), 10, BTreeSet::new());
+        state.wave_assignments.insert(tx_hash, wave_id.clone());
+        state.accumulators.insert(
+            wave_id.clone(),
+            crate::accumulator::ExecutionAccumulator::new(
+                wave_id,
+                Hash::from_bytes(b"block"),
+                10,
+                vec![],
+            ),
+        );
+
+        state.committed_height = 100;
+        state.prune_execution_state();
+
+        assert_eq!(
+            state.early_committed_provisions.len(),
+            0,
+            "Early provisions with wave assignment should be pruned"
+        );
+    }
+
+    #[test]
+    fn test_early_wave_attestations_pruned_when_stale() {
+        let mut state = make_test_state();
+        let tx = test_transaction(4);
+
+        let ec = Arc::new(ExecutionCertificate::new(
+            WaveId::new(ShardGroupId(0), 40, BTreeSet::new()),
+            40,
+            Hash::ZERO,
+            vec![hyperscale_types::TxOutcome {
+                tx_hash: tx.hash(),
+                outcome: ExecutionOutcome::Aborted,
+            }],
+            hyperscale_types::zero_bls_signature(),
+            hyperscale_types::SignerBitfield::new(1),
+        ));
+        state
+            .early_wave_attestations
+            .entry(tx.hash())
+            .or_default()
+            .push(ec);
+
+        // Advance past staleness cutoff (committed_height=100, cutoff=50, EC at height 40).
+        state.committed_height = 100;
+        state.prune_execution_state();
+
+        assert_eq!(
+            state.early_wave_attestations.len(),
+            0,
+            "Stale early attestation should be pruned"
+        );
+    }
+
+    #[test]
+    fn test_early_wave_attestations_kept_when_fresh() {
+        let mut state = make_test_state();
+        let tx = test_transaction(5);
+
+        let ec = Arc::new(ExecutionCertificate::new(
+            WaveId::new(ShardGroupId(0), 80, BTreeSet::new()),
+            80,
+            Hash::ZERO,
+            vec![hyperscale_types::TxOutcome {
+                tx_hash: tx.hash(),
+                outcome: ExecutionOutcome::Aborted,
+            }],
+            hyperscale_types::zero_bls_signature(),
+            hyperscale_types::SignerBitfield::new(1),
+        ));
+        state
+            .early_wave_attestations
+            .entry(tx.hash())
+            .or_default()
+            .push(ec);
+
+        state.committed_height = 100;
+        state.prune_execution_state();
+
+        assert_eq!(
+            state.early_wave_attestations.len(),
+            1,
+            "Fresh early attestation should be kept"
+        );
     }
 }
