@@ -615,6 +615,10 @@ impl StateMachine for NodeStateMachine {
                 self.on_block_committed(block_hash, height, block, provision_hashes)
             }
 
+            // ── Block Persisted (RocksDB write complete) ───────────────
+            // Bookkeeping only — consensus already advanced on BlockCommitted.
+            ProtocolEvent::BlockPersisted { .. } => vec![],
+
             // ── Provision ───────────────────────────────────────────────
             ProtocolEvent::StateProvisionReceived { batch } => self
                 .provisions

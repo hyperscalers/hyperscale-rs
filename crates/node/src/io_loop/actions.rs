@@ -431,8 +431,20 @@ where
     }
 
     /// Accumulate a block commit for batched dispatch. Records metrics
-    /// immediately (on the pinned thread) and feeds the sync protocol, then
-    /// defers the heavy JVT/metadata writes to [`flush_block_commits`].
+    /// immediately (on the pinned thread), feeds the sync protocol, fires
+    /// `BlockCommitted` to the state machine, then defers the heavy
+    /// JVT/metadata writes to [`flush_block_commits`].
+    ///
+    /// `BlockCommitted` fires immediately — before RocksDB persistence —
+    /// because the QC is the proof of commit (2f+1 agreement). Subsystem
+    /// notifications use event-carried data, not storage reads. The async
+    /// persistence closure sends `BlockPersisted` when the write completes.
+    ///
+    /// **Backpressure**: if the persistence lag exceeds
+    /// [`MAX_PERSISTENCE_LAG`] blocks, the immediate `BlockCommitted` is
+    /// suppressed and instead fires after the disk write (falling back to
+    /// the pre-decoupling behaviour). This bounds memory usage and the
+    /// crash-recovery window.
     fn accumulate_block_commit(&mut self, commit: super::PendingCommit) {
         let block = commit.block();
         let block_hash = block.hash();
@@ -456,8 +468,41 @@ where
             .handle(SyncInput::BlockCommitted { height: height.0 });
         self.process_sync_outputs(outputs);
 
+        // Fire BlockCommitted immediately unless persistence is falling
+        // too far behind (backpressure). When deferred, flush_block_commits
+        // sends BlockCommitted after the disk write instead.
+        let persistence_lag = height.0.saturating_sub(self.persisted_height);
+        if persistence_lag <= Self::MAX_PERSISTENCE_LAG {
+            let block_clone = commit.block().clone();
+            let provision_hashes = match &commit {
+                super::PendingCommit::Consensus {
+                    provision_hashes, ..
+                }
+                | super::PendingCommit::Synced {
+                    provision_hashes, ..
+                } => provision_hashes.clone(),
+            };
+            self.feed_event(ProtocolEvent::BlockCommitted {
+                block_hash,
+                height: height.0,
+                block: block_clone,
+                provision_hashes,
+            });
+        } else {
+            tracing::debug!(
+                height = height.0,
+                persisted = self.persisted_height,
+                lag = persistence_lag,
+                "Deferring BlockCommitted — persistence backpressure"
+            );
+        }
+
         self.pending_block_commits.push(commit);
     }
+
+    /// Maximum number of blocks consensus can advance ahead of persistence
+    /// before falling back to synchronous commit notification.
+    const MAX_PERSISTENCE_LAG: u64 = 5;
 
     /// Flush accumulated block commits and any pending receipt bundles.
     ///
@@ -580,8 +625,22 @@ where
         if ready_commits.is_empty() {
             return;
         }
+
+        // Track which blocks already had BlockCommitted fired immediately
+        // (not deferred by backpressure). Those only need BlockPersisted.
+        let already_notified: Vec<bool> = ready_commits
+            .iter()
+            .map(|c| {
+                c.block()
+                    .header
+                    .height
+                    .0
+                    .saturating_sub(self.persisted_height)
+                    <= Self::MAX_PERSISTENCE_LAG
+            })
+            .collect();
+
         let commits = ready_commits;
-        let commit_count = commits.len();
 
         let storage = Arc::clone(&self.storage);
         let topology = Arc::clone(&self.topology);
@@ -591,6 +650,8 @@ where
         self.commit_in_flight.store(true, Ordering::Release);
 
         self.pending_commit_task = Some(Box::new(move || {
+            let mut max_persisted = 0u64;
+
             for (i, commit) in commits.into_iter().enumerate() {
                 let block_hash = commit.block().hash();
                 let height = commit.block().header.height;
@@ -672,35 +733,43 @@ where
                     }
                 };
 
-                // Extract the block and provision hashes from the commit for the event.
-                let (block, provision_hashes) = match commit {
-                    super::PendingCommit::Consensus {
-                        block,
-                        provision_hashes,
-                        ..
-                    } => (block, provision_hashes),
-                    super::PendingCommit::Synced {
-                        block,
-                        provision_hashes,
-                        ..
-                    } => (block, provision_hashes),
-                };
+                max_persisted = max_persisted.max(height.0);
 
-                // Clear the in-flight flag before sending events for the last
-                // block. The channel send synchronizes-with recv on the main
-                // thread, so the flag is guaranteed visible when the resulting
-                // feed_event calls flush_block_commits to drain any backlog.
-                if i == commit_count - 1 {
-                    in_flight.store(false, Ordering::Release);
+                // For blocks deferred by backpressure, send BlockCommitted
+                // now that the disk write is done. For blocks already
+                // notified immediately, skip — they don't need a repeat.
+                if !already_notified[i] {
+                    let (block, provision_hashes) = match commit {
+                        super::PendingCommit::Consensus {
+                            block,
+                            provision_hashes,
+                            ..
+                        } => (block, provision_hashes),
+                        super::PendingCommit::Synced {
+                            block,
+                            provision_hashes,
+                            ..
+                        } => (block, provision_hashes),
+                    };
+
+                    let _ = event_tx.send(NodeInput::Protocol(ProtocolEvent::BlockCommitted {
+                        block_hash,
+                        height: height.0,
+                        block: Arc::unwrap_or_clone(block),
+                        provision_hashes,
+                    }));
                 }
-
-                let _ = event_tx.send(NodeInput::Protocol(ProtocolEvent::BlockCommitted {
-                    block_hash,
-                    height: height.0,
-                    block: Arc::unwrap_or_clone(block),
-                    provision_hashes,
-                }));
             }
+
+            // Clear the in-flight flag before sending BlockPersisted.
+            // The channel send synchronizes-with recv on the main thread,
+            // so the flag is guaranteed visible when the resulting
+            // feed_event calls flush_block_commits to drain any backlog.
+            in_flight.store(false, Ordering::Release);
+
+            let _ = event_tx.send(NodeInput::Protocol(ProtocolEvent::BlockPersisted {
+                height: max_persisted,
+            }));
         }));
     }
 

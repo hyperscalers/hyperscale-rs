@@ -87,7 +87,12 @@ pub enum ProtocolEvent {
         qc: QuorumCertificate,
     },
 
-    /// A block was committed to storage (state + block data atomically).
+    /// A block has been committed by consensus (QC formed, 2f+1 agreement).
+    ///
+    /// Fired immediately when the `CommitBlock` action arrives — before
+    /// durable RocksDB persistence. All event data is carried in-memory
+    /// from the action payload. Delegated actions that read substates use
+    /// the `SubstateOverlay` to see unpersisted state.
     BlockCommitted {
         block_hash: Hash,
         height: u64,
@@ -96,6 +101,13 @@ pub enum ProtocolEvent {
         /// batch data by the consumer via the ProvisionCoordinator.
         provision_hashes: Vec<Hash>,
     },
+
+    /// A block has been durably persisted to RocksDB.
+    ///
+    /// Fires after the async RocksDB write completes. Used for bookkeeping
+    /// (persistence lag tracking) — not consensus-critical.
+    /// The `height` is the highest block height in the persistence batch.
+    BlockPersisted { height: u64 },
 
     /// Quorum Certificate verification and building result.
     QuorumCertificateResult {
@@ -366,6 +378,7 @@ impl ProtocolEvent {
             ProtocolEvent::QuorumCertificateFormed { .. } => "QuorumCertificateFormed",
             ProtocolEvent::BlockReadyToCommit { .. } => "BlockReadyToCommit",
             ProtocolEvent::BlockCommitted { .. } => "BlockCommitted",
+            ProtocolEvent::BlockPersisted { .. } => "BlockPersisted",
             ProtocolEvent::QuorumCertificateResult { .. } => "QuorumCertificateResult",
             ProtocolEvent::QcSignatureVerified { .. } => "QcSignatureVerified",
             ProtocolEvent::RemoteHeaderQcVerified { .. } => "RemoteHeaderQcVerified",

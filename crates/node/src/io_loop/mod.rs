@@ -272,6 +272,12 @@ where
     // commit ordering.
     pending_block_commits: Vec<PendingCommit>,
 
+    /// Highest block height durably persisted to RocksDB. Updated when
+    /// `BlockPersisted` arrives. Used for backpressure: if consensus gets
+    /// too far ahead of persistence, we defer `BlockCommitted` until the
+    /// disk write completes (bounding memory and crash-recovery window).
+    persisted_height: u64,
+
     // Guard against out-of-order block commits across separate flushes.
     // When an async commit closure is in flight on the execution pool, new
     // blocks accumulate in `pending_block_commits` instead of spawning a
@@ -342,6 +348,7 @@ where
             .filter(|&&v| v != validator_id)
             .copied()
             .collect();
+        let initial_persisted_height = state.bft().committed_height();
         let b = &config.batch;
         let sync_protocol = SyncProtocol::new(config.sync.clone());
         let transaction_fetch_protocol =
@@ -386,6 +393,8 @@ where
                 b.committed_header_window,
             ),
             pending_block_commits: Vec::new(),
+            // At startup, everything committed is also persisted on disk.
+            persisted_height: initial_persisted_height,
             commit_in_flight: Arc::new(AtomicBool::new(false)),
             exec_cert_cache: Arc::new(Mutex::new(HashMap::new())),
             pending_sync_data: std::collections::HashMap::new(),
@@ -923,6 +932,13 @@ where
             }
 
             // ── Protocol events → state machine ────────────────────────
+            NodeInput::Protocol(ProtocolEvent::BlockPersisted { height }) => {
+                // Update persistence tracking before forwarding to state machine.
+                if height > self.persisted_height {
+                    self.persisted_height = height;
+                }
+                self.feed_event(ProtocolEvent::BlockPersisted { height });
+            }
             NodeInput::Protocol(pe) => {
                 self.feed_event(pe);
             }
