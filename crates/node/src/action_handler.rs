@@ -638,27 +638,20 @@ pub(crate) fn handle_delegated_action<
             let num_shards = ctx.topology.num_shards();
             // Engine handles execution + system/shard filtering internally.
             // Use overlay so execution sees state from unpersisted blocks.
-            let raw_results: Vec<_> = transactions
+            let (tx_outcomes, results): (Vec<_>, Vec<_>) = transactions
                 .iter()
                 .map(|tx| {
-                    hyperscale_engine::handlers::execute_single_shard(
+                    let r = hyperscale_engine::handlers::execute_single_shard(
                         ctx.executor,
                         &ctx.overlay,
                         tx,
                         local_shard,
                         num_shards,
-                    )
+                    );
+                    let outcome = hyperscale_engine::handlers::extract_execution_result(&r);
+                    (outcome, LocalExecutionEntry::from(r))
                 })
-                .collect();
-
-            let tx_outcomes: Vec<_> = raw_results
-                .iter()
-                .map(hyperscale_engine::handlers::extract_execution_result)
-                .collect();
-            let results = raw_results
-                .into_iter()
-                .map(LocalExecutionEntry::from)
-                .collect();
+                .unzip();
 
             Some(DelegatedResult {
                 events: vec![NodeInput::Protocol(
@@ -676,10 +669,10 @@ pub(crate) fn handle_delegated_action<
         Action::ExecuteCrossShardTransactions { requests } => {
             let local_shard = ctx.topology.local_shard();
             let num_shards = ctx.topology.num_shards();
-            let raw_results: Vec<_> = requests
+            let (tx_outcomes, results): (Vec<_>, Vec<_>) = requests
                 .iter()
                 .map(|req| {
-                    hyperscale_engine::handlers::execute_cross_shard(
+                    let r = hyperscale_engine::handlers::execute_cross_shard(
                         ctx.executor,
                         &ctx.overlay,
                         req.tx_hash,
@@ -687,18 +680,11 @@ pub(crate) fn handle_delegated_action<
                         &req.provisions,
                         local_shard,
                         num_shards,
-                    )
+                    );
+                    let outcome = hyperscale_engine::handlers::extract_execution_result(&r);
+                    (outcome, LocalExecutionEntry::from(r))
                 })
-                .collect();
-
-            let tx_outcomes: Vec<_> = raw_results
-                .iter()
-                .map(hyperscale_engine::handlers::extract_execution_result)
-                .collect();
-            let results = raw_results
-                .into_iter()
-                .map(LocalExecutionEntry::from)
-                .collect();
+                .unzip();
 
             Some(DelegatedResult {
                 events: vec![NodeInput::Protocol(
