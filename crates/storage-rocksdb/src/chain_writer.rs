@@ -39,6 +39,26 @@ impl hyperscale_storage::ChainWriter for RocksDbStorage {
         block_height: u64,
         pending_snapshots: &[std::sync::Arc<hyperscale_storage::JvtSnapshot>],
     ) -> (hyperscale_types::Hash, Self::PreparedCommit) {
+        // No receipts → no state changes → state root is unchanged.
+        // Build a no-op JvtSnapshot directly, avoiding put_at_version which
+        // would fail if the parent's tree nodes aren't in the store yet
+        // (e.g., proposer just exited sync and BlockPersisted hasn't fired).
+        if receipts.is_empty() {
+            let jvt_snapshot = hyperscale_storage::tree::noop_jvt_snapshot(
+                &SnapshotTreeStore::new(&self.db, &self.node_cache),
+                pending_snapshots,
+                parent_state_root,
+                parent_block_height,
+                block_height,
+            );
+            let write_batch = WriteBatch::default();
+            let prepared = RocksDbPreparedCommit {
+                write_batch,
+                jvt_snapshot,
+            };
+            return (parent_state_root, prepared);
+        }
+
         let snapshot_store = SnapshotTreeStore::new(&self.db, &self.node_cache);
         let parent_version =
             hyperscale_storage::tree::jvt_parent_height(parent_block_height, parent_state_root);

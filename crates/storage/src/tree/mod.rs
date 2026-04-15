@@ -93,6 +93,62 @@ pub fn jvt_parent_height(block_height: u64, root: Hash) -> Option<u64> {
     }
 }
 
+/// Build a no-op JvtSnapshot for a block with no state changes (empty receipts).
+///
+/// The state root is unchanged (`parent_state_root`). We try to copy the
+/// parent's root node to the new version so the overlay chain stays intact.
+/// If the parent root node isn't available (e.g., after sync when the tree
+/// hasn't been persisted yet), the snapshot is created without it — the
+/// commit path resolves this when the parent IS in the store.
+///
+/// # Safety assumption
+///
+/// This function sets `result_root = parent_state_root` unconditionally.
+/// Callers must only use this for blocks with genuinely empty receipts
+/// (no state changes). For consensus blocks, this is verified by the
+/// verification pipeline. For synced blocks, the QC signature attests
+/// to correctness — a QC-certified block with empty receipts is
+/// guaranteed to have `state_root == parent_state_root`.
+pub fn noop_jvt_snapshot<S: jvt::TreeReader>(
+    store: &S,
+    pending_snapshots: &[Arc<JvtSnapshot>],
+    parent_state_root: Hash,
+    parent_block_height: u64,
+    block_height: u64,
+) -> JvtSnapshot {
+    let mut nodes = Vec::new();
+
+    // Try to find the parent's root node so the version chain is unbroken.
+    if let Some(parent_ver) = jvt_parent_height(parent_block_height, parent_state_root) {
+        let root_key = jvt::NodeKey::root(parent_ver);
+
+        // Check pending snapshots first (overlay), then the base store.
+        let root_node = pending_snapshots
+            .iter()
+            .find_map(|s| {
+                s.nodes
+                    .iter()
+                    .find(|(k, _)| *k == root_key)
+                    .map(|(_, n)| Arc::clone(n))
+            })
+            .or_else(|| store.get_node(&root_key));
+
+        if let Some(node) = root_node {
+            nodes.push((jvt::NodeKey::root(block_height), node));
+        }
+    }
+
+    JvtSnapshot {
+        base_root: parent_state_root,
+        base_version: parent_block_height,
+        result_root: parent_state_root,
+        new_version: block_height,
+        nodes,
+        stale_node_keys: Vec::new(),
+        leaf_substate_associations: Vec::new(),
+    }
+}
+
 /// Convert a JVT commitment to a Hash (for state root, value hashes).
 ///
 /// Uses compressed serialization (32 bytes) for the consensus-visible identity.

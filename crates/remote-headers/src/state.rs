@@ -372,6 +372,43 @@ impl RemoteHeaderCoordinator {
         actions
     }
 
+    /// Immediately request missing headers for all remote shards that are
+    /// behind, bypassing the normal liveness timeout.
+    ///
+    /// Called on sync-complete so the validator quickly discovers provision
+    /// needs for blocks committed during the sync window.
+    pub fn flush_expected_headers(&mut self, topology: &TopologySnapshot) -> Vec<Action> {
+        let mut actions = vec![];
+        let current_height = self.local_committed_height.0;
+
+        for (&shard, expected) in self.expected.iter_mut() {
+            if expected.requested {
+                continue;
+            }
+
+            let from_height = BlockHeight(expected.last_verified_height.0 + 1);
+            let peers = topology.committee_for_shard(shard).to_vec();
+            if peers.is_empty() {
+                continue;
+            }
+
+            info!(
+                source_shard = shard.0,
+                from_height = from_height.0,
+                "Sync catchup — immediately requesting remote headers"
+            );
+
+            expected.requested = true;
+            expected.requested_at = BlockHeight(current_height);
+            actions.push(Action::RequestMissingCommittedBlockHeader {
+                source_shard: shard,
+                from_height,
+                peers,
+            });
+        }
+        actions
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
     // Public API: Queries
     // ═══════════════════════════════════════════════════════════════════════

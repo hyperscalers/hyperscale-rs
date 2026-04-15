@@ -550,17 +550,6 @@ pub enum Action {
         provision_hashes: Vec<Hash>,
     },
 
-    /// Commit a synced block via `commit_block` (recomputes state from
-    /// sync_data receipts). No PreparedCommit — sync blocks don't go
-    /// through the verification pipeline.
-    CommitSyncedBlock {
-        block: Block,
-        /// The QC that certified this block.
-        qc: QuorumCertificate,
-        /// Provision batch hashes from the block manifest (same as CommitBlock).
-        provision_hashes: Vec<Hash>,
-    },
-
     /// Emit transaction status update for RPC status cache.
     ///
     /// Emitted by the mempool whenever a transaction's status changes:
@@ -930,7 +919,6 @@ impl Action {
 
             // External Notifications
             Action::CommitBlock { .. } => "CommitBlock",
-            Action::CommitSyncedBlock { .. } => "CommitSyncedBlock",
             Action::EmitTransactionStatus { .. } => "EmitTransactionStatus",
 
             // Storage - Consensus

@@ -32,6 +32,27 @@ impl ChainWriter for SimStorage {
         block_height: u64,
         pending_snapshots: &[Arc<hyperscale_storage::JvtSnapshot>],
     ) -> (Hash, Self::PreparedCommit) {
+        // No receipts → no state changes → state root is unchanged.
+        // Build a no-op JvtSnapshot directly, avoiding put_at_version which
+        // would fail if the parent's tree nodes aren't in the store yet.
+        if receipts.is_empty() {
+            let s = self.state.read().unwrap();
+            let snapshot = hyperscale_storage::tree::noop_jvt_snapshot(
+                &s.tree_store,
+                pending_snapshots,
+                parent_state_root,
+                parent_block_height,
+                block_height,
+            );
+            drop(s);
+            let prepared = SimPreparedCommit {
+                snapshot,
+                merged_updates: Default::default(),
+                receipts: vec![],
+            };
+            return (parent_state_root, prepared);
+        }
+
         // Read lock: compute speculative JVT root.
         let s = self.state.read().unwrap();
 

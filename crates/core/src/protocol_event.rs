@@ -7,9 +7,9 @@
 
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, BlockManifest, BlockVote, CommittedBlockHeader, EpochConfig,
-    EpochId, ExecutionCertificate, ExecutionVote, FinalizedWave, Hash, Provision,
-    QuorumCertificate, RoutableTransaction, ShardGroupId, TxOutcome, ValidatorId, WaveCertificate,
-    WaveId,
+    EpochId, ExecutionCertificate, ExecutionVote, FinalizedWave, Hash, LocalReceiptEntry,
+    Provision, QuorumCertificate, RoutableTransaction, ShardGroupId, TxOutcome, ValidatorId,
+    WaveCertificate, WaveId,
 };
 use std::sync::Arc;
 
@@ -283,13 +283,26 @@ pub enum ProtocolEvent {
     // Sync Delivery (from IoLoop after sync protocol processing)
     // ═══════════════════════════════════════════════════════════════════════
     /// A synced block is ready to be applied to local state.
-    SyncBlockReadyToApply { block: Block, qc: QuorumCertificate },
+    /// Receipts from the sync peer are attached so BFT can construct
+    /// `FinalizedWave` objects and feed them into the verification pipeline.
+    SyncBlockReadyToApply {
+        block: Block,
+        qc: QuorumCertificate,
+        local_receipts: Vec<LocalReceiptEntry>,
+    },
 
     /// Sync EC BLS verification completed (async callback from crypto pool).
     SyncEcVerificationComplete { height: u64, valid: bool },
 
-    /// Sync completed successfully.
-    SyncComplete { height: u64 },
+    /// The io_loop's SyncProtocol has finished fetching all blocks up to
+    /// the sync target. BftState should exit sync mode so it can re-enter
+    /// if still behind, or resume normal consensus.
+    SyncProtocolComplete { height: u64 },
+
+    /// Sync recovery complete — validator has caught up and is resuming consensus.
+    /// Triggers immediate provision and remote header fetching so the validator
+    /// can participate in execution for recent blocks within the timeout window.
+    SyncResumed,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Global Consensus / Epoch
@@ -428,7 +441,8 @@ impl ProtocolEvent {
             // Sync Delivery
             ProtocolEvent::SyncEcVerificationComplete { .. } => "SyncEcVerificationComplete",
             ProtocolEvent::SyncBlockReadyToApply { .. } => "SyncBlockReadyToApply",
-            ProtocolEvent::SyncComplete { .. } => "SyncComplete",
+            ProtocolEvent::SyncProtocolComplete { .. } => "SyncProtocolComplete",
+            ProtocolEvent::SyncResumed => "SyncResumed",
 
             // Global Consensus / Epoch
             ProtocolEvent::GlobalBlockReceived { .. } => "GlobalBlockReceived",

@@ -210,7 +210,7 @@ impl NodeStateMachine {
         // time to fill in missing data first.
         actions.extend(
             self.bft
-                .check_pending_block_fetches(self.topology.snapshot()),
+                .check_pending_block_fetches(self.topology.snapshot(), false),
         );
 
         // Check if we're behind and need to catch up via sync.
@@ -471,20 +471,6 @@ impl NodeStateMachine {
 
         actions
     }
-
-    /// Handle sync complete — resume cleanup timer.
-    fn on_sync_complete(&mut self) -> Vec<Action> {
-        let mut actions = self.bft.on_sync_complete(self.topology.snapshot());
-        // Reschedule the cleanup timer. During sync, the cleanup timer
-        // fires StartSync actions which don't reschedule the timer.
-        // Now that sync is complete, we need to restart the cleanup timer
-        // to resume periodic fetch checks and sync health monitoring.
-        actions.push(Action::SetTimer {
-            id: TimerId::Cleanup,
-            duration: self.bft.config().cleanup_interval,
-        });
-        actions
-    }
 }
 
 impl StateMachine for NodeStateMachine {
@@ -621,8 +607,15 @@ impl StateMachine for NodeStateMachine {
             // are available via verified_state_roots (from prior
             // VerifyStateRoot), so the deferral gate already passes.
             ProtocolEvent::BlockPersisted { height } => {
-                self.bft.on_jvt_committed(height);
-                vec![]
+                let mut actions = self.bft.on_jvt_committed(self.topology.snapshot(), height);
+                // If BFT just resumed from sync, reschedule the cleanup timer.
+                if !actions.is_empty() {
+                    actions.push(Action::SetTimer {
+                        id: TimerId::Cleanup,
+                        duration: self.bft.config().cleanup_interval,
+                    });
+                }
+                actions
             }
 
             // ── Provision ───────────────────────────────────────────────
@@ -726,12 +719,33 @@ impl StateMachine for NodeStateMachine {
                 transactions,
             ),
             // ── Storage / Sync ───────────────────────────────────────────
-            ProtocolEvent::SyncBlockReadyToApply { block, qc } => self
-                .bft
-                .on_sync_block_ready_to_apply(self.topology.snapshot(), block, qc),
+            ProtocolEvent::SyncBlockReadyToApply {
+                block,
+                qc,
+                local_receipts,
+            } => self.bft.on_sync_block_ready_to_apply(
+                self.topology.snapshot(),
+                block,
+                qc,
+                local_receipts,
+            ),
             // Handled by IoLoop directly (sync verification pipeline).
             ProtocolEvent::SyncEcVerificationComplete { .. } => vec![],
-            ProtocolEvent::SyncComplete { .. } => self.on_sync_complete(),
+            // SyncProtocol finished fetching — tell BftState to exit sync
+            // mode so it can re-enter sync if still behind, or resume
+            // normal consensus.
+            ProtocolEvent::SyncProtocolComplete { .. } => {
+                self.bft.on_sync_complete(self.topology.snapshot())
+            }
+            // Sync recovery complete — flush expected provisions and remote
+            // headers immediately so we can participate in execution for
+            // recent blocks within the WAVE_TIMEOUT_BLOCKS window.
+            ProtocolEvent::SyncResumed => {
+                let topo = self.topology.snapshot();
+                let mut actions = self.remote_headers.flush_expected_headers(topo);
+                actions.extend(self.provisions.flush_expected_provisions(topo));
+                actions
+            }
             ProtocolEvent::ChainMetadataFetched { height, hash, qc } => self
                 .bft
                 .on_chain_metadata_fetched(self.topology.snapshot(), height, hash, qc),

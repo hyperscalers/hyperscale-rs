@@ -18,7 +18,7 @@ use hyperscale_types::{
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// Number of local committed blocks to wait before requesting missing provisions.
 /// This gives the source shard proposer time to send provisions normally.
@@ -253,6 +253,36 @@ impl ProvisionCoordinator {
             });
         }
 
+        actions
+    }
+
+    /// Immediately emit `FetchProvisionRemote` for all outstanding expected
+    /// provisions, bypassing the normal 10-block timeout.
+    ///
+    /// Called on sync-complete so the validator can participate in execution
+    /// for recent blocks within the `WAVE_TIMEOUT_BLOCKS` window.
+    pub fn flush_expected_provisions(
+        &mut self,
+        topology: &hyperscale_types::TopologySnapshot,
+    ) -> Vec<Action> {
+        let mut actions = vec![];
+        for (&(source_shard, block_height), expected) in self.expected_provisions.iter_mut() {
+            if expected.requested {
+                continue;
+            }
+            info!(
+                source_shard = source_shard.0,
+                block_height = block_height.0,
+                "Sync catchup — immediately requesting missing provisions"
+            );
+            expected.requested = true;
+            actions.push(Action::FetchProvisionRemote {
+                source_shard,
+                block_height,
+                proposer: expected.proposer,
+                peers: topology.committee_for_shard(source_shard).to_vec(),
+            });
+        }
         actions
     }
 

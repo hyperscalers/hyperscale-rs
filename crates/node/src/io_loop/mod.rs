@@ -72,52 +72,17 @@ pub(crate) type PendingDbUpdatesMap =
 
 /// A block commit waiting to be flushed to storage.
 ///
-/// Explicitly distinguishes consensus and sync paths so `flush_block_commits`
-/// knows which data source to use without side-channel sniffing.
-pub(crate) enum PendingCommit {
-    /// Consensus path: committed via PreparedCommit from BuildProposal
-    /// (proposer) or VerifyStateRoot (verifier).
-    Consensus {
-        block: Arc<Block>,
-        qc: Arc<QuorumCertificate>,
-        provision_hashes: Vec<Hash>,
-        /// Whether `BlockCommitted` was already fired immediately
-        /// in `accumulate_block_commit` (true) or deferred due to
-        /// backpressure (false). The flush closure uses this to
-        /// decide whether to send `BlockCommitted` after persistence.
-        committed_notified: bool,
-    },
-    /// Sync path: receipts and ECs come from `pending_sync_data`.
-    Synced {
-        block: Arc<Block>,
-        qc: Arc<QuorumCertificate>,
-        provision_hashes: Vec<Hash>,
-        /// See `Consensus::committed_notified`.
-        committed_notified: bool,
-    },
-}
-
-impl PendingCommit {
-    fn block(&self) -> &Block {
-        match self {
-            PendingCommit::Consensus { block, .. } | PendingCommit::Synced { block, .. } => block,
-        }
-    }
-
-    fn is_sync(&self) -> bool {
-        matches!(self, PendingCommit::Synced { .. })
-    }
-
-    fn committed_notified(&self) -> bool {
-        match self {
-            PendingCommit::Consensus {
-                committed_notified, ..
-            }
-            | PendingCommit::Synced {
-                committed_notified, ..
-            } => *committed_notified,
-        }
-    }
+/// All blocks — consensus and sync — go through the same commit pipeline:
+/// VerifyStateRoot → PreparedCommit → commit_prepared_blocks.
+pub(crate) struct PendingCommit {
+    pub block: Arc<Block>,
+    pub qc: Arc<QuorumCertificate>,
+    pub provision_hashes: Vec<Hash>,
+    /// Whether `BlockCommitted` was already fired immediately
+    /// in `accumulate_block_commit` (true) or deferred due to
+    /// backpressure (false). The flush closure uses this to
+    /// decide whether to send `BlockCommitted` after persistence.
+    pub committed_notified: bool,
 }
 
 /// Lock-free shared topology snapshot for handler closures and dispatch.
@@ -128,12 +93,6 @@ pub type SharedTopologySnapshot = Arc<ArcSwap<TopologySnapshot>>;
 
 /// Shared execution certificate cache for fallback serving.
 type ExecCertCache = Arc<Mutex<HashMap<(Hash, WaveId), Arc<ExecutionCertificate>>>>;
-
-/// Buffered sync data (receipts) for a block height.
-/// Consumed by the sync commit path for verification and atomic persistence.
-pub(crate) struct BufferedSyncResponse {
-    pub local_receipts: Vec<hyperscale_types::LocalReceiptEntry>,
-}
 
 /// Default certificate cache capacity.
 const DEFAULT_CERT_CACHE_SIZE: usize = 10_000;
@@ -357,7 +316,7 @@ where
     validation_batch: BatchAccumulator<Arc<RoutableTransaction>>,
     committed_header_batch: BatchAccumulator<CommittedHeaderVerificationItem>,
 
-    // Block commit accumulator — collects CommitBlock / CommitSyncedBlock
+    // Block commit accumulator — collects CommitBlock
     // actions within a single feed_event/handle_actions batch, then spawns
     // a single closure on the execution pool to commit them sequentially.
     // This keeps JVT writes off the pinned IoLoop thread while preserving
@@ -391,11 +350,10 @@ where
     // Shared with request handler thread. Keyed by (wave_id_hash, wave_id).
     exec_cert_cache: ExecCertCache,
 
-    // Sync data buffer: holds receipts and ECs from sync responses, keyed
-    // by block height. Consumed by the sync path in flush_block_commits
-    // for verification + atomic commit. Not stored to pending_receipt_bundles
-    // (receipts go through the verification pipeline first).
-    pending_sync_data: std::collections::HashMap<u64, BufferedSyncResponse>,
+    // Sync receipt buffer: holds receipts from sync responses, keyed by
+    // block height. Extracted when SyncOutput::DeliverBlock fires and
+    // attached to SyncBlockReadyToApply events. NOT used in flush_block_commits.
+    sync_receipt_buffer: std::collections::HashMap<u64, Vec<hyperscale_types::LocalReceiptEntry>>,
 
     // Pending commit task — prepared by flush_block_commits, spawned by the runner.
     // Production uses tokio::spawn_blocking; simulation runs inline.
@@ -489,7 +447,7 @@ where
             persisted_height: initial_persisted_height,
             commit_in_flight: Arc::new(AtomicBool::new(false)),
             exec_cert_cache: Arc::new(Mutex::new(HashMap::new())),
-            pending_sync_data: std::collections::HashMap::new(),
+            sync_receipt_buffer: std::collections::HashMap::new(),
             tx_status_cache: Arc::new(QuickCache::new(DEFAULT_TX_STATUS_CACHE_SIZE)),
             last_slow_tx_warn: std::time::Duration::ZERO,
             pending_commit_task: None,
@@ -718,12 +676,11 @@ where
                         .event_sender
                         .send(NodeInput::SyncBlockFetchFailed { height });
                 } else {
-                    // Buffer receipts + ECs for the sync commit path.
-                    // The commit closure verifies EC BLS signatures,
-                    // cross-checks EC↔TC hashes, and verifies state_root.
+                    // Buffer receipts for this height. They'll be extracted
+                    // when SyncOutput::DeliverBlock fires and attached to the
+                    // SyncBlockReadyToApply event for BFT processing.
                     if block.is_some() {
-                        self.pending_sync_data
-                            .insert(height, BufferedSyncResponse { local_receipts });
+                        self.sync_receipt_buffer.insert(height, local_receipts);
                     }
 
                     let outputs = self

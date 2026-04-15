@@ -88,13 +88,26 @@ where
                 SyncOutput::DeliverBlock { block, qc } => {
                     metrics::record_sync_block_received_by_bft();
                     metrics::record_sync_block_submitted_for_verification();
+                    // Extract receipts from the sync receipt buffer for this
+                    // height. They were buffered when the sync response arrived
+                    // and are now attached to the event so BFT can construct
+                    // FinalizedWave objects for the verification pipeline.
+                    let height = block.header.height.0;
+                    let local_receipts =
+                        self.sync_receipt_buffer.remove(&height).unwrap_or_default();
                     self.feed_event(ProtocolEvent::SyncBlockReadyToApply {
                         block: *block,
                         qc: *qc,
+                        local_receipts,
                     });
                 }
                 SyncOutput::SyncComplete { height } => {
-                    self.feed_event(ProtocolEvent::SyncComplete { height });
+                    tracing::info!(height, "Sync protocol complete, resuming consensus");
+                    // Tell BftState to exit sync mode. The previous
+                    // BlockPersisted → on_jvt_committed path was unreliable
+                    // because BlockPersisted requires PreparedCommit which
+                    // may not be available yet for synced blocks.
+                    self.feed_event(ProtocolEvent::SyncProtocolComplete { height });
                 }
             }
         }

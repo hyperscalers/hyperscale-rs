@@ -80,6 +80,11 @@ pub struct BftConfig {
     /// prematurely. Must be <= the node's `EXECUTION_TIMEOUT_BLOCKS` constant
     /// (the proposer-side threshold for generating timeout intents).
     pub min_execution_timeout_blocks: u64,
+
+    /// Maximum number of synced blocks to submit for parallel QC verification
+    /// at once. Bounds memory usage from buffered blocks and prevents
+    /// overwhelming the crypto pool during sync catch-up.
+    pub max_parallel_sync_verifications: usize,
 }
 
 impl Default for BftConfig {
@@ -98,6 +103,7 @@ impl Default for BftConfig {
             cleanup_interval: Duration::from_secs(1),
             min_block_interval: Duration::from_millis(500),
             min_execution_timeout_blocks: 30,
+            max_parallel_sync_verifications: 16,
         }
     }
 }

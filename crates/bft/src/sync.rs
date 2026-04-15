@@ -4,7 +4,7 @@
 //! synced block QC verifications. BftState owns this as a field and
 //! delegates sync-specific bookkeeping here.
 
-use hyperscale_types::{Block, Hash, QuorumCertificate};
+use hyperscale_types::{Block, Hash, LocalReceiptEntry, QuorumCertificate};
 use std::collections::{BTreeMap, HashMap};
 use tracing::{debug, info, warn};
 
@@ -20,6 +20,8 @@ pub(crate) struct PendingSyncedBlockVerification {
     pub qc: QuorumCertificate,
     /// Whether the QC signature has been verified.
     pub verified: bool,
+    /// Receipts from the sync peer for this block's wave certificates.
+    pub local_receipts: Vec<LocalReceiptEntry>,
 }
 
 /// Sync block coordination state.
@@ -31,9 +33,13 @@ pub(crate) struct SyncManager {
     /// Whether we are currently syncing (catching up to the network).
     syncing: bool,
 
+    /// The sync target height — set at sync start, cleared on resume.
+    /// Used by `on_jvt_committed` to auto-resume when persistence catches up.
+    sync_target_height: Option<u64>,
+
     /// Buffered out-of-order synced blocks waiting for earlier blocks.
-    /// Maps height -> (Block, QC).
-    buffered_synced_blocks: BTreeMap<u64, (Block, QuorumCertificate)>,
+    /// Maps height -> (Block, QC, receipts).
+    buffered_synced_blocks: BTreeMap<u64, (Block, QuorumCertificate, Vec<LocalReceiptEntry>)>,
 
     /// Synced blocks pending QC signature verification.
     /// Maps block_hash -> pending synced block info.
@@ -45,6 +51,7 @@ impl SyncManager {
     pub fn new() -> Self {
         Self {
             syncing: false,
+            sync_target_height: None,
             buffered_synced_blocks: BTreeMap::new(),
             pending_synced_block_verifications: HashMap::new(),
         }
@@ -62,6 +69,19 @@ impl SyncManager {
     /// Set the syncing flag.
     pub fn set_syncing(&mut self, syncing: bool) {
         self.syncing = syncing;
+        if !syncing {
+            self.sync_target_height = None;
+        }
+    }
+
+    /// Set the sync target height (called when sync starts).
+    pub fn set_sync_target(&mut self, height: u64) {
+        self.sync_target_height = Some(height);
+    }
+
+    /// Get the sync target height, if syncing.
+    pub fn sync_target_height(&self) -> Option<u64> {
+        self.sync_target_height
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -87,9 +107,16 @@ impl SyncManager {
     }
 
     /// Buffer a future synced block for later processing.
-    pub fn buffer_block(&mut self, height: u64, block: Block, qc: QuorumCertificate) {
+    pub fn buffer_block(
+        &mut self,
+        height: u64,
+        block: Block,
+        qc: QuorumCertificate,
+        local_receipts: Vec<LocalReceiptEntry>,
+    ) {
         debug!(height, "Buffering future synced block for later");
-        self.buffered_synced_blocks.insert(height, (block, qc));
+        self.buffered_synced_blocks
+            .insert(height, (block, qc, local_receipts));
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -105,6 +132,7 @@ impl SyncManager {
         block_hash: Hash,
         block: Block,
         qc: QuorumCertificate,
+        local_receipts: Vec<LocalReceiptEntry>,
     ) {
         let height = block.header.height.0;
         if self
@@ -128,6 +156,7 @@ impl SyncManager {
                 block,
                 qc,
                 verified: false,
+                local_receipts,
             },
         );
     }
@@ -151,8 +180,10 @@ impl SyncManager {
                 height = pending.block.header.height.0,
                 "Synced block QC signature verification FAILED - rejecting block"
             );
-            // Clear all pending synced blocks since chain is broken
-            self.pending_synced_block_verifications.clear();
+            // Only this block is removed (already done above). Other pending
+            // verifications are kept — a single bad peer shouldn't cascade
+            // into losing all in-flight sync work. Blocks above this height
+            // will be blocked by the gap until a re-sync fills it.
             return Some(SyncVerificationResult::Failed);
         }
 
@@ -175,15 +206,27 @@ impl SyncManager {
         self.pending_synced_block_verifications.len()
     }
 
+    /// Whether any sync block QC verification is in-flight (submitted but
+    /// not yet verified). Used by `should_advance_round` to suppress view
+    /// changes while we're actively verifying sync blocks.
+    pub fn has_pending_verifications(&self) -> bool {
+        self.pending_synced_block_verifications
+            .values()
+            .any(|p| !p.verified)
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
     // Drain verified blocks
     // ═══════════════════════════════════════════════════════════════════════
 
     /// Take the next consecutive verified block at the given height.
     ///
-    /// Returns the block and QC if a verified block exists at `height`,
+    /// Returns the block, QC, and receipts if a verified block exists at `height`,
     /// otherwise None.
-    pub fn take_verified_at_height(&mut self, height: u64) -> Option<(Block, QuorumCertificate)> {
+    pub fn take_verified_at_height(
+        &mut self,
+        height: u64,
+    ) -> Option<(Block, QuorumCertificate, Vec<LocalReceiptEntry>)> {
         let block_hash = self
             .pending_synced_block_verifications
             .iter()
@@ -195,7 +238,7 @@ impl SyncManager {
             .remove(&block_hash)
             .unwrap();
 
-        Some((pending.block, pending.qc))
+        Some((pending.block, pending.qc, pending.local_receipts))
     }
 
     /// Log the current state of pending verifications (for debugging).
@@ -233,14 +276,14 @@ impl SyncManager {
         &mut self,
         start_height: u64,
         max_count: usize,
-    ) -> Vec<(Block, QuorumCertificate)> {
+    ) -> Vec<(Block, QuorumCertificate, Vec<LocalReceiptEntry>)> {
         let mut result = Vec::new();
         let mut height = start_height;
 
         while result.len() < max_count {
-            if let Some((block, qc)) = self.buffered_synced_blocks.remove(&height) {
+            if let Some((block, qc, local_receipts)) = self.buffered_synced_blocks.remove(&height) {
                 debug!(height, "Draining buffered synced block");
-                result.push((block, qc));
+                result.push((block, qc, local_receipts));
                 height += 1;
             } else {
                 break;
@@ -264,6 +307,11 @@ impl SyncManager {
     // ═══════════════════════════════════════════════════════════════════════
 
     /// Remove sync state at or below committed height.
+    ///
+    /// Uses consensus committed height (not JVT-persisted height). These
+    /// diverge during async persistence, but sync state tracks consensus
+    /// progress — once a block is committed to consensus, its sync
+    /// bookkeeping is no longer needed regardless of persistence state.
     pub fn cleanup(&mut self, committed_height: u64) {
         self.buffered_synced_blocks
             .retain(|height, _| *height > committed_height);
@@ -282,6 +330,8 @@ impl SyncManager {
 pub(crate) enum SyncVerificationResult {
     /// QC verified successfully — ready to apply consecutive blocks.
     Verified,
-    /// QC verification failed — chain is broken, all pending cleared.
+    /// QC verification failed — the bad block is removed, other pending
+    /// verifications are preserved. Blocks above the failed height are
+    /// blocked by the gap until a re-sync fills it.
     Failed,
 }

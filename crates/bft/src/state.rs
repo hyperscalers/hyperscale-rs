@@ -57,9 +57,10 @@ pub struct BftMemoryStats {
 /// Production uses ValidatorId (from message signatures) and PeerId (libp2p).
 pub type NodeIndex = u32;
 use hyperscale_types::{
-    Block, BlockHeader, BlockHeight, BlockManifest, BlockVote, Bls12381G1PublicKey,
-    CommittedBlockHeader, FinalizedWave, Hash, Provision, QuorumCertificate, ReadyTransactions,
-    RoutableTransaction, ShardGroupId, TopologySnapshot, ValidatorId, VotePower,
+    derive_wave_tx_hashes, Block, BlockHeader, BlockHeight, BlockManifest, BlockVote,
+    Bls12381G1PublicKey, CommittedBlockHeader, FinalizedWave, Hash, LocalReceiptEntry, Provision,
+    QuorumCertificate, ReadyTransactions, ReceiptBundle, RoutableTransaction, ShardGroupId,
+    TopologySnapshot, TransactionDecision, TransactionOutcome, ValidatorId, VotePower,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -72,6 +73,74 @@ use crate::pending::PendingBlock;
 use crate::sync::{SyncManager, SyncVerificationResult};
 use crate::verification::VerificationPipeline;
 use crate::vote_set::VoteSet;
+
+/// Construct `FinalizedWave` objects from sync response data.
+///
+/// Maps the flat `local_receipts` from a sync peer to per-wave `FinalizedWave`
+/// objects, matching receipts to wave certificates by deriving which transactions
+/// each wave covers. The result is identical in structure to what the consensus
+/// path produces from local execution — making sync blocks indistinguishable
+/// in the verification and commit pipelines.
+///
+/// Returns `None` if any wave has missing receipts — the sync peer sent
+/// incomplete data and the block should be skipped (re-sync will recover).
+fn build_finalized_waves_from_sync(
+    topology: &TopologySnapshot,
+    block: &Block,
+    local_receipts: Vec<LocalReceiptEntry>,
+) -> Option<Vec<Arc<FinalizedWave>>> {
+    if block.certificates.is_empty() {
+        return Some(vec![]);
+    }
+
+    // Build a lookup map: tx_hash → LocalReceiptEntry
+    let receipt_map: HashMap<Hash, LocalReceiptEntry> =
+        local_receipts.into_iter().map(|e| (e.tx_hash, e)).collect();
+
+    let mut waves = Vec::with_capacity(block.certificates.len());
+
+    for wc in &block.certificates {
+        let tx_hashes = derive_wave_tx_hashes(topology, &wc.wave_id, &block.transactions);
+
+        let mut receipts = Vec::with_capacity(tx_hashes.len());
+        let mut tx_decisions = Vec::with_capacity(tx_hashes.len());
+        for tx_hash in &tx_hashes {
+            if let Some(entry) = receipt_map.get(tx_hash) {
+                let decision = match entry.receipt.outcome {
+                    TransactionOutcome::Success => TransactionDecision::Accept,
+                    TransactionOutcome::Failure => TransactionDecision::Reject,
+                };
+                tx_decisions.push((*tx_hash, decision));
+                receipts.push(ReceiptBundle {
+                    tx_hash: *tx_hash,
+                    local_receipt: Arc::new(entry.receipt.clone()),
+                    execution_output: None,
+                });
+            } else {
+                warn!(
+                    block_hash = ?block.hash(),
+                    height = block.header.height.0,
+                    wave_id = ?wc.wave_id,
+                    missing_tx = ?tx_hash,
+                    expected = tx_hashes.len(),
+                    have = receipts.len(),
+                    "Sync peer sent incomplete receipts — missing receipt for transaction"
+                );
+                return None;
+            }
+        }
+
+        waves.push(Arc::new(FinalizedWave {
+            certificate: Arc::clone(wc),
+            tx_hashes,
+            tx_decisions,
+            receipts,
+            finalized_height: block.header.height.0,
+        }));
+    }
+
+    Some(waves)
+}
 
 /// State recovered from storage on startup.
 ///
@@ -547,14 +616,11 @@ impl BftState {
         target_height: u64,
         target_hash: Hash,
     ) -> Vec<Action> {
-        // Don't restart sync if we're already syncing
-        // The runner's SyncManager handles target updates internally
+        // Don't raise the target while already syncing. The io_loop's
+        // SyncProtocol manages its own target internally. Once the current
+        // sync completes and we resume consensus, a new start_sync will
+        // fire naturally if we're still behind.
         if self.sync.is_syncing() {
-            warn!(
-                validator = ?topology.local_validator_id(),
-                target_height,
-                "Already syncing, skipping duplicate start_sync"
-            );
             return vec![];
         }
 
@@ -571,6 +637,7 @@ impl BftState {
         // - Suppresses fetch requests (check_pending_block_fetches returns empty)
         // - Signals to other code that we're catching up
         self.set_syncing(topology, true);
+        self.sync.set_sync_target(target_height);
 
         vec![Action::StartSync {
             target_height,
@@ -584,6 +651,7 @@ impl BftState {
         topology: &TopologySnapshot,
         block: Block,
         qc: QuorumCertificate,
+        local_receipts: Vec<LocalReceiptEntry>,
     ) -> Vec<Action> {
         let block_height = block.header.height.0;
 
@@ -599,7 +667,7 @@ impl BftState {
             return vec![];
         }
 
-        self.on_synced_block_ready(topology, block, qc)
+        self.on_synced_block_ready(topology, block, qc, local_receipts)
     }
 
     /// Handle sync complete (from runner via Event::SyncComplete).
@@ -618,7 +686,16 @@ impl BftState {
         // During sync, check_pending_block_fetches() returns empty because we
         // don't want to compete with sync for network resources. Now that sync
         // is done, we need to fetch any missing transactions/certificates.
-        self.check_pending_block_fetches(topology)
+        // Use force_immediate=true to bypass the age timeout — blocks received
+        // during sync shouldn't wait another timeout period to be fetched.
+        let mut actions = self.check_pending_block_fetches(topology, true);
+
+        // Notify NodeStateMachine to flush expected provisions and remote
+        // headers immediately so we can participate in execution for recent
+        // blocks within the WAVE_TIMEOUT_BLOCKS window.
+        actions.push(Action::Continuation(ProtocolEvent::SyncResumed));
+
+        actions
     }
 
     /// Record leader activity (resets the view change timeout).
@@ -704,7 +781,10 @@ impl BftState {
             .pending_blocks
             .values()
             .any(|pb| pb.header().height.0 == next_height && !pb.is_complete());
-        if self.verification.has_verification_in_flight() || has_incomplete_block_at_tip {
+        if self.verification.has_verification_in_flight()
+            || has_incomplete_block_at_tip
+            || self.sync.has_pending_verifications()
+        {
             return false;
         }
 
@@ -1185,15 +1265,12 @@ impl BftState {
             duration: self.config.proposal_interval,
         }];
 
-        if self
-            .verification
-            .parent_tree_available(parent_block_height, parent_hash)
-        {
-            actions.push(proposal_action);
-        } else {
-            self.verification
-                .defer_proposal(parent_hash, proposal_action);
-        }
+        // Fallback blocks are always empty (no transactions/receipts), so
+        // build_proposal can compute the state root without JVT access.
+        // Never defer — deferring empty proposals creates a liveness deadlock
+        // when the proposer just exited sync mode (verified_state_roots doesn't
+        // contain the parent, and BlockPersisted hasn't fired yet).
+        actions.push(proposal_action);
 
         actions
     }
@@ -1276,15 +1353,10 @@ impl BftState {
             duration: self.config.proposal_interval,
         }];
 
-        if self
-            .verification
-            .parent_tree_available(parent_block_height, parent_hash)
-        {
-            actions.push(proposal_action);
-        } else {
-            self.verification
-                .defer_proposal(parent_hash, proposal_action);
-        }
+        // Sync blocks are always empty (no transactions/receipts), so
+        // build_proposal can compute the state root without JVT access.
+        // Never defer — same liveness reasoning as fallback blocks.
+        actions.push(proposal_action);
 
         actions
     }
@@ -2536,8 +2608,12 @@ impl BftState {
         );
         if let Some(result) = self.sync.on_qc_verified(block_hash, valid) {
             return match result {
-                SyncVerificationResult::Failed => vec![],
-                SyncVerificationResult::Verified => self.try_apply_verified_synced_blocks(topology),
+                // Even on failure, try applying verified blocks below the gap.
+                // The failed block creates a gap that blocks further progress,
+                // but blocks already verified at lower heights can still apply.
+                SyncVerificationResult::Failed | SyncVerificationResult::Verified => {
+                    self.try_apply_verified_synced_blocks(topology)
+                }
             };
         }
 
@@ -2753,8 +2829,24 @@ impl BftState {
     /// (`NodeStateMachine`) drains them and computes `merged_updates`.
     ///
     /// A block committed to the tree store — unblock deferred verifications.
-    pub fn on_jvt_committed(&mut self, block_height: u64) {
+    pub fn on_jvt_committed(
+        &mut self,
+        topology: &TopologySnapshot,
+        block_height: u64,
+    ) -> Vec<Action> {
         self.verification.on_jvt_committed(block_height);
+
+        // Auto-resume from sync when persistence catches up to the sync target.
+        // This replaces the fragile SyncComplete → BlockPersisted two-event
+        // handshake which was subject to ordering races.
+        if self.sync.is_syncing() {
+            if let Some(target) = self.sync.sync_target_height() {
+                if block_height >= target {
+                    return self.on_sync_complete(topology);
+                }
+            }
+        }
+        vec![]
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -3280,6 +3372,7 @@ impl BftState {
         topology: &TopologySnapshot,
         block: Block,
         qc: QuorumCertificate,
+        local_receipts: Vec<LocalReceiptEntry>,
     ) -> Vec<Action> {
         let block_hash = block.hash();
         let height = block.header.height.0;
@@ -3331,14 +3424,14 @@ impl BftState {
         // Check if this block is the next one we need
         if height == next_needed {
             // This is exactly what we need - submit for verification immediately
-            return self.submit_synced_block_for_verification(topology, block, qc);
+            return self.submit_synced_block_for_verification(topology, block, qc, local_receipts);
         }
 
         // Block is not the next sequential height. Check if we should buffer it
         // or if we already have what we need and should try draining buffers.
         if height > next_needed {
             // Future block - buffer it for later
-            self.sync.buffer_block(height, block, qc);
+            self.sync.buffer_block(height, block, qc, local_receipts);
 
             // Check if we can drain any buffered blocks starting from next_needed
             return self.try_drain_buffered_synced_blocks(topology);
@@ -3363,6 +3456,7 @@ impl BftState {
         topology: &TopologySnapshot,
         block: Block,
         qc: QuorumCertificate,
+        local_receipts: Vec<LocalReceiptEntry>,
     ) -> Vec<Action> {
         let block_hash = block.hash();
         let height = block.header.height.0;
@@ -3370,7 +3464,7 @@ impl BftState {
         // Genesis QC doesn't need signature verification
         if qc.is_genesis() {
             debug!(height, "Synced block has genesis QC, applying directly");
-            return self.apply_synced_block(topology, block, qc);
+            return self.apply_synced_block(topology, block, qc, local_receipts);
         }
 
         // Collect public keys for QC verification
@@ -3388,7 +3482,7 @@ impl BftState {
 
         // Store pending verification info via SyncManager
         self.sync
-            .track_pending_verification(block_hash, block, qc.clone());
+            .track_pending_verification(block_hash, block, qc.clone(), local_receipts);
 
         // Delegate verification to runner
         vec![Action::VerifyQcSignature {
@@ -3412,16 +3506,14 @@ impl BftState {
         // How many blocks are already pending verification?
         let pending_count = self.sync.pending_verification_count();
 
-        // Limit parallel verifications to avoid overwhelming the crypto pool.
-        // This also bounds memory usage from buffered blocks.
-        const MAX_PARALLEL_SYNC_VERIFICATIONS: usize = 16;
+        let max_parallel = self.config.max_parallel_sync_verifications;
 
-        if pending_count >= MAX_PARALLEL_SYNC_VERIFICATIONS {
+        if pending_count >= max_parallel {
             // Already at max parallel verifications, wait for some to complete
             return actions;
         }
 
-        let slots_available = MAX_PARALLEL_SYNC_VERIFICATIONS - pending_count;
+        let slots_available = max_parallel - pending_count;
 
         // Find the next height we need - accounting for what's already pending verification
         let highest_pending_height = self.sync.highest_pending_height(self.committed_height);
@@ -3429,19 +3521,30 @@ impl BftState {
 
         // Drain buffered blocks from the SyncManager
         let blocks = self.sync.drain_buffered(start_height, slots_available);
-        for (block, qc) in blocks {
-            actions.extend(self.submit_synced_block_for_verification(topology, block, qc));
+        for (block, qc, local_receipts) in blocks {
+            actions.extend(self.submit_synced_block_for_verification(
+                topology,
+                block,
+                qc,
+                local_receipts,
+            ));
         }
 
         actions
     }
 
     /// Apply a synced block after QC verification (or for genesis QC).
+    ///
+    /// Constructs `FinalizedWave` objects from sync receipts and initiates
+    /// state root verification through the same pipeline as consensus blocks.
+    /// Emits `CommitBlock` (unified with consensus) and `CacheFinalizedWave`
+    /// so other syncing nodes can fetch wave data from us.
     fn apply_synced_block(
         &mut self,
         topology: &TopologySnapshot,
         block: Block,
         qc: QuorumCertificate,
+        local_receipts: Vec<LocalReceiptEntry>,
     ) -> Vec<Action> {
         let block_hash = block.hash();
         let height = block.header.height.0;
@@ -3451,7 +3554,41 @@ impl BftState {
             height = height,
             block_hash = ?block_hash,
             transactions = block.transactions.len(),
+            certificates = block.certificates.len(),
+            receipts = local_receipts.len(),
             "Applying synced block"
+        );
+
+        // Capture parent state BEFORE record_block_committed changes it.
+        // These are needed for state root verification.
+        let parent_state_root = self.committed_state_root;
+        let parent_block_height = self.committed_height;
+
+        // Construct FinalizedWave objects from sync response data.
+        // This makes sync blocks indistinguishable from consensus blocks
+        // in the verification pipeline.
+        let Some(finalized_waves) =
+            build_finalized_waves_from_sync(topology, &block, local_receipts)
+        else {
+            // Sync peer sent incomplete receipts. Don't advance committed_height —
+            // check_sync_health will eventually trigger a re-sync from a different peer.
+            warn!(
+                height,
+                block_hash = ?block_hash,
+                "Skipping synced block — incomplete receipts from sync peer"
+            );
+            return vec![];
+        };
+
+        // Initiate state root verification through the same pipeline as
+        // consensus blocks. This produces a PreparedCommit that
+        // flush_block_commits needs for commit_prepared_blocks.
+        self.verification.initiate_state_root_verification(
+            block_hash,
+            &block,
+            parent_state_root,
+            parent_block_height,
+            finalized_waves.clone(),
         );
 
         let removed_blocks = self.record_block_committed(&block, block_hash);
@@ -3494,12 +3631,20 @@ impl BftState {
             .map(|pb| pb.manifest().provision_hashes.clone())
             .unwrap_or_default();
 
-        // Emit actions for the synced block
-        let mut actions = vec![Action::CommitSyncedBlock {
+        // Emit CommitBlock (unified with consensus path).
+        let mut actions = vec![Action::CommitBlock {
             block: block.clone(),
             qc,
             provision_hashes,
         }];
+
+        // Cache constructed FinalizedWaves so other syncing nodes can fetch
+        // them via FinalizedWaveFetchProtocol instead of hitting the original proposer.
+        for wave in &finalized_waves {
+            actions.push(Action::CacheFinalizedWave {
+                wave: Arc::clone(wave),
+            });
+        }
 
         // Synced blocks: do NOT gossip committed header — the original
         // proposer already did. Fallback recovery handles missing headers.
@@ -3507,51 +3652,6 @@ impl BftState {
         // Cancel any pending fetches for removed blocks
         for block_hash in removed_blocks {
             actions.push(Action::CancelFetch { block_hash });
-        }
-
-        // After syncing a block, check if we have buffered commits for subsequent heights
-        // that can now be processed. This handles the case where:
-        // 1. Block N was incomplete, blocking commits
-        // 2. Blocks N+1, N+2, ... were complete but buffered in pending_commits
-        // 3. Sync provided block N
-        // 4. Now we can drain the pending_commits buffer
-        actions.extend(self.drain_pending_commits(topology));
-
-        actions
-    }
-
-    /// Drain buffered out-of-order commits that are now ready to be processed.
-    ///
-    /// Called after committing a block (via sync or normal consensus) to check
-    /// if there are buffered commits at subsequent heights that can now proceed.
-    fn drain_pending_commits(&mut self, topology: &TopologySnapshot) -> Vec<Action> {
-        let mut actions = Vec::new();
-
-        loop {
-            let next_height = self.committed_height + 1;
-
-            // Check if we have a buffered commit for the next height
-            let Some((block_hash, qc)) = self.pending_commits.remove(&next_height) else {
-                break;
-            };
-
-            debug!(
-                validator = ?topology.local_validator_id(),
-                height = next_height,
-                block_hash = ?block_hash,
-                "Processing buffered commit after sync"
-            );
-
-            // Try to commit this block - it should be complete since it was buffered
-            // in pending_commits (not pending_commits_awaiting_data)
-            let commit_actions = self.on_block_ready_to_commit(topology, block_hash, qc);
-            actions.extend(commit_actions);
-
-            // If on_block_ready_to_commit didn't actually commit (e.g., block not found),
-            // stop trying to drain further
-            if self.committed_height < next_height {
-                break;
-            }
         }
 
         actions
@@ -3574,12 +3674,13 @@ impl BftState {
                 .log_verification_state(self.committed_height, next_height);
 
             // Take the next verified block at the expected height
-            let Some((block, qc)) = self.sync.take_verified_at_height(next_height) else {
+            let Some((block, qc, local_receipts)) = self.sync.take_verified_at_height(next_height)
+            else {
                 info!(next_height, "No verified block at next height - stopping");
                 break;
             };
 
-            actions.extend(self.apply_synced_block(topology, block, qc));
+            actions.extend(self.apply_synced_block(topology, block, qc, local_receipts));
         }
 
         // After applying blocks, drain more buffered blocks for parallel verification
@@ -4195,7 +4296,11 @@ impl BftState {
     /// certificate creation time to fill in the missing data first.
     ///
     /// - `transaction_fetch_timeout`: How long to wait before fetching missing txs
-    pub fn check_pending_block_fetches(&self, topology: &TopologySnapshot) -> Vec<Action> {
+    pub fn check_pending_block_fetches(
+        &self,
+        topology: &TopologySnapshot,
+        force_immediate: bool,
+    ) -> Vec<Action> {
         // Don't fetch for gossip blocks while syncing.
         // Sync delivers complete blocks that will supersede these pending blocks.
         // This prevents FetchManager from consuming all request slots and starving sync.
@@ -4222,7 +4327,7 @@ impl BftState {
 
             // Check if we should fetch missing transactions
             let missing_txs = pending.missing_transactions();
-            if !missing_txs.is_empty() && age >= tx_timeout {
+            if !missing_txs.is_empty() && (force_immediate || age >= tx_timeout) {
                 debug!(
                     validator = ?topology.local_validator_id(),
                     block_hash = ?block_hash,
@@ -4240,7 +4345,7 @@ impl BftState {
 
             // Check if we should fetch missing provisions
             let missing_provisions = pending.missing_provisions();
-            if !missing_provisions.is_empty() && age >= tx_timeout {
+            if !missing_provisions.is_empty() && (force_immediate || age >= tx_timeout) {
                 debug!(
                     validator = ?topology.local_validator_id(),
                     block_hash = ?block_hash,
@@ -4257,7 +4362,7 @@ impl BftState {
 
             // Fetch missing finalized waves from the proposer or local peers.
             let missing_waves = pending.missing_waves();
-            if !missing_waves.is_empty() && age >= tx_timeout {
+            if !missing_waves.is_empty() && (force_immediate || age >= tx_timeout) {
                 debug!(
                     validator = ?topology.local_validator_id(),
                     block_hash = ?block_hash,
@@ -7672,12 +7777,16 @@ mod tests {
         let actions = state.on_sync_complete(&topology);
         assert!(!state.is_syncing());
 
-        // May return fetch actions for pending blocks (or empty if no pending blocks)
-        // The main assertion is that syncing is now false
-        // In this test state there are no pending blocks, so actions should be empty
+        // Should contain the SyncResumed continuation for provision/header flush.
+        // Fresh test state has no pending blocks, so only SyncResumed is expected.
+        assert_eq!(actions.len(), 1, "Expected only SyncResumed continuation");
         assert!(
-            actions.is_empty(),
-            "Fresh test state has no pending blocks, so no fetch actions expected"
+            matches!(
+                &actions[0],
+                Action::Continuation(ProtocolEvent::SyncResumed)
+            ),
+            "Expected SyncResumed continuation, got {:?}",
+            actions[0]
         );
     }
 
@@ -7882,7 +7991,7 @@ mod tests {
         };
 
         // Should return empty actions since block is stale
-        let actions = state.on_sync_block_ready_to_apply(&topology, block, qc);
+        let actions = state.on_sync_block_ready_to_apply(&topology, block, qc, vec![]);
         assert!(actions.is_empty(), "Stale sync block should be ignored");
 
         // Should NOT have set syncing flag
