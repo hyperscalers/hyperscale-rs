@@ -408,13 +408,24 @@ impl BftState {
         const K: usize = 2;
         let committee_len = topology.local_committee().len();
         let self_id = topology.local_validator_id();
-        let mut recipients = Vec::with_capacity(K);
+        let mut recipients = Vec::with_capacity(K + 1);
 
+        // Always include the block's proposer so it can aggregate its own QC.
+        // Without this, the proposer is blind to its block's QC until a later
+        // header carries it back (2 block cycles), causing spurious view changes.
+        let block_proposer = topology.proposer_for(height, round);
+        if block_proposer != self_id {
+            recipients.push(block_proposer);
+        }
+
+        // Send to the next K proposers for pipelining.
+        let mut next_count = 0;
         for offset in 0..committee_len as u64 {
             let proposer = topology.proposer_for(height + 1, round + offset);
             if proposer != self_id && !recipients.contains(&proposer) {
                 recipients.push(proposer);
-                if recipients.len() >= K {
+                next_count += 1;
+                if next_count >= K {
                     break;
                 }
             }
@@ -8288,46 +8299,54 @@ mod tests {
         // Proposer formula: committee[(height + round) % 4].
         let (state, topology) = make_test_state();
 
-        // Voting at height 0, round 0. Next proposers for height 1:
-        //   round 0: (1+0)%4 = 1 -> V1 (primary)
-        //   round 1: (1+1)%4 = 2 -> V2 (secondary)
+        // Voting at height 0, round 0.
+        //   Block proposer: (0+0)%4 = 0 -> V0 (self, skipped)
+        //   Next proposers for height 1:
+        //     round 0: (1+0)%4 = 1 -> V1
+        //     round 1: (1+1)%4 = 2 -> V2
         assert_eq!(
             state.vote_recipients(&topology, 0, 0),
             vec![ValidatorId(1), ValidatorId(2)]
         );
 
-        // Voting at height 1, round 0. Next proposers for height 2:
-        //   round 0: (2+0)%4 = 2 -> V2 (primary)
-        //   round 1: (2+1)%4 = 3 -> V3 (secondary)
+        // Voting at height 1, round 0.
+        //   Block proposer: (1+0)%4 = 1 -> V1 (included)
+        //   Next proposers for height 2:
+        //     round 0: (2+0)%4 = 2 -> V2
+        //     round 1: (2+1)%4 = 3 -> V3
         assert_eq!(
             state.vote_recipients(&topology, 1, 0),
-            vec![ValidatorId(2), ValidatorId(3)]
+            vec![ValidatorId(1), ValidatorId(2), ValidatorId(3)]
         );
     }
 
     #[test]
     fn test_vote_recipients_excludes_self() {
-        // Self = V0. Voting at height 3, round 0. Next proposers for height 4:
-        //   round 0: (4+0)%4 = 0 -> V0 (self, skipped)
-        //   round 1: (4+1)%4 = 1 -> V1 (primary)
-        //   round 2: (4+2)%4 = 2 -> V2 (secondary)
+        // Self = V0. Voting at height 3, round 0.
+        //   Block proposer: (3+0)%4 = 3 -> V3 (included)
+        //   Next proposers for height 4:
+        //     round 0: (4+0)%4 = 0 -> V0 (self, skipped)
+        //     round 1: (4+1)%4 = 1 -> V1
+        //     round 2: (4+2)%4 = 2 -> V2
         let (state, topology) = make_test_state();
         assert_eq!(
             state.vote_recipients(&topology, 3, 0),
-            vec![ValidatorId(1), ValidatorId(2)]
+            vec![ValidatorId(3), ValidatorId(1), ValidatorId(2)]
         );
     }
 
     #[test]
     fn test_vote_recipients_respects_current_round() {
-        // Self = V0. Voting at height 0, round 2. Next proposers for height 1:
-        //   round 2: (1+2)%4 = 3 -> V3 (primary)
-        //   round 3: (1+3)%4 = 0 -> V0 (self, skipped)
-        //   round 4: (1+4)%4 = 1 -> V1 (secondary)
+        // Self = V0. Voting at height 0, round 2.
+        //   Block proposer: (0+2)%4 = 2 -> V2 (included)
+        //   Next proposers for height 1:
+        //     round 2: (1+2)%4 = 3 -> V3
+        //     round 3: (1+3)%4 = 0 -> V0 (self, skipped)
+        //     round 4: (1+4)%4 = 1 -> V1
         let (state, topology) = make_test_state();
         assert_eq!(
             state.vote_recipients(&topology, 0, 2),
-            vec![ValidatorId(3), ValidatorId(1)]
+            vec![ValidatorId(2), ValidatorId(3), ValidatorId(1)]
         );
     }
 
