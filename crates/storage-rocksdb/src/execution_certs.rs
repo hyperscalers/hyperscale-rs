@@ -34,8 +34,8 @@ fn append_ec_to_batch(
 ) {
     let canonical_hash = cert.canonical_hash();
 
-    // Primary: canonical_hash → EC
-    storage.cf_put::<ExecutionCertsCf>(batch, &canonical_hash, cert);
+    // Primary: canonical_hash → EC (use cached SBOR bytes if available)
+    storage.cf_put_raw::<ExecutionCertsCf>(batch, &canonical_hash, cert, cert.cached_sbor_bytes());
 
     // Index: (block_height, canonical_hash) → ()
     storage.cf_put::<ExecutionCertsByHeightCf>(batch, &(cert.block_height(), canonical_hash), &());

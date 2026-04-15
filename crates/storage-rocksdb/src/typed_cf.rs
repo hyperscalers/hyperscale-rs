@@ -235,6 +235,24 @@ pub(crate) fn batch_put<CF: TypedCf>(
     batch.put_cf(cf, &key_bytes, &value_bytes);
 }
 
+/// Typed put into a WriteBatch, using pre-serialized value bytes if available.
+pub(crate) fn batch_put_raw<CF: TypedCf>(
+    batch: &mut WriteBatch,
+    cf: &ColumnFamily,
+    key: &CF::Key,
+    value: &CF::Value,
+    raw_value: Option<&[u8]>,
+) {
+    let key_bytes = CF::KeyCodec::default().encode(key);
+    match raw_value {
+        Some(bytes) => batch.put_cf(cf, &key_bytes, bytes),
+        None => {
+            let value_bytes = CF::ValueCodec::default().encode(value);
+            batch.put_cf(cf, &key_bytes, &value_bytes);
+        }
+    }
+}
+
 /// Typed delete in a WriteBatch.
 pub(crate) fn batch_delete<CF: TypedCf>(batch: &mut WriteBatch, cf: &ColumnFamily, key: &CF::Key) {
     let key_bytes = CF::KeyCodec::default().encode(key);

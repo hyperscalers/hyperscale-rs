@@ -220,6 +220,17 @@ impl RocksDbStorage {
         crate::typed_cf::batch_put::<CF>(batch, CF::handle(&self.cf()), key, value);
     }
 
+    /// Put a typed key/value into a WriteBatch, using pre-serialized bytes if available.
+    pub(crate) fn cf_put_raw<CF: crate::typed_cf::TypedCf>(
+        &self,
+        batch: &mut WriteBatch,
+        key: &CF::Key,
+        value: &CF::Value,
+        raw_value: Option<&[u8]>,
+    ) {
+        crate::typed_cf::batch_put_raw::<CF>(batch, CF::handle(&self.cf()), key, value, raw_value);
+    }
+
     /// Batch get typed values (RocksDB multi_get_cf).
     pub(crate) fn cf_multi_get<CF: crate::typed_cf::TypedCf>(
         &self,
