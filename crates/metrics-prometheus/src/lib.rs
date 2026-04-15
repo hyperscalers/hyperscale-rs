@@ -68,7 +68,6 @@ pub struct Metrics {
     pub rocksdb_write_latency: Histogram,
     pub storage_operation_latency: HistogramVec,
     pub storage_batch_size: Histogram,
-    pub storage_votes_persisted: Counter,
     pub storage_certificates_persisted: Counter,
     pub storage_blocks_persisted: Counter,
     pub storage_transactions_persisted: Counter,
@@ -369,12 +368,6 @@ impl Metrics {
                 "hyperscale_storage_batch_size",
                 "Number of writes in atomic batches",
                 vec![1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0]
-            )
-            .unwrap(),
-
-            storage_votes_persisted: register_counter!(
-                "hyperscale_storage_votes_persisted_total",
-                "Total number of votes persisted to storage"
             )
             .unwrap(),
 
@@ -727,10 +720,6 @@ impl MetricsRecorder for PrometheusRecorder {
 
     fn record_certificate_persisted(&self) {
         self.metrics.storage_certificates_persisted.inc();
-    }
-
-    fn record_vote_persisted(&self) {
-        self.metrics.storage_votes_persisted.inc();
     }
 
     fn record_transactions_persisted(&self, count: usize) {

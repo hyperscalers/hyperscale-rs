@@ -31,7 +31,6 @@ mod store;
 pub(crate) mod substate_key;
 pub(crate) mod typed_cf;
 pub(crate) mod versioned_key;
-mod votes;
 
 #[cfg(test)]
 mod tests;

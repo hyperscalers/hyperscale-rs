@@ -211,9 +211,6 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     /// Record a certificate persisted to storage.
     fn record_certificate_persisted(&self) {}
 
-    /// Record a vote persisted to storage.
-    fn record_vote_persisted(&self) {}
-
     /// Record transactions persisted to storage.
     fn record_transactions_persisted(&self, count: usize) {}
 
@@ -473,12 +470,6 @@ pub fn record_block_persisted() {
 #[inline]
 pub fn record_certificate_persisted() {
     recorder().record_certificate_persisted();
-}
-
-/// Record a vote persisted to storage.
-#[inline]
-pub fn record_vote_persisted() {
-    recorder().record_vote_persisted();
 }
 
 /// Record transactions persisted to storage.

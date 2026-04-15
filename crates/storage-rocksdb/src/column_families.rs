@@ -28,9 +28,6 @@ pub(crate) const TRANSACTIONS_CF: &str = "transactions";
 /// Column family name for wave certificates keyed by hash.
 pub(crate) const CERTIFICATES_CF: &str = "certificates";
 
-/// Column family name for BFT votes keyed by height.
-pub(crate) const VOTES_CF: &str = "votes";
-
 /// Column family name for JVT tree nodes.
 /// The string value remains "jmt_nodes" for backward compatibility with existing
 /// RocksDB databases created before the rename to JVT.
@@ -76,7 +73,6 @@ pub(crate) const ALL_COLUMN_FAMILIES: &[&str] = &[
     TRANSACTIONS_CF,
     STATE_CF,
     CERTIFICATES_CF,
-    VOTES_CF,
     JVT_NODES_CF,
     STALE_JVT_NODES_CF,
     VERSIONED_SUBSTATES_CF,
@@ -99,7 +95,6 @@ pub(crate) struct CfHandles<'a> {
     blocks: &'a rocksdb::ColumnFamily,
     transactions: &'a rocksdb::ColumnFamily,
     certificates: &'a rocksdb::ColumnFamily,
-    votes: &'a rocksdb::ColumnFamily,
     jvt_nodes: &'a rocksdb::ColumnFamily,
     stale_jvt_nodes: &'a rocksdb::ColumnFamily,
     versioned_substates: &'a rocksdb::ColumnFamily,
@@ -124,7 +119,6 @@ impl<'a> CfHandles<'a> {
             blocks: resolve(BLOCKS_CF),
             transactions: resolve(TRANSACTIONS_CF),
             certificates: resolve(CERTIFICATES_CF),
-            votes: resolve(VOTES_CF),
             jvt_nodes: resolve(JVT_NODES_CF),
             stale_jvt_nodes: resolve(STALE_JVT_NODES_CF),
             versioned_substates: resolve(VERSIONED_SUBSTATES_CF),
@@ -173,20 +167,6 @@ impl TypedCf for CertificatesCf {
     type ValueCodec = SborCodec<WaveCertificate>;
     fn handle<'a>(cf: &CfHandles<'a>) -> &'a rocksdb::ColumnFamily {
         cf.certificates
-    }
-}
-
-// BFT safety
-
-pub(crate) struct VotesCf;
-impl TypedCf for VotesCf {
-    const NAME: &'static str = VOTES_CF;
-    type Key = u64; // height
-    type Value = (Hash, u64); // (block_hash, round)
-    type KeyCodec = BeU64Codec;
-    type ValueCodec = SborCodec<(Hash, u64)>;
-    fn handle<'a>(cf: &CfHandles<'a>) -> &'a rocksdb::ColumnFamily {
-        cf.votes
     }
 }
 
