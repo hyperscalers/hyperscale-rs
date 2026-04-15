@@ -39,7 +39,7 @@ where
                     let es = self.event_sender.clone();
                     let peers = self.local_peers();
                     self.network.request(
-                        peers,
+                        &peers,
                         None,
                         GetBlockRequest {
                             height: BlockHeight(height),
@@ -121,7 +121,7 @@ where
                     let hs = tx_hashes.clone();
                     let peers = self.local_peers();
                     self.network.request(
-                        peers,
+                        &peers,
                         Some(proposer),
                         GetTransactionsRequest::new(block_hash, tx_hashes),
                         Box::new(move |result| match result {
@@ -174,7 +174,7 @@ where
                     let hs = batch_hashes.clone();
                     let peers = self.local_peers();
                     self.network.request(
-                        peers,
+                        &peers,
                         Some(proposer),
                         GetLocalProvisionsRequest::new(block_hash, batch_hashes),
                         Box::new(move |result| match result {
@@ -425,7 +425,7 @@ where
                     let hs = wave_id_hashes.clone();
                     let peers = self.local_peers();
                     self.network.request(
-                        peers,
+                        &peers,
                         Some(proposer),
                         GetFinalizedWavesRequest::new(block_hash, wave_id_hashes),
                         Box::new(move |result| match result {

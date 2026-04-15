@@ -341,9 +341,6 @@ where
     // (receipts go through the verification pipeline first).
     pending_sync_data: std::collections::HashMap<u64, BufferedSyncResponse>,
 
-    // Cached local shard peers (committee excluding self) — avoids per-call allocation.
-    cached_local_peers: Vec<ValidatorId>,
-
     // Pending commit task — prepared by flush_block_commits, spawned by the runner.
     // Production uses tokio::spawn_blocking; simulation runs inline.
     pending_commit_task: Option<Box<dyn FnOnce() + Send>>,
@@ -378,12 +375,6 @@ where
         let topo = topology.load();
         let local_shard = topo.local_shard();
         let validator_id = topo.local_validator_id();
-        let cached_local_peers: Vec<ValidatorId> = topo
-            .committee_for_shard(local_shard)
-            .iter()
-            .filter(|&&v| v != validator_id)
-            .copied()
-            .collect();
         let initial_persisted_height = state.bft().committed_height();
         let b = &config.batch;
         let sync_protocol = SyncProtocol::new(config.sync.clone());
@@ -443,7 +434,6 @@ where
             commit_in_flight: Arc::new(AtomicBool::new(false)),
             exec_cert_cache: Arc::new(Mutex::new(HashMap::new())),
             pending_sync_data: std::collections::HashMap::new(),
-            cached_local_peers,
             tx_status_cache: Arc::new(QuickCache::new(DEFAULT_TX_STATUS_CACHE_SIZE)),
             last_slow_tx_warn: std::time::Duration::ZERO,
             pending_commit_task: None,
@@ -453,19 +443,12 @@ where
         }
     }
 
-    /// Rebuild derived topology state (`local_shard`, `cached_local_peers`)
-    /// from a topology snapshot. Called after storing a new topology via
-    /// `Action::TopologyChanged`.
+    /// Rebuild derived topology state from a topology snapshot.
+    /// Called after storing a new topology via `Action::TopologyChanged`.
     fn rebuild_topology_cache_from(&mut self, topology: &hyperscale_types::TopologySnapshot) {
         self.local_shard = topology.local_shard();
         self.validator_id = topology.local_validator_id();
         self.num_shards = topology.num_shards();
-        self.cached_local_peers = topology
-            .committee_for_shard(self.local_shard)
-            .iter()
-            .filter(|&&v| v != self.validator_id)
-            .copied()
-            .collect();
     }
 
     // ─── Time ────────────────────────────────────────────────────────────

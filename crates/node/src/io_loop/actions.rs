@@ -59,7 +59,8 @@ where
                 // Sign proposal on consensus crypto pool, then broadcast.
                 let signing_key = Arc::clone(&self.signing_key);
                 let network = Arc::clone(&self.network);
-                let local_peers = self.cached_local_peers.clone();
+                let topology = Arc::clone(&self.topology);
+                let validator_id = self.validator_id;
 
                 self.dispatch.spawn_consensus_crypto(move || {
                     let block_hash = header.hash();
@@ -72,6 +73,13 @@ where
                     let sig = signing_key.sign_v1(&msg);
                     let gossip =
                         hyperscale_messages::BlockHeaderNotification::new(*header, *manifest, sig);
+                    let topo = topology.load();
+                    let local_peers: Vec<ValidatorId> = topo
+                        .committee_for_shard(topo.local_shard())
+                        .iter()
+                        .filter(|&&v| v != validator_id)
+                        .copied()
+                        .collect();
                     network.notify(&local_peers, &gossip);
                 });
             }
@@ -388,7 +396,7 @@ where
 
                 tracing::info!(
                     local_shard = self.local_shard.0,
-                    local_peers = self.cached_local_peers.len(),
+                    local_peers = self.local_peers().len(),
                     "Network topology updated"
                 );
             }
@@ -1150,7 +1158,12 @@ where
 
     /// Local shard committee excluding self, for use as the `peers` argument
     /// to `network.request()`.
-    pub(super) fn local_peers(&self) -> &[ValidatorId] {
-        &self.cached_local_peers
+    pub(super) fn local_peers(&self) -> Vec<ValidatorId> {
+        let topo = self.topology.load();
+        topo.committee_for_shard(self.local_shard)
+            .iter()
+            .filter(|&&v| v != self.validator_id)
+            .copied()
+            .collect()
     }
 }
