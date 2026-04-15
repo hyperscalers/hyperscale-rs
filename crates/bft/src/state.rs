@@ -35,11 +35,18 @@ pub struct BftMemoryStats {
     pub vote_sets: usize,
     pub certified_blocks: usize,
     pub pending_commits: usize,
+    pub pending_commits_awaiting_data: usize,
     pub remote_headers: usize,
+    pub voted_heights: usize,
+    pub received_votes_by_height: usize,
+    pub committed_tx_lookup: usize,
+    pub recently_committed_txs: usize,
+    pub recently_committed_certs: usize,
     pub pending_qc_verifications: usize,
     pub verified_qcs: usize,
     pub pending_state_root_verifications: usize,
     pub buffered_synced_blocks: usize,
+    pub pending_synced_block_verifications: usize,
 }
 
 /// Index type for simulation-only node routing.
@@ -4423,13 +4430,20 @@ impl BftState {
             vote_sets: self.vote_sets.len(),
             certified_blocks: self.certified_blocks.len(),
             pending_commits: self.pending_commits.len(),
+            pending_commits_awaiting_data: self.pending_commits_awaiting_data.len(),
             remote_headers: self.remote_headers.len(),
+            voted_heights: self.voted_heights.len(),
+            received_votes_by_height: self.received_votes_by_height.len(),
+            committed_tx_lookup: self.committed_tx_lookup.len(),
+            recently_committed_txs: self.recently_committed_txs.len(),
+            recently_committed_certs: self.recently_committed_certs.len(),
             pending_qc_verifications: self.verification.pending_qc_verifications_len(),
             verified_qcs: self.verification.verified_qcs_len(),
             pending_state_root_verifications: self
                 .verification
                 .pending_state_root_verifications_len(),
             buffered_synced_blocks: self.sync.buffered_synced_blocks_len(),
+            pending_synced_block_verifications: self.sync.pending_verification_count(),
         }
     }
 

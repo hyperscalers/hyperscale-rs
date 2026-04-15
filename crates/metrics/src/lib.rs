@@ -63,8 +63,20 @@ pub struct MemoryMetrics {
     pub bft_certified_blocks: usize,
     /// Out-of-order commits buffered.
     pub bft_pending_commits: usize,
+    /// Commits waiting for block data (header/txs).
+    pub bft_pending_commits_awaiting_data: usize,
     /// Remote shard headers for merkle proof validation.
     pub bft_remote_headers: usize,
+    /// Heights we have voted on (equivocation guard).
+    pub bft_voted_heights: usize,
+    /// Votes received per (height, validator) pair.
+    pub bft_received_votes_by_height: usize,
+    /// Committed transaction hash lookup.
+    pub bft_committed_tx_lookup: usize,
+    /// Recently committed transaction hashes (dedup window).
+    pub bft_recently_committed_txs: usize,
+    /// Recently committed certificate hashes (dedup window).
+    pub bft_recently_committed_certs: usize,
     /// Block headers pending QC verification.
     pub bft_pending_qc_verifications: usize,
     /// Cache of verified QC signatures.
@@ -73,6 +85,8 @@ pub struct MemoryMetrics {
     pub bft_pending_state_root_verifications: usize,
     /// Out-of-order synced blocks.
     pub bft_buffered_synced_blocks: usize,
+    /// Synced blocks pending QC verification.
+    pub bft_pending_synced_block_verifications: usize,
 
     // ── Execution ──
     /// In-memory write sets per transaction.
@@ -91,6 +105,29 @@ pub struct MemoryMetrics {
     pub exec_wave_certificate_trackers: usize,
     /// Expected execution certificates from remote shards.
     pub exec_expected_exec_certs: usize,
+    /// Verified state provisions per transaction.
+    pub exec_verified_provisions: usize,
+    /// Required provision shards per transaction.
+    pub exec_required_provision_shards: usize,
+    /// Received provision shards per transaction.
+    pub exec_received_provision_shards: usize,
+    /// Waves that have produced an execution certificate.
+    pub exec_waves_with_ec: usize,
+    /// Waves with pending vote retries.
+    pub exec_pending_vote_retries: usize,
+    /// Transaction to wave assignment mapping.
+    pub exec_wave_assignments: usize,
+    /// Waves waiting for receipt data.
+    pub exec_pending_wave_receipts: usize,
+    /// Execution results that arrived before wave tracking.
+    pub exec_early_execution_results: usize,
+    /// Wave attestations that arrived before tracking.
+    pub exec_early_wave_attestations: usize,
+    /// Committed provisions that arrived before tracking.
+    pub exec_early_committed_provisions: usize,
+    /// Fulfilled execution certificates from remote shards.
+    pub exec_fulfilled_exec_certs: usize,
+
     // ── Mempool ──
     /// All transactions in the pool.
     pub mempool_pool: usize,
@@ -104,6 +141,12 @@ pub struct MemoryMetrics {
     pub mempool_locked_nodes: usize,
     /// Distinct committed_at heights tracked for timeout scanning.
     pub mempool_in_flight_heights: usize,
+    /// Transactions deferred due to node conflicts.
+    pub mempool_deferred_by_nodes: usize,
+    /// Reverse index: node -> deferred transactions.
+    pub mempool_txs_deferred_by_node: usize,
+    /// Reverse index: node -> ready transactions.
+    pub mempool_ready_txs_by_node: usize,
 
     // ── Remote Headers ──
     /// Remote headers pending QC verification.
@@ -122,6 +165,12 @@ pub struct MemoryMetrics {
     pub prov_verified_batches: usize,
     /// Expected provisions that haven't arrived yet.
     pub prov_expected_provisions: usize,
+    /// Provision batch lookup by hash.
+    pub prov_batches_by_hash: usize,
+    /// Provision batches queued for processing.
+    pub prov_queued_provision_batches: usize,
+    /// Tombstones for committed provision batches.
+    pub prov_committed_batch_tombstones: usize,
 
     // ── Storage (byte-level where available) ──
     /// JVT node hydration cache entries.

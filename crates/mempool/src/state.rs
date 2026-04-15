@@ -126,6 +126,9 @@ pub struct MempoolMemoryStats {
     pub recently_evicted: usize,
     pub locked_nodes: usize,
     pub in_flight_heights: usize,
+    pub deferred_by_nodes: usize,
+    pub txs_deferred_by_node: usize,
+    pub ready_txs_by_node: usize,
 }
 
 /// Entry in the transaction pool.
@@ -1302,6 +1305,9 @@ impl MempoolState {
             recently_evicted: self.recently_evicted.len(),
             locked_nodes: self.locked_nodes_cache.len(),
             in_flight_heights: self.in_flight_by_height.len(),
+            deferred_by_nodes: self.deferred_by_nodes.len(),
+            txs_deferred_by_node: self.txs_deferred_by_node.len(),
+            ready_txs_by_node: self.ready_txs_by_node.len(),
         }
     }
 

@@ -82,6 +82,17 @@ pub struct ExecutionMemoryStats {
     pub early_votes: usize,
     pub wave_certificate_trackers: usize,
     pub expected_exec_certs: usize,
+    pub verified_provisions: usize,
+    pub required_provision_shards: usize,
+    pub received_provision_shards: usize,
+    pub waves_with_ec: usize,
+    pub pending_vote_retries: usize,
+    pub wave_assignments: usize,
+    pub pending_wave_receipts: usize,
+    pub early_execution_results: usize,
+    pub early_wave_attestations: usize,
+    pub early_committed_provisions: usize,
+    pub fulfilled_exec_certs: usize,
 }
 
 /// Execution state machine.
@@ -2113,6 +2124,17 @@ impl ExecutionState {
             early_votes: self.early_votes.len(),
             wave_certificate_trackers: self.wave_certificate_trackers.len(),
             expected_exec_certs: self.expected_exec_certs.len(),
+            verified_provisions: self.verified_provisions.len(),
+            required_provision_shards: self.required_provision_shards.len(),
+            received_provision_shards: self.received_provision_shards.len(),
+            waves_with_ec: self.waves_with_ec.len(),
+            pending_vote_retries: self.pending_vote_retries.len(),
+            wave_assignments: self.wave_assignments.len(),
+            pending_wave_receipts: self.pending_wave_receipts.len(),
+            early_execution_results: self.early_execution_results.len(),
+            early_wave_attestations: self.early_wave_attestations.len(),
+            early_committed_provisions: self.early_committed_provisions.len(),
+            fulfilled_exec_certs: self.fulfilled_exec_certs.len(),
         }
     }
 

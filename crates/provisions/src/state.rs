@@ -31,6 +31,9 @@ pub struct ProvisionMemoryStats {
     pub pending_provisions: usize,
     pub verified_batches: usize,
     pub expected_provisions: usize,
+    pub batches_by_hash: usize,
+    pub queued_provision_batches: usize,
+    pub committed_batch_tombstones: usize,
 }
 
 /// Tracks an expected provision that hasn't arrived yet.
@@ -153,6 +156,9 @@ impl ProvisionCoordinator {
             pending_provisions: self.pending_provisions.len(),
             verified_batches: self.verified_batches.len(),
             expected_provisions: self.expected_provisions.len(),
+            batches_by_hash: self.batches_by_hash.len(),
+            queued_provision_batches: self.queued_provision_batches.len(),
+            committed_batch_tombstones: self.committed_batch_tombstones.len(),
         }
     }
 

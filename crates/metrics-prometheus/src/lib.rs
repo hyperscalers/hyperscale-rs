@@ -1090,8 +1090,32 @@ impl MetricsRecorder for PrometheusRecorder {
             .set(m.bft_pending_commits as f64);
         self.metrics
             .memory_bft
+            .with_label_values(&["pending_commits_awaiting_data"])
+            .set(m.bft_pending_commits_awaiting_data as f64);
+        self.metrics
+            .memory_bft
             .with_label_values(&["remote_headers"])
             .set(m.bft_remote_headers as f64);
+        self.metrics
+            .memory_bft
+            .with_label_values(&["voted_heights"])
+            .set(m.bft_voted_heights as f64);
+        self.metrics
+            .memory_bft
+            .with_label_values(&["received_votes_by_height"])
+            .set(m.bft_received_votes_by_height as f64);
+        self.metrics
+            .memory_bft
+            .with_label_values(&["committed_tx_lookup"])
+            .set(m.bft_committed_tx_lookup as f64);
+        self.metrics
+            .memory_bft
+            .with_label_values(&["recently_committed_txs"])
+            .set(m.bft_recently_committed_txs as f64);
+        self.metrics
+            .memory_bft
+            .with_label_values(&["recently_committed_certs"])
+            .set(m.bft_recently_committed_certs as f64);
         self.metrics
             .memory_bft
             .with_label_values(&["pending_qc_verifications"])
@@ -1108,6 +1132,10 @@ impl MetricsRecorder for PrometheusRecorder {
             .memory_bft
             .with_label_values(&["buffered_synced_blocks"])
             .set(m.bft_buffered_synced_blocks as f64);
+        self.metrics
+            .memory_bft
+            .with_label_values(&["pending_synced_block_verifications"])
+            .set(m.bft_pending_synced_block_verifications as f64);
 
         // Execution
         self.metrics
@@ -1142,6 +1170,50 @@ impl MetricsRecorder for PrometheusRecorder {
             .memory_exec
             .with_label_values(&["expected_exec_certs"])
             .set(m.exec_expected_exec_certs as f64);
+        self.metrics
+            .memory_exec
+            .with_label_values(&["verified_provisions"])
+            .set(m.exec_verified_provisions as f64);
+        self.metrics
+            .memory_exec
+            .with_label_values(&["required_provision_shards"])
+            .set(m.exec_required_provision_shards as f64);
+        self.metrics
+            .memory_exec
+            .with_label_values(&["received_provision_shards"])
+            .set(m.exec_received_provision_shards as f64);
+        self.metrics
+            .memory_exec
+            .with_label_values(&["waves_with_ec"])
+            .set(m.exec_waves_with_ec as f64);
+        self.metrics
+            .memory_exec
+            .with_label_values(&["pending_vote_retries"])
+            .set(m.exec_pending_vote_retries as f64);
+        self.metrics
+            .memory_exec
+            .with_label_values(&["wave_assignments"])
+            .set(m.exec_wave_assignments as f64);
+        self.metrics
+            .memory_exec
+            .with_label_values(&["pending_wave_receipts"])
+            .set(m.exec_pending_wave_receipts as f64);
+        self.metrics
+            .memory_exec
+            .with_label_values(&["early_execution_results"])
+            .set(m.exec_early_execution_results as f64);
+        self.metrics
+            .memory_exec
+            .with_label_values(&["early_wave_attestations"])
+            .set(m.exec_early_wave_attestations as f64);
+        self.metrics
+            .memory_exec
+            .with_label_values(&["early_committed_provisions"])
+            .set(m.exec_early_committed_provisions as f64);
+        self.metrics
+            .memory_exec
+            .with_label_values(&["fulfilled_exec_certs"])
+            .set(m.exec_fulfilled_exec_certs as f64);
 
         // Mempool
         self.metrics
@@ -1168,6 +1240,18 @@ impl MetricsRecorder for PrometheusRecorder {
             .memory_mempool
             .with_label_values(&["in_flight_heights"])
             .set(m.mempool_in_flight_heights as f64);
+        self.metrics
+            .memory_mempool
+            .with_label_values(&["deferred_by_nodes"])
+            .set(m.mempool_deferred_by_nodes as f64);
+        self.metrics
+            .memory_mempool
+            .with_label_values(&["txs_deferred_by_node"])
+            .set(m.mempool_txs_deferred_by_node as f64);
+        self.metrics
+            .memory_mempool
+            .with_label_values(&["ready_txs_by_node"])
+            .set(m.mempool_ready_txs_by_node as f64);
 
         // Remote Headers
         self.metrics
@@ -1200,6 +1284,18 @@ impl MetricsRecorder for PrometheusRecorder {
             .memory_provisions
             .with_label_values(&["expected_provisions"])
             .set(m.prov_expected_provisions as f64);
+        self.metrics
+            .memory_provisions
+            .with_label_values(&["batches_by_hash"])
+            .set(m.prov_batches_by_hash as f64);
+        self.metrics
+            .memory_provisions
+            .with_label_values(&["queued_provision_batches"])
+            .set(m.prov_queued_provision_batches as f64);
+        self.metrics
+            .memory_provisions
+            .with_label_values(&["committed_batch_tombstones"])
+            .set(m.prov_committed_batch_tombstones as f64);
 
         // Storage
         self.metrics
