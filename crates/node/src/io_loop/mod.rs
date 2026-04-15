@@ -968,11 +968,18 @@ where
                 if height > self.persisted_height {
                     self.persisted_height = height;
                 }
-                // Prune pending_db_updates — these blocks are now in RocksDB.
+                // Prune pending_db_updates and jvt_snapshot_cache — these
+                // blocks are now in RocksDB. Without this, build_overlay
+                // re-indexes committed JVT nodes into the overlay HashMap on
+                // every dispatched action.
                 self.pending_db_updates
                     .lock()
                     .unwrap()
                     .retain(|_, (h, _)| *h > height);
+                self.jvt_snapshot_cache
+                    .lock()
+                    .unwrap()
+                    .retain(|_, (_, snap)| snap.new_version > height);
                 self.feed_event(ProtocolEvent::BlockPersisted { height });
             }
             NodeInput::Protocol(pe) => {
