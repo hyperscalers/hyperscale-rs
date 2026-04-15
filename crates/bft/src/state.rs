@@ -2915,7 +2915,8 @@ impl BftState {
         // regular proposal timer handle it.
         let next_height = height + 1;
 
-        let has_content = !ready_txs.is_empty() || !finalized_waves.is_empty();
+        let has_content =
+            !ready_txs.is_empty() || !finalized_waves.is_empty() || !provision_batches.is_empty();
 
         // Rate limit against the latest QC time (any proposer), not just our own
         // last proposal. With rotating proposers, per-validator tracking doesn't
