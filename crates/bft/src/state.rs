@@ -17,6 +17,10 @@ use hyperscale_core::{Action, ProtocolEvent, TimerId};
 /// Number of block heights to retain remote headers per shard below the tip.
 const REMOTE_HEADER_RETENTION_BLOCKS: u64 = 50;
 
+/// Number of blocks to retain committed transaction hashes for proposal dedup.
+/// Matches the mempool tombstone window so entries outlive any possible re-proposal.
+const COMMITTED_TX_RETENTION_BLOCKS: u64 = 500;
+
 /// BFT statistics for monitoring.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BftStats {
@@ -4119,6 +4123,14 @@ impl BftState {
         // committed past their height they are stale.
         self.pending_commits
             .retain(|height, _| *height > committed_height);
+
+        // Prune committed_tx_lookup entries older than the retention window.
+        // This map is used for proposal dedup — transactions committed far in the
+        // past will have been evicted from mempool already, so stale entries just
+        // waste memory.
+        let tx_lookup_cutoff = committed_height.saturating_sub(COMMITTED_TX_RETENTION_BLOCKS);
+        self.committed_tx_lookup
+            .retain(|_, height| height.0 > tx_lookup_cutoff);
 
         // Remote headers are pruned per-shard-tip in insert_remote_header(),
         // not by local committed height (remote shards have independent heights).

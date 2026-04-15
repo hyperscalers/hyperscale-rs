@@ -24,6 +24,11 @@ use tracing::{debug, warn};
 /// This gives the source shard proposer time to send provisions normally.
 const PROVISION_FALLBACK_TIMEOUT_BLOCKS: u64 = 10;
 
+/// Number of local committed blocks to retain verified remote headers.
+/// Headers older than this have either been matched with provisions (and can be
+/// discarded) or are stale (the source shard has moved far ahead).
+const VERIFIED_HEADER_RETENTION_BLOCKS: u64 = 100;
+
 /// Provision coordinator memory statistics for monitoring collection sizes.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ProvisionMemoryStats {
@@ -191,11 +196,26 @@ impl ProvisionCoordinator {
                 self.committed_batch_tombstones
                     .insert(*h, self.local_committed_height);
             }
-            for key in keys_to_remove {
-                self.verified_batches.remove(&key);
+            for key in &keys_to_remove {
+                self.verified_batches.remove(key);
+                // Header no longer needed once the provision is committed.
+                self.verified_remote_headers.remove(key);
             }
             self.queued_provision_batches
                 .retain(|b| !committed.contains(&b.hash()));
+        }
+
+        // Prune stale verified remote headers that were never matched with
+        // provisions (e.g. source shard sent header but no provisions for us).
+        // Use local committed height as a proxy — headers arriving far in the
+        // past relative to our chain are safe to discard.
+        let header_cutoff = self
+            .local_committed_height
+            .0
+            .saturating_sub(VERIFIED_HEADER_RETENTION_BLOCKS);
+        if header_cutoff > 0 {
+            self.verified_remote_headers
+                .retain(|&(_, h), _| h.0 > header_cutoff);
         }
 
         // Prune old tombstones (committed more than 100 blocks ago).
