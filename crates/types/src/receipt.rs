@@ -211,13 +211,6 @@ impl ExecutionMetadata {
 
 // ─── Network / Storage Types ─────────────────────────────────────────────────
 
-/// A local receipt paired with its transaction hash, for network responses.
-#[derive(Debug, Clone, PartialEq, Eq, sbor::prelude::BasicSbor)]
-pub struct LocalReceiptEntry {
-    pub tx_hash: Hash,
-    pub receipt: LocalReceipt,
-}
-
 /// A receipt bundle for storage — local receipt + optional execution output.
 ///
 /// `execution_output` is `None` when the receipt was fetched from a peer (sync/catch-up).

@@ -46,38 +46,21 @@ where
                         },
                         Box::new(move |result| match result {
                             Ok(resp) => {
-                                let (block_opt, qc_opt, local_receipts, execution_certificates) =
-                                    resp.into_parts();
+                                let (block_opt, qc_opt, execution_certificates) = resp.into_parts();
                                 let block = match (block_opt, qc_opt) {
                                     (Some(b), Some(q)) => Some((b, q)),
                                     _ => None,
                                 };
 
-                                // Validate that the peer included receipts.
-                                // If the block has completed (non-aborted) wave certs,
-                                // the peer must include receipts for the covered txs.
-                                // Basic sanity check: completed wave certs → non-empty receipts.
-                                // Full correctness is verified by state-root check later.
-                                let has_certs = block
-                                    .as_ref()
-                                    .is_some_and(|(b, _)| !b.certificates.is_empty());
-                                let receipts_complete = !has_certs || !local_receipts.is_empty();
-
-                                if receipts_complete {
-                                    let _ = es.send(NodeInput::SyncBlockResponseReceived {
-                                        height,
-                                        block: Box::new(block),
-                                        local_receipts,
-                                        execution_certificates,
-                                    });
-                                } else {
-                                    tracing::warn!(
-                                        height,
-                                        "Sync peer sent block with incomplete receipts — \
-                                         treating as fetch failure"
-                                    );
-                                    let _ = es.send(NodeInput::SyncBlockFetchFailed { height });
-                                }
+                                // Receipts ride along inside `Block.certificates`
+                                // (Arc<FinalizedWave>) — the storage-side
+                                // FinalizedWave::reconstruct guarantees they are
+                                // either present or the peer returned not_found.
+                                let _ = es.send(NodeInput::SyncBlockResponseReceived {
+                                    height,
+                                    block: Box::new(block),
+                                    execution_certificates,
+                                });
                             }
                             Err(_) => {
                                 let _ = es.send(NodeInput::SyncBlockFetchFailed { height });

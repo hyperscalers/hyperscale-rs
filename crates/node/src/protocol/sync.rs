@@ -373,9 +373,9 @@ impl SyncProtocol {
 
 /// Serve an inbound block sync request.
 ///
-/// Includes local receipts and execution certificates for each certificate
-/// in the block so the syncing peer can verify and apply state changes
-/// without re-executing. Returns not_found if any data is missing.
+/// Returns the full Block (which carries `Arc<FinalizedWave>` with receipts
+/// inline via `get_block_for_sync`'s reconstruction) plus the local ECs for
+/// this block's height. Returns `not_found` if any data is missing.
 pub fn serve_block_request(
     storage: &impl ChainReader,
     _topology: &TopologySnapshot,
@@ -384,34 +384,17 @@ pub fn serve_block_request(
     trace!(height = req.height.0, "Handling block sync request");
     match storage.get_block_for_sync(req.height) {
         Some((block, qc)) => {
-            // `Block.certificates` already carries `Arc<FinalizedWave>` with the
-            // wave's receipts attached (rebuilt from storage in `get_block_for_sync`
-            // via `FinalizedWave::reconstruct`). Flatten for the legacy response
-            // field; Step 5 of the refactor removes this field entirely.
-            let local_receipts: Vec<hyperscale_types::LocalReceiptEntry> = block
-                .certificates
-                .iter()
-                .flat_map(|fw| {
-                    fw.receipts
-                        .iter()
-                        .map(|bundle| hyperscale_types::LocalReceiptEntry {
-                            tx_hash: bundle.tx_hash,
-                            receipt: (*bundle.local_receipt).clone(),
-                        })
-                })
-                .collect();
-
             // Collect local ECs for this block height.
-            let execution_certificates =
-                storage.get_execution_certificates_by_height(block.header.height.0);
-
+            //
             // Serve all local ECs for this height. The syncing node verifies
             // EC integrity via the QC-attested certificate_root (which transitively
             // commits to ec_hashes). No canonical_hash matching here — validators
             // may aggregate at different vote_heights, producing genuinely
             // different ECs for the same wave (D1 edge case).
+            let execution_certificates =
+                storage.get_execution_certificates_by_height(block.header.height.0);
 
-            GetBlockResponse::found(block, qc, local_receipts, execution_certificates)
+            GetBlockResponse::found(block, qc, execution_certificates)
         }
         None => GetBlockResponse::not_found(),
     }

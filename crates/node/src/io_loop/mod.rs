@@ -615,7 +615,6 @@ where
             NodeInput::SyncBlockResponseReceived {
                 height,
                 block,
-                local_receipts,
                 execution_certificates: _,
             } => {
                 // Check 1: receipt_root verification (synchronous).
@@ -643,11 +642,6 @@ where
                         .event_sender
                         .send(NodeInput::SyncBlockFetchFailed { height });
                 } else {
-                    // Receipts ride along inside `Block.certificates` (Arc<FinalizedWave>)
-                    // — no separate buffering needed. The sync peer's
-                    // get_block_for_sync rebuilt them via FinalizedWave::reconstruct.
-                    let _ = local_receipts;
-
                     let outputs = self
                         .sync_protocol
                         .handle(SyncInput::BlockResponseReceived { height, block });

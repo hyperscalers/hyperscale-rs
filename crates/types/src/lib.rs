@@ -83,7 +83,7 @@ pub use block::{
 pub use quorum_certificate::QuorumCertificate;
 pub use receipt::{
     ApplicationEvent, ExecutionMetadata, FeeSummary, GlobalReceipt, LocalExecutionEntry,
-    LocalReceipt, LocalReceiptEntry, LogLevel, ReceiptBundle, TransactionOutcome,
+    LocalReceipt, LogLevel, ReceiptBundle, TransactionOutcome,
 };
 pub use signer_bitfield::SignerBitfield;
 pub use state::{StateEntry, StateProvision};

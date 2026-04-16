@@ -3,8 +3,8 @@
 use crate::ProtocolEvent;
 use hyperscale_types::{
     Block, BlockHeight, Bls12381G1PublicKey, Bls12381G2Signature, CommittedBlockHeader,
-    ExecutionCertificate, FinalizedWave, Hash, LocalReceiptEntry, Provision, QuorumCertificate,
-    RoutableTransaction, ShardGroupId, ValidatorId,
+    ExecutionCertificate, FinalizedWave, Hash, Provision, QuorumCertificate, RoutableTransaction,
+    ShardGroupId, ValidatorId,
 };
 use std::sync::Arc;
 
@@ -51,11 +51,10 @@ pub enum NodeInput {
     SubmitTransaction { tx: Arc<RoutableTransaction> },
 
     /// Sync block response received from network callback.
+    /// `Block.certificates` carries `Arc<FinalizedWave>` with receipts inline.
     SyncBlockResponseReceived {
         height: u64,
         block: Box<Option<(Block, QuorumCertificate)>>,
-        /// Local receipts for the block's certificates (from sync peer).
-        local_receipts: Vec<LocalReceiptEntry>,
         /// Execution certificates produced by the serving shard.
         execution_certificates: Vec<ExecutionCertificate>,
     },
