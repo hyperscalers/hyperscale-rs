@@ -21,7 +21,7 @@ impl RocksDbStorage {
         // populates the JVT with initial Radix state at height 0 but with a non-zero root.
         // The height 0 case is handled correctly by the state machine.
         use hyperscale_storage::SubstateStore;
-        let jvt_block_height = self.jvt_version();
+        let jvt_block_height = self.jmt_version();
         let jvt_root = self.state_root_hash();
         let jvt_root_opt = Some(jvt_root);
 

@@ -1,28 +1,29 @@
-//! Verkle state tree — flat single-tree design.
+//! Binary Jellyfish Merkle Tree (Blake3) state tree — flat single-tree design.
 //!
-//! All substates across all entities and partitions live in a single JVT tree.
-//! Storage keys are BLAKE3-hashed to 32-byte JVT keys for optimal tree depth.
+//! All substates across all entities and partitions live in a single JMT.
+//! Storage keys are BLAKE3-hashed to 32-byte JMT keys for compact paths.
 //!
 //! # Key mapping
 //!
-//! `jvt_key = BLAKE3(entity_key || partition_num || sort_key)` → `[u8; 32]`
+//! `jmt_key = BLAKE3(entity_key || partition_num || sort_key)` → `[u8; 32]`
 //!
 //! # Value encoding
 //!
-//! JVT values are field elements (`value_to_field(raw_bytes)`). Raw substate
-//! bytes are stored separately in the versioned data store (MVCC), not in the tree.
+//! The tree stores per-value hashes (`BLAKE3(raw_value_bytes)`) as
+//! `ValueHash`. Raw substate bytes are stored separately in the versioned
+//! data store (MVCC), not in the tree.
 
 mod collected_writes;
 pub mod proofs;
 mod snapshot;
 
 pub use collected_writes::CollectedWrites;
-pub use snapshot::{JvtSnapshot, LeafSubstateKeyAssociation};
+pub use snapshot::{JmtSnapshot, LeafSubstateKeyAssociation};
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-/// Layered tree reader that overlays pending JVT snapshots on a base store.
+/// Layered tree reader that overlays pending JMT snapshots on a base store.
 ///
 /// Used during chained verification: block N+1's `prepare_block_commit` needs
 /// tree nodes from block N's verification, which hasn't committed yet. The
@@ -31,12 +32,12 @@ use std::sync::Arc;
 pub struct OverlayTreeReader<'a, S> {
     base: &'a S,
     /// Overlay nodes indexed by NodeKey for O(1) lookup.
-    nodes: HashMap<jvt::NodeKey, Arc<jvt::Node>>,
+    nodes: HashMap<jmt::NodeKey, Arc<jmt::Node>>,
 }
 
 impl<'a, S> OverlayTreeReader<'a, S> {
     /// Create a new OverlayTreeReader.
-    pub fn new(base: &'a S, snapshots: &[Arc<JvtSnapshot>]) -> Self {
+    pub fn new(base: &'a S, snapshots: &[Arc<JmtSnapshot>]) -> Self {
         let mut nodes = HashMap::new();
         for snapshot in snapshots.iter() {
             for (key, node) in &snapshot.nodes {
@@ -47,18 +48,18 @@ impl<'a, S> OverlayTreeReader<'a, S> {
     }
 }
 
-impl<S: jvt::TreeReader + Sync> jvt::TreeReader for OverlayTreeReader<'_, S> {
-    fn get_node(&self, key: &jvt::NodeKey) -> Option<Arc<jvt::Node>> {
+impl<S: jmt::TreeReader + Sync> jmt::TreeReader for OverlayTreeReader<'_, S> {
+    fn get_node(&self, key: &jmt::NodeKey) -> Option<Arc<jmt::Node>> {
         self.nodes
             .get(key)
             .cloned()
             .or_else(|| self.base.get_node(key))
     }
 
-    fn get_root_key(&self, version: u64) -> Option<jvt::NodeKey> {
+    fn get_root_key(&self, version: u64) -> Option<jmt::NodeKey> {
         // Check if any overlay snapshot wrote a root at this version.
         // Root keys follow the convention NodeKey::root(version).
-        let root_key = jvt::NodeKey::root(version);
+        let root_key = jmt::NodeKey::root(version);
         if self.nodes.contains_key(&root_key) {
             Some(root_key)
         } else {
@@ -67,25 +68,35 @@ impl<S: jvt::TreeReader + Sync> jvt::TreeReader for OverlayTreeReader<'_, S> {
     }
 }
 
+use hyperscale_jmt as jmt;
+use hyperscale_jmt::{Blake3Hasher, Tree};
 use hyperscale_types::Hash;
-use jellyfish_verkle_tree as jvt;
 use rayon::prelude::*;
 
-// Re-export JVT types used in public APIs (CollectedWrites, NodeCache, etc.)
-pub use jvt::Node as JvtNode;
-pub use jvt::NodeKey as JvtNodeKey;
+// Re-export JMT types used in public APIs (CollectedWrites, etc.)
+pub use jmt::Node as JmtNode;
+pub use jmt::NodeKey as JmtNodeKey;
 
-/// Hash a storage key to a 32-byte JVT key.
+/// The JMT configuration this backend uses: binary arity, Blake3 hasher.
+/// Centralizing as a type alias so callers don't repeat the parameters.
+pub type Jmt = Tree<Blake3Hasher, 1>;
+
+/// Hash a storage key to a 32-byte JMT key.
 ///
 /// Storage keys are variable-length (`entity_key || partition_num || sort_key`).
-/// BLAKE3 hashing produces a fixed 32-byte key for optimal JVT tree depth (~4 levels).
-pub fn hash_storage_key(storage_key: &[u8]) -> jvt::Key {
+/// BLAKE3 hashing produces a fixed 32-byte key for uniform path depth.
+pub fn hash_storage_key(storage_key: &[u8]) -> jmt::Key {
     blake3::hash(storage_key).into()
 }
 
-/// Returns `None` when the JVT is truly empty (height 0 with zero root),
+/// Hash a raw value to a 32-byte value hash stored in leaves.
+pub fn hash_value(value: &[u8]) -> jmt::ValueHash {
+    blake3::hash(value).into()
+}
+
+/// Returns `None` when the JMT is truly empty (height 0 with zero root),
 /// indicating no parent node exists. Otherwise returns `Some(block_height)`.
-pub fn jvt_parent_height(block_height: u64, root: Hash) -> Option<u64> {
+pub fn jmt_parent_height(block_height: u64, root: Hash) -> Option<u64> {
     if block_height == 0 && root == Hash::ZERO {
         None
     } else {
@@ -93,7 +104,7 @@ pub fn jvt_parent_height(block_height: u64, root: Hash) -> Option<u64> {
     }
 }
 
-/// Build a no-op JvtSnapshot for a block with no state changes (empty receipts).
+/// Build a no-op JmtSnapshot for a block with no state changes (empty receipts).
 ///
 /// The state root is unchanged (`parent_state_root`). We try to copy the
 /// parent's root node to the new version so the overlay chain stays intact.
@@ -109,18 +120,18 @@ pub fn jvt_parent_height(block_height: u64, root: Hash) -> Option<u64> {
 /// verification pipeline. For synced blocks, the QC signature attests
 /// to correctness — a QC-certified block with empty receipts is
 /// guaranteed to have `state_root == parent_state_root`.
-pub fn noop_jvt_snapshot<S: jvt::TreeReader>(
+pub fn noop_jmt_snapshot<S: jmt::TreeReader>(
     store: &S,
-    pending_snapshots: &[Arc<JvtSnapshot>],
+    pending_snapshots: &[Arc<JmtSnapshot>],
     parent_state_root: Hash,
     parent_block_height: u64,
     block_height: u64,
-) -> JvtSnapshot {
+) -> JmtSnapshot {
     let mut nodes = Vec::new();
 
     // Try to find the parent's root node so the version chain is unbroken.
-    if let Some(parent_ver) = jvt_parent_height(parent_block_height, parent_state_root) {
-        let root_key = jvt::NodeKey::root(parent_ver);
+    if let Some(parent_ver) = jmt_parent_height(parent_block_height, parent_state_root) {
+        let root_key = jmt::NodeKey::root(parent_ver);
 
         // Check pending snapshots first (overlay), then the base store.
         let root_node = pending_snapshots
@@ -134,11 +145,11 @@ pub fn noop_jvt_snapshot<S: jvt::TreeReader>(
             .or_else(|| store.get_node(&root_key));
 
         if let Some(node) = root_node {
-            nodes.push((jvt::NodeKey::root(block_height), node));
+            nodes.push((jmt::NodeKey::root(block_height), node));
         }
     }
 
-    JvtSnapshot {
+    JmtSnapshot {
         base_root: parent_state_root,
         base_version: parent_block_height,
         result_root: parent_state_root,
@@ -147,17 +158,6 @@ pub fn noop_jvt_snapshot<S: jvt::TreeReader>(
         stale_node_keys: Vec::new(),
         leaf_substate_associations: Vec::new(),
     }
-}
-
-/// Convert a JVT commitment to a Hash (for state root, value hashes).
-///
-/// Uses compressed serialization (32 bytes) for the consensus-visible identity.
-pub fn commitment_to_hash(c: jvt::Commitment) -> Hash {
-    use ark_serialize::CanonicalSerialize;
-    let mut buf = [0u8; 32];
-    c.0.serialize_compressed(&mut buf[..])
-        .expect("Bandersnatch point serialization should never fail");
-    Hash::from_hash_bytes(&buf)
 }
 
 /// Build a storage key from entity_key + partition_num + sort_key.
@@ -172,22 +172,20 @@ fn make_storage_key(entity_key: &[u8], partition_num: u8, sort_key: &[u8]) -> Ve
 /// Computes new state tree nodes for the given database updates, returning
 /// the new root hash and all collected writes.
 ///
-/// Takes any `jvt::TreeReader` — the caller is responsible for providing
-/// a reader appropriate to its storage backend (e.g. cache-backed for RocksDB,
-/// direct HashMap for in-memory). `put_at_version` is agnostic to caching
-/// and serialization.
+/// Takes any `jmt::TreeReader` — the caller provides a reader appropriate
+/// to its storage backend.
 ///
 /// `parent_version` is the version of the existing root (`None` for initial state).
 /// `new_version` is the version to stamp on new nodes (typically block height).
 ///
 /// `reset_old_keys` provides the storage keys that existed in Reset partitions
-/// before the reset. These are needed to generate JVT deletes because hashed keys
+/// before the reset. These are needed to generate JMT deletes because hashed keys
 /// prevent tree-based enumeration.
 ///
 /// Accepts multiple `DatabaseUpdates` slices — all are flattened directly
-/// into JVT work items without merging. Since transactions hold exclusive
+/// into JMT work items without merging. Since transactions hold exclusive
 /// state locks, there are no key conflicts between updates.
-pub fn put_at_version<S: jvt::TreeReader + Sync>(
+pub fn put_at_version<S: jmt::TreeReader + Sync>(
     store: &S,
     parent_version: Option<u64>,
     new_version: u64,
@@ -202,8 +200,7 @@ pub fn put_at_version<S: jvt::TreeReader + Sync>(
         "put_at_version: new_version ({new_version}) must be greater than parent_version ({parent_version:?})"
     );
 
-    // Flatten all database updates into (storage_key_bytes, jvt_value) work items,
-    // then parallel-hash and convert to JVT key-value pairs.
+    // Flatten all database updates into (storage_key_bytes, optional_value) work items.
     let mut work_items: Vec<(Vec<u8>, Option<&[u8]>)> = Vec::new();
 
     for database_updates in database_updates_list {
@@ -248,49 +245,45 @@ pub fn put_at_version<S: jvt::TreeReader + Sync>(
 
     if work_items.is_empty() {
         // No updates — carry the existing root forward to the new version.
-        // We must write a root node at new_version so the next block can find it.
         let mut collected = CollectedWrites::default();
         let root_hash = parent_version
             .and_then(|v| {
-                let root_key = jvt::NodeKey::root(v);
+                let root_key = jmt::NodeKey::root(v);
                 let root_node = store.get_node(&root_key)?;
-                let commitment = root_node.commitment();
-                if commitment == jvt::zero_commitment() {
+                let hash: [u8; 32] = root_node.hash::<Blake3Hasher>();
+                if hash == [0u8; 32] {
                     return None;
                 }
-                let new_root_key = jvt::NodeKey::root(new_version);
+                let new_root_key = jmt::NodeKey::root(new_version);
                 collected.nodes.push((new_root_key, root_node));
-                Some(commitment_to_hash(commitment))
+                Some(Hash::from_hash_bytes(&hash))
             })
             .unwrap_or(Hash::ZERO);
         return (root_hash, collected);
     }
 
-    // Parallel phase: BLAKE3 hash each storage key and convert values to field
-    // elements. Each item is independent — this parallelizes the most expensive
-    // per-entry work (two BLAKE3 hashes + field conversion for Set operations).
-    let mut updates: Vec<(jvt::Key, Option<jvt::Value>)> = work_items
+    // Parallel phase: BLAKE3 hash each storage key and value. Each item is
+    // independent — this parallelizes the per-entry hashing work.
+    let mut updates: Vec<(jmt::Key, Option<jmt::ValueHash>)> = work_items
         .par_iter()
         .map(|(storage_key, value_ref)| {
-            let jvt_key = hash_storage_key(storage_key);
-            let jvt_value = value_ref.map(jvt::commitment::value_to_field);
-            (jvt_key, jvt_value)
+            let jmt_key = hash_storage_key(storage_key);
+            let jmt_value = value_ref.map(hash_value);
+            (jmt_key, jmt_value)
         })
         .collect();
 
-    // Sort by key for the BTreeMap ordering that apply_updates expects.
-    // No dedup needed — state locking guarantees no key conflicts between
-    // transactions, so each key appears at most once.
     updates.par_sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
-    let updates_btree: BTreeMap<jvt::Key, Option<jvt::Value>> = updates.into_iter().collect();
+    let updates_btree: BTreeMap<jmt::Key, Option<jmt::ValueHash>> = updates.into_iter().collect();
 
-    let result = jvt::apply_updates(store, parent_version, new_version, updates_btree);
+    let result = Jmt::apply_updates(store, parent_version, new_version, updates_btree)
+        .expect("JMT apply_updates failed");
 
-    let root_hash = if result.root_commitment == jvt::zero_commitment() {
+    let root_hash = if result.root_hash == [0u8; 32] {
         Hash::ZERO
     } else {
-        commitment_to_hash(result.root_commitment)
+        Hash::from_hash_bytes(&result.root_hash)
     };
 
     let mut collected = CollectedWrites::default();

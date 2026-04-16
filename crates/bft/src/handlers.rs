@@ -278,10 +278,10 @@ pub fn verify_state_root<S: ChainWriter + SubstateStore>(
     expected_root: Hash,
     finalized_waves: &[Arc<FinalizedWave>],
     block_height: u64,
-    pending_snapshots: &[Arc<hyperscale_storage::JvtSnapshot>],
+    pending_snapshots: &[Arc<hyperscale_storage::JmtSnapshot>],
 ) -> StateRootResult<S::PreparedCommit> {
     // Use the stable parent_block_height from the verification pipeline, not
-    // storage.jvt_version() which is racy — by the time this runs on the
+    // storage.jmt_version() which is racy — by the time this runs on the
     // ConsensusCrypto pool, other blocks may have committed and advanced the
     // JVT past the parent version.
     let (computed_root, prepared) = storage.prepare_block_commit(
@@ -347,7 +347,7 @@ pub fn build_proposal<S: ChainWriter + SubstateStore>(
     provision_hashes: Vec<Hash>,
     parent_in_flight: u32,
     finalized_tx_count: u32,
-    pending_snapshots: &[Arc<hyperscale_storage::JvtSnapshot>],
+    pending_snapshots: &[Arc<hyperscale_storage::JmtSnapshot>],
 ) -> ProposalResult<S::PreparedCommit> {
     let (state_root, prepared) = storage.prepare_block_commit(
         parent_state_root,

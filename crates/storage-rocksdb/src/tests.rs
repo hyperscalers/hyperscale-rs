@@ -277,17 +277,17 @@ fn test_block_height_increments_on_commit() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
 
-    assert_eq!(storage.jvt_version(), 0);
+    assert_eq!(storage.jmt_version(), 0);
 
     storage
         .commit(&make_database_update(vec![1, 2, 3], 0, vec![10], vec![1]))
         .unwrap();
-    assert_eq!(storage.jvt_version(), 1);
+    assert_eq!(storage.jmt_version(), 1);
 
     storage
         .commit(&make_database_update(vec![4, 5, 6], 0, vec![20], vec![2]))
         .unwrap();
-    assert_eq!(storage.jvt_version(), 2);
+    assert_eq!(storage.jmt_version(), 2);
 }
 
 #[test]
@@ -374,7 +374,7 @@ fn test_commit_block_empty_certs() {
     let qc = make_test_qc(&block);
 
     storage.commit_block(&Arc::new(block), &Arc::new(qc));
-    assert_eq!(storage.jvt_version(), 1);
+    assert_eq!(storage.jmt_version(), 1);
 }
 
 #[test]
@@ -464,7 +464,7 @@ fn test_certificates_batch() {
 fn test_initial_block_height_is_zero() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
-    assert_eq!(storage.jvt_version(), 0);
+    assert_eq!(storage.jmt_version(), 0);
 }
 
 #[test]
@@ -487,7 +487,7 @@ fn test_state_root_deterministic() {
     s2.commit(&updates).unwrap();
 
     assert_eq!(s1.state_root_hash(), s2.state_root_hash());
-    assert_eq!(s1.jvt_version(), s2.jvt_version());
+    assert_eq!(s1.jmt_version(), s2.jmt_version());
 }
 
 #[test]
@@ -554,7 +554,7 @@ fn test_commit_certificate_via_commit_store() {
 
     storage.commit_certificate_with_writes(&cert, &updates);
 
-    assert_eq!(storage.jvt_version(), 0);
+    assert_eq!(storage.jmt_version(), 0);
     assert_eq!(storage.state_root_hash(), Hash::ZERO);
     assert!(storage.get_certificate(&cert.wave_id.hash()).is_some());
 }
@@ -566,7 +566,7 @@ fn test_empty_commit_still_advances_version() {
 
     let updates = hyperscale_storage::DatabaseUpdates::default();
     storage.commit(&updates).unwrap();
-    assert_eq!(storage.jvt_version(), 1);
+    assert_eq!(storage.jmt_version(), 1);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -587,13 +587,13 @@ fn test_substates_survive_reopen() {
         cert_hash = cert.wave_id.hash();
         storage.commit_certificate_with_writes(&cert, &updates);
         root_after_write = storage.state_root_hash();
-        version_after_write = storage.jvt_version();
+        version_after_write = storage.jmt_version();
     }
 
     {
         let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
 
-        assert_eq!(storage.jvt_version(), version_after_write);
+        assert_eq!(storage.jmt_version(), version_after_write);
         assert_eq!(storage.state_root_hash(), root_after_write);
 
         let cert = storage.get_certificate(&cert_hash);

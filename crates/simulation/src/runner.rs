@@ -391,7 +391,7 @@ impl SimulationRunner {
                         return;
                     }
                     let merged = wrapper.into_merged();
-                    storage.finalize_genesis_jvt(&merged);
+                    storage.finalize_genesis_jmt(&merged);
                 });
                 self.genesis_executed[node_idx] = true;
             }
@@ -455,7 +455,7 @@ impl SimulationRunner {
                         return;
                     }
                     let merged = wrapper.into_merged();
-                    storage.finalize_genesis_jvt(&merged);
+                    storage.finalize_genesis_jmt(&merged);
                 });
                 self.genesis_executed[node_idx] = true;
             }

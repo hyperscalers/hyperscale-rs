@@ -59,7 +59,7 @@ pub struct RocksDbConfig {
     ///
     /// Set to 0 for immediate deletion (no history retention).
     /// Defaults to 256.
-    pub jvt_history_length: u64,
+    pub jmt_history_length: u64,
 }
 
 impl Default for RocksDbConfig {
@@ -74,7 +74,7 @@ impl Default for RocksDbConfig {
             bytes_per_sync: 1024 * 1024, // 1MB
             keep_log_file_num: 10,
             column_families: ALL_COLUMN_FAMILIES.iter().map(|s| s.to_string()).collect(),
-            jvt_history_length: 256,
+            jmt_history_length: 256,
         }
     }
 }

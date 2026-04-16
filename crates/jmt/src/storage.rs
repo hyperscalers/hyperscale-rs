@@ -1,0 +1,153 @@
+//! Storage traits and reference in-memory backend.
+//!
+//! The tree is stateless — callers plug their own storage in by
+//! implementing [`TreeReader`] (required for reads and proofs) and
+//! [`TreeWriter`] (to persist [`TreeUpdateBatch`] results).
+//!
+//! A RocksDB backend should implement these against column families;
+//! the node-key encoding ([`NodeKey::encode`]) is LSM-friendly with
+//! version as the big-endian prefix.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use crate::node::{Node, NodeKey, StaleNodeIndex};
+use crate::tree::UpdateResult;
+
+// ============================================================
+// Traits
+// ============================================================
+
+/// Read-only storage interface. Proof generation, reads, and the internal
+/// walks performed by `apply_updates` all go through this trait.
+pub trait TreeReader {
+    /// Fetch a node by its key. Returns `None` if the node is absent
+    /// (valid for pruned or never-written paths).
+    fn get_node(&self, key: &NodeKey) -> Option<Arc<Node>>;
+
+    /// Look up the root key for a committed version. Returns `None` for
+    /// versions that were never committed or have been pruned.
+    fn get_root_key(&self, version: u64) -> Option<NodeKey>;
+}
+
+/// Write storage interface. `TreeUpdateBatch` fields are applied via
+/// these three methods.
+pub trait TreeWriter {
+    fn put_node(&mut self, key: NodeKey, node: Node);
+    fn set_root_key(&mut self, version: u64, key: NodeKey);
+    fn record_stale(&mut self, entry: StaleNodeIndex);
+}
+
+// ============================================================
+// MemoryStore — reference implementation
+// ============================================================
+
+/// In-memory storage backend. Useful for tests, simulation, and as a
+/// reference implementation.
+#[derive(Clone, Debug, Default)]
+pub struct MemoryStore {
+    nodes: HashMap<NodeKey, Arc<Node>>,
+    root_keys: HashMap<u64, NodeKey>,
+    stale_index: Vec<StaleNodeIndex>,
+}
+
+impl MemoryStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Apply an [`UpdateResult`] from [`Tree::apply_updates`](crate::Tree::apply_updates)
+    /// to this store. Persists new nodes, records stale entries, and
+    /// updates the root-key mapping.
+    pub fn apply(&mut self, result: &UpdateResult) {
+        for (nk, node) in &result.batch.new_nodes {
+            self.put_node(nk.clone(), node.clone());
+        }
+        for stale in &result.batch.stale_nodes {
+            self.record_stale(stale.clone());
+        }
+        if let Some((v, ref rk)) = result.batch.root_key {
+            self.set_root_key(v, rk.clone());
+        }
+    }
+
+    /// Prune all nodes that became stale at or before the given version.
+    /// After calling, reads at pruned versions may fail.
+    pub fn prune(&mut self, up_to_version: u64) {
+        let (to_remove, to_keep): (Vec<_>, Vec<_>) = self
+            .stale_index
+            .drain(..)
+            .partition(|e| e.stale_since_version <= up_to_version);
+        for entry in &to_remove {
+            self.nodes.remove(&entry.node_key);
+        }
+        self.stale_index = to_keep;
+    }
+
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    pub fn stale_count(&self) -> usize {
+        self.stale_index.len()
+    }
+
+    pub fn versions(&self) -> Vec<u64> {
+        let mut vs: Vec<u64> = self.root_keys.keys().copied().collect();
+        vs.sort();
+        vs
+    }
+
+    pub fn latest_version(&self) -> Option<u64> {
+        self.root_keys.keys().max().copied()
+    }
+
+    pub fn latest_root_key(&self) -> Option<NodeKey> {
+        let v = self.latest_version()?;
+        self.root_keys.get(&v).cloned()
+    }
+}
+
+impl TreeReader for MemoryStore {
+    fn get_node(&self, key: &NodeKey) -> Option<Arc<Node>> {
+        self.nodes.get(key).cloned()
+    }
+
+    fn get_root_key(&self, version: u64) -> Option<NodeKey> {
+        self.root_keys.get(&version).cloned()
+    }
+}
+
+impl TreeWriter for MemoryStore {
+    fn put_node(&mut self, key: NodeKey, node: Node) {
+        self.nodes.insert(key, Arc::new(node));
+    }
+
+    fn set_root_key(&mut self, version: u64, key: NodeKey) {
+        self.root_keys.insert(version, key);
+    }
+
+    fn record_stale(&mut self, entry: StaleNodeIndex) {
+        self.stale_index.push(entry);
+    }
+}
+
+// Forward trait impls through Arc/Box so users can hand a shared store
+// to the stateless functions without needing to call as_ref() everywhere.
+impl<T: TreeReader + ?Sized> TreeReader for Arc<T> {
+    fn get_node(&self, key: &NodeKey) -> Option<Arc<Node>> {
+        (**self).get_node(key)
+    }
+    fn get_root_key(&self, version: u64) -> Option<NodeKey> {
+        (**self).get_root_key(version)
+    }
+}
+
+impl<T: TreeReader + ?Sized> TreeReader for &T {
+    fn get_node(&self, key: &NodeKey) -> Option<Arc<Node>> {
+        (**self).get_node(key)
+    }
+    fn get_root_key(&self, version: u64) -> Option<NodeKey> {
+        (**self).get_root_key(version)
+    }
+}

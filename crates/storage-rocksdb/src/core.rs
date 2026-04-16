@@ -5,30 +5,31 @@
 //! All operations are synchronous blocking I/O. Callers in async contexts
 //! should use `spawn_blocking` if needed to avoid blocking the runtime.
 //!
-//! # JVT Integration
+//! # JMT Integration
 //!
-//! Uses Jellyfish Verkle Tree (JVT) for cryptographic state commitment.
-//! JVT data is stored in dedicated column families (`jmt_nodes`, `jmt_meta`).
-//! On each commit, the JVT is updated and a new state root hash is computed.
+//! Uses a binary Jellyfish Merkle Tree (Blake3) for cryptographic state
+//! commitment. JMT data is stored in dedicated column families
+//! (`jmt_nodes`, `stale_jmt_nodes`) plus metadata under `jmt:metadata`.
+//! On each commit, the JMT is updated and a new state root hash is
+//! computed.
 
 use crate::column_families::{CfHandles, HOT_WRITE_COLUMN_FAMILIES};
 use crate::config::RocksDbConfig;
-use crate::jvt_snapshot_store::SnapshotTreeStore;
-use crate::jvt_stored::{StoredNode, StoredNodeKey, VersionedStoredNode};
-use crate::node_cache::NodeCache;
+use crate::jmt_snapshot_store::SnapshotTreeStore;
+use crate::jmt_stored::{StoredNode, StoredNodeKey, VersionedStoredNode};
 use crate::typed_cf::{DbCodec, TypedCf};
 
 /// Sort keys deleted by partition Reset operations, keyed by `(entity_key, partition_num)`.
-/// Passed to `put_at_version` so the JVT can reconstruct full storage keys and
+/// Passed to `put_at_version` so the JMT can reconstruct full storage keys and
 /// generate deletes for the hashed keys.
 pub(crate) type ResetOldKeys = std::collections::HashMap<(Vec<u8>, u8), Vec<DbSortKey>>;
 
+use hyperscale_jmt as jmt;
 use hyperscale_metrics as metrics;
 use hyperscale_storage::{
-    DatabaseUpdate, DatabaseUpdates, DbPartitionKey, DbSortKey, DbSubstateValue, JvtSnapshot,
+    DatabaseUpdate, DatabaseUpdates, DbPartitionKey, DbSortKey, DbSubstateValue, JmtSnapshot,
     PartitionDatabaseUpdates, PartitionEntry, StateRootHash, SubstateDatabase,
 };
-use jellyfish_verkle_tree as jvt;
 use rocksdb::{ColumnFamilyDescriptor, Options, WriteBatch, DB};
 use sbor::prelude::*;
 use std::path::Path;
@@ -43,30 +44,24 @@ use tracing::{instrument, Level};
 /// - LZ4 compression for disk efficiency
 /// - Block cache for read performance
 /// - Bloom filters for key existence checks
-/// - JVT for cryptographic state commitment
+/// - Binary Blake3 JMT for cryptographic state commitment
 ///
 /// Implements Radix's `SubstateDatabase` directly, plus our `SubstateStore` extension
-/// for snapshots, node listing, and JVT state roots.
+/// for snapshots, node listing, and JMT state roots.
 ///
-/// JVT tree nodes are persisted in the `jmt_nodes` column family. JVT metadata
-/// (version and root hash) is in the default CF under well-known keys and read
+/// JMT tree nodes are persisted in the `jmt_nodes` column family. JMT metadata
+/// (version and root hash) is in the default CF under `jmt:metadata` and read
 /// directly from RocksDB on demand — always hot in the memtable since they're
 /// written on every commit.
 pub struct RocksDbStorage {
     pub(crate) db: Arc<DB>,
 
-    /// Serializes JVT-mutating commits to prevent interleaved read-modify-write
-    /// sequences (e.g., `read_jvt_metadata` + `WriteBatch` write).
+    /// Serializes JMT-mutating commits to prevent interleaved read-modify-write
+    /// sequences (e.g., `read_jmt_metadata` + `WriteBatch` write).
     pub(crate) commit_lock: Mutex<()>,
 
-    /// Number of block heights of JVT history to retain before garbage collection.
-    pub(crate) jvt_history_length: u64,
-
-    /// Persistent cache of hydrated JVT tree nodes. Eliminates the expensive
-    /// `StoredNode::to_jvt()` conversion on repeated proof generations.
-    /// Populated eagerly during `put_at_version` (commit path) and lazily
-    /// during proof prefetch (read path).
-    pub(crate) node_cache: NodeCache,
+    /// Number of block heights of JMT history to retain before garbage collection.
+    pub(crate) jmt_history_length: u64,
 }
 
 /// Error type for storage operations.
@@ -181,20 +176,19 @@ impl RocksDbStorage {
         Ok(Self {
             db: Arc::new(db),
             commit_lock: Mutex::new(()),
-            jvt_history_length: config.jvt_history_length,
-            node_cache: NodeCache::new(),
+            jmt_history_length: config.jmt_history_length,
         })
     }
 
-    /// Get the configured JVT history retention length (in block heights).
-    pub fn jvt_history_length(&self) -> u64 {
-        self.jvt_history_length
+    /// Get the configured JMT history retention length (in block heights).
+    pub fn jmt_history_length(&self) -> u64 {
+        self.jmt_history_length
     }
 
     /// Resolve all column family handles from the database.
     ///
     /// This is cheap (HashMap lookups only, ~10ns per CF) and provides typed
-    /// access to all 12 column families without repeating
+    /// access to all column families without repeating
     /// `.cf_handle(NAME).expect(...)` at each call site.
     pub(crate) fn cf(&self) -> CfHandles<'_> {
         CfHandles::resolve(&self.db)
@@ -263,35 +257,35 @@ impl RocksDbStorage {
             .expect("BFT CRITICAL: write failed");
     }
 
-    /// Read JVT version and root hash directly from RocksDB.
+    /// Read JMT version and root hash directly from RocksDB.
     ///
     /// These are stored as a single 40-byte value under `jmt:metadata`:
     /// `[version_BE_8B][root_hash_32B]`. Always hot in the memtable since
     /// they're written on every commit.
-    pub(crate) fn read_jvt_metadata(&self) -> (u64, StateRootHash) {
-        crate::metadata::read_jvt_metadata(&*self.db)
+    pub(crate) fn read_jmt_metadata(&self) -> (u64, StateRootHash) {
+        crate::metadata::read_jmt_metadata(&*self.db)
     }
 
-    /// Append JVT data from a snapshot to a WriteBatch.
+    /// Append JMT data from a snapshot to a WriteBatch.
     ///
-    /// Writes JVT nodes, stale tree parts (for deferred GC), historical
-    /// substate associations (if enabled), and JVT metadata (version + root hash).
+    /// Writes JMT nodes, stale tree parts (for deferred GC), historical
+    /// substate associations (if enabled), and JMT metadata (version + root hash).
     ///
-    /// This is the write-side complement to `read_jvt_metadata`.
-    pub(crate) fn append_jvt_to_batch(
+    /// This is the write-side complement to `read_jmt_metadata`.
+    pub(crate) fn append_jmt_to_batch(
         &self,
         batch: &mut WriteBatch,
-        snapshot: &JvtSnapshot,
+        snapshot: &JmtSnapshot,
         new_version: u64,
     ) {
-        // JVT nodes — serialize hydrated nodes to stored form at write time.
+        // JMT nodes — serialize hydrated nodes to stored form at write time.
         let cf = self.cf();
-        for (jvt_key, jvt_node) in &snapshot.nodes {
-            let stored_key = StoredNodeKey::from_jvt(jvt_key);
-            let stored_node = StoredNode::from_jvt(jvt_node);
-            crate::typed_cf::batch_put::<crate::column_families::JvtNodesCf>(
+        for (jmt_key, jmt_node) in &snapshot.nodes {
+            let stored_key = StoredNodeKey::from_jmt(jmt_key);
+            let stored_node = StoredNode::from_jmt(jmt_node);
+            crate::typed_cf::batch_put::<crate::column_families::JmtNodesCf>(
                 batch,
-                crate::column_families::JvtNodesCf::handle(&cf),
+                crate::column_families::JmtNodesCf::handle(&cf),
                 &stored_key,
                 &VersionedStoredNode::from_latest(stored_node),
             );
@@ -300,25 +294,25 @@ impl RocksDbStorage {
         // Stale nodes for deferred GC — keyed by the version at which they became stale.
         if !snapshot.stale_node_keys.is_empty() {
             // Wrap keys as StaleTreePart::Node for SBOR serialization.
-            let stale_parts: Vec<crate::jvt_stored::StaleTreePart> = snapshot
+            let stale_parts: Vec<crate::jmt_stored::StaleTreePart> = snapshot
                 .stale_node_keys
                 .iter()
-                .map(|k| crate::jvt_stored::StaleTreePart::Node(StoredNodeKey::from_jvt(k)))
+                .map(|k| crate::jmt_stored::StaleTreePart::Node(StoredNodeKey::from_jmt(k)))
                 .collect();
-            crate::typed_cf::batch_put::<crate::column_families::StaleJvtNodesCf>(
+            crate::typed_cf::batch_put::<crate::column_families::StaleJmtNodesCf>(
                 batch,
-                crate::column_families::StaleJvtNodesCf::handle(&cf),
+                crate::column_families::StaleJmtNodesCf::handle(&cf),
                 &new_version,
                 &stale_parts,
             );
         }
 
-        // JVT metadata — single key, atomic read.
-        crate::metadata::write_jvt_metadata(batch, new_version, snapshot.result_root);
+        // JMT metadata — single key, atomic read.
+        crate::metadata::write_jmt_metadata(batch, new_version, snapshot.result_root);
     }
 
     /// Append consensus metadata (committed_height, committed_hash, committed_qc)
-    /// to a `WriteBatch` so it is persisted atomically with JVT + substate data.
+    /// to a `WriteBatch` so it is persisted atomically with JMT + substate data.
     pub(crate) fn append_consensus_to_batch(
         batch: &mut WriteBatch,
         block: &hyperscale_types::Block,
@@ -336,7 +330,7 @@ impl RocksDbStorage {
     ///
     /// Returns `(batch, reset_old_keys)` where `reset_old_keys` maps
     /// `(entity_key, partition_num)` to the old storage keys that were deleted
-    /// by Reset partitions (needed for JVT delete generation).
+    /// by Reset partitions (needed for JMT delete generation).
     pub(crate) fn build_substate_write_batch(
         &self,
         updates: &DatabaseUpdates,
@@ -438,43 +432,43 @@ impl RocksDbStorage {
         (batch, reset_old_keys)
     }
 
-    /// Write only substate data (no JVT computation).
+    /// Write only substate data (no JMT computation).
     ///
     /// Used during genesis bootstrap so each intermediate `commit()` call from the
-    /// Radix Engine writes substates without computing a JVT version.
-    /// After all genesis commits complete, [`finalize_genesis_jvt`] computes the
-    /// JVT once at version 0.
+    /// Radix Engine writes substates without computing a JMT version.
+    /// After all genesis commits complete, [`finalize_genesis_jmt`] computes the
+    /// JMT once at version 0.
     pub fn commit_substates_only(&self, updates: &DatabaseUpdates) {
         // Genesis: version 0
         let (batch, _) = self.build_substate_write_batch(updates, Some(0));
 
-        // Write substates only — no JVT, no sync (genesis isn't durability-critical).
+        // Write substates only — no JMT, no sync (genesis isn't durability-critical).
         self.db
             .write(batch)
             .expect("genesis substate-only commit failed");
     }
 
-    /// Compute the JVT once at version 0 from the merged genesis updates.
+    /// Compute the JMT once at version 0 from the merged genesis updates.
     ///
     /// Called after all genesis bootstrap commits are complete. This avoids
-    /// computing intermediate JVT versions during genesis (which would collide
+    /// computing intermediate JMT versions during genesis (which would collide
     /// with block 1's version).
     ///
     /// # Returns
-    /// The genesis state root hash (JVT root at version 0).
-    pub fn finalize_genesis_jvt(&self, merged: &DatabaseUpdates) -> StateRootHash {
+    /// The genesis state root hash (JMT root at version 0).
+    pub fn finalize_genesis_jmt(&self, merged: &DatabaseUpdates) -> StateRootHash {
         let _commit_guard = self.commit_lock.lock().unwrap();
 
-        // Guard: finalize_genesis_jvt must only be called once, on an uninitialized JVT.
-        let (current_version, current_root) = self.read_jvt_metadata();
+        // Guard: finalize_genesis_jmt must only be called once, on an uninitialized JMT.
+        let (current_version, current_root) = self.read_jmt_metadata();
         assert!(
             current_version == 0 && current_root == StateRootHash::ZERO,
-            "finalize_genesis_jvt called but JVT already initialized (version={current_version})"
+            "finalize_genesis_jmt called but JMT already initialized (version={current_version})"
         );
 
-        let snapshot_store = SnapshotTreeStore::new(&self.db, &self.node_cache);
+        let snapshot_store = SnapshotTreeStore::new(&self.db);
 
-        // parent=None, version=0: genesis is the first JVT state.
+        // parent=None, version=0: genesis is the first JMT state.
         let (root, collected) = hyperscale_storage::tree::put_at_version(
             &snapshot_store,
             None,
@@ -482,17 +476,15 @@ impl RocksDbStorage {
             &[merged],
             &Default::default(),
         );
-        let jvt_snapshot =
-            JvtSnapshot::from_collected_writes(collected, StateRootHash::ZERO, 0, root, 0);
+        let jmt_snapshot =
+            JmtSnapshot::from_collected_writes(collected, StateRootHash::ZERO, 0, root, 0);
 
         let mut batch = WriteBatch::default();
-        self.append_jvt_to_batch(&mut batch, &jvt_snapshot, 0);
+        self.append_jmt_to_batch(&mut batch, &jmt_snapshot, 0);
 
         self.db
             .write(batch)
-            .expect("genesis JVT finalization failed");
-
-        self.node_cache.populate(&jvt_snapshot.nodes);
+            .expect("genesis JMT finalization failed");
 
         root
     }
@@ -554,32 +546,18 @@ impl SubstateDatabase for RocksDbStorage {
     }
 }
 
-impl jvt::TreeReader for RocksDbStorage {
-    fn get_node(&self, key: &jvt::NodeKey) -> Option<Arc<jvt::Node>> {
-        // Fast path: serve from in-memory cache.
-        if let Some(node) = self.node_cache.get(key) {
-            return Some(node);
-        }
-        // Slow path: storage read + deserialize.
-        let stored_key = StoredNodeKey::from_jvt(key);
-        let node = self
-            .cf_get::<crate::column_families::JvtNodesCf>(&stored_key)
-            .map(|v| Arc::new(v.into_latest().to_jvt()));
-        // Populate cache on miss so subsequent reads benefit.
-        if let Some(ref n) = node {
-            self.node_cache.insert(key.clone(), Arc::clone(n));
-        }
-        node
+impl jmt::TreeReader for RocksDbStorage {
+    fn get_node(&self, key: &jmt::NodeKey) -> Option<Arc<jmt::Node>> {
+        let stored_key = StoredNodeKey::from_jmt(key);
+        self.cf_get::<crate::column_families::JmtNodesCf>(&stored_key)
+            .map(|v| Arc::new(v.into_latest().to_jmt()))
     }
 
-    fn get_root_key(&self, version: u64) -> Option<jvt::NodeKey> {
-        let root = jvt::NodeKey::root(version);
-        if self.node_cache.get(&root).is_some() {
-            return Some(root);
-        }
-        let stored_key = StoredNodeKey::from_jvt(&root);
+    fn get_root_key(&self, version: u64) -> Option<jmt::NodeKey> {
+        let root = jmt::NodeKey::root(version);
+        let stored_key = StoredNodeKey::from_jmt(&root);
         if self
-            .cf_get::<crate::column_families::JvtNodesCf>(&stored_key)
+            .cf_get::<crate::column_families::JmtNodesCf>(&stored_key)
             .is_some()
         {
             Some(root)
@@ -589,11 +567,11 @@ impl jvt::TreeReader for RocksDbStorage {
     }
 }
 
-/// Test-only methods with auto-incrementing JVT version logic.
+/// Test-only methods with auto-incrementing JMT version logic.
 /// Production uses `commit_block` / `commit_prepared_block` instead.
 #[cfg(test)]
 impl RocksDbStorage {
-    /// Test helper: commits database updates with auto-incrementing JVT version.
+    /// Test helper: commits database updates with auto-incrementing JMT version.
     /// Not used in production (use commit_block instead).
     #[instrument(level = Level::DEBUG, skip_all, fields(
         node_count = updates.node_updates.len(),
@@ -604,13 +582,13 @@ impl RocksDbStorage {
 
         let start = Instant::now();
 
-        // Compute JVT updates using a snapshot-based store for isolation
-        let snapshot_store = SnapshotTreeStore::new(&self.db, &self.node_cache);
-        let (base_version, base_root) = snapshot_store.read_jvt_metadata();
+        // Compute JMT updates using a snapshot-based store for isolation
+        let snapshot_store = SnapshotTreeStore::new(&self.db);
+        let (base_version, base_root) = snapshot_store.read_jmt_metadata();
 
         // Version 0 with a non-zero root means genesis has been computed at version 0.
-        // Only treat as "no parent" when the JVT is truly empty.
-        let parent_version = hyperscale_storage::tree::jvt_parent_height(base_version, base_root);
+        // Only treat as "no parent" when the JMT is truly empty.
+        let parent_version = hyperscale_storage::tree::jmt_parent_height(base_version, base_root);
         let new_version = base_version + 1;
 
         let (mut batch, reset_old_keys) =
@@ -623,7 +601,7 @@ impl RocksDbStorage {
             &[updates],
             &reset_old_keys,
         );
-        let jvt_snapshot = JvtSnapshot::from_collected_writes(
+        let jmt_snapshot = JmtSnapshot::from_collected_writes(
             collected,
             base_root,
             base_version,
@@ -631,13 +609,11 @@ impl RocksDbStorage {
             new_version,
         );
 
-        self.append_jvt_to_batch(&mut batch, &jvt_snapshot, new_version);
+        self.append_jmt_to_batch(&mut batch, &jmt_snapshot, new_version);
 
         self.db
             .write(batch)
             .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
-
-        self.node_cache.populate(&jvt_snapshot.nodes);
 
         let elapsed = start.elapsed();
         metrics::record_storage_write(elapsed.as_secs_f64());

@@ -133,7 +133,7 @@ pub(crate) fn parent_hash_for(action: &Action) -> Option<Hash> {
 /// peers (network-specific).
 #[allow(clippy::too_many_lines)]
 pub(crate) fn handle_delegated_action<
-    S: ChainWriter + SubstateStore + ChainReader + hyperscale_storage::JvtTreeReader + Sync,
+    S: ChainWriter + SubstateStore + ChainReader + hyperscale_storage::JmtTreeReader + Sync,
     E: Engine,
 >(
     action: Action,
@@ -731,7 +731,7 @@ fn fetch_entries_for_requests<S: ChainWriter + SubstateStore + ChainReader, E: E
 
 /// Group fetched entries by target shard and generate verkle proofs per shard.
 fn build_provision_batches<
-    S: ChainWriter + SubstateStore + ChainReader + hyperscale_storage::JvtTreeReader + Sync,
+    S: ChainWriter + SubstateStore + ChainReader + hyperscale_storage::JmtTreeReader + Sync,
     E: Engine,
 >(
     ctx: &ActionContext<'_, S, E>,
@@ -769,7 +769,7 @@ fn build_provision_batches<
 
         let proof = match ctx
             .view
-            .generate_verkle_proofs_overlay(&shard_keys, block_height.0)
+            .generate_merkle_proofs_overlay(&shard_keys, block_height.0)
         {
             Some(p) => p,
             None => {
@@ -778,7 +778,7 @@ fn build_provision_batches<
                     block_height = block_height.0,
                     target_shard = shard.0,
                     key_count = shard_keys.len(),
-                    "generate_verkle_proofs returned None — JVT version unavailable"
+                    "generate_merkle_proofs returned None — JVT version unavailable"
                 );
                 continue;
             }

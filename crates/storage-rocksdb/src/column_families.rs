@@ -5,7 +5,7 @@
 
 use crate::typed_cf::*;
 
-use crate::jvt_stored::{StoredNodeKey, VersionedStoredNode};
+use crate::jmt_stored::{StoredNodeKey, VersionedStoredNode};
 use hyperscale_types::{
     BlockMetadata, ExecutionCertificate, ExecutionMetadata, Hash, LocalReceipt,
     RoutableTransaction, WaveCertificate,
@@ -13,7 +13,7 @@ use hyperscale_types::{
 
 // ─── CF name constants ───────────────────────────────────────────────────────
 
-/// Column family name for the default CF (chain metadata, JVT metadata).
+/// Column family name for the default CF (chain metadata, JMT metadata).
 pub(crate) const DEFAULT_CF: &str = "default";
 
 /// Column family name for substate data.
@@ -28,16 +28,14 @@ pub(crate) const TRANSACTIONS_CF: &str = "transactions";
 /// Column family name for wave certificates keyed by hash.
 pub(crate) const CERTIFICATES_CF: &str = "certificates";
 
-/// Column family name for JVT tree nodes.
-/// The string value remains "jmt_nodes" for backward compatibility with existing
-/// RocksDB databases created before the rename to JVT.
-pub(crate) const JVT_NODES_CF: &str = "jmt_nodes";
+/// Column family name for JMT tree nodes.
+pub(crate) const JMT_NODES_CF: &str = "jmt_nodes";
 
-/// Column family for stale JVT nodes pending garbage collection.
+/// Column family for stale JMT nodes pending garbage collection.
 /// Key: `version_BE_8B` (the version at which nodes became stale).
 /// Value: SBOR-encoded `Vec<StaleTreePart>`.
-/// GC deletes entries older than `current_version - jvt_history_length`.
-pub(crate) const STALE_JVT_NODES_CF: &str = "stale_jvt_nodes";
+/// GC deletes entries older than `current_version - jmt_history_length`.
+pub(crate) const STALE_JMT_NODES_CF: &str = "stale_jmt_nodes";
 
 /// Column family for MVCC versioned substates.
 /// Key: `storage_key_bytes ++ version_BE_8B`, Value: SBOR-encoded substate bytes.
@@ -58,13 +56,13 @@ pub(crate) const EXECUTION_CERTS_CF: &str = "execution_certs";
 pub(crate) const EXECUTION_CERTS_BY_HEIGHT_CF: &str = "execution_certs_by_height";
 
 // Default-CF metadata keys are defined as MetadataEntry types in typed_cf.rs.
-// See CommittedHeightEntry, CommittedHashEntry, CommittedQcEntry, JvtMetadataEntry.
+// See CommittedHeightEntry, CommittedHashEntry, CommittedQcEntry, JmtMetadataEntry.
 
 /// CFs with high write throughput — get larger write buffers and tiered compression.
-/// State and JVT nodes are updated on every block commit; versioned substates
+/// State and JMT nodes are updated on every block commit; versioned substates
 /// mirror state writes for MVCC.
 pub(crate) const HOT_WRITE_COLUMN_FAMILIES: &[&str] =
-    &[STATE_CF, JVT_NODES_CF, VERSIONED_SUBSTATES_CF];
+    &[STATE_CF, JMT_NODES_CF, VERSIONED_SUBSTATES_CF];
 
 /// All column families used by the storage layer.
 pub(crate) const ALL_COLUMN_FAMILIES: &[&str] = &[
@@ -73,8 +71,8 @@ pub(crate) const ALL_COLUMN_FAMILIES: &[&str] = &[
     TRANSACTIONS_CF,
     STATE_CF,
     CERTIFICATES_CF,
-    JVT_NODES_CF,
-    STALE_JVT_NODES_CF,
+    JMT_NODES_CF,
+    STALE_JMT_NODES_CF,
     VERSIONED_SUBSTATES_CF,
     LOCAL_RECEIPTS_CF,
     EXECUTION_OUTPUTS_CF,
@@ -95,8 +93,8 @@ pub(crate) struct CfHandles<'a> {
     blocks: &'a rocksdb::ColumnFamily,
     transactions: &'a rocksdb::ColumnFamily,
     certificates: &'a rocksdb::ColumnFamily,
-    jvt_nodes: &'a rocksdb::ColumnFamily,
-    stale_jvt_nodes: &'a rocksdb::ColumnFamily,
+    jmt_nodes: &'a rocksdb::ColumnFamily,
+    stale_jmt_nodes: &'a rocksdb::ColumnFamily,
     versioned_substates: &'a rocksdb::ColumnFamily,
     local_receipts: &'a rocksdb::ColumnFamily,
     execution_outputs: &'a rocksdb::ColumnFamily,
@@ -119,8 +117,8 @@ impl<'a> CfHandles<'a> {
             blocks: resolve(BLOCKS_CF),
             transactions: resolve(TRANSACTIONS_CF),
             certificates: resolve(CERTIFICATES_CF),
-            jvt_nodes: resolve(JVT_NODES_CF),
-            stale_jvt_nodes: resolve(STALE_JVT_NODES_CF),
+            jmt_nodes: resolve(JMT_NODES_CF),
+            stale_jmt_nodes: resolve(STALE_JMT_NODES_CF),
             versioned_substates: resolve(VERSIONED_SUBSTATES_CF),
             local_receipts: resolve(LOCAL_RECEIPTS_CF),
             execution_outputs: resolve(EXECUTION_OUTPUTS_CF),
@@ -170,29 +168,29 @@ impl TypedCf for CertificatesCf {
     }
 }
 
-// JVT
+// JMT
 
-pub(crate) struct JvtNodesCf;
-impl TypedCf for JvtNodesCf {
-    const NAME: &'static str = JVT_NODES_CF;
+pub(crate) struct JmtNodesCf;
+impl TypedCf for JmtNodesCf {
+    const NAME: &'static str = JMT_NODES_CF;
     type Key = StoredNodeKey;
     type Value = VersionedStoredNode;
-    type KeyCodec = JvtKeyCodec;
+    type KeyCodec = JmtKeyCodec;
     type ValueCodec = SborCodec<VersionedStoredNode>;
     fn handle<'a>(cf: &CfHandles<'a>) -> &'a rocksdb::ColumnFamily {
-        cf.jvt_nodes
+        cf.jmt_nodes
     }
 }
 
-pub(crate) struct StaleJvtNodesCf;
-impl TypedCf for StaleJvtNodesCf {
-    const NAME: &'static str = STALE_JVT_NODES_CF;
+pub(crate) struct StaleJmtNodesCf;
+impl TypedCf for StaleJmtNodesCf {
+    const NAME: &'static str = STALE_JMT_NODES_CF;
     type Key = u64; // version at which nodes became stale
-    type Value = Vec<crate::jvt_stored::StaleTreePart>;
+    type Value = Vec<crate::jmt_stored::StaleTreePart>;
     type KeyCodec = BeU64Codec;
-    type ValueCodec = SborCodec<Vec<crate::jvt_stored::StaleTreePart>>;
+    type ValueCodec = SborCodec<Vec<crate::jmt_stored::StaleTreePart>>;
     fn handle<'a>(cf: &CfHandles<'a>) -> &'a rocksdb::ColumnFamily {
-        cf.stale_jvt_nodes
+        cf.stale_jmt_nodes
     }
 }
 

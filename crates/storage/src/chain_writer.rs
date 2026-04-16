@@ -4,7 +4,7 @@
 //! `prepare_block_commit` returns an opaque `PreparedCommit` handle that
 //! carries precomputed work; `commit_prepared_block` applies it efficiently.
 
-use crate::JvtSnapshot;
+use crate::JmtSnapshot;
 use hyperscale_types::{Block, FinalizedWave, Hash, QuorumCertificate};
 use std::sync::Arc;
 
@@ -24,24 +24,24 @@ use std::sync::Arc;
 pub trait ChainWriter: Send + Sync + 'static {
     /// Opaque handle carrying precomputed commit work.
     ///
-    /// For RocksDB this contains a `WriteBatch` + `JvtSnapshot`.
-    /// For SimStorage this contains a `JvtSnapshot` + pre-applied state.
+    /// For RocksDB this contains a `WriteBatch` + `JmtSnapshot`.
+    /// For SimStorage this contains a `JmtSnapshot` + pre-applied state.
     type PreparedCommit: Send + 'static;
 
     /// Compute speculative state root and return precomputed commit work.
     ///
     /// Extracts and merges `DatabaseUpdates` from each finalized wave's receipts
-    /// internally, then computes the speculative JVT root.
+    /// internally, then computes the speculative JMT root.
     ///
     /// `parent_block_height` is the height of the parent block whose state we
-    /// build on. Used as the JVT parent version for `put_at_version`. This
+    /// build on. Used as the JMT parent version for `put_at_version`. This
     /// must be a committed height or have its tree nodes provided via
     /// `pending_snapshots`.
     ///
-    /// `block_height` is the height of the block being prepared (used as JVT
+    /// `block_height` is the height of the block being prepared (used as JMT
     /// new version).
     ///
-    /// `pending_snapshots` contains JVT snapshots from prior verifications
+    /// `pending_snapshots` contains JMT snapshots from prior verifications
     /// that haven't been committed yet. Their tree nodes are overlaid on the
     /// base store so chained verifications can find parent nodes.
     ///
@@ -52,12 +52,12 @@ pub trait ChainWriter: Send + Sync + 'static {
         parent_block_height: u64,
         finalized_waves: &[Arc<FinalizedWave>],
         block_height: u64,
-        pending_snapshots: &[Arc<JvtSnapshot>],
+        pending_snapshots: &[Arc<JmtSnapshot>],
     ) -> (Hash, Self::PreparedCommit);
 
     /// Commit one or more blocks using precomputed work from `prepare_block_commit`.
     ///
-    /// This is the fast path: applies cached `WriteBatch`/`JvtSnapshot` handles
+    /// This is the fast path: applies cached `WriteBatch`/`JmtSnapshot` handles
     /// directly. When multiple blocks are provided, the implementation may
     /// batch I/O (e.g. deferring fsync until the final block) to amortize
     /// the per-block sync cost.
@@ -81,23 +81,16 @@ pub trait ChainWriter: Send + Sync + 'static {
     /// applicable).
     fn commit_block(&self, block: &Arc<Block>, qc: &Arc<QuorumCertificate>) -> Hash;
 
-    /// Extract the JVT snapshot from a prepared commit.
+    /// Extract the JMT snapshot from a prepared commit.
     ///
     /// Used by the action handler to collect pending tree nodes from prior
     /// verifications when dispatching chained `VerifyStateRoot` actions.
-    fn jvt_snapshot(prepared: &Self::PreparedCommit) -> &JvtSnapshot;
+    fn jmt_snapshot(prepared: &Self::PreparedCommit) -> &JmtSnapshot;
 
     /// Memory usage of storage caches in bytes: `(block_cache, memtable)`.
     ///
     /// Returns `(0, 0)` by default. Overridden by RocksDB to report actual usage.
     fn memory_usage_bytes(&self) -> (u64, u64) {
         (0, 0)
-    }
-
-    /// Number of entries in the JVT node cache.
-    ///
-    /// Returns `0` by default. Overridden by implementations with a node cache.
-    fn node_cache_len(&self) -> usize {
-        0
     }
 }

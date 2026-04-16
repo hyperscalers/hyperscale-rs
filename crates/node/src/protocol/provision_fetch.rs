@@ -414,7 +414,7 @@ pub fn serve_provision_request(
         }
     };
 
-    let jvt_version = block.header.height.0;
+    let jmt_version = block.header.height.0;
 
     let all_txs = block.transactions.iter();
 
@@ -453,12 +453,12 @@ pub fn serve_provision_request(
         }
 
         let entries =
-            match hyperscale_engine::fetch_state_entries(storage, &owned_nodes, jvt_version) {
+            match hyperscale_engine::fetch_state_entries(storage, &owned_nodes, jmt_version) {
                 Some(entries) => entries,
                 None => {
                     warn!(
                         block_height = req.block_height.0,
-                        jvt_version, "Provision request: historical JVT version unavailable"
+                        jmt_version, "Provision request: historical JVT version unavailable"
                     );
                     return GetProvisionResponse {
                         provisions: None,
@@ -482,7 +482,7 @@ pub fn serve_provision_request(
     // Phase 2: Generate ONE batched proof covering all entries.
     all_storage_keys.sort();
     all_storage_keys.dedup();
-    let proof = match storage.generate_verkle_proofs(&all_storage_keys, jvt_version) {
+    let proof = match storage.generate_merkle_proofs(&all_storage_keys, jmt_version) {
         Some(p) => Arc::new(p),
         None => {
             tracing::warn!(

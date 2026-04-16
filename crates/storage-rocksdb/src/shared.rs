@@ -91,8 +91,8 @@ impl SubstateStore for SharedStorage {
         self.0.snapshot()
     }
 
-    fn jvt_version(&self) -> u64 {
-        self.0.jvt_version()
+    fn jmt_version(&self) -> u64 {
+        self.0.jmt_version()
     }
 
     fn state_root_hash(&self) -> hyperscale_types::Hash {
@@ -108,24 +108,24 @@ impl SubstateStore for SharedStorage {
             .list_substates_for_node_at_height(node_id, block_height)
     }
 
-    fn generate_verkle_proofs(
+    fn generate_merkle_proofs(
         &self,
         storage_keys: &[Vec<u8>],
         block_height: u64,
-    ) -> Option<hyperscale_types::VerkleInclusionProof> {
-        self.0.generate_verkle_proofs(storage_keys, block_height)
+    ) -> Option<hyperscale_types::MerkleInclusionProof> {
+        self.0.generate_merkle_proofs(storage_keys, block_height)
     }
 }
 
-impl jellyfish_verkle_tree::TreeReader for SharedStorage {
+impl hyperscale_jmt::TreeReader for SharedStorage {
     fn get_node(
         &self,
-        key: &jellyfish_verkle_tree::NodeKey,
-    ) -> Option<std::sync::Arc<jellyfish_verkle_tree::Node>> {
+        key: &hyperscale_jmt::NodeKey,
+    ) -> Option<std::sync::Arc<hyperscale_jmt::Node>> {
         self.0.get_node(key)
     }
 
-    fn get_root_key(&self, version: u64) -> Option<jellyfish_verkle_tree::NodeKey> {
+    fn get_root_key(&self, version: u64) -> Option<hyperscale_jmt::NodeKey> {
         self.0.get_root_key(version)
     }
 }
@@ -133,8 +133,8 @@ impl jellyfish_verkle_tree::TreeReader for SharedStorage {
 impl hyperscale_storage::ChainWriter for SharedStorage {
     type PreparedCommit = RocksDbPreparedCommit;
 
-    fn jvt_snapshot(prepared: &Self::PreparedCommit) -> &hyperscale_storage::JvtSnapshot {
-        &prepared.jvt_snapshot
+    fn jmt_snapshot(prepared: &Self::PreparedCommit) -> &hyperscale_storage::JmtSnapshot {
+        &prepared.jmt_snapshot
     }
 
     fn prepare_block_commit(
@@ -143,7 +143,7 @@ impl hyperscale_storage::ChainWriter for SharedStorage {
         parent_block_height: u64,
         finalized_waves: &[std::sync::Arc<hyperscale_types::FinalizedWave>],
         block_height: u64,
-        pending_snapshots: &[std::sync::Arc<hyperscale_storage::JvtSnapshot>],
+        pending_snapshots: &[std::sync::Arc<hyperscale_storage::JmtSnapshot>],
     ) -> (Hash, Self::PreparedCommit) {
         self.0.prepare_block_commit(
             parent_state_root,
@@ -175,10 +175,6 @@ impl hyperscale_storage::ChainWriter for SharedStorage {
 
     fn memory_usage_bytes(&self) -> (u64, u64) {
         self.0.memory_usage_bytes()
-    }
-
-    fn node_cache_len(&self) -> usize {
-        self.0.node_cache_len()
     }
 }
 

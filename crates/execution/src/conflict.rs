@@ -251,8 +251,8 @@ impl ConflictDetector {
 mod tests {
     use super::*;
     use hyperscale_types::{
-        bls_keypair_from_seed, BlockHeight, NodeId, ShardGroupId, StateEntry, TopologySnapshot,
-        TxEntries, ValidatorId, ValidatorInfo, ValidatorSet, VerkleInclusionProof,
+        bls_keypair_from_seed, BlockHeight, MerkleInclusionProof, NodeId, ShardGroupId, StateEntry,
+        TopologySnapshot, TxEntries, ValidatorId, ValidatorInfo, ValidatorSet,
     };
 
     /// Create a NodeId that routes to `target_shard` under modulo-hash routing.
@@ -315,7 +315,7 @@ mod tests {
         Provision::new(
             source_shard,
             BlockHeight(height),
-            VerkleInclusionProof::dummy(),
+            MerkleInclusionProof::dummy(),
             txs.into_iter()
                 .map(|(hash, source_nodes, target_nodes)| TxEntries {
                     tx_hash: hash,

@@ -5,15 +5,12 @@ edition.workspace = true
 description = "RocksDB storage implementation for production"
 
 [dependencies]
-ark-ed-on-bls12-381-bandersnatch.workspace = true
-ark-serialize.workspace = true
-dashmap.workspace = true
 hex.workspace = true
+hyperscale-jmt.workspace = true
 hyperscale-storage.workspace = true
 hyperscale-metrics.workspace = true
 hyperscale-types.workspace = true
 hyperscale-bft.workspace = true
-jellyfish-verkle-tree.workspace = true
 radix-common.workspace = true
 radix-substate-store-interface.workspace = true
 rocksdb.workspace = true

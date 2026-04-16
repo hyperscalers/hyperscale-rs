@@ -2,17 +2,16 @@
 
 use std::sync::Arc;
 
-use jellyfish_verkle_tree as jvt;
+use hyperscale_jmt as jmt;
 
 /// Writes collected during a `put_at_version` computation.
 ///
-/// Nodes are stored as `(jvt::NodeKey, Arc<jvt::Node>)` — the canonical hydrated
-/// form from the JVT library. Storage backends serialize at write time.
-/// The cache takes the hydrated form directly.
+/// Nodes are stored as `(jmt::NodeKey, Arc<jmt::Node>)` — the canonical hydrated
+/// form from the JMT library. Storage backends serialize at write time.
 #[derive(Default)]
 pub struct CollectedWrites {
     /// New tree nodes created during computation.
-    pub nodes: Vec<(jvt::NodeKey, Arc<jvt::Node>)>,
+    pub nodes: Vec<(jmt::NodeKey, Arc<jmt::Node>)>,
     /// Keys of nodes that became stale (replaced by new versions).
-    pub stale_node_keys: Vec<jvt::NodeKey>,
+    pub stale_node_keys: Vec<jmt::NodeKey>,
 }

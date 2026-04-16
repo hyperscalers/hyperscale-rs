@@ -301,7 +301,7 @@ pub fn run_pinned_loop(mut io_loop: ProdIoLoop, mut config: PinnedLoopConfig) {
             let storage = io_loop.storage().clone();
             let gc_flag = gc_in_flight.clone();
             config.tokio_handle.spawn_blocking(move || {
-                let deleted = storage.run_jvt_gc();
+                let deleted = storage.run_jmt_gc();
                 if deleted > 0 {
                     debug!(deleted, "JVT garbage collection completed");
                 }

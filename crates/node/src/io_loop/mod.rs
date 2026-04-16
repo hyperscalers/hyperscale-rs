@@ -215,7 +215,6 @@ pub fn record_metrics<S: ChainWriter>(snapshot: MetricsSnapshot, storage: &S) {
     // RocksDB property queries — potentially slow under compaction pressure.
     let (rocksdb_bc, rocksdb_mt) = storage.memory_usage_bytes();
     let mut memory = snapshot.memory;
-    memory.jvt_node_cache_entries = storage.node_cache_len();
     memory.rocksdb_block_cache_usage_bytes = rocksdb_bc;
     memory.rocksdb_memtable_usage_bytes = rocksdb_mt;
     metrics::set_memory_metrics(&memory);
@@ -345,7 +344,7 @@ where
 
 impl<S, N, D, E> IoLoop<S, N, D, E>
 where
-    S: ChainWriter + SubstateStore + ChainReader + hyperscale_storage::JvtTreeReader + Send + Sync,
+    S: ChainWriter + SubstateStore + ChainReader + hyperscale_storage::JmtTreeReader + Send + Sync,
     N: Network,
     D: Dispatch,
     E: Engine,
@@ -1145,7 +1144,6 @@ where
                 prov_queued_provision_batches: prov_mem.queued_provision_batches,
                 prov_committed_batch_tombstones: prov_mem.committed_batch_tombstones,
                 // Storage — filled in by record_metrics off-thread.
-                jvt_node_cache_entries: 0,
                 rocksdb_block_cache_usage_bytes: 0,
                 rocksdb_memtable_usage_bytes: 0,
             },

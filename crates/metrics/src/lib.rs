@@ -173,8 +173,6 @@ pub struct MemoryMetrics {
     pub prov_committed_batch_tombstones: usize,
 
     // ── Storage (byte-level where available) ──
-    /// JVT node hydration cache entries.
-    pub jvt_node_cache_entries: usize,
     /// RocksDB block cache usage in bytes.
     pub rocksdb_block_cache_usage_bytes: u64,
     /// RocksDB memtable usage in bytes.

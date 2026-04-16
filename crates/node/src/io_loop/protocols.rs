@@ -19,7 +19,7 @@ use std::time::Duration;
 
 impl<S, N, D, E> IoLoop<S, N, D, E>
 where
-    S: ChainWriter + SubstateStore + ChainReader + hyperscale_storage::JvtTreeReader + Send + Sync,
+    S: ChainWriter + SubstateStore + ChainReader + hyperscale_storage::JmtTreeReader + Send + Sync,
     N: Network,
     D: Dispatch,
     E: Engine,
@@ -214,7 +214,7 @@ where
                                 Some(provisions) => {
                                     // Build a Provision from the response.
                                     let proof = response.proof.unwrap_or_else(
-                                        hyperscale_types::VerkleInclusionProof::dummy,
+                                        hyperscale_types::MerkleInclusionProof::dummy,
                                     );
                                     let transactions: Vec<hyperscale_types::TxEntries> = provisions
                                         .into_iter()

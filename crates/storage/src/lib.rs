@@ -14,11 +14,11 @@
 //! - `SimulationRunner` uses in-memory storage (`SimStorage`)
 //! - `ProductionRunner` uses RocksDB (`RocksDbStorage`)
 //!
-//! # Jellyfish Verkle Tree (JVT)
+//! # Jellyfish Merkle Tree (JMT)
 //!
-//! The `tree` module provides the verkle state tree implementation. Storage
-//! backends implement `jvt::TreeReader` to provide tree access — RocksDB uses
-//! a cache-backed adapter, SimStorage uses a direct HashMap lookup.
+//! The `tree` module provides the binary Blake3 JMT state tree adapter.
+//! Storage backends implement `jmt::TreeReader` to provide tree access —
+//! both RocksDB and SimStorage hook into the same trait.
 
 #![warn(missing_docs)]
 
@@ -38,11 +38,11 @@ pub mod test_helpers;
 pub use chain_reader::ChainReader;
 pub use chain_writer::ChainWriter;
 pub use genesis::{GenesisWrapper, SubstatesOnlyCommit};
-pub use jellyfish_verkle_tree::TreeReader as JvtTreeReader;
+pub use hyperscale_jmt::TreeReader as JmtTreeReader;
 pub use overlay::{SubstateDbLookup, SubstateLookup};
 pub use pending_chain::{ChainEntry, PendingChain, SubstateView};
 pub use store::SubstateStore;
-pub use tree::{CollectedWrites, JvtNodeKey, JvtSnapshot, LeafSubstateKeyAssociation};
+pub use tree::{CollectedWrites, JmtNodeKey, JmtSnapshot, LeafSubstateKeyAssociation};
 pub use writes::{
     merge_database_updates, merge_database_updates_from_arcs, merge_into,
     merge_updates_from_receipts,

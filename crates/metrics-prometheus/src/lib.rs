@@ -1309,10 +1309,6 @@ impl MetricsRecorder for PrometheusRecorder {
         // Storage
         self.metrics
             .memory_storage
-            .with_label_values(&["jvt_node_cache_entries"])
-            .set(m.jvt_node_cache_entries as f64);
-        self.metrics
-            .memory_storage
             .with_label_values(&["rocksdb_block_cache_bytes"])
             .set(m.rocksdb_block_cache_usage_bytes as f64);
         self.metrics

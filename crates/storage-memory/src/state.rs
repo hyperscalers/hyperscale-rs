@@ -4,8 +4,9 @@
 
 use crate::tree_store::SimTreeStore;
 
+use hyperscale_jmt as jmt;
 use hyperscale_storage::{
-    keys, DatabaseUpdate, DatabaseUpdates, DbPartitionKey, JvtSnapshot, PartitionDatabaseUpdates,
+    keys, DatabaseUpdate, DatabaseUpdates, DbPartitionKey, JmtSnapshot, PartitionDatabaseUpdates,
     StateRootHash,
 };
 use hyperscale_types::{
@@ -13,7 +14,6 @@ use hyperscale_types::{
     QuorumCertificate, RoutableTransaction, ShardGroupId, WaveCertificate,
 };
 use im::OrdMap;
-use jellyfish_verkle_tree as jvt;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
@@ -36,7 +36,7 @@ pub(crate) struct SharedState {
     pub current_block_height: u64,
     pub current_root_hash: StateRootHash,
     /// Leaf-key → substate-value associations for historical queries.
-    pub associations: HashMap<jvt::NodeKey, Vec<u8>>,
+    pub associations: HashMap<jmt::NodeKey, Vec<u8>>,
     /// MVCC versioned substate store: `(storage_key, version) → Option<value>`.
     /// BTreeMap ordering gives prefix scans and version ordering for free.
     /// A `None` value is a tombstone (deleted substate).
@@ -49,7 +49,7 @@ impl SharedState {
             data: OrdMap::new(),
             // Pruning disabled: historical substate reads traverse the JVT at
             // past heights and need old nodes to still exist. In production,
-            // RocksDB GC respects `jvt_history_length` (default 256).
+            // RocksDB GC respects `jmt_history_length` (default 256).
             // In simulation, tests are short-lived so retaining all nodes is fine.
             tree_store: SimTreeStore::new(),
             current_block_height: 0,
@@ -65,15 +65,15 @@ impl SharedState {
     /// agreed on the resulting state root). We apply unconditionally —
     /// the overlay may have computed from a base state ahead of the
     /// tree store, so base_root mismatches are expected and safe.
-    pub(crate) fn apply_jvt_snapshot(&mut self, snapshot: JvtSnapshot) {
-        for (jvt_key, jvt_node) in &snapshot.nodes {
+    pub(crate) fn apply_jmt_snapshot(&mut self, snapshot: JmtSnapshot) {
+        for (jmt_key, jmt_node) in &snapshot.nodes {
             self.tree_store
-                .insert(jvt_key.clone(), Arc::clone(jvt_node));
+                .insert(jmt_key.clone(), Arc::clone(jmt_node));
         }
         // NOTE: stale JVT nodes are NOT deleted here. Historical JVT nodes
-        // must be retained so that provision fetch (generate_verkle_proofs) can
+        // must be retained so that provision fetch (generate_merkle_proofs) can
         // read the tree at past block heights. In production, RocksDB GC handles
-        // pruning after `jvt_history_length` blocks (default 256). In simulation,
+        // pruning after `jmt_history_length` blocks (default 256). In simulation,
         // we retain all nodes (tests are short-lived).
         //
         // Previously this deleted stale nodes immediately, causing a race: the

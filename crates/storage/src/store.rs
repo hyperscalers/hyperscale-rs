@@ -2,18 +2,19 @@
 //!
 //! This module defines the storage abstraction used by runners to persist Radix state.
 
-use hyperscale_types::{Hash, NodeId, VerkleInclusionProof};
+use hyperscale_types::{Hash, MerkleInclusionProof, NodeId};
 use radix_substate_store_interface::interface::{DbSortKey, SubstateDatabase};
 
-/// Extension trait for substate storage with snapshots, node listing, and JVT state roots.
+/// Extension trait for substate storage with snapshots, node listing, and JMT state roots.
 ///
 /// This trait extends Radix's `SubstateDatabase` with additional methods needed
 /// for deterministic simulation and state commitment:
 /// - `snapshot()` - Create isolated views for parallel execution
-/// - `jvt_version()` / `state_root_hash()` - JVT state commitment
+/// - `jmt_version()` / `state_root_hash()` - JMT state commitment
 ///
-/// All implementations use Jellyfish Verkle Tree (JVT) internally to maintain
-/// cryptographic state roots, updated on each `commit_block()`.
+/// All implementations use a binary Blake3 Jellyfish Merkle Tree (JMT)
+/// internally to maintain cryptographic state roots, updated on each
+/// `commit_block()`.
 ///
 /// Runner storage types (`SimStorage`, `RocksDbStorage`) implement this trait
 /// along with `SubstateDatabase`.
@@ -34,24 +35,24 @@ pub trait SubstateStore: SubstateDatabase + Send + Sync + 'static {
     /// provides true point-in-time isolation from concurrent writes.
     fn snapshot(&self) -> Self::Snapshot<'_>;
 
-    /// Returns the block height of the last committed JVT state.
+    /// Returns the block height of the last committed JMT state.
     ///
-    /// This equals the block height because JVT version = block height.
+    /// This equals the block height because JMT version = block height.
     /// Returns 0 for fresh/genesis state.
-    fn jvt_version(&self) -> u64;
+    fn jmt_version(&self) -> u64;
 
-    /// Current JVT state root hash.
+    /// Current JMT state root hash.
     ///
-    /// Returns the Verkle root of all substates at the current version.
+    /// Returns the Blake3 root of all substates at the current version.
     /// This hash cryptographically commits to the entire state and can be used
     /// for state sync, light client proofs, and cross-validator consistency checks.
     ///
     /// Returns a zero hash if no commits have occurred.
     fn state_root_hash(&self) -> Hash;
 
-    /// List all substates for a node at a specific historical block height (= JVT version).
+    /// List all substates for a node at a specific historical block height (= JMT version).
     ///
-    /// Traverses the 3-tier JVT at the given height and looks up raw substate
+    /// Traverses the JMT at the given height and looks up raw substate
     /// values from the leaf association table.
     ///
     /// Returns `Some(entries)` on success (may be empty if the node has no
@@ -66,11 +67,11 @@ pub trait SubstateStore: SubstateDatabase + Send + Sync + 'static {
         block_height: u64,
     ) -> Option<Vec<(u8, DbSortKey, Vec<u8>)>>;
 
-    /// Generate an aggregated verkle inclusion proof for the given storage keys.
+    /// Generate a batched merkle multiproof for the given storage keys.
     /// Returns `None` if the requested version is unavailable (GC'd or not committed).
-    fn generate_verkle_proofs(
+    fn generate_merkle_proofs(
         &self,
         storage_keys: &[Vec<u8>],
         block_height: u64,
-    ) -> Option<VerkleInclusionProof>;
+    ) -> Option<MerkleInclusionProof>;
 }

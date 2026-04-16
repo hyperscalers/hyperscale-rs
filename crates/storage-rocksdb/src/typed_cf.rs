@@ -91,20 +91,20 @@ impl DbCodec<Vec<u8>> for RawCodec {
     }
 }
 
-/// JVT node key codec — wraps the existing `encode_key` function.
+/// JMT node key codec — wraps the existing `encode_key` function.
 #[derive(Default)]
-pub(crate) struct JvtKeyCodec;
+pub(crate) struct JmtKeyCodec;
 
-impl DbCodec<crate::jvt_stored::StoredNodeKey> for JvtKeyCodec {
-    fn encode_to(&self, value: &crate::jvt_stored::StoredNodeKey, buf: &mut Vec<u8>) {
-        let encoded = crate::jvt_stored::encode_key(value);
+impl DbCodec<crate::jmt_stored::StoredNodeKey> for JmtKeyCodec {
+    fn encode_to(&self, value: &crate::jmt_stored::StoredNodeKey, buf: &mut Vec<u8>) {
+        let encoded = crate::jmt_stored::encode_key(value);
         buf.extend_from_slice(&encoded);
     }
 
-    fn decode(&self, _bytes: &[u8]) -> crate::jvt_stored::StoredNodeKey {
-        // JVT keys are only encoded for writes/lookups, never decoded from raw bytes
+    fn decode(&self, _bytes: &[u8]) -> crate::jmt_stored::StoredNodeKey {
+        // JMT keys are only encoded for writes/lookups, never decoded from raw bytes
         // in our codebase (the decode path goes through SBOR for the node values).
-        unimplemented!("JVT key decoding not needed — keys are write-only in RocksDB")
+        unimplemented!("JMT key decoding not needed — keys are write-only in RocksDB")
     }
 }
 
@@ -461,11 +461,11 @@ impl DbCodec<hyperscale_types::BlockHeight> for BlockHeightCodec {
     }
 }
 
-/// JVT metadata codec — packed 40-byte format: `[version_BE_8B][root_hash_32B]`.
+/// JMT metadata codec — packed 40-byte format: `[version_BE_8B][root_hash_32B]`.
 #[derive(Default)]
-pub(crate) struct JvtMetadataCodec;
+pub(crate) struct JmtMetadataCodec;
 
-impl DbCodec<(u64, hyperscale_types::Hash)> for JvtMetadataCodec {
+impl DbCodec<(u64, hyperscale_types::Hash)> for JmtMetadataCodec {
     fn encode_to(&self, value: &(u64, hyperscale_types::Hash), buf: &mut Vec<u8>) {
         buf.extend_from_slice(&value.0.to_be_bytes());
         buf.extend_from_slice(&value.1.to_bytes());
@@ -502,9 +502,9 @@ impl MetadataEntry for CommittedQcEntry {
     type Codec = SborCodec<hyperscale_types::QuorumCertificate>;
 }
 
-pub(crate) struct JvtMetadataEntry;
-impl MetadataEntry for JvtMetadataEntry {
+pub(crate) struct JmtMetadataEntry;
+impl MetadataEntry for JmtMetadataEntry {
     const KEY: &'static [u8] = b"jmt:metadata";
     type Value = (u64, hyperscale_types::Hash);
-    type Codec = JvtMetadataCodec;
+    type Codec = JmtMetadataCodec;
 }

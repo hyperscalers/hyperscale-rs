@@ -8,7 +8,7 @@ description = "In-memory storage implementation for simulation"
 hyperscale-storage.workspace = true
 hyperscale-types.workspace = true
 im.workspace = true
-jellyfish-verkle-tree.workspace = true
+hyperscale-jmt.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]

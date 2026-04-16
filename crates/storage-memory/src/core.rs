@@ -59,7 +59,7 @@ impl SimStorage {
     }
 
     /// Get the current JVT version.
-    pub fn current_jvt_version(&self) -> u64 {
+    pub fn current_jmt_version(&self) -> u64 {
         self.state.read().unwrap().current_block_height
     }
 
@@ -139,7 +139,7 @@ impl SimStorage {
             apply_updates_to_ordmap(data, updates, Some((new_version, versioned_substates)));
         }
 
-        let parent_version = hyperscale_storage::tree::jvt_parent_height(
+        let parent_version = hyperscale_storage::tree::jmt_parent_height(
             s.current_block_height,
             s.current_root_hash,
         );
@@ -166,7 +166,7 @@ impl SimStorage {
     ///
     /// Used during genesis bootstrap so each intermediate `commit()` call from the
     /// Radix Engine writes substates without computing a JVT version.
-    /// After all genesis commits complete, [`finalize_genesis_jvt`] computes the
+    /// After all genesis commits complete, [`finalize_genesis_jmt`] computes the
     /// JVT once at version 0.
     pub fn commit_substates_only(&self, updates: &DatabaseUpdates) {
         let mut s = self.state.write().unwrap();
@@ -187,13 +187,13 @@ impl SimStorage {
     ///
     /// # Returns
     /// The genesis state root hash (JVT root at version 0).
-    pub fn finalize_genesis_jvt(&self, merged: &DatabaseUpdates) -> Hash {
+    pub fn finalize_genesis_jmt(&self, merged: &DatabaseUpdates) -> Hash {
         let mut s = self.state.write().unwrap();
 
-        // Guard: finalize_genesis_jvt must only be called once, on an uninitialized JVT.
+        // Guard: finalize_genesis_jmt must only be called once, on an uninitialized JVT.
         assert!(
             s.current_block_height == 0 && s.current_root_hash == Hash::ZERO,
-            "finalize_genesis_jvt called but JVT already initialized"
+            "finalize_genesis_jmt called but JVT already initialized"
         );
 
         // parent=None, version=0: genesis is the first JVT state.

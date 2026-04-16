@@ -545,8 +545,8 @@ impl ProvisionCoordinator {
 mod tests {
     use super::*;
     use hyperscale_types::{
-        bls_keypair_from_seed, BlockHeader, Bls12381G1PrivateKey, Hash, QuorumCertificate,
-        TopologySnapshot, TxEntries, ValidatorInfo, ValidatorSet, VerkleInclusionProof, WaveId,
+        bls_keypair_from_seed, BlockHeader, Bls12381G1PrivateKey, Hash, MerkleInclusionProof,
+        QuorumCertificate, TopologySnapshot, TxEntries, ValidatorInfo, ValidatorSet, WaveId,
     };
 
     fn make_test_topology(local_shard: ShardGroupId) -> TopologySnapshot {
@@ -694,7 +694,7 @@ mod tests {
         Provision::new(
             source_shard,
             BlockHeight(height),
-            VerkleInclusionProof::dummy(),
+            MerkleInclusionProof::dummy(),
             transactions,
         )
     }

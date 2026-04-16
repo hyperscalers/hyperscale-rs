@@ -1,13 +1,13 @@
 //! `SubstateStore` implementation for `RocksDbStorage`.
 
 use crate::core::RocksDbStorage;
-use crate::jvt_snapshot_store::SnapshotTreeStore;
+use crate::jmt_snapshot_store::SnapshotTreeStore;
 use crate::snapshot::RocksDbSnapshot;
 use crate::typed_cf::TypedCf;
 
 use crate::substate_key;
 use hyperscale_metrics as metrics;
-use hyperscale_storage::{DbSortKey, JvtSnapshot, SubstateStore};
+use hyperscale_storage::{DbSortKey, JmtSnapshot, SubstateStore};
 use hyperscale_types::NodeId;
 use rocksdb::WriteBatch;
 use std::time::Instant;
@@ -25,12 +25,12 @@ impl SubstateStore for RocksDbStorage {
         }
     }
 
-    fn jvt_version(&self) -> u64 {
-        self.read_jvt_metadata().0
+    fn jmt_version(&self) -> u64 {
+        self.read_jmt_metadata().0
     }
 
     fn state_root_hash(&self) -> hyperscale_types::Hash {
-        let (_, root_hash) = self.read_jvt_metadata();
+        let (_, root_hash) = self.read_jmt_metadata();
         root_hash
     }
 
@@ -39,7 +39,7 @@ impl SubstateStore for RocksDbStorage {
         node_id: &NodeId,
         block_height: u64,
     ) -> Option<Vec<(u8, DbSortKey, Vec<u8>)>> {
-        let (current_version, _) = self.read_jvt_metadata();
+        let (current_version, _) = self.read_jmt_metadata();
         if block_height > current_version {
             return None;
         }
@@ -88,14 +88,14 @@ impl SubstateStore for RocksDbStorage {
         Some(results)
     }
 
-    fn generate_verkle_proofs(
+    fn generate_merkle_proofs(
         &self,
         storage_keys: &[Vec<u8>],
         block_height: u64,
-    ) -> Option<hyperscale_types::VerkleInclusionProof> {
+    ) -> Option<hyperscale_types::MerkleInclusionProof> {
         // Use a RocksDB snapshot for all reads so concurrent JVT GC cannot
         // delete nodes mid-proof-generation.
-        let snapshot_store = SnapshotTreeStore::new(&self.db, &self.node_cache);
+        let snapshot_store = SnapshotTreeStore::new(&self.db);
         hyperscale_storage::tree::proofs::generate_proof(
             &snapshot_store,
             storage_keys,
@@ -119,7 +119,7 @@ impl RocksDbStorage {
     pub(crate) fn try_apply_prepared_commit(
         &self,
         mut write_batch: WriteBatch,
-        jvt_snapshot: JvtSnapshot,
+        jmt_snapshot: JmtSnapshot,
         block: &hyperscale_types::Block,
         qc: &hyperscale_types::QuorumCertificate,
         sync: bool,
@@ -130,31 +130,31 @@ impl RocksDbStorage {
         // Verify we're applying to the expected base state BEFORE writing anything.
         // Must check BOTH root AND version. Root can be unchanged with empty commits
         // (same root, different version), but the nodes are keyed by version.
-        let (current_version, current_root_hash) = self.read_jvt_metadata();
-        if current_root_hash != jvt_snapshot.base_root {
+        let (current_version, current_root_hash) = self.read_jmt_metadata();
+        if current_root_hash != jmt_snapshot.base_root {
             tracing::warn!(
-                expected_root = ?jvt_snapshot.base_root,
+                expected_root = ?jmt_snapshot.base_root,
                 actual_root = ?current_root_hash,
                 "JVT snapshot base ROOT mismatch - falling back to slow path"
             );
             return false;
         }
-        if current_version != jvt_snapshot.base_version {
+        if current_version != jmt_snapshot.base_version {
             tracing::debug!(
-                expected_version = jvt_snapshot.base_version,
+                expected_version = jmt_snapshot.base_version,
                 actual_version = current_version,
                 "JVT snapshot base VERSION mismatch (root matches) - proceeding with fast path. \
                  This is expected when empty commits advance the version counter."
             );
         }
 
-        let nodes_count = jvt_snapshot.nodes.len();
-        let stale_count = jvt_snapshot.stale_node_keys.len();
-        let associations_count = jvt_snapshot.leaf_substate_associations.len();
-        let new_version = jvt_snapshot.new_version;
-        let new_root = jvt_snapshot.result_root;
+        let nodes_count = jmt_snapshot.nodes.len();
+        let stale_count = jmt_snapshot.stale_node_keys.len();
+        let associations_count = jmt_snapshot.leaf_substate_associations.len();
+        let new_version = jmt_snapshot.new_version;
+        let new_root = jmt_snapshot.result_root;
 
-        self.append_jvt_to_batch(&mut write_batch, &jvt_snapshot, new_version);
+        self.append_jmt_to_batch(&mut write_batch, &jmt_snapshot, new_version);
 
         // Fold consensus metadata into the same batch for crash-safe atomicity.
         Self::append_consensus_to_batch(&mut write_batch, block, qc);
@@ -171,7 +171,6 @@ impl RocksDbStorage {
         // Populate the node cache with the newly committed nodes so that
         // subsequent reads (proof generation, next block's state root
         // verification) hit the cache instead of deserializing from RocksDB.
-        self.node_cache.populate(&jvt_snapshot.nodes);
 
         let elapsed = start.elapsed();
         metrics::record_storage_write(elapsed.as_secs_f64());

@@ -5,11 +5,12 @@
 //! All operations are synchronous blocking I/O. Callers in async contexts
 //! should use `spawn_blocking` if needed to avoid blocking the runtime.
 //!
-//! # JVT Integration
+//! # JMT Integration
 //!
-//! Uses Jellyfish Verkle Tree (JVT) for cryptographic state commitment.
-//! JVT data is stored in dedicated column families (`jmt_nodes`, `jmt_meta`).
-//! On each commit, the JVT is updated and a new state root hash is computed.
+//! Uses a binary Jellyfish Merkle Tree (JMT) with Blake3 hashing for
+//! cryptographic state commitment. JMT data is stored in dedicated
+//! column families (`jmt_nodes`, `jmt_meta`). On each commit, the JMT is
+//! updated and a new state root hash is computed.
 
 mod blocks;
 mod chain_reader;
@@ -19,10 +20,9 @@ pub(crate) mod config;
 pub(crate) mod core;
 mod execution_certs;
 mod gc;
-pub(crate) mod jvt_snapshot_store;
-pub mod jvt_stored;
+pub(crate) mod jmt_snapshot_store;
+pub mod jmt_stored;
 pub(crate) mod metadata;
-pub(crate) mod node_cache;
 mod receipts;
 mod recovery;
 mod shared;

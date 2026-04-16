@@ -2,9 +2,9 @@
 
 use crate::column_families::ALL_COLUMN_FAMILIES;
 use crate::core::RocksDbStorage;
-use crate::jvt_snapshot_store::SnapshotTreeStore;
+use crate::jmt_snapshot_store::SnapshotTreeStore;
 
-use hyperscale_storage::JvtSnapshot;
+use hyperscale_storage::JmtSnapshot;
 use hyperscale_types::ReceiptBundle;
 use radix_substate_store_interface::interface::DatabaseUpdates;
 use rocksdb::WriteBatch;
@@ -13,7 +13,7 @@ use std::sync::Arc;
 /// Precomputed commit work for a RocksDB block commit.
 ///
 /// Contains a pre-built `WriteBatch` (substate + receipt writes) and a
-/// `JvtSnapshot` (precomputed Verkle tree nodes).
+/// `JmtSnapshot` (precomputed Merkle tree nodes).
 ///
 /// # Performance
 ///
@@ -21,14 +21,14 @@ use std::sync::Arc;
 /// With batching: 1 fsync = ~5ms per block commit
 pub struct RocksDbPreparedCommit {
     pub(crate) write_batch: WriteBatch,
-    pub(crate) jvt_snapshot: JvtSnapshot,
+    pub(crate) jmt_snapshot: JmtSnapshot,
 }
 
 impl hyperscale_storage::ChainWriter for RocksDbStorage {
     type PreparedCommit = RocksDbPreparedCommit;
 
-    fn jvt_snapshot(prepared: &Self::PreparedCommit) -> &hyperscale_storage::JvtSnapshot {
-        &prepared.jvt_snapshot
+    fn jmt_snapshot(prepared: &Self::PreparedCommit) -> &hyperscale_storage::JmtSnapshot {
+        &prepared.jmt_snapshot
     }
 
     fn prepare_block_commit(
@@ -37,7 +37,7 @@ impl hyperscale_storage::ChainWriter for RocksDbStorage {
         parent_block_height: u64,
         finalized_waves: &[std::sync::Arc<hyperscale_types::FinalizedWave>],
         block_height: u64,
-        pending_snapshots: &[std::sync::Arc<hyperscale_storage::JvtSnapshot>],
+        pending_snapshots: &[std::sync::Arc<hyperscale_storage::JmtSnapshot>],
     ) -> (hyperscale_types::Hash, Self::PreparedCommit) {
         let receipts: Vec<&ReceiptBundle> = finalized_waves
             .iter()
@@ -45,12 +45,12 @@ impl hyperscale_storage::ChainWriter for RocksDbStorage {
             .collect();
 
         // No receipts → no state changes → state root is unchanged.
-        // Build a no-op JvtSnapshot directly, avoiding put_at_version which
+        // Build a no-op JmtSnapshot directly, avoiding put_at_version which
         // would fail if the parent's tree nodes aren't in the store yet
         // (e.g., proposer just exited sync and BlockPersisted hasn't fired).
         if receipts.is_empty() {
-            let jvt_snapshot = hyperscale_storage::tree::noop_jvt_snapshot(
-                &SnapshotTreeStore::new(&self.db, &self.node_cache),
+            let jmt_snapshot = hyperscale_storage::tree::noop_jmt_snapshot(
+                &SnapshotTreeStore::new(&self.db),
                 pending_snapshots,
                 parent_state_root,
                 parent_block_height,
@@ -59,18 +59,18 @@ impl hyperscale_storage::ChainWriter for RocksDbStorage {
             let write_batch = WriteBatch::default();
             let prepared = RocksDbPreparedCommit {
                 write_batch,
-                jvt_snapshot,
+                jmt_snapshot,
             };
             return (parent_state_root, prepared);
         }
 
-        let snapshot_store = SnapshotTreeStore::new(&self.db, &self.node_cache);
+        let snapshot_store = SnapshotTreeStore::new(&self.db);
         let parent_version =
-            hyperscale_storage::tree::jvt_parent_height(parent_block_height, parent_state_root);
+            hyperscale_storage::tree::jmt_parent_height(parent_block_height, parent_state_root);
 
         // Collect per-receipt DatabaseUpdates references — no merge needed.
         // State locking guarantees no key conflicts between receipts, so
-        // put_at_version can flatten them directly into JVT work items.
+        // put_at_version can flatten them directly into JMT work items.
         let per_receipt_updates: Vec<&DatabaseUpdates> = receipts
             .iter()
             .map(|b| &b.local_receipt.database_updates)
@@ -98,7 +98,7 @@ impl hyperscale_storage::ChainWriter for RocksDbStorage {
             )
         };
 
-        let jvt_snapshot = JvtSnapshot::from_collected_writes(
+        let jmt_snapshot = JmtSnapshot::from_collected_writes(
             collected,
             parent_state_root,
             parent_block_height,
@@ -123,7 +123,7 @@ impl hyperscale_storage::ChainWriter for RocksDbStorage {
 
         let prepared = RocksDbPreparedCommit {
             write_batch,
-            jvt_snapshot,
+            jmt_snapshot,
         };
 
         (computed_root, prepared)
@@ -141,7 +141,7 @@ impl hyperscale_storage::ChainWriter for RocksDbStorage {
         let mut roots = Vec::with_capacity(total);
 
         for (i, (prepared, block, qc)) in blocks.into_iter().enumerate() {
-            let result_root = prepared.jvt_snapshot.result_root;
+            let result_root = prepared.jmt_snapshot.result_root;
 
             let mut write_batch = prepared.write_batch;
 
@@ -156,7 +156,7 @@ impl hyperscale_storage::ChainWriter for RocksDbStorage {
             let sync = i == total - 1;
             let applied = self.try_apply_prepared_commit(
                 write_batch,
-                prepared.jvt_snapshot,
+                prepared.jmt_snapshot,
                 &block,
                 &qc,
                 sync,
@@ -213,10 +213,6 @@ impl hyperscale_storage::ChainWriter for RocksDbStorage {
         }
         (block_cache_usage, memtable_usage)
     }
-
-    fn node_cache_len(&self) -> usize {
-        self.node_cache.len()
-    }
 }
 
 impl RocksDbStorage {
@@ -231,8 +227,8 @@ impl RocksDbStorage {
         let block_height = block.header.height.0;
         let _commit_guard = self.commit_lock.lock().unwrap();
 
-        let snapshot_store = SnapshotTreeStore::new(&self.db, &self.node_cache);
-        let (base_version, base_root) = snapshot_store.read_jvt_metadata();
+        let snapshot_store = SnapshotTreeStore::new(&self.db);
+        let (base_version, base_root) = snapshot_store.read_jmt_metadata();
 
         assert!(
             block_height == base_version + 1 || (block_height == 0 && base_version == 0),
@@ -253,8 +249,8 @@ impl RocksDbStorage {
             self.add_receipt_bundle_to_batch(&mut batch, bundle);
         }
 
-        // Compute JVT update.
-        let parent_version = hyperscale_storage::tree::jvt_parent_height(base_version, base_root);
+        // Compute JMT update.
+        let parent_version = hyperscale_storage::tree::jmt_parent_height(base_version, base_root);
         let (new_root, collected) = hyperscale_storage::tree::put_at_version(
             &snapshot_store,
             parent_version,
@@ -262,14 +258,14 @@ impl RocksDbStorage {
             &[merged_updates],
             &reset_old_keys,
         );
-        let jvt_snapshot = JvtSnapshot::from_collected_writes(
+        let jmt_snapshot = JmtSnapshot::from_collected_writes(
             collected,
             base_root,
             base_version,
             new_root,
             block_height,
         );
-        self.append_jvt_to_batch(&mut batch, &jvt_snapshot, block_height);
+        self.append_jmt_to_batch(&mut batch, &jmt_snapshot, block_height);
 
         // Fold consensus metadata into the same batch for crash-safe atomicity.
         Self::append_consensus_to_batch(&mut batch, block, qc);
@@ -280,9 +276,6 @@ impl RocksDbStorage {
         self.db.write_opt(batch, &write_opts).expect(
             "BFT SAFETY CRITICAL: block commit failed - node state would diverge from network",
         );
-
-        // Populate cache with newly committed nodes.
-        self.node_cache.populate(&jvt_snapshot.nodes);
 
         new_root
     }

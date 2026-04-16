@@ -1,0 +1,16 @@
+[package]
+name = "hyperscale-jmt"
+version.workspace = true
+edition.workspace = true
+description = "Jellyfish Merkle Tree with generic hasher and batched multiproofs"
+
+[features]
+parallel = ["rayon"]
+
+[dependencies]
+blake3.workspace = true
+rayon = { workspace = true, optional = true }
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest = "1"

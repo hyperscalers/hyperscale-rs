@@ -3,16 +3,16 @@
 use crate::core::SimStorage;
 use crate::state::apply_updates_to_ordmap;
 
-use hyperscale_storage::{ChainWriter, DatabaseUpdates, JvtSnapshot};
+use hyperscale_storage::{ChainWriter, DatabaseUpdates, JmtSnapshot};
 use hyperscale_types::{Hash, ReceiptBundle};
 use std::sync::Arc;
 
 /// Precomputed commit work for a SimStorage block commit.
 ///
-/// Contains a `JvtSnapshot` (precomputed verkle tree nodes) plus the
+/// Contains a `JmtSnapshot` (precomputed verkle tree nodes) plus the
 /// merged updates and receipts for substate application at commit time.
 pub struct SimPreparedCommit {
-    snapshot: JvtSnapshot,
+    snapshot: JmtSnapshot,
     merged_updates: DatabaseUpdates,
     receipts: Vec<ReceiptBundle>,
 }
@@ -20,7 +20,7 @@ pub struct SimPreparedCommit {
 impl ChainWriter for SimStorage {
     type PreparedCommit = SimPreparedCommit;
 
-    fn jvt_snapshot(prepared: &Self::PreparedCommit) -> &hyperscale_storage::JvtSnapshot {
+    fn jmt_snapshot(prepared: &Self::PreparedCommit) -> &hyperscale_storage::JmtSnapshot {
         &prepared.snapshot
     }
 
@@ -30,7 +30,7 @@ impl ChainWriter for SimStorage {
         parent_block_height: u64,
         finalized_waves: &[Arc<hyperscale_types::FinalizedWave>],
         block_height: u64,
-        pending_snapshots: &[Arc<hyperscale_storage::JvtSnapshot>],
+        pending_snapshots: &[Arc<hyperscale_storage::JmtSnapshot>],
     ) -> (Hash, Self::PreparedCommit) {
         let receipts: Vec<ReceiptBundle> = finalized_waves
             .iter()
@@ -38,11 +38,11 @@ impl ChainWriter for SimStorage {
             .collect();
 
         // No receipts → no state changes → state root is unchanged.
-        // Build a no-op JvtSnapshot directly, avoiding put_at_version which
+        // Build a no-op JmtSnapshot directly, avoiding put_at_version which
         // would fail if the parent's tree nodes aren't in the store yet.
         if receipts.is_empty() {
             let s = self.state.read().unwrap();
-            let snapshot = hyperscale_storage::tree::noop_jvt_snapshot(
+            let snapshot = hyperscale_storage::tree::noop_jmt_snapshot(
                 &s.tree_store,
                 pending_snapshots,
                 parent_state_root,
@@ -62,7 +62,7 @@ impl ChainWriter for SimStorage {
         let s = self.state.read().unwrap();
 
         let parent_version =
-            hyperscale_storage::tree::jvt_parent_height(parent_block_height, parent_state_root);
+            hyperscale_storage::tree::jmt_parent_height(parent_block_height, parent_state_root);
 
         // Collect per-receipt DatabaseUpdates references — no merge needed.
         let per_receipt_updates: Vec<&hyperscale_storage::DatabaseUpdates> = receipts
@@ -90,7 +90,7 @@ impl ChainWriter for SimStorage {
             )
         };
 
-        let snapshot = JvtSnapshot::from_collected_writes(
+        let snapshot = JmtSnapshot::from_collected_writes(
             collected,
             parent_state_root,
             parent_block_height,
@@ -129,7 +129,7 @@ impl ChainWriter for SimStorage {
                 {
                     let mut s = self.state.write().unwrap();
 
-                    s.apply_jvt_snapshot(prepared.snapshot);
+                    s.apply_jmt_snapshot(prepared.snapshot);
 
                     {
                         let crate::state::SharedState {
@@ -201,10 +201,6 @@ impl ChainWriter for SimStorage {
         let merged_updates = hyperscale_storage::merge_updates_from_receipts(&receipts);
         self.commit_block_inner(&merged_updates, block, qc, &receipts)
     }
-
-    fn node_cache_len(&self) -> usize {
-        0
-    }
 }
 
 impl SimStorage {
@@ -240,7 +236,7 @@ impl SimStorage {
             );
         }
 
-        let parent_version = hyperscale_storage::tree::jvt_parent_height(
+        let parent_version = hyperscale_storage::tree::jmt_parent_height(
             s.current_block_height,
             s.current_root_hash,
         );
@@ -257,7 +253,7 @@ impl SimStorage {
             s.tree_store
                 .insert(key.clone(), std::sync::Arc::clone(node));
         }
-        // NOTE: stale JVT nodes are NOT deleted — see apply_jvt_snapshot comment.
+        // NOTE: stale JVT nodes are NOT deleted — see apply_jmt_snapshot comment.
         // Historical roots must be retained for provision proof generation at
         // past block heights. RocksDB GC handles pruning in production.
 

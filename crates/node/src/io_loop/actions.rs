@@ -21,7 +21,7 @@ use std::sync::Arc;
 use tracing::{debug, warn};
 impl<S, N, D, E> IoLoop<S, N, D, E>
 where
-    S: ChainWriter + SubstateStore + ChainReader + hyperscale_storage::JvtTreeReader + Send + Sync,
+    S: ChainWriter + SubstateStore + ChainReader + hyperscale_storage::JmtTreeReader + Send + Sync,
     N: Network,
     D: Dispatch,
     E: Engine,
@@ -896,14 +896,14 @@ where
                         receipts,
                     } = prep;
                     if let Some(parent_hash) = anchor_parent_hash {
-                        let jvt_snapshot = Arc::new(S::jvt_snapshot(&prepared).clone());
+                        let jmt_snapshot = Arc::new(S::jmt_snapshot(&prepared).clone());
                         pending_chain.insert(
                             block_hash,
                             hyperscale_storage::ChainEntry {
                                 parent_hash,
                                 height: block_height,
                                 receipts,
-                                jvt_snapshot,
+                                jmt_snapshot,
                             },
                         );
                     }

@@ -15,7 +15,7 @@ impl SubstateStore for SimStorage {
         SimSnapshot { data }
     }
 
-    fn jvt_version(&self) -> u64 {
+    fn jmt_version(&self) -> u64 {
         self.state.read().unwrap().current_block_height
     }
 
@@ -80,25 +80,25 @@ impl SubstateStore for SimStorage {
         Some(results)
     }
 
-    fn generate_verkle_proofs(
+    fn generate_merkle_proofs(
         &self,
         storage_keys: &[Vec<u8>],
         block_height: u64,
-    ) -> Option<hyperscale_types::VerkleInclusionProof> {
+    ) -> Option<hyperscale_types::MerkleInclusionProof> {
         let s = self.state.read().unwrap();
         hyperscale_storage::tree::proofs::generate_proof(&s.tree_store, storage_keys, block_height)
     }
 }
 
-impl jellyfish_verkle_tree::TreeReader for SimStorage {
+impl hyperscale_jmt::TreeReader for SimStorage {
     fn get_node(
         &self,
-        key: &jellyfish_verkle_tree::NodeKey,
-    ) -> Option<std::sync::Arc<jellyfish_verkle_tree::Node>> {
+        key: &hyperscale_jmt::NodeKey,
+    ) -> Option<std::sync::Arc<hyperscale_jmt::Node>> {
         self.state.read().unwrap().tree_store.get_node(key)
     }
 
-    fn get_root_key(&self, version: u64) -> Option<jellyfish_verkle_tree::NodeKey> {
+    fn get_root_key(&self, version: u64) -> Option<hyperscale_jmt::NodeKey> {
         self.state.read().unwrap().tree_store.get_root_key(version)
     }
 }

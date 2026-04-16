@@ -4,7 +4,7 @@
 //!
 //! Provision data has three natural levels:
 //!
-//! 1. **Source block** ([`SourceBlockAttestation`]): QC + state_root + verkle proof.
+//! 1. **Source block** ([`SourceBlockAttestation`]): QC + state_root + merkle proof.
 //!    Shared across all transactions from the same block. Serialized once.
 //!
 //! 2. **Transaction** ([`TxEntries`]): Per-transaction state entries.
@@ -21,24 +21,23 @@ use sbor::prelude::*;
 use std::collections::HashSet;
 
 // ============================================================================
-// VerkleInclusionProof
+// MerkleInclusionProof
 // ============================================================================
 
-/// Verkle proof of substates' inclusion in the state tree.
+/// Merkle multiproof authenticating substates' inclusion in the JMT state tree.
 ///
-/// Opaque bytes containing a serialized JVT `VerkleProof`. Serialization and
-/// verification are handled by the `state-tree` crate, which has the necessary
-/// arkworks dependencies.
+/// Opaque bytes containing an encoded `hyperscale_jmt::MultiProof`. Encoding,
+/// decoding and verification are handled by the storage crate, which owns
+/// the adapter between the JMT crate and on-wire SBOR types.
 ///
 /// The proof contains:
-/// - IPA-based multipoint proof (~576 bytes constant core)
-/// - Verifier queries (commitments + evaluation points + results, linear in key count)
-/// - Key data (claimed key, value, stem, termination info)
+/// - Per-claimed-key termination metadata (leaf / empty-subtree / leaf-mismatch)
+/// - Sibling hashes for bottom-up verification
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 #[sbor(transparent)]
-pub struct VerkleInclusionProof(pub Vec<u8>);
+pub struct MerkleInclusionProof(pub Vec<u8>);
 
-impl VerkleInclusionProof {
+impl MerkleInclusionProof {
     /// Create a new proof from raw bytes.
     pub fn new(bytes: Vec<u8>) -> Self {
         Self(bytes)
@@ -94,7 +93,7 @@ impl TxEntries {
 /// A batch of provisions from a single source block.
 ///
 /// Identifies the source block (for joining with `CommittedBlockHeader`)
-/// and carries the verkle proof plus per-transaction state entries.
+/// and carries the merkle proof plus per-transaction state entries.
 /// The QC and state_root are obtained from `CommittedBlockHeader` received
 /// via gossip — they don't travel with the provision batch.
 ///
@@ -106,8 +105,8 @@ pub struct Provision {
     /// Block height at which the state was committed.
     pub block_height: BlockHeight,
 
-    /// Aggregated verkle proof covering all entries for this block.
-    pub proof: VerkleInclusionProof,
+    /// Aggregated merkle multiproof covering all entries for this block.
+    pub proof: MerkleInclusionProof,
 
     /// Per-transaction entries.
     pub transactions: Vec<TxEntries>,
@@ -182,7 +181,7 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
         }
         let source_shard: ShardGroupId = decoder.decode()?;
         let block_height: BlockHeight = decoder.decode()?;
-        let proof: VerkleInclusionProof = decoder.decode()?;
+        let proof: MerkleInclusionProof = decoder.decode()?;
         let transactions: Vec<TxEntries> = decoder.decode()?;
         let hash = Self::compute_hash(source_shard, &block_height, &proof, &transactions);
         Ok(Self {
@@ -214,7 +213,7 @@ impl Provision {
     pub fn new(
         source_shard: ShardGroupId,
         block_height: BlockHeight,
-        proof: VerkleInclusionProof,
+        proof: MerkleInclusionProof,
         transactions: Vec<TxEntries>,
     ) -> Self {
         let hash = Self::compute_hash(source_shard, &block_height, &proof, &transactions);
@@ -235,7 +234,7 @@ impl Provision {
     fn compute_hash(
         source_shard: ShardGroupId,
         block_height: &BlockHeight,
-        proof: &VerkleInclusionProof,
+        proof: &MerkleInclusionProof,
         transactions: &[TxEntries],
     ) -> Hash {
         // Encode the content fields (excluding the hash itself) for hashing.
@@ -249,7 +248,7 @@ impl Provision {
         );
         bytes.extend_from_slice(
             &sbor::basic_encode(proof)
-                .expect("VerkleInclusionProof serialization should never fail"),
+                .expect("MerkleInclusionProof serialization should never fail"),
         );
         bytes.extend_from_slice(
             &sbor::basic_encode(transactions)
@@ -289,7 +288,7 @@ impl Provision {
         Self::new(
             source_shard,
             block_height,
-            VerkleInclusionProof::dummy(),
+            MerkleInclusionProof::dummy(),
             vec![],
         )
     }
@@ -313,7 +312,7 @@ mod tests {
         let original = Provision::new(
             ShardGroupId(1),
             BlockHeight(42),
-            VerkleInclusionProof::new(vec![1, 2, 3]),
+            MerkleInclusionProof::new(vec![1, 2, 3]),
             vec![],
         );
 
@@ -340,7 +339,7 @@ mod tests {
         let batch = Provision::new(
             ShardGroupId(0),
             BlockHeight(10),
-            VerkleInclusionProof::dummy(),
+            MerkleInclusionProof::dummy(),
             vec![TxEntries {
                 tx_hash: Hash::from_bytes(b"tx1"),
                 entries: vec![test_entry(1)],
@@ -375,10 +374,10 @@ mod tests {
     }
 
     #[test]
-    fn test_verkle_inclusion_proof_roundtrip() {
-        let proof = VerkleInclusionProof::new(vec![1, 2, 3, 4, 5]);
+    fn test_merkle_inclusion_proof_roundtrip() {
+        let proof = MerkleInclusionProof::new(vec![1, 2, 3, 4, 5]);
         let bytes = sbor::basic_encode(&proof).unwrap();
-        let decoded: VerkleInclusionProof = sbor::basic_decode(&bytes).unwrap();
+        let decoded: MerkleInclusionProof = sbor::basic_decode(&bytes).unwrap();
         assert_eq!(proof, decoded);
     }
 }

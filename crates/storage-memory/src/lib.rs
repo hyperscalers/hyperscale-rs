@@ -8,8 +8,8 @@
 //!
 //! # JVT Integration
 //!
-//! Uses `SimTreeStore` for Jellyfish Verkle Tree tracking, providing
-//! `jvt_version()` and `state_root_hash()` for state commitment. This ensures
+//! Uses `SimTreeStore` for Jellyfish Merkle Tree (JMT) tracking, providing
+//! `jmt_version()` and `state_root_hash()` for state commitment. This ensures
 //! simulation has identical JVT behavior to production.
 
 mod chain_reader;

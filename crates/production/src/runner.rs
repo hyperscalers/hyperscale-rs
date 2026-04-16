@@ -652,7 +652,7 @@ impl ProductionRunner {
 
             // Compute JVT once at version 0 from merged genesis updates.
             let merged = wrapper.into_merged();
-            storage.finalize_genesis_jvt(&merged)
+            storage.finalize_genesis_jmt(&merged)
         });
 
         info!(

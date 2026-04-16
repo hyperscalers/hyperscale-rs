@@ -141,7 +141,7 @@ keep_log_file_num = 10
 # Stale JVT nodes and their associations are kept for this many heights
 # before being eligible for deletion. This enables historical queries within
 # this window. Set to 0 for immediate deletion (no history retention).
-jvt_history_length = 256
+jmt_history_length = 256
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Mempool Configuration

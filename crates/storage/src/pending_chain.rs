@@ -6,11 +6,11 @@
 //! chain, so they are structurally invisible to anchored views.
 
 use crate::{
-    DatabaseUpdates, DbPartitionKey, DbSortKey, JvtSnapshot, PartitionDatabaseUpdates,
+    DatabaseUpdates, DbPartitionKey, DbSortKey, JmtSnapshot, PartitionDatabaseUpdates,
     SubstateStore,
 };
-use ::jellyfish_verkle_tree as jvt;
-use hyperscale_types::{Hash, LocalReceipt, NodeId, VerkleInclusionProof};
+use ::hyperscale_jmt as jmt;
+use hyperscale_types::{Hash, LocalReceipt, MerkleInclusionProof, NodeId};
 use radix_common::prelude::DatabaseUpdate;
 use radix_substate_store_interface::interface::SubstateDatabase;
 use std::collections::HashMap;
@@ -27,7 +27,7 @@ pub struct ChainEntry {
     /// Per-tx receipts produced by this block.
     pub receipts: Vec<Arc<LocalReceipt>>,
     /// JVT snapshot from this block's speculative state-root computation.
-    pub jvt_snapshot: Arc<JvtSnapshot>,
+    pub jmt_snapshot: Arc<JmtSnapshot>,
 }
 
 /// Append-only index of pending block state, shared between the io_loop
@@ -64,7 +64,7 @@ type ViewCell<S> = Arc<OnceLock<Arc<SubstateView<S>>>>;
 
 impl<S> PendingChain<S>
 where
-    S: SubstateStore + jvt::TreeReader + crate::ChainReader + Sync + 'static,
+    S: SubstateStore + jmt::TreeReader + crate::ChainReader + Sync + 'static,
 {
     /// Create a new empty `PendingChain` over the given base storage.
     pub fn new(base: Arc<S>) -> Self {
@@ -183,13 +183,13 @@ where
 type OverlayEntries = HashMap<(DbPartitionKey, DbSortKey), Option<Vec<u8>>>;
 
 /// JVT node index for O(1) tree-node lookup during proof generation.
-type JvtNodeIndex = HashMap<jvt::NodeKey, Arc<jvt::Node>>;
+type JmtNodeIndex = HashMap<jmt::NodeKey, Arc<jmt::Node>>;
 
 /// Anchored read view over base storage + a slice of pending blocks.
 ///
 /// Built once per anchor by [`PendingChain::view_at`] and cached via an
 /// `Arc`. Implements [`SubstateDatabase`], [`SubstateStore`],
-/// [`crate::ChainWriter`], and [`jvt::TreeReader`] so it can substitute
+/// [`crate::ChainWriter`], and [`jmt::TreeReader`] so it can substitute
 /// for the base storage in delegated action handlers.
 ///
 /// Once built the view is immutable — interior data is never mutated.
@@ -204,10 +204,10 @@ pub struct SubstateView<S> {
     /// JVT snapshots from the same chain, in commit order. Exposed via
     /// [`Self::pending_snapshots`] so handlers can pass them to
     /// `prepare_block_commit` for chained verification.
-    jvt_snapshots: Vec<Arc<JvtSnapshot>>,
-    /// JVT node index built from `jvt_snapshots` for O(1) lookup
-    /// (see [`jvt::TreeReader`] impl).
-    jvt_nodes: JvtNodeIndex,
+    jmt_snapshots: Vec<Arc<JmtSnapshot>>,
+    /// JVT node index built from `jmt_snapshots` for O(1) lookup
+    /// (see [`jmt::TreeReader`] impl).
+    jmt_nodes: JmtNodeIndex,
     /// Per-receipt references for versioned queries
     /// ([`SubstateStore::list_substates_for_node_at_height`]).
     /// Sorted by height ascending.
@@ -218,8 +218,8 @@ impl<S> SubstateView<S> {
     /// Pending JVT snapshots from the anchored chain, in commit order.
     /// Pass to `prepare_block_commit` so chained verification can find
     /// tree nodes from prior unpersisted blocks.
-    pub fn pending_snapshots(&self) -> &[Arc<JvtSnapshot>] {
-        &self.jvt_snapshots
+    pub fn pending_snapshots(&self) -> &[Arc<JmtSnapshot>] {
+        &self.jmt_snapshots
     }
 }
 
@@ -229,8 +229,8 @@ impl<S> SubstateView<S> {
     /// chain index for the duration of the walk without cloning.
     fn from_chain(base: Arc<S>, chain: &[&ChainEntry]) -> Self {
         let mut overlay: OverlayEntries = HashMap::new();
-        let mut jvt_snapshots: Vec<Arc<JvtSnapshot>> = Vec::with_capacity(chain.len());
-        let mut jvt_nodes: JvtNodeIndex = HashMap::new();
+        let mut jmt_snapshots: Vec<Arc<JmtSnapshot>> = Vec::with_capacity(chain.len());
+        let mut jmt_nodes: JmtNodeIndex = HashMap::new();
         let mut versioned_receipts: Vec<(u64, Arc<LocalReceipt>)> = Vec::new();
 
         for entry in chain {
@@ -238,17 +238,17 @@ impl<S> SubstateView<S> {
                 apply_database_updates(&mut overlay, &receipt.database_updates);
                 versioned_receipts.push((entry.height, Arc::clone(receipt)));
             }
-            for (key, node) in &entry.jvt_snapshot.nodes {
-                jvt_nodes.insert(key.clone(), Arc::clone(node));
+            for (key, node) in &entry.jmt_snapshot.nodes {
+                jmt_nodes.insert(key.clone(), Arc::clone(node));
             }
-            jvt_snapshots.push(Arc::clone(&entry.jvt_snapshot));
+            jmt_snapshots.push(Arc::clone(&entry.jmt_snapshot));
         }
 
         Self {
             base,
             overlay,
-            jvt_snapshots,
-            jvt_nodes,
+            jmt_snapshots,
+            jmt_nodes,
             versioned_receipts,
         }
     }
@@ -258,8 +258,8 @@ impl<S> SubstateView<S> {
         Self {
             base,
             overlay: HashMap::new(),
-            jvt_snapshots: Vec::new(),
-            jvt_nodes: HashMap::new(),
+            jmt_snapshots: Vec::new(),
+            jmt_nodes: HashMap::new(),
             versioned_receipts: Vec::new(),
         }
     }
@@ -413,8 +413,8 @@ impl<S: SubstateStore> SubstateStore for SubstateView<S> {
         }
     }
 
-    fn jvt_version(&self) -> u64 {
-        (*self.base).jvt_version()
+    fn jmt_version(&self) -> u64 {
+        (*self.base).jmt_version()
     }
 
     fn state_root_hash(&self) -> Hash {
@@ -426,7 +426,7 @@ impl<S: SubstateStore> SubstateStore for SubstateView<S> {
         node_id: &NodeId,
         block_height: u64,
     ) -> Option<Vec<(u8, DbSortKey, Vec<u8>)>> {
-        let persisted_version = (*self.base).jvt_version();
+        let persisted_version = (*self.base).jmt_version();
 
         // If the requested height is within persisted range, delegate.
         if block_height <= persisted_version {
@@ -488,50 +488,50 @@ impl<S: SubstateStore> SubstateStore for SubstateView<S> {
         )
     }
 
-    fn generate_verkle_proofs(
+    fn generate_merkle_proofs(
         &self,
         storage_keys: &[Vec<u8>],
         block_height: u64,
-    ) -> Option<VerkleInclusionProof> {
+    ) -> Option<MerkleInclusionProof> {
         // Try base first — works for heights already persisted.
-        if let Some(proof) = (*self.base).generate_verkle_proofs(storage_keys, block_height) {
+        if let Some(proof) = (*self.base).generate_merkle_proofs(storage_keys, block_height) {
             return Some(proof);
         }
-        // Beyond persisted — caller should use `generate_verkle_proofs_overlay`
+        // Beyond persisted — caller should use `generate_merkle_proofs_overlay`
         // which uses the JVT overlay via this view's `TreeReader` impl.
         None
     }
 }
 
-/// Override `generate_verkle_proofs` for callers that have a
-/// `jvt::TreeReader`-capable base, using the JVT overlay for unpersisted
+/// Override `generate_merkle_proofs` for callers that have a
+/// `jmt::TreeReader`-capable base, using the JVT overlay for unpersisted
 /// heights.
-impl<S: SubstateStore + jvt::TreeReader + Sync> SubstateView<S> {
+impl<S: SubstateStore + jmt::TreeReader + Sync> SubstateView<S> {
     /// Generate verkle proofs, falling back to the JVT overlay for
     /// unpersisted block heights.
-    pub fn generate_verkle_proofs_overlay(
+    pub fn generate_merkle_proofs_overlay(
         &self,
         storage_keys: &[Vec<u8>],
         block_height: u64,
-    ) -> Option<VerkleInclusionProof> {
-        if let Some(proof) = (*self.base).generate_verkle_proofs(storage_keys, block_height) {
+    ) -> Option<MerkleInclusionProof> {
+        if let Some(proof) = (*self.base).generate_merkle_proofs(storage_keys, block_height) {
             return Some(proof);
         }
         crate::tree::proofs::generate_proof(self, storage_keys, block_height)
     }
 }
 
-impl<S: jvt::TreeReader + Sync> jvt::TreeReader for SubstateView<S> {
-    fn get_node(&self, key: &jvt::NodeKey) -> Option<Arc<jvt::Node>> {
-        self.jvt_nodes
+impl<S: jmt::TreeReader + Sync> jmt::TreeReader for SubstateView<S> {
+    fn get_node(&self, key: &jmt::NodeKey) -> Option<Arc<jmt::Node>> {
+        self.jmt_nodes
             .get(key)
             .cloned()
             .or_else(|| (*self.base).get_node(key))
     }
 
-    fn get_root_key(&self, version: u64) -> Option<jvt::NodeKey> {
-        let root_key = jvt::NodeKey::root(version);
-        if self.jvt_nodes.contains_key(&root_key) {
+    fn get_root_key(&self, version: u64) -> Option<jmt::NodeKey> {
+        let root_key = jmt::NodeKey::root(version);
+        if self.jmt_nodes.contains_key(&root_key) {
             Some(root_key)
         } else {
             (*self.base).get_root_key(version)
@@ -548,7 +548,7 @@ impl<S: crate::ChainWriter> crate::ChainWriter for SubstateView<S> {
         parent_block_height: u64,
         finalized_waves: &[Arc<hyperscale_types::FinalizedWave>],
         block_height: u64,
-        pending_snapshots: &[Arc<JvtSnapshot>],
+        pending_snapshots: &[Arc<JmtSnapshot>],
     ) -> (Hash, Self::PreparedCommit) {
         (*self.base).prepare_block_commit(
             parent_state_root,
@@ -578,16 +578,12 @@ impl<S: crate::ChainWriter> crate::ChainWriter for SubstateView<S> {
         (*self.base).commit_block(block, qc)
     }
 
-    fn jvt_snapshot(prepared: &Self::PreparedCommit) -> &JvtSnapshot {
-        S::jvt_snapshot(prepared)
+    fn jmt_snapshot(prepared: &Self::PreparedCommit) -> &JmtSnapshot {
+        S::jmt_snapshot(prepared)
     }
 
     fn memory_usage_bytes(&self) -> (u64, u64) {
         (*self.base).memory_usage_bytes()
-    }
-
-    fn node_cache_len(&self) -> usize {
-        (*self.base).node_cache_len()
     }
 }
 
@@ -643,7 +639,7 @@ mod tests {
         fn snapshot(&self) -> Self::Snapshot<'_> {
             StubSnapshot
         }
-        fn jvt_version(&self) -> u64 {
+        fn jmt_version(&self) -> u64 {
             0
         }
         fn state_root_hash(&self) -> Hash {
@@ -656,20 +652,20 @@ mod tests {
         ) -> Option<Vec<(u8, DbSortKey, Vec<u8>)>> {
             None
         }
-        fn generate_verkle_proofs(
+        fn generate_merkle_proofs(
             &self,
             _storage_keys: &[Vec<u8>],
             _block_height: u64,
-        ) -> Option<VerkleInclusionProof> {
+        ) -> Option<MerkleInclusionProof> {
             None
         }
     }
 
-    impl jvt::TreeReader for StubStore {
-        fn get_node(&self, _key: &jvt::NodeKey) -> Option<Arc<jvt::Node>> {
+    impl jmt::TreeReader for StubStore {
+        fn get_node(&self, _key: &jmt::NodeKey) -> Option<Arc<jmt::Node>> {
             None
         }
-        fn get_root_key(&self, _version: u64) -> Option<jvt::NodeKey> {
+        fn get_root_key(&self, _version: u64) -> Option<jmt::NodeKey> {
             None
         }
     }
@@ -759,8 +755,8 @@ mod tests {
         })
     }
 
-    fn empty_snapshot() -> Arc<JvtSnapshot> {
-        Arc::new(JvtSnapshot {
+    fn empty_snapshot() -> Arc<JmtSnapshot> {
+        Arc::new(JmtSnapshot {
             base_root: Hash::ZERO,
             base_version: 0,
             result_root: Hash::ZERO,
@@ -776,7 +772,7 @@ mod tests {
             parent_hash: parent,
             height,
             receipts: vec![make_receipt(updates)],
-            jvt_snapshot: empty_snapshot(),
+            jmt_snapshot: empty_snapshot(),
         }
     }
 

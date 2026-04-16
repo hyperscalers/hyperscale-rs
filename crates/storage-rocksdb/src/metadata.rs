@@ -5,7 +5,7 @@
 //! These thin wrappers provide domain-specific names and handle default values.
 
 use crate::typed_cf::{
-    self, CommittedHashEntry, CommittedHeightEntry, CommittedQcEntry, JvtMetadataEntry,
+    self, CommittedHashEntry, CommittedHeightEntry, CommittedQcEntry, JmtMetadataEntry,
     ReadableStore,
 };
 
@@ -39,15 +39,15 @@ pub(crate) fn read_committed_qc(store: &impl ReadableStore) -> Option<QuorumCert
     typed_cf::meta_read::<CommittedQcEntry>(store)
 }
 
-// ─── JVT metadata ────────────────────────────────────────────────────────────
+// ─── JMT metadata ────────────────────────────────────────────────────────────
 
-pub(crate) fn write_jvt_metadata(batch: &mut WriteBatch, version: u64, root: StateRootHash) {
-    typed_cf::meta_write::<JvtMetadataEntry>(batch, &(version, root));
+pub(crate) fn write_jmt_metadata(batch: &mut WriteBatch, version: u64, root: StateRootHash) {
+    typed_cf::meta_write::<JmtMetadataEntry>(batch, &(version, root));
 }
 
-/// Read JVT version + root hash.
+/// Read JMT version + root hash.
 ///
 /// Returns `(0, ZERO)` for an uninitialized database.
-pub(crate) fn read_jvt_metadata(store: &impl ReadableStore) -> (u64, StateRootHash) {
-    typed_cf::meta_read::<JvtMetadataEntry>(store).unwrap_or((0, StateRootHash::ZERO))
+pub(crate) fn read_jmt_metadata(store: &impl ReadableStore) -> (u64, StateRootHash) {
+    typed_cf::meta_read::<JmtMetadataEntry>(store).unwrap_or((0, StateRootHash::ZERO))
 }

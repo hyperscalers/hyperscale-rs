@@ -292,9 +292,9 @@ fn test_transactions_batch_with_indexed_block() {
 // ═══════════════════════════════════════════════════════════════════════
 
 #[test]
-fn test_initial_jvt_version_is_zero() {
+fn test_initial_jmt_version_is_zero() {
     let storage = SimStorage::new();
-    assert_eq!(storage.jvt_version(), 0);
+    assert_eq!(storage.jmt_version(), 0);
 }
 
 #[test]
@@ -304,15 +304,15 @@ fn test_initial_state_root_is_zero() {
 }
 
 #[test]
-fn test_jvt_version_increments_on_commit() {
+fn test_jmt_version_increments_on_commit() {
     let storage = SimStorage::new();
-    assert_eq!(storage.jvt_version(), 0);
+    assert_eq!(storage.jmt_version(), 0);
 
     storage.commit_shared(&make_database_update(vec![1, 2, 3], 0, vec![10], vec![1]));
-    assert_eq!(storage.jvt_version(), 1);
+    assert_eq!(storage.jmt_version(), 1);
 
     storage.commit_shared(&make_database_update(vec![4, 5, 6], 0, vec![20], vec![2]));
-    assert_eq!(storage.jvt_version(), 2);
+    assert_eq!(storage.jmt_version(), 2);
 }
 
 #[test]
@@ -340,7 +340,7 @@ fn test_state_root_deterministic() {
     s2.commit_shared(&updates);
 
     assert_eq!(s1.state_root_hash(), s2.state_root_hash());
-    assert_eq!(s1.jvt_version(), s2.jvt_version());
+    assert_eq!(s1.jmt_version(), s2.jmt_version());
 }
 
 #[test]
@@ -359,7 +359,7 @@ fn test_empty_commit_still_advances_version() {
     let storage = SimStorage::new();
     let updates = DatabaseUpdates::default();
     storage.commit_shared(&updates);
-    assert_eq!(storage.jvt_version(), 1);
+    assert_eq!(storage.jmt_version(), 1);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -397,7 +397,7 @@ fn test_commit_block_empty() {
     let qc = make_test_qc(&block);
     commit_empty(&storage, &block, &qc);
     // Empty block: JVT version still advances to block_height
-    assert_eq!(storage.jvt_version(), 1);
+    assert_eq!(storage.jmt_version(), 1);
 }
 
 #[test]
@@ -452,12 +452,12 @@ fn test_clear() {
 
     // Add some data
     storage.commit_shared(&make_database_update(vec![1, 2, 3], 0, vec![10], vec![1]));
-    assert!(storage.jvt_version() > 0);
+    assert!(storage.jmt_version() > 0);
     assert!(!storage.is_empty());
 
     storage.clear();
 
-    assert_eq!(storage.jvt_version(), 0);
+    assert_eq!(storage.jmt_version(), 0);
     assert_eq!(storage.state_root_hash(), Hash::ZERO);
     assert!(storage.is_empty());
 }
