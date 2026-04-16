@@ -23,8 +23,9 @@
 //! 5. [`FinalizedWave`] — all data needed for block commit
 
 use crate::{
-    compute_padded_merkle_root, Bls12381G2Signature, Hash, ReceiptBundle, RoutableTransaction,
-    ShardGroupId, SignerBitfield, TopologySnapshot, TransactionDecision, ValidatorId,
+    compute_padded_merkle_root, Bls12381G2Signature, Hash, LocalReceipt, ReceiptBundle,
+    RoutableTransaction, ShardGroupId, SignerBitfield, TopologySnapshot, TransactionDecision,
+    ValidatorId,
 };
 use sbor::prelude::*;
 use std::collections::BTreeSet;
@@ -833,6 +834,52 @@ impl FinalizedWave {
             .any(|o| &o.tx_hash == tx_hash)
     }
 
+    /// Reconstruct a `FinalizedWave` from a `WaveCertificate` and a receipt lookup.
+    ///
+    /// Used on the storage/sync serving side to rebuild the in-memory shape
+    /// from committed state. Walks the local EC's `tx_outcomes` (canonical block
+    /// order), fetches each receipt via `lookup`, and synthesizes
+    /// `LocalReceipt::failure()` for aborted txs whose receipts were never
+    /// persisted (matches the synthesis logic in `execution::finalize_wave`).
+    ///
+    /// Returns `None` if:
+    /// - The WaveCertificate lacks a local EC (malformed — should not happen
+    ///   for a committed WC per the `create_wave_certificate` invariant).
+    /// - Any non-aborted tx's receipt is missing from the lookup (peer/storage
+    ///   has incomplete state — syncing peer should try a different source).
+    pub fn reconstruct<F>(certificate: Arc<WaveCertificate>, mut lookup: F) -> Option<Self>
+    where
+        F: FnMut(&Hash) -> Option<Arc<LocalReceipt>>,
+    {
+        let local_ec = certificate
+            .execution_certificates
+            .iter()
+            .find(|ec| ec.wave_id == certificate.wave_id)?;
+
+        let receipts: Vec<ReceiptBundle> = local_ec
+            .tx_outcomes
+            .iter()
+            .map(|outcome| match lookup(&outcome.tx_hash) {
+                Some(receipt) => Some(ReceiptBundle {
+                    tx_hash: outcome.tx_hash,
+                    local_receipt: receipt,
+                    execution_output: None,
+                }),
+                None if outcome.is_aborted() => Some(ReceiptBundle {
+                    tx_hash: outcome.tx_hash,
+                    local_receipt: Arc::new(LocalReceipt::failure()),
+                    execution_output: None,
+                }),
+                None => None,
+            })
+            .collect::<Option<Vec<_>>>()?;
+
+        Some(FinalizedWave {
+            certificate,
+            receipts,
+        })
+    }
+
     /// Aggregate per-tx decisions across all ECs (Aborted > Reject > Accept).
     ///
     /// Iteration order follows the local EC's canonical (block) order.
@@ -1257,5 +1304,153 @@ mod tests {
         let leader1 = wave_leader_at(&wave_id, 2, &committee);
         let leader2 = wave_leader_at(&wave_id, 2, &committee);
         assert_eq!(leader1, leader2);
+    }
+
+    // ─── FinalizedWave::reconstruct ────────────────────────────────────
+
+    fn make_local_ec(wave_id: &WaveId, outcomes: Vec<TxOutcome>) -> Arc<ExecutionCertificate> {
+        Arc::new(ExecutionCertificate::new(
+            wave_id.clone(),
+            wave_id.block_height + 1,
+            compute_global_receipt_root(&outcomes),
+            outcomes,
+            Bls12381G2Signature([0u8; 96]),
+            SignerBitfield::new(4),
+        ))
+    }
+
+    fn make_success_receipt() -> Arc<LocalReceipt> {
+        Arc::new(LocalReceipt {
+            outcome: crate::TransactionOutcome::Success,
+            database_updates: Default::default(),
+            application_events: vec![],
+        })
+    }
+
+    #[test]
+    fn reconstruct_from_all_success_outcomes() {
+        let wave_id = make_wave_id(0, 42, &[1]);
+        let tx_a = Hash::from_bytes(b"tx_a");
+        let tx_b = Hash::from_bytes(b"tx_b");
+
+        let outcomes = vec![
+            TxOutcome {
+                tx_hash: tx_a,
+                outcome: ExecutionOutcome::Executed {
+                    receipt_hash: Hash::from_bytes(b"r_a"),
+                    success: true,
+                },
+            },
+            TxOutcome {
+                tx_hash: tx_b,
+                outcome: ExecutionOutcome::Executed {
+                    receipt_hash: Hash::from_bytes(b"r_b"),
+                    success: true,
+                },
+            },
+        ];
+        let wc = Arc::new(WaveCertificate {
+            wave_id: wave_id.clone(),
+            execution_certificates: vec![make_local_ec(&wave_id, outcomes)],
+        });
+
+        let fw = FinalizedWave::reconstruct(wc, |_| Some(make_success_receipt()))
+            .expect("reconstruction should succeed");
+        assert_eq!(fw.tx_count(), 2);
+        let hashes: Vec<Hash> = fw.tx_hashes().collect();
+        assert_eq!(hashes, vec![tx_a, tx_b]);
+        assert_eq!(fw.receipts.len(), 2);
+        assert_eq!(fw.receipts[0].tx_hash, tx_a);
+        assert_eq!(fw.receipts[1].tx_hash, tx_b);
+    }
+
+    #[test]
+    fn reconstruct_synthesizes_failure_for_aborted_tx_without_receipt() {
+        let wave_id = make_wave_id(0, 42, &[1]);
+        let tx_a = Hash::from_bytes(b"tx_a");
+        let tx_b = Hash::from_bytes(b"tx_b_aborted");
+
+        let outcomes = vec![
+            TxOutcome {
+                tx_hash: tx_a,
+                outcome: ExecutionOutcome::Executed {
+                    receipt_hash: Hash::from_bytes(b"r_a"),
+                    success: true,
+                },
+            },
+            TxOutcome {
+                tx_hash: tx_b,
+                outcome: ExecutionOutcome::Aborted,
+            },
+        ];
+        let wc = Arc::new(WaveCertificate {
+            wave_id: wave_id.clone(),
+            execution_certificates: vec![make_local_ec(&wave_id, outcomes)],
+        });
+
+        // Lookup returns Some for tx_a, None for tx_b (never persisted — pure abort).
+        let fw = FinalizedWave::reconstruct(wc, |h| {
+            if *h == tx_a {
+                Some(make_success_receipt())
+            } else {
+                None
+            }
+        })
+        .expect("aborted tx without receipt should synthesize failure");
+
+        assert_eq!(fw.receipts.len(), 2);
+        assert_eq!(fw.receipts[1].tx_hash, tx_b);
+        assert_eq!(
+            fw.receipts[1].local_receipt.outcome,
+            crate::TransactionOutcome::Failure,
+            "synthesized receipt should have Failure outcome"
+        );
+    }
+
+    #[test]
+    fn reconstruct_fails_when_non_aborted_receipt_missing() {
+        let wave_id = make_wave_id(0, 42, &[1]);
+        let tx_a = Hash::from_bytes(b"tx_a");
+
+        let outcomes = vec![TxOutcome {
+            tx_hash: tx_a,
+            outcome: ExecutionOutcome::Executed {
+                receipt_hash: Hash::from_bytes(b"r_a"),
+                success: true,
+            },
+        }];
+        let wc = Arc::new(WaveCertificate {
+            wave_id: wave_id.clone(),
+            execution_certificates: vec![make_local_ec(&wave_id, outcomes)],
+        });
+
+        // Lookup always returns None — but tx is not aborted, so failure synthesis
+        // is not allowed.
+        let fw = FinalizedWave::reconstruct(wc, |_| None);
+        assert!(
+            fw.is_none(),
+            "reconstruction should fail when non-aborted receipt is missing"
+        );
+    }
+
+    #[test]
+    fn reconstruct_fails_when_local_ec_missing() {
+        let wave_id = make_wave_id(0, 42, &[1]);
+        // Only a remote EC (shard 1), no local EC matching wc.wave_id.
+        let remote_wave_id = make_wave_id(1, 42, &[0]);
+        let remote_ec = make_local_ec(
+            &remote_wave_id,
+            vec![TxOutcome {
+                tx_hash: Hash::from_bytes(b"tx"),
+                outcome: ExecutionOutcome::Aborted,
+            }],
+        );
+        let wc = Arc::new(WaveCertificate {
+            wave_id,
+            execution_certificates: vec![remote_ec],
+        });
+
+        let fw = FinalizedWave::reconstruct(wc, |_| Some(make_success_receipt()));
+        assert!(fw.is_none(), "reconstruction requires the local EC");
     }
 }
