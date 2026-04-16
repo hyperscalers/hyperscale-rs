@@ -2678,7 +2678,7 @@ impl BftState {
         block: Arc<Block>,
         block_hash: Hash,
         finalized_waves: Vec<Arc<FinalizedWave>>,
-        provision_hashes: Vec<Hash>,
+        provisions: Vec<Arc<Provision>>,
     ) -> Vec<Action> {
         // Take the pending proposal - if it doesn't match (height, round), something is wrong
         let Some(pending) = self.pending_proposal.take() else {
@@ -2705,9 +2705,9 @@ impl BftState {
 
         let has_certificates = !block.certificates.is_empty();
 
-        // Store our own block as pending (with all finalized waves)
+        // Store our own block as pending (with all finalized waves + provisions).
         let mut pending_block =
-            PendingBlock::from_complete_block(&block, finalized_waves, provision_hashes);
+            PendingBlock::from_complete_block(&block, finalized_waves, provisions);
 
         let total_tx_count = pending_block.transaction_count();
         info!(
@@ -3199,20 +3199,23 @@ impl BftState {
         let mut current_qc = certifying_qc;
 
         loop {
-            // Get the block and its finalized waves to commit.
-            // Provision hashes come from the block manifest (always available
-            // on PendingBlock) rather than batch data (which may not be fetched
-            // for sync/certified blocks). The consumer resolves hashes to batch
-            // data via the ProvisionCoordinator.
-            let (block, provision_hashes) =
-                if let Some(block) = self.certified_blocks.get(&current_hash) {
-                    (Some(block.clone()), vec![])
-                } else if let Some(pending) = self.pending_blocks.get(&current_hash) {
-                    let prov_hashes = pending.manifest().provision_hashes.clone();
-                    (pending.block().map(|b| (*b).clone()), prov_hashes)
-                } else {
-                    (None, vec![])
-                };
+            // Get the block and its provisions to commit.
+            //
+            // `PendingBlock.received_provisions` is populated during block
+            // assembly (gossip or proposer self-fill), so if the block is in
+            // `pending_blocks` its provisions are available inline — no
+            // lookup against any external cache. `certified_blocks` doesn't
+            // track provisions; those blocks commit with an empty slice
+            // (cross-shard execution for certified-only blocks is handled via
+            // SyncResumed / post-sync fetch).
+            let (block, provisions) = if let Some(block) = self.certified_blocks.get(&current_hash)
+            {
+                (Some(block.clone()), Vec::new())
+            } else if let Some(pending) = self.pending_blocks.get(&current_hash) {
+                (pending.block().map(|b| (*b).clone()), pending.provisions())
+            } else {
+                (None, Vec::new())
+            };
 
             let Some(block) = block else {
                 warn!("Block {} not found for commit", current_hash);
@@ -3249,7 +3252,7 @@ impl BftState {
             actions.push(Action::CommitBlock {
                 block: block.clone(),
                 qc: current_qc.clone(),
-                provision_hashes,
+                provisions,
             });
             // Only the block proposer gossips the committed header globally.
             // Other validators rely on receiving it via gossip propagation.
@@ -3528,20 +3531,21 @@ impl BftState {
             }
         }
 
-        // Get provision hashes from the pending block manifest if available,
-        // otherwise empty (the consumer will use the ProvisionCoordinator to
-        // resolve any missing provisions).
-        let provision_hashes = self
+        // Get provision batches from the pending block if we happen to have one
+        // (rare for synced blocks — they bypass consensus assembly). Otherwise
+        // commit with an empty slice and rely on `SyncResumed` / post-sync fetch
+        // to deliver provisions for blocks still within the execution window.
+        let provisions = self
             .pending_blocks
             .get(&block_hash)
-            .map(|pb| pb.manifest().provision_hashes.clone())
+            .map(|pb| pb.provisions())
             .unwrap_or_default();
 
         // Emit CommitBlock (unified with consensus path).
         let mut actions = vec![Action::CommitBlock {
             block: block.clone(),
             qc,
-            provision_hashes,
+            provisions,
         }];
 
         // Cache constructed FinalizedWaves so other syncing nodes can fetch

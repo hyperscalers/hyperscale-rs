@@ -554,11 +554,8 @@ pub enum Action {
         block: Block,
         /// The QC that certified this block.
         qc: QuorumCertificate,
-        /// Provision batch hashes from the block manifest. Resolved to actual
-        /// batch data by the consumer (NodeStateMachine) via the ProvisionCoordinator.
-        /// Using hashes instead of batch data ensures both consensus and sync
-        /// commit paths carry identical information — the manifest is always available.
-        provision_hashes: Vec<Hash>,
+        /// Provisions referenced by this block.
+        provisions: Vec<Arc<Provision>>,
     },
 
     /// Emit transaction status update for RPC status cache.

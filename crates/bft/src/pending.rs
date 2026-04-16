@@ -77,24 +77,31 @@ impl PendingBlock {
 
     /// Create a pending block from a complete block (proposer's own block).
     ///
-    /// The proposer already has all transactions and finalized waves.
-    /// Provision hashes are pre-computed and sorted by the action handler.
+    /// The proposer already has all transactions, finalized waves, and provision
+    /// batches. Provision hashes are derived (and sorted) from the batches so the
+    /// resulting `PendingBlock` is self-contained: both the manifest hashes and
+    /// `received_provisions` are populated from the same source.
     pub fn from_complete_block(
         block: &Block,
         finalized_waves: Vec<Arc<FinalizedWave>>,
-        provision_hashes: Vec<Hash>,
+        provisions: Vec<Arc<Provision>>,
     ) -> Self {
+        let mut provision_hashes: Vec<Hash> = provisions.iter().map(|p| p.hash()).collect();
+        provision_hashes.sort();
         let mut manifest = BlockManifest::from_block(block);
         manifest.provision_hashes = provision_hashes;
-        // Proposer already has all provision data in the ProvisionCoordinator —
-        // no missing hashes, so is_complete() returns true immediately.
+        let mut received_provisions: HashMap<Hash, Arc<Provision>> =
+            HashMap::with_capacity(provisions.len());
+        for batch in provisions {
+            received_provisions.insert(batch.hash(), batch);
+        }
         let mut pending = Self {
             header: block.header.clone(),
             received_transactions: HashMap::new(),
             missing_transaction_hashes: HashSet::new(),
             received_waves: BTreeMap::new(),
             missing_wave_hashes: HashSet::new(),
-            received_provisions: HashMap::new(),
+            received_provisions,
             missing_provision_hashes: HashSet::new(),
             manifest,
             constructed_block: None,
@@ -192,6 +199,15 @@ impl PendingBlock {
     /// Get the missing provision batch hashes as a Vec.
     pub fn missing_provisions(&self) -> Vec<Hash> {
         self.missing_provision_hashes.iter().copied().collect()
+    }
+
+    /// All received provision batches, in arbitrary order.
+    ///
+    /// When `is_complete()` is true, this contains the full set of provisions
+    /// referenced by the block manifest — no lookup against any external cache
+    /// is needed at commit time.
+    pub fn provisions(&self) -> Vec<Arc<Provision>> {
+        self.received_provisions.values().cloned().collect()
     }
 
     /// Check if this pending block needs a specific provision batch.

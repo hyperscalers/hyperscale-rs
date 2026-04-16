@@ -66,7 +66,11 @@ type PreparedCommitMap<S> =
 pub(crate) struct PendingCommit {
     pub block: Arc<Block>,
     pub qc: Arc<QuorumCertificate>,
-    pub provision_hashes: Vec<Hash>,
+    /// Provision batches referenced by this block. Carried inline from
+    /// `Action::CommitBlock` through to the downstream `BlockCommitted`
+    /// event, so consumers never rely on a lookup against the
+    /// ProvisionCoordinator cache.
+    pub provisions: Vec<Arc<Provision>>,
     /// Whether `BlockCommitted` was already fired immediately
     /// in `accumulate_block_commit` (true) or deferred due to
     /// backpressure (false). The flush closure uses this to

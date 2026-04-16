@@ -300,12 +300,12 @@ where
             Action::CommitBlock {
                 block,
                 qc,
-                provision_hashes,
+                provisions,
             } => {
                 self.accumulate_block_commit(super::PendingCommit {
                     block: Arc::new(block),
                     qc: Arc::new(qc),
-                    provision_hashes,
+                    provisions,
                     committed_notified: false, // set by accumulate_block_commit
                 });
             }
@@ -469,7 +469,7 @@ where
                 block_hash,
                 height: height.0,
                 block: Arc::unwrap_or_clone(Arc::clone(&commit.block)),
-                provision_hashes: commit.provision_hashes.clone(),
+                provisions: commit.provisions.clone(),
             });
         } else {
             tracing::debug!(
@@ -636,7 +636,7 @@ where
                         block_hash: block_hashes[i],
                         height,
                         block: Arc::unwrap_or_clone(commit.block),
-                        provision_hashes: commit.provision_hashes,
+                        provisions: commit.provisions,
                     }));
                 }
             }

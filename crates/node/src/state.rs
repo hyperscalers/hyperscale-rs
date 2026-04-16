@@ -315,7 +315,7 @@ impl NodeStateMachine {
         block_hash: Hash,
         height: u64,
         block: Block,
-        provision_hashes: Vec<Hash>,
+        provisions: Vec<Arc<Provision>>,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
         let block_height = BlockHeight(height);
@@ -359,23 +359,23 @@ impl NodeStateMachine {
                 .on_block_committed(self.topology.snapshot()),
         );
 
-        // Apply committed provisions deterministically. Resolve provision hashes
-        // to batch data via the ProvisionCoordinator — this works identically for
-        // both consensus and sync commit paths since hashes come from the manifest.
-        let provision_batches: Vec<Arc<Provision>> = provision_hashes
-            .iter()
-            .filter_map(|h| self.provisions.get_batch_by_hash(h))
-            .collect();
-        if !provision_batches.is_empty() {
+        // Apply committed provisions deterministically. Provision batches are
+        // carried inline by `CommitBlock`/`BlockCommitted` (populated from
+        // `PendingBlock.received_provisions` on the consensus path). No
+        // lookup-by-hash against the ProvisionCoordinator — the data arrives
+        // with the event, which eliminates the silent-drop failure mode when
+        // the coordinator's cache doesn't have a batch.
+        if !provisions.is_empty() {
             actions.extend(self.execution.apply_committed_provisions(
                 self.topology.snapshot(),
-                &provision_batches,
+                &provisions,
                 height,
                 block_hash,
             ));
         }
 
         // Let provisions coordinator handle cleanup + fallback timeouts.
+        let provision_hashes: Vec<Hash> = provisions.iter().map(|p| p.hash()).collect();
         actions.extend(self.provisions.on_block_committed(
             self.topology.snapshot(),
             &block,
@@ -563,7 +563,7 @@ impl StateMachine for NodeStateMachine {
                 block,
                 block_hash,
                 finalized_waves,
-                provision_hashes,
+                provisions,
             } => self.bft.on_proposal_built(
                 self.topology.snapshot(),
                 height,
@@ -571,7 +571,7 @@ impl StateMachine for NodeStateMachine {
                 block.clone(),
                 block_hash,
                 finalized_waves,
-                provision_hashes,
+                provisions,
             ),
 
             // ── Block Committed ──────────────────────────────────────────
@@ -579,8 +579,8 @@ impl StateMachine for NodeStateMachine {
                 block_hash,
                 height,
                 block,
-                provision_hashes,
-            } => self.on_block_committed(block_hash, height, block, provision_hashes),
+                provisions,
+            } => self.on_block_committed(block_hash, height, block, provisions),
 
             // ── Block Persisted (RocksDB write complete) ───────────────
             // Advances `last_committed_height`, which is one of the two

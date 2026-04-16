@@ -410,7 +410,7 @@ pub(crate) fn handle_delegated_action<
                 finalized_waves.clone(),
                 shard_group_id,
                 waves,
-                provision_hashes.clone(),
+                provision_hashes,
                 parent_in_flight,
                 finalized_tx_count,
                 &pending_snapshots,
@@ -434,7 +434,7 @@ pub(crate) fn handle_delegated_action<
                     block: Arc::new(result.block),
                     block_hash,
                     finalized_waves,
-                    provision_hashes,
+                    provisions: provision_batches,
                 })],
                 prepared_commit,
             })

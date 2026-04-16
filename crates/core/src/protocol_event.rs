@@ -97,9 +97,7 @@ pub enum ProtocolEvent {
         block_hash: Hash,
         height: u64,
         block: Block,
-        /// Provision batch hashes from the block manifest. Resolved to actual
-        /// batch data by the consumer via the ProvisionCoordinator.
-        provision_hashes: Vec<Hash>,
+        provisions: Vec<Arc<Provision>>,
     },
 
     /// A block has been durably persisted to RocksDB.
@@ -154,10 +152,8 @@ pub enum ProtocolEvent {
         round: u64,
         block: Arc<Block>,
         block_hash: Hash,
-        /// Finalized waves included in this block (carries receipts for atomic commit).
         finalized_waves: Vec<Arc<FinalizedWave>>,
-        /// Provision batch hashes included in this block (for PendingBlock DA tracking).
-        provision_hashes: Vec<Hash>,
+        provisions: Vec<Arc<Provision>>,
     },
 
     // ═══════════════════════════════════════════════════════════════════════

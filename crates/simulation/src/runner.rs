@@ -518,7 +518,7 @@ impl SimulationRunner {
                     block_hash: genesis_block.hash(),
                     height: 0,
                     block: genesis_block.clone(),
-                    provision_hashes: vec![],
+                    provisions: vec![],
                 });
                 self.schedule_event(node_index, self.now, genesis_commit_event);
             }
