@@ -161,13 +161,35 @@ impl hyperscale_storage::ChainWriter for RocksDbStorage {
                 &qc,
                 sync,
             );
-            assert!(
-                applied,
-                "BUG: prepared commit fast path failed at height {} — \
-                 serialized verification should guarantee freshness",
-                block.header.height.0
-            );
-            roots.push(result_root);
+            if applied {
+                roots.push(result_root);
+            } else {
+                // Fast path failed — RocksDB state advanced since preparation
+                // (e.g., sync path committed blocks between prepare and flush).
+                // Check if this height was already committed (sync path got
+                // there first) — if so, skip. Otherwise, fall back to full
+                // recomputation from current RocksDB state.
+                let (current_version, _) = {
+                    let _guard = self.commit_lock.lock().unwrap();
+                    SnapshotTreeStore::new(&self.db).read_jmt_metadata()
+                };
+                if block.header.height.0 <= current_version {
+                    tracing::debug!(
+                        height = block.header.height.0,
+                        current_version,
+                        "PreparedCommit stale — block already committed, skipping"
+                    );
+                    roots.push(result_root);
+                } else {
+                    tracing::debug!(
+                        height = block.header.height.0,
+                        current_version,
+                        "PreparedCommit stale, falling back to commit_block"
+                    );
+                    let root = self.commit_block(&block, &qc);
+                    roots.push(root);
+                }
+            }
         }
 
         roots

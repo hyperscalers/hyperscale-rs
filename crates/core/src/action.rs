@@ -558,6 +558,21 @@ pub enum Action {
         provisions: Vec<Arc<Provision>>,
     },
 
+    /// Commit a synced block. The io_loop calls `prepare_block_commit`
+    /// inline (JMT computation), inserts the snapshot into PendingChain
+    /// (so child verifications can find the parent's tree nodes), then
+    /// feeds the block into the same `flush_block_commits` pipeline as
+    /// consensus blocks for async RocksDB persistence.
+    CommitSyncedBlock {
+        block: Block,
+        qc: QuorumCertificate,
+        provisions: Vec<Arc<Provision>>,
+        /// Parent block's state root — base state for JMT computation.
+        parent_state_root: Hash,
+        /// Parent block's height — JMT parent version.
+        parent_block_height: u64,
+    },
+
     /// Emit transaction status update for RPC status cache.
     ///
     /// Emitted by the mempool whenever a transaction's status changes:
@@ -926,6 +941,7 @@ impl Action {
 
             // External Notifications
             Action::CommitBlock { .. } => "CommitBlock",
+            Action::CommitSyncedBlock { .. } => "CommitSyncedBlock",
             Action::EmitTransactionStatus { .. } => "EmitTransactionStatus",
 
             // Storage - Consensus

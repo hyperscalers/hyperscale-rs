@@ -14,7 +14,7 @@ use hyperscale_types::{Hash, LocalReceipt, MerkleInclusionProof, NodeId};
 use radix_common::prelude::DatabaseUpdate;
 use radix_substate_store_interface::interface::SubstateDatabase;
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, RwLock};
 
 /// One block's worth of pending state, indexed by block hash in
 /// [`PendingChain::entries`].
@@ -39,28 +39,10 @@ pub struct ChainEntry {
 /// `parent_hash` doesn't lead back to the committed chain) are not
 /// visited and contribute nothing — the orphan-corruption bug becomes
 /// impossible by construction.
-///
-/// **Memoization.** Built views are cached by anchor `parent_hash` in a
-/// per-anchor [`OnceLock`]. Concurrent `view_at(X)` calls serialize on
-/// the cell; only the first builds, the rest receive the result via the
-/// shared `Arc`. The build runs without the cache lock held, so
-/// unrelated anchors don't contend.
-///
-/// **Selective invalidation.**
-/// - [`Self::insert`] never invalidates: a fresh entry can only affect
-///   views at descendants, which can't exist yet.
-/// - [`Self::prune`] drops only cache entries whose anchor has
-///   `height ≤ committed_height`. Higher anchors captured their chain at
-///   build time and remain valid.
 pub struct PendingChain<S> {
     base: Arc<S>,
     entries: RwLock<HashMap<Hash, ChainEntry>>,
-    view_cache: RwLock<HashMap<Hash, ViewCell<S>>>,
 }
-
-/// Per-anchor cache cell. `OnceLock` serializes concurrent
-/// `view_at(X)` calls so only the first thread builds the view.
-type ViewCell<S> = Arc<OnceLock<Arc<SubstateView<S>>>>;
 
 impl<S> PendingChain<S>
 where
@@ -71,15 +53,10 @@ where
         Self {
             base,
             entries: RwLock::new(HashMap::new()),
-            view_cache: RwLock::new(HashMap::new()),
         }
     }
 
-    /// Append an entry. Idempotent on `(block_hash, parent_hash)`.
-    ///
-    /// Does not touch `view_cache` — a fresh entry can only affect views
-    /// anchored at this block or its descendants, neither of which can
-    /// have been cached yet.
+    /// Append an entry.
     pub fn insert(&self, block_hash: Hash, entry: ChainEntry) {
         self.entries.write().unwrap().insert(block_hash, entry);
     }
@@ -88,15 +65,10 @@ where
     /// `BlockPersisted`. Also drops cache entries whose anchor is at or
     /// below the committed height — higher-anchor views remain valid.
     pub fn prune(&self, committed_height: u64) {
-        let mut entries = self.entries.write().unwrap();
-        entries.retain(|_, e| e.height > committed_height);
-        let surviving_hashes = entries
-            .keys()
-            .copied()
-            .collect::<std::collections::HashSet<_>>();
-        drop(entries);
-        let mut cache = self.view_cache.write().unwrap();
-        cache.retain(|anchor_hash, _| surviving_hashes.contains(anchor_hash));
+        self.entries
+            .write()
+            .unwrap()
+            .retain(|_, e| e.height > committed_height);
     }
 
     /// Number of pending entries (for diagnostics / metrics).
@@ -109,27 +81,16 @@ where
         self.entries.read().unwrap().is_empty()
     }
 
-    /// Build (or fetch from cache) a view anchored at `parent_hash`.
+    /// Build a view anchored at `parent_hash`.
     ///
     /// The view sees state through `parent_hash` and all of its committed
     /// ancestors back to the persisted tip. Orphaned blocks not on this
     /// chain are invisible.
-    ///
-    /// Concurrent calls for the same `parent_hash` serialize on a
-    /// [`OnceLock`] and share the resulting `Arc<SubstateView>`.
-    ///
-    /// **Prune race:** if [`Self::prune`] drops the cell between a caller
-    /// observing it and invoking `get_or_init`, a subsequent `view_at`
-    /// installs a fresh cell and both builds run to completion. Each
-    /// result is internally consistent with the entry snapshot captured
-    /// at its build time — the extra work is a perf hit, not a
-    /// correctness issue.
     pub fn view_at(self: &Arc<Self>, parent_hash: Hash) -> Arc<SubstateView<S>> {
-        let cell = self.cell_for(parent_hash);
-        Arc::clone(cell.get_or_init(|| Arc::new(self.build_view(parent_hash))))
+        Arc::new(self.build_view(parent_hash))
     }
 
-    /// Build (or fetch) a view anchored at the latest committed block.
+    /// Build a view anchored at the latest committed block.
     /// For actions without a natural parent (RPC reads, fetch handlers).
     ///
     /// If no blocks have been committed yet, returns a view with no
@@ -139,21 +100,6 @@ where
             Some(h) => self.view_at(h),
             None => Arc::new(SubstateView::base_only(Arc::clone(&self.base))),
         }
-    }
-
-    /// Get-or-create the `OnceLock` cell for an anchor. The outer locks
-    /// only protect the cache map itself; the cell's init runs without
-    /// any cache lock held.
-    fn cell_for(&self, parent_hash: Hash) -> Arc<OnceLock<Arc<SubstateView<S>>>> {
-        if let Some(cell) = self.view_cache.read().unwrap().get(&parent_hash) {
-            return Arc::clone(cell);
-        }
-        let mut cache = self.view_cache.write().unwrap();
-        Arc::clone(
-            cache
-                .entry(parent_hash)
-                .or_insert_with(|| Arc::new(OnceLock::new())),
-        )
     }
 
     /// Walk `parent_hash` back through ancestors and flatten the chain
@@ -781,25 +727,8 @@ mod tests {
     }
 
     #[test]
-    fn insert_does_not_invalidate_cache() {
+    fn prune_drops_old_entries() {
         let chain = empty_chain();
-        let anchor = Hash::from_bytes(b"anchor");
-        let _ = chain.view_at(anchor); // populate cache
-        assert_eq!(chain.view_cache.read().unwrap().len(), 1);
-
-        chain.insert(
-            Hash::from_bytes(b"new"),
-            entry_at(Hash::ZERO, 1, DatabaseUpdates::default()),
-        );
-        // Cache cell should still be present; insert does not clear it.
-        assert_eq!(chain.view_cache.read().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn prune_drops_only_low_anchor_cache_entries() {
-        let chain = empty_chain();
-
-        // Insert entries at heights 1, 2, 3.
         let h1 = Hash::from_bytes(b"h1");
         let h2 = Hash::from_bytes(b"h2");
         let h3 = Hash::from_bytes(b"h3");
@@ -807,19 +736,9 @@ mod tests {
         chain.insert(h2, entry_at(h1, 2, DatabaseUpdates::default()));
         chain.insert(h3, entry_at(h2, 3, DatabaseUpdates::default()));
 
-        // Cache views anchored at h1, h2, h3.
-        let _ = chain.view_at(h1);
-        let _ = chain.view_at(h2);
-        let _ = chain.view_at(h3);
-        assert_eq!(chain.view_cache.read().unwrap().len(), 3);
-
-        // Prune through height 2 — h1 and h2 entries removed; only h3
-        // anchor's cache entry survives.
         chain.prune(2);
         assert_eq!(chain.entries.read().unwrap().len(), 1);
-        let cache = chain.view_cache.read().unwrap();
-        assert_eq!(cache.len(), 1);
-        assert!(cache.contains_key(&h3));
+        assert!(chain.entries.read().unwrap().contains_key(&h3));
     }
 
     #[test]
@@ -881,22 +800,6 @@ mod tests {
             view.get_raw_substate_by_db_key(&pk, &DbSortKey(vec![1])),
             Some(vec![10]),
         );
-    }
-
-    #[test]
-    fn concurrent_view_at_serializes_on_oncelock() {
-        // Same anchor returns the same Arc — both threads see the same view.
-        let chain = empty_chain();
-        let h1 = Hash::from_bytes(b"h1");
-        chain.insert(h1, entry_at(Hash::ZERO, 1, DatabaseUpdates::default()));
-
-        let chain_a = Arc::clone(&chain);
-        let chain_b = Arc::clone(&chain);
-        let t1 = std::thread::spawn(move || chain_a.view_at(h1));
-        let t2 = std::thread::spawn(move || chain_b.view_at(h1));
-        let v1 = t1.join().unwrap();
-        let v2 = t2.join().unwrap();
-        assert!(Arc::ptr_eq(&v1, &v2));
     }
 
     #[test]

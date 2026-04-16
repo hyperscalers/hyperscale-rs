@@ -229,18 +229,6 @@ pub struct BftState {
     /// transactions), we buffer the commit here and retry when the data arrives.
     pending_commits_awaiting_data: HashMap<Hash, (u64, QuorumCertificate)>,
 
-    /// Synced blocks awaiting state-root verification before commit.
-    ///
-    /// The sync path used to call `record_block_committed` eagerly (before
-    /// VerifyStateRoot completed), which advanced `committed_height` before
-    /// `verified_state_roots` / `last_committed_height` were ready. This
-    /// caused child verifications to defer indefinitely and starved proposers.
-    ///
-    /// Now `apply_synced_block` stashes the block here and only commits when
-    /// `on_state_root_verified` confirms the synced block's state root —
-    /// the same invariant as the consensus path.
-    pending_synced_commits: HashMap<Hash, (Block, QuorumCertificate)>,
-
     /// In-flight proposal awaiting `Event::ProposalBuilt` callback.
     pending_proposal: Option<PendingProposal>,
 
@@ -348,7 +336,6 @@ impl BftState {
             sync: SyncManager::new(),
             pending_commits: std::collections::BTreeMap::new(),
             pending_commits_awaiting_data: HashMap::new(),
-            pending_synced_commits: HashMap::new(),
             pending_proposal: None,
             committed_tx_lookup: HashMap::new(),
             recently_committed_txs: std::collections::HashSet::new(),
@@ -1087,11 +1074,6 @@ impl BftState {
         // provisions (derived from wave union) and missing execution certificates.
         let waves = hyperscale_types::compute_waves(topology, next_height, &transactions);
 
-        // Empty proposals (no finalized waves with receipts) don't need the parent's
-        // JMT overlay — `prepare_block_commit` takes a noop fast path that returns
-        // parent_state_root unchanged. Only non-empty proposals need the defer gate.
-        let has_receipts = waves_to_propose.iter().any(|fw| !fw.receipts.is_empty());
-
         let proposal_action = Action::BuildProposal {
             shard_group_id: topology.local_shard(),
             proposer: topology.local_validator_id(),
@@ -1116,17 +1098,18 @@ impl BftState {
             duration: self.config.proposal_interval,
         }];
 
-        // Dispatch unless the proposal has receipts AND the parent's tree nodes
-        // aren't available yet. When deferred, do NOT set pending_proposal —
-        // that way the next proposal timer tick re-checks parent_tree_available
-        // and dispatches as soon as it becomes true. Setting pending_proposal
-        // here would make the next tick hit the "build in flight" guard and
-        // skip the retry, which is how we end up in a 5s view-change loop
-        // whenever the async try_unblock_proposal callback is slow or missed.
-        if !has_receipts
-            || self
-                .verification
-                .parent_tree_available(parent_block_height, parent_hash)
+        // Dispatch unless the parent's tree nodes aren't available yet.
+        // Even empty blocks need the parent root node — noop_jmt_snapshot
+        // copies it to the new version so the overlay chain stays intact.
+        // Without this, a child block's VerifyStateRoot hits
+        // ParentVersionMissing when looking up the empty block's version.
+        //
+        // When deferred, do NOT set pending_proposal — that way the next
+        // proposal timer tick re-checks parent_tree_available and dispatches
+        // as soon as it becomes true.
+        if self
+            .verification
+            .parent_tree_available(parent_block_height, parent_hash)
         {
             // Track that a build is in flight (for correlation with ProposalBuilt).
             self.pending_proposal = Some(PendingProposal {
@@ -1986,31 +1969,40 @@ impl BftState {
                 // certified_in_flight is unreliable here — it may reflect THIS
                 // block's value (QC formed first) and the parent may have been
                 // pruned by the commit that QC triggered. If parent is gone,
-                // skip the vote; the block will be committed via sync.
+                // skip the vote but still run the verification pipeline —
+                // VerifyStateRoot produces the PreparedCommit that the commit
+                // path needs. Without it, flush_block_commits blocks forever
+                // if the consensus path commits this block (QC formed by others).
+                let skip_vote;
                 {
                     let parent_in_flight = if block.header.parent_qc.is_genesis() {
+                        skip_vote = false;
                         0
                     } else if let Some(h) = self.get_header_by_hash(block.header.parent_hash) {
+                        skip_vote = false;
                         h.in_flight
                     } else {
                         trace!(
                             block_hash = ?block_hash,
-                            "Skipping vote — parent pruned, block will commit via sync"
+                            "Skipping vote — parent pruned, still verifying for PreparedCommit"
                         );
-                        return vec![];
+                        skip_vote = true;
+                        0 // unused — in-flight check is skipped
                     };
-                    let finalized_tx_count: u32 = pending
-                        .finalized_waves()
-                        .iter()
-                        .map(|fw| fw.tx_count() as u32)
-                        .sum();
-                    if !self.verification.verify_in_flight(
-                        block_hash,
-                        &block,
-                        parent_in_flight,
-                        finalized_tx_count,
-                    ) {
-                        return vec![];
+                    if !skip_vote {
+                        let finalized_tx_count: u32 = pending
+                            .finalized_waves()
+                            .iter()
+                            .map(|fw| fw.tx_count() as u32)
+                            .sum();
+                        if !self.verification.verify_in_flight(
+                            block_hash,
+                            &block,
+                            parent_in_flight,
+                            finalized_tx_count,
+                        ) {
+                            return vec![];
+                        }
                     }
                 }
 
@@ -2096,7 +2088,11 @@ impl BftState {
                 }
 
                 // If any verifications were initiated, wait for them to complete.
-                if !verification_actions.is_empty() || !self.verification.is_block_verified(&block)
+                // When skip_vote is set (parent pruned), return after initiating
+                // verifications — we need the PreparedCommit but won't vote.
+                if skip_vote
+                    || !verification_actions.is_empty()
+                    || !self.verification.is_block_verified(&block)
                 {
                     return verification_actions;
                 }
@@ -2653,23 +2649,11 @@ impl BftState {
                 "Block root verification FAILED"
             );
             self.pending_blocks.remove(&block_hash);
-            self.pending_synced_commits.remove(&block_hash);
             return vec![];
         }
 
-        // Synced blocks: commit now that state root is verified.
-        // This is the deferred commit from apply_synced_block — only state
-        // root verification is required (synced blocks don't go through the
-        // full vote pipeline, the QC already attests the block).
-        if kind == VerificationKind::StateRoot {
-            if let Some((block, qc)) = self.pending_synced_commits.remove(&block_hash) {
-                return self.commit_synced_block(topology, block_hash, block, qc);
-            }
-        }
-
         let Some(pending_block) = self.pending_blocks.get(&block_hash) else {
-            // Not a consensus block and not a synced block — likely already
-            // committed or evicted.
+            // Block not in pending — likely already committed or evicted.
             debug!(
                 block_hash = ?block_hash,
                 ?kind,
@@ -3496,12 +3480,11 @@ impl BftState {
 
     /// Apply a synced block after QC verification (or for genesis QC).
     ///
-    /// Initiates state root verification through the same pipeline as
-    /// consensus blocks. The actual commit (`record_block_committed` +
-    /// `Action::CommitBlock`) is deferred until `on_state_root_verified`
-    /// confirms the block — matching the consensus path invariant that
-    /// `committed_height` only advances when the block's JMT snapshot is
-    /// in the PendingChain and the PreparedCommit is available.
+    /// Commits the block immediately: advances `committed_height` and emits
+    /// `CommitSyncedBlock` which the io_loop handles synchronously (inline
+    /// JMT computation + persist + fsync). No async VerifyStateRoot dispatch,
+    /// no PreparedCommit rendezvous — the parent's JMT is always in RocksDB
+    /// before the child starts, eliminating ParentVersionMissing panics.
     fn apply_synced_block(
         &mut self,
         topology: &TopologySnapshot,
@@ -3520,37 +3503,18 @@ impl BftState {
             "Applying synced block"
         );
 
-        // Parent state for verification: use certified_state_root (tracks
-        // the QC-attested chain) and the higher of committed or sync-applied
-        // height. We no longer advance committed_height here — that happens
-        // in commit_synced_block when VerifyStateRoot completes.
+        // Capture parent state for JMT computation BEFORE advancing heights.
         let parent_state_root = self.certified_state_root;
-        let parent_block_height = self.sync.sync_applied_height().max(self.committed_height);
+        let parent_block_height = self.committed_height;
 
-        let finalized_waves: Vec<Arc<FinalizedWave>> = block.certificates.clone();
+        // Advance committed_height. The QC is the proof of commit — same
+        // timing as the consensus path.
+        let removed_blocks = self.record_block_committed(&block, block_hash);
 
-        // Initiate state root verification through the same pipeline as
-        // consensus blocks. This produces a PreparedCommit that
-        // flush_block_commits needs for commit_prepared_blocks.
-        self.verification.initiate_state_root_verification(
-            block_hash,
-            &block,
-            parent_state_root,
-            parent_block_height,
-            finalized_waves.clone(),
-        );
-
-        // Track sync progress for the loop iterator — independent of
-        // committed_height which only advances after verification.
+        // Track sync progress for the loop iterator.
         self.sync.set_sync_applied_height(height);
 
-        // Stash for deferred commit. commit_synced_block() fires when
-        // on_state_root_verified confirms this block.
-        self.pending_synced_commits
-            .insert(block_hash, (block.clone(), qc.clone()));
-
-        // Update latest QC and certified tracking (needed for consensus
-        // participation while verification is in flight).
+        // Update latest QC and certified tracking.
         if self
             .latest_qc
             .as_ref()
@@ -3578,55 +3542,30 @@ impl BftState {
             }
         }
 
-        // Cache constructed FinalizedWaves so other syncing nodes can fetch
-        // them via FinalizedWaveFetchProtocol.
-        let mut actions = Vec::new();
-        for wave in &finalized_waves {
-            actions.push(Action::CacheFinalizedWave {
-                wave: Arc::clone(wave),
-            });
-        }
-
-        actions
-    }
-
-    /// Commit a synced block after its state root verification completed.
-    ///
-    /// Called from `on_block_root_verified` when a pending synced block's
-    /// state root is confirmed valid. This is the sync path's equivalent
-    /// of the consensus path's `commit_block_and_buffered`.
-    fn commit_synced_block(
-        &mut self,
-        topology: &TopologySnapshot,
-        block_hash: Hash,
-        block: Block,
-        qc: QuorumCertificate,
-    ) -> Vec<Action> {
-        let height = block.header.height.0;
-
-        info!(
-            validator = ?topology.local_validator_id(),
-            height = height,
-            block_hash = ?block_hash,
-            "Committing synced block (state root verified)"
-        );
-
-        let removed_blocks = self.record_block_committed(&block, block_hash);
-
         let provisions = self
             .pending_blocks
             .get(&block_hash)
             .map(|pb| pb.provisions())
             .unwrap_or_default();
 
-        let mut actions = vec![Action::CommitBlock {
-            block,
+        let mut actions = vec![Action::CommitSyncedBlock {
+            block: block.clone(),
             qc,
             provisions,
+            parent_state_root,
+            parent_block_height,
         }];
 
         for bh in removed_blocks {
             actions.push(Action::CancelFetch { block_hash: bh });
+        }
+
+        // Cache constructed FinalizedWaves so other syncing nodes can fetch
+        // them via FinalizedWaveFetchProtocol.
+        for wave in &block.certificates {
+            actions.push(Action::CacheFinalizedWave {
+                wave: Arc::clone(wave),
+            });
         }
 
         actions
@@ -3640,10 +3579,8 @@ impl BftState {
     fn try_apply_verified_synced_blocks(&mut self, topology: &TopologySnapshot) -> Vec<Action> {
         let mut actions = Vec::new();
 
-        // First, apply all consecutive verified blocks.
-        // Use the higher of committed_height and sync_applied_height as
-        // the base: committed_height may lag because it now only advances
-        // when VerifyStateRoot → commit_synced_block completes.
+        // Apply all consecutive verified blocks. committed_height and
+        // sync_applied_height advance together in apply_synced_block.
         loop {
             let base = self.committed_height.max(self.sync.sync_applied_height());
             let next_height = base + 1;

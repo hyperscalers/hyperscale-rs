@@ -15,7 +15,7 @@ use hyperscale_engine::Engine;
 use hyperscale_metrics as metrics;
 use hyperscale_network::Network;
 use hyperscale_storage::{ChainReader, ChainWriter, SubstateStore};
-use hyperscale_types::ValidatorId;
+use hyperscale_types::{Block, Hash, Provision, QuorumCertificate, ValidatorId};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tracing::{debug, warn};
@@ -309,6 +309,21 @@ where
                     committed_notified: false, // set by accumulate_block_commit
                 });
             }
+            Action::CommitSyncedBlock {
+                block,
+                qc,
+                provisions,
+                parent_state_root,
+                parent_block_height,
+            } => {
+                self.handle_commit_synced_block(
+                    block,
+                    qc,
+                    provisions,
+                    parent_state_root,
+                    parent_block_height,
+                );
+            }
             Action::EmitTransactionStatus {
                 tx_hash,
                 status,
@@ -436,6 +451,95 @@ where
     /// notifications use event-carried data, not storage reads. The async
     /// persistence closure sends `BlockPersisted` when the write completes.
     ///
+    /// Prepare a synced block's JMT state and feed it into the async
+    /// commit pipeline. Runs `prepare_block_commit` inline on the io_loop
+    /// (computation only), inserts the JMT snapshot into PendingChain so
+    /// child verifications can find parent tree nodes immediately, then
+    /// queues the block into `accumulate_block_commit` for batched async
+    /// RocksDB persistence via `flush_block_commits`.
+    ///
+    /// The PreparedCommit's `base_root` may be stale by flush time (other
+    /// blocks committed in between). `commit_prepared_blocks` handles this
+    /// via its fallback path (skip if already committed, else recompute).
+    fn handle_commit_synced_block(
+        &mut self,
+        block: Block,
+        qc: QuorumCertificate,
+        provisions: Vec<Arc<Provision>>,
+        parent_state_root: Hash,
+        parent_block_height: u64,
+    ) {
+        let block_hash = block.hash();
+        let height = block.header.height;
+
+        // Race guard: skip if already persisted (consensus path got there first).
+        if height.0 <= self.persisted_height {
+            return;
+        }
+
+        // Build view anchored at parent — includes prior synced blocks'
+        // JMT snapshots so chained verification can find parent nodes.
+        let view = self.pending_chain.view_at(block.header.parent_hash);
+        let pending_snapshots = view.pending_snapshots().to_vec();
+
+        // Inline JMT computation (no commit_lock — only reads).
+        let finalized_waves: Vec<Arc<hyperscale_types::FinalizedWave>> = block.certificates.clone();
+        let (computed_root, prepared) = view.prepare_block_commit(
+            parent_state_root,
+            parent_block_height,
+            &finalized_waves,
+            height.0,
+            &pending_snapshots,
+        );
+
+        // Byzantine detection: state root mismatch is fatal.
+        assert_eq!(
+            computed_root, block.header.state_root,
+            "State root mismatch for synced block at height {}",
+            height.0
+        );
+
+        // Insert JMT snapshot into PendingChain so child blocks'
+        // VerifyStateRoot can find this block's tree nodes via the overlay.
+        let jmt_snapshot = Arc::new(S::jmt_snapshot(&prepared).clone());
+        let receipts: Vec<Arc<hyperscale_types::LocalReceipt>> = finalized_waves
+            .iter()
+            .flat_map(|fw| fw.receipts.iter())
+            .map(|b| Arc::clone(&b.local_receipt))
+            .collect();
+        self.pending_chain.insert(
+            block_hash,
+            hyperscale_storage::ChainEntry {
+                parent_hash: block.header.parent_hash,
+                height: height.0,
+                receipts,
+                jmt_snapshot,
+            },
+        );
+
+        // Store PreparedCommit for flush_block_commits.
+        self.prepared_commits
+            .lock()
+            .unwrap()
+            .insert(block_hash, (height.0, prepared));
+
+        debug!(
+            height = height.0,
+            ?block_hash,
+            "Synced block prepared, queued for persist"
+        );
+
+        // Feed into the standard commit pipeline — accumulate_block_commit
+        // fires BlockCommitted immediately, flush_block_commits batches the
+        // RocksDB write with a single fsync.
+        self.accumulate_block_commit(super::PendingCommit {
+            block: Arc::new(block),
+            qc: Arc::new(qc),
+            provisions,
+            committed_notified: false,
+        });
+    }
+
     /// **Backpressure**: if the persistence lag exceeds
     /// [`MAX_PERSISTENCE_LAG`] blocks, the immediate `BlockCommitted` is
     /// suppressed and instead fires after the disk write (falling back to
@@ -444,6 +548,12 @@ where
     fn accumulate_block_commit(&mut self, mut commit: super::PendingCommit) {
         let block_hash = commit.block.hash();
         let height = commit.block.header.height;
+
+        // Skip blocks already persisted by the sync path.
+        if height.0 <= self.persisted_height {
+            return;
+        }
+
         debug!(height = height.0, ?block_hash, "Block committed");
 
         // Block commit latency: time from proposal timestamp to now.
@@ -519,6 +629,13 @@ where
 
         let mut commits = std::mem::take(&mut self.pending_block_commits);
 
+        // Drop blocks already persisted by the sync path.
+        let persisted = self.persisted_height;
+        commits.retain(|c| c.block.header.height.0 > persisted);
+        if commits.is_empty() {
+            return;
+        }
+
         // Sort by height to ensure parent blocks are flushed before children.
         // Cascading commits (e.g. QC formation during BlockCommitted processing)
         // can push child blocks into pending_block_commits before their parent
@@ -537,10 +654,11 @@ where
             .max()
             .unwrap_or(0);
 
-        // All blocks — consensus and sync — require a PreparedCommit from
-        // VerifyStateRoot. Blocks without one are deferred until their
-        // verification completes. Once any block defers, all subsequent
-        // blocks in the batch defer too (preserves height ordering).
+        // Consensus blocks require a PreparedCommit from VerifyStateRoot.
+        // (Sync blocks bypass this entirely via CommitSyncedBlock.)
+        // Blocks without one are deferred until their verification
+        // completes. Once any block defers, all subsequent blocks in
+        // the batch defer too (preserves height ordering).
         let mut ready_commits: Vec<super::PendingCommit> = Vec::with_capacity(commits.len());
         let mut prepared_map: Vec<S::PreparedCommit> = Vec::with_capacity(commits.len());
         {
