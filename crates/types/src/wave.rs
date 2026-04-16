@@ -601,13 +601,23 @@ pub fn compute_global_receipt_root_with_proof(
 /// Contains the execution certificates from all participating shards.
 /// Per-tx decisions (Accept/Reject/Aborted) are derived from the ECs.
 /// Every wave resolves through the EC path — there is no all-abort fallback.
+///
+/// # Invariant (well-formed WC)
+///
+/// A well-formed WaveCertificate always contains the **local EC** — the EC
+/// where `ec.wave_id == wc.wave_id`. The local EC is the authoritative source
+/// for the wave's tx set and canonical (block) ordering. Remote ECs attest
+/// against their own wave decompositions and may cover only subsets.
+///
+/// Enforced by `WaveCertificateTracker::create_wave_certificate`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WaveCertificate {
     /// Self-contained wave identifier (shard + height + remote dependencies).
     /// Globally unique. `hash(wave_id)` = identity key for manifest/storage.
     pub wave_id: WaveId,
     /// Execution certificates from all participating shards.
-    /// May contain multiple ECs from the same shard — this happens when
+    /// Always includes the local EC (see invariant above).
+    /// May contain multiple ECs from the same remote shard — this happens when
     /// a remote shard committed this wave's transactions across multiple blocks,
     /// producing separate ECs.
     /// Sorted by (shard_group_id, canonical_hash) for deterministic receipt_hash.

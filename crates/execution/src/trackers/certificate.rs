@@ -141,17 +141,22 @@ impl WaveCertificateTracker {
     ///
     /// Call only when `is_complete()` returns true.
     ///
-    /// Only includes ECs that cover at least one non-aborted tx in this wave.
-    /// ECs that only cover aborted txs are excluded — since aborted txs don't
-    /// require remote confirmation, including those ECs would make the
-    /// certificate list non-deterministic (depends on EC arrival order/timing).
+    /// The local EC (where `ec.wave_id == self.wave_id`) is always included —
+    /// it is the authoritative source for the wave's tx set and canonical ordering,
+    /// and is deterministic (the local accumulator emits exactly one vote per wave).
+    ///
+    /// Remote ECs are included only if they cover at least one non-aborted tx.
+    /// ECs covering only aborted txs are excluded because aborted txs don't require
+    /// remote confirmation — including them would make the certificate list
+    /// non-deterministic (depends on remote EC arrival order/timing).
     ///
     /// ECs are sorted by (shard_group_id, canonical_hash) for deterministic receipt_hash.
     pub fn create_wave_certificate(&mut self) -> WaveCertificate {
-        // Build set of ec_hashes that cover at least one non-aborted tx in this wave.
-        let required_ec_hashes: HashSet<Hash> = self
+        // Remote ECs: include only if they cover at least one non-aborted tx.
+        let required_remote_ec_hashes: HashSet<Hash> = self
             .execution_certificates
             .iter()
+            .filter(|ec| ec.wave_id != self.wave_id)
             .filter(|ec| {
                 ec.tx_outcomes.iter().any(|outcome| {
                     self.participating_shards.contains_key(&outcome.tx_hash)
@@ -161,11 +166,14 @@ impl WaveCertificateTracker {
             .map(|ec| ec.canonical_hash())
             .collect();
 
-        // Filter to only required ECs
+        // Collect: all local ECs + filtered remote ECs.
         let mut ecs: Vec<Arc<ExecutionCertificate>> = self
             .execution_certificates
             .iter()
-            .filter(|ec| required_ec_hashes.contains(&ec.canonical_hash()))
+            .filter(|ec| {
+                ec.wave_id == self.wave_id
+                    || required_remote_ec_hashes.contains(&ec.canonical_hash())
+            })
             .cloned()
             .collect();
 
@@ -318,5 +326,54 @@ mod tests {
 
         let decisions = tracker.tx_decisions();
         assert_eq!(decisions[0].1, TransactionDecision::Aborted);
+    }
+
+    #[test]
+    fn all_aborted_wave_retains_local_ec() {
+        // Invariant: a well-formed WaveCertificate always contains the local EC
+        // (the one matching wc.wave_id), even when every tx in the wave is aborted.
+        // This is required so downstream reconstruction can recover the canonical
+        // tx list + ordering from the local EC's tx_outcomes without any source-block
+        // lookup.
+        let wave_id = make_wave_id();
+        let tx1 = Hash::from_bytes(b"tx1");
+        let tx2 = Hash::from_bytes(b"tx2");
+
+        let both_shards = BTreeSet::from([ShardGroupId(0), ShardGroupId(1)]);
+        let mut participating = BTreeMap::new();
+        participating.insert(tx1, both_shards.clone());
+        participating.insert(tx2, both_shards);
+
+        let mut tracker = WaveCertificateTracker::new(wave_id.clone(), participating, 10);
+
+        // Both shards report all txs aborted.
+        let ec_local = make_ec(ShardGroupId(0), &wave_id, &[tx1, tx2], false);
+        let ec_remote = make_ec(ShardGroupId(1), &wave_id, &[tx1, tx2], false);
+        tracker.add_execution_certificate(ec_local);
+        tracker.add_execution_certificate(ec_remote);
+
+        let wc = tracker.create_wave_certificate();
+
+        // Local EC must be present — identified by ec.wave_id == wc.wave_id.
+        let local_ec = wc
+            .execution_certificates()
+            .iter()
+            .find(|ec| ec.wave_id == wc.wave_id);
+        assert!(
+            local_ec.is_some(),
+            "all-aborted WC must still contain local EC"
+        );
+        assert_eq!(local_ec.unwrap().tx_outcomes.len(), 2);
+
+        // Remote EC (which only covers aborted txs) is correctly excluded.
+        let remote_count = wc
+            .execution_certificates()
+            .iter()
+            .filter(|ec| ec.wave_id != wc.wave_id)
+            .count();
+        assert_eq!(
+            remote_count, 0,
+            "remote ECs covering only aborted txs should be excluded"
+        );
     }
 }
