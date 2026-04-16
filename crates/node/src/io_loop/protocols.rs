@@ -88,17 +88,13 @@ where
                 SyncOutput::DeliverBlock { block, qc } => {
                     metrics::record_sync_block_received_by_bft();
                     metrics::record_sync_block_submitted_for_verification();
-                    // Extract receipts from the sync receipt buffer for this
-                    // height. They were buffered when the sync response arrived
-                    // and are now attached to the event so BFT can construct
-                    // FinalizedWave objects for the verification pipeline.
-                    let height = block.header.height.0;
-                    let local_receipts =
-                        self.sync_receipt_buffer.remove(&height).unwrap_or_default();
+                    // `Block.certificates` already carries `Arc<FinalizedWave>`
+                    // with receipts inline (rebuilt by the sync peer's
+                    // `get_block_for_sync`), so no separate receipt buffer plumbing
+                    // is needed.
                     self.feed_event(ProtocolEvent::SyncBlockReadyToApply {
                         block: *block,
                         qc: *qc,
-                        local_receipts,
                     });
                 }
                 SyncOutput::SyncComplete { height } => {

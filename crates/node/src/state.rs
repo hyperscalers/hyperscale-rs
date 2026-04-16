@@ -719,16 +719,9 @@ impl StateMachine for NodeStateMachine {
                 transactions,
             ),
             // ── Storage / Sync ───────────────────────────────────────────
-            ProtocolEvent::SyncBlockReadyToApply {
-                block,
-                qc,
-                local_receipts,
-            } => self.bft.on_sync_block_ready_to_apply(
-                self.topology.snapshot(),
-                block,
-                qc,
-                local_receipts,
-            ),
+            ProtocolEvent::SyncBlockReadyToApply { block, qc } => self
+                .bft
+                .on_sync_block_ready_to_apply(self.topology.snapshot(), block, qc),
             // Handled by IoLoop directly (sync verification pipeline).
             ProtocolEvent::SyncEcVerificationComplete { .. } => vec![],
             // SyncProtocol finished fetching — tell BftState to exit sync

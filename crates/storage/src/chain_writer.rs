@@ -5,7 +5,7 @@
 //! carries precomputed work; `commit_prepared_block` applies it efficiently.
 
 use crate::JvtSnapshot;
-use hyperscale_types::{Block, Hash, QuorumCertificate, ReceiptBundle};
+use hyperscale_types::{Block, FinalizedWave, Hash, QuorumCertificate};
 use std::sync::Arc;
 
 /// Abstracts state commitment for both simulation and production storage.
@@ -30,8 +30,8 @@ pub trait ChainWriter: Send + Sync + 'static {
 
     /// Compute speculative state root and return precomputed commit work.
     ///
-    /// Extracts and merges `DatabaseUpdates` from the receipts internally,
-    /// then computes the speculative JVT root.
+    /// Extracts and merges `DatabaseUpdates` from each finalized wave's receipts
+    /// internally, then computes the speculative JVT root.
     ///
     /// `parent_block_height` is the height of the parent block whose state we
     /// build on. Used as the JVT parent version for `put_at_version`. This
@@ -50,7 +50,7 @@ pub trait ChainWriter: Send + Sync + 'static {
         &self,
         parent_state_root: Hash,
         parent_block_height: u64,
-        receipts: &[ReceiptBundle],
+        finalized_waves: &[Arc<FinalizedWave>],
         block_height: u64,
         pending_snapshots: &[Arc<JvtSnapshot>],
     ) -> (Hash, Self::PreparedCommit);
@@ -75,16 +75,11 @@ pub trait ChainWriter: Send + Sync + 'static {
 
     /// Commit a block's state writes from scratch (no prepared handle).
     ///
-    /// Extracts and merges `DatabaseUpdates` from the receipts internally.
-    /// Execution certificates are extracted from `block.certificates`.
-    /// Used when no `PreparedCommit` is available (e.g., sync blocks,
-    /// cache eviction, or proposer fast-path not applicable).
-    fn commit_block(
-        &self,
-        block: &Arc<Block>,
-        qc: &Arc<QuorumCertificate>,
-        receipts: &[ReceiptBundle],
-    ) -> Hash;
+    /// Extracts receipts and execution certificates from `block.certificates`,
+    /// merges `DatabaseUpdates` internally. Used when no `PreparedCommit` is
+    /// available (e.g., sync blocks, cache eviction, or proposer fast-path not
+    /// applicable).
+    fn commit_block(&self, block: &Arc<Block>, qc: &Arc<QuorumCertificate>) -> Hash;
 
     /// Extract the JVT snapshot from a prepared commit.
     ///

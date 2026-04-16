@@ -269,14 +269,14 @@ pub struct StateRootResult<P: Send> {
 /// Verify that the computed state root matches the expected root.
 ///
 /// Calls `storage.prepare_block_commit()` to compute the speculative state root
-/// from the receipts, then compares against the expected root. Returns the
+/// from the wave receipts, then compares against the expected root. Returns the
 /// prepared commit handle for caching on success.
 pub fn verify_state_root<S: ChainWriter + SubstateStore>(
     storage: &S,
     parent_state_root: Hash,
     parent_block_height: u64,
     expected_root: Hash,
-    receipts: &[ReceiptBundle],
+    finalized_waves: &[Arc<FinalizedWave>],
     block_height: u64,
     pending_snapshots: &[Arc<hyperscale_storage::JvtSnapshot>],
 ) -> StateRootResult<S::PreparedCommit> {
@@ -287,7 +287,7 @@ pub fn verify_state_root<S: ChainWriter + SubstateStore>(
     let (computed_root, prepared) = storage.prepare_block_commit(
         parent_state_root,
         parent_block_height,
-        receipts,
+        finalized_waves,
         block_height,
         pending_snapshots,
     );
@@ -342,7 +342,6 @@ pub fn build_proposal<S: ChainWriter + SubstateStore>(
     parent_block_height: u64,
     transactions: Vec<Arc<RoutableTransaction>>,
     certificates: Vec<Arc<FinalizedWave>>,
-    receipts: &[ReceiptBundle],
     local_shard: ShardGroupId,
     waves: Vec<WaveId>,
     provision_hashes: Vec<Hash>,
@@ -353,14 +352,22 @@ pub fn build_proposal<S: ChainWriter + SubstateStore>(
     let (state_root, prepared) = storage.prepare_block_commit(
         parent_state_root,
         parent_block_height,
-        receipts,
+        &certificates,
         height.0,
         pending_snapshots,
     );
 
+    // Receipts come from the finalized waves themselves — used here only to compute
+    // the local_receipt_root for the BlockHeader.
+    let receipts: Vec<&ReceiptBundle> = certificates
+        .iter()
+        .flat_map(|fw| fw.receipts.iter())
+        .collect();
+    let receipts_owned: Vec<ReceiptBundle> = receipts.iter().map(|&r| r.clone()).collect();
+
     let transaction_root = compute_transaction_root(&transactions);
     let certificate_root = compute_certificate_root(&certificates);
-    let local_receipt_root = compute_local_receipt_root(receipts);
+    let local_receipt_root = compute_local_receipt_root(&receipts_owned);
     let provision_root = compute_provision_root(&provision_hashes);
 
     // in_flight is deterministic from chain state:

@@ -58,8 +58,8 @@ pub struct BftMemoryStats {
 pub type NodeIndex = u32;
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, BlockManifest, BlockVote, Bls12381G1PublicKey,
-    CommittedBlockHeader, FinalizedWave, Hash, LocalReceiptEntry, Provision, QuorumCertificate,
-    ReadyTransactions, RoutableTransaction, ShardGroupId, TopologySnapshot, ValidatorId, VotePower,
+    CommittedBlockHeader, FinalizedWave, Hash, Provision, QuorumCertificate, ReadyTransactions,
+    RoutableTransaction, ShardGroupId, TopologySnapshot, ValidatorId, VotePower,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -582,7 +582,6 @@ impl BftState {
         topology: &TopologySnapshot,
         block: Block,
         qc: QuorumCertificate,
-        local_receipts: Vec<LocalReceiptEntry>,
     ) -> Vec<Action> {
         let block_height = block.header.height.0;
 
@@ -598,7 +597,7 @@ impl BftState {
             return vec![];
         }
 
-        self.on_synced_block_ready(topology, block, qc, local_receipts)
+        self.on_synced_block_ready(topology, block, qc)
     }
 
     /// Handle sync complete (from runner via Event::SyncComplete).
@@ -3303,7 +3302,6 @@ impl BftState {
         topology: &TopologySnapshot,
         block: Block,
         qc: QuorumCertificate,
-        local_receipts: Vec<LocalReceiptEntry>,
     ) -> Vec<Action> {
         let block_hash = block.hash();
         let height = block.header.height.0;
@@ -3355,14 +3353,14 @@ impl BftState {
         // Check if this block is the next one we need
         if height == next_needed {
             // This is exactly what we need - submit for verification immediately
-            return self.submit_synced_block_for_verification(topology, block, qc, local_receipts);
+            return self.submit_synced_block_for_verification(topology, block, qc);
         }
 
         // Block is not the next sequential height. Check if we should buffer it
         // or if we already have what we need and should try draining buffers.
         if height > next_needed {
             // Future block - buffer it for later
-            self.sync.buffer_block(height, block, qc, local_receipts);
+            self.sync.buffer_block(height, block, qc);
 
             // Check if we can drain any buffered blocks starting from next_needed
             return self.try_drain_buffered_synced_blocks(topology);
@@ -3387,7 +3385,6 @@ impl BftState {
         topology: &TopologySnapshot,
         block: Block,
         qc: QuorumCertificate,
-        local_receipts: Vec<LocalReceiptEntry>,
     ) -> Vec<Action> {
         let block_hash = block.hash();
         let height = block.header.height.0;
@@ -3395,7 +3392,7 @@ impl BftState {
         // Genesis QC doesn't need signature verification
         if qc.is_genesis() {
             debug!(height, "Synced block has genesis QC, applying directly");
-            return self.apply_synced_block(topology, block, qc, local_receipts);
+            return self.apply_synced_block(topology, block, qc);
         }
 
         // Collect public keys for QC verification
@@ -3413,7 +3410,7 @@ impl BftState {
 
         // Store pending verification info via SyncManager
         self.sync
-            .track_pending_verification(block_hash, block, qc.clone(), local_receipts);
+            .track_pending_verification(block_hash, block, qc.clone());
 
         // Delegate verification to runner
         vec![Action::VerifyQcSignature {
@@ -3452,13 +3449,8 @@ impl BftState {
 
         // Drain buffered blocks from the SyncManager
         let blocks = self.sync.drain_buffered(start_height, slots_available);
-        for (block, qc, local_receipts) in blocks {
-            actions.extend(self.submit_synced_block_for_verification(
-                topology,
-                block,
-                qc,
-                local_receipts,
-            ));
+        for (block, qc) in blocks {
+            actions.extend(self.submit_synced_block_for_verification(topology, block, qc));
         }
 
         actions
@@ -3466,16 +3458,15 @@ impl BftState {
 
     /// Apply a synced block after QC verification (or for genesis QC).
     ///
-    /// Constructs `FinalizedWave` objects from sync receipts and initiates
-    /// state root verification through the same pipeline as consensus blocks.
-    /// Emits `CommitBlock` (unified with consensus) and `CacheFinalizedWave`
-    /// so other syncing nodes can fetch wave data from us.
+    /// `Block.certificates` already carries `Arc<FinalizedWave>` with receipts
+    /// inline. Initiates state root verification through the same pipeline as
+    /// consensus blocks. Emits `CommitBlock` (unified with consensus) and
+    /// `CacheFinalizedWave` so other syncing nodes can fetch wave data from us.
     fn apply_synced_block(
         &mut self,
         topology: &TopologySnapshot,
         block: Block,
         qc: QuorumCertificate,
-        _local_receipts: Vec<LocalReceiptEntry>,
     ) -> Vec<Action> {
         let block_hash = block.hash();
         let height = block.header.height.0;
@@ -3593,13 +3584,12 @@ impl BftState {
                 .log_verification_state(self.committed_height, next_height);
 
             // Take the next verified block at the expected height
-            let Some((block, qc, local_receipts)) = self.sync.take_verified_at_height(next_height)
-            else {
+            let Some((block, qc)) = self.sync.take_verified_at_height(next_height) else {
                 info!(next_height, "No verified block at next height - stopping");
                 break;
             };
 
-            actions.extend(self.apply_synced_block(topology, block, qc, local_receipts));
+            actions.extend(self.apply_synced_block(topology, block, qc));
         }
 
         // After applying blocks, drain more buffered blocks for parallel verification
@@ -7910,7 +7900,7 @@ mod tests {
         };
 
         // Should return empty actions since block is stale
-        let actions = state.on_sync_block_ready_to_apply(&topology, block, qc, vec![]);
+        let actions = state.on_sync_block_ready_to_apply(&topology, block, qc);
         assert!(actions.is_empty(), "Stale sync block should be ignored");
 
         // Should NOT have set syncing flag

@@ -337,17 +337,13 @@ pub(crate) fn handle_delegated_action<
             let start = std::time::Instant::now();
             // Collect receipts from all finalized waves.
             // Merging happens inside prepare_block_commit on the thread pool.
-            let all_receipts: Vec<hyperscale_types::ReceiptBundle> = finalized_waves
-                .iter()
-                .flat_map(|fw| fw.receipts.iter().cloned())
-                .collect();
             let pending_snapshots = ctx.view.pending_snapshots().to_vec();
             let result = hyperscale_bft::handlers::verify_state_root(
                 &*ctx.view,
                 parent_state_root,
                 parent_block_height,
                 expected_root,
-                &all_receipts,
+                &finalized_waves,
                 block_height,
                 &pending_snapshots,
             );
@@ -355,8 +351,9 @@ pub(crate) fn handle_delegated_action<
                 "state_root",
                 start.elapsed().as_secs_f64(),
             );
-            let receipts: Vec<Arc<hyperscale_types::LocalReceipt>> = all_receipts
+            let receipts: Vec<Arc<hyperscale_types::LocalReceipt>> = finalized_waves
                 .iter()
+                .flat_map(|fw| fw.receipts.iter())
                 .map(|b| Arc::clone(&b.local_receipt))
                 .collect();
             let prepared_commit = result.prepared_commit.map(|p| PreparedBlock {
@@ -394,14 +391,9 @@ pub(crate) fn handle_delegated_action<
             finalized_tx_count,
         } => {
             // Pass FinalizedWaves straight through into Block.certificates.
+            // build_proposal extracts receipts from them internally for state-root
+            // computation and the local_receipt_root.
             let certificates: Vec<Arc<hyperscale_types::FinalizedWave>> = finalized_waves.clone();
-
-            // Collect all receipts from finalized waves.
-            // DatabaseUpdates merging happens inside prepare_block_commit.
-            let all_receipts: Vec<hyperscale_types::ReceiptBundle> = finalized_waves
-                .iter()
-                .flat_map(|fw| fw.receipts.iter().cloned())
-                .collect();
 
             let mut provision_hashes: Vec<hyperscale_types::Hash> =
                 provision_batches.iter().map(|b| b.hash()).collect();
@@ -423,7 +415,6 @@ pub(crate) fn handle_delegated_action<
                 parent_block_height,
                 transactions,
                 certificates,
-                &all_receipts,
                 shard_group_id,
                 waves,
                 provision_hashes.clone(),
@@ -431,8 +422,9 @@ pub(crate) fn handle_delegated_action<
                 finalized_tx_count,
                 &pending_snapshots,
             );
-            let receipts: Vec<Arc<hyperscale_types::LocalReceipt>> = all_receipts
+            let receipts: Vec<Arc<hyperscale_types::LocalReceipt>> = finalized_waves
                 .iter()
+                .flat_map(|fw| fw.receipts.iter())
                 .map(|b| Arc::clone(&b.local_receipt))
                 .collect();
             let block_hash = result.block_hash;

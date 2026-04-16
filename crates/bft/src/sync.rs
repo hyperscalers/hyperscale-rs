@@ -4,14 +4,15 @@
 //! synced block QC verifications. BftState owns this as a field and
 //! delegates sync-specific bookkeeping here.
 
-use hyperscale_types::{Block, Hash, LocalReceiptEntry, QuorumCertificate};
+use hyperscale_types::{Block, Hash, QuorumCertificate};
 use std::collections::{BTreeMap, HashMap};
 use tracing::{debug, info, warn};
 
 /// Synced block pending QC signature verification.
 ///
 /// When we receive a synced block, we must verify its QC signature before
-/// applying it to our state.
+/// applying it to our state. `block.certificates` already carries the receipts
+/// inline (via `Arc<FinalizedWave>`), so no separate receipts payload is needed.
 #[derive(Debug, Clone)]
 pub(crate) struct PendingSyncedBlockVerification {
     /// The synced block awaiting QC verification.
@@ -20,8 +21,6 @@ pub(crate) struct PendingSyncedBlockVerification {
     pub qc: QuorumCertificate,
     /// Whether the QC signature has been verified.
     pub verified: bool,
-    /// Receipts from the sync peer for this block's wave certificates.
-    pub local_receipts: Vec<LocalReceiptEntry>,
 }
 
 /// Sync block coordination state.
@@ -39,7 +38,7 @@ pub(crate) struct SyncManager {
 
     /// Buffered out-of-order synced blocks waiting for earlier blocks.
     /// Maps height -> (Block, QC, receipts).
-    buffered_synced_blocks: BTreeMap<u64, (Block, QuorumCertificate, Vec<LocalReceiptEntry>)>,
+    buffered_synced_blocks: BTreeMap<u64, (Block, QuorumCertificate)>,
 
     /// Synced blocks pending QC signature verification.
     /// Maps block_hash -> pending synced block info.
@@ -107,16 +106,9 @@ impl SyncManager {
     }
 
     /// Buffer a future synced block for later processing.
-    pub fn buffer_block(
-        &mut self,
-        height: u64,
-        block: Block,
-        qc: QuorumCertificate,
-        local_receipts: Vec<LocalReceiptEntry>,
-    ) {
+    pub fn buffer_block(&mut self, height: u64, block: Block, qc: QuorumCertificate) {
         debug!(height, "Buffering future synced block for later");
-        self.buffered_synced_blocks
-            .insert(height, (block, qc, local_receipts));
+        self.buffered_synced_blocks.insert(height, (block, qc));
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -132,7 +124,6 @@ impl SyncManager {
         block_hash: Hash,
         block: Block,
         qc: QuorumCertificate,
-        local_receipts: Vec<LocalReceiptEntry>,
     ) {
         let height = block.header.height.0;
         if self
@@ -156,7 +147,6 @@ impl SyncManager {
                 block,
                 qc,
                 verified: false,
-                local_receipts,
             },
         );
     }
@@ -221,12 +211,9 @@ impl SyncManager {
 
     /// Take the next consecutive verified block at the given height.
     ///
-    /// Returns the block, QC, and receipts if a verified block exists at `height`,
+    /// Returns the block and QC if a verified block exists at `height`,
     /// otherwise None.
-    pub fn take_verified_at_height(
-        &mut self,
-        height: u64,
-    ) -> Option<(Block, QuorumCertificate, Vec<LocalReceiptEntry>)> {
+    pub fn take_verified_at_height(&mut self, height: u64) -> Option<(Block, QuorumCertificate)> {
         let block_hash = self
             .pending_synced_block_verifications
             .iter()
@@ -238,7 +225,7 @@ impl SyncManager {
             .remove(&block_hash)
             .unwrap();
 
-        Some((pending.block, pending.qc, pending.local_receipts))
+        Some((pending.block, pending.qc))
     }
 
     /// Log the current state of pending verifications (for debugging).
@@ -276,14 +263,14 @@ impl SyncManager {
         &mut self,
         start_height: u64,
         max_count: usize,
-    ) -> Vec<(Block, QuorumCertificate, Vec<LocalReceiptEntry>)> {
+    ) -> Vec<(Block, QuorumCertificate)> {
         let mut result = Vec::new();
         let mut height = start_height;
 
         while result.len() < max_count {
-            if let Some((block, qc, local_receipts)) = self.buffered_synced_blocks.remove(&height) {
+            if let Some((block, qc)) = self.buffered_synced_blocks.remove(&height) {
                 debug!(height, "Draining buffered synced block");
-                result.push((block, qc, local_receipts));
+                result.push((block, qc));
                 height += 1;
             } else {
                 break;

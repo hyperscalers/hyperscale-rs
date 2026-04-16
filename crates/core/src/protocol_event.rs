@@ -7,9 +7,9 @@
 
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, BlockManifest, BlockVote, CommittedBlockHeader, EpochConfig,
-    EpochId, ExecutionCertificate, ExecutionVote, FinalizedWave, Hash, LocalReceiptEntry,
-    Provision, QuorumCertificate, RoutableTransaction, ShardGroupId, TxOutcome, ValidatorId,
-    WaveCertificate, WaveId,
+    EpochId, ExecutionCertificate, ExecutionVote, FinalizedWave, Hash, Provision,
+    QuorumCertificate, RoutableTransaction, ShardGroupId, TxOutcome, ValidatorId, WaveCertificate,
+    WaveId,
 };
 use std::sync::Arc;
 
@@ -283,13 +283,10 @@ pub enum ProtocolEvent {
     // Sync Delivery (from IoLoop after sync protocol processing)
     // ═══════════════════════════════════════════════════════════════════════
     /// A synced block is ready to be applied to local state.
-    /// Receipts from the sync peer are attached so BFT can construct
-    /// `FinalizedWave` objects and feed them into the verification pipeline.
-    SyncBlockReadyToApply {
-        block: Block,
-        qc: QuorumCertificate,
-        local_receipts: Vec<LocalReceiptEntry>,
-    },
+    /// `Block.certificates` already carries `Arc<FinalizedWave>` with receipts
+    /// attached (rebuilt by the sync peer's `get_block_for_sync` via
+    /// `FinalizedWave::reconstruct`), so no separate receipts payload is needed.
+    SyncBlockReadyToApply { block: Block, qc: QuorumCertificate },
 
     /// Sync EC BLS verification completed (async callback from crypto pool).
     SyncEcVerificationComplete { height: u64, valid: bool },

@@ -330,11 +330,6 @@ where
     // Shared with request handler thread. Keyed by (wave_id_hash, wave_id).
     exec_cert_cache: ExecCertCache,
 
-    // Sync receipt buffer: holds receipts from sync responses, keyed by
-    // block height. Extracted when SyncOutput::DeliverBlock fires and
-    // attached to SyncBlockReadyToApply events. NOT used in flush_block_commits.
-    sync_receipt_buffer: std::collections::HashMap<u64, Vec<hyperscale_types::LocalReceiptEntry>>,
-
     // Pending commit task — prepared by flush_block_commits, spawned by the runner.
     // Production uses tokio::spawn_blocking; simulation runs inline.
     pending_commit_task: Option<Box<dyn FnOnce() + Send>>,
@@ -420,7 +415,6 @@ where
             persisted_height: initial_persisted_height,
             commit_in_flight: Arc::new(AtomicBool::new(false)),
             exec_cert_cache: Arc::new(Mutex::new(HashMap::new())),
-            sync_receipt_buffer: std::collections::HashMap::new(),
             tx_status_cache: Arc::new(QuickCache::new(DEFAULT_TX_STATUS_CACHE_SIZE)),
             last_slow_tx_warn: std::time::Duration::ZERO,
             pending_commit_task: None,
@@ -649,12 +643,10 @@ where
                         .event_sender
                         .send(NodeInput::SyncBlockFetchFailed { height });
                 } else {
-                    // Buffer receipts for this height. They'll be extracted
-                    // when SyncOutput::DeliverBlock fires and attached to the
-                    // SyncBlockReadyToApply event for BFT processing.
-                    if block.is_some() {
-                        self.sync_receipt_buffer.insert(height, local_receipts);
-                    }
+                    // Receipts ride along inside `Block.certificates` (Arc<FinalizedWave>)
+                    // — no separate buffering needed. The sync peer's
+                    // get_block_for_sync rebuilt them via FinalizedWave::reconstruct.
+                    let _ = local_receipts;
 
                     let outputs = self
                         .sync_protocol

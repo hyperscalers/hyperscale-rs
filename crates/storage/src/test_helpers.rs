@@ -197,7 +197,7 @@ fn commit_empty_blocks_up_to(storage: &(impl ChainReader + ChainWriter), target:
     for h in 0..target {
         let b = make_test_block(h);
         let q = make_test_qc(&b);
-        storage.commit_block(&Arc::new(b), &Arc::new(q), &[]);
+        storage.commit_block(&Arc::new(b), &Arc::new(q));
     }
 }
 
@@ -213,7 +213,7 @@ pub fn test_ec_storage_roundtrip(storage: &(impl ChainReader + ChainWriter)) {
     commit_empty_blocks_up_to(storage, 10);
     let block = make_test_block_with_ecs(10, vec![Arc::new(ec)]);
     let qc = make_test_qc(&block);
-    storage.commit_block(&Arc::new(block), &Arc::new(qc), &[]);
+    storage.commit_block(&Arc::new(block), &Arc::new(qc));
 
     let by_height = storage.get_execution_certificates_by_height(10);
     assert_eq!(by_height.len(), 1);
@@ -234,17 +234,17 @@ pub fn test_ec_storage_batch(storage: &(impl ChainReader + ChainWriter)) {
     commit_empty_blocks_up_to(storage, 10);
     let block10 = make_test_block_with_ecs(10, vec![Arc::new(ec1), Arc::new(ec2)]);
     let qc10 = make_test_qc(&block10);
-    storage.commit_block(&Arc::new(block10), &Arc::new(qc10), &[]);
+    storage.commit_block(&Arc::new(block10), &Arc::new(qc10));
 
     // Commit blocks 11-19, then block 20 with one EC
     for h in 11..20 {
         let b = make_test_block(h);
         let q = make_test_qc(&b);
-        storage.commit_block(&Arc::new(b), &Arc::new(q), &[]);
+        storage.commit_block(&Arc::new(b), &Arc::new(q));
     }
     let block20 = make_test_block_with_ecs(20, vec![Arc::new(ec3.clone())]);
     let qc20 = make_test_qc(&block20);
-    storage.commit_block(&Arc::new(block20), &Arc::new(qc20), &[]);
+    storage.commit_block(&Arc::new(block20), &Arc::new(qc20));
 
     // Both ECs at height 10
     let at_10 = storage.get_execution_certificates_by_height(10);

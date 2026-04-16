@@ -11,14 +11,15 @@ use hyperscale_storage::{
 use hyperscale_types::{BlockHeight, Hash, NodeId};
 use std::sync::Arc;
 
-/// Helper: commit a block with given updates and no ECs/receipts.
+/// Helper: commit a block with given updates by injecting them via a single-tx
+/// FinalizedWave inside `block.certificates`.
 fn commit_with(
     storage: &SimStorage,
     updates: &DatabaseUpdates,
     block: &hyperscale_types::Block,
     qc: &hyperscale_types::QuorumCertificate,
 ) -> Hash {
-    let receipts = vec![hyperscale_types::ReceiptBundle {
+    let receipt = hyperscale_types::ReceiptBundle {
         tx_hash: Hash::ZERO,
         local_receipt: Arc::new(hyperscale_types::LocalReceipt {
             outcome: hyperscale_types::TransactionOutcome::Success,
@@ -26,8 +27,26 @@ fn commit_with(
             application_events: vec![],
         }),
         execution_output: None,
-    }];
-    storage.commit_block(&Arc::new(block.clone()), &Arc::new(qc.clone()), &receipts)
+    };
+    let mut block = block.clone();
+    if updates.node_updates.is_empty() {
+        // No updates → don't bother attaching a placeholder wave.
+    } else {
+        block
+            .certificates
+            .push(Arc::new(hyperscale_types::FinalizedWave {
+                certificate: Arc::new(hyperscale_types::WaveCertificate {
+                    wave_id: hyperscale_types::WaveId::new(
+                        hyperscale_types::ShardGroupId(0),
+                        block.header.height.0,
+                        std::collections::BTreeSet::new(),
+                    ),
+                    execution_certificates: vec![],
+                }),
+                receipts: vec![receipt],
+            }));
+    }
+    storage.commit_block(&Arc::new(block), &Arc::new(qc.clone()))
 }
 
 /// Helper: commit a block with empty updates and no ECs/receipts.

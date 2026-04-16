@@ -141,14 +141,14 @@ impl hyperscale_storage::ChainWriter for SharedStorage {
         &self,
         parent_state_root: Hash,
         parent_block_height: u64,
-        receipts: &[hyperscale_types::ReceiptBundle],
+        finalized_waves: &[std::sync::Arc<hyperscale_types::FinalizedWave>],
         block_height: u64,
         pending_snapshots: &[std::sync::Arc<hyperscale_storage::JvtSnapshot>],
     ) -> (Hash, Self::PreparedCommit) {
         self.0.prepare_block_commit(
             parent_state_root,
             parent_block_height,
-            receipts,
+            finalized_waves,
             block_height,
             pending_snapshots,
         )
@@ -169,9 +169,8 @@ impl hyperscale_storage::ChainWriter for SharedStorage {
         &self,
         block: &Arc<hyperscale_types::Block>,
         qc: &Arc<hyperscale_types::QuorumCertificate>,
-        receipts: &[hyperscale_types::ReceiptBundle],
     ) -> hyperscale_types::Hash {
-        self.0.commit_block(block, qc, receipts)
+        self.0.commit_block(block, qc)
     }
 
     fn memory_usage_bytes(&self) -> (u64, u64) {

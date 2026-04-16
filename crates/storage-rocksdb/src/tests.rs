@@ -30,7 +30,7 @@ fn updates_to_receipts(updates: &DatabaseUpdates) -> Vec<ReceiptBundle> {
 
 /// Helper: commit a block with empty updates and no ECs/receipts.
 fn commit_empty(storage: &RocksDbStorage, block: &hyperscale_types::Block, qc: &QuorumCertificate) {
-    storage.commit_block(&Arc::new(block.clone()), &Arc::new(qc.clone()), &[]);
+    storage.commit_block(&Arc::new(block.clone()), &Arc::new(qc.clone()));
 }
 
 #[test]
@@ -314,17 +314,37 @@ fn test_state_root_changes_on_commit() {
 // ChainWriter
 // ═══════════════════════════════════════════════════════════════════════
 
+/// Wrap receipts into a single FinalizedWave attached to `block.certificates`,
+/// so the new `commit_block` (which derives receipts from `block.certificates`)
+/// can apply them.
+fn attach_receipts(block: &mut hyperscale_types::Block, receipts: Vec<ReceiptBundle>) {
+    block
+        .certificates
+        .push(Arc::new(hyperscale_types::FinalizedWave {
+            certificate: Arc::new(hyperscale_types::WaveCertificate {
+                wave_id: hyperscale_types::WaveId::new(
+                    ShardGroupId(0),
+                    block.header.height.0,
+                    std::collections::BTreeSet::new(),
+                ),
+                execution_certificates: vec![],
+            }),
+            receipts,
+        }));
+}
+
 #[test]
 fn test_commit_block_applies_writes() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
 
     let updates = make_mapped_database_update(1, 0, vec![10], vec![42]);
-    let block = make_test_block(1);
+    let mut block = make_test_block(1);
+    let receipts = updates_to_receipts(&updates);
+    attach_receipts(&mut block, receipts);
     let qc = make_test_qc(&block);
 
-    let receipts = updates_to_receipts(&updates);
-    let result = storage.commit_block(&Arc::new(block), &Arc::new(qc), &receipts);
+    let result = storage.commit_block(&Arc::new(block), &Arc::new(qc));
     assert_ne!(result, Hash::ZERO);
 }
 
@@ -336,11 +356,12 @@ fn test_commit_block_multiple_certs() {
     let updates1 = make_mapped_database_update(1, 0, vec![10], vec![1]);
     let updates2 = make_mapped_database_update(2, 0, vec![20], vec![2]);
     let merged = hyperscale_storage::merge_database_updates(&[updates1, updates2]);
-    let block = make_test_block(1);
+    let mut block = make_test_block(1);
+    let receipts = updates_to_receipts(&merged);
+    attach_receipts(&mut block, receipts);
     let qc = make_test_qc(&block);
 
-    let receipts = updates_to_receipts(&merged);
-    let result = storage.commit_block(&Arc::new(block), &Arc::new(qc), &receipts);
+    let result = storage.commit_block(&Arc::new(block), &Arc::new(qc));
     assert_ne!(result, Hash::ZERO);
 }
 
@@ -352,7 +373,7 @@ fn test_commit_block_empty_certs() {
     let block = make_test_block(1);
     let qc = make_test_qc(&block);
 
-    storage.commit_block(&Arc::new(block), &Arc::new(qc), &[]);
+    storage.commit_block(&Arc::new(block), &Arc::new(qc));
     assert_eq!(storage.jvt_version(), 1);
 }
 
@@ -372,7 +393,7 @@ fn test_prepare_then_commit_matches_direct() {
     let s_direct = RocksDbStorage::open(temp_dir2.path()).unwrap();
     let block2 = make_test_block(1);
     let qc2 = make_test_qc(&block2);
-    let result_direct = s_direct.commit_block(&Arc::new(block2), &Arc::new(qc2), &[]);
+    let result_direct = s_direct.commit_block(&Arc::new(block2), &Arc::new(qc2));
 
     assert_eq!(result_prepared, result_direct);
     assert_eq!(spec_root, result_prepared);
@@ -395,7 +416,7 @@ fn test_commit_block_stores_certificates() {
     })];
     let qc = make_test_qc(&block);
 
-    let _ = storage.commit_block(&Arc::new(block), &Arc::new(qc), &[]);
+    let _ = storage.commit_block(&Arc::new(block), &Arc::new(qc));
 
     assert!(storage.get_certificate(&wave_hash).is_some());
 }
@@ -669,7 +690,7 @@ fn test_ec_survives_reopen() {
         let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
         let block = hyperscale_storage::test_helpers::make_test_block(0);
         let qc = hyperscale_storage::test_helpers::make_test_qc(&block);
-        storage.commit_block(&Arc::new(block), &Arc::new(qc), &[]);
+        storage.commit_block(&Arc::new(block), &Arc::new(qc));
         let mut block = hyperscale_storage::test_helpers::make_test_block(1);
         block
             .certificates
@@ -685,7 +706,7 @@ fn test_ec_survives_reopen() {
                 receipts: vec![],
             }));
         let qc = hyperscale_storage::test_helpers::make_test_qc(&block);
-        storage.commit_block(&Arc::new(block), &Arc::new(qc), &[]);
+        storage.commit_block(&Arc::new(block), &Arc::new(qc));
     }
 
     {
@@ -719,7 +740,7 @@ fn test_ec_atomic_with_block_commit() {
     let qc = make_test_qc(&block);
 
     // Commit block with EC atomically
-    storage.commit_block(&Arc::new(block), &Arc::new(qc), &[]);
+    storage.commit_block(&Arc::new(block), &Arc::new(qc));
 
     // EC should be retrievable by height
     let by_height = storage.get_execution_certificates_by_height(1);

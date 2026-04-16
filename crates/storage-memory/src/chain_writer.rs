@@ -28,10 +28,16 @@ impl ChainWriter for SimStorage {
         &self,
         parent_state_root: Hash,
         parent_block_height: u64,
-        receipts: &[ReceiptBundle],
+        finalized_waves: &[Arc<hyperscale_types::FinalizedWave>],
         block_height: u64,
         pending_snapshots: &[Arc<hyperscale_storage::JvtSnapshot>],
     ) -> (Hash, Self::PreparedCommit) {
+        // Flatten receipts from all finalized waves in block order.
+        let receipts: Vec<ReceiptBundle> = finalized_waves
+            .iter()
+            .flat_map(|fw| fw.receipts.iter().cloned())
+            .collect();
+
         // No receipts → no state changes → state root is unchanged.
         // Build a no-op JvtSnapshot directly, avoiding put_at_version which
         // would fail if the parent's tree nodes aren't in the store yet.
@@ -96,12 +102,12 @@ impl ChainWriter for SimStorage {
         drop(s); // Release read lock
 
         // Merge for commit-time substate writes (off the state_root critical path).
-        let merged_updates = hyperscale_storage::merge_updates_from_receipts(receipts);
+        let merged_updates = hyperscale_storage::merge_updates_from_receipts(&receipts);
 
         let prepared = SimPreparedCommit {
             snapshot,
             merged_updates,
-            receipts: receipts.to_vec(),
+            receipts,
         };
 
         (result_root, prepared)
@@ -187,10 +193,15 @@ impl ChainWriter for SimStorage {
         &self,
         block: &Arc<hyperscale_types::Block>,
         qc: &Arc<hyperscale_types::QuorumCertificate>,
-        receipts: &[ReceiptBundle],
     ) -> Hash {
-        let merged_updates = hyperscale_storage::merge_updates_from_receipts(receipts);
-        self.commit_block_inner(&merged_updates, block, qc, receipts)
+        // Flatten receipts from all finalized waves in block order.
+        let receipts: Vec<ReceiptBundle> = block
+            .certificates
+            .iter()
+            .flat_map(|fw| fw.receipts.iter().cloned())
+            .collect();
+        let merged_updates = hyperscale_storage::merge_updates_from_receipts(&receipts);
+        self.commit_block_inner(&merged_updates, block, qc, &receipts)
     }
 
     fn node_cache_len(&self) -> usize {

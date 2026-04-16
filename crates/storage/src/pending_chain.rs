@@ -546,14 +546,14 @@ impl<S: crate::ChainWriter> crate::ChainWriter for SubstateView<S> {
         &self,
         parent_state_root: Hash,
         parent_block_height: u64,
-        receipts: &[hyperscale_types::ReceiptBundle],
+        finalized_waves: &[Arc<hyperscale_types::FinalizedWave>],
         block_height: u64,
         pending_snapshots: &[Arc<JvtSnapshot>],
     ) -> (Hash, Self::PreparedCommit) {
         (*self.base).prepare_block_commit(
             parent_state_root,
             parent_block_height,
-            receipts,
+            finalized_waves,
             block_height,
             pending_snapshots,
         )
@@ -574,9 +574,8 @@ impl<S: crate::ChainWriter> crate::ChainWriter for SubstateView<S> {
         &self,
         block: &Arc<hyperscale_types::Block>,
         qc: &Arc<hyperscale_types::QuorumCertificate>,
-        receipts: &[hyperscale_types::ReceiptBundle],
     ) -> Hash {
-        (*self.base).commit_block(block, qc, receipts)
+        (*self.base).commit_block(block, qc)
     }
 
     fn jvt_snapshot(prepared: &Self::PreparedCommit) -> &JvtSnapshot {

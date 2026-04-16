@@ -35,10 +35,16 @@ impl hyperscale_storage::ChainWriter for RocksDbStorage {
         &self,
         parent_state_root: hyperscale_types::Hash,
         parent_block_height: u64,
-        receipts: &[ReceiptBundle],
+        finalized_waves: &[std::sync::Arc<hyperscale_types::FinalizedWave>],
         block_height: u64,
         pending_snapshots: &[std::sync::Arc<hyperscale_storage::JvtSnapshot>],
     ) -> (hyperscale_types::Hash, Self::PreparedCommit) {
+        // Flatten receipts from all finalized waves in block order.
+        let receipts: Vec<&ReceiptBundle> = finalized_waves
+            .iter()
+            .flat_map(|fw| fw.receipts.iter())
+            .collect();
+
         // No receipts → no state changes → state root is unchanged.
         // Build a no-op JvtSnapshot directly, avoiding put_at_version which
         // would fail if the parent's tree nodes aren't in the store yet
@@ -102,13 +108,17 @@ impl hyperscale_storage::ChainWriter for RocksDbStorage {
         );
 
         // Merge updates for the substate WriteBatch (off the state_root critical path).
-        let merged_updates = hyperscale_storage::merge_updates_from_receipts(receipts);
+        let updates: Vec<DatabaseUpdates> = receipts
+            .iter()
+            .map(|b| b.local_receipt.database_updates.clone())
+            .collect();
+        let merged_updates = hyperscale_storage::merge_database_updates(&updates);
 
         // Pre-build substate + receipt writes into a WriteBatch for efficient commit.
         let (mut write_batch, _reset_old_keys) =
             self.build_substate_write_batch(&merged_updates, Some(block_height));
 
-        for bundle in receipts {
+        for bundle in &receipts {
             self.add_receipt_bundle_to_batch(&mut write_batch, bundle);
         }
 
@@ -168,10 +178,15 @@ impl hyperscale_storage::ChainWriter for RocksDbStorage {
         &self,
         block: &Arc<hyperscale_types::Block>,
         qc: &Arc<hyperscale_types::QuorumCertificate>,
-        receipts: &[ReceiptBundle],
     ) -> hyperscale_types::Hash {
-        let merged_updates = hyperscale_storage::merge_updates_from_receipts(receipts);
-        self.commit_block_inner(&merged_updates, block, qc, receipts)
+        // Flatten receipts from all finalized waves in block order.
+        let receipts: Vec<ReceiptBundle> = block
+            .certificates
+            .iter()
+            .flat_map(|fw| fw.receipts.iter().cloned())
+            .collect();
+        let merged_updates = hyperscale_storage::merge_updates_from_receipts(&receipts);
+        self.commit_block_inner(&merged_updates, block, qc, &receipts)
     }
 
     fn memory_usage_bytes(&self) -> (u64, u64) {
