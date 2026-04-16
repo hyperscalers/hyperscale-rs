@@ -376,8 +376,11 @@ impl ExecutionState {
 
             // Create WaveCertificateTracker for finalization.
             // Build tx_participating_shards from the wave's transaction data.
+            // Preserve block order — `txs` iterates in the source block's tx order,
+            // which is the canonical wave ordering used by votes, ECs, and
+            // FinalizedWave.receipts downstream.
             let local_shard = topology.local_shard();
-            let tx_participating_shards: BTreeMap<Hash, BTreeSet<ShardGroupId>> = txs
+            let tx_participating_shards: Vec<(Hash, BTreeSet<ShardGroupId>)> = txs
                 .iter()
                 .map(|(tx_hash, _participating)| {
                     let shards: BTreeSet<ShardGroupId> = if wave_id.is_zero() {

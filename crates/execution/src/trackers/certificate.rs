@@ -8,7 +8,7 @@ use hyperscale_types::{
     ExecutionCertificate, ExecutionOutcome, Hash, ShardGroupId, TransactionDecision,
     WaveCertificate, WaveId,
 };
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 /// Tracks execution certificates for wave-level finalization.
@@ -18,18 +18,25 @@ use std::sync::Arc;
 /// blocks), so we track per-tx coverage rather than per-shard.
 ///
 /// Completion = every tx in the wave has all participating shards covered.
+///
+/// # Ordering
+///
+/// `tx_hashes` is stored in **block order** (the order in which the transactions
+/// appear in the source block). This matches the accumulator / ExecutionVote /
+/// ExecutionCertificate ordering convention, so `FinalizedWave.receipts` built
+/// from this tracker is aligned 1:1 with the local EC's `tx_outcomes`.
 #[derive(Debug)]
 pub struct WaveCertificateTracker {
     /// The wave being tracked.
     wave_id: WaveId,
-    /// Transaction hashes in this wave (from accumulator).
+    /// Transaction hashes in this wave, in block order (canonical).
     tx_hashes: Vec<Hash>,
     /// Participating shards for each tx (local + remote).
-    participating_shards: BTreeMap<Hash, BTreeSet<ShardGroupId>>,
+    participating_shards: HashMap<Hash, BTreeSet<ShardGroupId>>,
     /// Per-tx, which shards have reported.
-    covered: BTreeMap<Hash, BTreeSet<ShardGroupId>>,
+    covered: HashMap<Hash, BTreeSet<ShardGroupId>>,
     /// Per-tx, whether any shard reported an abort.
-    aborted: BTreeSet<Hash>,
+    aborted: HashSet<Hash>,
     /// All contributing ECs (held as Arc for cheap sharing).
     execution_certificates: Vec<Arc<ExecutionCertificate>>,
     /// Canonical hashes of ECs already processed (dedup guard).
@@ -45,22 +52,27 @@ pub struct WaveCertificateTracker {
 impl WaveCertificateTracker {
     /// Create a new tracker for a wave.
     ///
-    /// `tx_participating_shards` maps each tx_hash to the set of shards that
-    /// participate in its execution (local shard + remote provision sources).
+    /// `tx_participating_shards` is a list of `(tx_hash, shards)` pairs in
+    /// **block order** — the order is preserved as the canonical tx ordering
+    /// for the resulting `FinalizedWave.receipts`. Each entry maps a tx to the
+    /// set of shards that participate in its execution (local + remote provision
+    /// sources).
     pub fn new(
         wave_id: WaveId,
-        tx_participating_shards: BTreeMap<Hash, BTreeSet<ShardGroupId>>,
+        tx_participating_shards: Vec<(Hash, BTreeSet<ShardGroupId>)>,
         created_at: u64,
     ) -> Self {
-        let tx_hashes: Vec<Hash> = tx_participating_shards.keys().copied().collect();
-        let covered: BTreeMap<Hash, BTreeSet<ShardGroupId>> =
+        let tx_hashes: Vec<Hash> = tx_participating_shards.iter().map(|(h, _)| *h).collect();
+        let covered: HashMap<Hash, BTreeSet<ShardGroupId>> =
             tx_hashes.iter().map(|h| (*h, BTreeSet::new())).collect();
+        let participating_shards: HashMap<Hash, BTreeSet<ShardGroupId>> =
+            tx_participating_shards.into_iter().collect();
         Self {
             wave_id,
             tx_hashes,
-            participating_shards: tx_participating_shards,
+            participating_shards,
             covered,
-            aborted: BTreeSet::new(),
+            aborted: HashSet::new(),
             execution_certificates: Vec::new(),
             seen_ec_hashes: HashSet::new(),
             tx_has_failure: HashSet::new(),
@@ -121,11 +133,14 @@ impl WaveCertificateTracker {
     /// This avoids a deadlock where the remote shard never committed the tx
     /// (e.g. livelock — the tx was only committed on the local shard).
     pub fn is_complete(&self) -> bool {
-        for (tx_hash, expected) in &self.participating_shards {
+        for tx_hash in &self.tx_hashes {
             // Aborted txs don't need remote EC coverage — abort is terminal.
             if self.aborted.contains(tx_hash) {
                 continue;
             }
+            let Some(expected) = self.participating_shards.get(tx_hash) else {
+                return false;
+            };
             if let Some(covered) = self.covered.get(tx_hash) {
                 if !expected.is_subset(covered) {
                     return false;
@@ -265,8 +280,7 @@ mod tests {
         let wave_id = WaveId::new(ShardGroupId(0), 10, BTreeSet::new());
         let tx1 = Hash::from_bytes(b"tx1");
 
-        let mut participating = BTreeMap::new();
-        participating.insert(tx1, BTreeSet::from([ShardGroupId(0)]));
+        let participating = vec![(tx1, BTreeSet::from([ShardGroupId(0)]))];
 
         let mut tracker = WaveCertificateTracker::new(wave_id.clone(), participating, 10);
         assert!(!tracker.is_complete());
@@ -286,9 +300,7 @@ mod tests {
         let tx2 = Hash::from_bytes(b"tx2");
 
         let both_shards = BTreeSet::from([ShardGroupId(0), ShardGroupId(1)]);
-        let mut participating = BTreeMap::new();
-        participating.insert(tx1, both_shards.clone());
-        participating.insert(tx2, both_shards);
+        let participating = vec![(tx1, both_shards.clone()), (tx2, both_shards)];
 
         let mut tracker = WaveCertificateTracker::new(wave_id.clone(), participating, 10);
 
@@ -311,8 +323,7 @@ mod tests {
         let tx1 = Hash::from_bytes(b"tx1");
 
         let both_shards = BTreeSet::from([ShardGroupId(0), ShardGroupId(1)]);
-        let mut participating = BTreeMap::new();
-        participating.insert(tx1, both_shards);
+        let participating = vec![(tx1, both_shards)];
 
         let mut tracker = WaveCertificateTracker::new(wave_id.clone(), participating, 10);
 
@@ -340,9 +351,7 @@ mod tests {
         let tx2 = Hash::from_bytes(b"tx2");
 
         let both_shards = BTreeSet::from([ShardGroupId(0), ShardGroupId(1)]);
-        let mut participating = BTreeMap::new();
-        participating.insert(tx1, both_shards.clone());
-        participating.insert(tx2, both_shards);
+        let participating = vec![(tx1, both_shards.clone()), (tx2, both_shards)];
 
         let mut tracker = WaveCertificateTracker::new(wave_id.clone(), participating, 10);
 
@@ -375,5 +384,27 @@ mod tests {
             remote_count, 0,
             "remote ECs covering only aborted txs should be excluded"
         );
+    }
+
+    #[test]
+    fn tx_hashes_preserve_insertion_order() {
+        // Tracker must store tx_hashes in the order given by the caller
+        // (block order), not sort by hash. This is the canonical ordering
+        // invariant for downstream FinalizedWave.receipts.
+        let wave_id = make_wave_id();
+        // Pick hashes where block order != hash order.
+        let tx_a = Hash::from_bytes(b"zzz_first_in_block");
+        let tx_b = Hash::from_bytes(b"aaa_second_in_block");
+        let tx_c = Hash::from_bytes(b"mmm_third_in_block");
+
+        let shards = BTreeSet::from([ShardGroupId(0)]);
+        let participating = vec![
+            (tx_a, shards.clone()),
+            (tx_b, shards.clone()),
+            (tx_c, shards),
+        ];
+
+        let tracker = WaveCertificateTracker::new(wave_id, participating, 10);
+        assert_eq!(tracker.tx_hashes(), &[tx_a, tx_b, tx_c]);
     }
 }
