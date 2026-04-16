@@ -136,7 +136,7 @@ pub struct Metrics {
 impl Metrics {
     fn new() -> Self {
         let latency_buckets = vec![
-            0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
+            0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0,
         ];
 
         let build_info = register_gauge_vec!(
@@ -230,14 +230,17 @@ impl Metrics {
                 "hyperscale_signature_verification_latency_seconds",
                 "Signature verification latency by type",
                 &["type"],
-                vec![0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5]
+                vec![
+                    0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+                    30.0
+                ]
             )
             .unwrap(),
 
             execution_latency: register_histogram!(
                 "hyperscale_execution_latency_seconds",
                 "Transaction execution latency",
-                vec![0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0]
+                vec![0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 2.5, 5.0, 10.0]
             )
             .unwrap(),
 
@@ -282,7 +285,10 @@ impl Metrics {
                 "hyperscale_pool_task_duration_seconds",
                 "Time spent executing tasks in each dispatch pool",
                 &["pool"],
-                vec![0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0]
+                vec![
+                    0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+                    30.0
+                ]
             )
             .unwrap(),
 
@@ -352,14 +358,14 @@ impl Metrics {
             rocksdb_read_latency: register_histogram!(
                 "hyperscale_rocksdb_read_latency_seconds",
                 "RocksDB read operation latency",
-                vec![0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5]
+                vec![0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 2.0]
             )
             .unwrap(),
 
             rocksdb_write_latency: register_histogram!(
                 "hyperscale_rocksdb_write_latency_seconds",
                 "RocksDB write operation latency",
-                vec![0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5]
+                vec![0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 2.0]
             )
             .unwrap(),
 
@@ -367,14 +373,17 @@ impl Metrics {
                 "hyperscale_storage_operation_latency_seconds",
                 "Storage operation latency by type",
                 &["operation"],
-                vec![0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0]
+                vec![0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 2.5, 5.0, 10.0]
             )
             .unwrap(),
 
             storage_batch_size: register_histogram!(
                 "hyperscale_storage_batch_size",
                 "Number of writes in atomic batches",
-                vec![1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0]
+                vec![
+                    1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0,
+                    10000.0
+                ]
             )
             .unwrap(),
 
@@ -536,7 +545,7 @@ impl Metrics {
                 "hyperscale_fetch_latency_seconds",
                 "Fetch operation latency",
                 &["kind"],
-                vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0]
+                vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0]
             )
             .unwrap(),
 

@@ -4092,54 +4092,9 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "avg(hyperscale_consensus_crypto_pool_queue_depth)",
-          "legendFormat": "Consensus Crypto Pool (avg/validator)",
-          "refId": "C"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "avg(hyperscale_crypto_pool_queue_depth)",
-          "legendFormat": "General Crypto Pool (avg/validator)",
+          "expr": "label_replace(avg by (__name__) ({__name__=~\"hyperscale_.*_pool_queue_depth\"}), \"pool\", \"$1\", \"__name__\", \"hyperscale_(.*)_pool_queue_depth\")",
+          "legendFormat": "{{pool}}",
           "refId": "A"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "avg(hyperscale_tx_validation_pool_queue_depth)",
-          "legendFormat": "TX Validation Pool (avg/validator)",
-          "refId": "D"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "avg(hyperscale_execution_pool_queue_depth)",
-          "legendFormat": "Execution Pool (avg/validator)",
-          "refId": "B"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "avg(hyperscale_provisions_pool_queue_depth)",
-          "legendFormat": "Provisions Pool (avg/validator)",
-          "refId": "E"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "avg(hyperscale_state_root_pool_queue_depth)",
-          "legendFormat": "State Root Pool (avg/validator)",
-          "refId": "F"
         }
       ],
       "title": "Avg Thread Pool Queue Depth",
@@ -5697,45 +5652,9 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "avg(rate(hyperscale_pool_task_duration_seconds_sum{pool=\"consensus_crypto\"}[1m]))",
-          "legendFormat": "consensus_crypto",
+          "expr": "avg by (pool) (rate(hyperscale_pool_task_duration_seconds_sum[1m]))",
+          "legendFormat": "{{pool}}",
           "refId": "A"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "avg(rate(hyperscale_pool_task_duration_seconds_sum{pool=\"crypto\"}[1m]))",
-          "legendFormat": "crypto",
-          "refId": "B"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "avg(rate(hyperscale_pool_task_duration_seconds_sum{pool=\"tx_validation\"}[1m]))",
-          "legendFormat": "tx_validation",
-          "refId": "C"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "avg(rate(hyperscale_pool_task_duration_seconds_sum{pool=\"execution\"}[1m]))",
-          "legendFormat": "execution",
-          "refId": "D"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "avg(rate(hyperscale_pool_task_duration_seconds_sum{pool=\"provisions\"}[1m]))",
-          "legendFormat": "provisions",
-          "refId": "E"
         }
       ],
       "title": "Pool Utilization (busy seconds/sec per thread — divide by pool thread count)",
