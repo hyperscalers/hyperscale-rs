@@ -722,10 +722,8 @@ impl ExecutionState {
         for wc in certificates {
             let wave_id = &wc.wave_id;
             if let Some(finalized) = self.finalized_wave_certificates.get(wave_id) {
-                // Extract per-tx decisions from the finalized wave
-                for (tx_hash, decision) in &finalized.tx_decisions {
-                    committed_txs.push((*tx_hash, *decision));
-                }
+                // Derive per-tx decisions from the finalized wave's ECs
+                committed_txs.extend(finalized.tx_decisions());
             }
             // Clean up all state associated with this wave
             self.remove_finalized_wave(wave_id);
@@ -1757,7 +1755,6 @@ impl ExecutionState {
         self.pending_wave_receipts.remove(wave_id);
 
         let wc = tracker.create_wave_certificate();
-        let tx_decisions = tracker.tx_decisions();
         let tx_hashes = tracker.tx_hashes().to_vec();
         // Ensure aborted txs have failure receipts. This handles two cases:
         // 1. Overwrite: a non-quorum validator executed successfully but the EC
@@ -1780,6 +1777,9 @@ impl ExecutionState {
         }
 
         // Move receipts from cache into FinalizedWave for atomic commit.
+        // Receipts are aligned 1:1 with tx_hashes (block order), which matches
+        // the local EC's tx_outcomes order — so `FinalizedWave.receipts[i]` lines
+        // up with `FinalizedWave.tx_hashes().nth(i)`.
         let receipts: Vec<ReceiptBundle> = tx_hashes
             .iter()
             .filter_map(|h| self.receipt_cache.remove(h))
@@ -1788,10 +1788,7 @@ impl ExecutionState {
         let cert_arc = Arc::new(wc);
         let finalized = FinalizedWave {
             certificate: Arc::clone(&cert_arc),
-            tx_hashes: tx_hashes.clone(),
-            tx_decisions: tx_decisions.clone(),
             receipts,
-            finalized_height: self.committed_height,
         };
         let finalized_arc = Arc::new(finalized.clone());
         self.finalized_wave_certificates
@@ -1810,10 +1807,10 @@ impl ExecutionState {
         }));
 
         // Emit TransactionExecuted for each tx (per-tx mempool status updates)
-        for (tx_hash, decision) in &tx_decisions {
+        for (tx_hash, decision) in tracker.tx_decisions() {
             actions.push(Action::Continuation(ProtocolEvent::TransactionExecuted {
-                tx_hash: *tx_hash,
-                accepted: *decision == TransactionDecision::Accept,
+                tx_hash,
+                accepted: decision == TransactionDecision::Accept,
             }));
         }
         actions
@@ -1851,7 +1848,7 @@ impl ExecutionState {
     pub fn get_finalized_certificate(&self, tx_hash: &Hash) -> Option<Arc<WaveCertificate>> {
         self.finalized_wave_certificates
             .values()
-            .find(|fw| fw.tx_hashes.contains(tx_hash))
+            .find(|fw| fw.contains_tx(tx_hash))
             .map(|fw| Arc::clone(&fw.certificate))
     }
 
@@ -1859,10 +1856,10 @@ impl ExecutionState {
     ///
     /// Cleans up all per-tx tracking state for transactions in this wave.
     pub fn remove_finalized_wave(&mut self, wave_id: &WaveId) {
-        let tx_hashes = self
+        let tx_hashes: Vec<Hash> = self
             .finalized_wave_certificates
             .get(wave_id)
-            .map(|fw| fw.tx_hashes.clone())
+            .map(|fw| fw.tx_hashes().collect())
             .unwrap_or_default();
 
         self.finalized_wave_certificates.remove(wave_id);
@@ -1999,7 +1996,7 @@ impl ExecutionState {
     pub fn is_finalized(&self, tx_hash: &Hash) -> bool {
         self.finalized_wave_certificates
             .values()
-            .any(|fw| fw.tx_hashes.contains(tx_hash))
+            .any(|fw| fw.contains_tx(tx_hash))
     }
 
     /// Returns the set of all finalized transaction hashes.
@@ -2008,7 +2005,7 @@ impl ExecutionState {
     pub fn finalized_tx_hashes(&self) -> std::collections::HashSet<Hash> {
         self.finalized_wave_certificates
             .values()
-            .flat_map(|fw| fw.tx_hashes.iter().copied())
+            .flat_map(|fw| fw.tx_hashes())
             .collect()
     }
 

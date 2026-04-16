@@ -383,10 +383,7 @@ mod tests {
                 wave_id,
                 execution_certificates: vec![],
             }),
-            tx_hashes: vec![],
-            tx_decisions: vec![],
             receipts: vec![],
-            finalized_height: 1,
         });
 
         let added = pb.add_finalized_wave(fw);
@@ -427,10 +424,7 @@ mod tests {
                 wave_id,
                 execution_certificates: vec![],
             }),
-            tx_hashes: vec![],
-            tx_decisions: vec![],
             receipts: vec![],
-            finalized_height: 1,
         });
         pb.add_finalized_wave(fw);
         assert!(pb.is_complete());
@@ -454,10 +448,7 @@ mod tests {
 
         let fw = Arc::new(FinalizedWave {
             certificate: cert,
-            tx_hashes: vec![],
-            tx_decisions: vec![],
             receipts: vec![],
-            finalized_height: 1,
         });
 
         let pending = PendingBlock::from_complete_block(&block, vec![fw], vec![]);

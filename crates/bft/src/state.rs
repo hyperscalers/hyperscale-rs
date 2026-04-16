@@ -60,7 +60,7 @@ use hyperscale_types::{
     derive_wave_tx_hashes, Block, BlockHeader, BlockHeight, BlockManifest, BlockVote,
     Bls12381G1PublicKey, CommittedBlockHeader, FinalizedWave, Hash, LocalReceiptEntry, Provision,
     QuorumCertificate, ReadyTransactions, ReceiptBundle, RoutableTransaction, ShardGroupId,
-    TopologySnapshot, TransactionDecision, TransactionOutcome, ValidatorId, VotePower,
+    TopologySnapshot, ValidatorId, VotePower,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -103,14 +103,8 @@ fn build_finalized_waves_from_sync(
         let tx_hashes = derive_wave_tx_hashes(topology, &wc.wave_id, &block.transactions);
 
         let mut receipts = Vec::with_capacity(tx_hashes.len());
-        let mut tx_decisions = Vec::with_capacity(tx_hashes.len());
         for tx_hash in &tx_hashes {
             if let Some(entry) = receipt_map.get(tx_hash) {
-                let decision = match entry.receipt.outcome {
-                    TransactionOutcome::Success => TransactionDecision::Accept,
-                    TransactionOutcome::Failure => TransactionDecision::Reject,
-                };
-                tx_decisions.push((*tx_hash, decision));
                 receipts.push(ReceiptBundle {
                     tx_hash: *tx_hash,
                     local_receipt: Arc::new(entry.receipt.clone()),
@@ -132,10 +126,7 @@ fn build_finalized_waves_from_sync(
 
         waves.push(Arc::new(FinalizedWave {
             certificate: Arc::clone(wc),
-            tx_hashes,
-            tx_decisions,
             receipts,
-            finalized_height: block.header.height.0,
         }));
     }
 
@@ -1105,7 +1096,7 @@ impl BftState {
         let waves_to_propose: Vec<_> = candidate_waves
             .into_iter()
             .take_while(|fw| {
-                let new_total = finalized_tx_count.saturating_add(fw.tx_hashes.len());
+                let new_total = finalized_tx_count.saturating_add(fw.tx_count());
                 if new_total <= max_finalized_txs {
                     finalized_tx_count = new_total;
                     true
@@ -2050,7 +2041,7 @@ impl BftState {
                     let finalized_tx_count: u32 = pending
                         .finalized_waves()
                         .iter()
-                        .map(|fw| fw.tx_hashes.len() as u32)
+                        .map(|fw| fw.tx_count() as u32)
                         .sum();
                     if !self.verification.verify_in_flight(
                         block_hash,

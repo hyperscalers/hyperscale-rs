@@ -761,22 +761,29 @@ pub fn decode_wave_cert_vec<D: sbor::Decoder<sbor::NoCustomValueKind>>(
 
 /// A finalized wave — all participating shards have reported, WaveCertificate created.
 ///
-/// Holds all data needed for block commit: the wave certificate (which contains the
-/// execution certificates), per-tx decisions, and receipt bundles. Receipts are
-/// written atomically with the block at commit time (not fire-and-forget).
+/// Holds the wave certificate (which contains the execution certificates) plus the
+/// receipt bundles produced by local execution. Receipts are written atomically
+/// with the block at commit time (not fire-and-forget).
+///
+/// # Derived views
+///
+/// The wave's canonical tx list, ordering, and per-tx decisions are all **derived**
+/// from the WaveCertificate, not stored alongside it. See:
+/// - [`FinalizedWave::local_ec`] — the authoritative EC (where `ec.wave_id == wc.wave_id`)
+/// - [`FinalizedWave::tx_hashes`] — iterator over the wave's tx hashes in block order
+/// - [`FinalizedWave::tx_decisions`] — aggregated (Aborted > Reject > Accept) per tx
+///
+/// `receipts` is aligned 1:1 with `tx_hashes()` in block order.
 ///
 /// Shared via `Arc` across the system — flows from execution state through
 /// pending blocks, actions, and into the commit path.
 #[derive(Debug, Clone)]
 pub struct FinalizedWave {
     pub certificate: Arc<WaveCertificate>,
-    pub tx_hashes: Vec<Hash>,
-    /// Per-transaction decisions: (tx_hash, decision).
-    pub tx_decisions: Vec<(Hash, TransactionDecision)>,
-    /// Receipt bundles for all transactions in this wave.
+    /// Receipt bundles for all transactions in this wave, in block order.
+    /// Aligned 1:1 with `tx_hashes()`.
     /// Held in-memory until block commit, then written atomically with block metadata.
     pub receipts: Vec<ReceiptBundle>,
-    pub finalized_height: u64,
 }
 
 impl FinalizedWave {
@@ -794,6 +801,70 @@ impl FinalizedWave {
     pub fn execution_certificates(&self) -> &[Arc<ExecutionCertificate>] {
         &self.certificate.execution_certificates
     }
+
+    /// The local shard's EC — authoritative for wave membership and ordering.
+    ///
+    /// A well-formed WaveCertificate has exactly one EC with `ec.wave_id == wc.wave_id`
+    /// (invariant established by `WaveCertificateTracker::create_wave_certificate`
+    /// and the endorsement + convergence gate).
+    pub fn local_ec(&self) -> &ExecutionCertificate {
+        self.certificate
+            .execution_certificates
+            .iter()
+            .find(|ec| ec.wave_id == self.certificate.wave_id)
+            .expect("WaveCertificate invariant: local EC must be present")
+    }
+
+    /// Number of transactions in this wave.
+    pub fn tx_count(&self) -> usize {
+        self.local_ec().tx_outcomes.len()
+    }
+
+    /// Iterator over the wave's tx hashes in canonical block order.
+    pub fn tx_hashes(&self) -> impl Iterator<Item = Hash> + '_ {
+        self.local_ec().tx_outcomes.iter().map(|o| o.tx_hash)
+    }
+
+    /// Whether the wave contains a given tx.
+    pub fn contains_tx(&self, tx_hash: &Hash) -> bool {
+        self.local_ec()
+            .tx_outcomes
+            .iter()
+            .any(|o| &o.tx_hash == tx_hash)
+    }
+
+    /// Aggregate per-tx decisions across all ECs (Aborted > Reject > Accept).
+    ///
+    /// Iteration order follows the local EC's canonical (block) order.
+    pub fn tx_decisions(&self) -> Vec<(Hash, TransactionDecision)> {
+        let mut aborted: std::collections::HashSet<Hash> = std::collections::HashSet::new();
+        let mut failure: std::collections::HashSet<Hash> = std::collections::HashSet::new();
+        for ec in &self.certificate.execution_certificates {
+            for outcome in &ec.tx_outcomes {
+                if outcome.is_aborted() {
+                    aborted.insert(outcome.tx_hash);
+                }
+                if !matches!(
+                    outcome.outcome,
+                    ExecutionOutcome::Executed { success: true, .. }
+                ) {
+                    failure.insert(outcome.tx_hash);
+                }
+            }
+        }
+        self.tx_hashes()
+            .map(|h| {
+                let d = if aborted.contains(&h) {
+                    TransactionDecision::Aborted
+                } else if failure.contains(&h) {
+                    TransactionDecision::Reject
+                } else {
+                    TransactionDecision::Accept
+                };
+                (h, d)
+            })
+            .collect()
+    }
 }
 
 // Manual SBOR implementation for FinalizedWave (Arc fields prevent BasicSbor derive).
@@ -807,12 +878,9 @@ impl<E: sbor::Encoder<sbor::NoCustomValueKind>> sbor::Encode<sbor::NoCustomValue
     }
 
     fn encode_body(&self, encoder: &mut E) -> Result<(), sbor::EncodeError> {
-        encoder.write_size(5)?;
+        encoder.write_size(2)?;
         encoder.encode(self.certificate.as_ref())?;
-        encoder.encode(&self.tx_hashes)?;
-        encoder.encode(&self.tx_decisions)?;
         encoder.encode(&self.receipts)?;
-        encoder.encode(&self.finalized_height)?;
         Ok(())
     }
 }
@@ -826,23 +894,17 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
     ) -> Result<Self, sbor::DecodeError> {
         decoder.check_preloaded_value_kind(value_kind, sbor::ValueKind::Tuple)?;
         let length = decoder.read_size()?;
-        if length != 5 {
+        if length != 2 {
             return Err(sbor::DecodeError::UnexpectedSize {
-                expected: 5,
+                expected: 2,
                 actual: length,
             });
         }
         let certificate: WaveCertificate = decoder.decode()?;
-        let tx_hashes: Vec<Hash> = decoder.decode()?;
-        let tx_decisions: Vec<(Hash, TransactionDecision)> = decoder.decode()?;
         let receipts: Vec<ReceiptBundle> = decoder.decode()?;
-        let finalized_height: u64 = decoder.decode()?;
         Ok(Self {
             certificate: Arc::new(certificate),
-            tx_hashes,
-            tx_decisions,
             receipts,
-            finalized_height,
         })
     }
 }

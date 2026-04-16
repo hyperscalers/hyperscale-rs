@@ -128,11 +128,27 @@ impl WaveCertificateTracker {
 
     /// Whether every tx in the wave has all participating shards covered.
     ///
-    /// Aborted txs are treated as fully covered: the local shard's abort
+    /// The **local EC** (matching `self.wave_id`) must be present — this is
+    /// the downstream invariant for `FinalizedWave::local_ec()`. Without it we
+    /// could race-finalize on a remote EC alone when both shards detect a
+    /// livelock conflict and our local EC arrives after the remote one.
+    ///
+    /// Aborted txs are treated as fully covered by remote shards: the abort
     /// decision is terminal and doesn't require remote shard confirmation.
     /// This avoids a deadlock where the remote shard never committed the tx
     /// (e.g. livelock — the tx was only committed on the local shard).
     pub fn is_complete(&self) -> bool {
+        // The local EC must be present. It carries the canonical tx list /
+        // ordering for downstream consumers and is deterministic (one vote per
+        // wave from the local accumulator).
+        let has_local_ec = self
+            .execution_certificates
+            .iter()
+            .any(|ec| ec.wave_id == self.wave_id);
+        if !has_local_ec {
+            return false;
+        }
+
         for tx_hash in &self.tx_hashes {
             // Aborted txs don't need remote EC coverage — abort is terminal.
             if self.aborted.contains(tx_hash) {
