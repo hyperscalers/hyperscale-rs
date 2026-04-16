@@ -332,7 +332,7 @@ impl NodeStateMachine {
             .execution
             .on_certificates_committed(&block.certificates);
         for cert in &block.certificates {
-            let cert_hash = cert.wave_id.hash();
+            let cert_hash = cert.wave_id().hash();
             self.bft.remove_committed_transaction(&cert_hash);
         }
 

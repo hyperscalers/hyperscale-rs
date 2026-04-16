@@ -7,7 +7,7 @@ use crate::core::RocksDbStorage;
 use crate::typed_cf::TypedCf;
 use hyperscale_metrics as metrics;
 use hyperscale_types::{
-    Block, BlockHeight, BlockMetadata, Hash, QuorumCertificate, RoutableTransaction,
+    Block, BlockHeight, BlockMetadata, FinalizedWave, Hash, QuorumCertificate, RoutableTransaction,
     WaveCertificate,
 };
 use rocksdb::{WriteBatch, WriteOptions};
@@ -109,8 +109,8 @@ impl RocksDbStorage {
         for tx in block.transactions.iter() {
             self.cf_put::<TransactionsCf>(batch, &tx.hash(), tx.as_ref());
         }
-        for cert in &block.certificates {
-            self.cf_put::<CertificatesCf>(batch, &cert.wave_id.hash(), cert.as_ref());
+        for fw in &block.certificates {
+            self.cf_put::<CertificatesCf>(batch, &fw.wave_id().hash(), fw.certificate.as_ref());
         }
     }
 
@@ -147,20 +147,35 @@ impl RocksDbStorage {
         }
 
         // 3. Batch-fetch certificates (preserving order)
-        let certificates = self.get_certificates_batch_ordered(&metadata.manifest.cert_hashes);
+        let certs = self.get_certificates_batch_ordered(&metadata.manifest.cert_hashes);
 
         // Verify we got ALL certificates - return None if any are missing
-        if certificates.len() != metadata.manifest.cert_hashes.len() {
+        if certs.len() != metadata.manifest.cert_hashes.len() {
             tracing::warn!(
                 height = height.0,
                 expected = metadata.manifest.cert_hashes.len(),
-                found = certificates.len(),
+                found = certs.len(),
                 "Block has missing certificates - cannot serve sync request"
             );
             return None;
         }
 
-        // 4. Reconstruct block
+        // 4. Reconstruct each FinalizedWave from cert + stored receipts.
+        let certificates: Option<Vec<Arc<FinalizedWave>>> = certs
+            .into_iter()
+            .map(|cert| {
+                FinalizedWave::reconstruct(cert, |h| self.get_local_receipt(h)).map(Arc::new)
+            })
+            .collect();
+        let Some(certificates) = certificates else {
+            tracing::warn!(
+                height = height.0,
+                "Block has missing receipts for a non-aborted tx - cannot reconstruct FinalizedWave"
+            );
+            return None;
+        };
+
+        // 5. Reconstruct block
         let block = Block {
             header: metadata.header,
             transactions,
@@ -225,14 +240,14 @@ impl RocksDbStorage {
         }
 
         // 3. Try to batch-fetch certificates (preserving order)
-        let certificates = self.get_certificates_batch_ordered(&metadata.manifest.cert_hashes);
+        let certs = self.get_certificates_batch_ordered(&metadata.manifest.cert_hashes);
 
         // Check if all certificates are present - if not, return None
-        if certificates.len() != metadata.manifest.cert_hashes.len() {
+        if certs.len() != metadata.manifest.cert_hashes.len() {
             tracing::debug!(
                 height = height.0,
                 expected = metadata.manifest.cert_hashes.len(),
-                found = certificates.len(),
+                found = certs.len(),
                 "Block has missing certificates - cannot serve sync request"
             );
             let elapsed = start.elapsed().as_secs_f64();
@@ -240,7 +255,26 @@ impl RocksDbStorage {
             return None;
         }
 
-        // 4. Full block available - reconstruct it
+        // 4. Reconstruct each FinalizedWave from cert + stored receipts. If any
+        // wave has a non-aborted tx whose receipt is missing, the block is not
+        // servable and the syncing peer must try a different source.
+        let certificates: Option<Vec<Arc<FinalizedWave>>> = certs
+            .into_iter()
+            .map(|cert| {
+                FinalizedWave::reconstruct(cert, |h| self.get_local_receipt(h)).map(Arc::new)
+            })
+            .collect();
+        let Some(certificates) = certificates else {
+            tracing::debug!(
+                height = height.0,
+                "Block has missing receipts - cannot reconstruct FinalizedWave for sync"
+            );
+            let elapsed = start.elapsed().as_secs_f64();
+            metrics::record_storage_operation("get_block_for_sync_incomplete", elapsed);
+            return None;
+        };
+
+        // 5. Full block available - reconstruct it
         let block = Block {
             header: metadata.header,
             transactions,

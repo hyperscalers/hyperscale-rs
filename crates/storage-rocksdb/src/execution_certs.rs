@@ -20,8 +20,8 @@ pub(crate) fn append_block_certs_to_batch(
     batch: &mut WriteBatch,
     block: &Arc<Block>,
 ) {
-    for wc in &block.certificates {
-        for ec in &wc.execution_certificates {
+    for fw in &block.certificates {
+        for ec in &fw.certificate.execution_certificates {
             append_ec_to_batch(storage, batch, ec);
         }
     }

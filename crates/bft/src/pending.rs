@@ -4,7 +4,6 @@
 
 use hyperscale_types::{
     Block, BlockHeader, BlockManifest, FinalizedWave, Hash, Provision, RoutableTransaction,
-    WaveCertificate,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -234,16 +233,12 @@ impl PendingBlock {
             .filter_map(|hash| self.received_transactions.remove(hash))
             .collect();
 
-        // Build certificates from finalized waves in the original order.
-        let certificates: Vec<Arc<WaveCertificate>> = self
+        // Pass finalized waves into the block in manifest order.
+        let certificates: Vec<Arc<FinalizedWave>> = self
             .manifest
             .cert_hashes
             .iter()
-            .filter_map(|hash| {
-                self.received_waves
-                    .get(hash)
-                    .map(|fw| Arc::clone(&fw.certificate))
-            })
+            .filter_map(|hash| self.received_waves.get(hash).cloned())
             .collect();
 
         let block = Arc::new(Block {
@@ -440,16 +435,16 @@ mod tests {
             execution_certificates: vec![],
         });
 
-        let block = Block {
-            header: make_header(1),
-            transactions: vec![],
-            certificates: vec![cert.clone()],
-        };
-
         let fw = Arc::new(FinalizedWave {
             certificate: cert,
             receipts: vec![],
         });
+
+        let block = Block {
+            header: make_header(1),
+            transactions: vec![],
+            certificates: vec![Arc::clone(&fw)],
+        };
 
         let pending = PendingBlock::from_complete_block(&block, vec![fw], vec![]);
         assert!(pending.is_complete());

@@ -389,7 +389,10 @@ fn test_commit_block_stores_certificates() {
 
     // Create a block that includes this certificate
     let mut block = make_test_block(1);
-    block.certificates = vec![cert];
+    block.certificates = vec![Arc::new(hyperscale_types::FinalizedWave {
+        certificate: cert,
+        receipts: vec![],
+    })];
     let qc = make_test_qc(&block);
 
     let _ = storage.commit_block(&Arc::new(block), &Arc::new(qc), &[]);
@@ -670,13 +673,16 @@ fn test_ec_survives_reopen() {
         let mut block = hyperscale_storage::test_helpers::make_test_block(1);
         block
             .certificates
-            .push(Arc::new(hyperscale_types::WaveCertificate {
-                wave_id: hyperscale_types::WaveId::new(
-                    ShardGroupId(0),
-                    1,
-                    std::collections::BTreeSet::new(),
-                ),
-                execution_certificates: vec![Arc::new(ec)],
+            .push(Arc::new(hyperscale_types::FinalizedWave {
+                certificate: Arc::new(hyperscale_types::WaveCertificate {
+                    wave_id: hyperscale_types::WaveId::new(
+                        ShardGroupId(0),
+                        1,
+                        std::collections::BTreeSet::new(),
+                    ),
+                    execution_certificates: vec![Arc::new(ec)],
+                }),
+                receipts: vec![],
             }));
         let qc = hyperscale_storage::test_helpers::make_test_qc(&block);
         storage.commit_block(&Arc::new(block), &Arc::new(qc), &[]);
@@ -699,13 +705,16 @@ fn test_ec_atomic_with_block_commit() {
     let mut block = make_test_block(1);
     block
         .certificates
-        .push(Arc::new(hyperscale_types::WaveCertificate {
-            wave_id: hyperscale_types::WaveId::new(
-                ShardGroupId(0),
-                1,
-                std::collections::BTreeSet::new(),
-            ),
-            execution_certificates: vec![Arc::new(ec)],
+        .push(Arc::new(hyperscale_types::FinalizedWave {
+            certificate: Arc::new(hyperscale_types::WaveCertificate {
+                wave_id: hyperscale_types::WaveId::new(
+                    ShardGroupId(0),
+                    1,
+                    std::collections::BTreeSet::new(),
+                ),
+                execution_certificates: vec![Arc::new(ec)],
+            }),
+            receipts: vec![],
         }));
     let qc = make_test_qc(&block);
 

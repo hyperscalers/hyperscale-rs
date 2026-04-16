@@ -17,7 +17,7 @@ use hyperscale_messages::request::GetBlockRequest;
 use hyperscale_messages::response::GetBlockResponse;
 use hyperscale_metrics as metrics;
 use hyperscale_storage::ChainReader;
-use hyperscale_types::{Block, BlockHeight, Hash, QuorumCertificate, TopologySnapshot};
+use hyperscale_types::{Block, Hash, QuorumCertificate, TopologySnapshot};
 use serde::Serialize;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
@@ -378,35 +378,28 @@ impl SyncProtocol {
 /// without re-executing. Returns not_found if any data is missing.
 pub fn serve_block_request(
     storage: &impl ChainReader,
-    topology: &TopologySnapshot,
+    _topology: &TopologySnapshot,
     req: GetBlockRequest,
 ) -> GetBlockResponse {
     trace!(height = req.height.0, "Handling block sync request");
     match storage.get_block_for_sync(req.height) {
         Some((block, qc)) => {
-            // Collect receipts for transactions covered by wave certs in this block.
-            // Wave certs are lean (no per-tx data). For each completed wave cert,
-            // look up the source block (at wave_id.block_height) and derive which
-            // txs the wave covers via derive_wave_tx_hashes. Then look up receipts
-            // for those txs. This matches the proposer's state_root computation.
-            let mut local_receipts = Vec::new();
-            for wc in &block.certificates {
-                let source_height = BlockHeight(wc.wave_id.block_height);
-                let source_txs = match storage.get_block(source_height) {
-                    Some((source_block, _)) => source_block.transactions,
-                    None => continue,
-                };
-                let tx_hashes =
-                    hyperscale_types::derive_wave_tx_hashes(topology, &wc.wave_id, &source_txs);
-                for tx_hash in tx_hashes {
-                    if let Some(receipt) = storage.get_local_receipt(&tx_hash) {
-                        local_receipts.push(hyperscale_types::LocalReceiptEntry {
-                            tx_hash,
-                            receipt: (*receipt).clone(),
-                        });
-                    }
-                }
-            }
+            // `Block.certificates` already carries `Arc<FinalizedWave>` with the
+            // wave's receipts attached (rebuilt from storage in `get_block_for_sync`
+            // via `FinalizedWave::reconstruct`). Flatten for the legacy response
+            // field; Step 5 of the refactor removes this field entirely.
+            let local_receipts: Vec<hyperscale_types::LocalReceiptEntry> = block
+                .certificates
+                .iter()
+                .flat_map(|fw| {
+                    fw.receipts
+                        .iter()
+                        .map(|bundle| hyperscale_types::LocalReceiptEntry {
+                            tx_hash: bundle.tx_hash,
+                            receipt: (*bundle.local_receipt).clone(),
+                        })
+                })
+                .collect();
 
             // Collect local ECs for this block height.
             let execution_certificates =

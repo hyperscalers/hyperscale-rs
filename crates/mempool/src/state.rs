@@ -1379,8 +1379,9 @@ impl MempoolState {
 mod tests {
     use super::*;
     use hyperscale_types::{
-        generate_bls_keypair, test_utils::test_transaction, Block, BlockHeader, QuorumCertificate,
-        ShardGroupId, ValidatorId, ValidatorInfo, ValidatorSet, WaveCertificate, WaveId,
+        generate_bls_keypair, test_utils::test_transaction, Block, BlockHeader, FinalizedWave,
+        QuorumCertificate, ShardGroupId, ValidatorId, ValidatorInfo, ValidatorSet, WaveCertificate,
+        WaveId,
     };
     use std::collections::BTreeSet;
 
@@ -1420,7 +1421,15 @@ mod tests {
                 in_flight: 0,
             },
             transactions: transactions.into_iter().map(Arc::new).collect(),
-            certificates: wave_certs.into_iter().map(Arc::new).collect(),
+            certificates: wave_certs
+                .into_iter()
+                .map(|wc| {
+                    Arc::new(FinalizedWave {
+                        certificate: Arc::new(wc),
+                        receipts: vec![],
+                    })
+                })
+                .collect(),
         }
     }
 

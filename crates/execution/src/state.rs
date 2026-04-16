@@ -711,7 +711,7 @@ impl ExecutionState {
     /// then clean up the finalized entry.
     pub fn on_certificates_committed(
         &mut self,
-        certificates: &[Arc<hyperscale_types::WaveCertificate>],
+        certificates: &[Arc<hyperscale_types::FinalizedWave>],
     ) -> Vec<(Hash, hyperscale_types::TransactionDecision)> {
         if certificates.is_empty() {
             return vec![];
@@ -719,8 +719,8 @@ impl ExecutionState {
 
         let mut committed_txs = Vec::new();
 
-        for wc in certificates {
-            let wave_id = &wc.wave_id;
+        for fw in certificates {
+            let wave_id = fw.wave_id();
             if let Some(finalized) = self.finalized_wave_certificates.get(wave_id) {
                 // Derive per-tx decisions from the finalized wave's ECs
                 committed_txs.extend(finalized.tx_decisions());

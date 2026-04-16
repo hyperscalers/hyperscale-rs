@@ -10,8 +10,8 @@ use crate::{
 };
 use hyperscale_types::{
     zero_bls_signature, ApplicationEvent, Block, BlockHeader, BlockHeight, Bls12381G2Signature,
-    ExecutionCertificate, ExecutionMetadata, ExecutionOutcome, FeeSummary, Hash, LocalReceipt,
-    LogLevel, NodeId, QuorumCertificate, ReceiptBundle, ShardGroupId, SignerBitfield,
+    ExecutionCertificate, ExecutionMetadata, ExecutionOutcome, FeeSummary, FinalizedWave, Hash,
+    LocalReceipt, LogLevel, NodeId, QuorumCertificate, ReceiptBundle, ShardGroupId, SignerBitfield,
     TransactionOutcome, TxOutcome, ValidatorId, WaveCertificate, WaveId,
 };
 use radix_common::prelude::DatabaseUpdate;
@@ -180,9 +180,13 @@ pub fn make_test_execution_certificate(seed: u8, block_height: u64) -> Execution
 fn make_test_block_with_ecs(height: u64, ecs: Vec<Arc<ExecutionCertificate>>) -> Block {
     let mut block = make_test_block(height);
     if !ecs.is_empty() {
-        block.certificates.push(Arc::new(WaveCertificate {
+        let certificate = Arc::new(WaveCertificate {
             wave_id: WaveId::new(ShardGroupId(0), height, BTreeSet::new()),
             execution_certificates: ecs,
+        });
+        block.certificates.push(Arc::new(FinalizedWave {
+            certificate,
+            receipts: vec![],
         }));
     }
     block

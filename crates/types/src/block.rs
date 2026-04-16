@@ -1,24 +1,27 @@
 //! Block and BlockHeader types for consensus.
 
 use crate::{
-    block_vote_message, compute_merkle_root, compute_padded_merkle_root, decode_wave_cert_vec,
-    encode_wave_cert_vec, BlockHeight, Bls12381G1PrivateKey, Bls12381G2Signature, Hash,
-    QuorumCertificate, ReceiptBundle, RoutableTransaction, ShardGroupId, ValidatorId,
-    WaveCertificate, WaveId,
+    block_vote_message, compute_merkle_root, compute_padded_merkle_root, decode_finalized_wave_vec,
+    encode_finalized_wave_vec, BlockHeight, Bls12381G1PrivateKey, Bls12381G2Signature,
+    FinalizedWave, Hash, QuorumCertificate, ReceiptBundle, RoutableTransaction, ShardGroupId,
+    ValidatorId, WaveId,
 };
 use sbor::prelude::*;
 use std::sync::Arc;
 
-/// Compute the receipt merkle root for a block's wave certificates.
+/// Compute the receipt merkle root for a block's finalized waves.
 ///
-/// Each wave certificate's `receipt_hash` becomes a leaf.
+/// Each underlying wave certificate's `receipt_hash` becomes a leaf.
 /// Returns `Hash::ZERO` if there are no certificates.
-pub fn compute_certificate_root(certificates: &[Arc<WaveCertificate>]) -> Hash {
+pub fn compute_certificate_root(certificates: &[Arc<FinalizedWave>]) -> Hash {
     if certificates.is_empty() {
         return Hash::ZERO;
     }
 
-    let leaves: Vec<Hash> = certificates.iter().map(|c| c.receipt_hash()).collect();
+    let leaves: Vec<Hash> = certificates
+        .iter()
+        .map(|fw| fw.certificate.receipt_hash())
+        .collect();
     compute_merkle_root(&leaves)
 }
 
@@ -240,8 +243,16 @@ pub struct Block {
     /// All transactions in this block, sorted by hash.
     pub transactions: Vec<Arc<RoutableTransaction>>,
 
-    /// Wave certificates for finalized waves.
-    pub certificates: Vec<Arc<WaveCertificate>>,
+    /// Finalized waves for this block — each carries a `WaveCertificate`
+    /// plus the receipt bundles for the wave's transactions in block order.
+    ///
+    /// `Block` is the post-finalization / assembly shape (sync transport,
+    /// storage reconstruction, commit pipeline input). By the time a `Block`
+    /// exists, every wave has finalized and both the cert and receipts are
+    /// available — either from the local execution state (proposer / peer
+    /// assembly path) or rebuilt from storage via `FinalizedWave::reconstruct`
+    /// (sync serving path).
+    pub certificates: Vec<Arc<FinalizedWave>>,
 }
 
 // Manual PartialEq - compare transaction/certificate content, not Arc pointers
@@ -292,7 +303,7 @@ impl<E: sbor::Encoder<sbor::NoCustomValueKind>> sbor::Encode<sbor::NoCustomValue
         encoder.write_size(3)?;
         encoder.encode(&self.header)?;
         encode_tx_vec(encoder, &self.transactions)?;
-        encode_wave_cert_vec(encoder, &self.certificates)?;
+        encode_finalized_wave_vec(encoder, &self.certificates)?;
         Ok(())
     }
 }
@@ -345,7 +356,7 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
 
         let header: BlockHeader = decoder.decode()?;
         let transactions = decode_tx_vec(decoder)?;
-        let certificates = decode_wave_cert_vec(decoder, MAX_SBOR_COLLECTION_SIZE)?;
+        let certificates = decode_finalized_wave_vec(decoder, MAX_SBOR_COLLECTION_SIZE)?;
 
         Ok(Self {
             header,
@@ -453,7 +464,7 @@ impl BlockManifest {
             cert_hashes: block
                 .certificates
                 .iter()
-                .map(|c| c.wave_id.hash())
+                .map(|c| c.wave_id().hash())
                 .collect(),
             provision_hashes: vec![],
         }
@@ -640,7 +651,7 @@ mod tests {
         };
         use std::collections::BTreeSet;
 
-        let make_wave_cert = |seed: u8| -> Arc<WaveCertificate> {
+        let make_fw = |seed: u8| -> Arc<FinalizedWave> {
             let ec = Arc::new(ExecutionCertificate::new(
                 WaveId::new(ShardGroupId(0), 10, BTreeSet::from([ShardGroupId(1)])),
                 11,
@@ -655,13 +666,16 @@ mod tests {
                 Bls12381G2Signature([0u8; 96]),
                 SignerBitfield::new(4),
             ));
-            Arc::new(WaveCertificate {
-                wave_id: WaveId::new(ShardGroupId(0), 10, BTreeSet::from([ShardGroupId(1)])),
-                execution_certificates: vec![ec],
+            Arc::new(FinalizedWave {
+                certificate: Arc::new(WaveCertificate {
+                    wave_id: WaveId::new(ShardGroupId(0), 10, BTreeSet::from([ShardGroupId(1)])),
+                    execution_certificates: vec![ec],
+                }),
+                receipts: vec![],
             })
         };
 
-        let certs = vec![make_wave_cert(1), make_wave_cert(2)];
+        let certs = vec![make_fw(1), make_fw(2)];
         let root1 = compute_certificate_root(&certs);
         let root2 = compute_certificate_root(&certs);
         assert_eq!(root1, root2);
@@ -694,10 +708,15 @@ mod tests {
             wave_id: WaveId::new(ShardGroupId(0), 10, BTreeSet::new()),
             execution_certificates: vec![ec],
         });
+        let expected_receipt_hash = cert.receipt_hash();
+        let fw = Arc::new(FinalizedWave {
+            certificate: cert,
+            receipts: vec![],
+        });
 
-        let root = compute_certificate_root(std::slice::from_ref(&cert));
+        let root = compute_certificate_root(std::slice::from_ref(&fw));
         // Single cert: certificate_root should equal the cert's receipt_hash
-        assert_eq!(root, cert.receipt_hash());
+        assert_eq!(root, expected_receipt_hash);
     }
 
     #[test]

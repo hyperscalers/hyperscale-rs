@@ -146,7 +146,8 @@ impl ChainWriter for SimStorage {
                 }
                 c.blocks
                     .insert(block.header.height, ((*block).clone(), (*qc).clone()));
-                for cert in &block.certificates {
+                for fw in &block.certificates {
+                    let cert = &fw.certificate;
                     let wave_id_hash = cert.wave_id.hash();
                     c.certificates.insert(wave_id_hash, (**cert).clone());
                     c.wave_certs_by_height
@@ -162,8 +163,8 @@ impl ChainWriter for SimStorage {
                             .insert(bundle.tx_hash, exec_output.clone());
                     }
                 }
-                for wc in &block.certificates {
-                    for ec in &wc.execution_certificates {
+                for fw in &block.certificates {
+                    for ec in &fw.certificate.execution_certificates {
                         let canonical_hash = ec.canonical_hash();
                         c.execution_certs.insert(canonical_hash, (**ec).clone());
                         c.execution_certs_by_height
@@ -264,7 +265,8 @@ impl SimStorage {
             }
             c.blocks
                 .insert(block.header.height, ((**block).clone(), (**qc).clone()));
-            for cert in &block.certificates {
+            for fw in &block.certificates {
+                let cert = &fw.certificate;
                 let wave_id_hash = cert.wave_id.hash();
                 c.certificates.insert(wave_id_hash, (**cert).clone());
                 c.wave_certs_by_height
@@ -282,8 +284,8 @@ impl SimStorage {
                 }
             }
             // Store execution certificates (extracted from wave certs) atomically.
-            for wc in &block.certificates {
-                for ec in &wc.execution_certificates {
+            for fw in &block.certificates {
+                for ec in &fw.certificate.execution_certificates {
                     let canonical_hash = ec.canonical_hash();
                     c.execution_certs.insert(canonical_hash, (**ec).clone());
                     c.execution_certs_by_height

@@ -756,6 +756,43 @@ pub fn decode_wave_cert_vec<D: sbor::Decoder<sbor::NoCustomValueKind>>(
     Ok(certs)
 }
 
+/// Encode a `Vec<Arc<FinalizedWave>>` as an SBOR array.
+pub fn encode_finalized_wave_vec<E: sbor::Encoder<sbor::NoCustomValueKind>>(
+    encoder: &mut E,
+    waves: &[Arc<FinalizedWave>],
+) -> Result<(), sbor::EncodeError> {
+    encoder.write_value_kind(sbor::ValueKind::Array)?;
+    encoder.write_value_kind(sbor::ValueKind::Tuple)?;
+    encoder.write_size(waves.len())?;
+    for wave in waves {
+        encoder.encode_deeper_body(wave.as_ref())?;
+    }
+    Ok(())
+}
+
+/// Decode a `Vec<Arc<FinalizedWave>>` from an SBOR array.
+pub fn decode_finalized_wave_vec<D: sbor::Decoder<sbor::NoCustomValueKind>>(
+    decoder: &mut D,
+    max_size: usize,
+) -> Result<Vec<Arc<FinalizedWave>>, sbor::DecodeError> {
+    decoder.read_and_check_value_kind(sbor::ValueKind::Array)?;
+    decoder.read_and_check_value_kind(sbor::ValueKind::Tuple)?;
+    let count = decoder.read_size()?;
+    if count > max_size {
+        return Err(sbor::DecodeError::UnexpectedSize {
+            expected: max_size,
+            actual: count,
+        });
+    }
+    let mut waves = Vec::with_capacity(count);
+    for _ in 0..count {
+        let wave: FinalizedWave =
+            decoder.decode_deeper_body_with_value_kind(sbor::ValueKind::Tuple)?;
+        waves.push(Arc::new(wave));
+    }
+    Ok(waves)
+}
+
 // ============================================================================
 // FinalizedWave
 // ============================================================================
@@ -778,7 +815,7 @@ pub fn decode_wave_cert_vec<D: sbor::Decoder<sbor::NoCustomValueKind>>(
 ///
 /// Shared via `Arc` across the system — flows from execution state through
 /// pending blocks, actions, and into the commit path.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FinalizedWave {
     pub certificate: Arc<WaveCertificate>,
     /// Receipt bundles for all transactions in this wave, in block order.

@@ -7,7 +7,7 @@ use hyperscale_types::{
     Bls12381G2Signature, CommittedBlockHeader, EpochConfig, EpochId, ExecutionCertificate,
     ExecutionVote, FinalizedWave, Hash, NodeId, Provision, QuorumCertificate, ReceiptBundle,
     RoutableTransaction, ShardGroupId, SignerBitfield, StateProvision, TopologySnapshot, TxOutcome,
-    ValidatorId, VotePower, WaveCertificate, WaveId,
+    ValidatorId, VotePower, WaveId,
 };
 use std::collections::HashMap;
 use std::fmt;
@@ -463,8 +463,8 @@ pub enum Action {
         block_hash: Hash,
         /// Expected receipt root from block header.
         expected_root: Hash,
-        /// Wave certificates whose receipt_hash values form the merkle leaves.
-        certificates: Vec<Arc<WaveCertificate>>,
+        /// Finalized waves whose underlying cert `receipt_hash` values form the merkle leaves.
+        certificates: Vec<Arc<FinalizedWave>>,
     },
 
     /// Verify a block's local receipt root.

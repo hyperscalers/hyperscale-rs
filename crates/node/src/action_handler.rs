@@ -393,12 +393,8 @@ pub(crate) fn handle_delegated_action<
             parent_in_flight,
             finalized_tx_count,
         } => {
-            // Extract certificates from finalized waves.
-            // No storage reads needed — everything flows through Arc<FinalizedWave>.
-            let certificates: Vec<Arc<hyperscale_types::WaveCertificate>> = finalized_waves
-                .iter()
-                .map(|fw| Arc::clone(&fw.certificate))
-                .collect();
+            // Pass FinalizedWaves straight through into Block.certificates.
+            let certificates: Vec<Arc<hyperscale_types::FinalizedWave>> = finalized_waves.clone();
 
             // Collect all receipts from finalized waves.
             // DatabaseUpdates merging happens inside prepare_block_commit.

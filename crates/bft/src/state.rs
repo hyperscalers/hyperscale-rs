@@ -57,10 +57,9 @@ pub struct BftMemoryStats {
 /// Production uses ValidatorId (from message signatures) and PeerId (libp2p).
 pub type NodeIndex = u32;
 use hyperscale_types::{
-    derive_wave_tx_hashes, Block, BlockHeader, BlockHeight, BlockManifest, BlockVote,
-    Bls12381G1PublicKey, CommittedBlockHeader, FinalizedWave, Hash, LocalReceiptEntry, Provision,
-    QuorumCertificate, ReadyTransactions, ReceiptBundle, RoutableTransaction, ShardGroupId,
-    TopologySnapshot, ValidatorId, VotePower,
+    Block, BlockHeader, BlockHeight, BlockManifest, BlockVote, Bls12381G1PublicKey,
+    CommittedBlockHeader, FinalizedWave, Hash, LocalReceiptEntry, Provision, QuorumCertificate,
+    ReadyTransactions, RoutableTransaction, ShardGroupId, TopologySnapshot, ValidatorId, VotePower,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -73,65 +72,6 @@ use crate::pending::PendingBlock;
 use crate::sync::{SyncManager, SyncVerificationResult};
 use crate::verification::VerificationPipeline;
 use crate::vote_set::VoteSet;
-
-/// Construct `FinalizedWave` objects from sync response data.
-///
-/// Maps the flat `local_receipts` from a sync peer to per-wave `FinalizedWave`
-/// objects, matching receipts to wave certificates by deriving which transactions
-/// each wave covers. The result is identical in structure to what the consensus
-/// path produces from local execution — making sync blocks indistinguishable
-/// in the verification and commit pipelines.
-///
-/// Returns `None` if any wave has missing receipts — the sync peer sent
-/// incomplete data and the block should be skipped (re-sync will recover).
-fn build_finalized_waves_from_sync(
-    topology: &TopologySnapshot,
-    block: &Block,
-    local_receipts: Vec<LocalReceiptEntry>,
-) -> Option<Vec<Arc<FinalizedWave>>> {
-    if block.certificates.is_empty() {
-        return Some(vec![]);
-    }
-
-    // Build a lookup map: tx_hash → LocalReceiptEntry
-    let receipt_map: HashMap<Hash, LocalReceiptEntry> =
-        local_receipts.into_iter().map(|e| (e.tx_hash, e)).collect();
-
-    let mut waves = Vec::with_capacity(block.certificates.len());
-
-    for wc in &block.certificates {
-        let tx_hashes = derive_wave_tx_hashes(topology, &wc.wave_id, &block.transactions);
-
-        let mut receipts = Vec::with_capacity(tx_hashes.len());
-        for tx_hash in &tx_hashes {
-            if let Some(entry) = receipt_map.get(tx_hash) {
-                receipts.push(ReceiptBundle {
-                    tx_hash: *tx_hash,
-                    local_receipt: Arc::new(entry.receipt.clone()),
-                    execution_output: None,
-                });
-            } else {
-                warn!(
-                    block_hash = ?block.hash(),
-                    height = block.header.height.0,
-                    wave_id = ?wc.wave_id,
-                    missing_tx = ?tx_hash,
-                    expected = tx_hashes.len(),
-                    have = receipts.len(),
-                    "Sync peer sent incomplete receipts — missing receipt for transaction"
-                );
-                return None;
-            }
-        }
-
-        waves.push(Arc::new(FinalizedWave {
-            certificate: Arc::clone(wc),
-            receipts,
-        }));
-    }
-
-    Some(waves)
-}
 
 /// State recovered from storage on startup.
 ///
@@ -3236,7 +3176,7 @@ impl BftState {
             self.recently_committed_txs.insert(tx.hash());
         }
         for cert in &block.certificates {
-            self.recently_committed_certs.insert(cert.wave_id.hash());
+            self.recently_committed_certs.insert(cert.wave_id().hash());
         }
 
         // Reset backoff tracking — new height means fresh round counting.
@@ -3535,7 +3475,7 @@ impl BftState {
         topology: &TopologySnapshot,
         block: Block,
         qc: QuorumCertificate,
-        local_receipts: Vec<LocalReceiptEntry>,
+        _local_receipts: Vec<LocalReceiptEntry>,
     ) -> Vec<Action> {
         let block_hash = block.hash();
         let height = block.header.height.0;
@@ -3546,7 +3486,6 @@ impl BftState {
             block_hash = ?block_hash,
             transactions = block.transactions.len(),
             certificates = block.certificates.len(),
-            receipts = local_receipts.len(),
             "Applying synced block"
         );
 
@@ -3555,21 +3494,10 @@ impl BftState {
         let parent_state_root = self.committed_state_root;
         let parent_block_height = self.committed_height;
 
-        // Construct FinalizedWave objects from sync response data.
-        // This makes sync blocks indistinguishable from consensus blocks
-        // in the verification pipeline.
-        let Some(finalized_waves) =
-            build_finalized_waves_from_sync(topology, &block, local_receipts)
-        else {
-            // Sync peer sent incomplete receipts. Don't advance committed_height —
-            // check_sync_health will eventually trigger a re-sync from a different peer.
-            warn!(
-                height,
-                block_hash = ?block_hash,
-                "Skipping synced block — incomplete receipts from sync peer"
-            );
-            return vec![];
-        };
+        // `Block.certificates` already carries `Arc<FinalizedWave>` with the
+        // full wave data (certificate + receipts) assembled by the sync peer.
+        // Sync and consensus paths are indistinguishable downstream.
+        let finalized_waves: Vec<Arc<FinalizedWave>> = block.certificates.clone();
 
         // Initiate state root verification through the same pipeline as
         // consensus blocks. This produces a PreparedCommit that
@@ -4664,7 +4592,7 @@ impl BftState {
                 break;
             }
             for cert in &block.certificates {
-                cert_hashes.insert(cert.wave_id.hash());
+                cert_hashes.insert(cert.wave_id().hash());
             }
             for tx in &block.transactions {
                 tx_hashes.insert(tx.hash());

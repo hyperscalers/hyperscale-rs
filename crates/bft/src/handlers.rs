@@ -8,9 +8,9 @@ use hyperscale_storage::{ChainWriter, SubstateStore};
 use hyperscale_types::{
     batch_verify_bls_same_message, compute_certificate_root, compute_local_receipt_root,
     compute_provision_root, compute_transaction_root, verify_bls12381_v1, Block, BlockHeader,
-    BlockHeight, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature, Hash, QuorumCertificate,
-    ReceiptBundle, RoutableTransaction, ShardGroupId, SignerBitfield, ValidatorId, VotePower,
-    WaveCertificate, WaveId,
+    BlockHeight, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature, FinalizedWave, Hash,
+    QuorumCertificate, ReceiptBundle, RoutableTransaction, ShardGroupId, SignerBitfield,
+    ValidatorId, VotePower, WaveId,
 };
 use std::sync::Arc;
 
@@ -225,7 +225,7 @@ pub fn verify_transaction_root(
 /// Verify a block's receipt root against its wave certificates.
 ///
 /// Pure computation over the certificates' `receipt_hash` values.
-pub fn verify_certificate_root(expected_root: Hash, certificates: &[Arc<WaveCertificate>]) -> bool {
+pub fn verify_certificate_root(expected_root: Hash, certificates: &[Arc<FinalizedWave>]) -> bool {
     let computed_root = compute_certificate_root(certificates);
     let valid = computed_root == expected_root;
 
@@ -341,7 +341,7 @@ pub fn build_proposal<S: ChainWriter + SubstateStore>(
     parent_state_root: Hash,
     parent_block_height: u64,
     transactions: Vec<Arc<RoutableTransaction>>,
-    certificates: Vec<Arc<WaveCertificate>>,
+    certificates: Vec<Arc<FinalizedWave>>,
     receipts: &[ReceiptBundle],
     local_shard: ShardGroupId,
     waves: Vec<WaveId>,
