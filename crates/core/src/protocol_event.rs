@@ -92,7 +92,7 @@ pub enum ProtocolEvent {
     /// Fired immediately when the `CommitBlock` action arrives — before
     /// durable RocksDB persistence. All event data is carried in-memory
     /// from the action payload. Delegated actions that read substates use
-    /// the `SubstateOverlay` to see unpersisted state.
+    /// `PendingChain::view_at` to see unpersisted state.
     BlockCommitted {
         block_hash: Hash,
         height: u64,

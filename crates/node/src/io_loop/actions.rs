@@ -852,8 +852,18 @@ where
         let pool = action_handler::dispatch_pool_for(&action)
             .expect("dispatch_delegated_action called for delegated actions only");
 
-        // Extract parent_block_hash for snapshot cache keying (before action moves).
-        let action_parent_block_hash = match &action {
+        // Anchor + view for this action. Actions that don't read state
+        // (no parent_hash_for) get the committed-tip view; the view is
+        // unused but the construction is cheap (cache hit after first).
+        let view = match action_handler::parent_hash_for(&action) {
+            Some(parent_hash) => self.pending_chain.view_at(parent_hash),
+            None => self.pending_chain.view_at_committed_tip(),
+        };
+        // Anchor parent for inserting the resulting ChainEntry into
+        // PendingChain. For BuildProposal/VerifyStateRoot this is the
+        // block-being-built/verified's parent. Other actions don't
+        // produce prepared_commit so this is unused.
+        let anchor_parent_hash = match &action {
             Action::VerifyStateRoot {
                 parent_block_hash, ..
             } => Some(*parent_block_hash),
@@ -862,58 +872,48 @@ where
         };
 
         // Clone cheap shared state for the 'static spawn closure.
-        let storage = Arc::clone(&self.storage);
         let executor = self.executor.clone();
         let topology_snapshot = self.topology.load_full();
         let prepared_commits = Arc::clone(&self.prepared_commits);
-        let jvt_snapshot_cache = Arc::clone(&self.jvt_snapshot_cache);
-        let pending_db_updates = Arc::clone(&self.pending_db_updates);
-        let overlay_cache = Arc::clone(&self.overlay_cache);
+        let pending_chain = Arc::clone(&self.pending_chain);
         let event_tx = self.event_sender.clone();
 
         let spawn_fn = move || {
             let start = std::time::Instant::now();
-            // Clone cached overlay (cheap — 4 Arc bumps) instead of
-            // rebuilding from scratch on every dispatch.
-            let overlay = (**overlay_cache.load()).clone();
             let ctx = ActionContext {
                 executor: &executor,
                 topology: &topology_snapshot,
-                jvt_snapshot_cache: &jvt_snapshot_cache,
-                overlay,
+                view,
             };
             if let Some(result) = action_handler::handle_delegated_action(action, &ctx) {
                 if is_execution {
                     let elapsed = start.elapsed().as_secs_f64();
                     metrics::record_execution_latency(elapsed);
                 }
-                // Hold both overlay-relevant guards up front so we can
-                // insert and rebuild without re-locking.
-                let mut db_guard = pending_db_updates.lock().unwrap();
-                let mut jvt_guard = jvt_snapshot_cache.lock().unwrap();
-                let mut caches_changed = false;
-                if let Some((hash, height, prepared)) = result.prepared_commit {
-                    if let Some(parent_hash) = action_parent_block_hash {
-                        let snapshot = Arc::new(S::jvt_snapshot(&prepared).clone());
-                        jvt_guard.insert(hash, (parent_hash, snapshot));
-                        caches_changed = true;
+                if let Some(prep) = result.prepared_commit {
+                    let action_handler::PreparedBlock {
+                        block_hash,
+                        block_height,
+                        prepared,
+                        receipts,
+                    } = prep;
+                    if let Some(parent_hash) = anchor_parent_hash {
+                        let jvt_snapshot = Arc::new(S::jvt_snapshot(&prepared).clone());
+                        pending_chain.insert(
+                            block_hash,
+                            hyperscale_storage::ChainEntry {
+                                parent_hash,
+                                height: block_height,
+                                receipts,
+                                jvt_snapshot,
+                            },
+                        );
                     }
                     prepared_commits
                         .lock()
                         .unwrap()
-                        .insert(hash, (height, prepared));
+                        .insert(block_hash, (block_height, prepared));
                 }
-                if let Some((hash, height, updates)) = result.db_updates {
-                    db_guard.insert(hash, (height, updates));
-                    caches_changed = true;
-                }
-                if caches_changed {
-                    let new_overlay =
-                        action_handler::build_overlay_from_maps(&storage, &db_guard, &jvt_guard);
-                    overlay_cache.store(Arc::new(new_overlay));
-                }
-                drop(db_guard);
-                drop(jvt_guard);
                 for event in result.events {
                     let _ = event_tx.send(event);
                 }

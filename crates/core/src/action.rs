@@ -223,6 +223,10 @@ pub enum Action {
     /// `StateProvision`s, groups by target shard, and returns batches via
     /// `NodeInput::ProvisionReady` for network broadcast.
     FetchAndBroadcastProvision {
+        /// The committed block whose state is being attested to. Anchors
+        /// state reads via `PendingChain::view_at`. Verkle proofs are
+        /// generated against this block's state root.
+        block_hash: Hash,
         /// One entry per cross-shard tx that needs provisioning.
         requests: Vec<ProvisionRequest>,
         source_shard: ShardGroupId,
@@ -518,6 +522,8 @@ pub enum Action {
     /// Delegated to the engine thread pool in production, instant in simulation.
     /// Returns `ProtocolEvent::ExecutionBatchCompleted` with all votes when complete.
     ExecuteTransactions {
+        /// The committed block whose transactions are being executed.
+        /// Anchors state reads via `PendingChain::view_at`.
         block_hash: Hash,
         transactions: Vec<Arc<RoutableTransaction>>,
         state_root: Hash,
@@ -529,6 +535,11 @@ pub enum Action {
     /// all ready transactions and emits a single action for parallel execution.
     /// Returns `ProtocolEvent::ExecutionBatchCompleted` when complete.
     ExecuteCrossShardTransactions {
+        /// The committed block whose processing kicked off this execution
+        /// (either the block carrying the txs, or the block whose committed
+        /// provisions unblocked them). Anchors state reads via
+        /// `PendingChain::view_at`.
+        block_hash: Hash,
         /// The cross-shard execution requests to process.
         requests: Vec<CrossShardExecutionRequest>,
     },

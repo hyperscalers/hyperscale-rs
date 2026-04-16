@@ -386,6 +386,7 @@ impl NodeStateMachine {
                 self.topology.snapshot(),
                 &provision_batches,
                 height,
+                block_hash,
             ));
         }
 
@@ -597,15 +598,14 @@ impl StateMachine for NodeStateMachine {
             } => self.on_block_committed(block_hash, height, block, provision_hashes),
 
             // ── Block Persisted (RocksDB write complete) ───────────────
-            // Unblock deferred state root verifications whose parent's
-            // tree nodes are now in the tree store. This MUST happen on
-            // BlockPersisted (not BlockCommitted) because sync blocks
-            // skip VerifyStateRoot — their JVT snapshots are never cached
-            // in jvt_snapshot_cache, so the tree nodes only become
-            // available once commit_block writes them to storage.
-            // Consensus blocks are unaffected: their parents' tree nodes
-            // are available via verified_state_roots (from prior
-            // VerifyStateRoot), so the deferral gate already passes.
+            // Advances `last_committed_height`, which is one of the two
+            // gates that let deferred state root verifications proceed
+            // (the other being `verified_state_roots` from an earlier
+            // local VerifyStateRoot). Needed primarily for startup /
+            // catch-up: a freshly-booted node has persisted state but
+            // an empty `verified_state_roots`, so child verifications
+            // of just-persisted parents unblock here rather than
+            // through the in-memory set.
             ProtocolEvent::BlockPersisted { height } => {
                 let mut actions = self.bft.on_jvt_committed(self.topology.snapshot(), height);
                 // If BFT just resumed from sync, reschedule the cleanup timer.

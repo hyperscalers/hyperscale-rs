@@ -744,6 +744,7 @@ impl ExecutionState {
         topology: &TopologySnapshot,
         batches: &[Arc<Provision>],
         committed_height: u64,
+        committed_block_hash: Hash,
     ) -> Vec<Action> {
         let mut requests = Vec::new();
 
@@ -845,7 +846,10 @@ impl ExecutionState {
             })
             .collect();
         if !requests.is_empty() {
-            actions.push(Action::ExecuteCrossShardTransactions { requests });
+            actions.push(Action::ExecuteCrossShardTransactions {
+                block_hash: committed_block_hash,
+                requests,
+            });
         }
         actions
     }
@@ -1453,6 +1457,7 @@ impl ExecutionState {
                 Self::build_provision_requests(topology, &transactions, local_shard)
             {
                 actions.push(Action::FetchAndBroadcastProvision {
+                    block_hash,
                     requests,
                     source_shard: local_shard,
                     block_height: BlockHeight(height),
@@ -1531,6 +1536,7 @@ impl ExecutionState {
         }
         if !cross_shard_requests.is_empty() {
             actions.push(Action::ExecuteCrossShardTransactions {
+                block_hash,
                 requests: cross_shard_requests,
             });
         }

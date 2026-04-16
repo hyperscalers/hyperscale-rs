@@ -1,0 +1,920 @@
+//! Chain-anchored pending state index.
+//!
+//! Single shared structure keyed by block hash. Reads happen through
+//! [`SubstateView`], which is built by walking the parent chain from a
+//! given anchor — orphaned blocks are not ancestors of the canonical
+//! chain, so they are structurally invisible to anchored views.
+
+use crate::{
+    DatabaseUpdates, DbPartitionKey, DbSortKey, JvtSnapshot, PartitionDatabaseUpdates,
+    SubstateStore,
+};
+use ::jellyfish_verkle_tree as jvt;
+use hyperscale_types::{Hash, LocalReceipt, NodeId, VerkleInclusionProof};
+use radix_common::prelude::DatabaseUpdate;
+use radix_substate_store_interface::interface::SubstateDatabase;
+use std::collections::HashMap;
+use std::sync::{Arc, OnceLock, RwLock};
+
+/// One block's worth of pending state, indexed by block hash in
+/// [`PendingChain::entries`].
+#[derive(Clone)]
+pub struct ChainEntry {
+    /// Parent block hash. Used to walk the chain back to the committed tip.
+    pub parent_hash: Hash,
+    /// Block height. Used for pruning and version-aware reads.
+    pub height: u64,
+    /// Per-tx receipts produced by this block.
+    pub receipts: Vec<Arc<LocalReceipt>>,
+    /// JVT snapshot from this block's speculative state-root computation.
+    pub jvt_snapshot: Arc<JvtSnapshot>,
+}
+
+/// Append-only index of pending block state, shared between the io_loop
+/// and dispatch closures via `Arc`.
+///
+/// **Anchored reads.** Reads happen through [`Self::view_at`], which
+/// walks `parent_hash` back to the committed tip and flattens that
+/// chain's pending state into a [`SubstateView`]. Orphaned blocks (whose
+/// `parent_hash` doesn't lead back to the committed chain) are not
+/// visited and contribute nothing — the orphan-corruption bug becomes
+/// impossible by construction.
+///
+/// **Memoization.** Built views are cached by anchor `parent_hash` in a
+/// per-anchor [`OnceLock`]. Concurrent `view_at(X)` calls serialize on
+/// the cell; only the first builds, the rest receive the result via the
+/// shared `Arc`. The build runs without the cache lock held, so
+/// unrelated anchors don't contend.
+///
+/// **Selective invalidation.**
+/// - [`Self::insert`] never invalidates: a fresh entry can only affect
+///   views at descendants, which can't exist yet.
+/// - [`Self::prune`] drops only cache entries whose anchor has
+///   `height ≤ committed_height`. Higher anchors captured their chain at
+///   build time and remain valid.
+pub struct PendingChain<S> {
+    base: Arc<S>,
+    entries: RwLock<HashMap<Hash, ChainEntry>>,
+    view_cache: RwLock<HashMap<Hash, ViewCell<S>>>,
+}
+
+/// Per-anchor cache cell. `OnceLock` serializes concurrent
+/// `view_at(X)` calls so only the first thread builds the view.
+type ViewCell<S> = Arc<OnceLock<Arc<SubstateView<S>>>>;
+
+impl<S> PendingChain<S>
+where
+    S: SubstateStore + jvt::TreeReader + crate::ChainReader + Sync + 'static,
+{
+    /// Create a new empty `PendingChain` over the given base storage.
+    pub fn new(base: Arc<S>) -> Self {
+        Self {
+            base,
+            entries: RwLock::new(HashMap::new()),
+            view_cache: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Append an entry. Idempotent on `(block_hash, parent_hash)`.
+    ///
+    /// Does not touch `view_cache` — a fresh entry can only affect views
+    /// anchored at this block or its descendants, neither of which can
+    /// have been cached yet.
+    pub fn insert(&self, block_hash: Hash, entry: ChainEntry) {
+        self.entries.write().unwrap().insert(block_hash, entry);
+    }
+
+    /// Drop all entries with `height ≤ committed_height`. Called on
+    /// `BlockPersisted`. Also drops cache entries whose anchor is at or
+    /// below the committed height — higher-anchor views remain valid.
+    pub fn prune(&self, committed_height: u64) {
+        let mut entries = self.entries.write().unwrap();
+        entries.retain(|_, e| e.height > committed_height);
+        let surviving_hashes = entries
+            .keys()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        drop(entries);
+        let mut cache = self.view_cache.write().unwrap();
+        cache.retain(|anchor_hash, _| surviving_hashes.contains(anchor_hash));
+    }
+
+    /// Number of pending entries (for diagnostics / metrics).
+    pub fn len(&self) -> usize {
+        self.entries.read().unwrap().len()
+    }
+
+    /// Whether the chain has any pending entries.
+    pub fn is_empty(&self) -> bool {
+        self.entries.read().unwrap().is_empty()
+    }
+
+    /// Build (or fetch from cache) a view anchored at `parent_hash`.
+    ///
+    /// The view sees state through `parent_hash` and all of its committed
+    /// ancestors back to the persisted tip. Orphaned blocks not on this
+    /// chain are invisible.
+    ///
+    /// Concurrent calls for the same `parent_hash` serialize on a
+    /// [`OnceLock`] and share the resulting `Arc<SubstateView>`.
+    ///
+    /// **Prune race:** if [`Self::prune`] drops the cell between a caller
+    /// observing it and invoking `get_or_init`, a subsequent `view_at`
+    /// installs a fresh cell and both builds run to completion. Each
+    /// result is internally consistent with the entry snapshot captured
+    /// at its build time — the extra work is a perf hit, not a
+    /// correctness issue.
+    pub fn view_at(self: &Arc<Self>, parent_hash: Hash) -> Arc<SubstateView<S>> {
+        let cell = self.cell_for(parent_hash);
+        Arc::clone(cell.get_or_init(|| Arc::new(self.build_view(parent_hash))))
+    }
+
+    /// Build (or fetch) a view anchored at the latest committed block.
+    /// For actions without a natural parent (RPC reads, fetch handlers).
+    ///
+    /// If no blocks have been committed yet, returns a view with no
+    /// pending entries (reads fall through to base storage).
+    pub fn view_at_committed_tip(self: &Arc<Self>) -> Arc<SubstateView<S>> {
+        match self.base.committed_hash() {
+            Some(h) => self.view_at(h),
+            None => Arc::new(SubstateView::base_only(Arc::clone(&self.base))),
+        }
+    }
+
+    /// Get-or-create the `OnceLock` cell for an anchor. The outer locks
+    /// only protect the cache map itself; the cell's init runs without
+    /// any cache lock held.
+    fn cell_for(&self, parent_hash: Hash) -> Arc<OnceLock<Arc<SubstateView<S>>>> {
+        if let Some(cell) = self.view_cache.read().unwrap().get(&parent_hash) {
+            return Arc::clone(cell);
+        }
+        let mut cache = self.view_cache.write().unwrap();
+        Arc::clone(
+            cache
+                .entry(parent_hash)
+                .or_insert_with(|| Arc::new(OnceLock::new())),
+        )
+    }
+
+    /// Walk `parent_hash` back through ancestors and flatten the chain
+    /// into a `SubstateView`. Stops when an entry's parent is not in the
+    /// index (it's been persisted, or it's the committed tip).
+    ///
+    /// Holds the read lock for the duration of the walk; no per-entry
+    /// clones.
+    fn build_view(&self, parent_hash: Hash) -> SubstateView<S> {
+        let entries = self.entries.read().unwrap();
+        let mut chain: Vec<&ChainEntry> = Vec::new();
+        let mut cursor = parent_hash;
+        while let Some(entry) = entries.get(&cursor) {
+            cursor = entry.parent_hash;
+            chain.push(entry);
+        }
+        // Walk produces deepest-first; flip to commit order.
+        chain.reverse();
+        SubstateView::from_chain(Arc::clone(&self.base), &chain)
+    }
+}
+
+// ─── SubstateView ───────────────────────────────────────────────────────
+
+/// Flattened overlay entries: `(partition_key, sort_key) → Some(value)`
+/// or `None` (tombstone).
+type OverlayEntries = HashMap<(DbPartitionKey, DbSortKey), Option<Vec<u8>>>;
+
+/// JVT node index for O(1) tree-node lookup during proof generation.
+type JvtNodeIndex = HashMap<jvt::NodeKey, Arc<jvt::Node>>;
+
+/// Anchored read view over base storage + a slice of pending blocks.
+///
+/// Built once per anchor by [`PendingChain::view_at`] and cached via an
+/// `Arc`. Implements [`SubstateDatabase`], [`SubstateStore`],
+/// [`crate::ChainWriter`], and [`jvt::TreeReader`] so it can substitute
+/// for the base storage in delegated action handlers.
+///
+/// Once built the view is immutable — interior data is never mutated.
+/// This makes `Arc<SubstateView>` cheap to share across threads and
+/// simplifies cache invalidation (the cache drops `Arc` references; live
+/// views remain valid).
+pub struct SubstateView<S> {
+    base: Arc<S>,
+    /// Flattened pending substates from the anchored chain, in commit order.
+    /// Later entries override earlier ones for the same key.
+    overlay: OverlayEntries,
+    /// JVT snapshots from the same chain, in commit order. Exposed via
+    /// [`Self::pending_snapshots`] so handlers can pass them to
+    /// `prepare_block_commit` for chained verification.
+    jvt_snapshots: Vec<Arc<JvtSnapshot>>,
+    /// JVT node index built from `jvt_snapshots` for O(1) lookup
+    /// (see [`jvt::TreeReader`] impl).
+    jvt_nodes: JvtNodeIndex,
+    /// Per-receipt references for versioned queries
+    /// ([`SubstateStore::list_substates_for_node_at_height`]).
+    /// Sorted by height ascending.
+    versioned_receipts: Vec<(u64, Arc<LocalReceipt>)>,
+}
+
+impl<S> SubstateView<S> {
+    /// Pending JVT snapshots from the anchored chain, in commit order.
+    /// Pass to `prepare_block_commit` so chained verification can find
+    /// tree nodes from prior unpersisted blocks.
+    pub fn pending_snapshots(&self) -> &[Arc<JvtSnapshot>] {
+        &self.jvt_snapshots
+    }
+}
+
+impl<S> SubstateView<S> {
+    /// Build a view from a chain of entries in commit order (earliest first).
+    /// Takes borrowed entries so the caller can hold a read lock over the
+    /// chain index for the duration of the walk without cloning.
+    fn from_chain(base: Arc<S>, chain: &[&ChainEntry]) -> Self {
+        let mut overlay: OverlayEntries = HashMap::new();
+        let mut jvt_snapshots: Vec<Arc<JvtSnapshot>> = Vec::with_capacity(chain.len());
+        let mut jvt_nodes: JvtNodeIndex = HashMap::new();
+        let mut versioned_receipts: Vec<(u64, Arc<LocalReceipt>)> = Vec::new();
+
+        for entry in chain {
+            for receipt in &entry.receipts {
+                apply_database_updates(&mut overlay, &receipt.database_updates);
+                versioned_receipts.push((entry.height, Arc::clone(receipt)));
+            }
+            for (key, node) in &entry.jvt_snapshot.nodes {
+                jvt_nodes.insert(key.clone(), Arc::clone(node));
+            }
+            jvt_snapshots.push(Arc::clone(&entry.jvt_snapshot));
+        }
+
+        Self {
+            base,
+            overlay,
+            jvt_snapshots,
+            jvt_nodes,
+            versioned_receipts,
+        }
+    }
+
+    /// Build a view with no pending entries (reads always go to base).
+    fn base_only(base: Arc<S>) -> Self {
+        Self {
+            base,
+            overlay: HashMap::new(),
+            jvt_snapshots: Vec::new(),
+            jvt_nodes: HashMap::new(),
+            versioned_receipts: Vec::new(),
+        }
+    }
+}
+
+/// Flatten one receipt's `DatabaseUpdates` into the overlay map.
+/// Later calls override earlier ones for the same key (commit order).
+fn apply_database_updates(overlay: &mut OverlayEntries, updates: &DatabaseUpdates) {
+    for (node_key, node_updates) in &updates.node_updates {
+        for (&partition_num, partition_updates) in &node_updates.partition_updates {
+            let pk = DbPartitionKey {
+                node_key: node_key.clone(),
+                partition_num,
+            };
+            match partition_updates {
+                PartitionDatabaseUpdates::Delta { substate_updates } => {
+                    for (sort_key, update) in substate_updates {
+                        let value = match update {
+                            DatabaseUpdate::Set(v) => Some(v.clone()),
+                            DatabaseUpdate::Delete => None,
+                        };
+                        overlay.insert((pk.clone(), sort_key.clone()), value);
+                    }
+                }
+                PartitionDatabaseUpdates::Reset {
+                    new_substate_values,
+                } => {
+                    overlay.retain(|(epk, _), _| epk != &pk);
+                    for (sort_key, value) in new_substate_values {
+                        overlay.insert((pk.clone(), sort_key.clone()), Some(value.clone()));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Apply overlay entries on top of a base `SubstateDatabase` read.
+fn overlay_get(
+    overlay: &OverlayEntries,
+    base: &dyn SubstateDatabase,
+    partition_key: &DbPartitionKey,
+    sort_key: &DbSortKey,
+) -> Option<Vec<u8>> {
+    if let Some(v) = overlay.get(&(partition_key.clone(), sort_key.clone())) {
+        return v.clone();
+    }
+    base.get_raw_substate_by_db_key(partition_key, sort_key)
+}
+
+/// Apply overlay entries on top of a base `SubstateDatabase` list.
+fn overlay_list(
+    overlay: &OverlayEntries,
+    base: &dyn SubstateDatabase,
+    partition_key: &DbPartitionKey,
+    from_sort_key: Option<&DbSortKey>,
+) -> Vec<(DbSortKey, Vec<u8>)> {
+    let mut overlay_for_partition: Vec<(DbSortKey, Option<Vec<u8>>)> = overlay
+        .iter()
+        .filter(|((pk, _), _)| pk == partition_key)
+        .filter(|((_, sk), _)| from_sort_key.is_none_or(|from| sk >= from))
+        .map(|((_, sk), v)| (sk.clone(), v.clone()))
+        .collect();
+    overlay_for_partition.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+    let overlay_keys: std::collections::HashSet<DbSortKey> = overlay_for_partition
+        .iter()
+        .map(|(sk, _)| sk.clone())
+        .collect();
+
+    let base_entries: Vec<(DbSortKey, Vec<u8>)> = base
+        .list_raw_values_from_db_key(partition_key, from_sort_key)
+        .filter(|(sk, _)| !overlay_keys.contains(sk))
+        .collect();
+
+    let overlay_live: Vec<(DbSortKey, Vec<u8>)> = overlay_for_partition
+        .into_iter()
+        .filter_map(|(sk, v)| v.map(|val| (sk, val)))
+        .collect();
+
+    let mut merged = Vec::with_capacity(overlay_live.len() + base_entries.len());
+    merged.extend(overlay_live);
+    merged.extend(base_entries);
+    merged.sort_by(|(a, _), (b, _)| a.cmp(b));
+    merged
+}
+
+impl<S: SubstateDatabase> SubstateDatabase for SubstateView<S> {
+    fn get_raw_substate_by_db_key(
+        &self,
+        partition_key: &DbPartitionKey,
+        sort_key: &DbSortKey,
+    ) -> Option<Vec<u8>> {
+        overlay_get(&self.overlay, &*self.base, partition_key, sort_key)
+    }
+
+    fn list_raw_values_from_db_key(
+        &self,
+        partition_key: &DbPartitionKey,
+        from_sort_key: Option<&DbSortKey>,
+    ) -> Box<dyn Iterator<Item = (DbSortKey, Vec<u8>)> + '_> {
+        Box::new(overlay_list(&self.overlay, &*self.base, partition_key, from_sort_key).into_iter())
+    }
+}
+
+/// Snapshot from a `SubstateView` — overlays the same entries on the
+/// base storage's snapshot.
+pub struct ViewSnapshot<Snap> {
+    base_snapshot: Snap,
+    overlay: Arc<OverlayEntries>,
+}
+
+impl<Snap: SubstateDatabase> SubstateDatabase for ViewSnapshot<Snap> {
+    fn get_raw_substate_by_db_key(
+        &self,
+        partition_key: &DbPartitionKey,
+        sort_key: &DbSortKey,
+    ) -> Option<Vec<u8>> {
+        overlay_get(&self.overlay, &self.base_snapshot, partition_key, sort_key)
+    }
+
+    fn list_raw_values_from_db_key(
+        &self,
+        partition_key: &DbPartitionKey,
+        from_sort_key: Option<&DbSortKey>,
+    ) -> Box<dyn Iterator<Item = (DbSortKey, Vec<u8>)> + '_> {
+        Box::new(
+            overlay_list(
+                &self.overlay,
+                &self.base_snapshot,
+                partition_key,
+                from_sort_key,
+            )
+            .into_iter(),
+        )
+    }
+}
+
+impl<S: SubstateStore> SubstateStore for SubstateView<S> {
+    type Snapshot<'a>
+        = ViewSnapshot<S::Snapshot<'a>>
+    where
+        Self: 'a;
+
+    fn snapshot(&self) -> Self::Snapshot<'_> {
+        ViewSnapshot {
+            base_snapshot: (*self.base).snapshot(),
+            // Clone the overlay into an Arc so the snapshot is `'static`
+            // with respect to the view's overlay map.
+            overlay: Arc::new(self.overlay.clone()),
+        }
+    }
+
+    fn jvt_version(&self) -> u64 {
+        (*self.base).jvt_version()
+    }
+
+    fn state_root_hash(&self) -> Hash {
+        (*self.base).state_root_hash()
+    }
+
+    fn list_substates_for_node_at_height(
+        &self,
+        node_id: &NodeId,
+        block_height: u64,
+    ) -> Option<Vec<(u8, DbSortKey, Vec<u8>)>> {
+        let persisted_version = (*self.base).jvt_version();
+
+        // If the requested height is within persisted range, delegate.
+        if block_height <= persisted_version {
+            return (*self.base).list_substates_for_node_at_height(node_id, block_height);
+        }
+
+        // Get base result at the persisted version (latest available on disk).
+        let base_result =
+            (*self.base).list_substates_for_node_at_height(node_id, persisted_version);
+
+        // Build a map from base result, then apply pending receipts in
+        // commit order up to block_height.
+        let entity_key = crate::keys::node_entity_key(node_id);
+        let mut substates: HashMap<(u8, DbSortKey), Vec<u8>> = base_result
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(part, sk, v)| ((part, sk), v))
+            .collect();
+
+        for (h, receipt) in &self.versioned_receipts {
+            if *h > block_height {
+                break;
+            }
+            let updates = &receipt.database_updates;
+            if let Some(node_updates) = updates.node_updates.get(&entity_key) {
+                for (&partition_num, partition_updates) in &node_updates.partition_updates {
+                    match partition_updates {
+                        PartitionDatabaseUpdates::Delta { substate_updates } => {
+                            for (sort_key, update) in substate_updates {
+                                match update {
+                                    DatabaseUpdate::Set(v) => {
+                                        substates
+                                            .insert((partition_num, sort_key.clone()), v.clone());
+                                    }
+                                    DatabaseUpdate::Delete => {
+                                        substates.remove(&(partition_num, sort_key.clone()));
+                                    }
+                                }
+                            }
+                        }
+                        PartitionDatabaseUpdates::Reset {
+                            new_substate_values,
+                        } => {
+                            substates.retain(|(p, _), _| *p != partition_num);
+                            for (sort_key, value) in new_substate_values {
+                                substates.insert((partition_num, sort_key.clone()), value.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Some(
+            substates
+                .into_iter()
+                .map(|((p, sk), v)| (p, sk, v))
+                .collect(),
+        )
+    }
+
+    fn generate_verkle_proofs(
+        &self,
+        storage_keys: &[Vec<u8>],
+        block_height: u64,
+    ) -> Option<VerkleInclusionProof> {
+        // Try base first — works for heights already persisted.
+        if let Some(proof) = (*self.base).generate_verkle_proofs(storage_keys, block_height) {
+            return Some(proof);
+        }
+        // Beyond persisted — caller should use `generate_verkle_proofs_overlay`
+        // which uses the JVT overlay via this view's `TreeReader` impl.
+        None
+    }
+}
+
+/// Override `generate_verkle_proofs` for callers that have a
+/// `jvt::TreeReader`-capable base, using the JVT overlay for unpersisted
+/// heights.
+impl<S: SubstateStore + jvt::TreeReader + Sync> SubstateView<S> {
+    /// Generate verkle proofs, falling back to the JVT overlay for
+    /// unpersisted block heights.
+    pub fn generate_verkle_proofs_overlay(
+        &self,
+        storage_keys: &[Vec<u8>],
+        block_height: u64,
+    ) -> Option<VerkleInclusionProof> {
+        if let Some(proof) = (*self.base).generate_verkle_proofs(storage_keys, block_height) {
+            return Some(proof);
+        }
+        crate::tree::proofs::generate_proof(self, storage_keys, block_height)
+    }
+}
+
+impl<S: jvt::TreeReader + Sync> jvt::TreeReader for SubstateView<S> {
+    fn get_node(&self, key: &jvt::NodeKey) -> Option<Arc<jvt::Node>> {
+        self.jvt_nodes
+            .get(key)
+            .cloned()
+            .or_else(|| (*self.base).get_node(key))
+    }
+
+    fn get_root_key(&self, version: u64) -> Option<jvt::NodeKey> {
+        let root_key = jvt::NodeKey::root(version);
+        if self.jvt_nodes.contains_key(&root_key) {
+            Some(root_key)
+        } else {
+            (*self.base).get_root_key(version)
+        }
+    }
+}
+
+impl<S: crate::ChainWriter> crate::ChainWriter for SubstateView<S> {
+    type PreparedCommit = S::PreparedCommit;
+
+    fn prepare_block_commit(
+        &self,
+        parent_state_root: Hash,
+        parent_block_height: u64,
+        receipts: &[hyperscale_types::ReceiptBundle],
+        block_height: u64,
+        pending_snapshots: &[Arc<JvtSnapshot>],
+    ) -> (Hash, Self::PreparedCommit) {
+        (*self.base).prepare_block_commit(
+            parent_state_root,
+            parent_block_height,
+            receipts,
+            block_height,
+            pending_snapshots,
+        )
+    }
+
+    fn commit_prepared_blocks(
+        &self,
+        blocks: Vec<(
+            Self::PreparedCommit,
+            Arc<hyperscale_types::Block>,
+            Arc<hyperscale_types::QuorumCertificate>,
+        )>,
+    ) -> Vec<Hash> {
+        (*self.base).commit_prepared_blocks(blocks)
+    }
+
+    fn commit_block(
+        &self,
+        block: &Arc<hyperscale_types::Block>,
+        qc: &Arc<hyperscale_types::QuorumCertificate>,
+        receipts: &[hyperscale_types::ReceiptBundle],
+    ) -> Hash {
+        (*self.base).commit_block(block, qc, receipts)
+    }
+
+    fn jvt_snapshot(prepared: &Self::PreparedCommit) -> &JvtSnapshot {
+        S::jvt_snapshot(prepared)
+    }
+
+    fn memory_usage_bytes(&self) -> (u64, u64) {
+        (*self.base).memory_usage_bytes()
+    }
+
+    fn node_cache_len(&self) -> usize {
+        (*self.base).node_cache_len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use indexmap::IndexMap;
+    use radix_substate_store_interface::interface::{DatabaseUpdates, PartitionDatabaseUpdates};
+
+    /// Minimal stub implementing every trait `PendingChain<S>` requires.
+    /// Returns no data — tests only exercise the overlay and chain-walk
+    /// behavior, not the base storage.
+    struct StubStore;
+
+    impl SubstateDatabase for StubStore {
+        fn get_raw_substate_by_db_key(
+            &self,
+            _partition_key: &DbPartitionKey,
+            _sort_key: &DbSortKey,
+        ) -> Option<Vec<u8>> {
+            None
+        }
+        fn list_raw_values_from_db_key(
+            &self,
+            _partition_key: &DbPartitionKey,
+            _from_sort_key: Option<&DbSortKey>,
+        ) -> Box<dyn Iterator<Item = (DbSortKey, Vec<u8>)> + '_> {
+            Box::new(std::iter::empty())
+        }
+    }
+
+    /// Empty snapshot for `StubStore` — returns no data.
+    struct StubSnapshot;
+    impl SubstateDatabase for StubSnapshot {
+        fn get_raw_substate_by_db_key(
+            &self,
+            _partition_key: &DbPartitionKey,
+            _sort_key: &DbSortKey,
+        ) -> Option<Vec<u8>> {
+            None
+        }
+        fn list_raw_values_from_db_key(
+            &self,
+            _partition_key: &DbPartitionKey,
+            _from_sort_key: Option<&DbSortKey>,
+        ) -> Box<dyn Iterator<Item = (DbSortKey, Vec<u8>)> + '_> {
+            Box::new(std::iter::empty())
+        }
+    }
+
+    impl SubstateStore for StubStore {
+        type Snapshot<'a> = StubSnapshot;
+        fn snapshot(&self) -> Self::Snapshot<'_> {
+            StubSnapshot
+        }
+        fn jvt_version(&self) -> u64 {
+            0
+        }
+        fn state_root_hash(&self) -> Hash {
+            Hash::ZERO
+        }
+        fn list_substates_for_node_at_height(
+            &self,
+            _node_id: &NodeId,
+            _block_height: u64,
+        ) -> Option<Vec<(u8, DbSortKey, Vec<u8>)>> {
+            None
+        }
+        fn generate_verkle_proofs(
+            &self,
+            _storage_keys: &[Vec<u8>],
+            _block_height: u64,
+        ) -> Option<VerkleInclusionProof> {
+            None
+        }
+    }
+
+    impl jvt::TreeReader for StubStore {
+        fn get_node(&self, _key: &jvt::NodeKey) -> Option<Arc<jvt::Node>> {
+            None
+        }
+        fn get_root_key(&self, _version: u64) -> Option<jvt::NodeKey> {
+            None
+        }
+    }
+
+    impl crate::ChainReader for StubStore {
+        fn get_block(
+            &self,
+            _height: hyperscale_types::BlockHeight,
+        ) -> Option<(hyperscale_types::Block, hyperscale_types::QuorumCertificate)> {
+            None
+        }
+        fn committed_height(&self) -> hyperscale_types::BlockHeight {
+            hyperscale_types::BlockHeight(0)
+        }
+        fn committed_hash(&self) -> Option<Hash> {
+            None
+        }
+        fn latest_qc(&self) -> Option<hyperscale_types::QuorumCertificate> {
+            None
+        }
+        fn get_block_for_sync(
+            &self,
+            _height: hyperscale_types::BlockHeight,
+        ) -> Option<(hyperscale_types::Block, hyperscale_types::QuorumCertificate)> {
+            None
+        }
+        fn get_transactions_batch(
+            &self,
+            _hashes: &[Hash],
+        ) -> Vec<hyperscale_types::RoutableTransaction> {
+            Vec::new()
+        }
+        fn get_certificates_batch(
+            &self,
+            _hashes: &[Hash],
+        ) -> Vec<hyperscale_types::WaveCertificate> {
+            Vec::new()
+        }
+        fn get_local_receipt(&self, _tx_hash: &Hash) -> Option<Arc<LocalReceipt>> {
+            None
+        }
+        fn get_execution_certificates_by_height(
+            &self,
+            _block_height: u64,
+        ) -> Vec<hyperscale_types::ExecutionCertificate> {
+            Vec::new()
+        }
+        fn get_wave_certificate_for_tx(
+            &self,
+            _tx_hash: &Hash,
+        ) -> Option<hyperscale_types::WaveCertificate> {
+            None
+        }
+        fn get_ec_hashes_for_tx(
+            &self,
+            _tx_hash: &Hash,
+        ) -> Option<Vec<(hyperscale_types::ShardGroupId, Hash)>> {
+            None
+        }
+    }
+
+    fn make_delta(
+        node_key: &[u8],
+        partition: u8,
+        sort_key: Vec<u8>,
+        value: Vec<u8>,
+    ) -> DatabaseUpdates {
+        let mut updates = DatabaseUpdates::default();
+        let node = updates.node_updates.entry(node_key.to_vec()).or_default();
+        let part = node.partition_updates.entry(partition).or_insert_with(|| {
+            PartitionDatabaseUpdates::Delta {
+                substate_updates: IndexMap::new(),
+            }
+        });
+        if let PartitionDatabaseUpdates::Delta { substate_updates } = part {
+            substate_updates.insert(DbSortKey(sort_key), DatabaseUpdate::Set(value));
+        }
+        updates
+    }
+
+    fn make_receipt(updates: DatabaseUpdates) -> Arc<LocalReceipt> {
+        use hyperscale_types::{LocalReceipt, TransactionOutcome};
+        Arc::new(LocalReceipt {
+            outcome: TransactionOutcome::Success,
+            database_updates: updates,
+            application_events: vec![],
+        })
+    }
+
+    fn empty_snapshot() -> Arc<JvtSnapshot> {
+        Arc::new(JvtSnapshot {
+            base_root: Hash::ZERO,
+            base_version: 0,
+            result_root: Hash::ZERO,
+            new_version: 0,
+            nodes: vec![],
+            stale_node_keys: vec![],
+            leaf_substate_associations: vec![],
+        })
+    }
+
+    fn entry_at(parent: Hash, height: u64, updates: DatabaseUpdates) -> ChainEntry {
+        ChainEntry {
+            parent_hash: parent,
+            height,
+            receipts: vec![make_receipt(updates)],
+            jvt_snapshot: empty_snapshot(),
+        }
+    }
+
+    fn empty_chain() -> Arc<PendingChain<StubStore>> {
+        Arc::new(PendingChain::new(Arc::new(StubStore)))
+    }
+
+    #[test]
+    fn insert_does_not_invalidate_cache() {
+        let chain = empty_chain();
+        let anchor = Hash::from_bytes(b"anchor");
+        let _ = chain.view_at(anchor); // populate cache
+        assert_eq!(chain.view_cache.read().unwrap().len(), 1);
+
+        chain.insert(
+            Hash::from_bytes(b"new"),
+            entry_at(Hash::ZERO, 1, DatabaseUpdates::default()),
+        );
+        // Cache cell should still be present; insert does not clear it.
+        assert_eq!(chain.view_cache.read().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn prune_drops_only_low_anchor_cache_entries() {
+        let chain = empty_chain();
+
+        // Insert entries at heights 1, 2, 3.
+        let h1 = Hash::from_bytes(b"h1");
+        let h2 = Hash::from_bytes(b"h2");
+        let h3 = Hash::from_bytes(b"h3");
+        chain.insert(h1, entry_at(Hash::ZERO, 1, DatabaseUpdates::default()));
+        chain.insert(h2, entry_at(h1, 2, DatabaseUpdates::default()));
+        chain.insert(h3, entry_at(h2, 3, DatabaseUpdates::default()));
+
+        // Cache views anchored at h1, h2, h3.
+        let _ = chain.view_at(h1);
+        let _ = chain.view_at(h2);
+        let _ = chain.view_at(h3);
+        assert_eq!(chain.view_cache.read().unwrap().len(), 3);
+
+        // Prune through height 2 — h1 and h2 entries removed; only h3
+        // anchor's cache entry survives.
+        chain.prune(2);
+        assert_eq!(chain.entries.read().unwrap().len(), 1);
+        let cache = chain.view_cache.read().unwrap();
+        assert_eq!(cache.len(), 1);
+        assert!(cache.contains_key(&h3));
+    }
+
+    #[test]
+    fn view_at_walks_parent_chain() {
+        let chain = empty_chain();
+        let h1 = Hash::from_bytes(b"h1");
+        let h2 = Hash::from_bytes(b"h2");
+
+        let pk = DbPartitionKey {
+            node_key: b"node".to_vec(),
+            partition_num: 0,
+        };
+
+        chain.insert(
+            h1,
+            entry_at(Hash::ZERO, 1, make_delta(b"node", 0, vec![1], vec![10])),
+        );
+        chain.insert(
+            h2,
+            entry_at(h1, 2, make_delta(b"node", 0, vec![2], vec![20])),
+        );
+
+        let view = chain.view_at(h2);
+        // h2's parent chain: h2 → h1 → ZERO. Should see both writes.
+        assert_eq!(
+            view.get_raw_substate_by_db_key(&pk, &DbSortKey(vec![1])),
+            Some(vec![10]),
+        );
+        assert_eq!(
+            view.get_raw_substate_by_db_key(&pk, &DbSortKey(vec![2])),
+            Some(vec![20]),
+        );
+    }
+
+    #[test]
+    fn orphans_are_invisible_to_committed_chain_view() {
+        let chain = empty_chain();
+        let h1 = Hash::from_bytes(b"h1");
+        let orphan = Hash::from_bytes(b"orphan");
+
+        let pk = DbPartitionKey {
+            node_key: b"node".to_vec(),
+            partition_num: 0,
+        };
+
+        chain.insert(
+            h1,
+            entry_at(Hash::ZERO, 1, make_delta(b"node", 0, vec![1], vec![10])),
+        );
+        // Orphan: same height as h1, different parent (forks off ZERO).
+        chain.insert(
+            orphan,
+            entry_at(Hash::ZERO, 1, make_delta(b"node", 0, vec![1], vec![99])),
+        );
+
+        // View anchored at h1: should see h1's value, not the orphan's.
+        let view = chain.view_at(h1);
+        assert_eq!(
+            view.get_raw_substate_by_db_key(&pk, &DbSortKey(vec![1])),
+            Some(vec![10]),
+        );
+    }
+
+    #[test]
+    fn concurrent_view_at_serializes_on_oncelock() {
+        // Same anchor returns the same Arc — both threads see the same view.
+        let chain = empty_chain();
+        let h1 = Hash::from_bytes(b"h1");
+        chain.insert(h1, entry_at(Hash::ZERO, 1, DatabaseUpdates::default()));
+
+        let chain_a = Arc::clone(&chain);
+        let chain_b = Arc::clone(&chain);
+        let t1 = std::thread::spawn(move || chain_a.view_at(h1));
+        let t2 = std::thread::spawn(move || chain_b.view_at(h1));
+        let v1 = t1.join().unwrap();
+        let v2 = t2.join().unwrap();
+        assert!(Arc::ptr_eq(&v1, &v2));
+    }
+
+    #[test]
+    fn view_at_committed_tip_with_no_commits_returns_base_only() {
+        let chain = empty_chain();
+        let view = chain.view_at_committed_tip();
+        let pk = DbPartitionKey {
+            node_key: b"missing".to_vec(),
+            partition_num: 0,
+        };
+        assert_eq!(
+            view.get_raw_substate_by_db_key(&pk, &DbSortKey(vec![1])),
+            None,
+        );
+    }
+}

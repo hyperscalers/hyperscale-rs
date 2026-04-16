@@ -80,9 +80,10 @@ pub(crate) struct VerificationPipeline {
 
     /// State root verifications ready to dispatch.
     /// Drained by NodeStateMachine which emits `VerifyStateRoot` actions.
-    /// The action handler builds an `OverlayTreeReader` from cached
-    /// `PreparedCommit`s so verification can chain from prior results
-    /// without waiting for actual JVT commits.
+    /// The dispatched handler runs against a `SubstateView` anchored at
+    /// the parent block, which sees prior unpersisted JVT snapshots so
+    /// verification can chain from prior results without waiting for
+    /// actual JVT commits.
     ready_state_root_verifications: Vec<ReadyStateRootVerification>,
 
     /// BuildProposal action ready to dispatch (parent tree became available).

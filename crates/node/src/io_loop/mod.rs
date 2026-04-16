@@ -55,20 +55,9 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-/// Snapshot cache: `block_hash → (parent_block_hash, snapshot)`.
-pub(crate) type JvtSnapshotMap = HashMap<Hash, (Hash, Arc<hyperscale_storage::JvtSnapshot>)>;
-
 /// Prepared commit cache: `block_hash → (block_height, prepared_commit)`.
 type PreparedCommitMap<S> =
     HashMap<Hash, (u64, <S as hyperscale_storage::ChainWriter>::PreparedCommit)>;
-
-/// Pending database updates cache: `block_hash → (block_height, updates)`.
-///
-/// Populated alongside `PreparedCommitMap` when `prepare_block_commit` runs.
-/// Used by `SubstateOverlay` to serve substate reads for blocks that have been
-/// committed by consensus but not yet persisted to RocksDB.
-pub(crate) type PendingDbUpdatesMap =
-    HashMap<Hash, (u64, Vec<Arc<hyperscale_types::LocalReceipt>>)>;
 
 /// A block commit waiting to be flushed to storage.
 ///
@@ -264,21 +253,12 @@ where
     // when they outlive the block they were prepared for.
     prepared_commits: Arc<Mutex<PreparedCommitMap<S>>>,
 
-    /// JVT snapshots from successful verifications, keyed by block hash.
-    /// Value is `(parent_block_hash, snapshot)` so the chain can be walked
-    /// by following parent hashes. Arc-wrapped to avoid cloning node vecs
-    /// during chain walks. Pruned when blocks commit to the tree store.
-    jvt_snapshot_cache: Arc<Mutex<JvtSnapshotMap>>,
-
-    /// Pending database updates from unpersisted blocks (shared with dispatch closures).
-    /// Populated alongside `prepared_commits` when `prepare_block_commit` runs.
-    /// Used by `SubstateOverlay` in delegated action handlers.
-    pending_db_updates: Arc<Mutex<PendingDbUpdatesMap>>,
-
-    /// Cached overlay built from `pending_db_updates` and `jvt_snapshot_cache`.
-    /// Dispatch closures clone from this instead of rebuilding per-action.
-    /// Invalidated (rebuilt + swapped) when the underlying caches change.
-    overlay_cache: Arc<ArcSwap<hyperscale_storage::SubstateOverlay<S>>>,
+    /// Chain-anchored pending state. Indexed by block hash; reads happen
+    /// through `PendingChain::view_at(parent_hash)` which walks the
+    /// parent chain back to the committed tip. Orphaned blocks are not
+    /// ancestors and are structurally invisible to anchored views.
+    /// See `.plans/_unify-overlays.md`.
+    pending_chain: Arc<hyperscale_storage::PendingChain<S>>,
 
     // In-memory caches (shared with inbound router in production)
     cert_cache: Arc<QuickCache<Hash, Arc<WaveCertificate>>>,
@@ -401,12 +381,7 @@ where
         let header_fetch_protocol =
             HeaderFetchProtocol::new(crate::protocol::header_fetch::HeaderFetchConfig::default());
         let storage = Arc::new(storage);
-        let initial_overlay = hyperscale_storage::SubstateOverlay::new(
-            Arc::clone(&storage),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-        );
+        let pending_chain = Arc::new(hyperscale_storage::PendingChain::new(Arc::clone(&storage)));
         Self {
             state,
             storage,
@@ -420,9 +395,7 @@ where
             validator_id,
             num_shards: topo.num_shards(),
             prepared_commits: Arc::new(Mutex::new(HashMap::new())),
-            jvt_snapshot_cache: Arc::new(Mutex::new(HashMap::new())),
-            pending_db_updates: Arc::new(Mutex::new(HashMap::new())),
-            overlay_cache: Arc::new(ArcSwap::from_pointee(initial_overlay)),
+            pending_chain,
             cert_cache: Arc::new(QuickCache::new(DEFAULT_CERT_CACHE_SIZE)),
             tx_cache: Arc::new(QuickCache::new(DEFAULT_TX_CACHE_SIZE)),
             provision_cache: Arc::new(QuickCache::new(DEFAULT_PROVISION_CACHE_SIZE)),
@@ -965,21 +938,8 @@ where
                 if height > self.persisted_height {
                     self.persisted_height = height;
                 }
-                // Prune pending_db_updates and jvt_snapshot_cache — these
-                // blocks are now in RocksDB. Hold guards to avoid re-locking
-                // inside build_overlay_from_maps.
-                {
-                    let mut db_guard = self.pending_db_updates.lock().unwrap();
-                    let mut jvt_guard = self.jvt_snapshot_cache.lock().unwrap();
-                    db_guard.retain(|_, (h, _)| *h > height);
-                    jvt_guard.retain(|_, (_, snap)| snap.new_version > height);
-                    let new_overlay = crate::action_handler::build_overlay_from_maps(
-                        &self.storage,
-                        &db_guard,
-                        &jvt_guard,
-                    );
-                    self.overlay_cache.store(Arc::new(new_overlay));
-                }
+                // Drop pending state for blocks now persisted to RocksDB.
+                self.pending_chain.prune(height);
                 self.feed_event(ProtocolEvent::BlockPersisted { height });
             }
             NodeInput::Protocol(pe) => {
