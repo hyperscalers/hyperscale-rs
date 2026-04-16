@@ -229,6 +229,18 @@ pub struct BftState {
     /// transactions), we buffer the commit here and retry when the data arrives.
     pending_commits_awaiting_data: HashMap<Hash, (u64, QuorumCertificate)>,
 
+    /// Synced blocks awaiting state-root verification before commit.
+    ///
+    /// The sync path used to call `record_block_committed` eagerly (before
+    /// VerifyStateRoot completed), which advanced `committed_height` before
+    /// `verified_state_roots` / `last_committed_height` were ready. This
+    /// caused child verifications to defer indefinitely and starved proposers.
+    ///
+    /// Now `apply_synced_block` stashes the block here and only commits when
+    /// `on_state_root_verified` confirms the synced block's state root —
+    /// the same invariant as the consensus path.
+    pending_synced_commits: HashMap<Hash, (Block, QuorumCertificate)>,
+
     /// In-flight proposal awaiting `Event::ProposalBuilt` callback.
     pending_proposal: Option<PendingProposal>,
 
@@ -336,6 +348,7 @@ impl BftState {
             sync: SyncManager::new(),
             pending_commits: std::collections::BTreeMap::new(),
             pending_commits_awaiting_data: HashMap::new(),
+            pending_synced_commits: HashMap::new(),
             pending_proposal: None,
             committed_tx_lookup: HashMap::new(),
             recently_committed_txs: std::collections::HashSet::new(),
@@ -1060,12 +1073,6 @@ impl BftState {
 
         let parent_in_flight = self.certified_in_flight;
 
-        // Track that we have a pending proposal (for correlation)
-        self.pending_proposal = Some(PendingProposal {
-            height: block_height,
-            round,
-        });
-
         info!(
             validator = ?topology.local_validator_id(),
             height = next_height,
@@ -1079,6 +1086,11 @@ impl BftState {
         // QC-attested (part of block hash). Used by remote shards to detect missing
         // provisions (derived from wave union) and missing execution certificates.
         let waves = hyperscale_types::compute_waves(topology, next_height, &transactions);
+
+        // Empty proposals (no finalized waves with receipts) don't need the parent's
+        // JMT overlay — `prepare_block_commit` takes a noop fast path that returns
+        // parent_state_root unchanged. Only non-empty proposals need the defer gate.
+        let has_receipts = waves_to_propose.iter().any(|fw| !fw.receipts.is_empty());
 
         let proposal_action = Action::BuildProposal {
             shard_group_id: topology.local_shard(),
@@ -1104,13 +1116,23 @@ impl BftState {
             duration: self.config.proposal_interval,
         }];
 
-        // Defer BuildProposal if the parent's tree nodes aren't available yet.
-        // The verification pipeline will emit it once the parent is verified
-        // or committed to the tree store.
-        if self
-            .verification
-            .parent_tree_available(parent_block_height, parent_hash)
+        // Dispatch unless the proposal has receipts AND the parent's tree nodes
+        // aren't available yet. When deferred, do NOT set pending_proposal —
+        // that way the next proposal timer tick re-checks parent_tree_available
+        // and dispatches as soon as it becomes true. Setting pending_proposal
+        // here would make the next tick hit the "build in flight" guard and
+        // skip the retry, which is how we end up in a 5s view-change loop
+        // whenever the async try_unblock_proposal callback is slow or missed.
+        if !has_receipts
+            || self
+                .verification
+                .parent_tree_available(parent_block_height, parent_hash)
         {
+            // Track that a build is in flight (for correlation with ProposalBuilt).
+            self.pending_proposal = Some(PendingProposal {
+                height: block_height,
+                round,
+            });
             actions.push(proposal_action);
         } else {
             self.verification
@@ -2631,14 +2653,27 @@ impl BftState {
                 "Block root verification FAILED"
             );
             self.pending_blocks.remove(&block_hash);
+            self.pending_synced_commits.remove(&block_hash);
             return vec![];
         }
 
+        // Synced blocks: commit now that state root is verified.
+        // This is the deferred commit from apply_synced_block — only state
+        // root verification is required (synced blocks don't go through the
+        // full vote pipeline, the QC already attests the block).
+        if kind == VerificationKind::StateRoot {
+            if let Some((block, qc)) = self.pending_synced_commits.remove(&block_hash) {
+                return self.commit_synced_block(topology, block_hash, block, qc);
+            }
+        }
+
         let Some(pending_block) = self.pending_blocks.get(&block_hash) else {
-            warn!(
+            // Not a consensus block and not a synced block — likely already
+            // committed or evicted.
+            debug!(
                 block_hash = ?block_hash,
                 ?kind,
-                "Verification complete but pending block not found"
+                "Verification complete but block not found in pending or synced"
             );
             return vec![];
         };
@@ -3462,8 +3497,11 @@ impl BftState {
     /// Apply a synced block after QC verification (or for genesis QC).
     ///
     /// Initiates state root verification through the same pipeline as
-    /// consensus blocks. Emits `CommitBlock` (unified with consensus) and
-    /// `CacheFinalizedWave` so other syncing nodes can fetch wave data from us.
+    /// consensus blocks. The actual commit (`record_block_committed` +
+    /// `Action::CommitBlock`) is deferred until `on_state_root_verified`
+    /// confirms the block — matching the consensus path invariant that
+    /// `committed_height` only advances when the block's JMT snapshot is
+    /// in the PendingChain and the PreparedCommit is available.
     fn apply_synced_block(
         &mut self,
         topology: &TopologySnapshot,
@@ -3482,10 +3520,12 @@ impl BftState {
             "Applying synced block"
         );
 
-        // Capture parent state BEFORE record_block_committed changes it.
-        // These are needed for state root verification.
-        let parent_state_root = self.committed_state_root;
-        let parent_block_height = self.committed_height;
+        // Parent state for verification: use certified_state_root (tracks
+        // the QC-attested chain) and the higher of committed or sync-applied
+        // height. We no longer advance committed_height here — that happens
+        // in commit_synced_block when VerifyStateRoot completes.
+        let parent_state_root = self.certified_state_root;
+        let parent_block_height = self.sync.sync_applied_height().max(self.committed_height);
 
         let finalized_waves: Vec<Arc<FinalizedWave>> = block.certificates.clone();
 
@@ -3500,9 +3540,17 @@ impl BftState {
             finalized_waves.clone(),
         );
 
-        let removed_blocks = self.record_block_committed(&block, block_hash);
+        // Track sync progress for the loop iterator — independent of
+        // committed_height which only advances after verification.
+        self.sync.set_sync_applied_height(height);
 
-        // Update latest QC and certified tracking (this may help us catch up further)
+        // Stash for deferred commit. commit_synced_block() fires when
+        // on_state_root_verified confirms this block.
+        self.pending_synced_commits
+            .insert(block_hash, (block.clone(), qc.clone()));
+
+        // Update latest QC and certified tracking (needed for consensus
+        // participation while verification is in flight).
         if self
             .latest_qc
             .as_ref()
@@ -3524,44 +3572,61 @@ impl BftState {
             self.latest_qc = Some(block.header.parent_qc.clone());
             self.maybe_unlock_for_qc(topology, &block.header.parent_qc);
 
-            // Best-effort certified field update from the QC'd block.
             if let Some(ph) = self.get_header_by_hash(block.header.parent_qc.block_hash) {
                 self.certified_state_root = ph.state_root;
                 self.certified_in_flight = ph.in_flight;
             }
         }
 
-        // Get provision batches from the pending block if we happen to have one
-        // (rare for synced blocks — they bypass consensus assembly). Otherwise
-        // commit with an empty slice and rely on `SyncResumed` / post-sync fetch
-        // to deliver provisions for blocks still within the execution window.
-        let provisions = self
-            .pending_blocks
-            .get(&block_hash)
-            .map(|pb| pb.provisions())
-            .unwrap_or_default();
-
-        // Emit CommitBlock (unified with consensus path).
-        let mut actions = vec![Action::CommitBlock {
-            block: block.clone(),
-            qc,
-            provisions,
-        }];
-
         // Cache constructed FinalizedWaves so other syncing nodes can fetch
-        // them via FinalizedWaveFetchProtocol instead of hitting the original proposer.
+        // them via FinalizedWaveFetchProtocol.
+        let mut actions = Vec::new();
         for wave in &finalized_waves {
             actions.push(Action::CacheFinalizedWave {
                 wave: Arc::clone(wave),
             });
         }
 
-        // Synced blocks: do NOT gossip committed header — the original
-        // proposer already did. Fallback recovery handles missing headers.
+        actions
+    }
 
-        // Cancel any pending fetches for removed blocks
-        for block_hash in removed_blocks {
-            actions.push(Action::CancelFetch { block_hash });
+    /// Commit a synced block after its state root verification completed.
+    ///
+    /// Called from `on_block_root_verified` when a pending synced block's
+    /// state root is confirmed valid. This is the sync path's equivalent
+    /// of the consensus path's `commit_block_and_buffered`.
+    fn commit_synced_block(
+        &mut self,
+        topology: &TopologySnapshot,
+        block_hash: Hash,
+        block: Block,
+        qc: QuorumCertificate,
+    ) -> Vec<Action> {
+        let height = block.header.height.0;
+
+        info!(
+            validator = ?topology.local_validator_id(),
+            height = height,
+            block_hash = ?block_hash,
+            "Committing synced block (state root verified)"
+        );
+
+        let removed_blocks = self.record_block_committed(&block, block_hash);
+
+        let provisions = self
+            .pending_blocks
+            .get(&block_hash)
+            .map(|pb| pb.provisions())
+            .unwrap_or_default();
+
+        let mut actions = vec![Action::CommitBlock {
+            block,
+            qc,
+            provisions,
+        }];
+
+        for bh in removed_blocks {
+            actions.push(Action::CancelFetch { block_hash: bh });
         }
 
         actions
@@ -3575,9 +3640,13 @@ impl BftState {
     fn try_apply_verified_synced_blocks(&mut self, topology: &TopologySnapshot) -> Vec<Action> {
         let mut actions = Vec::new();
 
-        // First, apply all consecutive verified blocks
+        // First, apply all consecutive verified blocks.
+        // Use the higher of committed_height and sync_applied_height as
+        // the base: committed_height may lag because it now only advances
+        // when VerifyStateRoot → commit_synced_block completes.
         loop {
-            let next_height = self.committed_height + 1;
+            let base = self.committed_height.max(self.sync.sync_applied_height());
+            let next_height = base + 1;
 
             // Log state for debugging
             self.sync
@@ -3623,6 +3692,12 @@ impl BftState {
         let old_round = self.view;
         self.view += 1;
         self.view_changes += 1;
+
+        // Clear pending_proposal — a stale in-flight build from the previous
+        // round should not block the new round's proposer. If the old build
+        // completes later, on_proposal_built will see a height/round mismatch
+        // and discard it.
+        self.pending_proposal = None;
 
         info!(
             validator = ?topology.local_validator_id(),
@@ -4421,8 +4496,22 @@ impl BftState {
     }
 
     /// Take the ready BuildProposal action if one was unblocked.
+    ///
+    /// Also sets `pending_proposal` so a racing proposal timer tick doesn't
+    /// try to start a second build for the same (height, round). This mirrors
+    /// the `pending_proposal = Some(...)` guard in the dispatch branch of
+    /// `on_proposal_timer`; the deferred path intentionally leaves
+    /// `pending_proposal` unset so tick-based retries work, which means the
+    /// final "actually dispatching now" bookkeeping has to happen here.
     pub fn take_ready_proposal(&mut self) -> Option<Action> {
-        self.verification.take_ready_proposal()
+        let action = self.verification.take_ready_proposal()?;
+        if let Action::BuildProposal { height, round, .. } = &action {
+            self.pending_proposal = Some(PendingProposal {
+                height: *height,
+                round: *round,
+            });
+        }
+        Some(action)
     }
 
     /// Register committed transactions for execution timeout validation.

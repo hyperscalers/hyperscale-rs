@@ -35,6 +35,13 @@ pub(crate) struct SyncManager {
     /// Used by `on_jvt_committed` to auto-resume when persistence catches up.
     sync_target_height: Option<u64>,
 
+    /// Highest height passed to `apply_synced_block`. Used by the sync
+    /// loop (`try_apply_verified_synced_blocks`) to iterate through
+    /// blocks independently of `BftState::committed_height`, which now
+    /// only advances when the VerifyStateRoot → PreparedCommit →
+    /// commit_prepared_blocks pipeline completes.
+    sync_applied_height: u64,
+
     /// Buffered out-of-order synced blocks waiting for earlier blocks.
     /// Maps height -> (Block, QC, receipts).
     buffered_synced_blocks: BTreeMap<u64, (Block, QuorumCertificate)>,
@@ -50,6 +57,7 @@ impl SyncManager {
         Self {
             syncing: false,
             sync_target_height: None,
+            sync_applied_height: 0,
             buffered_synced_blocks: BTreeMap::new(),
             pending_synced_block_verifications: HashMap::new(),
         }
@@ -80,6 +88,17 @@ impl SyncManager {
     /// Get the sync target height, if syncing.
     pub fn sync_target_height(&self) -> Option<u64> {
         self.sync_target_height
+    }
+
+    /// Get the highest height that `apply_synced_block` has processed.
+    pub fn sync_applied_height(&self) -> u64 {
+        self.sync_applied_height
+    }
+
+    /// Record that a synced block at `height` has been submitted for
+    /// state-root verification (but not yet committed).
+    pub fn set_sync_applied_height(&mut self, height: u64) {
+        self.sync_applied_height = self.sync_applied_height.max(height);
     }
 
     // ═══════════════════════════════════════════════════════════════════════

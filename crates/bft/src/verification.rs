@@ -452,6 +452,17 @@ impl VerificationPipeline {
             self.try_unblock_proposal(block_hash);
         } else {
             warn!(block_hash = ?block_hash, "State root verification FAILED");
+
+            // Clear deferred children — they can never unblock since the
+            // parent failed. Without this, deferred entries are orphaned
+            // and block verification indefinitely.
+            if let Some(orphans) = self.deferred_state_root_verifications.remove(&block_hash) {
+                warn!(
+                    block_hash = ?block_hash,
+                    orphaned_count = orphans.len(),
+                    "Clearing deferred state root verifications — parent failed"
+                );
+            }
         }
 
         valid
