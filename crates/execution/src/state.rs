@@ -705,10 +705,6 @@ impl ExecutionState {
     ///
     /// Returns `(tx_hash, decision)` pairs for each committed transaction, so the
     /// caller can forward them to the mempool for terminal state transitions.
-    ///
-    /// Wave certs are lean (no per-tx data). We look up the per-tx
-    /// WaveCertificate from finalized_certificates to get tx_hash + decision,
-    /// then clean up the finalized entry.
     pub fn on_certificates_committed(
         &mut self,
         certificates: &[Arc<hyperscale_types::FinalizedWave>],
@@ -1776,10 +1772,8 @@ impl ExecutionState {
             }
         }
 
-        // Move receipts from cache into FinalizedWave for atomic commit.
-        // Receipts are aligned 1:1 with tx_hashes (block order), which matches
-        // the local EC's tx_outcomes order — so `FinalizedWave.receipts[i]` lines
-        // up with `FinalizedWave.tx_hashes().nth(i)`.
+        // Move receipts from cache into FinalizedWave for atomic commit, in
+        // block order — `receipts[i]` aligns with `tx_hashes[i]`.
         let receipts: Vec<ReceiptBundle> = tx_hashes
             .iter()
             .filter_map(|h| self.receipt_cache.remove(h))

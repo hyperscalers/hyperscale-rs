@@ -337,8 +337,7 @@ impl NodeStateMachine {
         }
 
         // Notify mempool and provisions of per-tx terminal states
-        // from committed wave certificates. Wave certs are lean (no per-tx data),
-        // so we use the decisions extracted from FinalizedWave above.
+        // from committed wave certificates.
         for (tx_hash, decision) in &committed_txs {
             if *decision == hyperscale_types::TransactionDecision::Aborted {
                 hyperscale_metrics::record_transaction_aborted();

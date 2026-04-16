@@ -11,8 +11,7 @@ use tracing::{debug, info, warn};
 /// Synced block pending QC signature verification.
 ///
 /// When we receive a synced block, we must verify its QC signature before
-/// applying it to our state. `block.certificates` already carries the receipts
-/// inline (via `Arc<FinalizedWave>`), so no separate receipts payload is needed.
+/// applying it to our state.
 #[derive(Debug, Clone)]
 pub(crate) struct PendingSyncedBlockVerification {
     /// The synced block awaiting QC verification.

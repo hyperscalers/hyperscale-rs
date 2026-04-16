@@ -357,17 +357,14 @@ pub fn build_proposal<S: ChainWriter + SubstateStore>(
         pending_snapshots,
     );
 
-    // Receipts come from the finalized waves themselves — used here only to compute
-    // the local_receipt_root for the BlockHeader.
-    let receipts: Vec<&ReceiptBundle> = certificates
+    let receipts: Vec<ReceiptBundle> = certificates
         .iter()
-        .flat_map(|fw| fw.receipts.iter())
+        .flat_map(|fw| fw.receipts.iter().cloned())
         .collect();
-    let receipts_owned: Vec<ReceiptBundle> = receipts.iter().map(|&r| r.clone()).collect();
 
     let transaction_root = compute_transaction_root(&transactions);
     let certificate_root = compute_certificate_root(&certificates);
-    let local_receipt_root = compute_local_receipt_root(&receipts_owned);
+    let local_receipt_root = compute_local_receipt_root(&receipts);
     let provision_root = compute_provision_root(&provision_hashes);
 
     // in_flight is deterministic from chain state:

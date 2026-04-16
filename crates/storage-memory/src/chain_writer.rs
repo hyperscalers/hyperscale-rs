@@ -32,7 +32,6 @@ impl ChainWriter for SimStorage {
         block_height: u64,
         pending_snapshots: &[Arc<hyperscale_storage::JvtSnapshot>],
     ) -> (Hash, Self::PreparedCommit) {
-        // Flatten receipts from all finalized waves in block order.
         let receipts: Vec<ReceiptBundle> = finalized_waves
             .iter()
             .flat_map(|fw| fw.receipts.iter().cloned())
@@ -194,7 +193,6 @@ impl ChainWriter for SimStorage {
         block: &Arc<hyperscale_types::Block>,
         qc: &Arc<hyperscale_types::QuorumCertificate>,
     ) -> Hash {
-        // Flatten receipts from all finalized waves in block order.
         let receipts: Vec<ReceiptBundle> = block
             .certificates
             .iter()

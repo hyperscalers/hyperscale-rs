@@ -19,19 +19,17 @@ fn commit_with(
     block: &hyperscale_types::Block,
     qc: &hyperscale_types::QuorumCertificate,
 ) -> Hash {
-    let receipt = hyperscale_types::ReceiptBundle {
-        tx_hash: Hash::ZERO,
-        local_receipt: Arc::new(hyperscale_types::LocalReceipt {
-            outcome: hyperscale_types::TransactionOutcome::Success,
-            database_updates: updates.clone(),
-            application_events: vec![],
-        }),
-        execution_output: None,
-    };
     let mut block = block.clone();
-    if updates.node_updates.is_empty() {
-        // No updates → don't bother attaching a placeholder wave.
-    } else {
+    if !updates.node_updates.is_empty() {
+        let receipt = hyperscale_types::ReceiptBundle {
+            tx_hash: Hash::ZERO,
+            local_receipt: Arc::new(hyperscale_types::LocalReceipt {
+                outcome: hyperscale_types::TransactionOutcome::Success,
+                database_updates: updates.clone(),
+                application_events: vec![],
+            }),
+            execution_output: None,
+        };
         block
             .certificates
             .push(Arc::new(hyperscale_types::FinalizedWave {

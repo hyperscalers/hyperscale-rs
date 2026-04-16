@@ -615,9 +615,8 @@ pub enum Action {
     /// Cache a finalized wave so peers can fetch it.
     ///
     /// Emitted by `finalize_wave` in `ExecutionState` when a wave completes.
-    /// The io_loop inserts the wave certificate into `cert_cache` and the
-    /// full `FinalizedWave` into `finalized_wave_cache`, both keyed by
-    /// `wave_id.hash()` (matches `BlockManifest.cert_hashes`).
+    /// The io_loop inserts the `FinalizedWave` into `finalized_wave_cache`,
+    /// keyed by `wave_id.hash()` (matches `BlockManifest.cert_hashes`).
     CacheFinalizedWave { wave: Arc<FinalizedWave> },
 
     /// Persist receipt bundles to disk. Fire-and-forget — no ProtocolEvent response.

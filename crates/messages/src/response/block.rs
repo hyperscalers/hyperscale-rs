@@ -7,8 +7,7 @@ use sbor::prelude::BasicSbor;
 
 /// Response to a block fetch request containing the full Block and its QC.
 ///
-/// `Block.certificates` carries `Arc<FinalizedWave>` with all per-wave receipts
-/// inline — no separate receipts field is needed.
+/// Receipts are carried inline as part of `Block.certificates[i].receipts`.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct GetBlockResponse {
     /// The requested block (None if not found).

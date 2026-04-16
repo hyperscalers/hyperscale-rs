@@ -51,7 +51,6 @@ pub enum NodeInput {
     SubmitTransaction { tx: Arc<RoutableTransaction> },
 
     /// Sync block response received from network callback.
-    /// `Block.certificates` carries `Arc<FinalizedWave>` with receipts inline.
     SyncBlockResponseReceived {
         height: u64,
         block: Box<Option<(Block, QuorumCertificate)>>,

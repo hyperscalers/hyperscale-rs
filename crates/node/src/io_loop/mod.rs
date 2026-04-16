@@ -47,7 +47,7 @@ use hyperscale_storage::{ChainReader, ChainWriter, SubstateStore};
 use hyperscale_types::{
     Block, Bls12381G1PrivateKey, Bls12381G1PublicKey, CommittedBlockHeader, ExecutionCertificate,
     FinalizedWave, Hash, Provision, QuorumCertificate, RoutableTransaction, ShardGroupId,
-    TopologySnapshot, ValidatorId, WaveCertificate, WaveId,
+    TopologySnapshot, ValidatorId, WaveId,
 };
 use quick_cache::sync::Cache as QuickCache;
 use std::collections::{HashMap, HashSet};
@@ -261,7 +261,6 @@ where
     pending_chain: Arc<hyperscale_storage::PendingChain<S>>,
 
     // In-memory caches (shared with inbound router in production)
-    cert_cache: Arc<QuickCache<Hash, Arc<WaveCertificate>>>,
     tx_cache: Arc<QuickCache<Hash, Arc<RoutableTransaction>>>,
     provision_cache: Arc<QuickCache<Hash, Arc<Provision>>>,
     finalized_wave_cache: Arc<QuickCache<Hash, Arc<FinalizedWave>>>,
@@ -391,7 +390,6 @@ where
             num_shards: topo.num_shards(),
             prepared_commits: Arc::new(Mutex::new(HashMap::new())),
             pending_chain,
-            cert_cache: Arc::new(QuickCache::new(DEFAULT_CERT_CACHE_SIZE)),
             tx_cache: Arc::new(QuickCache::new(DEFAULT_TX_CACHE_SIZE)),
             provision_cache: Arc::new(QuickCache::new(DEFAULT_PROVISION_CACHE_SIZE)),
             finalized_wave_cache: Arc::new(QuickCache::new(DEFAULT_CERT_CACHE_SIZE)),

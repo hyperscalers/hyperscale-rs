@@ -335,8 +335,6 @@ pub(crate) fn handle_delegated_action<
             block_height,
         } => {
             let start = std::time::Instant::now();
-            // Collect receipts from all finalized waves.
-            // Merging happens inside prepare_block_commit on the thread pool.
             let pending_snapshots = ctx.view.pending_snapshots().to_vec();
             let result = hyperscale_bft::handlers::verify_state_root(
                 &*ctx.view,
@@ -390,11 +388,6 @@ pub(crate) fn handle_delegated_action<
             parent_in_flight,
             finalized_tx_count,
         } => {
-            // Pass FinalizedWaves straight through into Block.certificates.
-            // build_proposal extracts receipts from them internally for state-root
-            // computation and the local_receipt_root.
-            let certificates: Vec<Arc<hyperscale_types::FinalizedWave>> = finalized_waves.clone();
-
             let mut provision_hashes: Vec<hyperscale_types::Hash> =
                 provision_batches.iter().map(|b| b.hash()).collect();
             provision_hashes.sort();
@@ -414,7 +407,7 @@ pub(crate) fn handle_delegated_action<
                 parent_state_root,
                 parent_block_height,
                 transactions,
-                certificates,
+                finalized_waves.clone(),
                 shard_group_id,
                 waves,
                 provision_hashes.clone(),

@@ -412,8 +412,6 @@ where
         match action {
             Action::CacheFinalizedWave { wave } => {
                 let wave_id_hash = wave.wave_id_hash();
-                self.cert_cache
-                    .insert(wave_id_hash, Arc::clone(&wave.certificate));
                 self.finalized_wave_cache.insert(wave_id_hash, wave);
             }
             Action::FetchChainMetadata => {

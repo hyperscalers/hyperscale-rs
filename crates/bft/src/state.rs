@@ -3458,8 +3458,7 @@ impl BftState {
 
     /// Apply a synced block after QC verification (or for genesis QC).
     ///
-    /// `Block.certificates` already carries `Arc<FinalizedWave>` with receipts
-    /// inline. Initiates state root verification through the same pipeline as
+    /// Initiates state root verification through the same pipeline as
     /// consensus blocks. Emits `CommitBlock` (unified with consensus) and
     /// `CacheFinalizedWave` so other syncing nodes can fetch wave data from us.
     fn apply_synced_block(
@@ -3485,9 +3484,6 @@ impl BftState {
         let parent_state_root = self.committed_state_root;
         let parent_block_height = self.committed_height;
 
-        // `Block.certificates` already carries `Arc<FinalizedWave>` with the
-        // full wave data (certificate + receipts) assembled by the sync peer.
-        // Sync and consensus paths are indistinguishable downstream.
         let finalized_waves: Vec<Arc<FinalizedWave>> = block.certificates.clone();
 
         // Initiate state root verification through the same pipeline as

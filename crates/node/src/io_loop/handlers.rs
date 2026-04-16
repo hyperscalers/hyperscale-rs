@@ -36,11 +36,9 @@ where
         // ── block.request → sync protocol ────────────────────────────
 
         let storage = Arc::clone(&self.storage);
-        let topology = Arc::clone(&self.topology);
         self.network
             .register_request_handler::<GetBlockRequest>(move |req| {
-                let topo = topology.load();
-                serve_block_request(&*storage, &topo, req)
+                serve_block_request(&*storage, req)
             });
 
         // ── transaction.request → fetch protocol ─────────────────────

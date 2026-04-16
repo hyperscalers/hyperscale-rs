@@ -51,11 +51,6 @@ where
                                     (Some(b), Some(q)) => Some((b, q)),
                                     _ => None,
                                 };
-
-                                // Receipts ride along inside `Block.certificates`
-                                // (Arc<FinalizedWave>) — the storage-side
-                                // FinalizedWave::reconstruct guarantees they are
-                                // either present or the peer returned not_found.
                                 let _ = es.send(NodeInput::SyncBlockResponseReceived {
                                     height,
                                     block: Box::new(block),
@@ -71,10 +66,6 @@ where
                 SyncOutput::DeliverBlock { block, qc } => {
                     metrics::record_sync_block_received_by_bft();
                     metrics::record_sync_block_submitted_for_verification();
-                    // `Block.certificates` already carries `Arc<FinalizedWave>`
-                    // with receipts inline (rebuilt by the sync peer's
-                    // `get_block_for_sync`), so no separate receipt buffer plumbing
-                    // is needed.
                     self.feed_event(ProtocolEvent::SyncBlockReadyToApply {
                         block: *block,
                         qc: *qc,

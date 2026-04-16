@@ -283,9 +283,6 @@ pub enum ProtocolEvent {
     // Sync Delivery (from IoLoop after sync protocol processing)
     // ═══════════════════════════════════════════════════════════════════════
     /// A synced block is ready to be applied to local state.
-    /// `Block.certificates` already carries `Arc<FinalizedWave>` with receipts
-    /// attached (rebuilt by the sync peer's `get_block_for_sync` via
-    /// `FinalizedWave::reconstruct`), so no separate receipts payload is needed.
     SyncBlockReadyToApply { block: Block, qc: QuorumCertificate },
 
     /// Sync EC BLS verification completed (async callback from crypto pool).

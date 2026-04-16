@@ -161,36 +161,6 @@ pub fn compute_waves(
         .collect()
 }
 
-/// Derive the transaction hashes belonging to a wave, given the source block's transactions.
-///
-/// This is the inverse of `compute_waves`: given a `WaveId` and the block's transactions,
-/// return the tx_hashes that belong to that wave. Deterministic — any node with the
-/// source block can re-derive the same result.
-///
-/// The WaveId is self-contained (`shard_group_id` + `block_height` + `remote_shards`),
-/// so no separate block hash is needed. The caller is responsible for providing the
-/// correct block's transactions (the block at `wave_id.block_height` on
-/// `wave_id.shard_group_id`'s chain).
-pub fn derive_wave_tx_hashes(
-    topology: &TopologySnapshot,
-    wave_id: &WaveId,
-    transactions: &[Arc<RoutableTransaction>],
-) -> Vec<Hash> {
-    let local_shard = wave_id.shard_group_id;
-    transactions
-        .iter()
-        .filter(|tx| {
-            let remote_shards: BTreeSet<ShardGroupId> = topology
-                .all_shards_for_transaction(tx)
-                .into_iter()
-                .filter(|&s| s != local_shard)
-                .collect();
-            remote_shards == wave_id.remote_shards
-        })
-        .map(|tx| tx.hash())
-        .collect()
-}
-
 /// Deterministically select the wave leader for a wave (attempt 0).
 ///
 /// The wave leader collects execution votes, aggregates the EC, and
