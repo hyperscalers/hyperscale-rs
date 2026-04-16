@@ -325,29 +325,13 @@ impl NodeStateMachine {
         self.bft
             .register_committed_transactions(&tx_hashes, block_height);
 
-        // Remove committed wave certificates from execution state.
-        // They've been included in this block, so don't need to be proposed again.
-        // Returns per-tx (tx_hash, decision) pairs for mempool terminal state updates.
-        let committed_txs = self
-            .execution
-            .on_certificates_committed(&block.certificates);
+        // Release execution's per-wave bookkeeping for wave certs included in
+        // this block. Per-tx terminal state for the mempool is handled below
+        // by `on_block_committed_full` reading `block.certificates` directly.
+        self.execution.cleanup_committed_waves(&block.certificates);
         for cert in &block.certificates {
             let cert_hash = cert.wave_id().hash();
             self.bft.remove_committed_transaction(&cert_hash);
-        }
-
-        // Notify mempool and provisions of per-tx terminal states
-        // from committed wave certificates.
-        for (tx_hash, decision) in &committed_txs {
-            if *decision == hyperscale_types::TransactionDecision::Aborted {
-                hyperscale_metrics::record_transaction_aborted();
-            }
-            actions.extend(self.mempool.on_certificate_committed(
-                self.topology.snapshot(),
-                *tx_hash,
-                *decision,
-                block_height,
-            ));
         }
 
         // Pass all transactions from block to execution (no need for mempool lookup).
@@ -361,7 +345,9 @@ impl NodeStateMachine {
             all_txs,
         ));
 
-        // Also let mempool handle it (marks transactions as committed, processes deferrals/aborts)
+        // Mempool: marks Pending → Committed for block.transactions, then drives
+        // each tx in `block.certificates` to its terminal state (Completed +
+        // tombstone). Same behavior for consensus and sync commit paths.
         actions.extend(
             self.mempool
                 .on_block_committed_full(self.topology.snapshot(), &block),

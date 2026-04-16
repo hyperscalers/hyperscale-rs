@@ -700,32 +700,22 @@ impl ExecutionState {
         actions
     }
 
-    /// Process committed wave certificates: remove finalized per-tx state for all
-    /// transactions whose certificates were included in the committed block.
+    /// Clean up execution-local per-wave state for wave certs included in the
+    /// committed block.
     ///
-    /// Returns `(tx_hash, decision)` pairs for each committed transaction, so the
-    /// caller can forward them to the mempool for terminal state transitions.
-    pub fn on_certificates_committed(
+    /// Per-tx terminal state for the mempool is now driven by
+    /// `mempool::on_block_committed_full` reading `block.certificates` directly
+    /// (single source of truth per `.plans/_wc-and-finalized-wave-refactor.md`).
+    /// This function only handles execution's own bookkeeping.
+    pub fn cleanup_committed_waves(
         &mut self,
         certificates: &[Arc<hyperscale_types::FinalizedWave>],
-    ) -> Vec<(Hash, hyperscale_types::TransactionDecision)> {
-        if certificates.is_empty() {
-            return vec![];
-        }
-
-        let mut committed_txs = Vec::new();
-
+    ) {
         for fw in certificates {
-            let wave_id = fw.wave_id();
-            if let Some(finalized) = self.finalized_wave_certificates.get(wave_id) {
-                // Derive per-tx decisions from the finalized wave's ECs
-                committed_txs.extend(finalized.tx_decisions());
-            }
-            // Clean up all state associated with this wave
-            self.remove_finalized_wave(wave_id);
+            // No-op for synced waves we never aggregated locally; for waves we
+            // tracked, releases accumulator/cache state for the wave's txs.
+            self.remove_finalized_wave(fw.as_ref());
         }
-
-        committed_txs
     }
 
     /// Apply provisions committed in a block to execution accumulators.
@@ -1849,34 +1839,33 @@ impl ExecutionState {
     /// Remove a finalized wave (after its wave cert has been committed in a block).
     ///
     /// Cleans up all per-tx tracking state for transactions in this wave.
-    pub fn remove_finalized_wave(&mut self, wave_id: &WaveId) {
-        let tx_hashes: Vec<Hash> = self
-            .finalized_wave_certificates
-            .get(wave_id)
-            .map(|fw| fw.tx_hashes().collect())
-            .unwrap_or_default();
-
+    /// Takes the `FinalizedWave` directly (rather than just a `WaveId`) so
+    /// cleanup works even when the wave was never aggregated locally — e.g.
+    /// for blocks received via sync. The committed `FinalizedWave` is the
+    /// authoritative tx-set source.
+    pub fn remove_finalized_wave(&mut self, fw: &hyperscale_types::FinalizedWave) {
+        let wave_id = fw.wave_id();
         self.finalized_wave_certificates.remove(wave_id);
         // Early attestations are a flat vec — no per-wave removal needed.
         // They're drained on block commit replay.
 
-        for tx_hash in &tx_hashes {
-            self.receipt_cache.remove(tx_hash);
-            self.pending_provisioning.remove(tx_hash);
+        for tx_hash in fw.tx_hashes() {
+            self.receipt_cache.remove(&tx_hash);
+            self.pending_provisioning.remove(&tx_hash);
 
             // Remove this TX from the wave's expected set in the accumulator.
-            if let Some(wave_key) = self.wave_assignments.get(tx_hash).cloned() {
+            if let Some(wave_key) = self.wave_assignments.get(&tx_hash).cloned() {
                 if let Some(accumulator) = self.accumulators.get_mut(&wave_key) {
-                    accumulator.remove_expected(tx_hash);
+                    accumulator.remove_expected(&tx_hash);
                 }
             }
 
-            self.wave_assignments.remove(tx_hash);
-            self.verified_provisions.remove(tx_hash);
-            self.required_provision_shards.remove(tx_hash);
-            self.received_provision_shards.remove(tx_hash);
-            self.early_committed_provisions.remove(tx_hash);
-            self.conflict_detector.remove_tx(tx_hash);
+            self.wave_assignments.remove(&tx_hash);
+            self.verified_provisions.remove(&tx_hash);
+            self.required_provision_shards.remove(&tx_hash);
+            self.received_provision_shards.remove(&tx_hash);
+            self.early_committed_provisions.remove(&tx_hash);
+            self.conflict_detector.remove_tx(&tx_hash);
         }
     }
 
