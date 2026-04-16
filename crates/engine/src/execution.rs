@@ -52,8 +52,9 @@ pub fn extract_database_updates(receipt: &TransactionReceipt) -> DatabaseUpdates
 /// Build a `LocalReceipt` from a Radix Engine receipt.
 ///
 /// Shard filtering is applied here so the receipt is always born with
-/// shard-specific `database_updates`. Pass `None` for `shard_context` in
-/// single-shard deployments (no filtering needed).
+/// shard-specific `database_updates`. System entity writes (ConsensusManager,
+/// TransactionTracker, Validator) are always filtered regardless of shard count,
+/// since their execution order is non-deterministic across validators.
 pub fn build_local_receipt<S: radix_substate_store_interface::interface::SubstateDatabase>(
     receipt: &TransactionReceipt,
     storage: &S,
@@ -73,15 +74,13 @@ pub fn build_local_receipt<S: radix_substate_store_interface::interface::Substat
                 }
             };
             let mut database_updates = extract_database_updates(receipt);
-            if num_shards > 1 {
-                database_updates = crate::sharding::filter_updates_for_shard(
-                    &database_updates,
-                    local_shard,
-                    num_shards,
-                    storage,
-                    declared_nodes,
-                );
-            }
+            database_updates = crate::sharding::filter_updates_for_shard(
+                &database_updates,
+                local_shard,
+                num_shards,
+                storage,
+                declared_nodes,
+            );
             LocalReceipt {
                 outcome,
                 database_updates,
