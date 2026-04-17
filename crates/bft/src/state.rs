@@ -3711,6 +3711,15 @@ impl BftState {
             }
         }
 
+        // Always schedule the next view change timer — proposers need it too
+        // in case their block doesn't gather quorum (e.g., other validators are
+        // vote-locked or offline). Without this, a proposer whose block fails to
+        // reach quorum would never advance rounds again.
+        let timer = Action::SetTimer {
+            id: TimerId::ViewChange,
+            duration: self.current_view_change_timeout(),
+        };
+
         // Check if we're the new proposer for this height/round
         if topology.should_propose(height, self.view) {
             // Check if we've already voted at this height - if so, we're locked
@@ -3722,7 +3731,9 @@ impl BftState {
                     existing_block = ?existing_hash,
                     "Vote-locked at this height, re-proposing"
                 );
-                return self.repropose_locked_block(topology, existing_hash, height);
+                let mut actions = self.repropose_locked_block(topology, existing_hash, height);
+                actions.push(timer);
+                return actions;
             }
 
             info!(
@@ -3733,14 +3744,13 @@ impl BftState {
             );
 
             // Build and broadcast a new block (use fallback block builder)
-            return self.build_and_broadcast_fallback_block(topology, height, self.view);
+            let mut actions = self.build_and_broadcast_fallback_block(topology, height, self.view);
+            actions.push(timer);
+            return actions;
         }
 
-        // Not the proposer - schedule view change timer with backoff
-        vec![Action::SetTimer {
-            id: TimerId::ViewChange,
-            duration: self.current_view_change_timeout(),
-        }]
+        // Not the proposer
+        vec![timer]
     }
 
     /// Called when we receive a QC from a block header that allows us to unlock.
