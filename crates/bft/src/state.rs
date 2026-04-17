@@ -1160,12 +1160,6 @@ impl BftState {
 
         self.record_leader_activity();
 
-        // Track pending proposal for correlation with ProposalBuilt callback.
-        self.pending_proposal = Some(PendingProposal {
-            height: block_height,
-            round,
-        });
-
         let proposal_action = Action::BuildProposal {
             shard_group_id: topology.local_shard(),
             proposer: topology.local_validator_id(),
@@ -1185,12 +1179,25 @@ impl BftState {
             finalized_tx_count: 0,
         };
 
-        // Fallback blocks are always empty (no transactions/receipts), so
-        // build_proposal can compute the state root without JVT access.
-        // Never defer — deferring empty proposals creates a liveness deadlock
-        // when the proposer just exited sync mode (verified_state_roots doesn't
-        // contain the parent, and BlockPersisted hasn't fired yet).
-        vec![proposal_action]
+        // Even empty fallback blocks need the parent root node —
+        // noop_jmt_snapshot copies it to the new version so the overlay chain
+        // stays intact. Defer if the parent tree isn't available yet;
+        // on_jvt_committed will unblock via take_ready_proposal().
+        let mut actions = vec![];
+        if self
+            .verification
+            .parent_tree_available(parent_block_height, parent_hash)
+        {
+            self.pending_proposal = Some(PendingProposal {
+                height: block_height,
+                round,
+            });
+            actions.push(proposal_action);
+        } else {
+            self.verification
+                .defer_proposal(parent_hash, proposal_action);
+        }
+        actions
     }
 
     /// Build and broadcast an empty block while syncing.
@@ -1241,12 +1248,6 @@ impl BftState {
 
         self.record_leader_activity();
 
-        // Track pending proposal for correlation with ProposalBuilt callback.
-        self.pending_proposal = Some(PendingProposal {
-            height: block_height,
-            round,
-        });
-
         let proposal_action = Action::BuildProposal {
             shard_group_id: topology.local_shard(),
             proposer: topology.local_validator_id(),
@@ -1266,10 +1267,25 @@ impl BftState {
             finalized_tx_count: 0,
         };
 
-        // Sync blocks are always empty (no transactions/receipts), so
-        // build_proposal can compute the state root without JVT access.
-        // Never defer — same liveness reasoning as fallback blocks.
-        vec![proposal_action]
+        // Even empty sync blocks need the parent root node — noop_jmt_snapshot
+        // copies it to the new version so the overlay chain stays intact.
+        // Defer if the parent tree isn't available yet; on_jvt_committed will
+        // unblock via take_ready_proposal().
+        let mut actions = vec![];
+        if self
+            .verification
+            .parent_tree_available(parent_block_height, parent_hash)
+        {
+            self.pending_proposal = Some(PendingProposal {
+                height: block_height,
+                round,
+            });
+            actions.push(proposal_action);
+        } else {
+            self.verification
+                .defer_proposal(parent_hash, proposal_action);
+        }
+        actions
     }
 
     /// Re-propose a block we're vote-locked to after a view change.
