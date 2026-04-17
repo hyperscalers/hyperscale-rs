@@ -3,10 +3,9 @@
 //! This module provides [`PooledDispatch`] which schedules work across
 //! priority-isolated rayon thread pools:
 //!
-//! - **Consensus Crypto**: Liveness-critical (block votes, QC verification)
-//! - **Crypto**: General signature verification (provisions, execution votes)
+//! - **Consensus Crypto**: Liveness-critical (block votes, QC verification, state root, proposal building)
+//! - **Crypto**: General signature verification (provisions, execution votes, cert aggregation)
 //! - **TX Validation**: Transaction signature verification (isolated from crypto)
-//! - **State Root**: JVT state root computation and proposal building
 //! - **Execution**: Radix Engine transaction execution
 //!
 //! # Example
@@ -76,16 +75,6 @@ pub struct ThreadPoolConfig {
     /// These run the Radix Engine and are CPU/memory intensive.
     pub execution_threads: usize,
 
-    /// Number of threads for state root computation (JVT updates, proposal building).
-    /// Isolated from consensus crypto so that JVT work does not block
-    /// liveness-critical QC and block vote verification.
-    pub state_root_threads: usize,
-
-    /// Number of threads for provision proof generation and verification.
-    /// Isolated from execution to prevent transaction floods from starving
-    /// time-sensitive provision work.
-    pub provisions_threads: usize,
-
     /// Whether to pin threads to specific CPU cores.
     /// Improves cache locality but reduces flexibility.
     pub pin_cores: bool,
@@ -119,12 +108,10 @@ impl ThreadPoolConfig {
     /// Create a minimal configuration for testing (1 thread per pool).
     pub fn minimal() -> Self {
         Self {
-            consensus_crypto_threads: 1,
-            crypto_threads: 1,
+            consensus_crypto_threads: 2,
+            crypto_threads: 2,
             tx_validation_threads: 1,
-            state_root_threads: 2,
             execution_threads: 1,
-            provisions_threads: 2,
             pin_cores: false,
             consensus_crypto_core_start: None,
             crypto_core_start: None,
@@ -140,21 +127,21 @@ impl ThreadPoolConfig {
         self.consensus_crypto_threads
             + self.crypto_threads
             + self.tx_validation_threads
-            + self.state_root_threads
             + self.execution_threads
-            + self.provisions_threads
     }
 
     /// Validate the configuration.
     pub fn validate(&self) -> Result<(), ThreadPoolError> {
-        if self.consensus_crypto_threads == 0 {
+        if self.consensus_crypto_threads < 2 {
             return Err(ThreadPoolError::InvalidConfig(
-                "consensus_crypto_threads must be at least 1".to_string(),
+                "consensus_crypto_threads must be at least 2 (verify + build concurrently)"
+                    .to_string(),
             ));
         }
-        if self.crypto_threads == 0 {
+        if self.crypto_threads < 2 {
             return Err(ThreadPoolError::InvalidConfig(
-                "crypto_threads must be at least 1".to_string(),
+                "crypto_threads must be at least 2 (cert aggregation + provision proofs)"
+                    .to_string(),
             ));
         }
         if self.tx_validation_threads == 0 {
@@ -162,20 +149,9 @@ impl ThreadPoolConfig {
                 "tx_validation_threads must be at least 1".to_string(),
             ));
         }
-        if self.state_root_threads < 2 {
-            return Err(ThreadPoolError::InvalidConfig(
-                "state_root_threads must be at least 2 (verify + build concurrently)".to_string(),
-            ));
-        }
         if self.execution_threads == 0 {
             return Err(ThreadPoolError::InvalidConfig(
                 "execution_threads must be at least 1".to_string(),
-            ));
-        }
-        if self.provisions_threads < 2 {
-            return Err(ThreadPoolError::InvalidConfig(
-                "provisions_threads must be at least 2 (proactive generation + fallback serving)"
-                    .to_string(),
             ));
         }
 
@@ -190,7 +166,6 @@ impl ThreadPoolConfig {
                 + self.consensus_crypto_threads
                 + self.crypto_threads
                 + self.tx_validation_threads
-                + self.state_root_threads
                 + self.execution_threads;
             if total_needed > available {
                 return Err(ThreadPoolError::InvalidConfig(format!(
@@ -237,21 +212,9 @@ impl ThreadPoolConfigBuilder {
         self
     }
 
-    /// Set the number of state root computation threads (JVT updates, proposal building).
-    pub fn state_root_threads(mut self, count: usize) -> Self {
-        self.config.state_root_threads = count;
-        self
-    }
-
     /// Set the number of execution threads.
     pub fn execution_threads(mut self, count: usize) -> Self {
         self.config.execution_threads = count;
-        self
-    }
-
-    /// Set the number of provision threads (IPA proof generation/verification).
-    pub fn provisions_threads(mut self, count: usize) -> Self {
-        self.config.provisions_threads = count;
         self
     }
 
@@ -325,7 +288,6 @@ impl Default for ThreadPoolConfigBuilder {
 /// - Consensus crypto pool (block votes, QC verification) — liveness-critical
 /// - General crypto pool (provisions, execution votes)
 /// - TX validation pool (transaction signatures) — isolated from crypto
-/// - State root pool (JVT updates, proposal building) — isolated from consensus crypto
 /// - Execution pool (Radix Engine)
 ///
 /// Spawned closures are automatically wrapped in `rayon::ThreadPool::install()`,
@@ -336,15 +298,11 @@ pub struct PooledDispatch {
     consensus_crypto_pool: Arc<rayon::ThreadPool>,
     crypto_pool: Arc<rayon::ThreadPool>,
     tx_validation_pool: Arc<rayon::ThreadPool>,
-    state_root_pool: Arc<rayon::ThreadPool>,
     execution_pool: Arc<rayon::ThreadPool>,
-    provisions_pool: Arc<rayon::ThreadPool>,
     consensus_crypto_pending: Arc<AtomicUsize>,
     crypto_pending: Arc<AtomicUsize>,
     tx_validation_pending: Arc<AtomicUsize>,
-    state_root_pending: Arc<AtomicUsize>,
     execution_pending: Arc<AtomicUsize>,
-    provisions_pending: Arc<AtomicUsize>,
 }
 
 impl PooledDispatch {
@@ -355,17 +313,13 @@ impl PooledDispatch {
         let consensus_crypto_pool = Arc::new(Self::build_consensus_crypto_pool(&config)?);
         let crypto_pool = Arc::new(Self::build_crypto_pool(&config)?);
         let tx_validation_pool = Arc::new(Self::build_tx_validation_pool(&config)?);
-        let state_root_pool = Arc::new(Self::build_state_root_pool(&config)?);
         let execution_pool = Arc::new(Self::build_execution_pool(&config)?);
-        let provisions_pool = Arc::new(Self::build_provisions_pool(&config)?);
 
         tracing::info!(
             consensus_crypto_threads = config.consensus_crypto_threads,
             crypto_threads = config.crypto_threads,
             tx_validation_threads = config.tx_validation_threads,
-            state_root_threads = config.state_root_threads,
             execution_threads = config.execution_threads,
-            provisions_threads = config.provisions_threads,
             pin_cores = config.pin_cores,
             "Thread pools initialized"
         );
@@ -375,15 +329,11 @@ impl PooledDispatch {
             consensus_crypto_pool,
             crypto_pool,
             tx_validation_pool,
-            state_root_pool,
             execution_pool,
-            provisions_pool,
             consensus_crypto_pending: Arc::new(AtomicUsize::new(0)),
             crypto_pending: Arc::new(AtomicUsize::new(0)),
             tx_validation_pending: Arc::new(AtomicUsize::new(0)),
-            state_root_pending: Arc::new(AtomicUsize::new(0)),
             execution_pending: Arc::new(AtomicUsize::new(0)),
-            provisions_pending: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -449,28 +399,6 @@ impl PooledDispatch {
             .num_threads(config.tx_validation_threads)
             .stack_size(config.crypto_stack_size)
             .thread_name(|i| format!("tx-val-{}", i))
-            .build()
-            .map_err(|e| ThreadPoolError::RayonBuildError(e.to_string()))
-    }
-
-    fn build_state_root_pool(
-        config: &ThreadPoolConfig,
-    ) -> Result<rayon::ThreadPool, ThreadPoolError> {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(config.state_root_threads)
-            .stack_size(config.crypto_stack_size)
-            .thread_name(|i| format!("state-root-{}", i))
-            .build()
-            .map_err(|e| ThreadPoolError::RayonBuildError(e.to_string()))
-    }
-
-    fn build_provisions_pool(
-        config: &ThreadPoolConfig,
-    ) -> Result<rayon::ThreadPool, ThreadPoolError> {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(config.provisions_threads)
-            .stack_size(config.crypto_stack_size)
-            .thread_name(|i| format!("provisions-{}", i))
             .build()
             .map_err(|e| ThreadPoolError::RayonBuildError(e.to_string()))
     }
@@ -555,18 +483,6 @@ impl Dispatch for PooledDispatch {
         });
     }
 
-    fn spawn_state_root(&self, f: impl FnOnce() + Send + 'static) {
-        self.state_root_pending.fetch_add(1, Ordering::Relaxed);
-        let pending = self.state_root_pending.clone();
-        let pool = Arc::clone(&self.state_root_pool);
-        self.state_root_pool.spawn_fifo(move || {
-            let start = std::time::Instant::now();
-            pool.install(f);
-            pending.fetch_sub(1, Ordering::Relaxed);
-            metrics::record_pool_task_completed("state_root", start.elapsed().as_secs_f64());
-        });
-    }
-
     #[instrument(level = "debug", skip_all)]
     fn spawn_execution(&self, f: impl FnOnce() + Send + 'static) {
         self.execution_pending.fetch_add(1, Ordering::Relaxed);
@@ -592,28 +508,8 @@ impl Dispatch for PooledDispatch {
         self.tx_validation_pending.load(Ordering::Relaxed)
     }
 
-    fn state_root_queue_depth(&self) -> usize {
-        self.state_root_pending.load(Ordering::Relaxed)
-    }
-
     fn execution_queue_depth(&self) -> usize {
         self.execution_pending.load(Ordering::Relaxed)
-    }
-
-    fn spawn_provisions(&self, f: impl FnOnce() + Send + 'static) {
-        self.provisions_pending.fetch_add(1, Ordering::Relaxed);
-        let pending = self.provisions_pending.clone();
-        let pool = Arc::clone(&self.provisions_pool);
-        self.provisions_pool.spawn_fifo(move || {
-            let start = std::time::Instant::now();
-            pool.install(f);
-            pending.fetch_sub(1, Ordering::Relaxed);
-            metrics::record_pool_task_completed("provisions", start.elapsed().as_secs_f64());
-        });
-    }
-
-    fn provisions_queue_depth(&self) -> usize {
-        self.provisions_pending.load(Ordering::Relaxed)
     }
 }
 
@@ -650,8 +546,8 @@ mod tests {
     #[test]
     fn test_minimal_config() {
         let config = ThreadPoolConfig::minimal();
-        assert_eq!(config.consensus_crypto_threads, 1);
-        assert_eq!(config.crypto_threads, 1);
+        assert_eq!(config.consensus_crypto_threads, 2);
+        assert_eq!(config.crypto_threads, 2);
         assert_eq!(config.tx_validation_threads, 1);
         assert_eq!(config.execution_threads, 1);
         config.validate().unwrap();
@@ -701,8 +597,8 @@ mod tests {
         let config = ThreadPoolConfig::minimal();
         let dispatch = PooledDispatch::new(config).unwrap();
 
-        assert_eq!(dispatch.config().consensus_crypto_threads, 1);
-        assert_eq!(dispatch.config().crypto_threads, 1);
+        assert_eq!(dispatch.config().consensus_crypto_threads, 2);
+        assert_eq!(dispatch.config().crypto_threads, 2);
         assert_eq!(dispatch.config().execution_threads, 1);
     }
 
@@ -753,11 +649,9 @@ mod tests {
             .consensus_crypto_threads(2)
             .crypto_threads(4)
             .tx_validation_threads(3)
-            .state_root_threads(2)
             .execution_threads(6)
-            .provisions_threads(2)
             .build_unchecked();
 
-        assert_eq!(config.total_threads(), 19); // 2 + 4 + 3 + 2 + 6 + 2
+        assert_eq!(config.total_threads(), 15); // 2 + 4 + 3 + 6
     }
 }

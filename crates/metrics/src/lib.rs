@@ -249,9 +249,7 @@ pub trait MetricsRecorder: Send + Sync + 'static {
         consensus_crypto: usize,
         crypto: usize,
         tx_validation: usize,
-        state_root: usize,
         execution: usize,
-        provisions: usize,
     ) {
     }
 
@@ -541,18 +539,9 @@ pub fn set_pool_queue_depths(
     consensus_crypto: usize,
     crypto: usize,
     tx_validation: usize,
-    state_root: usize,
     execution: usize,
-    provisions: usize,
 ) {
-    recorder().set_pool_queue_depths(
-        consensus_crypto,
-        crypto,
-        tx_validation,
-        state_root,
-        execution,
-        provisions,
-    );
+    recorder().set_pool_queue_depths(consensus_crypto, crypto, tx_validation, execution);
 }
 
 /// Record a completed pool task with its duration.

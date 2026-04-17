@@ -36,15 +36,7 @@ impl Dispatch for SyncDispatch {
         f();
     }
 
-    fn spawn_state_root(&self, f: impl FnOnce() + Send + 'static) {
-        f();
-    }
-
     fn spawn_execution(&self, f: impl FnOnce() + Send + 'static) {
-        f();
-    }
-
-    fn spawn_provisions(&self, f: impl FnOnce() + Send + 'static) {
         f();
     }
 
@@ -60,15 +52,7 @@ impl Dispatch for SyncDispatch {
         0
     }
 
-    fn state_root_queue_depth(&self) -> usize {
-        0
-    }
-
     fn execution_queue_depth(&self) -> usize {
-        0
-    }
-
-    fn provisions_queue_depth(&self) -> usize {
         0
     }
 }

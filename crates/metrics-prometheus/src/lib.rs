@@ -45,9 +45,7 @@ pub struct Metrics {
     pub consensus_crypto_pool_queue_depth: Gauge,
     pub crypto_pool_queue_depth: Gauge,
     pub tx_validation_pool_queue_depth: Gauge,
-    pub state_root_pool_queue_depth: Gauge,
     pub execution_pool_queue_depth: Gauge,
-    pub provisions_pool_queue_depth: Gauge,
     pub pool_task_duration: HistogramVec,
 
     // === Event Channel Depths ===
@@ -263,21 +261,9 @@ impl Metrics {
             )
             .unwrap(),
 
-            state_root_pool_queue_depth: register_gauge!(
-                "hyperscale_state_root_pool_queue_depth",
-                "Number of pending tasks in state root pool (JVT updates, proposal building)"
-            )
-            .unwrap(),
-
             execution_pool_queue_depth: register_gauge!(
                 "hyperscale_execution_pool_queue_depth",
                 "Number of pending tasks in execution pool"
-            )
-            .unwrap(),
-
-            provisions_pool_queue_depth: register_gauge!(
-                "hyperscale_provisions_pool_queue_depth",
-                "Number of pending tasks in provisions pool (proof generation/verification)"
             )
             .unwrap(),
 
@@ -799,9 +785,7 @@ impl MetricsRecorder for PrometheusRecorder {
         consensus_crypto: usize,
         crypto: usize,
         tx_validation: usize,
-        state_root: usize,
         execution: usize,
-        provisions: usize,
     ) {
         self.metrics
             .consensus_crypto_pool_queue_depth
@@ -811,14 +795,8 @@ impl MetricsRecorder for PrometheusRecorder {
             .tx_validation_pool_queue_depth
             .set(tx_validation as f64);
         self.metrics
-            .state_root_pool_queue_depth
-            .set(state_root as f64);
-        self.metrics
             .execution_pool_queue_depth
             .set(execution as f64);
-        self.metrics
-            .provisions_pool_queue_depth
-            .set(provisions as f64);
     }
 
     fn record_pool_task_completed(&self, pool: &str, latency_secs: f64) {

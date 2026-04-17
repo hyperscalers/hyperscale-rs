@@ -338,12 +338,6 @@ pub struct ThreadsConfig {
     #[serde(default)]
     pub tx_validation_threads: usize,
 
-    /// Number of state root computation threads (0 = auto).
-    /// Isolated from consensus crypto so JVT updates don't block
-    /// liveness-critical QC and block vote verification.
-    #[serde(default)]
-    pub state_root_threads: usize,
-
     /// Number of execution threads (0 = auto)
     #[serde(default)]
     pub execution_threads: usize,
@@ -841,32 +835,27 @@ fn build_engine_genesis_config(config: &GenesisConfig) -> Result<hyperscale_engi
 /// - Crypto: remainder (provisions, execution votes, certificate verification)
 ///
 /// On systems with fewer than 8 cores, all variable pools get 1 thread each.
-fn for_core_count(total_cores: usize) -> (usize, usize, usize, usize, usize) {
-    // Reserve 1 core for state machine + 2 for consensus crypto.
-    // Floor at 7 so small machines still get minimum threads per pool (over-subscribing is fine).
-    // 7 = 2 (consensus crypto) + 1 (crypto) + 1 (tx validation) + 2 (state root) + 1 (execution)
-    let pool_budget = total_cores.saturating_sub(3).max(7);
+fn for_core_count(total_cores: usize) -> (usize, usize, usize, usize) {
+    // Reserve 1 core for state machine.
+    // Floor at 6 so small machines still get minimum threads per pool (over-subscribing is fine).
+    // 6 = 2 (consensus crypto) + 2 (crypto) + 1 (tx validation) + 1 (execution)
+    let pool_budget = total_cores.saturating_sub(1).max(6);
 
-    if pool_budget <= 7 {
-        // Minimum viable: 2 consensus crypto + 2 state root + 1 each for other pools
-        (2, 1, 1, 2, 1)
+    if pool_budget <= 6 {
+        // Minimum viable: 2 consensus crypto + 2 crypto + 1 each for other pools
+        (2, 2, 1, 1)
     } else {
+        // Execution is the bottleneck (~80% utilization in production);
+        // crypto pools are lightly loaded (<5%). Give execution the lion's share.
         let consensus_crypto = 2;
-        let state_root = (pool_budget * 15 / 100).max(2);
-        let execution = (pool_budget * 25 / 100).max(1);
-        let tx_validation = (pool_budget * 15 / 100).max(1);
-        let crypto = pool_budget
-            .saturating_sub(state_root)
-            .saturating_sub(execution)
+        let crypto = 2;
+        let tx_validation = (pool_budget * 10 / 100).max(1);
+        let execution = pool_budget
+            .saturating_sub(consensus_crypto)
+            .saturating_sub(crypto)
             .saturating_sub(tx_validation)
             .max(1);
-        (
-            consensus_crypto,
-            crypto,
-            tx_validation,
-            state_root,
-            execution,
-        )
+        (consensus_crypto, crypto, tx_validation, execution)
     }
 }
 
@@ -880,19 +869,17 @@ fn build_thread_pool_config(config: &ThreadsConfig) -> ThreadPoolConfig {
     let all_auto = config.consensus_crypto_threads == 0
         && config.crypto_threads == 0
         && config.tx_validation_threads == 0
-        && config.state_root_threads == 0
         && config.execution_threads == 0;
 
     let mut builder = if all_auto {
         let available = std::thread::available_parallelism()
             .map(std::num::NonZeroUsize::get)
             .unwrap_or(4);
-        let (cc, crypto, tx_val, state_root, exec) = for_core_count(available);
+        let (cc, crypto, tx_val, exec) = for_core_count(available);
         ThreadPoolConfig::builder()
             .consensus_crypto_threads(cc)
             .crypto_threads(crypto)
             .tx_validation_threads(tx_val)
-            .state_root_threads(state_root)
             .execution_threads(exec)
     } else {
         let mut b = ThreadPoolConfig::builder();
@@ -904,9 +891,6 @@ fn build_thread_pool_config(config: &ThreadsConfig) -> ThreadPoolConfig {
         }
         if config.tx_validation_threads > 0 {
             b = b.tx_validation_threads(config.tx_validation_threads);
-        }
-        if config.state_root_threads > 0 {
-            b = b.state_root_threads(config.state_root_threads);
         }
         if config.execution_threads > 0 {
             b = b.execution_threads(config.execution_threads);
@@ -1438,51 +1422,37 @@ mod tests {
 
     #[test]
     fn test_for_core_count() {
-        // 6 cores: pool_budget = max(6-3, 7) = 7, minimum viable mode
-        let (cc, crypto, tx_val, sr, exec) = for_core_count(6);
+        // 4 cores: pool_budget = max(4-1, 6) = 6, minimum viable mode
+        let (cc, crypto, tx_val, exec) = for_core_count(4);
         assert_eq!(cc, 2);
-        assert_eq!(crypto, 1);
+        assert_eq!(crypto, 2);
         assert_eq!(tx_val, 1);
-        assert_eq!(sr, 2);
         assert_eq!(exec, 1);
 
-        // 12 cores: pool_budget = 9 (percentage mode)
-        // state_root 15% = 2 (min 2), execution 25% = 2, tx_validation 15% = 1, crypto = remainder = 4
-        let (cc, crypto, tx_val, sr, exec) = for_core_count(12);
+        // 12 cores: pool_budget = 11
+        // cc=2, crypto=2, tx_val=10%=1, execution=remainder=6
+        let (cc, crypto, tx_val, exec) = for_core_count(12);
         assert_eq!(cc, 2);
-        assert_eq!(crypto, 4);
+        assert_eq!(crypto, 2);
         assert_eq!(tx_val, 1);
-        assert_eq!(sr, 2);
-        assert_eq!(exec, 2);
+        assert_eq!(exec, 6);
 
-        // 18 cores: pool_budget = 15
-        // state_root 15% = 2, execution 25% = 3, tx_validation 15% = 2, crypto = remainder = 8
-        let (cc, crypto, tx_val, sr, exec) = for_core_count(18);
+        // 32 cores: pool_budget = 31
+        // cc=2, crypto=2, tx_val=10%=3, execution=remainder=24
+        let (cc, crypto, tx_val, exec) = for_core_count(32);
         assert_eq!(cc, 2);
-        assert_eq!(crypto, 8);
-        assert_eq!(tx_val, 2);
-        assert_eq!(sr, 2);
-        assert_eq!(exec, 3);
-
-        // 32 cores: pool_budget = 29
-        // state_root 15% = 4, execution 25% = 7, tx_validation 15% = 4, crypto = remainder = 14
-        let (cc, crypto, tx_val, sr, exec) = for_core_count(32);
-        assert_eq!(cc, 2);
-        assert_eq!(crypto, 14);
-        assert_eq!(tx_val, 4);
-        assert_eq!(sr, 4);
-        assert_eq!(exec, 7);
+        assert_eq!(crypto, 2);
+        assert_eq!(tx_val, 3);
+        assert_eq!(exec, 24);
     }
 
     #[test]
     fn test_build_thread_pool_config_auto() {
         let config = ThreadsConfig::default();
         let pool_config = build_thread_pool_config(&config);
-        // All auto → should have at least 1 thread per pool
-        assert!(pool_config.consensus_crypto_threads >= 1);
-        assert!(pool_config.crypto_threads >= 1);
+        assert!(pool_config.consensus_crypto_threads >= 2);
+        assert!(pool_config.crypto_threads >= 2);
         assert!(pool_config.tx_validation_threads >= 1);
-        assert!(pool_config.state_root_threads >= 1);
         assert!(pool_config.execution_threads >= 1);
     }
 
@@ -1492,7 +1462,6 @@ mod tests {
             consensus_crypto_threads: 3,
             crypto_threads: 8,
             tx_validation_threads: 4,
-            state_root_threads: 2,
             execution_threads: 10,
             io_threads: 0,
             pin_cores: false,
@@ -1501,7 +1470,6 @@ mod tests {
         assert_eq!(pool_config.consensus_crypto_threads, 3);
         assert_eq!(pool_config.crypto_threads, 8);
         assert_eq!(pool_config.tx_validation_threads, 4);
-        assert_eq!(pool_config.state_root_threads, 2);
         assert_eq!(pool_config.execution_threads, 10);
     }
 }

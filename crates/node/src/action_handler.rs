@@ -50,16 +50,13 @@ pub(crate) struct PreparedBlock<P: Send> {
 
 /// Which dispatch pool an action should run on in production.
 pub(crate) enum DispatchPool {
-    /// Liveness-critical consensus crypto (QC verification, block votes).
+    /// Liveness-critical consensus crypto (QC verification, block votes,
+    /// state root verification, proposal building).
     ConsensusCrypto,
-    /// General crypto verification (cert aggregation).
+    /// General crypto verification (cert aggregation, provision proofs).
     Crypto,
-    /// State root computation (JVT updates, proposal building).
-    StateRoot,
     /// Transaction execution (single-shard, merkle).
     Execution,
-    /// Provision proof generation and verification (IPA math).
-    Provision,
 }
 
 /// Map a delegated action to its execution pool.
@@ -68,7 +65,7 @@ pub(crate) enum DispatchPool {
 /// and should be handled by the runner directly.
 pub(crate) fn dispatch_pool_for(action: &Action) -> Option<DispatchPool> {
     match action {
-        // Consensus-critical crypto
+        // Consensus-critical crypto + state root computation
         Action::VerifyAndBuildQuorumCertificate { .. } => Some(DispatchPool::ConsensusCrypto),
         Action::VerifyQcSignature { .. } => Some(DispatchPool::ConsensusCrypto),
         Action::VerifyRemoteHeaderQc { .. } => Some(DispatchPool::ConsensusCrypto),
@@ -76,21 +73,15 @@ pub(crate) fn dispatch_pool_for(action: &Action) -> Option<DispatchPool> {
         Action::VerifyProvisionRoot { .. } => Some(DispatchPool::ConsensusCrypto),
         Action::VerifyCertificateRoot { .. } => Some(DispatchPool::ConsensusCrypto),
         Action::VerifyLocalReceiptRoot { .. } => Some(DispatchPool::ConsensusCrypto),
+        Action::VerifyStateRoot { .. } => Some(DispatchPool::ConsensusCrypto),
+        Action::BuildProposal { .. } => Some(DispatchPool::ConsensusCrypto),
 
-        // State root computation — JVT traversal, isolated from consensus crypto
-        // so that slow tree updates don't block liveness-critical QC verification.
-        Action::VerifyStateRoot { .. } => Some(DispatchPool::StateRoot),
-        Action::BuildProposal { .. } => Some(DispatchPool::StateRoot),
-
-        // General crypto
+        // General crypto (cert aggregation, provision proofs)
         Action::AggregateExecutionCertificate { .. } => Some(DispatchPool::Crypto),
         Action::VerifyAndAggregateExecutionVotes { .. } => Some(DispatchPool::Crypto),
         Action::VerifyExecutionCertificateSignature { .. } => Some(DispatchPool::Crypto),
-
-        // Provision work: IPA proof generation and verification.
-        // Dedicated pool to avoid starving execution and crypto work.
-        Action::VerifyProvision { .. } => Some(DispatchPool::Provision),
-        Action::FetchAndBroadcastProvision { .. } => Some(DispatchPool::Provision),
+        Action::VerifyProvision { .. } => Some(DispatchPool::Crypto),
+        Action::FetchAndBroadcastProvision { .. } => Some(DispatchPool::Crypto),
 
         // Execution
         Action::ExecuteTransactions { .. } => Some(DispatchPool::Execution),

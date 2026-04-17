@@ -353,7 +353,6 @@ rpc_mempool_limit = 32768
 consensus_crypto_threads = 0
 crypto_threads = $CRYPTO_THREADS
 tx_validation_threads = 0
-state_root_threads = 0
 execution_threads = $EXECUTION_THREADS
 io_threads = $IO_THREADS
 pin_cores = false
