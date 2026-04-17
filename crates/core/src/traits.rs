@@ -18,7 +18,7 @@ use std::time::Duration;
 /// impl StateMachine for NodeStateMachine {
 ///     fn handle(&mut self, event: ProtocolEvent) -> Vec<Action> {
 ///         match event {
-///             ProtocolEvent::ProposalTimer => self.bft.on_proposal_timer(),
+///             ProtocolEvent::ContentAvailable => self.try_propose(),
 ///             ProtocolEvent::BlockVoteReceived { vote } => {
 ///                 self.bft.on_block_vote(vote)
 ///             }

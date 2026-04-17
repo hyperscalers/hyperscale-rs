@@ -41,9 +41,12 @@ pub enum ProtocolEvent {
     // ═══════════════════════════════════════════════════════════════════════
     // Timers
     // ═══════════════════════════════════════════════════════════════════════
-    /// Time to propose a new block (if this node is the proposer).
-    /// Also used for implicit round advancement when no QC is formed.
-    ProposalTimer,
+    /// View change timeout fired — check if the leader has timed out.
+    ViewChangeTimer,
+
+    /// New proposable content is available (transactions, finalized waves, or provisions).
+    /// Triggers event-driven proposal building.
+    ContentAvailable,
 
     /// Periodic cleanup of stale state.
     CleanupTimer,
@@ -370,7 +373,8 @@ impl ProtocolEvent {
     pub fn type_name(&self) -> &'static str {
         match self {
             // Timers
-            ProtocolEvent::ProposalTimer => "ProposalTimer",
+            ProtocolEvent::ViewChangeTimer => "ViewChangeTimer",
+            ProtocolEvent::ContentAvailable => "ContentAvailable",
             ProtocolEvent::CleanupTimer => "CleanupTimer",
             ProtocolEvent::GlobalConsensusTimer => "GlobalConsensusTimer",
 

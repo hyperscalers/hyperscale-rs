@@ -47,7 +47,7 @@ fn test_schedule_initial_events() {
         runner.schedule_initial_event(
             node,
             Duration::from_millis(100),
-            NodeInput::Protocol(hyperscale_core::ProtocolEvent::ProposalTimer),
+            NodeInput::Protocol(hyperscale_core::ProtocolEvent::ContentAvailable),
         );
     }
 
@@ -74,7 +74,7 @@ fn test_determinism_same_seed() {
         runner1.schedule_initial_event(
             node,
             Duration::from_millis(100),
-            NodeInput::Protocol(hyperscale_core::ProtocolEvent::ProposalTimer),
+            NodeInput::Protocol(hyperscale_core::ProtocolEvent::ContentAvailable),
         );
     }
     runner1.run_until(Duration::from_secs(1));
@@ -86,7 +86,7 @@ fn test_determinism_same_seed() {
         runner2.schedule_initial_event(
             node,
             Duration::from_millis(100),
-            NodeInput::Protocol(hyperscale_core::ProtocolEvent::ProposalTimer),
+            NodeInput::Protocol(hyperscale_core::ProtocolEvent::ContentAvailable),
         );
     }
     runner2.run_until(Duration::from_secs(1));
@@ -122,7 +122,7 @@ fn test_different_seeds_diverge() {
         runner1.schedule_initial_event(
             node,
             Duration::from_millis(100),
-            NodeInput::Protocol(hyperscale_core::ProtocolEvent::ProposalTimer),
+            NodeInput::Protocol(hyperscale_core::ProtocolEvent::ContentAvailable),
         );
     }
     runner1.run_until(Duration::from_secs(1));
@@ -133,7 +133,7 @@ fn test_different_seeds_diverge() {
         runner2.schedule_initial_event(
             node,
             Duration::from_millis(100),
-            NodeInput::Protocol(hyperscale_core::ProtocolEvent::ProposalTimer),
+            NodeInput::Protocol(hyperscale_core::ProtocolEvent::ContentAvailable),
         );
     }
     runner2.run_until(Duration::from_secs(1));
@@ -170,7 +170,7 @@ fn test_multi_shard_simulation() {
         runner.schedule_initial_event(
             node,
             Duration::from_millis(100),
-            NodeInput::Protocol(hyperscale_core::ProtocolEvent::ProposalTimer),
+            NodeInput::Protocol(hyperscale_core::ProtocolEvent::ContentAvailable),
         );
     }
 
@@ -183,12 +183,12 @@ fn test_multi_shard_simulation() {
     );
 }
 
-/// Test that round advancement happens via proposal timer (HotStuff-2 style).
+/// Test that round advancement happens via view change timer (HotStuff-2 style).
 ///
-/// View changes are now implicit - when no QC forms within the timeout,
-/// the proposal timer triggers round advancement.
+/// View changes are triggered by the ViewChange timer when the leader
+/// fails to produce a QC within the timeout.
 #[test]
-fn test_round_advancement_via_proposal_timer() {
+fn test_round_advancement_via_view_change_timer() {
     let config = test_network_config();
     let mut runner = SimulationRunner::new(config, 42);
 
@@ -197,7 +197,7 @@ fn test_round_advancement_via_proposal_timer() {
         runner.schedule_initial_event(
             node,
             Duration::from_millis(100),
-            NodeInput::Protocol(hyperscale_core::ProtocolEvent::ProposalTimer),
+            NodeInput::Protocol(hyperscale_core::ProtocolEvent::ContentAvailable),
         );
     }
 
@@ -216,32 +216,24 @@ fn test_extended_simulation() {
     let config = test_network_config();
     let mut runner = SimulationRunner::new(config, 42);
 
-    // Schedule initial proposal timers
-    for node in 0..4 {
-        runner.schedule_initial_event(
-            node,
-            Duration::from_millis(100),
-            NodeInput::Protocol(hyperscale_core::ProtocolEvent::ProposalTimer),
-        );
-    }
+    // Initialize genesis — sets up ViewChange timers and initial ContentAvailable
+    runner.initialize_genesis();
 
     // Run for 10 seconds of simulated time
     runner.run_until(Duration::from_secs(10));
 
     let stats = runner.stats();
 
-    // With proposal timers every 100ms for 4 nodes over 10 seconds,
-    // we should see significant activity
     println!("Extended simulation stats:");
     println!("  Events processed: {}", stats.events_processed);
     println!("  Actions generated: {}", stats.actions_generated);
     println!("  Messages sent: {}", stats.messages_sent);
     println!("  Timers set: {}", stats.timers_set);
 
-    // Basic sanity checks
+    // With view change timers and event-driven proposals, we should see activity
     assert!(
-        stats.events_processed > 10,
-        "Should have processed many events"
+        stats.events_processed > 4,
+        "Should have processed events from all nodes"
     );
     assert!(stats.timers_set > 0, "Should have set some timers");
 }
@@ -258,7 +250,7 @@ fn test_extended_simulation_determinism() {
         runner1.schedule_initial_event(
             node,
             Duration::from_millis(100),
-            NodeInput::Protocol(hyperscale_core::ProtocolEvent::ProposalTimer),
+            NodeInput::Protocol(hyperscale_core::ProtocolEvent::ContentAvailable),
         );
     }
     runner1.run_until(Duration::from_secs(5));
@@ -270,7 +262,7 @@ fn test_extended_simulation_determinism() {
         runner2.schedule_initial_event(
             node,
             Duration::from_millis(100),
-            NodeInput::Protocol(hyperscale_core::ProtocolEvent::ProposalTimer),
+            NodeInput::Protocol(hyperscale_core::ProtocolEvent::ContentAvailable),
         );
     }
     runner2.run_until(Duration::from_secs(5));
@@ -298,7 +290,7 @@ fn test_genesis_initialization() {
     // Initialize genesis - this should set proposal timers for all nodes
     runner.initialize_genesis();
 
-    // Run for a short time (must be longer than proposal_interval of 300ms)
+    // Run for a short time to allow initial events to process
     runner.run_until(Duration::from_millis(500));
 
     let stats = runner.stats();

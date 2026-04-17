@@ -177,9 +177,13 @@ impl NodeInput {
             // Timers and network-received messages are classified explicitly;
             // everything else (callbacks, continuations, completions) defaults to Internal.
             NodeInput::Protocol(pe) => match pe {
-                ProtocolEvent::ProposalTimer
+                ProtocolEvent::ViewChangeTimer
                 | ProtocolEvent::CleanupTimer
                 | ProtocolEvent::GlobalConsensusTimer => EventPriority::Timer,
+
+                // ContentAvailable is an internal signal (from continuations
+                // or rate-limit retry timers), not a network or timer event.
+                ProtocolEvent::ContentAvailable => EventPriority::Internal,
 
                 ProtocolEvent::BlockHeaderReceived { .. }
                 | ProtocolEvent::RemoteBlockCommitted { .. }

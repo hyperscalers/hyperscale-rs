@@ -12,8 +12,10 @@ use std::time::Duration;
 /// Timer identification for scheduled events.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TimerId {
-    /// Block proposal timer (also used for implicit round advancement)
-    Proposal,
+    /// View change timeout — one-shot, reset on leader activity.
+    ViewChange,
+    /// Rate-limit retry — one-shot, fires when min_block_interval expires.
+    RateLimitRetry,
     /// Periodic cleanup timer
     Cleanup,
     /// Global consensus timer (epoch management)
@@ -26,7 +28,8 @@ impl TimerId {
     /// Convert this timer ID to the corresponding [`NodeInput`] event.
     pub fn into_event(self) -> NodeInput {
         match self {
-            TimerId::Proposal => NodeInput::Protocol(ProtocolEvent::ProposalTimer),
+            TimerId::ViewChange => NodeInput::Protocol(ProtocolEvent::ViewChangeTimer),
+            TimerId::RateLimitRetry => NodeInput::Protocol(ProtocolEvent::ContentAvailable),
             TimerId::Cleanup => NodeInput::Protocol(ProtocolEvent::CleanupTimer),
             TimerId::GlobalConsensus => NodeInput::Protocol(ProtocolEvent::GlobalConsensusTimer),
             TimerId::FetchTick => NodeInput::FetchTick,

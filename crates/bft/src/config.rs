@@ -5,9 +5,6 @@ use std::time::Duration;
 /// BFT consensus configuration.
 #[derive(Debug, Clone)]
 pub struct BftConfig {
-    /// Interval between proposal attempts.
-    pub proposal_interval: Duration,
-
     /// Base timeout for view change (before backoff).
     pub view_change_timeout: Duration,
 
@@ -90,7 +87,6 @@ pub struct BftConfig {
 impl Default for BftConfig {
     fn default() -> Self {
         Self {
-            proposal_interval: Duration::from_millis(1000),
             view_change_timeout: Duration::from_secs(5),
             view_change_timeout_increment: Duration::from_millis(1000),
             view_change_timeout_max: Some(Duration::from_secs(30)),
@@ -112,12 +108,6 @@ impl BftConfig {
     /// Create a new BFT configuration with default values.
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// Set the proposal interval.
-    pub fn with_proposal_interval(mut self, interval: Duration) -> Self {
-        self.proposal_interval = interval;
-        self
     }
 
     /// Set the view change timeout.

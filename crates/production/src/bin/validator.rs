@@ -924,7 +924,6 @@ fn build_thread_pool_config(config: &ThreadsConfig) -> ThreadPoolConfig {
 /// Build BFT configuration from TOML config.
 fn build_bft_config(config: &ConsensusConfig) -> BftConfig {
     BftConfig::new()
-        .with_proposal_interval(Duration::from_millis(config.proposal_interval_ms))
         .with_view_change_timeout(Duration::from_millis(config.view_change_timeout_ms))
         .with_max_transactions(config.max_transactions_per_block)
         .with_max_finalized_transactions(config.max_finalized_transactions_per_block)

@@ -688,7 +688,7 @@ impl ProductionRunner {
         io_loop.handle_actions(actions);
         io_loop.flush_all_batches();
 
-        // Drain timer ops from genesis actions (includes ProposalTimer).
+        // Drain timer ops from genesis actions (includes ViewChange timer).
         let genesis_output = io_loop.drain_pending_output();
         let mut timer_ops = genesis_output.timer_ops;
 

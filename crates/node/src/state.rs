@@ -67,7 +67,7 @@ impl std::fmt::Debug for NodeStateMachine {
 
 /// Inputs gathered for building a block proposal.
 ///
-/// Used by both `ProposalTimer` and `QuorumCertificateFormed` handlers
+/// Used by both `ContentAvailable` and `QuorumCertificateFormed` handlers
 /// to avoid duplicating the ready-transaction gathering logic.
 struct ProposalInputs {
     ready_txs: ReadyTransactions,
@@ -225,23 +225,33 @@ impl NodeStateMachine {
         actions
     }
 
-    /// Handle proposal timer — propose a block or advance the round on timeout.
-    fn on_proposal_timer(&mut self) -> Vec<Action> {
-        // Check if we should advance the round due to timeout.
-        // Delegated to BftState which owns timeout tracking.
-        if let Some(actions) = self.bft.check_round_timeout(self.topology.snapshot()) {
-            return actions;
+    /// Handle view change timer — check if the leader has timed out.
+    fn on_view_change_timer(&mut self) -> Vec<Action> {
+        match self.bft.check_round_timeout(self.topology.snapshot()) {
+            Some(actions) => actions,
+            None => {
+                // Conditions not met yet. Reschedule for the remaining time
+                // until the actual timeout fires (relative to last_leader_activity).
+                let remaining = self.bft.remaining_view_change_timeout();
+                vec![Action::SetTimer {
+                    id: TimerId::ViewChange,
+                    duration: remaining,
+                }]
+            }
         }
+    }
 
-        // Normal proposal timer - try to propose if we're the proposer
-        //
-        // Account for pipelining: multiple blocks can be proposed before any commit.
-        // We must count txs/certs in ALL pending blocks to avoid exceeding in-flight limits.
+    /// Handle content available — try to propose if we're the proposer.
+    fn on_content_available(&mut self) -> Vec<Action> {
+        self.try_event_driven_proposal()
+    }
+
+    /// Shared proposal logic for ContentAvailable and QC-formed paths.
+    fn try_event_driven_proposal(&mut self) -> Vec<Action> {
         let (pending_txs, pending_certs) = self.bft.pending_block_counts();
-
         let inputs = self.gather_proposal_inputs(pending_txs, pending_certs);
 
-        self.bft.on_proposal_timer(
+        self.bft.try_propose(
             self.topology.snapshot(),
             &inputs.ready_txs,
             inputs.finalized_waves,
@@ -389,6 +399,10 @@ impl NodeStateMachine {
         // the same votes.
         actions.extend(self.execution.emit_vote_actions(self.topology.snapshot()));
 
+        // Block committed changes in-flight counts — trigger proposal attempt
+        // so the next proposer can include newly ready transactions.
+        actions.push(Action::Continuation(ProtocolEvent::ContentAvailable));
+
         actions
     }
 
@@ -455,6 +469,9 @@ impl NodeStateMachine {
             &tx_for_pending,
         ));
 
+        // New transaction available — signal for event-driven proposal.
+        actions.push(Action::Continuation(ProtocolEvent::ContentAvailable));
+
         actions
     }
 }
@@ -470,7 +487,8 @@ impl StateMachine for NodeStateMachine {
         let mut actions = match event {
             // ── Timers ───────────────────────────────────────────────────
             ProtocolEvent::CleanupTimer => self.on_cleanup_timer(),
-            ProtocolEvent::ProposalTimer => self.on_proposal_timer(),
+            ProtocolEvent::ViewChangeTimer => self.on_view_change_timer(),
+            ProtocolEvent::ContentAvailable => self.on_content_available(),
 
             // ── BFT Consensus ────────────────────────────────────────────
             ProtocolEvent::BlockHeaderReceived { header, manifest } => {
@@ -617,9 +635,14 @@ impl StateMachine for NodeStateMachine {
                 committed_header,
                 valid,
             ),
-            ProtocolEvent::ProvisionVerified { batch } => self
-                .bft
-                .check_pending_blocks_for_provision(self.topology.snapshot(), &batch),
+            ProtocolEvent::ProvisionVerified { batch } => {
+                let mut actions = self
+                    .bft
+                    .check_pending_blocks_for_provision(self.topology.snapshot(), &batch);
+                // New provision batch queued — signal for event-driven proposal.
+                actions.push(Action::Continuation(ProtocolEvent::ContentAvailable));
+                actions
+            }
 
             // ── Execution ────────────────────────────────────────────────
             ProtocolEvent::ExecutionBatchCompleted {
@@ -685,10 +708,8 @@ impl StateMachine for NodeStateMachine {
                 wave_cert: _,
                 tx_hashes: _,
             } => {
-                // Wave-level finalization event. Per-tx handling is done via
-                // TransactionExecuted events emitted alongside WaveCompleted.
-                // Future: use this for wave-level mempool notifications.
-                vec![]
+                // New finalized wave available — signal for event-driven proposal.
+                vec![Action::Continuation(ProtocolEvent::ContentAvailable)]
             }
             ProtocolEvent::TransactionGossipReceived {
                 tx,

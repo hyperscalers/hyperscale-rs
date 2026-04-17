@@ -50,7 +50,7 @@ pub struct PinnedLoopConfig {
     /// Tokio runtime handle for spawning timer sleep tasks.
     pub tokio_handle: tokio::runtime::Handle,
     /// Timer ops from genesis initialization that need to be processed
-    /// before the event loop starts (e.g. the initial ProposalTimer).
+    /// before the event loop starts (e.g. the initial ViewChange timer).
     pub initial_timer_ops: Vec<TimerOp>,
     pub rpc_status: Option<Arc<ArcSwap<NodeStatusState>>>,
     pub sync_status: Option<Arc<ArcSwap<SyncStatus>>>,
@@ -197,7 +197,7 @@ pub fn run_pinned_loop(mut io_loop: ProdIoLoop, mut config: PinnedLoopConfig) {
 
     let mut timer_mgr = ProdTimerManager::new(config.tokio_handle.clone(), config.timer_tx.clone());
 
-    // Process timer ops from genesis initialization (e.g. ProposalTimer).
+    // Process timer ops from genesis initialization (e.g. ViewChange timer).
     for op in std::mem::take(&mut config.initial_timer_ops) {
         timer_mgr.process_op(op);
     }

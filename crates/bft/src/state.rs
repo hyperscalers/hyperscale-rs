@@ -665,7 +665,7 @@ impl BftState {
     ///
     /// When a validator receives a header or QC at round R, they know R rounds
     /// have been attempted, and can compute the same timeout as the proposer.
-    fn current_view_change_timeout(&self) -> Duration {
+    pub fn current_view_change_timeout(&self) -> Duration {
         let base = self.config.view_change_timeout;
         let increment = self.config.view_change_timeout_increment;
 
@@ -679,6 +679,21 @@ impl BftState {
         match self.config.view_change_timeout_max {
             Some(max) => timeout.min(max),
             None => timeout,
+        }
+    }
+
+    /// Compute remaining time until the view change timeout fires.
+    ///
+    /// Returns the duration from `now` until `last_leader_activity + timeout`.
+    /// If already past, returns a short retry duration (100ms).
+    pub fn remaining_view_change_timeout(&self) -> Duration {
+        let timeout = self.current_view_change_timeout();
+        let deadline = self.last_leader_activity.unwrap_or(Duration::ZERO) + timeout;
+        if self.now >= deadline {
+            // Already past — retry shortly (suppressed by verification/sync)
+            Duration::from_millis(100)
+        } else {
+            deadline - self.now
         }
     }
 
@@ -733,7 +748,7 @@ impl BftState {
     /// Returns actions for view change if timeout triggered, or empty vec if not.
     ///
     /// If a view change occurs, the caller should NOT proceed to call
-    /// `on_proposal_timer` in the same event handling cycle.
+    /// `try_propose` in the same event handling cycle.
     pub fn check_round_timeout(&mut self, topology: &TopologySnapshot) -> Option<Vec<Action>> {
         if !self.should_advance_round() {
             return None;
@@ -778,11 +793,12 @@ impl BftState {
             "Initialized genesis block"
         );
 
-        // Set initial timers
+        // Set initial timers and trigger first proposal attempt
         vec![
+            Action::Continuation(ProtocolEvent::ContentAvailable),
             Action::SetTimer {
-                id: TimerId::Proposal,
-                duration: self.config.proposal_interval,
+                id: TimerId::ViewChange,
+                duration: self.current_view_change_timeout(),
             },
             Action::SetTimer {
                 id: TimerId::Cleanup,
@@ -845,11 +861,12 @@ impl BftState {
             "Recovered chain state from storage"
         );
 
-        // Set timers to resume consensus and background tasks
+        // Set timers to resume consensus and trigger first proposal attempt
         let mut actions = vec![
+            Action::Continuation(ProtocolEvent::ContentAvailable),
             Action::SetTimer {
-                id: TimerId::Proposal,
-                duration: self.config.proposal_interval,
+                id: TimerId::ViewChange,
+                duration: self.current_view_change_timeout(),
             },
             Action::SetTimer {
                 id: TimerId::Cleanup,
@@ -869,15 +886,21 @@ impl BftState {
     // Proposer Logic
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /// Handle proposal timer - build and broadcast a new block.
+    /// Try to build and broadcast a new block proposal.
     ///
-    /// Takes ready transactions from mempool (already sectioned and hash-sorted),
-    /// plus certificates from execution.
+    /// This is the unified proposal entry point, called from:
+    /// - `ContentAvailable` events (new transactions, waves, or provisions)
+    /// - `on_qc_formed` (eager next-block proposal)
+    /// - `RateLimitRetry` timer (after rate-limit window expires)
+    ///
+    /// Returns empty if preconditions aren't met (not proposer, rate-limited,
+    /// build in-flight, etc.). No periodic rescheduling — callers are responsible
+    /// for triggering the next attempt via events or timers.
     #[instrument(skip(self, ready_txs, finalized_waves), fields(
         tx_count = ready_txs.len(),
         cert_count = finalized_waves.len(),
     ))]
-    pub fn on_proposal_timer(
+    pub fn try_propose(
         &mut self,
         topology: &TopologySnapshot,
         ready_txs: &ReadyTransactions,
@@ -894,27 +917,9 @@ impl BftState {
             .unwrap_or(self.committed_height + 1);
         let round = self.view;
 
-        debug!(
-            validator = ?topology.local_validator_id(),
-            height = next_height,
-            round = round,
-            "Proposal timer fired"
-        );
-
-        // Reschedule the timer
-        let actions = vec![Action::SetTimer {
-            id: TimerId::Proposal,
-            duration: self.config.proposal_interval,
-        }];
-
         // Check if we should propose
         if !topology.should_propose(next_height, round) {
-            trace!(
-                validator = ?topology.local_validator_id(),
-                expected = ?topology.proposer_for(next_height, round),
-                "Not the proposer for this height/round"
-            );
-            return actions;
+            return vec![];
         }
 
         // Global rate limit: ensure min_block_interval since the last QC from
@@ -925,8 +930,7 @@ impl BftState {
             .now
             .saturating_sub(self.last_qc_time.unwrap_or(Duration::ZERO));
         if time_since_last_qc < self.config.min_block_interval {
-            // Reschedule for exactly when the rate limit expires instead of
-            // waiting for the next full proposal_interval.
+            // Schedule a one-shot retry for when the rate limit expires.
             let remaining = self.config.min_block_interval - time_since_last_qc;
             trace!(
                 validator = ?topology.local_validator_id(),
@@ -935,16 +939,12 @@ impl BftState {
                 "Rate limiting proposal timer - rescheduling for rate limit expiry"
             );
             return vec![Action::SetTimer {
-                id: TimerId::Proposal,
+                id: TimerId::RateLimitRetry,
                 duration: remaining,
             }];
         }
 
         // Skip if a BuildProposal is already in-flight for this height.
-        // The timer fires every proposal_interval (1s), but block building
-        // can take longer (especially with many certificates). Without this
-        // guard, each tick spawns a redundant build on the thread pool —
-        // wasting CPU and delaying the first build via thread contention.
         if let Some(ref pending) = self.pending_proposal {
             if pending.height.0 == next_height && pending.round == round {
                 trace!(
@@ -953,7 +953,7 @@ impl BftState {
                     round = round,
                     "Proposal build already in-flight, skipping"
                 );
-                return actions;
+                return vec![];
             }
         }
 
@@ -962,13 +962,7 @@ impl BftState {
         // Re-proposing would create a different block hash (due to timestamp)
         // which we cannot vote for (vote locking).
         if self.voted_heights.contains_key(&next_height) {
-            trace!(
-                validator = ?topology.local_validator_id(),
-                height = next_height,
-                round = round,
-                "Already voted at this height, skipping proposal"
-            );
-            return actions;
+            return vec![];
         }
 
         // If we're syncing, propose an empty sync block instead of a full block.
@@ -1093,10 +1087,7 @@ impl BftState {
             finalized_tx_count: finalized_tx_count as u32,
         };
 
-        let mut actions = vec![Action::SetTimer {
-            id: TimerId::Proposal,
-            duration: self.config.proposal_interval,
-        }];
+        let mut actions = vec![];
 
         // Dispatch unless the parent's tree nodes aren't available yet.
         // Even empty blocks need the parent root node — noop_jmt_snapshot
@@ -1104,9 +1095,8 @@ impl BftState {
         // Without this, a child block's VerifyStateRoot hits
         // ParentVersionMissing when looking up the empty block's version.
         //
-        // When deferred, do NOT set pending_proposal — that way the next
-        // proposal timer tick re-checks parent_tree_available and dispatches
-        // as soon as it becomes true.
+        // When deferred, the verification pipeline will unblock and dispatch
+        // via take_ready_proposal() when the parent tree becomes available.
         if self
             .verification
             .parent_tree_available(parent_block_height, parent_hash)
@@ -1195,19 +1185,12 @@ impl BftState {
             finalized_tx_count: 0,
         };
 
-        let mut actions = vec![Action::SetTimer {
-            id: TimerId::Proposal,
-            duration: self.config.proposal_interval,
-        }];
-
         // Fallback blocks are always empty (no transactions/receipts), so
         // build_proposal can compute the state root without JVT access.
         // Never defer — deferring empty proposals creates a liveness deadlock
         // when the proposer just exited sync mode (verified_state_roots doesn't
         // contain the parent, and BlockPersisted hasn't fired yet).
-        actions.push(proposal_action);
-
-        actions
+        vec![proposal_action]
     }
 
     /// Build and broadcast an empty block while syncing.
@@ -1283,17 +1266,10 @@ impl BftState {
             finalized_tx_count: 0,
         };
 
-        let mut actions = vec![Action::SetTimer {
-            id: TimerId::Proposal,
-            duration: self.config.proposal_interval,
-        }];
-
         // Sync blocks are always empty (no transactions/receipts), so
         // build_proposal can compute the state root without JVT access.
         // Never defer — same liveness reasoning as fallback blocks.
-        actions.push(proposal_action);
-
-        actions
+        vec![proposal_action]
     }
 
     /// Re-propose a block we're vote-locked to after a view change.
@@ -1325,18 +1301,15 @@ impl BftState {
 
         // Try to get the pending block we voted for
         let Some(pending) = self.pending_blocks.get(&block_hash) else {
-            // Block not in pending_blocks - might have been cleaned up or committed
-            // Fall back to just setting the proposal timer
+            // Block not in pending_blocks - might have been cleaned up or committed.
+            // View change timer will handle further recovery.
             warn!(
                 validator = ?topology.local_validator_id(),
                 height = height,
                 block_hash = ?block_hash,
                 "Cannot re-propose: locked block not found in pending_blocks"
             );
-            return vec![Action::SetTimer {
-                id: TimerId::Proposal,
-                duration: self.config.proposal_interval,
-            }];
+            return vec![];
         };
 
         // IMPORTANT: Keep the original header unchanged, including the round.
@@ -1378,12 +1351,6 @@ impl BftState {
 
         // Record leader activity - we are producing blocks
         self.record_leader_activity();
-
-        // Set proposal timer in case this re-proposal also fails to gather quorum
-        actions.push(Action::SetTimer {
-            id: TimerId::Proposal,
-            duration: self.config.proposal_interval,
-        });
 
         actions
     }
@@ -1499,6 +1466,11 @@ impl BftState {
                 // to the next proposer only — non-proposers learn about QCs
                 // via block headers rather than forming them locally.
                 sync_actions.extend(self.try_two_chain_commit(topology, &header.parent_qc));
+
+                // Trigger a proposal attempt. Non-proposers who learn about QCs
+                // via block headers (rather than forming them locally) need this
+                // to advance the chain in the event-driven model.
+                sync_actions.push(Action::Continuation(ProtocolEvent::ContentAvailable));
             }
         }
 
@@ -1574,6 +1546,8 @@ impl BftState {
                     self.certified_state_root = header.state_root;
                     self.certified_in_flight = header.in_flight;
                     self.maybe_unlock_for_qc(topology, &deferred_qc);
+                    // Trigger proposal attempt after deferred QC adoption.
+                    sync_actions.push(Action::Continuation(ProtocolEvent::ContentAvailable));
                 }
             } else {
                 // Not for this block — put it back
@@ -2937,7 +2911,11 @@ impl BftState {
             }
         }
 
-        let mut actions = vec![];
+        // Reset the view change timer to count from now (leader progress).
+        let mut actions = vec![Action::SetTimer {
+            id: TimerId::ViewChange,
+            duration: self.current_view_change_timeout(),
+        }];
 
         actions.extend(self.try_two_chain_commit(topology, &qc));
 
@@ -2973,23 +2951,20 @@ impl BftState {
         // - We're syncing (should propose empty sync blocks to keep chain advancing)
         //
         // All other checks (should_propose, backpressure, voted_heights)
-        // are handled inside on_proposal_timer to avoid duplication.
+        // are handled inside try_propose to avoid duplication.
         let should_try_proposal = has_content || self.sync.is_syncing();
 
         if should_try_proposal && !rate_limited {
-            // on_proposal_timer will check if we're the proposer, backpressure, etc.
-            // State root is computed by NodeStateMachine and passed in.
-            // If certificates is empty, on_proposal_timer will inherit parent state.
-            actions.extend(self.on_proposal_timer(
+            // try_propose will check if we're the proposer, backpressure, etc.
+            actions.extend(self.try_propose(
                 topology,
                 ready_txs,
                 finalized_waves,
                 provision_batches,
             ));
         } else if should_try_proposal && rate_limited {
-            // Schedule the proposal timer to fire exactly when the rate limit
-            // expires, rather than waiting for the next periodic timer fire.
-            // This avoids up to proposal_interval of unnecessary delay.
+            // Schedule a one-shot timer to fire exactly when the rate limit
+            // expires, triggering ContentAvailable for the proposal attempt.
             let remaining = self.config.min_block_interval - time_since_last_qc;
             trace!(
                 validator = ?topology.local_validator_id(),
@@ -2999,17 +2974,18 @@ impl BftState {
                 "Rate limiting proposal - scheduling precise timer"
             );
             actions.push(Action::SetTimer {
-                id: TimerId::Proposal,
+                id: TimerId::RateLimitRetry,
                 duration: remaining,
             });
-        } else if !should_try_proposal && topology.should_propose(next_height, self.view) {
-            // We're the next proposer but have no content yet. Reschedule the
-            // proposal timer to fire promptly so we don't wait for a stale
-            // periodic tick (which may be delayed by event queue depth).
-            // This gives the mempool a brief window to accumulate transactions
-            // while ensuring we propose quickly even without content.
+        }
+
+        // If we're the next proposer, always schedule a backstop timer to
+        // ensure the chain keeps advancing even without new content events.
+        // This covers the case where all content is already committed and
+        // the chain needs empty blocks for execution finalization.
+        if topology.should_propose(next_height, self.view) {
             actions.push(Action::SetTimer {
-                id: TimerId::Proposal,
+                id: TimerId::RateLimitRetry,
                 duration: self.config.min_block_interval,
             });
         }
@@ -3620,7 +3596,7 @@ impl BftState {
     #[instrument(skip(self), fields(new_round = self.view + 1))]
     fn advance_round(&mut self, topology: &TopologySnapshot) -> Vec<Action> {
         // The next height to propose is one above the highest certified block,
-        // NOT one above the committed block. This matches on_proposal_timer behavior.
+        // NOT one above the committed block. This matches try_propose behavior.
         let height = self
             .latest_qc
             .as_ref()
@@ -3713,10 +3689,10 @@ impl BftState {
             return self.build_and_broadcast_fallback_block(topology, height, self.view);
         }
 
-        // Not the proposer - just reschedule the timer
+        // Not the proposer - schedule view change timer with backoff
         vec![Action::SetTimer {
-            id: TimerId::Proposal,
-            duration: self.config.proposal_interval,
+            id: TimerId::ViewChange,
+            duration: self.current_view_change_timeout(),
         }]
     }
 
@@ -4437,7 +4413,7 @@ impl BftState {
     /// Also sets `pending_proposal` so a racing proposal timer tick doesn't
     /// try to start a second build for the same (height, round). This mirrors
     /// the `pending_proposal = Some(...)` guard in the dispatch branch of
-    /// `on_proposal_timer`; the deferred path intentionally leaves
+    /// `try_propose`; the deferred path intentionally leaves
     /// `pending_proposal` unset so tick-based retries work, which means the
     /// final "actually dispatching now" bookkeeping has to happen here.
     pub fn take_ready_proposal(&mut self) -> Option<Action> {
@@ -7621,7 +7597,7 @@ mod tests {
             transactions: vec![Arc::new(hyperscale_types::test_utils::test_transaction(1))],
         };
 
-        let actions = state.on_proposal_timer(&topology, &ready_txs, vec![], vec![]);
+        let actions = state.try_propose(&topology, &ready_txs, vec![], vec![]);
 
         // Should emit BuildProposal (sync block goes through proposal pipeline)
         let proposal = actions
@@ -7677,8 +7653,7 @@ mod tests {
         // Enter sync mode
         state.set_syncing(&topology, true);
 
-        let actions =
-            state.on_proposal_timer(&topology, &ReadyTransactions::default(), vec![], vec![]);
+        let actions = state.try_propose(&topology, &ReadyTransactions::default(), vec![], vec![]);
 
         // Extract the BuildProposal and check timestamp
         let proposal = actions
@@ -7959,8 +7934,7 @@ mod tests {
         state.set_syncing(&topology, true);
 
         // Propose (which builds sync block)
-        let _actions =
-            state.on_proposal_timer(&topology, &ReadyTransactions::default(), vec![], vec![]);
+        let _actions = state.try_propose(&topology, &ReadyTransactions::default(), vec![], vec![]);
 
         // Leader activity should be updated
         assert_eq!(
@@ -8074,8 +8048,7 @@ mod tests {
         state.set_syncing(&topology, true);
 
         // Propose first sync block
-        let actions1 =
-            state.on_proposal_timer(&topology, &ReadyTransactions::default(), vec![], vec![]);
+        let actions1 = state.try_propose(&topology, &ReadyTransactions::default(), vec![], vec![]);
 
         // Verify we got a BuildProposal (not skipped due to syncing)
         let has_proposal = actions1
