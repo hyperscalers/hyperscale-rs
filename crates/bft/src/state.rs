@@ -1104,8 +1104,8 @@ impl BftState {
         // Without this, a child block's VerifyStateRoot hits
         // ParentVersionMissing when looking up the empty block's version.
         //
-        // When deferred, the verification pipeline will unblock and dispatch
-        // via take_ready_proposal() when the parent tree becomes available.
+        // When deferred, the verification pipeline will unblock and re-enter
+        // try_propose via ContentAvailable when the parent tree becomes available.
         if self
             .verification
             .parent_tree_available(parent_block_height, parent_hash)
@@ -1118,7 +1118,7 @@ impl BftState {
             actions.push(proposal_action);
         } else {
             self.verification
-                .defer_proposal(parent_hash, proposal_action);
+                .defer_proposal(parent_hash, parent_block_height);
         }
 
         actions
@@ -1191,7 +1191,7 @@ impl BftState {
         // Even empty fallback blocks need the parent root node —
         // noop_jmt_snapshot copies it to the new version so the overlay chain
         // stays intact. Defer if the parent tree isn't available yet;
-        // on_jvt_committed will unblock via take_ready_proposal().
+        // on_jvt_committed will unblock via ContentAvailable.
         let mut actions = vec![];
         if self
             .verification
@@ -1204,7 +1204,7 @@ impl BftState {
             actions.push(proposal_action);
         } else {
             self.verification
-                .defer_proposal(parent_hash, proposal_action);
+                .defer_proposal(parent_hash, parent_block_height);
         }
         actions
     }
@@ -1279,7 +1279,7 @@ impl BftState {
         // Even empty sync blocks need the parent root node — noop_jmt_snapshot
         // copies it to the new version so the overlay chain stays intact.
         // Defer if the parent tree isn't available yet; on_jvt_committed will
-        // unblock via take_ready_proposal().
+        // unblock via ContentAvailable.
         let mut actions = vec![];
         if self
             .verification
@@ -1292,7 +1292,7 @@ impl BftState {
             actions.push(proposal_action);
         } else {
             self.verification
-                .defer_proposal(parent_hash, proposal_action);
+                .defer_proposal(parent_hash, parent_block_height);
         }
         actions
     }
@@ -4433,23 +4433,13 @@ impl BftState {
         self.verification.drain_ready_state_root_verifications()
     }
 
-    /// Take the ready BuildProposal action if one was unblocked.
+    /// Check whether a deferred proposal was unblocked and should be retried.
     ///
-    /// Also sets `pending_proposal` so a racing proposal timer tick doesn't
-    /// try to start a second build for the same (height, round). This mirrors
-    /// the `pending_proposal = Some(...)` guard in the dispatch branch of
-    /// `try_propose`; the deferred path intentionally leaves
-    /// `pending_proposal` unset so tick-based retries work, which means the
-    /// final "actually dispatching now" bookkeeping has to happen here.
-    pub fn take_ready_proposal(&mut self) -> Option<Action> {
-        let action = self.verification.take_ready_proposal()?;
-        if let Action::BuildProposal { height, round, .. } = &action {
-            self.pending_proposal = Some(PendingProposal {
-                height: *height,
-                round: *round,
-            });
-        }
-        Some(action)
+    /// Returns `true` once when the parent tree becomes available. The caller
+    /// emits `ContentAvailable` to re-enter `try_propose` with fresh tx
+    /// selection — avoiding stale transactions from the original deferral.
+    pub fn take_ready_proposal(&mut self) -> bool {
+        self.verification.take_ready_proposal()
     }
 
     /// Register committed transactions for execution timeout validation.

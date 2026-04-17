@@ -69,10 +69,14 @@ pub(crate) struct VerificationPipeline {
     /// commit or prior verification). Keyed by parent_block_hash.
     deferred_state_root_verifications: HashMap<Hash, Vec<ReadyStateRootVerification>>,
 
-    /// BuildProposal action waiting for the parent's tree nodes to become
+    /// Deferred proposal waiting for the parent's tree nodes to become
     /// available. At most one pending at a time (new proposals replace old).
-    /// Keyed by parent_block_hash for unblocking.
-    deferred_proposal: Option<(Hash, Action)>,
+    /// Stores `(parent_block_hash, parent_block_height)` for unblocking.
+    /// When unblocked, we re-enter `try_propose` via `ContentAvailable`
+    /// rather than dispatching a stale `BuildProposal` — transaction
+    /// selection must use current state to avoid including txs that were
+    /// committed between deferral and dispatch.
+    deferred_proposal: Option<(Hash, u64)>,
 
     /// Last committed JVT height — used only to decide whether to defer
     /// verification (parent's tree nodes need to be in the store or overlay).
@@ -86,8 +90,10 @@ pub(crate) struct VerificationPipeline {
     /// actual JVT commits.
     ready_state_root_verifications: Vec<ReadyStateRootVerification>,
 
-    /// BuildProposal action ready to dispatch (parent tree became available).
-    ready_proposal: Option<Action>,
+    /// Set when a deferred proposal's parent tree became available.
+    /// Consumed by `take_ready_proposal` which emits `ContentAvailable`
+    /// to re-enter `try_propose` with fresh transaction selection.
+    proposal_unblocked: bool,
 
     // === Transaction root verification ===
     /// Blocks where transaction root verification is currently in-flight.
@@ -133,7 +139,7 @@ impl VerificationPipeline {
             deferred_state_root_verifications: HashMap::new(),
             deferred_proposal: None,
             ready_state_root_verifications: Vec::new(),
-            ready_proposal: None,
+            proposal_unblocked: false,
             last_committed_height: committed_height,
             transaction_root_verifications_in_flight: HashSet::new(),
             verified_transaction_roots: HashSet::new(),
@@ -812,9 +818,11 @@ impl VerificationPipeline {
         std::mem::take(&mut self.ready_state_root_verifications)
     }
 
-    /// Take the ready BuildProposal action if one was unblocked.
-    pub fn take_ready_proposal(&mut self) -> Option<Action> {
-        self.ready_proposal.take()
+    /// Check whether a deferred proposal was unblocked and should be retried.
+    /// Returns `true` once, then resets. The caller emits `ContentAvailable`
+    /// to re-enter `try_propose` with fresh transaction selection.
+    pub fn take_ready_proposal(&mut self) -> bool {
+        std::mem::take(&mut self.proposal_unblocked)
     }
 
     /// Check if a parent's tree nodes are available (committed or verified).
@@ -823,22 +831,25 @@ impl VerificationPipeline {
             || self.verified_state_roots.contains(&parent_hash)
     }
 
-    /// Defer a BuildProposal action until its parent's tree nodes are available.
-    /// Replaces any previously deferred proposal (only one active at a time).
-    pub fn defer_proposal(&mut self, parent_hash: Hash, action: Action) {
+    /// Record that a proposal is deferred until the parent's tree nodes are
+    /// available. Only the parent identity is stored — when unblocked, the
+    /// caller re-enters `try_propose` with fresh state rather than replaying
+    /// a stale `BuildProposal` action.
+    pub fn defer_proposal(&mut self, parent_hash: Hash, parent_block_height: u64) {
         debug!(
             parent_hash = ?parent_hash,
-            "Deferring BuildProposal — parent tree not yet available"
+            parent_block_height,
+            "Deferring proposal — parent tree not yet available"
         );
-        self.deferred_proposal = Some((parent_hash, action));
+        self.deferred_proposal = Some((parent_hash, parent_block_height));
     }
 
-    /// If the deferred proposal was waiting for `unblocked_hash`, make it ready.
+    /// If the deferred proposal was waiting for `unblocked_hash`, mark it ready.
     fn try_unblock_proposal(&mut self, unblocked_hash: Hash) {
         if matches!(&self.deferred_proposal, Some((parent, _)) if *parent == unblocked_hash) {
-            let (_, action) = self.deferred_proposal.take().unwrap();
-            debug!(parent_hash = ?unblocked_hash, "Unblocking deferred BuildProposal");
-            self.ready_proposal = Some(action);
+            self.deferred_proposal.take();
+            debug!(parent_hash = ?unblocked_hash, "Unblocking deferred proposal");
+            self.proposal_unblocked = true;
         }
     }
 
@@ -880,16 +891,11 @@ impl VerificationPipeline {
         }
 
         // Unblock deferred proposal if its parent height is now committed.
-        if let Some((_, action)) = &self.deferred_proposal {
-            let ready = matches!(
-                action,
-                Action::BuildProposal { parent_block_height, .. }
-                    if *parent_block_height <= block_height
-            );
-            if ready {
-                let (_, action) = self.deferred_proposal.take().unwrap();
-                debug!("Unblocking deferred BuildProposal — parent committed");
-                self.ready_proposal = Some(action);
+        if let Some((_, parent_block_height)) = &self.deferred_proposal {
+            if *parent_block_height <= block_height {
+                self.deferred_proposal.take();
+                debug!("Unblocking deferred proposal — parent committed");
+                self.proposal_unblocked = true;
             }
         }
     }
@@ -937,13 +943,8 @@ impl VerificationPipeline {
 
         // Clear deferred proposal if its parent is at or below committed height
         // (the proposal is stale — a new round/view will generate a fresh one).
-        if let Some((_, action)) = &self.deferred_proposal {
-            let stale = matches!(
-                action,
-                Action::BuildProposal { parent_block_height, .. }
-                    if *parent_block_height <= committed_height
-            );
-            if stale {
+        if let Some((_, parent_block_height)) = &self.deferred_proposal {
+            if *parent_block_height <= committed_height {
                 self.deferred_proposal = None;
             }
         }

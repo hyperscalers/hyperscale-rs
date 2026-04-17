@@ -794,8 +794,12 @@ impl StateMachine for NodeStateMachine {
             });
         }
 
-        // Emit deferred BuildProposal if its parent tree became available.
-        actions.extend(self.bft.take_ready_proposal());
+        // Re-enter try_propose if a deferred proposal was unblocked.
+        // ContentAvailable triggers fresh tx selection against current state,
+        // avoiding stale transactions from the original deferral.
+        if self.bft.take_ready_proposal() {
+            actions.push(Action::Continuation(ProtocolEvent::ContentAvailable));
+        }
 
         actions
     }
