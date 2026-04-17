@@ -305,6 +305,10 @@ pub fn run_pinned_loop(mut io_loop: ProdIoLoop, mut config: PinnedLoopConfig) {
                 if deleted > 0 {
                     debug!(deleted, "JVT garbage collection completed");
                 }
+                let vs_deleted = storage.run_versioned_substates_gc();
+                if vs_deleted > 0 {
+                    debug!(vs_deleted, "Versioned substates GC completed");
+                }
                 gc_flag.store(false, std::sync::atomic::Ordering::Relaxed);
             });
         }

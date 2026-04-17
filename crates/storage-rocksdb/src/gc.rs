@@ -1,6 +1,12 @@
-//! JMT garbage collection for RocksDB storage.
+//! Garbage collection for RocksDB storage.
+//!
+//! Two independent GC passes:
+//! - **JMT GC**: deletes stale tree nodes older than `jmt_history_length`.
+//! - **Versioned substates GC**: prunes MVCC history from `versioned_substates`
+//!   CF, keeping only the floor entry (latest version ≤ cutoff) per substate
+//!   key so historical reads within the retention window still resolve.
 
-use crate::column_families::{JmtNodesCf, StaleJmtNodesCf};
+use crate::column_families::{JmtNodesCf, StaleJmtNodesCf, VersionedSubstatesCf};
 use crate::core::RocksDbStorage;
 use crate::typed_cf::{self, TypedCf};
 
@@ -120,6 +126,151 @@ impl RocksDbStorage {
 
             typed_cf::batch_delete::<JmtNodesCf>(batch, jmt_cf, &stored_key);
             deleted += 1;
+        }
+
+        deleted
+    }
+
+    /// Run garbage collection for versioned substates.
+    ///
+    /// The `versioned_substates` CF stores MVCC history: every substate
+    /// write is recorded as `(storage_key, version) → value`. Without GC,
+    /// this CF grows without bound.
+    ///
+    /// **Retention policy**: for each unique substate key, keep:
+    /// - All entries with `version > cutoff` (within the retention window).
+    /// - The **floor entry** — the latest entry with `version ≤ cutoff` —
+    ///   so historical reads at `height = cutoff` still resolve substates
+    ///   that haven't been modified within the window.
+    /// - Delete everything older than the floor.
+    ///
+    /// The cutoff is `current_version - jmt_history_length`, matching the
+    /// JMT GC retention window.
+    ///
+    /// # Returns
+    ///
+    /// The number of entries deleted.
+    pub fn run_versioned_substates_gc(&self) -> usize {
+        let start = std::time::Instant::now();
+
+        let (current_version, _) = self.read_jmt_metadata();
+        let cutoff = current_version.saturating_sub(self.jmt_history_length);
+
+        if cutoff == 0 {
+            return 0;
+        }
+
+        let cf = self.cf();
+        let versioned_cf = VersionedSubstatesCf::handle(&cf);
+
+        // Full sequential scan. Keys are ordered as [storage_key][version_BE],
+        // so entries for the same substate key are contiguous with versions
+        // ascending. We track the previous raw storage key bytes to detect
+        // group boundaries.
+        let mut iter = self.db.raw_iterator_cf(versioned_cf);
+        iter.seek_to_first();
+
+        let mut batch = WriteBatch::default();
+        let mut deleted = 0;
+        // Keys pending deletion within the current substate key group.
+        // We buffer them because we don't know if an entry is the floor
+        // until we've seen the next entry or group boundary.
+        let mut pending_deletes: Vec<Vec<u8>> = Vec::new();
+        let mut prev_storage_key: Option<Vec<u8>> = None;
+
+        const VERSION_LEN: usize = 8;
+        // Flush batches periodically to bound memory.
+        const BATCH_FLUSH_THRESHOLD: usize = 10_000;
+
+        while iter.valid() {
+            let raw_key = match iter.key() {
+                Some(k) => k,
+                None => break,
+            };
+
+            if raw_key.len() < VERSION_LEN {
+                iter.next();
+                continue;
+            }
+
+            let key_len = raw_key.len() - VERSION_LEN;
+            let storage_key = &raw_key[..key_len];
+            let version = u64::from_be_bytes(raw_key[key_len..].try_into().unwrap());
+
+            // Detect substate key group change — flush pending deletes from
+            // the previous group. The last pending entry was the floor; it
+            // was already removed from pending_deletes below.
+            if prev_storage_key.as_deref() != Some(storage_key) {
+                // Flush remaining pending deletes from previous group.
+                for dk in pending_deletes.drain(..) {
+                    batch.delete_cf(versioned_cf, &dk);
+                    deleted += 1;
+                }
+                prev_storage_key = Some(storage_key.to_vec());
+            }
+
+            if version <= cutoff {
+                // This entry is at or below the cutoff. It MIGHT be the
+                // floor entry. Buffer it for deletion — if a newer entry
+                // (still ≤ cutoff) comes along, the buffered one is safe
+                // to delete. The last one buffered before we leave the
+                // ≤cutoff zone is the floor and must be kept.
+                //
+                // Flush all previously buffered entries (they're older
+                // than this one, so definitely not the floor).
+                for dk in pending_deletes.drain(..) {
+                    batch.delete_cf(versioned_cf, &dk);
+                    deleted += 1;
+                }
+                // Buffer this entry as the potential floor.
+                pending_deletes.push(raw_key.to_vec());
+            } else {
+                // version > cutoff — within retention window. The last
+                // buffered entry (if any) is the floor; pop it to keep it.
+                pending_deletes.pop(); // keep the floor
+                                       // Flush any remaining older entries.
+                for dk in pending_deletes.drain(..) {
+                    batch.delete_cf(versioned_cf, &dk);
+                    deleted += 1;
+                }
+            }
+
+            if deleted >= BATCH_FLUSH_THRESHOLD && !batch.is_empty() {
+                if let Err(e) = self.db.write(std::mem::take(&mut batch)) {
+                    tracing::error!("Versioned substates GC write failed: {}", e);
+                    return deleted;
+                }
+                batch = WriteBatch::default();
+            }
+
+            iter.next();
+        }
+
+        // Flush final group's pending deletes. The last buffered entry is
+        // the floor for a substate that has NO entries in the retention
+        // window — keep it so historical reads still resolve.
+        pending_deletes.pop(); // keep the floor
+        for dk in pending_deletes.drain(..) {
+            batch.delete_cf(versioned_cf, &dk);
+            deleted += 1;
+        }
+
+        if !batch.is_empty() {
+            if let Err(e) = self.db.write(batch) {
+                tracing::error!("Versioned substates GC write failed: {}", e);
+                return 0;
+            }
+        }
+
+        let elapsed = start.elapsed();
+        if deleted > 0 {
+            tracing::info!(
+                deleted,
+                cutoff,
+                current_version,
+                elapsed_ms = elapsed.as_millis(),
+                "Versioned substates GC completed"
+            );
         }
 
         deleted
