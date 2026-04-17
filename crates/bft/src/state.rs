@@ -733,21 +733,22 @@ impl BftState {
             return false;
         }
 
-        // Don't view-change if we've voted for the current proposal height.
-        // Voting confirms the leader produced a valid block; the QC will
-        // arrive via the next block header's parent_qc. Timing out here
-        // would cause cascading view changes because non-proposers never
-        // see QC formation directly (votes go only to the proposer).
-        if self.voted_heights.contains_key(&next_height) {
-            return false;
-        }
-
         let Some(last_activity) = self.last_leader_activity else {
             // No leader activity recorded yet — don't view-change before
             // the first proposal has had a chance to arrive.
             return false;
         };
         let timeout = self.current_view_change_timeout();
+
+        // If we've voted for the current proposal height, the leader did
+        // produce a valid block. The QC will arrive via the next block
+        // header's parent_qc. Use an extended deadline (2× timeout) to
+        // avoid premature view changes while still recovering if the
+        // proposer fails to aggregate quorum.
+        if self.voted_heights.contains_key(&next_height) {
+            return self.now.saturating_sub(last_activity) >= timeout.saturating_mul(2);
+        }
+
         self.now.saturating_sub(last_activity) >= timeout
     }
 
@@ -795,6 +796,10 @@ impl BftState {
         self.committed_state_root = genesis.header.state_root;
         self.certified_state_root = genesis.header.state_root;
         self.certified_in_flight = genesis.header.in_flight;
+
+        // Record genesis time as initial leader activity so that the view
+        // change timeout counts from startup rather than being disabled.
+        self.last_leader_activity = Some(self.now);
 
         info!(
             validator = ?topology.local_validator_id(),
@@ -861,6 +866,10 @@ impl BftState {
         // Clean up any votes for heights at or below the committed height.
         // This handles the case where we loaded votes from storage that are now stale.
         let removed_blocks = self.cleanup_old_state(height.0);
+
+        // Record recovery time as initial leader activity so that the view
+        // change timeout counts from startup rather than being disabled.
+        self.last_leader_activity = Some(self.now);
 
         info!(
             validator = ?topology.local_validator_id(),
