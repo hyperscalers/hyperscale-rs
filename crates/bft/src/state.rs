@@ -1907,6 +1907,7 @@ impl BftState {
         // BFT Safety: A validator must not vote for conflicting blocks at the same height
         // in the same round. Across rounds, the vote lock may be released on timeout if
         // no QC has formed (see `advance_round`), or via QC-based unlock (see `maybe_unlock_for_qc`).
+        let mut vote_locked = false;
         if let Some(&(existing_hash, existing_round)) = self.voted_heights.get(&height) {
             if existing_hash == block_hash {
                 // Already voted for this exact block (possibly in an earlier round)
@@ -1924,6 +1925,10 @@ impl BftState {
                 // This is expected during view changes: we voted in round N, then round N+1
                 // proposes a different block, but we're locked to our original vote.
                 // This is BFT safety working correctly, not a violation.
+                //
+                // Don't return early — fall through to the verification pipeline so
+                // that VerifyStateRoot produces the PreparedCommit needed if this block
+                // gets committed via QC formed by other validators.
                 warn!(
                     validator = ?topology.local_validator_id(),
                     existing = ?existing_hash,
@@ -1933,7 +1938,7 @@ impl BftState {
                     height = height,
                     "Vote locking: already voted for different block at this height (view change)"
                 );
-                return vec![];
+                vote_locked = true;
             }
         }
 
@@ -1973,17 +1978,19 @@ impl BftState {
                     return vec![];
                 }
 
-                // In-flight verification: must look up parent by hash.
-                // certified_in_flight is unreliable here — it may reflect THIS
-                // block's value (QC formed first) and the parent may have been
-                // pruned by the commit that QC triggered. If parent is gone,
-                // skip the vote but still run the verification pipeline —
+                // Determine whether to skip voting but still run verifications.
                 // VerifyStateRoot produces the PreparedCommit that the commit
-                // path needs. Without it, flush_block_commits blocks forever
-                // if the consensus path commits this block (QC formed by others).
+                // path needs — without it, flush_block_commits blocks forever
+                // if this block gets committed via QC formed by others.
+                //
+                // Skip cases: vote-locked (voted for a different block at this
+                // height) or parent pruned (can't verify in-flight count).
                 let skip_vote;
                 {
-                    let parent_in_flight = if block.header.parent_qc.is_genesis() {
+                    let parent_in_flight = if vote_locked {
+                        skip_vote = true;
+                        0 // unused — in-flight check is skipped
+                    } else if block.header.parent_qc.is_genesis() {
                         skip_vote = false;
                         0
                     } else if let Some(h) = self.get_header_by_hash(block.header.parent_hash) {
@@ -2096,8 +2103,8 @@ impl BftState {
                 }
 
                 // If any verifications were initiated, wait for them to complete.
-                // When skip_vote is set (parent pruned), return after initiating
-                // verifications — we need the PreparedCommit but won't vote.
+                // When skip_vote is set, return after initiating verifications —
+                // we need the PreparedCommit but won't vote.
                 if skip_vote
                     || !verification_actions.is_empty()
                     || !self.verification.is_block_verified(&block)
@@ -2105,6 +2112,12 @@ impl BftState {
                     return verification_actions;
                 }
             }
+        }
+
+        // Vote-locked validators must not vote — they only ran the verification
+        // pipeline above to produce PreparedCommit for the commit path.
+        if vote_locked {
+            return vec![];
         }
 
         // Create and send vote
