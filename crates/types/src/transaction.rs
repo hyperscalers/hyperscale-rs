@@ -38,6 +38,11 @@ pub struct RoutableTransaction {
     /// Not serialized - reconstructed on demand.
     /// Option because validation can theoretically fail (though shouldn't for RPC-validated txs).
     validated: OnceLock<Option<ValidatedUserTransaction>>,
+
+    /// Cached full SBOR encoding of this `RoutableTransaction`.
+    /// Set eagerly at construction/decode time so the commit thread
+    /// never re-encodes — the bytes are ready for `cf_put_raw`.
+    cached_sbor: Option<Vec<u8>>,
 }
 
 // Manual PartialEq/Eq - compare by hash for efficiency
@@ -58,7 +63,8 @@ impl Clone for RoutableTransaction {
             declared_writes: self.declared_writes.clone(),
             hash: self.hash,
             serialized_bytes: self.serialized_bytes.clone(),
-            validated: OnceLock::new(), // Don't clone cache - will be recomputed if needed
+            validated: OnceLock::new(),
+            cached_sbor: self.cached_sbor.clone(),
         }
     }
 }
@@ -91,14 +97,17 @@ impl RoutableTransaction {
         hasher.update(&payload);
         let hash = Hash::from_hash_bytes(hasher.finalize().as_bytes());
 
-        Self {
+        let mut tx = Self {
             transaction,
             declared_reads,
             declared_writes,
             hash,
             serialized_bytes: payload,
             validated: OnceLock::new(),
-        }
+            cached_sbor: None,
+        };
+        tx.populate_cached_sbor();
+        tx
     }
 
     /// Get the transaction hash (content-addressed).
@@ -158,6 +167,15 @@ impl RoutableTransaction {
     /// prefer `serialized_bytes()` which returns a reference.
     pub fn transaction_bytes(&self) -> Vec<u8> {
         self.serialized_bytes.clone()
+    }
+
+    /// Pre-serialized SBOR bytes of the full `RoutableTransaction`.
+    pub fn cached_sbor_bytes(&self) -> Option<&[u8]> {
+        self.cached_sbor.as_deref()
+    }
+
+    fn populate_cached_sbor(&mut self) {
+        self.cached_sbor = Some(sbor::basic_encode(self).expect("RoutableTransaction SBOR encode"));
     }
 
     /// Check if this transaction is cross-shard for the given number of shards.
@@ -244,14 +262,17 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
         // Decode declared_writes
         let declared_writes: Vec<NodeId> = decoder.decode()?;
 
-        Ok(Self {
+        let mut tx = Self {
             hash,
             transaction,
             declared_reads,
             declared_writes,
             serialized_bytes: tx_bytes,
             validated: OnceLock::new(),
-        })
+            cached_sbor: None,
+        };
+        tx.populate_cached_sbor();
+        Ok(tx)
     }
 }
 

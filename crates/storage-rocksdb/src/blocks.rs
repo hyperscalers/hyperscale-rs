@@ -107,7 +107,12 @@ impl RocksDbStorage {
         let metadata = BlockMetadata::from_block(block, qc.clone());
         self.cf_put::<BlocksCf>(batch, &block.header.height.0, &metadata);
         for tx in block.transactions.iter() {
-            self.cf_put::<TransactionsCf>(batch, &tx.hash(), tx.as_ref());
+            self.cf_put_raw::<TransactionsCf>(
+                batch,
+                &tx.hash(),
+                tx.as_ref(),
+                tx.cached_sbor_bytes(),
+            );
         }
         for fw in &block.certificates {
             self.cf_put::<CertificatesCf>(batch, &fw.wave_id().hash(), fw.certificate.as_ref());
