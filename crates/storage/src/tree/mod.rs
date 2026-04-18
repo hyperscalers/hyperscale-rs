@@ -273,7 +273,7 @@ pub fn put_at_version<S: jmt::TreeReader + Sync>(
         })
         .collect();
 
-    updates.par_sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    updates.par_sort_by(|a, b| a.0.cmp(&b.0));
 
     let updates_btree: BTreeMap<jmt::Key, Option<jmt::ValueHash>> = updates.into_iter().collect();
 
