@@ -149,18 +149,6 @@ pub struct BftState {
     /// Updated synchronously at commit time (not dependent on async JVT).
     committed_state_root: Hash,
 
-    /// State root from the latest certified block header.
-    /// Updated synchronously when a QC forms. This is the correct
-    /// parent_state_root for the next proposal (certified tip = parent).
-    certified_state_root: Hash,
-
-    /// In-flight transaction count from the latest certified block header.
-    /// Updated synchronously when a QC forms, mirroring certified_state_root.
-    /// Used for deterministic in-flight computation in proposals and fallback
-    /// blocks — avoids fragile hash lookups that can silently default to 0
-    /// when the parent block has been pruned from memory.
-    certified_in_flight: u32,
-
     /// Latest QC (certifies the latest certified block).
     latest_qc: Option<QuorumCertificate>,
 
@@ -321,8 +309,6 @@ impl BftState {
                 .committed_hash
                 .unwrap_or(Hash::from_bytes(&[0u8; 32])),
             committed_state_root: recovered.jvt_root.unwrap_or(Hash::ZERO),
-            certified_state_root: recovered.jvt_root.unwrap_or(Hash::ZERO),
-            certified_in_flight: 0,
             latest_qc: recovered.latest_qc,
             deferred_qc: None,
             genesis_block: None,
@@ -486,6 +472,31 @@ impl BftState {
         }
 
         None
+    }
+
+    /// State root of a parent block. Falls back to `committed_state_root`
+    /// when the parent is the committed tip (may have been pruned from the
+    /// in-memory caches by cleanup).
+    fn parent_state_root(&self, parent_hash: Hash) -> Hash {
+        if parent_hash == self.committed_hash {
+            return self.committed_state_root;
+        }
+        self.get_header_by_hash(parent_hash)
+            .map(|h| h.state_root)
+            .unwrap_or_else(|| {
+                warn!(
+                    ?parent_hash,
+                    committed_hash = ?self.committed_hash,
+                    "Parent header not found for state root lookup"
+                );
+                self.committed_state_root
+            })
+    }
+
+    fn parent_in_flight(&self, parent_hash: Hash) -> u32 {
+        self.get_header_by_hash(parent_hash)
+            .map(|h| h.in_flight)
+            .unwrap_or(0)
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -785,8 +796,6 @@ impl BftState {
         self.genesis_block = Some(genesis.clone());
         self.committed_hash = hash;
         self.committed_state_root = genesis.header.state_root;
-        self.certified_state_root = genesis.header.state_root;
-        self.certified_in_flight = genesis.header.in_flight;
 
         // Record genesis time as initial leader activity so that the view
         // change timeout counts from startup rather than being disabled.
@@ -1054,14 +1063,9 @@ impl BftState {
             .filter(|b| !qc_chain_provision_hashes.contains(&b.hash()))
             .collect();
 
-        // Use the certified tip's state_root as the base.
-        // In HotStuff-2, the parent is the certified (not committed) block.
-        // certified_state_root tracks the QC-attested chain of state_roots,
-        // independent of in-memory block headers which may carry stale values.
-        let parent_state_root = self.certified_state_root;
+        let parent_state_root = self.parent_state_root(parent_hash);
         let parent_block_height = parent_qc.height.0;
-
-        let parent_in_flight = self.certified_in_flight;
+        let parent_in_flight = self.parent_in_flight(parent_hash);
 
         info!(
             validator = ?topology.local_validator_id(),
@@ -1156,7 +1160,8 @@ impl BftState {
         // during view changes where a Byzantine proposer might try to advance consensus time
         let timestamp = parent_qc.weighted_timestamp_ms;
 
-        let parent_state_root = self.certified_state_root;
+        let parent_state_root = self.parent_state_root(parent_hash);
+        let parent_in_flight = self.parent_in_flight(parent_hash);
         let parent_block_height = parent_qc.height.0;
         let block_height = BlockHeight(height);
 
@@ -1184,7 +1189,7 @@ impl BftState {
             finalized_waves: vec![],
             waves: vec![],
             provision_batches: vec![],
-            parent_in_flight: self.certified_in_flight,
+            parent_in_flight,
             finalized_tx_count: 0,
         };
 
@@ -1244,7 +1249,8 @@ impl BftState {
         // inherit the parent timestamp (proposed after timeout, clock may have drifted).
         let timestamp = self.now.as_millis() as u64;
 
-        let parent_state_root = self.certified_state_root;
+        let parent_state_root = self.parent_state_root(parent_hash);
+        let parent_in_flight = self.parent_in_flight(parent_hash);
         let parent_block_height = parent_qc.height.0;
         let block_height = BlockHeight(height);
 
@@ -1272,7 +1278,7 @@ impl BftState {
             finalized_waves: vec![],
             waves: vec![],
             provision_batches: vec![],
-            parent_in_flight: self.certified_in_flight,
+            parent_in_flight,
             finalized_tx_count: 0,
         };
 
@@ -1480,12 +1486,6 @@ impl BftState {
                 self.latest_qc = Some(header.parent_qc.clone());
                 self.maybe_unlock_for_qc(topology, &header.parent_qc);
 
-                // Update certified tracking from the QC'd block if available.
-                if let Some(ch) = self.get_header_by_hash(header.parent_qc.block_hash) {
-                    self.certified_state_root = ch.state_root;
-                    self.certified_in_flight = ch.in_flight;
-                }
-
                 // Two-chain commit: the parent_qc may allow committing an
                 // ancestor block. This is essential when votes are targeted
                 // to the next proposer only — non-proposers learn about QCs
@@ -1568,8 +1568,6 @@ impl BftState {
                     .is_none_or(|existing| deferred_qc.height.0 > existing.height.0);
                 if should_adopt {
                     self.latest_qc = Some(deferred_qc.clone());
-                    self.certified_state_root = header.state_root;
-                    self.certified_in_flight = header.in_flight;
                     self.maybe_unlock_for_qc(topology, &deferred_qc);
                     // Trigger proposal attempt after deferred QC adoption.
                     sync_actions.push(Action::Continuation(ProtocolEvent::ContentAvailable));
@@ -2020,9 +2018,7 @@ impl BftState {
                 // The verification pipeline queues the request; NodeStateMachine
                 // will drain and emit VerifyStateRoot actions.
                 if self.verification.needs_state_root_verification(&block) {
-                    // Use certified_state_root — tracks the QC-attested chain.
-                    // In HotStuff-2, the parent is the certified tip.
-                    let parent_state_root = self.certified_state_root;
+                    let parent_state_root = self.parent_state_root(block.header.parent_hash);
                     let parent_block_height = block.header.parent_qc.height.0;
                     // Pass the PendingBlock's finalized waves directly — these carry
                     // the proposer's receipts (fetched via FinalizedWaveFetch), ensuring
@@ -2934,17 +2930,10 @@ impl BftState {
             .is_none_or(|existing| qc.height.0 > existing.height.0);
 
         if should_update {
-            // Read the certified block's header fields before adopting the QC.
-            // If the block isn't in memory (votes arrived before header), defer
-            // QC adoption — the late reconciliation in on_block_header will
-            // adopt it when the header arrives. This prevents proposing with
-            // stale certified_in_flight which causes deterministic rejection.
-            let certified_header = self.get_header_by_hash(block_hash);
-
-            if let Some(header) = certified_header {
+            // Defer adoption if the header isn't in memory yet — we need it
+            // to look up parent_state_root / parent_in_flight at proposal time.
+            if self.get_header_by_hash(block_hash).is_some() {
                 self.latest_qc = Some(qc.clone());
-                self.certified_state_root = header.state_root;
-                self.certified_in_flight = header.in_flight;
                 self.maybe_unlock_for_qc(topology, &qc);
             } else {
                 debug!(
@@ -3282,16 +3271,10 @@ impl BftState {
                 "Committing block"
             );
 
-            // Decide the commit action before advancing committed_height.
-            // CommitBlock expects a PreparedCommit from our own VerifyStateRoot
-            // in the io_loop cache. If we never ran state root verification
-            // (e.g., non-voter that aggregated others' votes into a QC, or the
-            // QC-sig-verification callback lost the race with cascading commit),
-            // route through CommitBlockByQcOnly so the io_loop computes the
-            // PreparedCommit inline instead of deadlocking.
-            //
-            // Capture parent state before `record_block_committed` rewrites
-            // `committed_state_root` and `committed_height` to this block's.
+            // CommitBlock expects a cached PreparedCommit from VerifyStateRoot.
+            // If we never verified (non-voter path), route through QcOnly so the
+            // io_loop computes it inline. Capture parent state before
+            // record_block_committed advances it.
             let state_root_verified = self.verification.is_state_root_verified(&current_hash);
             let parent_state_root = self.committed_state_root;
             let parent_block_height = self.committed_height;
@@ -3549,8 +3532,8 @@ impl BftState {
             "Applying synced block"
         );
 
-        // Capture parent state for JMT computation BEFORE advancing heights.
-        let parent_state_root = self.certified_state_root;
+        // Capture parent state BEFORE record_block_committed advances heights.
+        let parent_state_root = self.parent_state_root(block.header.parent_hash);
         let parent_block_height = self.committed_height;
 
         // Advance committed_height. The QC is the proof of commit — same
@@ -3560,19 +3543,17 @@ impl BftState {
         // Track sync progress for the loop iterator.
         self.sync.set_sync_applied_height(height);
 
-        // Update latest QC and certified tracking.
+        // Update latest QC if this one is newer.
         if self
             .latest_qc
             .as_ref()
             .is_none_or(|existing| qc.height.0 > existing.height.0)
         {
             self.latest_qc = Some(qc.clone());
-            self.certified_state_root = block.header.state_root;
-            self.certified_in_flight = block.header.in_flight;
             self.maybe_unlock_for_qc(topology, &qc);
         }
 
-        // Also cache the parent_qc from the block header if it's newer.
+        // Adopt the parent_qc from the block header if it's newer still.
         if !block.header.parent_qc.is_genesis()
             && self
                 .latest_qc
@@ -3581,11 +3562,6 @@ impl BftState {
         {
             self.latest_qc = Some(block.header.parent_qc.clone());
             self.maybe_unlock_for_qc(topology, &block.header.parent_qc);
-
-            if let Some(ph) = self.get_header_by_hash(block.header.parent_qc.block_hash) {
-                self.certified_state_root = ph.state_root;
-                self.certified_in_flight = ph.in_flight;
-            }
         }
 
         let provisions = self
