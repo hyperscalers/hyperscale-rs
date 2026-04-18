@@ -13,7 +13,7 @@
 //! On each commit, the JMT is updated and a new state root hash is
 //! computed.
 
-use crate::column_families::{CfHandles, HOT_WRITE_COLUMN_FAMILIES};
+use crate::column_families::{CfHandles, HOT_WRITE_COLUMN_FAMILIES, STATE_CF};
 use crate::config::RocksDbConfig;
 use crate::jmt_snapshot_store::SnapshotTreeStore;
 use crate::jmt_stored::{StoredNode, StoredNodeKey, VersionedStoredNode};
@@ -160,6 +160,19 @@ impl RocksDbStorage {
                 } else {
                     cf_opts.set_write_buffer_size(cold_write_buffer_size);
                     cf_opts.set_compression_type(config.compression.to_rocksdb());
+                }
+
+                // State CF: fixed 51-byte prefix (entity_key[50] + partition_num[1]).
+                // Groups all versions of all sort_keys under the same (entity,
+                // partition) into one bloom-filter bucket. Enables:
+                //   - `get`: bloom short-circuits SSTs that don't contain this
+                //     partition, before any seek.
+                //   - `list`/partition scans: seek to the 51-byte prefix hits
+                //     bloom first, prunes irrelevant SSTs.
+                // The 8-byte version suffix and variable-length sort_key are
+                // beyond the prefix so they don't reduce bloom selectivity.
+                if name == STATE_CF {
+                    cf_opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(51));
                 }
 
                 ColumnFamilyDescriptor::new(name, cf_opts)
