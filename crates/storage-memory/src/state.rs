@@ -13,7 +13,6 @@ use hyperscale_types::{
     Block, BlockHeight, ExecutionCertificate, ExecutionMetadata, Hash, LocalReceipt,
     QuorumCertificate, RoutableTransaction, ShardGroupId, WaveCertificate,
 };
-use im::OrdMap;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
@@ -30,23 +29,22 @@ use std::sync::Arc;
 /// JMT computations from `prepare_block_commit` take a read lock and can run
 /// concurrently with other readers, while commits take a write lock.
 pub(crate) struct SharedState {
-    /// Radix substate data. `im::OrdMap` for O(1) structural-sharing clones.
-    pub data: OrdMap<Vec<u8>, Vec<u8>>,
     pub tree_store: SimTreeStore,
     pub current_block_height: u64,
     pub current_root_hash: StateRootHash,
     /// Leaf-key → substate-value associations for historical queries.
     pub associations: HashMap<jmt::NodeKey, Vec<u8>>,
-    /// MVCC versioned substate store: `(storage_key, version) → Option<value>`.
-    /// BTreeMap ordering gives prefix scans and version ordering for free.
-    /// A `None` value is a tombstone (deleted substate).
-    pub versioned_substates: VersionedSubstateStore,
+    /// MVCC versioned substate store — the single source of truth for
+    /// substates. `(storage_key, version) → Option<value>`, where `None`
+    /// is a tombstone. BTreeMap ordering gives prefix scans and version
+    /// ordering for free; "current state" is simply the latest entry per
+    /// key.
+    pub substates: VersionedSubstateStore,
 }
 
 impl SharedState {
     pub(crate) fn new() -> Self {
         Self {
-            data: OrdMap::new(),
             // Pruning disabled: historical substate reads traverse the JMT at
             // past heights and need old nodes to still exist. In production,
             // RocksDB GC respects `jmt_history_length` (default 256).
@@ -54,7 +52,7 @@ impl SharedState {
             tree_store: SimTreeStore::new(),
             current_block_height: 0,
             current_root_hash: Hash::ZERO,
-            versioned_substates: BTreeMap::new(),
+            substates: BTreeMap::new(),
             associations: HashMap::new(),
         }
     }
@@ -168,15 +166,21 @@ impl ConsensusState {
 /// MVCC versioned substate store type: `(storage_key, version) → Option<value>`.
 pub(crate) type VersionedSubstateStore = BTreeMap<(Vec<u8>, u64), Option<Vec<u8>>>;
 
-/// Apply database updates to the data OrdMap and optionally the MVCC versioned store.
+/// Apply database updates to the MVCC substate store at `version`.
 ///
-/// When `versioned` is `Some((version, btree))`, also writes each update to the
-/// versioned store keyed by `(storage_key, version)`. Deletes are written as
-/// `None` (tombstone).
-pub(crate) fn apply_updates_to_ordmap(
-    data: &mut OrdMap<Vec<u8>, Vec<u8>>,
+/// Every write lands as `(storage_key, version) → Some(value)` (Set) or
+/// `(storage_key, version) → None` (Delete / Reset tombstone). "Current
+/// state" is derived by walking each key's version list and taking the
+/// latest non-tombstone entry.
+///
+/// For Reset partitions, the helper enumerates existing non-tombstone
+/// keys in the partition (latest entry per key at or below `version - 1`)
+/// and emits tombstones for each at `version` before writing the new
+/// values.
+pub(crate) fn apply_updates(
+    substates: &mut VersionedSubstateStore,
     updates: &DatabaseUpdates,
-    mut versioned: Option<(u64, &mut VersionedSubstateStore)>,
+    version: u64,
 ) {
     for (node_key, node_updates) in &updates.node_updates {
         for (partition_num, partition_updates) in &node_updates.partition_updates {
@@ -189,49 +193,72 @@ pub(crate) fn apply_updates_to_ordmap(
                 PartitionDatabaseUpdates::Delta { substate_updates } => {
                     for (sort_key, update) in substate_updates {
                         let key = keys::to_storage_key(&partition_key, sort_key);
-                        match update {
-                            DatabaseUpdate::Set(value) => {
-                                data.insert(key.clone(), value.clone());
-                                if let Some((ver, vs)) = &mut versioned {
-                                    vs.insert((key, *ver), Some(value.clone()));
-                                }
-                            }
-                            DatabaseUpdate::Delete => {
-                                data.remove(&key);
-                                if let Some((ver, vs)) = &mut versioned {
-                                    vs.insert((key, *ver), None);
-                                }
-                            }
-                        }
+                        let value = match update {
+                            DatabaseUpdate::Set(v) => Some(v.clone()),
+                            DatabaseUpdate::Delete => None,
+                        };
+                        substates.insert((key, version), value);
                     }
                 }
                 PartitionDatabaseUpdates::Reset {
                     new_substate_values,
                 } => {
-                    // Delete all existing in partition using range scan
-                    let prefix = keys::partition_prefix(&partition_key);
-                    let end = keys::next_prefix(&prefix).expect("storage key prefix overflow");
-
-                    let existing_keys: Vec<Vec<u8>> =
-                        data.range(prefix..end).map(|(k, _)| k.clone()).collect();
-
+                    // Enumerate keys currently live in the partition
+                    // (latest non-tombstone entry at or below `version`
+                    // pre-write), tombstone each at `version`.
+                    let existing_keys = live_partition_keys_at(
+                        substates,
+                        &partition_key,
+                        version.saturating_sub(1),
+                    );
                     for key in existing_keys {
-                        data.remove(&key);
-                        if let Some((ver, vs)) = &mut versioned {
-                            vs.insert((key, *ver), None);
-                        }
+                        substates.insert((key, version), None);
                     }
 
-                    // Insert new values
                     for (sort_key, value) in new_substate_values {
                         let key = keys::to_storage_key(&partition_key, sort_key);
-                        data.insert(key.clone(), value.clone());
-                        if let Some((ver, vs)) = &mut versioned {
-                            vs.insert((key, *ver), Some(value.clone()));
-                        }
+                        substates.insert((key, version), Some(value.clone()));
                     }
                 }
             }
         }
     }
+}
+
+/// Return storage keys that have a live (non-tombstone) entry in the
+/// partition at or below `version`.
+fn live_partition_keys_at(
+    substates: &VersionedSubstateStore,
+    partition_key: &DbPartitionKey,
+    version: u64,
+) -> Vec<Vec<u8>> {
+    let prefix = keys::partition_prefix(partition_key);
+    let end = keys::next_prefix(&prefix).expect("storage key prefix overflow");
+    let range_start = (prefix, 0u64);
+    let range_end = (end, 0u64);
+
+    let mut result: Vec<Vec<u8>> = Vec::new();
+    let mut current_key: Option<&Vec<u8>> = None;
+    let mut current_best_is_live = false;
+
+    for ((sk_full, ver), value) in substates.range(range_start..range_end) {
+        if current_key != Some(sk_full) {
+            if let Some(prev) = current_key {
+                if current_best_is_live {
+                    result.push(prev.clone());
+                }
+            }
+            current_key = Some(sk_full);
+            current_best_is_live = false;
+        }
+        if *ver <= version {
+            current_best_is_live = value.is_some();
+        }
+    }
+    if let Some(prev) = current_key {
+        if current_best_is_live {
+            result.push(prev.clone());
+        }
+    }
+    result
 }

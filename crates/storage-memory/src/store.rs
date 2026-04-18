@@ -47,7 +47,7 @@ impl SubstateStore for SimStorage {
         let range_start = (entity_key.clone(), 0u64);
         let range_end = (end_key, 0u64);
 
-        for ((sk, ver), value) in s.versioned_substates.range(range_start..range_end) {
+        for ((sk, ver), value) in s.substates.range(range_start..range_end) {
             // Storage key changed — flush previous group.
             if current_sk != Some(sk) {
                 if let (Some(prev_sk), Some(val)) = (current_sk, current_best) {
@@ -92,11 +92,8 @@ impl SubstateStore for SimStorage {
 
 impl VersionedStore for SimStorage {
     fn snapshot_at(&self, version: u64) -> Self::Snapshot<'_> {
-        let versioned_substates = self.state.read().unwrap().versioned_substates.clone();
-        SimSnapshot {
-            versioned_substates,
-            version,
-        }
+        let substates = self.state.read().unwrap().substates.clone();
+        SimSnapshot { substates, version }
     }
 }
 

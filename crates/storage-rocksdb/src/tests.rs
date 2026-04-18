@@ -38,8 +38,10 @@ fn test_basic_substate_operations() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
 
+    // 50-byte spread-prefix node_key — MVCC iteration decodes composite
+    // keys so raw short keys hit the entity-key length assertion.
     let partition_key = DbPartitionKey {
-        node_key: vec![1, 2, 3],
+        node_key: vec![3u8; 50],
         partition_num: 0,
     };
     let sort_key = DbSortKey(vec![10, 20]);

@@ -334,17 +334,16 @@ impl RocksDbStorage {
     pub(crate) fn build_substate_write_batch(
         &self,
         updates: &DatabaseUpdates,
-        version: Option<u64>,
+        version: u64,
     ) -> (WriteBatch, ResetOldKeys) {
         let mut batch = WriteBatch::default();
         let mut reset_old_keys = ResetOldKeys::new();
 
-        use crate::column_families::{StateCf, VersionedSubstatesCf};
-        use crate::typed_cf::{batch_delete, batch_put};
+        use crate::column_families::StateCf;
+        use crate::typed_cf::batch_put;
 
         let cf = self.cf();
         let state_cf = StateCf::handle(&cf);
-        let versioned_cf = VersionedSubstatesCf::handle(&cf);
 
         for (node_key, node_updates) in &updates.node_updates {
             for (partition_num, partition_updates) in &node_updates.partition_updates {
@@ -356,30 +355,14 @@ impl RocksDbStorage {
                 match partition_updates {
                     PartitionDatabaseUpdates::Delta { substate_updates } => {
                         for (sort_key, update) in substate_updates {
-                            let key = (partition_key.clone(), sort_key.clone());
+                            let key = ((partition_key.clone(), sort_key.clone()), version);
                             match update {
                                 DatabaseUpdate::Set(value) => {
                                     batch_put::<StateCf>(&mut batch, state_cf, &key, value);
-                                    if let Some(ver) = version {
-                                        batch_put::<VersionedSubstatesCf>(
-                                            &mut batch,
-                                            versioned_cf,
-                                            &(key, ver),
-                                            value,
-                                        );
-                                    }
                                 }
                                 DatabaseUpdate::Delete => {
-                                    batch_delete::<StateCf>(&mut batch, state_cf, &key);
-                                    if let Some(ver) = version {
-                                        // Empty value = tombstone
-                                        batch_put::<VersionedSubstatesCf>(
-                                            &mut batch,
-                                            versioned_cf,
-                                            &(key, ver),
-                                            &vec![],
-                                        );
-                                    }
+                                    // Empty value = tombstone at `version`.
+                                    batch_put::<StateCf>(&mut batch, state_cf, &key, &vec![]);
                                 }
                             }
                         }
@@ -387,42 +370,23 @@ impl RocksDbStorage {
                     PartitionDatabaseUpdates::Reset {
                         new_substate_values,
                     } => {
-                        let prefix = crate::substate_key::partition_prefix(&partition_key);
-                        let snap = self.db.snapshot();
-                        let mut old_sort_keys = Vec::new();
-
-                        for ((pk, sk), _value) in
-                            crate::typed_cf::prefix_iter_snap::<StateCf>(&snap, state_cf, &prefix)
-                        {
-                            let key = (pk, sk.clone());
-                            batch_delete::<StateCf>(&mut batch, state_cf, &key);
-                            old_sort_keys.push(sk);
-                            if let Some(ver) = version {
-                                batch_put::<VersionedSubstatesCf>(
-                                    &mut batch,
-                                    versioned_cf,
-                                    &(key, ver),
-                                    &vec![],
-                                );
-                            }
+                        // Enumerate keys currently in the partition (pre-write
+                        // state, i.e. latest entries at version-1 or earlier),
+                        // emit tombstones at `version`, then write new values.
+                        let old_sort_keys = self
+                            .list_partition_sort_keys_at(&partition_key, version.saturating_sub(1));
+                        for sk in &old_sort_keys {
+                            let key = ((partition_key.clone(), sk.clone()), version);
+                            batch_put::<StateCf>(&mut batch, state_cf, &key, &vec![]);
                         }
-
                         if !old_sort_keys.is_empty() {
                             reset_old_keys
                                 .insert((node_key.clone(), *partition_num), old_sort_keys);
                         }
 
                         for (sort_key, value) in new_substate_values {
-                            let key = (partition_key.clone(), sort_key.clone());
+                            let key = ((partition_key.clone(), sort_key.clone()), version);
                             batch_put::<StateCf>(&mut batch, state_cf, &key, value);
-                            if let Some(ver) = version {
-                                batch_put::<VersionedSubstatesCf>(
-                                    &mut batch,
-                                    versioned_cf,
-                                    &(key, ver),
-                                    value,
-                                );
-                            }
                         }
                     }
                 }
@@ -432,20 +396,60 @@ impl RocksDbStorage {
         (batch, reset_old_keys)
     }
 
-    /// Write only substate data (no JMT computation, no MVCC history).
-    ///
-    /// Used during genesis bootstrap so each intermediate `commit()` call from the
-    /// Radix Engine writes substates without computing a JMT version.
-    /// After all genesis commits complete, [`finalize_genesis_jmt`] computes the
-    /// JMT once at version 0 AND writes the merged updates to `versioned_substates`
-    /// in a single pass — this avoids intermediate Reset tombstones from earlier
-    /// bootstrap calls masking values in the version-0 MVCC history that the
-    /// final StateCf correctly contains.
-    pub fn commit_substates_only(&self, updates: &DatabaseUpdates) {
-        // Pass None so build_substate_write_batch skips versioned_substates.
-        let (batch, _) = self.build_substate_write_batch(updates, None);
+    /// Enumerate sort keys that have a live (non-tombstone) entry in the
+    /// given partition at or before `version`. Used by Reset-partition
+    /// handling to know which keys to tombstone at the new version.
+    fn list_partition_sort_keys_at(
+        &self,
+        partition_key: &DbPartitionKey,
+        version: u64,
+    ) -> Vec<DbSortKey> {
+        use crate::column_families::StateCf;
+        use crate::typed_cf::{self, TypedCf};
 
-        // Write substates only — no JMT, no sync (genesis isn't durability-critical).
+        let cf = self.cf();
+        let state_cf = StateCf::handle(&cf);
+        let partition_prefix = crate::substate_key::partition_prefix(partition_key);
+
+        let mut result: Vec<DbSortKey> = Vec::new();
+        let mut current_key: Option<(DbPartitionKey, DbSortKey)> = None;
+        let mut current_best: Option<Vec<u8>> = None;
+
+        for ((substate_key, ver), value) in
+            typed_cf::prefix_iter::<StateCf>(&self.db, state_cf, &partition_prefix)
+        {
+            if current_key.as_ref() != Some(&substate_key) {
+                if let (Some((_pk, sk)), Some(_)) = (current_key.take(), current_best.take()) {
+                    result.push(sk);
+                }
+                current_key = Some(substate_key);
+                current_best = None;
+            }
+            if ver <= version {
+                current_best = if value.is_empty() { None } else { Some(value) };
+            }
+        }
+        if let (Some((_pk, sk)), Some(_)) = (current_key, current_best) {
+            result.push(sk);
+        }
+
+        result
+    }
+
+    /// Write substate data at version 0 (no JMT computation).
+    ///
+    /// Used during genesis bootstrap for each incremental Radix-engine
+    /// commit. Writes go into the single MVCC `state` CF at version 0 so
+    /// that reads via `snapshot_at(0)` during subsequent bootstrap calls
+    /// see the accumulated state. After all genesis commits complete,
+    /// [`finalize_genesis_jmt`] computes the JMT once over the merged
+    /// updates — the substates are already in place by then.
+    pub fn commit_substates_only(&self, updates: &DatabaseUpdates) {
+        // Genesis writes at version 0. Repeat Sets to the same key
+        // overwrite at (key, 0) — idempotent by RocksDB write semantics.
+        let (batch, _) = self.build_substate_write_batch(updates, 0);
+
+        // Substates only — no JMT, no sync (genesis isn't durability-critical).
         self.db
             .write(batch)
             .expect("genesis substate-only commit failed");
@@ -453,9 +457,10 @@ impl RocksDbStorage {
 
     /// Compute the JMT once at version 0 from the merged genesis updates.
     ///
-    /// Called after all genesis bootstrap commits are complete. This avoids
-    /// computing intermediate JMT versions during genesis (which would collide
-    /// with block 1's version).
+    /// Called after all genesis bootstrap commits are complete. The
+    /// substates are already in the state CF at version 0 from the
+    /// incremental `commit_substates_only` calls; this just adds the
+    /// JMT tree for cryptographic commitment.
     ///
     /// # Returns
     /// The genesis state root hash (JMT root at version 0).
@@ -482,10 +487,7 @@ impl RocksDbStorage {
         let jmt_snapshot =
             JmtSnapshot::from_collected_writes(collected, StateRootHash::ZERO, 0, root, 0);
 
-        // Build the MVCC history for version 0 from the merged updates in one
-        // pass — bootstrap intentionally skipped versioned_substates writes,
-        // so we do them here where only final values and tombstones remain.
-        let (mut batch, _) = self.build_substate_write_batch_versioned_only(merged, 0);
+        let mut batch = WriteBatch::default();
         self.append_jmt_to_batch(&mut batch, &jmt_snapshot, 0);
 
         self.db
@@ -493,73 +495,6 @@ impl RocksDbStorage {
             .expect("genesis JMT finalization failed");
 
         root
-    }
-
-    /// Build a `WriteBatch` containing only `versioned_substates` writes for
-    /// the given merged updates at `version`. Used by
-    /// [`Self::finalize_genesis_jmt`] to populate MVCC history once from the
-    /// merged genesis state, avoiding tombstones left by intermediate
-    /// Reset-partition bootstrap commits.
-    fn build_substate_write_batch_versioned_only(
-        &self,
-        updates: &DatabaseUpdates,
-        version: u64,
-    ) -> (WriteBatch, ResetOldKeys) {
-        let mut batch = WriteBatch::default();
-        let reset_old_keys = ResetOldKeys::new();
-        use crate::column_families::VersionedSubstatesCf;
-        use crate::typed_cf::batch_put;
-
-        let versioned_cf = VersionedSubstatesCf::handle(&self.cf());
-
-        for (node_key, node_updates) in &updates.node_updates {
-            for (partition_num, partition_updates) in &node_updates.partition_updates {
-                let partition_key = DbPartitionKey {
-                    node_key: node_key.clone(),
-                    partition_num: *partition_num,
-                };
-                match partition_updates {
-                    PartitionDatabaseUpdates::Delta { substate_updates } => {
-                        for (sort_key, update) in substate_updates {
-                            let key = (partition_key.clone(), sort_key.clone());
-                            match update {
-                                DatabaseUpdate::Set(value) => {
-                                    batch_put::<VersionedSubstatesCf>(
-                                        &mut batch,
-                                        versioned_cf,
-                                        &(key, version),
-                                        value,
-                                    );
-                                }
-                                DatabaseUpdate::Delete => {
-                                    batch_put::<VersionedSubstatesCf>(
-                                        &mut batch,
-                                        versioned_cf,
-                                        &(key, version),
-                                        &vec![],
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    PartitionDatabaseUpdates::Reset {
-                        new_substate_values,
-                    } => {
-                        for (sort_key, value) in new_substate_values {
-                            let key = (partition_key.clone(), sort_key.clone());
-                            batch_put::<VersionedSubstatesCf>(
-                                &mut batch,
-                                versioned_cf,
-                                &(key, version),
-                                value,
-                            );
-                        }
-                    }
-                }
-            }
-        }
-
-        (batch, reset_old_keys)
     }
 }
 
@@ -580,13 +515,15 @@ impl SubstateDatabase for RocksDbStorage {
         partition_key: &DbPartitionKey,
         sort_key: &DbSortKey,
     ) -> Option<DbSubstateValue> {
+        // Default-version snapshot (= current committed tip) reads the
+        // latest value for this key via MVCC walk-back. Delegating to
+        // `snapshot()` keeps a single read path.
         let start = Instant::now();
-        let result = self
-            .cf_get::<crate::column_families::StateCf>(&(partition_key.clone(), sort_key.clone()));
+        let result = <Self as hyperscale_storage::SubstateStore>::snapshot(self)
+            .get_raw_substate_by_db_key(partition_key, sort_key);
         let elapsed = start.elapsed();
         metrics::record_storage_read(elapsed.as_secs_f64());
 
-        // Record span fields
         let span = tracing::Span::current();
         span.record("found", result.is_some());
         span.record("latency_us", elapsed.as_micros() as u64);
@@ -599,23 +536,12 @@ impl SubstateDatabase for RocksDbStorage {
         partition_key: &DbPartitionKey,
         from_sort_key: Option<&DbSortKey>,
     ) -> Box<dyn Iterator<Item = PartitionEntry> + '_> {
-        let prefix = crate::substate_key::partition_prefix(partition_key);
-        let start = match from_sort_key {
-            Some(sort_key) => {
-                let mut s = prefix.clone();
-                s.extend_from_slice(&sort_key.0);
-                s
-            }
-            None => prefix.clone(),
-        };
-
-        let cf = crate::column_families::StateCf::handle(&self.cf());
-        Box::new(
-            crate::typed_cf::prefix_iter_from::<crate::column_families::StateCf>(
-                &self.db, cf, &prefix, &start,
-            )
-            .map(|((_pk, sk), value)| (sk, value)),
-        )
+        // Partition scan at current version. Same rationale as `get` —
+        // one canonical read path through MVCC.
+        let items: Vec<_> = <Self as hyperscale_storage::SubstateStore>::snapshot(self)
+            .list_raw_values_from_db_key(partition_key, from_sort_key)
+            .collect();
+        Box::new(items.into_iter())
     }
 }
 
@@ -664,8 +590,7 @@ impl RocksDbStorage {
         let parent_version = hyperscale_storage::tree::jmt_parent_height(base_version, base_root);
         let new_version = base_version + 1;
 
-        let (mut batch, reset_old_keys) =
-            self.build_substate_write_batch(updates, Some(new_version));
+        let (mut batch, reset_old_keys) = self.build_substate_write_batch(updates, new_version);
 
         let (new_root, collected) = hyperscale_storage::tree::put_at_version(
             &snapshot_store,

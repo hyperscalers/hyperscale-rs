@@ -115,7 +115,7 @@ impl hyperscale_storage::ChainWriter for RocksDbStorage {
 
         // Pre-build substate + receipt writes into a WriteBatch for efficient commit.
         let (mut write_batch, _reset_old_keys) =
-            self.build_substate_write_batch(&merged_updates, Some(block_height));
+            self.build_substate_write_batch(&merged_updates, block_height);
 
         for bundle in &receipts {
             self.add_receipt_bundle_to_batch(&mut write_batch, bundle);
@@ -259,7 +259,7 @@ impl RocksDbStorage {
         );
 
         let (mut batch, reset_old_keys) =
-            self.build_substate_write_batch(merged_updates, Some(block_height));
+            self.build_substate_write_batch(merged_updates, block_height);
 
         // Persist block data (header, transactions, certificates) atomically.
         self.append_block_to_batch(&mut batch, block, qc);

@@ -1,13 +1,14 @@
 //! Core `SimStorage` struct and basic implementations.
 //!
 //! In-memory storage for deterministic simulation testing (DST).
-//! Uses `im::OrdMap` for O(1) structural-sharing clones.
+//! Substates are held in a single MVCC store: `(storage_key, version) →
+//! Option<value>`. "Current state" is derived by walking the latest entry
+//! per key; historical reads anchor to any version in the retention window.
 
-use crate::state::{apply_updates_to_ordmap, ConsensusState, SharedState};
+use crate::state::{apply_updates, ConsensusState, SharedState};
 
 use hyperscale_storage::{
-    keys, DatabaseUpdates, DbPartitionKey, DbSortKey, DbSubstateValue, PartitionEntry,
-    SubstateDatabase,
+    DatabaseUpdates, DbPartitionKey, DbSortKey, DbSubstateValue, PartitionEntry, SubstateDatabase,
 };
 use hyperscale_types::Hash;
 #[cfg(test)]
@@ -16,21 +17,19 @@ use std::sync::{Arc, RwLock};
 
 /// In-memory storage for simulation and testing.
 ///
-/// Uses `im::OrdMap` which provides:
-/// - Deterministic ordering (like BTreeMap)
-/// - O(1) clone via structural sharing
-/// - Thread-safe with Arc internally
+/// All substates live in an MVCC-versioned BTreeMap — the single source
+/// of truth. This mirrors `RocksDbStorage`'s single-CF design and avoids
+/// the dual-write / divergence class of bugs that a separate "current
+/// state" structure would introduce.
 ///
-/// This is critical for DST - same operations produce identical results,
-/// and snapshots are cheap regardless of data size.
-///
-/// Implements Radix's `SubstateDatabase` directly, plus our `SubstateStore` extension
-/// for snapshots, node listing, and JMT state roots.
+/// Implements Radix's `SubstateDatabase` directly, plus our `SubstateStore` /
+/// `VersionedStore` extensions for snapshots, node listing, and JMT state
+/// roots.
 ///
 /// # Locking Strategy
 ///
 /// Two RwLocks with independent lifetimes — no ordering constraint:
-/// - `state`: Substate data + JMT tree store + version/root/associations.
+/// - `state`: MVCC substate store + JMT tree store + version/root/associations.
 ///   Read lock for substate reads, JMT lookups, and speculative computation.
 ///   Write lock for commits (substate writes + JMT updates in one acquisition).
 /// - `consensus`: Block metadata, certificates, votes, committed state.
@@ -69,23 +68,15 @@ impl SimStorage {
         *self.consensus.write().unwrap() = ConsensusState::new();
     }
 
-    /// Get number of substate keys stored.
+    /// Number of MVCC substate entries. Approximates "size" — a single
+    /// key with many historical versions counts as multiple entries.
     pub fn len(&self) -> usize {
-        self.state.read().unwrap().data.len()
+        self.state.read().unwrap().substates.len()
     }
 
-    /// Check if substate storage is empty.
+    /// Whether the MVCC substate store has any entries.
     pub fn is_empty(&self) -> bool {
-        self.state.read().unwrap().data.is_empty()
-    }
-
-    /// Internal: iterate over a key range using OrdMap::range() for O(log n + k) lookup.
-    pub(crate) fn iter_range(&self, start: &[u8], end: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
-        let s = self.state.read().unwrap();
-        s.data
-            .range(start.to_vec()..end.to_vec())
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect()
+        self.state.read().unwrap().substates.is_empty()
     }
 
     /// Atomically commit a certificate and its state writes.
@@ -104,12 +95,7 @@ impl SimStorage {
         {
             let mut s = self.state.write().unwrap();
             let ver = s.current_block_height;
-            let crate::state::SharedState {
-                ref mut data,
-                ref mut versioned_substates,
-                ..
-            } = *s;
-            apply_updates_to_ordmap(data, updates, Some((ver, versioned_substates)));
+            apply_updates(&mut s.substates, updates, ver);
         }
         self.consensus
             .write()
@@ -130,14 +116,7 @@ impl SimStorage {
         let new_version = s.current_block_height + 1;
 
         // Apply substate updates first (visible for association resolution below).
-        {
-            let crate::state::SharedState {
-                ref mut data,
-                ref mut versioned_substates,
-                ..
-            } = *s;
-            apply_updates_to_ordmap(data, updates, Some((new_version, versioned_substates)));
-        }
+        apply_updates(&mut s.substates, updates, new_version);
 
         let parent_version = hyperscale_storage::tree::jmt_parent_height(
             s.current_block_height,
@@ -162,20 +141,15 @@ impl SimStorage {
         s.current_root_hash = new_root;
     }
 
-    /// Write only substate data (no JMT computation).
+    /// Write substate data at version 0 (no JMT computation).
     ///
-    /// Used during genesis bootstrap so each intermediate `commit()` call from the
-    /// Radix Engine writes substates without computing a JMT version.
-    /// After all genesis commits complete, [`finalize_genesis_jmt`] computes the
-    /// JMT once at version 0.
+    /// Used during genesis bootstrap for each incremental Radix-engine
+    /// commit. Writes go into the MVCC store at version 0 so reads during
+    /// subsequent bootstrap calls see the accumulated state. After all
+    /// genesis commits, [`finalize_genesis_jmt`] computes the JMT once.
     pub fn commit_substates_only(&self, updates: &DatabaseUpdates) {
         let mut s = self.state.write().unwrap();
-        // Skip MVCC writes during bootstrap — intermediate Reset partitions
-        // could tombstone values that later commits re-add, leaving holes in
-        // version-0 history. `finalize_genesis_jmt` writes the merged final
-        // state to `versioned_substates` in a single pass.
-        let crate::state::SharedState { ref mut data, .. } = *s;
-        apply_updates_to_ordmap(data, updates, None);
+        apply_updates(&mut s.substates, updates, 0);
     }
 
     /// Compute the JMT once at version 0 from the merged genesis updates.
@@ -211,54 +185,10 @@ impl SimStorage {
             s.tree_store.remove(stale_key);
         }
 
-        // Populate MVCC history from the merged genesis updates in one pass.
-        // Bootstrap intentionally skipped versioned writes to avoid Reset
-        // tombstones masking later re-writes at version 0.
-        Self::write_merged_versioned_at(&mut s.versioned_substates, merged, 0);
-
         s.current_block_height = 0;
         s.current_root_hash = root;
 
         root
-    }
-
-    fn write_merged_versioned_at(
-        versioned: &mut crate::state::VersionedSubstateStore,
-        updates: &DatabaseUpdates,
-        version: u64,
-    ) {
-        use hyperscale_storage::{keys, DatabaseUpdate, DbPartitionKey, PartitionDatabaseUpdates};
-        for (node_key, node_updates) in &updates.node_updates {
-            for (partition_num, partition_updates) in &node_updates.partition_updates {
-                let partition_key = DbPartitionKey {
-                    node_key: node_key.clone(),
-                    partition_num: *partition_num,
-                };
-                match partition_updates {
-                    PartitionDatabaseUpdates::Delta { substate_updates } => {
-                        for (sort_key, update) in substate_updates {
-                            let key = keys::to_storage_key(&partition_key, sort_key);
-                            match update {
-                                DatabaseUpdate::Set(value) => {
-                                    versioned.insert((key, version), Some(value.clone()));
-                                }
-                                DatabaseUpdate::Delete => {
-                                    versioned.insert((key, version), None);
-                                }
-                            }
-                        }
-                    }
-                    PartitionDatabaseUpdates::Reset {
-                        new_substate_values,
-                    } => {
-                        for (sort_key, value) in new_substate_values {
-                            let key = keys::to_storage_key(&partition_key, sort_key);
-                            versioned.insert((key, version), Some(value.clone()));
-                        }
-                    }
-                }
-            }
-        }
     }
 }
 
@@ -274,9 +204,10 @@ impl SubstateDatabase for SimStorage {
         partition_key: &DbPartitionKey,
         sort_key: &DbSortKey,
     ) -> Option<DbSubstateValue> {
-        let key = keys::to_storage_key(partition_key, sort_key);
-        let s = self.state.read().unwrap();
-        s.data.get(&key).cloned()
+        // Default-version snapshot (= current committed tip) reads the
+        // latest value via MVCC walk-back.
+        <Self as hyperscale_storage::SubstateStore>::snapshot(self)
+            .get_raw_substate_by_db_key(partition_key, sort_key)
     }
 
     fn list_raw_values_from_db_key(
@@ -284,29 +215,10 @@ impl SubstateDatabase for SimStorage {
         partition_key: &DbPartitionKey,
         from_sort_key: Option<&DbSortKey>,
     ) -> Box<dyn Iterator<Item = PartitionEntry> + '_> {
-        let prefix = keys::partition_prefix(partition_key);
-        let prefix_len = prefix.len();
-
-        let start = match from_sort_key {
-            Some(sort_key) => {
-                let mut s = prefix.clone();
-                s.extend_from_slice(&sort_key.0);
-                s
-            }
-            None => prefix.clone(),
-        };
-        let end = keys::next_prefix(&prefix).expect("storage key prefix overflow");
-
-        let items = self.iter_range(&start, &end);
-
-        Box::new(items.into_iter().filter_map(move |(full_key, value)| {
-            if full_key.len() > prefix_len {
-                let sort_key_bytes = full_key[prefix_len..].to_vec();
-                Some((DbSortKey(sort_key_bytes), value))
-            } else {
-                None
-            }
-        }))
+        let items: Vec<_> = <Self as hyperscale_storage::SubstateStore>::snapshot(self)
+            .list_raw_values_from_db_key(partition_key, from_sort_key)
+            .collect();
+        Box::new(items.into_iter())
     }
 }
 

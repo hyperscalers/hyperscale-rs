@@ -598,3 +598,43 @@ fn test_snapshot_at_version_is_deterministic_across_persistence_lag() {
         "validators at different persisted heights must agree on version-3 state"
     );
 }
+
+/// Exercises the seek-for-prev read path: a key with many historical
+/// versions resolves to the correct floor at any target version without
+/// scanning all intermediate versions. Correctness check; the perf win
+/// is visible as lower CPU on hot keys in production.
+#[test]
+fn test_snapshot_resolves_floor_among_many_versions() {
+    use hyperscale_storage::VersionedStore;
+
+    let node_seed = 5u8;
+    let nid = NodeId([node_seed; 30]);
+    let partition_num = 0;
+    let sort_key = vec![1u8];
+
+    let storage = SimStorage::new();
+    for h in 1..=50u64 {
+        let block = make_test_block(h);
+        let qc = make_test_qc(&block);
+        let updates =
+            make_mapped_database_update(node_seed, partition_num, sort_key.clone(), vec![h as u8]);
+        commit_with(&storage, &updates, &block, &qc);
+    }
+
+    let pk = DbPartitionKey {
+        node_key: hyperscale_storage::keys::node_entity_key(&nid),
+        partition_num,
+    };
+    let sk = DbSortKey(sort_key);
+
+    // Read at every 10th version — each should return the exact write
+    // from that height, not the latest or any adjacent version.
+    for target in [1u64, 10, 20, 25, 49, 50] {
+        let snap = storage.snapshot_at(target);
+        assert_eq!(
+            snap.get_raw_substate_by_db_key(&pk, &sk),
+            Some(vec![target as u8]),
+            "snapshot_at({target}) should resolve to block-{target} value"
+        );
+    }
+}

@@ -6,7 +6,7 @@
 //!   CF, keeping only the floor entry (latest version ≤ cutoff) per substate
 //!   key so historical reads within the retention window still resolve.
 
-use crate::column_families::{JmtNodesCf, StaleJmtNodesCf, VersionedSubstatesCf};
+use crate::column_families::{JmtNodesCf, StaleJmtNodesCf, StateCf};
 use crate::core::RocksDbStorage;
 use crate::typed_cf::{self, TypedCf};
 
@@ -161,7 +161,7 @@ impl RocksDbStorage {
         }
 
         let cf = self.cf();
-        let versioned_cf = VersionedSubstatesCf::handle(&cf);
+        let versioned_cf = StateCf::handle(&cf);
 
         // Full sequential scan. Keys are ordered as [storage_key][version_BE],
         // so entries for the same substate key are contiguous with versions
@@ -198,10 +198,14 @@ impl RocksDbStorage {
             let version = u64::from_be_bytes(raw_key[key_len..].try_into().unwrap());
 
             // Detect substate key group change — flush pending deletes from
-            // the previous group. The last pending entry was the floor; it
-            // was already removed from pending_deletes below.
+            // the previous group. The last pending entry is the floor for
+            // that group; keep it so reads beyond the retention window
+            // still resolve. Only the post-cutoff branch below pops the
+            // floor explicitly, and that only fires if the group had
+            // entries > cutoff. Groups with only pre-cutoff entries reach
+            // this boundary with the floor still buffered — pop it here.
             if prev_storage_key.as_deref() != Some(storage_key) {
-                // Flush remaining pending deletes from previous group.
+                pending_deletes.pop(); // keep the floor from the previous group
                 for dk in pending_deletes.drain(..) {
                     batch.delete_cf(versioned_cf, &dk);
                     deleted += 1;
@@ -280,3 +284,81 @@ impl RocksDbStorage {
 // Re-export the jmt_key type alias for compatibility elsewhere if needed.
 #[allow(unused)]
 fn _assert_jmt_key_stable(_k: &jmt::NodeKey) {}
+
+#[cfg(test)]
+mod tests {
+    use crate::core::RocksDbStorage;
+    use hyperscale_storage::{
+        DatabaseUpdate, DatabaseUpdates, DbPartitionKey, DbSortKey, NodeDatabaseUpdates,
+        PartitionDatabaseUpdates, SubstateDatabase,
+    };
+    use tempfile::TempDir;
+
+    /// Regression test for the GC group-boundary bug: keys with only
+    /// pre-cutoff versions must retain their floor entry so reads after
+    /// GC still resolve. Before the fix, the group-boundary drain
+    /// unconditionally deleted all pending entries (including the floor)
+    /// for every group except the last one in the scan.
+    #[test]
+    fn gc_preserves_floor_entry_for_all_groups() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut config = crate::config::RocksDbConfig::default();
+        config.jmt_history_length = 2; // tiny retention for test
+        let storage = RocksDbStorage::open_with_config(temp_dir.path(), config).unwrap();
+
+        // Two distinct substate keys, each written once at version 1
+        // (pre-cutoff after we advance past height 3).
+        let mk_key = |seed: u8, sort: u8| {
+            (
+                DbPartitionKey {
+                    node_key: vec![seed; 50],
+                    partition_num: 0,
+                },
+                DbSortKey(vec![sort]),
+            )
+        };
+        let (pk_a, sk_a) = mk_key(1, 10);
+        let (pk_b, sk_b) = mk_key(2, 20);
+
+        let mut writes = DatabaseUpdates::default();
+        for (pk, sk, v) in [
+            (pk_a.clone(), sk_a.clone(), vec![0xAA]),
+            (pk_b.clone(), sk_b.clone(), vec![0xBB]),
+        ] {
+            writes
+                .node_updates
+                .entry(pk.node_key.clone())
+                .or_insert_with(|| NodeDatabaseUpdates {
+                    partition_updates: Default::default(),
+                })
+                .partition_updates
+                .insert(
+                    pk.partition_num,
+                    PartitionDatabaseUpdates::Delta {
+                        substate_updates: [(sk, DatabaseUpdate::Set(v))].into_iter().collect(),
+                    },
+                );
+        }
+        storage.commit(&writes).unwrap();
+
+        // Advance the JMT version past the retention window with empty
+        // commits so the cutoff for GC is above version 1.
+        for _ in 0..4 {
+            storage.commit(&DatabaseUpdates::default()).unwrap();
+        }
+
+        storage.run_versioned_substates_gc();
+
+        // Both keys must still resolve — their floor entries survive GC.
+        assert_eq!(
+            storage.get_raw_substate_by_db_key(&pk_a, &sk_a),
+            Some(vec![0xAA]),
+            "floor entry for key A must be preserved across GC"
+        );
+        assert_eq!(
+            storage.get_raw_substate_by_db_key(&pk_b, &sk_b),
+            Some(vec![0xBB]),
+            "floor entry for key B must be preserved across GC"
+        );
+    }
+}

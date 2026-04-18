@@ -42,7 +42,7 @@ impl SubstateStore for RocksDbStorage {
         }
 
         let entity_prefix = substate_key::node_entity_key(node_id);
-        let versioned_cf = crate::column_families::VersionedSubstatesCf::handle(&self.cf());
+        let versioned_cf = crate::column_families::StateCf::handle(&self.cf());
         let snap = self.db.snapshot();
 
         // MVCC scan: iterate versioned_substates for this entity prefix.
@@ -55,7 +55,7 @@ impl SubstateStore for RocksDbStorage {
         let mut current_best: Option<Vec<u8>> = None;
 
         for ((substate_key, version), value) in crate::typed_cf::prefix_iter_snap::<
-            crate::column_families::VersionedSubstatesCf,
+            crate::column_families::StateCf,
         >(&snap, versioned_cf, &entity_prefix)
         {
             // Substate key changed — flush previous group.

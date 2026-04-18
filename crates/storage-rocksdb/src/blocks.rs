@@ -469,8 +469,10 @@ impl RocksDbStorage {
         self.cf_put::<CertificatesCf>(&mut batch, &certificate.wave_id.hash(), certificate);
         write_count += 1;
 
-        // 2. Add state writes to batch
+        // 2. Add state writes to batch at the current JMT version (this
+        //    helper is test-only; production goes through `commit_block`).
         let state_cf = crate::column_families::StateCf::handle(&cf);
+        let version = self.read_jmt_metadata().0;
         for (db_node_key, node_updates) in &updates.node_updates {
             for (partition_num, partition_updates) in &node_updates.partition_updates {
                 if let hyperscale_storage::PartitionDatabaseUpdates::Delta { substate_updates } =
@@ -481,22 +483,19 @@ impl RocksDbStorage {
                             node_key: db_node_key.clone(),
                             partition_num: *partition_num,
                         };
-                        let key = (partition_key, db_sort_key.clone());
+                        let key = ((partition_key, db_sort_key.clone()), version);
 
-                        match update {
-                            hyperscale_storage::DatabaseUpdate::Set(value) => {
-                                crate::typed_cf::batch_put::<crate::column_families::StateCf>(
-                                    &mut batch, state_cf, &key, value,
-                                );
-                                write_count += 1;
-                            }
-                            hyperscale_storage::DatabaseUpdate::Delete => {
-                                crate::typed_cf::batch_delete::<crate::column_families::StateCf>(
-                                    &mut batch, state_cf, &key,
-                                );
-                                write_count += 1;
-                            }
-                        }
+                        let value_bytes: Vec<u8> = match update {
+                            hyperscale_storage::DatabaseUpdate::Set(value) => value.clone(),
+                            hyperscale_storage::DatabaseUpdate::Delete => Vec::new(),
+                        };
+                        crate::typed_cf::batch_put::<crate::column_families::StateCf>(
+                            &mut batch,
+                            state_cf,
+                            &key,
+                            &value_bytes,
+                        );
+                        write_count += 1;
                     }
                 }
             }

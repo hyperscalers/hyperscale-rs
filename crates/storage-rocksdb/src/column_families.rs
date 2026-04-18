@@ -16,7 +16,11 @@ use hyperscale_types::{
 /// Column family name for the default CF (chain metadata, JMT metadata).
 pub(crate) const DEFAULT_CF: &str = "default";
 
-/// Column family name for substate data.
+/// Column family name for substate data. This CF is the single source of
+/// truth for substates — every write is versioned as `(storage_key,
+/// version)`, and the "current state" is simply the latest entry per key.
+/// Historical reads use version-aware walks; GC keeps a floor entry per
+/// key so reads at any height in the retention window resolve correctly.
 pub(crate) const STATE_CF: &str = "state";
 
 /// Column family name for block metadata (header + manifest) keyed by height.
@@ -37,11 +41,6 @@ pub(crate) const JMT_NODES_CF: &str = "jmt_nodes";
 /// GC deletes entries older than `current_version - jmt_history_length`.
 pub(crate) const STALE_JMT_NODES_CF: &str = "stale_jmt_nodes";
 
-/// Column family for MVCC versioned substates.
-/// Key: `storage_key_bytes ++ version_BE_8B`, Value: SBOR-encoded substate bytes.
-/// Enables historical reads via prefix scan + version filtering.
-pub(crate) const VERSIONED_SUBSTATES_CF: &str = "versioned_substates";
-
 /// Column family name for local receipts keyed by tx hash.
 pub(crate) const LOCAL_RECEIPTS_CF: &str = "local_receipts";
 
@@ -59,10 +58,8 @@ pub(crate) const EXECUTION_CERTS_BY_HEIGHT_CF: &str = "execution_certs_by_height
 // See CommittedHeightEntry, CommittedHashEntry, CommittedQcEntry, JmtMetadataEntry.
 
 /// CFs with high write throughput — get larger write buffers and tiered compression.
-/// State and JMT nodes are updated on every block commit; versioned substates
-/// mirror state writes for MVCC.
-pub(crate) const HOT_WRITE_COLUMN_FAMILIES: &[&str] =
-    &[STATE_CF, JMT_NODES_CF, VERSIONED_SUBSTATES_CF];
+/// State (MVCC-versioned) and JMT nodes are updated on every block commit.
+pub(crate) const HOT_WRITE_COLUMN_FAMILIES: &[&str] = &[STATE_CF, JMT_NODES_CF];
 
 /// All column families used by the storage layer.
 pub(crate) const ALL_COLUMN_FAMILIES: &[&str] = &[
@@ -73,7 +70,6 @@ pub(crate) const ALL_COLUMN_FAMILIES: &[&str] = &[
     CERTIFICATES_CF,
     JMT_NODES_CF,
     STALE_JMT_NODES_CF,
-    VERSIONED_SUBSTATES_CF,
     LOCAL_RECEIPTS_CF,
     EXECUTION_OUTPUTS_CF,
     EXECUTION_CERTS_CF,
@@ -95,7 +91,6 @@ pub(crate) struct CfHandles<'a> {
     certificates: &'a rocksdb::ColumnFamily,
     jmt_nodes: &'a rocksdb::ColumnFamily,
     stale_jmt_nodes: &'a rocksdb::ColumnFamily,
-    versioned_substates: &'a rocksdb::ColumnFamily,
     local_receipts: &'a rocksdb::ColumnFamily,
     execution_outputs: &'a rocksdb::ColumnFamily,
     execution_certs: &'a rocksdb::ColumnFamily,
@@ -119,7 +114,6 @@ impl<'a> CfHandles<'a> {
             certificates: resolve(CERTIFICATES_CF),
             jmt_nodes: resolve(JMT_NODES_CF),
             stale_jmt_nodes: resolve(STALE_JMT_NODES_CF),
-            versioned_substates: resolve(VERSIONED_SUBSTATES_CF),
             local_receipts: resolve(LOCAL_RECEIPTS_CF),
             execution_outputs: resolve(EXECUTION_OUTPUTS_CF),
             execution_certs: resolve(EXECUTION_CERTS_CF),
@@ -194,26 +188,18 @@ impl TypedCf for StaleJmtNodesCf {
     }
 }
 
-// State
-
+// State — MVCC-versioned single source of truth.
+//
+// Key: `((partition_key, sort_key), version)` encoded as
+// `storage_key_bytes ++ version_BE_8B`. Value: opaque substate bytes
+// (empty = tombstone).
+//
+// Reads resolve to the latest version ≤ target via walk-back. "Current
+// state" is simply `snapshot_at(jmt_version())`. GC keeps a floor entry
+// per key so reads within the retention window always resolve.
 pub(crate) struct StateCf;
 impl TypedCf for StateCf {
     const NAME: &'static str = STATE_CF;
-    type Key = (
-        radix_substate_store_interface::interface::DbPartitionKey,
-        radix_substate_store_interface::interface::DbSortKey,
-    );
-    type Value = Vec<u8>; // opaque substate bytes — schema owned by Radix engine
-    type KeyCodec = crate::substate_key::SubstateKeyCodec;
-    type ValueCodec = RawCodec;
-    fn handle<'a>(cf: &CfHandles<'a>) -> &'a rocksdb::ColumnFamily {
-        cf.state
-    }
-}
-
-pub(crate) struct VersionedSubstatesCf;
-impl TypedCf for VersionedSubstatesCf {
-    const NAME: &'static str = VERSIONED_SUBSTATES_CF;
     type Key = (
         (
             radix_substate_store_interface::interface::DbPartitionKey,
@@ -225,7 +211,7 @@ impl TypedCf for VersionedSubstatesCf {
     type KeyCodec = crate::versioned_key::VersionedSubstateKeyCodec;
     type ValueCodec = RawCodec;
     fn handle<'a>(cf: &CfHandles<'a>) -> &'a rocksdb::ColumnFamily {
-        cf.versioned_substates
+        cf.state
     }
 }
 

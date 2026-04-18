@@ -1,7 +1,7 @@
 //! `ChainWriter` implementation for `SimStorage`.
 
 use crate::core::SimStorage;
-use crate::state::apply_updates_to_ordmap;
+use crate::state::apply_updates;
 
 use hyperscale_storage::{ChainWriter, DatabaseUpdates, JmtSnapshot};
 use hyperscale_types::{Hash, ReceiptBundle};
@@ -131,18 +131,7 @@ impl ChainWriter for SimStorage {
 
                     s.apply_jmt_snapshot(prepared.snapshot);
 
-                    {
-                        let crate::state::SharedState {
-                            ref mut data,
-                            ref mut versioned_substates,
-                            ..
-                        } = *s;
-                        apply_updates_to_ordmap(
-                            data,
-                            &prepared.merged_updates,
-                            Some((block_height, versioned_substates)),
-                        );
-                    }
+                    apply_updates(&mut s.substates, &prepared.merged_updates, block_height);
                 }
 
                 let mut c = self.consensus.write().unwrap();
@@ -222,19 +211,8 @@ impl SimStorage {
             s.current_block_height
         );
 
-        // Apply substate writes to OrdMap + MVCC versioned store.
-        {
-            let crate::state::SharedState {
-                ref mut data,
-                ref mut versioned_substates,
-                ..
-            } = *s;
-            apply_updates_to_ordmap(
-                data,
-                merged_updates,
-                Some((block_height, versioned_substates)),
-            );
-        }
+        // Apply substate writes to the MVCC store at this block height.
+        apply_updates(&mut s.substates, merged_updates, block_height);
 
         let parent_version = hyperscale_storage::tree::jmt_parent_height(
             s.current_block_height,
