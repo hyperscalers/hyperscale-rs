@@ -93,7 +93,7 @@ impl SubstateStore for RocksDbStorage {
         storage_keys: &[Vec<u8>],
         block_height: u64,
     ) -> Option<hyperscale_types::MerkleInclusionProof> {
-        // Use a RocksDB snapshot for all reads so concurrent JVT GC cannot
+        // Use a RocksDB snapshot for all reads so concurrent JMT GC cannot
         // delete nodes mid-proof-generation.
         let snapshot_store = SnapshotTreeStore::new(&self.db);
         hyperscale_storage::tree::proofs::generate_proof(
@@ -108,10 +108,10 @@ impl RocksDbStorage {
     /// Try to apply a prepared block commit with a single fsync.
     ///
     /// This is the fast path for block commit. Applies the pre-built WriteBatch
-    /// atomically with one fsync, including all JVT nodes from the snapshot.
+    /// atomically with one fsync, including all JMT nodes from the snapshot.
     ///
     /// Returns `true` if successfully applied (fast path),
-    /// or `false` if the JVT state has changed since preparation
+    /// or `false` if the JMT state has changed since preparation
     /// (caller should fall back to slow path).
     ///
     /// # Panics
@@ -135,7 +135,7 @@ impl RocksDbStorage {
             tracing::warn!(
                 expected_root = ?jmt_snapshot.base_root,
                 actual_root = ?current_root_hash,
-                "JVT snapshot base ROOT mismatch - falling back to slow path"
+                "JMT snapshot base ROOT mismatch - falling back to slow path"
             );
             return false;
         }
@@ -143,7 +143,7 @@ impl RocksDbStorage {
             tracing::debug!(
                 expected_version = jmt_snapshot.base_version,
                 actual_version = current_version,
-                "JVT snapshot base VERSION mismatch (root matches) - proceeding with fast path. \
+                "JMT snapshot base VERSION mismatch (root matches) - proceeding with fast path. \
                  This is expected when empty commits advance the version counter."
             );
         }

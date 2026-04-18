@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 /// Precomputed commit work for a SimStorage block commit.
 ///
-/// Contains a `JmtSnapshot` (precomputed verkle tree nodes) plus the
+/// Contains a `JmtSnapshot` (precomputed merkle tree nodes) plus the
 /// merged updates and receipts for substate application at commit time.
 pub struct SimPreparedCommit {
     snapshot: JmtSnapshot,
@@ -58,7 +58,7 @@ impl ChainWriter for SimStorage {
             return (parent_state_root, prepared);
         }
 
-        // Read lock: compute speculative JVT root.
+        // Read lock: compute speculative JMT root.
         let s = self.state.read().unwrap();
 
         let parent_version =
@@ -253,7 +253,7 @@ impl SimStorage {
             s.tree_store
                 .insert(key.clone(), std::sync::Arc::clone(node));
         }
-        // NOTE: stale JVT nodes are NOT deleted — see apply_jmt_snapshot comment.
+        // NOTE: stale JMT nodes are NOT deleted — see apply_jmt_snapshot comment.
         // Historical roots must be retained for provision proof generation at
         // past block heights. RocksDB GC handles pruning in production.
 

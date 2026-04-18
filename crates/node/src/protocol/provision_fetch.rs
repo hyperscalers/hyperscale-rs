@@ -458,7 +458,7 @@ pub fn serve_provision_request(
                 None => {
                     warn!(
                         block_height = req.block_height.0,
-                        jmt_version, "Provision request: historical JVT version unavailable"
+                        jmt_version, "Provision request: historical JMT version unavailable"
                     );
                     return GetProvisionResponse {
                         provisions: None,

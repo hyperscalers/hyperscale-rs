@@ -283,7 +283,7 @@ pub fn verify_state_root<S: ChainWriter + SubstateStore>(
     // Use the stable parent_block_height from the verification pipeline, not
     // storage.jmt_version() which is racy — by the time this runs on the
     // ConsensusCrypto pool, other blocks may have committed and advanced the
-    // JVT past the parent version.
+    // JMT past the parent version.
     let (computed_root, prepared) = storage.prepare_block_commit(
         parent_state_root,
         parent_block_height,
@@ -320,7 +320,7 @@ pub struct ProposalResult<P: Send> {
 
 /// Build a proposal block, always computing the state root via `prepare_block_commit`.
 ///
-/// Uses the overlay (`pending_snapshots`) when the JVT hasn't committed the
+/// Uses the overlay (`pending_snapshots`) when the JMT hasn't committed the
 /// parent yet, so certificates are always included when available.
 ///
 /// Algorithm:

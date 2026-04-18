@@ -121,7 +121,7 @@ impl GlobalReceipt {
 /// Stored per-shard — `database_updates` contain only writes for the local
 /// shard (already filtered by `filter_updates_for_shard` during execution).
 ///
-/// Feeds `state_root` computation via JVT. Per-tx attribution committed via
+/// Feeds `state_root` computation via JMT. Per-tx attribution committed via
 /// `local_receipt_root` in the block header.
 ///
 /// Held in-memory in `FinalizedWave` until block commit, then written

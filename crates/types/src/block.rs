@@ -81,7 +81,7 @@ pub fn compute_transaction_root(transactions: &[Arc<RoutableTransaction>]) -> Ha
 /// - Chain position (height, parent hash)
 /// - Proposer identity
 /// - Proof of parent commitment (parent QC)
-/// - State commitment (JVT root after applying committed certificates)
+/// - State commitment (JMT root after applying committed certificates)
 /// - Transaction commitment (merkle root of all transactions in the block)
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct BlockHeader {
@@ -112,7 +112,7 @@ pub struct BlockHeader {
     /// Whether this block was created as a fallback when leader timed out.
     pub is_fallback: bool,
 
-    /// JVT state root hash after applying all certificates in this block.
+    /// JMT state root hash after applying all certificates in this block.
     pub state_root: Hash,
 
     /// Merkle root of all transactions in this block.
@@ -176,7 +176,7 @@ pub struct BlockHeader {
 }
 
 impl BlockHeader {
-    /// Create a genesis block header (height 0) with the given proposer and JVT state.
+    /// Create a genesis block header (height 0) with the given proposer and JMT state.
     pub fn genesis(shard_group_id: ShardGroupId, proposer: ValidatorId, state_root: Hash) -> Self {
         Self {
             shard_group_id,
@@ -381,7 +381,7 @@ impl sbor::Describe<sbor::NoCustomTypeKind> for Block {
 }
 
 impl Block {
-    /// Create an empty genesis block with the given proposer and JVT state.
+    /// Create an empty genesis block with the given proposer and JMT state.
     pub fn genesis(shard_group_id: ShardGroupId, proposer: ValidatorId, state_root: Hash) -> Self {
         Self {
             header: BlockHeader::genesis(shard_group_id, proposer, state_root),

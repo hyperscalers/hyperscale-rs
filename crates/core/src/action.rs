@@ -224,7 +224,7 @@ pub enum Action {
     /// `NodeInput::ProvisionReady` for network broadcast.
     FetchAndBroadcastProvision {
         /// The committed block whose state is being attested to. Anchors
-        /// state reads via `PendingChain::view_at`. Verkle proofs are
+        /// state reads via `PendingChain::view_at`. Merkle proofs are
         /// generated against this block's state root.
         block_hash: Hash,
         /// One entry per cross-shard tx that needs provisioning.
@@ -301,10 +301,10 @@ pub enum Action {
         total_voting_power: u64,
     },
 
-    /// Verify a provision batch's verkle inclusion proofs.
+    /// Verify a provision batch's merkle inclusion proofs.
     ///
     /// The QC was already verified by `RemoteHeaderCoordinator` when the header
-    /// was promoted to verified, so this only checks verkle proofs against the
+    /// was promoted to verified, so this only checks merkle proofs against the
     /// committed header's state root.
     ///
     /// Delegated to a thread pool in production, instant in simulation.
@@ -398,15 +398,15 @@ pub enum Action {
         height: BlockHeight,
     },
 
-    /// Verify a block's state root against the JVT.
+    /// Verify a block's state root against the JMT.
     ///
-    /// Applies the block's shard-local state changes to the JVT and compares the
+    /// Applies the block's shard-local state changes to the JMT and compares the
     /// resulting root against the header's `state_root`.
     /// Returns `ProtocolEvent::BlockRootVerified`.
     ///
     /// The action handler walks the snapshot chain from `parent_block_hash`
     /// to build an overlay of uncommitted tree nodes, then calls
-    /// `prepare_block_commit` which computes the JVT root and caches a
+    /// `prepare_block_commit` which computes the JMT root and caches a
     /// `PreparedCommit` for efficient commit later.
     VerifyStateRoot {
         block_hash: Hash,
@@ -414,14 +414,14 @@ pub enum Action {
         parent_block_hash: Hash,
         /// Base state root (parent block's state_root).
         parent_state_root: Hash,
-        /// Height of the parent block (stable JVT version for computation).
+        /// Height of the parent block (stable JMT version for computation).
         parent_block_height: u64,
         /// Expected state root after applying writes.
         expected_root: Hash,
         /// Finalized waves whose receipts contribute to the state root.
         /// The thread pool merges DatabaseUpdates from these.
         finalized_waves: Vec<Arc<FinalizedWave>>,
-        /// Block height (used as JVT version).
+        /// Block height (used as JMT version).
         block_height: u64,
     },
 
@@ -431,7 +431,7 @@ pub enum Action {
     /// against the block header's claimed transaction_root.
     /// Returns `ProtocolEvent::TransactionRootVerified`.
     ///
-    /// This is a pure CPU operation (no JVT dependency) so it can be verified
+    /// This is a pure CPU operation (no JMT dependency) so it can be verified
     /// in parallel with state root verification.
     VerifyTransactionRoot {
         block_hash: Hash,
@@ -502,7 +502,7 @@ pub enum Action {
         is_fallback: bool,
         /// Parent's state root (base for state root computation via overlay).
         parent_state_root: Hash,
-        /// Height of the parent block (stable JVT version for computation).
+        /// Height of the parent block (stable JMT version for computation).
         parent_block_height: u64,
         transactions: Vec<Arc<RoutableTransaction>>,
         /// Finalized waves to include in the block (carries certs + receipts + ECs).
@@ -548,7 +548,7 @@ pub enum Action {
     // Block Commit
     // ═══════════════════════════════════════════════════════════════════════
     /// Commit a consensus block via its PreparedCommit (from BuildProposal
-    /// or VerifyStateRoot). Block data + JVT + substates + receipts + ECs +
+    /// or VerifyStateRoot). Block data + JMT + substates + receipts + ECs +
     /// consensus metadata are written atomically.
     CommitBlock {
         block: Block,

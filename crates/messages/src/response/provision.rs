@@ -10,7 +10,7 @@ use sbor::prelude::BasicSbor;
 /// The target shard feeds these into the normal verification pipeline
 /// (QC + merkle proof checks).
 ///
-/// The aggregated verkle proof is stored once at the response level,
+/// The aggregated merkle proof is stored once at the response level,
 /// not per-provision.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct GetProvisionResponse {
@@ -23,7 +23,7 @@ pub struct GetProvisionResponse {
     ///   requester should try a different peer.
     pub provisions: Option<Vec<StateProvision>>,
 
-    /// Aggregated verkle proof covering all entries across all provisions.
+    /// Aggregated merkle proof covering all entries across all provisions.
     ///
     /// `None` when `provisions` is `None` or `Some(empty)`.
     pub proof: Option<MerkleInclusionProof>,

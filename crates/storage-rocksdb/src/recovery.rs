@@ -13,27 +13,27 @@ impl RocksDbStorage {
         let start = std::time::Instant::now();
         let (committed_height, committed_hash, latest_qc) = self.get_chain_metadata();
 
-        // Get current JVT state from storage - critical for correct state root computation.
+        // Get current JMT state from storage - critical for correct state root computation.
         // Without this, the state machine would start with Hash::ZERO which causes
-        // state root verification failures if the JVT has already advanced.
+        // state root verification failures if the JMT has already advanced.
         //
-        // Note: We always include JVT state, even at height 0, because genesis bootstrap
-        // populates the JVT with initial Radix state at height 0 but with a non-zero root.
+        // Note: We always include JMT state, even at height 0, because genesis bootstrap
+        // populates the JMT with initial Radix state at height 0 but with a non-zero root.
         // The height 0 case is handled correctly by the state machine.
         use hyperscale_storage::SubstateStore;
-        let jvt_block_height = self.jmt_version();
-        let jvt_root = self.state_root_hash();
-        let jvt_root_opt = Some(jvt_root);
+        let jmt_block_height = self.jmt_version();
+        let jmt_root = self.state_root_hash();
+        let jmt_root_opt = Some(jmt_root);
 
-        // Recovery invariant: JVT version (= block height) must match committed_height.
+        // Recovery invariant: JMT version (= block height) must match committed_height.
         // Since consensus metadata is now written atomically in the same WriteBatch
-        // as the JVT commit, a mismatch should never occur. If it does, something
+        // as the JMT commit, a mismatch should never occur. If it does, something
         // is seriously wrong (e.g., storage corruption).
-        if committed_height.0 > 0 && jvt_block_height != committed_height.0 {
+        if committed_height.0 > 0 && jmt_block_height != committed_height.0 {
             tracing::error!(
                 committed_height = committed_height.0,
-                jvt_block_height,
-                "RECOVERY: JVT version does not match committed height — \
+                jmt_block_height,
+                "RECOVERY: JMT version does not match committed height — \
                  this should not happen with atomic commits. Possible storage corruption."
             );
         }
@@ -45,8 +45,8 @@ impl RocksDbStorage {
             committed_height = committed_height.0,
             has_committed_hash = committed_hash.is_some(),
             has_latest_qc = latest_qc.is_some(),
-            jvt_block_height,
-            jvt_root = ?jvt_root,
+            jmt_block_height,
+            jmt_root = ?jmt_root,
             load_time_ms = elapsed * 1000.0,
             "Loaded recovered state from storage"
         );
@@ -55,7 +55,7 @@ impl RocksDbStorage {
             committed_height: committed_height.0,
             committed_hash,
             latest_qc,
-            jvt_root: jvt_root_opt,
+            jmt_root: jmt_root_opt,
         }
     }
 }

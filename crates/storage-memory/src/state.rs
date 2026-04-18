@@ -18,16 +18,16 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 // ═══════════════════════════════════════════════════════════════════════
-// Shared substate + JVT state (single RwLock)
+// Shared substate + JMT state (single RwLock)
 // ═══════════════════════════════════════════════════════════════════════
 
-/// Substate data and JVT state protected by a single RwLock.
+/// Substate data and JMT state protected by a single RwLock.
 ///
 /// A single lock ensures association resolution can read substate data
 /// atomically, avoiding deadlock.
 ///
 /// Using RwLock (instead of Mutex) allows concurrent read access: speculative
-/// JVT computations from `prepare_block_commit` take a read lock and can run
+/// JMT computations from `prepare_block_commit` take a read lock and can run
 /// concurrently with other readers, while commits take a write lock.
 pub(crate) struct SharedState {
     /// Radix substate data. `im::OrdMap` for O(1) structural-sharing clones.
@@ -47,7 +47,7 @@ impl SharedState {
     pub(crate) fn new() -> Self {
         Self {
             data: OrdMap::new(),
-            // Pruning disabled: historical substate reads traverse the JVT at
+            // Pruning disabled: historical substate reads traverse the JMT at
             // past heights and need old nodes to still exist. In production,
             // RocksDB GC respects `jmt_history_length` (default 256).
             // In simulation, tests are short-lived so retaining all nodes is fine.
@@ -59,7 +59,7 @@ impl SharedState {
         }
     }
 
-    /// Apply a JVT snapshot directly, inserting precomputed nodes.
+    /// Apply a JMT snapshot directly, inserting precomputed nodes.
     ///
     /// The snapshot's tree nodes are consensus-verified (2f+1 validators
     /// agreed on the resulting state root). We apply unconditionally —
@@ -70,7 +70,7 @@ impl SharedState {
             self.tree_store
                 .insert(jmt_key.clone(), Arc::clone(jmt_node));
         }
-        // NOTE: stale JVT nodes are NOT deleted here. Historical JVT nodes
+        // NOTE: stale JMT nodes are NOT deleted here. Historical JMT nodes
         // must be retained so that provision fetch (generate_merkle_proofs) can
         // read the tree at past block heights. In production, RocksDB GC handles
         // pruning after `jmt_history_length` blocks (default 256). In simulation,

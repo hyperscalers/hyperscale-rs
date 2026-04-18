@@ -282,7 +282,7 @@ pub struct ConsensusConfig {
 
     /// Minimum time between block proposals in milliseconds (rate limiting).
     /// Even when a QC forms immediately, wait at least this long since the last
-    /// proposal. Slower blocks accumulate more transactions for better verkle
+    /// proposal. Slower blocks accumulate more transactions for better merkle
     /// proof amortization.
     #[serde(default = "default_min_block_interval_ms")]
     pub min_block_interval_ms: u64,
@@ -413,9 +413,9 @@ pub struct StorageConfig {
     #[serde(default = "default_keep_log_file_num")]
     pub keep_log_file_num: usize,
 
-    /// Number of block heights of JVT history to retain before garbage collection.
+    /// Number of block heights of JMT history to retain before garbage collection.
     ///
-    /// Stale JVT nodes and their associations are kept for this many heights
+    /// Stale JMT nodes and their associations are kept for this many heights
     /// before being eligible for deletion. This enables historical queries within
     /// this window.
     ///
@@ -829,7 +829,7 @@ fn build_engine_genesis_config(config: &GenesisConfig) -> Result<hyperscale_engi
 ///
 /// Reserves 1 core for the state machine thread, then splits the remainder:
 /// - Consensus Crypto: 2 threads (fixed, liveness-critical for block votes/QC)
-/// - State Root: 10% of pool budget (JVT updates, proposal building)
+/// - State Root: 10% of pool budget (JMT updates, proposal building)
 /// - Execution: 25% of pool budget (Radix Engine)
 /// - TX Validation: 15% of pool budget (transaction signature verification)
 /// - Crypto: remainder (provisions, execution votes, certificate verification)

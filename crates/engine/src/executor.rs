@@ -45,9 +45,9 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::{instrument, Level};
 
-/// Fetch state entries for the given nodes from storage at a specific block height (= JVT version).
+/// Fetch state entries for the given nodes from storage at a specific block height (= JMT version).
 ///
-/// Reads substates at the given `block_height` using historical JVT traversal
+/// Reads substates at the given `block_height` using historical JMT traversal
 /// and the leaf association table. Both data and proofs must come from the same
 /// version to pass verification against the block header's `state_root`.
 ///
@@ -407,9 +407,9 @@ impl RadixExecutor {
         }
     }
 
-    /// Fetch state entries for the given nodes from storage at a specific block height (= JVT version).
+    /// Fetch state entries for the given nodes from storage at a specific block height (= JMT version).
     ///
-    /// Reads substates at the given `block_height` using historical JVT traversal.
+    /// Reads substates at the given `block_height` using historical JMT traversal.
     /// Both data and proofs must come from the same version.
     /// Returns `None` if the version is unavailable (GC'd or not yet committed).
     pub fn fetch_state_entries<S: SubstateStore>(

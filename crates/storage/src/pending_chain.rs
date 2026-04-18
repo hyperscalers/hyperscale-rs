@@ -26,7 +26,7 @@ pub struct ChainEntry {
     pub height: u64,
     /// Per-tx receipts produced by this block.
     pub receipts: Vec<Arc<LocalReceipt>>,
-    /// JVT snapshot from this block's speculative state-root computation.
+    /// JMT snapshot from this block's speculative state-root computation.
     pub jmt_snapshot: Arc<JmtSnapshot>,
 }
 
@@ -128,7 +128,7 @@ where
 /// or `None` (tombstone).
 type OverlayEntries = HashMap<(DbPartitionKey, DbSortKey), Option<Vec<u8>>>;
 
-/// JVT node index for O(1) tree-node lookup during proof generation.
+/// JMT node index for O(1) tree-node lookup during proof generation.
 type JmtNodeIndex = HashMap<jmt::NodeKey, Arc<jmt::Node>>;
 
 /// Anchored read view over base storage + a slice of pending blocks.
@@ -147,11 +147,11 @@ pub struct SubstateView<S> {
     /// Flattened pending substates from the anchored chain, in commit order.
     /// Later entries override earlier ones for the same key.
     overlay: OverlayEntries,
-    /// JVT snapshots from the same chain, in commit order. Exposed via
+    /// JMT snapshots from the same chain, in commit order. Exposed via
     /// [`Self::pending_snapshots`] so handlers can pass them to
     /// `prepare_block_commit` for chained verification.
     jmt_snapshots: Vec<Arc<JmtSnapshot>>,
-    /// JVT node index built from `jmt_snapshots` for O(1) lookup
+    /// JMT node index built from `jmt_snapshots` for O(1) lookup
     /// (see [`jmt::TreeReader`] impl).
     jmt_nodes: JmtNodeIndex,
     /// Per-receipt references for versioned queries
@@ -161,7 +161,7 @@ pub struct SubstateView<S> {
 }
 
 impl<S> SubstateView<S> {
-    /// Pending JVT snapshots from the anchored chain, in commit order.
+    /// Pending JMT snapshots from the anchored chain, in commit order.
     /// Pass to `prepare_block_commit` so chained verification can find
     /// tree nodes from prior unpersisted blocks.
     pub fn pending_snapshots(&self) -> &[Arc<JmtSnapshot>] {
@@ -444,16 +444,16 @@ impl<S: SubstateStore> SubstateStore for SubstateView<S> {
             return Some(proof);
         }
         // Beyond persisted — caller should use `generate_merkle_proofs_overlay`
-        // which uses the JVT overlay via this view's `TreeReader` impl.
+        // which uses the JMT overlay via this view's `TreeReader` impl.
         None
     }
 }
 
 /// Override `generate_merkle_proofs` for callers that have a
-/// `jmt::TreeReader`-capable base, using the JVT overlay for unpersisted
+/// `jmt::TreeReader`-capable base, using the JMT overlay for unpersisted
 /// heights.
 impl<S: SubstateStore + jmt::TreeReader + Sync> SubstateView<S> {
-    /// Generate verkle proofs, falling back to the JVT overlay for
+    /// Generate merkle proofs, falling back to the JMT overlay for
     /// unpersisted block heights.
     pub fn generate_merkle_proofs_overlay(
         &self,

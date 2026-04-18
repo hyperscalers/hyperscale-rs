@@ -164,7 +164,7 @@ fn test_snapshot_isolation() {
 fn test_snapshot_structural_sharing_performance() {
     let storage = SimStorage::new();
 
-    // Insert 10,000 items via substates-only (no JVT computation).
+    // Insert 10,000 items via substates-only (no JMT computation).
     // This test measures OrdMap snapshot performance, not tree commit speed.
     for i in 0..10_000u32 {
         let partition_key = DbPartitionKey {
@@ -288,7 +288,7 @@ fn test_transactions_batch_with_indexed_block() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// JVT state tracking
+// JMT state tracking
 // ═══════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -396,7 +396,7 @@ fn test_commit_block_empty() {
     let block = make_test_block(1);
     let qc = make_test_qc(&block);
     commit_empty(&storage, &block, &qc);
-    // Empty block: JVT version still advances to block_height
+    // Empty block: JMT version still advances to block_height
     assert_eq!(storage.jmt_version(), 1);
 }
 

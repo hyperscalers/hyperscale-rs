@@ -444,7 +444,7 @@ where
     /// Accumulate a block commit for batched dispatch. Records metrics
     /// immediately (on the pinned thread), feeds the sync protocol, fires
     /// `BlockCommitted` to the state machine, then defers the heavy
-    /// JVT/metadata writes to [`flush_block_commits`].
+    /// JMT/metadata writes to [`flush_block_commits`].
     ///
     /// `BlockCommitted` fires immediately — before RocksDB persistence —
     /// because the QC is the proof of commit (2f+1 agreement). Subsystem
@@ -559,7 +559,7 @@ where
         metrics::record_block_committed(height.0, commit_latency_secs);
         metrics::set_block_height(height.0);
         // Feed committed height to sync protocol (just tracks progress,
-        // doesn't need JVT state).
+        // doesn't need JMT state).
         let outputs = self
             .sync_protocol
             .handle(SyncInput::BlockCommitted { height: height.0 });

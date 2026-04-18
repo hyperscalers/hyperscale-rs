@@ -6,11 +6,11 @@
 //! snapshots without copying the entire dataset. This is critical for parallel
 //! transaction execution where each transaction needs an isolated view.
 //!
-//! # JVT Integration
+//! # JMT Integration
 //!
 //! Uses `SimTreeStore` for Jellyfish Merkle Tree (JMT) tracking, providing
 //! `jmt_version()` and `state_root_hash()` for state commitment. This ensures
-//! simulation has identical JVT behavior to production.
+//! simulation has identical JMT behavior to production.
 
 mod chain_reader;
 mod chain_writer;

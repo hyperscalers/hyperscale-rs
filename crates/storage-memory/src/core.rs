@@ -25,18 +25,18 @@ use std::sync::{Arc, RwLock};
 /// and snapshots are cheap regardless of data size.
 ///
 /// Implements Radix's `SubstateDatabase` directly, plus our `SubstateStore` extension
-/// for snapshots, node listing, and JVT state roots.
+/// for snapshots, node listing, and JMT state roots.
 ///
 /// # Locking Strategy
 ///
 /// Two RwLocks with independent lifetimes — no ordering constraint:
-/// - `state`: Substate data + JVT tree store + version/root/associations.
-///   Read lock for substate reads, JVT lookups, and speculative computation.
-///   Write lock for commits (substate writes + JVT updates in one acquisition).
+/// - `state`: Substate data + JMT tree store + version/root/associations.
+///   Read lock for substate reads, JMT lookups, and speculative computation.
+///   Write lock for commits (substate writes + JMT updates in one acquisition).
 /// - `consensus`: Block metadata, certificates, votes, committed state.
-///   Separate because consensus metadata is independent of substate/JVT state.
+///   Separate because consensus metadata is independent of substate/JMT state.
 pub struct SimStorage {
-    /// Substate data + JVT state (single RwLock).
+    /// Substate data + JMT state (single RwLock).
     pub(crate) state: Arc<RwLock<SharedState>>,
 
     /// Consensus metadata (single RwLock).
@@ -58,7 +58,7 @@ impl SimStorage {
         }
     }
 
-    /// Get the current JVT version.
+    /// Get the current JMT version.
     pub fn current_jmt_version(&self) -> u64 {
         self.state.read().unwrap().current_block_height
     }
@@ -91,7 +91,7 @@ impl SimStorage {
     /// Atomically commit a certificate and its state writes.
     ///
     /// Applies database updates and stores certificate metadata.
-    /// JVT is deferred to block commit — this mirrors the production
+    /// JMT is deferred to block commit — this mirrors the production
     /// `RocksDbStorage::commit_certificate_with_writes()` to ensure DST
     /// catches timing bugs where code incorrectly assumes state is available
     /// before certificate persistence.
@@ -118,10 +118,10 @@ impl SimStorage {
             .insert(certificate.wave_id.hash(), certificate.clone());
     }
 
-    /// Test helper: commits database updates with auto-incrementing JVT version.
+    /// Test helper: commits database updates with auto-incrementing JMT version.
     /// Not used in production (use commit_block instead).
     ///
-    /// Computes JVT updates and applies them to the tree store, resolving
+    /// Computes JMT updates and applies them to the tree store, resolving
     /// leaf-substate associations for historical reads.
     #[cfg(test)]
     pub fn commit_shared(&self, updates: &DatabaseUpdates) {
@@ -162,12 +162,12 @@ impl SimStorage {
         s.current_root_hash = new_root;
     }
 
-    /// Write only substate data (no JVT computation).
+    /// Write only substate data (no JMT computation).
     ///
     /// Used during genesis bootstrap so each intermediate `commit()` call from the
-    /// Radix Engine writes substates without computing a JVT version.
+    /// Radix Engine writes substates without computing a JMT version.
     /// After all genesis commits complete, [`finalize_genesis_jmt`] computes the
-    /// JVT once at version 0.
+    /// JMT once at version 0.
     pub fn commit_substates_only(&self, updates: &DatabaseUpdates) {
         let mut s = self.state.write().unwrap();
         // Skip MVCC writes during bootstrap — intermediate Reset partitions
@@ -178,24 +178,24 @@ impl SimStorage {
         apply_updates_to_ordmap(data, updates, None);
     }
 
-    /// Compute the JVT once at version 0 from the merged genesis updates.
+    /// Compute the JMT once at version 0 from the merged genesis updates.
     ///
     /// Called after all genesis bootstrap commits are complete. This avoids
-    /// computing intermediate JVT versions during genesis (which would collide
+    /// computing intermediate JMT versions during genesis (which would collide
     /// with block 1's version).
     ///
     /// # Returns
-    /// The genesis state root hash (JVT root at version 0).
+    /// The genesis state root hash (JMT root at version 0).
     pub fn finalize_genesis_jmt(&self, merged: &DatabaseUpdates) -> Hash {
         let mut s = self.state.write().unwrap();
 
-        // Guard: finalize_genesis_jmt must only be called once, on an uninitialized JVT.
+        // Guard: finalize_genesis_jmt must only be called once, on an uninitialized JMT.
         assert!(
             s.current_block_height == 0 && s.current_root_hash == Hash::ZERO,
-            "finalize_genesis_jmt called but JVT already initialized"
+            "finalize_genesis_jmt called but JMT already initialized"
         );
 
-        // parent=None, version=0: genesis is the first JVT state.
+        // parent=None, version=0: genesis is the first JMT state.
         let (root, collected) = hyperscale_storage::tree::put_at_version(
             &s.tree_store,
             None,

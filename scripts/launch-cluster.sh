@@ -39,7 +39,7 @@ NODE_HOSTNAME="${NODE_HOSTNAME:-localhost}"     # Hostname for spammer endpoints
 TCP_FALLBACK_ENABLED="${TCP_FALLBACK_ENABLED:-false}" # Enable TCP fallback transport (default: false)
 NETWORK_LATENCY_MS=""                           # Network latency in milliseconds (empty = disabled)
 PACKET_LOSS_PERCENT=""                          # Packet loss percentage (empty = disabled)
-JVT_HISTORY_LENGTH=256                          # Number of block heights of JVT history to retain (default: 256)
+JMT_HISTORY_LENGTH=256                          # Number of block heights of JMT history to retain (default: 256)
 
 # Mempool configuration
 MEMPOOL_MAX_IN_FLIGHT=12288                     # Max in-flight transactions (3x block limit)
@@ -127,7 +127,7 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --state-history-length)
-            JVT_HISTORY_LENGTH="$2"
+            JMT_HISTORY_LENGTH="$2"
             shift 2
             ;;
         --help|-h)
@@ -449,7 +449,7 @@ pin_cores = false
 max_background_jobs = 2
 write_buffer_mb = 64
 block_cache_mb = 256
-jvt_history_length = $JVT_HISTORY_LENGTH
+jmt_history_length = $JMT_HISTORY_LENGTH
 
 [mempool]
 max_in_flight = $MEMPOOL_MAX_IN_FLIGHT

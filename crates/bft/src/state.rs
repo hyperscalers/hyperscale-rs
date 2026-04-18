@@ -88,13 +88,13 @@ pub struct RecoveredState {
     /// Latest QC (certifies the highest certified block).
     pub latest_qc: Option<QuorumCertificate>,
 
-    /// Last committed JVT root hash.
+    /// Last committed JMT root hash.
     ///
     /// Restored from storage at startup so proposals use the correct parent
     /// state root instead of the default Hash::ZERO.
     ///
     /// If not provided (None), defaults to Hash::ZERO for fresh start.
-    pub jvt_root: Option<Hash>,
+    pub jmt_root: Option<Hash>,
 }
 
 /// Tracks in-flight proposal for correlating `Event::ProposalBuilt` callback.
@@ -146,7 +146,7 @@ pub struct BftState {
     committed_hash: Hash,
 
     /// State root from the latest committed block header.
-    /// Updated synchronously at commit time (not dependent on async JVT).
+    /// Updated synchronously at commit time (not dependent on async JMT).
     committed_state_root: Hash,
 
     /// Latest QC (certifies the latest certified block).
@@ -308,7 +308,7 @@ impl BftState {
             committed_hash: recovered
                 .committed_hash
                 .unwrap_or(Hash::from_bytes(&[0u8; 32])),
-            committed_state_root: recovered.jvt_root.unwrap_or(Hash::ZERO),
+            committed_state_root: recovered.jmt_root.unwrap_or(Hash::ZERO),
             latest_qc: recovered.latest_qc,
             deferred_qc: None,
             genesis_block: None,
@@ -424,7 +424,7 @@ impl BftState {
     ///
     /// This is the QC-attested value, updated synchronously at commit time.
     /// Used by the status API and as the canonical "current state root".
-    pub fn jvt_root(&self) -> Hash {
+    pub fn jmt_root(&self) -> Hash {
         self.committed_state_root
     }
 
@@ -2783,10 +2783,10 @@ impl BftState {
         actions
     }
 
-    /// Handle JVT state commit completion.
+    /// Handle JMT state commit completion.
     ///
-    /// Called when the runner has finished committing a block's state to the JVT.
-    /// This updates our tracked local JVT root (last_committed_jvt_root) and
+    /// Called when the runner has finished committing a block's state to the JMT.
+    /// This updates our tracked local JMT root (last_committed_jmt_root) and
     /// checks if any pending state root verifications can now proceed.
     ///
     /// Unblocked verifications are pushed to the ready queue; the caller
@@ -2908,7 +2908,7 @@ impl BftState {
     ///
     /// # State Root Parameter
     ///
-    /// `state_root` is the computed JVT root after applying writes from the certificates.
+    /// `state_root` is the computed JMT root after applying writes from the certificates.
     /// If certificates is empty, parent state is inherited.
     #[instrument(skip(self, qc, ready_txs, finalized_waves), fields(
         height = qc.height.0,

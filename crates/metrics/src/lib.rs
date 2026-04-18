@@ -81,7 +81,7 @@ pub struct MemoryMetrics {
     pub bft_pending_qc_verifications: usize,
     /// Cache of verified QC signatures.
     pub bft_verified_qcs: usize,
-    /// Blocks waiting for JVT to reach parent state.
+    /// Blocks waiting for JMT to reach parent state.
     pub bft_pending_state_root_verifications: usize,
     /// Out-of-order synced blocks.
     pub bft_buffered_synced_blocks: usize,

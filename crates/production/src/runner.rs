@@ -629,11 +629,11 @@ impl ProductionRunner {
 
         // Run Radix Engine genesis to set up initial state.
         //
-        // GenesisMutWrapper writes substates only (no JVT) during bootstrap, then
-        // we compute the JVT once at version 0. This ensures block 1 cleanly
-        // writes at JVT version 1 without colliding with genesis versions.
+        // GenesisMutWrapper writes substates only (no JMT) during bootstrap, then
+        // we compute the JMT once at version 0. This ensures block 1 cleanly
+        // writes at JMT version 1 without colliding with genesis versions.
         let genesis_config = self.genesis_config.take();
-        let genesis_jvt_root = io_loop.with_storage_and_executor(|storage, executor| {
+        let genesis_jmt_root = io_loop.with_storage_and_executor(|storage, executor| {
             // SharedStorage derefs to &RocksDbStorage.
             let mut wrapper = GenesisMutWrapper::new(storage);
             let result = if let Some(config) = genesis_config {
@@ -650,14 +650,14 @@ impl ProductionRunner {
                 panic!("Radix Engine genesis failed: {e:?}");
             }
 
-            // Compute JVT once at version 0 from merged genesis updates.
+            // Compute JMT once at version 0 from merged genesis updates.
             let merged = wrapper.into_merged();
             storage.finalize_genesis_jmt(&merged)
         });
 
         info!(
-            genesis_jvt_root = ?genesis_jvt_root,
-            "JVT state after genesis bootstrap"
+            genesis_jmt_root = ?genesis_jmt_root,
+            "JMT state after genesis bootstrap"
         );
 
         // Create genesis block.
@@ -669,7 +669,7 @@ impl ProductionRunner {
             .copied()
             .unwrap_or(ValidatorId(0));
 
-        let genesis_block = Block::genesis(self.local_shard, first_validator, genesis_jvt_root);
+        let genesis_block = Block::genesis(self.local_shard, first_validator, genesis_jmt_root);
 
         let genesis_hash = genesis_block.hash();
         info!(
@@ -692,9 +692,9 @@ impl ProductionRunner {
         let genesis_output = io_loop.drain_pending_output();
         let mut timer_ops = genesis_output.timer_ops;
 
-        // CRITICAL: Update state machine with the genesis JVT state.
+        // CRITICAL: Update state machine with the genesis JMT state.
         // The state machine was created BEFORE genesis bootstrap ran, so it has
-        // stale/zero state. We need to sync it with the actual JVT state from
+        // stale/zero state. We need to sync it with the actual JMT state from
         // genesis so future blocks compute state_root from the correct base.
         let genesis_commit_output = io_loop.step(NodeInput::Protocol(
             hyperscale_core::ProtocolEvent::BlockCommitted {
@@ -706,9 +706,9 @@ impl ProductionRunner {
         ));
 
         info!(
-            genesis_jvt_root = ?genesis_jvt_root,
+            genesis_jmt_root = ?genesis_jmt_root,
             actions = genesis_commit_output.actions_generated,
-            "Updated state machine with genesis JVT state"
+            "Updated state machine with genesis JMT state"
         );
 
         // Collect any additional timer ops from the commit step.

@@ -497,7 +497,7 @@ pub(crate) fn handle_delegated_action<
         }
 
         // --- State Provision Batch Verification ---
-        // QC was already verified by RemoteHeaderCoordinator; only verkle
+        // QC was already verified by RemoteHeaderCoordinator; only merkle
         // proofs need checking against the committed header's state root.
         Action::VerifyProvision {
             batch,
@@ -523,7 +523,7 @@ pub(crate) fn handle_delegated_action<
                             header_state_root = ?committed_header.header.state_root,
                             entry_count = all_entries.len(),
                             proof_len = batch.proof.as_bytes().len(),
-                            "Provision verkle proof verification failed"
+                            "Provision merkle proof verification failed"
                         );
                     }
                     valid
@@ -681,7 +681,7 @@ fn fetch_entries_for_requests<S: ChainWriter + SubstateStore + ChainReader, E: E
     for req in requests {
         // Expand account NodeIds to include owned vaults at the committed block height.
         // Must use historical reads — current state may have new vaults that don't
-        // exist at block_height, causing the verkle proof to fail on the remote shard.
+        // exist at block_height, causing the merkle proof to fail on the remote shard.
         let expanded_nodes = match hyperscale_engine::sharding::expand_nodes_with_owned_at_height(
             &*ctx.view,
             &req.nodes,
@@ -693,7 +693,7 @@ fn fetch_entries_for_requests<S: ChainWriter + SubstateStore + ChainReader, E: E
                     source_shard = source_shard.0,
                     block_height = block_height.0,
                     tx_hash = %req.tx_hash,
-                    "expand_nodes_with_owned_at_height: JVT version unavailable"
+                    "expand_nodes_with_owned_at_height: JMT version unavailable"
                 );
                 continue;
             }
@@ -710,7 +710,7 @@ fn fetch_entries_for_requests<S: ChainWriter + SubstateStore + ChainReader, E: E
                         block_height = block_height.0,
                         tx_hash = %req.tx_hash,
                         node_count = expanded_nodes.len(),
-                        "fetch_state_entries returned None — JVT version unavailable"
+                        "fetch_state_entries returned None — JMT version unavailable"
                     );
                     continue;
                 }
@@ -720,7 +720,7 @@ fn fetch_entries_for_requests<S: ChainWriter + SubstateStore + ChainReader, E: E
     per_tx
 }
 
-/// Group fetched entries by target shard and generate verkle proofs per shard.
+/// Group fetched entries by target shard and generate merkle proofs per shard.
 fn build_provision_batches<
     S: ChainWriter + SubstateStore + ChainReader + hyperscale_storage::JmtTreeReader + Sync,
     E: Engine,
@@ -769,7 +769,7 @@ fn build_provision_batches<
                     block_height = block_height.0,
                     target_shard = shard.0,
                     key_count = shard_keys.len(),
-                    "generate_merkle_proofs returned None — JVT version unavailable"
+                    "generate_merkle_proofs returned None — JMT version unavailable"
                 );
                 continue;
             }

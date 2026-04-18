@@ -22,7 +22,7 @@ pub(crate) struct PendingQcVerification {
     pub header: BlockHeader,
 }
 
-/// State root verification that is ready to dispatch (JVT is at the correct root).
+/// State root verification that is ready to dispatch (JMT is at the correct root).
 ///
 /// The `NodeStateMachine` drains these after each BFT call and emits
 /// `VerifyStateRoot` actions using the attached `FinalizedWave` data.
@@ -31,7 +31,7 @@ pub struct ReadyStateRootVerification {
     pub block_hash: Hash,
     pub parent_block_hash: Hash,
     pub parent_state_root: Hash,
-    /// The committed height of the parent block (stable JVT version for computation).
+    /// The committed height of the parent block (stable JMT version for computation).
     pub parent_block_height: u64,
     pub expected_root: Hash,
     /// Finalized waves from the PendingBlock — these carry the proposer's receipts,
@@ -88,9 +88,9 @@ pub(crate) struct VerificationPipeline {
     /// State root verifications ready to dispatch.
     /// Drained by NodeStateMachine which emits `VerifyStateRoot` actions.
     /// The dispatched handler runs against a `SubstateView` anchored at
-    /// the parent block, which sees prior unpersisted JVT snapshots so
+    /// the parent block, which sees prior unpersisted JMT snapshots so
     /// verification can chain from prior results without waiting for
-    /// actual JVT commits.
+    /// actual JMT commits.
     ready_state_root_verifications: Vec<ReadyStateRootVerification>,
 
     /// Set when a deferred proposal's parent tree became available.
@@ -394,8 +394,8 @@ impl VerificationPipeline {
     /// Initiate state root verification for a block.
     ///
     /// `parent_state_root` is the state root of the parent block (base state).
-    /// If JVT is ready, pushes to the ready queue for immediate dispatch.
-    /// Otherwise, queues for later when JVT catches up.
+    /// If JMT is ready, pushes to the ready queue for immediate dispatch.
+    /// Otherwise, queues for later when JMT catches up.
     ///
     /// In both cases, the `NodeStateMachine` is responsible for draining
     /// `ready_state_root_verifications` and computing `merged_updates` from
@@ -421,7 +421,7 @@ impl VerificationPipeline {
 
         // The parent's tree nodes must be available — either committed to
         // the tree store or in the snapshot cache (from a prior verification).
-        // Defer if: parent height exceeds committed JVT AND parent hasn't
+        // Defer if: parent height exceeds committed JMT AND parent hasn't
         // been verified (no snapshot in the overlay).
         let parent_tree_available = parent_block_height <= self.last_persisted_height
             || self.verified_state_roots.contains(&parent_hash);
@@ -781,7 +781,7 @@ impl VerificationPipeline {
     /// in_flight = parent.in_flight + new_txs - finalized_txs
     ///
     /// All validators can compute this from chain state, so it must be exact.
-    /// Certificates are only counted when actually included (JVT was ready).
+    /// Certificates are only counted when actually included (JMT was ready).
     pub fn verify_in_flight(
         &mut self,
         block_hash: Hash,

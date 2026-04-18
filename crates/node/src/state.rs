@@ -152,9 +152,9 @@ impl NodeStateMachine {
         &self.remote_headers
     }
 
-    /// Get the last committed JVT root hash (delegated to BFT's verification pipeline).
-    pub fn last_committed_jvt_root(&self) -> Hash {
-        self.bft.jvt_root()
+    /// Get the last committed JMT root hash (delegated to BFT's verification pipeline).
+    pub fn last_committed_jmt_root(&self) -> Hash {
+        self.bft.jmt_root()
     }
 
     /// Initialize the node with a genesis block.

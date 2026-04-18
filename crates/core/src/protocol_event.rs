@@ -173,7 +173,7 @@ pub enum ProtocolEvent {
 
     /// Batch-level provision verification completed.
     ///
-    /// The QC is verified once for the batch's attestation; verkle proofs are
+    /// The QC is verified once for the batch's attestation; merkle proofs are
     /// checked against the verified state root. The committed header is returned
     /// so the state machine can promote it without re-lookup.
     StateProvisionVerified {

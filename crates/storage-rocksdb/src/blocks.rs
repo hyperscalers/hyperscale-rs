@@ -502,7 +502,7 @@ impl RocksDbStorage {
             }
         }
 
-        // 3. Write batch atomically with sync for durability (JVT deferred to block commit)
+        // 3. Write batch atomically with sync for durability (JMT deferred to block commit)
         let mut write_opts = rocksdb::WriteOptions::default();
         write_opts.set_sync(true);
 
@@ -513,7 +513,7 @@ impl RocksDbStorage {
         tracing::debug!(
             wave_hash = %certificate.wave_id.hash(),
             write_count,
-            "Certificate state writes committed (JVT deferred to block commit)"
+            "Certificate state writes committed (JMT deferred to block commit)"
         );
 
         let elapsed = start.elapsed();

@@ -313,7 +313,7 @@ impl SyncManager {
 
     /// Remove sync state at or below committed height.
     ///
-    /// Uses consensus committed height (not JVT-persisted height). These
+    /// Uses consensus committed height (not JMT-persisted height). These
     /// diverge during async persistence, but sync state tracks consensus
     /// progress — once a block is committed to consensus, its sync
     /// bookkeeping is no longer needed regardless of persistence state.

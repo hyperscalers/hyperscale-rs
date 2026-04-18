@@ -6,7 +6,7 @@
 //!
 //! ## Provision Flow
 //!
-//! The source shard proposer broadcasts a `StateProvision` batch containing JVT
+//! The source shard proposer broadcasts a `StateProvision` batch containing JMT
 //! inclusion proofs. The target shard joins with remote block headers, then
 //! dispatches `VerifyStateProvision` to verify the QC signature once and
 //! merkle proofs per provision against the committed state root.
@@ -69,7 +69,7 @@ pub struct ProvisionCoordinator {
     ///
     /// Populated exclusively via `on_verified_remote_header()` from the
     /// `RemoteHeaderCoordinator`. All headers here have passed QC verification.
-    /// Used to join with provision batches for verkle proof verification.
+    /// Used to join with provision batches for merkle proof verification.
     verified_remote_headers: HashMap<(ShardGroupId, BlockHeight), Arc<CommittedBlockHeader>>,
 
     // ═══════════════════════════════════════════════════════════════════
@@ -408,9 +408,9 @@ impl ProvisionCoordinator {
         vec![]
     }
 
-    /// Emit a `VerifyProvision` action for async verkle proof verification.
+    /// Emit a `VerifyProvision` action for async merkle proof verification.
     ///
-    /// The QC was already verified by `RemoteHeaderCoordinator`, so only verkle
+    /// The QC was already verified by `RemoteHeaderCoordinator`, so only merkle
     /// proofs need checking against the committed header's state root.
     fn emit_provision_verification(
         &self,

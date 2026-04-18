@@ -54,7 +54,7 @@ gossipsub_heartbeat_ms = 100
 [consensus]
 # Block proposal interval (milliseconds)
 # Lower = faster finality, higher network load
-# Slower intervals accumulate more transactions per block, improving verkle proof amortization
+# Slower intervals accumulate more transactions per block, improving merkle proof amortization
 proposal_interval_ms = 1000
 
 # Minimum time between block proposals (milliseconds)
@@ -131,8 +131,8 @@ bytes_per_sync_mb = 1
 # Number of old log files to keep
 keep_log_file_num = 10
 
-# Number of block heights of JVT history to retain before garbage collection.
-# Stale JVT nodes and their associations are kept for this many heights
+# Number of block heights of JMT history to retain before garbage collection.
+# Stale JMT nodes and their associations are kept for this many heights
 # before being eligible for deletion. This enables historical queries within
 # this window. Set to 0 for immediate deletion (no history retention).
 jmt_history_length = 256

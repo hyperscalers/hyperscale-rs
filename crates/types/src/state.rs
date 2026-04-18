@@ -97,7 +97,7 @@ impl StateEntry {
 /// State provision from a source shard to a target shard.
 ///
 /// Only the block proposer sends these. Provision are always transported
-/// in a batch (per block) alongside a single aggregated verkle proof that
+/// in a batch (per block) alongside a single aggregated merkle proof that
 /// covers all entries across all provisions in that batch. The proof lives
 /// at the batch level (e.g. `StateProvisionNotification`) to avoid
 /// duplicating it per provision during serialization.
@@ -112,7 +112,7 @@ pub struct StateProvision {
     /// Source shard (the shard providing the state).
     pub source_shard: ShardGroupId,
 
-    /// Block height when this provision was created (= JVT version for verkle proofs).
+    /// Block height when this provision was created (= JMT version for merkle proofs).
     pub block_height: BlockHeight,
 
     /// Unix timestamp (milliseconds) of the block that triggered this provision.

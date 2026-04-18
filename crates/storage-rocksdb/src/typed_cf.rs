@@ -268,7 +268,7 @@ pub(crate) fn batch_delete<CF: TypedCf>(batch: &mut WriteBatch, cf: &ColumnFamil
 /// Typed full-scan iterator over a column family.
 ///
 /// Iterates all entries from the beginning, decoding each key/value through
-/// the CF's codecs. Use for small or bounded CFs (votes, stale JVT nodes).
+/// the CF's codecs. Use for small or bounded CFs (votes, stale JMT nodes).
 pub(crate) fn iter_all<'a, CF: TypedCf>(
     db: &'a rocksdb::DB,
     cf: &ColumnFamily,

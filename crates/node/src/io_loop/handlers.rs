@@ -55,7 +55,7 @@ where
         // Dedup + cache: the proof for (block_height, target_shard) is
         // deterministic. Multiple validators request the same provisions,
         // and retries can send the same request many times. Without dedup,
-        // each request regenerates the verkle proof (~30ms), and under load
+        // each request regenerates the merkle proof (~30ms), and under load
         // 40+ redundant proof generations per height cause CPU thrashing.
         //
         // The cache stores completed responses. The in-flight map tracks

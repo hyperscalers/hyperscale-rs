@@ -153,10 +153,10 @@ fn extract_owned_node_ids(value: &[u8], owner: NodeId, ownership: &mut HashMap<N
 /// Expand declared NodeIds to include owned internal nodes (vaults) at a
 /// specific block height.
 ///
-/// Reads substates via JVT historical traversal. This is critical for provision
+/// Reads substates via JMT historical traversal. This is critical for provision
 /// generation:
 /// the expanded node list must match the state at the committed block height,
-/// not the current tip, otherwise the verkle proof will cover keys that don't
+/// not the current tip, otherwise the merkle proof will cover keys that don't
 /// exist at the proof's version and verification will fail on the remote shard.
 pub fn expand_nodes_with_owned_at_height<S: hyperscale_storage::SubstateStore>(
     storage: &S,

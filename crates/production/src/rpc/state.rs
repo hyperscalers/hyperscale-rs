@@ -111,7 +111,7 @@ pub struct NodeStatusState {
     pub block_height: u64,
     pub view: u64,
     pub connected_peers: usize,
-    /// Current JVT state root hash (hex-encoded).
+    /// Current JMT state root hash (hex-encoded).
     pub state_root_hash: String,
 }
 

@@ -1,4 +1,4 @@
-//! Simple in-memory JVT tree store for simulation.
+//! Simple in-memory JMT tree store for simulation.
 //!
 //! Implements `jmt::TreeReader` directly, replacing the old
 //! `TypedInMemoryTreeStore` wrapper that used stored/serialized node types.
@@ -10,7 +10,7 @@ use hyperscale_jmt as jmt;
 
 /// Simple in-memory tree store that implements `jmt::TreeReader`.
 ///
-/// Stores hydrated JVT nodes directly (no serialization layer).
+/// Stores hydrated JMT nodes directly (no serialization layer).
 /// Thread safety is handled by the outer `RwLock<SharedState>`.
 pub struct SimTreeStore {
     nodes: HashMap<jmt::NodeKey, Arc<jmt::Node>>,

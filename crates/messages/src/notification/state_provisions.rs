@@ -12,14 +12,14 @@ use sbor::prelude::BasicSbor;
 /// the batch, allowing receivers to reject forged provisions before doing
 /// expensive merkle proof verification.
 ///
-/// The aggregated verkle proof is stored once at the batch level rather than
+/// The aggregated merkle proof is stored once at the batch level rather than
 /// per-provision, avoiding redundant serialization of the (potentially large)
 /// proof across N provisions.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct StateProvisionNotification {
     /// The state provisions being sent.
     pub provisions: Vec<hyperscale_types::StateProvision>,
-    /// Aggregated verkle proof covering all entries across all provisions.
+    /// Aggregated merkle proof covering all entries across all provisions.
     pub proof: MerkleInclusionProof,
     /// The validator who sent this batch.
     pub sender: ValidatorId,

@@ -10,7 +10,7 @@ use std::sync::Arc;
 /// Extract and merge `DatabaseUpdates` from receipt bundles.
 ///
 /// This is the canonical way to derive state updates from receipts for
-/// JVT computation and substate writes. Used internally by `ChainWriter`
+/// JMT computation and substate writes. Used internally by `ChainWriter`
 /// implementations.
 pub fn merge_updates_from_receipts(receipts: &[ReceiptBundle]) -> DatabaseUpdates {
     if receipts.is_empty() {

@@ -51,9 +51,9 @@ pub struct RocksDbConfig {
     pub keep_log_file_num: usize,
     /// Column families to create
     pub column_families: Vec<String>,
-    /// Number of block heights of JVT history to retain before garbage collection.
+    /// Number of block heights of JMT history to retain before garbage collection.
     ///
-    /// Stale JVT nodes and their associations are kept for this many heights
+    /// Stale JMT nodes and their associations are kept for this many heights
     /// before being eligible for deletion. This enables historical queries within
     /// this window.
     ///

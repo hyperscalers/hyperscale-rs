@@ -70,7 +70,7 @@ struct ExpectedHeader {
 ///
 /// Downstream consumers:
 /// - **BFT**: Uses verified `transaction_root` for deferral merkle proofs
-/// - **Provision**: Uses verified `state_root` for verkle proof verification;
+/// - **Provision**: Uses verified `state_root` for merkle proof verification;
 ///   `waves` field to register expected provisions
 /// - **Execution**: Uses `waves` field to register expected execution certs
 pub struct RemoteHeaderCoordinator {

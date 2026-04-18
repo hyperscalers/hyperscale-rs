@@ -14,7 +14,7 @@ use std::sync::Arc;
 /// Append execution certificate writes for a block to an existing `WriteBatch`.
 ///
 /// Extracts ECs from the block's wave certificates and folds them into the
-/// same atomic batch as JVT + block data (one fsync per block).
+/// same atomic batch as JMT + block data (one fsync per block).
 pub(crate) fn append_block_certs_to_batch(
     storage: &RocksDbStorage,
     batch: &mut WriteBatch,
