@@ -309,14 +309,14 @@ where
                     committed_notified: false, // set by accumulate_block_commit
                 });
             }
-            Action::CommitSyncedBlock {
+            Action::CommitBlockByQcOnly {
                 block,
                 qc,
                 provisions,
                 parent_state_root,
                 parent_block_height,
             } => {
-                self.handle_commit_synced_block(
+                self.handle_commit_block_by_qc_only(
                     block,
                     qc,
                     provisions,
@@ -451,17 +451,13 @@ where
     /// notifications use event-carried data, not storage reads. The async
     /// persistence closure sends `BlockPersisted` when the write completes.
     ///
-    /// Prepare a synced block's JMT state and feed it into the async
-    /// commit pipeline. Runs `prepare_block_commit` inline on the io_loop
-    /// (computation only), inserts the JMT snapshot into PendingChain so
-    /// child verifications can find parent tree nodes immediately, then
-    /// queues the block into `accumulate_block_commit` for batched async
-    /// RocksDB persistence via `flush_block_commits`.
+    /// Handler for [`Action::CommitBlockByQcOnly`].
     ///
-    /// The PreparedCommit's `base_root` may be stale by flush time (other
-    /// blocks committed in between). `commit_prepared_blocks` handles this
-    /// via its fallback path (skip if already committed, else recompute).
-    fn handle_commit_synced_block(
+    /// The inline-computed `PreparedCommit`'s `base_root` may be stale by
+    /// flush time (other blocks committed in between). `commit_prepared_blocks`
+    /// handles that via its fallback path — skip if already committed, else
+    /// recompute.
+    fn handle_commit_block_by_qc_only(
         &mut self,
         block: Block,
         qc: QuorumCertificate,
@@ -654,11 +650,11 @@ where
             .max()
             .unwrap_or(0);
 
-        // Consensus blocks require a PreparedCommit from VerifyStateRoot.
-        // (Sync blocks bypass this entirely via CommitSyncedBlock.)
-        // Blocks without one are deferred until their verification
-        // completes. Once any block defers, all subsequent blocks in
-        // the batch defer too (preserves height ordering).
+        // Blocks committed via CommitBlock need the PreparedCommit produced
+        // asynchronously by VerifyStateRoot. If it's not ready yet, defer —
+        // and defer all later blocks too to preserve height ordering. Blocks
+        // that came through CommitBlockByQcOnly already have their
+        // PreparedCommit cached inline so they don't hit this path.
         let mut ready_commits: Vec<super::PendingCommit> = Vec::with_capacity(commits.len());
         let mut prepared_map: Vec<S::PreparedCommit> = Vec::with_capacity(commits.len());
         {

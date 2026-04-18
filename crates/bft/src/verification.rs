@@ -214,6 +214,16 @@ impl VerificationPipeline {
     // Block verification (state root, tx root, receipt root)
     // ═══════════════════════════════════════════════════════════════════════
 
+    /// Whether this node has verified the state root of a block itself
+    /// (vs. trusting it purely via the QC chain).
+    ///
+    /// Used by the commit path to decide between `CommitBlock` (fast path —
+    /// PreparedCommit from `VerifyStateRoot` already in the cache) and
+    /// `CommitBlockByQcOnly` (slow path — compute inline at commit time).
+    pub fn is_state_root_verified(&self, block_hash: &Hash) -> bool {
+        self.verified_state_roots.contains(block_hash)
+    }
+
     /// Check if all async verifications are complete for a block.
     ///
     /// Returns true if source attestation, state root, and transaction root

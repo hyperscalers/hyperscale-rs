@@ -558,12 +558,15 @@ pub enum Action {
         provisions: Vec<Arc<Provision>>,
     },
 
-    /// Commit a synced block. The io_loop calls `prepare_block_commit`
-    /// inline (JMT computation), inserts the snapshot into PendingChain
-    /// (so child verifications can find the parent's tree nodes), then
-    /// feeds the block into the same `flush_block_commits` pipeline as
-    /// consensus blocks for async RocksDB persistence.
-    CommitSyncedBlock {
+    /// Commit a block trusted via QC only — no cached PreparedCommit exists
+    /// because we didn't run state root verification ourselves (sync path,
+    /// or consensus path when we didn't participate in voting).
+    ///
+    /// The io_loop computes the PreparedCommit inline and asserts the
+    /// computed root matches the block's declared root (same Byzantine
+    /// detection as async `VerifyStateRoot`), then feeds into the normal
+    /// `flush_block_commits` pipeline for async RocksDB persistence.
+    CommitBlockByQcOnly {
         block: Block,
         qc: QuorumCertificate,
         provisions: Vec<Arc<Provision>>,
@@ -941,7 +944,7 @@ impl Action {
 
             // External Notifications
             Action::CommitBlock { .. } => "CommitBlock",
-            Action::CommitSyncedBlock { .. } => "CommitSyncedBlock",
+            Action::CommitBlockByQcOnly { .. } => "CommitBlockByQcOnly",
             Action::EmitTransactionStatus { .. } => "EmitTransactionStatus",
 
             // Storage - Consensus

@@ -3282,6 +3282,20 @@ impl BftState {
                 "Committing block"
             );
 
+            // Decide the commit action before advancing committed_height.
+            // CommitBlock expects a PreparedCommit from our own VerifyStateRoot
+            // in the io_loop cache. If we never ran state root verification
+            // (e.g., non-voter that aggregated others' votes into a QC, or the
+            // QC-sig-verification callback lost the race with cascading commit),
+            // route through CommitBlockByQcOnly so the io_loop computes the
+            // PreparedCommit inline instead of deadlocking.
+            //
+            // Capture parent state before `record_block_committed` rewrites
+            // `committed_state_root` and `committed_height` to this block's.
+            let state_root_verified = self.verification.is_state_root_verified(&current_hash);
+            let parent_state_root = self.committed_state_root;
+            let parent_block_height = self.committed_height;
+
             let removed_blocks = self.record_block_committed(&block, current_hash);
             self.record_leader_activity();
 
@@ -3289,11 +3303,22 @@ impl BftState {
                 actions.push(Action::CancelFetch { block_hash });
             }
 
-            actions.push(Action::CommitBlock {
-                block: block.clone(),
-                qc: current_qc.clone(),
-                provisions,
-            });
+            let commit_action = if state_root_verified {
+                Action::CommitBlock {
+                    block: block.clone(),
+                    qc: current_qc.clone(),
+                    provisions,
+                }
+            } else {
+                Action::CommitBlockByQcOnly {
+                    block: block.clone(),
+                    qc: current_qc.clone(),
+                    provisions,
+                    parent_state_root,
+                    parent_block_height,
+                }
+            };
+            actions.push(commit_action);
             // Only the block proposer gossips the committed header globally.
             // Other validators rely on receiving it via gossip propagation.
             // If the proposer is byzantine/slow, the RemoteHeaderCoordinator
@@ -3502,7 +3527,7 @@ impl BftState {
     /// Apply a synced block after QC verification (or for genesis QC).
     ///
     /// Commits the block immediately: advances `committed_height` and emits
-    /// `CommitSyncedBlock` which the io_loop handles synchronously (inline
+    /// `CommitBlockByQcOnly` which the io_loop handles synchronously (inline
     /// JMT computation + persist + fsync). No async VerifyStateRoot dispatch,
     /// no PreparedCommit rendezvous — the parent's JMT is always in RocksDB
     /// before the child starts, eliminating ParentVersionMissing panics.
@@ -3569,7 +3594,7 @@ impl BftState {
             .map(|pb| pb.provisions())
             .unwrap_or_default();
 
-        let mut actions = vec![Action::CommitSyncedBlock {
+        let mut actions = vec![Action::CommitBlockByQcOnly {
             block: block.clone(),
             qc,
             provisions,
