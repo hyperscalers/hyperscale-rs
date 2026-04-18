@@ -78,9 +78,12 @@ pub(crate) struct VerificationPipeline {
     /// committed between deferral and dispatch.
     deferred_proposal: Option<(Hash, u64)>,
 
-    /// Last committed JVT height — used only to decide whether to defer
-    /// verification (parent's tree nodes need to be in the store or overlay).
-    last_committed_height: u64,
+    /// Highest persisted height — parent trees at or below this height
+    /// are readable from disk, so child verifications for blocks beyond
+    /// this height must defer until either parent persists, parent is
+    /// locally verified, or parent is consensus-committed (which places
+    /// its JMT snapshot in `PendingChain`).
+    last_persisted_height: u64,
 
     /// State root verifications ready to dispatch.
     /// Drained by NodeStateMachine which emits `VerifyStateRoot` actions.
@@ -130,7 +133,7 @@ pub(crate) struct VerificationPipeline {
 
 impl VerificationPipeline {
     /// Create a new verification pipeline.
-    pub fn new(committed_height: u64) -> Self {
+    pub fn new(persisted_height: u64) -> Self {
         Self {
             pending_qc_verifications: HashMap::new(),
             verified_qcs: HashMap::new(),
@@ -140,7 +143,7 @@ impl VerificationPipeline {
             deferred_proposal: None,
             ready_state_root_verifications: Vec::new(),
             proposal_unblocked: false,
-            last_committed_height: committed_height,
+            last_persisted_height: persisted_height,
             transaction_root_verifications_in_flight: HashSet::new(),
             verified_transaction_roots: HashSet::new(),
             certificate_root_verifications_in_flight: HashSet::new(),
@@ -420,7 +423,7 @@ impl VerificationPipeline {
         // the tree store or in the snapshot cache (from a prior verification).
         // Defer if: parent height exceeds committed JVT AND parent hasn't
         // been verified (no snapshot in the overlay).
-        let parent_tree_available = parent_block_height <= self.last_committed_height
+        let parent_tree_available = parent_block_height <= self.last_persisted_height
             || self.verified_state_roots.contains(&parent_hash);
 
         if !parent_tree_available {
@@ -835,9 +838,11 @@ impl VerificationPipeline {
         std::mem::take(&mut self.proposal_unblocked)
     }
 
-    /// Check if a parent's tree nodes are available (committed or verified).
+    /// Check if a parent's tree nodes are available (persisted or verified
+    /// or consensus-committed — all three place the parent's JMT snapshot
+    /// either on disk or in the `PendingChain` overlay).
     pub fn parent_tree_available(&self, parent_block_height: u64, parent_hash: Hash) -> bool {
-        parent_block_height <= self.last_committed_height
+        parent_block_height <= self.last_persisted_height
             || self.verified_state_roots.contains(&parent_hash)
     }
 
@@ -863,15 +868,22 @@ impl VerificationPipeline {
         }
     }
 
-    /// A block committed to the tree store. Unblock any deferred
-    /// verifications and proposals whose parent's tree nodes are now available.
-    pub fn on_jvt_committed(&mut self, block_height: u64) {
-        if block_height <= self.last_committed_height {
+    /// A block's state is now persisted to disk. Advances
+    /// `last_persisted_height` and unblocks any deferred verifications
+    /// or proposals whose parent is at or below the new persisted tip.
+    ///
+    /// This is the persistence-catch-up path — mainly relevant on boot
+    /// (parent on disk but never locally verified in this process) and
+    /// as a safety net if the consensus-commit path didn't fire for
+    /// some reason. Steady-state unblocking happens via
+    /// [`Self::on_block_committed`].
+    pub fn on_block_persisted(&mut self, block_height: u64) {
+        if block_height <= self.last_persisted_height {
             return;
         }
-        self.last_committed_height = block_height;
+        self.last_persisted_height = block_height;
 
-        // Unblock deferred verifications whose parent height is now committed.
+        // Unblock deferred verifications whose parent height is now persisted.
         let unblocked_parents: Vec<Hash> = self
             .deferred_state_root_verifications
             .iter()
@@ -900,14 +912,44 @@ impl VerificationPipeline {
             }
         }
 
-        // Unblock deferred proposal if its parent height is now committed.
+        // Unblock deferred proposal if its parent height is now persisted.
         if let Some((_, parent_block_height)) = &self.deferred_proposal {
             if *parent_block_height <= block_height {
                 self.deferred_proposal.take();
-                debug!("Unblocking deferred proposal — parent committed");
+                debug!("Unblocking deferred proposal — parent persisted");
                 self.proposal_unblocked = true;
             }
         }
+    }
+
+    /// A block has been committed by consensus (QC). Its JMT snapshot is
+    /// in `PendingChain` — either from a completed local `VerifyStateRoot`
+    /// or from the `CommitBlockByQcOnly` inline computation. Mark its
+    /// state root as available for child verifications and unblock any
+    /// deferred children or proposals waiting on this block.
+    ///
+    /// This replaces the persistence-coupling that caused deferred
+    /// verifications to queue behind `BlockPersisted` even when the
+    /// parent's tree was already readable from the overlay.
+    pub fn on_block_committed(&mut self, block_hash: Hash) {
+        if !self.verified_state_roots.insert(block_hash) {
+            return;
+        }
+
+        if let Some(deferred) = self.deferred_state_root_verifications.remove(&block_hash) {
+            for ready in deferred {
+                debug!(
+                    child = ?ready.block_hash,
+                    parent = ?block_hash,
+                    "Unblocking deferred state root verification (parent committed)"
+                );
+                self.state_root_verifications_in_flight
+                    .insert(ready.block_hash);
+                self.ready_state_root_verifications.push(ready);
+            }
+        }
+
+        self.try_unblock_proposal(block_hash);
     }
 
     // ═══════════════════════════════════════════════════════════════════════

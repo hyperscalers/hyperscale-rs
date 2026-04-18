@@ -1196,7 +1196,7 @@ impl BftState {
         // Even empty fallback blocks need the parent root node —
         // noop_jmt_snapshot copies it to the new version so the overlay chain
         // stays intact. Defer if the parent tree isn't available yet;
-        // on_jvt_committed will unblock via ContentAvailable.
+        // on_block_committed / on_block_persisted will unblock via ContentAvailable.
         let mut actions = vec![];
         if self
             .verification
@@ -1284,8 +1284,8 @@ impl BftState {
 
         // Even empty sync blocks need the parent root node — noop_jmt_snapshot
         // copies it to the new version so the overlay chain stays intact.
-        // Defer if the parent tree isn't available yet; on_jvt_committed will
-        // unblock via ContentAvailable.
+        // Defer if the parent tree isn't available yet; on_block_committed /
+        // on_block_persisted will unblock via ContentAvailable.
         let mut actions = vec![];
         if self
             .verification
@@ -2792,13 +2792,17 @@ impl BftState {
     /// Unblocked verifications are pushed to the ready queue; the caller
     /// (`NodeStateMachine`) drains them and computes `merged_updates`.
     ///
-    /// A block committed to the tree store — unblock deferred verifications.
-    pub fn on_jvt_committed(
+    /// A block has been persisted to disk — advances the persisted tip and
+    /// unblocks any deferred verifications still waiting on persistence
+    /// (boot-time catch-up or fallback if the consensus-commit hook was
+    /// missed). Also auto-resumes from sync when persistence reaches the
+    /// sync target.
+    pub fn on_block_persisted(
         &mut self,
         topology: &TopologySnapshot,
         block_height: u64,
     ) -> Vec<Action> {
-        self.verification.on_jvt_committed(block_height);
+        self.verification.on_block_persisted(block_height);
 
         // Auto-resume from sync when persistence catches up to the sync target.
         // This replaces the fragile SyncComplete → BlockPersisted two-event
@@ -2811,6 +2815,15 @@ impl BftState {
             }
         }
         vec![]
+    }
+
+    /// A block has been committed by consensus — mark its state root as
+    /// available for child verifications without waiting for persistence
+    /// or local re-verification. The block's JMT snapshot is in
+    /// `PendingChain` by the time `BlockCommitted` fires, so child
+    /// verifications can read the parent tree via the overlay.
+    pub fn on_block_committed_verification(&mut self, block_hash: Hash) {
+        self.verification.on_block_committed(block_hash);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -7219,7 +7232,7 @@ mod tests {
         // Simulate committed state up to height 3 so the parent tree is available
         // for BuildProposal (which defers if parent tree nodes aren't in the store).
         state.committed_height = 3;
-        state.verification.on_jvt_committed(3);
+        state.verification.on_block_persisted(3);
 
         // Set current time and simulate that enough time passed since last QC
         state.set_time(Duration::from_millis(1000));
@@ -7350,7 +7363,7 @@ mod tests {
         // Simulate committed state up to height 3 so the parent tree is available
         // for BuildProposal (which defers if parent tree nodes aren't in the store).
         state.committed_height = 3;
-        state.verification.on_jvt_committed(3);
+        state.verification.on_block_persisted(3);
 
         // QC just now (0ms ago) - normally would be rate limited
         state.set_time(Duration::from_millis(1000));
@@ -7618,7 +7631,7 @@ mod tests {
         state.set_time(Duration::from_secs(100));
         // Simulate committed state so parent tree is available for BuildProposal.
         state.committed_height = 3;
-        state.verification.on_jvt_committed(3);
+        state.verification.on_block_persisted(3);
 
         // Set up a QC so we propose for height 4 (validator 0's turn: (4+0)%4=0)
         let qc = QuorumCertificate {
@@ -7680,7 +7693,7 @@ mod tests {
         let current_time = Duration::from_secs(12345);
         state.set_time(current_time);
         state.committed_height = 3;
-        state.verification.on_jvt_committed(3);
+        state.verification.on_block_persisted(3);
 
         // Set up QC with old timestamp
         let old_timestamp = 1000u64;
@@ -7996,7 +8009,7 @@ mod tests {
         let (mut state, topology) = make_test_state();
         state.set_time(Duration::from_secs(100));
         state.committed_height = 3;
-        state.verification.on_jvt_committed(3);
+        state.verification.on_block_persisted(3);
 
         // Set up QC with specific timestamp
         let parent_timestamp = 50_000u64;
@@ -8075,7 +8088,7 @@ mod tests {
         let (mut state, topology) = make_test_state();
         state.set_time(Duration::from_secs(100));
         state.committed_height = 3;
-        state.verification.on_jvt_committed(3);
+        state.verification.on_block_persisted(3);
 
         // Set up initial QC
         let qc = QuorumCertificate {

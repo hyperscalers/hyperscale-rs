@@ -32,7 +32,7 @@ pub(crate) struct SyncManager {
     syncing: bool,
 
     /// The sync target height — set at sync start, cleared on resume.
-    /// Used by `on_jvt_committed` to auto-resume when persistence catches up.
+    /// Used by `on_block_persisted` to auto-resume when persistence catches up.
     sync_target_height: Option<u64>,
 
     /// Highest height passed to `apply_synced_block`. Used by the sync

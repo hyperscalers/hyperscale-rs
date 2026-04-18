@@ -335,6 +335,13 @@ impl NodeStateMachine {
         self.bft
             .register_committed_transactions(&tx_hashes, block_height);
 
+        // Mark this block as a usable parent for child state-root verifications.
+        // By the time BlockCommitted fires, the block's JMT snapshot is in
+        // PendingChain (populated either by a prior VerifyStateRoot or by the
+        // inline CommitBlockByQcOnly computation). Decouples child verification
+        // from the persistence latency that previously stalled the pipeline.
+        self.bft.on_block_committed_verification(block_hash);
+
         // Release execution's per-wave bookkeeping for wave certs included in
         // this block. Per-tx terminal state for the mempool is handled below
         // by `on_block_committed_full` reading `block.certificates` directly.
@@ -601,16 +608,16 @@ impl StateMachine for NodeStateMachine {
             } => self.on_block_committed(block_hash, height, block, provisions),
 
             // ── Block Persisted (RocksDB write complete) ───────────────
-            // Advances `last_committed_height`, which is one of the two
-            // gates that let deferred state root verifications proceed
-            // (the other being `verified_state_roots` from an earlier
-            // local VerifyStateRoot). Needed primarily for startup /
-            // catch-up: a freshly-booted node has persisted state but
-            // an empty `verified_state_roots`, so child verifications
-            // of just-persisted parents unblock here rather than
-            // through the in-memory set.
+            // Advances `last_persisted_height`, a fallback gate for deferred
+            // state root verifications (steady-state unblocking happens on
+            // `BlockCommitted`). Still needed for boot-time catch-up: a
+            // freshly-booted node has persisted state but an empty
+            // in-memory set, so child verifications of just-persisted
+            // parents unblock here. Also drives auto-resume-from-sync.
             ProtocolEvent::BlockPersisted { height } => {
-                let mut actions = self.bft.on_jvt_committed(self.topology.snapshot(), height);
+                let mut actions = self
+                    .bft
+                    .on_block_persisted(self.topology.snapshot(), height);
                 // If BFT just resumed from sync, reschedule the cleanup timer.
                 if !actions.is_empty() {
                     actions.push(Action::SetTimer {

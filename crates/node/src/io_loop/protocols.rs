@@ -74,7 +74,7 @@ where
                 SyncOutput::SyncComplete { height } => {
                     tracing::info!(height, "Sync protocol complete, resuming consensus");
                     // Tell BftState to exit sync mode. The previous
-                    // BlockPersisted → on_jvt_committed path was unreliable
+                    // BlockPersisted → on_block_persisted path was unreliable
                     // because BlockPersisted requires PreparedCommit which
                     // may not be available yet for synced blocks.
                     self.feed_event(ProtocolEvent::SyncProtocolComplete { height });
