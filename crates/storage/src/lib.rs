@@ -41,7 +41,7 @@ pub use genesis::{GenesisWrapper, SubstatesOnlyCommit};
 pub use hyperscale_jmt::TreeReader as JmtTreeReader;
 pub use overlay::{SubstateDbLookup, SubstateLookup};
 pub use pending_chain::{ChainEntry, PendingChain, SubstateView};
-pub use store::SubstateStore;
+pub use store::{SubstateStore, VersionedStore};
 pub use tree::{CollectedWrites, JmtNodeKey, JmtSnapshot, LeafSubstateKeyAssociation};
 pub use writes::{
     merge_database_updates, merge_database_updates_from_arcs, merge_into,

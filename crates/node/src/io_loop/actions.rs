@@ -21,7 +21,13 @@ use std::sync::Arc;
 use tracing::{debug, trace, warn};
 impl<S, N, D, E> IoLoop<S, N, D, E>
 where
-    S: ChainWriter + SubstateStore + ChainReader + hyperscale_storage::JmtTreeReader + Send + Sync,
+    S: ChainWriter
+        + SubstateStore
+        + hyperscale_storage::VersionedStore
+        + ChainReader
+        + hyperscale_storage::JmtTreeReader
+        + Send
+        + Sync,
     N: Network,
     D: Dispatch,
     E: Engine,

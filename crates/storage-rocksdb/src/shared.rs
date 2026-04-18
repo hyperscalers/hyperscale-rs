@@ -117,6 +117,12 @@ impl SubstateStore for SharedStorage {
     }
 }
 
+impl hyperscale_storage::VersionedStore for SharedStorage {
+    fn snapshot_at(&self, version: u64) -> Self::Snapshot<'_> {
+        self.0.snapshot_at(version)
+    }
+}
+
 impl hyperscale_jmt::TreeReader for SharedStorage {
     fn get_node(
         &self,

@@ -3,16 +3,16 @@
 use crate::core::SimStorage;
 use crate::snapshot::SimSnapshot;
 
-use hyperscale_storage::{keys, DbSortKey, SubstateStore};
+use hyperscale_storage::{keys, DbSortKey, SubstateStore, VersionedStore};
 use hyperscale_types::{Hash, NodeId};
 
 impl SubstateStore for SimStorage {
     type Snapshot<'a> = SimSnapshot;
 
     fn snapshot(&self) -> Self::Snapshot<'_> {
-        // O(1) clone with structural sharing!
-        let data = self.state.read().unwrap().data.clone();
-        SimSnapshot { data }
+        // Default version = current committed tip. Equivalent to reading
+        // latest state but uniform snapshot type across all call sites.
+        self.snapshot_at(self.jmt_version())
     }
 
     fn jmt_version(&self) -> u64 {
@@ -87,6 +87,16 @@ impl SubstateStore for SimStorage {
     ) -> Option<hyperscale_types::MerkleInclusionProof> {
         let s = self.state.read().unwrap();
         hyperscale_storage::tree::proofs::generate_proof(&s.tree_store, storage_keys, block_height)
+    }
+}
+
+impl VersionedStore for SimStorage {
+    fn snapshot_at(&self, version: u64) -> Self::Snapshot<'_> {
+        let versioned_substates = self.state.read().unwrap().versioned_substates.clone();
+        SimSnapshot {
+            versioned_substates,
+            version,
+        }
     }
 }
 

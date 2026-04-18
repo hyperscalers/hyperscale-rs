@@ -46,6 +46,18 @@ pub(crate) fn partition_prefix(partition_key: &DbPartitionKey) -> Vec<u8> {
     prefix
 }
 
+/// Build the full storage-key prefix for a specific (partition, sort_key).
+/// Used by the versioned substates CF to scan the version history of a
+/// single substate (the per-substate key suffix is an 8-byte big-endian
+/// version appended by the versioned CF's codec).
+pub(crate) fn substate_prefix(partition_key: &DbPartitionKey, sort_key: &DbSortKey) -> Vec<u8> {
+    let mut prefix = Vec::with_capacity(partition_key.node_key.len() + 1 + sort_key.0.len());
+    prefix.extend_from_slice(&partition_key.node_key);
+    prefix.push(partition_key.partition_num);
+    prefix.extend_from_slice(&sort_key.0);
+    prefix
+}
+
 /// Build the storage key prefix for a given NodeId (for node-level iteration).
 ///
 /// This is the hash-spread 50-byte representation of the NodeId (same as

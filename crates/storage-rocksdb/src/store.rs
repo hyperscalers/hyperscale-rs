@@ -7,7 +7,7 @@ use crate::typed_cf::TypedCf;
 
 use crate::substate_key;
 use hyperscale_metrics as metrics;
-use hyperscale_storage::{DbSortKey, JmtSnapshot, SubstateStore};
+use hyperscale_storage::{DbSortKey, JmtSnapshot, SubstateStore, VersionedStore};
 use hyperscale_types::NodeId;
 use rocksdb::WriteBatch;
 use std::time::Instant;
@@ -16,13 +16,10 @@ impl SubstateStore for RocksDbStorage {
     type Snapshot<'a> = RocksDbSnapshot<'a>;
 
     fn snapshot(&self) -> Self::Snapshot<'_> {
-        // Use RocksDB's native snapshot feature for point-in-time isolation.
-        // The snapshot provides a consistent view of the database at the time
-        // of creation, immune to concurrent writes.
-        RocksDbSnapshot {
-            snapshot: self.db.snapshot(),
-            db: &self.db,
-        }
+        // Default version = current committed tip. MVCC walk-back resolves
+        // every key to its latest write, equivalent to reading StateCf but
+        // going through the versioned path so the snapshot type is uniform.
+        self.snapshot_at(self.jmt_version())
     }
 
     fn jmt_version(&self) -> u64 {
@@ -101,6 +98,16 @@ impl SubstateStore for RocksDbStorage {
             storage_keys,
             block_height,
         )
+    }
+}
+
+impl VersionedStore for RocksDbStorage {
+    fn snapshot_at(&self, version: u64) -> Self::Snapshot<'_> {
+        RocksDbSnapshot {
+            snapshot: self.db.snapshot(),
+            db: &self.db,
+            version,
+        }
     }
 }
 

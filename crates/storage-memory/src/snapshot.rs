@@ -1,21 +1,22 @@
-//! Snapshot of in-memory storage.
+//! MVCC-aware in-memory snapshot.
 //!
-//! Contains a structurally-shared copy of the data at snapshot time.
-//! The clone is O(1) - only increments reference counts internally.
+//! Reads walk the versioned_substates map and take the latest write at or
+//! below the snapshot's target version. Used for both current-state reads
+//! (via `snapshot_at(jmt_version())`) and anchor-based reads from
+//! [`SubstateView`](hyperscale_storage::SubstateView).
 
 use hyperscale_storage::{
     keys, DbPartitionKey, DbSortKey, DbSubstateValue, PartitionEntry, SubstateDatabase,
 };
-use im::OrdMap;
+use std::collections::BTreeMap;
 
-/// Snapshot of in-memory storage.
+/// Snapshot of in-memory storage scoped to a specific JMT version.
 ///
-/// Contains a structurally-shared copy of the data at snapshot time.
-/// The clone is O(1) - only increments reference counts internally.
-///
-/// Implements `SubstateDatabase` for read-only access.
+/// Walks the `versioned_substates` map, taking the latest version ≤ target
+/// per storage key. Tombstones (None values) correctly resolve to `None`.
 pub struct SimSnapshot {
-    pub(crate) data: OrdMap<Vec<u8>, Vec<u8>>,
+    pub(crate) versioned_substates: BTreeMap<(Vec<u8>, u64), Option<Vec<u8>>>,
+    pub(crate) version: u64,
 }
 
 impl SubstateDatabase for SimSnapshot {
@@ -25,7 +26,16 @@ impl SubstateDatabase for SimSnapshot {
         sort_key: &DbSortKey,
     ) -> Option<DbSubstateValue> {
         let key = keys::to_storage_key(partition_key, sort_key);
-        self.data.get(&key).cloned()
+        let range_start = (key.clone(), 0u64);
+        let range_end = (key.clone(), u64::MAX);
+        let mut best: Option<Vec<u8>> = None;
+        for ((_, ver), value) in self.versioned_substates.range(range_start..=range_end) {
+            if *ver > self.version {
+                break;
+            }
+            best = value.clone();
+        }
+        best
     }
 
     fn list_raw_values_from_db_key(
@@ -35,32 +45,47 @@ impl SubstateDatabase for SimSnapshot {
     ) -> Box<dyn Iterator<Item = PartitionEntry> + '_> {
         let prefix = keys::partition_prefix(partition_key);
         let prefix_len = prefix.len();
-
         let start = match from_sort_key {
-            Some(sort_key) => {
+            Some(sk) => {
                 let mut s = prefix.clone();
-                s.extend_from_slice(&sort_key.0);
+                s.extend_from_slice(&sk.0);
                 s
             }
             None => prefix.clone(),
         };
         let end = keys::next_prefix(&prefix).expect("storage key prefix overflow");
 
-        // Use range() for O(log n + k) instead of O(n) full scan.
-        // Collect to Vec to avoid lifetime issues with the range iterator.
-        let items: Vec<_> = self
-            .data
-            .range(start..end)
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
+        // Group by storage_key, pick latest version <= self.version per group.
+        let range_start = (start, 0u64);
+        let range_end = (end, 0u64);
+        let target = self.version;
 
-        Box::new(items.into_iter().filter_map(move |(full_key, value)| {
-            if full_key.len() > prefix_len {
-                let sort_key_bytes = full_key[prefix_len..].to_vec();
-                Some((DbSortKey(sort_key_bytes), value))
-            } else {
-                None
+        let mut results: Vec<PartitionEntry> = Vec::new();
+        let mut current_key: Option<&Vec<u8>> = None;
+        let mut current_best: Option<Vec<u8>> = None;
+
+        for ((sk_full, ver), value) in self.versioned_substates.range(range_start..range_end) {
+            if current_key != Some(sk_full) {
+                if let (Some(prev), Some(val)) = (current_key, current_best.take()) {
+                    if prev.len() > prefix_len {
+                        let sort_key_bytes = prev[prefix_len..].to_vec();
+                        results.push((DbSortKey(sort_key_bytes), val));
+                    }
+                }
+                current_key = Some(sk_full);
+                current_best = None;
             }
-        }))
+            if *ver <= target {
+                current_best = value.clone();
+            }
+        }
+        if let (Some(prev), Some(val)) = (current_key, current_best) {
+            if prev.len() > prefix_len {
+                let sort_key_bytes = prev[prefix_len..].to_vec();
+                results.push((DbSortKey(sort_key_bytes), val));
+            }
+        }
+
+        Box::new(results.into_iter())
     }
 }

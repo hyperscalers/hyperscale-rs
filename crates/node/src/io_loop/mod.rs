@@ -43,7 +43,7 @@ use hyperscale_engine::{Engine, RadixExecutor, TransactionValidation};
 use hyperscale_messages::TransactionGossip;
 use hyperscale_metrics as metrics;
 use hyperscale_network::Network;
-use hyperscale_storage::{ChainReader, ChainWriter, SubstateStore};
+use hyperscale_storage::{ChainReader, ChainWriter, JmtTreeReader, SubstateStore, VersionedStore};
 use hyperscale_types::{
     Block, Bls12381G1PrivateKey, Bls12381G1PublicKey, CommittedBlockHeader, ExecutionCertificate,
     FinalizedWave, Hash, Provision, QuorumCertificate, RoutableTransaction, ShardGroupId,
@@ -233,7 +233,7 @@ pub fn record_metrics<S: ChainWriter>(snapshot: MetricsSnapshot, storage: &S) {
 /// - `E`: Engine (transaction execution — defaults to `RadixExecutor`)
 pub struct IoLoop<S, N, D, E: Engine = RadixExecutor>
 where
-    S: ChainWriter + SubstateStore + ChainReader,
+    S: ChainWriter + SubstateStore + VersionedStore + ChainReader,
     D: Dispatch,
 {
     // Core components
@@ -344,7 +344,7 @@ where
 
 impl<S, N, D, E> IoLoop<S, N, D, E>
 where
-    S: ChainWriter + SubstateStore + ChainReader + hyperscale_storage::JmtTreeReader + Send + Sync,
+    S: ChainWriter + SubstateStore + VersionedStore + ChainReader + JmtTreeReader + Send + Sync,
     N: Network,
     D: Dispatch,
     E: Engine,

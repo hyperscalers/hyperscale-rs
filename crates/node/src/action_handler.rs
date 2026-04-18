@@ -17,7 +17,11 @@ use std::sync::Arc;
 use tracing::warn;
 
 /// Context for executing delegated actions.
-pub(crate) struct ActionContext<'a, S: ChainWriter + SubstateStore + ChainReader, E: Engine> {
+pub(crate) struct ActionContext<
+    'a,
+    S: ChainWriter + SubstateStore + hyperscale_storage::VersionedStore + ChainReader,
+    E: Engine,
+> {
     pub executor: &'a E,
     pub topology: &'a hyperscale_types::TopologySnapshot,
     /// Anchored read view over base storage + the chain of unpersisted
@@ -124,7 +128,12 @@ pub(crate) fn parent_hash_for(action: &Action) -> Option<Hash> {
 /// peers (network-specific).
 #[allow(clippy::too_many_lines)]
 pub(crate) fn handle_delegated_action<
-    S: ChainWriter + SubstateStore + ChainReader + hyperscale_storage::JmtTreeReader + Sync,
+    S: ChainWriter
+        + SubstateStore
+        + hyperscale_storage::VersionedStore
+        + ChainReader
+        + hyperscale_storage::JmtTreeReader
+        + Sync,
     E: Engine,
 >(
     action: Action,
@@ -671,7 +680,10 @@ type FetchedTxEntries = (
     Arc<Vec<hyperscale_types::StateEntry>>,
 );
 
-fn fetch_entries_for_requests<S: ChainWriter + SubstateStore + ChainReader, E: Engine>(
+fn fetch_entries_for_requests<
+    S: ChainWriter + SubstateStore + hyperscale_storage::VersionedStore + ChainReader,
+    E: Engine,
+>(
     ctx: &ActionContext<'_, S, E>,
     requests: &[hyperscale_core::ProvisionRequest],
     source_shard: ShardGroupId,
@@ -722,7 +734,12 @@ fn fetch_entries_for_requests<S: ChainWriter + SubstateStore + ChainReader, E: E
 
 /// Group fetched entries by target shard and generate merkle proofs per shard.
 fn build_provision_batches<
-    S: ChainWriter + SubstateStore + ChainReader + hyperscale_storage::JmtTreeReader + Sync,
+    S: ChainWriter
+        + SubstateStore
+        + hyperscale_storage::VersionedStore
+        + ChainReader
+        + hyperscale_storage::JmtTreeReader
+        + Sync,
     E: Engine,
 >(
     ctx: &ActionContext<'_, S, E>,

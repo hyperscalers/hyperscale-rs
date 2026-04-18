@@ -78,8 +78,11 @@ fn test_snapshot() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
 
+    // Use a realistic 50-byte node_key (spread-prefix format). MVCC-aware
+    // snapshots decode composite keys during iteration, so raw short keys
+    // would hit the entity-key length assertion.
     let partition_key = DbPartitionKey {
-        node_key: vec![1, 2, 3],
+        node_key: vec![7u8; 50],
         partition_num: 0,
     };
     let sort_key = DbSortKey(vec![10]);

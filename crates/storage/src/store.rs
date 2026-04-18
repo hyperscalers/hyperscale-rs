@@ -17,22 +17,32 @@ use radix_substate_store_interface::interface::{DbSortKey, SubstateDatabase};
 /// `commit_block()`.
 ///
 /// Runner storage types (`SimStorage`, `RocksDbStorage`) implement this trait
-/// along with `SubstateDatabase`.
+/// along with `SubstateDatabase`. They additionally implement [`VersionedStore`]
+/// for explicit MVCC-version reads; views do not, since a view carries a
+/// bound anchor and has no meaningful answer for an arbitrary version.
 pub trait SubstateStore: SubstateDatabase + Send + Sync + 'static {
     /// The snapshot type returned by this storage.
+    ///
+    /// All snapshots are MVCC-aware — reads return the value as of some
+    /// specific version. For base storage types, that version is chosen
+    /// by the impl's [`Self::snapshot`] default (typically the current
+    /// committed tip). For views, it is the view's bound anchor height.
     type Snapshot<'a>: SubstateDatabase + Send + Sync
     where
         Self: 'a;
 
-    /// Create a snapshot for isolated reads.
+    /// Create a snapshot at the impl-defined default version.
+    ///
+    /// - Base storage (`RocksDbStorage`, `SimStorage`): snapshots at the
+    ///   current `jmt_version()`, i.e. the latest committed state.
+    /// - [`crate::pending_chain::SubstateView`]: snapshots at the view's
+    ///   bound anchor height, combining the overlay with a version-anchored
+    ///   base read — deterministic across validators regardless of each
+    ///   validator's persistence lag.
     ///
     /// Snapshots provide a consistent point-in-time view of the database,
     /// essential for parallel transaction execution where each transaction
     /// needs an isolated view.
-    ///
-    /// The snapshot borrows from the storage, ensuring the storage outlives
-    /// the snapshot. This enables RocksDB's native snapshot feature which
-    /// provides true point-in-time isolation from concurrent writes.
     fn snapshot(&self) -> Self::Snapshot<'_>;
 
     /// Returns the block height of the last committed JMT state.
@@ -74,4 +84,26 @@ pub trait SubstateStore: SubstateDatabase + Send + Sync + 'static {
         storage_keys: &[Vec<u8>],
         block_height: u64,
     ) -> Option<MerkleInclusionProof>;
+}
+
+/// Storage that supports reads at an explicit MVCC version.
+///
+/// Implemented by base storage types that own the `versioned_substates`
+/// history — `RocksDbStorage` and `SimStorage`. Views do **not** implement
+/// this: a view is bound to a single anchor, so asking for "snapshot at
+/// arbitrary version V" is not meaningful. Views produce anchor-based
+/// snapshots via [`SubstateStore::snapshot`], which internally delegate
+/// to the underlying base's `snapshot_at`.
+///
+/// The returned snapshot reads substate values as of `version`. When
+/// `version` exceeds the persisted tip, MVCC walk-back clamps to the
+/// tip — callers that need overlay coverage above the persisted tip
+/// must go through a [`crate::pending_chain::SubstateView`].
+///
+/// `version` must be within the MVCC retention window (currently 256
+/// blocks). Requests beyond the window fall back to the retention
+/// boundary, not the literal version asked for.
+pub trait VersionedStore: SubstateStore {
+    /// Create a snapshot anchored at the given MVCC version.
+    fn snapshot_at(&self, version: u64) -> Self::Snapshot<'_>;
 }

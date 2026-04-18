@@ -98,7 +98,10 @@ where
     pub fn view_at_committed_tip(self: &Arc<Self>) -> Arc<SubstateView<S>> {
         match self.base.committed_hash() {
             Some(h) => self.view_at(h),
-            None => Arc::new(SubstateView::base_only(Arc::clone(&self.base))),
+            None => Arc::new(SubstateView::base_only(
+                Arc::clone(&self.base),
+                self.base.jmt_version(),
+            )),
         }
     }
 
@@ -118,7 +121,13 @@ where
         }
         // Walk produces deepest-first; flip to commit order.
         chain.reverse();
-        SubstateView::from_chain(Arc::clone(&self.base), &chain)
+        // Anchor height = chain tip if any pending entries were found,
+        // otherwise the base's committed tip (parent already persisted).
+        let anchor_height = chain
+            .last()
+            .map(|e| e.height)
+            .unwrap_or_else(|| self.base.jmt_version());
+        SubstateView::from_chain(Arc::clone(&self.base), &chain, anchor_height)
     }
 }
 
@@ -144,6 +153,13 @@ type JmtNodeIndex = HashMap<jmt::NodeKey, Arc<jmt::Node>>;
 /// views remain valid).
 pub struct SubstateView<S> {
     base: Arc<S>,
+    /// Block height of the anchor — the chain's tip, or the base's
+    /// `jmt_version()` when the view has no pending entries. Used as the
+    /// MVCC version for base-storage reads in [`Self::snapshot`], so the
+    /// snapshot reflects state as-of this specific block rather than
+    /// "whatever the validator has currently persisted." Critical for
+    /// cross-validator determinism under persistence lag.
+    anchor_height: u64,
     /// Flattened pending substates from the anchored chain, in commit order.
     /// Later entries override earlier ones for the same key.
     overlay: OverlayEntries,
@@ -173,7 +189,11 @@ impl<S> SubstateView<S> {
     /// Build a view from a chain of entries in commit order (earliest first).
     /// Takes borrowed entries so the caller can hold a read lock over the
     /// chain index for the duration of the walk without cloning.
-    fn from_chain(base: Arc<S>, chain: &[&ChainEntry]) -> Self {
+    ///
+    /// `anchor_height` is the height of the view's anchor — the chain's
+    /// tip (last entry) when non-empty, or the base's committed tip when
+    /// the walk produced nothing.
+    fn from_chain(base: Arc<S>, chain: &[&ChainEntry], anchor_height: u64) -> Self {
         let mut overlay: OverlayEntries = HashMap::new();
         let mut jmt_snapshots: Vec<Arc<JmtSnapshot>> = Vec::with_capacity(chain.len());
         let mut jmt_nodes: JmtNodeIndex = HashMap::new();
@@ -192,6 +212,7 @@ impl<S> SubstateView<S> {
 
         Self {
             base,
+            anchor_height,
             overlay,
             jmt_snapshots,
             jmt_nodes,
@@ -200,9 +221,10 @@ impl<S> SubstateView<S> {
     }
 
     /// Build a view with no pending entries (reads always go to base).
-    fn base_only(base: Arc<S>) -> Self {
+    fn base_only(base: Arc<S>, anchor_height: u64) -> Self {
         Self {
             base,
+            anchor_height,
             overlay: HashMap::new(),
             jmt_snapshots: Vec::new(),
             jmt_nodes: HashMap::new(),
@@ -344,15 +366,21 @@ impl<Snap: SubstateDatabase> SubstateDatabase for ViewSnapshot<Snap> {
     }
 }
 
-impl<S: SubstateStore> SubstateStore for SubstateView<S> {
+impl<S: SubstateStore + crate::VersionedStore> SubstateStore for SubstateView<S> {
     type Snapshot<'a>
         = ViewSnapshot<S::Snapshot<'a>>
     where
         Self: 'a;
 
     fn snapshot(&self) -> Self::Snapshot<'_> {
+        // Base reads are MVCC-anchored to the view's anchor height so that
+        // keys not touched by any pending ancestor in the overlay resolve
+        // to the value at the anchor — not "current StateCf", which would
+        // leak post-anchor writes when this validator has persisted past
+        // descendants that others haven't. This is the determinism fix
+        // for cross-validator state_root computation.
         ViewSnapshot {
-            base_snapshot: (*self.base).snapshot(),
+            base_snapshot: (*self.base).snapshot_at(self.anchor_height),
             // Clone the overlay into an Arc so the snapshot is `'static`
             // with respect to the view's overlay map.
             overlay: Arc::new(self.overlay.clone()),
@@ -604,6 +632,12 @@ mod tests {
             _block_height: u64,
         ) -> Option<MerkleInclusionProof> {
             None
+        }
+    }
+
+    impl crate::VersionedStore for StubStore {
+        fn snapshot_at(&self, _version: u64) -> Self::Snapshot<'_> {
+            StubSnapshot
         }
     }
 

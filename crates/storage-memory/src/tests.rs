@@ -538,3 +538,63 @@ fn test_ec_storage_batch() {
     let storage = SimStorage::new();
     hyperscale_storage::test_helpers::test_ec_storage_batch(&storage);
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// Persistence-lag determinism
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Regression test: two validators with different `persisted_height`
+/// but reading at the same MVCC version must observe identical substate
+/// values. This is the scenario that caused the shard-0 state-root
+/// divergence — base snapshots used to read "current StateCf" which
+/// leaked post-anchor writes on the faster-persisting validator.
+#[test]
+fn test_snapshot_at_version_is_deterministic_across_persistence_lag() {
+    use hyperscale_storage::VersionedStore;
+
+    let nid = NodeId([1u8; 30]);
+    let partition_num = 0;
+    let sort_key = vec![1u8];
+
+    let commit = |storage: &SimStorage, height: u64, value: Vec<u8>| {
+        let block = make_test_block(height);
+        let qc = make_test_qc(&block);
+        let updates = make_mapped_database_update(1, partition_num, sort_key.clone(), value);
+        commit_with(storage, &updates, &block, &qc);
+    };
+
+    // Validator A: persists through block 5.
+    let a = SimStorage::new();
+    for h in 1..=5 {
+        commit(&a, h, vec![h as u8]);
+    }
+    assert_eq!(a.jmt_version(), 5);
+
+    // Validator B: stops at block 3.
+    let b = SimStorage::new();
+    for h in 1..=3 {
+        commit(&b, h, vec![h as u8]);
+    }
+    assert_eq!(b.jmt_version(), 3);
+
+    // Both read at version 3 via MVCC. Must see block-3's value on both,
+    // not A's current (block-5) value. Before the fix, A would return 5.
+    let snap_a = a.snapshot_at(3);
+    let snap_b = b.snapshot_at(3);
+    let pk = DbPartitionKey {
+        node_key: hyperscale_storage::keys::node_entity_key(&nid),
+        partition_num,
+    };
+    let sk = DbSortKey(sort_key.clone());
+
+    assert_eq!(
+        snap_a.get_raw_substate_by_db_key(&pk, &sk),
+        Some(vec![3]),
+        "validator A must see block-3 value at v3, not its current (block-5) value"
+    );
+    assert_eq!(
+        snap_a.get_raw_substate_by_db_key(&pk, &sk),
+        snap_b.get_raw_substate_by_db_key(&pk, &sk),
+        "validators at different persisted heights must agree on version-3 state"
+    );
+}
