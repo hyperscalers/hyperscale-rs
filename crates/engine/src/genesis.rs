@@ -7,7 +7,7 @@ use radix_common::types::ComponentAddress;
 use radix_engine::system::bootstrap::{
     GenesisDataChunk, GenesisReceipts, GenesisStakeAllocation, GenesisValidator,
 };
-use radix_engine::updates::{BabylonSettings, ProtocolBuilder};
+use radix_engine::updates::{BabylonSettings, ProtocolBuilder, ProtocolVersion};
 use radix_engine::vm::VmModules;
 use radix_engine_interface::blueprints::consensus_manager::ConsensusManagerConfig;
 use radix_substate_store_interface::interface::{CommittableSubstateDatabase, SubstateDatabase};
@@ -179,7 +179,7 @@ impl GenesisBuilder {
 
         ProtocolBuilder::for_network(&self.network)
             .configure_babylon(|_| babylon_settings)
-            .only_babylon()
+            .from_bootstrap_to(ProtocolVersion::CuttlefishPart2)
             .commit_each_protocol_update_advanced(store, &mut hooks, &vm_modules);
 
         Ok(hooks.into_genesis_receipts())
