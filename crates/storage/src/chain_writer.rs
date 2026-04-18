@@ -4,7 +4,7 @@
 //! `prepare_block_commit` returns an opaque `PreparedCommit` handle that
 //! carries precomputed work; `commit_prepared_block` applies it efficiently.
 
-use crate::JmtSnapshot;
+use crate::{BaseReadCache, JmtSnapshot};
 use hyperscale_types::{Block, FinalizedWave, Hash, QuorumCertificate};
 use std::sync::Arc;
 
@@ -45,6 +45,13 @@ pub trait ChainWriter: Send + Sync + 'static {
     /// that haven't been committed yet. Their tree nodes are overlaid on the
     /// base store so chained verifications can find parent nodes.
     ///
+    /// `base_reads` is an optional cache of reads observed through the
+    /// originating `SubstateView` during execution. When provided, it
+    /// lets the commit path skip a `multi_get_cf` on StateCf for keys
+    /// already read — a large fraction at high TPS. Callers without a
+    /// view (e.g. sync / tests) pass `None`; implementations fall back
+    /// to reading StateCf for any key missing from the cache.
+    ///
     /// Returns `(computed_state_root, prepared_commit_handle)`.
     fn prepare_block_commit(
         &self,
@@ -53,6 +60,7 @@ pub trait ChainWriter: Send + Sync + 'static {
         finalized_waves: &[Arc<FinalizedWave>],
         block_height: u64,
         pending_snapshots: &[Arc<JmtSnapshot>],
+        base_reads: Option<&BaseReadCache>,
     ) -> (Hash, Self::PreparedCommit);
 
     /// Commit one or more blocks using precomputed work from `prepare_block_commit`.

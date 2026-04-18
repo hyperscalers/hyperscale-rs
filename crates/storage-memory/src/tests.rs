@@ -411,7 +411,7 @@ fn test_prepare_then_commit_fast_path() {
 
     // Prepare path
     let parent_root = s_prepared.state_root_hash();
-    let (spec_root, prepared) = s_prepared.prepare_block_commit(parent_root, 0, &[], 1, &[]);
+    let (spec_root, prepared) = s_prepared.prepare_block_commit(parent_root, 0, &[], 1, &[], None);
     let result_prepared = s_prepared
         .commit_prepared_blocks(vec![(
             prepared,
@@ -434,7 +434,7 @@ fn test_prepare_commit_state_root_matches() {
     let qc = make_test_qc(&block);
 
     let parent_root = storage.state_root_hash();
-    let (spec_root, prepared) = storage.prepare_block_commit(parent_root, 0, &[], 1, &[]);
+    let (spec_root, prepared) = storage.prepare_block_commit(parent_root, 0, &[], 1, &[], None);
     let result = storage
         .commit_prepared_blocks(vec![(prepared, Arc::new(block), Arc::new(qc))])
         .remove(0);
@@ -544,7 +544,7 @@ fn test_ec_storage_batch() {
 // ═══════════════════════════════════════════════════════════════════════
 
 /// Regression test: two validators with different `persisted_height`
-/// but reading at the same MVCC version must observe identical substate
+/// but reading at the same historical version must observe identical substate
 /// values. This is the scenario that caused the shard-0 state-root
 /// divergence — base snapshots used to read "current StateCf" which
 /// leaked post-anchor writes on the faster-persisting validator.
@@ -577,8 +577,9 @@ fn test_snapshot_at_version_is_deterministic_across_persistence_lag() {
     }
     assert_eq!(b.jmt_version(), 3);
 
-    // Both read at version 3 via MVCC. Must see block-3's value on both,
-    // not A's current (block-5) value. Before the fix, A would return 5.
+    // Both read at version 3 via the state-history log. Must see block-3's
+    // value on both, not A's current (block-5) value. Before the fix, A
+    // would return 5.
     let snap_a = a.snapshot_at(3);
     let snap_b = b.snapshot_at(3);
     let pk = DbPartitionKey {
@@ -637,4 +638,267 @@ fn test_snapshot_resolves_floor_among_many_versions() {
             "snapshot_at({target}) should resolve to block-{target} value"
         );
     }
+}
+
+/// State-history walkthrough: key K created at V1 with value A, deleted
+/// at V2, recreated at V3 with value B. Every historical version must
+/// read back the correct value — that's the "smallest history entry
+/// after V" invariant end-to-end.
+///
+/// Uses `commit_shared` (test-only helper) so we don't have to
+/// construct full blocks/QCs around every write.
+#[test]
+fn test_state_history_create_delete_create() {
+    use hyperscale_storage::VersionedStore;
+
+    let nid = NodeId([7u8; 30]);
+    let partition_num = 0;
+    let sort_key = vec![42u8];
+    let pk = DbPartitionKey {
+        node_key: hyperscale_storage::keys::node_entity_key(&nid),
+        partition_num,
+    };
+    let sk = DbSortKey(sort_key.clone());
+
+    let storage = SimStorage::new();
+
+    // Keep a second key alive throughout so the JMT never empties out
+    // — the JMT parent-version chain would otherwise break at V2 if
+    // deleting K left the tree empty. The state-history behavior we're
+    // actually testing is entirely independent of this.
+    let anchor = make_mapped_database_update(99, 0, vec![0xFF], vec![0xFF]);
+
+    // V1: create with value A (=0xAA). Also set the anchor key.
+    let mut v1 = make_mapped_database_update(7, partition_num, sort_key.clone(), vec![0xAA]);
+    hyperscale_storage::merge_into(&mut v1, &anchor);
+    storage.commit_shared(&v1);
+
+    // V2: delete K.
+    let mut v2 = DatabaseUpdates::default();
+    v2.node_updates.insert(
+        pk.node_key.clone(),
+        NodeDatabaseUpdates {
+            partition_updates: [(
+                partition_num,
+                PartitionDatabaseUpdates::Delta {
+                    substate_updates: [(sk.clone(), DatabaseUpdate::Delete)].into_iter().collect(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        },
+    );
+    storage.commit_shared(&v2);
+
+    // V3: create again with value B (=0xBB).
+    let v3 = make_mapped_database_update(7, partition_num, sort_key.clone(), vec![0xBB]);
+    storage.commit_shared(&v3);
+
+    // Expected:
+    // V0: before any writes → None. History[K,1] = None wins (smallest
+    //     v' > 0 for K). prior = None → None.
+    // V1: snapshot_at(1) is "current" branch (1 == current_version only
+    //     after V1 commit; but we're at V3 now, so V1 is historical).
+    //     Smallest history > V1 is (K, 2) with prior=Some(A). → A.
+    // V2: smallest history > V2 is (K, 3) with prior=None (K was
+    //     deleted at V2, so pre-V3 was absent). → None.
+    // V3: trivial branch (current). current_state[K] = B. → B.
+    let expected: &[(u64, Option<Vec<u8>>)] = &[
+        (0, None),
+        (1, Some(vec![0xAA])),
+        (2, None),
+        (3, Some(vec![0xBB])),
+    ];
+
+    for (v, want) in expected {
+        let snap = storage.snapshot_at(*v);
+        let got = snap.get_raw_substate_by_db_key(&pk, &sk);
+        assert_eq!(
+            &got, want,
+            "state-history read at V={v}: want={want:?}, got={got:?}"
+        );
+    }
+}
+
+/// `snapshot_at(V)` must panic when V is below the retention floor.
+/// This is the DA-assumption guard: internal code should never
+/// anchor a view at a version beyond the retention window, and
+/// hitting it means a bug elsewhere (not a graceful-degradation
+/// case).
+#[test]
+#[should_panic(expected = "below retention floor")]
+fn test_snapshot_at_below_retention_panics() {
+    // Tiny retention: floor = current - 2.
+    let storage = SimStorage::with_jmt_history_length(2);
+    for h in 1..=10u64 {
+        let block = make_test_block(h);
+        let qc = make_test_qc(&block);
+        commit_with(&storage, &DatabaseUpdates::default(), &block, &qc);
+    }
+    // current=10, floor=8. Asking for V=1 is well below floor.
+    let _snap = <SimStorage as hyperscale_storage::VersionedStore>::snapshot_at(&storage, 1);
+}
+
+/// `list_substates_for_node_at_height` is an external-facing API —
+/// it must return `None` for out-of-retention heights rather than
+/// panicking (the panic path is reserved for `snapshot_at` callers).
+#[test]
+fn test_list_substates_at_height_respects_retention() {
+    use hyperscale_storage::keys;
+
+    let nid = NodeId([9u8; 30]);
+    let partition_num = 0;
+    let sort_key = vec![1u8];
+
+    let storage = SimStorage::with_jmt_history_length(2);
+    for h in 1..=10u64 {
+        let block = make_test_block(h);
+        let qc = make_test_qc(&block);
+        let updates =
+            make_mapped_database_update(9, partition_num, sort_key.clone(), vec![h as u8]);
+        commit_with(&storage, &updates, &block, &qc);
+    }
+    // current=10, floor=8.
+    let _ = keys::node_entity_key(&nid); // use imported for consistency
+
+    // Within retention: returns Some.
+    let got = storage.list_substates_for_node_at_height(&nid, 9);
+    assert!(got.is_some(), "height within retention must succeed");
+
+    // Below retention: returns None (graceful).
+    let got = storage.list_substates_for_node_at_height(&nid, 1);
+    assert!(got.is_none(), "height below retention must return None");
+
+    // Above current: returns None.
+    let got = storage.list_substates_for_node_at_height(&nid, 99);
+    assert!(got.is_none(), "future height returns None");
+}
+
+/// A Reset partition must capture a history entry for every key
+/// removed so historical reads see the pre-reset contents.
+#[test]
+fn test_reset_partition_captures_history_for_all_removed_keys() {
+    use hyperscale_storage::VersionedStore;
+
+    let node_key = vec![3u8; 50];
+    let partition_num = 0;
+    let pk = DbPartitionKey {
+        node_key: node_key.clone(),
+        partition_num,
+    };
+
+    let storage = SimStorage::new();
+
+    // V1: populate partition with A/B/C.
+    {
+        let block = make_test_block(1);
+        let qc = make_test_qc(&block);
+        let mut updates = DatabaseUpdates::default();
+        updates.node_updates.insert(
+            node_key.clone(),
+            NodeDatabaseUpdates {
+                partition_updates: [(
+                    partition_num,
+                    PartitionDatabaseUpdates::Delta {
+                        substate_updates: [
+                            (DbSortKey(vec![0xA1]), DatabaseUpdate::Set(vec![0xAA])),
+                            (DbSortKey(vec![0xB1]), DatabaseUpdate::Set(vec![0xBB])),
+                            (DbSortKey(vec![0xC1]), DatabaseUpdate::Set(vec![0xCC])),
+                        ]
+                        .into_iter()
+                        .collect(),
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            },
+        );
+        commit_with(&storage, &updates, &block, &qc);
+    }
+
+    // V2: reset partition to only D/E.
+    {
+        let block = make_test_block(2);
+        let qc = make_test_qc(&block);
+        let mut updates = DatabaseUpdates::default();
+        let mut new_values = indexmap::IndexMap::new();
+        new_values.insert(DbSortKey(vec![0xD1]), vec![0xDD]);
+        new_values.insert(DbSortKey(vec![0xE1]), vec![0xEE]);
+        updates.node_updates.insert(
+            node_key.clone(),
+            NodeDatabaseUpdates {
+                partition_updates: [(
+                    partition_num,
+                    PartitionDatabaseUpdates::Reset {
+                        new_substate_values: new_values,
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            },
+        );
+        commit_with(&storage, &updates, &block, &qc);
+    }
+
+    // At V1, the original contents A/B/C must still be visible.
+    let snap_v1 = storage.snapshot_at(1);
+    assert_eq!(
+        snap_v1.get_raw_substate_by_db_key(&pk, &DbSortKey(vec![0xA1])),
+        Some(vec![0xAA]),
+    );
+    assert_eq!(
+        snap_v1.get_raw_substate_by_db_key(&pk, &DbSortKey(vec![0xB1])),
+        Some(vec![0xBB]),
+    );
+    assert_eq!(
+        snap_v1.get_raw_substate_by_db_key(&pk, &DbSortKey(vec![0xC1])),
+        Some(vec![0xCC]),
+    );
+    // D/E must not be visible at V1 — they don't exist yet.
+    assert_eq!(
+        snap_v1.get_raw_substate_by_db_key(&pk, &DbSortKey(vec![0xD1])),
+        None,
+    );
+
+    // At V2, only D/E are visible.
+    let snap_v2 = storage.snapshot_at(2);
+    assert_eq!(
+        snap_v2.get_raw_substate_by_db_key(&pk, &DbSortKey(vec![0xA1])),
+        None,
+    );
+    assert_eq!(
+        snap_v2.get_raw_substate_by_db_key(&pk, &DbSortKey(vec![0xD1])),
+        Some(vec![0xDD]),
+    );
+    assert_eq!(
+        snap_v2.get_raw_substate_by_db_key(&pk, &DbSortKey(vec![0xE1])),
+        Some(vec![0xEE]),
+    );
+}
+
+/// Genesis-style writes via `commit_substates_only` must NOT populate
+/// the state-history log — there is no pre-state to preserve, and
+/// polluting the log with `(K, 0) → None` entries would waste space
+/// until GC.
+#[test]
+fn test_genesis_skips_history_entries() {
+    use hyperscale_storage::SubstatesOnlyCommit;
+
+    let storage = SimStorage::new();
+
+    let updates = make_database_update(vec![1u8; 50], 0, vec![1], vec![0xAA]);
+    <SimStorage as SubstatesOnlyCommit>::commit_substates_only(&storage, &updates);
+
+    // History map must be empty after a genesis-style commit.
+    assert_eq!(
+        storage.state.read().unwrap().state_history.len(),
+        0,
+        "commit_substates_only must not record state-history entries"
+    );
+    // current_state must have the genesis write though.
+    assert_eq!(
+        storage.state.read().unwrap().current_state.len(),
+        1,
+        "commit_substates_only populates current_state"
+    );
 }

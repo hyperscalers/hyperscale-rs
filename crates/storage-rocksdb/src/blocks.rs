@@ -3,8 +3,6 @@
 use crate::column_families::{BlocksCf, CertificatesCf, TransactionsCf};
 use crate::core::RocksDbStorage;
 
-#[cfg(test)]
-use crate::typed_cf::TypedCf;
 use hyperscale_metrics as metrics;
 use hyperscale_types::{
     Block, BlockHeight, BlockMetadata, FinalizedWave, Hash, QuorumCertificate, RoutableTransaction,
@@ -463,40 +461,26 @@ impl RocksDbStorage {
         let start = Instant::now();
         let mut batch = rocksdb::WriteBatch::default();
         let mut write_count = 0usize;
-        let cf = self.cf();
 
         // 1. Serialize and add certificate to batch
         self.cf_put::<CertificatesCf>(&mut batch, &certificate.wave_id.hash(), certificate);
         write_count += 1;
 
-        // 2. Add state writes to batch at the current JMT version (this
-        //    helper is test-only; production goes through `commit_block`).
-        let state_cf = crate::column_families::StateCf::handle(&cf);
+        // 2. Append substate writes to the cert batch at the current
+        //    JMT version. This helper is test-only; production goes
+        //    through `commit_block`. Delegate to
+        //    `append_substate_writes_to_batch` so the state-history
+        //    capture stays single-sourced.
         let version = self.read_jmt_metadata().0;
-        for (db_node_key, node_updates) in &updates.node_updates {
-            for (partition_num, partition_updates) in &node_updates.partition_updates {
+        let _reset_old_keys = self.append_substate_writes_to_batch(
+            &mut batch, updates, version, /* write_history */ true, /* base_reads */ None,
+        );
+        for (_db_node_key, node_updates) in &updates.node_updates {
+            for (_partition_num, partition_updates) in &node_updates.partition_updates {
                 if let hyperscale_storage::PartitionDatabaseUpdates::Delta { substate_updates } =
                     partition_updates
                 {
-                    for (db_sort_key, update) in substate_updates {
-                        let partition_key = hyperscale_storage::DbPartitionKey {
-                            node_key: db_node_key.clone(),
-                            partition_num: *partition_num,
-                        };
-                        let key = ((partition_key, db_sort_key.clone()), version);
-
-                        let value_bytes: Vec<u8> = match update {
-                            hyperscale_storage::DatabaseUpdate::Set(value) => value.clone(),
-                            hyperscale_storage::DatabaseUpdate::Delete => Vec::new(),
-                        };
-                        crate::typed_cf::batch_put::<crate::column_families::StateCf>(
-                            &mut batch,
-                            state_cf,
-                            &key,
-                            &value_bytes,
-                        );
-                        write_count += 1;
-                    }
+                    write_count += substate_updates.len();
                 }
             }
         }

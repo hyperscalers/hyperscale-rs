@@ -284,12 +284,16 @@ pub fn verify_state_root<S: ChainWriter + SubstateStore>(
     // storage.jmt_version() which is racy — by the time this runs on the
     // ConsensusCrypto pool, other blocks may have committed and advanced the
     // JMT past the parent version.
+    // `base_reads=None` lets a `SubstateView` storage drain its own
+    // execution-time cache inside its `prepare_block_commit` impl. Raw
+    // storage types (no view) fall through to `multi_get_cf`.
     let (computed_root, prepared) = storage.prepare_block_commit(
         parent_state_root,
         parent_block_height,
         finalized_waves,
         block_height,
         pending_snapshots,
+        None,
     );
 
     let valid = computed_root == expected_root;
@@ -355,6 +359,7 @@ pub fn build_proposal<S: ChainWriter + SubstateStore>(
         &certificates,
         height.0,
         pending_snapshots,
+        None,
     );
 
     let receipts: Vec<ReceiptBundle> = certificates

@@ -34,12 +34,14 @@ pub(crate) struct SharedState {
     pub current_root_hash: StateRootHash,
     /// Leaf-key → substate-value associations for historical queries.
     pub associations: HashMap<jmt::NodeKey, Vec<u8>>,
-    /// MVCC versioned substate store — the single source of truth for
-    /// substates. `(storage_key, version) → Option<value>`, where `None`
-    /// is a tombstone. BTreeMap ordering gives prefix scans and version
-    /// ordering for free; "current state" is simply the latest entry per
-    /// key.
-    pub substates: VersionedSubstateStore,
+    /// Current value per `storage_key`. Absent key = no value. This is
+    /// the authoritative source of truth for reads at the current tip.
+    pub current_state: BTreeMap<Vec<u8>, Vec<u8>>,
+    /// Per-write prior-value entries keyed by `(storage_key,
+    /// write_version)`. `None` means the key was absent immediately
+    /// before the write at that version. Consumed by historical reads
+    /// and the retention GC.
+    pub state_history: BTreeMap<(Vec<u8>, u64), Option<Vec<u8>>>,
 }
 
 impl SharedState {
@@ -52,7 +54,8 @@ impl SharedState {
             tree_store: SimTreeStore::new(),
             current_block_height: 0,
             current_root_hash: Hash::ZERO,
-            substates: BTreeMap::new(),
+            current_state: BTreeMap::new(),
+            state_history: BTreeMap::new(),
             associations: HashMap::new(),
         }
     }
@@ -163,24 +166,25 @@ impl ConsensusState {
     }
 }
 
-/// MVCC versioned substate store type: `(storage_key, version) → Option<value>`.
-pub(crate) type VersionedSubstateStore = BTreeMap<(Vec<u8>, u64), Option<Vec<u8>>>;
-
-/// Apply database updates to the MVCC substate store at `version`.
+/// Apply database updates to the substate store at `version`.
 ///
-/// Every write lands as `(storage_key, version) → Some(value)` (Set) or
-/// `(storage_key, version) → None` (Delete / Reset tombstone). "Current
-/// state" is derived by walking each key's version list and taking the
-/// latest non-tombstone entry.
+/// Each write mutates `current_state` directly. If `write_history` is
+/// true, the pre-write value (or `None` if absent) is captured into
+/// `state_history` at `(storage_key, version)` before the write is
+/// applied — this is the mechanism that lets historical reads at any
+/// earlier version recover the value-at-that-version. Genesis and
+/// other bootstrap paths pass `write_history: false` because there is
+/// no pre-state to preserve.
 ///
-/// For Reset partitions, the helper enumerates existing non-tombstone
-/// keys in the partition (latest entry per key at or below `version - 1`)
-/// and emits tombstones for each at `version` before writing the new
-/// values.
+/// For Reset partitions, the helper enumerates current keys in the
+/// partition (via `current_state`) and treats each the same way:
+/// capture history, then set (if re-written by `new_substate_values`)
+/// or delete.
 pub(crate) fn apply_updates(
-    substates: &mut VersionedSubstateStore,
+    state: &mut SharedState,
     updates: &DatabaseUpdates,
     version: u64,
+    write_history: bool,
 ) {
     for (node_key, node_updates) in &updates.node_updates {
         for (partition_num, partition_updates) in &node_updates.partition_updates {
@@ -193,31 +197,50 @@ pub(crate) fn apply_updates(
                 PartitionDatabaseUpdates::Delta { substate_updates } => {
                     for (sort_key, update) in substate_updates {
                         let key = keys::to_storage_key(&partition_key, sort_key);
-                        let value = match update {
-                            DatabaseUpdate::Set(v) => Some(v.clone()),
-                            DatabaseUpdate::Delete => None,
-                        };
-                        substates.insert((key, version), value);
+                        let prior = state.current_state.get(&key).cloned();
+                        if write_history {
+                            state.state_history.insert((key.clone(), version), prior);
+                        }
+                        match update {
+                            DatabaseUpdate::Set(v) => {
+                                state.current_state.insert(key, v.clone());
+                            }
+                            DatabaseUpdate::Delete => {
+                                state.current_state.remove(&key);
+                            }
+                        }
                     }
                 }
                 PartitionDatabaseUpdates::Reset {
                     new_substate_values,
                 } => {
                     // Enumerate keys currently live in the partition
-                    // (latest non-tombstone entry at or below `version`
-                    // pre-write), tombstone each at `version`.
-                    let existing_keys = live_partition_keys_at(
-                        substates,
-                        &partition_key,
-                        version.saturating_sub(1),
-                    );
-                    for key in existing_keys {
-                        substates.insert((key, version), None);
+                    // from `current_state` directly (one entry per key,
+                    // no version walk).
+                    let existing_keys = live_partition_keys(&state.current_state, &partition_key);
+                    let new_keys: std::collections::HashSet<Vec<u8>> = new_substate_values
+                        .iter()
+                        .map(|(sk, _)| keys::to_storage_key(&partition_key, sk))
+                        .collect();
+
+                    // Remove old keys that aren't in the new set.
+                    for key in &existing_keys {
+                        if !new_keys.contains(key) {
+                            let prior = state.current_state.remove(key);
+                            if write_history {
+                                state.state_history.insert((key.clone(), version), prior);
+                            }
+                        }
                     }
 
+                    // Write new values; capture history for each.
                     for (sort_key, value) in new_substate_values {
                         let key = keys::to_storage_key(&partition_key, sort_key);
-                        substates.insert((key, version), Some(value.clone()));
+                        let prior = state.current_state.get(&key).cloned();
+                        if write_history {
+                            state.state_history.insert((key.clone(), version), prior);
+                        }
+                        state.current_state.insert(key, value.clone());
                     }
                 }
             }
@@ -225,40 +248,15 @@ pub(crate) fn apply_updates(
     }
 }
 
-/// Return storage keys that have a live (non-tombstone) entry in the
-/// partition at or below `version`.
-fn live_partition_keys_at(
-    substates: &VersionedSubstateStore,
+/// Return storage keys currently live in the given partition.
+pub(crate) fn live_partition_keys(
+    current_state: &BTreeMap<Vec<u8>, Vec<u8>>,
     partition_key: &DbPartitionKey,
-    version: u64,
 ) -> Vec<Vec<u8>> {
     let prefix = keys::partition_prefix(partition_key);
     let end = keys::next_prefix(&prefix).expect("storage key prefix overflow");
-    let range_start = (prefix, 0u64);
-    let range_end = (end, 0u64);
-
-    let mut result: Vec<Vec<u8>> = Vec::new();
-    let mut current_key: Option<&Vec<u8>> = None;
-    let mut current_best_is_live = false;
-
-    for ((sk_full, ver), value) in substates.range(range_start..range_end) {
-        if current_key != Some(sk_full) {
-            if let Some(prev) = current_key {
-                if current_best_is_live {
-                    result.push(prev.clone());
-                }
-            }
-            current_key = Some(sk_full);
-            current_best_is_live = false;
-        }
-        if *ver <= version {
-            current_best_is_live = value.is_some();
-        }
-    }
-    if let Some(prev) = current_key {
-        if current_best_is_live {
-            result.push(prev.clone());
-        }
-    }
-    result
+    current_state
+        .range(prefix..end)
+        .map(|(k, _)| k.clone())
+        .collect()
 }

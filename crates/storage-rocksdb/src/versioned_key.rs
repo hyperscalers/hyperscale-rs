@@ -1,10 +1,11 @@
-//! Composite key type for the `versioned_substates` column family.
+//! Composite key type for the `state_history` column family.
 //!
-//! Layout: `[storage_key_bytes...][version_BE_8B]`
+//! Layout: `[storage_key_bytes...][write_version_BE_8B]`
 //!
-//! The big-endian version suffix ensures that for a given storage key prefix,
-//! versions sort in ascending lexicographic order — enabling efficient
-//! "find latest version <= N" scans.
+//! The big-endian version suffix ensures that for a given storage key
+//! prefix, entries sort in ascending lexicographic order on version —
+//! enabling the forward seek used by historical reads to find the
+//! smallest `write_version > V` for a key.
 
 use crate::substate_key::SubstateKeyCodec;
 use crate::typed_cf::DbCodec;

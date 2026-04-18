@@ -103,19 +103,28 @@ struct ExecutorCaches {
 /// with per-transaction result caching so identical executions across
 /// validators in the same shard only run once.
 pub trait Engine: Clone + Send + Sync + 'static {
-    /// Execute single-shard transactions (READ-ONLY).
-    fn execute_single_shard<S: SubstateStore>(
+    /// Execute single-shard transactions (READ-ONLY) against a
+    /// caller-provided snapshot. Snapshot hoisting lets the caller
+    /// share one rocksdb snapshot across multiple engine calls in the
+    /// same action batch.
+    fn execute_single_shard<D: SubstateDatabase>(
         &self,
-        storage: &S,
+        snapshot: &D,
         transactions: &[Arc<RoutableTransaction>],
         local_shard: hyperscale_types::ShardGroupId,
         num_shards: u64,
     ) -> Result<ExecutionOutput, ExecutionError>;
 
     /// Execute cross-shard transactions with provisions (READ-ONLY).
-    fn execute_cross_shard<S: SubstateStore>(
+    ///
+    /// Takes a pre-built snapshot rather than storage so the caller can
+    /// share one rocksdb snapshot across multiple `execute_cross_shard`
+    /// calls in the same action batch — each call avoids a fresh
+    /// `storage.snapshot()` (which costs `db.snapshot()` +
+    /// `read_jmt_metadata` against the default CF).
+    fn execute_cross_shard<D: SubstateDatabase>(
         &self,
-        storage: &S,
+        snapshot: &D,
         transactions: &[Arc<RoutableTransaction>],
         provisions: &[hyperscale_types::StateProvision],
         local_shard: hyperscale_types::ShardGroupId,
@@ -239,9 +248,9 @@ impl RadixExecutor {
         tx_count = transactions.len(),
         latency_us = tracing::field::Empty,
     ))]
-    pub fn execute_single_shard<S: SubstateStore>(
+    pub fn execute_single_shard<D: SubstateDatabase>(
         &self,
-        storage: &S,
+        snapshot: &D,
         transactions: &[Arc<RoutableTransaction>],
         local_shard: hyperscale_types::ShardGroupId,
         num_shards: u64,
@@ -249,8 +258,14 @@ impl RadixExecutor {
         let start = Instant::now();
         let mut results = Vec::with_capacity(transactions.len());
 
+        // Caller-provided snapshot — one rocksdb snapshot can serve
+        // every tx in the batch AND every other engine call in the
+        // same action (cross-shard, fetch). State doesn't change
+        // during execution — commits serialize by commit_lock elsewhere
+        // — so sharing one snapshot is correct and avoids per-tx
+        // `storage.snapshot()` + `read_jmt_metadata` overhead.
         for tx in transactions {
-            let result = self.execute_one(storage, tx, local_shard, num_shards)?;
+            let result = self.execute_one(snapshot, tx, local_shard, num_shards)?;
             results.push(result);
         }
 
@@ -277,9 +292,9 @@ impl RadixExecutor {
         provision_count = provisions.len(),
         latency_us = tracing::field::Empty,
     ))]
-    pub fn execute_cross_shard<S: SubstateStore>(
+    pub fn execute_cross_shard<D: SubstateDatabase>(
         &self,
-        storage: &S,
+        snapshot: &D,
         transactions: &[Arc<RoutableTransaction>],
         provisions: &[StateProvision],
         local_shard: hyperscale_types::ShardGroupId,
@@ -289,13 +304,14 @@ impl RadixExecutor {
 
         let mut results = Vec::with_capacity(transactions.len());
 
-        // Take a snapshot for isolated execution
-        let snapshot = storage.snapshot();
-
+        // Caller-provided snapshot — one rocksdb snapshot can serve
+        // multiple `execute_cross_shard` calls from the same action
+        // batch, avoiding a `storage.snapshot()` per request.
+        //
         // Create provisioned snapshot from pre-computed storage keys.
         let entry_slices: Vec<&[StateEntry]> =
             provisions.iter().map(|p| p.entries.as_slice()).collect();
-        let provisioned = ProvisionedSnapshot::from_provisions(&snapshot, &entry_slices);
+        let provisioned = ProvisionedSnapshot::from_provisions(snapshot, &entry_slices);
 
         for tx in transactions {
             // Execute using cached VM modules and config
@@ -309,8 +325,9 @@ impl RadixExecutor {
                 &self.caches.exec_config,
             );
 
-            // Use snapshot for filtering — same rationale as execute_one.
-            let result = self.receipt_to_result(&snapshot, tx, &receipt, local_shard, num_shards);
+            // Same snapshot for receipt filtering — resolve_owned_nodes
+            // must see the same ownership state as the execution.
+            let result = self.receipt_to_result(snapshot, tx, &receipt, local_shard, num_shards);
 
             // NO COMMIT HERE - DatabaseUpdates are cached by the state machine
             // and applied when the WaveCertificate is included in a block.
@@ -326,16 +343,20 @@ impl RadixExecutor {
     ///
     /// Executes against a snapshot and returns the result with collected writes.
     /// Does NOT commit to storage - that happens later during certificate persistence.
-    fn execute_one<S: SubstateStore>(
+    /// Execute a single transaction against a pre-taken snapshot.
+    ///
+    /// Takes `&impl SubstateDatabase` rather than `&SubstateStore` so the
+    /// caller can hoist snapshot creation outside the per-tx loop — state
+    /// doesn't change during execution (commits are serialized), so
+    /// reusing one snapshot across a batch is safe and far cheaper than
+    /// a snapshot-per-tx.
+    fn execute_one<D: SubstateDatabase>(
         &self,
-        storage: &S,
+        snapshot: &D,
         tx: &RoutableTransaction,
         local_shard: hyperscale_types::ShardGroupId,
         num_shards: u64,
     ) -> Result<SingleTxResult, ExecutionError> {
-        // Take a snapshot for isolated execution
-        let snapshot = storage.snapshot();
-
         // Get or create validated transaction (cached on RoutableTransaction)
         // This avoids re-validating signatures if already validated at RPC submission
         let validated = tx
@@ -345,17 +366,18 @@ impl RadixExecutor {
 
         // Use cached vm_modules and exec_config
         let receipt = execute_transaction(
-            &snapshot,
+            snapshot,
             &self.caches.vm_modules,
             &self.caches.exec_config,
             &executable,
         );
 
-        // Use the same snapshot for receipt filtering — resolve_owned_nodes must
-        // see the same ownership state as the execution. Using shared storage
-        // would race with concurrent cert commits, producing different filtered
-        // DatabaseUpdates and receipt_hash divergence across validators.
-        let result = self.receipt_to_result(&snapshot, tx, &receipt, local_shard, num_shards);
+        // Same snapshot for receipt filtering — resolve_owned_nodes must
+        // see the same ownership state as the execution. Using shared
+        // storage would race with concurrent cert commits, producing
+        // different filtered DatabaseUpdates and receipt_hash divergence
+        // across validators.
+        let result = self.receipt_to_result(snapshot, tx, &receipt, local_shard, num_shards);
 
         // NO COMMIT HERE - DatabaseUpdates are cached by the state machine
         // and applied when the WaveCertificate is included in a block.
@@ -438,25 +460,25 @@ impl Clone for RadixExecutor {
 }
 
 impl Engine for RadixExecutor {
-    fn execute_single_shard<S: SubstateStore>(
+    fn execute_single_shard<D: SubstateDatabase>(
         &self,
-        storage: &S,
+        snapshot: &D,
         transactions: &[Arc<RoutableTransaction>],
         local_shard: hyperscale_types::ShardGroupId,
         num_shards: u64,
     ) -> Result<ExecutionOutput, ExecutionError> {
-        self.execute_single_shard(storage, transactions, local_shard, num_shards)
+        self.execute_single_shard(snapshot, transactions, local_shard, num_shards)
     }
 
-    fn execute_cross_shard<S: SubstateStore>(
+    fn execute_cross_shard<D: SubstateDatabase>(
         &self,
-        storage: &S,
+        snapshot: &D,
         transactions: &[Arc<RoutableTransaction>],
         provisions: &[hyperscale_types::StateProvision],
         local_shard: hyperscale_types::ShardGroupId,
         num_shards: u64,
     ) -> Result<ExecutionOutput, ExecutionError> {
-        self.execute_cross_shard(storage, transactions, provisions, local_shard, num_shards)
+        self.execute_cross_shard(snapshot, transactions, provisions, local_shard, num_shards)
     }
 
     fn fetch_state_entries<S: SubstateStore>(

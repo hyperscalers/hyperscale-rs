@@ -2,17 +2,18 @@
 //!
 //! Two independent GC passes:
 //! - **JMT GC**: deletes stale tree nodes older than `jmt_history_length`.
-//! - **Versioned substates GC**: prunes MVCC history from `versioned_substates`
-//!   CF, keeping only the floor entry (latest version ≤ cutoff) per substate
-//!   key so historical reads within the retention window still resolve.
+//! - **State-history GC**: prunes state-history entries older than
+//!   `jmt_history_length`. `StateCf` is always authoritative for current
+//!   values, so deleting old history entries only costs the ability to
+//!   serve historical reads beyond the retention window.
 
-use crate::column_families::{JmtNodesCf, StaleJmtNodesCf, StateCf};
+use crate::column_families::{JmtNodesCf, StaleJmtNodesCf, StateHistoryCf};
 use crate::core::RocksDbStorage;
 use crate::typed_cf::{self, TypedCf};
 
-use crate::jmt_stored::{StaleTreePart, StoredNode, StoredNodeKey};
+use crate::jmt_stored::StaleTreePart;
 use hyperscale_jmt as jmt;
-use rocksdb::{ColumnFamily, WriteBatch};
+use rocksdb::WriteBatch;
 
 impl RocksDbStorage {
     /// Run garbage collection for stale JMT nodes.
@@ -63,9 +64,6 @@ impl RocksDbStorage {
                         typed_cf::batch_delete::<JmtNodesCf>(&mut batch, jmt_cf, &key);
                         deleted_nodes += 1;
                     }
-                    StaleTreePart::Subtree(key) => {
-                        deleted_nodes += Self::delete_subtree(&self.db, jmt_cf, &key, &mut batch);
-                    }
                 }
             }
 
@@ -78,6 +76,24 @@ impl RocksDbStorage {
                 tracing::error!("JMT GC write failed: {}", e);
                 return 0;
             }
+        }
+
+        // Force compaction over the just-tombstoned range of
+        // StaleJmtNodesCf so the CF actually shrinks (tombstones alone
+        // don't reclaim disk — they just mask until a compaction runs).
+        // The range is small and version-ordered, so this is cheap.
+        //
+        // We intentionally DO NOT force-compact JmtNodesCf here:
+        // deleted tree nodes are scattered across the entire keyspace
+        // and a bounded range is hard to compute. Reclamation relies
+        // on natural write-amplification compaction; if JmtNodesCf
+        // tombstone accumulation becomes a problem, set
+        // `periodic_compaction_seconds` on the CF at open time.
+        if processed_count > 0 {
+            let lo = 0u64.to_be_bytes();
+            let hi = cutoff_version.to_be_bytes();
+            self.db
+                .compact_range_cf(stale_cf, Some(&lo[..]), Some(&hi[..]));
         }
 
         let elapsed = start.elapsed();
@@ -95,65 +111,43 @@ impl RocksDbStorage {
         processed_count
     }
 
-    /// Delete a JMT subtree iteratively using an explicit stack.
+    /// Run garbage collection for state-history entries.
     ///
-    /// Avoids stack overflow on deep trees. Returns the number of nodes deleted.
-    fn delete_subtree(
-        db: &rocksdb::DB,
-        jmt_cf: &ColumnFamily,
-        root_key: &StoredNodeKey,
-        batch: &mut WriteBatch,
-    ) -> usize {
-        let mut stack = vec![root_key.clone()];
-        let mut deleted = 0;
-
-        while let Some(stored_key) = stack.pop() {
-            let node = match typed_cf::get::<JmtNodesCf>(db, jmt_cf, &stored_key) {
-                Some(versioned) => versioned.into_latest(),
-                None => continue, // Already deleted in a previous GC run.
-            };
-
-            if let StoredNode::Internal(internal) = &node {
-                // Rehydrate the parent key to construct each child's path.
-                if let Ok(jmt_key) = stored_key.to_jmt() {
-                    const ARITY_BITS: u8 = 1;
-                    for child in &internal.children {
-                        let child_jmt_key = jmt_key.child(child.version, child.bucket, ARITY_BITS);
-                        stack.push(StoredNodeKey::from_jmt(&child_jmt_key));
-                    }
-                }
-            }
-
-            typed_cf::batch_delete::<JmtNodesCf>(batch, jmt_cf, &stored_key);
-            deleted += 1;
-        }
-
-        deleted
-    }
-
-    /// Run garbage collection for versioned substates.
+    /// The `state_history` CF stores prior-value entries keyed by
+    /// `(storage_key, write_version)`. Without GC, it grows without
+    /// bound. Deletion is trivial: anything with `version ≤ cutoff` is
+    /// beyond the retention window. No floor preservation is needed —
+    /// the `state` CF is always authoritative for current values, and
+    /// the retention-panic on `snapshot_at(V)` guards against internal
+    /// callers ever asking for a version below `cutoff`.
     ///
-    /// The `versioned_substates` CF stores MVCC history: every substate
-    /// write is recorded as `(storage_key, version) → value`. Without GC,
-    /// this CF grows without bound.
+    /// # Boundary invariant
     ///
-    /// **Retention policy**: for each unique substate key, keep:
-    /// - All entries with `version > cutoff` (within the retention window).
-    /// - The **floor entry** — the latest entry with `version ≤ cutoff` —
-    ///   so historical reads at `height = cutoff` still resolve substates
-    ///   that haven't been modified within the window.
-    /// - Delete everything older than the floor.
+    /// `cutoff` here MUST equal `floor` in `snapshot_at`: readers at
+    /// `V = floor` need history entries with `v' > V = floor`, i.e. the
+    /// smallest surviving `v'` must be `floor + 1 = cutoff + 1`. GC
+    /// deletes `v' ≤ cutoff`, so the first preserved entry is exactly
+    /// `cutoff + 1` — zero-margin. Any refactor that makes `floor <
+    /// cutoff` (e.g. rounding, off-by-one in saturating math) silently
+    /// breaks historical reads at the boundary without a panic.
     ///
-    /// The cutoff is `current_version - jmt_history_length`, matching the
-    /// JMT GC retention window.
+    /// # Concurrency
+    ///
+    /// Runs without `commit_lock`. Safe because concurrent readers hold
+    /// a `rocksdb::Snapshot` whose sequence number predates any GC
+    /// delete-tombstones issued afterwards: RocksDB compaction preserves
+    /// SSTs referenced by live snapshots, so readers see pre-delete
+    /// values regardless of GC progress. This isolation is load-bearing.
     ///
     /// # Returns
     ///
     /// The number of entries deleted.
-    pub fn run_versioned_substates_gc(&self) -> usize {
+    pub fn run_state_history_gc(&self) -> usize {
         let start = std::time::Instant::now();
 
         let (current_version, _) = self.read_jmt_metadata();
+        // Must match `snapshot_at`'s floor calculation exactly — see
+        // boundary invariant above.
         let cutoff = current_version.saturating_sub(self.jmt_history_length);
 
         if cutoff == 0 {
@@ -161,25 +155,23 @@ impl RocksDbStorage {
         }
 
         let cf = self.cf();
-        let versioned_cf = StateCf::handle(&cf);
+        let history_cf = StateHistoryCf::handle(&cf);
 
-        // Full sequential scan. Keys are ordered as [storage_key][version_BE],
-        // so entries for the same substate key are contiguous with versions
-        // ascending. We track the previous raw storage key bytes to detect
-        // group boundaries.
-        let mut iter = self.db.raw_iterator_cf(versioned_cf);
+        // `StateHistoryCf` has a 51-byte prefix extractor. Default
+        // iteration with a prefix extractor is undefined across prefix
+        // boundaries — we need `total_order_seek` so `seek_to_first` +
+        // `next` walks the entire CF regardless of prefix groups.
+        let mut read_opts = rocksdb::ReadOptions::default();
+        read_opts.set_total_order_seek(true);
+        let mut iter = self.db.raw_iterator_cf_opt(history_cf, read_opts);
         iter.seek_to_first();
 
         let mut batch = WriteBatch::default();
         let mut deleted = 0;
-        // Keys pending deletion within the current substate key group.
-        // We buffer them because we don't know if an entry is the floor
-        // until we've seen the next entry or group boundary.
-        let mut pending_deletes: Vec<Vec<u8>> = Vec::new();
-        let mut prev_storage_key: Option<Vec<u8>> = None;
+        let mut lowest_deleted_key: Option<Vec<u8>> = None;
+        let mut highest_deleted_key: Option<Vec<u8>> = None;
 
         const VERSION_LEN: usize = 8;
-        // Flush batches periodically to bound memory.
         const BATCH_FLUSH_THRESHOLD: usize = 10_000;
 
         while iter.valid() {
@@ -194,76 +186,46 @@ impl RocksDbStorage {
             }
 
             let key_len = raw_key.len() - VERSION_LEN;
-            let storage_key = &raw_key[..key_len];
             let version = u64::from_be_bytes(raw_key[key_len..].try_into().unwrap());
 
-            // Detect substate key group change — flush pending deletes from
-            // the previous group. The last pending entry is the floor for
-            // that group; keep it so reads beyond the retention window
-            // still resolve. Only the post-cutoff branch below pops the
-            // floor explicitly, and that only fires if the group had
-            // entries > cutoff. Groups with only pre-cutoff entries reach
-            // this boundary with the floor still buffered — pop it here.
-            if prev_storage_key.as_deref() != Some(storage_key) {
-                pending_deletes.pop(); // keep the floor from the previous group
-                for dk in pending_deletes.drain(..) {
-                    batch.delete_cf(versioned_cf, &dk);
-                    deleted += 1;
-                }
-                prev_storage_key = Some(storage_key.to_vec());
-            }
-
             if version <= cutoff {
-                // This entry is at or below the cutoff. It MIGHT be the
-                // floor entry. Buffer it for deletion — if a newer entry
-                // (still ≤ cutoff) comes along, the buffered one is safe
-                // to delete. The last one buffered before we leave the
-                // ≤cutoff zone is the floor and must be kept.
-                //
-                // Flush all previously buffered entries (they're older
-                // than this one, so definitely not the floor).
-                for dk in pending_deletes.drain(..) {
-                    batch.delete_cf(versioned_cf, &dk);
-                    deleted += 1;
+                if lowest_deleted_key.is_none() {
+                    lowest_deleted_key = Some(raw_key.to_vec());
                 }
-                // Buffer this entry as the potential floor.
-                pending_deletes.push(raw_key.to_vec());
-            } else {
-                // version > cutoff — within retention window. The last
-                // buffered entry (if any) is the floor; pop it to keep it.
-                pending_deletes.pop(); // keep the floor
-                                       // Flush any remaining older entries.
-                for dk in pending_deletes.drain(..) {
-                    batch.delete_cf(versioned_cf, &dk);
-                    deleted += 1;
+                highest_deleted_key = Some(raw_key.to_vec());
+                batch.delete_cf(history_cf, raw_key);
+                deleted += 1;
+                if deleted % BATCH_FLUSH_THRESHOLD == 0 {
+                    if let Err(e) = self.db.write(std::mem::take(&mut batch)) {
+                        tracing::error!("State-history GC write failed: {}", e);
+                        return deleted;
+                    }
+                    batch = WriteBatch::default();
                 }
-            }
-
-            if deleted >= BATCH_FLUSH_THRESHOLD && !batch.is_empty() {
-                if let Err(e) = self.db.write(std::mem::take(&mut batch)) {
-                    tracing::error!("Versioned substates GC write failed: {}", e);
-                    return deleted;
-                }
-                batch = WriteBatch::default();
             }
 
             iter.next();
         }
 
-        // Flush final group's pending deletes. The last buffered entry is
-        // the floor for a substate that has NO entries in the retention
-        // window — keep it so historical reads still resolve.
-        pending_deletes.pop(); // keep the floor
-        for dk in pending_deletes.drain(..) {
-            batch.delete_cf(versioned_cf, &dk);
-            deleted += 1;
-        }
-
         if !batch.is_empty() {
             if let Err(e) = self.db.write(batch) {
-                tracing::error!("Versioned substates GC write failed: {}", e);
-                return 0;
+                tracing::error!("State-history GC write failed: {}", e);
+                // Return the count we already persisted in prior batches
+                // rather than 0 — callers use this to log progress.
+                return deleted;
             }
+        }
+
+        // Tombstones only reclaim disk once compaction rewrites the
+        // affected SSTs. Under write-heavy workloads the oldest entries
+        // (exactly what GC targets) live in L5-L6 (Zstd tier) which see
+        // no natural compaction pressure. Issue a compact_range over
+        // the deleted key span to trigger reclamation. `None` args
+        // would compact the whole CF; we constrain to the actual
+        // tombstoned range.
+        if let (Some(lo), Some(hi)) = (lowest_deleted_key, highest_deleted_key) {
+            self.db
+                .compact_range_cf(history_cf, Some(lo.as_slice()), Some(hi.as_slice()));
         }
 
         let elapsed = start.elapsed();
@@ -273,7 +235,7 @@ impl RocksDbStorage {
                 cutoff,
                 current_version,
                 elapsed_ms = elapsed.as_millis(),
-                "Versioned substates GC completed"
+                "State-history GC completed"
             );
         }
 
@@ -294,20 +256,19 @@ mod tests {
     };
     use tempfile::TempDir;
 
-    /// Regression test for the GC group-boundary bug: keys with only
-    /// pre-cutoff versions must retain their floor entry so reads after
-    /// GC still resolve. Before the fix, the group-boundary drain
-    /// unconditionally deleted all pending entries (including the floor)
-    /// for every group except the last one in the scan.
+    /// Aggressive state-history GC must not affect current-tip reads.
+    /// StateCf holds the authoritative current value per key; deleting
+    /// history only costs the ability to serve historical reads below
+    /// the retention floor.
     #[test]
-    fn gc_preserves_floor_entry_for_all_groups() {
+    fn state_history_gc_preserves_current_state() {
         let temp_dir = TempDir::new().unwrap();
-        let mut config = crate::config::RocksDbConfig::default();
-        config.jmt_history_length = 2; // tiny retention for test
+        let config = crate::config::RocksDbConfig {
+            jmt_history_length: 2, // tiny retention for test
+            ..Default::default()
+        };
         let storage = RocksDbStorage::open_with_config(temp_dir.path(), config).unwrap();
 
-        // Two distinct substate keys, each written once at version 1
-        // (pre-cutoff after we advance past height 3).
         let mk_key = |seed: u8, sort: u8| {
             (
                 DbPartitionKey {
@@ -341,24 +302,25 @@ mod tests {
         }
         storage.commit(&writes).unwrap();
 
-        // Advance the JMT version past the retention window with empty
-        // commits so the cutoff for GC is above version 1.
+        // Advance JMT version past the retention window with empty
+        // commits so the history cutoff is above version 1.
         for _ in 0..4 {
             storage.commit(&DatabaseUpdates::default()).unwrap();
         }
 
-        storage.run_versioned_substates_gc();
+        storage.run_state_history_gc();
 
-        // Both keys must still resolve — their floor entries survive GC.
+        // Current-tip reads are served from StateCf — history GC
+        // cannot affect them regardless of how aggressive the retention is.
         assert_eq!(
             storage.get_raw_substate_by_db_key(&pk_a, &sk_a),
             Some(vec![0xAA]),
-            "floor entry for key A must be preserved across GC"
+            "StateCf entry for key A survives state-history GC"
         );
         assert_eq!(
             storage.get_raw_substate_by_db_key(&pk_b, &sk_b),
             Some(vec![0xBB]),
-            "floor entry for key B must be preserved across GC"
+            "StateCf entry for key B survives state-history GC"
         );
     }
 }

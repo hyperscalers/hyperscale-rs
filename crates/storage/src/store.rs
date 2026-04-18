@@ -18,15 +18,16 @@ use radix_substate_store_interface::interface::{DbSortKey, SubstateDatabase};
 ///
 /// Runner storage types (`SimStorage`, `RocksDbStorage`) implement this trait
 /// along with `SubstateDatabase`. They additionally implement [`VersionedStore`]
-/// for explicit MVCC-version reads; views do not, since a view carries a
-/// bound anchor and has no meaningful answer for an arbitrary version.
+/// for explicit historical-version reads; views do not, since a view carries
+/// a bound anchor and has no meaningful answer for an arbitrary version.
 pub trait SubstateStore: SubstateDatabase + Send + Sync + 'static {
     /// The snapshot type returned by this storage.
     ///
-    /// All snapshots are MVCC-aware — reads return the value as of some
-    /// specific version. For base storage types, that version is chosen
-    /// by the impl's [`Self::snapshot`] default (typically the current
-    /// committed tip). For views, it is the view's bound anchor height.
+    /// All snapshots are version-aware — reads return the value as of
+    /// some specific version. For base storage types, that version is
+    /// chosen by the impl's [`Self::snapshot`] default (typically the
+    /// current committed tip). For views, it is the view's bound
+    /// anchor height.
     type Snapshot<'a>: SubstateDatabase + Send + Sync
     where
         Self: 'a;
@@ -86,24 +87,29 @@ pub trait SubstateStore: SubstateDatabase + Send + Sync + 'static {
     ) -> Option<MerkleInclusionProof>;
 }
 
-/// Storage that supports reads at an explicit MVCC version.
+/// Storage that supports reads at an explicit historical version.
 ///
-/// Implemented by base storage types that own the `versioned_substates`
-/// history — `RocksDbStorage` and `SimStorage`. Views do **not** implement
-/// this: a view is bound to a single anchor, so asking for "snapshot at
+/// Implemented by base storage types that own the state-history log —
+/// `RocksDbStorage` and `SimStorage`. Views do **not** implement this:
+/// a view is bound to a single anchor, so asking for "snapshot at
 /// arbitrary version V" is not meaningful. Views produce anchor-based
 /// snapshots via [`SubstateStore::snapshot`], which internally delegate
 /// to the underlying base's `snapshot_at`.
 ///
 /// The returned snapshot reads substate values as of `version`. When
-/// `version` exceeds the persisted tip, MVCC walk-back clamps to the
-/// tip — callers that need overlay coverage above the persisted tip
-/// must go through a [`crate::pending_chain::SubstateView`].
+/// `version` exceeds the persisted tip, the snapshot reads the current
+/// value directly — callers that need overlay coverage above the
+/// persisted tip must go through a [`crate::pending_chain::SubstateView`].
 ///
-/// `version` must be within the MVCC retention window (currently 256
-/// blocks). Requests beyond the window fall back to the retention
-/// boundary, not the literal version asked for.
+/// # Panics
+///
+/// `snapshot_at(V)` panics if `V < current_version - jmt_history_length`
+/// (saturating). This is an internal DA-assumption check — below the
+/// retention floor, the history log has been GC'd and historical reads
+/// can't be served correctly. External-facing APIs that accept
+/// network-supplied versions must check retention themselves and
+/// return `None` for out-of-range heights rather than calling through.
 pub trait VersionedStore: SubstateStore {
-    /// Create a snapshot anchored at the given MVCC version.
+    /// Create a snapshot anchored at the given historical version.
     fn snapshot_at(&self, version: u64) -> Self::Snapshot<'_>;
 }

@@ -3,9 +3,7 @@
 use crate::core::RocksDbStorage;
 use crate::jmt_snapshot_store::SnapshotTreeStore;
 use crate::snapshot::RocksDbSnapshot;
-use crate::typed_cf::TypedCf;
 
-use crate::substate_key;
 use hyperscale_metrics as metrics;
 use hyperscale_storage::{DbSortKey, JmtSnapshot, SubstateStore, VersionedStore};
 use hyperscale_types::NodeId;
@@ -16,10 +14,17 @@ impl SubstateStore for RocksDbStorage {
     type Snapshot<'a> = RocksDbSnapshot<'a>;
 
     fn snapshot(&self) -> Self::Snapshot<'_> {
-        // Default version = current committed tip. MVCC walk-back resolves
-        // every key to its latest write, equivalent to reading StateCf but
-        // going through the versioned path so the snapshot type is uniform.
-        self.snapshot_at(self.jmt_version())
+        // Default version = current committed tip as seen through the
+        // snapshot's own LSN. Picking the version from a separate live
+        // read would race with commits (see `snapshot_at` for details).
+        let snapshot = self.db.snapshot();
+        let (current_version, _) = crate::metadata::read_jmt_metadata(&snapshot);
+        RocksDbSnapshot {
+            snapshot,
+            db: &self.db,
+            version: current_version,
+            current_version,
+        }
     }
 
     fn jmt_version(&self) -> u64 {
@@ -36,53 +41,28 @@ impl SubstateStore for RocksDbStorage {
         node_id: &NodeId,
         block_height: u64,
     ) -> Option<Vec<(u8, DbSortKey, Vec<u8>)>> {
-        let (current_version, _) = self.read_jmt_metadata();
+        // Take the snapshot first so bounds checks and the subsequent
+        // reads all see one consistent LSN (see `snapshot_at` for why).
+        let snapshot = self.db.snapshot();
+        let (current_version, _) = crate::metadata::read_jmt_metadata(&snapshot);
         if block_height > current_version {
             return None;
         }
-
-        let entity_prefix = substate_key::node_entity_key(node_id);
-        let versioned_cf = crate::column_families::StateCf::handle(&self.cf());
-        let snap = self.db.snapshot();
-
-        // MVCC scan: iterate versioned_substates for this entity prefix.
-        // Keys are ((partition_key, sort_key), version), sorted lexicographically.
-        // For each unique (partition_key, sort_key), take the latest version <= block_height.
-        type SubstateKey = (hyperscale_storage::DbPartitionKey, DbSortKey);
-
-        let mut results = Vec::new();
-        let mut current_sk: Option<SubstateKey> = None;
-        let mut current_best: Option<Vec<u8>> = None;
-
-        for ((substate_key, version), value) in crate::typed_cf::prefix_iter_snap::<
-            crate::column_families::StateCf,
-        >(&snap, versioned_cf, &entity_prefix)
-        {
-            // Substate key changed — flush previous group.
-            if current_sk.as_ref() != Some(&substate_key) {
-                if let (Some((pk, sk)), Some(val)) = (current_sk.take(), current_best.take()) {
-                    results.push((pk.partition_num, sk, val));
-                }
-                current_sk = Some(substate_key);
-                current_best = None;
-            }
-
-            // Ascending version order: overwrite with each version <= height.
-            if version <= block_height {
-                if value.is_empty() {
-                    current_best = None; // tombstone
-                } else {
-                    current_best = Some(value);
-                }
-            }
+        let floor = current_version.saturating_sub(self.jmt_history_length);
+        if block_height < floor {
+            // Below retention — historical state no longer recoverable.
+            // External API: return None (network-supplied heights may
+            // legitimately fall out of range; `snapshot_at` would panic,
+            // so don't delegate for this case).
+            return None;
         }
-
-        // Flush last group.
-        if let (Some((pk, sk)), Some(val)) = (current_sk, current_best) {
-            results.push((pk.partition_num, sk, val));
-        }
-
-        Some(results)
+        let snap = RocksDbSnapshot {
+            snapshot,
+            db: &self.db,
+            version: block_height,
+            current_version,
+        };
+        Some(snap.list_raw_values_for_node(node_id))
     }
 
     fn generate_merkle_proofs(
@@ -103,10 +83,38 @@ impl SubstateStore for RocksDbStorage {
 
 impl VersionedStore for RocksDbStorage {
     fn snapshot_at(&self, version: u64) -> Self::Snapshot<'_> {
+        // Take the DB snapshot FIRST, then read metadata THROUGH it.
+        // Reading metadata from the live DB and then taking the snapshot
+        // races with concurrent commits: a commit between the two reads
+        // leaves `current_version` stale relative to the snapshot's LSN.
+        // If `version == stale_current_version`, the trivial branch fires
+        // and returns post-commit StateCf values — a torn read.
+        // Capturing both from the same snapshot gives one consistent view.
+        let snapshot = self.db.snapshot();
+        let (current_version, _) = crate::metadata::read_jmt_metadata(&snapshot);
+
+        // Retention invariant: below the configured floor we can't
+        // serve historical reads reliably (history entries have been GC'd).
+        // This is an internal DA-assumption check — external APIs that
+        // accept network-supplied versions (e.g. `list_substates_for_node_at_height`)
+        // must check retention themselves and return None, not call
+        // through here.
+        //
+        // `floor` MUST match the cutoff in `run_state_history_gc` — see the
+        // boundary invariant there. Zero-margin by design.
+        let floor = current_version.saturating_sub(self.jmt_history_length);
+        assert!(
+            version >= floor,
+            "snapshot_at({version}) below retention floor {floor} \
+             (current_version={current_version}, jmt_history_length={}) — \
+             BFT/DA invariant broken; caller must anchor within retention",
+            self.jmt_history_length,
+        );
         RocksDbSnapshot {
-            snapshot: self.db.snapshot(),
+            snapshot,
             db: &self.db,
             version,
+            current_version,
         }
     }
 }

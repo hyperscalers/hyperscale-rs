@@ -31,6 +31,9 @@ impl ChainWriter for SimStorage {
         finalized_waves: &[Arc<hyperscale_types::FinalizedWave>],
         block_height: u64,
         pending_snapshots: &[Arc<hyperscale_storage::JmtSnapshot>],
+        // Memory backend already keeps state in-memory — the priors
+        // hint is irrelevant to its perf and is ignored.
+        _base_reads: Option<&hyperscale_storage::BaseReadCache>,
     ) -> (Hash, Self::PreparedCommit) {
         let receipts: Vec<ReceiptBundle> = finalized_waves
             .iter()
@@ -131,7 +134,12 @@ impl ChainWriter for SimStorage {
 
                     s.apply_jmt_snapshot(prepared.snapshot);
 
-                    apply_updates(&mut s.substates, &prepared.merged_updates, block_height);
+                    apply_updates(
+                        &mut s,
+                        &prepared.merged_updates,
+                        block_height,
+                        /* write_history */ true,
+                    );
                 }
 
                 let mut c = self.consensus.write().unwrap();
@@ -211,8 +219,13 @@ impl SimStorage {
             s.current_block_height
         );
 
-        // Apply substate writes to the MVCC store at this block height.
-        apply_updates(&mut s.substates, merged_updates, block_height);
+        // Apply substate writes at this block height.
+        apply_updates(
+            &mut s,
+            merged_updates,
+            block_height,
+            /* write_history */ true,
+        );
 
         let parent_version = hyperscale_storage::tree::jmt_parent_height(
             s.current_block_height,

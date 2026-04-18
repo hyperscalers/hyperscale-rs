@@ -492,6 +492,8 @@ where
             &finalized_waves,
             height.0,
             &pending_snapshots,
+            // `None` → the view drains its own base-read cache internally.
+            None,
         );
 
         // Byzantine detection: state root mismatch is fatal.

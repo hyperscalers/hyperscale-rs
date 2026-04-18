@@ -420,7 +420,7 @@ pub struct StorageConfig {
     /// this window.
     ///
     /// Set to 0 for immediate deletion (no history retention).
-    /// Defaults to 60,000 (matching Babylon's default).
+    /// Defaults to 256.
     #[serde(default = "default_jmt_history_length", alias = "jmt_history_length")]
     pub jmt_history_length: u64,
 }

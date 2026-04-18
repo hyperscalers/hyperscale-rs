@@ -10,8 +10,9 @@
 //! # Value encoding
 //!
 //! The tree stores per-value hashes (`BLAKE3(raw_value_bytes)`) as
-//! `ValueHash`. Raw substate bytes are stored separately in the versioned
-//! data store (MVCC), not in the tree.
+//! `ValueHash`. Raw substate bytes are stored separately in the state
+//! CF (current values) and state-history CF (per-write prior values),
+//! not in the tree.
 
 mod collected_writes;
 pub mod proofs;

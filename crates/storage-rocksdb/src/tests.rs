@@ -38,7 +38,7 @@ fn test_basic_substate_operations() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
 
-    // 50-byte spread-prefix node_key — MVCC iteration decodes composite
+    // 50-byte spread-prefix node_key — snapshot iteration decodes composite
     // keys so raw short keys hit the entity-key length assertion.
     let partition_key = DbPartitionKey {
         node_key: vec![3u8; 50],
@@ -80,7 +80,7 @@ fn test_snapshot() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
 
-    // Use a realistic 50-byte node_key (spread-prefix format). MVCC-aware
+    // Use a realistic 50-byte node_key (spread-prefix format). Snapshot
     // snapshots decode composite keys during iteration, so raw short keys
     // would hit the entity-key length assertion.
     let partition_key = DbPartitionKey {
@@ -387,7 +387,7 @@ fn test_prepare_then_commit_matches_direct() {
     let temp_dir1 = TempDir::new().unwrap();
     let s_prepared = RocksDbStorage::open(temp_dir1.path()).unwrap();
     let parent_root = s_prepared.state_root_hash();
-    let (spec_root, prepared) = s_prepared.prepare_block_commit(parent_root, 0, &[], 1, &[]);
+    let (spec_root, prepared) = s_prepared.prepare_block_commit(parent_root, 0, &[], 1, &[], None);
     let block = make_test_block(1);
     let qc = make_test_qc(&block);
     let result_prepared = s_prepared
@@ -751,4 +751,352 @@ fn test_ec_atomic_with_block_commit() {
     let by_height = storage.get_execution_certificates_by_height(1);
     assert_eq!(by_height.len(), 1);
     assert_eq!(by_height[0].block_height(), 1);
+}
+
+// ─── State-history semantics (parity with storage-memory tests) ─────────────
+//
+// These mirror `storage-memory/src/tests.rs`:
+//   - test_state_history_create_delete_create
+//   - test_snapshot_at_below_retention_panics
+//   - test_list_substates_at_height_respects_retention
+//   - test_reset_partition_captures_history_for_all_removed_keys
+//   - test_genesis_skips_history_entries
+//
+// RocksDB encodes the history log differently (SBOR codec, prefix extractor,
+// snapshot isolation, column family) so backend parity is not free.
+
+/// Helper: port of `commit_with` from the memory tests. Injects the updates
+/// as a single-tx FinalizedWave receipt inside a block and commits it.
+fn rocks_commit_with(
+    storage: &RocksDbStorage,
+    updates: &DatabaseUpdates,
+    block: &hyperscale_types::Block,
+    qc: &QuorumCertificate,
+) {
+    let mut block = block.clone();
+    if !updates.node_updates.is_empty() {
+        let receipt = hyperscale_types::ReceiptBundle {
+            tx_hash: Hash::ZERO,
+            local_receipt: Arc::new(hyperscale_types::LocalReceipt {
+                outcome: hyperscale_types::TransactionOutcome::Success,
+                database_updates: updates.clone(),
+                application_events: vec![],
+            }),
+            execution_output: None,
+        };
+        block
+            .certificates
+            .push(Arc::new(hyperscale_types::FinalizedWave {
+                certificate: Arc::new(hyperscale_types::WaveCertificate {
+                    wave_id: hyperscale_types::WaveId::new(
+                        ShardGroupId(0),
+                        block.header.height.0,
+                        std::collections::BTreeSet::new(),
+                    ),
+                    execution_certificates: vec![],
+                }),
+                receipts: vec![receipt],
+            }));
+    }
+    storage.commit_block(&Arc::new(block), &Arc::new(qc.clone()));
+}
+
+/// State-history walkthrough: key K created at V1 with value A, deleted
+/// at V2, recreated at V3 with value B. Every historical version must
+/// read back the correct value — that's the "smallest history entry
+/// after V" invariant end-to-end.
+#[test]
+fn test_state_history_create_delete_create() {
+    use hyperscale_storage::VersionedStore;
+
+    let temp_dir = TempDir::new().unwrap();
+    let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
+
+    let node_key = vec![7u8; 50];
+    let partition_num = 0u8;
+    let sort_key = vec![42u8];
+    let pk = DbPartitionKey {
+        node_key: node_key.clone(),
+        partition_num,
+    };
+    let sk = DbSortKey(sort_key.clone());
+
+    // Keep an anchor key alive throughout so the JMT never empties out —
+    // deleting K alone at V2 would otherwise break the parent-version
+    // chain. The state-history behavior under test is independent of this.
+    let anchor_node_key = vec![99u8; 50];
+    let mk_delta = |nk: &[u8], p: u8, sk_bytes: Vec<u8>, val: DatabaseUpdate| {
+        let mut u = DatabaseUpdates::default();
+        u.node_updates.insert(
+            nk.to_vec(),
+            NodeDatabaseUpdates {
+                partition_updates: [(
+                    p,
+                    PartitionDatabaseUpdates::Delta {
+                        substate_updates: [(DbSortKey(sk_bytes), val)].into_iter().collect(),
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            },
+        );
+        u
+    };
+
+    // V1: create K=A, plus anchor.
+    let mut v1 = mk_delta(
+        &node_key,
+        partition_num,
+        sort_key.clone(),
+        DatabaseUpdate::Set(vec![0xAA]),
+    );
+    let anchor = mk_delta(
+        &anchor_node_key,
+        0,
+        vec![0xFF],
+        DatabaseUpdate::Set(vec![0xFF]),
+    );
+    hyperscale_storage::merge_into(&mut v1, &anchor);
+    storage.commit(&v1).unwrap();
+
+    // V2: delete K.
+    let v2 = mk_delta(
+        &node_key,
+        partition_num,
+        sort_key.clone(),
+        DatabaseUpdate::Delete,
+    );
+    storage.commit(&v2).unwrap();
+
+    // V3: recreate K=B.
+    let v3 = mk_delta(
+        &node_key,
+        partition_num,
+        sort_key.clone(),
+        DatabaseUpdate::Set(vec![0xBB]),
+    );
+    storage.commit(&v3).unwrap();
+
+    // See memory test for derivation:
+    let expected: &[(u64, Option<Vec<u8>>)] = &[
+        (0, None),
+        (1, Some(vec![0xAA])),
+        (2, None),
+        (3, Some(vec![0xBB])),
+    ];
+    for (v, want) in expected {
+        let snap = <RocksDbStorage as VersionedStore>::snapshot_at(&storage, *v);
+        let got = snap.get_raw_substate_by_db_key(&pk, &sk);
+        assert_eq!(
+            &got, want,
+            "state-history read at V={v}: want={want:?}, got={got:?}"
+        );
+    }
+}
+
+/// `snapshot_at(V)` must panic when V is below the retention floor.
+#[test]
+#[should_panic(expected = "below retention floor")]
+fn test_snapshot_at_below_retention_panics() {
+    let temp_dir = TempDir::new().unwrap();
+    let config = crate::config::RocksDbConfig {
+        jmt_history_length: 2,
+        ..Default::default()
+    };
+    let storage = RocksDbStorage::open_with_config(temp_dir.path(), config).unwrap();
+
+    for h in 1..=10u64 {
+        let block = make_test_block(h);
+        let qc = make_test_qc(&block);
+        commit_empty(&storage, &block, &qc);
+    }
+    // current=10, floor=8. V=1 is well below floor.
+    let _snap = <RocksDbStorage as hyperscale_storage::VersionedStore>::snapshot_at(&storage, 1);
+}
+
+/// `list_substates_for_node_at_height` is an external-facing API — it
+/// must return `None` for out-of-retention heights rather than panicking.
+#[test]
+fn test_list_substates_at_height_respects_retention() {
+    use hyperscale_types::NodeId;
+
+    let temp_dir = TempDir::new().unwrap();
+    let config = crate::config::RocksDbConfig {
+        jmt_history_length: 2,
+        ..Default::default()
+    };
+    let storage = RocksDbStorage::open_with_config(temp_dir.path(), config).unwrap();
+
+    let nid = NodeId([9u8; 30]);
+    let partition_num = 0u8;
+    let sort_key = vec![1u8];
+
+    for h in 1..=10u64 {
+        let block = make_test_block(h);
+        let qc = make_test_qc(&block);
+        let updates =
+            make_mapped_database_update(9, partition_num, sort_key.clone(), vec![h as u8]);
+        rocks_commit_with(&storage, &updates, &block, &qc);
+    }
+    // current=10, floor=8.
+
+    // Within retention: returns Some.
+    assert!(
+        storage.list_substates_for_node_at_height(&nid, 9).is_some(),
+        "height within retention must succeed"
+    );
+    // Below retention: returns None.
+    assert!(
+        storage.list_substates_for_node_at_height(&nid, 1).is_none(),
+        "height below retention must return None"
+    );
+    // Above current: returns None.
+    assert!(
+        storage
+            .list_substates_for_node_at_height(&nid, 99)
+            .is_none(),
+        "future height returns None"
+    );
+}
+
+/// A Reset partition must capture a history entry for every key removed
+/// so historical reads see the pre-reset contents.
+#[test]
+fn test_reset_partition_captures_history_for_all_removed_keys() {
+    use hyperscale_storage::VersionedStore;
+
+    let temp_dir = TempDir::new().unwrap();
+    let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
+
+    let node_key = vec![3u8; 50];
+    let partition_num = 0u8;
+    let pk = DbPartitionKey {
+        node_key: node_key.clone(),
+        partition_num,
+    };
+
+    // V1: populate A/B/C.
+    {
+        let mut updates = DatabaseUpdates::default();
+        updates.node_updates.insert(
+            node_key.clone(),
+            NodeDatabaseUpdates {
+                partition_updates: [(
+                    partition_num,
+                    PartitionDatabaseUpdates::Delta {
+                        substate_updates: [
+                            (DbSortKey(vec![0xA1]), DatabaseUpdate::Set(vec![0xAA])),
+                            (DbSortKey(vec![0xB1]), DatabaseUpdate::Set(vec![0xBB])),
+                            (DbSortKey(vec![0xC1]), DatabaseUpdate::Set(vec![0xCC])),
+                        ]
+                        .into_iter()
+                        .collect(),
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            },
+        );
+        storage.commit(&updates).unwrap();
+    }
+
+    // V2: reset to D/E only.
+    {
+        let mut updates = DatabaseUpdates::default();
+        let mut new_values = sbor::prelude::IndexMap::new();
+        new_values.insert(DbSortKey(vec![0xD1]), vec![0xDD]);
+        new_values.insert(DbSortKey(vec![0xE1]), vec![0xEE]);
+        updates.node_updates.insert(
+            node_key.clone(),
+            NodeDatabaseUpdates {
+                partition_updates: [(
+                    partition_num,
+                    PartitionDatabaseUpdates::Reset {
+                        new_substate_values: new_values,
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            },
+        );
+        storage.commit(&updates).unwrap();
+    }
+
+    // V1: original A/B/C visible, D/E not yet.
+    let snap_v1 = <RocksDbStorage as VersionedStore>::snapshot_at(&storage, 1);
+    assert_eq!(
+        snap_v1.get_raw_substate_by_db_key(&pk, &DbSortKey(vec![0xA1])),
+        Some(vec![0xAA])
+    );
+    assert_eq!(
+        snap_v1.get_raw_substate_by_db_key(&pk, &DbSortKey(vec![0xB1])),
+        Some(vec![0xBB])
+    );
+    assert_eq!(
+        snap_v1.get_raw_substate_by_db_key(&pk, &DbSortKey(vec![0xC1])),
+        Some(vec![0xCC])
+    );
+    assert_eq!(
+        snap_v1.get_raw_substate_by_db_key(&pk, &DbSortKey(vec![0xD1])),
+        None
+    );
+
+    // V2: only D/E visible.
+    let snap_v2 = <RocksDbStorage as VersionedStore>::snapshot_at(&storage, 2);
+    assert_eq!(
+        snap_v2.get_raw_substate_by_db_key(&pk, &DbSortKey(vec![0xA1])),
+        None
+    );
+    assert_eq!(
+        snap_v2.get_raw_substate_by_db_key(&pk, &DbSortKey(vec![0xD1])),
+        Some(vec![0xDD])
+    );
+    assert_eq!(
+        snap_v2.get_raw_substate_by_db_key(&pk, &DbSortKey(vec![0xE1])),
+        Some(vec![0xEE])
+    );
+}
+
+/// Genesis-style writes via `commit_substates_only` must NOT populate the
+/// state-history CF — there is no pre-state to preserve.
+#[test]
+fn test_genesis_skips_history_entries() {
+    use hyperscale_storage::SubstatesOnlyCommit;
+
+    let temp_dir = TempDir::new().unwrap();
+    let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
+
+    let updates = make_database_update(vec![1u8; 50], 0, vec![1], vec![0xAA]);
+    <RocksDbStorage as SubstatesOnlyCommit>::commit_substates_only(&storage, &updates);
+
+    // StateHistoryCf must be empty after a genesis-style commit.
+    let history_count = {
+        let cf = storage
+            .db
+            .cf_handle(crate::column_families::STATE_HISTORY_CF)
+            .expect("state_history CF exists");
+        let mut iter = storage.db.raw_iterator_cf(cf);
+        iter.seek_to_first();
+        let mut n = 0usize;
+        while iter.valid() {
+            n += 1;
+            iter.next();
+        }
+        n
+    };
+    assert_eq!(
+        history_count, 0,
+        "commit_substates_only must not record state-history entries"
+    );
+
+    // StateCf must hold the genesis write (readable via current-tip snapshot).
+    let pk = DbPartitionKey {
+        node_key: vec![1u8; 50],
+        partition_num: 0,
+    };
+    let sk = DbSortKey(vec![1]);
+    assert_eq!(
+        storage.get_raw_substate_by_db_key(&pk, &sk),
+        Some(vec![0xAA])
+    );
 }

@@ -136,12 +136,15 @@ pub struct StoredLeafNode {
 }
 
 /// Identifies a region of the tree eligible for pruning.
+///
+/// Currently only `Node` is ever emitted by the write path — JMT never
+/// produces subtree-wide stale regions at its current arity. Kept as an
+/// enum so that future tree variants (e.g. higher-arity subtree stales)
+/// can be added without a schema change.
 #[derive(Clone, PartialEq, Eq, Hash, Debug, BasicCategorize, BasicEncode, BasicDecode)]
 pub enum StaleTreePart {
     /// A single node.
     Node(StoredNodeKey),
-    /// An entire subtree rooted at this key (recursive delete).
-    Subtree(StoredNodeKey),
 }
 
 // ============================================================

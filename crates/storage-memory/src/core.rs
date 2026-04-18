@@ -1,9 +1,12 @@
 //! Core `SimStorage` struct and basic implementations.
 //!
 //! In-memory storage for deterministic simulation testing (DST).
-//! Substates are held in a single MVCC store: `(storage_key, version) →
-//! Option<value>`. "Current state" is derived by walking the latest entry
-//! per key; historical reads anchor to any version in the retention window.
+//! Substates live in two BTreeMaps: `current_state: (storage_key →
+//! value)` for current-tip reads, and `state_history: ((storage_key,
+//! write_version) → Option<prior>)` for historical reads. A read at
+//! version V below the current tip uses a single forward seek on
+//! `state_history` to find the smallest write after V; its prior value
+//! is the state at V.
 
 use crate::state::{apply_updates, ConsensusState, SharedState};
 
@@ -17,10 +20,10 @@ use std::sync::{Arc, RwLock};
 
 /// In-memory storage for simulation and testing.
 ///
-/// All substates live in an MVCC-versioned BTreeMap — the single source
-/// of truth. This mirrors `RocksDbStorage`'s single-CF design and avoids
-/// the dual-write / divergence class of bugs that a separate "current
-/// state" structure would introduce.
+/// Substates live in a `current_state` BTreeMap (authoritative for
+/// current-tip reads) with a companion `state_history` BTreeMap
+/// capturing per-write prior values for historical reads. This mirrors
+/// `RocksDbStorage`'s two-CF layout.
 ///
 /// Implements Radix's `SubstateDatabase` directly, plus our `SubstateStore` /
 /// `VersionedStore` extensions for snapshots, node listing, and JMT state
@@ -29,7 +32,7 @@ use std::sync::{Arc, RwLock};
 /// # Locking Strategy
 ///
 /// Two RwLocks with independent lifetimes — no ordering constraint:
-/// - `state`: MVCC substate store + JMT tree store + version/root/associations.
+/// - `state`: current_state + state-history log + JMT tree store + version/root/associations.
 ///   Read lock for substate reads, JMT lookups, and speculative computation.
 ///   Write lock for commits (substate writes + JMT updates in one acquisition).
 /// - `consensus`: Block metadata, certificates, votes, committed state.
@@ -40,6 +43,13 @@ pub struct SimStorage {
 
     /// Consensus metadata (single RwLock).
     pub(crate) consensus: RwLock<ConsensusState>,
+
+    /// Retention window for historical substate reads. `snapshot_at(V)`
+    /// panics if `V < current_version - jmt_history_length` (saturating).
+    /// Defaults to `u64::MAX` so tests keep working — deliberately set
+    /// a smaller value in tests that want to exercise retention
+    /// behaviour.
+    pub(crate) jmt_history_length: u64,
 }
 
 impl Default for SimStorage {
@@ -54,6 +64,17 @@ impl SimStorage {
         Self {
             state: Arc::new(RwLock::new(SharedState::new())),
             consensus: RwLock::new(ConsensusState::new()),
+            jmt_history_length: u64::MAX,
+        }
+    }
+
+    /// Create storage with a specific retention window. Used by tests
+    /// that exercise the retention panic.
+    pub fn with_jmt_history_length(jmt_history_length: u64) -> Self {
+        Self {
+            state: Arc::new(RwLock::new(SharedState::new())),
+            consensus: RwLock::new(ConsensusState::new()),
+            jmt_history_length,
         }
     }
 
@@ -68,15 +89,16 @@ impl SimStorage {
         *self.consensus.write().unwrap() = ConsensusState::new();
     }
 
-    /// Number of MVCC substate entries. Approximates "size" — a single
-    /// key with many historical versions counts as multiple entries.
+    /// Number of live substate entries (current tip). Historical
+    /// state-history entries are not counted — use
+    /// `.state.read().state_history.len()` for that.
     pub fn len(&self) -> usize {
-        self.state.read().unwrap().substates.len()
+        self.state.read().unwrap().current_state.len()
     }
 
-    /// Whether the MVCC substate store has any entries.
+    /// Whether the substate store has any live entries.
     pub fn is_empty(&self) -> bool {
-        self.state.read().unwrap().substates.is_empty()
+        self.state.read().unwrap().current_state.is_empty()
     }
 
     /// Atomically commit a certificate and its state writes.
@@ -95,7 +117,7 @@ impl SimStorage {
         {
             let mut s = self.state.write().unwrap();
             let ver = s.current_block_height;
-            apply_updates(&mut s.substates, updates, ver);
+            apply_updates(&mut s, updates, ver, /* write_history */ true);
         }
         self.consensus
             .write()
@@ -116,7 +138,7 @@ impl SimStorage {
         let new_version = s.current_block_height + 1;
 
         // Apply substate updates first (visible for association resolution below).
-        apply_updates(&mut s.substates, updates, new_version);
+        apply_updates(&mut s, updates, new_version, /* write_history */ true);
 
         let parent_version = hyperscale_storage::tree::jmt_parent_height(
             s.current_block_height,
@@ -144,12 +166,14 @@ impl SimStorage {
     /// Write substate data at version 0 (no JMT computation).
     ///
     /// Used during genesis bootstrap for each incremental Radix-engine
-    /// commit. Writes go into the MVCC store at version 0 so reads during
-    /// subsequent bootstrap calls see the accumulated state. After all
-    /// genesis commits, [`finalize_genesis_jmt`] computes the JMT once.
+    /// commit. Writes land in `current_state` at version 0; **no
+    /// state-history entries** are recorded — genesis has no pre-state
+    /// to preserve.
+    /// After all genesis commits, [`finalize_genesis_jmt`] computes the
+    /// JMT once.
     pub fn commit_substates_only(&self, updates: &DatabaseUpdates) {
         let mut s = self.state.write().unwrap();
-        apply_updates(&mut s.substates, updates, 0);
+        apply_updates(&mut s, updates, 0, /* write_history */ false);
     }
 
     /// Compute the JMT once at version 0 from the merged genesis updates.
@@ -205,7 +229,7 @@ impl SubstateDatabase for SimStorage {
         sort_key: &DbSortKey,
     ) -> Option<DbSubstateValue> {
         // Default-version snapshot (= current committed tip) reads the
-        // latest value via MVCC walk-back.
+        // latest value from `current_state`.
         <Self as hyperscale_storage::SubstateStore>::snapshot(self)
             .get_raw_substate_by_db_key(partition_key, sort_key)
     }

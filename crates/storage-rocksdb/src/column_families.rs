@@ -16,12 +16,21 @@ use hyperscale_types::{
 /// Column family name for the default CF (chain metadata, JMT metadata).
 pub(crate) const DEFAULT_CF: &str = "default";
 
-/// Column family name for substate data. This CF is the single source of
-/// truth for substates — every write is versioned as `(storage_key,
-/// version)`, and the "current state" is simply the latest entry per key.
-/// Historical reads use version-aware walks; GC keeps a floor entry per
-/// key so reads at any height in the retention window resolve correctly.
+/// Column family name for substate data. Stores the current value per
+/// unversioned `(partition_key, sort_key)`. History for recent writes
+/// lives in `STATE_HISTORY_CF` (same storage_key + write-version suffix,
+/// value is the pre-write prior state). Current-state reads are a
+/// direct point lookup; historical reads at version V seek the smallest
+/// state-history entry for the key with `write_version > V` and return
+/// its prior value.
 pub(crate) const STATE_CF: &str = "state";
+
+/// Column family name for the per-write state-history log used by
+/// historical reads.
+/// Key: `((partition_key, sort_key), write_version)`; value: the prior
+/// value at that key immediately before the write at `write_version`.
+/// A `None` value means "key was absent before the write."
+pub(crate) const STATE_HISTORY_CF: &str = "state_history";
 
 /// Column family name for block metadata (header + manifest) keyed by height.
 pub(crate) const BLOCKS_CF: &str = "blocks";
@@ -58,8 +67,8 @@ pub(crate) const EXECUTION_CERTS_BY_HEIGHT_CF: &str = "execution_certs_by_height
 // See CommittedHeightEntry, CommittedHashEntry, CommittedQcEntry, JmtMetadataEntry.
 
 /// CFs with high write throughput — get larger write buffers and tiered compression.
-/// State (MVCC-versioned) and JMT nodes are updated on every block commit.
-pub(crate) const HOT_WRITE_COLUMN_FAMILIES: &[&str] = &[STATE_CF, JMT_NODES_CF];
+/// State, state-history log, and JMT nodes are updated on every block commit.
+pub(crate) const HOT_WRITE_COLUMN_FAMILIES: &[&str] = &[STATE_CF, STATE_HISTORY_CF, JMT_NODES_CF];
 
 /// All column families used by the storage layer.
 pub(crate) const ALL_COLUMN_FAMILIES: &[&str] = &[
@@ -67,6 +76,7 @@ pub(crate) const ALL_COLUMN_FAMILIES: &[&str] = &[
     BLOCKS_CF,
     TRANSACTIONS_CF,
     STATE_CF,
+    STATE_HISTORY_CF,
     CERTIFICATES_CF,
     JMT_NODES_CF,
     STALE_JMT_NODES_CF,
@@ -86,6 +96,7 @@ pub(crate) const ALL_COLUMN_FAMILIES: &[&str] = &[
 /// [`TypedCf::handle()`](crate::typed_cf::TypedCf::handle).
 pub(crate) struct CfHandles<'a> {
     state: &'a rocksdb::ColumnFamily,
+    state_history: &'a rocksdb::ColumnFamily,
     blocks: &'a rocksdb::ColumnFamily,
     transactions: &'a rocksdb::ColumnFamily,
     certificates: &'a rocksdb::ColumnFamily,
@@ -109,6 +120,7 @@ impl<'a> CfHandles<'a> {
         };
         Self {
             state: resolve(STATE_CF),
+            state_history: resolve(STATE_HISTORY_CF),
             blocks: resolve(BLOCKS_CF),
             transactions: resolve(TRANSACTIONS_CF),
             certificates: resolve(CERTIFICATES_CF),
@@ -188,30 +200,62 @@ impl TypedCf for StaleJmtNodesCf {
     }
 }
 
-// State — MVCC-versioned single source of truth.
+// State — current-value-per-key source of truth.
 //
-// Key: `((partition_key, sort_key), version)` encoded as
-// `storage_key_bytes ++ version_BE_8B`. Value: opaque substate bytes
-// (empty = tombstone).
+// Key: `(partition_key, sort_key)` encoded as `storage_key_bytes`.
+// Value: opaque substate bytes. An absent row means "no value for this
+// key" — deletions do `batch.delete_cf(state_cf, K)`, not a tombstone
+// sentinel.
 //
-// Reads resolve to the latest version ≤ target via walk-back. "Current
-// state" is simply `snapshot_at(jmt_version())`. GC keeps a floor entry
-// per key so reads within the retention window always resolve.
+// Current reads are direct point lookups. Historical reads at version V
+// go through the companion `StateHistoryCf`: seek the smallest history
+// entry for K with `write_version > V` and return its stored prior value.
 pub(crate) struct StateCf;
 impl TypedCf for StateCf {
     const NAME: &'static str = STATE_CF;
+    type Key = (
+        radix_substate_store_interface::interface::DbPartitionKey,
+        radix_substate_store_interface::interface::DbSortKey,
+    );
+    type Value = Vec<u8>;
+    type KeyCodec = crate::substate_key::SubstateKeyCodec;
+    type ValueCodec = RawCodec;
+    fn handle<'a>(cf: &CfHandles<'a>) -> &'a rocksdb::ColumnFamily {
+        cf.state
+    }
+}
+
+// State-history log — per-write prior-value entries for historical reads.
+//
+// Key: `((partition_key, sort_key), write_version)` encoded as
+// `storage_key_bytes ++ write_version_BE_8B`. Value:
+// `Option<Vec<u8>>` — the value the key held immediately before the
+// write at `write_version`. `None` means "key was absent before the
+// write."
+//
+// Every write to `StateCf` at version V captures a history entry at
+// `(K, V)` (except during genesis / bootstrap, which skips history
+// writes). GC deletes entries older than the retention window; `StateCf`
+// is always authoritative for the current tip.
+//
+// Read-only: historical reads reconstruct the value-at-V by seeking the
+// smallest entry for K with `v' > V`. Nothing ever mutates `StateCf`
+// from this log.
+pub(crate) struct StateHistoryCf;
+impl TypedCf for StateHistoryCf {
+    const NAME: &'static str = STATE_HISTORY_CF;
     type Key = (
         (
             radix_substate_store_interface::interface::DbPartitionKey,
             radix_substate_store_interface::interface::DbSortKey,
         ),
         u64,
-    ); // ((partition_key, sort_key), version)
-    type Value = Vec<u8>; // opaque substate bytes (empty = tombstone)
+    ); // ((partition_key, sort_key), write_version)
+    type Value = Option<Vec<u8>>;
     type KeyCodec = crate::versioned_key::VersionedSubstateKeyCodec;
-    type ValueCodec = RawCodec;
+    type ValueCodec = SborCodec<Option<Vec<u8>>>;
     fn handle<'a>(cf: &CfHandles<'a>) -> &'a rocksdb::ColumnFamily {
-        cf.state
+        cf.state_history
     }
 }
 

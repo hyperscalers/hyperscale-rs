@@ -150,6 +150,7 @@ impl hyperscale_storage::ChainWriter for SharedStorage {
         finalized_waves: &[std::sync::Arc<hyperscale_types::FinalizedWave>],
         block_height: u64,
         pending_snapshots: &[std::sync::Arc<hyperscale_storage::JmtSnapshot>],
+        base_reads: Option<&hyperscale_storage::BaseReadCache>,
     ) -> (Hash, Self::PreparedCommit) {
         self.0.prepare_block_commit(
             parent_state_root,
@@ -157,6 +158,7 @@ impl hyperscale_storage::ChainWriter for SharedStorage {
             finalized_waves,
             block_height,
             pending_snapshots,
+            base_reads,
         )
     }
 

@@ -3,7 +3,7 @@
 use crate::core::SimStorage;
 use crate::snapshot::SimSnapshot;
 
-use hyperscale_storage::{keys, DbSortKey, SubstateStore, VersionedStore};
+use hyperscale_storage::{DbSortKey, SubstateStore, VersionedStore};
 use hyperscale_types::{Hash, NodeId};
 
 impl SubstateStore for SimStorage {
@@ -28,56 +28,22 @@ impl SubstateStore for SimStorage {
         node_id: &NodeId,
         block_height: u64,
     ) -> Option<Vec<(u8, DbSortKey, Vec<u8>)>> {
-        let entity_key = keys::node_entity_key(node_id);
-        let s = self.state.read().unwrap();
-
-        if block_height > s.current_block_height {
+        let current_version = self.state.read().unwrap().current_block_height;
+        if block_height > current_version {
             return None;
         }
-
-        // MVCC prefix scan: iterate the versioned store for entries under this
-        // entity, taking the latest version <= block_height for each storage key.
-        // Key ordering: (storage_key, version) — ascending on both.
-        let entity_len = entity_key.len();
-        let end_key = keys::next_prefix(&entity_key).unwrap_or_default();
-        let mut results = Vec::new();
-        let mut current_sk: Option<&Vec<u8>> = None;
-        let mut current_best: Option<&Vec<u8>> = None;
-
-        let range_start = (entity_key.clone(), 0u64);
-        let range_end = (end_key, 0u64);
-
-        for ((sk, ver), value) in s.substates.range(range_start..range_end) {
-            // Storage key changed — flush previous group.
-            if current_sk != Some(sk) {
-                if let (Some(prev_sk), Some(val)) = (current_sk, current_best) {
-                    if prev_sk.len() > entity_len {
-                        let partition_num = prev_sk[entity_len];
-                        let sort_key = DbSortKey(prev_sk[entity_len + 1..].to_vec());
-                        results.push((partition_num, sort_key, val.clone()));
-                    }
-                }
-                current_sk = Some(sk);
-                current_best = None;
-            }
-            // Ascending version order: overwrite candidate with each version <= height.
-            if *ver <= block_height {
-                match value {
-                    Some(v) => current_best = Some(v),
-                    None => current_best = None, // tombstone: substate deleted
-                }
-            }
+        let floor = current_version.saturating_sub(self.jmt_history_length);
+        if block_height < floor {
+            // Below retention — historical state no longer recoverable.
+            // External API: return None (network-supplied heights may
+            // legitimately fall out of range; `snapshot_at` would panic,
+            // so don't delegate for this case).
+            return None;
         }
-        // Flush last group.
-        if let (Some(prev_sk), Some(val)) = (current_sk, current_best) {
-            if prev_sk.len() > entity_len {
-                let partition_num = prev_sk[entity_len];
-                let sort_key = DbSortKey(prev_sk[entity_len + 1..].to_vec());
-                results.push((partition_num, sort_key, val.clone()));
-            }
-        }
-
-        Some(results)
+        Some(
+            self.snapshot_at(block_height)
+                .list_raw_values_for_node(node_id),
+        )
     }
 
     fn generate_merkle_proofs(
@@ -92,8 +58,28 @@ impl SubstateStore for SimStorage {
 
 impl VersionedStore for SimStorage {
     fn snapshot_at(&self, version: u64) -> Self::Snapshot<'_> {
-        let substates = self.state.read().unwrap().substates.clone();
-        SimSnapshot { substates, version }
+        // Retention invariant: see `RocksDbStorage::snapshot_at` for the
+        // full reasoning. Below the floor we can't serve historical
+        // reads; hitting this is a DA-assumption bug in the caller.
+        let guard = self.state.read().unwrap();
+        let current_version = guard.current_block_height;
+        let floor = current_version.saturating_sub(self.jmt_history_length);
+        assert!(
+            version >= floor,
+            "snapshot_at({version}) below retention floor {floor} \
+             (current_version={current_version}, jmt_history_length={}) — \
+             BFT/DA invariant broken; caller must anchor within retention",
+            self.jmt_history_length,
+        );
+        // Clone state + state-history for snapshot isolation. Memory
+        // snapshots are point-in-time copies — they don't observe later
+        // mutations of the backing store.
+        SimSnapshot {
+            current_state: guard.current_state.clone(),
+            state_history: guard.state_history.clone(),
+            version,
+            current_version,
+        }
     }
 }
 

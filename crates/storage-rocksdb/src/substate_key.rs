@@ -1,8 +1,8 @@
 //! Substate key encoding for RocksDB.
 //!
-//! Constructs the composite byte keys used in the `state` and `versioned_substates`
-//! column families. These are RocksDB-specific — the memory storage backend uses
-//! native structured keys instead.
+//! Constructs the composite byte keys used in the `state` and
+//! `state_history` column families. These are RocksDB-specific — the
+//! memory storage backend uses native structured keys instead.
 //!
 //! Key layout: `[node_key (50B)][partition_num (1B)][sort_key (var)]`
 //!

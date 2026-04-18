@@ -38,6 +38,7 @@ impl hyperscale_storage::ChainWriter for RocksDbStorage {
         finalized_waves: &[std::sync::Arc<hyperscale_types::FinalizedWave>],
         block_height: u64,
         pending_snapshots: &[std::sync::Arc<hyperscale_storage::JmtSnapshot>],
+        base_reads: Option<&hyperscale_storage::BaseReadCache>,
     ) -> (hyperscale_types::Hash, Self::PreparedCommit) {
         let receipts: Vec<&ReceiptBundle> = finalized_waves
             .iter()
@@ -114,8 +115,12 @@ impl hyperscale_storage::ChainWriter for RocksDbStorage {
         let merged_updates = hyperscale_storage::merge_database_updates(&updates);
 
         // Pre-build substate + receipt writes into a WriteBatch for efficient commit.
-        let (mut write_batch, _reset_old_keys) =
-            self.build_substate_write_batch(&merged_updates, block_height);
+        let (mut write_batch, _reset_old_keys) = self.build_substate_write_batch(
+            &merged_updates,
+            block_height,
+            /* write_history */ true,
+            base_reads,
+        );
 
         for bundle in &receipts {
             self.add_receipt_bundle_to_batch(&mut write_batch, bundle);
@@ -258,8 +263,14 @@ impl RocksDbStorage {
             base_version
         );
 
-        let (mut batch, reset_old_keys) =
-            self.build_substate_write_batch(merged_updates, block_height);
+        // Sync path has no view → no base-read cache → fall through to
+        // multi_get_cf for all priors.
+        let (mut batch, reset_old_keys) = self.build_substate_write_batch(
+            merged_updates,
+            block_height,
+            /* write_history */ true,
+            /* base_reads */ None,
+        );
 
         // Persist block data (header, transactions, certificates) atomically.
         self.append_block_to_batch(&mut batch, block, qc);

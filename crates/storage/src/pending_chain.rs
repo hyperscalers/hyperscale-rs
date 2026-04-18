@@ -14,7 +14,15 @@ use hyperscale_types::{Hash, LocalReceipt, MerkleInclusionProof, NodeId};
 use radix_common::prelude::DatabaseUpdate;
 use radix_substate_store_interface::interface::SubstateDatabase;
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
+
+/// Cached base-storage reads observed through a [`SubstateView`].
+///
+/// Populated lazily on every overlay-miss read; captured at commit time
+/// and handed to `append_substate_writes_to_batch` so `capture_history`
+/// can source priors without a fresh `multi_get_cf` on StateCf. Entries
+/// are `(partition_key, sort_key) → value-at-anchor`.
+pub type BaseReadCache = HashMap<(DbPartitionKey, DbSortKey), Option<Vec<u8>>>;
 
 /// One block's worth of pending state, indexed by block hash in
 /// [`PendingChain::entries`].
@@ -155,10 +163,10 @@ pub struct SubstateView<S> {
     base: Arc<S>,
     /// Block height of the anchor — the chain's tip, or the base's
     /// `jmt_version()` when the view has no pending entries. Used as the
-    /// MVCC version for base-storage reads in [`Self::snapshot`], so the
-    /// snapshot reflects state as-of this specific block rather than
-    /// "whatever the validator has currently persisted." Critical for
-    /// cross-validator determinism under persistence lag.
+    /// historical version for base-storage reads in [`Self::snapshot`],
+    /// so the snapshot reflects state as-of this specific block rather
+    /// than "whatever the validator has currently persisted." Critical
+    /// for cross-validator determinism under persistence lag.
     anchor_height: u64,
     /// Flattened pending substates from the anchored chain, in commit order.
     /// Later entries override earlier ones for the same key.
@@ -174,6 +182,13 @@ pub struct SubstateView<S> {
     /// ([`SubstateStore::list_substates_for_node_at_height`]).
     /// Sorted by height ascending.
     versioned_receipts: Vec<(u64, Arc<LocalReceipt>)>,
+    /// Lazy cache of base-storage reads observed through this view.
+    /// Populated on every overlay-miss `get_raw_substate_by_db_key` call.
+    /// Consumed at commit time by `take_base_reads` so `capture_history`
+    /// can skip a `multi_get_cf` on StateCf for keys execution already
+    /// read. Arc-shared with derived `ViewSnapshot`s so reads through
+    /// either path populate the same cache.
+    base_reads: Arc<Mutex<BaseReadCache>>,
 }
 
 impl<S> SubstateView<S> {
@@ -217,6 +232,7 @@ impl<S> SubstateView<S> {
             jmt_snapshots,
             jmt_nodes,
             versioned_receipts,
+            base_reads: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -229,7 +245,20 @@ impl<S> SubstateView<S> {
             jmt_snapshots: Vec::new(),
             jmt_nodes: HashMap::new(),
             versioned_receipts: Vec::new(),
+            base_reads: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Drain the cache of base-storage reads observed through this view.
+    ///
+    /// The returned map holds one entry per distinct `(partition_key,
+    /// sort_key)` that was read from base (not overlay) during the view's
+    /// lifetime — i.e. exactly the priors `capture_history` would
+    /// otherwise re-read from StateCf at commit time. Called by the
+    /// commit pipeline to skip the `multi_get_cf` on StateCf for keys
+    /// already in the cache.
+    pub fn take_base_reads(&self) -> BaseReadCache {
+        std::mem::take(&mut *self.base_reads.lock().unwrap())
     }
 }
 
@@ -266,16 +295,31 @@ fn apply_database_updates(overlay: &mut OverlayEntries, updates: &DatabaseUpdate
 }
 
 /// Apply overlay entries on top of a base `SubstateDatabase` read.
+///
+/// If `base_reads_cache` is provided, every base-storage read (overlay
+/// miss) is recorded there exactly once per key — the first observed
+/// value wins. The cache is handed to `capture_history` at commit time
+/// so priors for keys execution already read don't require a fresh
+/// `multi_get_cf` on StateCf.
 fn overlay_get(
     overlay: &OverlayEntries,
     base: &dyn SubstateDatabase,
     partition_key: &DbPartitionKey,
     sort_key: &DbSortKey,
+    base_reads_cache: Option<&Mutex<BaseReadCache>>,
 ) -> Option<Vec<u8>> {
     if let Some(v) = overlay.get(&(partition_key.clone(), sort_key.clone())) {
         return v.clone();
     }
-    base.get_raw_substate_by_db_key(partition_key, sort_key)
+    let value = base.get_raw_substate_by_db_key(partition_key, sort_key);
+    if let Some(cache) = base_reads_cache {
+        cache
+            .lock()
+            .unwrap()
+            .entry((partition_key.clone(), sort_key.clone()))
+            .or_insert_with(|| value.clone());
+    }
+    value
 }
 
 /// Apply overlay entries on top of a base `SubstateDatabase` list.
@@ -321,7 +365,13 @@ impl<S: SubstateDatabase> SubstateDatabase for SubstateView<S> {
         partition_key: &DbPartitionKey,
         sort_key: &DbSortKey,
     ) -> Option<Vec<u8>> {
-        overlay_get(&self.overlay, &*self.base, partition_key, sort_key)
+        overlay_get(
+            &self.overlay,
+            &*self.base,
+            partition_key,
+            sort_key,
+            Some(&self.base_reads),
+        )
     }
 
     fn list_raw_values_from_db_key(
@@ -329,6 +379,10 @@ impl<S: SubstateDatabase> SubstateDatabase for SubstateView<S> {
         partition_key: &DbPartitionKey,
         from_sort_key: Option<&DbSortKey>,
     ) -> Box<dyn Iterator<Item = (DbSortKey, Vec<u8>)> + '_> {
+        // List reads intentionally bypass the base-read cache: caching a
+        // whole partition's rows per call would bloat the cache without
+        // meaningfully reducing commit-path work (capture_history is
+        // per-key, not per-partition).
         Box::new(overlay_list(&self.overlay, &*self.base, partition_key, from_sort_key).into_iter())
     }
 }
@@ -338,6 +392,9 @@ impl<S: SubstateDatabase> SubstateDatabase for SubstateView<S> {
 pub struct ViewSnapshot<Snap> {
     base_snapshot: Snap,
     overlay: Arc<OverlayEntries>,
+    /// Shared with the parent `SubstateView` so reads through this
+    /// snapshot populate the same cache as direct-impl reads.
+    base_reads: Arc<Mutex<BaseReadCache>>,
 }
 
 impl<Snap: SubstateDatabase> SubstateDatabase for ViewSnapshot<Snap> {
@@ -346,7 +403,13 @@ impl<Snap: SubstateDatabase> SubstateDatabase for ViewSnapshot<Snap> {
         partition_key: &DbPartitionKey,
         sort_key: &DbSortKey,
     ) -> Option<Vec<u8>> {
-        overlay_get(&self.overlay, &self.base_snapshot, partition_key, sort_key)
+        overlay_get(
+            &self.overlay,
+            &self.base_snapshot,
+            partition_key,
+            sort_key,
+            Some(&self.base_reads),
+        )
     }
 
     fn list_raw_values_from_db_key(
@@ -373,7 +436,7 @@ impl<S: SubstateStore + crate::VersionedStore> SubstateStore for SubstateView<S>
         Self: 'a;
 
     fn snapshot(&self) -> Self::Snapshot<'_> {
-        // Base reads are MVCC-anchored to the view's anchor height so that
+        // Base reads are anchored to the view's anchor height so that
         // keys not touched by any pending ancestor in the overlay resolve
         // to the value at the anchor — not "current StateCf", which would
         // leak post-anchor writes when this validator has persisted past
@@ -384,6 +447,9 @@ impl<S: SubstateStore + crate::VersionedStore> SubstateStore for SubstateView<S>
             // Clone the overlay into an Arc so the snapshot is `'static`
             // with respect to the view's overlay map.
             overlay: Arc::new(self.overlay.clone()),
+            // Share the base-read cache so reads via either the view's
+            // direct impl or this snapshot populate the same map.
+            base_reads: Arc::clone(&self.base_reads),
         }
     }
 
@@ -523,13 +589,25 @@ impl<S: crate::ChainWriter> crate::ChainWriter for SubstateView<S> {
         finalized_waves: &[Arc<hyperscale_types::FinalizedWave>],
         block_height: u64,
         pending_snapshots: &[Arc<JmtSnapshot>],
+        base_reads: Option<&BaseReadCache>,
     ) -> (Hash, Self::PreparedCommit) {
+        // Drain the view's own cache when the caller didn't supply one.
+        // This is the common path: execution reads through the view,
+        // prepare_block_commit consumes the accumulated priors so the
+        // base's capture_history can skip the StateCf multi_get.
+        let drained = if base_reads.is_none() {
+            Some(self.take_base_reads())
+        } else {
+            None
+        };
+        let effective = base_reads.or(drained.as_ref());
         (*self.base).prepare_block_commit(
             parent_state_root,
             parent_block_height,
             finalized_waves,
             block_height,
             pending_snapshots,
+            effective,
         )
     }
 

@@ -562,18 +562,38 @@ pub(crate) fn handle_delegated_action<
         } => {
             let local_shard = ctx.topology.local_shard();
             let num_shards = ctx.topology.num_shards();
-            // Engine handles execution + system/shard filtering internally.
-            // Use overlay so execution sees state from unpersisted blocks.
-            let (tx_outcomes, results): (Vec<_>, Vec<_>) = transactions
-                .iter()
-                .map(|tx| {
-                    let r = hyperscale_engine::handlers::execute_single_shard(
-                        ctx.executor,
-                        &*ctx.view,
-                        tx,
-                        local_shard,
-                        num_shards,
-                    );
+            // ONE anchored snapshot for the whole batch. State doesn't
+            // change during execution (commits serialize elsewhere), so
+            // one rocksdb snapshot serves every tx — avoids per-tx
+            // `db.snapshot()` + `read_jmt_metadata` overhead.
+            let view_snap =
+                <hyperscale_storage::SubstateView<_> as hyperscale_storage::SubstateStore>::snapshot(
+                    &*ctx.view,
+                );
+            let batch_result = ctx.executor.execute_single_shard(
+                &view_snap,
+                transactions.as_slice(),
+                local_shard,
+                num_shards,
+            );
+            let per_tx: Vec<_> = match batch_result {
+                Ok(output) => output.results,
+                Err(e) => {
+                    // Whole-batch failure is rare and fatal-ish; produce
+                    // one failure entry per tx so the state machine can
+                    // still advance without losing transactions.
+                    tracing::warn!(error = %e, "single-shard batch execution failed");
+                    transactions
+                        .iter()
+                        .map(|tx| {
+                            hyperscale_engine::SingleTxResult::failure(tx.hash(), e.to_string())
+                        })
+                        .collect()
+                }
+            };
+            let (tx_outcomes, results): (Vec<_>, Vec<_>) = per_tx
+                .into_iter()
+                .map(|r| {
                     let outcome = hyperscale_engine::handlers::extract_execution_result(&r);
                     (outcome, LocalExecutionEntry::from(r))
                 })
@@ -597,18 +617,36 @@ pub(crate) fn handle_delegated_action<
         } => {
             let local_shard = ctx.topology.local_shard();
             let num_shards = ctx.topology.num_shards();
+            // ONE anchored snapshot shared across every request's
+            // execution — avoids per-request `storage.snapshot()`.
+            // Each request still applies its OWN provisions (as its
+            // own overlay) on top of this shared base snapshot.
+            let view_snap =
+                <hyperscale_storage::SubstateView<_> as hyperscale_storage::SubstateStore>::snapshot(
+                    &*ctx.view,
+                );
             let (tx_outcomes, results): (Vec<_>, Vec<_>) = requests
                 .iter()
                 .map(|req| {
-                    let r = hyperscale_engine::handlers::execute_cross_shard(
-                        ctx.executor,
-                        &*ctx.view,
-                        req.tx_hash,
-                        &req.transaction,
+                    let output = ctx.executor.execute_cross_shard(
+                        &view_snap,
+                        std::slice::from_ref(&req.transaction),
                         &req.provisions,
                         local_shard,
                         num_shards,
                     );
+                    let r = match output {
+                        Ok(mut o) => o.results.pop().unwrap_or_else(|| {
+                            hyperscale_engine::SingleTxResult::failure(
+                                req.tx_hash,
+                                "No cross-shard execution result returned",
+                            )
+                        }),
+                        Err(e) => {
+                            tracing::warn!(tx_hash = ?req.tx_hash, error = %e, "cross-shard execution failed");
+                            hyperscale_engine::SingleTxResult::failure(req.tx_hash, e.to_string())
+                        }
+                    };
                     let outcome = hyperscale_engine::handlers::extract_execution_result(&r);
                     (outcome, LocalExecutionEntry::from(r))
                 })

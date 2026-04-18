@@ -39,9 +39,9 @@ impl SimulationEngine {
     }
 
     /// Execute a single transaction, returning a cached result if available.
-    fn execute_cached<S: SubstateStore>(
+    fn execute_cached<D: SubstateDatabase>(
         &self,
-        storage: &S,
+        snapshot: &D,
         tx: &Arc<RoutableTransaction>,
         local_shard: ShardGroupId,
         num_shards: u64,
@@ -56,7 +56,7 @@ impl SimulationEngine {
         let result = lock.get_or_init(|| {
             // Cache miss — delegate to the real executor (single-tx batch).
             match self.inner.execute_single_shard(
-                storage,
+                snapshot,
                 std::slice::from_ref(tx),
                 local_shard,
                 num_shards,
@@ -74,9 +74,9 @@ impl SimulationEngine {
     }
 
     /// Execute a single cross-shard transaction, returning a cached result if available.
-    fn execute_cross_shard_cached<S: SubstateStore>(
+    fn execute_cross_shard_cached<D: SubstateDatabase>(
         &self,
-        storage: &S,
+        snapshot: &D,
         tx: &Arc<RoutableTransaction>,
         provisions: &[StateProvision],
         local_shard: ShardGroupId,
@@ -91,7 +91,7 @@ impl SimulationEngine {
 
         let result = lock.get_or_init(|| {
             match self.inner.execute_cross_shard(
-                storage,
+                snapshot,
                 std::slice::from_ref(tx),
                 provisions,
                 local_shard,
@@ -120,23 +120,23 @@ impl Clone for SimulationEngine {
 }
 
 impl Engine for SimulationEngine {
-    fn execute_single_shard<S: SubstateStore>(
+    fn execute_single_shard<D: SubstateDatabase>(
         &self,
-        storage: &S,
+        snapshot: &D,
         transactions: &[Arc<RoutableTransaction>],
         local_shard: ShardGroupId,
         num_shards: u64,
     ) -> Result<ExecutionOutput, ExecutionError> {
         let mut results = Vec::with_capacity(transactions.len());
         for tx in transactions {
-            results.push(self.execute_cached(storage, tx, local_shard, num_shards)?);
+            results.push(self.execute_cached(snapshot, tx, local_shard, num_shards)?);
         }
         Ok(ExecutionOutput::new(results))
     }
 
-    fn execute_cross_shard<S: SubstateStore>(
+    fn execute_cross_shard<D: SubstateDatabase>(
         &self,
-        storage: &S,
+        snapshot: &D,
         transactions: &[Arc<RoutableTransaction>],
         provisions: &[StateProvision],
         local_shard: ShardGroupId,
@@ -145,7 +145,7 @@ impl Engine for SimulationEngine {
         let mut results = Vec::with_capacity(transactions.len());
         for tx in transactions {
             results.push(self.execute_cross_shard_cached(
-                storage,
+                snapshot,
                 tx,
                 provisions,
                 local_shard,

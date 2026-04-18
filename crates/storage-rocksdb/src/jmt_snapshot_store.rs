@@ -34,9 +34,9 @@ impl<'a> SnapshotTreeStore<'a> {
         }
     }
 
-    /// Read the latest (non-tombstone) substate value visible through this
-    /// RocksDB snapshot via MVCC walk-back. Used when collecting historical
-    /// state associations during proof generation.
+    /// Read the current substate value visible through this RocksDB
+    /// snapshot. Used when collecting historical state associations
+    /// during proof generation.
     pub fn get_substate(
         &self,
         partition_key: &DbPartitionKey,
@@ -44,15 +44,9 @@ impl<'a> SnapshotTreeStore<'a> {
     ) -> Option<Vec<u8>> {
         let cf = CfHandles::resolve(self.db);
         let state_cf = StateCf::handle(&cf);
-        // Walk this substate's version list; last non-tombstone entry wins.
-        let prefix = crate::substate_key::substate_prefix(partition_key, sort_key);
-        let mut best: Option<Vec<u8>> = None;
-        for ((_key, _version), value) in
-            typed_cf::prefix_iter_snap::<StateCf>(&self.snapshot, state_cf, &prefix)
-        {
-            best = if value.is_empty() { None } else { Some(value) };
-        }
-        best
+        // Direct point lookup on the unversioned state CF.
+        let state_key = (partition_key.clone(), sort_key.clone());
+        typed_cf::get::<StateCf>(&self.snapshot, state_cf, &state_key)
     }
 
     /// Read the JMT version and root hash from this snapshot. Uses the
