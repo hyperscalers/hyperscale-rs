@@ -1,35 +1,26 @@
 //! Block fetch response.
 
-use hyperscale_types::{
-    Block, ExecutionCertificate, MessagePriority, NetworkMessage, QuorumCertificate,
-};
+use hyperscale_types::{Block, MessagePriority, NetworkMessage, QuorumCertificate};
 use sbor::prelude::BasicSbor;
 
 /// Response to a block fetch request containing the full Block and its QC.
 ///
-/// Receipts are carried inline as part of `Block.certificates[i].receipts`.
+/// ECs are carried inside `Block.certificates[i].wave_certificate.execution_certificates`
+/// and receipts are carried inline as part of `Block.certificates[i].receipts`.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct GetBlockResponse {
     /// The requested block (None if not found).
     pub block: Option<Block>,
     /// The QC that certifies this block (None if block not found or at tip).
     pub qc: Option<QuorumCertificate>,
-    /// Execution certificates produced by the serving shard for this block.
-    /// Remote shard ECs are available from those remote shards.
-    pub execution_certificates: Vec<ExecutionCertificate>,
 }
 
 impl GetBlockResponse {
     /// Create a response with a found block and its certifying QC.
-    pub fn found(
-        block: Block,
-        qc: QuorumCertificate,
-        execution_certificates: Vec<ExecutionCertificate>,
-    ) -> Self {
+    pub fn found(block: Block, qc: QuorumCertificate) -> Self {
         Self {
             block: Some(block),
             qc: Some(qc),
-            execution_certificates,
         }
     }
 
@@ -38,7 +29,6 @@ impl GetBlockResponse {
         Self {
             block: None,
             qc: None,
-            execution_certificates: vec![],
         }
     }
 
@@ -57,15 +47,9 @@ impl GetBlockResponse {
         self.qc.as_ref()
     }
 
-    /// Consume and return the block, QC, and execution certificates.
-    pub fn into_parts(
-        self,
-    ) -> (
-        Option<Block>,
-        Option<QuorumCertificate>,
-        Vec<ExecutionCertificate>,
-    ) {
-        (self.block, self.qc, self.execution_certificates)
+    /// Consume and return the block and QC.
+    pub fn into_parts(self) -> (Option<Block>, Option<QuorumCertificate>) {
+        (self.block, self.qc)
     }
 }
 
@@ -131,12 +115,11 @@ mod tests {
     fn test_block_response_found() {
         let block = create_test_block();
         let qc = create_test_qc(&block);
-        let response = GetBlockResponse::found(block.clone(), qc.clone(), vec![]);
+        let response = GetBlockResponse::found(block.clone(), qc.clone());
 
         assert!(response.has_block());
         assert_eq!(response.block(), Some(&block));
         assert_eq!(response.qc(), Some(&qc));
-        assert!(response.execution_certificates.is_empty());
     }
 
     #[test]
@@ -146,18 +129,16 @@ mod tests {
         assert!(!response.has_block());
         assert_eq!(response.block(), None);
         assert_eq!(response.qc(), None);
-        assert!(response.execution_certificates.is_empty());
     }
 
     #[test]
     fn test_block_response_into_parts() {
         let block = create_test_block();
         let qc = create_test_qc(&block);
-        let response = GetBlockResponse::found(block.clone(), qc.clone(), vec![]);
+        let response = GetBlockResponse::found(block.clone(), qc.clone());
 
-        let (extracted_block, extracted_qc, extracted_ecs) = response.into_parts();
+        let (extracted_block, extracted_qc) = response.into_parts();
         assert_eq!(extracted_block, Some(block));
         assert_eq!(extracted_qc, Some(qc));
-        assert!(extracted_ecs.is_empty());
     }
 }

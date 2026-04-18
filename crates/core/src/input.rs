@@ -54,8 +54,6 @@ pub enum NodeInput {
     SyncBlockResponseReceived {
         height: u64,
         block: Box<Option<(Block, QuorumCertificate)>>,
-        /// Execution certificates produced by the serving shard.
-        execution_certificates: Vec<ExecutionCertificate>,
     },
 
     /// Sync block fetch failed from network callback.

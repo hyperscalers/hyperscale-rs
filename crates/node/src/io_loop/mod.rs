@@ -613,11 +613,7 @@ where
             }
 
             // ── Sync protocol ──────────────────────────────────────────
-            NodeInput::SyncBlockResponseReceived {
-                height,
-                block,
-                execution_certificates: _,
-            } => {
+            NodeInput::SyncBlockResponseReceived { height, block } => {
                 // Check 1: receipt_root verification (synchronous).
                 // Verify block body matches the QC-attested header.
                 let certificate_root_valid = match *block {

@@ -373,26 +373,18 @@ impl SyncProtocol {
 
 /// Serve an inbound block sync request.
 ///
-/// Returns the full Block plus the local ECs for this block's height.
+/// Returns the full Block (which includes ECs embedded in each
+/// `FinalizedWave.wave_certificate.execution_certificates`) plus the QC.
 /// Returns `not_found` if any data is missing.
 ///
 /// `get_block_for_sync` rebuilds each `FinalizedWave` from stored receipts and
 /// places it on `block.certificates`, so the syncing peer gets a self-contained
-/// block with everything needed to verify and apply state changes.
-///
-/// Local ECs are served alongside the block. The syncing node verifies EC
-/// integrity via the QC-attested `certificate_root` (which transitively
-/// commits to ec_hashes). No canonical_hash matching here — validators may
-/// aggregate at different vote_heights, producing genuinely different ECs
-/// for the same wave (D1 edge case).
+/// block with everything needed to verify and apply state changes. The syncing
+/// node verifies EC integrity via the QC-attested `certificate_root`.
 pub fn serve_block_request(storage: &impl ChainReader, req: GetBlockRequest) -> GetBlockResponse {
     trace!(height = req.height.0, "Handling block sync request");
     match storage.get_block_for_sync(req.height) {
-        Some((block, qc)) => {
-            let execution_certificates =
-                storage.get_execution_certificates_by_height(block.header.height.0);
-            GetBlockResponse::found(block, qc, execution_certificates)
-        }
+        Some((block, qc)) => GetBlockResponse::found(block, qc),
         None => GetBlockResponse::not_found(),
     }
 }

@@ -46,7 +46,7 @@ where
                         },
                         Box::new(move |result| match result {
                             Ok(resp) => {
-                                let (block_opt, qc_opt, execution_certificates) = resp.into_parts();
+                                let (block_opt, qc_opt) = resp.into_parts();
                                 let block = match (block_opt, qc_opt) {
                                     (Some(b), Some(q)) => Some((b, q)),
                                     _ => None,
@@ -54,7 +54,6 @@ where
                                 let _ = es.send(NodeInput::SyncBlockResponseReceived {
                                     height,
                                     block: Box::new(block),
-                                    execution_certificates,
                                 });
                             }
                             Err(_) => {
