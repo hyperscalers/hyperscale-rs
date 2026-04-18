@@ -18,7 +18,7 @@ use hyperscale_storage::{ChainReader, ChainWriter, SubstateStore};
 use hyperscale_types::{Block, Hash, Provision, QuorumCertificate, ValidatorId};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use tracing::{debug, warn};
+use tracing::{debug, trace, warn};
 impl<S, N, D, E> IoLoop<S, N, D, E>
 where
     S: ChainWriter + SubstateStore + ChainReader + hyperscale_storage::JmtTreeReader + Send + Sync,
@@ -332,7 +332,7 @@ where
                 submitted_locally,
                 phase_times,
             } => {
-                debug!(?tx_hash, ?status, "Transaction status");
+                trace!(?tx_hash, ?status, "Transaction status");
                 if status.is_final() && submitted_locally {
                     let now = self.state.now();
                     let latency_secs = now.saturating_sub(added_at).as_secs_f64();

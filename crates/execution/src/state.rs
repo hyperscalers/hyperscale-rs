@@ -1576,7 +1576,7 @@ impl ExecutionState {
             .into_iter()
             .collect();
 
-        tracing::debug!(
+        tracing::trace!(
             tx_hash = ?tx_hash,
             shard = local_shard.0,
             participating = ?participating_shards,

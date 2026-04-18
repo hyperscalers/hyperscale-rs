@@ -395,7 +395,7 @@ impl MempoolState {
         // Add to ready tracking
         self.add_to_ready_tracking(hash, &tx, cross_shard, self.now);
 
-        tracing::debug!(tx_hash = ?hash, pool_size = self.pool.len(), "Transaction added to mempool via gossip");
+        tracing::trace!(tx_hash = ?hash, pool_size = self.pool.len(), "Transaction added to mempool via gossip");
 
         // No events emitted — gossip acceptance is silent to avoid flooding
         // the consensus channel under high transaction load.
