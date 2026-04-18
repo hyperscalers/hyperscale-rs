@@ -432,15 +432,18 @@ impl RocksDbStorage {
         (batch, reset_old_keys)
     }
 
-    /// Write only substate data (no JMT computation).
+    /// Write only substate data (no JMT computation, no MVCC history).
     ///
     /// Used during genesis bootstrap so each intermediate `commit()` call from the
     /// Radix Engine writes substates without computing a JMT version.
     /// After all genesis commits complete, [`finalize_genesis_jmt`] computes the
-    /// JMT once at version 0.
+    /// JMT once at version 0 AND writes the merged updates to `versioned_substates`
+    /// in a single pass — this avoids intermediate Reset tombstones from earlier
+    /// bootstrap calls masking values in the version-0 MVCC history that the
+    /// final StateCf correctly contains.
     pub fn commit_substates_only(&self, updates: &DatabaseUpdates) {
-        // Genesis: version 0
-        let (batch, _) = self.build_substate_write_batch(updates, Some(0));
+        // Pass None so build_substate_write_batch skips versioned_substates.
+        let (batch, _) = self.build_substate_write_batch(updates, None);
 
         // Write substates only — no JMT, no sync (genesis isn't durability-critical).
         self.db
@@ -479,7 +482,10 @@ impl RocksDbStorage {
         let jmt_snapshot =
             JmtSnapshot::from_collected_writes(collected, StateRootHash::ZERO, 0, root, 0);
 
-        let mut batch = WriteBatch::default();
+        // Build the MVCC history for version 0 from the merged updates in one
+        // pass — bootstrap intentionally skipped versioned_substates writes,
+        // so we do them here where only final values and tombstones remain.
+        let (mut batch, _) = self.build_substate_write_batch_versioned_only(merged, 0);
         self.append_jmt_to_batch(&mut batch, &jmt_snapshot, 0);
 
         self.db
@@ -487,6 +493,73 @@ impl RocksDbStorage {
             .expect("genesis JMT finalization failed");
 
         root
+    }
+
+    /// Build a `WriteBatch` containing only `versioned_substates` writes for
+    /// the given merged updates at `version`. Used by
+    /// [`Self::finalize_genesis_jmt`] to populate MVCC history once from the
+    /// merged genesis state, avoiding tombstones left by intermediate
+    /// Reset-partition bootstrap commits.
+    fn build_substate_write_batch_versioned_only(
+        &self,
+        updates: &DatabaseUpdates,
+        version: u64,
+    ) -> (WriteBatch, ResetOldKeys) {
+        let mut batch = WriteBatch::default();
+        let reset_old_keys = ResetOldKeys::new();
+        use crate::column_families::VersionedSubstatesCf;
+        use crate::typed_cf::batch_put;
+
+        let versioned_cf = VersionedSubstatesCf::handle(&self.cf());
+
+        for (node_key, node_updates) in &updates.node_updates {
+            for (partition_num, partition_updates) in &node_updates.partition_updates {
+                let partition_key = DbPartitionKey {
+                    node_key: node_key.clone(),
+                    partition_num: *partition_num,
+                };
+                match partition_updates {
+                    PartitionDatabaseUpdates::Delta { substate_updates } => {
+                        for (sort_key, update) in substate_updates {
+                            let key = (partition_key.clone(), sort_key.clone());
+                            match update {
+                                DatabaseUpdate::Set(value) => {
+                                    batch_put::<VersionedSubstatesCf>(
+                                        &mut batch,
+                                        versioned_cf,
+                                        &(key, version),
+                                        value,
+                                    );
+                                }
+                                DatabaseUpdate::Delete => {
+                                    batch_put::<VersionedSubstatesCf>(
+                                        &mut batch,
+                                        versioned_cf,
+                                        &(key, version),
+                                        &vec![],
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    PartitionDatabaseUpdates::Reset {
+                        new_substate_values,
+                    } => {
+                        for (sort_key, value) in new_substate_values {
+                            let key = (partition_key.clone(), sort_key.clone());
+                            batch_put::<VersionedSubstatesCf>(
+                                &mut batch,
+                                versioned_cf,
+                                &(key, version),
+                                value,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        (batch, reset_old_keys)
     }
 }
 

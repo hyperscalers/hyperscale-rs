@@ -170,13 +170,12 @@ impl SimStorage {
     /// JVT once at version 0.
     pub fn commit_substates_only(&self, updates: &DatabaseUpdates) {
         let mut s = self.state.write().unwrap();
-        // Genesis: no version tracking, write at version 0.
-        let crate::state::SharedState {
-            ref mut data,
-            ref mut versioned_substates,
-            ..
-        } = *s;
-        apply_updates_to_ordmap(data, updates, Some((0, versioned_substates)));
+        // Skip MVCC writes during bootstrap — intermediate Reset partitions
+        // could tombstone values that later commits re-add, leaving holes in
+        // version-0 history. `finalize_genesis_jmt` writes the merged final
+        // state to `versioned_substates` in a single pass.
+        let crate::state::SharedState { ref mut data, .. } = *s;
+        apply_updates_to_ordmap(data, updates, None);
     }
 
     /// Compute the JVT once at version 0 from the merged genesis updates.
@@ -212,10 +211,54 @@ impl SimStorage {
             s.tree_store.remove(stale_key);
         }
 
+        // Populate MVCC history from the merged genesis updates in one pass.
+        // Bootstrap intentionally skipped versioned writes to avoid Reset
+        // tombstones masking later re-writes at version 0.
+        Self::write_merged_versioned_at(&mut s.versioned_substates, merged, 0);
+
         s.current_block_height = 0;
         s.current_root_hash = root;
 
         root
+    }
+
+    fn write_merged_versioned_at(
+        versioned: &mut crate::state::VersionedSubstateStore,
+        updates: &DatabaseUpdates,
+        version: u64,
+    ) {
+        use hyperscale_storage::{keys, DatabaseUpdate, DbPartitionKey, PartitionDatabaseUpdates};
+        for (node_key, node_updates) in &updates.node_updates {
+            for (partition_num, partition_updates) in &node_updates.partition_updates {
+                let partition_key = DbPartitionKey {
+                    node_key: node_key.clone(),
+                    partition_num: *partition_num,
+                };
+                match partition_updates {
+                    PartitionDatabaseUpdates::Delta { substate_updates } => {
+                        for (sort_key, update) in substate_updates {
+                            let key = keys::to_storage_key(&partition_key, sort_key);
+                            match update {
+                                DatabaseUpdate::Set(value) => {
+                                    versioned.insert((key, version), Some(value.clone()));
+                                }
+                                DatabaseUpdate::Delete => {
+                                    versioned.insert((key, version), None);
+                                }
+                            }
+                        }
+                    }
+                    PartitionDatabaseUpdates::Reset {
+                        new_substate_values,
+                    } => {
+                        for (sort_key, value) in new_substate_values {
+                            let key = keys::to_storage_key(&partition_key, sort_key);
+                            versioned.insert((key, version), Some(value.clone()));
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
