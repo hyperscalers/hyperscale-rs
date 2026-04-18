@@ -740,15 +740,6 @@ impl BftState {
         };
         let timeout = self.current_view_change_timeout();
 
-        // If we've voted for the current proposal height, the leader did
-        // produce a valid block. The QC will arrive via the next block
-        // header's parent_qc. Use an extended deadline (2× timeout) to
-        // avoid premature view changes while still recovering if the
-        // proposer fails to aggregate quorum.
-        if self.voted_heights.contains_key(&next_height) {
-            return self.now.saturating_sub(last_activity) >= timeout.saturating_mul(2);
-        }
-
         self.now.saturating_sub(last_activity) >= timeout
     }
 
@@ -2217,6 +2208,13 @@ impl BftState {
         // unless the vote lock is released on timeout (see `advance_round`) or by
         // QC-based unlock (see `maybe_unlock_for_qc`).
         self.voted_heights.insert(height, (block_hash, round));
+
+        // Reset the view change timer — voting proves the leader produced a
+        // valid block. Non-proposers only learn about QC formation when the
+        // next block header arrives (votes go to proposer only), so without
+        // this reset the 5s timeout fires before the header arrives, causing
+        // cascading view changes under normal load.
+        self.record_leader_activity();
 
         let timestamp = self.now.as_millis() as u64;
 
