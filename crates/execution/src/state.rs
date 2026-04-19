@@ -239,6 +239,14 @@ const EXEC_CERT_RETRY_INTERVAL_BLOCKS: u64 = 20;
 /// Blocks to wait before retrying a vote with the next rotated wave leader.
 const VOTE_RETRY_BLOCKS: u64 = 5;
 
+/// Blocks to retain committed remote provisions in `ConflictDetector` for
+/// reverse conflict detection. A local tx that hasn't registered against a
+/// stored provision this many blocks after its commit can't conflict with it
+/// — its own block has long committed. Anything older is dropped to bound the
+/// detector's memory and per-block iteration cost (see
+/// `ConflictDetector::prune_provisions_older_than`).
+const CONFLICT_PROVISION_RETENTION_BLOCKS: u64 = 50;
+
 /// Tracks a pending vote sent to a wave leader, for retry on timeout.
 ///
 /// Retries are unbounded — the loop self-terminates when a working leader
@@ -1474,6 +1482,17 @@ impl ExecutionState {
         // pending provisioning, execution cache, early arrivals) is only cleaned
         // up on terminal state — never by block-count timeout.
         self.prune_execution_state();
+
+        // Drop conflict-detector entries for remote provisions older than the
+        // retention window. `register_tx` iterates over these per cross-shard
+        // tx; left unbounded they drive quadratic TPS decay.
+        let cutoff = height.saturating_sub(CONFLICT_PROVISION_RETENTION_BLOCKS);
+        if cutoff > 0 {
+            let dropped = self.conflict_detector.prune_provisions_older_than(cutoff);
+            if dropped > 0 {
+                tracing::debug!(dropped, cutoff, "Pruned aged conflict-detector provisions");
+            }
+        }
 
         if transactions.is_empty() {
             return actions;

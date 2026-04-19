@@ -236,6 +236,31 @@ impl ConflictDetector {
         }
     }
 
+    /// Drop stored provisions older than `cutoff_height`.
+    ///
+    /// Reverse conflict detection (provision stored before local tx registers)
+    /// only matters while the local tx could still arrive. Once the local tx's
+    /// block has committed well past the provision's commit height, no future
+    /// registration can conflict with it, so the entry is safe to drop.
+    ///
+    /// Call from `on_block_committed` to bound `stored_provisions` size — without
+    /// this, `register_tx` iterates unboundedly many past provisions per
+    /// cross-shard tx per block (quadratic TPS decay under sustained load).
+    pub fn prune_provisions_older_than(&mut self, cutoff_height: u64) -> usize {
+        let before = self.stored_provisions.len();
+        self.stored_provisions
+            .retain(|_, prov| prov.committed_at_height > cutoff_height);
+        // Rebuild `provisions_by_shard` to drop dangling tx refs.
+        self.provisions_by_shard.clear();
+        for &(tx_hash, shard) in self.stored_provisions.keys() {
+            self.provisions_by_shard
+                .entry(shard)
+                .or_default()
+                .insert(tx_hash);
+        }
+        before - self.stored_provisions.len()
+    }
+
     /// Number of local transactions being tracked.
     pub fn tracked_tx_count(&self) -> usize {
         self.tx_needs.len()
