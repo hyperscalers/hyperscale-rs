@@ -1372,16 +1372,21 @@ impl ExecutionState {
                 });
             }
         }
-        // Prune old entries that have been requested and are very stale,
-        // BUT keep entries whose transactions still have active certificate
-        // trackers waiting for the remote EC. Without this, txs whose local
-        // EC formed but remote EC never arrived stop retrying and are stuck
-        // permanently.
-        let active_wave_ids: HashSet<&WaveId> = self.wave_assignments.values().collect();
-        self.expected_exec_certs.retain(|(_, _, wave_id), e| {
-            let age = self.committed_height.saturating_sub(e.discovered_at);
-            age < 100 || active_wave_ids.contains(wave_id)
-        });
+        // Retain expectations while any local wave tracker still needs an EC
+        // from that source shard. `wave_certificate_trackers` is the
+        // authoritative "what am I still waiting on" set — entries are removed
+        // by `finalize_wave` once a wave is complete. Keyed by source shard
+        // (not wave_id) because expected entries carry the remote shard's
+        // wave decomposition, which cannot be matched against local wave ids.
+        let local_shard = topology.local_shard();
+        let shards_needed: HashSet<ShardGroupId> = self
+            .wave_certificate_trackers
+            .keys()
+            .flat_map(|wid| wid.remote_shards.iter().copied())
+            .filter(|s| *s != local_shard)
+            .collect();
+        self.expected_exec_certs
+            .retain(|(source_shard, _, _), _| shards_needed.contains(source_shard));
 
         // Prune fulfilled set using local height when fulfilled (not remote
         // block height, which can differ significantly across shards).
@@ -2728,5 +2733,90 @@ mod tests {
             _ => false,
         });
         assert!(has_remote, "Should include remote shard broadcast");
+    }
+
+    // ========================================================================
+    // Expected Execution Cert Retention
+    // ========================================================================
+
+    /// Multi-shard topology for expected-cert tests: 4 validators, 2 shards.
+    /// Local is validator 0 (shard 0); shard 1 = {1, 3}.
+    fn make_two_shard_topology() -> TopologySnapshot {
+        let keys: Vec<Bls12381G1PrivateKey> = (0..4).map(|_| generate_bls_keypair()).collect();
+        let validators: Vec<ValidatorInfo> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| ValidatorInfo {
+                validator_id: ValidatorId(i as u64),
+                public_key: k.public_key(),
+                voting_power: 1,
+            })
+            .collect();
+        TopologySnapshot::new(ValidatorId(0), 2, ValidatorSet::new(validators))
+    }
+
+    /// Regression test for expected_exec_certs retention.
+    ///
+    /// Previously, the retention predicate compared the remote shard's wave_id
+    /// (stored in the expected entry) against the local shard's wave_assignments
+    /// values — these have different `shard_group_id` and can never match. All
+    /// entries aged out at 100 blocks and fallback retries stopped, stranding
+    /// any cross-shard wave whose remote EC missed the broadcast window.
+    ///
+    /// The fix retains entries while any local `wave_certificate_tracker`
+    /// still lists the source shard as a participating remote.
+    #[test]
+    fn test_expected_exec_cert_retained_while_tracker_pending() {
+        use crate::trackers::WaveCertificateTracker;
+        use std::collections::BTreeSet;
+
+        let topo = make_two_shard_topology();
+        let mut state = make_test_state();
+
+        let remote_shard = ShardGroupId(1);
+        let remote_wave = WaveId::new(remote_shard, 5, [ShardGroupId(0)].into_iter().collect());
+        state.on_verified_remote_header(&topo, remote_shard, 5, std::slice::from_ref(&remote_wave));
+        assert_eq!(
+            state.expected_exec_certs.len(),
+            1,
+            "expectation should register for wave targeting local shard"
+        );
+
+        // Simulate an outstanding local cross-shard wave needing shard 1's EC.
+        let local_wave = WaveId::new(ShardGroupId(0), 10, [remote_shard].into_iter().collect());
+        let tx_hash = Hash::from_bytes(b"stuck-cross-shard-tx");
+        let mut participating = BTreeSet::new();
+        participating.insert(ShardGroupId(0));
+        participating.insert(remote_shard);
+        state.wave_certificate_trackers.insert(
+            local_wave.clone(),
+            WaveCertificateTracker::new(local_wave.clone(), vec![(tx_hash, participating)], 10),
+        );
+
+        // Advance local committed_height well past the former 100-block cap.
+        state.committed_height = 500;
+        let actions = state.check_exec_cert_timeouts(&topo);
+
+        assert_eq!(
+            state.expected_exec_certs.len(),
+            1,
+            "expectation must survive age pruning while a local tracker still needs shard 1"
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::RequestMissingExecutionCert { .. })),
+            "fallback fetch must keep firing while the expectation is retained"
+        );
+
+        // Once the local tracker resolves (simulating finalize_wave), the
+        // expectation is no longer needed and gets pruned.
+        state.wave_certificate_trackers.remove(&local_wave);
+        state.committed_height = 600;
+        let _ = state.check_exec_cert_timeouts(&topo);
+        assert!(
+            state.expected_exec_certs.is_empty(),
+            "expectation must be pruned once no tracker needs the source shard"
+        );
     }
 }
