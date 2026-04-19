@@ -1195,6 +1195,10 @@ impl MetricsRecorder for PrometheusRecorder {
             .set(m.exec_early_wave_attestations as f64);
         self.metrics
             .memory_exec
+            .with_label_values(&["pending_routing"])
+            .set(m.exec_pending_routing as f64);
+        self.metrics
+            .memory_exec
             .with_label_values(&["early_committed_provisions"])
             .set(m.exec_early_committed_provisions as f64);
         self.metrics

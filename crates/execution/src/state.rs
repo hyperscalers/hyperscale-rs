@@ -91,6 +91,7 @@ pub struct ExecutionMemoryStats {
     pub pending_wave_receipts: usize,
     pub early_execution_results: usize,
     pub early_wave_attestations: usize,
+    pub pending_routing: usize,
     pub early_committed_provisions: usize,
     pub fulfilled_exec_certs: usize,
 }
@@ -193,6 +194,13 @@ pub struct ExecutionState {
     /// Multiple tx_hash entries may reference the same Arc<EC> (one EC covers many txs).
     early_wave_attestations: HashMap<Hash, Vec<Arc<ExecutionCertificate>>>,
 
+    /// Per-EC bookkeeping for buffered ECs in `early_wave_attestations`.
+    /// Tracks the set of tx_hashes still awaiting a local wave assignment.
+    /// When the set drains to empty, the EC has been fully routed and the
+    /// entry is dropped. Also drives height-based GC for ECs whose txs
+    /// never land locally (orphans, malicious tx_hashes).
+    pending_routing: HashMap<WaveId, BufferedEc>,
+
     /// Provisions from committed batches whose transactions haven't been committed yet.
     /// Maps tx_hash -> set of source shards that have sent provisions.
     /// Replayed in `start_cross_shard_execution` when the tx block commits.
@@ -218,6 +226,19 @@ impl Default for ExecutionState {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Bookkeeping for an EC buffered in `early_wave_attestations`.
+///
+/// Holds a single owning reference to the EC plus the set of tx_hashes from
+/// `tx_outcomes` that haven't been routed to a local wave tracker yet. As
+/// each unrouted tx eventually lands in a local block, the tx_hash is
+/// removed from `pending_txs`; when the set drains to empty the EC has
+/// been fully routed and the entry is dropped.
+#[derive(Debug)]
+struct BufferedEc {
+    ec: Arc<ExecutionCertificate>,
+    pending_txs: HashSet<Hash>,
 }
 
 /// Tracks an expected execution certificate that hasn't arrived yet.
@@ -246,6 +267,13 @@ const VOTE_RETRY_BLOCKS: u64 = 5;
 /// detector's memory and per-block iteration cost (see
 /// `ConflictDetector::prune_provisions_older_than`).
 const CONFLICT_PROVISION_RETENTION_BLOCKS: u64 = 50;
+
+/// Maximum age (in local committed blocks past the EC's source block height)
+/// before a buffered EC is considered stale and evicted. Bounds the leak from
+/// ECs whose tx_hashes never land in a local block (orphaned txs, malicious
+/// or buggy remotes referencing tx_hashes our shard will never see).
+/// Sized well above the longest plausible cross-shard inclusion lag.
+const EC_BUFFER_RETENTION_BLOCKS: u64 = 200;
 
 /// Tracks a pending vote sent to a wave leader, for retry on timeout.
 ///
@@ -288,6 +316,7 @@ impl ExecutionState {
             early_execution_results: HashMap::new(),
             verified_provisions: HashMap::new(),
             early_wave_attestations: HashMap::new(),
+            pending_routing: HashMap::new(),
             early_committed_provisions: HashMap::new(),
             required_provision_shards: HashMap::new(),
             received_provision_shards: HashMap::new(),
@@ -1184,12 +1213,8 @@ impl ExecutionState {
         if !has_any_tracker {
             // No tracker yet — buffer by tx_hash for targeted replay when block commits
             let ec_arc = Arc::new(cert);
-            for outcome in &ec_arc.tx_outcomes {
-                self.early_wave_attestations
-                    .entry(outcome.tx_hash)
-                    .or_default()
-                    .push(Arc::clone(&ec_arc));
-            }
+            let tx_hashes: Vec<Hash> = ec_arc.tx_outcomes.iter().map(|o| o.tx_hash).collect();
+            self.buffer_ec(&ec_arc, &tx_hashes);
             return vec![];
         }
 
@@ -1264,12 +1289,8 @@ impl ExecutionState {
             actions.extend(self.handle_wave_attestation(topology, ec_arc));
         } else {
             // Buffer by tx_hash for targeted replay when block commits
-            for outcome in &ec_arc.tx_outcomes {
-                self.early_wave_attestations
-                    .entry(outcome.tx_hash)
-                    .or_default()
-                    .push(Arc::clone(&ec_arc));
-            }
+            let tx_hashes: Vec<Hash> = ec_arc.tx_outcomes.iter().map(|o| o.tx_hash).collect();
+            self.buffer_ec(&ec_arc, &tx_hashes);
         }
 
         actions
@@ -1483,6 +1504,11 @@ impl ExecutionState {
         // up on terminal state — never by block-count timeout.
         self.prune_execution_state();
 
+        // Drop buffered ECs whose source block height is too far behind the
+        // local committed height — covers tx_hashes that will never land
+        // locally (orphaned txs, malicious tx_hashes from remote shards).
+        self.prune_stale_buffered_ecs();
+
         // Drop conflict-detector entries for remote provisions older than the
         // retention window. `register_tx` iterates over these per cross-shard
         // tx; left unbounded they drive quadratic TPS decay.
@@ -1678,6 +1704,86 @@ impl ExecutionState {
     // Phase 5: Finalization
     // ═══════════════════════════════════════════════════════════════════════════
 
+    /// Buffer an EC under tx_hashes that don't have a local wave assignment yet.
+    ///
+    /// Idempotent: tx_hashes already tracked in `pending_routing[ec.wave_id]`
+    /// are skipped, so replaying an already-buffered EC won't create duplicate
+    /// entries in `early_wave_attestations`.
+    fn buffer_ec(&mut self, ec: &Arc<ExecutionCertificate>, tx_hashes: &[Hash]) {
+        if tx_hashes.is_empty() {
+            return;
+        }
+        let entry = self
+            .pending_routing
+            .entry(ec.wave_id.clone())
+            .or_insert_with(|| BufferedEc {
+                ec: Arc::clone(ec),
+                pending_txs: HashSet::new(),
+            });
+        for tx_hash in tx_hashes {
+            if entry.pending_txs.insert(*tx_hash) {
+                self.early_wave_attestations
+                    .entry(*tx_hash)
+                    .or_default()
+                    .push(Arc::clone(ec));
+            }
+        }
+    }
+
+    /// Mark `tx_hashes` as routed for `ec`. When the pending set drains to
+    /// empty the EC has been fully delivered to local trackers and the
+    /// bookkeeping entry is dropped.
+    fn clear_routed_txs(&mut self, ec: &Arc<ExecutionCertificate>, tx_hashes: &[Hash]) {
+        let Some(entry) = self.pending_routing.get_mut(&ec.wave_id) else {
+            return;
+        };
+        for tx_hash in tx_hashes {
+            entry.pending_txs.remove(tx_hash);
+        }
+        if entry.pending_txs.is_empty() {
+            self.pending_routing.remove(&ec.wave_id);
+        }
+    }
+
+    /// Drop buffered ECs whose source wave is older than
+    /// `EC_BUFFER_RETENTION_BLOCKS` behind the local committed height.
+    /// Covers the leak from tx_hashes that never land in a local block
+    /// (orphaned txs, malicious or buggy remotes referencing unknown txs).
+    fn prune_stale_buffered_ecs(&mut self) {
+        if self.committed_height < EC_BUFFER_RETENTION_BLOCKS {
+            return;
+        }
+        let cutoff = self.committed_height - EC_BUFFER_RETENTION_BLOCKS;
+        let stale: Vec<WaveId> = self
+            .pending_routing
+            .iter()
+            .filter(|(wid, _)| wid.block_height <= cutoff)
+            .map(|(wid, _)| wid.clone())
+            .collect();
+        if stale.is_empty() {
+            return;
+        }
+        let count = stale.len();
+        for wid in stale {
+            let Some(entry) = self.pending_routing.remove(&wid) else {
+                continue;
+            };
+            for tx_hash in &entry.pending_txs {
+                if let Some(vec) = self.early_wave_attestations.get_mut(tx_hash) {
+                    vec.retain(|e| !Arc::ptr_eq(e, &entry.ec));
+                    if vec.is_empty() {
+                        self.early_wave_attestations.remove(tx_hash);
+                    }
+                }
+            }
+        }
+        tracing::debug!(
+            count,
+            committed_height = self.committed_height,
+            "Pruned stale buffered ECs"
+        );
+    }
+
     /// Handle a wave-level attestation (execution certificate) from any shard.
     ///
     /// A remote EC's wave_id reflects the remote shard's wave decomposition,
@@ -1685,26 +1791,29 @@ impl ExecutionState {
     /// outcomes for transactions in MULTIPLE local waves.
     ///
     /// Routing: iterate tx_outcomes → look up local wave via wave_assignments →
-    /// feed the EC to each affected local wave tracker.
+    /// feed the EC to each affected local wave tracker. Tx_hashes without a
+    /// local assignment are buffered (or kept buffered) via `pending_routing`
+    /// until their blocks commit; routed tx_hashes are cleared from the
+    /// pending set, dropping the EC entirely once fully routed.
     fn handle_wave_attestation(
         &mut self,
         _topology: &TopologySnapshot,
         ec: Arc<ExecutionCertificate>,
     ) -> Vec<Action> {
-        // Find all local waves affected by this EC's tx_outcomes.
-        // Buffer EC under unrouted tx_hashes so it's replayed when their blocks commit.
         let mut affected_waves: BTreeSet<WaveId> = BTreeSet::new();
+        let mut routed_tx_hashes: Vec<Hash> = Vec::new();
+        let mut unrouted_tx_hashes: Vec<Hash> = Vec::new();
         for outcome in &ec.tx_outcomes {
             if let Some(local_wave_id) = self.wave_assignments.get(&outcome.tx_hash) {
                 affected_waves.insert(local_wave_id.clone());
+                routed_tx_hashes.push(outcome.tx_hash);
             } else {
-                // Tx doesn't have a wave assignment yet — buffer for replay.
-                self.early_wave_attestations
-                    .entry(outcome.tx_hash)
-                    .or_default()
-                    .push(Arc::clone(&ec));
+                unrouted_tx_hashes.push(outcome.tx_hash);
             }
         }
+
+        self.clear_routed_txs(&ec, &routed_tx_hashes);
+        self.buffer_ec(&ec, &unrouted_tx_hashes);
 
         if affected_waves.is_empty() {
             return vec![];
@@ -2141,6 +2250,7 @@ impl ExecutionState {
             pending_wave_receipts: self.pending_wave_receipts.len(),
             early_execution_results: self.early_execution_results.len(),
             early_wave_attestations: self.early_wave_attestations.len(),
+            pending_routing: self.pending_routing.len(),
             early_committed_provisions: self.early_committed_provisions.len(),
             fulfilled_exec_certs: self.fulfilled_exec_certs.len(),
         }

@@ -1115,6 +1115,7 @@ where
                 exec_pending_wave_receipts: exec_mem.pending_wave_receipts,
                 exec_early_execution_results: exec_mem.early_execution_results,
                 exec_early_wave_attestations: exec_mem.early_wave_attestations,
+                exec_pending_routing: exec_mem.pending_routing,
                 exec_early_committed_provisions: exec_mem.early_committed_provisions,
                 exec_fulfilled_exec_certs: exec_mem.fulfilled_exec_certs,
                 // Mempool

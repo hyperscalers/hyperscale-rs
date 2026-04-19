@@ -123,6 +123,8 @@ pub struct MemoryMetrics {
     pub exec_early_execution_results: usize,
     /// Wave attestations that arrived before tracking.
     pub exec_early_wave_attestations: usize,
+    /// Buffered ECs awaiting full routing to local wave trackers.
+    pub exec_pending_routing: usize,
     /// Committed provisions that arrived before tracking.
     pub exec_early_committed_provisions: usize,
     /// Fulfilled execution certificates from remote shards.
