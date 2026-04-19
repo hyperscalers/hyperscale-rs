@@ -474,8 +474,18 @@ where
         let block_hash = block.hash();
         let height = block.header.height;
 
-        // Race guard: skip if already persisted (consensus path got there first).
-        if height.0 <= self.persisted_height {
+        // Race guard: skip if already persisted (consensus path got there first),
+        // or already prepared and queued for persist. The latter catches the
+        // window between consensus-path prepare and RocksDB fsync — without it,
+        // recomputing JMT here can produce a transient root mismatch and trip
+        // the byzantine-detection assert below on a self-inflicted race.
+        if height.0 <= self.persisted_height
+            || self
+                .prepared_commits
+                .lock()
+                .unwrap()
+                .contains_key(&block_hash)
+        {
             return;
         }
 
