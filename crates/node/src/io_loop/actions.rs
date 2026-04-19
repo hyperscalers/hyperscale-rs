@@ -474,68 +474,97 @@ where
         let block_hash = block.hash();
         let height = block.header.height;
 
-        // Race guard: skip if already persisted (consensus path got there first).
+        // Hard skip only if already persisted (consensus path got all the
+        // way through). We must still enqueue blocks whose `prepared_commits`
+        // entry was populated by the consensus path but that never had
+        // `BlockReadyToCommit` fire — e.g. a self-proposed block whose
+        // child arrived via sync rather than consensus, so the 2-chain
+        // commit rule never triggered. Dropping the block here leaves its
+        // prepared commit orphaned in the cache, and the next block to
+        // reach `flush_block_commits` trips the strict ordering assert
+        // in `commit_block_inner` because its parent was never applied.
         if height.0 <= self.persisted_height {
             return;
         }
 
-        // Build view anchored at parent — includes prior synced blocks'
-        // JMT snapshots so chained verification can find parent nodes.
-        let view = self.pending_chain.view_at(block.header.parent_hash);
-        let pending_snapshots = view.pending_snapshots().to_vec();
-
-        // Inline JMT computation (no commit_lock — only reads).
-        let finalized_waves: Vec<Arc<hyperscale_types::FinalizedWave>> = block.certificates.clone();
-        let (computed_root, prepared) = view.prepare_block_commit(
-            parent_state_root,
-            parent_block_height,
-            &finalized_waves,
-            height.0,
-            &pending_snapshots,
-            // `None` → the view drains its own base-read cache internally.
-            None,
-        );
-
-        // Byzantine detection: state root mismatch is fatal.
-        assert_eq!(
-            computed_root, block.header.state_root,
-            "State root mismatch for synced block at height {}",
-            height.0
-        );
-
-        // Insert JMT snapshot into PendingChain so child blocks'
-        // VerifyStateRoot can find this block's tree nodes via the overlay.
-        let jmt_snapshot = Arc::new(S::jmt_snapshot(&prepared).clone());
-        let receipts: Vec<Arc<hyperscale_types::LocalReceipt>> = finalized_waves
-            .iter()
-            .flat_map(|fw| fw.receipts.iter())
-            .map(|b| Arc::clone(&b.local_receipt))
-            .collect();
-        self.pending_chain.insert(
-            block_hash,
-            hyperscale_storage::ChainEntry {
-                parent_hash: block.header.parent_hash,
-                height: height.0,
-                receipts,
-                jmt_snapshot,
-            },
-        );
-
-        // Store PreparedCommit for flush_block_commits.
-        self.prepared_commits
+        // If the consensus path already produced the prepared commit
+        // (VerifyStateRoot/ExecuteTransactions), reuse it — recomputing JMT
+        // here can produce a transient root mismatch and trip the
+        // byzantine-detection assert below on a self-inflicted race.
+        let already_prepared = self
+            .prepared_commits
             .lock()
             .unwrap()
-            .insert(block_hash, (height.0, prepared));
+            .contains_key(&block_hash);
 
-        debug!(
-            height = height.0,
-            ?block_hash,
-            "Synced block prepared, queued for persist"
-        );
+        if !already_prepared {
+            // Build view anchored at parent — includes prior synced blocks'
+            // JMT snapshots so chained verification can find parent nodes.
+            let view = self.pending_chain.view_at(block.header.parent_hash);
+            let pending_snapshots = view.pending_snapshots().to_vec();
+
+            // Inline JMT computation (no commit_lock — only reads).
+            let finalized_waves: Vec<Arc<hyperscale_types::FinalizedWave>> =
+                block.certificates.clone();
+            let (computed_root, prepared) = view.prepare_block_commit(
+                parent_state_root,
+                parent_block_height,
+                &finalized_waves,
+                height.0,
+                &pending_snapshots,
+                // `None` → the view drains its own base-read cache internally.
+                None,
+            );
+
+            // Byzantine detection: state root mismatch is fatal.
+            assert_eq!(
+                computed_root, block.header.state_root,
+                "State root mismatch for synced block at height {}",
+                height.0
+            );
+
+            // Insert JMT snapshot into PendingChain so child blocks'
+            // VerifyStateRoot can find this block's tree nodes via the overlay.
+            let jmt_snapshot = Arc::new(S::jmt_snapshot(&prepared).clone());
+            let receipts: Vec<Arc<hyperscale_types::LocalReceipt>> = finalized_waves
+                .iter()
+                .flat_map(|fw| fw.receipts.iter())
+                .map(|b| Arc::clone(&b.local_receipt))
+                .collect();
+            self.pending_chain.insert(
+                block_hash,
+                hyperscale_storage::ChainEntry {
+                    parent_hash: block.header.parent_hash,
+                    height: height.0,
+                    receipts,
+                    jmt_snapshot,
+                },
+            );
+
+            // Store PreparedCommit for flush_block_commits.
+            self.prepared_commits
+                .lock()
+                .unwrap()
+                .insert(block_hash, (height.0, prepared));
+
+            debug!(
+                height = height.0,
+                ?block_hash,
+                "Synced block prepared, queued for persist"
+            );
+        } else {
+            debug!(
+                height = height.0,
+                ?block_hash,
+                "Reusing prepared commit from consensus path"
+            );
+        }
 
         // Feed into the standard commit pipeline — accumulate_block_commit
         // fires BlockCommitted immediately, flush_block_commits batches the
-        // RocksDB write with a single fsync.
+        // RocksDB write with a single fsync. `accumulate_block_commit`
+        // dedups by block_hash so double-emission (consensus + sync both
+        // reaching commit) is safe.
         self.accumulate_block_commit(super::PendingCommit {
             block: Arc::new(block),
             qc: Arc::new(qc),
@@ -555,6 +584,17 @@ where
 
         // Skip blocks already persisted by the sync path.
         if height.0 <= self.persisted_height {
+            return;
+        }
+
+        // Dedup: consensus and sync paths can both reach commit for the same
+        // block (e.g. self-proposed block whose child arrived via sync). Push
+        // once; the prepared commit is also singular in `prepared_commits`.
+        if self
+            .pending_block_commits
+            .iter()
+            .any(|c| c.block.hash() == block_hash)
+        {
             return;
         }
 
