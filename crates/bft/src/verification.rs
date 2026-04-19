@@ -25,7 +25,11 @@ pub(crate) struct PendingQcVerification {
 /// State root verification that is ready to dispatch (JMT is at the correct root).
 ///
 /// The `NodeStateMachine` drains these after each BFT call and emits
-/// `VerifyStateRoot` actions using the attached `FinalizedWave` data.
+/// `VerifyStateRoot` actions. `parent_state_root` and `finalized_waves` are
+/// resolved at drain time from the current chain/pending-block state, not
+/// captured at `initiate_state_root_verification` time — capturing at initiate
+/// time produced a stale-snapshot race where an entry deferred before its
+/// parent committed would dispatch with the wrong `parent_state_root`.
 #[derive(Debug)]
 pub struct ReadyStateRootVerification {
     pub block_hash: Hash,
@@ -37,6 +41,19 @@ pub struct ReadyStateRootVerification {
     /// Finalized waves from the PendingBlock — these carry the proposer's receipts,
     /// ensuring all validators verify against the same execution outputs.
     pub finalized_waves: Vec<Arc<FinalizedWave>>,
+    pub block_height: u64,
+}
+
+/// Internal queue entry for state root verification. Holds only block identity
+/// — `parent_state_root` and `finalized_waves` are resolved freshly when
+/// `BftState::drain_ready_state_root_verifications` converts this into the
+/// public `ReadyStateRootVerification`.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingStateRootVerification {
+    pub block_hash: Hash,
+    pub parent_block_hash: Hash,
+    pub parent_block_height: u64,
+    pub expected_root: Hash,
     pub block_height: u64,
 }
 
@@ -67,7 +84,7 @@ pub(crate) struct VerificationPipeline {
 
     /// Blocks waiting for their parent's tree nodes to become available (via
     /// commit or prior verification). Keyed by parent_block_hash.
-    deferred_state_root_verifications: HashMap<Hash, Vec<ReadyStateRootVerification>>,
+    deferred_state_root_verifications: HashMap<Hash, Vec<PendingStateRootVerification>>,
 
     /// Deferred proposal waiting for the parent's tree nodes to become
     /// available. At most one pending at a time (new proposals replace old).
@@ -91,7 +108,7 @@ pub(crate) struct VerificationPipeline {
     /// the parent block, which sees prior unpersisted JMT snapshots so
     /// verification can chain from prior results without waiting for
     /// actual JMT commits.
-    ready_state_root_verifications: Vec<ReadyStateRootVerification>,
+    ready_state_root_verifications: Vec<PendingStateRootVerification>,
 
     /// Set when a deferred proposal's parent tree became available.
     /// Consumed by `take_ready_proposal` which emits `ContentAvailable`
@@ -393,29 +410,24 @@ impl VerificationPipeline {
 
     /// Initiate state root verification for a block.
     ///
-    /// `parent_state_root` is the state root of the parent block (base state).
     /// If JMT is ready, pushes to the ready queue for immediate dispatch.
-    /// Otherwise, queues for later when JMT catches up.
-    ///
-    /// In both cases, the `NodeStateMachine` is responsible for draining
-    /// `ready_state_root_verifications` and computing `merged_updates` from
-    /// the execution cache before emitting the actual `VerifyStateRoot` action.
+    /// Otherwise, queues for later when JMT catches up. Only block identity
+    /// is captured; `parent_state_root` and `finalized_waves` are resolved
+    /// freshly at drain time to avoid stale-snapshot races where an entry
+    /// deferred before its parent committed would dispatch with the wrong
+    /// base state.
     pub fn initiate_state_root_verification(
         &mut self,
         block_hash: Hash,
         block: &Block,
-        parent_state_root: Hash,
         parent_block_height: u64,
-        finalized_waves: Vec<Arc<FinalizedWave>>,
     ) {
         let parent_hash = block.header.parent_hash;
-        let ready = ReadyStateRootVerification {
+        let ready = PendingStateRootVerification {
             block_hash,
             parent_block_hash: parent_hash,
-            parent_state_root,
             parent_block_height,
             expected_root: block.header.state_root,
-            finalized_waves,
             block_height: block.header.height.0,
         };
 
@@ -825,9 +837,12 @@ impl VerificationPipeline {
 
     /// Drain state root verifications that are ready to dispatch.
     ///
-    /// The caller (`NodeStateMachine`) computes `merged_updates` from the
-    /// execution cache for each verification and emits the `VerifyStateRoot` action.
-    pub fn drain_ready_state_root_verifications(&mut self) -> Vec<ReadyStateRootVerification> {
+    /// Returns entries holding only block identity — `BftState` enriches each
+    /// one with a fresh `parent_state_root` and `finalized_waves` snapshot
+    /// before constructing the public `ReadyStateRootVerification`.
+    pub(crate) fn drain_ready_state_root_verifications(
+        &mut self,
+    ) -> Vec<PendingStateRootVerification> {
         std::mem::take(&mut self.ready_state_root_verifications)
     }
 

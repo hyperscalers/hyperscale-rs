@@ -2019,22 +2019,16 @@ impl BftState {
 
                 // Verify state root if block has committed certificates.
                 // The verification pipeline queues the request; NodeStateMachine
-                // will drain and emit VerifyStateRoot actions.
+                // will drain and emit VerifyStateRoot actions. The drain
+                // wrapper resolves `parent_state_root` and `finalized_waves`
+                // freshly from the chain/pending-block state at that time,
+                // so we don't capture them here.
                 if self.verification.needs_state_root_verification(&block) {
-                    let parent_state_root = self.parent_state_root(block.header.parent_hash);
                     let parent_block_height = block.header.parent_qc.height.0;
-                    // Use manifest order (block.certificates) — not pending.finalized_waves()
-                    // which iterates a BTreeMap keyed by wave_id_hash. The JMT's
-                    // BTreeMap-collapse over work_items is last-writer-wins for
-                    // duplicate storage keys, so wave order must match the proposer's
-                    // (block_height-sorted, recorded in the manifest).
-                    let finalized_waves = block.certificates.clone();
                     self.verification.initiate_state_root_verification(
                         block_hash,
                         &block,
-                        parent_state_root,
                         parent_block_height,
-                        finalized_waves,
                     );
                 }
 
@@ -4471,10 +4465,39 @@ impl BftState {
     // ═══════════════════════════════════════════════════════════════════════════
 
     /// Drain state root verifications that are ready to dispatch.
+    ///
+    /// Each drained entry is enriched here (not at `initiate_*` time) with a
+    /// fresh `parent_state_root` and `finalized_waves` snapshot. Capturing
+    /// these at initiate time produced a stale-snapshot race: an entry
+    /// deferred before its parent committed would still hold the
+    /// pre-commit `parent_state_root` (committed_state_root fallback when
+    /// the parent header wasn't in the index yet), causing the dispatched
+    /// verification to compute against the grandparent's base state.
     pub fn drain_ready_state_root_verifications(
         &mut self,
     ) -> Vec<crate::verification::ReadyStateRootVerification> {
-        self.verification.drain_ready_state_root_verifications()
+        self.verification
+            .drain_ready_state_root_verifications()
+            .into_iter()
+            .map(|pending| {
+                let parent_state_root = self.parent_state_root(pending.parent_block_hash);
+                let finalized_waves = self
+                    .pending_blocks
+                    .get(&pending.block_hash)
+                    .and_then(|pb| pb.block())
+                    .map(|b| b.certificates.clone())
+                    .unwrap_or_default();
+                crate::verification::ReadyStateRootVerification {
+                    block_hash: pending.block_hash,
+                    parent_block_hash: pending.parent_block_hash,
+                    parent_state_root,
+                    parent_block_height: pending.parent_block_height,
+                    expected_root: pending.expected_root,
+                    finalized_waves,
+                    block_height: pending.block_height,
+                }
+            })
+            .collect()
     }
 
     /// Check whether a deferred proposal was unblocked and should be retried.
