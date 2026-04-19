@@ -42,8 +42,9 @@ pub struct PendingBlock {
     /// Set of wave_id hashes we're still waiting for.
     missing_wave_hashes: HashSet<Hash>,
 
-    /// Received provision batches keyed by batch hash.
-    received_provisions: HashMap<Hash, Arc<Provision>>,
+    /// Received provision batches keyed by batch hash. BTreeMap so
+    /// `provisions()` iteration is deterministic across validators.
+    received_provisions: BTreeMap<Hash, Arc<Provision>>,
 
     /// Set of provision batch hashes we're still waiting for.
     missing_provision_hashes: HashSet<Hash>,
@@ -68,7 +69,7 @@ impl PendingBlock {
             missing_transaction_hashes,
             received_waves: BTreeMap::new(),
             missing_wave_hashes,
-            received_provisions: HashMap::with_capacity(manifest.provision_hashes.len()),
+            received_provisions: BTreeMap::new(),
             missing_provision_hashes,
             manifest,
             constructed_block: None,
@@ -90,8 +91,7 @@ impl PendingBlock {
         provision_hashes.sort();
         let mut manifest = BlockManifest::from_block(block);
         manifest.provision_hashes = provision_hashes;
-        let mut received_provisions: HashMap<Hash, Arc<Provision>> =
-            HashMap::with_capacity(provisions.len());
+        let mut received_provisions: BTreeMap<Hash, Arc<Provision>> = BTreeMap::new();
         for batch in provisions {
             received_provisions.insert(batch.hash(), batch);
         }

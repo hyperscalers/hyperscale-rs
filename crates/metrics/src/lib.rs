@@ -93,16 +93,12 @@ pub struct MemoryMetrics {
     pub exec_cache_entries: usize,
     /// Wave certificates ready for block inclusion.
     pub exec_finalized_wave_certificates: usize,
-    /// Transactions waiting for provisioning.
-    pub exec_pending_provisioning: usize,
-    /// Per-tx results collection per wave.
-    pub exec_accumulators: usize,
+    /// Active wave states (per-wave execution + finalization tracking).
+    pub exec_waves: usize,
     /// Execution votes collection per wave.
     pub exec_vote_trackers: usize,
     /// Votes that arrived before tracking started.
     pub exec_early_votes: usize,
-    /// Wave-level finalization trackers.
-    pub exec_wave_certificate_trackers: usize,
     /// Expected execution certificates from remote shards.
     pub exec_expected_exec_certs: usize,
     /// Verified state provisions per transaction.
@@ -117,16 +113,10 @@ pub struct MemoryMetrics {
     pub exec_pending_vote_retries: usize,
     /// Transaction to wave assignment mapping.
     pub exec_wave_assignments: usize,
-    /// Waves waiting for receipt data.
-    pub exec_pending_wave_receipts: usize,
-    /// Execution results that arrived before wave tracking.
-    pub exec_early_execution_results: usize,
     /// Wave attestations that arrived before tracking.
     pub exec_early_wave_attestations: usize,
     /// Buffered ECs awaiting full routing to local wave trackers.
     pub exec_pending_routing: usize,
-    /// Committed provisions that arrived before tracking.
-    pub exec_early_committed_provisions: usize,
     /// Fulfilled execution certificates from remote shards.
     pub exec_fulfilled_exec_certs: usize,
 

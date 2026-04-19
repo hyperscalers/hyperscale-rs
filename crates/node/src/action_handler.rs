@@ -556,6 +556,7 @@ pub(crate) fn handle_delegated_action<
         // --- Transaction execution ---
         // The returned event is ExecutionBatchCompleted with results and tx_outcomes.
         Action::ExecuteTransactions {
+            wave_id,
             block_hash: _,
             transactions,
             state_root: _,
@@ -602,6 +603,7 @@ pub(crate) fn handle_delegated_action<
             Some(DelegatedResult {
                 events: vec![NodeInput::Protocol(
                     ProtocolEvent::ExecutionBatchCompleted {
+                        wave_id,
                         results,
                         tx_outcomes,
                     },
@@ -612,6 +614,7 @@ pub(crate) fn handle_delegated_action<
 
         // --- Cross-shard transaction execution ---
         Action::ExecuteCrossShardTransactions {
+            wave_id,
             block_hash: _,
             requests,
         } => {
@@ -655,6 +658,7 @@ pub(crate) fn handle_delegated_action<
             Some(DelegatedResult {
                 events: vec![NodeInput::Protocol(
                     ProtocolEvent::ExecutionBatchCompleted {
+                        wave_id,
                         results,
                         tx_outcomes,
                     },

@@ -351,7 +351,6 @@ impl NodeStateMachine {
             self.bft.remove_committed_transaction(&cert_hash);
         }
 
-        // Pass all transactions from block to execution (no need for mempool lookup).
         let all_txs = block.transactions.clone();
         actions.extend(self.execution.on_block_committed(
             self.topology.snapshot(),
@@ -360,6 +359,7 @@ impl NodeStateMachine {
             block.header.timestamp,
             block.header.proposer,
             all_txs,
+            &provisions,
         ));
 
         // Mempool: marks Pending → Committed for block.transactions, then drives
@@ -375,21 +375,6 @@ impl NodeStateMachine {
             self.remote_headers
                 .on_block_committed(self.topology.snapshot()),
         );
-
-        // Apply committed provisions deterministically. Provision batches are
-        // carried inline by `CommitBlock`/`BlockCommitted` (populated from
-        // `PendingBlock.received_provisions` on the consensus path). No
-        // lookup-by-hash against the ProvisionCoordinator — the data arrives
-        // with the event, which eliminates the silent-drop failure mode when
-        // the coordinator's cache doesn't have a batch.
-        if !provisions.is_empty() {
-            actions.extend(self.execution.apply_committed_provisions(
-                self.topology.snapshot(),
-                &provisions,
-                height,
-                block_hash,
-            ));
-        }
 
         // Let provisions coordinator handle cleanup + fallback timeouts.
         let provision_hashes: Vec<Hash> = provisions.iter().map(|p| p.hash()).collect();
@@ -434,16 +419,6 @@ impl NodeStateMachine {
         }
 
         actions
-    }
-
-    fn on_transaction_provisioned(&mut self, tx_hash: Hash) -> Vec<Action> {
-        self.mempool.on_transaction_provisioned(tx_hash);
-        vec![]
-    }
-
-    fn on_wave_ready(&mut self, tx_hashes: Vec<Hash>) -> Vec<Action> {
-        self.mempool.on_wave_ready(&tx_hashes);
-        vec![]
     }
 
     fn on_ec_created(&mut self, tx_hashes: Vec<Hash>) -> Vec<Action> {
@@ -653,15 +628,14 @@ impl StateMachine for NodeStateMachine {
 
             // ── Execution ────────────────────────────────────────────────
             ProtocolEvent::ExecutionBatchCompleted {
+                wave_id,
                 results,
                 tx_outcomes,
             } => {
-                let mut actions = self
-                    .execution
-                    .on_execution_batch_completed(results, tx_outcomes);
+                self.execution
+                    .on_execution_batch_completed(wave_id, results, tx_outcomes);
                 // Execution results gate vote emission — re-scan.
-                actions.extend(self.execution.emit_vote_actions(self.topology.snapshot()));
-                actions
+                self.execution.emit_vote_actions(self.topology.snapshot())
             }
 
             // ── Wave Execution (wave-based voting) ────────────────────────
@@ -704,10 +678,6 @@ impl StateMachine for NodeStateMachine {
             ProtocolEvent::TransactionExecuted { tx_hash, accepted } => {
                 self.on_transaction_executed(tx_hash, accepted)
             }
-            ProtocolEvent::TransactionProvisioned { tx_hash } => {
-                self.on_transaction_provisioned(tx_hash)
-            }
-            ProtocolEvent::WaveReady { tx_hashes } => self.on_wave_ready(tx_hashes),
             ProtocolEvent::ExecutionCertificateCreated { tx_hashes } => {
                 self.on_ec_created(tx_hashes)
             }

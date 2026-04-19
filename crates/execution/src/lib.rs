@@ -8,14 +8,14 @@
 //! - State provisioning
 //! - Vote aggregation and certificate formation
 
-pub mod accumulator;
 pub mod conflict;
 pub mod handlers;
+pub mod wave_state;
 
 mod state;
-mod trackers;
+mod vote_tracker;
 
-pub use accumulator::ExecutionAccumulator;
 pub use hyperscale_types::FinalizedWave;
 pub use state::{CompletionData, ExecutionMemoryStats, ExecutionState};
-pub use trackers::{VoteTracker, WaveCertificateTracker};
+pub use vote_tracker::VoteTracker;
+pub use wave_state::{WaveState, WAVE_TIMEOUT_BLOCKS};

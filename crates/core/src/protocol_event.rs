@@ -189,14 +189,18 @@ pub enum ProtocolEvent {
     // ═══════════════════════════════════════════════════════════════════════
     // Execution
     // ═══════════════════════════════════════════════════════════════════════
-    /// Batch of execution results from an ExecuteTransactions dispatch.
+    /// Batch of execution results from an ExecuteTransactions / ExecuteCrossShardTransactions dispatch.
     ///
     /// Results carry the full execution output (DatabaseUpdates, receipts) — stays local.
+    /// Every result in this batch belongs to `wave_id`; the wave gets exactly
+    /// one `ExecutionBatchCompleted` and no further results arrive for it.
     ///
     /// The state machine uses results to:
     /// 1. Store pending execution updates (co-located with TC at finalization)
     /// 2. Store receipts in receipt_cache for later finalized wave assembly
     ExecutionBatchCompleted {
+        /// The wave whose execution produced these results.
+        wave_id: WaveId,
         results: Vec<hyperscale_types::LocalExecutionEntry>,
         /// Per-tx outcomes extracted on the handler thread for vote signing.
         tx_outcomes: Vec<TxOutcome>,
@@ -239,12 +243,6 @@ pub enum ProtocolEvent {
     /// A transaction's execution outcome has been resolved and certificate finalized.
     /// Used for per-tx mempool status updates.
     TransactionExecuted { tx_hash: Hash, accepted: bool },
-
-    /// A cross-shard transaction's provisions have arrived.
-    TransactionProvisioned { tx_hash: Hash },
-
-    /// All transactions in a wave are ready (all provisioned or timed out).
-    WaveReady { tx_hashes: Vec<Hash> },
 
     /// Local execution certificate created for a wave (local votes aggregated).
     ExecutionCertificateCreated { tx_hashes: Vec<Hash> },
@@ -421,8 +419,6 @@ impl ProtocolEvent {
             // Mempool / Transactions
             ProtocolEvent::TransactionGossipReceived { .. } => "TransactionGossipReceived",
             ProtocolEvent::TransactionExecuted { .. } => "TransactionExecuted",
-            ProtocolEvent::TransactionProvisioned { .. } => "TransactionProvisioned",
-            ProtocolEvent::WaveReady { .. } => "WaveReady",
             ProtocolEvent::ExecutionCertificateCreated { .. } => "ExecutionCertificateCreated",
             ProtocolEvent::WaveCompleted { .. } => "WaveCompleted",
 

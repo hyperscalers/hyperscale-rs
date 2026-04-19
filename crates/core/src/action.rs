@@ -517,11 +517,15 @@ pub enum Action {
         finalized_tx_count: u32,
     },
 
-    /// Execute a batch of single-shard transactions.
+    /// Execute every transaction in a single-shard wave.
     ///
     /// Delegated to the engine thread pool in production, instant in simulation.
-    /// Returns `ProtocolEvent::ExecutionBatchCompleted` with all votes when complete.
+    /// Returns `ProtocolEvent::ExecutionBatchCompleted` carrying `wave_id` so the
+    /// state machine can route results back to the correct wave.
     ExecuteTransactions {
+        /// The wave whose txs are being executed. Single-shard waves have
+        /// `remote_shards = {}`; they dispatch immediately at `on_block_committed`.
+        wave_id: WaveId,
         /// The committed block whose transactions are being executed.
         /// Anchors state reads via `PendingChain::view_at`.
         block_hash: Hash,
@@ -529,18 +533,21 @@ pub enum Action {
         state_root: Hash,
     },
 
-    /// Execute a batch of cross-shard transactions with provisioned state.
+    /// Execute every transaction in a cross-shard wave, once all its txs are fully provisioned.
     ///
-    /// Used after cross-shard provisioning completes. The state machine batches
-    /// all ready transactions and emits a single action for parallel execution.
-    /// Returns `ProtocolEvent::ExecutionBatchCompleted` when complete.
+    /// Fired the moment a wave transitions from partially-provisioned to
+    /// fully-provisioned (or at block commit if all provisions arrived
+    /// early). All txs in the wave are dispatched together.
+    /// Returns `ProtocolEvent::ExecutionBatchCompleted` carrying `wave_id`.
     ExecuteCrossShardTransactions {
+        /// The wave being executed.
+        wave_id: WaveId,
         /// The committed block whose processing kicked off this execution
         /// (either the block carrying the txs, or the block whose committed
         /// provisions unblocked them). Anchors state reads via
         /// `PendingChain::view_at`.
         block_hash: Hash,
-        /// The cross-shard execution requests to process.
+        /// The cross-shard execution requests to process (one per tx in the wave).
         requests: Vec<CrossShardExecutionRequest>,
     },
 

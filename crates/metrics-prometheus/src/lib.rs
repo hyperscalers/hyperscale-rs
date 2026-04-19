@@ -1135,12 +1135,8 @@ impl MetricsRecorder for PrometheusRecorder {
             .set(m.exec_finalized_wave_certificates as f64);
         self.metrics
             .memory_exec
-            .with_label_values(&["pending_provisioning"])
-            .set(m.exec_pending_provisioning as f64);
-        self.metrics
-            .memory_exec
-            .with_label_values(&["accumulators"])
-            .set(m.exec_accumulators as f64);
+            .with_label_values(&["waves"])
+            .set(m.exec_waves as f64);
         self.metrics
             .memory_exec
             .with_label_values(&["vote_trackers"])
@@ -1149,10 +1145,6 @@ impl MetricsRecorder for PrometheusRecorder {
             .memory_exec
             .with_label_values(&["early_votes"])
             .set(m.exec_early_votes as f64);
-        self.metrics
-            .memory_exec
-            .with_label_values(&["wave_certificate_trackers"])
-            .set(m.exec_wave_certificate_trackers as f64);
         self.metrics
             .memory_exec
             .with_label_values(&["expected_exec_certs"])
@@ -1183,24 +1175,12 @@ impl MetricsRecorder for PrometheusRecorder {
             .set(m.exec_wave_assignments as f64);
         self.metrics
             .memory_exec
-            .with_label_values(&["pending_wave_receipts"])
-            .set(m.exec_pending_wave_receipts as f64);
-        self.metrics
-            .memory_exec
-            .with_label_values(&["early_execution_results"])
-            .set(m.exec_early_execution_results as f64);
-        self.metrics
-            .memory_exec
             .with_label_values(&["early_wave_attestations"])
             .set(m.exec_early_wave_attestations as f64);
         self.metrics
             .memory_exec
             .with_label_values(&["pending_routing"])
             .set(m.exec_pending_routing as f64);
-        self.metrics
-            .memory_exec
-            .with_label_values(&["early_committed_provisions"])
-            .set(m.exec_early_committed_provisions as f64);
         self.metrics
             .memory_exec
             .with_label_values(&["fulfilled_exec_certs"])
