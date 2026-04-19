@@ -1035,11 +1035,14 @@ impl BftState {
 
         // Sort oldest waves first (by kickoff block_height) so older waves are
         // committed before newer ones when we hit the per-block tx limit.
+        // Tiebreak by wave_id_hash so the manifest order is fully canonical —
+        // verifiers flatten receipts into JMT work_items in manifest order, and
+        // the BTreeMap-collapse there is last-writer-wins for duplicate keys.
         let mut candidate_waves: Vec<_> = finalized_waves
             .into_iter()
             .filter(|fw| !qc_chain_cert_hashes.contains(&fw.wave_id_hash()))
             .collect();
-        candidate_waves.sort_by_key(|fw| fw.wave_id().block_height);
+        candidate_waves.sort_by_key(|fw| (fw.wave_id().block_height, fw.wave_id_hash()));
 
         // Limit by total finalized transaction count across all included waves.
         let max_finalized_txs = self.config.max_finalized_transactions_per_block;
@@ -2020,10 +2023,12 @@ impl BftState {
                 if self.verification.needs_state_root_verification(&block) {
                     let parent_state_root = self.parent_state_root(block.header.parent_hash);
                     let parent_block_height = block.header.parent_qc.height.0;
-                    // Pass the PendingBlock's finalized waves directly — these carry
-                    // the proposer's receipts (fetched via FinalizedWaveFetch), ensuring
-                    // all validators verify against the same execution outputs.
-                    let finalized_waves = pending.finalized_waves();
+                    // Use manifest order (block.certificates) — not pending.finalized_waves()
+                    // which iterates a BTreeMap keyed by wave_id_hash. The JMT's
+                    // BTreeMap-collapse over work_items is last-writer-wins for
+                    // duplicate storage keys, so wave order must match the proposer's
+                    // (block_height-sorted, recorded in the manifest).
+                    let finalized_waves = block.certificates.clone();
                     self.verification.initiate_state_root_verification(
                         block_hash,
                         &block,
@@ -2073,16 +2078,11 @@ impl BftState {
                     .verification
                     .needs_local_receipt_root_verification(&block)
                 {
-                    let receipts = self
-                        .pending_blocks
-                        .get(&block_hash)
-                        .map(|p| {
-                            p.finalized_waves()
-                                .iter()
-                                .flat_map(|fw| fw.receipts.iter().cloned())
-                                .collect()
-                        })
-                        .unwrap_or_default();
+                    let receipts: Vec<_> = block
+                        .certificates
+                        .iter()
+                        .flat_map(|fw| fw.receipts.iter().cloned())
+                        .collect();
                     verification_actions
                         .extend(self.verification.initiate_local_receipt_root_verification(
                             block_hash, &block, receipts,
