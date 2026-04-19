@@ -401,12 +401,13 @@ impl RocksDbStorage {
         write_history: bool,
         base_reads: Option<&hyperscale_storage::BaseReadCache>,
     ) -> ResetOldKeys {
-        use crate::column_families::{StateCf, StateHistoryCf};
-        use crate::typed_cf::{batch_delete, batch_put, multi_get};
+        use crate::column_families::{StaleStateHistoryCf, StateCf, StateHistoryCf};
+        use crate::typed_cf::{batch_delete, batch_put, multi_get, DbCodec};
 
         let cf = self.cf();
         let state_cf = StateCf::handle(&cf);
         let history_cf = StateHistoryCf::handle(&cf);
+        let stale_history_cf = StaleStateHistoryCf::handle(&cf);
 
         // Each update needs its prior value for the state-history entry.
         // Fast path: the view-cache (`base_reads`) already has it from
@@ -548,6 +549,10 @@ impl RocksDbStorage {
         }
 
         // Pass 2: emit history + state batch puts.
+        // Accumulate the raw history keys written so we can record the
+        // stale-set entry for this version in one shot.
+        let history_key_codec = crate::versioned_key::VersionedSubstateKeyCodec;
+        let mut stale_history_keys: Vec<Vec<u8>> = Vec::new();
         for (op, prior_slot) in ops.into_iter().zip(priors) {
             let prior =
                 prior_slot.expect("every op must have a resolved prior (cache hit or fetched)");
@@ -567,12 +572,9 @@ impl RocksDbStorage {
                         continue;
                     }
                     if write_history {
-                        batch_put::<StateHistoryCf>(
-                            batch,
-                            history_cf,
-                            &(state_key.clone(), version),
-                            &prior,
-                        );
+                        let history_key = (state_key.clone(), version);
+                        stale_history_keys.push(history_key_codec.encode(&history_key));
+                        batch_put::<StateHistoryCf>(batch, history_cf, &history_key, &prior);
                     }
                     batch_put::<StateCf>(batch, state_cf, &state_key, new_value);
                 }
@@ -583,16 +585,25 @@ impl RocksDbStorage {
                         continue;
                     }
                     if write_history {
-                        batch_put::<StateHistoryCf>(
-                            batch,
-                            history_cf,
-                            &(state_key.clone(), version),
-                            &prior,
-                        );
+                        let history_key = (state_key.clone(), version);
+                        stale_history_keys.push(history_key_codec.encode(&history_key));
+                        batch_put::<StateHistoryCf>(batch, history_cf, &history_key, &prior);
                     }
                     batch_delete::<StateCf>(batch, state_cf, &state_key);
                 }
             }
+        }
+
+        // Index the history keys by version so GC can delete them without
+        // scanning StateHistoryCf. Skipped when write_history is false
+        // (genesis) — nothing was written.
+        if write_history && !stale_history_keys.is_empty() {
+            batch_put::<StaleStateHistoryCf>(
+                batch,
+                stale_history_cf,
+                &version,
+                &stale_history_keys,
+            );
         }
 
         reset_old_keys

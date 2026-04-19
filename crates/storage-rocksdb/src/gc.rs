@@ -7,7 +7,7 @@
 //!   values, so deleting old history entries only costs the ability to
 //!   serve historical reads beyond the retention window.
 
-use crate::column_families::{JmtNodesCf, StaleJmtNodesCf, StateHistoryCf};
+use crate::column_families::{JmtNodesCf, StaleJmtNodesCf, StaleStateHistoryCf, StateHistoryCf};
 use crate::core::RocksDbStorage;
 use crate::typed_cf::{self, TypedCf};
 
@@ -156,55 +156,43 @@ impl RocksDbStorage {
 
         let cf = self.cf();
         let history_cf = StateHistoryCf::handle(&cf);
+        let stale_history_cf = StaleStateHistoryCf::handle(&cf);
 
-        // `StateHistoryCf` has a 51-byte prefix extractor. Default
-        // iteration with a prefix extractor is undefined across prefix
-        // boundaries — we need `total_order_seek` so `seek_to_first` +
-        // `next` walks the entire CF regardless of prefix groups.
-        let mut read_opts = rocksdb::ReadOptions::default();
-        read_opts.set_total_order_seek(true);
-        let mut iter = self.db.raw_iterator_cf_opt(history_cf, read_opts);
-        iter.seek_to_first();
-
+        // Walk the version-indexed stale set in ascending order — each
+        // entry lists the raw `state_history` keys written at that
+        // version. Stops as soon as we reach a version past the cutoff,
+        // so GC cost is proportional to deletes-needed, not CF size.
         let mut batch = WriteBatch::default();
         let mut deleted = 0;
         let mut lowest_deleted_key: Option<Vec<u8>> = None;
         let mut highest_deleted_key: Option<Vec<u8>> = None;
 
-        const VERSION_LEN: usize = 8;
         const BATCH_FLUSH_THRESHOLD: usize = 10_000;
 
-        while iter.valid() {
-            let raw_key = match iter.key() {
-                Some(k) => k,
-                None => break,
-            };
-
-            if raw_key.len() < VERSION_LEN {
-                iter.next();
-                continue;
+        for (version, history_keys) in
+            typed_cf::iter_all::<StaleStateHistoryCf>(&self.db, stale_history_cf)
+        {
+            if version > cutoff {
+                break;
             }
 
-            let key_len = raw_key.len() - VERSION_LEN;
-            let version = u64::from_be_bytes(raw_key[key_len..].try_into().unwrap());
-
-            if version <= cutoff {
+            for raw_key in &history_keys {
                 if lowest_deleted_key.is_none() {
-                    lowest_deleted_key = Some(raw_key.to_vec());
+                    lowest_deleted_key = Some(raw_key.clone());
                 }
-                highest_deleted_key = Some(raw_key.to_vec());
+                highest_deleted_key = Some(raw_key.clone());
                 batch.delete_cf(history_cf, raw_key);
                 deleted += 1;
-                if deleted % BATCH_FLUSH_THRESHOLD == 0 {
-                    if let Err(e) = self.db.write(std::mem::take(&mut batch)) {
-                        tracing::error!("State-history GC write failed: {}", e);
-                        return deleted;
-                    }
-                    batch = WriteBatch::default();
-                }
             }
+            typed_cf::batch_delete::<StaleStateHistoryCf>(&mut batch, stale_history_cf, &version);
 
-            iter.next();
+            if deleted >= BATCH_FLUSH_THRESHOLD {
+                if let Err(e) = self.db.write(std::mem::take(&mut batch)) {
+                    tracing::error!("State-history GC write failed: {}", e);
+                    return deleted;
+                }
+                batch = WriteBatch::default();
+            }
         }
 
         if !batch.is_empty() {
@@ -220,9 +208,7 @@ impl RocksDbStorage {
         // affected SSTs. Under write-heavy workloads the oldest entries
         // (exactly what GC targets) live in L5-L6 (Zstd tier) which see
         // no natural compaction pressure. Issue a compact_range over
-        // the deleted key span to trigger reclamation. `None` args
-        // would compact the whole CF; we constrain to the actual
-        // tombstoned range.
+        // the deleted key span to trigger reclamation.
         if let (Some(lo), Some(hi)) = (lowest_deleted_key, highest_deleted_key) {
             self.db
                 .compact_range_cf(history_cf, Some(lo.as_slice()), Some(hi.as_slice()));

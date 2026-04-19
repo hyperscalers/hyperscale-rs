@@ -50,6 +50,21 @@ pub(crate) const JMT_NODES_CF: &str = "jmt_nodes";
 /// GC deletes entries older than `current_version - jmt_history_length`.
 pub(crate) const STALE_JMT_NODES_CF: &str = "stale_jmt_nodes";
 
+/// Column family indexing `state_history` entries by their write version so
+/// GC can delete retention-expired history without scanning the whole
+/// `state_history` CF.
+///
+/// Key: `version_BE_8B` — the write_version at which these history entries
+/// were created (one entry per block commit).
+/// Value: SBOR-encoded `Vec<Vec<u8>>` — the list of raw `state_history` keys
+/// (i.e. `storage_key_bytes ++ BE8(version)`) written at that version.
+///
+/// Written alongside every `state_history` entry. GC iterates this CF in
+/// version order (cheap — version-keyed), breaks at `version >= cutoff`, and
+/// issues one `delete_cf` per listed history key plus one for the stale-set
+/// entry itself. Mirrors the `stale_jmt_nodes` pattern.
+pub(crate) const STALE_STATE_HISTORY_CF: &str = "stale_state_history";
+
 /// Column family name for local receipts keyed by tx hash.
 pub(crate) const LOCAL_RECEIPTS_CF: &str = "local_receipts";
 
@@ -77,6 +92,7 @@ pub(crate) const ALL_COLUMN_FAMILIES: &[&str] = &[
     TRANSACTIONS_CF,
     STATE_CF,
     STATE_HISTORY_CF,
+    STALE_STATE_HISTORY_CF,
     CERTIFICATES_CF,
     JMT_NODES_CF,
     STALE_JMT_NODES_CF,
@@ -97,6 +113,7 @@ pub(crate) const ALL_COLUMN_FAMILIES: &[&str] = &[
 pub(crate) struct CfHandles<'a> {
     state: &'a rocksdb::ColumnFamily,
     state_history: &'a rocksdb::ColumnFamily,
+    stale_state_history: &'a rocksdb::ColumnFamily,
     blocks: &'a rocksdb::ColumnFamily,
     transactions: &'a rocksdb::ColumnFamily,
     certificates: &'a rocksdb::ColumnFamily,
@@ -121,6 +138,7 @@ impl<'a> CfHandles<'a> {
         Self {
             state: resolve(STATE_CF),
             state_history: resolve(STATE_HISTORY_CF),
+            stale_state_history: resolve(STALE_STATE_HISTORY_CF),
             blocks: resolve(BLOCKS_CF),
             transactions: resolve(TRANSACTIONS_CF),
             certificates: resolve(CERTIFICATES_CF),
@@ -197,6 +215,22 @@ impl TypedCf for StaleJmtNodesCf {
     type ValueCodec = SborCodec<Vec<crate::jmt_stored::StaleTreePart>>;
     fn handle<'a>(cf: &CfHandles<'a>) -> &'a rocksdb::ColumnFamily {
         cf.stale_jmt_nodes
+    }
+}
+
+/// Version-indexed list of `state_history` keys written at each version.
+/// Enables incremental GC of `state_history` — GC walks this CF in version
+/// order, deletes the listed history keys for each version ≤ cutoff, and
+/// drops the stale-set entry itself. No full `state_history` scan.
+pub(crate) struct StaleStateHistoryCf;
+impl TypedCf for StaleStateHistoryCf {
+    const NAME: &'static str = STALE_STATE_HISTORY_CF;
+    type Key = u64; // write_version
+    type Value = Vec<Vec<u8>>; // raw `state_history` keys (storage_key ++ BE8(version))
+    type KeyCodec = BeU64Codec;
+    type ValueCodec = SborCodec<Vec<Vec<u8>>>;
+    fn handle<'a>(cf: &CfHandles<'a>) -> &'a rocksdb::ColumnFamily {
+        cf.stale_state_history
     }
 }
 
