@@ -40,9 +40,9 @@
 use hyperscale_core::{Action, CrossShardExecutionRequest, ProtocolEvent, ProvisionRequest};
 use hyperscale_types::{
     BlockHeight, Bls12381G1PublicKey, ExecutionCertificate, ExecutionOutcome, ExecutionVote, Hash,
-    LocalExecutionEntry, LocalReceipt, NodeId, Provision, ReceiptBundle, RoutableTransaction,
-    ShardGroupId, StateProvision, TopologySnapshot, TransactionDecision, TxOutcome, ValidatorId,
-    WaveCertificate, WaveId,
+    LocalExecutionEntry, NodeId, Provision, ReceiptBundle, RoutableTransaction, ShardGroupId,
+    StateProvision, TopologySnapshot, TransactionDecision, TxOutcome, ValidatorId, WaveCertificate,
+    WaveId,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -1719,24 +1719,6 @@ impl ExecutionState {
         let wc = wave.create_wave_certificate();
         let tx_hashes = wave.tx_hashes().to_vec();
 
-        // Synthesize failure receipts for aborted txs so `FinalizedWave.receipts`
-        // stays aligned 1:1 with `tx_hashes()` — an invariant that the sync-path
-        // reconstructor (`FinalizedWave::reconstruct`) depends on. Without this,
-        // validators that finalize locally (variable receipt count) and validators
-        // that reconstruct from sync (always tx_count, with failure synthesis)
-        // would compute different `local_receipt_root`.
-        for tx_hash in &tx_hashes {
-            if wave.is_tx_aborted(tx_hash) {
-                self.receipt_cache.insert(
-                    *tx_hash,
-                    ReceiptBundle {
-                        tx_hash: *tx_hash,
-                        local_receipt: Arc::new(LocalReceipt::failure()),
-                        execution_output: None,
-                    },
-                );
-            }
-        }
         let receipts: Vec<ReceiptBundle> = tx_hashes
             .iter()
             .filter_map(|h| self.receipt_cache.remove(h))

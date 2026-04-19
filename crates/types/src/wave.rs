@@ -781,15 +781,16 @@ pub fn decode_finalized_wave_vec<D: sbor::Decoder<sbor::NoCustomValueKind>>(
 /// - [`FinalizedWave::tx_hashes`] — iterator over the wave's tx hashes in block order
 /// - [`FinalizedWave::tx_decisions`] — aggregated (Aborted > Reject > Accept) per tx
 ///
-/// `receipts` is aligned 1:1 with `tx_hashes()` in block order.
+/// `receipts` contains only txs that actually executed (sparse subset of
+/// `tx_hashes()`, same block order). Aborted txs produce no receipt.
 ///
 /// Shared via `Arc` across the system — flows from execution state through
 /// pending blocks, actions, and into the commit path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FinalizedWave {
     pub certificate: Arc<WaveCertificate>,
-    /// Receipt bundles for all transactions in this wave, in block order.
-    /// Aligned 1:1 with `tx_hashes()`.
+    /// Receipt bundles for txs that executed. Aborted txs are absent —
+    /// `receipts.len() <= tx_count()`. Preserves canonical block order.
     /// Held in-memory until block commit, then written atomically with block metadata.
     pub receipts: Vec<ReceiptBundle>,
 }
@@ -845,9 +846,8 @@ impl FinalizedWave {
     ///
     /// Used on the storage/sync serving side to rebuild the in-memory shape
     /// from committed state. Walks the local EC's `tx_outcomes` (canonical block
-    /// order), fetches each receipt via `lookup`, and synthesizes
-    /// `LocalReceipt::failure()` for aborted txs whose receipts were never
-    /// persisted (matches the synthesis logic in `execution::finalize_wave`).
+    /// order) and fetches each receipt via `lookup`. Aborted txs are skipped —
+    /// they produce no receipt (matches the shape in `execution::finalize_wave`).
     ///
     /// Returns `None` if:
     /// - The WaveCertificate lacks a local EC (malformed — should not happen
@@ -863,23 +863,18 @@ impl FinalizedWave {
             .iter()
             .find(|ec| ec.wave_id == certificate.wave_id)?;
 
-        let receipts: Vec<ReceiptBundle> = local_ec
-            .tx_outcomes
-            .iter()
-            .map(|outcome| match lookup(&outcome.tx_hash) {
-                Some(receipt) => Some(ReceiptBundle {
+        let mut receipts: Vec<ReceiptBundle> = Vec::with_capacity(local_ec.tx_outcomes.len());
+        for outcome in &local_ec.tx_outcomes {
+            match lookup(&outcome.tx_hash) {
+                Some(receipt) => receipts.push(ReceiptBundle {
                     tx_hash: outcome.tx_hash,
                     local_receipt: receipt,
                     execution_output: None,
                 }),
-                None if outcome.is_aborted() => Some(ReceiptBundle {
-                    tx_hash: outcome.tx_hash,
-                    local_receipt: Arc::new(LocalReceipt::failure()),
-                    execution_output: None,
-                }),
-                None => None,
-            })
-            .collect::<Option<Vec<_>>>()?;
+                None if outcome.is_aborted() => {}
+                None => return None,
+            }
+        }
 
         Some(FinalizedWave {
             certificate,
@@ -1372,7 +1367,7 @@ mod tests {
     }
 
     #[test]
-    fn reconstruct_synthesizes_failure_for_aborted_tx_without_receipt() {
+    fn reconstruct_skips_aborted_tx_without_receipt() {
         let wave_id = make_wave_id(0, 42, &[1]);
         let tx_a = Hash::from_bytes(b"tx_a");
         let tx_b = Hash::from_bytes(b"tx_b_aborted");
@@ -1403,15 +1398,11 @@ mod tests {
                 None
             }
         })
-        .expect("aborted tx without receipt should synthesize failure");
+        .expect("aborted tx without receipt should be skipped, not fail");
 
-        assert_eq!(fw.receipts.len(), 2);
-        assert_eq!(fw.receipts[1].tx_hash, tx_b);
-        assert_eq!(
-            fw.receipts[1].local_receipt.outcome,
-            crate::TransactionOutcome::Failure,
-            "synthesized receipt should have Failure outcome"
-        );
+        assert_eq!(fw.tx_count(), 2);
+        assert_eq!(fw.receipts.len(), 1);
+        assert_eq!(fw.receipts[0].tx_hash, tx_a);
     }
 
     #[test]

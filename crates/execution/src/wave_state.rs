@@ -417,11 +417,6 @@ impl WaveState {
         true
     }
 
-    /// Whether any shard's EC has marked a given tx as aborted.
-    pub fn is_tx_aborted(&self, tx_hash: &Hash) -> bool {
-        self.tracker_aborted.contains(tx_hash)
-    }
-
     /// Whether a tx was aborted before dispatch (pre-dispatch reverse-conflict).
     /// Used by dispatch to skip executing txs the wave has already decided to
     /// abort.
