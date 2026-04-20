@@ -115,6 +115,13 @@ pub struct ExecutionState {
     /// Current committed height for pruning stale entries.
     committed_height: u64,
 
+    /// Height of the most recent block whose full content (txs, certs,
+    /// provisions) was locally resolvable AND whose state transitions have
+    /// been applied. Distinct from `committed_height`, which advances on BFT
+    /// QC alone; execution may lag when data is still being fetched.
+    /// Invariant: `processed_height <= committed_height`.
+    processed_height: u64,
+
     // ═══════════════════════════════════════════════════════════════════════
     // Provisioning
     // ═══════════════════════════════════════════════════════════════════════
@@ -344,6 +351,7 @@ impl ExecutionState {
             receipt_cache: HashMap::new(),
             finalized_wave_certificates: BTreeMap::new(),
             committed_height: 0,
+            processed_height: 0,
             waves: HashMap::new(),
             vote_trackers: HashMap::new(),
             waves_with_ec: HashSet::new(),
@@ -368,6 +376,12 @@ impl ExecutionState {
     /// Set the current time.
     pub fn set_time(&mut self, now: Duration) {
         self.now = now;
+    }
+
+    /// Height of the latest block fully processed by execution. See the field
+    /// on `ExecutionState` for the semantic contract.
+    pub fn processed_height(&self) -> u64 {
+        self.processed_height
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -1567,6 +1581,10 @@ impl ExecutionState {
         // waves can transition to provisioned from the same block's batches.
         if !provisions.is_empty() {
             actions.extend(self.apply_committed_provisions(topology, provisions, height));
+        }
+
+        if height > self.processed_height {
+            self.processed_height = height;
         }
 
         actions
