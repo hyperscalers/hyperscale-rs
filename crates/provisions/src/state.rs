@@ -13,7 +13,8 @@
 
 use hyperscale_core::{Action, ProtocolEvent};
 use hyperscale_types::{
-    BlockHeight, CommittedBlockHeader, Hash, Provision, ShardGroupId, TopologySnapshot, ValidatorId,
+    compute_padded_merkle_root, BlockHeight, CommittedBlockHeader, Hash, Provision, ShardGroupId,
+    TopologySnapshot, ValidatorId,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -387,7 +388,11 @@ impl ProvisionCoordinator {
                 "Found buffered provision batches for verified header"
             );
             for batch in batches {
-                actions.extend(self.emit_provision_verification(batch, committed_header.clone()));
+                actions.extend(self.emit_provision_verification(
+                    topology,
+                    batch,
+                    committed_header.clone(),
+                ));
             }
         }
 
@@ -432,7 +437,7 @@ impl ProvisionCoordinator {
         // Look for matching verified remote header (pre-verified by RemoteHeaderCoordinator).
         let key = (source_shard, block_height);
         if let Some(verified_header) = self.verified_remote_headers.get(&key).cloned() {
-            return self.emit_provision_verification(batch, verified_header);
+            return self.emit_provision_verification(topology, batch, verified_header);
         }
 
         // No verified header yet — buffer the batch
@@ -448,13 +453,55 @@ impl ProvisionCoordinator {
 
     /// Emit a `VerifyProvision` action for async merkle proof verification.
     ///
-    /// The QC was already verified by `RemoteHeaderCoordinator`, so only merkle
-    /// proofs need checking against the committed header's state root.
+    /// Runs the provision-batch completeness check first: the source block's
+    /// `provision_tx_roots[local_shard]` commits to the ordered tx hashes the
+    /// target shard is meant to receive. A mismatch means the proposer
+    /// dropped txs on the broadcast path (or the batch was tampered with) —
+    /// reject the batch entirely so the 10-block fallback timer refetches a
+    /// complete one from a peer.
+    ///
+    /// The QC was already verified by `RemoteHeaderCoordinator`, so the
+    /// downstream `VerifyProvision` action only needs to check merkle proofs
+    /// against the committed state root.
     fn emit_provision_verification(
         &self,
+        topology: &TopologySnapshot,
         batch: Provision,
         committed_header: Arc<CommittedBlockHeader>,
     ) -> Vec<Action> {
+        let local_shard = topology.local_shard();
+        let Some(expected_root) = committed_header
+            .header
+            .provision_tx_roots
+            .get(&local_shard)
+            .copied()
+        else {
+            warn!(
+                source_shard = batch.source_shard.0,
+                block_height = batch.block_height.0,
+                local_shard = local_shard.0,
+                "Dropping provision batch: source header has no provision_tx_root for us"
+            );
+            return vec![];
+        };
+
+        let leaves: Vec<Hash> = batch.transactions.iter().map(|t| t.tx_hash).collect();
+        let computed_root = compute_padded_merkle_root(&leaves);
+
+        if computed_root != expected_root {
+            warn!(
+                source_shard = batch.source_shard.0,
+                block_height = batch.block_height.0,
+                local_shard = local_shard.0,
+                tx_count = batch.transactions.len(),
+                ?expected_root,
+                ?computed_root,
+                "Rejecting incomplete provision batch — tx-root mismatch; \
+                 fallback fetch will request a complete batch"
+            );
+            return vec![];
+        }
+
         vec![Action::VerifyProvision {
             batch,
             committed_header,
@@ -626,6 +673,22 @@ mod tests {
         make_committed_header_with_targets(shard, height, vec![ShardGroupId(0)])
     }
 
+    /// Build a CommittedBlockHeader whose `provision_tx_roots[local_shard]`
+    /// commits to the provided tx hashes — used by tests that fire matching
+    /// provision batches through `on_state_provisions_received`.
+    fn make_committed_header_committing(
+        shard: ShardGroupId,
+        height: u64,
+        local_shard: ShardGroupId,
+        tx_hashes: &[Hash],
+    ) -> Arc<CommittedBlockHeader> {
+        let mut header_arc = make_committed_header_with_targets(shard, height, vec![local_shard]);
+        let header = Arc::get_mut(&mut header_arc).unwrap();
+        let root = hyperscale_types::compute_padded_merkle_root(tx_hashes);
+        header.header.provision_tx_roots.insert(local_shard, root);
+        header_arc
+    }
+
     #[test]
     fn test_remote_header_stored_in_verified_buffer() {
         let topology = make_test_topology(ShardGroupId(0));
@@ -745,8 +808,9 @@ mod tests {
         let tx_hash = Hash::from_bytes(b"tx1");
         let source_shard = ShardGroupId(1);
 
-        // First: header arrives
-        let header = make_committed_header(source_shard, 10);
+        // First: header arrives (commits to the single tx we'll send).
+        let header =
+            make_committed_header_committing(source_shard, 10, ShardGroupId(0), &[tx_hash]);
         coordinator.on_verified_remote_header(&topology, header);
 
         // Then: batch arrives — should emit VerifyProvision
@@ -787,8 +851,9 @@ mod tests {
         let batch = make_batch(tx_hash, source_shard, ShardGroupId(0), 10);
         coordinator.on_state_provisions_received(&topology, batch);
 
-        // Then header arrives — should trigger verification of buffered batch
-        let header = make_committed_header(source_shard, 10);
+        // Then header arrives (commits to the buffered tx) — should trigger verification
+        let header =
+            make_committed_header_committing(source_shard, 10, ShardGroupId(0), &[tx_hash]);
         let actions = coordinator.on_verified_remote_header(&topology, header);
 
         assert_eq!(actions.len(), 1);
@@ -822,8 +887,9 @@ mod tests {
         let tx_hash = Hash::from_bytes(b"tx1");
         let source_shard = ShardGroupId(1);
 
-        // Setup: header + batch + verification
-        let header = make_committed_header(source_shard, 10);
+        // Setup: header (committing to our single tx) + batch + verification.
+        let header =
+            make_committed_header_committing(source_shard, 10, ShardGroupId(0), &[tx_hash]);
         coordinator.on_verified_remote_header(&topology, header.clone());
         let batch = make_batch(tx_hash, source_shard, ShardGroupId(0), 10);
         coordinator.on_state_provisions_received(&topology, batch.clone());
@@ -900,13 +966,15 @@ mod tests {
         let mut coordinator = ProvisionCoordinator::new();
 
         let source_shard = ShardGroupId(1);
-        let header = make_committed_header(source_shard, 10);
-        coordinator.on_verified_remote_header(&topology, header);
 
-        // Send batch with 3 transactions from the same block
+        // Send batch with 3 transactions from the same block; header commits to them.
         let tx_hashes: Vec<_> = (0..3)
             .map(|i| Hash::from_bytes(format!("tx{i}").as_bytes()))
             .collect();
+        let header =
+            make_committed_header_committing(source_shard, 10, ShardGroupId(0), &tx_hashes);
+        coordinator.on_verified_remote_header(&topology, header);
+
         let batch = make_batch_multi(tx_hashes, source_shard, 10);
 
         let actions = coordinator.on_state_provisions_received(&topology, batch);
@@ -927,14 +995,16 @@ mod tests {
         let mut coordinator = ProvisionCoordinator::new();
 
         let source_shard = ShardGroupId(1);
+        let tx_hash = Hash::from_bytes(b"tx1");
 
-        // Verified header from coordinator
-        let header = make_committed_header(source_shard, 10);
+        // Verified header from coordinator (commits to the tx we'll send).
+        let header =
+            make_committed_header_committing(source_shard, 10, ShardGroupId(0), &[tx_hash]);
         coordinator.on_verified_remote_header(&topology, header);
         assert_eq!(coordinator.verified_remote_header_count(), 1);
 
         // Batch arrives — should send single verified candidate
-        let batch = make_batch(Hash::from_bytes(b"tx1"), source_shard, ShardGroupId(0), 10);
+        let batch = make_batch(tx_hash, source_shard, ShardGroupId(0), 10);
         let actions = coordinator.on_state_provisions_received(&topology, batch);
 
         assert_eq!(actions.len(), 1);
@@ -951,19 +1021,22 @@ mod tests {
         let mut coordinator = ProvisionCoordinator::new();
 
         let source_shard = ShardGroupId(1);
-        let header = make_committed_header(source_shard, 10);
+        let tx_hash = Hash::from_bytes(b"tx1");
+
+        // Header commits to the tx set we'll send.
+        let header =
+            make_committed_header_committing(source_shard, 10, ShardGroupId(0), &[tx_hash]);
         coordinator.on_verified_remote_header(&topology, header.clone());
 
-        // First batch verifies (promotes header to verified)
-        let batch1 = make_batch(Hash::from_bytes(b"tx1"), source_shard, ShardGroupId(0), 10);
+        // First batch verifies (promotes header to verified).
+        let batch1 = make_batch(tx_hash, source_shard, ShardGroupId(0), 10);
         coordinator.on_state_provisions_received(&topology, batch1.clone());
         coordinator.on_state_provisions_verified(&topology, batch1, Some(header.clone()), true);
 
-        // Second batch for different tx at same (shard, height)
-        let batch2 = make_batch(Hash::from_bytes(b"tx2"), source_shard, ShardGroupId(0), 10);
+        // A second arrival for the same tx set reuses the verified header.
+        let batch2 = make_batch(tx_hash, source_shard, ShardGroupId(0), 10);
         let actions = coordinator.on_state_provisions_received(&topology, batch2);
 
-        // Should send the verified header
         assert_eq!(actions.len(), 1);
         assert!(matches!(
             &actions[0],
@@ -973,19 +1046,64 @@ mod tests {
     }
 
     #[test]
+    fn test_partial_provision_batch_rejected() {
+        // Proposer's broadcast path drops a tx from a batch. The source block
+        // header commits to the full tx set; the arriving batch contains only
+        // a subset. Completeness check must reject so the fallback fetch
+        // refetches a complete batch from a peer.
+        let topology = make_test_topology(ShardGroupId(0));
+        let mut coordinator = ProvisionCoordinator::new();
+
+        let source_shard = ShardGroupId(1);
+        let tx_full = vec![
+            Hash::from_bytes(b"tx_a"),
+            Hash::from_bytes(b"tx_b"),
+            Hash::from_bytes(b"tx_c"),
+        ];
+        let header = make_committed_header_committing(source_shard, 10, ShardGroupId(0), &tx_full);
+        coordinator.on_verified_remote_header(&topology, header);
+
+        // Arriving batch is missing tx_c.
+        let partial = make_batch_multi(tx_full[..2].to_vec(), source_shard, 10);
+        let actions = coordinator.on_state_provisions_received(&topology, partial);
+
+        assert!(
+            actions.is_empty(),
+            "partial batch must be rejected, not dispatched"
+        );
+    }
+
+    #[test]
+    fn test_batch_with_missing_header_entry_rejected() {
+        // Source block has no provision_tx_roots entry for our shard, yet a
+        // batch arrived claiming to target us — reject.
+        let topology = make_test_topology(ShardGroupId(0));
+        let mut coordinator = ProvisionCoordinator::new();
+
+        let source_shard = ShardGroupId(1);
+        // Header targets our shard via waves but has no provision_tx_roots
+        // entry for us — mismatched commitment shape.
+        let header = make_committed_header(source_shard, 10);
+        coordinator.on_verified_remote_header(&topology, header);
+
+        let batch = make_batch(Hash::from_bytes(b"tx1"), source_shard, ShardGroupId(0), 10);
+        let actions = coordinator.on_state_provisions_received(&topology, batch);
+
+        assert!(actions.is_empty());
+    }
+
+    #[test]
     fn test_batch_invalid_does_not_emit() {
         let topology = make_test_topology(ShardGroupId(0));
         let mut coordinator = ProvisionCoordinator::new();
 
         let source_shard = ShardGroupId(1);
-        let header = make_committed_header(source_shard, 10);
+        let tx_hashes = vec![Hash::from_bytes(b"tx_ok"), Hash::from_bytes(b"tx_bad")];
+        let header =
+            make_committed_header_committing(source_shard, 10, ShardGroupId(0), &tx_hashes);
         coordinator.on_verified_remote_header(&topology, header.clone());
 
-        let batch = make_batch_multi(
-            vec![Hash::from_bytes(b"tx_ok"), Hash::from_bytes(b"tx_bad")],
-            source_shard,
-            10,
-        );
+        let batch = make_batch_multi(tx_hashes, source_shard, 10);
 
         coordinator.on_state_provisions_received(&topology, batch.clone());
 
@@ -1010,9 +1128,8 @@ mod tests {
         height: u64,
         provision_targets: Vec<ShardGroupId>,
     ) -> Arc<CommittedBlockHeader> {
-        // Convert flat provision targets into waves: each target shard becomes
-        // its own single-dependency wave. Preserves the test semantics
-        // (provision_targets() returns the same set).
+        // Each target shard gets its own single-dependency wave so that
+        // `provision_targets()` on the resulting header yields the input set.
         let waves: Vec<WaveId> = provision_targets
             .into_iter()
             .map(|s| WaveId {
