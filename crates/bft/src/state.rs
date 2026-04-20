@@ -3534,6 +3534,25 @@ impl BftState {
             "Applying synced block"
         );
 
+        // The sync peer can serve a block whose `FinalizedWave.receipts`
+        // don't agree with their own EC (different shard-local execution,
+        // bug, or byzantine serving). Applying such a block would feed the
+        // peer's divergent `LocalReceipt.database_updates` into our
+        // `pending_chain` overlay and substate DB, corrupting subsequent
+        // reads. Reject at ingress; `SyncProtocol` re-attempts the height.
+        for fw in block.certificates() {
+            if let Err(err) = fw.validate_receipts_against_ec() {
+                warn!(
+                    ?block_hash,
+                    height,
+                    wave_id_hash = ?fw.wave_id_hash(),
+                    ?err,
+                    "Rejecting synced block: FinalizedWave receipts inconsistent with its EC"
+                );
+                return vec![];
+            }
+        }
+
         // Capture parent state BEFORE record_block_committed advances heights.
         let parent_state_root = self.parent_state_root(block.header().parent_hash);
         let parent_block_height = self.committed_height;
@@ -8637,5 +8656,95 @@ mod tests {
         let (state, _topology) = make_test_state();
         let block = make_test_block_with_transactions(5, vec![]);
         assert!(state.validate_no_duplicate_transactions(&block).is_ok());
+    }
+
+    #[test]
+    fn test_apply_synced_block_rejects_inconsistent_wave_receipts() {
+        use hyperscale_types::{
+            ExecutionCertificate, ExecutionOutcome, FinalizedWave, LocalReceipt, ReceiptBundle,
+            TransactionOutcome, TxOutcome, WaveCertificate, WaveId,
+        };
+
+        let (mut state, topology) = make_test_state();
+        state.set_time(Duration::from_secs(100));
+        let committed_before = state.committed_height;
+
+        // Build a FinalizedWave whose EC attests "success" but whose receipt
+        // reports "failure" — the divergent-peer signature we want to reject.
+        let tx_hash = Hash::from_bytes(b"tx_divergent");
+        let wave_id = WaveId::new(ShardGroupId(0), 1, std::collections::BTreeSet::new());
+        let ec = ExecutionCertificate::new(
+            wave_id.clone(),
+            1,
+            Hash::ZERO,
+            vec![TxOutcome {
+                tx_hash,
+                outcome: ExecutionOutcome::Executed {
+                    receipt_hash: Hash::ZERO,
+                    success: true,
+                },
+            }],
+            Bls12381G2Signature([0u8; 96]),
+            SignerBitfield::new(4),
+        );
+        let bad_wave = Arc::new(FinalizedWave {
+            certificate: Arc::new(WaveCertificate {
+                wave_id,
+                execution_certificates: vec![Arc::new(ec)],
+            }),
+            receipts: vec![ReceiptBundle {
+                tx_hash,
+                local_receipt: Arc::new(LocalReceipt {
+                    outcome: TransactionOutcome::Failure, // EC said Success
+                    database_updates: Default::default(),
+                    application_events: vec![],
+                }),
+                execution_output: None,
+            }],
+        });
+
+        let block = Block::Live {
+            header: BlockHeader {
+                shard_group_id: ShardGroupId(0),
+                height: BlockHeight(1),
+                parent_hash: Hash::ZERO,
+                parent_qc: QuorumCertificate::genesis(),
+                proposer: ValidatorId(1),
+                timestamp: 1000,
+                round: 0,
+                is_fallback: false,
+                state_root: Hash::ZERO,
+                transaction_root: Hash::ZERO,
+                certificate_root: Hash::ZERO,
+                local_receipt_root: Hash::ZERO,
+                provision_root: Hash::ZERO,
+                waves: vec![],
+                in_flight: 0,
+            },
+            transactions: vec![],
+            certificates: vec![bad_wave],
+            provisions: vec![],
+        };
+        let qc = QuorumCertificate {
+            block_hash: block.hash(),
+            shard_group_id: ShardGroupId(0),
+            height: BlockHeight(1),
+            parent_block_hash: Hash::ZERO,
+            round: 0,
+            signers: SignerBitfield::empty(),
+            aggregated_signature: zero_bls_signature(),
+            weighted_timestamp_ms: 1000,
+        };
+
+        let actions = state.apply_synced_block(&topology, block, qc);
+
+        assert!(
+            actions.is_empty(),
+            "apply_synced_block should reject a block whose wave receipts disagree with its EC"
+        );
+        assert_eq!(
+            state.committed_height, committed_before,
+            "rejected block must not advance committed_height"
+        );
     }
 }
