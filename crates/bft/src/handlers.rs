@@ -10,7 +10,7 @@ use hyperscale_types::{
     compute_provision_root, compute_transaction_root, compute_waves_with_roots, verify_bls12381_v1,
     Block, BlockHeader, BlockHeight, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature,
     FinalizedWave, Hash, QuorumCertificate, ReceiptBundle, RoutableTransaction, ShardGroupId,
-    SignerBitfield, TopologySnapshot, ValidatorId, VotePower,
+    SignerBitfield, TopologySnapshot, ValidatorId, VotePower, WaveId,
 };
 use std::sync::Arc;
 
@@ -216,6 +216,35 @@ pub fn verify_transaction_root(
             ?computed_root,
             tx_count = transactions.len(),
             "Transaction root verification FAILED"
+        );
+    }
+
+    valid
+}
+
+/// Verify a block's per-wave tx-membership commitments.
+///
+/// Recomputes the wave partition from the block's transactions and compares
+/// the resulting `BTreeMap<WaveId, Hash>` against the header's claimed map
+/// by full equality. Phantom wave entries fail because the recomputed map
+/// only contains waves with ≥1 actual tx; tampered per-wave roots fail
+/// because the recomputed roots don't match.
+pub fn verify_wave_roots(
+    expected: &std::collections::BTreeMap<WaveId, Hash>,
+    block_height: u64,
+    transactions: &[Arc<RoutableTransaction>],
+    topology: &TopologySnapshot,
+) -> bool {
+    let computed = compute_waves_with_roots(topology, block_height, transactions);
+    let valid = &computed == expected;
+
+    if !valid {
+        tracing::warn!(
+            block_height,
+            tx_count = transactions.len(),
+            ?expected,
+            ?computed,
+            "Wave root verification FAILED"
         );
     }
 

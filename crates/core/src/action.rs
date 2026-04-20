@@ -482,6 +482,26 @@ pub enum Action {
         receipts: Vec<ReceiptBundle>,
     },
 
+    /// Verify a block's wave commitments.
+    ///
+    /// Recomputes `compute_waves_with_roots(topology, height, transactions)`
+    /// and compares against the block header's `waves` map by full-map
+    /// equality. Catches both forged wave identities and tampered per-wave
+    /// tx-membership roots.
+    ///
+    /// Pure CPU operation — verified in parallel with other root verifications.
+    VerifyWaveRoots {
+        block_hash: Hash,
+        /// Expected wave commitments from block header.
+        expected: std::collections::BTreeMap<WaveId, Hash>,
+        /// Block height (used as the waves' `block_height`).
+        block_height: u64,
+        /// Transactions in the block.
+        transactions: Vec<Arc<RoutableTransaction>>,
+        /// Topology snapshot used to classify tx-to-wave membership.
+        topology: TopologySnapshot,
+    },
+
     /// Build a complete block proposal.
     ///
     /// Computes the new state root from certificates, builds the complete block,
@@ -937,6 +957,7 @@ impl Action {
             Action::VerifyProvisionRoot { .. } => "VerifyProvisionRoot",
             Action::VerifyCertificateRoot { .. } => "VerifyCertificateRoot",
             Action::VerifyLocalReceiptRoot { .. } => "VerifyLocalReceiptRoot",
+            Action::VerifyWaveRoots { .. } => "VerifyWaveRoots",
             Action::BuildProposal { .. } => "BuildProposal",
 
             // Delegated Work - Execution

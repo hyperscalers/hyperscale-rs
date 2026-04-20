@@ -286,6 +286,7 @@ where
             | Action::VerifyProvisionRoot { .. }
             | Action::VerifyCertificateRoot { .. }
             | Action::VerifyLocalReceiptRoot { .. }
+            | Action::VerifyWaveRoots { .. }
             | Action::VerifyProvision { .. }
             | Action::ExecuteTransactions { .. }
             | Action::ExecuteCrossShardTransactions { .. }
