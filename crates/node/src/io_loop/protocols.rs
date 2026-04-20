@@ -50,21 +50,18 @@ where
                     self.network.request(
                         &peers,
                         None,
-                        GetBlockRequest {
-                            height: BlockHeight(height),
-                            target_height: BlockHeight(target_height),
-                        },
+                        GetBlockRequest::new(BlockHeight(height), BlockHeight(target_height)),
                         Box::new(move |result| match result {
                             Ok(resp) => {
                                 let (block_opt, qc_opt) = resp.into_parts();
                                 let block = match (block_opt, qc_opt) {
-                                    (Some(b), Some(q)) => Some((b, q)),
+                                    (Some(block), Some(qc)) => {
+                                        Some(Box::new(hyperscale_core::FetchedBlock { block, qc }))
+                                    }
                                     _ => None,
                                 };
-                                let _ = es.send(NodeInput::SyncBlockResponseReceived {
-                                    height,
-                                    block: Box::new(block),
-                                });
+                                let _ =
+                                    es.send(NodeInput::SyncBlockResponseReceived { height, block });
                             }
                             Err(_) => {
                                 let _ = es.send(NodeInput::SyncBlockFetchFailed { height });

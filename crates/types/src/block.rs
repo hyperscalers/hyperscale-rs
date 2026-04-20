@@ -504,19 +504,62 @@ impl Block {
         }
     }
 
-    /// Provision batches. `Some` only for `Live`; `Sealed` blocks have
+    /// Provision batches. Non-empty only for `Live`; `Sealed` blocks have
     /// dropped their provisions because the cross-shard execution window
-    /// they served has passed.
-    pub fn provisions(&self) -> Option<&[Arc<Provision>]> {
+    /// they served has passed. Use `is_live()` when the variant itself
+    /// matters — this accessor flattens both cases to a slice.
+    pub fn provisions(&self) -> &[Arc<Provision>] {
         match self {
-            Block::Live { provisions, .. } => Some(provisions),
-            Block::Sealed { .. } => None,
+            Block::Live { provisions, .. } => provisions,
+            Block::Sealed { .. } => &[],
         }
     }
 
     /// True if this block is still in its `Live` variant.
     pub fn is_live(&self) -> bool {
         matches!(self, Block::Live { .. })
+    }
+
+    /// Convert to `Sealed` by dropping provisions. Identity on an already-
+    /// sealed block. This is the canonical persisted shape; sync-serving
+    /// glue re-attaches provisions (via `into_live`) when the requester
+    /// needs them.
+    pub fn into_sealed(self) -> Block {
+        match self {
+            Block::Live {
+                header,
+                transactions,
+                certificates,
+                ..
+            } => Block::Sealed {
+                header,
+                transactions,
+                certificates,
+            },
+            sealed @ Block::Sealed { .. } => sealed,
+        }
+    }
+
+    /// Attach provisions, promoting `Sealed` → `Live`. Used by sync-serving
+    /// to upgrade a persisted block when the requester is still inside the
+    /// cross-shard execution window. Panics if invoked on a `Live` block —
+    /// that would silently discard the existing provision set.
+    pub fn into_live(self, provisions: Vec<Arc<Provision>>) -> Block {
+        match self {
+            Block::Sealed {
+                header,
+                transactions,
+                certificates,
+            } => Block::Live {
+                header,
+                transactions,
+                certificates,
+                provisions,
+            },
+            Block::Live { .. } => {
+                panic!("into_live called on an already-Live block")
+            }
+        }
     }
 
     /// Compute hash of this block (hashes the header).

@@ -3,6 +3,7 @@
 use crate::core::RocksDbStorage;
 use crate::typed_cf::TypedCf;
 
+use hyperscale_storage::BlockForSync;
 use hyperscale_types::{
     Block, BlockHeight, ExecutionCertificate, Hash, QuorumCertificate, RoutableTransaction,
     ShardGroupId, WaveCertificate,
@@ -26,11 +27,14 @@ impl hyperscale_storage::ChainReader for RocksDbStorage {
         self.read_latest_qc()
     }
 
-    fn get_block_for_sync(
-        &self,
-        height: BlockHeight,
-    ) -> Option<(Block, QuorumCertificate, Vec<Hash>)> {
-        RocksDbStorage::get_block_for_sync(self, height)
+    fn get_block_for_sync(&self, height: BlockHeight) -> Option<BlockForSync> {
+        RocksDbStorage::get_block_for_sync(self, height).map(|(block, qc, provision_hashes)| {
+            BlockForSync {
+                block,
+                qc,
+                provision_hashes,
+            }
+        })
     }
 
     fn get_transactions_batch(&self, hashes: &[Hash]) -> Vec<RoutableTransaction> {

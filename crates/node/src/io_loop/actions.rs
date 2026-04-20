@@ -464,7 +464,7 @@ where
         parent_block_height: u64,
     ) {
         let block_hash = block.hash();
-        let height = block.header().height;
+        let height = block.height();
 
         // Hard skip only if already persisted (consensus path got all the
         // way through). We must still enqueue blocks whose `prepared_commits`
@@ -572,7 +572,7 @@ where
     /// crash-recovery window.
     fn accumulate_block_commit(&mut self, mut commit: super::PendingCommit) {
         let block_hash = commit.block.hash();
-        let height = commit.block.header().height;
+        let height = commit.block.height();
 
         // Skip blocks already persisted by the sync path.
         if height.0 <= self.persisted_height {
@@ -665,7 +665,7 @@ where
 
         // Drop blocks already persisted by the sync path.
         let persisted = self.persisted_height;
-        commits.retain(|c| c.block.header().height.0 > persisted);
+        commits.retain(|c| c.block.height().0 > persisted);
         if commits.is_empty() {
             return;
         }
@@ -677,14 +677,14 @@ where
         // sorting, the child block (which may lack a PreparedCommit) would defer
         // and block the ready parent, causing a deadlock where BlockPersisted
         // never fires and sync_awaiting_persistence_height is never satisfied.
-        commits.sort_by_key(|c| c.block.header().height.0);
+        commits.sort_by_key(|c| c.block.height().0);
 
         // Extract prepared commit handles for each block in the batch,
         // then prune any stale entries at or below the highest committed
         // height.
         let max_committed_height = commits
             .iter()
-            .map(|c| c.block.header().height.0)
+            .map(|c| c.block.height().0)
             .max()
             .unwrap_or(0);
 
@@ -710,7 +710,7 @@ where
                 if deferring || not_ready {
                     if !deferring {
                         tracing::debug!(
-                            height = commit.block.header().height.0,
+                            height = commit.block.height().0,
                             certs = commit.block.certificates().len(),
                             "Deferring block commit — awaiting PreparedCommit from VerifyStateRoot"
                         );
@@ -719,7 +719,7 @@ where
                     // Put back prepared commit if we extracted one.
                     if let Some(p) = prepared {
                         let bh = commit.block.hash();
-                        let h = commit.block.header().height.0;
+                        let h = commit.block.height().0;
                         cache.insert(bh, (h, p));
                     }
                     self.pending_block_commits.push(commit);
@@ -762,7 +762,7 @@ where
                 Arc<hyperscale_types::QuorumCertificate>,
             )> = Vec::with_capacity(commits.len());
 
-            let heights: Vec<u64> = commits.iter().map(|c| c.block.header().height.0).collect();
+            let heights: Vec<u64> = commits.iter().map(|c| c.block.height().0).collect();
             let block_hashes: Vec<hyperscale_types::Hash> =
                 commits.iter().map(|c| c.block.hash()).collect();
 

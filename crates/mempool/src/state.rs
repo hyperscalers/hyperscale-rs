@@ -469,7 +469,7 @@ impl MempoolState {
     /// 2. Process certificates → mark completed
     /// 3. Process aborts → update status to terminal
     #[instrument(skip(self, block), fields(
-        height = block.header().height.0,
+        height = block.height().0,
         tx_count = block.transaction_count()
     ))]
     pub fn on_block_committed_full(
@@ -477,7 +477,7 @@ impl MempoolState {
         topology: &TopologySnapshot,
         block: &Block,
     ) -> Vec<Action> {
-        let height = block.header().height;
+        let height = block.height();
         let mut actions = Vec::new();
 
         self.current_height = height;

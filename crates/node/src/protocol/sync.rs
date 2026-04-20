@@ -13,6 +13,7 @@
 //! Production: `SyncManager` wraps this, maps outputs to tokio tasks.
 //! Simulation: feeds inputs/outputs synchronously via event queue.
 
+use hyperscale_core::FetchedBlock;
 use hyperscale_execution::WAVE_TIMEOUT_BLOCKS;
 use hyperscale_messages::request::GetBlockRequest;
 use hyperscale_messages::response::GetBlockResponse;
@@ -108,7 +109,7 @@ pub enum SyncInput {
     /// `None` means the peer did not have the block.
     BlockResponseReceived {
         height: u64,
-        block: Box<Option<(Block, QuorumCertificate)>>,
+        block: Option<Box<FetchedBlock>>,
     },
     /// A block fetch failed after all retries.
     BlockFetchFailed { height: u64 },
@@ -167,7 +168,7 @@ impl SyncProtocol {
                 target_hash,
             } => self.handle_start_sync(target_height, target_hash),
             SyncInput::BlockResponseReceived { height, block } => {
-                self.handle_block_response(height, *block)
+                self.handle_block_response(height, block.map(|b| *b))
             }
             SyncInput::BlockFetchFailed { height } => self.handle_block_fetch_failed(height),
             SyncInput::BlockCommitted { height } => self.handle_block_committed(height),
@@ -229,17 +230,17 @@ impl SyncProtocol {
     fn handle_block_response(
         &mut self,
         height: u64,
-        block: Option<(Block, QuorumCertificate)>,
+        response: Option<FetchedBlock>,
     ) -> Vec<SyncOutput> {
         self.heights_in_flight.remove(&height);
 
-        match block {
-            Some((block, qc)) => {
+        match response {
+            Some(FetchedBlock { block, qc }) => {
                 // Validate
-                if block.header().height.0 != height {
+                if block.height().0 != height {
                     warn!(
                         expected = height,
-                        got = block.header().height.0,
+                        got = block.height().0,
                         "Height mismatch in sync response"
                     );
                     metrics::record_sync_block_filtered("height_mismatch");
@@ -358,9 +359,14 @@ impl SyncProtocol {
     }
 
     /// Emit FetchBlock outputs for pending heights up to concurrent limit.
+    /// Short-circuits when no sync target is set — heights are only queued
+    /// after `handle_start_sync`, so a missing target means nothing to
+    /// fetch.
     fn emit_fetch_outputs(&mut self) -> Vec<SyncOutput> {
+        let Some((target_height, _)) = self.sync_target else {
+            return Vec::new();
+        };
         let mut outputs = Vec::new();
-        let target_height = self.sync_target.map(|(h, _)| h).unwrap_or(0);
         while self.heights_in_flight.len() < self.config.max_concurrent_fetches {
             if let Some(height) = self.pop_next_height() {
                 self.heights_in_flight.insert(height);
@@ -399,7 +405,12 @@ pub fn serve_block_request(
         target_height = req.target_height.0,
         "Handling block sync request"
     );
-    let Some((block, qc, provision_hashes)) = storage.get_block_for_sync(req.height) else {
+    let Some(hyperscale_storage::BlockForSync {
+        block,
+        qc,
+        provision_hashes,
+    }) = storage.get_block_for_sync(req.height)
+    else {
         return GetBlockResponse::not_found();
     };
 
@@ -423,24 +434,7 @@ pub fn serve_block_request(
         return GetBlockResponse::not_found();
     };
 
-    let (header, transactions, certificates) = match block {
-        Block::Sealed {
-            header,
-            transactions,
-            certificates,
-        } => (header, transactions, certificates),
-        Block::Live { .. } => {
-            unreachable!("storage returns Sealed; Live is assembled only in this function")
-        }
-    };
-    let block = Block::Live {
-        header,
-        transactions,
-        certificates,
-        provisions,
-    };
-
-    GetBlockResponse::found(block, qc)
+    GetBlockResponse::found(block.into_live(provisions), qc)
 }
 
 #[cfg(test)]

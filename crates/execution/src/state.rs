@@ -115,13 +115,6 @@ pub struct ExecutionState {
     /// Current committed height for pruning stale entries.
     committed_height: u64,
 
-    /// Height of the most recent block whose full content (txs, certs,
-    /// provisions) was locally resolvable AND whose state transitions have
-    /// been applied. Distinct from `committed_height`, which advances on BFT
-    /// QC alone; execution may lag when data is still being fetched.
-    /// Invariant: `processed_height <= committed_height`.
-    processed_height: u64,
-
     // ═══════════════════════════════════════════════════════════════════════
     // Provisioning
     // ═══════════════════════════════════════════════════════════════════════
@@ -351,7 +344,6 @@ impl ExecutionState {
             receipt_cache: HashMap::new(),
             finalized_wave_certificates: BTreeMap::new(),
             committed_height: 0,
-            processed_height: 0,
             waves: HashMap::new(),
             vote_trackers: HashMap::new(),
             waves_with_ec: HashSet::new(),
@@ -376,12 +368,6 @@ impl ExecutionState {
     /// Set the current time.
     pub fn set_time(&mut self, now: Duration) {
         self.now = now;
-    }
-
-    /// Height of the latest block fully processed by execution. See the field
-    /// on `ExecutionState` for the semantic contract.
-    pub fn processed_height(&self) -> u64 {
-        self.processed_height
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -1458,9 +1444,15 @@ impl ExecutionState {
     // Block Commit Handling
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /// Handle block committed - start executing transactions.
+    /// Handle block committed.
+    ///
+    /// Runs the variant-agnostic bookkeeping (height bump, timeout checks,
+    /// pruning), then dispatches to either `on_live_block_committed` —
+    /// which drives fresh execution — or `on_sealed_block_committed` —
+    /// which only records tx → wave mappings so late-arriving certs can
+    /// route back to the mempool.
     #[instrument(skip(self, block), fields(
-        height = block.header().height.0,
+        height = block.height().0,
         block_hash = ?block.hash(),
         tx_count = block.transactions().len(),
         is_live = block.is_live(),
@@ -1470,42 +1462,7 @@ impl ExecutionState {
         topology: &TopologySnapshot,
         block: &Block,
     ) -> Vec<Action> {
-        let block_hash = block.hash();
-        let header = block.header();
-        let height = header.height.0;
-        let block_timestamp = header.timestamp;
-        let proposer = header.proposer;
-        let transactions = block.transactions();
-        // Provisions for `Live`; `Sealed` never carries any (the window
-        // that needed them has passed). Both handled uniformly below.
-        let provisions: &[Arc<Provision>] = block.provisions().unwrap_or(&[]);
-
-        let mut actions = Vec::new();
-
-        // ── Provision broadcasting (proposer only) ─────────────────────
-        //
-        // Only applies to `Live` blocks: `Sealed` is past the execution
-        // window, so any waves it sourced have already been aggregated and
-        // finalized upstream — there's nothing left to broadcast.
-        if block.is_live() {
-            let local_shard = topology.local_shard();
-            let is_proposer = topology.local_validator_id() == proposer;
-
-            if is_proposer {
-                if let Some((requests, shard_recipients)) =
-                    Self::build_provision_requests(topology, transactions, local_shard)
-                {
-                    actions.push(Action::FetchAndBroadcastProvision {
-                        block_hash,
-                        requests,
-                        source_shard: local_shard,
-                        block_height: BlockHeight(height),
-                        block_timestamp,
-                        shard_recipients,
-                    });
-                }
-            }
-        }
+        let height = block.height().0;
 
         // Update committed height before anything else — needed for timeout
         // calculations and pruning even when there are no new transactions.
@@ -1513,23 +1470,13 @@ impl ExecutionState {
             self.committed_height = height;
         }
 
-        // Check for timed-out expected execution certs and prune stale entries.
-        // Must run every block, not just when there are new transactions.
+        let mut actions = Vec::new();
+
+        // Timeout checks + pruning run every block, not just commits that
+        // carry txs.
         actions.extend(self.check_exec_cert_timeouts(topology));
-
-        // Re-send votes to rotated leaders for waves where the leader hasn't
-        // produced an EC within VOTE_RETRY_BLOCKS.
         actions.extend(self.check_vote_retry_timeouts(topology));
-
-        // Prune ephemeral wave state (waves + vote trackers + early votes)
-        // whose backing tx assignments have all resolved. Cross-shard
-        // resolution state is only cleaned up on terminal state — never by
-        // block-count timeout.
         self.prune_execution_state();
-
-        // Drop buffered ECs whose source block height is too far behind the
-        // local committed height — covers tx_hashes that will never land
-        // locally (orphaned txs, malicious tx_hashes from remote shards).
         self.prune_stale_buffered_ecs();
 
         // Drop conflict-detector entries for remote provisions older than the
@@ -1543,70 +1490,138 @@ impl ExecutionState {
             }
         }
 
+        match block {
+            Block::Live {
+                header,
+                transactions,
+                provisions,
+                ..
+            } => actions.extend(self.on_live_block_committed(
+                topology,
+                block.hash(),
+                header,
+                transactions,
+                provisions,
+            )),
+            Block::Sealed {
+                header,
+                transactions,
+                ..
+            } => actions.extend(self.on_sealed_block_committed(topology, header, transactions)),
+        }
+
+        actions
+    }
+
+    /// Live path: still within the cross-shard execution window. Proposer
+    /// broadcasts provisions, setup+dispatch runs for the block's txs, and
+    /// inline provisions are applied so newly-created waves can transition
+    /// to `Provisioned` immediately.
+    fn on_live_block_committed(
+        &mut self,
+        topology: &TopologySnapshot,
+        block_hash: Hash,
+        header: &hyperscale_types::BlockHeader,
+        transactions: &[Arc<RoutableTransaction>],
+        provisions: &[Arc<Provision>],
+    ) -> Vec<Action> {
+        let height = header.height.0;
+        let mut actions = Vec::new();
+
+        // ── Provision broadcasting (proposer only) ─────────────────────
+        if topology.local_validator_id() == header.proposer {
+            let local_shard = topology.local_shard();
+            if let Some((requests, shard_recipients)) =
+                Self::build_provision_requests(topology, transactions, local_shard)
+            {
+                actions.push(Action::FetchAndBroadcastProvision {
+                    block_hash,
+                    requests,
+                    source_shard: local_shard,
+                    block_height: BlockHeight(height),
+                    block_timestamp: header.timestamp,
+                    shard_recipients,
+                });
+            }
+        }
+
         if !transactions.is_empty() {
-            let block_tx_hashes: Vec<Hash> = transactions.iter().map(|tx| tx.hash()).collect();
+            tracing::debug!(
+                height = height,
+                tx_count = transactions.len(),
+                "Starting execution for new transactions"
+            );
 
-            if block.is_live() {
-                tracing::debug!(
-                    height = height,
-                    tx_count = transactions.len(),
-                    "Starting execution for new transactions"
-                );
-
-                let (dispatch_actions, early_votes) =
-                    self.setup_waves_and_dispatch(topology, block_hash, height, transactions);
-                actions.extend(dispatch_actions);
-                for vote in early_votes {
-                    actions.extend(self.on_execution_vote(topology, vote));
-                }
-            } else {
-                // Sealed: the cross-shard execution window has passed for
-                // this block. Its waves will finalize from the already-
-                // aggregated cert + receipts included downstream. Record
-                // only the tx→wave mapping so a late-arriving cert can
-                // still route back to each tx for mempool terminal state;
-                // skip WaveState creation, dispatch, and vote tracking.
-                self.register_sealed_wave_assignments(topology, height, transactions);
+            let (dispatch_actions, early_votes) =
+                self.setup_waves_and_dispatch(topology, block_hash, height, transactions);
+            actions.extend(dispatch_actions);
+            for vote in early_votes {
+                actions.extend(self.on_execution_vote(topology, vote));
             }
 
-            // Replay buffered early ECs for txs that now have wave assignments.
-            // Runs for both variants: a Sealed block's txs still need cert
-            // routing when that cert eventually lands.
-            let mut ecs_to_replay: Vec<Arc<ExecutionCertificate>> = Vec::new();
-            let mut seen_ec_ptrs: HashSet<usize> = HashSet::new();
-            for tx_hash in &block_tx_hashes {
-                if let Some(ecs) = self.early_wave_attestations.remove(tx_hash) {
-                    for ec in ecs {
-                        let ptr = Arc::as_ptr(&ec) as usize;
-                        if seen_ec_ptrs.insert(ptr) {
-                            ecs_to_replay.push(ec);
-                        }
-                    }
-                }
-            }
-            if !ecs_to_replay.is_empty() {
-                tracing::debug!(
-                    count = ecs_to_replay.len(),
-                    "Replaying early wave attestations for newly committed txs"
-                );
-                for ec in ecs_to_replay {
-                    actions.extend(self.handle_wave_attestation(topology, ec));
-                }
-            }
+            actions.extend(self.replay_early_wave_attestations(topology, transactions));
         }
 
         // Apply this block's provisions after wave setup so newly-created
         // waves can transition to provisioned from the same block's batches.
-        // Sealed blocks skip this: provisions are dropped by design past the
-        // window, and the waves they would have fed are already resolved.
-        if block.is_live() && !provisions.is_empty() {
+        if !provisions.is_empty() {
             actions.extend(self.apply_committed_provisions(topology, provisions, height));
         }
 
-        if height > self.processed_height {
-            self.processed_height = height;
-        }
+        actions
+    }
 
+    /// Sealed path: past the cross-shard execution window. Waves will
+    /// finalize from the already-aggregated cert + receipts included
+    /// downstream, so we skip WaveState creation, dispatch, and vote
+    /// tracking. Only the tx → wave mapping is recorded (plus any early
+    /// ECs replayed) so a late-arriving cert still routes back to each
+    /// tx for mempool terminal-state bookkeeping.
+    fn on_sealed_block_committed(
+        &mut self,
+        topology: &TopologySnapshot,
+        header: &hyperscale_types::BlockHeader,
+        transactions: &[Arc<RoutableTransaction>],
+    ) -> Vec<Action> {
+        if transactions.is_empty() {
+            return Vec::new();
+        }
+        self.register_sealed_wave_assignments(topology, header.height.0, transactions);
+        self.replay_early_wave_attestations(topology, transactions)
+    }
+
+    /// Replay buffered early ECs for txs that have just received wave
+    /// assignments. Invoked from both the live and sealed commit paths —
+    /// in either case, a cert that arrived ahead of the commit now has a
+    /// tx target to route to.
+    fn replay_early_wave_attestations(
+        &mut self,
+        topology: &TopologySnapshot,
+        transactions: &[Arc<RoutableTransaction>],
+    ) -> Vec<Action> {
+        let mut ecs_to_replay: Vec<Arc<ExecutionCertificate>> = Vec::new();
+        let mut seen_ec_ptrs: HashSet<usize> = HashSet::new();
+        for tx in transactions {
+            if let Some(ecs) = self.early_wave_attestations.remove(&tx.hash()) {
+                for ec in ecs {
+                    let ptr = Arc::as_ptr(&ec) as usize;
+                    if seen_ec_ptrs.insert(ptr) {
+                        ecs_to_replay.push(ec);
+                    }
+                }
+            }
+        }
+        if ecs_to_replay.is_empty() {
+            return Vec::new();
+        }
+        tracing::debug!(
+            count = ecs_to_replay.len(),
+            "Replaying early wave attestations for newly committed txs"
+        );
+        let mut actions = Vec::new();
+        for ec in ecs_to_replay {
+            actions.extend(self.handle_wave_attestation(topology, ec));
+        }
         actions
     }
 

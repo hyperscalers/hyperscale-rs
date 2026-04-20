@@ -120,7 +120,7 @@ impl SyncManager {
     pub fn has_pending_at_height(&self, height: u64) -> bool {
         self.pending_synced_block_verifications
             .values()
-            .any(|p| p.block.header().height.0 == height)
+            .any(|p| p.block.height().0 == height)
     }
 
     /// Buffer a future synced block for later processing.
@@ -143,7 +143,7 @@ impl SyncManager {
         block: Block,
         qc: QuorumCertificate,
     ) {
-        let height = block.header().height.0;
+        let height = block.height().0;
         if self
             .pending_synced_block_verifications
             .contains_key(&block_hash)
@@ -185,7 +185,7 @@ impl SyncManager {
         if !valid {
             warn!(
                 block_hash = ?block_hash,
-                height = pending.block.header().height.0,
+                height = pending.block.height().0,
                 "Synced block QC signature verification FAILED - rejecting block"
             );
             // Only this block is removed (already done above). Other pending
@@ -197,7 +197,7 @@ impl SyncManager {
 
         info!(
             block_hash = ?block_hash,
-            height = pending.block.header().height.0,
+            height = pending.block.height().0,
             "Synced block QC verified successfully"
         );
 
@@ -235,7 +235,7 @@ impl SyncManager {
         let block_hash = self
             .pending_synced_block_verifications
             .iter()
-            .find(|(_, p)| p.verified && p.block.header().height.0 == height)
+            .find(|(_, p)| p.verified && p.block.height().0 == height)
             .map(|(h, _)| *h)?;
 
         let pending = self
@@ -252,13 +252,13 @@ impl SyncManager {
             .pending_synced_block_verifications
             .values()
             .filter(|p| p.verified)
-            .map(|p| p.block.header().height.0)
+            .map(|p| p.block.height().0)
             .collect();
         let unverified_heights: Vec<_> = self
             .pending_synced_block_verifications
             .values()
             .filter(|p| !p.verified)
-            .map(|p| p.block.header().height.0)
+            .map(|p| p.block.height().0)
             .collect();
         info!(
             committed_height,
@@ -302,7 +302,7 @@ impl SyncManager {
     pub fn highest_pending_height(&self, committed_height: u64) -> u64 {
         self.pending_synced_block_verifications
             .values()
-            .map(|p| p.block.header().height.0)
+            .map(|p| p.block.height().0)
             .max()
             .unwrap_or(committed_height)
     }
@@ -322,7 +322,7 @@ impl SyncManager {
             .retain(|height, _| *height > committed_height);
 
         self.pending_synced_block_verifications
-            .retain(|_, pending| pending.block.header().height.0 > committed_height);
+            .retain(|_, pending| pending.block.height().0 > committed_height);
     }
 
     /// Number of buffered out-of-order synced blocks.

@@ -103,7 +103,7 @@ impl RocksDbStorage {
         qc: &QuorumCertificate,
     ) {
         let metadata = BlockMetadata::from_block(block, qc.clone());
-        self.cf_put::<BlocksCf>(batch, &block.header().height.0, &metadata);
+        self.cf_put::<BlocksCf>(batch, &block.height().0, &metadata);
         for tx in block.transactions().iter() {
             self.cf_put_raw::<TransactionsCf>(
                 batch,
@@ -178,12 +178,14 @@ impl RocksDbStorage {
             return None;
         };
 
-        // 5. Reconstruct block
-        let block = Block::Live {
+        // 5. Reconstruct as `Sealed` — the on-disk shape never carries
+        // provisions. Sync-serving glue re-attaches them from the
+        // in-memory cache when a requester is still within the
+        // execution window.
+        let block = Block::Sealed {
             header: metadata.header,
             transactions,
             certificates,
-            provisions: vec![],
         };
 
         let elapsed = start.elapsed().as_secs_f64();

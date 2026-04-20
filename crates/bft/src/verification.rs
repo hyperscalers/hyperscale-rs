@@ -369,7 +369,7 @@ impl VerificationPipeline {
 
         warn!(
             block_hash = ?block_hash,
-            height = block.header().height.0,
+            height = block.height().0,
             proposer = ?block.header().proposer,
             certs = block.certificates().len(),
             txs = block.transaction_count(),
@@ -428,7 +428,7 @@ impl VerificationPipeline {
             parent_block_hash: parent_hash,
             parent_block_height,
             expected_root: block.header().state_root,
-            block_height: block.header().height.0,
+            block_height: block.height().0,
         };
 
         // The parent's tree nodes must be available — either committed to
@@ -819,7 +819,7 @@ impl VerificationPipeline {
         } else {
             warn!(
                 block_hash = ?block_hash,
-                height = block.header().height.0,
+                height = block.height().0,
                 proposed = proposed,
                 expected = expected,
                 parent_in_flight = parent_in_flight,

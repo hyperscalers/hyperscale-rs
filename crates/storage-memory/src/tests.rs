@@ -34,7 +34,7 @@ fn commit_with(
             certificate: Arc::new(hyperscale_types::WaveCertificate {
                 wave_id: hyperscale_types::WaveId::new(
                     hyperscale_types::ShardGroupId(0),
-                    block.header().height.0,
+                    block.height().0,
                     std::collections::BTreeSet::new(),
                 ),
                 execution_certificates: vec![],
@@ -253,7 +253,7 @@ fn test_block_storage_and_retrieval() {
     commit_empty(&storage, &block, &qc);
 
     let (stored_block, stored_qc) = storage.get_block(BlockHeight(1)).unwrap();
-    assert_eq!(stored_block.header().height, BlockHeight(1));
+    assert_eq!(stored_block.height(), BlockHeight(1));
     assert_eq!(stored_block.header().timestamp, 1_000);
     assert_eq!(stored_qc.block_hash, block.hash());
 }
@@ -281,7 +281,7 @@ fn test_get_block_for_sync() {
 
     let result = storage.get_block_for_sync(BlockHeight(1));
     assert!(result.is_some());
-    assert_eq!(result.unwrap().0.header().height, BlockHeight(1));
+    assert_eq!(result.unwrap().block.height(), BlockHeight(1));
 
     assert!(storage.get_block_for_sync(BlockHeight(999)).is_none());
 }

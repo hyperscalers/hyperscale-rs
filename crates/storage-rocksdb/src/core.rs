@@ -349,7 +349,7 @@ impl RocksDbStorage {
         block: &hyperscale_types::Block,
         qc: &hyperscale_types::QuorumCertificate,
     ) {
-        crate::metadata::write_committed_height(batch, block.header().height);
+        crate::metadata::write_committed_height(batch, block.height());
         crate::metadata::write_committed_hash(batch, &block.hash());
         crate::metadata::write_committed_qc(batch, qc);
     }

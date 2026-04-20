@@ -414,7 +414,7 @@ pub fn serve_provision_request(
         }
     };
 
-    let jmt_version = block.header().height.0;
+    let jmt_version = block.height().0;
 
     let all_txs = block.transactions().iter();
 

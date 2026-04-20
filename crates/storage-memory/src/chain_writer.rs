@@ -146,8 +146,10 @@ impl ChainWriter for SimStorage {
                 for tx in block.transactions().iter() {
                     c.transactions.insert(tx.hash(), tx.as_ref().clone());
                 }
-                c.blocks
-                    .insert(block.header().height, ((*block).clone(), (*qc).clone()));
+                c.blocks.insert(
+                    block.height(),
+                    ((*block).clone().into_sealed(), (*qc).clone()),
+                );
                 for fw in block.certificates() {
                     let cert = &fw.certificate;
                     let wave_id_hash = cert.wave_id.hash();
@@ -175,10 +177,10 @@ impl ChainWriter for SimStorage {
                             .push(canonical_hash);
                     }
                 }
-                c.committed_height = block.header().height;
+                c.committed_height = block.height();
                 c.committed_hash = Some(block.hash());
                 c.committed_qc = Some((*qc).clone());
-                c.prune_receipts(block.header().height.0);
+                c.prune_receipts(block.height().0);
 
                 result_root
             })
@@ -209,7 +211,7 @@ impl SimStorage {
         qc: &Arc<hyperscale_types::QuorumCertificate>,
         receipts: &[ReceiptBundle],
     ) -> Hash {
-        let block_height = block.header().height.0;
+        let block_height = block.height().0;
         let mut s = self.state.write().unwrap();
 
         assert!(
@@ -259,8 +261,10 @@ impl SimStorage {
             for tx in block.transactions().iter() {
                 c.transactions.insert(tx.hash(), tx.as_ref().clone());
             }
-            c.blocks
-                .insert(block.header().height, ((**block).clone(), (**qc).clone()));
+            c.blocks.insert(
+                block.height(),
+                ((**block).clone().into_sealed(), (**qc).clone()),
+            );
             for fw in block.certificates() {
                 let cert = &fw.certificate;
                 let wave_id_hash = cert.wave_id.hash();
@@ -290,10 +294,10 @@ impl SimStorage {
                         .push(canonical_hash);
                 }
             }
-            c.committed_height = block.header().height;
+            c.committed_height = block.height();
             c.committed_hash = Some(block.hash());
             c.committed_qc = Some((**qc).clone());
-            c.prune_receipts(block.header().height.0);
+            c.prune_receipts(block.height().0);
         }
 
         new_root

@@ -2,7 +2,7 @@
 
 use crate::core::SimStorage;
 
-use hyperscale_storage::ChainReader;
+use hyperscale_storage::{BlockForSync, ChainReader};
 use hyperscale_types::{
     Block, BlockHeight, ExecutionCertificate, Hash, LocalReceipt, QuorumCertificate,
     RoutableTransaction, ShardGroupId, WaveCertificate,
@@ -26,10 +26,7 @@ impl ChainReader for SimStorage {
         self.consensus.read().unwrap().committed_qc.clone()
     }
 
-    fn get_block_for_sync(
-        &self,
-        height: BlockHeight,
-    ) -> Option<(Block, QuorumCertificate, Vec<Hash>)> {
+    fn get_block_for_sync(&self, height: BlockHeight) -> Option<BlockForSync> {
         self.consensus
             .read()
             .unwrap()
@@ -39,16 +36,11 @@ impl ChainReader for SimStorage {
             .map(|(block, qc)| {
                 let provision_hashes =
                     hyperscale_types::BlockManifest::from_block(&block).provision_hashes;
-                // The on-disk (persisted) shape is always `Sealed`. Collapse
-                // to `Sealed` here so memory and rocksdb backends return the
-                // same variant; sync-serving glue upgrades to `Live` when
-                // the requester is still in the execution window.
-                let sealed = Block::Sealed {
-                    header: block.header().clone(),
-                    transactions: block.transactions().to_vec(),
-                    certificates: block.certificates().to_vec(),
-                };
-                (sealed, qc, provision_hashes)
+                BlockForSync {
+                    block,
+                    qc,
+                    provision_hashes,
+                }
             })
     }
 

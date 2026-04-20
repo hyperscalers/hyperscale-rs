@@ -35,7 +35,7 @@ mod writes;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_helpers;
 
-pub use chain_reader::ChainReader;
+pub use chain_reader::{BlockForSync, ChainReader};
 pub use chain_writer::ChainWriter;
 pub use genesis::{GenesisWrapper, SubstatesOnlyCommit};
 pub use hyperscale_jmt::TreeReader as JmtTreeReader;
