@@ -101,6 +101,10 @@ pub enum ProtocolEvent {
         height: u64,
         block: Block,
         provisions: Vec<Arc<Provision>>,
+        /// Expected provision batch hashes from the block's manifest.
+        /// Paired with `provisions`: if the two sets disagree, the advance
+        /// gate stalls execution until the fetch protocol closes the gap.
+        provision_hashes: Vec<Hash>,
     },
 
     /// A block has been durably persisted to RocksDB.

@@ -307,11 +307,13 @@ where
                 block,
                 qc,
                 provisions,
+                provision_hashes,
             } => {
                 self.accumulate_block_commit(super::PendingCommit {
                     block: Arc::new(block),
                     qc: Arc::new(qc),
                     provisions,
+                    provision_hashes,
                     committed_notified: false, // set by accumulate_block_commit
                 });
             }
@@ -319,6 +321,7 @@ where
                 block,
                 qc,
                 provisions,
+                provision_hashes,
                 parent_state_root,
                 parent_block_height,
             } => {
@@ -326,6 +329,7 @@ where
                     block,
                     qc,
                     provisions,
+                    provision_hashes,
                     parent_state_root,
                     parent_block_height,
                 );
@@ -468,6 +472,7 @@ where
         block: Block,
         qc: QuorumCertificate,
         provisions: Vec<Arc<Provision>>,
+        provision_hashes: Vec<Hash>,
         parent_state_root: Hash,
         parent_block_height: u64,
     ) {
@@ -569,6 +574,7 @@ where
             block: Arc::new(block),
             qc: Arc::new(qc),
             provisions,
+            provision_hashes,
             committed_notified: false,
         });
     }
@@ -624,6 +630,7 @@ where
                 height: height.0,
                 block: Arc::unwrap_or_clone(Arc::clone(&commit.block)),
                 provisions: commit.provisions.clone(),
+                provision_hashes: commit.provision_hashes.clone(),
             });
         } else {
             tracing::debug!(
@@ -799,6 +806,7 @@ where
                         height,
                         block: Arc::unwrap_or_clone(commit.block),
                         provisions: commit.provisions,
+                        provision_hashes: commit.provision_hashes,
                     }));
                 }
             }

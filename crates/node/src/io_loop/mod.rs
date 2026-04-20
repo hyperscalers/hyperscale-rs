@@ -71,6 +71,12 @@ pub(crate) struct PendingCommit {
     /// event, so consumers never rely on a lookup against the
     /// ProvisionCoordinator cache.
     pub provisions: Vec<Arc<Provision>>,
+    /// Expected provision batch hashes from the block's manifest. Paired
+    /// with `provisions`: if the set carried inline is incomplete (sync or
+    /// certified-only paths), the advance gate detects the gap by comparing
+    /// against these hashes and stalls execution until the fetch protocol
+    /// resolves them.
+    pub provision_hashes: Vec<Hash>,
     /// Whether `BlockCommitted` was already fired immediately
     /// in `accumulate_block_commit` (true) or deferred due to
     /// backpressure (false). The flush closure uses this to

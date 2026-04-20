@@ -336,6 +336,7 @@ impl NodeStateMachine {
         height: u64,
         block: Block,
         provisions: Vec<Arc<Provision>>,
+        expected_provision_hashes: Vec<Hash>,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
         let block_height = BlockHeight(height);
@@ -352,29 +353,10 @@ impl NodeStateMachine {
         // from the persistence latency that previously stalled the pipeline.
         self.bft.on_block_committed_verification(block_hash);
 
-        // Release execution's per-wave bookkeeping for wave certs included in
-        // this block. Per-tx terminal state for the mempool is handled below
-        // by `on_block_committed_full` reading `block.certificates` directly.
-        self.execution.cleanup_committed_waves(&block.certificates);
-        for cert in &block.certificates {
-            let cert_hash = cert.wave_id().hash();
-            self.bft.remove_committed_transaction(&cert_hash);
-        }
-
-        let all_txs = block.transactions.clone();
-        actions.extend(self.execution.on_block_committed(
-            self.topology.snapshot(),
-            block_hash,
-            height,
-            block.header.timestamp,
-            block.header.proposer,
-            all_txs,
-            &provisions,
-        ));
-
         // Mempool: marks Pending → Committed for block.transactions, then drives
         // each tx in `block.certificates` to its terminal state (Completed +
-        // tombstone). Same behavior for consensus and sync commit paths.
+        // tombstone). Runs independently of execution advance: BFT commit is
+        // authoritative for mempool terminal state.
         actions.extend(
             self.mempool
                 .on_block_committed_full(self.topology.snapshot(), &block),
@@ -386,12 +368,89 @@ impl NodeStateMachine {
                 .on_block_committed(self.topology.snapshot()),
         );
 
-        // Let provisions coordinator handle cleanup + fallback timeouts.
-        let provision_hashes: Vec<Hash> = provisions.iter().map(|p| p.hash()).collect();
+        // Let provisions coordinator handle cleanup + fallback timeouts. Uses
+        // the delivered provisions — the coordinator manages its own inventory
+        // independent of whether execution is caught up.
+        let delivered_provision_hashes: Vec<Hash> = provisions.iter().map(|p| p.hash()).collect();
         actions.extend(self.provisions.on_block_committed(
             self.topology.snapshot(),
             &block,
-            &provision_hashes,
+            &delivered_provision_hashes,
+        ));
+
+        // Advance gate: only process execution for this block if (a) no earlier
+        // block is still buffered awaiting data, and (b) every expected provision
+        // is locally resolvable. Otherwise buffer and emit a fetch; the retry
+        // loop (hooked into data-arrival events) will drain once complete.
+        let (resolved_provisions, missing) =
+            resolve_provisions(provisions, &expected_provision_hashes, &self.provisions);
+
+        let can_advance = !self.execution.has_awaiting_blocks() && missing.is_empty();
+        if can_advance {
+            actions.extend(self.apply_block_to_execution(
+                block_hash,
+                height,
+                &block,
+                &resolved_provisions,
+            ));
+        } else {
+            if !missing.is_empty() {
+                actions.push(Action::FetchProvisionLocal {
+                    block_hash,
+                    proposer: block.header.proposer,
+                    batch_hashes: missing,
+                });
+            }
+            self.execution.buffer_awaiting_block(
+                height,
+                hyperscale_execution::AwaitingBlock {
+                    block_hash,
+                    block_timestamp: block.header.timestamp,
+                    proposer: block.header.proposer,
+                    block,
+                    provisions: resolved_provisions,
+                    expected_provision_hashes,
+                },
+            );
+        }
+
+        // Block committed changes in-flight counts — trigger proposal attempt
+        // so the next proposer can include newly ready transactions.
+        actions.push(Action::Continuation(ProtocolEvent::ContentAvailable));
+
+        actions
+    }
+
+    /// Apply a fully-resolved committed block to execution: cert cleanup,
+    /// wave setup + dispatch, vote emission. Split out so the advance gate
+    /// can either call this immediately or defer it until the retry loop
+    /// drains the awaiting buffer.
+    fn apply_block_to_execution(
+        &mut self,
+        block_hash: Hash,
+        height: u64,
+        block: &Block,
+        provisions: &[Arc<Provision>],
+    ) -> Vec<Action> {
+        let mut actions = Vec::new();
+
+        // Release execution's per-wave bookkeeping for wave certs included in
+        // this block. Per-tx terminal state for the mempool is already handled
+        // separately by `on_block_committed_full` reading `block.certificates`.
+        self.execution.cleanup_committed_waves(&block.certificates);
+        for cert in &block.certificates {
+            let cert_hash = cert.wave_id().hash();
+            self.bft.remove_committed_transaction(&cert_hash);
+        }
+
+        actions.extend(self.execution.on_block_committed(
+            self.topology.snapshot(),
+            block_hash,
+            height,
+            block.header.timestamp,
+            block.header.proposer,
+            block.transactions.clone(),
+            provisions,
         ));
 
         // Round voting: scan all incomplete waves and emit votes for complete ones.
@@ -400,10 +459,6 @@ impl NodeStateMachine {
         // is deterministic at this height. All validators at this height produce
         // the same votes.
         actions.extend(self.execution.emit_vote_actions(self.topology.snapshot()));
-
-        // Block committed changes in-flight counts — trigger proposal attempt
-        // so the next proposer can include newly ready transactions.
-        actions.push(Action::Continuation(ProtocolEvent::ContentAvailable));
 
         actions
     }
@@ -590,7 +645,8 @@ impl StateMachine for NodeStateMachine {
                 height,
                 block,
                 provisions,
-            } => self.on_block_committed(block_hash, height, block, provisions),
+                provision_hashes,
+            } => self.on_block_committed(block_hash, height, block, provisions, provision_hashes),
 
             // ── Block Persisted (RocksDB write complete) ───────────────
             // Advances `last_persisted_height`, a fallback gate for deferred
@@ -841,4 +897,39 @@ impl StateMachine for NodeStateMachine {
     fn now(&self) -> Duration {
         self.now
     }
+}
+
+/// Resolve the expected provision set for a committed block.
+///
+/// Starts from the provisions delivered inline with the commit action and
+/// tops up from the coordinator's cache for any hash in `expected_hashes`
+/// that isn't already present. Returns the (possibly-reordered) resolved
+/// set plus any hashes that couldn't be resolved locally — the caller is
+/// expected to emit a fetch for those and buffer the block.
+fn resolve_provisions(
+    provided: Vec<Arc<Provision>>,
+    expected_hashes: &[Hash],
+    coordinator: &ProvisionCoordinator,
+) -> (Vec<Arc<Provision>>, Vec<Hash>) {
+    if expected_hashes.is_empty() {
+        return (provided, Vec::new());
+    }
+    let mut have: HashMap<Hash, Arc<Provision>> =
+        provided.into_iter().map(|p| (p.hash(), p)).collect();
+    let mut missing = Vec::new();
+    for h in expected_hashes {
+        if have.contains_key(h) {
+            continue;
+        }
+        if let Some(batch) = coordinator.get_batch_by_hash(h) {
+            have.insert(*h, batch);
+        } else {
+            missing.push(*h);
+        }
+    }
+    let resolved: Vec<Arc<Provision>> = expected_hashes
+        .iter()
+        .filter_map(|h| have.remove(h))
+        .collect();
+    (resolved, missing)
 }
