@@ -61,9 +61,11 @@ pub struct WaveState {
     // ── Provisioning phase ──────────────────────────────────────────────
     /// Txs whose required remote-shard provisions have all arrived.
     provisioned_txs: HashSet<Hash>,
-    /// The block height at which the last tx became provisioned; set exactly
-    /// once, on the transition from "partial" to "all provisioned". `None` if
-    /// the wave has not yet reached full provisioning.
+    /// Per-tx earliest ready height. `all_provisioned_at` is the max across
+    /// this map — deterministic regardless of call order.
+    provisioned_tx_heights: HashMap<Hash, u64>,
+    /// The block height at which every tx in the wave became ready. `None`
+    /// until `provisioned_txs` is full.
     all_provisioned_at: Option<u64>,
     /// Whether execution has been dispatched (single `ExecuteTransactions` /
     /// `ExecuteCrossShardTransactions` emitted). Set true once execution fires.
@@ -128,10 +130,12 @@ impl WaveState {
         let tx_hash_set: HashSet<Hash> = tx_hashes.iter().copied().collect();
 
         // Single-shard waves are trivially provisioned at creation.
-        let (provisioned_txs, all_provisioned_at) = if single_shard {
-            (tx_hash_set.clone(), Some(block_height))
+        let (provisioned_txs, provisioned_tx_heights, all_provisioned_at) = if single_shard {
+            let heights: HashMap<Hash, u64> =
+                tx_hashes.iter().map(|h| (*h, block_height)).collect();
+            (tx_hash_set.clone(), heights, Some(block_height))
         } else {
-            (HashSet::new(), None)
+            (HashSet::new(), HashMap::new(), None)
         };
 
         Self {
@@ -143,6 +147,7 @@ impl WaveState {
             tx_hash_set,
             transactions,
             provisioned_txs,
+            provisioned_tx_heights,
             all_provisioned_at,
             dispatched: false,
             execution_results: HashMap::new(),
@@ -209,7 +214,8 @@ impl WaveState {
         }
     }
 
-    /// Mark a single tx as provisioned (all its required shards reported).
+    /// Mark a single tx as provisioned. Keeps the earliest `at_height` per tx
+    /// so the wave's transition height is a pure function of the event set.
     ///
     /// Returns `true` iff this call transitioned the wave from "partial" to
     /// "all provisioned" — the caller uses that signal to emit the single
@@ -218,13 +224,25 @@ impl WaveState {
         if !self.tx_hash_set.contains(&tx_hash) {
             return false;
         }
-        if !self.provisioned_txs.insert(tx_hash) {
-            return false;
-        }
 
-        // Transition check — did this call complete the last missing tx?
-        if self.all_provisioned_at.is_none() && self.provisioned_txs.len() == self.tx_hashes.len() {
-            self.all_provisioned_at = Some(at_height);
+        self.provisioned_tx_heights
+            .entry(tx_hash)
+            .and_modify(|h| *h = (*h).min(at_height))
+            .or_insert(at_height);
+
+        let is_new = self.provisioned_txs.insert(tx_hash);
+
+        if is_new
+            && self.all_provisioned_at.is_none()
+            && self.provisioned_txs.len() == self.tx_hashes.len()
+        {
+            let max_height = self
+                .provisioned_tx_heights
+                .values()
+                .copied()
+                .max()
+                .unwrap_or(at_height);
+            self.all_provisioned_at = Some(max_height);
             true
         } else {
             false
