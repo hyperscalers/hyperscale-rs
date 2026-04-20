@@ -1496,6 +1496,10 @@ impl ExecutionState {
         self.prune_execution_state();
         self.prune_stale_buffered_ecs();
 
+        for wave in self.waves.values() {
+            wave.log_if_overdue(self.committed_height);
+        }
+
         // Drop conflict-detector entries for remote provisions older than the
         // retention window. `register_tx` iterates over these per cross-shard
         // tx; left unbounded they drive quadratic TPS decay.

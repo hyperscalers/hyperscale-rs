@@ -469,6 +469,67 @@ impl WaveState {
         self.explicit_aborts.contains_key(tx_hash)
     }
 
+    /// Emit a `warn!` log if the wave has aged past `WAVE_TIMEOUT_BLOCKS`
+    /// without completing. Dumps enough state to diagnose what phase it's
+    /// stuck in (provisioning / dispatch / voting / EC collection). Called
+    /// once per committed block per surviving wave.
+    pub fn log_if_overdue(&self, committed_height: u64) {
+        let age = committed_height.saturating_sub(self.block_height);
+        if age <= WAVE_TIMEOUT_BLOCKS {
+            return;
+        }
+
+        let total = self.tx_hashes.len();
+        let provisioned = self.provisioned_txs.len();
+
+        let mut missing_coverage: Vec<String> = Vec::new();
+        for tx_hash in &self.tx_hashes {
+            if self.tracker_aborted.contains(tx_hash) {
+                continue;
+            }
+            let expected = self
+                .participating_shards
+                .get(tx_hash)
+                .cloned()
+                .unwrap_or_default();
+            let covered = self
+                .covered_shards
+                .get(tx_hash)
+                .cloned()
+                .unwrap_or_default();
+            let missing: BTreeSet<ShardGroupId> = expected.difference(&covered).copied().collect();
+            if !missing.is_empty() {
+                let missing_list: Vec<String> = missing.iter().map(|s| s.0.to_string()).collect();
+                missing_coverage.push(format!("{:?}→[{}]", tx_hash, missing_list.join(",")));
+            }
+        }
+
+        let local_receipts_ready = self.has_local_receipts_for_non_aborted();
+
+        tracing::warn!(
+            wave = %self.wave_id,
+            block_hash = ?self.block_hash,
+            block_height = self.block_height,
+            committed_height,
+            age_blocks = age,
+            timeout_blocks = WAVE_TIMEOUT_BLOCKS,
+            num_txs = total,
+            provisioned = format!("{}/{}", provisioned, total),
+            all_provisioned_at = ?self.all_provisioned_at,
+            dispatched = self.dispatched,
+            voted = self.voted,
+            local_ec_emitted = self.local_ec_emitted,
+            local_receipts_ready,
+            execution_results = self.execution_results.len(),
+            explicit_aborts = self.explicit_aborts.len(),
+            tracker_aborted = self.tracker_aborted.len(),
+            ecs_collected = self.execution_certificates.len(),
+            is_complete = self.is_complete(),
+            missing_coverage = missing_coverage.join(" "),
+            "Wave overdue: alive past execution timeout without completing"
+        );
+    }
+
     /// Build the final `WaveCertificate`. Local EC is always included;
     /// remote ECs are included only if they cover at least one non-aborted
     /// tx. Deterministic order: `(shard_group_id, canonical_hash)`.
