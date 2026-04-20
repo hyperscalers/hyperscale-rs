@@ -3241,17 +3241,21 @@ impl BftState {
             // assembly (gossip or proposer self-fill), so if the block is in
             // `pending_blocks` its provisions are available inline — no
             // lookup against any external cache. `certified_blocks` doesn't
-            // track provisions; those blocks commit with an empty slice
-            // (cross-shard execution for certified-only blocks is handled via
-            // SyncResumed / post-sync fetch).
-            let (block, provisions) = if let Some(block) = self.certified_blocks.get(&current_hash)
-            {
-                (Some(block.clone()), Vec::new())
-            } else if let Some(pending) = self.pending_blocks.get(&current_hash) {
-                (pending.block().map(|b| (*b).clone()), pending.provisions())
-            } else {
-                (None, Vec::new())
-            };
+            // track provisions or a manifest; those blocks commit with an
+            // empty slice and empty expected hashes, and execution stalls
+            // (via the advance gate) until the fetch protocol delivers them.
+            let (block, provisions, provision_hashes) =
+                if let Some(block) = self.certified_blocks.get(&current_hash) {
+                    (Some(block.clone()), Vec::new(), Vec::new())
+                } else if let Some(pending) = self.pending_blocks.get(&current_hash) {
+                    (
+                        pending.block().map(|b| (*b).clone()),
+                        pending.provisions(),
+                        pending.manifest().provision_hashes.clone(),
+                    )
+                } else {
+                    (None, Vec::new(), Vec::new())
+                };
 
             let Some(block) = block else {
                 warn!("Block {} not found for commit", current_hash);
@@ -3298,12 +3302,14 @@ impl BftState {
                     block: block.clone(),
                     qc: current_qc.clone(),
                     provisions,
+                    provision_hashes: provision_hashes.clone(),
                 }
             } else {
                 Action::CommitBlockByQcOnly {
                     block: block.clone(),
                     qc: current_qc.clone(),
                     provisions,
+                    provision_hashes: provision_hashes.clone(),
                     parent_state_root,
                     parent_block_height,
                 }
@@ -3571,16 +3577,17 @@ impl BftState {
             self.maybe_unlock_for_qc(topology, &block.header.parent_qc);
         }
 
-        let provisions = self
+        let (provisions, provision_hashes) = self
             .pending_blocks
             .get(&block_hash)
-            .map(|pb| pb.provisions())
+            .map(|pb| (pb.provisions(), pb.manifest().provision_hashes.clone()))
             .unwrap_or_default();
 
         let mut actions = vec![Action::CommitBlockByQcOnly {
             block: block.clone(),
             qc,
             provisions,
+            provision_hashes,
             parent_state_root,
             parent_block_height,
         }];

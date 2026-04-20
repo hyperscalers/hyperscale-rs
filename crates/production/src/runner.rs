@@ -702,6 +702,7 @@ impl ProductionRunner {
                 height: 0,
                 block: genesis_block,
                 provisions: vec![],
+                provision_hashes: vec![],
             },
         ));
 

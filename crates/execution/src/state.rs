@@ -39,8 +39,8 @@
 
 use hyperscale_core::{Action, CrossShardExecutionRequest, ProtocolEvent, ProvisionRequest};
 use hyperscale_types::{
-    BlockHeight, Bls12381G1PublicKey, ExecutionCertificate, ExecutionOutcome, ExecutionVote, Hash,
-    LocalExecutionEntry, NodeId, Provision, ReceiptBundle, RoutableTransaction, ShardGroupId,
+    Block, BlockHeight, Bls12381G1PublicKey, ExecutionCertificate, ExecutionOutcome, ExecutionVote,
+    Hash, LocalExecutionEntry, NodeId, Provision, ReceiptBundle, RoutableTransaction, ShardGroupId,
     StateProvision, TopologySnapshot, TransactionDecision, TxOutcome, ValidatorId, WaveCertificate,
     WaveId,
 };
@@ -121,6 +121,13 @@ pub struct ExecutionState {
     /// QC alone; execution may lag when data is still being fetched.
     /// Invariant: `processed_height <= committed_height`.
     processed_height: u64,
+
+    /// Blocks committed by BFT but awaiting data resolution (missing
+    /// provisions, typically). Held in order so the retry loop drains them
+    /// sequentially once the fetch protocol fills the gaps. Entries carry
+    /// the provisions already resolved plus the expected hash set so the
+    /// resolver can tell when every piece is in hand.
+    awaiting_blocks: BTreeMap<u64, AwaitingBlock>,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Provisioning
@@ -220,6 +227,20 @@ impl Default for ExecutionState {
 struct BufferedEc {
     ec: Arc<ExecutionCertificate>,
     pending_txs: HashSet<Hash>,
+}
+
+/// A BFT-committed block held until its provision batches are fully
+/// resolvable. Paired with the set of provisions already collected and the
+/// expected hash set from the block's manifest so the resolver can check
+/// completeness without re-deriving either from the block itself.
+#[derive(Debug, Clone)]
+pub struct AwaitingBlock {
+    pub block: Block,
+    pub block_hash: Hash,
+    pub block_timestamp: u64,
+    pub proposer: ValidatorId,
+    pub provisions: Vec<Arc<Provision>>,
+    pub expected_provision_hashes: Vec<Hash>,
 }
 
 /// Tracks an expected execution certificate that hasn't arrived yet.
@@ -352,6 +373,7 @@ impl ExecutionState {
             finalized_wave_certificates: BTreeMap::new(),
             committed_height: 0,
             processed_height: 0,
+            awaiting_blocks: BTreeMap::new(),
             waves: HashMap::new(),
             vote_trackers: HashMap::new(),
             waves_with_ec: HashSet::new(),
@@ -382,6 +404,20 @@ impl ExecutionState {
     /// on `ExecutionState` for the semantic contract.
     pub fn processed_height(&self) -> u64 {
         self.processed_height
+    }
+
+    /// True if any BFT-committed blocks are still waiting for data before
+    /// execution can apply them. Used by the advance gate to ensure
+    /// subsequent blocks defer rather than skip ahead out of order.
+    pub fn has_awaiting_blocks(&self) -> bool {
+        !self.awaiting_blocks.is_empty()
+    }
+
+    /// Buffer a committed block whose provision batches aren't fully
+    /// resolvable yet. The advancer revisits it whenever new provisions
+    /// arrive; once complete, it drains in height order.
+    pub fn buffer_awaiting_block(&mut self, height: u64, entry: AwaitingBlock) {
+        self.awaiting_blocks.insert(height, entry);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
