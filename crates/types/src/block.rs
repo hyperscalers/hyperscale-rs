@@ -75,6 +75,24 @@ pub fn compute_transaction_root(transactions: &[Arc<RoutableTransaction>]) -> Ha
     compute_padded_merkle_root(&leaves)
 }
 
+/// Compute the merkle root of the tx hashes assigned to a single wave.
+///
+/// Callers pass tx hashes in block order, which is already hash-ascending, so
+/// no sort step is needed on either proposer or verifier side. The receiver
+/// filters an incoming `ProvisionBatch` the same way — by wave membership
+/// preserving batch order — and recomputes this root to check completeness.
+///
+/// Returns `Hash::ZERO` for empty input, matching [`compute_transaction_root`].
+/// In practice a wave never exists without ≥1 tx; the structural guarantee
+/// comes from [`compute_waves_with_roots`](crate::compute_waves_with_roots),
+/// which only emits map entries for non-empty buckets.
+pub fn compute_wave_tx_root(tx_hashes: &[Hash]) -> Hash {
+    if tx_hashes.is_empty() {
+        return Hash::ZERO;
+    }
+    compute_padded_merkle_root(tx_hashes)
+}
+
 /// Block header containing consensus metadata.
 ///
 /// The header is what validators vote on. It contains:
@@ -807,6 +825,37 @@ mod tests {
         let root2 = compute_transaction_root(std::slice::from_ref(&tx));
         assert_eq!(root1, root2);
         assert_ne!(root1, Hash::ZERO);
+    }
+
+    #[test]
+    fn test_compute_wave_tx_root_empty() {
+        let root = compute_wave_tx_root(&[]);
+        assert_eq!(root, Hash::ZERO);
+    }
+
+    #[test]
+    fn test_compute_wave_tx_root_order_sensitive() {
+        // Receiver/proposer use block-tx order (already hash-ascending), so
+        // the helper is deliberately order-sensitive. Callers must pass the
+        // canonical order.
+        let a = Hash::from_bytes(b"a");
+        let b = Hash::from_bytes(b"b");
+        let root_ab = compute_wave_tx_root(&[a, b]);
+        let root_ba = compute_wave_tx_root(&[b, a]);
+        assert_ne!(root_ab, root_ba);
+    }
+
+    #[test]
+    fn test_compute_wave_tx_root_deterministic() {
+        let leaves = [
+            Hash::from_bytes(b"tx1"),
+            Hash::from_bytes(b"tx2"),
+            Hash::from_bytes(b"tx3"),
+        ];
+        let r1 = compute_wave_tx_root(&leaves);
+        let r2 = compute_wave_tx_root(&leaves);
+        assert_eq!(r1, r2);
+        assert_ne!(r1, Hash::ZERO);
     }
 
     #[test]
