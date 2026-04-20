@@ -593,7 +593,6 @@ impl BftState {
         topology: &TopologySnapshot,
         block: Block,
         qc: QuorumCertificate,
-        provision_hashes: Vec<Hash>,
     ) -> Vec<Action> {
         let block_height = block.header().height.0;
 
@@ -609,7 +608,7 @@ impl BftState {
             return vec![];
         }
 
-        self.on_synced_block_ready(topology, block, qc, provision_hashes)
+        self.on_synced_block_ready(topology, block, qc)
     }
 
     /// Handle sync complete (from runner via Event::SyncComplete).
@@ -3240,13 +3239,10 @@ impl BftState {
         let mut current_qc = certifying_qc;
 
         loop {
-            // Get the block and its provisions to commit.
-            //
-            // `PendingBlock.received_provisions` is populated during block
-            // assembly (gossip or proposer self-fill), so if the block is
-            // in `pending_blocks` its provisions are available inline. No
-            // external cache lookup — the advance gate takes care of
-            // missing batches once the action reaches execution.
+            // Get the fully-assembled block to commit. `PendingBlock` gates
+            // itself on `is_complete()` (all txs + certs + provisions
+            // received), and `construct_block` attaches the provisions
+            // inline on `Block::Live` — no external cache lookup needed.
             let Some(pending) = self.pending_blocks.get(&current_hash) else {
                 warn!(
                     ?current_hash,
@@ -3261,8 +3257,6 @@ impl BftState {
                 );
                 break;
             };
-            let provisions = pending.provisions();
-            let provision_hashes = pending.manifest().provision_hashes.clone();
 
             let height = block.header().height.0;
 
@@ -3303,15 +3297,11 @@ impl BftState {
                 Action::CommitBlock {
                     block: block.clone(),
                     qc: current_qc.clone(),
-                    provisions,
-                    provision_hashes: provision_hashes.clone(),
                 }
             } else {
                 Action::CommitBlockByQcOnly {
                     block: block.clone(),
                     qc: current_qc.clone(),
-                    provisions,
-                    provision_hashes: provision_hashes.clone(),
                     parent_state_root,
                     parent_block_height,
                 }
@@ -3368,7 +3358,6 @@ impl BftState {
         topology: &TopologySnapshot,
         block: Block,
         qc: QuorumCertificate,
-        provision_hashes: Vec<Hash>,
     ) -> Vec<Action> {
         let block_hash = block.hash();
         let height = block.header().height.0;
@@ -3420,19 +3409,14 @@ impl BftState {
         // Check if this block is the next one we need
         if height == next_needed {
             // This is exactly what we need - submit for verification immediately
-            return self.submit_synced_block_for_verification(
-                topology,
-                block,
-                qc,
-                provision_hashes,
-            );
+            return self.submit_synced_block_for_verification(topology, block, qc);
         }
 
         // Block is not the next sequential height. Check if we should buffer it
         // or if we already have what we need and should try draining buffers.
         if height > next_needed {
             // Future block - buffer it for later
-            self.sync.buffer_block(height, block, qc, provision_hashes);
+            self.sync.buffer_block(height, block, qc);
 
             // Check if we can drain any buffered blocks starting from next_needed
             return self.try_drain_buffered_synced_blocks(topology);
@@ -3457,7 +3441,6 @@ impl BftState {
         topology: &TopologySnapshot,
         block: Block,
         qc: QuorumCertificate,
-        provision_hashes: Vec<Hash>,
     ) -> Vec<Action> {
         let block_hash = block.hash();
         let height = block.header().height.0;
@@ -3465,7 +3448,7 @@ impl BftState {
         // Genesis QC doesn't need signature verification
         if qc.is_genesis() {
             debug!(height, "Synced block has genesis QC, applying directly");
-            return self.apply_synced_block(topology, block, qc, provision_hashes);
+            return self.apply_synced_block(topology, block, qc);
         }
 
         // Collect public keys for QC verification
@@ -3483,7 +3466,7 @@ impl BftState {
 
         // Store pending verification info via SyncManager
         self.sync
-            .track_pending_verification(block_hash, block, qc.clone(), provision_hashes);
+            .track_pending_verification(block_hash, block, qc.clone());
 
         // Delegate verification to runner
         vec![Action::VerifyQcSignature {
@@ -3522,13 +3505,8 @@ impl BftState {
 
         // Drain buffered blocks from the SyncManager
         let blocks = self.sync.drain_buffered(start_height, slots_available);
-        for (block, qc, provision_hashes) in blocks {
-            actions.extend(self.submit_synced_block_for_verification(
-                topology,
-                block,
-                qc,
-                provision_hashes,
-            ));
+        for (block, qc) in blocks {
+            actions.extend(self.submit_synced_block_for_verification(topology, block, qc));
         }
 
         actions
@@ -3546,7 +3524,6 @@ impl BftState {
         topology: &TopologySnapshot,
         block: Block,
         qc: QuorumCertificate,
-        provision_hashes: Vec<Hash>,
     ) -> Vec<Action> {
         let block_hash = block.hash();
         let height = block.header().height.0;
@@ -3592,24 +3569,9 @@ impl BftState {
             self.maybe_unlock_for_qc(topology, &block.header().parent_qc);
         }
 
-        // Variant routing. `Live` sync blocks carry their provisions
-        // inline (attached by the serving peer), so we extract them here
-        // and hand them to the commit pipeline — the advance gate sees a
-        // matching expected/resolved set and proceeds without a lookup.
-        // `Sealed` blocks are past the execution window by definition: no
-        // provisions are needed, no advance-gate resolution is attempted,
-        // and `execution.on_block_committed` will short-circuit to the
-        // no-dispatch recording path.
-        let (provisions, expected_provision_hashes) = match &block {
-            Block::Live { provisions, .. } => (provisions.clone(), provision_hashes),
-            Block::Sealed { .. } => (Vec::new(), Vec::new()),
-        };
-
         let mut actions = vec![Action::CommitBlockByQcOnly {
             block: block.clone(),
             qc,
-            provisions,
-            provision_hashes: expected_provision_hashes,
             parent_state_root,
             parent_block_height,
         }];
@@ -3648,14 +3610,12 @@ impl BftState {
                 .log_verification_state(self.committed_height, next_height);
 
             // Take the next verified block at the expected height
-            let Some((block, qc, provision_hashes)) =
-                self.sync.take_verified_at_height(next_height)
-            else {
+            let Some((block, qc)) = self.sync.take_verified_at_height(next_height) else {
                 info!(next_height, "No verified block at next height - stopping");
                 break;
             };
 
-            actions.extend(self.apply_synced_block(topology, block, qc, provision_hashes));
+            actions.extend(self.apply_synced_block(topology, block, qc));
         }
 
         // After applying blocks, drain more buffered blocks for parallel verification
@@ -8018,7 +7978,7 @@ mod tests {
         };
 
         // Should return empty actions since block is stale
-        let actions = state.on_sync_block_ready_to_apply(&topology, block, qc, vec![]);
+        let actions = state.on_sync_block_ready_to_apply(&topology, block, qc);
         assert!(actions.is_empty(), "Stale sync block should be ignored");
 
         // Should NOT have set syncing flag

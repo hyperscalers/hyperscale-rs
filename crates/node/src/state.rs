@@ -11,7 +11,6 @@ use hyperscale_types::{
     Block, BlockHeader, BlockHeight, BlockManifest, FinalizedWave, Hash, Provision,
     QuorumCertificate, ReadyTransactions, RoutableTransaction, ShardGroupId, TopologySnapshot,
 };
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::instrument;
@@ -321,16 +320,9 @@ impl NodeStateMachine {
     }
 
     /// Handle block committed — notify all subsystems in the correct order.
-    fn on_block_committed(
-        &mut self,
-        block_hash: Hash,
-        height: u64,
-        block: Block,
-        provisions: Vec<Arc<Provision>>,
-        expected_provision_hashes: Vec<Hash>,
-    ) -> Vec<Action> {
+    fn on_block_committed(&mut self, block_hash: Hash, block: Block) -> Vec<Action> {
         let mut actions = Vec::new();
-        let block_height = BlockHeight(height);
+        let block_height = block.header().height;
 
         // Register committed tx hashes with BFT for timeout abort validation.
         let tx_hashes: Vec<Hash> = block.transactions().iter().map(|tx| tx.hash()).collect();
@@ -346,8 +338,7 @@ impl NodeStateMachine {
 
         // Mempool: marks Pending → Committed for block.transactions, then drives
         // each tx in `block.certificates` to its terminal state (Completed +
-        // tombstone). Runs independently of execution advance: BFT commit is
-        // authoritative for mempool terminal state.
+        // tombstone). Same behavior for consensus and sync commit paths.
         actions.extend(
             self.mempool
                 .on_block_committed_full(self.topology.snapshot(), &block),
@@ -359,53 +350,20 @@ impl NodeStateMachine {
                 .on_block_committed(self.topology.snapshot()),
         );
 
-        // Let provisions coordinator handle cleanup + fallback timeouts. Uses
-        // the delivered provisions — the coordinator manages its own inventory
-        // independent of whether execution is caught up.
-        let delivered_provision_hashes: Vec<Hash> = provisions.iter().map(|p| p.hash()).collect();
+        // Provisions coordinator: prune + schedule fallback timeouts. Reads
+        // provision hashes directly off the block — Live carries them
+        // inline, Sealed has none.
+        let provision_hashes: Vec<Hash> = block
+            .provisions()
+            .map(|ps| ps.iter().map(|p| p.hash()).collect())
+            .unwrap_or_default();
         actions.extend(self.provisions.on_block_committed(
             self.topology.snapshot(),
             &block,
-            &delivered_provision_hashes,
+            &provision_hashes,
         ));
 
-        // Advance gate: only process execution for this block if (a) no earlier
-        // block is still buffered awaiting data, and (b) every expected provision
-        // is locally resolvable. Otherwise buffer and emit a fetch; the retry
-        // loop (hooked into data-arrival events) will drain once complete.
-        let (resolved_provisions, missing) =
-            resolve_provisions(provisions, &expected_provision_hashes, &self.provisions);
-
-        let can_advance = !self.execution.has_awaiting_blocks() && missing.is_empty();
-        if can_advance {
-            actions.extend(self.apply_block_to_execution(&block, &resolved_provisions));
-        } else {
-            if !missing.is_empty() {
-                actions.push(Action::FetchProvisionLocal {
-                    block_hash,
-                    proposer: block.header().proposer,
-                    batch_hashes: missing,
-                });
-            }
-            self.execution.buffer_awaiting_block(
-                height,
-                hyperscale_execution::AwaitingBlock {
-                    block_hash,
-                    block_timestamp: block.header().timestamp,
-                    proposer: block.header().proposer,
-                    block,
-                    provisions: resolved_provisions,
-                    expected_provision_hashes,
-                },
-            );
-            // Execution is now blocked on data — escalate any still-pending
-            // cross-shard expected provisions past the default 10-block
-            // wait so remote shards retry without avoidable delay.
-            actions.extend(
-                self.provisions
-                    .flush_expected_provisions(self.topology.snapshot()),
-            );
-        }
+        actions.extend(self.apply_block_to_execution(&block));
 
         // Block committed changes in-flight counts — trigger proposal attempt
         // so the next proposer can include newly ready transactions.
@@ -414,63 +372,11 @@ impl NodeStateMachine {
         actions
     }
 
-    /// Drain the awaiting-blocks buffer in height order, applying each
-    /// block whose provisions now resolve locally. Stops at the first
-    /// unresolvable block — execution progresses strictly in order, so a
-    /// single stuck block holds every later one behind it until the
-    /// fetch protocol closes the gap. Called after every handled event so
-    /// any data-arrival path (provision, tx, wave) can unstick the buffer.
-    fn try_advance_execution(&mut self) -> Vec<Action> {
-        let mut actions = Vec::new();
-        loop {
-            let next_height = self.execution.processed_height() + 1;
-            let Some(entry) = self.execution.pop_awaiting_block(next_height) else {
-                break;
-            };
-            let (resolved, missing) = resolve_provisions(
-                entry.provisions,
-                &entry.expected_provision_hashes,
-                &self.provisions,
-            );
-            if !missing.is_empty() {
-                // Still short of data — put the block back with whatever
-                // additional provisions we just picked up and stop here.
-                // Later arrivals will trigger another advance attempt.
-                actions.push(Action::FetchProvisionLocal {
-                    block_hash: entry.block_hash,
-                    proposer: entry.proposer,
-                    batch_hashes: missing,
-                });
-                self.execution.buffer_awaiting_block(
-                    next_height,
-                    hyperscale_execution::AwaitingBlock {
-                        provisions: resolved,
-                        ..entry
-                    },
-                );
-                // Escalate any still-pending cross-shard expected provisions
-                // past the default 10-block wait: execution is blocked on
-                // data, so remote shards should retry without avoidable delay.
-                actions.extend(
-                    self.provisions
-                        .flush_expected_provisions(self.topology.snapshot()),
-                );
-                break;
-            }
-            actions.extend(self.apply_block_to_execution(&entry.block, &resolved));
-        }
-        actions
-    }
-
-    /// Apply a fully-resolved committed block to execution: cert cleanup,
-    /// wave setup + dispatch, vote emission. Split out so the advance gate
-    /// can either call this immediately or defer it until the retry loop
-    /// drains the awaiting buffer.
-    fn apply_block_to_execution(
-        &mut self,
-        block: &Block,
-        provisions: &[Arc<Provision>],
-    ) -> Vec<Action> {
+    /// Apply a committed block to execution: cert cleanup, wave setup +
+    /// dispatch (Live) or wave-assignment recording only (Sealed), and
+    /// vote emission. Provisions live inline on `Block::Live` — no
+    /// separate argument needed.
+    fn apply_block_to_execution(&mut self, block: &Block) -> Vec<Action> {
         let mut actions = Vec::new();
 
         // Release execution's per-wave bookkeeping for wave certs included in
@@ -482,11 +388,10 @@ impl NodeStateMachine {
             self.bft.remove_committed_transaction(&cert_hash);
         }
 
-        actions.extend(self.execution.on_block_committed(
-            self.topology.snapshot(),
-            block,
-            provisions,
-        ));
+        actions.extend(
+            self.execution
+                .on_block_committed(self.topology.snapshot(), block),
+        );
 
         // Round voting: scan all incomplete waves and emit votes for complete ones.
         // This is the SINGLE path to execution voting. Abort intents have already
@@ -675,13 +580,9 @@ impl StateMachine for NodeStateMachine {
             ),
 
             // ── Block Committed ──────────────────────────────────────────
-            ProtocolEvent::BlockCommitted {
-                block_hash,
-                height,
-                block,
-                provisions,
-                provision_hashes,
-            } => self.on_block_committed(block_hash, height, block, provisions, provision_hashes),
+            ProtocolEvent::BlockCommitted { block_hash, block } => {
+                self.on_block_committed(block_hash, block)
+            }
 
             // ── Block Persisted (RocksDB write complete) ───────────────
             // Advances `last_persisted_height`, a fallback gate for deferred
@@ -803,16 +704,9 @@ impl StateMachine for NodeStateMachine {
                 transactions,
             ),
             // ── Storage / Sync ───────────────────────────────────────────
-            ProtocolEvent::SyncBlockReadyToApply {
-                block,
-                qc,
-                provision_hashes,
-            } => self.bft.on_sync_block_ready_to_apply(
-                self.topology.snapshot(),
-                block,
-                qc,
-                provision_hashes,
-            ),
+            ProtocolEvent::SyncBlockReadyToApply { block, qc } => self
+                .bft
+                .on_sync_block_ready_to_apply(self.topology.snapshot(), block, qc),
             // Handled by IoLoop directly (sync verification pipeline).
             ProtocolEvent::SyncEcVerificationComplete { .. } => vec![],
             // SyncProtocol finished fetching — tell BftState to exit sync
@@ -886,12 +780,6 @@ impl StateMachine for NodeStateMachine {
             actions.push(Action::Continuation(ProtocolEvent::ContentAvailable));
         }
 
-        // Every event is a potential unblock point for execution's
-        // awaiting-blocks buffer: a provision arrival fills a gap, a
-        // transaction or wave arrival (future-proofing the gate) makes a
-        // block resolvable. Cheap no-op when the buffer is empty.
-        actions.extend(self.try_advance_execution());
-
         actions
     }
 
@@ -906,39 +794,4 @@ impl StateMachine for NodeStateMachine {
     fn now(&self) -> Duration {
         self.now
     }
-}
-
-/// Resolve the expected provision set for a committed block.
-///
-/// Starts from the provisions delivered inline with the commit action and
-/// tops up from the coordinator's cache for any hash in `expected_hashes`
-/// that isn't already present. Returns the (possibly-reordered) resolved
-/// set plus any hashes that couldn't be resolved locally — the caller is
-/// expected to emit a fetch for those and buffer the block.
-fn resolve_provisions(
-    provided: Vec<Arc<Provision>>,
-    expected_hashes: &[Hash],
-    coordinator: &ProvisionCoordinator,
-) -> (Vec<Arc<Provision>>, Vec<Hash>) {
-    if expected_hashes.is_empty() {
-        return (provided, Vec::new());
-    }
-    let mut have: HashMap<Hash, Arc<Provision>> =
-        provided.into_iter().map(|p| (p.hash(), p)).collect();
-    let mut missing = Vec::new();
-    for h in expected_hashes {
-        if have.contains_key(h) {
-            continue;
-        }
-        if let Some(batch) = coordinator.get_batch_by_hash(h) {
-            have.insert(*h, batch);
-        } else {
-            missing.push(*h);
-        }
-    }
-    let resolved: Vec<Arc<Provision>> = expected_hashes
-        .iter()
-        .filter_map(|h| have.remove(h))
-        .collect();
-    (resolved, missing)
 }

@@ -201,15 +201,6 @@ impl PendingBlock {
         self.missing_provision_hashes.iter().copied().collect()
     }
 
-    /// All received provision batches, in arbitrary order.
-    ///
-    /// When `is_complete()` is true, this contains the full set of provisions
-    /// referenced by the block manifest — no lookup against any external cache
-    /// is needed at commit time.
-    pub fn provisions(&self) -> Vec<Arc<Provision>> {
-        self.received_provisions.values().cloned().collect()
-    }
-
     /// Check if this pending block needs a specific provision batch.
     pub fn needs_provision(&self, batch_hash: &Hash) -> bool {
         self.missing_provision_hashes.contains(batch_hash)

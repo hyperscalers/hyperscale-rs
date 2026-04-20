@@ -516,10 +516,7 @@ impl SimulationRunner {
                 // Sync state machine with actual JMT state after genesis bootstrap
                 let genesis_commit_event = NodeInput::Protocol(ProtocolEvent::BlockCommitted {
                     block_hash: genesis_block.hash(),
-                    height: 0,
                     block: genesis_block.clone(),
-                    provisions: vec![],
-                    provision_hashes: vec![],
                 });
                 self.schedule_event(node_index, self.now, genesis_commit_event);
             }

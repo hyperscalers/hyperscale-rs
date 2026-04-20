@@ -106,10 +106,9 @@ pub enum SyncInput {
     },
     /// A block response was received.
     /// `None` means the peer did not have the block.
-    /// `provision_hashes` carries the block manifest's provision batch hashes.
     BlockResponseReceived {
         height: u64,
-        block: Box<Option<(Block, QuorumCertificate, Vec<Hash>)>>,
+        block: Box<Option<(Block, QuorumCertificate)>>,
     },
     /// A block fetch failed after all retries.
     BlockFetchFailed { height: u64 },
@@ -125,11 +124,9 @@ pub enum SyncOutput {
     /// choose between `Block::Live` and `Block::Sealed`.
     FetchBlock { height: u64, target_height: u64 },
     /// A validated block is ready to deliver to BFT.
-    /// `provision_hashes` come straight from the block's manifest.
     DeliverBlock {
         block: Box<Block>,
         qc: Box<QuorumCertificate>,
-        provision_hashes: Vec<Hash>,
     },
     /// Sync is complete (reached target).
     SyncComplete { height: u64 },
@@ -232,12 +229,12 @@ impl SyncProtocol {
     fn handle_block_response(
         &mut self,
         height: u64,
-        block: Option<(Block, QuorumCertificate, Vec<Hash>)>,
+        block: Option<(Block, QuorumCertificate)>,
     ) -> Vec<SyncOutput> {
         self.heights_in_flight.remove(&height);
 
         match block {
-            Some((block, qc, provision_hashes)) => {
+            Some((block, qc)) => {
                 // Validate
                 if block.header().height.0 != height {
                     warn!(
@@ -271,7 +268,6 @@ impl SyncProtocol {
                 let mut outputs = vec![SyncOutput::DeliverBlock {
                     block: Box::new(block),
                     qc: Box::new(qc),
-                    provision_hashes,
                 }];
                 outputs.extend(self.emit_fetch_outputs());
                 outputs
@@ -411,7 +407,7 @@ pub fn serve_block_request(
         req.height.0 + WAVE_TIMEOUT_BLOCKS > req.target_height.0 && !provision_hashes.is_empty();
 
     if !needs_live {
-        return GetBlockResponse::found(block, qc, provision_hashes);
+        return GetBlockResponse::found(block, qc);
     }
 
     let resolved: Option<Vec<Arc<Provision>>> = provision_hashes
@@ -444,7 +440,7 @@ pub fn serve_block_request(
         provisions,
     };
 
-    GetBlockResponse::found(block, qc, provision_hashes)
+    GetBlockResponse::found(block, qc)
 }
 
 #[cfg(test)]
