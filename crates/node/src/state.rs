@@ -403,6 +403,13 @@ impl NodeStateMachine {
                     expected_provision_hashes,
                 },
             );
+            // Execution is now blocked on data — escalate any still-pending
+            // cross-shard expected provisions past the default 10-block
+            // wait so remote shards retry without avoidable delay.
+            actions.extend(
+                self.provisions
+                    .flush_expected_provisions(self.topology.snapshot()),
+            );
         }
 
         // Block committed changes in-flight counts — trigger proposal attempt
@@ -445,6 +452,13 @@ impl NodeStateMachine {
                         provisions: resolved,
                         ..entry
                     },
+                );
+                // Escalate any still-pending cross-shard expected provisions
+                // past the default 10-block wait: execution is blocked on
+                // data, so remote shards should retry without avoidable delay.
+                actions.extend(
+                    self.provisions
+                        .flush_expected_provisions(self.topology.snapshot()),
                 );
                 break;
             }
