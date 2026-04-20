@@ -1501,44 +1501,49 @@ impl ExecutionState {
     // ═══════════════════════════════════════════════════════════════════════════
 
     /// Handle block committed - start executing transactions.
-    #[instrument(skip(self, transactions), fields(
-        height = height,
-        block_hash = ?block_hash,
-        tx_count = transactions.len()
+    #[instrument(skip(self, block), fields(
+        height = block.header().height.0,
+        block_hash = ?block.hash(),
+        tx_count = block.transactions().len(),
+        is_live = block.is_live(),
     ))]
-    #[allow(clippy::too_many_arguments)]
     pub fn on_block_committed(
         &mut self,
         topology: &TopologySnapshot,
-        block_hash: Hash,
-        height: u64,
-        block_timestamp: u64,
-        proposer: ValidatorId,
-        transactions: Vec<Arc<RoutableTransaction>>,
+        block: &Block,
         provisions: &[Arc<Provision>],
     ) -> Vec<Action> {
+        let block_hash = block.hash();
+        let header = block.header();
+        let height = header.height.0;
+        let block_timestamp = header.timestamp;
+        let proposer = header.proposer;
+        let transactions = block.transactions();
+
         let mut actions = Vec::new();
 
         // ── Provision broadcasting (proposer only) ─────────────────────
         //
-        // Provisioning is a block-level proposer duty: the proposer must
-        // broadcast state entries for all cross-shard transactions in the
-        // committed block, regardless of local execution state.
-        let local_shard = topology.local_shard();
-        let is_proposer = topology.local_validator_id() == proposer;
+        // Only applies to `Live` blocks: `Sealed` is past the execution
+        // window, so any waves it sourced have already been aggregated and
+        // finalized upstream — there's nothing left to broadcast.
+        if block.is_live() {
+            let local_shard = topology.local_shard();
+            let is_proposer = topology.local_validator_id() == proposer;
 
-        if is_proposer {
-            if let Some((requests, shard_recipients)) =
-                Self::build_provision_requests(topology, &transactions, local_shard)
-            {
-                actions.push(Action::FetchAndBroadcastProvision {
-                    block_hash,
-                    requests,
-                    source_shard: local_shard,
-                    block_height: BlockHeight(height),
-                    block_timestamp,
-                    shard_recipients,
-                });
+            if is_proposer {
+                if let Some((requests, shard_recipients)) =
+                    Self::build_provision_requests(topology, transactions, local_shard)
+                {
+                    actions.push(Action::FetchAndBroadcastProvision {
+                        block_hash,
+                        requests,
+                        source_shard: local_shard,
+                        block_height: BlockHeight(height),
+                        block_timestamp,
+                        shard_recipients,
+                    });
+                }
             }
         }
 
@@ -1579,23 +1584,34 @@ impl ExecutionState {
         }
 
         if !transactions.is_empty() {
-            tracing::debug!(
-                height = height,
-                tx_count = transactions.len(),
-                "Starting execution for new transactions"
-            );
-
-            // Collect tx hashes before setup — needed for early EC replay below.
             let block_tx_hashes: Vec<Hash> = transactions.iter().map(|tx| tx.hash()).collect();
 
-            let (dispatch_actions, early_votes) =
-                self.setup_waves_and_dispatch(topology, block_hash, height, &transactions);
-            actions.extend(dispatch_actions);
-            for vote in early_votes {
-                actions.extend(self.on_execution_vote(topology, vote));
+            if block.is_live() {
+                tracing::debug!(
+                    height = height,
+                    tx_count = transactions.len(),
+                    "Starting execution for new transactions"
+                );
+
+                let (dispatch_actions, early_votes) =
+                    self.setup_waves_and_dispatch(topology, block_hash, height, transactions);
+                actions.extend(dispatch_actions);
+                for vote in early_votes {
+                    actions.extend(self.on_execution_vote(topology, vote));
+                }
+            } else {
+                // Sealed: the cross-shard execution window has passed for
+                // this block. Its waves will finalize from the already-
+                // aggregated cert + receipts included downstream. Record
+                // only the tx→wave mapping so a late-arriving cert can
+                // still route back to each tx for mempool terminal state;
+                // skip WaveState creation, dispatch, and vote tracking.
+                self.register_sealed_wave_assignments(topology, height, transactions);
             }
 
             // Replay buffered early ECs for txs that now have wave assignments.
+            // Runs for both variants: a Sealed block's txs still need cert
+            // routing when that cert eventually lands.
             let mut ecs_to_replay: Vec<Arc<ExecutionCertificate>> = Vec::new();
             let mut seen_ec_ptrs: HashSet<usize> = HashSet::new();
             for tx_hash in &block_tx_hashes {
@@ -1621,7 +1637,9 @@ impl ExecutionState {
 
         // Apply this block's provisions after wave setup so newly-created
         // waves can transition to provisioned from the same block's batches.
-        if !provisions.is_empty() {
+        // Sealed blocks skip this: provisions are dropped by design past the
+        // window, and the waves they would have fed are already resolved.
+        if block.is_live() && !provisions.is_empty() {
             actions.extend(self.apply_committed_provisions(topology, provisions, height));
         }
 
@@ -1630,6 +1648,25 @@ impl ExecutionState {
         }
 
         actions
+    }
+
+    /// Register tx → wave assignments for a `Sealed` block without any of
+    /// the execution-side state setup (WaveState, vote tracker, conflict
+    /// detector, required-provision tracking). The block's waves are
+    /// already settled; we only need the mapping so a future cert can
+    /// route back to the tx for mempool terminal-state bookkeeping.
+    fn register_sealed_wave_assignments(
+        &mut self,
+        topology: &TopologySnapshot,
+        block_height: u64,
+        transactions: &[Arc<RoutableTransaction>],
+    ) {
+        let waves = self.assign_waves(topology, block_height, transactions);
+        for (wave_id, txs) in waves {
+            for (tx, _) in &txs {
+                self.wave_assignments.insert(tx.hash(), wave_id.clone());
+            }
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -2173,6 +2210,42 @@ mod tests {
         ExecutionState::new()
     }
 
+    /// Build a minimal `Block::Live` suitable for driving
+    /// `on_block_committed` in tests. The returned block's `hash()` is
+    /// derived from a deterministic header built from the inputs.
+    fn make_live_block(
+        topology: &TopologySnapshot,
+        height: u64,
+        timestamp: u64,
+        proposer: ValidatorId,
+        transactions: Vec<Arc<RoutableTransaction>>,
+    ) -> Block {
+        use hyperscale_types::{BlockHeader, QuorumCertificate};
+        let header = BlockHeader {
+            shard_group_id: topology.local_shard(),
+            height: BlockHeight(height),
+            parent_hash: Hash::ZERO,
+            parent_qc: QuorumCertificate::genesis(),
+            proposer,
+            timestamp,
+            round: 0,
+            is_fallback: false,
+            state_root: Hash::ZERO,
+            transaction_root: Hash::ZERO,
+            certificate_root: Hash::ZERO,
+            local_receipt_root: Hash::ZERO,
+            provision_root: Hash::ZERO,
+            waves: vec![],
+            in_flight: 0,
+        };
+        Block::Live {
+            header,
+            transactions,
+            certificates: vec![],
+            provisions: vec![],
+        }
+    }
+
     #[test]
     fn test_execution_state_creation() {
         let state = make_test_state();
@@ -2186,18 +2259,16 @@ mod tests {
 
         let tx = test_transaction(1);
         let tx_hash = tx.hash();
-        let block_hash = Hash::from_bytes(b"block1");
-
-        // Block committed with transaction
-        let actions = state.on_block_committed(
+        let block = make_live_block(
             &topology,
-            block_hash,
             1,
             1000,
             ValidatorId(0),
             vec![Arc::new(tx.clone())],
-            &[],
         );
+
+        // Block committed with transaction
+        let actions = state.on_block_committed(&topology, &block, &[]);
 
         // Should request execution (single-shard path) and set up wave tracking
         assert!(!actions.is_empty());
@@ -2324,39 +2395,30 @@ mod tests {
     #[test]
     fn test_only_leader_gets_vote_tracker() {
         let tx = test_transaction(1);
-        let block_hash = Hash::from_bytes(b"block1");
 
         // Determine who the wave leader will be for this block's wave.
         let topo0 = make_topology_for(0);
         let committee = topo0.local_committee().to_vec();
+        let block = make_live_block(&topo0, 1, 1000, ValidatorId(0), vec![Arc::new(tx.clone())]);
 
         // Commit the block as validator 0 to discover the wave_id.
         let mut state0 = make_test_state();
-        state0.on_block_committed(
-            &topo0,
-            block_hash,
-            1,
-            1000,
-            ValidatorId(0),
-            vec![Arc::new(tx.clone())],
-            &[],
-        );
+        state0.on_block_committed(&topo0, &block, &[]);
         let wave_id = state0.wave_assignments.values().next().unwrap().clone();
 
         let leader = hyperscale_types::wave_leader(&wave_id, &committee);
 
         // Leader should have a VoteTracker.
         let topo_leader = make_topology_for(leader.0);
-        let mut state_leader = make_test_state();
-        state_leader.on_block_committed(
+        let block_leader = make_live_block(
             &topo_leader,
-            block_hash,
             1,
             1000,
             ValidatorId(0),
             vec![Arc::new(tx.clone())],
-            &[],
         );
+        let mut state_leader = make_test_state();
+        state_leader.on_block_committed(&topo_leader, &block_leader, &[]);
         assert!(
             state_leader.vote_trackers.contains_key(&wave_id),
             "Leader should have VoteTracker"
@@ -2365,16 +2427,15 @@ mod tests {
         // A non-leader should NOT have a VoteTracker.
         let non_leader_id = committee.iter().find(|&&v| v != leader).unwrap();
         let topo_non = make_topology_for(non_leader_id.0);
-        let mut state_non = make_test_state();
-        state_non.on_block_committed(
+        let block_non = make_live_block(
             &topo_non,
-            block_hash,
             1,
             1000,
             ValidatorId(0),
             vec![Arc::new(tx.clone())],
-            &[],
         );
+        let mut state_non = make_test_state();
+        state_non.on_block_committed(&topo_non, &block_non, &[]);
         assert!(
             !state_non.vote_trackers.contains_key(&wave_id),
             "Non-leader should NOT have VoteTracker"
@@ -2384,20 +2445,13 @@ mod tests {
     #[test]
     fn test_fallback_tracker_created_on_vote() {
         let tx = test_transaction(1);
-        let block_hash = Hash::from_bytes(b"block1");
         let topo = make_topology_for(0);
         let committee = topo.local_committee().to_vec();
+        let block = make_live_block(&topo, 1, 1000, ValidatorId(0), vec![Arc::new(tx.clone())]);
+        let block_hash = block.hash();
 
         let mut state = make_test_state();
-        state.on_block_committed(
-            &topo,
-            block_hash,
-            1,
-            1000,
-            ValidatorId(0),
-            vec![Arc::new(tx.clone())],
-            &[],
-        );
+        state.on_block_committed(&topo, &block, &[]);
 
         let wave_id = state.wave_assignments.values().next().unwrap().clone();
         let leader = hyperscale_types::wave_leader(&wave_id, &committee);
@@ -2405,16 +2459,15 @@ mod tests {
         // If we're the leader, this test doesn't apply — find a non-leader topology.
         let non_leader_id = committee.iter().find(|&&v| v != leader).unwrap();
         let topo_non = make_topology_for(non_leader_id.0);
-        let mut state_non = make_test_state();
-        state_non.on_block_committed(
+        let block_non = make_live_block(
             &topo_non,
-            block_hash,
             1,
             1000,
             ValidatorId(0),
             vec![Arc::new(tx.clone())],
-            &[],
         );
+        let mut state_non = make_test_state();
+        state_non.on_block_committed(&topo_non, &block_non, &[]);
 
         assert!(!state_non.vote_trackers.contains_key(&wave_id));
         assert!(state_non.waves.contains_key(&wave_id));
