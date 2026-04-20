@@ -421,6 +421,52 @@ impl NodeStateMachine {
         actions
     }
 
+    /// Drain the awaiting-blocks buffer in height order, applying each
+    /// block whose provisions now resolve locally. Stops at the first
+    /// unresolvable block — execution progresses strictly in order, so a
+    /// single stuck block holds every later one behind it until the
+    /// fetch protocol closes the gap. Called after every handled event so
+    /// any data-arrival path (provision, tx, wave) can unstick the buffer.
+    fn try_advance_execution(&mut self) -> Vec<Action> {
+        let mut actions = Vec::new();
+        loop {
+            let next_height = self.execution.processed_height() + 1;
+            let Some(entry) = self.execution.pop_awaiting_block(next_height) else {
+                break;
+            };
+            let (resolved, missing) = resolve_provisions(
+                entry.provisions,
+                &entry.expected_provision_hashes,
+                &self.provisions,
+            );
+            if !missing.is_empty() {
+                // Still short of data — put the block back with whatever
+                // additional provisions we just picked up and stop here.
+                // Later arrivals will trigger another advance attempt.
+                actions.push(Action::FetchProvisionLocal {
+                    block_hash: entry.block_hash,
+                    proposer: entry.proposer,
+                    batch_hashes: missing,
+                });
+                self.execution.buffer_awaiting_block(
+                    next_height,
+                    hyperscale_execution::AwaitingBlock {
+                        provisions: resolved,
+                        ..entry
+                    },
+                );
+                break;
+            }
+            actions.extend(self.apply_block_to_execution(
+                entry.block_hash,
+                next_height,
+                &entry.block,
+                &resolved,
+            ));
+        }
+        actions
+    }
+
     /// Apply a fully-resolved committed block to execution: cert cleanup,
     /// wave setup + dispatch, vote emission. Split out so the advance gate
     /// can either call this immediately or defer it until the retry loop
@@ -882,6 +928,12 @@ impl StateMachine for NodeStateMachine {
                 }
             }
         }
+
+        // Every event is a potential unblock point for execution's
+        // awaiting-blocks buffer: a provision arrival fills a gap, a
+        // transaction or wave arrival (future-proofing the gate) makes a
+        // block resolvable. Cheap no-op when the buffer is empty.
+        actions.extend(self.try_advance_execution());
 
         actions
     }

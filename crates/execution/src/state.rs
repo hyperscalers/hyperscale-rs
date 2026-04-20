@@ -420,6 +420,12 @@ impl ExecutionState {
         self.awaiting_blocks.insert(height, entry);
     }
 
+    /// Remove and return the awaiting block at `height`, if any. The
+    /// advancer uses this to drain blocks in order once their data lands.
+    pub fn pop_awaiting_block(&mut self, height: u64) -> Option<AwaitingBlock> {
+        self.awaiting_blocks.remove(&height)
+    }
+
     // ═══════════════════════════════════════════════════════════════════════════
     // Certificate Updates (from finalized_certificates)
     // ═══════════════════════════════════════════════════════════════════════════
