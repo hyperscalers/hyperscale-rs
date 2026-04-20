@@ -243,7 +243,7 @@ where
                     match block_and_qc {
                         Some((block, qc)) => {
                             let committed = hyperscale_types::CommittedBlockHeader::new(
-                                block.header,
+                                block.header().clone(),
                                 qc,
                             );
                             GetCommittedBlockHeaderResponse {

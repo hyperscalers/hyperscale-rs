@@ -178,16 +178,16 @@ impl hyperscale_storage::ChainWriter for RocksDbStorage {
                     let _guard = self.commit_lock.lock().unwrap();
                     SnapshotTreeStore::new(&self.db).read_jmt_metadata()
                 };
-                if block.header.height.0 <= current_version {
+                if block.header().height.0 <= current_version {
                     tracing::debug!(
-                        height = block.header.height.0,
+                        height = block.header().height.0,
                         current_version,
                         "PreparedCommit stale — block already committed, skipping"
                     );
                     roots.push(result_root);
                 } else {
                     tracing::debug!(
-                        height = block.header.height.0,
+                        height = block.header().height.0,
                         current_version,
                         "PreparedCommit stale, falling back to commit_block"
                     );
@@ -206,7 +206,7 @@ impl hyperscale_storage::ChainWriter for RocksDbStorage {
         qc: &Arc<hyperscale_types::QuorumCertificate>,
     ) -> hyperscale_types::Hash {
         let receipts: Vec<ReceiptBundle> = block
-            .certificates
+            .certificates()
             .iter()
             .flat_map(|fw| fw.receipts.iter().cloned())
             .collect();
@@ -251,7 +251,7 @@ impl RocksDbStorage {
         qc: &Arc<hyperscale_types::QuorumCertificate>,
         receipts: &[ReceiptBundle],
     ) -> hyperscale_types::Hash {
-        let block_height = block.header.height.0;
+        let block_height = block.header().height.0;
         let _commit_guard = self.commit_lock.lock().unwrap();
 
         let snapshot_store = SnapshotTreeStore::new(&self.db);

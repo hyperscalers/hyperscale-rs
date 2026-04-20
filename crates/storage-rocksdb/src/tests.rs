@@ -184,8 +184,8 @@ fn test_block_storage_and_retrieval() {
     commit_empty(&storage, &block, &qc);
 
     let (stored_block, stored_qc) = storage.get_block(BlockHeight(1)).unwrap();
-    assert_eq!(stored_block.header.height, BlockHeight(1));
-    assert_eq!(stored_block.header.timestamp, 1_000);
+    assert_eq!(stored_block.header().height, BlockHeight(1));
+    assert_eq!(stored_block.header().timestamp, 1_000);
     assert_eq!(stored_qc.block_hash, block.hash());
 }
 
@@ -202,9 +202,9 @@ fn test_block_range_retrieval() {
 
     let blocks = storage.get_blocks_range(BlockHeight(2), BlockHeight(5));
     assert_eq!(blocks.len(), 3);
-    assert_eq!(blocks[0].0.header.height, BlockHeight(2));
-    assert_eq!(blocks[1].0.header.height, BlockHeight(3));
-    assert_eq!(blocks[2].0.header.height, BlockHeight(4));
+    assert_eq!(blocks[0].0.header().height, BlockHeight(2));
+    assert_eq!(blocks[1].0.header().height, BlockHeight(3));
+    assert_eq!(blocks[2].0.header().height, BlockHeight(4));
 }
 
 #[test]
@@ -319,23 +319,99 @@ fn test_state_root_changes_on_commit() {
 // ChainWriter
 // ═══════════════════════════════════════════════════════════════════════
 
+/// Append a `FinalizedWave` to a block in place. Because `Block` is an enum,
+/// this replaces the whole value via `std::mem::replace`.
+fn push_wave(block: &mut hyperscale_types::Block, fw: Arc<hyperscale_types::FinalizedWave>) {
+    let taken = std::mem::replace(
+        block,
+        hyperscale_types::Block::Sealed {
+            header: block.header().clone(),
+            transactions: vec![],
+            certificates: vec![],
+        },
+    );
+    *block = match taken {
+        hyperscale_types::Block::Live {
+            header,
+            transactions,
+            mut certificates,
+            provisions,
+        } => {
+            certificates.push(fw);
+            hyperscale_types::Block::Live {
+                header,
+                transactions,
+                certificates,
+                provisions,
+            }
+        }
+        hyperscale_types::Block::Sealed {
+            header,
+            transactions,
+            mut certificates,
+        } => {
+            certificates.push(fw);
+            hyperscale_types::Block::Sealed {
+                header,
+                transactions,
+                certificates,
+            }
+        }
+    };
+}
+
 /// Wrap receipts into a single FinalizedWave attached to `block.certificates`,
 /// so the new `commit_block` (which derives receipts from `block.certificates`)
 /// can apply them.
 fn attach_receipts(block: &mut hyperscale_types::Block, receipts: Vec<ReceiptBundle>) {
-    block
-        .certificates
-        .push(Arc::new(hyperscale_types::FinalizedWave {
-            certificate: Arc::new(hyperscale_types::WaveCertificate {
-                wave_id: hyperscale_types::WaveId::new(
-                    ShardGroupId(0),
-                    block.header.height.0,
-                    std::collections::BTreeSet::new(),
-                ),
-                execution_certificates: vec![],
-            }),
-            receipts,
-        }));
+    let new_fw = Arc::new(hyperscale_types::FinalizedWave {
+        certificate: Arc::new(hyperscale_types::WaveCertificate {
+            wave_id: hyperscale_types::WaveId::new(
+                ShardGroupId(0),
+                block.header().height.0,
+                std::collections::BTreeSet::new(),
+            ),
+            execution_certificates: vec![],
+        }),
+        receipts,
+    });
+    // Take block out, mutate, and put back.
+    let taken = std::mem::replace(
+        block,
+        hyperscale_types::Block::Sealed {
+            header: block.header().clone(),
+            transactions: vec![],
+            certificates: vec![],
+        },
+    );
+    *block = match taken {
+        hyperscale_types::Block::Live {
+            header,
+            transactions,
+            mut certificates,
+            provisions,
+        } => {
+            certificates.push(new_fw);
+            hyperscale_types::Block::Live {
+                header,
+                transactions,
+                certificates,
+                provisions,
+            }
+        }
+        hyperscale_types::Block::Sealed {
+            header,
+            transactions,
+            mut certificates,
+        } => {
+            certificates.push(new_fw);
+            hyperscale_types::Block::Sealed {
+                header,
+                transactions,
+                certificates,
+            }
+        }
+    };
 }
 
 #[test]
@@ -414,11 +490,35 @@ fn test_commit_block_stores_certificates() {
     let wave_hash = cert.wave_id.hash();
 
     // Create a block that includes this certificate
-    let mut block = make_test_block(1);
-    block.certificates = vec![Arc::new(hyperscale_types::FinalizedWave {
-        certificate: cert,
-        receipts: vec![],
-    })];
+    let block = make_test_block(1);
+    let block = match block {
+        hyperscale_types::Block::Live {
+            header,
+            transactions,
+            provisions,
+            ..
+        } => hyperscale_types::Block::Live {
+            header,
+            transactions,
+            certificates: vec![Arc::new(hyperscale_types::FinalizedWave {
+                certificate: cert,
+                receipts: vec![],
+            })],
+            provisions,
+        },
+        hyperscale_types::Block::Sealed {
+            header,
+            transactions,
+            ..
+        } => hyperscale_types::Block::Sealed {
+            header,
+            transactions,
+            certificates: vec![Arc::new(hyperscale_types::FinalizedWave {
+                certificate: cert,
+                receipts: vec![],
+            })],
+        },
+    };
     let qc = make_test_qc(&block);
 
     let _ = storage.commit_block(&Arc::new(block), &Arc::new(qc));
@@ -544,7 +644,7 @@ fn test_get_block_for_sync() {
 
     let result = storage.get_block_for_sync(BlockHeight(1));
     assert!(result.is_some());
-    assert_eq!(result.unwrap().0.header.height, BlockHeight(1));
+    assert_eq!(result.unwrap().0.header().height, BlockHeight(1));
 
     assert!(storage.get_block_for_sync(BlockHeight(999)).is_none());
 }
@@ -638,7 +738,7 @@ fn test_blocks_survive_reopen() {
         let (block, qc) = storage
             .get_block(BlockHeight(1))
             .expect("block should survive reopen");
-        assert_eq!(block.header.height, BlockHeight(1));
+        assert_eq!(block.header().height, BlockHeight(1));
         assert_eq!(qc.height, BlockHeight(1));
     }
 }
@@ -697,9 +797,9 @@ fn test_ec_survives_reopen() {
         let qc = hyperscale_storage::test_helpers::make_test_qc(&block);
         storage.commit_block(&Arc::new(block), &Arc::new(qc));
         let mut block = hyperscale_storage::test_helpers::make_test_block(1);
-        block
-            .certificates
-            .push(Arc::new(hyperscale_types::FinalizedWave {
+        push_wave(
+            &mut block,
+            Arc::new(hyperscale_types::FinalizedWave {
                 certificate: Arc::new(hyperscale_types::WaveCertificate {
                     wave_id: hyperscale_types::WaveId::new(
                         ShardGroupId(0),
@@ -709,7 +809,8 @@ fn test_ec_survives_reopen() {
                     execution_certificates: vec![Arc::new(ec)],
                 }),
                 receipts: vec![],
-            }));
+            }),
+        );
         let qc = hyperscale_storage::test_helpers::make_test_qc(&block);
         storage.commit_block(&Arc::new(block), &Arc::new(qc));
     }
@@ -729,9 +830,9 @@ fn test_ec_atomic_with_block_commit() {
 
     let ec = hyperscale_storage::test_helpers::make_test_execution_certificate(1, 1);
     let mut block = make_test_block(1);
-    block
-        .certificates
-        .push(Arc::new(hyperscale_types::FinalizedWave {
+    push_wave(
+        &mut block,
+        Arc::new(hyperscale_types::FinalizedWave {
             certificate: Arc::new(hyperscale_types::WaveCertificate {
                 wave_id: hyperscale_types::WaveId::new(
                     ShardGroupId(0),
@@ -741,7 +842,8 @@ fn test_ec_atomic_with_block_commit() {
                 execution_certificates: vec![Arc::new(ec)],
             }),
             receipts: vec![],
-        }));
+        }),
+    );
     let qc = make_test_qc(&block);
 
     // Commit block with EC atomically
@@ -784,19 +886,18 @@ fn rocks_commit_with(
             }),
             execution_output: None,
         };
-        block
-            .certificates
-            .push(Arc::new(hyperscale_types::FinalizedWave {
-                certificate: Arc::new(hyperscale_types::WaveCertificate {
-                    wave_id: hyperscale_types::WaveId::new(
-                        ShardGroupId(0),
-                        block.header.height.0,
-                        std::collections::BTreeSet::new(),
-                    ),
-                    execution_certificates: vec![],
-                }),
-                receipts: vec![receipt],
-            }));
+        let wave = Arc::new(hyperscale_types::FinalizedWave {
+            certificate: Arc::new(hyperscale_types::WaveCertificate {
+                wave_id: hyperscale_types::WaveId::new(
+                    ShardGroupId(0),
+                    block.header().height.0,
+                    std::collections::BTreeSet::new(),
+                ),
+                execution_certificates: vec![],
+            }),
+            receipts: vec![receipt],
+        });
+        push_wave(&mut block, wave);
     }
     storage.commit_block(&Arc::new(block), &Arc::new(qc.clone()));
 }

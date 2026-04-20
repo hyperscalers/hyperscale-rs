@@ -103,8 +103,8 @@ impl RocksDbStorage {
         qc: &QuorumCertificate,
     ) {
         let metadata = BlockMetadata::from_block(block, qc.clone());
-        self.cf_put::<BlocksCf>(batch, &block.header.height.0, &metadata);
-        for tx in block.transactions.iter() {
+        self.cf_put::<BlocksCf>(batch, &block.header().height.0, &metadata);
+        for tx in block.transactions().iter() {
             self.cf_put_raw::<TransactionsCf>(
                 batch,
                 &tx.hash(),
@@ -112,7 +112,7 @@ impl RocksDbStorage {
                 tx.cached_sbor_bytes(),
             );
         }
-        for fw in &block.certificates {
+        for fw in block.certificates() {
             self.cf_put::<CertificatesCf>(batch, &fw.wave_id().hash(), fw.certificate.as_ref());
         }
     }
@@ -179,10 +179,11 @@ impl RocksDbStorage {
         };
 
         // 5. Reconstruct block
-        let block = Block {
+        let block = Block::Live {
             header: metadata.header,
             transactions,
             certificates,
+            provisions: vec![],
         };
 
         let elapsed = start.elapsed().as_secs_f64();
@@ -281,10 +282,11 @@ impl RocksDbStorage {
         };
 
         // 5. Full block available - reconstruct it
-        let block = Block {
+        let block = Block::Live {
             header: metadata.header,
             transactions,
             certificates,
+            provisions: vec![],
         };
         let provision_hashes = metadata.manifest.provision_hashes;
 

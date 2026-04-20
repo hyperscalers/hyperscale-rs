@@ -88,7 +88,7 @@ pub fn make_test_block(height: u64) -> Block {
     // Use the full u64 bytes for the parent hash so heights > 255 don't alias.
     let mut parent_bytes = [0u8; 32];
     parent_bytes[..8].copy_from_slice(&height.to_le_bytes());
-    Block {
+    Block::Live {
         header: BlockHeader {
             shard_group_id: ShardGroupId(0),
             height: BlockHeight(height),
@@ -108,6 +108,7 @@ pub fn make_test_block(height: u64) -> Block {
         },
         transactions: vec![],
         certificates: vec![],
+        provisions: vec![],
     }
 }
 
@@ -116,12 +117,12 @@ pub fn make_test_qc(block: &Block) -> QuorumCertificate {
     QuorumCertificate {
         block_hash: block.hash(),
         shard_group_id: ShardGroupId(0),
-        height: block.header.height,
-        parent_block_hash: block.header.parent_hash,
+        height: block.header().height,
+        parent_block_hash: block.header().parent_hash,
         round: 0,
         aggregated_signature: zero_bls_signature(),
         signers: SignerBitfield::new(4),
-        weighted_timestamp_ms: block.header.timestamp,
+        weighted_timestamp_ms: block.header().timestamp,
     }
 }
 
@@ -178,18 +179,46 @@ pub fn make_test_execution_certificate(seed: u8, block_height: u64) -> Execution
 
 /// Build a test block that carries ECs inside its wave certificates.
 fn make_test_block_with_ecs(height: u64, ecs: Vec<Arc<ExecutionCertificate>>) -> Block {
-    let mut block = make_test_block(height);
-    if !ecs.is_empty() {
-        let certificate = Arc::new(WaveCertificate {
-            wave_id: WaveId::new(ShardGroupId(0), height, BTreeSet::new()),
-            execution_certificates: ecs,
-        });
-        block.certificates.push(Arc::new(FinalizedWave {
-            certificate,
-            receipts: vec![],
-        }));
+    let block = make_test_block(height);
+    if ecs.is_empty() {
+        return block;
     }
-    block
+    let certificate = Arc::new(WaveCertificate {
+        wave_id: WaveId::new(ShardGroupId(0), height, BTreeSet::new()),
+        execution_certificates: ecs,
+    });
+    let new_fw = Arc::new(FinalizedWave {
+        certificate,
+        receipts: vec![],
+    });
+    match block {
+        Block::Live {
+            header,
+            transactions,
+            mut certificates,
+            provisions,
+        } => {
+            certificates.push(new_fw);
+            Block::Live {
+                header,
+                transactions,
+                certificates,
+                provisions,
+            }
+        }
+        Block::Sealed {
+            header,
+            transactions,
+            mut certificates,
+        } => {
+            certificates.push(new_fw);
+            Block::Sealed {
+                header,
+                transactions,
+                certificates,
+            }
+        }
+    }
 }
 
 /// Helper to commit empty blocks up to (but not including) the target height.

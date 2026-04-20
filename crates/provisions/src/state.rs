@@ -180,7 +180,7 @@ impl ProvisionCoordinator {
         committed_provision_hashes: &[Hash],
     ) -> Vec<Action> {
         // Update local committed height
-        self.local_committed_height = block.header.height;
+        self.local_committed_height = block.header().height;
 
         // Prune provision batches that were committed in this block.
         if !committed_provision_hashes.is_empty() {
@@ -1010,18 +1010,14 @@ mod tests {
 
     /// Make a minimal Block at the given height for on_block_committed calls.
     fn make_block(height: u64) -> hyperscale_types::Block {
-        hyperscale_types::Block::genesis(ShardGroupId(0), ValidatorId(0), Hash::ZERO)
-            .tap_mut(|b| b.header.height = BlockHeight(height))
-    }
-
-    /// Helper trait to mutate in-place and return self.
-    trait TapMut {
-        fn tap_mut(self, f: impl FnOnce(&mut Self)) -> Self;
-    }
-    impl<T> TapMut for T {
-        fn tap_mut(mut self, f: impl FnOnce(&mut Self)) -> Self {
-            f(&mut self);
-            self
+        let mut header =
+            hyperscale_types::BlockHeader::genesis(ShardGroupId(0), ValidatorId(0), Hash::ZERO);
+        header.height = BlockHeight(height);
+        hyperscale_types::Block::Live {
+            header,
+            transactions: vec![],
+            certificates: vec![],
+            provisions: vec![],
         }
     }
 

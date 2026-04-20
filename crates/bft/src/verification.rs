@@ -259,19 +259,19 @@ impl VerificationPipeline {
             self.verified_transaction_roots.contains(&block_hash)
         };
 
-        let certificate_root_ok = if block.certificates.is_empty() {
+        let certificate_root_ok = if block.certificates().is_empty() {
             true
         } else {
             self.verified_certificate_roots.contains(&block_hash)
         };
 
-        let local_receipt_root_ok = if block.certificates.is_empty() {
+        let local_receipt_root_ok = if block.certificates().is_empty() {
             true
         } else {
             self.verified_local_receipt_roots.contains(&block_hash)
         };
 
-        let provision_root_ok = if block.header.provision_root == Hash::ZERO {
+        let provision_root_ok = if block.header().provision_root == Hash::ZERO {
             true
         } else {
             self.verified_provision_roots.contains(&block_hash)
@@ -322,7 +322,7 @@ impl VerificationPipeline {
             "NOT_STARTED"
         };
 
-        let certificate_root_status = if block.certificates.is_empty() {
+        let certificate_root_status = if block.certificates().is_empty() {
             "skipped(no_certs)"
         } else if self.verified_certificate_roots.contains(&block_hash) {
             "verified"
@@ -335,7 +335,7 @@ impl VerificationPipeline {
             "NOT_STARTED"
         };
 
-        let local_receipt_root_status = if block.certificates.is_empty() {
+        let local_receipt_root_status = if block.certificates().is_empty() {
             "skipped(no_certs)"
         } else if self.verified_local_receipt_roots.contains(&block_hash) {
             "verified"
@@ -348,7 +348,7 @@ impl VerificationPipeline {
             "NOT_STARTED"
         };
 
-        let provision_root_status = if block.header.provision_root == Hash::ZERO {
+        let provision_root_status = if block.header().provision_root == Hash::ZERO {
             "skipped(no_provisions)"
         } else if self.verified_provision_roots.contains(&block_hash) {
             "verified"
@@ -369,9 +369,9 @@ impl VerificationPipeline {
 
         warn!(
             block_hash = ?block_hash,
-            height = block.header.height.0,
-            proposer = ?block.header.proposer,
-            certs = block.certificates.len(),
+            height = block.header().height.0,
+            proposer = ?block.header().proposer,
+            certs = block.certificates().len(),
             txs = block.transaction_count(),
             state_root = state_root_status,
             tx_root = tx_root_status,
@@ -422,13 +422,13 @@ impl VerificationPipeline {
         block: &Block,
         parent_block_height: u64,
     ) {
-        let parent_hash = block.header.parent_hash;
+        let parent_hash = block.header().parent_hash;
         let ready = PendingStateRootVerification {
             block_hash,
             parent_block_hash: parent_hash,
             parent_block_height,
-            expected_root: block.header.state_root,
-            block_height: block.header.height.0,
+            expected_root: block.header().state_root,
+            block_height: block.header().height.0,
         };
 
         // The parent's tree nodes must be available — either committed to
@@ -571,8 +571,8 @@ impl VerificationPipeline {
     ) -> Vec<Action> {
         debug!(
             block_hash = ?block_hash,
-            tx_count = block.transactions.len(),
-            expected_root = ?block.header.transaction_root,
+            tx_count = block.transactions().len(),
+            expected_root = ?block.header().transaction_root,
             "Initiating transaction root verification"
         );
 
@@ -581,8 +581,8 @@ impl VerificationPipeline {
 
         vec![Action::VerifyTransactionRoot {
             block_hash,
-            expected_root: block.header.transaction_root,
-            transactions: block.transactions.clone(),
+            expected_root: block.header().transaction_root,
+            transactions: block.transactions().to_vec(),
         }]
     }
 
@@ -606,7 +606,7 @@ impl VerificationPipeline {
 
     /// Check if a block needs receipt root verification before voting.
     pub fn needs_certificate_root_verification(&self, block: &Block) -> bool {
-        if block.certificates.is_empty() {
+        if block.certificates().is_empty() {
             return false;
         }
 
@@ -631,8 +631,8 @@ impl VerificationPipeline {
     ) -> Vec<Action> {
         debug!(
             block_hash = ?block_hash,
-            cert_count = block.certificates.len(),
-            expected_root = ?block.header.certificate_root,
+            cert_count = block.certificates().len(),
+            expected_root = ?block.header().certificate_root,
             "Initiating receipt root verification"
         );
 
@@ -641,8 +641,8 @@ impl VerificationPipeline {
 
         vec![Action::VerifyCertificateRoot {
             block_hash,
-            expected_root: block.header.certificate_root,
-            certificates: block.certificates.clone(),
+            expected_root: block.header().certificate_root,
+            certificates: block.certificates().to_vec(),
         }]
     }
 
@@ -666,7 +666,7 @@ impl VerificationPipeline {
 
     /// Check if a block needs local receipt root verification before voting.
     pub fn needs_local_receipt_root_verification(&self, block: &Block) -> bool {
-        if block.certificates.is_empty() {
+        if block.certificates().is_empty() {
             return false;
         }
 
@@ -693,7 +693,7 @@ impl VerificationPipeline {
         debug!(
             block_hash = ?block_hash,
             receipt_count = receipts.len(),
-            expected_root = ?block.header.local_receipt_root,
+            expected_root = ?block.header().local_receipt_root,
             "Initiating local receipt root verification"
         );
 
@@ -702,7 +702,7 @@ impl VerificationPipeline {
 
         vec![Action::VerifyLocalReceiptRoot {
             block_hash,
-            expected_root: block.header.local_receipt_root,
+            expected_root: block.header().local_receipt_root,
             receipts,
         }]
     }
@@ -727,7 +727,7 @@ impl VerificationPipeline {
 
     /// Check if a block needs provisions root verification before voting.
     pub fn needs_provision_root_verification(&self, block: &Block) -> bool {
-        if block.header.provision_root == Hash::ZERO {
+        if block.header().provision_root == Hash::ZERO {
             return false;
         }
 
@@ -754,7 +754,7 @@ impl VerificationPipeline {
         debug!(
             block_hash = ?block_hash,
             batch_count = manifest.provision_hashes.len(),
-            expected_root = ?block.header.provision_root,
+            expected_root = ?block.header().provision_root,
             "Initiating provisions root verification"
         );
 
@@ -763,7 +763,7 @@ impl VerificationPipeline {
 
         vec![Action::VerifyProvisionRoot {
             block_hash,
-            expected_root: block.header.provision_root,
+            expected_root: block.header().provision_root,
             batch_hashes: manifest.provision_hashes.clone(),
         }]
     }
@@ -801,10 +801,10 @@ impl VerificationPipeline {
         parent_in_flight: u32,
         finalized_tx_count: u32,
     ) -> bool {
-        let proposed = block.header.in_flight;
+        let proposed = block.header().in_flight;
 
         // Compute expected: only subtract finalized txs when certs are actually included.
-        let certs_finalized = if block.certificates.is_empty() {
+        let certs_finalized = if block.certificates().is_empty() {
             0
         } else {
             finalized_tx_count
@@ -819,7 +819,7 @@ impl VerificationPipeline {
         } else {
             warn!(
                 block_hash = ?block_hash,
-                height = block.header.height.0,
+                height = block.header().height.0,
                 proposed = proposed,
                 expected = expected,
                 parent_in_flight = parent_in_flight,

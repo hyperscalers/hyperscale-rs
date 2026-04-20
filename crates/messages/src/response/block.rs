@@ -85,7 +85,7 @@ mod tests {
     fn create_test_block() -> Block {
         let tx = test_transaction(1);
 
-        Block {
+        Block::Live {
             header: BlockHeader {
                 shard_group_id: ShardGroupId(0),
                 height: BlockHeight(1),
@@ -105,6 +105,7 @@ mod tests {
             },
             transactions: vec![std::sync::Arc::new(tx)],
             certificates: vec![],
+            provisions: vec![],
         }
     }
 
@@ -112,9 +113,9 @@ mod tests {
         QuorumCertificate {
             block_hash: block.hash(),
             shard_group_id: ShardGroupId(0),
-            height: block.header.height,
-            parent_block_hash: block.header.parent_hash,
-            round: block.header.round,
+            height: block.header().height,
+            parent_block_hash: block.header().parent_hash,
+            round: block.header().round,
             aggregated_signature: zero_bls_signature(),
             signers: SignerBitfield::new(0),
             weighted_timestamp_ms: 0,
