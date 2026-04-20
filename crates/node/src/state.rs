@@ -53,14 +53,6 @@ pub struct NodeStateMachine {
 
     /// Current time.
     now: Duration,
-
-    /// Provisions resolved at sync-block-arrival time, keyed by block hash.
-    /// Consumed when post-processing emitted `CommitBlockByQcOnly` actions to
-    /// fill in their `provisions` field — sync delivers via a different path
-    /// than consensus, so `pending_blocks` is empty for synced blocks. Kept
-    /// here (rather than in BftState) because the lookup needs
-    /// `ProvisionCoordinator`, which lives at this layer.
-    pending_sync_provisions: HashMap<Hash, Vec<Arc<Provision>>>,
 }
 
 impl std::fmt::Debug for NodeStateMachine {
@@ -116,7 +108,6 @@ impl NodeStateMachine {
             remote_headers: RemoteHeaderCoordinator::new(),
             topology,
             now: Duration::ZERO,
-            pending_sync_provisions: HashMap::new(),
         }
     }
 
@@ -818,24 +809,12 @@ impl StateMachine for NodeStateMachine {
                 block,
                 qc,
                 provision_hashes,
-            } => {
-                // Resolve provision hashes against ProvisionCoordinator now,
-                // while we have access. Cache for the eventual
-                // CommitBlockByQcOnly emit (which may come from this event or
-                // from a later buffer drain). Provisions arrive via gossip
-                // independently of sync mode, so the coordinator typically
-                // has them already.
-                let block_hash = block.hash();
-                let resolved: Vec<Arc<Provision>> = provision_hashes
-                    .iter()
-                    .filter_map(|h| self.provisions.get_batch_by_hash(h))
-                    .collect();
-                if !resolved.is_empty() {
-                    self.pending_sync_provisions.insert(block_hash, resolved);
-                }
-                self.bft
-                    .on_sync_block_ready_to_apply(self.topology.snapshot(), block, qc)
-            }
+            } => self.bft.on_sync_block_ready_to_apply(
+                self.topology.snapshot(),
+                block,
+                qc,
+                provision_hashes,
+            ),
             // Handled by IoLoop directly (sync verification pipeline).
             ProtocolEvent::SyncEcVerificationComplete { .. } => vec![],
             // SyncProtocol finished fetching — tell BftState to exit sync
@@ -907,26 +886,6 @@ impl StateMachine for NodeStateMachine {
         // avoiding stale transactions from the original deferral.
         if self.bft.take_ready_proposal() {
             actions.push(Action::Continuation(ProtocolEvent::ContentAvailable));
-        }
-
-        // Fill provisions on any CommitBlockByQcOnly emitted via the sync
-        // path. BftState's `apply_synced_block` falls back to
-        // `pending_blocks.provisions()` which is empty for synced blocks
-        // (they bypass the gossip-driven PendingBlock assembly). The
-        // resolved provisions for each block were cached in
-        // `pending_sync_provisions` when the SyncBlockReadyToApply event
-        // landed; consume them here.
-        for action in &mut actions {
-            if let Action::CommitBlockByQcOnly {
-                block, provisions, ..
-            } = action
-            {
-                if provisions.is_empty() {
-                    if let Some(resolved) = self.pending_sync_provisions.remove(&block.hash()) {
-                        *provisions = resolved;
-                    }
-                }
-            }
         }
 
         // Every event is a potential unblock point for execution's
