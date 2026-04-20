@@ -631,10 +631,14 @@ impl StateMachine for NodeStateMachine {
                 results,
                 tx_outcomes,
             } => {
-                self.execution
-                    .on_execution_batch_completed(wave_id, results, tx_outcomes);
-                // Execution results gate vote emission — re-scan.
-                self.execution.emit_vote_actions(self.topology.snapshot())
+                // Results arriving can (a) finalize a wave whose local EC
+                // landed ahead of the engine, (b) unblock new vote
+                // emission. Thread both through.
+                let mut actions =
+                    self.execution
+                        .on_execution_batch_completed(wave_id, results, tx_outcomes);
+                actions.extend(self.execution.emit_vote_actions(self.topology.snapshot()));
+                actions
             }
 
             // ── Wave Execution (wave-based voting) ────────────────────────

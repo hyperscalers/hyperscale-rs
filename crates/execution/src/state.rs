@@ -637,20 +637,27 @@ impl ExecutionState {
     }
 
     /// Absorb a completed execution batch: route receipts into the cache and
-    /// record per-tx outcomes on the wave. Votes are emitted separately in
-    /// the block commit wave scan.
+    /// record per-tx outcomes on the wave.
+    ///
+    /// Returns any actions that became newly possible because the batch
+    /// unblocked a wave that was waiting only on local receipts. In
+    /// particular, a cross-shard wave whose local EC arrived before this
+    /// validator's engine finished will defer finalization under the
+    /// `has_local_receipts_for_non_aborted` gate in `WaveState::is_complete`;
+    /// once the batch lands, the wave becomes complete and we finalize
+    /// here rather than waiting for some unrelated trigger.
     pub fn on_execution_batch_completed(
         &mut self,
         wave_id: WaveId,
         results: Vec<LocalExecutionEntry>,
         tx_outcomes: Vec<TxOutcome>,
-    ) {
+    ) -> Vec<Action> {
         if results.is_empty() && tx_outcomes.is_empty() {
             tracing::warn!(
                 wave = %wave_id,
                 "ExecutionBatchCompleted produced ZERO results"
             );
-            return;
+            return Vec::new();
         }
 
         for result in results {
@@ -668,10 +675,20 @@ impl ExecutionState {
                 wave = %wave_id,
                 "ExecutionBatchCompleted for unknown wave — dropping (wave was pruned or never created)"
             );
-            return;
+            return Vec::new();
         };
         for wr in tx_outcomes {
             wave.record_execution_result(wr.tx_hash, wr.outcome);
+        }
+
+        // With local receipts now in hand, the wave may have crossed into
+        // `is_complete` if its local EC arrived ahead of the engine. Drive
+        // finalization from here so the deferred finalize happens on the
+        // same event that unblocked it.
+        if wave.is_complete() {
+            self.finalize_wave(&wave_id)
+        } else {
+            Vec::new()
         }
     }
 
