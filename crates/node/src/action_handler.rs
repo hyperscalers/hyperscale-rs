@@ -388,10 +388,6 @@ pub(crate) fn handle_delegated_action<
             parent_in_flight,
             finalized_tx_count,
         } => {
-            let mut provision_hashes: Vec<hyperscale_types::Hash> =
-                provision_batches.iter().map(|b| b.hash()).collect();
-            provision_hashes.sort();
-
             // Anchor (parent_hash) already applied via ctx.view.
             let pending_snapshots = ctx.view.pending_snapshots().to_vec();
 
@@ -410,7 +406,7 @@ pub(crate) fn handle_delegated_action<
                 finalized_waves.clone(),
                 shard_group_id,
                 waves,
-                provision_hashes,
+                provision_batches.clone(),
                 parent_in_flight,
                 finalized_tx_count,
                 &pending_snapshots,

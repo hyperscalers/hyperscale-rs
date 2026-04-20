@@ -3592,16 +3592,24 @@ impl BftState {
             self.maybe_unlock_for_qc(topology, &block.header().parent_qc);
         }
 
-        // Sync blocks skip gossip-driven PendingBlock assembly, so inline
-        // provisions aren't available here. The expected hashes carried via
-        // `SyncBlockReadyToApply` feed the advance gate directly — it
-        // resolves from `ProvisionCoordinator` and stalls execution on a
-        // miss rather than proceeding with partial data.
+        // Variant routing. `Live` sync blocks carry their provisions
+        // inline (attached by the serving peer), so we extract them here
+        // and hand them to the commit pipeline — the advance gate sees a
+        // matching expected/resolved set and proceeds without a lookup.
+        // `Sealed` blocks are past the execution window by definition: no
+        // provisions are needed, no advance-gate resolution is attempted,
+        // and `execution.on_block_committed` will short-circuit to the
+        // no-dispatch recording path.
+        let (provisions, expected_provision_hashes) = match &block {
+            Block::Live { provisions, .. } => (provisions.clone(), provision_hashes),
+            Block::Sealed { .. } => (Vec::new(), Vec::new()),
+        };
+
         let mut actions = vec![Action::CommitBlockByQcOnly {
             block: block.clone(),
             qc,
-            provisions: Vec::new(),
-            provision_hashes,
+            provisions,
+            provision_hashes: expected_provision_hashes,
             parent_state_root,
             parent_block_height,
         }];
