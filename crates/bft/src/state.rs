@@ -458,7 +458,7 @@ impl BftState {
     /// header fields (state_root, in_flight) are needed.
     fn get_header_by_hash(&self, block_hash: Hash) -> Option<BlockHeader> {
         if let Some(block) = self.certified_blocks.get(&block_hash) {
-            return Some(block.header.clone());
+            return Some(block.header().clone());
         }
 
         if let Some(pending) = self.pending_blocks.get(&block_hash) {
@@ -467,7 +467,7 @@ impl BftState {
 
         if let Some(genesis) = &self.genesis_block {
             if genesis.hash() == block_hash {
-                return Some(genesis.header.clone());
+                return Some(genesis.header().clone());
             }
         }
 
@@ -595,7 +595,7 @@ impl BftState {
         qc: QuorumCertificate,
         provision_hashes: Vec<Hash>,
     ) -> Vec<Action> {
-        let block_height = block.header.height.0;
+        let block_height = block.header().height.0;
 
         // Ignore stale blocks that have already been committed.
         // Late-arriving sync blocks can arrive after sync completes.
@@ -796,7 +796,7 @@ impl BftState {
 
         self.genesis_block = Some(genesis.clone());
         self.committed_hash = hash;
-        self.committed_state_root = genesis.header.state_root;
+        self.committed_state_root = genesis.header().state_root;
 
         // Record genesis time as initial leader activity so that the view
         // change timeout counts from startup rather than being disabled.
@@ -1983,10 +1983,10 @@ impl BftState {
                     let parent_in_flight = if vote_locked {
                         skip_vote = true;
                         0 // unused — in-flight check is skipped
-                    } else if block.header.parent_qc.is_genesis() {
+                    } else if block.header().parent_qc.is_genesis() {
                         skip_vote = false;
                         0
-                    } else if let Some(h) = self.get_header_by_hash(block.header.parent_hash) {
+                    } else if let Some(h) = self.get_header_by_hash(block.header().parent_hash) {
                         skip_vote = false;
                         h.in_flight
                     } else {
@@ -2025,7 +2025,7 @@ impl BftState {
                 // freshly from the chain/pending-block state at that time,
                 // so we don't capture them here.
                 if self.verification.needs_state_root_verification(&block) {
-                    let parent_block_height = block.header.parent_qc.height.0;
+                    let parent_block_height = block.header().parent_qc.height.0;
                     self.verification.initiate_state_root_verification(
                         block_hash,
                         &block,
@@ -2074,7 +2074,7 @@ impl BftState {
                     .needs_local_receipt_root_verification(&block)
                 {
                     let receipts: Vec<_> = block
-                        .certificates
+                        .certificates()
                         .iter()
                         .flat_map(|fw| fw.receipts.iter().cloned())
                         .collect();
@@ -2110,7 +2110,7 @@ impl BftState {
     ///
     /// Transactions must be sorted by hash (ascending).
     fn validate_transaction_ordering(&self, block: &Block) -> Result<(), String> {
-        Self::verify_hash_sorted(&block.transactions, "transactions")?;
+        Self::verify_hash_sorted(block.transactions(), "transactions")?;
         Ok(())
     }
 
@@ -2120,13 +2120,17 @@ impl BftState {
     /// compares with the header's claimed value. This prevents a byzantine
     /// proposer from lying about which waves exist.
     fn validate_waves(&self, topology: &TopologySnapshot, block: &Block) -> Result<(), String> {
-        let expected =
-            hyperscale_types::compute_waves(topology, block.header.height.0, &block.transactions);
+        let expected = hyperscale_types::compute_waves(
+            topology,
+            block.header().height.0,
+            block.transactions(),
+        );
 
-        if block.header.waves != expected {
+        if block.header().waves != expected {
             return Err(format!(
                 "waves mismatch: header={:?}, computed={:?}",
-                block.header.waves, expected
+                block.header().waves,
+                expected
             ));
         }
 
@@ -2142,13 +2146,13 @@ impl BftState {
     /// the committed_tx_lookup which tracks all historically committed txs
     /// (survives recently_committed_txs cleanup after BlockCommitted events).
     fn validate_no_duplicate_transactions(&self, block: &Block) -> Result<(), String> {
-        if block.transactions.is_empty() {
+        if block.transactions().is_empty() {
             return Ok(());
         }
 
-        let (_, qc_chain_tx_hashes, _) = self.collect_qc_chain_hashes(block.header.parent_hash);
+        let (_, qc_chain_tx_hashes, _) = self.collect_qc_chain_hashes(block.header().parent_hash);
 
-        for tx in &block.transactions {
+        for tx in block.transactions() {
             let tx_hash = tx.hash();
             if qc_chain_tx_hashes.contains(&tx_hash) {
                 return Err(format!(
@@ -2732,7 +2736,7 @@ impl BftState {
             return vec![];
         }
 
-        let has_certificates = !block.certificates.is_empty();
+        let has_certificates = !block.certificates().is_empty();
 
         // Store our own block as pending (with all finalized waves + provisions).
         let mut pending_block =
@@ -2768,7 +2772,7 @@ impl BftState {
         self.verification.mark_proposal_fully_verified(block_hash);
 
         let mut actions = vec![Action::BroadcastBlockHeader {
-            header: Box::new(block.header.clone()),
+            header: Box::new(block.header().clone()),
             manifest: Box::new(manifest),
         }];
 
@@ -2856,12 +2860,12 @@ impl BftState {
         // Look up the block to count transactions and certificates
         if let Some(pending) = self.pending_blocks.get(&committable_hash) {
             if let Some(block) = pending.block() {
-                (block.transactions.len(), block.certificates.len())
+                (block.transactions().len(), block.certificates().len())
             } else {
                 (0, 0)
             }
         } else if let Some(block) = self.certified_blocks.get(&committable_hash) {
-            (block.transactions.len(), block.certificates.len())
+            (block.transactions().len(), block.certificates().len())
         } else {
             (0, 0)
         }
@@ -3071,7 +3075,7 @@ impl BftState {
         let certifying_qc = if let Some(pending) = self.pending_blocks.get(&block_hash) {
             pending.header().parent_qc.clone()
         } else if let Some(block) = self.certified_blocks.get(&block_hash) {
-            block.header.parent_qc.clone()
+            block.header().parent_qc.clone()
         } else {
             warn!(
                 validator = ?topology.local_validator_id(),
@@ -3140,7 +3144,7 @@ impl BftState {
             return vec![];
         };
 
-        let height = block.header.height.0;
+        let height = block.header().height.0;
 
         // Check if we've already committed this or higher
         if height <= self.committed_height {
@@ -3200,18 +3204,18 @@ impl BftState {
     /// resets backoff tracking, and cleans up old state. Returns removed block hashes
     /// for fetch cancellation.
     fn record_block_committed(&mut self, block: &Block, block_hash: Hash) -> Vec<Hash> {
-        let height = block.header.height.0;
+        let height = block.header().height.0;
 
         self.committed_height = height;
         self.committed_hash = block_hash;
-        self.committed_state_root = block.header.state_root;
+        self.committed_state_root = block.header().state_root;
 
         // Buffer committed hashes so collect_qc_chain_hashes can
         // exclude them even after cleanup_old_state removes the block.
-        for tx in &block.transactions {
+        for tx in block.transactions() {
             self.recently_committed_txs.insert(tx.hash());
         }
-        for cert in &block.certificates {
+        for cert in block.certificates() {
             self.recently_committed_certs.insert(cert.wave_id().hash());
         }
 
@@ -3260,7 +3264,7 @@ impl BftState {
             let provisions = pending.provisions();
             let provision_hashes = pending.manifest().provision_hashes.clone();
 
-            let height = block.header.height.0;
+            let height = block.header().height.0;
 
             // Safety check - should always be the next expected height
             if height != self.committed_height + 1 {
@@ -3276,7 +3280,7 @@ impl BftState {
                 validator = ?topology.local_validator_id(),
                 height = height,
                 block_hash = ?current_hash,
-                transactions = block.transactions.len(),
+                transactions = block.transactions().len(),
                 "Committing block"
             );
 
@@ -3317,9 +3321,9 @@ impl BftState {
             // Other validators rely on receiving it via gossip propagation.
             // If the proposer is byzantine/slow, the RemoteHeaderCoordinator
             // will detect the liveness timeout and trigger a fallback fetch.
-            if block.header.proposer == topology.local_validator_id() {
+            if block.header().proposer == topology.local_validator_id() {
                 let committed_header = hyperscale_types::CommittedBlockHeader::new(
-                    block.header.clone(),
+                    block.header().clone(),
                     current_qc.clone(),
                 );
                 actions.push(Action::BroadcastCommittedBlockHeader { committed_header });
@@ -3356,7 +3360,7 @@ impl BftState {
     /// Blocks may arrive out of order from concurrent fetches. Out-of-order blocks
     /// are buffered and processed once earlier blocks complete verification.
     #[instrument(skip(self, block, qc), fields(
-        height = block.header.height.0,
+        height = block.header().height.0,
         block_hash = ?block.hash()
     ))]
     fn on_synced_block_ready(
@@ -3367,7 +3371,7 @@ impl BftState {
         provision_hashes: Vec<Hash>,
     ) -> Vec<Action> {
         let block_hash = block.hash();
-        let height = block.header.height.0;
+        let height = block.header().height.0;
 
         info!(
             height,
@@ -3456,7 +3460,7 @@ impl BftState {
         provision_hashes: Vec<Hash>,
     ) -> Vec<Action> {
         let block_hash = block.hash();
-        let height = block.header.height.0;
+        let height = block.header().height.0;
 
         // Genesis QC doesn't need signature verification
         if qc.is_genesis() {
@@ -3545,19 +3549,19 @@ impl BftState {
         provision_hashes: Vec<Hash>,
     ) -> Vec<Action> {
         let block_hash = block.hash();
-        let height = block.header.height.0;
+        let height = block.header().height.0;
 
         info!(
             validator = ?topology.local_validator_id(),
             height = height,
             block_hash = ?block_hash,
-            transactions = block.transactions.len(),
-            certificates = block.certificates.len(),
+            transactions = block.transactions().len(),
+            certificates = block.certificates().len(),
             "Applying synced block"
         );
 
         // Capture parent state BEFORE record_block_committed advances heights.
-        let parent_state_root = self.parent_state_root(block.header.parent_hash);
+        let parent_state_root = self.parent_state_root(block.header().parent_hash);
         let parent_block_height = self.committed_height;
 
         // Advance committed_height. The QC is the proof of commit — same
@@ -3578,14 +3582,14 @@ impl BftState {
         }
 
         // Adopt the parent_qc from the block header if it's newer still.
-        if !block.header.parent_qc.is_genesis()
+        if !block.header().parent_qc.is_genesis()
             && self
                 .latest_qc
                 .as_ref()
-                .is_none_or(|existing| block.header.parent_qc.height.0 > existing.height.0)
+                .is_none_or(|existing| block.header().parent_qc.height.0 > existing.height.0)
         {
-            self.latest_qc = Some(block.header.parent_qc.clone());
-            self.maybe_unlock_for_qc(topology, &block.header.parent_qc);
+            self.latest_qc = Some(block.header().parent_qc.clone());
+            self.maybe_unlock_for_qc(topology, &block.header().parent_qc);
         }
 
         // Sync blocks skip gossip-driven PendingBlock assembly, so inline
@@ -3608,7 +3612,7 @@ impl BftState {
 
         // Cache constructed FinalizedWaves so other syncing nodes can fetch
         // them via FinalizedWaveFetchProtocol.
-        for wave in &block.certificates {
+        for wave in block.certificates() {
             actions.push(Action::CacheFinalizedWave {
                 wave: Arc::clone(wave),
             });
@@ -4234,7 +4238,7 @@ impl BftState {
 
         // Remove certified blocks at or below committed height
         self.certified_blocks
-            .retain(|_, block| block.header.height.0 > committed_height);
+            .retain(|_, block| block.header().height.0 > committed_height);
 
         // Remove pending commits awaiting data at or below committed height
         self.pending_commits_awaiting_data
@@ -4504,7 +4508,7 @@ impl BftState {
                     .pending_blocks
                     .get(&pending.block_hash)
                     .and_then(|pb| pb.block())
-                    .map(|b| b.certificates.clone())
+                    .map(|b| b.certificates().to_vec())
                     .unwrap_or_default();
                 crate::verification::ReadyStateRootVerification {
                     block_hash: pending.block_hash,
@@ -4681,16 +4685,16 @@ impl BftState {
 
         let mut current_hash = parent_hash;
         while let Some(block) = self.get_block_by_hash(current_hash) {
-            if block.header.height.0 <= self.committed_height {
+            if block.header().height.0 <= self.committed_height {
                 break;
             }
-            for cert in &block.certificates {
+            for cert in block.certificates() {
                 cert_hashes.insert(cert.wave_id().hash());
             }
-            for tx in &block.transactions {
+            for tx in block.transactions() {
                 tx_hashes.insert(tx.hash());
             }
-            current_hash = block.header.parent_hash;
+            current_hash = block.header().parent_hash;
         }
 
         // Fallback: walk pending blocks whose full block data hasn't been
@@ -4760,7 +4764,7 @@ impl BftState {
         if self
             .certified_blocks
             .values()
-            .any(|block| block.header.height.0 == height)
+            .any(|block| block.header().height.0 == height)
         {
             return true;
         }
@@ -4886,10 +4890,11 @@ mod tests {
     }
 
     fn make_empty_block(height: u64) -> Block {
-        Block {
+        Block::Live {
             header: make_header_at_height(height, 1000),
             transactions: vec![],
             certificates: vec![],
+            provisions: vec![],
         }
     }
 
@@ -7096,10 +7101,11 @@ mod tests {
         height: u64,
         transactions: Vec<Arc<hyperscale_types::RoutableTransaction>>,
     ) -> Block {
-        Block {
+        Block::Live {
             header: make_header_at_height(height, 100_000),
             transactions,
             certificates: vec![],
+            provisions: vec![],
         }
     }
 
@@ -7108,10 +7114,11 @@ mod tests {
         height: u64,
         transactions: Vec<Arc<hyperscale_types::RoutableTransaction>>,
     ) -> Block {
-        Block {
+        Block::Live {
             header: make_header_at_height(height, 100_000),
             transactions,
             certificates: vec![],
+            provisions: vec![],
         }
     }
 
@@ -7968,7 +7975,7 @@ mod tests {
         state.committed_height = 10; // Already committed past height 1
 
         // Create a stale synced block at height 1
-        let block = Block {
+        let block = Block::Live {
             header: BlockHeader {
                 shard_group_id: ShardGroupId(0),
                 height: BlockHeight(1),
@@ -7988,6 +7995,7 @@ mod tests {
             },
             transactions: vec![],
             certificates: vec![],
+            provisions: vec![],
         };
 
         let qc = QuorumCertificate {
@@ -8526,7 +8534,7 @@ mod tests {
         let tx1 = make_test_tx_with_seed(10);
         let tx2 = make_test_tx_with_seed(20);
         // Ancestor block at height 5 contains tx1
-        let ancestor_block = Block {
+        let ancestor_block = Block::Live {
             header: BlockHeader {
                 shard_group_id: ShardGroupId(0),
                 height: BlockHeight(5),
@@ -8546,6 +8554,7 @@ mod tests {
             },
             transactions: vec![tx1.clone()],
             certificates: vec![],
+            provisions: vec![],
         };
         let ancestor_hash = ancestor_block.hash();
         state.certified_blocks.insert(ancestor_hash, ancestor_block);
@@ -8553,7 +8562,7 @@ mod tests {
         // New block at height 6, parent = ancestor, contains tx1 (duplicate) + tx2
         let mut txs = vec![tx1, tx2];
         sort_txs_by_hash(&mut txs);
-        let block = Block {
+        let block = Block::Live {
             header: BlockHeader {
                 shard_group_id: ShardGroupId(0),
                 height: BlockHeight(6),
@@ -8573,6 +8582,7 @@ mod tests {
             },
             transactions: txs,
             certificates: vec![],
+            provisions: vec![],
         };
 
         let result = state.validate_no_duplicate_transactions(&block);
@@ -8588,7 +8598,7 @@ mod tests {
         let tx1 = make_test_tx_with_seed(10);
 
         // Ancestor at height 5 (== committed_height) contains tx1
-        let ancestor_block = Block {
+        let ancestor_block = Block::Live {
             header: BlockHeader {
                 shard_group_id: ShardGroupId(0),
                 height: BlockHeight(5),
@@ -8608,13 +8618,14 @@ mod tests {
             },
             transactions: vec![tx1.clone()],
             certificates: vec![],
+            provisions: vec![],
         };
         let ancestor_hash = ancestor_block.hash();
         state.certified_blocks.insert(ancestor_hash, ancestor_block);
 
         // Block at height 6, parent = ancestor. tx1 is in ancestor but ancestor
         // is at committed height so the walk stops — this should be allowed.
-        let block = Block {
+        let block = Block::Live {
             header: BlockHeader {
                 shard_group_id: ShardGroupId(0),
                 height: BlockHeight(6),
@@ -8634,6 +8645,7 @@ mod tests {
             },
             transactions: vec![tx1],
             certificates: vec![],
+            provisions: vec![],
         };
 
         // Ancestor is at committed height, so walk stops before checking it

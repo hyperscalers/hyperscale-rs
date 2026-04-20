@@ -3,8 +3,8 @@
 use crate::{
     block_vote_message, compute_merkle_root, compute_padded_merkle_root, decode_finalized_wave_vec,
     encode_finalized_wave_vec, BlockHeight, Bls12381G1PrivateKey, Bls12381G2Signature,
-    FinalizedWave, Hash, QuorumCertificate, ReceiptBundle, RoutableTransaction, ShardGroupId,
-    ValidatorId, WaveId,
+    FinalizedWave, Hash, Provision, QuorumCertificate, ReceiptBundle, RoutableTransaction,
+    ShardGroupId, ValidatorId, WaveId,
 };
 use sbor::prelude::*;
 use std::sync::Arc;
@@ -229,47 +229,51 @@ impl BlockHeader {
 ///
 /// Transactions are stored in a single flat list, sorted by hash for deterministic ordering.
 ///
-/// Additional block contents:
-/// - **certificates**: Wave certificates (per-wave finalization proofs)
+/// Blocks have two variants reflecting their temporal lifecycle:
+/// - **`Live`**: within the cross-shard execution window. Carries the
+///   provisions needed to execute cross-shard waves locally.
+/// - **`Sealed`**: past the execution window (at least `WAVE_TIMEOUT_BLOCKS`
+///   behind the local committed tip). Waves are finalized from certs +
+///   receipts alone, so provisions are no longer needed and are dropped
+///   from memory. The on-disk / storage shape is always `Sealed`.
 ///
-/// Transactions and certificates are stored as `Arc` for efficient cloning
-/// and sharing across the system. When serialized (for storage or network),
-/// the underlying data is written directly.
+/// The header's `provision_root` commits to the original provision set, so
+/// `Sealed` is self-consistent — a `Live` block matches its `Sealed` form
+/// modulo the provision payload.
 #[derive(Debug, Clone)]
-pub struct Block {
-    /// Block header with consensus metadata.
-    pub header: BlockHeader,
-
-    /// All transactions in this block, sorted by hash.
-    pub transactions: Vec<Arc<RoutableTransaction>>,
-
-    /// Finalized waves for this block — each carries a `WaveCertificate`
-    /// plus the receipt bundles for the wave's transactions in block order.
-    ///
-    /// `Block` is the post-finalization / assembly shape (sync transport,
-    /// storage reconstruction, commit pipeline input). By the time a `Block`
-    /// exists, every wave has finalized and both the cert and receipts are
-    /// available — either from the local execution state (proposer / peer
-    /// assembly path) or rebuilt from storage via `FinalizedWave::reconstruct`
-    /// (sync serving path).
-    pub certificates: Vec<Arc<FinalizedWave>>,
+pub enum Block {
+    Live {
+        header: BlockHeader,
+        transactions: Vec<Arc<RoutableTransaction>>,
+        certificates: Vec<Arc<FinalizedWave>>,
+        provisions: Vec<Arc<Provision>>,
+    },
+    Sealed {
+        header: BlockHeader,
+        transactions: Vec<Arc<RoutableTransaction>>,
+        certificates: Vec<Arc<FinalizedWave>>,
+    },
 }
 
-// Manual PartialEq - compare transaction/certificate content, not Arc pointers
+// Manual PartialEq - compare transaction/certificate content, not Arc pointers.
+// Provisions are excluded from equality: the header's `provision_root` already
+// commits to them, and a Live and Sealed form of the same block should compare
+// equal for content purposes.
 impl PartialEq for Block {
     fn eq(&self, other: &Self) -> bool {
         fn tx_lists_equal(a: &[Arc<RoutableTransaction>], b: &[Arc<RoutableTransaction>]) -> bool {
             a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.hash() == y.hash())
         }
+        fn cert_lists_equal(a: &[Arc<FinalizedWave>], b: &[Arc<FinalizedWave>]) -> bool {
+            a.len() == b.len()
+                && a.iter()
+                    .zip(b.iter())
+                    .all(|(x, y)| x.as_ref() == y.as_ref())
+        }
 
-        self.header == other.header
-            && tx_lists_equal(&self.transactions, &other.transactions)
-            && self.certificates.len() == other.certificates.len()
-            && self
-                .certificates
-                .iter()
-                .zip(other.certificates.iter())
-                .all(|(a, b)| a.as_ref() == b.as_ref())
+        self.header() == other.header()
+            && tx_lists_equal(self.transactions(), other.transactions())
+            && cert_lists_equal(self.certificates(), other.certificates())
     }
 }
 
@@ -294,16 +298,58 @@ fn encode_tx_vec<E: sbor::Encoder<sbor::NoCustomValueKind>>(
     Ok(())
 }
 
+/// Helper to encode a Vec<Arc<Provision>> as an SBOR array. Mirrors the
+/// transaction / finalized-wave helpers.
+fn encode_provision_vec<E: sbor::Encoder<sbor::NoCustomValueKind>>(
+    encoder: &mut E,
+    provisions: &[Arc<Provision>],
+) -> Result<(), sbor::EncodeError> {
+    encoder.write_value_kind(sbor::ValueKind::Array)?;
+    encoder.write_value_kind(sbor::ValueKind::Tuple)?;
+    encoder.write_size(provisions.len())?;
+    for p in provisions {
+        encoder.encode_deeper_body(p.as_ref())?;
+    }
+    Ok(())
+}
+
+// Variant tag bytes for SBOR encoding. Explicit rather than relying on
+// derive so future additions don't renumber existing variants silently.
+const BLOCK_VARIANT_LIVE: u8 = 0;
+const BLOCK_VARIANT_SEALED: u8 = 1;
+
 impl<E: sbor::Encoder<sbor::NoCustomValueKind>> sbor::Encode<sbor::NoCustomValueKind, E> for Block {
     fn encode_value_kind(&self, encoder: &mut E) -> Result<(), sbor::EncodeError> {
-        encoder.write_value_kind(sbor::ValueKind::Tuple)
+        encoder.write_value_kind(sbor::ValueKind::Enum)
     }
 
     fn encode_body(&self, encoder: &mut E) -> Result<(), sbor::EncodeError> {
-        encoder.write_size(3)?;
-        encoder.encode(&self.header)?;
-        encode_tx_vec(encoder, &self.transactions)?;
-        encode_finalized_wave_vec(encoder, &self.certificates)?;
+        match self {
+            Block::Live {
+                header,
+                transactions,
+                certificates,
+                provisions,
+            } => {
+                encoder.write_discriminator(BLOCK_VARIANT_LIVE)?;
+                encoder.write_size(4)?;
+                encoder.encode(header)?;
+                encode_tx_vec(encoder, transactions)?;
+                encode_finalized_wave_vec(encoder, certificates)?;
+                encode_provision_vec(encoder, provisions)?;
+            }
+            Block::Sealed {
+                header,
+                transactions,
+                certificates,
+            } => {
+                encoder.write_discriminator(BLOCK_VARIANT_SEALED)?;
+                encoder.write_size(3)?;
+                encoder.encode(header)?;
+                encode_tx_vec(encoder, transactions)?;
+                encode_finalized_wave_vec(encoder, certificates)?;
+            }
+        }
         Ok(())
     }
 }
@@ -339,36 +385,79 @@ fn decode_tx_vec<D: sbor::Decoder<sbor::NoCustomValueKind>>(
     Ok(txs)
 }
 
+/// Helper to decode a Vec<Arc<Provision>> from an SBOR array.
+fn decode_provision_vec<D: sbor::Decoder<sbor::NoCustomValueKind>>(
+    decoder: &mut D,
+) -> Result<Vec<Arc<Provision>>, sbor::DecodeError> {
+    decoder.read_and_check_value_kind(sbor::ValueKind::Array)?;
+    decoder.read_and_check_value_kind(sbor::ValueKind::Tuple)?;
+    let count = decoder.read_size()?;
+    if count > MAX_SBOR_COLLECTION_SIZE {
+        return Err(sbor::DecodeError::UnexpectedSize {
+            expected: MAX_SBOR_COLLECTION_SIZE,
+            actual: count,
+        });
+    }
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        let p: Provision = decoder.decode_deeper_body_with_value_kind(sbor::ValueKind::Tuple)?;
+        out.push(Arc::new(p));
+    }
+    Ok(out)
+}
+
 impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValueKind, D> for Block {
     fn decode_body_with_value_kind(
         decoder: &mut D,
         value_kind: sbor::ValueKind<sbor::NoCustomValueKind>,
     ) -> Result<Self, sbor::DecodeError> {
-        decoder.check_preloaded_value_kind(value_kind, sbor::ValueKind::Tuple)?;
+        decoder.check_preloaded_value_kind(value_kind, sbor::ValueKind::Enum)?;
+        let discriminator = decoder.read_discriminator()?;
         let length = decoder.read_size()?;
 
-        if length != 3 {
-            return Err(sbor::DecodeError::UnexpectedSize {
-                expected: 3,
-                actual: length,
-            });
+        match discriminator {
+            BLOCK_VARIANT_LIVE => {
+                if length != 4 {
+                    return Err(sbor::DecodeError::UnexpectedSize {
+                        expected: 4,
+                        actual: length,
+                    });
+                }
+                let header: BlockHeader = decoder.decode()?;
+                let transactions = decode_tx_vec(decoder)?;
+                let certificates = decode_finalized_wave_vec(decoder, MAX_SBOR_COLLECTION_SIZE)?;
+                let provisions = decode_provision_vec(decoder)?;
+                Ok(Block::Live {
+                    header,
+                    transactions,
+                    certificates,
+                    provisions,
+                })
+            }
+            BLOCK_VARIANT_SEALED => {
+                if length != 3 {
+                    return Err(sbor::DecodeError::UnexpectedSize {
+                        expected: 3,
+                        actual: length,
+                    });
+                }
+                let header: BlockHeader = decoder.decode()?;
+                let transactions = decode_tx_vec(decoder)?;
+                let certificates = decode_finalized_wave_vec(decoder, MAX_SBOR_COLLECTION_SIZE)?;
+                Ok(Block::Sealed {
+                    header,
+                    transactions,
+                    certificates,
+                })
+            }
+            other => Err(sbor::DecodeError::UnknownDiscriminator(other)),
         }
-
-        let header: BlockHeader = decoder.decode()?;
-        let transactions = decode_tx_vec(decoder)?;
-        let certificates = decode_finalized_wave_vec(decoder, MAX_SBOR_COLLECTION_SIZE)?;
-
-        Ok(Self {
-            header,
-            transactions,
-            certificates,
-        })
     }
 }
 
 impl sbor::Categorize<sbor::NoCustomValueKind> for Block {
     fn value_kind() -> sbor::ValueKind<sbor::NoCustomValueKind> {
-        sbor::ValueKind::Tuple
+        sbor::ValueKind::Enum
     }
 }
 
@@ -382,47 +471,87 @@ impl sbor::Describe<sbor::NoCustomTypeKind> for Block {
 
 impl Block {
     /// Create an empty genesis block with the given proposer and JMT state.
+    ///
+    /// Genesis is born `Live` with no provisions — the temporality machinery
+    /// activates only once there are cross-shard waves in flight.
     pub fn genesis(shard_group_id: ShardGroupId, proposer: ValidatorId, state_root: Hash) -> Self {
-        Self {
+        Block::Live {
             header: BlockHeader::genesis(shard_group_id, proposer, state_root),
             transactions: vec![],
             certificates: vec![],
+            provisions: vec![],
         }
+    }
+
+    /// Block header — present in both variants.
+    pub fn header(&self) -> &BlockHeader {
+        match self {
+            Block::Live { header, .. } | Block::Sealed { header, .. } => header,
+        }
+    }
+
+    /// Transactions in the block — present in both variants.
+    pub fn transactions(&self) -> &[Arc<RoutableTransaction>] {
+        match self {
+            Block::Live { transactions, .. } | Block::Sealed { transactions, .. } => transactions,
+        }
+    }
+
+    /// Finalized waves (certificates) in the block — present in both variants.
+    pub fn certificates(&self) -> &[Arc<FinalizedWave>] {
+        match self {
+            Block::Live { certificates, .. } | Block::Sealed { certificates, .. } => certificates,
+        }
+    }
+
+    /// Provision batches. `Some` only for `Live`; `Sealed` blocks have
+    /// dropped their provisions because the cross-shard execution window
+    /// they served has passed.
+    pub fn provisions(&self) -> Option<&[Arc<Provision>]> {
+        match self {
+            Block::Live { provisions, .. } => Some(provisions),
+            Block::Sealed { .. } => None,
+        }
+    }
+
+    /// True if this block is still in its `Live` variant.
+    pub fn is_live(&self) -> bool {
+        matches!(self, Block::Live { .. })
     }
 
     /// Compute hash of this block (hashes the header).
     pub fn hash(&self) -> Hash {
-        self.header.hash()
+        self.header().hash()
     }
 
     /// Get block height.
     pub fn height(&self) -> BlockHeight {
-        self.header.height
+        self.header().height
     }
 
     /// Get total number of transactions.
     pub fn transaction_count(&self) -> usize {
-        self.transactions.len()
+        self.transactions().len()
     }
 
     /// Check if this block contains a specific transaction by hash.
     pub fn contains_transaction(&self, tx_hash: &Hash) -> bool {
-        self.transactions.iter().any(|tx| tx.hash() == *tx_hash)
+        self.transactions().iter().any(|tx| tx.hash() == *tx_hash)
     }
 
     /// Get all transaction hashes.
     pub fn transaction_hashes(&self) -> Vec<Hash> {
-        self.transactions.iter().map(|tx| tx.hash()).collect()
+        self.transactions().iter().map(|tx| tx.hash()).collect()
     }
 
     /// Check if this is the genesis block.
     pub fn is_genesis(&self) -> bool {
-        self.header.is_genesis()
+        self.header().is_genesis()
     }
 
     /// Get number of wave certificates in this block.
     pub fn certificate_count(&self) -> usize {
-        self.certificates.len()
+        self.certificates().len()
     }
 }
 
@@ -460,9 +589,9 @@ impl BlockManifest {
     /// `cert_hashes` uses wave_id identity hashes (computable without EC knowledge).
     pub fn from_block(block: &Block) -> Self {
         Self {
-            tx_hashes: block.transactions.iter().map(|tx| tx.hash()).collect(),
+            tx_hashes: block.transactions().iter().map(|tx| tx.hash()).collect(),
             cert_hashes: block
-                .certificates
+                .certificates()
                 .iter()
                 .map(|c| c.wave_id().hash())
                 .collect(),
@@ -505,7 +634,7 @@ impl BlockMetadata {
     /// Create metadata from a full block and QC.
     pub fn from_block(block: &Block, qc: QuorumCertificate) -> Self {
         Self {
-            header: block.header.clone(),
+            header: block.header().clone(),
             manifest: BlockManifest::from_block(block),
             qc,
         }
@@ -609,8 +738,8 @@ mod tests {
         assert!(genesis.is_genesis());
         assert_eq!(genesis.height(), BlockHeight(0));
         assert_eq!(genesis.transaction_count(), 0);
-        assert_eq!(genesis.header.transaction_root, Hash::ZERO);
-        assert_eq!(genesis.header.parent_qc, QuorumCertificate::genesis());
+        assert_eq!(genesis.header().transaction_root, Hash::ZERO);
+        assert_eq!(genesis.header().parent_qc, QuorumCertificate::genesis());
     }
 
     #[test]
@@ -722,7 +851,7 @@ mod tests {
     #[test]
     fn test_genesis_certificate_root_is_zero() {
         let genesis = Block::genesis(ShardGroupId(0), ValidatorId(0), Hash::ZERO);
-        assert_eq!(genesis.header.certificate_root, Hash::ZERO);
+        assert_eq!(genesis.header().certificate_root, Hash::ZERO);
     }
 }
 

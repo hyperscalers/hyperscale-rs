@@ -234,10 +234,10 @@ impl SyncProtocol {
         match block {
             Some((block, qc, provision_hashes)) => {
                 // Validate
-                if block.header.height.0 != height {
+                if block.header().height.0 != height {
                     warn!(
                         expected = height,
-                        got = block.header.height.0,
+                        got = block.header().height.0,
                         "Height mismatch in sync response"
                     );
                     metrics::record_sync_block_filtered("height_mismatch");

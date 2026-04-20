@@ -143,12 +143,12 @@ impl ChainWriter for SimStorage {
                 }
 
                 let mut c = self.consensus.write().unwrap();
-                for tx in block.transactions.iter() {
+                for tx in block.transactions().iter() {
                     c.transactions.insert(tx.hash(), tx.as_ref().clone());
                 }
                 c.blocks
-                    .insert(block.header.height, ((*block).clone(), (*qc).clone()));
-                for fw in &block.certificates {
+                    .insert(block.header().height, ((*block).clone(), (*qc).clone()));
+                for fw in block.certificates() {
                     let cert = &fw.certificate;
                     let wave_id_hash = cert.wave_id.hash();
                     c.certificates.insert(wave_id_hash, (**cert).clone());
@@ -165,7 +165,7 @@ impl ChainWriter for SimStorage {
                             .insert(bundle.tx_hash, exec_output.clone());
                     }
                 }
-                for fw in &block.certificates {
+                for fw in block.certificates() {
                     for ec in &fw.certificate.execution_certificates {
                         let canonical_hash = ec.canonical_hash();
                         c.execution_certs.insert(canonical_hash, (**ec).clone());
@@ -175,10 +175,10 @@ impl ChainWriter for SimStorage {
                             .push(canonical_hash);
                     }
                 }
-                c.committed_height = block.header.height;
+                c.committed_height = block.header().height;
                 c.committed_hash = Some(block.hash());
                 c.committed_qc = Some((*qc).clone());
-                c.prune_receipts(block.header.height.0);
+                c.prune_receipts(block.header().height.0);
 
                 result_root
             })
@@ -191,7 +191,7 @@ impl ChainWriter for SimStorage {
         qc: &Arc<hyperscale_types::QuorumCertificate>,
     ) -> Hash {
         let receipts: Vec<ReceiptBundle> = block
-            .certificates
+            .certificates()
             .iter()
             .flat_map(|fw| fw.receipts.iter().cloned())
             .collect();
@@ -209,7 +209,7 @@ impl SimStorage {
         qc: &Arc<hyperscale_types::QuorumCertificate>,
         receipts: &[ReceiptBundle],
     ) -> Hash {
-        let block_height = block.header.height.0;
+        let block_height = block.header().height.0;
         let mut s = self.state.write().unwrap();
 
         assert!(
@@ -256,12 +256,12 @@ impl SimStorage {
         // Store block + certificate + consensus state atomically.
         {
             let mut c = self.consensus.write().unwrap();
-            for tx in block.transactions.iter() {
+            for tx in block.transactions().iter() {
                 c.transactions.insert(tx.hash(), tx.as_ref().clone());
             }
             c.blocks
-                .insert(block.header.height, ((**block).clone(), (**qc).clone()));
-            for fw in &block.certificates {
+                .insert(block.header().height, ((**block).clone(), (**qc).clone()));
+            for fw in block.certificates() {
                 let cert = &fw.certificate;
                 let wave_id_hash = cert.wave_id.hash();
                 c.certificates.insert(wave_id_hash, (**cert).clone());
@@ -280,7 +280,7 @@ impl SimStorage {
                 }
             }
             // Store execution certificates (extracted from wave certs) atomically.
-            for fw in &block.certificates {
+            for fw in block.certificates() {
                 for ec in &fw.certificate.execution_certificates {
                     let canonical_hash = ec.canonical_hash();
                     c.execution_certs.insert(canonical_hash, (**ec).clone());
@@ -290,10 +290,10 @@ impl SimStorage {
                         .push(canonical_hash);
                 }
             }
-            c.committed_height = block.header.height;
+            c.committed_height = block.header().height;
             c.committed_hash = Some(block.hash());
             c.committed_qc = Some((**qc).clone());
-            c.prune_receipts(block.header.height.0);
+            c.prune_receipts(block.header().height.0);
         }
 
         new_root

@@ -96,7 +96,7 @@ impl PendingBlock {
             received_provisions.insert(batch.hash(), batch);
         }
         let mut pending = Self {
-            header: block.header.clone(),
+            header: block.header().clone(),
             received_transactions: HashMap::new(),
             missing_transaction_hashes: HashSet::new(),
             received_waves: BTreeMap::new(),
@@ -107,7 +107,7 @@ impl PendingBlock {
             constructed_block: None,
         };
         // Fill in all transactions
-        for tx in &block.transactions {
+        for tx in block.transactions() {
             pending
                 .received_transactions
                 .insert(tx.hash(), Arc::clone(tx));
@@ -257,10 +257,11 @@ impl PendingBlock {
             .filter_map(|hash| self.received_waves.get(hash).cloned())
             .collect();
 
-        let block = Arc::new(Block {
+        let block = Arc::new(Block::Live {
             header: self.header.clone(),
             transactions,
             certificates,
+            provisions: vec![],
         });
 
         self.constructed_block = Some(Arc::clone(&block));
@@ -456,10 +457,11 @@ mod tests {
             receipts: vec![],
         });
 
-        let block = Block {
+        let block = Block::Live {
             header: make_header(1),
             transactions: vec![],
             certificates: vec![Arc::clone(&fw)],
+            provisions: vec![],
         };
 
         let pending = PendingBlock::from_complete_block(&block, vec![fw], vec![]);

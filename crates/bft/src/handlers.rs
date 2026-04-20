@@ -396,10 +396,11 @@ pub fn build_proposal<S: ChainWriter + SubstateStore>(
         in_flight,
     };
 
-    let block = Block {
+    let block = Block::Live {
         header,
         transactions,
         certificates,
+        provisions: vec![],
     };
 
     let block_hash = block.hash();

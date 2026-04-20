@@ -469,7 +469,7 @@ impl MempoolState {
     /// 2. Process certificates → mark completed
     /// 3. Process aborts → update status to terminal
     #[instrument(skip(self, block), fields(
-        height = block.header.height.0,
+        height = block.header().height.0,
         tx_count = block.transaction_count()
     ))]
     pub fn on_block_committed_full(
@@ -477,7 +477,7 @@ impl MempoolState {
         topology: &TopologySnapshot,
         block: &Block,
     ) -> Vec<Action> {
-        let height = block.header.height;
+        let height = block.header().height;
         let mut actions = Vec::new();
 
         self.current_height = height;
@@ -489,7 +489,7 @@ impl MempoolState {
         // This handles the case where we fetched transactions to vote on a block
         // but didn't receive them via gossip. We need them in the mempool for
         // status tracking (execution status updates).
-        for tx in block.transactions.iter() {
+        for tx in block.transactions().iter() {
             let hash = tx.hash();
             if !self.pool.contains_key(&hash) {
                 let cross_shard = tx.is_cross_shard(topology.num_shards());
@@ -517,7 +517,7 @@ impl MempoolState {
         // Update transaction status to Committed and add locks.
         // This must happen synchronously to prevent the same transactions from being
         // re-proposed before the status update is processed.
-        for tx in block.transactions.iter() {
+        for tx in block.transactions().iter() {
             let hash = tx.hash();
             if let Some(entry) = self.pool.get_mut(&hash) {
                 // Only update if still Pending (avoid overwriting later states during sync)
@@ -551,7 +551,7 @@ impl MempoolState {
         // Per-tx terminal state from committed wave certificates. Decisions are
         // derived from each FinalizedWave directly, so this works identically
         // for consensus and sync commit paths.
-        for fw in &block.certificates {
+        for fw in block.certificates() {
             for (tx_hash, decision) in fw.tx_decisions() {
                 if matches!(decision, TransactionDecision::Aborted) {
                     hyperscale_metrics::record_transaction_aborted();
@@ -1412,7 +1412,7 @@ mod tests {
         transactions: Vec<RoutableTransaction>,
         wave_certs: Vec<WaveCertificate>,
     ) -> Block {
-        Block {
+        Block::Live {
             header: BlockHeader {
                 shard_group_id: ShardGroupId(0),
                 height: BlockHeight(height),
@@ -1440,6 +1440,41 @@ mod tests {
                     })
                 })
                 .collect(),
+            provisions: vec![],
+        }
+    }
+
+    /// Append a `FinalizedWave` to a test block. The block is reconstructed
+    /// because `Block` is an enum — we can't mutate the inner `certificates`
+    /// vec directly.
+    fn push_finalized_wave(block: Block, fw: Arc<FinalizedWave>) -> Block {
+        match block {
+            Block::Live {
+                header,
+                transactions,
+                mut certificates,
+                provisions,
+            } => {
+                certificates.push(fw);
+                Block::Live {
+                    header,
+                    transactions,
+                    certificates,
+                    provisions,
+                }
+            }
+            Block::Sealed {
+                header,
+                transactions,
+                mut certificates,
+            } => {
+                certificates.push(fw);
+                Block::Sealed {
+                    header,
+                    transactions,
+                    certificates,
+                }
+            }
         }
     }
 
@@ -1461,14 +1496,14 @@ mod tests {
         let tx_hash = tx.hash();
         mempool.on_submit_transaction(&topology, Arc::new(tx.clone()));
 
-        let mut commit_block = make_test_block(1, vec![tx], vec![]);
-        commit_block
-            .certificates
-            .push(Arc::new(make_test_finalized_wave(
+        let commit_block = push_finalized_wave(
+            make_test_block(1, vec![tx], vec![]),
+            Arc::new(make_test_finalized_wave(
                 1,
                 tx_hash,
                 TransactionDecision::Aborted,
-            )));
+            )),
+        );
         let actions = mempool.on_block_committed_full(&topology, &commit_block);
 
         // Should have emitted Completed(Aborted) status
@@ -1501,14 +1536,14 @@ mod tests {
 
         // Submit and commit the transaction with an Accept-decision wave cert.
         mempool.on_submit_transaction(&topology, Arc::new(tx.clone()));
-        let mut commit_block = make_test_block(1, vec![tx], vec![]);
-        commit_block
-            .certificates
-            .push(Arc::new(make_test_finalized_wave(
+        let commit_block = push_finalized_wave(
+            make_test_block(1, vec![tx], vec![]),
+            Arc::new(make_test_finalized_wave(
                 1,
                 tx_hash,
                 TransactionDecision::Accept,
-            )));
+            )),
+        );
         mempool.on_block_committed_full(&topology, &commit_block);
 
         // Transaction should be tombstoned
@@ -1526,14 +1561,14 @@ mod tests {
 
         // Submit and complete the transaction (commit + Accept wave cert in one block).
         mempool.on_submit_transaction(&topology, Arc::new(tx.clone()));
-        let mut commit_block = make_test_block(1, vec![tx.clone()], vec![]);
-        commit_block
-            .certificates
-            .push(Arc::new(make_test_finalized_wave(
+        let commit_block = push_finalized_wave(
+            make_test_block(1, vec![tx.clone()], vec![]),
+            Arc::new(make_test_finalized_wave(
                 1,
                 tx_hash,
                 TransactionDecision::Accept,
-            )));
+            )),
+        );
         mempool.on_block_committed_full(&topology, &commit_block);
 
         // Verify it's tombstoned
@@ -1557,14 +1592,14 @@ mod tests {
 
         // Submit and complete the transaction (commit + Accept wave cert in one block).
         mempool.on_submit_transaction(&topology, Arc::new(tx.clone()));
-        let mut commit_block = make_test_block(1, vec![tx.clone()], vec![]);
-        commit_block
-            .certificates
-            .push(Arc::new(make_test_finalized_wave(
+        let commit_block = push_finalized_wave(
+            make_test_block(1, vec![tx.clone()], vec![]),
+            Arc::new(make_test_finalized_wave(
                 1,
                 tx_hash,
                 TransactionDecision::Accept,
-            )));
+            )),
+        );
         mempool.on_block_committed_full(&topology, &commit_block);
 
         // Try to re-submit - should be rejected (no status emitted)
@@ -1585,14 +1620,14 @@ mod tests {
 
         // Submit and commit with an Aborted-decision wave cert.
         mempool.on_submit_transaction(&topology, Arc::new(tx.clone()));
-        let mut commit_block = make_test_block(1, vec![tx.clone()], vec![]);
-        commit_block
-            .certificates
-            .push(Arc::new(make_test_finalized_wave(
+        let commit_block = push_finalized_wave(
+            make_test_block(1, vec![tx.clone()], vec![]),
+            Arc::new(make_test_finalized_wave(
                 1,
                 tx_hash,
                 TransactionDecision::Aborted,
-            )));
+            )),
+        );
         mempool.on_block_committed_full(&topology, &commit_block);
 
         // Transaction should be tombstoned
@@ -1614,14 +1649,14 @@ mod tests {
             let tx_hash = tx.hash();
 
             mempool.on_submit_transaction(&topology, Arc::new(tx.clone()));
-            let mut commit_block = make_test_block(i as u64, vec![tx], vec![]);
-            commit_block
-                .certificates
-                .push(Arc::new(make_test_finalized_wave(
+            let commit_block = push_finalized_wave(
+                make_test_block(i as u64, vec![tx], vec![]),
+                Arc::new(make_test_finalized_wave(
                     i as u64,
                     tx_hash,
                     TransactionDecision::Accept,
-                )));
+                )),
+            );
             mempool.on_block_committed_full(&topology, &commit_block);
         }
 
@@ -1651,14 +1686,14 @@ mod tests {
 
         // Commit the transaction with an Accept-decision wave cert.
         mempool.on_submit_transaction(&topology, Arc::new(tx.clone()));
-        let mut commit_block = make_test_block(10, vec![tx.clone()], vec![]);
-        commit_block
-            .certificates
-            .push(Arc::new(make_test_finalized_wave(
+        let commit_block = push_finalized_wave(
+            make_test_block(10, vec![tx.clone()], vec![]),
+            Arc::new(make_test_finalized_wave(
                 10,
                 tx_hash,
                 TransactionDecision::Accept,
-            )));
+            )),
+        );
         mempool.on_block_committed_full(&topology, &commit_block);
 
         // Pool should be empty

@@ -333,7 +333,7 @@ impl NodeStateMachine {
         let block_height = BlockHeight(height);
 
         // Register committed tx hashes with BFT for timeout abort validation.
-        let tx_hashes: Vec<Hash> = block.transactions.iter().map(|tx| tx.hash()).collect();
+        let tx_hashes: Vec<Hash> = block.transactions().iter().map(|tx| tx.hash()).collect();
         self.bft
             .register_committed_transactions(&tx_hashes, block_height);
 
@@ -388,7 +388,7 @@ impl NodeStateMachine {
             if !missing.is_empty() {
                 actions.push(Action::FetchProvisionLocal {
                     block_hash,
-                    proposer: block.header.proposer,
+                    proposer: block.header().proposer,
                     batch_hashes: missing,
                 });
             }
@@ -396,8 +396,8 @@ impl NodeStateMachine {
                 height,
                 hyperscale_execution::AwaitingBlock {
                     block_hash,
-                    block_timestamp: block.header.timestamp,
-                    proposer: block.header.proposer,
+                    block_timestamp: block.header().timestamp,
+                    proposer: block.header().proposer,
                     block,
                     provisions: resolved_provisions,
                     expected_provision_hashes,
@@ -488,8 +488,8 @@ impl NodeStateMachine {
         // Release execution's per-wave bookkeeping for wave certs included in
         // this block. Per-tx terminal state for the mempool is already handled
         // separately by `on_block_committed_full` reading `block.certificates`.
-        self.execution.cleanup_committed_waves(&block.certificates);
-        for cert in &block.certificates {
+        self.execution.cleanup_committed_waves(block.certificates());
+        for cert in block.certificates() {
             let cert_hash = cert.wave_id().hash();
             self.bft.remove_committed_transaction(&cert_hash);
         }
@@ -498,9 +498,9 @@ impl NodeStateMachine {
             self.topology.snapshot(),
             block_hash,
             height,
-            block.header.timestamp,
-            block.header.proposer,
-            block.transactions.clone(),
+            block.header().timestamp,
+            block.header().proposer,
+            block.transactions().to_vec(),
             provisions,
         ));
 

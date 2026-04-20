@@ -414,9 +414,9 @@ pub fn serve_provision_request(
         }
     };
 
-    let jmt_version = block.header.height.0;
+    let jmt_version = block.header().height.0;
 
-    let all_txs = block.transactions.iter();
+    let all_txs = block.transactions().iter();
 
     // Phase 1: Fetch state entries for all matching transactions.
     let mut per_tx: Vec<(
@@ -504,7 +504,7 @@ pub fn serve_provision_request(
             target_shard: req.target_shard,
             source_shard: local_shard,
             block_height: req.block_height,
-            block_timestamp: block.header.timestamp,
+            block_timestamp: block.header().timestamp,
             entries,
         });
     }

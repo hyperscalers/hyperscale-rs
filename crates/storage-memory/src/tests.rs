@@ -19,8 +19,8 @@ fn commit_with(
     block: &hyperscale_types::Block,
     qc: &hyperscale_types::QuorumCertificate,
 ) -> Hash {
-    let mut block = block.clone();
-    if !updates.node_updates.is_empty() {
+    let block = block.clone();
+    let block = if !updates.node_updates.is_empty() {
         let receipt = hyperscale_types::ReceiptBundle {
             tx_hash: Hash::ZERO,
             local_receipt: Arc::new(hyperscale_types::LocalReceipt {
@@ -30,20 +30,48 @@ fn commit_with(
             }),
             execution_output: None,
         };
+        let new_fw = Arc::new(hyperscale_types::FinalizedWave {
+            certificate: Arc::new(hyperscale_types::WaveCertificate {
+                wave_id: hyperscale_types::WaveId::new(
+                    hyperscale_types::ShardGroupId(0),
+                    block.header().height.0,
+                    std::collections::BTreeSet::new(),
+                ),
+                execution_certificates: vec![],
+            }),
+            receipts: vec![receipt],
+        });
+        match block {
+            hyperscale_types::Block::Live {
+                header,
+                transactions,
+                mut certificates,
+                provisions,
+            } => {
+                certificates.push(new_fw);
+                hyperscale_types::Block::Live {
+                    header,
+                    transactions,
+                    certificates,
+                    provisions,
+                }
+            }
+            hyperscale_types::Block::Sealed {
+                header,
+                transactions,
+                mut certificates,
+            } => {
+                certificates.push(new_fw);
+                hyperscale_types::Block::Sealed {
+                    header,
+                    transactions,
+                    certificates,
+                }
+            }
+        }
+    } else {
         block
-            .certificates
-            .push(Arc::new(hyperscale_types::FinalizedWave {
-                certificate: Arc::new(hyperscale_types::WaveCertificate {
-                    wave_id: hyperscale_types::WaveId::new(
-                        hyperscale_types::ShardGroupId(0),
-                        block.header.height.0,
-                        std::collections::BTreeSet::new(),
-                    ),
-                    execution_certificates: vec![],
-                }),
-                receipts: vec![receipt],
-            }));
-    }
+    };
     storage.commit_block(&Arc::new(block), &Arc::new(qc.clone()))
 }
 
@@ -225,8 +253,8 @@ fn test_block_storage_and_retrieval() {
     commit_empty(&storage, &block, &qc);
 
     let (stored_block, stored_qc) = storage.get_block(BlockHeight(1)).unwrap();
-    assert_eq!(stored_block.header.height, BlockHeight(1));
-    assert_eq!(stored_block.header.timestamp, 1_000);
+    assert_eq!(stored_block.header().height, BlockHeight(1));
+    assert_eq!(stored_block.header().timestamp, 1_000);
     assert_eq!(stored_qc.block_hash, block.hash());
 }
 
@@ -253,7 +281,7 @@ fn test_get_block_for_sync() {
 
     let result = storage.get_block_for_sync(BlockHeight(1));
     assert!(result.is_some());
-    assert_eq!(result.unwrap().0.header.height, BlockHeight(1));
+    assert_eq!(result.unwrap().0.header().height, BlockHeight(1));
 
     assert!(storage.get_block_for_sync(BlockHeight(999)).is_none());
 }
@@ -268,11 +296,32 @@ fn test_transactions_batch_missing() {
 #[test]
 fn test_transactions_batch_with_indexed_block() {
     let storage = SimStorage::new();
-    let mut block = make_test_block(1);
+    let block = make_test_block(1);
 
     let tx = Arc::new(hyperscale_types::test_utils::test_transaction(42));
     let tx_hash = tx.hash();
-    block.transactions = vec![tx];
+    let block = match block {
+        hyperscale_types::Block::Live {
+            header,
+            certificates,
+            provisions,
+            ..
+        } => hyperscale_types::Block::Live {
+            header,
+            transactions: vec![tx],
+            certificates,
+            provisions,
+        },
+        hyperscale_types::Block::Sealed {
+            header,
+            certificates,
+            ..
+        } => hyperscale_types::Block::Sealed {
+            header,
+            transactions: vec![tx],
+            certificates,
+        },
+    };
 
     let qc = make_test_qc(&block);
     commit_empty(&storage, &block, &qc);
