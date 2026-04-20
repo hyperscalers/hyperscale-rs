@@ -37,6 +37,12 @@ use std::sync::Arc;
 /// timeout from the same wave start height.
 pub const WAVE_TIMEOUT_BLOCKS: u64 = 32;
 
+/// Age at which a still-alive wave emits a single diagnostic warning. Set
+/// comfortably past `WAVE_TIMEOUT_BLOCKS` so that waves resolving via the
+/// normal timeout-abort path (including cross-shard cert gossip) pass
+/// silently; only genuinely-wedged waves surface.
+pub const WAVE_OVERDUE_WARN_BLOCKS: u64 = 64;
+
 /// Per-wave state across the entire execution lifecycle.
 #[derive(Debug)]
 pub struct WaveState {
@@ -469,13 +475,14 @@ impl WaveState {
         self.explicit_aborts.contains_key(tx_hash)
     }
 
-    /// Emit a `warn!` log if the wave has aged past `WAVE_TIMEOUT_BLOCKS`
-    /// without completing. Dumps enough state to diagnose what phase it's
-    /// stuck in (provisioning / dispatch / voting / EC collection). Called
-    /// once per committed block per surviving wave.
+    /// Emit a `warn!` log exactly once, when the wave reaches
+    /// `WAVE_OVERDUE_WARN_BLOCKS` of age without completing. Dumps enough
+    /// state to diagnose what phase it's stuck in (provisioning / dispatch /
+    /// voting / EC collection). Called once per committed block per surviving
+    /// wave; the `==` guard ensures a single emission per wave.
     pub fn log_if_overdue(&self, committed_height: u64) {
         let age = committed_height.saturating_sub(self.block_height);
-        if age <= WAVE_TIMEOUT_BLOCKS {
+        if age != WAVE_OVERDUE_WARN_BLOCKS {
             return;
         }
 
