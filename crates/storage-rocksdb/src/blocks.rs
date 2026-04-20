@@ -219,7 +219,10 @@ impl RocksDbStorage {
     ///
     /// This ensures sync responses always contain complete, self-contained blocks.
     /// If a peer can't provide a complete block, the requester should try another peer.
-    pub fn get_block_for_sync(&self, height: BlockHeight) -> Option<(Block, QuorumCertificate)> {
+    pub fn get_block_for_sync(
+        &self,
+        height: BlockHeight,
+    ) -> Option<(Block, QuorumCertificate, Vec<Hash>)> {
         let start = Instant::now();
 
         // 1. Get block metadata
@@ -283,12 +286,13 @@ impl RocksDbStorage {
             transactions,
             certificates,
         };
+        let provision_hashes = metadata.manifest.provision_hashes;
 
         let elapsed = start.elapsed().as_secs_f64();
         metrics::record_storage_read(elapsed);
         metrics::record_storage_operation("get_block_for_sync_complete", elapsed);
 
-        Some((block, metadata.qc))
+        Some((block, metadata.qc, provision_hashes))
     }
 
     /// Get multiple transactions by hash, preserving order.

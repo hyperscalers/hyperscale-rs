@@ -103,9 +103,10 @@ pub enum SyncInput {
     },
     /// A block response was received.
     /// `None` means the peer did not have the block.
+    /// `provision_hashes` carries the block manifest's provision batch hashes.
     BlockResponseReceived {
         height: u64,
-        block: Box<Option<(Block, QuorumCertificate)>>,
+        block: Box<Option<(Block, QuorumCertificate, Vec<Hash>)>>,
     },
     /// A block fetch failed after all retries.
     BlockFetchFailed { height: u64 },
@@ -119,9 +120,11 @@ pub enum SyncOutput {
     /// Request the runner to fetch a block at this height.
     FetchBlock { height: u64 },
     /// A validated block is ready to deliver to BFT.
+    /// `provision_hashes` come straight from the block's manifest.
     DeliverBlock {
         block: Box<Block>,
         qc: Box<QuorumCertificate>,
+        provision_hashes: Vec<Hash>,
     },
     /// Sync is complete (reached target).
     SyncComplete { height: u64 },
@@ -224,12 +227,12 @@ impl SyncProtocol {
     fn handle_block_response(
         &mut self,
         height: u64,
-        block: Option<(Block, QuorumCertificate)>,
+        block: Option<(Block, QuorumCertificate, Vec<Hash>)>,
     ) -> Vec<SyncOutput> {
         self.heights_in_flight.remove(&height);
 
         match block {
-            Some((block, qc)) => {
+            Some((block, qc, provision_hashes)) => {
                 // Validate
                 if block.header.height.0 != height {
                     warn!(
@@ -263,6 +266,7 @@ impl SyncProtocol {
                 let mut outputs = vec![SyncOutput::DeliverBlock {
                     block: Box::new(block),
                     qc: Box::new(qc),
+                    provision_hashes,
                 }];
                 outputs.extend(self.emit_fetch_outputs());
                 outputs
@@ -384,7 +388,7 @@ impl SyncProtocol {
 pub fn serve_block_request(storage: &impl ChainReader, req: GetBlockRequest) -> GetBlockResponse {
     trace!(height = req.height.0, "Handling block sync request");
     match storage.get_block_for_sync(req.height) {
-        Some((block, qc)) => GetBlockResponse::found(block, qc),
+        Some((block, qc, provision_hashes)) => GetBlockResponse::found(block, qc, provision_hashes),
         None => GetBlockResponse::not_found(),
     }
 }

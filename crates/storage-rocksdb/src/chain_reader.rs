@@ -26,7 +26,10 @@ impl hyperscale_storage::ChainReader for RocksDbStorage {
         self.read_latest_qc()
     }
 
-    fn get_block_for_sync(&self, height: BlockHeight) -> Option<(Block, QuorumCertificate)> {
+    fn get_block_for_sync(
+        &self,
+        height: BlockHeight,
+    ) -> Option<(Block, QuorumCertificate, Vec<Hash>)> {
         RocksDbStorage::get_block_for_sync(self, height)
     }
 

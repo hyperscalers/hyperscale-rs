@@ -203,7 +203,10 @@ impl hyperscale_storage::ChainReader for SharedStorage {
         self.0.latest_qc()
     }
 
-    fn get_block_for_sync(&self, height: BlockHeight) -> Option<(Block, QuorumCertificate)> {
+    fn get_block_for_sync(
+        &self,
+        height: BlockHeight,
+    ) -> Option<(Block, QuorumCertificate, Vec<Hash>)> {
         self.0.get_block_for_sync(height)
     }
 

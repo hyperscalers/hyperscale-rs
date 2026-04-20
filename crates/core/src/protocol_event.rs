@@ -280,7 +280,15 @@ pub enum ProtocolEvent {
     // Sync Delivery (from IoLoop after sync protocol processing)
     // ═══════════════════════════════════════════════════════════════════════
     /// A synced block is ready to be applied to local state.
-    SyncBlockReadyToApply { block: Block, qc: QuorumCertificate },
+    ///
+    /// `provision_hashes` carries the block manifest's provision batch hashes
+    /// so the receiver can resolve them against its `ProvisionCoordinator`
+    /// cache (provisions are not part of the block payload).
+    SyncBlockReadyToApply {
+        block: Block,
+        qc: QuorumCertificate,
+        provision_hashes: Vec<hyperscale_types::Hash>,
+    },
 
     /// Sync EC BLS verification completed (async callback from crypto pool).
     SyncEcVerificationComplete { height: u64, valid: bool },

@@ -617,7 +617,7 @@ where
                 // Check 1: receipt_root verification (synchronous).
                 // Verify block body matches the QC-attested header.
                 let certificate_root_valid = match *block {
-                    Some((ref b, _)) if !b.certificates.is_empty() => {
+                    Some((ref b, _, _)) if !b.certificates.is_empty() => {
                         let computed = hyperscale_types::compute_certificate_root(&b.certificates);
                         if computed != b.header.certificate_root {
                             tracing::warn!(

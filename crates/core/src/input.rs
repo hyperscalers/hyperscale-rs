@@ -51,9 +51,13 @@ pub enum NodeInput {
     SubmitTransaction { tx: Arc<RoutableTransaction> },
 
     /// Sync block response received from network callback.
+    ///
+    /// `provision_hashes` carries the block manifest's provision batch hashes
+    /// so the receiver can resolve them against its local
+    /// `ProvisionCoordinator` cache. Empty when the block was not found.
     SyncBlockResponseReceived {
         height: u64,
-        block: Box<Option<(Block, QuorumCertificate)>>,
+        block: Box<Option<(Block, QuorumCertificate, Vec<hyperscale_types::Hash>)>>,
     },
 
     /// Sync block fetch failed from network callback.

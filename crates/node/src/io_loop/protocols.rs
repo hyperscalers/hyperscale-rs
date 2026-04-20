@@ -52,9 +52,9 @@ where
                         },
                         Box::new(move |result| match result {
                             Ok(resp) => {
-                                let (block_opt, qc_opt) = resp.into_parts();
+                                let (block_opt, qc_opt, provision_hashes) = resp.into_parts();
                                 let block = match (block_opt, qc_opt) {
-                                    (Some(b), Some(q)) => Some((b, q)),
+                                    (Some(b), Some(q)) => Some((b, q, provision_hashes)),
                                     _ => None,
                                 };
                                 let _ = es.send(NodeInput::SyncBlockResponseReceived {
@@ -68,12 +68,17 @@ where
                         }),
                     );
                 }
-                SyncOutput::DeliverBlock { block, qc } => {
+                SyncOutput::DeliverBlock {
+                    block,
+                    qc,
+                    provision_hashes,
+                } => {
                     metrics::record_sync_block_received_by_bft();
                     metrics::record_sync_block_submitted_for_verification();
                     self.feed_event(ProtocolEvent::SyncBlockReadyToApply {
                         block: *block,
                         qc: *qc,
+                        provision_hashes,
                     });
                 }
                 SyncOutput::SyncComplete { height } => {

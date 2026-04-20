@@ -26,8 +26,21 @@ impl ChainReader for SimStorage {
         self.consensus.read().unwrap().committed_qc.clone()
     }
 
-    fn get_block_for_sync(&self, height: BlockHeight) -> Option<(Block, QuorumCertificate)> {
-        self.consensus.read().unwrap().blocks.get(&height).cloned()
+    fn get_block_for_sync(
+        &self,
+        height: BlockHeight,
+    ) -> Option<(Block, QuorumCertificate, Vec<Hash>)> {
+        self.consensus
+            .read()
+            .unwrap()
+            .blocks
+            .get(&height)
+            .cloned()
+            .map(|(block, qc)| {
+                let provision_hashes =
+                    hyperscale_types::BlockManifest::from_block(&block).provision_hashes;
+                (block, qc, provision_hashes)
+            })
     }
 
     fn get_transactions_batch(&self, hashes: &[Hash]) -> Vec<RoutableTransaction> {
