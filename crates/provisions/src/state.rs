@@ -259,8 +259,9 @@ impl ProvisionCoordinator {
     /// Immediately emit `FetchProvisionRemote` for all outstanding expected
     /// provisions, bypassing the normal 10-block timeout.
     ///
-    /// Called on sync-complete so the validator can participate in execution
-    /// for recent blocks within the `WAVE_TIMEOUT_BLOCKS` window.
+    /// Called when urgency overrides the default patience — sync completion
+    /// (validator needs to catch up before `WAVE_TIMEOUT_BLOCKS` runs out)
+    /// and the execution advance gate stalling on missing data.
     pub fn flush_expected_provisions(
         &mut self,
         topology: &hyperscale_types::TopologySnapshot,
@@ -273,7 +274,7 @@ impl ProvisionCoordinator {
             info!(
                 source_shard = source_shard.0,
                 block_height = block_height.0,
-                "Sync catchup — immediately requesting missing provisions"
+                "Eager fetch — immediately requesting missing provisions"
             );
             expected.requested = true;
             actions.push(Action::FetchProvisionRemote {
