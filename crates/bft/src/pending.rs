@@ -257,11 +257,21 @@ impl PendingBlock {
             .filter_map(|hash| self.received_waves.get(hash).cloned())
             .collect();
 
+        // Attach provisions in manifest order. `received_provisions` is
+        // populated as provision batches arrive via gossip / local fetch,
+        // and `is_complete()` gates assembly on all of them being present.
+        let provisions: Vec<Arc<Provision>> = self
+            .manifest
+            .provision_hashes
+            .iter()
+            .filter_map(|hash| self.received_provisions.get(hash).cloned())
+            .collect();
+
         let block = Arc::new(Block::Live {
             header: self.header.clone(),
             transactions,
             certificates,
-            provisions: vec![],
+            provisions,
         });
 
         self.constructed_block = Some(Arc::clone(&block));

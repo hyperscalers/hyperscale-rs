@@ -348,7 +348,7 @@ pub fn build_proposal<S: ChainWriter + SubstateStore>(
     certificates: Vec<Arc<FinalizedWave>>,
     local_shard: ShardGroupId,
     waves: Vec<WaveId>,
-    provision_hashes: Vec<Hash>,
+    provisions: Vec<Arc<hyperscale_types::Provision>>,
     parent_in_flight: u32,
     finalized_tx_count: u32,
     pending_snapshots: &[Arc<hyperscale_storage::JmtSnapshot>],
@@ -366,6 +366,9 @@ pub fn build_proposal<S: ChainWriter + SubstateStore>(
         .iter()
         .flat_map(|fw| fw.receipts.iter().cloned())
         .collect();
+
+    let mut provision_hashes: Vec<Hash> = provisions.iter().map(|p| p.hash()).collect();
+    provision_hashes.sort();
 
     let transaction_root = compute_transaction_root(&transactions);
     let certificate_root = compute_certificate_root(&certificates);
@@ -400,7 +403,7 @@ pub fn build_proposal<S: ChainWriter + SubstateStore>(
         header,
         transactions,
         certificates,
-        provisions: vec![],
+        provisions,
     };
 
     let block_hash = block.hash();
