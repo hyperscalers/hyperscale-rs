@@ -15,7 +15,7 @@ use hyperscale_engine::Engine;
 use hyperscale_metrics as metrics;
 use hyperscale_network::Network;
 use hyperscale_storage::{ChainReader, ChainWriter, SubstateStore};
-use hyperscale_types::{Block, Hash, Provision, QuorumCertificate, ValidatorId};
+use hyperscale_types::{Block, Hash, QuorumCertificate, ValidatorId};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tracing::{debug, trace, warn};
@@ -303,33 +303,22 @@ where
             // ═══════════════════════════════════════════════════════════
             // Block commit + notifications
             // ═══════════════════════════════════════════════════════════
-            Action::CommitBlock {
-                block,
-                qc,
-                provisions,
-                provision_hashes,
-            } => {
+            Action::CommitBlock { block, qc } => {
                 self.accumulate_block_commit(super::PendingCommit {
                     block: Arc::new(block),
                     qc: Arc::new(qc),
-                    provisions,
-                    provision_hashes,
                     committed_notified: false, // set by accumulate_block_commit
                 });
             }
             Action::CommitBlockByQcOnly {
                 block,
                 qc,
-                provisions,
-                provision_hashes,
                 parent_state_root,
                 parent_block_height,
             } => {
                 self.handle_commit_block_by_qc_only(
                     block,
                     qc,
-                    provisions,
-                    provision_hashes,
                     parent_state_root,
                     parent_block_height,
                 );
@@ -471,8 +460,6 @@ where
         &mut self,
         block: Block,
         qc: QuorumCertificate,
-        provisions: Vec<Arc<Provision>>,
-        provision_hashes: Vec<Hash>,
         parent_state_root: Hash,
         parent_block_height: u64,
     ) {
@@ -574,8 +561,6 @@ where
         self.accumulate_block_commit(super::PendingCommit {
             block: Arc::new(block),
             qc: Arc::new(qc),
-            provisions,
-            provision_hashes,
             committed_notified: false,
         });
     }
@@ -628,10 +613,7 @@ where
         if notify_now {
             self.feed_event(ProtocolEvent::BlockCommitted {
                 block_hash,
-                height: height.0,
                 block: Arc::unwrap_or_clone(Arc::clone(&commit.block)),
-                provisions: commit.provisions.clone(),
-                provision_hashes: commit.provision_hashes.clone(),
             });
         } else {
             tracing::debug!(
@@ -799,15 +781,12 @@ where
 
             // Send deferred BlockCommitted events for blocks that weren't notified
             // at accumulation time (due to persistence backpressure).
-            for (i, &height) in heights.iter().enumerate() {
+            for (i, _) in heights.iter().enumerate() {
                 if !already_notified[i] {
                     let commit = commit_slots[i].take().unwrap();
                     let _ = event_tx.send(NodeInput::Protocol(ProtocolEvent::BlockCommitted {
                         block_hash: block_hashes[i],
-                        height,
                         block: Arc::unwrap_or_clone(commit.block),
-                        provisions: commit.provisions,
-                        provision_hashes: commit.provision_hashes,
                     }));
                 }
             }

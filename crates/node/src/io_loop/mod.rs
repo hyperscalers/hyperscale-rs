@@ -66,17 +66,6 @@ type PreparedCommitMap<S> =
 pub(crate) struct PendingCommit {
     pub block: Arc<Block>,
     pub qc: Arc<QuorumCertificate>,
-    /// Provision batches referenced by this block. Carried inline from
-    /// `Action::CommitBlock` through to the downstream `BlockCommitted`
-    /// event, so consumers never rely on a lookup against the
-    /// ProvisionCoordinator cache.
-    pub provisions: Vec<Arc<Provision>>,
-    /// Expected provision batch hashes from the block's manifest. Paired
-    /// with `provisions`: if the set carried inline is incomplete (sync or
-    /// certified-only paths), the advance gate detects the gap by comparing
-    /// against these hashes and stalls execution until the fetch protocol
-    /// resolves them.
-    pub provision_hashes: Vec<Hash>,
     /// Whether `BlockCommitted` was already fired immediately
     /// in `accumulate_block_commit` (true) or deferred due to
     /// backpressure (false). The flush closure uses this to
@@ -623,7 +612,7 @@ where
                 // Check 1: receipt_root verification (synchronous).
                 // Verify block body matches the QC-attested header.
                 let certificate_root_valid = match *block {
-                    Some((ref b, _, _)) if !b.certificates().is_empty() => {
+                    Some((ref b, _)) if !b.certificates().is_empty() => {
                         let computed = hyperscale_types::compute_certificate_root(b.certificates());
                         if computed != b.header().certificate_root {
                             tracing::warn!(

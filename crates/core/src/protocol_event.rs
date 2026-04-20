@@ -96,16 +96,7 @@ pub enum ProtocolEvent {
     /// durable RocksDB persistence. All event data is carried in-memory
     /// from the action payload. Delegated actions that read substates use
     /// `PendingChain::view_at` to see unpersisted state.
-    BlockCommitted {
-        block_hash: Hash,
-        height: u64,
-        block: Block,
-        provisions: Vec<Arc<Provision>>,
-        /// Expected provision batch hashes from the block's manifest.
-        /// Paired with `provisions`: if the two sets disagree, the advance
-        /// gate stalls execution until the fetch protocol closes the gap.
-        provision_hashes: Vec<Hash>,
-    },
+    BlockCommitted { block_hash: Hash, block: Block },
 
     /// A block has been durably persisted to RocksDB.
     ///
@@ -284,15 +275,7 @@ pub enum ProtocolEvent {
     // Sync Delivery (from IoLoop after sync protocol processing)
     // ═══════════════════════════════════════════════════════════════════════
     /// A synced block is ready to be applied to local state.
-    ///
-    /// `provision_hashes` carries the block manifest's provision batch hashes
-    /// so the receiver can resolve them against its `ProvisionCoordinator`
-    /// cache (provisions are not part of the block payload).
-    SyncBlockReadyToApply {
-        block: Block,
-        qc: QuorumCertificate,
-        provision_hashes: Vec<hyperscale_types::Hash>,
-    },
+    SyncBlockReadyToApply { block: Block, qc: QuorumCertificate },
 
     /// Sync EC BLS verification completed (async callback from crypto pool).
     SyncEcVerificationComplete { height: u64, valid: bool },

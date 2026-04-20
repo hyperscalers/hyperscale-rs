@@ -1,35 +1,26 @@
 //! Block fetch response.
 
-use hyperscale_types::{Block, Hash, MessagePriority, NetworkMessage, QuorumCertificate};
+use hyperscale_types::{Block, MessagePriority, NetworkMessage, QuorumCertificate};
 use sbor::prelude::BasicSbor;
 
 /// Response to a block fetch request containing the full Block and its QC.
 ///
 /// ECs are carried inside `Block.certificates[i].wave_certificate.execution_certificates`
 /// and receipts are carried inline as part of `Block.certificates[i].receipts`.
-///
-/// `provision_hashes` carries the block manifest's provision batch hashes so the
-/// receiver can resolve them against its own `ProvisionCoordinator` cache —
-/// provisions themselves are not persisted.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct GetBlockResponse {
     /// The requested block (None if not found).
     pub block: Option<Block>,
     /// The QC that certifies this block (None if block not found or at tip).
     pub qc: Option<QuorumCertificate>,
-    /// Provision batch hashes the block commits to (manifest.provision_hashes).
-    /// Empty if block not found or has no provisions.
-    pub provision_hashes: Vec<Hash>,
 }
 
 impl GetBlockResponse {
-    /// Create a response with a found block, its certifying QC, and the
-    /// block's provision batch hashes.
-    pub fn found(block: Block, qc: QuorumCertificate, provision_hashes: Vec<Hash>) -> Self {
+    /// Create a response with a found block and its certifying QC.
+    pub fn found(block: Block, qc: QuorumCertificate) -> Self {
         Self {
             block: Some(block),
             qc: Some(qc),
-            provision_hashes,
         }
     }
 
@@ -38,7 +29,6 @@ impl GetBlockResponse {
         Self {
             block: None,
             qc: None,
-            provision_hashes: Vec::new(),
         }
     }
 
@@ -57,9 +47,9 @@ impl GetBlockResponse {
         self.qc.as_ref()
     }
 
-    /// Consume and return the block, QC, and provision hashes.
-    pub fn into_parts(self) -> (Option<Block>, Option<QuorumCertificate>, Vec<Hash>) {
-        (self.block, self.qc, self.provision_hashes)
+    /// Consume and return the block and QC.
+    pub fn into_parts(self) -> (Option<Block>, Option<QuorumCertificate>) {
+        (self.block, self.qc)
     }
 }
 
@@ -126,7 +116,7 @@ mod tests {
     fn test_block_response_found() {
         let block = create_test_block();
         let qc = create_test_qc(&block);
-        let response = GetBlockResponse::found(block.clone(), qc.clone(), vec![]);
+        let response = GetBlockResponse::found(block.clone(), qc.clone());
 
         assert!(response.has_block());
         assert_eq!(response.block(), Some(&block));
@@ -146,11 +136,10 @@ mod tests {
     fn test_block_response_into_parts() {
         let block = create_test_block();
         let qc = create_test_qc(&block);
-        let response = GetBlockResponse::found(block.clone(), qc.clone(), vec![]);
+        let response = GetBlockResponse::found(block.clone(), qc.clone());
 
-        let (extracted_block, extracted_qc, extracted_provisions) = response.into_parts();
+        let (extracted_block, extracted_qc) = response.into_parts();
         assert_eq!(extracted_block, Some(block));
         assert_eq!(extracted_qc, Some(qc));
-        assert!(extracted_provisions.is_empty());
     }
 }

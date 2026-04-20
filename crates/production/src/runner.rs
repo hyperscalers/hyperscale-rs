@@ -699,10 +699,7 @@ impl ProductionRunner {
         let genesis_commit_output = io_loop.step(NodeInput::Protocol(
             hyperscale_core::ProtocolEvent::BlockCommitted {
                 block_hash: genesis_block.hash(),
-                height: 0,
                 block: genesis_block,
-                provisions: vec![],
-                provision_hashes: vec![],
             },
         ));
 

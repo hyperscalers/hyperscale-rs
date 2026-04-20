@@ -24,6 +24,13 @@ use tracing::{debug, info, warn};
 /// This gives the source shard proposer time to send provisions normally.
 const PROVISION_FALLBACK_TIMEOUT_BLOCKS: u64 = 10;
 
+/// Number of local committed blocks to retain a committed provision in the
+/// in-memory cache. After this many blocks past its commit, the provision
+/// is dropped — the block it served has aged past the cross-shard execution
+/// window (`WAVE_TIMEOUT_BLOCKS`), so no peer can still need it as part of
+/// a `Block::Live` serving response. Must be `>= WAVE_TIMEOUT_BLOCKS`.
+const COMMITTED_PROVISION_RETENTION_BLOCKS: u64 = 32;
+
 /// Number of local committed blocks to retain verified remote headers.
 /// Headers older than this have either been matched with provisions (and can be
 /// discarded) or are stale (the source shard has moved far ahead).
@@ -113,6 +120,15 @@ pub struct ProvisionCoordinator {
     /// Maps hash → commit height for age-based pruning.
     committed_batch_tombstones: HashMap<Hash, BlockHeight>,
 
+    /// Committed provision hashes grouped by the local block height at which
+    /// they committed. Drives deferred eviction: `batches_by_hash` and
+    /// `verified_batches` retain these entries until `commit_height +
+    /// COMMITTED_PROVISION_RETENTION_BLOCKS` falls behind the local tip, at
+    /// which point they're dropped. Ensures peers catching up can still
+    /// receive `Block::Live` (with inline provisions) for any block within
+    /// the cross-shard execution window.
+    committed_retention: BTreeMap<BlockHeight, Vec<Hash>>,
+
     // ═══════════════════════════════════════════════════════════════════
     // Time
     // ═══════════════════════════════════════════════════════════════════
@@ -150,6 +166,7 @@ impl ProvisionCoordinator {
             expected_provisions: BTreeMap::new(),
             queued_provision_batches: Vec::new(),
             committed_batch_tombstones: HashMap::new(),
+            committed_retention: BTreeMap::new(),
             now: Duration::ZERO,
         }
     }
@@ -182,27 +199,45 @@ impl ProvisionCoordinator {
         // Update local committed height
         self.local_committed_height = block.header().height;
 
-        // Prune provision batches that were committed in this block.
+        // Record provision batches committed in this block, but don't
+        // evict them yet — peers catching up within the cross-shard
+        // execution window still need them attached to `Block::Live`
+        // sync responses. Eviction happens below once they age out.
         if !committed_provision_hashes.is_empty() {
             let committed: std::collections::HashSet<Hash> =
                 committed_provision_hashes.iter().copied().collect();
-            // Remove from hash index and collect (shard, height) keys to prune.
-            let mut keys_to_remove = Vec::new();
             for h in &committed {
-                if let Some(batch) = self.batches_by_hash.remove(h) {
-                    keys_to_remove.push((batch.source_shard, batch.block_height));
-                }
                 // Tombstone: prevent re-queueing if duplicate gossip arrives later.
                 self.committed_batch_tombstones
                     .insert(*h, self.local_committed_height);
             }
-            for key in &keys_to_remove {
-                self.verified_batches.remove(key);
-                // Header no longer needed once the provision is committed.
-                self.verified_remote_headers.remove(key);
-            }
+            self.committed_retention
+                .entry(self.local_committed_height)
+                .or_default()
+                .extend(committed.iter().copied());
             self.queued_provision_batches
                 .retain(|b| !committed.contains(&b.hash()));
+        }
+
+        // Evict committed provisions whose block has aged past the
+        // retention window. `split_off` partitions by the first retained
+        // height, leaving aged-out entries in `aged` for cleanup.
+        let retention_cutoff = BlockHeight(
+            self.local_committed_height
+                .0
+                .saturating_sub(COMMITTED_PROVISION_RETENTION_BLOCKS),
+        );
+        let still_retained = self.committed_retention.split_off(&retention_cutoff);
+        let aged = std::mem::replace(&mut self.committed_retention, still_retained);
+        for (_height, hashes) in aged {
+            for h in hashes {
+                if let Some(batch) = self.batches_by_hash.remove(&h) {
+                    let key = (batch.source_shard, batch.block_height);
+                    self.verified_batches.remove(&key);
+                    // Header no longer needed once the provision is evicted.
+                    self.verified_remote_headers.remove(&key);
+                }
+            }
         }
 
         // Prune stale verified remote headers that were never matched with

@@ -561,13 +561,6 @@ pub enum Action {
         block: Block,
         /// The QC that certified this block.
         qc: QuorumCertificate,
-        /// Provisions referenced by this block.
-        provisions: Vec<Arc<Provision>>,
-        /// The full set of provision batch hashes expected for this block,
-        /// derived from the block's manifest. Used at commit time to detect
-        /// missing batches (where `provisions.len() < provision_hashes.len()`)
-        /// so execution can stall until the fetch protocol fills the gap.
-        provision_hashes: Vec<Hash>,
     },
 
     /// Commit a block trusted via QC only — no cached PreparedCommit exists
@@ -581,9 +574,6 @@ pub enum Action {
     CommitBlockByQcOnly {
         block: Block,
         qc: QuorumCertificate,
-        provisions: Vec<Arc<Provision>>,
-        /// See [`Action::CommitBlock::provision_hashes`].
-        provision_hashes: Vec<Hash>,
         /// Parent block's state root — base state for JMT computation.
         parent_state_root: Hash,
         /// Parent block's height — JMT parent version.

@@ -18,10 +18,6 @@ pub(crate) struct PendingSyncedBlockVerification {
     pub block: Block,
     /// The QC that certifies this block.
     pub qc: QuorumCertificate,
-    /// Expected provision batch hashes from the block's manifest. Carried
-    /// through sync so the advance gate can tell whether execution has
-    /// every provision locally once this block is applied.
-    pub provision_hashes: Vec<Hash>,
     /// Whether the QC signature has been verified.
     pub verified: bool,
 }
@@ -47,10 +43,8 @@ pub(crate) struct SyncManager {
     sync_applied_height: u64,
 
     /// Buffered out-of-order synced blocks waiting for earlier blocks.
-    /// Maps height -> (Block, QC, expected provision hashes). The hashes
-    /// are carried through so later application can feed them into the
-    /// advance gate without a separate lookup.
-    buffered_synced_blocks: BTreeMap<u64, (Block, QuorumCertificate, Vec<Hash>)>,
+    /// Maps height -> (Block, QC).
+    buffered_synced_blocks: BTreeMap<u64, (Block, QuorumCertificate)>,
 
     /// Synced blocks pending QC signature verification.
     /// Maps block_hash -> pending synced block info.
@@ -130,16 +124,9 @@ impl SyncManager {
     }
 
     /// Buffer a future synced block for later processing.
-    pub fn buffer_block(
-        &mut self,
-        height: u64,
-        block: Block,
-        qc: QuorumCertificate,
-        provision_hashes: Vec<Hash>,
-    ) {
+    pub fn buffer_block(&mut self, height: u64, block: Block, qc: QuorumCertificate) {
         debug!(height, "Buffering future synced block for later");
-        self.buffered_synced_blocks
-            .insert(height, (block, qc, provision_hashes));
+        self.buffered_synced_blocks.insert(height, (block, qc));
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -155,7 +142,6 @@ impl SyncManager {
         block_hash: Hash,
         block: Block,
         qc: QuorumCertificate,
-        provision_hashes: Vec<Hash>,
     ) {
         let height = block.header().height.0;
         if self
@@ -178,7 +164,6 @@ impl SyncManager {
             PendingSyncedBlockVerification {
                 block,
                 qc,
-                provision_hashes,
                 verified: false,
             },
         );
@@ -246,10 +231,7 @@ impl SyncManager {
     ///
     /// Returns the block and QC if a verified block exists at `height`,
     /// otherwise None.
-    pub fn take_verified_at_height(
-        &mut self,
-        height: u64,
-    ) -> Option<(Block, QuorumCertificate, Vec<Hash>)> {
+    pub fn take_verified_at_height(&mut self, height: u64) -> Option<(Block, QuorumCertificate)> {
         let block_hash = self
             .pending_synced_block_verifications
             .iter()
@@ -261,7 +243,7 @@ impl SyncManager {
             .remove(&block_hash)
             .unwrap();
 
-        Some((pending.block, pending.qc, pending.provision_hashes))
+        Some((pending.block, pending.qc))
     }
 
     /// Log the current state of pending verifications (for debugging).
@@ -299,7 +281,7 @@ impl SyncManager {
         &mut self,
         start_height: u64,
         max_count: usize,
-    ) -> Vec<(Block, QuorumCertificate, Vec<Hash>)> {
+    ) -> Vec<(Block, QuorumCertificate)> {
         let mut result = Vec::new();
         let mut height = start_height;
 
