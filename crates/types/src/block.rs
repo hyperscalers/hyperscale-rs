@@ -76,24 +76,6 @@ pub fn compute_transaction_root(transactions: &[Arc<RoutableTransaction>]) -> Ha
     compute_padded_merkle_root(&leaves)
 }
 
-/// Compute the merkle root of the tx hashes assigned to a single wave.
-///
-/// Callers pass tx hashes in block order, which is already hash-ascending, so
-/// no sort step is needed on either proposer or verifier side. The receiver
-/// filters an incoming `ProvisionBatch` the same way — by wave membership
-/// preserving batch order — and recomputes this root to check completeness.
-///
-/// Returns `Hash::ZERO` for empty input, matching [`compute_transaction_root`].
-/// In practice a wave never exists without ≥1 tx; the structural guarantee
-/// comes from [`compute_waves_with_roots`](crate::compute_waves_with_roots),
-/// which only emits map entries for non-empty buckets.
-pub fn compute_wave_tx_root(tx_hashes: &[Hash]) -> Hash {
-    if tx_hashes.is_empty() {
-        return Hash::ZERO;
-    }
-    compute_padded_merkle_root(tx_hashes)
-}
-
 /// Block header containing consensus metadata.
 ///
 /// The header is what validators vote on. It contains:
@@ -166,23 +148,34 @@ pub struct BlockHeader {
     /// `Hash::ZERO` when no provisions are included (single-shard or empty block).
     pub provision_root: Hash,
 
-    /// Cross-shard execution waves in this block, each committed to the
-    /// merkle root of its assigned tx hashes.
+    /// Cross-shard execution waves in this block.
     ///
     /// Each `WaveId` is the set of remote shards that a group of transactions
     /// depends on for provisions. Transactions with identical remote shard sets
     /// share a wave. Wave-zero (single-shard txs) is excluded.
     ///
-    /// The per-wave `Hash` is `compute_wave_tx_root(tx_hashes_in_wave)`,
-    /// letting target shards verify that an incoming `ProvisionBatch` contains
-    /// every tx assigned to a wave that targets them — catching silently
-    /// dropped txs on the broadcast path. Entries only exist for waves with
-    /// ≥1 tx (structural invariant from [`crate::compute_waves_with_roots`]).
-    ///
     /// QC-attested (covered by the block hash), so a byzantine proposer
-    /// cannot forge the map without the block being rejected by honest
-    /// validators. Empty for genesis, fallback, and sync blocks.
-    pub waves: BTreeMap<WaveId, Hash>,
+    /// cannot forge it without the block being rejected by honest validators —
+    /// `validate_waves` recomputes this from `transactions` and compares.
+    ///
+    /// Used by remote shards to know which execution certificates to expect.
+    /// Provision-batch completeness is handled separately via
+    /// [`BlockHeader::provision_tx_roots`]. Empty for genesis, fallback, and
+    /// sync blocks.
+    pub waves: Vec<WaveId>,
+
+    /// Per-target-shard merkle commitment over the tx hashes a target shard
+    /// should receive provisions for from this block.
+    ///
+    /// Key = target shard; value = `compute_padded_merkle_root` over the
+    /// ordered tx hashes destined for that target (block order, already
+    /// hash-ascending). Lets the target verify a received `ProvisionBatch`
+    /// contains the full set it was meant to receive — catches silently
+    /// dropped txs on the broadcast path.
+    ///
+    /// Entries only exist for targets with ≥1 tx. Empty for genesis,
+    /// single-shard-only blocks, and empty blocks.
+    pub provision_tx_roots: BTreeMap<ShardGroupId, Hash>,
 
     /// Approximate number of in-flight transactions on this shard at proposal time.
     ///
@@ -213,7 +206,8 @@ impl BlockHeader {
             certificate_root: Hash::ZERO,
             local_receipt_root: Hash::ZERO,
             provision_root: Hash::ZERO,
-            waves: BTreeMap::new(),
+            waves: vec![],
+            provision_tx_roots: BTreeMap::new(),
             in_flight: 0,
         }
     }
@@ -223,7 +217,7 @@ impl BlockHeader {
     /// Returns the sorted set of all remote shards that need provisions from this block.
     pub fn provision_targets(&self) -> Vec<ShardGroupId> {
         let mut set = std::collections::BTreeSet::new();
-        for wave in self.waves.keys() {
+        for wave in &self.waves {
             set.extend(wave.remote_shards.iter().copied());
         }
         set.into_iter().collect()
@@ -786,7 +780,8 @@ mod tests {
             certificate_root: Hash::ZERO,
             local_receipt_root: Hash::ZERO,
             provision_root: Hash::ZERO,
-            waves: BTreeMap::new(),
+            waves: vec![],
+            provision_tx_roots: BTreeMap::new(),
             in_flight: 0,
         };
 
@@ -828,37 +823,6 @@ mod tests {
         let root2 = compute_transaction_root(std::slice::from_ref(&tx));
         assert_eq!(root1, root2);
         assert_ne!(root1, Hash::ZERO);
-    }
-
-    #[test]
-    fn test_compute_wave_tx_root_empty() {
-        let root = compute_wave_tx_root(&[]);
-        assert_eq!(root, Hash::ZERO);
-    }
-
-    #[test]
-    fn test_compute_wave_tx_root_order_sensitive() {
-        // Receiver/proposer use block-tx order (already hash-ascending), so
-        // the helper is deliberately order-sensitive. Callers must pass the
-        // canonical order.
-        let a = Hash::from_bytes(b"a");
-        let b = Hash::from_bytes(b"b");
-        let root_ab = compute_wave_tx_root(&[a, b]);
-        let root_ba = compute_wave_tx_root(&[b, a]);
-        assert_ne!(root_ab, root_ba);
-    }
-
-    #[test]
-    fn test_compute_wave_tx_root_deterministic() {
-        let leaves = [
-            Hash::from_bytes(b"tx1"),
-            Hash::from_bytes(b"tx2"),
-            Hash::from_bytes(b"tx3"),
-        ];
-        let r1 = compute_wave_tx_root(&leaves);
-        let r2 = compute_wave_tx_root(&leaves);
-        assert_eq!(r1, r2);
-        assert_ne!(r1, Hash::ZERO);
     }
 
     #[test]

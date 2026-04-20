@@ -1324,11 +1324,11 @@ impl ExecutionState {
         topology: &TopologySnapshot,
         source_shard: ShardGroupId,
         block_height: u64,
-        waves: &BTreeMap<WaveId, Hash>,
+        waves: &[WaveId],
     ) {
         let local_shard = topology.local_shard();
 
-        for wave in waves.keys() {
+        for wave in waves {
             if wave.remote_shards.contains(&local_shard) {
                 let key = (source_shard, block_height, wave.clone());
                 // Don't re-register if this cert was already received.
@@ -2231,7 +2231,8 @@ mod tests {
             certificate_root: Hash::ZERO,
             local_receipt_root: Hash::ZERO,
             provision_root: Hash::ZERO,
-            waves: BTreeMap::new(),
+            waves: vec![],
+            provision_tx_roots: BTreeMap::new(),
             in_flight: 0,
         };
         Block::Live {
@@ -2660,8 +2661,7 @@ mod tests {
 
         let remote_shard = ShardGroupId(1);
         let remote_wave = WaveId::new(remote_shard, 5, [ShardGroupId(0)].into_iter().collect());
-        let waves = BTreeMap::from([(remote_wave.clone(), Hash::ZERO)]);
-        state.on_verified_remote_header(&topo, remote_shard, 5, &waves);
+        state.on_verified_remote_header(&topo, remote_shard, 5, std::slice::from_ref(&remote_wave));
         assert_eq!(
             state.expected_exec_certs.len(),
             1,

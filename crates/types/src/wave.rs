@@ -23,9 +23,9 @@
 //! 5. [`FinalizedWave`] — all data needed for block commit
 
 use crate::{
-    compute_padded_merkle_root, compute_wave_tx_root, Bls12381G2Signature, Hash, LocalReceipt,
-    ReceiptBundle, RoutableTransaction, ShardGroupId, SignerBitfield, TopologySnapshot,
-    TransactionDecision, TransactionOutcome, ValidatorId,
+    compute_padded_merkle_root, Bls12381G2Signature, Hash, LocalReceipt, ReceiptBundle,
+    RoutableTransaction, ShardGroupId, SignerBitfield, TopologySnapshot, TransactionDecision,
+    TransactionOutcome, ValidatorId,
 };
 use sbor::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
@@ -161,50 +161,38 @@ pub fn compute_waves(
         .collect()
 }
 
-/// Compute the set of cross-shard waves for a block's transactions and the
-/// merkle root of each wave's assigned tx hashes.
+/// Per-target-shard merkle commitment over the tx hashes destined for each
+/// target shard in a block's cross-shard provision batches.
 ///
-/// Same partitioning as [`compute_waves`], but also commits each wave to its
-/// membership — target shards use the root to verify that an incoming
-/// `ProvisionBatch` contains the full tx set they were meant to receive.
+/// For each cross-shard tx, emit the tx hash into the bucket of every remote
+/// shard that tx touches. The resulting per-target leaves are merkle-committed
+/// in block order (already hash-ascending) so the target shard can verify a
+/// received `ProvisionBatch` contains the full set it was meant to receive.
 ///
-/// Only emits an entry for waves with ≥1 tx (structural: a bucket only exists
-/// because a tx fell into it). Combined with full-map equality in verification,
-/// this prevents a byzantine proposer from stuffing phantom `WaveId` entries
-/// into the block header.
-pub fn compute_waves_with_roots(
+/// Only emits an entry for targets with ≥1 tx. Empty for blocks with no
+/// cross-shard txs.
+pub fn compute_provision_tx_roots(
     topology: &TopologySnapshot,
-    block_height: u64,
     transactions: &[Arc<RoutableTransaction>],
-) -> BTreeMap<WaveId, Hash> {
+) -> BTreeMap<ShardGroupId, Hash> {
     let local_shard = topology.local_shard();
-    let mut buckets: BTreeMap<BTreeSet<ShardGroupId>, Vec<Hash>> = BTreeMap::new();
+    let mut per_target: BTreeMap<ShardGroupId, Vec<Hash>> = BTreeMap::new();
 
     for tx in transactions {
         if topology.is_single_shard_transaction(tx) {
             continue;
         }
-        let remote_shards: BTreeSet<ShardGroupId> = topology
-            .all_shards_for_transaction(tx)
-            .into_iter()
-            .filter(|&s| s != local_shard)
-            .collect();
-        if remote_shards.is_empty() {
-            continue;
+        for shard in topology.all_shards_for_transaction(tx) {
+            if shard == local_shard {
+                continue;
+            }
+            per_target.entry(shard).or_default().push(tx.hash());
         }
-        buckets.entry(remote_shards).or_default().push(tx.hash());
     }
 
-    buckets
+    per_target
         .into_iter()
-        .map(|(remote_shards, tx_hashes)| {
-            let wave_id = WaveId {
-                shard_group_id: local_shard,
-                block_height,
-                remote_shards,
-            };
-            (wave_id, compute_wave_tx_root(&tx_hashes))
-        })
+        .map(|(shard, hashes)| (shard, compute_padded_merkle_root(&hashes)))
         .collect()
 }
 
@@ -1194,14 +1182,14 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_waves_with_roots_empty() {
+    fn test_compute_provision_tx_roots_empty() {
         let topology = two_shard_topology();
-        let map = compute_waves_with_roots(&topology, 10, &[]);
+        let map = compute_provision_tx_roots(&topology, &[]);
         assert!(map.is_empty());
     }
 
     #[test]
-    fn test_compute_waves_with_roots_single_shard_excluded() {
+    fn test_compute_provision_tx_roots_single_shard_excluded() {
         let topology = two_shard_topology();
         let local_node = node_on_shard(&topology, topology.local_shard());
         let tx = Arc::new(test_transaction_with_nodes(
@@ -1209,50 +1197,17 @@ mod tests {
             vec![local_node],
             vec![local_node],
         ));
-        let map = compute_waves_with_roots(&topology, 10, &[tx]);
-        assert!(map.is_empty(), "single-shard tx must not produce a wave");
+        let map = compute_provision_tx_roots(&topology, &[tx]);
+        assert!(map.is_empty(), "single-shard tx must not produce an entry");
     }
 
     #[test]
-    fn test_compute_waves_with_roots_matches_compute_waves_keys() {
+    fn test_compute_provision_tx_roots_covers_all_touched_targets() {
         let topology = two_shard_topology();
         let local_node = node_on_shard(&topology, topology.local_shard());
         let remote_node = node_on_shard(&topology, ShardGroupId(1));
 
-        // Cross-shard txs: writes span both shards, so `consensus_shards` = {0,1}
-        // and the wave's `remote_shards` = {1}.
-        let tx_a = Arc::new(test_transaction_with_nodes(
-            &[1, 2, 3],
-            vec![],
-            vec![local_node, remote_node],
-        ));
-        let tx_b = Arc::new(test_transaction_with_nodes(
-            &[4, 5, 6],
-            vec![],
-            vec![local_node, remote_node],
-        ));
-        let txs = vec![tx_a.clone(), tx_b.clone()];
-
-        let keys_only = compute_waves(&topology, 10, &txs);
-        let with_roots = compute_waves_with_roots(&topology, 10, &txs);
-
-        let expected_keys: BTreeSet<_> = keys_only.iter().cloned().collect();
-        let actual_keys: BTreeSet<_> = with_roots.keys().cloned().collect();
-        assert_eq!(expected_keys, actual_keys);
-
-        // Two txs share the same remote_shards → one wave with root over both.
-        assert_eq!(with_roots.len(), 1);
-        let expected_root = crate::compute_wave_tx_root(&[tx_a.hash(), tx_b.hash()]);
-        let (_, actual_root) = with_roots.iter().next().unwrap();
-        assert_eq!(*actual_root, expected_root);
-    }
-
-    #[test]
-    fn test_compute_waves_with_roots_determinism_under_reorder() {
-        let topology = two_shard_topology();
-        let local_node = node_on_shard(&topology, topology.local_shard());
-        let remote_node = node_on_shard(&topology, ShardGroupId(1));
-
+        // Cross-shard tx: writes span local shard 0 and remote shard 1.
         let tx_a = Arc::new(test_transaction_with_nodes(
             &[1, 2, 3],
             vec![],
@@ -1264,15 +1219,14 @@ mod tests {
             vec![local_node, remote_node],
         ));
 
-        let forward = compute_waves_with_roots(&topology, 10, &[tx_a.clone(), tx_b.clone()]);
-        let reversed = compute_waves_with_roots(&topology, 10, &[tx_b, tx_a]);
+        let roots = compute_provision_tx_roots(&topology, &[tx_a.clone(), tx_b.clone()]);
 
-        // Same keys either way. Values differ if input tx order differs —
-        // callers pass txs in canonical block order (hash-ascending), so the
-        // test just asserts that the wave partition itself is stable.
-        let forward_keys: BTreeSet<_> = forward.keys().cloned().collect();
-        let reversed_keys: BTreeSet<_> = reversed.keys().cloned().collect();
-        assert_eq!(forward_keys, reversed_keys);
+        // Local shard excluded; only shard 1 receives provisions.
+        assert_eq!(roots.len(), 1);
+        assert!(roots.contains_key(&ShardGroupId(1)));
+
+        let expected = compute_padded_merkle_root(&[tx_a.hash(), tx_b.hash()]);
+        assert_eq!(roots[&ShardGroupId(1)], expected);
     }
 
     #[test]

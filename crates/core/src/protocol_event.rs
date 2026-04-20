@@ -27,7 +27,7 @@ pub enum VerificationKind {
     CertificateRoot,
     LocalReceiptRoot,
     ProvisionRoot,
-    WaveRoots,
+    ProvisionTxRoots,
 }
 
 /// Events that the state machine processes.
@@ -390,7 +390,7 @@ impl ProtocolEvent {
                 VerificationKind::CertificateRoot => "BlockRootVerified::CertificateRoot",
                 VerificationKind::LocalReceiptRoot => "BlockRootVerified::LocalReceiptRoot",
                 VerificationKind::ProvisionRoot => "BlockRootVerified::ProvisionRoot",
-                VerificationKind::WaveRoots => "BlockRootVerified::WaveRoots",
+                VerificationKind::ProvisionTxRoots => "BlockRootVerified::ProvisionTxRoots",
             },
             ProtocolEvent::ProposalBuilt { .. } => "ProposalBuilt",
 
