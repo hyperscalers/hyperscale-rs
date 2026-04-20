@@ -40,7 +40,10 @@ where
     pub(super) fn process_sync_outputs(&mut self, outputs: Vec<SyncOutput>) {
         for output in outputs {
             match output {
-                SyncOutput::FetchBlock { height } => {
+                SyncOutput::FetchBlock {
+                    height,
+                    target_height,
+                } => {
                     use hyperscale_messages::request::GetBlockRequest;
                     let es = self.event_sender.clone();
                     let peers = self.local_peers();
@@ -49,6 +52,7 @@ where
                         None,
                         GetBlockRequest {
                             height: BlockHeight(height),
+                            target_height: BlockHeight(target_height),
                         },
                         Box::new(move |result| match result {
                             Ok(resp) => {

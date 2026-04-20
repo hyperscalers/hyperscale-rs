@@ -6,18 +6,26 @@ use sbor::prelude::BasicSbor;
 
 /// Request to fetch a full Block by height during sync or catch-up.
 ///
-/// Note: The wire format encodes this as `height.to_le_bytes()` (8 bytes).
-/// This type exists for documentation and type-safety in the message layer.
+/// `target_height` carries the requester's catch-up goal so the serving
+/// peer can decide whether to return the block as `Live` (still within
+/// the execution window relative to the target) or `Sealed` (past the
+/// window, no provisions needed).
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct GetBlockRequest {
     /// Height of the block being requested.
     pub height: BlockHeight,
+    /// Height the requester is catching up to. Used by the serving peer
+    /// to pick between `Block::Live` and `Block::Sealed`.
+    pub target_height: BlockHeight,
 }
 
 impl GetBlockRequest {
     /// Create a new block fetch request.
-    pub fn new(height: BlockHeight) -> Self {
-        Self { height }
+    pub fn new(height: BlockHeight, target_height: BlockHeight) -> Self {
+        Self {
+            height,
+            target_height,
+        }
     }
 }
 
@@ -44,7 +52,8 @@ mod tests {
 
     #[test]
     fn test_get_block_request() {
-        let request = GetBlockRequest::new(BlockHeight(42));
+        let request = GetBlockRequest::new(BlockHeight(42), BlockHeight(100));
         assert_eq!(request.height, BlockHeight(42));
+        assert_eq!(request.target_height, BlockHeight(100));
     }
 }

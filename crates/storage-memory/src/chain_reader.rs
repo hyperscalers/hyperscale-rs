@@ -39,7 +39,16 @@ impl ChainReader for SimStorage {
             .map(|(block, qc)| {
                 let provision_hashes =
                     hyperscale_types::BlockManifest::from_block(&block).provision_hashes;
-                (block, qc, provision_hashes)
+                // The on-disk (persisted) shape is always `Sealed`. Collapse
+                // to `Sealed` here so memory and rocksdb backends return the
+                // same variant; sync-serving glue upgrades to `Live` when
+                // the requester is still in the execution window.
+                let sealed = Block::Sealed {
+                    header: block.header().clone(),
+                    transactions: block.transactions().to_vec(),
+                    certificates: block.certificates().to_vec(),
+                };
+                (sealed, qc, provision_hashes)
             })
     }
 

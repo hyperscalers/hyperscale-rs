@@ -317,7 +317,7 @@ mod tests {
         // Second handler should have won (overwrites).
         // Encode a real request, call the raw handler, verify it works.
         let handler = adapter.registry.get_request("block.request").unwrap();
-        let req = GetBlockRequest::new(BlockHeight(1));
+        let req = GetBlockRequest::new(BlockHeight(1), BlockHeight(1));
         let req_bytes = sbor::basic_encode(&req).unwrap();
         let response_bytes = handler(&req_bytes);
         assert!(!response_bytes.is_empty());
@@ -334,7 +334,7 @@ mod tests {
         adapter.request(
             peers,
             preferred,
-            GetBlockRequest::new(BlockHeight(42)),
+            GetBlockRequest::new(BlockHeight(42), BlockHeight(42)),
             Box::new(|_| {}),
         );
 
@@ -363,7 +363,7 @@ mod tests {
         adapter.request(
             &[ValidatorId(1)],
             None,
-            GetBlockRequest::new(BlockHeight(1)),
+            GetBlockRequest::new(BlockHeight(1), BlockHeight(1)),
             Box::new(move |r| {
                 *result_clone.lock().unwrap() = Some(r);
             }),
@@ -395,7 +395,7 @@ mod tests {
         adapter.request(
             &[ValidatorId(1)],
             None,
-            GetBlockRequest::new(BlockHeight(1)),
+            GetBlockRequest::new(BlockHeight(1), BlockHeight(1)),
             Box::new(move |r| {
                 *result_clone.lock().unwrap() = Some(r);
             }),
