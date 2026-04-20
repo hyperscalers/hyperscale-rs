@@ -97,7 +97,7 @@ pub use wave::{
     compute_global_receipt_root_with_proof, compute_waves, decode_finalized_wave_vec,
     decode_wave_cert_vec, encode_finalized_wave_vec, encode_wave_cert_vec, tx_outcome_leaf,
     wave_leader, wave_leader_at, ExecutionCertificate, ExecutionOutcome, ExecutionVote,
-    FinalizedWave, TxOutcome, WaveCertificate, WaveId,
+    FinalizedWave, ReceiptValidationError, TxOutcome, WaveCertificate, WaveId,
 };
 // Re-export with legacy alias for cross-crate use
 pub use wave::compute_global_receipt_root as compute_execution_receipt_root;
