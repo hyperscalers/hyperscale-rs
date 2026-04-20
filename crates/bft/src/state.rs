@@ -2075,6 +2075,14 @@ impl BftState {
                         ));
                 }
 
+                // Verify wave roots if block declares any cross-shard waves.
+                if self.verification.needs_wave_root_verification(&block) {
+                    verification_actions.extend(
+                        self.verification
+                            .initiate_wave_root_verification(block_hash, &block, topology),
+                    );
+                }
+
                 // If any verifications were initiated, wait for them to complete.
                 // When skip_vote is set, return after initiating verifications —
                 // we need the PreparedCommit but won't vote.
@@ -2645,6 +2653,9 @@ impl BftState {
             VerificationKind::ProvisionRoot => self
                 .verification
                 .on_provision_root_verified(block_hash, valid),
+            VerificationKind::WaveRoots => {
+                self.verification.on_wave_roots_verified(block_hash, valid)
+            }
         };
 
         if !pipeline_ok {
