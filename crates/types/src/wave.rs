@@ -25,7 +25,7 @@
 use crate::{
     compute_padded_merkle_root, Bls12381G2Signature, Hash, LocalReceipt, ReceiptBundle,
     RoutableTransaction, ShardGroupId, SignerBitfield, TopologySnapshot, TransactionDecision,
-    ValidatorId,
+    TransactionOutcome, ValidatorId,
 };
 use sbor::prelude::*;
 use std::collections::BTreeSet;
@@ -795,6 +795,31 @@ pub struct FinalizedWave {
     pub receipts: Vec<ReceiptBundle>,
 }
 
+/// Reason a `FinalizedWave`'s receipts don't agree with its own EC.
+/// Returned by [`FinalizedWave::validate_receipts_against_ec`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReceiptValidationError {
+    /// The WaveCertificate has no EC whose `wave_id == wc.wave_id`.
+    /// Every committed WC carries exactly one such "local" EC per the
+    /// `create_wave_certificate` invariant; this indicates a malformed
+    /// or tampered certificate.
+    MissingLocalEc,
+    /// A non-aborted `tx_outcome` has no corresponding receipt.
+    MissingReceipt { tx_hash: Hash },
+    /// A receipt's `tx_hash` doesn't match the expected position in
+    /// canonical order.
+    TxHashMismatch { expected: Hash, actual: Hash },
+    /// A receipt's outcome (Success/Failure) disagrees with the EC's
+    /// attested outcome for that tx.
+    OutcomeMismatch {
+        tx_hash: Hash,
+        expected: TransactionOutcome,
+        actual: TransactionOutcome,
+    },
+    /// More receipts than non-aborted outcomes.
+    ExtraReceipt { tx_hash: Hash },
+}
+
 impl FinalizedWave {
     /// Get the wave ID from the certificate.
     pub fn wave_id(&self) -> &WaveId {
@@ -880,6 +905,66 @@ impl FinalizedWave {
             certificate,
             receipts,
         })
+    }
+
+    /// Validate that `receipts` are consistent with the local EC's
+    /// `tx_outcomes`: exactly one receipt per non-aborted outcome, in
+    /// tx_outcomes canonical order, with matching tx_hash and matching
+    /// success/failure outcome.
+    ///
+    /// This does **not** verify `database_updates` or `writes_root` —
+    /// `LocalReceipt` carries only shard-filtered writes, so the global
+    /// `writes_root` the EC commits to can't be reconstructed from a
+    /// local receipt alone. Use to catch gross drift (wrong tx, wrong
+    /// success/fail, missing or surplus receipts) at peer-wave ingress.
+    pub fn validate_receipts_against_ec(&self) -> Result<(), ReceiptValidationError> {
+        let local_ec = self
+            .certificate
+            .execution_certificates
+            .iter()
+            .find(|ec| ec.wave_id == self.certificate.wave_id)
+            .ok_or(ReceiptValidationError::MissingLocalEc)?;
+
+        let mut receipt_iter = self.receipts.iter();
+        for outcome in &local_ec.tx_outcomes {
+            match outcome.outcome {
+                ExecutionOutcome::Aborted => {
+                    // Aborted outcomes carry no local receipt; skip.
+                }
+                ExecutionOutcome::Executed { success, .. } => {
+                    let receipt =
+                        receipt_iter
+                            .next()
+                            .ok_or(ReceiptValidationError::MissingReceipt {
+                                tx_hash: outcome.tx_hash,
+                            })?;
+                    if receipt.tx_hash != outcome.tx_hash {
+                        return Err(ReceiptValidationError::TxHashMismatch {
+                            expected: outcome.tx_hash,
+                            actual: receipt.tx_hash,
+                        });
+                    }
+                    let expected = if success {
+                        TransactionOutcome::Success
+                    } else {
+                        TransactionOutcome::Failure
+                    };
+                    if receipt.local_receipt.outcome != expected {
+                        return Err(ReceiptValidationError::OutcomeMismatch {
+                            tx_hash: outcome.tx_hash,
+                            expected,
+                            actual: receipt.local_receipt.outcome,
+                        });
+                    }
+                }
+            }
+        }
+        if let Some(extra) = receipt_iter.next() {
+            return Err(ReceiptValidationError::ExtraReceipt {
+                tx_hash: extra.tx_hash,
+            });
+        }
+        Ok(())
     }
 
     /// Aggregate per-tx decisions across all ECs (Aborted > Reject > Accept).
@@ -1450,5 +1535,205 @@ mod tests {
 
         let fw = FinalizedWave::reconstruct(wc, |_| Some(make_success_receipt()));
         assert!(fw.is_none(), "reconstruction requires the local EC");
+    }
+
+    // ─── validate_receipts_against_ec ──────────────────────────────────────
+
+    fn make_failure_receipt() -> Arc<LocalReceipt> {
+        Arc::new(LocalReceipt {
+            outcome: crate::TransactionOutcome::Failure,
+            database_updates: Default::default(),
+            application_events: vec![],
+        })
+    }
+
+    #[test]
+    fn validate_accepts_receipts_matching_outcomes() {
+        let wave_id = make_wave_id(0, 42, &[1]);
+        let tx_a = Hash::from_bytes(b"tx_a");
+        let tx_b = Hash::from_bytes(b"tx_b_aborted");
+        let tx_c = Hash::from_bytes(b"tx_c_fail");
+
+        let outcomes = vec![
+            TxOutcome {
+                tx_hash: tx_a,
+                outcome: ExecutionOutcome::Executed {
+                    receipt_hash: Hash::ZERO,
+                    success: true,
+                },
+            },
+            TxOutcome {
+                tx_hash: tx_b,
+                outcome: ExecutionOutcome::Aborted,
+            },
+            TxOutcome {
+                tx_hash: tx_c,
+                outcome: ExecutionOutcome::Executed {
+                    receipt_hash: Hash::ZERO,
+                    success: false,
+                },
+            },
+        ];
+        let fw = FinalizedWave {
+            certificate: Arc::new(WaveCertificate {
+                wave_id: wave_id.clone(),
+                execution_certificates: vec![make_local_ec(&wave_id, outcomes)],
+            }),
+            receipts: vec![
+                ReceiptBundle {
+                    tx_hash: tx_a,
+                    local_receipt: make_success_receipt(),
+                    execution_output: None,
+                },
+                ReceiptBundle {
+                    tx_hash: tx_c,
+                    local_receipt: make_failure_receipt(),
+                    execution_output: None,
+                },
+            ],
+        };
+        assert_eq!(fw.validate_receipts_against_ec(), Ok(()));
+    }
+
+    #[test]
+    fn validate_rejects_outcome_flip() {
+        let wave_id = make_wave_id(0, 42, &[1]);
+        let tx_a = Hash::from_bytes(b"tx_a");
+        let outcomes = vec![TxOutcome {
+            tx_hash: tx_a,
+            outcome: ExecutionOutcome::Executed {
+                receipt_hash: Hash::ZERO,
+                success: true,
+            },
+        }];
+        // EC says success but the receipt claims failure.
+        let fw = FinalizedWave {
+            certificate: Arc::new(WaveCertificate {
+                wave_id: wave_id.clone(),
+                execution_certificates: vec![make_local_ec(&wave_id, outcomes)],
+            }),
+            receipts: vec![ReceiptBundle {
+                tx_hash: tx_a,
+                local_receipt: make_failure_receipt(),
+                execution_output: None,
+            }],
+        };
+        assert!(matches!(
+            fw.validate_receipts_against_ec(),
+            Err(ReceiptValidationError::OutcomeMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_missing_receipt() {
+        let wave_id = make_wave_id(0, 42, &[1]);
+        let tx_a = Hash::from_bytes(b"tx_a");
+        let outcomes = vec![TxOutcome {
+            tx_hash: tx_a,
+            outcome: ExecutionOutcome::Executed {
+                receipt_hash: Hash::ZERO,
+                success: true,
+            },
+        }];
+        let fw = FinalizedWave {
+            certificate: Arc::new(WaveCertificate {
+                wave_id: wave_id.clone(),
+                execution_certificates: vec![make_local_ec(&wave_id, outcomes)],
+            }),
+            receipts: vec![], // non-aborted outcome without a receipt
+        };
+        assert!(matches!(
+            fw.validate_receipts_against_ec(),
+            Err(ReceiptValidationError::MissingReceipt { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_extra_receipt() {
+        let wave_id = make_wave_id(0, 42, &[1]);
+        let tx_a = Hash::from_bytes(b"tx_a");
+        let outcomes = vec![TxOutcome {
+            tx_hash: tx_a,
+            outcome: ExecutionOutcome::Aborted,
+        }];
+        let fw = FinalizedWave {
+            certificate: Arc::new(WaveCertificate {
+                wave_id: wave_id.clone(),
+                execution_certificates: vec![make_local_ec(&wave_id, outcomes)],
+            }),
+            receipts: vec![ReceiptBundle {
+                tx_hash: tx_a,
+                local_receipt: make_success_receipt(),
+                execution_output: None,
+            }],
+        };
+        assert!(matches!(
+            fw.validate_receipts_against_ec(),
+            Err(ReceiptValidationError::ExtraReceipt { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_tx_hash_mismatch() {
+        let wave_id = make_wave_id(0, 42, &[1]);
+        let tx_a = Hash::from_bytes(b"tx_a");
+        let tx_b = Hash::from_bytes(b"tx_b");
+        let outcomes = vec![TxOutcome {
+            tx_hash: tx_a,
+            outcome: ExecutionOutcome::Executed {
+                receipt_hash: Hash::ZERO,
+                success: true,
+            },
+        }];
+        let fw = FinalizedWave {
+            certificate: Arc::new(WaveCertificate {
+                wave_id: wave_id.clone(),
+                execution_certificates: vec![make_local_ec(&wave_id, outcomes)],
+            }),
+            receipts: vec![ReceiptBundle {
+                tx_hash: tx_b, // wrong tx for this outcome slot
+                local_receipt: make_success_receipt(),
+                execution_output: None,
+            }],
+        };
+        assert!(matches!(
+            fw.validate_receipts_against_ec(),
+            Err(ReceiptValidationError::TxHashMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_missing_local_ec() {
+        let wave_id = make_wave_id(0, 42, &[1]);
+        let remote_wave_id = make_wave_id(1, 42, &[0]);
+        let remote_ec = make_local_ec(&remote_wave_id, vec![]);
+        let fw = FinalizedWave {
+            certificate: Arc::new(WaveCertificate {
+                wave_id, // differs from any EC's wave_id
+                execution_certificates: vec![remote_ec],
+            }),
+            receipts: vec![],
+        };
+        assert_eq!(
+            fw.validate_receipts_against_ec(),
+            Err(ReceiptValidationError::MissingLocalEc)
+        );
+    }
+
+    #[test]
+    fn validate_all_aborted_wave_with_empty_receipts_passes() {
+        let wave_id = make_wave_id(0, 42, &[1]);
+        let outcomes = vec![TxOutcome {
+            tx_hash: Hash::from_bytes(b"aborted"),
+            outcome: ExecutionOutcome::Aborted,
+        }];
+        let fw = FinalizedWave {
+            certificate: Arc::new(WaveCertificate {
+                wave_id: wave_id.clone(),
+                execution_certificates: vec![make_local_ec(&wave_id, outcomes)],
+            }),
+            receipts: vec![],
+        };
+        assert_eq!(fw.validate_receipts_against_ec(), Ok(()));
     }
 }

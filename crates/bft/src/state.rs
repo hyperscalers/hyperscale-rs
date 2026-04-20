@@ -4018,6 +4018,12 @@ impl BftState {
     /// When a FinalizedWave is produced locally, it might complete a pending block
     /// that was waiting for that wave. This method checks all pending blocks and
     /// triggers voting if any are now complete.
+    ///
+    /// Fetched/broadcast waves are validated against their own EC before use:
+    /// a peer with divergent local execution could serve a wave whose receipts
+    /// disagree with the outcomes the EC attests to. Rejecting such a wave
+    /// leaves the pending block incomplete; the fetch protocol retries from a
+    /// different peer.
     pub fn check_pending_blocks_for_finalized_wave(
         &mut self,
         topology: &TopologySnapshot,
@@ -4025,6 +4031,15 @@ impl BftState {
         fw: &Arc<FinalizedWave>,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
+
+        if let Err(err) = fw.validate_receipts_against_ec() {
+            warn!(
+                ?wave_id_hash,
+                ?err,
+                "Rejecting FinalizedWave: receipts inconsistent with its EC"
+            );
+            return actions;
+        }
 
         // Find pending blocks that need this finalized wave
         let mut block_hashes: Vec<Hash> = self
