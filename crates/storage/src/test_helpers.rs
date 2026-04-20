@@ -16,7 +16,7 @@ use hyperscale_types::{
 };
 use radix_common::prelude::DatabaseUpdate;
 use radix_substate_store_interface::db_key_mapper::{DatabaseKeyMapper, SpreadPrefixKeyMapper};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 /// Build a `DatabaseUpdates` containing a single `Set` operation.
@@ -103,7 +103,7 @@ pub fn make_test_block(height: u64) -> Block {
             certificate_root: Hash::ZERO,
             local_receipt_root: Hash::ZERO,
             provision_root: Hash::ZERO,
-            waves: vec![],
+            waves: BTreeMap::new(),
             in_flight: 0,
         },
         transactions: vec![],

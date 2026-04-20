@@ -542,6 +542,7 @@ impl RemoteHeaderCoordinator {
 mod tests {
     use super::*;
     use hyperscale_types::{BlockHeader, Hash, QuorumCertificate, ShardGroupId, ValidatorId};
+    use std::collections::BTreeMap;
 
     // Basic structural tests — full integration tests require TopologySnapshot
     // which is tested via node-level tests.
@@ -572,7 +573,7 @@ mod tests {
             certificate_root: Hash::ZERO,
             local_receipt_root: Hash::ZERO,
             provision_root: Hash::ZERO,
-            waves: vec![],
+            waves: BTreeMap::new(),
             in_flight: 0,
         };
         let mut qc = QuorumCertificate::genesis();

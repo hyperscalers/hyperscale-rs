@@ -71,6 +71,7 @@ mod tests {
         test_utils::test_transaction, zero_bls_signature, BlockHeader, BlockHeight, Hash,
         ShardGroupId, SignerBitfield, ValidatorId,
     };
+    use std::collections::BTreeMap;
 
     fn create_test_block() -> Block {
         let tx = test_transaction(1);
@@ -90,7 +91,7 @@ mod tests {
                 certificate_root: Hash::ZERO,
                 local_receipt_root: Hash::ZERO,
                 provision_root: Hash::ZERO,
-                waves: vec![],
+                waves: BTreeMap::new(),
                 in_flight: 0,
             },
             transactions: vec![std::sync::Arc::new(tx)],
