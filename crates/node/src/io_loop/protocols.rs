@@ -184,8 +184,17 @@ where
                     );
                 }
                 LocalProvisionFetchOutput::Deliver { batches } => {
+                    // Route through the coordinator's receive path so each
+                    // batch hits the per-target completeness check against
+                    // the source header's `provision_tx_roots`. The content-
+                    // hash match inside `LocalProvisionFetchProtocol` only
+                    // proves the batch matches what the proposer committed
+                    // to in BlockManifest; it doesn't catch a proposer that
+                    // committed to an incomplete batch.
                     for batch in batches {
-                        self.feed_event(ProtocolEvent::ProvisionVerified { batch });
+                        self.feed_event(ProtocolEvent::StateProvisionReceived {
+                            batch: (*batch).clone(),
+                        });
                     }
                 }
             }
