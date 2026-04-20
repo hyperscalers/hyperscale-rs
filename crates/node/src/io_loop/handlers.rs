@@ -42,9 +42,10 @@ where
         // ── block.request → sync protocol ────────────────────────────
 
         let storage = Arc::clone(&self.storage);
+        let provision_cache = Arc::clone(&self.provision_cache);
         self.network
             .register_request_handler::<GetBlockRequest>(move |req| {
-                serve_block_request(&*storage, req)
+                serve_block_request(&*storage, &provision_cache, req)
             });
 
         // ── transaction.request → fetch protocol ─────────────────────

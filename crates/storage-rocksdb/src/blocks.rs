@@ -281,12 +281,14 @@ impl RocksDbStorage {
             return None;
         };
 
-        // 5. Full block available - reconstruct it
-        let block = Block::Live {
+        // 5. Full block available - reconstruct as `Sealed`: on-disk form
+        // carries no provisions by design. The sync-serving glue above
+        // optionally upgrades to `Live` by attaching provisions from the
+        // in-memory cache when the requester needs them.
+        let block = Block::Sealed {
             header: metadata.header,
             transactions,
             certificates,
-            provisions: vec![],
         };
         let provision_hashes = metadata.manifest.provision_hashes;
 

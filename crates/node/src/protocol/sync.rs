@@ -13,14 +13,17 @@
 //! Production: `SyncManager` wraps this, maps outputs to tokio tasks.
 //! Simulation: feeds inputs/outputs synchronously via event queue.
 
+use hyperscale_execution::WAVE_TIMEOUT_BLOCKS;
 use hyperscale_messages::request::GetBlockRequest;
 use hyperscale_messages::response::GetBlockResponse;
 use hyperscale_metrics as metrics;
 use hyperscale_storage::ChainReader;
-use hyperscale_types::{Block, Hash, QuorumCertificate};
+use hyperscale_types::{Block, Hash, Provision, QuorumCertificate};
+use quick_cache::sync::Cache as QuickCache;
 use serde::Serialize;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
+use std::sync::Arc;
 use tracing::{info, trace, warn};
 
 /// Configuration for the sync protocol.
@@ -117,8 +120,10 @@ pub enum SyncInput {
 /// Outputs from the sync protocol state machine.
 #[derive(Debug)]
 pub enum SyncOutput {
-    /// Request the runner to fetch a block at this height.
-    FetchBlock { height: u64 },
+    /// Request the runner to fetch a block at this height. `target_height`
+    /// is the sync target, passed through to the serving peer so it can
+    /// choose between `Block::Live` and `Block::Sealed`.
+    FetchBlock { height: u64, target_height: u64 },
     /// A validated block is ready to deliver to BFT.
     /// `provision_hashes` come straight from the block's manifest.
     DeliverBlock {
@@ -359,10 +364,14 @@ impl SyncProtocol {
     /// Emit FetchBlock outputs for pending heights up to concurrent limit.
     fn emit_fetch_outputs(&mut self) -> Vec<SyncOutput> {
         let mut outputs = Vec::new();
+        let target_height = self.sync_target.map(|(h, _)| h).unwrap_or(0);
         while self.heights_in_flight.len() < self.config.max_concurrent_fetches {
             if let Some(height) = self.pop_next_height() {
                 self.heights_in_flight.insert(height);
-                outputs.push(SyncOutput::FetchBlock { height });
+                outputs.push(SyncOutput::FetchBlock {
+                    height,
+                    target_height,
+                });
             } else {
                 break;
             }
@@ -377,20 +386,65 @@ impl SyncProtocol {
 
 /// Serve an inbound block sync request.
 ///
-/// Returns the full Block (which includes ECs embedded in each
-/// `FinalizedWave.wave_certificate.execution_certificates`) plus the QC.
-/// Returns `not_found` if any data is missing.
-///
-/// `get_block_for_sync` rebuilds each `FinalizedWave` from stored receipts and
-/// places it on `block.certificates`, so the syncing peer gets a self-contained
-/// block with everything needed to verify and apply state changes. The syncing
-/// node verifies EC integrity via the QC-attested `certificate_root`.
-pub fn serve_block_request(storage: &impl ChainReader, req: GetBlockRequest) -> GetBlockResponse {
-    trace!(height = req.height.0, "Handling block sync request");
-    match storage.get_block_for_sync(req.height) {
-        Some((block, qc, provision_hashes)) => GetBlockResponse::found(block, qc, provision_hashes),
-        None => GetBlockResponse::not_found(),
+/// Storage always returns `Block::Sealed` — the persisted shape carries no
+/// provisions. If the requester is still within the cross-shard execution
+/// window relative to their `target_height`, this function must upgrade
+/// to `Block::Live` by attaching the matching provisions from the local
+/// in-memory cache. If the provisions have already aged out of the cache,
+/// returns `not_found` rather than silently downgrading to `Sealed` — the
+/// requester genuinely needs `Live` and will try another peer.
+pub fn serve_block_request(
+    storage: &impl ChainReader,
+    provision_cache: &QuickCache<Hash, Arc<Provision>>,
+    req: GetBlockRequest,
+) -> GetBlockResponse {
+    trace!(
+        height = req.height.0,
+        target_height = req.target_height.0,
+        "Handling block sync request"
+    );
+    let Some((block, qc, provision_hashes)) = storage.get_block_for_sync(req.height) else {
+        return GetBlockResponse::not_found();
+    };
+
+    let needs_live =
+        req.height.0 + WAVE_TIMEOUT_BLOCKS > req.target_height.0 && !provision_hashes.is_empty();
+
+    if !needs_live {
+        return GetBlockResponse::found(block, qc, provision_hashes);
     }
+
+    let resolved: Option<Vec<Arc<Provision>>> = provision_hashes
+        .iter()
+        .map(|h| provision_cache.get(h))
+        .collect();
+    let Some(provisions) = resolved else {
+        trace!(
+            height = req.height.0,
+            target_height = req.target_height.0,
+            "Provisions no longer cached — requester must try another peer"
+        );
+        return GetBlockResponse::not_found();
+    };
+
+    let (header, transactions, certificates) = match block {
+        Block::Sealed {
+            header,
+            transactions,
+            certificates,
+        } => (header, transactions, certificates),
+        Block::Live { .. } => {
+            unreachable!("storage returns Sealed; Live is assembled only in this function")
+        }
+    };
+    let block = Block::Live {
+        header,
+        transactions,
+        certificates,
+        provisions,
+    };
+
+    GetBlockResponse::found(block, qc, provision_hashes)
 }
 
 #[cfg(test)]
@@ -429,7 +483,7 @@ mod tests {
         let fetch_heights: Vec<u64> = outputs
             .iter()
             .filter_map(|o| match o {
-                SyncOutput::FetchBlock { height } => Some(*height),
+                SyncOutput::FetchBlock { height, .. } => Some(*height),
                 _ => None,
             })
             .collect();
@@ -477,6 +531,6 @@ mod tests {
         // Should re-emit a FetchBlock for height 1
         assert!(outputs
             .iter()
-            .any(|o| matches!(o, SyncOutput::FetchBlock { height: 1 })));
+            .any(|o| matches!(o, SyncOutput::FetchBlock { height: 1, .. })));
     }
 }
