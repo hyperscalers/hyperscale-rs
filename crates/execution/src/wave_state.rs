@@ -298,6 +298,23 @@ impl WaveState {
             .all(|h| self.execution_results.contains_key(h) || self.explicit_aborts.contains_key(h))
     }
 
+    /// True if, for every non-aborted tx in the wave, local execution has
+    /// produced a result. Aborted txs (via pre-dispatch conflict, explicit
+    /// intent, or cert-attested `Aborted` outcome) don't require a receipt.
+    ///
+    /// Gates [`Self::is_complete`] so `finalize_wave` can't run while any
+    /// non-aborted tx's receipt is still in flight from the engine —
+    /// without this check, a cross-shard wave whose local EC arrives
+    /// before this validator's engine results would finalize with missing
+    /// receipts.
+    fn has_local_receipts_for_non_aborted(&self) -> bool {
+        self.tx_hashes.iter().all(|h| {
+            self.tracker_aborted.contains(h)
+                || self.explicit_aborts.contains_key(h)
+                || self.execution_results.contains_key(h)
+        })
+    }
+
     // ── Vote emission ───────────────────────────────────────────────────
 
     /// Vote height (relative to `block_height`):
@@ -412,10 +429,20 @@ impl WaveState {
         self.is_complete()
     }
 
-    /// Whether the wave is complete: local EC present AND every tx either
-    /// aborted (terminal) or covered by every participating shard.
+    /// Whether the wave is complete: local EC present, every non-aborted
+    /// tx has a local execution result on this validator, and every tx
+    /// either aborted (terminal) or covered by every participating shard.
+    ///
+    /// The local-receipt gate prevents the race where a cross-shard wave's
+    /// local EC arrives (aggregated from other validators' votes) before
+    /// this validator's engine finishes executing — without it,
+    /// `finalize_wave` silently drops the pending txs' receipt slots and
+    /// produces a divergent FinalizedWave.
     pub fn is_complete(&self) -> bool {
         if !self.local_ec_emitted {
+            return false;
+        }
+        if !self.has_local_receipts_for_non_aborted() {
             return false;
         }
         for tx_hash in &self.tx_hashes {
@@ -711,6 +738,65 @@ mod tests {
         let ec_local = make_ec(w.wave_id(), ShardGroupId(0), &[h0, h1], true);
         assert!(w.add_execution_certificate(ec_local));
         assert!(w.is_complete());
+    }
+
+    #[test]
+    fn is_complete_false_when_local_ec_arrives_before_engine_results() {
+        // The race the gate is designed to catch: a cross-shard wave's
+        // local EC is aggregated from *other* validators' votes while this
+        // validator's engine is still running. Coverage looks good but
+        // there are no local receipts yet — finalizing here would produce
+        // a `FinalizedWave` with missing receipts. Gate must hold until
+        // the engine catches up.
+        let mut w = make_cross_shard_wave(2);
+        let h0 = w.tx_hashes()[0];
+        let h1 = w.tx_hashes()[1];
+
+        w.mark_tx_provisioned(h0, WAVE_START + 1);
+        w.mark_tx_provisioned(h1, WAVE_START + 1);
+
+        // Remote EC lands first (other shard was fast).
+        let ec_remote = make_ec(w.wave_id(), ShardGroupId(1), &[h0, h1], true);
+        w.add_execution_certificate(ec_remote);
+
+        // Local EC lands — built from the other three committee members'
+        // votes without this validator contributing. Coverage is complete
+        // but no local engine result yet.
+        let ec_local = make_ec(w.wave_id(), ShardGroupId(0), &[h0, h1], true);
+        w.add_execution_certificate(ec_local);
+        assert!(
+            !w.is_complete(),
+            "wave must not be complete before local engine results arrive"
+        );
+
+        // Engine finishes — first result not yet enough.
+        w.record_execution_result(h0, executed(true));
+        assert!(!w.is_complete());
+
+        // Second result — now fully resolvable.
+        w.record_execution_result(h1, executed(true));
+        assert!(w.is_complete());
+    }
+
+    #[test]
+    fn is_complete_when_ec_attests_abort_without_local_result() {
+        // Symmetric to the race fix: if the local EC marks a tx aborted,
+        // that tx legitimately has no local receipt. The gate must not
+        // stall on such txs — `tracker_aborted` covers for them.
+        let mut w = make_cross_shard_wave(2);
+        let h0 = w.tx_hashes()[0];
+        let h1 = w.tx_hashes()[1];
+
+        w.mark_tx_provisioned(h0, WAVE_START + 1);
+        w.mark_tx_provisioned(h1, WAVE_START + 1);
+
+        // Local EC attests both txs aborted. No execution results needed.
+        let ec_local = make_ec(w.wave_id(), ShardGroupId(0), &[h0, h1], false);
+        w.add_execution_certificate(ec_local);
+        assert!(
+            w.is_complete(),
+            "all-aborted wave resolves without local engine results"
+        );
     }
 
     #[test]
