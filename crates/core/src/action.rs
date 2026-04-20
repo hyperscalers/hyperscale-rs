@@ -507,8 +507,6 @@ pub enum Action {
         transactions: Vec<Arc<RoutableTransaction>>,
         /// Finalized waves to include in the block (carries certs + receipts + ECs).
         finalized_waves: Vec<Arc<FinalizedWave>>,
-        /// Cross-shard execution waves in this block.
-        waves: Vec<WaveId>,
         /// Provision batches from remote shards, included in this block.
         provision_batches: Vec<Arc<Provision>>,
         /// Parent block's in-flight count (for deterministic computation).

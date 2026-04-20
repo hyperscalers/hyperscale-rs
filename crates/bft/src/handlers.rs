@@ -7,10 +7,10 @@
 use hyperscale_storage::{ChainWriter, SubstateStore};
 use hyperscale_types::{
     batch_verify_bls_same_message, compute_certificate_root, compute_local_receipt_root,
-    compute_provision_root, compute_transaction_root, verify_bls12381_v1, Block, BlockHeader,
-    BlockHeight, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature, FinalizedWave, Hash,
-    QuorumCertificate, ReceiptBundle, RoutableTransaction, ShardGroupId, SignerBitfield,
-    ValidatorId, VotePower, WaveId,
+    compute_provision_root, compute_transaction_root, compute_waves_with_roots, verify_bls12381_v1,
+    Block, BlockHeader, BlockHeight, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature,
+    FinalizedWave, Hash, QuorumCertificate, ReceiptBundle, RoutableTransaction, ShardGroupId,
+    SignerBitfield, TopologySnapshot, ValidatorId, VotePower,
 };
 use std::sync::Arc;
 
@@ -347,7 +347,7 @@ pub fn build_proposal<S: ChainWriter + SubstateStore>(
     transactions: Vec<Arc<RoutableTransaction>>,
     certificates: Vec<Arc<FinalizedWave>>,
     local_shard: ShardGroupId,
-    waves: Vec<WaveId>,
+    topology: &TopologySnapshot,
     provisions: Vec<Arc<hyperscale_types::Provision>>,
     parent_in_flight: u32,
     finalized_tx_count: u32,
@@ -374,6 +374,7 @@ pub fn build_proposal<S: ChainWriter + SubstateStore>(
     let certificate_root = compute_certificate_root(&certificates);
     let local_receipt_root = compute_local_receipt_root(&receipts);
     let provision_root = compute_provision_root(&provision_hashes);
+    let waves = compute_waves_with_roots(topology, height.0, &transactions);
 
     // in_flight is deterministic from chain state:
     // parent's in_flight + new transactions committed - transactions finalized by certificates.

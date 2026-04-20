@@ -68,6 +68,7 @@ impl NetworkMessage for BlockHeaderNotification {
 #[cfg(test)]
 mod tests {
     use hyperscale_types::{BlockHeight, Hash, QuorumCertificate, ShardGroupId, ValidatorId};
+    use std::collections::BTreeMap;
 
     use super::*;
 
@@ -86,7 +87,7 @@ mod tests {
             certificate_root: Hash::ZERO,
             local_receipt_root: Hash::ZERO,
             provision_root: Hash::ZERO,
-            waves: vec![],
+            waves: BTreeMap::new(),
             in_flight: 0,
         }
     }

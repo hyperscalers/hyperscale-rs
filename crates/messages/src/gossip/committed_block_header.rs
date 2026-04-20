@@ -64,6 +64,7 @@ mod tests {
             zero_bls_signature, BlockHeader, BlockHeight, Hash, QuorumCertificate, ShardGroupId,
             ValidatorId,
         };
+        use std::collections::BTreeMap;
 
         let header = BlockHeader {
             shard_group_id: ShardGroupId(1),
@@ -79,7 +80,7 @@ mod tests {
             certificate_root: Hash::ZERO,
             local_receipt_root: Hash::ZERO,
             provision_root: Hash::ZERO,
-            waves: vec![],
+            waves: BTreeMap::new(),
             in_flight: 0,
         };
         let qc = QuorumCertificate::genesis();

@@ -1079,11 +1079,6 @@ impl BftState {
             "Requesting block build for proposal"
         );
 
-        // Compute waves: which cross-shard execution waves exist in this block.
-        // QC-attested (part of block hash). Used by remote shards to detect missing
-        // provisions (derived from wave union) and missing execution certificates.
-        let waves = hyperscale_types::compute_waves(topology, next_height, &transactions);
-
         let proposal_action = Action::BuildProposal {
             shard_group_id: topology.local_shard(),
             proposer: topology.local_validator_id(),
@@ -1097,7 +1092,6 @@ impl BftState {
             parent_block_height,
             transactions,
             finalized_waves: waves_to_propose,
-            waves,
             provision_batches,
             parent_in_flight,
             finalized_tx_count: finalized_tx_count as u32,
@@ -1190,7 +1184,6 @@ impl BftState {
             parent_block_height,
             transactions: vec![],
             finalized_waves: vec![],
-            waves: vec![],
             provision_batches: vec![],
             parent_in_flight,
             finalized_tx_count: 0,
@@ -1279,7 +1272,6 @@ impl BftState {
             parent_block_height,
             transactions: vec![],
             finalized_waves: vec![],
-            waves: vec![],
             provision_batches: vec![],
             parent_in_flight,
             finalized_tx_count: 0,
@@ -2119,8 +2111,11 @@ impl BftState {
     /// compares with the header's claimed value. This prevents a byzantine
     /// proposer from lying about which waves exist.
     fn validate_waves(&self, topology: &TopologySnapshot, block: &Block) -> Result<(), String> {
-        let expected =
-            hyperscale_types::compute_waves(topology, block.height().0, block.transactions());
+        let expected = hyperscale_types::compute_waves_with_roots(
+            topology,
+            block.height().0,
+            block.transactions(),
+        );
 
         if block.header().waves != expected {
             return Err(format!(
@@ -4810,6 +4805,7 @@ mod tests {
         zero_bls_signature, Bls12381G2Signature, SignerBitfield, ValidatorInfo, ValidatorSet,
     };
     use hyperscale_types::{Bls12381G1PrivateKey, TopologySnapshot};
+    use std::collections::BTreeMap;
 
     fn make_test_state() -> (BftState, TopologySnapshot) {
         make_test_state_with_validators(4)
@@ -4883,7 +4879,7 @@ mod tests {
             certificate_root: Hash::ZERO,
             local_receipt_root: Hash::ZERO,
             provision_root: Hash::ZERO,
-            waves: vec![],
+            waves: BTreeMap::new(),
             in_flight: 0,
         }
     }
@@ -4917,7 +4913,7 @@ mod tests {
             certificate_root: Hash::ZERO,
             local_receipt_root: Hash::ZERO,
             provision_root: Hash::ZERO,
-            waves: vec![],
+            waves: BTreeMap::new(),
             in_flight: 0,
         };
 
@@ -5016,7 +5012,7 @@ mod tests {
             certificate_root: Hash::ZERO,
             local_receipt_root: Hash::ZERO,
             provision_root: Hash::ZERO,
-            waves: vec![],
+            waves: BTreeMap::new(),
             in_flight: 0,
         };
 
@@ -5041,7 +5037,7 @@ mod tests {
             certificate_root: Hash::ZERO,
             local_receipt_root: Hash::ZERO,
             provision_root: Hash::ZERO,
-            waves: vec![],
+            waves: BTreeMap::new(),
             in_flight: 0,
         };
         assert!(
@@ -5118,7 +5114,7 @@ mod tests {
             certificate_root: Hash::ZERO,
             local_receipt_root: Hash::ZERO,
             provision_root: Hash::ZERO,
-            waves: vec![],
+            waves: BTreeMap::new(),
             in_flight: 0,
         };
 
@@ -5206,7 +5202,7 @@ mod tests {
             certificate_root: Hash::ZERO,
             local_receipt_root: Hash::ZERO,
             provision_root: Hash::ZERO,
-            waves: vec![],
+            waves: BTreeMap::new(),
             in_flight: 0,
         };
 
@@ -5313,7 +5309,7 @@ mod tests {
             certificate_root: Hash::ZERO,
             local_receipt_root: Hash::ZERO,
             provision_root: Hash::ZERO,
-            waves: vec![],
+            waves: BTreeMap::new(),
             in_flight: 0,
         };
 
@@ -5388,7 +5384,7 @@ mod tests {
             certificate_root: Hash::ZERO,
             local_receipt_root: Hash::ZERO,
             provision_root: Hash::ZERO,
-            waves: vec![],
+            waves: BTreeMap::new(),
             in_flight: 0,
         };
 
@@ -5654,7 +5650,7 @@ mod tests {
             certificate_root: Hash::ZERO,
             local_receipt_root: Hash::ZERO,
             provision_root: Hash::ZERO,
-            waves: vec![],
+            waves: BTreeMap::new(),
             in_flight: 0,
         };
         let block_a_hash = block_a.hash();
@@ -5673,7 +5669,7 @@ mod tests {
             certificate_root: Hash::ZERO,
             local_receipt_root: Hash::ZERO,
             provision_root: Hash::ZERO,
-            waves: vec![],
+            waves: BTreeMap::new(),
             in_flight: 0,
         };
         let block_b_hash = block_b.hash();
@@ -5721,7 +5717,7 @@ mod tests {
             certificate_root: Hash::ZERO,
             local_receipt_root: Hash::ZERO,
             provision_root: Hash::ZERO,
-            waves: vec![],
+            waves: BTreeMap::new(),
             in_flight: 0,
         };
         let block_hash = block.hash();
@@ -5763,7 +5759,7 @@ mod tests {
                 certificate_root: Hash::ZERO,
                 local_receipt_root: Hash::ZERO,
                 provision_root: Hash::ZERO,
-                waves: vec![],
+                waves: BTreeMap::new(),
                 in_flight: 0,
             };
             state.try_vote_on_block(&topology, block.hash(), height, 0);
@@ -6064,7 +6060,7 @@ mod tests {
             certificate_root: Hash::ZERO,
             local_receipt_root: Hash::ZERO,
             provision_root: Hash::ZERO,
-            waves: vec![],
+            waves: BTreeMap::new(),
             in_flight: 0,
         };
         let original_block_hash = original_header.hash();
@@ -6144,7 +6140,7 @@ mod tests {
             certificate_root: Hash::ZERO,
             local_receipt_root: Hash::ZERO,
             provision_root: Hash::ZERO,
-            waves: vec![],
+            waves: BTreeMap::new(),
             in_flight: 0,
         };
 
@@ -6183,7 +6179,7 @@ mod tests {
             certificate_root: Hash::ZERO,
             local_receipt_root: Hash::ZERO,
             provision_root: Hash::ZERO,
-            waves: vec![],
+            waves: BTreeMap::new(),
             in_flight: 0,
         };
 
@@ -6514,7 +6510,7 @@ mod tests {
             certificate_root: Hash::ZERO,
             local_receipt_root: Hash::ZERO,
             provision_root: Hash::ZERO,
-            waves: vec![],
+            waves: BTreeMap::new(),
             in_flight: 0,
         };
         let original_block_hash = original_header.hash();
@@ -6744,7 +6740,7 @@ mod tests {
             certificate_root: Hash::ZERO,
             local_receipt_root: Hash::ZERO,
             provision_root: Hash::ZERO,
-            waves: vec![],
+            waves: BTreeMap::new(),
             in_flight: 0,
         };
         let block_hash_r1 = header_round1.hash();
@@ -6763,7 +6759,7 @@ mod tests {
             certificate_root: Hash::ZERO,
             local_receipt_root: Hash::ZERO,
             provision_root: Hash::ZERO,
-            waves: vec![],
+            waves: BTreeMap::new(),
             in_flight: 0,
         };
         let block_hash_r2 = header_round2.hash();
@@ -6782,7 +6778,7 @@ mod tests {
             certificate_root: Hash::ZERO,
             local_receipt_root: Hash::ZERO,
             provision_root: Hash::ZERO,
-            waves: vec![],
+            waves: BTreeMap::new(),
             in_flight: 0,
         };
         let block_hash_r3 = header_round3.hash();
@@ -6802,7 +6798,7 @@ mod tests {
             certificate_root: Hash::ZERO,
             local_receipt_root: Hash::ZERO,
             provision_root: Hash::ZERO,
-            waves: vec![],
+            waves: BTreeMap::new(),
             in_flight: 0,
         };
         let block_hash_h6 = header_height6.hash();
@@ -7029,7 +7025,7 @@ mod tests {
             certificate_root: Hash::ZERO,
             local_receipt_root: Hash::ZERO,
             provision_root: Hash::ZERO,
-            waves: vec![],
+            waves: BTreeMap::new(),
             in_flight: 0,
         };
 
@@ -7068,7 +7064,7 @@ mod tests {
             certificate_root: Hash::ZERO,
             local_receipt_root: Hash::ZERO,
             provision_root: Hash::ZERO,
-            waves: vec![],
+            waves: BTreeMap::new(),
             in_flight: 0,
         };
 
@@ -7989,7 +7985,7 @@ mod tests {
                 certificate_root: Hash::ZERO,
                 local_receipt_root: Hash::ZERO,
                 provision_root: Hash::ZERO,
-                waves: vec![],
+                waves: BTreeMap::new(),
                 in_flight: 0,
             },
             transactions: vec![],
@@ -8548,7 +8544,7 @@ mod tests {
                 certificate_root: Hash::ZERO,
                 local_receipt_root: Hash::ZERO,
                 provision_root: Hash::ZERO,
-                waves: vec![],
+                waves: BTreeMap::new(),
                 in_flight: 0,
             },
             transactions: vec![tx1.clone()],
@@ -8576,7 +8572,7 @@ mod tests {
                 certificate_root: Hash::ZERO,
                 local_receipt_root: Hash::ZERO,
                 provision_root: Hash::ZERO,
-                waves: vec![],
+                waves: BTreeMap::new(),
                 in_flight: 0,
             },
             transactions: txs,
@@ -8612,7 +8608,7 @@ mod tests {
                 certificate_root: Hash::ZERO,
                 local_receipt_root: Hash::ZERO,
                 provision_root: Hash::ZERO,
-                waves: vec![],
+                waves: BTreeMap::new(),
                 in_flight: 0,
             },
             transactions: vec![tx1.clone()],
@@ -8639,7 +8635,7 @@ mod tests {
                 certificate_root: Hash::ZERO,
                 local_receipt_root: Hash::ZERO,
                 provision_root: Hash::ZERO,
-                waves: vec![],
+                waves: BTreeMap::new(),
                 in_flight: 0,
             },
             transactions: vec![tx1],
@@ -8718,7 +8714,7 @@ mod tests {
                 certificate_root: Hash::ZERO,
                 local_receipt_root: Hash::ZERO,
                 provision_root: Hash::ZERO,
-                waves: vec![],
+                waves: BTreeMap::new(),
                 in_flight: 0,
             },
             transactions: vec![],
