@@ -145,12 +145,12 @@ pub(crate) struct VerificationPipeline {
     /// Blocks with verified provisions roots.
     verified_provision_roots: HashSet<Hash>,
 
-    // === Wave root verification ===
-    /// Blocks where wave root verification is currently in-flight.
-    wave_root_verifications_in_flight: HashSet<Hash>,
+    // === Provision tx-root verification ===
+    /// Blocks where provision tx-root verification is currently in-flight.
+    provision_tx_root_verifications_in_flight: HashSet<Hash>,
 
-    /// Blocks with verified wave roots.
-    verified_wave_roots: HashSet<Hash>,
+    /// Blocks with verified provision tx-roots.
+    verified_provision_tx_roots: HashSet<Hash>,
 
     // === In-flight count verification ===
     /// Blocks with verified in-flight counts (synchronous tolerance check).
@@ -178,8 +178,8 @@ impl VerificationPipeline {
             verified_local_receipt_roots: HashSet::new(),
             provision_root_verifications_in_flight: HashSet::new(),
             verified_provision_roots: HashSet::new(),
-            wave_root_verifications_in_flight: HashSet::new(),
-            verified_wave_roots: HashSet::new(),
+            provision_tx_root_verifications_in_flight: HashSet::new(),
+            verified_provision_tx_roots: HashSet::new(),
             verified_in_flight: HashSet::new(),
         }
     }
@@ -238,7 +238,7 @@ impl VerificationPipeline {
             || !self.certificate_root_verifications_in_flight.is_empty()
             || !self.local_receipt_root_verifications_in_flight.is_empty()
             || !self.provision_root_verifications_in_flight.is_empty()
-            || !self.wave_root_verifications_in_flight.is_empty()
+            || !self.provision_tx_root_verifications_in_flight.is_empty()
             || !self.pending_qc_verifications.is_empty()
     }
 
@@ -289,10 +289,10 @@ impl VerificationPipeline {
             self.verified_provision_roots.contains(&block_hash)
         };
 
-        let wave_root_ok = if block.header().waves.is_empty() {
+        let provision_tx_root_ok = if block.header().provision_tx_roots.is_empty() {
             true
         } else {
-            self.verified_wave_roots.contains(&block_hash)
+            self.verified_provision_tx_roots.contains(&block_hash)
         };
 
         let in_flight_ok = self.verified_in_flight.contains(&block_hash);
@@ -302,7 +302,7 @@ impl VerificationPipeline {
             && certificate_root_ok
             && local_receipt_root_ok
             && provision_root_ok
-            && wave_root_ok
+            && provision_tx_root_ok
             && in_flight_ok
     }
 
@@ -380,11 +380,14 @@ impl VerificationPipeline {
             "NOT_STARTED"
         };
 
-        let wave_root_status = if block.header().waves.is_empty() {
-            "skipped(no_waves)"
-        } else if self.verified_wave_roots.contains(&block_hash) {
+        let provision_tx_root_status = if block.header().provision_tx_roots.is_empty() {
+            "skipped(no_provision_targets)"
+        } else if self.verified_provision_tx_roots.contains(&block_hash) {
             "verified"
-        } else if self.wave_root_verifications_in_flight.contains(&block_hash) {
+        } else if self
+            .provision_tx_root_verifications_in_flight
+            .contains(&block_hash)
+        {
             "in_flight"
         } else {
             "NOT_STARTED"
@@ -407,7 +410,7 @@ impl VerificationPipeline {
             certificate_root = certificate_root_status,
             local_receipt_root = local_receipt_root_status,
             provision_root = provision_root_status,
-            wave_root = wave_root_status,
+            provision_tx_root = provision_tx_root_status,
             in_flight = in_flight_status,
             "View change — block verification was incomplete"
         );
@@ -569,7 +572,7 @@ impl VerificationPipeline {
         self.verified_certificate_roots.insert(block_hash);
         self.verified_local_receipt_roots.insert(block_hash);
         self.verified_provision_roots.insert(block_hash);
-        self.verified_wave_roots.insert(block_hash);
+        self.verified_provision_tx_roots.insert(block_hash);
         self.verified_in_flight.insert(block_hash);
     }
 
@@ -815,18 +818,20 @@ impl VerificationPipeline {
         valid
     }
 
-    // ─── Wave roots ─────────────────────────────────────────────────────
+    // ─── Provision tx-roots ─────────────────────────────────────────────
 
-    /// Check if a block needs wave root verification before voting.
-    pub fn needs_wave_root_verification(&self, block: &Block) -> bool {
-        if block.header().waves.is_empty() {
+    /// Check if a block needs provision tx-root verification before voting.
+    pub fn needs_provision_tx_root_verification(&self, block: &Block) -> bool {
+        if block.header().provision_tx_roots.is_empty() {
             return false;
         }
 
         let block_hash = block.hash();
 
-        if self.verified_wave_roots.contains(&block_hash)
-            || self.wave_root_verifications_in_flight.contains(&block_hash)
+        if self.verified_provision_tx_roots.contains(&block_hash)
+            || self
+                .provision_tx_root_verifications_in_flight
+                .contains(&block_hash)
         {
             return false;
         }
@@ -834,8 +839,8 @@ impl VerificationPipeline {
         true
     }
 
-    /// Initiate wave root verification for a block.
-    pub fn initiate_wave_root_verification(
+    /// Initiate provision tx-root verification for a block.
+    pub fn initiate_provision_tx_root_verification(
         &mut self,
         block_hash: Hash,
         block: &Block,
@@ -843,30 +848,31 @@ impl VerificationPipeline {
     ) -> Vec<Action> {
         debug!(
             block_hash = ?block_hash,
-            wave_count = block.header().waves.len(),
-            "Initiating wave root verification"
+            target_count = block.header().provision_tx_roots.len(),
+            "Initiating provision tx-root verification"
         );
 
-        self.wave_root_verifications_in_flight.insert(block_hash);
+        self.provision_tx_root_verifications_in_flight
+            .insert(block_hash);
 
-        vec![Action::VerifyWaveRoots {
+        vec![Action::VerifyProvisionTxRoots {
             block_hash,
-            expected: block.header().waves.clone(),
-            block_height: block.height().0,
+            expected: block.header().provision_tx_roots.clone(),
             transactions: block.transactions().to_vec(),
             topology: topology.clone(),
         }]
     }
 
-    /// Record a wave root verification result.
-    pub fn on_wave_roots_verified(&mut self, block_hash: Hash, valid: bool) -> bool {
-        self.wave_root_verifications_in_flight.remove(&block_hash);
+    /// Record a provision tx-root verification result.
+    pub fn on_provision_tx_roots_verified(&mut self, block_hash: Hash, valid: bool) -> bool {
+        self.provision_tx_root_verifications_in_flight
+            .remove(&block_hash);
 
         if valid {
-            self.verified_wave_roots.insert(block_hash);
+            self.verified_provision_tx_roots.insert(block_hash);
             debug!(
                 block_hash = ?block_hash,
-                "Wave roots verified successfully"
+                "Provision tx-roots verified successfully"
             );
         }
 

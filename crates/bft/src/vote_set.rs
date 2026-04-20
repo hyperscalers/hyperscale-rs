@@ -402,7 +402,8 @@ mod tests {
             certificate_root: Hash::ZERO,
             local_receipt_root: Hash::ZERO,
             provision_root: Hash::ZERO,
-            waves: std::collections::BTreeMap::new(),
+            waves: vec![],
+            provision_tx_roots: std::collections::BTreeMap::new(),
             in_flight: 0,
         }
     }

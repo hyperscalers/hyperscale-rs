@@ -7,10 +7,10 @@
 use hyperscale_storage::{ChainWriter, SubstateStore};
 use hyperscale_types::{
     batch_verify_bls_same_message, compute_certificate_root, compute_local_receipt_root,
-    compute_provision_root, compute_transaction_root, compute_waves_with_roots, verify_bls12381_v1,
-    Block, BlockHeader, BlockHeight, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature,
-    FinalizedWave, Hash, QuorumCertificate, ReceiptBundle, RoutableTransaction, ShardGroupId,
-    SignerBitfield, TopologySnapshot, ValidatorId, VotePower, WaveId,
+    compute_provision_root, compute_provision_tx_roots, compute_transaction_root, compute_waves,
+    verify_bls12381_v1, Block, BlockHeader, BlockHeight, BlockVote, Bls12381G1PublicKey,
+    Bls12381G2Signature, FinalizedWave, Hash, QuorumCertificate, ReceiptBundle,
+    RoutableTransaction, ShardGroupId, SignerBitfield, TopologySnapshot, ValidatorId, VotePower,
 };
 use std::sync::Arc;
 
@@ -222,29 +222,25 @@ pub fn verify_transaction_root(
     valid
 }
 
-/// Verify a block's per-wave tx-membership commitments.
+/// Verify a block's per-target-shard provision-batch commitments.
 ///
-/// Recomputes the wave partition from the block's transactions and compares
-/// the resulting `BTreeMap<WaveId, Hash>` against the header's claimed map
-/// by full equality. Phantom wave entries fail because the recomputed map
-/// only contains waves with ≥1 actual tx; tampered per-wave roots fail
-/// because the recomputed roots don't match.
-pub fn verify_wave_roots(
-    expected: &std::collections::BTreeMap<WaveId, Hash>,
-    block_height: u64,
+/// Recomputes the per-target merkle roots from the block's transactions and
+/// compares against the header's claimed map by full equality. A missing or
+/// tampered target-root fails because the recomputed root won't match.
+pub fn verify_provision_tx_roots(
+    expected: &std::collections::BTreeMap<ShardGroupId, Hash>,
     transactions: &[Arc<RoutableTransaction>],
     topology: &TopologySnapshot,
 ) -> bool {
-    let computed = compute_waves_with_roots(topology, block_height, transactions);
+    let computed = compute_provision_tx_roots(topology, transactions);
     let valid = &computed == expected;
 
     if !valid {
         tracing::warn!(
-            block_height,
             tx_count = transactions.len(),
             ?expected,
             ?computed,
-            "Wave root verification FAILED"
+            "Provision tx-root verification FAILED"
         );
     }
 
@@ -403,7 +399,8 @@ pub fn build_proposal<S: ChainWriter + SubstateStore>(
     let certificate_root = compute_certificate_root(&certificates);
     let local_receipt_root = compute_local_receipt_root(&receipts);
     let provision_root = compute_provision_root(&provision_hashes);
-    let waves = compute_waves_with_roots(topology, height.0, &transactions);
+    let waves = compute_waves(topology, height.0, &transactions);
+    let provision_tx_roots = compute_provision_tx_roots(topology, &transactions);
 
     // in_flight is deterministic from chain state:
     // parent's in_flight + new transactions committed - transactions finalized by certificates.
@@ -426,6 +423,7 @@ pub fn build_proposal<S: ChainWriter + SubstateStore>(
         local_receipt_root,
         provision_root,
         waves,
+        provision_tx_roots,
         in_flight,
     };
 

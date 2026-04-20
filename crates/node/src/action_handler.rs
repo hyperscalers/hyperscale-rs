@@ -77,7 +77,7 @@ pub(crate) fn dispatch_pool_for(action: &Action) -> Option<DispatchPool> {
         Action::VerifyProvisionRoot { .. } => Some(DispatchPool::ConsensusCrypto),
         Action::VerifyCertificateRoot { .. } => Some(DispatchPool::ConsensusCrypto),
         Action::VerifyLocalReceiptRoot { .. } => Some(DispatchPool::ConsensusCrypto),
-        Action::VerifyWaveRoots { .. } => Some(DispatchPool::ConsensusCrypto),
+        Action::VerifyProvisionTxRoots { .. } => Some(DispatchPool::ConsensusCrypto),
         Action::VerifyStateRoot { .. } => Some(DispatchPool::ConsensusCrypto),
         Action::BuildProposal { .. } => Some(DispatchPool::ConsensusCrypto),
 
@@ -258,27 +258,25 @@ pub(crate) fn handle_delegated_action<
             })
         }
 
-        Action::VerifyWaveRoots {
+        Action::VerifyProvisionTxRoots {
             block_hash,
             expected,
-            block_height,
             transactions,
             topology,
         } => {
             let start = std::time::Instant::now();
-            let valid = hyperscale_bft::handlers::verify_wave_roots(
+            let valid = hyperscale_bft::handlers::verify_provision_tx_roots(
                 &expected,
-                block_height,
                 &transactions,
                 &topology,
             );
             metrics::record_signature_verification_latency(
-                "wave_roots",
+                "provision_tx_roots",
                 start.elapsed().as_secs_f64(),
             );
             Some(DelegatedResult {
                 events: vec![NodeInput::Protocol(ProtocolEvent::BlockRootVerified {
-                    kind: hyperscale_core::VerificationKind::WaveRoots,
+                    kind: hyperscale_core::VerificationKind::ProvisionTxRoots,
                     block_hash,
                     valid,
                 })],

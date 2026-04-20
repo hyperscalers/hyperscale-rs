@@ -482,23 +482,21 @@ pub enum Action {
         receipts: Vec<ReceiptBundle>,
     },
 
-    /// Verify a block's wave commitments.
+    /// Verify a block's per-target-shard provision-batch commitments.
     ///
-    /// Recomputes `compute_waves_with_roots(topology, height, transactions)`
-    /// and compares against the block header's `waves` map by full-map
-    /// equality. Catches both forged wave identities and tampered per-wave
-    /// tx-membership roots.
+    /// Recomputes `compute_provision_tx_roots(topology, transactions)` and
+    /// compares against the block header's `provision_tx_roots` by full-map
+    /// equality. Catches tampering with which txs are claimed to target
+    /// which shard.
     ///
     /// Pure CPU operation — verified in parallel with other root verifications.
-    VerifyWaveRoots {
+    VerifyProvisionTxRoots {
         block_hash: Hash,
-        /// Expected wave commitments from block header.
-        expected: std::collections::BTreeMap<WaveId, Hash>,
-        /// Block height (used as the waves' `block_height`).
-        block_height: u64,
+        /// Expected per-target roots from block header.
+        expected: std::collections::BTreeMap<ShardGroupId, Hash>,
         /// Transactions in the block.
         transactions: Vec<Arc<RoutableTransaction>>,
-        /// Topology snapshot used to classify tx-to-wave membership.
+        /// Topology snapshot used to route txs to target shards.
         topology: TopologySnapshot,
     },
 
@@ -957,7 +955,7 @@ impl Action {
             Action::VerifyProvisionRoot { .. } => "VerifyProvisionRoot",
             Action::VerifyCertificateRoot { .. } => "VerifyCertificateRoot",
             Action::VerifyLocalReceiptRoot { .. } => "VerifyLocalReceiptRoot",
-            Action::VerifyWaveRoots { .. } => "VerifyWaveRoots",
+            Action::VerifyProvisionTxRoots { .. } => "VerifyProvisionTxRoots",
             Action::BuildProposal { .. } => "BuildProposal",
 
             // Delegated Work - Execution

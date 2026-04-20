@@ -353,7 +353,7 @@ impl ProvisionCoordinator {
         let targets_us = committed_header
             .header
             .waves
-            .keys()
+            .iter()
             .any(|w| w.remote_shards.contains(&local_shard));
 
         if targets_us {
@@ -1011,20 +1011,14 @@ mod tests {
         provision_targets: Vec<ShardGroupId>,
     ) -> Arc<CommittedBlockHeader> {
         // Convert flat provision targets into waves: each target shard becomes
-        // its own single-dependency wave. This preserves the test semantics
-        // (provision_targets() returns the same set). Values are placeholder
-        // zero hashes — these tests don't exercise root verification.
-        let waves: std::collections::BTreeMap<WaveId, Hash> = provision_targets
+        // its own single-dependency wave. Preserves the test semantics
+        // (provision_targets() returns the same set).
+        let waves: Vec<WaveId> = provision_targets
             .into_iter()
-            .map(|s| {
-                (
-                    WaveId {
-                        shard_group_id: shard,
-                        block_height: height,
-                        remote_shards: std::collections::BTreeSet::from([s]),
-                    },
-                    Hash::ZERO,
-                )
+            .map(|s| WaveId {
+                shard_group_id: shard,
+                block_height: height,
+                remote_shards: std::collections::BTreeSet::from([s]),
             })
             .collect();
         let header = BlockHeader {
@@ -1042,6 +1036,7 @@ mod tests {
             local_receipt_root: Hash::ZERO,
             provision_root: Hash::ZERO,
             waves,
+            provision_tx_roots: std::collections::BTreeMap::new(),
             in_flight: 0,
         };
         let header_hash = header.hash();

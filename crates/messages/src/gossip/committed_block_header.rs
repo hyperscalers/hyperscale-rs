@@ -80,7 +80,8 @@ mod tests {
             certificate_root: Hash::ZERO,
             local_receipt_root: Hash::ZERO,
             provision_root: Hash::ZERO,
-            waves: BTreeMap::new(),
+            waves: vec![],
+            provision_tx_roots: BTreeMap::new(),
             in_flight: 0,
         };
         let qc = QuorumCertificate::genesis();

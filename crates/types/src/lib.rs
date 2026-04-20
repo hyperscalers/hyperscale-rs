@@ -77,8 +77,8 @@ pub use signing::{
 
 pub use block::{
     compute_certificate_root, compute_local_receipt_root, compute_provision_root,
-    compute_transaction_root, compute_wave_tx_root, Block, BlockHeader, BlockManifest,
-    BlockMetadata, BlockVote, CommittedBlockHeader,
+    compute_transaction_root, Block, BlockHeader, BlockManifest, BlockMetadata, BlockVote,
+    CommittedBlockHeader,
 };
 pub use quorum_certificate::QuorumCertificate;
 pub use receipt::{
@@ -94,7 +94,7 @@ pub use transaction::{
 };
 pub use validator::{ValidatorInfo, ValidatorSet};
 pub use wave::{
-    compute_global_receipt_root_with_proof, compute_waves, compute_waves_with_roots,
+    compute_global_receipt_root_with_proof, compute_provision_tx_roots, compute_waves,
     decode_finalized_wave_vec, decode_wave_cert_vec, encode_finalized_wave_vec,
     encode_wave_cert_vec, tx_outcome_leaf, wave_leader, wave_leader_at, ExecutionCertificate,
     ExecutionOutcome, ExecutionVote, FinalizedWave, ReceiptValidationError, TxOutcome,
