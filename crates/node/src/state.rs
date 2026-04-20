@@ -378,12 +378,7 @@ impl NodeStateMachine {
 
         let can_advance = !self.execution.has_awaiting_blocks() && missing.is_empty();
         if can_advance {
-            actions.extend(self.apply_block_to_execution(
-                block_hash,
-                height,
-                &block,
-                &resolved_provisions,
-            ));
+            actions.extend(self.apply_block_to_execution(&block, &resolved_provisions));
         } else {
             if !missing.is_empty() {
                 actions.push(Action::FetchProvisionLocal {
@@ -462,12 +457,7 @@ impl NodeStateMachine {
                 );
                 break;
             }
-            actions.extend(self.apply_block_to_execution(
-                entry.block_hash,
-                next_height,
-                &entry.block,
-                &resolved,
-            ));
+            actions.extend(self.apply_block_to_execution(&entry.block, &resolved));
         }
         actions
     }
@@ -478,8 +468,6 @@ impl NodeStateMachine {
     /// drains the awaiting buffer.
     fn apply_block_to_execution(
         &mut self,
-        block_hash: Hash,
-        height: u64,
         block: &Block,
         provisions: &[Arc<Provision>],
     ) -> Vec<Action> {
@@ -496,11 +484,7 @@ impl NodeStateMachine {
 
         actions.extend(self.execution.on_block_committed(
             self.topology.snapshot(),
-            block_hash,
-            height,
-            block.header().timestamp,
-            block.header().proposer,
-            block.transactions().to_vec(),
+            block,
             provisions,
         ));
 
