@@ -594,7 +594,7 @@ impl BftState {
         block: Block,
         qc: QuorumCertificate,
     ) -> Vec<Action> {
-        let block_height = block.header().height.0;
+        let block_height = block.height().0;
 
         // Ignore stale blocks that have already been committed.
         // Late-arriving sync blocks can arrive after sync completes.
@@ -2119,11 +2119,8 @@ impl BftState {
     /// compares with the header's claimed value. This prevents a byzantine
     /// proposer from lying about which waves exist.
     fn validate_waves(&self, topology: &TopologySnapshot, block: &Block) -> Result<(), String> {
-        let expected = hyperscale_types::compute_waves(
-            topology,
-            block.header().height.0,
-            block.transactions(),
-        );
+        let expected =
+            hyperscale_types::compute_waves(topology, block.height().0, block.transactions());
 
         if block.header().waves != expected {
             return Err(format!(
@@ -3143,7 +3140,7 @@ impl BftState {
             return vec![];
         };
 
-        let height = block.header().height.0;
+        let height = block.height().0;
 
         // Check if we've already committed this or higher
         if height <= self.committed_height {
@@ -3203,7 +3200,7 @@ impl BftState {
     /// resets backoff tracking, and cleans up old state. Returns removed block hashes
     /// for fetch cancellation.
     fn record_block_committed(&mut self, block: &Block, block_hash: Hash) -> Vec<Hash> {
-        let height = block.header().height.0;
+        let height = block.height().0;
 
         self.committed_height = height;
         self.committed_hash = block_hash;
@@ -3258,7 +3255,7 @@ impl BftState {
                 break;
             };
 
-            let height = block.header().height.0;
+            let height = block.height().0;
 
             // Safety check - should always be the next expected height
             if height != self.committed_height + 1 {
@@ -3350,7 +3347,7 @@ impl BftState {
     /// Blocks may arrive out of order from concurrent fetches. Out-of-order blocks
     /// are buffered and processed once earlier blocks complete verification.
     #[instrument(skip(self, block, qc), fields(
-        height = block.header().height.0,
+        height = block.height().0,
         block_hash = ?block.hash()
     ))]
     fn on_synced_block_ready(
@@ -3360,7 +3357,7 @@ impl BftState {
         qc: QuorumCertificate,
     ) -> Vec<Action> {
         let block_hash = block.hash();
-        let height = block.header().height.0;
+        let height = block.height().0;
 
         info!(
             height,
@@ -3443,7 +3440,7 @@ impl BftState {
         qc: QuorumCertificate,
     ) -> Vec<Action> {
         let block_hash = block.hash();
-        let height = block.header().height.0;
+        let height = block.height().0;
 
         // Genesis QC doesn't need signature verification
         if qc.is_genesis() {
@@ -3526,7 +3523,7 @@ impl BftState {
         qc: QuorumCertificate,
     ) -> Vec<Action> {
         let block_hash = block.hash();
-        let height = block.header().height.0;
+        let height = block.height().0;
 
         info!(
             validator = ?topology.local_validator_id(),
@@ -4206,7 +4203,7 @@ impl BftState {
 
         // Remove certified blocks at or below committed height
         self.certified_blocks
-            .retain(|_, block| block.header().height.0 > committed_height);
+            .retain(|_, block| block.height().0 > committed_height);
 
         // Remove pending commits awaiting data at or below committed height
         self.pending_commits_awaiting_data
@@ -4653,7 +4650,7 @@ impl BftState {
 
         let mut current_hash = parent_hash;
         while let Some(block) = self.get_block_by_hash(current_hash) {
-            if block.header().height.0 <= self.committed_height {
+            if block.height().0 <= self.committed_height {
                 break;
             }
             for cert in block.certificates() {
@@ -4732,7 +4729,7 @@ impl BftState {
         if self
             .certified_blocks
             .values()
-            .any(|block| block.header().height.0 == height)
+            .any(|block| block.height().0 == height)
         {
             return true;
         }

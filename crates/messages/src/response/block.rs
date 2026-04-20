@@ -103,7 +103,7 @@ mod tests {
         QuorumCertificate {
             block_hash: block.hash(),
             shard_group_id: ShardGroupId(0),
-            height: block.header().height,
+            height: block.height(),
             parent_block_hash: block.header().parent_hash,
             round: block.header().round,
             aggregated_signature: zero_bls_signature(),

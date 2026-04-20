@@ -9,6 +9,21 @@ use hyperscale_types::{
 };
 use std::sync::Arc;
 
+/// A sync-ready block retrieved from storage. Always carries a `Sealed`
+/// block — the persisted shape never includes provisions. Sync-serving
+/// glue re-attaches provisions (promoting to `Live`) when the requester
+/// is still within the cross-shard execution window.
+#[derive(Debug, Clone)]
+pub struct BlockForSync {
+    /// The stored block in `Sealed` form.
+    pub block: Block,
+    /// The QC that certified this block.
+    pub qc: QuorumCertificate,
+    /// Provision batch hashes from the block's manifest — the sync-serving
+    /// layer uses these to look up provisions in the in-memory cache.
+    pub provision_hashes: Vec<Hash>,
+}
+
 /// Abstracts consensus-related storage for both simulation and production.
 ///
 /// Provides a uniform interface for reading blocks, certificates, receipts,
@@ -32,15 +47,10 @@ pub trait ChainReader: Send + Sync + 'static {
 
     /// Get a complete block for serving sync requests.
     ///
-    /// Returns `Some((block, qc, provision_hashes))` only if the full block is
-    /// available with all transactions and certificates. `provision_hashes` is
-    /// the manifest's `provision_hashes` field — the receiver resolves them
-    /// against its own `ProvisionCoordinator` cache (provisions are not
-    /// persisted). Returns `None` if any data is missing.
-    fn get_block_for_sync(
-        &self,
-        height: BlockHeight,
-    ) -> Option<(Block, QuorumCertificate, Vec<Hash>)>;
+    /// Returns `Some(BlockForSync)` only if the full block is available
+    /// with all transactions and certificates. Returns `None` if any
+    /// data is missing.
+    fn get_block_for_sync(&self, height: BlockHeight) -> Option<BlockForSync>;
 
     /// Get multiple transactions by hash (batch read).
     ///

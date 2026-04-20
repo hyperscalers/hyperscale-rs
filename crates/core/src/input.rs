@@ -8,6 +8,14 @@ use hyperscale_types::{
 };
 use std::sync::Arc;
 
+/// A block fetched from a sync peer, paired with its certifying QC. Boxed
+/// when carried on `NodeInput` / `SyncInput` to keep those enums small.
+#[derive(Debug, Clone)]
+pub struct FetchedBlock {
+    pub block: Block,
+    pub qc: QuorumCertificate,
+}
+
 /// Priority levels for event ordering within the same timestamp.
 ///
 /// Events at the same simulation time are processed in priority order.
@@ -53,7 +61,7 @@ pub enum NodeInput {
     /// Sync block response received from network callback.
     SyncBlockResponseReceived {
         height: u64,
-        block: Box<Option<(Block, QuorumCertificate)>>,
+        block: Option<Box<FetchedBlock>>,
     },
 
     /// Sync block fetch failed from network callback.

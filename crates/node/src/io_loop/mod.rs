@@ -611,14 +611,16 @@ where
             NodeInput::SyncBlockResponseReceived { height, block } => {
                 // Check 1: receipt_root verification (synchronous).
                 // Verify block body matches the QC-attested header.
-                let certificate_root_valid = match *block {
-                    Some((ref b, _)) if !b.certificates().is_empty() => {
-                        let computed = hyperscale_types::compute_certificate_root(b.certificates());
-                        if computed != b.header().certificate_root {
+                let certificate_root_valid = match block.as_deref() {
+                    Some(fetched) if !fetched.block.certificates().is_empty() => {
+                        let computed = hyperscale_types::compute_certificate_root(
+                            fetched.block.certificates(),
+                        );
+                        if computed != fetched.block.header().certificate_root {
                             tracing::warn!(
                                 height,
                                 ?computed,
-                                expected = ?b.header().certificate_root,
+                                expected = ?fetched.block.header().certificate_root,
                                 "Sync: certificate_root mismatch — rejecting response"
                             );
                             false

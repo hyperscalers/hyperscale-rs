@@ -20,8 +20,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
-/// Number of local committed blocks to wait before requesting missing provisions.
-/// This gives the source shard proposer time to send provisions normally.
+/// Number of local committed blocks to wait before falling back to
+/// peer-fetch for missing provisions. Proposers include provisions inline
+/// in `Block::Live` during assembly, so this timeout only triggers when
+/// gossip dropped a batch — in which case we fetch from a shard peer.
 const PROVISION_FALLBACK_TIMEOUT_BLOCKS: u64 = 10;
 
 /// Number of local committed blocks to retain a committed provision in the
@@ -197,7 +199,7 @@ impl ProvisionCoordinator {
         committed_provision_hashes: &[Hash],
     ) -> Vec<Action> {
         // Update local committed height
-        self.local_committed_height = block.header().height;
+        self.local_committed_height = block.height();
 
         // Record provision batches committed in this block, but don't
         // evict them yet — peers catching up within the cross-shard

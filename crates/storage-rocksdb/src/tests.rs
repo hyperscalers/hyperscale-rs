@@ -184,7 +184,7 @@ fn test_block_storage_and_retrieval() {
     commit_empty(&storage, &block, &qc);
 
     let (stored_block, stored_qc) = storage.get_block(BlockHeight(1)).unwrap();
-    assert_eq!(stored_block.header().height, BlockHeight(1));
+    assert_eq!(stored_block.height(), BlockHeight(1));
     assert_eq!(stored_block.header().timestamp, 1_000);
     assert_eq!(stored_qc.block_hash, block.hash());
 }
@@ -202,9 +202,9 @@ fn test_block_range_retrieval() {
 
     let blocks = storage.get_blocks_range(BlockHeight(2), BlockHeight(5));
     assert_eq!(blocks.len(), 3);
-    assert_eq!(blocks[0].0.header().height, BlockHeight(2));
-    assert_eq!(blocks[1].0.header().height, BlockHeight(3));
-    assert_eq!(blocks[2].0.header().height, BlockHeight(4));
+    assert_eq!(blocks[0].0.height(), BlockHeight(2));
+    assert_eq!(blocks[1].0.height(), BlockHeight(3));
+    assert_eq!(blocks[2].0.height(), BlockHeight(4));
 }
 
 #[test]
@@ -368,7 +368,7 @@ fn attach_receipts(block: &mut hyperscale_types::Block, receipts: Vec<ReceiptBun
         certificate: Arc::new(hyperscale_types::WaveCertificate {
             wave_id: hyperscale_types::WaveId::new(
                 ShardGroupId(0),
-                block.header().height.0,
+                block.height().0,
                 std::collections::BTreeSet::new(),
             ),
             execution_certificates: vec![],
@@ -644,7 +644,7 @@ fn test_get_block_for_sync() {
 
     let result = storage.get_block_for_sync(BlockHeight(1));
     assert!(result.is_some());
-    assert_eq!(result.unwrap().0.header().height, BlockHeight(1));
+    assert_eq!(result.unwrap().0.height(), BlockHeight(1));
 
     assert!(storage.get_block_for_sync(BlockHeight(999)).is_none());
 }
@@ -738,7 +738,7 @@ fn test_blocks_survive_reopen() {
         let (block, qc) = storage
             .get_block(BlockHeight(1))
             .expect("block should survive reopen");
-        assert_eq!(block.header().height, BlockHeight(1));
+        assert_eq!(block.height(), BlockHeight(1));
         assert_eq!(qc.height, BlockHeight(1));
     }
 }
@@ -890,7 +890,7 @@ fn rocks_commit_with(
             certificate: Arc::new(hyperscale_types::WaveCertificate {
                 wave_id: hyperscale_types::WaveId::new(
                     ShardGroupId(0),
-                    block.header().height.0,
+                    block.height().0,
                     std::collections::BTreeSet::new(),
                 ),
                 execution_certificates: vec![],

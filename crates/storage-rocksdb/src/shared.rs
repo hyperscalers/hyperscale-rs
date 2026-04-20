@@ -13,7 +13,8 @@ use crate::core::RocksDbStorage;
 use crate::snapshot::RocksDbSnapshot;
 
 use hyperscale_storage::{
-    DbPartitionKey, DbSortKey, DbSubstateValue, PartitionEntry, SubstateDatabase, SubstateStore,
+    BlockForSync, DbPartitionKey, DbSortKey, DbSubstateValue, PartitionEntry, SubstateDatabase,
+    SubstateStore,
 };
 use hyperscale_types::{
     Block, BlockHeight, Hash, NodeId, QuorumCertificate, RoutableTransaction, ShardGroupId,
@@ -203,11 +204,8 @@ impl hyperscale_storage::ChainReader for SharedStorage {
         self.0.latest_qc()
     }
 
-    fn get_block_for_sync(
-        &self,
-        height: BlockHeight,
-    ) -> Option<(Block, QuorumCertificate, Vec<Hash>)> {
-        self.0.get_block_for_sync(height)
+    fn get_block_for_sync(&self, height: BlockHeight) -> Option<BlockForSync> {
+        hyperscale_storage::ChainReader::get_block_for_sync(&*self.0, height)
     }
 
     fn get_transactions_batch(&self, hashes: &[Hash]) -> Vec<RoutableTransaction> {

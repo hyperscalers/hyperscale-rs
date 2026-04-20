@@ -322,7 +322,7 @@ impl NodeStateMachine {
     /// Handle block committed — notify all subsystems in the correct order.
     fn on_block_committed(&mut self, block_hash: Hash, block: Block) -> Vec<Action> {
         let mut actions = Vec::new();
-        let block_height = block.header().height;
+        let block_height = block.height();
 
         // Register committed tx hashes with BFT for timeout abort validation.
         let tx_hashes: Vec<Hash> = block.transactions().iter().map(|tx| tx.hash()).collect();
@@ -332,8 +332,8 @@ impl NodeStateMachine {
         // Mark this block as a usable parent for child state-root verifications.
         // By the time BlockCommitted fires, the block's JMT snapshot is in
         // PendingChain (populated either by a prior VerifyStateRoot or by the
-        // inline CommitBlockByQcOnly computation). Decouples child verification
-        // from the persistence latency that previously stalled the pipeline.
+        // inline CommitBlockByQcOnly computation), so children can verify
+        // against it without waiting on RocksDB persistence.
         self.bft.on_block_committed_verification(block_hash);
 
         // Mempool: marks Pending → Committed for block.transactions, then drives
@@ -352,11 +352,8 @@ impl NodeStateMachine {
 
         // Provisions coordinator: prune + schedule fallback timeouts. Reads
         // provision hashes directly off the block — Live carries them
-        // inline, Sealed has none.
-        let provision_hashes: Vec<Hash> = block
-            .provisions()
-            .map(|ps| ps.iter().map(|p| p.hash()).collect())
-            .unwrap_or_default();
+        // inline, Sealed has none (empty slice).
+        let provision_hashes: Vec<Hash> = block.provisions().iter().map(|p| p.hash()).collect();
         actions.extend(self.provisions.on_block_committed(
             self.topology.snapshot(),
             &block,

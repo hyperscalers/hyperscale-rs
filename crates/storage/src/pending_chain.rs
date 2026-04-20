@@ -747,11 +747,7 @@ mod tests {
         fn get_block_for_sync(
             &self,
             _height: hyperscale_types::BlockHeight,
-        ) -> Option<(
-            hyperscale_types::Block,
-            hyperscale_types::QuorumCertificate,
-            Vec<Hash>,
-        )> {
+        ) -> Option<crate::BlockForSync> {
             None
         }
         fn get_transactions_batch(

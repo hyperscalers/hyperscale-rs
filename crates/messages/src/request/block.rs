@@ -20,8 +20,16 @@ pub struct GetBlockRequest {
 }
 
 impl GetBlockRequest {
-    /// Create a new block fetch request.
+    /// Create a new block fetch request. Panics if `target_height <
+    /// height` — a request for a block past the stated sync target is a
+    /// programming error in the caller (sync always catches up forward).
     pub fn new(height: BlockHeight, target_height: BlockHeight) -> Self {
+        assert!(
+            target_height >= height,
+            "GetBlockRequest: target_height ({}) must be >= height ({})",
+            target_height.0,
+            height.0,
+        );
         Self {
             height,
             target_height,
