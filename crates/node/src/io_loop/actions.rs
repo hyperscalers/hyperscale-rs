@@ -378,7 +378,8 @@ where
             | Action::RequestMissingExecutionCert { .. }
             | Action::CancelExecutionCertFetch { .. }
             | Action::CancelProvisionFetch { .. }
-            | Action::RequestMissingCommittedBlockHeader { .. } => {
+            | Action::RequestMissingCommittedBlockHeader { .. }
+            | Action::CancelCommittedHeaderFetch { .. } => {
                 self.process_sync_fetch_action(action);
             }
 
@@ -966,6 +967,15 @@ where
                     });
                 self.process_exec_cert_fetch_outputs(tick_outputs);
                 self.update_fetch_tick_timer();
+            }
+            Action::CancelCommittedHeaderFetch {
+                source_shard,
+                from_height,
+            } => {
+                self.header_fetch_protocol.handle(HeaderFetchInput::Cancel {
+                    source_shard,
+                    from_height,
+                });
             }
             Action::RequestMissingCommittedBlockHeader {
                 source_shard,

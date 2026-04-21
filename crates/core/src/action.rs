@@ -883,6 +883,16 @@ pub enum Action {
         block_height: u64,
     },
 
+    /// Cancel an in-flight remote-header fetch because the header arrived
+    /// through another path (gossip).
+    ///
+    /// Without this, the fetch protocol would keep retrying forever even
+    /// after the gap was closed by a gossip-delivered header.
+    CancelCommittedHeaderFetch {
+        source_shard: ShardGroupId,
+        from_height: BlockHeight,
+    },
+
     /// Request missing provisions from a source shard via cross-shard request.
     ///
     /// Emitted by `ProvisionCoordinator` when a remote block's `waves` field
@@ -1013,6 +1023,7 @@ impl Action {
             Action::RequestMissingCommittedBlockHeader { .. } => {
                 "RequestMissingCommittedBlockHeader"
             }
+            Action::CancelCommittedHeaderFetch { .. } => "CancelCommittedHeaderFetch",
         }
     }
 }

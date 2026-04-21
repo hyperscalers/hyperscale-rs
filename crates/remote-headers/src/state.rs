@@ -266,21 +266,39 @@ impl RemoteHeaderCoordinator {
         self.verified.insert(key, Arc::clone(&header));
         self.pending.remove(&key);
 
+        let mut actions = Vec::new();
+
         // Update liveness tracking: advance the remote tip and record the
         // local height at which we received it (the actual liveness signal).
         // Reset the request flag so future gaps can trigger new requests.
+        //
+        // If a fallback fetch was already dispatched for this gap, cancel it
+        // now — otherwise the fetch protocol would keep retrying forever
+        // even though gossip has closed the gap.
         if let Some(expected) = self.expected.get_mut(&shard) {
             if height > expected.last_verified_height {
+                let pending_fetch_from = if expected.requested {
+                    Some(BlockHeight(expected.last_verified_height.0 + 1))
+                } else {
+                    None
+                };
                 expected.last_verified_height = height;
                 expected.last_verified_at_local = self.local_committed_height;
                 expected.requested = false;
+                if let Some(from_height) = pending_fetch_from {
+                    actions.push(Action::CancelCommittedHeaderFetch {
+                        source_shard: shard,
+                        from_height,
+                    });
+                }
             }
         }
 
         // Emit continuation so downstream consumers receive the verified header.
-        vec![Action::Continuation(ProtocolEvent::RemoteHeaderVerified {
+        actions.push(Action::Continuation(ProtocolEvent::RemoteHeaderVerified {
             committed_header: header,
-        })]
+        }));
+        actions
     }
 
     // ═══════════════════════════════════════════════════════════════════════

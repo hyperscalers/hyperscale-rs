@@ -56,7 +56,6 @@ pub enum HeaderFetchInput {
         from_height: BlockHeight,
     },
     /// Cancel a pending fetch (header arrived via gossip).
-    #[allow(dead_code)]
     Cancel {
         source_shard: ShardGroupId,
         from_height: BlockHeight,
