@@ -61,7 +61,6 @@ pub enum ExecCertFetchInput {
         block_height: u64,
     },
     /// Cancel a pending fetch (cert arrived via proactive path).
-    #[allow(dead_code)]
     Cancel {
         source_shard: ShardGroupId,
         block_height: u64,

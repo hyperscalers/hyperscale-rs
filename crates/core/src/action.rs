@@ -873,6 +873,16 @@ pub enum Action {
         peers: Vec<ValidatorId>,
     },
 
+    /// Cancel an in-flight execution-cert fetch because the EC arrived
+    /// through another path (broadcast) or the wave no longer needs it.
+    ///
+    /// Without this, the fetch protocol would keep retrying forever even
+    /// after the expectation has been fulfilled via `on_wave_certificate`.
+    CancelExecutionCertFetch {
+        source_shard: ShardGroupId,
+        block_height: u64,
+    },
+
     /// Request missing provisions from a source shard via cross-shard request.
     ///
     /// Emitted by `ProvisionCoordinator` when a remote block's `waves` field
@@ -998,6 +1008,7 @@ impl Action {
             Action::CancelFetch { .. } => "CancelFetch",
             Action::FetchProvisionRemote { .. } => "FetchProvisionRemote",
             Action::RequestMissingExecutionCert { .. } => "RequestMissingExecutionCert",
+            Action::CancelExecutionCertFetch { .. } => "CancelExecutionCertFetch",
             Action::CancelProvisionFetch { .. } => "CancelProvisionFetch",
             Action::RequestMissingCommittedBlockHeader { .. } => {
                 "RequestMissingCommittedBlockHeader"

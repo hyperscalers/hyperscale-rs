@@ -1203,8 +1203,28 @@ impl ExecutionState {
         // Clear expected cert tracking and mark as fulfilled so late-arriving
         // duplicate headers don't re-register the expectation.
         let key = (shard, cert.block_height(), cert.wave_id.clone());
-        self.expected_exec_certs.remove(&key);
-        self.fulfilled_exec_certs.insert(key, self.committed_height);
+        let cleared = self.expected_exec_certs.remove(&key).is_some();
+        self.fulfilled_exec_certs
+            .insert(key.clone(), self.committed_height);
+
+        let mut actions = Vec::new();
+
+        // If a fallback fetch was already dispatched for this expectation, tell
+        // the fetch protocol to drop it — otherwise it would keep retrying
+        // forever even after the EC has arrived here.
+        if cleared {
+            tracing::debug!(
+                source_shard = shard.0,
+                block_height = cert.block_height(),
+                wave = %cert.wave_id,
+                at_local_height = self.committed_height,
+                "Fulfilled expected exec cert"
+            );
+            actions.push(Action::CancelExecutionCertFetch {
+                source_shard: shard,
+                block_height: cert.block_height(),
+            });
+        }
 
         // Check if any local wave tracker covers txs in this EC.
         // Route by tx_hash → local wave, not by ec.wave_id (which is the remote shard's wave).
@@ -1220,7 +1240,7 @@ impl ExecutionState {
             let ec_arc = Arc::new(cert);
             let tx_hashes: Vec<Hash> = ec_arc.tx_outcomes.iter().map(|o| o.tx_hash).collect();
             self.buffer_ec(&ec_arc, &tx_hashes);
-            return vec![];
+            return actions;
         }
 
         // Get public keys for the source shard's committee
@@ -1235,15 +1255,16 @@ impl ExecutionState {
                 shard = shard.0,
                 "Could not resolve all public keys for execution cert verification"
             );
-            return vec![];
+            return actions;
         }
 
         // Delegate signature verification to the crypto pool. The signing
         // message derives solely from WaveId (self-contained) + receipt root.
-        vec![Action::VerifyExecutionCertificateSignature {
+        actions.push(Action::VerifyExecutionCertificateSignature {
             certificate: cert,
             public_keys,
-        }]
+        });
+        actions
     }
 
     /// Handle execution certificate signature verification result.

@@ -376,6 +376,7 @@ where
             | Action::CancelFetch { .. }
             | Action::FetchProvisionRemote { .. }
             | Action::RequestMissingExecutionCert { .. }
+            | Action::CancelExecutionCertFetch { .. }
             | Action::CancelProvisionFetch { .. }
             | Action::RequestMissingCommittedBlockHeader { .. } => {
                 self.process_sync_fetch_action(action);
@@ -921,6 +922,16 @@ where
             } => {
                 self.provision_fetch_protocol
                     .handle(ProvisionFetchInput::Cancel {
+                        source_shard,
+                        block_height,
+                    });
+            }
+            Action::CancelExecutionCertFetch {
+                source_shard,
+                block_height,
+            } => {
+                self.exec_cert_fetch_protocol
+                    .handle(ExecCertFetchInput::Cancel {
                         source_shard,
                         block_height,
                     });
