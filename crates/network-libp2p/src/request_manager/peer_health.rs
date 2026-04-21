@@ -313,8 +313,15 @@ impl PeerHealthTracker {
     }
 
     /// Get the RTT EMA for a specific peer without cloning.
+    ///
+    /// Returns `None` if the peer has never had a successful request — the
+    /// seeded default EMA is not a real observation and the caller should
+    /// treat the peer as cold (e.g. use a wider cold-start timeout).
     pub fn rtt_ema_secs(&self, peer: &PeerId) -> Option<f64> {
-        self.peers.get(peer).map(|r| r.rtt_ema_secs)
+        self.peers
+            .get(peer)
+            .filter(|r| r.total_successes > 0)
+            .map(|r| r.rtt_ema_secs)
     }
 
     /// Get the number of tracked peers.

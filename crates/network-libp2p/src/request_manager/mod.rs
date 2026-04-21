@@ -47,17 +47,27 @@ use std::time::Duration;
 use thiserror::Error;
 
 /// Maximum timeout for stream operations.
-const MAX_STREAM_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_STREAM_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Minimum timeout for stream operations (floor for RTT-based calculation).
-const MIN_STREAM_TIMEOUT: Duration = Duration::from_millis(500);
+/// Warm-path floor: minimum timeout once we have RTT data for a peer.
+///
+/// Absorbs jitter and short transport stalls (QUIC retransmit, brief GC, etc.)
+/// Small enough that a dead peer is detected quickly on fast links — on a
+/// 5 ms-RTT LAN the adaptive multiplier gives 25 ms, which is too tight for
+/// real jitter, so we floor at 300 ms.
+const MIN_STREAM_TIMEOUT_WARM: Duration = Duration::from_millis(300);
 
-/// Default timeout for stream operations when no RTT data is available.
-/// Based on default RTT of 100ms × 5 = 500ms, but we use 1s to be safe for cold start.
-const DEFAULT_STREAM_TIMEOUT: Duration = Duration::from_secs(1);
+/// Cold-start floor: timeout used when we have no RTT data for a peer yet.
+///
+/// Wide enough to tolerate the actual round-trip of a WAN peer on the very
+/// first request. The RTT EMA only updates on success, so if this is tight
+/// we can enter a self-reinforcing trap: every request times out, nothing
+/// ever records a successful RTT, the timeout stays tight. One successful
+/// request is enough to drop into the warm path.
+const MIN_STREAM_TIMEOUT_COLD: Duration = Duration::from_secs(2);
 
 /// Multiplier for RTT to compute stream timeout.
-/// Timeout = RTT * multiplier, clamped to [MIN, MAX].
+/// Timeout = RTT * multiplier, clamped to [MIN_WARM, MAX].
 const STREAM_TIMEOUT_RTT_MULTIPLIER: f64 = 5.0;
 
 /// Errors from request operations.

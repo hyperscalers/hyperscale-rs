@@ -1,22 +1,25 @@
 //! Timeout and backoff computation based on peer RTT history.
 
 use super::{
-    RequestManager, RequestPriority, DEFAULT_STREAM_TIMEOUT, MAX_STREAM_TIMEOUT,
-    MIN_STREAM_TIMEOUT, STREAM_TIMEOUT_RTT_MULTIPLIER,
+    RequestManager, RequestPriority, MAX_STREAM_TIMEOUT, MIN_STREAM_TIMEOUT_COLD,
+    MIN_STREAM_TIMEOUT_WARM, STREAM_TIMEOUT_RTT_MULTIPLIER,
 };
 use libp2p::PeerId;
 use std::time::Duration;
 
 /// Compute stream timeout from optional RTT EMA.
 ///
-/// Uses 5x RTT clamped to `[500ms, 5s]`. Falls back to 1s when RTT is unknown.
+/// If an RTT estimate exists (peer has succeeded at least once), use
+/// `rtt × multiplier` clamped to `[MIN_WARM, MAX]`. If the peer is cold
+/// (no RTT data yet), use `MIN_STREAM_TIMEOUT_COLD` — wide enough to avoid
+/// the self-reinforcing-trap where aggressive timeouts prevent the EMA
+/// from ever being seeded.
 fn stream_timeout_from_rtt(rtt_ema_secs: Option<f64>) -> Duration {
-    rtt_ema_secs
-        .map(|rtt| {
-            let rtt_based = Duration::from_secs_f64(rtt * STREAM_TIMEOUT_RTT_MULTIPLIER);
-            rtt_based.clamp(MIN_STREAM_TIMEOUT, MAX_STREAM_TIMEOUT)
-        })
-        .unwrap_or(DEFAULT_STREAM_TIMEOUT)
+    match rtt_ema_secs {
+        Some(rtt) => Duration::from_secs_f64(rtt * STREAM_TIMEOUT_RTT_MULTIPLIER)
+            .clamp(MIN_STREAM_TIMEOUT_WARM, MAX_STREAM_TIMEOUT),
+        None => MIN_STREAM_TIMEOUT_COLD,
+    }
 }
 
 /// Compute initial backoff from optional RTT EMA and priority.
@@ -76,23 +79,24 @@ mod tests {
 
     #[test]
     fn test_stream_timeout_known_rtt() {
-        // 100ms * 5 = 500ms (at min)
-        let timeout = stream_timeout_from_rtt(Some(0.1));
-        assert_eq!(timeout, MIN_STREAM_TIMEOUT);
+        // 5ms × 5 = 25ms → clamped up to warm floor (300ms)
+        let timeout = stream_timeout_from_rtt(Some(0.005));
+        assert_eq!(timeout, MIN_STREAM_TIMEOUT_WARM);
 
-        // 200ms * 5 = 1000ms (in range)
+        // 200ms × 5 = 1000ms (in range)
         let timeout = stream_timeout_from_rtt(Some(0.2));
         assert_eq!(timeout, Duration::from_secs(1));
 
-        // 2000ms * 5 = 10000ms (clamped to max)
-        let timeout = stream_timeout_from_rtt(Some(2.0));
+        // 5s × 5 = 25s → clamped down to MAX (10s)
+        let timeout = stream_timeout_from_rtt(Some(5.0));
         assert_eq!(timeout, MAX_STREAM_TIMEOUT);
     }
 
     #[test]
     fn test_stream_timeout_unknown_rtt() {
+        // Cold peer (no successful request yet) uses the wider cold floor.
         let timeout = stream_timeout_from_rtt(None);
-        assert_eq!(timeout, DEFAULT_STREAM_TIMEOUT);
+        assert_eq!(timeout, MIN_STREAM_TIMEOUT_COLD);
     }
 
     #[test]
