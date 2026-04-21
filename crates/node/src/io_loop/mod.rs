@@ -1095,7 +1095,7 @@ where
                 bft_buffered_synced_blocks: bft_mem.buffered_synced_blocks,
                 bft_pending_synced_block_verifications: bft_mem.pending_synced_block_verifications,
                 // Execution
-                exec_cache_entries: exec_mem.receipt_cache,
+                exec_cache_entries: exec_mem.wave_execution_receipts,
                 exec_finalized_wave_certificates: exec_mem.finalized_wave_certificates,
                 exec_waves: exec_mem.waves,
                 exec_vote_trackers: exec_mem.vote_trackers,

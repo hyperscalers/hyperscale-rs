@@ -26,7 +26,7 @@
 //!    is terminal-covered), the wave is complete and ready for finalization.
 
 use hyperscale_types::{
-    compute_execution_receipt_root, ExecutionCertificate, ExecutionOutcome, Hash,
+    compute_execution_receipt_root, ExecutionCertificate, ExecutionOutcome, Hash, ReceiptBundle,
     RoutableTransaction, ShardGroupId, TransactionDecision, TxOutcome, WaveCertificate, WaveId,
 };
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -80,6 +80,12 @@ pub struct WaveState {
     // ── Local execution outputs ─────────────────────────────────────────
     /// Execution results from the engine (per-tx). Non-abort outcomes only.
     execution_results: HashMap<Hash, ExecutionOutcome>,
+    /// Local receipts from the engine, one per executed tx. Drained into the
+    /// `FinalizedWave` at finalization via `take_receipt`. Scoping these to
+    /// the wave (rather than a process-wide cache) prevents a receipt from a
+    /// locally-executed tx from leaking into a `FinalizedWave` whose EC later
+    /// attests that tx as `Aborted` — the `ExtraReceipt` race.
+    execution_receipts: HashMap<Hash, ReceiptBundle>,
     /// Explicit aborts from `ConflictDetector`. Value = the local block height
     /// at which the conflict was committed. Distinct from remote-reported
     /// aborts in `tracker_aborted` — these are local pre-vote decisions.
@@ -157,6 +163,7 @@ impl WaveState {
             all_provisioned_at,
             dispatched: false,
             execution_results: HashMap::new(),
+            execution_receipts: HashMap::new(),
             explicit_aborts: HashMap::new(),
             voted: false,
             local_ec_emitted: false,
@@ -266,6 +273,38 @@ impl WaveState {
         }
         self.execution_results.entry(tx_hash).or_insert(outcome);
         self.has_outcome_for_every_tx()
+    }
+
+    /// Record a local receipt from the engine. First-write-wins.
+    ///
+    /// Paired with `record_execution_result`: both flow from the same
+    /// `ExecutionBatchCompleted` event and are scoped to this wave. Receipts
+    /// for txs not in the wave are silently dropped.
+    pub fn record_receipt(&mut self, bundle: ReceiptBundle) {
+        if !self.tx_hash_set.contains(&bundle.tx_hash) {
+            return;
+        }
+        self.execution_receipts
+            .entry(bundle.tx_hash)
+            .or_insert(bundle);
+    }
+
+    /// Number of receipts currently held by this wave. Exposed for memory
+    /// stats; receipts drain at finalization.
+    pub fn receipt_count(&self) -> usize {
+        self.execution_receipts.len()
+    }
+
+    /// Take the receipt for a tx, removing it from the wave.
+    ///
+    /// Used at finalization time, walking the local EC's `tx_outcomes` in
+    /// canonical order and pulling a receipt for each non-aborted outcome.
+    /// Returns `None` if the receipt is absent — for an aborted outcome this
+    /// is expected; for a non-aborted outcome it indicates the
+    /// `has_local_receipts_for_non_aborted` gate was bypassed, which would
+    /// be a bug.
+    pub fn take_receipt(&mut self, tx_hash: &Hash) -> Option<ReceiptBundle> {
+        self.execution_receipts.remove(tx_hash)
     }
 
     /// Record an explicit abort from `ConflictDetector`. Keeps the earliest

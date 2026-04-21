@@ -193,7 +193,7 @@ pub enum ProtocolEvent {
     ///
     /// The state machine uses results to:
     /// 1. Store pending execution updates (co-located with TC at finalization)
-    /// 2. Store receipts in receipt_cache for later finalized wave assembly
+    /// 2. Store receipts on the `WaveState` for later finalized wave assembly
     ExecutionBatchCompleted {
         /// The wave whose execution produced these results.
         wave_id: WaveId,

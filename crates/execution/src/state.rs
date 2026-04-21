@@ -79,7 +79,8 @@ use hyperscale_types::FinalizedWave;
 /// Execution memory statistics for monitoring collection sizes.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ExecutionMemoryStats {
-    pub receipt_cache: usize,
+    /// Total receipts held across all in-flight waves, awaiting finalization.
+    pub wave_execution_receipts: usize,
     pub finalized_wave_certificates: usize,
     pub waves: usize,
     pub vote_trackers: usize,
@@ -102,11 +103,6 @@ pub struct ExecutionMemoryStats {
 pub struct ExecutionState {
     /// Current time.
     now: Duration,
-
-    /// In-memory receipt cache — holds ReceiptBundles from execution until
-    /// they are consumed by `finalize_wave` (moved into `FinalizedWave.receipts`)
-    /// or cleaned up on abort/deferral.
-    receipt_cache: HashMap<Hash, ReceiptBundle>,
 
     /// Finalized wave certificates ready for block inclusion.
     /// Uses BTreeMap for deterministic iteration order (keyed by WaveId).
@@ -341,7 +337,6 @@ impl ExecutionState {
     pub fn new() -> Self {
         Self {
             now: Duration::ZERO,
-            receipt_cache: HashMap::new(),
             finalized_wave_certificates: BTreeMap::new(),
             committed_height: 0,
             waves: HashMap::new(),
@@ -660,16 +655,6 @@ impl ExecutionState {
             return Vec::new();
         }
 
-        for result in results {
-            let tx_hash = result.tx_hash;
-            let bundle = ReceiptBundle {
-                tx_hash,
-                local_receipt: Arc::new(result.local_receipt),
-                execution_output: Some(result.execution_output),
-            };
-            self.receipt_cache.insert(tx_hash, bundle);
-        }
-
         let Some(wave) = self.waves.get_mut(&wave_id) else {
             tracing::warn!(
                 wave = %wave_id,
@@ -677,6 +662,13 @@ impl ExecutionState {
             );
             return Vec::new();
         };
+        for result in results {
+            wave.record_receipt(ReceiptBundle {
+                tx_hash: result.tx_hash,
+                local_receipt: Arc::new(result.local_receipt),
+                execution_output: Some(result.execution_output),
+            });
+        }
         for wr in tx_outcomes {
             wave.record_execution_result(wr.tx_hash, wr.outcome);
         }
@@ -1805,17 +1797,38 @@ impl ExecutionState {
     /// Called when the wave's local EC is present and every non-aborted tx is
     /// covered by all participating shards.
     fn finalize_wave(&mut self, wave_id: &WaveId) -> Vec<Action> {
-        let Some(wave) = self.waves.remove(wave_id) else {
+        let Some(mut wave) = self.waves.remove(wave_id) else {
             return vec![];
         };
 
         let wc = wave.create_wave_certificate();
-        let tx_hashes = wave.tx_hashes().to_vec();
 
-        let receipts: Vec<ReceiptBundle> = tx_hashes
+        // Walk the local EC's tx_outcomes in canonical order and collect a
+        // receipt for each non-aborted outcome. Aborted outcomes contribute
+        // no receipt; stray receipts for aborted txs (e.g. local execution
+        // completed before the aggregated EC attested `Aborted`) are dropped
+        // with the wave. This mirrors `FinalizedWave::reconstruct` and is
+        // what `validate_receipts_against_ec` enforces at peer ingress.
+        let local_ec = wc
+            .execution_certificates
             .iter()
-            .filter_map(|h| self.receipt_cache.remove(h))
-            .collect();
+            .find(|ec| ec.wave_id == wc.wave_id)
+            .expect("WaveCertificate invariant: local EC must be present");
+        let mut receipts: Vec<ReceiptBundle> = Vec::with_capacity(local_ec.tx_outcomes.len());
+        for outcome in &local_ec.tx_outcomes {
+            if outcome.is_aborted() {
+                continue;
+            }
+            match wave.take_receipt(&outcome.tx_hash) {
+                Some(bundle) => receipts.push(bundle),
+                None => tracing::error!(
+                    wave = %wave_id,
+                    tx_hash = ?outcome.tx_hash,
+                    "finalize_wave: non-aborted tx is missing its local receipt \
+                     (is_complete gate bypassed)"
+                ),
+            }
+        }
 
         let cert_arc = Arc::new(wc);
         let finalized = FinalizedWave {
@@ -1834,7 +1847,7 @@ impl ExecutionState {
 
         actions.push(Action::Continuation(ProtocolEvent::WaveCompleted {
             wave_cert: cert_arc,
-            tx_hashes: tx_hashes.clone(),
+            tx_hashes: wave.tx_hashes().to_vec(),
         }));
 
         for (tx_hash, decision) in wave.tx_decisions() {
@@ -1898,7 +1911,6 @@ impl ExecutionState {
         self.waves.remove(wave_id);
 
         for tx_hash in fw.tx_hashes() {
-            self.receipt_cache.remove(&tx_hash);
             self.wave_assignments.remove(&tx_hash);
             self.verified_provisions.remove(&tx_hash);
             self.required_provision_shards.remove(&tx_hash);
@@ -2129,7 +2141,7 @@ impl ExecutionState {
     /// Get execution memory statistics for monitoring collection sizes.
     pub fn memory_stats(&self) -> ExecutionMemoryStats {
         ExecutionMemoryStats {
-            receipt_cache: self.receipt_cache.len(),
+            wave_execution_receipts: self.waves.values().map(|w| w.receipt_count()).sum(),
             finalized_wave_certificates: self.finalized_wave_certificates.len(),
             waves: self.waves.len(),
             vote_trackers: self.vote_trackers.len(),
