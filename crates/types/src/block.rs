@@ -3,7 +3,7 @@
 use crate::{
     block_vote_message, compute_merkle_root, compute_padded_merkle_root, decode_finalized_wave_vec,
     encode_finalized_wave_vec, BlockHeight, Bls12381G1PrivateKey, Bls12381G2Signature,
-    FinalizedWave, Hash, ProposerTimestamp, Provision, QuorumCertificate, ReceiptBundle,
+    FinalizedWave, Hash, ProposerTimestamp, Provision, QuorumCertificate, ReceiptBundle, Round,
     RoutableTransaction, ShardGroupId, ValidatorId, WaveId,
 };
 use sbor::prelude::*;
@@ -113,7 +113,7 @@ pub struct BlockHeader {
     pub timestamp: ProposerTimestamp,
 
     /// View/round number for view change protocol.
-    pub round: u64,
+    pub round: Round,
 
     /// Whether this block was created as a fallback when leader timed out.
     pub is_fallback: bool,
@@ -204,7 +204,7 @@ impl BlockHeader {
             parent_qc: QuorumCertificate::genesis(),
             proposer,
             timestamp: ProposerTimestamp::ZERO,
-            round: 0,
+            round: Round::INITIAL,
             is_fallback: false,
             state_root,
             transaction_root: Hash::ZERO,
@@ -241,7 +241,7 @@ impl BlockHeader {
 
     /// Get the expected proposer for this height (round-robin).
     pub fn expected_proposer(&self, num_validators: u64) -> ValidatorId {
-        ValidatorId((self.height.0 + self.round) % num_validators)
+        ValidatorId((self.height.0 + self.round.0) % num_validators)
     }
 }
 
@@ -778,7 +778,7 @@ mod tests {
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(0),
             timestamp: ProposerTimestamp(1234567890),
-            round: 0,
+            round: Round::INITIAL,
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
@@ -941,7 +941,7 @@ pub struct BlockVote {
     /// Height of the block.
     pub height: BlockHeight,
     /// Round number (for view change).
-    pub round: u64,
+    pub round: Round,
     /// Validator who cast this vote.
     pub voter: ValidatorId,
     /// BLS signature over the domain-separated signing message.
@@ -957,7 +957,7 @@ impl BlockVote {
         block_hash: Hash,
         shard_group_id: ShardGroupId,
         height: BlockHeight,
-        round: u64,
+        round: Round,
         voter: ValidatorId,
         signing_key: &Bls12381G1PrivateKey,
         timestamp: ProposerTimestamp,

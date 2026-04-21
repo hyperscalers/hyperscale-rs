@@ -67,7 +67,9 @@ pub use hash::{
     compute_merkle_root, compute_merkle_root_with_proof, compute_padded_merkle_root,
     verify_merkle_inclusion, Hash,
 };
-pub use identifiers::{BlockHeight, NodeId, PartitionNumber, ShardGroupId, ValidatorId, VotePower};
+pub use identifiers::{
+    Attempt, BlockHeight, NodeId, PartitionNumber, Round, ShardGroupId, ValidatorId, VotePower,
+};
 pub use network::{MessagePriority, NetworkMessage, Request, ShardMessage};
 pub use proofs::{MerkleInclusionProof, Provision, TxEntries};
 pub use signing::{

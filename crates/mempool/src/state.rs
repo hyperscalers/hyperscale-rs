@@ -1333,8 +1333,8 @@ mod tests {
     use hyperscale_types::{
         generate_bls_keypair, test_utils::test_transaction, Block, BlockHeader,
         Bls12381G2Signature, ExecutionCertificate, ExecutionOutcome, FinalizedWave,
-        QuorumCertificate, ShardGroupId, SignerBitfield, TxOutcome, ValidatorId, ValidatorInfo,
-        ValidatorSet, WaveCertificate, WaveId, WeightedTimestamp,
+        QuorumCertificate, Round, ShardGroupId, SignerBitfield, TxOutcome, ValidatorId,
+        ValidatorInfo, ValidatorSet, WaveCertificate, WaveId, WeightedTimestamp,
     };
     use std::collections::BTreeSet;
 
@@ -1400,7 +1400,7 @@ mod tests {
                 parent_qc: QuorumCertificate::genesis(),
                 proposer: ValidatorId(0),
                 timestamp: hyperscale_types::ProposerTimestamp(1234567890),
-                round: 0,
+                round: Round::INITIAL,
                 is_fallback: false,
                 state_root: Hash::ZERO,
                 transaction_root: Hash::ZERO,

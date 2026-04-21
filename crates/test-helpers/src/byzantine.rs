@@ -6,7 +6,7 @@
 use crate::TestCommittee;
 use hyperscale_types::{
     block_vote_message, BlockHeight, BlockVote, Bls12381G2Signature, Hash, ProposerTimestamp,
-    ShardGroupId,
+    Round, ShardGroupId,
 };
 
 /// Create a block vote with an invalid signature (signed with wrong key).
@@ -19,7 +19,7 @@ pub fn make_wrong_key_block_vote(
     actual_signer_idx: usize,
     block_hash: Hash,
     height: BlockHeight,
-    round: u64,
+    round: Round,
     shard: ShardGroupId,
 ) -> BlockVote {
     let message = block_vote_message(shard, height, round, &block_hash);
@@ -47,7 +47,7 @@ pub fn make_wrong_message_block_vote(
     claimed_block_hash: Hash,
     actual_signed_hash: Hash,
     height: BlockHeight,
-    round: u64,
+    round: Round,
     shard: ShardGroupId,
 ) -> BlockVote {
     // Sign for different block
@@ -79,7 +79,7 @@ pub fn make_garbage_signature_vote(
     voter_idx: usize,
     block_hash: Hash,
     height: BlockHeight,
-    round: u64,
+    round: Round,
     shard: ShardGroupId,
 ) -> BlockVote {
     BlockVote {
@@ -111,7 +111,7 @@ mod tests {
             1, // actual signer
             block_hash,
             BlockHeight(1),
-            0,
+            Round::INITIAL,
             shard,
         );
 
@@ -136,7 +136,7 @@ mod tests {
             claimed_hash,
             actual_hash,
             BlockHeight(1),
-            0,
+            Round::INITIAL,
             shard,
         );
 
@@ -150,8 +150,14 @@ mod tests {
         let block_hash = Hash::from_bytes(b"block");
         let shard = ShardGroupId(0);
 
-        let bad_vote =
-            make_garbage_signature_vote(&committee, 0, block_hash, BlockHeight(1), 0, shard);
+        let bad_vote = make_garbage_signature_vote(
+            &committee,
+            0,
+            block_hash,
+            BlockHeight(1),
+            Round::INITIAL,
+            shard,
+        );
 
         // Should NOT verify
         assert!(!verify_block_vote(&bad_vote, committee.public_key(0)));
@@ -164,8 +170,14 @@ mod tests {
         let block_hash = Hash::from_bytes(b"block");
         let shard = ShardGroupId(0);
 
-        let valid_vote =
-            make_signed_block_vote(&committee, 0, block_hash, BlockHeight(1), 0, shard);
+        let valid_vote = make_signed_block_vote(
+            &committee,
+            0,
+            block_hash,
+            BlockHeight(1),
+            Round::INITIAL,
+            shard,
+        );
 
         assert!(verify_block_vote(&valid_vote, committee.public_key(0)));
     }

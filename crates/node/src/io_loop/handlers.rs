@@ -352,7 +352,7 @@ where
                         warn!(
                             proposer = proposer.0,
                             height = gossip.header.height.0,
-                            round = gossip.header.round,
+                            round = gossip.header.round.0,
                             "Block header proposer signature invalid — dropping"
                         );
                         return;

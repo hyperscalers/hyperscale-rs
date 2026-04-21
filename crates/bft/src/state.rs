@@ -58,7 +58,7 @@ pub type NodeIndex = u32;
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, BlockManifest, BlockVote, Bls12381G1PublicKey, CertifiedBlock,
     CommittedBlockHeader, FinalizedWave, Hash, Provision, QuorumCertificate, ReadyTransactions,
-    RoutableTransaction, ShardGroupId, TopologySnapshot, ValidatorId, VotePower,
+    Round, RoutableTransaction, ShardGroupId, TopologySnapshot, ValidatorId, VotePower,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -100,7 +100,7 @@ pub struct RecoveredState {
 #[derive(Debug, Clone)]
 struct PendingProposal {
     height: BlockHeight,
-    round: u64,
+    round: Round,
 }
 
 /// BFT consensus state machine.
@@ -126,7 +126,7 @@ pub struct BftState {
     // Chain State
     // ═══════════════════════════════════════════════════════════════════════════
     /// Current view/round number.
-    view: u64,
+    view: Round,
 
     /// View number at the start of the current height.
     ///
@@ -136,7 +136,7 @@ pub struct BftState {
     /// This enables Tendermint-style timeout backoff where the view change timeout
     /// increases linearly with each failed round at the same height, preventing
     /// synchronized timeout storms across validators.
-    view_at_height_start: u64,
+    view_at_height_start: Round,
 
     /// Latest committed block height.
     committed_height: u64,
@@ -182,7 +182,7 @@ pub struct BftState {
     /// Key: height, Value: (block_hash, round)
     /// We also track the round to allow re-voting for the SAME block in a later round
     /// (which is safe), while preventing votes for DIFFERENT blocks at the same height and round.
-    voted_heights: HashMap<u64, (Hash, u64)>,
+    voted_heights: HashMap<u64, (Hash, Round)>,
 
     /// Tracks which block each validator has voted for at each height.
     /// Key: (height, validator_id), Value: block_hash
@@ -195,7 +195,7 @@ pub struct BftState {
     ///
     /// Maps (height, voter) -> (block_hash, round) so we can distinguish legitimate revotes
     /// (different round) from Byzantine equivocation (same round, different block).
-    received_votes_by_height: HashMap<(u64, ValidatorId), (Hash, u64)>,
+    received_votes_by_height: HashMap<(u64, ValidatorId), (Hash, Round)>,
 
     /// Blocks that have been certified (have QC) but not yet committed.
     /// Maps block_hash -> Block.
@@ -266,7 +266,7 @@ pub struct BftState {
     /// Last (height, round) for which we reset the leader activity timer on header receipt.
     /// Prevents a Byzantine leader from spamming headers to delay view changes.
     /// We only reset once per (height, round) from the leader.
-    last_header_reset: Option<(u64, u64)>,
+    last_header_reset: Option<(BlockHeight, Round)>,
 
     // ═══════════════════════════════════════════════════════════════════════════
     // Statistics
@@ -304,8 +304,8 @@ impl BftState {
     ) -> Self {
         Self {
             node_index,
-            view: 0,
-            view_at_height_start: 0,
+            view: Round::INITIAL,
+            view_at_height_start: Round::INITIAL,
             committed_height: recovered.committed_height.0,
             committed_hash: recovered
                 .committed_hash
@@ -397,8 +397,8 @@ impl BftState {
     fn vote_recipients(
         &self,
         topology: &TopologySnapshot,
-        height: u64,
-        round: u64,
+        height: BlockHeight,
+        round: Round,
     ) -> Vec<ValidatorId> {
         const K: usize = 2;
         let committee_len = topology.local_committee().len();
@@ -416,7 +416,7 @@ impl BftState {
         // Send to the next K proposers for pipelining.
         let mut next_count = 0;
         for offset in 0..committee_len as u64 {
-            let proposer = topology.proposer_for(height + 1, round + offset);
+            let proposer = topology.proposer_for(height.next(), round + offset);
             if proposer != self_id && !recipients.contains(&proposer) {
                 recipients.push(proposer);
                 next_count += 1;
@@ -662,7 +662,7 @@ impl BftState {
     ///
     /// Rate-limited to once per (height, round) to prevent a Byzantine leader
     /// from spamming headers with different hashes to delay view changes.
-    fn record_header_activity(&mut self, height: u64, round: u64) {
+    fn record_header_activity(&mut self, height: BlockHeight, round: Round) {
         let header_key = (height, round);
         if self.last_header_reset != Some(header_key) {
             self.last_leader_activity = Some(self.now);
@@ -689,7 +689,7 @@ impl BftState {
         let increment = self.config.view_change_timeout_increment;
 
         // Rounds attempted at current height (saturating to handle edge cases)
-        let rounds_at_height = self.view.saturating_sub(self.view_at_height_start);
+        let rounds_at_height = self.view.0.saturating_sub(self.view_at_height_start.0);
 
         // Linear backoff: base + increment * rounds
         let timeout = base + increment * rounds_at_height as u32;
@@ -780,11 +780,11 @@ impl BftState {
         self.last_header_reset = None;
 
         let timeout = self.current_view_change_timeout();
-        let rounds_at_height = self.view.saturating_sub(self.view_at_height_start);
+        let rounds_at_height = self.view.0.saturating_sub(self.view_at_height_start.0);
 
         info!(
             validator = ?topology.local_validator_id(),
-            view = self.view,
+            view = self.view.0,
             rounds_at_height = rounds_at_height,
             timeout_ms = timeout.as_millis(),
             "Round timeout - advancing round (implicit view change)"
@@ -943,7 +943,7 @@ impl BftState {
         let round = self.view;
 
         // Check if we should propose
-        if !topology.should_propose(next_height, round) {
+        if !topology.should_propose(BlockHeight(next_height), round) {
             return vec![];
         }
 
@@ -953,7 +953,7 @@ impl BftState {
                 trace!(
                     validator = ?topology.local_validator_id(),
                     height = next_height,
-                    round = round,
+                    round = round.0,
                     "Proposal build already in-flight, skipping"
                 );
                 return vec![];
@@ -1058,7 +1058,7 @@ impl BftState {
         info!(
             validator = ?topology.local_validator_id(),
             height = next_height,
-            round = round,
+            round = round.0,
             transactions = transactions.len(),
             waves = waves_to_propose.len(),
             "Requesting block build for proposal"
@@ -1129,7 +1129,7 @@ impl BftState {
         &mut self,
         topology: &TopologySnapshot,
         height: u64,
-        round: u64,
+        round: Round,
     ) -> Vec<Action> {
         // Get parent info from latest QC
         let (parent_hash, parent_qc) = if let Some(qc) = &self.latest_qc {
@@ -1150,7 +1150,7 @@ impl BftState {
         info!(
             validator = ?topology.local_validator_id(),
             height = height,
-            round = round,
+            round = round.0,
             "Building fallback block (leader timeout)"
         );
 
@@ -1216,7 +1216,7 @@ impl BftState {
         &mut self,
         topology: &TopologySnapshot,
         height: u64,
-        round: u64,
+        round: Round,
     ) -> Vec<Action> {
         // Get parent info from latest QC
         let (parent_hash, parent_qc) = if let Some(qc) = &self.latest_qc {
@@ -1238,7 +1238,7 @@ impl BftState {
         info!(
             validator = ?topology.local_validator_id(),
             height = height,
-            round = round,
+            round = round.0,
             "Building sync block (syncing, empty payload)"
         );
 
@@ -1341,7 +1341,7 @@ impl BftState {
         info!(
             validator = ?topology.local_validator_id(),
             height = height,
-            original_round = original_round,
+            original_round = original_round.0,
             block_hash = ?block_hash,
             tx_count = manifest.transaction_count(),
             cert_count = manifest.cert_hashes.len(),
@@ -1378,7 +1378,7 @@ impl BftState {
     /// the network peer ID.
     #[instrument(skip(self, header, manifest, lookup_tx, lookup_finalized_wave, lookup_provision), fields(
         height = header.height.0,
-        round = header.round,
+        round = header.round.0,
         proposer = ?header.proposer,
         tx_count = manifest.transaction_count()
     ))]
@@ -1400,7 +1400,7 @@ impl BftState {
             validator = ?topology.local_validator_id(),
             proposer = ?header.proposer,
             height = height,
-            round = round,
+            round = round.0,
             block_hash = ?block_hash,
             "Received block header"
         );
@@ -1490,8 +1490,8 @@ impl BftState {
         if round > self.view {
             info!(
                 validator = ?topology.local_validator_id(),
-                old_view = self.view,
-                new_view = round,
+                old_view = self.view.0,
+                new_view = round.0,
                 header_height = height,
                 "View synchronization: advancing view to match received block header"
             );
@@ -1511,7 +1511,7 @@ impl BftState {
         // Record leader activity for receiving a valid header.
         // Rate-limited to once per (height, round) to prevent Byzantine leaders
         // from spamming different headers to delay view changes.
-        self.record_header_activity(height, round);
+        self.record_header_activity(BlockHeight(height), round);
 
         // Check if we already have this block
         if self.pending_blocks.contains_key(&block_hash) {
@@ -1683,7 +1683,7 @@ impl BftState {
         }
 
         // Check proposer is correct for this height/round
-        let expected_proposer = topology.proposer_for(height, round);
+        let expected_proposer = topology.proposer_for(BlockHeight(height), round);
         if header.proposer != expected_proposer {
             return Err(format!(
                 "wrong proposer: expected {:?}, got {:?}",
@@ -1875,7 +1875,7 @@ impl BftState {
         topology: &TopologySnapshot,
         block_hash: Hash,
         height: u64,
-        round: u64,
+        round: Round,
     ) -> Vec<Action> {
         // Check vote locking - have we already voted for a block at this height?
         // BFT Safety: A validator must not vote for conflicting blocks at the same height
@@ -1889,8 +1889,8 @@ impl BftState {
                     validator = ?topology.local_validator_id(),
                     block_hash = ?block_hash,
                     height = height,
-                    round = round,
-                    existing_round = existing_round,
+                    round = round.0,
+                    existing_round = existing_round.0,
                     "Already voted for this block"
                 );
                 return vec![];
@@ -1906,9 +1906,9 @@ impl BftState {
                 warn!(
                     validator = ?topology.local_validator_id(),
                     existing = ?existing_hash,
-                    existing_round = existing_round,
+                    existing_round = existing_round.0,
                     new = ?block_hash,
-                    new_round = round,
+                    new_round = round.0,
                     height = height,
                     "Vote locking: already voted for different block at this height (view change)"
                 );
@@ -2177,7 +2177,7 @@ impl BftState {
     /// Create a vote for a block.
     #[tracing::instrument(level = "debug", skip(self), fields(
         height = height,
-        round = round,
+        round = round.0,
         sign_us = tracing::field::Empty,
     ))]
     fn create_vote(
@@ -2185,7 +2185,7 @@ impl BftState {
         topology: &TopologySnapshot,
         block_hash: Hash,
         height: u64,
-        round: u64,
+        round: Round,
     ) -> Vec<Action> {
         // Record that we voted for this block at this height.
         // Core safety invariant: we will not vote for a different block at this height
@@ -2205,12 +2205,12 @@ impl BftState {
         debug!(
             validator = ?topology.local_validator_id(),
             height = height,
-            round = round,
+            round = round.0,
             block_hash = ?block_hash,
             "Emitting vote (signing delegated to crypto pool)"
         );
 
-        let recipients = self.vote_recipients(topology, height, round);
+        let recipients = self.vote_recipients(topology, BlockHeight(height), round);
 
         // Emit SignAndBroadcastBlockVote — the io_loop signs on the consensus
         // crypto pool, broadcasts, and feeds the signed vote back for local
@@ -2467,8 +2467,8 @@ impl BftState {
             if vote.round > self.view {
                 info!(
                     validator = ?validator_id,
-                    old_view = self.view,
-                    new_view = vote.round,
+                    old_view = self.view.0,
+                    new_view = vote.round.0,
                     vote_anchor_ts_ms = vote.height.0,
                     voter = ?vote.voter,
                     "View synchronization: advancing view to match verified vote"
@@ -2487,7 +2487,7 @@ impl BftState {
                     warn!(
                         voter = ?vote.voter,
                         height = vote.height.0,
-                        round = vote.round,
+                        round = vote.round.0,
                         existing_block = ?existing_hash,
                         new_block = ?block_hash,
                         "EQUIVOCATION DETECTED: validator voted for different blocks at same height/round"
@@ -2693,13 +2693,13 @@ impl BftState {
     /// Called when the runner completes `Action::BuildProposal`. The runner has
     /// computed the state root, built the complete block, and cached the WriteBatch
     /// for efficient commit later.
-    #[instrument(skip(self, block, finalized_waves), fields(height = %height.0, round = round))]
+    #[instrument(skip(self, block, finalized_waves), fields(height = %height.0, round = round.0))]
     #[allow(clippy::too_many_arguments)]
     pub fn on_proposal_built(
         &mut self,
         topology: &TopologySnapshot,
         height: BlockHeight,
-        round: u64,
+        round: Round,
         block: Arc<Block>,
         block_hash: Hash,
         finalized_waves: Vec<Arc<FinalizedWave>>,
@@ -2709,7 +2709,7 @@ impl BftState {
         let Some(pending) = self.pending_proposal.take() else {
             warn!(
                 height = height.0,
-                round = round,
+                round = round.0,
                 "ProposalBuilt received but no pending proposal"
             );
             return vec![];
@@ -2718,9 +2718,9 @@ impl BftState {
         if pending.height != height || pending.round != round {
             warn!(
                 expected_height = pending.height.0,
-                expected_round = pending.round,
+                expected_round = pending.round.0,
                 received_height = height.0,
-                received_round = round,
+                received_round = round.0,
                 "ProposalBuilt mismatch - discarding stale result"
             );
             // Put back the pending proposal if it's different (shouldn't happen)
@@ -2738,7 +2738,7 @@ impl BftState {
         info!(
             validator = ?topology.local_validator_id(),
             height = height.0,
-            round = round,
+            round = round.0,
             block_hash = ?block_hash,
             transactions = total_tx_count,
             certificates = pending_block.certificate_count(),
@@ -3597,7 +3597,7 @@ impl BftState {
     /// each validator advances locally.
     ///
     /// Returns actions to propose if we're the new proposer.
-    #[instrument(skip(self), fields(new_round = self.view + 1))]
+    #[instrument(skip(self), fields(new_round = self.view.0 + 1))]
     fn advance_round(&mut self, topology: &TopologySnapshot) -> Vec<Action> {
         // The next height to propose is one above the highest certified block,
         // NOT one above the committed block. This matches try_propose behavior.
@@ -3619,8 +3619,8 @@ impl BftState {
         info!(
             validator = ?topology.local_validator_id(),
             height = height,
-            old_round = old_round,
-            new_round = self.view,
+            old_round = old_round.0,
+            new_round = self.view.0,
             view_changes = self.view_changes,
             "Advancing round locally (implicit view change)"
         );
@@ -3660,7 +3660,7 @@ impl BftState {
                 info!(
                     validator = ?topology.local_validator_id(),
                     height = height,
-                    new_round = self.view,
+                    new_round = self.view.0,
                     latest_qc_height = latest_qc_height,
                     cleared_votes = cleared_votes,
                     "Unlocking vote at height (no QC formed, safe by quorum intersection)"
@@ -3678,13 +3678,13 @@ impl BftState {
         };
 
         // Check if we're the new proposer for this height/round
-        if topology.should_propose(height, self.view) {
+        if topology.should_propose(BlockHeight(height), self.view) {
             // Check if we've already voted at this height - if so, we're locked
             if let Some(&(existing_hash, _)) = self.voted_heights.get(&height) {
                 info!(
                     validator = ?topology.local_validator_id(),
                     height = height,
-                    new_round = self.view,
+                    new_round = self.view.0,
                     existing_block = ?existing_hash,
                     "Vote-locked at this height, re-proposing"
                 );
@@ -3696,7 +3696,7 @@ impl BftState {
             info!(
                 validator = ?topology.local_validator_id(),
                 height = height,
-                new_round = self.view,
+                new_round = self.view.0,
                 "We are the new proposer after round advance - building block"
             );
 
@@ -3758,8 +3758,8 @@ impl BftState {
         if qc.round > self.view {
             info!(
                 validator = ?topology.local_validator_id(),
-                old_view = self.view,
-                new_view = qc.round,
+                old_view = self.view.0,
+                new_view = qc.round.0,
                 qc_height = qc.height.0,
                 "View synchronization: advancing view to match QC"
             );
@@ -4117,7 +4117,7 @@ impl BftState {
     /// 3. If we cleared ALL verifications, we'd lose the valid vote at round N
     ///
     /// Returns the number of vote entries cleared.
-    fn clear_vote_tracking_for_height(&mut self, height: u64, new_round: u64) -> usize {
+    fn clear_vote_tracking_for_height(&mut self, height: u64, new_round: Round) -> usize {
         let mut cleared = 0;
 
         // Clear received_votes_by_height for this height
@@ -4531,7 +4531,7 @@ impl BftState {
     }
 
     /// Get the current view/round.
-    pub fn view(&self) -> u64 {
+    pub fn view(&self) -> Round {
         self.view
     }
 
@@ -4539,7 +4539,7 @@ impl BftState {
     pub fn stats(&self) -> BftStats {
         BftStats {
             view_changes: self.view_changes,
-            current_round: self.view,
+            current_round: self.view.0,
             committed_height: BlockHeight(self.committed_height),
         }
     }
@@ -4575,7 +4575,7 @@ impl BftState {
             .as_ref()
             .map(|qc| qc.height.0 + 1)
             .unwrap_or(self.committed_height + 1);
-        topology.should_propose(next_height, self.view)
+        topology.should_propose(BlockHeight(next_height), self.view)
     }
 
     /// Compute the parent hash for the next proposal.
@@ -4675,7 +4675,7 @@ impl BftState {
     }
 
     /// Get the voted heights map (for testing/debugging).
-    pub fn voted_heights(&self) -> &HashMap<u64, (Hash, u64)> {
+    pub fn voted_heights(&self) -> &HashMap<u64, (Hash, Round)> {
         &self.voted_heights
     }
 
@@ -4744,7 +4744,7 @@ impl BftState {
             .unwrap_or(self.committed_height + 1);
         let round = self.view;
 
-        topology.should_propose(next_height, round)
+        topology.should_propose(BlockHeight(next_height), round)
             && !self.voted_heights.contains_key(&next_height)
     }
 }
@@ -4796,13 +4796,25 @@ mod tests {
         let (_state, topology) = make_test_state();
 
         // Height 0, round 0 -> validator 0
-        assert_eq!(topology.proposer_for(0, 0), ValidatorId(0));
+        assert_eq!(
+            topology.proposer_for(BlockHeight(0), Round(0)),
+            ValidatorId(0)
+        );
         // Height 1, round 0 -> validator 1
-        assert_eq!(topology.proposer_for(1, 0), ValidatorId(1));
+        assert_eq!(
+            topology.proposer_for(BlockHeight(1), Round(0)),
+            ValidatorId(1)
+        );
         // Height 2, round 0 -> validator 2
-        assert_eq!(topology.proposer_for(2, 0), ValidatorId(2));
+        assert_eq!(
+            topology.proposer_for(BlockHeight(2), Round(0)),
+            ValidatorId(2)
+        );
         // Height 0, round 1 -> validator 1
-        assert_eq!(topology.proposer_for(0, 1), ValidatorId(1));
+        assert_eq!(
+            topology.proposer_for(BlockHeight(0), Round(1)),
+            ValidatorId(1)
+        );
     }
 
     #[test]
@@ -4810,11 +4822,11 @@ mod tests {
         let (_state, topology) = make_test_state();
 
         // Validator 0 should propose at height 0, round 0
-        assert!(topology.should_propose(0, 0));
+        assert!(topology.should_propose(BlockHeight(0), Round(0)));
         // But not at height 1
-        assert!(!topology.should_propose(1, 0));
+        assert!(!topology.should_propose(BlockHeight(1), Round(0)));
         // Or height 0, round 1
-        assert!(!topology.should_propose(0, 1));
+        assert!(!topology.should_propose(BlockHeight(0), Round(1)));
     }
 
     fn make_header_at_height(height: u64, timestamp_ms: u64) -> BlockHeader {
@@ -4825,7 +4837,7 @@ mod tests {
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(height % 4), // Round-robin
             timestamp: ProposerTimestamp(timestamp_ms),
-            round: 0,
+            round: Round(0),
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
@@ -4860,7 +4872,7 @@ mod tests {
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(0),
             timestamp: ProposerTimestamp::ZERO, // Genesis timestamp is 0
-            round: 0,
+            round: Round(0),
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
@@ -4960,7 +4972,7 @@ mod tests {
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(1),
             timestamp: ProposerTimestamp(50_000), // 50 seconds - would fail normal validation (now=100s, max_delay=30s)
-            round: 5,                             // High round indicates view changes occurred
+            round: Round(5),                      // High round indicates view changes occurred
             is_fallback: true,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
@@ -4986,7 +4998,7 @@ mod tests {
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(1),
             timestamp: ProposerTimestamp(50_000),
-            round: 5,
+            round: Round(5),
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
@@ -5050,7 +5062,7 @@ mod tests {
             shard_group_id: ShardGroupId(0),
             height: BlockHeight(1),
             parent_block_hash: Hash::ZERO,
-            round: 0,
+            round: Round(0),
             aggregated_signature: zero_bls_signature(), // Dummy for test
             signers,
 
@@ -5064,7 +5076,7 @@ mod tests {
             parent_qc: parent_qc.clone(),
             proposer: ValidatorId(2), // height 2, round 0 -> validator 2
             timestamp: ProposerTimestamp(100_000),
-            round: 0,
+            round: Round(0),
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
@@ -5139,7 +5151,7 @@ mod tests {
             shard_group_id: ShardGroupId(0),
             height: BlockHeight(1),
             parent_block_hash: Hash::ZERO,
-            round: 0,
+            round: Round(0),
             aggregated_signature: zero_bls_signature(),
             signers,
 
@@ -5153,7 +5165,7 @@ mod tests {
             parent_qc: parent_qc.clone(),
             proposer: ValidatorId(2),
             timestamp: ProposerTimestamp(100_000),
-            round: 0,
+            round: Round(0),
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
@@ -5247,7 +5259,7 @@ mod tests {
             shard_group_id: ShardGroupId(0),
             height: BlockHeight(1),
             parent_block_hash: Hash::ZERO,
-            round: 0,
+            round: Round(0),
             aggregated_signature: zero_bls_signature(),
             signers,
 
@@ -5261,7 +5273,7 @@ mod tests {
             parent_qc: parent_qc.clone(),
             proposer: ValidatorId(2),
             timestamp: ProposerTimestamp(100_000),
-            round: 0,
+            round: Round(0),
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
@@ -5337,7 +5349,7 @@ mod tests {
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(1), // height 1, round 0 -> validator 1
             timestamp: ProposerTimestamp(100_000),
-            round: 0,
+            round: Round(0),
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
@@ -5441,7 +5453,7 @@ mod tests {
 
         // Simulate having voted at height 1
         let block_hash = Hash::from_bytes(b"voted_block");
-        state.voted_heights.insert(1, (block_hash, 0));
+        state.voted_heights.insert(1, (block_hash, Round(0)));
 
         // Advance round - should unlock since no QC at height 1
         let _actions = state.advance_round(&topology);
@@ -5459,13 +5471,13 @@ mod tests {
         // Set up vote locks at heights 1, 2, 3
         state
             .voted_heights
-            .insert(1, (Hash::from_bytes(b"block1"), 0));
+            .insert(1, (Hash::from_bytes(b"block1"), Round(0)));
         state
             .voted_heights
-            .insert(2, (Hash::from_bytes(b"block2"), 0));
+            .insert(2, (Hash::from_bytes(b"block2"), Round(0)));
         state
             .voted_heights
-            .insert(3, (Hash::from_bytes(b"block3"), 0));
+            .insert(3, (Hash::from_bytes(b"block3"), Round(0)));
 
         // Receive QC at height 2 - should unlock heights 1 and 2
         let qc = QuorumCertificate {
@@ -5473,7 +5485,7 @@ mod tests {
             shard_group_id: ShardGroupId(0),
             height: BlockHeight(2),
             parent_block_hash: Hash::from_bytes(b"parent"),
-            round: 0,
+            round: Round(0),
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
 
@@ -5501,7 +5513,7 @@ mod tests {
         let (mut state, topology) = make_test_state();
 
         // Start at view 5
-        state.view = 5;
+        state.view = Round(5);
 
         // Receive QC formed at round 10 - should advance view to 10
         let qc = QuorumCertificate {
@@ -5509,7 +5521,7 @@ mod tests {
             shard_group_id: ShardGroupId(0),
             height: BlockHeight(2),
             parent_block_hash: Hash::from_bytes(b"parent"),
-            round: 10,
+            round: Round(10),
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
 
@@ -5518,7 +5530,7 @@ mod tests {
 
         state.maybe_unlock_for_qc(&topology, &qc);
 
-        assert_eq!(state.view, 10, "View should sync to QC's round");
+        assert_eq!(state.view, Round(10), "View should sync to QC's round");
     }
 
     #[test]
@@ -5526,7 +5538,7 @@ mod tests {
         let (mut state, topology) = make_test_state();
 
         // Start at view 15
-        state.view = 15;
+        state.view = Round(15);
 
         // Receive QC formed at round 10 - should NOT regress view
         let qc = QuorumCertificate {
@@ -5534,7 +5546,7 @@ mod tests {
             shard_group_id: ShardGroupId(0),
             height: BlockHeight(2),
             parent_block_hash: Hash::from_bytes(b"parent"),
-            round: 10,
+            round: Round(10),
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
 
@@ -5543,7 +5555,11 @@ mod tests {
 
         state.maybe_unlock_for_qc(&topology, &qc);
 
-        assert_eq!(state.view, 15, "View should NOT regress to lower QC round");
+        assert_eq!(
+            state.view,
+            Round(15),
+            "View should NOT regress to lower QC round"
+        );
     }
 
     #[test]
@@ -5551,13 +5567,13 @@ mod tests {
         let (mut state, topology) = make_test_state();
 
         // Start at view 5
-        state.view = 5;
+        state.view = Round(5);
 
         // Genesis QC should not affect view
         let genesis_qc = QuorumCertificate::genesis();
         state.maybe_unlock_for_qc(&topology, &genesis_qc);
 
-        assert_eq!(state.view, 5, "Genesis QC should not change view");
+        assert_eq!(state.view, Round(5), "Genesis QC should not change view");
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -5593,8 +5609,8 @@ mod tests {
         state.set_time(Duration::from_secs(100));
 
         let height = 1u64;
-        let round_0 = 0u64;
-        let round_1 = 1u64;
+        let round_0 = Round(0);
+        let round_1 = Round(1);
 
         // Create two different blocks at the same height
         let block_a = BlockHeader {
@@ -5673,7 +5689,7 @@ mod tests {
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(1),
             timestamp: ProposerTimestamp(100_000),
-            round: 0,
+            round: Round(0),
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
@@ -5687,12 +5703,12 @@ mod tests {
         let block_hash = block.hash();
 
         // Vote for block at round 0
-        let actions = state.try_vote_on_block(&topology, block_hash, height, 0);
+        let actions = state.try_vote_on_block(&topology, block_hash, height, Round(0));
         assert!(!actions.is_empty(), "Should vote for block");
 
         // Try to vote for SAME block at round 1 (after view change)
         // This should return empty (already voted) but NOT log a warning
-        let actions = state.try_vote_on_block(&topology, block_hash, height, 1);
+        let actions = state.try_vote_on_block(&topology, block_hash, height, Round(1));
         assert!(
             actions.is_empty(),
             "Should not re-broadcast vote for same block"
@@ -5716,7 +5732,7 @@ mod tests {
                 parent_qc: QuorumCertificate::genesis(),
                 proposer: ValidatorId(1),
                 timestamp: ProposerTimestamp(100_000),
-                round: 0,
+                round: Round(0),
                 is_fallback: false,
                 state_root: Hash::ZERO,
                 transaction_root: Hash::ZERO,
@@ -5727,7 +5743,7 @@ mod tests {
                 provision_tx_roots: BTreeMap::new(),
                 in_flight: 0,
             };
-            state.try_vote_on_block(&topology, block.hash(), height, 0);
+            state.try_vote_on_block(&topology, block.hash(), height, Round(0));
         }
 
         assert_eq!(state.voted_heights.len(), 3);
@@ -5761,7 +5777,7 @@ mod tests {
         state.set_time(Duration::from_secs(100));
 
         let height = 5u64;
-        let round = 2u64;
+        let round = Round(2);
         let byzantine_voter = ValidatorId(2);
 
         let block_a = Hash::from_bytes(b"block_a_at_height_5");
@@ -5837,7 +5853,7 @@ mod tests {
             block_hash: block_a,
             shard_group_id: ShardGroupId(0),
             height: BlockHeight(height),
-            round: 0,
+            round: Round(0),
             voter,
             signature: zero_bls_signature(),
             timestamp: ProposerTimestamp(100_000),
@@ -5850,7 +5866,7 @@ mod tests {
             block_hash: block_b,
             shard_group_id: ShardGroupId(0),
             height: BlockHeight(height),
-            round: 1, // Different round
+            round: Round(1), // Different round
             voter,
             signature: zero_bls_signature(),
             timestamp: ProposerTimestamp(100_000),
@@ -5867,7 +5883,7 @@ mod tests {
             *recorded_hash, block_b,
             "Vote at higher round should be recorded"
         );
-        assert_eq!(*recorded_round, 1);
+        assert_eq!(*recorded_round, Round(1));
     }
 
     #[test]
@@ -5877,7 +5893,7 @@ mod tests {
         state.set_time(Duration::from_secs(100));
 
         let voter = ValidatorId(2);
-        let round = 0u64;
+        let round = Round(0);
 
         // Vote for block at height 5
         let vote_h5 = BlockVote {
@@ -5928,7 +5944,7 @@ mod tests {
         state.set_time(Duration::from_secs(100));
 
         let height = 5u64;
-        let round = 0u64;
+        let round = Round(0);
         let legitimate_voter = ValidatorId(2);
 
         let block_b = Hash::from_bytes(b"legitimate_block");
@@ -5973,7 +5989,7 @@ mod tests {
             let block_hash = Hash::from_bytes(format!("block_{}", height).as_bytes());
             state
                 .received_votes_by_height
-                .insert((height, voter), (block_hash, 0)); // round 0
+                .insert((height, voter), (block_hash, Round(0))); // round 0
         }
 
         assert_eq!(state.received_votes_by_height.len(), 3);
@@ -6006,8 +6022,8 @@ mod tests {
         state.set_time(Duration::from_secs(100));
 
         let height = 1u64;
-        let original_round = 0u64;
-        let view_change_round = 31u64;
+        let original_round = Round(0);
+        let view_change_round = Round(31);
 
         // Create original block from validator 1 at round 0
         // proposer_for(1, 0) = (1 + 0) % 4 = 1 = ValidatorId(1)
@@ -6088,7 +6104,7 @@ mod tests {
         let (state, topology, _keys) = make_multi_validator_state();
 
         let height = 1u64;
-        let original_round = 0u64;
+        let original_round = Round(0);
 
         // Create block with original proposer for (height=1, round=0)
         // proposer_for(1, 0) = (1 + 0) % 4 = 1 = ValidatorId(1)
@@ -6139,7 +6155,7 @@ mod tests {
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(3), // Wrong! Should be ValidatorId(1) for round=0
             timestamp: ProposerTimestamp(state.now.as_millis() as u64),
-            round: 0,
+            round: Round(0),
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
@@ -6185,7 +6201,7 @@ mod tests {
 
         // Round 0: Vote for block A at height 1
         let block_a = Hash::from_bytes(b"block_a_round_0");
-        state.voted_heights.insert(height, (block_a, 0));
+        state.voted_heights.insert(height, (block_a, Round(0)));
         assert!(state.voted_heights.contains_key(&height));
 
         // Round 1: First view change
@@ -6194,9 +6210,9 @@ mod tests {
         // proposer_for(1, 0) = (1+0)%4 = 1 = ValidatorId(1)
         // proposer_for(1, 1) = (1+1)%4 = 2 = ValidatorId(2)
         // So ValidatorId(0) is NOT the proposer at round 1.
-        state.view = 0; // Reset for clean test
+        state.view = Round(0); // Reset for clean test
         let _actions = state.advance_round(&topology);
-        assert_eq!(state.view, 1);
+        assert_eq!(state.view, Round(1));
         // Vote lock should be cleared (no QC at height 1, latest_qc_height = 0 < 1)
         // Since we're NOT the proposer, no new vote is created
         assert!(
@@ -6206,12 +6222,12 @@ mod tests {
 
         // Simulate voting for block B at round 1 (externally, as if we received a proposal)
         let block_b = Hash::from_bytes(b"block_b_round_1");
-        state.voted_heights.insert(height, (block_b, 1));
+        state.voted_heights.insert(height, (block_b, Round(1)));
 
         // Round 2: Second view change - not proposer, should unlock
         // proposer_for(1, 2) = (1+2)%4 = 3 = ValidatorId(3)
         let _actions = state.advance_round(&topology);
-        assert_eq!(state.view, 2);
+        assert_eq!(state.view, Round(2));
         assert!(
             !state.voted_heights.contains_key(&height),
             "Vote lock should be cleared after second view change (not proposer)"
@@ -6219,12 +6235,12 @@ mod tests {
 
         // Simulate voting for block C at round 2
         let block_c = Hash::from_bytes(b"block_c_round_2");
-        state.voted_heights.insert(height, (block_c, 2));
+        state.voted_heights.insert(height, (block_c, Round(2)));
 
         // Round 3: Third view change - not proposer, should unlock
         // proposer_for(1, 3) = (1+3)%4 = 0 = ValidatorId(0) - WE ARE THE PROPOSER!
         let actions = state.advance_round(&topology);
-        assert_eq!(state.view, 3);
+        assert_eq!(state.view, Round(3));
         // Since we're the proposer, we emit BuildProposal for a fallback block.
         // The actual vote happens later in on_proposal_built (async).
         // Vote lock was cleared by advance_round (no QC at height 1).
@@ -6261,7 +6277,7 @@ mod tests {
             shard_group_id: ShardGroupId(0),
             height: BlockHeight(1),
             parent_block_hash: Hash::ZERO,
-            round: 0,
+            round: Round(0),
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
             weighted_timestamp: WeightedTimestamp(100_000),
@@ -6269,10 +6285,10 @@ mod tests {
         state.latest_qc = Some(qc);
 
         // We have votes at heights 1 and 2
-        state.voted_heights.insert(1, (qc_block, 0));
+        state.voted_heights.insert(1, (qc_block, Round(0)));
         state
             .voted_heights
-            .insert(2, (Hash::from_bytes(b"block_at_2"), 0));
+            .insert(2, (Hash::from_bytes(b"block_at_2"), Round(0)));
 
         // View change advances round. With QC at height 1, we propose for height 2.
         // The unlock check is: latest_qc_height (1) < height (2)? Yes.
@@ -6302,16 +6318,16 @@ mod tests {
         // Set up vote locks at multiple heights
         state
             .voted_heights
-            .insert(1, (Hash::from_bytes(b"block_1"), 0));
+            .insert(1, (Hash::from_bytes(b"block_1"), Round(0)));
         state
             .voted_heights
-            .insert(2, (Hash::from_bytes(b"block_2"), 0));
+            .insert(2, (Hash::from_bytes(b"block_2"), Round(0)));
         state
             .voted_heights
-            .insert(3, (Hash::from_bytes(b"block_3"), 0));
+            .insert(3, (Hash::from_bytes(b"block_3"), Round(0)));
 
         // Simulate being at round 5 (multiple view changes happened)
-        state.view = 5;
+        state.view = Round(5);
 
         // Now receive a QC at height 2 (maybe from a different validator's proposal)
         let qc = QuorumCertificate {
@@ -6319,7 +6335,7 @@ mod tests {
             shard_group_id: ShardGroupId(0),
             height: BlockHeight(2),
             parent_block_hash: Hash::from_bytes(b"parent_1"),
-            round: 3, // Different round from our votes
+            round: Round(3), // Different round from our votes
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
             weighted_timestamp: WeightedTimestamp(100_000),
@@ -6354,7 +6370,7 @@ mod tests {
         let height = 5u64;
 
         // We voted for block A
-        state.voted_heights.insert(height, (block_a, 0));
+        state.voted_heights.insert(height, (block_a, Round(0)));
 
         // QC forms for block B (different block at same height)
         let qc = QuorumCertificate {
@@ -6362,7 +6378,7 @@ mod tests {
             shard_group_id: ShardGroupId(0),
             height: BlockHeight(height),
             parent_block_hash: Hash::from_bytes(b"parent"),
-            round: 0,
+            round: Round(0),
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
             weighted_timestamp: WeightedTimestamp(100_000),
@@ -6391,10 +6407,10 @@ mod tests {
         let block_b = Hash::from_bytes(b"block_b");
 
         // Vote for block A at height 1
-        state.voted_heights.insert(height, (block_a, 0));
+        state.voted_heights.insert(height, (block_a, Round(0)));
 
         // Try to vote for block B at the same height - should be blocked
-        let actions = state.try_vote_on_block(&topology, block_b, height, 1); // Different round doesn't help
+        let actions = state.try_vote_on_block(&topology, block_b, height, Round(1)); // Different round doesn't help
 
         assert!(
             actions.is_empty(),
@@ -6402,7 +6418,7 @@ mod tests {
         );
         assert_eq!(
             state.voted_heights.get(&height),
-            Some(&(block_a, 0)),
+            Some(&(block_a, Round(0))),
             "Vote lock should still point to original block"
         );
     }
@@ -6418,10 +6434,10 @@ mod tests {
         let block_a = Hash::from_bytes(b"block_a");
 
         // Vote for block A at round 0
-        state.voted_heights.insert(height, (block_a, 0));
+        state.voted_heights.insert(height, (block_a, Round(0)));
 
         // Try to vote for same block A at round 1 - should be a no-op (already voted)
-        let actions = state.try_vote_on_block(&topology, block_a, height, 1);
+        let actions = state.try_vote_on_block(&topology, block_a, height, Round(1));
 
         // Should be empty because we already voted for this block
         assert!(
@@ -6471,7 +6487,7 @@ mod tests {
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(1), // proposer_for(1, 0) = 1
             timestamp: ProposerTimestamp(100_000),
-            round: 0,
+            round: Round(0),
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
@@ -6487,11 +6503,13 @@ mod tests {
         // Add to pending blocks and vote for it
         let pending = PendingBlock::from_manifest(original_header, BlockManifest::default());
         state.pending_blocks.insert(original_block_hash, pending);
-        state.voted_heights.insert(1, (original_block_hash, 0));
+        state
+            .voted_heights
+            .insert(1, (original_block_hash, Round(0)));
 
         // Advance to round 3 where we become the proposer
         // Since no QC at height 1, vote lock is cleared, then we create fallback
-        state.view = 2; // Will become 3 after advance_round
+        state.view = Round(2); // Will become 3 after advance_round
 
         let actions = state.advance_round(&topology);
 
@@ -6523,7 +6541,7 @@ mod tests {
         }) = proposal_action
         {
             assert!(*is_fallback, "Should be a fallback block");
-            assert_eq!(*round, 3, "Fallback proposal should be at new round");
+            assert_eq!(*round, Round(3), "Fallback proposal should be at new round");
         }
     }
 
@@ -6557,7 +6575,7 @@ mod tests {
         assert!(!state.voted_heights.contains_key(&1));
 
         // Advance to round 3 where we become proposer
-        state.view = 2;
+        state.view = Round(2);
         let actions = state.advance_round(&topology);
 
         // Should emit BuildProposal for the fallback block
@@ -6580,7 +6598,7 @@ mod tests {
         }) = proposal_action
         {
             assert!(*is_fallback, "Block should be marked as fallback");
-            assert_eq!(*round, 3, "Block should be at round 3");
+            assert_eq!(*round, Round(3), "Block should be at round 3");
         }
     }
 
@@ -6595,9 +6613,9 @@ mod tests {
         let block_h3 = Hash::from_bytes(b"block_height_3");
 
         // Vote at multiple heights
-        state.voted_heights.insert(1, (block_h1, 0));
-        state.voted_heights.insert(2, (block_h2, 0));
-        state.voted_heights.insert(3, (block_h3, 0));
+        state.voted_heights.insert(1, (block_h1, Round(0)));
+        state.voted_heights.insert(2, (block_h2, Round(0)));
+        state.voted_heights.insert(3, (block_h3, Round(0)));
 
         // QC at height 1 should only unlock height 1
         let qc_h1 = QuorumCertificate {
@@ -6605,7 +6623,7 @@ mod tests {
             shard_group_id: ShardGroupId(0),
             height: BlockHeight(1),
             parent_block_hash: Hash::ZERO,
-            round: 0,
+            round: Round(0),
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
             weighted_timestamp: WeightedTimestamp(100_000),
@@ -6633,7 +6651,7 @@ mod tests {
 
         state
             .voted_heights
-            .insert(1, (Hash::from_bytes(b"block_1"), 0));
+            .insert(1, (Hash::from_bytes(b"block_1"), Round(0)));
 
         let genesis_qc = QuorumCertificate::genesis();
         state.maybe_unlock_for_qc(&topology, &genesis_qc);
@@ -6651,22 +6669,26 @@ mod tests {
 
         // Add vote tracking for multiple validators at height 5
         let height = 5u64;
-        state
-            .received_votes_by_height
-            .insert((height, ValidatorId(0)), (Hash::from_bytes(b"block_a"), 0));
-        state
-            .received_votes_by_height
-            .insert((height, ValidatorId(1)), (Hash::from_bytes(b"block_b"), 0));
-        state
-            .received_votes_by_height
-            .insert((height, ValidatorId(2)), (Hash::from_bytes(b"block_a"), 1));
+        state.received_votes_by_height.insert(
+            (height, ValidatorId(0)),
+            (Hash::from_bytes(b"block_a"), Round(0)),
+        );
+        state.received_votes_by_height.insert(
+            (height, ValidatorId(1)),
+            (Hash::from_bytes(b"block_b"), Round(0)),
+        );
+        state.received_votes_by_height.insert(
+            (height, ValidatorId(2)),
+            (Hash::from_bytes(b"block_a"), Round(1)),
+        );
         // Also add tracking at different height
-        state
-            .received_votes_by_height
-            .insert((6, ValidatorId(0)), (Hash::from_bytes(b"block_c"), 0));
+        state.received_votes_by_height.insert(
+            (6, ValidatorId(0)),
+            (Hash::from_bytes(b"block_c"), Round(0)),
+        );
 
         // Clear tracking for height 5, advancing to round 2
-        let cleared = state.clear_vote_tracking_for_height(height, 2);
+        let cleared = state.clear_vote_tracking_for_height(height, Round(2));
 
         assert_eq!(cleared, 3, "Should clear 3 entries at height 5");
         assert!(
@@ -6702,7 +6724,7 @@ mod tests {
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(2), // (5 + 1) % 4 = 2
             timestamp: ProposerTimestamp(100_000),
-            round: 1,
+            round: Round(1),
             is_fallback: true,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
@@ -6722,7 +6744,7 @@ mod tests {
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(3), // (5 + 2) % 4 = 3
             timestamp: ProposerTimestamp(100_001),
-            round: 2,
+            round: Round(2),
             is_fallback: true,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
@@ -6742,7 +6764,7 @@ mod tests {
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(0), // (5 + 3) % 4 = 0
             timestamp: ProposerTimestamp(100_002),
-            round: 3,
+            round: Round(3),
             is_fallback: true,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
@@ -6763,7 +6785,7 @@ mod tests {
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(2), // (6 + 0) % 4 = 2
             timestamp: ProposerTimestamp(100_003),
-            round: 0,
+            round: Round(0),
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
@@ -6786,7 +6808,7 @@ mod tests {
                 block_hash_r1,
                 shard,
                 BlockHeight(height),
-                1,
+                Round(1),
                 ValidatorId(0),
                 &keys[0],
                 ProposerTimestamp(100_000),
@@ -6802,7 +6824,7 @@ mod tests {
                 block_hash_r2,
                 shard,
                 BlockHeight(height),
-                2,
+                Round(2),
                 ValidatorId(1),
                 &keys[1],
                 ProposerTimestamp(100_001),
@@ -6818,7 +6840,7 @@ mod tests {
                 block_hash_r3,
                 shard,
                 BlockHeight(height),
-                3,
+                Round(3),
                 ValidatorId(2),
                 &keys[2],
                 ProposerTimestamp(100_002),
@@ -6834,7 +6856,7 @@ mod tests {
                 block_hash_h6,
                 shard,
                 BlockHeight(6),
-                0,
+                Round(0),
                 ValidatorId(3),
                 &keys[3],
                 ProposerTimestamp(100_003),
@@ -6846,7 +6868,7 @@ mod tests {
         assert_eq!(state.vote_sets.len(), 4);
 
         // Clear tracking for height 5, advancing to round 2
-        state.clear_vote_tracking_for_height(height, 2);
+        state.clear_vote_tracking_for_height(height, Round(2));
 
         // Round 1 vote set should be cleared (round < new_round)
         assert!(
@@ -6909,7 +6931,7 @@ mod tests {
             shard_group_id: ShardGroupId(0),
             height: BlockHeight(3),
             parent_block_hash: Hash::from_bytes(b"block_2"),
-            round: 0,
+            round: Round(0),
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
             weighted_timestamp: WeightedTimestamp(100_000),
@@ -6982,7 +7004,7 @@ mod tests {
             shard_group_id: ShardGroupId(0),
             height: BlockHeight(1),
             parent_block_hash: Hash::ZERO,
-            round: 0,
+            round: Round(0),
             aggregated_signature: zero_bls_signature(),
             signers: signers.clone(),
 
@@ -6997,7 +7019,7 @@ mod tests {
             parent_qc: parent_qc.clone(),
             proposer: ValidatorId(2), // height 2, round 0 -> validator 2
             timestamp: ProposerTimestamp(100_000),
-            round: 0,
+            round: Round(0),
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
@@ -7037,7 +7059,7 @@ mod tests {
             parent_qc: parent_qc.clone(),
             proposer: ValidatorId(3), // height 2, round 1 -> validator 3
             timestamp: ProposerTimestamp(100_001),
-            round: 1,
+            round: Round(1),
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
@@ -7215,7 +7237,7 @@ mod tests {
             &[0, 1, 2], // 3 voters for quorum
             parent_hash,
             BlockHeight(1),
-            0,
+            Round(0),
             Hash::ZERO,
             ShardGroupId(0),
         );
@@ -7265,7 +7287,7 @@ mod tests {
             0, // voter index
             block_hash,
             BlockHeight(1),
-            0,
+            Round(0),
             shard,
         );
 
@@ -7287,7 +7309,7 @@ mod tests {
         let block_hash = Hash::from_bytes(b"test_block");
         let shard = ShardGroupId(0);
         let height = BlockHeight(1);
-        let round = 0u64;
+        let round = Round(0);
 
         // All validators sign the same message
         let message = hyperscale_types::block_vote_message(shard, height, round, &block_hash);
@@ -7314,7 +7336,7 @@ mod tests {
         let block_hash = Hash::from_bytes(b"test_block");
         let shard = ShardGroupId(0);
         let height = BlockHeight(1);
-        let round = 0u64;
+        let round = Round(0);
 
         let message = hyperscale_types::block_vote_message(shard, height, round, &block_hash);
 
@@ -7347,7 +7369,7 @@ mod tests {
         let block_hash = Hash::from_bytes(b"test_block");
         let shard = ShardGroupId(0);
         let height = BlockHeight(1);
-        let round = 0u64;
+        let round = Round(0);
         let message = hyperscale_types::block_vote_message(shard, height, round, &block_hash);
 
         // Simulate vote collection and aggregation (what vote_set.rs does)
@@ -7393,7 +7415,7 @@ mod tests {
             shard_group_id: ShardGroupId(0),
             height: BlockHeight(3),
             parent_block_hash: Hash::from_bytes(b"block_2"),
-            round: 0,
+            round: Round(0),
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
             weighted_timestamp: WeightedTimestamp(100_000),
@@ -7456,7 +7478,7 @@ mod tests {
             shard_group_id: ShardGroupId(0),
             height: BlockHeight(3),
             parent_block_hash: Hash::from_bytes(b"block_2"),
-            round: 0,
+            round: Round(0),
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
             weighted_timestamp: WeightedTimestamp(old_timestamp),
@@ -7525,7 +7547,7 @@ mod tests {
         // Create a block from another proposer (validator 1 proposes height 1)
         let block_hash = Hash::from_bytes(b"other_proposer_block");
         let height = 1u64;
-        let round = 0u64;
+        let round = Round(0);
 
         // Directly call try_vote_on_block (simulating after QC verification)
         let actions = state.try_vote_on_block(&topology, block_hash, height, round);
@@ -7613,7 +7635,7 @@ mod tests {
         let block_b = Hash::from_bytes(b"block_b");
 
         // Vote for block A
-        let actions = state.try_vote_on_block(&topology, block_a, height, 0);
+        let actions = state.try_vote_on_block(&topology, block_a, height, Round(0));
         assert!(
             actions
                 .iter()
@@ -7622,7 +7644,7 @@ mod tests {
         );
 
         // Try to vote for block B at same height - should be blocked
-        let actions = state.try_vote_on_block(&topology, block_b, height, 1);
+        let actions = state.try_vote_on_block(&topology, block_b, height, Round(1));
         assert!(
             !actions
                 .iter()
@@ -7652,7 +7674,7 @@ mod tests {
             shard_group_id: ShardGroupId(0),
             height: BlockHeight(5),
             parent_block_hash: Hash::from_bytes(b"block_4"),
-            round: 0,
+            round: Round(0),
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
             weighted_timestamp: WeightedTimestamp(1000),
@@ -7689,7 +7711,7 @@ mod tests {
                 parent_qc: QuorumCertificate::genesis(),
                 proposer: ValidatorId(1),
                 timestamp: ProposerTimestamp(1000),
-                round: 0,
+                round: Round(0),
                 is_fallback: false,
                 state_root: Hash::ZERO,
                 transaction_root: Hash::ZERO,
@@ -7710,7 +7732,7 @@ mod tests {
             shard_group_id: ShardGroupId(0),
             height: BlockHeight(1),
             parent_block_hash: Hash::ZERO,
-            round: 0,
+            round: Round(0),
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
             weighted_timestamp: WeightedTimestamp(1000),
@@ -7740,7 +7762,7 @@ mod tests {
             shard_group_id: ShardGroupId(0),
             height: BlockHeight(3),
             parent_block_hash: Hash::from_bytes(b"block_2"),
-            round: 0,
+            round: Round(0),
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
             weighted_timestamp: WeightedTimestamp(100_000),
@@ -7776,7 +7798,7 @@ mod tests {
             shard_group_id: ShardGroupId(0),
             height: BlockHeight(3),
             parent_block_hash: Hash::from_bytes(b"block_2"),
-            round: 0,
+            round: Round(0),
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
             weighted_timestamp: WeightedTimestamp(parent_timestamp),
@@ -7785,7 +7807,7 @@ mod tests {
 
         // Test 1: Build sync block
         state.set_syncing(&topology, true);
-        let sync_actions = state.build_and_broadcast_sync_block(&topology, 4, 0);
+        let sync_actions = state.build_and_broadcast_sync_block(&topology, 4, Round(0));
         state.set_syncing(&topology, false);
 
         // Reset state for fallback test
@@ -7795,7 +7817,7 @@ mod tests {
         state.voted_heights.clear();
 
         // Test 2: Build fallback block
-        let fallback_actions = state.build_and_broadcast_fallback_block(&topology, 4, 1);
+        let fallback_actions = state.build_and_broadcast_fallback_block(&topology, 4, Round(1));
 
         // Extract BuildProposal actions
         let sync_proposal = sync_actions
@@ -7855,7 +7877,7 @@ mod tests {
             shard_group_id: ShardGroupId(0),
             height: BlockHeight(3),
             parent_block_hash: Hash::from_bytes(b"block_2"),
-            round: 0,
+            round: Round(0),
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
             weighted_timestamp: WeightedTimestamp(100_000),
@@ -7888,8 +7910,8 @@ mod tests {
         let increment = Duration::from_secs(1);
 
         // At round 0 (same as view_at_height_start), timeout should be base
-        assert_eq!(state.view, 0);
-        assert_eq!(state.view_at_height_start, 0);
+        assert_eq!(state.view, Round(0));
+        assert_eq!(state.view_at_height_start, Round(0));
         assert_eq!(
             state.current_view_change_timeout(),
             base_timeout,
@@ -7897,7 +7919,7 @@ mod tests {
         );
 
         // Advance round (view change)
-        state.view = 1;
+        state.view = Round(1);
         assert_eq!(
             state.current_view_change_timeout(),
             base_timeout + increment,
@@ -7905,7 +7927,7 @@ mod tests {
         );
 
         // Advance round again
-        state.view = 2;
+        state.view = Round(2);
         assert_eq!(
             state.current_view_change_timeout(),
             base_timeout + increment * 2,
@@ -7913,7 +7935,7 @@ mod tests {
         );
 
         // Advance round to 5
-        state.view = 5;
+        state.view = Round(5);
         assert_eq!(
             state.current_view_change_timeout(),
             base_timeout + increment * 5,
@@ -7930,7 +7952,7 @@ mod tests {
         let increment = Duration::from_secs(1);
 
         // Simulate several view changes at height 0
-        state.view = 5;
+        state.view = Round(5);
         assert_eq!(
             state.current_view_change_timeout(),
             base_timeout + increment * 5,
@@ -7950,7 +7972,7 @@ mod tests {
         );
 
         // Another view change at new height
-        state.view = 6;
+        state.view = Round(6);
         assert_eq!(
             state.current_view_change_timeout(),
             base_timeout + increment,
@@ -7983,14 +8005,14 @@ mod tests {
         // With zero increment, timeout should always be base regardless of round
         assert_eq!(state.current_view_change_timeout(), base_timeout);
 
-        state.view = 10;
+        state.view = Round(10);
         assert_eq!(
             state.current_view_change_timeout(),
             base_timeout,
             "With zero increment, timeout should remain constant"
         );
 
-        state.view = 100;
+        state.view = Round(100);
         assert_eq!(
             state.current_view_change_timeout(),
             base_timeout,
@@ -8003,8 +8025,8 @@ mod tests {
         let (mut state, _topology) = make_test_state();
 
         // Set up: we're at round 0, last_leader_activity = 0
-        state.view = 0;
-        state.view_at_height_start = 0;
+        state.view = Round(0);
+        state.view_at_height_start = Round(0);
         state.last_leader_activity = Some(Duration::ZERO);
 
         // Base timeout is 5s
@@ -8017,7 +8039,7 @@ mod tests {
 
         // Now at round 1, timeout should be 6s
         // Reset and simulate we're at round 1
-        state.view = 1;
+        state.view = Round(1);
         state.last_leader_activity = Some(Duration::from_secs(10));
 
         // At 5s after last activity, should NOT trigger (need 6s)
@@ -8035,7 +8057,7 @@ mod tests {
         );
 
         // At round 5, timeout should be 10s
-        state.view = 5;
+        state.view = Round(5);
         state.last_leader_activity = Some(Duration::from_secs(20));
 
         // At 9s after last activity, should NOT trigger
@@ -8081,7 +8103,7 @@ mod tests {
         let max_timeout = Duration::from_secs(10);
 
         // At low rounds, timeout follows linear formula
-        state.view = 3;
+        state.view = Round(3);
         assert_eq!(
             state.current_view_change_timeout(),
             base_timeout + increment * 3,
@@ -8089,7 +8111,7 @@ mod tests {
         );
 
         // At round 5: 5s + 5*1s = 10s (exactly at cap)
-        state.view = 5;
+        state.view = Round(5);
         assert_eq!(
             state.current_view_change_timeout(),
             max_timeout,
@@ -8097,7 +8119,7 @@ mod tests {
         );
 
         // At round 10: would be 15s, but capped at 10s
-        state.view = 10;
+        state.view = Round(10);
         assert_eq!(
             state.current_view_change_timeout(),
             max_timeout,
@@ -8105,7 +8127,7 @@ mod tests {
         );
 
         // At round 100: would be 105s, but capped at 10s
-        state.view = 100;
+        state.view = Round(100);
         assert_eq!(
             state.current_view_change_timeout(),
             max_timeout,
@@ -8139,7 +8161,7 @@ mod tests {
         let increment = Duration::from_secs(1);
 
         // At round 100: 5s + 100*1s = 105s (no cap)
-        state.view = 100;
+        state.view = Round(100);
         assert_eq!(
             state.current_view_change_timeout(),
             base_timeout + increment * 100,
@@ -8147,7 +8169,7 @@ mod tests {
         );
 
         // At round 1000: 5s + 1000*1s = 1005s (no cap)
-        state.view = 1000;
+        state.view = Round(1000);
         assert_eq!(
             state.current_view_change_timeout(),
             base_timeout + increment * 1000,
@@ -8171,7 +8193,7 @@ mod tests {
         //     round 0: (1+0)%4 = 1 -> V1
         //     round 1: (1+1)%4 = 2 -> V2
         assert_eq!(
-            state.vote_recipients(&topology, 0, 0),
+            state.vote_recipients(&topology, BlockHeight(0), Round(0)),
             vec![ValidatorId(1), ValidatorId(2)]
         );
 
@@ -8181,7 +8203,7 @@ mod tests {
         //     round 0: (2+0)%4 = 2 -> V2
         //     round 1: (2+1)%4 = 3 -> V3
         assert_eq!(
-            state.vote_recipients(&topology, 1, 0),
+            state.vote_recipients(&topology, BlockHeight(1), Round(0)),
             vec![ValidatorId(1), ValidatorId(2), ValidatorId(3)]
         );
     }
@@ -8196,7 +8218,7 @@ mod tests {
         //     round 2: (4+2)%4 = 2 -> V2
         let (state, topology) = make_test_state();
         assert_eq!(
-            state.vote_recipients(&topology, 3, 0),
+            state.vote_recipients(&topology, BlockHeight(3), Round(0)),
             vec![ValidatorId(3), ValidatorId(1), ValidatorId(2)]
         );
     }
@@ -8211,7 +8233,7 @@ mod tests {
         //     round 4: (1+4)%4 = 1 -> V1
         let (state, topology) = make_test_state();
         assert_eq!(
-            state.vote_recipients(&topology, 0, 2),
+            state.vote_recipients(&topology, BlockHeight(0), Round(2)),
             vec![ValidatorId(2), ValidatorId(3), ValidatorId(1)]
         );
     }
@@ -8220,7 +8242,9 @@ mod tests {
     fn test_vote_recipients_empty_when_solo_validator() {
         // Solo validator — no one to send to (own vote processed internally).
         let (state, topology) = make_test_state_with_validators(1);
-        assert!(state.vote_recipients(&topology, 0, 0).is_empty());
+        assert!(state
+            .vote_recipients(&topology, BlockHeight(0), Round(0))
+            .is_empty());
     }
 
     #[test]
@@ -8251,7 +8275,7 @@ mod tests {
                 parent_qc: QuorumCertificate::genesis(),
                 proposer: ValidatorId(1),
                 timestamp: ProposerTimestamp(100_000),
-                round: 0,
+                round: Round(0),
                 is_fallback: false,
                 state_root: Hash::ZERO,
                 transaction_root: Hash::ZERO,
@@ -8280,7 +8304,7 @@ mod tests {
                 parent_qc: QuorumCertificate::genesis(),
                 proposer: ValidatorId(2),
                 timestamp: ProposerTimestamp(100_001),
-                round: 0,
+                round: Round(0),
                 is_fallback: false,
                 state_root: Hash::ZERO,
                 transaction_root: Hash::ZERO,
@@ -8317,7 +8341,7 @@ mod tests {
                 parent_qc: QuorumCertificate::genesis(),
                 proposer: ValidatorId(1),
                 timestamp: ProposerTimestamp(100_000),
-                round: 0,
+                round: Round(0),
                 is_fallback: false,
                 state_root: Hash::ZERO,
                 transaction_root: Hash::ZERO,
@@ -8345,7 +8369,7 @@ mod tests {
                 parent_qc: QuorumCertificate::genesis(),
                 proposer: ValidatorId(2),
                 timestamp: ProposerTimestamp(100_001),
-                round: 0,
+                round: Round(0),
                 is_fallback: false,
                 state_root: Hash::ZERO,
                 transaction_root: Hash::ZERO,
@@ -8429,7 +8453,7 @@ mod tests {
                 parent_qc: QuorumCertificate::genesis(),
                 proposer: ValidatorId(1),
                 timestamp: ProposerTimestamp(1000),
-                round: 0,
+                round: Round(0),
                 is_fallback: false,
                 state_root: Hash::ZERO,
                 transaction_root: Hash::ZERO,
@@ -8449,7 +8473,7 @@ mod tests {
             shard_group_id: ShardGroupId(0),
             height: BlockHeight(1),
             parent_block_hash: Hash::ZERO,
-            round: 0,
+            round: Round(0),
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
             weighted_timestamp: WeightedTimestamp(1000),

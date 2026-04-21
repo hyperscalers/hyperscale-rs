@@ -22,7 +22,7 @@
 //! `signing_message()` method pattern. The signing message is constructed
 //! by prepending the domain tag to the serialized content.
 
-use crate::{BlockHeight, Hash, ShardGroupId, StateProvision, WaveId};
+use crate::{BlockHeight, Hash, Round, ShardGroupId, StateProvision, WaveId};
 
 /// Domain tag for BFT block votes.
 ///
@@ -46,7 +46,7 @@ pub const DOMAIN_COMMITTED_BLOCK_HEADER: &[u8] = b"COMMITTED_BLOCK_HEADER";
 pub fn block_vote_message(
     shard_group: ShardGroupId,
     height: BlockHeight,
-    round: u64,
+    round: Round,
     block_hash: &Hash,
 ) -> Vec<u8> {
     let mut message = Vec::with_capacity(80);
@@ -92,7 +92,7 @@ pub const DOMAIN_BLOCK_HEADER: &[u8] = b"BLOCK_HEADER";
 pub fn block_header_message(
     shard_group: ShardGroupId,
     height: BlockHeight,
-    round: u64,
+    round: Round,
     block_hash: &Hash,
 ) -> Vec<u8> {
     let mut message = Vec::with_capacity(80);
@@ -257,8 +257,8 @@ mod tests {
         let shard = ShardGroupId(1);
         let block = Hash::from_bytes(b"test_block");
 
-        let msg1 = block_vote_message(shard, BlockHeight(10), 0, &block);
-        let msg2 = block_vote_message(shard, BlockHeight(10), 0, &block);
+        let msg1 = block_vote_message(shard, BlockHeight(10), Round::INITIAL, &block);
+        let msg2 = block_vote_message(shard, BlockHeight(10), Round::INITIAL, &block);
 
         assert_eq!(msg1, msg2);
         assert!(msg1.starts_with(DOMAIN_BLOCK_VOTE));
@@ -281,8 +281,8 @@ mod tests {
         let shard = ShardGroupId(1);
         let block = Hash::from_bytes(b"test_block");
 
-        let msg1 = block_header_message(shard, BlockHeight(10), 0, &block);
-        let msg2 = block_header_message(shard, BlockHeight(10), 0, &block);
+        let msg1 = block_header_message(shard, BlockHeight(10), Round::INITIAL, &block);
+        let msg2 = block_header_message(shard, BlockHeight(10), Round::INITIAL, &block);
 
         assert_eq!(msg1, msg2);
         assert!(msg1.starts_with(DOMAIN_BLOCK_HEADER));
@@ -293,8 +293,8 @@ mod tests {
         let shard = ShardGroupId(1);
         let block = Hash::from_bytes(b"test_block");
 
-        let header_msg = block_header_message(shard, BlockHeight(10), 0, &block);
-        let vote_msg = block_vote_message(shard, BlockHeight(10), 0, &block);
+        let header_msg = block_header_message(shard, BlockHeight(10), Round::INITIAL, &block);
+        let vote_msg = block_vote_message(shard, BlockHeight(10), Round::INITIAL, &block);
 
         // Must differ due to different domain tags (prevents cross-protocol replay)
         assert_ne!(header_msg, vote_msg);
@@ -349,7 +349,7 @@ mod tests {
         let block_msg = block_vote_message(
             ShardGroupId(0),
             BlockHeight::GENESIS,
-            0,
+            Round::INITIAL,
             &Hash::from_bytes(bytes),
         );
 

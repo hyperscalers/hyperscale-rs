@@ -12,7 +12,9 @@
 
 #[cfg(test)]
 use hyperscale_types::QuorumCertificate;
-use hyperscale_types::{BlockHeader, BlockHeight, BlockVote, Bls12381G1PublicKey, Hash, VotePower};
+use hyperscale_types::{
+    BlockHeader, BlockHeight, BlockVote, Bls12381G1PublicKey, Hash, Round, VotePower,
+};
 
 /// Votes for a specific block.
 ///
@@ -27,7 +29,7 @@ pub struct VoteSet {
     height: Option<BlockHeight>,
 
     /// Round number when votes are collected.
-    round: Option<u64>,
+    round: Option<Round>,
 
     /// Parent block hash (from the block's header).
     parent_block_hash: Option<Hash>,
@@ -102,7 +104,7 @@ impl VoteSet {
     }
 
     /// Get the round number.
-    pub fn round(&self) -> Option<u64> {
+    pub fn round(&self) -> Option<Round> {
         self.round
     }
 
@@ -218,11 +220,11 @@ impl VoteSet {
     /// Get data needed for verification action.
     ///
     /// Returns (block_hash, height, round, parent_block_hash) or None if not ready.
-    pub fn verification_data(&self) -> Option<(Hash, BlockHeight, u64, Hash)> {
+    pub fn verification_data(&self) -> Option<(Hash, BlockHeight, Round, Hash)> {
         Some((
             self.block_hash?,
             self.height?,
-            self.round.unwrap_or(0),
+            self.round.unwrap_or(Round::INITIAL),
             self.parent_block_hash?,
         ))
     }
@@ -357,7 +359,7 @@ impl VoteSet {
         };
 
         let height = self.height.ok_or("no height in vote set")?;
-        let round = self.round.unwrap_or(0);
+        let round = self.round.unwrap_or(Round::INITIAL);
         let parent_block_hash = self
             .parent_block_hash
             .ok_or("no parent block hash in vote set")?;
@@ -397,7 +399,7 @@ mod tests {
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(0),
             timestamp: hyperscale_types::ProposerTimestamp(1234567890),
-            round: 0,
+            round: Round::INITIAL,
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
@@ -420,7 +422,7 @@ mod tests {
             block_hash,
             test_shard_group(),
             BlockHeight(height),
-            0,
+            Round::INITIAL,
             ValidatorId(voter_index as u64),
             &keys[voter_index],
             hyperscale_types::ProposerTimestamp(1000000000000),

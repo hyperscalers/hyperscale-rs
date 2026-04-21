@@ -1,8 +1,8 @@
 //! Quorum certificate for BFT consensus.
 
 use crate::{
-    block_vote_message, zero_bls_signature, BlockHeight, Bls12381G2Signature, Hash, ShardGroupId,
-    SignerBitfield, WeightedTimestamp,
+    block_vote_message, zero_bls_signature, BlockHeight, Bls12381G2Signature, Hash, Round,
+    ShardGroupId, SignerBitfield, WeightedTimestamp,
 };
 use sbor::prelude::*;
 
@@ -24,7 +24,7 @@ pub struct QuorumCertificate {
     pub parent_block_hash: Hash,
 
     /// Round number when this QC was formed.
-    pub round: u64,
+    pub round: Round,
 
     /// Bitfield indicating which validators signed.
     pub signers: SignerBitfield,
@@ -47,7 +47,7 @@ impl QuorumCertificate {
             shard_group_id: ShardGroupId(0),
             height: BlockHeight(0),
             parent_block_hash: Hash::ZERO,
-            round: 0,
+            round: Round::INITIAL,
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
             weighted_timestamp: WeightedTimestamp::ZERO,
@@ -137,7 +137,7 @@ mod tests {
             shard_group_id: ShardGroupId(0),
             height: BlockHeight(1),
             parent_block_hash: parent_hash,
-            round: 0,
+            round: Round::INITIAL,
             signers,
             aggregated_signature: zero_bls_signature(),
             weighted_timestamp: WeightedTimestamp(1000),

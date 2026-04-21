@@ -748,7 +748,7 @@ mod tests {
     use super::*;
     use hyperscale_types::{
         bls_keypair_from_seed, BlockHeader, Bls12381G1PrivateKey, Hash, MerkleInclusionProof,
-        QuorumCertificate, TopologySnapshot, TxEntries, ValidatorInfo, ValidatorSet, WaveId,
+        QuorumCertificate, Round, TopologySnapshot, TxEntries, ValidatorInfo, ValidatorSet, WaveId,
         WeightedTimestamp,
     };
 
@@ -1253,7 +1253,7 @@ mod tests {
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(0),
             timestamp: hyperscale_types::ProposerTimestamp(1000 + height),
-            round: 0,
+            round: Round::INITIAL,
             is_fallback: false,
             state_root: Hash::from_bytes(format!("root_{shard}_{height}").as_bytes()),
             transaction_root: Hash::ZERO,

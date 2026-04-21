@@ -11,7 +11,7 @@ use crate::{
 use hyperscale_types::{
     zero_bls_signature, ApplicationEvent, Block, BlockHeader, BlockHeight, Bls12381G2Signature,
     ExecutionCertificate, ExecutionMetadata, ExecutionOutcome, FeeSummary, FinalizedWave, Hash,
-    LocalReceipt, LogLevel, NodeId, ProposerTimestamp, QuorumCertificate, ReceiptBundle,
+    LocalReceipt, LogLevel, NodeId, ProposerTimestamp, QuorumCertificate, ReceiptBundle, Round,
     ShardGroupId, SignerBitfield, TransactionOutcome, TxOutcome, ValidatorId, WaveCertificate,
     WaveId, WeightedTimestamp,
 };
@@ -97,7 +97,7 @@ pub fn make_test_block(height: BlockHeight) -> Block {
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(0),
             timestamp: ProposerTimestamp(height.0 * 1000),
-            round: 0,
+            round: Round::INITIAL,
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
@@ -121,7 +121,7 @@ pub fn make_test_qc(block: &Block) -> QuorumCertificate {
         shard_group_id: ShardGroupId(0),
         height: block.height(),
         parent_block_hash: block.header().parent_hash,
-        round: 0,
+        round: Round::INITIAL,
         aggregated_signature: zero_bls_signature(),
         signers: SignerBitfield::new(4),
         weighted_timestamp: WeightedTimestamp(block.header().timestamp.as_millis()),

@@ -23,7 +23,7 @@
 //! 5. [`FinalizedWave`] — all data needed for block commit
 
 use crate::{
-    compute_padded_merkle_root, BlockHeight, Bls12381G2Signature, Hash, LocalReceipt,
+    compute_padded_merkle_root, Attempt, BlockHeight, Bls12381G2Signature, Hash, LocalReceipt,
     ReceiptBundle, RoutableTransaction, ShardGroupId, SignerBitfield, TopologySnapshot,
     TransactionDecision, TransactionOutcome, ValidatorId, WeightedTimestamp,
 };
@@ -202,7 +202,7 @@ pub fn compute_provision_tx_roots(
 /// broadcasts it to local peers and remote shards. Convenience wrapper
 /// for `wave_leader_at(wave_id, 0, committee)`.
 pub fn wave_leader(wave_id: &WaveId, committee: &[ValidatorId]) -> ValidatorId {
-    wave_leader_at(wave_id, 0, committee)
+    wave_leader_at(wave_id, Attempt::INITIAL, committee)
 }
 
 /// Deterministically select the wave leader with rotation for fallback.
@@ -214,7 +214,11 @@ pub fn wave_leader(wave_id: &WaveId, committee: &[ValidatorId]) -> ValidatorId {
 ///
 /// Uses `Hash(sbor_encode(wave_id) ++ attempt.to_le_bytes()) % committee_size`
 /// for deterministic selection. All validators compute the same result.
-pub fn wave_leader_at(wave_id: &WaveId, attempt: u32, committee: &[ValidatorId]) -> ValidatorId {
+pub fn wave_leader_at(
+    wave_id: &WaveId,
+    attempt: Attempt,
+    committee: &[ValidatorId],
+) -> ValidatorId {
     assert!(!committee.is_empty(), "committee must not be empty");
     let mut buf = basic_encode(wave_id).expect("WaveId serialization should never fail");
     buf.extend_from_slice(&attempt.to_le_bytes());
@@ -1464,7 +1468,7 @@ mod tests {
         let wave_id = make_wave_id(0, 100, &[1]);
         assert_eq!(
             wave_leader(&wave_id, &committee),
-            wave_leader_at(&wave_id, 0, &committee)
+            wave_leader_at(&wave_id, Attempt::INITIAL, &committee)
         );
     }
 
@@ -1479,7 +1483,7 @@ mod tests {
         let wave_id = make_wave_id(0, 100, &[1]);
         let mut leaders: std::collections::HashSet<ValidatorId> = std::collections::HashSet::new();
         for attempt in 0..4 {
-            leaders.insert(wave_leader_at(&wave_id, attempt, &committee));
+            leaders.insert(wave_leader_at(&wave_id, Attempt(attempt), &committee));
         }
         // With 4 attempts and 4 committee members, we should get multiple distinct leaders.
         // (Not guaranteed to be all 4 due to hash collisions, but at least 2.)
@@ -1494,7 +1498,7 @@ mod tests {
         let committee = vec![ValidatorId(1), ValidatorId(2), ValidatorId(3)];
         let wave_id = make_wave_id(0, 100, &[1]);
         // Large attempt values should not panic — they wrap via modulo.
-        let _ = wave_leader_at(&wave_id, 1000, &committee);
+        let _ = wave_leader_at(&wave_id, Attempt(1000), &committee);
     }
 
     #[test]
@@ -1506,8 +1510,8 @@ mod tests {
             ValidatorId(4),
         ];
         let wave_id = make_wave_id(0, 100, &[1]);
-        let leader1 = wave_leader_at(&wave_id, 2, &committee);
-        let leader2 = wave_leader_at(&wave_id, 2, &committee);
+        let leader1 = wave_leader_at(&wave_id, Attempt(2), &committee);
+        let leader2 = wave_leader_at(&wave_id, Attempt(2), &committee);
         assert_eq!(leader1, leader2);
     }
 

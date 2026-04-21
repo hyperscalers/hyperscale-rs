@@ -608,7 +608,9 @@ impl RemoteHeaderCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hyperscale_types::{BlockHeader, Hash, QuorumCertificate, ShardGroupId, ValidatorId};
+    use hyperscale_types::{
+        BlockHeader, Hash, QuorumCertificate, Round, ShardGroupId, ValidatorId,
+    };
     use std::collections::BTreeMap;
 
     // Basic structural tests — full integration tests require TopologySnapshot
@@ -633,7 +635,7 @@ mod tests {
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(0),
             timestamp: hyperscale_types::ProposerTimestamp(1234567890),
-            round: 0,
+            round: Round::INITIAL,
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,

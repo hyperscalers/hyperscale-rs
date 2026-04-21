@@ -6,7 +6,7 @@
 
 use hyperscale_core::NodeInput;
 use hyperscale_simulation::{NetworkConfig, SimulationRunner};
-use hyperscale_types::BlockHeight;
+use hyperscale_types::{BlockHeight, Round};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing_test::traced_test;
@@ -524,7 +524,7 @@ fn test_view_change_complete_flow() {
         );
         assert_eq!(
             node.bft().view(),
-            0,
+            Round(0),
             "Node {} should be at round 0",
             node_idx
         );
@@ -538,7 +538,7 @@ fn test_view_change_complete_flow() {
         let node = runner.node(node_idx).expect("Node should exist");
         assert_eq!(
             node.bft().view(),
-            0,
+            Round(0),
             "Node {} should still be at round 0 after 1 second",
             node_idx
         );
@@ -553,7 +553,7 @@ fn test_view_change_complete_flow() {
     for node_idx in 0..4u32 {
         let node = runner.node(node_idx).expect("Node should exist");
         let round = node.bft().view();
-        if round > 0 {
+        if round > Round(0) {
             nodes_with_round_change += 1;
         }
         println!(
@@ -692,7 +692,7 @@ fn test_proposer_rotation_after_view_change() {
     runner.initialize_genesis();
 
     // Get initial view for all nodes
-    let initial_views: Vec<u64> = (0..4u32)
+    let initial_views: Vec<Round> = (0..4u32)
         .map(|i| runner.node(i).unwrap().bft().view())
         .collect();
 
@@ -702,7 +702,7 @@ fn test_proposer_rotation_after_view_change() {
     runner.run_until(Duration::from_secs(15));
 
     // Get final views
-    let final_views: Vec<u64> = (0..4u32)
+    let final_views: Vec<Round> = (0..4u32)
         .map(|i| runner.node(i).unwrap().bft().view())
         .collect();
 
@@ -882,7 +882,7 @@ fn test_round_determinism() {
     runner1.initialize_genesis();
     runner1.run_until(Duration::from_secs(12));
 
-    let views1: Vec<u64> = (0..4u32)
+    let views1: Vec<Round> = (0..4u32)
         .map(|i| runner1.node(i).unwrap().bft().view())
         .collect();
     let heights1: Vec<BlockHeight> = (0..4u32)
@@ -894,7 +894,7 @@ fn test_round_determinism() {
     runner2.initialize_genesis();
     runner2.run_until(Duration::from_secs(12));
 
-    let views2: Vec<u64> = (0..4u32)
+    let views2: Vec<Round> = (0..4u32)
         .map(|i| runner2.node(i).unwrap().bft().view())
         .collect();
     let heights2: Vec<BlockHeight> = (0..4u32)
@@ -1836,7 +1836,7 @@ fn test_partition_recovery_hotstuff2() {
     // 3. Round advancement is happening (view > 0 indicates timeout handling)
 
     // All nodes should have advanced rounds during the timeout period
-    let all_views: Vec<u64> = (0..4u32)
+    let all_views: Vec<Round> = (0..4u32)
         .map(|i| runner.node(i).unwrap().bft().view())
         .collect();
     println!("Final views: {:?}", all_views);

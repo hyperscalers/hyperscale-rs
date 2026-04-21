@@ -6,7 +6,7 @@ use hyperscale_types::{
     Block, BlockHeader, BlockHeight, BlockManifest, BlockVote, Bls12381G1PublicKey,
     Bls12381G2Signature, CommittedBlockHeader, EpochConfig, EpochId, ExecutionCertificate,
     ExecutionVote, FinalizedWave, Hash, NodeId, ProposerTimestamp, Provision, QuorumCertificate,
-    ReceiptBundle, RoutableTransaction, ShardGroupId, SignerBitfield, StateProvision,
+    ReceiptBundle, Round, RoutableTransaction, ShardGroupId, SignerBitfield, StateProvision,
     TopologySnapshot, TxOutcome, ValidatorId, VotePower, WaveId, WeightedTimestamp,
 };
 use std::collections::HashMap;
@@ -287,7 +287,7 @@ pub enum Action {
         /// Block height.
         height: BlockHeight,
         /// Round number.
-        round: u64,
+        round: Round,
         /// Parent block hash (from the block's header).
         parent_block_hash: Hash,
         /// Votes to verify and potentially aggregate.
@@ -512,7 +512,7 @@ pub enum Action {
         shard_group_id: ShardGroupId,
         proposer: ValidatorId,
         height: BlockHeight,
-        round: u64,
+        round: Round,
         parent_hash: Hash,
         parent_qc: QuorumCertificate,
         timestamp: ProposerTimestamp,
@@ -640,7 +640,7 @@ pub enum Action {
     SignAndBroadcastBlockVote {
         block_hash: Hash,
         height: BlockHeight,
-        round: u64,
+        round: Round,
         timestamp: ProposerTimestamp,
         /// Targeted vote recipients — the next proposer who needs this vote
         /// to build the QC for the next block.

@@ -6,7 +6,7 @@
 use crate::TestCommittee;
 use hyperscale_types::{
     block_vote_message, verify_bls12381_v1, BlockHeight, BlockVote, Bls12381G1PublicKey,
-    Bls12381G2Signature, ExecutionOutcome, Hash, ProposerTimestamp, QuorumCertificate,
+    Bls12381G2Signature, ExecutionOutcome, Hash, ProposerTimestamp, QuorumCertificate, Round,
     ShardGroupId, SignerBitfield, WeightedTimestamp,
 };
 
@@ -39,7 +39,7 @@ pub fn make_signed_block_vote(
     voter_idx: usize,
     block_hash: Hash,
     height: BlockHeight,
-    round: u64,
+    round: Round,
     shard: ShardGroupId,
 ) -> BlockVote {
     BlockVote::new(
@@ -88,7 +88,7 @@ pub fn make_signed_qc(
     voter_indices: &[usize],
     block_hash: Hash,
     height: BlockHeight,
-    round: u64,
+    round: Round,
     parent_hash: Hash,
     shard: ShardGroupId,
 ) -> QuorumCertificate {
@@ -181,7 +181,14 @@ mod tests {
         let block_hash = Hash::from_bytes(b"test_block");
         let shard = ShardGroupId(0);
 
-        let vote = make_signed_block_vote(&committee, 0, block_hash, BlockHeight(1), 0, shard);
+        let vote = make_signed_block_vote(
+            &committee,
+            0,
+            block_hash,
+            BlockHeight(1),
+            Round::INITIAL,
+            shard,
+        );
 
         // Should verify with correct key
         assert!(verify_block_vote(&vote, committee.public_key(0)));
@@ -202,7 +209,7 @@ mod tests {
             &[0, 1, 2],
             block_hash,
             BlockHeight(1),
-            0,
+            Round::INITIAL,
             parent_hash,
             shard,
         );

@@ -39,10 +39,10 @@
 
 use hyperscale_core::{Action, CrossShardExecutionRequest, ProtocolEvent, ProvisionRequest};
 use hyperscale_types::{
-    Block, BlockHeight, Bls12381G1PublicKey, ExecutionCertificate, ExecutionOutcome, ExecutionVote,
-    Hash, LocalExecutionEntry, NodeId, Provision, ReceiptBundle, RoutableTransaction, ShardGroupId,
-    StateProvision, TopologySnapshot, TransactionDecision, TxOutcome, ValidatorId, WaveCertificate,
-    WaveId, WeightedTimestamp,
+    Attempt, Block, BlockHeight, Bls12381G1PublicKey, ExecutionCertificate, ExecutionOutcome,
+    ExecutionVote, Hash, LocalExecutionEntry, NodeId, Provision, ReceiptBundle,
+    RoutableTransaction, ShardGroupId, StateProvision, TopologySnapshot, TransactionDecision,
+    TxOutcome, ValidatorId, WaveCertificate, WaveId, WeightedTimestamp,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -293,7 +293,7 @@ struct PendingVoteRetry {
     /// Compared against `committed_ts_ms` to detect leader aggregation
     /// timeouts independently of block production rate.
     sent_at_ts_ms: WeightedTimestamp,
-    attempt: u32,
+    attempt: Attempt,
     block_hash: Hash,
     block_height: BlockHeight,
     vote_anchor_ts_ms: WeightedTimestamp,
@@ -749,7 +749,7 @@ impl ExecutionState {
                     completion.wave_id.clone(),
                     PendingVoteRetry {
                         sent_at_ts_ms: self.committed_ts_ms,
-                        attempt: 0,
+                        attempt: Attempt::INITIAL,
                         block_hash: completion.block_hash,
                         block_height: completion.block_height,
                         vote_anchor_ts_ms: completion.vote_anchor_ts_ms,
@@ -1491,7 +1491,7 @@ impl ExecutionState {
 
             tracing::info!(
                 wave = %wave_id,
-                attempt = pending.attempt,
+                attempt = pending.attempt.0,
                 new_leader = new_leader.0,
                 "Vote retry timeout — re-sending to rotated leader"
             );
@@ -2339,7 +2339,7 @@ mod tests {
         proposer: ValidatorId,
         transactions: Vec<Arc<RoutableTransaction>>,
     ) -> Block {
-        use hyperscale_types::{BlockHeader, ProposerTimestamp, QuorumCertificate};
+        use hyperscale_types::{BlockHeader, ProposerTimestamp, QuorumCertificate, Round};
         let header = BlockHeader {
             shard_group_id: topology.local_shard(),
             height: BlockHeight(height),
@@ -2347,7 +2347,7 @@ mod tests {
             parent_qc: QuorumCertificate::genesis(),
             proposer,
             timestamp: ProposerTimestamp(timestamp_ms),
-            round: 0,
+            round: Round::INITIAL,
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
@@ -2636,7 +2636,7 @@ mod tests {
             wave_id.clone(),
             PendingVoteRetry {
                 sent_at_ts_ms: WeightedTimestamp(10_000),
-                attempt: 0,
+                attempt: Attempt::INITIAL,
                 block_hash: Hash::from_bytes(b"block1"),
                 block_height: BlockHeight(1),
                 vote_anchor_ts_ms: WeightedTimestamp::ZERO,
@@ -2656,7 +2656,8 @@ mod tests {
                 ..
             } => {
                 assert_eq!(wid, &wave_id);
-                let expected_leader = hyperscale_types::wave_leader_at(&wave_id, 1, &committee);
+                let expected_leader =
+                    hyperscale_types::wave_leader_at(&wave_id, Attempt(1), &committee);
                 assert_eq!(*leader, expected_leader, "Should rotate to attempt 1");
             }
             other => panic!(
@@ -2667,7 +2668,7 @@ mod tests {
 
         // Pending retry should be updated to attempt 1, anchored at current ts.
         let retry = state.pending_vote_retries.get(&wave_id).unwrap();
-        assert_eq!(retry.attempt, 1);
+        assert_eq!(retry.attempt, Attempt(1));
         assert_eq!(retry.sent_at_ts_ms, state.committed_ts_ms);
     }
 
@@ -2682,7 +2683,7 @@ mod tests {
             wave_id.clone(),
             PendingVoteRetry {
                 sent_at_ts_ms: WeightedTimestamp(5_000),
-                attempt: 0,
+                attempt: Attempt::INITIAL,
                 block_hash: Hash::from_bytes(b"block1"),
                 block_height: BlockHeight(1),
                 vote_anchor_ts_ms: WeightedTimestamp::ZERO,

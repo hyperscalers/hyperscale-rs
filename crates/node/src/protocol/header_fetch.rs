@@ -591,7 +591,7 @@ mod tests {
     }
 
     fn make_test_header(shard_id: u64, h: u64) -> CommittedBlockHeader {
-        use hyperscale_types::{BlockHeader, Hash, QuorumCertificate};
+        use hyperscale_types::{BlockHeader, Hash, QuorumCertificate, Round};
 
         let header = BlockHeader {
             shard_group_id: ShardGroupId(shard_id),
@@ -600,7 +600,7 @@ mod tests {
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(0),
             timestamp: hyperscale_types::ProposerTimestamp::ZERO,
-            round: 0,
+            round: Round::INITIAL,
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,

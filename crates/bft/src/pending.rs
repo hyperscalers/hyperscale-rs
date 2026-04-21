@@ -298,7 +298,7 @@ impl PendingBlock {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hyperscale_types::{BlockHeight, QuorumCertificate, ShardGroupId, ValidatorId};
+    use hyperscale_types::{BlockHeight, QuorumCertificate, Round, ShardGroupId, ValidatorId};
 
     fn make_header(height: u64) -> BlockHeader {
         BlockHeader {
@@ -308,7 +308,7 @@ mod tests {
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(0),
             timestamp: hyperscale_types::ProposerTimestamp(1234567890),
-            round: 0,
+            round: Round::INITIAL,
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,

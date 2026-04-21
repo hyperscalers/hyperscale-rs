@@ -8,8 +8,8 @@
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, BlockManifest, BlockVote, CertifiedBlock,
     CommittedBlockHeader, EpochConfig, EpochId, ExecutionCertificate, ExecutionVote, FinalizedWave,
-    Hash, Provision, QuorumCertificate, RoutableTransaction, ShardGroupId, TxOutcome, ValidatorId,
-    WaveCertificate, WaveId,
+    Hash, Provision, QuorumCertificate, Round, RoutableTransaction, ShardGroupId, TxOutcome,
+    ValidatorId, WaveCertificate, WaveId,
 };
 use std::sync::Arc;
 
@@ -176,7 +176,7 @@ pub enum ProtocolEvent {
     /// Proposal block built by the runner.
     ProposalBuilt {
         height: BlockHeight,
-        round: u64,
+        round: Round,
         block: Arc<Block>,
         block_hash: Hash,
         finalized_waves: Vec<Arc<FinalizedWave>>,

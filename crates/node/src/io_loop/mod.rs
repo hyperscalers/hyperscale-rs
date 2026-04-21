@@ -1150,7 +1150,7 @@ where
 
         NodeStatusSnapshot {
             committed_height: self.state.bft().committed_height(),
-            view: self.state.bft().view(),
+            view: self.state.bft().view().0,
             state_root,
             sync: self.sync_protocol.status(),
             mempool_pending: contention.pending_count as usize,

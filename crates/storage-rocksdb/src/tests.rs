@@ -9,7 +9,7 @@ use hyperscale_storage::{
     NodeDatabaseUpdates, PartitionDatabaseUpdates, SubstateDatabase, SubstateStore,
 };
 use hyperscale_types::{
-    BlockHeight, Hash, QuorumCertificate, ReceiptBundle, ShardGroupId, WeightedTimestamp,
+    BlockHeight, Hash, QuorumCertificate, ReceiptBundle, Round, ShardGroupId, WeightedTimestamp,
 };
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -226,7 +226,7 @@ fn test_recovery_with_qc() {
             shard_group_id: ShardGroupId(0),
             height: BlockHeight(100),
             parent_block_hash: Hash::from_bytes(&[98; 32]),
-            round: 5,
+            round: Round(5),
             aggregated_signature: zero_bls_signature(),
             signers: SignerBitfield::new(4),
             weighted_timestamp: WeightedTimestamp(100_000),
@@ -244,7 +244,7 @@ fn test_recovery_with_qc() {
 
         let qc = recovered.latest_qc.unwrap();
         assert_eq!(qc.height, BlockHeight(100));
-        assert_eq!(qc.round, 5);
+        assert_eq!(qc.round, Round(5));
         assert_eq!(qc.block_hash, expected_hash);
     }
 }

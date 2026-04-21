@@ -6,7 +6,7 @@
 //! (in the `hyperscale-topology` crate) which builds new snapshots.
 
 use crate::{
-    BlockHeight, Bls12381G1PublicKey, EpochConfig, EpochId, NodeId, RoutableTransaction,
+    BlockHeight, Bls12381G1PublicKey, EpochConfig, EpochId, NodeId, Round, RoutableTransaction,
     ShardCommitteeConfig, ShardGroupId, ValidatorId, ValidatorSet, ValidatorShardState, VotePower,
 };
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -361,19 +361,19 @@ impl TopologySnapshot {
     ///
     /// # Panics
     /// Panics if the local committee is empty (invariant violation).
-    pub fn proposer_for(&self, height: u64, round: u64) -> ValidatorId {
+    pub fn proposer_for(&self, height: BlockHeight, round: Round) -> ValidatorId {
         let committee = self.local_committee();
         debug_assert!(
             !committee.is_empty(),
             "proposer_for called with empty committee for shard {:?}",
             self.local_shard
         );
-        let index = (height + round) as usize % committee.len();
+        let index = (height.0 + round.0) as usize % committee.len();
         committee[index]
     }
 
     /// Check if the local validator should propose at this height and round.
-    pub fn should_propose(&self, height: u64, round: u64) -> bool {
+    pub fn should_propose(&self, height: BlockHeight, round: Round) -> bool {
         self.proposer_for(height, round) == self.local_validator_id
     }
 
@@ -587,10 +587,22 @@ mod tests {
     fn test_proposer_rotation() {
         let snapshot = make_snapshot(4, 0);
 
-        assert_eq!(snapshot.proposer_for(0, 0), ValidatorId(0));
-        assert_eq!(snapshot.proposer_for(1, 0), ValidatorId(1));
-        assert_eq!(snapshot.proposer_for(4, 0), ValidatorId(0));
-        assert_eq!(snapshot.proposer_for(0, 1), ValidatorId(1));
+        assert_eq!(
+            snapshot.proposer_for(BlockHeight(0), Round(0)),
+            ValidatorId(0)
+        );
+        assert_eq!(
+            snapshot.proposer_for(BlockHeight(1), Round(0)),
+            ValidatorId(1)
+        );
+        assert_eq!(
+            snapshot.proposer_for(BlockHeight(4), Round(0)),
+            ValidatorId(0)
+        );
+        assert_eq!(
+            snapshot.proposer_for(BlockHeight(0), Round(1)),
+            ValidatorId(1)
+        );
     }
 
     #[test]

@@ -10,8 +10,8 @@ use hyperscale_types::{
     compute_provision_root, compute_provision_tx_roots, compute_transaction_root, compute_waves,
     verify_bls12381_v1, Block, BlockHeader, BlockHeight, BlockVote, Bls12381G1PublicKey,
     Bls12381G2Signature, FinalizedWave, Hash, ProposerTimestamp, QuorumCertificate, ReceiptBundle,
-    RoutableTransaction, ShardGroupId, SignerBitfield, TopologySnapshot, ValidatorId, VotePower,
-    WeightedTimestamp,
+    Round, RoutableTransaction, ShardGroupId, SignerBitfield, TopologySnapshot, ValidatorId,
+    VotePower, WeightedTimestamp,
 };
 use std::sync::Arc;
 
@@ -38,7 +38,7 @@ pub fn verify_and_build_qc(
     block_hash: Hash,
     shard_group_id: ShardGroupId,
     height: BlockHeight,
-    round: u64,
+    round: Round,
     parent_block_hash: Hash,
     votes_to_verify: Vec<(usize, BlockVote, Bls12381G1PublicKey, u64)>,
     already_verified: Vec<(usize, BlockVote, u64)>,
@@ -363,7 +363,7 @@ pub fn build_proposal<S: ChainWriter + SubstateStore>(
     storage: &S,
     proposer: ValidatorId,
     height: BlockHeight,
-    round: u64,
+    round: Round,
     parent_hash: Hash,
     parent_qc: QuorumCertificate,
     timestamp: ProposerTimestamp,

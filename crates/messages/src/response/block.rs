@@ -60,7 +60,7 @@ mod tests {
     use super::*;
     use hyperscale_types::{
         test_utils::test_transaction, zero_bls_signature, Block, BlockHeader, BlockHeight, Hash,
-        ProposerTimestamp, QuorumCertificate, ShardGroupId, SignerBitfield, ValidatorId,
+        ProposerTimestamp, QuorumCertificate, Round, ShardGroupId, SignerBitfield, ValidatorId,
         WeightedTimestamp,
     };
     use std::collections::BTreeMap;
@@ -76,7 +76,7 @@ mod tests {
                 parent_qc: QuorumCertificate::genesis(),
                 proposer: ValidatorId(0),
                 timestamp: ProposerTimestamp(1234567890),
-                round: 0,
+                round: Round::INITIAL,
                 is_fallback: false,
                 state_root: Hash::ZERO,
                 transaction_root: Hash::ZERO,

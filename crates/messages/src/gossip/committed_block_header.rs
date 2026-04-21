@@ -63,8 +63,8 @@ mod tests {
     #[test]
     fn test_sbor_roundtrip() {
         use hyperscale_types::{
-            zero_bls_signature, BlockHeader, BlockHeight, Hash, QuorumCertificate, ShardGroupId,
-            ValidatorId,
+            zero_bls_signature, BlockHeader, BlockHeight, Hash, QuorumCertificate, Round,
+            ShardGroupId, ValidatorId,
         };
         use std::collections::BTreeMap;
 
@@ -75,7 +75,7 @@ mod tests {
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(0),
             timestamp: ProposerTimestamp(1234567890),
-            round: 0,
+            round: Round::INITIAL,
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,

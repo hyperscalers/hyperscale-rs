@@ -92,6 +92,110 @@ impl fmt::Display for BlockHeight {
     }
 }
 
+/// BFT round / view number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, BasicSbor)]
+#[sbor(transparent)]
+pub struct Round(pub u64);
+
+impl Round {
+    /// Initial round.
+    pub const INITIAL: Self = Round(0);
+
+    /// Get the next round.
+    pub fn next(self) -> Self {
+        Round(self.0 + 1)
+    }
+
+    /// Saturating subtraction by a raw offset.
+    pub fn saturating_sub(self, rhs: u64) -> Self {
+        Round(self.0.saturating_sub(rhs))
+    }
+
+    /// Little-endian byte representation of the inner value.
+    pub fn to_le_bytes(self) -> [u8; 8] {
+        self.0.to_le_bytes()
+    }
+}
+
+impl std::ops::Add<u64> for Round {
+    type Output = Round;
+    fn add(self, rhs: u64) -> Round {
+        Round(self.0 + rhs)
+    }
+}
+
+impl std::ops::Sub<u64> for Round {
+    type Output = Round;
+    fn sub(self, rhs: u64) -> Round {
+        Round(self.0 - rhs)
+    }
+}
+
+impl std::ops::Sub<Round> for Round {
+    type Output = u64;
+    fn sub(self, rhs: Round) -> u64 {
+        self.0 - rhs.0
+    }
+}
+
+impl std::ops::AddAssign<u64> for Round {
+    fn add_assign(&mut self, rhs: u64) {
+        self.0 += rhs;
+    }
+}
+
+impl fmt::Display for Round {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Round({})", self.0)
+    }
+}
+
+/// Wave-leader rotation counter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, BasicSbor)]
+#[sbor(transparent)]
+pub struct Attempt(pub u32);
+
+impl Attempt {
+    /// Initial attempt.
+    pub const INITIAL: Self = Attempt(0);
+
+    /// Get the next attempt.
+    pub fn next(self) -> Self {
+        Attempt(self.0 + 1)
+    }
+
+    /// Little-endian byte representation of the inner value.
+    pub fn to_le_bytes(self) -> [u8; 4] {
+        self.0.to_le_bytes()
+    }
+}
+
+impl std::ops::Add<u32> for Attempt {
+    type Output = Attempt;
+    fn add(self, rhs: u32) -> Attempt {
+        Attempt(self.0 + rhs)
+    }
+}
+
+impl std::ops::Sub<u32> for Attempt {
+    type Output = Attempt;
+    fn sub(self, rhs: u32) -> Attempt {
+        Attempt(self.0 - rhs)
+    }
+}
+
+impl std::ops::AddAssign<u32> for Attempt {
+    fn add_assign(&mut self, rhs: u32) {
+        self.0 += rhs;
+    }
+}
+
+impl fmt::Display for Attempt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Attempt({})", self.0)
+    }
+}
+
 /// Vote power (stake weight).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, BasicSbor)]
 #[sbor(transparent)]
