@@ -146,7 +146,9 @@ impl InboundRouter {
                             match result {
                                 Ok(()) => router_clone.record_success(&peer_id),
                                 Err(ref e) => {
-                                    router_clone.record_failure(&peer_id);
+                                    if !e.is_client_abandonment() {
+                                        router_clone.record_failure(&peer_id);
+                                    }
                                     debug!(peer = %peer_id, error = ?e, "Request stream handling failed");
                                 }
                             }
@@ -187,7 +189,9 @@ impl InboundRouter {
                             match result {
                                 Ok(()) => router_clone.record_success(&peer_id),
                                 Err(ref e) => {
-                                    router_clone.record_failure(&peer_id);
+                                    if !e.is_client_abandonment() {
+                                        router_clone.record_failure(&peer_id);
+                                    }
                                     debug!(peer = %peer_id, error = ?e, "Notification stream handling failed");
                                 }
                             }
@@ -427,6 +431,27 @@ enum StreamError {
     Io(std::io::Error),
     Frame(FrameError),
     UnknownMessageType,
+}
+
+impl StreamError {
+    /// Whether the error was caused by the peer closing/resetting the stream
+    /// rather than a protocol violation or a local fault. Speculative-retry
+    /// clients abandon streams as a normal part of their retry strategy, so
+    /// these must not count toward the per-peer failure threshold.
+    fn is_client_abandonment(&self) -> bool {
+        let io_kind = match self {
+            StreamError::Io(e) => Some(e.kind()),
+            StreamError::Frame(FrameError::Io(e)) => Some(e.kind()),
+            _ => None,
+        };
+        matches!(
+            io_kind,
+            Some(std::io::ErrorKind::UnexpectedEof)
+                | Some(std::io::ErrorKind::BrokenPipe)
+                | Some(std::io::ErrorKind::ConnectionReset)
+                | Some(std::io::ErrorKind::ConnectionAborted)
+        )
+    }
 }
 
 impl std::fmt::Display for StreamError {
