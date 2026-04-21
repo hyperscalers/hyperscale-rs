@@ -78,11 +78,6 @@ impl SimStorage {
         }
     }
 
-    /// Get the current JMT version.
-    pub fn current_jmt_version(&self) -> u64 {
-        self.state.read().unwrap().current_block_height
-    }
-
     /// Clear all data (useful for testing).
     pub fn clear(&mut self) {
         *self.state.write().unwrap() = SharedState::new();

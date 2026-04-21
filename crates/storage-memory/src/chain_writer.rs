@@ -97,9 +97,9 @@ impl ChainWriter for SimStorage {
         let snapshot = JmtSnapshot::from_collected_writes(
             collected,
             parent_state_root,
-            parent_block_height.0,
+            parent_block_height,
             result_root,
-            block_height.0,
+            block_height,
         );
 
         drop(s); // Release read lock
@@ -127,7 +127,7 @@ impl ChainWriter for SimStorage {
         blocks
             .into_iter()
             .map(|(prepared, block, qc)| {
-                let block_height_u64 = prepared.snapshot.new_version;
+                let block_height_u64 = prepared.snapshot.new_height.0;
                 let result_root = prepared.snapshot.result_root;
 
                 {

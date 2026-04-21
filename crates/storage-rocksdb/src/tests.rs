@@ -287,17 +287,17 @@ fn test_block_height_increments_on_commit() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
 
-    assert_eq!(storage.jmt_version(), 0);
+    assert_eq!(storage.jmt_height(), BlockHeight(0));
 
     storage
         .commit(&make_database_update(vec![1, 2, 3], 0, vec![10], vec![1]))
         .unwrap();
-    assert_eq!(storage.jmt_version(), 1);
+    assert_eq!(storage.jmt_height(), BlockHeight(1));
 
     storage
         .commit(&make_database_update(vec![4, 5, 6], 0, vec![20], vec![2]))
         .unwrap();
-    assert_eq!(storage.jmt_version(), 2);
+    assert_eq!(storage.jmt_height(), BlockHeight(2));
 }
 
 #[test]
@@ -460,7 +460,7 @@ fn test_commit_block_empty_certs() {
     let qc = make_test_qc(&block);
 
     storage.commit_block(&Arc::new(block), &Arc::new(qc));
-    assert_eq!(storage.jmt_version(), 1);
+    assert_eq!(storage.jmt_height(), BlockHeight(1));
 }
 
 #[test]
@@ -581,7 +581,7 @@ fn test_certificates_batch() {
 fn test_initial_block_height_is_zero() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
-    assert_eq!(storage.jmt_version(), 0);
+    assert_eq!(storage.jmt_height(), BlockHeight(0));
 }
 
 #[test]
@@ -604,7 +604,7 @@ fn test_state_root_deterministic() {
     s2.commit(&updates).unwrap();
 
     assert_eq!(s1.state_root_hash(), s2.state_root_hash());
-    assert_eq!(s1.jmt_version(), s2.jmt_version());
+    assert_eq!(s1.jmt_height(), s2.jmt_height());
 }
 
 #[test]
@@ -671,7 +671,7 @@ fn test_commit_certificate_via_commit_store() {
 
     storage.commit_certificate_with_writes(&cert, &updates);
 
-    assert_eq!(storage.jmt_version(), 0);
+    assert_eq!(storage.jmt_height(), BlockHeight(0));
     assert_eq!(storage.state_root_hash(), Hash::ZERO);
     assert!(storage.get_certificate(&cert.wave_id.hash()).is_some());
 }
@@ -683,7 +683,7 @@ fn test_empty_commit_still_advances_version() {
 
     let updates = hyperscale_storage::DatabaseUpdates::default();
     storage.commit(&updates).unwrap();
-    assert_eq!(storage.jmt_version(), 1);
+    assert_eq!(storage.jmt_height(), BlockHeight(1));
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -704,13 +704,13 @@ fn test_substates_survive_reopen() {
         cert_hash = cert.wave_id.hash();
         storage.commit_certificate_with_writes(&cert, &updates);
         root_after_write = storage.state_root_hash();
-        version_after_write = storage.jmt_version();
+        version_after_write = storage.jmt_height();
     }
 
     {
         let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
 
-        assert_eq!(storage.jmt_version(), version_after_write);
+        assert_eq!(storage.jmt_height(), version_after_write);
         assert_eq!(storage.state_root_hash(), root_after_write);
 
         let cert = storage.get_certificate(&cert_hash);
@@ -998,7 +998,7 @@ fn test_state_history_create_delete_create() {
         (3, Some(vec![0xBB])),
     ];
     for (v, want) in expected {
-        let snap = <RocksDbStorage as VersionedStore>::snapshot_at(&storage, *v);
+        let snap = <RocksDbStorage as VersionedStore>::snapshot_at(&storage, BlockHeight(*v));
         let got = snap.get_raw_substate_by_db_key(&pk, &sk);
         assert_eq!(
             &got, want,
@@ -1024,7 +1024,10 @@ fn test_snapshot_at_below_retention_panics() {
         commit_empty(&storage, &block, &qc);
     }
     // current=10, floor=8. V=1 is well below floor.
-    let _snap = <RocksDbStorage as hyperscale_storage::VersionedStore>::snapshot_at(&storage, 1);
+    let _snap = <RocksDbStorage as hyperscale_storage::VersionedStore>::snapshot_at(
+        &storage,
+        BlockHeight(1),
+    );
 }
 
 /// `list_substates_for_node_at_height` is an external-facing API — it
@@ -1140,7 +1143,7 @@ fn test_reset_partition_captures_history_for_all_removed_keys() {
     }
 
     // V1: original A/B/C visible, D/E not yet.
-    let snap_v1 = <RocksDbStorage as VersionedStore>::snapshot_at(&storage, 1);
+    let snap_v1 = <RocksDbStorage as VersionedStore>::snapshot_at(&storage, BlockHeight(1));
     assert_eq!(
         snap_v1.get_raw_substate_by_db_key(&pk, &DbSortKey(vec![0xA1])),
         Some(vec![0xAA])
@@ -1159,7 +1162,7 @@ fn test_reset_partition_captures_history_for_all_removed_keys() {
     );
 
     // V2: only D/E visible.
-    let snap_v2 = <RocksDbStorage as VersionedStore>::snapshot_at(&storage, 2);
+    let snap_v2 = <RocksDbStorage as VersionedStore>::snapshot_at(&storage, BlockHeight(2));
     assert_eq!(
         snap_v2.get_raw_substate_by_db_key(&pk, &DbSortKey(vec![0xA1])),
         None

@@ -108,7 +108,7 @@ where
             Some(h) => self.view_at(h),
             None => Arc::new(SubstateView::base_only(
                 Arc::clone(&self.base),
-                BlockHeight(self.base.jmt_version()),
+                self.base.jmt_height(),
             )),
         }
     }
@@ -134,7 +134,7 @@ where
         let anchor_height = chain
             .last()
             .map(|e| e.height)
-            .unwrap_or_else(|| BlockHeight(self.base.jmt_version()));
+            .unwrap_or_else(|| self.base.jmt_height());
         SubstateView::from_chain(Arc::clone(&self.base), &chain, anchor_height)
     }
 }
@@ -162,7 +162,7 @@ type JmtNodeIndex = HashMap<jmt::NodeKey, Arc<jmt::Node>>;
 pub struct SubstateView<S> {
     base: Arc<S>,
     /// Block height of the anchor — the chain's tip, or the base's
-    /// `jmt_version()` when the view has no pending entries. Used as the
+    /// `jmt_height()` when the view has no pending entries. Used as the
     /// historical version for base-storage reads in [`Self::snapshot`],
     /// so the snapshot reflects state as-of this specific block rather
     /// than "whatever the validator has currently persisted." Critical
@@ -443,7 +443,7 @@ impl<S: SubstateStore + crate::VersionedStore> SubstateStore for SubstateView<S>
         // descendants that others haven't. This is the determinism fix
         // for cross-validator state_root computation.
         ViewSnapshot {
-            base_snapshot: (*self.base).snapshot_at(self.anchor_height.0),
+            base_snapshot: (*self.base).snapshot_at(self.anchor_height),
             // Clone the overlay into an Arc so the snapshot is `'static`
             // with respect to the view's overlay map.
             overlay: Arc::new(self.overlay.clone()),
@@ -453,8 +453,8 @@ impl<S: SubstateStore + crate::VersionedStore> SubstateStore for SubstateView<S>
         }
     }
 
-    fn jmt_version(&self) -> u64 {
-        (*self.base).jmt_version()
+    fn jmt_height(&self) -> BlockHeight {
+        (*self.base).jmt_height()
     }
 
     fn state_root_hash(&self) -> Hash {
@@ -466,7 +466,7 @@ impl<S: SubstateStore + crate::VersionedStore> SubstateStore for SubstateView<S>
         node_id: &NodeId,
         block_height: BlockHeight,
     ) -> Option<Vec<(u8, DbSortKey, Vec<u8>)>> {
-        let persisted_version = BlockHeight((*self.base).jmt_version());
+        let persisted_version = (*self.base).jmt_height();
 
         // If the requested height is within persisted range, delegate.
         if block_height <= persisted_version {
@@ -691,8 +691,8 @@ mod tests {
         fn snapshot(&self) -> Self::Snapshot<'_> {
             StubSnapshot
         }
-        fn jmt_version(&self) -> u64 {
-            0
+        fn jmt_height(&self) -> BlockHeight {
+            BlockHeight::GENESIS
         }
         fn state_root_hash(&self) -> Hash {
             Hash::ZERO
@@ -714,7 +714,7 @@ mod tests {
     }
 
     impl crate::VersionedStore for StubStore {
-        fn snapshot_at(&self, _version: u64) -> Self::Snapshot<'_> {
+        fn snapshot_at(&self, _height: BlockHeight) -> Self::Snapshot<'_> {
             StubSnapshot
         }
     }
@@ -810,9 +810,9 @@ mod tests {
     fn empty_snapshot() -> Arc<JmtSnapshot> {
         Arc::new(JmtSnapshot {
             base_root: Hash::ZERO,
-            base_version: 0,
+            base_height: BlockHeight::GENESIS,
             result_root: Hash::ZERO,
-            new_version: 0,
+            new_height: BlockHeight::GENESIS,
             nodes: vec![],
             stale_node_keys: vec![],
             leaf_substate_associations: vec![],

@@ -307,7 +307,7 @@ pub fn verify_state_root<S: ChainWriter + SubstateStore>(
     pending_snapshots: &[Arc<hyperscale_storage::JmtSnapshot>],
 ) -> StateRootResult<S::PreparedCommit> {
     // Use the stable parent_block_height from the verification pipeline, not
-    // storage.jmt_version() which is racy — by the time this runs on the
+    // storage.jmt_height() which is racy — by the time this runs on the
     // ConsensusCrypto pool, other blocks may have committed and advanced the
     // JMT past the parent version.
     // `base_reads=None` lets a `SubstateView` storage drain its own

@@ -10,7 +10,7 @@ use radix_substate_store_interface::interface::{DbSortKey, SubstateDatabase};
 /// This trait extends Radix's `SubstateDatabase` with additional methods needed
 /// for deterministic simulation and state commitment:
 /// - `snapshot()` - Create isolated views for parallel execution
-/// - `jmt_version()` / `state_root_hash()` - JMT state commitment
+/// - `jmt_height()` / `state_root_hash()` - JMT state commitment
 ///
 /// All implementations use a binary Blake3 Jellyfish Merkle Tree (JMT)
 /// internally to maintain cryptographic state roots, updated on each
@@ -35,7 +35,7 @@ pub trait SubstateStore: SubstateDatabase + Send + Sync + 'static {
     /// Create a snapshot at the impl-defined default version.
     ///
     /// - Base storage (`RocksDbStorage`, `SimStorage`): snapshots at the
-    ///   current `jmt_version()`, i.e. the latest committed state.
+    ///   current `jmt_height()`, i.e. the latest committed state.
     /// - [`crate::pending_chain::SubstateView`]: snapshots at the view's
     ///   bound anchor height, combining the overlay with a version-anchored
     ///   base read — deterministic across validators regardless of each
@@ -48,9 +48,8 @@ pub trait SubstateStore: SubstateDatabase + Send + Sync + 'static {
 
     /// Returns the block height of the last committed JMT state.
     ///
-    /// This equals the block height because JMT version = block height.
-    /// Returns 0 for fresh/genesis state.
-    fn jmt_version(&self) -> u64;
+    /// Genesis maps to `BlockHeight::GENESIS`.
+    fn jmt_height(&self) -> BlockHeight;
 
     /// Current JMT state root hash.
     ///
@@ -61,7 +60,7 @@ pub trait SubstateStore: SubstateDatabase + Send + Sync + 'static {
     /// Returns a zero hash if no commits have occurred.
     fn state_root_hash(&self) -> Hash;
 
-    /// List all substates for a node at a specific historical block height (= JMT version).
+    /// List all substates for a node at a specific historical block height.
     ///
     /// Traverses the JMT at the given height and looks up raw substate
     /// values from the leaf association table.
@@ -110,6 +109,6 @@ pub trait SubstateStore: SubstateDatabase + Send + Sync + 'static {
 /// network-supplied versions must check retention themselves and
 /// return `None` for out-of-range heights rather than calling through.
 pub trait VersionedStore: SubstateStore {
-    /// Create a snapshot anchored at the given historical version.
-    fn snapshot_at(&self, version: u64) -> Self::Snapshot<'_>;
+    /// Create a snapshot anchored at the given historical block height.
+    fn snapshot_at(&self, height: BlockHeight) -> Self::Snapshot<'_>;
 }

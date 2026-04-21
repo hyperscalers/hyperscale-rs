@@ -3,6 +3,7 @@
 use crate::core::RocksDbStorage;
 
 use hyperscale_metrics as metrics;
+use hyperscale_types::BlockHeight;
 
 impl RocksDbStorage {
     /// Load recovered state from storage for crash recovery.
@@ -21,7 +22,7 @@ impl RocksDbStorage {
         // populates the JMT with initial Radix state at height 0 but with a non-zero root.
         // The height 0 case is handled correctly by the state machine.
         use hyperscale_storage::SubstateStore;
-        let jmt_block_height = self.jmt_version();
+        let jmt_block_height = self.jmt_height();
         let jmt_root = self.state_root_hash();
         let jmt_root_opt = Some(jmt_root);
 
@@ -29,10 +30,10 @@ impl RocksDbStorage {
         // Since consensus metadata is now written atomically in the same WriteBatch
         // as the JMT commit, a mismatch should never occur. If it does, something
         // is seriously wrong (e.g., storage corruption).
-        if committed_height.0 > 0 && jmt_block_height != committed_height.0 {
+        if committed_height > BlockHeight::GENESIS && jmt_block_height != committed_height {
             tracing::error!(
                 committed_height = committed_height.0,
-                jmt_block_height,
+                jmt_block_height = jmt_block_height.0,
                 "RECOVERY: JMT version does not match committed height — \
                  this should not happen with atomic commits. Possible storage corruption."
             );
@@ -45,7 +46,7 @@ impl RocksDbStorage {
             committed_height = committed_height.0,
             has_committed_hash = committed_hash.is_some(),
             has_latest_qc = latest_qc.is_some(),
-            jmt_block_height,
+            jmt_block_height = jmt_block_height.0,
             jmt_root = ?jmt_root,
             load_time_ms = elapsed * 1000.0,
             "Loaded recovered state from storage"

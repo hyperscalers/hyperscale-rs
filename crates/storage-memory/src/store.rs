@@ -10,13 +10,13 @@ impl SubstateStore for SimStorage {
     type Snapshot<'a> = SimSnapshot;
 
     fn snapshot(&self) -> Self::Snapshot<'_> {
-        // Default version = current committed tip. Equivalent to reading
+        // Default height = current committed tip. Equivalent to reading
         // latest state but uniform snapshot type across all call sites.
-        self.snapshot_at(self.jmt_version())
+        self.snapshot_at(self.jmt_height())
     }
 
-    fn jmt_version(&self) -> u64 {
-        self.state.read().unwrap().current_block_height
+    fn jmt_height(&self) -> BlockHeight {
+        BlockHeight(self.state.read().unwrap().current_block_height)
     }
 
     fn state_root_hash(&self) -> Hash {
@@ -41,7 +41,7 @@ impl SubstateStore for SimStorage {
             return None;
         }
         Some(
-            self.snapshot_at(block_height.0)
+            self.snapshot_at(block_height)
                 .list_raw_values_for_node(node_id),
         )
     }
@@ -57,7 +57,7 @@ impl SubstateStore for SimStorage {
 }
 
 impl VersionedStore for SimStorage {
-    fn snapshot_at(&self, version: u64) -> Self::Snapshot<'_> {
+    fn snapshot_at(&self, height: BlockHeight) -> Self::Snapshot<'_> {
         // Retention invariant: see `RocksDbStorage::snapshot_at` for the
         // full reasoning. Below the floor we can't serve historical
         // reads; hitting this is a DA-assumption bug in the caller.
@@ -65,8 +65,8 @@ impl VersionedStore for SimStorage {
         let current_version = guard.current_block_height;
         let floor = current_version.saturating_sub(self.jmt_history_length);
         assert!(
-            version >= floor,
-            "snapshot_at({version}) below retention floor {floor} \
+            height.0 >= floor,
+            "snapshot_at({height}) below retention floor {floor} \
              (current_version={current_version}, jmt_history_length={}) — \
              BFT/DA invariant broken; caller must anchor within retention",
             self.jmt_history_length,
@@ -77,7 +77,7 @@ impl VersionedStore for SimStorage {
         SimSnapshot {
             current_state: guard.current_state.clone(),
             state_history: guard.state_history.clone(),
-            version,
+            version: height.0,
             current_version,
         }
     }

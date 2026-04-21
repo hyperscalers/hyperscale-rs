@@ -413,14 +413,14 @@ pub enum Action {
         parent_block_hash: Hash,
         /// Base state root (parent block's state_root).
         parent_state_root: Hash,
-        /// Height of the parent block (stable JMT version for computation).
+        /// Height of the parent block (stable anchor for JMT computation).
         parent_block_height: BlockHeight,
         /// Expected state root after applying writes.
         expected_root: Hash,
         /// Finalized waves whose receipts contribute to the state root.
         /// The thread pool merges DatabaseUpdates from these.
         finalized_waves: Vec<Arc<FinalizedWave>>,
-        /// Block height (used as JMT version).
+        /// Block height being verified.
         block_height: BlockHeight,
     },
 
@@ -519,7 +519,7 @@ pub enum Action {
         is_fallback: bool,
         /// Parent's state root (base for state root computation via overlay).
         parent_state_root: Hash,
-        /// Height of the parent block (stable JMT version for computation).
+        /// Height of the parent block (stable anchor for JMT computation).
         parent_block_height: BlockHeight,
         transactions: Vec<Arc<RoutableTransaction>>,
         /// Finalized waves to include in the block (carries certs + receipts + ECs).

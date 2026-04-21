@@ -92,8 +92,8 @@ impl SubstateStore for SharedStorage {
         self.0.snapshot()
     }
 
-    fn jmt_version(&self) -> u64 {
-        self.0.jmt_version()
+    fn jmt_height(&self) -> BlockHeight {
+        self.0.jmt_height()
     }
 
     fn state_root_hash(&self) -> hyperscale_types::Hash {
@@ -119,8 +119,8 @@ impl SubstateStore for SharedStorage {
 }
 
 impl hyperscale_storage::VersionedStore for SharedStorage {
-    fn snapshot_at(&self, version: u64) -> Self::Snapshot<'_> {
-        self.0.snapshot_at(version)
+    fn snapshot_at(&self, height: BlockHeight) -> Self::Snapshot<'_> {
+        self.0.snapshot_at(height)
     }
 }
 

@@ -676,8 +676,13 @@ impl RocksDbStorage {
             &[merged],
             &Default::default(),
         );
-        let jmt_snapshot =
-            JmtSnapshot::from_collected_writes(collected, StateRootHash::ZERO, 0, root, 0);
+        let jmt_snapshot = JmtSnapshot::from_collected_writes(
+            collected,
+            StateRootHash::ZERO,
+            hyperscale_types::BlockHeight::GENESIS,
+            root,
+            hyperscale_types::BlockHeight::GENESIS,
+        );
 
         let mut batch = WriteBatch::default();
         self.append_jmt_to_batch(&mut batch, &jmt_snapshot, 0);
@@ -803,9 +808,9 @@ impl RocksDbStorage {
         let jmt_snapshot = JmtSnapshot::from_collected_writes(
             collected,
             base_root,
-            base_version,
+            hyperscale_types::BlockHeight(base_version),
             new_root,
-            new_version,
+            hyperscale_types::BlockHeight(new_version),
         );
 
         self.append_jmt_to_batch(&mut batch, &jmt_snapshot, new_version);

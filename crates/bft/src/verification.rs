@@ -38,7 +38,7 @@ pub struct ReadyStateRootVerification {
     pub block_hash: Hash,
     pub parent_block_hash: Hash,
     pub parent_state_root: Hash,
-    /// The committed height of the parent block (stable JMT version for computation).
+    /// The committed height of the parent block (stable anchor for JMT computation).
     pub parent_block_height: BlockHeight,
     pub expected_root: Hash,
     /// Finalized waves from the PendingBlock — these carry the proposer's receipts,

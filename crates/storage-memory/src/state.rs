@@ -84,7 +84,7 @@ impl SharedState {
             self.associations.insert(a.tree_node_key, a.substate_value);
         }
 
-        self.current_block_height = snapshot.new_version;
+        self.current_block_height = snapshot.new_height.0;
         self.current_root_hash = snapshot.result_root;
     }
 }

@@ -103,9 +103,9 @@ impl hyperscale_storage::ChainWriter for RocksDbStorage {
         let jmt_snapshot = JmtSnapshot::from_collected_writes(
             collected,
             parent_state_root,
-            parent_block_height.0,
+            parent_block_height,
             computed_root,
-            block_height.0,
+            block_height,
         );
 
         // Merge updates for the substate WriteBatch (off the state_root critical path).
@@ -297,9 +297,9 @@ impl RocksDbStorage {
         let jmt_snapshot = JmtSnapshot::from_collected_writes(
             collected,
             base_root,
-            base_version,
+            BlockHeight(base_version),
             new_root,
-            block_height,
+            BlockHeight(block_height),
         );
         self.append_jmt_to_batch(&mut batch, &jmt_snapshot, block_height);
 

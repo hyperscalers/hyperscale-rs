@@ -344,9 +344,9 @@ fn test_transactions_batch_with_indexed_block() {
 // ═══════════════════════════════════════════════════════════════════════
 
 #[test]
-fn test_initial_jmt_version_is_zero() {
+fn test_initial_jmt_height_is_zero() {
     let storage = SimStorage::new();
-    assert_eq!(storage.jmt_version(), 0);
+    assert_eq!(storage.jmt_height(), BlockHeight(0));
 }
 
 #[test]
@@ -356,15 +356,15 @@ fn test_initial_state_root_is_zero() {
 }
 
 #[test]
-fn test_jmt_version_increments_on_commit() {
+fn test_jmt_height_increments_on_commit() {
     let storage = SimStorage::new();
-    assert_eq!(storage.jmt_version(), 0);
+    assert_eq!(storage.jmt_height(), BlockHeight(0));
 
     storage.commit_shared(&make_database_update(vec![1, 2, 3], 0, vec![10], vec![1]));
-    assert_eq!(storage.jmt_version(), 1);
+    assert_eq!(storage.jmt_height(), BlockHeight(1));
 
     storage.commit_shared(&make_database_update(vec![4, 5, 6], 0, vec![20], vec![2]));
-    assert_eq!(storage.jmt_version(), 2);
+    assert_eq!(storage.jmt_height(), BlockHeight(2));
 }
 
 #[test]
@@ -392,7 +392,7 @@ fn test_state_root_deterministic() {
     s2.commit_shared(&updates);
 
     assert_eq!(s1.state_root_hash(), s2.state_root_hash());
-    assert_eq!(s1.jmt_version(), s2.jmt_version());
+    assert_eq!(s1.jmt_height(), s2.jmt_height());
 }
 
 #[test]
@@ -411,7 +411,7 @@ fn test_empty_commit_still_advances_version() {
     let storage = SimStorage::new();
     let updates = DatabaseUpdates::default();
     storage.commit_shared(&updates);
-    assert_eq!(storage.jmt_version(), 1);
+    assert_eq!(storage.jmt_height(), BlockHeight(1));
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -449,7 +449,7 @@ fn test_commit_block_empty() {
     let qc = make_test_qc(&block);
     commit_empty(&storage, &block, &qc);
     // Empty block: JMT version still advances to block_height
-    assert_eq!(storage.jmt_version(), 1);
+    assert_eq!(storage.jmt_height(), BlockHeight(1));
 }
 
 #[test]
@@ -518,12 +518,12 @@ fn test_clear() {
 
     // Add some data
     storage.commit_shared(&make_database_update(vec![1, 2, 3], 0, vec![10], vec![1]));
-    assert!(storage.jmt_version() > 0);
+    assert!(storage.jmt_height() > BlockHeight::GENESIS);
     assert!(!storage.is_empty());
 
     storage.clear();
 
-    assert_eq!(storage.jmt_version(), 0);
+    assert_eq!(storage.jmt_height(), BlockHeight(0));
     assert_eq!(storage.state_root_hash(), Hash::ZERO);
     assert!(storage.is_empty());
 }
@@ -634,20 +634,20 @@ fn test_snapshot_at_version_is_deterministic_across_persistence_lag() {
     for h in 1..=5 {
         commit(&a, h, vec![h as u8]);
     }
-    assert_eq!(a.jmt_version(), 5);
+    assert_eq!(a.jmt_height(), BlockHeight(5));
 
     // Validator B: stops at block 3.
     let b = SimStorage::new();
     for h in 1..=3 {
         commit(&b, h, vec![h as u8]);
     }
-    assert_eq!(b.jmt_version(), 3);
+    assert_eq!(b.jmt_height(), BlockHeight(3));
 
     // Both read at version 3 via the state-history log. Must see block-3's
     // value on both, not A's current (block-5) value. Before the fix, A
     // would return 5.
-    let snap_a = a.snapshot_at(3);
-    let snap_b = b.snapshot_at(3);
+    let snap_a = a.snapshot_at(BlockHeight(3));
+    let snap_b = b.snapshot_at(BlockHeight(3));
     let pk = DbPartitionKey {
         node_key: hyperscale_storage::keys::node_entity_key(&nid),
         partition_num,
@@ -697,7 +697,7 @@ fn test_snapshot_resolves_floor_among_many_versions() {
     // Read at every 10th version — each should return the exact write
     // from that height, not the latest or any adjacent version.
     for target in [1u64, 10, 20, 25, 49, 50] {
-        let snap = storage.snapshot_at(target);
+        let snap = storage.snapshot_at(BlockHeight(target));
         assert_eq!(
             snap.get_raw_substate_by_db_key(&pk, &sk),
             Some(vec![target as u8]),
@@ -777,7 +777,7 @@ fn test_state_history_create_delete_create() {
     ];
 
     for (v, want) in expected {
-        let snap = storage.snapshot_at(*v);
+        let snap = storage.snapshot_at(BlockHeight(*v));
         let got = snap.get_raw_substate_by_db_key(&pk, &sk);
         assert_eq!(
             &got, want,
@@ -802,7 +802,8 @@ fn test_snapshot_at_below_retention_panics() {
         commit_with(&storage, &DatabaseUpdates::default(), &block, &qc);
     }
     // current=10, floor=8. Asking for V=1 is well below floor.
-    let _snap = <SimStorage as hyperscale_storage::VersionedStore>::snapshot_at(&storage, 1);
+    let _snap =
+        <SimStorage as hyperscale_storage::VersionedStore>::snapshot_at(&storage, BlockHeight(1));
 }
 
 /// `list_substates_for_node_at_height` is an external-facing API —
@@ -907,7 +908,7 @@ fn test_reset_partition_captures_history_for_all_removed_keys() {
     }
 
     // At V1, the original contents A/B/C must still be visible.
-    let snap_v1 = storage.snapshot_at(1);
+    let snap_v1 = storage.snapshot_at(BlockHeight(1));
     assert_eq!(
         snap_v1.get_raw_substate_by_db_key(&pk, &DbSortKey(vec![0xA1])),
         Some(vec![0xAA]),
@@ -927,7 +928,7 @@ fn test_reset_partition_captures_history_for_all_removed_keys() {
     );
 
     // At V2, only D/E are visible.
-    let snap_v2 = storage.snapshot_at(2);
+    let snap_v2 = storage.snapshot_at(BlockHeight(2));
     assert_eq!(
         snap_v2.get_raw_substate_by_db_key(&pk, &DbSortKey(vec![0xA1])),
         None,

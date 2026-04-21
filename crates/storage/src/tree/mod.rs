@@ -152,9 +152,9 @@ pub fn noop_jmt_snapshot<S: jmt::TreeReader>(
 
     JmtSnapshot {
         base_root: parent_state_root,
-        base_version: parent_block_height.0,
+        base_height: parent_block_height,
         result_root: parent_state_root,
-        new_version: block_height.0,
+        new_height: block_height,
         nodes,
         stale_node_keys: Vec::new(),
         leaf_substate_associations: Vec::new(),
