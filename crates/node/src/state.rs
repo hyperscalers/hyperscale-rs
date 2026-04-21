@@ -4,7 +4,7 @@ use hyperscale_bft::{BftConfig, BftState, RecoveredState};
 use hyperscale_core::{Action, ProtocolEvent, StateMachine, TimerId};
 use hyperscale_execution::ExecutionState;
 use hyperscale_mempool::{MempoolConfig, MempoolState};
-use hyperscale_provisions::ProvisionCoordinator;
+use hyperscale_provisions::{ProvisionConfig, ProvisionCoordinator};
 use hyperscale_remote_headers::RemoteHeaderCoordinator;
 use hyperscale_topology::TopologyState;
 use hyperscale_types::{
@@ -86,12 +86,14 @@ impl NodeStateMachine {
     /// * `bft_config` - BFT configuration
     /// * `recovered` - State recovered from storage. Use `RecoveredState::default()` for fresh start.
     /// * `mempool_config` - Mempool configuration
+    /// * `provision_config` - Provision coordinator configuration
     pub fn new(
         node_index: NodeIndex,
         topology: TopologyState,
         bft_config: BftConfig,
         recovered: RecoveredState,
         mempool_config: MempoolConfig,
+        provision_config: ProvisionConfig,
     ) -> Self {
         Self {
             node_index,
@@ -103,7 +105,7 @@ impl NodeStateMachine {
             ),
             execution: ExecutionState::new(),
             mempool: MempoolState::with_config(mempool_config),
-            provisions: ProvisionCoordinator::new(),
+            provisions: ProvisionCoordinator::with_config(provision_config),
             remote_headers: RemoteHeaderCoordinator::new(),
             topology,
             now: Duration::ZERO,

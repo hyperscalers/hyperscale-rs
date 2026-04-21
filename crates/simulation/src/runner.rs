@@ -210,6 +210,7 @@ impl SimulationRunner {
                     BftConfig::default(),
                     RecoveredState::default(),
                     MempoolConfig::default(),
+                    hyperscale_provisions::ProvisionConfig::default(),
                 );
 
                 let (event_tx, event_rx) = crossbeam::channel::unbounded();

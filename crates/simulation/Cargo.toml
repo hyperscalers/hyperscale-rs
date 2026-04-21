@@ -13,6 +13,7 @@ hyperscale-mempool.workspace = true
 hyperscale-network.workspace = true
 hyperscale-network-memory.workspace = true
 hyperscale-node.workspace = true
+hyperscale-provisions.workspace = true
 hyperscale-storage.workspace = true
 hyperscale-storage-memory.workspace = true
 hyperscale-topology.workspace = true

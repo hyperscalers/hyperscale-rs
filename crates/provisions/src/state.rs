@@ -16,10 +16,18 @@ use hyperscale_types::{
     compute_padded_merkle_root, BlockHeight, CommittedBlockHeader, Hash, Provision, ShardGroupId,
     TopologySnapshot, ValidatorId,
 };
+use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, warn};
+
+/// Default minimum dwell time a verified provision batch sits in the queue
+/// before the proposer can include it in a block. Gives shard peers time to
+/// receive and verify the same batch via gossip, so they don't have to fetch
+/// it later. Also buys headroom for the fetch-serving cache since peers hit
+/// local state instead of requesting back.
+pub const DEFAULT_MIN_DWELL_TIME: Duration = Duration::from_millis(500);
 
 /// Number of local committed blocks to wait before falling back to
 /// peer-fetch for missing provisions. Proposers include provisions inline
@@ -38,6 +46,30 @@ const COMMITTED_PROVISION_RETENTION_BLOCKS: u64 = 32;
 /// Headers older than this have either been matched with provisions (and can be
 /// discarded) or are stale (the source shard has moved far ahead).
 const VERIFIED_HEADER_RETENTION_BLOCKS: u64 = 100;
+
+/// Provision coordinator configuration.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProvisionConfig {
+    /// Minimum time a verified provision batch must sit in the proposal queue
+    /// before it becomes eligible for inclusion. Batches younger than this are
+    /// skipped by `queued_provisions()` but remain in the queue.
+    ///
+    /// Set to zero to disable.
+    #[serde(default = "default_min_dwell_time")]
+    pub min_dwell_time: Duration,
+}
+
+fn default_min_dwell_time() -> Duration {
+    DEFAULT_MIN_DWELL_TIME
+}
+
+impl Default for ProvisionConfig {
+    fn default() -> Self {
+        Self {
+            min_dwell_time: DEFAULT_MIN_DWELL_TIME,
+        }
+    }
+}
 
 /// Provision coordinator memory statistics for monitoring collection sizes.
 #[derive(Clone, Copy, Debug, Default)]
@@ -63,6 +95,14 @@ struct ExpectedProvision {
     proposer: ValidatorId,
 }
 
+/// A verified provision batch queued for inclusion, timestamped for dwell-time
+/// filtering at proposal time.
+#[derive(Debug, Clone)]
+struct QueuedProvision {
+    batch: Arc<Provision>,
+    added_at: Duration,
+}
+
 /// Centralized provision coordination.
 ///
 /// Responsibilities:
@@ -72,6 +112,11 @@ struct ExpectedProvision {
 /// - Queue verified batches for block inclusion
 /// - Request missing provisions after timeout (fallback recovery)
 pub struct ProvisionCoordinator {
+    // ═══════════════════════════════════════════════════════════════════
+    // Configuration
+    // ═══════════════════════════════════════════════════════════════════
+    config: ProvisionConfig,
+
     // ═══════════════════════════════════════════════════════════════════
     // Verified Remote Block Headers
     // ═══════════════════════════════════════════════════════════════════
@@ -116,7 +161,9 @@ pub struct ProvisionCoordinator {
     /// Provision batches received from remote shards, queued for inclusion
     /// in the next block proposal. Proposer drains this queue when building
     /// a proposal. Every validator queues (any might become next proposer).
-    queued_provision_batches: Vec<Arc<Provision>>,
+    /// Each entry is timestamped so `queued_provisions()` can apply the
+    /// configured `min_dwell_time`.
+    queued_provision_batches: Vec<QueuedProvision>,
 
     /// Tombstone set: hashes of provision batches that have been committed.
     /// Prevents re-queueing if a duplicate batch arrives via gossip after commit.
@@ -158,9 +205,15 @@ impl Default for ProvisionCoordinator {
 }
 
 impl ProvisionCoordinator {
-    /// Create a new ProvisionCoordinator.
+    /// Create a new ProvisionCoordinator with default config.
     pub fn new() -> Self {
+        Self::with_config(ProvisionConfig::default())
+    }
+
+    /// Create a new ProvisionCoordinator with the given config.
+    pub fn with_config(config: ProvisionConfig) -> Self {
         Self {
+            config,
             verified_remote_headers: HashMap::new(),
             pending_provisions: HashMap::new(),
             verified_batches: BTreeMap::new(),
@@ -219,7 +272,7 @@ impl ProvisionCoordinator {
                 .or_default()
                 .extend(committed.iter().copied());
             self.queued_provision_batches
-                .retain(|b| !committed.contains(&b.hash()));
+                .retain(|q| !committed.contains(&q.batch.hash()));
         }
 
         // Evict committed provisions whose block has aged past the
@@ -579,8 +632,13 @@ impl ProvisionCoordinator {
         self.verified_batches.insert(batch_key, Arc::clone(&batch));
         self.batches_by_hash.insert(batch_hash, Arc::clone(&batch));
 
-        // Queue for inclusion in the next block proposal.
-        self.queued_provision_batches.push(Arc::clone(&batch));
+        // Queue for inclusion in the next block proposal. Timestamp drives
+        // the dwell-time filter in `queued_provisions()` — peers need time to
+        // receive/verify the batch via gossip before the proposer commits it.
+        self.queued_provision_batches.push(QueuedProvision {
+            batch: Arc::clone(&batch),
+            added_at: self.now,
+        });
 
         debug!(
             source_shard = source_shard.0,
@@ -600,10 +658,17 @@ impl ProvisionCoordinator {
     // Query Methods (for other modules)
     // ═══════════════════════════════════════════════════════════════════════
 
-    /// Get queued provision batches for inclusion in a block proposal.
-    /// Batches remain in the queue until pruned on block commit.
+    /// Get queued provision batches eligible for inclusion in a block
+    /// proposal. Skips batches that haven't met `min_dwell_time` yet — they
+    /// stay queued for a later call. Batches remain in the underlying queue
+    /// until pruned on block commit.
     pub fn queued_provisions(&self) -> Vec<Arc<Provision>> {
-        self.queued_provision_batches.clone()
+        let min_dwell = self.config.min_dwell_time;
+        self.queued_provision_batches
+            .iter()
+            .filter(|q| self.now.saturating_sub(q.added_at) >= min_dwell)
+            .map(|q| Arc::clone(&q.batch))
+            .collect()
     }
 
     /// Look up a verified provision batch by its content hash.
@@ -1339,6 +1404,121 @@ mod tests {
                 } if *s == source_shard && *h == BlockHeight(10)
             )),
             "Should emit CancelProvisionFetch when expected provision is verified"
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Dwell-time Tests
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Helper: verify a batch through the coordinator, returning the queue
+    /// size. Stamps `added_at` at `coordinator.now`.
+    fn verify_batch_into_queue(
+        coordinator: &mut ProvisionCoordinator,
+        topology: &TopologySnapshot,
+        source_shard: ShardGroupId,
+        height: u64,
+        tx_hash: Hash,
+    ) {
+        let header =
+            make_committed_header_committing(source_shard, height, ShardGroupId(0), &[tx_hash]);
+        coordinator.on_verified_remote_header(topology, header.clone());
+        let batch = make_batch(tx_hash, source_shard, ShardGroupId(0), height);
+        coordinator.on_state_provisions_received(topology, batch.clone());
+        coordinator.on_state_provisions_verified(topology, batch, Some(header), true);
+    }
+
+    #[test]
+    fn test_dwell_time_zero_yields_immediately() {
+        let topology = make_test_topology(ShardGroupId(0));
+        let mut coordinator = ProvisionCoordinator::with_config(ProvisionConfig {
+            min_dwell_time: Duration::ZERO,
+        });
+        coordinator.set_time(Duration::from_secs(1));
+        verify_batch_into_queue(
+            &mut coordinator,
+            &topology,
+            ShardGroupId(1),
+            10,
+            Hash::from_bytes(b"tx1"),
+        );
+
+        assert_eq!(
+            coordinator.queued_provisions().len(),
+            1,
+            "Zero dwell time should expose the batch immediately"
+        );
+    }
+
+    #[test]
+    fn test_dwell_time_filters_young_batch() {
+        let topology = make_test_topology(ShardGroupId(0));
+        let mut coordinator = ProvisionCoordinator::with_config(ProvisionConfig {
+            min_dwell_time: Duration::from_millis(500),
+        });
+
+        // Verify at t=1.0s
+        coordinator.set_time(Duration::from_secs(1));
+        verify_batch_into_queue(
+            &mut coordinator,
+            &topology,
+            ShardGroupId(1),
+            10,
+            Hash::from_bytes(b"tx1"),
+        );
+
+        // t=1.2s — dwell not met (200ms < 500ms)
+        coordinator.set_time(Duration::from_millis(1200));
+        assert_eq!(
+            coordinator.queued_provisions().len(),
+            0,
+            "Batch younger than min_dwell_time must be skipped"
+        );
+
+        // t=1.5s — exactly at dwell
+        coordinator.set_time(Duration::from_millis(1500));
+        assert_eq!(
+            coordinator.queued_provisions().len(),
+            1,
+            "Batch at min_dwell_time must become eligible"
+        );
+    }
+
+    #[test]
+    fn test_dwell_time_mixed_eligibility() {
+        let topology = make_test_topology(ShardGroupId(0));
+        let mut coordinator = ProvisionCoordinator::with_config(ProvisionConfig {
+            min_dwell_time: Duration::from_millis(200),
+        });
+
+        // t=1.0s: verify old batch
+        coordinator.set_time(Duration::from_secs(1));
+        verify_batch_into_queue(
+            &mut coordinator,
+            &topology,
+            ShardGroupId(1),
+            10,
+            Hash::from_bytes(b"tx_old"),
+        );
+
+        // t=1.3s: verify young batch
+        coordinator.set_time(Duration::from_millis(1300));
+        verify_batch_into_queue(
+            &mut coordinator,
+            &topology,
+            ShardGroupId(1),
+            11,
+            Hash::from_bytes(b"tx_young"),
+        );
+
+        // t=1.4s: old batch dwelled 400ms (eligible), young batch dwelled
+        // 100ms (still blocked).
+        coordinator.set_time(Duration::from_millis(1400));
+        let eligible = coordinator.queued_provisions();
+        assert_eq!(eligible.len(), 1);
+        assert_eq!(
+            eligible[0].transactions[0].tx_hash,
+            Hash::from_bytes(b"tx_old")
         );
     }
 }

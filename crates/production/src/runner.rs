@@ -152,6 +152,8 @@ pub struct ProductionRunnerBuilder {
     network_definition: Option<NetworkDefinition>,
     /// Mempool configuration.
     mempool_config: MempoolConfig,
+    /// Provision coordinator configuration.
+    provision_config: hyperscale_provisions::ProvisionConfig,
 }
 
 impl Default for ProductionRunnerBuilder {
@@ -177,6 +179,7 @@ impl ProductionRunnerBuilder {
             genesis_config: None,
             network_definition: None,
             mempool_config: MempoolConfig::default(),
+            provision_config: hyperscale_provisions::ProvisionConfig::default(),
         }
     }
 
@@ -231,6 +234,12 @@ impl ProductionRunnerBuilder {
     /// Set the mempool configuration.
     pub fn mempool_config(mut self, config: MempoolConfig) -> Self {
         self.mempool_config = config;
+        self
+    }
+
+    /// Set the provision coordinator configuration.
+    pub fn provision_config(mut self, config: hyperscale_provisions::ProvisionConfig) -> Self {
+        self.provision_config = config;
         self
     }
 
@@ -353,6 +362,7 @@ impl ProductionRunnerBuilder {
             bft_config,
             recovered,
             self.mempool_config,
+            self.provision_config,
         );
 
         // ── Create SharedStorage ────────────────────────────────────────

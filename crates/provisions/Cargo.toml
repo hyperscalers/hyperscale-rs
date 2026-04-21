@@ -8,6 +8,7 @@ description = "Centralized provision coordination for cross-shard transactions"
 hyperscale-core.workspace = true
 hyperscale-types.workspace = true
 
+serde.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]

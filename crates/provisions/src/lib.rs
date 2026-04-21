@@ -20,4 +20,4 @@
 
 mod state;
 
-pub use state::{ProvisionCoordinator, ProvisionMemoryStats};
+pub use state::{ProvisionConfig, ProvisionCoordinator, ProvisionMemoryStats};

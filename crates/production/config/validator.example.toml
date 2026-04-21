@@ -155,6 +155,17 @@ max_in_flight = 12288
 max_pending = 8192
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Provisions Configuration
+# ═══════════════════════════════════════════════════════════════════════════════
+
+[provisions]
+# Minimum time a verified provision batch must sit in the proposal queue before
+# it becomes eligible for block inclusion. Gives shard peers time to receive
+# and verify the same batch via gossip, so they don't have to fetch it later.
+# Durations are parsed as toml tables: `{ secs = 0, nanos = 500_000_000 }`.
+min_dwell_time = { secs = 0, nanos = 500_000_000 }
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Metrics Configuration
 # ═══════════════════════════════════════════════════════════════════════════════
 

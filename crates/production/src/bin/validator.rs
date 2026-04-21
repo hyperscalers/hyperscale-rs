@@ -56,6 +56,7 @@ use hyperscale_production::{
     init_telemetry, PooledDispatch, ProductionRunner, RocksDbConfig, RocksDbStorage,
     TelemetryConfig, ThreadPoolConfig,
 };
+use hyperscale_provisions::ProvisionConfig;
 use hyperscale_topology::TopologyState;
 use hyperscale_types::{
     bls_keypair_from_seed, generate_bls_keypair, Bls12381G1PrivateKey, Bls12381G1PublicKey,
@@ -158,6 +159,10 @@ pub struct ValidatorConfig {
     /// Mempool configuration
     #[serde(default)]
     pub mempool: MempoolConfig,
+
+    /// Provision coordinator configuration
+    #[serde(default)]
+    pub provisions: ProvisionConfig,
 }
 
 /// Node identity configuration.
@@ -1307,7 +1312,8 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
         .rpc_status(rpc_node_status.clone())
         .mempool_snapshot(rpc_mempool_snapshot.clone())
         .sync_status(rpc_sync_status.clone())
-        .mempool_config(config.mempool.clone());
+        .mempool_config(config.mempool.clone())
+        .provision_config(config.provisions.clone());
 
     // Wire up genesis configuration if XRD balances are specified
     if !config.genesis.xrd_balances.is_empty() {
