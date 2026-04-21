@@ -153,7 +153,7 @@ where
             Action::SignAndSendExecutionVote {
                 block_hash,
                 block_height,
-                vote_height,
+                vote_anchor_ts_ms,
                 wave_id,
                 global_receipt_root,
                 tx_outcomes,
@@ -171,7 +171,7 @@ where
                 self.dispatch.spawn_crypto(move || {
                     let tx_count = tx_outcomes.len() as u32;
                     let msg = hyperscale_types::exec_vote_message(
-                        vote_height,
+                        vote_anchor_ts_ms,
                         &wave_id,
                         local_shard,
                         &global_receipt_root,
@@ -181,7 +181,7 @@ where
                     let vote = hyperscale_types::ExecutionVote {
                         block_hash,
                         block_height,
-                        vote_height,
+                        vote_anchor_ts_ms,
                         wave_id,
                         shard_group_id: local_shard,
                         global_receipt_root,

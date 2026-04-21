@@ -189,7 +189,7 @@ pub const DOMAIN_EXEC_CERT_BATCH: &[u8] = b"EXEC_CERT_BATCH";
 /// The wave_id is serialized as length-prefixed sorted shard IDs, making
 /// the message deterministic regardless of construction order.
 pub fn exec_vote_message(
-    vote_height: u64,
+    vote_anchor_ts_ms: u64,
     wave_id: &WaveId,
     shard_group: ShardGroupId,
     global_receipt_root: &Hash,
@@ -197,7 +197,7 @@ pub fn exec_vote_message(
 ) -> Vec<u8> {
     let mut message = Vec::with_capacity(128);
     message.extend_from_slice(DOMAIN_EXEC_VOTE);
-    message.extend_from_slice(&vote_height.to_le_bytes());
+    message.extend_from_slice(&vote_anchor_ts_ms.to_le_bytes());
     // WaveId is self-contained (shard + block_height + remote_shards),
     // so no separate block_hash needed in the signing message.
     message.extend_from_slice(&wave_id.shard_group_id.0.to_le_bytes());
@@ -310,7 +310,6 @@ mod tests {
             target_shard: ShardGroupId(2),
             source_shard: ShardGroupId(1),
             block_height: BlockHeight(10),
-            block_timestamp: 0,
             entries: Arc::new(vec![]),
         }];
 

@@ -247,10 +247,10 @@ impl BlockHeader {
 /// Blocks have two variants reflecting their temporal lifecycle:
 /// - **`Live`**: within the cross-shard execution window. Carries the
 ///   provisions needed to execute cross-shard waves locally.
-/// - **`Sealed`**: past the execution window (at least `WAVE_TIMEOUT_BLOCKS`
-///   behind the local committed tip). Waves are finalized from certs +
-///   receipts alone, so provisions are no longer needed and are dropped
-///   from memory. The on-disk / storage shape is always `Sealed`.
+/// - **`Sealed`**: past the execution window (at least `WAVE_TIMEOUT` of
+///   wall-clock behind the local committed tip). Waves are finalized from
+///   certs + receipts alone, so provisions are no longer needed and are
+///   dropped from memory. The on-disk / storage shape is always `Sealed`.
 ///
 /// The header's `provision_root` commits to the original provision set, so
 /// `Sealed` is self-consistent — a `Live` block matches its `Sealed` form

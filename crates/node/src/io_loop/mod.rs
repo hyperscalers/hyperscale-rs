@@ -886,11 +886,8 @@ where
             //
             // The FetchAndBroadcastProvision delegated action built provisions
             // grouped by target shard. Broadcast one batch per shard.
-            NodeInput::ProvisionReady {
-                batches,
-                block_timestamp,
-            } => {
-                self.broadcast_provisions(batches, block_timestamp);
+            NodeInput::ProvisionReady { batches } => {
+                self.broadcast_provisions(batches);
             }
 
             // ── Finalized wave fetch ─────────────────────────────────
@@ -998,7 +995,6 @@ where
             hyperscale_types::Provision,
             Vec<hyperscale_types::ValidatorId>,
         )>,
-        block_timestamp: u64,
     ) {
         let signing_key = Arc::clone(&self.signing_key);
         let network = Arc::clone(&self.network);
@@ -1018,7 +1014,6 @@ where
                         target_shard: shard,
                         source_shard,
                         block_height,
-                        block_timestamp,
                         entries: std::sync::Arc::new(tx.entries),
                     })
                     .collect();

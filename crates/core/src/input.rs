@@ -124,8 +124,6 @@ pub enum NodeInput {
     ProvisionReady {
         /// (target_shard, provision_batch, recipients) per target shard.
         batches: Vec<(ShardGroupId, Provision, Vec<ValidatorId>)>,
-        /// Block timestamp from the source block (for wire format).
-        block_timestamp: u64,
     },
 
     /// Provision successfully received from a provision fetch request.

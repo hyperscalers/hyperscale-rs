@@ -17,11 +17,13 @@
 use hyperscale_types::{Hash, NodeId, Provision, ShardGroupId, TopologySnapshot};
 use std::collections::{HashMap, HashSet};
 
-/// A detected conflict: the loser tx should be aborted at the given height.
+/// A detected conflict: the loser tx should be aborted at the given commit.
 #[derive(Debug, Clone)]
 pub struct DetectedConflict {
     pub loser_tx: Hash,
-    pub committed_at_height: u64,
+    /// Weighted timestamp (ms) of the commit that detected this conflict.
+    /// Anchors time-based wave state (vote anchor, provisioning timestamp).
+    pub committed_at_ts_ms: u64,
 }
 
 /// Stored provision data for reverse conflict detection.
@@ -32,7 +34,10 @@ struct StoredProvision {
     source_nodes: HashSet<NodeId>,
     /// Nodes the remote tx needs from the target shard (our shard).
     target_nodes: HashSet<NodeId>,
-    committed_at_height: u64,
+    /// Local weighted timestamp (ms) at commit — retention anchor used
+    /// both by `prune_provisions_older_than` and propagated to
+    /// `DetectedConflict` for wave bookkeeping.
+    committed_at_ts_ms: u64,
 }
 
 /// Tracks local cross-shard transactions and committed provision node-IDs
@@ -116,7 +121,7 @@ impl ConflictDetector {
                         if tx_hash > prov.remote_tx {
                             conflicts.push(DetectedConflict {
                                 loser_tx: tx_hash,
-                                committed_at_height: prov.committed_at_height,
+                                committed_at_ts_ms: prov.committed_at_ts_ms,
                             });
                         }
                     }
@@ -137,7 +142,7 @@ impl ConflictDetector {
     pub fn detect_conflicts(
         &mut self,
         batch: &Provision,
-        committed_at_height: u64,
+        committed_at_ts_ms: u64,
     ) -> Vec<DetectedConflict> {
         let source_shard = batch.source_shard;
         let mut conflicts = Vec::new();
@@ -158,7 +163,7 @@ impl ConflictDetector {
                     remote_tx,
                     source_nodes: source_nodes.clone(),
                     target_nodes: target_nodes.clone(),
-                    committed_at_height,
+                    committed_at_ts_ms,
                 },
             );
             self.provisions_by_shard
@@ -195,7 +200,7 @@ impl ConflictDetector {
                     if local_tx > remote_tx {
                         conflicts.push(DetectedConflict {
                             loser_tx: local_tx,
-                            committed_at_height,
+                            committed_at_ts_ms,
                         });
                     }
                 }
@@ -246,10 +251,10 @@ impl ConflictDetector {
     /// Call from `on_block_committed` to bound `stored_provisions` size — without
     /// this, `register_tx` iterates unboundedly many past provisions per
     /// cross-shard tx per block (quadratic TPS decay under sustained load).
-    pub fn prune_provisions_older_than(&mut self, cutoff_height: u64) -> usize {
+    pub fn prune_provisions_older_than(&mut self, cutoff_ts_ms: u64) -> usize {
         let before = self.stored_provisions.len();
         self.stored_provisions
-            .retain(|_, prov| prov.committed_at_height > cutoff_height);
+            .retain(|_, prov| prov.committed_at_ts_ms > cutoff_ts_ms);
         // Rebuild `provisions_by_shard` to drop dangling tx refs.
         self.provisions_by_shard.clear();
         for &(tx_hash, shard) in self.stored_provisions.keys() {
@@ -381,7 +386,7 @@ mod tests {
             10,
             vec![(remote_tx, vec![node_b], vec![local_node])],
         );
-        let conflicts = detector.detect_conflicts(&batch, 10);
+        let conflicts = detector.detect_conflicts(&batch, 10 * 500);
         assert!(conflicts.is_empty());
     }
 
@@ -404,7 +409,7 @@ mod tests {
             10,
             vec![(remote_tx, vec![remote_node], vec![local_b])],
         );
-        let conflicts = detector.detect_conflicts(&batch, 10);
+        let conflicts = detector.detect_conflicts(&batch, 10 * 500);
         assert!(conflicts.is_empty());
     }
 
@@ -426,11 +431,11 @@ mod tests {
             10,
             vec![(lower, vec![remote_node], vec![local_node])],
         );
-        let conflicts = detector.detect_conflicts(&batch, 10);
+        let conflicts = detector.detect_conflicts(&batch, 10 * 500);
 
         assert_eq!(conflicts.len(), 1);
         assert_eq!(conflicts[0].loser_tx, higher);
-        assert_eq!(conflicts[0].committed_at_height, 10);
+        assert_eq!(conflicts[0].committed_at_ts_ms, 10 * 500);
     }
 
     #[test]
@@ -450,7 +455,7 @@ mod tests {
             10,
             vec![(higher, vec![remote_node], vec![local_node])],
         );
-        let conflicts = detector.detect_conflicts(&batch, 10);
+        let conflicts = detector.detect_conflicts(&batch, 10 * 500);
         assert!(conflicts.is_empty());
     }
 
@@ -469,14 +474,14 @@ mod tests {
             5,
             vec![(lower, vec![remote_node], vec![local_node])],
         );
-        let fwd_conflicts = detector.detect_conflicts(&batch, 5);
+        let fwd_conflicts = detector.detect_conflicts(&batch, 5 * 500);
         assert!(fwd_conflicts.is_empty());
 
         // Local tx registers AFTER — reverse detection catches bidirectional overlap
         let rev_conflicts = detector.register_tx(higher, &topo, &[remote_node, local_node], &[]);
         assert_eq!(rev_conflicts.len(), 1);
         assert_eq!(rev_conflicts[0].loser_tx, higher);
-        assert_eq!(rev_conflicts[0].committed_at_height, 5);
+        assert_eq!(rev_conflicts[0].committed_at_ts_ms, 5 * 500);
     }
 
     #[test]
@@ -494,7 +499,7 @@ mod tests {
             5,
             vec![(higher, vec![remote_node], vec![local_node])],
         );
-        detector.detect_conflicts(&batch, 5);
+        detector.detect_conflicts(&batch, 5 * 500);
 
         // Local tx registers with lower hash — wins, no conflict
         let rev_conflicts = detector.register_tx(lower, &topo, &[remote_node, local_node], &[]);
@@ -519,7 +524,7 @@ mod tests {
             10,
             vec![(remote_tx, vec![remote_node], vec![local_node])],
         );
-        let conflicts = detector.detect_conflicts(&batch, 10);
+        let conflicts = detector.detect_conflicts(&batch, 10 * 500);
         assert!(conflicts.is_empty());
     }
 
@@ -540,7 +545,7 @@ mod tests {
             10,
             vec![(remote_tx, vec![remote_node], vec![local_node])],
         );
-        let conflicts = detector.detect_conflicts(&batch, 10);
+        let conflicts = detector.detect_conflicts(&batch, 10 * 500);
         assert!(conflicts.is_empty());
     }
 
@@ -558,7 +563,7 @@ mod tests {
             5,
             vec![(lower, vec![remote_node], vec![local_node])],
         );
-        detector.detect_conflicts(&batch, 5);
+        detector.detect_conflicts(&batch, 5 * 500);
         assert_eq!(detector.stored_provision_count(), 1);
 
         detector.remove_provision(&lower, ShardGroupId(1));

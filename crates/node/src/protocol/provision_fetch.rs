@@ -504,7 +504,6 @@ pub fn serve_provision_request(
             target_shard: req.target_shard,
             source_shard: local_shard,
             block_height: req.block_height,
-            block_timestamp: block.header().timestamp,
             entries,
         });
     }

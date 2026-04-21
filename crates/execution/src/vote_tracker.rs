@@ -6,9 +6,9 @@
 //! ## Round Voting
 //!
 //! Validators vote at each block commit where their wave is complete.
-//! Votes include `vote_height` in the BLS-signed message, so votes at
+//! Votes include `vote_anchor_ts_ms` in the BLS-signed message, so votes at
 //! different heights have different signatures and cannot be aggregated.
-//! The tracker groups by `(global_receipt_root, vote_height)` and checks quorum
+//! The tracker groups by `(global_receipt_root, vote_anchor_ts_ms)` and checks quorum
 //! per group.
 //!
 //! ## Deferred Verification Optimization
@@ -20,7 +20,7 @@
 use hyperscale_types::{Bls12381G1PublicKey, ExecutionVote, Hash, ValidatorId, WaveId};
 use std::collections::{BTreeMap, HashSet};
 
-/// Key for grouping votes: `(global_receipt_root, vote_height)`.
+/// Key for grouping votes: `(global_receipt_root, vote_anchor_ts_ms)`.
 ///
 /// Votes at different heights have different BLS signatures and cannot be
 /// aggregated together. This prevents stale votes from combining with new
@@ -44,9 +44,9 @@ pub struct VoteTracker {
     // ═══════════════════════════════════════════════════════════════════════
     // Verified votes (passed signature verification)
     // ═══════════════════════════════════════════════════════════════════════
-    /// Verified votes grouped by (global_receipt_root, vote_height).
+    /// Verified votes grouped by (global_receipt_root, vote_anchor_ts_ms).
     votes_by_key: BTreeMap<VoteKey, Vec<ExecutionVote>>,
-    /// Voting power per (global_receipt_root, vote_height) (verified votes only).
+    /// Voting power per (global_receipt_root, vote_anchor_ts_ms) (verified votes only).
     power_by_key: BTreeMap<VoteKey, u64>,
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -57,8 +57,8 @@ pub struct VoteTracker {
     unverified_votes: Vec<(ExecutionVote, Bls12381G1PublicKey, u64)>,
     /// Total voting power of unverified votes.
     unverified_power: u64,
-    /// Validators we've already seen votes from at each vote_height (dedup).
-    /// Key is (validator_id, vote_height).
+    /// Validators we've already seen votes from at each vote_anchor_ts_ms (dedup).
+    /// Key is (validator_id, vote_anchor_ts_ms).
     seen: HashSet<(ValidatorId, u64)>,
     /// Whether a verification batch is currently in flight.
     pending_verification: bool,
@@ -97,7 +97,7 @@ impl VoteTracker {
     /// Buffer an unverified vote for later batch verification.
     ///
     /// Returns `true` if the vote was buffered, `false` if it was a duplicate.
-    /// Dedup is per (validator, vote_height) — the same validator can vote at
+    /// Dedup is per (validator, vote_anchor_ts_ms) — the same validator can vote at
     /// multiple heights (round voting), but only once per height.
     pub fn buffer_unverified_vote(
         &mut self,
@@ -105,7 +105,7 @@ impl VoteTracker {
         public_key: Bls12381G1PublicKey,
         voting_power: u64,
     ) -> bool {
-        let dedup_key = (vote.validator, vote.vote_height);
+        let dedup_key = (vote.validator, vote.vote_anchor_ts_ms);
 
         if self.seen.contains(&dedup_key) {
             return false;
@@ -160,39 +160,39 @@ impl VoteTracker {
 
     /// Add a verified vote and its voting power.
     pub fn add_verified_vote(&mut self, vote: ExecutionVote, power: u64) {
-        let key = (vote.global_receipt_root, vote.vote_height);
+        let key = (vote.global_receipt_root, vote.vote_anchor_ts_ms);
         self.votes_by_key.entry(key).or_default().push(vote);
         *self.power_by_key.entry(key).or_insert(0) += power;
     }
 
-    /// Check if quorum is reached for any (global_receipt_root, vote_height) pair.
+    /// Check if quorum is reached for any (global_receipt_root, vote_anchor_ts_ms) pair.
     ///
-    /// Returns `Some((global_receipt_root, vote_height, total_power))` if quorum reached.
-    /// If multiple pairs have quorum, returns the one with the lowest vote_height.
+    /// Returns `Some((global_receipt_root, vote_anchor_ts_ms, total_power))` if quorum reached.
+    /// If multiple pairs have quorum, returns the one with the lowest vote_anchor_ts_ms.
     pub fn check_quorum(&self) -> Option<(Hash, u64, u64)> {
         let mut best: Option<(Hash, u64, u64)> = None;
-        for (&(global_receipt_root, vote_height), &power) in &self.power_by_key {
+        for (&(global_receipt_root, vote_anchor_ts_ms), &power) in &self.power_by_key {
             if power >= self.quorum {
                 match &best {
-                    Some((_, best_height, _)) if vote_height >= *best_height => {}
-                    _ => best = Some((global_receipt_root, vote_height, power)),
+                    Some((_, best_height, _)) if vote_anchor_ts_ms >= *best_height => {}
+                    _ => best = Some((global_receipt_root, vote_anchor_ts_ms, power)),
                 }
             }
         }
         best
     }
 
-    /// Take votes for a specific (global_receipt_root, vote_height) pair.
+    /// Take votes for a specific (global_receipt_root, vote_anchor_ts_ms) pair.
     pub fn take_votes(
         &mut self,
         global_receipt_root: &Hash,
-        vote_height: u64,
+        vote_anchor_ts_ms: u64,
     ) -> Vec<ExecutionVote> {
-        let key = (*global_receipt_root, vote_height);
+        let key = (*global_receipt_root, vote_anchor_ts_ms);
         self.votes_by_key.remove(&key).unwrap_or_default()
     }
 
-    /// Return the total verified voting power across all (global_receipt_root, vote_height) groups.
+    /// Return the total verified voting power across all (global_receipt_root, vote_anchor_ts_ms) groups.
     pub fn total_verified_power(&self) -> u64 {
         self.power_by_key.values().sum()
     }
@@ -241,7 +241,7 @@ mod tests {
         ExecutionVote {
             block_hash: Hash::from_bytes(b"block"),
             block_height: 10,
-            vote_height: 11,
+            vote_anchor_ts_ms: 11,
             wave_id: WaveId::new(ShardGroupId(0), 0, BTreeSet::new()),
             shard_group_id: ShardGroupId(0),
             global_receipt_root,
@@ -273,7 +273,7 @@ mod tests {
         assert!(result.is_some());
         let (r, vh, power) = result.unwrap();
         assert_eq!(r, root);
-        assert_eq!(vh, 11); // vote_height from make_vote
+        assert_eq!(vh, 11); // vote_anchor_ts_ms from make_vote
         assert_eq!(power, 3);
         assert_eq!(tracker.votes_for_global_receipt_root(&root).len(), 3);
     }

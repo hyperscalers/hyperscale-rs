@@ -13,7 +13,6 @@
 //! Production: `SyncManager` wraps this, maps outputs to tokio tasks.
 //! Simulation: feeds inputs/outputs synchronously via event queue.
 
-use hyperscale_execution::WAVE_TIMEOUT_BLOCKS;
 use hyperscale_messages::request::GetBlockRequest;
 use hyperscale_messages::response::GetBlockResponse;
 use hyperscale_metrics as metrics;
@@ -410,8 +409,14 @@ pub fn serve_block_request(
         return GetBlockResponse::not_found();
     };
 
+    // Block-count heuristic for "requester might still need provisions."
+    // Sized generously so a Sealed block is only served when the requester
+    // is clearly past the cross-shard execution window; if they need Live
+    // and this peer can't attach provisions, they fall through to another
+    // peer via `not_found`.
+    const LIVE_BLOCK_WINDOW: u64 = 64;
     let needs_live =
-        req.height.0 + WAVE_TIMEOUT_BLOCKS > req.target_height.0 && !provision_hashes.is_empty();
+        req.height.0 + LIVE_BLOCK_WINDOW > req.target_height.0 && !provision_hashes.is_empty();
 
     if !needs_live {
         return GetBlockResponse::found(CertifiedBlock::new_unchecked(block, qc));

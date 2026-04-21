@@ -115,9 +115,6 @@ pub struct StateProvision {
     /// Block height when this provision was created (= JMT version for merkle proofs).
     pub block_height: BlockHeight,
 
-    /// Unix timestamp (milliseconds) of the block that triggered this provision.
-    pub block_timestamp: u64,
-
     /// The state entries with pre-computed storage keys.
     /// Wrapped in Arc for efficient sharing when broadcasting to multiple shards.
     pub entries: Arc<Vec<StateEntry>>,
@@ -130,7 +127,6 @@ impl PartialEq for StateProvision {
             && self.target_shard == other.target_shard
             && self.source_shard == other.source_shard
             && self.block_height == other.block_height
-            && self.block_timestamp == other.block_timestamp
             && *self.entries == *other.entries
     }
 }
@@ -146,12 +142,11 @@ impl<E: sbor::Encoder<sbor::NoCustomValueKind>> sbor::Encode<sbor::NoCustomValue
     }
 
     fn encode_body(&self, encoder: &mut E) -> Result<(), sbor::EncodeError> {
-        encoder.write_size(6)?;
+        encoder.write_size(5)?;
         encoder.encode(&self.transaction_hash)?;
         encoder.encode(&self.target_shard)?;
         encoder.encode(&self.source_shard)?;
         encoder.encode(&self.block_height)?;
-        encoder.encode(&self.block_timestamp)?;
         encoder.encode(self.entries.as_ref())?;
         Ok(())
     }
@@ -167,9 +162,9 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
         decoder.check_preloaded_value_kind(value_kind, sbor::ValueKind::Tuple)?;
         let length = decoder.read_size()?;
 
-        if length != 6 {
+        if length != 5 {
             return Err(sbor::DecodeError::UnexpectedSize {
-                expected: 6,
+                expected: 5,
                 actual: length,
             });
         }
@@ -178,7 +173,6 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
         let target_shard: ShardGroupId = decoder.decode()?;
         let source_shard: ShardGroupId = decoder.decode()?;
         let block_height: BlockHeight = decoder.decode()?;
-        let block_timestamp: u64 = decoder.decode()?;
         let entries: Vec<StateEntry> = decoder.decode()?;
 
         Ok(Self {
@@ -186,7 +180,6 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
             target_shard,
             source_shard,
             block_height,
-            block_timestamp,
             entries: Arc::new(entries),
         })
     }

@@ -13,13 +13,12 @@
 //! the complete block data, making it recoverable from any honest validator in that set.
 
 use hyperscale_core::{Action, CommitSource, ProtocolEvent, TimerId};
+use hyperscale_types::REMOTE_HEADER_RETENTION;
 
-/// Number of block heights to retain remote headers per shard below the tip.
-const REMOTE_HEADER_RETENTION_BLOCKS: u64 = 50;
-
-/// Number of blocks to retain committed transaction hashes for proposal dedup.
-/// Matches the mempool tombstone window so entries outlive any possible re-proposal.
-const COMMITTED_TX_RETENTION_BLOCKS: u64 = 500;
+/// How long to retain committed transaction hashes for proposal dedup.
+/// Matches the mempool tombstone window so entries outlive any possible
+/// re-proposal. Anchored on the weighted timestamp of the committing QC.
+const COMMITTED_TX_RETENTION: Duration = Duration::from_secs(300);
 
 /// BFT statistics for monitoring.
 #[derive(Clone, Copy, Debug, Default)]
@@ -145,6 +144,10 @@ pub struct BftState {
     /// Hash of the latest committed block.
     committed_hash: Hash,
 
+    /// BFT-authenticated weighted timestamp (ms) of the latest committed
+    /// block. "Now" reference for time-based retention in proposal dedup.
+    committed_ts_ms: u64,
+
     /// State root from the latest committed block header.
     /// Updated synchronously at commit time (not dependent on async JMT).
     committed_state_root: Hash,
@@ -222,7 +225,9 @@ pub struct BftState {
 
     /// Lookup of committed tx hashes to their committed height.
     /// Populated by the node state layer from the mempool on each block commit.
-    committed_tx_lookup: HashMap<Hash, BlockHeight>,
+    /// Tx hash → `weighted_timestamp_ms` at commit. Bounded memory for
+    /// proposal dedup; pruned by `COMMITTED_TX_RETENTION`.
+    committed_tx_lookup: HashMap<Hash, u64>,
 
     /// Hashes from recently committed blocks, held until the mempool
     /// processes the async `BlockCommitted` event and purges them.
@@ -235,8 +240,11 @@ pub struct BftState {
     /// Only headers with verified QCs (tracked in verification pipeline) are trusted.
     remote_headers: HashMap<(ShardGroupId, BlockHeight), Arc<CommittedBlockHeader>>,
 
-    /// Highest seen block height per remote shard. Used for pruning.
-    remote_header_tips: HashMap<ShardGroupId, BlockHeight>,
+    /// Highest seen `(block_height, weighted_timestamp_ms)` per remote shard.
+    /// The timestamp is the pruning anchor — retention is measured against
+    /// how long ago (in remote wall-clock) each stored header was produced,
+    /// so pruning stays meaningful when remote block cadence varies.
+    remote_header_tips: HashMap<ShardGroupId, (BlockHeight, u64)>,
 
     // ═══════════════════════════════════════════════════════════════════════════
     // Configuration
@@ -302,6 +310,11 @@ impl BftState {
             committed_hash: recovered
                 .committed_hash
                 .unwrap_or(Hash::from_bytes(&[0u8; 32])),
+            committed_ts_ms: recovered
+                .latest_qc
+                .as_ref()
+                .map(|qc| qc.weighted_timestamp_ms)
+                .unwrap_or(0),
             committed_state_root: recovered.jmt_root.unwrap_or(Hash::ZERO),
             latest_qc: recovered.latest_qc,
             deferred_qc: None,
@@ -352,20 +365,22 @@ impl BftState {
             return vec![];
         }
 
+        let header_ts_ms = header.qc.weighted_timestamp_ms;
         self.remote_headers.insert(key, Arc::clone(&header));
 
         // Update tip and prune old headers for this shard.
         let tip = self
             .remote_header_tips
             .entry(shard)
-            .or_insert(BlockHeight(0));
-        if height > *tip {
-            *tip = height;
+            .or_insert((BlockHeight(0), 0));
+        if height > tip.0 {
+            *tip = (height, header_ts_ms);
         }
-        let cutoff = tip.0.saturating_sub(REMOTE_HEADER_RETENTION_BLOCKS);
-        if cutoff > 0 {
+        let retention_ms = REMOTE_HEADER_RETENTION.as_millis() as u64;
+        let cutoff_ms = tip.1.saturating_sub(retention_ms);
+        if cutoff_ms > 0 {
             self.remote_headers
-                .retain(|&(s, h), _| s != shard || h.0 >= cutoff);
+                .retain(|&(s, _), hdr| s != shard || hdr.qc.weighted_timestamp_ms >= cutoff_ms);
         }
 
         vec![]
@@ -625,7 +640,7 @@ impl BftState {
 
         // Notify NodeStateMachine to flush expected provisions and remote
         // headers immediately so we can participate in execution for recent
-        // blocks within the WAVE_TIMEOUT_BLOCKS window.
+        // blocks within the WAVE_TIMEOUT window.
         actions.push(Action::Continuation(ProtocolEvent::SyncResumed));
 
         actions
@@ -2134,8 +2149,8 @@ impl BftState {
             }
             if self.committed_tx_lookup.contains_key(&tx_hash) {
                 return Err(format!(
-                    "transaction {} already committed at height {}",
-                    tx_hash, self.committed_tx_lookup[&tx_hash].0,
+                    "transaction {} already committed at ts_ms {}",
+                    tx_hash, self.committed_tx_lookup[&tx_hash],
                 ));
             }
         }
@@ -2254,7 +2269,7 @@ impl BftState {
         // This prevents wasting crypto resources verifying stale votes.
         if height <= self.committed_height {
             trace!(
-                vote_height = height,
+                vote_anchor_ts_ms = height,
                 committed_height = self.committed_height,
                 voter = ?vote.voter,
                 "Skipping vote for already-committed height"
@@ -2452,7 +2467,7 @@ impl BftState {
                     validator = ?validator_id,
                     old_view = self.view,
                     new_view = vote.round,
-                    vote_height = vote.height.0,
+                    vote_anchor_ts_ms = vote.height.0,
                     voter = ?vote.voter,
                     "View synchronization: advancing view to match verified vote"
                 );
@@ -3113,11 +3128,17 @@ impl BftState {
     /// Updates committed_height/hash, buffers recently committed hashes for dedup,
     /// resets backoff tracking, and cleans up old state. Returns removed block hashes
     /// for fetch cancellation.
-    fn record_block_committed(&mut self, block: &Block, block_hash: Hash) -> Vec<Hash> {
+    fn record_block_committed(
+        &mut self,
+        block: &Block,
+        block_hash: Hash,
+        commit_ts_ms: u64,
+    ) -> Vec<Hash> {
         let height = block.height().0;
 
         self.committed_height = height;
         self.committed_hash = block_hash;
+        self.committed_ts_ms = commit_ts_ms;
         self.committed_state_root = block.header().state_root;
 
         // Buffer committed hashes so collect_qc_chain_hashes can
@@ -3199,7 +3220,8 @@ impl BftState {
             let parent_state_root = self.committed_state_root;
             let parent_block_height = self.committed_height;
 
-            let removed_blocks = self.record_block_committed(&block, current_hash);
+            let removed_blocks =
+                self.record_block_committed(&block, current_hash, current_qc.weighted_timestamp_ms);
             self.record_leader_activity();
 
             for block_hash in removed_blocks {
@@ -3473,7 +3495,8 @@ impl BftState {
 
         // Advance committed_height. The QC is the proof of commit — same
         // timing as the consensus path.
-        let removed_blocks = self.record_block_committed(&block, block_hash);
+        let removed_blocks =
+            self.record_block_committed(&block, block_hash, qc.weighted_timestamp_ms);
 
         // Track sync progress for the loop iterator.
         self.sync.set_sync_applied_height(height);
@@ -4165,12 +4188,13 @@ impl BftState {
             .retain(|height, _| *height > committed_height);
 
         // Prune committed_tx_lookup entries older than the retention window.
-        // This map is used for proposal dedup — transactions committed far in the
-        // past will have been evicted from mempool already, so stale entries just
-        // waste memory.
-        let tx_lookup_cutoff = committed_height.saturating_sub(COMMITTED_TX_RETENTION_BLOCKS);
+        // This map is used for proposal dedup — transactions committed far in
+        // the past will have been evicted from mempool already, so stale
+        // entries just waste memory.
+        let retention_ms = COMMITTED_TX_RETENTION.as_millis() as u64;
+        let tx_lookup_cutoff_ms = self.committed_ts_ms.saturating_sub(retention_ms);
         self.committed_tx_lookup
-            .retain(|_, height| height.0 > tx_lookup_cutoff);
+            .retain(|_, ts_ms| *ts_ms > tx_lookup_cutoff_ms);
 
         // Remote headers are pruned per-shard-tip in insert_remote_header(),
         // not by local committed height (remote shards have independent heights).
@@ -4451,20 +4475,22 @@ impl BftState {
     /// Called by the node state layer after mempool processes a committed block.
     /// Validators use this to verify that conflicts
     /// reference transactions that were actually committed at the claimed height.
-    pub fn register_committed_transactions(&mut self, tx_hashes: &[Hash], height: BlockHeight) {
+    pub fn register_committed_transactions(&mut self, tx_hashes: &[Hash], commit_ts_ms: u64) {
         for tx_hash in tx_hashes {
             // A tx should only be committed once. Log if we see a duplicate.
             if let Some(&existing) = self.committed_tx_lookup.get(tx_hash) {
-                if existing != height {
+                if existing != commit_ts_ms {
                     tracing::warn!(
                         tx_hash = %tx_hash,
-                        existing_height = existing.0,
-                        new_height = height.0,
-                        "Transaction committed at two different heights!"
+                        existing_ts_ms = existing,
+                        new_ts_ms = commit_ts_ms,
+                        "Transaction committed at two different timestamps!"
                     );
                 }
             }
-            self.committed_tx_lookup.entry(*tx_hash).or_insert(height);
+            self.committed_tx_lookup
+                .entry(*tx_hash)
+                .or_insert(commit_ts_ms);
         }
         // Remove only this block's tx hashes from the bridge buffer.
         // Other blocks may have committed but not yet been processed by the

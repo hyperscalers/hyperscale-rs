@@ -20,6 +20,7 @@ mod identifiers;
 mod network;
 mod proofs;
 mod signing;
+mod timeouts;
 
 // Consensus types
 mod block;
@@ -89,6 +90,7 @@ pub use receipt::{
 };
 pub use signer_bitfield::SignerBitfield;
 pub use state::{StateEntry, StateProvision};
+pub use timeouts::{REMOTE_HEADER_RETENTION, WAVE_TIMEOUT};
 pub use topology::{node_id_hash_u64, shard_for_node, TopologySnapshot, TopologySnapshotError};
 pub use transaction::{
     sign_and_notarize, sign_and_notarize_with_options, ReadyTransactions, RoutableTransaction,

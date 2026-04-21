@@ -17,13 +17,19 @@ use tracing::instrument;
 /// improving batching and fairness.
 pub const DEFAULT_MIN_DWELL_TIME: Duration = Duration::from_millis(150);
 
-/// Number of blocks to retain evicted transactions for peer fetch requests.
-/// This allows slow validators to catch up and fetch transactions from peers
-/// even after the transaction has been evicted from the active pool.
-const TRANSACTION_RETENTION_BLOCKS: u64 = 50;
+/// How long to retain evicted transactions for peer fetch requests. Allows
+/// slow validators to catch up and fetch transactions from peers even after
+/// the transaction has been evicted from the active pool. Measured against
+/// `current_ts_ms` (BFT-authenticated weighted timestamp of the last
+/// committed block).
+const TRANSACTION_RETENTION: Duration = Duration::from_secs(30);
 
-/// How many blocks to retain tombstones in the mempool (gossip deduplication).
-const TOMBSTONE_RETENTION_BLOCKS: u64 = 500;
+/// How long to retain tombstones in the mempool (gossip deduplication).
+/// Measured against `current_ts_ms` (BFT-authenticated weighted timestamp
+/// of the last committed block). Paired with BFT's `COMMITTED_TX_RETENTION`
+/// — both must cover the longest plausible late-gossip window so stale
+/// transactions don't get re-accepted.
+const TOMBSTONE_RETENTION: Duration = Duration::from_secs(300);
 
 /// Default backpressure limit.
 ///
@@ -181,13 +187,16 @@ pub struct MempoolState {
     /// Tombstones for transactions that have reached terminal states.
     /// Prevents re-adding completed/aborted/retried transactions via gossip.
     /// Maps: tx_hash -> block_height when tombstoned (for cleanup)
-    tombstones: HashMap<Hash, BlockHeight>,
+    /// Tombstones keyed by tx_hash → `current_ts_ms` at insertion. Retention
+    /// compares against that timestamp, not block height.
+    tombstones: HashMap<Hash, u64>,
 
     /// Recently evicted transactions kept for peer fetch requests.
     /// Maps tx_hash -> (transaction, eviction_height).
     /// Transactions are moved here when evicted, then pruned after
-    /// TRANSACTION_RETENTION_BLOCKS to allow slow peers to fetch them.
-    recently_evicted: HashMap<Hash, (Arc<RoutableTransaction>, BlockHeight)>,
+    /// TRANSACTION_RETENTION to allow slow peers to fetch them.
+    /// Value = `(tx, evicted_at_ts_ms)`.
+    recently_evicted: HashMap<Hash, (Arc<RoutableTransaction>, u64)>,
 
     /// Cached set of locked nodes (incrementally maintained).
     /// A node is locked if any transaction that declares it is in Committed or Executed status.
@@ -238,6 +247,11 @@ pub struct MempoolState {
     /// Current committed block height (for retry transaction creation).
     current_height: BlockHeight,
 
+    /// BFT-authenticated weighted timestamp (ms) of the last locally committed
+    /// block. "Now" reference for retention windows that must be deterministic
+    /// across validators and independent of block production rate.
+    current_ts_ms: u64,
+
     /// Configuration for mempool behavior.
     config: MempoolConfig,
 }
@@ -281,6 +295,7 @@ impl MempoolState {
             in_flight_by_height: BTreeMap::new(),
             now: Duration::ZERO,
             current_height: BlockHeight(0),
+            current_ts_ms: 0,
             config,
         }
     }
@@ -398,7 +413,7 @@ impl MempoolState {
     ///
     /// This removes the transaction from the pool and moves it to the
     /// recently_evicted cache so slow peers can still fetch it. The cache
-    /// is pruned after TRANSACTION_RETENTION_BLOCKS.
+    /// is pruned after `TRANSACTION_RETENTION`.
     ///
     /// Also adds the transaction to the tombstone set to prevent it from
     /// being re-added via gossip. Terminal states include:
@@ -442,9 +457,9 @@ impl MempoolState {
         // Move transaction to recently_evicted cache instead of discarding
         if let Some(entry) = self.pool.remove(&tx_hash) {
             self.recently_evicted
-                .insert(tx_hash, (entry.tx, self.current_height));
+                .insert(tx_hash, (entry.tx, self.current_ts_ms));
         }
-        self.tombstones.insert(tx_hash, self.current_height);
+        self.tombstones.insert(tx_hash, self.current_ts_ms);
     }
 
     /// Check if a transaction hash is tombstoned (reached terminal state).
@@ -452,14 +467,12 @@ impl MempoolState {
         self.tombstones.contains_key(tx_hash)
     }
 
-    /// Prune recently evicted transactions older than TRANSACTION_RETENTION_BLOCKS.
+    /// Prune recently evicted transactions older than TRANSACTION_RETENTION.
     fn prune_recently_evicted(&mut self) {
-        let cutoff = self
-            .current_height
-            .0
-            .saturating_sub(TRANSACTION_RETENTION_BLOCKS);
+        let retention_ms = TRANSACTION_RETENTION.as_millis() as u64;
+        let cutoff_ms = self.current_ts_ms.saturating_sub(retention_ms);
         self.recently_evicted
-            .retain(|_, (_, height)| height.0 > cutoff);
+            .retain(|_, (_, evicted_at_ts_ms)| *evicted_at_ts_ms > cutoff_ms);
     }
 
     /// Process a committed block - update statuses and finalize transactions.
@@ -482,6 +495,7 @@ impl MempoolState {
         let mut actions = Vec::new();
 
         self.current_height = height;
+        self.current_ts_ms = certified.qc.weighted_timestamp_ms;
 
         // Prune old entries from recently_evicted cache
         self.prune_recently_evicted();
@@ -1285,31 +1299,24 @@ impl MempoolState {
     }
 
     /// Clean up old tombstones using the default retention window.
-    pub fn cleanup_default_tombstones(&mut self, current_height: BlockHeight) -> usize {
-        self.cleanup_old_tombstones(current_height, TOMBSTONE_RETENTION_BLOCKS)
+    pub fn cleanup_default_tombstones(&mut self) -> usize {
+        self.cleanup_old_tombstones(TOMBSTONE_RETENTION)
     }
 
-    /// Clean up old tombstones and completed winners to prevent unbounded memory growth.
+    /// Clean up old tombstones to prevent unbounded memory growth.
     ///
-    /// Tombstones are kept for `retention_blocks` after creation to ensure gossip
-    /// propagation has completed. After that, they can be safely removed since any
-    /// late-arriving gossip for a very old transaction is likely stale anyway.
+    /// Tombstones are kept for `retention` after creation to ensure gossip
+    /// propagation has completed. After that, they can be safely removed since
+    /// any late-arriving gossip for a very old transaction is likely stale
+    /// anyway. Anchored on `current_ts_ms` (updated in `on_block_committed`).
     ///
-    /// # Parameters
-    /// - `current_height`: The current block height
-    /// - `retention_blocks`: Number of blocks to retain tombstones after creation
-    ///
-    /// # Returns
-    /// Number of tombstones cleaned up
-    pub fn cleanup_old_tombstones(
-        &mut self,
-        current_height: BlockHeight,
-        retention_blocks: u64,
-    ) -> usize {
-        let cutoff = current_height.0.saturating_sub(retention_blocks);
+    /// Returns the number of tombstones cleaned up.
+    pub fn cleanup_old_tombstones(&mut self, retention: Duration) -> usize {
+        let retention_ms = retention.as_millis() as u64;
+        let cutoff_ms = self.current_ts_ms.saturating_sub(retention_ms);
         let before_count = self.tombstones.len();
 
-        self.tombstones.retain(|_, height| height.0 > cutoff);
+        self.tombstones.retain(|_, ts_ms| *ts_ms > cutoff_ms);
 
         before_count - self.tombstones.len()
     }
@@ -1418,12 +1425,19 @@ mod tests {
         }
     }
 
-    /// Pair a test `Block` with a matching zeroed QC so it satisfies the
-    /// `CertifiedBlock` pairing invariant. Tests use this to construct the
-    /// committed-block argument for `on_block_committed`.
+    /// Nominal block spacing used by tests to synthesize `weighted_timestamp_ms`
+    /// from block heights. Ratios against retention constants below preserve
+    /// the old "block count" intuition when reading the tests.
+    const TEST_BLOCK_INTERVAL_MS: u64 = 500;
+
+    /// Pair a test `Block` with a matching zeroed QC (weighted_timestamp_ms
+    /// stamped from `height * TEST_BLOCK_INTERVAL_MS`) so it satisfies the
+    /// `CertifiedBlock` pairing invariant and advances the mempool's
+    /// timestamp anchor on commit.
     fn certify(block: Block) -> CertifiedBlock {
         let qc = QuorumCertificate {
             block_hash: block.hash(),
+            weighted_timestamp_ms: block.height().0 * TEST_BLOCK_INTERVAL_MS,
             ..QuorumCertificate::genesis()
         };
         CertifiedBlock::new_unchecked(block, qc)
@@ -1645,15 +1659,18 @@ mod tests {
             mempool.on_block_committed(&topology, &certify(commit_block));
         }
 
-        // Should have 5 tombstones
+        // Should have 5 tombstones, created at ts 500..=2500 ms.
         assert_eq!(mempool.tombstone_count(), 5);
 
-        // Cleanup with short retention - should remove some
-        let cleaned = mempool.cleanup_old_tombstones(BlockHeight(110), 5);
+        // Advance current_ts_ms to simulate later progress; short retention
+        // keeps only very recent tombstones, so older ones are cleaned.
+        mempool.current_ts_ms = 3_500;
+        let cleaned = mempool.cleanup_old_tombstones(Duration::from_millis(1_500));
         assert!(cleaned > 0, "Should have cleaned up some tombstones");
 
-        // Cleanup with long retention - should remove all remaining
-        let _cleaned = mempool.cleanup_old_tombstones(BlockHeight(200), 5);
+        // Advance further and use zero retention — removes everything.
+        mempool.current_ts_ms = 10_000;
+        let _cleaned = mempool.cleanup_old_tombstones(Duration::ZERO);
         assert_eq!(mempool.tombstone_count(), 0);
     }
 

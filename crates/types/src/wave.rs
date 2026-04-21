@@ -299,10 +299,10 @@ pub struct ExecutionVote {
     /// Consensus height at which this vote was cast.
     ///
     /// Validators vote at each block commit where the wave is complete.
-    /// Including `vote_height` in the BLS-signed message prevents
+    /// Including `vote_anchor_ts_ms` in the BLS-signed message prevents
     /// cross-height aggregation, ensuring that if an abort intent changes
     /// the global_receipt_root between heights, stale votes cannot combine.
-    pub vote_height: u64,
+    pub vote_anchor_ts_ms: u64,
     /// Which wave within the block.
     pub wave_id: WaveId,
     /// Which shard produced this vote.
@@ -338,9 +338,9 @@ pub struct ExecutionCertificate {
     pub wave_id: WaveId,
     /// Consensus height at which quorum was reached.
     ///
-    /// Must match the `vote_height` in the aggregated votes. Needed to
+    /// Must match the `vote_anchor_ts_ms` in the aggregated votes. Needed to
     /// reconstruct the BLS signing message for signature verification.
-    pub vote_height: u64,
+    pub vote_anchor_ts_ms: u64,
     /// Merkle root over per-tx outcome leaves.
     pub global_receipt_root: Hash,
     /// Per-transaction outcomes (in wave order = block order).
@@ -360,7 +360,7 @@ impl std::fmt::Debug for ExecutionCertificate {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ExecutionCertificate")
             .field("wave_id", &self.wave_id)
-            .field("vote_height", &self.vote_height)
+            .field("vote_anchor_ts_ms", &self.vote_anchor_ts_ms)
             .field("global_receipt_root", &self.global_receipt_root)
             .field("tx_outcomes", &self.tx_outcomes)
             .field("aggregated_signature", &self.aggregated_signature)
@@ -374,7 +374,7 @@ impl Clone for ExecutionCertificate {
     fn clone(&self) -> Self {
         Self {
             wave_id: self.wave_id.clone(),
-            vote_height: self.vote_height,
+            vote_anchor_ts_ms: self.vote_anchor_ts_ms,
             global_receipt_root: self.global_receipt_root,
             tx_outcomes: self.tx_outcomes.clone(),
             aggregated_signature: self.aggregated_signature,
@@ -389,7 +389,7 @@ impl PartialEq for ExecutionCertificate {
     fn eq(&self, other: &Self) -> bool {
         self.canonical_hash == other.canonical_hash
             && self.wave_id == other.wave_id
-            && self.vote_height == other.vote_height
+            && self.vote_anchor_ts_ms == other.vote_anchor_ts_ms
             && self.global_receipt_root == other.global_receipt_root
             && self.tx_outcomes == other.tx_outcomes
             && self.aggregated_signature == other.aggregated_signature
@@ -410,7 +410,7 @@ impl<E: sbor::Encoder<sbor::NoCustomValueKind>> sbor::Encode<sbor::NoCustomValue
     fn encode_body(&self, encoder: &mut E) -> Result<(), sbor::EncodeError> {
         encoder.write_size(6)?;
         encoder.encode(&self.wave_id)?;
-        encoder.encode(&self.vote_height)?;
+        encoder.encode(&self.vote_anchor_ts_ms)?;
         encoder.encode(&self.global_receipt_root)?;
         encoder.encode(&self.tx_outcomes)?;
         encoder.encode(&self.aggregated_signature)?;
@@ -435,16 +435,20 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
             });
         }
         let wave_id: WaveId = decoder.decode()?;
-        let vote_height: u64 = decoder.decode()?;
+        let vote_anchor_ts_ms: u64 = decoder.decode()?;
         let global_receipt_root: Hash = decoder.decode()?;
         let tx_outcomes: Vec<TxOutcome> = decoder.decode()?;
         let aggregated_signature: Bls12381G2Signature = decoder.decode()?;
         let signers: SignerBitfield = decoder.decode()?;
-        let canonical_hash =
-            Self::compute_canonical_hash(&wave_id, vote_height, &global_receipt_root, &tx_outcomes);
+        let canonical_hash = Self::compute_canonical_hash(
+            &wave_id,
+            vote_anchor_ts_ms,
+            &global_receipt_root,
+            &tx_outcomes,
+        );
         let mut ec = Self {
             wave_id,
-            vote_height,
+            vote_anchor_ts_ms,
             global_receipt_root,
             tx_outcomes,
             aggregated_signature,
@@ -476,17 +480,21 @@ impl ExecutionCertificate {
     /// Create a new execution certificate, computing the canonical hash eagerly.
     pub fn new(
         wave_id: WaveId,
-        vote_height: u64,
+        vote_anchor_ts_ms: u64,
         global_receipt_root: Hash,
         tx_outcomes: Vec<TxOutcome>,
         aggregated_signature: Bls12381G2Signature,
         signers: SignerBitfield,
     ) -> Self {
-        let canonical_hash =
-            Self::compute_canonical_hash(&wave_id, vote_height, &global_receipt_root, &tx_outcomes);
+        let canonical_hash = Self::compute_canonical_hash(
+            &wave_id,
+            vote_anchor_ts_ms,
+            &global_receipt_root,
+            &tx_outcomes,
+        );
         let mut ec = Self {
             wave_id,
-            vote_height,
+            vote_anchor_ts_ms,
             global_receipt_root,
             tx_outcomes,
             aggregated_signature,
@@ -530,13 +538,13 @@ impl ExecutionCertificate {
 
     fn compute_canonical_hash(
         wave_id: &WaveId,
-        vote_height: u64,
+        vote_anchor_ts_ms: u64,
         global_receipt_root: &Hash,
         tx_outcomes: &[TxOutcome],
     ) -> Hash {
         let mut hasher = blake3::Hasher::new();
         hasher.update(&basic_encode(wave_id).unwrap());
-        hasher.update(&vote_height.to_le_bytes());
+        hasher.update(&vote_anchor_ts_ms.to_le_bytes());
         hasher.update(global_receipt_root.as_bytes());
         hasher.update(&basic_encode(tx_outcomes).unwrap());
         Hash::from_hash_bytes(hasher.finalize().as_bytes())
@@ -635,7 +643,7 @@ impl WaveCertificate {
     ///
     /// Hashes sorted (shard_group_id, canonical_hash) pairs. The vec is
     /// pre-sorted at construction time for deterministic ordering.
-    /// canonical_hash already encodes the WaveId, vote_height,
+    /// canonical_hash already encodes the WaveId, vote_anchor_ts_ms,
     /// global_receipt_root, and all tx_outcomes — so this commits to
     /// the full content of every contributing EC.
     pub fn receipt_hash(&self) -> Hash {

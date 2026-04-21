@@ -63,8 +63,10 @@ pub struct CompletionData {
     pub block_hash: Hash,
     /// Block height (= wave_starting_height).
     pub block_height: u64,
-    /// Relative vote height (blocks since wave started).
-    pub vote_height: u64,
+    /// BFT-authenticated weighted timestamp (ms) at which this wave's outcome
+    /// is fixed. Included in the vote payload and the EC canonical hash, so all
+    /// validators aggregate under the same identifier.
+    pub vote_anchor_ts_ms: u64,
     /// Wave identifier.
     pub wave_id: WaveId,
     /// Merkle root over per-tx outcome leaves (cross-shard agreement).
@@ -101,7 +103,9 @@ pub struct ExecutionMemoryStats {
 ///
 /// Handles transaction execution after blocks are committed.
 pub struct ExecutionState {
-    /// Current time.
+    /// Local wall-clock "now" — kept for symmetry with the other sub-state
+    /// machines even though execution's deterministic timeouts all anchor on
+    /// `committed_ts_ms` (the QC's weighted timestamp).
     now: Duration,
 
     /// Finalized wave certificates ready for block inclusion.
@@ -110,6 +114,11 @@ pub struct ExecutionState {
 
     /// Current committed height for pruning stale entries.
     committed_height: u64,
+
+    /// BFT-authenticated weighted timestamp (ms) of the last locally committed
+    /// block. "Now" reference for timeouts that must be deterministic across
+    /// validators and independent of block production rate.
+    committed_ts_ms: u64,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Provisioning
@@ -187,8 +196,9 @@ pub struct ExecutionState {
 
     /// Fulfilled execution cert keys — prevents late-arriving duplicate headers
     /// from re-registering expectations after certs have already been received.
-    /// Maps (source_shard, block_height, wave_id) → local_height_when_fulfilled
-    /// for age-based pruning using local time.
+    /// Maps `(source_shard, block_height, wave_id)` → `committed_ts_ms` when the
+    /// cert was received, for age-based pruning anchored on the committing QC's
+    /// `weighted_timestamp_ms`.
     fulfilled_exec_certs: HashMap<(ShardGroupId, u64, WaveId), u64>,
 }
 
@@ -209,43 +219,67 @@ impl Default for ExecutionState {
 struct BufferedEc {
     ec: Arc<ExecutionCertificate>,
     pending_txs: HashSet<Hash>,
+    /// Local weighted timestamp (ms) when this EC was first buffered. Used
+    /// by `prune_stale_buffered_ecs` to drop entries older than
+    /// `EC_BUFFER_RETENTION`.
+    buffered_at_ts_ms: u64,
 }
 
 /// Tracks an expected execution certificate that hasn't arrived yet.
 #[derive(Debug, Clone)]
 struct ExpectedExecCert {
-    /// Local committed height when we first learned about this expected cert.
-    discovered_at: u64,
-    /// Local committed height when we last sent a fallback request, if any.
+    /// Local weighted timestamp (ms) when we first learned about this cert.
+    discovered_at_ts_ms: u64,
+    /// Local weighted timestamp (ms) when we last sent a fallback request.
     /// `None` means never requested. Allows periodic re-requests with cooldown.
-    last_requested_at: Option<u64>,
+    last_requested_at_ts_ms: Option<u64>,
 }
 
-/// Number of blocks to wait before the first fallback request.
-const EXEC_CERT_FALLBACK_TIMEOUT_BLOCKS: u64 = 10;
+/// How long to wait before the first fallback request. Anchored on the
+/// committing QC's `weighted_timestamp_ms`, so the window stays meaningful
+/// regardless of local block production rate. Sized comfortably below
+/// `WAVE_TIMEOUT` so fallback fetches rescue missing ECs before the wave
+/// aborts.
+const EXEC_CERT_FALLBACK_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Number of blocks between repeated fallback requests for the same cert.
-const EXEC_CERT_RETRY_INTERVAL_BLOCKS: u64 = 20;
+/// Interval between repeated fallback requests for the same cert.
+const EXEC_CERT_RETRY_INTERVAL: Duration = Duration::from_secs(10);
 
-/// Blocks to wait before retrying a vote with the next rotated wave leader.
+/// How long to wait before retrying a vote with the next rotated wave leader.
 /// Must exceed typical wave-leader aggregation latency so we don't rotate
-/// past a leader that's about to succeed.
-const VOTE_RETRY_BLOCKS: u64 = 16;
+/// past a leader that's about to succeed. Measured against the BFT-
+/// authenticated `weighted_timestamp_ms` of locally committed blocks.
+const VOTE_RETRY_TIMEOUT: Duration = Duration::from_secs(8);
 
-/// Blocks to retain committed remote provisions in `ConflictDetector` for
+/// How long to retain committed remote provisions in `ConflictDetector` for
 /// reverse conflict detection. A local tx that hasn't registered against a
-/// stored provision this many blocks after its commit can't conflict with it
-/// — its own block has long committed. Anything older is dropped to bound the
-/// detector's memory and per-block iteration cost (see
-/// `ConflictDetector::prune_provisions_older_than`).
-const CONFLICT_PROVISION_RETENTION_BLOCKS: u64 = 50;
+/// stored provision after this window can't conflict with it — its own block
+/// has long committed. Anything older is dropped to bound the detector's
+/// memory and per-block iteration cost (see
+/// `ConflictDetector::prune_provisions_older_than`). Anchored on the
+/// committing QC's `weighted_timestamp_ms`.
+const CONFLICT_PROVISION_RETENTION: Duration = Duration::from_secs(30);
 
-/// Maximum age (in local committed blocks past the EC's source block height)
-/// before a buffered EC is considered stale and evicted. Bounds the leak from
-/// ECs whose tx_hashes never land in a local block (orphaned txs, malicious
-/// or buggy remotes referencing tx_hashes our shard will never see).
-/// Sized well above the longest plausible cross-shard inclusion lag.
-const EC_BUFFER_RETENTION_BLOCKS: u64 = 200;
+/// Maximum age before a buffered EC is considered stale and evicted. Bounds
+/// the leak from ECs whose tx_hashes never land in a local block (orphaned
+/// txs, malicious or buggy remotes referencing tx_hashes our shard will never
+/// see). Sized well above the longest plausible cross-shard inclusion lag
+/// so a legitimate late-arriving EC isn't evicted before it can be routed.
+/// Anchored on the committing QC's `weighted_timestamp_ms` via each
+/// `BufferedEc.buffered_at_ts_ms`.
+const EC_BUFFER_RETENTION: Duration = Duration::from_secs(60);
+
+/// How long to retain `fulfilled_exec_certs` entries after the EC landed.
+/// Guards against late-arriving duplicate headers re-registering the expectation.
+/// Sized above `EC_BUFFER_RETENTION` so any duplicate still in flight finds
+/// its tombstone. Anchored on committing QC's `weighted_timestamp_ms`.
+const FULFILLED_EXEC_CERT_RETENTION: Duration = Duration::from_secs(60);
+
+/// How long to retain unmatched `early_votes` whose block never committed
+/// locally. A non-arrival past this window indicates BFT is broken; entries
+/// are dropped to bound memory. Anchored on `vote_anchor_ts_ms` embedded in
+/// the vote vs the committing QC's `weighted_timestamp_ms`.
+const EARLY_VOTE_RETENTION: Duration = Duration::from_secs(30);
 
 /// Tracks a pending vote sent to a wave leader, for retry on timeout.
 ///
@@ -255,11 +289,14 @@ const EC_BUFFER_RETENTION_BLOCKS: u64 = 200;
 /// still need a leader to aggregate the timeout votes).
 #[derive(Debug, Clone)]
 struct PendingVoteRetry {
-    sent_at_height: u64,
+    /// Local weighted timestamp (ms) when this vote was last dispatched.
+    /// Compared against `committed_ts_ms` to detect leader aggregation
+    /// timeouts independently of block production rate.
+    sent_at_ts_ms: u64,
     attempt: u32,
     block_hash: Hash,
     block_height: u64,
-    vote_height: u64,
+    vote_anchor_ts_ms: u64,
     global_receipt_root: Hash,
     tx_outcomes: Arc<Vec<TxOutcome>>,
 }
@@ -341,6 +378,7 @@ impl ExecutionState {
             now: Duration::ZERO,
             finalized_wave_certificates: BTreeMap::new(),
             committed_height: 0,
+            committed_ts_ms: 0,
             waves: HashMap::new(),
             vote_trackers: HashMap::new(),
             waves_with_ec: HashSet::new(),
@@ -362,7 +400,7 @@ impl ExecutionState {
     // Time Management
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /// Set the current time.
+    /// Set the current wall-clock time.
     pub fn set_time(&mut self, now: Duration) {
         self.now = now;
     }
@@ -433,6 +471,7 @@ impl ExecutionState {
         topology: &TopologySnapshot,
         block_hash: Hash,
         block_height: u64,
+        block_ts_ms: u64,
         transactions: &[Arc<RoutableTransaction>],
     ) -> (Vec<Action>, Vec<ExecutionVote>) {
         let waves = self.assign_waves(topology, block_height, transactions);
@@ -490,19 +529,20 @@ impl ExecutionState {
                 }
             }
 
-            // Create the WaveState. For single-shard waves, `all_provisioned_at`
-            // is set to `block_height` immediately by the constructor.
+            // Create the WaveState. For single-shard waves,
+            // `all_provisioned_at_ts_ms` is set to `wave_start_ts_ms`
+            // immediately by the constructor.
             let mut wave_state = WaveState::new(
                 wave_id.clone(),
                 block_hash,
-                block_height,
+                block_ts_ms,
                 txs,
                 is_single_shard,
             );
 
             // Apply the deadlock-resolving reverse conflicts collected above.
             for conflict in reverse_conflicts {
-                wave_state.record_abort(conflict.loser_tx, conflict.committed_at_height);
+                wave_state.record_abort(conflict.loser_tx, conflict.committed_at_ts_ms);
             }
 
             // For cross-shard waves: fold in any provisions that already arrived
@@ -519,7 +559,7 @@ impl ExecutionState {
                                     .is_some_and(|received| required.is_subset(received))
                             });
                     if all_ready {
-                        wave_state.mark_tx_provisioned(tx_hash, block_height);
+                        wave_state.mark_tx_provisioned(tx_hash, block_ts_ms);
                     }
                 }
             }
@@ -588,11 +628,11 @@ impl ExecutionState {
     ///
     /// A wave can emit a vote when:
     /// 1. It's fully provisioned and every tx has an outcome, OR
-    /// 2. The `WAVE_TIMEOUT_BLOCKS` deadline has passed (wave aborts entirely)
+    /// 2. The `WAVE_TIMEOUT` deadline has passed (wave aborts entirely)
     ///
     /// Waves that already had an EC formed are skipped.
     pub fn scan_complete_waves(&mut self) -> Vec<CompletionData> {
-        let committed_height = self.committed_height;
+        let committed_ts_ms = self.committed_ts_ms;
         let waves_with_ec = &self.waves_with_ec;
 
         let votable_wave_ids: Vec<WaveId> = self
@@ -601,7 +641,7 @@ impl ExecutionState {
             .filter(|(wid, w)| {
                 !waves_with_ec.contains(wid)
                     && !w.local_ec_emitted()
-                    && w.can_emit_vote(committed_height)
+                    && w.can_emit_vote(committed_ts_ms)
             })
             .map(|(wid, _)| wid.clone())
             .collect();
@@ -611,8 +651,8 @@ impl ExecutionState {
             let wave = self.waves.get_mut(&wave_id).unwrap();
             let block_hash = wave.block_hash();
             let block_height = wave.block_height();
-            let Some((vote_height, global_receipt_root, tx_outcomes)) =
-                wave.build_vote_data(committed_height)
+            let Some((vote_anchor_ts_ms, global_receipt_root, tx_outcomes)) =
+                wave.build_vote_data(committed_ts_ms)
             else {
                 continue;
             };
@@ -620,7 +660,7 @@ impl ExecutionState {
             completions.push(CompletionData {
                 block_hash,
                 block_height,
-                vote_height,
+                vote_anchor_ts_ms,
                 wave_id,
                 global_receipt_root,
                 tx_outcomes,
@@ -690,9 +730,10 @@ impl ExecutionState {
     ///
     /// This is the SINGLE path to execution voting. Call after conflicts
     /// have been processed so wave state is deterministic at this height.
-    /// Each vote is sent to the wave leader (unicast). The `vote_height` is a
-    /// relative offset determined by the wave (either `all_provisioned_at -
-    /// block_height` or `WAVE_TIMEOUT_BLOCKS` for timeout-abort).
+    /// Each vote is sent to the wave leader (unicast). The `vote_anchor_ts_ms`
+    /// is the BFT-authenticated weighted timestamp determined by the wave
+    /// (either `all_provisioned_at_ts_ms`, or `wave_start_ts_ms + WAVE_TIMEOUT`
+    /// for timeout-abort).
     pub fn emit_vote_actions(&mut self, topology: &TopologySnapshot) -> Vec<Action> {
         let committee = topology.local_committee().to_vec();
         let local_vid = topology.local_validator_id();
@@ -707,11 +748,11 @@ impl ExecutionState {
                 self.pending_vote_retries.insert(
                     completion.wave_id.clone(),
                     PendingVoteRetry {
-                        sent_at_height: self.committed_height,
+                        sent_at_ts_ms: self.committed_ts_ms,
                         attempt: 0,
                         block_hash: completion.block_hash,
                         block_height: completion.block_height,
-                        vote_height: completion.vote_height,
+                        vote_anchor_ts_ms: completion.vote_anchor_ts_ms,
                         global_receipt_root: completion.global_receipt_root,
                         tx_outcomes: Arc::clone(&tx_outcomes),
                     },
@@ -720,7 +761,7 @@ impl ExecutionState {
             actions.push(Action::SignAndSendExecutionVote {
                 block_hash: completion.block_hash,
                 block_height: completion.block_height,
-                vote_height: completion.vote_height,
+                vote_anchor_ts_ms: completion.vote_anchor_ts_ms,
                 wave_id: completion.wave_id,
                 global_receipt_root: completion.global_receipt_root,
                 tx_outcomes: (*tx_outcomes).clone(),
@@ -758,6 +799,7 @@ impl ExecutionState {
         topology: &TopologySnapshot,
         batches: &[Arc<Provision>],
         committed_height: u64,
+        committed_ts_ms: u64,
     ) -> Vec<Action> {
         // Sort for deterministic phase-2 iteration (logs, action vector order).
         let mut ordered: Vec<&Arc<Provision>> = batches.iter().collect();
@@ -776,7 +818,6 @@ impl ExecutionState {
                     target_shard: topology.local_shard(),
                     source_shard,
                     block_height: batch.block_height,
-                    block_timestamp: 0,
                     entries: Arc::new(tx_entry.entries.clone()),
                 }];
                 self.verified_provisions
@@ -803,7 +844,7 @@ impl ExecutionState {
             let source_shard = batch.source_shard;
             for conflict in self
                 .conflict_detector
-                .detect_conflicts(batch, committed_height)
+                .detect_conflicts(batch, committed_ts_ms)
             {
                 let loser = conflict.loser_tx;
                 let already_provisioned =
@@ -826,7 +867,7 @@ impl ExecutionState {
                 if wave.dispatched() {
                     continue;
                 }
-                wave.record_abort(loser, conflict.committed_at_height);
+                wave.record_abort(loser, conflict.committed_at_ts_ms);
                 affected_waves.insert(wave_id);
                 tracing::debug!(
                     loser_tx = %loser,
@@ -861,7 +902,7 @@ impl ExecutionState {
                                 .is_some_and(|received| required.is_subset(received))
                         });
                 if all_ready {
-                    wave.mark_tx_provisioned(*tx_hash, committed_height);
+                    wave.mark_tx_provisioned(*tx_hash, committed_ts_ms);
                 }
             }
 
@@ -960,7 +1001,7 @@ impl ExecutionState {
 
         let tracker = self.vote_trackers.get_mut(&wave_id).unwrap();
 
-        // buffer_unverified_vote handles dedup per (validator, vote_height).
+        // buffer_unverified_vote handles dedup per (validator, vote_anchor_ts_ms).
         // Same validator can vote at multiple heights (round voting).
         if !tracker.buffer_unverified_vote(vote, public_key, voting_power) {
             return vec![];
@@ -1065,7 +1106,8 @@ impl ExecutionState {
             return vec![];
         };
 
-        let Some((global_receipt_root, vote_height, _total_power)) = tracker.check_quorum() else {
+        let Some((global_receipt_root, vote_anchor_ts_ms, _total_power)) = tracker.check_quorum()
+        else {
             return vec![];
         };
 
@@ -1074,11 +1116,11 @@ impl ExecutionState {
         tracing::info!(
             block_hash = ?block_hash,
             wave = %wave_id,
-            vote_height,
+            vote_anchor_ts_ms,
             "Execution vote quorum reached — aggregating certificate"
         );
 
-        let votes = tracker.take_votes(&global_receipt_root, vote_height);
+        let votes = tracker.take_votes(&global_receipt_root, vote_anchor_ts_ms);
         let committee = topology.local_committee().to_vec();
 
         // Remove the vote tracker — this EC is the shard's final answer.
@@ -1206,7 +1248,7 @@ impl ExecutionState {
         let key = (shard, cert.block_height(), cert.wave_id.clone());
         let cleared = self.expected_exec_certs.remove(&key).is_some();
         self.fulfilled_exec_certs
-            .insert(key.clone(), self.committed_height);
+            .insert(key.clone(), self.committed_ts_ms);
 
         let mut actions = Vec::new();
 
@@ -1218,7 +1260,7 @@ impl ExecutionState {
                 source_shard = shard.0,
                 block_height = cert.block_height(),
                 wave = %cert.wave_id,
-                at_local_height = self.committed_height,
+                at_local_ts_ms = self.committed_ts_ms,
                 "Fulfilled expected exec cert"
             );
             actions.push(Action::CancelExecutionCertFetch {
@@ -1354,8 +1396,8 @@ impl ExecutionState {
                 self.expected_exec_certs
                     .entry(key)
                     .or_insert(ExpectedExecCert {
-                        discovered_at: self.committed_height,
-                        last_requested_at: None,
+                        discovered_at_ts_ms: self.committed_ts_ms,
+                        last_requested_at_ts_ms: None,
                     });
             }
         }
@@ -1367,28 +1409,28 @@ impl ExecutionState {
     /// that have exceeded the timeout.
     fn check_exec_cert_timeouts(&mut self, topology: &TopologySnapshot) -> Vec<Action> {
         let mut actions = Vec::new();
-        let current_height = self.committed_height;
+        let now_ms = self.committed_ts_ms;
+        let fallback_ms = EXEC_CERT_FALLBACK_TIMEOUT.as_millis() as u64;
+        let retry_ms = EXEC_CERT_RETRY_INTERVAL.as_millis() as u64;
         for ((source_shard, block_height, wave_id), expected) in &mut self.expected_exec_certs {
-            let age = current_height.saturating_sub(expected.discovered_at);
+            let age_ms = now_ms.saturating_sub(expected.discovered_at_ts_ms);
 
-            let should_request = match expected.last_requested_at {
+            let should_request = match expected.last_requested_at_ts_ms {
                 // Never requested — use initial timeout
-                None => age >= EXEC_CERT_FALLBACK_TIMEOUT_BLOCKS,
+                None => age_ms >= fallback_ms,
                 // Previously requested — use retry interval
-                Some(last) => {
-                    current_height.saturating_sub(last) >= EXEC_CERT_RETRY_INTERVAL_BLOCKS
-                }
+                Some(last) => now_ms.saturating_sub(last) >= retry_ms,
             };
 
             if should_request {
-                let is_retry = expected.last_requested_at.is_some();
-                expected.last_requested_at = Some(current_height);
+                let is_retry = expected.last_requested_at_ts_ms.is_some();
+                expected.last_requested_at_ts_ms = Some(now_ms);
                 let peers = topology.committee_for_shard(*source_shard).to_vec();
                 tracing::info!(
                     source_shard = source_shard.0,
                     block_height = block_height,
                     wave = %wave_id,
-                    age,
+                    age_ms,
                     retry = is_retry,
                     "Execution cert timeout — requesting fallback"
                 );
@@ -1416,36 +1458,39 @@ impl ExecutionState {
         self.expected_exec_certs
             .retain(|(source_shard, _, _), _| shards_needed.contains(source_shard));
 
-        // Prune fulfilled set using local height when fulfilled (not remote
-        // block height, which can differ significantly across shards).
-        let fulfilled_cutoff = self.committed_height.saturating_sub(100);
+        // Prune fulfilled set by wall-clock age of the fulfillment, not remote
+        // block height (which can differ significantly across shards).
+        let fulfilled_cutoff_ms = self
+            .committed_ts_ms
+            .saturating_sub(FULFILLED_EXEC_CERT_RETENTION.as_millis() as u64);
         self.fulfilled_exec_certs
-            .retain(|_, &mut fulfilled_at| fulfilled_at > fulfilled_cutoff);
+            .retain(|_, &mut fulfilled_at_ts_ms| fulfilled_at_ts_ms > fulfilled_cutoff_ms);
 
         actions
     }
 
     /// Re-send votes to rotated leaders for waves that haven't produced an EC.
     ///
-    /// Called during block commit processing. If VOTE_RETRY_BLOCKS have elapsed
-    /// since a vote was sent and no EC has been received, re-send the same vote
-    /// to the next deterministically-rotated leader.
+    /// Called during block commit processing. If `VOTE_RETRY_TIMEOUT` has
+    /// elapsed since a vote was sent and no EC has been received, re-send the
+    /// same vote to the next deterministically-rotated leader.
     fn check_vote_retry_timeouts(&mut self, topology: &TopologySnapshot) -> Vec<Action> {
         let mut actions = Vec::new();
-        let current_height = self.committed_height;
+        let now_ms = self.committed_ts_ms;
+        let timeout_ms = VOTE_RETRY_TIMEOUT.as_millis() as u64;
         let committee = topology.local_committee().to_vec();
 
         // Collect retries first to avoid borrow conflict.
         let retries: Vec<(WaveId, PendingVoteRetry)> = self
             .pending_vote_retries
             .iter()
-            .filter(|(_, p)| current_height.saturating_sub(p.sent_at_height) >= VOTE_RETRY_BLOCKS)
+            .filter(|(_, p)| now_ms.saturating_sub(p.sent_at_ts_ms) >= timeout_ms)
             .map(|(w, p)| (w.clone(), p.clone()))
             .collect();
 
         for (wave_id, mut pending) in retries {
             pending.attempt += 1;
-            pending.sent_at_height = current_height;
+            pending.sent_at_ts_ms = now_ms;
             let new_leader =
                 hyperscale_types::wave_leader_at(&wave_id, pending.attempt, &committee);
 
@@ -1459,7 +1504,7 @@ impl ExecutionState {
             actions.push(Action::SignAndSendExecutionVote {
                 block_hash: pending.block_hash,
                 block_height: pending.block_height,
-                vote_height: pending.vote_height,
+                vote_anchor_ts_ms: pending.vote_anchor_ts_ms,
                 wave_id: wave_id.clone(),
                 global_receipt_root: pending.global_receipt_root,
                 tx_outcomes: (*pending.tx_outcomes).clone(),
@@ -1496,10 +1541,12 @@ impl ExecutionState {
         let block = &certified.block;
         let height = block.height().0;
 
-        // Update committed height before anything else — needed for timeout
-        // calculations and pruning even when there are no new transactions.
+        // Update committed height + timestamp before anything else — needed
+        // for timeout calculations and pruning even when there are no new
+        // transactions.
         if height > self.committed_height {
             self.committed_height = height;
+            self.committed_ts_ms = certified.qc.weighted_timestamp_ms;
         }
 
         let mut actions = Vec::new();
@@ -1511,18 +1558,25 @@ impl ExecutionState {
         self.prune_execution_state();
         self.prune_stale_buffered_ecs();
 
-        for wave in self.waves.values() {
-            wave.log_if_overdue(self.committed_height);
+        for wave in self.waves.values_mut() {
+            wave.log_if_overdue(self.committed_ts_ms);
         }
 
         // Drop conflict-detector entries for remote provisions older than the
         // retention window. `register_tx` iterates over these per cross-shard
         // tx; left unbounded they drive quadratic TPS decay.
-        let cutoff = height.saturating_sub(CONFLICT_PROVISION_RETENTION_BLOCKS);
-        if cutoff > 0 {
-            let dropped = self.conflict_detector.prune_provisions_older_than(cutoff);
+        let retention_ms = CONFLICT_PROVISION_RETENTION.as_millis() as u64;
+        let cutoff_ms = self.committed_ts_ms.saturating_sub(retention_ms);
+        if cutoff_ms > 0 {
+            let dropped = self
+                .conflict_detector
+                .prune_provisions_older_than(cutoff_ms);
             if dropped > 0 {
-                tracing::debug!(dropped, cutoff, "Pruned aged conflict-detector provisions");
+                tracing::debug!(
+                    dropped,
+                    cutoff_ms,
+                    "Pruned aged conflict-detector provisions"
+                );
             }
         }
 
@@ -1575,7 +1629,6 @@ impl ExecutionState {
                     requests,
                     source_shard: local_shard,
                     block_height: BlockHeight(height),
-                    block_timestamp: header.timestamp,
                     shard_recipients,
                 });
             }
@@ -1588,8 +1641,13 @@ impl ExecutionState {
                 "Starting execution for new transactions"
             );
 
-            let (dispatch_actions, early_votes) =
-                self.setup_waves_and_dispatch(topology, block_hash, height, transactions);
+            let (dispatch_actions, early_votes) = self.setup_waves_and_dispatch(
+                topology,
+                block_hash,
+                height,
+                self.committed_ts_ms,
+                transactions,
+            );
             actions.extend(dispatch_actions);
             for vote in early_votes {
                 actions.extend(self.on_execution_vote(topology, vote));
@@ -1601,7 +1659,12 @@ impl ExecutionState {
         // Apply this block's provisions after wave setup so newly-created
         // waves can transition to provisioned from the same block's batches.
         if !provisions.is_empty() {
-            actions.extend(self.apply_committed_provisions(topology, provisions, height));
+            actions.extend(self.apply_committed_provisions(
+                topology,
+                provisions,
+                height,
+                self.committed_ts_ms,
+            ));
         }
 
         actions
@@ -1693,12 +1756,14 @@ impl ExecutionState {
         if tx_hashes.is_empty() {
             return;
         }
+        let now_ms = self.committed_ts_ms;
         let entry = self
             .pending_routing
             .entry(ec.wave_id.clone())
             .or_insert_with(|| BufferedEc {
                 ec: Arc::clone(ec),
                 pending_txs: HashSet::new(),
+                buffered_at_ts_ms: now_ms,
             });
         for tx_hash in tx_hashes {
             if entry.pending_txs.insert(*tx_hash) {
@@ -1726,18 +1791,19 @@ impl ExecutionState {
     }
 
     /// Drop buffered ECs whose source wave is older than
-    /// `EC_BUFFER_RETENTION_BLOCKS` behind the local committed height.
+    /// `EC_BUFFER_RETENTION` behind the committing QC's weighted timestamp.
     /// Covers the leak from tx_hashes that never land in a local block
     /// (orphaned txs, malicious or buggy remotes referencing unknown txs).
     fn prune_stale_buffered_ecs(&mut self) {
-        if self.committed_height < EC_BUFFER_RETENTION_BLOCKS {
+        let retention_ms = EC_BUFFER_RETENTION.as_millis() as u64;
+        if self.committed_ts_ms < retention_ms {
             return;
         }
-        let cutoff = self.committed_height - EC_BUFFER_RETENTION_BLOCKS;
+        let cutoff_ms = self.committed_ts_ms - retention_ms;
         let stale: Vec<WaveId> = self
             .pending_routing
             .iter()
-            .filter(|(wid, _)| wid.block_height <= cutoff)
+            .filter(|(_, entry)| entry.buffered_at_ts_ms <= cutoff_ms)
             .map(|(wid, _)| wid.clone())
             .collect();
         if stale.is_empty() {
@@ -1989,12 +2055,15 @@ impl ExecutionState {
         // Prune early execution votes:
         // - Wave resolved (EC formed) → votes no longer needed
         // - Leader replayed them (VoteTracker exists) → already consumed
-        // - No wave and stale (50+ blocks) → block never committed, BFT broken
+        // - No wave and older than `EARLY_VOTE_RETENTION` → block never
+        //   committed, BFT broken
         //
         // Non-leaders with a wave but no VoteTracker KEEP early votes. They may
         // become fallback leaders via rotation and need to replay them into the
         // on-demand VoteTracker created in on_execution_vote().
-        let ev_cutoff = self.committed_height.saturating_sub(50);
+        let ev_cutoff_ms = self
+            .committed_ts_ms
+            .saturating_sub(EARLY_VOTE_RETENTION.as_millis() as u64);
         let before_ev = self.early_votes.len();
         self.early_votes.retain(|key, votes| {
             if self.waves_with_ec.contains(key) {
@@ -2008,7 +2077,7 @@ impl ExecutionState {
             }
             votes
                 .first()
-                .map(|v| v.block_height > ev_cutoff)
+                .map(|v| v.vote_anchor_ts_ms > ev_cutoff_ms)
                 .unwrap_or(false)
         });
         let pruned_ev = before_ev - self.early_votes.len();
@@ -2518,7 +2587,7 @@ mod tests {
         let fake_vote = ExecutionVote {
             block_hash,
             block_height: 1,
-            vote_height: 0,
+            vote_anchor_ts_ms: 0,
             wave_id: wave_id.clone(),
             shard_group_id: ShardGroupId(0),
             global_receipt_root: Hash::ZERO,
@@ -2545,16 +2614,19 @@ mod tests {
 
         let mut state = make_test_state();
         state.committed_height = 20;
+        // "Now" timestamp exactly VOTE_RETRY_TIMEOUT past the original send.
+        let timeout_ms = VOTE_RETRY_TIMEOUT.as_millis() as u64;
+        state.committed_ts_ms = 10_000 + timeout_ms;
 
-        // Manually insert a pending retry as if we'd sent a vote at height 4.
+        // Manually insert a pending retry as if we'd sent a vote at t=10_000ms.
         state.pending_vote_retries.insert(
             wave_id.clone(),
             PendingVoteRetry {
-                sent_at_height: 4,
+                sent_at_ts_ms: 10_000,
                 attempt: 0,
                 block_hash: Hash::from_bytes(b"block1"),
                 block_height: 1,
-                vote_height: 0,
+                vote_anchor_ts_ms: 0,
                 global_receipt_root: Hash::ZERO,
                 tx_outcomes: Arc::new(vec![]),
             },
@@ -2562,7 +2634,7 @@ mod tests {
 
         let actions = state.check_vote_retry_timeouts(&topo);
 
-        // Height 20 - 4 = 16 >= VOTE_RETRY_BLOCKS (16), so should emit retry.
+        // Elapsed == VOTE_RETRY_TIMEOUT, so should emit retry.
         assert_eq!(actions.len(), 1);
         match &actions[0] {
             Action::SignAndSendExecutionVote {
@@ -2580,10 +2652,10 @@ mod tests {
             ),
         }
 
-        // Pending retry should be updated to attempt 1.
+        // Pending retry should be updated to attempt 1, anchored at current ts.
         let retry = state.pending_vote_retries.get(&wave_id).unwrap();
         assert_eq!(retry.attempt, 1);
-        assert_eq!(retry.sent_at_height, 20);
+        assert_eq!(retry.sent_at_ts_ms, state.committed_ts_ms);
     }
 
     #[test]
@@ -2596,11 +2668,11 @@ mod tests {
         state.pending_vote_retries.insert(
             wave_id.clone(),
             PendingVoteRetry {
-                sent_at_height: 5,
+                sent_at_ts_ms: 5_000,
                 attempt: 0,
                 block_hash: Hash::from_bytes(b"block1"),
                 block_height: 1,
-                vote_height: 0,
+                vote_anchor_ts_ms: 0,
                 global_receipt_root: Hash::ZERO,
                 tx_outcomes: Arc::new(vec![]),
             },
@@ -2725,16 +2797,18 @@ mod tests {
             WaveState::new(
                 local_wave.clone(),
                 Hash::from_bytes(b"block"),
-                10,
+                5_000,
                 vec![(tx, participating)],
                 false,
             ),
         );
         state.wave_assignments.insert(tx_hash, local_wave.clone());
 
-        // Advance committed_height far enough that age-based pruning would
-        // otherwise evict the expectation.
+        // Advance committed time past fallback + retry thresholds so the
+        // age-based gate would fire. The expectation must survive regardless
+        // because a local wave still needs shard 1's EC.
         state.committed_height = 500;
+        state.committed_ts_ms = 60_000;
         let actions = state.check_exec_cert_timeouts(&topo);
 
         assert_eq!(
@@ -2754,6 +2828,7 @@ mod tests {
         state.waves.remove(&local_wave);
         state.wave_assignments.remove(&tx_hash);
         state.committed_height = 600;
+        state.committed_ts_ms = 120_000;
         let _ = state.check_exec_cert_timeouts(&topo);
         assert!(
             state.expected_exec_certs.is_empty(),

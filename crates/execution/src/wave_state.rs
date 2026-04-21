@@ -18,9 +18,8 @@
 //! 3. **Executes atomically** — one `ExecuteTransactions` /
 //!    `ExecuteCrossShardTransactions` action per wave. Results land via
 //!    `record_execution_result`.
-//! 4. **Votes** once all results present (or at the block-height +
-//!    `WAVE_TIMEOUT_BLOCKS` deadline if still not provisioned — entire wave
-//!    aborts).
+//! 4. **Votes** once all results present (or at the `wave_start_ts +
+//!    WAVE_TIMEOUT` deadline if still not provisioned — entire wave aborts).
 //! 5. **Collects ECs** from all participating shards via
 //!    `add_execution_certificate`. When every tx is covered (or aborted, which
 //!    is terminal-covered), the wave is complete and ready for finalization.
@@ -28,20 +27,17 @@
 use hyperscale_types::{
     compute_execution_receipt_root, ExecutionCertificate, ExecutionOutcome, Hash, ReceiptBundle,
     RoutableTransaction, ShardGroupId, TransactionDecision, TxOutcome, WaveCertificate, WaveId,
+    WAVE_TIMEOUT,
 };
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
-
-/// Number of blocks after wave start before a not-fully-provisioned wave is
-/// aborted in its entirety. Deterministic — every validator computes the same
-/// timeout from the same wave start height.
-pub const WAVE_TIMEOUT_BLOCKS: u64 = 32;
+use std::time::Duration;
 
 /// Age at which a still-alive wave emits a single diagnostic warning. Set
-/// comfortably past `WAVE_TIMEOUT_BLOCKS` so that waves resolving via the
-/// normal timeout-abort path (including cross-shard cert gossip) pass
-/// silently; only genuinely-wedged waves surface.
-pub const WAVE_OVERDUE_WARN_BLOCKS: u64 = 64;
+/// past `WAVE_TIMEOUT` so waves resolving via the normal timeout-abort path
+/// (including cross-shard cert gossip) pass silently; only genuinely-wedged
+/// waves surface.
+pub const WAVE_OVERDUE_WARN: Duration = Duration::from_secs(WAVE_TIMEOUT.as_secs() * 2);
 
 /// Per-wave state across the entire execution lifecycle.
 #[derive(Debug)]
@@ -49,8 +45,6 @@ pub struct WaveState {
     // ── Identity ────────────────────────────────────────────────────────
     wave_id: WaveId,
     block_hash: Hash,
-    /// Wave-starting block height (= `wave_id.block_height`).
-    block_height: u64,
 
     // ── Tx layout (in block order) ──────────────────────────────────────
     tx_hashes: Vec<Hash>,
@@ -64,15 +58,20 @@ pub struct WaveState {
     /// dispatch time.
     transactions: HashMap<Hash, Arc<RoutableTransaction>>,
 
+    /// BFT-authenticated weighted timestamp (ms) of the wave-starting block.
+    /// Anchor for wave-level wall-clock timeouts (wave abort, vote anchor
+    /// in the timeout path).
+    wave_start_ts_ms: u64,
+
     // ── Provisioning phase ──────────────────────────────────────────────
     /// Txs whose required remote-shard provisions have all arrived.
     provisioned_txs: HashSet<Hash>,
-    /// Per-tx earliest ready height. `all_provisioned_at` is the max across
-    /// this map — deterministic regardless of call order.
-    provisioned_tx_heights: HashMap<Hash, u64>,
-    /// The block height at which every tx in the wave became ready. `None`
-    /// until `provisioned_txs` is full.
-    all_provisioned_at: Option<u64>,
+    /// Per-tx earliest ready timestamp (ms). `all_provisioned_at_ts_ms` is
+    /// the max across this map — deterministic regardless of call order.
+    provisioned_tx_ts_ms: HashMap<Hash, u64>,
+    /// The weighted timestamp (ms) at which every tx in the wave became
+    /// ready. `None` until `provisioned_txs` is full.
+    all_provisioned_at_ts_ms: Option<u64>,
     /// Whether execution has been dispatched (single `ExecuteTransactions` /
     /// `ExecuteCrossShardTransactions` emitted). Set true once execution fires.
     dispatched: bool,
@@ -86,15 +85,18 @@ pub struct WaveState {
     /// locally-executed tx from leaking into a `FinalizedWave` whose EC later
     /// attests that tx as `Aborted` — the `ExtraReceipt` race.
     execution_receipts: HashMap<Hash, ReceiptBundle>,
-    /// Explicit aborts from `ConflictDetector`. Value = the local block height
-    /// at which the conflict was committed. Distinct from remote-reported
+    /// Explicit aborts from `ConflictDetector`. Distinct from remote-reported
     /// aborts in `tracker_aborted` — these are local pre-vote decisions.
-    explicit_aborts: HashMap<Hash, u64>,
+    explicit_aborts: HashSet<Hash>,
     /// Whether the local vote has been emitted (`build_vote_data` called once).
     voted: bool,
     /// Whether the local EC has been added to `execution_certificates`. Gates
     /// wave completion: `is_complete` requires the local EC to be present.
     local_ec_emitted: bool,
+    /// Latches `log_if_overdue`: fires once per wave after crossing the
+    /// `WAVE_OVERDUE_WARN` threshold. Under ts-based ages we can't rely on
+    /// exact equality (commits can skip over any given ms value).
+    overdue_warned: bool,
 
     // ── Cross-shard EC collection ───────────────────────────────────────
     /// Per-tx, which shards have reported via an EC.
@@ -115,11 +117,12 @@ impl WaveState {
     ///
     /// `txs` is in block order. Each entry is `(transaction, participating_shards)`.
     /// `single_shard` indicates whether this is a single-shard wave (`remote_shards` empty);
-    /// if so, `all_provisioned_at` is set to `block_height` immediately.
+    /// if so, `all_provisioned_at` / `all_provisioned_at_ts_ms` are set to the
+    /// wave-starting block's height/timestamp immediately.
     pub fn new(
         wave_id: WaveId,
         block_hash: Hash,
-        block_height: u64,
+        wave_start_ts_ms: u64,
         txs: Vec<(Arc<RoutableTransaction>, BTreeSet<ShardGroupId>)>,
         single_shard: bool,
     ) -> Self {
@@ -142,10 +145,10 @@ impl WaveState {
         let tx_hash_set: HashSet<Hash> = tx_hashes.iter().copied().collect();
 
         // Single-shard waves are trivially provisioned at creation.
-        let (provisioned_txs, provisioned_tx_heights, all_provisioned_at) = if single_shard {
-            let heights: HashMap<Hash, u64> =
-                tx_hashes.iter().map(|h| (*h, block_height)).collect();
-            (tx_hash_set.clone(), heights, Some(block_height))
+        let (provisioned_txs, provisioned_tx_ts_ms, all_provisioned_at_ts_ms) = if single_shard {
+            let ts_map: HashMap<Hash, u64> =
+                tx_hashes.iter().map(|h| (*h, wave_start_ts_ms)).collect();
+            (tx_hash_set.clone(), ts_map, Some(wave_start_ts_ms))
         } else {
             (HashSet::new(), HashMap::new(), None)
         };
@@ -153,20 +156,21 @@ impl WaveState {
         Self {
             wave_id,
             block_hash,
-            block_height,
+            wave_start_ts_ms,
             tx_hashes,
             participating_shards,
             tx_hash_set,
             transactions,
             provisioned_txs,
-            provisioned_tx_heights,
-            all_provisioned_at,
+            provisioned_tx_ts_ms,
+            all_provisioned_at_ts_ms,
             dispatched: false,
             execution_results: HashMap::new(),
             execution_receipts: HashMap::new(),
-            explicit_aborts: HashMap::new(),
+            explicit_aborts: HashSet::new(),
             voted: false,
             local_ec_emitted: false,
+            overdue_warned: false,
             covered_shards,
             tracker_aborted: HashSet::new(),
             tx_has_failure: HashSet::new(),
@@ -186,7 +190,7 @@ impl WaveState {
     }
 
     pub fn block_height(&self) -> u64 {
-        self.block_height
+        self.wave_id.block_height
     }
 
     pub fn tx_hashes(&self) -> &[Hash] {
@@ -202,7 +206,7 @@ impl WaveState {
 
     /// Whether this wave has reached full provisioning.
     pub fn is_fully_provisioned(&self) -> bool {
-        self.all_provisioned_at.is_some()
+        self.all_provisioned_at_ts_ms.is_some()
     }
 
     /// Whether execution has been dispatched for this wave.
@@ -227,35 +231,36 @@ impl WaveState {
         }
     }
 
-    /// Mark a single tx as provisioned. Keeps the earliest `at_height` per tx
-    /// so the wave's transition height is a pure function of the event set.
+    /// Mark a single tx as provisioned. Keeps the earliest `at_ts_ms` per tx
+    /// so the wave's transition timestamp is a pure function of the event
+    /// set.
     ///
     /// Returns `true` iff this call transitioned the wave from "partial" to
     /// "all provisioned" — the caller uses that signal to emit the single
     /// per-wave execution dispatch action.
-    pub fn mark_tx_provisioned(&mut self, tx_hash: Hash, at_height: u64) -> bool {
+    pub fn mark_tx_provisioned(&mut self, tx_hash: Hash, at_ts_ms: u64) -> bool {
         if !self.tx_hash_set.contains(&tx_hash) {
             return false;
         }
 
-        self.provisioned_tx_heights
+        self.provisioned_tx_ts_ms
             .entry(tx_hash)
-            .and_modify(|h| *h = (*h).min(at_height))
-            .or_insert(at_height);
+            .and_modify(|t| *t = (*t).min(at_ts_ms))
+            .or_insert(at_ts_ms);
 
         let is_new = self.provisioned_txs.insert(tx_hash);
 
         if is_new
-            && self.all_provisioned_at.is_none()
+            && self.all_provisioned_at_ts_ms.is_none()
             && self.provisioned_txs.len() == self.tx_hashes.len()
         {
-            let max_height = self
-                .provisioned_tx_heights
+            let max_ts_ms = self
+                .provisioned_tx_ts_ms
                 .values()
                 .copied()
                 .max()
-                .unwrap_or(at_height);
-            self.all_provisioned_at = Some(max_height);
+                .unwrap_or(at_ts_ms);
+            self.all_provisioned_at_ts_ms = Some(max_ts_ms);
             true
         } else {
             false
@@ -324,15 +329,12 @@ impl WaveState {
     /// never arrive. Without this, a single aborted tx forced the wave into
     /// the timeout branch, which then marked every tx Aborted (including the
     /// ones that executed successfully).
-    pub fn record_abort(&mut self, tx_hash: Hash, committed_at_height: u64) -> bool {
+    pub fn record_abort(&mut self, tx_hash: Hash, committed_at_ts_ms: u64) -> bool {
         if self.dispatched || !self.tx_hash_set.contains(&tx_hash) {
             return false;
         }
-        self.explicit_aborts
-            .entry(tx_hash)
-            .and_modify(|h| *h = (*h).min(committed_at_height))
-            .or_insert(committed_at_height);
-        self.mark_tx_provisioned(tx_hash, committed_at_height);
+        self.explicit_aborts.insert(tx_hash);
+        self.mark_tx_provisioned(tx_hash, committed_at_ts_ms);
         self.has_outcome_for_every_tx()
     }
 
@@ -340,7 +342,7 @@ impl WaveState {
     fn has_outcome_for_every_tx(&self) -> bool {
         self.tx_hashes
             .iter()
-            .all(|h| self.execution_results.contains_key(h) || self.explicit_aborts.contains_key(h))
+            .all(|h| self.execution_results.contains_key(h) || self.explicit_aborts.contains(h))
     }
 
     /// True if, for every non-aborted tx in the wave, local execution has
@@ -355,66 +357,70 @@ impl WaveState {
     fn has_local_receipts_for_non_aborted(&self) -> bool {
         self.tx_hashes.iter().all(|h| {
             self.tracker_aborted.contains(h)
-                || self.explicit_aborts.contains_key(h)
+                || self.explicit_aborts.contains(h)
                 || self.execution_results.contains_key(h)
         })
     }
 
     // ── Vote emission ───────────────────────────────────────────────────
 
-    /// Vote height (relative to `block_height`):
-    /// - If fully provisioned: `all_provisioned_at - block_height`
-    /// - Else: `WAVE_TIMEOUT_BLOCKS` (wave-abort case)
-    fn target_vote_height(&self) -> u64 {
-        match self.all_provisioned_at {
-            Some(h) => h.saturating_sub(self.block_height),
-            None => WAVE_TIMEOUT_BLOCKS,
+    /// Vote anchor timestamp — the BFT-authenticated weighted timestamp (ms)
+    /// at which this wave's outcome is fixed.
+    /// - Fully provisioned: `all_provisioned_at_ts_ms` (max provisioning ts
+    ///   across txs in the wave).
+    /// - Timed out: `wave_start_ts_ms + WAVE_TIMEOUT` (deterministic abort
+    ///   anchor).
+    ///
+    /// Included in the vote payload and the EC canonical hash, so all
+    /// validators aggregate under the same identifier.
+    fn target_vote_anchor_ts_ms(&self) -> u64 {
+        match self.all_provisioned_at_ts_ms {
+            Some(ts_ms) => ts_ms,
+            None => self.wave_start_ts_ms + WAVE_TIMEOUT.as_millis() as u64,
         }
     }
 
-    /// Whether the local vote can be emitted at the given committed height.
+    /// Whether the local vote can be emitted at the given committed timestamp.
     ///
     /// Two branches:
-    /// - Fully provisioned: need `committed_height >= all_provisioned_at` AND
-    ///   every tx has an execution result or explicit abort.
-    /// - Not provisioned: wait until `committed_height >= block_height + WAVE_TIMEOUT_BLOCKS`.
-    ///   Upon timeout, every tx in the wave is implicitly aborted.
-    pub fn can_emit_vote(&self, committed_height: u64) -> bool {
+    /// - Fully provisioned: need `committed_ts_ms >= all_provisioned_at_ts_ms`
+    ///   AND every tx has an execution result or explicit abort.
+    /// - Not provisioned: wait until `committed_ts_ms >= wave_start_ts_ms +
+    ///   WAVE_TIMEOUT`. Upon timeout, every tx in the wave is implicitly
+    ///   aborted.
+    pub fn can_emit_vote(&self, committed_ts_ms: u64) -> bool {
         if self.voted {
             return false;
         }
-        match self.all_provisioned_at {
-            Some(provisioned_at) => {
-                committed_height >= provisioned_at && self.has_outcome_for_every_tx()
+        match self.all_provisioned_at_ts_ms {
+            Some(provisioned_at_ts_ms) => {
+                committed_ts_ms >= provisioned_at_ts_ms && self.has_outcome_for_every_tx()
             }
-            None => committed_height >= self.block_height + WAVE_TIMEOUT_BLOCKS,
+            None => committed_ts_ms >= self.wave_start_ts_ms + WAVE_TIMEOUT.as_millis() as u64,
         }
     }
 
-    /// Build vote payload at the target height, consuming the one-shot vote.
+    /// Build vote payload at the target anchor, consuming the one-shot vote.
     ///
-    /// Returns `(vote_height, global_receipt_root, tx_outcomes)`. Returns
-    /// `None` if `can_emit_vote` is false.
+    /// Returns `(vote_anchor_ts_ms, global_receipt_root, tx_outcomes)`.
+    /// Returns `None` if `can_emit_vote` is false.
     ///
-    /// In the timeout-abort branch (`all_provisioned_at = None`), every tx
-    /// gets an `ExecutionOutcome::Aborted`. In the provisioned branch, each
-    /// tx's outcome is its explicit abort (if any) or execution result.
-    pub fn build_vote_data(
-        &mut self,
-        committed_height: u64,
-    ) -> Option<(u64, Hash, Vec<TxOutcome>)> {
-        if !self.can_emit_vote(committed_height) {
+    /// In the timeout-abort branch (`all_provisioned_at_ts_ms = None`), every
+    /// tx gets an `ExecutionOutcome::Aborted`. In the provisioned branch,
+    /// each tx's outcome is its explicit abort (if any) or execution result.
+    pub fn build_vote_data(&mut self, committed_ts_ms: u64) -> Option<(u64, Hash, Vec<TxOutcome>)> {
+        if !self.can_emit_vote(committed_ts_ms) {
             return None;
         }
 
-        let target = self.target_vote_height();
-        let timed_out = self.all_provisioned_at.is_none();
+        let target = self.target_vote_anchor_ts_ms();
+        let timed_out = self.all_provisioned_at_ts_ms.is_none();
 
         let outcomes: Vec<TxOutcome> = self
             .tx_hashes
             .iter()
             .map(|tx_hash| {
-                let outcome = if timed_out || self.explicit_aborts.contains_key(tx_hash) {
+                let outcome = if timed_out || self.explicit_aborts.contains(tx_hash) {
                     ExecutionOutcome::Aborted
                 } else {
                     // Safe: has_outcome_for_every_tx() ensured presence
@@ -511,19 +517,25 @@ impl WaveState {
     /// Used by dispatch to skip executing txs the wave has already decided to
     /// abort.
     pub fn is_tx_explicitly_aborted(&self, tx_hash: &Hash) -> bool {
-        self.explicit_aborts.contains_key(tx_hash)
+        self.explicit_aborts.contains(tx_hash)
     }
 
     /// Emit a `warn!` log exactly once, when the wave reaches
-    /// `WAVE_OVERDUE_WARN_BLOCKS` of age without completing. Dumps enough
-    /// state to diagnose what phase it's stuck in (provisioning / dispatch /
-    /// voting / EC collection). Called once per committed block per surviving
-    /// wave; the `==` guard ensures a single emission per wave.
-    pub fn log_if_overdue(&self, committed_height: u64) {
-        let age = committed_height.saturating_sub(self.block_height);
-        if age != WAVE_OVERDUE_WARN_BLOCKS {
+    /// `WAVE_OVERDUE_WARN` of age without completing. Dumps enough state to
+    /// diagnose what phase it's stuck in (provisioning / dispatch / voting /
+    /// EC collection). Called once per committed block per surviving wave;
+    /// we latch the warning at the first crossing of the threshold using
+    /// tick-transition detection by the caller.
+    pub fn log_if_overdue(&mut self, committed_ts_ms: u64) {
+        if self.overdue_warned {
             return;
         }
+        let age_ms = committed_ts_ms.saturating_sub(self.wave_start_ts_ms);
+        let warn_ms = WAVE_OVERDUE_WARN.as_millis() as u64;
+        if age_ms < warn_ms {
+            return;
+        }
+        self.overdue_warned = true;
 
         let total = self.tx_hashes.len();
         let provisioned = self.provisioned_txs.len();
@@ -555,13 +567,14 @@ impl WaveState {
         tracing::warn!(
             wave = %self.wave_id,
             block_hash = ?self.block_hash,
-            block_height = self.block_height,
-            committed_height,
-            age_blocks = age,
-            timeout_blocks = WAVE_TIMEOUT_BLOCKS,
+            block_height = self.wave_id.block_height,
+            wave_start_ts_ms = self.wave_start_ts_ms,
+            committed_ts_ms,
+            age_ms,
+            timeout_ms = WAVE_TIMEOUT.as_millis() as u64,
             num_txs = total,
             provisioned = format!("{}/{}", provisioned, total),
-            all_provisioned_at = ?self.all_provisioned_at,
+            all_provisioned_at_ts_ms = ?self.all_provisioned_at_ts_ms,
             dispatched = self.dispatched,
             voted = self.voted,
             local_ec_emitted = self.local_ec_emitted,
@@ -653,6 +666,14 @@ mod tests {
         ))
     }
 
+    /// Tests use synthetic timestamps proportional to block heights so the
+    /// block-height intuition in assertions maps cleanly to ts space.
+    const TEST_BLOCK_INTERVAL_MS: u64 = 500;
+
+    fn ts_for(height: u64) -> u64 {
+        height * TEST_BLOCK_INTERVAL_MS
+    }
+
     fn make_single_shard_wave(n: usize) -> WaveState {
         let txs: Vec<(Arc<RoutableTransaction>, BTreeSet<ShardGroupId>)> = (0..n)
             .map(|i| (make_tx(i as u8), BTreeSet::from([ShardGroupId(0)])))
@@ -660,7 +681,7 @@ mod tests {
         WaveState::new(
             WaveId::new(ShardGroupId(0), WAVE_START, BTreeSet::new()),
             Hash::from_bytes(b"block"),
-            WAVE_START,
+            ts_for(WAVE_START),
             txs,
             true,
         )
@@ -677,7 +698,7 @@ mod tests {
                 BTreeSet::from([ShardGroupId(1)]),
             ),
             Hash::from_bytes(b"block"),
-            WAVE_START,
+            ts_for(WAVE_START),
             txs,
             false,
         )
@@ -726,14 +747,14 @@ mod tests {
     fn single_shard_is_provisioned_on_creation() {
         let w = make_single_shard_wave(2);
         assert!(w.is_fully_provisioned());
-        assert_eq!(w.all_provisioned_at, Some(WAVE_START));
+        assert_eq!(w.all_provisioned_at_ts_ms, Some(ts_for(WAVE_START)));
     }
 
     #[test]
     fn cross_shard_not_provisioned_on_creation() {
         let w = make_cross_shard_wave(2);
         assert!(!w.is_fully_provisioned());
-        assert_eq!(w.all_provisioned_at, None);
+        assert_eq!(w.all_provisioned_at_ts_ms, None);
     }
 
     #[test]
@@ -742,14 +763,14 @@ mod tests {
         let h0 = w.tx_hashes()[0];
         let h1 = w.tx_hashes()[1];
 
-        assert!(!w.mark_tx_provisioned(h0, WAVE_START + 1));
+        assert!(!w.mark_tx_provisioned(h0, ts_for(WAVE_START + 1)));
         assert!(!w.is_fully_provisioned());
-        assert!(w.mark_tx_provisioned(h1, WAVE_START + 2));
+        assert!(w.mark_tx_provisioned(h1, ts_for(WAVE_START + 2)));
         assert!(w.is_fully_provisioned());
-        assert_eq!(w.all_provisioned_at, Some(WAVE_START + 2));
+        assert_eq!(w.all_provisioned_at_ts_ms, Some(ts_for(WAVE_START + 2)));
 
         // Idempotent: repeat calls don't retransition.
-        assert!(!w.mark_tx_provisioned(h1, WAVE_START + 3));
+        assert!(!w.mark_tx_provisioned(h1, ts_for(WAVE_START + 3)));
     }
 
     #[test]
@@ -759,27 +780,29 @@ mod tests {
         let h1 = w.tx_hashes()[1];
 
         // No results yet.
-        assert!(!w.can_emit_vote(WAVE_START));
+        assert!(!w.can_emit_vote(ts_for(WAVE_START)));
 
         w.record_execution_result(h0, executed(true));
-        assert!(!w.can_emit_vote(WAVE_START));
+        assert!(!w.can_emit_vote(ts_for(WAVE_START)));
 
         w.record_execution_result(h1, executed(true));
-        assert!(w.can_emit_vote(WAVE_START));
+        assert!(w.can_emit_vote(ts_for(WAVE_START)));
     }
 
     #[test]
     fn timeout_abort_without_provisions() {
         let mut w = make_cross_shard_wave(2);
+        let wave_start_ts = ts_for(WAVE_START);
+        let timeout_ms = WAVE_TIMEOUT.as_millis() as u64;
 
         // Not yet at timeout.
-        assert!(!w.can_emit_vote(WAVE_START + WAVE_TIMEOUT_BLOCKS - 1));
+        assert!(!w.can_emit_vote(wave_start_ts + timeout_ms - 1));
 
-        // Exactly at timeout — all txs implicitly abort.
-        assert!(w.can_emit_vote(WAVE_START + WAVE_TIMEOUT_BLOCKS));
+        // At timeout — all txs implicitly abort.
+        assert!(w.can_emit_vote(wave_start_ts + timeout_ms));
 
-        let (vh, _root, outcomes) = w.build_vote_data(WAVE_START + WAVE_TIMEOUT_BLOCKS).unwrap();
-        assert_eq!(vh, WAVE_TIMEOUT_BLOCKS);
+        let (anchor, _root, outcomes) = w.build_vote_data(wave_start_ts + timeout_ms).unwrap();
+        assert_eq!(anchor, wave_start_ts + timeout_ms);
         assert_eq!(outcomes.len(), 2);
         assert!(outcomes
             .iter()
@@ -792,10 +815,10 @@ mod tests {
         let h0 = w.tx_hashes()[0];
         w.record_execution_result(h0, executed(true));
 
-        assert!(w.build_vote_data(WAVE_START).is_some());
+        assert!(w.build_vote_data(ts_for(WAVE_START)).is_some());
         // Already voted; can't again.
-        assert!(!w.can_emit_vote(WAVE_START + 100));
-        assert!(w.build_vote_data(WAVE_START + 100).is_none());
+        assert!(!w.can_emit_vote(ts_for(WAVE_START + 100)));
+        assert!(w.build_vote_data(ts_for(WAVE_START + 100)).is_none());
     }
 
     #[test]
@@ -805,9 +828,9 @@ mod tests {
         let h1 = w.tx_hashes()[1];
 
         w.record_execution_result(h0, executed(true));
-        w.record_abort(h1, WAVE_START + 3);
+        w.record_abort(h1, ts_for(WAVE_START + 3));
 
-        let (_, _, outcomes) = w.build_vote_data(WAVE_START + 3).unwrap();
+        let (_, _, outcomes) = w.build_vote_data(ts_for(WAVE_START + 3)).unwrap();
         assert!(matches!(
             outcomes[0].outcome,
             ExecutionOutcome::Executed { .. }
@@ -816,12 +839,15 @@ mod tests {
     }
 
     #[test]
-    fn abort_keeps_earliest_height() {
+    fn abort_marks_tx_as_aborted() {
         let mut w = make_single_shard_wave(1);
         let h0 = w.tx_hashes()[0];
-        w.record_abort(h0, 20);
-        w.record_abort(h0, 15);
-        assert_eq!(w.explicit_aborts.get(&h0), Some(&15));
+        w.record_abort(h0, ts_for(20));
+        assert!(w.explicit_aborts.contains(&h0));
+        // Idempotent: calling again doesn't clear or duplicate.
+        w.record_abort(h0, ts_for(15));
+        assert!(w.explicit_aborts.contains(&h0));
+        assert_eq!(w.explicit_aborts.len(), 1);
     }
 
     #[test]
@@ -831,8 +857,8 @@ mod tests {
         let h1 = w.tx_hashes()[1];
 
         // Fully provision and execute locally.
-        w.mark_tx_provisioned(h0, WAVE_START + 1);
-        w.mark_tx_provisioned(h1, WAVE_START + 1);
+        w.mark_tx_provisioned(h0, ts_for(WAVE_START + 1));
+        w.mark_tx_provisioned(h1, ts_for(WAVE_START + 1));
         w.record_execution_result(h0, executed(true));
         w.record_execution_result(h1, executed(true));
 
@@ -859,8 +885,8 @@ mod tests {
         let h0 = w.tx_hashes()[0];
         let h1 = w.tx_hashes()[1];
 
-        w.mark_tx_provisioned(h0, WAVE_START + 1);
-        w.mark_tx_provisioned(h1, WAVE_START + 1);
+        w.mark_tx_provisioned(h0, ts_for(WAVE_START + 1));
+        w.mark_tx_provisioned(h1, ts_for(WAVE_START + 1));
 
         // Remote EC lands first (other shard was fast).
         let ec_remote = make_ec(w.wave_id(), ShardGroupId(1), &[h0, h1], true);
@@ -894,8 +920,8 @@ mod tests {
         let h0 = w.tx_hashes()[0];
         let h1 = w.tx_hashes()[1];
 
-        w.mark_tx_provisioned(h0, WAVE_START + 1);
-        w.mark_tx_provisioned(h1, WAVE_START + 1);
+        w.mark_tx_provisioned(h0, ts_for(WAVE_START + 1));
+        w.mark_tx_provisioned(h1, ts_for(WAVE_START + 1));
 
         // Local EC attests both txs aborted. No execution results needed.
         let ec_local = make_ec(w.wave_id(), ShardGroupId(0), &[h0, h1], false);
@@ -931,17 +957,17 @@ mod tests {
         let h1 = w.tx_hashes()[1];
 
         // Fully provision and dispatch.
-        w.mark_tx_provisioned(h0, WAVE_START + 1);
-        w.mark_tx_provisioned(h1, WAVE_START + 1);
+        w.mark_tx_provisioned(h0, ts_for(WAVE_START + 1));
+        w.mark_tx_provisioned(h1, ts_for(WAVE_START + 1));
         assert!(w.mark_dispatched());
 
         // A post-dispatch conflict abort must be rejected.
-        assert!(!w.record_abort(h0, WAVE_START + 2));
+        assert!(!w.record_abort(h0, ts_for(WAVE_START + 2)));
         // No explicit abort was recorded.
         w.record_execution_result(h0, executed(true));
         w.record_execution_result(h1, executed(true));
         // If record_abort had mutated, h0's outcome would have flipped to Aborted.
-        let (_, _, outcomes) = w.build_vote_data(WAVE_START + 2).unwrap();
+        let (_, _, outcomes) = w.build_vote_data(ts_for(WAVE_START + 2)).unwrap();
         assert!(matches!(
             outcomes[0].outcome,
             ExecutionOutcome::Executed { success: true, .. }

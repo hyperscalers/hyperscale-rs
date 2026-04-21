@@ -985,7 +985,7 @@ fn test_wave_leader_failure_recovers_via_rotation() {
 
         // Run long enough for:
         // - Transaction to be committed in a block
-        // - Vote retry timeout (VOTE_RETRY_BLOCKS = 16 blocks)
+        // - Vote retry timeout (`VOTE_RETRY_TIMEOUT = 8s`)
         // - Fallback leader to aggregate and broadcast EC
         // - Wave certificate to be finalized
         let mut reached_terminal = false;

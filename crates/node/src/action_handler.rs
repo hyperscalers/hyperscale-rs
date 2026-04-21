@@ -695,7 +695,6 @@ pub(crate) fn handle_delegated_action<
             requests,
             source_shard,
             block_height,
-            block_timestamp,
             shard_recipients,
         } => {
             // Phase 1: Fetch state entries for all transactions.
@@ -708,10 +707,7 @@ pub(crate) fn handle_delegated_action<
                     "All fetch_state_entries failed — no provisions to broadcast"
                 );
                 return Some(DelegatedResult {
-                    events: vec![NodeInput::ProvisionReady {
-                        batches: vec![],
-                        block_timestamp: 0,
-                    }],
+                    events: vec![NodeInput::ProvisionReady { batches: vec![] }],
                     prepared_commit: None,
                 });
             }
@@ -720,10 +716,7 @@ pub(crate) fn handle_delegated_action<
             let batches =
                 build_provision_batches(ctx, per_tx, source_shard, block_height, &shard_recipients);
             Some(DelegatedResult {
-                events: vec![NodeInput::ProvisionReady {
-                    batches,
-                    block_timestamp,
-                }],
+                events: vec![NodeInput::ProvisionReady { batches }],
                 prepared_commit: None,
             })
         }

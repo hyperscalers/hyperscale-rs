@@ -184,7 +184,7 @@ pub enum Action {
         block_hash: Hash,
         block_height: u64,
         /// Consensus height at which this vote is being cast.
-        vote_height: u64,
+        vote_anchor_ts_ms: u64,
         wave_id: WaveId,
         global_receipt_root: Hash,
         /// Per-tx outcomes in wave order. Carried on the vote so the
@@ -231,7 +231,6 @@ pub enum Action {
         requests: Vec<ProvisionRequest>,
         source_shard: ShardGroupId,
         block_height: BlockHeight,
-        block_timestamp: u64,
         /// Per-shard recipients for provision broadcasts (excluding self).
         shard_recipients: HashMap<ShardGroupId, Vec<ValidatorId>>,
     },

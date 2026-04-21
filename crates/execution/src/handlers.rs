@@ -60,11 +60,11 @@ pub fn aggregate_execution_certificate(
         }
     }
 
-    let vote_height = votes.first().map(|v| v.vote_height).unwrap_or(0);
+    let vote_anchor_ts_ms = votes.first().map(|v| v.vote_anchor_ts_ms).unwrap_or(0);
 
     ExecutionCertificate::new(
         wave_id.clone(),
-        vote_height,
+        vote_anchor_ts_ms,
         global_receipt_root,
         tx_outcomes,
         aggregated_signature,
@@ -91,7 +91,7 @@ pub fn batch_verify_execution_votes(
         HashMap::new();
     for (vote, pk, power) in votes {
         let msg = exec_vote_message(
-            vote.vote_height,
+            vote.vote_anchor_ts_ms,
             &vote.wave_id,
             vote.shard_group_id,
             &vote.global_receipt_root,
@@ -140,7 +140,7 @@ pub fn verify_execution_certificate_signature(
     public_keys: &[Bls12381G1PublicKey],
 ) -> bool {
     let msg = exec_vote_message(
-        certificate.vote_height,
+        certificate.vote_anchor_ts_ms,
         &certificate.wave_id,
         certificate.shard_group_id(),
         &certificate.global_receipt_root,

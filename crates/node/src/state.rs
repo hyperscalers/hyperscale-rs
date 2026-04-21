@@ -8,7 +8,7 @@ use hyperscale_provisions::{ProvisionConfig, ProvisionCoordinator};
 use hyperscale_remote_headers::RemoteHeaderCoordinator;
 use hyperscale_topology::TopologyState;
 use hyperscale_types::{
-    Block, BlockHeader, BlockHeight, BlockManifest, CertifiedBlock, FinalizedWave, Hash, Provision,
+    Block, BlockHeader, BlockManifest, CertifiedBlock, FinalizedWave, Hash, Provision,
     QuorumCertificate, ReadyTransactions, RoutableTransaction, ShardGroupId, TopologySnapshot,
 };
 use std::sync::Arc;
@@ -221,8 +221,7 @@ impl NodeStateMachine {
         actions.extend(self.bft.check_sync_health(self.topology.snapshot()));
 
         // Clean up old tombstones in mempool to prevent unbounded memory growth.
-        let current_height = BlockHeight(self.bft.committed_height());
-        self.mempool.cleanup_default_tombstones(current_height);
+        self.mempool.cleanup_default_tombstones();
 
         actions
     }
@@ -325,7 +324,6 @@ impl NodeStateMachine {
     fn on_block_committed(&mut self, certified: CertifiedBlock) -> Vec<Action> {
         let mut actions = Vec::new();
         let block_hash = certified.block.hash();
-        let block_height = certified.block.height();
 
         // Register committed tx hashes with BFT for timeout abort validation.
         let tx_hashes: Vec<Hash> = certified
@@ -335,7 +333,7 @@ impl NodeStateMachine {
             .map(|tx| tx.hash())
             .collect();
         self.bft
-            .register_committed_transactions(&tx_hashes, block_height);
+            .register_committed_transactions(&tx_hashes, certified.qc.weighted_timestamp_ms);
 
         // Mark this block as a usable parent for child state-root verifications.
         // By the time BlockCommitted fires, the block's JMT snapshot is in
@@ -728,7 +726,7 @@ impl StateMachine for NodeStateMachine {
             }
             // Sync recovery complete — flush expected provisions and remote
             // headers immediately so we can participate in execution for
-            // recent blocks within the WAVE_TIMEOUT_BLOCKS window.
+            // recent blocks within the WAVE_TIMEOUT window.
             ProtocolEvent::SyncResumed => {
                 let topo = self.topology.snapshot();
                 let mut actions = self.remote_headers.flush_expected_headers(topo);

@@ -15,7 +15,7 @@ pub mod wave_state;
 mod state;
 mod vote_tracker;
 
-pub use hyperscale_types::FinalizedWave;
+pub use hyperscale_types::{FinalizedWave, WAVE_TIMEOUT};
 pub use state::{CompletionData, ExecutionMemoryStats, ExecutionState};
 pub use vote_tracker::VoteTracker;
-pub use wave_state::{WaveState, WAVE_TIMEOUT_BLOCKS};
+pub use wave_state::WaveState;
