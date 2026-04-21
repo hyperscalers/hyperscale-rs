@@ -1149,29 +1149,29 @@ mod tests {
         }
     }
 
-    fn make_wave_id(shard: u64, height: u64, remote: &[u64]) -> WaveId {
+    fn make_wave_id(shard: u64, height: BlockHeight, remote: &[u64]) -> WaveId {
         WaveId {
             shard_group_id: ShardGroupId(shard),
-            block_height: BlockHeight(height),
+            block_height: height,
             remote_shards: remote.iter().map(|&s| ShardGroupId(s)).collect(),
         }
     }
 
     #[test]
     fn test_wave_id_display() {
-        let zero = make_wave_id(0, 42, &[]);
+        let zero = make_wave_id(0, BlockHeight(42), &[]);
         assert_eq!(zero.to_string(), "Wave(shard=0, h=42, ∅)");
 
-        let wave = make_wave_id(0, 42, &[2, 5]);
+        let wave = make_wave_id(0, BlockHeight(42), &[2, 5]);
         assert_eq!(wave.to_string(), "Wave(shard=0, h=42, {2,5})");
     }
 
     #[test]
     fn test_wave_id_ordering() {
-        let zero = make_wave_id(0, 42, &[]);
-        let wave_a = make_wave_id(0, 42, &[1]);
-        let wave_b = make_wave_id(0, 42, &[2]);
-        let wave_ab = make_wave_id(0, 42, &[1, 2]);
+        let zero = make_wave_id(0, BlockHeight(42), &[]);
+        let wave_a = make_wave_id(0, BlockHeight(42), &[1]);
+        let wave_b = make_wave_id(0, BlockHeight(42), &[2]);
+        let wave_ab = make_wave_id(0, BlockHeight(42), &[1, 2]);
 
         assert!(zero < wave_a);
         assert!(wave_a < wave_b);
@@ -1180,16 +1180,16 @@ mod tests {
 
     #[test]
     fn test_wave_id_hash_deterministic() {
-        let w1 = make_wave_id(0, 42, &[1]);
-        let w2 = make_wave_id(0, 42, &[1]);
+        let w1 = make_wave_id(0, BlockHeight(42), &[1]);
+        let w2 = make_wave_id(0, BlockHeight(42), &[1]);
         assert_eq!(w1.hash(), w2.hash());
         assert_ne!(w1.hash(), Hash::ZERO);
     }
 
     #[test]
     fn test_wave_id_hash_differs_by_height() {
-        let w1 = make_wave_id(0, 42, &[1]);
-        let w2 = make_wave_id(0, 43, &[1]);
+        let w1 = make_wave_id(0, BlockHeight(42), &[1]);
+        let w2 = make_wave_id(0, BlockHeight(43), &[1]);
         assert_ne!(w1.hash(), w2.hash());
     }
 
@@ -1342,7 +1342,7 @@ mod tests {
         signature: Bls12381G2Signature,
     ) -> ExecutionCertificate {
         ExecutionCertificate::new(
-            make_wave_id(0, 10, &[1]),
+            make_wave_id(0, BlockHeight(10), &[1]),
             WeightedTimestamp(11),
             Hash::from_bytes(b"global_receipt_root"),
             vec![make_outcome(1), make_outcome(2)],
@@ -1382,7 +1382,7 @@ mod tests {
 
     fn make_test_wave_ec(shard: u64, seed: u8) -> Arc<ExecutionCertificate> {
         Arc::new(ExecutionCertificate::new(
-            make_wave_id(shard, 42, &[1]),
+            make_wave_id(shard, BlockHeight(42), &[1]),
             WeightedTimestamp(43),
             Hash::from_bytes(&[seed + 100; 4]),
             vec![make_outcome(seed)],
@@ -1394,7 +1394,7 @@ mod tests {
     #[test]
     fn test_receipt_hash_deterministic() {
         let wc = WaveCertificate {
-            wave_id: make_wave_id(0, 42, &[1]),
+            wave_id: make_wave_id(0, BlockHeight(42), &[1]),
             execution_certificates: vec![make_test_wave_ec(0, 1), make_test_wave_ec(1, 2)],
         };
         assert_eq!(wc.receipt_hash(), wc.receipt_hash());
@@ -1403,7 +1403,7 @@ mod tests {
 
     #[test]
     fn test_receipt_hash_changes_with_ec() {
-        let wave_id = make_wave_id(0, 42, &[1]);
+        let wave_id = make_wave_id(0, BlockHeight(42), &[1]);
         let wc1 = WaveCertificate {
             wave_id: wave_id.clone(),
             execution_certificates: vec![make_test_wave_ec(0, 1)],
@@ -1418,7 +1418,7 @@ mod tests {
     #[test]
     fn test_wave_cert_sbor_roundtrip() {
         let wc = WaveCertificate {
-            wave_id: make_wave_id(0, 42, &[1]),
+            wave_id: make_wave_id(0, BlockHeight(42), &[1]),
             execution_certificates: vec![make_test_wave_ec(0, 1), make_test_wave_ec(1, 2)],
         };
         let encoded = basic_encode(&wc).unwrap();
@@ -1430,7 +1430,7 @@ mod tests {
     fn test_arc_vec_sbor_roundtrip() {
         let certs = vec![
             Arc::new(WaveCertificate {
-                wave_id: make_wave_id(0, 42, &[1]),
+                wave_id: make_wave_id(0, BlockHeight(42), &[1]),
                 execution_certificates: vec![make_test_wave_ec(0, 1)],
             }),
             Arc::new(WaveCertificate {
@@ -1465,7 +1465,7 @@ mod tests {
             ValidatorId(3),
             ValidatorId(4),
         ];
-        let wave_id = make_wave_id(0, 100, &[1]);
+        let wave_id = make_wave_id(0, BlockHeight(100), &[1]);
         assert_eq!(
             wave_leader(&wave_id, &committee),
             wave_leader_at(&wave_id, Attempt::INITIAL, &committee)
@@ -1480,7 +1480,7 @@ mod tests {
             ValidatorId(3),
             ValidatorId(4),
         ];
-        let wave_id = make_wave_id(0, 100, &[1]);
+        let wave_id = make_wave_id(0, BlockHeight(100), &[1]);
         let mut leaders: std::collections::HashSet<ValidatorId> = std::collections::HashSet::new();
         for attempt in 0..4 {
             leaders.insert(wave_leader_at(&wave_id, Attempt(attempt), &committee));
@@ -1496,7 +1496,7 @@ mod tests {
     #[test]
     fn test_wave_leader_at_wraps() {
         let committee = vec![ValidatorId(1), ValidatorId(2), ValidatorId(3)];
-        let wave_id = make_wave_id(0, 100, &[1]);
+        let wave_id = make_wave_id(0, BlockHeight(100), &[1]);
         // Large attempt values should not panic — they wrap via modulo.
         let _ = wave_leader_at(&wave_id, Attempt(1000), &committee);
     }
@@ -1509,7 +1509,7 @@ mod tests {
             ValidatorId(3),
             ValidatorId(4),
         ];
-        let wave_id = make_wave_id(0, 100, &[1]);
+        let wave_id = make_wave_id(0, BlockHeight(100), &[1]);
         let leader1 = wave_leader_at(&wave_id, Attempt(2), &committee);
         let leader2 = wave_leader_at(&wave_id, Attempt(2), &committee);
         assert_eq!(leader1, leader2);
@@ -1538,7 +1538,7 @@ mod tests {
 
     #[test]
     fn reconstruct_from_all_success_outcomes() {
-        let wave_id = make_wave_id(0, 42, &[1]);
+        let wave_id = make_wave_id(0, BlockHeight(42), &[1]);
         let tx_a = Hash::from_bytes(b"tx_a");
         let tx_b = Hash::from_bytes(b"tx_b");
 
@@ -1575,7 +1575,7 @@ mod tests {
 
     #[test]
     fn reconstruct_skips_aborted_tx_without_receipt() {
-        let wave_id = make_wave_id(0, 42, &[1]);
+        let wave_id = make_wave_id(0, BlockHeight(42), &[1]);
         let tx_a = Hash::from_bytes(b"tx_a");
         let tx_b = Hash::from_bytes(b"tx_b_aborted");
 
@@ -1614,7 +1614,7 @@ mod tests {
 
     #[test]
     fn reconstruct_fails_when_non_aborted_receipt_missing() {
-        let wave_id = make_wave_id(0, 42, &[1]);
+        let wave_id = make_wave_id(0, BlockHeight(42), &[1]);
         let tx_a = Hash::from_bytes(b"tx_a");
 
         let outcomes = vec![TxOutcome {
@@ -1640,9 +1640,9 @@ mod tests {
 
     #[test]
     fn reconstruct_fails_when_local_ec_missing() {
-        let wave_id = make_wave_id(0, 42, &[1]);
+        let wave_id = make_wave_id(0, BlockHeight(42), &[1]);
         // Only a remote EC (shard 1), no local EC matching wc.wave_id.
-        let remote_wave_id = make_wave_id(1, 42, &[0]);
+        let remote_wave_id = make_wave_id(1, BlockHeight(42), &[0]);
         let remote_ec = make_local_ec(
             &remote_wave_id,
             vec![TxOutcome {
@@ -1671,7 +1671,7 @@ mod tests {
 
     #[test]
     fn validate_accepts_receipts_matching_outcomes() {
-        let wave_id = make_wave_id(0, 42, &[1]);
+        let wave_id = make_wave_id(0, BlockHeight(42), &[1]);
         let tx_a = Hash::from_bytes(b"tx_a");
         let tx_b = Hash::from_bytes(b"tx_b_aborted");
         let tx_c = Hash::from_bytes(b"tx_c_fail");
@@ -1719,7 +1719,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_outcome_flip() {
-        let wave_id = make_wave_id(0, 42, &[1]);
+        let wave_id = make_wave_id(0, BlockHeight(42), &[1]);
         let tx_a = Hash::from_bytes(b"tx_a");
         let outcomes = vec![TxOutcome {
             tx_hash: tx_a,
@@ -1748,7 +1748,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_missing_receipt() {
-        let wave_id = make_wave_id(0, 42, &[1]);
+        let wave_id = make_wave_id(0, BlockHeight(42), &[1]);
         let tx_a = Hash::from_bytes(b"tx_a");
         let outcomes = vec![TxOutcome {
             tx_hash: tx_a,
@@ -1772,7 +1772,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_extra_receipt() {
-        let wave_id = make_wave_id(0, 42, &[1]);
+        let wave_id = make_wave_id(0, BlockHeight(42), &[1]);
         let tx_a = Hash::from_bytes(b"tx_a");
         let outcomes = vec![TxOutcome {
             tx_hash: tx_a,
@@ -1797,7 +1797,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_tx_hash_mismatch() {
-        let wave_id = make_wave_id(0, 42, &[1]);
+        let wave_id = make_wave_id(0, BlockHeight(42), &[1]);
         let tx_a = Hash::from_bytes(b"tx_a");
         let tx_b = Hash::from_bytes(b"tx_b");
         let outcomes = vec![TxOutcome {
@@ -1826,8 +1826,8 @@ mod tests {
 
     #[test]
     fn validate_rejects_missing_local_ec() {
-        let wave_id = make_wave_id(0, 42, &[1]);
-        let remote_wave_id = make_wave_id(1, 42, &[0]);
+        let wave_id = make_wave_id(0, BlockHeight(42), &[1]);
+        let remote_wave_id = make_wave_id(1, BlockHeight(42), &[0]);
         let remote_ec = make_local_ec(&remote_wave_id, vec![]);
         let fw = FinalizedWave {
             certificate: Arc::new(WaveCertificate {
@@ -1844,7 +1844,7 @@ mod tests {
 
     #[test]
     fn validate_all_aborted_wave_with_empty_receipts_passes() {
-        let wave_id = make_wave_id(0, 42, &[1]);
+        let wave_id = make_wave_id(0, BlockHeight(42), &[1]);
         let outcomes = vec![TxOutcome {
             tx_hash: Hash::from_bytes(b"aborted"),
             outcome: ExecutionOutcome::Aborted,

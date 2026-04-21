@@ -622,8 +622,8 @@ fn test_snapshot_at_version_is_deterministic_across_persistence_lag() {
     let partition_num = 0;
     let sort_key = vec![1u8];
 
-    let commit = |storage: &SimStorage, height: u64, value: Vec<u8>| {
-        let block = make_test_block(BlockHeight(height));
+    let commit = |storage: &SimStorage, height: BlockHeight, value: Vec<u8>| {
+        let block = make_test_block(height);
         let qc = make_test_qc(&block);
         let updates = make_mapped_database_update(1, partition_num, sort_key.clone(), value);
         commit_with(storage, &updates, &block, &qc);
@@ -631,15 +631,15 @@ fn test_snapshot_at_version_is_deterministic_across_persistence_lag() {
 
     // Validator A: persists through block 5.
     let a = SimStorage::new();
-    for h in 1..=5 {
-        commit(&a, h, vec![h as u8]);
+    for h in 1..=5u64 {
+        commit(&a, BlockHeight(h), vec![h as u8]);
     }
     assert_eq!(a.jmt_height(), BlockHeight(5));
 
     // Validator B: stops at block 3.
     let b = SimStorage::new();
-    for h in 1..=3 {
-        commit(&b, h, vec![h as u8]);
+    for h in 1..=3u64 {
+        commit(&b, BlockHeight(h), vec![h as u8]);
     }
     assert_eq!(b.jmt_height(), BlockHeight(3));
 

@@ -819,10 +819,10 @@ mod tests {
         })
     }
 
-    fn entry_at(parent: Hash, height: u64, updates: DatabaseUpdates) -> ChainEntry {
+    fn entry_at(parent: Hash, height: BlockHeight, updates: DatabaseUpdates) -> ChainEntry {
         ChainEntry {
             parent_hash: parent,
-            height: BlockHeight(height),
+            height,
             receipts: vec![make_receipt(updates)],
             jmt_snapshot: empty_snapshot(),
         }
@@ -838,9 +838,12 @@ mod tests {
         let h1 = Hash::from_bytes(b"h1");
         let h2 = Hash::from_bytes(b"h2");
         let h3 = Hash::from_bytes(b"h3");
-        chain.insert(h1, entry_at(Hash::ZERO, 1, DatabaseUpdates::default()));
-        chain.insert(h2, entry_at(h1, 2, DatabaseUpdates::default()));
-        chain.insert(h3, entry_at(h2, 3, DatabaseUpdates::default()));
+        chain.insert(
+            h1,
+            entry_at(Hash::ZERO, BlockHeight(1), DatabaseUpdates::default()),
+        );
+        chain.insert(h2, entry_at(h1, BlockHeight(2), DatabaseUpdates::default()));
+        chain.insert(h3, entry_at(h2, BlockHeight(3), DatabaseUpdates::default()));
 
         chain.prune(BlockHeight(2));
         assert_eq!(chain.entries.read().unwrap().len(), 1);
@@ -860,11 +863,19 @@ mod tests {
 
         chain.insert(
             h1,
-            entry_at(Hash::ZERO, 1, make_delta(b"node", 0, vec![1], vec![10])),
+            entry_at(
+                Hash::ZERO,
+                BlockHeight(1),
+                make_delta(b"node", 0, vec![1], vec![10]),
+            ),
         );
         chain.insert(
             h2,
-            entry_at(h1, 2, make_delta(b"node", 0, vec![2], vec![20])),
+            entry_at(
+                h1,
+                BlockHeight(2),
+                make_delta(b"node", 0, vec![2], vec![20]),
+            ),
         );
 
         let view = chain.view_at(h2);
@@ -892,12 +903,20 @@ mod tests {
 
         chain.insert(
             h1,
-            entry_at(Hash::ZERO, 1, make_delta(b"node", 0, vec![1], vec![10])),
+            entry_at(
+                Hash::ZERO,
+                BlockHeight(1),
+                make_delta(b"node", 0, vec![1], vec![10]),
+            ),
         );
         // Orphan: same height as h1, different parent (forks off ZERO).
         chain.insert(
             orphan,
-            entry_at(Hash::ZERO, 1, make_delta(b"node", 0, vec![1], vec![99])),
+            entry_at(
+                Hash::ZERO,
+                BlockHeight(1),
+                make_delta(b"node", 0, vec![1], vec![99]),
+            ),
         );
 
         // View anchored at h1: should see h1's value, not the orphan's.

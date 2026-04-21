@@ -601,7 +601,7 @@ impl StateMachine for NodeStateMachine {
             ProtocolEvent::BlockPersisted { height } => {
                 let mut actions = self
                     .bft
-                    .on_block_persisted(self.topology.snapshot(), height.0);
+                    .on_block_persisted(self.topology.snapshot(), height);
                 // If BFT just resumed from sync, reschedule the cleanup timer.
                 if !actions.is_empty() {
                     actions.push(Action::SetTimer {

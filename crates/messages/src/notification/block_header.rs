@@ -74,10 +74,10 @@ mod tests {
 
     use super::*;
 
-    fn make_header(height: u64) -> BlockHeader {
+    fn make_header(height: BlockHeight) -> BlockHeader {
         BlockHeader {
             shard_group_id: ShardGroupId(0),
-            height: BlockHeight(height),
+            height,
             parent_hash: Hash::from_bytes(b"parent"),
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(0),
@@ -101,7 +101,7 @@ mod tests {
 
     #[test]
     fn test_block_header_gossip_creation() {
-        let header = make_header(1);
+        let header = make_header(BlockHeight(1));
         let manifest = BlockManifest {
             tx_hashes: vec![
                 Hash::from_bytes(b"tx1"),
@@ -120,7 +120,7 @@ mod tests {
 
     #[test]
     fn test_block_header_gossip_into_parts() {
-        let header = make_header(5);
+        let header = make_header(BlockHeight(5));
         let manifest = BlockManifest {
             tx_hashes: vec![Hash::from_bytes(b"tx1")],
             ..Default::default()
@@ -139,7 +139,7 @@ mod tests {
         let tx3 = Hash::from_bytes(b"tx3");
 
         let gossip = BlockHeaderNotification::new(
-            make_header(1),
+            make_header(BlockHeight(1)),
             BlockManifest {
                 tx_hashes: vec![tx1, tx2, tx3],
                 ..Default::default()

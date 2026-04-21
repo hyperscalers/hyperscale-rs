@@ -30,7 +30,7 @@ use std::sync::Arc;
 /// concurrently with other readers, while commits take a write lock.
 pub(crate) struct SharedState {
     pub tree_store: SimTreeStore,
-    pub current_block_height: u64,
+    pub current_block_height: BlockHeight,
     pub current_root_hash: StateRootHash,
     /// Leaf-key → substate-value associations for historical queries.
     pub associations: HashMap<jmt::NodeKey, Vec<u8>>,
@@ -52,7 +52,7 @@ impl SharedState {
             // RocksDB GC respects `jmt_history_length` (default 256).
             // In simulation, tests are short-lived so retaining all nodes is fine.
             tree_store: SimTreeStore::new(),
-            current_block_height: 0,
+            current_block_height: BlockHeight::GENESIS,
             current_root_hash: Hash::ZERO,
             current_state: BTreeMap::new(),
             state_history: BTreeMap::new(),
@@ -84,7 +84,7 @@ impl SharedState {
             self.associations.insert(a.tree_node_key, a.substate_value);
         }
 
-        self.current_block_height = snapshot.new_height.0;
+        self.current_block_height = snapshot.new_height;
         self.current_root_hash = snapshot.result_root;
     }
 }

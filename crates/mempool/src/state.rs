@@ -1388,14 +1388,14 @@ mod tests {
     }
 
     fn make_test_block(
-        height: u64,
+        height: BlockHeight,
         transactions: Vec<RoutableTransaction>,
         wave_certs: Vec<WaveCertificate>,
     ) -> Block {
         Block::Live {
             header: BlockHeader {
                 shard_group_id: ShardGroupId(0),
-                height: BlockHeight(height),
+                height,
                 parent_hash: Hash::from_bytes(b"parent"),
                 parent_qc: QuorumCertificate::genesis(),
                 proposer: ValidatorId(0),
@@ -1496,7 +1496,7 @@ mod tests {
         mempool.on_submit_transaction(&topology, Arc::new(tx.clone()));
 
         let commit_block = push_finalized_wave(
-            make_test_block(1, vec![tx], vec![]),
+            make_test_block(BlockHeight(1), vec![tx], vec![]),
             Arc::new(make_test_finalized_wave(
                 BlockHeight(1),
                 tx_hash,
@@ -1536,7 +1536,7 @@ mod tests {
         // Submit and commit the transaction with an Accept-decision wave cert.
         mempool.on_submit_transaction(&topology, Arc::new(tx.clone()));
         let commit_block = push_finalized_wave(
-            make_test_block(1, vec![tx], vec![]),
+            make_test_block(BlockHeight(1), vec![tx], vec![]),
             Arc::new(make_test_finalized_wave(
                 BlockHeight(1),
                 tx_hash,
@@ -1561,7 +1561,7 @@ mod tests {
         // Submit and complete the transaction (commit + Accept wave cert in one block).
         mempool.on_submit_transaction(&topology, Arc::new(tx.clone()));
         let commit_block = push_finalized_wave(
-            make_test_block(1, vec![tx.clone()], vec![]),
+            make_test_block(BlockHeight(1), vec![tx.clone()], vec![]),
             Arc::new(make_test_finalized_wave(
                 BlockHeight(1),
                 tx_hash,
@@ -1592,7 +1592,7 @@ mod tests {
         // Submit and complete the transaction (commit + Accept wave cert in one block).
         mempool.on_submit_transaction(&topology, Arc::new(tx.clone()));
         let commit_block = push_finalized_wave(
-            make_test_block(1, vec![tx.clone()], vec![]),
+            make_test_block(BlockHeight(1), vec![tx.clone()], vec![]),
             Arc::new(make_test_finalized_wave(
                 BlockHeight(1),
                 tx_hash,
@@ -1620,7 +1620,7 @@ mod tests {
         // Submit and commit with an Aborted-decision wave cert.
         mempool.on_submit_transaction(&topology, Arc::new(tx.clone()));
         let commit_block = push_finalized_wave(
-            make_test_block(1, vec![tx.clone()], vec![]),
+            make_test_block(BlockHeight(1), vec![tx.clone()], vec![]),
             Arc::new(make_test_finalized_wave(
                 BlockHeight(1),
                 tx_hash,
@@ -1649,7 +1649,7 @@ mod tests {
 
             mempool.on_submit_transaction(&topology, Arc::new(tx.clone()));
             let commit_block = push_finalized_wave(
-                make_test_block(i as u64, vec![tx], vec![]),
+                make_test_block(BlockHeight(i as u64), vec![tx], vec![]),
                 Arc::new(make_test_finalized_wave(
                     BlockHeight(i as u64),
                     tx_hash,
@@ -1689,7 +1689,7 @@ mod tests {
         // Commit the transaction with an Accept-decision wave cert.
         mempool.on_submit_transaction(&topology, Arc::new(tx.clone()));
         let commit_block = push_finalized_wave(
-            make_test_block(10, vec![tx.clone()], vec![]),
+            make_test_block(BlockHeight(10), vec![tx.clone()], vec![]),
             Arc::new(make_test_finalized_wave(
                 BlockHeight(10),
                 tx_hash,

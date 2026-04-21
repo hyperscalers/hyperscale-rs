@@ -341,12 +341,12 @@ mod tests {
     /// Create a provision with source nodes (entries) and target nodes per tx.
     fn make_batch(
         source_shard: ShardGroupId,
-        height: u64,
+        height: BlockHeight,
         txs: Vec<(Hash, Vec<NodeId>, Vec<NodeId>)>,
     ) -> Provision {
         Provision::new(
             source_shard,
-            BlockHeight(height),
+            height,
             MerkleInclusionProof::dummy(),
             txs.into_iter()
                 .map(|(hash, source_nodes, target_nodes)| TxEntries {
@@ -385,7 +385,7 @@ mod tests {
         let remote_tx = Hash::from_bytes(b"tx_beta");
         let batch = make_batch(
             ShardGroupId(1),
-            10,
+            BlockHeight(10),
             vec![(remote_tx, vec![node_b], vec![local_node])],
         );
         let conflicts = detector.detect_conflicts(&batch, WeightedTimestamp(10 * 500));
@@ -408,7 +408,7 @@ mod tests {
         let remote_tx = Hash::from_bytes(b"tx_beta");
         let batch = make_batch(
             ShardGroupId(1),
-            10,
+            BlockHeight(10),
             vec![(remote_tx, vec![remote_node], vec![local_b])],
         );
         let conflicts = detector.detect_conflicts(&batch, WeightedTimestamp(10 * 500));
@@ -430,7 +430,7 @@ mod tests {
         // Remote provision: source has remote_node (overlap dir 1), targets local_node (overlap dir 2)
         let batch = make_batch(
             ShardGroupId(1),
-            10,
+            BlockHeight(10),
             vec![(lower, vec![remote_node], vec![local_node])],
         );
         let conflicts = detector.detect_conflicts(&batch, WeightedTimestamp(10 * 500));
@@ -454,7 +454,7 @@ mod tests {
 
         let batch = make_batch(
             ShardGroupId(1),
-            10,
+            BlockHeight(10),
             vec![(higher, vec![remote_node], vec![local_node])],
         );
         let conflicts = detector.detect_conflicts(&batch, WeightedTimestamp(10 * 500));
@@ -473,7 +473,7 @@ mod tests {
         // Provisions commit FIRST
         let batch = make_batch(
             ShardGroupId(1),
-            5,
+            BlockHeight(5),
             vec![(lower, vec![remote_node], vec![local_node])],
         );
         let fwd_conflicts = detector.detect_conflicts(&batch, WeightedTimestamp(5 * 500));
@@ -501,7 +501,7 @@ mod tests {
         // Provisions commit first with the higher hash
         let batch = make_batch(
             ShardGroupId(1),
-            5,
+            BlockHeight(5),
             vec![(higher, vec![remote_node], vec![local_node])],
         );
         detector.detect_conflicts(&batch, WeightedTimestamp(5 * 500));
@@ -526,7 +526,7 @@ mod tests {
         let remote_tx = Hash::from_bytes(b"tx_beta");
         let batch = make_batch(
             ShardGroupId(1),
-            10,
+            BlockHeight(10),
             vec![(remote_tx, vec![remote_node], vec![local_node])],
         );
         let conflicts = detector.detect_conflicts(&batch, WeightedTimestamp(10 * 500));
@@ -547,7 +547,7 @@ mod tests {
         let remote_tx = Hash::from_bytes(b"tx_beta");
         let batch = make_batch(
             ShardGroupId(0),
-            10,
+            BlockHeight(10),
             vec![(remote_tx, vec![remote_node], vec![local_node])],
         );
         let conflicts = detector.detect_conflicts(&batch, WeightedTimestamp(10 * 500));
@@ -565,7 +565,7 @@ mod tests {
 
         let batch = make_batch(
             ShardGroupId(1),
-            5,
+            BlockHeight(5),
             vec![(lower, vec![remote_node], vec![local_node])],
         );
         detector.detect_conflicts(&batch, WeightedTimestamp(5 * 500));

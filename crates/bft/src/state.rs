@@ -139,7 +139,7 @@ pub struct BftState {
     view_at_height_start: Round,
 
     /// Latest committed block height.
-    committed_height: u64,
+    committed_height: BlockHeight,
 
     /// Hash of the latest committed block.
     committed_hash: Hash,
@@ -182,7 +182,7 @@ pub struct BftState {
     /// Key: height, Value: (block_hash, round)
     /// We also track the round to allow re-voting for the SAME block in a later round
     /// (which is safe), while preventing votes for DIFFERENT blocks at the same height and round.
-    voted_heights: HashMap<u64, (Hash, Round)>,
+    voted_heights: HashMap<BlockHeight, (Hash, Round)>,
 
     /// Tracks which block each validator has voted for at each height.
     /// Key: (height, validator_id), Value: block_hash
@@ -195,7 +195,7 @@ pub struct BftState {
     ///
     /// Maps (height, voter) -> (block_hash, round) so we can distinguish legitimate revotes
     /// (different round) from Byzantine equivocation (same round, different block).
-    received_votes_by_height: HashMap<(u64, ValidatorId), (Hash, Round)>,
+    received_votes_by_height: HashMap<(BlockHeight, ValidatorId), (Hash, Round)>,
 
     /// Blocks that have been certified (have QC) but not yet committed.
     /// Maps block_hash -> Block.
@@ -212,13 +212,14 @@ pub struct BftState {
     /// When we receive a BlockReadyToCommit for height N but we're still at committed_height < N-1,
     /// we buffer it here and process it once the earlier blocks are committed.
     /// This handles out-of-order commit events caused by parallel signature verification.
-    pending_commits: std::collections::BTreeMap<u64, (Hash, QuorumCertificate, CommitSource)>,
+    pending_commits:
+        std::collections::BTreeMap<BlockHeight, (Hash, QuorumCertificate, CommitSource)>,
 
     /// Commits waiting for block data (transactions/certificates) to arrive.
     /// Maps block_hash -> (height, QC, source).
     /// When BlockReadyToCommit fires but the block isn't complete yet (still fetching
     /// transactions), we buffer the commit here and retry when the data arrives.
-    pending_commits_awaiting_data: HashMap<Hash, (u64, QuorumCertificate, CommitSource)>,
+    pending_commits_awaiting_data: HashMap<Hash, (BlockHeight, QuorumCertificate, CommitSource)>,
 
     /// In-flight proposal awaiting `Event::ProposalBuilt` callback.
     pending_proposal: Option<PendingProposal>,
@@ -306,7 +307,7 @@ impl BftState {
             node_index,
             view: Round::INITIAL,
             view_at_height_start: Round::INITIAL,
-            committed_height: recovered.committed_height.0,
+            committed_height: recovered.committed_height,
             committed_hash: recovered
                 .committed_hash
                 .unwrap_or(Hash::from_bytes(&[0u8; 32])),
@@ -325,7 +326,7 @@ impl BftState {
             voted_heights: HashMap::new(),
             received_votes_by_height: HashMap::new(),
             certified_blocks: HashMap::new(),
-            verification: VerificationPipeline::new(recovered.committed_height.0),
+            verification: VerificationPipeline::new(recovered.committed_height),
             sync: SyncManager::new(),
             pending_commits: std::collections::BTreeMap::new(),
             pending_commits_awaiting_data: HashMap::new(),
@@ -564,7 +565,7 @@ impl BftState {
     fn start_sync(
         &mut self,
         topology: &TopologySnapshot,
-        target_height: u64,
+        target_height: BlockHeight,
         target_hash: Hash,
     ) -> Vec<Action> {
         // Don't raise the target while already syncing. The io_loop's
@@ -577,9 +578,9 @@ impl BftState {
 
         info!(
             validator = ?topology.local_validator_id(),
-            target_height,
+            target_height = target_height.0,
             target_hash = ?target_hash,
-            committed_height = self.committed_height,
+            committed_height = self.committed_height.0,
             "Starting sync - setting syncing flag and requesting blocks"
         );
 
@@ -591,7 +592,7 @@ impl BftState {
         self.sync.set_sync_target(target_height);
 
         vec![Action::StartSync {
-            target_height: BlockHeight(target_height),
+            target_height,
             target_hash,
         }]
     }
@@ -602,15 +603,15 @@ impl BftState {
         topology: &TopologySnapshot,
         certified: CertifiedBlock,
     ) -> Vec<Action> {
-        let block_height = certified.block.height().0;
+        let block_height = certified.block.height();
 
         // Ignore stale blocks that have already been committed.
         // Late-arriving sync blocks can arrive after sync completes.
         if block_height <= self.committed_height {
             warn!(
                 validator = ?topology.local_validator_id(),
-                block_height,
-                committed_height = self.committed_height,
+                block_height = block_height.0,
+                committed_height = self.committed_height.0,
                 "Ignoring stale synced block - already committed"
             );
             return vec![];
@@ -740,7 +741,7 @@ impl BftState {
             .latest_qc
             .as_ref()
             .map(|qc| qc.height.0 + 1)
-            .unwrap_or(self.committed_height + 1);
+            .unwrap_or(self.committed_height.0 + 1);
         let has_incomplete_block_at_tip = self
             .pending_blocks
             .values()
@@ -862,7 +863,7 @@ impl BftState {
         }
 
         // Restore committed state
-        self.committed_height = height.0;
+        self.committed_height = height;
         if let Some(h) = hash {
             self.committed_hash = h;
         }
@@ -873,7 +874,7 @@ impl BftState {
 
         // Clean up any votes for heights at or below the committed height.
         // This handles the case where we loaded votes from storage that are now stale.
-        let removed_blocks = self.cleanup_old_state(height.0);
+        let removed_blocks = self.cleanup_old_state(height);
 
         // Record recovery time as initial leader activity so that the view
         // change timeout counts from startup rather than being disabled.
@@ -881,7 +882,7 @@ impl BftState {
 
         info!(
             validator = ?topology.local_validator_id(),
-            committed_height = self.committed_height,
+            committed_height = self.committed_height.0,
             committed_hash = ?self.committed_hash,
             has_qc = qc.is_some(),
             "Recovered chain state from storage"
@@ -938,21 +939,21 @@ impl BftState {
         let next_height = self
             .latest_qc
             .as_ref()
-            .map(|qc| qc.height.0 + 1)
-            .unwrap_or(self.committed_height + 1);
+            .map(|qc| qc.height.next())
+            .unwrap_or(self.committed_height.next());
         let round = self.view;
 
         // Check if we should propose
-        if !topology.should_propose(BlockHeight(next_height), round) {
+        if !topology.should_propose(next_height, round) {
             return vec![];
         }
 
         // Skip if a BuildProposal is already in-flight for this height.
         if let Some(ref pending) = self.pending_proposal {
-            if pending.height.0 == next_height && pending.round == round {
+            if pending.height == next_height && pending.round == round {
                 trace!(
                     validator = ?topology.local_validator_id(),
-                    height = next_height,
+                    height = next_height.0,
                     round = round.0,
                     "Proposal build already in-flight, skipping"
                 );
@@ -982,7 +983,7 @@ impl BftState {
         };
 
         let timestamp = ProposerTimestamp(self.now.as_millis() as u64);
-        let block_height = BlockHeight(next_height);
+        let block_height = next_height;
 
         // Walk the QC chain to find certificates and transactions already in
         // pending/certified blocks above committed height. Excluding these
@@ -1057,7 +1058,7 @@ impl BftState {
 
         info!(
             validator = ?topology.local_validator_id(),
-            height = next_height,
+            height = next_height.0,
             round = round.0,
             transactions = transactions.len(),
             waves = waves_to_propose.len(),
@@ -1128,7 +1129,7 @@ impl BftState {
     fn build_and_broadcast_fallback_block(
         &mut self,
         topology: &TopologySnapshot,
-        height: u64,
+        height: BlockHeight,
         round: Round,
     ) -> Vec<Action> {
         // Get parent info from latest QC
@@ -1145,11 +1146,11 @@ impl BftState {
         let parent_state_root = self.parent_state_root(parent_hash);
         let parent_in_flight = self.parent_in_flight(parent_hash);
         let parent_block_height = parent_qc.height;
-        let block_height = BlockHeight(height);
+        let block_height = height;
 
         info!(
             validator = ?topology.local_validator_id(),
-            height = height,
+            height = height.0,
             round = round.0,
             "Building fallback block (leader timeout)"
         );
@@ -1215,7 +1216,7 @@ impl BftState {
     fn build_and_broadcast_sync_block(
         &mut self,
         topology: &TopologySnapshot,
-        height: u64,
+        height: BlockHeight,
         round: Round,
     ) -> Vec<Action> {
         // Get parent info from latest QC
@@ -1233,11 +1234,11 @@ impl BftState {
         let parent_state_root = self.parent_state_root(parent_hash);
         let parent_in_flight = self.parent_in_flight(parent_hash);
         let parent_block_height = parent_qc.height;
-        let block_height = BlockHeight(height);
+        let block_height = height;
 
         info!(
             validator = ?topology.local_validator_id(),
-            height = height,
+            height = height.0,
             round = round.0,
             "Building sync block (syncing, empty payload)"
         );
@@ -1306,7 +1307,7 @@ impl BftState {
         &mut self,
         topology: &TopologySnapshot,
         block_hash: Hash,
-        height: u64,
+        height: BlockHeight,
     ) -> Vec<Action> {
         let mut actions = vec![];
 
@@ -1316,7 +1317,7 @@ impl BftState {
             // View change timer will handle further recovery.
             warn!(
                 validator = ?topology.local_validator_id(),
-                height = height,
+                height = height.0,
                 block_hash = ?block_hash,
                 "Cannot re-propose: locked block not found in pending_blocks"
             );
@@ -1340,7 +1341,7 @@ impl BftState {
 
         info!(
             validator = ?topology.local_validator_id(),
-            height = height,
+            height = height.0,
             original_round = original_round.0,
             block_hash = ?block_hash,
             tx_count = manifest.transaction_count(),
@@ -1393,13 +1394,13 @@ impl BftState {
         lookup_provision: impl Fn(&Hash) -> Option<Arc<Provision>>,
     ) -> Vec<Action> {
         let block_hash = header.hash();
-        let height = header.height.0;
+        let height = header.height;
         let round = header.round;
 
         debug!(
             validator = ?topology.local_validator_id(),
             proposer = ?header.proposer,
-            height = height,
+            height = height.0,
             round = round.0,
             block_hash = ?block_hash,
             "Received block header"
@@ -1421,7 +1422,7 @@ impl BftState {
         // syncing validators to still participate in consensus at the tip (building QCs,
         // proposing empty sync blocks) while catching up on historical blocks in parallel.
         if !header.parent_qc.is_genesis() {
-            let parent_height = header.parent_qc.height.0;
+            let parent_height = header.parent_qc.height;
             let parent_block_hash = header.parent_qc.block_hash;
 
             // Check if we have a COMPLETE parent block. If the parent is incomplete
@@ -1436,9 +1437,9 @@ impl BftState {
 
                 info!(
                     validator = ?topology.local_validator_id(),
-                    committed_height = self.committed_height,
-                    parent_height = parent_height,
-                    target_height = target_height,
+                    committed_height = self.committed_height.0,
+                    parent_height = parent_height.0,
+                    target_height = target_height.0,
                     "Missing parent block, triggering sync (continuing to process header)"
                 );
 
@@ -1492,7 +1493,7 @@ impl BftState {
                 validator = ?topology.local_validator_id(),
                 old_view = self.view.0,
                 new_view = round.0,
-                header_height = height,
+                header_height = height.0,
                 "View synchronization: advancing view to match received block header"
             );
             self.view = round;
@@ -1511,7 +1512,7 @@ impl BftState {
         // Record leader activity for receiving a valid header.
         // Rate-limited to once per (height, round) to prevent Byzantine leaders
         // from spamming different headers to delay view changes.
-        self.record_header_activity(BlockHeight(height), round);
+        self.record_header_activity(height, round);
 
         // Check if we already have this block
         if self.pending_blocks.contains_key(&block_hash) {
@@ -1671,19 +1672,19 @@ impl BftState {
         topology: &TopologySnapshot,
         header: &BlockHeader,
     ) -> Result<(), String> {
-        let height = header.height.0;
+        let height = header.height;
         let round = header.round;
 
         // Check height is above what we've committed (reject old blocks)
         if height <= self.committed_height {
             return Err(format!(
                 "height {} is at or below committed height {}",
-                height, self.committed_height
+                height.0, self.committed_height.0
             ));
         }
 
         // Check proposer is correct for this height/round
-        let expected_proposer = topology.proposer_for(BlockHeight(height), round);
+        let expected_proposer = topology.proposer_for(height, round);
         if header.proposer != expected_proposer {
             return Err(format!(
                 "wrong proposer: expected {:?}, got {:?}",
@@ -1706,10 +1707,10 @@ impl BftState {
             }
 
             // The parent QC's height should be one less than this block's height
-            if header.parent_qc.height.0 + 1 != height {
+            if header.parent_qc.height.0 + 1 != height.0 {
                 return Err(format!(
                     "parent QC height {} doesn't match block height {} - 1",
-                    header.parent_qc.height.0, height
+                    header.parent_qc.height.0, height.0
                 ));
             }
 
@@ -1725,10 +1726,10 @@ impl BftState {
             // The caller (on_block_header) will delegate verification before voting.
         } else {
             // Genesis QC - this should only be for height 1
-            if height != self.committed_height + 1 {
+            if height.0 != self.committed_height.0 + 1 {
                 return Err(format!(
                     "genesis QC only valid for first block after committed height, got height {}",
-                    height
+                    height.0
                 ));
             }
         }
@@ -1818,7 +1819,7 @@ impl BftState {
         };
 
         let header = pending.header().clone();
-        let height = header.height.0;
+        let height = header.height;
         let round = header.round;
 
         // For non-genesis QC, delegate signature verification before voting.
@@ -1874,7 +1875,7 @@ impl BftState {
         &mut self,
         topology: &TopologySnapshot,
         block_hash: Hash,
-        height: u64,
+        height: BlockHeight,
         round: Round,
     ) -> Vec<Action> {
         // Check vote locking - have we already voted for a block at this height?
@@ -1888,7 +1889,7 @@ impl BftState {
                 trace!(
                     validator = ?topology.local_validator_id(),
                     block_hash = ?block_hash,
-                    height = height,
+                    height = height.0,
                     round = round.0,
                     existing_round = existing_round.0,
                     "Already voted for this block"
@@ -1909,7 +1910,7 @@ impl BftState {
                     existing_round = existing_round.0,
                     new = ?block_hash,
                     new_round = round.0,
-                    height = height,
+                    height = height.0,
                     "Vote locking: already voted for different block at this height (view change)"
                 );
                 vote_locked = true;
@@ -2176,7 +2177,7 @@ impl BftState {
 
     /// Create a vote for a block.
     #[tracing::instrument(level = "debug", skip(self), fields(
-        height = height,
+        height = height.0,
         round = round.0,
         sign_us = tracing::field::Empty,
     ))]
@@ -2184,7 +2185,7 @@ impl BftState {
         &mut self,
         topology: &TopologySnapshot,
         block_hash: Hash,
-        height: u64,
+        height: BlockHeight,
         round: Round,
     ) -> Vec<Action> {
         // Record that we voted for this block at this height.
@@ -2204,20 +2205,20 @@ impl BftState {
 
         debug!(
             validator = ?topology.local_validator_id(),
-            height = height,
+            height = height.0,
             round = round.0,
             block_hash = ?block_hash,
             "Emitting vote (signing delegated to crypto pool)"
         );
 
-        let recipients = self.vote_recipients(topology, BlockHeight(height), round);
+        let recipients = self.vote_recipients(topology, height, round);
 
         // Emit SignAndBroadcastBlockVote — the io_loop signs on the consensus
         // crypto pool, broadcasts, and feeds the signed vote back for local
         // VoteSet tracking via BlockVoteReceived.
         vec![Action::SignAndBroadcastBlockVote {
             block_hash,
-            height: BlockHeight(height),
+            height,
             round,
             timestamp,
             recipients,
@@ -2264,15 +2265,15 @@ impl BftState {
         vote: BlockVote,
     ) -> Vec<Action> {
         let block_hash = vote.block_hash;
-        let height = vote.height.0;
+        let height = vote.height;
         let is_own_vote = vote.voter == topology.local_validator_id();
 
         // Early out: skip votes for already-committed heights.
         // This prevents wasting crypto resources verifying stale votes.
         if height <= self.committed_height {
             trace!(
-                vote_anchor_ts_ms = height,
-                committed_height = self.committed_height,
+                vote_anchor_ts_ms = height.0,
+                committed_height = self.committed_height.0,
                 voter = ?vote.voter,
                 "Skipping vote for already-committed height"
             );
@@ -2479,7 +2480,7 @@ impl BftState {
             // Equivocation detection: check if this validator already voted for a DIFFERENT
             // block at the same height AND round. Voting for different blocks at different
             // rounds is allowed (vote lock release on timeout/QC), but same round is Byzantine behavior.
-            let vote_key = (vote.height.0, vote.voter);
+            let vote_key = (vote.height, vote.voter);
             if let Some(&(existing_hash, existing_round)) =
                 self.received_votes_by_height.get(&vote_key)
             {
@@ -2598,12 +2599,12 @@ impl BftState {
         // Cache the verified QC so we don't re-verify it for other blocks
         // with the same parent_qc (e.g., during view changes).
         let qc_block_hash = header.parent_qc.block_hash;
-        let qc_height = header.parent_qc.height.0;
+        let qc_height = header.parent_qc.height;
         self.verification
             .cache_verified_qc(qc_block_hash, qc_height);
 
         // QC is valid - proceed to vote on the block
-        let height = header.height.0;
+        let height = header.height;
         let round = header.round;
         self.try_vote_on_block(topology, block_hash, height, round)
     }
@@ -2682,7 +2683,7 @@ impl BftState {
             return vec![];
         }
 
-        let height = pending_block.header().height.0;
+        let height = pending_block.header().height;
         let round = pending_block.header().round;
 
         self.create_vote(topology, block_hash, height, round)
@@ -2769,7 +2770,7 @@ impl BftState {
         }];
 
         // Vote for our own block
-        actions.extend(self.create_vote(topology, block_hash, height.0, round));
+        actions.extend(self.create_vote(topology, block_hash, height, round));
 
         actions
     }
@@ -2791,10 +2792,9 @@ impl BftState {
     pub fn on_block_persisted(
         &mut self,
         topology: &TopologySnapshot,
-        block_height: u64,
+        block_height: BlockHeight,
     ) -> Vec<Action> {
-        self.verification
-            .on_block_persisted(BlockHeight(block_height));
+        self.verification.on_block_persisted(block_height);
 
         // Auto-resume from sync when persistence catches up to the sync target.
         // This replaces the fragile SyncComplete → BlockPersisted two-event
@@ -2846,7 +2846,7 @@ impl BftState {
         };
 
         // Only count if we haven't already committed this height
-        if committable_height.0 <= self.committed_height {
+        if committable_height <= self.committed_height {
             return (0, 0);
         }
 
@@ -2916,12 +2916,12 @@ impl BftState {
         finalized_waves: Vec<Arc<FinalizedWave>>,
         provision_batches: Vec<Arc<Provision>>,
     ) -> Vec<Action> {
-        let height = qc.height.0;
+        let height = qc.height;
 
         info!(
             validator = ?topology.local_validator_id(),
             block_hash = ?block_hash,
-            height = height,
+            height = height.0,
             "QC formed"
         );
 
@@ -2943,7 +2943,7 @@ impl BftState {
             } else {
                 debug!(
                     block_hash = ?block_hash,
-                    height = height,
+                    height = height.0,
                     "Deferring QC adoption — block header not yet in memory"
                 );
                 self.deferred_qc = Some((block_hash, qc.clone()));
@@ -2990,7 +2990,7 @@ impl BftState {
             return vec![];
         };
 
-        if committable_height.0 <= self.committed_height {
+        if committable_height <= self.committed_height {
             return vec![];
         }
 
@@ -3040,13 +3040,13 @@ impl BftState {
         let Some(block) = block else {
             // Block not yet constructed - check if it's pending (waiting for transactions/certificates)
             if let Some(pending) = self.pending_blocks.get(&block_hash) {
-                let height = pending.header().height.0;
+                let height = pending.header().height;
                 // Only buffer if not already committed
                 if height > self.committed_height {
                     debug!(
                         validator = ?topology.local_validator_id(),
                         block_hash = ?block_hash,
-                        height = height,
+                        height = height.0,
                         missing_txs = pending.missing_transaction_count(),
                         missing_waves = pending.missing_wave_count(),
                         "Block not yet complete, buffering commit until data arrives"
@@ -3061,7 +3061,7 @@ impl BftState {
                     validator = ?topology.local_validator_id(),
                     block_hash = ?block_hash,
                     qc_height = qc.height.0,
-                    committed_height = self.committed_height,
+                    committed_height = self.committed_height.0,
                     in_certified_blocks = in_certified,
                     certified_blocks_count = self.certified_blocks.len(),
                     pending_blocks_count = self.pending_blocks.len(),
@@ -3071,14 +3071,14 @@ impl BftState {
             return vec![];
         };
 
-        let height = block.height().0;
+        let height = block.height();
 
         // Check if we've already committed this or higher
         if height <= self.committed_height {
             trace!(
                 "Block {} at height {} already committed",
                 block_hash,
-                height
+                height.0
             );
             return vec![];
         }
@@ -3086,11 +3086,11 @@ impl BftState {
         // Buffer out-of-order commits for later processing
         // This handles the case where signature verification completes out of order,
         // causing BlockReadyToCommit events to arrive non-sequentially.
-        if height != self.committed_height + 1 {
+        if height != self.committed_height.next() {
             warn!(
                 "Buffering out-of-order commit: expected height {}, got {}",
-                self.committed_height + 1,
-                height
+                self.committed_height.0 + 1,
+                height.0
             );
             self.pending_commits
                 .insert(height, (block_hash, qc, source));
@@ -3115,7 +3115,7 @@ impl BftState {
             info!(
                 validator = ?topology.local_validator_id(),
                 block_hash = ?block_hash,
-                height = height,
+                height = height.0,
                 "Retrying commit after block data arrived"
             );
             self.on_block_ready_to_commit(topology, block_hash, qc, source)
@@ -3137,7 +3137,7 @@ impl BftState {
         block_hash: Hash,
         commit_ts_ms: u64,
     ) -> Vec<Hash> {
-        let height = block.height().0;
+        let height = block.height();
 
         self.committed_height = height;
         self.committed_hash = block_hash;
@@ -3195,21 +3195,21 @@ impl BftState {
                 break;
             };
 
-            let height = block.height().0;
+            let height = block.height();
 
             // Safety check - should always be the next expected height
-            if height != self.committed_height + 1 {
+            if height != self.committed_height.next() {
                 warn!(
                     "Unexpected height in commit_block_and_buffered: expected {}, got {}",
-                    self.committed_height + 1,
-                    height
+                    self.committed_height.0 + 1,
+                    height.0
                 );
                 break;
             }
 
             info!(
                 validator = ?topology.local_validator_id(),
-                height = height,
+                height = height.0,
                 block_hash = ?current_hash,
                 transactions = block.transactions().len(),
                 "Committing block"
@@ -3221,7 +3221,7 @@ impl BftState {
             // record_block_committed advances it.
             let state_root_verified = self.verification.is_state_root_verified(&current_hash);
             let parent_state_root = self.committed_state_root;
-            let parent_block_height = BlockHeight(self.committed_height);
+            let parent_block_height = self.committed_height;
 
             let removed_blocks = self.record_block_committed(
                 &block,
@@ -3263,13 +3263,13 @@ impl BftState {
             }
 
             // Check if the next height is buffered
-            let next_height = height + 1;
+            let next_height = height.next();
             if let Some((next_hash, next_qc, next_source)) =
                 self.pending_commits.remove(&next_height)
             {
                 debug!(
                     "Processing buffered commit for height {} after committing {}",
-                    next_height, height
+                    next_height.0, height.0
                 );
                 current_hash = next_hash;
                 current_qc = next_qc;
@@ -3305,12 +3305,12 @@ impl BftState {
         certified: CertifiedBlock,
     ) -> Vec<Action> {
         let block_hash = certified.block.hash();
-        let height = certified.block.height().0;
+        let height = certified.block.height();
 
         info!(
-            height,
+            height = height.0,
             block_hash = ?block_hash,
-            committed_height = self.committed_height,
+            committed_height = self.committed_height.0,
             pending_verifications = self.sync.pending_verification_count(),
             "Received synced block"
         );
@@ -3318,8 +3318,8 @@ impl BftState {
         // Check if we've already committed this or higher
         if height <= self.committed_height {
             info!(
-                height,
-                committed = self.committed_height,
+                height = height.0,
+                committed = self.committed_height.0,
                 "Synced block already committed - filtering"
             );
             return vec![];
@@ -3332,19 +3332,22 @@ impl BftState {
         // Check if we already have this block pending or buffered
         if self.sync.has_pending_verification(&block_hash) {
             info!(
-                height,
+                height = height.0,
                 "Synced block already pending verification - filtering"
             );
             return vec![];
         }
         if self.sync.has_buffered_height(height) {
-            info!(height, "Synced block already buffered - filtering");
+            info!(
+                height = height.0,
+                "Synced block already buffered - filtering"
+            );
             return vec![];
         }
 
         // Calculate what height we need next for sequential application.
         // We need the lowest height that's not yet pending or buffered.
-        let next_needed = self.committed_height + 1;
+        let next_needed = self.committed_height.next();
 
         // Check if this block is the next one we need
         if height == next_needed {
@@ -3365,9 +3368,9 @@ impl BftState {
         // height < next_needed but > committed_height - this shouldn't happen
         // if the checks above are correct, but handle gracefully
         warn!(
-            height,
-            next_needed,
-            committed = self.committed_height,
+            height = height.0,
+            next_needed = next_needed.0,
+            committed = self.committed_height.0,
             "Unexpected synced block height - already have or past this"
         );
         vec![]
@@ -3382,11 +3385,14 @@ impl BftState {
         certified: CertifiedBlock,
     ) -> Vec<Action> {
         let block_hash = certified.block.hash();
-        let height = certified.block.height().0;
+        let height = certified.block.height();
 
         // Genesis QC doesn't need signature verification
         if certified.qc.is_genesis() {
-            debug!(height, "Synced block has genesis QC, applying directly");
+            debug!(
+                height = height.0,
+                "Synced block has genesis QC, applying directly"
+            );
             return self.apply_synced_block(topology, certified);
         }
 
@@ -3398,7 +3404,7 @@ impl BftState {
 
         let qc = certified.qc.clone();
         info!(
-            height,
+            height = height.0,
             block_hash = ?block_hash,
             signers = qc.signers.count(),
             "Submitting synced block for QC verification"
@@ -3440,7 +3446,7 @@ impl BftState {
 
         // Find the next height we need - accounting for what's already pending verification
         let highest_pending_height = self.sync.highest_pending_height(self.committed_height);
-        let start_height = highest_pending_height.max(self.committed_height) + 1;
+        let start_height = highest_pending_height.max(self.committed_height) + 1u64;
 
         // Drain buffered blocks from the SyncManager
         let blocks = self.sync.drain_buffered(start_height, slots_available);
@@ -3465,11 +3471,11 @@ impl BftState {
     ) -> Vec<Action> {
         let CertifiedBlock { block, qc } = certified;
         let block_hash = block.hash();
-        let height = block.height().0;
+        let height = block.height();
 
         info!(
             validator = ?topology.local_validator_id(),
-            height = height,
+            height = height.0,
             block_hash = ?block_hash,
             transactions = block.transactions().len(),
             certificates = block.certificates().len(),
@@ -3486,7 +3492,7 @@ impl BftState {
             if let Err(err) = fw.validate_receipts_against_ec() {
                 warn!(
                     ?block_hash,
-                    height,
+                    height = height.0,
                     wave_id_hash = ?fw.wave_id_hash(),
                     ?err,
                     "Rejecting synced block: FinalizedWave receipts inconsistent with its EC"
@@ -3497,7 +3503,7 @@ impl BftState {
 
         // Capture parent state BEFORE record_block_committed advances heights.
         let parent_state_root = self.parent_state_root(block.header().parent_hash);
-        let parent_block_height = BlockHeight(self.committed_height);
+        let parent_block_height = self.committed_height;
 
         // Advance committed_height. The QC is the proof of commit — same
         // timing as the consensus path.
@@ -3563,7 +3569,7 @@ impl BftState {
         // sync_applied_height advance together in apply_synced_block.
         loop {
             let base = self.committed_height.max(self.sync.sync_applied_height());
-            let next_height = base + 1;
+            let next_height = base + 1u64;
 
             // Log state for debugging
             self.sync
@@ -3571,7 +3577,10 @@ impl BftState {
 
             // Take the next verified block at the expected height
             let Some(certified) = self.sync.take_verified_at_height(next_height) else {
-                info!(next_height, "No verified block at next height - stopping");
+                info!(
+                    next_height = next_height.0,
+                    "No verified block at next height - stopping"
+                );
                 break;
             };
 
@@ -3604,8 +3613,8 @@ impl BftState {
         let height = self
             .latest_qc
             .as_ref()
-            .map(|qc| qc.height.0 + 1)
-            .unwrap_or(self.committed_height + 1);
+            .map(|qc| qc.height.next())
+            .unwrap_or(self.committed_height.next());
         let old_round = self.view;
         self.view += 1;
         self.view_changes += 1;
@@ -3618,7 +3627,7 @@ impl BftState {
 
         info!(
             validator = ?topology.local_validator_id(),
-            height = height,
+            height = height.0,
             old_round = old_round.0,
             new_round = self.view.0,
             view_changes = self.view_changes,
@@ -3627,7 +3636,7 @@ impl BftState {
 
         // Log why any pending blocks at this height couldn't be verified in time.
         for pending in self.pending_blocks.values() {
-            if pending.header().height.0 == height {
+            if pending.header().height == height {
                 if let Some(block) = pending.block() {
                     if !self.verification.is_block_verified(&block) {
                         self.verification.log_incomplete_verification(&block);
@@ -3635,7 +3644,7 @@ impl BftState {
                 } else {
                     warn!(
                         block_hash = ?pending.header().hash(),
-                        height = height,
+                        height = height.0,
                         missing_txs = pending.missing_transaction_count(),
                         missing_waves = pending.missing_wave_count(),
                         "View change — block still incomplete (missing data)"
@@ -3650,7 +3659,11 @@ impl BftState {
         // seen it, a conflicting block can never reach quorum.
         // Note: this is more aggressive than HotStuff-2 (which requires a TC or
         // higher QC to unlock). See `maybe_unlock_for_qc` for QC-based unlocking.
-        let latest_qc_height = self.latest_qc.as_ref().map(|qc| qc.height.0).unwrap_or(0);
+        let latest_qc_height = self
+            .latest_qc
+            .as_ref()
+            .map(|qc| qc.height)
+            .unwrap_or(BlockHeight::GENESIS);
         if latest_qc_height < height {
             // No QC formed at current height - safe to unlock
             let had_vote = self.voted_heights.remove(&height).is_some();
@@ -3659,9 +3672,9 @@ impl BftState {
             if had_vote || cleared_votes > 0 {
                 info!(
                     validator = ?topology.local_validator_id(),
-                    height = height,
+                    height = height.0,
                     new_round = self.view.0,
-                    latest_qc_height = latest_qc_height,
+                    latest_qc_height = latest_qc_height.0,
                     cleared_votes = cleared_votes,
                     "Unlocking vote at height (no QC formed, safe by quorum intersection)"
                 );
@@ -3678,12 +3691,12 @@ impl BftState {
         };
 
         // Check if we're the new proposer for this height/round
-        if topology.should_propose(BlockHeight(height), self.view) {
+        if topology.should_propose(height, self.view) {
             // Check if we've already voted at this height - if so, we're locked
             if let Some(&(existing_hash, _)) = self.voted_heights.get(&height) {
                 info!(
                     validator = ?topology.local_validator_id(),
-                    height = height,
+                    height = height.0,
                     new_round = self.view.0,
                     existing_block = ?existing_hash,
                     "Vote-locked at this height, re-proposing"
@@ -3695,7 +3708,7 @@ impl BftState {
 
             info!(
                 validator = ?topology.local_validator_id(),
-                height = height,
+                height = height.0,
                 new_round = self.view.0,
                 "We are the new proposer after round advance - building block"
             );
@@ -3770,8 +3783,8 @@ impl BftState {
         // This is safe because:
         // 1. Heights < H: consensus has moved past these heights
         // 2. Height = H: if we voted for a different block, it can never get a QC (quorum intersection)
-        let qc_height = qc.height.0;
-        let unlocked: Vec<u64> = self
+        let qc_height = qc.height;
+        let unlocked: Vec<BlockHeight> = self
             .voted_heights
             .keys()
             .filter(|h| **h <= qc_height)
@@ -3782,8 +3795,8 @@ impl BftState {
             if self.voted_heights.remove(&height).is_some() {
                 trace!(
                     validator = ?topology.local_validator_id(),
-                    height = height,
-                    qc_height = qc_height,
+                    height = height.0,
+                    qc_height = qc_height.0,
                     "Unlocked vote due to higher QC"
                 );
             }
@@ -4117,7 +4130,7 @@ impl BftState {
     /// 3. If we cleared ALL verifications, we'd lose the valid vote at round N
     ///
     /// Returns the number of vote entries cleared.
-    fn clear_vote_tracking_for_height(&mut self, height: u64, new_round: Round) -> usize {
+    fn clear_vote_tracking_for_height(&mut self, height: BlockHeight, new_round: Round) -> usize {
         let mut cleared = 0;
 
         // Clear received_votes_by_height for this height
@@ -4151,18 +4164,18 @@ impl BftState {
     ///
     /// Returns the hashes of pending blocks that were removed, so callers can
     /// emit `CancelFetch` actions to clean up any in-flight fetch operations.
-    fn cleanup_old_state(&mut self, committed_height: u64) -> Vec<Hash> {
+    fn cleanup_old_state(&mut self, committed_height: BlockHeight) -> Vec<Hash> {
         // Collect hashes of pending blocks that will be removed
         let removed_hashes: Vec<Hash> = self
             .pending_blocks
             .iter()
-            .filter(|(_, pending)| pending.header().height.0 <= committed_height)
+            .filter(|(_, pending)| pending.header().height <= committed_height)
             .map(|(hash, _)| *hash)
             .collect();
 
         // Remove pending blocks at or below committed height
         self.pending_blocks
-            .retain(|_, pending| pending.header().height.0 > committed_height);
+            .retain(|_, pending| pending.header().height > committed_height);
 
         // Also clean up fetch coordinator to match pending_blocks
         self.fetch.cleanup(&self.pending_blocks);
@@ -4181,7 +4194,7 @@ impl BftState {
 
         // Remove certified blocks at or below committed height
         self.certified_blocks
-            .retain(|_, block| block.height().0 > committed_height);
+            .retain(|_, block| block.height() > committed_height);
 
         // Remove pending commits awaiting data at or below committed height
         self.pending_commits_awaiting_data
@@ -4324,7 +4337,7 @@ impl BftState {
             return vec![];
         };
 
-        let qc_height = latest_qc.height.0;
+        let qc_height = latest_qc.height;
         let qc_hash = latest_qc.block_hash;
 
         // If we're already at or past the QC height, nothing to do
@@ -4341,7 +4354,7 @@ impl BftState {
         // The critical check is whether we have a COMPLETE block at the next height
         // we need to commit. Having blocks at higher heights doesn't help if we're
         // stuck on an earlier incomplete block.
-        let next_needed_height = self.committed_height + 1;
+        let next_needed_height = self.committed_height.next();
 
         // Check if we have the block data AND the commit authority for the next height.
         // Having block data alone is NOT enough - we also need a pending commit
@@ -4350,15 +4363,15 @@ impl BftState {
         let has_pending_commit = self.pending_commits.contains_key(&next_needed_height);
 
         // Log sync health status when behind
-        let gap = qc_height.saturating_sub(self.committed_height);
+        let gap = qc_height - self.committed_height;
         if gap > 5 {
             let pending_commit_count = self.pending_commits.len();
             let pending_data_count = self.pending_commits_awaiting_data.len();
             warn!(
                 validator = ?topology.local_validator_id(),
-                committed_height = self.committed_height,
-                next_needed_height = next_needed_height,
-                qc_height = qc_height,
+                committed_height = self.committed_height.0,
+                next_needed_height = next_needed_height.0,
+                qc_height = qc_height.0,
                 gap = gap,
                 has_next_complete = has_next_block,
                 has_pending_commit = has_pending_commit,
@@ -4380,9 +4393,9 @@ impl BftState {
                 if gap > 10 {
                     warn!(
                         validator = ?topology.local_validator_id(),
-                        committed_height = self.committed_height,
-                        next_needed_height = next_needed_height,
-                        qc_height = qc_height,
+                        committed_height = self.committed_height.0,
+                        next_needed_height = next_needed_height.0,
+                        qc_height = qc_height.0,
                         gap = gap,
                         "Have complete block and pending commit but significantly behind - triggering sync to recover"
                     );
@@ -4401,9 +4414,9 @@ impl BftState {
             if gap > 3 {
                 warn!(
                     validator = ?topology.local_validator_id(),
-                    committed_height = self.committed_height,
-                    next_needed_height = next_needed_height,
-                    qc_height = qc_height,
+                    committed_height = self.committed_height.0,
+                    next_needed_height = next_needed_height.0,
+                    qc_height = qc_height.0,
                     gap = gap,
                     "Have complete block but no pending commit (missing QC) - triggering sync to recover"
                 );
@@ -4418,9 +4431,9 @@ impl BftState {
         // Trigger sync to get the complete block data.
         info!(
             validator = ?topology.local_validator_id(),
-            committed_height = self.committed_height,
-            next_needed_height = next_needed_height,
-            qc_height = qc_height,
+            committed_height = self.committed_height.0,
+            next_needed_height = next_needed_height.0,
+            qc_height = qc_height.0,
             "Sync health check: can't make progress, triggering catch-up sync"
         );
 
@@ -4517,7 +4530,7 @@ impl BftState {
 
     /// Get the current committed height.
     pub fn committed_height(&self) -> BlockHeight {
-        BlockHeight(self.committed_height)
+        self.committed_height
     }
 
     /// Get the committed block hash.
@@ -4540,7 +4553,7 @@ impl BftState {
         BftStats {
             view_changes: self.view_changes,
             current_round: self.view.0,
-            committed_height: BlockHeight(self.committed_height),
+            committed_height: self.committed_height,
         }
     }
 
@@ -4574,7 +4587,7 @@ impl BftState {
             .latest_qc
             .as_ref()
             .map(|qc| qc.height.0 + 1)
-            .unwrap_or(self.committed_height + 1);
+            .unwrap_or(self.committed_height.0 + 1);
         topology.should_propose(BlockHeight(next_height), self.view)
     }
 
@@ -4631,7 +4644,7 @@ impl BftState {
 
         let mut current_hash = parent_hash;
         while let Some(block) = self.get_block_by_hash(current_hash) {
-            if block.height().0 <= self.committed_height {
+            if block.height() <= self.committed_height {
                 break;
             }
             for cert in block.certificates() {
@@ -4648,7 +4661,7 @@ impl BftState {
         {
             let mut current_hash = parent_hash;
             while let Some(pending) = self.pending_blocks.get(&current_hash) {
-                let h = pending.header().height.0;
+                let h = pending.header().height;
                 if h <= self.committed_height {
                     break;
                 }
@@ -4675,7 +4688,7 @@ impl BftState {
     }
 
     /// Get the voted heights map (for testing/debugging).
-    pub fn voted_heights(&self) -> &HashMap<u64, (Hash, Round)> {
+    pub fn voted_heights(&self) -> &HashMap<BlockHeight, (Hash, Round)> {
         &self.voted_heights
     }
 
@@ -4691,7 +4704,7 @@ impl BftState {
     /// - Block is in `certified_blocks` (always complete)
     /// - Block is in `pending_synced_block_verifications` (synced blocks are always complete)
     /// - Block is in `buffered_synced_blocks` (synced blocks are always complete)
-    fn has_complete_block_at_height(&self, height: u64) -> bool {
+    fn has_complete_block_at_height(&self, height: BlockHeight) -> bool {
         // Already committed
         if height <= self.committed_height {
             return true;
@@ -4701,7 +4714,7 @@ impl BftState {
         if self
             .pending_blocks
             .values()
-            .any(|pb| pb.header().height.0 == height && pb.is_complete() && pb.block().is_some())
+            .any(|pb| pb.header().height == height && pb.is_complete() && pb.block().is_some())
         {
             return true;
         }
@@ -4710,7 +4723,7 @@ impl BftState {
         if self
             .certified_blocks
             .values()
-            .any(|block| block.height().0 == height)
+            .any(|block| block.height() == height)
         {
             return true;
         }
@@ -4740,11 +4753,11 @@ impl BftState {
         let next_height = self
             .latest_qc
             .as_ref()
-            .map(|qc| qc.height.0 + 1)
-            .unwrap_or(self.committed_height + 1);
+            .map(|qc| qc.height.next())
+            .unwrap_or(self.committed_height.next());
         let round = self.view;
 
-        topology.should_propose(BlockHeight(next_height), round)
+        topology.should_propose(next_height, round)
             && !self.voted_heights.contains_key(&next_height)
     }
 }
@@ -4829,13 +4842,13 @@ mod tests {
         assert!(!topology.should_propose(BlockHeight(0), Round(1)));
     }
 
-    fn make_header_at_height(height: u64, timestamp_ms: u64) -> BlockHeader {
+    fn make_header_at_height(height: BlockHeight, timestamp_ms: u64) -> BlockHeader {
         BlockHeader {
             shard_group_id: ShardGroupId(0),
-            height: BlockHeight(height),
+            height,
             parent_hash: Hash::from_bytes(b"parent"),
             parent_qc: QuorumCertificate::genesis(),
-            proposer: ValidatorId(height % 4), // Round-robin
+            proposer: ValidatorId(height.0 % 4), // Round-robin
             timestamp: ProposerTimestamp(timestamp_ms),
             round: Round(0),
             is_fallback: false,
@@ -4850,7 +4863,7 @@ mod tests {
         }
     }
 
-    fn make_empty_block(height: u64) -> Block {
+    fn make_empty_block(height: BlockHeight) -> Block {
         Block::Live {
             header: make_header_at_height(height, 1000),
             transactions: vec![],
@@ -4895,15 +4908,15 @@ mod tests {
         state.set_time(Duration::from_secs(100));
 
         // Timestamp at 99 seconds (1 second behind) - should be OK
-        let header = make_header_at_height(1, 99_000);
+        let header = make_header_at_height(BlockHeight(1), 99_000);
         assert!(state.validate_timestamp(&header).is_ok());
 
         // Timestamp at 100 seconds (exactly now) - should be OK
-        let header = make_header_at_height(1, 100_000);
+        let header = make_header_at_height(BlockHeight(1), 100_000);
         assert!(state.validate_timestamp(&header).is_ok());
 
         // Timestamp at 101 seconds (1 second ahead) - should be OK
-        let header = make_header_at_height(1, 101_000);
+        let header = make_header_at_height(BlockHeight(1), 101_000);
         assert!(state.validate_timestamp(&header).is_ok());
     }
 
@@ -4914,7 +4927,7 @@ mod tests {
         state.set_time(Duration::from_secs(100));
 
         // Timestamp at 50 seconds (50 seconds behind, max delay is 30) - should fail
-        let header = make_header_at_height(1, 50_000);
+        let header = make_header_at_height(BlockHeight(1), 50_000);
         let result = state.validate_timestamp(&header);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("too old"));
@@ -4927,7 +4940,7 @@ mod tests {
         state.set_time(Duration::from_secs(100));
 
         // Timestamp at 110 seconds (10 seconds ahead, max rush is 2) - should fail
-        let header = make_header_at_height(1, 110_000);
+        let header = make_header_at_height(BlockHeight(1), 110_000);
         let result = state.validate_timestamp(&header);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("too far ahead"));
@@ -4940,19 +4953,19 @@ mod tests {
         state.set_time(Duration::from_secs(100));
 
         // At exactly max delay boundary (70 seconds = 100 - 30) - should be OK
-        let header = make_header_at_height(1, 70_000);
+        let header = make_header_at_height(BlockHeight(1), 70_000);
         assert!(state.validate_timestamp(&header).is_ok());
 
         // Just past max delay (69.999 seconds) - should fail
-        let header = make_header_at_height(1, 69_999);
+        let header = make_header_at_height(BlockHeight(1), 69_999);
         assert!(state.validate_timestamp(&header).is_err());
 
         // At exactly max rush boundary (102 seconds = 100 + 2) - should be OK
-        let header = make_header_at_height(1, 102_000);
+        let header = make_header_at_height(BlockHeight(1), 102_000);
         assert!(state.validate_timestamp(&header).is_ok());
 
         // Just past max rush (102.001 seconds) - should fail
-        let header = make_header_at_height(1, 102_001);
+        let header = make_header_at_height(BlockHeight(1), 102_001);
         assert!(state.validate_timestamp(&header).is_err());
     }
 
@@ -5048,7 +5061,7 @@ mod tests {
 
         // Set committed_height to 1 so we don't trigger sync for parent
         let parent_hash = Hash::from_bytes(b"parent_block");
-        state.committed_height = 1;
+        state.committed_height = BlockHeight(1);
         state.committed_hash = parent_hash;
 
         // Create a block at height 2 with a non-genesis parent QC
@@ -5133,12 +5146,12 @@ mod tests {
 
         // Set committed_height to 1 so we don't trigger sync for parent
         let parent_hash = Hash::from_bytes(b"parent_block");
-        state.committed_height = 1;
+        state.committed_height = BlockHeight(1);
         state.committed_hash = parent_hash;
         // Parent block must be in memory for in-flight verification
         state
             .certified_blocks
-            .insert(parent_hash, make_empty_block(1));
+            .insert(parent_hash, make_empty_block(BlockHeight(1)));
 
         // Create block header with non-genesis QC
         let mut signers = SignerBitfield::new(4);
@@ -5245,7 +5258,7 @@ mod tests {
 
         // Set committed_height to 1 so we don't trigger sync for parent
         let parent_hash = Hash::from_bytes(b"parent_block");
-        state.committed_height = 1;
+        state.committed_height = BlockHeight(1);
         state.committed_hash = parent_hash;
 
         // Create block header
@@ -5453,13 +5466,15 @@ mod tests {
 
         // Simulate having voted at height 1
         let block_hash = Hash::from_bytes(b"voted_block");
-        state.voted_heights.insert(1, (block_hash, Round(0)));
+        state
+            .voted_heights
+            .insert(BlockHeight(1), (block_hash, Round(0)));
 
         // Advance round - should unlock since no QC at height 1
         let _actions = state.advance_round(&topology);
 
         assert!(
-            !state.voted_heights.contains_key(&1),
+            !state.voted_heights.contains_key(&BlockHeight(1)),
             "Vote lock should be cleared when no QC at height"
         );
     }
@@ -5471,13 +5486,13 @@ mod tests {
         // Set up vote locks at heights 1, 2, 3
         state
             .voted_heights
-            .insert(1, (Hash::from_bytes(b"block1"), Round(0)));
+            .insert(BlockHeight(1), (Hash::from_bytes(b"block1"), Round(0)));
         state
             .voted_heights
-            .insert(2, (Hash::from_bytes(b"block2"), Round(0)));
+            .insert(BlockHeight(2), (Hash::from_bytes(b"block2"), Round(0)));
         state
             .voted_heights
-            .insert(3, (Hash::from_bytes(b"block3"), Round(0)));
+            .insert(BlockHeight(3), (Hash::from_bytes(b"block3"), Round(0)));
 
         // Receive QC at height 2 - should unlock heights 1 and 2
         let qc = QuorumCertificate {
@@ -5495,15 +5510,15 @@ mod tests {
         state.maybe_unlock_for_qc(&topology, &qc);
 
         assert!(
-            !state.voted_heights.contains_key(&1),
+            !state.voted_heights.contains_key(&BlockHeight(1)),
             "Height 1 should be unlocked"
         );
         assert!(
-            !state.voted_heights.contains_key(&2),
+            !state.voted_heights.contains_key(&BlockHeight(2)),
             "Height 2 should be unlocked"
         );
         assert!(
-            state.voted_heights.contains_key(&3),
+            state.voted_heights.contains_key(&BlockHeight(3)),
             "Height 3 should remain locked"
         );
     }
@@ -5608,14 +5623,14 @@ mod tests {
         let (mut state, topology, _keys) = make_multi_validator_state();
         state.set_time(Duration::from_secs(100));
 
-        let height = 1u64;
+        let height = BlockHeight(1);
         let round_0 = Round(0);
         let round_1 = Round(1);
 
         // Create two different blocks at the same height
         let block_a = BlockHeader {
             shard_group_id: ShardGroupId(0),
-            height: BlockHeight(height),
+            height,
             parent_hash: Hash::from_bytes(b"parent"),
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(1),
@@ -5635,7 +5650,7 @@ mod tests {
 
         let block_b = BlockHeader {
             shard_group_id: ShardGroupId(0),
-            height: BlockHeight(height),
+            height,
             parent_hash: Hash::from_bytes(b"parent"),
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(2),
@@ -5681,10 +5696,10 @@ mod tests {
         let (mut state, topology, _keys) = make_multi_validator_state();
         state.set_time(Duration::from_secs(100));
 
-        let height = 1u64;
+        let height = BlockHeight(1);
         let block = BlockHeader {
             shard_group_id: ShardGroupId(0),
-            height: BlockHeight(height),
+            height,
             parent_hash: Hash::from_bytes(b"parent"),
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(1),
@@ -5724,10 +5739,11 @@ mod tests {
         state.set_time(Duration::from_secs(100));
 
         // Vote at heights 1, 2, 3
-        for height in 1..=3 {
+        for h in 1u64..=3 {
+            let height = BlockHeight(h);
             let block = BlockHeader {
                 shard_group_id: ShardGroupId(0),
-                height: BlockHeight(height),
+                height,
                 parent_hash: Hash::from_bytes(b"parent"),
                 parent_qc: QuorumCertificate::genesis(),
                 proposer: ValidatorId(1),
@@ -5749,13 +5765,13 @@ mod tests {
         assert_eq!(state.voted_heights.len(), 3);
 
         // Simulate commit at height 2
-        state.cleanup_old_state(2);
+        state.cleanup_old_state(BlockHeight(2));
 
         // Only height 3 should remain
         assert_eq!(state.voted_heights.len(), 1);
-        assert!(state.voted_heights.contains_key(&3));
-        assert!(!state.voted_heights.contains_key(&1));
-        assert!(!state.voted_heights.contains_key(&2));
+        assert!(state.voted_heights.contains_key(&BlockHeight(3)));
+        assert!(!state.voted_heights.contains_key(&BlockHeight(1)));
+        assert!(!state.voted_heights.contains_key(&BlockHeight(2)));
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -5776,7 +5792,7 @@ mod tests {
         let (mut state, topology, _keys) = make_multi_validator_state();
         state.set_time(Duration::from_secs(100));
 
-        let height = 5u64;
+        let height = BlockHeight(5);
         let round = Round(2);
         let byzantine_voter = ValidatorId(2);
 
@@ -5787,7 +5803,7 @@ mod tests {
         let vote_a = BlockVote {
             block_hash: block_a,
             shard_group_id: ShardGroupId(0),
-            height: BlockHeight(height),
+            height,
             round,
             voter: byzantine_voter,
             signature: zero_bls_signature(),
@@ -5813,7 +5829,7 @@ mod tests {
         let vote_b = BlockVote {
             block_hash: block_b,
             shard_group_id: ShardGroupId(0),
-            height: BlockHeight(height),
+            height,
             round,
             voter: byzantine_voter,
             signature: zero_bls_signature(),
@@ -5842,7 +5858,7 @@ mod tests {
         let (mut state, topology, _keys) = make_multi_validator_state();
         state.set_time(Duration::from_secs(100));
 
-        let height = 5u64;
+        let height = BlockHeight(5);
         let voter = ValidatorId(2);
 
         let block_a = Hash::from_bytes(b"block_a_at_height_5");
@@ -5852,7 +5868,7 @@ mod tests {
         let vote_a = BlockVote {
             block_hash: block_a,
             shard_group_id: ShardGroupId(0),
-            height: BlockHeight(height),
+            height,
             round: Round(0),
             voter,
             signature: zero_bls_signature(),
@@ -5865,7 +5881,7 @@ mod tests {
         let vote_b = BlockVote {
             block_hash: block_b,
             shard_group_id: ShardGroupId(0),
-            height: BlockHeight(height),
+            height,
             round: Round(1), // Different round
             voter,
             signature: zero_bls_signature(),
@@ -5922,8 +5938,12 @@ mod tests {
         let _actions = state.on_qc_result(&topology, vote_h6.block_hash, None, verified_votes_h6);
 
         // Both should be recorded
-        assert!(state.received_votes_by_height.contains_key(&(5, voter)));
-        assert!(state.received_votes_by_height.contains_key(&(6, voter)));
+        assert!(state
+            .received_votes_by_height
+            .contains_key(&(BlockHeight(5), voter)));
+        assert!(state
+            .received_votes_by_height
+            .contains_key(&(BlockHeight(6), voter)));
     }
 
     #[test]
@@ -5943,7 +5963,7 @@ mod tests {
         let (mut state, topology, _keys) = make_multi_validator_state();
         state.set_time(Duration::from_secs(100));
 
-        let height = 5u64;
+        let height = BlockHeight(5);
         let round = Round(0);
         let legitimate_voter = ValidatorId(2);
 
@@ -5953,7 +5973,7 @@ mod tests {
         let legitimate_vote = BlockVote {
             block_hash: block_b,
             shard_group_id: ShardGroupId(0),
-            height: BlockHeight(height),
+            height,
             round,
             voter: legitimate_voter,
             signature: zero_bls_signature(),
@@ -5984,9 +6004,10 @@ mod tests {
         state.set_time(Duration::from_secs(100));
 
         // Record votes at heights 1, 2, 3 from different validators
-        for height in 1..=3u64 {
-            let voter = ValidatorId(height);
-            let block_hash = Hash::from_bytes(format!("block_{}", height).as_bytes());
+        for h in 1..=3u64 {
+            let height = BlockHeight(h);
+            let voter = ValidatorId(h);
+            let block_hash = Hash::from_bytes(format!("block_{}", h).as_bytes());
             state
                 .received_votes_by_height
                 .insert((height, voter), (block_hash, Round(0))); // round 0
@@ -5995,13 +6016,13 @@ mod tests {
         assert_eq!(state.received_votes_by_height.len(), 3);
 
         // Commit at height 2
-        state.cleanup_old_state(2);
+        state.cleanup_old_state(BlockHeight(2));
 
         // Only height 3 votes should remain
         assert_eq!(state.received_votes_by_height.len(), 1);
         assert!(state
             .received_votes_by_height
-            .contains_key(&(3, ValidatorId(3))));
+            .contains_key(&(BlockHeight(3), ValidatorId(3))));
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -6021,7 +6042,7 @@ mod tests {
         let (mut state, topology, _keys) = make_multi_validator_state();
         state.set_time(Duration::from_secs(100));
 
-        let height = 1u64;
+        let height = BlockHeight(1);
         let original_round = Round(0);
         let view_change_round = Round(31);
 
@@ -6029,7 +6050,7 @@ mod tests {
         // proposer_for(1, 0) = (1 + 0) % 4 = 1 = ValidatorId(1)
         let original_header = BlockHeader {
             shard_group_id: ShardGroupId(0),
-            height: BlockHeight(height),
+            height,
             parent_hash: Hash::from_bytes(b"parent"),
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(1),
@@ -6103,14 +6124,14 @@ mod tests {
 
         let (state, topology, _keys) = make_multi_validator_state();
 
-        let height = 1u64;
+        let height = BlockHeight(1);
         let original_round = Round(0);
 
         // Create block with original proposer for (height=1, round=0)
         // proposer_for(1, 0) = (1 + 0) % 4 = 1 = ValidatorId(1)
         let header = BlockHeader {
             shard_group_id: ShardGroupId(0),
-            height: BlockHeight(height),
+            height,
             parent_hash: Hash::from_bytes(b"parent"),
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(1),
@@ -6144,13 +6165,13 @@ mod tests {
 
         let (state, topology, _keys) = make_multi_validator_state();
 
-        let height = 1u64;
+        let height = BlockHeight(1);
 
         // Create block claiming round=0 but with wrong proposer
         // proposer_for(1, 0) = ValidatorId(1), but we claim ValidatorId(3)
         let header = BlockHeader {
             shard_group_id: ShardGroupId(0),
-            height: BlockHeight(height),
+            height,
             parent_hash: Hash::from_bytes(b"parent"),
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(3), // Wrong! Should be ValidatorId(1) for round=0
@@ -6197,7 +6218,7 @@ mod tests {
         let (mut state, topology) = make_test_state();
         state.set_time(Duration::from_secs(100));
 
-        let height = 1u64;
+        let height = BlockHeight(1);
 
         // Round 0: Vote for block A at height 1
         let block_a = Hash::from_bytes(b"block_a_round_0");
@@ -6285,10 +6306,12 @@ mod tests {
         state.latest_qc = Some(qc);
 
         // We have votes at heights 1 and 2
-        state.voted_heights.insert(1, (qc_block, Round(0)));
         state
             .voted_heights
-            .insert(2, (Hash::from_bytes(b"block_at_2"), Round(0)));
+            .insert(BlockHeight(1), (qc_block, Round(0)));
+        state
+            .voted_heights
+            .insert(BlockHeight(2), (Hash::from_bytes(b"block_at_2"), Round(0)));
 
         // View change advances round. With QC at height 1, we propose for height 2.
         // The unlock check is: latest_qc_height (1) < height (2)? Yes.
@@ -6297,13 +6320,13 @@ mod tests {
 
         // Vote at height 1 should still be there (advance_round doesn't touch it)
         assert!(
-            state.voted_heights.contains_key(&1),
+            state.voted_heights.contains_key(&BlockHeight(1)),
             "Vote lock at height 1 should be preserved (advance_round only unlocks at proposal height)"
         );
 
         // Vote at height 2 should be cleared (we're proposing for height 2, no QC there)
         assert!(
-            !state.voted_heights.contains_key(&2),
+            !state.voted_heights.contains_key(&BlockHeight(2)),
             "Vote lock at height 2 should be cleared (no QC at height 2)"
         );
     }
@@ -6318,13 +6341,13 @@ mod tests {
         // Set up vote locks at multiple heights
         state
             .voted_heights
-            .insert(1, (Hash::from_bytes(b"block_1"), Round(0)));
+            .insert(BlockHeight(1), (Hash::from_bytes(b"block_1"), Round(0)));
         state
             .voted_heights
-            .insert(2, (Hash::from_bytes(b"block_2"), Round(0)));
+            .insert(BlockHeight(2), (Hash::from_bytes(b"block_2"), Round(0)));
         state
             .voted_heights
-            .insert(3, (Hash::from_bytes(b"block_3"), Round(0)));
+            .insert(BlockHeight(3), (Hash::from_bytes(b"block_3"), Round(0)));
 
         // Simulate being at round 5 (multiple view changes happened)
         state.view = Round(5);
@@ -6345,16 +6368,16 @@ mod tests {
 
         // Heights 1 and 2 should be unlocked
         assert!(
-            !state.voted_heights.contains_key(&1),
+            !state.voted_heights.contains_key(&BlockHeight(1)),
             "Height 1 should be unlocked by QC at height 2"
         );
         assert!(
-            !state.voted_heights.contains_key(&2),
+            !state.voted_heights.contains_key(&BlockHeight(2)),
             "Height 2 should be unlocked by QC at height 2"
         );
         // Height 3 should remain locked
         assert!(
-            state.voted_heights.contains_key(&3),
+            state.voted_heights.contains_key(&BlockHeight(3)),
             "Height 3 should remain locked"
         );
     }
@@ -6367,7 +6390,7 @@ mod tests {
 
         let block_a = Hash::from_bytes(b"block_a");
         let block_b = Hash::from_bytes(b"block_b");
-        let height = 5u64;
+        let height = BlockHeight(5);
 
         // We voted for block A
         state.voted_heights.insert(height, (block_a, Round(0)));
@@ -6376,7 +6399,7 @@ mod tests {
         let qc = QuorumCertificate {
             block_hash: block_b, // Different from our vote!
             shard_group_id: ShardGroupId(0),
-            height: BlockHeight(height),
+            height,
             parent_block_hash: Hash::from_bytes(b"parent"),
             round: Round(0),
             signers: SignerBitfield::empty(),
@@ -6402,7 +6425,7 @@ mod tests {
         let (mut state, topology, _keys) = make_multi_validator_state();
         state.set_time(Duration::from_secs(100));
 
-        let height = 1u64;
+        let height = BlockHeight(1);
         let block_a = Hash::from_bytes(b"block_a");
         let block_b = Hash::from_bytes(b"block_b");
 
@@ -6430,7 +6453,7 @@ mod tests {
         let (mut state, topology, _keys) = make_multi_validator_state();
         state.set_time(Duration::from_secs(100));
 
-        let height = 1u64;
+        let height = BlockHeight(1);
         let block_a = Hash::from_bytes(b"block_a");
 
         // Vote for block A at round 0
@@ -6505,7 +6528,7 @@ mod tests {
         state.pending_blocks.insert(original_block_hash, pending);
         state
             .voted_heights
-            .insert(1, (original_block_hash, Round(0)));
+            .insert(BlockHeight(1), (original_block_hash, Round(0)));
 
         // Advance to round 3 where we become the proposer
         // Since no QC at height 1, vote lock is cleared, then we create fallback
@@ -6516,7 +6539,7 @@ mod tests {
         // Vote lock was cleared by advance_round (no QC at height 1).
         // The actual vote happens async in on_proposal_built.
         assert!(
-            !state.voted_heights.contains_key(&1),
+            !state.voted_heights.contains_key(&BlockHeight(1)),
             "Vote lock should be cleared — vote happens async via on_proposal_built"
         );
 
@@ -6572,7 +6595,7 @@ mod tests {
         state.set_time(Duration::from_secs(100));
 
         // No vote lock at height 1 - we haven't voted yet
-        assert!(!state.voted_heights.contains_key(&1));
+        assert!(!state.voted_heights.contains_key(&BlockHeight(1)));
 
         // Advance to round 3 where we become proposer
         state.view = Round(2);
@@ -6613,9 +6636,15 @@ mod tests {
         let block_h3 = Hash::from_bytes(b"block_height_3");
 
         // Vote at multiple heights
-        state.voted_heights.insert(1, (block_h1, Round(0)));
-        state.voted_heights.insert(2, (block_h2, Round(0)));
-        state.voted_heights.insert(3, (block_h3, Round(0)));
+        state
+            .voted_heights
+            .insert(BlockHeight(1), (block_h1, Round(0)));
+        state
+            .voted_heights
+            .insert(BlockHeight(2), (block_h2, Round(0)));
+        state
+            .voted_heights
+            .insert(BlockHeight(3), (block_h3, Round(0)));
 
         // QC at height 1 should only unlock height 1
         let qc_h1 = QuorumCertificate {
@@ -6631,15 +6660,15 @@ mod tests {
         state.maybe_unlock_for_qc(&topology, &qc_h1);
 
         assert!(
-            !state.voted_heights.contains_key(&1),
+            !state.voted_heights.contains_key(&BlockHeight(1)),
             "Height 1 should be unlocked"
         );
         assert!(
-            state.voted_heights.contains_key(&2),
+            state.voted_heights.contains_key(&BlockHeight(2)),
             "Height 2 should remain locked"
         );
         assert!(
-            state.voted_heights.contains_key(&3),
+            state.voted_heights.contains_key(&BlockHeight(3)),
             "Height 3 should remain locked"
         );
     }
@@ -6651,13 +6680,13 @@ mod tests {
 
         state
             .voted_heights
-            .insert(1, (Hash::from_bytes(b"block_1"), Round(0)));
+            .insert(BlockHeight(1), (Hash::from_bytes(b"block_1"), Round(0)));
 
         let genesis_qc = QuorumCertificate::genesis();
         state.maybe_unlock_for_qc(&topology, &genesis_qc);
 
         assert!(
-            state.voted_heights.contains_key(&1),
+            state.voted_heights.contains_key(&BlockHeight(1)),
             "Genesis QC should not unlock any votes"
         );
     }
@@ -6668,7 +6697,7 @@ mod tests {
         let (mut state, _topology) = make_test_state();
 
         // Add vote tracking for multiple validators at height 5
-        let height = 5u64;
+        let height = BlockHeight(5);
         state.received_votes_by_height.insert(
             (height, ValidatorId(0)),
             (Hash::from_bytes(b"block_a"), Round(0)),
@@ -6683,7 +6712,7 @@ mod tests {
         );
         // Also add tracking at different height
         state.received_votes_by_height.insert(
-            (6, ValidatorId(0)),
+            (BlockHeight(6), ValidatorId(0)),
             (Hash::from_bytes(b"block_c"), Round(0)),
         );
 
@@ -6694,13 +6723,13 @@ mod tests {
         assert!(
             !state
                 .received_votes_by_height
-                .contains_key(&(5, ValidatorId(0))),
+                .contains_key(&(BlockHeight(5), ValidatorId(0))),
             "Height 5 entries should be cleared"
         );
         assert!(
             state
                 .received_votes_by_height
-                .contains_key(&(6, ValidatorId(0))),
+                .contains_key(&(BlockHeight(6), ValidatorId(0))),
             "Height 6 entries should remain"
         );
     }
@@ -6714,12 +6743,12 @@ mod tests {
         let (mut state, _topology, keys) = make_multi_validator_state();
         state.set_time(Duration::from_secs(100));
 
-        let height = 5u64;
+        let height = BlockHeight(5);
 
         // Create block headers at different rounds
         let header_round1 = BlockHeader {
             shard_group_id: ShardGroupId(0),
-            height: BlockHeight(height),
+            height,
             parent_hash: Hash::from_bytes(b"parent"),
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(2), // (5 + 1) % 4 = 2
@@ -6739,7 +6768,7 @@ mod tests {
 
         let header_round2 = BlockHeader {
             shard_group_id: ShardGroupId(0),
-            height: BlockHeight(height),
+            height,
             parent_hash: Hash::from_bytes(b"parent"),
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(3), // (5 + 2) % 4 = 3
@@ -6759,7 +6788,7 @@ mod tests {
 
         let header_round3 = BlockHeader {
             shard_group_id: ShardGroupId(0),
-            height: BlockHeight(height),
+            height,
             parent_hash: Hash::from_bytes(b"parent"),
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(0), // (5 + 3) % 4 = 0
@@ -6807,7 +6836,7 @@ mod tests {
             BlockVote::new(
                 block_hash_r1,
                 shard,
-                BlockHeight(height),
+                height,
                 Round(1),
                 ValidatorId(0),
                 &keys[0],
@@ -6823,7 +6852,7 @@ mod tests {
             BlockVote::new(
                 block_hash_r2,
                 shard,
-                BlockHeight(height),
+                height,
                 Round(2),
                 ValidatorId(1),
                 &keys[1],
@@ -6839,7 +6868,7 @@ mod tests {
             BlockVote::new(
                 block_hash_r3,
                 shard,
-                BlockHeight(height),
+                height,
                 Round(3),
                 ValidatorId(2),
                 &keys[2],
@@ -6918,13 +6947,13 @@ mod tests {
         let (mut state, topology) = make_test_state();
         state.set_time(Duration::from_secs(100));
         // Parent tree must be available or try_propose defers.
-        state.committed_height = 3;
+        state.committed_height = BlockHeight(3);
         state.verification.on_block_persisted(BlockHeight(3));
 
         let block_3_hash = Hash::from_bytes(b"block_3");
         state
             .certified_blocks
-            .insert(block_3_hash, make_empty_block(3));
+            .insert(block_3_hash, make_empty_block(BlockHeight(3)));
 
         let qc = QuorumCertificate {
             block_hash: block_3_hash,
@@ -6987,11 +7016,11 @@ mod tests {
 
         // Set committed_height to 1 so we don't trigger sync
         let parent_hash = Hash::from_bytes(b"parent_block");
-        state.committed_height = 1;
+        state.committed_height = BlockHeight(1);
         state.committed_hash = parent_hash;
         state
             .certified_blocks
-            .insert(parent_hash, make_empty_block(1));
+            .insert(parent_hash, make_empty_block(BlockHeight(1)));
 
         // Create a parent QC that will be shared by multiple blocks
         let mut signers = SignerBitfield::new(4);
@@ -7049,7 +7078,9 @@ mod tests {
 
         // Simulate QC verification success by directly inserting into the cache.
         // In real operation, this happens in on_qc_signature_verified when valid=true.
-        state.verification.cache_verified_qc(parent_hash, 1);
+        state
+            .verification
+            .cache_verified_qc(parent_hash, BlockHeight(1));
 
         // Second block at height 2, round 1 (same parent QC - view change scenario)
         let header2 = BlockHeader {
@@ -7096,7 +7127,7 @@ mod tests {
     // ═══════════════════════════════════════════════════════════════════════════
 
     fn make_test_block_with_transactions(
-        height: u64,
+        height: BlockHeight,
         transactions: Vec<Arc<hyperscale_types::RoutableTransaction>>,
     ) -> Block {
         Block::Live {
@@ -7109,7 +7140,7 @@ mod tests {
 
     /// Create a test block with transactions.
     fn make_sectioned_test_block(
-        height: u64,
+        height: BlockHeight,
         transactions: Vec<Arc<hyperscale_types::RoutableTransaction>>,
     ) -> Block {
         Block::Live {
@@ -7140,7 +7171,7 @@ mod tests {
     #[test]
     fn test_validate_transaction_ordering_empty_block() {
         let (state, _topology) = make_test_state();
-        let block = make_test_block_with_transactions(5, vec![]);
+        let block = make_test_block_with_transactions(BlockHeight(5), vec![]);
         assert!(state.validate_transaction_ordering(&block).is_ok());
     }
 
@@ -7148,7 +7179,7 @@ mod tests {
     fn test_validate_transaction_ordering_single_tx() {
         let (state, _topology) = make_test_state();
         let tx = make_test_tx(1, false);
-        let block = make_test_block_with_transactions(5, vec![tx]);
+        let block = make_test_block_with_transactions(BlockHeight(5), vec![tx]);
         assert!(state.validate_transaction_ordering(&block).is_ok());
     }
 
@@ -7164,7 +7195,7 @@ mod tests {
         ];
         sort_txs_by_hash(&mut txs);
 
-        let block = make_test_block_with_transactions(5, txs);
+        let block = make_test_block_with_transactions(BlockHeight(5), txs);
         assert!(state.validate_transaction_ordering(&block).is_ok());
     }
 
@@ -7181,7 +7212,7 @@ mod tests {
         sort_txs_by_hash(&mut txs);
         txs.reverse();
 
-        let block = make_test_block_with_transactions(5, txs);
+        let block = make_test_block_with_transactions(BlockHeight(5), txs);
         let result = state.validate_transaction_ordering(&block);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not in hash order"));
@@ -7199,7 +7230,7 @@ mod tests {
         let mut txs = vec![tx1, tx2, tx3, tx4];
         sort_txs_by_hash(&mut txs);
 
-        let block = make_sectioned_test_block(5, txs);
+        let block = make_sectioned_test_block(BlockHeight(5), txs);
         assert!(state.validate_transaction_ordering(&block).is_ok());
     }
 
@@ -7214,7 +7245,7 @@ mod tests {
         sort_txs_by_hash(&mut txs);
         txs.reverse(); // Make invalid
 
-        let block = make_sectioned_test_block(5, txs);
+        let block = make_sectioned_test_block(BlockHeight(5), txs);
         let result = state.validate_transaction_ordering(&block);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not in hash order"));
@@ -7406,7 +7437,7 @@ mod tests {
         let (mut state, topology) = make_test_state();
         state.set_time(Duration::from_secs(100));
         // Simulate committed state so parent tree is available for BuildProposal.
-        state.committed_height = 3;
+        state.committed_height = BlockHeight(3);
         state.verification.on_block_persisted(BlockHeight(3));
 
         // Set up a QC so we propose for height 4 (validator 0's turn: (4+0)%4=0)
@@ -7468,7 +7499,7 @@ mod tests {
         let (mut state, topology) = make_test_state();
         let current_time = Duration::from_secs(12345);
         state.set_time(current_time);
-        state.committed_height = 3;
+        state.committed_height = BlockHeight(3);
         state.verification.on_block_persisted(BlockHeight(3));
 
         // Set up QC with old timestamp
@@ -7546,7 +7577,7 @@ mod tests {
 
         // Create a block from another proposer (validator 1 proposes height 1)
         let block_hash = Hash::from_bytes(b"other_proposer_block");
-        let height = 1u64;
+        let height = BlockHeight(1);
         let round = Round(0);
 
         // Directly call try_vote_on_block (simulating after QC verification)
@@ -7630,7 +7661,7 @@ mod tests {
         // Enter sync mode
         state.set_syncing(&topology, true);
 
-        let height = 1u64;
+        let height = BlockHeight(1);
         let block_a = Hash::from_bytes(b"block_a");
         let block_b = Hash::from_bytes(b"block_b");
 
@@ -7700,7 +7731,7 @@ mod tests {
     fn test_stale_sync_block_ignored() {
         let (mut state, topology) = make_test_state();
         state.set_time(Duration::from_secs(100));
-        state.committed_height = 10; // Already committed past height 1
+        state.committed_height = BlockHeight(10); // Already committed past height 1
 
         // Create a stale synced block at height 1
         let block = Block::Live {
@@ -7788,7 +7819,7 @@ mod tests {
         // This test verifies the key differences between sync blocks and fallback blocks
         let (mut state, topology) = make_test_state();
         state.set_time(Duration::from_secs(100));
-        state.committed_height = 3;
+        state.committed_height = BlockHeight(3);
         state.verification.on_block_persisted(BlockHeight(3));
 
         // Set up QC with specific timestamp
@@ -7807,7 +7838,8 @@ mod tests {
 
         // Test 1: Build sync block
         state.set_syncing(&topology, true);
-        let sync_actions = state.build_and_broadcast_sync_block(&topology, 4, Round(0));
+        let sync_actions =
+            state.build_and_broadcast_sync_block(&topology, BlockHeight(4), Round(0));
         state.set_syncing(&topology, false);
 
         // Reset state for fallback test
@@ -7817,7 +7849,8 @@ mod tests {
         state.voted_heights.clear();
 
         // Test 2: Build fallback block
-        let fallback_actions = state.build_and_broadcast_fallback_block(&topology, 4, Round(1));
+        let fallback_actions =
+            state.build_and_broadcast_fallback_block(&topology, BlockHeight(4), Round(1));
 
         // Extract BuildProposal actions
         let sync_proposal = sync_actions
@@ -7868,7 +7901,7 @@ mod tests {
         // Simulate a scenario where a syncing proposer keeps the chain advancing
         let (mut state, topology) = make_test_state();
         state.set_time(Duration::from_secs(100));
-        state.committed_height = 3;
+        state.committed_height = BlockHeight(3);
         state.verification.on_block_persisted(BlockHeight(3));
 
         // Set up initial QC
@@ -7961,7 +7994,7 @@ mod tests {
 
         // Simulate height advance (commit)
         // This should reset view_at_height_start to current view
-        state.committed_height = 1;
+        state.committed_height = BlockHeight(1);
         state.view_at_height_start = state.view; // This is what happens in commit
 
         // Now timeout should be back to base (0 rounds at new height)
@@ -8255,14 +8288,14 @@ mod tests {
         let tx2 = make_test_tx_with_seed(20);
 
         // Block has unique transactions, no ancestors to conflict with
-        let block = make_test_block_with_transactions(5, vec![tx1, tx2]);
+        let block = make_test_block_with_transactions(BlockHeight(5), vec![tx1, tx2]);
         assert!(state.validate_no_duplicate_transactions(&block).is_ok());
     }
 
     #[test]
     fn test_validate_no_duplicate_transactions_rejects_cross_block_dup() {
         let (mut state, _topology) = make_test_state();
-        state.committed_height = 3;
+        state.committed_height = BlockHeight(3);
 
         let tx1 = make_test_tx_with_seed(10);
         let tx2 = make_test_tx_with_seed(20);
@@ -8328,7 +8361,7 @@ mod tests {
     #[test]
     fn test_validate_no_duplicate_transactions_ignores_committed_ancestors() {
         let (mut state, _topology) = make_test_state();
-        state.committed_height = 5;
+        state.committed_height = BlockHeight(5);
 
         let tx1 = make_test_tx_with_seed(10);
 
@@ -8392,7 +8425,7 @@ mod tests {
     #[test]
     fn test_validate_no_duplicate_transactions_empty_block() {
         let (state, _topology) = make_test_state();
-        let block = make_test_block_with_transactions(5, vec![]);
+        let block = make_test_block_with_transactions(BlockHeight(5), vec![]);
         assert!(state.validate_no_duplicate_transactions(&block).is_ok());
     }
 

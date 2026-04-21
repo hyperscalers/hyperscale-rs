@@ -99,8 +99,8 @@ impl VoteSet {
     }
 
     /// Get the block height.
-    pub fn height(&self) -> Option<u64> {
-        self.height.map(|h| h.0)
+    pub fn height(&self) -> Option<BlockHeight> {
+        self.height
     }
 
     /// Get the round number.
@@ -391,10 +391,10 @@ mod tests {
         ShardGroupId(0)
     }
 
-    fn make_header(height: u64) -> BlockHeader {
+    fn make_header(height: BlockHeight) -> BlockHeader {
         BlockHeader {
             shard_group_id: ShardGroupId(0),
-            height: BlockHeight(height),
+            height,
             parent_hash: Hash::from_bytes(b"parent"),
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(0),
@@ -416,12 +416,12 @@ mod tests {
         keys: &[Bls12381G1PrivateKey],
         voter_index: usize,
         block_hash: Hash,
-        height: u64,
+        height: BlockHeight,
     ) -> BlockVote {
         BlockVote::new(
             block_hash,
             test_shard_group(),
-            BlockHeight(height),
+            height,
             Round::INITIAL,
             ValidatorId(voter_index as u64),
             &keys[voter_index],
@@ -431,36 +431,36 @@ mod tests {
 
     #[test]
     fn test_vote_set_creation() {
-        let header = make_header(1);
+        let header = make_header(BlockHeight(1));
         let vote_set = VoteSet::new(Some(header.clone()), 4);
 
         assert_eq!(vote_set.verified_power(), 0);
-        assert_eq!(vote_set.height(), Some(1));
+        assert_eq!(vote_set.height(), Some(BlockHeight(1)));
     }
 
     #[test]
     fn test_buffer_unverified_votes() {
         let keys: Vec<Bls12381G1PrivateKey> = (0..4).map(|_| generate_bls_keypair()).collect();
-        let header = make_header(1);
+        let header = make_header(BlockHeight(1));
         let block_hash = header.hash();
         let mut vote_set = VoteSet::new(Some(header), 4);
 
         // Buffer first vote
-        let vote0 = make_vote(&keys, 0, block_hash, 1);
+        let vote0 = make_vote(&keys, 0, block_hash, BlockHeight(1));
         let pk0 = keys[0].public_key();
         assert!(vote_set.buffer_unverified_vote(0, vote0, pk0, 1));
         assert_eq!(vote_set.unverified_power(), 1);
         assert_eq!(vote_set.verified_power(), 0);
 
         // Buffer duplicate (should fail)
-        let vote0_dup = make_vote(&keys, 0, block_hash, 1);
+        let vote0_dup = make_vote(&keys, 0, block_hash, BlockHeight(1));
         let pk0_dup = keys[0].public_key();
         assert!(!vote_set.buffer_unverified_vote(0, vote0_dup, pk0_dup, 1));
         assert_eq!(vote_set.unverified_power(), 1);
 
         // Buffer more votes
-        let vote1 = make_vote(&keys, 1, block_hash, 1);
-        let vote2 = make_vote(&keys, 2, block_hash, 1);
+        let vote1 = make_vote(&keys, 1, block_hash, BlockHeight(1));
+        let vote2 = make_vote(&keys, 2, block_hash, BlockHeight(1));
         assert!(vote_set.buffer_unverified_vote(1, vote1, keys[1].public_key(), 1));
         assert!(vote_set.buffer_unverified_vote(2, vote2, keys[2].public_key(), 1));
         assert_eq!(vote_set.unverified_power(), 3);
@@ -469,24 +469,24 @@ mod tests {
     #[test]
     fn test_should_trigger_verification() {
         let keys: Vec<Bls12381G1PrivateKey> = (0..4).map(|_| generate_bls_keypair()).collect();
-        let header = make_header(1);
+        let header = make_header(BlockHeight(1));
         let block_hash = header.hash();
         let mut vote_set = VoteSet::new(Some(header), 4);
 
         let total_power = 4u64;
 
         // Not enough votes yet
-        let vote0 = make_vote(&keys, 0, block_hash, 1);
+        let vote0 = make_vote(&keys, 0, block_hash, BlockHeight(1));
         vote_set.buffer_unverified_vote(0, vote0, keys[0].public_key(), 1);
         assert!(!vote_set.should_trigger_verification(total_power));
 
         // Still not enough
-        let vote1 = make_vote(&keys, 1, block_hash, 1);
+        let vote1 = make_vote(&keys, 1, block_hash, BlockHeight(1));
         vote_set.buffer_unverified_vote(1, vote1, keys[1].public_key(), 1);
         assert!(!vote_set.should_trigger_verification(total_power));
 
         // Now we have quorum potential (3/4 > 2/3)
-        let vote2 = make_vote(&keys, 2, block_hash, 1);
+        let vote2 = make_vote(&keys, 2, block_hash, BlockHeight(1));
         vote_set.buffer_unverified_vote(2, vote2, keys[2].public_key(), 1);
         assert!(vote_set.should_trigger_verification(total_power));
     }
@@ -494,13 +494,13 @@ mod tests {
     #[test]
     fn test_add_verified_votes() {
         let keys: Vec<Bls12381G1PrivateKey> = (0..4).map(|_| generate_bls_keypair()).collect();
-        let header = make_header(1);
+        let header = make_header(BlockHeight(1));
         let block_hash = header.hash();
         let mut vote_set = VoteSet::new(Some(header), 4);
 
         // Add verified votes directly (e.g., own votes)
         for i in 0..3 {
-            let vote = make_vote(&keys, i, block_hash, 1);
+            let vote = make_vote(&keys, i, block_hash, BlockHeight(1));
             assert!(vote_set.add_verified_vote(i, vote, 1));
         }
 

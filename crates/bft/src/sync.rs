@@ -4,7 +4,7 @@
 //! synced block QC verifications. BftState owns this as a field and
 //! delegates sync-specific bookkeeping here.
 
-use hyperscale_types::{CertifiedBlock, Hash};
+use hyperscale_types::{BlockHeight, CertifiedBlock, Hash};
 use std::collections::{BTreeMap, HashMap};
 use tracing::{debug, info, warn};
 
@@ -31,18 +31,18 @@ pub(crate) struct SyncManager {
 
     /// The sync target height — set at sync start, cleared on resume.
     /// Used by `on_block_persisted` to auto-resume when persistence catches up.
-    sync_target_height: Option<u64>,
+    sync_target_height: Option<BlockHeight>,
 
     /// Highest height passed to `apply_synced_block`. Used by the sync
     /// loop (`try_apply_verified_synced_blocks`) to iterate through
     /// blocks independently of `BftState::committed_height`, which now
     /// only advances when the VerifyStateRoot → PreparedCommit →
     /// commit_prepared_blocks pipeline completes.
-    sync_applied_height: u64,
+    sync_applied_height: BlockHeight,
 
     /// Buffered out-of-order synced blocks waiting for earlier blocks.
     /// Maps height -> CertifiedBlock.
-    buffered_synced_blocks: BTreeMap<u64, CertifiedBlock>,
+    buffered_synced_blocks: BTreeMap<BlockHeight, CertifiedBlock>,
 
     /// Synced blocks pending QC signature verification.
     /// Maps block_hash -> pending synced block info.
@@ -55,7 +55,7 @@ impl SyncManager {
         Self {
             syncing: false,
             sync_target_height: None,
-            sync_applied_height: 0,
+            sync_applied_height: BlockHeight::GENESIS,
             buffered_synced_blocks: BTreeMap::new(),
             pending_synced_block_verifications: HashMap::new(),
         }
@@ -79,23 +79,23 @@ impl SyncManager {
     }
 
     /// Set the sync target height (called when sync starts).
-    pub fn set_sync_target(&mut self, height: u64) {
+    pub fn set_sync_target(&mut self, height: BlockHeight) {
         self.sync_target_height = Some(height);
     }
 
     /// Get the sync target height, if syncing.
-    pub fn sync_target_height(&self) -> Option<u64> {
+    pub fn sync_target_height(&self) -> Option<BlockHeight> {
         self.sync_target_height
     }
 
     /// Get the highest height that `apply_synced_block` has processed.
-    pub fn sync_applied_height(&self) -> u64 {
+    pub fn sync_applied_height(&self) -> BlockHeight {
         self.sync_applied_height
     }
 
     /// Record that a synced block at `height` has been submitted for
     /// state-root verification (but not yet committed).
-    pub fn set_sync_applied_height(&mut self, height: u64) {
+    pub fn set_sync_applied_height(&mut self, height: BlockHeight) {
         self.sync_applied_height = self.sync_applied_height.max(height);
     }
 
@@ -110,20 +110,20 @@ impl SyncManager {
     }
 
     /// Check if a height is already buffered.
-    pub fn has_buffered_height(&self, height: u64) -> bool {
+    pub fn has_buffered_height(&self, height: BlockHeight) -> bool {
         self.buffered_synced_blocks.contains_key(&height)
     }
 
     /// Check if any pending verification has a block at the given height.
-    pub fn has_pending_at_height(&self, height: u64) -> bool {
+    pub fn has_pending_at_height(&self, height: BlockHeight) -> bool {
         self.pending_synced_block_verifications
             .values()
-            .any(|p| p.certified.block.height().0 == height)
+            .any(|p| p.certified.block.height() == height)
     }
 
     /// Buffer a future synced block for later processing.
-    pub fn buffer_block(&mut self, height: u64, certified: CertifiedBlock) {
-        debug!(height, "Buffering future synced block for later");
+    pub fn buffer_block(&mut self, height: BlockHeight, certified: CertifiedBlock) {
+        debug!(height = height.0, "Buffering future synced block for later");
         self.buffered_synced_blocks.insert(height, certified);
     }
 
@@ -223,11 +223,11 @@ impl SyncManager {
     ///
     /// Returns the certified block if a verified entry exists at `height`,
     /// otherwise None.
-    pub fn take_verified_at_height(&mut self, height: u64) -> Option<CertifiedBlock> {
+    pub fn take_verified_at_height(&mut self, height: BlockHeight) -> Option<CertifiedBlock> {
         let block_hash = self
             .pending_synced_block_verifications
             .iter()
-            .find(|(_, p)| p.verified && p.certified.block.height().0 == height)
+            .find(|(_, p)| p.verified && p.certified.block.height() == height)
             .map(|(h, _)| *h)?;
 
         let pending = self
@@ -239,7 +239,7 @@ impl SyncManager {
     }
 
     /// Log the current state of pending verifications (for debugging).
-    pub fn log_verification_state(&self, committed_height: u64, next_height: u64) {
+    pub fn log_verification_state(&self, committed_height: BlockHeight, next_height: BlockHeight) {
         let verified_heights: Vec<_> = self
             .pending_synced_block_verifications
             .values()
@@ -253,8 +253,8 @@ impl SyncManager {
             .map(|p| p.certified.block.height().0)
             .collect();
         info!(
-            committed_height,
-            next_height,
+            committed_height = committed_height.0,
+            next_height = next_height.0,
             verified_heights = ?verified_heights,
             unverified_heights = ?unverified_heights,
             "try_apply_verified_synced_blocks: checking"
@@ -269,15 +269,19 @@ impl SyncManager {
     ///
     /// Returns blocks in sequential order starting from `start_height`,
     /// up to `max_count` blocks.
-    pub fn drain_buffered(&mut self, start_height: u64, max_count: usize) -> Vec<CertifiedBlock> {
+    pub fn drain_buffered(
+        &mut self,
+        start_height: BlockHeight,
+        max_count: usize,
+    ) -> Vec<CertifiedBlock> {
         let mut result = Vec::new();
         let mut height = start_height;
 
         while result.len() < max_count {
             if let Some(entry) = self.buffered_synced_blocks.remove(&height) {
-                debug!(height, "Draining buffered synced block");
+                debug!(height = height.0, "Draining buffered synced block");
                 result.push(entry);
-                height += 1;
+                height += 1u64;
             } else {
                 break;
             }
@@ -287,10 +291,10 @@ impl SyncManager {
     }
 
     /// Get the highest height among pending verifications.
-    pub fn highest_pending_height(&self, committed_height: u64) -> u64 {
+    pub fn highest_pending_height(&self, committed_height: BlockHeight) -> BlockHeight {
         self.pending_synced_block_verifications
             .values()
-            .map(|p| p.certified.block.height().0)
+            .map(|p| p.certified.block.height())
             .max()
             .unwrap_or(committed_height)
     }
@@ -305,12 +309,12 @@ impl SyncManager {
     /// diverge during async persistence, but sync state tracks consensus
     /// progress — once a block is committed to consensus, its sync
     /// bookkeeping is no longer needed regardless of persistence state.
-    pub fn cleanup(&mut self, committed_height: u64) {
+    pub fn cleanup(&mut self, committed_height: BlockHeight) {
         self.buffered_synced_blocks
             .retain(|height, _| *height > committed_height);
 
         self.pending_synced_block_verifications
-            .retain(|_, pending| pending.certified.block.height().0 > committed_height);
+            .retain(|_, pending| pending.certified.block.height() > committed_height);
     }
 
     /// Number of buffered out-of-order synced blocks.

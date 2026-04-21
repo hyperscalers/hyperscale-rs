@@ -357,10 +357,10 @@ impl SimulationRunner {
     }
 
     /// Check if a specific block is stored for a node.
-    pub fn has_committed_block(&self, node: NodeIndex, height: u64) -> bool {
+    pub fn has_committed_block(&self, node: NodeIndex, height: BlockHeight) -> bool {
         self.io_loops
             .get(node as usize)
-            .map(|nl| nl.storage().get_block(BlockHeight(height)).is_some())
+            .map(|nl| nl.storage().get_block(height).is_some())
             .unwrap_or(false)
     }
 

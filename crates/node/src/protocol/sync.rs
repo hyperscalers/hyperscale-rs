@@ -138,11 +138,11 @@ pub enum SyncOutput {
 /// executing the returned outputs.
 pub struct SyncProtocol {
     config: SyncConfig,
-    sync_target: Option<(u64, Hash)>,
-    committed_height: u64,
-    heights_to_fetch: BinaryHeap<Reverse<u64>>,
-    heights_queued: HashSet<u64>,
-    heights_in_flight: HashSet<u64>,
+    sync_target: Option<(BlockHeight, Hash)>,
+    committed_height: BlockHeight,
+    heights_to_fetch: BinaryHeap<Reverse<BlockHeight>>,
+    heights_queued: HashSet<BlockHeight>,
+    heights_in_flight: HashSet<BlockHeight>,
 }
 
 impl SyncProtocol {
@@ -151,7 +151,7 @@ impl SyncProtocol {
         Self {
             config,
             sync_target: None,
-            committed_height: 0,
+            committed_height: BlockHeight::GENESIS,
             heights_to_fetch: BinaryHeap::new(),
             heights_queued: HashSet::new(),
             heights_in_flight: HashSet::new(),
@@ -181,7 +181,7 @@ impl SyncProtocol {
     /// Number of blocks behind target (for metrics).
     pub fn blocks_behind(&self) -> u64 {
         self.sync_target
-            .map(|(t, _)| t.saturating_sub(self.committed_height))
+            .map(|(t, _)| t.0.saturating_sub(self.committed_height.0))
             .unwrap_or(0)
     }
 
@@ -193,11 +193,11 @@ impl SyncProtocol {
             } else {
                 SyncStateKind::Idle
             },
-            current_height: self.committed_height,
-            target_height: self.sync_target.map(|(h, _)| h),
+            current_height: self.committed_height.0,
+            target_height: self.sync_target.map(|(h, _)| h.0),
             blocks_behind: self
                 .sync_target
-                .map(|(t, _)| t.saturating_sub(self.committed_height))
+                .map(|(t, _)| t.0.saturating_sub(self.committed_height.0))
                 .unwrap_or(0),
             pending_fetches: self.heights_in_flight.len(),
             queued_heights: self.heights_queued.len(),
@@ -213,18 +213,18 @@ impl SyncProtocol {
         target_height: BlockHeight,
         target_hash: Hash,
     ) -> Vec<SyncOutput> {
-        if self.sync_target.is_some_and(|(t, _)| t >= target_height.0) {
+        if self.sync_target.is_some_and(|(t, _)| t >= target_height) {
             return vec![];
         }
 
         info!(
             target_height = target_height.0,
             ?target_hash,
-            committed = self.committed_height,
+            committed = self.committed_height.0,
             "Starting sync"
         );
 
-        self.sync_target = Some((target_height.0, target_hash));
+        self.sync_target = Some((target_height, target_hash));
         self.queue_heights_in_window();
         self.emit_fetch_outputs()
     }
@@ -234,19 +234,19 @@ impl SyncProtocol {
         height: BlockHeight,
         response: Option<CertifiedBlock>,
     ) -> Vec<SyncOutput> {
-        self.heights_in_flight.remove(&height.0);
+        self.heights_in_flight.remove(&height);
 
         match response {
             Some(CertifiedBlock { block, qc }) => {
                 // Validate
-                if block.height().0 != height.0 {
+                if block.height() != height {
                     warn!(
                         expected = height.0,
                         got = block.height().0,
                         "Height mismatch in sync response"
                     );
                     metrics::record_sync_block_filtered("height_mismatch");
-                    self.queue_height(height.0);
+                    self.queue_height(height);
                     return self.emit_fetch_outputs();
                 }
 
@@ -254,14 +254,14 @@ impl SyncProtocol {
                 if qc.block_hash != block_hash {
                     warn!(height = height.0, "QC block hash mismatch in sync response");
                     metrics::record_sync_block_filtered("qc_hash_mismatch");
-                    self.queue_height(height.0);
+                    self.queue_height(height);
                     return self.emit_fetch_outputs();
                 }
 
-                if qc.height.0 != height.0 {
+                if qc.height != height {
                     warn!(height = height.0, "QC height mismatch in sync response");
                     metrics::record_sync_block_filtered("qc_height_mismatch");
-                    self.queue_height(height.0);
+                    self.queue_height(height);
                     return self.emit_fetch_outputs();
                 }
 
@@ -278,33 +278,31 @@ impl SyncProtocol {
             None => {
                 warn!(height = height.0, "Empty sync response, re-queuing");
                 metrics::record_sync_response_error("empty_response");
-                self.queue_height(height.0);
+                self.queue_height(height);
                 self.emit_fetch_outputs()
             }
         }
     }
 
     fn handle_block_fetch_failed(&mut self, height: BlockHeight) -> Vec<SyncOutput> {
-        self.heights_in_flight.remove(&height.0);
+        self.heights_in_flight.remove(&height);
         warn!(height = height.0, "Sync fetch failed, re-queuing");
         metrics::record_sync_response_error("fetch_failed");
-        self.queue_height(height.0);
+        self.queue_height(height);
         self.emit_fetch_outputs()
     }
 
     fn handle_block_committed(&mut self, height: BlockHeight) -> Vec<SyncOutput> {
-        self.committed_height = height.0;
-        self.remove_heights_at_or_below(height.0);
+        self.committed_height = height;
+        self.remove_heights_at_or_below(height);
 
         if let Some((target, _)) = self.sync_target {
             metrics::record_sync_block_applied();
-            if height.0 >= target {
-                info!(height = height.0, target, "Sync complete");
+            if height >= target {
+                info!(height = height.0, target = target.0, "Sync complete");
                 self.sync_target = None;
                 self.clear_height_queue();
-                return vec![SyncOutput::SyncComplete {
-                    height: BlockHeight(target),
-                }];
+                return vec![SyncOutput::SyncComplete { height: target }];
             }
 
             // Extend sliding window
@@ -318,13 +316,13 @@ impl SyncProtocol {
     // Height Queue Helpers
     // ═══════════════════════════════════════════════════════════════════════
 
-    fn queue_height(&mut self, height: u64) {
+    fn queue_height(&mut self, height: BlockHeight) {
         if !self.heights_in_flight.contains(&height) && self.heights_queued.insert(height) {
             self.heights_to_fetch.push(Reverse(height));
         }
     }
 
-    fn pop_next_height(&mut self) -> Option<u64> {
+    fn pop_next_height(&mut self) -> Option<BlockHeight> {
         while let Some(Reverse(height)) = self.heights_to_fetch.pop() {
             if self.heights_queued.remove(&height) && !self.heights_in_flight.contains(&height) {
                 return Some(height);
@@ -338,7 +336,7 @@ impl SyncProtocol {
         self.heights_queued.clear();
     }
 
-    fn remove_heights_at_or_below(&mut self, threshold: u64) {
+    fn remove_heights_at_or_below(&mut self, threshold: BlockHeight) {
         self.heights_queued.retain(|&h| h > threshold);
         self.heights_in_flight.retain(|&h| h > threshold);
     }
@@ -348,16 +346,17 @@ impl SyncProtocol {
             return;
         };
 
-        let first_height = self.committed_height + 1;
+        let first_height = self.committed_height.0 + 1;
         let window_end = if self.config.sync_window_size == 0 {
-            target_height
+            target_height.0
         } else {
-            (self.committed_height + self.config.sync_window_size).min(target_height)
+            (self.committed_height.0 + self.config.sync_window_size).min(target_height.0)
         };
 
         for height in first_height..=window_end {
-            if !self.heights_in_flight.contains(&height) {
-                self.queue_height(height);
+            let h = BlockHeight(height);
+            if !self.heights_in_flight.contains(&h) {
+                self.queue_height(h);
             }
         }
     }
@@ -375,8 +374,8 @@ impl SyncProtocol {
             if let Some(height) = self.pop_next_height() {
                 self.heights_in_flight.insert(height);
                 outputs.push(SyncOutput::FetchBlock {
-                    height: BlockHeight(height),
-                    target_height: BlockHeight(target_height),
+                    height,
+                    target_height,
                 });
             } else {
                 break;

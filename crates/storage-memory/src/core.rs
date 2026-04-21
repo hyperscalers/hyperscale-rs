@@ -13,9 +13,9 @@ use crate::state::{apply_updates, ConsensusState, SharedState};
 use hyperscale_storage::{
     DatabaseUpdates, DbPartitionKey, DbSortKey, DbSubstateValue, PartitionEntry, SubstateDatabase,
 };
-use hyperscale_types::Hash;
 #[cfg(test)]
 use hyperscale_types::WaveCertificate;
+use hyperscale_types::{BlockHeight, Hash};
 use std::sync::{Arc, RwLock};
 
 /// In-memory storage for simulation and testing.
@@ -111,7 +111,7 @@ impl SimStorage {
     ) {
         {
             let mut s = self.state.write().unwrap();
-            let ver = s.current_block_height;
+            let ver = s.current_block_height.0;
             apply_updates(&mut s, updates, ver, /* write_history */ true);
         }
         self.consensus
@@ -128,17 +128,15 @@ impl SimStorage {
     /// leaf-substate associations for historical reads.
     #[cfg(test)]
     pub fn commit_shared(&self, updates: &DatabaseUpdates) {
-        use hyperscale_types::BlockHeight;
-
         let mut s = self.state.write().unwrap();
 
-        let new_version = s.current_block_height + 1;
+        let new_version = s.current_block_height.0 + 1;
 
         // Apply substate updates first (visible for association resolution below).
         apply_updates(&mut s, updates, new_version, /* write_history */ true);
 
         let parent_version = hyperscale_storage::tree::jmt_parent_height(
-            BlockHeight(s.current_block_height),
+            s.current_block_height,
             s.current_root_hash,
         )
         .map(|h| h.0);
@@ -157,7 +155,7 @@ impl SimStorage {
             s.tree_store.remove(stale_key);
         }
 
-        s.current_block_height = new_version;
+        s.current_block_height = BlockHeight(new_version);
         s.current_root_hash = new_root;
     }
 
@@ -187,7 +185,7 @@ impl SimStorage {
 
         // Guard: finalize_genesis_jmt must only be called once, on an uninitialized JMT.
         assert!(
-            s.current_block_height == 0 && s.current_root_hash == Hash::ZERO,
+            s.current_block_height == BlockHeight::GENESIS && s.current_root_hash == Hash::ZERO,
             "finalize_genesis_jmt called but JMT already initialized"
         );
 
@@ -207,7 +205,7 @@ impl SimStorage {
             s.tree_store.remove(stale_key);
         }
 
-        s.current_block_height = 0;
+        s.current_block_height = BlockHeight::GENESIS;
         s.current_root_hash = root;
 
         root

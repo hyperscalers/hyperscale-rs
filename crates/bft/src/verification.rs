@@ -76,7 +76,7 @@ pub(crate) struct VerificationPipeline {
 
     /// Cache of already-verified QC signatures.
     /// Maps QC's block_hash (the block the QC certifies) -> height.
-    verified_qcs: HashMap<Hash, u64>,
+    verified_qcs: HashMap<Hash, BlockHeight>,
 
     // === State root verification ===
     /// Blocks where state root verification is currently in-flight.
@@ -103,7 +103,7 @@ pub(crate) struct VerificationPipeline {
     /// this height must defer until either parent persists, parent is
     /// locally verified, or parent is consensus-committed (which places
     /// its JMT snapshot in `PendingChain`).
-    last_persisted_height: u64,
+    last_persisted_height: BlockHeight,
 
     /// State root verifications ready to dispatch.
     /// Drained by NodeStateMachine which emits `VerifyStateRoot` actions.
@@ -160,7 +160,7 @@ pub(crate) struct VerificationPipeline {
 
 impl VerificationPipeline {
     /// Create a new verification pipeline.
-    pub fn new(persisted_height: u64) -> Self {
+    pub fn new(persisted_height: BlockHeight) -> Self {
         Self {
             pending_qc_verifications: HashMap::new(),
             verified_qcs: HashMap::new(),
@@ -207,11 +207,11 @@ impl VerificationPipeline {
     }
 
     /// Cache a verified QC to skip future re-verification.
-    pub fn cache_verified_qc(&mut self, qc_block_hash: Hash, height: u64) {
+    pub fn cache_verified_qc(&mut self, qc_block_hash: Hash, height: BlockHeight) {
         self.verified_qcs.insert(qc_block_hash, height);
         trace!(
             qc_block_hash = ?qc_block_hash,
-            qc_height = height,
+            qc_height = height.0,
             "Cached verified QC"
         );
     }
@@ -469,7 +469,7 @@ impl VerificationPipeline {
         // the tree store or in the snapshot cache (from a prior verification).
         // Defer if: parent height exceeds committed JMT AND parent hasn't
         // been verified (no snapshot in the overlay).
-        let parent_tree_available = parent_block_height.0 <= self.last_persisted_height
+        let parent_tree_available = parent_block_height <= self.last_persisted_height
             || self.verified_state_roots.contains(&parent_hash);
 
         if !parent_tree_available {
@@ -957,7 +957,7 @@ impl VerificationPipeline {
         parent_block_height: BlockHeight,
         parent_hash: Hash,
     ) -> bool {
-        parent_block_height.0 <= self.last_persisted_height
+        parent_block_height <= self.last_persisted_height
             || self.verified_state_roots.contains(&parent_hash)
     }
 
@@ -993,10 +993,10 @@ impl VerificationPipeline {
     /// some reason. Steady-state unblocking happens via
     /// [`Self::on_block_committed`].
     pub fn on_block_persisted(&mut self, block_height: BlockHeight) {
-        if block_height.0 <= self.last_persisted_height {
+        if block_height <= self.last_persisted_height {
             return;
         }
-        self.last_persisted_height = block_height.0;
+        self.last_persisted_height = block_height;
 
         // Unblock deferred verifications whose parent height is now persisted.
         let unblocked_parents: Vec<Hash> = self
@@ -1086,7 +1086,7 @@ impl VerificationPipeline {
     pub fn cleanup(
         &mut self,
         pending_blocks: &HashMap<Hash, crate::pending::PendingBlock>,
-        committed_height: u64,
+        committed_height: BlockHeight,
     ) {
         self.pending_qc_verifications
             .retain(|hash, _| pending_blocks.contains_key(hash));
@@ -1111,7 +1111,7 @@ impl VerificationPipeline {
         // Clear deferred proposal if its parent is at or below committed height
         // (the proposal is stale — a new round/view will generate a fresh one).
         if let Some((_, parent_block_height)) = &self.deferred_proposal {
-            if parent_block_height.0 <= committed_height {
+            if *parent_block_height <= committed_height {
                 self.deferred_proposal = None;
             }
         }

@@ -16,7 +16,7 @@ impl SubstateStore for SimStorage {
     }
 
     fn jmt_height(&self) -> BlockHeight {
-        BlockHeight(self.state.read().unwrap().current_block_height)
+        self.state.read().unwrap().current_block_height
     }
 
     fn state_root_hash(&self) -> Hash {
@@ -28,7 +28,7 @@ impl SubstateStore for SimStorage {
         node_id: &NodeId,
         block_height: BlockHeight,
     ) -> Option<Vec<(u8, DbSortKey, Vec<u8>)>> {
-        let current_version = self.state.read().unwrap().current_block_height;
+        let current_version = self.state.read().unwrap().current_block_height.0;
         if block_height.0 > current_version {
             return None;
         }
@@ -62,7 +62,7 @@ impl VersionedStore for SimStorage {
         // full reasoning. Below the floor we can't serve historical
         // reads; hitting this is a DA-assumption bug in the caller.
         let guard = self.state.read().unwrap();
-        let current_version = guard.current_block_height;
+        let current_version = guard.current_block_height.0;
         let floor = current_version.saturating_sub(self.jmt_history_length);
         assert!(
             height.0 >= floor,

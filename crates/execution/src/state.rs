@@ -113,7 +113,7 @@ pub struct ExecutionState {
     finalized_wave_certificates: BTreeMap<WaveId, FinalizedWave>,
 
     /// Current committed height for pruning stale entries.
-    committed_height: u64,
+    committed_height: BlockHeight,
 
     /// BFT-authenticated weighted timestamp of the last locally committed
     /// block. "Now" reference for timeouts that must be deterministic across
@@ -377,7 +377,7 @@ impl ExecutionState {
         Self {
             now: Duration::ZERO,
             finalized_wave_certificates: BTreeMap::new(),
-            committed_height: 0,
+            committed_height: BlockHeight::GENESIS,
             committed_ts_ms: WeightedTimestamp::ZERO,
             waves: HashMap::new(),
             vote_trackers: HashMap::new(),
@@ -1534,7 +1534,7 @@ impl ExecutionState {
         certified: &hyperscale_types::CertifiedBlock,
     ) -> Vec<Action> {
         let block = &certified.block;
-        let height = block.height().0;
+        let height = block.height();
 
         // Update committed height + timestamp before anything else — needed
         // for timeout calculations and pruning even when there are no new
@@ -1836,7 +1836,7 @@ impl ExecutionState {
         }
         tracing::debug!(
             count,
-            committed_height = self.committed_height,
+            committed_height = self.committed_height.0,
             "Pruned stale buffered ECs"
         );
     }
@@ -2334,7 +2334,7 @@ mod tests {
     /// derived from a deterministic header built from the inputs.
     fn make_live_block(
         topology: &TopologySnapshot,
-        height: u64,
+        height: BlockHeight,
         timestamp_ms: u64,
         proposer: ValidatorId,
         transactions: Vec<Arc<RoutableTransaction>>,
@@ -2342,7 +2342,7 @@ mod tests {
         use hyperscale_types::{BlockHeader, ProposerTimestamp, QuorumCertificate, Round};
         let header = BlockHeader {
             shard_group_id: topology.local_shard(),
-            height: BlockHeight(height),
+            height,
             parent_hash: Hash::ZERO,
             parent_qc: QuorumCertificate::genesis(),
             proposer,
@@ -2381,7 +2381,7 @@ mod tests {
         let tx_hash = tx.hash();
         let block = make_live_block(
             &topology,
-            1,
+            BlockHeight(1),
             1000,
             ValidatorId(0),
             vec![Arc::new(tx.clone())],
@@ -2524,7 +2524,13 @@ mod tests {
         // Determine who the wave leader will be for this block's wave.
         let topo0 = make_topology_for(0);
         let committee = topo0.local_committee().to_vec();
-        let block = make_live_block(&topo0, 1, 1000, ValidatorId(0), vec![Arc::new(tx.clone())]);
+        let block = make_live_block(
+            &topo0,
+            BlockHeight(1),
+            1000,
+            ValidatorId(0),
+            vec![Arc::new(tx.clone())],
+        );
 
         // Commit the block as validator 0 to discover the wave_id.
         let mut state0 = make_test_state();
@@ -2537,7 +2543,7 @@ mod tests {
         let topo_leader = make_topology_for(leader.0);
         let block_leader = make_live_block(
             &topo_leader,
-            1,
+            BlockHeight(1),
             1000,
             ValidatorId(0),
             vec![Arc::new(tx.clone())],
@@ -2554,7 +2560,7 @@ mod tests {
         let topo_non = make_topology_for(non_leader_id.0);
         let block_non = make_live_block(
             &topo_non,
-            1,
+            BlockHeight(1),
             1000,
             ValidatorId(0),
             vec![Arc::new(tx.clone())],
@@ -2572,7 +2578,13 @@ mod tests {
         let tx = test_transaction(1);
         let topo = make_topology_for(0);
         let committee = topo.local_committee().to_vec();
-        let block = make_live_block(&topo, 1, 1000, ValidatorId(0), vec![Arc::new(tx.clone())]);
+        let block = make_live_block(
+            &topo,
+            BlockHeight(1),
+            1000,
+            ValidatorId(0),
+            vec![Arc::new(tx.clone())],
+        );
         let block_hash = block.hash();
 
         let mut state = make_test_state();
@@ -2586,7 +2598,7 @@ mod tests {
         let topo_non = make_topology_for(non_leader_id.0);
         let block_non = make_live_block(
             &topo_non,
-            1,
+            BlockHeight(1),
             1000,
             ValidatorId(0),
             vec![Arc::new(tx.clone())],
@@ -2627,7 +2639,7 @@ mod tests {
         let committee = topo.local_committee().to_vec();
 
         let mut state = make_test_state();
-        state.committed_height = 20;
+        state.committed_height = BlockHeight(20);
         // "Now" timestamp exactly VOTE_RETRY_TIMEOUT past the original send.
         state.committed_ts_ms = WeightedTimestamp(10_000).plus(VOTE_RETRY_TIMEOUT);
 
@@ -2678,7 +2690,7 @@ mod tests {
         let topo = make_test_topology();
 
         let mut state = make_test_state();
-        state.committed_height = 10;
+        state.committed_height = BlockHeight(10);
         state.pending_vote_retries.insert(
             wave_id.clone(),
             PendingVoteRetry {
@@ -2838,7 +2850,7 @@ mod tests {
         // Advance committed time past fallback + retry thresholds so the
         // age-based gate would fire. The expectation must survive regardless
         // because a local wave still needs shard 1's EC.
-        state.committed_height = 500;
+        state.committed_height = BlockHeight(500);
         state.committed_ts_ms = WeightedTimestamp(60_000);
         let actions = state.check_exec_cert_timeouts(&topo);
 
@@ -2858,7 +2870,7 @@ mod tests {
         // expectation is no longer needed and gets pruned.
         state.waves.remove(&local_wave);
         state.wave_assignments.remove(&tx_hash);
-        state.committed_height = 600;
+        state.committed_height = BlockHeight(600);
         state.committed_ts_ms = WeightedTimestamp(120_000);
         let _ = state.check_exec_cert_timeouts(&topo);
         assert!(

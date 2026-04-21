@@ -2234,10 +2234,10 @@ fn test_isolated_node_divergence() {
     for i in 0..4u32 {
         let count = runner.committed_block_count(i);
         // Check specific heights
-        let has_46 = runner.has_committed_block(i, 46);
-        let has_47 = runner.has_committed_block(i, 47);
-        let has_48 = runner.has_committed_block(i, 48);
-        let has_49 = runner.has_committed_block(i, 49);
+        let has_46 = runner.has_committed_block(i, BlockHeight(46));
+        let has_47 = runner.has_committed_block(i, BlockHeight(47));
+        let has_48 = runner.has_committed_block(i, BlockHeight(48));
+        let has_49 = runner.has_committed_block(i, BlockHeight(49));
         println!(
             "  Node {}: {} blocks, has 46={}, 47={}, 48={}, 49={}",
             i, count, has_46, has_47, has_48, has_49

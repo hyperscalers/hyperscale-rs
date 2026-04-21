@@ -212,12 +212,13 @@ impl SimStorage {
         qc: &Arc<hyperscale_types::QuorumCertificate>,
         receipts: &[ReceiptBundle],
     ) -> Hash {
-        let block_height = block.height().0;
+        let block_height = block.height();
         let mut s = self.state.write().unwrap();
 
         assert!(
             block_height == s.current_block_height + 1
-                || (block_height == 0 && s.current_block_height == 0),
+                || (block_height == BlockHeight::GENESIS
+                    && s.current_block_height == BlockHeight::GENESIS),
             "commit_block: block_height ({block_height}) must be exactly current_version + 1 ({})",
             s.current_block_height
         );
@@ -226,12 +227,12 @@ impl SimStorage {
         apply_updates(
             &mut s,
             merged_updates,
-            block_height,
+            block_height.0,
             /* write_history */ true,
         );
 
         let parent_version = hyperscale_storage::tree::jmt_parent_height(
-            BlockHeight(s.current_block_height),
+            s.current_block_height,
             s.current_root_hash,
         )
         .map(|h| h.0);
@@ -239,7 +240,7 @@ impl SimStorage {
         let (new_root, collected) = hyperscale_storage::tree::put_at_version(
             &s.tree_store,
             parent_version,
-            block_height,
+            block_height.0,
             &[merged_updates],
             &Default::default(),
         );

@@ -307,7 +307,7 @@ pub enum ProtocolEvent {
     SyncBlockReadyToApply { certified: CertifiedBlock },
 
     /// Sync EC BLS verification completed (async callback from crypto pool).
-    SyncEcVerificationComplete { height: u64, valid: bool },
+    SyncEcVerificationComplete { height: BlockHeight, valid: bool },
 
     /// The io_loop's SyncProtocol has finished fetching all blocks up to
     /// the sync target. BftState should exit sync mode so it can re-enter

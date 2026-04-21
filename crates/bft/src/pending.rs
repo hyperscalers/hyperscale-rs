@@ -300,10 +300,10 @@ mod tests {
     use super::*;
     use hyperscale_types::{BlockHeight, QuorumCertificate, Round, ShardGroupId, ValidatorId};
 
-    fn make_header(height: u64) -> BlockHeader {
+    fn make_header(height: BlockHeight) -> BlockHeader {
         BlockHeader {
             shard_group_id: ShardGroupId(0),
-            height: BlockHeight(height),
+            height,
             parent_hash: Hash::from_bytes(b"parent"),
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(0),
@@ -325,7 +325,7 @@ mod tests {
     fn test_pending_block_creation() {
         let tx1 = Hash::from_bytes(b"tx1");
         let tx2 = Hash::from_bytes(b"tx2");
-        let header = make_header(1);
+        let header = make_header(BlockHeight(1));
 
         let pb = PendingBlock::from_manifest(
             header.clone(),
@@ -344,7 +344,7 @@ mod tests {
 
     #[test]
     fn test_empty_block_is_complete() {
-        let header = make_header(1);
+        let header = make_header(BlockHeight(1));
         let pb = PendingBlock::from_manifest(header, BlockManifest::default());
 
         assert!(pb.is_complete());
@@ -355,7 +355,7 @@ mod tests {
         let tx1 = Hash::from_bytes(b"tx1");
         let wave1 = Hash::from_bytes(b"wave1");
         let wave2 = Hash::from_bytes(b"wave2");
-        let header = make_header(1);
+        let header = make_header(BlockHeight(1));
 
         let pb = PendingBlock::from_manifest(
             header,
@@ -379,7 +379,7 @@ mod tests {
 
         let wave_id = WaveId::new(ShardGroupId(0), BlockHeight(1), Default::default());
         let wave_hash = wave_id.hash();
-        let header = make_header(1);
+        let header = make_header(BlockHeight(1));
 
         let mut pb = PendingBlock::from_manifest(
             header,
@@ -416,7 +416,7 @@ mod tests {
         let tx_hash = tx.hash();
         let wave_id = WaveId::new(ShardGroupId(0), BlockHeight(1), Default::default());
         let wave_hash = wave_id.hash();
-        let header = make_header(1);
+        let header = make_header(BlockHeight(1));
 
         let mut pb = PendingBlock::from_manifest(
             header,
@@ -462,7 +462,7 @@ mod tests {
         });
 
         let block = Block::Live {
-            header: make_header(1),
+            header: make_header(BlockHeight(1)),
             transactions: vec![],
             certificates: vec![Arc::clone(&fw)],
             provisions: vec![],
