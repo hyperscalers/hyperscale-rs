@@ -13,8 +13,8 @@
 use hyperscale_core::{NodeInput, TransactionStatus};
 use hyperscale_simulation::{NetworkConfig, SimulationRunner};
 use hyperscale_types::{
-    ed25519_keypair_from_seed, shard_for_node, sign_and_notarize, Ed25519PrivateKey, NodeId,
-    RoutableTransaction, ShardGroupId,
+    ed25519_keypair_from_seed, shard_for_node, sign_and_notarize, BlockHeight, Ed25519PrivateKey,
+    NodeId, RoutableTransaction, ShardGroupId,
 };
 use radix_common::constants::XRD;
 use radix_common::crypto::Ed25519PublicKey;
@@ -113,7 +113,7 @@ fn test_e2e_single_shard_transaction() {
         let node = runner.node(node_idx).expect("Node should exist");
         assert_eq!(
             node.bft().committed_height(),
-            0,
+            BlockHeight(0),
             "Node {} should be at genesis height",
             node_idx
         );
@@ -157,7 +157,7 @@ fn test_e2e_single_shard_transaction() {
     let mut any_committed = false;
     for node_idx in 0..4u32 {
         let node = runner.node(node_idx).expect("Node should exist");
-        if node.bft().committed_height() > 0 {
+        if node.bft().committed_height() > BlockHeight::GENESIS {
             any_committed = true;
             println!(
                 "Node {} committed height: {}",
@@ -194,7 +194,7 @@ fn test_e2e_single_shard_transaction() {
             println!("✓ Transaction already completed and evicted after initial consensus!\n");
 
             // Print final state
-            let max_height: u64 = (0..4)
+            let max_height: BlockHeight = (0..4)
                 .map(|i| runner.node(i).unwrap().bft().committed_height())
                 .max()
                 .unwrap();
@@ -217,7 +217,7 @@ fn test_e2e_single_shard_transaction() {
         println!("✓ Transaction already completed after initial consensus!\n");
 
         // Print final state
-        let max_height: u64 = (0..4)
+        let max_height: BlockHeight = (0..4)
             .map(|i| runner.node(i).unwrap().bft().committed_height())
             .max()
             .unwrap();
@@ -327,7 +327,7 @@ fn test_e2e_single_shard_transaction() {
     println!("Timers set: {}", stats.timers_set);
 
     // Verify all nodes have progressed
-    let mut max_height = 0;
+    let mut max_height = BlockHeight::GENESIS;
     for node_idx in 0..4u32 {
         let node = runner.node(node_idx).expect("Node should exist");
         let height = node.bft().committed_height();
@@ -349,7 +349,7 @@ fn test_e2e_single_shard_transaction() {
 
     // Assertions
     assert!(
-        max_height >= 1,
+        max_height >= BlockHeight(1),
         "Should have committed at least one block beyond genesis"
     );
     assert!(
@@ -405,7 +405,7 @@ fn test_e2e_single_shard_determinism() {
     runner1.run_until(Duration::from_secs(5));
 
     let stats1 = runner1.stats().clone();
-    let heights1: Vec<u64> = (0..4)
+    let heights1: Vec<BlockHeight> = (0..4)
         .map(|i| runner1.node(i).unwrap().bft().committed_height())
         .collect();
 
@@ -422,7 +422,7 @@ fn test_e2e_single_shard_determinism() {
     runner2.run_until(Duration::from_secs(5));
 
     let stats2 = runner2.stats().clone();
-    let heights2: Vec<u64> = (0..4)
+    let heights2: Vec<BlockHeight> = (0..4)
         .map(|i| runner2.node(i).unwrap().bft().committed_height())
         .collect();
 
@@ -490,10 +490,10 @@ fn test_e2e_multi_shard_consensus() {
     println!("\n=== After 5 seconds ===");
 
     // Check each shard's progress
-    let shard0_heights: Vec<u64> = (0..3)
+    let shard0_heights: Vec<BlockHeight> = (0..3)
         .map(|i| runner.node(i).unwrap().bft().committed_height())
         .collect();
-    let shard1_heights: Vec<u64> = (3..6)
+    let shard1_heights: Vec<BlockHeight> = (3..6)
         .map(|i| runner.node(i).unwrap().bft().committed_height())
         .collect();
 
@@ -505,8 +505,14 @@ fn test_e2e_multi_shard_consensus() {
     let shard0_max = *shard0_heights.iter().max().unwrap();
     let shard1_max = *shard1_heights.iter().max().unwrap();
 
-    assert!(shard0_max >= 1, "Shard 0 should have made progress");
-    assert!(shard1_max >= 1, "Shard 1 should have made progress");
+    assert!(
+        shard0_max >= BlockHeight(1),
+        "Shard 0 should have made progress"
+    );
+    assert!(
+        shard1_max >= BlockHeight(1),
+        "Shard 1 should have made progress"
+    );
 
     let stats = runner.stats();
     println!("\nFinal stats:");
@@ -745,18 +751,24 @@ fn test_e2e_cross_shard_transaction() {
     }
 
     // Verify both shards made progress
-    let shard0_max: u64 = (0..3)
+    let shard0_max: BlockHeight = (0..3)
         .map(|i| runner.node(i).unwrap().bft().committed_height())
         .max()
         .unwrap();
-    let shard1_max: u64 = (3..6)
+    let shard1_max: BlockHeight = (3..6)
         .map(|i| runner.node(i).unwrap().bft().committed_height())
         .max()
         .unwrap();
 
     // Assertions
-    assert!(shard0_max >= 2, "Shard 0 should have committed blocks");
-    assert!(shard1_max >= 2, "Shard 1 should have committed blocks");
+    assert!(
+        shard0_max >= BlockHeight(2),
+        "Shard 0 should have committed blocks"
+    );
+    assert!(
+        shard1_max >= BlockHeight(2),
+        "Shard 1 should have committed blocks"
+    );
     assert!(in_mempool, "Transaction should have entered mempool");
     assert!(
         committed || completed,
@@ -817,7 +829,7 @@ fn test_e2e_cross_shard_determinism() {
     runner1.run_until(Duration::from_secs(5));
 
     let stats1 = runner1.stats().clone();
-    let heights1: Vec<u64> = (0..6)
+    let heights1: Vec<BlockHeight> = (0..6)
         .map(|i| runner1.node(i).unwrap().bft().committed_height())
         .collect();
 
@@ -834,7 +846,7 @@ fn test_e2e_cross_shard_determinism() {
     runner2.run_until(Duration::from_secs(5));
 
     let stats2 = runner2.stats().clone();
-    let heights2: Vec<u64> = (0..6)
+    let heights2: Vec<BlockHeight> = (0..6)
         .map(|i| runner2.node(i).unwrap().bft().committed_height())
         .collect();
 
@@ -903,7 +915,7 @@ fn test_e2e_transaction_throughput() {
     let elapsed = runner.now() - start;
 
     // Get final state
-    let max_height: u64 = (0..4)
+    let max_height: BlockHeight = (0..4)
         .map(|i| runner.node(i).unwrap().bft().committed_height())
         .max()
         .unwrap();
@@ -916,12 +928,15 @@ fn test_e2e_transaction_throughput() {
     println!("  Events processed: {}", stats.events_processed);
     println!("  Messages sent: {}", stats.messages_sent);
 
-    if max_height > 0 {
-        let blocks_per_second = max_height as f64 / elapsed.as_secs_f64();
+    if max_height > BlockHeight::GENESIS {
+        let blocks_per_second = max_height.0 as f64 / elapsed.as_secs_f64();
         println!("  Blocks per second: {:.2}", blocks_per_second);
     }
 
-    assert!(max_height >= 5, "Should have committed multiple blocks");
+    assert!(
+        max_height >= BlockHeight(5),
+        "Should have committed multiple blocks"
+    );
 
     println!("\n✅ Throughput Test PASSED!");
 }
@@ -1008,7 +1023,7 @@ fn test_wave_leader_failure_recovers_via_rotation() {
             }
         }
 
-        let max_height: u64 = (0..4)
+        let max_height: BlockHeight = (0..4)
             .map(|i| runner.node(i).unwrap().bft().committed_height())
             .max()
             .unwrap();

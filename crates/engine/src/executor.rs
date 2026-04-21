@@ -36,7 +36,7 @@ use crate::execution::{
 use crate::genesis::{GenesisBuilder, GenesisConfig, GenesisError};
 use crate::result::{ExecutionOutput, SingleTxResult};
 use hyperscale_storage::{CommittableSubstateDatabase, SubstateDatabase, SubstateStore};
-use hyperscale_types::{NodeId, RoutableTransaction, StateEntry, StateProvision};
+use hyperscale_types::{BlockHeight, NodeId, RoutableTransaction, StateEntry, StateProvision};
 use radix_common::network::NetworkDefinition;
 use radix_engine::transaction::{execute_transaction, ExecutionConfig, TransactionReceipt};
 use radix_engine::vm::DefaultVmModules;
@@ -57,7 +57,7 @@ use tracing::{instrument, Level};
 pub fn fetch_state_entries<S: SubstateStore>(
     storage: &S,
     nodes: &[NodeId],
-    block_height: u64,
+    block_height: BlockHeight,
 ) -> Option<Vec<StateEntry>> {
     use radix_substate_store_interface::db_key_mapper::{DatabaseKeyMapper, SpreadPrefixKeyMapper};
 
@@ -136,7 +136,7 @@ pub trait Engine: Clone + Send + Sync + 'static {
         &self,
         storage: &S,
         nodes: &[hyperscale_types::NodeId],
-        block_height: u64,
+        block_height: BlockHeight,
     ) -> Option<Vec<hyperscale_types::StateEntry>>;
 
     /// Run genesis bootstrapping on the given storage.
@@ -438,7 +438,7 @@ impl RadixExecutor {
         &self,
         storage: &S,
         nodes: &[NodeId],
-        block_height: u64,
+        block_height: BlockHeight,
     ) -> Option<Vec<StateEntry>> {
         fetch_state_entries(storage, nodes, block_height)
     }
@@ -485,7 +485,7 @@ impl Engine for RadixExecutor {
         &self,
         storage: &S,
         nodes: &[hyperscale_types::NodeId],
-        block_height: u64,
+        block_height: BlockHeight,
     ) -> Option<Vec<hyperscale_types::StateEntry>> {
         self.fetch_state_entries(storage, nodes, block_height)
     }

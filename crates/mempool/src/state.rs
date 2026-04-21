@@ -1342,7 +1342,7 @@ mod tests {
     /// for the given inputs. The wave height is set equal to the containing block
     /// height, with no remote shard dependencies.
     fn make_test_finalized_wave(
-        block_height: u64,
+        block_height: BlockHeight,
         tx_hash: Hash,
         decision: TransactionDecision,
     ) -> FinalizedWave {
@@ -1360,7 +1360,7 @@ mod tests {
         let wave_id = WaveId::new(ShardGroupId(0), block_height, BTreeSet::new());
         let ec = ExecutionCertificate::new(
             wave_id.clone(),
-            WeightedTimestamp(block_height + 1),
+            WeightedTimestamp(block_height.0 + 1),
             Hash::ZERO,
             vec![TxOutcome { tx_hash, outcome }],
             Bls12381G2Signature([0u8; 96]),
@@ -1478,7 +1478,7 @@ mod tests {
     }
 
     #[allow(dead_code)]
-    fn make_test_wave_certificate(height: u64) -> WaveCertificate {
+    fn make_test_wave_certificate(height: BlockHeight) -> WaveCertificate {
         WaveCertificate {
             wave_id: WaveId::new(ShardGroupId(0), height, BTreeSet::new()),
             execution_certificates: vec![],
@@ -1498,7 +1498,7 @@ mod tests {
         let commit_block = push_finalized_wave(
             make_test_block(1, vec![tx], vec![]),
             Arc::new(make_test_finalized_wave(
-                1,
+                BlockHeight(1),
                 tx_hash,
                 TransactionDecision::Aborted,
             )),
@@ -1538,7 +1538,7 @@ mod tests {
         let commit_block = push_finalized_wave(
             make_test_block(1, vec![tx], vec![]),
             Arc::new(make_test_finalized_wave(
-                1,
+                BlockHeight(1),
                 tx_hash,
                 TransactionDecision::Accept,
             )),
@@ -1563,7 +1563,7 @@ mod tests {
         let commit_block = push_finalized_wave(
             make_test_block(1, vec![tx.clone()], vec![]),
             Arc::new(make_test_finalized_wave(
-                1,
+                BlockHeight(1),
                 tx_hash,
                 TransactionDecision::Accept,
             )),
@@ -1594,7 +1594,7 @@ mod tests {
         let commit_block = push_finalized_wave(
             make_test_block(1, vec![tx.clone()], vec![]),
             Arc::new(make_test_finalized_wave(
-                1,
+                BlockHeight(1),
                 tx_hash,
                 TransactionDecision::Accept,
             )),
@@ -1622,7 +1622,7 @@ mod tests {
         let commit_block = push_finalized_wave(
             make_test_block(1, vec![tx.clone()], vec![]),
             Arc::new(make_test_finalized_wave(
-                1,
+                BlockHeight(1),
                 tx_hash,
                 TransactionDecision::Aborted,
             )),
@@ -1651,7 +1651,7 @@ mod tests {
             let commit_block = push_finalized_wave(
                 make_test_block(i as u64, vec![tx], vec![]),
                 Arc::new(make_test_finalized_wave(
-                    i as u64,
+                    BlockHeight(i as u64),
                     tx_hash,
                     TransactionDecision::Accept,
                 )),
@@ -1691,7 +1691,7 @@ mod tests {
         let commit_block = push_finalized_wave(
             make_test_block(10, vec![tx.clone()], vec![]),
             Arc::new(make_test_finalized_wave(
-                10,
+                BlockHeight(10),
                 tx_hash,
                 TransactionDecision::Accept,
             )),

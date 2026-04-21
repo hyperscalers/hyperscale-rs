@@ -133,6 +133,8 @@ impl SimStorage {
     /// leaf-substate associations for historical reads.
     #[cfg(test)]
     pub fn commit_shared(&self, updates: &DatabaseUpdates) {
+        use hyperscale_types::BlockHeight;
+
         let mut s = self.state.write().unwrap();
 
         let new_version = s.current_block_height + 1;
@@ -141,9 +143,10 @@ impl SimStorage {
         apply_updates(&mut s, updates, new_version, /* write_history */ true);
 
         let parent_version = hyperscale_storage::tree::jmt_parent_height(
-            s.current_block_height,
+            BlockHeight(s.current_block_height),
             s.current_root_hash,
-        );
+        )
+        .map(|h| h.0);
         let (new_root, collected) = hyperscale_storage::tree::put_at_version(
             &s.tree_store,
             parent_version,

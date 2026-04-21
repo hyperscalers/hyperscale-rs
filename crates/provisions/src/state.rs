@@ -1242,7 +1242,7 @@ mod tests {
             .into_iter()
             .map(|s| WaveId {
                 shard_group_id: shard,
-                block_height: height,
+                block_height: BlockHeight(height),
                 remote_shards: std::collections::BTreeSet::from([s]),
             })
             .collect();

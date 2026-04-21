@@ -12,7 +12,7 @@
 //! ```
 
 use hyperscale_metrics as metrics;
-use hyperscale_types::{ExecutionCertificate, ShardGroupId, ValidatorId, WaveId};
+use hyperscale_types::{BlockHeight, ExecutionCertificate, ShardGroupId, ValidatorId, WaveId};
 use std::collections::{BTreeMap, HashSet};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, trace};
@@ -45,28 +45,31 @@ pub enum ExecCertFetchInput {
     /// A new fetch request from the execution state machine.
     Request {
         source_shard: ShardGroupId,
-        block_height: u64,
+        block_height: BlockHeight,
         wave_id: WaveId,
         peers: Vec<ValidatorId>,
     },
     /// Execution certificates were successfully received.
     Received {
         source_shard: ShardGroupId,
-        block_height: u64,
+        block_height: BlockHeight,
         certificates: Vec<ExecutionCertificate>,
     },
     /// A fetch attempt failed (network error or peer returned None).
     Failed {
         source_shard: ShardGroupId,
-        block_height: u64,
+        block_height: BlockHeight,
     },
     /// Cancel a pending fetch (cert arrived via proactive path).
     Cancel {
         source_shard: ShardGroupId,
-        block_height: u64,
+        block_height: BlockHeight,
     },
     /// Periodic tick — spawn pending fetch operations.
-    Tick { now: Instant, committed_height: u64 },
+    Tick {
+        now: Instant,
+        committed_height: BlockHeight,
+    },
 }
 
 /// Outputs from the execution certificate fetch protocol state machine.
@@ -75,7 +78,7 @@ pub enum ExecCertFetchOutput {
     /// Request the runner to fetch execution certs from a specific peer.
     Fetch {
         source_shard: ShardGroupId,
-        block_height: u64,
+        block_height: BlockHeight,
         wave_ids: Vec<WaveId>,
         peer: ValidatorId,
     },
@@ -101,7 +104,7 @@ struct PendingExecCertFetch {
 pub struct ExecCertFetchProtocol {
     config: ExecCertFetchConfig,
     /// Pending fetches keyed by (source_shard, block_height).
-    pending: BTreeMap<(ShardGroupId, u64), PendingExecCertFetch>,
+    pending: BTreeMap<(ShardGroupId, BlockHeight), PendingExecCertFetch>,
 }
 
 impl ExecCertFetchProtocol {
@@ -171,7 +174,7 @@ impl ExecCertFetchProtocol {
     fn handle_request(
         &mut self,
         source_shard: ShardGroupId,
-        block_height: u64,
+        block_height: BlockHeight,
         wave_id: WaveId,
         peers: Vec<ValidatorId>,
     ) -> Vec<ExecCertFetchOutput> {
@@ -186,7 +189,7 @@ impl ExecCertFetchProtocol {
             existing.rounds = 0;
             trace!(
                 source_shard = source_shard.0,
-                block_height,
+                block_height = block_height.0,
                 "Refreshed peer list for pending exec cert fetch"
             );
             return vec![];
@@ -206,7 +209,7 @@ impl ExecCertFetchProtocol {
 
         debug!(
             source_shard = source_shard.0,
-            block_height,
+            block_height = block_height.0,
             wave = %wave_id,
             peer_count = peers.len(),
             "Starting exec cert fetch"
@@ -230,14 +233,14 @@ impl ExecCertFetchProtocol {
     fn handle_received(
         &mut self,
         source_shard: ShardGroupId,
-        block_height: u64,
+        block_height: BlockHeight,
         certificates: Vec<ExecutionCertificate>,
     ) -> Vec<ExecCertFetchOutput> {
         let key = (source_shard, block_height);
         if self.pending.remove(&key).is_some() {
             debug!(
                 source_shard = source_shard.0,
-                block_height,
+                block_height = block_height.0,
                 count = certificates.len(),
                 "Exec cert fetch complete"
             );
@@ -246,7 +249,7 @@ impl ExecCertFetchProtocol {
         } else {
             trace!(
                 source_shard = source_shard.0,
-                block_height,
+                block_height = block_height.0,
                 "Exec certs received for unknown fetch"
             );
             vec![]
@@ -256,13 +259,14 @@ impl ExecCertFetchProtocol {
     fn handle_cancel(
         &mut self,
         source_shard: ShardGroupId,
-        block_height: u64,
+        block_height: BlockHeight,
     ) -> Vec<ExecCertFetchOutput> {
         let key = (source_shard, block_height);
         if self.pending.remove(&key).is_some() {
             debug!(
                 source_shard = source_shard.0,
-                block_height, "Exec cert fetch cancelled"
+                block_height = block_height.0,
+                "Exec cert fetch cancelled"
             );
         }
         vec![]
@@ -271,7 +275,7 @@ impl ExecCertFetchProtocol {
     fn handle_failed(
         &mut self,
         source_shard: ShardGroupId,
-        block_height: u64,
+        block_height: BlockHeight,
     ) -> Vec<ExecCertFetchOutput> {
         let key = (source_shard, block_height);
         if let Some(state) = self.pending.get_mut(&key) {
@@ -279,7 +283,7 @@ impl ExecCertFetchProtocol {
             metrics::record_fetch_failed("exec_cert");
             debug!(
                 source_shard = source_shard.0,
-                block_height,
+                block_height = block_height.0,
                 tried = state.tried.len(),
                 remaining = state.peers.len().saturating_sub(state.tried.len()),
                 "Exec cert fetch failed, will try next peer"
@@ -292,7 +296,7 @@ impl ExecCertFetchProtocol {
     fn spawn_pending_fetches(
         &mut self,
         now: Instant,
-        _committed_height: u64,
+        _committed_height: BlockHeight,
     ) -> Vec<ExecCertFetchOutput> {
         let mut outputs = Vec::new();
 
@@ -332,7 +336,7 @@ impl ExecCertFetchProtocol {
                     available_slots -= 1;
                     trace!(
                         source_shard = source_shard.0,
-                        block_height,
+                        block_height = block_height.0,
                         peer = peer.0,
                         "Fetching exec certs from peer"
                     );
@@ -353,7 +357,7 @@ impl ExecCertFetchProtocol {
                     state.next_retry_at = Some(now + backoff);
                     info!(
                         source_shard = source_shard.0,
-                        block_height,
+                        block_height = block_height.0,
                         round = state.rounds,
                         backoff_ms = backoff.as_millis(),
                         "Exec cert fetch exhausted peers, backing off"
@@ -367,7 +371,7 @@ impl ExecCertFetchProtocol {
 
     /// Tiered eviction: prefer entries below committed_height (truly stale),
     /// fall back to oldest-by-height.
-    fn evict_one(&mut self, source_shard: ShardGroupId, committed_height: u64) {
+    fn evict_one(&mut self, source_shard: ShardGroupId, committed_height: BlockHeight) {
         // Tier 1: below committed_height (truly stale)
         let stale = self
             .pending
@@ -387,8 +391,8 @@ impl ExecCertFetchProtocol {
         if let Some(key) = target {
             debug!(
                 source_shard = source_shard.0,
-                evicted_height = key.1,
-                committed_height,
+                evicted_height = key.1 .0,
+                committed_height = committed_height.0,
                 "Evicting exec cert fetch entry (tiered eviction)"
             );
             self.pending.remove(&key);
@@ -407,11 +411,11 @@ mod tests {
     fn tick() -> ExecCertFetchInput {
         ExecCertFetchInput::Tick {
             now: Instant::now(),
-            committed_height: 0,
+            committed_height: BlockHeight(0),
         }
     }
 
-    fn tick_at(now: Instant, committed_height: u64) -> ExecCertFetchInput {
+    fn tick_at(now: Instant, committed_height: BlockHeight) -> ExecCertFetchInput {
         ExecCertFetchInput::Tick {
             now,
             committed_height,
@@ -429,7 +433,7 @@ mod tests {
     fn wave(shards: &[u64]) -> WaveId {
         WaveId::new(
             ShardGroupId(0),
-            1,
+            BlockHeight(1),
             shards.iter().map(|&s| ShardGroupId(s)).collect(),
         )
     }
@@ -448,7 +452,7 @@ mod tests {
         // Submit a request.
         let outputs = protocol.handle(ExecCertFetchInput::Request {
             source_shard: shard(1),
-            block_height: 10,
+            block_height: BlockHeight(10),
             wave_id: wave(&[0, 1]),
             peers: vec![vid(1), vid(2), vid(3)],
         });
@@ -466,7 +470,7 @@ mod tests {
                 peer,
             } => {
                 assert_eq!(*source_shard, shard(1));
-                assert_eq!(*block_height, 10);
+                assert_eq!(*block_height, BlockHeight(10));
                 assert_eq!(wave_ids.len(), 1);
                 assert_eq!(*peer, vid(1));
             }
@@ -480,7 +484,7 @@ mod tests {
 
         protocol.handle(ExecCertFetchInput::Request {
             source_shard: shard(1),
-            block_height: 10,
+            block_height: BlockHeight(10),
             wave_id: wave(&[0, 1]),
             peers: vec![vid(1), vid(2), vid(3)],
         });
@@ -496,7 +500,7 @@ mod tests {
         // Fail → frees in_flight.
         protocol.handle(ExecCertFetchInput::Failed {
             source_shard: shard(1),
-            block_height: 10,
+            block_height: BlockHeight(10),
         });
 
         // Tick 2: next untried peer (vid(2)).
@@ -510,7 +514,7 @@ mod tests {
         // Fail again.
         protocol.handle(ExecCertFetchInput::Failed {
             source_shard: shard(1),
-            block_height: 10,
+            block_height: BlockHeight(10),
         });
 
         // Tick 3: last peer (vid(3)).
@@ -528,7 +532,7 @@ mod tests {
 
         protocol.handle(ExecCertFetchInput::Request {
             source_shard: shard(1),
-            block_height: 10,
+            block_height: BlockHeight(10),
             wave_id: wave(&[0, 1]),
             peers: vec![vid(1), vid(2)],
         });
@@ -536,19 +540,19 @@ mod tests {
         let now = Instant::now();
 
         // Exhaust all peers in round 0.
-        protocol.handle(tick_at(now, 0));
+        protocol.handle(tick_at(now, BlockHeight(0)));
         protocol.handle(ExecCertFetchInput::Failed {
             source_shard: shard(1),
-            block_height: 10,
+            block_height: BlockHeight(10),
         });
-        protocol.handle(tick_at(now, 0));
+        protocol.handle(tick_at(now, BlockHeight(0)));
         protocol.handle(ExecCertFetchInput::Failed {
             source_shard: shard(1),
-            block_height: 10,
+            block_height: BlockHeight(10),
         });
 
         // All peers exhausted → backoff set, entry NOT dropped.
-        let outputs = protocol.handle(tick_at(now, 0));
+        let outputs = protocol.handle(tick_at(now, BlockHeight(0)));
         assert!(outputs.is_empty(), "Should be in backoff");
         assert!(
             protocol.has_pending(),
@@ -556,11 +560,11 @@ mod tests {
         );
 
         // Tick during backoff window → still no fetch.
-        let outputs = protocol.handle(tick_at(now + Duration::from_millis(500), 0));
+        let outputs = protocol.handle(tick_at(now + Duration::from_millis(500), BlockHeight(0)));
         assert!(outputs.is_empty(), "Still in backoff window");
 
         // Tick after backoff expires → retry with reset peers.
-        let outputs = protocol.handle(tick_at(now + Duration::from_secs(2), 0));
+        let outputs = protocol.handle(tick_at(now + Duration::from_secs(2), BlockHeight(0)));
         assert_eq!(outputs.len(), 1, "Should retry after backoff");
         assert!(matches!(
             &outputs[0],
@@ -574,7 +578,7 @@ mod tests {
 
         protocol.handle(ExecCertFetchInput::Request {
             source_shard: shard(1),
-            block_height: 10,
+            block_height: BlockHeight(10),
             wave_id: wave(&[0, 1]),
             peers: vec![vid(1)],
         });
@@ -582,35 +586,35 @@ mod tests {
         let now = Instant::now();
 
         // Exhaust round 0 (1 peer).
-        protocol.handle(tick_at(now, 0));
+        protocol.handle(tick_at(now, BlockHeight(0)));
         protocol.handle(ExecCertFetchInput::Failed {
             source_shard: shard(1),
-            block_height: 10,
+            block_height: BlockHeight(10),
         });
         // All peers exhausted → round 1, backoff = 500ms * 2^1 = 1000ms
-        protocol.handle(tick_at(now, 0));
+        protocol.handle(tick_at(now, BlockHeight(0)));
 
         // Check state: rounds=1, next_retry_at set.
-        let state = protocol.pending.get(&(shard(1), 10)).unwrap();
+        let state = protocol.pending.get(&(shard(1), BlockHeight(10))).unwrap();
         assert_eq!(state.rounds, 1);
         assert!(state.next_retry_at.is_some());
 
         // Tick at 999ms → still backing off.
-        let outputs = protocol.handle(tick_at(now + Duration::from_millis(999), 0));
+        let outputs = protocol.handle(tick_at(now + Duration::from_millis(999), BlockHeight(0)));
         assert!(outputs.is_empty());
 
         // Tick at 1001ms → retry.
-        let outputs = protocol.handle(tick_at(now + Duration::from_millis(1001), 0));
+        let outputs = protocol.handle(tick_at(now + Duration::from_millis(1001), BlockHeight(0)));
         assert_eq!(outputs.len(), 1);
 
         // Fail again, exhaust round 1 → round 2, backoff = 500ms * 2^2 = 2000ms
         protocol.handle(ExecCertFetchInput::Failed {
             source_shard: shard(1),
-            block_height: 10,
+            block_height: BlockHeight(10),
         });
         let now2 = now + Duration::from_millis(1001);
-        protocol.handle(tick_at(now2, 0));
-        let state = protocol.pending.get(&(shard(1), 10)).unwrap();
+        protocol.handle(tick_at(now2, BlockHeight(0)));
+        let state = protocol.pending.get(&(shard(1), BlockHeight(10))).unwrap();
         assert_eq!(state.rounds, 2);
     }
 
@@ -620,7 +624,7 @@ mod tests {
 
         protocol.handle(ExecCertFetchInput::Request {
             source_shard: shard(1),
-            block_height: 10,
+            block_height: BlockHeight(10),
             wave_id: wave(&[0, 1]),
             peers: vec![vid(1), vid(2)],
         });
@@ -631,7 +635,7 @@ mod tests {
         // Receive certificates.
         let outputs = protocol.handle(ExecCertFetchInput::Received {
             source_shard: shard(1),
-            block_height: 10,
+            block_height: BlockHeight(10),
             certificates: vec![],
         });
 
@@ -649,7 +653,7 @@ mod tests {
 
         protocol.handle(ExecCertFetchInput::Request {
             source_shard: shard(1),
-            block_height: 10,
+            block_height: BlockHeight(10),
             wave_id: wave(&[0, 1]),
             peers: vec![vid(1), vid(2)],
         });
@@ -657,13 +661,13 @@ mod tests {
         // Duplicate request with a different wave_id.
         protocol.handle(ExecCertFetchInput::Request {
             source_shard: shard(1),
-            block_height: 10,
+            block_height: BlockHeight(10),
             wave_id: wave(&[0, 2]),
             peers: vec![vid(1), vid(2), vid(3)],
         });
 
         // Should have merged wave_ids.
-        let state = protocol.pending.get(&(shard(1), 10)).unwrap();
+        let state = protocol.pending.get(&(shard(1), BlockHeight(10))).unwrap();
         assert_eq!(state.wave_ids.len(), 2); // original + new unique one
         assert_eq!(state.peers.len(), 3); // refreshed
     }
@@ -680,7 +684,7 @@ mod tests {
         for h in 10..13 {
             protocol.handle(ExecCertFetchInput::Request {
                 source_shard: shard(1),
-                block_height: h,
+                block_height: BlockHeight(h),
                 wave_id: wave(&[0, 1]),
                 peers: vec![vid(1)],
             });
@@ -697,7 +701,7 @@ mod tests {
 
         let outputs = protocol.handle(ExecCertFetchInput::Received {
             source_shard: shard(99),
-            block_height: 999,
+            block_height: BlockHeight(999),
             certificates: vec![],
         });
         assert!(outputs.is_empty());
@@ -709,7 +713,7 @@ mod tests {
 
         protocol.handle(ExecCertFetchInput::Request {
             source_shard: shard(1),
-            block_height: 10,
+            block_height: BlockHeight(10),
             wave_id: wave(&[0, 1]),
             peers: vec![vid(1), vid(2)],
         });
@@ -729,7 +733,7 @@ mod tests {
 
         protocol.handle(ExecCertFetchInput::Request {
             source_shard: shard(1),
-            block_height: 10,
+            block_height: BlockHeight(10),
             wave_id: wave(&[0, 1]),
             peers: vec![vid(1), vid(2)],
         });
@@ -737,7 +741,7 @@ mod tests {
 
         let outputs = protocol.handle(ExecCertFetchInput::Cancel {
             source_shard: shard(1),
-            block_height: 10,
+            block_height: BlockHeight(10),
         });
         assert!(outputs.is_empty());
         assert!(
@@ -752,7 +756,7 @@ mod tests {
 
         let outputs = protocol.handle(ExecCertFetchInput::Cancel {
             source_shard: shard(99),
-            block_height: 999,
+            block_height: BlockHeight(999),
         });
         assert!(outputs.is_empty());
     }
@@ -763,7 +767,7 @@ mod tests {
 
         protocol.handle(ExecCertFetchInput::Request {
             source_shard: shard(1),
-            block_height: 10,
+            block_height: BlockHeight(10),
             wave_id: wave(&[0, 1]),
             peers: vec![vid(1)],
         });
@@ -776,7 +780,7 @@ mod tests {
         // Cancel while in-flight — should still remove.
         protocol.handle(ExecCertFetchInput::Cancel {
             source_shard: shard(1),
-            block_height: 10,
+            block_height: BlockHeight(10),
         });
         assert!(
             !protocol.has_pending(),
@@ -796,7 +800,7 @@ mod tests {
         for h in 10..13 {
             protocol.handle(ExecCertFetchInput::Request {
                 source_shard: shard(1),
-                block_height: h,
+                block_height: BlockHeight(h),
                 wave_id: wave(&[0, 1]),
                 peers: vec![vid(1), vid(2)],
             });
@@ -807,7 +811,7 @@ mod tests {
         // 4th request should evict the oldest (height 10) and insert height 13.
         protocol.handle(ExecCertFetchInput::Request {
             source_shard: shard(1),
-            block_height: 13,
+            block_height: BlockHeight(13),
             wave_id: wave(&[0, 1]),
             peers: vec![vid(1), vid(2)],
         });
@@ -817,18 +821,18 @@ mod tests {
             "Should still be 3 after eviction"
         );
         assert!(
-            !protocol.pending.contains_key(&(shard(1), 10)),
+            !protocol.pending.contains_key(&(shard(1), BlockHeight(10))),
             "Oldest entry (height 10) should have been evicted"
         );
         assert!(
-            protocol.pending.contains_key(&(shard(1), 13)),
+            protocol.pending.contains_key(&(shard(1), BlockHeight(13))),
             "New entry (height 13) should be present"
         );
 
         // Requests for a DIFFERENT shard should still be accepted independently.
         protocol.handle(ExecCertFetchInput::Request {
             source_shard: shard(2),
-            block_height: 10,
+            block_height: BlockHeight(10),
             wave_id: wave(&[0, 2]),
             peers: vec![vid(3)],
         });
@@ -847,7 +851,7 @@ mod tests {
         for h in 10..12 {
             protocol.handle(ExecCertFetchInput::Request {
                 source_shard: shard(1),
-                block_height: h,
+                block_height: BlockHeight(h),
                 wave_id: wave(&[0, 1]),
                 peers: vec![vid(1)],
             });
@@ -857,7 +861,7 @@ mod tests {
         // Complete one fetch — should free a slot.
         protocol.handle(ExecCertFetchInput::Received {
             source_shard: shard(1),
-            block_height: 10,
+            block_height: BlockHeight(10),
             certificates: vec![],
         });
         assert!(!protocol.is_shard_saturated(shard(1)));
@@ -865,7 +869,7 @@ mod tests {
         // New request should now be accepted without eviction.
         protocol.handle(ExecCertFetchInput::Request {
             source_shard: shard(1),
-            block_height: 12,
+            block_height: BlockHeight(12),
             wave_id: wave(&[0, 1]),
             peers: vec![vid(1)],
         });
@@ -884,7 +888,7 @@ mod tests {
         for h in [5, 15, 25] {
             protocol.handle(ExecCertFetchInput::Request {
                 source_shard: shard(1),
-                block_height: h,
+                block_height: BlockHeight(h),
                 wave_id: wave(&[0, 1]),
                 peers: vec![vid(1)],
             });
@@ -892,21 +896,21 @@ mod tests {
         assert_eq!(protocol.pending_count_for_shard(shard(1)), 3);
 
         // Evict with committed_height=20 — should prefer height 5 (below committed).
-        protocol.evict_one(shard(1), 20);
+        protocol.evict_one(shard(1), BlockHeight(20));
         assert_eq!(protocol.pending_count_for_shard(shard(1)), 2);
         assert!(
-            !protocol.pending.contains_key(&(shard(1), 5)),
+            !protocol.pending.contains_key(&(shard(1), BlockHeight(5))),
             "Stale entry (height 5 < committed 20) should be evicted first"
         );
-        assert!(protocol.pending.contains_key(&(shard(1), 15)));
-        assert!(protocol.pending.contains_key(&(shard(1), 25)));
+        assert!(protocol.pending.contains_key(&(shard(1), BlockHeight(15))));
+        assert!(protocol.pending.contains_key(&(shard(1), BlockHeight(25))));
 
         // Evict again with committed_height=14 — height 15 is above, no stale entries.
         // Falls back to oldest-by-height → evicts 15.
-        protocol.evict_one(shard(1), 14);
+        protocol.evict_one(shard(1), BlockHeight(14));
         assert_eq!(protocol.pending_count_for_shard(shard(1)), 1);
         assert!(
-            protocol.pending.contains_key(&(shard(1), 25)),
+            protocol.pending.contains_key(&(shard(1), BlockHeight(25))),
             "Only height 25 should remain"
         );
     }

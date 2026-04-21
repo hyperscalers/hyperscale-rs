@@ -273,7 +273,7 @@ impl NodeStateMachine {
         // For blocks further ahead, skip validation - validators at different heights
         // have different in_flight() counts, causing split votes and view changes.
         let committed_height = self.bft.committed_height();
-        let is_next_block = header.height.0 == committed_height + 1;
+        let is_next_block = header.height == committed_height + 1;
 
         if is_next_block
             && self
@@ -472,7 +472,7 @@ impl StateMachine for NodeStateMachine {
         node = self.node_index,
         shard = self.topology.snapshot().local_shard().0,
         event = %event.type_name(),
-        height = self.bft.committed_height(),
+        height = self.bft.committed_height().0,
     ))]
     fn handle(&mut self, event: ProtocolEvent) -> Vec<Action> {
         let mut actions = match event {
@@ -556,7 +556,7 @@ impl StateMachine for NodeStateMachine {
                 self.execution.on_verified_remote_header(
                     topology,
                     shard,
-                    committed_header.header.height.0,
+                    committed_header.header.height,
                     &committed_header.header.waves,
                 );
 
@@ -601,7 +601,7 @@ impl StateMachine for NodeStateMachine {
             ProtocolEvent::BlockPersisted { height } => {
                 let mut actions = self
                     .bft
-                    .on_block_persisted(self.topology.snapshot(), height);
+                    .on_block_persisted(self.topology.snapshot(), height.0);
                 // If BFT just resumed from sync, reschedule the cleanup timer.
                 if !actions.is_empty() {
                     actions.push(Action::SetTimer {

@@ -11,6 +11,7 @@ use hyperscale_messages::{
 };
 use hyperscale_network::Network;
 use hyperscale_storage::{ChainReader, ChainWriter, SubstateStore};
+use hyperscale_types::BlockHeight;
 use tracing::warn;
 
 impl<S, N, D, E> IoLoop<S, N, D, E>
@@ -239,7 +240,7 @@ where
 
                     // Look up the committed block at the requested height.
                     let certified = storage
-                        .get_block(hyperscale_types::BlockHeight(req.height.0));
+                        .get_block(BlockHeight(req.height.0));
 
                     match certified {
                         Some(certified) => {

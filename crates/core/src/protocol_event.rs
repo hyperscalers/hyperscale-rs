@@ -132,7 +132,7 @@ pub enum ProtocolEvent {
     /// Fires after the async RocksDB write completes. Used for bookkeeping
     /// (persistence lag tracking) — not consensus-critical.
     /// The `height` is the highest block height in the persistence batch.
-    BlockPersisted { height: u64 },
+    BlockPersisted { height: BlockHeight },
 
     /// Quorum Certificate verification and building result.
     QuorumCertificateResult {
@@ -312,7 +312,7 @@ pub enum ProtocolEvent {
     /// The io_loop's SyncProtocol has finished fetching all blocks up to
     /// the sync target. BftState should exit sync mode so it can re-enter
     /// if still behind, or resume normal consensus.
-    SyncProtocolComplete { height: u64 },
+    SyncProtocolComplete { height: BlockHeight },
 
     /// Sync recovery complete — validator has caught up and is resuming consensus.
     /// Triggers immediate provision and remote header fetching so the validator

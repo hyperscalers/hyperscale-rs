@@ -6,7 +6,7 @@
 //! hyperscale type system.
 
 use hyperscale_jmt::{self as jmt, Blake3Hasher, MultiProof, Tree};
-use hyperscale_types::{Hash, MerkleInclusionProof};
+use hyperscale_types::{BlockHeight, Hash, MerkleInclusionProof};
 
 use super::{hash_storage_key, hash_value, Jmt};
 
@@ -22,9 +22,9 @@ use super::{hash_storage_key, hash_value, Jmt};
 pub fn generate_proof<S: jmt::TreeReader>(
     store: &S,
     storage_keys: &[Vec<u8>],
-    block_height: u64,
+    block_height: BlockHeight,
 ) -> Option<MerkleInclusionProof> {
-    let root_key = jmt::NodeKey::root(block_height);
+    let root_key = jmt::NodeKey::root(block_height.0);
 
     let jmt_keys: Vec<jmt::Key> = storage_keys.iter().map(|sk| hash_storage_key(sk)).collect();
 

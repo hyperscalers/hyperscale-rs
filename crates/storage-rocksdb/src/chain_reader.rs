@@ -49,9 +49,12 @@ impl hyperscale_storage::ChainReader for RocksDbStorage {
         RocksDbStorage::get_local_receipt(self, tx_hash)
     }
 
-    fn get_execution_certificates_by_height(&self, block_height: u64) -> Vec<ExecutionCertificate> {
+    fn get_execution_certificates_by_height(
+        &self,
+        block_height: BlockHeight,
+    ) -> Vec<ExecutionCertificate> {
         let cf = crate::column_families::ExecutionCertsByHeightCf::handle(&self.cf());
-        let prefix = block_height.to_be_bytes();
+        let prefix = block_height.0.to_be_bytes();
         crate::typed_cf::prefix_iter::<crate::column_families::ExecutionCertsByHeightCf>(
             &self.db, cf, &prefix,
         )

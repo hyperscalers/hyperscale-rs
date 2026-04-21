@@ -6,6 +6,7 @@
 
 use hyperscale_core::NodeInput;
 use hyperscale_simulation::{NetworkConfig, SimulationRunner};
+use hyperscale_types::BlockHeight;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing_test::traced_test;
@@ -517,7 +518,7 @@ fn test_view_change_complete_flow() {
         let node = runner.node(node_idx).expect("Node should exist");
         assert_eq!(
             node.bft().committed_height(),
-            0,
+            BlockHeight(0),
             "Node {} should be at height 0",
             node_idx
         );
@@ -605,7 +606,7 @@ fn test_view_change_quorum_after_commit() {
     let mut any_committed = false;
     for node_idx in 0..4u32 {
         let node = runner.node(node_idx).expect("Node should exist");
-        if node.bft().committed_height() > 0 {
+        if node.bft().committed_height() > BlockHeight::GENESIS {
             any_committed = true;
             println!(
                 "Node {} has committed height {}",
@@ -755,7 +756,7 @@ fn test_round_reset_on_commit() {
 
         // If blocks were committed, the system is making progress
         // Round advancement only happens when no QC forms within timeout
-        if committed > 0 {
+        if committed > BlockHeight::GENESIS {
             // Progress is being made, round may or may not have advanced
             // depending on timing of commits vs timeouts
             println!("  -> Making progress with committed height {}", committed);
@@ -884,7 +885,7 @@ fn test_round_determinism() {
     let views1: Vec<u64> = (0..4u32)
         .map(|i| runner1.node(i).unwrap().bft().view())
         .collect();
-    let heights1: Vec<u64> = (0..4u32)
+    let heights1: Vec<BlockHeight> = (0..4u32)
         .map(|i| runner1.node(i).unwrap().bft().committed_height())
         .collect();
 
@@ -896,7 +897,7 @@ fn test_round_determinism() {
     let views2: Vec<u64> = (0..4u32)
         .map(|i| runner2.node(i).unwrap().bft().view())
         .collect();
-    let heights2: Vec<u64> = (0..4u32)
+    let heights2: Vec<BlockHeight> = (0..4u32)
         .map(|i| runner2.node(i).unwrap().bft().committed_height())
         .collect();
 
@@ -937,7 +938,7 @@ fn test_block_commit_verification() {
     runner.run_until(Duration::from_secs(3));
 
     // Get committed heights for all nodes
-    let committed_heights: Vec<u64> = (0..4u32)
+    let committed_heights: Vec<BlockHeight> = (0..4u32)
         .map(|i| runner.node(i).unwrap().bft().committed_height())
         .collect();
 
@@ -948,7 +949,10 @@ fn test_block_commit_verification() {
     // own block via the next block header, so it commits one block later.
     let max_height = *committed_heights.iter().max().unwrap();
     let min_height = *committed_heights.iter().min().unwrap();
-    assert!(max_height > 0, "Should have committed at least one block");
+    assert!(
+        max_height > BlockHeight(0),
+        "Should have committed at least one block"
+    );
     assert!(
         max_height - min_height <= 1,
         "Committed heights should differ by at most 1, got {:?}",
@@ -957,15 +961,15 @@ fn test_block_commit_verification() {
 
     // QC heights also differ by at most 1 — the last proposer doesn't
     // form the QC for its own block until the next header arrives.
-    let qc_heights: Vec<u64> = (0..4u32)
+    let qc_heights: Vec<BlockHeight> = (0..4u32)
         .map(|i| {
             runner
                 .node(i)
                 .unwrap()
                 .bft()
                 .latest_qc()
-                .map(|qc| qc.height.0)
-                .unwrap_or(0)
+                .map(|qc| qc.height)
+                .unwrap_or(BlockHeight::GENESIS)
         })
         .collect();
 
@@ -1004,7 +1008,7 @@ fn test_block_commit_determinism() {
     runner1.initialize_genesis();
     runner1.run_until(Duration::from_secs(2));
 
-    let heights1: Vec<u64> = (0..4u32)
+    let heights1: Vec<BlockHeight> = (0..4u32)
         .map(|i| runner1.node(i).unwrap().bft().committed_height())
         .collect();
     let qc_heights1: Vec<Option<u64>> = (0..4u32)
@@ -1024,7 +1028,7 @@ fn test_block_commit_determinism() {
     runner2.initialize_genesis();
     runner2.run_until(Duration::from_secs(2));
 
-    let heights2: Vec<u64> = (0..4u32)
+    let heights2: Vec<BlockHeight> = (0..4u32)
         .map(|i| runner2.node(i).unwrap().bft().committed_height())
         .collect();
     let qc_heights2: Vec<Option<u64>> = (0..4u32)
@@ -1069,7 +1073,7 @@ fn test_sequential_commit() {
     runner.initialize_genesis();
 
     // Run incrementally and verify sequential commits
-    let mut last_committed = 0u64;
+    let mut last_committed = BlockHeight::GENESIS;
 
     for step in 1..=10 {
         runner.run_until(Duration::from_millis(step * 700));
@@ -1088,7 +1092,7 @@ fn test_sequential_commit() {
 
     // With targeted voting, nodes may differ by at most 1 committed height
     // at any snapshot (the last proposer learns about its QC via the next header).
-    let final_heights: Vec<u64> = (0..4u32)
+    let final_heights: Vec<BlockHeight> = (0..4u32)
         .map(|i| runner.node(i).unwrap().bft().committed_height())
         .collect();
 
@@ -1102,7 +1106,7 @@ fn test_sequential_commit() {
 
     // With 1000ms proposal interval, expect ~5 blocks in 7 seconds
     assert!(
-        max_h >= 5,
+        max_h >= BlockHeight(5),
         "Should have committed at least 5 blocks in 7 seconds, got {}",
         max_h
     );
@@ -1133,9 +1137,9 @@ fn test_consensus_throughput() {
     let committed_height = runner.node(0).unwrap().bft().committed_height();
     let stats = runner.stats();
 
-    let blocks_per_second = committed_height as f64 / 10.0;
-    let messages_per_block = if committed_height > 0 {
-        stats.messages_sent as f64 / committed_height as f64
+    let blocks_per_second = committed_height.0 as f64 / 10.0;
+    let messages_per_block = if committed_height > BlockHeight::GENESIS {
+        stats.messages_sent as f64 / committed_height.0 as f64
     } else {
         0.0
     };
@@ -1149,7 +1153,7 @@ fn test_consensus_throughput() {
 
     // Pipeline-limited with no rate-limit floor; expect comfortable progress.
     assert!(
-        committed_height >= 5,
+        committed_height >= BlockHeight(5),
         "Should commit at least 5 blocks in 10 seconds"
     );
     assert!(
@@ -1253,7 +1257,7 @@ fn test_mempool_to_block_integration() {
 
     // At least one block should have been committed
     assert!(
-        committed_height > 0,
+        committed_height > BlockHeight::GENESIS,
         "Should have committed at least one block"
     );
 }
@@ -1311,7 +1315,7 @@ fn test_execution_flow() {
 
     // Verify blocks were committed (transaction was processed)
     assert!(
-        node0.bft().committed_height() > 0,
+        node0.bft().committed_height() > BlockHeight::GENESIS,
         "Should have committed blocks"
     );
 }
@@ -1402,7 +1406,7 @@ fn test_multi_shard_initialization() {
         assert_eq!(node.shard().0, 0, "Node {} should be in shard 0", node_idx);
         assert_eq!(
             node.bft().committed_height(),
-            0,
+            BlockHeight(0),
             "Node {} should be at genesis",
             node_idx
         );
@@ -1414,7 +1418,7 @@ fn test_multi_shard_initialization() {
         assert_eq!(node.shard().0, 1, "Node {} should be in shard 1", node_idx);
         assert_eq!(
             node.bft().committed_height(),
-            0,
+            BlockHeight(0),
             "Node {} should be at genesis",
             node_idx
         );
@@ -1434,8 +1438,8 @@ fn test_multi_shard_consensus_progress() {
     runner.run_until(Duration::from_secs(5));
 
     // Collect committed heights by shard
-    let mut shard0_heights: Vec<u64> = Vec::new();
-    let mut shard1_heights: Vec<u64> = Vec::new();
+    let mut shard0_heights: Vec<BlockHeight> = Vec::new();
+    let mut shard1_heights: Vec<BlockHeight> = Vec::new();
 
     for node_idx in 0..4u32 {
         let height = runner.node(node_idx).unwrap().bft().committed_height();
@@ -1469,8 +1473,14 @@ fn test_multi_shard_consensus_progress() {
     );
 
     // Both shards should have made progress
-    assert!(shard0_min > 0, "Shard 0 should have committed blocks");
-    assert!(shard1_min > 0, "Shard 1 should have committed blocks");
+    assert!(
+        shard0_min > BlockHeight::GENESIS,
+        "Shard 0 should have committed blocks"
+    );
+    assert!(
+        shard1_min > BlockHeight::GENESIS,
+        "Shard 1 should have committed blocks"
+    );
 
     let stats = runner.stats();
     println!("\nSimulation stats:");
@@ -1607,7 +1617,7 @@ fn test_multi_shard_determinism() {
     runner1.initialize_genesis();
     runner1.run_until(Duration::from_secs(3));
 
-    let heights1: Vec<u64> = (0..8u32)
+    let heights1: Vec<BlockHeight> = (0..8u32)
         .map(|i| runner1.node(i).unwrap().bft().committed_height())
         .collect();
     let stats1 = runner1.stats().clone();
@@ -1617,7 +1627,7 @@ fn test_multi_shard_determinism() {
     runner2.initialize_genesis();
     runner2.run_until(Duration::from_secs(3));
 
-    let heights2: Vec<u64> = (0..8u32)
+    let heights2: Vec<BlockHeight> = (0..8u32)
         .map(|i| runner2.node(i).unwrap().bft().committed_height())
         .collect();
     let stats2 = runner2.stats().clone();
@@ -1805,7 +1815,7 @@ fn test_partition_recovery_hotstuff2() {
     );
 
     // Collect heights after partition heals
-    let heights_after: Vec<u64> = (0..4u32)
+    let heights_after: Vec<BlockHeight> = (0..4u32)
         .map(|i| runner.node(i).unwrap().bft().committed_height())
         .collect();
 
@@ -1839,7 +1849,7 @@ fn test_partition_recovery_hotstuff2() {
 
     // After partition heals, nodes should resume making progress
     // The key assertion: max_height should be higher than height_during
-    let height_diff = max_height.saturating_sub(min_height);
+    let height_diff = max_height.0.saturating_sub(min_height.0);
     println!("Height difference: {}", height_diff);
 
     // With HotStuff-2 style view changes, recovery may be slower initially
@@ -1850,7 +1860,7 @@ fn test_partition_recovery_hotstuff2() {
          height_during={}, max_height={} (expected > {})",
         height_during,
         max_height,
-        height_during + 3
+        (height_during + 3).0
     );
 
     // Small divergence is expected due to in-flight messages and sync timing
@@ -1941,7 +1951,7 @@ fn test_packet_loss_application() {
     // Run with packet loss
     runner.run_until(Duration::from_secs(3));
 
-    let heights: Vec<u64> = (0..4u32)
+    let heights: Vec<BlockHeight> = (0..4u32)
         .map(|i| runner.node(i).unwrap().bft().committed_height())
         .collect();
 
@@ -1973,7 +1983,7 @@ fn test_packet_loss_application() {
     // Some progress should still be made (consensus isn't completely broken)
     let max_height = *heights.iter().max().unwrap();
     assert!(
-        max_height > 0,
+        max_height > BlockHeight(0),
         "Some progress should be made even with 10% loss"
     );
 }
@@ -1997,7 +2007,7 @@ fn test_packet_loss_determinism() {
     runner1.initialize_genesis();
     runner1.run_until(Duration::from_secs(3));
     let stats1 = runner1.stats().clone();
-    let heights1: Vec<u64> = (0..4u32)
+    let heights1: Vec<BlockHeight> = (0..4u32)
         .map(|i| runner1.node(i).unwrap().bft().committed_height())
         .collect();
 
@@ -2006,7 +2016,7 @@ fn test_packet_loss_determinism() {
     runner2.initialize_genesis();
     runner2.run_until(Duration::from_secs(3));
     let stats2 = runner2.stats().clone();
-    let heights2: Vec<u64> = (0..4u32)
+    let heights2: Vec<BlockHeight> = (0..4u32)
         .map(|i| runner2.node(i).unwrap().bft().committed_height())
         .collect();
 
@@ -2047,7 +2057,7 @@ fn test_sync_triggers_when_behind() {
     runner.run_until(Duration::from_secs(8));
 
     // Check all nodes have made progress
-    let heights: Vec<u64> = (0..4u32)
+    let heights: Vec<BlockHeight> = (0..4u32)
         .map(|i| runner.node(i).unwrap().bft().committed_height())
         .collect();
 
@@ -2058,7 +2068,7 @@ fn test_sync_triggers_when_behind() {
     let min_height = *heights.iter().min().unwrap();
 
     assert!(
-        max_height >= 5,
+        max_height >= BlockHeight(5),
         "Should have committed at least 5 blocks, got {}",
         max_height
     );
@@ -2093,7 +2103,7 @@ fn test_sync_detection_threshold() {
     runner.run_until(Duration::from_secs(2));
 
     // All nodes should be at the same height during normal operation
-    let heights: Vec<u64> = (0..4u32)
+    let heights: Vec<BlockHeight> = (0..4u32)
         .map(|i| runner.node(i).unwrap().bft().committed_height())
         .collect();
 
@@ -2126,7 +2136,10 @@ fn test_committed_blocks_stored_for_sync() {
 
     // Check that node 0 has committed blocks
     let height = runner.node(0).unwrap().bft().committed_height();
-    assert!(height >= 5, "Should have committed at least 5 blocks");
+    assert!(
+        height >= BlockHeight(5),
+        "Should have committed at least 5 blocks"
+    );
 
     // The simulation stores committed blocks in the runner's committed_blocks cache
     // This is verified indirectly - if blocks weren't stored, sync requests would fail
@@ -2148,7 +2161,7 @@ fn test_sync_state_isolation() {
         let node = runner.node(i).unwrap();
         assert_eq!(
             node.bft().committed_height(),
-            0,
+            BlockHeight(0),
             "Fresh node {} should be at height 0",
             i
         );
@@ -2192,7 +2205,7 @@ fn test_isolated_node_divergence() {
     runner.run_until(Duration::from_secs(4));
 
     // Check heights
-    let heights_during: Vec<u64> = (0..4u32)
+    let heights_during: Vec<BlockHeight> = (0..4u32)
         .map(|i| runner.node(i).unwrap().bft().committed_height())
         .collect();
     println!("Heights during isolation: {:?}", heights_during);
@@ -2249,7 +2262,7 @@ fn test_isolated_node_divergence() {
     }
 
     // Check final heights
-    let final_heights: Vec<u64> = (0..4u32)
+    let final_heights: Vec<BlockHeight> = (0..4u32)
         .map(|i| runner.node(i).unwrap().bft().committed_height())
         .collect();
     println!("Final heights: {:?}", final_heights);

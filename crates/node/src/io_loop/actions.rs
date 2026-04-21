@@ -15,7 +15,7 @@ use hyperscale_engine::Engine;
 use hyperscale_metrics as metrics;
 use hyperscale_network::Network;
 use hyperscale_storage::{ChainReader, ChainWriter, SubstateStore};
-use hyperscale_types::{Block, CertifiedBlock, Hash, QuorumCertificate, ValidatorId};
+use hyperscale_types::{Block, BlockHeight, CertifiedBlock, Hash, QuorumCertificate, ValidatorId};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tracing::{debug, trace, warn};
@@ -72,7 +72,7 @@ where
                     let block_hash = header.hash();
                     let msg = hyperscale_types::block_header_message(
                         header.shard_group_id,
-                        header.height.0,
+                        header.height,
                         header.round,
                         &block_hash,
                     );
@@ -134,7 +134,7 @@ where
                 self.dispatch.spawn_consensus_crypto(move || {
                     let msg = hyperscale_types::committed_block_header_message(
                         committed_header.header.shard_group_id,
-                        committed_header.header.height.0,
+                        committed_header.header.height,
                         &committed_header.header.hash(),
                     );
                     let sig = signing_key.sign_v1(&msg);
@@ -250,7 +250,7 @@ where
                             .values()
                             .map(|c| c.block_height())
                             .max()
-                            .unwrap_or(0)
+                            .unwrap_or(BlockHeight::GENESIS)
                             .saturating_sub(500);
                         cache.retain(|_, c| c.block_height() > cutoff);
                     }
@@ -467,7 +467,7 @@ where
         block: Block,
         qc: QuorumCertificate,
         parent_state_root: Hash,
-        parent_block_height: u64,
+        parent_block_height: BlockHeight,
         source: CommitSource,
     ) {
         let block_hash = block.hash();
@@ -482,7 +482,7 @@ where
         // prepared commit orphaned in the cache, and the next block to
         // reach `flush_block_commits` trips the strict ordering assert
         // in `commit_block_inner` because its parent was never applied.
-        if height.0 <= self.persisted_height {
+        if height <= self.persisted_height {
             return;
         }
 
@@ -509,7 +509,7 @@ where
                 parent_state_root,
                 parent_block_height,
                 &finalized_waves,
-                height.0,
+                height,
                 &pending_snapshots,
                 // `None` → the view drains its own base-read cache internally.
                 None,
@@ -535,7 +535,7 @@ where
                 block_hash,
                 hyperscale_storage::ChainEntry {
                     parent_hash: block.header().parent_hash,
-                    height: height.0,
+                    height,
                     receipts,
                     jmt_snapshot,
                 },
@@ -545,7 +545,7 @@ where
             self.prepared_commits
                 .lock()
                 .unwrap()
-                .insert(block_hash, (height.0, prepared));
+                .insert(block_hash, (height, prepared));
 
             debug!(
                 height = height.0,
@@ -583,7 +583,7 @@ where
         let height = commit.block.height();
 
         // Skip blocks already persisted by the sync path.
-        if height.0 <= self.persisted_height {
+        if height <= self.persisted_height {
             return;
         }
 
@@ -613,13 +613,13 @@ where
         // doesn't need JMT state).
         let outputs = self
             .sync_protocol
-            .handle(SyncInput::BlockCommitted { height: height.0 });
+            .handle(SyncInput::BlockCommitted { height });
         self.process_sync_outputs(outputs);
 
         // Fire BlockCommitted immediately unless persistence is falling
         // too far behind (backpressure). When deferred, flush_block_commits
         // sends BlockCommitted after the disk write instead.
-        let persistence_lag = height.0.saturating_sub(self.persisted_height);
+        let persistence_lag = height.0.saturating_sub(self.persisted_height.0);
         let notify_now = persistence_lag <= Self::MAX_PERSISTENCE_LAG;
         if notify_now {
             let certified = CertifiedBlock::new_unchecked(
@@ -630,7 +630,7 @@ where
         } else {
             tracing::debug!(
                 height = height.0,
-                persisted = self.persisted_height,
+                persisted = self.persisted_height.0,
                 lag = persistence_lag,
                 "Deferring BlockCommitted — persistence backpressure"
             );
@@ -676,7 +676,7 @@ where
         let mut commits = std::mem::take(&mut self.pending_block_commits);
 
         // Drop blocks already persisted by the sync path.
-        let persisted = self.persisted_height;
+        let persisted = self.persisted_height.0;
         commits.retain(|c| c.block.height().0 > persisted);
         if commits.is_empty() {
             return;
@@ -696,9 +696,9 @@ where
         // height.
         let max_committed_height = commits
             .iter()
-            .map(|c| c.block.height().0)
+            .map(|c| c.block.height())
             .max()
-            .unwrap_or(0);
+            .unwrap_or(BlockHeight::GENESIS);
 
         // Blocks committed via CommitBlock need the PreparedCommit produced
         // asynchronously by VerifyStateRoot. If it's not ready yet, defer —
@@ -731,7 +731,7 @@ where
                     // Put back prepared commit if we extracted one.
                     if let Some(p) = prepared {
                         let bh = commit.block.hash();
-                        let h = commit.block.height().0;
+                        let h = commit.block.height();
                         cache.insert(bh, (h, p));
                     }
                     self.pending_block_commits.push(commit);
@@ -774,7 +774,7 @@ where
                 Arc<hyperscale_types::QuorumCertificate>,
             )> = Vec::with_capacity(commits.len());
 
-            let heights: Vec<u64> = commits.iter().map(|c| c.block.height().0).collect();
+            let heights: Vec<BlockHeight> = commits.iter().map(|c| c.block.height()).collect();
 
             // Wrap commits in Option so we can take() them for deferred notifications.
             let mut commit_slots: Vec<Option<super::PendingCommit>> =
@@ -787,7 +787,11 @@ where
 
             let _roots = storage.commit_prepared_blocks(batch);
 
-            let max_persisted = heights.iter().copied().max().unwrap_or(0);
+            let max_persisted = heights
+                .iter()
+                .copied()
+                .max()
+                .unwrap_or(BlockHeight::GENESIS);
 
             // Send deferred BlockCommitted events for blocks that weren't notified
             // at accumulation time (due to persistence backpressure).
@@ -955,7 +959,7 @@ where
             } => {
                 debug!(
                     source_shard = source_shard.0,
-                    block_height,
+                    block_height = block_height.0,
                     wave = %wave_id,
                     peer_count = peers.len(),
                     "Requesting missing execution cert from source shard"

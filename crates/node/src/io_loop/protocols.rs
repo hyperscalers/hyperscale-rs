@@ -13,7 +13,7 @@ use hyperscale_engine::Engine;
 use hyperscale_metrics as metrics;
 use hyperscale_network::Network;
 use hyperscale_storage::{ChainReader, ChainWriter, SubstateStore};
-use hyperscale_types::{BlockHeight, ValidatorId};
+use hyperscale_types::ValidatorId;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -50,7 +50,7 @@ where
                     self.network.request(
                         &peers,
                         None,
-                        GetBlockRequest::new(BlockHeight(height), BlockHeight(target_height)),
+                        GetBlockRequest::new(height, target_height),
                         Box::new(move |result| match result {
                             Ok(resp) => {
                                 let block = resp.into_certified().map(Box::new);
@@ -71,7 +71,10 @@ where
                     });
                 }
                 SyncOutput::SyncComplete { height } => {
-                    tracing::info!(height, "Sync protocol complete, resuming consensus");
+                    tracing::info!(
+                        height = height.0,
+                        "Sync protocol complete, resuming consensus"
+                    );
                     // Tell BftState to exit sync mode. The previous
                     // BlockPersisted → on_block_persisted path was unreliable
                     // because BlockPersisted requires PreparedCommit which

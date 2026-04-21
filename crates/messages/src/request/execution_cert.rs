@@ -1,7 +1,7 @@
 //! Execution certificate fetch request for fallback recovery.
 
 use crate::response::GetExecutionCertsResponse;
-use hyperscale_types::{MessagePriority, NetworkMessage, Request, WaveId};
+use hyperscale_types::{BlockHeight, MessagePriority, NetworkMessage, Request, WaveId};
 use sbor::prelude::BasicSbor;
 
 /// Request to fetch missing execution certificates from a source shard.
@@ -12,7 +12,7 @@ use sbor::prelude::BasicSbor;
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct GetExecutionCertsRequest {
     /// Height of the source block whose execution certs are needed.
-    pub block_height: u64,
+    pub block_height: BlockHeight,
     /// Which waves' certs are missing.
     pub wave_ids: Vec<WaveId>,
 }
@@ -40,10 +40,10 @@ mod tests {
     #[test]
     fn test_sbor_roundtrip() {
         let request = GetExecutionCertsRequest {
-            block_height: 42,
+            block_height: BlockHeight(42),
             wave_ids: vec![WaveId::new(
                 ShardGroupId(0),
-                42,
+                BlockHeight(42),
                 BTreeSet::from([ShardGroupId(1), ShardGroupId(2)]),
             )],
         };

@@ -38,5 +38,9 @@ fn append_ec_to_batch(
     storage.cf_put_raw::<ExecutionCertsCf>(batch, &canonical_hash, cert, cert.cached_sbor_bytes());
 
     // Index: (block_height, canonical_hash) → ()
-    storage.cf_put::<ExecutionCertsByHeightCf>(batch, &(cert.block_height(), canonical_hash), &());
+    storage.cf_put::<ExecutionCertsByHeightCf>(
+        batch,
+        &(cert.block_height().0, canonical_hash),
+        &(),
+    );
 }

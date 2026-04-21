@@ -45,7 +45,7 @@ pub fn verify_and_build_qc(
     total_voting_power: u64,
 ) -> QcVerificationResult {
     let signing_message =
-        hyperscale_types::block_vote_message(shard_group_id, height.0, round, &block_hash);
+        hyperscale_types::block_vote_message(shard_group_id, height, round, &block_hash);
     // Start with already-verified votes (e.g., our own vote)
     let mut all_verified: Vec<(usize, BlockVote, u64)> = already_verified;
     let mut all_signatures: Vec<Bls12381G2Signature> =
@@ -300,10 +300,10 @@ pub struct StateRootResult<P: Send> {
 pub fn verify_state_root<S: ChainWriter + SubstateStore>(
     storage: &S,
     parent_state_root: Hash,
-    parent_block_height: u64,
+    parent_block_height: BlockHeight,
     expected_root: Hash,
     finalized_waves: &[Arc<FinalizedWave>],
-    block_height: u64,
+    block_height: BlockHeight,
     pending_snapshots: &[Arc<hyperscale_storage::JmtSnapshot>],
 ) -> StateRootResult<S::PreparedCommit> {
     // Use the stable parent_block_height from the verification pipeline, not
@@ -329,8 +329,8 @@ pub fn verify_state_root<S: ChainWriter + SubstateStore>(
             ?expected_root,
             ?computed_root,
             ?parent_state_root,
-            block_height,
-            parent_block_height,
+            block_height = block_height.0,
+            parent_block_height = parent_block_height.0,
             "State root verification FAILED"
         );
     }
@@ -369,7 +369,7 @@ pub fn build_proposal<S: ChainWriter + SubstateStore>(
     timestamp: ProposerTimestamp,
     is_fallback: bool,
     parent_state_root: Hash,
-    parent_block_height: u64,
+    parent_block_height: BlockHeight,
     transactions: Vec<Arc<RoutableTransaction>>,
     certificates: Vec<Arc<FinalizedWave>>,
     local_shard: ShardGroupId,
@@ -383,7 +383,7 @@ pub fn build_proposal<S: ChainWriter + SubstateStore>(
         parent_state_root,
         parent_block_height,
         &certificates,
-        height.0,
+        height,
         pending_snapshots,
         None,
     );
@@ -400,7 +400,7 @@ pub fn build_proposal<S: ChainWriter + SubstateStore>(
     let certificate_root = compute_certificate_root(&certificates);
     let local_receipt_root = compute_local_receipt_root(&receipts);
     let provision_root = compute_provision_root(&provision_hashes);
-    let waves = compute_waves(topology, height.0, &transactions);
+    let waves = compute_waves(topology, height, &transactions);
     let provision_tx_roots = compute_provision_tx_roots(topology, &transactions);
 
     // in_flight is deterministic from chain state:

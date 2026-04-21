@@ -71,7 +71,7 @@ impl<S: jmt::TreeReader + Sync> jmt::TreeReader for OverlayTreeReader<'_, S> {
 
 use hyperscale_jmt as jmt;
 use hyperscale_jmt::{Blake3Hasher, Tree};
-use hyperscale_types::Hash;
+use hyperscale_types::{BlockHeight, Hash};
 use rayon::prelude::*;
 
 // Re-export JMT types used in public APIs (CollectedWrites, etc.)
@@ -97,8 +97,8 @@ pub fn hash_value(value: &[u8]) -> jmt::ValueHash {
 
 /// Returns `None` when the JMT is truly empty (height 0 with zero root),
 /// indicating no parent node exists. Otherwise returns `Some(block_height)`.
-pub fn jmt_parent_height(block_height: u64, root: Hash) -> Option<u64> {
-    if block_height == 0 && root == Hash::ZERO {
+pub fn jmt_parent_height(block_height: BlockHeight, root: Hash) -> Option<BlockHeight> {
+    if block_height == BlockHeight::GENESIS && root == Hash::ZERO {
         None
     } else {
         Some(block_height)
@@ -125,14 +125,14 @@ pub fn noop_jmt_snapshot<S: jmt::TreeReader>(
     store: &S,
     pending_snapshots: &[Arc<JmtSnapshot>],
     parent_state_root: Hash,
-    parent_block_height: u64,
-    block_height: u64,
+    parent_block_height: BlockHeight,
+    block_height: BlockHeight,
 ) -> JmtSnapshot {
     let mut nodes = Vec::new();
 
     // Try to find the parent's root node so the version chain is unbroken.
     if let Some(parent_ver) = jmt_parent_height(parent_block_height, parent_state_root) {
-        let root_key = jmt::NodeKey::root(parent_ver);
+        let root_key = jmt::NodeKey::root(parent_ver.0);
 
         // Check pending snapshots first (overlay), then the base store.
         let root_node = pending_snapshots
@@ -146,15 +146,15 @@ pub fn noop_jmt_snapshot<S: jmt::TreeReader>(
             .or_else(|| store.get_node(&root_key));
 
         if let Some(node) = root_node {
-            nodes.push((jmt::NodeKey::root(block_height), node));
+            nodes.push((jmt::NodeKey::root(block_height.0), node));
         }
     }
 
     JmtSnapshot {
         base_root: parent_state_root,
-        base_version: parent_block_height,
+        base_version: parent_block_height.0,
         result_root: parent_state_root,
-        new_version: block_height,
+        new_version: block_height.0,
         nodes,
         stale_node_keys: Vec::new(),
         leaf_substate_associations: Vec::new(),

@@ -85,7 +85,7 @@ where
             for (committed_header, sender, public_key, sender_signature) in items {
                 let msg = hyperscale_types::committed_block_header_message(
                     committed_header.header.shard_group_id,
-                    committed_header.header.height.0,
+                    committed_header.header.height,
                     &committed_header.header.hash(),
                 );
                 let valid = verify_bls_with_metrics(

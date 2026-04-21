@@ -846,7 +846,11 @@ mod tests {
 
         let make_fw = |seed: u8| -> Arc<FinalizedWave> {
             let ec = Arc::new(ExecutionCertificate::new(
-                WaveId::new(ShardGroupId(0), 10, BTreeSet::from([ShardGroupId(1)])),
+                WaveId::new(
+                    ShardGroupId(0),
+                    BlockHeight(10),
+                    BTreeSet::from([ShardGroupId(1)]),
+                ),
                 crate::WeightedTimestamp(11),
                 Hash::from_bytes(&[seed + 100; 4]),
                 vec![TxOutcome {
@@ -861,7 +865,11 @@ mod tests {
             ));
             Arc::new(FinalizedWave {
                 certificate: Arc::new(WaveCertificate {
-                    wave_id: WaveId::new(ShardGroupId(0), 10, BTreeSet::from([ShardGroupId(1)])),
+                    wave_id: WaveId::new(
+                        ShardGroupId(0),
+                        BlockHeight(10),
+                        BTreeSet::from([ShardGroupId(1)]),
+                    ),
                     execution_certificates: vec![ec],
                 }),
                 receipts: vec![],
@@ -884,7 +892,7 @@ mod tests {
         use std::collections::BTreeSet;
 
         let ec = Arc::new(ExecutionCertificate::new(
-            WaveId::new(ShardGroupId(0), 10, BTreeSet::new()),
+            WaveId::new(ShardGroupId(0), BlockHeight(10), BTreeSet::new()),
             crate::WeightedTimestamp(11),
             Hash::from_bytes(b"receipt"),
             vec![TxOutcome {
@@ -898,7 +906,7 @@ mod tests {
             SignerBitfield::new(4),
         ));
         let cert = Arc::new(WaveCertificate {
-            wave_id: WaveId::new(ShardGroupId(0), 10, BTreeSet::new()),
+            wave_id: WaveId::new(ShardGroupId(0), BlockHeight(10), BTreeSet::new()),
             execution_certificates: vec![ec],
         });
         let expected_receipt_hash = cert.receipt_hash();
@@ -954,7 +962,7 @@ impl BlockVote {
         signing_key: &Bls12381G1PrivateKey,
         timestamp: ProposerTimestamp,
     ) -> Self {
-        let message = block_vote_message(shard_group_id, height.0, round, &block_hash);
+        let message = block_vote_message(shard_group_id, height, round, &block_hash);
         let signature = signing_key.sign_v1(&message);
         Self {
             block_hash,
@@ -974,7 +982,7 @@ impl BlockVote {
     pub fn signing_message(&self) -> Vec<u8> {
         block_vote_message(
             self.shard_group_id,
-            self.height.0,
+            self.height,
             self.round,
             &self.block_hash,
         )

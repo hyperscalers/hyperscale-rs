@@ -23,9 +23,9 @@
 //! 5. [`FinalizedWave`] — all data needed for block commit
 
 use crate::{
-    compute_padded_merkle_root, Bls12381G2Signature, Hash, LocalReceipt, ReceiptBundle,
-    RoutableTransaction, ShardGroupId, SignerBitfield, TopologySnapshot, TransactionDecision,
-    TransactionOutcome, ValidatorId, WeightedTimestamp,
+    compute_padded_merkle_root, BlockHeight, Bls12381G2Signature, Hash, LocalReceipt,
+    ReceiptBundle, RoutableTransaction, ShardGroupId, SignerBitfield, TopologySnapshot,
+    TransactionDecision, TransactionOutcome, ValidatorId, WeightedTimestamp,
 };
 use sbor::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
@@ -51,7 +51,7 @@ pub struct WaveId {
     /// The shard that committed the block containing this wave's transactions.
     pub shard_group_id: ShardGroupId,
     /// Block height at which the wave's transactions were committed.
-    pub block_height: u64,
+    pub block_height: BlockHeight,
     /// Set of remote shards the transactions depend on (empty for single-shard waves).
     pub remote_shards: BTreeSet<ShardGroupId>,
 }
@@ -60,7 +60,7 @@ impl WaveId {
     /// Create a new WaveId.
     pub fn new(
         shard_group_id: ShardGroupId,
-        block_height: u64,
+        block_height: BlockHeight,
         remote_shards: BTreeSet<ShardGroupId>,
     ) -> Self {
         Self {
@@ -96,13 +96,13 @@ impl std::fmt::Display for WaveId {
             write!(
                 f,
                 "Wave(shard={}, h={}, ∅)",
-                self.shard_group_id.0, self.block_height
+                self.shard_group_id.0, self.block_height.0
             )
         } else {
             write!(
                 f,
                 "Wave(shard={}, h={}, {{",
-                self.shard_group_id.0, self.block_height
+                self.shard_group_id.0, self.block_height.0
             )?;
             for (i, shard) in self.remote_shards.iter().enumerate() {
                 if i > 0 {
@@ -131,7 +131,7 @@ impl std::fmt::Display for WaveId {
 /// validation (to verify the header's waves field).
 pub fn compute_waves(
     topology: &TopologySnapshot,
-    block_height: u64,
+    block_height: BlockHeight,
     transactions: &[Arc<RoutableTransaction>],
 ) -> Vec<WaveId> {
     let local_shard = topology.local_shard();
@@ -295,7 +295,7 @@ pub struct ExecutionVote {
     /// Block this wave belongs to.
     pub block_hash: Hash,
     /// Block height (the block containing the wave's transactions).
-    pub block_height: u64,
+    pub block_height: BlockHeight,
     /// BFT-authenticated anchor at which this vote was cast.
     ///
     /// Validators vote at each block commit where the wave is complete.
@@ -512,7 +512,7 @@ impl ExecutionCertificate {
     }
 
     /// Block height (the block containing the wave's transactions).
-    pub fn block_height(&self) -> u64 {
+    pub fn block_height(&self) -> BlockHeight {
         self.wave_id.block_height
     }
 
@@ -1148,7 +1148,7 @@ mod tests {
     fn make_wave_id(shard: u64, height: u64, remote: &[u64]) -> WaveId {
         WaveId {
             shard_group_id: ShardGroupId(shard),
-            block_height: height,
+            block_height: BlockHeight(height),
             remote_shards: remote.iter().map(|&s| ShardGroupId(s)).collect(),
         }
     }
@@ -1432,7 +1432,7 @@ mod tests {
             Arc::new(WaveCertificate {
                 wave_id: WaveId {
                     shard_group_id: ShardGroupId(0),
-                    block_height: 42,
+                    block_height: BlockHeight(42),
                     remote_shards: BTreeSet::new(),
                 },
                 execution_certificates: vec![make_test_wave_ec(1, 3)],
@@ -1516,7 +1516,7 @@ mod tests {
     fn make_local_ec(wave_id: &WaveId, outcomes: Vec<TxOutcome>) -> Arc<ExecutionCertificate> {
         Arc::new(ExecutionCertificate::new(
             wave_id.clone(),
-            WeightedTimestamp(wave_id.block_height + 1),
+            WeightedTimestamp(wave_id.block_height.0 + 1),
             compute_global_receipt_root(&outcomes),
             outcomes,
             Bls12381G2Signature([0u8; 96]),

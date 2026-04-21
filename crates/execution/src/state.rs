@@ -62,7 +62,7 @@ pub struct CompletionData {
     /// Block this wave belongs to.
     pub block_hash: Hash,
     /// Block height (= wave_starting_height).
-    pub block_height: u64,
+    pub block_height: BlockHeight,
     /// BFT-authenticated weighted timestamp at which this wave's outcome is
     /// fixed. Included in the vote payload and the EC canonical hash, so all
     /// validators aggregate under the same identifier.
@@ -192,14 +192,14 @@ pub struct ExecutionState {
     /// Populated when remote block headers with waves targeting our shard are seen.
     /// Cleared when the matching cert is received and verified.
     /// After timeout, triggers `RequestMissingExecutionCert` fallback.
-    expected_exec_certs: HashMap<(ShardGroupId, u64, WaveId), ExpectedExecCert>,
+    expected_exec_certs: HashMap<(ShardGroupId, BlockHeight, WaveId), ExpectedExecCert>,
 
     /// Fulfilled execution cert keys — prevents late-arriving duplicate headers
     /// from re-registering expectations after certs have already been received.
     /// Maps `(source_shard, block_height, wave_id)` → `committed_ts_ms` when the
     /// cert was received, for age-based pruning anchored on the committing QC's
     /// `weighted_timestamp_ms`.
-    fulfilled_exec_certs: HashMap<(ShardGroupId, u64, WaveId), WeightedTimestamp>,
+    fulfilled_exec_certs: HashMap<(ShardGroupId, BlockHeight, WaveId), WeightedTimestamp>,
 }
 
 impl Default for ExecutionState {
@@ -295,7 +295,7 @@ struct PendingVoteRetry {
     sent_at_ts_ms: WeightedTimestamp,
     attempt: u32,
     block_hash: Hash,
-    block_height: u64,
+    block_height: BlockHeight,
     vote_anchor_ts_ms: WeightedTimestamp,
     global_receipt_root: Hash,
     tx_outcomes: Arc<Vec<TxOutcome>>,
@@ -423,7 +423,7 @@ impl ExecutionState {
     fn assign_waves(
         &self,
         topology: &TopologySnapshot,
-        block_height: u64,
+        block_height: BlockHeight,
         transactions: &[Arc<RoutableTransaction>],
     ) -> WaveAssignments {
         let local_shard = topology.local_shard();
@@ -470,7 +470,7 @@ impl ExecutionState {
         &mut self,
         topology: &TopologySnapshot,
         block_hash: Hash,
-        block_height: u64,
+        block_height: BlockHeight,
         block_ts_ms: WeightedTimestamp,
         transactions: &[Arc<RoutableTransaction>],
     ) -> (Vec<Action>, Vec<ExecutionVote>) {
@@ -798,7 +798,7 @@ impl ExecutionState {
         &mut self,
         topology: &TopologySnapshot,
         batches: &[Arc<Provision>],
-        committed_height: u64,
+        committed_height: BlockHeight,
         committed_ts_ms: WeightedTimestamp,
     ) -> Vec<Action> {
         // Sort for deterministic phase-2 iteration (logs, action vector order).
@@ -872,7 +872,7 @@ impl ExecutionState {
                 tracing::debug!(
                     loser_tx = %loser,
                     source_shard = source_shard.0,
-                    committed_at = committed_height,
+                    committed_at = committed_height.0,
                     "Node-ID overlap conflict — aborting loser"
                 );
             }
@@ -1258,7 +1258,7 @@ impl ExecutionState {
         if cleared {
             tracing::debug!(
                 source_shard = shard.0,
-                block_height = cert.block_height(),
+                block_height = cert.block_height().0,
                 wave = %cert.wave_id,
                 at_local_ts_ms = self.committed_ts_ms.as_millis(),
                 "Fulfilled expected exec cert"
@@ -1379,7 +1379,7 @@ impl ExecutionState {
         &mut self,
         topology: &TopologySnapshot,
         source_shard: ShardGroupId,
-        block_height: u64,
+        block_height: BlockHeight,
         waves: &[WaveId],
     ) {
         let local_shard = topology.local_shard();
@@ -1426,7 +1426,7 @@ impl ExecutionState {
                 let peers = topology.committee_for_shard(*source_shard).to_vec();
                 tracing::info!(
                     source_shard = source_shard.0,
-                    block_height = block_height,
+                    block_height = block_height.0,
                     wave = %wave_id,
                     age_ms = age.as_millis() as u64,
                     retry = is_retry,
@@ -1627,7 +1627,7 @@ impl ExecutionState {
         transactions: &[Arc<RoutableTransaction>],
         provisions: &[Arc<Provision>],
     ) -> Vec<Action> {
-        let height = header.height.0;
+        let height = header.height;
         let mut actions = Vec::new();
 
         // ── Provision broadcasting (proposer only) ─────────────────────
@@ -1640,7 +1640,7 @@ impl ExecutionState {
                     block_hash,
                     requests,
                     source_shard: local_shard,
-                    block_height: BlockHeight(height),
+                    block_height: height,
                     shard_recipients,
                 });
             }
@@ -1648,7 +1648,7 @@ impl ExecutionState {
 
         if !transactions.is_empty() {
             tracing::debug!(
-                height = height,
+                height = height.0,
                 tx_count = transactions.len(),
                 "Starting execution for new transactions"
             );
@@ -1697,7 +1697,7 @@ impl ExecutionState {
         if transactions.is_empty() {
             return Vec::new();
         }
-        self.register_sealed_wave_assignments(topology, header.height.0, transactions);
+        self.register_sealed_wave_assignments(topology, header.height, transactions);
         self.replay_early_wave_attestations(topology, transactions)
     }
 
@@ -1744,7 +1744,7 @@ impl ExecutionState {
     fn register_sealed_wave_assignments(
         &mut self,
         topology: &TopologySnapshot,
-        block_height: u64,
+        block_height: BlockHeight,
         transactions: &[Arc<RoutableTransaction>],
     ) {
         let waves = self.assign_waves(topology, block_height, transactions);
@@ -2428,7 +2428,7 @@ mod tests {
 
         let committee = TestCommittee::new(4, 42);
         let shard = ShardGroupId(0);
-        let wave_id = WaveId::new(ShardGroupId(0), 0, BTreeSet::new());
+        let wave_id = WaveId::new(ShardGroupId(0), BlockHeight(0), BTreeSet::new());
 
         // Different receipt roots = different messages
         let root1 = Hash::from_bytes(b"root1");
@@ -2466,7 +2466,7 @@ mod tests {
 
         let committee = TestCommittee::new(4, 42);
         let shard = ShardGroupId(0);
-        let wave_id = WaveId::new(ShardGroupId(0), 0, BTreeSet::new());
+        let wave_id = WaveId::new(ShardGroupId(0), BlockHeight(0), BTreeSet::new());
 
         let root1 = Hash::from_bytes(b"root1");
         let root2 = Hash::from_bytes(b"root2");
@@ -2600,7 +2600,7 @@ mod tests {
         // Simulate receiving a vote (as if we're a fallback leader).
         let fake_vote = ExecutionVote {
             block_hash,
-            block_height: 1,
+            block_height: BlockHeight(1),
             vote_anchor_ts_ms: WeightedTimestamp::ZERO,
             wave_id: wave_id.clone(),
             shard_group_id: ShardGroupId(0),
@@ -2622,7 +2622,7 @@ mod tests {
 
     #[test]
     fn test_vote_retry_timeout_emits_rotated_action() {
-        let wave_id = WaveId::new(ShardGroupId(0), 1, BTreeSet::new());
+        let wave_id = WaveId::new(ShardGroupId(0), BlockHeight(1), BTreeSet::new());
         let topo = make_test_topology();
         let committee = topo.local_committee().to_vec();
 
@@ -2638,7 +2638,7 @@ mod tests {
                 sent_at_ts_ms: WeightedTimestamp(10_000),
                 attempt: 0,
                 block_hash: Hash::from_bytes(b"block1"),
-                block_height: 1,
+                block_height: BlockHeight(1),
                 vote_anchor_ts_ms: WeightedTimestamp::ZERO,
                 global_receipt_root: Hash::ZERO,
                 tx_outcomes: Arc::new(vec![]),
@@ -2673,7 +2673,7 @@ mod tests {
 
     #[test]
     fn test_vote_retry_cancelled_on_ec_receipt() {
-        let wave_id = WaveId::new(ShardGroupId(0), 1, BTreeSet::new());
+        let wave_id = WaveId::new(ShardGroupId(0), BlockHeight(1), BTreeSet::new());
         let topo = make_test_topology();
 
         let mut state = make_test_state();
@@ -2684,7 +2684,7 @@ mod tests {
                 sent_at_ts_ms: WeightedTimestamp(5_000),
                 attempt: 0,
                 block_hash: Hash::from_bytes(b"block1"),
-                block_height: 1,
+                block_height: BlockHeight(1),
                 vote_anchor_ts_ms: WeightedTimestamp::ZERO,
                 global_receipt_root: Hash::ZERO,
                 tx_outcomes: Arc::new(vec![]),
@@ -2713,7 +2713,11 @@ mod tests {
 
     #[test]
     fn test_leader_broadcasts_ec_locally() {
-        let wave_id = WaveId::new(ShardGroupId(0), 1, [ShardGroupId(1)].into_iter().collect());
+        let wave_id = WaveId::new(
+            ShardGroupId(0),
+            BlockHeight(1),
+            [ShardGroupId(1)].into_iter().collect(),
+        );
         let topo = make_test_topology();
 
         let mut state = make_test_state();
@@ -2790,8 +2794,17 @@ mod tests {
         let mut state = make_test_state();
 
         let remote_shard = ShardGroupId(1);
-        let remote_wave = WaveId::new(remote_shard, 5, [ShardGroupId(0)].into_iter().collect());
-        state.on_verified_remote_header(&topo, remote_shard, 5, std::slice::from_ref(&remote_wave));
+        let remote_wave = WaveId::new(
+            remote_shard,
+            BlockHeight(5),
+            [ShardGroupId(0)].into_iter().collect(),
+        );
+        state.on_verified_remote_header(
+            &topo,
+            remote_shard,
+            BlockHeight(5),
+            std::slice::from_ref(&remote_wave),
+        );
         assert_eq!(
             state.expected_exec_certs.len(),
             1,
@@ -2799,7 +2812,11 @@ mod tests {
         );
 
         // Simulate an outstanding local cross-shard wave needing shard 1's EC.
-        let local_wave = WaveId::new(ShardGroupId(0), 10, [remote_shard].into_iter().collect());
+        let local_wave = WaveId::new(
+            ShardGroupId(0),
+            BlockHeight(10),
+            [remote_shard].into_iter().collect(),
+        );
         let tx = Arc::new(test_transaction(7));
         let tx_hash = tx.hash();
         let mut participating = BTreeSet::new();

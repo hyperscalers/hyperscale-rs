@@ -135,7 +135,7 @@ fn test_recovery_resumes_at_correct_height() {
         let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
         let recovered = storage.load_recovered_state();
 
-        assert_eq!(recovered.committed_height, 50);
+        assert_eq!(recovered.committed_height, BlockHeight(50));
         assert_eq!(recovered.committed_hash, Some(expected_hash));
     }
 }
@@ -146,7 +146,7 @@ fn test_commit_certificate_with_writes_persists_both() {
     let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
 
     let updates = make_mapped_database_update(1, 0, vec![10, 20], vec![99, 88, 77]);
-    let cert = make_test_wave_certificate(42, ShardGroupId(0));
+    let cert = make_test_wave_certificate(BlockHeight(42), ShardGroupId(0));
     let wave_hash = cert.wave_id.hash();
 
     storage.commit_certificate_with_writes(&cert, &updates);
@@ -178,7 +178,7 @@ fn test_block_storage_and_retrieval() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
 
-    let block = make_test_block(1);
+    let block = make_test_block(BlockHeight(1));
     let qc = make_test_qc(&block);
 
     assert!(storage.get_block(BlockHeight(1)).is_none());
@@ -200,7 +200,7 @@ fn test_block_range_retrieval() {
     let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
 
     for h in 1..=5u64 {
-        let block = make_test_block(h);
+        let block = make_test_block(BlockHeight(h));
         let qc = make_test_qc(&block);
         commit_empty(&storage, &block, &qc);
     }
@@ -238,7 +238,7 @@ fn test_recovery_with_qc() {
         let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
         let recovered = storage.load_recovered_state();
 
-        assert_eq!(recovered.committed_height, 100);
+        assert_eq!(recovered.committed_height, BlockHeight(100));
         assert_eq!(recovered.committed_hash, Some(expected_hash));
         assert!(recovered.latest_qc.is_some());
 
@@ -255,7 +255,7 @@ fn test_certificate_idempotency() {
     let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
 
     let updates = make_mapped_database_update(1, 0, vec![10, 20], vec![99, 88, 77]);
-    let cert = make_test_wave_certificate(42, ShardGroupId(0));
+    let cert = make_test_wave_certificate(BlockHeight(42), ShardGroupId(0));
     let wave_hash = cert.wave_id.hash();
 
     storage.commit_certificate_with_writes(&cert, &updates);
@@ -273,7 +273,7 @@ fn test_empty_state_on_fresh_database() {
 
     let recovered = storage.load_recovered_state();
 
-    assert_eq!(recovered.committed_height, 0);
+    assert_eq!(recovered.committed_height, BlockHeight(0));
     assert!(recovered.committed_hash.is_none());
     assert!(recovered.latest_qc.is_none());
 }
@@ -373,7 +373,7 @@ fn attach_receipts(block: &mut hyperscale_types::Block, receipts: Vec<ReceiptBun
         certificate: Arc::new(hyperscale_types::WaveCertificate {
             wave_id: hyperscale_types::WaveId::new(
                 ShardGroupId(0),
-                block.height().0,
+                block.height(),
                 std::collections::BTreeSet::new(),
             ),
             execution_certificates: vec![],
@@ -425,7 +425,7 @@ fn test_commit_block_applies_writes() {
     let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
 
     let updates = make_mapped_database_update(1, 0, vec![10], vec![42]);
-    let mut block = make_test_block(1);
+    let mut block = make_test_block(BlockHeight(1));
     let receipts = updates_to_receipts(&updates);
     attach_receipts(&mut block, receipts);
     let qc = make_test_qc(&block);
@@ -442,7 +442,7 @@ fn test_commit_block_multiple_certs() {
     let updates1 = make_mapped_database_update(1, 0, vec![10], vec![1]);
     let updates2 = make_mapped_database_update(2, 0, vec![20], vec![2]);
     let merged = hyperscale_storage::merge_database_updates(&[updates1, updates2]);
-    let mut block = make_test_block(1);
+    let mut block = make_test_block(BlockHeight(1));
     let receipts = updates_to_receipts(&merged);
     attach_receipts(&mut block, receipts);
     let qc = make_test_qc(&block);
@@ -456,7 +456,7 @@ fn test_commit_block_empty_certs() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
 
-    let block = make_test_block(1);
+    let block = make_test_block(BlockHeight(1));
     let qc = make_test_qc(&block);
 
     storage.commit_block(&Arc::new(block), &Arc::new(qc));
@@ -468,8 +468,15 @@ fn test_prepare_then_commit_matches_direct() {
     let temp_dir1 = TempDir::new().unwrap();
     let s_prepared = RocksDbStorage::open(temp_dir1.path()).unwrap();
     let parent_root = s_prepared.state_root_hash();
-    let (spec_root, prepared) = s_prepared.prepare_block_commit(parent_root, 0, &[], 1, &[], None);
-    let block = make_test_block(1);
+    let (spec_root, prepared) = s_prepared.prepare_block_commit(
+        parent_root,
+        BlockHeight::GENESIS,
+        &[],
+        BlockHeight(1),
+        &[],
+        None,
+    );
+    let block = make_test_block(BlockHeight(1));
     let qc = make_test_qc(&block);
     let result_prepared = s_prepared
         .commit_prepared_blocks(vec![(prepared, Arc::new(block), Arc::new(qc))])
@@ -477,7 +484,7 @@ fn test_prepare_then_commit_matches_direct() {
 
     let temp_dir2 = TempDir::new().unwrap();
     let s_direct = RocksDbStorage::open(temp_dir2.path()).unwrap();
-    let block2 = make_test_block(1);
+    let block2 = make_test_block(BlockHeight(1));
     let qc2 = make_test_qc(&block2);
     let result_direct = s_direct.commit_block(&Arc::new(block2), &Arc::new(qc2));
 
@@ -491,11 +498,11 @@ fn test_commit_block_stores_certificates() {
     let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
 
     let shard = ShardGroupId(0);
-    let cert = Arc::new(make_test_wave_certificate(1, shard));
+    let cert = Arc::new(make_test_wave_certificate(BlockHeight(1), shard));
     let wave_hash = cert.wave_id.hash();
 
     // Create a block that includes this certificate
-    let block = make_test_block(1);
+    let block = make_test_block(BlockHeight(1));
     let block = match block {
         hyperscale_types::Block::Live {
             header,
@@ -549,8 +556,8 @@ fn test_certificates_batch() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
 
-    let cert1 = make_test_wave_certificate(1, ShardGroupId(0));
-    let cert2 = make_test_wave_certificate(2, ShardGroupId(0));
+    let cert1 = make_test_wave_certificate(BlockHeight(1), ShardGroupId(0));
+    let cert2 = make_test_wave_certificate(BlockHeight(2), ShardGroupId(0));
     let hash1 = cert1.wave_id.hash();
     let hash2 = cert2.wave_id.hash();
 
@@ -620,7 +627,7 @@ fn test_certificate_store_and_retrieve() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
 
-    let cert = make_test_wave_certificate(1, ShardGroupId(0));
+    let cert = make_test_wave_certificate(BlockHeight(1), ShardGroupId(0));
     let wave_hash = cert.wave_id.hash();
 
     storage.put_certificate(&wave_hash, &cert);
@@ -643,7 +650,7 @@ fn test_get_block_for_sync() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
 
-    let block = make_test_block(1);
+    let block = make_test_block(BlockHeight(1));
     let qc = make_test_qc(&block);
     commit_empty(&storage, &block, &qc);
 
@@ -660,7 +667,7 @@ fn test_commit_certificate_via_commit_store() {
     let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
 
     let updates = make_mapped_database_update(1, 0, vec![10], vec![42]);
-    let cert = make_test_wave_certificate(1, ShardGroupId(0));
+    let cert = make_test_wave_certificate(BlockHeight(1), ShardGroupId(0));
 
     storage.commit_certificate_with_writes(&cert, &updates);
 
@@ -693,7 +700,7 @@ fn test_substates_survive_reopen() {
     {
         let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
         let updates = make_mapped_database_update(1, 0, vec![10], vec![42]);
-        let cert = make_test_wave_certificate(1, ShardGroupId(0));
+        let cert = make_test_wave_certificate(BlockHeight(1), ShardGroupId(0));
         cert_hash = cert.wave_id.hash();
         storage.commit_certificate_with_writes(&cert, &updates);
         root_after_write = storage.state_root_hash();
@@ -732,7 +739,7 @@ fn test_blocks_survive_reopen() {
 
     {
         let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
-        let block = make_test_block(1);
+        let block = make_test_block(BlockHeight(1));
         let qc = make_test_qc(&block);
         commit_empty(&storage, &block, &qc);
     }
@@ -794,21 +801,21 @@ fn test_ec_storage_batch() {
 #[test]
 fn test_ec_survives_reopen() {
     let temp_dir = TempDir::new().unwrap();
-    let ec = hyperscale_storage::test_helpers::make_test_execution_certificate(1, 1);
+    let ec = hyperscale_storage::test_helpers::make_test_execution_certificate(1, BlockHeight(1));
 
     {
         let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
-        let block = hyperscale_storage::test_helpers::make_test_block(0);
+        let block = hyperscale_storage::test_helpers::make_test_block(BlockHeight(0));
         let qc = hyperscale_storage::test_helpers::make_test_qc(&block);
         storage.commit_block(&Arc::new(block), &Arc::new(qc));
-        let mut block = hyperscale_storage::test_helpers::make_test_block(1);
+        let mut block = hyperscale_storage::test_helpers::make_test_block(BlockHeight(1));
         push_wave(
             &mut block,
             Arc::new(hyperscale_types::FinalizedWave {
                 certificate: Arc::new(hyperscale_types::WaveCertificate {
                     wave_id: hyperscale_types::WaveId::new(
                         ShardGroupId(0),
-                        1,
+                        BlockHeight(1),
                         std::collections::BTreeSet::new(),
                     ),
                     execution_certificates: vec![Arc::new(ec)],
@@ -822,9 +829,9 @@ fn test_ec_survives_reopen() {
 
     {
         let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
-        let by_height = storage.get_execution_certificates_by_height(1);
+        let by_height = storage.get_execution_certificates_by_height(BlockHeight(1));
         assert_eq!(by_height.len(), 1);
-        assert_eq!(by_height[0].block_height(), 1);
+        assert_eq!(by_height[0].block_height(), BlockHeight(1));
     }
 }
 
@@ -833,15 +840,15 @@ fn test_ec_atomic_with_block_commit() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
 
-    let ec = hyperscale_storage::test_helpers::make_test_execution_certificate(1, 1);
-    let mut block = make_test_block(1);
+    let ec = hyperscale_storage::test_helpers::make_test_execution_certificate(1, BlockHeight(1));
+    let mut block = make_test_block(BlockHeight(1));
     push_wave(
         &mut block,
         Arc::new(hyperscale_types::FinalizedWave {
             certificate: Arc::new(hyperscale_types::WaveCertificate {
                 wave_id: hyperscale_types::WaveId::new(
                     ShardGroupId(0),
-                    1,
+                    BlockHeight(1),
                     std::collections::BTreeSet::new(),
                 ),
                 execution_certificates: vec![Arc::new(ec)],
@@ -855,9 +862,9 @@ fn test_ec_atomic_with_block_commit() {
     storage.commit_block(&Arc::new(block), &Arc::new(qc));
 
     // EC should be retrievable by height
-    let by_height = storage.get_execution_certificates_by_height(1);
+    let by_height = storage.get_execution_certificates_by_height(BlockHeight(1));
     assert_eq!(by_height.len(), 1);
-    assert_eq!(by_height[0].block_height(), 1);
+    assert_eq!(by_height[0].block_height(), BlockHeight(1));
 }
 
 // ─── State-history semantics (parity with storage-memory tests) ─────────────
@@ -895,7 +902,7 @@ fn rocks_commit_with(
             certificate: Arc::new(hyperscale_types::WaveCertificate {
                 wave_id: hyperscale_types::WaveId::new(
                     ShardGroupId(0),
-                    block.height().0,
+                    block.height(),
                     std::collections::BTreeSet::new(),
                 ),
                 execution_certificates: vec![],
@@ -1012,7 +1019,7 @@ fn test_snapshot_at_below_retention_panics() {
     let storage = RocksDbStorage::open_with_config(temp_dir.path(), config).unwrap();
 
     for h in 1..=10u64 {
-        let block = make_test_block(h);
+        let block = make_test_block(BlockHeight(h));
         let qc = make_test_qc(&block);
         commit_empty(&storage, &block, &qc);
     }
@@ -1038,7 +1045,7 @@ fn test_list_substates_at_height_respects_retention() {
     let sort_key = vec![1u8];
 
     for h in 1..=10u64 {
-        let block = make_test_block(h);
+        let block = make_test_block(BlockHeight(h));
         let qc = make_test_qc(&block);
         let updates =
             make_mapped_database_update(9, partition_num, sort_key.clone(), vec![h as u8]);
@@ -1048,18 +1055,22 @@ fn test_list_substates_at_height_respects_retention() {
 
     // Within retention: returns Some.
     assert!(
-        storage.list_substates_for_node_at_height(&nid, 9).is_some(),
+        storage
+            .list_substates_for_node_at_height(&nid, BlockHeight(9))
+            .is_some(),
         "height within retention must succeed"
     );
     // Below retention: returns None.
     assert!(
-        storage.list_substates_for_node_at_height(&nid, 1).is_none(),
+        storage
+            .list_substates_for_node_at_height(&nid, BlockHeight(1))
+            .is_none(),
         "height below retention must return None"
     );
     // Above current: returns None.
     assert!(
         storage
-            .list_substates_for_node_at_height(&nid, 99)
+            .list_substates_for_node_at_height(&nid, BlockHeight(99))
             .is_none(),
         "future height returns None"
     );

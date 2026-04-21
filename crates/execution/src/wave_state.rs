@@ -25,9 +25,9 @@
 //!    is terminal-covered), the wave is complete and ready for finalization.
 
 use hyperscale_types::{
-    compute_execution_receipt_root, ExecutionCertificate, ExecutionOutcome, Hash, ReceiptBundle,
-    RoutableTransaction, ShardGroupId, TransactionDecision, TxOutcome, WaveCertificate, WaveId,
-    WeightedTimestamp, WAVE_TIMEOUT,
+    compute_execution_receipt_root, BlockHeight, ExecutionCertificate, ExecutionOutcome, Hash,
+    ReceiptBundle, RoutableTransaction, ShardGroupId, TransactionDecision, TxOutcome,
+    WaveCertificate, WaveId, WeightedTimestamp, WAVE_TIMEOUT,
 };
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -189,7 +189,7 @@ impl WaveState {
         self.block_hash
     }
 
-    pub fn block_height(&self) -> u64 {
+    pub fn block_height(&self) -> BlockHeight {
         self.wave_id.block_height
     }
 
@@ -569,7 +569,7 @@ impl WaveState {
         tracing::warn!(
             wave = %self.wave_id,
             block_hash = ?self.block_hash,
-            block_height = self.wave_id.block_height,
+            block_height = self.wave_id.block_height.0,
             wave_start_ts_ms = self.wave_start_ts_ms.as_millis(),
             committed_ts_ms = committed_ts_ms.as_millis(),
             age_ms = age.as_millis() as u64,
@@ -658,7 +658,7 @@ mod tests {
         Bls12381G2Signature, SignerBitfield,
     };
 
-    const WAVE_START: u64 = 10;
+    const WAVE_START: BlockHeight = BlockHeight(10);
 
     fn make_tx(seed: u8) -> Arc<RoutableTransaction> {
         Arc::new(test_transaction_with_nodes(
@@ -672,8 +672,8 @@ mod tests {
     /// block-height intuition in assertions maps cleanly to ts space.
     const TEST_BLOCK_INTERVAL_MS: u64 = 500;
 
-    fn ts_for(height: u64) -> WeightedTimestamp {
-        WeightedTimestamp(height * TEST_BLOCK_INTERVAL_MS)
+    fn ts_for(height: BlockHeight) -> WeightedTimestamp {
+        WeightedTimestamp(height.0 * TEST_BLOCK_INTERVAL_MS)
     }
 
     fn make_single_shard_wave(n: usize) -> WaveState {
@@ -737,7 +737,7 @@ mod tests {
         );
         Arc::new(ExecutionCertificate::new(
             ec_wave_id,
-            WeightedTimestamp(wave_id.block_height + 1),
+            WeightedTimestamp(wave_id.block_height.0 + 1),
             Hash::from_bytes(b"global_receipt_root"),
             outcomes,
             Bls12381G2Signature([0u8; 96]),
@@ -845,10 +845,10 @@ mod tests {
     fn abort_marks_tx_as_aborted() {
         let mut w = make_single_shard_wave(1);
         let h0 = w.tx_hashes()[0];
-        w.record_abort(h0, ts_for(20));
+        w.record_abort(h0, ts_for(BlockHeight(20)));
         assert!(w.explicit_aborts.contains(&h0));
         // Idempotent: calling again doesn't clear or duplicate.
-        w.record_abort(h0, ts_for(15));
+        w.record_abort(h0, ts_for(BlockHeight(15)));
         assert!(w.explicit_aborts.contains(&h0));
         assert_eq!(w.explicit_aborts.len(), 1);
     }
@@ -1042,7 +1042,7 @@ mod tests {
         );
         let ec_remote = Arc::new(ExecutionCertificate::new(
             ec_wave_id,
-            WeightedTimestamp(w.wave_id().block_height + 1),
+            WeightedTimestamp(w.wave_id().block_height.0 + 1),
             Hash::from_bytes(b"gr"),
             std::mem::take(&mut outcomes),
             Bls12381G2Signature([0u8; 96]),

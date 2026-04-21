@@ -12,7 +12,9 @@ use hyperscale_core::{Action, NodeInput, ProtocolEvent};
 use hyperscale_engine::Engine;
 use hyperscale_metrics as metrics;
 use hyperscale_storage::{ChainReader, ChainWriter, SubstateStore};
-use hyperscale_types::{Hash, LocalExecutionEntry, Provision, ShardGroupId, TxEntries};
+use hyperscale_types::{
+    BlockHeight, Hash, LocalExecutionEntry, Provision, ShardGroupId, TxEntries,
+};
 use std::sync::Arc;
 use tracing::warn;
 
@@ -47,7 +49,7 @@ pub(crate) struct DelegatedResult<P: Send> {
 /// `prepared_commits`.
 pub(crate) struct PreparedBlock<P: Send> {
     pub block_hash: Hash,
-    pub block_height: u64,
+    pub block_height: BlockHeight,
     pub prepared: P,
     pub receipts: Vec<Arc<hyperscale_types::LocalReceipt>>,
 }
@@ -445,7 +447,7 @@ pub(crate) fn handle_delegated_action<
             let block_hash = result.block_hash;
             let prepared_commit = result.prepared_commit.map(|p| PreparedBlock {
                 block_hash,
-                block_height: height.0,
+                block_height: height,
                 prepared: p,
                 receipts,
             });
@@ -744,7 +746,7 @@ fn fetch_entries_for_requests<
     ctx: &ActionContext<'_, S, E>,
     requests: &[hyperscale_core::ProvisionRequest],
     source_shard: ShardGroupId,
-    block_height: hyperscale_types::BlockHeight,
+    block_height: BlockHeight,
 ) -> Vec<FetchedTxEntries> {
     let mut per_tx = Vec::with_capacity(requests.len());
     for req in requests {
@@ -754,7 +756,7 @@ fn fetch_entries_for_requests<
         let expanded_nodes = match hyperscale_engine::sharding::expand_nodes_with_owned_at_height(
             &*ctx.view,
             &req.nodes,
-            block_height.0,
+            block_height,
         ) {
             Some(nodes) => nodes,
             None => {
@@ -770,7 +772,7 @@ fn fetch_entries_for_requests<
         let entries =
             match ctx
                 .executor
-                .fetch_state_entries(&*ctx.view, &expanded_nodes, block_height.0)
+                .fetch_state_entries(&*ctx.view, &expanded_nodes, block_height)
             {
                 Some(entries) => entries,
                 None => {
@@ -802,7 +804,7 @@ fn build_provision_batches<
     ctx: &ActionContext<'_, S, E>,
     per_tx: Vec<FetchedTxEntries>,
     source_shard: ShardGroupId,
-    block_height: hyperscale_types::BlockHeight,
+    block_height: BlockHeight,
     shard_recipients: &std::collections::HashMap<ShardGroupId, Vec<hyperscale_types::ValidatorId>>,
 ) -> Vec<(ShardGroupId, Provision, Vec<hyperscale_types::ValidatorId>)> {
     use std::collections::HashMap;
@@ -834,7 +836,7 @@ fn build_provision_batches<
 
         let proof = match ctx
             .view
-            .generate_merkle_proofs_overlay(&shard_keys, block_height.0)
+            .generate_merkle_proofs_overlay(&shard_keys, block_height)
         {
             Some(p) => p,
             None => {

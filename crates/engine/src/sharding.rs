@@ -65,7 +65,7 @@
 //! producing different DatabaseUpdates and divergent state roots.
 
 use hyperscale_storage::{DatabaseUpdates, DbPartitionKey, SubstateDatabase};
-use hyperscale_types::{NodeId, ShardGroupId};
+use hyperscale_types::{BlockHeight, NodeId, ShardGroupId};
 use std::collections::{HashMap, HashSet};
 
 /// System entity type bytes that should be filtered from DatabaseUpdates.
@@ -161,7 +161,7 @@ fn extract_owned_node_ids(value: &[u8], owner: NodeId, ownership: &mut HashMap<N
 pub fn expand_nodes_with_owned_at_height<S: hyperscale_storage::SubstateStore>(
     storage: &S,
     nodes: &[NodeId],
-    block_height: u64,
+    block_height: BlockHeight,
 ) -> Option<Vec<NodeId>> {
     let ownership = resolve_owned_nodes_at_height(storage, nodes, block_height)?;
     let mut expanded: Vec<NodeId> = nodes.to_vec();
@@ -182,7 +182,7 @@ pub fn expand_nodes_with_owned_at_height<S: hyperscale_storage::SubstateStore>(
 fn resolve_owned_nodes_at_height<S: hyperscale_storage::SubstateStore>(
     storage: &S,
     declared_nodes: &[NodeId],
-    block_height: u64,
+    block_height: BlockHeight,
 ) -> Option<HashMap<NodeId, NodeId>> {
     let mut ownership: HashMap<NodeId, NodeId> = HashMap::new();
 

@@ -13,7 +13,7 @@ use crate::RadixExecutor;
 use dashmap::DashMap;
 use hyperscale_storage::{CommittableSubstateDatabase, SubstateDatabase, SubstateStore};
 use hyperscale_types::{
-    Hash, NodeId, RoutableTransaction, ShardGroupId, StateEntry, StateProvision,
+    BlockHeight, Hash, NodeId, RoutableTransaction, ShardGroupId, StateEntry, StateProvision,
 };
 use radix_common::network::NetworkDefinition;
 use std::sync::{Arc, OnceLock};
@@ -159,7 +159,7 @@ impl Engine for SimulationEngine {
         &self,
         storage: &S,
         nodes: &[NodeId],
-        block_height: u64,
+        block_height: BlockHeight,
     ) -> Option<Vec<StateEntry>> {
         self.inner.fetch_state_entries(storage, nodes, block_height)
     }

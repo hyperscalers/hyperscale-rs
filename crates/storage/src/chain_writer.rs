@@ -5,7 +5,7 @@
 //! carries precomputed work; `commit_prepared_block` applies it efficiently.
 
 use crate::{BaseReadCache, JmtSnapshot};
-use hyperscale_types::{Block, FinalizedWave, Hash, QuorumCertificate};
+use hyperscale_types::{Block, BlockHeight, FinalizedWave, Hash, QuorumCertificate};
 use std::sync::Arc;
 
 /// Abstracts state commitment for both simulation and production storage.
@@ -56,9 +56,9 @@ pub trait ChainWriter: Send + Sync + 'static {
     fn prepare_block_commit(
         &self,
         parent_state_root: Hash,
-        parent_block_height: u64,
+        parent_block_height: BlockHeight,
         finalized_waves: &[Arc<FinalizedWave>],
-        block_height: u64,
+        block_height: BlockHeight,
         pending_snapshots: &[Arc<JmtSnapshot>],
         base_reads: Option<&BaseReadCache>,
     ) -> (Hash, Self::PreparedCommit);

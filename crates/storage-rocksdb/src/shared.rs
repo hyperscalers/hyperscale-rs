@@ -103,7 +103,7 @@ impl SubstateStore for SharedStorage {
     fn list_substates_for_node_at_height(
         &self,
         node_id: &NodeId,
-        block_height: u64,
+        block_height: BlockHeight,
     ) -> Option<Vec<(u8, DbSortKey, Vec<u8>)>> {
         self.0
             .list_substates_for_node_at_height(node_id, block_height)
@@ -112,7 +112,7 @@ impl SubstateStore for SharedStorage {
     fn generate_merkle_proofs(
         &self,
         storage_keys: &[Vec<u8>],
-        block_height: u64,
+        block_height: BlockHeight,
     ) -> Option<hyperscale_types::MerkleInclusionProof> {
         self.0.generate_merkle_proofs(storage_keys, block_height)
     }
@@ -147,9 +147,9 @@ impl hyperscale_storage::ChainWriter for SharedStorage {
     fn prepare_block_commit(
         &self,
         parent_state_root: Hash,
-        parent_block_height: u64,
+        parent_block_height: BlockHeight,
         finalized_waves: &[std::sync::Arc<hyperscale_types::FinalizedWave>],
-        block_height: u64,
+        block_height: BlockHeight,
         pending_snapshots: &[std::sync::Arc<hyperscale_storage::JmtSnapshot>],
         base_reads: Option<&hyperscale_storage::BaseReadCache>,
     ) -> (Hash, Self::PreparedCommit) {
@@ -222,7 +222,7 @@ impl hyperscale_storage::ChainReader for SharedStorage {
 
     fn get_execution_certificates_by_height(
         &self,
-        block_height: u64,
+        block_height: BlockHeight,
     ) -> Vec<hyperscale_types::ExecutionCertificate> {
         self.0.get_execution_certificates_by_height(block_height)
     }

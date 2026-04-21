@@ -52,12 +52,12 @@ pub enum NodeInput {
 
     /// Sync block response received from network callback.
     SyncBlockResponseReceived {
-        height: u64,
+        height: BlockHeight,
         block: Option<Box<CertifiedBlock>>,
     },
 
     /// Sync block fetch failed from network callback.
-    SyncBlockFetchFailed { height: u64 },
+    SyncBlockFetchFailed { height: BlockHeight },
 
     /// Periodic tick for the fetch protocol to retry pending operations.
     FetchTick,
@@ -138,14 +138,14 @@ pub enum NodeInput {
     /// Execution certificates successfully fetched from a source shard.
     ExecCertFetchReceived {
         source_shard: ShardGroupId,
-        block_height: u64,
+        block_height: BlockHeight,
         certificates: Vec<ExecutionCertificate>,
     },
 
     /// An execution certificate fetch request failed.
     ExecCertFetchFailed {
         source_shard: ShardGroupId,
-        block_height: u64,
+        block_height: BlockHeight,
     },
 
     /// Committed block header successfully fetched from a source shard.

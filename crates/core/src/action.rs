@@ -182,7 +182,7 @@ pub enum Action {
     /// the wave leader (unicast). The leader aggregates 2f+1 votes into an EC.
     SignAndSendExecutionVote {
         block_hash: Hash,
-        block_height: u64,
+        block_height: BlockHeight,
         /// Consensus height at which this vote is being cast.
         vote_anchor_ts_ms: WeightedTimestamp,
         wave_id: WaveId,
@@ -414,14 +414,14 @@ pub enum Action {
         /// Base state root (parent block's state_root).
         parent_state_root: Hash,
         /// Height of the parent block (stable JMT version for computation).
-        parent_block_height: u64,
+        parent_block_height: BlockHeight,
         /// Expected state root after applying writes.
         expected_root: Hash,
         /// Finalized waves whose receipts contribute to the state root.
         /// The thread pool merges DatabaseUpdates from these.
         finalized_waves: Vec<Arc<FinalizedWave>>,
         /// Block height (used as JMT version).
-        block_height: u64,
+        block_height: BlockHeight,
     },
 
     /// Verify a block's transaction root.
@@ -520,7 +520,7 @@ pub enum Action {
         /// Parent's state root (base for state root computation via overlay).
         parent_state_root: Hash,
         /// Height of the parent block (stable JMT version for computation).
-        parent_block_height: u64,
+        parent_block_height: BlockHeight,
         transactions: Vec<Arc<RoutableTransaction>>,
         /// Finalized waves to include in the block (carries certs + receipts + ECs).
         finalized_waves: Vec<Arc<FinalizedWave>>,
@@ -594,7 +594,7 @@ pub enum Action {
         /// Parent block's state root — base state for JMT computation.
         parent_state_root: Hash,
         /// Parent block's height — JMT parent version.
-        parent_block_height: u64,
+        parent_block_height: BlockHeight,
         /// How this node learned the certifying QC (aggregator vs header).
         source: crate::CommitSource,
     },
@@ -793,7 +793,7 @@ pub enum Action {
     /// `ProtocolEvent::SyncBlockReadyToApply`.
     StartSync {
         /// The height we need to sync to.
-        target_height: u64,
+        target_height: BlockHeight,
         /// The hash of the target block (for verification).
         target_hash: Hash,
     },
@@ -869,7 +869,7 @@ pub enum Action {
         /// The shard that should have sent the execution cert.
         source_shard: ShardGroupId,
         /// The block height whose execution cert is missing.
-        block_height: u64,
+        block_height: BlockHeight,
         /// Which wave's cert is missing.
         wave_id: WaveId,
         /// All validators in the source shard (candidate peers for the request).
@@ -883,7 +883,7 @@ pub enum Action {
     /// after the expectation has been fulfilled via `on_wave_certificate`.
     CancelExecutionCertFetch {
         source_shard: ShardGroupId,
-        block_height: u64,
+        block_height: BlockHeight,
     },
 
     /// Cancel an in-flight remote-header fetch because the header arrived

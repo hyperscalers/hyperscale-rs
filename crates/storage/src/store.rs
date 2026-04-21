@@ -2,7 +2,7 @@
 //!
 //! This module defines the storage abstraction used by runners to persist Radix state.
 
-use hyperscale_types::{Hash, MerkleInclusionProof, NodeId};
+use hyperscale_types::{BlockHeight, Hash, MerkleInclusionProof, NodeId};
 use radix_substate_store_interface::interface::{DbSortKey, SubstateDatabase};
 
 /// Extension trait for substate storage with snapshots, node listing, and JMT state roots.
@@ -75,7 +75,7 @@ pub trait SubstateStore: SubstateDatabase + Send + Sync + 'static {
     fn list_substates_for_node_at_height(
         &self,
         node_id: &NodeId,
-        block_height: u64,
+        block_height: BlockHeight,
     ) -> Option<Vec<(u8, DbSortKey, Vec<u8>)>>;
 
     /// Generate a batched merkle multiproof for the given storage keys.
@@ -83,7 +83,7 @@ pub trait SubstateStore: SubstateDatabase + Send + Sync + 'static {
     fn generate_merkle_proofs(
         &self,
         storage_keys: &[Vec<u8>],
-        block_height: u64,
+        block_height: BlockHeight,
     ) -> Option<MerkleInclusionProof>;
 }
 

@@ -30,7 +30,7 @@ impl CommittedBlockHeaderGossip {
     pub fn signing_message(&self) -> Vec<u8> {
         committed_block_header_message(
             self.committed_header.header.shard_group_id,
-            self.committed_header.header.height.0,
+            self.committed_header.header.height,
             &self.committed_header.header.hash(),
         )
     }

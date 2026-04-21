@@ -45,9 +45,9 @@ use hyperscale_metrics as metrics;
 use hyperscale_network::Network;
 use hyperscale_storage::{ChainReader, ChainWriter, JmtTreeReader, SubstateStore, VersionedStore};
 use hyperscale_types::{
-    Block, Bls12381G1PrivateKey, Bls12381G1PublicKey, CommittedBlockHeader, ExecutionCertificate,
-    FinalizedWave, Hash, Provision, QuorumCertificate, RoutableTransaction, ShardGroupId,
-    TopologySnapshot, ValidatorId, WaveId,
+    Block, BlockHeight, Bls12381G1PrivateKey, Bls12381G1PublicKey, CommittedBlockHeader,
+    ExecutionCertificate, FinalizedWave, Hash, Provision, QuorumCertificate, RoutableTransaction,
+    ShardGroupId, TopologySnapshot, ValidatorId, WaveId,
 };
 use quick_cache::sync::Cache as QuickCache;
 use std::collections::{HashMap, HashSet};
@@ -56,8 +56,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Prepared commit cache: `block_hash → (block_height, prepared_commit)`.
-type PreparedCommitMap<S> =
-    HashMap<Hash, (u64, <S as hyperscale_storage::ChainWriter>::PreparedCommit)>;
+type PreparedCommitMap<S> = HashMap<
+    Hash,
+    (
+        BlockHeight,
+        <S as hyperscale_storage::ChainWriter>::PreparedCommit,
+    ),
+>;
 
 /// A block commit waiting to be flushed to storage.
 ///
@@ -145,7 +150,7 @@ pub struct StepOutput {
 /// The production runner maps this into its RPC shared state types.
 #[derive(Debug, Clone)]
 pub struct NodeStatusSnapshot {
-    pub committed_height: u64,
+    pub committed_height: BlockHeight,
     pub view: u64,
     pub state_root: Hash,
     pub sync: SyncStatus,
@@ -307,7 +312,7 @@ where
     /// `BlockPersisted` arrives. Used for backpressure: if consensus gets
     /// too far ahead of persistence, we defer `BlockCommitted` until the
     /// disk write completes (bounding memory and crash-recovery window).
-    persisted_height: u64,
+    persisted_height: BlockHeight,
 
     // Guard against out-of-order block commits across separate flushes.
     // When an async commit closure is in flight on the execution pool, new
@@ -621,7 +626,7 @@ where
                         );
                         if computed != fetched.block.header().certificate_root {
                             tracing::warn!(
-                                height,
+                                height = height.0,
                                 ?computed,
                                 expected = ?fetched.block.header().certificate_root,
                                 "Sync: certificate_root mismatch — rejecting response"

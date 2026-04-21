@@ -28,7 +28,7 @@ pub struct BftStats {
     /// Current round within the current height.
     pub current_round: u64,
     /// Current committed height.
-    pub committed_height: u64,
+    pub committed_height: BlockHeight,
 }
 
 /// BFT memory statistics for monitoring collection sizes.
@@ -79,7 +79,7 @@ use crate::vote_set::VoteSet;
 #[derive(Debug, Clone, Default)]
 pub struct RecoveredState {
     /// Last committed block height.
-    pub committed_height: u64,
+    pub committed_height: BlockHeight,
 
     /// Last committed block hash (None for fresh start).
     pub committed_hash: Option<Hash>,
@@ -306,7 +306,7 @@ impl BftState {
             node_index,
             view: 0,
             view_at_height_start: 0,
-            committed_height: recovered.committed_height,
+            committed_height: recovered.committed_height.0,
             committed_hash: recovered
                 .committed_hash
                 .unwrap_or(Hash::from_bytes(&[0u8; 32])),
@@ -325,7 +325,7 @@ impl BftState {
             voted_heights: HashMap::new(),
             received_votes_by_height: HashMap::new(),
             certified_blocks: HashMap::new(),
-            verification: VerificationPipeline::new(recovered.committed_height),
+            verification: VerificationPipeline::new(recovered.committed_height.0),
             sync: SyncManager::new(),
             pending_commits: std::collections::BTreeMap::new(),
             pending_commits_awaiting_data: HashMap::new(),
@@ -591,7 +591,7 @@ impl BftState {
         self.sync.set_sync_target(target_height);
 
         vec![Action::StartSync {
-            target_height,
+            target_height: BlockHeight(target_height),
             target_hash,
         }]
     }
@@ -1052,7 +1052,7 @@ impl BftState {
             .collect();
 
         let parent_state_root = self.parent_state_root(parent_hash);
-        let parent_block_height = parent_qc.height.0;
+        let parent_block_height = parent_qc.height;
         let parent_in_flight = self.parent_in_flight(parent_hash);
 
         info!(
@@ -1144,7 +1144,7 @@ impl BftState {
 
         let parent_state_root = self.parent_state_root(parent_hash);
         let parent_in_flight = self.parent_in_flight(parent_hash);
-        let parent_block_height = parent_qc.height.0;
+        let parent_block_height = parent_qc.height;
         let block_height = BlockHeight(height);
 
         info!(
@@ -1232,7 +1232,7 @@ impl BftState {
 
         let parent_state_root = self.parent_state_root(parent_hash);
         let parent_in_flight = self.parent_in_flight(parent_hash);
-        let parent_block_height = parent_qc.height.0;
+        let parent_block_height = parent_qc.height;
         let block_height = BlockHeight(height);
 
         info!(
@@ -2006,7 +2006,7 @@ impl BftState {
                 // freshly from the chain/pending-block state at that time,
                 // so we don't capture them here.
                 if self.verification.needs_state_root_verification(&block) {
-                    let parent_block_height = block.header().parent_qc.height.0;
+                    let parent_block_height = block.header().parent_qc.height;
                     self.verification.initiate_state_root_verification(
                         block_hash,
                         &block,
@@ -2113,7 +2113,7 @@ impl BftState {
     /// proposer from lying about which waves exist.
     fn validate_waves(&self, topology: &TopologySnapshot, block: &Block) -> Result<(), String> {
         let expected =
-            hyperscale_types::compute_waves(topology, block.height().0, block.transactions());
+            hyperscale_types::compute_waves(topology, block.height(), block.transactions());
 
         if block.header().waves != expected {
             return Err(format!(
@@ -2793,7 +2793,8 @@ impl BftState {
         topology: &TopologySnapshot,
         block_height: u64,
     ) -> Vec<Action> {
-        self.verification.on_block_persisted(block_height);
+        self.verification
+            .on_block_persisted(BlockHeight(block_height));
 
         // Auto-resume from sync when persistence catches up to the sync target.
         // This replaces the fragile SyncComplete → BlockPersisted two-event
@@ -3220,7 +3221,7 @@ impl BftState {
             // record_block_committed advances it.
             let state_root_verified = self.verification.is_state_root_verified(&current_hash);
             let parent_state_root = self.committed_state_root;
-            let parent_block_height = self.committed_height;
+            let parent_block_height = BlockHeight(self.committed_height);
 
             let removed_blocks = self.record_block_committed(
                 &block,
@@ -3496,7 +3497,7 @@ impl BftState {
 
         // Capture parent state BEFORE record_block_committed advances heights.
         let parent_state_root = self.parent_state_root(block.header().parent_hash);
-        let parent_block_height = self.committed_height;
+        let parent_block_height = BlockHeight(self.committed_height);
 
         // Advance committed_height. The QC is the proof of commit — same
         // timing as the consensus path.
@@ -4515,8 +4516,8 @@ impl BftState {
     }
 
     /// Get the current committed height.
-    pub fn committed_height(&self) -> u64 {
-        self.committed_height
+    pub fn committed_height(&self) -> BlockHeight {
+        BlockHeight(self.committed_height)
     }
 
     /// Get the committed block hash.
@@ -4539,7 +4540,7 @@ impl BftState {
         BftStats {
             view_changes: self.view_changes,
             current_round: self.view,
-            committed_height: self.committed_height,
+            committed_height: BlockHeight(self.committed_height),
         }
     }
 
@@ -6896,7 +6897,7 @@ mod tests {
         state.set_time(Duration::from_secs(100));
         // Parent tree must be available or try_propose defers.
         state.committed_height = 3;
-        state.verification.on_block_persisted(3);
+        state.verification.on_block_persisted(BlockHeight(3));
 
         let block_3_hash = Hash::from_bytes(b"block_3");
         state
@@ -7285,7 +7286,7 @@ mod tests {
         let committee = TestCommittee::new(4, 42);
         let block_hash = Hash::from_bytes(b"test_block");
         let shard = ShardGroupId(0);
-        let height = 1u64;
+        let height = BlockHeight(1);
         let round = 0u64;
 
         // All validators sign the same message
@@ -7312,7 +7313,7 @@ mod tests {
         let committee = TestCommittee::new(4, 42);
         let block_hash = Hash::from_bytes(b"test_block");
         let shard = ShardGroupId(0);
-        let height = 1u64;
+        let height = BlockHeight(1);
         let round = 0u64;
 
         let message = hyperscale_types::block_vote_message(shard, height, round, &block_hash);
@@ -7345,7 +7346,7 @@ mod tests {
         let committee = TestCommittee::new(4, 42);
         let block_hash = Hash::from_bytes(b"test_block");
         let shard = ShardGroupId(0);
-        let height = 1u64;
+        let height = BlockHeight(1);
         let round = 0u64;
         let message = hyperscale_types::block_vote_message(shard, height, round, &block_hash);
 
@@ -7384,7 +7385,7 @@ mod tests {
         state.set_time(Duration::from_secs(100));
         // Simulate committed state so parent tree is available for BuildProposal.
         state.committed_height = 3;
-        state.verification.on_block_persisted(3);
+        state.verification.on_block_persisted(BlockHeight(3));
 
         // Set up a QC so we propose for height 4 (validator 0's turn: (4+0)%4=0)
         let qc = QuorumCertificate {
@@ -7446,7 +7447,7 @@ mod tests {
         let current_time = Duration::from_secs(12345);
         state.set_time(current_time);
         state.committed_height = 3;
-        state.verification.on_block_persisted(3);
+        state.verification.on_block_persisted(BlockHeight(3));
 
         // Set up QC with old timestamp
         let old_timestamp = 1000u64;
@@ -7766,7 +7767,7 @@ mod tests {
         let (mut state, topology) = make_test_state();
         state.set_time(Duration::from_secs(100));
         state.committed_height = 3;
-        state.verification.on_block_persisted(3);
+        state.verification.on_block_persisted(BlockHeight(3));
 
         // Set up QC with specific timestamp
         let parent_timestamp = 50_000u64;
@@ -7846,7 +7847,7 @@ mod tests {
         let (mut state, topology) = make_test_state();
         state.set_time(Duration::from_secs(100));
         state.committed_height = 3;
-        state.verification.on_block_persisted(3);
+        state.verification.on_block_persisted(BlockHeight(3));
 
         // Set up initial QC
         let qc = QuorumCertificate {
@@ -8385,7 +8386,11 @@ mod tests {
         // Build a FinalizedWave whose EC attests "success" but whose receipt
         // reports "failure" — the divergent-peer signature we want to reject.
         let tx_hash = Hash::from_bytes(b"tx_divergent");
-        let wave_id = WaveId::new(ShardGroupId(0), 1, std::collections::BTreeSet::new());
+        let wave_id = WaveId::new(
+            ShardGroupId(0),
+            BlockHeight(1),
+            std::collections::BTreeSet::new(),
+        );
         let ec = ExecutionCertificate::new(
             wave_id.clone(),
             WeightedTimestamp(1),

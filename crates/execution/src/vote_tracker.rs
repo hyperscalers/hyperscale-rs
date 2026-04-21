@@ -232,7 +232,7 @@ impl VoteTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hyperscale_types::{generate_bls_keypair, zero_bls_signature, ShardGroupId};
+    use hyperscale_types::{generate_bls_keypair, zero_bls_signature, BlockHeight, ShardGroupId};
     use std::collections::BTreeSet;
 
     fn make_test_public_key() -> Bls12381G1PublicKey {
@@ -242,9 +242,9 @@ mod tests {
     fn make_vote(validator: u64, global_receipt_root: Hash) -> ExecutionVote {
         ExecutionVote {
             block_hash: Hash::from_bytes(b"block"),
-            block_height: 10,
+            block_height: BlockHeight(10),
             vote_anchor_ts_ms: WeightedTimestamp(11),
-            wave_id: WaveId::new(ShardGroupId(0), 0, BTreeSet::new()),
+            wave_id: WaveId::new(ShardGroupId(0), BlockHeight(0), BTreeSet::new()),
             shard_group_id: ShardGroupId(0),
             global_receipt_root,
             tx_count: 5,
@@ -257,7 +257,7 @@ mod tests {
     #[test]
     fn test_vote_tracker_quorum() {
         let mut tracker = VoteTracker::new(
-            WaveId::new(ShardGroupId(0), 0, BTreeSet::new()),
+            WaveId::new(ShardGroupId(0), BlockHeight(0), BTreeSet::new()),
             Hash::from_bytes(b"block"),
             3,
         );
@@ -283,7 +283,7 @@ mod tests {
     #[test]
     fn test_vote_tracker_conflicting_roots() {
         let mut tracker = VoteTracker::new(
-            WaveId::new(ShardGroupId(0), 0, BTreeSet::new()),
+            WaveId::new(ShardGroupId(0), BlockHeight(0), BTreeSet::new()),
             Hash::from_bytes(b"block"),
             3,
         );
@@ -307,7 +307,7 @@ mod tests {
         let pk = make_test_public_key();
         let root = Hash::from_bytes(b"root");
         let mut tracker = VoteTracker::new(
-            WaveId::new(ShardGroupId(0), 0, BTreeSet::new()),
+            WaveId::new(ShardGroupId(0), BlockHeight(0), BTreeSet::new()),
             Hash::from_bytes(b"block"),
             3,
         );
@@ -337,7 +337,7 @@ mod tests {
         let pk = make_test_public_key();
         let root = Hash::from_bytes(b"root");
         let mut tracker = VoteTracker::new(
-            WaveId::new(ShardGroupId(0), 0, BTreeSet::new()),
+            WaveId::new(ShardGroupId(0), BlockHeight(0), BTreeSet::new()),
             Hash::from_bytes(b"block"),
             3,
         );
@@ -351,7 +351,7 @@ mod tests {
         let pk = make_test_public_key();
         let root = Hash::from_bytes(b"root");
         let mut tracker = VoteTracker::new(
-            WaveId::new(ShardGroupId(0), 0, BTreeSet::new()),
+            WaveId::new(ShardGroupId(0), BlockHeight(0), BTreeSet::new()),
             Hash::from_bytes(b"block"),
             3,
         );

@@ -4,7 +4,7 @@ use crate::core::SimStorage;
 use crate::state::apply_updates;
 
 use hyperscale_storage::{ChainWriter, DatabaseUpdates, JmtSnapshot};
-use hyperscale_types::{CertifiedBlock, Hash, ReceiptBundle};
+use hyperscale_types::{BlockHeight, CertifiedBlock, Hash, ReceiptBundle};
 use std::sync::Arc;
 
 /// Precomputed commit work for a SimStorage block commit.
@@ -27,9 +27,9 @@ impl ChainWriter for SimStorage {
     fn prepare_block_commit(
         &self,
         parent_state_root: Hash,
-        parent_block_height: u64,
+        parent_block_height: BlockHeight,
         finalized_waves: &[Arc<hyperscale_types::FinalizedWave>],
-        block_height: u64,
+        block_height: BlockHeight,
         pending_snapshots: &[Arc<hyperscale_storage::JmtSnapshot>],
         // Memory backend already keeps state in-memory — the priors
         // hint is irrelevant to its perf and is ignored.
@@ -65,7 +65,8 @@ impl ChainWriter for SimStorage {
         let s = self.state.read().unwrap();
 
         let parent_version =
-            hyperscale_storage::tree::jmt_parent_height(parent_block_height, parent_state_root);
+            hyperscale_storage::tree::jmt_parent_height(parent_block_height, parent_state_root)
+                .map(|h| h.0);
 
         // Collect per-receipt DatabaseUpdates references — no merge needed.
         let per_receipt_updates: Vec<&hyperscale_storage::DatabaseUpdates> = receipts
@@ -77,7 +78,7 @@ impl ChainWriter for SimStorage {
             hyperscale_storage::tree::put_at_version(
                 &s.tree_store,
                 parent_version,
-                block_height,
+                block_height.0,
                 &per_receipt_updates,
                 &Default::default(),
             )
@@ -87,7 +88,7 @@ impl ChainWriter for SimStorage {
             hyperscale_storage::tree::put_at_version(
                 &overlay,
                 parent_version,
-                block_height,
+                block_height.0,
                 &per_receipt_updates,
                 &Default::default(),
             )
@@ -96,9 +97,9 @@ impl ChainWriter for SimStorage {
         let snapshot = JmtSnapshot::from_collected_writes(
             collected,
             parent_state_root,
-            parent_block_height,
+            parent_block_height.0,
             result_root,
-            block_height,
+            block_height.0,
         );
 
         drop(s); // Release read lock
@@ -126,7 +127,7 @@ impl ChainWriter for SimStorage {
         blocks
             .into_iter()
             .map(|(prepared, block, qc)| {
-                let block_height = prepared.snapshot.new_version;
+                let block_height_u64 = prepared.snapshot.new_version;
                 let result_root = prepared.snapshot.result_root;
 
                 {
@@ -137,7 +138,7 @@ impl ChainWriter for SimStorage {
                     apply_updates(
                         &mut s,
                         &prepared.merged_updates,
-                        block_height,
+                        block_height_u64,
                         /* write_history */ true,
                     );
                 }
@@ -180,7 +181,7 @@ impl ChainWriter for SimStorage {
                 c.committed_height = block.height();
                 c.committed_hash = Some(block.hash());
                 c.committed_qc = Some((*qc).clone());
-                c.prune_receipts(block.height().0);
+                c.prune_receipts(block.height());
 
                 result_root
             })
@@ -230,9 +231,10 @@ impl SimStorage {
         );
 
         let parent_version = hyperscale_storage::tree::jmt_parent_height(
-            s.current_block_height,
+            BlockHeight(s.current_block_height),
             s.current_root_hash,
-        );
+        )
+        .map(|h| h.0);
 
         let (new_root, collected) = hyperscale_storage::tree::put_at_version(
             &s.tree_store,
@@ -297,7 +299,7 @@ impl SimStorage {
             c.committed_height = block.height();
             c.committed_hash = Some(block.hash());
             c.committed_qc = Some((**qc).clone());
-            c.prune_receipts(block.height().0);
+            c.prune_receipts(block.height());
         }
 
         new_root

@@ -61,7 +61,7 @@ impl QuorumCertificate {
     pub fn signing_message(&self) -> Vec<u8> {
         block_vote_message(
             self.shard_group_id,
-            self.height.0,
+            self.height,
             self.round,
             &self.block_hash,
         )

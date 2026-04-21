@@ -92,7 +92,7 @@ pub fn make_signed_qc(
     parent_hash: Hash,
     shard: ShardGroupId,
 ) -> QuorumCertificate {
-    let message = block_vote_message(shard, height.0, round, &block_hash);
+    let message = block_vote_message(shard, height, round, &block_hash);
 
     // Collect individual signatures
     let signatures: Vec<Bls12381G2Signature> = voter_indices

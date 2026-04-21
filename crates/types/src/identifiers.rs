@@ -26,7 +26,7 @@ impl fmt::Display for ShardGroupId {
 }
 
 /// Block height.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, BasicSbor)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, BasicSbor)]
 #[sbor(transparent)]
 pub struct BlockHeight(pub u64);
 
@@ -46,6 +46,43 @@ impl BlockHeight {
         } else {
             None
         }
+    }
+
+    /// Saturating subtraction by a raw offset.
+    pub fn saturating_sub(self, rhs: u64) -> Self {
+        BlockHeight(self.0.saturating_sub(rhs))
+    }
+
+    /// Little-endian byte representation of the inner value.
+    pub fn to_le_bytes(self) -> [u8; 8] {
+        self.0.to_le_bytes()
+    }
+}
+
+impl std::ops::Add<u64> for BlockHeight {
+    type Output = BlockHeight;
+    fn add(self, rhs: u64) -> BlockHeight {
+        BlockHeight(self.0 + rhs)
+    }
+}
+
+impl std::ops::Sub<u64> for BlockHeight {
+    type Output = BlockHeight;
+    fn sub(self, rhs: u64) -> BlockHeight {
+        BlockHeight(self.0 - rhs)
+    }
+}
+
+impl std::ops::Sub<BlockHeight> for BlockHeight {
+    type Output = u64;
+    fn sub(self, rhs: BlockHeight) -> u64 {
+        self.0 - rhs.0
+    }
+}
+
+impl std::ops::AddAssign<u64> for BlockHeight {
+    fn add_assign(&mut self, rhs: u64) {
+        self.0 += rhs;
     }
 }
 

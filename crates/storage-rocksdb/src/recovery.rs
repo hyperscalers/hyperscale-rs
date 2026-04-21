@@ -52,7 +52,7 @@ impl RocksDbStorage {
         );
 
         hyperscale_bft::RecoveredState {
-            committed_height: committed_height.0,
+            committed_height,
             committed_hash,
             latest_qc,
             jmt_root: jmt_root_opt,

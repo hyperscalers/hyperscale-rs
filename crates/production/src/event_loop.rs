@@ -138,7 +138,7 @@ fn update_rpc_state(config: &PinnedLoopConfig, snapshot: &NodeStatusSnapshot) {
     if let Some(ref rpc_status) = config.rpc_status {
         let current = rpc_status.load();
         rpc_status.store(Arc::new(NodeStatusState {
-            block_height: snapshot.committed_height,
+            block_height: snapshot.committed_height.0,
             view: snapshot.view,
             state_root_hash: hex::encode(snapshot.state_root.as_bytes()),
             // Preserve fields set by other writers (runner sets connected_peers)

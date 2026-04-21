@@ -6,7 +6,7 @@ use crate::snapshot::RocksDbSnapshot;
 
 use hyperscale_metrics as metrics;
 use hyperscale_storage::{DbSortKey, JmtSnapshot, SubstateStore, VersionedStore};
-use hyperscale_types::NodeId;
+use hyperscale_types::{BlockHeight, NodeId};
 use rocksdb::WriteBatch;
 use std::time::Instant;
 
@@ -39,17 +39,17 @@ impl SubstateStore for RocksDbStorage {
     fn list_substates_for_node_at_height(
         &self,
         node_id: &NodeId,
-        block_height: u64,
+        block_height: BlockHeight,
     ) -> Option<Vec<(u8, DbSortKey, Vec<u8>)>> {
         // Take the snapshot first so bounds checks and the subsequent
         // reads all see one consistent LSN (see `snapshot_at` for why).
         let snapshot = self.db.snapshot();
         let (current_version, _) = crate::metadata::read_jmt_metadata(&snapshot);
-        if block_height > current_version {
+        if block_height.0 > current_version {
             return None;
         }
         let floor = current_version.saturating_sub(self.jmt_history_length);
-        if block_height < floor {
+        if block_height.0 < floor {
             // Below retention — historical state no longer recoverable.
             // External API: return None (network-supplied heights may
             // legitimately fall out of range; `snapshot_at` would panic,
@@ -59,7 +59,7 @@ impl SubstateStore for RocksDbStorage {
         let snap = RocksDbSnapshot {
             snapshot,
             db: &self.db,
-            version: block_height,
+            version: block_height.0,
             current_version,
         };
         Some(snap.list_raw_values_for_node(node_id))
@@ -68,7 +68,7 @@ impl SubstateStore for RocksDbStorage {
     fn generate_merkle_proofs(
         &self,
         storage_keys: &[Vec<u8>],
-        block_height: u64,
+        block_height: BlockHeight,
     ) -> Option<hyperscale_types::MerkleInclusionProof> {
         // Use a RocksDB snapshot for all reads so concurrent JMT GC cannot
         // delete nodes mid-proof-generation.

@@ -769,6 +769,8 @@ impl RocksDbStorage {
         latency_us = tracing::field::Empty,
     ))]
     pub fn commit(&self, updates: &DatabaseUpdates) -> Result<(), StorageError> {
+        use hyperscale_types::BlockHeight;
+
         let _commit_guard = self.commit_lock.lock().unwrap();
 
         let start = Instant::now();
@@ -779,7 +781,9 @@ impl RocksDbStorage {
 
         // Version 0 with a non-zero root means genesis has been computed at version 0.
         // Only treat as "no parent" when the JMT is truly empty.
-        let parent_version = hyperscale_storage::tree::jmt_parent_height(base_version, base_root);
+        let parent_version =
+            hyperscale_storage::tree::jmt_parent_height(BlockHeight(base_version), base_root)
+                .map(|h| h.0);
         let new_version = base_version + 1;
 
         let (mut batch, reset_old_keys) = self.build_substate_write_batch(

@@ -4,6 +4,7 @@
 //! the key type, value type, and their encodings. The [`DbCodec`] trait abstracts
 //! encode/decode so the same type can use different encodings in different CFs.
 
+use hyperscale_types::BlockHeight;
 use rocksdb::{ColumnFamily, WriteBatch};
 use std::marker::PhantomData;
 
@@ -450,14 +451,14 @@ pub(crate) fn meta_write<E: MetadataEntry>(batch: &mut WriteBatch, value: &E::Va
 #[derive(Default)]
 pub(crate) struct BlockHeightCodec;
 
-impl DbCodec<hyperscale_types::BlockHeight> for BlockHeightCodec {
-    fn encode_to(&self, value: &hyperscale_types::BlockHeight, buf: &mut Vec<u8>) {
+impl DbCodec<BlockHeight> for BlockHeightCodec {
+    fn encode_to(&self, value: &BlockHeight, buf: &mut Vec<u8>) {
         buf.extend_from_slice(&value.0.to_be_bytes());
     }
 
-    fn decode(&self, bytes: &[u8]) -> hyperscale_types::BlockHeight {
+    fn decode(&self, bytes: &[u8]) -> BlockHeight {
         let arr: [u8; 8] = bytes.try_into().unwrap_or([0; 8]);
-        hyperscale_types::BlockHeight(u64::from_be_bytes(arr))
+        BlockHeight(u64::from_be_bytes(arr))
     }
 }
 
@@ -484,7 +485,7 @@ impl DbCodec<(u64, hyperscale_types::Hash)> for JmtMetadataCodec {
 pub(crate) struct CommittedHeightEntry;
 impl MetadataEntry for CommittedHeightEntry {
     const KEY: &'static [u8] = b"chain:committed_height";
-    type Value = hyperscale_types::BlockHeight;
+    type Value = BlockHeight;
     type Codec = BlockHeightCodec;
 }
 

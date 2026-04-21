@@ -414,7 +414,7 @@ pub fn serve_provision_request(
         }
     };
 
-    let jmt_version = block.height().0;
+    let jmt_version = block.height();
 
     let all_txs = block.transactions().iter();
 
@@ -458,7 +458,8 @@ pub fn serve_provision_request(
                 None => {
                     warn!(
                         block_height = req.block_height.0,
-                        jmt_version, "Provision request: historical JMT version unavailable"
+                        jmt_version = jmt_version.0,
+                        "Provision request: historical JMT version unavailable"
                     );
                     return GetProvisionResponse {
                         provisions: None,

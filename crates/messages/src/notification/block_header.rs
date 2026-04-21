@@ -42,7 +42,7 @@ impl BlockHeaderNotification {
     pub fn signing_message(&self) -> Vec<u8> {
         block_header_message(
             self.header.shard_group_id,
-            self.header.height.0,
+            self.header.height,
             self.header.round,
             &self.header.hash(),
         )

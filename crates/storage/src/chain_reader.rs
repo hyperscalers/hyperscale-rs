@@ -70,7 +70,10 @@ pub trait ChainReader: Send + Sync + 'static {
     // ─── Execution Certificate Reads ────────────────────────────────────
 
     /// Retrieve all execution certificates for a given block height.
-    fn get_execution_certificates_by_height(&self, block_height: u64) -> Vec<ExecutionCertificate>;
+    fn get_execution_certificates_by_height(
+        &self,
+        block_height: BlockHeight,
+    ) -> Vec<ExecutionCertificate>;
 
     // ─── Wave Certificate Indexes ─────────────────────────────────────────
 

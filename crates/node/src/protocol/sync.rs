@@ -17,7 +17,7 @@ use hyperscale_messages::request::GetBlockRequest;
 use hyperscale_messages::response::GetBlockResponse;
 use hyperscale_metrics as metrics;
 use hyperscale_storage::ChainReader;
-use hyperscale_types::{CertifiedBlock, Hash, Provision};
+use hyperscale_types::{BlockHeight, CertifiedBlock, Hash, Provision};
 use quick_cache::sync::Cache as QuickCache;
 use serde::Serialize;
 use std::cmp::Reverse;
@@ -100,19 +100,19 @@ impl Default for SyncStatus {
 pub enum SyncInput {
     /// Start or update sync target.
     StartSync {
-        target_height: u64,
+        target_height: BlockHeight,
         target_hash: Hash,
     },
     /// A block response was received.
     /// `None` means the peer did not have the block.
     BlockResponseReceived {
-        height: u64,
+        height: BlockHeight,
         block: Option<Box<CertifiedBlock>>,
     },
     /// A block fetch failed after all retries.
-    BlockFetchFailed { height: u64 },
+    BlockFetchFailed { height: BlockHeight },
     /// A block was committed by the state machine.
-    BlockCommitted { height: u64 },
+    BlockCommitted { height: BlockHeight },
 }
 
 /// Outputs from the sync protocol state machine.
@@ -121,11 +121,14 @@ pub enum SyncOutput {
     /// Request the runner to fetch a block at this height. `target_height`
     /// is the sync target, passed through to the serving peer so it can
     /// choose between `Block::Live` and `Block::Sealed`.
-    FetchBlock { height: u64, target_height: u64 },
+    FetchBlock {
+        height: BlockHeight,
+        target_height: BlockHeight,
+    },
     /// A validated block is ready to deliver to BFT.
     DeliverBlock { certified: Box<CertifiedBlock> },
     /// Sync is complete (reached target).
-    SyncComplete { height: u64 },
+    SyncComplete { height: BlockHeight },
 }
 
 /// Sync protocol state machine.
@@ -205,60 +208,64 @@ impl SyncProtocol {
     // Input Handlers
     // ═══════════════════════════════════════════════════════════════════════
 
-    fn handle_start_sync(&mut self, target_height: u64, target_hash: Hash) -> Vec<SyncOutput> {
-        if self.sync_target.is_some_and(|(t, _)| t >= target_height) {
+    fn handle_start_sync(
+        &mut self,
+        target_height: BlockHeight,
+        target_hash: Hash,
+    ) -> Vec<SyncOutput> {
+        if self.sync_target.is_some_and(|(t, _)| t >= target_height.0) {
             return vec![];
         }
 
         info!(
-            target_height,
+            target_height = target_height.0,
             ?target_hash,
             committed = self.committed_height,
             "Starting sync"
         );
 
-        self.sync_target = Some((target_height, target_hash));
+        self.sync_target = Some((target_height.0, target_hash));
         self.queue_heights_in_window();
         self.emit_fetch_outputs()
     }
 
     fn handle_block_response(
         &mut self,
-        height: u64,
+        height: BlockHeight,
         response: Option<CertifiedBlock>,
     ) -> Vec<SyncOutput> {
-        self.heights_in_flight.remove(&height);
+        self.heights_in_flight.remove(&height.0);
 
         match response {
             Some(CertifiedBlock { block, qc }) => {
                 // Validate
-                if block.height().0 != height {
+                if block.height().0 != height.0 {
                     warn!(
-                        expected = height,
+                        expected = height.0,
                         got = block.height().0,
                         "Height mismatch in sync response"
                     );
                     metrics::record_sync_block_filtered("height_mismatch");
-                    self.queue_height(height);
+                    self.queue_height(height.0);
                     return self.emit_fetch_outputs();
                 }
 
                 let block_hash = block.hash();
                 if qc.block_hash != block_hash {
-                    warn!(height, "QC block hash mismatch in sync response");
+                    warn!(height = height.0, "QC block hash mismatch in sync response");
                     metrics::record_sync_block_filtered("qc_hash_mismatch");
-                    self.queue_height(height);
+                    self.queue_height(height.0);
                     return self.emit_fetch_outputs();
                 }
 
-                if qc.height.0 != height {
-                    warn!(height, "QC height mismatch in sync response");
+                if qc.height.0 != height.0 {
+                    warn!(height = height.0, "QC height mismatch in sync response");
                     metrics::record_sync_block_filtered("qc_height_mismatch");
-                    self.queue_height(height);
+                    self.queue_height(height.0);
                     return self.emit_fetch_outputs();
                 }
 
-                trace!(height, "Valid sync block received");
+                trace!(height = height.0, "Valid sync block received");
                 metrics::record_sync_block_downloaded();
                 metrics::record_sync_block_verified();
                 let certified = CertifiedBlock::new_unchecked(block, qc);
@@ -269,33 +276,35 @@ impl SyncProtocol {
                 outputs
             }
             None => {
-                warn!(height, "Empty sync response, re-queuing");
+                warn!(height = height.0, "Empty sync response, re-queuing");
                 metrics::record_sync_response_error("empty_response");
-                self.queue_height(height);
+                self.queue_height(height.0);
                 self.emit_fetch_outputs()
             }
         }
     }
 
-    fn handle_block_fetch_failed(&mut self, height: u64) -> Vec<SyncOutput> {
-        self.heights_in_flight.remove(&height);
-        warn!(height, "Sync fetch failed, re-queuing");
+    fn handle_block_fetch_failed(&mut self, height: BlockHeight) -> Vec<SyncOutput> {
+        self.heights_in_flight.remove(&height.0);
+        warn!(height = height.0, "Sync fetch failed, re-queuing");
         metrics::record_sync_response_error("fetch_failed");
-        self.queue_height(height);
+        self.queue_height(height.0);
         self.emit_fetch_outputs()
     }
 
-    fn handle_block_committed(&mut self, height: u64) -> Vec<SyncOutput> {
-        self.committed_height = height;
-        self.remove_heights_at_or_below(height);
+    fn handle_block_committed(&mut self, height: BlockHeight) -> Vec<SyncOutput> {
+        self.committed_height = height.0;
+        self.remove_heights_at_or_below(height.0);
 
         if let Some((target, _)) = self.sync_target {
             metrics::record_sync_block_applied();
-            if height >= target {
-                info!(height, target, "Sync complete");
+            if height.0 >= target {
+                info!(height = height.0, target, "Sync complete");
                 self.sync_target = None;
                 self.clear_height_queue();
-                return vec![SyncOutput::SyncComplete { height: target }];
+                return vec![SyncOutput::SyncComplete {
+                    height: BlockHeight(target),
+                }];
             }
 
             // Extend sliding window
@@ -366,8 +375,8 @@ impl SyncProtocol {
             if let Some(height) = self.pop_next_height() {
                 self.heights_in_flight.insert(height);
                 outputs.push(SyncOutput::FetchBlock {
-                    height,
-                    target_height,
+                    height: BlockHeight(height),
+                    target_height: BlockHeight(target_height),
                 });
             } else {
                 break;
@@ -468,13 +477,13 @@ mod tests {
         });
 
         let outputs = protocol.handle(SyncInput::StartSync {
-            target_height: 5,
+            target_height: BlockHeight(5),
             target_hash: Hash::ZERO,
         });
 
         assert!(protocol.is_syncing());
         // Should emit FetchBlock for heights 1..=5
-        let fetch_heights: Vec<u64> = outputs
+        let fetch_heights: Vec<BlockHeight> = outputs
             .iter()
             .filter_map(|o| match o {
                 SyncOutput::FetchBlock { height, .. } => Some(*height),
@@ -492,19 +501,21 @@ mod tests {
         });
 
         protocol.handle(SyncInput::StartSync {
-            target_height: 2,
+            target_height: BlockHeight(2),
             target_hash: Hash::ZERO,
         });
 
         assert!(protocol.is_syncing());
 
         // Commit up to target
-        let outputs = protocol.handle(SyncInput::BlockCommitted { height: 2 });
+        let outputs = protocol.handle(SyncInput::BlockCommitted {
+            height: BlockHeight(2),
+        });
 
         assert!(!protocol.is_syncing());
         assert!(outputs
             .iter()
-            .any(|o| matches!(o, SyncOutput::SyncComplete { height: 2 })));
+            .any(|o| matches!(o, SyncOutput::SyncComplete { height } if height.0 == 2)));
     }
 
     #[test]
@@ -515,16 +526,18 @@ mod tests {
         });
 
         protocol.handle(SyncInput::StartSync {
-            target_height: 3,
+            target_height: BlockHeight(3),
             target_hash: Hash::ZERO,
         });
 
         // Fail the first fetch
-        let outputs = protocol.handle(SyncInput::BlockFetchFailed { height: 1 });
+        let outputs = protocol.handle(SyncInput::BlockFetchFailed {
+            height: BlockHeight(1),
+        });
 
         // Should re-emit a FetchBlock for height 1
         assert!(outputs
             .iter()
-            .any(|o| matches!(o, SyncOutput::FetchBlock { height: 1, .. })));
+            .any(|o| matches!(o, SyncOutput::FetchBlock { height, .. } if height.0 == 1)));
     }
 }

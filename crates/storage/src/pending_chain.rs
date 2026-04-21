@@ -10,7 +10,7 @@ use crate::{
     SubstateStore,
 };
 use ::hyperscale_jmt as jmt;
-use hyperscale_types::{Hash, LocalReceipt, MerkleInclusionProof, NodeId};
+use hyperscale_types::{BlockHeight, Hash, LocalReceipt, MerkleInclusionProof, NodeId};
 use radix_common::prelude::DatabaseUpdate;
 use radix_substate_store_interface::interface::SubstateDatabase;
 use std::collections::HashMap;
@@ -31,7 +31,7 @@ pub struct ChainEntry {
     /// Parent block hash. Used to walk the chain back to the committed tip.
     pub parent_hash: Hash,
     /// Block height. Used for pruning and version-aware reads.
-    pub height: u64,
+    pub height: BlockHeight,
     /// Per-tx receipts produced by this block.
     pub receipts: Vec<Arc<LocalReceipt>>,
     /// JMT snapshot from this block's speculative state-root computation.
@@ -72,7 +72,7 @@ where
     /// Drop all entries with `height ≤ committed_height`. Called on
     /// `BlockPersisted`. Also drops cache entries whose anchor is at or
     /// below the committed height — higher-anchor views remain valid.
-    pub fn prune(&self, committed_height: u64) {
+    pub fn prune(&self, committed_height: BlockHeight) {
         self.entries
             .write()
             .unwrap()
@@ -108,7 +108,7 @@ where
             Some(h) => self.view_at(h),
             None => Arc::new(SubstateView::base_only(
                 Arc::clone(&self.base),
-                self.base.jmt_version(),
+                BlockHeight(self.base.jmt_version()),
             )),
         }
     }
@@ -134,7 +134,7 @@ where
         let anchor_height = chain
             .last()
             .map(|e| e.height)
-            .unwrap_or_else(|| self.base.jmt_version());
+            .unwrap_or_else(|| BlockHeight(self.base.jmt_version()));
         SubstateView::from_chain(Arc::clone(&self.base), &chain, anchor_height)
     }
 }
@@ -167,7 +167,7 @@ pub struct SubstateView<S> {
     /// so the snapshot reflects state as-of this specific block rather
     /// than "whatever the validator has currently persisted." Critical
     /// for cross-validator determinism under persistence lag.
-    anchor_height: u64,
+    anchor_height: BlockHeight,
     /// Flattened pending substates from the anchored chain, in commit order.
     /// Later entries override earlier ones for the same key.
     overlay: OverlayEntries,
@@ -181,7 +181,7 @@ pub struct SubstateView<S> {
     /// Per-receipt references for versioned queries
     /// ([`SubstateStore::list_substates_for_node_at_height`]).
     /// Sorted by height ascending.
-    versioned_receipts: Vec<(u64, Arc<LocalReceipt>)>,
+    versioned_receipts: Vec<(BlockHeight, Arc<LocalReceipt>)>,
     /// Lazy cache of base-storage reads observed through this view.
     /// Populated on every overlay-miss `get_raw_substate_by_db_key` call.
     /// Consumed at commit time by `take_base_reads` so `capture_history`
@@ -208,11 +208,11 @@ impl<S> SubstateView<S> {
     /// `anchor_height` is the height of the view's anchor — the chain's
     /// tip (last entry) when non-empty, or the base's committed tip when
     /// the walk produced nothing.
-    fn from_chain(base: Arc<S>, chain: &[&ChainEntry], anchor_height: u64) -> Self {
+    fn from_chain(base: Arc<S>, chain: &[&ChainEntry], anchor_height: BlockHeight) -> Self {
         let mut overlay: OverlayEntries = HashMap::new();
         let mut jmt_snapshots: Vec<Arc<JmtSnapshot>> = Vec::with_capacity(chain.len());
         let mut jmt_nodes: JmtNodeIndex = HashMap::new();
-        let mut versioned_receipts: Vec<(u64, Arc<LocalReceipt>)> = Vec::new();
+        let mut versioned_receipts: Vec<(BlockHeight, Arc<LocalReceipt>)> = Vec::new();
 
         for entry in chain {
             for receipt in &entry.receipts {
@@ -237,7 +237,7 @@ impl<S> SubstateView<S> {
     }
 
     /// Build a view with no pending entries (reads always go to base).
-    fn base_only(base: Arc<S>, anchor_height: u64) -> Self {
+    fn base_only(base: Arc<S>, anchor_height: BlockHeight) -> Self {
         Self {
             base,
             anchor_height,
@@ -443,7 +443,7 @@ impl<S: SubstateStore + crate::VersionedStore> SubstateStore for SubstateView<S>
         // descendants that others haven't. This is the determinism fix
         // for cross-validator state_root computation.
         ViewSnapshot {
-            base_snapshot: (*self.base).snapshot_at(self.anchor_height),
+            base_snapshot: (*self.base).snapshot_at(self.anchor_height.0),
             // Clone the overlay into an Arc so the snapshot is `'static`
             // with respect to the view's overlay map.
             overlay: Arc::new(self.overlay.clone()),
@@ -464,9 +464,9 @@ impl<S: SubstateStore + crate::VersionedStore> SubstateStore for SubstateView<S>
     fn list_substates_for_node_at_height(
         &self,
         node_id: &NodeId,
-        block_height: u64,
+        block_height: BlockHeight,
     ) -> Option<Vec<(u8, DbSortKey, Vec<u8>)>> {
-        let persisted_version = (*self.base).jmt_version();
+        let persisted_version = BlockHeight((*self.base).jmt_version());
 
         // If the requested height is within persisted range, delegate.
         if block_height <= persisted_version {
@@ -531,7 +531,7 @@ impl<S: SubstateStore + crate::VersionedStore> SubstateStore for SubstateView<S>
     fn generate_merkle_proofs(
         &self,
         storage_keys: &[Vec<u8>],
-        block_height: u64,
+        block_height: BlockHeight,
     ) -> Option<MerkleInclusionProof> {
         // Try base first — works for heights already persisted.
         if let Some(proof) = (*self.base).generate_merkle_proofs(storage_keys, block_height) {
@@ -552,7 +552,7 @@ impl<S: SubstateStore + jmt::TreeReader + Sync> SubstateView<S> {
     pub fn generate_merkle_proofs_overlay(
         &self,
         storage_keys: &[Vec<u8>],
-        block_height: u64,
+        block_height: BlockHeight,
     ) -> Option<MerkleInclusionProof> {
         if let Some(proof) = (*self.base).generate_merkle_proofs(storage_keys, block_height) {
             return Some(proof);
@@ -585,9 +585,9 @@ impl<S: crate::ChainWriter> crate::ChainWriter for SubstateView<S> {
     fn prepare_block_commit(
         &self,
         parent_state_root: Hash,
-        parent_block_height: u64,
+        parent_block_height: BlockHeight,
         finalized_waves: &[Arc<hyperscale_types::FinalizedWave>],
-        block_height: u64,
+        block_height: BlockHeight,
         pending_snapshots: &[Arc<JmtSnapshot>],
         base_reads: Option<&BaseReadCache>,
     ) -> (Hash, Self::PreparedCommit) {
@@ -700,14 +700,14 @@ mod tests {
         fn list_substates_for_node_at_height(
             &self,
             _node_id: &NodeId,
-            _block_height: u64,
+            _block_height: BlockHeight,
         ) -> Option<Vec<(u8, DbSortKey, Vec<u8>)>> {
             None
         }
         fn generate_merkle_proofs(
             &self,
             _storage_keys: &[Vec<u8>],
-            _block_height: u64,
+            _block_height: BlockHeight,
         ) -> Option<MerkleInclusionProof> {
             None
         }
@@ -729,14 +729,11 @@ mod tests {
     }
 
     impl crate::ChainReader for StubStore {
-        fn get_block(
-            &self,
-            _height: hyperscale_types::BlockHeight,
-        ) -> Option<hyperscale_types::CertifiedBlock> {
+        fn get_block(&self, _height: BlockHeight) -> Option<hyperscale_types::CertifiedBlock> {
             None
         }
-        fn committed_height(&self) -> hyperscale_types::BlockHeight {
-            hyperscale_types::BlockHeight(0)
+        fn committed_height(&self) -> BlockHeight {
+            BlockHeight(0)
         }
         fn committed_hash(&self) -> Option<Hash> {
             None
@@ -744,10 +741,7 @@ mod tests {
         fn latest_qc(&self) -> Option<hyperscale_types::QuorumCertificate> {
             None
         }
-        fn get_block_for_sync(
-            &self,
-            _height: hyperscale_types::BlockHeight,
-        ) -> Option<crate::BlockForSync> {
+        fn get_block_for_sync(&self, _height: BlockHeight) -> Option<crate::BlockForSync> {
             None
         }
         fn get_transactions_batch(
@@ -767,7 +761,7 @@ mod tests {
         }
         fn get_execution_certificates_by_height(
             &self,
-            _block_height: u64,
+            _block_height: BlockHeight,
         ) -> Vec<hyperscale_types::ExecutionCertificate> {
             Vec::new()
         }
@@ -828,7 +822,7 @@ mod tests {
     fn entry_at(parent: Hash, height: u64, updates: DatabaseUpdates) -> ChainEntry {
         ChainEntry {
             parent_hash: parent,
-            height,
+            height: BlockHeight(height),
             receipts: vec![make_receipt(updates)],
             jmt_snapshot: empty_snapshot(),
         }
@@ -848,7 +842,7 @@ mod tests {
         chain.insert(h2, entry_at(h1, 2, DatabaseUpdates::default()));
         chain.insert(h3, entry_at(h2, 3, DatabaseUpdates::default()));
 
-        chain.prune(2);
+        chain.prune(BlockHeight(2));
         assert_eq!(chain.entries.read().unwrap().len(), 1);
         assert!(chain.entries.read().unwrap().contains_key(&h3));
     }

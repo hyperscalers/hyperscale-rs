@@ -5,7 +5,7 @@ use crate::core::RocksDbStorage;
 use crate::jmt_snapshot_store::SnapshotTreeStore;
 
 use hyperscale_storage::JmtSnapshot;
-use hyperscale_types::ReceiptBundle;
+use hyperscale_types::{BlockHeight, ReceiptBundle};
 use radix_substate_store_interface::interface::DatabaseUpdates;
 use rocksdb::WriteBatch;
 use std::sync::Arc;
@@ -34,9 +34,9 @@ impl hyperscale_storage::ChainWriter for RocksDbStorage {
     fn prepare_block_commit(
         &self,
         parent_state_root: hyperscale_types::Hash,
-        parent_block_height: u64,
+        parent_block_height: BlockHeight,
         finalized_waves: &[std::sync::Arc<hyperscale_types::FinalizedWave>],
-        block_height: u64,
+        block_height: BlockHeight,
         pending_snapshots: &[std::sync::Arc<hyperscale_storage::JmtSnapshot>],
         base_reads: Option<&hyperscale_storage::BaseReadCache>,
     ) -> (hyperscale_types::Hash, Self::PreparedCommit) {
@@ -67,7 +67,8 @@ impl hyperscale_storage::ChainWriter for RocksDbStorage {
 
         let snapshot_store = SnapshotTreeStore::new(&self.db);
         let parent_version =
-            hyperscale_storage::tree::jmt_parent_height(parent_block_height, parent_state_root);
+            hyperscale_storage::tree::jmt_parent_height(parent_block_height, parent_state_root)
+                .map(|h| h.0);
 
         // Collect per-receipt DatabaseUpdates references — no merge needed.
         // State locking guarantees no key conflicts between receipts, so
@@ -81,7 +82,7 @@ impl hyperscale_storage::ChainWriter for RocksDbStorage {
             hyperscale_storage::tree::put_at_version(
                 &snapshot_store,
                 parent_version,
-                block_height,
+                block_height.0,
                 &per_receipt_updates,
                 &Default::default(),
             )
@@ -93,7 +94,7 @@ impl hyperscale_storage::ChainWriter for RocksDbStorage {
             hyperscale_storage::tree::put_at_version(
                 &overlay,
                 parent_version,
-                block_height,
+                block_height.0,
                 &per_receipt_updates,
                 &Default::default(),
             )
@@ -102,9 +103,9 @@ impl hyperscale_storage::ChainWriter for RocksDbStorage {
         let jmt_snapshot = JmtSnapshot::from_collected_writes(
             collected,
             parent_state_root,
-            parent_block_height,
+            parent_block_height.0,
             computed_root,
-            block_height,
+            block_height.0,
         );
 
         // Merge updates for the substate WriteBatch (off the state_root critical path).
@@ -117,7 +118,7 @@ impl hyperscale_storage::ChainWriter for RocksDbStorage {
         // Pre-build substate + receipt writes into a WriteBatch for efficient commit.
         let (mut write_batch, _reset_old_keys) = self.build_substate_write_batch(
             &merged_updates,
-            block_height,
+            block_height.0,
             /* write_history */ true,
             base_reads,
         );
@@ -283,7 +284,9 @@ impl RocksDbStorage {
         }
 
         // Compute JMT update.
-        let parent_version = hyperscale_storage::tree::jmt_parent_height(base_version, base_root);
+        let parent_version =
+            hyperscale_storage::tree::jmt_parent_height(BlockHeight(base_version), base_root)
+                .map(|h| h.0);
         let (new_root, collected) = hyperscale_storage::tree::put_at_version(
             &snapshot_store,
             parent_version,

@@ -4,7 +4,7 @@ use crate::core::SimStorage;
 use crate::snapshot::SimSnapshot;
 
 use hyperscale_storage::{DbSortKey, SubstateStore, VersionedStore};
-use hyperscale_types::{Hash, NodeId};
+use hyperscale_types::{BlockHeight, Hash, NodeId};
 
 impl SubstateStore for SimStorage {
     type Snapshot<'a> = SimSnapshot;
@@ -26,14 +26,14 @@ impl SubstateStore for SimStorage {
     fn list_substates_for_node_at_height(
         &self,
         node_id: &NodeId,
-        block_height: u64,
+        block_height: BlockHeight,
     ) -> Option<Vec<(u8, DbSortKey, Vec<u8>)>> {
         let current_version = self.state.read().unwrap().current_block_height;
-        if block_height > current_version {
+        if block_height.0 > current_version {
             return None;
         }
         let floor = current_version.saturating_sub(self.jmt_history_length);
-        if block_height < floor {
+        if block_height.0 < floor {
             // Below retention — historical state no longer recoverable.
             // External API: return None (network-supplied heights may
             // legitimately fall out of range; `snapshot_at` would panic,
@@ -41,7 +41,7 @@ impl SubstateStore for SimStorage {
             return None;
         }
         Some(
-            self.snapshot_at(block_height)
+            self.snapshot_at(block_height.0)
                 .list_raw_values_for_node(node_id),
         )
     }
@@ -49,7 +49,7 @@ impl SubstateStore for SimStorage {
     fn generate_merkle_proofs(
         &self,
         storage_keys: &[Vec<u8>],
-        block_height: u64,
+        block_height: BlockHeight,
     ) -> Option<hyperscale_types::MerkleInclusionProof> {
         let s = self.state.read().unwrap();
         hyperscale_storage::tree::proofs::generate_proof(&s.tree_store, storage_keys, block_height)

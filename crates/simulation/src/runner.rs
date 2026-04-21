@@ -19,7 +19,7 @@ use hyperscale_storage::{ChainReader, GenesisWrapper};
 use hyperscale_storage_memory::SimStorage;
 use hyperscale_topology::TopologyState;
 use hyperscale_types::{
-    bls_keypair_from_seed, shard_for_node, Bls12381G1PrivateKey, Bls12381G1PublicKey,
+    bls_keypair_from_seed, shard_for_node, BlockHeight, Bls12381G1PrivateKey, Bls12381G1PublicKey,
     CertifiedBlock, Hash as TxHash, NodeId, ShardGroupId, TransactionStatus, ValidatorId,
     ValidatorInfo, ValidatorSet,
 };
@@ -344,7 +344,7 @@ impl SimulationRunner {
                 let s = nl.storage();
                 let committed = s.committed_height();
                 if committed.0 == 0 {
-                    if s.get_block(hyperscale_types::BlockHeight(0)).is_some() {
+                    if s.get_block(BlockHeight(0)).is_some() {
                         1
                     } else {
                         0
@@ -360,11 +360,7 @@ impl SimulationRunner {
     pub fn has_committed_block(&self, node: NodeIndex, height: u64) -> bool {
         self.io_loops
             .get(node as usize)
-            .map(|nl| {
-                nl.storage()
-                    .get_block(hyperscale_types::BlockHeight(height))
-                    .is_some()
-            })
+            .map(|nl| nl.storage().get_block(BlockHeight(height)).is_some())
             .unwrap_or(false)
     }
 

@@ -112,13 +112,13 @@ pub(crate) struct ConsensusState {
     /// Execution output details keyed by transaction hash.
     pub execution_outputs: HashMap<Hash, ExecutionMetadata>,
     /// Insertion height for each receipt, enabling height-based pruning.
-    pub receipt_heights: HashMap<Hash, u64>,
+    pub receipt_heights: HashMap<Hash, BlockHeight>,
     /// Execution certificates keyed by canonical hash.
     pub execution_certs: HashMap<Hash, ExecutionCertificate>,
     /// Index: block_height → set of canonical hashes for that height.
-    pub execution_certs_by_height: HashMap<u64, Vec<Hash>>,
+    pub execution_certs_by_height: HashMap<BlockHeight, Vec<Hash>>,
     /// Index: block_height → wave_id hashes at that height.
-    pub wave_certs_by_height: HashMap<u64, Vec<Hash>>,
+    pub wave_certs_by_height: HashMap<BlockHeight, Vec<Hash>>,
     /// Index: tx_hash → wave_id hash of the wave cert that finalized it.
     pub tx_to_wave: HashMap<Hash, Hash>,
     /// Index: tx_hash → vec of (shard_group_id, ec_hash) pairs covering it.
@@ -149,9 +149,9 @@ impl ConsensusState {
     }
 
     /// Prune receipts older than the retention window.
-    pub(crate) fn prune_receipts(&mut self, committed_height: u64) {
+    pub(crate) fn prune_receipts(&mut self, committed_height: BlockHeight) {
         let cutoff = committed_height.saturating_sub(SIM_RECEIPT_RETENTION_BLOCKS);
-        if cutoff == 0 {
+        if cutoff == BlockHeight::GENESIS {
             return;
         }
         self.receipt_heights.retain(|tx_hash, height| {

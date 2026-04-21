@@ -22,7 +22,7 @@ pub fn make_wrong_key_block_vote(
     round: u64,
     shard: ShardGroupId,
 ) -> BlockVote {
-    let message = block_vote_message(shard, height.0, round, &block_hash);
+    let message = block_vote_message(shard, height, round, &block_hash);
     // Sign with wrong key
     let signature = committee.keypair(actual_signer_idx).sign_v1(&message);
 
@@ -51,7 +51,7 @@ pub fn make_wrong_message_block_vote(
     shard: ShardGroupId,
 ) -> BlockVote {
     // Sign for different block
-    let message = block_vote_message(shard, height.0, round, &actual_signed_hash);
+    let message = block_vote_message(shard, height, round, &actual_signed_hash);
     let signature = committee.keypair(voter_idx).sign_v1(&message);
 
     BlockVote {

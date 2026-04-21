@@ -69,7 +69,10 @@ impl ChainReader for SimStorage {
             .cloned()
     }
 
-    fn get_execution_certificates_by_height(&self, block_height: u64) -> Vec<ExecutionCertificate> {
+    fn get_execution_certificates_by_height(
+        &self,
+        block_height: BlockHeight,
+    ) -> Vec<ExecutionCertificate> {
         let c = self.consensus.read().unwrap();
         c.execution_certs_by_height
             .get(&block_height)

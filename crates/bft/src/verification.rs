@@ -5,7 +5,8 @@
 //! retaining control-flow decisions (voting, block rejection).
 
 use hyperscale_types::{
-    Block, BlockHeader, BlockManifest, FinalizedWave, Hash, ReceiptBundle, TopologySnapshot,
+    Block, BlockHeader, BlockHeight, BlockManifest, FinalizedWave, Hash, ReceiptBundle,
+    TopologySnapshot,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -38,12 +39,12 @@ pub struct ReadyStateRootVerification {
     pub parent_block_hash: Hash,
     pub parent_state_root: Hash,
     /// The committed height of the parent block (stable JMT version for computation).
-    pub parent_block_height: u64,
+    pub parent_block_height: BlockHeight,
     pub expected_root: Hash,
     /// Finalized waves from the PendingBlock — these carry the proposer's receipts,
     /// ensuring all validators verify against the same execution outputs.
     pub finalized_waves: Vec<Arc<FinalizedWave>>,
-    pub block_height: u64,
+    pub block_height: BlockHeight,
 }
 
 /// Internal queue entry for state root verification. Holds only block identity
@@ -54,9 +55,9 @@ pub struct ReadyStateRootVerification {
 pub(crate) struct PendingStateRootVerification {
     pub block_hash: Hash,
     pub parent_block_hash: Hash,
-    pub parent_block_height: u64,
+    pub parent_block_height: BlockHeight,
     pub expected_root: Hash,
-    pub block_height: u64,
+    pub block_height: BlockHeight,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -95,7 +96,7 @@ pub(crate) struct VerificationPipeline {
     /// rather than dispatching a stale `BuildProposal` — transaction
     /// selection must use current state to avoid including txs that were
     /// committed between deferral and dispatch.
-    deferred_proposal: Option<(Hash, u64)>,
+    deferred_proposal: Option<(Hash, BlockHeight)>,
 
     /// Highest persisted height — parent trees at or below this height
     /// are readable from disk, so child verifications for blocks beyond
@@ -453,7 +454,7 @@ impl VerificationPipeline {
         &mut self,
         block_hash: Hash,
         block: &Block,
-        parent_block_height: u64,
+        parent_block_height: BlockHeight,
     ) {
         let parent_hash = block.header().parent_hash;
         let ready = PendingStateRootVerification {
@@ -461,14 +462,14 @@ impl VerificationPipeline {
             parent_block_hash: parent_hash,
             parent_block_height,
             expected_root: block.header().state_root,
-            block_height: block.height().0,
+            block_height: block.height(),
         };
 
         // The parent's tree nodes must be available — either committed to
         // the tree store or in the snapshot cache (from a prior verification).
         // Defer if: parent height exceeds committed JMT AND parent hasn't
         // been verified (no snapshot in the overlay).
-        let parent_tree_available = parent_block_height <= self.last_persisted_height
+        let parent_tree_available = parent_block_height.0 <= self.last_persisted_height
             || self.verified_state_roots.contains(&parent_hash);
 
         if !parent_tree_available {
@@ -951,8 +952,12 @@ impl VerificationPipeline {
     /// Check if a parent's tree nodes are available (persisted or verified
     /// or consensus-committed — all three place the parent's JMT snapshot
     /// either on disk or in the `PendingChain` overlay).
-    pub fn parent_tree_available(&self, parent_block_height: u64, parent_hash: Hash) -> bool {
-        parent_block_height <= self.last_persisted_height
+    pub fn parent_tree_available(
+        &self,
+        parent_block_height: BlockHeight,
+        parent_hash: Hash,
+    ) -> bool {
+        parent_block_height.0 <= self.last_persisted_height
             || self.verified_state_roots.contains(&parent_hash)
     }
 
@@ -960,10 +965,10 @@ impl VerificationPipeline {
     /// available. Only the parent identity is stored — when unblocked, the
     /// caller re-enters `try_propose` with fresh state rather than replaying
     /// a stale `BuildProposal` action.
-    pub fn defer_proposal(&mut self, parent_hash: Hash, parent_block_height: u64) {
+    pub fn defer_proposal(&mut self, parent_hash: Hash, parent_block_height: BlockHeight) {
         debug!(
             parent_hash = ?parent_hash,
-            parent_block_height,
+            parent_block_height = parent_block_height.0,
             "Deferring proposal — parent tree not yet available"
         );
         self.deferred_proposal = Some((parent_hash, parent_block_height));
@@ -987,11 +992,11 @@ impl VerificationPipeline {
     /// as a safety net if the consensus-commit path didn't fire for
     /// some reason. Steady-state unblocking happens via
     /// [`Self::on_block_committed`].
-    pub fn on_block_persisted(&mut self, block_height: u64) {
-        if block_height <= self.last_persisted_height {
+    pub fn on_block_persisted(&mut self, block_height: BlockHeight) {
+        if block_height.0 <= self.last_persisted_height {
             return;
         }
-        self.last_persisted_height = block_height;
+        self.last_persisted_height = block_height.0;
 
         // Unblock deferred verifications whose parent height is now persisted.
         let unblocked_parents: Vec<Hash> = self
@@ -1106,7 +1111,7 @@ impl VerificationPipeline {
         // Clear deferred proposal if its parent is at or below committed height
         // (the proposal is stale — a new round/view will generate a fresh one).
         if let Some((_, parent_block_height)) = &self.deferred_proposal {
-            if *parent_block_height <= committed_height {
+            if parent_block_height.0 <= committed_height {
                 self.deferred_proposal = None;
             }
         }
