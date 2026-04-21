@@ -252,10 +252,10 @@ fn test_block_storage_and_retrieval() {
 
     commit_empty(&storage, &block, &qc);
 
-    let (stored_block, stored_qc) = storage.get_block(BlockHeight(1)).unwrap();
-    assert_eq!(stored_block.height(), BlockHeight(1));
-    assert_eq!(stored_block.header().timestamp, 1_000);
-    assert_eq!(stored_qc.block_hash, block.hash());
+    let stored = storage.get_block(BlockHeight(1)).unwrap();
+    assert_eq!(stored.block.height(), BlockHeight(1));
+    assert_eq!(stored.block.header().timestamp, 1_000);
+    assert_eq!(stored.qc.block_hash, block.hash());
 }
 
 #[test]

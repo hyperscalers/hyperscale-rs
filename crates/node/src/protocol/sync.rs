@@ -13,13 +13,12 @@
 //! Production: `SyncManager` wraps this, maps outputs to tokio tasks.
 //! Simulation: feeds inputs/outputs synchronously via event queue.
 
-use hyperscale_core::FetchedBlock;
 use hyperscale_execution::WAVE_TIMEOUT_BLOCKS;
 use hyperscale_messages::request::GetBlockRequest;
 use hyperscale_messages::response::GetBlockResponse;
 use hyperscale_metrics as metrics;
 use hyperscale_storage::ChainReader;
-use hyperscale_types::{Block, Hash, Provision, QuorumCertificate};
+use hyperscale_types::{CertifiedBlock, Hash, Provision};
 use quick_cache::sync::Cache as QuickCache;
 use serde::Serialize;
 use std::cmp::Reverse;
@@ -109,7 +108,7 @@ pub enum SyncInput {
     /// `None` means the peer did not have the block.
     BlockResponseReceived {
         height: u64,
-        block: Option<Box<FetchedBlock>>,
+        block: Option<Box<CertifiedBlock>>,
     },
     /// A block fetch failed after all retries.
     BlockFetchFailed { height: u64 },
@@ -125,10 +124,7 @@ pub enum SyncOutput {
     /// choose between `Block::Live` and `Block::Sealed`.
     FetchBlock { height: u64, target_height: u64 },
     /// A validated block is ready to deliver to BFT.
-    DeliverBlock {
-        block: Box<Block>,
-        qc: Box<QuorumCertificate>,
-    },
+    DeliverBlock { certified: Box<CertifiedBlock> },
     /// Sync is complete (reached target).
     SyncComplete { height: u64 },
 }
@@ -230,12 +226,12 @@ impl SyncProtocol {
     fn handle_block_response(
         &mut self,
         height: u64,
-        response: Option<FetchedBlock>,
+        response: Option<CertifiedBlock>,
     ) -> Vec<SyncOutput> {
         self.heights_in_flight.remove(&height);
 
         match response {
-            Some(FetchedBlock { block, qc }) => {
+            Some(CertifiedBlock { block, qc }) => {
                 // Validate
                 if block.height().0 != height {
                     warn!(
@@ -266,9 +262,9 @@ impl SyncProtocol {
                 trace!(height, "Valid sync block received");
                 metrics::record_sync_block_downloaded();
                 metrics::record_sync_block_verified();
+                let certified = CertifiedBlock::new_unchecked(block, qc);
                 let mut outputs = vec![SyncOutput::DeliverBlock {
-                    block: Box::new(block),
-                    qc: Box::new(qc),
+                    certified: Box::new(certified),
                 }];
                 outputs.extend(self.emit_fetch_outputs());
                 outputs
@@ -418,7 +414,7 @@ pub fn serve_block_request(
         req.height.0 + WAVE_TIMEOUT_BLOCKS > req.target_height.0 && !provision_hashes.is_empty();
 
     if !needs_live {
-        return GetBlockResponse::found(block, qc);
+        return GetBlockResponse::found(CertifiedBlock::new_unchecked(block, qc));
     }
 
     let resolved: Option<Vec<Arc<Provision>>> = provision_hashes
@@ -434,7 +430,10 @@ pub fn serve_block_request(
         return GetBlockResponse::not_found();
     };
 
-    GetBlockResponse::found(block.into_live(provisions), qc)
+    GetBlockResponse::found(CertifiedBlock::new_unchecked(
+        block.into_live(provisions),
+        qc,
+    ))
 }
 
 #[cfg(test)]

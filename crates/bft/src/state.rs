@@ -57,7 +57,7 @@ pub struct BftMemoryStats {
 /// Production uses ValidatorId (from message signatures) and PeerId (libp2p).
 pub type NodeIndex = u32;
 use hyperscale_types::{
-    Block, BlockHeader, BlockHeight, BlockManifest, BlockVote, Bls12381G1PublicKey,
+    Block, BlockHeader, BlockHeight, BlockManifest, BlockVote, Bls12381G1PublicKey, CertifiedBlock,
     CommittedBlockHeader, FinalizedWave, Hash, Provision, QuorumCertificate, ReadyTransactions,
     RoutableTransaction, ShardGroupId, TopologySnapshot, ValidatorId, VotePower,
 };
@@ -584,10 +584,9 @@ impl BftState {
     pub fn on_sync_block_ready_to_apply(
         &mut self,
         topology: &TopologySnapshot,
-        block: Block,
-        qc: QuorumCertificate,
+        certified: CertifiedBlock,
     ) -> Vec<Action> {
-        let block_height = block.height().0;
+        let block_height = certified.block.height().0;
 
         // Ignore stale blocks that have already been committed.
         // Late-arriving sync blocks can arrive after sync completes.
@@ -601,7 +600,7 @@ impl BftState {
             return vec![];
         }
 
-        self.on_synced_block_ready(topology, block, qc)
+        self.on_synced_block_ready(topology, certified)
     }
 
     /// Handle sync complete (from runner via Event::SyncComplete).
@@ -3268,18 +3267,17 @@ impl BftState {
     ///
     /// Blocks may arrive out of order from concurrent fetches. Out-of-order blocks
     /// are buffered and processed once earlier blocks complete verification.
-    #[instrument(skip(self, block, qc), fields(
-        height = block.height().0,
-        block_hash = ?block.hash()
+    #[instrument(skip(self, certified), fields(
+        height = certified.block.height().0,
+        block_hash = ?certified.block.hash()
     ))]
     fn on_synced_block_ready(
         &mut self,
         topology: &TopologySnapshot,
-        block: Block,
-        qc: QuorumCertificate,
+        certified: CertifiedBlock,
     ) -> Vec<Action> {
-        let block_hash = block.hash();
-        let height = block.height().0;
+        let block_hash = certified.block.hash();
+        let height = certified.block.height().0;
 
         info!(
             height,
@@ -3299,14 +3297,9 @@ impl BftState {
             return vec![];
         }
 
-        // Verify QC matches block (do this early, before buffering)
-        if qc.block_hash != block_hash {
-            warn!(
-                "Synced block QC mismatch: block_hash {:?} != qc.block_hash {:?}",
-                block_hash, qc.block_hash
-            );
-            return vec![];
-        }
+        // The CertifiedBlock pairing invariant is enforced at construction
+        // (sync protocol verifies `qc.block_hash == block.hash()` before
+        // wrapping). No redundant check needed here.
 
         // Check if we already have this block pending or buffered
         if self.sync.has_pending_verification(&block_hash) {
@@ -3328,14 +3321,14 @@ impl BftState {
         // Check if this block is the next one we need
         if height == next_needed {
             // This is exactly what we need - submit for verification immediately
-            return self.submit_synced_block_for_verification(topology, block, qc);
+            return self.submit_synced_block_for_verification(topology, certified);
         }
 
         // Block is not the next sequential height. Check if we should buffer it
         // or if we already have what we need and should try draining buffers.
         if height > next_needed {
             // Future block - buffer it for later
-            self.sync.buffer_block(height, block, qc);
+            self.sync.buffer_block(height, certified);
 
             // Check if we can drain any buffered blocks starting from next_needed
             return self.try_drain_buffered_synced_blocks(topology);
@@ -3358,24 +3351,24 @@ impl BftState {
     fn submit_synced_block_for_verification(
         &mut self,
         topology: &TopologySnapshot,
-        block: Block,
-        qc: QuorumCertificate,
+        certified: CertifiedBlock,
     ) -> Vec<Action> {
-        let block_hash = block.hash();
-        let height = block.height().0;
+        let block_hash = certified.block.hash();
+        let height = certified.block.height().0;
 
         // Genesis QC doesn't need signature verification
-        if qc.is_genesis() {
+        if certified.qc.is_genesis() {
             debug!(height, "Synced block has genesis QC, applying directly");
-            return self.apply_synced_block(topology, block, qc);
+            return self.apply_synced_block(topology, certified);
         }
 
         // Collect public keys for QC verification
-        let Some(public_keys) = self.collect_qc_signer_keys(topology, &qc) else {
+        let Some(public_keys) = self.collect_qc_signer_keys(topology, &certified.qc) else {
             warn!("Failed to collect public keys for synced block QC verification");
             return vec![];
         };
 
+        let qc = certified.qc.clone();
         info!(
             height,
             block_hash = ?block_hash,
@@ -3384,8 +3377,7 @@ impl BftState {
         );
 
         // Store pending verification info via SyncManager
-        self.sync
-            .track_pending_verification(block_hash, block, qc.clone());
+        self.sync.track_pending_verification(block_hash, certified);
 
         // Delegate verification to runner
         vec![Action::VerifyQcSignature {
@@ -3424,8 +3416,8 @@ impl BftState {
 
         // Drain buffered blocks from the SyncManager
         let blocks = self.sync.drain_buffered(start_height, slots_available);
-        for (block, qc) in blocks {
-            actions.extend(self.submit_synced_block_for_verification(topology, block, qc));
+        for certified in blocks {
+            actions.extend(self.submit_synced_block_for_verification(topology, certified));
         }
 
         actions
@@ -3441,9 +3433,9 @@ impl BftState {
     fn apply_synced_block(
         &mut self,
         topology: &TopologySnapshot,
-        block: Block,
-        qc: QuorumCertificate,
+        certified: CertifiedBlock,
     ) -> Vec<Action> {
+        let CertifiedBlock { block, qc } = certified;
         let block_hash = block.hash();
         let height = block.height().0;
 
@@ -3549,12 +3541,12 @@ impl BftState {
                 .log_verification_state(self.committed_height, next_height);
 
             // Take the next verified block at the expected height
-            let Some((block, qc)) = self.sync.take_verified_at_height(next_height) else {
+            let Some(certified) = self.sync.take_verified_at_height(next_height) else {
                 info!(next_height, "No verified block at next height - stopping");
                 break;
             };
 
-            actions.extend(self.apply_synced_block(topology, block, qc));
+            actions.extend(self.apply_synced_block(topology, certified));
         }
 
         // After applying blocks, drain more buffered blocks for parallel verification
@@ -7691,7 +7683,8 @@ mod tests {
         };
 
         // Should return empty actions since block is stale
-        let actions = state.on_sync_block_ready_to_apply(&topology, block, qc);
+        let certified = CertifiedBlock::new_unchecked(block, qc);
+        let actions = state.on_sync_block_ready_to_apply(&topology, certified);
         assert!(actions.is_empty(), "Stale sync block should be ignored");
 
         // Should NOT have set syncing flag
@@ -8423,7 +8416,8 @@ mod tests {
             weighted_timestamp_ms: 1000,
         };
 
-        let actions = state.apply_synced_block(&topology, block, qc);
+        let certified = CertifiedBlock::new_unchecked(block, qc);
+        let actions = state.apply_synced_block(&topology, certified);
 
         assert!(
             actions.is_empty(),

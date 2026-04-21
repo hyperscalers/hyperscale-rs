@@ -10,7 +10,7 @@ use hyperscale_storage::{
     StateRootHash,
 };
 use hyperscale_types::{
-    Block, BlockHeight, ExecutionCertificate, ExecutionMetadata, Hash, LocalReceipt,
+    BlockHeight, CertifiedBlock, ExecutionCertificate, ExecutionMetadata, Hash, LocalReceipt,
     QuorumCertificate, RoutableTransaction, ShardGroupId, WaveCertificate,
 };
 use std::collections::{BTreeMap, HashMap};
@@ -96,7 +96,7 @@ impl SharedState {
 /// All consensus-related metadata bundled into a single RwLock.
 pub(crate) struct ConsensusState {
     /// Committed blocks indexed by height.
-    pub blocks: BTreeMap<BlockHeight, (Block, QuorumCertificate)>,
+    pub blocks: BTreeMap<BlockHeight, CertifiedBlock>,
     /// Committed height.
     pub committed_height: BlockHeight,
     /// Committed block hash.

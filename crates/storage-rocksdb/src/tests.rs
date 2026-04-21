@@ -183,10 +183,10 @@ fn test_block_storage_and_retrieval() {
 
     commit_empty(&storage, &block, &qc);
 
-    let (stored_block, stored_qc) = storage.get_block(BlockHeight(1)).unwrap();
-    assert_eq!(stored_block.height(), BlockHeight(1));
-    assert_eq!(stored_block.header().timestamp, 1_000);
-    assert_eq!(stored_qc.block_hash, block.hash());
+    let stored = storage.get_block(BlockHeight(1)).unwrap();
+    assert_eq!(stored.block.height(), BlockHeight(1));
+    assert_eq!(stored.block.header().timestamp, 1_000);
+    assert_eq!(stored.qc.block_hash, block.hash());
 }
 
 #[test]
@@ -202,9 +202,9 @@ fn test_block_range_retrieval() {
 
     let blocks = storage.get_blocks_range(BlockHeight(2), BlockHeight(5));
     assert_eq!(blocks.len(), 3);
-    assert_eq!(blocks[0].0.height(), BlockHeight(2));
-    assert_eq!(blocks[1].0.height(), BlockHeight(3));
-    assert_eq!(blocks[2].0.height(), BlockHeight(4));
+    assert_eq!(blocks[0].block.height(), BlockHeight(2));
+    assert_eq!(blocks[1].block.height(), BlockHeight(3));
+    assert_eq!(blocks[2].block.height(), BlockHeight(4));
 }
 
 #[test]
@@ -735,11 +735,11 @@ fn test_blocks_survive_reopen() {
     {
         let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
 
-        let (block, qc) = storage
+        let stored = storage
             .get_block(BlockHeight(1))
             .expect("block should survive reopen");
-        assert_eq!(block.height(), BlockHeight(1));
-        assert_eq!(qc.height, BlockHeight(1));
+        assert_eq!(stored.block.height(), BlockHeight(1));
+        assert_eq!(stored.qc.height, BlockHeight(1));
     }
 }
 

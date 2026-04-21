@@ -732,7 +732,7 @@ mod tests {
         fn get_block(
             &self,
             _height: hyperscale_types::BlockHeight,
-        ) -> Option<(hyperscale_types::Block, hyperscale_types::QuorumCertificate)> {
+        ) -> Option<hyperscale_types::CertifiedBlock> {
             None
         }
         fn committed_height(&self) -> hyperscale_types::BlockHeight {

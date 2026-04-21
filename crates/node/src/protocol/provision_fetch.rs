@@ -400,8 +400,8 @@ pub fn serve_provision_request(
     num_shards: u64,
     req: GetProvisionRequest,
 ) -> GetProvisionResponse {
-    let (block, _qc) = match storage.get_block(req.block_height) {
-        Some(pair) => pair,
+    let block = match storage.get_block(req.block_height) {
+        Some(certified) => certified.block,
         None => {
             warn!(
                 block_height = req.block_height.0,

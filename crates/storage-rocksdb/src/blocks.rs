@@ -5,8 +5,8 @@ use crate::core::RocksDbStorage;
 
 use hyperscale_metrics as metrics;
 use hyperscale_types::{
-    Block, BlockHeight, BlockMetadata, FinalizedWave, Hash, QuorumCertificate, RoutableTransaction,
-    WaveCertificate,
+    Block, BlockHeight, BlockMetadata, CertifiedBlock, FinalizedWave, Hash, QuorumCertificate,
+    RoutableTransaction, WaveCertificate,
 };
 use rocksdb::{WriteBatch, WriteOptions};
 use std::sync::Arc;
@@ -20,16 +20,12 @@ impl RocksDbStorage {
     /// Returns blocks in ascending height order. Uses `get_block_denormalized`
     /// for each height to properly reconstruct blocks from metadata + individual
     /// transaction/certificate entries.
-    pub fn get_blocks_range(
-        &self,
-        from: BlockHeight,
-        to: BlockHeight,
-    ) -> Vec<(Block, QuorumCertificate)> {
+    pub fn get_blocks_range(&self, from: BlockHeight, to: BlockHeight) -> Vec<CertifiedBlock> {
         let mut result = Vec::new();
         let mut h = from.0;
         while h < to.0 {
-            if let Some(block_qc) = self.get_block_denormalized(BlockHeight(h)) {
-                result.push(block_qc);
+            if let Some(certified) = self.get_block_denormalized(BlockHeight(h)) {
+                result.push(certified);
             }
             h += 1;
         }
@@ -125,10 +121,7 @@ impl RocksDbStorage {
     /// Returns `None` if the block metadata is not found, or if any referenced
     /// transactions or certificates are missing. This ensures sync responses
     /// always contain complete, self-contained blocks.
-    pub(crate) fn get_block_denormalized(
-        &self,
-        height: BlockHeight,
-    ) -> Option<(Block, QuorumCertificate)> {
+    pub(crate) fn get_block_denormalized(&self, height: BlockHeight) -> Option<CertifiedBlock> {
         let start = Instant::now();
 
         // 1. Get block metadata
@@ -192,7 +185,7 @@ impl RocksDbStorage {
         metrics::record_storage_read(elapsed);
         metrics::record_storage_operation("get_block_denormalized", elapsed);
 
-        Some((block, metadata.qc))
+        Some(CertifiedBlock::new_unchecked(block, metadata.qc))
     }
 
     /// Get block metadata only (without fetching transactions/certificates).

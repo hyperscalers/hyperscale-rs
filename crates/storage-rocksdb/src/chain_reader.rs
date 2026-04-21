@@ -5,13 +5,13 @@ use crate::typed_cf::TypedCf;
 
 use hyperscale_storage::BlockForSync;
 use hyperscale_types::{
-    Block, BlockHeight, ExecutionCertificate, Hash, QuorumCertificate, RoutableTransaction,
-    ShardGroupId, WaveCertificate,
+    BlockHeight, CertifiedBlock, ExecutionCertificate, Hash, QuorumCertificate,
+    RoutableTransaction, ShardGroupId, WaveCertificate,
 };
 use std::sync::Arc;
 
 impl hyperscale_storage::ChainReader for RocksDbStorage {
-    fn get_block(&self, height: BlockHeight) -> Option<(Block, QuorumCertificate)> {
+    fn get_block(&self, height: BlockHeight) -> Option<CertifiedBlock> {
         self.get_block_denormalized(height)
     }
 

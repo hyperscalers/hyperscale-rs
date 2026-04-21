@@ -4,7 +4,7 @@
 //! synced block QC verifications. BftState owns this as a field and
 //! delegates sync-specific bookkeeping here.
 
-use hyperscale_types::{Block, Hash, QuorumCertificate};
+use hyperscale_types::{CertifiedBlock, Hash};
 use std::collections::{BTreeMap, HashMap};
 use tracing::{debug, info, warn};
 
@@ -14,10 +14,8 @@ use tracing::{debug, info, warn};
 /// applying it to our state.
 #[derive(Debug, Clone)]
 pub(crate) struct PendingSyncedBlockVerification {
-    /// The synced block awaiting QC verification.
-    pub block: Block,
-    /// The QC that certifies this block.
-    pub qc: QuorumCertificate,
+    /// The synced block + certifying QC awaiting QC-signature verification.
+    pub certified: CertifiedBlock,
     /// Whether the QC signature has been verified.
     pub verified: bool,
 }
@@ -43,8 +41,8 @@ pub(crate) struct SyncManager {
     sync_applied_height: u64,
 
     /// Buffered out-of-order synced blocks waiting for earlier blocks.
-    /// Maps height -> (Block, QC).
-    buffered_synced_blocks: BTreeMap<u64, (Block, QuorumCertificate)>,
+    /// Maps height -> CertifiedBlock.
+    buffered_synced_blocks: BTreeMap<u64, CertifiedBlock>,
 
     /// Synced blocks pending QC signature verification.
     /// Maps block_hash -> pending synced block info.
@@ -120,13 +118,13 @@ impl SyncManager {
     pub fn has_pending_at_height(&self, height: u64) -> bool {
         self.pending_synced_block_verifications
             .values()
-            .any(|p| p.block.height().0 == height)
+            .any(|p| p.certified.block.height().0 == height)
     }
 
     /// Buffer a future synced block for later processing.
-    pub fn buffer_block(&mut self, height: u64, block: Block, qc: QuorumCertificate) {
+    pub fn buffer_block(&mut self, height: u64, certified: CertifiedBlock) {
         debug!(height, "Buffering future synced block for later");
-        self.buffered_synced_blocks.insert(height, (block, qc));
+        self.buffered_synced_blocks.insert(height, certified);
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -137,13 +135,8 @@ impl SyncManager {
     ///
     /// Callers should check `has_pending_verification` first to avoid
     /// silently overwriting an in-flight verification.
-    pub fn track_pending_verification(
-        &mut self,
-        block_hash: Hash,
-        block: Block,
-        qc: QuorumCertificate,
-    ) {
-        let height = block.height().0;
+    pub fn track_pending_verification(&mut self, block_hash: Hash, certified: CertifiedBlock) {
+        let height = certified.block.height().0;
         if self
             .pending_synced_block_verifications
             .contains_key(&block_hash)
@@ -162,8 +155,7 @@ impl SyncManager {
         self.pending_synced_block_verifications.insert(
             block_hash,
             PendingSyncedBlockVerification {
-                block,
-                qc,
+                certified,
                 verified: false,
             },
         );
@@ -185,7 +177,7 @@ impl SyncManager {
         if !valid {
             warn!(
                 block_hash = ?block_hash,
-                height = pending.block.height().0,
+                height = pending.certified.block.height().0,
                 "Synced block QC signature verification FAILED - rejecting block"
             );
             // Only this block is removed (already done above). Other pending
@@ -197,7 +189,7 @@ impl SyncManager {
 
         info!(
             block_hash = ?block_hash,
-            height = pending.block.height().0,
+            height = pending.certified.block.height().0,
             "Synced block QC verified successfully"
         );
 
@@ -229,13 +221,13 @@ impl SyncManager {
 
     /// Take the next consecutive verified block at the given height.
     ///
-    /// Returns the block and QC if a verified block exists at `height`,
+    /// Returns the certified block if a verified entry exists at `height`,
     /// otherwise None.
-    pub fn take_verified_at_height(&mut self, height: u64) -> Option<(Block, QuorumCertificate)> {
+    pub fn take_verified_at_height(&mut self, height: u64) -> Option<CertifiedBlock> {
         let block_hash = self
             .pending_synced_block_verifications
             .iter()
-            .find(|(_, p)| p.verified && p.block.height().0 == height)
+            .find(|(_, p)| p.verified && p.certified.block.height().0 == height)
             .map(|(h, _)| *h)?;
 
         let pending = self
@@ -243,7 +235,7 @@ impl SyncManager {
             .remove(&block_hash)
             .unwrap();
 
-        Some((pending.block, pending.qc))
+        Some(pending.certified)
     }
 
     /// Log the current state of pending verifications (for debugging).
@@ -252,13 +244,13 @@ impl SyncManager {
             .pending_synced_block_verifications
             .values()
             .filter(|p| p.verified)
-            .map(|p| p.block.height().0)
+            .map(|p| p.certified.block.height().0)
             .collect();
         let unverified_heights: Vec<_> = self
             .pending_synced_block_verifications
             .values()
             .filter(|p| !p.verified)
-            .map(|p| p.block.height().0)
+            .map(|p| p.certified.block.height().0)
             .collect();
         info!(
             committed_height,
@@ -277,11 +269,7 @@ impl SyncManager {
     ///
     /// Returns blocks in sequential order starting from `start_height`,
     /// up to `max_count` blocks.
-    pub fn drain_buffered(
-        &mut self,
-        start_height: u64,
-        max_count: usize,
-    ) -> Vec<(Block, QuorumCertificate)> {
+    pub fn drain_buffered(&mut self, start_height: u64, max_count: usize) -> Vec<CertifiedBlock> {
         let mut result = Vec::new();
         let mut height = start_height;
 
@@ -302,7 +290,7 @@ impl SyncManager {
     pub fn highest_pending_height(&self, committed_height: u64) -> u64 {
         self.pending_synced_block_verifications
             .values()
-            .map(|p| p.block.height().0)
+            .map(|p| p.certified.block.height().0)
             .max()
             .unwrap_or(committed_height)
     }
@@ -322,7 +310,7 @@ impl SyncManager {
             .retain(|height, _| *height > committed_height);
 
         self.pending_synced_block_verifications
-            .retain(|_, pending| pending.block.height().0 > committed_height);
+            .retain(|_, pending| pending.certified.block.height().0 > committed_height);
     }
 
     /// Number of buffered out-of-order synced blocks.

@@ -238,14 +238,14 @@ where
                     use hyperscale_messages::response::GetCommittedBlockHeaderResponse;
 
                     // Look up the committed block at the requested height.
-                    let block_and_qc = storage
+                    let certified = storage
                         .get_block(hyperscale_types::BlockHeight(req.height.0));
 
-                    match block_and_qc {
-                        Some((block, qc)) => {
+                    match certified {
+                        Some(certified) => {
                             let committed = hyperscale_types::CommittedBlockHeader::new(
-                                block.header().clone(),
-                                qc,
+                                certified.block.header().clone(),
+                                certified.qc,
                             );
                             GetCommittedBlockHeaderResponse {
                                 header: Some(committed),

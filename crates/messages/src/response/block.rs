@@ -1,55 +1,46 @@
 //! Block fetch response.
 
-use hyperscale_types::{Block, MessagePriority, NetworkMessage, QuorumCertificate};
+use hyperscale_types::{CertifiedBlock, MessagePriority, NetworkMessage};
 use sbor::prelude::BasicSbor;
 
-/// Response to a block fetch request containing the full Block and its QC.
+/// Response to a block fetch request.
 ///
-/// ECs are carried inside `Block.certificates[i].wave_certificate.execution_certificates`
-/// and receipts are carried inline as part of `Block.certificates[i].receipts`.
+/// When found, carries the block together with the QC that certifies it
+/// (`CertifiedBlock`). ECs are inside
+/// `certified.block.certificates[i].wave_certificate.execution_certificates`
+/// and receipts are inline in `certified.block.certificates[i].receipts`.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct GetBlockResponse {
-    /// The requested block (None if not found).
-    pub block: Option<Block>,
-    /// The QC that certifies this block (None if block not found or at tip).
-    pub qc: Option<QuorumCertificate>,
+    /// The requested block + certifying QC (None if not found).
+    pub certified: Option<CertifiedBlock>,
 }
 
 impl GetBlockResponse {
     /// Create a response with a found block and its certifying QC.
-    pub fn found(block: Block, qc: QuorumCertificate) -> Self {
+    pub fn found(certified: CertifiedBlock) -> Self {
         Self {
-            block: Some(block),
-            qc: Some(qc),
+            certified: Some(certified),
         }
     }
 
     /// Create a response for a block not found.
     pub fn not_found() -> Self {
-        Self {
-            block: None,
-            qc: None,
-        }
+        Self { certified: None }
     }
 
     /// Check if the block was found.
     pub fn has_block(&self) -> bool {
-        self.block.is_some()
+        self.certified.is_some()
     }
 
-    /// Get the block if present.
-    pub fn block(&self) -> Option<&Block> {
-        self.block.as_ref()
+    /// Get the certified block if present.
+    pub fn certified(&self) -> Option<&CertifiedBlock> {
+        self.certified.as_ref()
     }
 
-    /// Get the QC if present.
-    pub fn qc(&self) -> Option<&QuorumCertificate> {
-        self.qc.as_ref()
-    }
-
-    /// Consume and return the block and QC.
-    pub fn into_parts(self) -> (Option<Block>, Option<QuorumCertificate>) {
-        (self.block, self.qc)
+    /// Consume and return the certified block.
+    pub fn into_certified(self) -> Option<CertifiedBlock> {
+        self.certified
     }
 }
 
@@ -68,8 +59,8 @@ impl NetworkMessage for GetBlockResponse {
 mod tests {
     use super::*;
     use hyperscale_types::{
-        test_utils::test_transaction, zero_bls_signature, BlockHeader, BlockHeight, Hash,
-        ShardGroupId, SignerBitfield, ValidatorId,
+        test_utils::test_transaction, zero_bls_signature, Block, BlockHeader, BlockHeight, Hash,
+        QuorumCertificate, ShardGroupId, SignerBitfield, ValidatorId,
     };
     use std::collections::BTreeMap;
 
@@ -118,11 +109,11 @@ mod tests {
     fn test_block_response_found() {
         let block = create_test_block();
         let qc = create_test_qc(&block);
-        let response = GetBlockResponse::found(block.clone(), qc.clone());
+        let certified = CertifiedBlock::new_unchecked(block, qc);
+        let response = GetBlockResponse::found(certified.clone());
 
         assert!(response.has_block());
-        assert_eq!(response.block(), Some(&block));
-        assert_eq!(response.qc(), Some(&qc));
+        assert_eq!(response.certified(), Some(&certified));
     }
 
     #[test]
@@ -130,18 +121,16 @@ mod tests {
         let response = GetBlockResponse::not_found();
 
         assert!(!response.has_block());
-        assert_eq!(response.block(), None);
-        assert_eq!(response.qc(), None);
+        assert_eq!(response.certified(), None);
     }
 
     #[test]
-    fn test_block_response_into_parts() {
+    fn test_block_response_into_certified() {
         let block = create_test_block();
         let qc = create_test_qc(&block);
-        let response = GetBlockResponse::found(block.clone(), qc.clone());
+        let certified = CertifiedBlock::new_unchecked(block, qc);
+        let response = GetBlockResponse::found(certified.clone());
 
-        let (extracted_block, extracted_qc) = response.into_parts();
-        assert_eq!(extracted_block, Some(block));
-        assert_eq!(extracted_qc, Some(qc));
+        assert_eq!(response.into_certified(), Some(certified));
     }
 }

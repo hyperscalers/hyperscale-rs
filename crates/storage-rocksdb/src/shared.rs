@@ -17,8 +17,8 @@ use hyperscale_storage::{
     SubstateStore,
 };
 use hyperscale_types::{
-    Block, BlockHeight, Hash, NodeId, QuorumCertificate, RoutableTransaction, ShardGroupId,
-    WaveCertificate,
+    BlockHeight, CertifiedBlock, Hash, NodeId, QuorumCertificate, RoutableTransaction,
+    ShardGroupId, WaveCertificate,
 };
 use std::sync::Arc;
 
@@ -188,7 +188,7 @@ impl hyperscale_storage::ChainWriter for SharedStorage {
 }
 
 impl hyperscale_storage::ChainReader for SharedStorage {
-    fn get_block(&self, height: BlockHeight) -> Option<(Block, QuorumCertificate)> {
+    fn get_block(&self, height: BlockHeight) -> Option<CertifiedBlock> {
         self.0.get_block(height)
     }
 

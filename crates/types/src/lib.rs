@@ -23,6 +23,7 @@ mod signing;
 
 // Consensus types
 mod block;
+mod certified_block;
 mod epoch;
 mod quorum_certificate;
 mod receipt;
@@ -80,6 +81,7 @@ pub use block::{
     compute_transaction_root, Block, BlockHeader, BlockManifest, BlockMetadata, BlockVote,
     CommittedBlockHeader,
 };
+pub use certified_block::{CertifiedBlock, CertifiedBlockHashMismatch};
 pub use quorum_certificate::QuorumCertificate;
 pub use receipt::{
     ApplicationEvent, ExecutionMetadata, FeeSummary, GlobalReceipt, LocalExecutionEntry,

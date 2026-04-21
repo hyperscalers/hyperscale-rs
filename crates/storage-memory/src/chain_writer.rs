@@ -4,7 +4,7 @@ use crate::core::SimStorage;
 use crate::state::apply_updates;
 
 use hyperscale_storage::{ChainWriter, DatabaseUpdates, JmtSnapshot};
-use hyperscale_types::{Hash, ReceiptBundle};
+use hyperscale_types::{CertifiedBlock, Hash, ReceiptBundle};
 use std::sync::Arc;
 
 /// Precomputed commit work for a SimStorage block commit.
@@ -148,7 +148,7 @@ impl ChainWriter for SimStorage {
                 }
                 c.blocks.insert(
                     block.height(),
-                    ((*block).clone().into_sealed(), (*qc).clone()),
+                    CertifiedBlock::new_unchecked((*block).clone().into_sealed(), (*qc).clone()),
                 );
                 for fw in block.certificates() {
                     let cert = &fw.certificate;
@@ -263,7 +263,7 @@ impl SimStorage {
             }
             c.blocks.insert(
                 block.height(),
-                ((**block).clone().into_sealed(), (**qc).clone()),
+                CertifiedBlock::new_unchecked((**block).clone().into_sealed(), (**qc).clone()),
             );
             for fw in block.certificates() {
                 let cert = &fw.certificate;

@@ -4,8 +4,8 @@
 //! All methods take `&self` — implementations use interior mutability.
 
 use hyperscale_types::{
-    Block, BlockHeight, ExecutionCertificate, Hash, LocalReceipt, QuorumCertificate,
-    RoutableTransaction, ShardGroupId, WaveCertificate,
+    Block, BlockHeight, CertifiedBlock, ExecutionCertificate, Hash, LocalReceipt,
+    QuorumCertificate, RoutableTransaction, ShardGroupId, WaveCertificate,
 };
 use std::sync::Arc;
 
@@ -34,7 +34,7 @@ pub struct BlockForSync {
 /// is sufficient (nodes sync past voted heights on restart).
 pub trait ChainReader: Send + Sync + 'static {
     /// Get a committed block by height.
-    fn get_block(&self, height: BlockHeight) -> Option<(Block, QuorumCertificate)>;
+    fn get_block(&self, height: BlockHeight) -> Option<CertifiedBlock>;
 
     /// Get the highest committed block height.
     fn committed_height(&self) -> BlockHeight;

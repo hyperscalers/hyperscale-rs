@@ -53,13 +53,7 @@ where
                         GetBlockRequest::new(BlockHeight(height), BlockHeight(target_height)),
                         Box::new(move |result| match result {
                             Ok(resp) => {
-                                let (block_opt, qc_opt) = resp.into_parts();
-                                let block = match (block_opt, qc_opt) {
-                                    (Some(block), Some(qc)) => {
-                                        Some(Box::new(hyperscale_core::FetchedBlock { block, qc }))
-                                    }
-                                    _ => None,
-                                };
+                                let block = resp.into_certified().map(Box::new);
                                 let _ =
                                     es.send(NodeInput::SyncBlockResponseReceived { height, block });
                             }
@@ -69,12 +63,11 @@ where
                         }),
                     );
                 }
-                SyncOutput::DeliverBlock { block, qc } => {
+                SyncOutput::DeliverBlock { certified } => {
                     metrics::record_sync_block_received_by_bft();
                     metrics::record_sync_block_submitted_for_verification();
                     self.feed_event(ProtocolEvent::SyncBlockReadyToApply {
-                        block: *block,
-                        qc: *qc,
+                        certified: *certified,
                     });
                 }
                 SyncOutput::SyncComplete { height } => {

@@ -6,10 +6,10 @@
 //! boundary between protocol logic and I/O orchestration.
 
 use hyperscale_types::{
-    Block, BlockHeader, BlockHeight, BlockManifest, BlockVote, CommittedBlockHeader, EpochConfig,
-    EpochId, ExecutionCertificate, ExecutionVote, FinalizedWave, Hash, Provision,
-    QuorumCertificate, RoutableTransaction, ShardGroupId, TxOutcome, ValidatorId, WaveCertificate,
-    WaveId,
+    Block, BlockHeader, BlockHeight, BlockManifest, BlockVote, CertifiedBlock,
+    CommittedBlockHeader, EpochConfig, EpochId, ExecutionCertificate, ExecutionVote, FinalizedWave,
+    Hash, Provision, QuorumCertificate, RoutableTransaction, ShardGroupId, TxOutcome, ValidatorId,
+    WaveCertificate, WaveId,
 };
 use std::sync::Arc;
 
@@ -304,7 +304,7 @@ pub enum ProtocolEvent {
     // Sync Delivery (from IoLoop after sync protocol processing)
     // ═══════════════════════════════════════════════════════════════════════
     /// A synced block is ready to be applied to local state.
-    SyncBlockReadyToApply { block: Block, qc: QuorumCertificate },
+    SyncBlockReadyToApply { certified: CertifiedBlock },
 
     /// Sync EC BLS verification completed (async callback from crypto pool).
     SyncEcVerificationComplete { height: u64, valid: bool },
