@@ -308,11 +308,15 @@ impl RemoteHeaderCoordinator {
     /// Handle local block committed — update liveness tracking and check timeouts.
     ///
     /// Call this on each local block commit. It:
-    /// 1. Updates local committed height
+    /// 1. Updates local committed height from the block header
     /// 2. Seeds expected headers for any newly-discovered remote shards
     /// 3. Checks for timed-out remote shards and emits fallback requests
-    pub fn on_block_committed(&mut self, topology: &TopologySnapshot) -> Vec<Action> {
-        self.local_committed_height = BlockHeight(self.local_committed_height.0 + 1);
+    pub fn on_block_committed(
+        &mut self,
+        topology: &TopologySnapshot,
+        certified: &hyperscale_types::CertifiedBlock,
+    ) -> Vec<Action> {
+        self.local_committed_height = certified.block.height();
 
         // Seed expected headers for remote shards we haven't seen yet.
         let local_shard = topology.local_shard();

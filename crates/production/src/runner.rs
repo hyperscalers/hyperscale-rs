@@ -710,10 +710,15 @@ impl ProductionRunner {
         // The state machine was created BEFORE genesis bootstrap ran, so it has
         // stale/zero state. We need to sync it with the actual JMT state from
         // genesis so future blocks compute state_root from the correct base.
+        let genesis_qc = hyperscale_types::QuorumCertificate {
+            block_hash: genesis_block.hash(),
+            ..hyperscale_types::QuorumCertificate::genesis()
+        };
+        let genesis_certified =
+            hyperscale_types::CertifiedBlock::new_unchecked(genesis_block, genesis_qc);
         let genesis_commit_output = io_loop.step(NodeInput::Protocol(
             hyperscale_core::ProtocolEvent::BlockCommitted {
-                block_hash: genesis_block.hash(),
-                block: genesis_block,
+                certified: genesis_certified,
             },
         ));
 

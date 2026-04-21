@@ -250,19 +250,18 @@ impl ProvisionCoordinator {
     pub fn on_block_committed(
         &mut self,
         topology: &TopologySnapshot,
-        block: &hyperscale_types::Block,
-        committed_provision_hashes: &[Hash],
+        certified: &hyperscale_types::CertifiedBlock,
     ) -> Vec<Action> {
-        // Update local committed height
+        let block = &certified.block;
         self.local_committed_height = block.height();
 
         // Record provision batches committed in this block, but don't
         // evict them yet — peers catching up within the cross-shard
         // execution window still need them attached to `Block::Live`
         // sync responses. Eviction happens below once they age out.
-        if !committed_provision_hashes.is_empty() {
-            let committed: std::collections::HashSet<Hash> =
-                committed_provision_hashes.iter().copied().collect();
+        let committed: std::collections::HashSet<Hash> =
+            block.provisions().iter().map(|p| p.hash()).collect();
+        if !committed.is_empty() {
             for h in &committed {
                 // Tombstone: prevent re-queueing if duplicate gossip arrives later.
                 self.committed_batch_tombstones
@@ -1235,16 +1234,21 @@ mod tests {
     }
 
     /// Make a minimal Block at the given height for on_block_committed calls.
-    fn make_block(height: u64) -> hyperscale_types::Block {
+    fn make_block(height: u64) -> hyperscale_types::CertifiedBlock {
         let mut header =
             hyperscale_types::BlockHeader::genesis(ShardGroupId(0), ValidatorId(0), Hash::ZERO);
         header.height = BlockHeight(height);
-        hyperscale_types::Block::Live {
+        let block = hyperscale_types::Block::Live {
             header,
             transactions: vec![],
             certificates: vec![],
             provisions: vec![],
-        }
+        };
+        let qc = hyperscale_types::QuorumCertificate {
+            block_hash: block.hash(),
+            ..hyperscale_types::QuorumCertificate::genesis()
+        };
+        hyperscale_types::CertifiedBlock::new_unchecked(block, qc)
     }
 
     #[test]
@@ -1305,13 +1309,13 @@ mod tests {
         // Advance blocks — should not emit before the timeout threshold (10 blocks)
         for h in 1..=9 {
             let block = make_block(h);
-            let actions = coordinator.on_block_committed(&topology, &block, &[]);
+            let actions = coordinator.on_block_committed(&topology, &block);
             assert!(actions.is_empty(), "Should not emit request at height {h}");
         }
 
         // At height 10, age = 10 - 0 = 10 >= PROVISION_FALLBACK_TIMEOUT_BLOCKS → fires
         let block = make_block(10);
-        let actions = coordinator.on_block_committed(&topology, &block, &[]);
+        let actions = coordinator.on_block_committed(&topology, &block);
         assert_eq!(actions.len(), 1);
         assert!(matches!(
             &actions[0],
@@ -1336,12 +1340,12 @@ mod tests {
 
         // Advance past timeout to trigger the one-time request at height 30
         for h in 1..=30 {
-            coordinator.on_block_committed(&topology, &make_block(h), &[]);
+            coordinator.on_block_committed(&topology, &make_block(h));
         }
 
         // Coordinator is fire-and-forget: no further emissions at any height.
         for h in 31..=100 {
-            let actions = coordinator.on_block_committed(&topology, &make_block(h), &[]);
+            let actions = coordinator.on_block_committed(&topology, &make_block(h));
             assert!(
                 actions.is_empty(),
                 "Should never re-emit after initial request (height {h})"
@@ -1360,7 +1364,7 @@ mod tests {
 
         // Advance a few blocks
         for h in 1..=5 {
-            coordinator.on_block_committed(&topology, &make_block(h), &[]);
+            coordinator.on_block_committed(&topology, &make_block(h));
         }
 
         // Batch arrives and is verified before timeout
@@ -1370,7 +1374,7 @@ mod tests {
 
         // Continue past timeout threshold
         for h in 6..=15 {
-            let actions = coordinator.on_block_committed(&topology, &make_block(h), &[]);
+            let actions = coordinator.on_block_committed(&topology, &make_block(h));
             assert!(
                 actions.is_empty(),
                 "Should not request at height {h} (provision already verified)"
@@ -1429,7 +1433,7 @@ mod tests {
         // Advance local well past any old time-based cutoff but short of the
         // orphan threshold. Header stays because its batch hasn't verified yet.
         for h in 1..=(ORPHAN_HEADER_CUTOFF_BLOCKS / 2) {
-            coordinator.on_block_committed(&topology, &make_block(h), &[]);
+            coordinator.on_block_committed(&topology, &make_block(h));
         }
 
         assert_eq!(
@@ -1476,17 +1480,13 @@ mod tests {
 
         // Not yet past the orphan cutoff — still retained.
         for h in 1..=ORPHAN_HEADER_CUTOFF_BLOCKS {
-            coordinator.on_block_committed(&topology, &make_block(h), &[]);
+            coordinator.on_block_committed(&topology, &make_block(h));
         }
         assert_eq!(coordinator.verified_remote_header_count(), 1);
         assert_eq!(coordinator.expected_provisions.len(), 1);
 
         // One past — orphan sweep drops header and expected entry together.
-        coordinator.on_block_committed(
-            &topology,
-            &make_block(ORPHAN_HEADER_CUTOFF_BLOCKS + 1),
-            &[],
-        );
+        coordinator.on_block_committed(&topology, &make_block(ORPHAN_HEADER_CUTOFF_BLOCKS + 1));
         assert_eq!(coordinator.verified_remote_header_count(), 0);
         assert_eq!(coordinator.expected_provisions.len(), 0);
     }

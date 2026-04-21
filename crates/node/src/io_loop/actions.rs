@@ -15,7 +15,7 @@ use hyperscale_engine::Engine;
 use hyperscale_metrics as metrics;
 use hyperscale_network::Network;
 use hyperscale_storage::{ChainReader, ChainWriter, SubstateStore};
-use hyperscale_types::{Block, Hash, QuorumCertificate, ValidatorId};
+use hyperscale_types::{Block, CertifiedBlock, Hash, QuorumCertificate, ValidatorId};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tracing::{debug, trace, warn};
@@ -622,10 +622,11 @@ where
         let persistence_lag = height.0.saturating_sub(self.persisted_height);
         let notify_now = persistence_lag <= Self::MAX_PERSISTENCE_LAG;
         if notify_now {
-            self.feed_event(ProtocolEvent::BlockCommitted {
-                block_hash,
-                block: Arc::unwrap_or_clone(Arc::clone(&commit.block)),
-            });
+            let certified = CertifiedBlock::new_unchecked(
+                Arc::unwrap_or_clone(Arc::clone(&commit.block)),
+                Arc::unwrap_or_clone(Arc::clone(&commit.qc)),
+            );
+            self.feed_event(ProtocolEvent::BlockCommitted { certified });
         } else {
             tracing::debug!(
                 height = height.0,
@@ -774,8 +775,6 @@ where
             )> = Vec::with_capacity(commits.len());
 
             let heights: Vec<u64> = commits.iter().map(|c| c.block.height().0).collect();
-            let block_hashes: Vec<hyperscale_types::Hash> =
-                commits.iter().map(|c| c.block.hash()).collect();
 
             // Wrap commits in Option so we can take() them for deferred notifications.
             let mut commit_slots: Vec<Option<super::PendingCommit>> =
@@ -795,9 +794,12 @@ where
             for (i, _) in heights.iter().enumerate() {
                 if !already_notified[i] {
                     let commit = commit_slots[i].take().unwrap();
+                    let certified = CertifiedBlock::new_unchecked(
+                        Arc::unwrap_or_clone(commit.block),
+                        Arc::unwrap_or_clone(commit.qc),
+                    );
                     let _ = event_tx.send(NodeInput::Protocol(ProtocolEvent::BlockCommitted {
-                        block_hash: block_hashes[i],
-                        block: Arc::unwrap_or_clone(commit.block),
+                        certified,
                     }));
                 }
             }

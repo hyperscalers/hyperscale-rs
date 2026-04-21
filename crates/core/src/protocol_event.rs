@@ -125,7 +125,7 @@ pub enum ProtocolEvent {
     /// durable RocksDB persistence. All event data is carried in-memory
     /// from the action payload. Delegated actions that read substates use
     /// `PendingChain::view_at` to see unpersisted state.
-    BlockCommitted { block_hash: Hash, block: Block },
+    BlockCommitted { certified: CertifiedBlock },
 
     /// A block has been durably persisted to RocksDB.
     ///

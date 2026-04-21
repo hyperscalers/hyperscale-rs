@@ -2,8 +2,8 @@
 
 use hyperscale_core::{Action, FinalizationPhaseTimes, TransactionStatus};
 use hyperscale_types::{
-    Block, BlockHeight, Hash, NodeId, ReadyTransactions, RoutableTransaction, TopologySnapshot,
-    TransactionDecision,
+    BlockHeight, CertifiedBlock, Hash, NodeId, ReadyTransactions, RoutableTransaction,
+    TopologySnapshot, TransactionDecision,
 };
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -468,15 +468,16 @@ impl MempoolState {
     /// 1. Mark committed transactions
     /// 2. Process certificates → mark completed
     /// 3. Process aborts → update status to terminal
-    #[instrument(skip(self, block), fields(
-        height = block.height().0,
-        tx_count = block.transaction_count()
+    #[instrument(skip(self, certified), fields(
+        height = certified.block.height().0,
+        tx_count = certified.block.transaction_count()
     ))]
-    pub fn on_block_committed_full(
+    pub fn on_block_committed(
         &mut self,
         topology: &TopologySnapshot,
-        block: &Block,
+        certified: &CertifiedBlock,
     ) -> Vec<Action> {
+        let block = &certified.block;
         let height = block.height();
         let mut actions = Vec::new();
 
@@ -565,7 +566,7 @@ impl MempoolState {
 
     /// Mark a transaction as terminal in response to a committed wave certificate.
     ///
-    /// Called from `on_block_committed_full` once per tx in `block.certificates`.
+    /// Called from `on_block_committed` once per tx in `block.certificates`.
     /// Emits the terminal status update and evicts/tombstones the entry.
     fn process_certificate_committed(
         &mut self,
@@ -611,34 +612,6 @@ impl MempoolState {
         }
 
         actions
-    }
-
-    /// Mark transactions as committed when block is committed (legacy method).
-    #[deprecated(note = "Use on_block_committed_full instead")]
-    pub fn on_block_committed(&mut self, tx_hashes: &[Hash], height: BlockHeight) {
-        for hash in tx_hashes {
-            // Check if we need to add locked nodes (clone tx first to avoid borrow issues)
-            let should_add_locks = self
-                .pool
-                .get(hash)
-                .is_some_and(|entry| !entry.status.holds_state_lock());
-            let tx_clone = self.pool.get(hash).map(|e| Arc::clone(&e.tx));
-
-            if should_add_locks {
-                if let Some(tx) = tx_clone {
-                    self.add_locked_nodes(&tx);
-                    self.committed_count += 1;
-                    self.in_flight_by_height
-                        .entry(height)
-                        .or_default()
-                        .push(*hash);
-                }
-            }
-
-            if let Some(entry) = self.pool.get_mut(hash) {
-                entry.status = TransactionStatus::Committed(height);
-            }
-        }
     }
 
     /// Record when the local execution certificate was created for a wave's txs.
@@ -1445,6 +1418,17 @@ mod tests {
         }
     }
 
+    /// Pair a test `Block` with a matching zeroed QC so it satisfies the
+    /// `CertifiedBlock` pairing invariant. Tests use this to construct the
+    /// committed-block argument for `on_block_committed`.
+    fn certify(block: Block) -> CertifiedBlock {
+        let qc = QuorumCertificate {
+            block_hash: block.hash(),
+            ..QuorumCertificate::genesis()
+        };
+        CertifiedBlock::new_unchecked(block, qc)
+    }
+
     /// Append a `FinalizedWave` to a test block. The block is reconstructed
     /// because `Block` is an enum — we can't mutate the inner `certificates`
     /// vec directly.
@@ -1505,7 +1489,7 @@ mod tests {
                 TransactionDecision::Aborted,
             )),
         );
-        let actions = mempool.on_block_committed_full(&topology, &commit_block);
+        let actions = mempool.on_block_committed(&topology, &certify(commit_block));
 
         // Should have emitted Completed(Aborted) status
         let aborted_action = actions.iter().find(|a| {
@@ -1545,7 +1529,7 @@ mod tests {
                 TransactionDecision::Accept,
             )),
         );
-        mempool.on_block_committed_full(&topology, &commit_block);
+        mempool.on_block_committed(&topology, &certify(commit_block));
 
         // Transaction should be tombstoned
         assert!(mempool.is_tombstoned(&tx_hash));
@@ -1570,7 +1554,7 @@ mod tests {
                 TransactionDecision::Accept,
             )),
         );
-        mempool.on_block_committed_full(&topology, &commit_block);
+        mempool.on_block_committed(&topology, &certify(commit_block));
 
         // Verify it's tombstoned
         assert!(mempool.is_tombstoned(&tx_hash));
@@ -1601,7 +1585,7 @@ mod tests {
                 TransactionDecision::Accept,
             )),
         );
-        mempool.on_block_committed_full(&topology, &commit_block);
+        mempool.on_block_committed(&topology, &certify(commit_block));
 
         // Try to re-submit - should be rejected (no status emitted)
         let actions = mempool.on_submit_transaction(&topology, Arc::new(tx.clone()));
@@ -1629,7 +1613,7 @@ mod tests {
                 TransactionDecision::Aborted,
             )),
         );
-        mempool.on_block_committed_full(&topology, &commit_block);
+        mempool.on_block_committed(&topology, &certify(commit_block));
 
         // Transaction should be tombstoned
         assert!(mempool.is_tombstoned(&tx_hash));
@@ -1658,7 +1642,7 @@ mod tests {
                     TransactionDecision::Accept,
                 )),
             );
-            mempool.on_block_committed_full(&topology, &commit_block);
+            mempool.on_block_committed(&topology, &certify(commit_block));
         }
 
         // Should have 5 tombstones
@@ -1695,7 +1679,7 @@ mod tests {
                 TransactionDecision::Accept,
             )),
         );
-        mempool.on_block_committed_full(&topology, &commit_block);
+        mempool.on_block_committed(&topology, &certify(commit_block));
 
         // Pool should be empty
         assert_eq!(mempool.len(), 0);

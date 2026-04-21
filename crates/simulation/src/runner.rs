@@ -20,8 +20,8 @@ use hyperscale_storage_memory::SimStorage;
 use hyperscale_topology::TopologyState;
 use hyperscale_types::{
     bls_keypair_from_seed, shard_for_node, Bls12381G1PrivateKey, Bls12381G1PublicKey,
-    Hash as TxHash, NodeId, ShardGroupId, TransactionStatus, ValidatorId, ValidatorInfo,
-    ValidatorSet,
+    CertifiedBlock, Hash as TxHash, NodeId, ShardGroupId, TransactionStatus, ValidatorId,
+    ValidatorInfo, ValidatorSet,
 };
 use radix_common::network::NetworkDefinition;
 use rand::SeedableRng;
@@ -514,10 +514,17 @@ impl SimulationRunner {
                 self.drain_node_io(node_index);
                 self.process_step_output(node_index, output);
 
-                // Sync state machine with actual JMT state after genesis bootstrap
-                let genesis_commit_event = NodeInput::Protocol(ProtocolEvent::BlockCommitted {
+                // Sync state machine with actual JMT state after genesis bootstrap.
+                // Pair the genesis block with a zeroed QC whose `block_hash` matches
+                // so the CertifiedBlock pairing invariant holds.
+                let genesis_qc = hyperscale_types::QuorumCertificate {
                     block_hash: genesis_block.hash(),
-                    block: genesis_block.clone(),
+                    ..hyperscale_types::QuorumCertificate::genesis()
+                };
+                let genesis_certified =
+                    CertifiedBlock::new_unchecked(genesis_block.clone(), genesis_qc);
+                let genesis_commit_event = NodeInput::Protocol(ProtocolEvent::BlockCommitted {
+                    certified: genesis_certified,
                 });
                 self.schedule_event(node_index, self.now, genesis_commit_event);
             }

@@ -733,9 +733,8 @@ impl ExecutionState {
     /// Clean up execution-local per-wave state for wave certs included in the
     /// committed block.
     ///
-    /// Per-tx terminal state for the mempool is now driven by
-    /// `mempool::on_block_committed_full` reading `block.certificates` directly
-    /// (single source of truth per `.plans/_wc-and-finalized-wave-refactor.md`).
+    /// Per-tx terminal state for the mempool is driven by
+    /// `mempool::on_block_committed` reading `block.certificates` directly.
     /// This function only handles execution's own bookkeeping.
     pub fn cleanup_committed_waves(
         &mut self,
@@ -1483,17 +1482,18 @@ impl ExecutionState {
     /// which drives fresh execution — or `on_sealed_block_committed` —
     /// which only records tx → wave mappings so late-arriving certs can
     /// route back to the mempool.
-    #[instrument(skip(self, block), fields(
-        height = block.height().0,
-        block_hash = ?block.hash(),
-        tx_count = block.transactions().len(),
-        is_live = block.is_live(),
+    #[instrument(skip(self, certified), fields(
+        height = certified.block.height().0,
+        block_hash = ?certified.block.hash(),
+        tx_count = certified.block.transactions().len(),
+        is_live = certified.block.is_live(),
     ))]
     pub fn on_block_committed(
         &mut self,
         topology: &TopologySnapshot,
-        block: &Block,
+        certified: &hyperscale_types::CertifiedBlock,
     ) -> Vec<Action> {
+        let block = &certified.block;
         let height = block.height().0;
 
         // Update committed height before anything else — needed for timeout
@@ -2241,6 +2241,16 @@ mod tests {
         ExecutionState::new()
     }
 
+    /// Pair a test `Block` with a matching zeroed QC so it satisfies the
+    /// `CertifiedBlock` pairing invariant.
+    fn certify(block: Block) -> hyperscale_types::CertifiedBlock {
+        let qc = hyperscale_types::QuorumCertificate {
+            block_hash: block.hash(),
+            ..hyperscale_types::QuorumCertificate::genesis()
+        };
+        hyperscale_types::CertifiedBlock::new_unchecked(block, qc)
+    }
+
     /// Build a minimal `Block::Live` suitable for driving
     /// `on_block_committed` in tests. The returned block's `hash()` is
     /// derived from a deterministic header built from the inputs.
@@ -2300,7 +2310,7 @@ mod tests {
         );
 
         // Block committed with transaction
-        let actions = state.on_block_committed(&topology, &block);
+        let actions = state.on_block_committed(&topology, &certify(block.clone()));
 
         // Should request execution (single-shard path) and set up wave tracking
         assert!(!actions.is_empty());
@@ -2435,7 +2445,7 @@ mod tests {
 
         // Commit the block as validator 0 to discover the wave_id.
         let mut state0 = make_test_state();
-        state0.on_block_committed(&topo0, &block);
+        state0.on_block_committed(&topo0, &certify(block.clone()));
         let wave_id = state0.wave_assignments.values().next().unwrap().clone();
 
         let leader = hyperscale_types::wave_leader(&wave_id, &committee);
@@ -2450,7 +2460,7 @@ mod tests {
             vec![Arc::new(tx.clone())],
         );
         let mut state_leader = make_test_state();
-        state_leader.on_block_committed(&topo_leader, &block_leader);
+        state_leader.on_block_committed(&topo_leader, &certify(block_leader.clone()));
         assert!(
             state_leader.vote_trackers.contains_key(&wave_id),
             "Leader should have VoteTracker"
@@ -2467,7 +2477,7 @@ mod tests {
             vec![Arc::new(tx.clone())],
         );
         let mut state_non = make_test_state();
-        state_non.on_block_committed(&topo_non, &block_non);
+        state_non.on_block_committed(&topo_non, &certify(block_non.clone()));
         assert!(
             !state_non.vote_trackers.contains_key(&wave_id),
             "Non-leader should NOT have VoteTracker"
@@ -2483,7 +2493,7 @@ mod tests {
         let block_hash = block.hash();
 
         let mut state = make_test_state();
-        state.on_block_committed(&topo, &block);
+        state.on_block_committed(&topo, &certify(block.clone()));
 
         let wave_id = state.wave_assignments.values().next().unwrap().clone();
         let leader = hyperscale_types::wave_leader(&wave_id, &committee);
@@ -2499,7 +2509,7 @@ mod tests {
             vec![Arc::new(tx.clone())],
         );
         let mut state_non = make_test_state();
-        state_non.on_block_committed(&topo_non, &block_non);
+        state_non.on_block_committed(&topo_non, &certify(block_non.clone()));
 
         assert!(!state_non.vote_trackers.contains_key(&wave_id));
         assert!(state_non.waves.contains_key(&wave_id));

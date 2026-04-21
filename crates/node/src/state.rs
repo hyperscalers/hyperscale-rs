@@ -8,7 +8,7 @@ use hyperscale_provisions::{ProvisionConfig, ProvisionCoordinator};
 use hyperscale_remote_headers::RemoteHeaderCoordinator;
 use hyperscale_topology::TopologyState;
 use hyperscale_types::{
-    Block, BlockHeader, BlockHeight, BlockManifest, FinalizedWave, Hash, Provision,
+    Block, BlockHeader, BlockHeight, BlockManifest, CertifiedBlock, FinalizedWave, Hash, Provision,
     QuorumCertificate, ReadyTransactions, RoutableTransaction, ShardGroupId, TopologySnapshot,
 };
 use std::sync::Arc;
@@ -322,12 +322,18 @@ impl NodeStateMachine {
     }
 
     /// Handle block committed — notify all subsystems in the correct order.
-    fn on_block_committed(&mut self, block_hash: Hash, block: Block) -> Vec<Action> {
+    fn on_block_committed(&mut self, certified: CertifiedBlock) -> Vec<Action> {
         let mut actions = Vec::new();
-        let block_height = block.height();
+        let block_hash = certified.block.hash();
+        let block_height = certified.block.height();
 
         // Register committed tx hashes with BFT for timeout abort validation.
-        let tx_hashes: Vec<Hash> = block.transactions().iter().map(|tx| tx.hash()).collect();
+        let tx_hashes: Vec<Hash> = certified
+            .block
+            .transactions()
+            .iter()
+            .map(|tx| tx.hash())
+            .collect();
         self.bft
             .register_committed_transactions(&tx_hashes, block_height);
 
@@ -343,26 +349,24 @@ impl NodeStateMachine {
         // tombstone). Same behavior for consensus and sync commit paths.
         actions.extend(
             self.mempool
-                .on_block_committed_full(self.topology.snapshot(), &block),
+                .on_block_committed(self.topology.snapshot(), &certified),
         );
 
         // Remote header coordinator: update liveness and check for timeouts.
         actions.extend(
             self.remote_headers
-                .on_block_committed(self.topology.snapshot()),
+                .on_block_committed(self.topology.snapshot(), &certified),
         );
 
         // Provisions coordinator: prune + schedule fallback timeouts. Reads
         // provision hashes directly off the block — Live carries them
         // inline, Sealed has none (empty slice).
-        let provision_hashes: Vec<Hash> = block.provisions().iter().map(|p| p.hash()).collect();
-        actions.extend(self.provisions.on_block_committed(
-            self.topology.snapshot(),
-            &block,
-            &provision_hashes,
-        ));
+        actions.extend(
+            self.provisions
+                .on_block_committed(self.topology.snapshot(), &certified),
+        );
 
-        actions.extend(self.apply_block_to_execution(&block));
+        actions.extend(self.apply_block_to_execution(&certified));
 
         // Block committed changes in-flight counts — trigger proposal attempt
         // so the next proposer can include newly ready transactions.
@@ -375,21 +379,22 @@ impl NodeStateMachine {
     /// dispatch (Live) or wave-assignment recording only (Sealed), and
     /// vote emission. Provisions live inline on `Block::Live` — no
     /// separate argument needed.
-    fn apply_block_to_execution(&mut self, block: &Block) -> Vec<Action> {
+    fn apply_block_to_execution(&mut self, certified: &CertifiedBlock) -> Vec<Action> {
         let mut actions = Vec::new();
 
         // Release execution's per-wave bookkeeping for wave certs included in
         // this block. Per-tx terminal state for the mempool is already handled
-        // separately by `on_block_committed_full` reading `block.certificates`.
-        self.execution.cleanup_committed_waves(block.certificates());
-        for cert in block.certificates() {
+        // separately by `on_block_committed` reading `block.certificates`.
+        self.execution
+            .cleanup_committed_waves(certified.block.certificates());
+        for cert in certified.block.certificates() {
             let cert_hash = cert.wave_id().hash();
             self.bft.remove_committed_transaction(&cert_hash);
         }
 
         actions.extend(
             self.execution
-                .on_block_committed(self.topology.snapshot(), block),
+                .on_block_committed(self.topology.snapshot(), certified),
         );
 
         // Round voting: scan all incomplete waves and emit votes for complete ones.
@@ -584,9 +589,7 @@ impl StateMachine for NodeStateMachine {
             ),
 
             // ── Block Committed ──────────────────────────────────────────
-            ProtocolEvent::BlockCommitted { block_hash, block } => {
-                self.on_block_committed(block_hash, block)
-            }
+            ProtocolEvent::BlockCommitted { certified } => self.on_block_committed(certified),
 
             // ── Block Persisted (RocksDB write complete) ───────────────
             // Advances `last_persisted_height`, a fallback gate for deferred
