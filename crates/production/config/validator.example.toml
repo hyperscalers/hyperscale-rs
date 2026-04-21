@@ -54,7 +54,7 @@ gossipsub_heartbeat_ms = 100
 [consensus]
 # View change timeout (milliseconds)
 # How long to wait before triggering leader rotation
-view_change_timeout_ms = 5000
+view_change_timeout_ms = 3000
 
 # Maximum transactions per block
 max_transactions_per_block = 4096

@@ -31,7 +31,7 @@
 //! bootstrap_peers = []
 //!
 //! [consensus]
-//! view_change_timeout_ms = 5000
+//! view_change_timeout_ms = 3000
 //!
 //! [threads]
 //! crypto_threads = 4
@@ -291,7 +291,7 @@ impl Default for ConsensusConfig {
 }
 
 fn default_view_change_timeout_ms() -> u64 {
-    5000
+    3000
 }
 
 fn default_max_transactions_per_block() -> usize {

@@ -167,7 +167,7 @@ bootstrap_peers = [$BOOTSTRAP_PEERS]
 version_interop_mode = "relaxed"
 tcp_fallback_port_range = "9000-9000"
 [consensus]
-view_change_timeout_ms = 5000
+view_change_timeout_ms = 3000
 [metrics]
 enabled = true
 listen_addr = "0.0.0.0:8080"

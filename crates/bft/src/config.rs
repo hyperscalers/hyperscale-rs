@@ -66,7 +66,7 @@ pub struct BftConfig {
 impl Default for BftConfig {
     fn default() -> Self {
         Self {
-            view_change_timeout: Duration::from_secs(5),
+            view_change_timeout: Duration::from_secs(3),
             view_change_timeout_increment: Duration::from_millis(1000),
             view_change_timeout_max: Some(Duration::from_secs(30)),
             max_transactions_per_block: 4096,
