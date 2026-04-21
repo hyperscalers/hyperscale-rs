@@ -1539,9 +1539,29 @@ impl ExecutionState {
         // Update committed height + timestamp before anything else — needed
         // for timeout calculations and pruning even when there are no new
         // transactions.
+        let first_commit = self.committed_ts_ms == WeightedTimestamp::ZERO;
         if height > self.committed_height {
             self.committed_height = height;
             self.committed_ts_ms = certified.qc.weighted_timestamp;
+        }
+
+        // Retro-stamp entries recorded before the first local commit. Remote
+        // headers can register expected exec certs (and ECs themselves can be
+        // buffered) while `committed_ts_ms` is still zero; without this, every
+        // such entry would report a ~57-year age on the next commit and
+        // trigger a fallback fetch storm.
+        if first_commit && self.committed_ts_ms != WeightedTimestamp::ZERO {
+            let now_ts = self.committed_ts_ms;
+            for expected in self.expected_exec_certs.values_mut() {
+                if expected.discovered_at_ts_ms == WeightedTimestamp::ZERO {
+                    expected.discovered_at_ts_ms = now_ts;
+                }
+            }
+            for buffered in self.pending_routing.values_mut() {
+                if buffered.buffered_at_ts_ms == WeightedTimestamp::ZERO {
+                    buffered.buffered_at_ts_ms = now_ts;
+                }
+            }
         }
 
         let mut actions = Vec::new();

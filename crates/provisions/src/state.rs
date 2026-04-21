@@ -274,8 +274,23 @@ impl ProvisionCoordinator {
         certified: &hyperscale_types::CertifiedBlock,
     ) -> Vec<Action> {
         let block = &certified.block;
+        let new_ts_ms = certified.qc.weighted_timestamp.as_millis();
+        let first_commit = self.local_committed_ts_ms == 0;
         self.local_committed_height = block.height();
-        self.local_committed_ts_ms = certified.qc.weighted_timestamp.as_millis();
+        self.local_committed_ts_ms = new_ts_ms;
+
+        // Retro-stamp `expected_provisions` entries recorded before the first
+        // local commit. Remote headers can arrive and register expectations
+        // while `local_committed_ts_ms` is still zero; without this, every
+        // such entry would report a ~57-year age on the next commit and
+        // trigger a fallback fetch storm.
+        if first_commit {
+            for expected in self.expected_provisions.values_mut() {
+                if expected.discovered_at_ts_ms == 0 {
+                    expected.discovered_at_ts_ms = new_ts_ms;
+                }
+            }
+        }
 
         // Record provision batches committed in this block, but don't
         // evict them yet — peers catching up within the cross-shard
@@ -1332,19 +1347,24 @@ mod tests {
         let topology = make_test_topology(ShardGroupId(0));
         let mut coordinator = ProvisionCoordinator::new();
 
-        // Remote header arrives targeting our shard at local height 0
+        // Prime local clock with a first commit so the expected-provision
+        // entry stamped below gets a real baseline (not the zero sentinel).
+        coordinator.on_block_committed(&topology, &make_block(1));
+
+        // Remote header arrives targeting our shard; discovered_at stamped at ts=500ms.
         let header = make_committed_header_with_targets(ShardGroupId(1), 10, vec![ShardGroupId(0)]);
         coordinator.on_verified_remote_header(&topology, header);
 
-        // Advance blocks — should not emit before the timeout threshold (10 blocks)
-        for h in 1..=9 {
+        // Advance blocks — should not emit before the timeout threshold.
+        // discovered_at = 500ms; fires when now_ms - 500 >= 5000 → h = 11.
+        for h in 2..=10 {
             let block = make_block(h);
             let actions = coordinator.on_block_committed(&topology, &block);
             assert!(actions.is_empty(), "Should not emit request at height {h}");
         }
 
-        // At height 10, ts = 10 * 500ms = 5000ms >= PROVISION_FALLBACK_TIMEOUT → fires
-        let block = make_block(10);
+        // At height 11, age = 5500 - 500 = 5000 >= PROVISION_FALLBACK_TIMEOUT → fires.
+        let block = make_block(11);
         let actions = coordinator.on_block_committed(&topology, &block);
         assert_eq!(actions.len(), 1);
         assert!(matches!(
@@ -1358,6 +1378,37 @@ mod tests {
                 && *block_height == BlockHeight(10)
                 && *proposer == ValidatorId(0)
         ));
+    }
+
+    #[test]
+    fn test_pregenesis_header_retrostamped_on_first_commit() {
+        // Regression: without retro-stamping, an expected_provisions entry
+        // recorded while `local_committed_ts_ms == 0` would report a ~epoch-ms
+        // age on the very next commit and trigger an immediate fallback,
+        // bypassing PROVISION_FALLBACK_TIMEOUT entirely.
+        let topology = make_test_topology(ShardGroupId(0));
+        let mut coordinator = ProvisionCoordinator::new();
+
+        // Remote header arrives BEFORE any local block commits.
+        let header = make_committed_header_with_targets(ShardGroupId(1), 10, vec![ShardGroupId(0)]);
+        coordinator.on_verified_remote_header(&topology, header);
+        assert_eq!(coordinator.expected_provisions.len(), 1);
+
+        // First local commit at ts=500ms. Should NOT fire — the pre-genesis
+        // entry has just been retro-stamped to 500ms.
+        let actions = coordinator.on_block_committed(&topology, &make_block(1));
+        assert!(
+            actions.is_empty(),
+            "Pre-genesis entry must be retro-stamped, not fire immediately"
+        );
+
+        // Fires on schedule from the retro-stamp baseline, not absolute zero.
+        for h in 2..=10 {
+            let actions = coordinator.on_block_committed(&topology, &make_block(h));
+            assert!(actions.is_empty(), "Should not emit at height {h}");
+        }
+        let actions = coordinator.on_block_committed(&topology, &make_block(11));
+        assert_eq!(actions.len(), 1);
     }
 
     #[test]
@@ -1503,6 +1554,10 @@ mod tests {
         let topology = make_test_topology(ShardGroupId(0));
         let mut coordinator = ProvisionCoordinator::new();
 
+        // Prime local clock so the expected-provision entry gets a real
+        // baseline rather than the zero sentinel retro-stamped on first commit.
+        coordinator.on_block_committed(&topology, &make_block(1));
+
         // Header arrives but the batch never does — this is the orphan case
         // the long-horizon sweep guards against.
         let header = make_committed_header_with_targets(ShardGroupId(1), 10, vec![ShardGroupId(0)]);
@@ -1510,15 +1565,16 @@ mod tests {
         assert_eq!(coordinator.expected_provisions.len(), 1);
 
         // Not yet past the orphan cutoff — still retained.
+        // discovered_at was stamped at ts=500ms (the priming commit).
         let orphan_cutoff_blocks = ORPHAN_HEADER_CUTOFF.as_millis() as u64 / TEST_BLOCK_INTERVAL_MS;
-        for h in 1..=orphan_cutoff_blocks {
+        for h in 2..=orphan_cutoff_blocks + 1 {
             coordinator.on_block_committed(&topology, &make_block(h));
         }
         assert_eq!(coordinator.verified_remote_header_count(), 1);
         assert_eq!(coordinator.expected_provisions.len(), 1);
 
         // One past — orphan sweep drops header and expected entry together.
-        coordinator.on_block_committed(&topology, &make_block(orphan_cutoff_blocks + 1));
+        coordinator.on_block_committed(&topology, &make_block(orphan_cutoff_blocks + 2));
         assert_eq!(coordinator.verified_remote_header_count(), 0);
         assert_eq!(coordinator.expected_provisions.len(), 0);
     }

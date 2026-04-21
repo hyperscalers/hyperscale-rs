@@ -331,8 +331,25 @@ impl RemoteHeaderCoordinator {
         topology: &TopologySnapshot,
         certified: &hyperscale_types::CertifiedBlock,
     ) -> Vec<Action> {
+        let new_ts_ms = certified.qc.weighted_timestamp.as_millis();
+        let first_commit = self.local_committed_ts_ms == 0;
         self.local_committed_height = certified.block.height();
-        self.local_committed_ts_ms = certified.qc.weighted_timestamp.as_millis();
+        self.local_committed_ts_ms = new_ts_ms;
+
+        // Retro-stamp entries recorded before the first local commit: remote
+        // headers can arrive (and verify) while `local_committed_ts_ms` is
+        // still zero, which would otherwise make age computations report the
+        // full epoch on the very next commit and trigger a fallback storm.
+        if first_commit {
+            for expected in self.expected.values_mut() {
+                if expected.discovered_at_ts_ms == 0 {
+                    expected.discovered_at_ts_ms = new_ts_ms;
+                }
+                if expected.last_verified_at_ts_ms == Some(0) {
+                    expected.last_verified_at_ts_ms = Some(new_ts_ms);
+                }
+            }
+        }
 
         // Seed expected headers for remote shards we haven't seen yet.
         let local_shard = topology.local_shard();
