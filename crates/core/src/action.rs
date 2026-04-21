@@ -5,9 +5,9 @@ use hyperscale_messages::TransactionGossip;
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, BlockManifest, BlockVote, Bls12381G1PublicKey,
     Bls12381G2Signature, CommittedBlockHeader, EpochConfig, EpochId, ExecutionCertificate,
-    ExecutionVote, FinalizedWave, Hash, NodeId, Provision, QuorumCertificate, ReceiptBundle,
-    RoutableTransaction, ShardGroupId, SignerBitfield, StateProvision, TopologySnapshot, TxOutcome,
-    ValidatorId, VotePower, WaveId,
+    ExecutionVote, FinalizedWave, Hash, NodeId, ProposerTimestamp, Provision, QuorumCertificate,
+    ReceiptBundle, RoutableTransaction, ShardGroupId, SignerBitfield, StateProvision,
+    TopologySnapshot, TxOutcome, ValidatorId, VotePower, WaveId, WeightedTimestamp,
 };
 use std::collections::HashMap;
 use std::fmt;
@@ -184,7 +184,7 @@ pub enum Action {
         block_hash: Hash,
         block_height: u64,
         /// Consensus height at which this vote is being cast.
-        vote_anchor_ts_ms: u64,
+        vote_anchor_ts_ms: WeightedTimestamp,
         wave_id: WaveId,
         global_receipt_root: Hash,
         /// Per-tx outcomes in wave order. Carried on the vote so the
@@ -515,7 +515,7 @@ pub enum Action {
         round: u64,
         parent_hash: Hash,
         parent_qc: QuorumCertificate,
-        timestamp: u64,
+        timestamp: ProposerTimestamp,
         is_fallback: bool,
         /// Parent's state root (base for state root computation via overlay).
         parent_state_root: Hash,
@@ -641,7 +641,7 @@ pub enum Action {
         block_hash: Hash,
         height: BlockHeight,
         round: u64,
-        timestamp: u64,
+        timestamp: ProposerTimestamp,
         /// Targeted vote recipients — the next proposer who needs this vote
         /// to build the QC for the next block.
         recipients: Vec<ValidatorId>,

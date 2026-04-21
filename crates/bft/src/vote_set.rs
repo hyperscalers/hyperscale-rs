@@ -247,7 +247,8 @@ impl VoteSet {
 
         for (committee_index, vote, voting_power) in verified_votes {
             // Accumulate weighted timestamp
-            self.verified_timestamp_weight_sum += vote.timestamp as u128 * voting_power as u128;
+            self.verified_timestamp_weight_sum +=
+                vote.timestamp.as_millis() as u128 * voting_power as u128;
             self.verified_power += voting_power;
             self.verified_votes
                 .push((committee_index, vote, voting_power));
@@ -285,7 +286,8 @@ impl VoteSet {
         }
 
         // Accumulate weighted timestamp
-        self.verified_timestamp_weight_sum += vote.timestamp as u128 * voting_power as u128;
+        self.verified_timestamp_weight_sum +=
+            vote.timestamp.as_millis() as u128 * voting_power as u128;
         self.verified_power += voting_power;
         self.verified_votes
             .push((committee_index, vote, voting_power));
@@ -309,7 +311,7 @@ impl VoteSet {
         block_hash: Hash,
         shard_group_id: hyperscale_types::ShardGroupId,
     ) -> Result<QuorumCertificate, String> {
-        use hyperscale_types::{Bls12381G2Signature, SignerBitfield};
+        use hyperscale_types::{Bls12381G2Signature, SignerBitfield, WeightedTimestamp};
 
         if self.verified_votes.is_empty() {
             return Err("cannot build QC with no votes".to_string());
@@ -370,7 +372,7 @@ impl VoteSet {
             round,
             aggregated_signature,
             signers,
-            weighted_timestamp_ms,
+            weighted_timestamp: WeightedTimestamp(weighted_timestamp_ms),
         })
     }
 }
@@ -394,7 +396,7 @@ mod tests {
             parent_hash: Hash::from_bytes(b"parent"),
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(0),
-            timestamp: 1234567890,
+            timestamp: hyperscale_types::ProposerTimestamp(1234567890),
             round: 0,
             is_fallback: false,
             state_root: Hash::ZERO,
@@ -421,7 +423,7 @@ mod tests {
             0,
             ValidatorId(voter_index as u64),
             &keys[voter_index],
-            1000000000000,
+            hyperscale_types::ProposerTimestamp(1000000000000),
         )
     }
 

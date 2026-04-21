@@ -6,7 +6,8 @@
 use crate::TestCommittee;
 use hyperscale_types::{
     block_vote_message, verify_bls12381_v1, BlockHeight, BlockVote, Bls12381G1PublicKey,
-    Bls12381G2Signature, ExecutionOutcome, Hash, QuorumCertificate, ShardGroupId, SignerBitfield,
+    Bls12381G2Signature, ExecutionOutcome, Hash, ProposerTimestamp, QuorumCertificate,
+    ShardGroupId, SignerBitfield, WeightedTimestamp,
 };
 
 /// Create a properly-signed block vote.
@@ -48,7 +49,7 @@ pub fn make_signed_block_vote(
         round,
         committee.validator_id(voter_idx),
         committee.keypair(voter_idx),
-        1000 + voter_idx as u64 * 100, // Deterministic timestamps
+        ProposerTimestamp(1000 + voter_idx as u64 * 100), // Deterministic timestamps
     )
 }
 
@@ -124,7 +125,7 @@ pub fn make_signed_qc(
         round,
         signers,
         aggregated_signature,
-        weighted_timestamp_ms,
+        weighted_timestamp: WeightedTimestamp(weighted_timestamp_ms),
     }
 }
 

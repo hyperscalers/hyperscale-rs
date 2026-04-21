@@ -495,7 +495,7 @@ impl MempoolState {
         let mut actions = Vec::new();
 
         self.current_height = height;
-        self.current_ts_ms = certified.qc.weighted_timestamp_ms;
+        self.current_ts_ms = certified.qc.weighted_timestamp.as_millis();
 
         // Prune old entries from recently_evicted cache
         self.prune_recently_evicted();
@@ -1334,7 +1334,7 @@ mod tests {
         generate_bls_keypair, test_utils::test_transaction, Block, BlockHeader,
         Bls12381G2Signature, ExecutionCertificate, ExecutionOutcome, FinalizedWave,
         QuorumCertificate, ShardGroupId, SignerBitfield, TxOutcome, ValidatorId, ValidatorInfo,
-        ValidatorSet, WaveCertificate, WaveId,
+        ValidatorSet, WaveCertificate, WaveId, WeightedTimestamp,
     };
     use std::collections::BTreeSet;
 
@@ -1360,7 +1360,7 @@ mod tests {
         let wave_id = WaveId::new(ShardGroupId(0), block_height, BTreeSet::new());
         let ec = ExecutionCertificate::new(
             wave_id.clone(),
-            block_height + 1,
+            WeightedTimestamp(block_height + 1),
             Hash::ZERO,
             vec![TxOutcome { tx_hash, outcome }],
             Bls12381G2Signature([0u8; 96]),
@@ -1399,7 +1399,7 @@ mod tests {
                 parent_hash: Hash::from_bytes(b"parent"),
                 parent_qc: QuorumCertificate::genesis(),
                 proposer: ValidatorId(0),
-                timestamp: 1234567890,
+                timestamp: hyperscale_types::ProposerTimestamp(1234567890),
                 round: 0,
                 is_fallback: false,
                 state_root: Hash::ZERO,
@@ -1437,7 +1437,7 @@ mod tests {
     fn certify(block: Block) -> CertifiedBlock {
         let qc = QuorumCertificate {
             block_hash: block.hash(),
-            weighted_timestamp_ms: block.height().0 * TEST_BLOCK_INTERVAL_MS,
+            weighted_timestamp: WeightedTimestamp(block.height().0 * TEST_BLOCK_INTERVAL_MS),
             ..QuorumCertificate::genesis()
         };
         CertifiedBlock::new_unchecked(block, qc)

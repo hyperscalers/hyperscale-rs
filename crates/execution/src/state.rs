@@ -42,7 +42,7 @@ use hyperscale_types::{
     Block, BlockHeight, Bls12381G1PublicKey, ExecutionCertificate, ExecutionOutcome, ExecutionVote,
     Hash, LocalExecutionEntry, NodeId, Provision, ReceiptBundle, RoutableTransaction, ShardGroupId,
     StateProvision, TopologySnapshot, TransactionDecision, TxOutcome, ValidatorId, WaveCertificate,
-    WaveId,
+    WaveId, WeightedTimestamp,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -63,10 +63,10 @@ pub struct CompletionData {
     pub block_hash: Hash,
     /// Block height (= wave_starting_height).
     pub block_height: u64,
-    /// BFT-authenticated weighted timestamp (ms) at which this wave's outcome
-    /// is fixed. Included in the vote payload and the EC canonical hash, so all
+    /// BFT-authenticated weighted timestamp at which this wave's outcome is
+    /// fixed. Included in the vote payload and the EC canonical hash, so all
     /// validators aggregate under the same identifier.
-    pub vote_anchor_ts_ms: u64,
+    pub vote_anchor_ts_ms: WeightedTimestamp,
     /// Wave identifier.
     pub wave_id: WaveId,
     /// Merkle root over per-tx outcome leaves (cross-shard agreement).
@@ -115,10 +115,10 @@ pub struct ExecutionState {
     /// Current committed height for pruning stale entries.
     committed_height: u64,
 
-    /// BFT-authenticated weighted timestamp (ms) of the last locally committed
+    /// BFT-authenticated weighted timestamp of the last locally committed
     /// block. "Now" reference for timeouts that must be deterministic across
     /// validators and independent of block production rate.
-    committed_ts_ms: u64,
+    committed_ts_ms: WeightedTimestamp,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Provisioning
@@ -199,7 +199,7 @@ pub struct ExecutionState {
     /// Maps `(source_shard, block_height, wave_id)` → `committed_ts_ms` when the
     /// cert was received, for age-based pruning anchored on the committing QC's
     /// `weighted_timestamp_ms`.
-    fulfilled_exec_certs: HashMap<(ShardGroupId, u64, WaveId), u64>,
+    fulfilled_exec_certs: HashMap<(ShardGroupId, u64, WaveId), WeightedTimestamp>,
 }
 
 impl Default for ExecutionState {
@@ -219,20 +219,20 @@ impl Default for ExecutionState {
 struct BufferedEc {
     ec: Arc<ExecutionCertificate>,
     pending_txs: HashSet<Hash>,
-    /// Local weighted timestamp (ms) when this EC was first buffered. Used
-    /// by `prune_stale_buffered_ecs` to drop entries older than
+    /// Local weighted timestamp when this EC was first buffered. Used by
+    /// `prune_stale_buffered_ecs` to drop entries older than
     /// `EC_BUFFER_RETENTION`.
-    buffered_at_ts_ms: u64,
+    buffered_at_ts_ms: WeightedTimestamp,
 }
 
 /// Tracks an expected execution certificate that hasn't arrived yet.
 #[derive(Debug, Clone)]
 struct ExpectedExecCert {
-    /// Local weighted timestamp (ms) when we first learned about this cert.
-    discovered_at_ts_ms: u64,
-    /// Local weighted timestamp (ms) when we last sent a fallback request.
+    /// Local weighted timestamp when we first learned about this cert.
+    discovered_at_ts_ms: WeightedTimestamp,
+    /// Local weighted timestamp when we last sent a fallback request.
     /// `None` means never requested. Allows periodic re-requests with cooldown.
-    last_requested_at_ts_ms: Option<u64>,
+    last_requested_at_ts_ms: Option<WeightedTimestamp>,
 }
 
 /// How long to wait before the first fallback request. Anchored on the
@@ -289,14 +289,14 @@ const EARLY_VOTE_RETENTION: Duration = Duration::from_secs(30);
 /// still need a leader to aggregate the timeout votes).
 #[derive(Debug, Clone)]
 struct PendingVoteRetry {
-    /// Local weighted timestamp (ms) when this vote was last dispatched.
+    /// Local weighted timestamp when this vote was last dispatched.
     /// Compared against `committed_ts_ms` to detect leader aggregation
     /// timeouts independently of block production rate.
-    sent_at_ts_ms: u64,
+    sent_at_ts_ms: WeightedTimestamp,
     attempt: u32,
     block_hash: Hash,
     block_height: u64,
-    vote_anchor_ts_ms: u64,
+    vote_anchor_ts_ms: WeightedTimestamp,
     global_receipt_root: Hash,
     tx_outcomes: Arc<Vec<TxOutcome>>,
 }
@@ -378,7 +378,7 @@ impl ExecutionState {
             now: Duration::ZERO,
             finalized_wave_certificates: BTreeMap::new(),
             committed_height: 0,
-            committed_ts_ms: 0,
+            committed_ts_ms: WeightedTimestamp::ZERO,
             waves: HashMap::new(),
             vote_trackers: HashMap::new(),
             waves_with_ec: HashSet::new(),
@@ -471,7 +471,7 @@ impl ExecutionState {
         topology: &TopologySnapshot,
         block_hash: Hash,
         block_height: u64,
-        block_ts_ms: u64,
+        block_ts_ms: WeightedTimestamp,
         transactions: &[Arc<RoutableTransaction>],
     ) -> (Vec<Action>, Vec<ExecutionVote>) {
         let waves = self.assign_waves(topology, block_height, transactions);
@@ -799,7 +799,7 @@ impl ExecutionState {
         topology: &TopologySnapshot,
         batches: &[Arc<Provision>],
         committed_height: u64,
-        committed_ts_ms: u64,
+        committed_ts_ms: WeightedTimestamp,
     ) -> Vec<Action> {
         // Sort for deterministic phase-2 iteration (logs, action vector order).
         let mut ordered: Vec<&Arc<Provision>> = batches.iter().collect();
@@ -1116,7 +1116,7 @@ impl ExecutionState {
         tracing::info!(
             block_hash = ?block_hash,
             wave = %wave_id,
-            vote_anchor_ts_ms,
+            vote_anchor_ts_ms = vote_anchor_ts_ms.as_millis(),
             "Execution vote quorum reached — aggregating certificate"
         );
 
@@ -1260,7 +1260,7 @@ impl ExecutionState {
                 source_shard = shard.0,
                 block_height = cert.block_height(),
                 wave = %cert.wave_id,
-                at_local_ts_ms = self.committed_ts_ms,
+                at_local_ts_ms = self.committed_ts_ms.as_millis(),
                 "Fulfilled expected exec cert"
             );
             actions.push(Action::CancelExecutionCertFetch {
@@ -1409,28 +1409,26 @@ impl ExecutionState {
     /// that have exceeded the timeout.
     fn check_exec_cert_timeouts(&mut self, topology: &TopologySnapshot) -> Vec<Action> {
         let mut actions = Vec::new();
-        let now_ms = self.committed_ts_ms;
-        let fallback_ms = EXEC_CERT_FALLBACK_TIMEOUT.as_millis() as u64;
-        let retry_ms = EXEC_CERT_RETRY_INTERVAL.as_millis() as u64;
+        let now_ts = self.committed_ts_ms;
         for ((source_shard, block_height, wave_id), expected) in &mut self.expected_exec_certs {
-            let age_ms = now_ms.saturating_sub(expected.discovered_at_ts_ms);
+            let age = now_ts.elapsed_since(expected.discovered_at_ts_ms);
 
             let should_request = match expected.last_requested_at_ts_ms {
                 // Never requested — use initial timeout
-                None => age_ms >= fallback_ms,
+                None => age >= EXEC_CERT_FALLBACK_TIMEOUT,
                 // Previously requested — use retry interval
-                Some(last) => now_ms.saturating_sub(last) >= retry_ms,
+                Some(last) => now_ts.elapsed_since(last) >= EXEC_CERT_RETRY_INTERVAL,
             };
 
             if should_request {
                 let is_retry = expected.last_requested_at_ts_ms.is_some();
-                expected.last_requested_at_ts_ms = Some(now_ms);
+                expected.last_requested_at_ts_ms = Some(now_ts);
                 let peers = topology.committee_for_shard(*source_shard).to_vec();
                 tracing::info!(
                     source_shard = source_shard.0,
                     block_height = block_height,
                     wave = %wave_id,
-                    age_ms,
+                    age_ms = age.as_millis() as u64,
                     retry = is_retry,
                     "Execution cert timeout — requesting fallback"
                 );
@@ -1460,11 +1458,9 @@ impl ExecutionState {
 
         // Prune fulfilled set by wall-clock age of the fulfillment, not remote
         // block height (which can differ significantly across shards).
-        let fulfilled_cutoff_ms = self
-            .committed_ts_ms
-            .saturating_sub(FULFILLED_EXEC_CERT_RETENTION.as_millis() as u64);
+        let fulfilled_cutoff = self.committed_ts_ms.minus(FULFILLED_EXEC_CERT_RETENTION);
         self.fulfilled_exec_certs
-            .retain(|_, &mut fulfilled_at_ts_ms| fulfilled_at_ts_ms > fulfilled_cutoff_ms);
+            .retain(|_, &mut fulfilled_at| fulfilled_at > fulfilled_cutoff);
 
         actions
     }
@@ -1476,21 +1472,20 @@ impl ExecutionState {
     /// same vote to the next deterministically-rotated leader.
     fn check_vote_retry_timeouts(&mut self, topology: &TopologySnapshot) -> Vec<Action> {
         let mut actions = Vec::new();
-        let now_ms = self.committed_ts_ms;
-        let timeout_ms = VOTE_RETRY_TIMEOUT.as_millis() as u64;
+        let now_ts = self.committed_ts_ms;
         let committee = topology.local_committee().to_vec();
 
         // Collect retries first to avoid borrow conflict.
         let retries: Vec<(WaveId, PendingVoteRetry)> = self
             .pending_vote_retries
             .iter()
-            .filter(|(_, p)| now_ms.saturating_sub(p.sent_at_ts_ms) >= timeout_ms)
+            .filter(|(_, p)| now_ts.elapsed_since(p.sent_at_ts_ms) >= VOTE_RETRY_TIMEOUT)
             .map(|(w, p)| (w.clone(), p.clone()))
             .collect();
 
         for (wave_id, mut pending) in retries {
             pending.attempt += 1;
-            pending.sent_at_ts_ms = now_ms;
+            pending.sent_at_ts_ms = now_ts;
             let new_leader =
                 hyperscale_types::wave_leader_at(&wave_id, pending.attempt, &committee);
 
@@ -1546,7 +1541,7 @@ impl ExecutionState {
         // transactions.
         if height > self.committed_height {
             self.committed_height = height;
-            self.committed_ts_ms = certified.qc.weighted_timestamp_ms;
+            self.committed_ts_ms = certified.qc.weighted_timestamp;
         }
 
         let mut actions = Vec::new();
@@ -1565,16 +1560,13 @@ impl ExecutionState {
         // Drop conflict-detector entries for remote provisions older than the
         // retention window. `register_tx` iterates over these per cross-shard
         // tx; left unbounded they drive quadratic TPS decay.
-        let retention_ms = CONFLICT_PROVISION_RETENTION.as_millis() as u64;
-        let cutoff_ms = self.committed_ts_ms.saturating_sub(retention_ms);
-        if cutoff_ms > 0 {
-            let dropped = self
-                .conflict_detector
-                .prune_provisions_older_than(cutoff_ms);
+        let cutoff = self.committed_ts_ms.minus(CONFLICT_PROVISION_RETENTION);
+        if cutoff.as_millis() > 0 {
+            let dropped = self.conflict_detector.prune_provisions_older_than(cutoff);
             if dropped > 0 {
                 tracing::debug!(
                     dropped,
-                    cutoff_ms,
+                    cutoff_ms = cutoff.as_millis(),
                     "Pruned aged conflict-detector provisions"
                 );
             }
@@ -1795,15 +1787,14 @@ impl ExecutionState {
     /// Covers the leak from tx_hashes that never land in a local block
     /// (orphaned txs, malicious or buggy remotes referencing unknown txs).
     fn prune_stale_buffered_ecs(&mut self) {
-        let retention_ms = EC_BUFFER_RETENTION.as_millis() as u64;
-        if self.committed_ts_ms < retention_ms {
+        if self.committed_ts_ms.as_millis() < EC_BUFFER_RETENTION.as_millis() as u64 {
             return;
         }
-        let cutoff_ms = self.committed_ts_ms - retention_ms;
+        let cutoff = self.committed_ts_ms.minus(EC_BUFFER_RETENTION);
         let stale: Vec<WaveId> = self
             .pending_routing
             .iter()
-            .filter(|(_, entry)| entry.buffered_at_ts_ms <= cutoff_ms)
+            .filter(|(_, entry)| entry.buffered_at_ts_ms <= cutoff)
             .map(|(wid, _)| wid.clone())
             .collect();
         if stale.is_empty() {
@@ -2061,9 +2052,7 @@ impl ExecutionState {
         // Non-leaders with a wave but no VoteTracker KEEP early votes. They may
         // become fallback leaders via rotation and need to replay them into the
         // on-demand VoteTracker created in on_execution_vote().
-        let ev_cutoff_ms = self
-            .committed_ts_ms
-            .saturating_sub(EARLY_VOTE_RETENTION.as_millis() as u64);
+        let ev_cutoff = self.committed_ts_ms.minus(EARLY_VOTE_RETENTION);
         let before_ev = self.early_votes.len();
         self.early_votes.retain(|key, votes| {
             if self.waves_with_ec.contains(key) {
@@ -2077,7 +2066,7 @@ impl ExecutionState {
             }
             votes
                 .first()
-                .map(|v| v.vote_anchor_ts_ms > ev_cutoff_ms)
+                .map(|v| v.vote_anchor_ts_ms > ev_cutoff)
                 .unwrap_or(false)
         });
         let pruned_ev = before_ev - self.early_votes.len();
@@ -2326,18 +2315,18 @@ mod tests {
     fn make_live_block(
         topology: &TopologySnapshot,
         height: u64,
-        timestamp: u64,
+        timestamp_ms: u64,
         proposer: ValidatorId,
         transactions: Vec<Arc<RoutableTransaction>>,
     ) -> Block {
-        use hyperscale_types::{BlockHeader, QuorumCertificate};
+        use hyperscale_types::{BlockHeader, ProposerTimestamp, QuorumCertificate};
         let header = BlockHeader {
             shard_group_id: topology.local_shard(),
             height: BlockHeight(height),
             parent_hash: Hash::ZERO,
             parent_qc: QuorumCertificate::genesis(),
             proposer,
-            timestamp,
+            timestamp: ProposerTimestamp(timestamp_ms),
             round: 0,
             is_fallback: false,
             state_root: Hash::ZERO,
@@ -2426,9 +2415,12 @@ mod tests {
         let root2 = Hash::from_bytes(b"root2");
         let root3 = Hash::from_bytes(b"root3");
 
-        let msg1 = hyperscale_types::exec_vote_message(1, &wave_id, shard, &root1, 1);
-        let msg2 = hyperscale_types::exec_vote_message(1, &wave_id, shard, &root2, 1);
-        let msg3 = hyperscale_types::exec_vote_message(1, &wave_id, shard, &root3, 1);
+        let msg1 =
+            hyperscale_types::exec_vote_message(WeightedTimestamp(1), &wave_id, shard, &root1, 1);
+        let msg2 =
+            hyperscale_types::exec_vote_message(WeightedTimestamp(1), &wave_id, shard, &root2, 1);
+        let msg3 =
+            hyperscale_types::exec_vote_message(WeightedTimestamp(1), &wave_id, shard, &root3, 1);
 
         let sig1 = committee.keypair(0).sign_v1(&msg1);
         let sig2 = committee.keypair(1).sign_v1(&msg2);
@@ -2459,8 +2451,10 @@ mod tests {
         let root1 = Hash::from_bytes(b"root1");
         let root2 = Hash::from_bytes(b"root2");
 
-        let msg1 = hyperscale_types::exec_vote_message(1, &wave_id, shard, &root1, 1);
-        let msg2 = hyperscale_types::exec_vote_message(1, &wave_id, shard, &root2, 1);
+        let msg1 =
+            hyperscale_types::exec_vote_message(WeightedTimestamp(1), &wave_id, shard, &root1, 1);
+        let msg2 =
+            hyperscale_types::exec_vote_message(WeightedTimestamp(1), &wave_id, shard, &root2, 1);
 
         // First is valid, second is signed with wrong key
         let sig1 = committee.keypair(0).sign_v1(&msg1);
@@ -2587,7 +2581,7 @@ mod tests {
         let fake_vote = ExecutionVote {
             block_hash,
             block_height: 1,
-            vote_anchor_ts_ms: 0,
+            vote_anchor_ts_ms: WeightedTimestamp::ZERO,
             wave_id: wave_id.clone(),
             shard_group_id: ShardGroupId(0),
             global_receipt_root: Hash::ZERO,
@@ -2615,18 +2609,17 @@ mod tests {
         let mut state = make_test_state();
         state.committed_height = 20;
         // "Now" timestamp exactly VOTE_RETRY_TIMEOUT past the original send.
-        let timeout_ms = VOTE_RETRY_TIMEOUT.as_millis() as u64;
-        state.committed_ts_ms = 10_000 + timeout_ms;
+        state.committed_ts_ms = WeightedTimestamp(10_000).plus(VOTE_RETRY_TIMEOUT);
 
         // Manually insert a pending retry as if we'd sent a vote at t=10_000ms.
         state.pending_vote_retries.insert(
             wave_id.clone(),
             PendingVoteRetry {
-                sent_at_ts_ms: 10_000,
+                sent_at_ts_ms: WeightedTimestamp(10_000),
                 attempt: 0,
                 block_hash: Hash::from_bytes(b"block1"),
                 block_height: 1,
-                vote_anchor_ts_ms: 0,
+                vote_anchor_ts_ms: WeightedTimestamp::ZERO,
                 global_receipt_root: Hash::ZERO,
                 tx_outcomes: Arc::new(vec![]),
             },
@@ -2668,11 +2661,11 @@ mod tests {
         state.pending_vote_retries.insert(
             wave_id.clone(),
             PendingVoteRetry {
-                sent_at_ts_ms: 5_000,
+                sent_at_ts_ms: WeightedTimestamp(5_000),
                 attempt: 0,
                 block_hash: Hash::from_bytes(b"block1"),
                 block_height: 1,
-                vote_anchor_ts_ms: 0,
+                vote_anchor_ts_ms: WeightedTimestamp::ZERO,
                 global_receipt_root: Hash::ZERO,
                 tx_outcomes: Arc::new(vec![]),
             },
@@ -2683,7 +2676,7 @@ mod tests {
         // Simulate receiving a verified local shard EC.
         let cert = hyperscale_types::ExecutionCertificate::new(
             wave_id.clone(),
-            0,
+            WeightedTimestamp::ZERO,
             Hash::ZERO,
             vec![],
             hyperscale_types::zero_bls_signature(),
@@ -2707,7 +2700,7 @@ mod tests {
 
         let cert = hyperscale_types::ExecutionCertificate::new(
             wave_id.clone(),
-            0,
+            WeightedTimestamp::ZERO,
             Hash::ZERO,
             vec![],
             hyperscale_types::zero_bls_signature(),
@@ -2797,7 +2790,7 @@ mod tests {
             WaveState::new(
                 local_wave.clone(),
                 Hash::from_bytes(b"block"),
-                5_000,
+                WeightedTimestamp(5_000),
                 vec![(tx, participating)],
                 false,
             ),
@@ -2808,7 +2801,7 @@ mod tests {
         // age-based gate would fire. The expectation must survive regardless
         // because a local wave still needs shard 1's EC.
         state.committed_height = 500;
-        state.committed_ts_ms = 60_000;
+        state.committed_ts_ms = WeightedTimestamp(60_000);
         let actions = state.check_exec_cert_timeouts(&topo);
 
         assert_eq!(
@@ -2828,7 +2821,7 @@ mod tests {
         state.waves.remove(&local_wave);
         state.wave_assignments.remove(&tx_hash);
         state.committed_height = 600;
-        state.committed_ts_ms = 120_000;
+        state.committed_ts_ms = WeightedTimestamp(120_000);
         let _ = state.check_exec_cert_timeouts(&topo);
         assert!(
             state.expected_exec_certs.is_empty(),

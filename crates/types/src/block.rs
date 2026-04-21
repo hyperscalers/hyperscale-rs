@@ -3,8 +3,8 @@
 use crate::{
     block_vote_message, compute_merkle_root, compute_padded_merkle_root, decode_finalized_wave_vec,
     encode_finalized_wave_vec, BlockHeight, Bls12381G1PrivateKey, Bls12381G2Signature,
-    FinalizedWave, Hash, Provision, QuorumCertificate, ReceiptBundle, RoutableTransaction,
-    ShardGroupId, ValidatorId, WaveId,
+    FinalizedWave, Hash, ProposerTimestamp, Provision, QuorumCertificate, ReceiptBundle,
+    RoutableTransaction, ShardGroupId, ValidatorId, WaveId,
 };
 use sbor::prelude::*;
 use std::collections::BTreeMap;
@@ -104,8 +104,13 @@ pub struct BlockHeader {
     /// Validator that proposed this block.
     pub proposer: ValidatorId,
 
-    /// Unix timestamp (milliseconds) when block was proposed.
-    pub timestamp: u64,
+    /// Proposer's local wall-clock when this block was proposed.
+    ///
+    /// **Not** BFT-authenticated. Used only for BFT liveness bounds (rejecting
+    /// rushed/stale proposals against the local validator's clock) and local
+    /// latency metrics. Never anchor a deterministic timeout on this — use
+    /// `qc.weighted_timestamp` / `ts_ms` fields derived from it instead.
+    pub timestamp: ProposerTimestamp,
 
     /// View/round number for view change protocol.
     pub round: u64,
@@ -198,7 +203,7 @@ impl BlockHeader {
             parent_hash: Hash::from_bytes(&[0u8; 32]),
             parent_qc: QuorumCertificate::genesis(),
             proposer,
-            timestamp: 0,
+            timestamp: ProposerTimestamp::ZERO,
             round: 0,
             is_fallback: false,
             state_root,
@@ -772,7 +777,7 @@ mod tests {
             parent_hash: Hash::from_bytes(b"parent"),
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(0),
-            timestamp: 1234567890,
+            timestamp: ProposerTimestamp(1234567890),
             round: 0,
             is_fallback: false,
             state_root: Hash::ZERO,
@@ -842,7 +847,7 @@ mod tests {
         let make_fw = |seed: u8| -> Arc<FinalizedWave> {
             let ec = Arc::new(ExecutionCertificate::new(
                 WaveId::new(ShardGroupId(0), 10, BTreeSet::from([ShardGroupId(1)])),
-                11,
+                crate::WeightedTimestamp(11),
                 Hash::from_bytes(&[seed + 100; 4]),
                 vec![TxOutcome {
                     tx_hash: Hash::from_bytes(&[seed; 4]),
@@ -880,7 +885,7 @@ mod tests {
 
         let ec = Arc::new(ExecutionCertificate::new(
             WaveId::new(ShardGroupId(0), 10, BTreeSet::new()),
-            11,
+            crate::WeightedTimestamp(11),
             Hash::from_bytes(b"receipt"),
             vec![TxOutcome {
                 tx_hash: Hash::from_bytes(b"tx1"),
@@ -933,8 +938,9 @@ pub struct BlockVote {
     pub voter: ValidatorId,
     /// BLS signature over the domain-separated signing message.
     pub signature: Bls12381G2Signature,
-    /// Timestamp when this vote was created (milliseconds since epoch).
-    pub timestamp: u64,
+    /// Voter's local wall-clock when this vote was created. Stake-weighted
+    /// into the QC's `weighted_timestamp` once 2f+1 votes are aggregated.
+    pub timestamp: ProposerTimestamp,
 }
 
 impl BlockVote {
@@ -946,7 +952,7 @@ impl BlockVote {
         round: u64,
         voter: ValidatorId,
         signing_key: &Bls12381G1PrivateKey,
-        timestamp: u64,
+        timestamp: ProposerTimestamp,
     ) -> Self {
         let message = block_vote_message(shard_group_id, height.0, round, &block_hash);
         let signature = signing_key.sign_v1(&message);

@@ -599,7 +599,7 @@ mod tests {
             parent_hash: Hash::ZERO,
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(0),
-            timestamp: 0,
+            timestamp: hyperscale_types::ProposerTimestamp::ZERO,
             round: 0,
             is_fallback: false,
             state_root: Hash::ZERO,

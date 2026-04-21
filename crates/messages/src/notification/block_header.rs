@@ -67,7 +67,9 @@ impl NetworkMessage for BlockHeaderNotification {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_types::{BlockHeight, Hash, QuorumCertificate, ShardGroupId, ValidatorId};
+    use hyperscale_types::{
+        BlockHeight, Hash, ProposerTimestamp, QuorumCertificate, ShardGroupId, ValidatorId,
+    };
     use std::collections::BTreeMap;
 
     use super::*;
@@ -79,7 +81,7 @@ mod tests {
             parent_hash: Hash::from_bytes(b"parent"),
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(0),
-            timestamp: 1234567890,
+            timestamp: ProposerTimestamp(1234567890),
             round: 0,
             is_fallback: false,
             state_root: Hash::ZERO,

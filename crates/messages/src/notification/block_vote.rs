@@ -43,7 +43,9 @@ impl NetworkMessage for BlockVoteNotification {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_types::{zero_bls_signature, BlockHeight, Hash, ShardGroupId, ValidatorId};
+    use hyperscale_types::{
+        zero_bls_signature, BlockHeight, Hash, ProposerTimestamp, ShardGroupId, ValidatorId,
+    };
 
     use super::*;
 
@@ -56,7 +58,7 @@ mod tests {
             round: 0,
             voter: ValidatorId(2),
             signature: zero_bls_signature(),
-            timestamp: 1000000000000,
+            timestamp: ProposerTimestamp(1000000000000),
         };
 
         let gossip = BlockVoteNotification::new(vote.clone());
@@ -72,7 +74,7 @@ mod tests {
             round: 0,
             voter: ValidatorId(1),
             signature: zero_bls_signature(),
-            timestamp: 1000000000000,
+            timestamp: ProposerTimestamp(1000000000000),
         };
 
         let gossip = BlockVoteNotification::new(vote.clone());

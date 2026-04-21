@@ -5,7 +5,8 @@
 
 use crate::TestCommittee;
 use hyperscale_types::{
-    block_vote_message, BlockHeight, BlockVote, Bls12381G2Signature, Hash, ShardGroupId,
+    block_vote_message, BlockHeight, BlockVote, Bls12381G2Signature, Hash, ProposerTimestamp,
+    ShardGroupId,
 };
 
 /// Create a block vote with an invalid signature (signed with wrong key).
@@ -32,7 +33,7 @@ pub fn make_wrong_key_block_vote(
         round,
         voter: committee.validator_id(claimed_voter_idx), // Claims to be this voter
         signature,                                        // But signed by different key
-        timestamp: 1000,
+        timestamp: ProposerTimestamp(1000),
     }
 }
 
@@ -60,7 +61,7 @@ pub fn make_wrong_message_block_vote(
         round,
         voter: committee.validator_id(voter_idx),
         signature, // But signed for different block
-        timestamp: 1000,
+        timestamp: ProposerTimestamp(1000),
     }
 }
 
@@ -88,7 +89,7 @@ pub fn make_garbage_signature_vote(
         round,
         voter: committee.validator_id(voter_idx),
         signature: make_garbage_signature(),
-        timestamp: 1000,
+        timestamp: ProposerTimestamp(1000),
     }
 }
 

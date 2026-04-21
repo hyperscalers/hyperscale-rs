@@ -48,6 +48,8 @@ impl NetworkMessage for CommittedBlockHeaderGossip {
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_types::ProposerTimestamp;
+
     use super::*;
 
     #[test]
@@ -72,7 +74,7 @@ mod tests {
             parent_hash: Hash::from_bytes(b"parent"),
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(0),
-            timestamp: 1234567890,
+            timestamp: ProposerTimestamp(1234567890),
             round: 0,
             is_fallback: false,
             state_root: Hash::ZERO,

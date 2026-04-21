@@ -8,7 +8,9 @@ use hyperscale_storage::{
     ChainReader, ChainWriter, DatabaseUpdate, DatabaseUpdates, DbPartitionKey, DbSortKey,
     NodeDatabaseUpdates, PartitionDatabaseUpdates, SubstateDatabase, SubstateStore,
 };
-use hyperscale_types::{BlockHeight, Hash, QuorumCertificate, ReceiptBundle, ShardGroupId};
+use hyperscale_types::{
+    BlockHeight, Hash, QuorumCertificate, ReceiptBundle, ShardGroupId, WeightedTimestamp,
+};
 use std::sync::Arc;
 use tempfile::TempDir;
 
@@ -185,7 +187,10 @@ fn test_block_storage_and_retrieval() {
 
     let stored = storage.get_block(BlockHeight(1)).unwrap();
     assert_eq!(stored.block.height(), BlockHeight(1));
-    assert_eq!(stored.block.header().timestamp, 1_000);
+    assert_eq!(
+        stored.block.header().timestamp,
+        hyperscale_types::ProposerTimestamp(1_000)
+    );
     assert_eq!(stored.qc.block_hash, block.hash());
 }
 
@@ -224,7 +229,7 @@ fn test_recovery_with_qc() {
             round: 5,
             aggregated_signature: zero_bls_signature(),
             signers: SignerBitfield::new(4),
-            weighted_timestamp_ms: 100_000,
+            weighted_timestamp: WeightedTimestamp(100_000),
         };
         storage.set_chain_metadata(BlockHeight(100), Some(expected_hash), Some(&qc));
     }

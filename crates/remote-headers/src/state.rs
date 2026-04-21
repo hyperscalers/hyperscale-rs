@@ -218,7 +218,7 @@ impl RemoteHeaderCoordinator {
         sender_map.insert(sender, Arc::clone(&committed_header));
 
         // Update tip and prune old entries.
-        let header_ts_ms = committed_header.qc.weighted_timestamp_ms;
+        let header_ts_ms = committed_header.qc.weighted_timestamp.as_millis();
         self.update_tip_and_prune(shard, height, header_ts_ms);
 
         if first_for_key {
@@ -332,7 +332,7 @@ impl RemoteHeaderCoordinator {
         certified: &hyperscale_types::CertifiedBlock,
     ) -> Vec<Action> {
         self.local_committed_height = certified.block.height();
-        self.local_committed_ts_ms = certified.qc.weighted_timestamp_ms;
+        self.local_committed_ts_ms = certified.qc.weighted_timestamp.as_millis();
 
         // Seed expected headers for remote shards we haven't seen yet.
         let local_shard = topology.local_shard();
@@ -517,8 +517,9 @@ impl RemoteHeaderCoordinator {
         for (&shard, &(_, tip_ts)) in &self.tips {
             let cutoff_ms = tip_ts.saturating_sub(retention_ms);
             if cutoff_ms > 0 {
-                self.verified
-                    .retain(|&(s, _), hdr| s != shard || hdr.qc.weighted_timestamp_ms >= cutoff_ms);
+                self.verified.retain(|&(s, _), hdr| {
+                    s != shard || hdr.qc.weighted_timestamp.as_millis() >= cutoff_ms
+                });
             }
         }
     }
@@ -545,10 +546,11 @@ impl RemoteHeaderCoordinator {
                 s != shard
                     || sender_map
                         .values()
-                        .any(|h| h.qc.weighted_timestamp_ms >= cutoff_ms)
+                        .any(|h| h.qc.weighted_timestamp.as_millis() >= cutoff_ms)
             });
-            self.verified
-                .retain(|&(s, _), hdr| s != shard || hdr.qc.weighted_timestamp_ms >= cutoff_ms);
+            self.verified.retain(|&(s, _), hdr| {
+                s != shard || hdr.qc.weighted_timestamp.as_millis() >= cutoff_ms
+            });
         }
     }
 
@@ -613,7 +615,7 @@ mod tests {
             parent_hash: Hash::ZERO,
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(0),
-            timestamp: 1234567890,
+            timestamp: hyperscale_types::ProposerTimestamp(1234567890),
             round: 0,
             is_fallback: false,
             state_root: Hash::ZERO,

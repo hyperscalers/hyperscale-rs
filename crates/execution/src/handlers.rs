@@ -3,7 +3,7 @@
 use hyperscale_types::{
     batch_verify_bls_same_message, exec_vote_message, verify_bls12381_v1, zero_bls_signature,
     Bls12381G1PublicKey, Bls12381G2Signature, ExecutionCertificate, ExecutionVote, Hash,
-    ShardGroupId, SignerBitfield, ValidatorId, WaveId,
+    ShardGroupId, SignerBitfield, ValidatorId, WaveId, WeightedTimestamp,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -60,7 +60,10 @@ pub fn aggregate_execution_certificate(
         }
     }
 
-    let vote_anchor_ts_ms = votes.first().map(|v| v.vote_anchor_ts_ms).unwrap_or(0);
+    let vote_anchor_ts_ms = votes
+        .first()
+        .map(|v| v.vote_anchor_ts_ms)
+        .unwrap_or(WeightedTimestamp::ZERO);
 
     ExecutionCertificate::new(
         wave_id.clone(),

@@ -11,8 +11,9 @@ use crate::{
 use hyperscale_types::{
     zero_bls_signature, ApplicationEvent, Block, BlockHeader, BlockHeight, Bls12381G2Signature,
     ExecutionCertificate, ExecutionMetadata, ExecutionOutcome, FeeSummary, FinalizedWave, Hash,
-    LocalReceipt, LogLevel, NodeId, QuorumCertificate, ReceiptBundle, ShardGroupId, SignerBitfield,
-    TransactionOutcome, TxOutcome, ValidatorId, WaveCertificate, WaveId,
+    LocalReceipt, LogLevel, NodeId, ProposerTimestamp, QuorumCertificate, ReceiptBundle,
+    ShardGroupId, SignerBitfield, TransactionOutcome, TxOutcome, ValidatorId, WaveCertificate,
+    WaveId, WeightedTimestamp,
 };
 use radix_common::prelude::DatabaseUpdate;
 use radix_substate_store_interface::db_key_mapper::{DatabaseKeyMapper, SpreadPrefixKeyMapper};
@@ -95,7 +96,7 @@ pub fn make_test_block(height: u64) -> Block {
             parent_hash: Hash::from_bytes(&parent_bytes),
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(0),
-            timestamp: height * 1000,
+            timestamp: ProposerTimestamp(height * 1000),
             round: 0,
             is_fallback: false,
             state_root: Hash::ZERO,
@@ -123,7 +124,7 @@ pub fn make_test_qc(block: &Block) -> QuorumCertificate {
         round: 0,
         aggregated_signature: zero_bls_signature(),
         signers: SignerBitfield::new(4),
-        weighted_timestamp_ms: block.header().timestamp,
+        weighted_timestamp: WeightedTimestamp(block.header().timestamp.as_millis()),
     }
 }
 
@@ -164,7 +165,7 @@ pub fn make_test_receipt_bundle(seed: u8) -> ReceiptBundle {
 pub fn make_test_execution_certificate(seed: u8, block_height: u64) -> ExecutionCertificate {
     ExecutionCertificate::new(
         WaveId::new(ShardGroupId(0), block_height, BTreeSet::new()),
-        block_height + 1,
+        WeightedTimestamp(block_height + 1),
         Hash::from_bytes(&[seed + 50; 32]),
         vec![TxOutcome {
             tx_hash: Hash::from_bytes(&[seed + 100; 32]),

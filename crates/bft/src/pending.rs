@@ -307,7 +307,7 @@ mod tests {
             parent_hash: Hash::from_bytes(b"parent"),
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(0),
-            timestamp: 1234567890,
+            timestamp: hyperscale_types::ProposerTimestamp(1234567890),
             round: 0,
             is_fallback: false,
             state_root: Hash::ZERO,

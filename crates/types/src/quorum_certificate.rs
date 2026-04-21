@@ -2,7 +2,7 @@
 
 use crate::{
     block_vote_message, zero_bls_signature, BlockHeight, Bls12381G2Signature, Hash, ShardGroupId,
-    SignerBitfield,
+    SignerBitfield, WeightedTimestamp,
 };
 use sbor::prelude::*;
 
@@ -32,9 +32,9 @@ pub struct QuorumCertificate {
     /// Aggregated BLS signature from all signers.
     pub aggregated_signature: Bls12381G2Signature,
 
-    /// Stake-weighted timestamp in milliseconds.
+    /// BFT-authenticated stake-weighted block timestamp.
     /// Computed as: sum(timestamp_i * stake_i) / sum(stake_i)
-    pub weighted_timestamp_ms: u64,
+    pub weighted_timestamp: WeightedTimestamp,
 }
 
 impl QuorumCertificate {
@@ -50,7 +50,7 @@ impl QuorumCertificate {
             round: 0,
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
-            weighted_timestamp_ms: 0,
+            weighted_timestamp: WeightedTimestamp::ZERO,
         }
     }
 
@@ -140,7 +140,7 @@ mod tests {
             round: 0,
             signers,
             aggregated_signature: zero_bls_signature(),
-            weighted_timestamp_ms: 1000,
+            weighted_timestamp: WeightedTimestamp(1000),
         };
 
         assert!(!qc.is_genesis());

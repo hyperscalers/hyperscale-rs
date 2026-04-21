@@ -9,8 +9,9 @@ use hyperscale_types::{
     batch_verify_bls_same_message, compute_certificate_root, compute_local_receipt_root,
     compute_provision_root, compute_provision_tx_roots, compute_transaction_root, compute_waves,
     verify_bls12381_v1, Block, BlockHeader, BlockHeight, BlockVote, Bls12381G1PublicKey,
-    Bls12381G2Signature, FinalizedWave, Hash, QuorumCertificate, ReceiptBundle,
+    Bls12381G2Signature, FinalizedWave, Hash, ProposerTimestamp, QuorumCertificate, ReceiptBundle,
     RoutableTransaction, ShardGroupId, SignerBitfield, TopologySnapshot, ValidatorId, VotePower,
+    WeightedTimestamp,
 };
 use std::sync::Arc;
 
@@ -115,7 +116,7 @@ pub fn verify_and_build_qc(
 
                 for (idx, vote, power) in &sorted_votes {
                     signers.set(*idx);
-                    timestamp_weight_sum += vote.timestamp as u128 * *power as u128;
+                    timestamp_weight_sum += vote.timestamp.as_millis() as u128 * *power as u128;
                 }
 
                 let weighted_timestamp_ms = if verified_power == 0 {
@@ -132,7 +133,7 @@ pub fn verify_and_build_qc(
                     round,
                     aggregated_signature,
                     signers,
-                    weighted_timestamp_ms,
+                    weighted_timestamp: WeightedTimestamp(weighted_timestamp_ms),
                 })
             }
             Err(e) => {
@@ -365,7 +366,7 @@ pub fn build_proposal<S: ChainWriter + SubstateStore>(
     round: u64,
     parent_hash: Hash,
     parent_qc: QuorumCertificate,
-    timestamp: u64,
+    timestamp: ProposerTimestamp,
     is_fallback: bool,
     parent_state_root: Hash,
     parent_block_height: u64,

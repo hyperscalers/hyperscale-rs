@@ -17,7 +17,9 @@
 //! we have enough voting power for quorum. This avoids wasting CPU on votes
 //! we'll never use.
 
-use hyperscale_types::{Bls12381G1PublicKey, ExecutionVote, Hash, ValidatorId, WaveId};
+use hyperscale_types::{
+    Bls12381G1PublicKey, ExecutionVote, Hash, ValidatorId, WaveId, WeightedTimestamp,
+};
 use std::collections::{BTreeMap, HashSet};
 
 /// Key for grouping votes: `(global_receipt_root, vote_anchor_ts_ms)`.
@@ -25,7 +27,7 @@ use std::collections::{BTreeMap, HashSet};
 /// Votes at different heights have different BLS signatures and cannot be
 /// aggregated together. This prevents stale votes from combining with new
 /// ones if an abort intent changes the global_receipt_root between heights.
-type VoteKey = (Hash, u64);
+type VoteKey = (Hash, WeightedTimestamp);
 
 /// Tracks execution votes for a specific wave within a block.
 ///
@@ -59,7 +61,7 @@ pub struct VoteTracker {
     unverified_power: u64,
     /// Validators we've already seen votes from at each vote_anchor_ts_ms (dedup).
     /// Key is (validator_id, vote_anchor_ts_ms).
-    seen: HashSet<(ValidatorId, u64)>,
+    seen: HashSet<(ValidatorId, WeightedTimestamp)>,
     /// Whether a verification batch is currently in flight.
     pending_verification: bool,
 }
@@ -169,12 +171,12 @@ impl VoteTracker {
     ///
     /// Returns `Some((global_receipt_root, vote_anchor_ts_ms, total_power))` if quorum reached.
     /// If multiple pairs have quorum, returns the one with the lowest vote_anchor_ts_ms.
-    pub fn check_quorum(&self) -> Option<(Hash, u64, u64)> {
-        let mut best: Option<(Hash, u64, u64)> = None;
+    pub fn check_quorum(&self) -> Option<(Hash, WeightedTimestamp, u64)> {
+        let mut best: Option<(Hash, WeightedTimestamp, u64)> = None;
         for (&(global_receipt_root, vote_anchor_ts_ms), &power) in &self.power_by_key {
             if power >= self.quorum {
                 match &best {
-                    Some((_, best_height, _)) if vote_anchor_ts_ms >= *best_height => {}
+                    Some((_, best_anchor, _)) if vote_anchor_ts_ms >= *best_anchor => {}
                     _ => best = Some((global_receipt_root, vote_anchor_ts_ms, power)),
                 }
             }
@@ -186,7 +188,7 @@ impl VoteTracker {
     pub fn take_votes(
         &mut self,
         global_receipt_root: &Hash,
-        vote_anchor_ts_ms: u64,
+        vote_anchor_ts_ms: WeightedTimestamp,
     ) -> Vec<ExecutionVote> {
         let key = (*global_receipt_root, vote_anchor_ts_ms);
         self.votes_by_key.remove(&key).unwrap_or_default()
@@ -241,7 +243,7 @@ mod tests {
         ExecutionVote {
             block_hash: Hash::from_bytes(b"block"),
             block_height: 10,
-            vote_anchor_ts_ms: 11,
+            vote_anchor_ts_ms: WeightedTimestamp(11),
             wave_id: WaveId::new(ShardGroupId(0), 0, BTreeSet::new()),
             shard_group_id: ShardGroupId(0),
             global_receipt_root,
@@ -273,7 +275,7 @@ mod tests {
         assert!(result.is_some());
         let (r, vh, power) = result.unwrap();
         assert_eq!(r, root);
-        assert_eq!(vh, 11); // vote_anchor_ts_ms from make_vote
+        assert_eq!(vh, WeightedTimestamp(11)); // vote_anchor_ts_ms from make_vote
         assert_eq!(power, 3);
         assert_eq!(tracker.votes_for_global_receipt_root(&root).len(), 3);
     }

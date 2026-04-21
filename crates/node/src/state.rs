@@ -332,8 +332,10 @@ impl NodeStateMachine {
             .iter()
             .map(|tx| tx.hash())
             .collect();
-        self.bft
-            .register_committed_transactions(&tx_hashes, certified.qc.weighted_timestamp_ms);
+        self.bft.register_committed_transactions(
+            &tx_hashes,
+            certified.qc.weighted_timestamp.as_millis(),
+        );
 
         // Mark this block as a usable parent for child state-root verifications.
         // By the time BlockCommitted fires, the block's JMT snapshot is in

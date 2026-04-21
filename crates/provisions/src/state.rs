@@ -275,7 +275,7 @@ impl ProvisionCoordinator {
     ) -> Vec<Action> {
         let block = &certified.block;
         self.local_committed_height = block.height();
-        self.local_committed_ts_ms = certified.qc.weighted_timestamp_ms;
+        self.local_committed_ts_ms = certified.qc.weighted_timestamp.as_millis();
 
         // Record provision batches committed in this block, but don't
         // evict them yet — peers catching up within the cross-shard
@@ -734,6 +734,7 @@ mod tests {
     use hyperscale_types::{
         bls_keypair_from_seed, BlockHeader, Bls12381G1PrivateKey, Hash, MerkleInclusionProof,
         QuorumCertificate, TopologySnapshot, TxEntries, ValidatorInfo, ValidatorSet, WaveId,
+        WeightedTimestamp,
     };
 
     fn make_test_topology(local_shard: ShardGroupId) -> TopologySnapshot {
@@ -1236,7 +1237,7 @@ mod tests {
             parent_hash: Hash::from_bytes(b"parent"),
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(0),
-            timestamp: 1000 + height,
+            timestamp: hyperscale_types::ProposerTimestamp(1000 + height),
             round: 0,
             is_fallback: false,
             state_root: Hash::from_bytes(format!("root_{shard}_{height}").as_bytes()),
@@ -1274,7 +1275,7 @@ mod tests {
         };
         let qc = hyperscale_types::QuorumCertificate {
             block_hash: block.hash(),
-            weighted_timestamp_ms: height * TEST_BLOCK_INTERVAL_MS,
+            weighted_timestamp: WeightedTimestamp(height * TEST_BLOCK_INTERVAL_MS),
             ..hyperscale_types::QuorumCertificate::genesis()
         };
         hyperscale_types::CertifiedBlock::new_unchecked(block, qc)

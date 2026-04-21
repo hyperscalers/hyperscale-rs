@@ -13,7 +13,7 @@
 //! the complete block data, making it recoverable from any honest validator in that set.
 
 use hyperscale_core::{Action, CommitSource, ProtocolEvent, TimerId};
-use hyperscale_types::REMOTE_HEADER_RETENTION;
+use hyperscale_types::{ProposerTimestamp, REMOTE_HEADER_RETENTION};
 
 /// How long to retain committed transaction hashes for proposal dedup.
 /// Matches the mempool tombstone window so entries outlive any possible
@@ -313,7 +313,7 @@ impl BftState {
             committed_ts_ms: recovered
                 .latest_qc
                 .as_ref()
-                .map(|qc| qc.weighted_timestamp_ms)
+                .map(|qc| qc.weighted_timestamp.as_millis())
                 .unwrap_or(0),
             committed_state_root: recovered.jmt_root.unwrap_or(Hash::ZERO),
             latest_qc: recovered.latest_qc,
@@ -365,7 +365,7 @@ impl BftState {
             return vec![];
         }
 
-        let header_ts_ms = header.qc.weighted_timestamp_ms;
+        let header_ts_ms = header.qc.weighted_timestamp.as_millis();
         self.remote_headers.insert(key, Arc::clone(&header));
 
         // Update tip and prune old headers for this shard.
@@ -379,8 +379,9 @@ impl BftState {
         let retention_ms = REMOTE_HEADER_RETENTION.as_millis() as u64;
         let cutoff_ms = tip.1.saturating_sub(retention_ms);
         if cutoff_ms > 0 {
-            self.remote_headers
-                .retain(|&(s, _), hdr| s != shard || hdr.qc.weighted_timestamp_ms >= cutoff_ms);
+            self.remote_headers.retain(|&(s, _), hdr| {
+                s != shard || hdr.qc.weighted_timestamp.as_millis() >= cutoff_ms
+            });
         }
 
         vec![]
@@ -980,7 +981,7 @@ impl BftState {
             (self.committed_hash, QuorumCertificate::genesis())
         };
 
-        let timestamp = self.now.as_millis() as u64;
+        let timestamp = ProposerTimestamp(self.now.as_millis() as u64);
         let block_height = BlockHeight(next_height);
 
         // Walk the QC chain to find certificates and transactions already in
@@ -1139,7 +1140,7 @@ impl BftState {
 
         // Fallback blocks inherit the parent's timestamp - this prevents time manipulation
         // during view changes where a Byzantine proposer might try to advance consensus time
-        let timestamp = parent_qc.weighted_timestamp_ms;
+        let timestamp = ProposerTimestamp(parent_qc.weighted_timestamp.as_millis());
 
         let parent_state_root = self.parent_state_root(parent_hash);
         let parent_in_flight = self.parent_in_flight(parent_hash);
@@ -1227,7 +1228,7 @@ impl BftState {
         // Sync blocks use normal timestamps - the proposer is online with a good clock,
         // they just can't execute transactions. This differs from fallback blocks which
         // inherit the parent timestamp (proposed after timeout, clock may have drifted).
-        let timestamp = self.now.as_millis() as u64;
+        let timestamp = ProposerTimestamp(self.now.as_millis() as u64);
 
         let parent_state_root = self.parent_state_root(parent_hash);
         let parent_in_flight = self.parent_in_flight(parent_hash);
@@ -1773,20 +1774,21 @@ impl BftState {
         }
 
         let now = self.now.as_millis() as u64;
+        let header_ts_ms = header.timestamp.as_millis();
 
         // Check if timestamp is too old
-        if header.timestamp < now.saturating_sub(self.config.max_timestamp_delay_ms) {
+        if header_ts_ms < now.saturating_sub(self.config.max_timestamp_delay_ms) {
             return Err(format!(
                 "proposer timestamp {} is too old (now: {}, max delay: {}ms)",
-                header.timestamp, now, self.config.max_timestamp_delay_ms
+                header_ts_ms, now, self.config.max_timestamp_delay_ms
             ));
         }
 
         // Check if timestamp is too far in the future
-        if header.timestamp > now + self.config.max_timestamp_rush_ms {
+        if header_ts_ms > now + self.config.max_timestamp_rush_ms {
             return Err(format!(
                 "proposer timestamp {} is too far ahead (now: {}, max rush: {}ms)",
-                header.timestamp, now, self.config.max_timestamp_rush_ms
+                header_ts_ms, now, self.config.max_timestamp_rush_ms
             ));
         }
 
@@ -2198,7 +2200,7 @@ impl BftState {
         // cascading view changes under normal load.
         self.record_leader_activity();
 
-        let timestamp = self.now.as_millis() as u64;
+        let timestamp = ProposerTimestamp(self.now.as_millis() as u64);
 
         debug!(
             validator = ?topology.local_validator_id(),
@@ -3220,8 +3222,11 @@ impl BftState {
             let parent_state_root = self.committed_state_root;
             let parent_block_height = self.committed_height;
 
-            let removed_blocks =
-                self.record_block_committed(&block, current_hash, current_qc.weighted_timestamp_ms);
+            let removed_blocks = self.record_block_committed(
+                &block,
+                current_hash,
+                current_qc.weighted_timestamp.as_millis(),
+            );
             self.record_leader_activity();
 
             for block_hash in removed_blocks {
@@ -3496,7 +3501,7 @@ impl BftState {
         // Advance committed_height. The QC is the proof of commit — same
         // timing as the consensus path.
         let removed_blocks =
-            self.record_block_committed(&block, block_hash, qc.weighted_timestamp_ms);
+            self.record_block_committed(&block, block_hash, qc.weighted_timestamp.as_millis());
 
         // Track sync progress for the loop iterator.
         self.sync.set_sync_applied_height(height);
@@ -4749,6 +4754,7 @@ mod tests {
     use hyperscale_types::{
         batch_verify_bls_same_message, generate_bls_keypair, verify_bls12381_v1,
         zero_bls_signature, Bls12381G2Signature, SignerBitfield, ValidatorInfo, ValidatorSet,
+        WeightedTimestamp,
     };
     use hyperscale_types::{Bls12381G1PrivateKey, TopologySnapshot};
     use std::collections::BTreeMap;
@@ -4810,14 +4816,14 @@ mod tests {
         assert!(!topology.should_propose(0, 1));
     }
 
-    fn make_header_at_height(height: u64, timestamp: u64) -> BlockHeader {
+    fn make_header_at_height(height: u64, timestamp_ms: u64) -> BlockHeader {
         BlockHeader {
             shard_group_id: ShardGroupId(0),
             height: BlockHeight(height),
             parent_hash: Hash::from_bytes(b"parent"),
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(height % 4), // Round-robin
-            timestamp,
+            timestamp: ProposerTimestamp(timestamp_ms),
             round: 0,
             is_fallback: false,
             state_root: Hash::ZERO,
@@ -4852,7 +4858,7 @@ mod tests {
             parent_hash: Hash::from_bytes(b"genesis_parent"),
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(0),
-            timestamp: 0, // Genesis timestamp is 0
+            timestamp: ProposerTimestamp::ZERO, // Genesis timestamp is 0
             round: 0,
             is_fallback: false,
             state_root: Hash::ZERO,
@@ -4952,8 +4958,8 @@ mod tests {
             parent_hash: Hash::from_bytes(b"parent"),
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(1),
-            timestamp: 50_000, // 50 seconds - would fail normal validation (now=100s, max_delay=30s)
-            round: 5,          // High round indicates view changes occurred
+            timestamp: ProposerTimestamp(50_000), // 50 seconds - would fail normal validation (now=100s, max_delay=30s)
+            round: 5,                             // High round indicates view changes occurred
             is_fallback: true,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
@@ -4978,7 +4984,7 @@ mod tests {
             parent_hash: Hash::from_bytes(b"parent"),
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(1),
-            timestamp: 50_000,
+            timestamp: ProposerTimestamp(50_000),
             round: 5,
             is_fallback: false,
             state_root: Hash::ZERO,
@@ -5047,7 +5053,7 @@ mod tests {
             aggregated_signature: zero_bls_signature(), // Dummy for test
             signers,
 
-            weighted_timestamp_ms: 99_000,
+            weighted_timestamp: WeightedTimestamp(99_000),
         };
 
         let header = BlockHeader {
@@ -5056,7 +5062,7 @@ mod tests {
             parent_hash,
             parent_qc: parent_qc.clone(),
             proposer: ValidatorId(2), // height 2, round 0 -> validator 2
-            timestamp: 100_000,
+            timestamp: ProposerTimestamp(100_000),
             round: 0,
             is_fallback: false,
             state_root: Hash::ZERO,
@@ -5136,7 +5142,7 @@ mod tests {
             aggregated_signature: zero_bls_signature(),
             signers,
 
-            weighted_timestamp_ms: 99_000,
+            weighted_timestamp: WeightedTimestamp(99_000),
         };
 
         let header = BlockHeader {
@@ -5145,7 +5151,7 @@ mod tests {
             parent_hash,
             parent_qc: parent_qc.clone(),
             proposer: ValidatorId(2),
-            timestamp: 100_000,
+            timestamp: ProposerTimestamp(100_000),
             round: 0,
             is_fallback: false,
             state_root: Hash::ZERO,
@@ -5244,7 +5250,7 @@ mod tests {
             aggregated_signature: zero_bls_signature(),
             signers,
 
-            weighted_timestamp_ms: 99_000,
+            weighted_timestamp: WeightedTimestamp(99_000),
         };
 
         let header = BlockHeader {
@@ -5253,7 +5259,7 @@ mod tests {
             parent_hash,
             parent_qc: parent_qc.clone(),
             proposer: ValidatorId(2),
-            timestamp: 100_000,
+            timestamp: ProposerTimestamp(100_000),
             round: 0,
             is_fallback: false,
             state_root: Hash::ZERO,
@@ -5329,7 +5335,7 @@ mod tests {
             parent_hash: Hash::ZERO,
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(1), // height 1, round 0 -> validator 1
-            timestamp: 100_000,
+            timestamp: ProposerTimestamp(100_000),
             round: 0,
             is_fallback: false,
             state_root: Hash::ZERO,
@@ -5470,7 +5476,7 @@ mod tests {
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
 
-            weighted_timestamp_ms: 100_000,
+            weighted_timestamp: WeightedTimestamp(100_000),
         };
 
         state.maybe_unlock_for_qc(&topology, &qc);
@@ -5506,7 +5512,7 @@ mod tests {
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
 
-            weighted_timestamp_ms: 100_000,
+            weighted_timestamp: WeightedTimestamp(100_000),
         };
 
         state.maybe_unlock_for_qc(&topology, &qc);
@@ -5531,7 +5537,7 @@ mod tests {
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
 
-            weighted_timestamp_ms: 100_000,
+            weighted_timestamp: WeightedTimestamp(100_000),
         };
 
         state.maybe_unlock_for_qc(&topology, &qc);
@@ -5596,7 +5602,7 @@ mod tests {
             parent_hash: Hash::from_bytes(b"parent"),
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(1),
-            timestamp: 100_000,
+            timestamp: ProposerTimestamp(100_000),
             round: round_0,
             is_fallback: false,
             state_root: Hash::ZERO,
@@ -5616,7 +5622,7 @@ mod tests {
             parent_hash: Hash::from_bytes(b"parent"),
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(2),
-            timestamp: 100_001, // Different timestamp = different hash
+            timestamp: ProposerTimestamp(100_001), // Different timestamp = different hash
             round: round_1,
             is_fallback: false,
             state_root: Hash::ZERO,
@@ -5665,7 +5671,7 @@ mod tests {
             parent_hash: Hash::from_bytes(b"parent"),
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(1),
-            timestamp: 100_000,
+            timestamp: ProposerTimestamp(100_000),
             round: 0,
             is_fallback: false,
             state_root: Hash::ZERO,
@@ -5708,7 +5714,7 @@ mod tests {
                 parent_hash: Hash::from_bytes(b"parent"),
                 parent_qc: QuorumCertificate::genesis(),
                 proposer: ValidatorId(1),
-                timestamp: 100_000,
+                timestamp: ProposerTimestamp(100_000),
                 round: 0,
                 is_fallback: false,
                 state_root: Hash::ZERO,
@@ -5768,7 +5774,7 @@ mod tests {
             round,
             voter: byzantine_voter,
             signature: zero_bls_signature(),
-            timestamp: 100_000,
+            timestamp: ProposerTimestamp(100_000),
         };
 
         // Simulate verified vote being processed (no QC formed)
@@ -5794,7 +5800,7 @@ mod tests {
             round,
             voter: byzantine_voter,
             signature: zero_bls_signature(),
-            timestamp: 100_000,
+            timestamp: ProposerTimestamp(100_000),
         };
 
         // Process second verified vote - equivocation should be detected and logged
@@ -5833,7 +5839,7 @@ mod tests {
             round: 0,
             voter,
             signature: zero_bls_signature(),
-            timestamp: 100_000,
+            timestamp: ProposerTimestamp(100_000),
         };
         let verified_votes_a = vec![(0usize, vote_a, 1u64)];
         let _actions = state.on_qc_result(&topology, block_a, None, verified_votes_a);
@@ -5846,7 +5852,7 @@ mod tests {
             round: 1, // Different round
             voter,
             signature: zero_bls_signature(),
-            timestamp: 100_000,
+            timestamp: ProposerTimestamp(100_000),
         };
         let verified_votes_b = vec![(0usize, vote_b, 1u64)];
         let _actions = state.on_qc_result(&topology, block_b, None, verified_votes_b);
@@ -5880,7 +5886,7 @@ mod tests {
             round,
             voter,
             signature: zero_bls_signature(),
-            timestamp: 100_000,
+            timestamp: ProposerTimestamp(100_000),
         };
         let verified_votes_h5 = vec![(0usize, vote_h5.clone(), 1u64)];
         let _actions = state.on_qc_result(&topology, vote_h5.block_hash, None, verified_votes_h5);
@@ -5893,7 +5899,7 @@ mod tests {
             round,
             voter,
             signature: zero_bls_signature(),
-            timestamp: 100_000,
+            timestamp: ProposerTimestamp(100_000),
         };
         let verified_votes_h6 = vec![(0usize, vote_h6.clone(), 1u64)];
         let _actions = state.on_qc_result(&topology, vote_h6.block_hash, None, verified_votes_h6);
@@ -5934,7 +5940,7 @@ mod tests {
             round,
             voter: legitimate_voter,
             signature: zero_bls_signature(),
-            timestamp: 100_000,
+            timestamp: ProposerTimestamp(100_000),
         };
 
         // Simulate verification result - only legitimate vote verified
@@ -6010,7 +6016,7 @@ mod tests {
             parent_hash: Hash::from_bytes(b"parent"),
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(1),
-            timestamp: 100_000,
+            timestamp: ProposerTimestamp(100_000),
             round: original_round,
             is_fallback: false,
             state_root: Hash::ZERO,
@@ -6091,7 +6097,7 @@ mod tests {
             parent_hash: Hash::from_bytes(b"parent"),
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(1),
-            timestamp: (state.now.as_millis() as u64), // Current time for timestamp validation
+            timestamp: ProposerTimestamp(state.now.as_millis() as u64), // Current time for timestamp validation
             round: original_round,
             is_fallback: false,
             state_root: Hash::ZERO,
@@ -6131,7 +6137,7 @@ mod tests {
             parent_hash: Hash::from_bytes(b"parent"),
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(3), // Wrong! Should be ValidatorId(1) for round=0
-            timestamp: (state.now.as_millis() as u64),
+            timestamp: ProposerTimestamp(state.now.as_millis() as u64),
             round: 0,
             is_fallback: false,
             state_root: Hash::ZERO,
@@ -6257,7 +6263,7 @@ mod tests {
             round: 0,
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
-            weighted_timestamp_ms: 100_000,
+            weighted_timestamp: WeightedTimestamp(100_000),
         };
         state.latest_qc = Some(qc);
 
@@ -6315,7 +6321,7 @@ mod tests {
             round: 3, // Different round from our votes
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
-            weighted_timestamp_ms: 100_000,
+            weighted_timestamp: WeightedTimestamp(100_000),
         };
 
         state.maybe_unlock_for_qc(&topology, &qc);
@@ -6358,7 +6364,7 @@ mod tests {
             round: 0,
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
-            weighted_timestamp_ms: 100_000,
+            weighted_timestamp: WeightedTimestamp(100_000),
         };
 
         state.maybe_unlock_for_qc(&topology, &qc);
@@ -6463,7 +6469,7 @@ mod tests {
             parent_hash: Hash::from_bytes(b"parent"),
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(1), // proposer_for(1, 0) = 1
-            timestamp: 100_000,
+            timestamp: ProposerTimestamp(100_000),
             round: 0,
             is_fallback: false,
             state_root: Hash::ZERO,
@@ -6601,7 +6607,7 @@ mod tests {
             round: 0,
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
-            weighted_timestamp_ms: 100_000,
+            weighted_timestamp: WeightedTimestamp(100_000),
         };
         state.maybe_unlock_for_qc(&topology, &qc_h1);
 
@@ -6694,7 +6700,7 @@ mod tests {
             parent_hash: Hash::from_bytes(b"parent"),
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(2), // (5 + 1) % 4 = 2
-            timestamp: 100_000,
+            timestamp: ProposerTimestamp(100_000),
             round: 1,
             is_fallback: true,
             state_root: Hash::ZERO,
@@ -6714,7 +6720,7 @@ mod tests {
             parent_hash: Hash::from_bytes(b"parent"),
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(3), // (5 + 2) % 4 = 3
-            timestamp: 100_001,
+            timestamp: ProposerTimestamp(100_001),
             round: 2,
             is_fallback: true,
             state_root: Hash::ZERO,
@@ -6734,7 +6740,7 @@ mod tests {
             parent_hash: Hash::from_bytes(b"parent"),
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(0), // (5 + 3) % 4 = 0
-            timestamp: 100_002,
+            timestamp: ProposerTimestamp(100_002),
             round: 3,
             is_fallback: true,
             state_root: Hash::ZERO,
@@ -6755,7 +6761,7 @@ mod tests {
             parent_hash: Hash::from_bytes(b"parent"),
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(2), // (6 + 0) % 4 = 2
-            timestamp: 100_003,
+            timestamp: ProposerTimestamp(100_003),
             round: 0,
             is_fallback: false,
             state_root: Hash::ZERO,
@@ -6782,7 +6788,7 @@ mod tests {
                 1,
                 ValidatorId(0),
                 &keys[0],
-                100_000,
+                ProposerTimestamp(100_000),
             ),
             1,
         );
@@ -6798,7 +6804,7 @@ mod tests {
                 2,
                 ValidatorId(1),
                 &keys[1],
-                100_001,
+                ProposerTimestamp(100_001),
             ),
             1,
         );
@@ -6814,7 +6820,7 @@ mod tests {
                 3,
                 ValidatorId(2),
                 &keys[2],
-                100_002,
+                ProposerTimestamp(100_002),
             ),
             1,
         );
@@ -6830,7 +6836,7 @@ mod tests {
                 0,
                 ValidatorId(3),
                 &keys[3],
-                100_003,
+                ProposerTimestamp(100_003),
             ),
             1,
         );
@@ -6905,7 +6911,7 @@ mod tests {
             round: 0,
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
-            weighted_timestamp_ms: 100_000,
+            weighted_timestamp: WeightedTimestamp(100_000),
         };
 
         let actions = state.on_qc_formed(
@@ -6979,7 +6985,7 @@ mod tests {
             aggregated_signature: zero_bls_signature(),
             signers: signers.clone(),
 
-            weighted_timestamp_ms: 99_000,
+            weighted_timestamp: WeightedTimestamp(99_000),
         };
 
         // First block at height 2, round 0
@@ -6989,7 +6995,7 @@ mod tests {
             parent_hash,
             parent_qc: parent_qc.clone(),
             proposer: ValidatorId(2), // height 2, round 0 -> validator 2
-            timestamp: 100_000,
+            timestamp: ProposerTimestamp(100_000),
             round: 0,
             is_fallback: false,
             state_root: Hash::ZERO,
@@ -7029,7 +7035,7 @@ mod tests {
             parent_hash,
             parent_qc: parent_qc.clone(),
             proposer: ValidatorId(3), // height 2, round 1 -> validator 3
-            timestamp: 100_001,
+            timestamp: ProposerTimestamp(100_001),
             round: 1,
             is_fallback: false,
             state_root: Hash::ZERO,
@@ -7389,7 +7395,7 @@ mod tests {
             round: 0,
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
-            weighted_timestamp_ms: 100_000,
+            weighted_timestamp: WeightedTimestamp(100_000),
         };
         state.latest_qc = Some(qc);
 
@@ -7452,7 +7458,7 @@ mod tests {
             round: 0,
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
-            weighted_timestamp_ms: old_timestamp,
+            weighted_timestamp: WeightedTimestamp(old_timestamp),
         };
         state.latest_qc = Some(qc);
 
@@ -7471,11 +7477,12 @@ mod tests {
             // Sync blocks use current time, NOT inherited timestamp
             assert_eq!(
                 *timestamp,
-                current_time.as_millis() as u64,
+                ProposerTimestamp(current_time.as_millis() as u64),
                 "Sync block should use current timestamp, not parent's"
             );
             assert_ne!(
-                *timestamp, old_timestamp,
+                timestamp.as_millis(),
+                old_timestamp,
                 "Sync block should NOT inherit parent timestamp like fallback blocks"
             );
         }
@@ -7647,7 +7654,7 @@ mod tests {
             round: 0,
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
-            weighted_timestamp_ms: 1000,
+            weighted_timestamp: WeightedTimestamp(1000),
         });
 
         // check_sync_health should trigger sync since we're behind (committed=0, qc=5)
@@ -7680,7 +7687,7 @@ mod tests {
                 parent_hash: Hash::ZERO,
                 parent_qc: QuorumCertificate::genesis(),
                 proposer: ValidatorId(1),
-                timestamp: 1000,
+                timestamp: ProposerTimestamp(1000),
                 round: 0,
                 is_fallback: false,
                 state_root: Hash::ZERO,
@@ -7705,7 +7712,7 @@ mod tests {
             round: 0,
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
-            weighted_timestamp_ms: 1000,
+            weighted_timestamp: WeightedTimestamp(1000),
         };
 
         // Should return empty actions since block is stale
@@ -7735,7 +7742,7 @@ mod tests {
             round: 0,
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
-            weighted_timestamp_ms: 100_000,
+            weighted_timestamp: WeightedTimestamp(100_000),
         };
         state.latest_qc = Some(qc);
 
@@ -7771,7 +7778,7 @@ mod tests {
             round: 0,
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
-            weighted_timestamp_ms: parent_timestamp,
+            weighted_timestamp: WeightedTimestamp(parent_timestamp),
         };
         state.latest_qc = Some(qc);
 
@@ -7820,11 +7827,12 @@ mod tests {
             // Difference 2: timestamp handling
             assert_eq!(
                 *sync_ts,
-                Duration::from_secs(100).as_millis() as u64,
+                ProposerTimestamp(Duration::from_secs(100).as_millis() as u64),
                 "Sync block uses current timestamp"
             );
             assert_eq!(
-                *fb_ts, parent_timestamp,
+                *fb_ts,
+                ProposerTimestamp(parent_timestamp),
                 "Fallback block inherits parent timestamp"
             );
         } else {
@@ -7849,7 +7857,7 @@ mod tests {
             round: 0,
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
-            weighted_timestamp_ms: 100_000,
+            weighted_timestamp: WeightedTimestamp(100_000),
         };
         state.latest_qc = Some(qc);
 
@@ -8241,7 +8249,7 @@ mod tests {
                 parent_hash: Hash::from_bytes(b"grandparent"),
                 parent_qc: QuorumCertificate::genesis(),
                 proposer: ValidatorId(1),
-                timestamp: 100_000,
+                timestamp: ProposerTimestamp(100_000),
                 round: 0,
                 is_fallback: false,
                 state_root: Hash::ZERO,
@@ -8270,7 +8278,7 @@ mod tests {
                 parent_hash: ancestor_hash,
                 parent_qc: QuorumCertificate::genesis(),
                 proposer: ValidatorId(2),
-                timestamp: 100_001,
+                timestamp: ProposerTimestamp(100_001),
                 round: 0,
                 is_fallback: false,
                 state_root: Hash::ZERO,
@@ -8307,7 +8315,7 @@ mod tests {
                 parent_hash: Hash::from_bytes(b"grandparent"),
                 parent_qc: QuorumCertificate::genesis(),
                 proposer: ValidatorId(1),
-                timestamp: 100_000,
+                timestamp: ProposerTimestamp(100_000),
                 round: 0,
                 is_fallback: false,
                 state_root: Hash::ZERO,
@@ -8335,7 +8343,7 @@ mod tests {
                 parent_hash: ancestor_hash,
                 parent_qc: QuorumCertificate::genesis(),
                 proposer: ValidatorId(2),
-                timestamp: 100_001,
+                timestamp: ProposerTimestamp(100_001),
                 round: 0,
                 is_fallback: false,
                 state_root: Hash::ZERO,
@@ -8380,7 +8388,7 @@ mod tests {
         let wave_id = WaveId::new(ShardGroupId(0), 1, std::collections::BTreeSet::new());
         let ec = ExecutionCertificate::new(
             wave_id.clone(),
-            1,
+            WeightedTimestamp(1),
             Hash::ZERO,
             vec![TxOutcome {
                 tx_hash,
@@ -8415,7 +8423,7 @@ mod tests {
                 parent_hash: Hash::ZERO,
                 parent_qc: QuorumCertificate::genesis(),
                 proposer: ValidatorId(1),
-                timestamp: 1000,
+                timestamp: ProposerTimestamp(1000),
                 round: 0,
                 is_fallback: false,
                 state_root: Hash::ZERO,
@@ -8439,7 +8447,7 @@ mod tests {
             round: 0,
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
-            weighted_timestamp_ms: 1000,
+            weighted_timestamp: WeightedTimestamp(1000),
         };
 
         let certified = CertifiedBlock::new_unchecked(block, qc);

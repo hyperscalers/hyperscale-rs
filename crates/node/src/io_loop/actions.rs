@@ -606,7 +606,7 @@ where
         // under the 2-chain rule.
         let now_ms = self.state.now().as_millis() as u64;
         let commit_latency_secs =
-            (now_ms.saturating_sub(commit.block.header().timestamp)) as f64 / 1000.0;
+            (now_ms.saturating_sub(commit.block.header().timestamp.as_millis())) as f64 / 1000.0;
         metrics::record_block_committed(height.0, commit_latency_secs, commit.source.as_str());
         metrics::set_block_height(height.0);
         // Feed committed height to sync protocol (just tracks progress,

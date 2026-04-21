@@ -25,7 +25,7 @@
 use crate::{
     compute_padded_merkle_root, Bls12381G2Signature, Hash, LocalReceipt, ReceiptBundle,
     RoutableTransaction, ShardGroupId, SignerBitfield, TopologySnapshot, TransactionDecision,
-    TransactionOutcome, ValidatorId,
+    TransactionOutcome, ValidatorId, WeightedTimestamp,
 };
 use sbor::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
@@ -296,13 +296,13 @@ pub struct ExecutionVote {
     pub block_hash: Hash,
     /// Block height (the block containing the wave's transactions).
     pub block_height: u64,
-    /// Consensus height at which this vote was cast.
+    /// BFT-authenticated anchor at which this vote was cast.
     ///
     /// Validators vote at each block commit where the wave is complete.
     /// Including `vote_anchor_ts_ms` in the BLS-signed message prevents
     /// cross-height aggregation, ensuring that if an abort intent changes
     /// the global_receipt_root between heights, stale votes cannot combine.
-    pub vote_anchor_ts_ms: u64,
+    pub vote_anchor_ts_ms: WeightedTimestamp,
     /// Which wave within the block.
     pub wave_id: WaveId,
     /// Which shard produced this vote.
@@ -340,7 +340,7 @@ pub struct ExecutionCertificate {
     ///
     /// Must match the `vote_anchor_ts_ms` in the aggregated votes. Needed to
     /// reconstruct the BLS signing message for signature verification.
-    pub vote_anchor_ts_ms: u64,
+    pub vote_anchor_ts_ms: WeightedTimestamp,
     /// Merkle root over per-tx outcome leaves.
     pub global_receipt_root: Hash,
     /// Per-transaction outcomes (in wave order = block order).
@@ -435,7 +435,7 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
             });
         }
         let wave_id: WaveId = decoder.decode()?;
-        let vote_anchor_ts_ms: u64 = decoder.decode()?;
+        let vote_anchor_ts_ms: WeightedTimestamp = decoder.decode()?;
         let global_receipt_root: Hash = decoder.decode()?;
         let tx_outcomes: Vec<TxOutcome> = decoder.decode()?;
         let aggregated_signature: Bls12381G2Signature = decoder.decode()?;
@@ -480,7 +480,7 @@ impl ExecutionCertificate {
     /// Create a new execution certificate, computing the canonical hash eagerly.
     pub fn new(
         wave_id: WaveId,
-        vote_anchor_ts_ms: u64,
+        vote_anchor_ts_ms: WeightedTimestamp,
         global_receipt_root: Hash,
         tx_outcomes: Vec<TxOutcome>,
         aggregated_signature: Bls12381G2Signature,
@@ -538,13 +538,13 @@ impl ExecutionCertificate {
 
     fn compute_canonical_hash(
         wave_id: &WaveId,
-        vote_anchor_ts_ms: u64,
+        vote_anchor_ts_ms: WeightedTimestamp,
         global_receipt_root: &Hash,
         tx_outcomes: &[TxOutcome],
     ) -> Hash {
         let mut hasher = blake3::Hasher::new();
         hasher.update(&basic_encode(wave_id).unwrap());
-        hasher.update(&vote_anchor_ts_ms.to_le_bytes());
+        hasher.update(&vote_anchor_ts_ms.as_millis().to_le_bytes());
         hasher.update(global_receipt_root.as_bytes());
         hasher.update(&basic_encode(tx_outcomes).unwrap());
         Hash::from_hash_bytes(hasher.finalize().as_bytes())
@@ -1339,7 +1339,7 @@ mod tests {
     ) -> ExecutionCertificate {
         ExecutionCertificate::new(
             make_wave_id(0, 10, &[1]),
-            11,
+            WeightedTimestamp(11),
             Hash::from_bytes(b"global_receipt_root"),
             vec![make_outcome(1), make_outcome(2)],
             signature,
@@ -1379,7 +1379,7 @@ mod tests {
     fn make_test_wave_ec(shard: u64, seed: u8) -> Arc<ExecutionCertificate> {
         Arc::new(ExecutionCertificate::new(
             make_wave_id(shard, 42, &[1]),
-            43,
+            WeightedTimestamp(43),
             Hash::from_bytes(&[seed + 100; 4]),
             vec![make_outcome(seed)],
             Bls12381G2Signature([0u8; 96]),
@@ -1516,7 +1516,7 @@ mod tests {
     fn make_local_ec(wave_id: &WaveId, outcomes: Vec<TxOutcome>) -> Arc<ExecutionCertificate> {
         Arc::new(ExecutionCertificate::new(
             wave_id.clone(),
-            wave_id.block_height + 1,
+            WeightedTimestamp(wave_id.block_height + 1),
             compute_global_receipt_root(&outcomes),
             outcomes,
             Bls12381G2Signature([0u8; 96]),
