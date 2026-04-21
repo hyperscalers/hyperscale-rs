@@ -42,10 +42,11 @@ const PROVISION_FALLBACK_TIMEOUT_BLOCKS: u64 = 10;
 /// a `Block::Live` serving response. Must be `>= WAVE_TIMEOUT_BLOCKS`.
 const COMMITTED_PROVISION_RETENTION_BLOCKS: u64 = 32;
 
-/// Number of local committed blocks to retain verified remote headers.
-/// Headers older than this have either been matched with provisions (and can be
-/// discarded) or are stale (the source shard has moved far ahead).
-const VERIFIED_HEADER_RETENTION_BLOCKS: u64 = 100;
+/// Blocks past `expected.discovered_at` after which an unmatched header is
+/// treated as orphaned and dropped. Headers are otherwise retained while their
+/// batch is still outstanding — this guards only against truly stuck entries
+/// whose fallback fetches never resolved.
+const ORPHAN_HEADER_CUTOFF_BLOCKS: u64 = 500;
 
 /// Provision coordinator configuration.
 #[derive(Debug, Clone, Deserialize)]
@@ -296,17 +297,25 @@ impl ProvisionCoordinator {
             }
         }
 
-        // Prune stale verified remote headers that were never matched with
-        // provisions (e.g. source shard sent header but no provisions for us).
-        // Use local committed height as a proxy — headers arriving far in the
-        // past relative to our chain are safe to discard.
-        let header_cutoff = self
+        // Drop truly orphaned `expected_provisions` entries (and their headers)
+        // whose fallback fetch never resolved after a long horizon. Under normal
+        // operation a header is retained exactly while its batch is outstanding;
+        // this only catches entries that would otherwise leak indefinitely.
+        let orphan_cutoff = self
             .local_committed_height
             .0
-            .saturating_sub(VERIFIED_HEADER_RETENTION_BLOCKS);
-        if header_cutoff > 0 {
-            self.verified_remote_headers
-                .retain(|&(_, h), _| h.0 > header_cutoff);
+            .saturating_sub(ORPHAN_HEADER_CUTOFF_BLOCKS);
+        if orphan_cutoff > 0 {
+            let before = self.expected_provisions.len();
+            self.expected_provisions
+                .retain(|_, exp| exp.discovered_at.0 >= orphan_cutoff);
+            if self.expected_provisions.len() != before {
+                // Drop matching headers — they're useless without an expected batch.
+                let live: std::collections::HashSet<_> =
+                    self.expected_provisions.keys().copied().collect();
+                self.verified_remote_headers
+                    .retain(|key, _| live.contains(key));
+            }
         }
 
         // Prune old tombstones (committed more than 100 blocks ago).
@@ -487,8 +496,19 @@ impl ProvisionCoordinator {
             return vec![];
         }
 
-        // Look for matching verified remote header (pre-verified by RemoteHeaderCoordinator).
         let key = (source_shard, block_height);
+
+        // Skip if this key was already verified (duplicate gossip/fetch) or
+        // already committed (tombstoned by hash). Avoids re-dispatching
+        // verification work and buffering stale duplicates in
+        // `pending_provisions`.
+        if self.verified_batches.contains_key(&key)
+            || self.committed_batch_tombstones.contains_key(&batch.hash())
+        {
+            return vec![];
+        }
+
+        // Look for matching verified remote header (pre-verified by RemoteHeaderCoordinator).
         if let Some(verified_header) = self.verified_remote_headers.get(&key).cloned() {
             return self.emit_provision_verification(topology, batch, verified_header);
         }
@@ -575,21 +595,17 @@ impl ProvisionCoordinator {
         let mut actions = vec![];
         let source_shard = batch.source_shard;
 
-        // Promote the verified header if we have one
+        // Clear expected-provision tracking and the matching header. The
+        // header's only job — verify this batch — is done; hanging on to it
+        // wastes memory. Cancel any in-flight fallback fetch to prevent
+        // duplicate delivery.
         if let Some(ref header) = committed_header {
             let shard = header.header.shard_group_id;
             let height = header.header.height;
             let key = (shard, height);
 
-            // Header already in verified_remote_headers from coordinator.
-            // Ensure it's there (idempotent insert).
-            self.verified_remote_headers
-                .entry(key)
-                .or_insert_with(|| header.clone());
-
-            // Clear expected provision tracking — provisions arrived and verified.
-            // Cancel any in-flight fallback fetch to prevent duplicate delivery.
             if self.expected_provisions.remove(&key).is_some() {
+                self.verified_remote_headers.remove(&key);
                 actions.push(Action::CancelProvisionFetch {
                     source_shard: shard,
                     block_height: height,
@@ -952,24 +968,20 @@ mod tests {
         let tx_hash = Hash::from_bytes(b"tx1");
         let source_shard = ShardGroupId(1);
 
-        // Setup: header (committing to our single tx) + batch + verification.
+        // Setup: header + batch + verification.
         let header =
             make_committed_header_committing(source_shard, 10, ShardGroupId(0), &[tx_hash]);
         coordinator.on_verified_remote_header(&topology, header.clone());
         let batch = make_batch(tx_hash, source_shard, ShardGroupId(0), 10);
         coordinator.on_state_provisions_received(&topology, batch.clone());
-
-        // Simulate successful verification
         coordinator.on_state_provisions_verified(&topology, batch, Some(header), true);
 
-        // Second batch for same (tx, shard) goes through verification again
-        // (proof must be verified as a whole — no per-tx pre-filtering).
-        // Duplicate entries are harmlessly re-inserted by on_state_provisions_verified.
+        // A duplicate batch for the same (shard, height) must short-circuit —
+        // no verification action, no buffering.
         let batch2 = make_batch(tx_hash, source_shard, ShardGroupId(0), 10);
         let actions = coordinator.on_state_provisions_received(&topology, batch2);
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, Action::VerifyProvision { .. })));
+        assert!(actions.is_empty());
+        assert!(coordinator.pending_provisions.is_empty());
     }
 
     #[test]
@@ -1081,26 +1093,20 @@ mod tests {
     }
 
     #[test]
-    fn test_provision_uses_verified_header_when_available() {
+    fn test_provision_header_usable_while_batch_outstanding() {
         let topology = make_test_topology(ShardGroupId(0));
         let mut coordinator = ProvisionCoordinator::new();
 
         let source_shard = ShardGroupId(1);
         let tx_hash = Hash::from_bytes(b"tx1");
 
-        // Header commits to the tx set we'll send.
         let header =
             make_committed_header_committing(source_shard, 10, ShardGroupId(0), &[tx_hash]);
-        coordinator.on_verified_remote_header(&topology, header.clone());
+        coordinator.on_verified_remote_header(&topology, header);
 
-        // First batch verifies (promotes header to verified).
-        let batch1 = make_batch(tx_hash, source_shard, ShardGroupId(0), 10);
-        coordinator.on_state_provisions_received(&topology, batch1.clone());
-        coordinator.on_state_provisions_verified(&topology, batch1, Some(header.clone()), true);
-
-        // A second arrival for the same tx set reuses the verified header.
-        let batch2 = make_batch(tx_hash, source_shard, ShardGroupId(0), 10);
-        let actions = coordinator.on_state_provisions_received(&topology, batch2);
+        // Batch arrives while the header is live — verification dispatches.
+        let batch = make_batch(tx_hash, source_shard, ShardGroupId(0), 10);
+        let actions = coordinator.on_state_provisions_received(&topology, batch);
 
         assert_eq!(actions.len(), 1);
         assert!(matches!(
@@ -1405,6 +1411,84 @@ mod tests {
             )),
             "Should emit CancelProvisionFetch when expected provision is verified"
         );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Header Retention Tests
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_header_retained_while_batch_outstanding() {
+        let topology = make_test_topology(ShardGroupId(0));
+        let mut coordinator = ProvisionCoordinator::new();
+
+        let header = make_committed_header_with_targets(ShardGroupId(1), 10, vec![ShardGroupId(0)]);
+        coordinator.on_verified_remote_header(&topology, header);
+        assert_eq!(coordinator.verified_remote_header_count(), 1);
+
+        // Advance local well past any old time-based cutoff but short of the
+        // orphan threshold. Header stays because its batch hasn't verified yet.
+        for h in 1..=(ORPHAN_HEADER_CUTOFF_BLOCKS / 2) {
+            coordinator.on_block_committed(&topology, &make_block(h), &[]);
+        }
+
+        assert_eq!(
+            coordinator.verified_remote_header_count(),
+            1,
+            "Header must be retained while expected_provisions entry is live"
+        );
+    }
+
+    #[test]
+    fn test_header_dropped_on_batch_verification() {
+        let topology = make_test_topology(ShardGroupId(0));
+        let mut coordinator = ProvisionCoordinator::new();
+
+        let source_shard = ShardGroupId(1);
+        let tx_hash = Hash::from_bytes(b"tx1");
+
+        let header =
+            make_committed_header_committing(source_shard, 10, ShardGroupId(0), &[tx_hash]);
+        coordinator.on_verified_remote_header(&topology, header.clone());
+        assert_eq!(coordinator.verified_remote_header_count(), 1);
+
+        let batch = make_batch(tx_hash, source_shard, ShardGroupId(0), 10);
+        coordinator.on_state_provisions_received(&topology, batch.clone());
+        coordinator.on_state_provisions_verified(&topology, batch, Some(header), true);
+
+        assert_eq!(
+            coordinator.verified_remote_header_count(),
+            0,
+            "Header must be dropped once its batch is verified"
+        );
+    }
+
+    #[test]
+    fn test_orphan_header_dropped_after_cutoff() {
+        let topology = make_test_topology(ShardGroupId(0));
+        let mut coordinator = ProvisionCoordinator::new();
+
+        // Header arrives but the batch never does — this is the orphan case
+        // the long-horizon sweep guards against.
+        let header = make_committed_header_with_targets(ShardGroupId(1), 10, vec![ShardGroupId(0)]);
+        coordinator.on_verified_remote_header(&topology, header);
+        assert_eq!(coordinator.expected_provisions.len(), 1);
+
+        // Not yet past the orphan cutoff — still retained.
+        for h in 1..=ORPHAN_HEADER_CUTOFF_BLOCKS {
+            coordinator.on_block_committed(&topology, &make_block(h), &[]);
+        }
+        assert_eq!(coordinator.verified_remote_header_count(), 1);
+        assert_eq!(coordinator.expected_provisions.len(), 1);
+
+        // One past — orphan sweep drops header and expected entry together.
+        coordinator.on_block_committed(
+            &topology,
+            &make_block(ORPHAN_HEADER_CUTOFF_BLOCKS + 1),
+            &[],
+        );
+        assert_eq!(coordinator.verified_remote_header_count(), 0);
+        assert_eq!(coordinator.expected_provisions.len(), 0);
     }
 
     // ═══════════════════════════════════════════════════════════════════════
