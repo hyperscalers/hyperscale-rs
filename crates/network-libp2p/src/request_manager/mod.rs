@@ -126,22 +126,6 @@ pub struct RequestManagerConfig {
 
     /// Minimum concurrency (won't reduce below this even under poor conditions).
     pub min_concurrent: usize,
-
-    /// Multiplier for speculative retry timeout based on observed RTT.
-    /// After `rtt * speculative_retry_multiplier`, send a duplicate request to race.
-    /// Set to 0.0 to disable speculative retries.
-    /// Default: 2.0 (retry after 2× observed RTT)
-    pub speculative_retry_multiplier: f64,
-
-    /// Minimum time before speculative retry, regardless of RTT.
-    /// Prevents too-aggressive retries on very fast networks.
-    /// Default: 200ms
-    pub speculative_retry_min: Duration,
-
-    /// Maximum time before speculative retry.
-    /// After this, just wait for libp2p timeout rather than speculative retry.
-    /// Default: 2s
-    pub speculative_retry_max: Duration,
 }
 
 impl Default for RequestManagerConfig {
@@ -156,9 +140,6 @@ impl Default for RequestManagerConfig {
             backoff_multiplier: 1.5,
             target_success_rate: 0.5,
             min_concurrent: 4,
-            speculative_retry_multiplier: 2.0, // Speculative retry after 2× RTT
-            speculative_retry_min: Duration::from_millis(200),
-            speculative_retry_max: Duration::from_secs(2),
         }
     }
 }
@@ -296,14 +277,5 @@ mod tests {
         assert_eq!(config.target_success_rate, 0.5);
         assert_eq!(config.min_concurrent, 4);
         assert!(config.min_concurrent <= config.max_concurrent);
-    }
-
-    #[test]
-    fn test_default_config_speculative_retry() {
-        let config = RequestManagerConfig::default();
-        assert_eq!(config.speculative_retry_multiplier, 2.0);
-        assert_eq!(config.speculative_retry_min, Duration::from_millis(200));
-        assert_eq!(config.speculative_retry_max, Duration::from_secs(2));
-        assert!(config.speculative_retry_min < config.speculative_retry_max);
     }
 }

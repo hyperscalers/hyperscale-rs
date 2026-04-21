@@ -8,7 +8,7 @@ use crate::adapter::NetworkError;
 use bytes::Bytes;
 use hyperscale_metrics as metrics;
 use libp2p::PeerId;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, trace, warn};
 
 impl RequestManager {
@@ -49,10 +49,11 @@ impl RequestManager {
                 "Starting request attempt"
             );
 
-            // Use speculative retry to race against packet loss
+            let start = Instant::now();
             let result = self
-                .send_request_with_speculative_retry(&current_peer, type_id, data, priority)
+                .send_request(&current_peer, type_id, data, priority)
                 .await;
+            let elapsed = start.elapsed();
 
             debug!(
                 peer = ?current_peer,
@@ -63,7 +64,7 @@ impl RequestManager {
             );
 
             match result {
-                Ok((response, elapsed)) => {
+                Ok(response) => {
                     // Success! Update health and return.
                     self.health.record_success(&current_peer, elapsed);
 

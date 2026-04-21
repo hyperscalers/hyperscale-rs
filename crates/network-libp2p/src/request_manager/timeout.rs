@@ -7,24 +7,6 @@ use super::{
 use libp2p::PeerId;
 use std::time::Duration;
 
-/// Compute speculative timeout from optional RTT EMA.
-///
-/// If RTT is known, uses `rtt * multiplier` clamped to `[min, max]`.
-/// If unknown, returns `max` (conservative).
-fn speculative_timeout_from_rtt(
-    rtt_ema_secs: Option<f64>,
-    multiplier: f64,
-    min: Duration,
-    max: Duration,
-) -> Duration {
-    rtt_ema_secs
-        .map(|rtt| {
-            let rtt_based = Duration::from_secs_f64(rtt * multiplier);
-            rtt_based.clamp(min, max)
-        })
-        .unwrap_or(max)
-}
-
 /// Compute stream timeout from optional RTT EMA.
 ///
 /// Uses 5x RTT clamped to `[500ms, 5s]`. Falls back to 1s when RTT is unknown.
@@ -63,16 +45,6 @@ fn initial_backoff_from_rtt(
 }
 
 impl RequestManager {
-    /// Compute the speculative retry timeout based on peer's RTT history.
-    pub(super) fn compute_speculative_timeout(&self, peer: &PeerId) -> Duration {
-        speculative_timeout_from_rtt(
-            self.health.rtt_ema_secs(peer),
-            self.config.speculative_retry_multiplier,
-            self.config.speculative_retry_min,
-            self.config.speculative_retry_max,
-        )
-    }
-
     /// Compute the stream timeout based on peer's RTT history.
     ///
     /// Uses 5x RTT as the timeout, clamped to reasonable bounds.
@@ -101,32 +73,6 @@ impl RequestManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_speculative_timeout_known_rtt() {
-        let min = Duration::from_millis(200);
-        let max = Duration::from_secs(2);
-        let multiplier = 2.0;
-
-        // 100ms RTT * 2.0 = 200ms (at min)
-        let timeout = speculative_timeout_from_rtt(Some(0.1), multiplier, min, max);
-        assert_eq!(timeout, min);
-
-        // 500ms RTT * 2.0 = 1000ms (in range)
-        let timeout = speculative_timeout_from_rtt(Some(0.5), multiplier, min, max);
-        assert_eq!(timeout, Duration::from_secs(1));
-
-        // 2000ms RTT * 2.0 = 4000ms (clamped to max)
-        let timeout = speculative_timeout_from_rtt(Some(2.0), multiplier, min, max);
-        assert_eq!(timeout, max);
-    }
-
-    #[test]
-    fn test_speculative_timeout_unknown_rtt() {
-        let max = Duration::from_secs(2);
-        let timeout = speculative_timeout_from_rtt(None, 2.0, Duration::from_millis(200), max);
-        assert_eq!(timeout, max);
-    }
 
     #[test]
     fn test_stream_timeout_known_rtt() {
