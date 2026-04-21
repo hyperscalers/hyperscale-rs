@@ -37,7 +37,7 @@ use crate::protocol::sync::{SyncInput, SyncProtocol, SyncStatus};
 use crate::protocol::transaction_fetch::{TransactionFetchInput, TransactionFetchProtocol};
 use crate::NodeStateMachine;
 use arc_swap::ArcSwap;
-use hyperscale_core::{Action, NodeInput, ProtocolEvent, StateMachine, TimerId};
+use hyperscale_core::{Action, CommitSource, NodeInput, ProtocolEvent, StateMachine, TimerId};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::{Engine, RadixExecutor, TransactionValidation};
 use hyperscale_messages::TransactionGossip;
@@ -66,6 +66,9 @@ type PreparedCommitMap<S> =
 pub(crate) struct PendingCommit {
     pub block: Arc<Block>,
     pub qc: Arc<QuorumCertificate>,
+    /// How this node learned the certifying QC. Tagged into metrics so
+    /// dashboards can separate aggregator/header/sync commit paths.
+    pub source: CommitSource,
     /// Whether `BlockCommitted` was already fired immediately
     /// in `accumulate_block_commit` (true) or deferred due to
     /// backpressure (false). The flush closure uses this to

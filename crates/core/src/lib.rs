@@ -38,6 +38,6 @@ pub use action::{
     Action, CrossShardExecutionRequest, FinalizationPhaseTimes, ProvisionRequest, TransactionStatus,
 };
 pub use input::{EventPriority, FetchedBlock, NodeInput};
-pub use protocol_event::{ProtocolEvent, VerificationKind};
+pub use protocol_event::{CommitSource, ProtocolEvent, VerificationKind};
 pub use timer::{TimerId, TimerScheduler};
 pub use traits::StateMachine;

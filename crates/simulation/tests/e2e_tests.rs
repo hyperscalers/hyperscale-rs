@@ -985,14 +985,11 @@ fn test_wave_leader_failure_recovers_via_rotation() {
 
         // Run long enough for:
         // - Transaction to be committed in a block
-        // - Vote retry timeout (VOTE_RETRY_BLOCKS = 5 blocks)
+        // - Vote retry timeout (VOTE_RETRY_BLOCKS = 16 blocks)
         // - Fallback leader to aggregate and broadcast EC
         // - Wave certificate to be finalized
-        // With 3/4 nodes active, blocks commit ~every 200ms.
-        // 5 block retry = ~1s, plus aggregation + wave cert = ~2-3s more.
-        // 30 seconds (300 iterations) gives ample margin.
         let mut reached_terminal = false;
-        for _ in 0..300 {
+        for _ in 0..600 {
             runner.run_until(runner.now() + Duration::from_millis(100));
             let status = runner.node(submit_node).unwrap().mempool().status(&tx_hash);
             match &status {

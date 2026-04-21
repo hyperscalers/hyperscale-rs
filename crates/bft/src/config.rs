@@ -57,18 +57,6 @@ pub struct BftConfig {
     /// - Checks sync health and triggers catch-up sync if needed
     pub cleanup_interval: Duration,
 
-    /// Minimum time between block proposals (rate limiting).
-    ///
-    /// Even when a QC forms immediately, we wait at least this long since the last
-    /// proposal before proposing the next block. This prevents burst behavior under
-    /// high load where blocks could otherwise be produced at wire speed, causing:
-    /// - Fast validators to race ahead of slower ones
-    /// - Vote accumulation storms from rapid block production
-    /// - Excessive pressure on the execution layer
-    ///
-    /// Set to Duration::ZERO to disable rate limiting (not recommended for production).
-    pub min_block_interval: Duration,
-
     /// Minimum number of blocks that must elapse before an ExecutionTimeout
     /// abort intent is considered valid. Validators reject abort intents where
     /// `block_height - committed_at < min_execution_timeout_blocks`.
@@ -97,7 +85,6 @@ impl Default for BftConfig {
             transaction_fetch_timeout: Duration::from_millis(150),
             certificate_fetch_timeout: Duration::from_millis(500),
             cleanup_interval: Duration::from_secs(1),
-            min_block_interval: Duration::from_millis(500),
             min_execution_timeout_blocks: 30,
             max_parallel_sync_verifications: 16,
         }
@@ -139,12 +126,6 @@ impl BftConfig {
     /// Set the maximum finalized transactions per block.
     pub fn with_max_finalized_transactions(mut self, max: usize) -> Self {
         self.max_finalized_transactions_per_block = max;
-        self
-    }
-
-    /// Set the minimum block interval.
-    pub fn with_min_block_interval(mut self, interval: Duration) -> Self {
-        self.min_block_interval = interval;
         self
     }
 }

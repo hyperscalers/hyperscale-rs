@@ -1147,15 +1147,14 @@ fn test_consensus_throughput() {
     println!("  Messages per block: {:.1}", messages_per_block);
     println!("  Events processed: {}", stats.events_processed);
 
-    // With 1000ms proposal interval and empty blocks, expect ~8 blocks in 10 seconds
-    // (10000ms / 1000ms ≈ 10 blocks, accounting for latency and min_block_interval)
+    // Pipeline-limited with no rate-limit floor; expect comfortable progress.
     assert!(
         committed_height >= 5,
-        "Should commit at least 5 blocks in 10 seconds with 1000ms proposal interval"
+        "Should commit at least 5 blocks in 10 seconds"
     );
     assert!(
         blocks_per_second >= 0.5,
-        "Should achieve at least 0.5 blocks/second with timer-based proposals"
+        "Should achieve at least 0.5 blocks/second"
     );
 }
 

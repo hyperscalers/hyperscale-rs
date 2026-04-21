@@ -981,8 +981,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.50, sum(rate(hyperscale_block_commit_latency_seconds_bucket[1m])) by (le))",
-          "legendFormat": "p50",
+          "expr": "histogram_quantile(0.50, sum(rate(hyperscale_block_commit_latency_seconds_bucket[1m])) by (le, source))",
+          "legendFormat": "p50 {{source}}",
           "refId": "A"
         },
         {
@@ -990,8 +990,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.95, sum(rate(hyperscale_block_commit_latency_seconds_bucket[1m])) by (le))",
-          "legendFormat": "p95",
+          "expr": "histogram_quantile(0.95, sum(rate(hyperscale_block_commit_latency_seconds_bucket[1m])) by (le, source))",
+          "legendFormat": "p95 {{source}}",
           "refId": "B"
         },
         {
@@ -999,8 +999,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.99, sum(rate(hyperscale_block_commit_latency_seconds_bucket[1m])) by (le))",
-          "legendFormat": "p99",
+          "expr": "histogram_quantile(0.99, sum(rate(hyperscale_block_commit_latency_seconds_bucket[1m])) by (le, source))",
+          "legendFormat": "p99 {{source}}",
           "refId": "C"
         }
       ],

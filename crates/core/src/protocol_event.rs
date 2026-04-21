@@ -13,6 +13,33 @@ use hyperscale_types::{
 };
 use std::sync::Arc;
 
+/// How a node learned about the certifying QC that commits a given block.
+///
+/// Under the 2-chain rule, block N commits when the node observes QC_{N+1}.
+/// A validator either aggregates that QC locally (if it was a vote recipient
+/// for N+1) or learns it from block N+2's `parent_qc`. These two paths have
+/// distinct latency characteristics, so tagging commits with their source
+/// lets dashboards separate the modes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitSource {
+    /// Certifying QC was aggregated on this node.
+    Aggregator,
+    /// Certifying QC was learned from a subsequent block's `parent_qc`.
+    Header,
+    /// Block was applied via the sync protocol (historical catch-up).
+    Sync,
+}
+
+impl CommitSource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CommitSource::Aggregator => "aggregator",
+            CommitSource::Header => "header",
+            CommitSource::Sync => "sync",
+        }
+    }
+}
+
 /// Which block root verification completed.
 ///
 /// Used with `ProtocolEvent::BlockRootVerified` to identify which
@@ -89,6 +116,7 @@ pub enum ProtocolEvent {
     BlockReadyToCommit {
         block_hash: Hash,
         qc: QuorumCertificate,
+        source: CommitSource,
     },
 
     /// A block has been committed by consensus (QC formed, 2f+1 agreement).

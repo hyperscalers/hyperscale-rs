@@ -342,8 +342,6 @@ idle_connection_timeout_ms = 30000
 keep_alive_interval_ms = 5000
 
 [consensus]
-proposal_interval_ms = 1000
-min_block_interval_ms = 500
 view_change_timeout_ms = 5000
 max_transactions_per_block = 4096
 max_finalized_transactions_per_block = 8192

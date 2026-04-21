@@ -498,9 +498,14 @@ impl StateMachine for NodeStateMachine {
             ProtocolEvent::BlockVoteReceived { vote } => {
                 self.bft.on_block_vote(self.topology.snapshot(), vote)
             }
-            ProtocolEvent::BlockReadyToCommit { block_hash, qc } => self
-                .bft
-                .on_block_ready_to_commit(self.topology.snapshot(), block_hash, qc),
+            ProtocolEvent::BlockReadyToCommit {
+                block_hash,
+                qc,
+                source,
+            } => {
+                self.bft
+                    .on_block_ready_to_commit(self.topology.snapshot(), block_hash, qc, source)
+            }
             ProtocolEvent::QuorumCertificateResult {
                 block_hash,
                 qc,

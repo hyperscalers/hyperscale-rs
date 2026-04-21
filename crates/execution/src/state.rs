@@ -228,7 +228,9 @@ const EXEC_CERT_FALLBACK_TIMEOUT_BLOCKS: u64 = 10;
 const EXEC_CERT_RETRY_INTERVAL_BLOCKS: u64 = 20;
 
 /// Blocks to wait before retrying a vote with the next rotated wave leader.
-const VOTE_RETRY_BLOCKS: u64 = 5;
+/// Must exceed typical wave-leader aggregation latency so we don't rotate
+/// past a leader that's about to succeed.
+const VOTE_RETRY_BLOCKS: u64 = 16;
 
 /// Blocks to retain committed remote provisions in `ConflictDetector` for
 /// reverse conflict detection. A local tx that hasn't registered against a
@@ -2532,13 +2534,13 @@ mod tests {
         let committee = topo.local_committee().to_vec();
 
         let mut state = make_test_state();
-        state.committed_height = 10;
+        state.committed_height = 20;
 
-        // Manually insert a pending retry as if we'd sent a vote at height 5.
+        // Manually insert a pending retry as if we'd sent a vote at height 4.
         state.pending_vote_retries.insert(
             wave_id.clone(),
             PendingVoteRetry {
-                sent_at_height: 5,
+                sent_at_height: 4,
                 attempt: 0,
                 block_hash: Hash::from_bytes(b"block1"),
                 block_height: 1,
@@ -2550,7 +2552,7 @@ mod tests {
 
         let actions = state.check_vote_retry_timeouts(&topo);
 
-        // Height 10 - 5 = 5 >= VOTE_RETRY_BLOCKS (5), so should emit retry.
+        // Height 20 - 4 = 16 >= VOTE_RETRY_BLOCKS (16), so should emit retry.
         assert_eq!(actions.len(), 1);
         match &actions[0] {
             Action::SignAndSendExecutionVote {
@@ -2571,7 +2573,7 @@ mod tests {
         // Pending retry should be updated to attempt 1.
         let retry = state.pending_vote_retries.get(&wave_id).unwrap();
         assert_eq!(retry.attempt, 1);
-        assert_eq!(retry.sent_at_height, 10);
+        assert_eq!(retry.sent_at_height, 20);
     }
 
     #[test]

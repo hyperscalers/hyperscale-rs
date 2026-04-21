@@ -12,7 +12,7 @@
 //! This provides a strong DA guarantee: if a QC forms, at least 2f+1 validators have
 //! the complete block data, making it recoverable from any honest validator in that set.
 
-use hyperscale_core::{Action, ProtocolEvent, TimerId};
+use hyperscale_core::{Action, CommitSource, ProtocolEvent, TimerId};
 
 /// Number of block heights to retain remote headers per shard below the tip.
 const REMOTE_HEADER_RETENTION_BLOCKS: u64 = 50;
@@ -209,13 +209,13 @@ pub struct BftState {
     /// When we receive a BlockReadyToCommit for height N but we're still at committed_height < N-1,
     /// we buffer it here and process it once the earlier blocks are committed.
     /// This handles out-of-order commit events caused by parallel signature verification.
-    pending_commits: std::collections::BTreeMap<u64, (Hash, QuorumCertificate)>,
+    pending_commits: std::collections::BTreeMap<u64, (Hash, QuorumCertificate, CommitSource)>,
 
     /// Commits waiting for block data (transactions/certificates) to arrive.
-    /// Maps block_hash -> (height, QC).
+    /// Maps block_hash -> (height, QC, source).
     /// When BlockReadyToCommit fires but the block isn't complete yet (still fetching
     /// transactions), we buffer the commit here and retry when the data arrives.
-    pending_commits_awaiting_data: HashMap<Hash, (u64, QuorumCertificate)>,
+    pending_commits_awaiting_data: HashMap<Hash, (u64, QuorumCertificate, CommitSource)>,
 
     /// In-flight proposal awaiting `Event::ProposalBuilt` callback.
     pending_proposal: Option<PendingProposal>,
@@ -248,12 +248,6 @@ pub struct BftState {
     // ═══════════════════════════════════════════════════════════════════════════
     /// Current time (set by runner before each handle call).
     now: Duration,
-
-    /// Timestamp when the last QC formed (for any proposer, not just us).
-    /// Used for global rate limiting: ensures min_block_interval between
-    /// successive blocks regardless of which validator proposed them.
-    /// `None` until the first QC forms.
-    last_qc_time: Option<Duration>,
 
     /// Time of last leader activity (for round timeout detection).
     /// Reset when we see leader activity (proposal, header receipt, QC, commit).
@@ -330,7 +324,6 @@ impl BftState {
             remote_header_tips: HashMap::new(),
             config,
             now: Duration::ZERO,
-            last_qc_time: None,
             last_leader_activity: None,
             last_header_reset: None,
             view_changes: 0,
@@ -909,11 +902,10 @@ impl BftState {
     /// This is the unified proposal entry point, called from:
     /// - `ContentAvailable` events (new transactions, waves, or provisions)
     /// - `on_qc_formed` (eager next-block proposal)
-    /// - `RateLimitRetry` timer (after rate-limit window expires)
     ///
-    /// Returns empty if preconditions aren't met (not proposer, rate-limited,
-    /// build in-flight, etc.). No periodic rescheduling — callers are responsible
-    /// for triggering the next attempt via events or timers.
+    /// Returns empty if preconditions aren't met (not proposer, build in-flight,
+    /// already voted at this height, etc.). No periodic rescheduling — callers
+    /// are responsible for triggering the next attempt via events.
     #[instrument(skip(self, ready_txs, finalized_waves), fields(
         tx_count = ready_txs.len(),
         cert_count = finalized_waves.len(),
@@ -938,28 +930,6 @@ impl BftState {
         // Check if we should propose
         if !topology.should_propose(next_height, round) {
             return vec![];
-        }
-
-        // Global rate limit: ensure min_block_interval since the last QC from
-        // any proposer. Without this, the timer path bypasses the rate limit
-        // that on_qc_formed enforces, since the timer fires independently.
-        // When no QC has formed yet, ZERO ensures we're never rate-limited.
-        let time_since_last_qc = self
-            .now
-            .saturating_sub(self.last_qc_time.unwrap_or(Duration::ZERO));
-        if time_since_last_qc < self.config.min_block_interval {
-            // Schedule a one-shot retry for when the rate limit expires.
-            let remaining = self.config.min_block_interval - time_since_last_qc;
-            trace!(
-                validator = ?topology.local_validator_id(),
-                time_since_last_ms = time_since_last_qc.as_millis(),
-                remaining_ms = remaining.as_millis(),
-                "Rate limiting proposal timer - rescheduling for rate limit expiry"
-            );
-            return vec![Action::SetTimer {
-                id: TimerId::RateLimitRetry,
-                duration: remaining,
-            }];
         }
 
         // Skip if a BuildProposal is already in-flight for this height.
@@ -1485,7 +1455,11 @@ impl BftState {
                 // ancestor block. This is essential when votes are targeted
                 // to the next proposer only — non-proposers learn about QCs
                 // via block headers rather than forming them locally.
-                sync_actions.extend(self.try_two_chain_commit(topology, &header.parent_qc));
+                sync_actions.extend(self.try_two_chain_commit(
+                    topology,
+                    &header.parent_qc,
+                    CommitSource::Header,
+                ));
 
                 // Trigger a proposal attempt. Non-proposers who learn about QCs
                 // via block headers (rather than forming them locally) need this
@@ -2965,82 +2939,13 @@ impl BftState {
             duration: self.current_view_change_timeout(),
         }];
 
-        actions.extend(self.try_two_chain_commit(topology, &qc));
+        actions.extend(self.try_two_chain_commit(topology, &qc, CommitSource::Aggregator));
 
-        // Immediately try to propose the next block if there's content to include.
-        // This is how the QC propagates to other validators - the next block
-        // header will include this QC as parent_qc.
-        //
-        // We only propose immediately if there's actual content (transactions,
-        // conflicts, or certificates). Empty blocks provide no value and
-        // just waste resources on signature verification and storage. If there's
-        // nothing to include, the regular proposal timer will fire and propagate
-        // the QC then.
-        //
-        // Rate limiting: Even with content, we respect min_block_interval to prevent
-        // burst behavior under high load. If we proposed too recently, let the
-        // regular proposal timer handle it.
-        let next_height = height + 1;
-
-        let has_content =
-            !ready_txs.is_empty() || !finalized_waves.is_empty() || !provision_batches.is_empty();
-
-        // Rate limit against the latest QC time (any proposer), not just our own
-        // last proposal. With rotating proposers, per-validator tracking doesn't
-        // throttle the global block rate — per-validator tracking would be
-        // stale by the time it's their turn again with rotating proposers.
-        let time_since_last_qc = self
-            .now
-            .saturating_sub(self.last_qc_time.unwrap_or(Duration::ZERO));
-        let rate_limited = time_since_last_qc < self.config.min_block_interval;
-
-        // Attempt immediate proposal if:
-        // - We have content to include, OR
-        // - We're syncing (should propose empty sync blocks to keep chain advancing)
-        //
-        // All other checks (should_propose, backpressure, voted_heights)
-        // are handled inside try_propose to avoid duplication.
-        let should_try_proposal = has_content || self.sync.is_syncing();
-
-        if should_try_proposal && !rate_limited {
-            // try_propose will check if we're the proposer, backpressure, etc.
-            actions.extend(self.try_propose(
-                topology,
-                ready_txs,
-                finalized_waves,
-                provision_batches,
-            ));
-        } else if should_try_proposal && rate_limited {
-            // Schedule a one-shot timer to fire exactly when the rate limit
-            // expires, triggering ContentAvailable for the proposal attempt.
-            let remaining = self.config.min_block_interval - time_since_last_qc;
-            trace!(
-                validator = ?topology.local_validator_id(),
-                next_height = next_height,
-                time_since_last_ms = time_since_last_qc.as_millis(),
-                remaining_ms = remaining.as_millis(),
-                "Rate limiting proposal - scheduling precise timer"
-            );
-            actions.push(Action::SetTimer {
-                id: TimerId::RateLimitRetry,
-                duration: remaining,
-            });
-        }
-
-        // If we're the next proposer, always schedule a backstop timer to
-        // ensure the chain keeps advancing even without new content events.
-        // This covers the case where all content is already committed and
-        // the chain needs empty blocks for execution finalization.
-        if topology.should_propose(next_height, self.view) {
-            actions.push(Action::SetTimer {
-                id: TimerId::RateLimitRetry,
-                duration: self.config.min_block_interval,
-            });
-        }
-
-        // Update last_qc_time AFTER the rate limit check so this QC's time
-        // gates the NEXT proposal, not the one we just decided about.
-        self.last_qc_time = Some(self.now);
+        // Propose the next block immediately — under the 2-chain commit rule,
+        // block N+1 is what certifies block N, so any gap in proposing N+1
+        // stalls the finalization of N and everything pending behind it.
+        // `try_propose` handles the should_propose / backpressure checks.
+        actions.extend(self.try_propose(topology, ready_txs, finalized_waves, provision_batches));
 
         actions
     }
@@ -3055,6 +2960,7 @@ impl BftState {
         &self,
         topology: &TopologySnapshot,
         qc: &QuorumCertificate,
+        source: CommitSource,
     ) -> Vec<Action> {
         if !qc.has_committable_block() {
             return vec![];
@@ -3091,6 +2997,7 @@ impl BftState {
         vec![Action::Continuation(ProtocolEvent::BlockReadyToCommit {
             block_hash: committable_hash,
             qc: certifying_qc,
+            source,
         })]
     }
 
@@ -3104,6 +3011,7 @@ impl BftState {
         topology: &TopologySnapshot,
         block_hash: Hash,
         qc: QuorumCertificate,
+        source: CommitSource,
     ) -> Vec<Action> {
         // Get the block to commit
         let block = if let Some(pending) = self.pending_blocks.get(&block_hash) {
@@ -3127,7 +3035,7 @@ impl BftState {
                         "Block not yet complete, buffering commit until data arrives"
                     );
                     self.pending_commits_awaiting_data
-                        .insert(block_hash, (height, qc));
+                        .insert(block_hash, (height, qc, source));
                 }
             } else {
                 // Block not in pending_blocks - check if it's in certified_blocks
@@ -3167,12 +3075,13 @@ impl BftState {
                 self.committed_height + 1,
                 height
             );
-            self.pending_commits.insert(height, (block_hash, qc));
+            self.pending_commits
+                .insert(height, (block_hash, qc, source));
             return vec![];
         }
 
         // Commit this block and any buffered subsequent blocks
-        self.commit_block_and_buffered(topology, block_hash, qc)
+        self.commit_block_and_buffered(topology, block_hash, qc, source)
     }
 
     /// Check if a block that just became complete has a pending commit waiting for it.
@@ -3185,14 +3094,14 @@ impl BftState {
         topology: &TopologySnapshot,
         block_hash: Hash,
     ) -> Vec<Action> {
-        if let Some((height, qc)) = self.pending_commits_awaiting_data.remove(&block_hash) {
+        if let Some((height, qc, source)) = self.pending_commits_awaiting_data.remove(&block_hash) {
             info!(
                 validator = ?topology.local_validator_id(),
                 block_hash = ?block_hash,
                 height = height,
                 "Retrying commit after block data arrived"
             );
-            self.on_block_ready_to_commit(topology, block_hash, qc)
+            self.on_block_ready_to_commit(topology, block_hash, qc, source)
         } else {
             vec![]
         }
@@ -3236,10 +3145,12 @@ impl BftState {
         topology: &TopologySnapshot,
         block_hash: Hash,
         certifying_qc: QuorumCertificate,
+        source: CommitSource,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
         let mut current_hash = block_hash;
         let mut current_qc = certifying_qc;
+        let mut current_source = source;
 
         loop {
             // Get the fully-assembled block to commit. `PendingBlock` gates
@@ -3300,6 +3211,7 @@ impl BftState {
                 Action::CommitBlock {
                     block: block.clone(),
                     qc: current_qc.clone(),
+                    source: current_source,
                 }
             } else {
                 Action::CommitBlockByQcOnly {
@@ -3307,6 +3219,7 @@ impl BftState {
                     qc: current_qc.clone(),
                     parent_state_root,
                     parent_block_height,
+                    source: current_source,
                 }
             };
             actions.push(commit_action);
@@ -3324,13 +3237,16 @@ impl BftState {
 
             // Check if the next height is buffered
             let next_height = height + 1;
-            if let Some((next_hash, next_qc)) = self.pending_commits.remove(&next_height) {
+            if let Some((next_hash, next_qc, next_source)) =
+                self.pending_commits.remove(&next_height)
+            {
                 debug!(
                     "Processing buffered commit for height {} after committing {}",
                     next_height, height
                 );
                 current_hash = next_hash;
                 current_qc = next_qc;
+                current_source = next_source;
             } else {
                 // No more buffered commits
                 break;
@@ -3596,6 +3512,7 @@ impl BftState {
             qc,
             parent_state_root,
             parent_block_height,
+            source: CommitSource::Sync,
         }];
 
         for bh in removed_blocks {
@@ -4247,7 +4164,7 @@ impl BftState {
 
         // Remove pending commits awaiting data at or below committed height
         self.pending_commits_awaiting_data
-            .retain(|_, (height, _)| *height > committed_height);
+            .retain(|_, (height, _, _)| *height > committed_height);
 
         // Remove buffered out-of-order commits at or below committed height.
         // These are commits that arrived before their predecessors; once we've
@@ -6947,16 +6864,23 @@ mod tests {
     }
 
     #[test]
-    fn test_qc_formed_does_not_propose_empty_block() {
-        // When a QC forms and there's no content (empty mempool,
-        // no conflicts, no certificates), we should NOT immediately propose.
-        // This avoids wasting resources on empty block pipelining.
+    fn test_qc_formed_proposes_empty_block_for_finalization() {
+        // Under the 2-chain commit rule, block N+1 is what certifies block N.
+        // After a QC forms we must propose N+1 immediately — even with no
+        // content — or finalization of N stalls.
         let (mut state, topology) = make_test_state();
         state.set_time(Duration::from_secs(100));
+        // Parent tree must be available or try_propose defers.
+        state.committed_height = 3;
+        state.verification.on_block_persisted(3);
 
-        // Create a QC at height 3 (so next height would be 4, which validator 0 proposes)
+        let block_3_hash = Hash::from_bytes(b"block_3");
+        state
+            .certified_blocks
+            .insert(block_3_hash, make_empty_block(3));
+
         let qc = QuorumCertificate {
-            block_hash: Hash::from_bytes(b"block_3"),
+            block_hash: block_3_hash,
             shard_group_id: ShardGroupId(0),
             height: BlockHeight(3),
             parent_block_hash: Hash::from_bytes(b"block_2"),
@@ -6966,24 +6890,23 @@ mod tests {
             weighted_timestamp_ms: 100_000,
         };
 
-        // Call on_qc_formed with empty content
         let actions = state.on_qc_formed(
             &topology,
-            qc.block_hash,
+            block_3_hash,
             qc,
-            &ReadyTransactions::default(), // empty mempool
-            vec![],                        // no certificates
+            &ReadyTransactions::default(),
+            vec![],
             vec![],
         );
 
-        // Should NOT contain a BlockHeader broadcast (no proposal)
-        let has_block_header = actions
-            .iter()
-            .any(|a| matches!(a, Action::BroadcastBlockHeader { .. }));
+        // Should emit BuildProposal for height 4 even with empty content.
+        let has_build_proposal = actions.iter().any(
+            |a| matches!(a, Action::BuildProposal { height, .. } if height == &BlockHeight(4)),
+        );
 
         assert!(
-            !has_block_header,
-            "Should not propose empty block immediately after QC formation"
+            has_build_proposal,
+            "Should propose empty block immediately after QC formation to advance finalization"
         );
     }
 
@@ -7248,277 +7171,6 @@ mod tests {
         let result = state.validate_transaction_ordering(&block);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not in hash order"));
-    }
-
-    #[test]
-    fn test_min_block_interval_rate_limits_immediate_proposal() {
-        // When a QC forms with content but we proposed too recently,
-        // the immediate proposal should be rate-limited.
-
-        let (mut state, topology) = make_test_state();
-
-        // Set current time and simulate that a QC formed very recently
-        state.set_time(Duration::from_millis(1000));
-        state.last_qc_time = Some(Duration::from_millis(950)); // 50ms ago
-
-        // min_block_interval is 500ms by default, so we're within the rate limit window
-
-        // Create a QC at height 3 (so next height would be 4, which validator 0 proposes)
-        let qc = QuorumCertificate {
-            block_hash: Hash::from_bytes(b"block_3"),
-            shard_group_id: ShardGroupId(0),
-            height: BlockHeight(3),
-            parent_block_hash: Hash::from_bytes(b"block_2"),
-            round: 0,
-            signers: SignerBitfield::empty(),
-            aggregated_signature: zero_bls_signature(),
-            weighted_timestamp_ms: 1000,
-        };
-
-        // Create a ready transaction so there's content to propose
-        let ready_txs = ReadyTransactions {
-            transactions: vec![make_test_tx_with_seed(42)],
-        };
-
-        let actions = state.on_qc_formed(
-            &topology,
-            qc.block_hash,
-            qc,
-            &ready_txs, // has content
-            vec![],
-            vec![],
-        );
-
-        // Should NOT contain a BlockHeader broadcast (rate limited)
-        let has_block_header = actions
-            .iter()
-            .any(|a| matches!(a, Action::BroadcastBlockHeader { .. }));
-
-        assert!(
-            !has_block_header,
-            "Should NOT propose immediately when rate limited (last QC 50ms ago, limit is 500ms)"
-        );
-    }
-
-    #[test]
-    fn test_min_block_interval_allows_proposal_after_interval() {
-        // When enough time has passed since the last proposal,
-        // immediate proposals should be allowed.
-
-        let (mut state, topology) = make_test_state();
-        // Simulate committed state up to height 3 so the parent tree is available
-        // for BuildProposal (which defers if parent tree nodes aren't in the store).
-        state.committed_height = 3;
-        state.verification.on_block_persisted(3);
-
-        // Set current time and simulate that enough time passed since last QC
-        state.set_time(Duration::from_millis(1000));
-        state.last_qc_time = Some(Duration::from_millis(100)); // 900ms ago
-
-        // min_block_interval is 500ms by default, so 900ms > 500ms - should be allowed
-
-        // Create a QC at height 3 (so next height would be 4, which validator 0 proposes)
-        let block_3_hash = Hash::from_bytes(b"block_3");
-        let qc = QuorumCertificate {
-            block_hash: block_3_hash,
-            shard_group_id: ShardGroupId(0),
-            height: BlockHeight(3),
-            parent_block_hash: Hash::from_bytes(b"block_2"),
-            round: 0,
-            signers: SignerBitfield::empty(),
-            aggregated_signature: zero_bls_signature(),
-            weighted_timestamp_ms: 1000,
-        };
-
-        // Insert the certified block so on_qc_formed can read its header
-        state
-            .certified_blocks
-            .insert(block_3_hash, make_empty_block(3));
-
-        // Create a ready transaction so there's content to propose
-        let ready_txs = ReadyTransactions {
-            transactions: vec![make_test_tx_with_seed(42)],
-        };
-
-        let actions = state.on_qc_formed(&topology, block_3_hash, qc, &ready_txs, vec![], vec![]);
-
-        // Should contain a BuildProposal action (enough time passed)
-        // After the refactor, proposal building is async - we emit BuildProposal
-        // and the runner calls back with ProposalBuilt which triggers the broadcast.
-        let has_build_proposal = actions.iter().any(
-            |a| matches!(a, Action::BuildProposal { height, .. } if height == &BlockHeight(4)),
-        );
-
-        assert!(
-            has_build_proposal,
-            "Should propose after rate limit interval has passed (900ms > 800ms)"
-        );
-    }
-
-    #[test]
-    fn test_min_block_interval_configurable() {
-        // Test that the min_block_interval config is respected.
-
-        let keys: Vec<Bls12381G1PrivateKey> = (0..4).map(|_| generate_bls_keypair()).collect();
-        let validators: Vec<ValidatorInfo> = keys
-            .iter()
-            .enumerate()
-            .map(|(i, k)| ValidatorInfo {
-                validator_id: ValidatorId(i as u64),
-                public_key: k.public_key(),
-                voting_power: 1,
-            })
-            .collect();
-        let validator_set = ValidatorSet::new(validators);
-        let topology = TopologySnapshot::new(ValidatorId(0), 1, validator_set);
-
-        // Create config with longer min_block_interval
-        let config = BftConfig {
-            min_block_interval: Duration::from_millis(500),
-            ..BftConfig::default()
-        };
-
-        let mut state = BftState::new(0, &topology, config, RecoveredState::default());
-
-        // Set current time and simulate that QC formed 200ms ago
-        state.set_time(Duration::from_millis(1000));
-        state.last_qc_time = Some(Duration::from_millis(800)); // 200ms ago
-
-        // With min_block_interval of 500ms, 200ms is not enough - should be rate limited
-
-        let qc = QuorumCertificate {
-            block_hash: Hash::from_bytes(b"block_3"),
-            shard_group_id: ShardGroupId(0),
-            height: BlockHeight(3),
-            parent_block_hash: Hash::from_bytes(b"block_2"),
-            round: 0,
-            signers: SignerBitfield::empty(),
-            aggregated_signature: zero_bls_signature(),
-            weighted_timestamp_ms: 1000,
-        };
-
-        let ready_txs = ReadyTransactions {
-            transactions: vec![make_test_tx_with_seed(42)],
-        };
-
-        let actions = state.on_qc_formed(&topology, qc.block_hash, qc, &ready_txs, vec![], vec![]);
-
-        let has_block_header = actions
-            .iter()
-            .any(|a| matches!(a, Action::BroadcastBlockHeader { .. }));
-
-        assert!(
-            !has_block_header,
-            "Should be rate limited with custom 500ms interval (only 200ms passed)"
-        );
-    }
-
-    #[test]
-    fn test_min_block_interval_zero_disables_rate_limiting() {
-        // Test that setting min_block_interval to zero disables rate limiting.
-
-        let keys: Vec<Bls12381G1PrivateKey> = (0..4).map(|_| generate_bls_keypair()).collect();
-        let validators: Vec<ValidatorInfo> = keys
-            .iter()
-            .enumerate()
-            .map(|(i, k)| ValidatorInfo {
-                validator_id: ValidatorId(i as u64),
-                public_key: k.public_key(),
-                voting_power: 1,
-            })
-            .collect();
-        let validator_set = ValidatorSet::new(validators);
-        let topology = TopologySnapshot::new(ValidatorId(0), 1, validator_set);
-
-        // Create config with zero min_block_interval (disabled)
-        let config = BftConfig {
-            min_block_interval: Duration::ZERO,
-            ..BftConfig::default()
-        };
-
-        let mut state = BftState::new(0, &topology, config, RecoveredState::default());
-        // Simulate committed state up to height 3 so the parent tree is available
-        // for BuildProposal (which defers if parent tree nodes aren't in the store).
-        state.committed_height = 3;
-        state.verification.on_block_persisted(3);
-
-        // QC just now (0ms ago) - normally would be rate limited
-        state.set_time(Duration::from_millis(1000));
-        state.last_qc_time = Some(Duration::from_millis(1000));
-
-        // Insert the certified block so on_qc_formed can read its header
-        let block_3_hash = Hash::from_bytes(b"block_3");
-        state
-            .certified_blocks
-            .insert(block_3_hash, make_empty_block(3));
-
-        let qc = QuorumCertificate {
-            block_hash: block_3_hash,
-            shard_group_id: ShardGroupId(0),
-            height: BlockHeight(3),
-            parent_block_hash: Hash::from_bytes(b"block_2"),
-            round: 0,
-            signers: SignerBitfield::empty(),
-            aggregated_signature: zero_bls_signature(),
-            weighted_timestamp_ms: 1000,
-        };
-
-        let ready_txs = ReadyTransactions {
-            transactions: vec![make_test_tx_with_seed(42)],
-        };
-
-        let actions = state.on_qc_formed(&topology, qc.block_hash, qc, &ready_txs, vec![], vec![]);
-
-        // Should contain a BuildProposal action (rate limiting disabled)
-        // After the refactor, proposal building is async - we emit BuildProposal
-        // and the runner calls back with ProposalBuilt which triggers the broadcast.
-        let has_build_proposal = actions.iter().any(
-            |a| matches!(a, Action::BuildProposal { height, .. } if height == &BlockHeight(4)),
-        );
-
-        assert!(
-            has_build_proposal,
-            "Should allow immediate proposal when min_block_interval is zero"
-        );
-    }
-
-    #[test]
-    fn test_on_qc_formed_updates_last_qc_time() {
-        // Verify that on_qc_formed updates last_qc_time after the rate limit check.
-        // This ensures the NEXT proposal is rate-limited against this QC's time.
-        let (mut state, topology) = make_test_state();
-        state.set_time(Duration::from_millis(5000));
-
-        // Ensure last_qc_time starts at None
-        assert_eq!(state.last_qc_time, None);
-
-        // Create a QC at height 3
-        let qc = QuorumCertificate {
-            block_hash: Hash::from_bytes(b"block_3"),
-            shard_group_id: ShardGroupId(0),
-            height: BlockHeight(3),
-            parent_block_hash: Hash::from_bytes(b"block_2"),
-            round: 0,
-            signers: SignerBitfield::empty(),
-            aggregated_signature: zero_bls_signature(),
-            weighted_timestamp_ms: 5000,
-        };
-
-        let _actions = state.on_qc_formed(
-            &topology,
-            qc.block_hash,
-            qc,
-            &ReadyTransactions::default(),
-            vec![],
-            vec![],
-        );
-
-        // Verify last_qc_time was updated to current time
-        assert_eq!(
-            state.last_qc_time,
-            Some(Duration::from_millis(5000)),
-            "last_qc_time should be updated to current time after on_qc_formed"
-        );
     }
 
     // ========================================================================

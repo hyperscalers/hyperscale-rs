@@ -9,7 +9,7 @@ use crate::protocol::local_provision_fetch::LocalProvisionFetchInput;
 use crate::protocol::provision_fetch::ProvisionFetchInput;
 use crate::protocol::sync::SyncInput;
 use crate::protocol::transaction_fetch::TransactionFetchInput;
-use hyperscale_core::{Action, NodeInput, ProtocolEvent, StateMachine};
+use hyperscale_core::{Action, CommitSource, NodeInput, ProtocolEvent, StateMachine};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::Engine;
 use hyperscale_metrics as metrics;
@@ -304,10 +304,11 @@ where
             // ═══════════════════════════════════════════════════════════
             // Block commit + notifications
             // ═══════════════════════════════════════════════════════════
-            Action::CommitBlock { block, qc } => {
+            Action::CommitBlock { block, qc, source } => {
                 self.accumulate_block_commit(super::PendingCommit {
                     block: Arc::new(block),
                     qc: Arc::new(qc),
+                    source,
                     committed_notified: false, // set by accumulate_block_commit
                 });
             }
@@ -316,12 +317,14 @@ where
                 qc,
                 parent_state_root,
                 parent_block_height,
+                source,
             } => {
                 self.handle_commit_block_by_qc_only(
                     block,
                     qc,
                     parent_state_root,
                     parent_block_height,
+                    source,
                 );
             }
             Action::EmitTransactionStatus {
@@ -465,6 +468,7 @@ where
         qc: QuorumCertificate,
         parent_state_root: Hash,
         parent_block_height: u64,
+        source: CommitSource,
     ) {
         let block_hash = block.hash();
         let height = block.height();
@@ -564,6 +568,7 @@ where
         self.accumulate_block_commit(super::PendingCommit {
             block: Arc::new(block),
             qc: Arc::new(qc),
+            source,
             committed_notified: false,
         });
     }
@@ -595,11 +600,14 @@ where
 
         debug!(height = height.0, ?block_hash, "Block committed");
 
-        // Block commit latency: time from proposal timestamp to now.
+        // Block commit latency: time from proposal timestamp to now. Labeled
+        // by `source` so dashboards can separate the three commit paths
+        // (aggregator/header/sync), which have materially different latencies
+        // under the 2-chain rule.
         let now_ms = self.state.now().as_millis() as u64;
         let commit_latency_secs =
             (now_ms.saturating_sub(commit.block.header().timestamp)) as f64 / 1000.0;
-        metrics::record_block_committed(height.0, commit_latency_secs);
+        metrics::record_block_committed(height.0, commit_latency_secs, commit.source.as_str());
         metrics::set_block_height(height.0);
         // Feed committed height to sync protocol (just tracks progress,
         // doesn't need JMT state).

@@ -52,15 +52,6 @@ gossipsub_heartbeat_ms = 100
 # ═══════════════════════════════════════════════════════════════════════════════
 
 [consensus]
-# Block proposal interval (milliseconds)
-# Lower = faster finality, higher network load
-# Slower intervals accumulate more transactions per block, improving merkle proof amortization
-proposal_interval_ms = 1000
-
-# Minimum time between block proposals (milliseconds)
-# Rate limits rapid block production even when QC forms immediately
-min_block_interval_ms = 500
-
 # View change timeout (milliseconds)
 # How long to wait before triggering leader rotation
 view_change_timeout_ms = 5000

@@ -21,7 +21,7 @@ use prometheus::{
 pub struct Metrics {
     // === Consensus ===
     pub blocks_committed: Counter,
-    pub block_commit_latency: Histogram,
+    pub block_commit_latency: HistogramVec,
     pub block_height: Gauge,
     pub round: Gauge,
     pub view_changes: Gauge,
@@ -134,7 +134,8 @@ pub struct Metrics {
 impl Metrics {
     fn new() -> Self {
         let latency_buckets = vec![
-            0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0,
+            0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5,
+            3.0, 5.0, 10.0, 30.0, 60.0, 120.0,
         ];
 
         let build_info = register_gauge_vec!(
@@ -157,9 +158,10 @@ impl Metrics {
             )
             .unwrap(),
 
-            block_commit_latency: register_histogram!(
+            block_commit_latency: register_histogram_vec!(
                 "hyperscale_block_commit_latency_seconds",
-                "Time from proposal to commit",
+                "Time from proposal to commit, split by how this node learned the certifying QC",
+                &["source"],
                 latency_buckets.clone()
             )
             .unwrap(),
@@ -732,10 +734,11 @@ impl MetricsRecorder for PrometheusRecorder {
 
     // ── Consensus ────────────────────────────────────────────────────
 
-    fn record_block_committed(&self, height: u64, commit_latency_secs: f64) {
+    fn record_block_committed(&self, height: u64, commit_latency_secs: f64, source: &str) {
         self.metrics.blocks_committed.inc();
         self.metrics
             .block_commit_latency
+            .with_label_values(&[source])
             .observe(commit_latency_secs);
         self.metrics.block_height.set(height as f64);
     }

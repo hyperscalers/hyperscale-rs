@@ -31,8 +31,6 @@
 //! bootstrap_peers = []
 //!
 //! [consensus]
-//! proposal_interval_ms = 1000
-//! min_block_interval_ms = 500
 //! view_change_timeout_ms = 5000
 //!
 //! [threads]
@@ -269,10 +267,6 @@ fn default_keep_alive_interval_ms() -> u64 {
 /// Consensus configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ConsensusConfig {
-    /// Interval between proposal attempts (milliseconds)
-    #[serde(default = "default_proposal_interval_ms")]
-    pub proposal_interval_ms: u64,
-
     /// Timeout for view change (milliseconds)
     #[serde(default = "default_view_change_timeout_ms")]
     pub view_change_timeout_ms: u64,
@@ -284,29 +278,16 @@ pub struct ConsensusConfig {
     /// Maximum finalized transactions per block (across all wave certificates)
     #[serde(default = "default_max_finalized_transactions_per_block")]
     pub max_finalized_transactions_per_block: usize,
-
-    /// Minimum time between block proposals in milliseconds (rate limiting).
-    /// Even when a QC forms immediately, wait at least this long since the last
-    /// proposal. Slower blocks accumulate more transactions for better merkle
-    /// proof amortization.
-    #[serde(default = "default_min_block_interval_ms")]
-    pub min_block_interval_ms: u64,
 }
 
 impl Default for ConsensusConfig {
     fn default() -> Self {
         Self {
-            proposal_interval_ms: default_proposal_interval_ms(),
             view_change_timeout_ms: default_view_change_timeout_ms(),
             max_transactions_per_block: default_max_transactions_per_block(),
             max_finalized_transactions_per_block: default_max_finalized_transactions_per_block(),
-            min_block_interval_ms: default_min_block_interval_ms(),
         }
     }
-}
-
-fn default_proposal_interval_ms() -> u64 {
-    1000
 }
 
 fn default_view_change_timeout_ms() -> u64 {
@@ -319,10 +300,6 @@ fn default_max_transactions_per_block() -> usize {
 
 fn default_max_finalized_transactions_per_block() -> usize {
     8192
-}
-
-fn default_min_block_interval_ms() -> u64 {
-    500
 }
 
 /// Thread pool configuration.
@@ -916,7 +893,6 @@ fn build_bft_config(config: &ConsensusConfig) -> BftConfig {
         .with_view_change_timeout(Duration::from_millis(config.view_change_timeout_ms))
         .with_max_transactions(config.max_transactions_per_block)
         .with_max_finalized_transactions(config.max_finalized_transactions_per_block)
-        .with_min_block_interval(Duration::from_millis(config.min_block_interval_ms))
 }
 
 /// Build network configuration from TOML config.

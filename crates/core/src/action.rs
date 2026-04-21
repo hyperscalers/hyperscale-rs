@@ -577,6 +577,8 @@ pub enum Action {
         block: Block,
         /// The QC that certified this block.
         qc: QuorumCertificate,
+        /// How this node learned the certifying QC (aggregator vs header).
+        source: crate::CommitSource,
     },
 
     /// Commit a block trusted via QC only — no cached PreparedCommit exists
@@ -594,6 +596,8 @@ pub enum Action {
         parent_state_root: Hash,
         /// Parent block's height — JMT parent version.
         parent_block_height: u64,
+        /// How this node learned the certifying QC (aggregator vs header).
+        source: crate::CommitSource,
     },
 
     /// Emit transaction status update for RPC status cache.

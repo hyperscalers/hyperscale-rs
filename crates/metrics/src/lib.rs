@@ -207,7 +207,7 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     // ── Consensus ────────────────────────────────────────────────────
 
     /// Record a block committed.
-    fn record_block_committed(&self, height: u64, commit_latency_secs: f64) {}
+    fn record_block_committed(&self, height: u64, commit_latency_secs: f64, source: &str) {}
 
     /// Record a transaction finalized.
     fn record_transaction_finalized(&self, latency_secs: f64, cross_shard: bool) {}
@@ -471,8 +471,8 @@ pub fn record_transactions_persisted(count: usize) {
 
 /// Record a block committed.
 #[inline]
-pub fn record_block_committed(height: u64, commit_latency_secs: f64) {
-    recorder().record_block_committed(height, commit_latency_secs);
+pub fn record_block_committed(height: u64, commit_latency_secs: f64, source: &str) {
+    recorder().record_block_committed(height, commit_latency_secs, source);
 }
 
 /// Record a transaction finalized.
