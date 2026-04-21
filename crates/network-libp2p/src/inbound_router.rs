@@ -317,48 +317,68 @@ impl InboundRouter {
         }
     }
 
-    /// Handle a single incoming request stream (read request, call handler, write response).
+    /// Handle a persistent inbound request stream.
+    ///
+    /// Loops reading typed request frames and writing response frames until
+    /// the client closes the stream or the idle timeout elapses. Matches the
+    /// notification-stream pattern — one stream per peer, many request/response
+    /// pairs.
     async fn handle_request_stream(
         &self,
-        _peer: PeerId,
+        peer: PeerId,
         mut stream: Stream,
     ) -> Result<(), StreamError> {
-        // Read typed frame: type_id header + compressed SBOR payload.
-        let (type_id, sbor_payload, req_wire_bytes) = tokio::time::timeout(
-            STREAM_IO_TIMEOUT,
-            stream_framing::read_typed_frame(&mut stream, MAX_FRAME_SIZE),
-        )
-        .await
-        .map_err(|_| StreamError::Timeout)?
-        .map_err(StreamError::Frame)?;
+        loop {
+            // Read the next request frame (idle timeout between requests).
+            let read_result = tokio::time::timeout(
+                PERSISTENT_STREAM_IDLE_TIMEOUT,
+                stream_framing::read_typed_frame(&mut stream, MAX_FRAME_SIZE),
+            )
+            .await;
 
-        metrics::record_libp2p_bandwidth(req_wire_bytes as u64, 0);
+            let (type_id, sbor_payload, req_wire_bytes) = match read_result {
+                Ok(Ok(frame)) => frame,
+                Ok(Err(FrameError::Io(ref e))) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    // Client closed the stream cleanly between requests.
+                    debug!(%peer, "Request stream closed by sender");
+                    return Ok(());
+                }
+                Ok(Err(e)) => return Err(StreamError::Frame(e)),
+                Err(_) => {
+                    // Idle timeout — close our side. Client will reconnect
+                    // on next request.
+                    debug!(%peer, "Request stream idle timeout, closing");
+                    return Ok(());
+                }
+            };
 
-        // Look up the per-type request handler.
-        let handler = self
-            .registry
-            .get_request(&type_id)
-            .ok_or(StreamError::UnknownMessageType)?;
+            metrics::record_libp2p_bandwidth(req_wire_bytes as u64, 0);
 
-        // Delegate to the handler on the blocking thread pool.
-        // Handlers like provision.request do heavy work (merkle proof generation)
-        // that would starve the async runtime if run on a worker thread.
-        let response_sbor = tokio::task::spawn_blocking(move || handler(&sbor_payload))
+            // Look up the per-type request handler.
+            let handler = self
+                .registry
+                .get_request(&type_id)
+                .ok_or(StreamError::UnknownMessageType)?;
+
+            // Delegate to the handler on the blocking thread pool.
+            // Handlers like provision.request do heavy work (merkle proof
+            // generation) that would starve the async runtime if run on a
+            // worker thread.
+            let response_sbor = tokio::task::spawn_blocking(move || handler(&sbor_payload))
+                .await
+                .expect("request handler task panicked");
+
+            // Write length-prefixed compressed response with timeout.
+            let resp_wire_bytes = tokio::time::timeout(
+                STREAM_IO_TIMEOUT,
+                stream_framing::write_frame(&mut stream, &response_sbor),
+            )
             .await
-            .expect("request handler task panicked");
+            .map_err(|_| StreamError::Timeout)?
+            .map_err(StreamError::Io)?;
 
-        // Write length-prefixed compressed response with timeout.
-        let resp_wire_bytes = tokio::time::timeout(
-            STREAM_IO_TIMEOUT,
-            stream_framing::write_frame(&mut stream, &response_sbor),
-        )
-        .await
-        .map_err(|_| StreamError::Timeout)?
-        .map_err(StreamError::Io)?;
-
-        metrics::record_libp2p_bandwidth(0, resp_wire_bytes as u64);
-
-        Ok(())
+            metrics::record_libp2p_bandwidth(0, resp_wire_bytes as u64);
+        }
     }
 
     /// Handle a persistent incoming notification stream.

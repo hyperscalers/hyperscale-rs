@@ -36,7 +36,8 @@ mod retry;
 mod stream;
 mod timeout;
 
-use crate::adapter::{Libp2pAdapter, NetworkError};
+use crate::adapter::NetworkError;
+use crate::request_pool::RequestStreamPool;
 use bytes::Bytes;
 use libp2p::PeerId;
 use peer_health::{PeerHealthConfig, PeerHealthTracker};
@@ -146,13 +147,16 @@ impl Default for RequestManagerConfig {
 
 /// Request manager with intelligent retry and peer selection.
 ///
-/// Wraps the network adapter and provides:
+/// Provides:
 /// - Request-centric retry logic (same peer first, then rotate)
 /// - Weighted peer selection based on health metrics
 /// - Adaptive concurrency control
 /// - Exponential backoff between retries
+///
+/// Actual stream I/O is delegated to a shared [`RequestStreamPool`], which
+/// maintains one persistent stream per peer.
 pub struct RequestManager {
-    adapter: Arc<Libp2pAdapter>,
+    pool: Arc<RequestStreamPool>,
     config: RequestManagerConfig,
     /// Peer health tracker (uses DashMap internally, no external lock needed).
     health: PeerHealthTracker,
@@ -164,10 +168,10 @@ pub struct RequestManager {
 
 impl RequestManager {
     /// Create a new request manager.
-    pub fn new(adapter: Arc<Libp2pAdapter>, config: RequestManagerConfig) -> Self {
+    pub fn new(pool: Arc<RequestStreamPool>, config: RequestManagerConfig) -> Self {
         let effective = config.max_concurrent;
         Self {
-            adapter,
+            pool,
             health: PeerHealthTracker::new(PeerHealthConfig {
                 max_in_flight_per_peer: config.max_per_peer,
                 ..Default::default()

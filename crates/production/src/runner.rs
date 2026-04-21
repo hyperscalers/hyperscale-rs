@@ -405,8 +405,12 @@ impl ProductionRunnerBuilder {
         .await?;
 
         // ── Create RequestManager ────────────────────────────────────────
-        let request_manager = Arc::new(hyperscale_network_libp2p::RequestManager::new(
+        let request_pool = Arc::new(hyperscale_network_libp2p::RequestStreamPool::new(
             adapter.clone(),
+            tokio::runtime::Handle::current(),
+        ));
+        let request_manager = Arc::new(hyperscale_network_libp2p::RequestManager::new(
+            request_pool,
             hyperscale_network_libp2p::RequestManagerConfig::default(),
         ));
 
