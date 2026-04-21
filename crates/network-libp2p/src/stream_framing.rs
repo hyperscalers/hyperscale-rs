@@ -49,7 +49,11 @@ impl From<io::Error> for FrameError {
     }
 }
 
-/// Compress `data`, write it as a length-prefixed frame, flush, and close the write side.
+/// Compress `data`, write it as a length-prefixed frame, and flush.
+///
+/// The reader uses `read_exact` with the length prefix to bound the read, so no
+/// end-of-stream signal is required. Stream destruction happens naturally when
+/// the caller drops it.
 ///
 /// Returns the number of bytes written on the wire (length prefix + compressed payload).
 pub(crate) async fn write_frame<S: AsyncWrite + Unpin>(
@@ -71,7 +75,6 @@ pub(crate) async fn write_frame<S: AsyncWrite + Unpin>(
     buf.extend_from_slice(&compressed);
     stream.write_all(&buf).await?;
     stream.flush().await?;
-    stream.close().await?;
     Ok(buf.len())
 }
 
@@ -115,16 +118,15 @@ const MAX_TYPE_ID_LEN: usize = 256;
 
 /// Write a typed request frame: type_id header followed by compressed SBOR payload.
 ///
-/// Flushes and half-closes the write side so the receiver knows the request is complete.
+/// Writes and flushes, but does not close. The reader frames the request with
+/// `read_exact` against the length prefix, so no end-of-stream signal is needed.
 /// Returns the number of bytes written on the wire.
 pub(crate) async fn write_typed_frame<S: AsyncWrite + Unpin>(
     stream: &mut S,
     type_id: &str,
     sbor_data: &[u8],
 ) -> Result<usize, io::Error> {
-    let wire_bytes = write_typed_frame_no_close(stream, type_id, sbor_data).await?;
-    stream.close().await?;
-    Ok(wire_bytes)
+    write_typed_frame_no_close(stream, type_id, sbor_data).await
 }
 
 /// Write a typed frame WITHOUT closing the stream.

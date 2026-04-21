@@ -53,7 +53,6 @@ impl RequestManager {
             .map_err(|e| NetworkError::StreamOpenFailed(format!("{:?}", e)))?;
 
         // Write typed frame (type_id header + compressed SBOR) with timeout.
-        // write_typed_frame flushes and half-closes the write side.
         let write_result = tokio::time::timeout(
             timeout,
             stream_framing::write_typed_frame(&mut stream, type_id, sbor_data),
