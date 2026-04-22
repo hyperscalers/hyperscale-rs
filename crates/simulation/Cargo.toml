@@ -38,4 +38,5 @@ rand_chacha.workspace = true
 # Radix dependencies for e2e tests
 radix-transactions.workspace = true
 
+hyperscale-test-helpers.workspace = true
 tracing-test.workspace = true

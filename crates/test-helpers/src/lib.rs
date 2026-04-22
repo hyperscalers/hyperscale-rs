@@ -30,8 +30,7 @@
 //! assert!(verify_bls12381_v1(&msg, pk, &vote.signature));
 //! ```
 
-#[cfg(test)]
-mod byzantine;
+pub mod byzantine;
 pub mod fixtures;
 
 use hyperscale_types::{
