@@ -3,13 +3,13 @@
 use hyperscale_bft::{BftConfig, BftCoordinator, RecoveredState};
 use hyperscale_core::{Action, ProtocolEvent, StateMachine, TimerId};
 use hyperscale_execution::ExecutionCoordinator;
-use hyperscale_mempool::{MempoolConfig, MempoolState};
+use hyperscale_mempool::{MempoolConfig, MempoolCoordinator};
 use hyperscale_provisions::{ProvisionConfig, ProvisionCoordinator};
 use hyperscale_remote_headers::RemoteHeaderCoordinator;
 use hyperscale_topology::TopologyState;
 use hyperscale_types::{
     Block, BlockHeader, BlockManifest, CertifiedBlock, FinalizedWave, Hash, Provision,
-    QuorumCertificate, ReadyTransactions, RoutableTransaction, ShardGroupId, TopologySnapshot,
+    QuorumCertificate, RoutableTransaction, ShardGroupId, TopologySnapshot,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -42,7 +42,7 @@ pub struct NodeStateMachine {
     execution: ExecutionCoordinator,
 
     /// Mempool state.
-    mempool: MempoolState,
+    mempool: MempoolCoordinator,
 
     /// Provision coordination for cross-shard transactions.
     provisions: ProvisionCoordinator,
@@ -70,7 +70,7 @@ impl std::fmt::Debug for NodeStateMachine {
 /// Used by both `ContentAvailable` and `QuorumCertificateFormed` handlers
 /// to avoid duplicating the ready-transaction gathering logic.
 struct ProposalInputs {
-    ready_txs: ReadyTransactions,
+    ready_txs: Vec<Arc<RoutableTransaction>>,
     finalized_waves: Vec<Arc<FinalizedWave>>,
     provision_batches: Vec<Arc<Provision>>,
 }
@@ -99,7 +99,7 @@ impl NodeStateMachine {
             node_index,
             bft: BftCoordinator::new(node_index, bft_config.clone(), recovered),
             execution: ExecutionCoordinator::new(),
-            mempool: MempoolState::with_config(mempool_config),
+            mempool: MempoolCoordinator::with_config(mempool_config),
             provisions: ProvisionCoordinator::with_config(provision_config),
             remote_headers: RemoteHeaderCoordinator::new(),
             topology,
@@ -125,7 +125,7 @@ impl NodeStateMachine {
     }
 
     /// Get a reference to the mempool state.
-    pub fn mempool(&self) -> &MempoolState {
+    pub fn mempool(&self) -> &MempoolCoordinator {
         &self.mempool
     }
 

@@ -129,8 +129,6 @@ pub struct MemoryMetrics {
     pub mempool_recently_evicted: usize,
     /// Cached set of locked nodes.
     pub mempool_locked_nodes: usize,
-    /// Distinct committed_at heights tracked for timeout scanning.
-    pub mempool_in_flight_heights: usize,
     /// Transactions deferred due to node conflicts.
     pub mempool_deferred_by_nodes: usize,
     /// Reverse index: node -> deferred transactions.

@@ -1208,10 +1208,6 @@ impl MetricsRecorder for PrometheusRecorder {
             .set(m.mempool_locked_nodes as f64);
         self.metrics
             .memory_mempool
-            .with_label_values(&["in_flight_heights"])
-            .set(m.mempool_in_flight_heights as f64);
-        self.metrics
-            .memory_mempool
             .with_label_values(&["deferred_by_nodes"])
             .set(m.mempool_deferred_by_nodes as f64);
         self.metrics

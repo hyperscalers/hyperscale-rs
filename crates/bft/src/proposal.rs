@@ -16,8 +16,8 @@
 
 use hyperscale_core::Action;
 use hyperscale_types::{
-    BlockHeight, FinalizedWave, Hash, ProposerTimestamp, Provision, ReadyTransactions, Round,
-    RoutableTransaction, TopologySnapshot,
+    BlockHeight, FinalizedWave, Hash, ProposerTimestamp, Provision, Round, RoutableTransaction,
+    TopologySnapshot,
 };
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -119,13 +119,12 @@ impl ProposalTracker {
 /// survive past mempool eviction — critical after sync). Logs the dedup
 /// count when it is non-zero.
 pub(crate) fn select_transactions(
-    ready_txs: &ReadyTransactions,
+    ready_txs: &[Arc<RoutableTransaction>],
     qc_chain_tx_hashes: &HashSet<Hash>,
     tx_cache: &CommittedTxCache,
 ) -> Vec<Arc<RoutableTransaction>> {
-    let before = ready_txs.transactions.len();
+    let before = ready_txs.len();
     let filtered: Vec<_> = ready_txs
-        .transactions
         .iter()
         .filter(|tx| {
             let h = tx.hash();

@@ -97,8 +97,8 @@ pub use timeouts::{REMOTE_HEADER_RETENTION, WAVE_TIMEOUT};
 pub use timestamp::{ProposerTimestamp, WeightedTimestamp};
 pub use topology::{node_id_hash_u64, shard_for_node, TopologySnapshot, TopologySnapshotError};
 pub use transaction::{
-    sign_and_notarize, sign_and_notarize_with_options, ReadyTransactions, RoutableTransaction,
-    TransactionDecision, TransactionError, TransactionStatus, TransactionStatusParseError,
+    sign_and_notarize, sign_and_notarize_with_options, RoutableTransaction, TransactionDecision,
+    TransactionError, TransactionStatus, TransactionStatusParseError,
 };
 pub use validator::{ValidatorInfo, ValidatorSet};
 pub use wave::{

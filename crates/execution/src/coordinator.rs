@@ -1835,19 +1835,6 @@ mod tests {
         ExecutionCoordinator::new()
     }
 
-    /// Pair a test `Block` with a matching zeroed QC so it satisfies the
-    /// `CertifiedBlock` pairing invariant.
-    fn certify(block: Block) -> hyperscale_types::CertifiedBlock {
-        let qc = hyperscale_types::QuorumCertificate {
-            block_hash: block.hash(),
-            ..hyperscale_types::QuorumCertificate::genesis()
-        };
-        hyperscale_types::CertifiedBlock::new_unchecked(block, qc)
-    }
-
-    /// Build a minimal `Block::Live` suitable for driving
-    /// `on_block_committed` in tests. The returned block's `hash()` is
-    /// derived from a deterministic header built from the inputs.
     fn make_live_block(
         topology: &TopologySnapshot,
         height: BlockHeight,
@@ -1855,31 +1842,18 @@ mod tests {
         proposer: ValidatorId,
         transactions: Vec<Arc<RoutableTransaction>>,
     ) -> Block {
-        use hyperscale_types::{BlockHeader, ProposerTimestamp, QuorumCertificate, Round};
-        let header = BlockHeader {
-            shard_group_id: topology.local_shard(),
+        hyperscale_test_helpers::make_live_block(
+            topology.local_shard(),
             height,
-            parent_hash: Hash::ZERO,
-            parent_qc: QuorumCertificate::genesis(),
+            timestamp_ms,
             proposer,
-            timestamp: ProposerTimestamp(timestamp_ms),
-            round: Round::INITIAL,
-            is_fallback: false,
-            state_root: Hash::ZERO,
-            transaction_root: Hash::ZERO,
-            certificate_root: Hash::ZERO,
-            local_receipt_root: Hash::ZERO,
-            provision_root: Hash::ZERO,
-            waves: vec![],
-            provision_tx_roots: BTreeMap::new(),
-            in_flight: 0,
-        };
-        Block::Live {
-            header,
             transactions,
-            certificates: vec![],
-            provisions: vec![],
-        }
+            vec![],
+        )
+    }
+
+    fn certify(block: Block) -> hyperscale_types::CertifiedBlock {
+        hyperscale_test_helpers::certify(block, 0)
     }
 
     #[test]

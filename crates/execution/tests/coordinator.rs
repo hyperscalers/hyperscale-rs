@@ -7,29 +7,14 @@
 
 use hyperscale_execution::{ExecutionCoordinator, ExecutionMemoryStats};
 use hyperscale_test_helpers::TestCommittee;
-use hyperscale_types::{
-    BlockHeight, Hash, ShardGroupId, TopologySnapshot, ValidatorInfo, ValidatorSet, WaveId,
-};
-
-fn topology_for(committee: &TestCommittee, local_idx: usize) -> TopologySnapshot {
-    let validators: Vec<ValidatorInfo> = (0..committee.size())
-        .map(|i| ValidatorInfo {
-            validator_id: committee.validator_id(i),
-            public_key: *committee.public_key(i),
-            voting_power: 1,
-        })
-        .collect();
-    let validator_set = ValidatorSet::new(validators);
-    TopologySnapshot::new(committee.validator_id(local_idx), 1, validator_set)
-}
+use hyperscale_types::{BlockHeight, Hash, ShardGroupId, TopologySnapshot, WaveId};
 
 fn fresh_coordinator() -> ExecutionCoordinator {
     ExecutionCoordinator::new()
 }
 
 fn fresh_coordinator_with_topology() -> (ExecutionCoordinator, TopologySnapshot) {
-    let committee = TestCommittee::new(4, 42);
-    let topology = topology_for(&committee, 0);
+    let topology = TestCommittee::new(4, 42).topology_snapshot(0, 1);
     (fresh_coordinator(), topology)
 }
 

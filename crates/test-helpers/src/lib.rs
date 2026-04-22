@@ -17,8 +17,15 @@
 //! ```
 
 use hyperscale_types::{
-    bls_keypair_from_seed, Bls12381G1PrivateKey, Bls12381G1PublicKey, ValidatorId,
+    bls_keypair_from_seed, Block, BlockHeader, BlockHeight, Bls12381G1PrivateKey,
+    Bls12381G1PublicKey, Bls12381G2Signature, CertifiedBlock, ExecutionCertificate,
+    ExecutionOutcome, FinalizedWave, Hash, ProposerTimestamp, QuorumCertificate, Round,
+    RoutableTransaction, ShardGroupId, SignerBitfield, TopologySnapshot, TransactionDecision,
+    TxOutcome, ValidatorId, ValidatorInfo, ValidatorSet, WaveCertificate, WaveId,
+    WeightedTimestamp,
 };
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 /// A test committee of validators with deterministic BLS keypairs.
 ///
@@ -164,6 +171,115 @@ impl TestCommittee {
     /// Returns the first `quorum_threshold()` indices.
     pub fn quorum_indices(&self) -> Vec<usize> {
         (0..self.quorum_threshold()).collect()
+    }
+
+    /// Build a [`TopologySnapshot`] from this committee with uniform voting
+    /// power. `local_idx` picks which validator the snapshot represents;
+    /// `num_shards` sets the shard count for tx routing.
+    pub fn topology_snapshot(&self, local_idx: usize, num_shards: u64) -> TopologySnapshot {
+        let validators: Vec<ValidatorInfo> = (0..self.size())
+            .map(|i| ValidatorInfo {
+                validator_id: self.validator_id(i),
+                public_key: *self.public_key(i),
+                voting_power: 1,
+            })
+            .collect();
+        let validator_set = ValidatorSet::new(validators);
+        TopologySnapshot::new(self.validator_id(local_idx), num_shards, validator_set)
+    }
+}
+
+/// Build a minimal `Block::Live` fixture for driving state machines.
+///
+/// Every non-essential header field takes a zero default: all merkle roots
+/// are `Hash::ZERO`, `parent_qc` is `QuorumCertificate::genesis()`, `round`
+/// is `Round::INITIAL`, and there are no wave roots or provisions. Callers
+/// pass only the bits that vary between tests.
+pub fn make_live_block(
+    shard_group_id: ShardGroupId,
+    height: BlockHeight,
+    timestamp_ms: u64,
+    proposer: ValidatorId,
+    transactions: Vec<Arc<RoutableTransaction>>,
+    certificates: Vec<Arc<FinalizedWave>>,
+) -> Block {
+    let header = BlockHeader {
+        shard_group_id,
+        height,
+        parent_hash: Hash::ZERO,
+        parent_qc: QuorumCertificate::genesis(),
+        proposer,
+        timestamp: ProposerTimestamp(timestamp_ms),
+        round: Round::INITIAL,
+        is_fallback: false,
+        state_root: Hash::ZERO,
+        transaction_root: Hash::ZERO,
+        certificate_root: Hash::ZERO,
+        local_receipt_root: Hash::ZERO,
+        provision_root: Hash::ZERO,
+        waves: vec![],
+        provision_tx_roots: BTreeMap::new(),
+        in_flight: 0,
+    };
+    Block::Live {
+        header,
+        transactions,
+        certificates,
+        provisions: vec![],
+    }
+}
+
+/// Pair a block with a minimal valid `QuorumCertificate` so it satisfies
+/// the `CertifiedBlock` pairing invariant. `weighted_timestamp_ms` stamps
+/// the BFT-authenticated time anchor; pass `0` when retention-window
+/// behavior doesn't matter.
+pub fn certify(block: Block, weighted_timestamp_ms: u64) -> CertifiedBlock {
+    let qc = QuorumCertificate {
+        block_hash: block.hash(),
+        weighted_timestamp: WeightedTimestamp(weighted_timestamp_ms),
+        ..QuorumCertificate::genesis()
+    };
+    CertifiedBlock::new_unchecked(block, qc)
+}
+
+/// Build a minimal `FinalizedWave` carrying a single tx decision. The wave
+/// is anchored on `ShardGroupId(0)` with `block_height` as its identity
+/// and no remote shard dependencies — sufficient for driving
+/// `on_block_committed` when tests only care about tx-terminal-state side
+/// effects. The inner EC carries a zeroed BLS signature and a 4-seat
+/// signer bitfield, so callers should not feed the result through
+/// verification paths.
+pub fn make_finalized_wave(
+    block_height: BlockHeight,
+    tx_hash: Hash,
+    decision: TransactionDecision,
+) -> FinalizedWave {
+    let outcome = match decision {
+        TransactionDecision::Accept => ExecutionOutcome::Executed {
+            receipt_hash: Hash::ZERO,
+            success: true,
+        },
+        TransactionDecision::Reject => ExecutionOutcome::Executed {
+            receipt_hash: Hash::ZERO,
+            success: false,
+        },
+        TransactionDecision::Aborted => ExecutionOutcome::Aborted,
+    };
+    let wave_id = WaveId::new(ShardGroupId(0), block_height, BTreeSet::new());
+    let ec = ExecutionCertificate::new(
+        wave_id.clone(),
+        WeightedTimestamp(block_height.0 + 1),
+        Hash::ZERO,
+        vec![TxOutcome { tx_hash, outcome }],
+        Bls12381G2Signature([0u8; 96]),
+        SignerBitfield::new(4),
+    );
+    FinalizedWave {
+        certificate: Arc::new(WaveCertificate {
+            wave_id,
+            execution_certificates: vec![Arc::new(ec)],
+        }),
+        receipts: vec![],
     }
 }
 

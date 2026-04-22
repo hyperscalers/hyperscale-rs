@@ -413,41 +413,6 @@ impl TransactionStatus {
             TransactionStatus::Committed(_) | TransactionStatus::Executed { .. }
         )
     }
-
-    /// Returns a rough ordering value for the status in the normal lifecycle.
-    ///
-    /// This is used to detect stale status updates (where we've already progressed
-    /// past the incoming status). Note that this doesn't capture all valid transitions,
-    /// but it helps identify clearly stale updates.
-    ///
-    /// Ordering: Pending(0) < Committed(1) < Executed(2) < Completed(3)
-    pub fn ordinal(&self) -> u8 {
-        match self {
-            TransactionStatus::Pending => 0,
-            TransactionStatus::Committed(_) => 1,
-            TransactionStatus::Executed { .. } => 2,
-            TransactionStatus::Completed(_) => 3,
-        }
-    }
-
-    /// Check if this transition is valid.
-    pub fn can_transition_to(&self, next: &TransactionStatus) -> bool {
-        use TransactionStatus::*;
-
-        match (self, next) {
-            // Pending → Committed
-            (Pending, Committed(_)) => true,
-
-            // Committed → Executed (execution complete, certificate created)
-            (Committed(_), Executed { .. }) => true,
-
-            // Executed → Completed (certificate committed in block)
-            (Executed { .. }, Completed(_)) => true,
-
-            // No other transitions are valid
-            _ => false,
-        }
-    }
 }
 
 impl std::fmt::Display for TransactionStatus {
@@ -1075,33 +1040,6 @@ pub fn sign_and_notarize_with_options(
         signed_intent,
         notary_signature: NotarySignatureV1(notary_signature),
     })
-}
-
-/// Ready transactions for block proposal.
-///
-/// Transactions are sorted by hash (from BTreeMap iteration order) for determinism.
-/// All transactions are subject to the same backpressure limit.
-#[derive(Clone, Debug, Default)]
-pub struct ReadyTransactions {
-    /// Transactions ready for inclusion, sorted by hash.
-    pub transactions: Vec<std::sync::Arc<RoutableTransaction>>,
-}
-
-impl ReadyTransactions {
-    /// Total number of transactions.
-    pub fn len(&self) -> usize {
-        self.transactions.len()
-    }
-
-    /// Whether there are no transactions.
-    pub fn is_empty(&self) -> bool {
-        self.transactions.is_empty()
-    }
-
-    /// Iterate all transactions.
-    pub fn iter(&self) -> impl Iterator<Item = &std::sync::Arc<RoutableTransaction>> {
-        self.transactions.iter()
-    }
 }
 
 #[cfg(test)]

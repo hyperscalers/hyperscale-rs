@@ -2,7 +2,7 @@
 //!
 //! These tests verify that the backpressure system works correctly in the
 //! integrated simulation environment, testing the interaction between:
-//! - MempoolState (ready_transactions with backpressure, in_flight count)
+//! - MempoolCoordinator (ready_transactions with backpressure, in_flight count)
 //! - ProvisionCoordinator (tracking provisions for livelock detection)
 //! - NodeStateMachine (attaching proofs to transactions)
 //!

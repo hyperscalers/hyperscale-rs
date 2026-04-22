@@ -51,7 +51,7 @@ pub struct BftMemoryStats {
 pub type NodeIndex = u32;
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, BlockManifest, BlockVote, CertifiedBlock, FinalizedWave, Hash,
-    Provision, QuorumCertificate, ReadyTransactions, Round, RoutableTransaction, TopologySnapshot,
+    Provision, QuorumCertificate, Round, RoutableTransaction, TopologySnapshot,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -623,7 +623,7 @@ impl BftCoordinator {
     pub fn try_propose(
         &mut self,
         topology: &TopologySnapshot,
-        ready_txs: &ReadyTransactions,
+        ready_txs: &[Arc<RoutableTransaction>],
         finalized_waves: Vec<Arc<FinalizedWave>>,
         provision_batches: Vec<Arc<Provision>>,
     ) -> Vec<Action> {
@@ -1876,7 +1876,7 @@ impl BftCoordinator {
         topology: &TopologySnapshot,
         block_hash: Hash,
         qc: QuorumCertificate,
-        ready_txs: &ReadyTransactions,
+        ready_txs: &[Arc<RoutableTransaction>],
         finalized_waves: Vec<Arc<FinalizedWave>>,
         provision_batches: Vec<Arc<Provision>>,
     ) -> Vec<Action> {
@@ -3907,14 +3907,7 @@ mod tests {
             ..make_test_qc(block_3_hash, BlockHeight(3))
         };
 
-        let actions = state.on_qc_formed(
-            &topology,
-            block_3_hash,
-            qc,
-            &ReadyTransactions::default(),
-            vec![],
-            vec![],
-        );
+        let actions = state.on_qc_formed(&topology, block_3_hash, qc, &[], vec![], vec![]);
 
         // Should emit BuildProposal for height 4 even with empty content.
         let has_build_proposal = actions.iter().any(
@@ -4039,9 +4032,7 @@ mod tests {
         assert!(state.is_syncing());
 
         // Ready txs must be dropped — sync blocks are always empty.
-        let ready_txs = ReadyTransactions {
-            transactions: vec![Arc::new(hyperscale_types::test_utils::test_transaction(1))],
-        };
+        let ready_txs = vec![Arc::new(hyperscale_types::test_utils::test_transaction(1))];
         let actions = state.try_propose(&topology, &ready_txs, vec![], vec![]);
 
         let proposal = actions
@@ -4080,7 +4071,7 @@ mod tests {
         });
         state.set_syncing(&topology, true);
 
-        let actions = state.try_propose(&topology, &ReadyTransactions::default(), vec![], vec![]);
+        let actions = state.try_propose(&topology, &[], vec![], vec![]);
         let Some(Action::BuildProposal { timestamp, .. }) = actions
             .iter()
             .find(|a| matches!(a, Action::BuildProposal { .. }))
@@ -4249,7 +4240,7 @@ mod tests {
             ..make_test_qc(Hash::from_bytes(b"block_3"), BlockHeight(3))
         });
         state.set_syncing(&topology, true);
-        let _ = state.try_propose(&topology, &ReadyTransactions::default(), vec![], vec![]);
+        let _ = state.try_propose(&topology, &[], vec![], vec![]);
 
         assert_eq!(
             state.view_change.last_leader_activity,
@@ -4326,7 +4317,7 @@ mod tests {
         });
         state.set_syncing(&topology, true);
 
-        let actions = state.try_propose(&topology, &ReadyTransactions::default(), vec![], vec![]);
+        let actions = state.try_propose(&topology, &[], vec![], vec![]);
         assert!(actions
             .iter()
             .any(|a| matches!(a, Action::BuildProposal { .. })));

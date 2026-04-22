@@ -6,28 +6,15 @@
 
 use hyperscale_bft::{BftConfig, BftCoordinator, BftMemoryStats, BftStats, RecoveredState};
 use hyperscale_test_helpers::TestCommittee;
-use hyperscale_types::{BlockHeight, Round, TopologySnapshot, ValidatorInfo, ValidatorSet};
+use hyperscale_types::{BlockHeight, Round, TopologySnapshot};
 use std::time::Duration;
-
-fn test_topology(committee: &TestCommittee, local_idx: usize) -> TopologySnapshot {
-    let validators: Vec<ValidatorInfo> = (0..committee.size())
-        .map(|i| ValidatorInfo {
-            validator_id: committee.validator_id(i),
-            public_key: *committee.public_key(i),
-            voting_power: 1,
-        })
-        .collect();
-    let validator_set = ValidatorSet::new(validators);
-    TopologySnapshot::new(committee.validator_id(local_idx), 1, validator_set)
-}
 
 fn fresh_coordinator(config: BftConfig) -> BftCoordinator {
     BftCoordinator::new(0, config, RecoveredState::default())
 }
 
 fn fresh_coordinator_with_topology(config: BftConfig) -> (BftCoordinator, TopologySnapshot) {
-    let committee = TestCommittee::new(4, 42);
-    let topology = test_topology(&committee, 0);
+    let topology = TestCommittee::new(4, 42).topology_snapshot(0, 1);
     (fresh_coordinator(config), topology)
 }
 
@@ -114,7 +101,7 @@ fn is_current_proposer_matches_topology() {
     // Each validator's coordinator should answer `is_current_proposer` consistently
     // with `topology.should_propose(height, round)` for that validator.
     for local_idx in 0..4 {
-        let topology = test_topology(&committee, local_idx);
+        let topology = committee.topology_snapshot(local_idx, 1);
         let coordinator = BftCoordinator::new(
             local_idx as u32,
             BftConfig::default(),
@@ -140,7 +127,7 @@ fn will_propose_next_is_true_for_exactly_one_validator_in_fresh_committee() {
     let committee = TestCommittee::new(4, 42);
     let mut proposers = 0usize;
     for local_idx in 0..4 {
-        let topology = test_topology(&committee, local_idx);
+        let topology = committee.topology_snapshot(local_idx, 1);
         let coordinator = BftCoordinator::new(
             local_idx as u32,
             BftConfig::default(),

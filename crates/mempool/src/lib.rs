@@ -1,20 +1,22 @@
 //! Mempool state machine.
 //!
-//! This crate implements the transaction mempool as a pure, synchronous
-//! state machine. It handles:
+//! A pure, synchronous state machine driving the transaction mempool.
+//! The [`MempoolCoordinator`] composes three sub-machines:
 //!
-//! - Transaction submission and validation
-//! - Transaction gossip
-//! - Transaction status tracking
-//! - Conflict detection
+//! - Tombstones + evicted-body cache for terminal-state deduplication.
+//! - Lock tracker for node-level state locks and in-flight counters.
+//! - Ready set for incrementally-maintained pending-tx selection.
 //!
-//! # Key Difference from Async Version
-//!
-//! Uses `HashMap` instead of `DashMap` since there's no concurrent access.
-//! All access is serialized through the event loop.
+//! Callers drive the coordinator via `on_submit_transaction`,
+//! `on_transaction_gossip`, `on_block_committed`, and related lifecycle
+//! methods; all I/O is deferred to the caller via returned `Action`s.
 
-mod state;
+mod coordinator;
+mod lock_tracker;
+mod ready_set;
+mod tombstones;
 
-pub use state::{
-    LockContentionStats, MempoolConfig, MempoolMemoryStats, MempoolState, DEFAULT_MIN_DWELL_TIME,
+pub use coordinator::{
+    LockContentionStats, MempoolConfig, MempoolCoordinator, MempoolMemoryStats,
+    DEFAULT_MIN_DWELL_TIME,
 };

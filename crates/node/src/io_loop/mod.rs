@@ -1118,7 +1118,6 @@ where
                 mempool_tombstones: mempool_mem.tombstones,
                 mempool_recently_evicted: mempool_mem.recently_evicted,
                 mempool_locked_nodes: mempool_mem.locked_nodes,
-                mempool_in_flight_heights: mempool_mem.in_flight_heights,
                 mempool_deferred_by_nodes: mempool_mem.deferred_by_nodes,
                 mempool_txs_deferred_by_node: mempool_mem.txs_deferred_by_node,
                 mempool_ready_txs_by_node: mempool_mem.ready_txs_by_node,
