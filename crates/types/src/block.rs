@@ -2,9 +2,10 @@
 
 use crate::{
     block_vote_message, compute_merkle_root, compute_padded_merkle_root, decode_finalized_wave_vec,
-    encode_finalized_wave_vec, BlockHeight, Bls12381G1PrivateKey, Bls12381G2Signature,
-    FinalizedWave, Hash, ProposerTimestamp, Provision, QuorumCertificate, ReceiptBundle, Round,
-    RoutableTransaction, ShardGroupId, ValidatorId, WaveId,
+    encode_finalized_wave_vec, BlockHash, BlockHeight, Bls12381G1PrivateKey, Bls12381G2Signature,
+    CertificateRoot, FinalizedWave, Hash, LocalReceiptRoot, ProposerTimestamp, Provision,
+    ProvisionsRoot, QuorumCertificate, ReceiptBundle, Round, RoutableTransaction, ShardGroupId,
+    StateRoot, TransactionRoot, TxHash, ValidatorId, WaveId,
 };
 use sbor::prelude::*;
 use std::collections::BTreeMap;
@@ -14,16 +15,16 @@ use std::sync::Arc;
 ///
 /// Each underlying wave certificate's `receipt_hash` becomes a leaf.
 /// Returns `Hash::ZERO` if there are no certificates.
-pub fn compute_certificate_root(certificates: &[Arc<FinalizedWave>]) -> Hash {
+pub fn compute_certificate_root(certificates: &[Arc<FinalizedWave>]) -> CertificateRoot {
     if certificates.is_empty() {
-        return Hash::ZERO;
+        return CertificateRoot::ZERO;
     }
 
     let leaves: Vec<Hash> = certificates
         .iter()
-        .map(|fw| fw.certificate.receipt_hash())
+        .map(|fw| fw.certificate.receipt_hash().into_raw())
         .collect();
-    compute_merkle_root(&leaves)
+    CertificateRoot::from_raw(compute_merkle_root(&leaves))
 }
 
 /// Compute the local receipt merkle root for a block's receipts.
@@ -32,9 +33,9 @@ pub fn compute_certificate_root(certificates: &[Arc<FinalizedWave>]) -> Hash {
 /// becomes a leaf. Receipts are sorted by `tx_hash` before computing the root
 /// to ensure determinism regardless of collection order (e.g. HashMap iteration).
 /// Returns `Hash::ZERO` if there are no receipts.
-pub fn compute_local_receipt_root(receipts: &[ReceiptBundle]) -> Hash {
+pub fn compute_local_receipt_root(receipts: &[ReceiptBundle]) -> LocalReceiptRoot {
     if receipts.is_empty() {
-        return Hash::ZERO;
+        return LocalReceiptRoot::ZERO;
     }
 
     // Sort by tx_hash for deterministic ordering across validators.
@@ -48,32 +49,32 @@ pub fn compute_local_receipt_root(receipts: &[ReceiptBundle]) -> Hash {
         .into_iter()
         .map(|(_, receipt_hash)| receipt_hash)
         .collect();
-    compute_merkle_root(&leaves)
+    LocalReceiptRoot::from_raw(compute_merkle_root(&leaves))
 }
 
 /// Compute the provisions merkle root for a block.
 ///
 /// Each provision batch's hash becomes a leaf. Returns `Hash::ZERO` if empty.
-pub fn compute_provision_root(batch_hashes: &[Hash]) -> Hash {
+pub fn compute_provision_root(batch_hashes: &[Hash]) -> ProvisionsRoot {
     if batch_hashes.is_empty() {
-        return Hash::ZERO;
+        return ProvisionsRoot::ZERO;
     }
-    compute_padded_merkle_root(batch_hashes)
+    ProvisionsRoot::from_raw(compute_padded_merkle_root(batch_hashes))
 }
 
 /// Compute the transaction merkle root for a block.
 ///
 /// Each transaction's hash becomes a leaf directly. Returns `Hash::ZERO` if empty.
-pub fn compute_transaction_root(transactions: &[Arc<RoutableTransaction>]) -> Hash {
+pub fn compute_transaction_root(transactions: &[Arc<RoutableTransaction>]) -> TransactionRoot {
     if transactions.is_empty() {
-        return Hash::ZERO;
+        return TransactionRoot::ZERO;
     }
 
-    let leaves: Vec<Hash> = transactions.iter().map(|tx| tx.hash()).collect();
+    let leaves: Vec<Hash> = transactions.iter().map(|tx| tx.hash().into_raw()).collect();
 
     // Use padded merkle root (power-of-2 padding with Hash::ZERO) so that
     // merkle inclusion proofs can be generated and verified for any leaf.
-    compute_padded_merkle_root(&leaves)
+    TransactionRoot::from_raw(compute_padded_merkle_root(&leaves))
 }
 
 /// Block header containing consensus metadata.
@@ -96,7 +97,7 @@ pub struct BlockHeader {
     pub height: BlockHeight,
 
     /// Hash of parent block.
-    pub parent_hash: Hash,
+    pub parent_hash: BlockHash,
 
     /// Quorum certificate proving parent block was committed.
     pub parent_qc: QuorumCertificate,
@@ -119,13 +120,13 @@ pub struct BlockHeader {
     pub is_fallback: bool,
 
     /// JMT state root hash after applying all certificates in this block.
-    pub state_root: Hash,
+    pub state_root: StateRoot,
 
     /// Merkle root of all transactions in this block.
     ///
     /// Each transaction's hash is a leaf in a padded binary merkle tree.
-    /// For empty blocks (fallback, sync), this is `Hash::ZERO`.
-    pub transaction_root: Hash,
+    /// For empty blocks (fallback, sync), this is `TransactionRoot::ZERO`.
+    pub transaction_root: TransactionRoot,
 
     /// Merkle root of all certificate receipt hashes in this block.
     ///
@@ -133,8 +134,8 @@ pub struct BlockHeader {
     /// in a binary merkle tree. This enables light-client proof of "did transaction
     /// X succeed/fail in block N?" without replaying the block.
     ///
-    /// For empty blocks (genesis, fallback, no certificates), this is `Hash::ZERO`.
-    pub certificate_root: Hash,
+    /// For empty blocks (genesis, fallback, no certificates), this is `CertificateRoot::ZERO`.
+    pub certificate_root: CertificateRoot,
 
     /// Merkle root of per-tx `LocalReceipt` hashes for all transactions
     /// covered by this block's wave certificates.
@@ -143,15 +144,15 @@ pub struct BlockHeader {
     /// that were applied to produce `state_root`. Enables per-tx delta attribution
     /// and receipt integrity verification by sync nodes.
     ///
-    /// For empty blocks (genesis, fallback, no certificates), this is `Hash::ZERO`.
-    pub local_receipt_root: Hash,
+    /// For empty blocks (genesis, fallback, no certificates), this is `LocalReceiptRoot::ZERO`.
+    pub local_receipt_root: LocalReceiptRoot,
 
     /// Merkle root of provision batches included in this block.
     ///
     /// Commits to which remote-shard provisions are available at this height.
     /// Validators who voted for the BFT proposal have this data locally.
-    /// `Hash::ZERO` when no provisions are included (single-shard or empty block).
-    pub provision_root: Hash,
+    /// `ProvisionsRoot::ZERO` when no provisions are included (single-shard or empty block).
+    pub provision_root: ProvisionsRoot,
 
     /// Cross-shard execution waves in this block.
     ///
@@ -196,21 +197,25 @@ pub struct BlockHeader {
 
 impl BlockHeader {
     /// Create a genesis block header (height 0) with the given proposer and JMT state.
-    pub fn genesis(shard_group_id: ShardGroupId, proposer: ValidatorId, state_root: Hash) -> Self {
+    pub fn genesis(
+        shard_group_id: ShardGroupId,
+        proposer: ValidatorId,
+        state_root: StateRoot,
+    ) -> Self {
         Self {
             shard_group_id,
             height: BlockHeight(0),
-            parent_hash: Hash::from_bytes(&[0u8; 32]),
+            parent_hash: BlockHash::from_raw(Hash::from_bytes(&[0u8; 32])),
             parent_qc: QuorumCertificate::genesis(),
             proposer,
             timestamp: ProposerTimestamp::ZERO,
             round: Round::INITIAL,
             is_fallback: false,
             state_root,
-            transaction_root: Hash::ZERO,
-            certificate_root: Hash::ZERO,
-            local_receipt_root: Hash::ZERO,
-            provision_root: Hash::ZERO,
+            transaction_root: TransactionRoot::ZERO,
+            certificate_root: CertificateRoot::ZERO,
+            local_receipt_root: LocalReceiptRoot::ZERO,
+            provision_root: ProvisionsRoot::ZERO,
             waves: vec![],
             provision_tx_roots: BTreeMap::new(),
             in_flight: 0,
@@ -229,9 +234,9 @@ impl BlockHeader {
     }
 
     /// Compute hash of this block header.
-    pub fn hash(&self) -> Hash {
+    pub fn hash(&self) -> BlockHash {
         let bytes = basic_encode(self).expect("BlockHeader serialization should never fail");
-        Hash::from_bytes(&bytes)
+        BlockHash::from_raw(Hash::from_bytes(&bytes))
     }
 
     /// Check if this is the genesis block header.
@@ -494,7 +499,11 @@ impl Block {
     ///
     /// Genesis is born `Live` with no provisions — the temporality machinery
     /// activates only once there are cross-shard waves in flight.
-    pub fn genesis(shard_group_id: ShardGroupId, proposer: ValidatorId, state_root: Hash) -> Self {
+    pub fn genesis(
+        shard_group_id: ShardGroupId,
+        proposer: ValidatorId,
+        state_root: StateRoot,
+    ) -> Self {
         Block::Live {
             header: BlockHeader::genesis(shard_group_id, proposer, state_root),
             transactions: vec![],
@@ -583,7 +592,7 @@ impl Block {
     }
 
     /// Compute hash of this block (hashes the header).
-    pub fn hash(&self) -> Hash {
+    pub fn hash(&self) -> BlockHash {
         self.header().hash()
     }
 
@@ -598,12 +607,12 @@ impl Block {
     }
 
     /// Check if this block contains a specific transaction by hash.
-    pub fn contains_transaction(&self, tx_hash: &Hash) -> bool {
+    pub fn contains_transaction(&self, tx_hash: &TxHash) -> bool {
         self.transactions().iter().any(|tx| tx.hash() == *tx_hash)
     }
 
     /// Get all transaction hashes.
-    pub fn transaction_hashes(&self) -> Vec<Hash> {
+    pub fn transaction_hashes(&self) -> Vec<TxHash> {
         self.transactions().iter().map(|tx| tx.hash()).collect()
     }
 
@@ -630,7 +639,7 @@ impl Block {
 #[derive(Debug, Clone, Default, PartialEq, Eq, BasicSbor)]
 pub struct BlockManifest {
     /// Transaction hashes in block order.
-    pub tx_hashes: Vec<Hash>,
+    pub tx_hashes: Vec<TxHash>,
 
     /// Certificate hashes (wave_id hashes) in block order.
     /// Validators use these to match against their locally finalized waves.
@@ -709,7 +718,7 @@ impl BlockMetadata {
     }
 
     /// Compute hash of this block (hashes the header).
-    pub fn hash(&self) -> Hash {
+    pub fn hash(&self) -> BlockHash {
         self.header.hash()
     }
 
@@ -745,7 +754,7 @@ impl CommittedBlockHeader {
     }
 
     /// Compute the block hash (hashes the header).
-    pub fn block_hash(&self) -> Hash {
+    pub fn block_hash(&self) -> BlockHash {
         self.header.hash()
     }
 
@@ -760,7 +769,7 @@ impl CommittedBlockHeader {
     }
 
     /// Get the state root committed by this block.
-    pub fn state_root(&self) -> Hash {
+    pub fn state_root(&self) -> StateRoot {
         self.header.state_root
     }
 }
@@ -774,17 +783,17 @@ mod tests {
         let header = BlockHeader {
             shard_group_id: ShardGroupId(0),
             height: BlockHeight(1),
-            parent_hash: Hash::from_bytes(b"parent"),
+            parent_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(0),
             timestamp: ProposerTimestamp(1234567890),
             round: Round::INITIAL,
             is_fallback: false,
-            state_root: Hash::ZERO,
-            transaction_root: Hash::ZERO,
-            certificate_root: Hash::ZERO,
-            local_receipt_root: Hash::ZERO,
-            provision_root: Hash::ZERO,
+            state_root: StateRoot::ZERO,
+            transaction_root: TransactionRoot::ZERO,
+            certificate_root: CertificateRoot::ZERO,
+            local_receipt_root: LocalReceiptRoot::ZERO,
+            provision_root: ProvisionsRoot::ZERO,
             waves: vec![],
             provision_tx_roots: BTreeMap::new(),
             in_flight: 0,
@@ -797,19 +806,19 @@ mod tests {
 
     #[test]
     fn test_genesis_block() {
-        let genesis = Block::genesis(ShardGroupId(0), ValidatorId(0), Hash::ZERO);
+        let genesis = Block::genesis(ShardGroupId(0), ValidatorId(0), StateRoot::ZERO);
 
         assert!(genesis.is_genesis());
         assert_eq!(genesis.height(), BlockHeight(0));
         assert_eq!(genesis.transaction_count(), 0);
-        assert_eq!(genesis.header().transaction_root, Hash::ZERO);
+        assert_eq!(genesis.header().transaction_root, TransactionRoot::ZERO);
         assert_eq!(genesis.header().parent_qc, QuorumCertificate::genesis());
     }
 
     #[test]
     fn test_compute_transaction_root_empty() {
         let root = compute_transaction_root(&[]);
-        assert_eq!(root, Hash::ZERO);
+        assert_eq!(root, TransactionRoot::ZERO);
     }
 
     #[test]
@@ -827,13 +836,13 @@ mod tests {
         let root1 = compute_transaction_root(std::slice::from_ref(&tx));
         let root2 = compute_transaction_root(std::slice::from_ref(&tx));
         assert_eq!(root1, root2);
-        assert_ne!(root1, Hash::ZERO);
+        assert_ne!(root1, TransactionRoot::ZERO);
     }
 
     #[test]
     fn test_compute_certificate_root_empty() {
         let root = compute_certificate_root(&[]);
-        assert_eq!(root, Hash::ZERO);
+        assert_eq!(root, CertificateRoot::ZERO);
     }
 
     #[test]
@@ -852,9 +861,9 @@ mod tests {
                     BTreeSet::from([ShardGroupId(1)]),
                 ),
                 crate::WeightedTimestamp(11),
-                Hash::from_bytes(&[seed + 100; 4]),
+                crate::GlobalReceiptRoot::from_raw(Hash::from_bytes(&[seed + 100; 4])),
                 vec![TxOutcome {
-                    tx_hash: Hash::from_bytes(&[seed; 4]),
+                    tx_hash: TxHash::from_raw(Hash::from_bytes(&[seed; 4])),
                     outcome: ExecutionOutcome::Executed {
                         receipt_hash: Hash::from_bytes(&[seed + 50; 4]),
                         success: true,
@@ -880,7 +889,7 @@ mod tests {
         let root1 = compute_certificate_root(&certs);
         let root2 = compute_certificate_root(&certs);
         assert_eq!(root1, root2);
-        assert_ne!(root1, Hash::ZERO);
+        assert_ne!(root1, CertificateRoot::ZERO);
     }
 
     #[test]
@@ -894,9 +903,9 @@ mod tests {
         let ec = Arc::new(ExecutionCertificate::new(
             WaveId::new(ShardGroupId(0), BlockHeight(10), BTreeSet::new()),
             crate::WeightedTimestamp(11),
-            Hash::from_bytes(b"receipt"),
+            crate::GlobalReceiptRoot::from_raw(Hash::from_bytes(b"receipt")),
             vec![TxOutcome {
-                tx_hash: Hash::from_bytes(b"tx1"),
+                tx_hash: TxHash::from_raw(Hash::from_bytes(b"tx1")),
                 outcome: ExecutionOutcome::Executed {
                     receipt_hash: Hash::from_bytes(b"rh"),
                     success: true,
@@ -917,13 +926,13 @@ mod tests {
 
         let root = compute_certificate_root(std::slice::from_ref(&fw));
         // Single cert: certificate_root should equal the cert's receipt_hash
-        assert_eq!(root, expected_receipt_hash);
+        assert_eq!(root.into_raw(), expected_receipt_hash.into_raw());
     }
 
     #[test]
     fn test_genesis_certificate_root_is_zero() {
-        let genesis = Block::genesis(ShardGroupId(0), ValidatorId(0), Hash::ZERO);
-        assert_eq!(genesis.header().certificate_root, Hash::ZERO);
+        let genesis = Block::genesis(ShardGroupId(0), ValidatorId(0), StateRoot::ZERO);
+        assert_eq!(genesis.header().certificate_root, CertificateRoot::ZERO);
     }
 }
 
@@ -935,7 +944,7 @@ mod tests {
 #[derive(Debug, Clone, PartialEq, Eq, sbor::prelude::BasicSbor)]
 pub struct BlockVote {
     /// Hash of the block being voted on.
-    pub block_hash: Hash,
+    pub block_hash: BlockHash,
     /// Shard group this vote belongs to (prevents cross-shard replay).
     pub shard_group_id: ShardGroupId,
     /// Height of the block.
@@ -954,7 +963,7 @@ pub struct BlockVote {
 impl BlockVote {
     /// Create a new block vote with domain-separated signing.
     pub fn new(
-        block_hash: Hash,
+        block_hash: BlockHash,
         shard_group_id: ShardGroupId,
         height: BlockHeight,
         round: Round,

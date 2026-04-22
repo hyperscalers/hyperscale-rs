@@ -39,10 +39,10 @@
 
 use hyperscale_core::{Action, ProtocolEvent, ProvisionRequest};
 use hyperscale_types::{
-    Attempt, Block, BlockHeight, ExecutionCertificate, ExecutionOutcome, ExecutionVote, Hash,
-    LocalExecutionEntry, NodeId, Provision, ReceiptBundle, RoutableTransaction, ShardGroupId,
-    TopologySnapshot, TransactionDecision, TxOutcome, ValidatorId, WaveCertificate, WaveId,
-    WeightedTimestamp,
+    Attempt, Block, BlockHash, BlockHeight, ExecutionCertificate, ExecutionOutcome, ExecutionVote,
+    GlobalReceiptRoot, Hash, LocalExecutionEntry, NodeId, Provision, ReceiptBundle,
+    RoutableTransaction, ShardGroupId, TopologySnapshot, TransactionDecision, TxHash, TxOutcome,
+    ValidatorId, WaveCertificate, WaveId, WeightedTimestamp,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -67,7 +67,7 @@ use crate::waves::{PendingVoteRetry, RetryEffect, WaveRegistry};
 #[derive(Debug)]
 pub struct CompletionData {
     /// Block this wave belongs to.
-    pub block_hash: Hash,
+    pub block_hash: BlockHash,
     /// Block height (= wave_starting_height).
     pub block_height: BlockHeight,
     /// BFT-authenticated weighted timestamp at which this wave's outcome is
@@ -77,7 +77,7 @@ pub struct CompletionData {
     /// Wave identifier.
     pub wave_id: WaveId,
     /// Merkle root over per-tx outcome leaves (cross-shard agreement).
-    pub global_receipt_root: Hash,
+    pub global_receipt_root: GlobalReceiptRoot,
     /// Per-tx outcomes in wave order.
     pub tx_outcomes: Vec<hyperscale_types::TxOutcome>,
 }
@@ -273,7 +273,7 @@ impl ExecutionCoordinator {
     fn setup_waves_and_dispatch(
         &mut self,
         topology: &TopologySnapshot,
-        block_hash: Hash,
+        block_hash: BlockHash,
         block_height: BlockHeight,
         block_ts_ms: WeightedTimestamp,
         transactions: &[Arc<RoutableTransaction>],
@@ -285,7 +285,7 @@ impl ExecutionCoordinator {
         let mut votes_to_replay: Vec<ExecutionVote> = Vec::new();
 
         for (wave_id, txs) in waves {
-            let tx_hashes: Vec<Hash> = txs.iter().map(|(tx, _)| tx.hash()).collect();
+            let tx_hashes: Vec<TxHash> = txs.iter().map(|(tx, _)| tx.hash()).collect();
             for &tx_hash in &tx_hashes {
                 self.waves.assign_tx(tx_hash, wave_id.clone());
             }
@@ -393,7 +393,7 @@ impl ExecutionCoordinator {
     ///
     /// Execution is dispatched per wave, so a result for an unassigned tx is
     /// a bug (e.g. stale engine callback for a pruned wave) — logged and dropped.
-    pub fn record_execution_result(&mut self, tx_hash: Hash, outcome: ExecutionOutcome) {
+    pub fn record_execution_result(&mut self, tx_hash: TxHash, outcome: ExecutionOutcome) {
         let Some(wave_key) = self.waves.wave_assignment(&tx_hash) else {
             tracing::warn!(
                 tx_hash = ?tx_hash,
@@ -648,7 +648,7 @@ impl ExecutionCoordinator {
             }
 
             // Identify txs that are now all-shards-ready.
-            let tx_hashes: Vec<Hash> = wave.tx_hashes().to_vec();
+            let tx_hashes: Vec<TxHash> = wave.tx_hashes().to_vec();
             for tx_hash in &tx_hashes {
                 if self.provisioning.is_fully_provisioned(tx_hash) {
                     wave.mark_tx_provisioned(*tx_hash, committed_ts_ms);
@@ -815,7 +815,7 @@ impl ExecutionCoordinator {
         &mut self,
         topology: &TopologySnapshot,
         wave_id: WaveId,
-        block_hash: Hash,
+        block_hash: BlockHash,
         verified_votes: Vec<(ExecutionVote, u64)>,
     ) -> Vec<Action> {
         let Some(tracker) = self.waves.get_tracker_mut(&wave_id) else {
@@ -1311,7 +1311,7 @@ impl ExecutionCoordinator {
     fn on_live_block_committed(
         &mut self,
         topology: &TopologySnapshot,
-        block_hash: Hash,
+        block_hash: BlockHash,
         header: &hyperscale_types::BlockHeader,
         transactions: &[Arc<RoutableTransaction>],
         provisions: &[Arc<Provision>],
@@ -1399,7 +1399,7 @@ impl ExecutionCoordinator {
         topology: &TopologySnapshot,
         transactions: &[Arc<RoutableTransaction>],
     ) -> Vec<Action> {
-        let tx_hashes: Vec<Hash> = transactions.iter().map(|tx| tx.hash()).collect();
+        let tx_hashes: Vec<TxHash> = transactions.iter().map(|tx| tx.hash()).collect();
         let ecs_to_replay = self.early.drain_ecs_for_txs(&tx_hashes);
         if ecs_to_replay.is_empty() {
             return Vec::new();
@@ -1551,7 +1551,7 @@ impl ExecutionCoordinator {
     // ═══════════════════════════════════════════════════════════════════════════
 
     /// Get the local wave assignment for a transaction.
-    pub fn get_wave_assignment(&self, tx_hash: &Hash) -> Option<WaveId> {
+    pub fn get_wave_assignment(&self, tx_hash: &TxHash) -> Option<WaveId> {
         self.waves.wave_assignment(tx_hash)
     }
 
@@ -1569,7 +1569,7 @@ impl ExecutionCoordinator {
     ///
     /// Returns the wave certificate if the tx is part of a finalized wave.
     /// Once committed, certificates are persisted to storage and should be fetched from there.
-    pub fn get_finalized_certificate(&self, tx_hash: &Hash) -> Option<Arc<WaveCertificate>> {
+    pub fn get_finalized_certificate(&self, tx_hash: &TxHash) -> Option<Arc<WaveCertificate>> {
         self.finalized.get_certificate_for_tx(tx_hash)
     }
 
@@ -1646,26 +1646,26 @@ impl ExecutionCoordinator {
     }
 
     /// Check if a transaction is finalized (part of a finalized wave).
-    pub fn is_finalized(&self, tx_hash: &Hash) -> bool {
+    pub fn is_finalized(&self, tx_hash: &TxHash) -> bool {
         self.finalized.is_finalized(tx_hash)
     }
 
     /// Returns the set of all finalized transaction hashes.
     ///
     /// Used by the node orchestrator to pass to BFT for conflict filtering.
-    pub fn finalized_tx_hashes(&self) -> std::collections::HashSet<Hash> {
+    pub fn finalized_tx_hashes(&self) -> std::collections::HashSet<TxHash> {
         self.finalized.all_tx_hashes()
     }
 
     /// Check if we're waiting for provisioning to complete for a transaction.
     ///
     /// Note: Actual provision tracking is handled by ProvisionCoordinator.
-    pub fn is_awaiting_provisioning(&self, tx_hash: &Hash) -> bool {
+    pub fn is_awaiting_provisioning(&self, tx_hash: &TxHash) -> bool {
         self.waves.is_awaiting_provisioning(tx_hash)
     }
 
     /// Get debug info about wave state for a transaction.
-    pub fn certificate_tracking_debug(&self, tx_hash: &Hash) -> String {
+    pub fn certificate_tracking_debug(&self, tx_hash: &TxHash) -> String {
         let wave_info = if let Some(wave_id) = self.waves.wave_assignment(tx_hash) {
             if let Some(wave) = self.waves.get_wave(&wave_id) {
                 format!("wave={}, complete={}", wave_id, wave.is_complete())
@@ -2012,7 +2012,7 @@ mod tests {
             vote_anchor_ts_ms: WeightedTimestamp::ZERO,
             wave_id: wave_id.clone(),
             shard_group_id: ShardGroupId(0),
-            global_receipt_root: Hash::ZERO,
+            global_receipt_root: GlobalReceiptRoot::ZERO,
             tx_count: 1,
             tx_outcomes: vec![],
             validator: leader, // vote from the original leader
@@ -2046,10 +2046,10 @@ mod tests {
             PendingVoteRetry {
                 sent_at_ts_ms: WeightedTimestamp(10_000),
                 attempt: Attempt::INITIAL,
-                block_hash: Hash::from_bytes(b"block1"),
+                block_hash: BlockHash::from_raw(Hash::from_bytes(b"block1")),
                 block_height: BlockHeight(1),
                 vote_anchor_ts_ms: WeightedTimestamp::ZERO,
-                global_receipt_root: Hash::ZERO,
+                global_receipt_root: GlobalReceiptRoot::ZERO,
                 tx_outcomes: Arc::new(vec![]),
             },
         );
@@ -2102,10 +2102,10 @@ mod tests {
             PendingVoteRetry {
                 sent_at_ts_ms: WeightedTimestamp(5_000),
                 attempt: Attempt::INITIAL,
-                block_hash: Hash::from_bytes(b"block1"),
+                block_hash: BlockHash::from_raw(Hash::from_bytes(b"block1")),
                 block_height: BlockHeight(1),
                 vote_anchor_ts_ms: WeightedTimestamp::ZERO,
-                global_receipt_root: Hash::ZERO,
+                global_receipt_root: GlobalReceiptRoot::ZERO,
                 tx_outcomes: Arc::new(vec![]),
             },
         );
@@ -2114,7 +2114,7 @@ mod tests {
         let cert = hyperscale_types::ExecutionCertificate::new(
             wave_id.clone(),
             WeightedTimestamp::ZERO,
-            Hash::ZERO,
+            GlobalReceiptRoot::ZERO,
             vec![],
             hyperscale_types::zero_bls_signature(),
             hyperscale_types::SignerBitfield::new(4),
@@ -2145,7 +2145,7 @@ mod tests {
         let cert = hyperscale_types::ExecutionCertificate::new(
             wave_id.clone(),
             WeightedTimestamp::ZERO,
-            Hash::ZERO,
+            GlobalReceiptRoot::ZERO,
             vec![],
             hyperscale_types::zero_bls_signature(),
             hyperscale_types::SignerBitfield::new(4),
@@ -2200,9 +2200,9 @@ mod tests {
         let cert = hyperscale_types::ExecutionCertificate::new(
             wave_id,
             WeightedTimestamp::ZERO,
-            Hash::ZERO,
+            GlobalReceiptRoot::ZERO,
             vec![hyperscale_types::TxOutcome {
-                tx_hash: Hash::from_bytes(b"untracked_tx"),
+                tx_hash: TxHash::from_raw(Hash::from_bytes(b"untracked_tx")),
                 outcome: ExecutionOutcome::Aborted,
             }],
             hyperscale_types::zero_bls_signature(),
@@ -2287,7 +2287,7 @@ mod tests {
             local_wave.clone(),
             WaveState::new(
                 local_wave.clone(),
-                Hash::from_bytes(b"block"),
+                BlockHash::from_raw(Hash::from_bytes(b"block")),
                 WeightedTimestamp(5_000),
                 vec![(tx, participating)],
                 false,
@@ -2348,14 +2348,14 @@ mod tests {
             .collect();
         let mut wave = WaveState::new(
             wave_id.clone(),
-            Hash::from_bytes(b"block"),
+            BlockHash::from_raw(Hash::from_bytes(b"block")),
             WeightedTimestamp(1_000),
             txs,
             true,
         );
 
         // Record per-tx execution results + receipts.
-        let tx_hashes: Vec<Hash> = wave.tx_hashes().to_vec();
+        let tx_hashes: Vec<TxHash> = wave.tx_hashes().to_vec();
         let tx_outcomes: Vec<hyperscale_types::TxOutcome> = tx_hashes
             .iter()
             .map(|h| hyperscale_types::TxOutcome {
@@ -2389,7 +2389,7 @@ mod tests {
         let local_ec = Arc::new(hyperscale_types::ExecutionCertificate::new(
             wave_id.clone(),
             WeightedTimestamp(1_000),
-            Hash::from_bytes(b"global_receipt_root"),
+            GlobalReceiptRoot::from_raw(Hash::from_bytes(b"global_receipt_root")),
             tx_outcomes,
             hyperscale_types::zero_bls_signature(),
             hyperscale_types::SignerBitfield::new(4),
@@ -2537,7 +2537,7 @@ mod tests {
             local_wave.clone(),
             WaveState::new(
                 local_wave,
-                Hash::from_bytes(b"block"),
+                BlockHash::from_raw(Hash::from_bytes(b"block")),
                 WeightedTimestamp(0),
                 vec![(tx, participating)],
                 false,

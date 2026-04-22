@@ -17,8 +17,11 @@
 //! we have enough voting power for quorum. This avoids wasting CPU on votes
 //! we'll never use.
 
+#[cfg(test)]
+use hyperscale_types::Hash;
 use hyperscale_types::{
-    Bls12381G1PublicKey, ExecutionVote, Hash, ValidatorId, WaveId, WeightedTimestamp,
+    BlockHash, Bls12381G1PublicKey, ExecutionVote, GlobalReceiptRoot, ValidatorId, WaveId,
+    WeightedTimestamp,
 };
 use std::collections::{BTreeMap, HashSet};
 
@@ -27,7 +30,7 @@ use std::collections::{BTreeMap, HashSet};
 /// Votes at different heights have different BLS signatures and cannot be
 /// aggregated together. This prevents stale votes from combining with new
 /// ones if an abort intent changes the global_receipt_root between heights.
-type VoteKey = (Hash, WeightedTimestamp);
+type VoteKey = (GlobalReceiptRoot, WeightedTimestamp);
 
 /// Tracks execution votes for a specific wave within a block.
 ///
@@ -39,7 +42,7 @@ pub struct VoteTracker {
     /// Wave identifier.
     wave_id: WaveId,
     /// Block hash this wave belongs to.
-    block_hash: Hash,
+    block_hash: BlockHash,
     /// Quorum threshold (2f+1 voting power).
     quorum: u64,
 
@@ -68,7 +71,7 @@ pub struct VoteTracker {
 
 impl VoteTracker {
     /// Create a new execution vote tracker.
-    pub fn new(wave_id: WaveId, block_hash: Hash, quorum: u64) -> Self {
+    pub fn new(wave_id: WaveId, block_hash: BlockHash, quorum: u64) -> Self {
         Self {
             wave_id,
             block_hash,
@@ -88,7 +91,7 @@ impl VoteTracker {
     }
 
     /// Get the block hash.
-    pub fn block_hash(&self) -> Hash {
+    pub fn block_hash(&self) -> BlockHash {
         self.block_hash
     }
 
@@ -171,8 +174,8 @@ impl VoteTracker {
     ///
     /// Returns `Some((global_receipt_root, vote_anchor_ts_ms, total_power))` if quorum reached.
     /// If multiple pairs have quorum, returns the one with the lowest vote_anchor_ts_ms.
-    pub fn check_quorum(&self) -> Option<(Hash, WeightedTimestamp, u64)> {
-        let mut best: Option<(Hash, WeightedTimestamp, u64)> = None;
+    pub fn check_quorum(&self) -> Option<(GlobalReceiptRoot, WeightedTimestamp, u64)> {
+        let mut best: Option<(GlobalReceiptRoot, WeightedTimestamp, u64)> = None;
         for (&(global_receipt_root, vote_anchor_ts_ms), &power) in &self.power_by_key {
             if power >= self.quorum {
                 match &best {
@@ -187,7 +190,7 @@ impl VoteTracker {
     /// Take votes for a specific (global_receipt_root, vote_anchor_ts_ms) pair.
     pub fn take_votes(
         &mut self,
-        global_receipt_root: &Hash,
+        global_receipt_root: &GlobalReceiptRoot,
         vote_anchor_ts_ms: WeightedTimestamp,
     ) -> Vec<ExecutionVote> {
         let key = (*global_receipt_root, vote_anchor_ts_ms);
@@ -210,8 +213,8 @@ impl VoteTracker {
 
     /// Return a summary of verified voting power per global receipt root (summed across vote heights).
     /// Used for diagnostics when quorum cannot be reached.
-    pub fn global_receipt_root_power_summary(&self) -> Vec<(Hash, u64)> {
-        let mut by_root: BTreeMap<Hash, u64> = BTreeMap::new();
+    pub fn global_receipt_root_power_summary(&self) -> Vec<(GlobalReceiptRoot, u64)> {
+        let mut by_root: BTreeMap<GlobalReceiptRoot, u64> = BTreeMap::new();
         for (&(root, _), &power) in &self.power_by_key {
             *by_root.entry(root).or_insert(0) += power;
         }
@@ -220,7 +223,10 @@ impl VoteTracker {
 
     /// Get votes for a specific global receipt root at any height (for tests).
     #[cfg(test)]
-    pub fn votes_for_global_receipt_root(&self, global_receipt_root: &Hash) -> Vec<&ExecutionVote> {
+    pub fn votes_for_global_receipt_root(
+        &self,
+        global_receipt_root: &GlobalReceiptRoot,
+    ) -> Vec<&ExecutionVote> {
         self.votes_by_key
             .iter()
             .filter(|((root, _), _)| root == global_receipt_root)
@@ -239,9 +245,9 @@ mod tests {
         generate_bls_keypair().public_key()
     }
 
-    fn make_vote(validator: u64, global_receipt_root: Hash) -> ExecutionVote {
+    fn make_vote(validator: u64, global_receipt_root: GlobalReceiptRoot) -> ExecutionVote {
         ExecutionVote {
-            block_hash: Hash::from_bytes(b"block"),
+            block_hash: BlockHash::from_raw(Hash::from_bytes(b"block")),
             block_height: BlockHeight(10),
             vote_anchor_ts_ms: WeightedTimestamp(11),
             wave_id: WaveId::new(ShardGroupId(0), BlockHeight(0), BTreeSet::new()),
@@ -258,11 +264,11 @@ mod tests {
     fn test_vote_tracker_quorum() {
         let mut tracker = VoteTracker::new(
             WaveId::new(ShardGroupId(0), BlockHeight(0), BTreeSet::new()),
-            Hash::from_bytes(b"block"),
+            BlockHash::from_raw(Hash::from_bytes(b"block")),
             3,
         );
 
-        let root = Hash::from_bytes(b"receipt_root");
+        let root = GlobalReceiptRoot::from_raw(Hash::from_bytes(b"receipt_root"));
 
         tracker.add_verified_vote(make_vote(0, root), 1);
         assert!(tracker.check_quorum().is_none());
@@ -284,12 +290,12 @@ mod tests {
     fn test_vote_tracker_conflicting_roots() {
         let mut tracker = VoteTracker::new(
             WaveId::new(ShardGroupId(0), BlockHeight(0), BTreeSet::new()),
-            Hash::from_bytes(b"block"),
+            BlockHash::from_raw(Hash::from_bytes(b"block")),
             3,
         );
 
-        let root_a = Hash::from_bytes(b"root_a");
-        let root_b = Hash::from_bytes(b"root_b");
+        let root_a = GlobalReceiptRoot::from_raw(Hash::from_bytes(b"root_a"));
+        let root_b = GlobalReceiptRoot::from_raw(Hash::from_bytes(b"root_b"));
 
         tracker.add_verified_vote(make_vote(0, root_a), 1);
         tracker.add_verified_vote(make_vote(1, root_b), 1);
@@ -305,10 +311,10 @@ mod tests {
     #[test]
     fn test_deferred_verification_flow() {
         let pk = make_test_public_key();
-        let root = Hash::from_bytes(b"root");
+        let root = GlobalReceiptRoot::from_raw(Hash::from_bytes(b"root"));
         let mut tracker = VoteTracker::new(
             WaveId::new(ShardGroupId(0), BlockHeight(0), BTreeSet::new()),
-            Hash::from_bytes(b"block"),
+            BlockHash::from_raw(Hash::from_bytes(b"block")),
             3,
         );
 
@@ -335,10 +341,10 @@ mod tests {
     #[test]
     fn test_duplicate_validator_rejected() {
         let pk = make_test_public_key();
-        let root = Hash::from_bytes(b"root");
+        let root = GlobalReceiptRoot::from_raw(Hash::from_bytes(b"root"));
         let mut tracker = VoteTracker::new(
             WaveId::new(ShardGroupId(0), BlockHeight(0), BTreeSet::new()),
-            Hash::from_bytes(b"block"),
+            BlockHash::from_raw(Hash::from_bytes(b"block")),
             3,
         );
 
@@ -349,10 +355,10 @@ mod tests {
     #[test]
     fn test_combined_verified_and_unverified_power() {
         let pk = make_test_public_key();
-        let root = Hash::from_bytes(b"root");
+        let root = GlobalReceiptRoot::from_raw(Hash::from_bytes(b"root"));
         let mut tracker = VoteTracker::new(
             WaveId::new(ShardGroupId(0), BlockHeight(0), BTreeSet::new()),
-            Hash::from_bytes(b"block"),
+            BlockHash::from_raw(Hash::from_bytes(b"block")),
             3,
         );
 

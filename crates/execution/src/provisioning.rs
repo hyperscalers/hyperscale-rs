@@ -22,8 +22,10 @@
 //! registration (via [`register_tx`](ProvisioningTracker::register_tx))
 //! flow through the tracker.
 
+#[cfg(test)]
+use hyperscale_types::Hash;
 use hyperscale_types::{
-    Hash, NodeId, Provision, ShardGroupId, StateProvision, TopologySnapshot, WeightedTimestamp,
+    NodeId, Provision, ShardGroupId, StateProvision, TopologySnapshot, TxHash, WeightedTimestamp,
 };
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -34,15 +36,15 @@ pub(crate) struct ProvisioningTracker {
     /// Verified provisions keyed by `tx_hash`. Written when provisions are
     /// absorbed; read when a cross-shard wave dispatches. Cleaned only when
     /// the wave certificate is committed (terminal state).
-    verified: HashMap<Hash, Vec<StateProvision>>,
+    verified: HashMap<TxHash, Vec<StateProvision>>,
 
     /// Remote shards each cross-shard tx needs provisions from. Populated
     /// at wave creation.
-    required: HashMap<Hash, BTreeSet<ShardGroupId>>,
+    required: HashMap<TxHash, BTreeSet<ShardGroupId>>,
 
     /// Remote shards whose provisions have been received. Populated by
     /// [`absorb_batch`].
-    received: HashMap<Hash, BTreeSet<ShardGroupId>>,
+    received: HashMap<TxHash, BTreeSet<ShardGroupId>>,
 
     /// Detects node-ID overlap conflicts between local cross-shard txs and
     /// committed remote provisions. Deterministic because provisions are
@@ -64,14 +66,14 @@ impl ProvisioningTracker {
 
     /// Record the remote shards `tx_hash` needs provisions from. Overwrites
     /// any previous entry — callers set this once per wave creation.
-    pub fn record_required(&mut self, tx_hash: Hash, remote_shards: BTreeSet<ShardGroupId>) {
+    pub fn record_required(&mut self, tx_hash: TxHash, remote_shards: BTreeSet<ShardGroupId>) {
         self.required.insert(tx_hash, remote_shards);
     }
 
     /// Whether every remote shard's provision for `tx_hash` has been
     /// received. Returns `false` for txs with no recorded requirements
     /// (single-shard txs or txs we aren't tracking).
-    pub fn is_fully_provisioned(&self, tx_hash: &Hash) -> bool {
+    pub fn is_fully_provisioned(&self, tx_hash: &TxHash) -> bool {
         self.required.get(tx_hash).is_some_and(|required| {
             self.received
                 .get(tx_hash)
@@ -89,7 +91,7 @@ impl ProvisioningTracker {
     /// which local waves are affected and to drive the dispatch check.
     /// Preserves iteration order of `batch.transactions` (callers sort
     /// batches upstream for determinism).
-    pub fn absorb_batch(&mut self, batch: &Provision, local_shard: ShardGroupId) -> Vec<Hash> {
+    pub fn absorb_batch(&mut self, batch: &Provision, local_shard: ShardGroupId) -> Vec<TxHash> {
         let mut touched = Vec::with_capacity(batch.transactions.len());
         let source_shard = batch.source_shard;
         for tx_entry in &batch.transactions {
@@ -121,7 +123,7 @@ impl ProvisioningTracker {
     /// execution can proceed and the deadlock resolution is moot).
     pub fn register_tx(
         &mut self,
-        tx_hash: Hash,
+        tx_hash: TxHash,
         topology: &TopologySnapshot,
         declared_reads: &[NodeId],
         declared_writes: &[NodeId],
@@ -153,7 +155,7 @@ impl ProvisioningTracker {
 
     /// Drop all state for `tx_hash` across every owned map. Called when a
     /// wave certificate commits and the transaction reaches terminal state.
-    pub fn remove_tx(&mut self, tx_hash: &Hash) {
+    pub fn remove_tx(&mut self, tx_hash: &TxHash) {
         self.verified.remove(tx_hash);
         self.required.remove(tx_hash);
         self.received.remove(tx_hash);
@@ -165,7 +167,7 @@ impl ProvisioningTracker {
     /// Borrow the verified-provisions map. Used by the coordinator when
     /// passing it to `handlers::build_dispatch_action`, which needs a
     /// per-tx lookup and doesn't care about the surrounding tracker state.
-    pub fn verified(&self) -> &HashMap<Hash, Vec<StateProvision>> {
+    pub fn verified(&self) -> &HashMap<TxHash, Vec<StateProvision>> {
         &self.verified
     }
 
@@ -194,7 +196,7 @@ mod tests {
     fn make_provision_batch(
         source: ShardGroupId,
         block_height: BlockHeight,
-        tx_hashes: Vec<Hash>,
+        tx_hashes: Vec<TxHash>,
     ) -> Arc<Provision> {
         let transactions: Vec<TxEntries> = tx_hashes
             .into_iter()
@@ -218,13 +220,13 @@ mod tests {
         assert_eq!(t.verified_len(), 0);
         assert_eq!(t.required_len(), 0);
         assert_eq!(t.received_len(), 0);
-        assert!(!t.is_fully_provisioned(&Hash::from_bytes(b"missing")));
+        assert!(!t.is_fully_provisioned(&TxHash::from_raw(Hash::from_bytes(b"missing"))));
     }
 
     #[test]
     fn is_fully_provisioned_requires_required_subset_of_received() {
         let mut t = ProvisioningTracker::new();
-        let tx = Hash::from_bytes(b"tx");
+        let tx = TxHash::from_raw(Hash::from_bytes(b"tx"));
         t.record_required(tx, [shard(1), shard(2)].into_iter().collect());
 
         assert!(!t.is_fully_provisioned(&tx));
@@ -243,7 +245,7 @@ mod tests {
     #[test]
     fn is_fully_provisioned_false_without_required_entry() {
         let mut t = ProvisioningTracker::new();
-        let tx = Hash::from_bytes(b"tx");
+        let tx = TxHash::from_raw(Hash::from_bytes(b"tx"));
         // Absorbed batch records `received[tx]` but there's no `required` —
         // the query must not report fully-provisioned just because
         // anything landed.
@@ -255,8 +257,8 @@ mod tests {
     #[test]
     fn absorb_batch_returns_touched_tx_hashes_in_order() {
         let mut t = ProvisioningTracker::new();
-        let tx_a = Hash::from_bytes(b"a");
-        let tx_b = Hash::from_bytes(b"b");
+        let tx_a = TxHash::from_raw(Hash::from_bytes(b"a"));
+        let tx_b = TxHash::from_raw(Hash::from_bytes(b"b"));
         let batch = make_provision_batch(shard(1), BlockHeight(5), vec![tx_a, tx_b]);
         let touched = t.absorb_batch(&batch, shard(0));
         assert_eq!(touched, vec![tx_a, tx_b]);
@@ -265,7 +267,7 @@ mod tests {
     #[test]
     fn absorb_batch_populates_verified_and_received_maps() {
         let mut t = ProvisioningTracker::new();
-        let tx = Hash::from_bytes(b"tx");
+        let tx = TxHash::from_raw(Hash::from_bytes(b"tx"));
         let batch = make_provision_batch(shard(1), BlockHeight(5), vec![tx]);
         t.absorb_batch(&batch, shard(0));
 
@@ -281,7 +283,7 @@ mod tests {
     #[test]
     fn absorb_multiple_batches_for_same_tx_accumulates() {
         let mut t = ProvisioningTracker::new();
-        let tx = Hash::from_bytes(b"tx");
+        let tx = TxHash::from_raw(Hash::from_bytes(b"tx"));
         t.absorb_batch(
             &make_provision_batch(shard(1), BlockHeight(5), vec![tx]),
             shard(0),
@@ -304,7 +306,7 @@ mod tests {
     #[test]
     fn remove_tx_drops_state_from_every_owned_map() {
         let mut t = ProvisioningTracker::new();
-        let tx = Hash::from_bytes(b"tx");
+        let tx = TxHash::from_raw(Hash::from_bytes(b"tx"));
         t.record_required(tx, [shard(1)].into_iter().collect());
         let batch = make_provision_batch(shard(1), BlockHeight(5), vec![tx]);
         t.absorb_batch(&batch, shard(0));
@@ -321,7 +323,7 @@ mod tests {
     #[test]
     fn record_required_overwrites_existing_entry() {
         let mut t = ProvisioningTracker::new();
-        let tx = Hash::from_bytes(b"tx");
+        let tx = TxHash::from_raw(Hash::from_bytes(b"tx"));
         t.record_required(tx, [shard(1)].into_iter().collect());
         // Re-record with a different requirement set.
         t.record_required(tx, [shard(1), shard(2)].into_iter().collect());

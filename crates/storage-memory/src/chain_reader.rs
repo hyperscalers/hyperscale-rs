@@ -4,8 +4,8 @@ use crate::core::SimStorage;
 
 use hyperscale_storage::{BlockForSync, ChainReader};
 use hyperscale_types::{
-    BlockHeight, CertifiedBlock, ExecutionCertificate, Hash, LocalReceipt, QuorumCertificate,
-    RoutableTransaction, ShardGroupId, WaveCertificate,
+    BlockHash, BlockHeight, CertifiedBlock, ExecutionCertificate, ExecutionCertificateHash, Hash,
+    LocalReceipt, QuorumCertificate, RoutableTransaction, ShardGroupId, TxHash, WaveCertificate,
 };
 use std::sync::Arc;
 
@@ -18,7 +18,7 @@ impl ChainReader for SimStorage {
         self.consensus.read().unwrap().committed_height
     }
 
-    fn committed_hash(&self) -> Option<Hash> {
+    fn committed_hash(&self) -> Option<BlockHash> {
         self.consensus.read().unwrap().committed_hash
     }
 
@@ -44,7 +44,7 @@ impl ChainReader for SimStorage {
             })
     }
 
-    fn get_transactions_batch(&self, hashes: &[Hash]) -> Vec<RoutableTransaction> {
+    fn get_transactions_batch(&self, hashes: &[TxHash]) -> Vec<RoutableTransaction> {
         let c = self.consensus.read().unwrap();
         hashes
             .iter()
@@ -60,7 +60,7 @@ impl ChainReader for SimStorage {
             .collect()
     }
 
-    fn get_local_receipt(&self, tx_hash: &Hash) -> Option<Arc<LocalReceipt>> {
+    fn get_local_receipt(&self, tx_hash: &TxHash) -> Option<Arc<LocalReceipt>> {
         self.consensus
             .read()
             .unwrap()
@@ -85,13 +85,16 @@ impl ChainReader for SimStorage {
             .unwrap_or_default()
     }
 
-    fn get_wave_certificate_for_tx(&self, tx_hash: &Hash) -> Option<WaveCertificate> {
+    fn get_wave_certificate_for_tx(&self, tx_hash: &TxHash) -> Option<WaveCertificate> {
         let c = self.consensus.read().unwrap();
         let wave_id_hash = c.tx_to_wave.get(tx_hash)?;
         c.certificates.get(wave_id_hash).cloned()
     }
 
-    fn get_ec_hashes_for_tx(&self, tx_hash: &Hash) -> Option<Vec<(ShardGroupId, Hash)>> {
+    fn get_ec_hashes_for_tx(
+        &self,
+        tx_hash: &TxHash,
+    ) -> Option<Vec<(ShardGroupId, ExecutionCertificateHash)>> {
         self.consensus
             .read()
             .unwrap()

@@ -1,7 +1,7 @@
 //! Finalized wave fetch request (intra-shard DA).
 
 use crate::response::GetFinalizedWavesResponse;
-use hyperscale_types::{Hash, MessagePriority, NetworkMessage, Request};
+use hyperscale_types::{BlockHash, Hash, MessagePriority, NetworkMessage, Request};
 use sbor::prelude::BasicSbor;
 
 /// Request to fetch finalized wave data for a pending block.
@@ -12,14 +12,14 @@ use sbor::prelude::BasicSbor;
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct GetFinalizedWavesRequest {
     /// Hash of the block that needs these finalized waves.
-    pub block_hash: Hash,
+    pub block_hash: BlockHash,
 
     /// Wave ID hashes (from `BlockManifest.cert_hashes`) being requested.
     pub wave_id_hashes: Vec<Hash>,
 }
 
 impl GetFinalizedWavesRequest {
-    pub fn new(block_hash: Hash, wave_id_hashes: Vec<Hash>) -> Self {
+    pub fn new(block_hash: BlockHash, wave_id_hashes: Vec<Hash>) -> Self {
         Self {
             block_hash,
             wave_id_hashes,
@@ -48,7 +48,7 @@ mod tests {
     #[test]
     fn test_sbor_roundtrip() {
         let request = GetFinalizedWavesRequest {
-            block_hash: Hash::from_bytes(b"block"),
+            block_hash: BlockHash::from_raw(Hash::from_bytes(b"block")),
             wave_id_hashes: vec![Hash::from_bytes(b"wave1"), Hash::from_bytes(b"wave2")],
         };
         let encoded = sbor::basic_encode(&request).unwrap();

@@ -6,9 +6,9 @@
 //! boundary between protocol logic and I/O orchestration.
 
 use hyperscale_types::{
-    Block, BlockHeader, BlockHeight, BlockManifest, BlockVote, CertifiedBlock,
+    Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, BlockVote, CertifiedBlock,
     CommittedBlockHeader, EpochConfig, EpochId, ExecutionCertificate, ExecutionVote, FinalizedWave,
-    Hash, Provision, QuorumCertificate, Round, RoutableTransaction, ShardGroupId, TxOutcome,
+    Provision, QuorumCertificate, Round, RoutableTransaction, ShardGroupId, TxHash, TxOutcome,
     ValidatorId, WaveCertificate, WaveId, WeightedTimestamp,
 };
 use std::sync::Arc;
@@ -108,13 +108,13 @@ pub enum ProtocolEvent {
 
     /// A quorum certificate was formed for a block.
     QuorumCertificateFormed {
-        block_hash: Hash,
+        block_hash: BlockHash,
         qc: QuorumCertificate,
     },
 
     /// A block is ready to be committed.
     BlockReadyToCommit {
-        block_hash: Hash,
+        block_hash: BlockHash,
         qc: QuorumCertificate,
         source: CommitSource,
     },
@@ -136,13 +136,13 @@ pub enum ProtocolEvent {
 
     /// Quorum Certificate verification and building result.
     QuorumCertificateResult {
-        block_hash: Hash,
+        block_hash: BlockHash,
         qc: Option<QuorumCertificate>,
         verified_votes: Vec<(usize, BlockVote, u64)>,
     },
 
     /// QC signature verification completed.
-    QcSignatureVerified { block_hash: Hash, valid: bool },
+    QcSignatureVerified { block_hash: BlockHash, valid: bool },
 
     /// Remote header QC verification completed.
     RemoteHeaderQcVerified {
@@ -169,7 +169,7 @@ pub enum ProtocolEvent {
     /// vote if so. The `kind` field distinguishes which verification finished.
     BlockRootVerified {
         kind: VerificationKind,
-        block_hash: Hash,
+        block_hash: BlockHash,
         valid: bool,
     },
 
@@ -178,7 +178,7 @@ pub enum ProtocolEvent {
         height: BlockHeight,
         round: Round,
         block: Arc<Block>,
-        block_hash: Hash,
+        block_hash: BlockHash,
         finalized_waves: Vec<Arc<FinalizedWave>>,
         provisions: Vec<Arc<Provision>>,
     },
@@ -244,7 +244,7 @@ pub enum ProtocolEvent {
     /// Batch execution vote verification completed.
     ExecutionVotesVerifiedAndAggregated {
         wave_id: WaveId,
-        block_hash: Hash,
+        block_hash: BlockHash,
         verified_votes: Vec<(ExecutionVote, u64)>,
     },
 
@@ -274,16 +274,16 @@ pub enum ProtocolEvent {
 
     /// A transaction's execution outcome has been resolved and certificate finalized.
     /// Used for per-tx mempool status updates.
-    TransactionExecuted { tx_hash: Hash, accepted: bool },
+    TransactionExecuted { tx_hash: TxHash, accepted: bool },
 
     /// Local execution certificate created for a wave (local votes aggregated).
-    ExecutionCertificateCreated { tx_hashes: Vec<Hash> },
+    ExecutionCertificateCreated { tx_hashes: Vec<TxHash> },
 
     /// A wave's execution has been finalized (all shards reported).
     /// Carries the wave cert (which contains the ECs) and per-tx hashes.
     WaveCompleted {
         wave_cert: Arc<WaveCertificate>,
-        tx_hashes: Vec<Hash>,
+        tx_hashes: Vec<TxHash>,
     },
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -291,7 +291,7 @@ pub enum ProtocolEvent {
     // ═══════════════════════════════════════════════════════════════════════
     /// Fetched transactions delivered to state machine.
     TransactionFetchDelivered {
-        block_hash: Hash,
+        block_hash: BlockHash,
         transactions: Vec<Arc<RoutableTransaction>>,
     },
 
@@ -304,7 +304,7 @@ pub enum ProtocolEvent {
     /// Chain metadata fetched from storage.
     ChainMetadataFetched {
         height: BlockHeight,
-        hash: Option<Hash>,
+        hash: Option<BlockHash>,
         qc: Option<QuorumCertificate>,
     },
 
@@ -335,13 +335,13 @@ pub enum ProtocolEvent {
         epoch: EpochId,
         height: BlockHeight,
         proposer: ValidatorId,
-        block_hash: Hash,
+        block_hash: BlockHash,
         next_epoch_config: Option<Box<EpochConfig>>,
     },
 
     /// Received a vote on a global block.
     GlobalBlockVoteReceived {
-        block_hash: Hash,
+        block_hash: BlockHash,
         shard: ShardGroupId,
         shard_signature: hyperscale_types::Bls12381G2Signature,
         signers: hyperscale_types::SignerBitfield,
@@ -349,7 +349,10 @@ pub enum ProtocolEvent {
     },
 
     /// Global quorum certificate formed.
-    GlobalQcFormed { block_hash: Hash, epoch: EpochId },
+    GlobalQcFormed {
+        block_hash: BlockHash,
+        epoch: EpochId,
+    },
 
     /// Epoch transition is imminent.
     EpochEndApproaching {

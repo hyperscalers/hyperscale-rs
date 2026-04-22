@@ -103,7 +103,7 @@ fn cross_shard_transfer(
 /// Returns the final status (or None if evicted/not found).
 fn poll_until_terminal(
     runner: &mut SimulationRunner,
-    tx_hash: hyperscale_types::Hash,
+    tx_hash: hyperscale_types::TxHash,
     node_index: u32,
     max_iterations: usize,
     step: Duration,

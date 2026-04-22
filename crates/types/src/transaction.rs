@@ -1,6 +1,6 @@
 //! Transaction types for consensus.
 
-use crate::{BlockHeight, Hash, NodeId};
+use crate::{BlockHeight, Hash, NodeId, TxHash};
 use radix_common::data::manifest::{manifest_decode, manifest_encode};
 use radix_transactions::model::{UserTransaction, ValidatedUserTransaction};
 use radix_transactions::validation::TransactionValidator;
@@ -111,8 +111,8 @@ impl RoutableTransaction {
     }
 
     /// Get the transaction hash (content-addressed).
-    pub fn hash(&self) -> Hash {
-        self.hash
+    pub fn hash(&self) -> TxHash {
+        TxHash::from_raw(self.hash)
     }
 
     /// Get a reference to the underlying Radix transaction.

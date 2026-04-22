@@ -1,6 +1,6 @@
 //! Execution result types.
 
-use hyperscale_types::{Hash, LocalExecutionEntry, LocalReceipt};
+use hyperscale_types::{Hash, LocalExecutionEntry, LocalReceipt, TxHash, WritesRoot};
 /// Output from executing a batch of transactions.
 #[derive(Debug, Clone)]
 pub struct ExecutionOutput {
@@ -44,7 +44,7 @@ impl ExecutionOutput {
 #[derive(Debug, Clone)]
 pub struct SingleTxResult {
     /// Hash of the executed transaction.
-    pub tx_hash: Hash,
+    pub tx_hash: TxHash,
 
     /// Whether execution succeeded (committed).
     pub success: bool,
@@ -66,7 +66,7 @@ pub struct SingleTxResult {
 impl SingleTxResult {
     /// Create a successful result.
     pub fn success(
-        tx_hash: Hash,
+        tx_hash: TxHash,
         receipt_hash: Hash,
         local_receipt: LocalReceipt,
         execution_output: hyperscale_types::ExecutionMetadata,
@@ -82,11 +82,11 @@ impl SingleTxResult {
     }
 
     /// Create a failed result.
-    pub fn failure(tx_hash: Hash, error: impl Into<String>) -> Self {
+    pub fn failure(tx_hash: TxHash, error: impl Into<String>) -> Self {
         let local_receipt = LocalReceipt::failure();
         // Failures have no writes, so writes_root is ZERO.
         let receipt_hash = local_receipt
-            .global_receipt(Hash::from_bytes(&[0u8; 32]))
+            .global_receipt(WritesRoot::ZERO)
             .receipt_hash();
         Self {
             tx_hash,

@@ -71,7 +71,7 @@ impl<S: jmt::TreeReader + Sync> jmt::TreeReader for OverlayTreeReader<'_, S> {
 
 use hyperscale_jmt as jmt;
 use hyperscale_jmt::{Blake3Hasher, Tree};
-use hyperscale_types::{BlockHeight, Hash};
+use hyperscale_types::{BlockHeight, Hash, StateRoot};
 use rayon::prelude::*;
 
 // Re-export JMT types used in public APIs (CollectedWrites, etc.)
@@ -97,8 +97,8 @@ pub fn hash_value(value: &[u8]) -> jmt::ValueHash {
 
 /// Returns `None` when the JMT is truly empty (height 0 with zero root),
 /// indicating no parent node exists. Otherwise returns `Some(block_height)`.
-pub fn jmt_parent_height(block_height: BlockHeight, root: Hash) -> Option<BlockHeight> {
-    if block_height == BlockHeight::GENESIS && root == Hash::ZERO {
+pub fn jmt_parent_height(block_height: BlockHeight, root: StateRoot) -> Option<BlockHeight> {
+    if block_height == BlockHeight::GENESIS && root == StateRoot::ZERO {
         None
     } else {
         Some(block_height)
@@ -124,7 +124,7 @@ pub fn jmt_parent_height(block_height: BlockHeight, root: Hash) -> Option<BlockH
 pub fn noop_jmt_snapshot<S: jmt::TreeReader>(
     store: &S,
     pending_snapshots: &[Arc<JmtSnapshot>],
-    parent_state_root: Hash,
+    parent_state_root: StateRoot,
     parent_block_height: BlockHeight,
     block_height: BlockHeight,
 ) -> JmtSnapshot {
@@ -195,7 +195,7 @@ pub fn put_at_version<S: jmt::TreeReader + Sync>(
         (Vec<u8>, u8),
         Vec<radix_substate_store_interface::interface::DbSortKey>,
     >,
-) -> (Hash, CollectedWrites) {
+) -> (StateRoot, CollectedWrites) {
     assert!(
         parent_version.is_none_or(|pv| new_version > pv),
         "put_at_version: new_version ({new_version}) must be greater than parent_version ({parent_version:?})"
@@ -257,9 +257,9 @@ pub fn put_at_version<S: jmt::TreeReader + Sync>(
                 }
                 let new_root_key = jmt::NodeKey::root(new_version);
                 collected.nodes.push((new_root_key, root_node));
-                Some(Hash::from_hash_bytes(&hash))
+                Some(StateRoot::from_raw(Hash::from_hash_bytes(&hash)))
             })
-            .unwrap_or(Hash::ZERO);
+            .unwrap_or(StateRoot::ZERO);
         return (root_hash, collected);
     }
 
@@ -282,9 +282,9 @@ pub fn put_at_version<S: jmt::TreeReader + Sync>(
         .expect("JMT apply_updates failed");
 
     let root_hash = if result.root_hash == [0u8; 32] {
-        Hash::ZERO
+        StateRoot::ZERO
     } else {
-        Hash::from_hash_bytes(&result.root_hash)
+        StateRoot::from_raw(Hash::from_hash_bytes(&result.root_hash))
     };
 
     let mut collected = CollectedWrites::default();

@@ -9,7 +9,7 @@ use crate::typed_cf::{
     ReadableStore,
 };
 
-use hyperscale_storage::StateRootHash;
+use hyperscale_storage::StateRoot;
 use hyperscale_types::{BlockHeight, Hash, QuorumCertificate};
 use rocksdb::WriteBatch;
 
@@ -41,13 +41,13 @@ pub(crate) fn read_committed_qc(store: &impl ReadableStore) -> Option<QuorumCert
 
 // ─── JMT metadata ────────────────────────────────────────────────────────────
 
-pub(crate) fn write_jmt_metadata(batch: &mut WriteBatch, version: u64, root: StateRootHash) {
+pub(crate) fn write_jmt_metadata(batch: &mut WriteBatch, version: u64, root: StateRoot) {
     typed_cf::meta_write::<JmtMetadataEntry>(batch, &(version, root));
 }
 
 /// Read JMT version + root hash.
 ///
 /// Returns `(0, ZERO)` for an uninitialized database.
-pub(crate) fn read_jmt_metadata(store: &impl ReadableStore) -> (u64, StateRootHash) {
-    typed_cf::meta_read::<JmtMetadataEntry>(store).unwrap_or((0, StateRootHash::ZERO))
+pub(crate) fn read_jmt_metadata(store: &impl ReadableStore) -> (u64, StateRoot) {
+    typed_cf::meta_read::<JmtMetadataEntry>(store).unwrap_or((0, StateRoot::ZERO))
 }

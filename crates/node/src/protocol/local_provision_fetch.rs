@@ -5,7 +5,7 @@
 //! through peers on failure.
 
 use hyperscale_metrics as metrics;
-use hyperscale_types::{Hash, Provision, ValidatorId};
+use hyperscale_types::{BlockHash, Hash, Provision, ValidatorId};
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use tracing::{debug, info, trace};
@@ -33,19 +33,22 @@ impl Default for LocalProvisionFetchConfig {
 pub enum LocalProvisionFetchInput {
     /// Request provision batches for a pending block.
     Request {
-        block_hash: Hash,
+        block_hash: BlockHash,
         proposer: ValidatorId,
         batch_hashes: Vec<Hash>,
     },
     /// Provision batches were received.
     Received {
-        block_hash: Hash,
+        block_hash: BlockHash,
         batches: Vec<Arc<Provision>>,
     },
     /// A fetch operation failed.
-    Failed { block_hash: Hash, hashes: Vec<Hash> },
+    Failed {
+        block_hash: BlockHash,
+        hashes: Vec<Hash>,
+    },
     /// Cancel fetch for a specific block.
-    CancelFetch { block_hash: Hash },
+    CancelFetch { block_hash: BlockHash },
     /// Tick: spawn pending fetch operations.
     Tick,
 }
@@ -55,7 +58,7 @@ pub enum LocalProvisionFetchInput {
 pub enum LocalProvisionFetchOutput {
     /// Request the runner to fetch provision batches from a peer.
     Fetch {
-        block_hash: Hash,
+        block_hash: BlockHash,
         proposer: ValidatorId,
         batch_hashes: Vec<Hash>,
     },
@@ -146,7 +149,7 @@ impl BlockFetchState {
 /// Local provision fetch protocol state machine.
 pub struct LocalProvisionFetchProtocol {
     config: LocalProvisionFetchConfig,
-    fetches: BTreeMap<Hash, BlockFetchState>,
+    fetches: BTreeMap<BlockHash, BlockFetchState>,
 }
 
 impl LocalProvisionFetchProtocol {
@@ -190,7 +193,7 @@ impl LocalProvisionFetchProtocol {
 
     fn handle_request(
         &mut self,
-        block_hash: Hash,
+        block_hash: BlockHash,
         proposer: ValidatorId,
         batch_hashes: Vec<Hash>,
     ) -> Vec<LocalProvisionFetchOutput> {
@@ -222,7 +225,7 @@ impl LocalProvisionFetchProtocol {
 
     fn handle_received(
         &mut self,
-        block_hash: Hash,
+        block_hash: BlockHash,
         batches: Vec<Arc<Provision>>,
     ) -> Vec<LocalProvisionFetchOutput> {
         let Some(state) = self.fetches.get_mut(&block_hash) else {
@@ -263,7 +266,7 @@ impl LocalProvisionFetchProtocol {
 
     fn handle_failed(
         &mut self,
-        block_hash: Hash,
+        block_hash: BlockHash,
         hashes: Vec<Hash>,
     ) -> Vec<LocalProvisionFetchOutput> {
         if let Some(state) = self.fetches.get_mut(&block_hash) {

@@ -22,7 +22,13 @@
 //! `signing_message()` method pattern. The signing message is constructed
 //! by prepending the domain tag to the serialized content.
 
-use crate::{BlockHeight, Hash, Round, ShardGroupId, StateProvision, WaveId};
+#[cfg(test)]
+use crate::Hash;
+#[cfg(test)]
+use crate::TxHash;
+use crate::{
+    BlockHash, BlockHeight, GlobalReceiptRoot, Round, ShardGroupId, StateProvision, WaveId,
+};
 
 /// Domain tag for BFT block votes.
 ///
@@ -47,7 +53,7 @@ pub fn block_vote_message(
     shard_group: ShardGroupId,
     height: BlockHeight,
     round: Round,
-    block_hash: &Hash,
+    block_hash: &BlockHash,
 ) -> Vec<u8> {
     let mut message = Vec::with_capacity(80);
     message.extend_from_slice(DOMAIN_BLOCK_VOTE);
@@ -65,7 +71,7 @@ pub fn block_vote_message(
 pub fn committed_block_header_message(
     shard_group_id: ShardGroupId,
     height: BlockHeight,
-    block_hash: &Hash,
+    block_hash: &BlockHash,
 ) -> Vec<u8> {
     let mut message = Vec::with_capacity(64);
     message.extend_from_slice(DOMAIN_COMMITTED_BLOCK_HEADER);
@@ -93,7 +99,7 @@ pub fn block_header_message(
     shard_group: ShardGroupId,
     height: BlockHeight,
     round: Round,
-    block_hash: &Hash,
+    block_hash: &BlockHash,
 ) -> Vec<u8> {
     let mut message = Vec::with_capacity(80);
     message.extend_from_slice(DOMAIN_BLOCK_HEADER);
@@ -192,7 +198,7 @@ pub fn exec_vote_message(
     vote_anchor_ts_ms: crate::WeightedTimestamp,
     wave_id: &WaveId,
     shard_group: ShardGroupId,
-    global_receipt_root: &Hash,
+    global_receipt_root: &GlobalReceiptRoot,
     tx_count: u32,
 ) -> Vec<u8> {
     let mut message = Vec::with_capacity(128);
@@ -207,7 +213,7 @@ pub fn exec_vote_message(
         message.extend_from_slice(&shard.0.to_le_bytes());
     }
     message.extend_from_slice(&shard_group.0.to_le_bytes());
-    message.extend_from_slice(global_receipt_root.as_bytes());
+    message.extend_from_slice(global_receipt_root.as_raw().as_bytes());
     message.extend_from_slice(&tx_count.to_le_bytes());
     message
 }
@@ -219,7 +225,7 @@ pub fn exec_vote_batch_message(
 ) -> Vec<u8> {
     let mut hasher = blake3::Hasher::new();
     for v in votes {
-        hasher.update(v.global_receipt_root.as_bytes());
+        hasher.update(v.global_receipt_root.as_raw().as_bytes());
     }
     let digest = hasher.finalize();
 
@@ -237,7 +243,7 @@ pub fn exec_cert_batch_message(
 ) -> Vec<u8> {
     let mut hasher = blake3::Hasher::new();
     for c in certificates {
-        hasher.update(c.global_receipt_root.as_bytes());
+        hasher.update(c.global_receipt_root.as_raw().as_bytes());
     }
     let digest = hasher.finalize();
 
@@ -255,7 +261,7 @@ mod tests {
     #[test]
     fn test_block_vote_message_deterministic() {
         let shard = ShardGroupId(1);
-        let block = Hash::from_bytes(b"test_block");
+        let block = BlockHash::from_raw(Hash::from_bytes(b"test_block"));
 
         let msg1 = block_vote_message(shard, BlockHeight(10), Round::INITIAL, &block);
         let msg2 = block_vote_message(shard, BlockHeight(10), Round::INITIAL, &block);
@@ -267,7 +273,7 @@ mod tests {
     #[test]
     fn test_committed_block_header_message_deterministic() {
         let shard = ShardGroupId(1);
-        let block = Hash::from_bytes(b"test_block");
+        let block = BlockHash::from_raw(Hash::from_bytes(b"test_block"));
 
         let msg1 = committed_block_header_message(shard, BlockHeight(10), &block);
         let msg2 = committed_block_header_message(shard, BlockHeight(10), &block);
@@ -279,7 +285,7 @@ mod tests {
     #[test]
     fn test_block_header_message_deterministic() {
         let shard = ShardGroupId(1);
-        let block = Hash::from_bytes(b"test_block");
+        let block = BlockHash::from_raw(Hash::from_bytes(b"test_block"));
 
         let msg1 = block_header_message(shard, BlockHeight(10), Round::INITIAL, &block);
         let msg2 = block_header_message(shard, BlockHeight(10), Round::INITIAL, &block);
@@ -291,7 +297,7 @@ mod tests {
     #[test]
     fn test_block_header_differs_from_block_vote() {
         let shard = ShardGroupId(1);
-        let block = Hash::from_bytes(b"test_block");
+        let block = BlockHash::from_raw(Hash::from_bytes(b"test_block"));
 
         let header_msg = block_header_message(shard, BlockHeight(10), Round::INITIAL, &block);
         let vote_msg = block_vote_message(shard, BlockHeight(10), Round::INITIAL, &block);
@@ -306,7 +312,7 @@ mod tests {
         use std::sync::Arc;
 
         let provisions = vec![StateProvision {
-            transaction_hash: Hash::from_bytes(b"tx1"),
+            transaction_hash: TxHash::from_raw(Hash::from_bytes(b"tx1")),
             target_shard: ShardGroupId(2),
             source_shard: ShardGroupId(1),
             block_height: BlockHeight(10),
@@ -350,7 +356,7 @@ mod tests {
             ShardGroupId(0),
             BlockHeight::GENESIS,
             Round::INITIAL,
-            &Hash::from_bytes(bytes),
+            &BlockHash::from_raw(Hash::from_bytes(bytes)),
         );
 
         assert_ne!(bind_msg, block_msg);

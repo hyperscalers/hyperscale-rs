@@ -7,11 +7,12 @@ use crate::tree_store::SimTreeStore;
 use hyperscale_jmt as jmt;
 use hyperscale_storage::{
     keys, DatabaseUpdate, DatabaseUpdates, DbPartitionKey, JmtSnapshot, PartitionDatabaseUpdates,
-    StateRootHash,
+    StateRoot,
 };
 use hyperscale_types::{
-    BlockHeight, CertifiedBlock, ExecutionCertificate, ExecutionMetadata, Hash, LocalReceipt,
-    QuorumCertificate, RoutableTransaction, ShardGroupId, WaveCertificate,
+    BlockHash, BlockHeight, CertifiedBlock, ExecutionCertificate, ExecutionCertificateHash,
+    ExecutionMetadata, Hash, LocalReceipt, QuorumCertificate, RoutableTransaction, ShardGroupId,
+    TxHash, WaveCertificate,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -31,7 +32,7 @@ use std::sync::Arc;
 pub(crate) struct SharedState {
     pub tree_store: SimTreeStore,
     pub current_block_height: BlockHeight,
-    pub current_root_hash: StateRootHash,
+    pub current_root_hash: StateRoot,
     /// Leaf-key → substate-value associations for historical queries.
     pub associations: HashMap<jmt::NodeKey, Vec<u8>>,
     /// Current value per `storage_key`. Absent key = no value. This is
@@ -53,7 +54,7 @@ impl SharedState {
             // In simulation, tests are short-lived so retaining all nodes is fine.
             tree_store: SimTreeStore::new(),
             current_block_height: BlockHeight::GENESIS,
-            current_root_hash: Hash::ZERO,
+            current_root_hash: StateRoot::ZERO,
             current_state: BTreeMap::new(),
             state_history: BTreeMap::new(),
             associations: HashMap::new(),
@@ -100,29 +101,29 @@ pub(crate) struct ConsensusState {
     /// Committed height.
     pub committed_height: BlockHeight,
     /// Committed block hash.
-    pub committed_hash: Option<Hash>,
+    pub committed_hash: Option<BlockHash>,
     /// Latest QC.
     pub committed_qc: Option<QuorumCertificate>,
     /// Transactions indexed by hash.
-    pub transactions: HashMap<Hash, RoutableTransaction>,
+    pub transactions: HashMap<TxHash, RoutableTransaction>,
     /// Wave certificates indexed by identity hash.
     pub certificates: HashMap<Hash, WaveCertificate>,
     /// Local receipts keyed by transaction hash.
-    pub local_receipts: HashMap<Hash, Arc<LocalReceipt>>,
+    pub local_receipts: HashMap<TxHash, Arc<LocalReceipt>>,
     /// Execution output details keyed by transaction hash.
-    pub execution_outputs: HashMap<Hash, ExecutionMetadata>,
+    pub execution_outputs: HashMap<TxHash, ExecutionMetadata>,
     /// Insertion height for each receipt, enabling height-based pruning.
-    pub receipt_heights: HashMap<Hash, BlockHeight>,
+    pub receipt_heights: HashMap<TxHash, BlockHeight>,
     /// Execution certificates keyed by canonical hash.
-    pub execution_certs: HashMap<Hash, ExecutionCertificate>,
+    pub execution_certs: HashMap<ExecutionCertificateHash, ExecutionCertificate>,
     /// Index: block_height → set of canonical hashes for that height.
-    pub execution_certs_by_height: HashMap<BlockHeight, Vec<Hash>>,
+    pub execution_certs_by_height: HashMap<BlockHeight, Vec<ExecutionCertificateHash>>,
     /// Index: block_height → wave_id hashes at that height.
     pub wave_certs_by_height: HashMap<BlockHeight, Vec<Hash>>,
     /// Index: tx_hash → wave_id hash of the wave cert that finalized it.
-    pub tx_to_wave: HashMap<Hash, Hash>,
+    pub tx_to_wave: HashMap<TxHash, Hash>,
     /// Index: tx_hash → vec of (shard_group_id, ec_hash) pairs covering it.
-    pub tx_to_ec: HashMap<Hash, Vec<(ShardGroupId, Hash)>>,
+    pub tx_to_ec: HashMap<TxHash, Vec<(ShardGroupId, ExecutionCertificateHash)>>,
 }
 
 /// Maximum number of blocks worth of receipts to retain in simulation storage.

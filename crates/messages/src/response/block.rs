@@ -59,9 +59,10 @@ impl NetworkMessage for GetBlockResponse {
 mod tests {
     use super::*;
     use hyperscale_types::{
-        test_utils::test_transaction, zero_bls_signature, Block, BlockHeader, BlockHeight, Hash,
-        ProposerTimestamp, QuorumCertificate, Round, ShardGroupId, SignerBitfield, ValidatorId,
-        WeightedTimestamp,
+        test_utils::test_transaction, zero_bls_signature, Block, BlockHash, BlockHeader,
+        BlockHeight, CertificateRoot, Hash, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot,
+        QuorumCertificate, Round, ShardGroupId, SignerBitfield, StateRoot, TransactionRoot,
+        ValidatorId, WeightedTimestamp,
     };
     use std::collections::BTreeMap;
 
@@ -72,17 +73,17 @@ mod tests {
             header: BlockHeader {
                 shard_group_id: ShardGroupId(0),
                 height: BlockHeight(1),
-                parent_hash: Hash::from_bytes(b"parent"),
+                parent_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
                 parent_qc: QuorumCertificate::genesis(),
                 proposer: ValidatorId(0),
                 timestamp: ProposerTimestamp(1234567890),
                 round: Round::INITIAL,
                 is_fallback: false,
-                state_root: Hash::ZERO,
-                transaction_root: Hash::ZERO,
-                certificate_root: Hash::ZERO,
-                local_receipt_root: Hash::ZERO,
-                provision_root: Hash::ZERO,
+                state_root: StateRoot::ZERO,
+                transaction_root: TransactionRoot::ZERO,
+                certificate_root: CertificateRoot::ZERO,
+                local_receipt_root: LocalReceiptRoot::ZERO,
+                provision_root: ProvisionsRoot::ZERO,
                 waves: vec![],
                 provision_tx_roots: BTreeMap::new(),
                 in_flight: 0,

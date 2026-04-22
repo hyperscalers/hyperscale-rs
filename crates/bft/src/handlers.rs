@@ -8,16 +8,17 @@ use hyperscale_storage::{ChainWriter, SubstateStore};
 use hyperscale_types::{
     batch_verify_bls_same_message, compute_certificate_root, compute_local_receipt_root,
     compute_provision_root, compute_provision_tx_roots, compute_transaction_root, compute_waves,
-    verify_bls12381_v1, Block, BlockHeader, BlockHeight, BlockVote, Bls12381G1PublicKey,
-    Bls12381G2Signature, FinalizedWave, Hash, ProposerTimestamp, QuorumCertificate, ReceiptBundle,
-    Round, RoutableTransaction, ShardGroupId, SignerBitfield, TopologySnapshot, ValidatorId,
-    VotePower, WeightedTimestamp,
+    verify_bls12381_v1, Block, BlockHash, BlockHeader, BlockHeight, BlockVote, Bls12381G1PublicKey,
+    Bls12381G2Signature, CertificateRoot, FinalizedWave, Hash, LocalReceiptRoot, ProposerTimestamp,
+    ProvisionsRoot, QuorumCertificate, ReceiptBundle, Round, RoutableTransaction, ShardGroupId,
+    SignerBitfield, StateRoot, TopologySnapshot, TransactionRoot, ValidatorId, VotePower,
+    WeightedTimestamp,
 };
 use std::sync::Arc;
 
 /// Result of QC verification and assembly.
 pub struct QcVerificationResult {
-    pub block_hash: Hash,
+    pub block_hash: BlockHash,
     pub qc: Option<QuorumCertificate>,
     /// Verified votes returned when no QC was formed (for accumulation across rounds).
     /// Empty when a QC is successfully built.
@@ -36,11 +37,11 @@ pub struct QcVerificationResult {
 /// the split helpers exist for focused unit testing of each phase.
 #[allow(clippy::too_many_arguments)]
 pub fn verify_and_build_qc(
-    block_hash: Hash,
+    block_hash: BlockHash,
     shard_group_id: ShardGroupId,
     height: BlockHeight,
     round: Round,
-    parent_block_hash: Hash,
+    parent_block_hash: BlockHash,
     votes_to_verify: Vec<(usize, BlockVote, Bls12381G1PublicKey, u64)>,
     already_verified: Vec<(usize, BlockVote, u64)>,
     total_voting_power: u64,
@@ -88,7 +89,7 @@ pub fn verify_and_build_qc(
 /// or more bad signatures) falls back to individual verification so a
 /// single forged vote doesn't poison the whole batch.
 pub fn verify_vote_batch(
-    block_hash: Hash,
+    block_hash: BlockHash,
     signing_message: &[u8],
     votes_to_verify: Vec<(usize, BlockVote, Bls12381G1PublicKey, u64)>,
     already_verified: Vec<(usize, BlockVote, u64)>,
@@ -142,11 +143,11 @@ pub fn verify_vote_batch(
 /// Returns `None` only if BLS aggregation itself fails. Caller must ensure
 /// `verified_votes` is non-empty and that quorum has been reached.
 pub fn build_qc_from_verified(
-    block_hash: Hash,
+    block_hash: BlockHash,
     shard_group_id: ShardGroupId,
     height: BlockHeight,
     round: Round,
-    parent_block_hash: Hash,
+    parent_block_hash: BlockHash,
     verified_votes: &[(usize, BlockVote, u64)],
 ) -> Option<QuorumCertificate> {
     let mut sorted: Vec<_> = verified_votes.to_vec();
@@ -218,7 +219,7 @@ pub fn verify_qc_signature(qc: &QuorumCertificate, public_keys: &[Bls12381G1Publ
 }
 
 /// Verify that the computed transaction merkle root matches the expected root.
-pub fn verify_provision_root(expected_root: Hash, batch_hashes: &[Hash]) -> bool {
+pub fn verify_provision_root(expected_root: ProvisionsRoot, batch_hashes: &[Hash]) -> bool {
     let computed_root = compute_provision_root(batch_hashes);
     let valid = computed_root == expected_root;
 
@@ -235,7 +236,7 @@ pub fn verify_provision_root(expected_root: Hash, batch_hashes: &[Hash]) -> bool
 }
 
 pub fn verify_transaction_root(
-    expected_root: Hash,
+    expected_root: TransactionRoot,
     transactions: &[Arc<RoutableTransaction>],
 ) -> bool {
     let computed_root = compute_transaction_root(transactions);
@@ -281,7 +282,10 @@ pub fn verify_provision_tx_roots(
 /// Verify a block's receipt root against its wave certificates.
 ///
 /// Pure computation over the certificates' `receipt_hash` values.
-pub fn verify_certificate_root(expected_root: Hash, certificates: &[Arc<FinalizedWave>]) -> bool {
+pub fn verify_certificate_root(
+    expected_root: CertificateRoot,
+    certificates: &[Arc<FinalizedWave>],
+) -> bool {
     let computed_root = compute_certificate_root(certificates);
     let valid = computed_root == expected_root;
 
@@ -300,7 +304,10 @@ pub fn verify_certificate_root(expected_root: Hash, certificates: &[Arc<Finalize
 /// Verify a block's local receipt root against its receipt bundles.
 ///
 /// Pure computation over the receipts' `receipt_hash()` values.
-pub fn verify_local_receipt_root(expected_root: Hash, receipts: &[ReceiptBundle]) -> bool {
+pub fn verify_local_receipt_root(
+    expected_root: LocalReceiptRoot,
+    receipts: &[ReceiptBundle],
+) -> bool {
     let computed_root = compute_local_receipt_root(receipts);
     let valid = computed_root == expected_root;
 
@@ -329,9 +336,9 @@ pub struct StateRootResult<P: Send> {
 /// prepared commit handle for caching on success.
 pub fn verify_state_root<S: ChainWriter + SubstateStore>(
     storage: &S,
-    parent_state_root: Hash,
+    parent_state_root: StateRoot,
     parent_block_height: BlockHeight,
-    expected_root: Hash,
+    expected_root: StateRoot,
     finalized_waves: &[Arc<FinalizedWave>],
     block_height: BlockHeight,
     pending_snapshots: &[Arc<hyperscale_storage::JmtSnapshot>],
@@ -374,7 +381,7 @@ pub fn verify_state_root<S: ChainWriter + SubstateStore>(
 /// Result of building a proposal block.
 pub struct ProposalResult<P: Send> {
     pub block: Block,
-    pub block_hash: Hash,
+    pub block_hash: BlockHash,
     pub prepared_commit: Option<P>,
 }
 
@@ -394,11 +401,11 @@ pub fn build_proposal<S: ChainWriter + SubstateStore>(
     proposer: ValidatorId,
     height: BlockHeight,
     round: Round,
-    parent_hash: Hash,
+    parent_hash: BlockHash,
     parent_qc: QuorumCertificate,
     timestamp: ProposerTimestamp,
     is_fallback: bool,
-    parent_state_root: Hash,
+    parent_state_root: StateRoot,
     parent_block_height: BlockHeight,
     transactions: Vec<Arc<RoutableTransaction>>,
     certificates: Vec<Arc<FinalizedWave>>,
@@ -490,7 +497,7 @@ mod tests {
     fn make_vote(
         keys: &[Bls12381G1PrivateKey],
         voter_index: usize,
-        block_hash: Hash,
+        block_hash: BlockHash,
         height: BlockHeight,
         round: Round,
         timestamp_ms: u64,
@@ -515,7 +522,7 @@ mod tests {
     #[test]
     fn verify_vote_batch_empty_input_returns_already_verified_unchanged() {
         let keys = keypairs(2);
-        let block_hash = Hash::from_bytes(b"block");
+        let block_hash = BlockHash::from_raw(Hash::from_bytes(b"block"));
         let v = make_vote(&keys, 0, block_hash, BlockHeight(1), Round::INITIAL, 1000);
         let already = vec![(0usize, v, 1u64)];
         let out = verify_vote_batch(block_hash, b"msg", Vec::new(), already.clone());
@@ -525,7 +532,7 @@ mod tests {
     #[test]
     fn verify_vote_batch_accepts_all_valid_signatures() {
         let keys = keypairs(3);
-        let block_hash = Hash::from_bytes(b"b1");
+        let block_hash = BlockHash::from_raw(Hash::from_bytes(b"b1"));
         let height = BlockHeight(1);
         let round = Round::INITIAL;
         let msg = hyperscale_types::block_vote_message(shard(), height, round, &block_hash);
@@ -544,13 +551,13 @@ mod tests {
     #[test]
     fn verify_vote_batch_falls_back_when_one_signature_bad() {
         let keys = keypairs(3);
-        let block_hash = Hash::from_bytes(b"b1");
+        let block_hash = BlockHash::from_raw(Hash::from_bytes(b"b1"));
         let height = BlockHeight(1);
         let round = Round::INITIAL;
         let msg = hyperscale_types::block_vote_message(shard(), height, round, &block_hash);
 
         // Vote 1's signature is replaced by a signature over a different block.
-        let other_hash = Hash::from_bytes(b"other");
+        let other_hash = BlockHash::from_raw(Hash::from_bytes(b"other"));
         let mut bad_vote = make_vote(&keys, 1, block_hash, height, round, 1000);
         let bad_signing_vote = make_vote(&keys, 1, other_hash, height, round, 1000);
         bad_vote.signature = bad_signing_vote.signature;
@@ -579,7 +586,7 @@ mod tests {
     #[test]
     fn verify_vote_batch_rejects_all_when_wrong_message() {
         let keys = keypairs(2);
-        let block_hash = Hash::from_bytes(b"b1");
+        let block_hash = BlockHash::from_raw(Hash::from_bytes(b"b1"));
         let wrong_msg = b"unrelated";
         let to_verify: Vec<_> = (0..2)
             .map(|i| {
@@ -596,10 +603,10 @@ mod tests {
     #[test]
     fn build_qc_from_verified_produces_round_trippable_qc() {
         let keys = keypairs(3);
-        let block_hash = Hash::from_bytes(b"block");
+        let block_hash = BlockHash::from_raw(Hash::from_bytes(b"block"));
         let height = BlockHeight(5);
         let round = Round::INITIAL;
-        let parent = Hash::from_bytes(b"parent");
+        let parent = BlockHash::from_raw(Hash::from_bytes(b"parent"));
 
         let verified: Vec<_> = (0..3)
             .map(|i| {
@@ -622,7 +629,7 @@ mod tests {
     #[test]
     fn build_qc_from_verified_sorts_signers_bitfield_deterministically() {
         let keys = keypairs(4);
-        let block_hash = Hash::from_bytes(b"b");
+        let block_hash = BlockHash::from_raw(Hash::from_bytes(b"b"));
         let verified: Vec<_> = [2, 0, 3]
             .into_iter()
             .map(|i: usize| {
@@ -636,7 +643,7 @@ mod tests {
             shard(),
             BlockHeight(1),
             Round::INITIAL,
-            Hash::ZERO,
+            BlockHash::ZERO,
             &verified,
         )
         .unwrap();
@@ -648,7 +655,7 @@ mod tests {
     #[test]
     fn build_qc_from_verified_computes_stake_weighted_timestamp() {
         let keys = keypairs(3);
-        let block_hash = Hash::from_bytes(b"b");
+        let block_hash = BlockHash::from_raw(Hash::from_bytes(b"b"));
         // Votes with different timestamps and powers; weighted mean = (1000*1 + 2000*2 + 3000*3) / 6 = 14000/6 ≈ 2333.
         let verified = vec![
             (
@@ -673,7 +680,7 @@ mod tests {
             shard(),
             BlockHeight(1),
             Round::INITIAL,
-            Hash::ZERO,
+            BlockHash::ZERO,
             &verified,
         )
         .unwrap();
@@ -688,7 +695,7 @@ mod tests {
         // 3 votes of power 1 each, total 4 → 3/4 = quorum only if 2f+1 where f=1 (3/4 OK).
         // Use total_voting_power=10 to force failure (3 < 2/3*10 = 6.67).
         let keys = keypairs(3);
-        let block_hash = Hash::from_bytes(b"b");
+        let block_hash = BlockHash::from_raw(Hash::from_bytes(b"b"));
         let height = BlockHeight(1);
         let round = Round::INITIAL;
         let to_verify: Vec<_> = (0..3)
@@ -703,7 +710,7 @@ mod tests {
             shard(),
             height,
             round,
-            Hash::ZERO,
+            BlockHash::ZERO,
             to_verify,
             Vec::new(),
             10,
@@ -716,7 +723,7 @@ mod tests {
     #[test]
     fn verify_and_build_qc_builds_qc_when_quorum_reached() {
         let keys = keypairs(4);
-        let block_hash = Hash::from_bytes(b"b");
+        let block_hash = BlockHash::from_raw(Hash::from_bytes(b"b"));
         let height = BlockHeight(1);
         let round = Round::INITIAL;
         let to_verify: Vec<_> = (0..3)
@@ -731,7 +738,7 @@ mod tests {
             shard(),
             height,
             round,
-            Hash::ZERO,
+            BlockHash::ZERO,
             to_verify,
             Vec::new(),
             4,
@@ -747,7 +754,7 @@ mod tests {
     #[test]
     fn verify_qc_signature_rejects_empty_signer_set() {
         let keys = keypairs(3);
-        let block_hash = Hash::from_bytes(b"b");
+        let block_hash = BlockHash::from_raw(Hash::from_bytes(b"b"));
         let verified: Vec<_> = (0..3)
             .map(|i| {
                 let vote = make_vote(&keys, i, block_hash, BlockHeight(1), Round::INITIAL, 1000);
@@ -759,7 +766,7 @@ mod tests {
             shard(),
             BlockHeight(1),
             Round::INITIAL,
-            Hash::ZERO,
+            BlockHash::ZERO,
             &verified,
         )
         .unwrap();
@@ -772,7 +779,7 @@ mod tests {
     #[test]
     fn verify_qc_signature_rejects_wrong_public_keys() {
         let keys = keypairs(3);
-        let block_hash = Hash::from_bytes(b"b");
+        let block_hash = BlockHash::from_raw(Hash::from_bytes(b"b"));
         let verified: Vec<_> = (0..3)
             .map(|i| {
                 let vote = make_vote(&keys, i, block_hash, BlockHeight(1), Round::INITIAL, 1000);
@@ -784,7 +791,7 @@ mod tests {
             shard(),
             BlockHeight(1),
             Round::INITIAL,
-            Hash::ZERO,
+            BlockHash::ZERO,
             &verified,
         )
         .unwrap();
@@ -801,7 +808,10 @@ mod tests {
         let txs: Vec<Arc<RoutableTransaction>> = Vec::new();
         let root = compute_transaction_root(&txs);
         assert!(verify_transaction_root(root, &txs));
-        assert!(!verify_transaction_root(Hash::from_bytes(b"wrong"), &txs));
+        assert!(!verify_transaction_root(
+            TransactionRoot::from_raw(Hash::from_bytes(b"wrong")),
+            &txs
+        ));
     }
 
     #[test]
@@ -809,7 +819,10 @@ mod tests {
         let hashes = vec![Hash::from_bytes(b"a"), Hash::from_bytes(b"b")];
         let root = compute_provision_root(&hashes);
         assert!(verify_provision_root(root, &hashes));
-        assert!(!verify_provision_root(Hash::from_bytes(b"nope"), &hashes));
+        assert!(!verify_provision_root(
+            ProvisionsRoot::from_raw(Hash::from_bytes(b"nope")),
+            &hashes
+        ));
     }
 
     #[test]
@@ -817,7 +830,10 @@ mod tests {
         let certs: Vec<Arc<FinalizedWave>> = Vec::new();
         let root = compute_certificate_root(&certs);
         assert!(verify_certificate_root(root, &certs));
-        assert!(!verify_certificate_root(Hash::from_bytes(b"wrong"), &certs));
+        assert!(!verify_certificate_root(
+            CertificateRoot::from_raw(Hash::from_bytes(b"wrong")),
+            &certs
+        ));
     }
 
     #[test]
@@ -826,7 +842,7 @@ mod tests {
         let root = compute_local_receipt_root(&receipts);
         assert!(verify_local_receipt_root(root, &receipts));
         assert!(!verify_local_receipt_root(
-            Hash::from_bytes(b"wrong"),
+            LocalReceiptRoot::from_raw(Hash::from_bytes(b"wrong")),
             &receipts
         ));
     }

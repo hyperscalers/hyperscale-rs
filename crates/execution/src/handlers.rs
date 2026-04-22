@@ -1,10 +1,13 @@
 //! Execution handler functions shared between production and simulation runners.
 
 use hyperscale_core::{Action, CrossShardExecutionRequest};
+#[cfg(test)]
+use hyperscale_types::Hash;
 use hyperscale_types::{
     batch_verify_bls_same_message, exec_vote_message, verify_bls12381_v1, zero_bls_signature,
-    Bls12381G1PublicKey, Bls12381G2Signature, ExecutionCertificate, ExecutionVote, Hash,
-    RoutableTransaction, SignerBitfield, StateProvision, ValidatorId, WaveId, WeightedTimestamp,
+    BlockHash, Bls12381G1PublicKey, Bls12381G2Signature, ExecutionCertificate, ExecutionVote,
+    GlobalReceiptRoot, RoutableTransaction, SignerBitfield, StateProvision, StateRoot, TxHash,
+    ValidatorId, WaveId, WeightedTimestamp,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -24,7 +27,7 @@ use crate::wave_state::WaveState;
 /// identical outcomes (they share the same global_receipt_root).
 pub fn aggregate_execution_certificate(
     wave_id: &WaveId,
-    global_receipt_root: Hash,
+    global_receipt_root: GlobalReceiptRoot,
     votes: &[ExecutionVote],
     committee: &[ValidatorId],
 ) -> ExecutionCertificate {
@@ -189,8 +192,8 @@ pub fn verify_execution_certificate_signature(
 /// reason to execute them.
 pub(crate) fn build_dispatch_action(
     wave: &WaveState,
-    verified_provisions: &HashMap<Hash, Vec<StateProvision>>,
-    block_hash: Hash,
+    verified_provisions: &HashMap<TxHash, Vec<StateProvision>>,
+    block_hash: BlockHash,
 ) -> Option<Action> {
     if wave.wave_id().is_zero() {
         // Single-shard wave: no provisions needed.
@@ -207,7 +210,7 @@ pub(crate) fn build_dispatch_action(
             wave_id: wave.wave_id().clone(),
             block_hash,
             transactions,
-            state_root: Hash::from_bytes(&[0u8; 32]),
+            state_root: StateRoot::ZERO,
         });
     }
 
@@ -268,7 +271,7 @@ mod tests {
         bls_keypair_from_seed(&[seed; 32])
     }
 
-    fn outcome(tx: Hash) -> TxOutcome {
+    fn outcome(tx: TxHash) -> TxOutcome {
         TxOutcome {
             tx_hash: tx,
             outcome: ExecutionOutcome::Executed {
@@ -282,14 +285,14 @@ mod tests {
         voter: ValidatorId,
         sk: &Bls12381G1PrivateKey,
         wid: &WaveId,
-        global_receipt_root: Hash,
+        global_receipt_root: GlobalReceiptRoot,
         anchor: WeightedTimestamp,
         tx_outcomes: Vec<TxOutcome>,
     ) -> ExecutionVote {
         let tx_count = tx_outcomes.len() as u32;
         let msg = exec_vote_message(anchor, wid, shard(), &global_receipt_root, tx_count);
         ExecutionVote {
-            block_hash: Hash::ZERO,
+            block_hash: BlockHash::ZERO,
             block_height: BlockHeight(1),
             vote_anchor_ts_ms: anchor,
             wave_id: wid.clone(),
@@ -315,8 +318,8 @@ mod tests {
             ValidatorId(3),
         ];
         let wid = wave_id(1);
-        let root = Hash::from_bytes(b"root");
-        let tx = Hash::from_bytes(b"tx");
+        let root = GlobalReceiptRoot::from_raw(Hash::from_bytes(b"root"));
+        let tx = TxHash::from_raw(Hash::from_bytes(b"tx"));
         let outcomes = vec![outcome(tx)];
 
         let sk1 = keypair(1);
@@ -352,8 +355,8 @@ mod tests {
     fn aggregate_dedups_votes_from_same_validator() {
         let committee = vec![ValidatorId(0), ValidatorId(1)];
         let wid = wave_id(1);
-        let root = Hash::from_bytes(b"root");
-        let outcomes = vec![outcome(Hash::from_bytes(b"tx"))];
+        let root = GlobalReceiptRoot::from_raw(Hash::from_bytes(b"root"));
+        let outcomes = vec![outcome(TxHash::from_raw(Hash::from_bytes(b"tx")))];
         let sk0 = keypair(0);
 
         // Same voter cast twice.
@@ -385,7 +388,8 @@ mod tests {
     #[test]
     fn aggregate_empty_votes_yields_zero_signature() {
         let committee = vec![ValidatorId(0)];
-        let ec = aggregate_execution_certificate(&wave_id(1), Hash::ZERO, &[], &committee);
+        let ec =
+            aggregate_execution_certificate(&wave_id(1), GlobalReceiptRoot::ZERO, &[], &committee);
         assert_eq!(ec.aggregated_signature, zero_bls_signature());
         assert_eq!(ec.signers.count_ones(), 0);
         assert!(ec.tx_outcomes.is_empty());
@@ -396,8 +400,8 @@ mod tests {
     #[test]
     fn batch_verify_accepts_all_valid_signatures() {
         let wid = wave_id(1);
-        let root = Hash::from_bytes(b"root");
-        let outcomes = vec![outcome(Hash::from_bytes(b"tx"))];
+        let root = GlobalReceiptRoot::from_raw(Hash::from_bytes(b"root"));
+        let outcomes = vec![outcome(TxHash::from_raw(Hash::from_bytes(b"tx")))];
         let sk0 = keypair(0);
         let sk1 = keypair(1);
 
@@ -435,8 +439,8 @@ mod tests {
     #[test]
     fn batch_verify_falls_back_and_drops_individual_bad_signature() {
         let wid = wave_id(1);
-        let root = Hash::from_bytes(b"root");
-        let outcomes = vec![outcome(Hash::from_bytes(b"tx"))];
+        let root = GlobalReceiptRoot::from_raw(Hash::from_bytes(b"root"));
+        let outcomes = vec![outcome(TxHash::from_raw(Hash::from_bytes(b"tx")))];
         let sk0 = keypair(0);
         let sk1 = keypair(1);
         let sk2 = keypair(2);
@@ -448,7 +452,7 @@ mod tests {
             ValidatorId(1),
             &sk1,
             &wid,
-            Hash::from_bytes(b"other"),
+            GlobalReceiptRoot::from_raw(Hash::from_bytes(b"other")),
             WeightedTimestamp(100),
             outcomes.clone(),
         );
@@ -507,8 +511,8 @@ mod tests {
             ValidatorId(3),
         ];
         let wid = wave_id(1);
-        let root = Hash::from_bytes(b"root");
-        let outcomes = vec![outcome(Hash::from_bytes(b"tx"))];
+        let root = GlobalReceiptRoot::from_raw(Hash::from_bytes(b"root"));
+        let outcomes = vec![outcome(TxHash::from_raw(Hash::from_bytes(b"tx")))];
         let sks: Vec<_> = (0..4).map(|i| keypair(i as u8)).collect();
 
         let votes: Vec<ExecutionVote> = (0..4)
@@ -533,8 +537,8 @@ mod tests {
     fn verify_ec_signature_rejects_wrong_public_keys() {
         let committee = vec![ValidatorId(0), ValidatorId(1)];
         let wid = wave_id(1);
-        let root = Hash::from_bytes(b"root");
-        let outcomes = vec![outcome(Hash::from_bytes(b"tx"))];
+        let root = GlobalReceiptRoot::from_raw(Hash::from_bytes(b"root"));
+        let outcomes = vec![outcome(TxHash::from_raw(Hash::from_bytes(b"tx")))];
         let sk0 = keypair(0);
         let sk1 = keypair(1);
 
@@ -574,7 +578,7 @@ mod tests {
                 (Arc::new(test_transaction(*s)), participating)
             })
             .collect();
-        WaveState::new(wave_id(0), Hash::ZERO, WeightedTimestamp(0), txs, true)
+        WaveState::new(wave_id(0), BlockHash::ZERO, WeightedTimestamp(0), txs, true)
     }
 
     fn cross_shard_wave_with(tx_seeds: &[u8], remote: ShardGroupId) -> WaveState {
@@ -589,7 +593,7 @@ mod tests {
             .collect();
         WaveState::new(
             cross_shard_wave_id(1, &[remote]),
-            Hash::ZERO,
+            BlockHash::ZERO,
             WeightedTimestamp(0),
             txs,
             false,
@@ -601,7 +605,7 @@ mod tests {
         let wave = single_shard_wave_with(&[1, 2]);
         let provisions = HashMap::new();
 
-        let action = build_dispatch_action(&wave, &provisions, Hash::ZERO);
+        let action = build_dispatch_action(&wave, &provisions, BlockHash::ZERO);
         match action {
             Some(Action::ExecuteTransactions { transactions, .. }) => {
                 assert_eq!(transactions.len(), 2);
@@ -615,7 +619,7 @@ mod tests {
         let wave = cross_shard_wave_with(&[1], ShardGroupId(1));
         let provisions = HashMap::new();
 
-        assert!(build_dispatch_action(&wave, &provisions, Hash::ZERO).is_none());
+        assert!(build_dispatch_action(&wave, &provisions, BlockHash::ZERO).is_none());
     }
 
     #[test]
@@ -634,7 +638,7 @@ mod tests {
             }],
         );
 
-        let action = build_dispatch_action(&wave, &provisions, Hash::ZERO);
+        let action = build_dispatch_action(&wave, &provisions, BlockHash::ZERO);
         match action {
             Some(Action::ExecuteCrossShardTransactions { requests, .. }) => {
                 assert_eq!(requests.len(), 1);
@@ -650,7 +654,7 @@ mod tests {
         let aborted = wave.tx_hashes()[0];
         wave.record_abort(aborted, WeightedTimestamp(0));
 
-        let action = build_dispatch_action(&wave, &HashMap::new(), Hash::ZERO);
+        let action = build_dispatch_action(&wave, &HashMap::new(), BlockHash::ZERO);
         match action {
             Some(Action::ExecuteTransactions { transactions, .. }) => {
                 assert_eq!(transactions.len(), 1);
@@ -666,6 +670,6 @@ mod tests {
         let aborted = wave.tx_hashes()[0];
         wave.record_abort(aborted, WeightedTimestamp(0));
 
-        assert!(build_dispatch_action(&wave, &HashMap::new(), Hash::ZERO).is_none());
+        assert!(build_dispatch_action(&wave, &HashMap::new(), BlockHash::ZERO).is_none());
     }
 }

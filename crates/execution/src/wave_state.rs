@@ -24,10 +24,13 @@
 //!    `add_execution_certificate`. When every tx is covered (or aborted, which
 //!    is terminal-covered), the wave is complete and ready for finalization.
 
+#[cfg(test)]
+use hyperscale_types::Hash;
 use hyperscale_types::{
-    compute_execution_receipt_root, BlockHeight, ExecutionCertificate, ExecutionOutcome, Hash,
-    ReceiptBundle, RoutableTransaction, ShardGroupId, TransactionDecision, TxOutcome,
-    WaveCertificate, WaveId, WeightedTimestamp, WAVE_TIMEOUT,
+    compute_execution_receipt_root, BlockHash, BlockHeight, ExecutionCertificate,
+    ExecutionCertificateHash, ExecutionOutcome, GlobalReceiptRoot, ReceiptBundle,
+    RoutableTransaction, ShardGroupId, TransactionDecision, TxHash, TxOutcome, WaveCertificate,
+    WaveId, WeightedTimestamp, WAVE_TIMEOUT,
 };
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -44,19 +47,19 @@ pub const WAVE_OVERDUE_WARN: Duration = Duration::from_secs(WAVE_TIMEOUT.as_secs
 pub struct WaveState {
     // ── Identity ────────────────────────────────────────────────────────
     wave_id: WaveId,
-    block_hash: Hash,
+    block_hash: BlockHash,
 
     // ── Tx layout (in block order) ──────────────────────────────────────
-    tx_hashes: Vec<Hash>,
+    tx_hashes: Vec<TxHash>,
     /// Participating shards per tx — the shards whose ECs must cover each tx
     /// for completion. Always includes local shard; cross-shard txs include
     /// remote shards too.
-    participating_shards: HashMap<Hash, BTreeSet<ShardGroupId>>,
+    participating_shards: HashMap<TxHash, BTreeSet<ShardGroupId>>,
     /// O(1) membership check (mirrors `tx_hashes`).
-    tx_hash_set: HashSet<Hash>,
+    tx_hash_set: HashSet<TxHash>,
     /// Transactions owned by the wave, used to build execution requests at
     /// dispatch time.
-    transactions: HashMap<Hash, Arc<RoutableTransaction>>,
+    transactions: HashMap<TxHash, Arc<RoutableTransaction>>,
 
     /// BFT-authenticated weighted timestamp of the wave-starting block.
     /// Anchor for wave-level wall-clock timeouts (wave abort, vote anchor
@@ -65,10 +68,10 @@ pub struct WaveState {
 
     // ── Provisioning phase ──────────────────────────────────────────────
     /// Txs whose required remote-shard provisions have all arrived.
-    provisioned_txs: HashSet<Hash>,
+    provisioned_txs: HashSet<TxHash>,
     /// Per-tx earliest ready timestamp. `all_provisioned_at_ts_ms` is
     /// the max across this map — deterministic regardless of call order.
-    provisioned_tx_ts_ms: HashMap<Hash, WeightedTimestamp>,
+    provisioned_tx_ts_ms: HashMap<TxHash, WeightedTimestamp>,
     /// The weighted timestamp at which every tx in the wave became
     /// ready. `None` until `provisioned_txs` is full.
     all_provisioned_at_ts_ms: Option<WeightedTimestamp>,
@@ -78,16 +81,16 @@ pub struct WaveState {
 
     // ── Local execution outputs ─────────────────────────────────────────
     /// Execution results from the engine (per-tx). Non-abort outcomes only.
-    execution_results: HashMap<Hash, ExecutionOutcome>,
+    execution_results: HashMap<TxHash, ExecutionOutcome>,
     /// Local receipts from the engine, one per executed tx. Drained into the
     /// `FinalizedWave` at finalization via `take_receipt`. Scoping these to
     /// the wave (rather than a process-wide cache) prevents a receipt from a
     /// locally-executed tx from leaking into a `FinalizedWave` whose EC later
     /// attests that tx as `Aborted` — the `ExtraReceipt` race.
-    execution_receipts: HashMap<Hash, ReceiptBundle>,
+    execution_receipts: HashMap<TxHash, ReceiptBundle>,
     /// Explicit aborts from `ConflictDetector`. Distinct from remote-reported
     /// aborts in `tracker_aborted` — these are local pre-vote decisions.
-    explicit_aborts: HashSet<Hash>,
+    explicit_aborts: HashSet<TxHash>,
     /// Whether the local vote has been emitted (`build_vote_data` called once).
     voted: bool,
     /// Whether the local EC has been added to `execution_certificates`. Gates
@@ -100,16 +103,16 @@ pub struct WaveState {
 
     // ── Cross-shard EC collection ───────────────────────────────────────
     /// Per-tx, which shards have reported via an EC.
-    covered_shards: HashMap<Hash, BTreeSet<ShardGroupId>>,
+    covered_shards: HashMap<TxHash, BTreeSet<ShardGroupId>>,
     /// Per-tx, whether any shard's EC reported abort. Terminal — an aborted tx
     /// doesn't require further remote coverage.
-    tracker_aborted: HashSet<Hash>,
+    tracker_aborted: HashSet<TxHash>,
     /// Per-tx, whether any shard's EC reported a non-success outcome.
-    tx_has_failure: HashSet<Hash>,
+    tx_has_failure: HashSet<TxHash>,
     /// All collected ECs (local + remote).
     execution_certificates: Vec<Arc<ExecutionCertificate>>,
     /// Deduplication of received ECs by canonical hash.
-    seen_ec_hashes: HashSet<Hash>,
+    seen_ec_hashes: HashSet<ExecutionCertificateHash>,
 }
 
 impl WaveState {
@@ -121,17 +124,17 @@ impl WaveState {
     /// wave-starting block's height/timestamp immediately.
     pub fn new(
         wave_id: WaveId,
-        block_hash: Hash,
+        block_hash: BlockHash,
         wave_start_ts_ms: WeightedTimestamp,
         txs: Vec<(Arc<RoutableTransaction>, BTreeSet<ShardGroupId>)>,
         single_shard: bool,
     ) -> Self {
-        let mut tx_hashes: Vec<Hash> = Vec::with_capacity(txs.len());
-        let mut transactions: HashMap<Hash, Arc<RoutableTransaction>> =
+        let mut tx_hashes: Vec<TxHash> = Vec::with_capacity(txs.len());
+        let mut transactions: HashMap<TxHash, Arc<RoutableTransaction>> =
             HashMap::with_capacity(txs.len());
-        let mut participating_shards: HashMap<Hash, BTreeSet<ShardGroupId>> =
+        let mut participating_shards: HashMap<TxHash, BTreeSet<ShardGroupId>> =
             HashMap::with_capacity(txs.len());
-        let mut covered_shards: HashMap<Hash, BTreeSet<ShardGroupId>> =
+        let mut covered_shards: HashMap<TxHash, BTreeSet<ShardGroupId>> =
             HashMap::with_capacity(txs.len());
 
         for (tx, shards) in txs {
@@ -142,11 +145,11 @@ impl WaveState {
             covered_shards.insert(h, BTreeSet::new());
         }
 
-        let tx_hash_set: HashSet<Hash> = tx_hashes.iter().copied().collect();
+        let tx_hash_set: HashSet<TxHash> = tx_hashes.iter().copied().collect();
 
         // Single-shard waves are trivially provisioned at creation.
         let (provisioned_txs, provisioned_tx_ts_ms, all_provisioned_at_ts_ms) = if single_shard {
-            let ts_map: HashMap<Hash, WeightedTimestamp> =
+            let ts_map: HashMap<TxHash, WeightedTimestamp> =
                 tx_hashes.iter().map(|h| (*h, wave_start_ts_ms)).collect();
             (tx_hash_set.clone(), ts_map, Some(wave_start_ts_ms))
         } else {
@@ -185,7 +188,7 @@ impl WaveState {
         &self.wave_id
     }
 
-    pub fn block_hash(&self) -> Hash {
+    pub fn block_hash(&self) -> BlockHash {
         self.block_hash
     }
 
@@ -193,12 +196,12 @@ impl WaveState {
         self.wave_id.block_height
     }
 
-    pub fn tx_hashes(&self) -> &[Hash] {
+    pub fn tx_hashes(&self) -> &[TxHash] {
         &self.tx_hashes
     }
 
     /// Transaction data by hash (for building execution requests).
-    pub fn transaction(&self, tx_hash: &Hash) -> Option<&Arc<RoutableTransaction>> {
+    pub fn transaction(&self, tx_hash: &TxHash) -> Option<&Arc<RoutableTransaction>> {
         self.transactions.get(tx_hash)
     }
 
@@ -238,7 +241,7 @@ impl WaveState {
     /// Returns `true` iff this call transitioned the wave from "partial" to
     /// "all provisioned" — the caller uses that signal to emit the single
     /// per-wave execution dispatch action.
-    pub fn mark_tx_provisioned(&mut self, tx_hash: Hash, at_ts_ms: WeightedTimestamp) -> bool {
+    pub fn mark_tx_provisioned(&mut self, tx_hash: TxHash, at_ts_ms: WeightedTimestamp) -> bool {
         if !self.tx_hash_set.contains(&tx_hash) {
             return false;
         }
@@ -272,7 +275,7 @@ impl WaveState {
     /// Record an execution outcome from the engine. First-write-wins.
     /// Returns `true` if the wave now has an outcome (execution result or
     /// explicit abort) for every tx.
-    pub fn record_execution_result(&mut self, tx_hash: Hash, outcome: ExecutionOutcome) -> bool {
+    pub fn record_execution_result(&mut self, tx_hash: TxHash, outcome: ExecutionOutcome) -> bool {
         if !self.tx_hash_set.contains(&tx_hash) {
             return false;
         }
@@ -308,7 +311,7 @@ impl WaveState {
     /// is expected; for a non-aborted outcome it indicates the
     /// `has_local_receipts_for_non_aborted` gate was bypassed, which would
     /// be a bug.
-    pub fn take_receipt(&mut self, tx_hash: &Hash) -> Option<ReceiptBundle> {
+    pub fn take_receipt(&mut self, tx_hash: &TxHash) -> Option<ReceiptBundle> {
         self.execution_receipts.remove(tx_hash)
     }
 
@@ -329,7 +332,7 @@ impl WaveState {
     /// never arrive. Without this, a single aborted tx forced the wave into
     /// the timeout branch, which then marked every tx Aborted (including the
     /// ones that executed successfully).
-    pub fn record_abort(&mut self, tx_hash: Hash, committed_at_ts_ms: WeightedTimestamp) -> bool {
+    pub fn record_abort(&mut self, tx_hash: TxHash, committed_at_ts_ms: WeightedTimestamp) -> bool {
         if self.dispatched || !self.tx_hash_set.contains(&tx_hash) {
             return false;
         }
@@ -411,7 +414,7 @@ impl WaveState {
     pub fn build_vote_data(
         &mut self,
         committed_ts_ms: WeightedTimestamp,
-    ) -> Option<(WeightedTimestamp, Hash, Vec<TxOutcome>)> {
+    ) -> Option<(WeightedTimestamp, GlobalReceiptRoot, Vec<TxOutcome>)> {
         if !self.can_emit_vote(committed_ts_ms) {
             return None;
         }
@@ -519,7 +522,7 @@ impl WaveState {
     /// Whether a tx was aborted before dispatch (pre-dispatch reverse-conflict).
     /// Used by dispatch to skip executing txs the wave has already decided to
     /// abort.
-    pub fn is_tx_explicitly_aborted(&self, tx_hash: &Hash) -> bool {
+    pub fn is_tx_explicitly_aborted(&self, tx_hash: &TxHash) -> bool {
         self.explicit_aborts.contains(tx_hash)
     }
 
@@ -597,7 +600,7 @@ impl WaveState {
     ///
     /// Callers should invoke only when `is_complete()` is true.
     pub fn create_wave_certificate(&self) -> WaveCertificate {
-        let required_remote_ec_hashes: HashSet<Hash> = self
+        let required_remote_ec_hashes: HashSet<ExecutionCertificateHash> = self
             .execution_certificates
             .iter()
             .filter(|ec| ec.wave_id != self.wave_id)
@@ -633,7 +636,7 @@ impl WaveState {
 
     /// Per-tx terminal decisions derived from collected ECs.
     /// Priority: Aborted > Reject > Accept.
-    pub fn tx_decisions(&self) -> Vec<(Hash, TransactionDecision)> {
+    pub fn tx_decisions(&self) -> Vec<(TxHash, TransactionDecision)> {
         self.tx_hashes
             .iter()
             .map(|tx_hash| {
@@ -682,7 +685,7 @@ mod tests {
             .collect();
         WaveState::new(
             WaveId::new(ShardGroupId(0), WAVE_START, BTreeSet::new()),
-            Hash::from_bytes(b"block"),
+            BlockHash::from_raw(Hash::from_bytes(b"block")),
             ts_for(WAVE_START),
             txs,
             true,
@@ -699,7 +702,7 @@ mod tests {
                 WAVE_START,
                 BTreeSet::from([ShardGroupId(1)]),
             ),
-            Hash::from_bytes(b"block"),
+            BlockHash::from_raw(Hash::from_bytes(b"block")),
             ts_for(WAVE_START),
             txs,
             false,
@@ -716,7 +719,7 @@ mod tests {
     fn make_ec(
         wave_id: &WaveId,
         ec_shard: ShardGroupId,
-        tx_hashes: &[Hash],
+        tx_hashes: &[TxHash],
         success: bool,
     ) -> Arc<ExecutionCertificate> {
         let outcomes: Vec<TxOutcome> = tx_hashes
@@ -738,7 +741,7 @@ mod tests {
         Arc::new(ExecutionCertificate::new(
             ec_wave_id,
             WeightedTimestamp(wave_id.block_height.0 + 1),
-            Hash::from_bytes(b"global_receipt_root"),
+            GlobalReceiptRoot::from_raw(Hash::from_bytes(b"global_receipt_root")),
             outcomes,
             Bls12381G2Signature([0u8; 96]),
             SignerBitfield::new(4),
@@ -1043,14 +1046,15 @@ mod tests {
         let ec_remote = Arc::new(ExecutionCertificate::new(
             ec_wave_id,
             WeightedTimestamp(w.wave_id().block_height.0 + 1),
-            Hash::from_bytes(b"gr"),
+            GlobalReceiptRoot::from_raw(Hash::from_bytes(b"gr")),
             std::mem::take(&mut outcomes),
             Bls12381G2Signature([0u8; 96]),
             SignerBitfield::new(4),
         ));
         w.add_execution_certificate(ec_remote);
 
-        let decisions: HashMap<Hash, TransactionDecision> = w.tx_decisions().into_iter().collect();
+        let decisions: HashMap<TxHash, TransactionDecision> =
+            w.tx_decisions().into_iter().collect();
         assert_eq!(decisions[&h1], TransactionDecision::Aborted);
         assert_eq!(decisions[&h2], TransactionDecision::Reject);
         assert_eq!(decisions[&h0], TransactionDecision::Accept);

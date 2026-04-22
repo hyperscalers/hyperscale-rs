@@ -10,7 +10,7 @@ use axum::{
 };
 use hyperscale_core::{NodeInput, TransactionStatus};
 use hyperscale_metrics as metrics;
-use hyperscale_types::{Hash, RoutableTransaction, TransactionDecision};
+use hyperscale_types::{Hash, RoutableTransaction, TransactionDecision, TxHash};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -285,7 +285,7 @@ pub async fn get_transaction_handler(
 ) -> impl IntoResponse {
     // Parse the hash from hex (expects the raw hash bytes, not data to hash)
     let tx_hash = match Hash::from_hex(&hash_hex) {
-        Ok(hash) => hash,
+        Ok(hash) => TxHash::from_raw(hash),
         Err(_) => {
             return (
                 StatusCode::BAD_REQUEST,
@@ -597,8 +597,8 @@ mod tests {
     async fn test_get_transaction_found() {
         let state = create_test_state();
         // Create a hash from some input bytes
-        let tx_hash = Hash::from_bytes(&[0x12; 32]);
-        let tx_hash_hex = hex::encode(tx_hash.as_bytes());
+        let tx_hash = TxHash::from_raw(Hash::from_bytes(&[0x12; 32]));
+        let tx_hash_hex = hex::encode(tx_hash.as_raw().as_bytes());
 
         // Insert a transaction into the cache
         state

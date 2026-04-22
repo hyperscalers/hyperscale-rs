@@ -48,7 +48,7 @@ impl NetworkMessage for CommittedBlockHeaderGossip {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_types::ProposerTimestamp;
+    use hyperscale_types::{BlockHash, ProposerTimestamp};
 
     use super::*;
 
@@ -63,25 +63,26 @@ mod tests {
     #[test]
     fn test_sbor_roundtrip() {
         use hyperscale_types::{
-            zero_bls_signature, BlockHeader, BlockHeight, Hash, QuorumCertificate, Round,
-            ShardGroupId, ValidatorId,
+            zero_bls_signature, BlockHeader, BlockHeight, CertificateRoot, Hash, LocalReceiptRoot,
+            ProvisionsRoot, QuorumCertificate, Round, ShardGroupId, StateRoot, TransactionRoot,
+            ValidatorId,
         };
         use std::collections::BTreeMap;
 
         let header = BlockHeader {
             shard_group_id: ShardGroupId(1),
             height: BlockHeight(42),
-            parent_hash: Hash::from_bytes(b"parent"),
+            parent_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(0),
             timestamp: ProposerTimestamp(1234567890),
             round: Round::INITIAL,
             is_fallback: false,
-            state_root: Hash::ZERO,
-            transaction_root: Hash::ZERO,
-            certificate_root: Hash::ZERO,
-            local_receipt_root: Hash::ZERO,
-            provision_root: Hash::ZERO,
+            state_root: StateRoot::ZERO,
+            transaction_root: TransactionRoot::ZERO,
+            certificate_root: CertificateRoot::ZERO,
+            local_receipt_root: LocalReceiptRoot::ZERO,
+            provision_root: ProvisionsRoot::ZERO,
             waves: vec![],
             provision_tx_roots: BTreeMap::new(),
             in_flight: 0,

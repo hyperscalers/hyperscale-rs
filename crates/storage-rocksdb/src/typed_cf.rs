@@ -466,16 +466,18 @@ impl DbCodec<BlockHeight> for BlockHeightCodec {
 #[derive(Default)]
 pub(crate) struct JmtMetadataCodec;
 
-impl DbCodec<(u64, hyperscale_types::Hash)> for JmtMetadataCodec {
-    fn encode_to(&self, value: &(u64, hyperscale_types::Hash), buf: &mut Vec<u8>) {
+impl DbCodec<(u64, hyperscale_types::StateRoot)> for JmtMetadataCodec {
+    fn encode_to(&self, value: &(u64, hyperscale_types::StateRoot), buf: &mut Vec<u8>) {
         buf.extend_from_slice(&value.0.to_be_bytes());
-        buf.extend_from_slice(&value.1.to_bytes());
+        buf.extend_from_slice(&value.1.as_raw().to_bytes());
     }
 
-    fn decode(&self, bytes: &[u8]) -> (u64, hyperscale_types::Hash) {
+    fn decode(&self, bytes: &[u8]) -> (u64, hyperscale_types::StateRoot) {
         assert!(bytes.len() == 40, "jmt:metadata must be 40 bytes");
         let version = u64::from_be_bytes(bytes[..8].try_into().unwrap());
-        let root_hash = hyperscale_types::Hash::from_hash_bytes(&bytes[8..40]);
+        let root_hash = hyperscale_types::StateRoot::from_raw(
+            hyperscale_types::Hash::from_hash_bytes(&bytes[8..40]),
+        );
         (version, root_hash)
     }
 }
@@ -506,6 +508,6 @@ impl MetadataEntry for CommittedQcEntry {
 pub(crate) struct JmtMetadataEntry;
 impl MetadataEntry for JmtMetadataEntry {
     const KEY: &'static [u8] = b"jmt:metadata";
-    type Value = (u64, hyperscale_types::Hash);
+    type Value = (u64, hyperscale_types::StateRoot);
     type Codec = JmtMetadataCodec;
 }

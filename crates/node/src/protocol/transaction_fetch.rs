@@ -15,7 +15,9 @@ use hyperscale_messages::request::GetTransactionsRequest;
 use hyperscale_messages::response::GetTransactionsResponse;
 use hyperscale_metrics as metrics;
 use hyperscale_storage::ChainReader;
-use hyperscale_types::{Hash, RoutableTransaction, ValidatorId};
+#[cfg(test)]
+use hyperscale_types::Hash;
+use hyperscale_types::{BlockHash, RoutableTransaction, TxHash, ValidatorId};
 use quick_cache::sync::Cache as QuickCache;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashSet};
@@ -59,19 +61,22 @@ pub struct TransactionFetchStatus {
 pub enum TransactionFetchInput {
     /// Request transactions for a pending block.
     RequestTransactions {
-        block_hash: Hash,
+        block_hash: BlockHash,
         proposer: ValidatorId,
-        tx_hashes: Vec<Hash>,
+        tx_hashes: Vec<TxHash>,
     },
     /// Transactions were received for a block.
     TransactionsReceived {
-        block_hash: Hash,
+        block_hash: BlockHash,
         transactions: Vec<Arc<RoutableTransaction>>,
     },
     /// A fetch operation failed.
-    FetchFailed { block_hash: Hash, hashes: Vec<Hash> },
+    FetchFailed {
+        block_hash: BlockHash,
+        hashes: Vec<TxHash>,
+    },
     /// Cancel fetch for a specific block.
-    CancelFetch { block_hash: Hash },
+    CancelFetch { block_hash: BlockHash },
     /// Tick: spawn pending fetch operations.
     Tick,
 }
@@ -81,13 +86,13 @@ pub enum TransactionFetchInput {
 pub enum TransactionFetchOutput {
     /// Request the runner to fetch transactions.
     FetchTransactions {
-        block_hash: Hash,
+        block_hash: BlockHash,
         proposer: ValidatorId,
-        tx_hashes: Vec<Hash>,
+        tx_hashes: Vec<TxHash>,
     },
     /// Deliver fetched transactions to BFT.
     DeliverTransactions {
-        block_hash: Hash,
+        block_hash: BlockHash,
         transactions: Vec<Arc<RoutableTransaction>>,
     },
 }
@@ -96,14 +101,14 @@ pub enum TransactionFetchOutput {
 #[derive(Debug)]
 struct BlockFetchState {
     proposer: ValidatorId,
-    missing_hashes: HashSet<Hash>,
-    in_flight_hashes: HashSet<Hash>,
-    received_hashes: HashSet<Hash>,
+    missing_hashes: HashSet<TxHash>,
+    in_flight_hashes: HashSet<TxHash>,
+    received_hashes: HashSet<TxHash>,
     in_flight_count: usize,
 }
 
 impl BlockFetchState {
-    fn new(proposer: ValidatorId, hashes: Vec<Hash>) -> Self {
+    fn new(proposer: ValidatorId, hashes: Vec<TxHash>) -> Self {
         Self {
             proposer,
             missing_hashes: hashes.into_iter().collect(),
@@ -117,21 +122,21 @@ impl BlockFetchState {
         self.missing_hashes.is_empty() && self.in_flight_hashes.is_empty()
     }
 
-    fn hashes_to_fetch(&self) -> Vec<Hash> {
+    fn hashes_to_fetch(&self) -> Vec<TxHash> {
         self.missing_hashes
             .difference(&self.in_flight_hashes)
             .copied()
             .collect()
     }
 
-    fn mark_in_flight(&mut self, hashes: &[Hash]) {
+    fn mark_in_flight(&mut self, hashes: &[TxHash]) {
         for hash in hashes {
             self.in_flight_hashes.insert(*hash);
         }
         self.in_flight_count += 1;
     }
 
-    fn mark_received(&mut self, hashes: impl IntoIterator<Item = Hash>) {
+    fn mark_received(&mut self, hashes: impl IntoIterator<Item = TxHash>) {
         for hash in hashes {
             self.missing_hashes.remove(&hash);
             self.in_flight_hashes.remove(&hash);
@@ -139,11 +144,11 @@ impl BlockFetchState {
         }
     }
 
-    fn was_received(&self, hash: &Hash) -> bool {
+    fn was_received(&self, hash: &TxHash) -> bool {
         self.received_hashes.contains(hash)
     }
 
-    fn mark_fetch_failed(&mut self, hashes: &[Hash]) {
+    fn mark_fetch_failed(&mut self, hashes: &[TxHash]) {
         for hash in hashes {
             self.in_flight_hashes.remove(hash);
         }
@@ -157,7 +162,7 @@ impl BlockFetchState {
     /// Move any in-flight hashes that weren't received back to missing.
     fn reclaim_unreceived(&mut self) {
         if self.in_flight_count == 0 && !self.in_flight_hashes.is_empty() {
-            let stuck: Vec<Hash> = self
+            let stuck: Vec<TxHash> = self
                 .in_flight_hashes
                 .iter()
                 .filter(|h| !self.received_hashes.contains(h))
@@ -174,7 +179,7 @@ impl BlockFetchState {
 /// Fetch protocol state machine.
 pub struct TransactionFetchProtocol {
     config: TransactionFetchConfig,
-    tx_fetches: BTreeMap<Hash, BlockFetchState>,
+    tx_fetches: BTreeMap<BlockHash, BlockFetchState>,
 }
 
 impl TransactionFetchProtocol {
@@ -226,9 +231,9 @@ impl TransactionFetchProtocol {
 
     fn handle_request_transactions(
         &mut self,
-        block_hash: Hash,
+        block_hash: BlockHash,
         proposer: ValidatorId,
-        tx_hashes: Vec<Hash>,
+        tx_hashes: Vec<TxHash>,
     ) -> Vec<TransactionFetchOutput> {
         if tx_hashes.is_empty() {
             return vec![];
@@ -258,7 +263,7 @@ impl TransactionFetchProtocol {
 
     fn handle_transactions_received(
         &mut self,
-        block_hash: Hash,
+        block_hash: BlockHash,
         transactions: Vec<Arc<RoutableTransaction>>,
     ) -> Vec<TransactionFetchOutput> {
         let Some(state) = self.tx_fetches.get_mut(&block_hash) else {
@@ -268,7 +273,7 @@ impl TransactionFetchProtocol {
 
         state.mark_fetch_complete();
 
-        let received_hashes: Vec<Hash> = transactions.iter().map(|tx| tx.hash()).collect();
+        let received_hashes: Vec<TxHash> = transactions.iter().map(|tx| tx.hash()).collect();
         let received_count = received_hashes.len();
         state.mark_received(received_hashes);
         state.reclaim_unreceived();
@@ -301,8 +306,8 @@ impl TransactionFetchProtocol {
 
     fn handle_fetch_failed(
         &mut self,
-        block_hash: Hash,
-        hashes: Vec<Hash>,
+        block_hash: BlockHash,
+        hashes: Vec<TxHash>,
     ) -> Vec<TransactionFetchOutput> {
         if let Some(state) = self.tx_fetches.get_mut(&block_hash) {
             state.mark_fetch_failed(&hashes);
@@ -361,7 +366,7 @@ const MAX_ITEMS_PER_RESPONSE: usize = 500;
 /// committed transactions), then falls back to storage.
 pub fn serve_transaction_request(
     storage: &impl ChainReader,
-    tx_cache: &QuickCache<Hash, Arc<RoutableTransaction>>,
+    tx_cache: &QuickCache<TxHash, Arc<RoutableTransaction>>,
     req: GetTransactionsRequest,
 ) -> GetTransactionsResponse {
     let requested_count = req.tx_hashes.len();
@@ -421,10 +426,10 @@ mod tests {
     #[test]
     fn test_request_and_tick() {
         let mut protocol = TransactionFetchProtocol::new(TransactionFetchConfig::default());
-        let block_hash = Hash::from_bytes(b"test_block");
+        let block_hash = BlockHash::from_raw(Hash::from_bytes(b"test_block"));
         let hashes = vec![
-            Hash::from_bytes(b"tx1_hash_data_here"),
-            Hash::from_bytes(b"tx2_hash_data_here"),
+            TxHash::from_raw(Hash::from_bytes(b"tx1_hash_data_here")),
+            TxHash::from_raw(Hash::from_bytes(b"tx2_hash_data_here")),
         ];
 
         protocol.handle(TransactionFetchInput::RequestTransactions {

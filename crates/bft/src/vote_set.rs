@@ -10,7 +10,7 @@
 //! [`VoteSet::add_verified_vote`] since we just signed them.
 
 use hyperscale_types::{
-    BlockHeader, BlockHeight, BlockVote, Bls12381G1PublicKey, Hash, Round, VotePower,
+    BlockHash, BlockHeader, BlockHeight, BlockVote, Bls12381G1PublicKey, Round, VotePower,
 };
 
 #[cfg(test)]
@@ -23,7 +23,7 @@ use hyperscale_types::QuorumCertificate;
 #[derive(Debug, Clone)]
 pub struct VoteSet {
     /// Block hash being voted on.
-    block_hash: Option<Hash>,
+    block_hash: Option<BlockHash>,
 
     /// Block height.
     height: Option<BlockHeight>,
@@ -32,7 +32,7 @@ pub struct VoteSet {
     round: Option<Round>,
 
     /// Parent block hash (from the block's header).
-    parent_block_hash: Option<Hash>,
+    parent_block_hash: Option<BlockHash>,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Verified votes (passed signature verification)
@@ -220,7 +220,7 @@ impl VoteSet {
     /// Get data needed for verification action.
     ///
     /// Returns (block_hash, height, round, parent_block_hash) or None if not ready.
-    pub fn verification_data(&self) -> Option<(Hash, BlockHeight, Round, Hash)> {
+    pub fn verification_data(&self) -> Option<(BlockHash, BlockHeight, Round, BlockHash)> {
         Some((
             self.block_hash?,
             self.height?,
@@ -311,7 +311,7 @@ impl VoteSet {
     #[cfg(test)]
     pub fn build_qc(
         &mut self,
-        block_hash: Hash,
+        block_hash: BlockHash,
         shard_group_id: hyperscale_types::ShardGroupId,
     ) -> Result<QuorumCertificate, String> {
         use hyperscale_types::{Bls12381G2Signature, SignerBitfield, WeightedTimestamp};
@@ -384,7 +384,8 @@ impl VoteSet {
 mod tests {
     use super::*;
     use hyperscale_types::{
-        generate_bls_keypair, Bls12381G1PrivateKey, QuorumCertificate, ShardGroupId, ValidatorId,
+        generate_bls_keypair, Bls12381G1PrivateKey, CertificateRoot, Hash, LocalReceiptRoot,
+        ProvisionsRoot, QuorumCertificate, ShardGroupId, StateRoot, TransactionRoot, ValidatorId,
     };
 
     fn test_shard_group() -> ShardGroupId {
@@ -395,17 +396,17 @@ mod tests {
         BlockHeader {
             shard_group_id: ShardGroupId(0),
             height,
-            parent_hash: Hash::from_bytes(b"parent"),
+            parent_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(0),
             timestamp: hyperscale_types::ProposerTimestamp(1234567890),
             round: Round::INITIAL,
             is_fallback: false,
-            state_root: Hash::ZERO,
-            transaction_root: Hash::ZERO,
-            certificate_root: Hash::ZERO,
-            local_receipt_root: Hash::ZERO,
-            provision_root: Hash::ZERO,
+            state_root: StateRoot::ZERO,
+            transaction_root: TransactionRoot::ZERO,
+            certificate_root: CertificateRoot::ZERO,
+            local_receipt_root: LocalReceiptRoot::ZERO,
+            provision_root: ProvisionsRoot::ZERO,
             waves: vec![],
             provision_tx_roots: std::collections::BTreeMap::new(),
             in_flight: 0,
@@ -415,7 +416,7 @@ mod tests {
     fn make_vote(
         keys: &[Bls12381G1PrivateKey],
         voter_index: usize,
-        block_hash: Hash,
+        block_hash: BlockHash,
         height: BlockHeight,
     ) -> BlockVote {
         BlockVote::new(

@@ -4,7 +4,7 @@ use crate::core::SimStorage;
 use crate::snapshot::SimSnapshot;
 
 use hyperscale_storage::{DbSortKey, SubstateStore, VersionedStore};
-use hyperscale_types::{BlockHeight, Hash, NodeId};
+use hyperscale_types::{BlockHeight, NodeId, StateRoot};
 
 impl SubstateStore for SimStorage {
     type Snapshot<'a> = SimSnapshot;
@@ -19,7 +19,7 @@ impl SubstateStore for SimStorage {
         self.state.read().unwrap().current_block_height
     }
 
-    fn state_root_hash(&self) -> Hash {
+    fn state_root_hash(&self) -> StateRoot {
         self.state.read().unwrap().current_root_hash
     }
 

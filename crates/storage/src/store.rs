@@ -2,7 +2,7 @@
 //!
 //! This module defines the storage abstraction used by runners to persist Radix state.
 
-use hyperscale_types::{BlockHeight, Hash, MerkleInclusionProof, NodeId};
+use hyperscale_types::{BlockHeight, MerkleInclusionProof, NodeId, StateRoot};
 use radix_substate_store_interface::interface::{DbSortKey, SubstateDatabase};
 
 /// Extension trait for substate storage with snapshots, node listing, and JMT state roots.
@@ -58,7 +58,7 @@ pub trait SubstateStore: SubstateDatabase + Send + Sync + 'static {
     /// for state sync, light client proofs, and cross-validator consistency checks.
     ///
     /// Returns a zero hash if no commits have occurred.
-    fn state_root_hash(&self) -> Hash;
+    fn state_root_hash(&self) -> StateRoot;
 
     /// List all substates for a node at a specific historical block height.
     ///

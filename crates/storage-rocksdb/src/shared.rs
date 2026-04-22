@@ -17,8 +17,8 @@ use hyperscale_storage::{
     SubstateStore,
 };
 use hyperscale_types::{
-    BlockHeight, CertifiedBlock, Hash, NodeId, QuorumCertificate, RoutableTransaction,
-    ShardGroupId, WaveCertificate,
+    BlockHash, BlockHeight, CertifiedBlock, ExecutionCertificateHash, Hash, NodeId,
+    QuorumCertificate, RoutableTransaction, ShardGroupId, StateRoot, TxHash, WaveCertificate,
 };
 use std::sync::Arc;
 
@@ -96,7 +96,7 @@ impl SubstateStore for SharedStorage {
         self.0.jmt_height()
     }
 
-    fn state_root_hash(&self) -> hyperscale_types::Hash {
+    fn state_root_hash(&self) -> hyperscale_types::StateRoot {
         self.0.state_root_hash()
     }
 
@@ -146,13 +146,13 @@ impl hyperscale_storage::ChainWriter for SharedStorage {
 
     fn prepare_block_commit(
         &self,
-        parent_state_root: Hash,
+        parent_state_root: StateRoot,
         parent_block_height: BlockHeight,
         finalized_waves: &[std::sync::Arc<hyperscale_types::FinalizedWave>],
         block_height: BlockHeight,
         pending_snapshots: &[std::sync::Arc<hyperscale_storage::JmtSnapshot>],
         base_reads: Option<&hyperscale_storage::BaseReadCache>,
-    ) -> (Hash, Self::PreparedCommit) {
+    ) -> (StateRoot, Self::PreparedCommit) {
         self.0.prepare_block_commit(
             parent_state_root,
             parent_block_height,
@@ -170,7 +170,7 @@ impl hyperscale_storage::ChainWriter for SharedStorage {
             Arc<hyperscale_types::Block>,
             Arc<hyperscale_types::QuorumCertificate>,
         )>,
-    ) -> Vec<hyperscale_types::Hash> {
+    ) -> Vec<hyperscale_types::StateRoot> {
         self.0.commit_prepared_blocks(blocks)
     }
 
@@ -178,7 +178,7 @@ impl hyperscale_storage::ChainWriter for SharedStorage {
         &self,
         block: &Arc<hyperscale_types::Block>,
         qc: &Arc<hyperscale_types::QuorumCertificate>,
-    ) -> hyperscale_types::Hash {
+    ) -> hyperscale_types::StateRoot {
         self.0.commit_block(block, qc)
     }
 
@@ -196,7 +196,7 @@ impl hyperscale_storage::ChainReader for SharedStorage {
         self.0.committed_height()
     }
 
-    fn committed_hash(&self) -> Option<Hash> {
+    fn committed_hash(&self) -> Option<BlockHash> {
         self.0.committed_hash()
     }
 
@@ -208,7 +208,7 @@ impl hyperscale_storage::ChainReader for SharedStorage {
         hyperscale_storage::ChainReader::get_block_for_sync(&*self.0, height)
     }
 
-    fn get_transactions_batch(&self, hashes: &[Hash]) -> Vec<RoutableTransaction> {
+    fn get_transactions_batch(&self, hashes: &[TxHash]) -> Vec<RoutableTransaction> {
         self.0.get_transactions_batch(hashes)
     }
 
@@ -216,7 +216,7 @@ impl hyperscale_storage::ChainReader for SharedStorage {
         self.0.get_certificates_batch(hashes)
     }
 
-    fn get_local_receipt(&self, tx_hash: &Hash) -> Option<Arc<hyperscale_types::LocalReceipt>> {
+    fn get_local_receipt(&self, tx_hash: &TxHash) -> Option<Arc<hyperscale_types::LocalReceipt>> {
         self.0.get_local_receipt(tx_hash)
     }
 
@@ -227,11 +227,14 @@ impl hyperscale_storage::ChainReader for SharedStorage {
         self.0.get_execution_certificates_by_height(block_height)
     }
 
-    fn get_wave_certificate_for_tx(&self, tx_hash: &Hash) -> Option<WaveCertificate> {
+    fn get_wave_certificate_for_tx(&self, tx_hash: &TxHash) -> Option<WaveCertificate> {
         self.0.get_wave_certificate_for_tx(tx_hash)
     }
 
-    fn get_ec_hashes_for_tx(&self, tx_hash: &Hash) -> Option<Vec<(ShardGroupId, Hash)>> {
+    fn get_ec_hashes_for_tx(
+        &self,
+        tx_hash: &TxHash,
+    ) -> Option<Vec<(ShardGroupId, ExecutionCertificateHash)>> {
         self.0.get_ec_hashes_for_tx(tx_hash)
     }
 }

@@ -15,7 +15,9 @@ use hyperscale_engine::Engine;
 use hyperscale_metrics as metrics;
 use hyperscale_network::Network;
 use hyperscale_storage::{ChainReader, ChainWriter, SubstateStore};
-use hyperscale_types::{Block, BlockHeight, CertifiedBlock, Hash, QuorumCertificate, ValidatorId};
+use hyperscale_types::{
+    Block, BlockHeight, CertifiedBlock, QuorumCertificate, StateRoot, ValidatorId,
+};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tracing::{debug, trace, warn};
@@ -477,7 +479,7 @@ where
         &mut self,
         block: Block,
         qc: QuorumCertificate,
-        parent_state_root: Hash,
+        parent_state_root: StateRoot,
         parent_block_height: BlockHeight,
         source: CommitSource,
     ) {

@@ -16,8 +16,8 @@
 
 use hyperscale_core::Action;
 use hyperscale_types::{
-    BlockHeight, FinalizedWave, Hash, ProposerTimestamp, Provision, Round, RoutableTransaction,
-    TopologySnapshot,
+    BlockHash, BlockHeight, FinalizedWave, Hash, ProposerTimestamp, Provision, Round,
+    RoutableTransaction, TopologySnapshot, TxHash,
 };
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -120,7 +120,7 @@ impl ProposalTracker {
 /// count when it is non-zero.
 pub(crate) fn select_transactions(
     ready_txs: &[Arc<RoutableTransaction>],
-    qc_chain_tx_hashes: &HashSet<Hash>,
+    qc_chain_tx_hashes: &HashSet<TxHash>,
     tx_cache: &CommittedTxCache,
 ) -> Vec<Arc<RoutableTransaction>> {
     let before = ready_txs.len();
@@ -192,7 +192,7 @@ pub(crate) struct BuildActionPlan {
     /// The `BuildProposal` action ready for dispatch.
     pub action: Action,
     /// Parent hash, forwarded to the tracker / verification pipeline.
-    pub parent_hash: Hash,
+    pub parent_hash: BlockHash,
     /// Parent block height, same rationale.
     pub parent_block_height: BlockHeight,
     /// Whether to record leader activity: `Fallback` / `Sync` count as
@@ -307,7 +307,7 @@ pub(crate) fn assemble_build_action(
 pub(crate) fn dispatch_or_defer(
     tracker: &mut ProposalTracker,
     verification: &mut VerificationPipeline,
-    parent_hash: Hash,
+    parent_hash: BlockHash,
     parent_block_height: BlockHeight,
     block_height: BlockHeight,
     round: Round,

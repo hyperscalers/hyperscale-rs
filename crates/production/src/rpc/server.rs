@@ -5,7 +5,7 @@ use super::state::{MempoolSnapshot, NodeStatusState, RpcState, TxSubmissionSende
 use crate::status::SyncStatus;
 use arc_swap::ArcSwap;
 use hyperscale_core::TransactionStatus;
-use hyperscale_types::Hash;
+use hyperscale_types::TxHash;
 use quick_cache::sync::Cache as QuickCache;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -61,7 +61,7 @@ pub struct RpcServerHandle {
     /// Node status provider for updates.
     node_status: Arc<ArcSwap<NodeStatusState>>,
     /// Transaction status cache (shared from IoLoop's QuickCache).
-    tx_status_cache: Arc<QuickCache<Hash, TransactionStatus>>,
+    tx_status_cache: Arc<QuickCache<TxHash, TransactionStatus>>,
     /// Mempool snapshot for updates.
     mempool_snapshot: Arc<ArcSwap<MempoolSnapshot>>,
 }
@@ -83,7 +83,7 @@ impl RpcServerHandle {
     }
 
     /// Get a reference to the transaction status cache.
-    pub fn tx_status_cache(&self) -> &Arc<QuickCache<Hash, TransactionStatus>> {
+    pub fn tx_status_cache(&self) -> &Arc<QuickCache<TxHash, TransactionStatus>> {
         &self.tx_status_cache
     }
 
@@ -120,7 +120,7 @@ impl RpcServer {
     pub fn new(
         config: RpcServerConfig,
         tx_submission_tx: TxSubmissionSender,
-        tx_status_cache: Arc<QuickCache<Hash, TransactionStatus>>,
+        tx_status_cache: Arc<QuickCache<TxHash, TransactionStatus>>,
     ) -> Self {
         let sync_backpressure_threshold = config.sync_backpressure_threshold;
         let state = RpcState {
@@ -147,7 +147,7 @@ impl RpcServer {
         sync_status: Arc<ArcSwap<SyncStatus>>,
         node_status: Arc<ArcSwap<NodeStatusState>>,
         tx_submission_tx: TxSubmissionSender,
-        tx_status_cache: Arc<QuickCache<Hash, TransactionStatus>>,
+        tx_status_cache: Arc<QuickCache<TxHash, TransactionStatus>>,
         mempool_snapshot: Arc<ArcSwap<MempoolSnapshot>>,
     ) -> Self {
         let sync_backpressure_threshold = config.sync_backpressure_threshold;

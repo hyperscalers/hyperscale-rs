@@ -5,8 +5,8 @@ use crate::typed_cf::TypedCf;
 
 use hyperscale_storage::BlockForSync;
 use hyperscale_types::{
-    BlockHeight, CertifiedBlock, ExecutionCertificate, Hash, QuorumCertificate,
-    RoutableTransaction, ShardGroupId, WaveCertificate,
+    BlockHash, BlockHeight, CertifiedBlock, ExecutionCertificate, ExecutionCertificateHash, Hash,
+    QuorumCertificate, RoutableTransaction, ShardGroupId, TxHash, WaveCertificate,
 };
 use std::sync::Arc;
 
@@ -19,8 +19,8 @@ impl hyperscale_storage::ChainReader for RocksDbStorage {
         self.read_committed_height()
     }
 
-    fn committed_hash(&self) -> Option<Hash> {
-        self.read_committed_hash()
+    fn committed_hash(&self) -> Option<BlockHash> {
+        self.read_committed_hash().map(BlockHash::from_raw)
     }
 
     fn latest_qc(&self) -> Option<QuorumCertificate> {
@@ -37,7 +37,7 @@ impl hyperscale_storage::ChainReader for RocksDbStorage {
         })
     }
 
-    fn get_transactions_batch(&self, hashes: &[Hash]) -> Vec<RoutableTransaction> {
+    fn get_transactions_batch(&self, hashes: &[TxHash]) -> Vec<RoutableTransaction> {
         RocksDbStorage::get_transactions_batch(self, hashes)
     }
 
@@ -45,7 +45,7 @@ impl hyperscale_storage::ChainReader for RocksDbStorage {
         RocksDbStorage::get_certificates_batch(self, hashes)
     }
 
-    fn get_local_receipt(&self, tx_hash: &Hash) -> Option<Arc<hyperscale_types::LocalReceipt>> {
+    fn get_local_receipt(&self, tx_hash: &TxHash) -> Option<Arc<hyperscale_types::LocalReceipt>> {
         RocksDbStorage::get_local_receipt(self, tx_hash)
     }
 
@@ -64,12 +64,15 @@ impl hyperscale_storage::ChainReader for RocksDbStorage {
         .collect()
     }
 
-    fn get_wave_certificate_for_tx(&self, _tx_hash: &Hash) -> Option<WaveCertificate> {
+    fn get_wave_certificate_for_tx(&self, _tx_hash: &TxHash) -> Option<WaveCertificate> {
         // TODO: populate and read a `tx_to_wave` CF at block commit time.
         None
     }
 
-    fn get_ec_hashes_for_tx(&self, _tx_hash: &Hash) -> Option<Vec<(ShardGroupId, Hash)>> {
+    fn get_ec_hashes_for_tx(
+        &self,
+        _tx_hash: &TxHash,
+    ) -> Option<Vec<(ShardGroupId, ExecutionCertificateHash)>> {
         // TODO: populate and read a `tx_to_ec` CF at block commit time.
         None
     }

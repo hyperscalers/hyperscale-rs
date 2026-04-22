@@ -32,7 +32,12 @@
 //!   `EarlyArrivalBuffer::buffer_ec` / `clear_routed` and walks the affected
 //!   waves.
 
-use hyperscale_types::{Attempt, ExecutionCertificate, Hash, TxOutcome, WaveId, WeightedTimestamp};
+#[cfg(test)]
+use hyperscale_types::Hash;
+use hyperscale_types::{
+    Attempt, BlockHash, ExecutionCertificate, GlobalReceiptRoot, TxHash, TxOutcome, WaveId,
+    WeightedTimestamp,
+};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -59,10 +64,10 @@ pub(crate) struct PendingVoteRetry {
     /// timeouts independently of block production rate.
     pub sent_at_ts_ms: WeightedTimestamp,
     pub attempt: Attempt,
-    pub block_hash: Hash,
+    pub block_hash: BlockHash,
     pub block_height: hyperscale_types::BlockHeight,
     pub vote_anchor_ts_ms: WeightedTimestamp,
-    pub global_receipt_root: Hash,
+    pub global_receipt_root: GlobalReceiptRoot,
     pub tx_outcomes: Arc<Vec<TxOutcome>>,
 }
 
@@ -73,10 +78,10 @@ pub(crate) struct PendingVoteRetry {
 pub(crate) struct RetryEffect {
     pub wave_id: WaveId,
     pub attempt: Attempt,
-    pub block_hash: Hash,
+    pub block_hash: BlockHash,
     pub block_height: hyperscale_types::BlockHeight,
     pub vote_anchor_ts_ms: WeightedTimestamp,
-    pub global_receipt_root: Hash,
+    pub global_receipt_root: GlobalReceiptRoot,
     pub tx_outcomes: Arc<Vec<TxOutcome>>,
 }
 
@@ -89,8 +94,8 @@ pub(crate) struct RetryEffect {
 #[derive(Debug, Default, Clone)]
 pub(crate) struct AttestationRouting {
     pub affected_waves: BTreeSet<WaveId>,
-    pub routed_tx_hashes: Vec<Hash>,
-    pub unrouted_tx_hashes: Vec<Hash>,
+    pub routed_tx_hashes: Vec<TxHash>,
+    pub unrouted_tx_hashes: Vec<TxHash>,
 }
 
 /// Counts returned by [`WaveRegistry::prune_resolved`] so the coordinator
@@ -127,7 +132,7 @@ pub(crate) struct WaveRegistry {
     /// `tx_hash → wave_id` reverse index. The authoritative lookup for
     /// "what local wave does this tx belong to" — drives EC routing,
     /// `is_awaiting_provisioning`, `get_wave_assignment`.
-    assignments: HashMap<Hash, WaveId>,
+    assignments: HashMap<TxHash, WaveId>,
 }
 
 impl WaveRegistry {
@@ -201,15 +206,15 @@ impl WaveRegistry {
 
     // ─── Assignments ────────────────────────────────────────────────────
 
-    pub fn assign_tx(&mut self, tx_hash: Hash, wave_id: WaveId) {
+    pub fn assign_tx(&mut self, tx_hash: TxHash, wave_id: WaveId) {
         self.assignments.insert(tx_hash, wave_id);
     }
 
-    pub fn remove_assignment(&mut self, tx_hash: &Hash) {
+    pub fn remove_assignment(&mut self, tx_hash: &TxHash) {
         self.assignments.remove(tx_hash);
     }
 
-    pub fn wave_assignment(&self, tx_hash: &Hash) -> Option<WaveId> {
+    pub fn wave_assignment(&self, tx_hash: &TxHash) -> Option<WaveId> {
         self.assignments.get(tx_hash).cloned()
     }
 
@@ -282,7 +287,7 @@ impl WaveRegistry {
     /// Whether `tx_hash` is assigned to a wave that's still waiting on
     /// provisions. False when the tx has no assignment, the wave is gone,
     /// or the wave is already fully provisioned.
-    pub fn is_awaiting_provisioning(&self, tx_hash: &Hash) -> bool {
+    pub fn is_awaiting_provisioning(&self, tx_hash: &TxHash) -> bool {
         let Some(wave_id) = self.assignments.get(tx_hash) else {
             return false;
         };
@@ -294,7 +299,7 @@ impl WaveRegistry {
     /// Count of unique tx_hashes across all cross-shard waves. Used by
     /// observability to gauge the outstanding cross-shard backlog.
     pub fn cross_shard_pending_count(&self) -> usize {
-        let mut pending_txs: HashSet<Hash> = HashSet::new();
+        let mut pending_txs: HashSet<TxHash> = HashSet::new();
         for (wave_id, wave) in &self.states {
             if !wave_id.is_zero() {
                 for h in wave.tx_hashes() {
@@ -392,7 +397,8 @@ impl WaveRegistry {
 mod tests {
     use super::*;
     use hyperscale_types::{
-        test_utils::test_transaction, BlockHeight, ExecutionOutcome, ShardGroupId, SignerBitfield,
+        test_utils::test_transaction, BlockHash, BlockHeight, ExecutionOutcome, ShardGroupId,
+        SignerBitfield,
     };
 
     fn shard() -> ShardGroupId {
@@ -411,18 +417,18 @@ mod tests {
         WeightedTimestamp(value)
     }
 
-    fn make_wave_state(wave_id: WaveId, block_hash: Hash, tx_seed: u8) -> WaveState {
+    fn make_wave_state(wave_id: WaveId, block_hash: BlockHash, tx_seed: u8) -> WaveState {
         let tx = Arc::new(test_transaction(tx_seed));
         let mut participating = BTreeSet::new();
         participating.insert(shard());
         WaveState::new(wave_id, block_hash, ms(0), vec![(tx, participating)], true)
     }
 
-    fn make_tracker(wave_id: WaveId, block_hash: Hash) -> VoteTracker {
+    fn make_tracker(wave_id: WaveId, block_hash: BlockHash) -> VoteTracker {
         VoteTracker::new(wave_id, block_hash, 3)
     }
 
-    fn make_outcome(tx_hash: Hash) -> TxOutcome {
+    fn make_outcome(tx_hash: TxHash) -> TxOutcome {
         TxOutcome {
             tx_hash,
             outcome: ExecutionOutcome::Executed {
@@ -432,11 +438,11 @@ mod tests {
         }
     }
 
-    fn make_ec(wave_id: WaveId, tx_hashes: &[Hash]) -> ExecutionCertificate {
+    fn make_ec(wave_id: WaveId, tx_hashes: &[TxHash]) -> ExecutionCertificate {
         ExecutionCertificate::new(
             wave_id,
             WeightedTimestamp::ZERO,
-            Hash::ZERO,
+            GlobalReceiptRoot::ZERO,
             tx_hashes.iter().map(|h| make_outcome(*h)).collect(),
             hyperscale_types::zero_bls_signature(),
             SignerBitfield::new(4),
@@ -459,7 +465,10 @@ mod tests {
     fn insert_and_query_wave_state() {
         let mut r = WaveRegistry::new();
         let wid = wave(1);
-        r.insert_wave(wid.clone(), make_wave_state(wid.clone(), Hash::ZERO, 1));
+        r.insert_wave(
+            wid.clone(),
+            make_wave_state(wid.clone(), BlockHash::ZERO, 1),
+        );
         assert!(r.contains_wave(&wid));
         assert!(r.get_wave(&wid).is_some());
         assert_eq!(r.waves_len(), 1);
@@ -469,7 +478,7 @@ mod tests {
     fn insert_and_remove_tracker() {
         let mut r = WaveRegistry::new();
         let wid = wave(1);
-        r.insert_tracker(wid.clone(), make_tracker(wid.clone(), Hash::ZERO));
+        r.insert_tracker(wid.clone(), make_tracker(wid.clone(), BlockHash::ZERO));
         assert!(r.contains_tracker(&wid));
 
         let removed = r.remove_tracker(&wid);
@@ -490,7 +499,7 @@ mod tests {
     #[test]
     fn assign_and_lookup_tx() {
         let mut r = WaveRegistry::new();
-        let tx = Hash::from_bytes(b"tx");
+        let tx = TxHash::from_raw(Hash::from_bytes(b"tx"));
         let wid = wave(1);
         r.assign_tx(tx, wid.clone());
         assert_eq!(r.wave_assignment(&tx), Some(wid));
@@ -505,10 +514,10 @@ mod tests {
         PendingVoteRetry {
             sent_at_ts_ms: sent_at,
             attempt: Attempt::INITIAL,
-            block_hash: Hash::ZERO,
+            block_hash: BlockHash::ZERO,
             block_height: BlockHeight(1),
             vote_anchor_ts_ms: ms(0),
-            global_receipt_root: Hash::ZERO,
+            global_receipt_root: GlobalReceiptRoot::ZERO,
             tx_outcomes: Arc::new(vec![]),
         }
     }
@@ -549,8 +558,8 @@ mod tests {
     #[test]
     fn classify_attestation_splits_routed_and_unrouted() {
         let mut r = WaveRegistry::new();
-        let tx_known = Hash::from_bytes(b"known");
-        let tx_unknown = Hash::from_bytes(b"unknown");
+        let tx_known = TxHash::from_raw(Hash::from_bytes(b"known"));
+        let tx_unknown = TxHash::from_raw(Hash::from_bytes(b"unknown"));
         let wid = wave(1);
 
         r.assign_tx(tx_known, wid.clone());
@@ -568,16 +577,16 @@ mod tests {
     #[test]
     fn is_awaiting_provisioning_false_without_assignment() {
         let r = WaveRegistry::new();
-        assert!(!r.is_awaiting_provisioning(&Hash::from_bytes(b"orphan")));
+        assert!(!r.is_awaiting_provisioning(&TxHash::from_raw(Hash::from_bytes(b"orphan"))));
     }
 
     #[test]
     fn is_awaiting_provisioning_false_when_single_shard_wave_is_ready() {
         // Single-shard waves pass `is_fully_provisioned = true` at creation.
         let mut r = WaveRegistry::new();
-        let tx = Hash::from_bytes(b"tx");
+        let tx = TxHash::from_raw(Hash::from_bytes(b"tx"));
         let wid = wave(1);
-        let ws = make_wave_state(wid.clone(), Hash::ZERO, 1);
+        let ws = make_wave_state(wid.clone(), BlockHash::ZERO, 1);
         let tx_hash_in_wave = ws.tx_hashes()[0];
         r.insert_wave(wid.clone(), ws);
         r.assign_tx(tx_hash_in_wave, wid);
@@ -593,9 +602,15 @@ mod tests {
         let mut r = WaveRegistry::new();
         let wid1 = wave(1);
         let wid2 = wave(2);
-        r.insert_wave(wid1.clone(), make_wave_state(wid1.clone(), Hash::ZERO, 1));
-        r.insert_wave(wid2.clone(), make_wave_state(wid2.clone(), Hash::ZERO, 2));
-        r.assign_tx(Hash::from_bytes(b"a"), wid1.clone());
+        r.insert_wave(
+            wid1.clone(),
+            make_wave_state(wid1.clone(), BlockHash::ZERO, 1),
+        );
+        r.insert_wave(
+            wid2.clone(),
+            make_wave_state(wid2.clone(), BlockHash::ZERO, 2),
+        );
+        r.assign_tx(TxHash::from_raw(Hash::from_bytes(b"a")), wid1.clone());
         // wid2 has no assignment — it's resolved.
 
         let counts = r.prune_resolved();
@@ -609,9 +624,12 @@ mod tests {
         let mut r = WaveRegistry::new();
         let wid1 = wave(1);
         let wid_gone = wave(99);
-        r.insert_wave(wid1.clone(), make_wave_state(wid1.clone(), Hash::ZERO, 1));
-        r.assign_tx(Hash::from_bytes(b"a"), wid1.clone());
-        r.assign_tx(Hash::from_bytes(b"dangling"), wid_gone);
+        r.insert_wave(
+            wid1.clone(),
+            make_wave_state(wid1.clone(), BlockHash::ZERO, 1),
+        );
+        r.assign_tx(TxHash::from_raw(Hash::from_bytes(b"a")), wid1.clone());
+        r.assign_tx(TxHash::from_raw(Hash::from_bytes(b"dangling")), wid_gone);
 
         let counts = r.prune_resolved();
         assert_eq!(counts.assignments, 1);
@@ -635,14 +653,14 @@ mod tests {
             let mut r = WaveRegistry::new();
             let wave_ids: Vec<WaveId> = wave_heights.iter().map(|h| wave(*h)).collect();
             for wid in &wave_ids {
-                r.insert_wave(wid.clone(), make_wave_state(wid.clone(), Hash::ZERO, 1));
-                r.insert_tracker(wid.clone(), make_tracker(wid.clone(), Hash::ZERO));
+                r.insert_wave(wid.clone(), make_wave_state(wid.clone(), BlockHash::ZERO, 1));
+                r.insert_tracker(wid.clone(), make_tracker(wid.clone(), BlockHash::ZERO));
                 r.mark_ec_dispatched(wid.clone());
                 r.record_vote_retry(wid.clone(), make_retry(ms(0)));
             }
             // Assign some subset of txs to some subset of waves.
             for (i, idx) in assignment_indices.iter().enumerate() {
-                let tx = Hash::from_bytes(&[i as u8; 32]);
+                let tx = TxHash::from_raw(Hash::from_bytes(&[i as u8; 32]));
                 let wid = &wave_ids[idx % wave_ids.len()];
                 r.assign_tx(tx, wid.clone());
             }
@@ -650,7 +668,9 @@ mod tests {
             let _ = r.prune_resolved();
 
             // Invariant 1: every assignment points to a live wave.
-            for wid in (0..20).filter_map(|i| r.wave_assignment(&Hash::from_bytes(&[i as u8; 32]))) {
+            for wid in (0..20).filter_map(|i| {
+                r.wave_assignment(&TxHash::from_raw(Hash::from_bytes(&[i as u8; 32])))
+            }) {
                 prop_assert!(r.contains_wave(&wid));
             }
             // Invariant 2: every tracker / ec_dispatched / retry key has a live wave
@@ -659,7 +679,9 @@ mod tests {
             for (wid, _) in r.waves_iter() {
                 // Surviving waves must have at least one assignment.
                 let referenced = (0..20).any(|i| {
-                    r.wave_assignment(&Hash::from_bytes(&[i as u8; 32])).as_ref() == Some(wid)
+                    r.wave_assignment(&TxHash::from_raw(Hash::from_bytes(&[i as u8; 32])))
+                        .as_ref()
+                        == Some(wid)
                 });
                 prop_assert!(referenced, "surviving wave {:?} not referenced by any assignment", wid);
             }

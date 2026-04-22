@@ -1,7 +1,7 @@
 //! Local provision batch fetch request (intra-shard DA).
 
 use crate::response::GetLocalProvisionsResponse;
-use hyperscale_types::{Hash, MessagePriority, NetworkMessage, Request};
+use hyperscale_types::{BlockHash, Hash, MessagePriority, NetworkMessage, Request};
 use sbor::prelude::BasicSbor;
 
 /// Request to fetch provision batch data for a pending block.
@@ -12,14 +12,14 @@ use sbor::prelude::BasicSbor;
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct GetLocalProvisionsRequest {
     /// Hash of the block that needs these provision batches.
-    pub block_hash: Hash,
+    pub block_hash: BlockHash,
 
     /// Hashes of the provision batches being requested.
     pub batch_hashes: Vec<Hash>,
 }
 
 impl GetLocalProvisionsRequest {
-    pub fn new(block_hash: Hash, batch_hashes: Vec<Hash>) -> Self {
+    pub fn new(block_hash: BlockHash, batch_hashes: Vec<Hash>) -> Self {
         Self {
             block_hash,
             batch_hashes,
@@ -48,7 +48,7 @@ mod tests {
     #[test]
     fn test_sbor_roundtrip() {
         let request = GetLocalProvisionsRequest {
-            block_hash: Hash::from_bytes(b"block"),
+            block_hash: BlockHash::from_raw(Hash::from_bytes(b"block")),
             batch_hashes: vec![Hash::from_bytes(b"batch1"), Hash::from_bytes(b"batch2")],
         };
         let encoded = sbor::basic_encode(&request).unwrap();

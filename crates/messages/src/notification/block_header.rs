@@ -68,7 +68,9 @@ impl NetworkMessage for BlockHeaderNotification {
 #[cfg(test)]
 mod tests {
     use hyperscale_types::{
-        BlockHeight, Hash, ProposerTimestamp, QuorumCertificate, Round, ShardGroupId, ValidatorId,
+        BlockHash, BlockHeight, CertificateRoot, Hash, LocalReceiptRoot, ProposerTimestamp,
+        ProvisionsRoot, QuorumCertificate, Round, ShardGroupId, StateRoot, TransactionRoot, TxHash,
+        ValidatorId,
     };
     use std::collections::BTreeMap;
 
@@ -78,17 +80,17 @@ mod tests {
         BlockHeader {
             shard_group_id: ShardGroupId(0),
             height,
-            parent_hash: Hash::from_bytes(b"parent"),
+            parent_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(0),
             timestamp: ProposerTimestamp(1234567890),
             round: Round::INITIAL,
             is_fallback: false,
-            state_root: Hash::ZERO,
-            transaction_root: Hash::ZERO,
-            certificate_root: Hash::ZERO,
-            local_receipt_root: Hash::ZERO,
-            provision_root: Hash::ZERO,
+            state_root: StateRoot::ZERO,
+            transaction_root: TransactionRoot::ZERO,
+            certificate_root: CertificateRoot::ZERO,
+            local_receipt_root: LocalReceiptRoot::ZERO,
+            provision_root: ProvisionsRoot::ZERO,
             waves: vec![],
             provision_tx_roots: BTreeMap::new(),
             in_flight: 0,
@@ -104,10 +106,10 @@ mod tests {
         let header = make_header(BlockHeight(1));
         let manifest = BlockManifest {
             tx_hashes: vec![
-                Hash::from_bytes(b"tx1"),
-                Hash::from_bytes(b"tx2"),
-                Hash::from_bytes(b"tx3"),
-                Hash::from_bytes(b"tx4"),
+                TxHash::from_raw(Hash::from_bytes(b"tx1")),
+                TxHash::from_raw(Hash::from_bytes(b"tx2")),
+                TxHash::from_raw(Hash::from_bytes(b"tx3")),
+                TxHash::from_raw(Hash::from_bytes(b"tx4")),
             ],
             ..Default::default()
         };
@@ -122,7 +124,7 @@ mod tests {
     fn test_block_header_gossip_into_parts() {
         let header = make_header(BlockHeight(5));
         let manifest = BlockManifest {
-            tx_hashes: vec![Hash::from_bytes(b"tx1")],
+            tx_hashes: vec![TxHash::from_raw(Hash::from_bytes(b"tx1"))],
             ..Default::default()
         };
 
@@ -134,9 +136,9 @@ mod tests {
 
     #[test]
     fn test_block_header_gossip_all_transaction_hashes() {
-        let tx1 = Hash::from_bytes(b"tx1");
-        let tx2 = Hash::from_bytes(b"tx2");
-        let tx3 = Hash::from_bytes(b"tx3");
+        let tx1 = TxHash::from_raw(Hash::from_bytes(b"tx1"));
+        let tx2 = TxHash::from_raw(Hash::from_bytes(b"tx2"));
+        let tx3 = TxHash::from_raw(Hash::from_bytes(b"tx3"));
 
         let gossip = BlockHeaderNotification::new(
             make_header(BlockHeight(1)),
@@ -147,7 +149,7 @@ mod tests {
             zero_sig(),
         );
 
-        let all: Vec<Hash> = gossip.manifest.tx_hashes.to_vec();
+        let all: Vec<TxHash> = gossip.manifest.tx_hashes.to_vec();
         assert_eq!(all, vec![tx1, tx2, tx3]);
     }
 }

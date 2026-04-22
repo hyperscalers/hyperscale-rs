@@ -8,9 +8,11 @@
 //! transaction ordering, `waves` recomputation, cross-ancestor tx uniqueness)
 //! live in [`crate::validation`].
 
+#[cfg(test)]
+use hyperscale_types::Hash;
 use hyperscale_types::{
-    Block, BlockHeader, BlockHeight, BlockManifest, FinalizedWave, Hash, ReceiptBundle,
-    TopologySnapshot,
+    Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, FinalizedWave, ProvisionsRoot,
+    ReceiptBundle, StateRoot, TopologySnapshot,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -41,12 +43,12 @@ pub(crate) struct PendingQcVerification {
 /// parent committed would dispatch with the wrong `parent_state_root`.
 #[derive(Debug)]
 pub struct ReadyStateRootVerification {
-    pub block_hash: Hash,
-    pub parent_block_hash: Hash,
-    pub parent_state_root: Hash,
+    pub block_hash: BlockHash,
+    pub parent_block_hash: BlockHash,
+    pub parent_state_root: StateRoot,
     /// The committed height of the parent block (stable anchor for JMT computation).
     pub parent_block_height: BlockHeight,
-    pub expected_root: Hash,
+    pub expected_root: StateRoot,
     /// Finalized waves from the PendingBlock — these carry the proposer's receipts,
     /// ensuring all validators verify against the same execution outputs.
     pub finalized_waves: Vec<Arc<FinalizedWave>>,
@@ -69,10 +71,10 @@ pub(crate) enum InFlightCheck {
 /// time against the current chain view.
 #[derive(Debug, Clone)]
 pub(crate) struct PendingStateRootVerification {
-    pub block_hash: Hash,
-    pub parent_block_hash: Hash,
+    pub block_hash: BlockHash,
+    pub parent_block_hash: BlockHash,
     pub parent_block_height: BlockHeight,
-    pub expected_root: Hash,
+    pub expected_root: StateRoot,
     pub block_height: BlockHeight,
 }
 
@@ -88,22 +90,22 @@ pub(crate) struct VerificationPipeline {
     // === QC signature verification ===
     /// Block headers pending QC signature verification.
     /// Maps block_hash -> pending verification info.
-    pending_qc_verifications: HashMap<Hash, PendingQcVerification>,
+    pending_qc_verifications: HashMap<BlockHash, PendingQcVerification>,
 
     /// Cache of already-verified QC signatures.
     /// Maps QC's block_hash (the block the QC certifies) -> height.
-    verified_qcs: HashMap<Hash, BlockHeight>,
+    verified_qcs: HashMap<BlockHash, BlockHeight>,
 
     // === State root verification ===
     /// Blocks where state root verification is currently in-flight.
-    state_root_verifications_in_flight: HashSet<Hash>,
+    state_root_verifications_in_flight: HashSet<BlockHash>,
 
     /// Blocks with verified state roots.
-    verified_state_roots: HashSet<Hash>,
+    verified_state_roots: HashSet<BlockHash>,
 
     /// Blocks waiting for their parent's tree nodes to become available (via
     /// commit or prior verification). Keyed by parent_block_hash.
-    deferred_state_root_verifications: HashMap<Hash, Vec<PendingStateRootVerification>>,
+    deferred_state_root_verifications: HashMap<BlockHash, Vec<PendingStateRootVerification>>,
 
     /// Deferred proposal waiting for the parent's tree nodes to become
     /// available. At most one pending at a time (new proposals replace old).
@@ -112,7 +114,7 @@ pub(crate) struct VerificationPipeline {
     /// rather than dispatching a stale `BuildProposal` — transaction
     /// selection must use current state to avoid including txs that were
     /// committed between deferral and dispatch.
-    deferred_proposal: Option<(Hash, BlockHeight)>,
+    deferred_proposal: Option<(BlockHash, BlockHeight)>,
 
     /// Highest persisted height — parent trees at or below this height
     /// are readable from disk, so child verifications for blocks beyond
@@ -139,14 +141,14 @@ pub(crate) struct VerificationPipeline {
     /// certificate, local-receipt, provision, provision-tx roots).
     /// State-root uses separate fields above because its lifecycle
     /// includes deferred/ready queues for parent-tree availability.
-    in_flight_roots: HashSet<(Hash, VerificationKind)>,
+    in_flight_roots: HashSet<(BlockHash, VerificationKind)>,
 
     /// `(block_hash, kind)` pairs whose merkle root has been verified.
-    verified_roots: HashSet<(Hash, VerificationKind)>,
+    verified_roots: HashSet<(BlockHash, VerificationKind)>,
 
     // === In-flight count verification ===
     /// Blocks with verified in-flight counts (synchronous tolerance check).
-    verified_in_flight: HashSet<Hash>,
+    verified_in_flight: HashSet<BlockHash>,
 }
 
 impl VerificationPipeline {
@@ -174,13 +176,13 @@ impl VerificationPipeline {
 
     /// Whether the given merkle root has been verified for `block_hash`.
     /// State-root callers use [`Self::is_state_root_verified`] instead.
-    fn is_root_verified(&self, block_hash: Hash, kind: VerificationKind) -> bool {
+    fn is_root_verified(&self, block_hash: BlockHash, kind: VerificationKind) -> bool {
         self.verified_roots.contains(&(block_hash, kind))
     }
 
     /// Whether a merkle-root verification is currently in-flight for
     /// `(block_hash, kind)`.
-    fn is_root_in_flight(&self, block_hash: Hash, kind: VerificationKind) -> bool {
+    fn is_root_in_flight(&self, block_hash: BlockHash, kind: VerificationKind) -> bool {
         self.in_flight_roots.contains(&(block_hash, kind))
     }
 
@@ -188,7 +190,7 @@ impl VerificationPipeline {
     /// has already been verified, or is already in-flight.
     fn needs_root(
         &self,
-        block_hash: Hash,
+        block_hash: BlockHash,
         kind: VerificationKind,
         has_relevant_content: bool,
     ) -> bool {
@@ -199,7 +201,7 @@ impl VerificationPipeline {
 
     /// Mark the root verification as in-flight so duplicate dispatch is
     /// avoided until the result lands.
-    fn mark_root_in_flight(&mut self, block_hash: Hash, kind: VerificationKind) {
+    fn mark_root_in_flight(&mut self, block_hash: BlockHash, kind: VerificationKind) {
         self.in_flight_roots.insert((block_hash, kind));
     }
 
@@ -209,7 +211,7 @@ impl VerificationPipeline {
     /// State-root results go through [`Self::on_state_root_verified`].
     pub fn on_root_verified(
         &mut self,
-        block_hash: Hash,
+        block_hash: BlockHash,
         kind: VerificationKind,
         valid: bool,
     ) -> bool {
@@ -226,24 +228,28 @@ impl VerificationPipeline {
     // ═══════════════════════════════════════════════════════════════════════
 
     /// Track a block header pending QC signature verification.
-    pub fn track_pending_qc(&mut self, block_hash: Hash, header: BlockHeader) {
+    pub fn track_pending_qc(&mut self, block_hash: BlockHash, header: BlockHeader) {
         self.pending_qc_verifications
             .insert(block_hash, PendingQcVerification { header });
     }
 
     /// Check if a QC has already been verified (cache hit).
-    pub fn is_qc_verified(&self, qc_block_hash: &Hash) -> bool {
+    pub fn is_qc_verified(&self, qc_block_hash: &BlockHash) -> bool {
         self.verified_qcs.contains_key(qc_block_hash)
     }
 
     /// Record a QC signature verification result. Returns the pending header if found.
-    pub fn on_qc_verified(&mut self, block_hash: Hash, valid: bool) -> Option<(BlockHeader, bool)> {
+    pub fn on_qc_verified(
+        &mut self,
+        block_hash: BlockHash,
+        valid: bool,
+    ) -> Option<(BlockHeader, bool)> {
         let pending = self.pending_qc_verifications.remove(&block_hash)?;
         Some((pending.header, valid))
     }
 
     /// Cache a verified QC to skip future re-verification.
-    pub fn cache_verified_qc(&mut self, qc_block_hash: Hash, height: BlockHeight) {
+    pub fn cache_verified_qc(&mut self, qc_block_hash: BlockHash, height: BlockHeight) {
         self.verified_qcs.insert(qc_block_hash, height);
         trace!(
             qc_block_hash = ?qc_block_hash,
@@ -253,7 +259,7 @@ impl VerificationPipeline {
     }
 
     /// Check if a block has a pending QC verification in-flight.
-    pub fn has_pending_qc(&self, block_hash: &Hash) -> bool {
+    pub fn has_pending_qc(&self, block_hash: &BlockHash) -> bool {
         self.pending_qc_verifications.contains_key(block_hash)
     }
 
@@ -285,7 +291,7 @@ impl VerificationPipeline {
     /// Used by the commit path to decide between `CommitBlock` (fast path —
     /// PreparedCommit from `VerifyStateRoot` already in the cache) and
     /// `CommitBlockByQcOnly` (slow path — compute inline at commit time).
-    pub fn is_state_root_verified(&self, block_hash: &Hash) -> bool {
+    pub fn is_state_root_verified(&self, block_hash: &BlockHash) -> bool {
         self.verified_state_roots.contains(block_hash)
     }
 
@@ -315,7 +321,7 @@ impl VerificationPipeline {
             )
             && root_ok(
                 VerificationKind::ProvisionRoot,
-                h.provision_root != Hash::ZERO,
+                h.provision_root != ProvisionsRoot::ZERO,
             )
             && root_ok(
                 VerificationKind::ProvisionTxRoots,
@@ -377,7 +383,7 @@ impl VerificationPipeline {
         let provision_root_status = root_status(
             VerificationKind::ProvisionRoot,
             "skipped(no_provisions)",
-            h.provision_root != Hash::ZERO,
+            h.provision_root != ProvisionsRoot::ZERO,
         );
         let provision_tx_root_status = root_status(
             VerificationKind::ProvisionTxRoots,
@@ -443,7 +449,7 @@ impl VerificationPipeline {
     /// base state.
     pub fn initiate_state_root_verification(
         &mut self,
-        block_hash: Hash,
+        block_hash: BlockHash,
         block: &Block,
         parent_block_height: BlockHeight,
     ) {
@@ -483,7 +489,7 @@ impl VerificationPipeline {
     ///
     /// On success, unblocks any child blocks that were deferred waiting for
     /// this parent's verification to complete.
-    pub fn on_state_root_verified(&mut self, block_hash: Hash, valid: bool) -> bool {
+    pub fn on_state_root_verified(&mut self, block_hash: BlockHash, valid: bool) -> bool {
         self.state_root_verifications_in_flight.remove(&block_hash);
 
         if valid {
@@ -529,7 +535,7 @@ impl VerificationPipeline {
     /// The proposer computed the state root during `BuildProposal`, so it is
     /// inherently correct. This populates the overlay chain so that child
     /// blocks can verify without waiting for the block to be committed.
-    fn mark_proposal_state_root_verified(&mut self, block_hash: Hash) {
+    fn mark_proposal_state_root_verified(&mut self, block_hash: BlockHash) {
         self.verified_state_roots.insert(block_hash);
 
         // Unblock children deferred on this parent.
@@ -558,7 +564,7 @@ impl VerificationPipeline {
     /// the verification pipeline is complete. Without this, a view change
     /// would report these as NOT_STARTED since the proposer path bypasses
     /// `try_vote_on_block`.
-    pub fn mark_proposal_fully_verified(&mut self, block_hash: Hash) {
+    pub fn mark_proposal_fully_verified(&mut self, block_hash: BlockHash) {
         self.mark_proposal_state_root_verified(block_hash);
         for kind in [
             VerificationKind::TransactionRoot,
@@ -581,7 +587,7 @@ impl VerificationPipeline {
     /// Initiate transaction root verification for a block.
     pub fn initiate_transaction_root_verification(
         &mut self,
-        block_hash: Hash,
+        block_hash: BlockHash,
         block: &Block,
     ) -> Vec<Action> {
         debug!(
@@ -601,7 +607,7 @@ impl VerificationPipeline {
     /// Initiate receipt root verification for a block.
     pub fn initiate_certificate_root_verification(
         &mut self,
-        block_hash: Hash,
+        block_hash: BlockHash,
         block: &Block,
     ) -> Vec<Action> {
         debug!(
@@ -621,7 +627,7 @@ impl VerificationPipeline {
     /// Initiate local receipt root verification for a block.
     pub fn initiate_local_receipt_root_verification(
         &mut self,
-        block_hash: Hash,
+        block_hash: BlockHash,
         block: &Block,
         receipts: Vec<ReceiptBundle>,
     ) -> Vec<Action> {
@@ -642,7 +648,7 @@ impl VerificationPipeline {
     /// Initiate provisions root verification for a block.
     pub fn initiate_provision_root_verification(
         &mut self,
-        block_hash: Hash,
+        block_hash: BlockHash,
         block: &Block,
         manifest: &BlockManifest,
     ) -> Vec<Action> {
@@ -663,7 +669,7 @@ impl VerificationPipeline {
     /// Initiate provision tx-root verification for a block.
     pub fn initiate_provision_tx_root_verification(
         &mut self,
-        block_hash: Hash,
+        block_hash: BlockHash,
         block: &Block,
         topology: &TopologySnapshot,
     ) -> Vec<Action> {
@@ -693,8 +699,8 @@ impl VerificationPipeline {
     pub(crate) fn initiate_block_verifications(
         &mut self,
         topology: &TopologySnapshot,
-        pending_blocks: &HashMap<Hash, PendingBlock>,
-        block_hash: Hash,
+        pending_blocks: &HashMap<BlockHash, PendingBlock>,
+        block_hash: BlockHash,
         block: &Block,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
@@ -716,7 +722,7 @@ impl VerificationPipeline {
         if self.needs_root(
             block_hash,
             VerificationKind::ProvisionRoot,
-            h.provision_root != Hash::ZERO,
+            h.provision_root != ProvisionsRoot::ZERO,
         ) {
             if let Some(pending) = pending_blocks.get(&block_hash) {
                 actions.extend(self.initiate_provision_root_verification(
@@ -772,7 +778,7 @@ impl VerificationPipeline {
     pub(crate) fn classify_vote_in_flight(
         &mut self,
         chain: &ChainView<'_>,
-        block_hash: Hash,
+        block_hash: BlockHash,
         block: &Block,
         vote_locked: bool,
     ) -> InFlightCheck {
@@ -818,7 +824,7 @@ impl VerificationPipeline {
     /// Certificates are only counted when actually included (JMT was ready).
     pub fn verify_in_flight(
         &mut self,
-        block_hash: Hash,
+        block_hash: BlockHash,
         block: &Block,
         parent_in_flight: u32,
         finalized_tx_count: u32,
@@ -905,7 +911,7 @@ impl VerificationPipeline {
     pub fn parent_tree_available(
         &self,
         parent_block_height: BlockHeight,
-        parent_hash: Hash,
+        parent_hash: BlockHash,
     ) -> bool {
         parent_block_height <= self.last_persisted_height
             || self.verified_state_roots.contains(&parent_hash)
@@ -915,7 +921,7 @@ impl VerificationPipeline {
     /// available. Only the parent identity is stored — when unblocked, the
     /// caller re-enters `try_propose` with fresh state rather than replaying
     /// a stale `BuildProposal` action.
-    pub fn defer_proposal(&mut self, parent_hash: Hash, parent_block_height: BlockHeight) {
+    pub fn defer_proposal(&mut self, parent_hash: BlockHash, parent_block_height: BlockHeight) {
         debug!(
             parent_hash = ?parent_hash,
             parent_block_height = parent_block_height.0,
@@ -925,7 +931,7 @@ impl VerificationPipeline {
     }
 
     /// If the deferred proposal was waiting for `unblocked_hash`, mark it ready.
-    fn try_unblock_proposal(&mut self, unblocked_hash: Hash) {
+    fn try_unblock_proposal(&mut self, unblocked_hash: BlockHash) {
         if matches!(&self.deferred_proposal, Some((parent, _)) if *parent == unblocked_hash) {
             self.deferred_proposal.take();
             debug!(parent_hash = ?unblocked_hash, "Unblocking deferred proposal");
@@ -949,7 +955,7 @@ impl VerificationPipeline {
         self.last_persisted_height = block_height;
 
         // Unblock deferred verifications whose parent height is now persisted.
-        let unblocked_parents: Vec<Hash> = self
+        let unblocked_parents: Vec<BlockHash> = self
             .deferred_state_root_verifications
             .iter()
             .filter(|(_, entries)| {
@@ -996,7 +1002,7 @@ impl VerificationPipeline {
     /// Unblocking on commit (rather than persistence) lets deferred
     /// verifications proceed as soon as the parent's tree is readable from
     /// the overlay, without waiting for `BlockPersisted`.
-    pub fn on_block_committed(&mut self, block_hash: Hash) {
+    pub fn on_block_committed(&mut self, block_hash: BlockHash) {
         if !self.verified_state_roots.insert(block_hash) {
             return;
         }
@@ -1035,7 +1041,7 @@ impl VerificationPipeline {
     /// scenarios where multiple proposals share the same parent QC.
     pub fn cleanup(
         &mut self,
-        pending_blocks: &HashMap<Hash, crate::pending::PendingBlock>,
+        pending_blocks: &HashMap<BlockHash, crate::pending::PendingBlock>,
         committed_height: BlockHeight,
     ) {
         self.pending_qc_verifications
@@ -1107,12 +1113,13 @@ mod tests {
     use super::*;
     use crate::pending::PendingBlock;
     use hyperscale_types::{
-        ProposerTimestamp, QuorumCertificate, Round, RoutableTransaction, ShardGroupId, ValidatorId,
+        CertificateRoot, LocalReceiptRoot, ProposerTimestamp, QuorumCertificate, Round,
+        RoutableTransaction, ShardGroupId, TransactionRoot, ValidatorId,
     };
     use std::collections::BTreeMap;
     use std::time::Duration;
 
-    fn header(height: BlockHeight, parent_hash: Hash, in_flight: u32) -> BlockHeader {
+    fn header(height: BlockHeight, parent_hash: BlockHash, in_flight: u32) -> BlockHeader {
         BlockHeader {
             shard_group_id: ShardGroupId(0),
             height,
@@ -1122,11 +1129,11 @@ mod tests {
             timestamp: ProposerTimestamp(0),
             round: Round::INITIAL,
             is_fallback: false,
-            state_root: Hash::ZERO,
-            transaction_root: Hash::ZERO,
-            certificate_root: Hash::ZERO,
-            local_receipt_root: Hash::ZERO,
-            provision_root: Hash::ZERO,
+            state_root: StateRoot::ZERO,
+            transaction_root: TransactionRoot::ZERO,
+            certificate_root: CertificateRoot::ZERO,
+            local_receipt_root: LocalReceiptRoot::ZERO,
+            provision_root: ProvisionsRoot::ZERO,
             waves: Vec::new(),
             provision_tx_roots: BTreeMap::new(),
             in_flight,
@@ -1135,7 +1142,7 @@ mod tests {
 
     fn block_with(
         height: BlockHeight,
-        parent_hash: Hash,
+        parent_hash: BlockHash,
         in_flight: u32,
         transactions: Vec<Arc<RoutableTransaction>>,
     ) -> Block {
@@ -1149,15 +1156,15 @@ mod tests {
 
     fn chain_view<'a>(
         committed_height: BlockHeight,
-        committed_hash: Hash,
+        committed_hash: BlockHash,
         latest_qc: Option<&'a QuorumCertificate>,
-        certified: &'a HashMap<Hash, Block>,
-        pending: &'a HashMap<Hash, PendingBlock>,
+        certified: &'a HashMap<BlockHash, Block>,
+        pending: &'a HashMap<BlockHash, PendingBlock>,
     ) -> ChainView<'a> {
         ChainView {
             committed_height,
             committed_hash,
-            committed_state_root: Hash::ZERO,
+            committed_state_root: StateRoot::ZERO,
             latest_qc,
             genesis: None,
             certified,
@@ -1165,16 +1172,26 @@ mod tests {
         }
     }
 
+    fn bh(tag: &[u8]) -> BlockHash {
+        BlockHash::from_raw(Hash::from_bytes(tag))
+    }
+
     // ─── classify_vote_in_flight ────────────────────────────────────────
 
     #[test]
     fn classify_vote_in_flight_skips_vote_when_locked() {
         let mut vp = VerificationPipeline::new(BlockHeight::GENESIS);
-        let block = block_with(BlockHeight(1), Hash::ZERO, 0, vec![]);
+        let block = block_with(BlockHeight(1), BlockHash::ZERO, 0, vec![]);
         let block_hash = block.hash();
         let certified = HashMap::new();
         let pending = HashMap::new();
-        let chain = chain_view(BlockHeight::GENESIS, Hash::ZERO, None, &certified, &pending);
+        let chain = chain_view(
+            BlockHeight::GENESIS,
+            BlockHash::ZERO,
+            None,
+            &certified,
+            &pending,
+        );
 
         let out = vp.classify_vote_in_flight(&chain, block_hash, &block, true);
         assert!(matches!(out, InFlightCheck::SkipVote));
@@ -1185,10 +1202,11 @@ mod tests {
         // Non-genesis parent QC that isn't in the chain view: parent is
         // effectively pruned, so we skip voting but still keep verifying.
         let mut vp = VerificationPipeline::new(BlockHeight::GENESIS);
-        let mut h = header(BlockHeight(5), Hash::from_bytes(b"parent"), 0);
+        let parent = bh(b"parent");
+        let mut h = header(BlockHeight(5), parent, 0);
         let mut parent_qc = QuorumCertificate::genesis();
         parent_qc.height = BlockHeight(4);
-        parent_qc.block_hash = Hash::from_bytes(b"parent");
+        parent_qc.block_hash = parent;
         h.parent_qc = parent_qc;
         let block = Block::Live {
             header: h,
@@ -1199,7 +1217,7 @@ mod tests {
         let block_hash = block.hash();
         let certified = HashMap::new();
         let pending = HashMap::new();
-        let chain = chain_view(BlockHeight(3), Hash::ZERO, None, &certified, &pending);
+        let chain = chain_view(BlockHeight(3), BlockHash::ZERO, None, &certified, &pending);
 
         let out = vp.classify_vote_in_flight(&chain, block_hash, &block, false);
         assert!(matches!(out, InFlightCheck::SkipVote));
@@ -1208,11 +1226,17 @@ mod tests {
     #[test]
     fn classify_vote_in_flight_proceeds_when_genesis_parent_and_counts_match() {
         let mut vp = VerificationPipeline::new(BlockHeight::GENESIS);
-        let block = block_with(BlockHeight(1), Hash::ZERO, 0, vec![]);
+        let block = block_with(BlockHeight(1), BlockHash::ZERO, 0, vec![]);
         let block_hash = block.hash();
         let certified = HashMap::new();
         let pending = HashMap::new();
-        let chain = chain_view(BlockHeight::GENESIS, Hash::ZERO, None, &certified, &pending);
+        let chain = chain_view(
+            BlockHeight::GENESIS,
+            BlockHash::ZERO,
+            None,
+            &certified,
+            &pending,
+        );
 
         let out = vp.classify_vote_in_flight(&chain, block_hash, &block, false);
         assert!(matches!(out, InFlightCheck::Proceed));
@@ -1223,11 +1247,17 @@ mod tests {
         // Genesis parent → parent_in_flight = 0. Block claims in_flight = 5
         // with 0 transactions: proposed doesn't match expected → Abort.
         let mut vp = VerificationPipeline::new(BlockHeight::GENESIS);
-        let block = block_with(BlockHeight(1), Hash::ZERO, 5, vec![]);
+        let block = block_with(BlockHeight(1), BlockHash::ZERO, 5, vec![]);
         let block_hash = block.hash();
         let certified = HashMap::new();
         let pending = HashMap::new();
-        let chain = chain_view(BlockHeight::GENESIS, Hash::ZERO, None, &certified, &pending);
+        let chain = chain_view(
+            BlockHeight::GENESIS,
+            BlockHash::ZERO,
+            None,
+            &certified,
+            &pending,
+        );
 
         let out = vp.classify_vote_in_flight(&chain, block_hash, &block, false);
         assert!(matches!(out, InFlightCheck::Abort));
@@ -1240,7 +1270,13 @@ mod tests {
         let mut vp = VerificationPipeline::new(BlockHeight::GENESIS);
         let certified = HashMap::new();
         let pending = HashMap::new();
-        let chain = chain_view(BlockHeight::GENESIS, Hash::ZERO, None, &certified, &pending);
+        let chain = chain_view(
+            BlockHeight::GENESIS,
+            BlockHash::ZERO,
+            None,
+            &certified,
+            &pending,
+        );
 
         let out = vp.drain_ready_state_root_verifications(&chain);
         assert!(out.is_empty());
@@ -1251,7 +1287,7 @@ mod tests {
         // Parent is at GENESIS height ≤ last_persisted_height, so initiate
         // queues this entry directly into ready_state_root_verifications.
         let mut vp = VerificationPipeline::new(BlockHeight::GENESIS);
-        let parent_hash = Hash::from_bytes(b"parent");
+        let parent_hash = bh(b"parent");
         let block = block_with(BlockHeight(1), parent_hash, 0, vec![]);
         let block_hash = block.hash();
 
@@ -1263,7 +1299,7 @@ mod tests {
         let certified = HashMap::new();
         let chain = chain_view(
             BlockHeight::GENESIS,
-            Hash::ZERO,
+            BlockHash::ZERO,
             None,
             &certified,
             &pending_with_block,
@@ -1276,10 +1312,10 @@ mod tests {
         assert_eq!(out[0].parent_block_height, BlockHeight::GENESIS);
 
         // Draining again without another initiate yields nothing.
-        let empty_pending: HashMap<Hash, PendingBlock> = HashMap::new();
+        let empty_pending: HashMap<BlockHash, PendingBlock> = HashMap::new();
         let chain2 = chain_view(
             BlockHeight::GENESIS,
-            Hash::ZERO,
+            BlockHash::ZERO,
             None,
             &certified,
             &empty_pending,

@@ -16,6 +16,7 @@
 
 mod crypto;
 mod hash;
+mod hash_kinds;
 mod identifiers;
 mod network;
 mod proofs;
@@ -65,7 +66,12 @@ pub use epoch::{
 };
 pub use hash::{
     compute_merkle_root, compute_merkle_root_with_proof, compute_padded_merkle_root,
-    verify_merkle_inclusion, Hash,
+    verify_merkle_inclusion, Hash, TypedHash,
+};
+pub use hash_kinds::{
+    BlockHash, CertificateRoot, EventRoot, ExecutionCertificateHash, GlobalReceiptRoot,
+    LocalReceiptRoot, ProvisionsRoot, StateRoot, TransactionRoot, TxHash, WaveReceiptHash,
+    WritesRoot,
 };
 pub use identifiers::{
     Attempt, BlockHeight, NodeId, PartitionNumber, Round, ShardGroupId, ValidatorId, VotePower,

@@ -13,7 +13,7 @@ use crate::RadixExecutor;
 use dashmap::DashMap;
 use hyperscale_storage::{CommittableSubstateDatabase, SubstateDatabase, SubstateStore};
 use hyperscale_types::{
-    BlockHeight, Hash, NodeId, RoutableTransaction, ShardGroupId, StateEntry, StateProvision,
+    BlockHeight, NodeId, RoutableTransaction, ShardGroupId, StateEntry, StateProvision, TxHash,
 };
 use radix_common::network::NetworkDefinition;
 use std::sync::{Arc, OnceLock};
@@ -21,7 +21,7 @@ use std::sync::{Arc, OnceLock};
 /// Shared execution cache — one per shard group in simulation.
 ///
 /// Key: transaction hash.  Value: `OnceLock` ensuring compute-once semantics.
-pub type SimExecutionCache = Arc<DashMap<Hash, Arc<OnceLock<SingleTxResult>>>>;
+pub type SimExecutionCache = Arc<DashMap<TxHash, Arc<OnceLock<SingleTxResult>>>>;
 
 /// Caching wrapper around [`RadixExecutor`] for simulation.
 ///

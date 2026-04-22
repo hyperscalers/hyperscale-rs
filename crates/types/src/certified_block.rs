@@ -5,7 +5,7 @@
 //! `(Block, QuorumCertificate)` tuples through storage, sync, and the wire
 //! layer, which left the relationship between the two parts undocumented.
 
-use crate::{Block, BlockHeight, Hash, QuorumCertificate};
+use crate::{Block, BlockHash, BlockHeight, QuorumCertificate};
 use sbor::prelude::*;
 
 /// A block alongside the QC that certifies it.
@@ -27,8 +27,8 @@ pub struct CertifiedBlock {
 /// Error returned when the block hash doesn't match the QC's `block_hash`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CertifiedBlockHashMismatch {
-    pub block_hash: Hash,
-    pub qc_block_hash: Hash,
+    pub block_hash: BlockHash,
+    pub qc_block_hash: BlockHash,
 }
 
 impl CertifiedBlock {
@@ -66,7 +66,7 @@ impl CertifiedBlock {
         self.block.height()
     }
 
-    pub fn hash(&self) -> Hash {
+    pub fn hash(&self) -> BlockHash {
         self.block.hash()
     }
 }

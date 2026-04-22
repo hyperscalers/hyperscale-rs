@@ -20,8 +20,8 @@ use hyperscale_storage_memory::SimStorage;
 use hyperscale_topology::TopologyState;
 use hyperscale_types::{
     bls_keypair_from_seed, shard_for_node, BlockHeight, Bls12381G1PrivateKey, Bls12381G1PublicKey,
-    CertifiedBlock, Hash as TxHash, NodeId, ShardGroupId, TransactionStatus, ValidatorId,
-    ValidatorInfo, ValidatorSet,
+    CertifiedBlock, NodeId, ShardGroupId, TransactionStatus, TxHash, ValidatorId, ValidatorInfo,
+    ValidatorSet,
 };
 use radix_common::network::NetworkDefinition;
 use rand::SeedableRng;

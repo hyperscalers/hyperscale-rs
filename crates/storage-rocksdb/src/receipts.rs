@@ -4,7 +4,7 @@ use crate::column_families::{ExecutionOutputsCf, LocalReceiptsCf};
 use crate::core::RocksDbStorage;
 use crate::typed_cf::{self, TypedCf};
 
-use hyperscale_types::Hash;
+use hyperscale_types::TxHash;
 use rocksdb::WriteBatch;
 use std::sync::Arc;
 
@@ -48,7 +48,7 @@ impl RocksDbStorage {
         typed_cf::batch_put::<LocalReceiptsCf>(
             batch,
             LocalReceiptsCf::handle(&cf),
-            &bundle.tx_hash,
+            bundle.tx_hash.as_raw(),
             bundle.local_receipt.as_ref(),
         );
 
@@ -56,22 +56,26 @@ impl RocksDbStorage {
             typed_cf::batch_put::<ExecutionOutputsCf>(
                 batch,
                 ExecutionOutputsCf::handle(&cf),
-                &bundle.tx_hash,
+                bundle.tx_hash.as_raw(),
                 local,
             );
         }
     }
 
     /// Retrieve the local receipt for a transaction.
-    pub fn get_local_receipt(&self, tx_hash: &Hash) -> Option<Arc<hyperscale_types::LocalReceipt>> {
-        self.cf_get::<LocalReceiptsCf>(tx_hash).map(Arc::new)
+    pub fn get_local_receipt(
+        &self,
+        tx_hash: &TxHash,
+    ) -> Option<Arc<hyperscale_types::LocalReceipt>> {
+        self.cf_get::<LocalReceiptsCf>(tx_hash.as_raw())
+            .map(Arc::new)
     }
 
     /// Retrieve execution output details for a transaction.
     pub fn get_execution_output(
         &self,
-        tx_hash: &Hash,
+        tx_hash: &TxHash,
     ) -> Option<hyperscale_types::ExecutionMetadata> {
-        self.cf_get::<ExecutionOutputsCf>(tx_hash)
+        self.cf_get::<ExecutionOutputsCf>(tx_hash.as_raw())
     }
 }

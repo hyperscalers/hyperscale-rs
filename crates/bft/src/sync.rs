@@ -6,7 +6,8 @@
 
 use hyperscale_core::Action;
 use hyperscale_types::{
-    BlockHeight, Bls12381G1PublicKey, CertifiedBlock, Hash, QuorumCertificate, TopologySnapshot,
+    BlockHash, BlockHeight, Bls12381G1PublicKey, CertifiedBlock, QuorumCertificate,
+    TopologySnapshot,
 };
 use std::collections::{BTreeMap, HashMap};
 use tracing::{debug, info, warn};
@@ -50,7 +51,7 @@ pub(crate) struct SyncManager {
 
     /// Synced blocks pending QC signature verification.
     /// Maps block_hash -> pending synced block info.
-    pending_synced_block_verifications: HashMap<Hash, PendingSyncedBlockVerification>,
+    pending_synced_block_verifications: HashMap<BlockHash, PendingSyncedBlockVerification>,
 }
 
 impl SyncManager {
@@ -103,7 +104,7 @@ impl SyncManager {
     // ═══════════════════════════════════════════════════════════════════════
 
     /// Check if a synced block is already pending verification.
-    pub fn has_pending_verification(&self, block_hash: &Hash) -> bool {
+    pub fn has_pending_verification(&self, block_hash: &BlockHash) -> bool {
         self.pending_synced_block_verifications
             .contains_key(block_hash)
     }
@@ -262,7 +263,7 @@ impl SyncManager {
     /// `None` if the block_hash wasn't found in pending synced verifications.
     pub fn on_qc_verified(
         &mut self,
-        block_hash: Hash,
+        block_hash: BlockHash,
         valid: bool,
     ) -> Option<SyncVerificationResult> {
         let mut pending = self
@@ -468,7 +469,7 @@ pub(crate) enum SyncHealthDecision {
     /// Trigger catch-up sync to the named target.
     TriggerSync {
         target_height: BlockHeight,
-        target_hash: Hash,
+        target_hash: BlockHash,
     },
 }
 
@@ -587,8 +588,9 @@ mod tests {
     use super::*;
     use hyperscale_test_helpers::TestCommittee;
     use hyperscale_types::{
-        Block, BlockHeader, ProposerTimestamp, Round, ShardGroupId, ValidatorId, ValidatorInfo,
-        ValidatorSet,
+        Block, BlockHeader, CertificateRoot, Hash, LocalReceiptRoot, ProposerTimestamp,
+        ProvisionsRoot, Round, ShardGroupId, StateRoot, TransactionRoot, ValidatorId,
+        ValidatorInfo, ValidatorSet,
     };
     use std::collections::BTreeMap;
 
@@ -608,17 +610,17 @@ mod tests {
         BlockHeader {
             shard_group_id: ShardGroupId(0),
             height,
-            parent_hash: Hash::from_bytes(tag),
+            parent_hash: BlockHash::from_raw(Hash::from_bytes(tag)),
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(0),
             timestamp: ProposerTimestamp(0),
             round: Round::INITIAL,
             is_fallback: false,
-            state_root: Hash::ZERO,
-            transaction_root: Hash::ZERO,
-            certificate_root: Hash::ZERO,
-            local_receipt_root: Hash::ZERO,
-            provision_root: Hash::ZERO,
+            state_root: StateRoot::ZERO,
+            transaction_root: TransactionRoot::ZERO,
+            certificate_root: CertificateRoot::ZERO,
+            local_receipt_root: LocalReceiptRoot::ZERO,
+            provision_root: ProvisionsRoot::ZERO,
             waves: Vec::new(),
             provision_tx_roots: BTreeMap::new(),
             in_flight: 0,
@@ -788,7 +790,7 @@ mod tests {
     fn qc_at(height: BlockHeight) -> QuorumCertificate {
         let mut qc = QuorumCertificate::genesis();
         qc.height = height;
-        qc.block_hash = Hash::from_bytes(b"qc");
+        qc.block_hash = BlockHash::from_raw(Hash::from_bytes(b"qc"));
         qc
     }
 

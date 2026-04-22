@@ -3,7 +3,7 @@
 use crate::core::RocksDbStorage;
 
 use hyperscale_metrics as metrics;
-use hyperscale_types::BlockHeight;
+use hyperscale_types::{BlockHash, BlockHeight};
 
 impl RocksDbStorage {
     /// Load recovered state from storage for crash recovery.
@@ -54,7 +54,7 @@ impl RocksDbStorage {
 
         hyperscale_bft::RecoveredState {
             committed_height,
-            committed_hash,
+            committed_hash: committed_hash.map(BlockHash::from_raw),
             latest_qc,
             jmt_root: jmt_root_opt,
         }

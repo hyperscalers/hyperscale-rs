@@ -16,7 +16,7 @@
 //! - `deferred_by_nodes`: hash → set of nodes blocking it.
 
 use crate::lock_tracker::LockTracker;
-use hyperscale_types::{Hash, NodeId, RoutableTransaction};
+use hyperscale_types::{NodeId, RoutableTransaction, TxHash};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,10 +27,10 @@ struct ReadyEntry {
 }
 
 pub(crate) struct ReadySet {
-    ready: BTreeMap<Hash, ReadyEntry>,
-    deferred_by_nodes: HashMap<Hash, HashSet<NodeId>>,
-    txs_deferred_by_node: HashMap<NodeId, HashSet<Hash>>,
-    ready_txs_by_node: HashMap<NodeId, HashSet<Hash>>,
+    ready: BTreeMap<TxHash, ReadyEntry>,
+    deferred_by_nodes: HashMap<TxHash, HashSet<NodeId>>,
+    txs_deferred_by_node: HashMap<NodeId, HashSet<TxHash>>,
+    ready_txs_by_node: HashMap<NodeId, HashSet<TxHash>>,
 }
 
 impl ReadySet {
@@ -50,7 +50,7 @@ impl ReadySet {
     /// is a no-op.
     pub fn add(
         &mut self,
-        hash: Hash,
+        hash: TxHash,
         tx: Arc<RoutableTransaction>,
         added_at: Duration,
         locks: &LockTracker,
@@ -89,7 +89,7 @@ impl ReadySet {
     /// the set of nodes that were freed by removing a ready-set entry so the
     /// caller can cascade-promote deferred txs whose ready-set claim has now
     /// been released. Empty `Vec` when `hash` was deferred or absent.
-    pub fn remove(&mut self, hash: &Hash) -> Vec<NodeId> {
+    pub fn remove(&mut self, hash: &TxHash) -> Vec<NodeId> {
         let mut freed_nodes = Vec::new();
         if let Some(entry) = self.ready.remove(hash) {
             for node in entry.tx.all_declared_nodes() {
@@ -150,7 +150,7 @@ impl ReadySet {
     /// whose last blocker was `node` — those are candidates for ready-set
     /// promotion. The caller must verify each hash is still a valid, Pending
     /// pool entry before re-adding it via [`add`](Self::add).
-    pub fn promotable_for_node(&mut self, node: NodeId) -> Vec<Hash> {
+    pub fn promotable_for_node(&mut self, node: NodeId) -> Vec<TxHash> {
         let Some(deferred_txs) = self.txs_deferred_by_node.remove(&node) else {
             return Vec::new();
         };
@@ -203,7 +203,7 @@ mod tests {
     use super::*;
     use hyperscale_types::test_utils::{test_node, test_transaction_with_nodes};
 
-    fn tx_with(seed: u8, nodes: &[u8]) -> (Hash, Arc<RoutableTransaction>) {
+    fn tx_with(seed: u8, nodes: &[u8]) -> (TxHash, Arc<RoutableTransaction>) {
         let nodes: Vec<_> = nodes.iter().map(|n| test_node(*n)).collect();
         let tx = test_transaction_with_nodes(&[seed], nodes.clone(), nodes);
         let hash = tx.hash();
@@ -476,7 +476,7 @@ mod tests {
         op: &Op,
         rs: &mut ReadySet,
         locks: &mut LockTracker,
-        fixture: &[(Hash, Arc<RoutableTransaction>)],
+        fixture: &[(TxHash, Arc<RoutableTransaction>)],
     ) {
         let pool_len = fixture.len();
         match op {
@@ -509,7 +509,7 @@ mod tests {
     fn cascade_promote(
         rs: &mut ReadySet,
         locks: &LockTracker,
-        fixture: &[(Hash, Arc<RoutableTransaction>)],
+        fixture: &[(TxHash, Arc<RoutableTransaction>)],
         node: NodeId,
     ) {
         let mut promotable = rs.promotable_for_node(node);
@@ -530,7 +530,7 @@ mod tests {
         ) {
             // Fixture: 8 txs over 4 declared-node seeds, heavy overlap so the
             // deferred path gets real exercise.
-            let fixture: Vec<(Hash, Arc<RoutableTransaction>)> = (0..8)
+            let fixture: Vec<(TxHash, Arc<RoutableTransaction>)> = (0..8)
                 .map(|seed| tx_with(seed, &[0, 1, 2, 3][..(1 + (seed as usize) % 4)]))
                 .collect();
 

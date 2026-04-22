@@ -20,7 +20,7 @@
 
 use hyperscale_core::Action;
 use hyperscale_types::{
-    BlockHeader, BlockHeight, BlockVote, Hash, Round, TopologySnapshot, ValidatorId,
+    BlockHash, BlockHeader, BlockHeight, BlockVote, Round, TopologySnapshot, ValidatorId,
 };
 use std::collections::HashMap;
 use tracing::{info, trace, warn};
@@ -34,7 +34,7 @@ pub use crate::vote_set::VoteSet;
 /// record used for equivocation detection.
 pub(crate) struct VoteKeeper {
     /// Vote sets for blocks being voted on (block_hash -> vote set).
-    pub(crate) vote_sets: HashMap<Hash, VoteSet>,
+    pub(crate) vote_sets: HashMap<BlockHash, VoteSet>,
 
     /// Own-vote locking: tracks which block hash we voted for at each height.
     /// Critical for BFT safety — prevents voting for conflicting blocks at the
@@ -42,13 +42,13 @@ pub(crate) struct VoteKeeper {
     /// timeout or when a QC proves the lock is irrelevant.
     ///
     /// Key: height, Value: (block_hash, round)
-    pub(crate) voted_heights: HashMap<BlockHeight, (Hash, Round)>,
+    pub(crate) voted_heights: HashMap<BlockHeight, (BlockHash, Round)>,
 
     /// Per-validator record of received verified votes for equivocation
     /// detection. Key: (height, validator), Value: (block_hash, round).
     /// A different-block vote at the same (height, round) is equivocation;
     /// at a later round it's a legitimate revote after unlock.
-    pub(crate) received_votes_by_height: HashMap<(BlockHeight, ValidatorId), (Hash, Round)>,
+    pub(crate) received_votes_by_height: HashMap<(BlockHeight, ValidatorId), (BlockHash, Round)>,
 }
 
 impl VoteKeeper {
@@ -113,7 +113,7 @@ impl VoteKeeper {
     // ═══════════════════════════════════════════════════════════════════════
 
     /// Check whether we may vote for `block_hash` at `height`.
-    pub fn lock_decision(&self, height: BlockHeight, block_hash: Hash) -> LockDecision {
+    pub fn lock_decision(&self, height: BlockHeight, block_hash: BlockHash) -> LockDecision {
         match self.voted_heights.get(&height).copied() {
             None => LockDecision::Unlocked,
             Some((existing_hash, existing_round)) if existing_hash == block_hash => {
@@ -127,7 +127,7 @@ impl VoteKeeper {
     }
 
     /// Record our own vote for `block_hash` at `(height, round)`.
-    pub fn record_own_vote(&mut self, height: BlockHeight, block_hash: Hash, round: Round) {
+    pub fn record_own_vote(&mut self, height: BlockHeight, block_hash: BlockHash, round: Round) {
         self.voted_heights.insert(height, (block_hash, round));
     }
 
@@ -139,12 +139,12 @@ impl VoteKeeper {
 
     /// Read-only view of own-vote locks, for callers that need to iterate
     /// (e.g., QC-based unlock iterates all heights ≤ qc.height).
-    pub fn voted_heights(&self) -> &HashMap<BlockHeight, (Hash, Round)> {
+    pub fn voted_heights(&self) -> &HashMap<BlockHeight, (BlockHash, Round)> {
         &self.voted_heights
     }
 
     /// Block hash locked at `height`, if any.
-    pub fn locked_block(&self, height: BlockHeight) -> Option<Hash> {
+    pub fn locked_block(&self, height: BlockHeight) -> Option<BlockHash> {
         self.voted_heights.get(&height).map(|(hash, _)| *hash)
     }
 
@@ -253,7 +253,7 @@ impl VoteKeeper {
     pub fn maybe_trigger_verification(
         &mut self,
         topology: &TopologySnapshot,
-        block_hash: Hash,
+        block_hash: BlockHash,
     ) -> Vec<Action> {
         let total_power = topology.local_voting_power();
 
@@ -298,7 +298,7 @@ impl VoteKeeper {
 
     /// Mark the vote set for `block_hash` as having produced a QC, so
     /// subsequent duplicates are ignored. No-op if the set is absent.
-    pub fn mark_qc_built(&mut self, block_hash: Hash) {
+    pub fn mark_qc_built(&mut self, block_hash: BlockHash) {
         if let Some(vote_set) = self.vote_sets.get_mut(&block_hash) {
             vote_set.on_qc_built();
         }
@@ -307,7 +307,7 @@ impl VoteKeeper {
     /// Record a verified vote into the per-height equivocation log, warning
     /// on a different-block vote at the same round. Called after signature
     /// verification so a forged vote can't pre-empt a legitimate one.
-    pub fn track_verified_received_vote(&mut self, block_hash: Hash, vote: &BlockVote) {
+    pub fn track_verified_received_vote(&mut self, block_hash: BlockHash, vote: &BlockVote) {
         match self.record_received_vote(vote.height, vote.voter, block_hash, vote.round) {
             RecordResult::Accepted | RecordResult::Duplicate => {}
             RecordResult::Equivocation {
@@ -333,7 +333,7 @@ impl VoteKeeper {
     /// been cleaned up in the meantime.
     pub fn finalize_pending_batch(
         &mut self,
-        block_hash: Hash,
+        block_hash: BlockHash,
         verified_votes: Vec<(usize, BlockVote, u64)>,
     ) {
         let Some(vote_set) = self.vote_sets.get_mut(&block_hash) else {
@@ -373,7 +373,7 @@ impl VoteKeeper {
         &mut self,
         height: BlockHeight,
         voter: ValidatorId,
-        block_hash: Hash,
+        block_hash: BlockHash,
         round: Round,
     ) -> RecordResult {
         let key = (height, voter);
@@ -413,7 +413,7 @@ pub(crate) enum LockDecision {
     AlreadyVotedSameBlock { existing_round: Round },
     /// Locked to a different block at this height; caller must not vote.
     LockedToOther {
-        existing_block: Hash,
+        existing_block: BlockHash,
         existing_round: Round,
     },
 }
@@ -430,7 +430,7 @@ pub(crate) enum RecordResult {
     /// Byzantine: voter previously voted for a different block at the same
     /// `(height, round)`. The original is preserved.
     Equivocation {
-        existing_block: Hash,
+        existing_block: BlockHash,
         existing_round: Round,
     },
 }
@@ -438,23 +438,26 @@ pub(crate) enum RecordResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hyperscale_types::{QuorumCertificate, ShardGroupId, ValidatorId};
+    use hyperscale_types::{
+        CertificateRoot, Hash, LocalReceiptRoot, ProvisionsRoot, QuorumCertificate, ShardGroupId,
+        StateRoot, TransactionRoot, ValidatorId,
+    };
 
     fn make_header(height: BlockHeight) -> BlockHeader {
         BlockHeader {
             shard_group_id: ShardGroupId(0),
             height,
-            parent_hash: Hash::from_bytes(b"parent"),
+            parent_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(0),
             timestamp: hyperscale_types::ProposerTimestamp(1234567890),
             round: Round::INITIAL,
             is_fallback: false,
-            state_root: Hash::ZERO,
-            transaction_root: Hash::ZERO,
-            certificate_root: Hash::ZERO,
-            local_receipt_root: Hash::ZERO,
-            provision_root: Hash::ZERO,
+            state_root: StateRoot::ZERO,
+            transaction_root: TransactionRoot::ZERO,
+            certificate_root: CertificateRoot::ZERO,
+            local_receipt_root: LocalReceiptRoot::ZERO,
+            provision_root: ProvisionsRoot::ZERO,
             waves: vec![],
             provision_tx_roots: std::collections::BTreeMap::new(),
             in_flight: 0,
@@ -464,15 +467,21 @@ mod tests {
     #[test]
     fn keeper_cleanup_committed_drops_entries_at_and_below_height() {
         let mut vk = VoteKeeper::new();
-        vk.voted_heights
-            .insert(BlockHeight(1), (Hash::from_bytes(b"b1"), Round(0)));
-        vk.voted_heights
-            .insert(BlockHeight(2), (Hash::from_bytes(b"b2"), Round(0)));
-        vk.voted_heights
-            .insert(BlockHeight(3), (Hash::from_bytes(b"b3"), Round(0)));
+        vk.voted_heights.insert(
+            BlockHeight(1),
+            (BlockHash::from_raw(Hash::from_bytes(b"b1")), Round(0)),
+        );
+        vk.voted_heights.insert(
+            BlockHeight(2),
+            (BlockHash::from_raw(Hash::from_bytes(b"b2")), Round(0)),
+        );
+        vk.voted_heights.insert(
+            BlockHeight(3),
+            (BlockHash::from_raw(Hash::from_bytes(b"b3")), Round(0)),
+        );
         vk.received_votes_by_height.insert(
             (BlockHeight(2), ValidatorId(7)),
-            (Hash::from_bytes(b"b2"), Round(0)),
+            (BlockHash::from_raw(Hash::from_bytes(b"b2")), Round(0)),
         );
 
         vk.cleanup_committed(BlockHeight(2));
@@ -524,7 +533,7 @@ mod tests {
         let mut vk = VoteKeeper::new();
         let h = BlockHeight(5);
         let v = ValidatorId(2);
-        let block = Hash::from_bytes(b"block_a");
+        let block = BlockHash::from_raw(Hash::from_bytes(b"block_a"));
 
         assert_eq!(
             vk.record_received_vote(h, v, block, Round(0)),
@@ -538,8 +547,8 @@ mod tests {
         let mut vk = VoteKeeper::new();
         let h = BlockHeight(5);
         let v = ValidatorId(2);
-        let block_a = Hash::from_bytes(b"block_a");
-        let block_b = Hash::from_bytes(b"block_b");
+        let block_a = BlockHash::from_raw(Hash::from_bytes(b"block_a"));
+        let block_b = BlockHash::from_raw(Hash::from_bytes(b"block_b"));
 
         vk.record_received_vote(h, v, block_a, Round(0));
         let result = vk.record_received_vote(h, v, block_b, Round(0));
@@ -564,8 +573,8 @@ mod tests {
         let mut vk = VoteKeeper::new();
         let h = BlockHeight(5);
         let v = ValidatorId(2);
-        let block_a = Hash::from_bytes(b"block_a");
-        let block_b = Hash::from_bytes(b"block_b");
+        let block_a = BlockHash::from_raw(Hash::from_bytes(b"block_a"));
+        let block_b = BlockHash::from_raw(Hash::from_bytes(b"block_b"));
 
         vk.record_received_vote(h, v, block_a, Round(0));
         assert_eq!(
@@ -584,8 +593,8 @@ mod tests {
         let mut vk = VoteKeeper::new();
         let v = ValidatorId(2);
         let round = Round(0);
-        let block_a = Hash::from_bytes(b"block_a");
-        let block_b = Hash::from_bytes(b"block_b");
+        let block_a = BlockHash::from_raw(Hash::from_bytes(b"block_a"));
+        let block_b = BlockHash::from_raw(Hash::from_bytes(b"block_b"));
 
         assert_eq!(
             vk.record_received_vote(BlockHeight(5), v, block_a, round),
@@ -604,7 +613,7 @@ mod tests {
         let mut vk = VoteKeeper::new();
         let h = BlockHeight(5);
         let v = ValidatorId(2);
-        let block = Hash::from_bytes(b"block_a");
+        let block = BlockHash::from_raw(Hash::from_bytes(b"block_a"));
 
         vk.record_received_vote(h, v, block, Round(0));
         assert_eq!(
@@ -618,8 +627,8 @@ mod tests {
         let mut vk = VoteKeeper::new();
         let h = BlockHeight(5);
         let v = ValidatorId(2);
-        let block_a = Hash::from_bytes(b"block_a");
-        let block_b = Hash::from_bytes(b"block_b");
+        let block_a = BlockHash::from_raw(Hash::from_bytes(b"block_a"));
+        let block_b = BlockHash::from_raw(Hash::from_bytes(b"block_b"));
 
         vk.record_received_vote(h, v, block_a, Round(3));
         // Later arrival at LOWER round: stale, dropped without overwriting.
@@ -641,7 +650,7 @@ mod tests {
     fn lock_decision_is_unlocked_without_prior_vote() {
         let vk = VoteKeeper::new();
         assert_eq!(
-            vk.lock_decision(BlockHeight(1), Hash::from_bytes(b"b")),
+            vk.lock_decision(BlockHeight(1), BlockHash::from_raw(Hash::from_bytes(b"b"))),
             LockDecision::Unlocked
         );
     }
@@ -650,7 +659,7 @@ mod tests {
     fn lock_decision_reports_same_block_after_own_vote() {
         let mut vk = VoteKeeper::new();
         let h = BlockHeight(1);
-        let block = Hash::from_bytes(b"b");
+        let block = BlockHash::from_raw(Hash::from_bytes(b"b"));
         vk.record_own_vote(h, block, Round(0));
 
         assert_eq!(
@@ -665,8 +674,8 @@ mod tests {
     fn lock_decision_reports_locked_to_other_for_conflicting_block() {
         let mut vk = VoteKeeper::new();
         let h = BlockHeight(1);
-        let block_a = Hash::from_bytes(b"block_a");
-        let block_b = Hash::from_bytes(b"block_b");
+        let block_a = BlockHash::from_raw(Hash::from_bytes(b"block_a"));
+        let block_b = BlockHash::from_raw(Hash::from_bytes(b"block_b"));
         vk.record_own_vote(h, block_a, Round(0));
 
         match vk.lock_decision(h, block_b) {
@@ -685,7 +694,7 @@ mod tests {
     fn unlock_at_releases_lock_and_reports_prior_presence() {
         let mut vk = VoteKeeper::new();
         let h = BlockHeight(1);
-        vk.record_own_vote(h, Hash::from_bytes(b"b"), Round(0));
+        vk.record_own_vote(h, BlockHash::from_raw(Hash::from_bytes(b"b")), Round(0));
 
         assert!(vk.unlock_at(h));
         assert!(!vk.is_locked_at(h));
@@ -697,13 +706,14 @@ mod tests {
 #[cfg(test)]
 mod properties {
     use super::*;
+    use hyperscale_types::Hash;
     use proptest::prelude::*;
     use std::collections::HashMap;
 
     /// Arbitrary received-vote event, drawn from a small key space so multiple
     /// events are likely to collide on `(height, voter)` and stress the
     /// equivocation path.
-    fn vote_event() -> impl Strategy<Value = (BlockHeight, ValidatorId, Hash, Round)> {
+    fn vote_event() -> impl Strategy<Value = (BlockHeight, ValidatorId, BlockHash, Round)> {
         (
             1u64..=4, // height
             0u64..=3, // voter
@@ -711,7 +721,7 @@ mod properties {
             0u64..=3, // round
         )
             .prop_map(|(h, v, block_variant, r)| {
-                let block = Hash::from_bytes(&[block_variant; 32]);
+                let block = BlockHash::from_raw(Hash::from_bytes(&[block_variant; 32]));
                 (BlockHeight(h), ValidatorId(v), block, Round(r))
             })
     }
@@ -726,7 +736,7 @@ mod properties {
             events in prop::collection::vec(vote_event(), 0..80),
         ) {
             let mut vk = VoteKeeper::new();
-            let mut model: HashMap<(BlockHeight, ValidatorId), (Hash, Round)> = HashMap::new();
+            let mut model: HashMap<(BlockHeight, ValidatorId), (BlockHash, Round)> = HashMap::new();
 
             for (h, v, block, round) in events {
                 let result = vk.record_received_vote(h, v, block, round);
@@ -793,7 +803,7 @@ mod properties {
         ) {
             let mut vk = VoteKeeper::new();
             let h = BlockHeight(height);
-            let block = Hash::from_bytes(&[block_variant; 32]);
+            let block = BlockHash::from_raw(Hash::from_bytes(&[block_variant; 32]));
 
             vk.record_own_vote(h, block, Round(round));
             prop_assert!(vk.is_locked_at(h));

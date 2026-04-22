@@ -8,8 +8,8 @@ use hyperscale_provisions::{ProvisionConfig, ProvisionCoordinator};
 use hyperscale_remote_headers::RemoteHeaderCoordinator;
 use hyperscale_topology::TopologyState;
 use hyperscale_types::{
-    Block, BlockHeader, BlockManifest, CertifiedBlock, FinalizedWave, Hash, Provision,
-    QuorumCertificate, RoutableTransaction, ShardGroupId, TopologySnapshot,
+    Block, BlockHash, BlockHeader, BlockManifest, CertifiedBlock, FinalizedWave, Provision,
+    QuorumCertificate, RoutableTransaction, ShardGroupId, StateRoot, TopologySnapshot, TxHash,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -150,7 +150,7 @@ impl NodeStateMachine {
     }
 
     /// Get the last committed JMT root hash (delegated to BFT's verification pipeline).
-    pub fn last_committed_jmt_root(&self) -> Hash {
+    pub fn last_committed_jmt_root(&self) -> StateRoot {
         self.bft.jmt_root()
     }
 
@@ -294,7 +294,7 @@ impl NodeStateMachine {
     }
 
     /// Handle QC formed — may trigger immediate next proposal.
-    fn on_qc_formed(&mut self, block_hash: Hash, qc: QuorumCertificate) -> Vec<Action> {
+    fn on_qc_formed(&mut self, block_hash: BlockHash, qc: QuorumCertificate) -> Vec<Action> {
         // Count transactions and certificates in the block that will be committed.
         // This is critical for respecting in-flight limits: the BlockCommitted
         // event won't be processed until after we select transactions, so we
@@ -321,7 +321,7 @@ impl NodeStateMachine {
         let block_hash = certified.block.hash();
 
         // Register committed tx hashes with BFT for timeout abort validation.
-        let tx_hashes: Vec<Hash> = certified
+        let tx_hashes: Vec<TxHash> = certified
             .block
             .transactions()
             .iter()
@@ -382,10 +382,6 @@ impl NodeStateMachine {
         // separately by `on_block_committed` reading `block.certificates`.
         self.execution
             .cleanup_committed_waves(certified.block.certificates());
-        for cert in certified.block.certificates() {
-            let cert_hash = cert.wave_id().hash();
-            self.bft.remove_committed_transaction(&cert_hash);
-        }
 
         actions.extend(
             self.execution
@@ -403,7 +399,7 @@ impl NodeStateMachine {
     }
 
     /// Handle transaction executed — notify mempool and check pending blocks.
-    fn on_transaction_executed(&mut self, tx_hash: Hash, accepted: bool) -> Vec<Action> {
+    fn on_transaction_executed(&mut self, tx_hash: TxHash, accepted: bool) -> Vec<Action> {
         // Notify mempool
         let mut actions =
             self.mempool
@@ -425,7 +421,7 @@ impl NodeStateMachine {
         actions
     }
 
-    fn on_ec_created(&mut self, tx_hashes: Vec<Hash>) -> Vec<Action> {
+    fn on_ec_created(&mut self, tx_hashes: Vec<TxHash>) -> Vec<Action> {
         self.mempool.on_ec_created(&tx_hashes);
         vec![]
     }

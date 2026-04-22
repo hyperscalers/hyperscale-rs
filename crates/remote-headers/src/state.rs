@@ -609,7 +609,8 @@ impl RemoteHeaderCoordinator {
 mod tests {
     use super::*;
     use hyperscale_types::{
-        BlockHeader, Hash, QuorumCertificate, Round, ShardGroupId, ValidatorId,
+        BlockHash, BlockHeader, CertificateRoot, Hash, LocalReceiptRoot, ProvisionsRoot,
+        QuorumCertificate, Round, ShardGroupId, StateRoot, TransactionRoot, ValidatorId,
     };
     use std::collections::BTreeMap;
 
@@ -631,24 +632,24 @@ mod tests {
         let header = BlockHeader {
             shard_group_id: ShardGroupId(2),
             height: BlockHeight(5),
-            parent_hash: Hash::ZERO,
+            parent_hash: BlockHash::ZERO,
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(0),
             timestamp: hyperscale_types::ProposerTimestamp(1234567890),
             round: Round::INITIAL,
             is_fallback: false,
-            state_root: Hash::ZERO,
-            transaction_root: Hash::ZERO,
-            certificate_root: Hash::ZERO,
-            local_receipt_root: Hash::ZERO,
-            provision_root: Hash::ZERO,
+            state_root: StateRoot::ZERO,
+            transaction_root: TransactionRoot::ZERO,
+            certificate_root: CertificateRoot::ZERO,
+            local_receipt_root: LocalReceiptRoot::ZERO,
+            provision_root: ProvisionsRoot::ZERO,
             waves: vec![],
             provision_tx_roots: BTreeMap::new(),
             in_flight: 0,
         };
         let mut qc = QuorumCertificate::genesis();
         // Deliberately set wrong block_hash
-        qc.block_hash = Hash::from_bytes(b"wrong");
+        qc.block_hash = BlockHash::from_raw(Hash::from_bytes(b"wrong"));
         qc.shard_group_id = ShardGroupId(2);
         qc.height = BlockHeight(5);
 

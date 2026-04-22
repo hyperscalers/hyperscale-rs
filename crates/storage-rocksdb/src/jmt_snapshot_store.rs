@@ -7,7 +7,7 @@ use crate::jmt_stored::StoredNodeKey;
 use crate::typed_cf::{self, TypedCf};
 
 use hyperscale_jmt as jmt;
-use hyperscale_storage::{DbPartitionKey, DbSortKey, StateRootHash, SubstateLookup};
+use hyperscale_storage::{DbPartitionKey, DbSortKey, StateRoot, SubstateLookup};
 use rocksdb::{Snapshot, DB};
 
 /// A tree store that reads JMT nodes from a RocksDB snapshot.
@@ -54,7 +54,7 @@ impl<'a> SnapshotTreeStore<'a> {
     /// atomic with respect to the nodes visible through this snapshot.
     ///
     /// Returns `(version, root_hash)`. For an empty tree, returns `(0, [0; 32])`.
-    pub fn read_jmt_metadata(&self) -> (u64, StateRootHash) {
+    pub fn read_jmt_metadata(&self) -> (u64, StateRoot) {
         crate::metadata::read_jmt_metadata(&self.snapshot)
     }
 }

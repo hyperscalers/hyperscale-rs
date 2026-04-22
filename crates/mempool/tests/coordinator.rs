@@ -10,7 +10,7 @@ use hyperscale_mempool::{MempoolConfig, MempoolCoordinator, MempoolMemoryStats};
 use hyperscale_test_helpers::{certify, make_finalized_wave, make_live_block, TestCommittee};
 use hyperscale_types::{
     test_utils::test_transaction, BlockHeight, Hash, ShardGroupId, TopologySnapshot,
-    TransactionDecision, ValidatorId,
+    TransactionDecision, TxHash, ValidatorId,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -79,10 +79,12 @@ fn at_pending_limit_is_false_on_fresh_coordinator() {
 #[test]
 fn has_transaction_is_false_on_fresh_coordinator() {
     let coord = MempoolCoordinator::new();
-    assert!(!coord.has_transaction(&Hash::from_bytes(b"unknown")));
-    assert!(coord.status(&Hash::from_bytes(b"unknown")).is_none());
+    assert!(!coord.has_transaction(&TxHash::from_raw(Hash::from_bytes(b"unknown"))));
     assert!(coord
-        .get_transaction(&Hash::from_bytes(b"unknown"))
+        .status(&TxHash::from_raw(Hash::from_bytes(b"unknown")))
+        .is_none());
+    assert!(coord
+        .get_transaction(&TxHash::from_raw(Hash::from_bytes(b"unknown")))
         .is_none());
 }
 
@@ -107,7 +109,7 @@ fn lock_contention_stats_zero_on_fresh_coordinator() {
 #[test]
 fn is_tombstoned_is_false_on_fresh_coordinator() {
     let coord = MempoolCoordinator::new();
-    assert!(!coord.is_tombstoned(&Hash::from_bytes(b"unknown")));
+    assert!(!coord.is_tombstoned(&TxHash::from_raw(Hash::from_bytes(b"unknown"))));
 }
 
 #[test]

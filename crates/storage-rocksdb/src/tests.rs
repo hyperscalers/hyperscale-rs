@@ -9,7 +9,8 @@ use hyperscale_storage::{
     NodeDatabaseUpdates, PartitionDatabaseUpdates, SubstateDatabase, SubstateStore,
 };
 use hyperscale_types::{
-    BlockHeight, Hash, QuorumCertificate, ReceiptBundle, Round, ShardGroupId, WeightedTimestamp,
+    BlockHash, BlockHeight, Hash, QuorumCertificate, ReceiptBundle, Round, ShardGroupId, StateRoot,
+    TxHash, WeightedTimestamp,
 };
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -20,7 +21,7 @@ fn updates_to_receipts(updates: &DatabaseUpdates) -> Vec<ReceiptBundle> {
         return vec![];
     }
     vec![ReceiptBundle {
-        tx_hash: Hash::ZERO,
+        tx_hash: TxHash::ZERO,
         local_receipt: Arc::new(hyperscale_types::LocalReceipt {
             outcome: hyperscale_types::TransactionOutcome::Success,
             database_updates: updates.clone(),
@@ -136,7 +137,10 @@ fn test_recovery_resumes_at_correct_height() {
         let recovered = storage.load_recovered_state();
 
         assert_eq!(recovered.committed_height, BlockHeight(50));
-        assert_eq!(recovered.committed_hash, Some(expected_hash));
+        assert_eq!(
+            recovered.committed_hash,
+            Some(BlockHash::from_raw(expected_hash))
+        );
     }
 }
 
@@ -217,7 +221,8 @@ fn test_recovery_with_qc() {
     use hyperscale_types::{zero_bls_signature, SignerBitfield};
 
     let temp_dir = TempDir::new().unwrap();
-    let expected_hash = Hash::from_hash_bytes(&[99; 32]);
+    let expected_raw = Hash::from_hash_bytes(&[99; 32]);
+    let expected_hash = BlockHash::from_raw(expected_raw);
 
     {
         let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
@@ -225,13 +230,13 @@ fn test_recovery_with_qc() {
             block_hash: expected_hash,
             shard_group_id: ShardGroupId(0),
             height: BlockHeight(100),
-            parent_block_hash: Hash::from_bytes(&[98; 32]),
+            parent_block_hash: BlockHash::from_raw(Hash::from_bytes(&[98; 32])),
             round: Round(5),
             aggregated_signature: zero_bls_signature(),
             signers: SignerBitfield::new(4),
             weighted_timestamp: WeightedTimestamp(100_000),
         };
-        storage.set_chain_metadata(BlockHeight(100), Some(expected_hash), Some(&qc));
+        storage.set_chain_metadata(BlockHeight(100), Some(expected_raw), Some(&qc));
     }
 
     {
@@ -431,7 +436,7 @@ fn test_commit_block_applies_writes() {
     let qc = make_test_qc(&block);
 
     let result = storage.commit_block(&Arc::new(block), &Arc::new(qc));
-    assert_ne!(result, Hash::ZERO);
+    assert_ne!(result, StateRoot::ZERO);
 }
 
 #[test]
@@ -448,7 +453,7 @@ fn test_commit_block_multiple_certs() {
     let qc = make_test_qc(&block);
 
     let result = storage.commit_block(&Arc::new(block), &Arc::new(qc));
-    assert_ne!(result, Hash::ZERO);
+    assert_ne!(result, StateRoot::ZERO);
 }
 
 #[test]
@@ -547,7 +552,7 @@ fn test_transactions_batch_missing() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
 
-    let result = storage.get_transactions_batch(&[Hash::from_bytes(&[1; 32])]);
+    let result = storage.get_transactions_batch(&[TxHash::from_raw(Hash::from_bytes(&[1; 32]))]);
     assert!(result.is_empty());
 }
 
@@ -588,7 +593,7 @@ fn test_initial_block_height_is_zero() {
 fn test_initial_state_root_is_zero() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
-    assert_eq!(storage.state_root_hash(), Hash::ZERO);
+    assert_eq!(storage.state_root_hash(), StateRoot::ZERO);
 }
 
 #[test]
@@ -672,7 +677,7 @@ fn test_commit_certificate_via_commit_store() {
     storage.commit_certificate_with_writes(&cert, &updates);
 
     assert_eq!(storage.jmt_height(), BlockHeight(0));
-    assert_eq!(storage.state_root_hash(), Hash::ZERO);
+    assert_eq!(storage.state_root_hash(), StateRoot::ZERO);
     assert!(storage.get_certificate(&cert.wave_id.hash()).is_some());
 }
 
@@ -890,7 +895,7 @@ fn rocks_commit_with(
     let mut block = block.clone();
     if !updates.node_updates.is_empty() {
         let receipt = hyperscale_types::ReceiptBundle {
-            tx_hash: Hash::ZERO,
+            tx_hash: TxHash::ZERO,
             local_receipt: Arc::new(hyperscale_types::LocalReceipt {
                 outcome: hyperscale_types::TransactionOutcome::Success,
                 database_updates: updates.clone(),

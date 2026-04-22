@@ -9,11 +9,12 @@ use crate::{
     PartitionDatabaseUpdates,
 };
 use hyperscale_types::{
-    zero_bls_signature, ApplicationEvent, Block, BlockHeader, BlockHeight, Bls12381G2Signature,
-    ExecutionCertificate, ExecutionMetadata, ExecutionOutcome, FeeSummary, FinalizedWave, Hash,
-    LocalReceipt, LogLevel, NodeId, ProposerTimestamp, QuorumCertificate, ReceiptBundle, Round,
-    ShardGroupId, SignerBitfield, TransactionOutcome, TxOutcome, ValidatorId, WaveCertificate,
-    WaveId, WeightedTimestamp,
+    zero_bls_signature, ApplicationEvent, Block, BlockHash, BlockHeader, BlockHeight,
+    Bls12381G2Signature, CertificateRoot, ExecutionCertificate, ExecutionMetadata,
+    ExecutionOutcome, FeeSummary, FinalizedWave, GlobalReceiptRoot, Hash, LocalReceipt,
+    LocalReceiptRoot, LogLevel, NodeId, ProposerTimestamp, ProvisionsRoot, QuorumCertificate,
+    ReceiptBundle, Round, ShardGroupId, SignerBitfield, StateRoot, TransactionOutcome,
+    TransactionRoot, TxHash, TxOutcome, ValidatorId, WaveCertificate, WaveId, WeightedTimestamp,
 };
 use radix_common::prelude::DatabaseUpdate;
 use radix_substate_store_interface::db_key_mapper::{DatabaseKeyMapper, SpreadPrefixKeyMapper};
@@ -93,17 +94,17 @@ pub fn make_test_block(height: BlockHeight) -> Block {
         header: BlockHeader {
             shard_group_id: ShardGroupId(0),
             height,
-            parent_hash: Hash::from_bytes(&parent_bytes),
+            parent_hash: BlockHash::from_raw(Hash::from_bytes(&parent_bytes)),
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(0),
             timestamp: ProposerTimestamp(height.0 * 1000),
             round: Round::INITIAL,
             is_fallback: false,
-            state_root: Hash::ZERO,
-            transaction_root: Hash::ZERO,
-            certificate_root: Hash::ZERO,
-            local_receipt_root: Hash::ZERO,
-            provision_root: Hash::ZERO,
+            state_root: StateRoot::ZERO,
+            transaction_root: TransactionRoot::ZERO,
+            certificate_root: CertificateRoot::ZERO,
+            local_receipt_root: LocalReceiptRoot::ZERO,
+            provision_root: ProvisionsRoot::ZERO,
             waves: vec![],
             provision_tx_roots: BTreeMap::new(),
             in_flight: 0,
@@ -130,7 +131,7 @@ pub fn make_test_qc(block: &Block) -> QuorumCertificate {
 
 /// Build a `ReceiptBundle` with both local receipt and execution output.
 pub fn make_test_receipt_bundle(seed: u8) -> ReceiptBundle {
-    let tx_hash = Hash::from_bytes(&[seed; 32]);
+    let tx_hash = TxHash::from_raw(Hash::from_bytes(&[seed; 32]));
     let local_receipt = Arc::new(LocalReceipt {
         outcome: TransactionOutcome::Success,
         database_updates: DatabaseUpdates::default(),
@@ -169,9 +170,9 @@ pub fn make_test_execution_certificate(
     ExecutionCertificate::new(
         WaveId::new(ShardGroupId(0), block_height, BTreeSet::new()),
         WeightedTimestamp(block_height.0 + 1),
-        Hash::from_bytes(&[seed + 50; 32]),
+        GlobalReceiptRoot::from_raw(Hash::from_bytes(&[seed + 50; 32])),
         vec![TxOutcome {
-            tx_hash: Hash::from_bytes(&[seed + 100; 32]),
+            tx_hash: TxHash::from_raw(Hash::from_bytes(&[seed + 100; 32])),
             outcome: ExecutionOutcome::Executed {
                 receipt_hash: Hash::from_bytes(&[seed + 150; 32]),
                 success: true,

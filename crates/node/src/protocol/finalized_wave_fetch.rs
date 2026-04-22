@@ -5,7 +5,7 @@
 //! rotates through peers on failure.
 
 use hyperscale_metrics as metrics;
-use hyperscale_types::{FinalizedWave, Hash, ValidatorId};
+use hyperscale_types::{BlockHash, FinalizedWave, Hash, ValidatorId};
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use tracing::{debug, info, trace};
@@ -34,19 +34,22 @@ impl Default for FinalizedWaveFetchConfig {
 pub enum FinalizedWaveFetchInput {
     /// Request finalized waves for a pending block.
     Request {
-        block_hash: Hash,
+        block_hash: BlockHash,
         proposer: ValidatorId,
         wave_id_hashes: Vec<Hash>,
     },
     /// Finalized waves were received.
     Received {
-        block_hash: Hash,
+        block_hash: BlockHash,
         waves: Vec<Arc<FinalizedWave>>,
     },
     /// A fetch operation failed.
-    Failed { block_hash: Hash, hashes: Vec<Hash> },
+    Failed {
+        block_hash: BlockHash,
+        hashes: Vec<Hash>,
+    },
     /// Cancel fetch for a specific block.
-    CancelFetch { block_hash: Hash },
+    CancelFetch { block_hash: BlockHash },
     /// Tick: spawn pending fetch operations.
     Tick,
 }
@@ -56,7 +59,7 @@ pub enum FinalizedWaveFetchInput {
 pub enum FinalizedWaveFetchOutput {
     /// Request the runner to fetch finalized waves from a peer.
     Fetch {
-        block_hash: Hash,
+        block_hash: BlockHash,
         proposer: ValidatorId,
         wave_id_hashes: Vec<Hash>,
     },
@@ -146,7 +149,7 @@ impl BlockFetchState {
 /// Finalized wave fetch protocol state machine.
 pub struct FinalizedWaveFetchProtocol {
     config: FinalizedWaveFetchConfig,
-    fetches: BTreeMap<Hash, BlockFetchState>,
+    fetches: BTreeMap<BlockHash, BlockFetchState>,
 }
 
 impl FinalizedWaveFetchProtocol {
@@ -189,7 +192,7 @@ impl FinalizedWaveFetchProtocol {
 
     fn handle_request(
         &mut self,
-        block_hash: Hash,
+        block_hash: BlockHash,
         proposer: ValidatorId,
         wave_id_hashes: Vec<Hash>,
     ) -> Vec<FinalizedWaveFetchOutput> {
@@ -221,7 +224,7 @@ impl FinalizedWaveFetchProtocol {
 
     fn handle_received(
         &mut self,
-        block_hash: Hash,
+        block_hash: BlockHash,
         waves: Vec<Arc<FinalizedWave>>,
     ) -> Vec<FinalizedWaveFetchOutput> {
         let Some(state) = self.fetches.get_mut(&block_hash) else {
@@ -261,7 +264,7 @@ impl FinalizedWaveFetchProtocol {
 
     fn handle_failed(
         &mut self,
-        block_hash: Hash,
+        block_hash: BlockHash,
         hashes: Vec<Hash>,
     ) -> Vec<FinalizedWaveFetchOutput> {
         if let Some(state) = self.fetches.get_mut(&block_hash) {

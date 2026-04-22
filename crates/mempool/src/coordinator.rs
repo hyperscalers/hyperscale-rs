@@ -5,8 +5,8 @@ use crate::ready_set::ReadySet;
 use crate::tombstones::{TombstoneStore, TOMBSTONE_RETENTION, TRANSACTION_RETENTION};
 use hyperscale_core::{Action, FinalizationPhaseTimes, TransactionStatus};
 use hyperscale_types::{
-    BlockHeight, CertifiedBlock, Hash, NodeId, RoutableTransaction, TopologySnapshot,
-    TransactionDecision,
+    BlockHeight, CertifiedBlock, NodeId, RoutableTransaction, TopologySnapshot,
+    TransactionDecision, TxHash,
 };
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -160,7 +160,7 @@ struct PoolEntry {
 /// (status changes, conflicts arise, or evicted).
 pub struct MempoolCoordinator {
     /// Transaction pool sorted by hash (BTreeMap for ordered iteration).
-    pool: BTreeMap<Hash, PoolEntry>,
+    pool: BTreeMap<TxHash, PoolEntry>,
 
     /// Terminal-state dedup + recently-evicted body cache. Tombstones stop
     /// gossip from re-adding completed/aborted transactions; the evicted
@@ -349,7 +349,7 @@ impl MempoolCoordinator {
     /// being re-added via gossip. Terminal states include:
     /// - Completed (certificate committed)
     /// - Aborted (explicitly aborted)
-    fn evict_terminal(&mut self, tx_hash: Hash) {
+    fn evict_terminal(&mut self, tx_hash: TxHash) {
         // Remove locked nodes and update counters if this transaction was holding locks
         let info_to_unlock = self.pool.get(&tx_hash).and_then(|entry| {
             if entry.status.holds_state_lock() {
@@ -379,7 +379,7 @@ impl MempoolCoordinator {
     }
 
     /// Check if a transaction hash is tombstoned (reached terminal state).
-    pub fn is_tombstoned(&self, tx_hash: &Hash) -> bool {
+    pub fn is_tombstoned(&self, tx_hash: &TxHash) -> bool {
         self.tombstones.is_tombstoned(tx_hash)
     }
 
@@ -494,7 +494,7 @@ impl MempoolCoordinator {
     /// Emits the terminal status update and evicts/tombstones the entry.
     fn process_certificate_committed(
         &mut self,
-        tx_hash: Hash,
+        tx_hash: TxHash,
         decision: TransactionDecision,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
@@ -530,7 +530,7 @@ impl MempoolCoordinator {
     }
 
     /// Record when the local execution certificate was created for a wave's txs.
-    pub fn on_ec_created(&mut self, tx_hashes: &[Hash]) {
+    pub fn on_ec_created(&mut self, tx_hashes: &[TxHash]) {
         for tx_hash in tx_hashes {
             if let Some(entry) = self.pool.get_mut(tx_hash) {
                 entry.ec_created_at_time = Some(self.now);
@@ -545,7 +545,7 @@ impl MempoolCoordinator {
     pub fn on_transaction_executed(
         &mut self,
         _topology: &TopologySnapshot,
-        tx_hash: Hash,
+        tx_hash: TxHash,
         accepted: bool,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
@@ -623,7 +623,7 @@ impl MempoolCoordinator {
     /// currently-locked and already-claimed nodes.
     fn add_to_ready_tracking(
         &mut self,
-        hash: Hash,
+        hash: TxHash,
         tx: &Arc<RoutableTransaction>,
         added_at: Duration,
     ) {
@@ -633,7 +633,7 @@ impl MempoolCoordinator {
     /// Remove a transaction from ready tracking. If the tx was in the ready
     /// set, cascade-promote any deferred tx whose only blocker was the
     /// ready-set claim.
-    fn remove_from_ready_tracking(&mut self, hash: &Hash) {
+    fn remove_from_ready_tracking(&mut self, hash: &TxHash) {
         let freed_nodes = self.ready.remove(hash);
         for node in freed_nodes {
             self.promote_transactions_for_node(node);
@@ -646,7 +646,7 @@ impl MempoolCoordinator {
     fn promote_transactions_for_node(&mut self, node: NodeId) {
         let mut promotable = self.ready.promotable_for_node(node);
         promotable.sort();
-        let mut to_readd: Vec<(Hash, Arc<RoutableTransaction>, Duration)> = Vec::new();
+        let mut to_readd: Vec<(TxHash, Arc<RoutableTransaction>, Duration)> = Vec::new();
         for tx_hash in promotable {
             if let Some(entry) = self.pool.get(&tx_hash) {
                 if entry.status == TransactionStatus::Pending {
@@ -800,7 +800,7 @@ impl MempoolCoordinator {
     }
 
     /// Check if we have a transaction.
-    pub fn has_transaction(&self, hash: &Hash) -> bool {
+    pub fn has_transaction(&self, hash: &TxHash) -> bool {
         self.pool.contains_key(hash)
     }
 
@@ -809,7 +809,7 @@ impl MempoolCoordinator {
     /// Checks the active pool first, then the evicted-body cache, so peer
     /// fetch requests for transactions that have already reached a terminal
     /// state can still be served.
-    pub fn get_transaction(&self, hash: &Hash) -> Option<Arc<RoutableTransaction>> {
+    pub fn get_transaction(&self, hash: &TxHash) -> Option<Arc<RoutableTransaction>> {
         if let Some(entry) = self.pool.get(hash) {
             return Some(Arc::clone(&entry.tx));
         }
@@ -817,7 +817,7 @@ impl MempoolCoordinator {
     }
 
     /// Get transaction status.
-    pub fn status(&self, hash: &Hash) -> Option<TransactionStatus> {
+    pub fn status(&self, hash: &TxHash) -> Option<TransactionStatus> {
         self.pool.get(hash).map(|e| e.status.clone())
     }
 
@@ -850,7 +850,7 @@ impl MempoolCoordinator {
     /// Returns tuples of (hash, status, transaction Arc) for analysis.
     pub fn incomplete_transactions(
         &self,
-    ) -> Vec<(Hash, TransactionStatus, Arc<RoutableTransaction>)> {
+    ) -> Vec<(TxHash, TransactionStatus, Arc<RoutableTransaction>)> {
         self.pool
             .iter()
             .filter(|(_, entry)| {

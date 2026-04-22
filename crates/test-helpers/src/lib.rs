@@ -17,12 +17,13 @@
 //! ```
 
 use hyperscale_types::{
-    bls_keypair_from_seed, Block, BlockHeader, BlockHeight, Bls12381G1PrivateKey,
-    Bls12381G1PublicKey, Bls12381G2Signature, CertifiedBlock, ExecutionCertificate,
-    ExecutionOutcome, FinalizedWave, Hash, ProposerTimestamp, QuorumCertificate, Round,
-    RoutableTransaction, ShardGroupId, SignerBitfield, TopologySnapshot, TransactionDecision,
-    TxOutcome, ValidatorId, ValidatorInfo, ValidatorSet, WaveCertificate, WaveId,
-    WeightedTimestamp,
+    bls_keypair_from_seed, Block, BlockHash, BlockHeader, BlockHeight, Bls12381G1PrivateKey,
+    Bls12381G1PublicKey, Bls12381G2Signature, CertificateRoot, CertifiedBlock,
+    ExecutionCertificate, ExecutionOutcome, FinalizedWave, GlobalReceiptRoot, Hash,
+    LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round,
+    RoutableTransaction, ShardGroupId, SignerBitfield, StateRoot, TopologySnapshot,
+    TransactionDecision, TransactionRoot, TxHash, TxOutcome, ValidatorId, ValidatorInfo,
+    ValidatorSet, WaveCertificate, WaveId, WeightedTimestamp,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -206,17 +207,17 @@ pub fn make_live_block(
     let header = BlockHeader {
         shard_group_id,
         height,
-        parent_hash: Hash::ZERO,
+        parent_hash: BlockHash::ZERO,
         parent_qc: QuorumCertificate::genesis(),
         proposer,
         timestamp: ProposerTimestamp(timestamp_ms),
         round: Round::INITIAL,
         is_fallback: false,
-        state_root: Hash::ZERO,
-        transaction_root: Hash::ZERO,
-        certificate_root: Hash::ZERO,
-        local_receipt_root: Hash::ZERO,
-        provision_root: Hash::ZERO,
+        state_root: StateRoot::ZERO,
+        transaction_root: TransactionRoot::ZERO,
+        certificate_root: CertificateRoot::ZERO,
+        local_receipt_root: LocalReceiptRoot::ZERO,
+        provision_root: ProvisionsRoot::ZERO,
         waves: vec![],
         provision_tx_roots: BTreeMap::new(),
         in_flight: 0,
@@ -251,7 +252,7 @@ pub fn certify(block: Block, weighted_timestamp_ms: u64) -> CertifiedBlock {
 /// verification paths.
 pub fn make_finalized_wave(
     block_height: BlockHeight,
-    tx_hash: Hash,
+    tx_hash: TxHash,
     decision: TransactionDecision,
 ) -> FinalizedWave {
     let outcome = match decision {
@@ -269,7 +270,7 @@ pub fn make_finalized_wave(
     let ec = ExecutionCertificate::new(
         wave_id.clone(),
         WeightedTimestamp(block_height.0 + 1),
-        Hash::ZERO,
+        GlobalReceiptRoot::ZERO,
         vec![TxOutcome { tx_hash, outcome }],
         Bls12381G2Signature([0u8; 96]),
         SignerBitfield::new(4),

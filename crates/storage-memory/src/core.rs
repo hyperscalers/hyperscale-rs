@@ -15,7 +15,7 @@ use hyperscale_storage::{
 };
 #[cfg(test)]
 use hyperscale_types::WaveCertificate;
-use hyperscale_types::{BlockHeight, Hash};
+use hyperscale_types::{BlockHeight, StateRoot};
 use std::sync::{Arc, RwLock};
 
 /// In-memory storage for simulation and testing.
@@ -180,12 +180,13 @@ impl SimStorage {
     ///
     /// # Returns
     /// The genesis state root hash (JMT root at version 0).
-    pub fn finalize_genesis_jmt(&self, merged: &DatabaseUpdates) -> Hash {
+    pub fn finalize_genesis_jmt(&self, merged: &DatabaseUpdates) -> StateRoot {
         let mut s = self.state.write().unwrap();
 
         // Guard: finalize_genesis_jmt must only be called once, on an uninitialized JMT.
         assert!(
-            s.current_block_height == BlockHeight::GENESIS && s.current_root_hash == Hash::ZERO,
+            s.current_block_height == BlockHeight::GENESIS
+                && s.current_root_hash == StateRoot::ZERO,
             "finalize_genesis_jmt called but JMT already initialized"
         );
 

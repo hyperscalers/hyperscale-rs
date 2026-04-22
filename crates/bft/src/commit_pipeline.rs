@@ -13,23 +13,23 @@
 //!    be drained in sequence once the predecessor commits.
 
 use hyperscale_core::CommitSource;
-use hyperscale_types::{Block, BlockHeight, Hash, QuorumCertificate};
+use hyperscale_types::{Block, BlockHash, BlockHeight, QuorumCertificate};
 use std::collections::{BTreeMap, HashMap};
 
 pub(crate) struct CommitPipeline {
     /// Blocks that have been certified (have QC) but not yet committed.
     /// Keyed by block hash.
-    pub(crate) certified_blocks: HashMap<Hash, Block>,
+    pub(crate) certified_blocks: HashMap<BlockHash, Block>,
 
     /// Out-of-order commit buffer: commits received with height greater than
     /// `committed_height + 1`, parked until the predecessor commits.
     /// Keyed by target height.
-    pub(crate) out_of_order: BTreeMap<BlockHeight, (Hash, QuorumCertificate, CommitSource)>,
+    pub(crate) out_of_order: BTreeMap<BlockHeight, (BlockHash, QuorumCertificate, CommitSource)>,
 
     /// Awaiting-data commit buffer: commits whose block payload
     /// (transactions/certificates) has not fully arrived yet, retried when
     /// the block completes. Keyed by block hash.
-    pub(crate) awaiting_data: HashMap<Hash, (BlockHeight, QuorumCertificate, CommitSource)>,
+    pub(crate) awaiting_data: HashMap<BlockHash, (BlockHeight, QuorumCertificate, CommitSource)>,
 }
 
 impl CommitPipeline {
@@ -58,7 +58,7 @@ impl CommitPipeline {
     pub fn take_out_of_order(
         &mut self,
         height: BlockHeight,
-    ) -> Option<(Hash, QuorumCertificate, CommitSource)> {
+    ) -> Option<(BlockHash, QuorumCertificate, CommitSource)> {
         self.out_of_order.remove(&height)
     }
 
@@ -68,7 +68,7 @@ impl CommitPipeline {
     /// parked commit should be retried.
     pub fn take_awaiting_data(
         &mut self,
-        block_hash: &Hash,
+        block_hash: &BlockHash,
     ) -> Option<(BlockHeight, QuorumCertificate, CommitSource)> {
         self.awaiting_data.remove(block_hash)
     }
@@ -89,7 +89,7 @@ impl CommitPipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hyperscale_types::QuorumCertificate;
+    use hyperscale_types::{Hash, QuorumCertificate};
 
     fn make_qc(height: u64) -> QuorumCertificate {
         let mut qc = QuorumCertificate::genesis();
@@ -97,10 +97,14 @@ mod tests {
         qc
     }
 
+    fn bh(tag: &[u8]) -> BlockHash {
+        BlockHash::from_raw(Hash::from_bytes(tag))
+    }
+
     #[test]
     fn take_out_of_order_removes_and_returns_entry() {
         let mut pipeline = CommitPipeline::new();
-        let hash = Hash::from_bytes(b"h5");
+        let hash = bh(b"h5");
         pipeline
             .out_of_order
             .insert(BlockHeight(5), (hash, make_qc(5), CommitSource::Aggregator));
@@ -114,7 +118,7 @@ mod tests {
     #[test]
     fn take_awaiting_data_removes_and_returns_entry() {
         let mut pipeline = CommitPipeline::new();
-        let hash = Hash::from_bytes(b"h5");
+        let hash = bh(b"h5");
         pipeline
             .awaiting_data
             .insert(hash, (BlockHeight(5), make_qc(5), CommitSource::Aggregator));
@@ -128,9 +132,9 @@ mod tests {
     #[test]
     fn cleanup_committed_drops_entries_at_and_below_height() {
         let mut pipeline = CommitPipeline::new();
-        let h4 = Hash::from_bytes(b"h4");
-        let h5 = Hash::from_bytes(b"h5");
-        let h6 = Hash::from_bytes(b"h6");
+        let h4 = bh(b"h4");
+        let h5 = bh(b"h5");
+        let h6 = bh(b"h6");
 
         pipeline
             .out_of_order
@@ -160,6 +164,7 @@ mod tests {
 #[cfg(test)]
 mod properties {
     use super::*;
+    use hyperscale_types::Hash;
     use proptest::prelude::*;
 
     fn make_qc(height: u64) -> QuorumCertificate {
@@ -168,10 +173,10 @@ mod properties {
         qc
     }
 
-    fn hash_for(tag: u64) -> Hash {
+    fn hash_for(tag: u64) -> BlockHash {
         let mut bytes = [0u8; 32];
         bytes[..8].copy_from_slice(&tag.to_le_bytes());
-        Hash::from_bytes(&bytes)
+        BlockHash::from_raw(Hash::from_bytes(&bytes))
     }
 
     proptest! {

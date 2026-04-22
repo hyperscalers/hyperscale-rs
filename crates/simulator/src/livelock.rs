@@ -28,7 +28,7 @@
 
 use hyperscale_simulation::SimulationRunner;
 use hyperscale_types::{
-    shard_for_node, Hash, NodeId, RoutableTransaction, ShardGroupId, TransactionStatus,
+    shard_for_node, NodeId, RoutableTransaction, ShardGroupId, TransactionStatus, TxHash,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -36,7 +36,7 @@ use std::collections::{HashMap, HashSet};
 #[derive(Debug, Clone)]
 pub struct StuckTransaction {
     /// Transaction hash
-    pub hash: Hash,
+    pub hash: TxHash,
     /// Current status
     pub status: TransactionStatus,
     /// The transaction itself
@@ -55,7 +55,7 @@ pub struct StuckTransaction {
 #[derive(Debug, Clone)]
 pub struct LivelockCycle {
     /// Transactions involved in the potential cycle
-    pub transactions: Vec<Hash>,
+    pub transactions: Vec<TxHash>,
     /// Addresses (NodeIds) that form the contention
     pub contended_addresses: Vec<NodeId>,
     /// Shards involved in the cycle
@@ -76,7 +76,7 @@ pub struct LivelockReport {
     /// Cross-shard transactions that are stuck
     pub cross_shard_stuck: Vec<StuckTransaction>,
     /// Address contention map: address -> list of transactions holding/waiting
-    pub address_contention: HashMap<NodeId, Vec<Hash>>,
+    pub address_contention: HashMap<NodeId, Vec<TxHash>>,
 }
 
 impl LivelockReport {
@@ -259,7 +259,7 @@ impl LivelockAnalyzer {
             .collect();
 
         // Build address contention map
-        let mut address_contention: HashMap<NodeId, Vec<Hash>> = HashMap::new();
+        let mut address_contention: HashMap<NodeId, Vec<TxHash>> = HashMap::new();
         for tx in &self.stuck_transactions {
             for addr in &tx.transaction.declared_writes {
                 address_contention.entry(*addr).or_default().push(tx.hash);
@@ -285,7 +285,7 @@ impl LivelockAnalyzer {
     /// other transactions need, forming a circular dependency.
     fn detect_cycles(
         &self,
-        _address_contention: &HashMap<NodeId, Vec<Hash>>,
+        _address_contention: &HashMap<NodeId, Vec<TxHash>>,
     ) -> Vec<LivelockCycle> {
         let mut cycles = Vec::new();
 
@@ -348,7 +348,7 @@ impl LivelockAnalyzer {
 
         // Deduplicate cycles (A-B same as B-A)
         let mut unique_cycles = Vec::new();
-        let mut seen_pairs: HashSet<(Hash, Hash)> = HashSet::new();
+        let mut seen_pairs: HashSet<(TxHash, TxHash)> = HashSet::new();
         for cycle in cycles {
             if cycle.transactions.len() == 2 {
                 let (a, b) = (cycle.transactions[0], cycle.transactions[1]);

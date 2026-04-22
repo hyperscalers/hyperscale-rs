@@ -4,7 +4,7 @@ use crate::core::SimStorage;
 use crate::state::apply_updates;
 
 use hyperscale_storage::{ChainWriter, DatabaseUpdates, JmtSnapshot};
-use hyperscale_types::{BlockHeight, CertifiedBlock, Hash, ReceiptBundle};
+use hyperscale_types::{BlockHeight, CertifiedBlock, ReceiptBundle, StateRoot};
 use std::sync::Arc;
 
 /// Precomputed commit work for a SimStorage block commit.
@@ -26,7 +26,7 @@ impl ChainWriter for SimStorage {
 
     fn prepare_block_commit(
         &self,
-        parent_state_root: Hash,
+        parent_state_root: StateRoot,
         parent_block_height: BlockHeight,
         finalized_waves: &[Arc<hyperscale_types::FinalizedWave>],
         block_height: BlockHeight,
@@ -34,7 +34,7 @@ impl ChainWriter for SimStorage {
         // Memory backend already keeps state in-memory — the priors
         // hint is irrelevant to its perf and is ignored.
         _base_reads: Option<&hyperscale_storage::BaseReadCache>,
-    ) -> (Hash, Self::PreparedCommit) {
+    ) -> (StateRoot, Self::PreparedCommit) {
         let receipts: Vec<ReceiptBundle> = finalized_waves
             .iter()
             .flat_map(|fw| fw.receipts.iter().cloned())
@@ -123,7 +123,7 @@ impl ChainWriter for SimStorage {
             Arc<hyperscale_types::Block>,
             Arc<hyperscale_types::QuorumCertificate>,
         )>,
-    ) -> Vec<Hash> {
+    ) -> Vec<StateRoot> {
         blocks
             .into_iter()
             .map(|(prepared, block, qc)| {
@@ -192,7 +192,7 @@ impl ChainWriter for SimStorage {
         &self,
         block: &Arc<hyperscale_types::Block>,
         qc: &Arc<hyperscale_types::QuorumCertificate>,
-    ) -> Hash {
+    ) -> StateRoot {
         let receipts: Vec<ReceiptBundle> = block
             .certificates()
             .iter()
@@ -211,7 +211,7 @@ impl SimStorage {
         block: &Arc<hyperscale_types::Block>,
         qc: &Arc<hyperscale_types::QuorumCertificate>,
         receipts: &[ReceiptBundle],
-    ) -> Hash {
+    ) -> StateRoot {
         let block_height = block.height();
         let mut s = self.state.write().unwrap();
 

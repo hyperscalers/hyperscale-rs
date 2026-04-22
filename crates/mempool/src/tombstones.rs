@@ -12,7 +12,9 @@
 //! of the last committed block, so behavior is deterministic across validators
 //! regardless of block cadence.
 
-use hyperscale_types::{Hash, RoutableTransaction};
+#[cfg(test)]
+use hyperscale_types::Hash;
+use hyperscale_types::{RoutableTransaction, TxHash};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,8 +30,8 @@ pub(crate) const TRANSACTION_RETENTION: Duration = Duration::from_secs(30);
 pub(crate) const TOMBSTONE_RETENTION: Duration = Duration::from_secs(300);
 
 pub(crate) struct TombstoneStore {
-    tombstones: HashMap<Hash, u64>,
-    recently_evicted: HashMap<Hash, (Arc<RoutableTransaction>, u64)>,
+    tombstones: HashMap<TxHash, u64>,
+    recently_evicted: HashMap<TxHash, (Arc<RoutableTransaction>, u64)>,
 }
 
 impl TombstoneStore {
@@ -41,12 +43,12 @@ impl TombstoneStore {
     }
 
     /// Record `tx_hash` as tombstoned at `now_ms`.
-    pub fn tombstone(&mut self, tx_hash: Hash, now_ms: u64) {
+    pub fn tombstone(&mut self, tx_hash: TxHash, now_ms: u64) {
         self.tombstones.insert(tx_hash, now_ms);
     }
 
     /// Whether `tx_hash` has been tombstoned.
-    pub fn is_tombstoned(&self, tx_hash: &Hash) -> bool {
+    pub fn is_tombstoned(&self, tx_hash: &TxHash) -> bool {
         self.tombstones.contains_key(tx_hash)
     }
 
@@ -58,7 +60,7 @@ impl TombstoneStore {
     }
 
     /// Look up an evicted transaction body by hash.
-    pub fn get_evicted(&self, tx_hash: &Hash) -> Option<Arc<RoutableTransaction>> {
+    pub fn get_evicted(&self, tx_hash: &TxHash) -> Option<Arc<RoutableTransaction>> {
         self.recently_evicted
             .get(tx_hash)
             .map(|(tx, _)| Arc::clone(tx))
@@ -105,17 +107,17 @@ mod tests {
         let store = TombstoneStore::new();
         assert_eq!(store.len_tombstones(), 0);
         assert_eq!(store.len_evicted(), 0);
-        assert!(!store.is_tombstoned(&Hash::ZERO));
-        assert!(store.get_evicted(&Hash::ZERO).is_none());
+        assert!(!store.is_tombstoned(&TxHash::ZERO));
+        assert!(store.get_evicted(&TxHash::ZERO).is_none());
     }
 
     #[test]
     fn tombstone_is_observable_via_is_tombstoned() {
         let mut store = TombstoneStore::new();
-        let hash = Hash::from_bytes(b"tx1");
+        let hash = TxHash::from_raw(Hash::from_bytes(b"tx1"));
         store.tombstone(hash, 1_000);
         assert!(store.is_tombstoned(&hash));
-        assert!(!store.is_tombstoned(&Hash::from_bytes(b"other")));
+        assert!(!store.is_tombstoned(&TxHash::from_raw(Hash::from_bytes(b"other"))));
     }
 
     #[test]
@@ -151,22 +153,22 @@ mod tests {
     #[test]
     fn prune_tombstones_drops_entries_older_than_retention() {
         let mut store = TombstoneStore::new();
-        store.tombstone(Hash::from_bytes(b"old"), 100);
-        store.tombstone(Hash::from_bytes(b"recent"), 900);
+        store.tombstone(TxHash::from_raw(Hash::from_bytes(b"old")), 100);
+        store.tombstone(TxHash::from_raw(Hash::from_bytes(b"recent")), 900);
 
         // At now=1000 with retention=500ms: cutoff=500, "old" (100) dropped,
         // "recent" (900) kept.
         let removed = store.prune_tombstones(Duration::from_millis(500), 1_000);
         assert_eq!(removed, 1);
-        assert!(!store.is_tombstoned(&Hash::from_bytes(b"old")));
-        assert!(store.is_tombstoned(&Hash::from_bytes(b"recent")));
+        assert!(!store.is_tombstoned(&TxHash::from_raw(Hash::from_bytes(b"old"))));
+        assert!(store.is_tombstoned(&TxHash::from_raw(Hash::from_bytes(b"recent"))));
     }
 
     #[test]
     fn prune_tombstones_with_zero_retention_clears_everything() {
         let mut store = TombstoneStore::new();
-        store.tombstone(Hash::from_bytes(b"a"), 100);
-        store.tombstone(Hash::from_bytes(b"b"), 200);
+        store.tombstone(TxHash::from_raw(Hash::from_bytes(b"a")), 100);
+        store.tombstone(TxHash::from_raw(Hash::from_bytes(b"b")), 200);
 
         let removed = store.prune_tombstones(Duration::ZERO, 1_000);
         assert_eq!(removed, 2);
@@ -195,7 +197,7 @@ mod tests {
         // `ts > cutoff`). Documents the boundary so tests elsewhere don't
         // silently depend on the opposite.
         let mut store = TombstoneStore::new();
-        store.tombstone(Hash::from_bytes(b"at_cutoff"), 500);
+        store.tombstone(TxHash::from_raw(Hash::from_bytes(b"at_cutoff")), 500);
         // now=1000, retention=500ms → cutoff=500 → entry at 500 is dropped.
         let removed = store.prune_tombstones(Duration::from_millis(500), 1_000);
         assert_eq!(removed, 1);

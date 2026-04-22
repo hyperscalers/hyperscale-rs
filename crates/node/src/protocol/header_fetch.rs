@@ -591,22 +591,25 @@ mod tests {
     }
 
     fn make_test_header(shard_id: u64, h: u64) -> CommittedBlockHeader {
-        use hyperscale_types::{BlockHeader, Hash, QuorumCertificate, Round};
+        use hyperscale_types::{
+            BlockHash, BlockHeader, CertificateRoot, LocalReceiptRoot, ProvisionsRoot,
+            QuorumCertificate, Round, StateRoot, TransactionRoot,
+        };
 
         let header = BlockHeader {
             shard_group_id: ShardGroupId(shard_id),
             height: BlockHeight(h),
-            parent_hash: Hash::ZERO,
+            parent_hash: BlockHash::ZERO,
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(0),
             timestamp: hyperscale_types::ProposerTimestamp::ZERO,
             round: Round::INITIAL,
             is_fallback: false,
-            state_root: Hash::ZERO,
-            transaction_root: Hash::ZERO,
-            certificate_root: Hash::ZERO,
-            local_receipt_root: Hash::ZERO,
-            provision_root: Hash::ZERO,
+            state_root: StateRoot::ZERO,
+            transaction_root: TransactionRoot::ZERO,
+            certificate_root: CertificateRoot::ZERO,
+            local_receipt_root: LocalReceiptRoot::ZERO,
+            provision_root: ProvisionsRoot::ZERO,
             waves: vec![],
             provision_tx_roots: BTreeMap::new(),
             in_flight: 0,

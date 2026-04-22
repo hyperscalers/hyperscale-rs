@@ -10,7 +10,9 @@
 //! no mutations. It's a lens, not a sub-machine. The underlying fields live
 //! on `BftCoordinator` / `CommitPipeline` / `PendingBlock` just as before.
 
-use hyperscale_types::{Block, BlockHeader, BlockHeight, Hash, QuorumCertificate};
+use hyperscale_types::{
+    Block, BlockHash, BlockHeader, BlockHeight, Hash, QuorumCertificate, StateRoot, TxHash,
+};
 use std::collections::{HashMap, HashSet};
 use tracing::warn;
 
@@ -19,18 +21,18 @@ use crate::tx_cache::CommittedTxCache;
 
 pub(crate) struct ChainView<'a> {
     pub committed_height: BlockHeight,
-    pub committed_hash: Hash,
-    pub committed_state_root: Hash,
+    pub committed_hash: BlockHash,
+    pub committed_state_root: StateRoot,
     pub latest_qc: Option<&'a QuorumCertificate>,
     pub genesis: Option<&'a Block>,
-    pub certified: &'a HashMap<Hash, Block>,
-    pub pending: &'a HashMap<Hash, PendingBlock>,
+    pub certified: &'a HashMap<BlockHash, Block>,
+    pub pending: &'a HashMap<BlockHash, PendingBlock>,
 }
 
 impl<'a> ChainView<'a> {
     /// Look up a block by hash across certified, pending (if assembled), and
     /// genesis. Returns `None` if no source has the block.
-    pub fn get_block(&self, block_hash: Hash) -> Option<Block> {
+    pub fn get_block(&self, block_hash: BlockHash) -> Option<Block> {
         if let Some(block) = self.certified.get(&block_hash) {
             return Some(block.clone());
         }
@@ -50,7 +52,7 @@ impl<'a> ChainView<'a> {
     /// Header-only lookup, cheaper than `get_block` when only header fields
     /// are needed. Pending blocks always carry their header even before full
     /// assembly, so this succeeds in cases where `get_block` would fail.
-    pub fn get_header(&self, block_hash: Hash) -> Option<BlockHeader> {
+    pub fn get_header(&self, block_hash: BlockHash) -> Option<BlockHeader> {
         if let Some(block) = self.certified.get(&block_hash) {
             return Some(block.header().clone());
         }
@@ -68,7 +70,7 @@ impl<'a> ChainView<'a> {
     /// State root of the parent block. Returns the committed-tip state root
     /// when `parent_hash` IS the committed tip (may have been pruned from
     /// the in-memory caches by cleanup) or when lookup otherwise fails.
-    pub fn parent_state_root(&self, parent_hash: Hash) -> Hash {
+    pub fn parent_state_root(&self, parent_hash: BlockHash) -> StateRoot {
         if parent_hash == self.committed_hash {
             return self.committed_state_root;
         }
@@ -86,7 +88,7 @@ impl<'a> ChainView<'a> {
 
     /// In-flight count on the parent header. Returns `0` if the header is
     /// missing (parent pruned from in-memory caches).
-    pub fn parent_in_flight(&self, parent_hash: Hash) -> u32 {
+    pub fn parent_in_flight(&self, parent_hash: BlockHash) -> u32 {
         self.get_header(parent_hash)
             .map(|h| h.in_flight)
             .unwrap_or(0)
@@ -94,7 +96,7 @@ impl<'a> ChainView<'a> {
 
     /// Parent to use when building the next proposal: the latest QC's block
     /// if any, otherwise the committed tip under a genesis QC.
-    pub fn proposal_parent(&self) -> (Hash, QuorumCertificate) {
+    pub fn proposal_parent(&self) -> (BlockHash, QuorumCertificate) {
         if let Some(qc) = self.latest_qc {
             (qc.block_hash, qc.clone())
         } else {
@@ -114,11 +116,11 @@ impl<'a> ChainView<'a> {
     /// `BlockCommitted` event clears the mempool.
     pub fn collect_ancestor_hashes(
         &self,
-        parent_hash: Hash,
+        parent_hash: BlockHash,
         tx_cache: &CommittedTxCache,
-    ) -> (HashSet<Hash>, HashSet<Hash>, HashSet<Hash>) {
+    ) -> (HashSet<Hash>, HashSet<TxHash>, HashSet<Hash>) {
         let mut cert_hashes: HashSet<Hash> = HashSet::new();
-        let mut tx_hashes: HashSet<Hash> = HashSet::new();
+        let mut tx_hashes: HashSet<TxHash> = HashSet::new();
         let mut provision_hashes: HashSet<Hash> = HashSet::new();
 
         tx_hashes.extend(tx_cache.recent_tx_hashes());
@@ -164,12 +166,13 @@ impl<'a> ChainView<'a> {
 mod tests {
     use super::*;
     use hyperscale_types::{
-        BlockManifest, ProposerTimestamp, Round, ShardGroupId, ValidatorId, WeightedTimestamp,
+        BlockManifest, CertificateRoot, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, Round,
+        ShardGroupId, TransactionRoot, ValidatorId, WeightedTimestamp,
     };
     use std::collections::BTreeMap;
     use std::time::Duration;
 
-    fn make_header(height: u64, parent_hash: Hash) -> BlockHeader {
+    fn make_header(height: u64, parent_hash: BlockHash) -> BlockHeader {
         BlockHeader {
             shard_group_id: ShardGroupId(0),
             height: BlockHeight(height),
@@ -179,18 +182,18 @@ mod tests {
             timestamp: ProposerTimestamp(1000),
             round: Round::INITIAL,
             is_fallback: false,
-            state_root: Hash::from_bytes(&[height as u8; 32]),
-            transaction_root: Hash::ZERO,
-            certificate_root: Hash::ZERO,
-            local_receipt_root: Hash::ZERO,
-            provision_root: Hash::ZERO,
+            state_root: StateRoot::from_raw(Hash::from_bytes(&[height as u8; 32])),
+            transaction_root: TransactionRoot::ZERO,
+            certificate_root: CertificateRoot::ZERO,
+            local_receipt_root: LocalReceiptRoot::ZERO,
+            provision_root: ProvisionsRoot::ZERO,
             waves: vec![],
             provision_tx_roots: BTreeMap::new(),
             in_flight: height as u32,
         }
     }
 
-    fn make_block(height: u64, parent_hash: Hash) -> Block {
+    fn make_block(height: u64, parent_hash: BlockHash) -> Block {
         Block::Live {
             header: make_header(height, parent_hash),
             transactions: vec![],
@@ -204,10 +207,10 @@ mod tests {
     #[allow(clippy::too_many_arguments)]
     fn run_view<R>(
         committed_height: u64,
-        committed_hash: Hash,
-        committed_state_root: Hash,
-        certified: HashMap<Hash, Block>,
-        pending: HashMap<Hash, PendingBlock>,
+        committed_hash: BlockHash,
+        committed_state_root: StateRoot,
+        certified: HashMap<BlockHash, Block>,
+        pending: HashMap<BlockHash, PendingBlock>,
         latest_qc: Option<QuorumCertificate>,
         genesis: Option<Block>,
         f: impl FnOnce(&ChainView<'_>) -> R,
@@ -224,14 +227,18 @@ mod tests {
         f(&view)
     }
 
+    fn bh(tag: &[u8]) -> BlockHash {
+        BlockHash::from_raw(Hash::from_bytes(tag))
+    }
+
     #[test]
     fn get_block_finds_certified_pending_and_genesis() {
-        let hash_c = Hash::from_bytes(b"certified");
-        let hash_p = Hash::from_bytes(b"pending");
-        let genesis = make_block(0, Hash::ZERO);
+        let hash_c = bh(b"certified");
+        let hash_p = bh(b"pending");
+        let genesis = make_block(0, BlockHash::ZERO);
         let genesis_hash = genesis.hash();
 
-        let certified_block = make_block(5, Hash::ZERO);
+        let certified_block = make_block(5, BlockHash::ZERO);
         let certified_hash = certified_block.hash();
         let mut certified = HashMap::new();
         certified.insert(certified_hash, certified_block);
@@ -251,8 +258,8 @@ mod tests {
 
         run_view(
             0,
-            Hash::ZERO,
-            Hash::ZERO,
+            BlockHash::ZERO,
+            StateRoot::ZERO,
             certified,
             pending,
             None,
@@ -269,7 +276,7 @@ mod tests {
 
     #[test]
     fn get_header_returns_header_even_when_block_not_assembled() {
-        let parent = Hash::from_bytes(b"parent");
+        let parent = bh(b"parent");
         let header = make_header(3, parent);
         let block_hash = header.hash();
 
@@ -282,8 +289,8 @@ mod tests {
 
         run_view(
             0,
-            Hash::ZERO,
-            Hash::ZERO,
+            BlockHash::ZERO,
+            StateRoot::ZERO,
             HashMap::new(),
             pending,
             None,
@@ -298,8 +305,8 @@ mod tests {
 
     #[test]
     fn parent_state_root_uses_committed_tip_on_match() {
-        let tip_hash = Hash::from_bytes(b"tip");
-        let tip_root = Hash::from_bytes(b"tip_root");
+        let tip_hash = bh(b"tip");
+        let tip_root = StateRoot::from_raw(Hash::from_bytes(b"tip_root"));
 
         run_view(
             10,
@@ -317,10 +324,10 @@ mod tests {
 
     #[test]
     fn parent_state_root_reads_header_state_root_when_present() {
-        let tip_hash = Hash::from_bytes(b"tip");
-        let tip_root = Hash::ZERO;
+        let tip_hash = bh(b"tip");
+        let tip_root = StateRoot::ZERO;
 
-        let block = make_block(5, Hash::ZERO);
+        let block = make_block(5, BlockHash::ZERO);
         let hash = block.hash();
         let expected_state_root = block.header().state_root;
 
@@ -343,9 +350,9 @@ mod tests {
 
     #[test]
     fn parent_state_root_falls_back_to_tip_when_unknown() {
-        let tip_hash = Hash::from_bytes(b"tip");
-        let tip_root = Hash::from_bytes(b"tip_root");
-        let unknown = Hash::from_bytes(b"unknown");
+        let tip_hash = bh(b"tip");
+        let tip_root = StateRoot::from_raw(Hash::from_bytes(b"tip_root"));
+        let unknown = bh(b"unknown");
 
         run_view(
             10,
@@ -363,18 +370,18 @@ mod tests {
 
     #[test]
     fn parent_in_flight_returns_header_value_or_zero() {
-        let block = make_block(7, Hash::ZERO);
+        let block = make_block(7, BlockHash::ZERO);
         let hash = block.hash();
         let expected_in_flight = block.header().in_flight;
-        let unknown = Hash::from_bytes(b"unknown");
+        let unknown = bh(b"unknown");
 
         let mut certified = HashMap::new();
         certified.insert(hash, block);
 
         run_view(
             0,
-            Hash::ZERO,
-            Hash::ZERO,
+            BlockHash::ZERO,
+            StateRoot::ZERO,
             certified,
             HashMap::new(),
             None,
@@ -388,7 +395,7 @@ mod tests {
 
     #[test]
     fn proposal_parent_returns_latest_qc_when_present() {
-        let qc_block = Hash::from_bytes(b"qc_block");
+        let qc_block = bh(b"qc_block");
         let mut qc = QuorumCertificate::genesis();
         qc.block_hash = qc_block;
         qc.height = BlockHeight(5);
@@ -396,8 +403,8 @@ mod tests {
 
         run_view(
             0,
-            Hash::ZERO,
-            Hash::ZERO,
+            BlockHash::ZERO,
+            StateRoot::ZERO,
             HashMap::new(),
             HashMap::new(),
             Some(qc.clone()),
@@ -412,12 +419,12 @@ mod tests {
 
     #[test]
     fn proposal_parent_falls_back_to_committed_tip_without_qc() {
-        let tip_hash = Hash::from_bytes(b"tip");
+        let tip_hash = bh(b"tip");
 
         run_view(
             0,
             tip_hash,
-            Hash::ZERO,
+            StateRoot::ZERO,
             HashMap::new(),
             HashMap::new(),
             None,

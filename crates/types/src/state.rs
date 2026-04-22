@@ -1,6 +1,6 @@
 //! State-related types for cross-shard execution.
 
-use crate::{BlockHeight, Hash, NodeId, ShardGroupId};
+use crate::{BlockHeight, Hash, NodeId, ShardGroupId, TxHash};
 use sbor::prelude::*;
 use std::sync::Arc;
 
@@ -104,7 +104,7 @@ impl StateEntry {
 #[derive(Debug, Clone)]
 pub struct StateProvision {
     /// Hash of the transaction this provision is for.
-    pub transaction_hash: Hash,
+    pub transaction_hash: TxHash,
 
     /// Target shard (the shard executing the transaction).
     pub target_shard: ShardGroupId,
@@ -169,7 +169,7 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
             });
         }
 
-        let transaction_hash: Hash = decoder.decode()?;
+        let transaction_hash: TxHash = decoder.decode()?;
         let target_shard: ShardGroupId = decoder.decode()?;
         let source_shard: ShardGroupId = decoder.decode()?;
         let block_height: BlockHeight = decoder.decode()?;

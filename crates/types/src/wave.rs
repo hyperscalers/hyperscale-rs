@@ -23,9 +23,10 @@
 //! 5. [`FinalizedWave`] — all data needed for block commit
 
 use crate::{
-    compute_padded_merkle_root, Attempt, BlockHeight, Bls12381G2Signature, Hash, LocalReceipt,
-    ReceiptBundle, RoutableTransaction, ShardGroupId, SignerBitfield, TopologySnapshot,
-    TransactionDecision, TransactionOutcome, ValidatorId, WeightedTimestamp,
+    compute_padded_merkle_root, Attempt, BlockHash, BlockHeight, Bls12381G2Signature,
+    ExecutionCertificateHash, GlobalReceiptRoot, Hash, LocalReceipt, ReceiptBundle,
+    RoutableTransaction, ShardGroupId, SignerBitfield, TopologySnapshot, TransactionDecision,
+    TransactionOutcome, TxHash, ValidatorId, WaveReceiptHash, WeightedTimestamp,
 };
 use sbor::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
@@ -186,7 +187,10 @@ pub fn compute_provision_tx_roots(
             if shard == local_shard {
                 continue;
             }
-            per_target.entry(shard).or_default().push(tx.hash());
+            per_target
+                .entry(shard)
+                .or_default()
+                .push(tx.hash().into_raw());
         }
     }
 
@@ -242,7 +246,7 @@ pub fn wave_leader_at(
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct TxOutcome {
     /// Transaction hash.
-    pub tx_hash: Hash,
+    pub tx_hash: TxHash,
     /// The execution outcome for this transaction.
     pub outcome: ExecutionOutcome,
 }
@@ -297,7 +301,7 @@ impl ExecutionOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct ExecutionVote {
     /// Block this wave belongs to.
-    pub block_hash: Hash,
+    pub block_hash: BlockHash,
     /// Block height (the block containing the wave's transactions).
     pub block_height: BlockHeight,
     /// BFT-authenticated anchor at which this vote was cast.
@@ -312,7 +316,7 @@ pub struct ExecutionVote {
     /// Which shard produced this vote.
     pub shard_group_id: ShardGroupId,
     /// Merkle root over per-tx outcome leaves.
-    pub global_receipt_root: Hash,
+    pub global_receipt_root: GlobalReceiptRoot,
     /// Number of transactions in this wave.
     pub tx_count: u32,
     /// Per-tx execution outcomes in wave order.
@@ -346,7 +350,7 @@ pub struct ExecutionCertificate {
     /// reconstruct the BLS signing message for signature verification.
     pub vote_anchor_ts_ms: WeightedTimestamp,
     /// Merkle root over per-tx outcome leaves.
-    pub global_receipt_root: Hash,
+    pub global_receipt_root: GlobalReceiptRoot,
     /// Per-transaction outcomes (in wave order = block order).
     pub tx_outcomes: Vec<TxOutcome>,
     /// BLS aggregated signature from 2f+1 validators.
@@ -354,7 +358,7 @@ pub struct ExecutionCertificate {
     /// Which validators signed (bitfield indexed by committee position).
     pub signers: SignerBitfield,
     /// Cached canonical hash, computed eagerly at construction and on deserialization.
-    canonical_hash: Hash,
+    canonical_hash: ExecutionCertificateHash,
     /// Cached SBOR-encoded bytes. Populated at construction or after
     /// deserialization to avoid re-serialization on storage writes.
     cached_sbor: Option<Vec<u8>>,
@@ -440,7 +444,7 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
         }
         let wave_id: WaveId = decoder.decode()?;
         let vote_anchor_ts_ms: WeightedTimestamp = decoder.decode()?;
-        let global_receipt_root: Hash = decoder.decode()?;
+        let global_receipt_root: GlobalReceiptRoot = decoder.decode()?;
         let tx_outcomes: Vec<TxOutcome> = decoder.decode()?;
         let aggregated_signature: Bls12381G2Signature = decoder.decode()?;
         let signers: SignerBitfield = decoder.decode()?;
@@ -485,7 +489,7 @@ impl ExecutionCertificate {
     pub fn new(
         wave_id: WaveId,
         vote_anchor_ts_ms: WeightedTimestamp,
-        global_receipt_root: Hash,
+        global_receipt_root: GlobalReceiptRoot,
         tx_outcomes: Vec<TxOutcome>,
         aggregated_signature: Bls12381G2Signature,
         signers: SignerBitfield,
@@ -527,7 +531,7 @@ impl ExecutionCertificate {
     /// different 2f+1 subsets of votes, producing different signatures for the
     /// same wave — the canonical hash identifies the *logical* EC so that any
     /// valid aggregation resolves to the same hash.
-    pub fn canonical_hash(&self) -> Hash {
+    pub fn canonical_hash(&self) -> ExecutionCertificateHash {
         self.canonical_hash
     }
 
@@ -543,15 +547,15 @@ impl ExecutionCertificate {
     fn compute_canonical_hash(
         wave_id: &WaveId,
         vote_anchor_ts_ms: WeightedTimestamp,
-        global_receipt_root: &Hash,
+        global_receipt_root: &GlobalReceiptRoot,
         tx_outcomes: &[TxOutcome],
-    ) -> Hash {
+    ) -> ExecutionCertificateHash {
         let mut hasher = blake3::Hasher::new();
         hasher.update(&basic_encode(wave_id).unwrap());
         hasher.update(&vote_anchor_ts_ms.as_millis().to_le_bytes());
-        hasher.update(global_receipt_root.as_bytes());
+        hasher.update(global_receipt_root.as_raw().as_bytes());
         hasher.update(&basic_encode(tx_outcomes).unwrap());
-        Hash::from_hash_bytes(hasher.finalize().as_bytes())
+        ExecutionCertificateHash::from_raw(Hash::from_hash_bytes(hasher.finalize().as_bytes()))
     }
 }
 
@@ -587,9 +591,9 @@ pub fn tx_outcome_leaf(outcome: &TxOutcome) -> Hash {
 /// merkle inclusion proofs have a fixed `ceil(log2(N))` siblings.
 ///
 /// Outcomes must be in wave order (= block order within the wave).
-pub fn compute_global_receipt_root(outcomes: &[TxOutcome]) -> Hash {
+pub fn compute_global_receipt_root(outcomes: &[TxOutcome]) -> GlobalReceiptRoot {
     let leaves: Vec<Hash> = outcomes.iter().map(tx_outcome_leaf).collect();
-    compute_padded_merkle_root(&leaves)
+    GlobalReceiptRoot::from_raw(compute_padded_merkle_root(&leaves))
 }
 
 /// Compute receipt root and a merkle inclusion proof for a specific tx.
@@ -650,13 +654,13 @@ impl WaveCertificate {
     /// canonical_hash already encodes the WaveId, vote_anchor_ts_ms,
     /// global_receipt_root, and all tx_outcomes — so this commits to
     /// the full content of every contributing EC.
-    pub fn receipt_hash(&self) -> Hash {
+    pub fn receipt_hash(&self) -> WaveReceiptHash {
         let mut hasher = blake3::Hasher::new();
         for ec in &self.execution_certificates {
             hasher.update(&basic_encode(&ec.shard_group_id()).unwrap());
-            hasher.update(ec.canonical_hash().as_bytes());
+            hasher.update(ec.canonical_hash().as_raw().as_bytes());
         }
-        Hash::from_hash_bytes(hasher.finalize().as_bytes())
+        WaveReceiptHash::from_raw(Hash::from_hash_bytes(hasher.finalize().as_bytes()))
     }
 
     /// Get the execution certificates.
@@ -852,19 +856,19 @@ pub enum ReceiptValidationError {
     /// or tampered certificate.
     MissingLocalEc,
     /// A non-aborted `tx_outcome` has no corresponding receipt.
-    MissingReceipt { tx_hash: Hash },
+    MissingReceipt { tx_hash: TxHash },
     /// A receipt's `tx_hash` doesn't match the expected position in
     /// canonical order.
-    TxHashMismatch { expected: Hash, actual: Hash },
+    TxHashMismatch { expected: TxHash, actual: TxHash },
     /// A receipt's outcome (Success/Failure) disagrees with the EC's
     /// attested outcome for that tx.
     OutcomeMismatch {
-        tx_hash: Hash,
+        tx_hash: TxHash,
         expected: TransactionOutcome,
         actual: TransactionOutcome,
     },
     /// More receipts than non-aborted outcomes.
-    ExtraReceipt { tx_hash: Hash },
+    ExtraReceipt { tx_hash: TxHash },
 }
 
 impl FinalizedWave {
@@ -902,12 +906,12 @@ impl FinalizedWave {
     }
 
     /// Iterator over the wave's tx hashes in canonical block order.
-    pub fn tx_hashes(&self) -> impl Iterator<Item = Hash> + '_ {
+    pub fn tx_hashes(&self) -> impl Iterator<Item = TxHash> + '_ {
         self.local_ec().tx_outcomes.iter().map(|o| o.tx_hash)
     }
 
     /// Whether the wave contains a given tx.
-    pub fn contains_tx(&self, tx_hash: &Hash) -> bool {
+    pub fn contains_tx(&self, tx_hash: &TxHash) -> bool {
         self.local_ec()
             .tx_outcomes
             .iter()
@@ -928,7 +932,7 @@ impl FinalizedWave {
     ///   has incomplete state — syncing peer should try a different source).
     pub fn reconstruct<F>(certificate: Arc<WaveCertificate>, mut lookup: F) -> Option<Self>
     where
-        F: FnMut(&Hash) -> Option<Arc<LocalReceipt>>,
+        F: FnMut(&TxHash) -> Option<Arc<LocalReceipt>>,
     {
         let local_ec = certificate
             .execution_certificates
@@ -1017,9 +1021,9 @@ impl FinalizedWave {
     /// Aggregate per-tx decisions across all ECs (Aborted > Reject > Accept).
     ///
     /// Iteration order follows the local EC's canonical (block) order.
-    pub fn tx_decisions(&self) -> Vec<(Hash, TransactionDecision)> {
-        let mut aborted: std::collections::HashSet<Hash> = std::collections::HashSet::new();
-        let mut failure: std::collections::HashSet<Hash> = std::collections::HashSet::new();
+    pub fn tx_decisions(&self) -> Vec<(TxHash, TransactionDecision)> {
+        let mut aborted: std::collections::HashSet<TxHash> = std::collections::HashSet::new();
+        let mut failure: std::collections::HashSet<TxHash> = std::collections::HashSet::new();
         for ec in &self.certificate.execution_certificates {
             for outcome in &ec.tx_outcomes {
                 if outcome.is_aborted() {
@@ -1141,7 +1145,7 @@ mod tests {
 
     fn make_outcome(seed: u8) -> TxOutcome {
         TxOutcome {
-            tx_hash: Hash::from_bytes(&[seed; 4]),
+            tx_hash: TxHash::from_raw(Hash::from_bytes(&[seed; 4])),
             outcome: ExecutionOutcome::Executed {
                 receipt_hash: Hash::from_bytes(&[seed + 100; 4]),
                 success: true,
@@ -1237,7 +1241,8 @@ mod tests {
         assert_eq!(roots.len(), 1);
         assert!(roots.contains_key(&ShardGroupId(1)));
 
-        let expected = compute_padded_merkle_root(&[tx_a.hash(), tx_b.hash()]);
+        let expected =
+            compute_padded_merkle_root(&[tx_a.hash().into_raw(), tx_b.hash().into_raw()]);
         assert_eq!(roots[&ShardGroupId(1)], expected);
     }
 
@@ -1247,7 +1252,7 @@ mod tests {
         let root1 = compute_global_receipt_root(&outcomes);
         let root2 = compute_global_receipt_root(&outcomes);
         assert_eq!(root1, root2);
-        assert_ne!(root1, Hash::ZERO);
+        assert_ne!(root1, GlobalReceiptRoot::ZERO);
     }
 
     #[test]
@@ -1255,13 +1260,13 @@ mod tests {
         let outcomes = vec![make_outcome(1)];
         let root = compute_global_receipt_root(&outcomes);
         let expected = tx_outcome_leaf(&outcomes[0]);
-        assert_eq!(root, expected);
+        assert_eq!(root.into_raw(), expected);
     }
 
     #[test]
     fn test_global_receipt_root_empty() {
         let root = compute_global_receipt_root(&[]);
-        assert_eq!(root, Hash::ZERO);
+        assert_eq!(root, GlobalReceiptRoot::ZERO);
     }
 
     #[test]
@@ -1290,13 +1295,13 @@ mod tests {
             let (proof_root, siblings, leaf_index, leaf_hash) =
                 compute_global_receipt_root_with_proof(&outcomes, i);
 
-            assert_eq!(proof_root, root, "Root mismatch for index {i}");
+            assert_eq!(proof_root, root.into_raw(), "Root mismatch for index {i}");
 
             let expected_leaf = tx_outcome_leaf(&outcomes[i]);
             assert_eq!(leaf_hash, expected_leaf, "Leaf hash mismatch for index {i}");
 
             assert!(
-                crate::verify_merkle_inclusion(root, leaf_hash, &siblings, leaf_index),
+                crate::verify_merkle_inclusion(root.into_raw(), leaf_hash, &siblings, leaf_index),
                 "Proof failed for index {i}"
             );
         }
@@ -1305,14 +1310,14 @@ mod tests {
     #[test]
     fn test_tx_outcome_leaf_success_matters() {
         let success = TxOutcome {
-            tx_hash: Hash::from_bytes(b"tx"),
+            tx_hash: TxHash::from_raw(Hash::from_bytes(b"tx")),
             outcome: ExecutionOutcome::Executed {
                 receipt_hash: Hash::from_bytes(b"receipt"),
                 success: true,
             },
         };
         let failure = TxOutcome {
-            tx_hash: Hash::from_bytes(b"tx"),
+            tx_hash: TxHash::from_raw(Hash::from_bytes(b"tx")),
             outcome: ExecutionOutcome::Executed {
                 receipt_hash: Hash::from_bytes(b"receipt"),
                 success: false,
@@ -1324,14 +1329,14 @@ mod tests {
     #[test]
     fn test_tx_outcome_leaf_aborted_differs_from_executed() {
         let executed = TxOutcome {
-            tx_hash: Hash::from_bytes(b"tx"),
+            tx_hash: TxHash::from_raw(Hash::from_bytes(b"tx")),
             outcome: ExecutionOutcome::Executed {
                 receipt_hash: Hash::from_bytes(b"receipt"),
                 success: true,
             },
         };
         let aborted = TxOutcome {
-            tx_hash: Hash::from_bytes(b"tx"),
+            tx_hash: TxHash::from_raw(Hash::from_bytes(b"tx")),
             outcome: ExecutionOutcome::Aborted,
         };
         assert_ne!(tx_outcome_leaf(&executed), tx_outcome_leaf(&aborted));
@@ -1344,7 +1349,7 @@ mod tests {
         ExecutionCertificate::new(
             make_wave_id(0, BlockHeight(10), &[1]),
             WeightedTimestamp(11),
-            Hash::from_bytes(b"global_receipt_root"),
+            GlobalReceiptRoot::from_raw(Hash::from_bytes(b"global_receipt_root")),
             vec![make_outcome(1), make_outcome(2)],
             signature,
             signers,
@@ -1358,7 +1363,7 @@ mod tests {
         let ec1 = make_test_ec(signers.clone(), sig);
         let ec2 = make_test_ec(signers, sig);
         assert_eq!(ec1.canonical_hash(), ec2.canonical_hash());
-        assert_ne!(ec1.canonical_hash(), Hash::ZERO);
+        assert_ne!(ec1.canonical_hash(), ExecutionCertificateHash::ZERO);
     }
 
     #[test]
@@ -1384,7 +1389,7 @@ mod tests {
         Arc::new(ExecutionCertificate::new(
             make_wave_id(shard, BlockHeight(42), &[1]),
             WeightedTimestamp(43),
-            Hash::from_bytes(&[seed + 100; 4]),
+            GlobalReceiptRoot::from_raw(Hash::from_bytes(&[seed + 100; 4])),
             vec![make_outcome(seed)],
             Bls12381G2Signature([0u8; 96]),
             SignerBitfield::new(4),
@@ -1398,7 +1403,7 @@ mod tests {
             execution_certificates: vec![make_test_wave_ec(0, 1), make_test_wave_ec(1, 2)],
         };
         assert_eq!(wc.receipt_hash(), wc.receipt_hash());
-        assert_ne!(wc.receipt_hash(), Hash::ZERO);
+        assert_ne!(wc.receipt_hash(), WaveReceiptHash::ZERO);
     }
 
     #[test]
@@ -1539,8 +1544,8 @@ mod tests {
     #[test]
     fn reconstruct_from_all_success_outcomes() {
         let wave_id = make_wave_id(0, BlockHeight(42), &[1]);
-        let tx_a = Hash::from_bytes(b"tx_a");
-        let tx_b = Hash::from_bytes(b"tx_b");
+        let tx_a = TxHash::from_raw(Hash::from_bytes(b"tx_a"));
+        let tx_b = TxHash::from_raw(Hash::from_bytes(b"tx_b"));
 
         let outcomes = vec![
             TxOutcome {
@@ -1566,7 +1571,7 @@ mod tests {
         let fw = FinalizedWave::reconstruct(wc, |_| Some(make_success_receipt()))
             .expect("reconstruction should succeed");
         assert_eq!(fw.tx_count(), 2);
-        let hashes: Vec<Hash> = fw.tx_hashes().collect();
+        let hashes: Vec<TxHash> = fw.tx_hashes().collect();
         assert_eq!(hashes, vec![tx_a, tx_b]);
         assert_eq!(fw.receipts.len(), 2);
         assert_eq!(fw.receipts[0].tx_hash, tx_a);
@@ -1576,8 +1581,8 @@ mod tests {
     #[test]
     fn reconstruct_skips_aborted_tx_without_receipt() {
         let wave_id = make_wave_id(0, BlockHeight(42), &[1]);
-        let tx_a = Hash::from_bytes(b"tx_a");
-        let tx_b = Hash::from_bytes(b"tx_b_aborted");
+        let tx_a = TxHash::from_raw(Hash::from_bytes(b"tx_a"));
+        let tx_b = TxHash::from_raw(Hash::from_bytes(b"tx_b_aborted"));
 
         let outcomes = vec![
             TxOutcome {
@@ -1615,7 +1620,7 @@ mod tests {
     #[test]
     fn reconstruct_fails_when_non_aborted_receipt_missing() {
         let wave_id = make_wave_id(0, BlockHeight(42), &[1]);
-        let tx_a = Hash::from_bytes(b"tx_a");
+        let tx_a = TxHash::from_raw(Hash::from_bytes(b"tx_a"));
 
         let outcomes = vec![TxOutcome {
             tx_hash: tx_a,
@@ -1646,7 +1651,7 @@ mod tests {
         let remote_ec = make_local_ec(
             &remote_wave_id,
             vec![TxOutcome {
-                tx_hash: Hash::from_bytes(b"tx"),
+                tx_hash: TxHash::from_raw(Hash::from_bytes(b"tx")),
                 outcome: ExecutionOutcome::Aborted,
             }],
         );
@@ -1672,9 +1677,9 @@ mod tests {
     #[test]
     fn validate_accepts_receipts_matching_outcomes() {
         let wave_id = make_wave_id(0, BlockHeight(42), &[1]);
-        let tx_a = Hash::from_bytes(b"tx_a");
-        let tx_b = Hash::from_bytes(b"tx_b_aborted");
-        let tx_c = Hash::from_bytes(b"tx_c_fail");
+        let tx_a = TxHash::from_raw(Hash::from_bytes(b"tx_a"));
+        let tx_b = TxHash::from_raw(Hash::from_bytes(b"tx_b_aborted"));
+        let tx_c = TxHash::from_raw(Hash::from_bytes(b"tx_c_fail"));
 
         let outcomes = vec![
             TxOutcome {
@@ -1720,7 +1725,7 @@ mod tests {
     #[test]
     fn validate_rejects_outcome_flip() {
         let wave_id = make_wave_id(0, BlockHeight(42), &[1]);
-        let tx_a = Hash::from_bytes(b"tx_a");
+        let tx_a = TxHash::from_raw(Hash::from_bytes(b"tx_a"));
         let outcomes = vec![TxOutcome {
             tx_hash: tx_a,
             outcome: ExecutionOutcome::Executed {
@@ -1749,7 +1754,7 @@ mod tests {
     #[test]
     fn validate_rejects_missing_receipt() {
         let wave_id = make_wave_id(0, BlockHeight(42), &[1]);
-        let tx_a = Hash::from_bytes(b"tx_a");
+        let tx_a = TxHash::from_raw(Hash::from_bytes(b"tx_a"));
         let outcomes = vec![TxOutcome {
             tx_hash: tx_a,
             outcome: ExecutionOutcome::Executed {
@@ -1773,7 +1778,7 @@ mod tests {
     #[test]
     fn validate_rejects_extra_receipt() {
         let wave_id = make_wave_id(0, BlockHeight(42), &[1]);
-        let tx_a = Hash::from_bytes(b"tx_a");
+        let tx_a = TxHash::from_raw(Hash::from_bytes(b"tx_a"));
         let outcomes = vec![TxOutcome {
             tx_hash: tx_a,
             outcome: ExecutionOutcome::Aborted,
@@ -1798,8 +1803,8 @@ mod tests {
     #[test]
     fn validate_rejects_tx_hash_mismatch() {
         let wave_id = make_wave_id(0, BlockHeight(42), &[1]);
-        let tx_a = Hash::from_bytes(b"tx_a");
-        let tx_b = Hash::from_bytes(b"tx_b");
+        let tx_a = TxHash::from_raw(Hash::from_bytes(b"tx_a"));
+        let tx_b = TxHash::from_raw(Hash::from_bytes(b"tx_b"));
         let outcomes = vec![TxOutcome {
             tx_hash: tx_a,
             outcome: ExecutionOutcome::Executed {
@@ -1846,7 +1851,7 @@ mod tests {
     fn validate_all_aborted_wave_with_empty_receipts_passes() {
         let wave_id = make_wave_id(0, BlockHeight(42), &[1]);
         let outcomes = vec![TxOutcome {
-            tx_hash: Hash::from_bytes(b"aborted"),
+            tx_hash: TxHash::from_raw(Hash::from_bytes(b"aborted")),
             outcome: ExecutionOutcome::Aborted,
         }];
         let fw = FinalizedWave {

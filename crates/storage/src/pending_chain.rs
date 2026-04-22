@@ -10,7 +10,13 @@ use crate::{
     SubstateStore,
 };
 use ::hyperscale_jmt as jmt;
-use hyperscale_types::{BlockHeight, Hash, LocalReceipt, MerkleInclusionProof, NodeId};
+#[cfg(test)]
+use hyperscale_types::Hash;
+#[cfg(test)]
+use hyperscale_types::TxHash;
+use hyperscale_types::{
+    BlockHash, BlockHeight, LocalReceipt, MerkleInclusionProof, NodeId, StateRoot,
+};
 use radix_common::prelude::DatabaseUpdate;
 use radix_substate_store_interface::interface::SubstateDatabase;
 use std::collections::HashMap;
@@ -29,7 +35,7 @@ pub type BaseReadCache = HashMap<(DbPartitionKey, DbSortKey), Option<Vec<u8>>>;
 #[derive(Clone)]
 pub struct ChainEntry {
     /// Parent block hash. Used to walk the chain back to the committed tip.
-    pub parent_hash: Hash,
+    pub parent_hash: BlockHash,
     /// Block height. Used for pruning and version-aware reads.
     pub height: BlockHeight,
     /// Per-tx receipts produced by this block.
@@ -49,7 +55,7 @@ pub struct ChainEntry {
 /// impossible by construction.
 pub struct PendingChain<S> {
     base: Arc<S>,
-    entries: RwLock<HashMap<Hash, ChainEntry>>,
+    entries: RwLock<HashMap<BlockHash, ChainEntry>>,
 }
 
 impl<S> PendingChain<S>
@@ -65,7 +71,7 @@ where
     }
 
     /// Append an entry.
-    pub fn insert(&self, block_hash: Hash, entry: ChainEntry) {
+    pub fn insert(&self, block_hash: BlockHash, entry: ChainEntry) {
         self.entries.write().unwrap().insert(block_hash, entry);
     }
 
@@ -94,7 +100,7 @@ where
     /// The view sees state through `parent_hash` and all of its committed
     /// ancestors back to the persisted tip. Orphaned blocks not on this
     /// chain are invisible.
-    pub fn view_at(self: &Arc<Self>, parent_hash: Hash) -> Arc<SubstateView<S>> {
+    pub fn view_at(self: &Arc<Self>, parent_hash: BlockHash) -> Arc<SubstateView<S>> {
         Arc::new(self.build_view(parent_hash))
     }
 
@@ -119,7 +125,7 @@ where
     ///
     /// Holds the read lock for the duration of the walk; no per-entry
     /// clones.
-    fn build_view(&self, parent_hash: Hash) -> SubstateView<S> {
+    fn build_view(&self, parent_hash: BlockHash) -> SubstateView<S> {
         let entries = self.entries.read().unwrap();
         let mut chain: Vec<&ChainEntry> = Vec::new();
         let mut cursor = parent_hash;
@@ -457,7 +463,7 @@ impl<S: SubstateStore + crate::VersionedStore> SubstateStore for SubstateView<S>
         (*self.base).jmt_height()
     }
 
-    fn state_root_hash(&self) -> Hash {
+    fn state_root_hash(&self) -> StateRoot {
         (*self.base).state_root_hash()
     }
 
@@ -584,13 +590,13 @@ impl<S: crate::ChainWriter> crate::ChainWriter for SubstateView<S> {
 
     fn prepare_block_commit(
         &self,
-        parent_state_root: Hash,
+        parent_state_root: StateRoot,
         parent_block_height: BlockHeight,
         finalized_waves: &[Arc<hyperscale_types::FinalizedWave>],
         block_height: BlockHeight,
         pending_snapshots: &[Arc<JmtSnapshot>],
         base_reads: Option<&BaseReadCache>,
-    ) -> (Hash, Self::PreparedCommit) {
+    ) -> (StateRoot, Self::PreparedCommit) {
         // Drain the view's own cache when the caller didn't supply one.
         // This is the common path: execution reads through the view,
         // prepare_block_commit consumes the accumulated priors so the
@@ -618,7 +624,7 @@ impl<S: crate::ChainWriter> crate::ChainWriter for SubstateView<S> {
             Arc<hyperscale_types::Block>,
             Arc<hyperscale_types::QuorumCertificate>,
         )>,
-    ) -> Vec<Hash> {
+    ) -> Vec<StateRoot> {
         (*self.base).commit_prepared_blocks(blocks)
     }
 
@@ -626,7 +632,7 @@ impl<S: crate::ChainWriter> crate::ChainWriter for SubstateView<S> {
         &self,
         block: &Arc<hyperscale_types::Block>,
         qc: &Arc<hyperscale_types::QuorumCertificate>,
-    ) -> Hash {
+    ) -> StateRoot {
         (*self.base).commit_block(block, qc)
     }
 
@@ -694,8 +700,8 @@ mod tests {
         fn jmt_height(&self) -> BlockHeight {
             BlockHeight::GENESIS
         }
-        fn state_root_hash(&self) -> Hash {
-            Hash::ZERO
+        fn state_root_hash(&self) -> StateRoot {
+            StateRoot::ZERO
         }
         fn list_substates_for_node_at_height(
             &self,
@@ -735,7 +741,7 @@ mod tests {
         fn committed_height(&self) -> BlockHeight {
             BlockHeight(0)
         }
-        fn committed_hash(&self) -> Option<Hash> {
+        fn committed_hash(&self) -> Option<BlockHash> {
             None
         }
         fn latest_qc(&self) -> Option<hyperscale_types::QuorumCertificate> {
@@ -746,7 +752,7 @@ mod tests {
         }
         fn get_transactions_batch(
             &self,
-            _hashes: &[Hash],
+            _hashes: &[TxHash],
         ) -> Vec<hyperscale_types::RoutableTransaction> {
             Vec::new()
         }
@@ -756,7 +762,7 @@ mod tests {
         ) -> Vec<hyperscale_types::WaveCertificate> {
             Vec::new()
         }
-        fn get_local_receipt(&self, _tx_hash: &Hash) -> Option<Arc<LocalReceipt>> {
+        fn get_local_receipt(&self, _tx_hash: &TxHash) -> Option<Arc<LocalReceipt>> {
             None
         }
         fn get_execution_certificates_by_height(
@@ -767,14 +773,19 @@ mod tests {
         }
         fn get_wave_certificate_for_tx(
             &self,
-            _tx_hash: &Hash,
+            _tx_hash: &TxHash,
         ) -> Option<hyperscale_types::WaveCertificate> {
             None
         }
         fn get_ec_hashes_for_tx(
             &self,
-            _tx_hash: &Hash,
-        ) -> Option<Vec<(hyperscale_types::ShardGroupId, Hash)>> {
+            _tx_hash: &TxHash,
+        ) -> Option<
+            Vec<(
+                hyperscale_types::ShardGroupId,
+                hyperscale_types::ExecutionCertificateHash,
+            )>,
+        > {
             None
         }
     }
@@ -809,9 +820,9 @@ mod tests {
 
     fn empty_snapshot() -> Arc<JmtSnapshot> {
         Arc::new(JmtSnapshot {
-            base_root: Hash::ZERO,
+            base_root: StateRoot::ZERO,
             base_height: BlockHeight::GENESIS,
-            result_root: Hash::ZERO,
+            result_root: StateRoot::ZERO,
             new_height: BlockHeight::GENESIS,
             nodes: vec![],
             stale_node_keys: vec![],
@@ -819,13 +830,17 @@ mod tests {
         })
     }
 
-    fn entry_at(parent: Hash, height: BlockHeight, updates: DatabaseUpdates) -> ChainEntry {
+    fn entry_at(parent: BlockHash, height: BlockHeight, updates: DatabaseUpdates) -> ChainEntry {
         ChainEntry {
             parent_hash: parent,
             height,
             receipts: vec![make_receipt(updates)],
             jmt_snapshot: empty_snapshot(),
         }
+    }
+
+    fn bh(tag: &[u8]) -> BlockHash {
+        BlockHash::from_raw(Hash::from_bytes(tag))
     }
 
     fn empty_chain() -> Arc<PendingChain<StubStore>> {
@@ -835,12 +850,12 @@ mod tests {
     #[test]
     fn prune_drops_old_entries() {
         let chain = empty_chain();
-        let h1 = Hash::from_bytes(b"h1");
-        let h2 = Hash::from_bytes(b"h2");
-        let h3 = Hash::from_bytes(b"h3");
+        let h1 = bh(b"h1");
+        let h2 = bh(b"h2");
+        let h3 = bh(b"h3");
         chain.insert(
             h1,
-            entry_at(Hash::ZERO, BlockHeight(1), DatabaseUpdates::default()),
+            entry_at(BlockHash::ZERO, BlockHeight(1), DatabaseUpdates::default()),
         );
         chain.insert(h2, entry_at(h1, BlockHeight(2), DatabaseUpdates::default()));
         chain.insert(h3, entry_at(h2, BlockHeight(3), DatabaseUpdates::default()));
@@ -853,8 +868,8 @@ mod tests {
     #[test]
     fn view_at_walks_parent_chain() {
         let chain = empty_chain();
-        let h1 = Hash::from_bytes(b"h1");
-        let h2 = Hash::from_bytes(b"h2");
+        let h1 = bh(b"h1");
+        let h2 = bh(b"h2");
 
         let pk = DbPartitionKey {
             node_key: b"node".to_vec(),
@@ -864,7 +879,7 @@ mod tests {
         chain.insert(
             h1,
             entry_at(
-                Hash::ZERO,
+                BlockHash::ZERO,
                 BlockHeight(1),
                 make_delta(b"node", 0, vec![1], vec![10]),
             ),
@@ -893,8 +908,8 @@ mod tests {
     #[test]
     fn orphans_are_invisible_to_committed_chain_view() {
         let chain = empty_chain();
-        let h1 = Hash::from_bytes(b"h1");
-        let orphan = Hash::from_bytes(b"orphan");
+        let h1 = bh(b"h1");
+        let orphan = bh(b"orphan");
 
         let pk = DbPartitionKey {
             node_key: b"node".to_vec(),
@@ -904,7 +919,7 @@ mod tests {
         chain.insert(
             h1,
             entry_at(
-                Hash::ZERO,
+                BlockHash::ZERO,
                 BlockHeight(1),
                 make_delta(b"node", 0, vec![1], vec![10]),
             ),
@@ -913,7 +928,7 @@ mod tests {
         chain.insert(
             orphan,
             entry_at(
-                Hash::ZERO,
+                BlockHash::ZERO,
                 BlockHeight(1),
                 make_delta(b"node", 0, vec![1], vec![99]),
             ),

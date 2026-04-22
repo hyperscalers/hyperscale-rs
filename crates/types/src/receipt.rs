@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 
-use crate::{compute_merkle_root, DatabaseUpdates, Hash};
+use crate::{compute_merkle_root, DatabaseUpdates, EventRoot, Hash, TxHash, WritesRoot};
 
 // ─── Outcome ─────────────────────────────────────────────────────────────────
 
@@ -87,14 +87,14 @@ pub enum LogLevel {
 pub struct GlobalReceipt {
     pub outcome: TransactionOutcome,
     /// Merkle root of application event hashes.
-    pub event_root: Hash,
+    pub event_root: EventRoot,
     /// Merkle root of declared-only, system-filtered global database writes.
     ///
     /// Computed from `filter_updates_for_global_receipt()` — includes writes for
     /// ALL shards (not shard-filtered), but excludes system entities and undeclared
     /// writes. This ensures cross-shard validators agree on the same state changes
     /// for declared accounts.
-    pub writes_root: Hash,
+    pub writes_root: WritesRoot,
 }
 
 impl GlobalReceipt {
@@ -108,8 +108,8 @@ impl GlobalReceipt {
         };
         Hash::from_parts(&[
             &outcome_byte,
-            self.event_root.as_bytes(),
-            self.writes_root.as_bytes(),
+            self.event_root.as_raw().as_bytes(),
+            self.writes_root.as_raw().as_bytes(),
         ])
     }
 }
@@ -139,11 +139,11 @@ impl LocalReceipt {
     /// `writes_root` must be computed separately from unfiltered (global) writes
     /// via `filter_updates_for_global_receipt()`, since this local receipt only
     /// contains shard-filtered writes.
-    pub fn global_receipt(&self, writes_root: Hash) -> GlobalReceipt {
+    pub fn global_receipt(&self, writes_root: WritesRoot) -> GlobalReceipt {
         let event_hashes: Vec<Hash> = self.application_events.iter().map(|e| e.hash()).collect();
         GlobalReceipt {
             outcome: self.outcome,
-            event_root: compute_merkle_root(&event_hashes),
+            event_root: EventRoot::from_raw(compute_merkle_root(&event_hashes)),
             writes_root,
         }
     }
@@ -216,7 +216,7 @@ impl ExecutionMetadata {
 /// `execution_output` is `None` when the receipt was fetched from a peer (sync/catch-up).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReceiptBundle {
-    pub tx_hash: Hash,
+    pub tx_hash: TxHash,
     pub local_receipt: Arc<LocalReceipt>,
     /// Only populated when this node executed the transaction locally.
     pub execution_output: Option<ExecutionMetadata>,
@@ -256,7 +256,7 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
             });
         }
 
-        let tx_hash: Hash = decoder.decode()?;
+        let tx_hash: TxHash = decoder.decode()?;
         let local_receipt: LocalReceipt = decoder.decode()?;
         let execution_output: Option<ExecutionMetadata> = decoder.decode()?;
 
@@ -296,7 +296,7 @@ impl sbor::Describe<sbor::NoCustomTypeKind> for ReceiptBundle {
 #[derive(Debug, Clone)]
 pub struct LocalExecutionEntry {
     /// Hash of the executed transaction.
-    pub tx_hash: Hash,
+    pub tx_hash: TxHash,
     /// Pre-computed global receipt hash (outcome + event_root + writes_root).
     /// Computed on the execution thread pool to avoid recomputation on the state machine.
     pub receipt_hash: Hash,
@@ -330,8 +330,8 @@ mod tests {
     #[test]
     fn test_empty_receipt_has_zero_event_root() {
         let receipt = make_receipt(vec![]);
-        let global = receipt.global_receipt(Hash::ZERO);
-        assert_eq!(global.event_root, Hash::ZERO);
+        let global = receipt.global_receipt(WritesRoot::ZERO);
+        assert_eq!(global.event_root, EventRoot::ZERO);
     }
 
     #[test]
@@ -339,11 +339,11 @@ mod tests {
         let events = vec![make_event(1), make_event(2)];
         let receipt = make_receipt(events.clone());
 
-        let global = receipt.global_receipt(Hash::ZERO);
+        let global = receipt.global_receipt(WritesRoot::ZERO);
         assert_eq!(global.outcome, TransactionOutcome::Success);
 
         let event_hashes: Vec<Hash> = events.iter().map(|e| e.hash()).collect();
-        let expected_root = compute_merkle_root(&event_hashes);
+        let expected_root = EventRoot::from_raw(compute_merkle_root(&event_hashes));
         assert_eq!(global.event_root, expected_root);
     }
 
@@ -351,13 +351,13 @@ mod tests {
     fn test_receipt_hash_changes_with_outcome() {
         let success = GlobalReceipt {
             outcome: TransactionOutcome::Success,
-            event_root: Hash::ZERO,
-            writes_root: Hash::ZERO,
+            event_root: EventRoot::ZERO,
+            writes_root: WritesRoot::ZERO,
         };
         let failure = GlobalReceipt {
             outcome: TransactionOutcome::Failure,
-            event_root: Hash::ZERO,
-            writes_root: Hash::ZERO,
+            event_root: EventRoot::ZERO,
+            writes_root: WritesRoot::ZERO,
         };
         assert_ne!(success.receipt_hash(), failure.receipt_hash());
     }
@@ -367,8 +367,8 @@ mod tests {
         let receipt_a = make_receipt(vec![make_event(1)]);
         let receipt_b = make_receipt(vec![make_event(1), make_event(2)]);
         assert_ne!(
-            receipt_a.global_receipt(Hash::ZERO).receipt_hash(),
-            receipt_b.global_receipt(Hash::ZERO).receipt_hash()
+            receipt_a.global_receipt(WritesRoot::ZERO).receipt_hash(),
+            receipt_b.global_receipt(WritesRoot::ZERO).receipt_hash()
         );
     }
 
@@ -376,13 +376,13 @@ mod tests {
     fn test_receipt_hash_changes_with_writes_root() {
         let a = GlobalReceipt {
             outcome: TransactionOutcome::Success,
-            event_root: Hash::ZERO,
-            writes_root: Hash::ZERO,
+            event_root: EventRoot::ZERO,
+            writes_root: WritesRoot::ZERO,
         };
         let b = GlobalReceipt {
             outcome: TransactionOutcome::Success,
-            event_root: Hash::ZERO,
-            writes_root: Hash::from_bytes(b"different"),
+            event_root: EventRoot::ZERO,
+            writes_root: WritesRoot::from_raw(Hash::from_bytes(b"different")),
         };
         assert_ne!(a.receipt_hash(), b.receipt_hash());
     }
@@ -405,7 +405,7 @@ mod tests {
 
         // Bundle without execution output (synced from peer)
         let synced = ReceiptBundle {
-            tx_hash: Hash::from_bytes(b"synced_tx"),
+            tx_hash: TxHash::from_raw(Hash::from_bytes(b"synced_tx")),
             local_receipt: Arc::clone(&receipt),
             execution_output: None,
         };
@@ -413,7 +413,7 @@ mod tests {
 
         // Bundle with execution output (executed locally)
         let local = ReceiptBundle {
-            tx_hash: Hash::from_bytes(b"local_tx"),
+            tx_hash: TxHash::from_raw(Hash::from_bytes(b"local_tx")),
             local_receipt: receipt,
             execution_output: Some(ExecutionMetadata::failure(Some("test error".to_string()))),
         };

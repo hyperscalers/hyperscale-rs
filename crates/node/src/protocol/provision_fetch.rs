@@ -420,7 +420,7 @@ pub fn serve_provision_request(
 
     // Phase 1: Fetch state entries for all matching transactions.
     let mut per_tx: Vec<(
-        hyperscale_types::Hash,
+        hyperscale_types::TxHash,
         Arc<Vec<hyperscale_types::StateEntry>>,
     )> = Vec::new();
     let mut all_storage_keys: Vec<Vec<u8>> = Vec::new();

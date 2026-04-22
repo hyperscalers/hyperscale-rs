@@ -4,8 +4,9 @@
 //! All methods take `&self` — implementations use interior mutability.
 
 use hyperscale_types::{
-    Block, BlockHeight, CertifiedBlock, ExecutionCertificate, Hash, LocalReceipt,
-    QuorumCertificate, RoutableTransaction, ShardGroupId, WaveCertificate,
+    Block, BlockHash, BlockHeight, CertifiedBlock, ExecutionCertificate, ExecutionCertificateHash,
+    Hash, LocalReceipt, QuorumCertificate, RoutableTransaction, ShardGroupId, TxHash,
+    WaveCertificate,
 };
 use std::sync::Arc;
 
@@ -40,7 +41,7 @@ pub trait ChainReader: Send + Sync + 'static {
     fn committed_height(&self) -> BlockHeight;
 
     /// Get the latest committed block hash.
-    fn committed_hash(&self) -> Option<Hash>;
+    fn committed_hash(&self) -> Option<BlockHash>;
 
     /// Get the latest quorum certificate.
     fn latest_qc(&self) -> Option<QuorumCertificate>;
@@ -55,7 +56,7 @@ pub trait ChainReader: Send + Sync + 'static {
     /// Get multiple transactions by hash (batch read).
     ///
     /// Returns only transactions that were found (missing hashes are skipped).
-    fn get_transactions_batch(&self, hashes: &[Hash]) -> Vec<RoutableTransaction>;
+    fn get_transactions_batch(&self, hashes: &[TxHash]) -> Vec<RoutableTransaction>;
 
     /// Get multiple certificates by hash (batch read).
     ///
@@ -65,7 +66,7 @@ pub trait ChainReader: Send + Sync + 'static {
     // ─── Receipt Storage ──────────────────────────────────────────────────
 
     /// Retrieve the local receipt for a transaction.
-    fn get_local_receipt(&self, tx_hash: &Hash) -> Option<Arc<LocalReceipt>>;
+    fn get_local_receipt(&self, tx_hash: &TxHash) -> Option<Arc<LocalReceipt>>;
 
     // ─── Execution Certificate Reads ────────────────────────────────────
 
@@ -80,12 +81,15 @@ pub trait ChainReader: Send + Sync + 'static {
     /// Get the wave certificate that finalized a given transaction.
     ///
     /// Returns `None` if no wave cert has been recorded for this tx.
-    fn get_wave_certificate_for_tx(&self, tx_hash: &Hash) -> Option<WaveCertificate>;
+    fn get_wave_certificate_for_tx(&self, tx_hash: &TxHash) -> Option<WaveCertificate>;
 
     /// Get the execution certificate hashes associated with a transaction.
     ///
     /// Returns the `(ShardGroupId, ec_hash)` pairs from every shard that
     /// produced an EC covering this transaction. Returns `None` if no
     /// index entry exists for this tx.
-    fn get_ec_hashes_for_tx(&self, tx_hash: &Hash) -> Option<Vec<(ShardGroupId, Hash)>>;
+    fn get_ec_hashes_for_tx(
+        &self,
+        tx_hash: &TxHash,
+    ) -> Option<Vec<(ShardGroupId, ExecutionCertificateHash)>>;
 }

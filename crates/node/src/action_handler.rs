@@ -13,7 +13,7 @@ use hyperscale_engine::Engine;
 use hyperscale_metrics as metrics;
 use hyperscale_storage::{ChainReader, ChainWriter, SubstateStore};
 use hyperscale_types::{
-    BlockHeight, Hash, LocalExecutionEntry, Provision, ShardGroupId, TxEntries,
+    BlockHash, BlockHeight, LocalExecutionEntry, Provision, ShardGroupId, TxEntries, TxHash,
 };
 use std::sync::Arc;
 use tracing::warn;
@@ -48,7 +48,7 @@ pub(crate) struct DelegatedResult<P: Send> {
 /// A successful prepare result, ready to insert into `PendingChain` and
 /// `prepared_commits`.
 pub(crate) struct PreparedBlock<P: Send> {
-    pub block_hash: Hash,
+    pub block_hash: BlockHash,
     pub block_height: BlockHeight,
     pub prepared: P,
     pub receipts: Vec<Arc<hyperscale_types::LocalReceipt>>,
@@ -107,7 +107,7 @@ pub(crate) fn dispatch_pool_for(action: &Action) -> Option<DispatchPool> {
 ///   build on / verify against).
 /// - `Execute*` and `FetchAndBroadcastProvision` use the kicked-off
 ///   block (the committed block whose state these actions act on).
-pub(crate) fn parent_hash_for(action: &Action) -> Option<Hash> {
+pub(crate) fn parent_hash_for(action: &Action) -> Option<BlockHash> {
     match action {
         Action::VerifyStateRoot {
             parent_block_hash, ..
@@ -732,7 +732,7 @@ pub(crate) fn handle_delegated_action<
 /// transfers, not just the account's own substates.
 /// Per-tx fetched entries: (tx_hash, target_shards_with_nodes, state_entries).
 type FetchedTxEntries = (
-    Hash,
+    TxHash,
     Vec<(ShardGroupId, Vec<hyperscale_types::NodeId>)>,
     Arc<Vec<hyperscale_types::StateEntry>>,
 );

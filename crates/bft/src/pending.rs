@@ -4,8 +4,8 @@
 
 use hyperscale_core::Action;
 use hyperscale_types::{
-    Block, BlockHeader, BlockManifest, FinalizedWave, Hash, Provision, RoutableTransaction,
-    TopologySnapshot,
+    Block, BlockHash, BlockHeader, BlockManifest, FinalizedWave, Hash, Provision,
+    RoutableTransaction, TopologySnapshot, TxHash,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -32,10 +32,10 @@ pub struct PendingBlock {
     manifest: BlockManifest,
 
     /// Map of transaction hash -> Arc<RoutableTransaction> (for received transactions).
-    received_transactions: HashMap<Hash, Arc<RoutableTransaction>>,
+    received_transactions: HashMap<TxHash, Arc<RoutableTransaction>>,
 
     /// Set of transaction hashes we're still waiting for (HashSet for O(1) lookup).
-    missing_transaction_hashes: HashSet<Hash>,
+    missing_transaction_hashes: HashSet<TxHash>,
 
     /// Map of wave_id hash -> Arc<FinalizedWave> (carries cert + receipts + ECs).
     ///
@@ -69,7 +69,7 @@ impl PendingBlock {
         created_at: Duration,
     ) -> Self {
         let total_tx_count = manifest.transaction_count();
-        let missing_transaction_hashes: HashSet<Hash> =
+        let missing_transaction_hashes: HashSet<TxHash> =
             manifest.tx_hashes.iter().copied().collect();
         let missing_wave_hashes: HashSet<Hash> = manifest.cert_hashes.iter().copied().collect();
         let missing_provision_hashes: HashSet<Hash> =
@@ -179,12 +179,12 @@ impl PendingBlock {
     }
 
     /// Get the missing transaction hashes as a Vec (for iteration/display).
-    pub fn missing_transactions(&self) -> Vec<Hash> {
+    pub fn missing_transactions(&self) -> Vec<TxHash> {
         self.missing_transaction_hashes.iter().copied().collect()
     }
 
     /// Check if this pending block needs a specific transaction.
-    pub fn needs_transaction(&self, tx_hash: &Hash) -> bool {
+    pub fn needs_transaction(&self, tx_hash: &TxHash) -> bool {
         self.missing_transaction_hashes.contains(tx_hash)
     }
 
@@ -323,7 +323,7 @@ impl PendingBlock {
 /// bypasses the age check — used after sync resumes to pull any lingering
 /// holes without another timeout cycle.
 pub(crate) fn check_fetches(
-    pending_blocks: &HashMap<Hash, PendingBlock>,
+    pending_blocks: &HashMap<BlockHash, PendingBlock>,
     topology: &TopologySnapshot,
     now: Duration,
     timeout: Duration,
@@ -400,23 +400,26 @@ pub(crate) fn check_fetches(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hyperscale_types::{BlockHeight, QuorumCertificate, Round, ShardGroupId, ValidatorId};
+    use hyperscale_types::{
+        BlockHeight, CertificateRoot, LocalReceiptRoot, ProvisionsRoot, QuorumCertificate, Round,
+        ShardGroupId, StateRoot, TransactionRoot, ValidatorId,
+    };
 
     fn make_header(height: BlockHeight) -> BlockHeader {
         BlockHeader {
             shard_group_id: ShardGroupId(0),
             height,
-            parent_hash: Hash::from_bytes(b"parent"),
+            parent_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(0),
             timestamp: hyperscale_types::ProposerTimestamp(1234567890),
             round: Round::INITIAL,
             is_fallback: false,
-            state_root: Hash::ZERO,
-            transaction_root: Hash::ZERO,
-            certificate_root: Hash::ZERO,
-            local_receipt_root: Hash::ZERO,
-            provision_root: Hash::ZERO,
+            state_root: StateRoot::ZERO,
+            transaction_root: TransactionRoot::ZERO,
+            certificate_root: CertificateRoot::ZERO,
+            local_receipt_root: LocalReceiptRoot::ZERO,
+            provision_root: ProvisionsRoot::ZERO,
             waves: vec![],
             provision_tx_roots: BTreeMap::new(),
             in_flight: 0,
@@ -425,8 +428,8 @@ mod tests {
 
     #[test]
     fn test_pending_block_creation() {
-        let tx1 = Hash::from_bytes(b"tx1");
-        let tx2 = Hash::from_bytes(b"tx2");
+        let tx1 = TxHash::from_raw(Hash::from_bytes(b"tx1"));
+        let tx2 = TxHash::from_raw(Hash::from_bytes(b"tx2"));
         let header = make_header(BlockHeight(1));
 
         let pb = PendingBlock::from_manifest(
@@ -455,7 +458,7 @@ mod tests {
 
     #[test]
     fn test_pending_block_with_waves() {
-        let tx1 = Hash::from_bytes(b"tx1");
+        let tx1 = TxHash::from_raw(Hash::from_bytes(b"tx1"));
         let wave1 = Hash::from_bytes(b"wave1");
         let wave2 = Hash::from_bytes(b"wave2");
         let header = make_header(BlockHeight(1));

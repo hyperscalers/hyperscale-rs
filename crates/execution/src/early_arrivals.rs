@@ -36,7 +36,9 @@
 //!   that never land locally (orphaned txs or malicious remotes). Sized
 //!   well above plausible cross-shard inclusion lag.
 
-use hyperscale_types::{ExecutionCertificate, ExecutionVote, Hash, WaveId, WeightedTimestamp};
+use hyperscale_types::{ExecutionCertificate, ExecutionVote, TxHash, WaveId, WeightedTimestamp};
+#[cfg(test)]
+use hyperscale_types::{GlobalReceiptRoot, Hash};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -65,7 +67,7 @@ const EC_BUFFER_RETENTION: Duration = Duration::from_secs(60);
 #[derive(Debug)]
 struct BufferedEc {
     ec: Arc<ExecutionCertificate>,
-    pending_txs: HashSet<Hash>,
+    pending_txs: HashSet<TxHash>,
     /// Local weighted timestamp when this EC was first buffered. Used by
     /// [`EarlyArrivalBuffer::gc_stale_ecs`] to evict entries past the
     /// retention window.
@@ -79,7 +81,7 @@ pub(crate) struct EarlyArrivalBuffer {
     /// Reverse index from tx_hash to any buffered ECs mentioning it.
     /// Multiple tx_hash entries may reference the same `Arc<EC>` (one EC
     /// covers many txs).
-    tx_index: HashMap<Hash, Vec<Arc<ExecutionCertificate>>>,
+    tx_index: HashMap<TxHash, Vec<Arc<ExecutionCertificate>>>,
 
     /// Per-EC bookkeeping. `tx_index` and `pending_routing` must stay
     /// consistent: an EC present in `tx_index[tx_hash]` for some `tx_hash`
@@ -133,7 +135,7 @@ impl EarlyArrivalBuffer {
     pub fn buffer_ec(
         &mut self,
         ec: &Arc<ExecutionCertificate>,
-        tx_hashes: &[Hash],
+        tx_hashes: &[TxHash],
         now_ts: WeightedTimestamp,
     ) {
         if tx_hashes.is_empty() {
@@ -161,7 +163,7 @@ impl EarlyArrivalBuffer {
     /// empty the EC has been fully delivered and the entry is dropped.
     /// The reverse index is NOT touched here — the EC's tx_hashes are
     /// drained explicitly by [`drain_ecs_for_txs`] when those txs commit.
-    pub fn clear_routed(&mut self, ec: &Arc<ExecutionCertificate>, tx_hashes: &[Hash]) {
+    pub fn clear_routed(&mut self, ec: &Arc<ExecutionCertificate>, tx_hashes: &[TxHash]) {
         let Some(entry) = self.pending_routing.get_mut(&ec.wave_id) else {
             return;
         };
@@ -181,7 +183,7 @@ impl EarlyArrivalBuffer {
     /// `pending_routing` entry is left alone (the caller will typically
     /// feed the EC into `handle_wave_attestation`, which then calls
     /// `clear_routed` to drop the entry).
-    pub fn drain_ecs_for_txs(&mut self, tx_hashes: &[Hash]) -> Vec<Arc<ExecutionCertificate>> {
+    pub fn drain_ecs_for_txs(&mut self, tx_hashes: &[TxHash]) -> Vec<Arc<ExecutionCertificate>> {
         let mut ecs: Vec<Arc<ExecutionCertificate>> = Vec::new();
         let mut seen_ptrs: HashSet<usize> = HashSet::new();
         for tx_hash in tx_hashes {
@@ -264,7 +266,7 @@ impl EarlyArrivalBuffer {
 
     /// How many buffered ECs mention `tx_hash` — the count surfaced by the
     /// coordinator's `certificate_tracking_debug` output.
-    pub fn attestation_count_for_tx(&self, tx_hash: &Hash) -> usize {
+    pub fn attestation_count_for_tx(&self, tx_hash: &TxHash) -> usize {
         self.tx_index.get(tx_hash).map(|v| v.len()).unwrap_or(0)
     }
 }
@@ -273,8 +275,8 @@ impl EarlyArrivalBuffer {
 mod tests {
     use super::*;
     use hyperscale_types::{
-        bls_keypair_from_seed, exec_vote_message, zero_bls_signature, BlockHeight,
-        ExecutionOutcome, ShardGroupId, SignerBitfield, TxOutcome, ValidatorId,
+        bls_keypair_from_seed, exec_vote_message, zero_bls_signature, BlockHash, BlockHeight,
+        ExecutionOutcome, ShardGroupId, SignerBitfield, TxHash, TxOutcome, ValidatorId,
     };
 
     fn shard() -> ShardGroupId {
@@ -293,7 +295,7 @@ mod tests {
         WeightedTimestamp(value)
     }
 
-    fn make_tx_outcome(tx: Hash) -> TxOutcome {
+    fn make_tx_outcome(tx: TxHash) -> TxOutcome {
         TxOutcome {
             tx_hash: tx,
             outcome: ExecutionOutcome::Executed {
@@ -303,12 +305,12 @@ mod tests {
         }
     }
 
-    fn make_ec(wave_id: WaveId, tx_hashes: &[Hash]) -> Arc<ExecutionCertificate> {
+    fn make_ec(wave_id: WaveId, tx_hashes: &[TxHash]) -> Arc<ExecutionCertificate> {
         let outcomes: Vec<TxOutcome> = tx_hashes.iter().map(|h| make_tx_outcome(*h)).collect();
         Arc::new(ExecutionCertificate::new(
             wave_id,
             WeightedTimestamp::ZERO,
-            Hash::ZERO,
+            GlobalReceiptRoot::ZERO,
             outcomes,
             zero_bls_signature(),
             SignerBitfield::new(4),
@@ -316,8 +318,8 @@ mod tests {
     }
 
     fn make_vote(wave_id: WaveId, anchor_ts: WeightedTimestamp) -> ExecutionVote {
-        let tx_outcomes = vec![make_tx_outcome(Hash::from_bytes(b"tx"))];
-        let global_receipt_root = Hash::from_bytes(b"root");
+        let tx_outcomes = vec![make_tx_outcome(TxHash::from_raw(Hash::from_bytes(b"tx")))];
+        let global_receipt_root = GlobalReceiptRoot::from_raw(Hash::from_bytes(b"root"));
         let msg = exec_vote_message(
             anchor_ts,
             &wave_id,
@@ -328,7 +330,7 @@ mod tests {
         let kp = bls_keypair_from_seed(&[7u8; 32]);
         let signature = kp.sign_v1(&msg);
         ExecutionVote {
-            block_hash: Hash::ZERO,
+            block_hash: BlockHash::ZERO,
             block_height: BlockHeight(1),
             vote_anchor_ts_ms: anchor_ts,
             wave_id,
@@ -392,8 +394,8 @@ mod tests {
     fn buffer_ec_records_pending_set_and_reverse_index() {
         let mut b = EarlyArrivalBuffer::new();
         let w = wave(1);
-        let tx_a = Hash::from_bytes(b"a");
-        let tx_b = Hash::from_bytes(b"b");
+        let tx_a = TxHash::from_raw(Hash::from_bytes(b"a"));
+        let tx_b = TxHash::from_raw(Hash::from_bytes(b"b"));
         let ec = make_ec(w.clone(), &[tx_a, tx_b]);
 
         b.buffer_ec(&ec, &[tx_a, tx_b], ms(1_000));
@@ -407,7 +409,7 @@ mod tests {
     fn buffer_ec_idempotent_for_same_tx_hashes() {
         let mut b = EarlyArrivalBuffer::new();
         let w = wave(1);
-        let tx = Hash::from_bytes(b"a");
+        let tx = TxHash::from_raw(Hash::from_bytes(b"a"));
         let ec = make_ec(w.clone(), &[tx]);
 
         b.buffer_ec(&ec, &[tx], ms(1_000));
@@ -425,8 +427,8 @@ mod tests {
     fn clear_routed_drops_entry_once_pending_set_drains() {
         let mut b = EarlyArrivalBuffer::new();
         let w = wave(1);
-        let tx_a = Hash::from_bytes(b"a");
-        let tx_b = Hash::from_bytes(b"b");
+        let tx_a = TxHash::from_raw(Hash::from_bytes(b"a"));
+        let tx_b = TxHash::from_raw(Hash::from_bytes(b"b"));
         let ec = make_ec(w.clone(), &[tx_a, tx_b]);
 
         b.buffer_ec(&ec, &[tx_a, tx_b], ms(1_000));
@@ -444,8 +446,8 @@ mod tests {
     fn drain_ecs_for_txs_returns_ecs_and_clears_reverse_index() {
         let mut b = EarlyArrivalBuffer::new();
         let w = wave(1);
-        let tx_a = Hash::from_bytes(b"a");
-        let tx_b = Hash::from_bytes(b"b");
+        let tx_a = TxHash::from_raw(Hash::from_bytes(b"a"));
+        let tx_b = TxHash::from_raw(Hash::from_bytes(b"b"));
         let ec = make_ec(w.clone(), &[tx_a, tx_b]);
         b.buffer_ec(&ec, &[tx_a, tx_b], ms(1_000));
 
@@ -460,8 +462,8 @@ mod tests {
     fn drain_ecs_for_txs_dedups_arc_identity() {
         let mut b = EarlyArrivalBuffer::new();
         let w = wave(1);
-        let tx_a = Hash::from_bytes(b"a");
-        let tx_b = Hash::from_bytes(b"b");
+        let tx_a = TxHash::from_raw(Hash::from_bytes(b"a"));
+        let tx_b = TxHash::from_raw(Hash::from_bytes(b"b"));
         // Single EC covers both txs; draining both hashes should yield one EC.
         let ec = make_ec(w.clone(), &[tx_a, tx_b]);
         b.buffer_ec(&ec, &[tx_a, tx_b], ms(1_000));
@@ -475,8 +477,8 @@ mod tests {
         let mut b = EarlyArrivalBuffer::new();
         let w_old = wave(1);
         let w_fresh = wave(2);
-        let tx_old = Hash::from_bytes(b"old");
-        let tx_fresh = Hash::from_bytes(b"fresh");
+        let tx_old = TxHash::from_raw(Hash::from_bytes(b"old"));
+        let tx_fresh = TxHash::from_raw(Hash::from_bytes(b"fresh"));
 
         b.buffer_ec(&make_ec(w_old.clone(), &[tx_old]), &[tx_old], ms(1_000));
         b.buffer_ec(
@@ -498,7 +500,7 @@ mod tests {
     fn gc_stale_ecs_noop_before_retention_window_reached() {
         let mut b = EarlyArrivalBuffer::new();
         let w = wave(1);
-        let tx = Hash::from_bytes(b"tx");
+        let tx = TxHash::from_raw(Hash::from_bytes(b"tx"));
         b.buffer_ec(&make_ec(w, &[tx]), &[tx], ms(0));
 
         // now_ts below EC_BUFFER_RETENTION → no-op, even though the entry
@@ -512,8 +514,8 @@ mod tests {
         let mut b = EarlyArrivalBuffer::new();
         let w_zero = wave(1);
         let w_stamped = wave(2);
-        let tx_z = Hash::from_bytes(b"z");
-        let tx_s = Hash::from_bytes(b"s");
+        let tx_z = TxHash::from_raw(Hash::from_bytes(b"z"));
+        let tx_s = TxHash::from_raw(Hash::from_bytes(b"s"));
         b.buffer_ec(&make_ec(w_zero.clone(), &[tx_z]), &[tx_z], ms(0));
         b.buffer_ec(&make_ec(w_stamped.clone(), &[tx_s]), &[tx_s], ms(30_000));
 
@@ -575,7 +577,7 @@ mod tests {
             let mut b = EarlyArrivalBuffer::new();
             for (i, h) in heights.iter().enumerate() {
                 let w = wave(*h);
-                let tx = Hash::from_bytes(&[(i as u8); 32]);
+                let tx = TxHash::from_raw(Hash::from_bytes(&[(i as u8); 32]));
                 let age = ages_ms[i % ages_ms.len()];
                 let ts = if age >= now_ms { ms(0) } else { ms(now_ms - age) };
                 b.buffer_ec(&make_ec(w.clone(), &[tx]), &[tx], ts);

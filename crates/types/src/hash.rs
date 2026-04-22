@@ -274,6 +274,128 @@ impl fmt::Display for Hash {
     }
 }
 
+/// Domain-specific hash kinds that wrap [`Hash`] for compile-time safety.
+///
+/// Implementors are `#[repr(transparent)]` newtypes over [`Hash`] with identical
+/// SBOR encoding (`#[sbor(transparent)]`), so adopting a newtype for an existing
+/// field requires no wire-format or storage migration.
+///
+/// Construct via [`TypedHash::from_raw`] (or the inherent `from_raw`); unwrap via
+/// [`TypedHash::into_raw`] or `Into<Hash>`. Conversion is deliberately explicit —
+/// there is no `Deref<Target = Hash>`, since that would silently re-admit the
+/// cross-kind confusion this trait exists to prevent.
+pub trait TypedHash:
+    Copy + Eq + Ord + core::hash::Hash + fmt::Debug + fmt::Display + Into<Hash>
+{
+    /// Human-readable name for this hash kind (used in `Debug` output).
+    const KIND: &'static str;
+
+    /// Wrap a raw [`Hash`] as this kind.
+    fn from_raw(raw: Hash) -> Self;
+
+    /// Unwrap into the underlying raw [`Hash`].
+    fn into_raw(self) -> Hash;
+
+    /// Borrow the underlying raw [`Hash`].
+    fn as_raw(&self) -> &Hash;
+}
+
+/// Declare a `#[repr(transparent)]` newtype around [`Hash`] implementing [`TypedHash`].
+///
+/// Expands to a tuple struct with:
+/// - `Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, BasicSbor` derives
+/// - `#[sbor(transparent)]` for wire-format compatibility with raw `Hash`
+/// - Inherent `ZERO` const, `from_raw`, `into_raw`, `as_raw`
+/// - `From<Self> for Hash` (one-way; reverse is explicit via `from_raw`)
+/// - `Debug` prints as `Kind(abcd1234..wxyz5678)`
+/// - `Display` delegates to the underlying hex
+macro_rules! hash_newtype {
+    ($(#[$meta:meta])* $vis:vis $name:ident, $kind:literal) => {
+        $(#[$meta])*
+        #[repr(transparent)]
+        #[derive(
+            Clone,
+            Copy,
+            PartialEq,
+            Eq,
+            ::core::hash::Hash,
+            PartialOrd,
+            Ord,
+            ::sbor::BasicSbor,
+        )]
+        #[sbor(transparent)]
+        $vis struct $name($crate::Hash);
+
+        impl $name {
+            /// Zero-valued hash of this kind (all bytes `0x00`).
+            pub const ZERO: Self = Self($crate::Hash::ZERO);
+
+            /// Wrap a raw [`Hash`] as this kind.
+            pub const fn from_raw(raw: $crate::Hash) -> Self {
+                Self(raw)
+            }
+
+            /// Unwrap into the underlying raw [`Hash`].
+            pub const fn into_raw(self) -> $crate::Hash {
+                self.0
+            }
+
+            /// Borrow the underlying raw [`Hash`].
+            pub const fn as_raw(&self) -> &$crate::Hash {
+                &self.0
+            }
+
+            /// Borrow the raw 32-byte representation. Delegates to
+            /// [`Hash::as_bytes`] for ergonomic use in signing/hashing code.
+            pub fn as_bytes(&self) -> &[u8; 32] {
+                self.0.as_bytes()
+            }
+
+            /// Check whether this is the all-zero hash.
+            pub fn is_zero(&self) -> bool {
+                self.0.is_zero()
+            }
+        }
+
+        impl $crate::TypedHash for $name {
+            const KIND: &'static str = $kind;
+
+            fn from_raw(raw: $crate::Hash) -> Self {
+                Self(raw)
+            }
+
+            fn into_raw(self) -> $crate::Hash {
+                self.0
+            }
+
+            fn as_raw(&self) -> &$crate::Hash {
+                &self.0
+            }
+        }
+
+        impl From<$name> for $crate::Hash {
+            fn from(v: $name) -> $crate::Hash {
+                v.0
+            }
+        }
+
+        impl ::core::fmt::Debug for $name {
+            fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+                let hex = self.0.to_hex();
+                write!(f, "{}({}..{})", $kind, &hex[..8], &hex[56..])
+            }
+        }
+
+        impl ::core::fmt::Display for $name {
+            fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+                ::core::fmt::Display::fmt(&self.0, f)
+            }
+        }
+    };
+}
+
+pub(crate) use hash_newtype;
+
 /// Errors that can occur when parsing hex strings.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum HexError {

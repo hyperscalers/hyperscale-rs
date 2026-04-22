@@ -44,7 +44,8 @@ impl NetworkMessage for BlockVoteNotification {
 #[cfg(test)]
 mod tests {
     use hyperscale_types::{
-        zero_bls_signature, BlockHeight, Hash, ProposerTimestamp, Round, ShardGroupId, ValidatorId,
+        zero_bls_signature, BlockHash, BlockHeight, Hash, ProposerTimestamp, Round, ShardGroupId,
+        ValidatorId,
     };
 
     use super::*;
@@ -52,7 +53,7 @@ mod tests {
     #[test]
     fn test_block_vote_gossip_creation() {
         let vote = BlockVote {
-            block_hash: Hash::from_bytes(b"block_hash"),
+            block_hash: BlockHash::from_raw(Hash::from_bytes(b"block_hash")),
             shard_group_id: ShardGroupId(0),
             height: BlockHeight(10),
             round: Round::INITIAL,
@@ -68,7 +69,7 @@ mod tests {
     #[test]
     fn test_block_vote_gossip_into_vote() {
         let vote = BlockVote {
-            block_hash: Hash::from_bytes(b"test"),
+            block_hash: BlockHash::from_raw(Hash::from_bytes(b"test")),
             shard_group_id: ShardGroupId(0),
             height: BlockHeight(5),
             round: Round::INITIAL,

@@ -16,7 +16,11 @@
 use crate::config::BftConfig;
 use crate::tx_cache::CommittedTxCache;
 use hyperscale_types::{
-    Block, BlockHeader, BlockHeight, Hash, RoutableTransaction, TopologySnapshot, VotePower,
+    Block, BlockHeader, BlockHeight, RoutableTransaction, TopologySnapshot, TxHash, VotePower,
+};
+#[cfg(test)]
+use hyperscale_types::{
+    CertificateRoot, Hash, LocalReceiptRoot, ProvisionsRoot, StateRoot, TransactionRoot,
 };
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -161,7 +165,7 @@ pub(crate) fn validate_waves(topology: &TopologySnapshot, block: &Block) -> Resu
 /// block storage itself.
 pub(crate) fn validate_no_duplicate_transactions(
     block: &Block,
-    qc_chain_tx_hashes: &HashSet<Hash>,
+    qc_chain_tx_hashes: &HashSet<TxHash>,
     tx_cache: &CommittedTxCache,
 ) -> Result<(), String> {
     if block.transactions().is_empty() {
@@ -192,7 +196,7 @@ pub(crate) fn validate_no_duplicate_transactions(
 pub(crate) fn validate_block_for_vote(
     topology: &TopologySnapshot,
     block: &Block,
-    qc_chain_tx_hashes: &HashSet<Hash>,
+    qc_chain_tx_hashes: &HashSet<TxHash>,
     tx_cache: &CommittedTxCache,
 ) -> Result<(), String> {
     validate_transaction_ordering(block)?;
@@ -222,8 +226,8 @@ mod tests {
     use super::*;
     use hyperscale_test_helpers::TestCommittee;
     use hyperscale_types::{
-        compute_waves, test_utils, BlockHeader, ProposerTimestamp, QuorumCertificate, Round,
-        RoutableTransaction, ShardGroupId, ValidatorId, ValidatorInfo, ValidatorSet,
+        compute_waves, test_utils, BlockHash, BlockHeader, ProposerTimestamp, QuorumCertificate,
+        Round, RoutableTransaction, ShardGroupId, ValidatorId, ValidatorInfo, ValidatorSet,
     };
     use std::collections::BTreeMap;
 
@@ -243,17 +247,17 @@ mod tests {
         BlockHeader {
             shard_group_id: ShardGroupId(0),
             height,
-            parent_hash: Hash::from_bytes(b"parent"),
+            parent_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(height.0 % 4),
             timestamp: ProposerTimestamp(timestamp_ms),
             round: Round(0),
             is_fallback: false,
-            state_root: Hash::ZERO,
-            transaction_root: Hash::ZERO,
-            certificate_root: Hash::ZERO,
-            local_receipt_root: Hash::ZERO,
-            provision_root: Hash::ZERO,
+            state_root: StateRoot::ZERO,
+            transaction_root: TransactionRoot::ZERO,
+            certificate_root: CertificateRoot::ZERO,
+            local_receipt_root: LocalReceiptRoot::ZERO,
+            provision_root: ProvisionsRoot::ZERO,
             waves: vec![],
             provision_tx_roots: BTreeMap::new(),
             in_flight: 0,
@@ -264,17 +268,17 @@ mod tests {
         let header = BlockHeader {
             shard_group_id: ShardGroupId(0),
             height,
-            parent_hash: Hash::ZERO,
+            parent_hash: BlockHash::ZERO,
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(0),
             timestamp: ProposerTimestamp(0),
             round: Round::INITIAL,
             is_fallback: false,
-            state_root: Hash::ZERO,
-            transaction_root: Hash::ZERO,
-            certificate_root: Hash::ZERO,
-            local_receipt_root: Hash::ZERO,
-            provision_root: Hash::ZERO,
+            state_root: StateRoot::ZERO,
+            transaction_root: TransactionRoot::ZERO,
+            certificate_root: CertificateRoot::ZERO,
+            local_receipt_root: LocalReceiptRoot::ZERO,
+            provision_root: ProvisionsRoot::ZERO,
             waves,
             provision_tx_roots: BTreeMap::new(),
             in_flight: 0,
@@ -319,7 +323,7 @@ mod tests {
         let config = BftConfig::default();
         let now = Duration::from_secs(100);
         let mut header = header_at_height(BlockHeight(0), 0);
-        header.parent_hash = Hash::from_bytes(b"genesis_parent");
+        header.parent_hash = BlockHash::from_raw(Hash::from_bytes(b"genesis_parent"));
         header.proposer = ValidatorId(0);
         assert!(validate_timestamp(&header, &config, now).is_ok());
     }

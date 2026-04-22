@@ -12,6 +12,7 @@
 //!    mempool processing; pruned by `COMMITTED_TX_RETENTION`.
 
 use hyperscale_types::Hash;
+use hyperscale_types::TxHash;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
@@ -21,8 +22,8 @@ use std::time::Duration;
 const COMMITTED_TX_RETENTION: Duration = Duration::from_secs(300);
 
 pub(crate) struct CommittedTxCache {
-    tx_lookup: HashMap<Hash, u64>,
-    recently_committed_txs: HashSet<Hash>,
+    tx_lookup: HashMap<TxHash, u64>,
+    recently_committed_txs: HashSet<TxHash>,
     recently_committed_certs: HashSet<Hash>,
 }
 
@@ -41,7 +42,7 @@ impl CommittedTxCache {
     /// catches up.
     pub fn buffer_commit(
         &mut self,
-        tx_hashes: impl IntoIterator<Item = Hash>,
+        tx_hashes: impl IntoIterator<Item = TxHash>,
         cert_hashes: impl IntoIterator<Item = Hash>,
     ) {
         self.recently_committed_txs.extend(tx_hashes);
@@ -51,7 +52,7 @@ impl CommittedTxCache {
     /// Promote a block's tx hashes from the bridge buffer into the
     /// retention lookup. Called by the node state layer after the mempool
     /// processes a committed block.
-    pub fn register_committed(&mut self, tx_hashes: &[Hash], commit_ts_ms: u64) {
+    pub fn register_committed(&mut self, tx_hashes: &[TxHash], commit_ts_ms: u64) {
         for tx_hash in tx_hashes {
             if let Some(&existing) = self.tx_lookup.get(tx_hash) {
                 if existing != commit_ts_ms {
@@ -73,9 +74,8 @@ impl CommittedTxCache {
     /// Remove a finalized transaction from the retention lookup. Called when
     /// a TC is committed, so the tx is no longer relevant for timeout
     /// validation.
-    pub fn remove(&mut self, tx_hash: &Hash) {
+    pub fn remove(&mut self, tx_hash: &TxHash) {
         self.tx_lookup.remove(tx_hash);
-        self.recently_committed_certs.remove(tx_hash);
     }
 
     /// Drop retention-lookup entries older than the retention window.
@@ -86,15 +86,15 @@ impl CommittedTxCache {
         self.tx_lookup.retain(|_, ts_ms| *ts_ms > cutoff_ms);
     }
 
-    pub fn contains_tx(&self, tx_hash: &Hash) -> bool {
+    pub fn contains_tx(&self, tx_hash: &TxHash) -> bool {
         self.tx_lookup.contains_key(tx_hash)
     }
 
-    pub fn tx_commit_ts_ms(&self, tx_hash: &Hash) -> Option<u64> {
+    pub fn tx_commit_ts_ms(&self, tx_hash: &TxHash) -> Option<u64> {
         self.tx_lookup.get(tx_hash).copied()
     }
 
-    pub fn recent_tx_hashes(&self) -> impl Iterator<Item = Hash> + '_ {
+    pub fn recent_tx_hashes(&self) -> impl Iterator<Item = TxHash> + '_ {
         self.recently_committed_txs.iter().copied()
     }
 
@@ -123,54 +123,55 @@ mod tests {
         Hash::from_bytes(b)
     }
 
+    fn th(b: &[u8]) -> TxHash {
+        TxHash::from_raw(Hash::from_bytes(b))
+    }
+
     #[test]
     fn buffered_hashes_surface_in_recent_iterators() {
         let mut cache = CommittedTxCache::new();
-        cache.buffer_commit([h(b"tx1"), h(b"tx2")], [h(b"c1")]);
+        cache.buffer_commit([th(b"tx1"), th(b"tx2")], [h(b"c1")]);
 
-        let txs: HashSet<Hash> = cache.recent_tx_hashes().collect();
+        let txs: HashSet<TxHash> = cache.recent_tx_hashes().collect();
         let certs: HashSet<Hash> = cache.recent_cert_hashes().collect();
-        assert_eq!(txs, HashSet::from([h(b"tx1"), h(b"tx2")]));
+        assert_eq!(txs, HashSet::from([th(b"tx1"), th(b"tx2")]));
         assert_eq!(certs, HashSet::from([h(b"c1")]));
     }
 
     #[test]
     fn register_promotes_to_lookup_and_clears_bridge() {
         let mut cache = CommittedTxCache::new();
-        cache.buffer_commit([h(b"tx1"), h(b"tx2")], []);
-        cache.register_committed(&[h(b"tx1")], 1000);
+        cache.buffer_commit([th(b"tx1"), th(b"tx2")], []);
+        cache.register_committed(&[th(b"tx1")], 1000);
 
-        assert!(cache.contains_tx(&h(b"tx1")));
-        assert_eq!(cache.tx_commit_ts_ms(&h(b"tx1")), Some(1000));
-        assert!(!cache.contains_tx(&h(b"tx2")));
+        assert!(cache.contains_tx(&th(b"tx1")));
+        assert_eq!(cache.tx_commit_ts_ms(&th(b"tx1")), Some(1000));
+        assert!(!cache.contains_tx(&th(b"tx2")));
 
-        let remaining: HashSet<Hash> = cache.recent_tx_hashes().collect();
-        assert_eq!(remaining, HashSet::from([h(b"tx2")]));
+        let remaining: HashSet<TxHash> = cache.recent_tx_hashes().collect();
+        assert_eq!(remaining, HashSet::from([th(b"tx2")]));
     }
 
     #[test]
     fn prune_drops_entries_older_than_retention() {
         let mut cache = CommittedTxCache::new();
         let retention_ms = COMMITTED_TX_RETENTION.as_millis() as u64;
-        cache.register_committed(&[h(b"old")], 100);
-        cache.register_committed(&[h(b"new")], retention_ms + 200);
+        cache.register_committed(&[th(b"old")], 100);
+        cache.register_committed(&[th(b"new")], retention_ms + 200);
 
         cache.prune(retention_ms + 200);
 
-        assert!(!cache.contains_tx(&h(b"old")));
-        assert!(cache.contains_tx(&h(b"new")));
+        assert!(!cache.contains_tx(&th(b"old")));
+        assert!(cache.contains_tx(&th(b"new")));
     }
 
     #[test]
-    fn remove_clears_both_lookup_and_cert_bridge() {
+    fn remove_clears_lookup() {
         let mut cache = CommittedTxCache::new();
-        cache.buffer_commit([], [h(b"cert")]);
-        cache.register_committed(&[h(b"tx")], 100);
+        cache.register_committed(&[th(b"tx")], 100);
 
-        cache.remove(&h(b"tx"));
-        cache.remove(&h(b"cert"));
+        cache.remove(&th(b"tx"));
 
-        assert!(!cache.contains_tx(&h(b"tx")));
-        assert_eq!(cache.recent_cert_hashes().count(), 0);
+        assert!(!cache.contains_tx(&th(b"tx")));
     }
 }

@@ -318,18 +318,18 @@ pub fn filter_updates_for_global_receipt<S: SubstateDatabase>(
 /// SBOR-encodes the entire DatabaseUpdates (which uses BTreeMap for deterministic
 /// iteration order) and hashes to produce a single root. All validators executing
 /// the same transaction with the same declared nodes will produce identical output.
-pub fn compute_writes_root(updates: &DatabaseUpdates) -> hyperscale_types::Hash {
-    use hyperscale_types::Hash;
+pub fn compute_writes_root(updates: &DatabaseUpdates) -> hyperscale_types::WritesRoot {
+    use hyperscale_types::{Hash, WritesRoot};
 
     if updates.node_updates.is_empty() {
-        return Hash::ZERO;
+        return WritesRoot::ZERO;
     }
 
     // DatabaseUpdates uses BTreeMap internally, so SBOR encoding is
     // deterministic across validators.
     let encoded = radix_common::prelude::basic_encode(updates)
         .expect("DatabaseUpdates encoding should not fail");
-    Hash::from_bytes(&encoded)
+    WritesRoot::from_raw(Hash::from_bytes(&encoded))
 }
 
 // ============================================================================

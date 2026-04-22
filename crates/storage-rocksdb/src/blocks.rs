@@ -6,7 +6,7 @@ use crate::core::RocksDbStorage;
 use hyperscale_metrics as metrics;
 use hyperscale_types::{
     Block, BlockHeight, BlockMetadata, CertifiedBlock, FinalizedWave, Hash, QuorumCertificate,
-    RoutableTransaction, WaveCertificate,
+    RoutableTransaction, TxHash, WaveCertificate,
 };
 use rocksdb::{WriteBatch, WriteOptions};
 use std::sync::Arc;
@@ -41,13 +41,13 @@ impl RocksDbStorage {
     /// This is idempotent - storing the same transaction twice is safe.
     /// Used by `put_block_denormalized` to store transactions separately from block metadata.
     pub fn put_transaction(&self, tx: &RoutableTransaction) {
-        self.cf_put_sync::<TransactionsCf>(&tx.hash(), tx);
+        self.cf_put_sync::<TransactionsCf>(tx.hash().as_raw(), tx);
     }
 
     /// Get a transaction by hash.
-    pub fn get_transaction(&self, hash: &Hash) -> Option<RoutableTransaction> {
+    pub fn get_transaction(&self, hash: &TxHash) -> Option<RoutableTransaction> {
         let start = Instant::now();
-        let result = self.cf_get::<TransactionsCf>(hash);
+        let result = self.cf_get::<TransactionsCf>(hash.as_raw());
         metrics::record_storage_read(start.elapsed().as_secs_f64());
         result
     }
@@ -56,13 +56,14 @@ impl RocksDbStorage {
     ///
     /// Uses RocksDB's `multi_get_cf` for efficient batch retrieval.
     /// Returns only transactions that were found (missing hashes are skipped).
-    pub fn get_transactions_batch(&self, hashes: &[Hash]) -> Vec<RoutableTransaction> {
+    pub fn get_transactions_batch(&self, hashes: &[TxHash]) -> Vec<RoutableTransaction> {
         if hashes.is_empty() {
             return vec![];
         }
 
         let start = Instant::now();
-        let results = self.cf_multi_get::<TransactionsCf>(hashes);
+        let raw: Vec<Hash> = hashes.iter().map(|h| h.into_raw()).collect();
+        let results = self.cf_multi_get::<TransactionsCf>(&raw);
 
         let txs: Vec<_> = results.into_iter().flatten().collect();
 
@@ -103,7 +104,7 @@ impl RocksDbStorage {
         for tx in block.transactions().iter() {
             self.cf_put_raw::<TransactionsCf>(
                 batch,
-                &tx.hash(),
+                tx.hash().as_raw(),
                 tx.as_ref(),
                 tx.cached_sbor_bytes(),
             );
@@ -299,12 +300,13 @@ impl RocksDbStorage {
     /// Unlike `get_transactions_batch`, this returns results in the same order
     /// as the input hashes, with missing entries causing the result to be shorter.
     /// Callers should check that the result length matches the input length.
-    fn get_transactions_batch_ordered(&self, hashes: &[Hash]) -> Vec<Arc<RoutableTransaction>> {
+    fn get_transactions_batch_ordered(&self, hashes: &[TxHash]) -> Vec<Arc<RoutableTransaction>> {
         if hashes.is_empty() {
             return vec![];
         }
 
-        let results = self.cf_multi_get::<TransactionsCf>(hashes);
+        let raw: Vec<Hash> = hashes.iter().map(|h| h.into_raw()).collect();
+        let results = self.cf_multi_get::<TransactionsCf>(&raw);
 
         results
             .into_iter()

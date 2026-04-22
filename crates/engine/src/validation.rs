@@ -139,7 +139,7 @@ impl TransactionValidation {
     pub fn validate_with_hash(
         &self,
         tx: &RoutableTransaction,
-    ) -> (hyperscale_types::Hash, Result<(), ValidationError>) {
+    ) -> (hyperscale_types::TxHash, Result<(), ValidationError>) {
         let hash = tx.hash();
         let result = self.validate_transaction(tx);
         (hash, result)
@@ -155,7 +155,7 @@ impl TransactionValidation {
 #[derive(Debug)]
 pub struct BatchValidationResult {
     /// Transaction hash.
-    pub tx_hash: hyperscale_types::Hash,
+    pub tx_hash: hyperscale_types::TxHash,
     /// Validation result.
     pub result: Result<(), ValidationError>,
 }

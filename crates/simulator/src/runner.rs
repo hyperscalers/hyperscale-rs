@@ -13,7 +13,7 @@ use hyperscale_spammer::{
     AccountPool, AccountPoolError, FundingWorkload, TransferWorkload, WorkloadGenerator,
 };
 use hyperscale_types::{
-    shard_for_node, Hash, ShardGroupId, TransactionDecision, TransactionStatus,
+    shard_for_node, ShardGroupId, TransactionDecision, TransactionStatus, TxHash,
 };
 use radix_common::math::Decimal;
 use radix_common::network::NetworkDefinition;
@@ -48,7 +48,7 @@ pub struct Simulator {
     rng: ChaCha8Rng,
 
     /// Tracks in-flight transactions: hash -> (submit_time, target_shard).
-    in_flight: HashMap<Hash, (Duration, ShardGroupId)>,
+    in_flight: HashMap<TxHash, (Duration, ShardGroupId)>,
 }
 
 impl Simulator {
@@ -197,7 +197,7 @@ impl Simulator {
             .collect();
 
         for chunk in all_txs.chunks(batch_size) {
-            let mut pending: HashMap<Hash, ShardGroupId> = HashMap::new();
+            let mut pending: HashMap<TxHash, ShardGroupId> = HashMap::new();
 
             // Submit the batch.
             for (shard, tx) in chunk {
@@ -224,7 +224,7 @@ impl Simulator {
             while !pending.is_empty() && self.runner.now() < deadline {
                 self.runner.run_until(self.runner.now() + step);
 
-                let hashes: Vec<Hash> = pending.keys().copied().collect();
+                let hashes: Vec<TxHash> = pending.keys().copied().collect();
                 for hash in hashes {
                     if let Some(&shard) = pending.get(&hash) {
                         let node_idx = self.get_node_for_shard(shard);
@@ -358,7 +358,7 @@ impl Simulator {
 
         // We need to check the transaction status cache for each in-flight transaction
         // Using tx_status() which captures all emitted statuses, even after eviction
-        let hashes: Vec<Hash> = self.in_flight.keys().copied().collect();
+        let hashes: Vec<TxHash> = self.in_flight.keys().copied().collect();
 
         for hash in hashes {
             if let Some((submit_time, shard)) = self.in_flight.get(&hash).copied() {

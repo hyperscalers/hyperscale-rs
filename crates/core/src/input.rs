@@ -2,9 +2,9 @@
 
 use crate::ProtocolEvent;
 use hyperscale_types::{
-    BlockHeight, Bls12381G1PublicKey, Bls12381G2Signature, CertifiedBlock, CommittedBlockHeader,
-    ExecutionCertificate, FinalizedWave, Hash, Provision, RoutableTransaction, ShardGroupId,
-    ValidatorId,
+    BlockHash, BlockHeight, Bls12381G1PublicKey, Bls12381G2Signature, CertifiedBlock,
+    CommittedBlockHeader, ExecutionCertificate, FinalizedWave, Hash, Provision,
+    RoutableTransaction, ShardGroupId, TxHash, ValidatorId,
 };
 use std::sync::Arc;
 
@@ -63,31 +63,40 @@ pub enum NodeInput {
     FetchTick,
 
     /// Fetch transactions failed from network callback.
-    FetchTransactionsFailed { block_hash: Hash, hashes: Vec<Hash> },
+    FetchTransactionsFailed {
+        block_hash: BlockHash,
+        hashes: Vec<TxHash>,
+    },
 
     /// Received transactions from a fetch request (raw, before protocol processing).
     TransactionReceived {
-        block_hash: Hash,
+        block_hash: BlockHash,
         transactions: Vec<Arc<RoutableTransaction>>,
     },
 
     /// Local provision batches received from a fetch request.
     LocalProvisionReceived {
-        block_hash: Hash,
+        block_hash: BlockHash,
         batches: Vec<Arc<Provision>>,
     },
 
     /// Local provision fetch failed.
-    LocalProvisionFetchFailed { block_hash: Hash, hashes: Vec<Hash> },
+    LocalProvisionFetchFailed {
+        block_hash: BlockHash,
+        hashes: Vec<Hash>,
+    },
 
     /// Finalized waves received from a peer in response to a fetch request.
     FinalizedWaveReceived {
-        block_hash: Hash,
+        block_hash: BlockHash,
         waves: Vec<Arc<FinalizedWave>>,
     },
 
     /// A finalized wave fetch request failed.
-    FinalizedWaveFetchFailed { block_hash: Hash, hashes: Vec<Hash> },
+    FinalizedWaveFetchFailed {
+        block_hash: BlockHash,
+        hashes: Vec<Hash>,
+    },
 
     /// Transaction validated by the validation pipeline.
     TransactionValidated {
@@ -97,7 +106,7 @@ pub enum NodeInput {
 
     /// Transactions that failed validation — sent back so the IoLoop can
     /// remove their hashes from `pending_validation` and `locally_submitted`.
-    TransactionValidationsFailed { hashes: Vec<Hash> },
+    TransactionValidationsFailed { hashes: Vec<TxHash> },
 
     /// A committed block header from a remote shard whose sender signature
     /// has been verified by the IoLoop gossip gate.

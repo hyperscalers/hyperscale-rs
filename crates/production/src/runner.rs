@@ -62,7 +62,7 @@ use hyperscale_node::io_loop::{IoLoop, TimerOp};
 use hyperscale_node::SharedTopologySnapshot;
 use hyperscale_node::{NodeConfig, NodeStateMachine};
 use hyperscale_topology::TopologyState;
-use hyperscale_types::{Block, Bls12381G1PrivateKey, Hash, ShardGroupId, ValidatorId};
+use hyperscale_types::{Block, Bls12381G1PrivateKey, ShardGroupId, TxHash, ValidatorId};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -544,7 +544,7 @@ pub struct ProductionRunner {
     // ── Caches ───────────────────────────────────────────────────────────
     /// Transaction status cache, shared from IoLoop.
     /// Provided to the RPC server for lock-free status queries.
-    tx_status_cache: Arc<QuickCache<Hash, hyperscale_types::TransactionStatus>>,
+    tx_status_cache: Arc<QuickCache<TxHash, hyperscale_types::TransactionStatus>>,
 
     // ── Shutdown ─────────────────────────────────────────────────────────
     /// Shutdown signal receiver (external shutdown request).
@@ -579,7 +579,7 @@ impl ProductionRunner {
     /// This `Arc<QuickCache>` is the same instance used by IoLoop on the
     /// pinned thread. It can be passed directly to the RPC server for
     /// lock-free status queries.
-    pub fn tx_status_cache(&self) -> Arc<QuickCache<Hash, hyperscale_types::TransactionStatus>> {
+    pub fn tx_status_cache(&self) -> Arc<QuickCache<TxHash, hyperscale_types::TransactionStatus>> {
         Arc::clone(&self.tx_status_cache)
     }
 

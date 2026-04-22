@@ -72,7 +72,7 @@ pub fn empty_substate_database() -> impl SubstateDatabase {
 }
 
 // Re-export commonly needed Radix types for storage implementations
-pub use hyperscale_types::Hash as StateRootHash;
+pub use hyperscale_types::StateRoot;
 pub use radix_common::prelude::{DatabaseUpdate, DbSubstateValue};
 pub use radix_substate_store_interface::interface::{
     CommittableSubstateDatabase, DatabaseUpdates, DbPartitionKey, DbSortKey, NodeDatabaseUpdates,

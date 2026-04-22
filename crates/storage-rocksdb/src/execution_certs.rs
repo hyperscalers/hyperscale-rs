@@ -32,7 +32,7 @@ fn append_ec_to_batch(
     batch: &mut WriteBatch,
     cert: &Arc<ExecutionCertificate>,
 ) {
-    let canonical_hash = cert.canonical_hash();
+    let canonical_hash = cert.canonical_hash().into_raw();
 
     // Primary: canonical_hash → EC (use cached SBOR bytes if available)
     storage.cf_put_raw::<ExecutionCertsCf>(batch, &canonical_hash, cert, cert.cached_sbor_bytes());

@@ -9,7 +9,7 @@
 use crate::executor::Engine;
 use crate::SingleTxResult;
 use hyperscale_storage::SubstateStore;
-use hyperscale_types::{ExecutionOutcome, Hash, RoutableTransaction, ShardGroupId, TxOutcome};
+use hyperscale_types::{ExecutionOutcome, RoutableTransaction, ShardGroupId, TxHash, TxOutcome};
 use std::sync::Arc;
 
 /// Execute a single-shard transaction with shard filtering.
@@ -46,7 +46,7 @@ pub fn execute_single_shard<S: SubstateStore, E: Engine>(
 pub fn execute_cross_shard<S: SubstateStore, E: Engine>(
     executor: &E,
     storage: &S,
-    tx_hash: Hash,
+    tx_hash: TxHash,
     transaction: &Arc<RoutableTransaction>,
     provisions: &[hyperscale_types::StateProvision],
     local_shard: ShardGroupId,

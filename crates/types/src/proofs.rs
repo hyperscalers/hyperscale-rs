@@ -16,7 +16,7 @@
 //! of work. This eliminates the N× proof duplication that occurs when the
 //! proof is flattened into each per-transaction struct.
 
-use crate::{BlockHeight, Hash, NodeId, ShardGroupId, StateEntry};
+use crate::{BlockHeight, Hash, NodeId, ShardGroupId, StateEntry, TxHash};
 use sbor::prelude::*;
 use std::collections::HashSet;
 
@@ -66,7 +66,7 @@ impl MerkleInclusionProof {
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct TxEntries {
     /// Hash of the transaction.
-    pub tx_hash: Hash,
+    pub tx_hash: TxHash,
 
     /// The state entries this transaction touched on the source shard.
     pub entries: Vec<StateEntry>,
@@ -278,7 +278,7 @@ impl Provision {
     }
 
     /// Get transaction hashes in this batch.
-    pub fn tx_hashes(&self) -> Vec<Hash> {
+    pub fn tx_hashes(&self) -> Vec<TxHash> {
         self.transactions.iter().map(|tx| tx.tx_hash).collect()
     }
 
@@ -324,7 +324,7 @@ mod tests {
     #[test]
     fn test_tx_entries_node_ids() {
         let tx = TxEntries {
-            tx_hash: Hash::from_bytes(b"tx"),
+            tx_hash: TxHash::from_raw(Hash::from_bytes(b"tx")),
             entries: vec![test_entry(1), test_entry(2)],
             target_nodes: vec![],
         };
@@ -341,7 +341,7 @@ mod tests {
             BlockHeight(10),
             MerkleInclusionProof::dummy(),
             vec![TxEntries {
-                tx_hash: Hash::from_bytes(b"tx1"),
+                tx_hash: TxHash::from_raw(Hash::from_bytes(b"tx1")),
                 entries: vec![test_entry(1)],
                 target_nodes: vec![],
             }],
@@ -358,12 +358,12 @@ mod tests {
         let mut batch = Provision::dummy(ShardGroupId(0), BlockHeight(10));
         batch.transactions = vec![
             TxEntries {
-                tx_hash: Hash::from_bytes(b"tx1"),
+                tx_hash: TxHash::from_raw(Hash::from_bytes(b"tx1")),
                 entries: vec![entry.clone()],
                 target_nodes: vec![],
             },
             TxEntries {
-                tx_hash: Hash::from_bytes(b"tx2"),
+                tx_hash: TxHash::from_raw(Hash::from_bytes(b"tx2")),
                 entries: vec![entry, test_entry(2)],
                 target_nodes: vec![],
             },

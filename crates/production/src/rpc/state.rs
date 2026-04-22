@@ -3,7 +3,7 @@
 use crate::status::SyncStatus;
 use arc_swap::ArcSwap;
 use hyperscale_core::{NodeInput, TransactionStatus};
-use hyperscale_types::Hash;
+use hyperscale_types::TxHash;
 use quick_cache::sync::Cache as QuickCache;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -38,7 +38,7 @@ pub struct RpcState {
     ///
     /// Shared directly from IoLoop's internal QuickCache — writes happen on
     /// the pinned thread, reads happen here on the RPC thread, no locking needed.
-    pub tx_status_cache: Arc<QuickCache<Hash, TransactionStatus>>,
+    pub tx_status_cache: Arc<QuickCache<TxHash, TransactionStatus>>,
     /// Mempool snapshot for querying mempool stats.
     pub mempool_snapshot: Arc<ArcSwap<MempoolSnapshot>>,
     /// Number of blocks behind before rejecting transaction submissions.
@@ -118,23 +118,27 @@ pub struct NodeStatusState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hyperscale_types::{BlockHeight, TransactionDecision};
+    use hyperscale_types::{BlockHeight, Hash, TransactionDecision};
 
-    fn new_cache() -> QuickCache<Hash, TransactionStatus> {
+    fn new_cache() -> QuickCache<TxHash, TransactionStatus> {
         QuickCache::new(100)
+    }
+
+    fn tx(bytes: &[u8]) -> TxHash {
+        TxHash::from_raw(Hash::from_bytes(bytes))
     }
 
     #[test]
     fn test_cache_new() {
         let cache = new_cache();
-        let tx_hash = Hash::from_bytes(&[1u8; 32]);
+        let tx_hash = tx(&[1u8; 32]);
         assert!(cache.get(&tx_hash).is_none());
     }
 
     #[test]
     fn test_cache_update_and_get() {
         let cache = new_cache();
-        let tx_hash = Hash::from_bytes(&[1u8; 32]);
+        let tx_hash = tx(&[1u8; 32]);
 
         cache.insert(tx_hash, TransactionStatus::Pending);
 
@@ -145,7 +149,7 @@ mod tests {
     #[test]
     fn test_cache_status_transitions() {
         let cache = new_cache();
-        let tx_hash = Hash::from_bytes(&[2u8; 32]);
+        let tx_hash = tx(&[2u8; 32]);
 
         // Pending -> Committed
         cache.insert(tx_hash, TransactionStatus::Pending);
@@ -186,7 +190,7 @@ mod tests {
     #[test]
     fn test_cache_get_unknown() {
         let cache = new_cache();
-        let tx_hash = Hash::from_bytes(&[7u8; 32]);
+        let tx_hash = tx(&[7u8; 32]);
         assert!(cache.get(&tx_hash).is_none());
     }
 }

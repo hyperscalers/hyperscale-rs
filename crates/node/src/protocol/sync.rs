@@ -18,7 +18,7 @@ use hyperscale_messages::request::GetBlockRequest;
 use hyperscale_messages::response::GetBlockResponse;
 use hyperscale_metrics as metrics;
 use hyperscale_storage::ChainReader;
-use hyperscale_types::{BlockHeight, CertifiedBlock, Hash, Provision, WAVE_TIMEOUT};
+use hyperscale_types::{BlockHash, BlockHeight, CertifiedBlock, Provision, WAVE_TIMEOUT};
 use serde::Serialize;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
@@ -102,7 +102,7 @@ pub enum SyncInput {
     /// Start or update sync target.
     StartSync {
         target_height: BlockHeight,
-        target_hash: Hash,
+        target_hash: BlockHash,
     },
     /// A block response was received.
     /// `None` means the peer did not have the block.
@@ -139,7 +139,7 @@ pub enum SyncOutput {
 /// executing the returned outputs.
 pub struct SyncProtocol {
     config: SyncConfig,
-    sync_target: Option<(BlockHeight, Hash)>,
+    sync_target: Option<(BlockHeight, BlockHash)>,
     committed_height: BlockHeight,
     heights_to_fetch: BinaryHeap<Reverse<BlockHeight>>,
     heights_queued: HashSet<BlockHeight>,
@@ -212,7 +212,7 @@ impl SyncProtocol {
     fn handle_start_sync(
         &mut self,
         target_height: BlockHeight,
-        target_hash: Hash,
+        target_hash: BlockHash,
     ) -> Vec<SyncOutput> {
         if self.sync_target.is_some_and(|(t, _)| t >= target_height) {
             return vec![];
@@ -497,7 +497,7 @@ mod tests {
 
         let outputs = protocol.handle(SyncInput::StartSync {
             target_height: BlockHeight(5),
-            target_hash: Hash::ZERO,
+            target_hash: BlockHash::ZERO,
         });
 
         assert!(protocol.is_syncing());
@@ -521,7 +521,7 @@ mod tests {
 
         protocol.handle(SyncInput::StartSync {
             target_height: BlockHeight(2),
-            target_hash: Hash::ZERO,
+            target_hash: BlockHash::ZERO,
         });
 
         assert!(protocol.is_syncing());
@@ -546,7 +546,7 @@ mod tests {
 
         protocol.handle(SyncInput::StartSync {
             target_height: BlockHeight(3),
-            target_hash: Hash::ZERO,
+            target_hash: BlockHash::ZERO,
         });
 
         // Fail the first fetch

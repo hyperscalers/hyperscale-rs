@@ -16,6 +16,10 @@ use hyperscale_types::{
     compute_padded_merkle_root, BlockHeight, CommittedBlockHeader, Hash, Provision, ShardGroupId,
     TopologySnapshot, ValidatorId, WAVE_TIMEOUT,
 };
+#[cfg(test)]
+use hyperscale_types::{
+    CertificateRoot, LocalReceiptRoot, ProvisionsRoot, StateRoot, TransactionRoot, TxHash,
+};
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -594,7 +598,11 @@ impl ProvisionCoordinator {
             return vec![];
         };
 
-        let leaves: Vec<Hash> = batch.transactions.iter().map(|t| t.tx_hash).collect();
+        let leaves: Vec<Hash> = batch
+            .transactions
+            .iter()
+            .map(|t| t.tx_hash.into_raw())
+            .collect();
         let computed_root = compute_padded_merkle_root(&leaves);
 
         if computed_root != expected_root {
@@ -750,9 +758,9 @@ impl ProvisionCoordinator {
 mod tests {
     use super::*;
     use hyperscale_types::{
-        bls_keypair_from_seed, BlockHeader, Bls12381G1PrivateKey, Hash, MerkleInclusionProof,
-        QuorumCertificate, Round, TopologySnapshot, TxEntries, ValidatorInfo, ValidatorSet, WaveId,
-        WeightedTimestamp,
+        bls_keypair_from_seed, BlockHash, BlockHeader, Bls12381G1PrivateKey, Hash,
+        MerkleInclusionProof, QuorumCertificate, Round, TopologySnapshot, TxEntries, ValidatorInfo,
+        ValidatorSet, WaveId, WeightedTimestamp,
     };
 
     fn make_test_topology(local_shard: ShardGroupId) -> TopologySnapshot {
@@ -804,11 +812,12 @@ mod tests {
         shard: ShardGroupId,
         height: BlockHeight,
         local_shard: ShardGroupId,
-        tx_hashes: &[Hash],
+        tx_hashes: &[TxHash],
     ) -> Arc<CommittedBlockHeader> {
         let mut header_arc = make_committed_header_with_targets(shard, height, vec![local_shard]);
         let header = Arc::get_mut(&mut header_arc).unwrap();
-        let root = hyperscale_types::compute_padded_merkle_root(tx_hashes);
+        let raw: Vec<Hash> = tx_hashes.iter().map(|h| h.into_raw()).collect();
+        let root = hyperscale_types::compute_padded_merkle_root(&raw);
         header.header.provision_tx_roots.insert(local_shard, root);
         header_arc
     }
@@ -904,7 +913,7 @@ mod tests {
 
     /// Build a Provision for testing with a single transaction.
     fn make_batch(
-        tx_hash: Hash,
+        tx_hash: TxHash,
         source_shard: ShardGroupId,
         _target_shard: ShardGroupId,
         height: BlockHeight,
@@ -914,7 +923,7 @@ mod tests {
 
     /// Build a Provision for testing with multiple transactions.
     fn make_batch_multi(
-        tx_hashes: Vec<Hash>,
+        tx_hashes: Vec<TxHash>,
         source_shard: ShardGroupId,
         height: BlockHeight,
     ) -> Provision {
@@ -939,7 +948,7 @@ mod tests {
         let topology = make_test_topology(ShardGroupId(0));
         let mut coordinator = ProvisionCoordinator::new();
 
-        let tx_hash = Hash::from_bytes(b"tx1");
+        let tx_hash = TxHash::from_raw(Hash::from_bytes(b"tx1"));
         let source_shard = ShardGroupId(1);
 
         // First: header arrives (commits to the single tx we'll send).
@@ -967,7 +976,7 @@ mod tests {
         let topology = make_test_topology(ShardGroupId(0));
         let mut coordinator = ProvisionCoordinator::new();
 
-        let tx_hash = Hash::from_bytes(b"tx1");
+        let tx_hash = TxHash::from_raw(Hash::from_bytes(b"tx1"));
         let source_shard = ShardGroupId(1);
 
         // Batch arrives before header — should buffer
@@ -982,7 +991,7 @@ mod tests {
         let topology = make_test_topology(ShardGroupId(0));
         let mut coordinator = ProvisionCoordinator::new();
 
-        let tx_hash = Hash::from_bytes(b"tx1");
+        let tx_hash = TxHash::from_raw(Hash::from_bytes(b"tx1"));
         let source_shard = ShardGroupId(1);
 
         // Batch arrives first — buffered
@@ -1011,7 +1020,7 @@ mod tests {
         let mut coordinator = ProvisionCoordinator::new();
 
         let batch = make_batch(
-            Hash::from_bytes(b"tx1"),
+            TxHash::from_raw(Hash::from_bytes(b"tx1")),
             ShardGroupId(0), // own shard
             ShardGroupId(1),
             BlockHeight(10),
@@ -1026,7 +1035,7 @@ mod tests {
         let topology = make_test_topology(ShardGroupId(0));
         let mut coordinator = ProvisionCoordinator::new();
 
-        let tx_hash = Hash::from_bytes(b"tx1");
+        let tx_hash = TxHash::from_raw(Hash::from_bytes(b"tx1"));
         let source_shard = ShardGroupId(1);
 
         // Setup: header + batch + verification.
@@ -1054,7 +1063,7 @@ mod tests {
         let topology = make_test_topology(ShardGroupId(0));
         let mut coordinator = ProvisionCoordinator::new();
 
-        let tx_hash = Hash::from_bytes(b"tx1");
+        let tx_hash = TxHash::from_raw(Hash::from_bytes(b"tx1"));
         let source_shard = ShardGroupId(1);
 
         // Setup
@@ -1080,7 +1089,7 @@ mod tests {
         let topology = make_test_topology(ShardGroupId(0));
         let mut coordinator = ProvisionCoordinator::new();
 
-        let tx_hash = Hash::from_bytes(b"tx1");
+        let tx_hash = TxHash::from_raw(Hash::from_bytes(b"tx1"));
         let source_shard = ShardGroupId(1);
 
         let header = make_committed_header(source_shard, BlockHeight(10));
@@ -1111,7 +1120,7 @@ mod tests {
 
         // Send batch with 3 transactions from the same block; header commits to them.
         let tx_hashes: Vec<_> = (0..3)
-            .map(|i| Hash::from_bytes(format!("tx{i}").as_bytes()))
+            .map(|i| TxHash::from_raw(Hash::from_bytes(format!("tx{i}").as_bytes())))
             .collect();
         let header = make_committed_header_committing(
             source_shard,
@@ -1141,7 +1150,7 @@ mod tests {
         let mut coordinator = ProvisionCoordinator::new();
 
         let source_shard = ShardGroupId(1);
-        let tx_hash = Hash::from_bytes(b"tx1");
+        let tx_hash = TxHash::from_raw(Hash::from_bytes(b"tx1"));
 
         // Verified header from coordinator (commits to the tx we'll send).
         let header = make_committed_header_committing(
@@ -1171,7 +1180,7 @@ mod tests {
         let mut coordinator = ProvisionCoordinator::new();
 
         let source_shard = ShardGroupId(1);
-        let tx_hash = Hash::from_bytes(b"tx1");
+        let tx_hash = TxHash::from_raw(Hash::from_bytes(b"tx1"));
 
         let header = make_committed_header_committing(
             source_shard,
@@ -1204,9 +1213,9 @@ mod tests {
 
         let source_shard = ShardGroupId(1);
         let tx_full = vec![
-            Hash::from_bytes(b"tx_a"),
-            Hash::from_bytes(b"tx_b"),
-            Hash::from_bytes(b"tx_c"),
+            TxHash::from_raw(Hash::from_bytes(b"tx_a")),
+            TxHash::from_raw(Hash::from_bytes(b"tx_b")),
+            TxHash::from_raw(Hash::from_bytes(b"tx_c")),
         ];
         let header = make_committed_header_committing(
             source_shard,
@@ -1240,7 +1249,7 @@ mod tests {
         coordinator.on_verified_remote_header(&topology, header);
 
         let batch = make_batch(
-            Hash::from_bytes(b"tx1"),
+            TxHash::from_raw(Hash::from_bytes(b"tx1")),
             source_shard,
             ShardGroupId(0),
             BlockHeight(10),
@@ -1256,7 +1265,10 @@ mod tests {
         let mut coordinator = ProvisionCoordinator::new();
 
         let source_shard = ShardGroupId(1);
-        let tx_hashes = vec![Hash::from_bytes(b"tx_ok"), Hash::from_bytes(b"tx_bad")];
+        let tx_hashes = vec![
+            TxHash::from_raw(Hash::from_bytes(b"tx_ok")),
+            TxHash::from_raw(Hash::from_bytes(b"tx_bad")),
+        ];
         let header = make_committed_header_committing(
             source_shard,
             BlockHeight(10),
@@ -1303,17 +1315,19 @@ mod tests {
         let header = BlockHeader {
             shard_group_id: shard,
             height,
-            parent_hash: Hash::from_bytes(b"parent"),
+            parent_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(0),
             timestamp: hyperscale_types::ProposerTimestamp(1000 + height.0),
             round: Round::INITIAL,
             is_fallback: false,
-            state_root: Hash::from_bytes(format!("root_{shard}_{height}").as_bytes()),
-            transaction_root: Hash::ZERO,
-            certificate_root: Hash::ZERO,
-            local_receipt_root: Hash::ZERO,
-            provision_root: Hash::ZERO,
+            state_root: StateRoot::from_raw(Hash::from_bytes(
+                format!("root_{shard}_{height}").as_bytes(),
+            )),
+            transaction_root: TransactionRoot::ZERO,
+            certificate_root: CertificateRoot::ZERO,
+            local_receipt_root: LocalReceiptRoot::ZERO,
+            provision_root: ProvisionsRoot::ZERO,
             waves,
             provision_tx_roots: std::collections::BTreeMap::new(),
             in_flight: 0,
@@ -1333,8 +1347,11 @@ mod tests {
     /// Make a minimal Block at the given height for on_block_committed calls.
     /// The attached QC's `weighted_timestamp_ms` is `height * TEST_BLOCK_INTERVAL_MS`.
     fn make_block(height: BlockHeight) -> hyperscale_types::CertifiedBlock {
-        let mut header =
-            hyperscale_types::BlockHeader::genesis(ShardGroupId(0), ValidatorId(0), Hash::ZERO);
+        let mut header = hyperscale_types::BlockHeader::genesis(
+            ShardGroupId(0),
+            ValidatorId(0),
+            StateRoot::ZERO,
+        );
         header.height = height;
         let block = hyperscale_types::Block::Live {
             header,
@@ -1401,7 +1418,7 @@ mod tests {
 
         // Batch arrives and is verified
         let batch = make_batch(
-            Hash::from_bytes(b"tx1"),
+            TxHash::from_raw(Hash::from_bytes(b"tx1")),
             source_shard,
             ShardGroupId(0),
             BlockHeight(10),
@@ -1537,7 +1554,7 @@ mod tests {
 
         // Batch arrives and is verified before timeout
         let batch = make_batch(
-            Hash::from_bytes(b"tx1"),
+            TxHash::from_raw(Hash::from_bytes(b"tx1")),
             source_shard,
             ShardGroupId(0),
             BlockHeight(10),
@@ -1577,7 +1594,7 @@ mod tests {
 
         // Batch arrives and is verified
         let batch = make_batch(
-            Hash::from_bytes(b"tx1"),
+            TxHash::from_raw(Hash::from_bytes(b"tx1")),
             source_shard,
             ShardGroupId(0),
             BlockHeight(10),
@@ -1636,7 +1653,7 @@ mod tests {
         let mut coordinator = ProvisionCoordinator::new();
 
         let source_shard = ShardGroupId(1);
-        let tx_hash = Hash::from_bytes(b"tx1");
+        let tx_hash = TxHash::from_raw(Hash::from_bytes(b"tx1"));
 
         let header = make_committed_header_committing(
             source_shard,
@@ -1706,7 +1723,7 @@ mod tests {
         topology: &TopologySnapshot,
         source_shard: ShardGroupId,
         height: BlockHeight,
-        tx_hash: Hash,
+        tx_hash: TxHash,
     ) {
         let header =
             make_committed_header_committing(source_shard, height, ShardGroupId(0), &[tx_hash]);
@@ -1728,7 +1745,7 @@ mod tests {
             &topology,
             ShardGroupId(1),
             BlockHeight(10),
-            Hash::from_bytes(b"tx1"),
+            TxHash::from_raw(Hash::from_bytes(b"tx1")),
         );
 
         assert_eq!(
@@ -1752,7 +1769,7 @@ mod tests {
             &topology,
             ShardGroupId(1),
             BlockHeight(10),
-            Hash::from_bytes(b"tx1"),
+            TxHash::from_raw(Hash::from_bytes(b"tx1")),
         );
 
         // t=1.2s — dwell not met (200ms < 500ms)
@@ -1786,7 +1803,7 @@ mod tests {
             &topology,
             ShardGroupId(1),
             BlockHeight(10),
-            Hash::from_bytes(b"tx_old"),
+            TxHash::from_raw(Hash::from_bytes(b"tx_old")),
         );
 
         // t=1.3s: verify young batch
@@ -1796,7 +1813,7 @@ mod tests {
             &topology,
             ShardGroupId(1),
             BlockHeight(11),
-            Hash::from_bytes(b"tx_young"),
+            TxHash::from_raw(Hash::from_bytes(b"tx_young")),
         );
 
         // t=1.4s: old batch dwelled 400ms (eligible), young batch dwelled
@@ -1806,7 +1823,7 @@ mod tests {
         assert_eq!(eligible.len(), 1);
         assert_eq!(
             eligible[0].transactions[0].tx_hash,
-            Hash::from_bytes(b"tx_old")
+            TxHash::from_raw(Hash::from_bytes(b"tx_old"))
         );
     }
 }

@@ -1,7 +1,7 @@
 //! Quorum certificate for BFT consensus.
 
 use crate::{
-    block_vote_message, zero_bls_signature, BlockHeight, Bls12381G2Signature, Hash, Round,
+    block_vote_message, zero_bls_signature, BlockHash, BlockHeight, Bls12381G2Signature, Round,
     ShardGroupId, SignerBitfield, WeightedTimestamp,
 };
 use sbor::prelude::*;
@@ -12,7 +12,7 @@ use sbor::prelude::*;
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct QuorumCertificate {
     /// Hash of the block this QC certifies.
-    pub block_hash: Hash,
+    pub block_hash: BlockHash,
 
     /// Shard group this QC belongs to (prevents cross-shard replay).
     pub shard_group_id: ShardGroupId,
@@ -21,7 +21,7 @@ pub struct QuorumCertificate {
     pub height: BlockHeight,
 
     /// Hash of the parent block (for two-chain commit rule).
-    pub parent_block_hash: Hash,
+    pub parent_block_hash: BlockHash,
 
     /// Round number when this QC was formed.
     pub round: Round,
@@ -43,10 +43,10 @@ impl QuorumCertificate {
     /// The genesis QC has a zero block hash and zero signature.
     pub fn genesis() -> Self {
         Self {
-            block_hash: Hash::ZERO,
+            block_hash: BlockHash::ZERO,
             shard_group_id: ShardGroupId(0),
             height: BlockHeight(0),
-            parent_block_hash: Hash::ZERO,
+            parent_block_hash: BlockHash::ZERO,
             round: Round::INITIAL,
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
@@ -69,7 +69,7 @@ impl QuorumCertificate {
 
     /// Check if this is a genesis QC.
     pub fn is_genesis(&self) -> bool {
-        self.height.0 == 0 && self.block_hash == Hash::ZERO
+        self.height.0 == 0 && self.block_hash == BlockHash::ZERO
     }
 
     /// Get the number of signers.
@@ -99,7 +99,7 @@ impl QuorumCertificate {
     /// Get the hash of the committable block (parent hash).
     ///
     /// Returns None for genesis QC.
-    pub fn committable_hash(&self) -> Option<Hash> {
+    pub fn committable_hash(&self) -> Option<BlockHash> {
         if self.has_committable_block() {
             Some(self.parent_block_hash)
         } else {
@@ -112,12 +112,14 @@ impl QuorumCertificate {
 mod tests {
     use super::*;
 
+    use crate::Hash;
+
     #[test]
     fn test_genesis_qc() {
         let qc = QuorumCertificate::genesis();
         assert!(qc.is_genesis());
         assert_eq!(qc.height, BlockHeight(0));
-        assert_eq!(qc.block_hash, Hash::ZERO);
+        assert_eq!(qc.block_hash, BlockHash::ZERO);
         assert_eq!(qc.signer_count(), 0);
         assert!(!qc.has_committable_block());
         assert!(qc.committable_height().is_none());
@@ -131,9 +133,9 @@ mod tests {
         signers.set(1);
         signers.set(2);
 
-        let parent_hash = Hash::from_bytes(b"parent");
+        let parent_hash = BlockHash::from_raw(Hash::from_bytes(b"parent"));
         let qc = QuorumCertificate {
-            block_hash: Hash::from_bytes(b"block1"),
+            block_hash: BlockHash::from_raw(Hash::from_bytes(b"block1")),
             shard_group_id: ShardGroupId(0),
             height: BlockHeight(1),
             parent_block_hash: parent_hash,

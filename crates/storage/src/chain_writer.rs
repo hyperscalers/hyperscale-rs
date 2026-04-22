@@ -5,7 +5,7 @@
 //! carries precomputed work; `commit_prepared_block` applies it efficiently.
 
 use crate::{BaseReadCache, JmtSnapshot};
-use hyperscale_types::{Block, BlockHeight, FinalizedWave, Hash, QuorumCertificate};
+use hyperscale_types::{Block, BlockHeight, FinalizedWave, QuorumCertificate, StateRoot};
 use std::sync::Arc;
 
 /// Abstracts state commitment for both simulation and production storage.
@@ -55,13 +55,13 @@ pub trait ChainWriter: Send + Sync + 'static {
     /// Returns `(computed_state_root, prepared_commit_handle)`.
     fn prepare_block_commit(
         &self,
-        parent_state_root: Hash,
+        parent_state_root: StateRoot,
         parent_block_height: BlockHeight,
         finalized_waves: &[Arc<FinalizedWave>],
         block_height: BlockHeight,
         pending_snapshots: &[Arc<JmtSnapshot>],
         base_reads: Option<&BaseReadCache>,
-    ) -> (Hash, Self::PreparedCommit);
+    ) -> (StateRoot, Self::PreparedCommit);
 
     /// Commit one or more blocks using precomputed work from `prepare_block_commit`.
     ///
@@ -79,7 +79,7 @@ pub trait ChainWriter: Send + Sync + 'static {
     fn commit_prepared_blocks(
         &self,
         blocks: Vec<(Self::PreparedCommit, Arc<Block>, Arc<QuorumCertificate>)>,
-    ) -> Vec<Hash>;
+    ) -> Vec<StateRoot>;
 
     /// Commit a block's state writes from scratch (no prepared handle).
     ///
@@ -87,7 +87,7 @@ pub trait ChainWriter: Send + Sync + 'static {
     /// merges `DatabaseUpdates` internally. Used when no `PreparedCommit` is
     /// available (e.g., sync blocks, cache eviction, or proposer fast-path not
     /// applicable).
-    fn commit_block(&self, block: &Arc<Block>, qc: &Arc<QuorumCertificate>) -> Hash;
+    fn commit_block(&self, block: &Arc<Block>, qc: &Arc<QuorumCertificate>) -> StateRoot;
 
     /// Extract the JMT snapshot from a prepared commit.
     ///

@@ -8,7 +8,7 @@ use hyperscale_storage::{
     DbPartitionKey, DbSortKey, NodeDatabaseUpdates, PartitionDatabaseUpdates, SubstateDatabase,
     SubstateStore,
 };
-use hyperscale_types::{BlockHeight, Hash, NodeId};
+use hyperscale_types::{BlockHeight, Hash, NodeId, StateRoot, TxHash};
 use std::sync::Arc;
 
 /// Helper: commit a block with given updates by injecting them via a single-tx
@@ -18,11 +18,11 @@ fn commit_with(
     updates: &DatabaseUpdates,
     block: &hyperscale_types::Block,
     qc: &hyperscale_types::QuorumCertificate,
-) -> Hash {
+) -> StateRoot {
     let block = block.clone();
     let block = if !updates.node_updates.is_empty() {
         let receipt = hyperscale_types::ReceiptBundle {
-            tx_hash: Hash::ZERO,
+            tx_hash: TxHash::ZERO,
             local_receipt: Arc::new(hyperscale_types::LocalReceipt {
                 outcome: hyperscale_types::TransactionOutcome::Success,
                 database_updates: updates.clone(),
@@ -80,7 +80,7 @@ fn commit_empty(
     storage: &SimStorage,
     block: &hyperscale_types::Block,
     qc: &hyperscale_types::QuorumCertificate,
-) -> Hash {
+) -> StateRoot {
     commit_with(storage, &DatabaseUpdates::default(), block, qc)
 }
 
@@ -292,7 +292,7 @@ fn test_get_block_for_sync() {
 #[test]
 fn test_transactions_batch_missing() {
     let storage = SimStorage::new();
-    let result = storage.get_transactions_batch(&[Hash::from_bytes(&[1; 32])]);
+    let result = storage.get_transactions_batch(&[TxHash::from_raw(Hash::from_bytes(&[1; 32]))]);
     assert!(result.is_empty());
 }
 
@@ -334,7 +334,7 @@ fn test_transactions_batch_with_indexed_block() {
     assert_eq!(result[0].hash(), tx_hash);
 
     // Missing hash still excluded
-    let missing = Hash::from_bytes(&[99; 32]);
+    let missing = TxHash::from_raw(Hash::from_bytes(&[99; 32]));
     let partial = storage.get_transactions_batch(&[tx_hash, missing]);
     assert_eq!(partial.len(), 1);
 }
@@ -352,7 +352,7 @@ fn test_initial_jmt_height_is_zero() {
 #[test]
 fn test_initial_state_root_is_zero() {
     let storage = SimStorage::new();
-    assert_eq!(storage.state_root_hash(), Hash::ZERO);
+    assert_eq!(storage.state_root_hash(), StateRoot::ZERO);
 }
 
 #[test]
@@ -426,7 +426,7 @@ fn test_commit_block_single() {
     let qc = make_test_qc(&block);
 
     let result = commit_with(&storage, &updates, &block, &qc);
-    assert_ne!(result, Hash::ZERO);
+    assert_ne!(result, StateRoot::ZERO);
 }
 
 #[test]
@@ -439,7 +439,7 @@ fn test_commit_block_multiple_updates() {
     let qc = make_test_qc(&block);
 
     let result = commit_with(&storage, &merged, &block, &qc);
-    assert_ne!(result, Hash::ZERO);
+    assert_ne!(result, StateRoot::ZERO);
 }
 
 #[test]
@@ -524,7 +524,7 @@ fn test_clear() {
     storage.clear();
 
     assert_eq!(storage.jmt_height(), BlockHeight(0));
-    assert_eq!(storage.state_root_hash(), Hash::ZERO);
+    assert_eq!(storage.state_root_hash(), StateRoot::ZERO);
     assert!(storage.is_empty());
 }
 

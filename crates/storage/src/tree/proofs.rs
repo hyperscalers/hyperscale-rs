@@ -6,7 +6,7 @@
 //! hyperscale type system.
 
 use hyperscale_jmt::{self as jmt, Blake3Hasher, MultiProof, Tree};
-use hyperscale_types::{BlockHeight, Hash, MerkleInclusionProof};
+use hyperscale_types::{BlockHeight, MerkleInclusionProof, StateRoot};
 
 use super::{hash_storage_key, hash_value, Jmt};
 
@@ -40,7 +40,7 @@ pub fn generate_proof<S: jmt::TreeReader>(
 pub fn verify_proof(
     proof: &MerkleInclusionProof,
     entries: &[hyperscale_types::StateEntry],
-    state_root: Hash,
+    state_root: StateRoot,
     storage_key_for_entry: impl Fn(&hyperscale_types::StateEntry) -> &[u8],
 ) -> bool {
     if proof.as_bytes().is_empty() {
@@ -61,6 +61,6 @@ pub fn verify_proof(
         })
         .collect();
 
-    let root_bytes: [u8; 32] = *state_root.as_bytes();
+    let root_bytes: [u8; 32] = *state_root.as_raw().as_bytes();
     <Tree<Blake3Hasher, 1>>::verify(&multi_proof, root_bytes, &expected).is_ok()
 }

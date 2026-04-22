@@ -28,7 +28,7 @@ use hyperscale_jmt as jmt;
 use hyperscale_metrics as metrics;
 use hyperscale_storage::{
     DatabaseUpdate, DatabaseUpdates, DbPartitionKey, DbSortKey, DbSubstateValue, JmtSnapshot,
-    PartitionDatabaseUpdates, PartitionEntry, StateRootHash, SubstateDatabase,
+    PartitionDatabaseUpdates, PartitionEntry, StateRoot, SubstateDatabase,
 };
 use rocksdb::{ColumnFamilyDescriptor, Options, WriteBatch, DB};
 use sbor::prelude::*;
@@ -293,7 +293,7 @@ impl RocksDbStorage {
     /// These are stored as a single 40-byte value under `jmt:metadata`:
     /// `[version_BE_8B][root_hash_32B]`. Always hot in the memtable since
     /// they're written on every commit.
-    pub(crate) fn read_jmt_metadata(&self) -> (u64, StateRootHash) {
+    pub(crate) fn read_jmt_metadata(&self) -> (u64, StateRoot) {
         crate::metadata::read_jmt_metadata(&*self.db)
     }
 
@@ -350,7 +350,7 @@ impl RocksDbStorage {
         qc: &hyperscale_types::QuorumCertificate,
     ) {
         crate::metadata::write_committed_height(batch, block.height());
-        crate::metadata::write_committed_hash(batch, &block.hash());
+        crate::metadata::write_committed_hash(batch, block.hash().as_raw());
         crate::metadata::write_committed_qc(batch, qc);
     }
 
@@ -656,13 +656,13 @@ impl RocksDbStorage {
     ///
     /// # Returns
     /// The genesis state root hash (JMT root at version 0).
-    pub fn finalize_genesis_jmt(&self, merged: &DatabaseUpdates) -> StateRootHash {
+    pub fn finalize_genesis_jmt(&self, merged: &DatabaseUpdates) -> StateRoot {
         let _commit_guard = self.commit_lock.lock().unwrap();
 
         // Guard: finalize_genesis_jmt must only be called once, on an uninitialized JMT.
         let (current_version, current_root) = self.read_jmt_metadata();
         assert!(
-            current_version == 0 && current_root == StateRootHash::ZERO,
+            current_version == 0 && current_root == StateRoot::ZERO,
             "finalize_genesis_jmt called but JMT already initialized (version={current_version})"
         );
 
@@ -678,7 +678,7 @@ impl RocksDbStorage {
         );
         let jmt_snapshot = JmtSnapshot::from_collected_writes(
             collected,
-            StateRootHash::ZERO,
+            StateRoot::ZERO,
             hyperscale_types::BlockHeight::GENESIS,
             root,
             hyperscale_types::BlockHeight::GENESIS,

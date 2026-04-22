@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use super::CollectedWrites;
 use hyperscale_jmt as jmt;
-use hyperscale_types::{BlockHeight, Hash};
+use hyperscale_types::{BlockHeight, StateRoot};
 
 /// Associates a JMT leaf node with the substate value it represents.
 ///
@@ -29,11 +29,11 @@ pub struct LeafSubstateKeyAssociation {
 #[must_use]
 pub struct JmtSnapshot {
     /// The JMT root this snapshot was computed from.
-    pub base_root: Hash,
+    pub base_root: StateRoot,
     /// The block height this snapshot was computed from.
     pub base_height: BlockHeight,
     /// The resulting state root after applying all updates.
-    pub result_root: Hash,
+    pub result_root: StateRoot,
     /// The block height after applying this snapshot.
     pub new_height: BlockHeight,
     /// New tree nodes.
@@ -48,9 +48,9 @@ impl JmtSnapshot {
     /// Create a snapshot from collected writes.
     pub fn from_collected_writes(
         collected: CollectedWrites,
-        base_root: Hash,
+        base_root: StateRoot,
         base_height: BlockHeight,
-        result_root: Hash,
+        result_root: StateRoot,
         new_height: BlockHeight,
     ) -> Self {
         Self {

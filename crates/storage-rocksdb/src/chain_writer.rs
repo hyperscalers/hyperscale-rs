@@ -33,13 +33,13 @@ impl hyperscale_storage::ChainWriter for RocksDbStorage {
 
     fn prepare_block_commit(
         &self,
-        parent_state_root: hyperscale_types::Hash,
+        parent_state_root: hyperscale_types::StateRoot,
         parent_block_height: BlockHeight,
         finalized_waves: &[std::sync::Arc<hyperscale_types::FinalizedWave>],
         block_height: BlockHeight,
         pending_snapshots: &[std::sync::Arc<hyperscale_storage::JmtSnapshot>],
         base_reads: Option<&hyperscale_storage::BaseReadCache>,
-    ) -> (hyperscale_types::Hash, Self::PreparedCommit) {
+    ) -> (hyperscale_types::StateRoot, Self::PreparedCommit) {
         let receipts: Vec<&ReceiptBundle> = finalized_waves
             .iter()
             .flat_map(|fw| fw.receipts.iter())
@@ -142,7 +142,7 @@ impl hyperscale_storage::ChainWriter for RocksDbStorage {
             Arc<hyperscale_types::Block>,
             Arc<hyperscale_types::QuorumCertificate>,
         )>,
-    ) -> Vec<hyperscale_types::Hash> {
+    ) -> Vec<hyperscale_types::StateRoot> {
         let total = blocks.len();
         let mut roots = Vec::with_capacity(total);
 
@@ -205,7 +205,7 @@ impl hyperscale_storage::ChainWriter for RocksDbStorage {
         &self,
         block: &Arc<hyperscale_types::Block>,
         qc: &Arc<hyperscale_types::QuorumCertificate>,
-    ) -> hyperscale_types::Hash {
+    ) -> hyperscale_types::StateRoot {
         let receipts: Vec<ReceiptBundle> = block
             .certificates()
             .iter()
@@ -251,7 +251,7 @@ impl RocksDbStorage {
         block: &Arc<hyperscale_types::Block>,
         qc: &Arc<hyperscale_types::QuorumCertificate>,
         receipts: &[ReceiptBundle],
-    ) -> hyperscale_types::Hash {
+    ) -> hyperscale_types::StateRoot {
         let block_height = block.height().0;
         let _commit_guard = self.commit_lock.lock().unwrap();
 
