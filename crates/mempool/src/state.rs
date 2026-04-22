@@ -639,7 +639,7 @@ impl MempoolState {
 
     /// Mark a transaction as executed (execution complete, certificate created).
     ///
-    /// Called when ExecutionState finalizes a wave certificate.
+    /// Called when ExecutionCoordinator finalizes a wave certificate.
     #[instrument(skip(self), fields(tx_hash = ?tx_hash, accepted = accepted))]
     pub fn on_transaction_executed(
         &mut self,

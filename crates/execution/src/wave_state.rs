@@ -6,7 +6,7 @@
 //!
 //! ## Wave lifecycle
 //!
-//! 1. **Created** in `ExecutionState::on_block_committed` when waves are assigned
+//! 1. **Created** in `ExecutionCoordinator::on_block_committed` when waves are assigned
 //!    for a newly committed block. At creation, each tx's already-received
 //!    provisions are folded in — if every tx is fully provisioned at that point
 //!    (single-shard waves are trivially so), `all_provisioned_at` is set to the

@@ -1,7 +1,7 @@
 //! Execution certificate fetch protocol state machine.
 //!
 //! Pure synchronous state machine for cross-shard execution certificate
-//! fetching with per-peer rotation. Sits between the `ExecutionState`'s
+//! fetching with per-peer rotation. Sits between the `ExecutionCoordinator`'s
 //! `RequestMissingExecutionCert` action and the actual `network.request()`
 //! call, rotating through available peers on failure before giving up.
 //!

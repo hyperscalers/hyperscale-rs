@@ -321,10 +321,8 @@ pub enum Action {
     /// Delegated to a thread pool in production, instant in simulation.
     /// Returns `ProtocolEvent::ExecutionCertificateAggregated` when complete.
     AggregateExecutionCertificate {
-        /// Wave identifier.
+        /// Wave identifier. The producing shard is `wave_id.shard_group_id`.
         wave_id: WaveId,
-        /// Shard group that executed.
-        shard: ShardGroupId,
         /// Global receipt root (merkle root over per-tx outcome leaves).
         global_receipt_root: Hash,
         /// Votes to aggregate (with quorum). The first vote's `tx_outcomes`
@@ -652,7 +650,7 @@ pub enum Action {
     // ═══════════════════════════════════════════════════════════════════════
     /// Cache a finalized wave so peers can fetch it.
     ///
-    /// Emitted by `finalize_wave` in `ExecutionState` when a wave completes.
+    /// Emitted by `finalize_wave` in `ExecutionCoordinator` when a wave completes.
     /// The io_loop inserts the `FinalizedWave` into `finalized_wave_cache`,
     /// keyed by `wave_id.hash()` (matches `BlockManifest.cert_hashes`).
     CacheFinalizedWave { wave: Arc<FinalizedWave> },

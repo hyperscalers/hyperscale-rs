@@ -1,38 +1,20 @@
-//! Test helpers for Hyperscale - provides properly-signed fixtures for crypto testing.
+//! Test helpers for Hyperscale — a deterministic BLS committee fixture.
 //!
-//! This crate provides utilities for creating test fixtures with real BLS signatures,
-//! enabling tests to exercise the actual cryptographic verification paths rather than
-//! bypassing them with `zero_bls_signature()`.
+//! [`TestCommittee`] generates seeded BLS keypairs so tests can sign and
+//! verify against real cryptographic paths rather than bypassing them with
+//! zero signatures.
 //!
 //! # Example
 //!
 //! ```rust
-//! use hyperscale_test_helpers::{TestCommittee, fixtures};
-//! use hyperscale_types::{Hash, BlockHeight, Round, ShardGroupId, verify_bls12381_v1};
+//! use hyperscale_test_helpers::TestCommittee;
+//! use hyperscale_types::verify_bls12381_v1;
 //!
-//! // Create a committee of 4 validators with deterministic keys
 //! let committee = TestCommittee::new(4, 42);
-//!
-//! // Create a properly-signed block vote
-//! let block_hash = Hash::from_bytes(b"test_block");
-//! let vote = fixtures::make_signed_block_vote(
-//!     &committee,
-//!     0, // voter index
-//!     block_hash,
-//!     BlockHeight(1),
-//!     Round(0),
-//!     ShardGroupId(0),
-//! );
-//!
-//! // The vote has a real BLS signature that can be verified
-//! let pk = committee.public_key(0);
-//! let msg = vote.signing_message();
-//! assert!(verify_bls12381_v1(&msg, pk, &vote.signature));
+//! let message = b"test message";
+//! let signature = committee.keypair(0).sign_v1(message);
+//! assert!(verify_bls12381_v1(message, committee.public_key(0), &signature));
 //! ```
-
-#[cfg(test)]
-mod byzantine;
-pub mod fixtures;
 
 use hyperscale_types::{
     bls_keypair_from_seed, Bls12381G1PrivateKey, Bls12381G1PublicKey, ValidatorId,

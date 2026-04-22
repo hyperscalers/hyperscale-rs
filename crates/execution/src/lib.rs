@@ -12,10 +12,16 @@ pub mod conflict;
 pub mod handlers;
 pub mod wave_state;
 
-mod state;
+mod coordinator;
+mod early_arrivals;
+mod expected_certs;
+mod finalized_waves;
+mod lookups;
+mod provisioning;
 mod vote_tracker;
+mod waves;
 
+pub use coordinator::{CompletionData, ExecutionCoordinator, ExecutionMemoryStats};
 pub use hyperscale_types::{FinalizedWave, WAVE_TIMEOUT};
-pub use state::{CompletionData, ExecutionMemoryStats, ExecutionState};
 pub use vote_tracker::VoteTracker;
 pub use wave_state::WaveState;

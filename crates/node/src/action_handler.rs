@@ -467,7 +467,6 @@ pub(crate) fn handle_delegated_action<
         // --- Execution Vote Aggregation and Verification ---
         Action::AggregateExecutionCertificate {
             wave_id,
-            shard,
             global_receipt_root,
             votes,
             committee,
@@ -476,7 +475,6 @@ pub(crate) fn handle_delegated_action<
             // tx_outcomes extracted from votes by the handler (all quorum votes carry identical outcomes).
             let certificate = hyperscale_execution::handlers::aggregate_execution_certificate(
                 &wave_id,
-                shard,
                 global_receipt_root,
                 &votes,
                 &committee,

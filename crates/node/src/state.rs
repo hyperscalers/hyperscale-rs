@@ -2,7 +2,7 @@
 
 use hyperscale_bft::{BftConfig, BftCoordinator, RecoveredState};
 use hyperscale_core::{Action, ProtocolEvent, StateMachine, TimerId};
-use hyperscale_execution::ExecutionState;
+use hyperscale_execution::ExecutionCoordinator;
 use hyperscale_mempool::{MempoolConfig, MempoolState};
 use hyperscale_provisions::{ProvisionConfig, ProvisionCoordinator};
 use hyperscale_remote_headers::RemoteHeaderCoordinator;
@@ -39,7 +39,7 @@ pub struct NodeStateMachine {
     bft: BftCoordinator,
 
     /// Execution state.
-    execution: ExecutionState,
+    execution: ExecutionCoordinator,
 
     /// Mempool state.
     mempool: MempoolState,
@@ -98,7 +98,7 @@ impl NodeStateMachine {
         Self {
             node_index,
             bft: BftCoordinator::new(node_index, bft_config.clone(), recovered),
-            execution: ExecutionState::new(),
+            execution: ExecutionCoordinator::new(),
             mempool: MempoolState::with_config(mempool_config),
             provisions: ProvisionCoordinator::with_config(provision_config),
             remote_headers: RemoteHeaderCoordinator::new(),
@@ -135,7 +135,7 @@ impl NodeStateMachine {
     }
 
     /// Get a reference to the execution state.
-    pub fn execution(&self) -> &ExecutionState {
+    pub fn execution(&self) -> &ExecutionCoordinator {
         &self.execution
     }
 
