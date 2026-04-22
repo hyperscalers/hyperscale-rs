@@ -52,8 +52,15 @@ where
             // ═══════════════════════════════════════════════════════════
             Action::Continuation(pe) => {
                 // Populate provision cache for request handler serving.
-                if let ProtocolEvent::ProvisionVerified { ref batch } = pe {
-                    self.provision_cache.insert(batch.hash(), Arc::clone(batch));
+                // Retention is anchored to the source block's weighted ts so
+                // eviction is deterministic across validators.
+                if let ProtocolEvent::ProvisionVerified {
+                    ref batch,
+                    source_block_ts,
+                } = pe
+                {
+                    self.provision_cache
+                        .insert(Arc::clone(batch), source_block_ts);
                 }
                 let _ = self.event_sender.send(NodeInput::Protocol(pe));
             }
@@ -270,11 +277,15 @@ where
             // ═══════════════════════════════════════════════════════════
             Action::BuildProposal {
                 ref provision_batches,
+                ref parent_qc,
                 ..
             } => {
                 // Ensure provision data is serveable before the header reaches peers.
+                // Anchor retention on the parent QC's weighted timestamp — the
+                // tightest authenticated ts available before this block commits.
+                let anchor_ts = parent_qc.weighted_timestamp;
                 for batch in provision_batches {
-                    self.provision_cache.insert(batch.hash(), Arc::clone(batch));
+                    self.provision_cache.insert(Arc::clone(batch), anchor_ts);
                 }
                 self.dispatch_delegated_action(action);
             }

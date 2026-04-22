@@ -46,7 +46,7 @@ use hyperscale_network::Network;
 use hyperscale_storage::{ChainReader, ChainWriter, JmtTreeReader, SubstateStore, VersionedStore};
 use hyperscale_types::{
     Block, BlockHeight, Bls12381G1PrivateKey, Bls12381G1PublicKey, CommittedBlockHeader,
-    ExecutionCertificate, FinalizedWave, Hash, Provision, QuorumCertificate, RoutableTransaction,
+    ExecutionCertificate, FinalizedWave, Hash, QuorumCertificate, RoutableTransaction,
     ShardGroupId, TopologySnapshot, ValidatorId, WaveId,
 };
 use quick_cache::sync::Cache as QuickCache;
@@ -94,8 +94,6 @@ type ExecCertCache = Arc<Mutex<HashMap<(Hash, WaveId), Arc<ExecutionCertificate>
 const DEFAULT_CERT_CACHE_SIZE: usize = 10_000;
 /// Default transaction cache capacity.
 const DEFAULT_TX_CACHE_SIZE: usize = 50_000;
-/// Default provision batch cache capacity (for serving fetch requests).
-const DEFAULT_PROVISION_CACHE_SIZE: usize = 256;
 /// Default transaction status cache capacity.
 const DEFAULT_TX_STATUS_CACHE_SIZE: usize = 100_000;
 /// A committed header pending sender-signature verification.
@@ -268,7 +266,7 @@ where
 
     // In-memory caches (shared with inbound router in production)
     tx_cache: Arc<QuickCache<Hash, Arc<RoutableTransaction>>>,
-    provision_cache: Arc<QuickCache<Hash, Arc<Provision>>>,
+    provision_cache: Arc<crate::ProvisionCache>,
     finalized_wave_cache: Arc<QuickCache<Hash, Arc<FinalizedWave>>>,
 
     // Sync protocol
@@ -397,7 +395,7 @@ where
             prepared_commits: Arc::new(Mutex::new(HashMap::new())),
             pending_chain,
             tx_cache: Arc::new(QuickCache::new(DEFAULT_TX_CACHE_SIZE)),
-            provision_cache: Arc::new(QuickCache::new(DEFAULT_PROVISION_CACHE_SIZE)),
+            provision_cache: Arc::new(crate::ProvisionCache::new()),
             finalized_wave_cache: Arc::new(QuickCache::new(DEFAULT_CERT_CACHE_SIZE)),
             tx_validator,
             pending_validation: HashSet::new(),

@@ -658,13 +658,14 @@ impl ProvisionCoordinator {
             return actions;
         }
 
-        let Some(ref _header) = committed_header else {
+        let Some(ref header) = committed_header else {
             warn!(
                 source_shard = source_shard.0,
                 "Provision batch marked valid but no committed header"
             );
             return actions;
         };
+        let source_block_ts = header.qc.weighted_timestamp;
 
         // Store the verified batch whole
         let batch_key = (source_shard, batch.block_height);
@@ -698,9 +699,11 @@ impl ProvisionCoordinator {
             "Provision batch verified and queued"
         );
 
-        // Emit ProvisionVerified for downstream consumption.
+        // Emit ProvisionVerified for downstream consumption. The source
+        // block timestamp anchors retention in the io-loop provision cache.
         actions.push(Action::Continuation(ProtocolEvent::ProvisionVerified {
             batch: Arc::clone(&batch),
+            source_block_ts,
         }));
 
         actions
@@ -1067,7 +1070,7 @@ mod tests {
         // Should emit ProvisionVerified
         assert!(actions.iter().any(|a| matches!(
             a,
-            Action::Continuation(ProtocolEvent::ProvisionVerified { batch })
+            Action::Continuation(ProtocolEvent::ProvisionVerified { batch, .. })
             if batch.transactions[0].tx_hash == tx_hash
         )));
     }

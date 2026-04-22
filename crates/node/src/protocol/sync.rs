@@ -13,16 +13,17 @@
 //! Production: `SyncManager` wraps this, maps outputs to tokio tasks.
 //! Simulation: feeds inputs/outputs synchronously via event queue.
 
+use crate::ProvisionCache;
 use hyperscale_messages::request::GetBlockRequest;
 use hyperscale_messages::response::GetBlockResponse;
 use hyperscale_metrics as metrics;
 use hyperscale_storage::ChainReader;
-use hyperscale_types::{BlockHeight, CertifiedBlock, Hash, Provision};
-use quick_cache::sync::Cache as QuickCache;
+use hyperscale_types::{BlockHeight, CertifiedBlock, Hash, Provision, WAVE_TIMEOUT};
 use serde::Serialize;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{info, trace, warn};
 
 /// Configuration for the sync protocol.
@@ -389,18 +390,33 @@ impl SyncProtocol {
 // Inbound request serving
 // ═══════════════════════════════════════════════════════════════════════
 
+/// Retention margin beyond `WAVE_TIMEOUT` for the serve decision.
+///
+/// A block's waves are live for `WAVE_TIMEOUT`; a late-syncing peer still
+/// needs a rotation budget to fetch provisions, execute, and vote before
+/// its rotation deadline passes. Sized to cover one vote-retry rotation.
+const SERVE_MARGIN: Duration = Duration::from_secs(12);
+const LIVE_WINDOW: Duration = Duration::from_secs(WAVE_TIMEOUT.as_secs() + SERVE_MARGIN.as_secs());
+
 /// Serve an inbound block sync request.
 ///
 /// Storage always returns `Block::Sealed` — the persisted shape carries no
-/// provisions. If the requester is still within the cross-shard execution
-/// window relative to their `target_height`, this function must upgrade
-/// to `Block::Live` by attaching the matching provisions from the local
-/// in-memory cache. If the provisions have already aged out of the cache,
-/// returns `not_found` rather than silently downgrading to `Sealed` — the
-/// requester genuinely needs `Live` and will try another peer.
+/// provisions. Whether the requester needs `Block::Live` is a function of
+/// the block's own age: if its waves could still be open for execution
+/// voting (`block_ts + WAVE_TIMEOUT + margin > tip_ts`), provisions are
+/// attached from the local cache. Otherwise the `Sealed` block is served.
+///
+/// The wave-window check is based on the BFT-authenticated
+/// `weighted_timestamp` of the committing QC and the serving peer's own
+/// latest QC timestamp — both quantities are deterministic and don't
+/// depend on the requester's view.
+///
+/// On cache miss inside the live window the block is still served as
+/// `Sealed`; the requester can fetch missing provisions via
+/// `ProvisionFetchProtocol` rather than round-robining peers.
 pub fn serve_block_request(
     storage: &impl ChainReader,
-    provision_cache: &QuickCache<Hash, Arc<Provision>>,
+    provision_cache: &ProvisionCache,
     req: GetBlockRequest,
 ) -> GetBlockResponse {
     trace!(
@@ -417,16 +433,14 @@ pub fn serve_block_request(
         return GetBlockResponse::not_found();
     };
 
-    // Block-count heuristic for "requester might still need provisions."
-    // Sized generously so a Sealed block is only served when the requester
-    // is clearly past the cross-shard execution window; if they need Live
-    // and this peer can't attach provisions, they fall through to another
-    // peer via `not_found`.
-    const LIVE_BLOCK_WINDOW: u64 = 64;
-    let needs_live =
-        req.height.0 + LIVE_BLOCK_WINDOW > req.target_height.0 && !provision_hashes.is_empty();
+    let block_ts = qc.weighted_timestamp;
+    let tip_ts = storage
+        .latest_qc()
+        .map(|q| q.weighted_timestamp)
+        .unwrap_or(block_ts);
+    let wave_window_open = tip_ts.elapsed_since(block_ts) < LIVE_WINDOW;
 
-    if !needs_live {
+    if !wave_window_open || provision_hashes.is_empty() {
         return GetBlockResponse::found(CertifiedBlock::new_unchecked(block, qc));
     }
 
@@ -434,19 +448,25 @@ pub fn serve_block_request(
         .iter()
         .map(|h| provision_cache.get(h))
         .collect();
-    let Some(provisions) = resolved else {
-        trace!(
-            height = req.height.0,
-            target_height = req.target_height.0,
-            "Provisions no longer cached — requester must try another peer"
-        );
-        return GetBlockResponse::not_found();
-    };
 
-    GetBlockResponse::found(CertifiedBlock::new_unchecked(
-        block.into_live(provisions),
-        qc,
-    ))
+    match resolved {
+        Some(provisions) => GetBlockResponse::found(CertifiedBlock::new_unchecked(
+            block.into_live(provisions),
+            qc,
+        )),
+        None => {
+            // Cache miss inside the live window. Serve Sealed and let the
+            // requester pull provisions via the fetch protocol — avoids
+            // the peer-rotation retry storm the old `not_found` path caused
+            // when provisions had aged out everywhere.
+            trace!(
+                height = req.height.0,
+                "Cache miss for provisions inside live window — serving sealed"
+            );
+            metrics::record_sync_response_error("provision_cache_miss");
+            GetBlockResponse::found(CertifiedBlock::new_unchecked(block, qc))
+        }
+    }
 }
 
 #[cfg(test)]

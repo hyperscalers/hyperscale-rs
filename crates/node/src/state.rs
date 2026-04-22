@@ -609,7 +609,7 @@ impl StateMachine for NodeStateMachine {
                 committed_header,
                 valid,
             ),
-            ProtocolEvent::ProvisionVerified { batch } => {
+            ProtocolEvent::ProvisionVerified { batch, .. } => {
                 let mut actions = self
                     .bft
                     .check_pending_blocks_for_provision(self.topology.snapshot(), &batch);

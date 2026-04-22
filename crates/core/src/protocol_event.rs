@@ -9,7 +9,7 @@ use hyperscale_types::{
     Block, BlockHeader, BlockHeight, BlockManifest, BlockVote, CertifiedBlock,
     CommittedBlockHeader, EpochConfig, EpochId, ExecutionCertificate, ExecutionVote, FinalizedWave,
     Hash, Provision, QuorumCertificate, Round, RoutableTransaction, ShardGroupId, TxOutcome,
-    ValidatorId, WaveCertificate, WaveId,
+    ValidatorId, WaveCertificate, WaveId, WeightedTimestamp,
 };
 use std::sync::Arc;
 
@@ -187,7 +187,15 @@ pub enum ProtocolEvent {
     // Provision
     // ═══════════════════════════════════════════════════════════════════════
     /// A provision batch has been verified — ready for downstream consumption.
-    ProvisionVerified { batch: Arc<Provision> },
+    ///
+    /// `source_block_ts` is the BFT-authenticated weighted timestamp of the
+    /// source shard's committing QC. Downstream consumers (notably the
+    /// io-loop provision cache) anchor retention on this so eviction is
+    /// deterministic across validators.
+    ProvisionVerified {
+        batch: Arc<Provision>,
+        source_block_ts: WeightedTimestamp,
+    },
 
     /// Received a provision batch from a source shard (light-client path).
     ///
