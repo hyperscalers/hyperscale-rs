@@ -1,20 +1,20 @@
-//! Vote set for collecting block votes.
+//! Per-block vote accounting with deferred batch verification.
 //!
-//! ## Deferred Verification Optimization
+//! A [`VoteSet`] accumulates votes for a single block. Received signatures
+//! are buffered unverified until the combined (verified + unverified) power
+//! could possibly reach quorum; at that point the [`crate::vote_keeper`]
+//! triggers a single batch verification that either builds the QC or feeds
+//! the verified votes back in via [`VoteSet::on_votes_verified`].
 //!
-//! Votes are NOT verified when received. Instead, they are buffered until
-//! we have enough for quorum. At that point, we send a single
-//! `VerifyAndBuildQuorumCertificate` action that batch-verifies all signatures
-//! and builds the QC in one operation.
-//!
-//! This avoids wasting CPU on votes we'll never use (e.g., if a block
-//! never reaches quorum due to view change or leader failure).
+//! Own votes are recorded as already-verified via
+//! [`VoteSet::add_verified_vote`] since we just signed them.
 
-#[cfg(test)]
-use hyperscale_types::QuorumCertificate;
 use hyperscale_types::{
     BlockHeader, BlockHeight, BlockVote, Bls12381G1PublicKey, Hash, Round, VotePower,
 };
+
+#[cfg(test)]
+use hyperscale_types::QuorumCertificate;
 
 /// Votes for a specific block.
 ///
@@ -258,12 +258,13 @@ impl VoteSet {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // Legacy / Test Support
+    // Direct verified-vote insertion
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /// Add a verified vote directly (for own votes that skip verification).
-    ///
-    /// Returns true if vote was added, false if validator already voted.
+    /// Add an already-verified vote to the set — used for own votes, which
+    /// we just signed and so can treat as verified without a BLS check.
+    /// Also used by tests that want to seed verified state directly.
+    /// Returns true on insertion, false if the validator has already voted.
     pub fn add_verified_vote(
         &mut self,
         committee_index: usize,
@@ -386,7 +387,6 @@ mod tests {
         generate_bls_keypair, Bls12381G1PrivateKey, QuorumCertificate, ShardGroupId, ValidatorId,
     };
 
-    /// Test shard group.
     fn test_shard_group() -> ShardGroupId {
         ShardGroupId(0)
     }
@@ -427,15 +427,6 @@ mod tests {
             &keys[voter_index],
             hyperscale_types::ProposerTimestamp(1000000000000),
         )
-    }
-
-    #[test]
-    fn test_vote_set_creation() {
-        let header = make_header(BlockHeight(1));
-        let vote_set = VoteSet::new(Some(header.clone()), 4);
-
-        assert_eq!(vote_set.verified_power(), 0);
-        assert_eq!(vote_set.height(), Some(BlockHeight(1)));
     }
 
     #[test]

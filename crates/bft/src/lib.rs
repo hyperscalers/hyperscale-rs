@@ -58,14 +58,21 @@
 
 pub mod handlers;
 
+mod chain_view;
+mod commit_pipeline;
 mod config;
-mod fetch;
+mod coordinator;
+mod lookups;
 mod pending;
-mod state;
+mod proposal;
 mod sync;
+mod tx_cache;
+mod validation;
 mod verification;
+mod view_change;
+mod vote_keeper;
 mod vote_set;
 
 pub use config::BftConfig;
-pub use state::{BftMemoryStats, BftState, BftStats, RecoveredState};
+pub use coordinator::{BftCoordinator, BftMemoryStats, BftStats, RecoveredState};
 pub use verification::ReadyStateRootVerification;

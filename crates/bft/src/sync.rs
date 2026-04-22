@@ -1,12 +1,17 @@
 //! Sync coordination for catching up to the network.
 //!
 //! Manages the sync state flag, synced block buffering, and pending
-//! synced block QC verifications. BftState owns this as a field and
+//! synced block QC verifications. BftCoordinator owns this as a field and
 //! delegates sync-specific bookkeeping here.
 
-use hyperscale_types::{BlockHeight, CertifiedBlock, Hash};
+use hyperscale_core::Action;
+use hyperscale_types::{
+    BlockHeight, Bls12381G1PublicKey, CertifiedBlock, Hash, QuorumCertificate, TopologySnapshot,
+};
 use std::collections::{BTreeMap, HashMap};
 use tracing::{debug, info, warn};
+
+use crate::commit_pipeline::CommitPipeline;
 
 /// Synced block pending QC signature verification.
 ///
@@ -22,9 +27,9 @@ pub(crate) struct PendingSyncedBlockVerification {
 
 /// Sync block coordination state.
 ///
-/// BftState owns this as a field and delegates sync-specific bookkeeping
+/// BftCoordinator owns this as a field and delegates sync-specific bookkeeping
 /// to it. Core protocol state changes (committed_height, latest_qc) remain
-/// on BftState.
+/// on BftCoordinator.
 pub(crate) struct SyncManager {
     /// Whether we are currently syncing (catching up to the network).
     syncing: bool,
@@ -33,11 +38,10 @@ pub(crate) struct SyncManager {
     /// Used by `on_block_persisted` to auto-resume when persistence catches up.
     sync_target_height: Option<BlockHeight>,
 
-    /// Highest height passed to `apply_synced_block`. Used by the sync
-    /// loop (`try_apply_verified_synced_blocks`) to iterate through
-    /// blocks independently of `BftState::committed_height`, which now
-    /// only advances when the VerifyStateRoot → PreparedCommit →
-    /// commit_prepared_blocks pipeline completes.
+    /// Highest height handed to `apply_synced_block`, advancing together
+    /// with `committed_height` inside that call. The sync apply loop keys
+    /// off this marker rather than `committed_height` so it can pick the
+    /// next height without racing the commit pipeline's own advancement.
     sync_applied_height: BlockHeight,
 
     /// Buffered out-of-order synced blocks waiting for earlier blocks.
@@ -88,11 +92,6 @@ impl SyncManager {
         self.sync_target_height
     }
 
-    /// Get the highest height that `apply_synced_block` has processed.
-    pub fn sync_applied_height(&self) -> BlockHeight {
-        self.sync_applied_height
-    }
-
     /// Record that a synced block at `height` has been submitted for
     /// state-root verification (but not yet committed).
     pub fn set_sync_applied_height(&mut self, height: BlockHeight) {
@@ -127,30 +126,120 @@ impl SyncManager {
         self.buffered_synced_blocks.insert(height, certified);
     }
 
+    /// Plan the next batch of buffered synced blocks to dispatch for QC
+    /// verification. Respects `max_parallel_sync_verifications` and starts
+    /// from one above the highest currently-pending or committed height so
+    /// we don't resubmit work already in flight.
+    ///
+    /// Returns empty when the pending set is already saturated or no
+    /// sequentially-eligible buffered block is available.
+    pub fn next_submitable(
+        &mut self,
+        committed_height: BlockHeight,
+        max_parallel: usize,
+    ) -> Vec<CertifiedBlock> {
+        let pending_count = self.pending_verification_count();
+        if pending_count >= max_parallel {
+            return Vec::new();
+        }
+        let slots_available = max_parallel - pending_count;
+
+        let highest_pending_height = self.highest_pending_height(committed_height);
+        let start_height = highest_pending_height.max(committed_height) + 1u64;
+
+        self.drain_buffered(start_height, slots_available)
+    }
+
+    /// Classify a freshly received synced block against our current state:
+    /// drop it as stale/duplicate, mark it for QC-verification dispatch, or
+    /// stash it in the future-height buffer. Returns the outcome the
+    /// coordinator should act on.
+    pub fn ingest(
+        &mut self,
+        certified: CertifiedBlock,
+        committed_height: BlockHeight,
+    ) -> IngestOutcome {
+        let block_hash = certified.block.hash();
+        let height = certified.block.height();
+
+        if height <= committed_height {
+            info!(
+                height = height.0,
+                committed = committed_height.0,
+                "Synced block already committed - filtering"
+            );
+            return IngestOutcome::Drop;
+        }
+
+        if self.has_pending_verification(&block_hash) {
+            info!(
+                height = height.0,
+                "Synced block already pending verification - filtering"
+            );
+            return IngestOutcome::Drop;
+        }
+
+        if self.has_buffered_height(height) {
+            info!(
+                height = height.0,
+                "Synced block already buffered - filtering"
+            );
+            return IngestOutcome::Drop;
+        }
+
+        let next_needed = committed_height.next();
+        if height == next_needed {
+            return IngestOutcome::Submit(Box::new(certified));
+        }
+
+        if height > next_needed {
+            self.buffer_block(height, certified);
+            return IngestOutcome::Buffered;
+        }
+
+        warn!(
+            height = height.0,
+            next_needed = next_needed.0,
+            committed = committed_height.0,
+            "Unexpected synced block height - already have or past this"
+        );
+        IngestOutcome::Drop
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
     // Pending synced block verification tracking
     // ═══════════════════════════════════════════════════════════════════════
 
-    /// Track a synced block pending QC verification.
-    ///
-    /// Callers should check `has_pending_verification` first to avoid
-    /// silently overwriting an in-flight verification.
-    pub fn track_pending_verification(&mut self, block_hash: Hash, certified: CertifiedBlock) {
-        let height = certified.block.height().0;
+    /// Record `certified` as awaiting QC verification and construct the
+    /// corresponding [`Action::VerifyQcSignature`] to dispatch. The
+    /// tracking insert is paired with the action emission so the two can
+    /// never get out of sync; callers should check
+    /// [`Self::has_pending_verification`] first to avoid clobbering an
+    /// already-in-flight entry.
+    pub fn register_for_verification(
+        &mut self,
+        certified: CertifiedBlock,
+        public_keys: Vec<Bls12381G1PublicKey>,
+    ) -> Action {
+        let block_hash = certified.block.hash();
+        let height = certified.block.height();
+        let qc = certified.qc.clone();
+
         if self
             .pending_synced_block_verifications
             .contains_key(&block_hash)
         {
             warn!(
-                height,
-                block_hash = ?block_hash,
+                height = height.0,
+                ?block_hash,
                 "Overwriting existing pending synced block verification — this is unexpected"
             );
         }
         info!(
-            height,
-            block_hash = ?block_hash,
-            "Inserting into pending_synced_block_verifications"
+            height = height.0,
+            ?block_hash,
+            signers = qc.signers.count(),
+            "Submitting synced block for QC verification"
         );
         self.pending_synced_block_verifications.insert(
             block_hash,
@@ -159,6 +248,12 @@ impl SyncManager {
                 verified: false,
             },
         );
+
+        Action::VerifyQcSignature {
+            qc,
+            public_keys,
+            block_hash,
+        }
     }
 
     /// Handle QC verification result for a synced block.
@@ -206,10 +301,13 @@ impl SyncManager {
         self.pending_synced_block_verifications.len()
     }
 
-    /// Whether any sync block QC verification is in-flight (submitted but
-    /// not yet verified). Used by `should_advance_round` to suppress view
-    /// changes while we're actively verifying sync blocks.
-    pub fn has_pending_verifications(&self) -> bool {
+    /// Whether any sync block QC verification is still awaiting its result
+    /// (submitted but not yet verified). Used by `should_advance_round` to
+    /// suppress view changes while we're actively verifying sync blocks.
+    ///
+    /// Distinct from [`Self::has_pending_verification`], which asks whether
+    /// one specific block is tracked regardless of verification status.
+    pub fn has_unverified_in_flight(&self) -> bool {
         self.pending_synced_block_verifications
             .values()
             .any(|p| !p.verified)
@@ -236,6 +334,19 @@ impl SyncManager {
             .unwrap();
 
         Some(pending.certified)
+    }
+
+    /// Take the next block to apply in the consecutive-verified sequence.
+    /// Computes the target height from `committed_height` and our own
+    /// `sync_applied_height` marker (both advance together in apply), then
+    /// pops the matching verified entry. Returns `None` once the chain
+    /// catches up to the verified frontier; also logs the verified /
+    /// unverified pending heights for diagnostics.
+    pub fn take_next_verified(&mut self, committed_height: BlockHeight) -> Option<CertifiedBlock> {
+        let base = committed_height.max(self.sync_applied_height);
+        let next_height = base + 1u64;
+        self.log_verification_state(committed_height, next_height);
+        self.take_verified_at_height(next_height)
     }
 
     /// Log the current state of pending verifications (for debugging).
@@ -323,6 +434,23 @@ impl SyncManager {
     }
 }
 
+/// Classification of an incoming synced block. Returned by
+/// [`SyncManager::ingest`] so the coordinator doesn't have to replicate the
+/// stale/duplicate/ordering branching.
+pub(crate) enum IngestOutcome {
+    /// Stale (already committed), duplicate of an in-flight verification,
+    /// already-buffered, or arrived at a lower-than-needed height. The
+    /// caller does nothing further. Reason is logged internally.
+    Drop,
+    /// Block is the next height we need. Caller should dispatch QC
+    /// verification (or apply directly on genesis QC). Boxed to keep the
+    /// enum compact across variants.
+    Submit(Box<CertifiedBlock>),
+    /// Block is a future height and has been stored internally. Caller
+    /// should drive the buffer drain to see if anything is now submittable.
+    Buffered,
+}
+
 /// Result of a synced block QC verification.
 pub(crate) enum SyncVerificationResult {
     /// QC verified successfully — ready to apply consecutive blocks.
@@ -331,4 +459,351 @@ pub(crate) enum SyncVerificationResult {
     /// verifications are preserved. Blocks above the failed height are
     /// blocked by the gap until a re-sync fills it.
     Failed,
+}
+
+/// Decision returned by [`SyncManager::health_check`].
+pub(crate) enum SyncHealthDecision {
+    /// No action needed — already synced, already syncing, or making progress.
+    Idle,
+    /// Trigger catch-up sync to the named target.
+    TriggerSync {
+        target_height: BlockHeight,
+        target_hash: Hash,
+    },
+}
+
+impl SyncManager {
+    /// Decide whether we're stuck behind the latest QC and should fall back
+    /// to catch-up sync. Called periodically by the cleanup timer.
+    ///
+    /// The caller supplies `has_next_block`, which is `true` iff a complete
+    /// block is available at `committed_height + 1` across pending,
+    /// certified, or sync-buffered storage. Three escalation levels fire:
+    ///
+    /// - No block at the next height → sync immediately.
+    /// - Block present but no pending commit and the gap exceeds 3 → the
+    ///   QC that would trigger the commit was likely dropped; sync.
+    /// - Block present with a pending commit but the gap exceeds 10 → the
+    ///   commit flow is stalled (block hashes may have diverged after a
+    ///   prior sync); sync to recover.
+    pub fn health_check(
+        &self,
+        topology: &TopologySnapshot,
+        committed_height: BlockHeight,
+        latest_qc: Option<&QuorumCertificate>,
+        has_next_block: bool,
+        commits: &CommitPipeline,
+        pending_blocks_len: usize,
+    ) -> SyncHealthDecision {
+        let Some(latest_qc) = latest_qc else {
+            return SyncHealthDecision::Idle;
+        };
+
+        let qc_height = latest_qc.height;
+        let qc_hash = latest_qc.block_hash;
+
+        if committed_height >= qc_height {
+            return SyncHealthDecision::Idle;
+        }
+
+        if self.is_syncing() {
+            return SyncHealthDecision::Idle;
+        }
+
+        let next_needed_height = committed_height.next();
+        let has_pending_commit = commits.out_of_order.contains_key(&next_needed_height);
+        let gap = qc_height - committed_height;
+
+        if gap > 5 {
+            warn!(
+                validator = ?topology.local_validator_id(),
+                committed_height = committed_height.0,
+                next_needed_height = next_needed_height.0,
+                qc_height = qc_height.0,
+                gap = gap,
+                has_next_complete = has_next_block,
+                has_pending_commit = has_pending_commit,
+                pending_commits = commits.out_of_order.len(),
+                pending_commits_awaiting_data = commits.awaiting_data.len(),
+                certified_blocks = commits.certified_blocks.len(),
+                pending_blocks = pending_blocks_len,
+                "Sync health check status"
+            );
+        }
+
+        if has_next_block {
+            if has_pending_commit {
+                if gap > 10 {
+                    warn!(
+                        validator = ?topology.local_validator_id(),
+                        committed_height = committed_height.0,
+                        next_needed_height = next_needed_height.0,
+                        qc_height = qc_height.0,
+                        gap = gap,
+                        "Have complete block and pending commit but significantly behind - triggering sync to recover"
+                    );
+                    return SyncHealthDecision::TriggerSync {
+                        target_height: qc_height,
+                        target_hash: qc_hash,
+                    };
+                }
+                return SyncHealthDecision::Idle;
+            }
+
+            if gap > 3 {
+                warn!(
+                    validator = ?topology.local_validator_id(),
+                    committed_height = committed_height.0,
+                    next_needed_height = next_needed_height.0,
+                    qc_height = qc_height.0,
+                    gap = gap,
+                    "Have complete block but no pending commit (missing QC) - triggering sync to recover"
+                );
+                return SyncHealthDecision::TriggerSync {
+                    target_height: qc_height,
+                    target_hash: qc_hash,
+                };
+            }
+            return SyncHealthDecision::Idle;
+        }
+
+        info!(
+            validator = ?topology.local_validator_id(),
+            committed_height = committed_height.0,
+            next_needed_height = next_needed_height.0,
+            qc_height = qc_height.0,
+            "Sync health check: can't make progress, triggering catch-up sync"
+        );
+
+        SyncHealthDecision::TriggerSync {
+            target_height: qc_height,
+            target_hash: qc_hash,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hyperscale_test_helpers::TestCommittee;
+    use hyperscale_types::{
+        Block, BlockHeader, ProposerTimestamp, Round, ShardGroupId, ValidatorId, ValidatorInfo,
+        ValidatorSet,
+    };
+    use std::collections::BTreeMap;
+
+    fn topology() -> TopologySnapshot {
+        let committee = TestCommittee::new(4, 42);
+        let validators: Vec<ValidatorInfo> = (0..committee.size())
+            .map(|i| ValidatorInfo {
+                validator_id: committee.validator_id(i),
+                public_key: *committee.public_key(i),
+                voting_power: 1,
+            })
+            .collect();
+        TopologySnapshot::new(ValidatorId(0), 1, ValidatorSet::new(validators))
+    }
+
+    fn header(height: BlockHeight, tag: &[u8]) -> BlockHeader {
+        BlockHeader {
+            shard_group_id: ShardGroupId(0),
+            height,
+            parent_hash: Hash::from_bytes(tag),
+            parent_qc: QuorumCertificate::genesis(),
+            proposer: ValidatorId(0),
+            timestamp: ProposerTimestamp(0),
+            round: Round::INITIAL,
+            is_fallback: false,
+            state_root: Hash::ZERO,
+            transaction_root: Hash::ZERO,
+            certificate_root: Hash::ZERO,
+            local_receipt_root: Hash::ZERO,
+            provision_root: Hash::ZERO,
+            waves: Vec::new(),
+            provision_tx_roots: BTreeMap::new(),
+            in_flight: 0,
+        }
+    }
+
+    fn certified(height: BlockHeight, tag: &[u8]) -> CertifiedBlock {
+        let block = Block::Live {
+            header: header(height, tag),
+            transactions: Vec::new(),
+            certificates: Vec::new(),
+            provisions: Vec::new(),
+        };
+        let mut qc = QuorumCertificate::genesis();
+        qc.block_hash = block.hash();
+        qc.height = height;
+        CertifiedBlock::new_unchecked(block, qc)
+    }
+
+    // ─── ingest ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn ingest_drops_stale_block_at_or_below_committed() {
+        let mut sm = SyncManager::new();
+        let out = sm.ingest(certified(BlockHeight(3), b"s"), BlockHeight(5));
+        assert!(matches!(out, IngestOutcome::Drop));
+    }
+
+    #[test]
+    fn ingest_drops_block_already_pending_verification() {
+        let mut sm = SyncManager::new();
+        let cb = certified(BlockHeight(6), b"p");
+        sm.track_pending_verification_for_test(cb.clone());
+        let out = sm.ingest(cb, BlockHeight(5));
+        assert!(matches!(out, IngestOutcome::Drop));
+    }
+
+    #[test]
+    fn ingest_drops_block_already_buffered() {
+        let mut sm = SyncManager::new();
+        let cb = certified(BlockHeight(7), b"b");
+        sm.buffer_block(BlockHeight(7), cb.clone());
+        let out = sm.ingest(cb, BlockHeight(5));
+        assert!(matches!(out, IngestOutcome::Drop));
+    }
+
+    #[test]
+    fn ingest_submits_when_block_is_next_needed_height() {
+        let mut sm = SyncManager::new();
+        let cb = certified(BlockHeight(6), b"next");
+        let out = sm.ingest(cb, BlockHeight(5));
+        assert!(matches!(out, IngestOutcome::Submit(_)));
+    }
+
+    #[test]
+    fn ingest_buffers_future_block_and_stores_it() {
+        let mut sm = SyncManager::new();
+        let cb = certified(BlockHeight(8), b"future");
+        let out = sm.ingest(cb, BlockHeight(5));
+        assert!(matches!(out, IngestOutcome::Buffered));
+        assert!(sm.has_buffered_height(BlockHeight(8)));
+    }
+
+    // ─── next_submitable ────────────────────────────────────────────────
+
+    #[test]
+    fn next_submitable_is_empty_when_pending_saturates_parallelism() {
+        let mut sm = SyncManager::new();
+        sm.track_pending_verification_for_test(certified(BlockHeight(6), b"a"));
+        sm.track_pending_verification_for_test(certified(BlockHeight(7), b"b"));
+        let out = sm.next_submitable(BlockHeight(5), 2);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn next_submitable_drains_slots_from_buffer_starting_above_pending() {
+        let mut sm = SyncManager::new();
+        sm.track_pending_verification_for_test(certified(BlockHeight(6), b"pending"));
+        sm.buffer_block(BlockHeight(7), certified(BlockHeight(7), b"buf1"));
+        sm.buffer_block(BlockHeight(8), certified(BlockHeight(8), b"buf2"));
+        sm.buffer_block(BlockHeight(9), certified(BlockHeight(9), b"buf3"));
+
+        let out = sm.next_submitable(BlockHeight(5), 3);
+        let heights: Vec<_> = out.iter().map(|c| c.block.height().0).collect();
+        assert_eq!(heights, vec![7, 8]);
+    }
+
+    #[test]
+    fn next_submitable_skips_non_contiguous_buffered_entries() {
+        let mut sm = SyncManager::new();
+        sm.buffer_block(BlockHeight(8), certified(BlockHeight(8), b"later"));
+        let out = sm.next_submitable(BlockHeight(5), 4);
+        assert!(
+            out.is_empty(),
+            "drain requires contiguous sequence from start_height"
+        );
+    }
+
+    // ─── health_check ───────────────────────────────────────────────────
+
+    #[test]
+    fn health_check_idle_without_latest_qc() {
+        let sm = SyncManager::new();
+        let commits = CommitPipeline::new();
+        let decision = sm.health_check(&topology(), BlockHeight(0), None, false, &commits, 0);
+        assert!(matches!(decision, SyncHealthDecision::Idle));
+    }
+
+    #[test]
+    fn health_check_idle_when_already_at_qc_height() {
+        let sm = SyncManager::new();
+        let commits = CommitPipeline::new();
+        let qc = qc_at(BlockHeight(10));
+        let decision = sm.health_check(&topology(), BlockHeight(10), Some(&qc), true, &commits, 0);
+        assert!(matches!(decision, SyncHealthDecision::Idle));
+    }
+
+    #[test]
+    fn health_check_idle_when_already_syncing() {
+        let mut sm = SyncManager::new();
+        sm.set_syncing(true);
+        let commits = CommitPipeline::new();
+        let qc = qc_at(BlockHeight(10));
+        let decision = sm.health_check(&topology(), BlockHeight(5), Some(&qc), false, &commits, 0);
+        assert!(matches!(decision, SyncHealthDecision::Idle));
+    }
+
+    #[test]
+    fn health_check_triggers_sync_when_next_block_missing() {
+        let sm = SyncManager::new();
+        let commits = CommitPipeline::new();
+        let qc = qc_at(BlockHeight(10));
+        let decision = sm.health_check(&topology(), BlockHeight(5), Some(&qc), false, &commits, 0);
+        match decision {
+            SyncHealthDecision::TriggerSync {
+                target_height,
+                target_hash,
+            } => {
+                assert_eq!(target_height, BlockHeight(10));
+                assert_eq!(target_hash, qc.block_hash);
+            }
+            _ => panic!("expected TriggerSync for missing-next-block gap"),
+        }
+    }
+
+    #[test]
+    fn health_check_triggers_sync_when_block_present_but_qc_stalled() {
+        // has_next_block=true but no pending commit → missing-QC escalation
+        // fires when gap > 3.
+        let sm = SyncManager::new();
+        let commits = CommitPipeline::new();
+        let qc = qc_at(BlockHeight(10));
+        let decision = sm.health_check(&topology(), BlockHeight(5), Some(&qc), true, &commits, 0);
+        assert!(matches!(decision, SyncHealthDecision::TriggerSync { .. }));
+    }
+
+    #[test]
+    fn health_check_idle_when_gap_is_small_and_block_present() {
+        let sm = SyncManager::new();
+        let commits = CommitPipeline::new();
+        let qc = qc_at(BlockHeight(7));
+        // gap = 2, <= 3, so we wait for normal consensus.
+        let decision = sm.health_check(&topology(), BlockHeight(5), Some(&qc), true, &commits, 0);
+        assert!(matches!(decision, SyncHealthDecision::Idle));
+    }
+
+    fn qc_at(height: BlockHeight) -> QuorumCertificate {
+        let mut qc = QuorumCertificate::genesis();
+        qc.height = height;
+        qc.block_hash = Hash::from_bytes(b"qc");
+        qc
+    }
+
+    // Test-only shim avoiding the `pub fn` gate on the tracked insertion,
+    // which is otherwise reached only via `register_for_verification`.
+    impl SyncManager {
+        fn track_pending_verification_for_test(&mut self, certified: CertifiedBlock) {
+            let block_hash = certified.block.hash();
+            self.pending_synced_block_verifications.insert(
+                block_hash,
+                PendingSyncedBlockVerification {
+                    certified,
+                    verified: false,
+                },
+            );
+        }
+    }
 }

@@ -47,7 +47,7 @@ impl CommitSource {
 /// remain separate (they have different input types), but the
 /// callback event is unified because the handler logic is identical:
 /// record result → check if all verifications complete → vote.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum VerificationKind {
     StateRoot,
     TransactionRoot,
@@ -310,7 +310,7 @@ pub enum ProtocolEvent {
     SyncEcVerificationComplete { height: BlockHeight, valid: bool },
 
     /// The io_loop's SyncProtocol has finished fetching all blocks up to
-    /// the sync target. BftState should exit sync mode so it can re-enter
+    /// the sync target. BftCoordinator should exit sync mode so it can re-enter
     /// if still behind, or resume normal consensus.
     SyncProtocolComplete { height: BlockHeight },
 

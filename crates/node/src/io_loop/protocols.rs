@@ -75,7 +75,7 @@ where
                         height = height.0,
                         "Sync protocol complete, resuming consensus"
                     );
-                    // Tell BftState to exit sync mode. The previous
+                    // Tell BftCoordinator to exit sync mode. The previous
                     // BlockPersisted → on_block_persisted path was unreliable
                     // because BlockPersisted requires PreparedCommit which
                     // may not be available yet for synced blocks.

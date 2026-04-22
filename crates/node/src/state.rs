@@ -1,6 +1,6 @@
 //! Node state machine.
 
-use hyperscale_bft::{BftConfig, BftState, RecoveredState};
+use hyperscale_bft::{BftConfig, BftCoordinator, RecoveredState};
 use hyperscale_core::{Action, ProtocolEvent, StateMachine, TimerId};
 use hyperscale_execution::ExecutionState;
 use hyperscale_mempool::{MempoolConfig, MempoolState};
@@ -24,7 +24,7 @@ pub type NodeIndex = u32;
 /// Combined node state machine.
 ///
 /// Composes BFT, execution, mempool, and provisions into a single state machine.
-/// View changes are handled implicitly via local round advancement in BftState (HotStuff-2 style).
+/// View changes are handled implicitly via local round advancement in BftCoordinator (HotStuff-2 style).
 ///
 /// Note: Sync is handled entirely by the runner (production: SyncManager, simulation: runner logic).
 /// The runner sends SyncBlockReadyToApply events directly to BFT when synced blocks are ready.
@@ -36,7 +36,7 @@ pub struct NodeStateMachine {
     topology: TopologyState,
 
     /// BFT consensus state (includes implicit round advancement).
-    bft: BftState,
+    bft: BftCoordinator,
 
     /// Execution state.
     execution: ExecutionState,
@@ -97,12 +97,7 @@ impl NodeStateMachine {
     ) -> Self {
         Self {
             node_index,
-            bft: BftState::new(
-                node_index,
-                topology.snapshot(),
-                bft_config.clone(),
-                recovered,
-            ),
+            bft: BftCoordinator::new(node_index, bft_config.clone(), recovered),
             execution: ExecutionState::new(),
             mempool: MempoolState::with_config(mempool_config),
             provisions: ProvisionCoordinator::with_config(provision_config),
@@ -135,7 +130,7 @@ impl NodeStateMachine {
     }
 
     /// Get a reference to the BFT state.
-    pub fn bft(&self) -> &BftState {
+    pub fn bft(&self) -> &BftCoordinator {
         &self.bft
     }
 
@@ -526,25 +521,13 @@ impl StateMachine for NodeStateMachine {
                 height,
                 header,
                 valid,
-            } => {
-                // Store valid headers into BFT immediately so they're available
-                // for deferral merkle proof validation without a 1-step delay.
-                // Must capture returned actions — unblocked abort intent
-                // verifications are emitted here.
-                let mut actions = if valid {
-                    self.bft.on_verified_remote_header(Arc::clone(&header))
-                } else {
-                    vec![]
-                };
-                actions.extend(self.remote_headers.on_remote_header_qc_verified(
-                    self.topology.snapshot(),
-                    shard,
-                    height,
-                    header,
-                    valid,
-                ));
-                actions
-            }
+            } => self.remote_headers.on_remote_header_qc_verified(
+                self.topology.snapshot(),
+                shard,
+                height,
+                header,
+                valid,
+            ),
             ProtocolEvent::RemoteHeaderVerified { committed_header } => {
                 // Fan out verified header to downstream consumers.
                 // BFT already received the header in RemoteHeaderQcVerified
@@ -720,7 +703,7 @@ impl StateMachine for NodeStateMachine {
                 .on_sync_block_ready_to_apply(self.topology.snapshot(), certified),
             // Handled by IoLoop directly (sync verification pipeline).
             ProtocolEvent::SyncEcVerificationComplete { .. } => vec![],
-            // SyncProtocol finished fetching — tell BftState to exit sync
+            // SyncProtocol finished fetching — tell BftCoordinator to exit sync
             // mode so it can re-enter sync if still behind, or resume
             // normal consensus.
             ProtocolEvent::SyncProtocolComplete { .. } => {

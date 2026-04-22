@@ -2,11 +2,15 @@
 //!
 //! Tracks blocks being assembled from headers + gossiped transactions + finalized waves.
 
+use hyperscale_core::Action;
 use hyperscale_types::{
     Block, BlockHeader, BlockManifest, FinalizedWave, Hash, Provision, RoutableTransaction,
+    TopologySnapshot,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
+use tracing::debug;
 
 /// Tracks a block being assembled from header + gossiped transactions + finalized waves.
 ///
@@ -51,11 +55,19 @@ pub struct PendingBlock {
 
     /// The fully constructed block (None until all transactions/waves received).
     constructed_block: Option<Arc<Block>>,
+
+    /// Time at which this pending block was first observed. Used to schedule
+    /// fetch requests for missing data after a gossip grace period.
+    created_at: Duration,
 }
 
 impl PendingBlock {
     /// Create a pending block from a header and manifest.
-    pub fn from_manifest(header: BlockHeader, manifest: BlockManifest) -> Self {
+    pub fn from_manifest(
+        header: BlockHeader,
+        manifest: BlockManifest,
+        created_at: Duration,
+    ) -> Self {
         let total_tx_count = manifest.transaction_count();
         let missing_transaction_hashes: HashSet<Hash> =
             manifest.tx_hashes.iter().copied().collect();
@@ -73,6 +85,7 @@ impl PendingBlock {
             missing_provision_hashes,
             manifest,
             constructed_block: None,
+            created_at,
         }
     }
 
@@ -86,6 +99,7 @@ impl PendingBlock {
         block: &Block,
         finalized_waves: Vec<Arc<FinalizedWave>>,
         provisions: Vec<Arc<Provision>>,
+        created_at: Duration,
     ) -> Self {
         let mut provision_hashes: Vec<Hash> = provisions.iter().map(|p| p.hash()).collect();
         provision_hashes.sort();
@@ -105,6 +119,7 @@ impl PendingBlock {
             missing_provision_hashes: HashSet::new(),
             manifest,
             constructed_block: None,
+            created_at,
         };
         // Fill in all transactions
         for tx in block.transactions() {
@@ -279,6 +294,11 @@ impl PendingBlock {
         &self.header
     }
 
+    /// Time at which this pending block was first observed.
+    pub fn created_at(&self) -> Duration {
+        self.created_at
+    }
+
     /// Get the block manifest.
     pub fn manifest(&self) -> &BlockManifest {
         &self.manifest
@@ -293,6 +313,88 @@ impl PendingBlock {
     pub fn certificate_count(&self) -> usize {
         self.manifest.cert_hashes.len()
     }
+}
+
+/// Emit fetch actions for pending blocks whose missing data has been
+/// outstanding longer than `timeout`. Skips complete blocks.
+///
+/// Called periodically by the cleanup timer so gossip and local certificate
+/// production have a chance to fill the data first. `force_immediate`
+/// bypasses the age check — used after sync resumes to pull any lingering
+/// holes without another timeout cycle.
+pub(crate) fn check_fetches(
+    pending_blocks: &HashMap<Hash, PendingBlock>,
+    topology: &TopologySnapshot,
+    now: Duration,
+    timeout: Duration,
+    force_immediate: bool,
+) -> Vec<Action> {
+    let mut actions = Vec::new();
+
+    for (block_hash, pending) in pending_blocks {
+        if pending.is_complete() {
+            continue;
+        }
+
+        let age = now.saturating_sub(pending.created_at());
+        let ready = force_immediate || age >= timeout;
+        if !ready {
+            continue;
+        }
+
+        let proposer = pending.header().proposer;
+
+        let missing_txs = pending.missing_transactions();
+        if !missing_txs.is_empty() {
+            debug!(
+                validator = ?topology.local_validator_id(),
+                block_hash = ?block_hash,
+                missing_tx_count = missing_txs.len(),
+                age_ms = age.as_millis(),
+                timeout_ms = timeout.as_millis(),
+                "Fetch timeout reached, requesting missing transactions"
+            );
+            actions.push(Action::FetchTransactions {
+                block_hash: *block_hash,
+                proposer,
+                tx_hashes: missing_txs,
+            });
+        }
+
+        let missing_provisions = pending.missing_provisions();
+        if !missing_provisions.is_empty() {
+            debug!(
+                validator = ?topology.local_validator_id(),
+                block_hash = ?block_hash,
+                missing_provision_count = missing_provisions.len(),
+                age_ms = age.as_millis(),
+                "Fetch timeout reached, requesting missing provisions"
+            );
+            actions.push(Action::FetchProvisionLocal {
+                block_hash: *block_hash,
+                proposer,
+                batch_hashes: missing_provisions,
+            });
+        }
+
+        let missing_waves = pending.missing_waves();
+        if !missing_waves.is_empty() {
+            debug!(
+                validator = ?topology.local_validator_id(),
+                block_hash = ?block_hash,
+                missing_wave_count = missing_waves.len(),
+                age_ms = age.as_millis(),
+                "Fetch timeout reached, requesting missing finalized waves"
+            );
+            actions.push(Action::FetchFinalizedWave {
+                block_hash: *block_hash,
+                proposer,
+                wave_id_hashes: missing_waves,
+            });
+        }
+    }
+
+    actions
 }
 
 #[cfg(test)]
@@ -333,6 +435,7 @@ mod tests {
                 tx_hashes: vec![tx1, tx2],
                 ..Default::default()
             },
+            Duration::ZERO,
         );
 
         assert_eq!(pb.missing_transactions().len(), 2);
@@ -345,7 +448,7 @@ mod tests {
     #[test]
     fn test_empty_block_is_complete() {
         let header = make_header(BlockHeight(1));
-        let pb = PendingBlock::from_manifest(header, BlockManifest::default());
+        let pb = PendingBlock::from_manifest(header, BlockManifest::default(), Duration::ZERO);
 
         assert!(pb.is_complete());
     }
@@ -364,6 +467,7 @@ mod tests {
                 cert_hashes: vec![wave1, wave2],
                 ..Default::default()
             },
+            Duration::ZERO,
         );
 
         assert_eq!(pb.missing_transaction_count(), 1);
@@ -387,6 +491,7 @@ mod tests {
                 cert_hashes: vec![wave_hash],
                 ..Default::default()
             },
+            Duration::ZERO,
         );
 
         assert_eq!(pb.missing_wave_count(), 1);
@@ -425,6 +530,7 @@ mod tests {
                 cert_hashes: vec![wave_hash],
                 ..Default::default()
             },
+            Duration::ZERO,
         );
 
         assert!(!pb.is_complete());
@@ -468,7 +574,7 @@ mod tests {
             provisions: vec![],
         };
 
-        let pending = PendingBlock::from_complete_block(&block, vec![fw], vec![]);
+        let pending = PendingBlock::from_complete_block(&block, vec![fw], vec![], Duration::ZERO);
         assert!(pending.is_complete());
     }
 }

@@ -1086,7 +1086,6 @@ where
                 bft_certified_blocks: bft_mem.certified_blocks,
                 bft_pending_commits: bft_mem.pending_commits,
                 bft_pending_commits_awaiting_data: bft_mem.pending_commits_awaiting_data,
-                bft_remote_headers: bft_mem.remote_headers,
                 bft_voted_heights: bft_mem.voted_heights,
                 bft_received_votes_by_height: bft_mem.received_votes_by_height,
                 bft_committed_tx_lookup: bft_mem.committed_tx_lookup,

@@ -1,8 +1,12 @@
 //! Async verification pipeline for block voting.
 //!
 //! Tracks QC signature, state root, transaction root, and receipt root
-//! verifications. BftState delegates verification bookkeeping here while
+//! verifications. BftCoordinator delegates verification bookkeeping here while
 //! retaining control-flow decisions (voting, block rejection).
+//!
+//! Pure pre-vote validation helpers (header structure, timestamp bounds,
+//! transaction ordering, `waves` recomputation, cross-ancestor tx uniqueness)
+//! live in [`crate::validation`].
 
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, BlockManifest, FinalizedWave, Hash, ReceiptBundle,
@@ -12,7 +16,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::{debug, trace, warn};
 
-use hyperscale_core::Action;
+use crate::chain_view::ChainView;
+use crate::pending::PendingBlock;
+use hyperscale_core::{Action, VerificationKind};
 
 /// Block header pending QC signature verification.
 ///
@@ -47,10 +53,20 @@ pub struct ReadyStateRootVerification {
     pub block_height: BlockHeight,
 }
 
+/// Classification of the in-flight check outcome for the vote path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InFlightCheck {
+    /// In-flight count passes — proceed with voting.
+    Proceed,
+    /// Run verifications but do not vote (vote-locked, or parent pruned).
+    SkipVote,
+    /// In-flight count exceeds the allowed tolerance — abort entirely.
+    Abort,
+}
+
 /// Internal queue entry for state root verification. Holds only block identity
-/// — `parent_state_root` and `finalized_waves` are resolved freshly when
-/// `BftState::drain_ready_state_root_verifications` converts this into the
-/// public `ReadyStateRootVerification`.
+/// — `parent_state_root` and `finalized_waves` are resolved freshly at drain
+/// time against the current chain view.
 #[derive(Debug, Clone)]
 pub(crate) struct PendingStateRootVerification {
     pub block_hash: Hash,
@@ -66,8 +82,8 @@ pub(crate) struct PendingStateRootVerification {
 
 /// Tracks all async verification state for block voting.
 ///
-/// BftState owns this as a field and delegates verification bookkeeping
-/// to it. Control-flow decisions (vote, reject block) remain in BftState.
+/// BftCoordinator owns this as a field and delegates verification bookkeeping
+/// to it. Control-flow decisions (vote, reject block) remain in BftCoordinator.
 pub(crate) struct VerificationPipeline {
     // === QC signature verification ===
     /// Block headers pending QC signature verification.
@@ -118,40 +134,15 @@ pub(crate) struct VerificationPipeline {
     /// to re-enter `try_propose` with fresh transaction selection.
     proposal_unblocked: bool,
 
-    // === Transaction root verification ===
-    /// Blocks where transaction root verification is currently in-flight.
-    transaction_root_verifications_in_flight: HashSet<Hash>,
+    // === Per-root merkle verification ===
+    /// `(block_hash, kind)` pairs currently being verified (transaction,
+    /// certificate, local-receipt, provision, provision-tx roots).
+    /// State-root uses separate fields above because its lifecycle
+    /// includes deferred/ready queues for parent-tree availability.
+    in_flight_roots: HashSet<(Hash, VerificationKind)>,
 
-    /// Blocks with verified transaction roots.
-    verified_transaction_roots: HashSet<Hash>,
-
-    // === Certificate root verification ===
-    /// Blocks where receipt root verification is currently in-flight.
-    certificate_root_verifications_in_flight: HashSet<Hash>,
-
-    /// Blocks with verified receipt roots.
-    verified_certificate_roots: HashSet<Hash>,
-
-    // === Local receipt root verification ===
-    /// Blocks where local receipt root verification is currently in-flight.
-    local_receipt_root_verifications_in_flight: HashSet<Hash>,
-
-    /// Blocks with verified local receipt roots.
-    verified_local_receipt_roots: HashSet<Hash>,
-
-    // === Provision root verification ===
-    /// Blocks where provisions root verification is currently in-flight.
-    provision_root_verifications_in_flight: HashSet<Hash>,
-
-    /// Blocks with verified provisions roots.
-    verified_provision_roots: HashSet<Hash>,
-
-    // === Provision tx-root verification ===
-    /// Blocks where provision tx-root verification is currently in-flight.
-    provision_tx_root_verifications_in_flight: HashSet<Hash>,
-
-    /// Blocks with verified provision tx-roots.
-    verified_provision_tx_roots: HashSet<Hash>,
+    /// `(block_hash, kind)` pairs whose merkle root has been verified.
+    verified_roots: HashSet<(Hash, VerificationKind)>,
 
     // === In-flight count verification ===
     /// Blocks with verified in-flight counts (synchronous tolerance check).
@@ -171,18 +162,63 @@ impl VerificationPipeline {
             ready_state_root_verifications: Vec::new(),
             proposal_unblocked: false,
             last_persisted_height: persisted_height,
-            transaction_root_verifications_in_flight: HashSet::new(),
-            verified_transaction_roots: HashSet::new(),
-            certificate_root_verifications_in_flight: HashSet::new(),
-            verified_certificate_roots: HashSet::new(),
-            local_receipt_root_verifications_in_flight: HashSet::new(),
-            verified_local_receipt_roots: HashSet::new(),
-            provision_root_verifications_in_flight: HashSet::new(),
-            verified_provision_roots: HashSet::new(),
-            provision_tx_root_verifications_in_flight: HashSet::new(),
-            verified_provision_tx_roots: HashSet::new(),
+            in_flight_roots: HashSet::new(),
+            verified_roots: HashSet::new(),
             verified_in_flight: HashSet::new(),
         }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Per-root merkle state (shared helpers)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Whether the given merkle root has been verified for `block_hash`.
+    /// State-root callers use [`Self::is_state_root_verified`] instead.
+    fn is_root_verified(&self, block_hash: Hash, kind: VerificationKind) -> bool {
+        self.verified_roots.contains(&(block_hash, kind))
+    }
+
+    /// Whether a merkle-root verification is currently in-flight for
+    /// `(block_hash, kind)`.
+    fn is_root_in_flight(&self, block_hash: Hash, kind: VerificationKind) -> bool {
+        self.in_flight_roots.contains(&(block_hash, kind))
+    }
+
+    /// Skip the verification when the block carries no relevant content,
+    /// has already been verified, or is already in-flight.
+    fn needs_root(
+        &self,
+        block_hash: Hash,
+        kind: VerificationKind,
+        has_relevant_content: bool,
+    ) -> bool {
+        has_relevant_content
+            && !self.is_root_verified(block_hash, kind)
+            && !self.is_root_in_flight(block_hash, kind)
+    }
+
+    /// Mark the root verification as in-flight so duplicate dispatch is
+    /// avoided until the result lands.
+    fn mark_root_in_flight(&mut self, block_hash: Hash, kind: VerificationKind) {
+        self.in_flight_roots.insert((block_hash, kind));
+    }
+
+    /// Record a merkle-root verification result for one of the per-kind
+    /// merkle roots (transaction, certificate, local-receipt, provision,
+    /// provision-tx). Returns `valid` so the caller can short-circuit.
+    /// State-root results go through [`Self::on_state_root_verified`].
+    pub fn on_root_verified(
+        &mut self,
+        block_hash: Hash,
+        kind: VerificationKind,
+        valid: bool,
+    ) -> bool {
+        self.in_flight_roots.remove(&(block_hash, kind));
+        if valid {
+            self.verified_roots.insert((block_hash, kind));
+            debug!(?kind, ?block_hash, "Merkle root verified successfully");
+        }
+        valid
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -235,11 +271,7 @@ impl VerificationPipeline {
         !self.state_root_verifications_in_flight.is_empty()
             || !self.deferred_state_root_verifications.is_empty()
             || self.deferred_proposal.is_some()
-            || !self.transaction_root_verifications_in_flight.is_empty()
-            || !self.certificate_root_verifications_in_flight.is_empty()
-            || !self.local_receipt_root_verifications_in_flight.is_empty()
-            || !self.provision_root_verifications_in_flight.is_empty()
-            || !self.provision_tx_root_verifications_in_flight.is_empty()
+            || !self.in_flight_roots.is_empty()
             || !self.pending_qc_verifications.is_empty()
     }
 
@@ -263,54 +295,40 @@ impl VerificationPipeline {
     /// verifications are all done (or not needed).
     pub fn is_block_verified(&self, block: &Block) -> bool {
         let block_hash = block.hash();
+        let h = block.header();
 
-        let state_root_ok = self.verified_state_roots.contains(&block_hash);
+        let root_ok =
+            |kind, has_content: bool| !has_content || self.is_root_verified(block_hash, kind);
 
-        let transaction_root_ok = if block.transaction_count() == 0 {
-            true
-        } else {
-            self.verified_transaction_roots.contains(&block_hash)
-        };
-
-        let certificate_root_ok = if block.certificates().is_empty() {
-            true
-        } else {
-            self.verified_certificate_roots.contains(&block_hash)
-        };
-
-        let local_receipt_root_ok = if block.certificates().is_empty() {
-            true
-        } else {
-            self.verified_local_receipt_roots.contains(&block_hash)
-        };
-
-        let provision_root_ok = if block.header().provision_root == Hash::ZERO {
-            true
-        } else {
-            self.verified_provision_roots.contains(&block_hash)
-        };
-
-        let provision_tx_root_ok = if block.header().provision_tx_roots.is_empty() {
-            true
-        } else {
-            self.verified_provision_tx_roots.contains(&block_hash)
-        };
-
-        let in_flight_ok = self.verified_in_flight.contains(&block_hash);
-
-        state_root_ok
-            && transaction_root_ok
-            && certificate_root_ok
-            && local_receipt_root_ok
-            && provision_root_ok
-            && provision_tx_root_ok
-            && in_flight_ok
+        self.verified_state_roots.contains(&block_hash)
+            && root_ok(
+                VerificationKind::TransactionRoot,
+                block.transaction_count() > 0,
+            )
+            && root_ok(
+                VerificationKind::CertificateRoot,
+                !block.certificates().is_empty(),
+            )
+            && root_ok(
+                VerificationKind::LocalReceiptRoot,
+                !block.certificates().is_empty(),
+            )
+            && root_ok(
+                VerificationKind::ProvisionRoot,
+                h.provision_root != Hash::ZERO,
+            )
+            && root_ok(
+                VerificationKind::ProvisionTxRoots,
+                !h.provision_tx_roots.is_empty(),
+            )
+            && self.verified_in_flight.contains(&block_hash)
     }
 
     /// Log why a block's verification is incomplete. Called on view change
     /// to explain why the current block couldn't be voted on in time.
     pub fn log_incomplete_verification(&self, block: &Block) {
         let block_hash = block.hash();
+        let h = block.header();
 
         let state_root_status = if self.verified_state_roots.contains(&block_hash) {
             "verified"
@@ -329,70 +347,43 @@ impl VerificationPipeline {
             "NOT_STARTED"
         };
 
-        let tx_root_status = if block.transaction_count() == 0 {
-            "skipped(no_txs)"
-        } else if self.verified_transaction_roots.contains(&block_hash) {
-            "verified"
-        } else if self
-            .transaction_root_verifications_in_flight
-            .contains(&block_hash)
-        {
-            "in_flight"
-        } else {
-            "NOT_STARTED"
+        let root_status = |kind: VerificationKind, skip_label: &'static str, has_content: bool| {
+            if !has_content {
+                skip_label
+            } else if self.is_root_verified(block_hash, kind) {
+                "verified"
+            } else if self.is_root_in_flight(block_hash, kind) {
+                "in_flight"
+            } else {
+                "NOT_STARTED"
+            }
         };
 
-        let certificate_root_status = if block.certificates().is_empty() {
-            "skipped(no_certs)"
-        } else if self.verified_certificate_roots.contains(&block_hash) {
-            "verified"
-        } else if self
-            .certificate_root_verifications_in_flight
-            .contains(&block_hash)
-        {
-            "in_flight"
-        } else {
-            "NOT_STARTED"
-        };
-
-        let local_receipt_root_status = if block.certificates().is_empty() {
-            "skipped(no_certs)"
-        } else if self.verified_local_receipt_roots.contains(&block_hash) {
-            "verified"
-        } else if self
-            .local_receipt_root_verifications_in_flight
-            .contains(&block_hash)
-        {
-            "in_flight"
-        } else {
-            "NOT_STARTED"
-        };
-
-        let provision_root_status = if block.header().provision_root == Hash::ZERO {
-            "skipped(no_provisions)"
-        } else if self.verified_provision_roots.contains(&block_hash) {
-            "verified"
-        } else if self
-            .provision_root_verifications_in_flight
-            .contains(&block_hash)
-        {
-            "in_flight"
-        } else {
-            "NOT_STARTED"
-        };
-
-        let provision_tx_root_status = if block.header().provision_tx_roots.is_empty() {
-            "skipped(no_provision_targets)"
-        } else if self.verified_provision_tx_roots.contains(&block_hash) {
-            "verified"
-        } else if self
-            .provision_tx_root_verifications_in_flight
-            .contains(&block_hash)
-        {
-            "in_flight"
-        } else {
-            "NOT_STARTED"
-        };
+        let tx_root_status = root_status(
+            VerificationKind::TransactionRoot,
+            "skipped(no_txs)",
+            block.transaction_count() > 0,
+        );
+        let certificate_root_status = root_status(
+            VerificationKind::CertificateRoot,
+            "skipped(no_certs)",
+            !block.certificates().is_empty(),
+        );
+        let local_receipt_root_status = root_status(
+            VerificationKind::LocalReceiptRoot,
+            "skipped(no_certs)",
+            !block.certificates().is_empty(),
+        );
+        let provision_root_status = root_status(
+            VerificationKind::ProvisionRoot,
+            "skipped(no_provisions)",
+            h.provision_root != Hash::ZERO,
+        );
+        let provision_tx_root_status = root_status(
+            VerificationKind::ProvisionTxRoots,
+            "skipped(no_provision_targets)",
+            !h.provision_tx_roots.is_empty(),
+        );
 
         let in_flight_status = if self.verified_in_flight.contains(&block_hash) {
             "verified"
@@ -569,34 +560,23 @@ impl VerificationPipeline {
     /// `try_vote_on_block`.
     pub fn mark_proposal_fully_verified(&mut self, block_hash: Hash) {
         self.mark_proposal_state_root_verified(block_hash);
-        self.verified_transaction_roots.insert(block_hash);
-        self.verified_certificate_roots.insert(block_hash);
-        self.verified_local_receipt_roots.insert(block_hash);
-        self.verified_provision_roots.insert(block_hash);
-        self.verified_provision_tx_roots.insert(block_hash);
+        for kind in [
+            VerificationKind::TransactionRoot,
+            VerificationKind::CertificateRoot,
+            VerificationKind::LocalReceiptRoot,
+            VerificationKind::ProvisionRoot,
+            VerificationKind::ProvisionTxRoots,
+        ] {
+            self.verified_roots.insert((block_hash, kind));
+        }
         self.verified_in_flight.insert(block_hash);
     }
 
-    // ─── Transaction root ────────────────────────────────────────────────
-
-    /// Check if a block needs transaction root verification before voting.
-    pub fn needs_transaction_root_verification(&self, block: &Block) -> bool {
-        if block.transaction_count() == 0 {
-            return false;
-        }
-
-        let block_hash = block.hash();
-
-        if self.verified_transaction_roots.contains(&block_hash)
-            || self
-                .transaction_root_verifications_in_flight
-                .contains(&block_hash)
-        {
-            return false;
-        }
-
-        true
-    }
+    // ─── Per-kind initiators ────────────────────────────────────────────
+    //
+    // One method per root kind; each emits its distinct `Action` variant
+    // and records the in-flight marker via `mark_root_in_flight`. All
+    // results flow back through [`Self::on_root_verified`].
 
     /// Initiate transaction root verification for a block.
     pub fn initiate_transaction_root_verification(
@@ -605,57 +585,17 @@ impl VerificationPipeline {
         block: &Block,
     ) -> Vec<Action> {
         debug!(
-            block_hash = ?block_hash,
+            ?block_hash,
             tx_count = block.transactions().len(),
             expected_root = ?block.header().transaction_root,
             "Initiating transaction root verification"
         );
-
-        self.transaction_root_verifications_in_flight
-            .insert(block_hash);
-
+        self.mark_root_in_flight(block_hash, VerificationKind::TransactionRoot);
         vec![Action::VerifyTransactionRoot {
             block_hash,
             expected_root: block.header().transaction_root,
             transactions: block.transactions().to_vec(),
         }]
-    }
-
-    /// Record a transaction root verification result. Returns whether the verification passed.
-    pub fn on_transaction_root_verified(&mut self, block_hash: Hash, valid: bool) -> bool {
-        self.transaction_root_verifications_in_flight
-            .remove(&block_hash);
-
-        if valid {
-            self.verified_transaction_roots.insert(block_hash);
-            debug!(
-                block_hash = ?block_hash,
-                "Transaction root verified successfully"
-            );
-        }
-
-        valid
-    }
-
-    // ─── Certificate root ─────────────────────────────────────────────────────
-
-    /// Check if a block needs receipt root verification before voting.
-    pub fn needs_certificate_root_verification(&self, block: &Block) -> bool {
-        if block.certificates().is_empty() {
-            return false;
-        }
-
-        let block_hash = block.hash();
-
-        if self.verified_certificate_roots.contains(&block_hash)
-            || self
-                .certificate_root_verifications_in_flight
-                .contains(&block_hash)
-        {
-            return false;
-        }
-
-        true
     }
 
     /// Initiate receipt root verification for a block.
@@ -665,57 +605,17 @@ impl VerificationPipeline {
         block: &Block,
     ) -> Vec<Action> {
         debug!(
-            block_hash = ?block_hash,
+            ?block_hash,
             cert_count = block.certificates().len(),
             expected_root = ?block.header().certificate_root,
             "Initiating receipt root verification"
         );
-
-        self.certificate_root_verifications_in_flight
-            .insert(block_hash);
-
+        self.mark_root_in_flight(block_hash, VerificationKind::CertificateRoot);
         vec![Action::VerifyCertificateRoot {
             block_hash,
             expected_root: block.header().certificate_root,
             certificates: block.certificates().to_vec(),
         }]
-    }
-
-    /// Record a receipt root verification result. Returns whether the verification passed.
-    pub fn on_certificate_root_verified(&mut self, block_hash: Hash, valid: bool) -> bool {
-        self.certificate_root_verifications_in_flight
-            .remove(&block_hash);
-
-        if valid {
-            self.verified_certificate_roots.insert(block_hash);
-            debug!(
-                block_hash = ?block_hash,
-                "Certificate root verified successfully"
-            );
-        }
-
-        valid
-    }
-
-    // ─── Local receipt root ─────────────────────────────────────────────
-
-    /// Check if a block needs local receipt root verification before voting.
-    pub fn needs_local_receipt_root_verification(&self, block: &Block) -> bool {
-        if block.certificates().is_empty() {
-            return false;
-        }
-
-        let block_hash = block.hash();
-
-        if self.verified_local_receipt_roots.contains(&block_hash)
-            || self
-                .local_receipt_root_verifications_in_flight
-                .contains(&block_hash)
-        {
-            return false;
-        }
-
-        true
     }
 
     /// Initiate local receipt root verification for a block.
@@ -726,57 +626,17 @@ impl VerificationPipeline {
         receipts: Vec<ReceiptBundle>,
     ) -> Vec<Action> {
         debug!(
-            block_hash = ?block_hash,
+            ?block_hash,
             receipt_count = receipts.len(),
             expected_root = ?block.header().local_receipt_root,
             "Initiating local receipt root verification"
         );
-
-        self.local_receipt_root_verifications_in_flight
-            .insert(block_hash);
-
+        self.mark_root_in_flight(block_hash, VerificationKind::LocalReceiptRoot);
         vec![Action::VerifyLocalReceiptRoot {
             block_hash,
             expected_root: block.header().local_receipt_root,
             receipts,
         }]
-    }
-
-    /// Record a local receipt root verification result. Returns whether the verification passed.
-    pub fn on_local_receipt_root_verified(&mut self, block_hash: Hash, valid: bool) -> bool {
-        self.local_receipt_root_verifications_in_flight
-            .remove(&block_hash);
-
-        if valid {
-            self.verified_local_receipt_roots.insert(block_hash);
-            debug!(
-                block_hash = ?block_hash,
-                "Local receipt root verified successfully"
-            );
-        }
-
-        valid
-    }
-
-    // ─── Provision root ─────────────────────────────────────────────────
-
-    /// Check if a block needs provisions root verification before voting.
-    pub fn needs_provision_root_verification(&self, block: &Block) -> bool {
-        if block.header().provision_root == Hash::ZERO {
-            return false;
-        }
-
-        let block_hash = block.hash();
-
-        if self.verified_provision_roots.contains(&block_hash)
-            || self
-                .provision_root_verifications_in_flight
-                .contains(&block_hash)
-        {
-            return false;
-        }
-
-        true
     }
 
     /// Initiate provisions root verification for a block.
@@ -787,57 +647,17 @@ impl VerificationPipeline {
         manifest: &BlockManifest,
     ) -> Vec<Action> {
         debug!(
-            block_hash = ?block_hash,
+            ?block_hash,
             batch_count = manifest.provision_hashes.len(),
             expected_root = ?block.header().provision_root,
             "Initiating provisions root verification"
         );
-
-        self.provision_root_verifications_in_flight
-            .insert(block_hash);
-
+        self.mark_root_in_flight(block_hash, VerificationKind::ProvisionRoot);
         vec![Action::VerifyProvisionRoot {
             block_hash,
             expected_root: block.header().provision_root,
             batch_hashes: manifest.provision_hashes.clone(),
         }]
-    }
-
-    /// Record a provisions root verification result.
-    pub fn on_provision_root_verified(&mut self, block_hash: Hash, valid: bool) -> bool {
-        self.provision_root_verifications_in_flight
-            .remove(&block_hash);
-
-        if valid {
-            self.verified_provision_roots.insert(block_hash);
-            debug!(
-                block_hash = ?block_hash,
-                "Provision root verified successfully"
-            );
-        }
-
-        valid
-    }
-
-    // ─── Provision tx-roots ─────────────────────────────────────────────
-
-    /// Check if a block needs provision tx-root verification before voting.
-    pub fn needs_provision_tx_root_verification(&self, block: &Block) -> bool {
-        if block.header().provision_tx_roots.is_empty() {
-            return false;
-        }
-
-        let block_hash = block.hash();
-
-        if self.verified_provision_tx_roots.contains(&block_hash)
-            || self
-                .provision_tx_root_verifications_in_flight
-                .contains(&block_hash)
-        {
-            return false;
-        }
-
-        true
     }
 
     /// Initiate provision tx-root verification for a block.
@@ -848,14 +668,11 @@ impl VerificationPipeline {
         topology: &TopologySnapshot,
     ) -> Vec<Action> {
         debug!(
-            block_hash = ?block_hash,
+            ?block_hash,
             target_count = block.header().provision_tx_roots.len(),
             "Initiating provision tx-root verification"
         );
-
-        self.provision_tx_root_verifications_in_flight
-            .insert(block_hash);
-
+        self.mark_root_in_flight(block_hash, VerificationKind::ProvisionTxRoots);
         vec![Action::VerifyProvisionTxRoots {
             block_hash,
             expected: block.header().provision_tx_roots.clone(),
@@ -864,25 +681,134 @@ impl VerificationPipeline {
         }]
     }
 
-    /// Record a provision tx-root verification result.
-    pub fn on_provision_tx_roots_verified(&mut self, block_hash: Hash, valid: bool) -> bool {
-        self.provision_tx_root_verifications_in_flight
-            .remove(&block_hash);
+    // ═══════════════════════════════════════════════════════════════════════
+    // Async verification dispatch
+    // ═══════════════════════════════════════════════════════════════════════
 
-        if valid {
-            self.verified_provision_tx_roots.insert(block_hash);
-            debug!(
-                block_hash = ?block_hash,
-                "Provision tx-roots verified successfully"
-            );
+    /// Initiate every outstanding async verification for a candidate block in
+    /// parallel: state root, transaction root, provision root, certificate
+    /// root, local receipt root, and per-target provision tx roots. Returns
+    /// the actions the caller should dispatch; state-root verification is
+    /// queued into the ready list and drained separately.
+    pub(crate) fn initiate_block_verifications(
+        &mut self,
+        topology: &TopologySnapshot,
+        pending_blocks: &HashMap<Hash, PendingBlock>,
+        block_hash: Hash,
+        block: &Block,
+    ) -> Vec<Action> {
+        let mut actions = Vec::new();
+        let h = block.header();
+
+        if self.needs_state_root_verification(block) {
+            let parent_block_height = h.parent_qc.height;
+            self.initiate_state_root_verification(block_hash, block, parent_block_height);
         }
 
-        valid
+        if self.needs_root(
+            block_hash,
+            VerificationKind::TransactionRoot,
+            block.transaction_count() > 0,
+        ) {
+            actions.extend(self.initiate_transaction_root_verification(block_hash, block));
+        }
+
+        if self.needs_root(
+            block_hash,
+            VerificationKind::ProvisionRoot,
+            h.provision_root != Hash::ZERO,
+        ) {
+            if let Some(pending) = pending_blocks.get(&block_hash) {
+                actions.extend(self.initiate_provision_root_verification(
+                    block_hash,
+                    block,
+                    pending.manifest(),
+                ));
+            }
+        }
+
+        if self.needs_root(
+            block_hash,
+            VerificationKind::CertificateRoot,
+            !block.certificates().is_empty(),
+        ) {
+            actions.extend(self.initiate_certificate_root_verification(block_hash, block));
+        }
+
+        if self.needs_root(
+            block_hash,
+            VerificationKind::LocalReceiptRoot,
+            !block.certificates().is_empty(),
+        ) {
+            let receipts: Vec<_> = block
+                .certificates()
+                .iter()
+                .flat_map(|fw| fw.receipts.iter().cloned())
+                .collect();
+            actions
+                .extend(self.initiate_local_receipt_root_verification(block_hash, block, receipts));
+        }
+
+        if self.needs_root(
+            block_hash,
+            VerificationKind::ProvisionTxRoots,
+            !h.provision_tx_roots.is_empty(),
+        ) {
+            actions
+                .extend(self.initiate_provision_tx_root_verification(block_hash, block, topology));
+        }
+
+        actions
     }
 
     // ═══════════════════════════════════════════════════════════════════════
     // In-flight count verification (synchronous)
     // ═══════════════════════════════════════════════════════════════════════
+
+    /// Classify a vote-path block against the in-flight count tolerance,
+    /// resolving parent-in-flight from the chain view and finalized-tx count
+    /// from the pending block. Callers use the returned [`InFlightCheck`] to
+    /// decide between voting, running verifications only, or aborting.
+    pub(crate) fn classify_vote_in_flight(
+        &mut self,
+        chain: &ChainView<'_>,
+        block_hash: Hash,
+        block: &Block,
+        vote_locked: bool,
+    ) -> InFlightCheck {
+        if vote_locked {
+            return InFlightCheck::SkipVote;
+        }
+
+        let parent_in_flight = if block.header().parent_qc.is_genesis() {
+            0
+        } else if let Some(h) = chain.get_header(block.header().parent_hash) {
+            h.in_flight
+        } else {
+            trace!(
+                block_hash = ?block_hash,
+                "Skipping vote — parent pruned, still verifying for PreparedCommit"
+            );
+            return InFlightCheck::SkipVote;
+        };
+
+        let finalized_tx_count: u32 = chain
+            .pending
+            .get(&block_hash)
+            .map(|p| {
+                p.finalized_waves()
+                    .iter()
+                    .map(|fw| fw.tx_count() as u32)
+                    .sum()
+            })
+            .unwrap_or(0);
+
+        if self.verify_in_flight(block_hash, block, parent_in_flight, finalized_tx_count) {
+            InFlightCheck::Proceed
+        } else {
+            InFlightCheck::Abort
+        }
+    }
 
     /// Verify the proposed in-flight count is deterministically correct.
     ///
@@ -933,13 +859,37 @@ impl VerificationPipeline {
 
     /// Drain state root verifications that are ready to dispatch.
     ///
-    /// Returns entries holding only block identity — `BftState` enriches each
-    /// one with a fresh `parent_state_root` and `finalized_waves` snapshot
-    /// before constructing the public `ReadyStateRootVerification`.
+    /// Each drained entry is enriched at drain time (not when it was queued)
+    /// with a fresh `parent_state_root` and `finalized_waves` snapshot.
+    /// Capturing these eagerly produced a stale-snapshot race: an entry
+    /// deferred before its parent committed would still hold the
+    /// pre-commit `parent_state_root`, causing the dispatched verification
+    /// to compute against the grandparent's base state.
     pub(crate) fn drain_ready_state_root_verifications(
         &mut self,
-    ) -> Vec<PendingStateRootVerification> {
+        chain: &ChainView<'_>,
+    ) -> Vec<ReadyStateRootVerification> {
         std::mem::take(&mut self.ready_state_root_verifications)
+            .into_iter()
+            .map(|pending| {
+                let parent_state_root = chain.parent_state_root(pending.parent_block_hash);
+                let finalized_waves = chain
+                    .pending
+                    .get(&pending.block_hash)
+                    .and_then(|pb| pb.block())
+                    .map(|b| b.certificates().to_vec())
+                    .unwrap_or_default();
+                ReadyStateRootVerification {
+                    block_hash: pending.block_hash,
+                    parent_block_hash: pending.parent_block_hash,
+                    parent_state_root,
+                    parent_block_height: pending.parent_block_height,
+                    expected_root: pending.expected_root,
+                    finalized_waves,
+                    block_height: pending.block_height,
+                }
+            })
+            .collect()
     }
 
     /// Check whether a deferred proposal was unblocked and should be retried.
@@ -1043,9 +993,9 @@ impl VerificationPipeline {
     /// state root as available for child verifications and unblock any
     /// deferred children or proposals waiting on this block.
     ///
-    /// This replaces the persistence-coupling that caused deferred
-    /// verifications to queue behind `BlockPersisted` even when the
-    /// parent's tree was already readable from the overlay.
+    /// Unblocking on commit (rather than persistence) lets deferred
+    /// verifications proceed as soon as the parent's tree is readable from
+    /// the overlay, without waiting for `BlockPersisted`.
     pub fn on_block_committed(&mut self, block_hash: Hash) {
         if !self.verified_state_roots.insert(block_hash) {
             return;
@@ -1073,7 +1023,7 @@ impl VerificationPipeline {
 
     /// Remove verification state for blocks no longer in pending_blocks.
     ///
-    /// Called by BftState::cleanup_old_state() after it has cleaned up
+    /// Called by BftCoordinator::cleanup_old_state() after it has cleaned up
     /// pending_blocks. We use the surviving pending_blocks set to determine
     /// which verification state to keep.
     ///
@@ -1116,29 +1066,10 @@ impl VerificationPipeline {
             }
         }
 
-        self.transaction_root_verifications_in_flight
-            .retain(|hash| pending_blocks.contains_key(hash));
-
-        self.verified_transaction_roots
-            .retain(|hash| pending_blocks.contains_key(hash));
-
-        self.certificate_root_verifications_in_flight
-            .retain(|hash| pending_blocks.contains_key(hash));
-
-        self.verified_certificate_roots
-            .retain(|hash| pending_blocks.contains_key(hash));
-
-        self.local_receipt_root_verifications_in_flight
-            .retain(|hash| pending_blocks.contains_key(hash));
-
-        self.verified_local_receipt_roots
-            .retain(|hash| pending_blocks.contains_key(hash));
-
-        self.provision_root_verifications_in_flight
-            .retain(|hash| pending_blocks.contains_key(hash));
-
-        self.verified_provision_roots
-            .retain(|hash| pending_blocks.contains_key(hash));
+        self.in_flight_roots
+            .retain(|(hash, _)| pending_blocks.contains_key(hash));
+        self.verified_roots
+            .retain(|(hash, _)| pending_blocks.contains_key(hash));
 
         self.verified_in_flight
             .retain(|hash| pending_blocks.contains_key(hash));
@@ -1168,5 +1099,191 @@ impl VerificationPipeline {
             .values()
             .map(|v| v.len())
             .sum()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pending::PendingBlock;
+    use hyperscale_types::{
+        ProposerTimestamp, QuorumCertificate, Round, RoutableTransaction, ShardGroupId, ValidatorId,
+    };
+    use std::collections::BTreeMap;
+    use std::time::Duration;
+
+    fn header(height: BlockHeight, parent_hash: Hash, in_flight: u32) -> BlockHeader {
+        BlockHeader {
+            shard_group_id: ShardGroupId(0),
+            height,
+            parent_hash,
+            parent_qc: QuorumCertificate::genesis(),
+            proposer: ValidatorId(0),
+            timestamp: ProposerTimestamp(0),
+            round: Round::INITIAL,
+            is_fallback: false,
+            state_root: Hash::ZERO,
+            transaction_root: Hash::ZERO,
+            certificate_root: Hash::ZERO,
+            local_receipt_root: Hash::ZERO,
+            provision_root: Hash::ZERO,
+            waves: Vec::new(),
+            provision_tx_roots: BTreeMap::new(),
+            in_flight,
+        }
+    }
+
+    fn block_with(
+        height: BlockHeight,
+        parent_hash: Hash,
+        in_flight: u32,
+        transactions: Vec<Arc<RoutableTransaction>>,
+    ) -> Block {
+        Block::Live {
+            header: header(height, parent_hash, in_flight),
+            transactions,
+            certificates: Vec::new(),
+            provisions: Vec::new(),
+        }
+    }
+
+    fn chain_view<'a>(
+        committed_height: BlockHeight,
+        committed_hash: Hash,
+        latest_qc: Option<&'a QuorumCertificate>,
+        certified: &'a HashMap<Hash, Block>,
+        pending: &'a HashMap<Hash, PendingBlock>,
+    ) -> ChainView<'a> {
+        ChainView {
+            committed_height,
+            committed_hash,
+            committed_state_root: Hash::ZERO,
+            latest_qc,
+            genesis: None,
+            certified,
+            pending,
+        }
+    }
+
+    // ─── classify_vote_in_flight ────────────────────────────────────────
+
+    #[test]
+    fn classify_vote_in_flight_skips_vote_when_locked() {
+        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS);
+        let block = block_with(BlockHeight(1), Hash::ZERO, 0, vec![]);
+        let block_hash = block.hash();
+        let certified = HashMap::new();
+        let pending = HashMap::new();
+        let chain = chain_view(BlockHeight::GENESIS, Hash::ZERO, None, &certified, &pending);
+
+        let out = vp.classify_vote_in_flight(&chain, block_hash, &block, true);
+        assert!(matches!(out, InFlightCheck::SkipVote));
+    }
+
+    #[test]
+    fn classify_vote_in_flight_skips_vote_when_parent_pruned() {
+        // Non-genesis parent QC that isn't in the chain view: parent is
+        // effectively pruned, so we skip voting but still keep verifying.
+        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS);
+        let mut h = header(BlockHeight(5), Hash::from_bytes(b"parent"), 0);
+        let mut parent_qc = QuorumCertificate::genesis();
+        parent_qc.height = BlockHeight(4);
+        parent_qc.block_hash = Hash::from_bytes(b"parent");
+        h.parent_qc = parent_qc;
+        let block = Block::Live {
+            header: h,
+            transactions: Vec::new(),
+            certificates: Vec::new(),
+            provisions: Vec::new(),
+        };
+        let block_hash = block.hash();
+        let certified = HashMap::new();
+        let pending = HashMap::new();
+        let chain = chain_view(BlockHeight(3), Hash::ZERO, None, &certified, &pending);
+
+        let out = vp.classify_vote_in_flight(&chain, block_hash, &block, false);
+        assert!(matches!(out, InFlightCheck::SkipVote));
+    }
+
+    #[test]
+    fn classify_vote_in_flight_proceeds_when_genesis_parent_and_counts_match() {
+        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS);
+        let block = block_with(BlockHeight(1), Hash::ZERO, 0, vec![]);
+        let block_hash = block.hash();
+        let certified = HashMap::new();
+        let pending = HashMap::new();
+        let chain = chain_view(BlockHeight::GENESIS, Hash::ZERO, None, &certified, &pending);
+
+        let out = vp.classify_vote_in_flight(&chain, block_hash, &block, false);
+        assert!(matches!(out, InFlightCheck::Proceed));
+    }
+
+    #[test]
+    fn classify_vote_in_flight_aborts_on_in_flight_mismatch() {
+        // Genesis parent → parent_in_flight = 0. Block claims in_flight = 5
+        // with 0 transactions: proposed doesn't match expected → Abort.
+        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS);
+        let block = block_with(BlockHeight(1), Hash::ZERO, 5, vec![]);
+        let block_hash = block.hash();
+        let certified = HashMap::new();
+        let pending = HashMap::new();
+        let chain = chain_view(BlockHeight::GENESIS, Hash::ZERO, None, &certified, &pending);
+
+        let out = vp.classify_vote_in_flight(&chain, block_hash, &block, false);
+        assert!(matches!(out, InFlightCheck::Abort));
+    }
+
+    // ─── drain_ready_state_root_verifications ───────────────────────────
+
+    #[test]
+    fn drain_ready_state_root_verifications_returns_empty_when_nothing_ready() {
+        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS);
+        let certified = HashMap::new();
+        let pending = HashMap::new();
+        let chain = chain_view(BlockHeight::GENESIS, Hash::ZERO, None, &certified, &pending);
+
+        let out = vp.drain_ready_state_root_verifications(&chain);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn drain_ready_state_root_verifications_enriches_from_chain_view() {
+        // Parent is at GENESIS height ≤ last_persisted_height, so initiate
+        // queues this entry directly into ready_state_root_verifications.
+        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS);
+        let parent_hash = Hash::from_bytes(b"parent");
+        let block = block_with(BlockHeight(1), parent_hash, 0, vec![]);
+        let block_hash = block.hash();
+
+        vp.initiate_state_root_verification(block_hash, &block, BlockHeight::GENESIS);
+
+        let pb = PendingBlock::from_complete_block(&block, vec![], vec![], Duration::ZERO);
+        let mut pending_with_block = HashMap::new();
+        pending_with_block.insert(block_hash, pb);
+        let certified = HashMap::new();
+        let chain = chain_view(
+            BlockHeight::GENESIS,
+            Hash::ZERO,
+            None,
+            &certified,
+            &pending_with_block,
+        );
+
+        let out = vp.drain_ready_state_root_verifications(&chain);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].block_hash, block_hash);
+        assert_eq!(out[0].parent_block_hash, parent_hash);
+        assert_eq!(out[0].parent_block_height, BlockHeight::GENESIS);
+
+        // Draining again without another initiate yields nothing.
+        let empty_pending: HashMap<Hash, PendingBlock> = HashMap::new();
+        let chain2 = chain_view(
+            BlockHeight::GENESIS,
+            Hash::ZERO,
+            None,
+            &certified,
+            &empty_pending,
+        );
+        assert!(vp.drain_ready_state_root_verifications(&chain2).is_empty());
     }
 }

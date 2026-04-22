@@ -1084,10 +1084,6 @@ impl MetricsRecorder for PrometheusRecorder {
             .set(m.bft_pending_commits_awaiting_data as f64);
         self.metrics
             .memory_bft
-            .with_label_values(&["remote_headers"])
-            .set(m.bft_remote_headers as f64);
-        self.metrics
-            .memory_bft
             .with_label_values(&["voted_heights"])
             .set(m.bft_voted_heights as f64);
         self.metrics

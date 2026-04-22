@@ -18,7 +18,7 @@ use hyperscale_types::{
 ///
 /// ```rust
 /// use hyperscale_test_helpers::{TestCommittee, fixtures};
-/// use hyperscale_types::{Hash, BlockHeight, ShardGroupId, verify_bls12381_v1};
+/// use hyperscale_types::{Hash, BlockHeight, Round, ShardGroupId, verify_bls12381_v1};
 ///
 /// let committee = TestCommittee::new(4, 42);
 /// let vote = fixtures::make_signed_block_vote(
@@ -26,7 +26,7 @@ use hyperscale_types::{
 ///     0,
 ///     Hash::from_bytes(b"block"),
 ///     BlockHeight(1),
-///     0,
+///     Round(0),
 ///     ShardGroupId(0),
 /// );
 ///
@@ -62,7 +62,7 @@ pub fn make_signed_block_vote(
 ///
 /// ```rust
 /// use hyperscale_test_helpers::{TestCommittee, fixtures};
-/// use hyperscale_types::{Hash, BlockHeight, ShardGroupId, Bls12381G1PublicKey, batch_verify_bls_same_message};
+/// use hyperscale_types::{Hash, BlockHeight, Round, ShardGroupId, Bls12381G1PublicKey, batch_verify_bls_same_message};
 ///
 /// let committee = TestCommittee::new(4, 42);
 /// let qc = fixtures::make_signed_qc(
@@ -70,7 +70,7 @@ pub fn make_signed_block_vote(
 ///     &[0, 1, 2], // 3 voters
 ///     Hash::from_bytes(b"block"),
 ///     BlockHeight(1),
-///     0,
+///     Round(0),
 ///     Hash::from_bytes(b"parent"),
 ///     ShardGroupId(0),
 /// );

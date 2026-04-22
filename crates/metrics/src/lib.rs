@@ -65,8 +65,6 @@ pub struct MemoryMetrics {
     pub bft_pending_commits: usize,
     /// Commits waiting for block data (header/txs).
     pub bft_pending_commits_awaiting_data: usize,
-    /// Remote shard headers for merkle proof validation.
-    pub bft_remote_headers: usize,
     /// Heights we have voted on (equivocation guard).
     pub bft_voted_heights: usize,
     /// Votes received per (height, validator) pair.

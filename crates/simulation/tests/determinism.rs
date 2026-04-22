@@ -743,7 +743,7 @@ fn test_round_reset_on_commit() {
     runner.run_until(Duration::from_secs(3));
 
     // Check committed heights and BFT state
-    // With HotStuff-2 style, round is tracked in BftState via view()
+    // With HotStuff-2 style, round is tracked in BftCoordinator via view()
     for node_idx in 0..4u32 {
         let node = runner.node(node_idx).expect("Node should exist");
         let committed = node.bft().committed_height();
@@ -871,7 +871,7 @@ fn test_block_commit_diagnostic() {
 ///
 /// Runs the same simulation twice and verifies that the
 /// round numbers match exactly at every node.
-/// With HotStuff-2 style, round is tracked in BftState via view().
+/// With HotStuff-2 style, round is tracked in BftCoordinator via view().
 #[test]
 fn test_round_determinism() {
     let config = test_network_config();

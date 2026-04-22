@@ -26,13 +26,14 @@ pub struct QcVerificationResult {
 
 /// Verify block votes and build a quorum certificate if quorum is reached.
 ///
-/// Algorithm:
-/// 1. Start with already-verified votes and their signatures
-/// 2. Batch verify new votes using same-message BLS optimization
-/// 3. If batch fails, fall back to individual signature verification
-/// 4. Check if verified voting power meets quorum threshold
-/// 5. If quorum: aggregate signatures, build signer bitfield, compute weighted timestamp
-/// 6. Return QC + empty verified_votes on success, or None + all verified_votes if no quorum
+/// Thin composition of [`verify_vote_batch`] (signature verification) and
+/// [`build_qc_from_verified`] (aggregation + bitfield + timestamp) with the
+/// quorum-threshold check between them. Returns an empty `verified_votes`
+/// vec on success and the full verified set on failure so the caller can
+/// accumulate across rounds.
+///
+/// Called from the dispatch layer via `Action::VerifyAndBuildQuorumCertificate`;
+/// the split helpers exist for focused unit testing of each phase.
 #[allow(clippy::too_many_arguments)]
 pub fn verify_and_build_qc(
     block_hash: Hash,
@@ -46,12 +47,58 @@ pub fn verify_and_build_qc(
 ) -> QcVerificationResult {
     let signing_message =
         hyperscale_types::block_vote_message(shard_group_id, height, round, &block_hash);
-    // Start with already-verified votes (e.g., our own vote)
-    let mut all_verified: Vec<(usize, BlockVote, u64)> = already_verified;
-    let mut all_signatures: Vec<Bls12381G2Signature> =
-        all_verified.iter().map(|(_, v, _)| v.signature).collect();
 
-    // Extract signatures and public keys from votes to verify
+    let all_verified = verify_vote_batch(
+        block_hash,
+        &signing_message,
+        votes_to_verify,
+        already_verified,
+    );
+
+    let verified_power: u64 = all_verified.iter().map(|(_, _, power)| power).sum();
+    if all_verified.is_empty() || !VotePower::has_quorum(verified_power, total_voting_power) {
+        return QcVerificationResult {
+            block_hash,
+            qc: None,
+            verified_votes: all_verified,
+        };
+    }
+
+    let qc = build_qc_from_verified(
+        block_hash,
+        shard_group_id,
+        height,
+        round,
+        parent_block_hash,
+        &all_verified,
+    );
+
+    let return_votes = if qc.is_none() { all_verified } else { vec![] };
+    QcVerificationResult {
+        block_hash,
+        qc,
+        verified_votes: return_votes,
+    }
+}
+
+/// Verify a batch of vote signatures, appending the valid ones to
+/// `already_verified` and returning the combined verified set.
+///
+/// Uses the same-message BLS batch check for speed; on batch failure (one
+/// or more bad signatures) falls back to individual verification so a
+/// single forged vote doesn't poison the whole batch.
+pub fn verify_vote_batch(
+    block_hash: Hash,
+    signing_message: &[u8],
+    votes_to_verify: Vec<(usize, BlockVote, Bls12381G1PublicKey, u64)>,
+    already_verified: Vec<(usize, BlockVote, u64)>,
+) -> Vec<(usize, BlockVote, u64)> {
+    let mut all_verified = already_verified;
+
+    if votes_to_verify.is_empty() {
+        return all_verified;
+    }
+
     let signatures: Vec<Bls12381G2Signature> = votes_to_verify
         .iter()
         .map(|(_, v, _, _)| v.signature)
@@ -59,104 +106,87 @@ pub fn verify_and_build_qc(
     let public_keys: Vec<Bls12381G1PublicKey> =
         votes_to_verify.iter().map(|(_, _, pk, _)| *pk).collect();
 
-    // Batch verify all new signatures (same message optimization)
-    let batch_valid = if votes_to_verify.is_empty() {
-        true
-    } else {
-        batch_verify_bls_same_message(&signing_message, &signatures, &public_keys)
-    };
-
-    if batch_valid {
-        // Happy path: all new signatures valid, add them to verified set
+    if batch_verify_bls_same_message(signing_message, &signatures, &public_keys) {
         for (idx, vote, _, power) in votes_to_verify {
-            all_signatures.push(vote.signature);
             all_verified.push((idx, vote, power));
         }
-    } else {
-        // Some signatures invalid - verify individually to find valid ones
-        tracing::warn!(
-            block_hash = ?block_hash,
-            vote_count = votes_to_verify.len(),
-            "Batch vote verification failed, falling back to individual verification"
-        );
+        return all_verified;
+    }
 
-        for (idx, vote, pk, power) in &votes_to_verify {
-            if verify_bls12381_v1(&signing_message, pk, &vote.signature) {
-                all_signatures.push(vote.signature);
-                all_verified.push((*idx, vote.clone(), *power));
-            } else {
-                tracing::warn!(
-                    voter = ?vote.voter,
-                    block_hash = ?block_hash,
-                    "Invalid vote signature detected"
-                );
-            }
+    tracing::warn!(
+        ?block_hash,
+        vote_count = votes_to_verify.len(),
+        "Batch vote verification failed, falling back to individual verification"
+    );
+
+    for (idx, vote, pk, power) in votes_to_verify {
+        if verify_bls12381_v1(signing_message, &pk, &vote.signature) {
+            all_verified.push((idx, vote, power));
+        } else {
+            tracing::warn!(
+                voter = ?vote.voter,
+                ?block_hash,
+                "Invalid vote signature detected"
+            );
         }
     }
 
-    let verified_power: u64 = all_verified.iter().map(|(_, _, power)| power).sum();
+    all_verified
+}
 
-    // Check if we have quorum with all verified votes
-    if VotePower::has_quorum(verified_power, total_voting_power) && !all_signatures.is_empty() {
-        // Build QC - aggregate signatures
-        let qc = match Bls12381G2Signature::aggregate(&all_signatures, true) {
-            Ok(aggregated_signature) => {
-                // Sort votes by committee index for deterministic bitfield
-                let mut sorted_votes = all_verified.clone();
-                sorted_votes.sort_by_key(|(idx, _, _)| *idx);
+/// Aggregate a verified vote set into a [`QuorumCertificate`]. Sorts by
+/// committee index so the signer bitfield matches the aggregation order
+/// the verifier will use, and computes the stake-weighted timestamp from
+/// the vote timestamps.
+///
+/// Returns `None` only if BLS aggregation itself fails. Caller must ensure
+/// `verified_votes` is non-empty and that quorum has been reached.
+pub fn build_qc_from_verified(
+    block_hash: Hash,
+    shard_group_id: ShardGroupId,
+    height: BlockHeight,
+    round: Round,
+    parent_block_hash: Hash,
+    verified_votes: &[(usize, BlockVote, u64)],
+) -> Option<QuorumCertificate> {
+    let mut sorted: Vec<_> = verified_votes.to_vec();
+    sorted.sort_by_key(|(idx, _, _)| *idx);
 
-                // Build signers bitfield and calculate weighted timestamp
-                let max_idx = sorted_votes
-                    .iter()
-                    .map(|(idx, _, _)| *idx)
-                    .max()
-                    .unwrap_or(0);
-                let mut signers = SignerBitfield::new(max_idx + 1);
-                let mut timestamp_weight_sum: u128 = 0;
-
-                for (idx, vote, power) in &sorted_votes {
-                    signers.set(*idx);
-                    timestamp_weight_sum += vote.timestamp.as_millis() as u128 * *power as u128;
-                }
-
-                let weighted_timestamp_ms = if verified_power == 0 {
-                    0
-                } else {
-                    (timestamp_weight_sum / verified_power as u128) as u64
-                };
-
-                Some(QuorumCertificate {
-                    block_hash,
-                    shard_group_id,
-                    height,
-                    parent_block_hash,
-                    round,
-                    aggregated_signature,
-                    signers,
-                    weighted_timestamp: WeightedTimestamp(weighted_timestamp_ms),
-                })
-            }
-            Err(e) => {
-                tracing::warn!("Failed to aggregate BLS signatures for QC: {}", e);
-                None
-            }
-        };
-
-        // Return verified_votes only when QC build failed (for accumulation)
-        let return_votes = if qc.is_none() { all_verified } else { vec![] };
-        QcVerificationResult {
-            block_hash,
-            qc,
-            verified_votes: return_votes,
+    let signatures: Vec<Bls12381G2Signature> = sorted.iter().map(|(_, v, _)| v.signature).collect();
+    let aggregated_signature = match Bls12381G2Signature::aggregate(&signatures, true) {
+        Ok(sig) => sig,
+        Err(e) => {
+            tracing::warn!("Failed to aggregate BLS signatures for QC: {}", e);
+            return None;
         }
-    } else {
-        // No quorum - return all verified votes for later accumulation
-        QcVerificationResult {
-            block_hash,
-            qc: None,
-            verified_votes: all_verified,
-        }
+    };
+
+    let max_idx = sorted.iter().map(|(idx, _, _)| *idx).max().unwrap_or(0);
+    let mut signers = SignerBitfield::new(max_idx + 1);
+    let mut timestamp_weight_sum: u128 = 0;
+    let mut verified_power: u64 = 0;
+    for (idx, vote, power) in &sorted {
+        signers.set(*idx);
+        timestamp_weight_sum += vote.timestamp.as_millis() as u128 * *power as u128;
+        verified_power += *power;
     }
+
+    let weighted_timestamp_ms = if verified_power == 0 {
+        0
+    } else {
+        (timestamp_weight_sum / verified_power as u128) as u64
+    };
+
+    Some(QuorumCertificate {
+        block_hash,
+        shard_group_id,
+        height,
+        parent_block_hash,
+        round,
+        aggregated_signature,
+        signers,
+        weighted_timestamp: WeightedTimestamp(weighted_timestamp_ms),
+    })
 }
 
 /// Verify a quorum certificate's aggregated BLS signature.
@@ -441,5 +471,363 @@ pub fn build_proposal<S: ChainWriter + SubstateStore>(
         block,
         block_hash,
         prepared_commit: Some(prepared),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hyperscale_types::{
+        compute_certificate_root, compute_local_receipt_root, compute_provision_root,
+        compute_transaction_root, generate_bls_keypair, Bls12381G1PrivateKey, ProposerTimestamp,
+        ReceiptBundle,
+    };
+
+    fn shard() -> ShardGroupId {
+        ShardGroupId(0)
+    }
+
+    fn make_vote(
+        keys: &[Bls12381G1PrivateKey],
+        voter_index: usize,
+        block_hash: Hash,
+        height: BlockHeight,
+        round: Round,
+        timestamp_ms: u64,
+    ) -> BlockVote {
+        BlockVote::new(
+            block_hash,
+            shard(),
+            height,
+            round,
+            ValidatorId(voter_index as u64),
+            &keys[voter_index],
+            ProposerTimestamp(timestamp_ms),
+        )
+    }
+
+    fn keypairs(n: usize) -> Vec<Bls12381G1PrivateKey> {
+        (0..n).map(|_| generate_bls_keypair()).collect()
+    }
+
+    // ─── verify_vote_batch ──────────────────────────────────────────────
+
+    #[test]
+    fn verify_vote_batch_empty_input_returns_already_verified_unchanged() {
+        let keys = keypairs(2);
+        let block_hash = Hash::from_bytes(b"block");
+        let v = make_vote(&keys, 0, block_hash, BlockHeight(1), Round::INITIAL, 1000);
+        let already = vec![(0usize, v, 1u64)];
+        let out = verify_vote_batch(block_hash, b"msg", Vec::new(), already.clone());
+        assert_eq!(out.len(), already.len());
+    }
+
+    #[test]
+    fn verify_vote_batch_accepts_all_valid_signatures() {
+        let keys = keypairs(3);
+        let block_hash = Hash::from_bytes(b"b1");
+        let height = BlockHeight(1);
+        let round = Round::INITIAL;
+        let msg = hyperscale_types::block_vote_message(shard(), height, round, &block_hash);
+
+        let to_verify: Vec<_> = (0..3)
+            .map(|i| {
+                let vote = make_vote(&keys, i, block_hash, height, round, 1000);
+                (i, vote, keys[i].public_key(), 1u64)
+            })
+            .collect();
+
+        let out = verify_vote_batch(block_hash, &msg, to_verify, Vec::new());
+        assert_eq!(out.len(), 3);
+    }
+
+    #[test]
+    fn verify_vote_batch_falls_back_when_one_signature_bad() {
+        let keys = keypairs(3);
+        let block_hash = Hash::from_bytes(b"b1");
+        let height = BlockHeight(1);
+        let round = Round::INITIAL;
+        let msg = hyperscale_types::block_vote_message(shard(), height, round, &block_hash);
+
+        // Vote 1's signature is replaced by a signature over a different block.
+        let other_hash = Hash::from_bytes(b"other");
+        let mut bad_vote = make_vote(&keys, 1, block_hash, height, round, 1000);
+        let bad_signing_vote = make_vote(&keys, 1, other_hash, height, round, 1000);
+        bad_vote.signature = bad_signing_vote.signature;
+
+        let to_verify = vec![
+            (
+                0usize,
+                make_vote(&keys, 0, block_hash, height, round, 1000),
+                keys[0].public_key(),
+                1u64,
+            ),
+            (1usize, bad_vote, keys[1].public_key(), 1u64),
+            (
+                2usize,
+                make_vote(&keys, 2, block_hash, height, round, 1000),
+                keys[2].public_key(),
+                1u64,
+            ),
+        ];
+
+        let out = verify_vote_batch(block_hash, &msg, to_verify, Vec::new());
+        let indices: Vec<_> = out.iter().map(|(i, _, _)| *i).collect();
+        assert_eq!(indices, vec![0, 2]);
+    }
+
+    #[test]
+    fn verify_vote_batch_rejects_all_when_wrong_message() {
+        let keys = keypairs(2);
+        let block_hash = Hash::from_bytes(b"b1");
+        let wrong_msg = b"unrelated";
+        let to_verify: Vec<_> = (0..2)
+            .map(|i| {
+                let vote = make_vote(&keys, i, block_hash, BlockHeight(1), Round::INITIAL, 1000);
+                (i, vote, keys[i].public_key(), 1u64)
+            })
+            .collect();
+        let out = verify_vote_batch(block_hash, wrong_msg, to_verify, Vec::new());
+        assert!(out.is_empty());
+    }
+
+    // ─── build_qc_from_verified ─────────────────────────────────────────
+
+    #[test]
+    fn build_qc_from_verified_produces_round_trippable_qc() {
+        let keys = keypairs(3);
+        let block_hash = Hash::from_bytes(b"block");
+        let height = BlockHeight(5);
+        let round = Round::INITIAL;
+        let parent = Hash::from_bytes(b"parent");
+
+        let verified: Vec<_> = (0..3)
+            .map(|i| {
+                let vote = make_vote(&keys, i, block_hash, height, round, 1000);
+                (i, vote, 1u64)
+            })
+            .collect();
+
+        let qc = build_qc_from_verified(block_hash, shard(), height, round, parent, &verified)
+            .expect("build_qc should succeed");
+
+        let pubs: Vec<_> = keys.iter().map(|k| k.public_key()).collect();
+        assert!(verify_qc_signature(&qc, &pubs));
+        assert_eq!(qc.block_hash, block_hash);
+        assert_eq!(qc.height, height);
+        assert_eq!(qc.parent_block_hash, parent);
+        assert_eq!(qc.signer_count(), 3);
+    }
+
+    #[test]
+    fn build_qc_from_verified_sorts_signers_bitfield_deterministically() {
+        let keys = keypairs(4);
+        let block_hash = Hash::from_bytes(b"b");
+        let verified: Vec<_> = [2, 0, 3]
+            .into_iter()
+            .map(|i: usize| {
+                let vote = make_vote(&keys, i, block_hash, BlockHeight(1), Round::INITIAL, 1000);
+                (i, vote, 1u64)
+            })
+            .collect();
+
+        let qc = build_qc_from_verified(
+            block_hash,
+            shard(),
+            BlockHeight(1),
+            Round::INITIAL,
+            Hash::ZERO,
+            &verified,
+        )
+        .unwrap();
+
+        let set: Vec<_> = qc.signers.set_indices().collect();
+        assert_eq!(set, vec![0, 2, 3]);
+    }
+
+    #[test]
+    fn build_qc_from_verified_computes_stake_weighted_timestamp() {
+        let keys = keypairs(3);
+        let block_hash = Hash::from_bytes(b"b");
+        // Votes with different timestamps and powers; weighted mean = (1000*1 + 2000*2 + 3000*3) / 6 = 14000/6 ≈ 2333.
+        let verified = vec![
+            (
+                0,
+                make_vote(&keys, 0, block_hash, BlockHeight(1), Round::INITIAL, 1000),
+                1u64,
+            ),
+            (
+                1,
+                make_vote(&keys, 1, block_hash, BlockHeight(1), Round::INITIAL, 2000),
+                2u64,
+            ),
+            (
+                2,
+                make_vote(&keys, 2, block_hash, BlockHeight(1), Round::INITIAL, 3000),
+                3u64,
+            ),
+        ];
+
+        let qc = build_qc_from_verified(
+            block_hash,
+            shard(),
+            BlockHeight(1),
+            Round::INITIAL,
+            Hash::ZERO,
+            &verified,
+        )
+        .unwrap();
+
+        assert_eq!(qc.weighted_timestamp.as_millis(), 2333);
+    }
+
+    // ─── verify_and_build_qc (composition) ──────────────────────────────
+
+    #[test]
+    fn verify_and_build_qc_returns_none_without_quorum() {
+        // 3 votes of power 1 each, total 4 → 3/4 = quorum only if 2f+1 where f=1 (3/4 OK).
+        // Use total_voting_power=10 to force failure (3 < 2/3*10 = 6.67).
+        let keys = keypairs(3);
+        let block_hash = Hash::from_bytes(b"b");
+        let height = BlockHeight(1);
+        let round = Round::INITIAL;
+        let to_verify: Vec<_> = (0..3)
+            .map(|i| {
+                let vote = make_vote(&keys, i, block_hash, height, round, 1000);
+                (i, vote, keys[i].public_key(), 1u64)
+            })
+            .collect();
+
+        let result = verify_and_build_qc(
+            block_hash,
+            shard(),
+            height,
+            round,
+            Hash::ZERO,
+            to_verify,
+            Vec::new(),
+            10,
+        );
+
+        assert!(result.qc.is_none());
+        assert_eq!(result.verified_votes.len(), 3);
+    }
+
+    #[test]
+    fn verify_and_build_qc_builds_qc_when_quorum_reached() {
+        let keys = keypairs(4);
+        let block_hash = Hash::from_bytes(b"b");
+        let height = BlockHeight(1);
+        let round = Round::INITIAL;
+        let to_verify: Vec<_> = (0..3)
+            .map(|i| {
+                let vote = make_vote(&keys, i, block_hash, height, round, 1000);
+                (i, vote, keys[i].public_key(), 1u64)
+            })
+            .collect();
+
+        let result = verify_and_build_qc(
+            block_hash,
+            shard(),
+            height,
+            round,
+            Hash::ZERO,
+            to_verify,
+            Vec::new(),
+            4,
+        );
+
+        let qc = result.qc.expect("quorum reached, QC expected");
+        assert_eq!(qc.signer_count(), 3);
+        assert!(result.verified_votes.is_empty());
+    }
+
+    // ─── verify_qc_signature ────────────────────────────────────────────
+
+    #[test]
+    fn verify_qc_signature_rejects_empty_signer_set() {
+        let keys = keypairs(3);
+        let block_hash = Hash::from_bytes(b"b");
+        let verified: Vec<_> = (0..3)
+            .map(|i| {
+                let vote = make_vote(&keys, i, block_hash, BlockHeight(1), Round::INITIAL, 1000);
+                (i, vote, 1u64)
+            })
+            .collect();
+        let mut qc = build_qc_from_verified(
+            block_hash,
+            shard(),
+            BlockHeight(1),
+            Round::INITIAL,
+            Hash::ZERO,
+            &verified,
+        )
+        .unwrap();
+        qc.signers = SignerBitfield::new(3);
+
+        let pubs: Vec<_> = keys.iter().map(|k| k.public_key()).collect();
+        assert!(!verify_qc_signature(&qc, &pubs));
+    }
+
+    #[test]
+    fn verify_qc_signature_rejects_wrong_public_keys() {
+        let keys = keypairs(3);
+        let block_hash = Hash::from_bytes(b"b");
+        let verified: Vec<_> = (0..3)
+            .map(|i| {
+                let vote = make_vote(&keys, i, block_hash, BlockHeight(1), Round::INITIAL, 1000);
+                (i, vote, 1u64)
+            })
+            .collect();
+        let qc = build_qc_from_verified(
+            block_hash,
+            shard(),
+            BlockHeight(1),
+            Round::INITIAL,
+            Hash::ZERO,
+            &verified,
+        )
+        .unwrap();
+
+        let wrong_keys = keypairs(3);
+        let wrong_pubs: Vec<_> = wrong_keys.iter().map(|k| k.public_key()).collect();
+        assert!(!verify_qc_signature(&qc, &wrong_pubs));
+    }
+
+    // ─── root verifiers ─────────────────────────────────────────────────
+
+    #[test]
+    fn verify_transaction_root_accepts_matching_root_and_rejects_otherwise() {
+        let txs: Vec<Arc<RoutableTransaction>> = Vec::new();
+        let root = compute_transaction_root(&txs);
+        assert!(verify_transaction_root(root, &txs));
+        assert!(!verify_transaction_root(Hash::from_bytes(b"wrong"), &txs));
+    }
+
+    #[test]
+    fn verify_provision_root_matches_compute_provision_root() {
+        let hashes = vec![Hash::from_bytes(b"a"), Hash::from_bytes(b"b")];
+        let root = compute_provision_root(&hashes);
+        assert!(verify_provision_root(root, &hashes));
+        assert!(!verify_provision_root(Hash::from_bytes(b"nope"), &hashes));
+    }
+
+    #[test]
+    fn verify_certificate_root_matches_compute_certificate_root() {
+        let certs: Vec<Arc<FinalizedWave>> = Vec::new();
+        let root = compute_certificate_root(&certs);
+        assert!(verify_certificate_root(root, &certs));
+        assert!(!verify_certificate_root(Hash::from_bytes(b"wrong"), &certs));
+    }
+
+    #[test]
+    fn verify_local_receipt_root_matches_compute_local_receipt_root() {
+        let receipts: Vec<ReceiptBundle> = Vec::new();
+        let root = compute_local_receipt_root(&receipts);
+        assert!(verify_local_receipt_root(root, &receipts));
+        assert!(!verify_local_receipt_root(
+            Hash::from_bytes(b"wrong"),
+            &receipts
+        ));
     }
 }

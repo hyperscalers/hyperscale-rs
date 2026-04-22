@@ -8,7 +8,7 @@
 //!
 //! ```rust
 //! use hyperscale_test_helpers::{TestCommittee, fixtures};
-//! use hyperscale_types::{Hash, BlockHeight, ShardGroupId, verify_bls12381_v1};
+//! use hyperscale_types::{Hash, BlockHeight, Round, ShardGroupId, verify_bls12381_v1};
 //!
 //! // Create a committee of 4 validators with deterministic keys
 //! let committee = TestCommittee::new(4, 42);
@@ -20,7 +20,7 @@
 //!     0, // voter index
 //!     block_hash,
 //!     BlockHeight(1),
-//!     0, // round
+//!     Round(0),
 //!     ShardGroupId(0),
 //! );
 //!
