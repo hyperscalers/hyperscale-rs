@@ -343,20 +343,35 @@ impl WaveState {
             .all(|h| self.execution_results.contains_key(h) || self.explicit_aborts.contains(h))
     }
 
-    /// True if, for every non-aborted tx in the wave, local execution has
-    /// produced a result. Aborted txs (via pre-dispatch conflict, explicit
-    /// intent, or cert-attested `Aborted` outcome) don't require a receipt.
+    /// True if, for every non-aborted outcome in the local EC, this validator
+    /// has produced a matching local receipt. Aborted outcomes need no receipt.
     ///
-    /// Gates [`Self::is_complete`] so `finalize_wave` can't run while any
-    /// non-aborted tx's receipt is still in flight from the engine —
-    /// without this check, a cross-shard wave whose local EC arrives
-    /// before this validator's engine results would finalize with missing
-    /// receipts.
+    /// Gates [`Self::is_complete`] so `finalize_wave` can't produce a
+    /// [`FinalizedWave`] that fails
+    /// [`FinalizedWave::validate_receipts_against_ec`]. The check mirrors that
+    /// invariant: a receipt is needed exactly for the outcomes the EC attests
+    /// as `Executed`. When this validator's local abort decision disagrees
+    /// with the quorum's EC (e.g. its conflict detector aborted a tx peers
+    /// executed), the gate blocks here rather than synthesizing a
+    /// FinalizedWave with missing receipts. Recovery flows through the
+    /// existing peer-fetch path.
+    ///
+    /// Returns false if the local EC hasn't arrived yet; `local_ec_emitted`
+    /// is checked separately by [`Self::is_complete`] for the same reason.
+    ///
+    /// [`FinalizedWave`]: hyperscale_types::FinalizedWave
+    /// [`FinalizedWave::validate_receipts_against_ec`]:
+    ///     hyperscale_types::FinalizedWave::validate_receipts_against_ec
     fn has_local_receipts_for_non_aborted(&self) -> bool {
-        self.tx_hashes.iter().all(|h| {
-            self.tracker_aborted.contains(h)
-                || self.explicit_aborts.contains(h)
-                || self.execution_results.contains_key(h)
+        let Some(local_ec) = self
+            .execution_certificates
+            .iter()
+            .find(|ec| ec.wave_id == self.wave_id)
+        else {
+            return false;
+        };
+        local_ec.tx_outcomes.iter().all(|outcome| {
+            outcome.is_aborted() || self.execution_receipts.contains_key(&outcome.tx_hash)
         })
     }
 
@@ -653,7 +668,7 @@ mod tests {
     use super::*;
     use hyperscale_types::{
         test_utils::{test_node, test_transaction_with_nodes},
-        Bls12381G2Signature, GlobalReceiptHash, SignerBitfield,
+        Bls12381G2Signature, GlobalReceiptHash, LocalReceipt, SignerBitfield, TransactionOutcome,
     };
 
     const WAVE_START: BlockHeight = BlockHeight(10);
@@ -709,6 +724,27 @@ mod tests {
             receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(b"r")),
             success,
         }
+    }
+
+    /// Record a result + matching receipt, as the production path does
+    /// via `on_execution_batch_completed`. Tests that need execution to
+    /// look "real" should use this rather than `record_execution_result`
+    /// alone — the `is_complete` gate keys off `execution_receipts`.
+    fn record_executed(w: &mut WaveState, tx_hash: TxHash, success: bool) {
+        w.record_execution_result(tx_hash, executed(success));
+        w.record_receipt(ReceiptBundle {
+            tx_hash,
+            local_receipt: Arc::new(LocalReceipt {
+                outcome: if success {
+                    TransactionOutcome::Success
+                } else {
+                    TransactionOutcome::Failure
+                },
+                database_updates: Default::default(),
+                application_events: vec![],
+            }),
+            execution_output: None,
+        });
     }
 
     fn make_ec(
@@ -860,8 +896,8 @@ mod tests {
         // Fully provision and execute locally.
         w.mark_tx_provisioned(h0, ts_for(WAVE_START + 1));
         w.mark_tx_provisioned(h1, ts_for(WAVE_START + 1));
-        w.record_execution_result(h0, executed(true));
-        w.record_execution_result(h1, executed(true));
+        record_executed(&mut w, h0, true);
+        record_executed(&mut w, h1, true);
 
         // Remote-only EC doesn't complete.
         let ec_remote = make_ec(w.wave_id(), ShardGroupId(1), &[h0, h1], true);
@@ -904,11 +940,11 @@ mod tests {
         );
 
         // Engine finishes — first result not yet enough.
-        w.record_execution_result(h0, executed(true));
+        record_executed(&mut w, h0, true);
         assert!(!w.is_complete());
 
         // Second result — now fully resolvable.
-        w.record_execution_result(h1, executed(true));
+        record_executed(&mut w, h1, true);
         assert!(w.is_complete());
     }
 
@@ -930,6 +966,33 @@ mod tests {
         assert!(
             w.is_complete(),
             "all-aborted wave resolves without local engine results"
+        );
+    }
+
+    #[test]
+    fn is_complete_false_when_explicit_abort_disagrees_with_local_ec() {
+        // This validator's conflict detector aborted h0 locally (e.g. because
+        // it was behind on commits and saw different prior provisions). The
+        // quorum executed h0 and aggregated a local EC attesting Executed.
+        // Without a receipt-vs-EC gate, finalize_wave would build a
+        // FinalizedWave missing h0's receipt — which later fails
+        // `validate_receipts_against_ec` on any peer. The gate must block
+        // and let the existing peer-fetch path recover.
+        let mut w = make_cross_shard_wave(2);
+        let h0 = w.tx_hashes()[0];
+        let h1 = w.tx_hashes()[1];
+
+        // h0: local explicit abort. h1: executed, receipt recorded.
+        w.record_abort(h0, ts_for(WAVE_START + 1));
+        record_executed(&mut w, h1, true);
+
+        // Local EC disagrees: attests BOTH executed.
+        let ec_local = make_ec(w.wave_id(), ShardGroupId(0), &[h0, h1], true);
+        w.add_execution_certificate(ec_local);
+
+        assert!(
+            !w.is_complete(),
+            "must not finalize when local abort disagrees with quorum's EC"
         );
     }
 
