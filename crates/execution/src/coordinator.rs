@@ -38,14 +38,14 @@
 //! proofs are received, a WaveCertificate is created.
 
 use hyperscale_core::{Action, ProtocolEvent, ProvisionRequest};
-#[cfg(test)]
-use hyperscale_types::Hash;
 use hyperscale_types::{
-    Attempt, Block, BlockHash, BlockHeight, ExecutionCertificate, ExecutionOutcome, ExecutionVote,
-    GlobalReceiptRoot, LocalExecutionEntry, NodeId, Provision, ReceiptBundle, RoutableTransaction,
-    ShardGroupId, TopologySnapshot, TransactionDecision, TxHash, TxOutcome, ValidatorId,
-    WaveCertificate, WaveId, WaveIdHash, WeightedTimestamp,
+    Attempt, Block, BlockHash, BlockHeight, ExecutionCertificate, ExecutionVote, GlobalReceiptRoot,
+    LocalExecutionEntry, NodeId, Provision, ReceiptBundle, RoutableTransaction, ShardGroupId,
+    TopologySnapshot, TransactionDecision, TxHash, TxOutcome, ValidatorId, WaveCertificate, WaveId,
+    WaveIdHash, WeightedTimestamp,
 };
+#[cfg(test)]
+use hyperscale_types::{ExecutionOutcome, Hash};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -380,30 +380,6 @@ impl ExecutionCoordinator {
         }
 
         (dispatch_actions, votes_to_replay)
-    }
-
-    /// Record a transaction execution result into its wave.
-    ///
-    /// Updates the wave silently. Votes are NOT emitted here — they are
-    /// emitted during the block commit wave scan (`scan_complete_waves`), ensuring
-    /// deterministic voting at each consensus height.
-    ///
-    /// Execution is dispatched per wave, so a result for an unassigned tx is
-    /// a bug (e.g. stale engine callback for a pruned wave) — logged and dropped.
-    pub fn record_execution_result(&mut self, tx_hash: TxHash, outcome: ExecutionOutcome) {
-        let Some(wave_key) = self.waves.wave_assignment(&tx_hash) else {
-            tracing::warn!(
-                tx_hash = ?tx_hash,
-                "Execution result for unassigned tx — dropping"
-            );
-            return;
-        };
-
-        let Some(wave) = self.waves.get_wave_mut(&wave_key) else {
-            return;
-        };
-
-        wave.record_execution_result(tx_hash, outcome);
     }
 
     /// Scan all waves and return completion data for any that can emit a vote.
