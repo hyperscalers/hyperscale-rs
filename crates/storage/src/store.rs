@@ -10,7 +10,7 @@ use radix_substate_store_interface::interface::{DbSortKey, SubstateDatabase};
 /// This trait extends Radix's `SubstateDatabase` with additional methods needed
 /// for deterministic simulation and state commitment:
 /// - `snapshot()` - Create isolated views for parallel execution
-/// - `jmt_height()` / `state_root_hash()` - JMT state commitment
+/// - `jmt_height()` / `state_root()` - JMT state commitment
 ///
 /// All implementations use a binary Blake3 Jellyfish Merkle Tree (JMT)
 /// internally to maintain cryptographic state roots, updated on each
@@ -58,7 +58,7 @@ pub trait SubstateStore: SubstateDatabase + Send + Sync + 'static {
     /// for state sync, light client proofs, and cross-validator consistency checks.
     ///
     /// Returns a zero hash if no commits have occurred.
-    fn state_root_hash(&self) -> StateRoot;
+    fn state_root(&self) -> StateRoot;
 
     /// List all substates for a node at a specific historical block height.
     ///

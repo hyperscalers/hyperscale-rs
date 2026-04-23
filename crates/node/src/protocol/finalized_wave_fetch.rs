@@ -5,7 +5,7 @@
 //! rotates through peers on failure.
 
 use hyperscale_metrics as metrics;
-use hyperscale_types::{BlockHash, FinalizedWave, Hash, ValidatorId};
+use hyperscale_types::{BlockHash, FinalizedWave, ValidatorId, WaveIdHash};
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use tracing::{debug, info, trace};
@@ -36,7 +36,7 @@ pub enum FinalizedWaveFetchInput {
     Request {
         block_hash: BlockHash,
         proposer: ValidatorId,
-        wave_id_hashes: Vec<Hash>,
+        wave_id_hashes: Vec<WaveIdHash>,
     },
     /// Finalized waves were received.
     Received {
@@ -46,7 +46,7 @@ pub enum FinalizedWaveFetchInput {
     /// A fetch operation failed.
     Failed {
         block_hash: BlockHash,
-        hashes: Vec<Hash>,
+        hashes: Vec<WaveIdHash>,
     },
     /// Cancel fetch for a specific block.
     CancelFetch { block_hash: BlockHash },
@@ -61,7 +61,7 @@ pub enum FinalizedWaveFetchOutput {
     Fetch {
         block_hash: BlockHash,
         proposer: ValidatorId,
-        wave_id_hashes: Vec<Hash>,
+        wave_id_hashes: Vec<WaveIdHash>,
     },
     /// Deliver fetched finalized waves to the state machine.
     Deliver { waves: Vec<Arc<FinalizedWave>> },
@@ -71,14 +71,14 @@ pub enum FinalizedWaveFetchOutput {
 #[derive(Debug)]
 struct BlockFetchState {
     proposer: ValidatorId,
-    missing_hashes: HashSet<Hash>,
-    in_flight_hashes: HashSet<Hash>,
-    received_hashes: HashSet<Hash>,
+    missing_hashes: HashSet<WaveIdHash>,
+    in_flight_hashes: HashSet<WaveIdHash>,
+    received_hashes: HashSet<WaveIdHash>,
     in_flight_count: usize,
 }
 
 impl BlockFetchState {
-    fn new(proposer: ValidatorId, hashes: Vec<Hash>) -> Self {
+    fn new(proposer: ValidatorId, hashes: Vec<WaveIdHash>) -> Self {
         Self {
             proposer,
             missing_hashes: hashes.into_iter().collect(),
@@ -92,21 +92,21 @@ impl BlockFetchState {
         self.missing_hashes.is_empty() && self.in_flight_hashes.is_empty()
     }
 
-    fn hashes_to_fetch(&self) -> Vec<Hash> {
+    fn hashes_to_fetch(&self) -> Vec<WaveIdHash> {
         self.missing_hashes
             .difference(&self.in_flight_hashes)
             .copied()
             .collect()
     }
 
-    fn mark_in_flight(&mut self, hashes: &[Hash]) {
+    fn mark_in_flight(&mut self, hashes: &[WaveIdHash]) {
         for hash in hashes {
             self.in_flight_hashes.insert(*hash);
         }
         self.in_flight_count += 1;
     }
 
-    fn mark_received(&mut self, hashes: impl IntoIterator<Item = Hash>) {
+    fn mark_received(&mut self, hashes: impl IntoIterator<Item = WaveIdHash>) {
         for hash in hashes {
             self.missing_hashes.remove(&hash);
             self.in_flight_hashes.remove(&hash);
@@ -114,11 +114,11 @@ impl BlockFetchState {
         }
     }
 
-    fn was_received(&self, hash: &Hash) -> bool {
+    fn was_received(&self, hash: &WaveIdHash) -> bool {
         self.received_hashes.contains(hash)
     }
 
-    fn mark_fetch_failed(&mut self, hashes: &[Hash]) {
+    fn mark_fetch_failed(&mut self, hashes: &[WaveIdHash]) {
         for hash in hashes {
             self.in_flight_hashes.remove(hash);
         }
@@ -132,7 +132,7 @@ impl BlockFetchState {
     /// Move any in-flight hashes that weren't received back to missing.
     fn reclaim_unreceived(&mut self) {
         if self.in_flight_count == 0 && !self.in_flight_hashes.is_empty() {
-            let stuck: Vec<Hash> = self
+            let stuck: Vec<WaveIdHash> = self
                 .in_flight_hashes
                 .iter()
                 .filter(|h| !self.received_hashes.contains(h))
@@ -194,7 +194,7 @@ impl FinalizedWaveFetchProtocol {
         &mut self,
         block_hash: BlockHash,
         proposer: ValidatorId,
-        wave_id_hashes: Vec<Hash>,
+        wave_id_hashes: Vec<WaveIdHash>,
     ) -> Vec<FinalizedWaveFetchOutput> {
         if wave_id_hashes.is_empty() {
             return vec![];
@@ -234,7 +234,7 @@ impl FinalizedWaveFetchProtocol {
 
         state.mark_fetch_complete();
 
-        let received_hashes: Vec<Hash> = waves.iter().map(|fw| fw.wave_id_hash()).collect();
+        let received_hashes: Vec<WaveIdHash> = waves.iter().map(|fw| fw.wave_id_hash()).collect();
         let received_count = received_hashes.len();
         state.mark_received(received_hashes);
         state.reclaim_unreceived();
@@ -265,7 +265,7 @@ impl FinalizedWaveFetchProtocol {
     fn handle_failed(
         &mut self,
         block_hash: BlockHash,
-        hashes: Vec<Hash>,
+        hashes: Vec<WaveIdHash>,
     ) -> Vec<FinalizedWaveFetchOutput> {
         if let Some(state) = self.fetches.get_mut(&block_hash) {
             state.mark_fetch_failed(&hashes);

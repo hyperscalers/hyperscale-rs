@@ -24,9 +24,10 @@
 
 use crate::{
     compute_padded_merkle_root, Attempt, BlockHash, BlockHeight, Bls12381G2Signature,
-    ExecutionCertificateHash, GlobalReceiptRoot, Hash, LocalReceipt, ReceiptBundle,
-    RoutableTransaction, ShardGroupId, SignerBitfield, TopologySnapshot, TransactionDecision,
-    TransactionOutcome, TxHash, ValidatorId, WaveReceiptHash, WeightedTimestamp,
+    ExecutionCertificateHash, GlobalReceiptHash, GlobalReceiptRoot, Hash, LocalReceipt,
+    ProvisionTxRoot, ReceiptBundle, RoutableTransaction, ShardGroupId, SignerBitfield,
+    TopologySnapshot, TransactionDecision, TransactionOutcome, TxHash, ValidatorId, WaveIdHash,
+    WaveReceiptHash, WeightedTimestamp,
 };
 use sbor::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
@@ -85,9 +86,9 @@ impl WaveId {
     ///
     /// Used for: BlockManifest cert_hashes, PendingBlock matching, storage keys,
     /// wave cert fetch requests. Computable without knowing EC content.
-    pub fn hash(&self) -> Hash {
+    pub fn hash(&self) -> WaveIdHash {
         let bytes = basic_encode(self).expect("WaveId serialization should never fail");
-        Hash::from_bytes(&bytes)
+        WaveIdHash::from_raw(Hash::from_bytes(&bytes))
     }
 }
 
@@ -175,7 +176,7 @@ pub fn compute_waves(
 pub fn compute_provision_tx_roots(
     topology: &TopologySnapshot,
     transactions: &[Arc<RoutableTransaction>],
-) -> BTreeMap<ShardGroupId, Hash> {
+) -> BTreeMap<ShardGroupId, ProvisionTxRoot> {
     let local_shard = topology.local_shard();
     let mut per_target: BTreeMap<ShardGroupId, Vec<Hash>> = BTreeMap::new();
 
@@ -196,7 +197,12 @@ pub fn compute_provision_tx_roots(
 
     per_target
         .into_iter()
-        .map(|(shard, hashes)| (shard, compute_padded_merkle_root(&hashes)))
+        .map(|(shard, hashes)| {
+            (
+                shard,
+                ProvisionTxRoot::from_raw(compute_padded_merkle_root(&hashes)),
+            )
+        })
         .collect()
 }
 
@@ -264,7 +270,10 @@ pub enum ExecutionOutcome {
     /// Transaction executed. `receipt_hash` is the hash of the execution receipt.
     /// `success=true` means the transaction's logic succeeded (writes applied).
     /// `success=false` means the transaction's logic failed (no writes).
-    Executed { receipt_hash: Hash, success: bool },
+    Executed {
+        receipt_hash: GlobalReceiptHash,
+        success: bool,
+    },
     /// Transaction aborted before execution could complete.
     Aborted,
 }
@@ -280,11 +289,11 @@ impl ExecutionOutcome {
         matches!(self, ExecutionOutcome::Aborted)
     }
 
-    /// Get the receipt hash, or `Hash::ZERO` for aborted outcomes.
-    pub fn receipt_hash_or_zero(&self) -> Hash {
+    /// Get the receipt hash, or `GlobalReceiptHash::ZERO` for aborted outcomes.
+    pub fn receipt_hash_or_zero(&self) -> GlobalReceiptHash {
         match self {
             ExecutionOutcome::Executed { receipt_hash, .. } => *receipt_hash,
-            ExecutionOutcome::Aborted => Hash::ZERO,
+            ExecutionOutcome::Aborted => GlobalReceiptHash::ZERO,
         }
     }
 }
@@ -878,7 +887,7 @@ impl FinalizedWave {
     }
 
     /// Get the wave ID hash (used as key in pending block tracking).
-    pub fn wave_id_hash(&self) -> Hash {
+    pub fn wave_id_hash(&self) -> WaveIdHash {
         self.certificate.wave_id.hash()
     }
 
@@ -1147,7 +1156,7 @@ mod tests {
         TxOutcome {
             tx_hash: TxHash::from_raw(Hash::from_bytes(&[seed; 4])),
             outcome: ExecutionOutcome::Executed {
-                receipt_hash: Hash::from_bytes(&[seed + 100; 4]),
+                receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(&[seed + 100; 4])),
                 success: true,
             },
         }
@@ -1187,7 +1196,7 @@ mod tests {
         let w1 = make_wave_id(0, BlockHeight(42), &[1]);
         let w2 = make_wave_id(0, BlockHeight(42), &[1]);
         assert_eq!(w1.hash(), w2.hash());
-        assert_ne!(w1.hash(), Hash::ZERO);
+        assert_ne!(w1.hash(), WaveIdHash::ZERO);
     }
 
     #[test]
@@ -1241,8 +1250,10 @@ mod tests {
         assert_eq!(roots.len(), 1);
         assert!(roots.contains_key(&ShardGroupId(1)));
 
-        let expected =
-            compute_padded_merkle_root(&[tx_a.hash().into_raw(), tx_b.hash().into_raw()]);
+        let expected = ProvisionTxRoot::from_raw(compute_padded_merkle_root(&[
+            tx_a.hash().into_raw(),
+            tx_b.hash().into_raw(),
+        ]));
         assert_eq!(roots[&ShardGroupId(1)], expected);
     }
 
@@ -1312,14 +1323,14 @@ mod tests {
         let success = TxOutcome {
             tx_hash: TxHash::from_raw(Hash::from_bytes(b"tx")),
             outcome: ExecutionOutcome::Executed {
-                receipt_hash: Hash::from_bytes(b"receipt"),
+                receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(b"receipt")),
                 success: true,
             },
         };
         let failure = TxOutcome {
             tx_hash: TxHash::from_raw(Hash::from_bytes(b"tx")),
             outcome: ExecutionOutcome::Executed {
-                receipt_hash: Hash::from_bytes(b"receipt"),
+                receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(b"receipt")),
                 success: false,
             },
         };
@@ -1331,7 +1342,7 @@ mod tests {
         let executed = TxOutcome {
             tx_hash: TxHash::from_raw(Hash::from_bytes(b"tx")),
             outcome: ExecutionOutcome::Executed {
-                receipt_hash: Hash::from_bytes(b"receipt"),
+                receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(b"receipt")),
                 success: true,
             },
         };
@@ -1551,14 +1562,14 @@ mod tests {
             TxOutcome {
                 tx_hash: tx_a,
                 outcome: ExecutionOutcome::Executed {
-                    receipt_hash: Hash::from_bytes(b"r_a"),
+                    receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(b"r_a")),
                     success: true,
                 },
             },
             TxOutcome {
                 tx_hash: tx_b,
                 outcome: ExecutionOutcome::Executed {
-                    receipt_hash: Hash::from_bytes(b"r_b"),
+                    receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(b"r_b")),
                     success: true,
                 },
             },
@@ -1588,7 +1599,7 @@ mod tests {
             TxOutcome {
                 tx_hash: tx_a,
                 outcome: ExecutionOutcome::Executed {
-                    receipt_hash: Hash::from_bytes(b"r_a"),
+                    receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(b"r_a")),
                     success: true,
                 },
             },
@@ -1625,7 +1636,7 @@ mod tests {
         let outcomes = vec![TxOutcome {
             tx_hash: tx_a,
             outcome: ExecutionOutcome::Executed {
-                receipt_hash: Hash::from_bytes(b"r_a"),
+                receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(b"r_a")),
                 success: true,
             },
         }];
@@ -1685,7 +1696,7 @@ mod tests {
             TxOutcome {
                 tx_hash: tx_a,
                 outcome: ExecutionOutcome::Executed {
-                    receipt_hash: Hash::ZERO,
+                    receipt_hash: GlobalReceiptHash::ZERO,
                     success: true,
                 },
             },
@@ -1696,7 +1707,7 @@ mod tests {
             TxOutcome {
                 tx_hash: tx_c,
                 outcome: ExecutionOutcome::Executed {
-                    receipt_hash: Hash::ZERO,
+                    receipt_hash: GlobalReceiptHash::ZERO,
                     success: false,
                 },
             },
@@ -1729,7 +1740,7 @@ mod tests {
         let outcomes = vec![TxOutcome {
             tx_hash: tx_a,
             outcome: ExecutionOutcome::Executed {
-                receipt_hash: Hash::ZERO,
+                receipt_hash: GlobalReceiptHash::ZERO,
                 success: true,
             },
         }];
@@ -1758,7 +1769,7 @@ mod tests {
         let outcomes = vec![TxOutcome {
             tx_hash: tx_a,
             outcome: ExecutionOutcome::Executed {
-                receipt_hash: Hash::ZERO,
+                receipt_hash: GlobalReceiptHash::ZERO,
                 success: true,
             },
         }];
@@ -1808,7 +1819,7 @@ mod tests {
         let outcomes = vec![TxOutcome {
             tx_hash: tx_a,
             outcome: ExecutionOutcome::Executed {
-                receipt_hash: Hash::ZERO,
+                receipt_hash: GlobalReceiptHash::ZERO,
                 success: true,
             },
         }];

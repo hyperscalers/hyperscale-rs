@@ -19,7 +19,7 @@
 use hyperscale_types::{
     bls_keypair_from_seed, Block, BlockHash, BlockHeader, BlockHeight, Bls12381G1PrivateKey,
     Bls12381G1PublicKey, Bls12381G2Signature, CertificateRoot, CertifiedBlock,
-    ExecutionCertificate, ExecutionOutcome, FinalizedWave, GlobalReceiptRoot, Hash,
+    ExecutionCertificate, ExecutionOutcome, FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot,
     LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round,
     RoutableTransaction, ShardGroupId, SignerBitfield, StateRoot, TopologySnapshot,
     TransactionDecision, TransactionRoot, TxHash, TxOutcome, ValidatorId, ValidatorInfo,
@@ -257,11 +257,11 @@ pub fn make_finalized_wave(
 ) -> FinalizedWave {
     let outcome = match decision {
         TransactionDecision::Accept => ExecutionOutcome::Executed {
-            receipt_hash: Hash::ZERO,
+            receipt_hash: GlobalReceiptHash::ZERO,
             success: true,
         },
         TransactionDecision::Reject => ExecutionOutcome::Executed {
-            receipt_hash: Hash::ZERO,
+            receipt_hash: GlobalReceiptHash::ZERO,
             success: false,
         },
         TransactionDecision::Aborted => ExecutionOutcome::Aborted,

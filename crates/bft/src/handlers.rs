@@ -10,9 +10,9 @@ use hyperscale_types::{
     compute_provision_root, compute_provision_tx_roots, compute_transaction_root, compute_waves,
     verify_bls12381_v1, Block, BlockHash, BlockHeader, BlockHeight, BlockVote, Bls12381G1PublicKey,
     Bls12381G2Signature, CertificateRoot, FinalizedWave, Hash, LocalReceiptRoot, ProposerTimestamp,
-    ProvisionsRoot, QuorumCertificate, ReceiptBundle, Round, RoutableTransaction, ShardGroupId,
-    SignerBitfield, StateRoot, TopologySnapshot, TransactionRoot, ValidatorId, VotePower,
-    WeightedTimestamp,
+    ProvisionHash, ProvisionTxRoot, ProvisionsRoot, QuorumCertificate, ReceiptBundle, Round,
+    RoutableTransaction, ShardGroupId, SignerBitfield, StateRoot, TopologySnapshot,
+    TransactionRoot, ValidatorId, VotePower, WeightedTimestamp,
 };
 use std::sync::Arc;
 
@@ -260,7 +260,7 @@ pub fn verify_transaction_root(
 /// compares against the header's claimed map by full equality. A missing or
 /// tampered target-root fails because the recomputed root won't match.
 pub fn verify_provision_tx_roots(
-    expected: &std::collections::BTreeMap<ShardGroupId, Hash>,
+    expected: &std::collections::BTreeMap<ShardGroupId, ProvisionTxRoot>,
     transactions: &[Arc<RoutableTransaction>],
     topology: &TopologySnapshot,
 ) -> bool {
@@ -430,13 +430,14 @@ pub fn build_proposal<S: ChainWriter + SubstateStore>(
         .flat_map(|fw| fw.receipts.iter().cloned())
         .collect();
 
-    let mut provision_hashes: Vec<Hash> = provisions.iter().map(|p| p.hash()).collect();
+    let mut provision_hashes: Vec<ProvisionHash> = provisions.iter().map(|p| p.hash()).collect();
     provision_hashes.sort();
 
     let transaction_root = compute_transaction_root(&transactions);
     let certificate_root = compute_certificate_root(&certificates);
     let local_receipt_root = compute_local_receipt_root(&receipts);
-    let provision_root = compute_provision_root(&provision_hashes);
+    let raw_provision_hashes: Vec<Hash> = provision_hashes.iter().map(|h| h.into_raw()).collect();
+    let provision_root = compute_provision_root(&raw_provision_hashes);
     let waves = compute_waves(topology, height, &transactions);
     let provision_tx_roots = compute_provision_tx_roots(topology, &transactions);
 

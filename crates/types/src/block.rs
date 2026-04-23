@@ -1,11 +1,14 @@
 //! Block and BlockHeader types for consensus.
 
+#[cfg(test)]
+use crate::GlobalReceiptHash;
 use crate::{
     block_vote_message, compute_merkle_root, compute_padded_merkle_root, decode_finalized_wave_vec,
     encode_finalized_wave_vec, BlockHash, BlockHeight, Bls12381G1PrivateKey, Bls12381G2Signature,
     CertificateRoot, FinalizedWave, Hash, LocalReceiptRoot, ProposerTimestamp, Provision,
-    ProvisionsRoot, QuorumCertificate, ReceiptBundle, Round, RoutableTransaction, ShardGroupId,
-    StateRoot, TransactionRoot, TxHash, ValidatorId, WaveId,
+    ProvisionHash, ProvisionTxRoot, ProvisionsRoot, QuorumCertificate, ReceiptBundle, Round,
+    RoutableTransaction, ShardGroupId, StateRoot, TransactionRoot, TxHash, ValidatorId, WaveId,
+    WaveIdHash,
 };
 use sbor::prelude::*;
 use std::collections::BTreeMap;
@@ -181,7 +184,7 @@ pub struct BlockHeader {
     ///
     /// Entries only exist for targets with ≥1 tx. Empty for genesis,
     /// single-shard-only blocks, and empty blocks.
-    pub provision_tx_roots: BTreeMap<ShardGroupId, Hash>,
+    pub provision_tx_roots: BTreeMap<ShardGroupId, ProvisionTxRoot>,
 
     /// Approximate number of in-flight transactions on this shard at proposal time.
     ///
@@ -643,11 +646,11 @@ pub struct BlockManifest {
 
     /// Certificate hashes (wave_id hashes) in block order.
     /// Validators use these to match against their locally finalized waves.
-    pub cert_hashes: Vec<Hash>,
+    pub cert_hashes: Vec<WaveIdHash>,
 
     /// Hashes of provision batches included in this block.
     /// Used for provision data availability — validators fetch missing batches by hash.
-    pub provision_hashes: Vec<Hash>,
+    pub provision_hashes: Vec<ProvisionHash>,
 }
 
 impl BlockManifest {
@@ -865,7 +868,9 @@ mod tests {
                 vec![TxOutcome {
                     tx_hash: TxHash::from_raw(Hash::from_bytes(&[seed; 4])),
                     outcome: ExecutionOutcome::Executed {
-                        receipt_hash: Hash::from_bytes(&[seed + 50; 4]),
+                        receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(
+                            &[seed + 50; 4],
+                        )),
                         success: true,
                     },
                 }],
@@ -907,7 +912,7 @@ mod tests {
             vec![TxOutcome {
                 tx_hash: TxHash::from_raw(Hash::from_bytes(b"tx1")),
                 outcome: ExecutionOutcome::Executed {
-                    receipt_hash: Hash::from_bytes(b"rh"),
+                    receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(b"rh")),
                     success: true,
                 },
             }],

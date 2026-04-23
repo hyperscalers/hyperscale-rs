@@ -658,7 +658,7 @@ mod tests {
     use super::*;
     use hyperscale_types::{
         test_utils::{test_node, test_transaction_with_nodes},
-        Bls12381G2Signature, SignerBitfield,
+        Bls12381G2Signature, GlobalReceiptHash, SignerBitfield,
     };
 
     const WAVE_START: BlockHeight = BlockHeight(10);
@@ -711,7 +711,7 @@ mod tests {
 
     fn executed(success: bool) -> ExecutionOutcome {
         ExecutionOutcome::Executed {
-            receipt_hash: Hash::from_bytes(b"r"),
+            receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(b"r")),
             success,
         }
     }

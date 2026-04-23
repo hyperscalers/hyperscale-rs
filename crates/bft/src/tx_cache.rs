@@ -11,8 +11,7 @@
 //!    at commit, for historical dedup over a bounded window. Survives
 //!    mempool processing; pruned by `COMMITTED_TX_RETENTION`.
 
-use hyperscale_types::Hash;
-use hyperscale_types::TxHash;
+use hyperscale_types::{TxHash, WaveIdHash};
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
@@ -24,7 +23,7 @@ const COMMITTED_TX_RETENTION: Duration = Duration::from_secs(300);
 pub(crate) struct CommittedTxCache {
     tx_lookup: HashMap<TxHash, u64>,
     recently_committed_txs: HashSet<TxHash>,
-    recently_committed_certs: HashSet<Hash>,
+    recently_committed_certs: HashSet<WaveIdHash>,
 }
 
 impl CommittedTxCache {
@@ -43,7 +42,7 @@ impl CommittedTxCache {
     pub fn buffer_commit(
         &mut self,
         tx_hashes: impl IntoIterator<Item = TxHash>,
-        cert_hashes: impl IntoIterator<Item = Hash>,
+        cert_hashes: impl IntoIterator<Item = WaveIdHash>,
     ) {
         self.recently_committed_txs.extend(tx_hashes);
         self.recently_committed_certs.extend(cert_hashes);
@@ -98,7 +97,7 @@ impl CommittedTxCache {
         self.recently_committed_txs.iter().copied()
     }
 
-    pub fn recent_cert_hashes(&self) -> impl Iterator<Item = Hash> + '_ {
+    pub fn recent_cert_hashes(&self) -> impl Iterator<Item = WaveIdHash> + '_ {
         self.recently_committed_certs.iter().copied()
     }
 
@@ -118,9 +117,10 @@ impl CommittedTxCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hyperscale_types::Hash;
 
-    fn h(b: &[u8]) -> Hash {
-        Hash::from_bytes(b)
+    fn h(b: &[u8]) -> WaveIdHash {
+        WaveIdHash::from_raw(Hash::from_bytes(b))
     }
 
     fn th(b: &[u8]) -> TxHash {
@@ -133,7 +133,7 @@ mod tests {
         cache.buffer_commit([th(b"tx1"), th(b"tx2")], [h(b"c1")]);
 
         let txs: HashSet<TxHash> = cache.recent_tx_hashes().collect();
-        let certs: HashSet<Hash> = cache.recent_cert_hashes().collect();
+        let certs: HashSet<WaveIdHash> = cache.recent_cert_hashes().collect();
         assert_eq!(txs, HashSet::from([th(b"tx1"), th(b"tx2")]));
         assert_eq!(certs, HashSet::from([h(b"c1")]));
     }

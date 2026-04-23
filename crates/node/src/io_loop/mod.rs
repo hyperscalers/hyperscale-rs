@@ -46,8 +46,8 @@ use hyperscale_network::Network;
 use hyperscale_storage::{ChainReader, ChainWriter, JmtTreeReader, SubstateStore, VersionedStore};
 use hyperscale_types::{
     Block, BlockHash, BlockHeight, Bls12381G1PrivateKey, Bls12381G1PublicKey, CommittedBlockHeader,
-    ExecutionCertificate, FinalizedWave, Hash, QuorumCertificate, RoutableTransaction,
-    ShardGroupId, StateRoot, TopologySnapshot, TxHash, ValidatorId, WaveId,
+    ExecutionCertificate, FinalizedWave, QuorumCertificate, RoutableTransaction, ShardGroupId,
+    StateRoot, TopologySnapshot, TxHash, ValidatorId, WaveId, WaveIdHash,
 };
 use quick_cache::sync::Cache as QuickCache;
 use std::collections::{HashMap, HashSet};
@@ -88,7 +88,7 @@ pub(crate) struct PendingCommit {
 pub type SharedTopologySnapshot = Arc<ArcSwap<TopologySnapshot>>;
 
 /// Shared execution certificate cache for fallback serving.
-type ExecCertCache = Arc<Mutex<HashMap<(Hash, WaveId), Arc<ExecutionCertificate>>>>;
+type ExecCertCache = Arc<Mutex<HashMap<(WaveIdHash, WaveId), Arc<ExecutionCertificate>>>>;
 
 /// Default certificate cache capacity.
 const DEFAULT_CERT_CACHE_SIZE: usize = 10_000;
@@ -267,7 +267,7 @@ where
     // In-memory caches (shared with inbound router in production)
     tx_cache: Arc<QuickCache<TxHash, Arc<RoutableTransaction>>>,
     provision_cache: Arc<crate::ProvisionCache>,
-    finalized_wave_cache: Arc<QuickCache<Hash, Arc<FinalizedWave>>>,
+    finalized_wave_cache: Arc<QuickCache<WaveIdHash, Arc<FinalizedWave>>>,
 
     // Sync protocol
     sync_protocol: SyncProtocol,

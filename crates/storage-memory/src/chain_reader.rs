@@ -4,8 +4,9 @@ use crate::core::SimStorage;
 
 use hyperscale_storage::{BlockForSync, ChainReader};
 use hyperscale_types::{
-    BlockHash, BlockHeight, CertifiedBlock, ExecutionCertificate, ExecutionCertificateHash, Hash,
+    BlockHash, BlockHeight, CertifiedBlock, ExecutionCertificate, ExecutionCertificateHash,
     LocalReceipt, QuorumCertificate, RoutableTransaction, ShardGroupId, TxHash, WaveCertificate,
+    WaveIdHash,
 };
 use std::sync::Arc;
 
@@ -52,7 +53,7 @@ impl ChainReader for SimStorage {
             .collect()
     }
 
-    fn get_certificates_batch(&self, hashes: &[Hash]) -> Vec<WaveCertificate> {
+    fn get_certificates_batch(&self, hashes: &[WaveIdHash]) -> Vec<WaveCertificate> {
         let c = self.consensus.read().unwrap();
         hashes
             .iter()

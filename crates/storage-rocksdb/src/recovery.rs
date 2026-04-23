@@ -23,7 +23,7 @@ impl RocksDbStorage {
         // The height 0 case is handled correctly by the state machine.
         use hyperscale_storage::SubstateStore;
         let jmt_block_height = self.jmt_height();
-        let jmt_root = self.state_root_hash();
+        let jmt_root = self.state_root();
         let jmt_root_opt = Some(jmt_root);
 
         // Recovery invariant: JMT version (= block height) must match committed_height.

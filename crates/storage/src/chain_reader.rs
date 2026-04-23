@@ -5,8 +5,8 @@
 
 use hyperscale_types::{
     Block, BlockHash, BlockHeight, CertifiedBlock, ExecutionCertificate, ExecutionCertificateHash,
-    Hash, LocalReceipt, QuorumCertificate, RoutableTransaction, ShardGroupId, TxHash,
-    WaveCertificate,
+    LocalReceipt, ProvisionHash, QuorumCertificate, RoutableTransaction, ShardGroupId, TxHash,
+    WaveCertificate, WaveIdHash,
 };
 use std::sync::Arc;
 
@@ -22,7 +22,7 @@ pub struct BlockForSync {
     pub qc: QuorumCertificate,
     /// Provision batch hashes from the block's manifest — the sync-serving
     /// layer uses these to look up provisions in the in-memory cache.
-    pub provision_hashes: Vec<Hash>,
+    pub provision_hashes: Vec<ProvisionHash>,
 }
 
 /// Abstracts consensus-related storage for both simulation and production.
@@ -61,7 +61,7 @@ pub trait ChainReader: Send + Sync + 'static {
     /// Get multiple certificates by hash (batch read).
     ///
     /// Returns only certificates that were found (missing hashes are skipped).
-    fn get_certificates_batch(&self, hashes: &[Hash]) -> Vec<WaveCertificate>;
+    fn get_certificates_batch(&self, hashes: &[WaveIdHash]) -> Vec<WaveCertificate>;
 
     // ─── Receipt Storage ──────────────────────────────────────────────────
 

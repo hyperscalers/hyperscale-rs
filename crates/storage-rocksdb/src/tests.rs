@@ -10,7 +10,7 @@ use hyperscale_storage::{
 };
 use hyperscale_types::{
     BlockHash, BlockHeight, Hash, QuorumCertificate, ReceiptBundle, Round, ShardGroupId, StateRoot,
-    TxHash, WeightedTimestamp,
+    TxHash, WaveIdHash, WeightedTimestamp,
 };
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -310,18 +310,18 @@ fn test_state_root_changes_on_commit() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
 
-    let root0 = storage.state_root_hash();
+    let root0 = storage.state_root();
 
     storage
         .commit(&make_database_update(vec![1, 2, 3], 0, vec![10], vec![1]))
         .unwrap();
-    let root1 = storage.state_root_hash();
+    let root1 = storage.state_root();
     assert_ne!(root0, root1, "root should change after first commit");
 
     storage
         .commit(&make_database_update(vec![4, 5, 6], 0, vec![20], vec![2]))
         .unwrap();
-    let root2 = storage.state_root_hash();
+    let root2 = storage.state_root();
     assert_ne!(root1, root2, "root should change after second commit");
 }
 
@@ -472,7 +472,7 @@ fn test_commit_block_empty_certs() {
 fn test_prepare_then_commit_matches_direct() {
     let temp_dir1 = TempDir::new().unwrap();
     let s_prepared = RocksDbStorage::open(temp_dir1.path()).unwrap();
-    let parent_root = s_prepared.state_root_hash();
+    let parent_root = s_prepared.state_root();
     let (spec_root, prepared) = s_prepared.prepare_block_commit(
         parent_root,
         BlockHeight::GENESIS,
@@ -572,7 +572,7 @@ fn test_certificates_batch() {
     let result = storage.get_certificates_batch(&[hash1, hash2]);
     assert_eq!(result.len(), 2);
 
-    let missing = Hash::from_bytes(&[99; 32]);
+    let missing = WaveIdHash::from_raw(Hash::from_bytes(&[99; 32]));
     let partial = storage.get_certificates_batch(&[hash1, missing]);
     assert_eq!(partial.len(), 1);
     assert_eq!(partial[0].wave_id.hash(), hash1);
@@ -593,7 +593,7 @@ fn test_initial_block_height_is_zero() {
 fn test_initial_state_root_is_zero() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
-    assert_eq!(storage.state_root_hash(), StateRoot::ZERO);
+    assert_eq!(storage.state_root(), StateRoot::ZERO);
 }
 
 #[test]
@@ -608,7 +608,7 @@ fn test_state_root_deterministic() {
     let s2 = RocksDbStorage::open(td2.path()).unwrap();
     s2.commit(&updates).unwrap();
 
-    assert_eq!(s1.state_root_hash(), s2.state_root_hash());
+    assert_eq!(s1.state_root(), s2.state_root());
     assert_eq!(s1.jmt_height(), s2.jmt_height());
 }
 
@@ -624,7 +624,7 @@ fn test_state_root_differs_for_different_data() {
     s2.commit(&make_database_update(vec![1, 2, 3], 0, vec![10], vec![2]))
         .unwrap();
 
-    assert_ne!(s1.state_root_hash(), s2.state_root_hash());
+    assert_ne!(s1.state_root(), s2.state_root());
 }
 
 #[test]
@@ -646,7 +646,7 @@ fn test_certificate_get_missing() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
     assert!(storage
-        .get_certificate(&Hash::from_bytes(&[99; 32]))
+        .get_certificate(&WaveIdHash::from_raw(Hash::from_bytes(&[99; 32])))
         .is_none());
 }
 
@@ -677,7 +677,7 @@ fn test_commit_certificate_via_commit_store() {
     storage.commit_certificate_with_writes(&cert, &updates);
 
     assert_eq!(storage.jmt_height(), BlockHeight(0));
-    assert_eq!(storage.state_root_hash(), StateRoot::ZERO);
+    assert_eq!(storage.state_root(), StateRoot::ZERO);
     assert!(storage.get_certificate(&cert.wave_id.hash()).is_some());
 }
 
@@ -708,7 +708,7 @@ fn test_substates_survive_reopen() {
         let cert = make_test_wave_certificate(BlockHeight(1), ShardGroupId(0));
         cert_hash = cert.wave_id.hash();
         storage.commit_certificate_with_writes(&cert, &updates);
-        root_after_write = storage.state_root_hash();
+        root_after_write = storage.state_root();
         version_after_write = storage.jmt_height();
     }
 
@@ -716,7 +716,7 @@ fn test_substates_survive_reopen() {
         let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
 
         assert_eq!(storage.jmt_height(), version_after_write);
-        assert_eq!(storage.state_root_hash(), root_after_write);
+        assert_eq!(storage.state_root(), root_after_write);
 
         let cert = storage.get_certificate(&cert_hash);
         assert!(cert.is_some(), "certificate should survive reopen");

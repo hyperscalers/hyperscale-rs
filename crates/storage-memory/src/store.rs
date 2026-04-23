@@ -19,7 +19,7 @@ impl SubstateStore for SimStorage {
         self.state.read().unwrap().current_block_height
     }
 
-    fn state_root_hash(&self) -> StateRoot {
+    fn state_root(&self) -> StateRoot {
         self.state.read().unwrap().current_root_hash
     }
 

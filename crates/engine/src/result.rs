@@ -1,6 +1,6 @@
 //! Execution result types.
 
-use hyperscale_types::{Hash, LocalExecutionEntry, LocalReceipt, TxHash, WritesRoot};
+use hyperscale_types::{GlobalReceiptHash, LocalExecutionEntry, LocalReceipt, TxHash, WritesRoot};
 /// Output from executing a batch of transactions.
 #[derive(Debug, Clone)]
 pub struct ExecutionOutput {
@@ -51,7 +51,7 @@ pub struct SingleTxResult {
 
     // ─── Receipt fields ──────────────────────────────────────────────────
     /// Hash of GlobalReceipt (outcome + event_root).
-    pub receipt_hash: Hash,
+    pub receipt_hash: GlobalReceiptHash,
 
     /// Full local receipt with shard-filtered database updates and events.
     pub local_receipt: LocalReceipt,
@@ -67,7 +67,7 @@ impl SingleTxResult {
     /// Create a successful result.
     pub fn success(
         tx_hash: TxHash,
-        receipt_hash: Hash,
+        receipt_hash: GlobalReceiptHash,
         local_receipt: LocalReceipt,
         execution_output: hyperscale_types::ExecutionMetadata,
     ) -> Self {

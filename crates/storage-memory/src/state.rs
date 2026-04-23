@@ -11,8 +11,8 @@ use hyperscale_storage::{
 };
 use hyperscale_types::{
     BlockHash, BlockHeight, CertifiedBlock, ExecutionCertificate, ExecutionCertificateHash,
-    ExecutionMetadata, Hash, LocalReceipt, QuorumCertificate, RoutableTransaction, ShardGroupId,
-    TxHash, WaveCertificate,
+    ExecutionMetadata, LocalReceipt, QuorumCertificate, RoutableTransaction, ShardGroupId, TxHash,
+    WaveCertificate, WaveIdHash,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -107,7 +107,7 @@ pub(crate) struct ConsensusState {
     /// Transactions indexed by hash.
     pub transactions: HashMap<TxHash, RoutableTransaction>,
     /// Wave certificates indexed by identity hash.
-    pub certificates: HashMap<Hash, WaveCertificate>,
+    pub certificates: HashMap<WaveIdHash, WaveCertificate>,
     /// Local receipts keyed by transaction hash.
     pub local_receipts: HashMap<TxHash, Arc<LocalReceipt>>,
     /// Execution output details keyed by transaction hash.
@@ -119,9 +119,9 @@ pub(crate) struct ConsensusState {
     /// Index: block_height → set of canonical hashes for that height.
     pub execution_certs_by_height: HashMap<BlockHeight, Vec<ExecutionCertificateHash>>,
     /// Index: block_height → wave_id hashes at that height.
-    pub wave_certs_by_height: HashMap<BlockHeight, Vec<Hash>>,
+    pub wave_certs_by_height: HashMap<BlockHeight, Vec<WaveIdHash>>,
     /// Index: tx_hash → wave_id hash of the wave cert that finalized it.
-    pub tx_to_wave: HashMap<TxHash, Hash>,
+    pub tx_to_wave: HashMap<TxHash, WaveIdHash>,
     /// Index: tx_hash → vec of (shard_group_id, ec_hash) pairs covering it.
     pub tx_to_ec: HashMap<TxHash, Vec<(ShardGroupId, ExecutionCertificateHash)>>,
 }

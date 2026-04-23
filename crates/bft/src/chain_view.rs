@@ -10,8 +10,11 @@
 //! no mutations. It's a lens, not a sub-machine. The underlying fields live
 //! on `BftCoordinator` / `CommitPipeline` / `PendingBlock` just as before.
 
+#[cfg(test)]
+use hyperscale_types::Hash;
 use hyperscale_types::{
-    Block, BlockHash, BlockHeader, BlockHeight, Hash, QuorumCertificate, StateRoot, TxHash,
+    Block, BlockHash, BlockHeader, BlockHeight, ProvisionHash, QuorumCertificate, StateRoot,
+    TxHash, WaveIdHash,
 };
 use std::collections::{HashMap, HashSet};
 use tracing::warn;
@@ -118,10 +121,10 @@ impl<'a> ChainView<'a> {
         &self,
         parent_hash: BlockHash,
         tx_cache: &CommittedTxCache,
-    ) -> (HashSet<Hash>, HashSet<TxHash>, HashSet<Hash>) {
-        let mut cert_hashes: HashSet<Hash> = HashSet::new();
+    ) -> (HashSet<WaveIdHash>, HashSet<TxHash>, HashSet<ProvisionHash>) {
+        let mut cert_hashes: HashSet<WaveIdHash> = HashSet::new();
         let mut tx_hashes: HashSet<TxHash> = HashSet::new();
-        let mut provision_hashes: HashSet<Hash> = HashSet::new();
+        let mut provision_hashes: HashSet<ProvisionHash> = HashSet::new();
 
         tx_hashes.extend(tx_cache.recent_tx_hashes());
         cert_hashes.extend(tx_cache.recent_cert_hashes());

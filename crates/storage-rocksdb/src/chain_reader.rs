@@ -5,8 +5,8 @@ use crate::typed_cf::TypedCf;
 
 use hyperscale_storage::BlockForSync;
 use hyperscale_types::{
-    BlockHash, BlockHeight, CertifiedBlock, ExecutionCertificate, ExecutionCertificateHash, Hash,
-    QuorumCertificate, RoutableTransaction, ShardGroupId, TxHash, WaveCertificate,
+    BlockHash, BlockHeight, CertifiedBlock, ExecutionCertificate, ExecutionCertificateHash,
+    QuorumCertificate, RoutableTransaction, ShardGroupId, TxHash, WaveCertificate, WaveIdHash,
 };
 use std::sync::Arc;
 
@@ -41,7 +41,7 @@ impl hyperscale_storage::ChainReader for RocksDbStorage {
         RocksDbStorage::get_transactions_batch(self, hashes)
     }
 
-    fn get_certificates_batch(&self, hashes: &[Hash]) -> Vec<WaveCertificate> {
+    fn get_certificates_batch(&self, hashes: &[WaveIdHash]) -> Vec<WaveCertificate> {
         RocksDbStorage::get_certificates_batch(self, hashes)
     }
 

@@ -14,7 +14,9 @@
 
 use std::sync::Arc;
 
-use crate::{compute_merkle_root, DatabaseUpdates, EventRoot, Hash, TxHash, WritesRoot};
+use crate::{
+    compute_merkle_root, DatabaseUpdates, EventRoot, GlobalReceiptHash, Hash, TxHash, WritesRoot,
+};
 
 // ─── Outcome ─────────────────────────────────────────────────────────────────
 
@@ -101,16 +103,16 @@ impl GlobalReceipt {
     /// Compute the global receipt hash.
     ///
     /// This is the value signed over in execution votes and stored on certificates.
-    pub fn receipt_hash(&self) -> Hash {
+    pub fn receipt_hash(&self) -> GlobalReceiptHash {
         let outcome_byte = match self.outcome {
             TransactionOutcome::Success => [1u8],
             TransactionOutcome::Failure => [0u8],
         };
-        Hash::from_parts(&[
+        GlobalReceiptHash::from_raw(Hash::from_parts(&[
             &outcome_byte,
             self.event_root.as_raw().as_bytes(),
             self.writes_root.as_raw().as_bytes(),
-        ])
+        ]))
     }
 }
 
@@ -299,7 +301,7 @@ pub struct LocalExecutionEntry {
     pub tx_hash: TxHash,
     /// Pre-computed global receipt hash (outcome + event_root + writes_root).
     /// Computed on the execution thread pool to avoid recomputation on the state machine.
-    pub receipt_hash: Hash,
+    pub receipt_hash: GlobalReceiptHash,
     /// Full local receipt with shard-filtered database updates and events.
     pub local_receipt: LocalReceipt,
     /// Local execution metadata (fees, logs, errors).

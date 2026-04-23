@@ -5,8 +5,8 @@ use crate::core::RocksDbStorage;
 
 use hyperscale_metrics as metrics;
 use hyperscale_types::{
-    Block, BlockHeight, BlockMetadata, CertifiedBlock, FinalizedWave, Hash, QuorumCertificate,
-    RoutableTransaction, TxHash, WaveCertificate,
+    Block, BlockHeight, BlockMetadata, CertifiedBlock, FinalizedWave, Hash, ProvisionHash,
+    QuorumCertificate, RoutableTransaction, TxHash, WaveCertificate, WaveIdHash,
 };
 use rocksdb::{WriteBatch, WriteOptions};
 use std::sync::Arc;
@@ -110,7 +110,11 @@ impl RocksDbStorage {
             );
         }
         for fw in block.certificates() {
-            self.cf_put::<CertificatesCf>(batch, &fw.wave_id().hash(), fw.certificate.as_ref());
+            self.cf_put::<CertificatesCf>(
+                batch,
+                fw.wave_id().hash().as_raw(),
+                fw.certificate.as_ref(),
+            );
         }
     }
 
@@ -219,7 +223,7 @@ impl RocksDbStorage {
     pub fn get_block_for_sync(
         &self,
         height: BlockHeight,
-    ) -> Option<(Block, QuorumCertificate, Vec<Hash>)> {
+    ) -> Option<(Block, QuorumCertificate, Vec<ProvisionHash>)> {
         let start = Instant::now();
 
         // 1. Get block metadata
@@ -326,12 +330,13 @@ impl RocksDbStorage {
     /// Unlike `get_certificates_batch`, this returns results in the same order
     /// as the input hashes, with missing entries causing the result to be shorter.
     /// Callers should check that the result length matches the input length.
-    fn get_certificates_batch_ordered(&self, hashes: &[Hash]) -> Vec<Arc<WaveCertificate>> {
+    fn get_certificates_batch_ordered(&self, hashes: &[WaveIdHash]) -> Vec<Arc<WaveCertificate>> {
         if hashes.is_empty() {
             return vec![];
         }
 
-        let results = self.cf_multi_get::<CertificatesCf>(hashes);
+        let raw: Vec<Hash> = hashes.iter().map(|h| h.into_raw()).collect();
+        let results = self.cf_multi_get::<CertificatesCf>(&raw);
 
         results
             .into_iter()
@@ -411,26 +416,27 @@ impl RocksDbStorage {
     // ═══════════════════════════════════════════════════════════════════════
 
     /// Store a wave certificate.
-    pub fn put_certificate(&self, hash: &Hash, cert: &WaveCertificate) {
-        self.cf_put_sync::<CertificatesCf>(hash, cert);
+    pub fn put_certificate(&self, hash: &WaveIdHash, cert: &WaveCertificate) {
+        self.cf_put_sync::<CertificatesCf>(hash.as_raw(), cert);
     }
 
     /// Get a wave certificate by wave_id hash.
-    pub fn get_certificate(&self, hash: &Hash) -> Option<WaveCertificate> {
-        self.cf_get::<CertificatesCf>(hash)
+    pub fn get_certificate(&self, hash: &WaveIdHash) -> Option<WaveCertificate> {
+        self.cf_get::<CertificatesCf>(hash.as_raw())
     }
 
     /// Get multiple certificates by hash (batch read).
     ///
     /// Uses RocksDB's `multi_get_cf` for efficient batch retrieval.
     /// Returns only certificates that were found (missing hashes are skipped).
-    pub fn get_certificates_batch(&self, hashes: &[Hash]) -> Vec<WaveCertificate> {
+    pub fn get_certificates_batch(&self, hashes: &[WaveIdHash]) -> Vec<WaveCertificate> {
         if hashes.is_empty() {
             return vec![];
         }
 
         let start = Instant::now();
-        let results = self.cf_multi_get::<CertificatesCf>(hashes);
+        let raw: Vec<Hash> = hashes.iter().map(|h| h.into_raw()).collect();
+        let results = self.cf_multi_get::<CertificatesCf>(&raw);
         let certs: Vec<_> = results.into_iter().flatten().collect();
 
         let elapsed = start.elapsed().as_secs_f64();
@@ -468,7 +474,7 @@ impl RocksDbStorage {
         let mut write_count = 0usize;
 
         // 1. Serialize and add certificate to batch
-        self.cf_put::<CertificatesCf>(&mut batch, &certificate.wave_id.hash(), certificate);
+        self.cf_put::<CertificatesCf>(&mut batch, certificate.wave_id.hash().as_raw(), certificate);
         write_count += 1;
 
         // 2. Append substate writes to the cert batch at the current

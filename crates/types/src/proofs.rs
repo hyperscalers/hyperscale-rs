@@ -16,7 +16,7 @@
 //! of work. This eliminates the N× proof duplication that occurs when the
 //! proof is flattened into each per-transaction struct.
 
-use crate::{BlockHeight, Hash, NodeId, ShardGroupId, StateEntry, TxHash};
+use crate::{BlockHeight, Hash, NodeId, ProvisionHash, ShardGroupId, StateEntry, TxHash};
 use sbor::prelude::*;
 use std::collections::HashSet;
 
@@ -112,7 +112,7 @@ pub struct Provision {
     pub transactions: Vec<TxEntries>,
 
     /// Cached content hash (blake3 over SBOR-encoded content fields).
-    hash: Hash,
+    hash: ProvisionHash,
 }
 
 impl std::fmt::Debug for Provision {
@@ -227,7 +227,7 @@ impl Provision {
     }
 
     /// Content hash (precomputed at construction / deserialization).
-    pub fn hash(&self) -> Hash {
+    pub fn hash(&self) -> ProvisionHash {
         self.hash
     }
 
@@ -236,7 +236,7 @@ impl Provision {
         block_height: &BlockHeight,
         proof: &MerkleInclusionProof,
         transactions: &[TxEntries],
-    ) -> Hash {
+    ) -> ProvisionHash {
         // Encode the content fields (excluding the hash itself) for hashing.
         let mut bytes = Vec::new();
         bytes.extend_from_slice(
@@ -254,7 +254,7 @@ impl Provision {
             &sbor::basic_encode(transactions)
                 .expect("Vec<TxEntries> serialization should never fail"),
         );
-        Hash::from_bytes(&bytes)
+        ProvisionHash::from_raw(Hash::from_bytes(&bytes))
     }
 
     /// Get all node IDs across all transactions.

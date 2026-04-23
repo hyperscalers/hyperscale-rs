@@ -31,7 +31,7 @@ impl SubstateStore for RocksDbStorage {
         BlockHeight(self.read_jmt_metadata().0)
     }
 
-    fn state_root_hash(&self) -> hyperscale_types::StateRoot {
+    fn state_root(&self) -> hyperscale_types::StateRoot {
         let (_, root_hash) = self.read_jmt_metadata();
         root_hash
     }

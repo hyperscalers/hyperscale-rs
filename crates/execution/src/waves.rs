@@ -397,8 +397,8 @@ impl WaveRegistry {
 mod tests {
     use super::*;
     use hyperscale_types::{
-        test_utils::test_transaction, BlockHash, BlockHeight, ExecutionOutcome, ShardGroupId,
-        SignerBitfield,
+        test_utils::test_transaction, BlockHash, BlockHeight, ExecutionOutcome, GlobalReceiptHash,
+        ShardGroupId, SignerBitfield,
     };
 
     fn shard() -> ShardGroupId {
@@ -432,7 +432,7 @@ mod tests {
         TxOutcome {
             tx_hash,
             outcome: ExecutionOutcome::Executed {
-                receipt_hash: Hash::ZERO,
+                receipt_hash: GlobalReceiptHash::ZERO,
                 success: true,
             },
         }

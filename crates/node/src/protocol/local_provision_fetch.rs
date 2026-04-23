@@ -5,7 +5,7 @@
 //! through peers on failure.
 
 use hyperscale_metrics as metrics;
-use hyperscale_types::{BlockHash, Hash, Provision, ValidatorId};
+use hyperscale_types::{BlockHash, Provision, ProvisionHash, ValidatorId};
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use tracing::{debug, info, trace};
@@ -35,7 +35,7 @@ pub enum LocalProvisionFetchInput {
     Request {
         block_hash: BlockHash,
         proposer: ValidatorId,
-        batch_hashes: Vec<Hash>,
+        batch_hashes: Vec<ProvisionHash>,
     },
     /// Provision batches were received.
     Received {
@@ -45,7 +45,7 @@ pub enum LocalProvisionFetchInput {
     /// A fetch operation failed.
     Failed {
         block_hash: BlockHash,
-        hashes: Vec<Hash>,
+        hashes: Vec<ProvisionHash>,
     },
     /// Cancel fetch for a specific block.
     CancelFetch { block_hash: BlockHash },
@@ -60,7 +60,7 @@ pub enum LocalProvisionFetchOutput {
     Fetch {
         block_hash: BlockHash,
         proposer: ValidatorId,
-        batch_hashes: Vec<Hash>,
+        batch_hashes: Vec<ProvisionHash>,
     },
     /// Deliver fetched provision batches to BFT.
     Deliver { batches: Vec<Arc<Provision>> },
@@ -70,14 +70,14 @@ pub enum LocalProvisionFetchOutput {
 #[derive(Debug)]
 struct BlockFetchState {
     proposer: ValidatorId,
-    missing_hashes: HashSet<Hash>,
-    in_flight_hashes: HashSet<Hash>,
-    received_hashes: HashSet<Hash>,
+    missing_hashes: HashSet<ProvisionHash>,
+    in_flight_hashes: HashSet<ProvisionHash>,
+    received_hashes: HashSet<ProvisionHash>,
     in_flight_count: usize,
 }
 
 impl BlockFetchState {
-    fn new(proposer: ValidatorId, hashes: Vec<Hash>) -> Self {
+    fn new(proposer: ValidatorId, hashes: Vec<ProvisionHash>) -> Self {
         Self {
             proposer,
             missing_hashes: hashes.into_iter().collect(),
@@ -91,21 +91,21 @@ impl BlockFetchState {
         self.missing_hashes.is_empty() && self.in_flight_hashes.is_empty()
     }
 
-    fn hashes_to_fetch(&self) -> Vec<Hash> {
+    fn hashes_to_fetch(&self) -> Vec<ProvisionHash> {
         self.missing_hashes
             .difference(&self.in_flight_hashes)
             .copied()
             .collect()
     }
 
-    fn mark_in_flight(&mut self, hashes: &[Hash]) {
+    fn mark_in_flight(&mut self, hashes: &[ProvisionHash]) {
         for hash in hashes {
             self.in_flight_hashes.insert(*hash);
         }
         self.in_flight_count += 1;
     }
 
-    fn mark_received(&mut self, hashes: impl IntoIterator<Item = Hash>) {
+    fn mark_received(&mut self, hashes: impl IntoIterator<Item = ProvisionHash>) {
         for hash in hashes {
             self.missing_hashes.remove(&hash);
             self.in_flight_hashes.remove(&hash);
@@ -113,11 +113,11 @@ impl BlockFetchState {
         }
     }
 
-    fn was_received(&self, hash: &Hash) -> bool {
+    fn was_received(&self, hash: &ProvisionHash) -> bool {
         self.received_hashes.contains(hash)
     }
 
-    fn mark_fetch_failed(&mut self, hashes: &[Hash]) {
+    fn mark_fetch_failed(&mut self, hashes: &[ProvisionHash]) {
         for hash in hashes {
             self.in_flight_hashes.remove(hash);
         }
@@ -132,7 +132,7 @@ impl BlockFetchState {
     /// Called after marking received items to handle partial/empty responses.
     fn reclaim_unreceived(&mut self) {
         if self.in_flight_count == 0 && !self.in_flight_hashes.is_empty() {
-            let stuck: Vec<Hash> = self
+            let stuck: Vec<ProvisionHash> = self
                 .in_flight_hashes
                 .iter()
                 .filter(|h| !self.received_hashes.contains(h))
@@ -195,7 +195,7 @@ impl LocalProvisionFetchProtocol {
         &mut self,
         block_hash: BlockHash,
         proposer: ValidatorId,
-        batch_hashes: Vec<Hash>,
+        batch_hashes: Vec<ProvisionHash>,
     ) -> Vec<LocalProvisionFetchOutput> {
         if batch_hashes.is_empty() {
             return vec![];
@@ -235,7 +235,7 @@ impl LocalProvisionFetchProtocol {
 
         state.mark_fetch_complete();
 
-        let received_hashes: Vec<Hash> = batches.iter().map(|b| b.hash()).collect();
+        let received_hashes: Vec<ProvisionHash> = batches.iter().map(|b| b.hash()).collect();
         let received_count = received_hashes.len();
         state.mark_received(received_hashes);
         // Move any in-flight hashes not in the response back to missing for retry.
@@ -267,7 +267,7 @@ impl LocalProvisionFetchProtocol {
     fn handle_failed(
         &mut self,
         block_hash: BlockHash,
-        hashes: Vec<Hash>,
+        hashes: Vec<ProvisionHash>,
     ) -> Vec<LocalProvisionFetchOutput> {
         if let Some(state) = self.fetches.get_mut(&block_hash) {
             state.mark_fetch_failed(&hashes);

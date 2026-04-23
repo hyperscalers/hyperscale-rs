@@ -13,7 +13,7 @@
 //! the complete block data, making it recoverable from any honest validator in that set.
 
 use hyperscale_core::{Action, CommitSource, ProtocolEvent, TimerId};
-use hyperscale_types::{BlockHash, ProposerTimestamp};
+use hyperscale_types::{BlockHash, ProposerTimestamp, ProvisionHash, WaveIdHash};
 
 /// BFT statistics for monitoring.
 #[derive(Clone, Copy, Debug, Default)]
@@ -49,8 +49,10 @@ pub struct BftMemoryStats {
 /// Index type for simulation-only node routing.
 /// Production uses ValidatorId (from message signatures) and PeerId (libp2p).
 pub type NodeIndex = u32;
+#[cfg(test)]
+use hyperscale_types::Hash;
 use hyperscale_types::{
-    Block, BlockHeader, BlockHeight, BlockManifest, BlockVote, CertifiedBlock, FinalizedWave, Hash,
+    Block, BlockHeader, BlockHeight, BlockManifest, BlockVote, CertifiedBlock, FinalizedWave,
     Provision, QuorumCertificate, Round, RoutableTransaction, StateRoot, TopologySnapshot, TxHash,
 };
 use std::collections::HashMap;
@@ -881,8 +883,8 @@ impl BftCoordinator {
         header: BlockHeader,
         manifest: BlockManifest,
         lookup_tx: impl Fn(&TxHash) -> Option<Arc<RoutableTransaction>>,
-        lookup_finalized_wave: impl Fn(&Hash) -> Option<Arc<FinalizedWave>>,
-        lookup_provision: impl Fn(&Hash) -> Option<Arc<Provision>>,
+        lookup_finalized_wave: impl Fn(&WaveIdHash) -> Option<Arc<FinalizedWave>>,
+        lookup_provision: impl Fn(&ProvisionHash) -> Option<Arc<Provision>>,
     ) -> Vec<Action> {
         let block_hash = header.hash();
         let height = header.height;
@@ -1053,8 +1055,8 @@ impl BftCoordinator {
         header: BlockHeader,
         manifest: BlockManifest,
         lookup_tx: impl Fn(&TxHash) -> Option<Arc<RoutableTransaction>>,
-        lookup_finalized_wave: impl Fn(&Hash) -> Option<Arc<FinalizedWave>>,
-        lookup_provision: impl Fn(&Hash) -> Option<Arc<Provision>>,
+        lookup_finalized_wave: impl Fn(&WaveIdHash) -> Option<Arc<FinalizedWave>>,
+        lookup_provision: impl Fn(&ProvisionHash) -> Option<Arc<Provision>>,
     ) {
         let block_hash = header.hash();
         let mut pending = PendingBlock::from_manifest(header, manifest, self.now);
@@ -2795,7 +2797,7 @@ impl BftCoordinator {
     pub fn check_pending_blocks_for_finalized_wave(
         &mut self,
         topology: &TopologySnapshot,
-        wave_id_hash: Hash,
+        wave_id_hash: WaveIdHash,
         fw: &Arc<FinalizedWave>,
     ) -> Vec<Action> {
         if let Err(err) = fw.validate_receipts_against_ec() {
@@ -3154,9 +3156,9 @@ impl BftCoordinator {
         &self,
         parent_hash: BlockHash,
     ) -> (
-        std::collections::HashSet<Hash>,
+        std::collections::HashSet<WaveIdHash>,
         std::collections::HashSet<TxHash>,
-        std::collections::HashSet<Hash>,
+        std::collections::HashSet<ProvisionHash>,
     ) {
         self.chain_view()
             .collect_ancestor_hashes(parent_hash, &self.tx_cache)
@@ -3247,9 +3249,9 @@ mod tests {
     use super::*;
     use hyperscale_types::{
         generate_bls_keypair, zero_bls_signature, Bls12381G1PrivateKey, Bls12381G2Signature,
-        CertificateRoot, GlobalReceiptRoot, LocalReceiptRoot, ProvisionsRoot, ShardGroupId,
-        SignerBitfield, TopologySnapshot, TransactionRoot, ValidatorId, ValidatorInfo,
-        ValidatorSet, WeightedTimestamp,
+        CertificateRoot, GlobalReceiptHash, GlobalReceiptRoot, LocalReceiptRoot, ProvisionsRoot,
+        ShardGroupId, SignerBitfield, TopologySnapshot, TransactionRoot, ValidatorId,
+        ValidatorInfo, ValidatorSet, WeightedTimestamp,
     };
     use std::collections::BTreeMap;
 
@@ -4475,7 +4477,7 @@ mod tests {
             vec![TxOutcome {
                 tx_hash,
                 outcome: ExecutionOutcome::Executed {
-                    receipt_hash: Hash::ZERO,
+                    receipt_hash: GlobalReceiptHash::ZERO,
                     success: true,
                 },
             }],

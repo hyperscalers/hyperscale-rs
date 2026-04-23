@@ -7,7 +7,9 @@
 
 use hyperscale_execution::{ExecutionCoordinator, ExecutionMemoryStats};
 use hyperscale_test_helpers::TestCommittee;
-use hyperscale_types::{BlockHeight, Hash, ShardGroupId, TopologySnapshot, TxHash, WaveId};
+use hyperscale_types::{
+    BlockHeight, Hash, ShardGroupId, TopologySnapshot, TxHash, WaveId, WaveIdHash,
+};
 
 fn fresh_coordinator() -> ExecutionCoordinator {
     ExecutionCoordinator::new()
@@ -89,7 +91,7 @@ fn fresh_get_finalized_certificate_returns_none_for_any_tx() {
 fn fresh_get_finalized_wave_by_hash_returns_none_for_any_hash() {
     let coord = fresh_coordinator();
     assert!(coord
-        .get_finalized_wave_by_hash(&Hash::from_bytes(b"wave_hash"))
+        .get_finalized_wave_by_hash(&WaveIdHash::from_raw(Hash::from_bytes(b"wave_hash")))
         .is_none());
 }
 

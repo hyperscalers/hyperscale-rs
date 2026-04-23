@@ -16,7 +16,7 @@
 //! building, which iterates the store to include finalized waves in block
 //! order.
 
-use hyperscale_types::{FinalizedWave, Hash, TxHash, WaveCertificate, WaveId};
+use hyperscale_types::{FinalizedWave, TxHash, WaveCertificate, WaveId, WaveIdHash};
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
@@ -51,7 +51,7 @@ impl FinalizedWaveStore {
     /// Lookup by the hash of a wave's `WaveId`. Peers reference waves by
     /// `wave_id.hash()` in fetch requests, so this is the primary ingress
     /// lookup for serving finalized-wave data.
-    pub fn get_by_wave_id_hash(&self, wave_id_hash: &Hash) -> Option<Arc<FinalizedWave>> {
+    pub fn get_by_wave_id_hash(&self, wave_id_hash: &WaveIdHash) -> Option<Arc<FinalizedWave>> {
         self.waves
             .values()
             .find(|fw| fw.certificate.wave_id.hash() == *wave_id_hash)
@@ -102,8 +102,9 @@ impl FinalizedWaveStore {
 mod tests {
     use super::*;
     use hyperscale_types::{
-        zero_bls_signature, BlockHeight, ExecutionCertificate, ExecutionOutcome, GlobalReceiptRoot,
-        ShardGroupId, SignerBitfield, TxHash, TxOutcome, WeightedTimestamp,
+        zero_bls_signature, BlockHeight, ExecutionCertificate, ExecutionOutcome, GlobalReceiptHash,
+        GlobalReceiptRoot, Hash, ShardGroupId, SignerBitfield, TxHash, TxOutcome,
+        WeightedTimestamp,
     };
 
     fn make_wave_id(block_height: u64) -> WaveId {
@@ -121,7 +122,7 @@ mod tests {
             .map(|h| TxOutcome {
                 tx_hash: *h,
                 outcome: ExecutionOutcome::Executed {
-                    receipt_hash: Hash::ZERO,
+                    receipt_hash: GlobalReceiptHash::ZERO,
                     success: true,
                 },
             })
@@ -188,7 +189,7 @@ mod tests {
 
         // Unknown hash returns None.
         assert!(store
-            .get_by_wave_id_hash(&Hash::from_bytes(b"unknown"))
+            .get_by_wave_id_hash(&WaveIdHash::from_raw(Hash::from_bytes(b"unknown")))
             .is_none());
     }
 

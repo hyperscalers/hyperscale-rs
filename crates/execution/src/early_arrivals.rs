@@ -276,7 +276,8 @@ mod tests {
     use super::*;
     use hyperscale_types::{
         bls_keypair_from_seed, exec_vote_message, zero_bls_signature, BlockHash, BlockHeight,
-        ExecutionOutcome, ShardGroupId, SignerBitfield, TxHash, TxOutcome, ValidatorId,
+        ExecutionOutcome, GlobalReceiptHash, ShardGroupId, SignerBitfield, TxHash, TxOutcome,
+        ValidatorId,
     };
 
     fn shard() -> ShardGroupId {
@@ -299,7 +300,7 @@ mod tests {
         TxOutcome {
             tx_hash: tx,
             outcome: ExecutionOutcome::Executed {
-                receipt_hash: Hash::ZERO,
+                receipt_hash: GlobalReceiptHash::ZERO,
                 success: true,
             },
         }

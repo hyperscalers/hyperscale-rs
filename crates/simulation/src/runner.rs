@@ -481,7 +481,7 @@ impl SimulationRunner {
         for shard_id in 0..num_shards {
             let shard_start = shard_id * validators_per_shard;
             let first_node_storage = self.io_loops[shard_start as usize].storage();
-            let genesis_jmt_root = first_node_storage.state_root_hash();
+            let genesis_jmt_root = first_node_storage.state_root();
 
             info!(
                 shard = shard_id,

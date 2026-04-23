@@ -292,8 +292,10 @@ pub(crate) fn handle_delegated_action<
             batch_hashes,
         } => {
             let start = std::time::Instant::now();
+            let raw_batch_hashes: Vec<hyperscale_types::Hash> =
+                batch_hashes.iter().map(|h| h.into_raw()).collect();
             let valid =
-                hyperscale_bft::handlers::verify_provision_root(expected_root, &batch_hashes);
+                hyperscale_bft::handlers::verify_provision_root(expected_root, &raw_batch_hashes);
             metrics::record_signature_verification_latency(
                 "provision_root",
                 start.elapsed().as_secs_f64(),

@@ -352,7 +352,7 @@ fn test_initial_jmt_height_is_zero() {
 #[test]
 fn test_initial_state_root_is_zero() {
     let storage = SimStorage::new();
-    assert_eq!(storage.state_root_hash(), StateRoot::ZERO);
+    assert_eq!(storage.state_root(), StateRoot::ZERO);
 }
 
 #[test]
@@ -370,14 +370,14 @@ fn test_jmt_height_increments_on_commit() {
 #[test]
 fn test_state_root_changes_on_commit() {
     let storage = SimStorage::new();
-    let root0 = storage.state_root_hash();
+    let root0 = storage.state_root();
 
     storage.commit_shared(&make_database_update(vec![1, 2, 3], 0, vec![10], vec![1]));
-    let root1 = storage.state_root_hash();
+    let root1 = storage.state_root();
     assert_ne!(root0, root1, "root should change after first commit");
 
     storage.commit_shared(&make_database_update(vec![4, 5, 6], 0, vec![20], vec![2]));
-    let root2 = storage.state_root_hash();
+    let root2 = storage.state_root();
     assert_ne!(root1, root2, "root should change after second commit");
 }
 
@@ -391,7 +391,7 @@ fn test_state_root_deterministic() {
     s1.commit_shared(&updates);
     s2.commit_shared(&updates);
 
-    assert_eq!(s1.state_root_hash(), s2.state_root_hash());
+    assert_eq!(s1.state_root(), s2.state_root());
     assert_eq!(s1.jmt_height(), s2.jmt_height());
 }
 
@@ -403,7 +403,7 @@ fn test_state_root_differs_for_different_data() {
     s1.commit_shared(&make_database_update(vec![1, 2, 3], 0, vec![10], vec![1]));
     s2.commit_shared(&make_database_update(vec![1, 2, 3], 0, vec![10], vec![2]));
 
-    assert_ne!(s1.state_root_hash(), s2.state_root_hash());
+    assert_ne!(s1.state_root(), s2.state_root());
 }
 
 #[test]
@@ -462,7 +462,7 @@ fn test_prepare_then_commit_fast_path() {
     let qc = make_test_qc(&block);
 
     // Prepare path
-    let parent_root = s_prepared.state_root_hash();
+    let parent_root = s_prepared.state_root();
     let (spec_root, prepared) = s_prepared.prepare_block_commit(
         parent_root,
         BlockHeight::GENESIS,
@@ -492,7 +492,7 @@ fn test_prepare_commit_state_root_matches() {
     let block = make_test_block(BlockHeight(1));
     let qc = make_test_qc(&block);
 
-    let parent_root = storage.state_root_hash();
+    let parent_root = storage.state_root();
     let (spec_root, prepared) = storage.prepare_block_commit(
         parent_root,
         BlockHeight::GENESIS,
@@ -524,7 +524,7 @@ fn test_clear() {
     storage.clear();
 
     assert_eq!(storage.jmt_height(), BlockHeight(0));
-    assert_eq!(storage.state_root_hash(), StateRoot::ZERO);
+    assert_eq!(storage.state_root(), StateRoot::ZERO);
     assert!(storage.is_empty());
 }
 

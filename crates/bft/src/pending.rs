@@ -3,9 +3,11 @@
 //! Tracks blocks being assembled from headers + gossiped transactions + finalized waves.
 
 use hyperscale_core::Action;
+#[cfg(test)]
+use hyperscale_types::Hash;
 use hyperscale_types::{
-    Block, BlockHash, BlockHeader, BlockManifest, FinalizedWave, Hash, Provision,
-    RoutableTransaction, TopologySnapshot, TxHash,
+    Block, BlockHash, BlockHeader, BlockManifest, FinalizedWave, Provision, ProvisionHash,
+    RoutableTransaction, TopologySnapshot, TxHash, WaveIdHash,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -41,17 +43,17 @@ pub struct PendingBlock {
     ///
     /// A block is complete once
     /// all its waves have been independently finalized by this validator.
-    received_waves: BTreeMap<Hash, Arc<FinalizedWave>>,
+    received_waves: BTreeMap<WaveIdHash, Arc<FinalizedWave>>,
 
     /// Set of wave_id hashes we're still waiting for.
-    missing_wave_hashes: HashSet<Hash>,
+    missing_wave_hashes: HashSet<WaveIdHash>,
 
     /// Received provision batches keyed by batch hash. BTreeMap so
     /// `provisions()` iteration is deterministic across validators.
-    received_provisions: BTreeMap<Hash, Arc<Provision>>,
+    received_provisions: BTreeMap<ProvisionHash, Arc<Provision>>,
 
     /// Set of provision batch hashes we're still waiting for.
-    missing_provision_hashes: HashSet<Hash>,
+    missing_provision_hashes: HashSet<ProvisionHash>,
 
     /// The fully constructed block (None until all transactions/waves received).
     constructed_block: Option<Arc<Block>>,
@@ -71,8 +73,9 @@ impl PendingBlock {
         let total_tx_count = manifest.transaction_count();
         let missing_transaction_hashes: HashSet<TxHash> =
             manifest.tx_hashes.iter().copied().collect();
-        let missing_wave_hashes: HashSet<Hash> = manifest.cert_hashes.iter().copied().collect();
-        let missing_provision_hashes: HashSet<Hash> =
+        let missing_wave_hashes: HashSet<WaveIdHash> =
+            manifest.cert_hashes.iter().copied().collect();
+        let missing_provision_hashes: HashSet<ProvisionHash> =
             manifest.provision_hashes.iter().copied().collect();
 
         Self {
@@ -101,11 +104,12 @@ impl PendingBlock {
         provisions: Vec<Arc<Provision>>,
         created_at: Duration,
     ) -> Self {
-        let mut provision_hashes: Vec<Hash> = provisions.iter().map(|p| p.hash()).collect();
+        let mut provision_hashes: Vec<ProvisionHash> =
+            provisions.iter().map(|p| p.hash()).collect();
         provision_hashes.sort();
         let mut manifest = BlockManifest::from_block(block);
         manifest.provision_hashes = provision_hashes;
-        let mut received_provisions: BTreeMap<Hash, Arc<Provision>> = BTreeMap::new();
+        let mut received_provisions: BTreeMap<ProvisionHash, Arc<Provision>> = BTreeMap::new();
         for batch in provisions {
             received_provisions.insert(batch.hash(), batch);
         }
@@ -194,7 +198,7 @@ impl PendingBlock {
     }
 
     /// Check if this pending block needs a specific finalized wave.
-    pub fn needs_wave(&self, wave_id_hash: &Hash) -> bool {
+    pub fn needs_wave(&self, wave_id_hash: &WaveIdHash) -> bool {
         self.missing_wave_hashes.contains(wave_id_hash)
     }
 
@@ -212,17 +216,17 @@ impl PendingBlock {
     }
 
     /// Get the missing provision batch hashes as a Vec.
-    pub fn missing_provisions(&self) -> Vec<Hash> {
+    pub fn missing_provisions(&self) -> Vec<ProvisionHash> {
         self.missing_provision_hashes.iter().copied().collect()
     }
 
     /// Check if this pending block needs a specific provision batch.
-    pub fn needs_provision(&self, batch_hash: &Hash) -> bool {
+    pub fn needs_provision(&self, batch_hash: &ProvisionHash) -> bool {
         self.missing_provision_hashes.contains(batch_hash)
     }
 
     /// Get the missing wave ID hashes as a Vec.
-    pub fn missing_waves(&self) -> Vec<Hash> {
+    pub fn missing_waves(&self) -> Vec<WaveIdHash> {
         self.missing_wave_hashes.iter().copied().collect()
     }
 
@@ -459,8 +463,8 @@ mod tests {
     #[test]
     fn test_pending_block_with_waves() {
         let tx1 = TxHash::from_raw(Hash::from_bytes(b"tx1"));
-        let wave1 = Hash::from_bytes(b"wave1");
-        let wave2 = Hash::from_bytes(b"wave2");
+        let wave1 = WaveIdHash::from_raw(Hash::from_bytes(b"wave1"));
+        let wave2 = WaveIdHash::from_raw(Hash::from_bytes(b"wave2"));
         let header = make_header(BlockHeight(1));
 
         let pb = PendingBlock::from_manifest(

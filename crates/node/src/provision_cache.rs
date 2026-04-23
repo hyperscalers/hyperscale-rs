@@ -10,7 +10,7 @@
 //! Eviction is opportunistic: `insert` sweeps expired entries at most
 //! once per second. The secondary `by_expiry` index makes sweeps O(log n)
 //! in the number of expiring buckets.
-use hyperscale_types::{Hash, Provision, WeightedTimestamp, WAVE_TIMEOUT};
+use hyperscale_types::{Provision, ProvisionHash, WeightedTimestamp, WAVE_TIMEOUT};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -35,8 +35,8 @@ struct Entry {
 }
 
 struct Inner {
-    by_hash: HashMap<Hash, Entry>,
-    by_expiry: BTreeMap<WeightedTimestamp, Vec<Hash>>,
+    by_hash: HashMap<ProvisionHash, Entry>,
+    by_expiry: BTreeMap<WeightedTimestamp, Vec<ProvisionHash>>,
     last_sweep_ts: WeightedTimestamp,
     last_observed_ts: WeightedTimestamp,
 }
@@ -91,7 +91,7 @@ impl ProvisionCache {
     /// the periodic sweep, and a brief window of stale reads is harmless
     /// (the serve path's Live/Sealed decision uses block age, not cache
     /// entry age).
-    pub fn get(&self, hash: &Hash) -> Option<Arc<Provision>> {
+    pub fn get(&self, hash: &ProvisionHash) -> Option<Arc<Provision>> {
         self.inner
             .lock()
             .unwrap()

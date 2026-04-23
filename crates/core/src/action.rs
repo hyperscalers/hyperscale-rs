@@ -5,10 +5,11 @@ use hyperscale_messages::TransactionGossip;
 use hyperscale_types::{
     Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, BlockVote, Bls12381G1PublicKey,
     Bls12381G2Signature, CertificateRoot, CommittedBlockHeader, EpochConfig, EpochId,
-    ExecutionCertificate, ExecutionVote, FinalizedWave, GlobalReceiptRoot, Hash, LocalReceiptRoot,
-    NodeId, ProposerTimestamp, Provision, ProvisionsRoot, QuorumCertificate, ReceiptBundle, Round,
-    RoutableTransaction, ShardGroupId, SignerBitfield, StateProvision, StateRoot, TopologySnapshot,
-    TransactionRoot, TxHash, TxOutcome, ValidatorId, VotePower, WaveId, WeightedTimestamp,
+    ExecutionCertificate, ExecutionVote, FinalizedWave, GlobalReceiptRoot, LocalReceiptRoot,
+    NodeId, ProposerTimestamp, Provision, ProvisionHash, ProvisionTxRoot, ProvisionsRoot,
+    QuorumCertificate, ReceiptBundle, Round, RoutableTransaction, ShardGroupId, SignerBitfield,
+    StateProvision, StateRoot, TopologySnapshot, TransactionRoot, TxHash, TxOutcome, ValidatorId,
+    VotePower, WaveId, WaveIdHash, WeightedTimestamp,
 };
 use std::collections::HashMap;
 use std::fmt;
@@ -447,7 +448,7 @@ pub enum Action {
         block_hash: BlockHash,
         expected_root: ProvisionsRoot,
         /// Provision batch hashes from the block manifest.
-        batch_hashes: Vec<Hash>,
+        batch_hashes: Vec<ProvisionHash>,
     },
 
     /// Verify a block's receipt root.
@@ -491,7 +492,7 @@ pub enum Action {
     VerifyProvisionTxRoots {
         block_hash: BlockHash,
         /// Expected per-target roots from block header.
-        expected: std::collections::BTreeMap<ShardGroupId, Hash>,
+        expected: std::collections::BTreeMap<ShardGroupId, ProvisionTxRoot>,
         /// Transactions in the block.
         transactions: Vec<Arc<RoutableTransaction>>,
         /// Topology snapshot used to route txs to target shards.
@@ -821,7 +822,7 @@ pub enum Action {
         /// The proposer of the block (preferred fetch target).
         proposer: ValidatorId,
         /// Hashes of the missing provision batches.
-        batch_hashes: Vec<Hash>,
+        batch_hashes: Vec<ProvisionHash>,
     },
 
     /// Fetch missing finalized wave data for a pending block.
@@ -835,7 +836,7 @@ pub enum Action {
         /// The proposer of the block (preferred fetch target).
         proposer: ValidatorId,
         /// Wave ID hashes (from `BlockManifest.cert_hashes`) of missing waves.
-        wave_id_hashes: Vec<Hash>,
+        wave_id_hashes: Vec<WaveIdHash>,
     },
 
     /// Cancel any pending fetch operations for a block.

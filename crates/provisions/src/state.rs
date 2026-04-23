@@ -13,8 +13,8 @@
 
 use hyperscale_core::{Action, ProtocolEvent};
 use hyperscale_types::{
-    compute_padded_merkle_root, BlockHeight, CommittedBlockHeader, Hash, Provision, ShardGroupId,
-    TopologySnapshot, ValidatorId, WAVE_TIMEOUT,
+    compute_padded_merkle_root, BlockHeight, CommittedBlockHeader, Hash, Provision, ProvisionHash,
+    ProvisionTxRoot, ShardGroupId, TopologySnapshot, ValidatorId, WAVE_TIMEOUT,
 };
 #[cfg(test)]
 use hyperscale_types::{
@@ -160,7 +160,7 @@ pub struct ProvisionCoordinator {
     /// Hash-keyed index into verified batches for O(1) lookup by content hash.
     /// Populated alongside `verified_batches`. Used by `get_batch_by_hash()`
     /// and for efficient pruning in `on_block_committed`.
-    batches_by_hash: HashMap<Hash, Arc<Provision>>,
+    batches_by_hash: HashMap<ProvisionHash, Arc<Provision>>,
 
     // ═══════════════════════════════════════════════════════════════════
     // Expected Provision Tracking (fallback detection)
@@ -194,7 +194,7 @@ pub struct ProvisionCoordinator {
     /// Prevents re-queueing if a duplicate batch arrives via gossip after commit.
     /// Maps hash → committing QC's `weighted_timestamp_ms` for age-based
     /// pruning anchored on BFT-authenticated time.
-    committed_batch_tombstones: HashMap<Hash, u64>,
+    committed_batch_tombstones: HashMap<ProvisionHash, u64>,
 
     /// Committed provision hashes grouped by the local weighted timestamp
     /// (ms) at which they committed. Drives deferred eviction: entries
@@ -202,7 +202,7 @@ pub struct ProvisionCoordinator {
     /// behind the local tip ts, at which point they're dropped. Ensures
     /// peers catching up can still receive `Block::Live` (with inline
     /// provisions) for any block within the cross-shard execution window.
-    committed_retention: BTreeMap<u64, Vec<Hash>>,
+    committed_retention: BTreeMap<u64, Vec<ProvisionHash>>,
 
     // ═══════════════════════════════════════════════════════════════════
     // Time
@@ -300,7 +300,7 @@ impl ProvisionCoordinator {
         // evict them yet — peers catching up within the cross-shard
         // execution window still need them attached to `Block::Live`
         // sync responses. Eviction happens below once they age out.
-        let committed: std::collections::HashSet<Hash> =
+        let committed: std::collections::HashSet<ProvisionHash> =
             block.provisions().iter().map(|p| p.hash()).collect();
         if !committed.is_empty() {
             for h in &committed {
@@ -603,7 +603,7 @@ impl ProvisionCoordinator {
             .iter()
             .map(|t| t.tx_hash.into_raw())
             .collect();
-        let computed_root = compute_padded_merkle_root(&leaves);
+        let computed_root = ProvisionTxRoot::from_raw(compute_padded_merkle_root(&leaves));
 
         if computed_root != expected_root {
             warn!(
@@ -735,7 +735,7 @@ impl ProvisionCoordinator {
     }
 
     /// Look up a verified provision batch by its content hash.
-    pub fn get_batch_by_hash(&self, hash: &Hash) -> Option<Arc<Provision>> {
+    pub fn get_batch_by_hash(&self, hash: &ProvisionHash) -> Option<Arc<Provision>> {
         self.batches_by_hash.get(hash).cloned()
     }
 
@@ -817,7 +817,7 @@ mod tests {
         let mut header_arc = make_committed_header_with_targets(shard, height, vec![local_shard]);
         let header = Arc::get_mut(&mut header_arc).unwrap();
         let raw: Vec<Hash> = tx_hashes.iter().map(|h| h.into_raw()).collect();
-        let root = hyperscale_types::compute_padded_merkle_root(&raw);
+        let root = ProvisionTxRoot::from_raw(hyperscale_types::compute_padded_merkle_root(&raw));
         header.header.provision_tx_roots.insert(local_shard, root);
         header_arc
     }

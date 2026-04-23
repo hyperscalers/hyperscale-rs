@@ -3,8 +3,8 @@
 use crate::ProtocolEvent;
 use hyperscale_types::{
     BlockHash, BlockHeight, Bls12381G1PublicKey, Bls12381G2Signature, CertifiedBlock,
-    CommittedBlockHeader, ExecutionCertificate, FinalizedWave, Hash, Provision,
-    RoutableTransaction, ShardGroupId, TxHash, ValidatorId,
+    CommittedBlockHeader, ExecutionCertificate, FinalizedWave, Provision, ProvisionHash,
+    RoutableTransaction, ShardGroupId, TxHash, ValidatorId, WaveIdHash,
 };
 use std::sync::Arc;
 
@@ -83,7 +83,7 @@ pub enum NodeInput {
     /// Local provision fetch failed.
     LocalProvisionFetchFailed {
         block_hash: BlockHash,
-        hashes: Vec<Hash>,
+        hashes: Vec<ProvisionHash>,
     },
 
     /// Finalized waves received from a peer in response to a fetch request.
@@ -95,7 +95,7 @@ pub enum NodeInput {
     /// A finalized wave fetch request failed.
     FinalizedWaveFetchFailed {
         block_hash: BlockHash,
-        hashes: Vec<Hash>,
+        hashes: Vec<WaveIdHash>,
     },
 
     /// Transaction validated by the validation pipeline.

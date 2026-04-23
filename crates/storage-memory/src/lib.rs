@@ -9,7 +9,7 @@
 //! # JMT Integration
 //!
 //! Uses `SimTreeStore` for Jellyfish Merkle Tree (JMT) tracking, providing
-//! `jmt_height()` and `state_root_hash()` for state commitment. This ensures
+//! `jmt_height()` and `state_root()` for state commitment. This ensures
 //! simulation has identical JMT behavior to production.
 
 mod chain_reader;

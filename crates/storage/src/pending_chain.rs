@@ -463,8 +463,8 @@ impl<S: SubstateStore + crate::VersionedStore> SubstateStore for SubstateView<S>
         (*self.base).jmt_height()
     }
 
-    fn state_root_hash(&self) -> StateRoot {
-        (*self.base).state_root_hash()
+    fn state_root(&self) -> StateRoot {
+        (*self.base).state_root()
     }
 
     fn list_substates_for_node_at_height(
@@ -700,7 +700,7 @@ mod tests {
         fn jmt_height(&self) -> BlockHeight {
             BlockHeight::GENESIS
         }
-        fn state_root_hash(&self) -> StateRoot {
+        fn state_root(&self) -> StateRoot {
             StateRoot::ZERO
         }
         fn list_substates_for_node_at_height(
@@ -758,7 +758,7 @@ mod tests {
         }
         fn get_certificates_batch(
             &self,
-            _hashes: &[Hash],
+            _hashes: &[hyperscale_types::WaveIdHash],
         ) -> Vec<hyperscale_types::WaveCertificate> {
             Vec::new()
         }

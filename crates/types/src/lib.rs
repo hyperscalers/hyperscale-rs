@@ -69,9 +69,9 @@ pub use hash::{
     verify_merkle_inclusion, Hash, TypedHash,
 };
 pub use hash_kinds::{
-    BlockHash, CertificateRoot, EventRoot, ExecutionCertificateHash, GlobalReceiptRoot,
-    LocalReceiptRoot, ProvisionsRoot, StateRoot, TransactionRoot, TxHash, WaveReceiptHash,
-    WritesRoot,
+    BlockHash, CertificateRoot, EventRoot, ExecutionCertificateHash, GlobalReceiptHash,
+    GlobalReceiptRoot, LocalReceiptRoot, ProvisionHash, ProvisionTxRoot, ProvisionsRoot, StateRoot,
+    TransactionRoot, TxHash, WaveIdHash, WaveReceiptHash, WritesRoot,
 };
 pub use identifiers::{
     Attempt, BlockHeight, NodeId, PartitionNumber, Round, ShardGroupId, ValidatorId, VotePower,

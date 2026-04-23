@@ -38,11 +38,13 @@
 //! proofs are received, a WaveCertificate is created.
 
 use hyperscale_core::{Action, ProtocolEvent, ProvisionRequest};
+#[cfg(test)]
+use hyperscale_types::Hash;
 use hyperscale_types::{
     Attempt, Block, BlockHash, BlockHeight, ExecutionCertificate, ExecutionOutcome, ExecutionVote,
-    GlobalReceiptRoot, Hash, LocalExecutionEntry, NodeId, Provision, ReceiptBundle,
-    RoutableTransaction, ShardGroupId, TopologySnapshot, TransactionDecision, TxHash, TxOutcome,
-    ValidatorId, WaveCertificate, WaveId, WeightedTimestamp,
+    GlobalReceiptRoot, LocalExecutionEntry, NodeId, Provision, ReceiptBundle, RoutableTransaction,
+    ShardGroupId, TopologySnapshot, TransactionDecision, TxHash, TxOutcome, ValidatorId,
+    WaveCertificate, WaveId, WaveIdHash, WeightedTimestamp,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -1561,7 +1563,10 @@ impl ExecutionCoordinator {
     }
 
     /// Get a finalized wave by its wave_id hash (returns Arc for sharing).
-    pub fn get_finalized_wave_by_hash(&self, wave_id_hash: &Hash) -> Option<Arc<FinalizedWave>> {
+    pub fn get_finalized_wave_by_hash(
+        &self,
+        wave_id_hash: &WaveIdHash,
+    ) -> Option<Arc<FinalizedWave>> {
         self.finalized.get_by_wave_id_hash(wave_id_hash)
     }
 
@@ -1811,7 +1816,7 @@ mod tests {
     use super::*;
     use hyperscale_types::test_utils::test_transaction;
     use hyperscale_types::{
-        generate_bls_keypair, Bls12381G1PrivateKey, ValidatorInfo, ValidatorSet,
+        generate_bls_keypair, Bls12381G1PrivateKey, GlobalReceiptHash, ValidatorInfo, ValidatorSet,
     };
 
     fn make_test_topology() -> TopologySnapshot {
@@ -2361,7 +2366,7 @@ mod tests {
             .map(|h| hyperscale_types::TxOutcome {
                 tx_hash: *h,
                 outcome: ExecutionOutcome::Executed {
-                    receipt_hash: Hash::ZERO,
+                    receipt_hash: GlobalReceiptHash::ZERO,
                     success: true,
                 },
             })
@@ -2370,7 +2375,7 @@ mod tests {
             wave.record_execution_result(
                 *h,
                 ExecutionOutcome::Executed {
-                    receipt_hash: Hash::ZERO,
+                    receipt_hash: GlobalReceiptHash::ZERO,
                     success: true,
                 },
             );

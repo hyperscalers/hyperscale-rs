@@ -1,14 +1,14 @@
 //! Execution handler functions shared between production and simulation runners.
 
 use hyperscale_core::{Action, CrossShardExecutionRequest};
-#[cfg(test)]
-use hyperscale_types::Hash;
 use hyperscale_types::{
     batch_verify_bls_same_message, exec_vote_message, verify_bls12381_v1, zero_bls_signature,
     BlockHash, Bls12381G1PublicKey, Bls12381G2Signature, ExecutionCertificate, ExecutionVote,
     GlobalReceiptRoot, RoutableTransaction, SignerBitfield, StateProvision, StateRoot, TxHash,
     ValidatorId, WaveId, WeightedTimestamp,
 };
+#[cfg(test)]
+use hyperscale_types::{GlobalReceiptHash, Hash};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -275,7 +275,7 @@ mod tests {
         TxOutcome {
             tx_hash: tx,
             outcome: ExecutionOutcome::Executed {
-                receipt_hash: Hash::ZERO,
+                receipt_hash: GlobalReceiptHash::ZERO,
                 success: true,
             },
         }

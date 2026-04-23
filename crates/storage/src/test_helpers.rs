@@ -11,10 +11,11 @@ use crate::{
 use hyperscale_types::{
     zero_bls_signature, ApplicationEvent, Block, BlockHash, BlockHeader, BlockHeight,
     Bls12381G2Signature, CertificateRoot, ExecutionCertificate, ExecutionMetadata,
-    ExecutionOutcome, FeeSummary, FinalizedWave, GlobalReceiptRoot, Hash, LocalReceipt,
-    LocalReceiptRoot, LogLevel, NodeId, ProposerTimestamp, ProvisionsRoot, QuorumCertificate,
-    ReceiptBundle, Round, ShardGroupId, SignerBitfield, StateRoot, TransactionOutcome,
-    TransactionRoot, TxHash, TxOutcome, ValidatorId, WaveCertificate, WaveId, WeightedTimestamp,
+    ExecutionOutcome, FeeSummary, FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, Hash,
+    LocalReceipt, LocalReceiptRoot, LogLevel, NodeId, ProposerTimestamp, ProvisionsRoot,
+    QuorumCertificate, ReceiptBundle, Round, ShardGroupId, SignerBitfield, StateRoot,
+    TransactionOutcome, TransactionRoot, TxHash, TxOutcome, ValidatorId, WaveCertificate, WaveId,
+    WeightedTimestamp,
 };
 use radix_common::prelude::DatabaseUpdate;
 use radix_substate_store_interface::db_key_mapper::{DatabaseKeyMapper, SpreadPrefixKeyMapper};
@@ -174,7 +175,7 @@ pub fn make_test_execution_certificate(
         vec![TxOutcome {
             tx_hash: TxHash::from_raw(Hash::from_bytes(&[seed + 100; 32])),
             outcome: ExecutionOutcome::Executed {
-                receipt_hash: Hash::from_bytes(&[seed + 150; 32]),
+                receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(&[seed + 150; 32])),
                 success: true,
             },
         }],

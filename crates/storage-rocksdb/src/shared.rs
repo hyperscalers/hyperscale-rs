@@ -17,8 +17,8 @@ use hyperscale_storage::{
     SubstateStore,
 };
 use hyperscale_types::{
-    BlockHash, BlockHeight, CertifiedBlock, ExecutionCertificateHash, Hash, NodeId,
-    QuorumCertificate, RoutableTransaction, ShardGroupId, StateRoot, TxHash, WaveCertificate,
+    BlockHash, BlockHeight, CertifiedBlock, ExecutionCertificateHash, NodeId, QuorumCertificate,
+    RoutableTransaction, ShardGroupId, StateRoot, TxHash, WaveCertificate, WaveIdHash,
 };
 use std::sync::Arc;
 
@@ -96,8 +96,8 @@ impl SubstateStore for SharedStorage {
         self.0.jmt_height()
     }
 
-    fn state_root_hash(&self) -> hyperscale_types::StateRoot {
-        self.0.state_root_hash()
+    fn state_root(&self) -> hyperscale_types::StateRoot {
+        self.0.state_root()
     }
 
     fn list_substates_for_node_at_height(
@@ -212,7 +212,7 @@ impl hyperscale_storage::ChainReader for SharedStorage {
         self.0.get_transactions_batch(hashes)
     }
 
-    fn get_certificates_batch(&self, hashes: &[Hash]) -> Vec<WaveCertificate> {
+    fn get_certificates_batch(&self, hashes: &[WaveIdHash]) -> Vec<WaveCertificate> {
         self.0.get_certificates_batch(hashes)
     }
 
