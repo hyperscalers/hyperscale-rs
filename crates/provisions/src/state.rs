@@ -14,7 +14,7 @@
 use hyperscale_core::{Action, ProtocolEvent};
 use hyperscale_types::{
     compute_padded_merkle_root, BlockHeight, CommittedBlockHeader, Hash, Provision, ProvisionHash,
-    ProvisionTxRoot, ShardGroupId, TopologySnapshot, ValidatorId, WAVE_TIMEOUT,
+    ProvisionTxRoot, ShardGroupId, TopologySnapshot, ValidatorId, WeightedTimestamp, WAVE_TIMEOUT,
 };
 #[cfg(test)]
 use hyperscale_types::{
@@ -51,7 +51,7 @@ const PROVISION_FALLBACK_TIMEOUT: Duration = Duration::from_secs(5);
 /// `weighted_timestamp_ms`.
 const COMMITTED_PROVISION_RETENTION: Duration = Duration::from_secs(WAVE_TIMEOUT.as_secs() * 2);
 
-/// How long past `expected.discovered_at_ts_ms` before an unmatched header
+/// How long past `expected.discovered_at` before an unmatched header
 /// is treated as orphaned and dropped. Headers are otherwise retained while
 /// their batch is still outstanding — this guards only against truly stuck
 /// entries whose fallback fetches never resolved. Sized generously since
@@ -106,10 +106,10 @@ pub struct ProvisionMemoryStats {
 /// protocol owns retries from that point.
 #[derive(Debug, Clone)]
 struct ExpectedProvision {
-    /// Local weighted timestamp (ms) when we first expected this provision.
+    /// Local weighted timestamp when we first expected this provision.
     /// Used as the liveness baseline for both fallback-fetch and orphan
     /// eviction.
-    discovered_at_ts_ms: u64,
+    discovered_at: WeightedTimestamp,
     requested: bool,
     proposer: ValidatorId,
 }
@@ -168,11 +168,10 @@ pub struct ProvisionCoordinator {
     /// Current local committed height (updated on each block commit).
     local_committed_height: BlockHeight,
 
-    /// BFT-authenticated weighted timestamp (ms) of the last locally
-    /// committed block. "Now" reference for liveness timeouts so they're
-    /// independent of local block production rate and deterministic across
-    /// validators.
-    local_committed_ts_ms: u64,
+    /// BFT-authenticated weighted timestamp of the last locally committed
+    /// block. "Now" reference for liveness timeouts so they're independent
+    /// of local block production rate and deterministic across validators.
+    local_committed_ts: WeightedTimestamp,
 
     /// Expected provisions that haven't arrived yet.
     /// Keyed by `(source_shard, block_height)`. Populated when a remote
@@ -192,17 +191,17 @@ pub struct ProvisionCoordinator {
 
     /// Tombstone set: hashes of provision batches that have been committed.
     /// Prevents re-queueing if a duplicate batch arrives via gossip after commit.
-    /// Maps hash → committing QC's `weighted_timestamp_ms` for age-based
+    /// Maps hash → committing QC's `weighted_timestamp` for age-based
     /// pruning anchored on BFT-authenticated time.
-    committed_batch_tombstones: HashMap<ProvisionHash, u64>,
+    committed_batch_tombstones: HashMap<ProvisionHash, WeightedTimestamp>,
 
     /// Committed provision hashes grouped by the local weighted timestamp
-    /// (ms) at which they committed. Drives deferred eviction: entries
-    /// retained until `commit_ts_ms + COMMITTED_PROVISION_RETENTION` falls
-    /// behind the local tip ts, at which point they're dropped. Ensures
-    /// peers catching up can still receive `Block::Live` (with inline
-    /// provisions) for any block within the cross-shard execution window.
-    committed_retention: BTreeMap<u64, Vec<ProvisionHash>>,
+    /// at which they committed. Drives deferred eviction: entries retained
+    /// until `commit_ts + COMMITTED_PROVISION_RETENTION` falls behind the
+    /// local tip ts, at which point they're dropped. Ensures peers catching
+    /// up can still receive `Block::Live` (with inline provisions) for any
+    /// block within the cross-shard execution window.
+    committed_retention: BTreeMap<WeightedTimestamp, Vec<ProvisionHash>>,
 
     // ═══════════════════════════════════════════════════════════════════
     // Time
@@ -244,7 +243,7 @@ impl ProvisionCoordinator {
             verified_batches: BTreeMap::new(),
             batches_by_hash: HashMap::new(),
             local_committed_height: BlockHeight(0),
-            local_committed_ts_ms: 0,
+            local_committed_ts: WeightedTimestamp::ZERO,
             expected_provisions: BTreeMap::new(),
             queued_provision_batches: Vec::new(),
             committed_batch_tombstones: HashMap::new(),
@@ -278,20 +277,20 @@ impl ProvisionCoordinator {
         certified: &hyperscale_types::CertifiedBlock,
     ) -> Vec<Action> {
         let block = &certified.block;
-        let new_ts_ms = certified.qc.weighted_timestamp.as_millis();
-        let first_commit = self.local_committed_ts_ms == 0;
+        let new_ts = certified.qc.weighted_timestamp;
+        let first_commit = self.local_committed_ts == WeightedTimestamp::ZERO;
         self.local_committed_height = block.height();
-        self.local_committed_ts_ms = new_ts_ms;
+        self.local_committed_ts = new_ts;
 
         // Retro-stamp `expected_provisions` entries recorded before the first
         // local commit. Remote headers can arrive and register expectations
-        // while `local_committed_ts_ms` is still zero; without this, every
+        // while `local_committed_ts` is still zero; without this, every
         // such entry would report a ~57-year age on the next commit and
         // trigger a fallback fetch storm.
         if first_commit {
             for expected in self.expected_provisions.values_mut() {
-                if expected.discovered_at_ts_ms == 0 {
-                    expected.discovered_at_ts_ms = new_ts_ms;
+                if expected.discovered_at == WeightedTimestamp::ZERO {
+                    expected.discovered_at = new_ts;
                 }
             }
         }
@@ -306,10 +305,10 @@ impl ProvisionCoordinator {
             for h in &committed {
                 // Tombstone: prevent re-queueing if duplicate gossip arrives later.
                 self.committed_batch_tombstones
-                    .insert(*h, self.local_committed_ts_ms);
+                    .insert(*h, self.local_committed_ts);
             }
             self.committed_retention
-                .entry(self.local_committed_ts_ms)
+                .entry(self.local_committed_ts)
                 .or_default()
                 .extend(committed.iter().copied());
             self.queued_provision_batches
@@ -319,11 +318,10 @@ impl ProvisionCoordinator {
         // Evict committed provisions whose commit timestamp has aged past
         // the retention window. `split_off` partitions by the first retained
         // ts, leaving aged-out entries in `aged` for cleanup.
-        let retention_ms = COMMITTED_PROVISION_RETENTION.as_millis() as u64;
-        let retention_cutoff_ms = self.local_committed_ts_ms.saturating_sub(retention_ms);
-        let still_retained = self.committed_retention.split_off(&retention_cutoff_ms);
+        let retention_cutoff = self.local_committed_ts.minus(COMMITTED_PROVISION_RETENTION);
+        let still_retained = self.committed_retention.split_off(&retention_cutoff);
         let aged = std::mem::replace(&mut self.committed_retention, still_retained);
-        for (_ts_ms, hashes) in aged {
+        for (_ts, hashes) in aged {
             for h in hashes {
                 if let Some(batch) = self.batches_by_hash.remove(&h) {
                     let key = (batch.source_shard, batch.block_height);
@@ -338,13 +336,11 @@ impl ProvisionCoordinator {
         // whose fallback fetch never resolved after a long horizon. Under normal
         // operation a header is retained exactly while its batch is outstanding;
         // this only catches entries that would otherwise leak indefinitely.
-        let orphan_cutoff_ms = self
-            .local_committed_ts_ms
-            .saturating_sub(ORPHAN_HEADER_CUTOFF.as_millis() as u64);
-        if orphan_cutoff_ms > 0 {
+        let orphan_cutoff = self.local_committed_ts.minus(ORPHAN_HEADER_CUTOFF);
+        if orphan_cutoff > WeightedTimestamp::ZERO {
             let before = self.expected_provisions.len();
             self.expected_provisions
-                .retain(|_, exp| exp.discovered_at_ts_ms >= orphan_cutoff_ms);
+                .retain(|_, exp| exp.discovered_at >= orphan_cutoff);
             if self.expected_provisions.len() != before {
                 // Drop matching headers — they're useless without an expected batch.
                 let live: std::collections::HashSet<_> =
@@ -356,31 +352,27 @@ impl ProvisionCoordinator {
 
         // Prune tombstones past their retention window, measured against
         // BFT-authenticated time.
-        let tombstone_cutoff_ms = self
-            .local_committed_ts_ms
-            .saturating_sub(BATCH_TOMBSTONE_RETENTION.as_millis() as u64);
+        let tombstone_cutoff = self.local_committed_ts.minus(BATCH_TOMBSTONE_RETENTION);
         self.committed_batch_tombstones
-            .retain(|_, committed_at_ts_ms| *committed_at_ts_ms > tombstone_cutoff_ms);
+            .retain(|_, committed_at_ts| *committed_at_ts > tombstone_cutoff);
 
         // Check for timed-out expected provisions and emit fallback requests
         let mut actions = vec![];
-        let now_ms = self.local_committed_ts_ms;
-        let timeout_ms = PROVISION_FALLBACK_TIMEOUT.as_millis() as u64;
+        let now = self.local_committed_ts;
 
         for (&(source_shard, block_height), expected) in self.expected_provisions.iter_mut() {
             if expected.requested {
                 continue;
             }
 
-            let age_ms = now_ms.saturating_sub(expected.discovered_at_ts_ms);
-            if age_ms < timeout_ms {
+            if now.elapsed_since(expected.discovered_at) < PROVISION_FALLBACK_TIMEOUT {
                 continue;
             }
 
             warn!(
                 source_shard = source_shard.0,
                 block_height = block_height.0,
-                age_ms,
+                age_ms = now.elapsed_since(expected.discovered_at).as_millis() as u64,
                 "Provision timeout — requesting missing provisions via fallback"
             );
 
@@ -473,7 +465,7 @@ impl ProvisionCoordinator {
                     "Tracking expected provision (verified remote block targets our shard)"
                 );
                 ExpectedProvision {
-                    discovered_at_ts_ms: self.local_committed_ts_ms,
+                    discovered_at: self.local_committed_ts,
                     requested: false,
                     proposer,
                 }
@@ -1475,7 +1467,7 @@ mod tests {
     #[test]
     fn test_pregenesis_header_retrostamped_on_first_commit() {
         // Regression: without retro-stamping, an expected_provisions entry
-        // recorded while `local_committed_ts_ms == 0` would report a ~epoch-ms
+        // recorded while `local_committed_ts == 0` would report a ~epoch-ms
         // age on the very next commit and trigger an immediate fallback,
         // bypassing PROVISION_FALLBACK_TIMEOUT entirely.
         let topology = make_test_topology(ShardGroupId(0));

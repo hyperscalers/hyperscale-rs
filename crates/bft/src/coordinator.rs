@@ -13,7 +13,9 @@
 //! the complete block data, making it recoverable from any honest validator in that set.
 
 use hyperscale_core::{Action, CommitSource, ProtocolEvent, TimerId};
-use hyperscale_types::{BlockHash, ProposerTimestamp, ProvisionHash, WaveIdHash};
+use hyperscale_types::{
+    BlockHash, ProposerTimestamp, ProvisionHash, WaveIdHash, WeightedTimestamp,
+};
 
 /// BFT statistics for monitoring.
 #[derive(Clone, Copy, Debug, Default)]
@@ -127,9 +129,9 @@ pub struct BftCoordinator {
     /// Hash of the latest committed block.
     committed_hash: BlockHash,
 
-    /// BFT-authenticated weighted timestamp (ms) of the latest committed
-    /// block. "Now" reference for time-based retention in proposal dedup.
-    committed_ts_ms: u64,
+    /// BFT-authenticated weighted timestamp of the latest committed block.
+    /// "Now" reference for time-based retention in proposal dedup.
+    committed_ts: WeightedTimestamp,
 
     /// State root from the latest committed block header.
     /// Updated synchronously at commit time (not dependent on async JMT).
@@ -211,11 +213,11 @@ impl BftCoordinator {
             view_change: ViewChangeController::new(),
             committed_height: recovered.committed_height,
             committed_hash: recovered.committed_hash.unwrap_or(BlockHash::ZERO),
-            committed_ts_ms: recovered
+            committed_ts: recovered
                 .latest_qc
                 .as_ref()
-                .map(|qc| qc.weighted_timestamp.as_millis())
-                .unwrap_or(0),
+                .map(|qc| qc.weighted_timestamp)
+                .unwrap_or(WeightedTimestamp::ZERO),
             committed_state_root: recovered.jmt_root.unwrap_or(StateRoot::ZERO),
             latest_qc: recovered.latest_qc,
             deferred_qc: None,
@@ -1508,7 +1510,7 @@ impl BftCoordinator {
                     validator = ?validator_id,
                     old_view = old_view.0,
                     new_view = vote.round.0,
-                    vote_anchor_ts_ms = vote.height.0,
+                    vote_anchor_ts = vote.height.0,
                     voter = ?vote.voter,
                     "View synchronization: advancing view to match verified vote"
                 );
@@ -2103,13 +2105,13 @@ impl BftCoordinator {
         &mut self,
         block: &Block,
         block_hash: BlockHash,
-        commit_ts_ms: u64,
+        commit_ts: WeightedTimestamp,
     ) -> Vec<BlockHash> {
         let height = block.height();
 
         self.committed_height = height;
         self.committed_hash = block_hash;
-        self.committed_ts_ms = commit_ts_ms;
+        self.committed_ts = commit_ts;
         self.committed_state_root = block.header().state_root;
 
         // Buffer committed hashes so collect_qc_chain_hashes can
@@ -2228,8 +2230,7 @@ impl BftCoordinator {
         let parent_state_root = self.committed_state_root;
         let parent_block_height = self.committed_height;
 
-        let removed_blocks =
-            self.record_block_committed(&block, block_hash, qc.weighted_timestamp.as_millis());
+        let removed_blocks = self.record_block_committed(&block, block_hash, qc.weighted_timestamp);
         self.record_leader_activity();
 
         for removed in removed_blocks {
@@ -2360,8 +2361,7 @@ impl BftCoordinator {
 
         // Advance committed_height. The QC is the proof of commit — same
         // timing as the consensus path.
-        let removed_blocks =
-            self.record_block_committed(&block, block_hash, qc.weighted_timestamp.as_millis());
+        let removed_blocks = self.record_block_committed(&block, block_hash, qc.weighted_timestamp);
 
         // Track sync progress for the loop iterator.
         self.sync.set_sync_applied_height(height);
@@ -2953,7 +2953,7 @@ impl BftCoordinator {
         // Used for proposal dedup — transactions committed far in the past
         // will have been evicted from mempool already, so stale entries just
         // waste memory.
-        self.tx_cache.prune(self.committed_ts_ms);
+        self.tx_cache.prune(self.committed_ts);
 
         // Remote headers are pruned per-shard-tip at insertion time, not by
         // local committed height (remote shards have independent heights).
@@ -3052,8 +3052,12 @@ impl BftCoordinator {
     /// Called by the node state layer after mempool processes a committed block.
     /// Validators use this to verify that conflicts
     /// reference transactions that were actually committed at the claimed height.
-    pub fn register_committed_transactions(&mut self, tx_hashes: &[TxHash], commit_ts_ms: u64) {
-        self.tx_cache.register_committed(tx_hashes, commit_ts_ms);
+    pub fn register_committed_transactions(
+        &mut self,
+        tx_hashes: &[TxHash],
+        commit_ts: WeightedTimestamp,
+    ) {
+        self.tx_cache.register_committed(tx_hashes, commit_ts);
     }
 
     /// Remove a finalized transaction from the committed lookup.

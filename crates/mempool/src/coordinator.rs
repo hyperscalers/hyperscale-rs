@@ -6,7 +6,7 @@ use crate::tombstones::{TombstoneStore, TOMBSTONE_RETENTION, TRANSACTION_RETENTI
 use hyperscale_core::{Action, FinalizationPhaseTimes, TransactionStatus};
 use hyperscale_types::{
     BlockHeight, CertifiedBlock, NodeId, RoutableTransaction, TopologySnapshot,
-    TransactionDecision, TxHash,
+    TransactionDecision, TxHash, WeightedTimestamp,
 };
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -184,10 +184,10 @@ pub struct MempoolCoordinator {
     /// Current committed block height (for retry transaction creation).
     current_height: BlockHeight,
 
-    /// BFT-authenticated weighted timestamp (ms) of the last locally committed
+    /// BFT-authenticated weighted timestamp of the last locally committed
     /// block. "Now" reference for retention windows that must be deterministic
     /// across validators and independent of block production rate.
-    current_ts_ms: u64,
+    current_ts: WeightedTimestamp,
 
     /// Configuration for mempool behavior.
     config: MempoolConfig,
@@ -225,7 +225,7 @@ impl MempoolCoordinator {
             ready: ReadySet::new(),
             now: Duration::ZERO,
             current_height: BlockHeight(0),
-            current_ts_ms: 0,
+            current_ts: WeightedTimestamp::ZERO,
             config,
         }
     }
@@ -373,9 +373,9 @@ impl MempoolCoordinator {
         // Move transaction body into the evicted cache so slow peers can
         // still fetch it, and tombstone the hash to block re-insertion.
         if let Some(entry) = self.pool.remove(&tx_hash) {
-            self.tombstones.evict(entry.tx, self.current_ts_ms);
+            self.tombstones.evict(entry.tx, self.current_ts);
         }
-        self.tombstones.tombstone(tx_hash, self.current_ts_ms);
+        self.tombstones.tombstone(tx_hash, self.current_ts);
     }
 
     /// Check if a transaction hash is tombstoned (reached terminal state).
@@ -386,7 +386,7 @@ impl MempoolCoordinator {
     /// Drop evicted-cache entries that have aged out of the retention window.
     fn prune_recently_evicted(&mut self) {
         self.tombstones
-            .prune_evicted(TRANSACTION_RETENTION, self.current_ts_ms);
+            .prune_evicted(TRANSACTION_RETENTION, self.current_ts);
     }
 
     /// Process a committed block - update statuses and finalize transactions.
@@ -409,7 +409,7 @@ impl MempoolCoordinator {
         let mut actions = Vec::new();
 
         self.current_height = height;
-        self.current_ts_ms = certified.qc.weighted_timestamp.as_millis();
+        self.current_ts = certified.qc.weighted_timestamp;
 
         // Prune old entries from recently_evicted cache
         self.prune_recently_evicted();
@@ -873,12 +873,11 @@ impl MempoolCoordinator {
     /// Tombstones are kept for `retention` after creation to ensure gossip
     /// propagation has completed. After that, they can be safely removed since
     /// any late-arriving gossip for a very old transaction is likely stale
-    /// anyway. Anchored on `current_ts_ms` (updated in `on_block_committed`).
+    /// anyway. Anchored on `current_ts` (updated in `on_block_committed`).
     ///
     /// Returns the number of tombstones cleaned up.
     pub fn cleanup_old_tombstones(&mut self, retention: Duration) -> usize {
-        self.tombstones
-            .prune_tombstones(retention, self.current_ts_ms)
+        self.tombstones.prune_tombstones(retention, self.current_ts)
     }
 
     /// Get the number of tombstones currently tracked.

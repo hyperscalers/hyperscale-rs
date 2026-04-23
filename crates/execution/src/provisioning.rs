@@ -138,17 +138,15 @@ impl ProvisioningTracker {
     pub fn detect_conflicts(
         &mut self,
         batch: &Provision,
-        committed_at_ts_ms: WeightedTimestamp,
+        committed_at: WeightedTimestamp,
     ) -> Vec<DetectedConflict> {
-        self.conflict_detector
-            .detect_conflicts(batch, committed_at_ts_ms)
+        self.conflict_detector.detect_conflicts(batch, committed_at)
     }
 
     /// Drop the conflict-detector's stored provision history older than
     /// the cutoff. Returns the number of entries removed.
-    pub fn prune_old_provisions(&mut self, cutoff_ts_ms: WeightedTimestamp) -> usize {
-        self.conflict_detector
-            .prune_provisions_older_than(cutoff_ts_ms)
+    pub fn prune_old_provisions(&mut self, cutoff: WeightedTimestamp) -> usize {
+        self.conflict_detector.prune_provisions_older_than(cutoff)
     }
 
     // ─── Terminal cleanup ───────────────────────────────────────────────

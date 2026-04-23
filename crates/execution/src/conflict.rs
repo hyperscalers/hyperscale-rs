@@ -27,7 +27,7 @@ pub struct DetectedConflict {
     pub loser_tx: TxHash,
     /// Weighted timestamp of the commit that detected this conflict.
     /// Anchors time-based wave state (vote anchor, provisioning timestamp).
-    pub committed_at_ts_ms: WeightedTimestamp,
+    pub committed_at: WeightedTimestamp,
 }
 
 /// Stored provision data for reverse conflict detection.
@@ -41,7 +41,7 @@ struct StoredProvision {
     /// Local weighted timestamp at commit — retention anchor used both by
     /// `prune_provisions_older_than` and propagated to `DetectedConflict`
     /// for wave bookkeeping.
-    committed_at_ts_ms: WeightedTimestamp,
+    committed_at: WeightedTimestamp,
 }
 
 /// Tracks local cross-shard transactions and committed provision node-IDs
@@ -125,7 +125,7 @@ impl ConflictDetector {
                         if tx_hash > prov.remote_tx {
                             conflicts.push(DetectedConflict {
                                 loser_tx: tx_hash,
-                                committed_at_ts_ms: prov.committed_at_ts_ms,
+                                committed_at: prov.committed_at,
                             });
                         }
                     }
@@ -146,7 +146,7 @@ impl ConflictDetector {
     pub fn detect_conflicts(
         &mut self,
         batch: &Provision,
-        committed_at_ts_ms: WeightedTimestamp,
+        committed_at: WeightedTimestamp,
     ) -> Vec<DetectedConflict> {
         let source_shard = batch.source_shard;
         let mut conflicts = Vec::new();
@@ -167,7 +167,7 @@ impl ConflictDetector {
                     remote_tx,
                     source_nodes: source_nodes.clone(),
                     target_nodes: target_nodes.clone(),
-                    committed_at_ts_ms,
+                    committed_at,
                 },
             );
             self.provisions_by_shard
@@ -204,7 +204,7 @@ impl ConflictDetector {
                     if local_tx > remote_tx {
                         conflicts.push(DetectedConflict {
                             loser_tx: local_tx,
-                            committed_at_ts_ms,
+                            committed_at,
                         });
                     }
                 }
@@ -255,10 +255,10 @@ impl ConflictDetector {
     /// Call from `on_block_committed` to bound `stored_provisions` size — without
     /// this, `register_tx` iterates unboundedly many past provisions per
     /// cross-shard tx per block (quadratic TPS decay under sustained load).
-    pub fn prune_provisions_older_than(&mut self, cutoff_ts_ms: WeightedTimestamp) -> usize {
+    pub fn prune_provisions_older_than(&mut self, cutoff: WeightedTimestamp) -> usize {
         let before = self.stored_provisions.len();
         self.stored_provisions
-            .retain(|_, prov| prov.committed_at_ts_ms > cutoff_ts_ms);
+            .retain(|_, prov| prov.committed_at > cutoff);
         // Rebuild `provisions_by_shard` to drop dangling tx refs.
         self.provisions_by_shard.clear();
         for &(tx_hash, shard) in self.stored_provisions.keys() {
@@ -439,7 +439,7 @@ mod tests {
 
         assert_eq!(conflicts.len(), 1);
         assert_eq!(conflicts[0].loser_tx, higher);
-        assert_eq!(conflicts[0].committed_at_ts_ms, WeightedTimestamp(10 * 500));
+        assert_eq!(conflicts[0].committed_at, WeightedTimestamp(10 * 500));
     }
 
     #[test]
@@ -485,10 +485,7 @@ mod tests {
         let rev_conflicts = detector.register_tx(higher, &topo, &[remote_node, local_node], &[]);
         assert_eq!(rev_conflicts.len(), 1);
         assert_eq!(rev_conflicts[0].loser_tx, higher);
-        assert_eq!(
-            rev_conflicts[0].committed_at_ts_ms,
-            WeightedTimestamp(5 * 500)
-        );
+        assert_eq!(rev_conflicts[0].committed_at, WeightedTimestamp(5 * 500));
     }
 
     #[test]

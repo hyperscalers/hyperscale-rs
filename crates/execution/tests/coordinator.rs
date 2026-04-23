@@ -139,7 +139,7 @@ fn on_verified_remote_header_registers_expectation_for_wave_targeting_local_shar
     let (mut coord, topology) = fresh_coordinator_with_topology();
     let local_shard = topology.local_shard();
     // A remote shard's wave that targets our local shard must register an
-    // expectation. With committed_ts_ms still ZERO the initial-deadline
+    // expectation. With committed_ts still ZERO the initial-deadline
     // gate is silenced, but the expectation count must reflect the header.
     let remote_shard = ShardGroupId(99);
     let wave = WaveId::new(

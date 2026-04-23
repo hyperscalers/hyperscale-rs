@@ -186,7 +186,7 @@ pub enum Action {
         block_hash: BlockHash,
         block_height: BlockHeight,
         /// Consensus height at which this vote is being cast.
-        vote_anchor_ts_ms: WeightedTimestamp,
+        vote_anchor_ts: WeightedTimestamp,
         wave_id: WaveId,
         global_receipt_root: GlobalReceiptRoot,
         /// Per-tx outcomes in wave order. Carried on the vote so the

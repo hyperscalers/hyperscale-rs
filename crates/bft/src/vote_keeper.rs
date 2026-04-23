@@ -176,7 +176,7 @@ impl VoteKeeper {
 
         if height <= committed_height {
             trace!(
-                vote_anchor_ts_ms = height.0,
+                vote_anchor_ts = height.0,
                 committed_height = committed_height.0,
                 voter = ?vote.voter,
                 "Skipping vote for already-committed height"

@@ -6,9 +6,9 @@
 //! ## Round Voting
 //!
 //! Validators vote at each block commit where their wave is complete.
-//! Votes include `vote_anchor_ts_ms` in the BLS-signed message, so votes at
+//! Votes include `vote_anchor_ts` in the BLS-signed message, so votes at
 //! different heights have different signatures and cannot be aggregated.
-//! The tracker groups by `(global_receipt_root, vote_anchor_ts_ms)` and checks quorum
+//! The tracker groups by `(global_receipt_root, vote_anchor_ts)` and checks quorum
 //! per group.
 //!
 //! ## Deferred Verification Optimization
@@ -25,7 +25,7 @@ use hyperscale_types::{
 };
 use std::collections::{BTreeMap, HashSet};
 
-/// Key for grouping votes: `(global_receipt_root, vote_anchor_ts_ms)`.
+/// Key for grouping votes: `(global_receipt_root, vote_anchor_ts)`.
 ///
 /// Votes at different heights have different BLS signatures and cannot be
 /// aggregated together. This prevents stale votes from combining with new
@@ -49,9 +49,9 @@ pub struct VoteTracker {
     // ═══════════════════════════════════════════════════════════════════════
     // Verified votes (passed signature verification)
     // ═══════════════════════════════════════════════════════════════════════
-    /// Verified votes grouped by (global_receipt_root, vote_anchor_ts_ms).
+    /// Verified votes grouped by (global_receipt_root, vote_anchor_ts).
     votes_by_key: BTreeMap<VoteKey, Vec<ExecutionVote>>,
-    /// Voting power per (global_receipt_root, vote_anchor_ts_ms) (verified votes only).
+    /// Voting power per (global_receipt_root, vote_anchor_ts) (verified votes only).
     power_by_key: BTreeMap<VoteKey, u64>,
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -62,8 +62,8 @@ pub struct VoteTracker {
     unverified_votes: Vec<(ExecutionVote, Bls12381G1PublicKey, u64)>,
     /// Total voting power of unverified votes.
     unverified_power: u64,
-    /// Validators we've already seen votes from at each vote_anchor_ts_ms (dedup).
-    /// Key is (validator_id, vote_anchor_ts_ms).
+    /// Validators we've already seen votes from at each vote_anchor_ts (dedup).
+    /// Key is (validator_id, vote_anchor_ts).
     seen: HashSet<(ValidatorId, WeightedTimestamp)>,
     /// Whether a verification batch is currently in flight.
     pending_verification: bool,
@@ -102,7 +102,7 @@ impl VoteTracker {
     /// Buffer an unverified vote for later batch verification.
     ///
     /// Returns `true` if the vote was buffered, `false` if it was a duplicate.
-    /// Dedup is per (validator, vote_anchor_ts_ms) — the same validator can vote at
+    /// Dedup is per (validator, vote_anchor_ts) — the same validator can vote at
     /// multiple heights (round voting), but only once per height.
     pub fn buffer_unverified_vote(
         &mut self,
@@ -110,7 +110,7 @@ impl VoteTracker {
         public_key: Bls12381G1PublicKey,
         voting_power: u64,
     ) -> bool {
-        let dedup_key = (vote.validator, vote.vote_anchor_ts_ms);
+        let dedup_key = (vote.validator, vote.vote_anchor_ts);
 
         if self.seen.contains(&dedup_key) {
             return false;
@@ -165,39 +165,39 @@ impl VoteTracker {
 
     /// Add a verified vote and its voting power.
     pub fn add_verified_vote(&mut self, vote: ExecutionVote, power: u64) {
-        let key = (vote.global_receipt_root, vote.vote_anchor_ts_ms);
+        let key = (vote.global_receipt_root, vote.vote_anchor_ts);
         self.votes_by_key.entry(key).or_default().push(vote);
         *self.power_by_key.entry(key).or_insert(0) += power;
     }
 
-    /// Check if quorum is reached for any (global_receipt_root, vote_anchor_ts_ms) pair.
+    /// Check if quorum is reached for any (global_receipt_root, vote_anchor_ts) pair.
     ///
-    /// Returns `Some((global_receipt_root, vote_anchor_ts_ms, total_power))` if quorum reached.
-    /// If multiple pairs have quorum, returns the one with the lowest vote_anchor_ts_ms.
+    /// Returns `Some((global_receipt_root, vote_anchor_ts, total_power))` if quorum reached.
+    /// If multiple pairs have quorum, returns the one with the lowest vote_anchor_ts.
     pub fn check_quorum(&self) -> Option<(GlobalReceiptRoot, WeightedTimestamp, u64)> {
         let mut best: Option<(GlobalReceiptRoot, WeightedTimestamp, u64)> = None;
-        for (&(global_receipt_root, vote_anchor_ts_ms), &power) in &self.power_by_key {
+        for (&(global_receipt_root, vote_anchor_ts), &power) in &self.power_by_key {
             if power >= self.quorum {
                 match &best {
-                    Some((_, best_anchor, _)) if vote_anchor_ts_ms >= *best_anchor => {}
-                    _ => best = Some((global_receipt_root, vote_anchor_ts_ms, power)),
+                    Some((_, best_anchor, _)) if vote_anchor_ts >= *best_anchor => {}
+                    _ => best = Some((global_receipt_root, vote_anchor_ts, power)),
                 }
             }
         }
         best
     }
 
-    /// Take votes for a specific (global_receipt_root, vote_anchor_ts_ms) pair.
+    /// Take votes for a specific (global_receipt_root, vote_anchor_ts) pair.
     pub fn take_votes(
         &mut self,
         global_receipt_root: &GlobalReceiptRoot,
-        vote_anchor_ts_ms: WeightedTimestamp,
+        vote_anchor_ts: WeightedTimestamp,
     ) -> Vec<ExecutionVote> {
-        let key = (*global_receipt_root, vote_anchor_ts_ms);
+        let key = (*global_receipt_root, vote_anchor_ts);
         self.votes_by_key.remove(&key).unwrap_or_default()
     }
 
-    /// Return the total verified voting power across all (global_receipt_root, vote_anchor_ts_ms) groups.
+    /// Return the total verified voting power across all (global_receipt_root, vote_anchor_ts) groups.
     pub fn total_verified_power(&self) -> u64 {
         self.power_by_key.values().sum()
     }
@@ -249,7 +249,7 @@ mod tests {
         ExecutionVote {
             block_hash: BlockHash::from_raw(Hash::from_bytes(b"block")),
             block_height: BlockHeight(10),
-            vote_anchor_ts_ms: WeightedTimestamp(11),
+            vote_anchor_ts: WeightedTimestamp(11),
             wave_id: WaveId::new(ShardGroupId(0), BlockHeight(0), BTreeSet::new()),
             shard_group_id: ShardGroupId(0),
             global_receipt_root,
@@ -281,7 +281,7 @@ mod tests {
         assert!(result.is_some());
         let (r, vh, power) = result.unwrap();
         assert_eq!(r, root);
-        assert_eq!(vh, WeightedTimestamp(11)); // vote_anchor_ts_ms from make_vote
+        assert_eq!(vh, WeightedTimestamp(11)); // vote_anchor_ts from make_vote
         assert_eq!(power, 3);
         assert_eq!(tracker.votes_for_global_receipt_root(&root).len(), 3);
     }

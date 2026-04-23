@@ -13,7 +13,7 @@
 use hyperscale_core::{Action, ProtocolEvent};
 use hyperscale_types::{
     BlockHeight, Bls12381G1PublicKey, CommittedBlockHeader, ShardGroupId, TopologySnapshot,
-    ValidatorId, REMOTE_HEADER_RETENTION,
+    ValidatorId, WeightedTimestamp, REMOTE_HEADER_RETENTION,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -43,23 +43,23 @@ pub struct RemoteHeaderMemoryStats {
 /// headers from it. If none arrive within the timeout, we request via fallback.
 #[derive(Debug, Clone)]
 struct ExpectedHeader {
-    /// Local weighted timestamp (ms) when we first expected a header from
+    /// Local weighted timestamp when we first expected a header from
     /// this shard. Used as the liveness baseline until we verify a header.
-    discovered_at_ts_ms: u64,
+    discovered_at: WeightedTimestamp,
     /// Highest height we've verified from this shard (0 if none).
     last_verified_height: BlockHeight,
-    /// Local weighted timestamp (ms) when we last verified a header from
+    /// Local weighted timestamp when we last verified a header from
     /// this shard. Liveness baseline once set — the timeout measures how
     /// much *local* wall-clock has passed since we last heard from the
     /// remote shard, rather than comparing heights across independent
     /// counters. `None` until the first header is verified.
-    last_verified_at_ts_ms: Option<u64>,
+    last_verified_at: Option<WeightedTimestamp>,
     /// Whether we've already emitted a fallback request for the current gap.
     requested: bool,
-    /// Local weighted timestamp (ms) when we last emitted a fallback request.
+    /// Local weighted timestamp when we last emitted a fallback request.
     /// Used as a cooldown to prevent re-requesting every block when the
     /// gap remains open after a fetch completes or is dropped.
-    requested_at_ts_ms: u64,
+    requested_at: WeightedTimestamp,
 }
 
 /// Centralized remote block header coordination.
@@ -96,11 +96,11 @@ pub struct RemoteHeaderCoordinator {
     /// These have passed QC signature verification and structural checks.
     verified: HashMap<(ShardGroupId, BlockHeight), Arc<CommittedBlockHeader>>,
 
-    /// Highest seen `(block_height, weighted_timestamp_ms)` per remote shard.
+    /// Highest seen `(block_height, weighted_timestamp)` per remote shard.
     /// The timestamp is the pruning anchor — retention is measured against
     /// how long ago (in remote wall-clock) each stored header was produced,
     /// so pruning stays meaningful when remote block cadence varies.
-    tips: HashMap<ShardGroupId, (BlockHeight, u64)>,
+    tips: HashMap<ShardGroupId, (BlockHeight, WeightedTimestamp)>,
 
     // ═══════════════════════════════════════════════════════════════════
     // Liveness Tracking (for fallback requests)
@@ -115,11 +115,11 @@ pub struct RemoteHeaderCoordinator {
     /// Current local committed height (updated on each block commit).
     local_committed_height: BlockHeight,
 
-    /// BFT-authenticated weighted timestamp (ms) of the last locally committed
+    /// BFT-authenticated weighted timestamp of the last locally committed
     /// block. Used as the "now" reference for liveness timeouts so they're
     /// independent of local block production rate and deterministic across
     /// validators.
-    local_committed_ts_ms: u64,
+    local_committed_ts: WeightedTimestamp,
 }
 
 impl Default for RemoteHeaderCoordinator {
@@ -137,7 +137,7 @@ impl RemoteHeaderCoordinator {
             tips: HashMap::new(),
             expected: HashMap::new(),
             local_committed_height: BlockHeight(0),
-            local_committed_ts_ms: 0,
+            local_committed_ts: WeightedTimestamp::ZERO,
         }
     }
 
@@ -218,8 +218,8 @@ impl RemoteHeaderCoordinator {
         sender_map.insert(sender, Arc::clone(&committed_header));
 
         // Update tip and prune old entries.
-        let header_ts_ms = committed_header.qc.weighted_timestamp.as_millis();
-        self.update_tip_and_prune(shard, height, header_ts_ms);
+        let header_ts = committed_header.qc.weighted_timestamp;
+        self.update_tip_and_prune(shard, height, header_ts);
 
         if first_for_key {
             // Emit QC verification for the first header at this (shard, height).
@@ -298,7 +298,7 @@ impl RemoteHeaderCoordinator {
                     None
                 };
                 expected.last_verified_height = height;
-                expected.last_verified_at_ts_ms = Some(self.local_committed_ts_ms);
+                expected.last_verified_at = Some(self.local_committed_ts);
                 expected.requested = false;
                 if let Some(from_height) = pending_fetch_from {
                     actions.push(Action::CancelCommittedHeaderFetch {
@@ -331,22 +331,22 @@ impl RemoteHeaderCoordinator {
         topology: &TopologySnapshot,
         certified: &hyperscale_types::CertifiedBlock,
     ) -> Vec<Action> {
-        let new_ts_ms = certified.qc.weighted_timestamp.as_millis();
-        let first_commit = self.local_committed_ts_ms == 0;
+        let new_ts = certified.qc.weighted_timestamp;
+        let first_commit = self.local_committed_ts == WeightedTimestamp::ZERO;
         self.local_committed_height = certified.block.height();
-        self.local_committed_ts_ms = new_ts_ms;
+        self.local_committed_ts = new_ts;
 
         // Retro-stamp entries recorded before the first local commit: remote
-        // headers can arrive (and verify) while `local_committed_ts_ms` is
+        // headers can arrive (and verify) while `local_committed_ts` is
         // still zero, which would otherwise make age computations report the
         // full epoch on the very next commit and trigger a fallback storm.
         if first_commit {
             for expected in self.expected.values_mut() {
-                if expected.discovered_at_ts_ms == 0 {
-                    expected.discovered_at_ts_ms = new_ts_ms;
+                if expected.discovered_at == WeightedTimestamp::ZERO {
+                    expected.discovered_at = new_ts;
                 }
-                if expected.last_verified_at_ts_ms == Some(0) {
-                    expected.last_verified_at_ts_ms = Some(new_ts_ms);
+                if expected.last_verified_at == Some(WeightedTimestamp::ZERO) {
+                    expected.last_verified_at = Some(new_ts);
                 }
             }
         }
@@ -361,30 +361,26 @@ impl RemoteHeaderCoordinator {
             self.expected
                 .entry(shard)
                 .or_insert_with(|| ExpectedHeader {
-                    discovered_at_ts_ms: self.local_committed_ts_ms,
+                    discovered_at: self.local_committed_ts,
                     last_verified_height: BlockHeight(0),
-                    last_verified_at_ts_ms: None,
+                    last_verified_at: None,
                     requested: false,
-                    requested_at_ts_ms: 0,
+                    requested_at: WeightedTimestamp::ZERO,
                 });
         }
 
         // Check for timed-out remote shards.
         let mut actions = vec![];
-        let now_ms = self.local_committed_ts_ms;
-        let timeout_ms = HEADER_LIVENESS_TIMEOUT.as_millis() as u64;
+        let now = self.local_committed_ts;
 
         for (&shard, expected) in self.expected.iter_mut() {
             // Liveness baseline: when we last verified a header from this
             // shard, or the seeding time if we haven't seen one yet. Both
             // anchors are local weighted timestamps, so age is measured in
             // local wall-clock regardless of remote block production rate.
-            let baseline_ms = expected
-                .last_verified_at_ts_ms
-                .unwrap_or(expected.discovered_at_ts_ms);
+            let baseline = expected.last_verified_at.unwrap_or(expected.discovered_at);
 
-            let age_ms = now_ms.saturating_sub(baseline_ms);
-            if age_ms < timeout_ms {
+            if now.elapsed_since(baseline) < HEADER_LIVENESS_TIMEOUT {
                 continue;
             }
 
@@ -392,12 +388,10 @@ impl RemoteHeaderCoordinator {
             // a full cooldown period. This prevents flooding when the gap
             // remains open (e.g. fetch failed or returned a partial result
             // that didn't close the gap).
-            if expected.requested {
-                let since_request_ms = now_ms.saturating_sub(expected.requested_at_ts_ms);
-                if since_request_ms < timeout_ms {
-                    continue;
-                }
-                // Cooldown expired — allow a fresh request below.
+            if expected.requested
+                && now.elapsed_since(expected.requested_at) < HEADER_LIVENESS_TIMEOUT
+            {
+                continue;
             }
 
             // Request missing header from any validator in the source shard.
@@ -410,12 +404,12 @@ impl RemoteHeaderCoordinator {
             info!(
                 source_shard = shard.0,
                 from_height = from_height.0,
-                age_ms,
+                age_ms = now.elapsed_since(baseline).as_millis() as u64,
                 "Remote header liveness timeout — requesting missing headers via fallback"
             );
 
             expected.requested = true;
-            expected.requested_at_ts_ms = now_ms;
+            expected.requested_at = now;
             actions.push(Action::RequestMissingCommittedBlockHeader {
                 source_shard: shard,
                 from_height,
@@ -433,7 +427,7 @@ impl RemoteHeaderCoordinator {
     /// needs for blocks committed during the sync window.
     pub fn flush_expected_headers(&mut self, topology: &TopologySnapshot) -> Vec<Action> {
         let mut actions = vec![];
-        let now_ms = self.local_committed_ts_ms;
+        let now = self.local_committed_ts;
 
         for (&shard, expected) in self.expected.iter_mut() {
             if expected.requested {
@@ -453,7 +447,7 @@ impl RemoteHeaderCoordinator {
             );
 
             expected.requested = true;
-            expected.requested_at_ts_ms = now_ms;
+            expected.requested_at = now;
             actions.push(Action::RequestMissingCommittedBlockHeader {
                 source_shard: shard,
                 from_height,
@@ -530,13 +524,11 @@ impl RemoteHeaderCoordinator {
     /// each shard's tip. Pending entries are pruned on ingestion via
     /// `update_tip_and_prune`.
     pub fn cleanup(&mut self) {
-        let retention_ms = REMOTE_HEADER_RETENTION.as_millis() as u64;
         for (&shard, &(_, tip_ts)) in &self.tips {
-            let cutoff_ms = tip_ts.saturating_sub(retention_ms);
-            if cutoff_ms > 0 {
-                self.verified.retain(|&(s, _), hdr| {
-                    s != shard || hdr.qc.weighted_timestamp.as_millis() >= cutoff_ms
-                });
+            let cutoff = tip_ts.minus(REMOTE_HEADER_RETENTION);
+            if cutoff > WeightedTimestamp::ZERO {
+                self.verified
+                    .retain(|&(s, _), hdr| s != shard || hdr.qc.weighted_timestamp >= cutoff);
             }
         }
     }
@@ -550,24 +542,25 @@ impl RemoteHeaderCoordinator {
         &mut self,
         shard: ShardGroupId,
         height: BlockHeight,
-        header_ts_ms: u64,
+        header_ts: WeightedTimestamp,
     ) {
-        let tip = self.tips.entry(shard).or_insert((BlockHeight(0), 0));
+        let tip = self
+            .tips
+            .entry(shard)
+            .or_insert((BlockHeight(0), WeightedTimestamp::ZERO));
         if height > tip.0 {
-            *tip = (height, header_ts_ms);
+            *tip = (height, header_ts);
         }
-        let retention_ms = REMOTE_HEADER_RETENTION.as_millis() as u64;
-        let cutoff_ms = tip.1.saturating_sub(retention_ms);
-        if cutoff_ms > 0 {
+        let cutoff = tip.1.minus(REMOTE_HEADER_RETENTION);
+        if cutoff > WeightedTimestamp::ZERO {
             self.pending.retain(|&(s, _), sender_map| {
                 s != shard
                     || sender_map
                         .values()
-                        .any(|h| h.qc.weighted_timestamp.as_millis() >= cutoff_ms)
+                        .any(|h| h.qc.weighted_timestamp >= cutoff)
             });
-            self.verified.retain(|&(s, _), hdr| {
-                s != shard || hdr.qc.weighted_timestamp.as_millis() >= cutoff_ms
-            });
+            self.verified
+                .retain(|&(s, _), hdr| s != shard || hdr.qc.weighted_timestamp >= cutoff);
         }
     }
 

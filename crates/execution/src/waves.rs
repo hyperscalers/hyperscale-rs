@@ -60,13 +60,13 @@ pub(crate) const VOTE_RETRY_TIMEOUT: Duration = Duration::from_secs(8);
 #[derive(Debug, Clone)]
 pub(crate) struct PendingVoteRetry {
     /// Local weighted timestamp when this vote was last dispatched.
-    /// Compared against `committed_ts_ms` to detect leader aggregation
+    /// Compared against `committed_ts` to detect leader aggregation
     /// timeouts independently of block production rate.
-    pub sent_at_ts_ms: WeightedTimestamp,
+    pub sent_at: WeightedTimestamp,
     pub attempt: Attempt,
     pub block_hash: BlockHash,
     pub block_height: hyperscale_types::BlockHeight,
-    pub vote_anchor_ts_ms: WeightedTimestamp,
+    pub vote_anchor_ts: WeightedTimestamp,
     pub global_receipt_root: GlobalReceiptRoot,
     pub tx_outcomes: Arc<Vec<TxOutcome>>,
 }
@@ -80,7 +80,7 @@ pub(crate) struct RetryEffect {
     pub attempt: Attempt,
     pub block_hash: BlockHash,
     pub block_height: hyperscale_types::BlockHeight,
-    pub vote_anchor_ts_ms: WeightedTimestamp,
+    pub vote_anchor_ts: WeightedTimestamp,
     pub global_receipt_root: GlobalReceiptRoot,
     pub tx_outcomes: Arc<Vec<TxOutcome>>,
 }
@@ -231,13 +231,13 @@ impl WaveRegistry {
     /// Advance every retry whose last dispatch is at least
     /// [`VOTE_RETRY_TIMEOUT`] behind `now_ts`. Returns one
     /// [`RetryEffect`] per fired retry; entries stay in the retry table
-    /// with `attempt` incremented and `sent_at_ts_ms = now_ts` so the next
+    /// with `attempt` incremented and `sent_at = now_ts` so the next
     /// tick runs the rotated-leader check again.
     pub fn check_vote_retry_timeouts(&mut self, now_ts: WeightedTimestamp) -> Vec<RetryEffect> {
         let fired: Vec<WaveId> = self
             .retries
             .iter()
-            .filter(|(_, p)| now_ts.elapsed_since(p.sent_at_ts_ms) >= VOTE_RETRY_TIMEOUT)
+            .filter(|(_, p)| now_ts.elapsed_since(p.sent_at) >= VOTE_RETRY_TIMEOUT)
             .map(|(wid, _)| wid.clone())
             .collect();
 
@@ -248,13 +248,13 @@ impl WaveRegistry {
                 .get_mut(&wave_id)
                 .expect("entry exists: we just collected its key");
             pending.attempt += 1;
-            pending.sent_at_ts_ms = now_ts;
+            pending.sent_at = now_ts;
             effects.push(RetryEffect {
                 wave_id,
                 attempt: pending.attempt,
                 block_hash: pending.block_hash,
                 block_height: pending.block_height,
-                vote_anchor_ts_ms: pending.vote_anchor_ts_ms,
+                vote_anchor_ts: pending.vote_anchor_ts,
                 global_receipt_root: pending.global_receipt_root,
                 tx_outcomes: Arc::clone(&pending.tx_outcomes),
             });
@@ -512,11 +512,11 @@ mod tests {
 
     fn make_retry(sent_at: WeightedTimestamp) -> PendingVoteRetry {
         PendingVoteRetry {
-            sent_at_ts_ms: sent_at,
+            sent_at,
             attempt: Attempt::INITIAL,
             block_hash: BlockHash::ZERO,
             block_height: BlockHeight(1),
-            vote_anchor_ts_ms: ms(0),
+            vote_anchor_ts: ms(0),
             global_receipt_root: GlobalReceiptRoot::ZERO,
             tx_outcomes: Arc::new(vec![]),
         }
@@ -537,7 +537,7 @@ mod tests {
         assert_eq!(effects.len(), 1);
         assert_eq!(effects[0].attempt, Attempt(1));
 
-        // Retry cooldown restarts from the new sent_at_ts_ms.
+        // Retry cooldown restarts from the new sent_at.
         let effects = r.check_vote_retry_timeouts(ms(VOTE_RETRY_TIMEOUT.as_millis() as u64 + 1));
         assert!(effects.is_empty());
     }

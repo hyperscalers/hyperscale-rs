@@ -55,10 +55,10 @@ type ExpectedCertKey = (ShardGroupId, BlockHeight, WaveId);
 #[derive(Debug, Clone)]
 struct ExpectedEntry {
     /// Local weighted timestamp when we first learned about this cert.
-    discovered_at_ts_ms: WeightedTimestamp,
+    discovered_at: WeightedTimestamp,
     /// Local weighted timestamp when we last sent a fallback request.
     /// `None` means never requested.
-    last_requested_at_ts_ms: Option<WeightedTimestamp>,
+    last_requested_at: Option<WeightedTimestamp>,
 }
 
 /// A fallback fetch the coordinator should emit as
@@ -106,8 +106,8 @@ impl ExpectedCertTracker {
             return;
         }
         self.expected.entry(key).or_insert(ExpectedEntry {
-            discovered_at_ts_ms: now_ts,
-            last_requested_at_ts_ms: None,
+            discovered_at: now_ts,
+            last_requested_at: None,
         });
     }
 
@@ -129,20 +129,18 @@ impl ExpectedCertTracker {
 
     /// Drive the timeout state machine. Returns a `FallbackFetch` for each
     /// expectation that has crossed either the initial or the retry deadline
-    /// at `now_ts`. Records `last_requested_at_ts_ms = now_ts` on each
+    /// at `now_ts`. Records `last_requested_at = now_ts` on each
     /// returned entry so the retry cooldown starts ticking.
     pub fn check_timeouts(&mut self, now_ts: WeightedTimestamp) -> Vec<FallbackFetch> {
         let mut fetches = Vec::new();
         for ((source_shard, block_height, wave_id), entry) in &mut self.expected {
-            let should_request = match entry.last_requested_at_ts_ms {
-                None => {
-                    now_ts.elapsed_since(entry.discovered_at_ts_ms) >= EXEC_CERT_FALLBACK_TIMEOUT
-                }
+            let should_request = match entry.last_requested_at {
+                None => now_ts.elapsed_since(entry.discovered_at) >= EXEC_CERT_FALLBACK_TIMEOUT,
                 Some(last) => now_ts.elapsed_since(last) >= EXEC_CERT_RETRY_INTERVAL,
             };
             if should_request {
-                let is_retry = entry.last_requested_at_ts_ms.is_some();
-                entry.last_requested_at_ts_ms = Some(now_ts);
+                let is_retry = entry.last_requested_at.is_some();
+                entry.last_requested_at = Some(now_ts);
                 fetches.push(FallbackFetch {
                     source_shard: *source_shard,
                     block_height: *block_height,
@@ -171,14 +169,14 @@ impl ExpectedCertTracker {
             .retain(|_, &mut fulfilled_at| fulfilled_at > cutoff);
     }
 
-    /// Retro-stamp `discovered_at_ts_ms == ZERO` entries with `now_ts`.
+    /// Retro-stamp `discovered_at == ZERO` entries with `now_ts`.
     /// Remote headers can register expectations before our first local
     /// commit; without this, every such entry would report a ~57-year age
     /// on the next commit and trigger a fallback fetch storm.
     pub fn retro_stamp_zero_timestamps(&mut self, now_ts: WeightedTimestamp) {
         for entry in self.expected.values_mut() {
-            if entry.discovered_at_ts_ms == WeightedTimestamp::ZERO {
-                entry.discovered_at_ts_ms = now_ts;
+            if entry.discovered_at == WeightedTimestamp::ZERO {
+                entry.discovered_at = now_ts;
             }
         }
     }

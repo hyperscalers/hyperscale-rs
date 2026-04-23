@@ -11,7 +11,7 @@
 //!    at commit, for historical dedup over a bounded window. Survives
 //!    mempool processing; pruned by `COMMITTED_TX_RETENTION`.
 
-use hyperscale_types::{TxHash, WaveIdHash};
+use hyperscale_types::{TxHash, WaveIdHash, WeightedTimestamp};
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
@@ -21,7 +21,7 @@ use std::time::Duration;
 const COMMITTED_TX_RETENTION: Duration = Duration::from_secs(300);
 
 pub(crate) struct CommittedTxCache {
-    tx_lookup: HashMap<TxHash, u64>,
+    tx_lookup: HashMap<TxHash, WeightedTimestamp>,
     recently_committed_txs: HashSet<TxHash>,
     recently_committed_certs: HashSet<WaveIdHash>,
 }
@@ -51,19 +51,19 @@ impl CommittedTxCache {
     /// Promote a block's tx hashes from the bridge buffer into the
     /// retention lookup. Called by the node state layer after the mempool
     /// processes a committed block.
-    pub fn register_committed(&mut self, tx_hashes: &[TxHash], commit_ts_ms: u64) {
+    pub fn register_committed(&mut self, tx_hashes: &[TxHash], commit_ts: WeightedTimestamp) {
         for tx_hash in tx_hashes {
             if let Some(&existing) = self.tx_lookup.get(tx_hash) {
-                if existing != commit_ts_ms {
+                if existing != commit_ts {
                     tracing::warn!(
                         tx_hash = %tx_hash,
-                        existing_ts_ms = existing,
-                        new_ts_ms = commit_ts_ms,
+                        existing = %existing,
+                        new = %commit_ts,
                         "Transaction committed at two different timestamps!"
                     );
                 }
             }
-            self.tx_lookup.entry(*tx_hash).or_insert(commit_ts_ms);
+            self.tx_lookup.entry(*tx_hash).or_insert(commit_ts);
         }
         for tx_hash in tx_hashes {
             self.recently_committed_txs.remove(tx_hash);
@@ -78,18 +78,17 @@ impl CommittedTxCache {
     }
 
     /// Drop retention-lookup entries older than the retention window.
-    /// `now_ms` is the `weighted_timestamp_ms` of the latest committed block.
-    pub fn prune(&mut self, now_ms: u64) {
-        let retention_ms = COMMITTED_TX_RETENTION.as_millis() as u64;
-        let cutoff_ms = now_ms.saturating_sub(retention_ms);
-        self.tx_lookup.retain(|_, ts_ms| *ts_ms > cutoff_ms);
+    /// `now` is the `weighted_timestamp` of the latest committed block.
+    pub fn prune(&mut self, now: WeightedTimestamp) {
+        let cutoff = now.minus(COMMITTED_TX_RETENTION);
+        self.tx_lookup.retain(|_, ts| *ts > cutoff);
     }
 
     pub fn contains_tx(&self, tx_hash: &TxHash) -> bool {
         self.tx_lookup.contains_key(tx_hash)
     }
 
-    pub fn tx_commit_ts_ms(&self, tx_hash: &TxHash) -> Option<u64> {
+    pub fn tx_commit_ts(&self, tx_hash: &TxHash) -> Option<WeightedTimestamp> {
         self.tx_lookup.get(tx_hash).copied()
     }
 
@@ -142,10 +141,13 @@ mod tests {
     fn register_promotes_to_lookup_and_clears_bridge() {
         let mut cache = CommittedTxCache::new();
         cache.buffer_commit([th(b"tx1"), th(b"tx2")], []);
-        cache.register_committed(&[th(b"tx1")], 1000);
+        cache.register_committed(&[th(b"tx1")], WeightedTimestamp(1000));
 
         assert!(cache.contains_tx(&th(b"tx1")));
-        assert_eq!(cache.tx_commit_ts_ms(&th(b"tx1")), Some(1000));
+        assert_eq!(
+            cache.tx_commit_ts(&th(b"tx1")),
+            Some(WeightedTimestamp(1000))
+        );
         assert!(!cache.contains_tx(&th(b"tx2")));
 
         let remaining: HashSet<TxHash> = cache.recent_tx_hashes().collect();
@@ -156,10 +158,10 @@ mod tests {
     fn prune_drops_entries_older_than_retention() {
         let mut cache = CommittedTxCache::new();
         let retention_ms = COMMITTED_TX_RETENTION.as_millis() as u64;
-        cache.register_committed(&[th(b"old")], 100);
-        cache.register_committed(&[th(b"new")], retention_ms + 200);
+        cache.register_committed(&[th(b"old")], WeightedTimestamp(100));
+        cache.register_committed(&[th(b"new")], WeightedTimestamp(retention_ms + 200));
 
-        cache.prune(retention_ms + 200);
+        cache.prune(WeightedTimestamp(retention_ms + 200));
 
         assert!(!cache.contains_tx(&th(b"old")));
         assert!(cache.contains_tx(&th(b"new")));
@@ -168,7 +170,7 @@ mod tests {
     #[test]
     fn remove_clears_lookup() {
         let mut cache = CommittedTxCache::new();
-        cache.register_committed(&[th(b"tx")], 100);
+        cache.register_committed(&[th(b"tx")], WeightedTimestamp(100));
 
         cache.remove(&th(b"tx"));
 

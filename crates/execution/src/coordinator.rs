@@ -75,7 +75,7 @@ pub struct CompletionData {
     /// BFT-authenticated weighted timestamp at which this wave's outcome is
     /// fixed. Included in the vote payload and the EC canonical hash, so all
     /// validators aggregate under the same identifier.
-    pub vote_anchor_ts_ms: WeightedTimestamp,
+    pub vote_anchor_ts: WeightedTimestamp,
     /// Wave identifier.
     pub wave_id: WaveId,
     /// Merkle root over per-tx outcome leaves (cross-shard agreement).
@@ -113,7 +113,7 @@ pub struct ExecutionMemoryStats {
 pub struct ExecutionCoordinator {
     /// Local wall-clock "now" — kept for symmetry with the other sub-state
     /// machines even though execution's deterministic timeouts all anchor on
-    /// `committed_ts_ms` (the QC's weighted timestamp).
+    /// `committed_ts` (the QC's weighted timestamp).
     now: Duration,
 
     /// Finalized wave certificates ready for block inclusion, keyed by
@@ -127,7 +127,7 @@ pub struct ExecutionCoordinator {
     /// BFT-authenticated weighted timestamp of the last locally committed
     /// block. "Now" reference for timeouts that must be deterministic across
     /// validators and independent of block production rate.
-    committed_ts_ms: WeightedTimestamp,
+    committed_ts: WeightedTimestamp,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Provisioning
@@ -198,7 +198,7 @@ impl ExecutionCoordinator {
             now: Duration::ZERO,
             finalized: FinalizedWaveStore::new(),
             committed_height: BlockHeight::GENESIS,
-            committed_ts_ms: WeightedTimestamp::ZERO,
+            committed_ts: WeightedTimestamp::ZERO,
             waves: WaveRegistry::new(),
             early: EarlyArrivalBuffer::new(),
             provisioning: ProvisioningTracker::new(),
@@ -277,7 +277,7 @@ impl ExecutionCoordinator {
         topology: &TopologySnapshot,
         block_hash: BlockHash,
         block_height: BlockHeight,
-        block_ts_ms: WeightedTimestamp,
+        block_ts: WeightedTimestamp,
         transactions: &[Arc<RoutableTransaction>],
     ) -> (Vec<Action>, Vec<ExecutionVote>) {
         let waves = self.assign_waves(topology, block_height, transactions);
@@ -327,19 +327,14 @@ impl ExecutionCoordinator {
             }
 
             // Create the WaveState. For single-shard waves,
-            // `all_provisioned_at_ts_ms` is set to `wave_start_ts_ms`
+            // `all_provisioned_at` is set to `wave_start_ts`
             // immediately by the constructor.
-            let mut wave_state = WaveState::new(
-                wave_id.clone(),
-                block_hash,
-                block_ts_ms,
-                txs,
-                is_single_shard,
-            );
+            let mut wave_state =
+                WaveState::new(wave_id.clone(), block_hash, block_ts, txs, is_single_shard);
 
             // Apply the deadlock-resolving reverse conflicts collected above.
             for conflict in reverse_conflicts {
-                wave_state.record_abort(conflict.loser_tx, conflict.committed_at_ts_ms);
+                wave_state.record_abort(conflict.loser_tx, conflict.committed_at);
             }
 
             // For cross-shard waves: fold in any provisions that already arrived.
@@ -348,7 +343,7 @@ impl ExecutionCoordinator {
             if !is_single_shard {
                 for &tx_hash in &tx_hashes {
                     if self.provisioning.is_fully_provisioned(&tx_hash) {
-                        wave_state.mark_tx_provisioned(tx_hash, block_ts_ms);
+                        wave_state.mark_tx_provisioned(tx_hash, block_ts);
                     }
                 }
             }
@@ -422,7 +417,7 @@ impl ExecutionCoordinator {
     ///
     /// Waves that already had an EC formed are skipped.
     pub fn scan_complete_waves(&mut self) -> Vec<CompletionData> {
-        let committed_ts_ms = self.committed_ts_ms;
+        let committed_ts = self.committed_ts;
 
         let votable_wave_ids: Vec<WaveId> = self
             .waves
@@ -430,7 +425,7 @@ impl ExecutionCoordinator {
             .filter(|(wid, w)| {
                 !self.waves.is_ec_dispatched(wid)
                     && !w.local_ec_emitted()
-                    && w.can_emit_vote(committed_ts_ms)
+                    && w.can_emit_vote(committed_ts)
             })
             .map(|(wid, _)| wid.clone())
             .collect();
@@ -440,8 +435,8 @@ impl ExecutionCoordinator {
             let wave = self.waves.get_wave_mut(&wave_id).unwrap();
             let block_hash = wave.block_hash();
             let block_height = wave.block_height();
-            let Some((vote_anchor_ts_ms, global_receipt_root, tx_outcomes)) =
-                wave.build_vote_data(committed_ts_ms)
+            let Some((vote_anchor_ts, global_receipt_root, tx_outcomes)) =
+                wave.build_vote_data(committed_ts)
             else {
                 continue;
             };
@@ -449,7 +444,7 @@ impl ExecutionCoordinator {
             completions.push(CompletionData {
                 block_hash,
                 block_height,
-                vote_anchor_ts_ms,
+                vote_anchor_ts,
                 wave_id,
                 global_receipt_root,
                 tx_outcomes,
@@ -519,9 +514,9 @@ impl ExecutionCoordinator {
     ///
     /// This is the SINGLE path to execution voting. Call after conflicts
     /// have been processed so wave state is deterministic at this height.
-    /// Each vote is sent to the wave leader (unicast). The `vote_anchor_ts_ms`
+    /// Each vote is sent to the wave leader (unicast). The `vote_anchor_ts`
     /// is the BFT-authenticated weighted timestamp determined by the wave
-    /// (either `all_provisioned_at_ts_ms`, or `wave_start_ts_ms + WAVE_TIMEOUT`
+    /// (either `all_provisioned_at`, or `wave_start_ts + WAVE_TIMEOUT`
     /// for timeout-abort).
     pub fn emit_vote_actions(&mut self, topology: &TopologySnapshot) -> Vec<Action> {
         let committee = topology.local_committee().to_vec();
@@ -537,11 +532,11 @@ impl ExecutionCoordinator {
                 self.waves.record_vote_retry(
                     completion.wave_id.clone(),
                     PendingVoteRetry {
-                        sent_at_ts_ms: self.committed_ts_ms,
+                        sent_at: self.committed_ts,
                         attempt: Attempt::INITIAL,
                         block_hash: completion.block_hash,
                         block_height: completion.block_height,
-                        vote_anchor_ts_ms: completion.vote_anchor_ts_ms,
+                        vote_anchor_ts: completion.vote_anchor_ts,
                         global_receipt_root: completion.global_receipt_root,
                         tx_outcomes: Arc::clone(&tx_outcomes),
                     },
@@ -550,7 +545,7 @@ impl ExecutionCoordinator {
             actions.push(Action::SignAndSendExecutionVote {
                 block_hash: completion.block_hash,
                 block_height: completion.block_height,
-                vote_anchor_ts_ms: completion.vote_anchor_ts_ms,
+                vote_anchor_ts: completion.vote_anchor_ts,
                 wave_id: completion.wave_id,
                 global_receipt_root: completion.global_receipt_root,
                 tx_outcomes: (*tx_outcomes).clone(),
@@ -588,7 +583,7 @@ impl ExecutionCoordinator {
         topology: &TopologySnapshot,
         batches: &[Arc<Provision>],
         committed_height: BlockHeight,
-        committed_ts_ms: WeightedTimestamp,
+        committed_ts: WeightedTimestamp,
     ) -> Vec<Action> {
         // Sort for deterministic phase-2 iteration (logs, action vector order).
         let mut ordered: Vec<&Arc<Provision>> = batches.iter().collect();
@@ -612,7 +607,7 @@ impl ExecutionCoordinator {
         // dispatched (inert to mid-flight input).
         for batch in &ordered {
             let source_shard = batch.source_shard;
-            for conflict in self.provisioning.detect_conflicts(batch, committed_ts_ms) {
+            for conflict in self.provisioning.detect_conflicts(batch, committed_ts) {
                 let loser = conflict.loser_tx;
                 if self.provisioning.is_fully_provisioned(&loser) {
                     continue;
@@ -626,7 +621,7 @@ impl ExecutionCoordinator {
                 if wave.dispatched() {
                     continue;
                 }
-                wave.record_abort(loser, conflict.committed_at_ts_ms);
+                wave.record_abort(loser, conflict.committed_at);
                 affected_waves.insert(wave_id);
                 tracing::debug!(
                     loser_tx = %loser,
@@ -653,7 +648,7 @@ impl ExecutionCoordinator {
             let tx_hashes: Vec<TxHash> = wave.tx_hashes().to_vec();
             for tx_hash in &tx_hashes {
                 if self.provisioning.is_fully_provisioned(tx_hash) {
-                    wave.mark_tx_provisioned(*tx_hash, committed_ts_ms);
+                    wave.mark_tx_provisioned(*tx_hash, committed_ts);
                 }
             }
 
@@ -753,7 +748,7 @@ impl ExecutionCoordinator {
 
         let tracker = self.waves.get_tracker_mut(&wave_id).unwrap();
 
-        // buffer_unverified_vote handles dedup per (validator, vote_anchor_ts_ms).
+        // buffer_unverified_vote handles dedup per (validator, vote_anchor_ts).
         // Same validator can vote at multiple heights (round voting).
         if !tracker.buffer_unverified_vote(vote, public_key, voting_power) {
             return vec![];
@@ -858,7 +853,7 @@ impl ExecutionCoordinator {
             return vec![];
         };
 
-        let Some((global_receipt_root, vote_anchor_ts_ms, _total_power)) = tracker.check_quorum()
+        let Some((global_receipt_root, vote_anchor_ts, _total_power)) = tracker.check_quorum()
         else {
             return vec![];
         };
@@ -868,11 +863,11 @@ impl ExecutionCoordinator {
         tracing::info!(
             block_hash = ?block_hash,
             wave = %wave_id,
-            vote_anchor_ts_ms = vote_anchor_ts_ms.as_millis(),
+            vote_anchor_ts = vote_anchor_ts.as_millis(),
             "Execution vote quorum reached — aggregating certificate"
         );
 
-        let votes = tracker.take_votes(&global_receipt_root, vote_anchor_ts_ms);
+        let votes = tracker.take_votes(&global_receipt_root, vote_anchor_ts);
         let committee = topology.local_committee().to_vec();
 
         // Remove the vote tracker — this EC is the shard's final answer.
@@ -989,7 +984,7 @@ impl ExecutionCoordinator {
             shard,
             cert.block_height(),
             &cert.wave_id,
-            self.committed_ts_ms,
+            self.committed_ts,
         );
 
         let mut actions = Vec::new();
@@ -1002,7 +997,7 @@ impl ExecutionCoordinator {
                 source_shard = shard.0,
                 block_height = cert.block_height().0,
                 wave = %cert.wave_id,
-                at_local_ts_ms = self.committed_ts_ms.as_millis(),
+                at_local_ts_ms = self.committed_ts.as_millis(),
                 "Fulfilled expected exec cert"
             );
             actions.push(Action::CancelExecutionCertFetch {
@@ -1090,7 +1085,7 @@ impl ExecutionCoordinator {
                     source_shard,
                     block_height,
                     wave.clone(),
-                    self.committed_ts_ms,
+                    self.committed_ts,
                 );
             }
         }
@@ -1101,7 +1096,7 @@ impl ExecutionCoordinator {
     /// Called during block commit processing. Returns actions for any certs
     /// that have exceeded the timeout.
     fn check_exec_cert_timeouts(&mut self, topology: &TopologySnapshot) -> Vec<Action> {
-        let now_ts = self.committed_ts_ms;
+        let now_ts = self.committed_ts;
         let fetches = self.expected_certs.check_timeouts(now_ts);
 
         let mut actions = Vec::with_capacity(fetches.len());
@@ -1155,7 +1150,7 @@ impl ExecutionCoordinator {
     /// number; the coordinator resolves the rotated leader via topology
     /// and lifts each effect to `Action::SignAndSendExecutionVote`.
     fn check_vote_retry_timeouts(&mut self, topology: &TopologySnapshot) -> Vec<Action> {
-        let effects = self.waves.check_vote_retry_timeouts(self.committed_ts_ms);
+        let effects = self.waves.check_vote_retry_timeouts(self.committed_ts);
         if effects.is_empty() {
             return Vec::new();
         }
@@ -1167,7 +1162,7 @@ impl ExecutionCoordinator {
             attempt,
             block_hash,
             block_height,
-            vote_anchor_ts_ms,
+            vote_anchor_ts,
             global_receipt_root,
             tx_outcomes,
         } in effects
@@ -1182,7 +1177,7 @@ impl ExecutionCoordinator {
             actions.push(Action::SignAndSendExecutionVote {
                 block_hash,
                 block_height,
-                vote_anchor_ts_ms,
+                vote_anchor_ts,
                 wave_id,
                 global_receipt_root,
                 tx_outcomes: (*tx_outcomes).clone(),
@@ -1207,15 +1202,15 @@ impl ExecutionCoordinator {
     /// Orchestration order matters. The phases below run in sequence and
     /// depend on earlier phases completing first:
     ///
-    /// 1. **Anchor time** — bump `committed_height` and `committed_ts_ms`
+    /// 1. **Anchor time** — bump `committed_height` and `committed_ts`
     ///    from the QC. Every downstream phase reads these.
     /// 2. **First-commit retro-stamp** — entries buffered pre-first-commit
     ///    carry `WeightedTimestamp::ZERO`; stamp them with the new
-    ///    `committed_ts_ms` before timeout checks, otherwise
+    ///    `committed_ts` before timeout checks, otherwise
     ///    `elapsed_since(ZERO)` dwarfs every deadline and triggers a
     ///    fallback-fetch storm.
     /// 3. **Timeout checks** — expected-cert fallbacks and vote retries.
-    ///    Read the freshly-bumped `committed_ts_ms`.
+    ///    Read the freshly-bumped `committed_ts`.
     /// 4. **Pruning** — resolved waves, stale buffered ECs, aged
     ///    conflict-detector provisions. Must follow timeouts so a retry
     ///    fires before the wave it references is pruned away.
@@ -1238,19 +1233,19 @@ impl ExecutionCoordinator {
         // Update committed height + timestamp before anything else — needed
         // for timeout calculations and pruning even when there are no new
         // transactions.
-        let first_commit = self.committed_ts_ms == WeightedTimestamp::ZERO;
+        let first_commit = self.committed_ts == WeightedTimestamp::ZERO;
         if height > self.committed_height {
             self.committed_height = height;
-            self.committed_ts_ms = certified.qc.weighted_timestamp;
+            self.committed_ts = certified.qc.weighted_timestamp;
         }
 
         // Retro-stamp entries recorded before the first local commit. Remote
         // headers can register expected exec certs (and ECs themselves can be
-        // buffered) while `committed_ts_ms` is still zero; without this, every
+        // buffered) while `committed_ts` is still zero; without this, every
         // such entry would report a ~57-year age on the next commit and
         // trigger a fallback fetch storm.
-        if first_commit && self.committed_ts_ms != WeightedTimestamp::ZERO {
-            let now_ts = self.committed_ts_ms;
+        if first_commit && self.committed_ts != WeightedTimestamp::ZERO {
+            let now_ts = self.committed_ts;
             self.expected_certs.retro_stamp_zero_timestamps(now_ts);
             self.early.retro_stamp_zero_timestamps(now_ts);
         }
@@ -1262,16 +1257,16 @@ impl ExecutionCoordinator {
         actions.extend(self.check_exec_cert_timeouts(topology));
         actions.extend(self.check_vote_retry_timeouts(topology));
         self.prune_execution_state();
-        self.early.gc_stale_ecs(self.committed_ts_ms);
+        self.early.gc_stale_ecs(self.committed_ts);
 
         for (_, wave) in self.waves.waves_iter_mut() {
-            wave.log_if_overdue(self.committed_ts_ms);
+            wave.log_if_overdue(self.committed_ts);
         }
 
         // Drop conflict-detector entries for remote provisions older than the
         // retention window. `register_tx` iterates over these per cross-shard
         // tx; left unbounded they drive quadratic TPS decay.
-        let cutoff = self.committed_ts_ms.minus(CONFLICT_PROVISION_RETENTION);
+        let cutoff = self.committed_ts.minus(CONFLICT_PROVISION_RETENTION);
         if cutoff.as_millis() > 0 {
             let dropped = self.provisioning.prune_old_provisions(cutoff);
             if dropped > 0 {
@@ -1348,7 +1343,7 @@ impl ExecutionCoordinator {
                 topology,
                 block_hash,
                 height,
-                self.committed_ts_ms,
+                self.committed_ts,
                 transactions,
             );
             actions.extend(dispatch_actions);
@@ -1366,7 +1361,7 @@ impl ExecutionCoordinator {
                 topology,
                 provisions,
                 height,
-                self.committed_ts_ms,
+                self.committed_ts,
             ));
         }
 
@@ -1460,7 +1455,7 @@ impl ExecutionCoordinator {
 
         self.early.clear_routed(&ec, &routing.routed_tx_hashes);
         self.early
-            .buffer_ec(&ec, &routing.unrouted_tx_hashes, self.committed_ts_ms);
+            .buffer_ec(&ec, &routing.unrouted_tx_hashes, self.committed_ts);
 
         if routing.affected_waves.is_empty() {
             return vec![];
@@ -1619,7 +1614,7 @@ impl ExecutionCoordinator {
         // Non-leaders with a wave but no VoteTracker KEEP early votes. They
         // may become fallback leaders via rotation and need to replay them
         // into the on-demand VoteTracker created in `on_execution_vote`.
-        let ev_cutoff = self.committed_ts_ms.minus(EARLY_VOTE_RETENTION);
+        let ev_cutoff = self.committed_ts.minus(EARLY_VOTE_RETENTION);
         let before_ev = self.early.vote_len();
         let registry = &self.waves;
         self.early.retain_votes(|key, votes| {
@@ -1634,7 +1629,7 @@ impl ExecutionCoordinator {
             }
             votes
                 .first()
-                .map(|v| v.vote_anchor_ts_ms > ev_cutoff)
+                .map(|v| v.vote_anchor_ts > ev_cutoff)
                 .unwrap_or(false)
         });
         let pruned_ev = before_ev - self.early.vote_len();
@@ -2014,7 +2009,7 @@ mod tests {
         let fake_vote = ExecutionVote {
             block_hash,
             block_height: BlockHeight(1),
-            vote_anchor_ts_ms: WeightedTimestamp::ZERO,
+            vote_anchor_ts: WeightedTimestamp::ZERO,
             wave_id: wave_id.clone(),
             shard_group_id: ShardGroupId(0),
             global_receipt_root: GlobalReceiptRoot::ZERO,
@@ -2043,17 +2038,17 @@ mod tests {
         let mut state = make_test_state();
         state.committed_height = BlockHeight(20);
         // "Now" timestamp exactly VOTE_RETRY_TIMEOUT past the original send.
-        state.committed_ts_ms = WeightedTimestamp(10_000).plus(VOTE_RETRY_TIMEOUT);
+        state.committed_ts = WeightedTimestamp(10_000).plus(VOTE_RETRY_TIMEOUT);
 
         // Manually insert a pending retry as if we'd sent a vote at t=10_000ms.
         state.waves.record_vote_retry(
             wave_id.clone(),
             PendingVoteRetry {
-                sent_at_ts_ms: WeightedTimestamp(10_000),
+                sent_at: WeightedTimestamp(10_000),
                 attempt: Attempt::INITIAL,
                 block_hash: BlockHash::from_raw(Hash::from_bytes(b"block1")),
                 block_height: BlockHeight(1),
-                vote_anchor_ts_ms: WeightedTimestamp::ZERO,
+                vote_anchor_ts: WeightedTimestamp::ZERO,
                 global_receipt_root: GlobalReceiptRoot::ZERO,
                 tx_outcomes: Arc::new(vec![]),
             },
@@ -2083,7 +2078,7 @@ mod tests {
         // The retry is still tracked with its cooldown re-anchored at the
         // current committed timestamp — advance exactly one more
         // VOTE_RETRY_TIMEOUT and check that a retry at attempt 2 fires.
-        state.committed_ts_ms = state.committed_ts_ms.plus(VOTE_RETRY_TIMEOUT);
+        state.committed_ts = state.committed_ts.plus(VOTE_RETRY_TIMEOUT);
         let next = state.check_vote_retry_timeouts(&topo);
         assert_eq!(next.len(), 1);
         if let Action::SignAndSendExecutionVote { leader, .. } = &next[0] {
@@ -2105,11 +2100,11 @@ mod tests {
         state.waves.record_vote_retry(
             wave_id.clone(),
             PendingVoteRetry {
-                sent_at_ts_ms: WeightedTimestamp(5_000),
+                sent_at: WeightedTimestamp(5_000),
                 attempt: Attempt::INITIAL,
                 block_hash: BlockHash::from_raw(Hash::from_bytes(b"block1")),
                 block_height: BlockHeight(1),
-                vote_anchor_ts_ms: WeightedTimestamp::ZERO,
+                vote_anchor_ts: WeightedTimestamp::ZERO,
                 global_receipt_root: GlobalReceiptRoot::ZERO,
                 tx_outcomes: Arc::new(vec![]),
             },
@@ -2128,7 +2123,7 @@ mod tests {
 
         // Advance time past the retry deadline; if the retry had survived,
         // this would fire a SignAndSendExecutionVote action.
-        state.committed_ts_ms = WeightedTimestamp(5_000).plus(VOTE_RETRY_TIMEOUT);
+        state.committed_ts = WeightedTimestamp(5_000).plus(VOTE_RETRY_TIMEOUT);
         let actions = state.check_vote_retry_timeouts(&topo);
         assert!(
             actions.is_empty(),
@@ -2304,7 +2299,7 @@ mod tests {
         // age-based gate would fire. The expectation must survive regardless
         // because a local wave still needs shard 1's EC.
         state.committed_height = BlockHeight(500);
-        state.committed_ts_ms = WeightedTimestamp(60_000);
+        state.committed_ts = WeightedTimestamp(60_000);
         let actions = state.check_exec_cert_timeouts(&topo);
 
         assert_eq!(
@@ -2324,7 +2319,7 @@ mod tests {
         state.waves.remove_wave(&local_wave);
         state.waves.remove_assignment(&tx_hash);
         state.committed_height = BlockHeight(600);
-        state.committed_ts_ms = WeightedTimestamp(120_000);
+        state.committed_ts = WeightedTimestamp(120_000);
         let _ = state.check_exec_cert_timeouts(&topo);
         assert_eq!(
             state.expected_certs.expected_len(),
@@ -2504,7 +2499,7 @@ mod tests {
 
     // ═══════════════════════════════════════════════════════════════════════════
     // First-commit retro-stamp — remote headers can register expected ECs
-    // while committed_ts_ms is still ZERO. Without retro-stamp, the first
+    // while committed_ts is still ZERO. Without retro-stamp, the first
     // commit triggers a fallback-fetch storm because elapsed_since(ZERO)
     // dwarfs the fallback timeout.
     // ═══════════════════════════════════════════════════════════════════════════
@@ -2514,7 +2509,7 @@ mod tests {
         let topo = make_two_shard_topology();
         let mut state = make_test_state();
 
-        // Pre-first-commit: register an expectation. discovered_at_ts_ms is ZERO.
+        // Pre-first-commit: register an expectation. discovered_at is ZERO.
         let remote_shard = ShardGroupId(1);
         let remote_wave = WaveId::new(
             remote_shard,

@@ -46,7 +46,7 @@ use std::time::Duration;
 /// How long to retain unmatched early votes whose block never committed
 /// locally. A non-arrival past this window indicates BFT is broken; entries
 /// are dropped to bound memory. Anchored on the vote's embedded
-/// `vote_anchor_ts_ms` vs the committing QC's `weighted_timestamp_ms`.
+/// `vote_anchor_ts` vs the committing QC's `weighted_timestamp_ms`.
 pub(crate) const EARLY_VOTE_RETENTION: Duration = Duration::from_secs(30);
 
 /// Maximum age before a buffered EC is considered stale and evicted. Bounds
@@ -71,7 +71,7 @@ struct BufferedEc {
     /// Local weighted timestamp when this EC was first buffered. Used by
     /// [`EarlyArrivalBuffer::gc_stale_ecs`] to evict entries past the
     /// retention window.
-    buffered_at_ts_ms: WeightedTimestamp,
+    buffered_at: WeightedTimestamp,
 }
 
 pub(crate) struct EarlyArrivalBuffer {
@@ -147,7 +147,7 @@ impl EarlyArrivalBuffer {
             .or_insert_with(|| BufferedEc {
                 ec: Arc::clone(ec),
                 pending_txs: HashSet::new(),
-                buffered_at_ts_ms: now_ts,
+                buffered_at: now_ts,
             });
         for tx_hash in tx_hashes {
             if entry.pending_txs.insert(*tx_hash) {
@@ -215,7 +215,7 @@ impl EarlyArrivalBuffer {
         let stale: Vec<WaveId> = self
             .pending_routing
             .iter()
-            .filter(|(_, entry)| entry.buffered_at_ts_ms <= cutoff)
+            .filter(|(_, entry)| entry.buffered_at <= cutoff)
             .map(|(wid, _)| wid.clone())
             .collect();
         if stale.is_empty() {
@@ -238,14 +238,14 @@ impl EarlyArrivalBuffer {
         count
     }
 
-    /// Retro-stamp `buffered_at_ts_ms == ZERO` entries with `now_ts`.
+    /// Retro-stamp `buffered_at == ZERO` entries with `now_ts`.
     /// Remote ECs can arrive before our first local commit; without this,
     /// every such entry would report a ~57-year age on the next commit
     /// and be evicted immediately.
     pub fn retro_stamp_zero_timestamps(&mut self, now_ts: WeightedTimestamp) {
         for entry in self.pending_routing.values_mut() {
-            if entry.buffered_at_ts_ms == WeightedTimestamp::ZERO {
-                entry.buffered_at_ts_ms = now_ts;
+            if entry.buffered_at == WeightedTimestamp::ZERO {
+                entry.buffered_at = now_ts;
             }
         }
     }
@@ -333,7 +333,7 @@ mod tests {
         ExecutionVote {
             block_hash: BlockHash::ZERO,
             block_height: BlockHeight(1),
-            vote_anchor_ts_ms: anchor_ts,
+            vote_anchor_ts: anchor_ts,
             wave_id,
             shard_group_id: shard(),
             global_receipt_root,
@@ -566,7 +566,7 @@ mod tests {
         }
     }
 
-    // GC never drops an EC whose buffered_at_ts_ms is strictly greater than
+    // GC never drops an EC whose buffered_at is strictly greater than
     // the retention cutoff (now_ts - EC_BUFFER_RETENTION).
     proptest! {
         #[test]
@@ -591,9 +591,9 @@ mod tests {
             let cutoff = ms(now_ms).minus(EC_BUFFER_RETENTION);
             for entry in b.pending_routing.values() {
                 prop_assert!(
-                    entry.buffered_at_ts_ms > cutoff,
+                    entry.buffered_at > cutoff,
                     "GC left a stale entry: buffered_at={:?}, cutoff={:?}",
-                    entry.buffered_at_ts_ms,
+                    entry.buffered_at,
                     cutoff
                 );
             }

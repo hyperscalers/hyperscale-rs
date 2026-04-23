@@ -66,14 +66,14 @@ pub fn aggregate_execution_certificate(
         }
     }
 
-    let vote_anchor_ts_ms = votes
+    let vote_anchor_ts = votes
         .first()
-        .map(|v| v.vote_anchor_ts_ms)
+        .map(|v| v.vote_anchor_ts)
         .unwrap_or(WeightedTimestamp::ZERO);
 
     ExecutionCertificate::new(
         wave_id.clone(),
-        vote_anchor_ts_ms,
+        vote_anchor_ts,
         global_receipt_root,
         tx_outcomes,
         aggregated_signature,
@@ -100,7 +100,7 @@ pub fn batch_verify_execution_votes(
         HashMap::new();
     for (vote, pk, power) in votes {
         let msg = exec_vote_message(
-            vote.vote_anchor_ts_ms,
+            vote.vote_anchor_ts,
             &vote.wave_id,
             vote.shard_group_id,
             &vote.global_receipt_root,
@@ -149,7 +149,7 @@ pub fn verify_execution_certificate_signature(
     public_keys: &[Bls12381G1PublicKey],
 ) -> bool {
     let msg = exec_vote_message(
-        certificate.vote_anchor_ts_ms,
+        certificate.vote_anchor_ts,
         &certificate.wave_id,
         certificate.shard_group_id(),
         &certificate.global_receipt_root,
@@ -294,7 +294,7 @@ mod tests {
         ExecutionVote {
             block_hash: BlockHash::ZERO,
             block_height: BlockHeight(1),
-            vote_anchor_ts_ms: anchor,
+            vote_anchor_ts: anchor,
             wave_id: wid.clone(),
             shard_group_id: shard(),
             global_receipt_root,
