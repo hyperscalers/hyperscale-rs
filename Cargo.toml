@@ -22,7 +22,6 @@ members = [
     "crates/simulation",
     "crates/simulator",
     "crates/spammer",
-
     "crates/jmt",
     "crates/storage",
     "crates/storage-memory",
@@ -54,7 +53,6 @@ default-members = [
     "crates/simulation",
     "crates/simulator",
     "crates/spammer",
-
     "crates/jmt",
     "crates/storage",
     "crates/storage-memory",

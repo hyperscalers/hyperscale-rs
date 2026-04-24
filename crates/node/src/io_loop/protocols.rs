@@ -168,6 +168,7 @@ where
                                 let _ = es.send(NodeInput::LocalProvisionReceived {
                                     block_hash: bh,
                                     batches,
+                                    missing_hashes: resp.missing_hashes,
                                 });
                             }
                             Err(_) => {

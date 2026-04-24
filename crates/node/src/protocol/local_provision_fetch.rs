@@ -37,10 +37,13 @@ pub enum LocalProvisionFetchInput {
         proposer: ValidatorId,
         batch_hashes: Vec<ProvisionHash>,
     },
-    /// Provision batches were received.
+    /// Provision batches were received. `missing_hashes` lists requested
+    /// hashes the peer reported as absent, so the protocol can reclaim
+    /// them for retry without a per-peer in-flight heuristic.
     Received {
         block_hash: BlockHash,
         batches: Vec<Arc<Provision>>,
+        missing_hashes: Vec<ProvisionHash>,
     },
     /// A fetch operation failed.
     Failed {
@@ -128,6 +131,19 @@ impl BlockFetchState {
         self.in_flight_count = self.in_flight_count.saturating_sub(1);
     }
 
+    /// Move hashes the peer explicitly reported as missing back to the
+    /// missing set so another `Tick` retries them — typically on a different
+    /// peer, since the RequestManager rotates on each request.
+    fn reclaim_missing(&mut self, hashes: &[ProvisionHash]) {
+        for h in hashes {
+            if self.received_hashes.contains(h) {
+                continue;
+            }
+            self.in_flight_hashes.remove(h);
+            self.missing_hashes.insert(*h);
+        }
+    }
+
     /// Move any in-flight hashes that weren't received back to missing.
     /// Called after marking received items to handle partial/empty responses.
     fn reclaim_unreceived(&mut self) {
@@ -170,7 +186,8 @@ impl LocalProvisionFetchProtocol {
             LocalProvisionFetchInput::Received {
                 block_hash,
                 batches,
-            } => self.handle_received(block_hash, batches),
+                missing_hashes,
+            } => self.handle_received(block_hash, batches, missing_hashes),
             LocalProvisionFetchInput::Failed { block_hash, hashes } => {
                 self.handle_failed(block_hash, hashes)
             }
@@ -232,6 +249,7 @@ impl LocalProvisionFetchProtocol {
         &mut self,
         block_hash: BlockHash,
         batches: Vec<Arc<Provision>>,
+        missing_hashes: Vec<ProvisionHash>,
     ) -> Vec<LocalProvisionFetchOutput> {
         let Some(state) = self.fetches.get_mut(&block_hash) else {
             trace!(?block_hash, "Provision received for unknown fetch");
@@ -242,14 +260,18 @@ impl LocalProvisionFetchProtocol {
 
         let received_hashes: Vec<ProvisionHash> = batches.iter().map(|b| b.hash()).collect();
         let received_count = received_hashes.len();
+        let missing_count = missing_hashes.len();
         state.mark_received(received_hashes);
-        // Move any in-flight hashes not in the response back to missing for retry.
+        state.reclaim_missing(&missing_hashes);
+        // Catch-all for any in-flight hashes the peer didn't account for
+        // (e.g. a legacy peer or a truncated response).
         state.reclaim_unreceived();
         metrics::record_fetch_items_received("local_provision", received_count);
 
         info!(
             ?block_hash,
             received = received_count,
+            reported_missing = missing_count,
             remaining = state.missing_hashes.len(),
             "Received local provisions"
         );

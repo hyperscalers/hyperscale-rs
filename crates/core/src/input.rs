@@ -75,9 +75,15 @@ pub enum NodeInput {
     },
 
     /// Local provision batches received from a fetch request.
+    ///
+    /// `missing_hashes` lists requested hashes the peer did not have
+    /// (evicted or never seen). Together with `batches` it fully partitions
+    /// the request, so the fetch protocol can reclaim missing hashes for
+    /// retry without relying on a per-peer heuristic.
     LocalProvisionReceived {
         block_hash: BlockHash,
         batches: Vec<Arc<Provision>>,
+        missing_hashes: Vec<ProvisionHash>,
     },
 
     /// Local provision fetch failed.

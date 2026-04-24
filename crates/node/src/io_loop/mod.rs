@@ -860,11 +860,13 @@ where
             NodeInput::LocalProvisionReceived {
                 block_hash,
                 batches,
+                missing_hashes,
             } => {
                 let outputs = self.local_provision_fetch_protocol.handle(
                     LocalProvisionFetchInput::Received {
                         block_hash,
                         batches,
+                        missing_hashes,
                     },
                 );
                 self.process_local_provision_fetch_outputs(outputs);
