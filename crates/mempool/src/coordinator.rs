@@ -349,7 +349,7 @@ impl MempoolCoordinator {
     /// being re-added via gossip. Terminal states include:
     /// - Completed (certificate committed)
     /// - Aborted (explicitly aborted)
-    fn evict_terminal(&mut self, tx_hash: TxHash) {
+    fn evict_terminal(&mut self, topology: &TopologySnapshot, tx_hash: TxHash) {
         // Remove locked nodes and update counters if this transaction was holding locks
         let info_to_unlock = self.pool.get(&tx_hash).and_then(|entry| {
             if entry.status.holds_state_lock() {
@@ -359,7 +359,7 @@ impl MempoolCoordinator {
             }
         });
         if let Some((tx, status)) = info_to_unlock {
-            self.remove_locked_nodes(&tx);
+            self.remove_locked_nodes(topology, &tx);
             match status {
                 TransactionStatus::Committed(_) => self.locks.dec_committed(),
                 TransactionStatus::Executed { .. } => self.locks.dec_executed(),
@@ -459,7 +459,7 @@ impl MempoolCoordinator {
                     // Remove from ready tracking (no longer Pending)
                     self.remove_from_ready_tracking(&hash);
                     // Add locks for committed transactions and update counter
-                    self.add_locked_nodes(tx);
+                    self.add_locked_nodes(topology, tx);
                     self.locks.inc_committed();
                     actions.push(Action::EmitTransactionStatus {
                         tx_hash: hash,
@@ -481,7 +481,7 @@ impl MempoolCoordinator {
                 if matches!(decision, TransactionDecision::Aborted) {
                     hyperscale_metrics::record_transaction_aborted();
                 }
-                actions.extend(self.process_certificate_committed(tx_hash, decision));
+                actions.extend(self.process_certificate_committed(topology, tx_hash, decision));
             }
         }
 
@@ -494,6 +494,7 @@ impl MempoolCoordinator {
     /// Emits the terminal status update and evicts/tombstones the entry.
     fn process_certificate_committed(
         &mut self,
+        topology: &TopologySnapshot,
         tx_hash: TxHash,
         decision: TransactionDecision,
     ) -> Vec<Action> {
@@ -523,7 +524,7 @@ impl MempoolCoordinator {
             });
 
             // Release locks and evict — same for all terminal states
-            self.evict_terminal(tx_hash);
+            self.evict_terminal(topology, tx_hash);
         }
 
         actions
@@ -600,8 +601,19 @@ impl MempoolCoordinator {
     /// Called when a transaction transitions TO a lock-holding state (Committed/Executed).
     ///
     /// Also blocks any ready transactions that conflict with the newly locked nodes.
-    fn add_locked_nodes(&mut self, tx: &RoutableTransaction) {
-        let newly_locked = self.locks.lock_nodes(tx.all_declared_nodes().copied());
+    ///
+    /// Scoped to local-shard nodes. A cross-shard tx's remote nodes are not
+    /// owned by this shard's state machine; their lifetime is gated by the
+    /// peer shard's wave finalization, which can stall independently. Locking
+    /// them here would permanently defer future local cross-shard txs that
+    /// share those remote nodes, cascading the stall.
+    fn add_locked_nodes(&mut self, topology: &TopologySnapshot, tx: &RoutableTransaction) {
+        let local_shard = topology.local_shard();
+        let newly_locked = self.locks.lock_nodes(
+            tx.all_declared_nodes()
+                .filter(|node| topology.shard_for_node_id(node) == local_shard)
+                .copied(),
+        );
         for node in newly_locked {
             self.ready.block_node(node);
         }
@@ -611,8 +623,14 @@ impl MempoolCoordinator {
     /// Called when a transaction transitions FROM a lock-holding state (evicted).
     ///
     /// Also promotes any blocked transactions that were waiting on these nodes.
-    fn remove_locked_nodes(&mut self, tx: &RoutableTransaction) {
-        let newly_unlocked = self.locks.unlock_nodes(tx.all_declared_nodes().copied());
+    /// Scoped to local-shard nodes; mirrors [`Self::add_locked_nodes`].
+    fn remove_locked_nodes(&mut self, topology: &TopologySnapshot, tx: &RoutableTransaction) {
+        let local_shard = topology.local_shard();
+        let newly_unlocked = self.locks.unlock_nodes(
+            tx.all_declared_nodes()
+                .filter(|node| topology.shard_for_node_id(node) == local_shard)
+                .copied(),
+        );
         for node in newly_unlocked {
             self.promote_transactions_for_node(node);
         }
