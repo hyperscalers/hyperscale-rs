@@ -601,13 +601,11 @@ where
                     self.network.broadcast_to_shard(shard, &gossip);
                 }
 
-                // Track as locally submitted for latency metrics.
-                self.locally_submitted.insert(tx_hash);
-
-                // Queue for validation if not already in pipeline or cached.
                 if !self.pending_validation.contains(&tx_hash)
                     && self.tx_cache.get(&tx_hash).is_none()
                 {
+                    // Paired with validation: only queued txs are removed on completion.
+                    self.locally_submitted.insert(tx_hash);
                     self.pending_validation.insert(tx_hash);
                     self.queue_validation(tx);
                 }
