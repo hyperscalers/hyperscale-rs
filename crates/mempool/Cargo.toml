@@ -17,4 +17,4 @@ serde.workspace = true
 [dev-dependencies]
 hyperscale-test-helpers.workspace = true
 hyperscale-types = { workspace = true, features = ["test-utils"] }
-proptest = "1"
+proptest.workspace = true

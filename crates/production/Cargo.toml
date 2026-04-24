@@ -68,11 +68,11 @@ quick_cache.workspace = true
 # OpenTelemetry for distributed tracing
 opentelemetry.workspace = true
 opentelemetry_sdk = { workspace = true, features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.31.0", features = ["grpc-tonic", "reqwest-rustls"] }
-opentelemetry-semantic-conventions = "0.31.0"
+opentelemetry-otlp.workspace = true
+opentelemetry-semantic-conventions.workspace = true
 
 # Tracing integration (version matched to opentelemetry 0.31.0)
-tracing-opentelemetry = "0.32.0"
+tracing-opentelemetry.workspace = true
 
 # Tracing subscriber for layer composition
 tracing-subscriber = { workspace = true, features = ["fmt", "env-filter", "registry"] }
