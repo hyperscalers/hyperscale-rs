@@ -116,8 +116,10 @@ pub struct RequestManagerConfig {
     /// Maximum concurrent requests per peer.
     pub max_per_peer: u32,
 
-    /// Number of retries to same peer before rotating to a different peer.
-    /// Higher values are better for packet loss scenarios.
+    /// Number of retries to the same peer before rotating. Sized so that a
+    /// single request's `max_total_attempts` budget covers every candidate
+    /// peer — with 7 peers and 15 attempts, rotating every 2 attempts tries
+    /// all of them before exhaustion.
     pub retries_before_rotation: u32,
 
     /// Maximum total retry attempts before giving up.
@@ -144,8 +146,8 @@ impl Default for RequestManagerConfig {
         Self {
             max_concurrent: 64,
             max_per_peer: 8,
-            retries_before_rotation: 3, // Retry same peer 3x before rotating (good for packet loss)
-            max_total_attempts: 15,     // More attempts to handle lossy networks
+            retries_before_rotation: 2,
+            max_total_attempts: 15,
             initial_backoff: Duration::from_millis(100),
             max_backoff: Duration::from_millis(500), // Cap backoff to match stream timeout
             backoff_multiplier: 1.5,
@@ -283,7 +285,7 @@ mod tests {
     fn test_default_config() {
         let config = RequestManagerConfig::default();
         assert_eq!(config.max_concurrent, 64);
-        assert_eq!(config.retries_before_rotation, 3);
+        assert_eq!(config.retries_before_rotation, 2);
         assert_eq!(config.max_total_attempts, 15);
         assert_eq!(config.initial_backoff, Duration::from_millis(100));
         assert_eq!(config.max_backoff, Duration::from_millis(500));

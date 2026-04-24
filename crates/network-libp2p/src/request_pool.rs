@@ -12,9 +12,20 @@
 //! in the order requests are written, we don't need request IDs — the stream
 //! itself is the ordering primitive.
 //!
-//! On any I/O error or per-request timeout, the actor tears down the stream
-//! and exits. The next `send()` call detects the dead channel and spawns a
-//! fresh actor (subject to exponential backoff).
+//! ## Stale-stream recovery
+//!
+//! The inbound router closes its side of an idle request stream after
+//! `PERSISTENT_STREAM_IDLE_TIMEOUT` (60s). When we next write on a stream the
+//! peer has already closed, the write returns a `StreamIo` error — harmless
+//! but indistinguishable at the byte layer from a real fault. Because the
+//! request never reached the peer, it's safe to reopen the stream and retry
+//! the same request on the new stream. We close proactively after
+//! `CLIENT_IDLE_TIMEOUT` (below the server timeout) to avoid the race in the
+//! first place, and only fall back to the tear-down + backoff path after the
+//! reopened stream also fails.
+//!
+//! On a response-phase error (read or decompression), the request already
+//! crossed the wire so retry is not safe — the actor tears down and exits.
 
 use crate::adapter::{Libp2pAdapter, NetworkError};
 use crate::stream_framing::{self, MAX_FRAME_SIZE};
@@ -26,7 +37,7 @@ use libp2p::{PeerId, Stream};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
-use tracing::warn;
+use tracing::{debug, warn};
 
 /// Initial reconnection backoff after a stream failure.
 const INITIAL_BACKOFF: Duration = Duration::from_millis(100);
@@ -39,6 +50,13 @@ const BACKOFF_MULTIPLIER: u32 = 2;
 
 /// Channel capacity per peer. Bounds memory and provides caller backpressure.
 const PEER_CHANNEL_CAPACITY: usize = 64;
+
+/// Proactively close the persistent stream after this long without new
+/// requests. Must be strictly less than the inbound router's
+/// `PERSISTENT_STREAM_IDLE_TIMEOUT` so we always close before the peer does,
+/// avoiding the "write failed: sending stopped by peer" race on the next
+/// request after an idle gap.
+const CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// A request queued for dispatch on a peer's persistent stream.
 struct PendingRequest {
@@ -158,8 +176,8 @@ impl RequestStreamPool {
     }
 
     /// Actor task: opens a persistent stream and services queued requests
-    /// in order. Exits (and tears down the stream) on any I/O error or
-    /// request timeout.
+    /// in order. Closes cleanly after `CLIENT_IDLE_TIMEOUT` of inactivity.
+    /// Tears down (and applies backoff) on a response-phase error or timeout.
     async fn run_actor(
         peer: PeerId,
         mut req_rx: mpsc::Receiver<PendingRequest>,
@@ -183,18 +201,56 @@ impl RequestStreamPool {
 
         backoff_map.remove(&peer);
 
-        while let Some(req) = req_rx.recv().await {
-            let io = tokio::time::timeout(
+        loop {
+            let req = tokio::select! {
+                maybe_req = req_rx.recv() => match maybe_req {
+                    Some(r) => r,
+                    None => break,
+                },
+                _ = tokio::time::sleep(CLIENT_IDLE_TIMEOUT) => {
+                    debug!(peer = %peer, "Client idle timeout — closing persistent stream");
+                    break;
+                }
+            };
+
+            let outcome = tokio::time::timeout(
                 req.timeout,
                 do_request_response(&mut stream, req.type_id, &req.data),
             )
             .await;
 
-            match io {
-                Ok(Ok(response)) => {
+            // A write-phase failure usually means the peer closed the stream
+            // between requests (inbound-router idle close). The request never
+            // left our side, so reopen once and retry transparently before
+            // tearing down.
+            let outcome = match outcome {
+                Ok(IoOutcome::WriteFailed(e)) => {
+                    debug!(peer = %peer, error = ?e, "Write failed on persistent stream — reopening and retrying once");
+                    match adapter.open_request_stream(peer).await {
+                        Ok(new_stream) => {
+                            stream = new_stream;
+                            tokio::time::timeout(
+                                req.timeout,
+                                do_request_response(&mut stream, req.type_id, &req.data),
+                            )
+                            .await
+                        }
+                        Err(reopen_err) => {
+                            warn!(peer = %peer, error = ?reopen_err, "Failed to reopen persistent request stream");
+                            Ok(IoOutcome::ResponseFailed(NetworkError::StreamOpenFailed(
+                                format!("{reopen_err:?}"),
+                            )))
+                        }
+                    }
+                }
+                other => other,
+            };
+
+            match outcome {
+                Ok(IoOutcome::Ok(response)) => {
                     let _ = req.resp_tx.send(Ok(response));
                 }
-                Ok(Err(e)) => {
+                Ok(IoOutcome::WriteFailed(e)) | Ok(IoOutcome::ResponseFailed(e)) => {
                     let msg = format!("{e:?}");
                     let _ = req.resp_tx.send(Err(e));
                     warn!(peer = %peer, error = %msg, "Persistent request stream I/O failed");
@@ -202,7 +258,8 @@ impl RequestStreamPool {
                         NetworkError::StreamIo("peer stream reset after prior failure".into())
                     });
                     Self::apply_backoff(&backoff_map, &peer);
-                    break;
+                    peers.remove(&peer);
+                    return;
                 }
                 Err(_) => {
                     let _ = req.resp_tx.send(Err(NetworkError::Timeout));
@@ -212,7 +269,8 @@ impl RequestStreamPool {
                         NetworkError::StreamIo("peer stream reset after request timeout".into())
                     });
                     Self::apply_backoff(&backoff_map, &peer);
-                    break;
+                    peers.remove(&peer);
+                    return;
                 }
             }
         }
@@ -236,31 +294,51 @@ impl RequestStreamPool {
     }
 }
 
+/// Outcome of a single request/response round-trip on a persistent stream.
+///
+/// The distinction between `WriteFailed` and `ResponseFailed` drives the
+/// stale-stream recovery: `WriteFailed` means the request never reached the
+/// peer, so retrying on a fresh stream is safe. `ResponseFailed` means the
+/// request was already on the wire — the peer may have processed it, so
+/// retry could double-apply.
+enum IoOutcome {
+    Ok(Vec<u8>),
+    WriteFailed(NetworkError),
+    ResponseFailed(NetworkError),
+}
+
 /// Write a typed request frame and read the length-prefixed response.
-async fn do_request_response(
-    stream: &mut Stream,
-    type_id: &str,
-    data: &[u8],
-) -> Result<Vec<u8>, NetworkError> {
-    let wire_bytes = stream_framing::write_typed_frame(stream, type_id, data)
-        .await
-        .map_err(|e| NetworkError::StreamIo(format!("write failed: {e}")))?;
+async fn do_request_response(stream: &mut Stream, type_id: &str, data: &[u8]) -> IoOutcome {
+    let wire_bytes = match stream_framing::write_typed_frame(stream, type_id, data).await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            return IoOutcome::WriteFailed(NetworkError::StreamIo(format!("write failed: {e}")))
+        }
+    };
     metrics::record_libp2p_bandwidth(0, wire_bytes as u64);
 
-    let response_len = stream_framing::read_frame_len(stream, MAX_FRAME_SIZE)
-        .await
-        .map_err(|e| NetworkError::StreamIo(format!("read length failed: {e}")))?;
+    let response_len = match stream_framing::read_frame_len(stream, MAX_FRAME_SIZE).await {
+        Ok(len) => len,
+        Err(e) => {
+            return IoOutcome::ResponseFailed(NetworkError::StreamIo(format!(
+                "read length failed: {e}"
+            )))
+        }
+    };
 
     let mut compressed = vec![0u8; response_len];
-    stream
-        .read_exact(&mut compressed)
-        .await
-        .map_err(|e| NetworkError::StreamIo(format!("read body failed: {e}")))?;
+    if let Err(e) = stream.read_exact(&mut compressed).await {
+        return IoOutcome::ResponseFailed(NetworkError::StreamIo(format!("read body failed: {e}")));
+    }
 
     metrics::record_libp2p_bandwidth((4 + response_len) as u64, 0);
 
-    compression::decompress(&compressed)
-        .map_err(|e| NetworkError::StreamIo(format!("decompression failed: {e}")))
+    match compression::decompress(&compressed) {
+        Ok(bytes) => IoOutcome::Ok(bytes),
+        Err(e) => {
+            IoOutcome::ResponseFailed(NetworkError::StreamIo(format!("decompression failed: {e}")))
+        }
+    }
 }
 
 /// Drain any remaining queued requests and fail them with a fresh error
