@@ -4,7 +4,7 @@ use hyperscale_bft::{BftConfig, BftCoordinator, RecoveredState};
 use hyperscale_core::{Action, ProtocolEvent, StateMachine, TimerId};
 use hyperscale_execution::ExecutionCoordinator;
 use hyperscale_mempool::{MempoolConfig, MempoolCoordinator};
-use hyperscale_provisions::{ProvisionConfig, ProvisionCoordinator};
+use hyperscale_provisions::{OutboundProvisionTracker, ProvisionConfig, ProvisionCoordinator};
 use hyperscale_remote_headers::RemoteHeaderCoordinator;
 use hyperscale_topology::TopologyState;
 use hyperscale_types::{
@@ -46,6 +46,10 @@ pub struct NodeStateMachine {
 
     /// Provision coordination for cross-shard transactions.
     provisions: ProvisionCoordinator,
+
+    /// Retains outbound provision batches until the target shard's
+    /// execution certificates ACK every transaction they contain.
+    outbound_provisions: OutboundProvisionTracker,
 
     /// Remote block header coordination (single source of truth).
     remote_headers: RemoteHeaderCoordinator,
@@ -103,8 +107,9 @@ impl NodeStateMachine {
             mempool: MempoolCoordinator::with_config(mempool_config),
             provisions: ProvisionCoordinator::with_config_and_store(
                 provision_config,
-                provision_store,
+                Arc::clone(&provision_store),
             ),
+            outbound_provisions: OutboundProvisionTracker::new(provision_store),
             remote_headers: RemoteHeaderCoordinator::new(),
             topology,
             now: Duration::ZERO,
@@ -363,6 +368,11 @@ impl NodeStateMachine {
                 .on_block_committed(self.topology.snapshot(), &certified),
         );
 
+        // Outbound provision safety sweep — runs on the BFT-authenticated
+        // weighted timestamp so every validator evicts deterministically.
+        self.outbound_provisions
+            .on_block_committed(certified.qc.weighted_timestamp);
+
         actions.extend(self.apply_block_to_execution(&certified));
 
         // Block committed changes in-flight counts — trigger proposal attempt
@@ -615,6 +625,21 @@ impl StateMachine for NodeStateMachine {
                 actions.push(Action::Continuation(ProtocolEvent::ContentAvailable));
                 actions
             }
+            ProtocolEvent::OutboundProvisionBroadcast {
+                batch,
+                target_shard,
+            } => {
+                self.outbound_provisions.on_broadcast(batch, target_shard);
+                vec![]
+            }
+            ProtocolEvent::OutboundEcObserved {
+                target_shard,
+                tx_outcomes,
+            } => {
+                self.outbound_provisions
+                    .on_ec_observed(target_shard, &tx_outcomes);
+                vec![]
+            }
 
             // ── Execution ────────────────────────────────────────────────
             ProtocolEvent::ExecutionBatchCompleted {
@@ -658,11 +683,33 @@ impl StateMachine for NodeStateMachine {
                 .execution
                 .on_wave_certificate(self.topology.snapshot(), cert),
             ProtocolEvent::ExecutionCertificateSignatureVerified { certificate, valid } => {
+                // If the EC is for a remote wave where we were a source, the
+                // target shard's tx_outcomes acknowledge outbound batches we
+                // sent. Capture the ACK signal before the cert is consumed.
+                let local_shard = self.topology.snapshot().local_shard();
+                let outbound_ack = if valid
+                    && certificate.shard_group_id() != local_shard
+                    && certificate.wave_id.remote_shards.contains(&local_shard)
+                {
+                    Some((
+                        certificate.shard_group_id(),
+                        certificate.tx_outcomes.clone(),
+                    ))
+                } else {
+                    None
+                };
+
                 let mut actions = self.execution.on_certificate_verified(
                     self.topology.snapshot(),
                     certificate,
                     valid,
                 );
+                if let Some((target_shard, tx_outcomes)) = outbound_ack {
+                    actions.push(Action::Continuation(ProtocolEvent::OutboundEcObserved {
+                        target_shard,
+                        tx_outcomes,
+                    }));
+                }
                 // Remote EC abort propagation may unlock local accumulators — re-scan.
                 actions.extend(self.execution.emit_vote_actions(self.topology.snapshot()));
                 actions

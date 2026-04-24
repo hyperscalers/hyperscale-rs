@@ -203,6 +203,24 @@ pub enum ProtocolEvent {
     /// because they originate from a single `FetchAndBroadcastProvision` action.
     StateProvisionReceived { batch: Provision },
 
+    /// A provision batch our proposer generated was broadcast to a target
+    /// shard. Routed to the `OutboundProvisionTracker` so the batch can be
+    /// retained (and served from cache) until the target shard's execution
+    /// certificates acknowledge every transaction in it.
+    OutboundProvisionBroadcast {
+        batch: Arc<Provision>,
+        target_shard: ShardGroupId,
+    },
+
+    /// An execution certificate from a remote shard — for a wave that
+    /// depended on state provisions from *this* shard — has been verified.
+    /// The tracker uses `tx_outcomes` to drain pending transactions from
+    /// outbound batches; `Executed` and `Aborted` are both terminal.
+    OutboundEcObserved {
+        target_shard: ShardGroupId,
+        tx_outcomes: Vec<TxOutcome>,
+    },
+
     /// Batch-level provision verification completed.
     ///
     /// The QC is verified once for the batch's attestation; merkle proofs are
@@ -437,6 +455,8 @@ impl ProtocolEvent {
             ProtocolEvent::ProvisionVerified { .. } => "ProvisionVerified",
             ProtocolEvent::StateProvisionReceived { .. } => "StateProvisionReceived",
             ProtocolEvent::StateProvisionVerified { .. } => "StateProvisionVerified",
+            ProtocolEvent::OutboundProvisionBroadcast { .. } => "OutboundProvisionBroadcast",
+            ProtocolEvent::OutboundEcObserved { .. } => "OutboundEcObserved",
 
             // Execution
             ProtocolEvent::ExecutionBatchCompleted { .. } => "ExecutionBatchCompleted",

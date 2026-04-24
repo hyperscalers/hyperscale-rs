@@ -18,8 +18,10 @@
 //!
 //! - [`ProvisionCoordinator`] - Main sub-state machine
 
+mod outbound;
 mod state;
 mod store;
 
+pub use outbound::{OutboundMemoryStats, OutboundProvisionTracker, OUTBOUND_RETENTION_MAX};
 pub use state::{ProvisionConfig, ProvisionCoordinator, ProvisionMemoryStats};
 pub use store::ProvisionStore;

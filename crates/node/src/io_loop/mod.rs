@@ -889,8 +889,18 @@ where
             // ── Provision ready (from execution pool) ─────────────────
             //
             // The FetchAndBroadcastProvision delegated action built provisions
-            // grouped by target shard. Broadcast one batch per shard.
+            // grouped by target shard. Register each with the outbound
+            // tracker (which also inserts into the shared ProvisionStore)
+            // before broadcasting, so cross-shard `provision.request` and
+            // our own `local_provision.request` can serve the batch from
+            // memory while we await target ECs.
             NodeInput::ProvisionReady { batches } => {
+                for (target_shard, batch, _recipients) in &batches {
+                    self.feed_event(ProtocolEvent::OutboundProvisionBroadcast {
+                        batch: std::sync::Arc::new(batch.clone()),
+                        target_shard: *target_shard,
+                    });
+                }
                 self.broadcast_provisions(batches);
             }
 

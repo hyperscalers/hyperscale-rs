@@ -72,6 +72,7 @@ where
 
         let storage = Arc::clone(&self.storage);
         let topology = self.topology.clone();
+        let outbound_cache = Arc::clone(&self.provision_store);
 
         use std::collections::HashMap;
 
@@ -95,6 +96,32 @@ where
         self.network
             .register_request_handler::<GetProvisionRequest>(move |req: GetProvisionRequest| {
                 let cache_key = (req.block_height.0, req.target_shard.0);
+
+                // Outbound fast path: if we still hold the exact batch we
+                // generated for this (source_block_height, target_shard),
+                // rebuild the response from memory — no RocksDB regeneration,
+                // no merkle-proof recomputation.
+                let cached_outbound =
+                    outbound_cache.get_outbound(req.block_height, req.target_shard);
+                if let Some(batch) = cached_outbound.first() {
+                    use hyperscale_messages::response::GetProvisionResponse;
+                    use hyperscale_types::StateProvision;
+                    let provisions: Vec<StateProvision> = batch
+                        .transactions
+                        .iter()
+                        .map(|tx| StateProvision {
+                            transaction_hash: tx.tx_hash,
+                            target_shard: req.target_shard,
+                            source_shard: batch.source_shard,
+                            block_height: batch.block_height,
+                            entries: Arc::new(tx.entries.clone()),
+                        })
+                        .collect();
+                    return GetProvisionResponse {
+                        provisions: Some(provisions),
+                        proof: Some(batch.proof.clone()),
+                    };
+                }
 
                 // Fast path: check cache
                 {
