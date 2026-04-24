@@ -717,6 +717,24 @@ impl BftCoordinator {
             }
         }
 
+        // Suppress re-entry while a prior dispatch for the same target is
+        // parked on the verification pipeline waiting for the parent JMT
+        // tree. Without this, every `ContentAvailable` / `on_qc_formed` hit
+        // re-runs `assemble_build_action` and re-registers the defer,
+        // burning CPU and log bandwidth while peers time out on the
+        // proposer slot.
+        if let Some(deferred) = self.proposal.deferred() {
+            if deferred.height == next_height && deferred.round == round {
+                trace!(
+                    validator = ?topology.local_validator_id(),
+                    height = next_height.0,
+                    round = round.0,
+                    "Proposal deferred pending parent tree, skipping"
+                );
+                return false;
+            }
+        }
+
         if self.votes.is_locked_at(next_height) {
             return false;
         }
@@ -3044,7 +3062,15 @@ impl BftCoordinator {
     /// emits `ContentAvailable` to re-enter `try_propose` with fresh tx
     /// selection — avoiding stale transactions from the original deferral.
     pub fn take_ready_proposal(&mut self) -> bool {
-        self.verification.take_ready_proposal()
+        let ready = self.verification.take_ready_proposal();
+        if ready {
+            // Drop the tracker's deferred slot so `can_propose` lets the
+            // re-entry through. The next `try_propose` call will either
+            // successfully dispatch (new `start`) or re-defer with the
+            // current parent.
+            self.proposal.clear_deferred();
+        }
+        ready
     }
 
     /// Register committed transactions for execution timeout validation.
@@ -3936,6 +3962,72 @@ mod tests {
         assert!(
             has_build_proposal,
             "Should propose empty block immediately after QC formation to advance finalization"
+        );
+    }
+
+    #[test]
+    fn test_deferred_proposal_suppresses_rebuild_until_unblocked() {
+        // A deferred proposal (parent tree missing) must NOT re-emit
+        // BuildProposal on every subsequent try_propose for the same
+        // (height, round) — that's the spin loop v7 was hitting, producing
+        // hundreds of `"Requesting block build for proposal"` log lines per
+        // second while peers timed out on the proposer slot. After the
+        // parent tree lands, `take_ready_proposal` must clear the gate so
+        // the next try_propose can dispatch.
+
+        let (mut state, topology) = make_test_state();
+        state.set_time(Duration::from_secs(100));
+
+        // Local validator is ValidatorId(0). Proposer for (h=1, r=0) is
+        // ValidatorId((1+0)%4)=ValidatorId(1) — not us. Point the chain at
+        // (h=4, r=0) where proposer = (4+0)%4 = ValidatorId(0).
+        let parent_hash = BlockHash::from_raw(Hash::from_bytes(b"parent_tree_missing"));
+        state.committed_height = BlockHeight(3);
+        state.committed_hash = parent_hash;
+        state
+            .commits
+            .certified_blocks
+            .insert(parent_hash, make_empty_block(BlockHeight(3)));
+        state.latest_qc = Some(make_test_qc(parent_hash, BlockHeight(3)));
+        // Intentionally do NOT call on_block_persisted — parent tree
+        // unavailable forces the defer branch.
+
+        let first = state.try_propose(&topology, &[], vec![], vec![]);
+        assert!(
+            first
+                .iter()
+                .all(|a| !matches!(a, Action::BuildProposal { .. })),
+            "first try_propose should have deferred, not dispatched"
+        );
+        assert!(
+            state.proposal.deferred().is_some(),
+            "defer slot should be recorded"
+        );
+
+        let second = state.try_propose(&topology, &[], vec![], vec![]);
+        assert!(
+            second.is_empty(),
+            "second try_propose for same (height, round) must be suppressed"
+        );
+
+        // Parent tree lands — verification pipeline signals unblock and
+        // take_ready_proposal clears the tracker's deferred slot.
+        state.verification.on_block_persisted(BlockHeight(3));
+        assert!(
+            state.take_ready_proposal(),
+            "take_ready_proposal should report unblocked"
+        );
+        assert!(
+            state.proposal.deferred().is_none(),
+            "deferred slot should be cleared"
+        );
+
+        let third = state.try_propose(&topology, &[], vec![], vec![]);
+        assert!(
+            third.iter().any(
+                |a| matches!(a, Action::BuildProposal { height, .. } if *height == BlockHeight(4))
+            ),
+            "third try_propose should dispatch the BuildProposal"
         );
     }
 

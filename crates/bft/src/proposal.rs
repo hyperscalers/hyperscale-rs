@@ -59,6 +59,12 @@ pub(crate) struct PendingProposal {
 
 pub(crate) struct ProposalTracker {
     pending: Option<PendingProposal>,
+    /// Slot for a proposal that `dispatch_or_defer` could not dispatch
+    /// because the parent JMT tree wasn't available yet. Consulted from
+    /// `can_propose` so repeated `ContentAvailable` / QC-formed events for
+    /// the same `(height, round)` don't spin through `assemble_build_action`
+    /// while we're blocked waiting on `VerificationPipeline` to unblock.
+    deferred: Option<PendingProposal>,
 }
 
 /// Result of correlating a `ProposalBuilt` callback against the tracker.
@@ -75,12 +81,17 @@ pub(crate) enum TakeResult {
 
 impl ProposalTracker {
     pub fn new() -> Self {
-        Self { pending: None }
+        Self {
+            pending: None,
+            deferred: None,
+        }
     }
 
-    /// Record a new in-flight build.
+    /// Record a new in-flight build. A successful dispatch also invalidates
+    /// any deferred slot for a prior attempt.
     pub fn start(&mut self, height: BlockHeight, round: Round) {
         self.pending = Some(PendingProposal { height, round });
+        self.deferred = None;
     }
 
     /// Read the in-flight build, if any.
@@ -88,11 +99,32 @@ impl ProposalTracker {
         self.pending.as_ref()
     }
 
-    /// Drop the in-flight build without matching. Called on round advance
+    /// Drop both the in-flight and deferred slots. Called on round advance
     /// so a stale build completing later is discarded by the next
-    /// `take_matching`.
+    /// `take_matching` and the deferred slot doesn't gate the new round's
+    /// `(height, round)` target.
     pub fn clear(&mut self) {
         self.pending = None;
+        self.deferred = None;
+    }
+
+    /// Record that a build for `(height, round)` could not dispatch because
+    /// the parent JMT tree wasn't available. Consulted by `can_propose` to
+    /// suppress re-entry until `clear_deferred` fires.
+    pub fn mark_deferred(&mut self, height: BlockHeight, round: Round) {
+        self.deferred = Some(PendingProposal { height, round });
+    }
+
+    /// Read the deferred slot, if any.
+    pub fn deferred(&self) -> Option<&PendingProposal> {
+        self.deferred.as_ref()
+    }
+
+    /// Drop the deferred slot. Called when the verification pipeline signals
+    /// that the awaited parent tree has landed, so the next `try_propose`
+    /// actually re-dispatches.
+    pub fn clear_deferred(&mut self) {
+        self.deferred = None;
     }
 
     /// Consume the in-flight build iff its `(height, round)` matches.
@@ -318,6 +350,7 @@ pub(crate) fn dispatch_or_defer(
         vec![action]
     } else {
         verification.defer_proposal(parent_hash, parent_block_height);
+        tracker.mark_deferred(block_height, round);
         vec![]
     }
 }
@@ -373,5 +406,48 @@ mod tests {
             tracker.take_matching(BlockHeight(5), Round(1)),
             TakeResult::NotPending
         ));
+    }
+
+    #[test]
+    fn mark_deferred_records_slot_without_touching_pending() {
+        let mut tracker = ProposalTracker::new();
+        tracker.mark_deferred(BlockHeight(5), Round(1));
+
+        let d = tracker.deferred().unwrap();
+        assert_eq!(d.height, BlockHeight(5));
+        assert_eq!(d.round, Round(1));
+        assert!(tracker.pending().is_none());
+    }
+
+    #[test]
+    fn start_clears_deferred() {
+        let mut tracker = ProposalTracker::new();
+        tracker.mark_deferred(BlockHeight(5), Round(1));
+        tracker.start(BlockHeight(5), Round(1));
+
+        assert!(tracker.deferred().is_none());
+        assert!(tracker.pending().is_some());
+    }
+
+    #[test]
+    fn clear_drops_both_slots() {
+        let mut tracker = ProposalTracker::new();
+        tracker.start(BlockHeight(5), Round(1));
+        tracker.mark_deferred(BlockHeight(6), Round(2));
+        tracker.clear();
+
+        assert!(tracker.pending().is_none());
+        assert!(tracker.deferred().is_none());
+    }
+
+    #[test]
+    fn clear_deferred_leaves_pending_intact() {
+        let mut tracker = ProposalTracker::new();
+        tracker.start(BlockHeight(5), Round(1));
+        tracker.mark_deferred(BlockHeight(6), Round(2));
+        tracker.clear_deferred();
+
+        assert!(tracker.deferred().is_none());
+        assert!(tracker.pending().is_some());
     }
 }
