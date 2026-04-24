@@ -266,7 +266,7 @@ where
 
     // In-memory caches (shared with inbound router in production)
     tx_cache: Arc<QuickCache<TxHash, Arc<RoutableTransaction>>>,
-    provision_cache: Arc<crate::ProvisionCache>,
+    provision_store: Arc<hyperscale_provisions::ProvisionStore>,
     finalized_wave_cache: Arc<QuickCache<WaveIdHash, Arc<FinalizedWave>>>,
 
     // Sync protocol
@@ -380,6 +380,7 @@ where
             HeaderFetchProtocol::new(crate::protocol::header_fetch::HeaderFetchConfig::default());
         let storage = Arc::new(storage);
         let pending_chain = Arc::new(hyperscale_storage::PendingChain::new(Arc::clone(&storage)));
+        let provision_store = Arc::clone(state.provisions().store());
         Self {
             state,
             storage,
@@ -395,7 +396,7 @@ where
             prepared_commits: Arc::new(Mutex::new(HashMap::new())),
             pending_chain,
             tx_cache: Arc::new(QuickCache::new(DEFAULT_TX_CACHE_SIZE)),
-            provision_cache: Arc::new(crate::ProvisionCache::new()),
+            provision_store,
             finalized_wave_cache: Arc::new(QuickCache::new(DEFAULT_CERT_CACHE_SIZE)),
             tx_validator,
             pending_validation: HashSet::new(),
@@ -1134,7 +1135,7 @@ where
                 node_tx_cache: self.tx_cache.len(),
                 node_tx_status_cache: self.tx_status_cache.len(),
                 node_finalized_wave_cache: self.finalized_wave_cache.len(),
-                node_provision_cache: self.provision_cache.len(),
+                node_provision_cache: self.provision_store.len(),
                 node_exec_cert_cache: self.exec_cert_cache.lock().unwrap().len(),
                 node_prepared_commits: self.prepared_commits.lock().unwrap().len(),
                 node_pending_validation: self.pending_validation.len(),

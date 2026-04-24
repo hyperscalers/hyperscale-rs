@@ -94,13 +94,17 @@ impl NodeStateMachine {
         recovered: RecoveredState,
         mempool_config: MempoolConfig,
         provision_config: ProvisionConfig,
+        provision_store: Arc<hyperscale_provisions::ProvisionStore>,
     ) -> Self {
         Self {
             node_index,
             bft: BftCoordinator::new(node_index, bft_config.clone(), recovered),
             execution: ExecutionCoordinator::new(),
             mempool: MempoolCoordinator::with_config(mempool_config),
-            provisions: ProvisionCoordinator::with_config(provision_config),
+            provisions: ProvisionCoordinator::with_config_and_store(
+                provision_config,
+                provision_store,
+            ),
             remote_headers: RemoteHeaderCoordinator::new(),
             topology,
             now: Duration::ZERO,

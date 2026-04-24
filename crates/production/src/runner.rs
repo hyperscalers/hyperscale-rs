@@ -356,6 +356,7 @@ impl ProductionRunnerBuilder {
         let recovered = storage.load_recovered_state();
 
         // ── Create NodeStateMachine ──────────────────────────────────────
+        let provision_store = Arc::new(hyperscale_provisions::ProvisionStore::new());
         let state = NodeStateMachine::new(
             0, // node_index not meaningful in production
             topology_state,
@@ -363,6 +364,7 @@ impl ProductionRunnerBuilder {
             recovered,
             self.mempool_config,
             self.provision_config,
+            provision_store,
         );
 
         // ── Create SharedStorage ────────────────────────────────────────

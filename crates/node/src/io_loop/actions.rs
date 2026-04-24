@@ -53,17 +53,6 @@ where
             // Internal events
             // ═══════════════════════════════════════════════════════════
             Action::Continuation(pe) => {
-                // Populate provision cache for request handler serving.
-                // Retention is anchored to the source block's weighted ts so
-                // eviction is deterministic across validators.
-                if let ProtocolEvent::ProvisionVerified {
-                    ref batch,
-                    source_block_ts,
-                } = pe
-                {
-                    self.provision_cache
-                        .insert(Arc::clone(batch), source_block_ts);
-                }
                 let _ = self.event_sender.send(NodeInput::Protocol(pe));
             }
 
@@ -277,18 +266,11 @@ where
             // ═══════════════════════════════════════════════════════════
             // Delegated work — immediate dispatch
             // ═══════════════════════════════════════════════════════════
-            Action::BuildProposal {
-                ref provision_batches,
-                ref parent_qc,
-                ..
-            } => {
-                // Ensure provision data is serveable before the header reaches peers.
-                // Anchor retention on the parent QC's weighted timestamp — the
-                // tightest authenticated ts available before this block commits.
-                let anchor_ts = parent_qc.weighted_timestamp;
-                for batch in provision_batches {
-                    self.provision_cache.insert(Arc::clone(batch), anchor_ts);
-                }
+            Action::BuildProposal { .. } => {
+                // Provision batches included in the proposal were already
+                // inserted into the shared `ProvisionStore` by the provisions
+                // coordinator at verify time and persist until the
+                // post-commit retention sweep drops them.
                 self.dispatch_delegated_action(action);
             }
             Action::VerifyAndBuildQuorumCertificate { .. }

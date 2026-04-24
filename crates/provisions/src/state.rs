@@ -11,6 +11,7 @@
 //! dispatches `VerifyStateProvision` to verify the QC signature once and
 //! merkle proofs per provision against the committed state root.
 
+use crate::store::ProvisionStore;
 use hyperscale_core::{Action, ProtocolEvent};
 use hyperscale_types::{
     compute_padded_merkle_root, BlockHeight, CommittedBlockHeader, Hash, Provision, ProvisionHash,
@@ -157,10 +158,13 @@ pub struct ProvisionCoordinator {
     /// Stored whole after proof verification — no per-tx decomposition.
     verified_batches: BTreeMap<(ShardGroupId, BlockHeight), Arc<Provision>>,
 
-    /// Hash-keyed index into verified batches for O(1) lookup by content hash.
-    /// Populated alongside `verified_batches`. Used by `get_batch_by_hash()`
-    /// and for efficient pruning in `on_block_committed`.
-    batches_by_hash: HashMap<ProvisionHash, Arc<Provision>>,
+    /// Shared hash-keyed store for O(1) lookup by content hash, also used
+    /// by the io-loop request handler to serve `local_provision.request`.
+    /// Populated alongside `verified_batches`; drained from the same
+    /// post-commit retention path. Single source of truth — replaces the
+    /// separate time-based `ProvisionCache` that previously lived in the
+    /// io-loop and dropped batches before their owning block committed.
+    store: Arc<ProvisionStore>,
 
     // ═══════════════════════════════════════════════════════════════════
     // Expected Provision Tracking (fallback detection)
@@ -229,19 +233,29 @@ impl Default for ProvisionCoordinator {
 }
 
 impl ProvisionCoordinator {
-    /// Create a new ProvisionCoordinator with default config.
+    /// Create a new ProvisionCoordinator with default config and a fresh
+    /// local [`ProvisionStore`].
     pub fn new() -> Self {
-        Self::with_config(ProvisionConfig::default())
+        Self::with_config_and_store(ProvisionConfig::default(), Arc::new(ProvisionStore::new()))
     }
 
-    /// Create a new ProvisionCoordinator with the given config.
+    /// Create a new ProvisionCoordinator with the given config and a fresh
+    /// local [`ProvisionStore`].
     pub fn with_config(config: ProvisionConfig) -> Self {
+        Self::with_config_and_store(config, Arc::new(ProvisionStore::new()))
+    }
+
+    /// Create a new ProvisionCoordinator wired to an externally-owned
+    /// [`ProvisionStore`]. Production nodes share the store with the
+    /// io-loop so `local_provision.request` handlers read from the same
+    /// source of truth this coordinator writes to.
+    pub fn with_config_and_store(config: ProvisionConfig, store: Arc<ProvisionStore>) -> Self {
         Self {
             config,
             verified_remote_headers: HashMap::new(),
             pending_provisions: HashMap::new(),
             verified_batches: BTreeMap::new(),
-            batches_by_hash: HashMap::new(),
+            store,
             local_committed_height: BlockHeight(0),
             local_committed_ts: WeightedTimestamp::ZERO,
             expected_provisions: BTreeMap::new(),
@@ -259,7 +273,7 @@ impl ProvisionCoordinator {
             pending_provisions: self.pending_provisions.len(),
             verified_batches: self.verified_batches.len(),
             expected_provisions: self.expected_provisions.len(),
-            batches_by_hash: self.batches_by_hash.len(),
+            batches_by_hash: self.store.len(),
             queued_provision_batches: self.queued_provision_batches.len(),
             committed_batch_tombstones: self.committed_batch_tombstones.len(),
         }
@@ -323,12 +337,13 @@ impl ProvisionCoordinator {
         let aged = std::mem::replace(&mut self.committed_retention, still_retained);
         for (_ts, hashes) in aged {
             for h in hashes {
-                if let Some(batch) = self.batches_by_hash.remove(&h) {
+                if let Some(batch) = self.store.get(&h) {
                     let key = (batch.source_shard, batch.block_height);
                     self.verified_batches.remove(&key);
                     // Header no longer needed once the provision is evicted.
                     self.verified_remote_headers.remove(&key);
                 }
+                self.store.evict(std::iter::once(h));
             }
         }
 
@@ -683,7 +698,7 @@ impl ProvisionCoordinator {
         }
 
         self.verified_batches.insert(batch_key, Arc::clone(&batch));
-        self.batches_by_hash.insert(batch_hash, Arc::clone(&batch));
+        self.store.insert(Arc::clone(&batch));
 
         // Queue for inclusion in the next block proposal. Timestamp drives
         // the dwell-time filter in `queued_provisions()` — peers need time to
@@ -728,7 +743,13 @@ impl ProvisionCoordinator {
 
     /// Look up a verified provision batch by its content hash.
     pub fn get_batch_by_hash(&self, hash: &ProvisionHash) -> Option<Arc<Provision>> {
-        self.batches_by_hash.get(hash).cloned()
+        self.store.get(hash)
+    }
+
+    /// Shared provision store — same `Arc` the io-loop request handler
+    /// reads from to serve `local_provision.request` responses.
+    pub fn store(&self) -> &Arc<ProvisionStore> {
+        &self.store
     }
 
     /// Look up a verified remote committed block header by shard and height.

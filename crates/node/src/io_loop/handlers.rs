@@ -43,10 +43,10 @@ where
         // ── block.request → sync protocol ────────────────────────────
 
         let storage = Arc::clone(&self.storage);
-        let provision_cache = Arc::clone(&self.provision_cache);
+        let provision_store = Arc::clone(&self.provision_store);
         self.network
             .register_request_handler::<GetBlockRequest>(move |req| {
-                serve_block_request(&*storage, &provision_cache, req)
+                serve_block_request(&*storage, &provision_store, req)
             });
 
         // ── transaction.request → fetch protocol ─────────────────────
@@ -156,7 +156,7 @@ where
 
         // ── local_provision.request → provision cache lookup ─────────
 
-        let provision_cache = Arc::clone(&self.provision_cache);
+        let provision_store = Arc::clone(&self.provision_store);
         self.network
             .register_request_handler::<hyperscale_messages::request::GetLocalProvisionsRequest>(
                 move |req: hyperscale_messages::request::GetLocalProvisionsRequest| {
@@ -165,7 +165,7 @@ where
                     let batches: Vec<hyperscale_types::Provision> = req
                         .batch_hashes
                         .iter()
-                        .filter_map(|h| provision_cache.get(h).map(|b| (*b).clone()))
+                        .filter_map(|h| provision_store.get(h).map(|b| (*b).clone()))
                         .collect();
 
                     GetLocalProvisionsResponse::new(batches)

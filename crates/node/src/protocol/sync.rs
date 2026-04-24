@@ -13,7 +13,7 @@
 //! Production: `SyncManager` wraps this, maps outputs to tokio tasks.
 //! Simulation: feeds inputs/outputs synchronously via event queue.
 
-use crate::ProvisionCache;
+use crate::ProvisionStore;
 use hyperscale_messages::request::GetBlockRequest;
 use hyperscale_messages::response::GetBlockResponse;
 use hyperscale_metrics as metrics;
@@ -416,7 +416,7 @@ const LIVE_WINDOW: Duration = Duration::from_secs(WAVE_TIMEOUT.as_secs() + SERVE
 /// `ProvisionFetchProtocol` rather than round-robining peers.
 pub fn serve_block_request(
     storage: &impl ChainReader,
-    provision_cache: &ProvisionCache,
+    provision_store: &ProvisionStore,
     req: GetBlockRequest,
 ) -> GetBlockResponse {
     trace!(
@@ -446,7 +446,7 @@ pub fn serve_block_request(
 
     let resolved: Option<Vec<Arc<Provision>>> = provision_hashes
         .iter()
-        .map(|h| provision_cache.get(h))
+        .map(|h| provision_store.get(h))
         .collect();
 
     match resolved {

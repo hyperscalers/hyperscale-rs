@@ -19,5 +19,7 @@
 //! - [`ProvisionCoordinator`] - Main sub-state machine
 
 mod state;
+mod store;
 
 pub use state::{ProvisionConfig, ProvisionCoordinator, ProvisionMemoryStats};
+pub use store::ProvisionStore;

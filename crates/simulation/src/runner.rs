@@ -211,6 +211,7 @@ impl SimulationRunner {
                     RecoveredState::default(),
                     MempoolConfig::default(),
                     hyperscale_provisions::ProvisionConfig::default(),
+                    Arc::new(hyperscale_provisions::ProvisionStore::new()),
                 );
 
                 let (event_tx, event_rx) = crossbeam::channel::unbounded();
