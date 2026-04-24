@@ -1055,6 +1055,7 @@ where
         let mempool = self.state.mempool();
         let contention = mempool.lock_contention_stats();
         let fetch_status = self.transaction_fetch_protocol.status();
+        let sync_status = self.sync_protocol.status();
 
         let bft_mem = self.state.bft().memory_stats();
         let exec_mem = self.state.execution().memory_stats();
@@ -1131,6 +1132,30 @@ where
                 prov_batches_by_hash: prov_mem.batches_by_hash,
                 prov_queued_provision_batches: prov_mem.queued_provision_batches,
                 prov_committed_batch_tombstones: prov_mem.committed_batch_tombstones,
+                // Node (io_loop)
+                node_tx_cache: self.tx_cache.len(),
+                node_tx_status_cache: self.tx_status_cache.len(),
+                node_finalized_wave_cache: self.finalized_wave_cache.len(),
+                node_provision_cache: self.provision_cache.len(),
+                node_exec_cert_cache: self.exec_cert_cache.lock().unwrap().len(),
+                node_prepared_commits: self.prepared_commits.lock().unwrap().len(),
+                node_pending_validation: self.pending_validation.len(),
+                node_locally_submitted: self.locally_submitted.len(),
+                node_pending_block_commits: self.pending_block_commits.len(),
+                node_validation_batch: self.validation_batch.len(),
+                node_committed_header_batch: self.committed_header_batch.len(),
+                node_sync_queued_heights: sync_status.queued_heights,
+                node_sync_in_flight_fetches: sync_status.pending_fetches,
+                node_tx_fetch_blocks: fetch_status.pending_tx_blocks,
+                node_local_provision_fetch_pending: self
+                    .local_provision_fetch_protocol
+                    .pending_count(),
+                node_finalized_wave_fetch_pending: self
+                    .finalized_wave_fetch_protocol
+                    .pending_count(),
+                node_provision_fetch_pending: self.provision_fetch_protocol.pending_count(),
+                node_exec_cert_fetch_pending: self.exec_cert_fetch_protocol.pending_count(),
+                node_header_fetch_pending: self.header_fetch_protocol.pending_count(),
                 // Storage — filled in by record_metrics off-thread.
                 rocksdb_block_cache_usage_bytes: 0,
                 rocksdb_memtable_usage_bytes: 0,

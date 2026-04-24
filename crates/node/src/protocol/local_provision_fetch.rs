@@ -191,6 +191,11 @@ impl LocalProvisionFetchProtocol {
         self.fetches.values().map(|s| s.in_flight_count).sum()
     }
 
+    /// Returns the number of blocks with pending or in-flight provision fetches.
+    pub fn pending_count(&self) -> usize {
+        self.fetches.len()
+    }
+
     fn handle_request(
         &mut self,
         block_hash: BlockHash,

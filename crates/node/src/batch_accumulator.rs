@@ -68,6 +68,11 @@ impl<T> BatchAccumulator<T> {
     pub fn deadline(&self) -> Option<Duration> {
         self.deadline
     }
+
+    /// Number of items currently buffered.
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
 }
 
 /// A sharded batch accumulator that groups items by [`ShardGroupId`].

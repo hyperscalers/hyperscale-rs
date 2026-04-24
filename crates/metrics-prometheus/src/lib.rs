@@ -117,6 +117,7 @@ pub struct Metrics {
     pub memory_mempool: GaugeVec,
     pub memory_remote_headers: GaugeVec,
     pub memory_provisions: GaugeVec,
+    pub memory_node: GaugeVec,
     pub memory_storage: GaugeVec,
 
     // === Cross-Shard Message Delivery ===
@@ -610,6 +611,13 @@ impl Metrics {
             memory_provisions: register_gauge_vec!(
                 "hyperscale_memory_provisions_collections",
                 "Provision coordinator collection sizes (entry count)",
+                &["collection"]
+            )
+            .unwrap(),
+
+            memory_node: register_gauge_vec!(
+                "hyperscale_memory_node_collections",
+                "Node io_loop collection sizes (entry count)",
                 &["collection"]
             )
             .unwrap(),
@@ -1262,6 +1270,84 @@ impl MetricsRecorder for PrometheusRecorder {
             .memory_provisions
             .with_label_values(&["committed_batch_tombstones"])
             .set(m.prov_committed_batch_tombstones as f64);
+
+        // Node (io_loop)
+        self.metrics
+            .memory_node
+            .with_label_values(&["tx_cache"])
+            .set(m.node_tx_cache as f64);
+        self.metrics
+            .memory_node
+            .with_label_values(&["tx_status_cache"])
+            .set(m.node_tx_status_cache as f64);
+        self.metrics
+            .memory_node
+            .with_label_values(&["finalized_wave_cache"])
+            .set(m.node_finalized_wave_cache as f64);
+        self.metrics
+            .memory_node
+            .with_label_values(&["provision_cache"])
+            .set(m.node_provision_cache as f64);
+        self.metrics
+            .memory_node
+            .with_label_values(&["exec_cert_cache"])
+            .set(m.node_exec_cert_cache as f64);
+        self.metrics
+            .memory_node
+            .with_label_values(&["prepared_commits"])
+            .set(m.node_prepared_commits as f64);
+        self.metrics
+            .memory_node
+            .with_label_values(&["pending_validation"])
+            .set(m.node_pending_validation as f64);
+        self.metrics
+            .memory_node
+            .with_label_values(&["locally_submitted"])
+            .set(m.node_locally_submitted as f64);
+        self.metrics
+            .memory_node
+            .with_label_values(&["pending_block_commits"])
+            .set(m.node_pending_block_commits as f64);
+        self.metrics
+            .memory_node
+            .with_label_values(&["validation_batch"])
+            .set(m.node_validation_batch as f64);
+        self.metrics
+            .memory_node
+            .with_label_values(&["committed_header_batch"])
+            .set(m.node_committed_header_batch as f64);
+        self.metrics
+            .memory_node
+            .with_label_values(&["sync_queued_heights"])
+            .set(m.node_sync_queued_heights as f64);
+        self.metrics
+            .memory_node
+            .with_label_values(&["sync_in_flight_fetches"])
+            .set(m.node_sync_in_flight_fetches as f64);
+        self.metrics
+            .memory_node
+            .with_label_values(&["tx_fetch_blocks"])
+            .set(m.node_tx_fetch_blocks as f64);
+        self.metrics
+            .memory_node
+            .with_label_values(&["local_provision_fetch_pending"])
+            .set(m.node_local_provision_fetch_pending as f64);
+        self.metrics
+            .memory_node
+            .with_label_values(&["finalized_wave_fetch_pending"])
+            .set(m.node_finalized_wave_fetch_pending as f64);
+        self.metrics
+            .memory_node
+            .with_label_values(&["provision_fetch_pending"])
+            .set(m.node_provision_fetch_pending as f64);
+        self.metrics
+            .memory_node
+            .with_label_values(&["exec_cert_fetch_pending"])
+            .set(m.node_exec_cert_fetch_pending as f64);
+        self.metrics
+            .memory_node
+            .with_label_values(&["header_fetch_pending"])
+            .set(m.node_header_fetch_pending as f64);
 
         // Storage
         self.metrics

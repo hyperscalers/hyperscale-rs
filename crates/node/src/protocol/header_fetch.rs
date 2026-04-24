@@ -144,6 +144,11 @@ impl HeaderFetchProtocol {
         self.pending.values().filter(|s| s.in_flight).count()
     }
 
+    /// Returns the number of (shard, from_height) keys with pending or in-flight fetches.
+    pub fn pending_count(&self) -> usize {
+        self.pending.len()
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
     // Input Handlers
     // ═══════════════════════════════════════════════════════════════════════

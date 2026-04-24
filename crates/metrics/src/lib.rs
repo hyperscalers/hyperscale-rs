@@ -160,6 +160,46 @@ pub struct MemoryMetrics {
     /// Tombstones for committed provision batches.
     pub prov_committed_batch_tombstones: usize,
 
+    // ── Node (io_loop) ──
+    /// LRU cache of transaction bodies (fixed capacity, ~50k).
+    pub node_tx_cache: usize,
+    /// LRU cache of transaction statuses (fixed capacity, ~100k).
+    pub node_tx_status_cache: usize,
+    /// LRU cache of finalized wave certificates (fixed capacity, ~10k).
+    pub node_finalized_wave_cache: usize,
+    /// Time-bounded cache of provision bodies for cross-shard fetch service.
+    pub node_provision_cache: usize,
+    /// Fallback execution certificate cache keyed by (wave_id_hash, wave_id).
+    pub node_exec_cert_cache: usize,
+    /// Blocks with prepared JMT state awaiting flush.
+    pub node_prepared_commits: usize,
+    /// Transactions awaiting validation.
+    pub node_pending_validation: usize,
+    /// Locally-submitted transactions awaiting finalization (latency tracking).
+    pub node_locally_submitted: usize,
+    /// Block commits queued for batched flushing.
+    pub node_pending_block_commits: usize,
+    /// Transactions queued in the validation batch.
+    pub node_validation_batch: usize,
+    /// Committed headers queued in the verification batch.
+    pub node_committed_header_batch: usize,
+    /// Block heights queued for sync fetch.
+    pub node_sync_queued_heights: usize,
+    /// In-flight sync fetches.
+    pub node_sync_in_flight_fetches: usize,
+    /// Blocks with pending transaction fetches.
+    pub node_tx_fetch_blocks: usize,
+    /// Blocks with pending local provision fetches.
+    pub node_local_provision_fetch_pending: usize,
+    /// Blocks with pending finalized-wave fetches.
+    pub node_finalized_wave_fetch_pending: usize,
+    /// (shard, height) keys with pending cross-shard provision fetches.
+    pub node_provision_fetch_pending: usize,
+    /// (shard, height) keys with pending cross-shard execution-cert fetches.
+    pub node_exec_cert_fetch_pending: usize,
+    /// (shard, from_height) keys with pending cross-shard header fetches.
+    pub node_header_fetch_pending: usize,
+
     // ── Storage (byte-level where available) ──
     /// RocksDB block cache usage in bytes.
     pub rocksdb_block_cache_usage_bytes: u64,

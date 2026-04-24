@@ -170,6 +170,11 @@ impl ProvisionFetchProtocol {
         self.pending.values().filter(|s| s.in_flight).count()
     }
 
+    /// Returns the number of (shard, height) keys with pending or in-flight fetches.
+    pub fn pending_count(&self) -> usize {
+        self.pending.len()
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
     // Input Handlers
     // ═══════════════════════════════════════════════════════════════════════
