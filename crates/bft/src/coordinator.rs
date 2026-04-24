@@ -672,10 +672,11 @@ impl BftCoordinator {
             &qc_chain_cert_hashes,
             self.config.max_finalized_transactions_per_block,
         );
-        let provision_batches: Vec<_> = provision_batches
-            .into_iter()
-            .filter(|b| !qc_chain_provision_hashes.contains(&b.hash()))
-            .collect();
+        let provision_batches = crate::proposal::select_provision_batches(
+            provision_batches,
+            &qc_chain_provision_hashes,
+            self.config.max_provision_transactions_per_block,
+        );
 
         self.build_and_dispatch_proposal(
             topology,

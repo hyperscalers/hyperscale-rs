@@ -16,7 +16,7 @@
 
 use hyperscale_core::Action;
 use hyperscale_types::{
-    BlockHash, BlockHeight, FinalizedWave, ProposerTimestamp, Provision, Round,
+    BlockHash, BlockHeight, FinalizedWave, ProposerTimestamp, Provision, ProvisionHash, Round,
     RoutableTransaction, TopologySnapshot, TxHash, WaveIdHash,
 };
 use std::collections::HashSet;
@@ -209,6 +209,32 @@ pub(crate) fn select_finalized_waves(
         })
         .collect();
     (waves_to_propose, finalized_tx_count)
+}
+
+/// Select provision batches for inclusion: drop those already in the QC
+/// chain, then take from the FIFO queue until the running tx-count total
+/// would exceed `max_provision_txs`. Oldest batches go first so the queue
+/// drains monotonically; unselected batches remain queued for the next
+/// proposal.
+pub(crate) fn select_provision_batches(
+    provision_batches: Vec<Arc<Provision>>,
+    qc_chain_provision_hashes: &HashSet<ProvisionHash>,
+    max_provision_txs: usize,
+) -> Vec<Arc<Provision>> {
+    let mut running_tx_count = 0usize;
+    provision_batches
+        .into_iter()
+        .filter(|b| !qc_chain_provision_hashes.contains(&b.hash()))
+        .take_while(|b| {
+            let new_total = running_tx_count.saturating_add(b.transactions.len());
+            if new_total <= max_provision_txs {
+                running_tx_count = new_total;
+                true
+            } else {
+                false
+            }
+        })
+        .collect()
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
