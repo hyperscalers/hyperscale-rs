@@ -272,6 +272,13 @@ where
     // Sync protocol
     sync_protocol: SyncProtocol,
 
+    /// Elided sync responses awaiting a top-up. Keyed by block height.
+    /// Populated when rehydration misses; drained on topup response or
+    /// topup failure. Bodies captured by the closure we queue to the
+    /// network are looked up here.
+    pending_block_topups:
+        HashMap<BlockHeight, Box<hyperscale_messages::response::ElidedCertifiedBlock>>,
+
     // Fetch protocol (transaction/certificate fetching with chunking and retry)
     transaction_fetch_protocol: TransactionFetchProtocol,
 
@@ -424,6 +431,7 @@ where
             emitted_statuses: Vec::new(),
             actions_generated: 0,
             pending_timer_ops: Vec::new(),
+            pending_block_topups: HashMap::new(),
         }
     }
 
@@ -614,45 +622,75 @@ where
 
             // ── Sync protocol ──────────────────────────────────────────
             NodeInput::SyncBlockResponseReceived { height, block } => {
-                // Check 1: receipt_root verification (synchronous).
-                // Verify block body matches the QC-attested header.
-                let certificate_root_valid = match block.as_deref() {
-                    Some(fetched) if !fetched.block.certificates().is_empty() => {
-                        let computed = hyperscale_types::compute_certificate_root(
-                            fetched.block.certificates(),
-                        );
-                        if computed != fetched.block.header().certificate_root {
-                            tracing::warn!(
-                                height = height.0,
-                                ?computed,
-                                expected = ?fetched.block.header().certificate_root,
-                                "Sync: certificate_root mismatch — rejecting response"
-                            );
-                            false
-                        } else {
-                            true
-                        }
-                    }
-                    _ => true, // Empty block or no block — no root to check
+                let Some(elided) = block else {
+                    // Peer didn't have the block — pass through as `None`
+                    // to the sync state machine, which re-queues the height.
+                    self.deliver_sync_block(height, None);
+                    return self.drain_pending_output();
                 };
-
-                if !certificate_root_valid {
-                    let _ = self
-                        .event_sender
-                        .send(NodeInput::SyncBlockFetchFailed { height });
-                } else {
-                    let outputs = self
-                        .sync_protocol
-                        .handle(SyncInput::BlockResponseReceived { height, block });
-                    self.process_sync_outputs(outputs);
+                match self.rehydrate_elided_block(&elided) {
+                    Ok(cert) => self.deliver_sync_block(height, Some(Box::new(cert))),
+                    Err(miss) => {
+                        // Inventory bloom said we had bodies we couldn't
+                        // resolve. Buffer the elided block, fire a top-up
+                        // request for just the missing hashes. If the
+                        // response comes back with bodies that cover the
+                        // miss, we rehydrate and proceed normally; if it
+                        // fails, the buffered state is dropped and we
+                        // refetch from scratch via the existing retry path.
+                        metrics::record_sync_response_error("rehydration_miss");
+                        self.issue_sync_topup(height, elided, miss);
+                    }
                 }
             }
 
             NodeInput::SyncBlockFetchFailed { height } => {
+                // Evict any buffered topup state keyed on this height —
+                // the outer fetch is being re-attempted, and the topup
+                // round we scheduled for it is no longer relevant.
+                self.pending_block_topups.remove(&height);
                 let outputs = self
                     .sync_protocol
                     .handle(SyncInput::BlockFetchFailed { height });
                 self.process_sync_outputs(outputs);
+            }
+
+            NodeInput::SyncBlockTopUpReceived { height, response } => {
+                let Some(elided) = self.pending_block_topups.remove(&height) else {
+                    // Topup arrived after the pending state was already
+                    // evicted (e.g. the outer fetch was retried and
+                    // delivered first). Silently drop.
+                    return self.drain_pending_output();
+                };
+                let topup = response
+                    .map(|b| *b)
+                    .unwrap_or_else(hyperscale_messages::response::GetBlockTopUpResponse::empty);
+                match self.rehydrate_with_topup(&elided, topup) {
+                    Ok(cert) => self.deliver_sync_block(height, Some(Box::new(cert))),
+                    Err(miss) => {
+                        tracing::warn!(
+                            height = height.0,
+                            missing_total = miss.total(),
+                            "Sync: topup still short of bodies, refetching block"
+                        );
+                        metrics::record_sync_response_error("topup_short");
+                        let _ = self
+                            .event_sender
+                            .send(NodeInput::SyncBlockFetchFailed { height });
+                    }
+                }
+            }
+
+            NodeInput::SyncBlockTopUpFailed { height } => {
+                self.pending_block_topups.remove(&height);
+                tracing::warn!(
+                    height = height.0,
+                    "Sync: topup request failed, refetching block"
+                );
+                metrics::record_sync_response_error("topup_failed");
+                let _ = self
+                    .event_sender
+                    .send(NodeInput::SyncBlockFetchFailed { height });
             }
 
             // ── Fetch protocol ─────────────────────────────────────────

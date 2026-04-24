@@ -16,7 +16,9 @@
 //!   the cross-shard `provision.request` fast path. Eviction is gated on
 //!   terminal execution certificates from the target shard.
 
-use hyperscale_types::{BlockHeight, Provision, ProvisionHash, ShardGroupId};
+use hyperscale_types::{
+    BlockHeight, BloomFilter, Provision, ProvisionHash, ShardGroupId, DEFAULT_FPR,
+};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
@@ -114,10 +116,62 @@ impl ProvisionStore {
     pub fn is_empty(&self) -> bool {
         self.inner.lock().unwrap().is_empty()
     }
+
+    /// Build a bloom filter over every cached provision hash. Sync
+    /// inventory attaches this to `GetBlockRequest` so the responder can
+    /// elide provisions the requester already holds.
+    pub fn provision_bloom_snapshot(&self) -> Option<BloomFilter<ProvisionHash>> {
+        let inner = self.inner.lock().unwrap();
+        let mut bf = BloomFilter::with_capacity(inner.len(), DEFAULT_FPR)?;
+        for hash in inner.keys() {
+            bf.insert(hash);
+        }
+        Some(bf)
+    }
 }
 
 impl Default for ProvisionStore {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hyperscale_types::{MerkleInclusionProof, TxEntries, TxHash};
+
+    fn make_batch(tx_seed: u8, height: u64) -> Arc<Provision> {
+        Arc::new(Provision::new(
+            ShardGroupId(1),
+            BlockHeight(height),
+            MerkleInclusionProof::dummy(),
+            vec![TxEntries {
+                tx_hash: TxHash::from_raw(hyperscale_types::Hash::from_bytes(&[tx_seed])),
+                entries: vec![],
+                target_nodes: vec![],
+            }],
+        ))
+    }
+
+    #[test]
+    fn empty_store_yields_filter_that_matches_nothing() {
+        let store = ProvisionStore::new();
+        let bf = store.provision_bloom_snapshot().expect("empty sizing ok");
+        let absent = make_batch(99, 1);
+        assert!(!bf.contains(&absent.hash()));
+    }
+
+    #[test]
+    fn snapshot_contains_every_cached_hash() {
+        let store = ProvisionStore::new();
+        let batches: Vec<_> = (0u8..20).map(|i| make_batch(i, 1 + i as u64)).collect();
+        for b in &batches {
+            store.insert(b.clone());
+        }
+        let bf = store.provision_bloom_snapshot().unwrap();
+        for b in &batches {
+            assert!(bf.contains(&b.hash()), "missing cached batch");
+        }
     }
 }

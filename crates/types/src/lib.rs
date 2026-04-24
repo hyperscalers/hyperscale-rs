@@ -14,6 +14,7 @@
 //! This crate is self-contained with minimal dependencies. It does not depend on
 //! any other workspace crates, making it the foundation layer.
 
+mod bloom;
 mod crypto;
 mod hash;
 mod hash_kinds;
@@ -36,6 +37,8 @@ mod topology;
 mod transaction;
 mod validator;
 mod wave;
+
+pub use bloom::{BloomFilter, DEFAULT_FPR, MAX_BITS};
 
 // Re-export crypto types and helpers
 pub use crypto::{

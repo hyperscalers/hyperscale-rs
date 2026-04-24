@@ -16,7 +16,9 @@
 //! building, which iterates the store to include finalized waves in block
 //! order.
 
-use hyperscale_types::{FinalizedWave, TxHash, WaveCertificate, WaveId, WaveIdHash};
+use hyperscale_types::{
+    BloomFilter, FinalizedWave, TxHash, WaveCertificate, WaveId, WaveIdHash, DEFAULT_FPR,
+};
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
@@ -95,6 +97,17 @@ impl FinalizedWaveStore {
     #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.waves.is_empty()
+    }
+
+    /// Build a bloom filter over every tracked `WaveIdHash`. Sync
+    /// inventory attaches this to `GetBlockRequest` so the responder can
+    /// elide finalized-wave certificates the requester already has.
+    pub fn cert_bloom_snapshot(&self) -> Option<BloomFilter<WaveIdHash>> {
+        let mut bf = BloomFilter::with_capacity(self.waves.len(), DEFAULT_FPR)?;
+        for wave_id in self.waves.keys() {
+            bf.insert(&wave_id.hash());
+        }
+        Some(bf)
     }
 }
 
@@ -230,6 +243,24 @@ mod tests {
         assert!(!store.is_finalized(&tx1));
         assert!(store.is_finalized(&tx2));
         assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn cert_bloom_snapshot_contains_every_tracked_wave() {
+        let mut store = FinalizedWaveStore::new();
+        let tx1 = TxHash::from_raw(Hash::from_bytes(b"tx1"));
+        let tx2 = TxHash::from_raw(Hash::from_bytes(b"tx2"));
+        let (wid1, fw1) = make_finalized_wave(1, &[tx1]);
+        let (wid2, fw2) = make_finalized_wave(2, &[tx2]);
+        store.insert(wid1.clone(), fw1);
+        store.insert(wid2.clone(), fw2);
+
+        let bf = store.cert_bloom_snapshot().expect("sizing ok");
+        assert!(bf.contains(&wid1.hash()));
+        assert!(bf.contains(&wid2.hash()));
+        // Untracked wave-id hash: exercises the filter's zero region.
+        let absent = make_wave_id(99).hash();
+        assert!(!bf.contains(&absent));
     }
 
     #[test]

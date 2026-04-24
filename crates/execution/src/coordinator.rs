@@ -39,10 +39,10 @@
 
 use hyperscale_core::{Action, ProtocolEvent, ProvisionRequest};
 use hyperscale_types::{
-    Attempt, Block, BlockHash, BlockHeight, ExecutionCertificate, ExecutionVote, GlobalReceiptRoot,
-    LocalExecutionEntry, NodeId, Provision, ReceiptBundle, RoutableTransaction, ShardGroupId,
-    TopologySnapshot, TransactionDecision, TxHash, TxOutcome, ValidatorId, WaveCertificate, WaveId,
-    WaveIdHash, WeightedTimestamp,
+    Attempt, Block, BlockHash, BlockHeight, BloomFilter, ExecutionCertificate, ExecutionVote,
+    GlobalReceiptRoot, LocalExecutionEntry, NodeId, Provision, ReceiptBundle, RoutableTransaction,
+    ShardGroupId, TopologySnapshot, TransactionDecision, TxHash, TxOutcome, ValidatorId,
+    WaveCertificate, WaveId, WaveIdHash, WeightedTimestamp,
 };
 #[cfg(test)]
 use hyperscale_types::{ExecutionOutcome, Hash};
@@ -1539,6 +1539,14 @@ impl ExecutionCoordinator {
         wave_id_hash: &WaveIdHash,
     ) -> Option<Arc<FinalizedWave>> {
         self.finalized.get_by_wave_id_hash(wave_id_hash)
+    }
+
+    /// Bloom filter over every tracked finalized-wave id hash. Attached to
+    /// outgoing `GetBlockRequest`s so the responder can elide wave
+    /// certificates the requester already has. Returns `None` when the
+    /// cached set is too large to size a filter within the configured cap.
+    pub fn cert_bloom_snapshot(&self) -> Option<BloomFilter<WaveIdHash>> {
+        self.finalized.cert_bloom_snapshot()
     }
 
     /// Get the finalized wave certificate containing a specific transaction.

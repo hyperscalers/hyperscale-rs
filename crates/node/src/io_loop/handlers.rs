@@ -33,10 +33,10 @@ where
     /// the serving function in the corresponding protocol module.
     pub(super) fn register_request_handler(&self) {
         use crate::protocol::provision_fetch::serve_provision_request;
-        use crate::protocol::sync::serve_block_request;
+        use crate::protocol::sync::{serve_block_request, serve_block_topup_request};
         use crate::protocol::transaction_fetch::serve_transaction_request;
         use hyperscale_messages::request::{
-            GetBlockRequest, GetProvisionRequest, GetTransactionsRequest,
+            GetBlockRequest, GetBlockTopUpRequest, GetProvisionRequest, GetTransactionsRequest,
         };
         use std::sync::Arc;
 
@@ -47,6 +47,15 @@ where
         self.network
             .register_request_handler::<GetBlockRequest>(move |req| {
                 serve_block_request(&*storage, &provision_store, req)
+            });
+
+        // ── block_topup.request → sync protocol ──────────────────────
+
+        let storage = Arc::clone(&self.storage);
+        let provision_store = Arc::clone(&self.provision_store);
+        self.network
+            .register_request_handler::<GetBlockTopUpRequest>(move |req| {
+                serve_block_topup_request(&*storage, &provision_store, req)
             });
 
         // ── transaction.request → fetch protocol ─────────────────────

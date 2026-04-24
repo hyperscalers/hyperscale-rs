@@ -14,8 +14,10 @@
 //! Simulation: feeds inputs/outputs synchronously via event queue.
 
 use crate::ProvisionStore;
-use hyperscale_messages::request::GetBlockRequest;
-use hyperscale_messages::response::GetBlockResponse;
+use hyperscale_messages::request::{GetBlockRequest, GetBlockTopUpRequest};
+use hyperscale_messages::response::{
+    ElidedCertifiedBlock, GetBlockResponse, GetBlockTopUpResponse,
+};
 use hyperscale_metrics as metrics;
 use hyperscale_storage::ChainReader;
 use hyperscale_types::{BlockHash, BlockHeight, CertifiedBlock, Provision, WAVE_TIMEOUT};
@@ -441,7 +443,7 @@ pub fn serve_block_request(
     let wave_window_open = tip_ts.elapsed_since(block_ts) < LIVE_WINDOW;
 
     if !wave_window_open || provision_hashes.is_empty() {
-        return GetBlockResponse::found(CertifiedBlock::new_unchecked(block, qc));
+        return GetBlockResponse::found(ElidedCertifiedBlock::elide(block, qc, &req.inventory));
     }
 
     let resolved: Option<Vec<Arc<Provision>>> = provision_hashes
@@ -450,9 +452,10 @@ pub fn serve_block_request(
         .collect();
 
     match resolved {
-        Some(provisions) => GetBlockResponse::found(CertifiedBlock::new_unchecked(
+        Some(provisions) => GetBlockResponse::found(ElidedCertifiedBlock::elide(
             block.into_live(provisions),
             qc,
+            &req.inventory,
         )),
         None => {
             // Cache miss inside the live window. Serve Sealed and let the
@@ -464,9 +467,63 @@ pub fn serve_block_request(
                 "Cache miss for provisions inside live window — serving sealed"
             );
             metrics::record_sync_response_error("provision_cache_miss");
-            GetBlockResponse::found(CertifiedBlock::new_unchecked(block, qc))
+            GetBlockResponse::found(ElidedCertifiedBlock::elide(block, qc, &req.inventory))
         }
     }
+}
+
+/// Serve a top-up request — the requester's rehydration of an earlier
+/// elided response missed some bodies (bloom false-positives or local
+/// evictions), so it's asking for just those hashes.
+///
+/// Reads the block from storage and returns only the bodies whose hashes
+/// are listed in the request. Hashes we don't have (block evicted, or
+/// caller's hash is unknown) are silently omitted — the requester then
+/// falls back to a full refetch.
+pub fn serve_block_topup_request(
+    storage: &impl ChainReader,
+    provision_store: &ProvisionStore,
+    req: GetBlockTopUpRequest,
+) -> GetBlockTopUpResponse {
+    let Some(hyperscale_storage::BlockForSync { block, .. }) =
+        storage.get_block_for_sync(req.height)
+    else {
+        return GetBlockTopUpResponse::empty();
+    };
+
+    let transactions = req
+        .missing_tx
+        .iter()
+        .filter_map(|want| {
+            block
+                .transactions()
+                .iter()
+                .find(|tx| tx.hash() == *want)
+                .map(|tx| (*want, Arc::clone(tx)))
+        })
+        .collect();
+
+    let certificates = req
+        .missing_cert
+        .iter()
+        .filter_map(|want| {
+            block
+                .certificates()
+                .iter()
+                .find(|fw| fw.wave_id_hash() == *want)
+                .map(|fw| (*want, Arc::clone(fw)))
+        })
+        .collect();
+
+    // Provisions never live in the persisted block — they're held only in
+    // the in-memory cache, so resolve top-up hits against `provision_store`.
+    let provisions = req
+        .missing_provision
+        .iter()
+        .filter_map(|want| provision_store.get(want).map(|p| (*want, p)))
+        .collect();
+
+    GetBlockTopUpResponse::new(transactions, certificates, provisions)
 }
 
 #[cfg(test)]

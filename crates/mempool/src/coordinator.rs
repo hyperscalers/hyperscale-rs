@@ -5,8 +5,8 @@ use crate::ready_set::ReadySet;
 use crate::tombstones::{TombstoneStore, TOMBSTONE_RETENTION, TRANSACTION_RETENTION};
 use hyperscale_core::{Action, FinalizationPhaseTimes, TransactionStatus};
 use hyperscale_types::{
-    BlockHeight, CertifiedBlock, NodeId, RoutableTransaction, TopologySnapshot,
-    TransactionDecision, TxHash, WeightedTimestamp,
+    BlockHeight, BloomFilter, CertifiedBlock, NodeId, RoutableTransaction, TopologySnapshot,
+    TransactionDecision, TxHash, WeightedTimestamp, DEFAULT_FPR,
 };
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -839,6 +839,26 @@ impl MempoolCoordinator {
         self.pool.get(hash).map(|e| e.status.clone())
     }
 
+    /// Build a bloom filter over every transaction hash we can resolve
+    /// locally — both live pool entries and recently-evicted bodies. A sync
+    /// requester attaches this to `GetBlockRequest` so the responder can
+    /// elide transaction bodies already known to the requester.
+    ///
+    /// Returns `None` when the combined set is too large to size a filter
+    /// within the configured [`MAX_BITS`](hyperscale_types::MAX_BITS) cap;
+    /// callers treat this as "send no inventory, accept the full response."
+    pub fn tx_bloom_snapshot(&self) -> Option<BloomFilter<TxHash>> {
+        let n = self.pool.len() + self.tombstones.len_evicted();
+        let mut bf = BloomFilter::with_capacity(n, DEFAULT_FPR)?;
+        for hash in self.pool.keys() {
+            bf.insert(hash);
+        }
+        for hash in self.tombstones.recently_evicted_hashes() {
+            bf.insert(hash);
+        }
+        Some(bf)
+    }
+
     /// Get mempool memory statistics for monitoring collection sizes.
     pub fn memory_stats(&self) -> MempoolMemoryStats {
         MempoolMemoryStats {
@@ -970,6 +990,39 @@ mod tests {
             mempool.status(&tx_hash).is_none(),
             "Transaction should be evicted from pool after Aborted"
         );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Bloom-inventory snapshot
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn tx_bloom_snapshot_covers_pool_and_recently_evicted() {
+        let topology = make_test_topology();
+        let mut mempool = MempoolCoordinator::new();
+
+        // A submitted-but-not-yet-committed tx lands in pool.
+        let tx_live = test_transaction(1);
+        let tx_live_hash = tx_live.hash();
+        mempool.on_submit_transaction(&topology, Arc::new(tx_live.clone()));
+
+        // A second tx commits and gets evicted to recently_evicted.
+        let tx_done = test_transaction(2);
+        let tx_done_hash = tx_done.hash();
+        mempool.on_submit_transaction(&topology, Arc::new(tx_done.clone()));
+        let certified = certified_commit_block(
+            BlockHeight(1),
+            tx_done.clone(),
+            make_finalized_wave(BlockHeight(1), tx_done_hash, TransactionDecision::Accept),
+        );
+        mempool.on_block_committed(&topology, &certified);
+
+        let bf = mempool.tx_bloom_snapshot().expect("sizing ok");
+        assert!(bf.contains(&tx_live_hash));
+        assert!(bf.contains(&tx_done_hash));
+
+        let absent = test_transaction(3).hash();
+        assert!(!bf.contains(&absent));
     }
 
     // ═══════════════════════════════════════════════════════════════════════════

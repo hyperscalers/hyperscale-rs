@@ -2,9 +2,9 @@
 
 use crate::ProtocolEvent;
 use hyperscale_types::{
-    BlockHash, BlockHeight, Bls12381G1PublicKey, Bls12381G2Signature, CertifiedBlock,
-    CommittedBlockHeader, ExecutionCertificate, FinalizedWave, Provision, ProvisionHash,
-    RoutableTransaction, ShardGroupId, TxHash, ValidatorId, WaveIdHash,
+    BlockHash, BlockHeight, Bls12381G1PublicKey, Bls12381G2Signature, CommittedBlockHeader,
+    ExecutionCertificate, FinalizedWave, Provision, ProvisionHash, RoutableTransaction,
+    ShardGroupId, TxHash, ValidatorId, WaveIdHash,
 };
 use std::sync::Arc;
 
@@ -50,14 +50,29 @@ pub enum NodeInput {
     /// Client submitted a transaction.
     SubmitTransaction { tx: Arc<RoutableTransaction> },
 
-    /// Sync block response received from network callback.
+    /// Sync block response received from network callback. Carries the
+    /// elided wire shape; the IoLoop rehydrates to a full `CertifiedBlock`
+    /// by looking up omitted bodies in the local mempool / cert cache /
+    /// provision store before handing off to the sync state machine.
     SyncBlockResponseReceived {
         height: BlockHeight,
-        block: Option<Box<CertifiedBlock>>,
+        block: Option<Box<hyperscale_messages::response::ElidedCertifiedBlock>>,
     },
 
     /// Sync block fetch failed from network callback.
     SyncBlockFetchFailed { height: BlockHeight },
+
+    /// Top-up response received from network callback after a rehydration
+    /// miss. `response = None` signals the peer couldn't serve any of the
+    /// requested bodies (empty-response short-circuit on the wire).
+    SyncBlockTopUpReceived {
+        height: BlockHeight,
+        response: Option<Box<hyperscale_messages::response::GetBlockTopUpResponse>>,
+    },
+
+    /// Top-up request failed (timeout / transport error). The IoLoop
+    /// drops the buffered elided block and refetches the whole thing.
+    SyncBlockTopUpFailed { height: BlockHeight },
 
     /// Periodic tick for the fetch protocol to retry pending operations.
     FetchTick,
@@ -212,6 +227,8 @@ impl NodeInput {
             NodeInput::SubmitTransaction { .. } => EventPriority::Client,
             NodeInput::SyncBlockResponseReceived { .. } => EventPriority::Internal,
             NodeInput::SyncBlockFetchFailed { .. } => EventPriority::Internal,
+            NodeInput::SyncBlockTopUpReceived { .. } => EventPriority::Internal,
+            NodeInput::SyncBlockTopUpFailed { .. } => EventPriority::Internal,
             NodeInput::FetchTick => EventPriority::Timer,
             NodeInput::FetchTransactionsFailed { .. } => EventPriority::Internal,
             NodeInput::TransactionReceived { .. } => EventPriority::Network,
@@ -255,6 +272,8 @@ impl NodeInput {
             NodeInput::SubmitTransaction { .. } => "SubmitTransaction",
             NodeInput::SyncBlockResponseReceived { .. } => "SyncBlockResponseReceived",
             NodeInput::SyncBlockFetchFailed { .. } => "SyncBlockFetchFailed",
+            NodeInput::SyncBlockTopUpReceived { .. } => "SyncBlockTopUpReceived",
+            NodeInput::SyncBlockTopUpFailed { .. } => "SyncBlockTopUpFailed",
             NodeInput::FetchTick => "FetchTick",
             NodeInput::FetchTransactionsFailed { .. } => "FetchTransactionsFailed",
             NodeInput::TransactionReceived { .. } => "TransactionReceived",

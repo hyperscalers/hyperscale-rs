@@ -88,6 +88,13 @@ impl TombstoneStore {
     pub fn len_evicted(&self) -> usize {
         self.recently_evicted.len()
     }
+
+    /// Iterate the hashes of every cached evicted-body entry. Sync inventory
+    /// needs these: tombstoned transactions whose bodies we still hold must
+    /// not be re-requested during block catchup.
+    pub fn recently_evicted_hashes(&self) -> impl Iterator<Item = &TxHash> {
+        self.recently_evicted.keys()
+    }
 }
 
 #[cfg(test)]
