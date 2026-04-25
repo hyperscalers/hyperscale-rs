@@ -9,8 +9,8 @@ use hyperscale_core::TransactionStatus;
 use hyperscale_mempool::{MempoolConfig, MempoolCoordinator, MempoolMemoryStats};
 use hyperscale_test_helpers::{certify, make_finalized_wave, make_live_block, TestCommittee};
 use hyperscale_types::{
-    test_utils::test_transaction, BlockHeight, Hash, ShardGroupId, TopologySnapshot,
-    TransactionDecision, TxHash, ValidatorId,
+    test_utils::test_transaction, BlockHeight, Hash, LocalTimestamp, ShardGroupId,
+    TopologySnapshot, TransactionDecision, TxHash, ValidatorId,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -91,7 +91,9 @@ fn has_transaction_is_false_on_fresh_coordinator() {
 #[test]
 fn ready_transactions_is_empty_on_fresh_coordinator() {
     let coord = MempoolCoordinator::new();
-    assert!(coord.ready_transactions(100, 0, 0).is_empty());
+    assert!(coord
+        .ready_transactions(100, 0, 0, LocalTimestamp::ZERO)
+        .is_empty());
 }
 
 #[test]
@@ -119,12 +121,12 @@ fn submit_then_ready_round_trips_a_transaction() {
 
     let tx = test_transaction(1);
     let tx_hash = tx.hash();
-    coord.on_submit_transaction(&topology, Arc::new(tx));
+    coord.on_submit_transaction(&topology, Arc::new(tx), LocalTimestamp::ZERO);
 
     assert!(coord.has_transaction(&tx_hash));
     assert_eq!(coord.status(&tx_hash), Some(TransactionStatus::Pending));
 
-    let ready = coord.ready_transactions(10, 0, 0);
+    let ready = coord.ready_transactions(10, 0, 0, LocalTimestamp::ZERO);
     assert_eq!(ready.len(), 1);
     assert_eq!(ready[0].hash(), tx_hash);
 }
@@ -136,7 +138,7 @@ fn on_block_committed_transitions_pending_to_committed_and_bumps_in_flight() {
 
     let tx = test_transaction(1);
     let tx_hash = tx.hash();
-    coord.on_submit_transaction(&topology, Arc::new(tx.clone()));
+    coord.on_submit_transaction(&topology, Arc::new(tx.clone()), LocalTimestamp::ZERO);
     assert_eq!(coord.in_flight(), 0);
 
     let block = make_live_block(
@@ -147,7 +149,7 @@ fn on_block_committed_transitions_pending_to_committed_and_bumps_in_flight() {
         vec![Arc::new(tx)],
         vec![],
     );
-    coord.on_block_committed(&topology, &certify(block, 1_000));
+    coord.on_block_committed(&topology, &certify(block, 1_000), LocalTimestamp::ZERO);
 
     assert_eq!(coord.in_flight(), 1);
     assert_eq!(
@@ -163,7 +165,7 @@ fn on_block_committed_with_finalized_wave_tombstones_and_evicts() {
 
     let tx = test_transaction(1);
     let tx_hash = tx.hash();
-    coord.on_submit_transaction(&topology, Arc::new(tx.clone()));
+    coord.on_submit_transaction(&topology, Arc::new(tx.clone()), LocalTimestamp::ZERO);
 
     // Single block that both includes the tx and carries the wave cert
     // completing it — drives Pending → Committed → Completed in one call.
@@ -176,13 +178,13 @@ fn on_block_committed_with_finalized_wave_tombstones_and_evicts() {
         vec![Arc::new(tx.clone())],
         vec![Arc::new(fw)],
     );
-    coord.on_block_committed(&topology, &certify(block, 1_000));
+    coord.on_block_committed(&topology, &certify(block, 1_000), LocalTimestamp::ZERO);
 
     // Terminal state: evicted from pool, tombstoned so gossip can't revive it.
     assert!(coord.status(&tx_hash).is_none());
     assert!(coord.is_tombstoned(&tx_hash));
 
-    let actions = coord.on_transaction_gossip(&topology, Arc::new(tx), false);
+    let actions = coord.on_transaction_gossip(&topology, Arc::new(tx), false, LocalTimestamp::ZERO);
     assert!(actions.is_empty(), "tombstoned tx must not be re-accepted");
     assert!(!coord.has_transaction(&tx_hash));
 }

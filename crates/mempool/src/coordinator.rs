@@ -178,12 +178,6 @@ pub struct MempoolCoordinator {
     /// ready-set conflict), or neither (removed).
     ready: ReadySet,
 
-    /// Current local wall-clock time. Drives latency telemetry stamps and
-    /// the `min_dwell_time` filter on local proposal selection only — never
-    /// a deterministic state-retention anchor (use `current_ts:
-    /// WeightedTimestamp` for that).
-    now: LocalTimestamp,
-
     /// Current committed block height (for retry transaction creation).
     current_height: BlockHeight,
 
@@ -226,16 +220,10 @@ impl MempoolCoordinator {
             tombstones: TombstoneStore::new(),
             locks: LockTracker::new(),
             ready: ReadySet::new(),
-            now: LocalTimestamp::ZERO,
             current_height: BlockHeight(0),
             current_ts: WeightedTimestamp::ZERO,
             config,
         }
-    }
-
-    /// Set the current time.
-    pub fn set_time(&mut self, now: LocalTimestamp) {
-        self.now = now;
     }
 
     /// Handle transaction submission from client.
@@ -244,6 +232,7 @@ impl MempoolCoordinator {
         &mut self,
         topology: &TopologySnapshot,
         tx: Arc<RoutableTransaction>,
+        now: LocalTimestamp,
     ) -> Vec<Action> {
         let hash = tx.hash();
 
@@ -284,7 +273,7 @@ impl MempoolCoordinator {
             PoolEntry {
                 tx: Arc::clone(&tx),
                 status: TransactionStatus::Pending,
-                added_at: self.now,
+                added_at: now,
                 cross_shard,
                 submitted_locally: true, // Submitted via RPC
                 committed_at_time: None,
@@ -294,7 +283,7 @@ impl MempoolCoordinator {
         );
 
         // Add to ready tracking
-        self.add_to_ready_tracking(hash, &tx, self.now);
+        self.add_to_ready_tracking(hash, &tx, now);
 
         tracing::info!(tx_hash = ?hash, pool_size = self.pool.len(), "Transaction added to mempool via submit");
 
@@ -303,7 +292,7 @@ impl MempoolCoordinator {
         vec![Action::EmitTransactionStatus {
             tx_hash: hash,
             status: TransactionStatus::Pending,
-            added_at: self.now,
+            added_at: now,
             cross_shard,
             submitted_locally: true,
             phase_times: None,
@@ -322,6 +311,7 @@ impl MempoolCoordinator {
         topology: &TopologySnapshot,
         tx: Arc<RoutableTransaction>,
         submitted_locally: bool,
+        now: LocalTimestamp,
     ) -> Vec<Action> {
         let hash = tx.hash();
 
@@ -347,7 +337,7 @@ impl MempoolCoordinator {
             PoolEntry {
                 tx: Arc::clone(&tx),
                 status: TransactionStatus::Pending,
-                added_at: self.now,
+                added_at: now,
                 cross_shard,
                 submitted_locally,
                 committed_at_time: None,
@@ -357,7 +347,7 @@ impl MempoolCoordinator {
         );
 
         // Add to ready tracking
-        self.add_to_ready_tracking(hash, &tx, self.now);
+        self.add_to_ready_tracking(hash, &tx, now);
 
         tracing::trace!(tx_hash = ?hash, pool_size = self.pool.len(), "Transaction added to mempool via gossip");
 
@@ -440,6 +430,7 @@ impl MempoolCoordinator {
         &mut self,
         topology: &TopologySnapshot,
         certified: &CertifiedBlock,
+        now: LocalTimestamp,
     ) -> Vec<Action> {
         let block = &certified.block;
         let height = block.height();
@@ -457,27 +448,24 @@ impl MempoolCoordinator {
         // status tracking (execution status updates).
         for tx in block.transactions().iter() {
             let hash = tx.hash();
-            if !self.pool.contains_key(&hash) {
-                let cross_shard = tx.is_cross_shard(topology.num_shards());
-                self.pool.insert(
-                    hash,
-                    PoolEntry {
-                        tx: Arc::clone(tx),
-                        status: TransactionStatus::Pending, // Will be updated by execution
-                        added_at: self.now,
-                        cross_shard,
-                        submitted_locally: false, // Fetched for block processing
-                        committed_at_time: None,
-                        ec_created_at_time: None,
-                        executed_at_time: None,
-                    },
-                );
+            let num_shards = topology.num_shards();
+            self.pool.entry(hash).or_insert_with(|| {
                 tracing::debug!(
                     tx_hash = ?hash,
                     height = height.0,
                     "Added committed transaction to mempool"
                 );
-            }
+                PoolEntry {
+                    tx: Arc::clone(tx),
+                    status: TransactionStatus::Pending, // Will be updated by execution
+                    added_at: now,
+                    cross_shard: tx.is_cross_shard(num_shards),
+                    submitted_locally: false, // Fetched for block processing
+                    committed_at_time: None,
+                    ec_created_at_time: None,
+                    executed_at_time: None,
+                }
+            });
         }
 
         // Update transaction status to Committed and add locks.
@@ -492,7 +480,7 @@ impl MempoolCoordinator {
                     let cross_shard = entry.cross_shard;
                     let submitted_locally = entry.submitted_locally;
                     entry.status = TransactionStatus::Committed(height);
-                    entry.committed_at_time = Some(self.now);
+                    entry.committed_at_time = Some(now);
                     // Remove from ready tracking (no longer Pending)
                     self.remove_from_ready_tracking(&hash);
                     // Add locks for committed transactions and update counter
@@ -518,7 +506,8 @@ impl MempoolCoordinator {
                 if matches!(decision, TransactionDecision::Aborted) {
                     hyperscale_metrics::record_transaction_aborted();
                 }
-                actions.extend(self.process_certificate_committed(topology, tx_hash, decision));
+                actions
+                    .extend(self.process_certificate_committed(topology, tx_hash, decision, now));
             }
         }
 
@@ -534,6 +523,7 @@ impl MempoolCoordinator {
         topology: &TopologySnapshot,
         tx_hash: TxHash,
         decision: TransactionDecision,
+        now: LocalTimestamp,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
 
@@ -548,7 +538,7 @@ impl MempoolCoordinator {
                 wave_ready_at: None,
                 ec_created_at: entry.ec_created_at_time,
                 executed_at: entry.executed_at_time,
-                completed_at: self.now,
+                completed_at: now,
             });
 
             actions.push(Action::EmitTransactionStatus {
@@ -568,10 +558,10 @@ impl MempoolCoordinator {
     }
 
     /// Record when the local execution certificate was created for a wave's txs.
-    pub fn on_ec_created(&mut self, tx_hashes: &[TxHash]) {
+    pub fn on_ec_created(&mut self, tx_hashes: &[TxHash], now: LocalTimestamp) {
         for tx_hash in tx_hashes {
             if let Some(entry) = self.pool.get_mut(tx_hash) {
-                entry.ec_created_at_time = Some(self.now);
+                entry.ec_created_at_time = Some(now);
             }
         }
     }
@@ -585,6 +575,7 @@ impl MempoolCoordinator {
         _topology: &TopologySnapshot,
         tx_hash: TxHash,
         accepted: bool,
+        now: LocalTimestamp,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
 
@@ -617,7 +608,7 @@ impl MempoolCoordinator {
                 decision,
                 committed_at,
             };
-            entry.executed_at_time = Some(self.now);
+            entry.executed_at_time = Some(now);
             actions.push(Action::EmitTransactionStatus {
                 tx_hash,
                 status: TransactionStatus::Executed {
@@ -744,6 +735,7 @@ impl MempoolCoordinator {
         max_count: usize,
         pending_commit_tx_count: usize,
         pending_commit_cert_count: usize,
+        now: LocalTimestamp,
     ) -> Vec<Arc<RoutableTransaction>> {
         // Certificates reduce in-flight (transactions complete), txs increase it
         let effective_in_flight = self
@@ -764,7 +756,7 @@ impl MempoolCoordinator {
         let max_count = max_count.min(room);
 
         self.ready
-            .iter_ready(self.config.min_dwell_time, self.now)
+            .iter_ready(self.config.min_dwell_time, now)
             .take(max_count)
             .collect()
     }
@@ -1028,14 +1020,14 @@ mod tests {
         // Submit a TX, then commit a block whose FinalizedWave aborts it.
         let tx = test_transaction(1);
         let tx_hash = tx.hash();
-        mempool.on_submit_transaction(&topology, Arc::new(tx.clone()));
+        mempool.on_submit_transaction(&topology, Arc::new(tx.clone()), LocalTimestamp::ZERO);
 
         let certified = certified_commit_block(
             BlockHeight(1),
             tx,
             make_finalized_wave(BlockHeight(1), tx_hash, TransactionDecision::Aborted),
         );
-        let actions = mempool.on_block_committed(&topology, &certified);
+        let actions = mempool.on_block_committed(&topology, &certified, LocalTimestamp::ZERO);
 
         // Should have emitted Completed(Aborted) status
         let aborted_action = actions.iter().find(|a| {
@@ -1065,18 +1057,18 @@ mod tests {
         // A submitted-but-not-yet-committed tx lands in pool.
         let tx_live = test_transaction(1);
         let tx_live_hash = tx_live.hash();
-        mempool.on_submit_transaction(&topology, Arc::new(tx_live.clone()));
+        mempool.on_submit_transaction(&topology, Arc::new(tx_live.clone()), LocalTimestamp::ZERO);
 
         // A second tx commits and gets evicted to recently_evicted.
         let tx_done = test_transaction(2);
         let tx_done_hash = tx_done.hash();
-        mempool.on_submit_transaction(&topology, Arc::new(tx_done.clone()));
+        mempool.on_submit_transaction(&topology, Arc::new(tx_done.clone()), LocalTimestamp::ZERO);
         let certified = certified_commit_block(
             BlockHeight(1),
             tx_done.clone(),
             make_finalized_wave(BlockHeight(1), tx_done_hash, TransactionDecision::Accept),
         );
-        mempool.on_block_committed(&topology, &certified);
+        mempool.on_block_committed(&topology, &certified, LocalTimestamp::ZERO);
 
         let bf = mempool.tx_bloom_snapshot().expect("sizing ok");
         assert!(bf.contains(&tx_live_hash));
@@ -1099,19 +1091,24 @@ mod tests {
         let tx_hash = tx.hash();
 
         // Submit and complete the transaction (commit + Accept wave cert in one block).
-        mempool.on_submit_transaction(&topology, Arc::new(tx.clone()));
+        mempool.on_submit_transaction(&topology, Arc::new(tx.clone()), LocalTimestamp::ZERO);
         let certified = certified_commit_block(
             BlockHeight(1),
             tx.clone(),
             make_finalized_wave(BlockHeight(1), tx_hash, TransactionDecision::Accept),
         );
-        mempool.on_block_committed(&topology, &certified);
+        mempool.on_block_committed(&topology, &certified, LocalTimestamp::ZERO);
 
         // Verify it's tombstoned
         assert!(mempool.is_tombstoned(&tx_hash));
 
         // Try to re-add via gossip - should be rejected
-        let actions = mempool.on_transaction_gossip(&topology, Arc::new(tx.clone()), false);
+        let actions = mempool.on_transaction_gossip(
+            &topology,
+            Arc::new(tx.clone()),
+            false,
+            LocalTimestamp::ZERO,
+        );
         assert!(actions.is_empty(), "Tombstoned tx should be rejected");
 
         // Should still not be in pool
@@ -1127,16 +1124,17 @@ mod tests {
         let tx_hash = tx.hash();
 
         // Submit and complete the transaction (commit + Accept wave cert in one block).
-        mempool.on_submit_transaction(&topology, Arc::new(tx.clone()));
+        mempool.on_submit_transaction(&topology, Arc::new(tx.clone()), LocalTimestamp::ZERO);
         let certified = certified_commit_block(
             BlockHeight(1),
             tx.clone(),
             make_finalized_wave(BlockHeight(1), tx_hash, TransactionDecision::Accept),
         );
-        mempool.on_block_committed(&topology, &certified);
+        mempool.on_block_committed(&topology, &certified, LocalTimestamp::ZERO);
 
         // Try to re-submit - should be rejected (no status emitted)
-        let actions = mempool.on_submit_transaction(&topology, Arc::new(tx.clone()));
+        let actions =
+            mempool.on_submit_transaction(&topology, Arc::new(tx.clone()), LocalTimestamp::ZERO);
         assert!(actions.is_empty(), "Tombstoned tx should be rejected");
 
         // Should still not be in pool
@@ -1165,7 +1163,7 @@ mod tests {
             .map(|i| Arc::new(test_transaction(100 + i as u8)))
             .collect();
         for tx in &txs {
-            mempool.on_submit_transaction(topology, Arc::clone(tx));
+            mempool.on_submit_transaction(topology, Arc::clone(tx), LocalTimestamp::ZERO);
         }
         let block = hyperscale_test_helpers::make_live_block(
             ShardGroupId(0),
@@ -1178,6 +1176,7 @@ mod tests {
         mempool.on_block_committed(
             topology,
             &hyperscale_test_helpers::certify(block, TEST_BLOCK_INTERVAL_MS),
+            LocalTimestamp::ZERO,
         );
 
         assert!(
@@ -1233,14 +1232,22 @@ mod tests {
 
         // Add a single-shard transaction
         let single_shard_tx = test_transaction(1);
-        mempool.on_submit_transaction(&topology, Arc::new(single_shard_tx.clone()));
+        mempool.on_submit_transaction(
+            &topology,
+            Arc::new(single_shard_tx.clone()),
+            LocalTimestamp::ZERO,
+        );
 
         // Add a cross-shard transaction
         let cross_shard_tx = test_cross_shard_transaction(50);
-        mempool.on_submit_transaction(&topology, Arc::new(cross_shard_tx.clone()));
+        mempool.on_submit_transaction(
+            &topology,
+            Arc::new(cross_shard_tx.clone()),
+            LocalTimestamp::ZERO,
+        );
 
         // Below limit: all TXs should be returned
-        let ready = mempool.ready_transactions(10, 0, 0);
+        let ready = mempool.ready_transactions(10, 0, 0, LocalTimestamp::ZERO);
         assert_eq!(ready.len(), 2, "All TXs should be allowed below limit");
     }
 
@@ -1256,10 +1263,10 @@ mod tests {
 
         // Add a transaction
         let tx = test_transaction(1);
-        mempool.on_submit_transaction(&topology, Arc::new(tx.clone()));
+        mempool.on_submit_transaction(&topology, Arc::new(tx.clone()), LocalTimestamp::ZERO);
 
         // At limit: no TXs should be returned
-        let ready = mempool.ready_transactions(10, 0, 0);
+        let ready = mempool.ready_transactions(10, 0, 0, LocalTimestamp::ZERO);
         assert!(
             ready.is_empty(),
             "No TXs should be returned at in-flight limit"
@@ -1280,14 +1287,14 @@ mod tests {
 
         // Add a single-shard transaction
         let single_tx = test_transaction(1);
-        mempool.on_submit_transaction(&topology, Arc::new(single_tx.clone()));
+        mempool.on_submit_transaction(&topology, Arc::new(single_tx.clone()), LocalTimestamp::ZERO);
 
         // Add a cross-shard transaction
         let cross_tx = test_cross_shard_transaction(50);
-        mempool.on_submit_transaction(&topology, Arc::new(cross_tx.clone()));
+        mempool.on_submit_transaction(&topology, Arc::new(cross_tx.clone()), LocalTimestamp::ZERO);
 
         // Not at limit: all TXs should be allowed
-        let ready = mempool.ready_transactions(10, 0, 0);
+        let ready = mempool.ready_transactions(10, 0, 0, LocalTimestamp::ZERO);
         assert_eq!(ready.len(), 2);
     }
 
@@ -1302,8 +1309,8 @@ mod tests {
         let single_hash = single_tx.hash();
         let cross_tx = test_cross_shard_transaction(1);
         let cross_hash = cross_tx.hash();
-        mempool.on_submit_transaction(&topology, Arc::new(single_tx.clone()));
-        mempool.on_submit_transaction(&topology, Arc::new(cross_tx.clone()));
+        mempool.on_submit_transaction(&topology, Arc::new(single_tx.clone()), LocalTimestamp::ZERO);
+        mempool.on_submit_transaction(&topology, Arc::new(cross_tx.clone()), LocalTimestamp::ZERO);
         assert_eq!(mempool.in_flight(), 0, "Pending TXs do not count");
 
         // Block 1 commits both txs — both transition Pending → Committed.
@@ -1315,11 +1322,15 @@ mod tests {
             vec![Arc::new(single_tx), Arc::new(cross_tx)],
             vec![],
         );
-        mempool.on_block_committed(&topology, &hyperscale_test_helpers::certify(block1, 1_000));
+        mempool.on_block_committed(
+            &topology,
+            &hyperscale_test_helpers::certify(block1, 1_000),
+            LocalTimestamp::ZERO,
+        );
         assert_eq!(mempool.in_flight(), 2, "Committed TXs hold state locks");
 
         // Execution completes for the cross-shard tx — Executed still holds locks.
-        mempool.on_transaction_executed(&topology, cross_hash, true);
+        mempool.on_transaction_executed(&topology, cross_hash, true, LocalTimestamp::ZERO);
         assert_eq!(mempool.in_flight(), 2, "Executed TX still holds locks");
 
         // Block 2 carries the wave cert for the cross-shard tx — completes it.
@@ -1335,11 +1346,15 @@ mod tests {
                 TransactionDecision::Accept,
             ))],
         );
-        mempool.on_block_committed(&topology, &hyperscale_test_helpers::certify(block2, 2_000));
+        mempool.on_block_committed(
+            &topology,
+            &hyperscale_test_helpers::certify(block2, 2_000),
+            LocalTimestamp::ZERO,
+        );
         assert_eq!(mempool.in_flight(), 1, "Completed TX releases its lock");
 
         // Execute then finalize the single-shard tx.
-        mempool.on_transaction_executed(&topology, single_hash, true);
+        mempool.on_transaction_executed(&topology, single_hash, true, LocalTimestamp::ZERO);
         assert_eq!(mempool.in_flight(), 1);
 
         let block3 = hyperscale_test_helpers::make_live_block(
@@ -1354,7 +1369,11 @@ mod tests {
                 TransactionDecision::Accept,
             ))],
         );
-        mempool.on_block_committed(&topology, &hyperscale_test_helpers::certify(block3, 3_000));
+        mempool.on_block_committed(
+            &topology,
+            &hyperscale_test_helpers::certify(block3, 3_000),
+            LocalTimestamp::ZERO,
+        );
         assert_eq!(mempool.in_flight(), 0, "All completed");
     }
 
@@ -1371,11 +1390,11 @@ mod tests {
         let mut mempool = MempoolCoordinator::with_config(config);
         let topology = make_test_topology();
 
-        mempool.set_time(LocalTimestamp::from_millis(10_000));
+        let now = LocalTimestamp::from_millis(10_000);
         let tx = test_transaction(1);
-        mempool.on_submit_transaction(&topology, Arc::new(tx));
+        mempool.on_submit_transaction(&topology, Arc::new(tx), now);
 
-        let ready = mempool.ready_transactions(10, 0, 0);
+        let ready = mempool.ready_transactions(10, 0, 0, now);
         assert_eq!(ready.len(), 1, "Zero dwell time should select immediately");
     }
 
@@ -1385,13 +1404,12 @@ mod tests {
         let mut mempool = MempoolCoordinator::new();
         let topology = make_test_topology();
 
-        mempool.set_time(LocalTimestamp::from_millis(10_000));
+        let submitted_at = LocalTimestamp::from_millis(10_000);
         let tx = test_transaction(1);
-        mempool.on_submit_transaction(&topology, Arc::new(tx));
+        mempool.on_submit_transaction(&topology, Arc::new(tx), submitted_at);
 
         // At t=10.1s — not yet eligible (100ms < 150ms)
-        mempool.set_time(LocalTimestamp::from_millis(10_100));
-        let ready = mempool.ready_transactions(10, 0, 0);
+        let ready = mempool.ready_transactions(10, 0, 0, LocalTimestamp::from_millis(10_100));
         assert_eq!(
             ready.len(),
             0,
@@ -1399,8 +1417,7 @@ mod tests {
         );
 
         // At t=10.15s — eligible (150ms >= 150ms)
-        mempool.set_time(LocalTimestamp::from_millis(10_150));
-        let ready = mempool.ready_transactions(10, 0, 0);
+        let ready = mempool.ready_transactions(10, 0, 0, LocalTimestamp::from_millis(10_150));
         assert_eq!(ready.len(), 1, "Should select after 150ms default dwell");
     }
 
@@ -1414,17 +1431,16 @@ mod tests {
         let topology = make_test_topology();
 
         // Submit at t=10s
-        mempool.set_time(LocalTimestamp::from_millis(10_000));
+        let submitted_at = LocalTimestamp::from_millis(10_000);
         let tx = test_transaction(1);
-        mempool.on_submit_transaction(&topology, Arc::new(tx));
+        mempool.on_submit_transaction(&topology, Arc::new(tx), submitted_at);
 
         // Still at t=10s — dwell time not met
-        let ready = mempool.ready_transactions(10, 0, 0);
+        let ready = mempool.ready_transactions(10, 0, 0, submitted_at);
         assert_eq!(ready.len(), 0, "Should not select before dwell time");
 
         // Advance to t=10.3s — still not enough
-        mempool.set_time(LocalTimestamp::from_millis(10_300));
-        let ready = mempool.ready_transactions(10, 0, 0);
+        let ready = mempool.ready_transactions(10, 0, 0, LocalTimestamp::from_millis(10_300));
         assert_eq!(
             ready.len(),
             0,
@@ -1432,8 +1448,7 @@ mod tests {
         );
 
         // Advance to t=10.5s — exactly at dwell time
-        mempool.set_time(LocalTimestamp::from_millis(10_500));
-        let ready = mempool.ready_transactions(10, 0, 0);
+        let ready = mempool.ready_transactions(10, 0, 0, LocalTimestamp::from_millis(10_500));
         assert_eq!(ready.len(), 1, "Should select after dwell time elapses");
     }
 
@@ -1447,26 +1462,19 @@ mod tests {
         let topology = make_test_topology();
 
         // Submit tx1 at t=1s
-        mempool.set_time(LocalTimestamp::from_millis(1_000));
         let tx1 = test_transaction(1);
-        mempool.on_submit_transaction(&topology, Arc::new(tx1));
+        mempool.on_submit_transaction(&topology, Arc::new(tx1), LocalTimestamp::from_millis(1_000));
 
         // Submit tx2 at t=1.3s
-        mempool.set_time(LocalTimestamp::from_millis(1_300));
         let tx2 = test_transaction(2);
-        mempool.on_submit_transaction(&topology, Arc::new(tx2));
+        mempool.on_submit_transaction(&topology, Arc::new(tx2), LocalTimestamp::from_millis(1_300));
 
-        // At t=1.2s — tx1 has 200ms dwell (eligible), tx2 not yet submitted
-        // Actually we already submitted tx2 at 1.3s, so check at 1.4s:
-        // tx1 added at 1.0s, now 1.4s → 400ms dwell (eligible)
-        // tx2 added at 1.3s, now 1.4s → 100ms dwell (not eligible)
-        mempool.set_time(LocalTimestamp::from_millis(1_400));
-        let ready = mempool.ready_transactions(10, 0, 0);
+        // At t=1.4s — tx1 has 400ms dwell (eligible), tx2 has 100ms (not eligible).
+        let ready = mempool.ready_transactions(10, 0, 0, LocalTimestamp::from_millis(1_400));
         assert_eq!(ready.len(), 1, "Only tx1 should be eligible");
 
         // At t=1.5s — both eligible
-        mempool.set_time(LocalTimestamp::from_millis(1_500));
-        let ready = mempool.ready_transactions(10, 0, 0);
+        let ready = mempool.ready_transactions(10, 0, 0, LocalTimestamp::from_millis(1_500));
         assert_eq!(ready.len(), 2, "Both should be eligible");
     }
 
@@ -1493,7 +1501,8 @@ mod tests {
         set_current_ts(&mut mempool, WeightedTimestamp(2_000));
 
         let tx = tx_with_end(1, 1_000); // expired well before now
-        let actions = mempool.on_submit_transaction(&topology, Arc::clone(&tx));
+        let actions =
+            mempool.on_submit_transaction(&topology, Arc::clone(&tx), LocalTimestamp::ZERO);
         assert!(actions.is_empty(), "expired tx should be silently rejected");
         assert!(
             mempool.status(&tx.hash()).is_none(),
@@ -1508,7 +1517,8 @@ mod tests {
         set_current_ts(&mut mempool, WeightedTimestamp(2_000));
 
         let tx = tx_with_end(1, 1_000);
-        let actions = mempool.on_transaction_gossip(&topology, Arc::clone(&tx), false);
+        let actions =
+            mempool.on_transaction_gossip(&topology, Arc::clone(&tx), false, LocalTimestamp::ZERO);
         assert!(actions.is_empty());
         assert!(mempool.status(&tx.hash()).is_none());
     }
@@ -1520,7 +1530,7 @@ mod tests {
         set_current_ts(&mut mempool, WeightedTimestamp(500));
 
         let tx = tx_with_end(1, 1_000); // end_exclusive > now
-        mempool.on_submit_transaction(&topology, Arc::clone(&tx));
+        mempool.on_submit_transaction(&topology, Arc::clone(&tx), LocalTimestamp::ZERO);
         assert!(matches!(
             mempool.status(&tx.hash()),
             Some(TransactionStatus::Pending)
@@ -1535,8 +1545,8 @@ mod tests {
 
         let early = tx_with_end(1, 1_000); // alive
         let later = tx_with_end(2, 60_000); // alive
-        mempool.on_submit_transaction(&topology, Arc::clone(&early));
-        mempool.on_submit_transaction(&topology, Arc::clone(&later));
+        mempool.on_submit_transaction(&topology, Arc::clone(&early), LocalTimestamp::ZERO);
+        mempool.on_submit_transaction(&topology, Arc::clone(&later), LocalTimestamp::ZERO);
         assert_eq!(mempool.len(), 2);
 
         // Advance past `early`'s end_exclusive but not `later`'s.
@@ -1558,7 +1568,7 @@ mod tests {
 
         let tx = tx_with_end(1, 1_000);
         let tx_hash = tx.hash();
-        mempool.on_submit_transaction(&topology, Arc::clone(&tx));
+        mempool.on_submit_transaction(&topology, Arc::clone(&tx), LocalTimestamp::ZERO);
 
         set_current_ts(&mut mempool, WeightedTimestamp(1_500));
         let dropped = mempool.cleanup_expired_pending();
@@ -1569,7 +1579,8 @@ mod tests {
         // tombstone set stays empty, AND a fresh submission past expiry is
         // rejected via the admission path.
         assert!(!mempool.is_tombstoned(&tx_hash));
-        let actions = mempool.on_submit_transaction(&topology, Arc::clone(&tx));
+        let actions =
+            mempool.on_submit_transaction(&topology, Arc::clone(&tx), LocalTimestamp::ZERO);
         assert!(actions.is_empty(), "re-submission past expiry rejected");
         assert!(mempool.status(&tx_hash).is_none());
     }

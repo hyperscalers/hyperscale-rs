@@ -187,9 +187,9 @@ impl NodeStateMachine {
         // Request extra transactions from the mempool to compensate for QC-chain
         // duplicates that will be filtered by BFT during proposal building.
         let max_txs = self.bft.config().max_transactions_per_block + self.bft.dedup_overhead();
-        let ready_txs = self
-            .mempool
-            .ready_transactions(max_txs, pending_txs, pending_certs);
+        let ready_txs =
+            self.mempool
+                .ready_transactions(max_txs, pending_txs, pending_certs, self.now);
         let finalized_waves = self.execution.get_finalized_waves();
         let provision_batches = self.provisions.queued_provisions();
 
@@ -353,10 +353,11 @@ impl NodeStateMachine {
         // Mempool: marks Pending → Committed for block.transactions, then drives
         // each tx in `block.certificates` to its terminal state (Completed +
         // tombstone). Same behavior for consensus and sync commit paths.
-        actions.extend(
-            self.mempool
-                .on_block_committed(self.topology.snapshot(), &certified),
-        );
+        actions.extend(self.mempool.on_block_committed(
+            self.topology.snapshot(),
+            &certified,
+            self.now,
+        ));
 
         // Remote header coordinator: update liveness and check for timeouts.
         actions.extend(
@@ -417,9 +418,12 @@ impl NodeStateMachine {
     /// Handle transaction executed — notify mempool and check pending blocks.
     fn on_transaction_executed(&mut self, tx_hash: TxHash, accepted: bool) -> Vec<Action> {
         // Notify mempool
-        let mut actions =
-            self.mempool
-                .on_transaction_executed(self.topology.snapshot(), tx_hash, accepted);
+        let mut actions = self.mempool.on_transaction_executed(
+            self.topology.snapshot(),
+            tx_hash,
+            accepted,
+            self.now,
+        );
 
         // Check if any pending blocks are waiting for the finalized wave
         // that contains this tx.
@@ -438,7 +442,7 @@ impl NodeStateMachine {
     }
 
     fn on_ec_created(&mut self, tx_hashes: Vec<TxHash>) -> Vec<Action> {
-        self.mempool.on_ec_created(&tx_hashes);
+        self.mempool.on_ec_created(&tx_hashes, self.now);
         vec![]
     }
 
@@ -456,9 +460,12 @@ impl NodeStateMachine {
 
         let tx_hash = tx.hash();
         let tx_for_pending = Arc::clone(&tx);
-        let mut actions =
-            self.mempool
-                .on_transaction_gossip(self.topology.snapshot(), tx, submitted_locally);
+        let mut actions = self.mempool.on_transaction_gossip(
+            self.topology.snapshot(),
+            tx,
+            submitted_locally,
+            self.now,
+        );
 
         // Check if any pending blocks are now complete
         actions.extend(self.bft.check_pending_blocks_for_transaction(
@@ -829,7 +836,6 @@ impl StateMachine for NodeStateMachine {
     fn set_time(&mut self, now: LocalTimestamp) {
         self.now = now;
         self.bft.set_time(now);
-        self.mempool.set_time(now);
         self.provisions.set_time(now);
     }
 

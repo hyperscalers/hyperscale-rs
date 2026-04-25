@@ -1228,7 +1228,10 @@ fn test_mempool_to_block_integration() {
     );
 
     // Transactions submitted at ~50ms with 150ms min dwell time are not yet ready
-    let ready_count = node0.mempool().ready_transactions(100, 0, 0).len();
+    let ready_count = node0
+        .mempool()
+        .ready_transactions(100, 0, 0, hyperscale_types::LocalTimestamp::ZERO)
+        .len();
     assert_eq!(
         ready_count, 0,
         "Transactions should not be ready before dwell time (150ms) elapses"
