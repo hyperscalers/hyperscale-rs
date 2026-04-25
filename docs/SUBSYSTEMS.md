@@ -184,10 +184,9 @@ Global Consensus:  GlobalConsensusTimer, GlobalBlockReceived, etc. -> ALL RETURN
 | `crates/types/src/block.rs` | 751 | `Block`, `BlockHeader`, `CommittedBlockHeader`, merkle roots |
 | `crates/types/src/topology.rs` | 702 | `TopologySnapshot` — shard/validator mapping |
 | `crates/types/src/execution_vote.rs` | 614 | `ExecutionVote`, `WaveId`, wave assignment |
-| `crates/types/src/receipt.rs` | — | `GlobalReceipt`, `LocalReceipt`, `ExecutionOutput` |
+| `crates/types/src/receipt.rs` | 452 | `GlobalReceipt`, `LocalReceipt`, `ReceiptBundle`, `ExecutionOutput` |
 | `crates/types/src/hash.rs` | 497 | `Hash` type, merkle tree primitives |
 | `crates/types/src/crypto.rs` | 487 | BLS12-381 keys, signatures |
-| `crates/types/src/receipt.rs` | 452 | `ReceiptBundle`, `LocalReceipt` |
 | `crates/types/src/epoch.rs` | 426 | Epoch transition types |
 | `crates/types/src/signing.rs` | 354 | Domain-separated signing messages |
 | `crates/types/src/wave_certificate.rs` | 339 | `WaveCertificate` — cross-shard execution proof |

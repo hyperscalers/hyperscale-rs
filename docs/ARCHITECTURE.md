@@ -144,7 +144,7 @@ Given identical state + event, always returns identical actions.
 
 ### ProtocolEvent enum
 
-`crates/core/src/protocol_event.rs` -- **41 variants** organized into:
+`crates/core/src/protocol_event.rs` -- **44 variants** organized into:
 
 - Timers (3): `ProposalTimer`, `CleanupTimer`, `GlobalConsensusTimer`
 - BFT Consensus (12): header/vote/QC/commit/verification events
