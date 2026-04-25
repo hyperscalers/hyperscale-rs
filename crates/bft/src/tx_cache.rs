@@ -7,20 +7,22 @@
 //!    async `BlockCommitted` event and purges them. Lets proposal dedup and
 //!    QC-chain walks see the latest commit even while the event is in flight.
 //!
-//! 2. **Retention lookup** (`tx_lookup`): tx hash → `weighted_timestamp_ms`
-//!    at commit, for historical dedup over a bounded window. Survives
-//!    mempool processing; pruned by `COMMITTED_TX_RETENTION`.
+//! 2. **Retention lookup** (`tx_lookup`): tx hash → `end_timestamp_exclusive`
+//!    from the tx's `validity_range`, for historical dedup over a bounded
+//!    window. Survives mempool processing; pruned at the entry's own
+//!    `end_timestamp_exclusive`. Past expiry, the validator-side validity
+//!    check rejects re-submission anyway, so the entry is no longer
+//!    correctness-bearing — it becomes a perf optimisation. Maximum age is
+//!    bounded by `MAX_VALIDITY_RANGE` because admission requires
+//!    `end_timestamp_exclusive <= anchor + MAX_VALIDITY_RANGE`.
 
-use hyperscale_types::{TxHash, WaveIdHash, WeightedTimestamp};
+use hyperscale_types::{RoutableTransaction, TxHash, WaveIdHash, WeightedTimestamp};
 use std::collections::{HashMap, HashSet};
-use std::time::Duration;
-
-/// How long to retain committed transaction hashes for proposal dedup.
-/// Matches the mempool tombstone window so entries outlive any possible
-/// re-proposal. Anchored on the weighted timestamp of the committing QC.
-const COMMITTED_TX_RETENTION: Duration = Duration::from_secs(300);
+use std::sync::Arc;
 
 pub(crate) struct CommittedTxCache {
+    /// `tx_hash → end_timestamp_exclusive`. Pruned when
+    /// `end_timestamp_exclusive <= current_committed_ts`.
     tx_lookup: HashMap<TxHash, WeightedTimestamp>,
     recently_committed_txs: HashSet<TxHash>,
     recently_committed_certs: HashSet<WaveIdHash>,
@@ -48,25 +50,17 @@ impl CommittedTxCache {
         self.recently_committed_certs.extend(cert_hashes);
     }
 
-    /// Promote a block's tx hashes from the bridge buffer into the
-    /// retention lookup. Called by the node state layer after the mempool
+    /// Promote a block's transactions from the bridge buffer into the
+    /// retention lookup. Each entry's stored value is the tx's
+    /// `validity_range.end_timestamp_exclusive`, which bounds the entry's
+    /// lifetime. Called by the node state layer after the mempool
     /// processes a committed block.
-    pub fn register_committed(&mut self, tx_hashes: &[TxHash], commit_ts: WeightedTimestamp) {
-        for tx_hash in tx_hashes {
-            if let Some(&existing) = self.tx_lookup.get(tx_hash) {
-                if existing != commit_ts {
-                    tracing::warn!(
-                        tx_hash = %tx_hash,
-                        existing = %existing,
-                        new = %commit_ts,
-                        "Transaction committed at two different timestamps!"
-                    );
-                }
-            }
-            self.tx_lookup.entry(*tx_hash).or_insert(commit_ts);
-        }
-        for tx_hash in tx_hashes {
-            self.recently_committed_txs.remove(tx_hash);
+    pub fn register_committed(&mut self, transactions: &[Arc<RoutableTransaction>]) {
+        for tx in transactions {
+            let tx_hash = tx.hash();
+            let end = tx.validity_range.end_timestamp_exclusive;
+            self.tx_lookup.entry(tx_hash).or_insert(end);
+            self.recently_committed_txs.remove(&tx_hash);
         }
     }
 
@@ -77,19 +71,16 @@ impl CommittedTxCache {
         self.tx_lookup.remove(tx_hash);
     }
 
-    /// Drop retention-lookup entries older than the retention window.
+    /// Drop retention-lookup entries whose `end_timestamp_exclusive <= now`.
     /// `now` is the `weighted_timestamp` of the latest committed block.
+    /// Past expiry, the validator-side validity check rejects any
+    /// re-submission, so the entry is no longer correctness-bearing.
     pub fn prune(&mut self, now: WeightedTimestamp) {
-        let cutoff = now.minus(COMMITTED_TX_RETENTION);
-        self.tx_lookup.retain(|_, ts| *ts > cutoff);
+        self.tx_lookup.retain(|_, end| *end > now);
     }
 
     pub fn contains_tx(&self, tx_hash: &TxHash) -> bool {
         self.tx_lookup.contains_key(tx_hash)
-    }
-
-    pub fn tx_commit_ts(&self, tx_hash: &TxHash) -> Option<WeightedTimestamp> {
-        self.tx_lookup.get(tx_hash).copied()
     }
 
     pub fn recent_tx_hashes(&self) -> impl Iterator<Item = TxHash> + '_ {
@@ -116,7 +107,8 @@ impl CommittedTxCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hyperscale_types::Hash;
+    use hyperscale_types::test_utils::test_notarized_transaction_v1;
+    use hyperscale_types::{routable_from_notarized_v1, Hash, TimestampRange};
 
     fn h(b: &[u8]) -> WaveIdHash {
         WaveIdHash::from_raw(Hash::from_bytes(b))
@@ -124,6 +116,13 @@ mod tests {
 
     fn th(b: &[u8]) -> TxHash {
         TxHash::from_raw(Hash::from_bytes(b))
+    }
+
+    /// Build a test tx whose `validity_range.end_timestamp_exclusive == end_ms`.
+    fn tx_with_end(seed: u8, end_ms: u64) -> Arc<RoutableTransaction> {
+        let notarized = test_notarized_transaction_v1(&[seed]);
+        let range = TimestampRange::new(WeightedTimestamp::ZERO, WeightedTimestamp(end_ms));
+        Arc::new(routable_from_notarized_v1(notarized, range).expect("valid notarized fixture"))
     }
 
     #[test]
@@ -140,40 +139,45 @@ mod tests {
     #[test]
     fn register_promotes_to_lookup_and_clears_bridge() {
         let mut cache = CommittedTxCache::new();
-        cache.buffer_commit([th(b"tx1"), th(b"tx2")], []);
-        cache.register_committed(&[th(b"tx1")], WeightedTimestamp(1000));
+        let tx1 = tx_with_end(1, 60_000);
+        let tx1_hash = tx1.hash();
+        // tx2 is in the bridge but not registered — it should stay buffered.
+        let tx2_hash = th(b"tx2");
+        cache.buffer_commit([tx1_hash, tx2_hash], []);
+        cache.register_committed(std::slice::from_ref(&tx1));
 
-        assert!(cache.contains_tx(&th(b"tx1")));
-        assert_eq!(
-            cache.tx_commit_ts(&th(b"tx1")),
-            Some(WeightedTimestamp(1000))
-        );
-        assert!(!cache.contains_tx(&th(b"tx2")));
+        assert!(cache.contains_tx(&tx1_hash));
+        assert!(!cache.contains_tx(&tx2_hash));
 
         let remaining: HashSet<TxHash> = cache.recent_tx_hashes().collect();
-        assert_eq!(remaining, HashSet::from([th(b"tx2")]));
+        assert_eq!(remaining, HashSet::from([tx2_hash]));
     }
 
     #[test]
-    fn prune_drops_entries_older_than_retention() {
+    fn prune_drops_entries_past_their_end_exclusive() {
         let mut cache = CommittedTxCache::new();
-        let retention_ms = COMMITTED_TX_RETENTION.as_millis() as u64;
-        cache.register_committed(&[th(b"old")], WeightedTimestamp(100));
-        cache.register_committed(&[th(b"new")], WeightedTimestamp(retention_ms + 200));
+        let early = tx_with_end(1, 100);
+        let later = tx_with_end(2, 900);
+        let early_hash = early.hash();
+        let later_hash = later.hash();
+        cache.register_committed(&[early, later]);
 
-        cache.prune(WeightedTimestamp(retention_ms + 200));
+        // At now=500: early (end=100) is past expiry, later (end=900) survives.
+        cache.prune(WeightedTimestamp(500));
 
-        assert!(!cache.contains_tx(&th(b"old")));
-        assert!(cache.contains_tx(&th(b"new")));
+        assert!(!cache.contains_tx(&early_hash));
+        assert!(cache.contains_tx(&later_hash));
     }
 
     #[test]
     fn remove_clears_lookup() {
         let mut cache = CommittedTxCache::new();
-        cache.register_committed(&[th(b"tx")], WeightedTimestamp(100));
+        let tx = tx_with_end(1, 60_000);
+        let tx_hash = tx.hash();
+        cache.register_committed(&[tx]);
 
-        cache.remove(&th(b"tx"));
+        cache.remove(&tx_hash);
 
-        assert!(!cache.contains_tx(&th(b"tx")));
+        assert!(!cache.contains_tx(&tx_hash));
     }
 }

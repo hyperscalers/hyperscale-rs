@@ -1,34 +1,36 @@
 //! Tracks execution certificates this shard's wave leader broadcast to
 //! remote shards, re-broadcasting on a deterministic interval until the
 //! local wave finalizes (proof every participating shard, including the
-//! target, contributed an EC) or the safety horizon elapses.
+//! target, contributed an EC) or the [`RETENTION_HORIZON`] elapses.
 //!
-//! Symmetric to [`crate::OutboundProvisionTracker`], guards
-//! source→target provision delivery, this guards target→source EC
-//! delivery. Without it, a single dropped gossip leaves the source
-//! waiting on its 24s timeout + fallback fetch + per-peer rotation
-//! before recovery, and a sustained drop wedges the cross-shard pipe.
+//! Symmetric to `OutboundProvisionTracker` in `hyperscale-provisions`:
+//! that guards source→target provision delivery, this guards
+//! target→source EC delivery. Without it, a single dropped gossip leaves
+//! the source waiting on its 24s execution timeout + fallback fetch +
+//! per-peer rotation before recovery; a sustained drop wedges the
+//! cross-shard pipe.
 //!
 //! No new wire message: re-broadcasts reuse the existing
 //! `BroadcastExecutionCertificate` action. Eviction is driven by local
 //! wave finalization (the only positive signal available without an
-//! explicit ACK round-trip) plus a hard safety horizon.
+//! explicit ACK round-trip) plus the safety horizon.
+//!
+//! The horizon — `MAX_VALIDITY_RANGE + WAVE_TIMEOUT` — is principled,
+//! not arbitrary: a tx included at the latest possible moment within
+//! its `validity_range` gets `WAVE_TIMEOUT` after that to terminate, so
+//! any EC unacked past that bound references a wave no shard could
+//! still be processing. Same constant covers `OutboundProvisionTracker`.
 //!
 //! Anchored on `WeightedTimestamp` from the committing QC so every
 //! validator decides identically when to re-broadcast or evict.
 
 use hyperscale_types::{
-    ExecutionCertificate, ShardGroupId, ValidatorId, WaveId, WeightedTimestamp,
+    ExecutionCertificate, ShardGroupId, ValidatorId, WaveId, WeightedTimestamp, RETENTION_HORIZON,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, warn};
-
-/// Hard safety cap on outbound EC retention. Past this we stop
-/// re-broadcasting and log a warning — the target shard never finalized
-/// the wave and source-side fetch fallback hasn't recovered either.
-pub const OUTBOUND_EC_RETENTION_MAX: Duration = Duration::from_secs(5 * 60);
 
 /// Minimum gap between re-broadcasts of the same EC to the same target.
 /// Cheap (ECs are small) but bounded so we don't spam the network on a
@@ -160,7 +162,7 @@ impl OutboundExecutionCertificateTracker {
 
         for (key, entry) in &mut self.entries {
             let age = now.elapsed_since(entry.first_sent_at);
-            if age > OUTBOUND_EC_RETENTION_MAX {
+            if age > RETENTION_HORIZON {
                 to_evict.push(key.clone());
                 continue;
             }
@@ -298,7 +300,7 @@ mod tests {
         let w = wave(0, 100, &[1]);
         t.on_broadcast(cert(w), ShardGroupId(1), vids(&[4]));
 
-        let past = OUTBOUND_EC_RETENTION_MAX + Duration::from_secs(1);
+        let past = RETENTION_HORIZON + Duration::from_secs(1);
         t.on_block_committed(ts(1_000 + past.as_millis() as u64));
         assert_eq!(t.memory_stats().tracked_certificates, 0);
     }

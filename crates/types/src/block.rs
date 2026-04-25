@@ -834,7 +834,10 @@ mod tests {
         let network = NetworkDefinition::simulator();
         let key = crate::generate_ed25519_keypair();
         let notarized = crate::sign_and_notarize(manifest, &network, 1, &key).unwrap();
-        let tx = Arc::new(RoutableTransaction::try_from(notarized).unwrap());
+        let tx = Arc::new(
+            crate::routable_from_notarized_v1(notarized, crate::test_utils::test_validity_range())
+                .unwrap(),
+        );
 
         let root1 = compute_transaction_root(std::slice::from_ref(&tx));
         let root2 = compute_transaction_root(std::slice::from_ref(&tx));

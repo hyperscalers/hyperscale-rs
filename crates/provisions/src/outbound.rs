@@ -9,24 +9,22 @@
 //! the tx from the pending set. When the pending set empties, the batch
 //! is evicted from the store.
 //!
-//! A hard safety horizon ([`OUTBOUND_RETENTION_MAX`]) force-evicts batches
+//! A hard safety horizon ([`RETENTION_HORIZON`]) force-evicts batches
 //! that never reach a terminal EC; this is a bug-bound, not a nominal
 //! policy — every firing indicates an upstream liveness failure and is
-//! logged at `warn!`.
+//! logged at `warn!`. The bound is principled: a tx included at the
+//! latest possible moment within its `validity_range` gets `WAVE_TIMEOUT`
+//! to terminate, so any batch unacked past `MAX_VALIDITY_RANGE +
+//! WAVE_TIMEOUT` references a tx no shard could still be processing.
 
 use crate::store::ProvisionStore;
 use hyperscale_types::{
     BlockHeight, Provision, ProvisionHash, ShardGroupId, TxHash, TxOutcome, WeightedTimestamp,
+    RETENTION_HORIZON,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
 use tracing::{debug, warn};
-
-/// Hard safety cap on outbound retention. Batches awaiting a terminal EC
-/// longer than this are evicted with a warning — indicates upstream
-/// liveness trouble (waves not finalizing, ECs not propagating).
-pub const OUTBOUND_RETENTION_MAX: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OutboundMemoryStats {
@@ -148,7 +146,7 @@ impl OutboundProvisionTracker {
     }
 
     /// Safety sweep: evict outbound batches older than
-    /// [`OUTBOUND_RETENTION_MAX`]. Fires with `warn!` — a hit indicates
+    /// [`RETENTION_HORIZON`]. Fires with `warn!` — a hit indicates
     /// the target shard never produced a terminal EC (upstream bug).
     pub fn on_block_committed(&mut self, now: WeightedTimestamp) {
         self.now = now;
@@ -157,7 +155,7 @@ impl OutboundProvisionTracker {
             .entries
             .iter()
             .filter_map(|(hash, entry)| {
-                if now.elapsed_since(entry.generated_at) > OUTBOUND_RETENTION_MAX {
+                if now.elapsed_since(entry.generated_at) > RETENTION_HORIZON {
                     Some(*hash)
                 } else {
                     None
@@ -210,6 +208,7 @@ mod tests {
     use hyperscale_types::{
         ExecutionOutcome, GlobalReceiptHash, Hash, MerkleInclusionProof, TxEntries,
     };
+    use std::time::Duration;
 
     fn ts(ms: u64) -> WeightedTimestamp {
         WeightedTimestamp::from_millis(ms)
@@ -330,7 +329,7 @@ mod tests {
         let batch_hash = batch.hash();
         tracker.on_broadcast(Arc::clone(&batch), ShardGroupId(1));
 
-        let past_max = OUTBOUND_RETENTION_MAX + Duration::from_secs(1);
+        let past_max = RETENTION_HORIZON + Duration::from_secs(1);
         tracker.on_block_committed(ts(1_000_000 + past_max.as_millis() as u64));
         assert!(store.get(&batch_hash).is_none());
         assert_eq!(tracker.memory_stats().tracked_batches, 0);

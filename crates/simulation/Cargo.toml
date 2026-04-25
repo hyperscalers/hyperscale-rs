@@ -38,4 +38,8 @@ rand_chacha.workspace = true
 # Radix dependencies for e2e tests
 radix-transactions.workspace = true
 
+# Re-import types crate with the test-utils feature so tests can share
+# `test_validity_range()` rather than redefining it per test file.
+hyperscale-types = { workspace = true, features = ["test-utils"] }
+
 tracing-test.workspace = true

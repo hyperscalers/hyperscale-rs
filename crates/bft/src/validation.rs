@@ -21,7 +21,6 @@ use hyperscale_types::{
 #[cfg(test)]
 use hyperscale_types::{
     CertificateRoot, Hash, LocalReceiptRoot, ProvisionsRoot, StateRoot, TransactionRoot,
-    WeightedTimestamp,
 };
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -181,10 +180,10 @@ pub(crate) fn validate_no_duplicate_transactions(
                 tx_hash,
             ));
         }
-        if let Some(ts) = tx_cache.tx_commit_ts(&tx_hash) {
+        if tx_cache.contains_tx(&tx_hash) {
             return Err(format!(
-                "transaction {} already committed at {}",
-                tx_hash, ts,
+                "transaction {} already committed within its validity window",
+                tx_hash,
             ));
         }
     }
@@ -486,11 +485,11 @@ mod tests {
     #[test]
     fn validate_no_duplicate_transactions_rejects_tx_cache_dup() {
         let txs = sorted_txs(&[10, 20]);
-        let dup_hash = txs[0].hash();
+        let dup_tx = Arc::clone(&txs[0]);
         let block = block_with_transactions(BlockHeight(6), txs);
         let qc_chain = HashSet::new();
         let mut tx_cache = CommittedTxCache::new();
-        tx_cache.register_committed(&[dup_hash], WeightedTimestamp(100_000));
+        tx_cache.register_committed(&[dup_tx]);
         let err = validate_no_duplicate_transactions(&block, &qc_chain, &tx_cache).unwrap_err();
         assert!(err.contains("already committed"));
     }

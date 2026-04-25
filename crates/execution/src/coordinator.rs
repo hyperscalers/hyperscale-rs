@@ -42,7 +42,7 @@ use hyperscale_types::{
     Attempt, Block, BlockHash, BlockHeight, BloomFilter, ExecutionCertificate, ExecutionVote,
     GlobalReceiptRoot, LocalExecutionEntry, NodeId, Provision, ReceiptBundle, RoutableTransaction,
     ShardGroupId, TopologySnapshot, TransactionDecision, TxHash, TxOutcome, ValidatorId,
-    WaveCertificate, WaveId, WaveIdHash, WeightedTimestamp,
+    WaveCertificate, WaveId, WaveIdHash, WeightedTimestamp, WAVE_TIMEOUT,
 };
 #[cfg(test)]
 use hyperscale_types::{ExecutionOutcome, Hash};
@@ -182,14 +182,19 @@ impl Default for ExecutionCoordinator {
     }
 }
 
-/// How long to retain committed remote provisions in `ConflictDetector` for
-/// reverse conflict detection. A local tx that hasn't registered against a
-/// stored provision after this window can't conflict with it — its own block
-/// has long committed. Anything older is dropped to bound the detector's
-/// memory and per-block iteration cost (see
-/// `ConflictDetector::prune_provisions_older_than`). Anchored on the
-/// committing QC's `weighted_timestamp_ms`.
-const CONFLICT_PROVISION_RETENTION: Duration = Duration::from_secs(30);
+// Stored provisions are pruned `WAVE_TIMEOUT` past their `committed_at`.
+// After that, the remote tx that emitted the provision is provably terminal
+// (its wave has either finalized or hit the deterministic abort path), so
+// the detector entry can no longer flag a meaningful conflict.
+//
+// `MAX_VALIDITY_RANGE` is *not* the right bound here — that governs
+// admission, not post-inclusion lifetime. Once a remote tx is in a block
+// (which is the precondition for storing its provision), the existing
+// wave/execution timeout owns its termination. Same reasoning that drives
+// `RETENTION_HORIZON`'s `MAX_VALIDITY_RANGE + WAVE_TIMEOUT` bound, just
+// applied per-stored-provision: each entry's `committed_at` already
+// accounts for the admission window, so only the post-inclusion
+// `WAVE_TIMEOUT` portion remains.
 
 /// Per-shard recipient lists for provision broadcasting.
 type ShardRecipients = HashMap<ShardGroupId, Vec<ValidatorId>>;
@@ -1269,10 +1274,12 @@ impl ExecutionCoordinator {
             wave.log_if_overdue(self.committed_ts);
         }
 
-        // Drop conflict-detector entries for remote provisions older than the
-        // retention window. `register_tx` iterates over these per cross-shard
-        // tx; left unbounded they drive quadratic TPS decay.
-        let cutoff = self.committed_ts.minus(CONFLICT_PROVISION_RETENTION);
+        // Drop conflict-detector entries past `WAVE_TIMEOUT` from their
+        // commit. `register_tx` iterates over these per cross-shard tx;
+        // left unbounded they drive quadratic TPS decay. Past the bound
+        // the remote tx is provably terminal — see the constant block
+        // above for the full reasoning.
+        let cutoff = self.committed_ts.minus(WAVE_TIMEOUT);
         if cutoff.as_millis() > 0 {
             let dropped = self.provisioning.prune_old_provisions(cutoff);
             if dropped > 0 {

@@ -17,6 +17,7 @@ pub mod config;
 pub mod genesis;
 mod latency;
 pub mod runner;
+pub mod validity;
 pub mod workloads;
 
 pub use accounts::{

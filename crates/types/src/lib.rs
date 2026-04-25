@@ -24,6 +24,7 @@ mod proofs;
 mod signing;
 mod timeouts;
 mod timestamp;
+mod timestamp_range;
 
 // Consensus types
 mod block;
@@ -102,10 +103,12 @@ pub use receipt::{
 };
 pub use signer_bitfield::SignerBitfield;
 pub use state::{StateEntry, StateProvision};
-pub use timeouts::{REMOTE_HEADER_RETENTION, WAVE_TIMEOUT};
+pub use timeouts::{REMOTE_HEADER_RETENTION, RETENTION_HORIZON, WAVE_TIMEOUT};
 pub use timestamp::{ProposerTimestamp, WeightedTimestamp};
+pub use timestamp_range::{TimestampRange, MAX_VALIDITY_RANGE};
 pub use topology::{node_id_hash_u64, shard_for_node, TopologySnapshot, TopologySnapshotError};
 pub use transaction::{
+    routable_from_notarized_v1, routable_from_notarized_v2, routable_from_user_transaction,
     sign_and_notarize, sign_and_notarize_with_options, RoutableTransaction, TransactionDecision,
     TransactionError, TransactionStatus, TransactionStatusParseError,
 };
@@ -189,7 +192,24 @@ pub mod test_utils {
         write_nodes: Vec<NodeId>,
     ) -> RoutableTransaction {
         let tx = test_notarized_transaction_v1(seed_bytes);
-        RoutableTransaction::new(UserTransaction::V1(tx), read_nodes, write_nodes)
+        RoutableTransaction::new(
+            UserTransaction::V1(tx),
+            read_nodes,
+            write_nodes,
+            test_validity_range(),
+        )
+    }
+
+    /// Validity range used for test transactions: a wide window centred on
+    /// `WeightedTimestamp::ZERO` so test fixtures don't need to thread a
+    /// real anchor through every helper. Tests that exercise expiry should
+    /// build their own range.
+    pub fn test_validity_range() -> TimestampRange {
+        use std::time::Duration;
+        TimestampRange::new(
+            WeightedTimestamp::ZERO,
+            WeightedTimestamp::ZERO.plus(Duration::from_secs(60)),
+        )
     }
 
     /// Create a simple test transaction.

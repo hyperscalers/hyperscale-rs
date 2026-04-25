@@ -661,12 +661,21 @@ impl BftCoordinator {
         // height — the two-chain commit window leaves them visible and the
         // mempool doesn't clear its ready-set until commit, so we must dedup
         // here to avoid repeating items across consecutive blocks.
-        let (parent_hash, _) = self.chain_view().proposal_parent();
+        let (parent_hash, parent_qc) = self.chain_view().proposal_parent();
         let (qc_chain_cert_hashes, qc_chain_tx_hashes, qc_chain_provision_hashes) =
             self.collect_qc_chain_hashes(parent_hash);
 
-        let transactions =
-            crate::proposal::select_transactions(ready_txs, &qc_chain_tx_hashes, &self.tx_cache);
+        // Anchor validity-window filtering on the parent QC's weighted
+        // timestamp — the deterministic clock voters will use to verify
+        // this block. The one-block lag (this block's own QC may carry a
+        // slightly later timestamp) is bounded by MAX_VALIDITY_RANGE.
+        let validity_anchor = parent_qc.weighted_timestamp;
+        let transactions = crate::proposal::select_transactions(
+            ready_txs,
+            &qc_chain_tx_hashes,
+            &self.tx_cache,
+            validity_anchor,
+        );
         let (finalized_waves, finalized_tx_count) = crate::proposal::select_finalized_waves(
             finalized_waves,
             &qc_chain_cert_hashes,
@@ -3077,14 +3086,12 @@ impl BftCoordinator {
     /// Register committed transactions for execution timeout validation.
     ///
     /// Called by the node state layer after mempool processes a committed block.
-    /// Validators use this to verify that conflicts
-    /// reference transactions that were actually committed at the claimed height.
-    pub fn register_committed_transactions(
-        &mut self,
-        tx_hashes: &[TxHash],
-        commit_ts: WeightedTimestamp,
-    ) {
-        self.tx_cache.register_committed(tx_hashes, commit_ts);
+    /// Validators use this for proposal-side dedup so a tx hash already
+    /// committed to the chain cannot be re-included while still in its
+    /// `validity_range`. Each entry's lifetime is bounded by its own
+    /// `end_timestamp_exclusive`.
+    pub fn register_committed_transactions(&mut self, transactions: &[Arc<RoutableTransaction>]) {
+        self.tx_cache.register_committed(transactions);
     }
 
     /// Remove a finalized transaction from the committed lookup.

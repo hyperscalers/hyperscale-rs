@@ -424,20 +424,29 @@ pub enum Action {
         block_height: BlockHeight,
     },
 
-    /// Verify a block's transaction root.
+    /// Verify a block's transaction root and per-tx validity windows.
     ///
     /// Computes the merkle root from the block's transactions and compares
-    /// against the block header's claimed transaction_root.
-    /// Returns `ProtocolEvent::TransactionRootVerified`.
+    /// against the header's `transaction_root`. Also checks that every tx's
+    /// `validity_range` is well-formed and contains `validity_anchor` — the
+    /// parent QC's `weighted_timestamp` carried on the block. Returns
+    /// `ProtocolEvent::BlockRootVerified { kind: TransactionRoot, valid }`;
+    /// `valid` is true iff both the merkle root matches and every tx is
+    /// in-window.
     ///
-    /// This is a pure CPU operation (no JMT dependency) so it can be verified
-    /// in parallel with state root verification.
+    /// Pure CPU; no JMT dependency.
     VerifyTransactionRoot {
         block_hash: BlockHash,
         /// Expected transaction root from block header.
         expected_root: TransactionRoot,
         /// Transactions in the block.
         transactions: Vec<Arc<RoutableTransaction>>,
+        /// Parent QC's `weighted_timestamp` — the BFT-authenticated clock
+        /// every honest validator agrees on for this block. The validity
+        /// check is `start_inclusive <= anchor < end_exclusive`. The
+        /// one-block lag (this block's own QC may carry a slightly later
+        /// timestamp) is bounded by `MAX_VALIDITY_RANGE`.
+        validity_anchor: WeightedTimestamp,
     },
 
     /// Verify a block's provisions root.

@@ -242,10 +242,14 @@ pub(crate) fn handle_delegated_action<
             block_hash,
             expected_root,
             transactions,
+            validity_anchor,
         } => {
             let start = std::time::Instant::now();
-            let valid =
-                hyperscale_bft::handlers::verify_transaction_root(expected_root, &transactions);
+            let valid = hyperscale_bft::handlers::verify_transaction_root(
+                expected_root,
+                &transactions,
+                validity_anchor,
+            );
             metrics::record_signature_verification_latency(
                 "transaction_root",
                 start.elapsed().as_secs_f64(),

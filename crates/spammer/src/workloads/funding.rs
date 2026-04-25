@@ -4,7 +4,9 @@
 //! that couldn't be included in genesis due to engine limits.
 
 use crate::accounts::{AccountPool, FundingOp};
-use hyperscale_types::{sign_and_notarize, RoutableTransaction, ShardGroupId};
+use hyperscale_types::{
+    routable_from_notarized_v1, sign_and_notarize, RoutableTransaction, ShardGroupId,
+};
 use radix_common::constants::XRD;
 use radix_common::math::Decimal;
 use radix_common::network::NetworkDefinition;
@@ -79,7 +81,10 @@ impl FundingWorkload {
                     }
                 };
 
-            let tx: RoutableTransaction = match notarized.try_into() {
+            let tx: RoutableTransaction = match routable_from_notarized_v1(
+                notarized,
+                crate::validity::validity_range_for_now(),
+            ) {
                 Ok(t) => t,
                 Err(e) => {
                     warn!(error = ?e, "Failed to convert funding transaction");

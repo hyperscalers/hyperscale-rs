@@ -8,9 +8,10 @@
 
 use hyperscale_core::{NodeInput, TransactionStatus};
 use hyperscale_simulation::{NetworkConfig, SimulationRunner};
+use hyperscale_types::test_utils::test_validity_range;
 use hyperscale_types::{
-    ed25519_keypair_from_seed, shard_for_node, sign_and_notarize, Ed25519PrivateKey, NodeId,
-    RoutableTransaction, ShardGroupId, TransactionDecision,
+    ed25519_keypair_from_seed, routable_from_notarized_v1, shard_for_node, sign_and_notarize,
+    Ed25519PrivateKey, NodeId, RoutableTransaction, ShardGroupId, TransactionDecision,
 };
 use radix_common::constants::XRD;
 use radix_common::math::Decimal;
@@ -96,7 +97,7 @@ fn cross_shard_transfer(
         .try_deposit_entire_worktop_or_abort(to, None)
         .build();
     let notarized = sign_and_notarize(manifest, &network(), nonce, signer).expect("sign");
-    notarized.try_into().expect("valid tx")
+    routable_from_notarized_v1(notarized, test_validity_range()).expect("valid tx")
 }
 
 /// Poll until a transaction reaches a terminal status or the iteration limit.

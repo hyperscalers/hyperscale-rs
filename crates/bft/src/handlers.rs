@@ -235,14 +235,29 @@ pub fn verify_provision_root(expected_root: ProvisionsRoot, batch_hashes: &[Hash
     valid
 }
 
+/// Verify a block's transaction root and per-tx validity windows.
+///
+/// Two checks, both load-bearing for block validity:
+///
+/// 1. The merkle root of `transactions` matches `expected_root`.
+/// 2. Every tx's `validity_range` is well-formed against `validity_anchor`
+///    AND contains it. `validity_anchor` is the parent QC's
+///    `weighted_timestamp` — the BFT-authenticated clock every honest
+///    validator agrees on for this block. The check is the same expression
+///    the proposer applied during selection, so an honest cluster never
+///    sees this fail; a malicious proposer that included an expired tx
+///    has the block rejected.
+///
+/// Half-open semantics: `start_inclusive <= anchor < end_exclusive`.
 pub fn verify_transaction_root(
     expected_root: TransactionRoot,
     transactions: &[Arc<RoutableTransaction>],
+    validity_anchor: WeightedTimestamp,
 ) -> bool {
     let computed_root = compute_transaction_root(transactions);
-    let valid = computed_root == expected_root;
+    let root_valid = computed_root == expected_root;
 
-    if !valid {
+    if !root_valid {
         tracing::warn!(
             ?expected_root,
             ?computed_root,
@@ -251,7 +266,23 @@ pub fn verify_transaction_root(
         );
     }
 
-    valid
+    let mut windows_valid = true;
+    for tx in transactions {
+        if !tx.validity_range.is_well_formed(validity_anchor)
+            || !tx.validity_range.contains(validity_anchor)
+        {
+            tracing::warn!(
+                tx_hash = ?tx.hash(),
+                anchor_ms = validity_anchor.as_millis(),
+                start_ms = tx.validity_range.start_timestamp_inclusive.as_millis(),
+                end_ms = tx.validity_range.end_timestamp_exclusive.as_millis(),
+                "Transaction validity range check FAILED"
+            );
+            windows_valid = false;
+        }
+    }
+
+    root_valid && windows_valid
 }
 
 /// Verify a block's per-target-shard provision-batch commitments.
@@ -808,11 +839,72 @@ mod tests {
     fn verify_transaction_root_accepts_matching_root_and_rejects_otherwise() {
         let txs: Vec<Arc<RoutableTransaction>> = Vec::new();
         let root = compute_transaction_root(&txs);
-        assert!(verify_transaction_root(root, &txs));
+        let anchor = WeightedTimestamp::ZERO;
+        assert!(verify_transaction_root(root, &txs, anchor));
         assert!(!verify_transaction_root(
             TransactionRoot::from_raw(Hash::from_bytes(b"wrong")),
-            &txs
+            &txs,
+            anchor,
         ));
+    }
+
+    #[test]
+    fn verify_transaction_root_rejects_expired_tx() {
+        use hyperscale_types::test_utils::test_notarized_transaction_v1;
+        use hyperscale_types::{routable_from_notarized_v1, TimestampRange};
+        use std::time::Duration;
+
+        let anchor = WeightedTimestamp::from_millis(100_000);
+        // Range ends at 1_000ms — anchor at 100_000ms is well past
+        // end_timestamp_exclusive, so the tx is expired.
+        let expired_range = TimestampRange::new(
+            WeightedTimestamp::ZERO,
+            WeightedTimestamp::from_millis(1_000),
+        );
+        let notarized = test_notarized_transaction_v1(&[1]);
+        let tx = Arc::new(
+            routable_from_notarized_v1(notarized, expired_range).expect("valid notarized fixture"),
+        );
+        let txs = vec![tx];
+        let root = compute_transaction_root(&txs);
+
+        // Merkle root matches but the tx is expired — verification fails.
+        assert!(!verify_transaction_root(root, &txs, anchor));
+
+        // Same root, anchor inside the range — verification passes.
+        let valid_range = TimestampRange::new(anchor, anchor.plus(Duration::from_secs(60)));
+        let notarized2 = test_notarized_transaction_v1(&[2]);
+        let tx2 = Arc::new(
+            routable_from_notarized_v1(notarized2, valid_range).expect("valid notarized fixture"),
+        );
+        let txs2 = vec![tx2];
+        let root2 = compute_transaction_root(&txs2);
+        assert!(verify_transaction_root(root2, &txs2, anchor));
+    }
+
+    #[test]
+    fn verify_transaction_root_rejects_malformed_range() {
+        use hyperscale_types::test_utils::test_notarized_transaction_v1;
+        use hyperscale_types::{routable_from_notarized_v1, TimestampRange};
+        use std::time::Duration;
+
+        let anchor = WeightedTimestamp::from_millis(1_000);
+        // Length over MAX_VALIDITY_RANGE.
+        let too_wide = TimestampRange::new(
+            WeightedTimestamp::ZERO,
+            anchor.plus(Duration::from_secs(10 * 60)),
+        );
+        let notarized = test_notarized_transaction_v1(&[3]);
+        let tx = Arc::new(
+            routable_from_notarized_v1(notarized, too_wide).expect("valid notarized fixture"),
+        );
+        let txs = vec![tx];
+        let root = compute_transaction_root(&txs);
+
+        assert!(
+            !verify_transaction_root(root, &txs, anchor),
+            "malformed range must reject even when merkle root matches"
+        );
     }
 
     #[test]

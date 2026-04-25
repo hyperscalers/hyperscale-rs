@@ -24,8 +24,6 @@
 //!    `add_execution_certificate`. When every tx is covered (or aborted, which
 //!    is terminal-covered), the wave is complete and ready for finalization.
 
-#[cfg(test)]
-use hyperscale_types::Hash;
 use hyperscale_types::{
     compute_execution_receipt_root, BlockHash, BlockHeight, ExecutionCertificate,
     ExecutionCertificateHash, ExecutionOutcome, GlobalReceiptRoot, ReceiptBundle,
@@ -36,10 +34,16 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Age at which a still-alive wave emits a single diagnostic warning. Set
-/// past `WAVE_TIMEOUT` so waves resolving via the normal timeout-abort path
-/// (including cross-shard cert gossip) pass silently; only genuinely-wedged
-/// waves surface.
+/// Age at which a still-alive wave emits a single diagnostic warning.
+///
+/// Under the two-stage lifecycle (windows gate admission, the wave/execution
+/// timeout owns termination), every tx is supposed to terminate with a
+/// `WaveCertificate` — success via vote aggregation or abort via the
+/// deterministic all-abort fallback. The threshold is set past
+/// `WAVE_TIMEOUT` so waves resolving via the normal abort path
+/// (including cross-shard cert gossip) pass silently. If a wave reaches
+/// this age, the post-inclusion termination guarantee has failed and the
+/// dump is invariant-violation diagnostics, not routine load noise.
 pub const WAVE_OVERDUE_WARN: Duration = Duration::from_secs(WAVE_TIMEOUT.as_secs() * 2);
 
 /// Per-wave state across the entire execution lifecycle.
@@ -537,11 +541,13 @@ impl WaveState {
     }
 
     /// Emit a `warn!` log exactly once, when the wave reaches
-    /// `WAVE_OVERDUE_WARN` of age without completing. Dumps enough state to
-    /// diagnose what phase it's stuck in (provisioning / dispatch / voting /
-    /// EC collection). Called once per committed block per surviving wave;
-    /// we latch the warning at the first crossing of the threshold using
-    /// tick-transition detection by the caller.
+    /// `WAVE_OVERDUE_WARN` of age without completing. A firing here is an
+    /// invariant violation under the two-stage lifecycle — every tx is
+    /// supposed to terminate with a `WaveCertificate` — so the dump
+    /// captures enough state to diagnose where the post-inclusion
+    /// termination guarantee broke (provisioning / dispatch / voting /
+    /// EC collection). Latched at the first crossing of the threshold so
+    /// it fires once per stuck wave, not once per surviving commit.
     pub fn log_if_overdue(&mut self, committed_ts: WeightedTimestamp) {
         if self.overdue_warned {
             return;
@@ -668,7 +674,8 @@ mod tests {
     use super::*;
     use hyperscale_types::{
         test_utils::{test_node, test_transaction_with_nodes},
-        Bls12381G2Signature, GlobalReceiptHash, LocalReceipt, SignerBitfield, TransactionOutcome,
+        Bls12381G2Signature, GlobalReceiptHash, Hash, LocalReceipt, SignerBitfield,
+        TransactionOutcome,
     };
 
     const WAVE_START: BlockHeight = BlockHeight(10);

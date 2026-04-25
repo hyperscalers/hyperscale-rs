@@ -2,7 +2,7 @@
 
 use crate::lock_tracker::LockTracker;
 use crate::ready_set::ReadySet;
-use crate::tombstones::{TombstoneStore, TOMBSTONE_RETENTION, TRANSACTION_RETENTION};
+use crate::tombstones::TombstoneStore;
 use hyperscale_core::{Action, FinalizationPhaseTimes, TransactionStatus};
 use hyperscale_types::{
     BlockHeight, BloomFilter, CertifiedBlock, NodeId, RoutableTransaction, TopologySnapshot,
@@ -372,10 +372,21 @@ impl MempoolCoordinator {
 
         // Move transaction body into the evicted cache so slow peers can
         // still fetch it, and tombstone the hash to block re-insertion.
+        // Both entries expire at the tx's `end_timestamp_exclusive` —
+        // past that, validity check rejects re-submission anyway.
         if let Some(entry) = self.pool.remove(&tx_hash) {
-            self.tombstones.evict(entry.tx, self.current_ts);
+            let end = entry.tx.validity_range.end_timestamp_exclusive;
+            self.tombstones.evict(entry.tx);
+            self.tombstones.tombstone(tx_hash, end);
+        } else {
+            // No body — tombstone with whatever expiry we can reconstruct.
+            // In practice this branch is unreachable today (callers always
+            // tombstone via `evict_terminal` after a successful pool lookup),
+            // but the safety net stays so a future caller can't accidentally
+            // tombstone a hash with no expiry. Use `current_ts` so the entry
+            // is dropped on the very next prune sweep.
+            self.tombstones.tombstone(tx_hash, self.current_ts);
         }
-        self.tombstones.tombstone(tx_hash, self.current_ts);
     }
 
     /// Check if a transaction hash is tombstoned (reached terminal state).
@@ -383,10 +394,9 @@ impl MempoolCoordinator {
         self.tombstones.is_tombstoned(tx_hash)
     }
 
-    /// Drop evicted-cache entries that have aged out of the retention window.
+    /// Drop evicted-cache entries past their `end_timestamp_exclusive`.
     fn prune_recently_evicted(&mut self) {
-        self.tombstones
-            .prune_evicted(TRANSACTION_RETENTION, self.current_ts);
+        self.tombstones.prune_evicted(self.current_ts);
     }
 
     /// Process a committed block - update statuses and finalize transactions.
@@ -901,21 +911,16 @@ impl MempoolCoordinator {
             .collect()
     }
 
-    /// Clean up old tombstones using the default retention window.
-    pub fn cleanup_default_tombstones(&mut self) -> usize {
-        self.cleanup_old_tombstones(TOMBSTONE_RETENTION)
-    }
-
-    /// Clean up old tombstones to prevent unbounded memory growth.
+    /// Drop tombstones whose `end_timestamp_exclusive <= current_ts`.
     ///
-    /// Tombstones are kept for `retention` after creation to ensure gossip
-    /// propagation has completed. After that, they can be safely removed since
-    /// any late-arriving gossip for a very old transaction is likely stale
-    /// anyway. Anchored on `current_ts` (updated in `on_block_committed`).
+    /// Past `end_timestamp_exclusive`, the validator-side validity check
+    /// rejects any re-submission of the tx, so the tombstone is no longer
+    /// load-bearing for correctness — it becomes a pure perf optimisation.
+    /// Anchored on `current_ts` (updated in `on_block_committed`).
     ///
-    /// Returns the number of tombstones cleaned up.
-    pub fn cleanup_old_tombstones(&mut self, retention: Duration) -> usize {
-        self.tombstones.prune_tombstones(retention, self.current_ts)
+    /// Returns the number of tombstones dropped.
+    pub fn cleanup_expired_tombstones(&mut self) -> usize {
+        self.tombstones.prune_tombstones(self.current_ts)
     }
 
     /// Get the number of tombstones currently tracked.

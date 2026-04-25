@@ -17,7 +17,7 @@
 use hyperscale_core::Action;
 use hyperscale_types::{
     BlockHash, BlockHeight, FinalizedWave, ProposerTimestamp, Provision, ProvisionHash, Round,
-    RoutableTransaction, TopologySnapshot, TxHash, WaveIdHash,
+    RoutableTransaction, TopologySnapshot, TxHash, WaveIdHash, WeightedTimestamp,
 };
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -145,32 +145,52 @@ impl ProposalTracker {
 // Payload selection
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Filter ready transactions for proposal inclusion: drop those already in
-/// the QC chain (ancestors in the two-chain window) and those in the
-/// retention-backed committed-tx cache (historically-committed hashes that
-/// survive past mempool eviction — critical after sync). Logs the dedup
-/// count when it is non-zero.
+/// Filter ready transactions for proposal inclusion. Drops, in this order:
+///
+/// 1. Txs already in the QC chain (ancestors in the two-chain window) or the
+///    retention-backed committed-tx cache (historically-committed hashes that
+///    survive past mempool eviction — critical after sync).
+/// 2. Txs whose `validity_range` is malformed against `validity_anchor`, or
+///    whose half-open range does not contain `validity_anchor`. This is the
+///    same expression voters apply during block verification, anchored on
+///    the parent QC's weighted_timestamp; filtering here saves us from
+///    proposing blocks that will be rejected.
+///
+/// Logs the dedup and expiry counts when non-zero.
 pub(crate) fn select_transactions(
     ready_txs: &[Arc<RoutableTransaction>],
     qc_chain_tx_hashes: &HashSet<TxHash>,
     tx_cache: &CommittedTxCache,
+    validity_anchor: WeightedTimestamp,
 ) -> Vec<Arc<RoutableTransaction>> {
     let before = ready_txs.len();
+    let mut deduped = 0;
+    let mut expired = 0;
     let filtered: Vec<_> = ready_txs
         .iter()
         .filter(|tx| {
             let h = tx.hash();
-            !qc_chain_tx_hashes.contains(&h) && !tx_cache.contains_tx(&h)
+            if qc_chain_tx_hashes.contains(&h) || tx_cache.contains_tx(&h) {
+                deduped += 1;
+                return false;
+            }
+            if !tx.validity_range.is_well_formed(validity_anchor)
+                || !tx.validity_range.contains(validity_anchor)
+            {
+                expired += 1;
+                return false;
+            }
+            true
         })
         .cloned()
         .collect();
-    let deduped = before - filtered.len();
-    if deduped > 0 {
+    if deduped > 0 || expired > 0 {
         debug!(
             deduped,
+            expired,
             before,
             after = filtered.len(),
-            "Filtered transactions already in QC chain or committed"
+            "Filtered proposal candidates"
         );
     }
     filtered
@@ -475,5 +495,109 @@ mod tests {
 
         assert!(tracker.deferred().is_none());
         assert!(tracker.pending().is_some());
+    }
+
+    // ─── select_transactions: validity-window filter ───────────────────
+
+    use hyperscale_types::test_utils::test_notarized_transaction_v1;
+    use hyperscale_types::{routable_from_notarized_v1, TimestampRange};
+
+    fn ts(ms: u64) -> WeightedTimestamp {
+        WeightedTimestamp::from_millis(ms)
+    }
+
+    fn tx_with_range(seed: u8, range: TimestampRange) -> Arc<RoutableTransaction> {
+        let notarized = test_notarized_transaction_v1(&[seed]);
+        Arc::new(routable_from_notarized_v1(notarized, range).expect("valid notarized"))
+    }
+
+    fn empty_tx_cache() -> CommittedTxCache {
+        CommittedTxCache::new()
+    }
+
+    #[test]
+    fn select_transactions_drops_expired_txs() {
+        // Anchor in the future of the tx's range.
+        let anchor = ts(100_000);
+        let expired_range = TimestampRange::new(ts(0), ts(1_000));
+        let valid_range = TimestampRange::new(anchor, anchor.plus(Duration::from_secs(60)));
+
+        let txs = vec![
+            tx_with_range(1, expired_range),
+            tx_with_range(2, valid_range),
+        ];
+
+        let selected = select_transactions(&txs, &HashSet::new(), &empty_tx_cache(), anchor);
+
+        assert_eq!(selected.len(), 1, "only the in-range tx should survive");
+        assert_eq!(selected[0].hash(), txs[1].hash());
+    }
+
+    #[test]
+    fn select_transactions_drops_not_yet_valid_txs() {
+        // Anchor sits before the tx's start.
+        let anchor = ts(50);
+        let future_range = TimestampRange::new(ts(1_000), ts(60_000));
+        let txs = vec![tx_with_range(3, future_range)];
+
+        let selected = select_transactions(&txs, &HashSet::new(), &empty_tx_cache(), anchor);
+
+        assert!(
+            selected.is_empty(),
+            "tx whose start is past anchor should be filtered"
+        );
+    }
+
+    #[test]
+    fn select_transactions_drops_malformed_ranges() {
+        let anchor = ts(1_000);
+        // Length over MAX_VALIDITY_RANGE (5 min).
+        let too_wide = TimestampRange::new(ts(0), anchor.plus(Duration::from_secs(10 * 60)));
+        let txs = vec![tx_with_range(4, too_wide)];
+
+        let selected = select_transactions(&txs, &HashSet::new(), &empty_tx_cache(), anchor);
+
+        assert!(selected.is_empty(), "malformed range should be filtered");
+    }
+
+    #[test]
+    fn select_transactions_drops_at_upper_bound_exclusive() {
+        // Half-open: end_timestamp_exclusive == anchor must be filtered.
+        let anchor = ts(1_000);
+        let range = TimestampRange::new(ts(500), anchor); // [500, 1000)
+        let txs = vec![tx_with_range(5, range)];
+
+        let selected = select_transactions(&txs, &HashSet::new(), &empty_tx_cache(), anchor);
+
+        assert!(
+            selected.is_empty(),
+            "anchor == end_exclusive must be excluded (half-open)"
+        );
+    }
+
+    #[test]
+    fn select_transactions_keeps_at_lower_bound_inclusive() {
+        // Half-open: start_timestamp_inclusive == anchor must be kept.
+        let anchor = ts(1_000);
+        let range = TimestampRange::new(anchor, anchor.plus(Duration::from_secs(60)));
+        let txs = vec![tx_with_range(6, range)];
+
+        let selected = select_transactions(&txs, &HashSet::new(), &empty_tx_cache(), anchor);
+
+        assert_eq!(selected.len(), 1, "anchor == start_inclusive must be kept");
+    }
+
+    #[test]
+    fn select_transactions_dedup_short_circuits_validity_check() {
+        // Tx in QC chain — should be dropped without consulting the
+        // validity range. We pass an obviously-invalid range to confirm.
+        let anchor = ts(100_000);
+        let any_range = TimestampRange::new(ts(0), ts(1_000));
+        let tx = tx_with_range(7, any_range);
+        let mut chain = HashSet::new();
+        chain.insert(tx.hash());
+
+        let selected = select_transactions(&[tx], &chain, &empty_tx_cache(), anchor);
+        assert!(selected.is_empty());
     }
 }

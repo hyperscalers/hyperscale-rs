@@ -2,35 +2,38 @@
 //!
 //! Two concerns sharing a lifecycle:
 //!
-//! - **Tombstones** (`tx_hash → insertion_ts`) stop gossip from re-adding
-//!   transactions that have already reached a terminal state (Completed,
-//!   Aborted).
-//! - **Recently-evicted bodies** (`tx_hash → (tx, eviction_ts)`) retain
-//!   the transaction payload after eviction so slow peers can still fetch it.
+//! - **Tombstones** (`tx_hash → end_timestamp_exclusive`) stop gossip from
+//!   re-adding transactions that have already reached a terminal state
+//!   (Completed, Aborted).
+//! - **Recently-evicted bodies** (`tx_hash → (tx, end_timestamp_exclusive)`)
+//!   retain the transaction payload after eviction so slow peers can still
+//!   fetch it.
 //!
-//! Retention windows are anchored on the BFT-authenticated weighted timestamp
-//! of the last committed block, so behavior is deterministic across validators
-//! regardless of block cadence.
+//! Retention is `end_timestamp_exclusive`-derived: an entry is dropped once
+//! the latest committed `WeightedTimestamp` reaches the tx's
+//! `end_timestamp_exclusive`. Past that point, even a re-submission would be
+//! rejected by block validity (validator-side check on `validity_range`),
+//! so the tombstone is no longer needed for correctness — it becomes a pure
+//! perf optimisation. The maximum age of any entry is bounded by
+//! `MAX_VALIDITY_RANGE` because admission requires
+//! `end_timestamp_exclusive <= anchor + MAX_VALIDITY_RANGE`.
+//!
+//! Anchored on the BFT-authenticated weighted timestamp of the last committed
+//! block, so behavior is deterministic across validators regardless of block
+//! cadence.
 
 #[cfg(test)]
 use hyperscale_types::Hash;
 use hyperscale_types::{RoutableTransaction, TxHash, WeightedTimestamp};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
-
-/// How long to retain evicted transactions for peer fetch requests. Allows
-/// slow validators to catch up and fetch transactions from peers even after
-/// the transaction has reached a terminal state.
-pub(crate) const TRANSACTION_RETENTION: Duration = Duration::from_secs(30);
-
-/// How long to retain tombstones. Paired with BFT's `COMMITTED_TX_RETENTION`
-/// — both must cover the longest plausible late-gossip window so stale
-/// transactions don't get re-accepted.
-pub(crate) const TOMBSTONE_RETENTION: Duration = Duration::from_secs(300);
 
 pub(crate) struct TombstoneStore {
+    /// `tx_hash → end_timestamp_exclusive`. Pruned when
+    /// `end_timestamp_exclusive <= current_committed_ts`.
     tombstones: HashMap<TxHash, WeightedTimestamp>,
+    /// `tx_hash → (body, end_timestamp_exclusive)`. Same lifetime as the
+    /// matching tombstone so peer fetches and dedup expire together.
     recently_evicted: HashMap<TxHash, (Arc<RoutableTransaction>, WeightedTimestamp)>,
 }
 
@@ -42,9 +45,10 @@ impl TombstoneStore {
         }
     }
 
-    /// Record `tx_hash` as tombstoned at `now`.
-    pub fn tombstone(&mut self, tx_hash: TxHash, now: WeightedTimestamp) {
-        self.tombstones.insert(tx_hash, now);
+    /// Record `tx_hash` as tombstoned. `end_timestamp_exclusive` comes from
+    /// the tx's `validity_range` and bounds the entry's lifetime.
+    pub fn tombstone(&mut self, tx_hash: TxHash, end_timestamp_exclusive: WeightedTimestamp) {
+        self.tombstones.insert(tx_hash, end_timestamp_exclusive);
     }
 
     /// Whether `tx_hash` has been tombstoned.
@@ -53,10 +57,12 @@ impl TombstoneStore {
     }
 
     /// Move a transaction body into the evicted cache under its own hash.
-    /// Callers typically pair this with [`tombstone`](Self::tombstone).
-    pub fn evict(&mut self, tx: Arc<RoutableTransaction>, now: WeightedTimestamp) {
+    /// Reads `validity_range.end_timestamp_exclusive` from the tx so the
+    /// entry expires alongside its tombstone.
+    pub fn evict(&mut self, tx: Arc<RoutableTransaction>) {
         let hash = tx.hash();
-        self.recently_evicted.insert(hash, (tx, now));
+        let end = tx.validity_range.end_timestamp_exclusive;
+        self.recently_evicted.insert(hash, (tx, end));
     }
 
     /// Look up an evicted transaction body by hash.
@@ -66,19 +72,21 @@ impl TombstoneStore {
             .map(|(tx, _)| Arc::clone(tx))
     }
 
-    /// Drop tombstones older than `retention`, anchored on `now`. Returns
-    /// the number of entries removed.
-    pub fn prune_tombstones(&mut self, retention: Duration, now: WeightedTimestamp) -> usize {
-        let cutoff = now.minus(retention);
+    /// Drop tombstones whose `end_timestamp_exclusive <= now`. Returns the
+    /// number of entries removed. Past expiry, the validator-side validity
+    /// check rejects any re-submission, so the tombstone is no longer
+    /// load-bearing for correctness.
+    pub fn prune_tombstones(&mut self, now: WeightedTimestamp) -> usize {
         let before = self.tombstones.len();
-        self.tombstones.retain(|_, ts| *ts > cutoff);
+        self.tombstones.retain(|_, end| *end > now);
         before - self.tombstones.len()
     }
 
-    /// Drop evicted entries older than `retention`, anchored on `now`.
-    pub fn prune_evicted(&mut self, retention: Duration, now: WeightedTimestamp) {
-        let cutoff = now.minus(retention);
-        self.recently_evicted.retain(|_, (_, ts)| *ts > cutoff);
+    /// Drop evicted entries whose `end_timestamp_exclusive <= now`. Symmetric
+    /// to `prune_tombstones` — peers cannot include the tx anywhere past
+    /// expiry, so retaining the body is wasted memory.
+    pub fn prune_evicted(&mut self, now: WeightedTimestamp) {
+        self.recently_evicted.retain(|_, (_, end)| *end > now);
     }
 
     pub fn len_tombstones(&self) -> usize {
@@ -100,10 +108,14 @@ impl TombstoneStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hyperscale_types::test_utils::test_transaction;
+    use hyperscale_types::test_utils::test_notarized_transaction_v1;
+    use hyperscale_types::{routable_from_notarized_v1, TimestampRange};
 
-    fn tx_arc(seed: u8) -> Arc<RoutableTransaction> {
-        Arc::new(test_transaction(seed))
+    /// Build a test tx whose `validity_range.end_timestamp_exclusive == end`.
+    fn tx_with_end(seed: u8, end_ms: u64) -> Arc<RoutableTransaction> {
+        let notarized = test_notarized_transaction_v1(&[seed]);
+        let range = TimestampRange::new(WeightedTimestamp::ZERO, WeightedTimestamp(end_ms));
+        Arc::new(routable_from_notarized_v1(notarized, range).expect("valid notarized fixture"))
     }
 
     #[test]
@@ -127,9 +139,9 @@ mod tests {
     #[test]
     fn evict_then_get_evicted_round_trips_the_body() {
         let mut store = TombstoneStore::new();
-        let tx = tx_arc(1);
+        let tx = tx_with_end(1, 60_000);
         let hash = tx.hash();
-        store.evict(Arc::clone(&tx), WeightedTimestamp(500));
+        store.evict(Arc::clone(&tx));
 
         let got = store.get_evicted(&hash).expect("body present");
         assert_eq!(got.hash(), hash);
@@ -141,41 +153,41 @@ mod tests {
         // Evicting does not tombstone, and vice versa. The coordinator pairs
         // them deliberately; the store does not.
         let mut store = TombstoneStore::new();
-        let tx = tx_arc(2);
+        let tx = tx_with_end(2, 60_000);
         let hash = tx.hash();
+        let end = tx.validity_range.end_timestamp_exclusive;
 
-        store.evict(Arc::clone(&tx), WeightedTimestamp(100));
+        store.evict(Arc::clone(&tx));
         assert!(!store.is_tombstoned(&hash));
         assert_eq!(store.len_tombstones(), 0);
 
-        store.tombstone(hash, WeightedTimestamp(100));
+        store.tombstone(hash, end);
         assert!(store.is_tombstoned(&hash));
         assert_eq!(store.len_tombstones(), 1);
         assert_eq!(store.len_evicted(), 1);
     }
 
     #[test]
-    fn prune_tombstones_drops_entries_older_than_retention() {
+    fn prune_tombstones_drops_entries_past_their_end_exclusive() {
         let mut store = TombstoneStore::new();
         store.tombstone(
             TxHash::from_raw(Hash::from_bytes(b"old")),
             WeightedTimestamp(100),
         );
         store.tombstone(
-            TxHash::from_raw(Hash::from_bytes(b"recent")),
+            TxHash::from_raw(Hash::from_bytes(b"future")),
             WeightedTimestamp(900),
         );
 
-        // At now=1000 with retention=500ms: cutoff=500, "old" (100) dropped,
-        // "recent" (900) kept.
-        let removed = store.prune_tombstones(Duration::from_millis(500), WeightedTimestamp(1_000));
+        // At now=500: "old" (end=100) is past expiry, "future" (end=900) survives.
+        let removed = store.prune_tombstones(WeightedTimestamp(500));
         assert_eq!(removed, 1);
         assert!(!store.is_tombstoned(&TxHash::from_raw(Hash::from_bytes(b"old"))));
-        assert!(store.is_tombstoned(&TxHash::from_raw(Hash::from_bytes(b"recent"))));
+        assert!(store.is_tombstoned(&TxHash::from_raw(Hash::from_bytes(b"future"))));
     }
 
     #[test]
-    fn prune_tombstones_with_zero_retention_clears_everything() {
+    fn prune_tombstones_far_in_future_clears_everything() {
         let mut store = TombstoneStore::new();
         store.tombstone(
             TxHash::from_raw(Hash::from_bytes(b"a")),
@@ -186,39 +198,38 @@ mod tests {
             WeightedTimestamp(200),
         );
 
-        let removed = store.prune_tombstones(Duration::ZERO, WeightedTimestamp(1_000));
+        let removed = store.prune_tombstones(WeightedTimestamp(1_000));
         assert_eq!(removed, 2);
         assert_eq!(store.len_tombstones(), 0);
     }
 
     #[test]
-    fn prune_evicted_drops_old_bodies() {
+    fn prune_evicted_drops_bodies_past_their_end_exclusive() {
         let mut store = TombstoneStore::new();
-        let old_tx = tx_arc(10);
-        let recent_tx = tx_arc(11);
-        let old_hash = old_tx.hash();
-        let recent_hash = recent_tx.hash();
+        let early_tx = tx_with_end(10, 100);
+        let later_tx = tx_with_end(11, 900);
+        let early_hash = early_tx.hash();
+        let later_hash = later_tx.hash();
 
-        store.evict(old_tx, WeightedTimestamp(100));
-        store.evict(recent_tx, WeightedTimestamp(900));
+        store.evict(early_tx);
+        store.evict(later_tx);
 
-        store.prune_evicted(Duration::from_millis(500), WeightedTimestamp(1_000));
-        assert!(store.get_evicted(&old_hash).is_none());
-        assert!(store.get_evicted(&recent_hash).is_some());
+        // At now=500: early (end=100) is past expiry, later (end=900) survives.
+        store.prune_evicted(WeightedTimestamp(500));
+        assert!(store.get_evicted(&early_hash).is_none());
+        assert!(store.get_evicted(&later_hash).is_some());
     }
 
     #[test]
-    fn prune_respects_strict_greater_than_cutoff() {
-        // Entries whose ts equals the cutoff are dropped (retain keeps
-        // `ts > cutoff`). Documents the boundary so tests elsewhere don't
-        // silently depend on the opposite.
+    fn prune_drops_entries_at_exact_end_exclusive() {
+        // Half-open semantics: end_timestamp_exclusive == now means past
+        // expiry. retain keeps `end > now`.
         let mut store = TombstoneStore::new();
         store.tombstone(
-            TxHash::from_raw(Hash::from_bytes(b"at_cutoff")),
+            TxHash::from_raw(Hash::from_bytes(b"at_end")),
             WeightedTimestamp(500),
         );
-        // now=1000, retention=500ms → cutoff=500 → entry at 500 is dropped.
-        let removed = store.prune_tombstones(Duration::from_millis(500), WeightedTimestamp(1_000));
+        let removed = store.prune_tombstones(WeightedTimestamp(500));
         assert_eq!(removed, 1);
     }
 }

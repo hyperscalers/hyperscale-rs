@@ -13,8 +13,10 @@
 
 use hyperscale_core::{NodeInput, TransactionStatus};
 use hyperscale_simulation::{NetworkConfig, SimulationRunner};
+use hyperscale_types::test_utils::test_validity_range;
 use hyperscale_types::{
-    ed25519_keypair_from_seed, sign_and_notarize, Ed25519PrivateKey, RoutableTransaction,
+    ed25519_keypair_from_seed, routable_from_notarized_v1, sign_and_notarize, Ed25519PrivateKey,
+    RoutableTransaction,
 };
 use radix_common::constants::XRD;
 use radix_common::crypto::Ed25519PublicKey;
@@ -93,7 +95,8 @@ fn test_single_shard_unaffected_by_backpressure() {
 
     let notarized = sign_and_notarize(manifest, &simulator_network(), 1, &keypair)
         .expect("should sign transaction");
-    let transaction: RoutableTransaction = notarized.try_into().expect("valid transaction");
+    let transaction: RoutableTransaction =
+        routable_from_notarized_v1(notarized, test_validity_range()).expect("valid transaction");
     let tx_hash = transaction.hash();
 
     // Submit via event
@@ -159,7 +162,8 @@ fn test_provision_coordinator_tracking() {
 
     let notarized = sign_and_notarize(manifest, &simulator_network(), 2, &keypair)
         .expect("should sign transaction");
-    let transaction: RoutableTransaction = notarized.try_into().expect("valid transaction");
+    let transaction: RoutableTransaction =
+        routable_from_notarized_v1(notarized, test_validity_range()).expect("valid transaction");
     let tx_hash = transaction.hash();
     let is_cross_shard = transaction.is_cross_shard(2);
 
@@ -224,7 +228,9 @@ fn test_mempool_backpressure_integration() {
 
         let notarized = sign_and_notarize(manifest, &simulator_network(), 3 + i as u32, &keypair)
             .expect("should sign transaction");
-        let transaction: RoutableTransaction = notarized.try_into().expect("valid transaction");
+        let transaction: RoutableTransaction =
+            routable_from_notarized_v1(notarized, test_validity_range())
+                .expect("valid transaction");
 
         runner.schedule_initial_event(
             0,
@@ -375,7 +381,8 @@ fn test_completed_tx_cleanup() {
 
     let notarized = sign_and_notarize(manifest, &simulator_network(), 4, &keypair)
         .expect("should sign transaction");
-    let transaction: RoutableTransaction = notarized.try_into().expect("valid transaction");
+    let transaction: RoutableTransaction =
+        routable_from_notarized_v1(notarized, test_validity_range()).expect("valid transaction");
     let tx_hash = transaction.hash();
 
     runner.schedule_initial_event(

@@ -224,8 +224,10 @@ impl NodeStateMachine {
         // meaning the network has progressed but we're stuck.
         actions.extend(self.bft.check_sync_health(self.topology.snapshot()));
 
-        // Clean up old tombstones in mempool to prevent unbounded memory growth.
-        self.mempool.cleanup_default_tombstones();
+        // Drop tombstones whose `end_timestamp_exclusive` has passed —
+        // past expiry, validator-side validity check rejects re-submission
+        // anyway, so the tombstone is no longer correctness-bearing.
+        self.mempool.cleanup_expired_tombstones();
 
         actions
     }
@@ -329,15 +331,11 @@ impl NodeStateMachine {
         let mut actions = Vec::new();
         let block_hash = certified.block.hash();
 
-        // Register committed tx hashes with BFT for timeout abort validation.
-        let tx_hashes: Vec<TxHash> = certified
-            .block
-            .transactions()
-            .iter()
-            .map(|tx| tx.hash())
-            .collect();
+        // Register committed transactions with BFT for proposal dedup.
+        // The tx_cache reads each tx's `validity_range.end_timestamp_exclusive`
+        // to bound its own retention.
         self.bft
-            .register_committed_transactions(&tx_hashes, certified.qc.weighted_timestamp);
+            .register_committed_transactions(certified.block.transactions());
 
         // Mark this block as a usable parent for child state-root verifications.
         // By the time BlockCommitted fires, the block's JMT snapshot is in

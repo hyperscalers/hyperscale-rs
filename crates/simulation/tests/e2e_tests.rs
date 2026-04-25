@@ -12,9 +12,10 @@
 
 use hyperscale_core::{NodeInput, TransactionStatus};
 use hyperscale_simulation::{NetworkConfig, SimulationRunner};
+use hyperscale_types::test_utils::test_validity_range;
 use hyperscale_types::{
-    ed25519_keypair_from_seed, shard_for_node, sign_and_notarize, BlockHeight, Ed25519PrivateKey,
-    NodeId, RoutableTransaction, ShardGroupId,
+    ed25519_keypair_from_seed, routable_from_notarized_v1, shard_for_node, sign_and_notarize,
+    BlockHeight, Ed25519PrivateKey, NodeId, RoutableTransaction, ShardGroupId,
 };
 use radix_common::constants::XRD;
 use radix_common::crypto::Ed25519PublicKey;
@@ -132,7 +133,8 @@ fn test_e2e_single_shard_transaction() {
 
     let notarized = sign_and_notarize(manifest, &simulator_network(), 1, &signer)
         .expect("should sign transaction");
-    let transaction: RoutableTransaction = notarized.try_into().expect("valid transaction");
+    let transaction: RoutableTransaction =
+        routable_from_notarized_v1(notarized, test_validity_range()).expect("valid transaction");
     let tx_hash = transaction.hash();
 
     println!("Transaction created: {:?}", tx_hash);
@@ -390,7 +392,8 @@ fn test_e2e_single_shard_determinism() {
 
     let notarized = sign_and_notarize(manifest, &simulator_network(), 1, &signer)
         .expect("should sign transaction");
-    let transaction: RoutableTransaction = notarized.try_into().expect("valid transaction");
+    let transaction: RoutableTransaction =
+        routable_from_notarized_v1(notarized, test_validity_range()).expect("valid transaction");
 
     // First run
     let mut runner1 = SimulationRunner::new(config.clone(), seed);
@@ -613,7 +616,8 @@ fn test_e2e_cross_shard_transaction() {
         .build();
     let notarized =
         sign_and_notarize(manifest, &simulator_network(), 200, &account0_kp).expect("should sign");
-    let cross_shard_tx: RoutableTransaction = notarized.try_into().expect("valid transaction");
+    let cross_shard_tx: RoutableTransaction =
+        routable_from_notarized_v1(notarized, test_validity_range()).expect("valid transaction");
     let tx_hash = cross_shard_tx.hash();
 
     println!("Cross-shard transaction: {:?}", tx_hash);
@@ -814,7 +818,8 @@ fn test_e2e_cross_shard_determinism() {
         .build();
     let notarized =
         sign_and_notarize(manifest, &simulator_network(), 1, &signer).expect("should sign");
-    let transaction: RoutableTransaction = notarized.try_into().expect("valid transaction");
+    let transaction: RoutableTransaction =
+        routable_from_notarized_v1(notarized, test_validity_range()).expect("valid transaction");
 
     // First run
     let mut runner1 = SimulationRunner::new(config.clone(), seed);
@@ -900,7 +905,8 @@ fn test_e2e_transaction_throughput() {
             .build();
         let notarized = sign_and_notarize(manifest, &simulator_network(), i as u32 + 1, &signer)
             .expect("should sign");
-        let tx: RoutableTransaction = notarized.try_into().expect("valid transaction");
+        let tx: RoutableTransaction = routable_from_notarized_v1(notarized, test_validity_range())
+            .expect("valid transaction");
 
         runner.schedule_initial_event(
             (i % 4) as u32, // Distribute across validators
@@ -987,7 +993,9 @@ fn test_wave_leader_failure_recovers_via_rotation() {
         let notarized =
             sign_and_notarize(manifest, &simulator_network(), 300 + isolated_node, &signer)
                 .expect("should sign");
-        let transaction: RoutableTransaction = notarized.try_into().expect("valid transaction");
+        let transaction: RoutableTransaction =
+            routable_from_notarized_v1(notarized, test_validity_range())
+                .expect("valid transaction");
         let tx_hash = transaction.hash();
 
         runner.schedule_initial_event(

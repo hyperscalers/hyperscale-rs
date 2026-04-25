@@ -6,7 +6,7 @@ use crate::config::SpammerConfig;
 use crate::latency::{LatencyReport, LatencyTracker};
 use crate::workloads::TransferWorkload;
 use futures::future::join_all;
-use hyperscale_types::{RoutableTransaction, ShardGroupId};
+use hyperscale_types::{routable_from_notarized_v1, RoutableTransaction, ShardGroupId};
 use radix_common::math::Decimal;
 use radix_common::network::NetworkDefinition;
 use radix_common::types::ComponentAddress;
@@ -693,7 +693,7 @@ impl PartitionWorkload {
             Err(_) => return None,
         };
 
-        notarized.try_into().ok()
+        routable_from_notarized_v1(notarized, crate::validity::validity_range_for_now()).ok()
     }
 }
 

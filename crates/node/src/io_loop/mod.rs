@@ -261,7 +261,6 @@ where
     /// through `PendingChain::view_at(parent_hash)` which walks the
     /// parent chain back to the committed tip. Orphaned blocks are not
     /// ancestors and are structurally invisible to anchored views.
-    /// See `.plans/_unify-overlays.md`.
     pending_chain: Arc<hyperscale_storage::PendingChain<S>>,
 
     // In-memory caches (shared with inbound router in production)

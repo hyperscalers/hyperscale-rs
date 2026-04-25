@@ -22,6 +22,6 @@ mod outbound;
 mod state;
 mod store;
 
-pub use outbound::{OutboundMemoryStats, OutboundProvisionTracker, OUTBOUND_RETENTION_MAX};
+pub use outbound::{OutboundMemoryStats, OutboundProvisionTracker};
 pub use state::{ProvisionConfig, ProvisionCoordinator, ProvisionMemoryStats};
 pub use store::ProvisionStore;

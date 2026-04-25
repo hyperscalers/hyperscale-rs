@@ -186,9 +186,19 @@ impl TransactionValidation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hyperscale_types::generate_ed25519_keypair;
+    use hyperscale_types::{
+        generate_ed25519_keypair, routable_from_notarized_v1, TimestampRange, WeightedTimestamp,
+    };
     use radix_common::network::NetworkDefinition;
     use radix_transactions::builder::ManifestBuilder;
+    use std::time::Duration;
+
+    fn wide_validity_range() -> TimestampRange {
+        TimestampRange::new(
+            WeightedTimestamp::ZERO,
+            WeightedTimestamp::ZERO.plus(Duration::from_secs(60)),
+        )
+    }
 
     #[test]
     fn test_validation_error_display() {
@@ -222,7 +232,8 @@ mod tests {
             hyperscale_types::sign_and_notarize(manifest, &network, 1, &signer).unwrap();
 
         // Convert to RoutableTransaction
-        let routable: RoutableTransaction = notarized.try_into().unwrap();
+        let routable: RoutableTransaction =
+            routable_from_notarized_v1(notarized, wide_validity_range()).unwrap();
 
         // Validate
         let validator = TransactionValidation::new(network);
@@ -244,7 +255,8 @@ mod tests {
         let manifest = ManifestBuilder::new().drop_all_proofs().build();
         let notarized =
             hyperscale_types::sign_and_notarize(manifest, &network, 1, &signer).unwrap();
-        let routable: RoutableTransaction = notarized.try_into().unwrap();
+        let routable: RoutableTransaction =
+            routable_from_notarized_v1(notarized, wide_validity_range()).unwrap();
         let expected_hash = routable.hash();
 
         let validator = TransactionValidation::new(network);
@@ -268,8 +280,10 @@ mod tests {
         let notarized2 =
             hyperscale_types::sign_and_notarize(manifest2, &network, 2, &signer).unwrap();
 
-        let routable1: RoutableTransaction = notarized1.try_into().unwrap();
-        let routable2: RoutableTransaction = notarized2.try_into().unwrap();
+        let routable1: RoutableTransaction =
+            routable_from_notarized_v1(notarized1, wide_validity_range()).unwrap();
+        let routable2: RoutableTransaction =
+            routable_from_notarized_v1(notarized2, wide_validity_range()).unwrap();
 
         let validator = TransactionValidation::new(network);
         let results = validator.validate_batch(&[&routable1, &routable2]);

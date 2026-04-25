@@ -585,6 +585,10 @@ impl VerificationPipeline {
     // results flow back through [`Self::on_root_verified`].
 
     /// Initiate transaction root verification for a block.
+    ///
+    /// The handler also enforces per-tx `validity_range`, anchored on the
+    /// parent QC's `weighted_timestamp` carried on the block header. Same
+    /// expression voters and the proposer apply.
     pub fn initiate_transaction_root_verification(
         &mut self,
         block_hash: BlockHash,
@@ -601,6 +605,7 @@ impl VerificationPipeline {
             block_hash,
             expected_root: block.header().transaction_root,
             transactions: block.transactions().to_vec(),
+            validity_anchor: block.header().parent_qc.weighted_timestamp,
         }]
     }
 
