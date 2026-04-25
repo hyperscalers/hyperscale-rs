@@ -110,12 +110,14 @@ pub enum NodeInput {
     /// Finalized waves received from a peer in response to a fetch request.
     FinalizedWaveReceived {
         block_hash: BlockHash,
+        peer: ValidatorId,
         waves: Vec<Arc<FinalizedWave>>,
     },
 
     /// A finalized wave fetch request failed.
     FinalizedWaveFetchFailed {
         block_hash: BlockHash,
+        peer: ValidatorId,
         hashes: Vec<WaveIdHash>,
     },
 

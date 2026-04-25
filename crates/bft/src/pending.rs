@@ -390,10 +390,18 @@ pub(crate) fn check_fetches(
                 age_ms = age.as_millis(),
                 "Fetch timeout reached, requesting missing finalized waves"
             );
+            let local_self = topology.local_validator_id();
+            let peers: Vec<_> = topology
+                .committee_for_shard(topology.local_shard())
+                .iter()
+                .copied()
+                .filter(|v| *v != local_self)
+                .collect();
             actions.push(Action::FetchFinalizedWave {
                 block_hash: *block_hash,
                 proposer,
                 wave_id_hashes: missing_waves,
+                peers,
             });
         }
     }

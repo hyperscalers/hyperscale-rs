@@ -867,16 +867,20 @@ where
                 block_hash,
                 proposer,
                 wave_id_hashes,
+                peers,
             } => {
                 self.finalized_wave_fetch_protocol
                     .handle(FinalizedWaveFetchInput::Request {
                         block_hash,
                         proposer,
                         wave_id_hashes,
+                        peers,
                     });
-                let tick_outputs = self
-                    .finalized_wave_fetch_protocol
-                    .handle(FinalizedWaveFetchInput::Tick);
+                let tick_outputs =
+                    self.finalized_wave_fetch_protocol
+                        .handle(FinalizedWaveFetchInput::Tick {
+                            now: std::time::Instant::now(),
+                        });
                 self.process_finalized_wave_fetch_outputs(tick_outputs);
                 self.update_fetch_tick_timer();
             }

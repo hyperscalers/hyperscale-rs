@@ -829,14 +829,19 @@ pub enum Action {
     ///
     /// Emitted by `check_pending_block_fetches()` when a pending block has
     /// missing waves past the fetch timeout. The runner sends a
-    /// `GetFinalizedWavesRequest` to the proposer or local peers.
+    /// `GetFinalizedWavesRequest` to the proposer first, falling back to
+    /// other local-committee peers from `peers` on empty/failure responses.
     FetchFinalizedWave {
         /// Hash of the block that needs these finalized waves.
         block_hash: BlockHash,
-        /// The proposer of the block (preferred fetch target).
+        /// The proposer of the block (tried first).
         proposer: ValidatorId,
         /// Wave ID hashes (from `BlockManifest.cert_hashes`) of missing waves.
         wave_id_hashes: Vec<WaveIdHash>,
+        /// Local-committee fallback peer pool (excluding self). The fetch
+        /// protocol rotates through these when the proposer doesn't have
+        /// the data cached.
+        peers: Vec<ValidatorId>,
     },
 
     /// Cancel any pending fetch operations for a block.

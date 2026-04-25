@@ -730,9 +730,11 @@ where
                     .handle(LocalProvisionFetchInput::Tick);
                 self.process_local_provision_fetch_outputs(local_prov_outputs);
                 // Also tick the finalized wave fetch protocol.
-                let wave_outputs = self
-                    .finalized_wave_fetch_protocol
-                    .handle(FinalizedWaveFetchInput::Tick);
+                let wave_outputs =
+                    self.finalized_wave_fetch_protocol
+                        .handle(FinalizedWaveFetchInput::Tick {
+                            now: std::time::Instant::now(),
+                        });
                 self.process_finalized_wave_fetch_outputs(wave_outputs);
                 // Also tick the provision fetch protocol.
                 let prov_outputs =
@@ -943,23 +945,41 @@ where
             }
 
             // ── Finalized wave fetch ─────────────────────────────────
-            NodeInput::FinalizedWaveReceived { block_hash, waves } => {
-                let outputs = self
-                    .finalized_wave_fetch_protocol
-                    .handle(FinalizedWaveFetchInput::Received { block_hash, waves });
+            NodeInput::FinalizedWaveReceived {
+                block_hash,
+                peer,
+                waves,
+            } => {
+                let outputs =
+                    self.finalized_wave_fetch_protocol
+                        .handle(FinalizedWaveFetchInput::Received {
+                            block_hash,
+                            peer,
+                            waves,
+                        });
                 self.process_finalized_wave_fetch_outputs(outputs);
                 self.update_fetch_tick_timer();
             }
 
-            NodeInput::FinalizedWaveFetchFailed { block_hash, hashes } => {
-                let outputs = self
-                    .finalized_wave_fetch_protocol
-                    .handle(FinalizedWaveFetchInput::Failed { block_hash, hashes });
+            NodeInput::FinalizedWaveFetchFailed {
+                block_hash,
+                peer,
+                hashes,
+            } => {
+                let outputs =
+                    self.finalized_wave_fetch_protocol
+                        .handle(FinalizedWaveFetchInput::Failed {
+                            block_hash,
+                            peer,
+                            hashes,
+                        });
                 self.process_finalized_wave_fetch_outputs(outputs);
                 // Tick to retry pending fetches.
-                let tick_outputs = self
-                    .finalized_wave_fetch_protocol
-                    .handle(FinalizedWaveFetchInput::Tick);
+                let tick_outputs =
+                    self.finalized_wave_fetch_protocol
+                        .handle(FinalizedWaveFetchInput::Tick {
+                            now: std::time::Instant::now(),
+                        });
                 self.process_finalized_wave_fetch_outputs(tick_outputs);
                 self.update_fetch_tick_timer();
             }

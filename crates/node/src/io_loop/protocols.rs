@@ -566,29 +566,36 @@ where
             match output {
                 FinalizedWaveFetchOutput::Fetch {
                     block_hash,
-                    proposer,
+                    peer,
                     wave_id_hashes,
                 } => {
                     use hyperscale_messages::request::GetFinalizedWavesRequest;
                     let es = self.event_sender.clone();
                     let bh = block_hash;
                     let hs = wave_id_hashes.clone();
-                    let peers = self.local_peers();
+                    // Pin the request to the chosen peer (no fallback set):
+                    // the protocol drives rotation itself, retrying with the
+                    // next peer on `Failed` / empty `Received`. Letting the
+                    // network's request manager rotate would defeat the
+                    // protocol-level tried-peer tracking.
+                    let pinned = [peer];
                     self.network.request(
-                        &peers,
-                        Some(proposer),
+                        &pinned,
+                        Some(peer),
                         GetFinalizedWavesRequest::new(block_hash, wave_id_hashes),
                         Box::new(move |result| match result {
                             Ok(resp) => {
                                 let waves = resp.waves.into_iter().map(Arc::new).collect();
                                 let _ = es.send(NodeInput::FinalizedWaveReceived {
                                     block_hash: bh,
+                                    peer,
                                     waves,
                                 });
                             }
                             Err(_) => {
                                 let _ = es.send(NodeInput::FinalizedWaveFetchFailed {
                                     block_hash: bh,
+                                    peer,
                                     hashes: hs,
                                 });
                             }
