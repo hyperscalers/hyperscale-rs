@@ -1118,11 +1118,10 @@ mod tests {
     use super::*;
     use crate::pending::PendingBlock;
     use hyperscale_types::{
-        CertificateRoot, LocalReceiptRoot, ProposerTimestamp, QuorumCertificate, Round,
-        RoutableTransaction, ShardGroupId, TransactionRoot, ValidatorId,
+        CertificateRoot, LocalReceiptRoot, LocalTimestamp, ProposerTimestamp, QuorumCertificate,
+        Round, RoutableTransaction, ShardGroupId, TransactionRoot, ValidatorId,
     };
     use std::collections::BTreeMap;
-    use std::time::Duration;
 
     fn header(height: BlockHeight, parent_hash: BlockHash, in_flight: u32) -> BlockHeader {
         BlockHeader {
@@ -1298,7 +1297,7 @@ mod tests {
 
         vp.initiate_state_root_verification(block_hash, &block, BlockHeight::GENESIS);
 
-        let pb = PendingBlock::from_complete_block(&block, vec![], vec![], Duration::ZERO);
+        let pb = PendingBlock::from_complete_block(&block, vec![], vec![], LocalTimestamp::ZERO);
         let mut pending_with_block = HashMap::new();
         pending_with_block.insert(block_hash, pb);
         let certified = HashMap::new();

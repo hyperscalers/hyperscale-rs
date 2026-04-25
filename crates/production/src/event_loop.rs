@@ -124,13 +124,20 @@ const GC_INTERVAL: Duration = Duration::from_secs(30);
 /// Fallback timeout when no batch deadlines are pending.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// Get wall-clock time as a Duration since UNIX epoch.
-///
-/// Used to set the state machine's logical clock before each step.
-fn wall_clock_duration() -> Duration {
-    SystemTime::now()
+/// Mint the io_loop's monotonic local clock as a `LocalTimestamp` (ms
+/// since UNIX epoch). Used to set the state machine's clock before each
+/// step. We use `SystemTime` rather than process-start `Instant` because
+/// the value sits next to `WeightedTimestamp` (also ms since UNIX epoch)
+/// at the proposer-skew boundary; same epoch lets the comparison work
+/// without unit conversion. NTP back-steps are absorbed by the saturating
+/// arithmetic on `LocalTimestamp` — view-change timers can briefly fire
+/// faster than expected after a step but will never panic.
+fn wall_clock_local() -> hyperscale_types::LocalTimestamp {
+    let ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system clock before UNIX epoch")
+        .as_millis() as u64;
+    hyperscale_types::LocalTimestamp::from_millis(ms)
 }
 
 /// Push a [`NodeStatusSnapshot`] into the shared RPC state objects.
@@ -214,7 +221,7 @@ pub fn run_pinned_loop(mut io_loop: ProdIoLoop, mut config: PinnedLoopConfig) {
         }
 
         // ── Set wall-clock time ──
-        let now = wall_clock_duration();
+        let now = wall_clock_local();
         io_loop.set_time(now);
 
         // ── Priority try_recv cascade ──
@@ -263,7 +270,7 @@ pub fn run_pinned_loop(mut io_loop: ProdIoLoop, mut config: PinnedLoopConfig) {
         }
 
         // ── Flush expired batches ──
-        io_loop.flush_expired_batches(wall_clock_duration());
+        io_loop.flush_expired_batches(wall_clock_local());
 
         // ── Periodic metrics + RPC status snapshot ──
         if last_metrics.elapsed() >= METRICS_INTERVAL {

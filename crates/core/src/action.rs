@@ -2,6 +2,7 @@
 
 use crate::{ProtocolEvent, TimerId};
 use hyperscale_messages::TransactionGossip;
+use hyperscale_types::LocalTimestamp;
 use hyperscale_types::{
     Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, BlockVote, Bls12381G1PublicKey,
     Bls12381G2Signature, CertificateRoot, CommittedBlockHeader, EpochConfig, EpochId,
@@ -18,26 +19,28 @@ use std::time::Duration;
 
 /// Phase timing breakdown for transaction finalization.
 ///
-/// Tracks wall-clock timestamps (as `Duration` since process start) at each
-/// phase transition, enabling diagnosis of slow finalization.
+/// Tracks local wall-clock timestamps (`LocalTimestamp`, i.e. ms since the
+/// io_loop's clock origin) at each phase transition, enabling diagnosis of
+/// slow finalization. Local-only — never serialized, never compared across
+/// validators.
 #[derive(Debug, Clone)]
 pub struct FinalizationPhaseTimes {
     /// When the transaction was first added to the mempool.
-    pub added_at: Duration,
+    pub added_at: LocalTimestamp,
     /// When the block containing the transaction was committed.
-    pub committed_at: Option<Duration>,
+    pub committed_at: Option<LocalTimestamp>,
     /// When cross-shard provisions arrived for this transaction.
     /// None for single-shard transactions (provisioned immediately).
-    pub provisioned_at: Option<Duration>,
+    pub provisioned_at: Option<LocalTimestamp>,
     /// When all transactions in the wave became ready (all provisioned/aborted).
     /// Captures time spent waiting for other transactions in the same batch.
-    pub wave_ready_at: Option<Duration>,
+    pub wave_ready_at: Option<LocalTimestamp>,
     /// When the local execution certificate was created (local votes aggregated).
-    pub ec_created_at: Option<Duration>,
+    pub ec_created_at: Option<LocalTimestamp>,
     /// When the wave certificate was created (all shards reported ECs).
-    pub executed_at: Option<Duration>,
+    pub executed_at: Option<LocalTimestamp>,
     /// When the transaction reached terminal state (TC committed in block).
-    pub completed_at: Duration,
+    pub completed_at: LocalTimestamp,
 }
 
 impl fmt::Display for FinalizationPhaseTimes {
@@ -628,7 +631,7 @@ pub enum Action {
         tx_hash: TxHash,
         status: TransactionStatus,
         /// When the transaction was added to the mempool (for latency tracking).
-        added_at: Duration,
+        added_at: LocalTimestamp,
         /// Whether this is a cross-shard transaction (for metrics labeling).
         cross_shard: bool,
         /// Whether this transaction was submitted locally (via RPC) vs received via gossip/fetch.

@@ -114,6 +114,16 @@ impl ProposerTimestamp {
         ProposerTimestamp(ms)
     }
 
+    /// Mint a `ProposerTimestamp` from this validator's local wall-clock.
+    /// The single legitimate boundary cast: a proposer / voter encodes its
+    /// own `LocalTimestamp` into the header / vote payload, where the
+    /// stake-weighted aggregation will later combine 2f+1 of them into a
+    /// `WeightedTimestamp`. No other `LocalTimestamp` → `ProposerTimestamp`
+    /// path exists.
+    pub const fn from_local(local: LocalTimestamp) -> Self {
+        ProposerTimestamp(local.as_millis())
+    }
+
     /// Raw ms value — use at serialization / metrics boundaries only.
     pub const fn as_millis(self) -> u64 {
         self.0

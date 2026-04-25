@@ -14,7 +14,7 @@
 
 use hyperscale_core::{Action, CommitSource, ProtocolEvent, TimerId};
 use hyperscale_types::{
-    BlockHash, ProposerTimestamp, ProvisionHash, WaveIdHash, WeightedTimestamp,
+    BlockHash, LocalTimestamp, ProposerTimestamp, ProvisionHash, WaveIdHash, WeightedTimestamp,
 };
 
 /// BFT statistics for monitoring.
@@ -190,8 +190,11 @@ pub struct BftCoordinator {
     // ═══════════════════════════════════════════════════════════════════════════
     // Time
     // ═══════════════════════════════════════════════════════════════════════════
-    /// Current time (set by runner before each handle call).
-    now: Duration,
+    /// Local wall-clock time, set by the runner before each `handle()` call.
+    /// Drives view-change timing, IO retry backoff, and the proposer-skew
+    /// gate on incoming headers — never used as a deterministic consensus
+    /// anchor (use `committed_ts: WeightedTimestamp` for that).
+    now: LocalTimestamp,
 }
 
 impl std::fmt::Debug for BftCoordinator {
@@ -237,7 +240,7 @@ impl BftCoordinator {
             proposal: ProposalTracker::new(),
             tx_cache: CommittedTxCache::new(),
             config,
-            now: Duration::ZERO,
+            now: LocalTimestamp::ZERO,
         }
     }
 
@@ -267,7 +270,7 @@ impl BftCoordinator {
     // ═══════════════════════════════════════════════════════════════════════════
 
     /// Set the current time.
-    pub fn set_time(&mut self, now: Duration) {
+    pub fn set_time(&mut self, now: LocalTimestamp) {
         self.now = now;
     }
 
@@ -1435,7 +1438,7 @@ impl BftCoordinator {
         // cascading view changes under normal load.
         self.record_leader_activity();
 
-        let timestamp = ProposerTimestamp(self.now.as_millis() as u64);
+        let timestamp = ProposerTimestamp::from_local(self.now);
 
         debug!(
             validator = ?topology.local_validator_id(),
@@ -3415,7 +3418,7 @@ mod tests {
         use hyperscale_types::SignerBitfield;
 
         let (mut state, topology) = make_multi_validator_state_at(1);
-        state.set_time(Duration::from_secs(100));
+        state.set_time(LocalTimestamp::from_millis(100_000));
 
         // committed_height = 1 avoids triggering sync on the non-genesis parent QC.
         let parent_hash = BlockHash::from_raw(Hash::from_bytes(b"parent_block"));
@@ -3456,7 +3459,7 @@ mod tests {
         use hyperscale_types::SignerBitfield;
 
         let (mut state, topology) = make_multi_validator_state_at(1);
-        state.set_time(Duration::from_secs(100));
+        state.set_time(LocalTimestamp::from_millis(100_000));
 
         let parent_hash = BlockHash::from_raw(Hash::from_bytes(b"parent_block"));
         state.committed_height = BlockHeight(1);
@@ -3514,7 +3517,7 @@ mod tests {
         use hyperscale_types::SignerBitfield;
 
         let (mut state, topology) = make_multi_validator_state_at(1);
-        state.set_time(Duration::from_secs(100));
+        state.set_time(LocalTimestamp::from_millis(100_000));
 
         let parent_hash = BlockHash::from_raw(Hash::from_bytes(b"parent_block"));
         state.committed_height = BlockHeight(1);
@@ -3557,7 +3560,7 @@ mod tests {
 
         let (mut state, topology) = make_multi_validator_state_at(1);
 
-        state.set_time(Duration::from_secs(100));
+        state.set_time(LocalTimestamp::from_millis(100_000));
 
         // Genesis QC has no signature — verification must be skipped, not queued.
         let header = BlockHeader {
@@ -3587,7 +3590,7 @@ mod tests {
 
         // Local = ValidatorId(2) is proposer at (1, 1) since (1+1)%4 = 2.
         let (mut state, topology) = make_multi_validator_state_at(2);
-        state.set_time(Duration::from_secs(100));
+        state.set_time(LocalTimestamp::from_millis(100_000));
 
         let actions = state.advance_round(&topology);
         assert!(actions.iter().any(|a| matches!(
@@ -3602,7 +3605,7 @@ mod tests {
     #[test]
     fn test_advance_round_unlocks_when_no_qc() {
         let (mut state, topology) = make_test_state();
-        state.set_time(Duration::from_secs(100));
+        state.set_time(LocalTimestamp::from_millis(100_000));
 
         state.votes.voted_heights.insert(
             BlockHeight(1),
@@ -3683,7 +3686,7 @@ mod tests {
     #[test]
     fn test_vote_locking_prevents_voting_for_different_block_at_same_height() {
         let (mut state, topology) = make_multi_validator_state();
-        state.set_time(Duration::from_secs(100));
+        state.set_time(LocalTimestamp::from_millis(100_000));
 
         let height = BlockHeight(1);
         let round_0 = Round(0);
@@ -3721,7 +3724,7 @@ mod tests {
     fn test_vote_locking_allows_revoting_same_block() {
         // Re-voting for the same block at a later round is a no-op (no re-broadcast).
         let (mut state, topology) = make_multi_validator_state();
-        state.set_time(Duration::from_secs(100));
+        state.set_time(LocalTimestamp::from_millis(100_000));
 
         let height = BlockHeight(1);
         let block_hash = make_header_at_height(height, 100_000).hash();
@@ -3743,7 +3746,7 @@ mod tests {
         // received_votes_by_height, so a legitimate vote for a different block
         // from the same voter is not flagged as equivocation on verification.
         let (mut state, topology) = make_multi_validator_state();
-        state.set_time(Duration::from_secs(100));
+        state.set_time(LocalTimestamp::from_millis(100_000));
 
         let height = BlockHeight(5);
         let voter = ValidatorId(2);
@@ -3778,15 +3781,18 @@ mod tests {
         // and block hash — otherwise our vote lock would prevent us from voting
         // for our own re-proposal.
         let (mut state, topology) = make_multi_validator_state();
-        state.set_time(Duration::from_secs(100));
+        state.set_time(LocalTimestamp::from_millis(100_000));
 
         let height = BlockHeight(1);
         // proposer_for(1, 0) = ValidatorId(1)
         let original_header = make_header_at_height(height, 100_000);
         let original_block_hash = original_header.hash();
 
-        let pending =
-            PendingBlock::from_manifest(original_header, BlockManifest::default(), Duration::ZERO);
+        let pending = PendingBlock::from_manifest(
+            original_header,
+            BlockManifest::default(),
+            LocalTimestamp::ZERO,
+        );
         state.pending_blocks.insert(original_block_hash, pending);
         state
             .votes
@@ -3813,7 +3819,7 @@ mod tests {
         // re-proposal carrying the original round — validation only keys off
         // proposer_for(height, header.round), not the receiver's view.
         let (state, topology) = make_multi_validator_state();
-        let header = make_header_at_height(BlockHeight(1), state.now.as_millis() as u64);
+        let header = make_header_at_height(BlockHeight(1), state.now.as_millis());
 
         assert!(crate::validation::validate_header(
             &topology,
@@ -3831,7 +3837,7 @@ mod tests {
         // proposer_for(1, 0) = ValidatorId(1), but the header claims ValidatorId(3).
         let header = BlockHeader {
             proposer: ValidatorId(3),
-            ..make_header_at_height(BlockHeight(1), state.now.as_millis() as u64)
+            ..make_header_at_height(BlockHeight(1), state.now.as_millis())
         };
 
         let result = crate::validation::validate_header(
@@ -3862,7 +3868,7 @@ mod tests {
         // proposer_for(1, R) = (1 + R) % 4 — local is ValidatorId(0), so we're
         // proposer at R=3.
         let (mut state, topology) = make_test_state();
-        state.set_time(Duration::from_secs(100));
+        state.set_time(LocalTimestamp::from_millis(100_000));
         let height = BlockHeight(1);
 
         let vote_and_advance = |state: &mut BftCoordinator, block: &[u8], round: Round| {
@@ -3902,7 +3908,7 @@ mod tests {
         // (latest_qc.height + 1). Vote locks at lower heights are left for
         // cleanup_committed to remove on commit.
         let (mut state, topology) = make_test_state();
-        state.set_time(Duration::from_secs(100));
+        state.set_time(LocalTimestamp::from_millis(100_000));
 
         let qc_block = BlockHash::from_raw(Hash::from_bytes(b"qc_block_at_1"));
         state.latest_qc = Some(make_test_qc(qc_block, BlockHeight(1)));
@@ -3952,7 +3958,7 @@ mod tests {
         // After a QC forms we must propose N+1 immediately — even with no
         // content — or finalization of N stalls.
         let (mut state, topology) = make_test_state();
-        state.set_time(Duration::from_secs(100));
+        state.set_time(LocalTimestamp::from_millis(100_000));
         // Parent tree must be available or try_propose defers.
         state.committed_height = BlockHeight(3);
         state.verification.on_block_persisted(BlockHeight(3));
@@ -3992,7 +3998,7 @@ mod tests {
         // the next try_propose can dispatch.
 
         let (mut state, topology) = make_test_state();
-        state.set_time(Duration::from_secs(100));
+        state.set_time(LocalTimestamp::from_millis(100_000));
 
         // Local validator is ValidatorId(0). Proposer for (h=1, r=0) is
         // ValidatorId((1+0)%4)=ValidatorId(1) — not us. Point the chain at
@@ -4055,7 +4061,7 @@ mod tests {
         use hyperscale_types::SignerBitfield;
 
         let (mut state, topology) = make_multi_validator_state_at(0);
-        state.set_time(Duration::from_secs(100));
+        state.set_time(LocalTimestamp::from_millis(100_000));
 
         let parent_hash = BlockHash::from_raw(Hash::from_bytes(b"parent_block"));
         state.committed_height = BlockHeight(1);
@@ -4144,7 +4150,7 @@ mod tests {
     #[test]
     fn test_syncing_validator_proposes_empty_block() {
         let (mut state, topology) = make_test_state();
-        state.set_time(Duration::from_secs(100));
+        state.set_time(LocalTimestamp::from_millis(100_000));
         // Simulate committed state so parent tree is available for BuildProposal.
         state.committed_height = BlockHeight(3);
         state.verification.on_block_persisted(BlockHeight(3));
@@ -4188,7 +4194,7 @@ mod tests {
         // Sync blocks timestamp with the wall clock; they do not inherit the
         // parent's weighted timestamp like fallback blocks do.
         let (mut state, topology) = make_test_state();
-        let current_time = Duration::from_secs(12345);
+        let current_time = LocalTimestamp::from_millis(12_345_000);
         state.set_time(current_time);
         state.committed_height = BlockHeight(3);
         state.verification.on_block_persisted(BlockHeight(3));
@@ -4211,10 +4217,7 @@ mod tests {
         else {
             panic!("expected BuildProposal");
         };
-        assert_eq!(
-            *timestamp,
-            ProposerTimestamp(current_time.as_millis() as u64)
-        );
+        assert_eq!(*timestamp, ProposerTimestamp::from_local(current_time));
         assert_ne!(timestamp.as_millis(), old_timestamp);
     }
 
@@ -4239,7 +4242,7 @@ mod tests {
         // Syncing only blocks us from proposing content; we still vote on others'
         // blocks once verification completes.
         let (mut state, topology) = make_multi_validator_state();
-        state.set_time(Duration::from_secs(100));
+        state.set_time(LocalTimestamp::from_millis(100_000));
         state.set_syncing(&topology, true);
 
         let block_hash = BlockHash::from_raw(Hash::from_bytes(b"other_proposer_block"));
@@ -4258,8 +4261,8 @@ mod tests {
         // advance the view if the leader fails, otherwise the chain stalls
         // while they catch up.
         let (mut state, topology) = make_test_state();
-        state.set_time(Duration::from_secs(100));
-        state.view_change.last_leader_activity = Some(Duration::from_secs(0));
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        state.view_change.last_leader_activity = Some(LocalTimestamp::ZERO);
 
         assert!(state.should_advance_round());
         state.set_syncing(&topology, true);
@@ -4272,15 +4275,15 @@ mod tests {
         // Leaving sync resets leader activity to `now` so the fresh round doesn't
         // immediately time out on stale activity from before sync started.
         let (mut state, topology) = make_test_state();
-        state.set_time(Duration::from_secs(100));
-        state.view_change.last_leader_activity = Some(Duration::from_secs(0));
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        state.view_change.last_leader_activity = Some(LocalTimestamp::ZERO);
 
         state.set_syncing(&topology, true);
         state.on_sync_complete(&topology);
 
         assert_eq!(
             state.view_change.last_leader_activity,
-            Some(Duration::from_secs(100))
+            Some(LocalTimestamp::from_millis(100_000))
         );
     }
 
@@ -4288,7 +4291,7 @@ mod tests {
     fn test_syncing_validator_vote_locking_preserved() {
         // Vote locking applies during sync just as in normal operation.
         let (mut state, topology) = make_multi_validator_state();
-        state.set_time(Duration::from_secs(100));
+        state.set_time(LocalTimestamp::from_millis(100_000));
         state.set_syncing(&topology, true);
 
         let height = BlockHeight(1);
@@ -4315,7 +4318,7 @@ mod tests {
         // check_sync_health triggers StartSync when the gap to latest_qc is
         // large (>3) without a pending commit.
         let (mut state, topology) = make_test_state();
-        state.set_time(Duration::from_secs(100));
+        state.set_time(LocalTimestamp::from_millis(100_000));
         assert!(!state.is_syncing());
 
         state.latest_qc = Some(QuorumCertificate {
@@ -4339,7 +4342,7 @@ mod tests {
         // A synced block below committed_height must be dropped without advancing
         // any state — including the syncing flag.
         let (mut state, topology) = make_test_state();
-        state.set_time(Duration::from_secs(100));
+        state.set_time(LocalTimestamp::from_millis(100_000));
         state.committed_height = BlockHeight(10);
 
         let block = Block::Live {
@@ -4368,8 +4371,8 @@ mod tests {
         // Dispatching a sync proposal is progress — it must reset the leader
         // activity timer so we don't immediately view-change out of it.
         let (mut state, topology) = make_test_state();
-        state.set_time(Duration::from_secs(100));
-        state.view_change.last_leader_activity = Some(Duration::from_secs(0));
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        state.view_change.last_leader_activity = Some(LocalTimestamp::ZERO);
 
         state.latest_qc = Some(QuorumCertificate {
             parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"block_2")),
@@ -4383,7 +4386,7 @@ mod tests {
 
         assert_eq!(
             state.view_change.last_leader_activity,
-            Some(Duration::from_secs(100))
+            Some(LocalTimestamp::from_millis(100_000))
         );
     }
 
@@ -4392,7 +4395,7 @@ mod tests {
         // Sync blocks use current time and is_fallback=false; fallback blocks
         // inherit the parent's weighted timestamp and set is_fallback=true.
         let (mut state, topology) = make_test_state();
-        state.set_time(Duration::from_secs(100));
+        state.set_time(LocalTimestamp::from_millis(100_000));
         state.committed_height = BlockHeight(3);
         state.verification.on_block_persisted(BlockHeight(3));
 
@@ -4449,7 +4452,7 @@ mod tests {
         // Sync mode must not suppress proposal — a syncing proposer still emits
         // BuildProposal (with an empty payload) so the chain keeps advancing.
         let (mut state, topology) = make_test_state();
-        state.set_time(Duration::from_secs(100));
+        state.set_time(LocalTimestamp::from_millis(100_000));
         state.committed_height = BlockHeight(3);
         state.verification.on_block_persisted(BlockHeight(3));
 
@@ -4571,7 +4574,7 @@ mod tests {
         };
 
         let (mut state, topology) = make_test_state();
-        state.set_time(Duration::from_secs(100));
+        state.set_time(LocalTimestamp::from_millis(100_000));
         let committed_before = state.committed_height;
 
         // Build a FinalizedWave whose EC attests "success" but whose receipt

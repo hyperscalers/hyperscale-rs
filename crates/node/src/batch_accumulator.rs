@@ -2,10 +2,10 @@
 //!
 //! Both [`BatchAccumulator`] and [`ShardedBatchAccumulator`] collect items until
 //! either a maximum count or a time window is reached, at which point the caller
-//! flushes the batch. Deadlines are tracked as logical time (`Duration`) so both
-//! production (wall clock) and simulation (logical clock) use the same paths.
+//! flushes the batch. Deadlines are tracked as `LocalTimestamp` (the io_loop's
+//! monotonic local clock) so both production and simulation use the same paths.
 
-use hyperscale_types::ShardGroupId;
+use hyperscale_types::{LocalTimestamp, ShardGroupId};
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -19,7 +19,7 @@ pub(crate) struct BatchAccumulator<T> {
     count: usize,
     max_count: usize,
     window: Duration,
-    deadline: Option<Duration>,
+    deadline: Option<LocalTimestamp>,
 }
 
 impl<T> BatchAccumulator<T> {
@@ -35,7 +35,7 @@ impl<T> BatchAccumulator<T> {
     }
 
     /// Push an item with weight 1. Returns `true` if the batch is full.
-    pub fn push(&mut self, item: T, now: Duration) -> bool {
+    pub fn push(&mut self, item: T, now: LocalTimestamp) -> bool {
         self.push_weighted(item, 1, now)
     }
 
@@ -43,9 +43,9 @@ impl<T> BatchAccumulator<T> {
     ///
     /// Use this when the count threshold applies to a measure other than the
     /// number of items (e.g. total individual votes across grouped vote items).
-    pub fn push_weighted(&mut self, item: T, weight: usize, now: Duration) -> bool {
+    pub fn push_weighted(&mut self, item: T, weight: usize, now: LocalTimestamp) -> bool {
         if self.count == 0 {
-            self.deadline = Some(now + self.window);
+            self.deadline = Some(now.plus(self.window));
         }
         self.items.push(item);
         self.count += weight;
@@ -60,12 +60,12 @@ impl<T> BatchAccumulator<T> {
     }
 
     /// Whether the batch deadline has expired.
-    pub fn is_expired(&self, now: Duration) -> bool {
+    pub fn is_expired(&self, now: LocalTimestamp) -> bool {
         self.deadline.is_some_and(|d| now >= d)
     }
 
     /// The deadline for this batch, if non-empty.
-    pub fn deadline(&self) -> Option<Duration> {
+    pub fn deadline(&self) -> Option<LocalTimestamp> {
         self.deadline
     }
 
@@ -85,7 +85,7 @@ pub(crate) struct ShardedBatchAccumulator<T> {
     total: usize,
     max_count: usize,
     window: Duration,
-    deadline: Option<Duration>,
+    deadline: Option<LocalTimestamp>,
 }
 
 #[allow(dead_code)]
@@ -102,9 +102,9 @@ impl<T> ShardedBatchAccumulator<T> {
     }
 
     /// Push an item for a specific shard. Returns `true` if the batch is full.
-    pub fn push(&mut self, shard: ShardGroupId, item: T, now: Duration) -> bool {
+    pub fn push(&mut self, shard: ShardGroupId, item: T, now: LocalTimestamp) -> bool {
         if self.total == 0 {
-            self.deadline = Some(now + self.window);
+            self.deadline = Some(now.plus(self.window));
         }
         self.by_shard.entry(shard).or_default().push(item);
         self.total += 1;
@@ -119,12 +119,12 @@ impl<T> ShardedBatchAccumulator<T> {
     }
 
     /// Whether the batch deadline has expired.
-    pub fn is_expired(&self, now: Duration) -> bool {
+    pub fn is_expired(&self, now: LocalTimestamp) -> bool {
         self.deadline.is_some_and(|d| now >= d)
     }
 
     /// The deadline for this batch, if non-empty.
-    pub fn deadline(&self) -> Option<Duration> {
+    pub fn deadline(&self) -> Option<LocalTimestamp> {
         self.deadline
     }
 }
@@ -136,7 +136,7 @@ mod tests {
     #[test]
     fn push_returns_true_when_full() {
         let mut batch = BatchAccumulator::new(3, Duration::from_millis(100));
-        let now = Duration::from_secs(1);
+        let now = LocalTimestamp::from_millis(1_000);
         assert!(!batch.push("a", now));
         assert!(!batch.push("b", now));
         assert!(batch.push("c", now));
@@ -145,7 +145,7 @@ mod tests {
     #[test]
     fn take_resets_accumulator() {
         let mut batch = BatchAccumulator::new(10, Duration::from_millis(100));
-        let now = Duration::from_secs(1);
+        let now = LocalTimestamp::from_millis(1_000);
         batch.push("a", now);
         batch.push("b", now);
 
@@ -154,9 +154,12 @@ mod tests {
         assert!(batch.deadline().is_none());
 
         // After take, next push sets a fresh deadline.
-        let now2 = Duration::from_secs(2);
+        let now2 = LocalTimestamp::from_millis(2_000);
         batch.push("c", now2);
-        assert_eq!(batch.deadline(), Some(now2 + Duration::from_millis(100)));
+        assert_eq!(
+            batch.deadline(),
+            Some(now2.plus(Duration::from_millis(100)))
+        );
     }
 
     #[test]
@@ -164,32 +167,32 @@ mod tests {
         let mut batch = BatchAccumulator::<u32>::new(10, Duration::from_millis(50));
         assert!(batch.deadline().is_none());
 
-        let now = Duration::from_secs(1);
+        let now = LocalTimestamp::from_millis(1_000);
         batch.push(1, now);
-        assert_eq!(batch.deadline(), Some(now + Duration::from_millis(50)));
+        assert_eq!(batch.deadline(), Some(now.plus(Duration::from_millis(50))));
 
         // Second push doesn't change deadline.
-        let later = Duration::from_secs(2);
+        let later = LocalTimestamp::from_millis(2_000);
         batch.push(2, later);
-        assert_eq!(batch.deadline(), Some(now + Duration::from_millis(50)));
+        assert_eq!(batch.deadline(), Some(now.plus(Duration::from_millis(50))));
     }
 
     #[test]
     fn is_expired() {
         let mut batch = BatchAccumulator::new(10, Duration::from_millis(100));
-        let now = Duration::from_secs(1);
+        let now = LocalTimestamp::from_millis(1_000);
         batch.push(42, now);
 
         assert!(!batch.is_expired(now));
-        assert!(!batch.is_expired(now + Duration::from_millis(99)));
-        assert!(batch.is_expired(now + Duration::from_millis(100)));
-        assert!(batch.is_expired(now + Duration::from_millis(200)));
+        assert!(!batch.is_expired(now.plus(Duration::from_millis(99))));
+        assert!(batch.is_expired(now.plus(Duration::from_millis(100))));
+        assert!(batch.is_expired(now.plus(Duration::from_millis(200))));
     }
 
     #[test]
     fn weighted_push() {
         let mut batch = BatchAccumulator::new(10, Duration::from_millis(100));
-        let now = Duration::from_secs(1);
+        let now = LocalTimestamp::from_millis(1_000);
         assert!(!batch.push_weighted("group_a", 4, now));
         assert!(!batch.push_weighted("group_b", 5, now));
         assert!(batch.push_weighted("group_c", 1, now)); // total = 10
@@ -201,7 +204,7 @@ mod tests {
     #[test]
     fn sharded_push_and_take() {
         let mut batch = ShardedBatchAccumulator::new(5, Duration::from_millis(100));
-        let now = Duration::from_secs(1);
+        let now = LocalTimestamp::from_millis(1_000);
         let shard_a = ShardGroupId(0);
         let shard_b = ShardGroupId(1);
 
@@ -218,7 +221,7 @@ mod tests {
     #[test]
     fn sharded_full() {
         let mut batch = ShardedBatchAccumulator::new(2, Duration::from_millis(100));
-        let now = Duration::from_secs(1);
+        let now = LocalTimestamp::from_millis(1_000);
         let shard = ShardGroupId(0);
 
         assert!(!batch.push(shard, 1, now));

@@ -16,12 +16,12 @@
 
 use hyperscale_core::Action;
 use hyperscale_types::{
-    BlockHash, BlockHeight, FinalizedWave, ProposerTimestamp, Provision, ProvisionHash, Round,
-    RoutableTransaction, TopologySnapshot, TxHash, WaveIdHash, WeightedTimestamp,
+    BlockHash, BlockHeight, FinalizedWave, LocalTimestamp, ProposerTimestamp, Provision,
+    ProvisionHash, Round, RoutableTransaction, TopologySnapshot, TxHash, WaveIdHash,
+    WeightedTimestamp,
 };
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Duration;
 use tracing::debug;
 
 use crate::chain_view::ChainView;
@@ -291,7 +291,7 @@ pub(crate) fn assemble_build_action(
     chain: &ChainView,
     height: BlockHeight,
     round: Round,
-    now: Duration,
+    now: LocalTimestamp,
     kind: ProposalKind,
 ) -> BuildActionPlan {
     let (parent_hash, parent_qc) = chain.proposal_parent();
@@ -315,7 +315,7 @@ pub(crate) fn assemble_build_action(
             provision_batches,
             finalized_tx_count,
         } => (
-            ProposerTimestamp(now.as_millis() as u64),
+            ProposerTimestamp::from_local(now),
             false,
             transactions,
             finalized_waves,
@@ -325,7 +325,7 @@ pub(crate) fn assemble_build_action(
             false,
         ),
         ProposalKind::Fallback => (
-            ProposerTimestamp(parent_qc.weighted_timestamp.as_millis()),
+            ProposerTimestamp::from_millis(parent_qc.weighted_timestamp.as_millis()),
             true,
             Vec::new(),
             Vec::new(),
@@ -335,7 +335,7 @@ pub(crate) fn assemble_build_action(
             true,
         ),
         ProposalKind::Sync => (
-            ProposerTimestamp(now.as_millis() as u64),
+            ProposerTimestamp::from_local(now),
             false,
             Vec::new(),
             Vec::new(),
@@ -404,6 +404,7 @@ pub(crate) fn dispatch_or_defer(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn start_records_pending_slot() {

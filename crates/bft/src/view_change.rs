@@ -16,7 +16,7 @@
 //!   delay view changes indefinitely.
 
 use crate::config::BftConfig;
-use hyperscale_types::{BlockHeight, Round};
+use hyperscale_types::{BlockHeight, LocalTimestamp, Round};
 use std::time::Duration;
 
 pub(crate) struct ViewChangeController {
@@ -31,7 +31,7 @@ pub(crate) struct ViewChangeController {
     /// Time of last leader activity (proposal, header receipt, QC, commit).
     /// `None` until the first activity is recorded — prevents spurious view
     /// changes before any leader has had a chance to act.
-    pub(crate) last_leader_activity: Option<Duration>,
+    pub(crate) last_leader_activity: Option<LocalTimestamp>,
 
     /// `(height, round)` for which the leader-activity timer was last reset on
     /// header receipt. Ensures a single reset per `(height, round)` so a
@@ -66,13 +66,18 @@ impl ViewChangeController {
     }
 
     /// Record a direct signal of leader progress (proposal, QC, commit).
-    pub fn record_leader_activity(&mut self, now: Duration) {
+    pub fn record_leader_activity(&mut self, now: LocalTimestamp) {
         self.last_leader_activity = Some(now);
     }
 
     /// Record leader progress from a received header, rate-limited to once
     /// per `(height, round)` to thwart Byzantine header-spam.
-    pub fn record_header_activity(&mut self, height: BlockHeight, round: Round, now: Duration) {
+    pub fn record_header_activity(
+        &mut self,
+        height: BlockHeight,
+        round: Round,
+        now: LocalTimestamp,
+    ) {
         let key = (height, round);
         if self.last_header_reset != Some(key) {
             self.last_leader_activity = Some(now);
@@ -96,19 +101,22 @@ impl ViewChangeController {
     }
 
     /// Time remaining until the view change timer should fire.
-    pub fn remaining_timeout(&self, config: &BftConfig, now: Duration) -> Duration {
+    pub fn remaining_timeout(&self, config: &BftConfig, now: LocalTimestamp) -> Duration {
         let timeout = self.current_timeout(config);
-        let deadline = self.last_leader_activity.unwrap_or(Duration::ZERO) + timeout;
+        let deadline = self
+            .last_leader_activity
+            .unwrap_or(LocalTimestamp::ZERO)
+            .plus(timeout);
         if now >= deadline {
             Duration::from_millis(100)
         } else {
-            deadline - now
+            deadline.saturating_sub(now)
         }
     }
 
     /// Returns `true` if the leader has been silent longer than the current
     /// timeout and a view change should fire.
-    pub fn timeout_elapsed(&self, config: &BftConfig, now: Duration) -> bool {
+    pub fn timeout_elapsed(&self, config: &BftConfig, now: LocalTimestamp) -> bool {
         let Some(last_activity) = self.last_leader_activity else {
             return false;
         };
@@ -225,8 +233,8 @@ mod tests {
     #[test]
     fn record_header_activity_is_rate_limited_per_height_round() {
         let mut vc = ViewChangeController::new();
-        let t1 = Duration::from_secs(1);
-        let t2 = Duration::from_secs(2);
+        let t1 = LocalTimestamp::from_millis(1_000);
+        let t2 = LocalTimestamp::from_millis(2_000);
 
         vc.record_header_activity(BlockHeight(5), Round(0), t1);
         assert_eq!(vc.last_leader_activity, Some(t1));
@@ -244,17 +252,17 @@ mod tests {
     fn timeout_elapsed_requires_recorded_leader_activity() {
         let vc = ViewChangeController::new();
         let config = cfg(1000, 0, None);
-        assert!(!vc.timeout_elapsed(&config, Duration::from_secs(100)));
+        assert!(!vc.timeout_elapsed(&config, LocalTimestamp::from_millis(100_000)));
     }
 
     #[test]
     fn timeout_elapsed_true_once_past_deadline() {
         let mut vc = ViewChangeController::new();
         let config = cfg(1000, 0, None);
-        vc.record_leader_activity(Duration::from_secs(10));
+        vc.record_leader_activity(LocalTimestamp::from_millis(10_000));
 
-        assert!(!vc.timeout_elapsed(&config, Duration::from_millis(10_500)));
-        assert!(vc.timeout_elapsed(&config, Duration::from_secs(11)));
+        assert!(!vc.timeout_elapsed(&config, LocalTimestamp::from_millis(10_500)));
+        assert!(vc.timeout_elapsed(&config, LocalTimestamp::from_millis(11_000)));
     }
 
     #[test]

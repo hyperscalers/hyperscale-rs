@@ -169,11 +169,10 @@ impl<'a> ChainView<'a> {
 mod tests {
     use super::*;
     use hyperscale_types::{
-        BlockManifest, CertificateRoot, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, Round,
-        ShardGroupId, TransactionRoot, ValidatorId, WeightedTimestamp,
+        BlockManifest, CertificateRoot, LocalReceiptRoot, LocalTimestamp, ProposerTimestamp,
+        ProvisionsRoot, Round, ShardGroupId, TransactionRoot, ValidatorId, WeightedTimestamp,
     };
     use std::collections::BTreeMap;
-    use std::time::Duration;
 
     fn make_header(height: u64, parent_hash: BlockHash) -> BlockHeader {
         BlockHeader {
@@ -250,7 +249,7 @@ mod tests {
             let mut pb = PendingBlock::from_manifest(
                 make_header(6, certified_hash),
                 BlockManifest::default(),
-                Duration::ZERO,
+                LocalTimestamp::ZERO,
             );
             pb.construct_block().unwrap();
             pb
@@ -285,8 +284,11 @@ mod tests {
 
         // Pending block without a constructed inner block — should still
         // yield a header.
-        let pending_block =
-            PendingBlock::from_manifest(header.clone(), BlockManifest::default(), Duration::ZERO);
+        let pending_block = PendingBlock::from_manifest(
+            header.clone(),
+            BlockManifest::default(),
+            LocalTimestamp::ZERO,
+        );
         let mut pending = HashMap::new();
         pending.insert(block_hash, pending_block);
 

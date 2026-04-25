@@ -335,7 +335,7 @@ where
 
     /// Last time a "transaction finalization exceeded 10s" warning was emitted.
     /// Rate-limited to avoid flooding logs during cross-shard latency spikes.
-    last_slow_tx_warn: std::time::Duration,
+    last_slow_tx_warn: hyperscale_types::LocalTimestamp,
 
     // Execution certificate cache for fallback serving.
     // Shared with request handler thread. Keyed by (wave_id_hash, wave_id).
@@ -427,7 +427,7 @@ where
             commit_in_flight: Arc::new(AtomicBool::new(false)),
             exec_cert_cache: Arc::new(Mutex::new(HashMap::new())),
             tx_status_cache: Arc::new(QuickCache::new(DEFAULT_TX_STATUS_CACHE_SIZE)),
-            last_slow_tx_warn: std::time::Duration::ZERO,
+            last_slow_tx_warn: hyperscale_types::LocalTimestamp::ZERO,
             pending_commit_task: None,
             emitted_statuses: Vec::new(),
             actions_generated: 0,
@@ -450,7 +450,7 @@ where
     ///
     /// Must be called before `step()` to keep the state machine's clock
     /// in sync with the driving environment.
-    pub fn set_time(&mut self, now: Duration) {
+    pub fn set_time(&mut self, now: hyperscale_types::LocalTimestamp) {
         self.state.set_time(now);
     }
 
@@ -1033,7 +1033,7 @@ where
     /// Call this with the current time before processing events. In production,
     /// the loop calls this with wall-clock time. In simulation, the harness
     /// calls it with logical time.
-    pub fn flush_expired_batches(&mut self, now: Duration) {
+    pub fn flush_expired_batches(&mut self, now: hyperscale_types::LocalTimestamp) {
         if self.validation_batch.is_expired(now) {
             self.flush_validation_batch();
         }
@@ -1046,7 +1046,7 @@ where
     ///
     /// Used by the production `run()` loop for `recv_timeout()` and by the
     /// simulation harness to know when to schedule a flush.
-    pub fn nearest_batch_deadline(&self) -> Option<Duration> {
+    pub fn nearest_batch_deadline(&self) -> Option<hyperscale_types::LocalTimestamp> {
         [
             self.validation_batch.deadline(),
             self.committed_header_batch.deadline(),

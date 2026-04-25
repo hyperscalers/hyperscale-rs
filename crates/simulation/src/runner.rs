@@ -610,7 +610,9 @@ impl SimulationRunner {
                 self.stats.events_processed += 1;
                 self.stats.events_by_priority[event.priority() as usize] += 1;
 
-                self.io_loops[node_index as usize].set_time(self.now);
+                self.io_loops[node_index as usize].set_time(
+                    hyperscale_types::LocalTimestamp::from_millis(self.now.as_millis() as u64),
+                );
                 let output = self.io_loops[node_index as usize].step(event);
                 self.io_loops[node_index as usize].flush_all_batches();
 

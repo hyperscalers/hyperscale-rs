@@ -6,8 +6,8 @@ use hyperscale_core::Action;
 #[cfg(test)]
 use hyperscale_types::Hash;
 use hyperscale_types::{
-    Block, BlockHash, BlockHeader, BlockManifest, FinalizedWave, Provision, ProvisionHash,
-    RoutableTransaction, TopologySnapshot, TxHash, WaveIdHash,
+    Block, BlockHash, BlockHeader, BlockManifest, FinalizedWave, LocalTimestamp, Provision,
+    ProvisionHash, RoutableTransaction, TopologySnapshot, TxHash, WaveIdHash,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -60,7 +60,7 @@ pub struct PendingBlock {
 
     /// Time at which this pending block was first observed. Used to schedule
     /// fetch requests for missing data after a gossip grace period.
-    created_at: Duration,
+    created_at: LocalTimestamp,
 }
 
 impl PendingBlock {
@@ -68,7 +68,7 @@ impl PendingBlock {
     pub fn from_manifest(
         header: BlockHeader,
         manifest: BlockManifest,
-        created_at: Duration,
+        created_at: LocalTimestamp,
     ) -> Self {
         let total_tx_count = manifest.transaction_count();
         let missing_transaction_hashes: HashSet<TxHash> =
@@ -102,7 +102,7 @@ impl PendingBlock {
         block: &Block,
         finalized_waves: Vec<Arc<FinalizedWave>>,
         provisions: Vec<Arc<Provision>>,
-        created_at: Duration,
+        created_at: LocalTimestamp,
     ) -> Self {
         let mut provision_hashes: Vec<ProvisionHash> =
             provisions.iter().map(|p| p.hash()).collect();
@@ -299,7 +299,7 @@ impl PendingBlock {
     }
 
     /// Time at which this pending block was first observed.
-    pub fn created_at(&self) -> Duration {
+    pub fn created_at(&self) -> LocalTimestamp {
         self.created_at
     }
 
@@ -329,7 +329,7 @@ impl PendingBlock {
 pub(crate) fn check_fetches(
     pending_blocks: &HashMap<BlockHash, PendingBlock>,
     topology: &TopologySnapshot,
-    now: Duration,
+    now: LocalTimestamp,
     timeout: Duration,
     force_immediate: bool,
 ) -> Vec<Action> {
@@ -340,7 +340,7 @@ pub(crate) fn check_fetches(
             continue;
         }
 
-        let age = now.saturating_sub(pending.created_at());
+        let age = now.elapsed_since(pending.created_at());
         let ready = force_immediate || age >= timeout;
         if !ready {
             continue;
@@ -450,7 +450,7 @@ mod tests {
                 tx_hashes: vec![tx1, tx2],
                 ..Default::default()
             },
-            Duration::ZERO,
+            LocalTimestamp::ZERO,
         );
 
         assert_eq!(pb.missing_transactions().len(), 2);
@@ -463,7 +463,8 @@ mod tests {
     #[test]
     fn test_empty_block_is_complete() {
         let header = make_header(BlockHeight(1));
-        let pb = PendingBlock::from_manifest(header, BlockManifest::default(), Duration::ZERO);
+        let pb =
+            PendingBlock::from_manifest(header, BlockManifest::default(), LocalTimestamp::ZERO);
 
         assert!(pb.is_complete());
     }
@@ -482,7 +483,7 @@ mod tests {
                 cert_hashes: vec![wave1, wave2],
                 ..Default::default()
             },
-            Duration::ZERO,
+            LocalTimestamp::ZERO,
         );
 
         assert_eq!(pb.missing_transaction_count(), 1);
@@ -506,7 +507,7 @@ mod tests {
                 cert_hashes: vec![wave_hash],
                 ..Default::default()
             },
-            Duration::ZERO,
+            LocalTimestamp::ZERO,
         );
 
         assert_eq!(pb.missing_wave_count(), 1);
@@ -545,7 +546,7 @@ mod tests {
                 cert_hashes: vec![wave_hash],
                 ..Default::default()
             },
-            Duration::ZERO,
+            LocalTimestamp::ZERO,
         );
 
         assert!(!pb.is_complete());
@@ -589,7 +590,8 @@ mod tests {
             provisions: vec![],
         };
 
-        let pending = PendingBlock::from_complete_block(&block, vec![fw], vec![], Duration::ZERO);
+        let pending =
+            PendingBlock::from_complete_block(&block, vec![fw], vec![], LocalTimestamp::ZERO);
         assert!(pending.is_complete());
     }
 }

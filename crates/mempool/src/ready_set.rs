@@ -16,14 +16,14 @@
 //! - `deferred_by_nodes`: hash → set of nodes blocking it.
 
 use crate::lock_tracker::LockTracker;
-use hyperscale_types::{NodeId, RoutableTransaction, TxHash};
+use hyperscale_types::{LocalTimestamp, NodeId, RoutableTransaction, TxHash};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
 struct ReadyEntry {
     tx: Arc<RoutableTransaction>,
-    added_at: Duration,
+    added_at: LocalTimestamp,
 }
 
 pub(crate) struct ReadySet {
@@ -52,7 +52,7 @@ impl ReadySet {
         &mut self,
         hash: TxHash,
         tx: Arc<RoutableTransaction>,
-        added_at: Duration,
+        added_at: LocalTimestamp,
         locks: &LockTracker,
     ) {
         if self.ready.contains_key(&hash) || self.deferred_by_nodes.contains_key(&hash) {
@@ -173,7 +173,7 @@ impl ReadySet {
     pub fn iter_ready(
         &self,
         min_dwell: Duration,
-        now: Duration,
+        now: LocalTimestamp,
     ) -> impl Iterator<Item = Arc<RoutableTransaction>> + '_ {
         self.ready
             .values()
@@ -313,7 +313,7 @@ mod tests {
         let locks = LockTracker::new();
         let (hash, tx) = tx_with(1, &[10]);
 
-        rs.add(hash, tx, Duration::ZERO, &locks);
+        rs.add(hash, tx, LocalTimestamp::ZERO, &locks);
         assert_eq!(rs.ready_count(), 1);
         assert_eq!(rs.deferred_count(), 0);
         check_invariants(&rs).unwrap();
@@ -326,7 +326,7 @@ mod tests {
         locks.lock_nodes([test_node(10)]);
 
         let (hash, tx) = tx_with(1, &[10]);
-        rs.add(hash, tx, Duration::ZERO, &locks);
+        rs.add(hash, tx, LocalTimestamp::ZERO, &locks);
         assert_eq!(rs.ready_count(), 0);
         assert_eq!(rs.deferred_count(), 1);
         check_invariants(&rs).unwrap();
@@ -339,8 +339,8 @@ mod tests {
         let (h1, tx1) = tx_with(1, &[10]);
         let (h2, tx2) = tx_with(2, &[10]);
 
-        rs.add(h1, tx1, Duration::ZERO, &locks);
-        rs.add(h2, tx2, Duration::ZERO, &locks);
+        rs.add(h1, tx1, LocalTimestamp::ZERO, &locks);
+        rs.add(h2, tx2, LocalTimestamp::ZERO, &locks);
         assert_eq!(rs.ready_count(), 1);
         assert_eq!(rs.deferred_count(), 1);
         check_invariants(&rs).unwrap();
@@ -352,7 +352,7 @@ mod tests {
         let locks = LockTracker::new();
         let (h, tx) = tx_with(1, &[10, 20]);
 
-        rs.add(h, tx, Duration::ZERO, &locks);
+        rs.add(h, tx, LocalTimestamp::ZERO, &locks);
         // `all_declared_nodes` iterates reads then writes; the fixture passes
         // the same nodes for both, so duplicates in `freed` are expected.
         // Only membership matters — the caller feeds each node through the
@@ -370,7 +370,7 @@ mod tests {
         locks.lock_nodes([test_node(10)]);
         let (h, tx) = tx_with(1, &[10]);
 
-        rs.add(h, tx, Duration::ZERO, &locks);
+        rs.add(h, tx, LocalTimestamp::ZERO, &locks);
         let freed = rs.remove(&h);
         assert!(freed.is_empty());
         check_invariants(&rs).unwrap();
@@ -381,7 +381,7 @@ mod tests {
         let mut rs = ReadySet::new();
         let locks = LockTracker::new();
         let (h, tx) = tx_with(1, &[10]);
-        rs.add(h, tx, Duration::ZERO, &locks);
+        rs.add(h, tx, LocalTimestamp::ZERO, &locks);
 
         rs.block_node(test_node(10));
         assert_eq!(rs.ready_count(), 0);
@@ -397,12 +397,12 @@ mod tests {
 
         // Single-blocker tx: only blocked by node 10.
         let (h_single, tx_single) = tx_with(1, &[10]);
-        rs.add(h_single, tx_single, Duration::ZERO, &locks);
+        rs.add(h_single, tx_single, LocalTimestamp::ZERO, &locks);
 
         // Dual-blocker tx: blocked by both 10 and 20. Removing node 10 from
         // its blocker set should NOT mark it promotable (20 still blocks).
         let (h_dual, tx_dual) = tx_with(2, &[10, 20]);
-        rs.add(h_dual, tx_dual, Duration::ZERO, &locks);
+        rs.add(h_dual, tx_dual, LocalTimestamp::ZERO, &locks);
 
         let promotable = rs.promotable_for_node(test_node(10));
         assert_eq!(promotable, vec![h_single]);
@@ -415,15 +415,15 @@ mod tests {
         let mut rs = ReadySet::new();
         let locks = LockTracker::new();
         let (h, tx) = tx_with(1, &[10]);
-        rs.add(h, tx, Duration::from_millis(100), &locks);
+        rs.add(h, tx, LocalTimestamp::from_millis(100), &locks);
 
         let below: Vec<_> = rs
-            .iter_ready(Duration::from_millis(200), Duration::from_millis(250))
+            .iter_ready(Duration::from_millis(200), LocalTimestamp::from_millis(250))
             .collect();
         assert!(below.is_empty());
 
         let above: Vec<_> = rs
-            .iter_ready(Duration::from_millis(100), Duration::from_millis(250))
+            .iter_ready(Duration::from_millis(100), LocalTimestamp::from_millis(250))
             .collect();
         assert_eq!(above.len(), 1);
     }
@@ -436,11 +436,11 @@ mod tests {
         let (h1, tx1) = tx_with(1, &[10]);
         let (h2, tx2) = tx_with(2, &[20]);
 
-        rs.add(h1, tx1, Duration::ZERO, &locks);
-        rs.add(h2, tx2, Duration::ZERO, &locks);
+        rs.add(h1, tx1, LocalTimestamp::ZERO, &locks);
+        rs.add(h2, tx2, LocalTimestamp::ZERO, &locks);
 
         let order: Vec<_> = rs
-            .iter_ready(Duration::ZERO, Duration::from_secs(1))
+            .iter_ready(Duration::ZERO, LocalTimestamp::from_millis(1_000))
             .map(|tx| tx.hash())
             .collect();
         let mut sorted = order.clone();
@@ -482,7 +482,7 @@ mod tests {
         match op {
             Op::Add(i) => {
                 let (hash, tx) = &fixture[(*i as usize) % pool_len];
-                rs.add(*hash, Arc::clone(tx), Duration::ZERO, locks);
+                rs.add(*hash, Arc::clone(tx), LocalTimestamp::ZERO, locks);
             }
             Op::Remove(i) => {
                 let (hash, _) = &fixture[(*i as usize) % pool_len];
@@ -516,7 +516,7 @@ mod tests {
         promotable.sort();
         for hash in promotable {
             if let Some((_, tx)) = fixture.iter().find(|(h, _)| *h == hash) {
-                rs.add(hash, Arc::clone(tx), Duration::ZERO, locks);
+                rs.add(hash, Arc::clone(tx), LocalTimestamp::ZERO, locks);
             }
         }
     }

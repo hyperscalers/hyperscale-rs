@@ -1,7 +1,7 @@
 //! Core traits for state machines.
 
 use crate::{Action, ProtocolEvent};
-use std::time::Duration;
+use hyperscale_types::LocalTimestamp;
 
 /// A state machine that processes events.
 ///
@@ -26,7 +26,7 @@ use std::time::Duration;
 ///         }
 ///     }
 ///
-///     fn set_time(&mut self, now: Duration) {
+///     fn set_time(&mut self, now: LocalTimestamp) {
 ///         self.now = now;
 ///     }
 /// }
@@ -53,18 +53,20 @@ pub trait StateMachine {
     /// - Emitting notifications to clients
     fn handle(&mut self, event: ProtocolEvent) -> Vec<Action>;
 
-    /// Set the current time.
+    /// Set the current local wall-clock time.
     ///
-    /// Called by the runner before each `handle()` call to provide the
-    /// current simulation or wall-clock time.
+    /// Called by the runner before each `handle()` call. The clock is
+    /// minted by the IO boundary (production io_loop or simulator driver)
+    /// in milliseconds since a fixed origin captured at process start.
+    /// Anchors view-change timers, IO retry backoff, and the proposer-skew
+    /// check — never used as a deterministic consensus anchor (use
+    /// `WeightedTimestamp` for that).
     ///
     /// # Arguments
     ///
-    /// * `now` - The current time as a duration since some epoch
-    fn set_time(&mut self, now: Duration);
+    /// * `now` - This validator's monotonic local wall-clock.
+    fn set_time(&mut self, now: LocalTimestamp);
 
-    /// Get the current time.
-    ///
-    /// Returns the time that was last set via `set_time()`.
-    fn now(&self) -> Duration;
+    /// Get the current local wall-clock time, as last set via `set_time`.
+    fn now(&self) -> LocalTimestamp;
 }

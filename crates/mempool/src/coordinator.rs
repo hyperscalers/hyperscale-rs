@@ -5,8 +5,8 @@ use crate::ready_set::ReadySet;
 use crate::tombstones::TombstoneStore;
 use hyperscale_core::{Action, FinalizationPhaseTimes, TransactionStatus};
 use hyperscale_types::{
-    BlockHeight, BloomFilter, CertifiedBlock, NodeId, RoutableTransaction, TopologySnapshot,
-    TransactionDecision, TxHash, WeightedTimestamp, DEFAULT_FPR,
+    BlockHeight, BloomFilter, CertifiedBlock, LocalTimestamp, NodeId, RoutableTransaction,
+    TopologySnapshot, TransactionDecision, TxHash, WeightedTimestamp, DEFAULT_FPR,
 };
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -130,18 +130,18 @@ pub struct MempoolMemoryStats {
 struct PoolEntry {
     tx: Arc<RoutableTransaction>,
     status: TransactionStatus,
-    added_at: Duration,
+    added_at: LocalTimestamp,
     /// Whether this is a cross-shard transaction (cached at insertion time).
     cross_shard: bool,
     /// Whether this transaction was submitted locally (via RPC) vs received via gossip/fetch.
     /// Only locally-submitted transactions should contribute to latency metrics.
     submitted_locally: bool,
-    /// Timestamp when the block containing this tx was committed.
-    committed_at_time: Option<Duration>,
-    /// Timestamp when the local execution certificate was created.
-    ec_created_at_time: Option<Duration>,
-    /// Timestamp when the wave certificate was created (all shards reported ECs).
-    executed_at_time: Option<Duration>,
+    /// Local time when the block containing this tx was committed.
+    committed_at_time: Option<LocalTimestamp>,
+    /// Local time when the local execution certificate was created.
+    ec_created_at_time: Option<LocalTimestamp>,
+    /// Local time when the wave certificate was created (all shards reported ECs).
+    executed_at_time: Option<LocalTimestamp>,
 }
 
 /// Mempool state machine.
@@ -178,8 +178,11 @@ pub struct MempoolCoordinator {
     /// ready-set conflict), or neither (removed).
     ready: ReadySet,
 
-    /// Current time.
-    now: Duration,
+    /// Current local wall-clock time. Drives latency telemetry stamps and
+    /// the `min_dwell_time` filter on local proposal selection only — never
+    /// a deterministic state-retention anchor (use `current_ts:
+    /// WeightedTimestamp` for that).
+    now: LocalTimestamp,
 
     /// Current committed block height (for retry transaction creation).
     current_height: BlockHeight,
@@ -223,7 +226,7 @@ impl MempoolCoordinator {
             tombstones: TombstoneStore::new(),
             locks: LockTracker::new(),
             ready: ReadySet::new(),
-            now: Duration::ZERO,
+            now: LocalTimestamp::ZERO,
             current_height: BlockHeight(0),
             current_ts: WeightedTimestamp::ZERO,
             config,
@@ -231,7 +234,7 @@ impl MempoolCoordinator {
     }
 
     /// Set the current time.
-    pub fn set_time(&mut self, now: Duration) {
+    pub fn set_time(&mut self, now: LocalTimestamp) {
         self.now = now;
     }
 
@@ -677,7 +680,7 @@ impl MempoolCoordinator {
         &mut self,
         hash: TxHash,
         tx: &Arc<RoutableTransaction>,
-        added_at: Duration,
+        added_at: LocalTimestamp,
     ) {
         self.ready.add(hash, Arc::clone(tx), added_at, &self.locks);
     }
@@ -698,7 +701,7 @@ impl MempoolCoordinator {
     fn promote_transactions_for_node(&mut self, node: NodeId) {
         let mut promotable = self.ready.promotable_for_node(node);
         promotable.sort();
-        let mut to_readd: Vec<(TxHash, Arc<RoutableTransaction>, Duration)> = Vec::new();
+        let mut to_readd: Vec<(TxHash, Arc<RoutableTransaction>, LocalTimestamp)> = Vec::new();
         for tx_hash in promotable {
             if let Some(entry) = self.pool.get(&tx_hash) {
                 if entry.status == TransactionStatus::Pending {
@@ -1368,7 +1371,7 @@ mod tests {
         let mut mempool = MempoolCoordinator::with_config(config);
         let topology = make_test_topology();
 
-        mempool.set_time(Duration::from_secs(10));
+        mempool.set_time(LocalTimestamp::from_millis(10_000));
         let tx = test_transaction(1);
         mempool.on_submit_transaction(&topology, Arc::new(tx));
 
@@ -1382,12 +1385,12 @@ mod tests {
         let mut mempool = MempoolCoordinator::new();
         let topology = make_test_topology();
 
-        mempool.set_time(Duration::from_secs(10));
+        mempool.set_time(LocalTimestamp::from_millis(10_000));
         let tx = test_transaction(1);
         mempool.on_submit_transaction(&topology, Arc::new(tx));
 
         // At t=10.1s — not yet eligible (100ms < 150ms)
-        mempool.set_time(Duration::from_millis(10_100));
+        mempool.set_time(LocalTimestamp::from_millis(10_100));
         let ready = mempool.ready_transactions(10, 0, 0);
         assert_eq!(
             ready.len(),
@@ -1396,7 +1399,7 @@ mod tests {
         );
 
         // At t=10.15s — eligible (150ms >= 150ms)
-        mempool.set_time(Duration::from_millis(10_150));
+        mempool.set_time(LocalTimestamp::from_millis(10_150));
         let ready = mempool.ready_transactions(10, 0, 0);
         assert_eq!(ready.len(), 1, "Should select after 150ms default dwell");
     }
@@ -1411,7 +1414,7 @@ mod tests {
         let topology = make_test_topology();
 
         // Submit at t=10s
-        mempool.set_time(Duration::from_secs(10));
+        mempool.set_time(LocalTimestamp::from_millis(10_000));
         let tx = test_transaction(1);
         mempool.on_submit_transaction(&topology, Arc::new(tx));
 
@@ -1420,7 +1423,7 @@ mod tests {
         assert_eq!(ready.len(), 0, "Should not select before dwell time");
 
         // Advance to t=10.3s — still not enough
-        mempool.set_time(Duration::from_millis(10_300));
+        mempool.set_time(LocalTimestamp::from_millis(10_300));
         let ready = mempool.ready_transactions(10, 0, 0);
         assert_eq!(
             ready.len(),
@@ -1429,7 +1432,7 @@ mod tests {
         );
 
         // Advance to t=10.5s — exactly at dwell time
-        mempool.set_time(Duration::from_millis(10_500));
+        mempool.set_time(LocalTimestamp::from_millis(10_500));
         let ready = mempool.ready_transactions(10, 0, 0);
         assert_eq!(ready.len(), 1, "Should select after dwell time elapses");
     }
@@ -1444,12 +1447,12 @@ mod tests {
         let topology = make_test_topology();
 
         // Submit tx1 at t=1s
-        mempool.set_time(Duration::from_secs(1));
+        mempool.set_time(LocalTimestamp::from_millis(1_000));
         let tx1 = test_transaction(1);
         mempool.on_submit_transaction(&topology, Arc::new(tx1));
 
         // Submit tx2 at t=1.3s
-        mempool.set_time(Duration::from_millis(1_300));
+        mempool.set_time(LocalTimestamp::from_millis(1_300));
         let tx2 = test_transaction(2);
         mempool.on_submit_transaction(&topology, Arc::new(tx2));
 
@@ -1457,12 +1460,12 @@ mod tests {
         // Actually we already submitted tx2 at 1.3s, so check at 1.4s:
         // tx1 added at 1.0s, now 1.4s → 400ms dwell (eligible)
         // tx2 added at 1.3s, now 1.4s → 100ms dwell (not eligible)
-        mempool.set_time(Duration::from_millis(1_400));
+        mempool.set_time(LocalTimestamp::from_millis(1_400));
         let ready = mempool.ready_transactions(10, 0, 0);
         assert_eq!(ready.len(), 1, "Only tx1 should be eligible");
 
         // At t=1.5s — both eligible
-        mempool.set_time(Duration::from_millis(1_500));
+        mempool.set_time(LocalTimestamp::from_millis(1_500));
         let ready = mempool.ready_transactions(10, 0, 0);
         assert_eq!(ready.len(), 2, "Both should be eligible");
     }

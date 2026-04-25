@@ -14,8 +14,9 @@
 use crate::store::ProvisionStore;
 use hyperscale_core::{Action, ProtocolEvent};
 use hyperscale_types::{
-    compute_padded_merkle_root, BlockHeight, CommittedBlockHeader, Hash, Provision, ProvisionHash,
-    ProvisionTxRoot, ShardGroupId, TopologySnapshot, ValidatorId, WeightedTimestamp, WAVE_TIMEOUT,
+    compute_padded_merkle_root, BlockHeight, CommittedBlockHeader, Hash, LocalTimestamp, Provision,
+    ProvisionHash, ProvisionTxRoot, ShardGroupId, TopologySnapshot, ValidatorId, WeightedTimestamp,
+    WAVE_TIMEOUT,
 };
 #[cfg(test)]
 use hyperscale_types::{
@@ -120,7 +121,7 @@ struct ExpectedProvision {
 #[derive(Debug, Clone)]
 struct QueuedProvision {
     batch: Arc<Provision>,
-    added_at: Duration,
+    added_at: LocalTimestamp,
 }
 
 /// Centralized provision coordination.
@@ -210,8 +211,11 @@ pub struct ProvisionCoordinator {
     // ═══════════════════════════════════════════════════════════════════
     // Time
     // ═══════════════════════════════════════════════════════════════════
-    /// Current time.
-    now: Duration,
+    /// Current local wall-clock time. Drives the `min_dwell_time` filter on
+    /// queued-provision selection and stamps `QueuedProvision.added_at` for
+    /// that filter — never a state-retention anchor (use
+    /// `local_committed_ts: WeightedTimestamp` for that).
+    now: LocalTimestamp,
 }
 
 impl std::fmt::Debug for ProvisionCoordinator {
@@ -262,7 +266,7 @@ impl ProvisionCoordinator {
             queued_provision_batches: Vec::new(),
             committed_batch_tombstones: HashMap::new(),
             committed_retention: BTreeMap::new(),
-            now: Duration::ZERO,
+            now: LocalTimestamp::ZERO,
         }
     }
 
@@ -280,7 +284,7 @@ impl ProvisionCoordinator {
     }
 
     /// Set the current time.
-    pub fn set_time(&mut self, now: Duration) {
+    pub fn set_time(&mut self, now: LocalTimestamp) {
         self.now = now;
     }
 
@@ -1752,7 +1756,7 @@ mod tests {
         let mut coordinator = ProvisionCoordinator::with_config(ProvisionConfig {
             min_dwell_time: Duration::ZERO,
         });
-        coordinator.set_time(Duration::from_secs(1));
+        coordinator.set_time(LocalTimestamp::from_millis(1_000));
         verify_batch_into_queue(
             &mut coordinator,
             &topology,
@@ -1776,7 +1780,7 @@ mod tests {
         });
 
         // Verify at t=1.0s
-        coordinator.set_time(Duration::from_secs(1));
+        coordinator.set_time(LocalTimestamp::from_millis(1_000));
         verify_batch_into_queue(
             &mut coordinator,
             &topology,
@@ -1786,7 +1790,7 @@ mod tests {
         );
 
         // t=1.2s — dwell not met (200ms < 500ms)
-        coordinator.set_time(Duration::from_millis(1200));
+        coordinator.set_time(LocalTimestamp::from_millis(1200));
         assert_eq!(
             coordinator.queued_provisions().len(),
             0,
@@ -1794,7 +1798,7 @@ mod tests {
         );
 
         // t=1.5s — exactly at dwell
-        coordinator.set_time(Duration::from_millis(1500));
+        coordinator.set_time(LocalTimestamp::from_millis(1500));
         assert_eq!(
             coordinator.queued_provisions().len(),
             1,
@@ -1810,7 +1814,7 @@ mod tests {
         });
 
         // t=1.0s: verify old batch
-        coordinator.set_time(Duration::from_secs(1));
+        coordinator.set_time(LocalTimestamp::from_millis(1_000));
         verify_batch_into_queue(
             &mut coordinator,
             &topology,
@@ -1820,7 +1824,7 @@ mod tests {
         );
 
         // t=1.3s: verify young batch
-        coordinator.set_time(Duration::from_millis(1300));
+        coordinator.set_time(LocalTimestamp::from_millis(1300));
         verify_batch_into_queue(
             &mut coordinator,
             &topology,
@@ -1831,7 +1835,7 @@ mod tests {
 
         // t=1.4s: old batch dwelled 400ms (eligible), young batch dwelled
         // 100ms (still blocked).
-        coordinator.set_time(Duration::from_millis(1400));
+        coordinator.set_time(LocalTimestamp::from_millis(1400));
         let eligible = coordinator.queued_provisions();
         assert_eq!(eligible.len(), 1);
         assert_eq!(

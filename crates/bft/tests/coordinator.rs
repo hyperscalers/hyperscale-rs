@@ -6,7 +6,7 @@
 
 use hyperscale_bft::{BftConfig, BftCoordinator, BftMemoryStats, BftStats, RecoveredState};
 use hyperscale_test_helpers::TestCommittee;
-use hyperscale_types::{BlockHeight, Round, TopologySnapshot};
+use hyperscale_types::{BlockHeight, LocalTimestamp, Round, TopologySnapshot};
 use std::time::Duration;
 
 fn fresh_coordinator(config: BftConfig) -> BftCoordinator {
@@ -172,6 +172,6 @@ fn check_round_timeout_does_not_fire_without_recorded_activity() {
     // A fresh coordinator has no leader-activity timestamp; `check_round_timeout`
     // must not fire a view change because there's no baseline to time-out
     // against.
-    coordinator.set_time(Duration::from_secs(3600));
+    coordinator.set_time(LocalTimestamp::from_millis(3_600_000));
     assert!(coordinator.check_round_timeout(&topology).is_none());
 }

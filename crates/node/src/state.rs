@@ -8,11 +8,11 @@ use hyperscale_provisions::{OutboundProvisionTracker, ProvisionConfig, Provision
 use hyperscale_remote_headers::RemoteHeaderCoordinator;
 use hyperscale_topology::TopologyState;
 use hyperscale_types::{
-    Block, BlockHash, BlockHeader, BlockManifest, CertifiedBlock, FinalizedWave, Provision,
-    QuorumCertificate, RoutableTransaction, ShardGroupId, StateRoot, TopologySnapshot, TxHash,
+    Block, BlockHash, BlockHeader, BlockManifest, CertifiedBlock, FinalizedWave, LocalTimestamp,
+    Provision, QuorumCertificate, RoutableTransaction, ShardGroupId, StateRoot, TopologySnapshot,
+    TxHash,
 };
 use std::sync::Arc;
-use std::time::Duration;
 use tracing::instrument;
 
 /// Index type for simulation-only node routing.
@@ -55,7 +55,7 @@ pub struct NodeStateMachine {
     remote_headers: RemoteHeaderCoordinator,
 
     /// Current time.
-    now: Duration,
+    now: LocalTimestamp,
 }
 
 impl std::fmt::Debug for NodeStateMachine {
@@ -112,7 +112,7 @@ impl NodeStateMachine {
             outbound_provisions: OutboundProvisionTracker::new(provision_store),
             remote_headers: RemoteHeaderCoordinator::new(),
             topology,
-            now: Duration::ZERO,
+            now: LocalTimestamp::ZERO,
         }
     }
 
@@ -826,14 +826,14 @@ impl StateMachine for NodeStateMachine {
         actions
     }
 
-    fn set_time(&mut self, now: Duration) {
+    fn set_time(&mut self, now: LocalTimestamp) {
         self.now = now;
         self.bft.set_time(now);
         self.mempool.set_time(now);
         self.provisions.set_time(now);
     }
 
-    fn now(&self) -> Duration {
+    fn now(&self) -> LocalTimestamp {
         self.now
     }
 }
