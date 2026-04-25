@@ -661,11 +661,11 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "avg(rate(hyperscale_view_changes[1m])) * 60",
+          "expr": "avg(rate(hyperscale_view_changes[1m]) + rate(hyperscale_view_syncs[1m])) * 60",
           "refId": "A"
         }
       ],
-      "title": "View Changes/min",
+      "title": "Round advances/min (changes + syncs)",
       "type": "stat"
     },
     {
@@ -1181,11 +1181,20 @@
             "uid": "${datasource}"
           },
           "expr": "hyperscale_view_changes",
-          "legendFormat": "{{instance}}",
+          "legendFormat": "{{instance}} self-timeout",
           "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "hyperscale_view_syncs",
+          "legendFormat": "{{instance}} caught-up",
+          "refId": "B"
         }
       ],
-      "title": "View Changes by Validator",
+      "title": "Round advances by Validator (self-timeout vs caught-up)",
       "type": "timeseries"
     },
     {

@@ -20,8 +20,15 @@ use hyperscale_types::{
 /// BFT statistics for monitoring.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BftStats {
-    /// Total number of view changes (round advances due to timeout).
+    /// Total number of view changes (round advances due to local
+    /// leader-activity timeout — i.e. *we* timed out).
     pub view_changes: u64,
+    /// Total number of view syncs (rounds we jumped to because a header /
+    /// vote / QC arrived carrying a higher round). Distinct from
+    /// `view_changes` — a follower whose `view_changes` stays at zero can
+    /// still see its `view` climb to thousands while peers churn. Watch
+    /// both to see cluster-wide view-change activity.
+    pub view_syncs: u64,
     /// Current round within the current height.
     pub current_round: u64,
     /// Current committed height.
@@ -3126,6 +3133,7 @@ impl BftCoordinator {
     pub fn stats(&self) -> BftStats {
         BftStats {
             view_changes: self.view_change.view_changes,
+            view_syncs: self.view_change.view_syncs,
             current_round: self.view_change.view.0,
             committed_height: self.committed_height,
         }

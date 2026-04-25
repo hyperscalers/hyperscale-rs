@@ -256,8 +256,11 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     /// Set the current BFT round gauge.
     fn set_bft_round(&self, round: u64) {}
 
-    /// Set the view changes gauge.
+    /// Set the view changes gauge (self-originated round advances).
     fn set_view_changes(&self, count: u64) {}
+
+    /// Set the view syncs gauge (rounds we caught up to from peers).
+    fn set_view_syncs(&self, count: u64) {}
 
     /// Set the mempool size gauge.
     fn set_mempool_size(&self, size: usize) {}
@@ -535,6 +538,12 @@ pub fn set_bft_round(round: u64) {
 #[inline]
 pub fn set_view_changes(count: u64) {
     recorder().set_view_changes(count);
+}
+
+/// Set the view syncs gauge.
+#[inline]
+pub fn set_view_syncs(count: u64) {
+    recorder().set_view_syncs(count);
 }
 
 /// Set the mempool size gauge.

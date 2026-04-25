@@ -38,9 +38,19 @@ pub(crate) struct ViewChangeController {
     /// Byzantine leader can't spam headers to delay view changes.
     pub(crate) last_header_reset: Option<(BlockHeight, Round)>,
 
-    /// Cumulative count of view changes (round advances due to timeout),
-    /// exported as a metric.
+    /// Cumulative count of view changes (round advances due to local
+    /// leader-activity timeout). Self-originated only; does not count
+    /// rounds we advanced to via `sync_to_qc_round` because some other
+    /// validator timed out and we're catching up.
     pub(crate) view_changes: u64,
+
+    /// Cumulative count of view syncs (rounds we jumped to because a
+    /// header / vote / QC arrived carrying a higher round than ours).
+    /// Distinct from `view_changes`: a node that never times out itself
+    /// can still see its `view` climb to thousands if peers keep timing
+    /// out and it perpetually catches up. Watching only `view_changes`
+    /// hides cluster-wide view-change activity at the slowest validator.
+    pub(crate) view_syncs: u64,
 }
 
 impl ViewChangeController {
@@ -51,6 +61,7 @@ impl ViewChangeController {
             last_leader_activity: None,
             last_header_reset: None,
             view_changes: 0,
+            view_syncs: 0,
         }
     }
 
@@ -120,12 +131,14 @@ impl ViewChangeController {
         self.view
     }
 
-    /// Synchronize the local round to a QC's round if the QC is ahead. Keeps
-    /// us from falling behind the rest of the network after a partition.
+    /// Synchronize the local round to a higher round seen on a QC, header,
+    /// or vote. Keeps us from falling behind the rest of the network after
+    /// a partition or when peers are timing out faster than we are.
     /// Returns `true` if the view was advanced.
     pub fn sync_to_qc_round(&mut self, qc_round: Round) -> bool {
         if qc_round > self.view {
             self.view = qc_round;
+            self.view_syncs += 1;
             true
         } else {
             false

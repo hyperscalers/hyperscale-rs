@@ -84,11 +84,13 @@ fn stats_reports_initial_defaults() {
     let coordinator = fresh_coordinator(BftConfig::default());
     let BftStats {
         view_changes,
+        view_syncs,
         current_round,
         committed_height,
     } = coordinator.stats();
 
     assert_eq!(view_changes, 0);
+    assert_eq!(view_syncs, 0);
     assert_eq!(current_round, Round::INITIAL.0);
     assert_eq!(committed_height, BlockHeight::GENESIS);
 }

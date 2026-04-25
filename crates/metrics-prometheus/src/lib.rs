@@ -25,6 +25,7 @@ pub struct Metrics {
     pub block_height: Gauge,
     pub round: Gauge,
     pub view_changes: Gauge,
+    pub view_syncs: Gauge,
     pub build_info: GaugeVec,
 
     // === Transactions ===
@@ -178,7 +179,13 @@ impl Metrics {
 
             view_changes: register_gauge!(
                 "hyperscale_view_changes",
-                "Total number of view changes (round advances due to timeout)"
+                "Self-originated view changes (this validator's leader-activity timer fired)"
+            )
+            .unwrap(),
+
+            view_syncs: register_gauge!(
+                "hyperscale_view_syncs",
+                "Rounds advanced via sync_to_qc_round (caught up to higher round seen on peers)"
             )
             .unwrap(),
 
@@ -769,6 +776,10 @@ impl MetricsRecorder for PrometheusRecorder {
 
     fn set_view_changes(&self, count: u64) {
         self.metrics.view_changes.set(count as f64);
+    }
+
+    fn set_view_syncs(&self, count: u64) {
+        self.metrics.view_syncs.set(count as f64);
     }
 
     fn set_mempool_size(&self, size: usize) {

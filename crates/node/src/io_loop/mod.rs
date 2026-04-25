@@ -178,6 +178,7 @@ pub struct NodeStatusSnapshot {
 pub struct MetricsSnapshot {
     pub bft_round: u64,
     pub view_changes: u64,
+    pub view_syncs: u64,
     pub mempool_size: usize,
     pub contention_ratio: f64,
     pub in_flight: usize,
@@ -201,6 +202,7 @@ pub struct MetricsSnapshot {
 pub fn record_metrics<S: ChainWriter>(snapshot: MetricsSnapshot, storage: &S) {
     metrics::set_bft_round(snapshot.bft_round);
     metrics::set_view_changes(snapshot.view_changes);
+    metrics::set_view_syncs(snapshot.view_syncs);
     metrics::set_mempool_size(snapshot.mempool_size);
     metrics::set_lock_contention(snapshot.contention_ratio);
     metrics::set_in_flight(snapshot.in_flight);
@@ -1134,6 +1136,7 @@ where
         MetricsSnapshot {
             bft_round: bft_stats.current_round,
             view_changes: bft_stats.view_changes,
+            view_syncs: bft_stats.view_syncs,
             mempool_size: mempool.len(),
             contention_ratio: contention.contention_ratio(),
             in_flight: mempool.in_flight(),
