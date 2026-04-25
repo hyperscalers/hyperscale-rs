@@ -469,6 +469,17 @@ impl LivelockState {
         &self.pending_abort_intents
     }
 
+    /// Remove expired tombstones. Called during block commit to prevent unbounded growth.
+    fn cleanup_tombstones(&mut self) {
+        let now = self.now;
+        let before = self.tombstones.len();
+        self.tombstones.retain(|_, &mut expiry| expiry > now);
+        let pruned = before - self.tombstones.len();
+        if pruned > 0 {
+            tracing::debug!(pruned, remaining = self.tombstones.len(), "Pruned expired livelock tombstones");
+        }
+    }
+
     /// Called when a block is committed.
     ///
     /// First registers any cross-shard transactions for cycle detection,
@@ -540,6 +551,9 @@ impl LivelockState {
         // Keep only abort intents still in our hash set (those not in this block)
         self.pending_abort_intents
             .retain(|d| self.pending_abort_intent_hashes.contains(&d.tx_hash));
+
+        // Prune expired tombstones to prevent unbounded growth.
+        self.cleanup_tombstones();
 
         trace!(
             height = height.0,
@@ -1109,5 +1123,36 @@ mod tests {
             outputs.is_empty(),
             "Late provision after abort should be rejected by tombstone"
         );
+    }
+
+    #[test]
+    fn test_tombstone_cleanup_removes_expired() {
+        let config = LivelockConfig {
+            tombstone_ttl: Duration::from_secs(30),
+            ..Default::default()
+        };
+        let mut state = LivelockState::with_config(config);
+
+        // Insert tombstones at t=10s (expire at t=40s)
+        state.set_time(Duration::from_secs(10));
+        let tx1 = hash_with_prefix(1);
+        let tx2 = hash_with_prefix(2);
+        state.tombstones.insert(tx1, Duration::from_secs(40));
+        state.tombstones.insert(tx2, Duration::from_secs(40));
+
+        // Insert a tombstone at t=30s (expires at t=60s)
+        let tx3 = hash_with_prefix(3);
+        state.tombstones.insert(tx3, Duration::from_secs(60));
+
+        assert_eq!(state.tombstones.len(), 3);
+
+        // Advance to t=50s — tx1 and tx2 should be pruned, tx3 should remain
+        state.set_time(Duration::from_secs(50));
+        state.cleanup_tombstones();
+
+        assert_eq!(state.tombstones.len(), 1);
+        assert!(!state.tombstones.contains_key(&tx1));
+        assert!(!state.tombstones.contains_key(&tx2));
+        assert!(state.tombstones.contains_key(&tx3));
     }
 }

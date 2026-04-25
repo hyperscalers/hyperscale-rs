@@ -1008,9 +1008,14 @@ impl ExecutionState {
         });
 
         if !has_any_tracker {
-            // No tracker yet — buffer entire EC for later replay when block commits
-            let ec_arc = Arc::new(cert);
-            self.early_wave_attestations.push((ec_arc, current_height));
+            // No tracker yet — buffer entire EC for later replay when block commits.
+            // Cap at 1,000 entries to prevent unbounded growth from Byzantine peers.
+            if self.early_wave_attestations.len() < 1_000 {
+                let ec_arc = Arc::new(cert);
+                self.early_wave_attestations.push((ec_arc, current_height));
+            } else {
+                tracing::warn!("Dropping early wave attestation — buffer at capacity (1000)");
+            }
             return vec![];
         }
 
@@ -1086,9 +1091,11 @@ impl ExecutionState {
         });
         if has_any_tracker {
             actions.extend(self.handle_wave_attestation(topology, ec_arc));
-        } else {
+        } else if self.early_wave_attestations.len() < 1_000 {
             // Buffer for later replay when block commits and tracker is created
             self.early_wave_attestations.push((ec_arc, current_height));
+        } else {
+            tracing::warn!("Dropping early wave attestation — buffer at capacity (1000)");
         }
 
         actions
@@ -1849,11 +1856,38 @@ impl ExecutionState {
         });
         let pruned_ev = before_ev - self.early_votes.len();
 
-        if pruned_acc > 0 || pruned_vt > 0 || pruned_ev > 0 {
+        // Prune early provisioning complete entries older than 50 blocks.
+        let before_epc = self.early_provisioning_complete.len();
+        self.early_provisioning_complete
+            .retain(|_, (_, arrival_height)| *arrival_height > ev_cutoff);
+        let pruned_epc = before_epc - self.early_provisioning_complete.len();
+
+        // Prune early wave attestations older than 50 blocks.
+        let before_ewa = self.early_wave_attestations.len();
+        self.early_wave_attestations
+            .retain(|(_, arrival_height)| *arrival_height > ev_cutoff);
+        let pruned_ewa = before_ewa - self.early_wave_attestations.len();
+
+        // Prune early execution results — no arrival height tracked, so cap at 10,000 entries.
+        let pruned_eer = if self.early_execution_results.len() > 10_000 {
+            let excess = self.early_execution_results.len() - 10_000;
+            let keys_to_remove: Vec<_> = self.early_execution_results.keys().take(excess).copied().collect();
+            for key in &keys_to_remove {
+                self.early_execution_results.remove(key);
+            }
+            keys_to_remove.len()
+        } else {
+            0
+        };
+
+        if pruned_acc > 0 || pruned_vt > 0 || pruned_ev > 0 || pruned_epc > 0 || pruned_ewa > 0 || pruned_eer > 0 {
             tracing::debug!(
                 pruned_acc,
                 pruned_vt,
                 pruned_ev,
+                pruned_epc,
+                pruned_ewa,
+                pruned_eer,
                 "Pruned resolved wave state"
             );
         }
@@ -2246,5 +2280,58 @@ mod tests {
             vec![true, false],
             "Second signature should fail verification"
         );
+    }
+
+    #[test]
+    fn test_prune_early_provisioning_complete() {
+        let mut state = make_test_state();
+
+        // Insert entries at different arrival heights
+        let tx1 = test_transaction(1).hash();
+        let tx2 = test_transaction(2).hash();
+        let tx3 = test_transaction(3).hash();
+        state.early_provisioning_complete.insert(tx1, (vec![], 10));
+        state.early_provisioning_complete.insert(tx2, (vec![], 20));
+        state.early_provisioning_complete.insert(tx3, (vec![], 80));
+
+        assert_eq!(state.early_provisioning_complete.len(), 3);
+
+        // Advance committed_height to 70 — cutoff is 70-50=20
+        // Entries at height 10 and 20 should be pruned (not > 20), height 80 retained
+        state.committed_height = 70;
+        state.prune_execution_state();
+
+        assert_eq!(state.early_provisioning_complete.len(), 1);
+        assert!(state.early_provisioning_complete.contains_key(&tx3));
+    }
+
+    #[test]
+    fn test_prune_early_wave_attestations() {
+        let mut state = make_test_state();
+
+        // Insert attestations with different arrival heights (using dummy Arc<ExecutionCertificate>)
+        let dummy_ec = || {
+            Arc::new(hyperscale_types::ExecutionCertificate {
+                wave_id: WaveId::new(ShardGroupId(0), 1, std::collections::BTreeSet::new()),
+                vote_height: 1,
+                global_receipt_root: Hash::ZERO,
+                tx_outcomes: vec![],
+                aggregated_signature: Bls12381G1PrivateKey::from_u64(1).unwrap().sign_v1(b"test"),
+                signers: hyperscale_types::SignerBitfield::new(4),
+            })
+        };
+
+        state.early_wave_attestations.push((dummy_ec(), 10));
+        state.early_wave_attestations.push((dummy_ec(), 15));
+        state.early_wave_attestations.push((dummy_ec(), 80));
+
+        assert_eq!(state.early_wave_attestations.len(), 3);
+
+        // Advance committed_height to 70 — cutoff is 20
+        state.committed_height = 70;
+        state.prune_execution_state();
+
+        assert_eq!(state.early_wave_attestations.len(), 1);
+        assert_eq!(state.early_wave_attestations[0].1, 80);
     }
 }

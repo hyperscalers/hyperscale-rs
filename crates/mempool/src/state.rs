@@ -375,6 +375,17 @@ impl MempoolState {
             return vec![];
         }
 
+        // Enforce pool capacity on gossip path — prevents unbounded growth from peers.
+        // RPC submissions are bounded by at_pending_limit(); gossip must be bounded too.
+        if self.pool.len() >= self.config.max_pending + self.config.max_in_flight {
+            tracing::debug!(
+                tx_hash = ?hash,
+                pool_size = self.pool.len(),
+                "Rejecting gossip tx — pool at capacity"
+            );
+            return vec![];
+        }
+
         let cross_shard = tx.is_cross_shard(topology.num_shards());
         self.pool.insert(
             hash,
@@ -492,6 +503,28 @@ impl MempoolState {
 
         // Prune old entries from recently_evicted cache
         self.prune_recently_evicted();
+
+        // Safety-net pruning for in_flight_by_height: remove entries far older than
+        // the execution timeout. These are orphans that evict_terminal missed
+        // (e.g. due to block reorganization or dropped status updates).
+        let in_flight_cutoff = BlockHeight(
+            height
+                .0
+                .saturating_sub(EXECUTION_TIMEOUT_BLOCKS + TRANSACTION_RETENTION_BLOCKS),
+        );
+        let before_if = self.in_flight_by_height.len();
+        self.in_flight_by_height = self.in_flight_by_height.split_off(&in_flight_cutoff);
+        let pruned_if = before_if - self.in_flight_by_height.len();
+
+        // Prune tombstones older than TOMBSTONE_RETENTION_BLOCKS.
+        let tombstone_cutoff = height.0.saturating_sub(TOMBSTONE_RETENTION_BLOCKS);
+        let before_ts = self.tombstones.len();
+        self.tombstones.retain(|_, &mut h| h.0 > tombstone_cutoff);
+        let pruned_ts = before_ts - self.tombstones.len();
+
+        if pruned_if > 0 || pruned_ts > 0 {
+            tracing::debug!(pruned_if, pruned_ts, "Pruned stale mempool tracking state");
+        }
 
         // Ensure all committed transactions are in the mempool.
         // This handles the case where we fetched transactions to vote on a block
@@ -2143,5 +2176,78 @@ mod tests {
         mempool.set_time(Duration::from_millis(1_500));
         let ready = mempool.ready_transactions(10, 0, 0);
         assert_eq!(ready.transactions.len(), 2, "Both should be eligible");
+    }
+
+    #[test]
+    fn test_gossip_rejects_at_pool_capacity() {
+        let topology = make_test_topology();
+        let mut mempool = MempoolState::with_config(MempoolConfig {
+            max_in_flight: 3,
+            max_pending: 2,
+            min_dwell_time: Duration::ZERO,
+        });
+
+        // Fill pool to capacity (max_pending + max_in_flight = 5)
+        for i in 0..5u8 {
+            let tx = test_transaction(i);
+            mempool.on_transaction_gossip(&topology, Arc::new(tx), false);
+        }
+        assert_eq!(mempool.pool.len(), 5);
+
+        // Next gossip tx should be rejected
+        let tx_over = test_transaction(99);
+        let tx_over_hash = tx_over.hash();
+        let actions = mempool.on_transaction_gossip(&topology, Arc::new(tx_over), false);
+        assert!(actions.is_empty());
+        assert!(!mempool.pool.contains_key(&tx_over_hash), "Should reject gossip tx at capacity");
+        assert_eq!(mempool.pool.len(), 5);
+    }
+
+    #[test]
+    fn test_stale_in_flight_by_height_pruned() {
+        let topology = make_test_topology();
+        let mut mempool = MempoolState::new();
+
+        // Manually insert stale in_flight_by_height entries
+        let tx1 = test_transaction(1).hash();
+        let tx2 = test_transaction(2).hash();
+        let tx3 = test_transaction(3).hash();
+        mempool.in_flight_by_height.insert(BlockHeight(5), vec![tx1]);
+        mempool.in_flight_by_height.insert(BlockHeight(10), vec![tx2]);
+        mempool.in_flight_by_height.insert(BlockHeight(200), vec![tx3]);
+
+        assert_eq!(mempool.in_flight_by_height.len(), 3);
+
+        // Commit a block at height 200 — cutoff = 200 - 50 - 50 = 100
+        // Entries at height 5 and 10 should be pruned, height 200 retained
+        let block = make_test_block(200, vec![], vec![]);
+        mempool.on_block_committed_full(&topology, &block);
+
+        assert_eq!(mempool.in_flight_by_height.len(), 1);
+        assert!(mempool.in_flight_by_height.contains_key(&BlockHeight(200)));
+    }
+
+    #[test]
+    fn test_stale_tombstones_pruned() {
+        let topology = make_test_topology();
+        let mut mempool = MempoolState::new();
+
+        // Insert tombstones at old heights
+        let tx1 = test_transaction(1).hash();
+        let tx2 = test_transaction(2).hash();
+        let tx3 = test_transaction(3).hash();
+        mempool.tombstones.insert(tx1, BlockHeight(10));
+        mempool.tombstones.insert(tx2, BlockHeight(50));
+        mempool.tombstones.insert(tx3, BlockHeight(600));
+
+        assert_eq!(mempool.tombstones.len(), 3);
+
+        // Commit block at height 600 — tombstone cutoff = 600 - 500 = 100
+        // Entries at height 10 and 50 should be pruned, height 600 retained
+        let block = make_test_block(600, vec![], vec![]);
+        mempool.on_block_committed_full(&topology, &block);
+
+        assert_eq!(mempool.tombstones.len(), 1);
+        assert!(mempool.tombstones.contains_key(&tx3));
     }
 }
