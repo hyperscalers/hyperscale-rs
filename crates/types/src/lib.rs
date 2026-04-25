@@ -104,7 +104,7 @@ pub use receipt::{
 pub use signer_bitfield::SignerBitfield;
 pub use state::{StateEntry, StateProvision};
 pub use timeouts::{REMOTE_HEADER_RETENTION, RETENTION_HORIZON, WAVE_TIMEOUT};
-pub use timestamp::{ProposerTimestamp, WeightedTimestamp};
+pub use timestamp::{LocalTimestamp, ProposerTimestamp, WeightedTimestamp};
 pub use timestamp_range::{TimestampRange, MAX_VALIDITY_RANGE};
 pub use topology::{node_id_hash_u64, shard_for_node, TopologySnapshot, TopologySnapshotError};
 pub use transaction::{
