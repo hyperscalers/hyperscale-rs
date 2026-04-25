@@ -325,43 +325,40 @@ where
             Action::EmitTransactionStatus {
                 tx_hash,
                 status,
-                added_at,
                 cross_shard,
                 submitted_locally,
-                phase_times,
             } => {
                 trace!(?tx_hash, ?status, "Transaction status");
+                let now = self.state.now();
+                let terminal_phases = self.tx_phase_times.observe_status(tx_hash, &status, now);
                 if status.is_final() && submitted_locally {
-                    let now = self.state.now();
-                    let latency_secs = now.saturating_sub(added_at).as_secs_f64();
-                    if latency_secs > 10.0 {
-                        // Rate-limit slow tx warnings to avoid log floods during
-                        // cross-shard latency spikes.
-                        let since_last_warn = now.saturating_sub(self.last_slow_tx_warn);
-                        if since_last_warn >= std::time::Duration::from_secs(30) {
-                            self.last_slow_tx_warn = now;
-                            if let Some(ref phases) = phase_times {
+                    if let Some(phases) = terminal_phases {
+                        let latency_secs = now.saturating_sub(phases.added_at()).as_secs_f64();
+                        if latency_secs > 10.0 {
+                            // Rate-limit slow tx warnings to avoid log floods during
+                            // cross-shard latency spikes.
+                            let since_last_warn = now.saturating_sub(self.last_slow_tx_warn);
+                            if since_last_warn >= std::time::Duration::from_secs(30) {
+                                self.last_slow_tx_warn = now;
+                                let phases_display = phases.display_at(now);
                                 warn!(
                                     ?tx_hash,
                                     latency_secs,
                                     cross_shard,
-                                    %phases,
-                                    "Transaction finalization exceeded 10s"
-                                );
-                            } else {
-                                warn!(
-                                    ?tx_hash,
-                                    latency_secs,
-                                    cross_shard,
+                                    %phases_display,
                                     "Transaction finalization exceeded 10s"
                                 );
                             }
                         }
+                        metrics::record_transaction_finalized(latency_secs, cross_shard);
                     }
-                    metrics::record_transaction_finalized(latency_secs, cross_shard);
                 }
                 self.tx_status_cache.insert(tx_hash, status.clone());
                 self.emitted_statuses.push((tx_hash, status));
+            }
+            Action::RecordTxEcCreated { tx_hashes } => {
+                self.tx_phase_times
+                    .record_ec_created(&tx_hashes, self.state.now());
             }
 
             // ═══════════════════════════════════════════════════════════

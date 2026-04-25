@@ -21,6 +21,7 @@
 mod actions;
 mod batches;
 mod handlers;
+mod phase_times;
 mod protocols;
 mod verify;
 
@@ -337,6 +338,11 @@ where
     /// Rate-limited to avoid flooding logs during cross-shard latency spikes.
     last_slow_tx_warn: hyperscale_types::LocalTimestamp,
 
+    /// Per-tx phase-time stamps for the slow-tx finalization log. Populated
+    /// from `EmitTransactionStatus` and `RecordTxEcCreated` actions; entries
+    /// are dropped on terminal status.
+    tx_phase_times: phase_times::TxPhaseTimesCache,
+
     // Execution certificate cache for fallback serving.
     // Shared with request handler thread. Keyed by (wave_id_hash, wave_id).
     exec_cert_cache: ExecCertCache,
@@ -428,6 +434,7 @@ where
             exec_cert_cache: Arc::new(Mutex::new(HashMap::new())),
             tx_status_cache: Arc::new(QuickCache::new(DEFAULT_TX_STATUS_CACHE_SIZE)),
             last_slow_tx_warn: hyperscale_types::LocalTimestamp::ZERO,
+            tx_phase_times: phase_times::TxPhaseTimesCache::default(),
             pending_commit_task: None,
             emitted_statuses: Vec::new(),
             actions_generated: 0,

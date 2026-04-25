@@ -149,7 +149,7 @@ fn on_block_committed_transitions_pending_to_committed_and_bumps_in_flight() {
         vec![Arc::new(tx)],
         vec![],
     );
-    coord.on_block_committed(&topology, &certify(block, 1_000), LocalTimestamp::ZERO);
+    coord.on_block_committed(&topology, &certify(block, 1_000));
 
     assert_eq!(coord.in_flight(), 1);
     assert_eq!(
@@ -178,7 +178,7 @@ fn on_block_committed_with_finalized_wave_tombstones_and_evicts() {
         vec![Arc::new(tx.clone())],
         vec![Arc::new(fw)],
     );
-    coord.on_block_committed(&topology, &certify(block, 1_000), LocalTimestamp::ZERO);
+    coord.on_block_committed(&topology, &certify(block, 1_000));
 
     // Terminal state: evicted from pool, tombstoned so gossip can't revive it.
     assert!(coord.status(&tx_hash).is_none());

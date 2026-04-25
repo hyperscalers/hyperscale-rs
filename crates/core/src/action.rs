@@ -2,7 +2,6 @@
 
 use crate::{ProtocolEvent, TimerId};
 use hyperscale_messages::TransactionGossip;
-use hyperscale_types::LocalTimestamp;
 use hyperscale_types::{
     Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, BlockVote, Bls12381G1PublicKey,
     Bls12381G2Signature, CertificateRoot, CommittedBlockHeader, EpochConfig, EpochId,
@@ -13,118 +12,8 @@ use hyperscale_types::{
     VotePower, WaveId, WaveIdHash, WeightedTimestamp,
 };
 use std::collections::HashMap;
-use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
-
-/// Phase timing breakdown for transaction finalization.
-///
-/// Tracks local wall-clock timestamps (`LocalTimestamp`, i.e. ms since the
-/// io_loop's clock origin) at each phase transition, enabling diagnosis of
-/// slow finalization. Local-only — never serialized, never compared across
-/// validators.
-#[derive(Debug, Clone)]
-pub struct FinalizationPhaseTimes {
-    /// When the transaction was first added to the mempool.
-    pub added_at: LocalTimestamp,
-    /// When the block containing the transaction was committed.
-    pub committed_at: Option<LocalTimestamp>,
-    /// When cross-shard provisions arrived for this transaction.
-    /// None for single-shard transactions (provisioned immediately).
-    pub provisioned_at: Option<LocalTimestamp>,
-    /// When all transactions in the wave became ready (all provisioned/aborted).
-    /// Captures time spent waiting for other transactions in the same batch.
-    pub wave_ready_at: Option<LocalTimestamp>,
-    /// When the local execution certificate was created (local votes aggregated).
-    pub ec_created_at: Option<LocalTimestamp>,
-    /// When the wave certificate was created (all shards reported ECs).
-    pub executed_at: Option<LocalTimestamp>,
-    /// When the transaction reached terminal state (TC committed in block).
-    pub completed_at: LocalTimestamp,
-}
-
-impl fmt::Display for FinalizationPhaseTimes {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let total = self
-            .completed_at
-            .saturating_sub(self.added_at)
-            .as_secs_f64();
-        let mempool_to_commit = self
-            .committed_at
-            .map(|c| c.saturating_sub(self.added_at).as_secs_f64());
-
-        // Break the old "execution" phase into: provisioning → batch_wait → execution
-        let commit_to_provision = match (self.committed_at, self.provisioned_at) {
-            (Some(c), Some(p)) => Some(p.saturating_sub(c).as_secs_f64()),
-            _ => None,
-        };
-        let provision_to_wave_ready = match (self.provisioned_at, self.wave_ready_at) {
-            (Some(p), Some(w)) => Some(w.saturating_sub(p).as_secs_f64()),
-            _ => None,
-        };
-        let wave_ready_to_ec = match (self.wave_ready_at, self.ec_created_at) {
-            (Some(w), Some(e)) => Some(e.saturating_sub(w).as_secs_f64()),
-            _ => None,
-        };
-        let ec_to_exec = match (self.ec_created_at, self.executed_at) {
-            (Some(e), Some(x)) => Some(x.saturating_sub(e).as_secs_f64()),
-            _ => None,
-        };
-        // Fallback: if no ec_created_at, show wave_ready→executed as "voting"
-        let wave_ready_to_exec = if wave_ready_to_ec.is_none() {
-            match (self.wave_ready_at, self.executed_at) {
-                (Some(w), Some(e)) => Some(e.saturating_sub(w).as_secs_f64()),
-                _ => None,
-            }
-        } else {
-            None
-        };
-        // Fallback: if we have committed_at and executed_at but no intermediate timestamps
-        let commit_to_exec = if commit_to_provision.is_none() {
-            match (self.committed_at, self.executed_at) {
-                (Some(c), Some(e)) => Some(e.saturating_sub(c).as_secs_f64()),
-                _ => None,
-            }
-        } else {
-            None
-        };
-        let exec_to_complete = self
-            .executed_at
-            .map(|e| self.completed_at.saturating_sub(e).as_secs_f64());
-
-        write!(f, "total={total:.3}s")?;
-        if let Some(v) = mempool_to_commit {
-            write!(f, " mempool={v:.3}s")?;
-        }
-        if let Some(v) = commit_to_provision {
-            write!(f, " provisioning={v:.3}s")?;
-        }
-        if let Some(v) = provision_to_wave_ready {
-            write!(f, " batch_wait={v:.3}s")?;
-        }
-        if let Some(v) = wave_ready_to_ec {
-            write!(f, " voting={v:.3}s")?;
-        }
-        if let Some(v) = ec_to_exec {
-            write!(f, " ec_collection={v:.3}s")?;
-        }
-        if let Some(v) = wave_ready_to_exec {
-            write!(f, " voting={v:.3}s")?;
-        }
-        if let Some(v) = commit_to_exec {
-            write!(f, " execution={v:.3}s")?;
-        }
-        if let Some(v) = exec_to_complete {
-            write!(f, " tc_inclusion={v:.3}s")?;
-        }
-        // If we have committed_at but no executed_at, show the commit→complete span
-        if let (Some(c), None) = (self.committed_at, self.executed_at) {
-            let v = self.completed_at.saturating_sub(c).as_secs_f64();
-            write!(f, " commit_to_complete={v:.3}s")?;
-        }
-        Ok(())
-    }
-}
 
 /// A request to execute a cross-shard transaction with its provisions.
 #[derive(Debug, Clone)]
@@ -625,21 +514,25 @@ pub enum Action {
     /// this action, allowing clients to query transaction status via the
     /// `GET /api/v1/transactions/{hash}` endpoint.
     ///
-    /// The `added_at` field tracks when the transaction was first added to the
-    /// mempool, enabling end-to-end latency metrics for finalized transactions.
+    /// Latency tracking and phase-time stamping live in the io_loop, not
+    /// here — the mempool only emits the status itself, and the io_loop
+    /// stamps wall-clock against its own side cache (`tx_phase_times`)
+    /// keyed by `tx_hash`.
     EmitTransactionStatus {
         tx_hash: TxHash,
         status: TransactionStatus,
-        /// When the transaction was added to the mempool (for latency tracking).
-        added_at: LocalTimestamp,
         /// Whether this is a cross-shard transaction (for metrics labeling).
         cross_shard: bool,
         /// Whether this transaction was submitted locally (via RPC) vs received via gossip/fetch.
         /// Only locally-submitted transactions should contribute to latency metrics.
         submitted_locally: bool,
-        /// Phase timing breakdown for finalized transactions (populated only for terminal statuses).
-        phase_times: Option<FinalizationPhaseTimes>,
     },
+
+    /// Notify the io_loop that a local execution certificate was just
+    /// formed for `tx_hashes`. The io_loop stamps `ec_created_at` in its
+    /// per-tx phase-time side cache, used for the slow-tx finalization
+    /// log. State-machine state isn't affected — this is pure telemetry.
+    RecordTxEcCreated { tx_hashes: Vec<TxHash> },
 
     // ═══════════════════════════════════════════════════════════════════════
     // Network: BFT Votes
@@ -1007,6 +900,7 @@ impl Action {
             Action::CommitBlock { .. } => "CommitBlock",
             Action::CommitBlockByQcOnly { .. } => "CommitBlockByQcOnly",
             Action::EmitTransactionStatus { .. } => "EmitTransactionStatus",
+            Action::RecordTxEcCreated { .. } => "RecordTxEcCreated",
 
             // Storage - Consensus
             Action::SignAndBroadcastBlockVote { .. } => "SignAndBroadcastBlockVote",

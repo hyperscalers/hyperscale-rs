@@ -353,11 +353,10 @@ impl NodeStateMachine {
         // Mempool: marks Pending → Committed for block.transactions, then drives
         // each tx in `block.certificates` to its terminal state (Completed +
         // tombstone). Same behavior for consensus and sync commit paths.
-        actions.extend(self.mempool.on_block_committed(
-            self.topology.snapshot(),
-            &certified,
-            self.now,
-        ));
+        actions.extend(
+            self.mempool
+                .on_block_committed(self.topology.snapshot(), &certified),
+        );
 
         // Remote header coordinator: update liveness and check for timeouts.
         actions.extend(
@@ -418,12 +417,9 @@ impl NodeStateMachine {
     /// Handle transaction executed — notify mempool and check pending blocks.
     fn on_transaction_executed(&mut self, tx_hash: TxHash, accepted: bool) -> Vec<Action> {
         // Notify mempool
-        let mut actions = self.mempool.on_transaction_executed(
-            self.topology.snapshot(),
-            tx_hash,
-            accepted,
-            self.now,
-        );
+        let mut actions =
+            self.mempool
+                .on_transaction_executed(self.topology.snapshot(), tx_hash, accepted);
 
         // Check if any pending blocks are waiting for the finalized wave
         // that contains this tx.
@@ -442,8 +438,7 @@ impl NodeStateMachine {
     }
 
     fn on_ec_created(&mut self, tx_hashes: Vec<TxHash>) -> Vec<Action> {
-        self.mempool.on_ec_created(&tx_hashes, self.now);
-        vec![]
+        self.mempool.on_ec_created(&tx_hashes)
     }
 
     /// Handle transaction gossip received — add to mempool and check pending blocks.

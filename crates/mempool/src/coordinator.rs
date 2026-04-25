@@ -3,7 +3,7 @@
 use crate::lock_tracker::LockTracker;
 use crate::ready_set::ReadySet;
 use crate::tombstones::TombstoneStore;
-use hyperscale_core::{Action, FinalizationPhaseTimes, TransactionStatus};
+use hyperscale_core::{Action, TransactionStatus};
 use hyperscale_types::{
     BlockHeight, BloomFilter, CertifiedBlock, LocalTimestamp, NodeId, RoutableTransaction,
     TopologySnapshot, TransactionDecision, TxHash, WeightedTimestamp, DEFAULT_FPR,
@@ -130,18 +130,19 @@ pub struct MempoolMemoryStats {
 struct PoolEntry {
     tx: Arc<RoutableTransaction>,
     status: TransactionStatus,
-    added_at: LocalTimestamp,
     /// Whether this is a cross-shard transaction (cached at insertion time).
     cross_shard: bool,
     /// Whether this transaction was submitted locally (via RPC) vs received via gossip/fetch.
     /// Only locally-submitted transactions should contribute to latency metrics.
     submitted_locally: bool,
-    /// Local time when the block containing this tx was committed.
-    committed_at_time: Option<LocalTimestamp>,
-    /// Local time when the local execution certificate was created.
-    ec_created_at_time: Option<LocalTimestamp>,
-    /// Local time when the wave certificate was created (all shards reported ECs).
-    executed_at_time: Option<LocalTimestamp>,
+    /// Local time at first admission to the pool. Held only so that a tx
+    /// promoted from the deferred set back into the ready set keeps its
+    /// original dwell anchor — without this, every blocker release would
+    /// reset the dwell clock and a chronically-deferred tx could be
+    /// starved indefinitely. *Not* a telemetry stamp; phase-time tracking
+    /// for the slow-tx finalization log lives in the io_loop's
+    /// `tx_phase_times` side cache.
+    admitted_at: LocalTimestamp,
 }
 
 /// Mempool state machine.
@@ -241,10 +242,8 @@ impl MempoolCoordinator {
             return vec![Action::EmitTransactionStatus {
                 tx_hash: hash,
                 status: TransactionStatus::Pending, // Already exists
-                added_at: entry.added_at,
                 cross_shard: entry.cross_shard,
                 submitted_locally: entry.submitted_locally,
-                phase_times: None,
             }];
         }
 
@@ -273,12 +272,9 @@ impl MempoolCoordinator {
             PoolEntry {
                 tx: Arc::clone(&tx),
                 status: TransactionStatus::Pending,
-                added_at: now,
                 cross_shard,
                 submitted_locally: true, // Submitted via RPC
-                committed_at_time: None,
-                ec_created_at_time: None,
-                executed_at_time: None,
+                admitted_at: now,
             },
         );
 
@@ -292,10 +288,8 @@ impl MempoolCoordinator {
         vec![Action::EmitTransactionStatus {
             tx_hash: hash,
             status: TransactionStatus::Pending,
-            added_at: now,
             cross_shard,
             submitted_locally: true,
-            phase_times: None,
         }]
     }
 
@@ -337,12 +331,9 @@ impl MempoolCoordinator {
             PoolEntry {
                 tx: Arc::clone(&tx),
                 status: TransactionStatus::Pending,
-                added_at: now,
                 cross_shard,
                 submitted_locally,
-                committed_at_time: None,
-                ec_created_at_time: None,
-                executed_at_time: None,
+                admitted_at: now,
             },
         );
 
@@ -430,7 +421,6 @@ impl MempoolCoordinator {
         &mut self,
         topology: &TopologySnapshot,
         certified: &CertifiedBlock,
-        now: LocalTimestamp,
     ) -> Vec<Action> {
         let block = &certified.block;
         let height = block.height();
@@ -458,12 +448,12 @@ impl MempoolCoordinator {
                 PoolEntry {
                     tx: Arc::clone(tx),
                     status: TransactionStatus::Pending, // Will be updated by execution
-                    added_at: now,
                     cross_shard: tx.is_cross_shard(num_shards),
                     submitted_locally: false, // Fetched for block processing
-                    committed_at_time: None,
-                    ec_created_at_time: None,
-                    executed_at_time: None,
+                    // Block-committed entries skip the dwell path entirely
+                    // (next loop transitions them straight to Committed +
+                    // takes locks), so the anchor is never read.
+                    admitted_at: LocalTimestamp::ZERO,
                 }
             });
         }
@@ -476,11 +466,9 @@ impl MempoolCoordinator {
             if let Some(entry) = self.pool.get_mut(&hash) {
                 // Only update if still Pending (avoid overwriting later states during sync)
                 if matches!(entry.status, TransactionStatus::Pending) {
-                    let added_at = entry.added_at;
                     let cross_shard = entry.cross_shard;
                     let submitted_locally = entry.submitted_locally;
                     entry.status = TransactionStatus::Committed(height);
-                    entry.committed_at_time = Some(now);
                     // Remove from ready tracking (no longer Pending)
                     self.remove_from_ready_tracking(&hash);
                     // Add locks for committed transactions and update counter
@@ -489,10 +477,8 @@ impl MempoolCoordinator {
                     actions.push(Action::EmitTransactionStatus {
                         tx_hash: hash,
                         status: TransactionStatus::Committed(height),
-                        added_at,
                         cross_shard,
                         submitted_locally,
-                        phase_times: None,
                     });
                 }
             }
@@ -506,8 +492,7 @@ impl MempoolCoordinator {
                 if matches!(decision, TransactionDecision::Aborted) {
                     hyperscale_metrics::record_transaction_aborted();
                 }
-                actions
-                    .extend(self.process_certificate_committed(topology, tx_hash, decision, now));
+                actions.extend(self.process_certificate_committed(topology, tx_hash, decision));
             }
         }
 
@@ -523,31 +508,18 @@ impl MempoolCoordinator {
         topology: &TopologySnapshot,
         tx_hash: TxHash,
         decision: TransactionDecision,
-        now: LocalTimestamp,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
 
         if let Some(entry) = self.pool.get(&tx_hash) {
-            let added_at = entry.added_at;
             let cross_shard = entry.cross_shard;
             let submitted_locally = entry.submitted_locally;
-            let phase_times = Some(FinalizationPhaseTimes {
-                added_at: entry.added_at,
-                committed_at: entry.committed_at_time,
-                provisioned_at: None,
-                wave_ready_at: None,
-                ec_created_at: entry.ec_created_at_time,
-                executed_at: entry.executed_at_time,
-                completed_at: now,
-            });
 
             actions.push(Action::EmitTransactionStatus {
                 tx_hash,
                 status: TransactionStatus::Completed(decision),
-                added_at,
                 cross_shard,
                 submitted_locally,
-                phase_times,
             });
 
             // Release locks and evict — same for all terminal states
@@ -557,13 +529,17 @@ impl MempoolCoordinator {
         actions
     }
 
-    /// Record when the local execution certificate was created for a wave's txs.
-    pub fn on_ec_created(&mut self, tx_hashes: &[TxHash], now: LocalTimestamp) {
-        for tx_hash in tx_hashes {
-            if let Some(entry) = self.pool.get_mut(tx_hash) {
-                entry.ec_created_at_time = Some(now);
-            }
+    /// Record that local ECs were just formed for these transactions.
+    /// Pure telemetry — emits a `RecordTxEcCreated` action that the io_loop
+    /// stamps into its phase-time side cache for the slow-tx finalization
+    /// log. State-machine state isn't touched.
+    pub fn on_ec_created(&self, tx_hashes: &[TxHash]) -> Vec<Action> {
+        if tx_hashes.is_empty() {
+            return vec![];
         }
+        vec![Action::RecordTxEcCreated {
+            tx_hashes: tx_hashes.to_vec(),
+        }]
     }
 
     /// Mark a transaction as executed (execution complete, certificate created).
@@ -575,7 +551,6 @@ impl MempoolCoordinator {
         _topology: &TopologySnapshot,
         tx_hash: TxHash,
         accepted: bool,
-        now: LocalTimestamp,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
 
@@ -585,7 +560,6 @@ impl MempoolCoordinator {
             } else {
                 TransactionDecision::Reject
             };
-            let added_at = entry.added_at;
             let cross_shard = entry.cross_shard;
             let submitted_locally = entry.submitted_locally;
 
@@ -608,17 +582,14 @@ impl MempoolCoordinator {
                 decision,
                 committed_at,
             };
-            entry.executed_at_time = Some(now);
             actions.push(Action::EmitTransactionStatus {
                 tx_hash,
                 status: TransactionStatus::Executed {
                     decision,
                     committed_at,
                 },
-                added_at,
                 cross_shard,
                 submitted_locally,
-                phase_times: None,
             });
         }
 
@@ -696,7 +667,7 @@ impl MempoolCoordinator {
         for tx_hash in promotable {
             if let Some(entry) = self.pool.get(&tx_hash) {
                 if entry.status == TransactionStatus::Pending {
-                    to_readd.push((tx_hash, Arc::clone(&entry.tx), entry.added_at));
+                    to_readd.push((tx_hash, Arc::clone(&entry.tx), entry.admitted_at));
                 }
             }
         }
@@ -1027,7 +998,7 @@ mod tests {
             tx,
             make_finalized_wave(BlockHeight(1), tx_hash, TransactionDecision::Aborted),
         );
-        let actions = mempool.on_block_committed(&topology, &certified, LocalTimestamp::ZERO);
+        let actions = mempool.on_block_committed(&topology, &certified);
 
         // Should have emitted Completed(Aborted) status
         let aborted_action = actions.iter().find(|a| {
@@ -1068,7 +1039,7 @@ mod tests {
             tx_done.clone(),
             make_finalized_wave(BlockHeight(1), tx_done_hash, TransactionDecision::Accept),
         );
-        mempool.on_block_committed(&topology, &certified, LocalTimestamp::ZERO);
+        mempool.on_block_committed(&topology, &certified);
 
         let bf = mempool.tx_bloom_snapshot().expect("sizing ok");
         assert!(bf.contains(&tx_live_hash));
@@ -1097,7 +1068,7 @@ mod tests {
             tx.clone(),
             make_finalized_wave(BlockHeight(1), tx_hash, TransactionDecision::Accept),
         );
-        mempool.on_block_committed(&topology, &certified, LocalTimestamp::ZERO);
+        mempool.on_block_committed(&topology, &certified);
 
         // Verify it's tombstoned
         assert!(mempool.is_tombstoned(&tx_hash));
@@ -1130,7 +1101,7 @@ mod tests {
             tx.clone(),
             make_finalized_wave(BlockHeight(1), tx_hash, TransactionDecision::Accept),
         );
-        mempool.on_block_committed(&topology, &certified, LocalTimestamp::ZERO);
+        mempool.on_block_committed(&topology, &certified);
 
         // Try to re-submit - should be rejected (no status emitted)
         let actions =
@@ -1176,7 +1147,6 @@ mod tests {
         mempool.on_block_committed(
             topology,
             &hyperscale_test_helpers::certify(block, TEST_BLOCK_INTERVAL_MS),
-            LocalTimestamp::ZERO,
         );
 
         assert!(
@@ -1322,15 +1292,11 @@ mod tests {
             vec![Arc::new(single_tx), Arc::new(cross_tx)],
             vec![],
         );
-        mempool.on_block_committed(
-            &topology,
-            &hyperscale_test_helpers::certify(block1, 1_000),
-            LocalTimestamp::ZERO,
-        );
+        mempool.on_block_committed(&topology, &hyperscale_test_helpers::certify(block1, 1_000));
         assert_eq!(mempool.in_flight(), 2, "Committed TXs hold state locks");
 
         // Execution completes for the cross-shard tx — Executed still holds locks.
-        mempool.on_transaction_executed(&topology, cross_hash, true, LocalTimestamp::ZERO);
+        mempool.on_transaction_executed(&topology, cross_hash, true);
         assert_eq!(mempool.in_flight(), 2, "Executed TX still holds locks");
 
         // Block 2 carries the wave cert for the cross-shard tx — completes it.
@@ -1346,15 +1312,11 @@ mod tests {
                 TransactionDecision::Accept,
             ))],
         );
-        mempool.on_block_committed(
-            &topology,
-            &hyperscale_test_helpers::certify(block2, 2_000),
-            LocalTimestamp::ZERO,
-        );
+        mempool.on_block_committed(&topology, &hyperscale_test_helpers::certify(block2, 2_000));
         assert_eq!(mempool.in_flight(), 1, "Completed TX releases its lock");
 
         // Execute then finalize the single-shard tx.
-        mempool.on_transaction_executed(&topology, single_hash, true, LocalTimestamp::ZERO);
+        mempool.on_transaction_executed(&topology, single_hash, true);
         assert_eq!(mempool.in_flight(), 1);
 
         let block3 = hyperscale_test_helpers::make_live_block(
@@ -1369,11 +1331,7 @@ mod tests {
                 TransactionDecision::Accept,
             ))],
         );
-        mempool.on_block_committed(
-            &topology,
-            &hyperscale_test_helpers::certify(block3, 3_000),
-            LocalTimestamp::ZERO,
-        );
+        mempool.on_block_committed(&topology, &hyperscale_test_helpers::certify(block3, 3_000));
         assert_eq!(mempool.in_flight(), 0, "All completed");
     }
 
