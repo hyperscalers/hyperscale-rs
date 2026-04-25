@@ -191,7 +191,7 @@ impl NodeStateMachine {
             self.mempool
                 .ready_transactions(max_txs, pending_txs, pending_certs, self.now);
         let finalized_waves = self.execution.get_finalized_waves();
-        let provision_batches = self.provisions.queued_provisions();
+        let provision_batches = self.provisions.queued_provisions(self.now);
 
         ProposalInputs {
             ready_txs,
@@ -627,6 +627,7 @@ impl StateMachine for NodeStateMachine {
                 batch,
                 committed_header,
                 valid,
+                self.now,
             ),
             ProtocolEvent::ProvisionVerified { batch, .. } => {
                 let mut actions = self
@@ -836,7 +837,6 @@ impl StateMachine for NodeStateMachine {
     fn set_time(&mut self, now: LocalTimestamp) {
         self.now = now;
         self.bft.set_time(now);
-        self.provisions.set_time(now);
     }
 
     fn now(&self) -> LocalTimestamp {

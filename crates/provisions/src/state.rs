@@ -207,15 +207,6 @@ pub struct ProvisionCoordinator {
     /// up can still receive `Block::Live` (with inline provisions) for any
     /// block within the cross-shard execution window.
     committed_retention: BTreeMap<WeightedTimestamp, Vec<ProvisionHash>>,
-
-    // ═══════════════════════════════════════════════════════════════════
-    // Time
-    // ═══════════════════════════════════════════════════════════════════
-    /// Current local wall-clock time. Drives the `min_dwell_time` filter on
-    /// queued-provision selection and stamps `QueuedProvision.added_at` for
-    /// that filter — never a state-retention anchor (use
-    /// `local_committed_ts: WeightedTimestamp` for that).
-    now: LocalTimestamp,
 }
 
 impl std::fmt::Debug for ProvisionCoordinator {
@@ -266,7 +257,6 @@ impl ProvisionCoordinator {
             queued_provision_batches: Vec::new(),
             committed_batch_tombstones: HashMap::new(),
             committed_retention: BTreeMap::new(),
-            now: LocalTimestamp::ZERO,
         }
     }
 
@@ -281,11 +271,6 @@ impl ProvisionCoordinator {
             queued_provision_batches: self.queued_provision_batches.len(),
             committed_batch_tombstones: self.committed_batch_tombstones.len(),
         }
-    }
-
-    /// Set the current time.
-    pub fn set_time(&mut self, now: LocalTimestamp) {
-        self.now = now;
     }
 
     /// Handle block committed - check for timed-out expected provisions.
@@ -646,6 +631,7 @@ impl ProvisionCoordinator {
         batch: Provision,
         committed_header: Option<Arc<CommittedBlockHeader>>,
         valid: bool,
+        now: LocalTimestamp,
     ) -> Vec<Action> {
         let mut actions = vec![];
         let source_shard = batch.source_shard;
@@ -709,7 +695,7 @@ impl ProvisionCoordinator {
         // receive/verify the batch via gossip before the proposer commits it.
         self.queued_provision_batches.push(QueuedProvision {
             batch: Arc::clone(&batch),
-            added_at: self.now,
+            added_at: now,
         });
 
         debug!(
@@ -736,11 +722,11 @@ impl ProvisionCoordinator {
     /// proposal. Skips batches that haven't met `min_dwell_time` yet — they
     /// stay queued for a later call. Batches remain in the underlying queue
     /// until pruned on block commit.
-    pub fn queued_provisions(&self) -> Vec<Arc<Provision>> {
+    pub fn queued_provisions(&self, now: LocalTimestamp) -> Vec<Arc<Provision>> {
         let min_dwell = self.config.min_dwell_time;
         self.queued_provision_batches
             .iter()
-            .filter(|q| self.now.saturating_sub(q.added_at) >= min_dwell)
+            .filter(|q| now.saturating_sub(q.added_at) >= min_dwell)
             .map(|q| Arc::clone(&q.batch))
             .collect()
     }
@@ -1065,7 +1051,13 @@ mod tests {
         coordinator.on_verified_remote_header(&topology, header.clone());
         let batch = make_batch(tx_hash, source_shard, ShardGroupId(0), BlockHeight(10));
         coordinator.on_state_provisions_received(&topology, batch.clone());
-        coordinator.on_state_provisions_verified(&topology, batch, Some(header), true);
+        coordinator.on_state_provisions_verified(
+            &topology,
+            batch,
+            Some(header),
+            true,
+            LocalTimestamp::ZERO,
+        );
 
         // A duplicate batch for the same (shard, height) must short-circuit —
         // no verification action, no buffering.
@@ -1090,8 +1082,13 @@ mod tests {
         coordinator.on_state_provisions_received(&topology, batch.clone());
 
         // Verify
-        let actions =
-            coordinator.on_state_provisions_verified(&topology, batch, Some(header), true);
+        let actions = coordinator.on_state_provisions_verified(
+            &topology,
+            batch,
+            Some(header),
+            true,
+            LocalTimestamp::ZERO,
+        );
 
         // Should emit ProvisionVerified
         assert!(actions.iter().any(|a| matches!(
@@ -1115,7 +1112,13 @@ mod tests {
         coordinator.on_state_provisions_received(&topology, batch.clone());
 
         // Verification fails — no committed_header returned
-        let actions = coordinator.on_state_provisions_verified(&topology, batch, None, false);
+        let actions = coordinator.on_state_provisions_verified(
+            &topology,
+            batch,
+            None,
+            false,
+            LocalTimestamp::ZERO,
+        );
 
         // Should NOT emit ProvisionVerified
         assert!(!actions.iter().any(|a| matches!(
@@ -1299,8 +1302,13 @@ mod tests {
         coordinator.on_state_provisions_received(&topology, batch.clone());
 
         // Entire batch fails verification
-        let actions =
-            coordinator.on_state_provisions_verified(&topology, batch, Some(header), false);
+        let actions = coordinator.on_state_provisions_verified(
+            &topology,
+            batch,
+            Some(header),
+            false,
+            LocalTimestamp::ZERO,
+        );
 
         // Verification failed — no ProvisionVerified emitted
         assert!(!actions.iter().any(|a| matches!(
@@ -1441,7 +1449,13 @@ mod tests {
             BlockHeight(10),
         );
         coordinator.on_state_provisions_received(&topology, batch.clone());
-        coordinator.on_state_provisions_verified(&topology, batch, Some(header), true);
+        coordinator.on_state_provisions_verified(
+            &topology,
+            batch,
+            Some(header),
+            true,
+            LocalTimestamp::ZERO,
+        );
 
         // Expected provision should be cleared
         assert_eq!(coordinator.expected_provisions.len(), 0);
@@ -1577,7 +1591,13 @@ mod tests {
             BlockHeight(10),
         );
         coordinator.on_state_provisions_received(&topology, batch.clone());
-        coordinator.on_state_provisions_verified(&topology, batch, Some(header), true);
+        coordinator.on_state_provisions_verified(
+            &topology,
+            batch,
+            Some(header),
+            true,
+            LocalTimestamp::ZERO,
+        );
 
         // Continue past timeout threshold
         for h in 6..=15 {
@@ -1617,8 +1637,13 @@ mod tests {
             BlockHeight(10),
         );
         coordinator.on_state_provisions_received(&topology, batch.clone());
-        let actions =
-            coordinator.on_state_provisions_verified(&topology, batch, Some(header), true);
+        let actions = coordinator.on_state_provisions_verified(
+            &topology,
+            batch,
+            Some(header),
+            true,
+            LocalTimestamp::ZERO,
+        );
 
         // Should emit CancelProvisionFetch action
         assert!(
@@ -1683,7 +1708,13 @@ mod tests {
 
         let batch = make_batch(tx_hash, source_shard, ShardGroupId(0), BlockHeight(10));
         coordinator.on_state_provisions_received(&topology, batch.clone());
-        coordinator.on_state_provisions_verified(&topology, batch, Some(header), true);
+        coordinator.on_state_provisions_verified(
+            &topology,
+            batch,
+            Some(header),
+            true,
+            LocalTimestamp::ZERO,
+        );
 
         assert_eq!(
             coordinator.verified_remote_header_count(),
@@ -1733,21 +1764,22 @@ mod tests {
     // Dwell-time Tests
     // ═══════════════════════════════════════════════════════════════════════
 
-    /// Helper: verify a batch through the coordinator, returning the queue
-    /// size. Stamps `added_at` at `coordinator.now`.
+    /// Helper: verify a batch through the coordinator, stamping `added_at`
+    /// at `now`.
     fn verify_batch_into_queue(
         coordinator: &mut ProvisionCoordinator,
         topology: &TopologySnapshot,
         source_shard: ShardGroupId,
         height: BlockHeight,
         tx_hash: TxHash,
+        now: LocalTimestamp,
     ) {
         let header =
             make_committed_header_committing(source_shard, height, ShardGroupId(0), &[tx_hash]);
         coordinator.on_verified_remote_header(topology, header.clone());
         let batch = make_batch(tx_hash, source_shard, ShardGroupId(0), height);
         coordinator.on_state_provisions_received(topology, batch.clone());
-        coordinator.on_state_provisions_verified(topology, batch, Some(header), true);
+        coordinator.on_state_provisions_verified(topology, batch, Some(header), true, now);
     }
 
     #[test]
@@ -1756,17 +1788,18 @@ mod tests {
         let mut coordinator = ProvisionCoordinator::with_config(ProvisionConfig {
             min_dwell_time: Duration::ZERO,
         });
-        coordinator.set_time(LocalTimestamp::from_millis(1_000));
+        let now = LocalTimestamp::from_millis(1_000);
         verify_batch_into_queue(
             &mut coordinator,
             &topology,
             ShardGroupId(1),
             BlockHeight(10),
             TxHash::from_raw(Hash::from_bytes(b"tx1")),
+            now,
         );
 
         assert_eq!(
-            coordinator.queued_provisions().len(),
+            coordinator.queued_provisions(now).len(),
             1,
             "Zero dwell time should expose the batch immediately"
         );
@@ -1780,27 +1813,29 @@ mod tests {
         });
 
         // Verify at t=1.0s
-        coordinator.set_time(LocalTimestamp::from_millis(1_000));
         verify_batch_into_queue(
             &mut coordinator,
             &topology,
             ShardGroupId(1),
             BlockHeight(10),
             TxHash::from_raw(Hash::from_bytes(b"tx1")),
+            LocalTimestamp::from_millis(1_000),
         );
 
         // t=1.2s — dwell not met (200ms < 500ms)
-        coordinator.set_time(LocalTimestamp::from_millis(1200));
         assert_eq!(
-            coordinator.queued_provisions().len(),
+            coordinator
+                .queued_provisions(LocalTimestamp::from_millis(1_200))
+                .len(),
             0,
             "Batch younger than min_dwell_time must be skipped"
         );
 
         // t=1.5s — exactly at dwell
-        coordinator.set_time(LocalTimestamp::from_millis(1500));
         assert_eq!(
-            coordinator.queued_provisions().len(),
+            coordinator
+                .queued_provisions(LocalTimestamp::from_millis(1_500))
+                .len(),
             1,
             "Batch at min_dwell_time must become eligible"
         );
@@ -1814,29 +1849,28 @@ mod tests {
         });
 
         // t=1.0s: verify old batch
-        coordinator.set_time(LocalTimestamp::from_millis(1_000));
         verify_batch_into_queue(
             &mut coordinator,
             &topology,
             ShardGroupId(1),
             BlockHeight(10),
             TxHash::from_raw(Hash::from_bytes(b"tx_old")),
+            LocalTimestamp::from_millis(1_000),
         );
 
         // t=1.3s: verify young batch
-        coordinator.set_time(LocalTimestamp::from_millis(1300));
         verify_batch_into_queue(
             &mut coordinator,
             &topology,
             ShardGroupId(1),
             BlockHeight(11),
             TxHash::from_raw(Hash::from_bytes(b"tx_young")),
+            LocalTimestamp::from_millis(1_300),
         );
 
         // t=1.4s: old batch dwelled 400ms (eligible), young batch dwelled
         // 100ms (still blocked).
-        coordinator.set_time(LocalTimestamp::from_millis(1400));
-        let eligible = coordinator.queued_provisions();
+        let eligible = coordinator.queued_provisions(LocalTimestamp::from_millis(1_400));
         assert_eq!(eligible.len(), 1);
         assert_eq!(
             eligible[0].transactions[0].tx_hash,
