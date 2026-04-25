@@ -27,7 +27,7 @@ use crate::{
     ExecutionCertificateHash, GlobalReceiptHash, GlobalReceiptRoot, Hash, LocalReceipt,
     ProvisionTxRoot, ReceiptBundle, RoutableTransaction, ShardGroupId, SignerBitfield,
     TopologySnapshot, TransactionDecision, TransactionOutcome, TxHash, ValidatorId, WaveIdHash,
-    WaveReceiptHash, WeightedTimestamp,
+    WaveReceiptHash, WeightedTimestamp, RETENTION_HORIZON,
 };
 use sbor::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
@@ -526,6 +526,16 @@ impl ExecutionCertificate {
     /// The shard that produced this certificate.
     pub fn shard_group_id(&self) -> ShardGroupId {
         self.wave_id.shard_group_id
+    }
+
+    /// Deadline past which this certificate is provably useless on every shard.
+    ///
+    /// Anchored on `vote_anchor_ts` — the wave's BFT-authenticated commit
+    /// timestamp. Past `vote_anchor_ts + RETENTION_HORIZON` every tx in the
+    /// wave has expired its `validity_range` and terminated (success or
+    /// abort), so no shard can still reference this EC.
+    pub fn deadline(&self) -> WeightedTimestamp {
+        self.vote_anchor_ts.plus(RETENTION_HORIZON)
     }
 
     /// Block height (the block containing the wave's transactions).
@@ -1394,6 +1404,12 @@ mod tests {
 
         // Different signers + signatures → same canonical hash
         assert_eq!(ec_a.canonical_hash(), ec_b.canonical_hash());
+    }
+
+    #[test]
+    fn ec_deadline_is_vote_anchor_ts_plus_retention_horizon() {
+        let ec = make_test_wave_ec(0, 1);
+        assert_eq!(ec.deadline(), ec.vote_anchor_ts.plus(RETENTION_HORIZON));
     }
 
     fn make_test_wave_ec(shard: u64, seed: u8) -> Arc<ExecutionCertificate> {

@@ -25,7 +25,7 @@
 //! validator decides identically when to re-broadcast or evict.
 
 use hyperscale_types::{
-    ExecutionCertificate, ShardGroupId, ValidatorId, WaveId, WeightedTimestamp, RETENTION_HORIZON,
+    ExecutionCertificate, ShardGroupId, ValidatorId, WaveId, WeightedTimestamp,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -47,7 +47,11 @@ struct OutboundCertEntry {
     certificate: Arc<ExecutionCertificate>,
     target_shard: ShardGroupId,
     recipients: Vec<ValidatorId>,
-    first_sent_at: WeightedTimestamp,
+    /// Hard deadline past which the EC is provably useless: every tx in the
+    /// wave has expired and terminated. Computed via
+    /// `ExecutionCertificate::deadline()` from the wave's
+    /// `vote_anchor_ts` — the BFT-authenticated wave commit time.
+    deadline: WeightedTimestamp,
     last_sent_at: WeightedTimestamp,
     rebroadcast_count: u32,
 }
@@ -111,13 +115,14 @@ impl OutboundExecutionCertificateTracker {
             recipients = recipients.len(),
             "Tracking outbound execution certificate"
         );
+        let deadline = certificate.deadline();
         self.entries.insert(
             key,
             OutboundCertEntry {
                 certificate,
                 target_shard,
                 recipients,
-                first_sent_at: self.now,
+                deadline,
                 last_sent_at: self.now,
                 rebroadcast_count: 0,
             },
@@ -161,8 +166,7 @@ impl OutboundExecutionCertificateTracker {
         let mut to_evict = Vec::new();
 
         for (key, entry) in &mut self.entries {
-            let age = now.elapsed_since(entry.first_sent_at);
-            if age > RETENTION_HORIZON {
+            if now > entry.deadline {
                 to_evict.push(key.clone());
                 continue;
             }
@@ -184,8 +188,8 @@ impl OutboundExecutionCertificateTracker {
                     wave = %key.0,
                     target_shard = key.1.0,
                     rebroadcasts = entry.rebroadcast_count,
-                    age_secs = now.elapsed_since(entry.first_sent_at).as_secs(),
-                    "Evicting outbound execution certificate past safety horizon — \
+                    past_deadline_secs = now.elapsed_since(entry.deadline).as_secs(),
+                    "Evicting outbound execution certificate past deadline — \
                      wave never finalized; remote shard likely missed our EC"
                 );
             }
@@ -200,6 +204,7 @@ mod tests {
     use super::*;
     use hyperscale_types::{
         BlockHeight, Bls12381G2Signature, GlobalReceiptRoot, Hash, SignerBitfield,
+        RETENTION_HORIZON,
     };
 
     fn ts(ms: u64) -> WeightedTimestamp {

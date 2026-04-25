@@ -16,7 +16,10 @@
 //! of work. This eliminates the N× proof duplication that occurs when the
 //! proof is flattened into each per-transaction struct.
 
-use crate::{BlockHeight, Hash, NodeId, ProvisionHash, ShardGroupId, StateEntry, TxHash};
+use crate::{
+    BlockHeight, Hash, NodeId, ProvisionHash, ShardGroupId, StateEntry, TxHash, WeightedTimestamp,
+    RETENTION_HORIZON,
+};
 use sbor::prelude::*;
 use std::collections::HashSet;
 
@@ -231,6 +234,18 @@ impl Provision {
         self.hash
     }
 
+    /// Deadline past which this batch is provably useless on every shard.
+    ///
+    /// `source_weighted_ts` is the source block's QC `weighted_timestamp`,
+    /// available from the paired remote header. Past
+    /// `source_weighted_ts + RETENTION_HORIZON` every tx that could have
+    /// referenced this batch's data has expired its `validity_range` and
+    /// completed (or aborted via the all-abort fallback) — no shard can
+    /// still reference this batch.
+    pub fn deadline(&self, source_weighted_ts: WeightedTimestamp) -> WeightedTimestamp {
+        source_weighted_ts.plus(RETENTION_HORIZON)
+    }
+
     fn compute_hash(
         source_shard: ShardGroupId,
         block_height: &BlockHeight,
@@ -305,6 +320,18 @@ mod tests {
         storage_key.push(0);
         storage_key.push(seed);
         StateEntry::new(storage_key, Some(vec![seed, seed + 1]))
+    }
+
+    #[test]
+    fn test_provision_deadline_is_source_ts_plus_retention_horizon() {
+        let batch = Provision::new(
+            ShardGroupId(1),
+            BlockHeight(100),
+            MerkleInclusionProof::new(vec![]),
+            vec![],
+        );
+        let source_ts = WeightedTimestamp::from_millis(1_000_000);
+        assert_eq!(batch.deadline(source_ts), source_ts.plus(RETENTION_HORIZON));
     }
 
     #[test]

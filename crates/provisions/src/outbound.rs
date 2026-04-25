@@ -20,7 +20,6 @@
 use crate::store::ProvisionStore;
 use hyperscale_types::{
     BlockHeight, Provision, ProvisionHash, ShardGroupId, TxHash, TxOutcome, WeightedTimestamp,
-    RETENTION_HORIZON,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -36,7 +35,12 @@ struct OutboundEntry {
     target_shard: ShardGroupId,
     source_block_height: BlockHeight,
     pending_txs: HashSet<TxHash>,
-    generated_at: WeightedTimestamp,
+    /// Hard deadline past which the batch is provably useless: every tx in
+    /// it has expired its `validity_range` and terminated. Computed once at
+    /// insert from the latest BFT-authenticated `local_committed_ts` —
+    /// conservatively ≥ the source block's true ts, so eviction never fires
+    /// before the deadline has actually passed.
+    deadline: WeightedTimestamp,
 }
 
 /// Sub-state machine that retains outbound provision batches until the
@@ -99,7 +103,7 @@ impl OutboundProvisionTracker {
                 target_shard,
                 source_block_height: batch.block_height,
                 pending_txs: tx_hashes,
-                generated_at: self.now,
+                deadline: batch.deadline(self.now),
             },
         );
 
@@ -145,9 +149,9 @@ impl OutboundProvisionTracker {
         }
     }
 
-    /// Safety sweep: evict outbound batches older than
-    /// [`RETENTION_HORIZON`]. Fires with `warn!` — a hit indicates
-    /// the target shard never produced a terminal EC (upstream bug).
+    /// Safety sweep: evict outbound batches whose deadline has passed.
+    /// Fires with `warn!` — a hit indicates the target shard never produced
+    /// a terminal EC (upstream bug).
     pub fn on_block_committed(&mut self, now: WeightedTimestamp) {
         self.now = now;
 
@@ -155,7 +159,7 @@ impl OutboundProvisionTracker {
             .entries
             .iter()
             .filter_map(|(hash, entry)| {
-                if now.elapsed_since(entry.generated_at) > RETENTION_HORIZON {
+                if now > entry.deadline {
                     Some(*hash)
                 } else {
                     None
@@ -173,10 +177,10 @@ impl OutboundProvisionTracker {
                 target_shard = entry.target_shard.0,
                 source_block_height = entry.source_block_height.0,
                 pending_txs = entry.pending_txs.len(),
-                age_secs = now.elapsed_since(entry.generated_at).as_secs(),
-                "Evicting outbound provision past safety horizon — no terminal EC observed"
+                past_deadline_secs = now.elapsed_since(entry.deadline).as_secs(),
+                "Evicting outbound provision past deadline — no terminal EC observed"
             );
-            self.evict(&batch_hash, "safety-timeout");
+            self.evict(&batch_hash, "deadline-passed");
         }
     }
 
@@ -207,6 +211,7 @@ mod tests {
     use super::*;
     use hyperscale_types::{
         ExecutionOutcome, GlobalReceiptHash, Hash, MerkleInclusionProof, TxEntries,
+        RETENTION_HORIZON,
     };
     use std::time::Duration;
 
