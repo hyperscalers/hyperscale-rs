@@ -6,8 +6,7 @@ Rust BFT consensus protocol for Radix. 55K LOC, 28 crates, 738 tests. Built by h
 ## Repo
 - Upstream: https://github.com/hyperscalers/hyperscale-rs
 - Our fork: https://github.com/bigdevxrd/hyperscale-rs
-- Local: /Users/bigdev/Projects/hyperscale-rs
-- Builds clean on Mac (`cargo check` passes)
+- Builds clean (`cargo check` passes)
 
 ## What We've Done So Far
 1. **Forked + cloned** (Apr 8)
@@ -42,7 +41,6 @@ Hashlock (security audit firm) also opened #52 introducing themselves — signal
 
 **Before starting:**
 ```bash
-cd /Users/bigdev/Projects/hyperscale-rs
 git pull origin main  # Codebase moves fast
 cargo test -p hyperscale-mempool  # Run existing tests
 ```
@@ -66,7 +64,7 @@ cargo test -p hyperscale-mempool  # Run existing tests
 ```
 NodeInput → IoLoop → ProtocolEvent → NodeStateMachine
   ├── BftState (11,925 LOC) — HotStuff-2 consensus
-  ├── ExecutionState (2,776 LOC) — cross-shard 2PC
+  ├── ExecutionState (2,776 LOC) — cross-shard wave execution
   ├── MempoolState (2,151 LOC) — tx pool ← OUR TARGET
   ├── ProvisionCoordinator — cross-shard state
   ├── RemoteHeaderCoordinator — remote block headers
@@ -108,16 +106,6 @@ All state machine logic is **synchronous, deterministic, pure** (no I/O). I/O de
 - `CONTRIBUTION-PLAN.md` — full 6-PR phased plan with timeline
 - `HANDOFF.md` — this file
 
-## Agent Support
-- `bigdev-agents` CLI can run the researcher agent for analysis:
-  ```bash
-  cd /Users/bigdev/Projects/bigdev-agents
-  ANTHROPIC_API_KEY=<key> node scripts/run-agent.js researcher --profile hyperscale "<question>"
-  ```
-- Budget: Haiku for research ($0.001/1k tokens), free models for quick questions
-- Yesterday's agent output: `bigdev-agents/output/researcher-2026-04-08T10-01-54.md` (issue triage)
-
-## Memory References
-- `~/.claude/projects/-Users-bigdev-Projects-auto-trader-xrd/memory/project_agent_architecture.md` — agent setup
+## Related References
 - `openclaw-bert/workspace/PROJECT-HYPERSCALERS.md` — Bert's original analysis (20 issues mapped)
-- `scrypto-xrd/SCRYPTO-AUDIT-2026-04-08.md` — our Scrypto audit methodology (same rigor)
+- `scrypto-xrd/SCRYPTO-AUDIT-2026-04-08.md` — Scrypto audit methodology (same rigor)

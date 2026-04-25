@@ -125,7 +125,7 @@ Given identical state + event, always returns identical actions.
 | `bft`             | `BftState`               | HotStuff-2 consensus state            |
 | `execution`       | `ExecutionState`         | Wave execution + voting               |
 | `mempool`         | `MempoolState`           | Transaction pool                      |
-| `provisions`      | `ProvisionCoordinator`   | Cross-shard 2PC provisions            |
+| `provisions`      | `ProvisionCoordinator`   | Cross-shard provision coordination     |
 | `remote_headers`  | `RemoteHeaderCoordinator`| Remote committed header tracking      |
 | `livelock`        | `LivelockState`          | Cross-shard cycle detection           |
 | `now`             | `Duration`               | Logical clock                         |

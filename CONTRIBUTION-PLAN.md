@@ -25,7 +25,7 @@ We posted a detailed security audit on #22 (unbounded data structures) — first
 |-------|-----|------|---------------|
 | **bft** | 11,925 | Highest — core consensus | Strong (Rust + protocol knowledge) |
 | **types** | 7,157 | Foundation — changes ripple everywhere | Medium (careful, low risk) |
-| **execution** | 2,776 | Cross-shard 2PC | Strong (we understand Radix execution) |
+| **execution** | 2,776 | Cross-shard wave execution | Strong (we understand Radix execution) |
 | **mempool** | 2,151 | Our audit target | Strong (we identified the bugs) |
 | **engine** | 2,083 | Radix Engine integration | Very strong (Scrypto expertise) |
 | **livelock** | 1,524 | Deadlock detection | Medium |
@@ -162,7 +162,6 @@ We posted a detailed security audit on #22 (unbounded data structures) — first
 
 ```bash
 # Build
-cd /Users/bigdev/Projects/hyperscale-rs
 cargo build --release
 
 # Test specific crate

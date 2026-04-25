@@ -16,7 +16,7 @@ Rust implementation of the Hyperscale consensus protocol for Radix. Sharded BFT 
 ## Key Architecture
 - Two-chain commit (HotStuff-2 based)
 - Optimistic pipelining — propose immediately after QC formation
-- Cross-shard 2PC for multi-shard transactions
+- Wave-based cross-shard execution voting (not 2PC)
 - Deterministic simulation as first-class testing
 - Radix Engine integration for smart contract execution
 
