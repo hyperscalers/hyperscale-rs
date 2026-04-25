@@ -229,6 +229,12 @@ impl NodeStateMachine {
         // anyway, so the tombstone is no longer correctness-bearing.
         self.mempool.cleanup_expired_tombstones();
 
+        // Drop pending pool entries past their `end_timestamp_exclusive`.
+        // The proposer filter already skips them at selection time; this
+        // sweep keeps the pool from accumulating dead entries when expiry
+        // outpaces selection (transient cross-shard stalls, etc.).
+        self.mempool.cleanup_expired_pending();
+
         actions
     }
 

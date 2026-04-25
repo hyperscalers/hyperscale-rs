@@ -262,6 +262,19 @@ impl MempoolCoordinator {
             return vec![];
         }
 
+        // Reject if already past `validity_range.end_timestamp_exclusive`.
+        // Same expression the proposer/validator apply, just at the
+        // admission boundary so expired txs never enter the pool.
+        if tx.validity_range.end_timestamp_exclusive <= self.current_ts {
+            tracing::debug!(
+                tx_hash = ?hash,
+                end_ms = tx.validity_range.end_timestamp_exclusive.as_millis(),
+                now_ms = self.current_ts.as_millis(),
+                "Rejecting expired transaction submission"
+            );
+            return vec![];
+        }
+
         let cross_shard = tx.is_cross_shard(topology.num_shards());
         self.pool.insert(
             hash,
@@ -311,6 +324,17 @@ impl MempoolCoordinator {
 
         // Ignore if already have it or if tombstoned (completed/aborted)
         if self.pool.contains_key(&hash) || self.is_tombstoned(&hash) {
+            return vec![];
+        }
+
+        // Reject if past expiry — same admission rule as the RPC submit path.
+        if tx.validity_range.end_timestamp_exclusive <= self.current_ts {
+            tracing::trace!(
+                tx_hash = ?hash,
+                end_ms = tx.validity_range.end_timestamp_exclusive.as_millis(),
+                now_ms = self.current_ts.as_millis(),
+                "Dropping expired gossiped transaction"
+            );
             return vec![];
         }
 
@@ -923,6 +947,35 @@ impl MempoolCoordinator {
         self.tombstones.prune_tombstones(self.current_ts)
     }
 
+    /// Drop `Pending` pool entries whose `end_timestamp_exclusive <= current_ts`.
+    ///
+    /// Pending txs hold no state locks (locks are taken on `Committed` /
+    /// `Executed`), so removal is safe without going through the
+    /// terminal-eviction path. Re-submission past expiry is rejected at
+    /// admission, so no tombstone is needed either.
+    ///
+    /// The proposer-side filter already skips expired txs at selection
+    /// time; this sweep is what keeps the pool from accumulating dead
+    /// pending entries when expiry outpaces selection (e.g. a transient
+    /// stall in cross-shard EC delivery delays inclusion past the window).
+    ///
+    /// Returns the number of pending entries dropped.
+    pub fn cleanup_expired_pending(&mut self) -> usize {
+        let now = self.current_ts;
+        let expired: Vec<TxHash> = self
+            .pool
+            .iter()
+            .filter(|(_, entry)| matches!(entry.status, TransactionStatus::Pending))
+            .filter(|(_, entry)| entry.tx.validity_range.end_timestamp_exclusive <= now)
+            .map(|(hash, _)| *hash)
+            .collect();
+        for hash in &expired {
+            self.pool.remove(hash);
+            self.remove_from_ready_tracking(hash);
+        }
+        expired.len()
+    }
+
     /// Get the number of tombstones currently tracked.
     pub fn tombstone_count(&self) -> usize {
         self.tombstones.len_tombstones()
@@ -1412,5 +1465,109 @@ mod tests {
         mempool.set_time(Duration::from_millis(1_500));
         let ready = mempool.ready_transactions(10, 0, 0);
         assert_eq!(ready.len(), 2, "Both should be eligible");
+    }
+
+    // ─── validity-window admission + pending sweep ──────────────────────
+
+    fn tx_with_end(seed: u8, end_ms: u64) -> Arc<RoutableTransaction> {
+        use hyperscale_types::test_utils::test_notarized_transaction_v1;
+        use hyperscale_types::{routable_from_notarized_v1, TimestampRange};
+        let notarized = test_notarized_transaction_v1(&[seed]);
+        let range = TimestampRange::new(WeightedTimestamp::ZERO, WeightedTimestamp(end_ms));
+        Arc::new(routable_from_notarized_v1(notarized, range).expect("valid notarized fixture"))
+    }
+
+    /// Force-set `current_ts` for tests that need to control the admission /
+    /// sweep clock without going through a full block commit.
+    fn set_current_ts(mempool: &mut MempoolCoordinator, ts: WeightedTimestamp) {
+        mempool.current_ts = ts;
+    }
+
+    #[test]
+    fn rpc_submit_rejects_expired_transaction() {
+        let topology = make_test_topology();
+        let mut mempool = MempoolCoordinator::new();
+        set_current_ts(&mut mempool, WeightedTimestamp(2_000));
+
+        let tx = tx_with_end(1, 1_000); // expired well before now
+        let actions = mempool.on_submit_transaction(&topology, Arc::clone(&tx));
+        assert!(actions.is_empty(), "expired tx should be silently rejected");
+        assert!(
+            mempool.status(&tx.hash()).is_none(),
+            "expired tx must not enter the pool"
+        );
+    }
+
+    #[test]
+    fn gossip_drops_expired_transaction() {
+        let topology = make_test_topology();
+        let mut mempool = MempoolCoordinator::new();
+        set_current_ts(&mut mempool, WeightedTimestamp(2_000));
+
+        let tx = tx_with_end(1, 1_000);
+        let actions = mempool.on_transaction_gossip(&topology, Arc::clone(&tx), false);
+        assert!(actions.is_empty());
+        assert!(mempool.status(&tx.hash()).is_none());
+    }
+
+    #[test]
+    fn rpc_submit_admits_in_window_transaction() {
+        let topology = make_test_topology();
+        let mut mempool = MempoolCoordinator::new();
+        set_current_ts(&mut mempool, WeightedTimestamp(500));
+
+        let tx = tx_with_end(1, 1_000); // end_exclusive > now
+        mempool.on_submit_transaction(&topology, Arc::clone(&tx));
+        assert!(matches!(
+            mempool.status(&tx.hash()),
+            Some(TransactionStatus::Pending)
+        ));
+    }
+
+    #[test]
+    fn cleanup_expired_pending_drops_only_past_expiry_entries() {
+        let topology = make_test_topology();
+        let mut mempool = MempoolCoordinator::new();
+        set_current_ts(&mut mempool, WeightedTimestamp(500));
+
+        let early = tx_with_end(1, 1_000); // alive
+        let later = tx_with_end(2, 60_000); // alive
+        mempool.on_submit_transaction(&topology, Arc::clone(&early));
+        mempool.on_submit_transaction(&topology, Arc::clone(&later));
+        assert_eq!(mempool.len(), 2);
+
+        // Advance past `early`'s end_exclusive but not `later`'s.
+        set_current_ts(&mut mempool, WeightedTimestamp(1_500));
+        let dropped = mempool.cleanup_expired_pending();
+        assert_eq!(dropped, 1);
+        assert!(mempool.status(&early.hash()).is_none());
+        assert!(matches!(
+            mempool.status(&later.hash()),
+            Some(TransactionStatus::Pending)
+        ));
+    }
+
+    #[test]
+    fn cleanup_expired_pending_does_not_tombstone_dropped_entries() {
+        let topology = make_test_topology();
+        let mut mempool = MempoolCoordinator::new();
+        set_current_ts(&mut mempool, WeightedTimestamp(500));
+
+        let tx = tx_with_end(1, 1_000);
+        let tx_hash = tx.hash();
+        mempool.on_submit_transaction(&topology, Arc::clone(&tx));
+
+        set_current_ts(&mut mempool, WeightedTimestamp(1_500));
+        let dropped = mempool.cleanup_expired_pending();
+        assert_eq!(dropped, 1);
+
+        // Pending sweep does not tombstone — re-submission is rejected by
+        // the admission check, not by the tombstone set. Confirm both: the
+        // tombstone set stays empty, AND a fresh submission past expiry is
+        // rejected via the admission path.
+        assert!(!mempool.is_tombstoned(&tx_hash));
+        let actions = mempool.on_submit_transaction(&topology, Arc::clone(&tx));
+        assert!(actions.is_empty(), "re-submission past expiry rejected");
+        assert!(mempool.status(&tx_hash).is_none());
     }
 }
