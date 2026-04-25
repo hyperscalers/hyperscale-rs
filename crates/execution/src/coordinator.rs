@@ -48,7 +48,6 @@ use hyperscale_types::{
 use hyperscale_types::{ExecutionOutcome, Hash};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
 use tracing::instrument;
 
 use crate::conflict::DetectedConflict;
@@ -113,11 +112,6 @@ pub struct ExecutionMemoryStats {
 ///
 /// Handles transaction execution after blocks are committed.
 pub struct ExecutionCoordinator {
-    /// Local wall-clock "now" — kept for symmetry with the other sub-state
-    /// machines even though execution's deterministic timeouts all anchor on
-    /// `committed_ts` (the QC's weighted timestamp).
-    now: Duration,
-
     /// Finalized wave certificates ready for block inclusion, keyed by
     /// `WaveId`. Terminal-state lookup surface for wave-id-hash fetches,
     /// tx-membership queries, and proposal building.
@@ -211,7 +205,6 @@ impl ExecutionCoordinator {
     /// Create a new execution state machine.
     pub fn new() -> Self {
         Self {
-            now: Duration::ZERO,
             finalized: FinalizedWaveStore::new(),
             committed_height: BlockHeight::GENESIS,
             committed_ts: WeightedTimestamp::ZERO,
@@ -221,15 +214,6 @@ impl ExecutionCoordinator {
             expected_certs: ExpectedCertTracker::new(),
             outbound_certs: OutboundExecutionCertificateTracker::new(),
         }
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════════
-    // Time Management
-    // ═══════════════════════════════════════════════════════════════════════════
-
-    /// Set the current wall-clock time.
-    pub fn set_time(&mut self, now: Duration) {
-        self.now = now;
     }
 
     // ═══════════════════════════════════════════════════════════════════════════

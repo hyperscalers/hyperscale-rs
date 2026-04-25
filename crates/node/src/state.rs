@@ -829,7 +829,6 @@ impl StateMachine for NodeStateMachine {
     fn set_time(&mut self, now: Duration) {
         self.now = now;
         self.bft.set_time(now);
-        self.execution.set_time(now);
         self.mempool.set_time(now);
         self.provisions.set_time(now);
     }
