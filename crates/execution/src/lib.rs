@@ -17,6 +17,7 @@ mod early_arrivals;
 mod expected_certs;
 mod finalized_waves;
 mod lookups;
+mod outbound_certs;
 mod provisioning;
 mod vote_tracker;
 mod waves;

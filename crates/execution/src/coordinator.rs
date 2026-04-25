@@ -57,6 +57,7 @@ use crate::expected_certs::{ExpectedCertTracker, FallbackFetch};
 use crate::finalized_waves::FinalizedWaveStore;
 use crate::handlers::build_dispatch_action;
 use crate::lookups::{committee_public_keys_for_shard, peers_excluding_self};
+use crate::outbound_certs::OutboundExecutionCertificateTracker;
 use crate::provisioning::ProvisioningTracker;
 use crate::vote_tracker::VoteTracker;
 use crate::wave_state::WaveState;
@@ -105,6 +106,7 @@ pub struct ExecutionMemoryStats {
     pub early_wave_attestations: usize,
     pub pending_routing: usize,
     pub fulfilled_exec_certs: usize,
+    pub outbound_certs: usize,
 }
 
 /// Execution state machine.
@@ -163,6 +165,15 @@ pub struct ExecutionCoordinator {
     /// set and the fulfilled-tombstone set used to guard against duplicate
     /// headers re-opening closed expectations.
     expected_certs: ExpectedCertTracker,
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Outbound EC Retention (target → source delivery guarantee)
+    // ═══════════════════════════════════════════════════════════════════════
+    /// Retains ECs the wave leader broadcast to remote shards and re-emits
+    /// them on a deterministic interval until the wave finalizes locally
+    /// (positive ACK signal) or the safety horizon elapses. Symmetric to
+    /// `OutboundProvisionTracker` on the source side.
+    outbound_certs: OutboundExecutionCertificateTracker,
 }
 
 impl Default for ExecutionCoordinator {
@@ -203,6 +214,7 @@ impl ExecutionCoordinator {
             early: EarlyArrivalBuffer::new(),
             provisioning: ProvisioningTracker::new(),
             expected_certs: ExpectedCertTracker::new(),
+            outbound_certs: OutboundExecutionCertificateTracker::new(),
         }
     }
 
@@ -916,9 +928,16 @@ impl ExecutionCoordinator {
             });
         }
 
-        // Broadcast EC to remote participating shards.
+        // Broadcast EC to remote participating shards. Track each per-target
+        // send so a dropped notify is re-emitted before the source's 24s
+        // fallback timer trips — symmetric to ef4eb45a on provisions.
         for target_shard in &remote_shards {
             let recipients: Vec<ValidatorId> = topology.committee_for_shard(*target_shard).to_vec();
+            self.outbound_certs.on_broadcast(
+                Arc::clone(&certificate),
+                *target_shard,
+                recipients.clone(),
+            );
             actions.push(Action::BroadcastExecutionCertificate {
                 shard: *target_shard,
                 certificate: Arc::clone(&certificate),
@@ -1235,6 +1254,17 @@ impl ExecutionCoordinator {
         self.prune_execution_state();
         self.early.gc_stale_ecs(self.committed_ts);
 
+        // Re-broadcast outbound ECs that haven't been ACKed via wave
+        // finalization. Driven from the commit cadence so the schedule is
+        // deterministic across validators.
+        for directive in self.outbound_certs.on_block_committed(self.committed_ts) {
+            actions.push(Action::BroadcastExecutionCertificate {
+                shard: directive.target_shard,
+                certificate: directive.certificate,
+                recipients: directive.recipients,
+            });
+        }
+
         for (_, wave) in self.waves.waves_iter_mut() {
             wave.log_if_overdue(self.committed_ts);
         }
@@ -1461,6 +1491,12 @@ impl ExecutionCoordinator {
         let Some(mut wave) = self.waves.remove_wave(wave_id) else {
             return vec![];
         };
+
+        // Wave finalization requires every participating shard's EC, which
+        // means each remote shard executed this wave — strong evidence they
+        // also received our outbound EC (or are about to). Drop the
+        // re-broadcast tracker entry to stop wasting bandwidth.
+        self.outbound_certs.on_wave_finalized(wave_id);
 
         let wc = wave.create_wave_certificate();
 
@@ -1768,6 +1804,7 @@ impl ExecutionCoordinator {
             early_wave_attestations: self.early.tx_index_len(),
             pending_routing: self.early.pending_routing_len(),
             fulfilled_exec_certs: self.expected_certs.fulfilled_len(),
+            outbound_certs: self.outbound_certs.memory_stats().tracked_certificates,
         }
     }
 

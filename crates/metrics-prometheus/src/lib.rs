@@ -1192,6 +1192,10 @@ impl MetricsRecorder for PrometheusRecorder {
             .memory_exec
             .with_label_values(&["fulfilled_exec_certs"])
             .set(m.exec_fulfilled_exec_certs as f64);
+        self.metrics
+            .memory_exec
+            .with_label_values(&["outbound_certs"])
+            .set(m.exec_outbound_certs as f64);
 
         // Mempool
         self.metrics

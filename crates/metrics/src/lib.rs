@@ -117,6 +117,8 @@ pub struct MemoryMetrics {
     pub exec_pending_routing: usize,
     /// Fulfilled execution certificates from remote shards.
     pub exec_fulfilled_exec_certs: usize,
+    /// Outbound ECs awaiting wave finalization (re-broadcast tracker).
+    pub exec_outbound_certs: usize,
 
     // ── Mempool ──
     /// All transactions in the pool.

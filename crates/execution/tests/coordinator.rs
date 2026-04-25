@@ -51,6 +51,7 @@ fn memory_stats_destructures_all_fields_for_fresh_coordinator() {
         early_wave_attestations,
         pending_routing,
         fulfilled_exec_certs,
+        outbound_certs,
     } = coord.memory_stats();
 
     assert_eq!(wave_execution_receipts, 0);
@@ -68,6 +69,7 @@ fn memory_stats_destructures_all_fields_for_fresh_coordinator() {
     assert_eq!(early_wave_attestations, 0);
     assert_eq!(pending_routing, 0);
     assert_eq!(fulfilled_exec_certs, 0);
+    assert_eq!(outbound_certs, 0);
 }
 
 #[test]

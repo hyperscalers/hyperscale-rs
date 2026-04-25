@@ -1160,6 +1160,7 @@ where
                 exec_early_wave_attestations: exec_mem.early_wave_attestations,
                 exec_pending_routing: exec_mem.pending_routing,
                 exec_fulfilled_exec_certs: exec_mem.fulfilled_exec_certs,
+                exec_outbound_certs: exec_mem.outbound_certs,
                 // Mempool
                 mempool_pool: mempool_mem.pool,
                 mempool_ready: mempool_mem.ready,
