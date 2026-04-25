@@ -29,7 +29,7 @@
 //! [`retain_if_shard_needed`](ExpectedCertTracker::retain_if_shard_needed),
 //! because the tracker cannot see the wave set.
 
-use hyperscale_types::{BlockHeight, ShardGroupId, WaveId, WeightedTimestamp};
+use hyperscale_types::{BlockHeight, ShardGroupId, WaveId, WeightedTimestamp, WAVE_TIMEOUT};
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
@@ -44,10 +44,10 @@ const EXEC_CERT_FALLBACK_TIMEOUT: Duration = Duration::from_secs(5);
 const EXEC_CERT_RETRY_INTERVAL: Duration = Duration::from_secs(10);
 
 /// How long to retain fulfilled entries after the EC landed. Guards against
-/// late-arriving duplicate headers re-registering the expectation. Sized
-/// above `EarlyArrivalBuffer`'s retention so any duplicate still in flight
-/// finds its tombstone.
-const FULFILLED_EXEC_CERT_RETENTION: Duration = Duration::from_secs(60);
+/// late-arriving duplicate headers re-registering the expectation. Matches
+/// `EarlyArrivalBuffer`'s `EC_BUFFER_RETENTION = WAVE_TIMEOUT * 2` so any
+/// duplicate still in flight from that path finds its tombstone here.
+const FULFILLED_EXEC_CERT_RETENTION: Duration = Duration::from_secs(WAVE_TIMEOUT.as_secs() * 2);
 
 type ExpectedCertKey = (ShardGroupId, BlockHeight, WaveId);
 

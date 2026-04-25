@@ -36,7 +36,9 @@
 //!   that never land locally (orphaned txs or malicious remotes). Sized
 //!   well above plausible cross-shard inclusion lag.
 
-use hyperscale_types::{ExecutionCertificate, ExecutionVote, TxHash, WaveId, WeightedTimestamp};
+use hyperscale_types::{
+    ExecutionCertificate, ExecutionVote, TxHash, WaveId, WeightedTimestamp, WAVE_TIMEOUT,
+};
 #[cfg(test)]
 use hyperscale_types::{GlobalReceiptRoot, Hash};
 use std::collections::{HashMap, HashSet};
@@ -44,18 +46,19 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// How long to retain unmatched early votes whose block never committed
-/// locally. A non-arrival past this window indicates BFT is broken; entries
-/// are dropped to bound memory. Anchored on the vote's embedded
-/// `vote_anchor_ts` vs the committing QC's `weighted_timestamp_ms`.
-pub(crate) const EARLY_VOTE_RETENTION: Duration = Duration::from_secs(30);
+/// locally. Past `WAVE_TIMEOUT` from the vote's `vote_anchor_ts`, the wave
+/// the vote belonged to has aborted (success or all-abort), so the vote can
+/// no longer contribute to a useful wave. Anchored on the committing QC's
+/// `weighted_timestamp_ms` so the bound is BFT-authenticated.
+pub(crate) const EARLY_VOTE_RETENTION: Duration = WAVE_TIMEOUT;
 
 /// Maximum age before a buffered EC is considered stale and evicted. Bounds
 /// the leak from ECs whose tx_hashes never land in a local block (orphaned
 /// txs, malicious or buggy remotes referencing tx_hashes our shard will
-/// never see). Sized well above the longest plausible cross-shard inclusion
-/// lag so a legitimate late-arriving EC isn't evicted before it can be
-/// routed.
-const EC_BUFFER_RETENTION: Duration = Duration::from_secs(60);
+/// never see). Sized at `WAVE_TIMEOUT * 2` — twice the cross-shard execution
+/// window covers a slow remote committing locally well past its source
+/// commit, while still bounding the leak.
+const EC_BUFFER_RETENTION: Duration = Duration::from_secs(WAVE_TIMEOUT.as_secs() * 2);
 
 /// Bookkeeping for an EC awaiting local routing.
 ///
@@ -506,7 +509,8 @@ mod tests {
 
         // now_ts below EC_BUFFER_RETENTION → no-op, even though the entry
         // was buffered at timestamp 0.
-        assert_eq!(b.gc_stale_ecs(ms(59_000)), 0);
+        let just_under = EC_BUFFER_RETENTION.as_millis() as u64 - 1;
+        assert_eq!(b.gc_stale_ecs(ms(just_under)), 0);
         assert_eq!(b.pending_routing_len(), 1);
     }
 
