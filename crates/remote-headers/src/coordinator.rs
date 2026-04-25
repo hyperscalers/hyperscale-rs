@@ -1,4 +1,4 @@
-//! RemoteHeaderCoordinator sub-state machine for centralized remote header management.
+//! Centralized remote header coordination.
 //!
 //! This module is the single source of truth for remote committed block headers.
 //! It receives raw headers from gossip (or fallback fetch), dispatches QC

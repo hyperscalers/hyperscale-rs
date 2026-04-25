@@ -26,6 +26,6 @@
 //! `Action::RequestMissingCommittedBlockHeader` after a timeout, triggering a
 //! point-to-point fetch from any validator in the source shard.
 
-mod state;
+mod coordinator;
 
-pub use state::{RemoteHeaderCoordinator, RemoteHeaderMemoryStats};
+pub use coordinator::{RemoteHeaderCoordinator, RemoteHeaderMemoryStats};
