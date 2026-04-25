@@ -107,5 +107,5 @@ All state machine logic is **synchronous, deterministic, pure** (no I/O). I/O de
 - `HANDOFF.md` — this file
 
 ## Related References
-- `openclaw-bert/workspace/PROJECT-HYPERSCALERS.md` — Bert's original analysis (20 issues mapped)
-- `scrypto-xrd/SCRYPTO-AUDIT-2026-04-08.md` — Scrypto audit methodology (same rigor)
+- See `docs/IMPLEMENTATION.md` section 7 for the full unbounded data structure audit
+- See `CONTRIBUTION-PLAN.md` for the phased contribution approach

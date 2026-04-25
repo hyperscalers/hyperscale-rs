@@ -24,7 +24,7 @@ Rust implementation of the Hyperscale consensus protocol for Radix. Sharded BFT 
 - Issue #22: Unbounded in-memory data structures (DoS vector) — HIGH PRIORITY
 - Issue #18: Transaction/substate test suite (test gap)
 - Issue #17: Fee model in sharded RE (design hole)
-- See openclaw-bert/workspace/PROJECT-HYPERSCALERS.md for Bert's full analysis
+- See `CONTRIBUTION-PLAN.md` and `docs/IMPLEMENTATION.md` section 7 for full analysis
 
 ## Build
 ```bash

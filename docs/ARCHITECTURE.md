@@ -65,7 +65,7 @@ TYPES                               |
 |-------------------------------|--------------------------------------|
 | `hyperscale-bft`              | BFT consensus state (HotStuff-2)     |
 | `hyperscale-core`             | `StateMachine` trait, `Action`, `ProtocolEvent` |
-| `hyperscale-dispatch`         | `Dispatch` trait + `DispatchPool`     |
+| `hyperscale-dispatch`         | `Dispatch` trait                      |
 | `hyperscale-dispatch-pooled`  | Rayon-backed multi-pool dispatch      |
 | `hyperscale-dispatch-sync`    | Single-thread dispatch (simulation)  |
 | `hyperscale-engine`           | Radix Engine integration             |
@@ -319,7 +319,7 @@ Actions map to one of four `DispatchPool` variants, or `None` (handled inline by
 
 ### DispatchPool enum
 
-`crates/dispatch/src/lib.rs:36-45`
+`crates/node/src/action_handler.rs:36-49`
 
 | Pool              | Priority  | Work type                              |
 |-------------------|-----------|----------------------------------------|
