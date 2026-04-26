@@ -1,6 +1,8 @@
 //! Action processing and dispatch.
 
-use super::{IoLoop, TimerOp};
+use super::IoLoop;
+use super::TimerOp;
+use super::block_commit::{AccumulateDecision, PendingCommit};
 use crate::action_handler::{self, ActionContext, DispatchPool};
 use crate::protocol::execution_cert_fetch::ExecCertFetchInput;
 use crate::protocol::finalized_wave_fetch::FinalizedWaveFetchInput;
@@ -15,11 +17,8 @@ use hyperscale_engine::Engine;
 use hyperscale_metrics as metrics;
 use hyperscale_network::Network;
 use hyperscale_storage::{ChainReader, ChainWriter, JmtTreeReader, SubstateStore, VersionedStore};
-use hyperscale_types::{
-    Block, BlockHeight, CertifiedBlock, QuorumCertificate, StateRoot, ValidatorId,
-};
+use hyperscale_types::{Block, BlockHeight, QuorumCertificate, StateRoot, ValidatorId};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use tracing::{debug, trace, warn};
 impl<S, N, D, E> IoLoop<S, N, D, E>
 where
@@ -281,11 +280,11 @@ where
             // Block commit + notifications
             // ═══════════════════════════════════════════════════════════
             Action::CommitBlock { block, qc, source } => {
-                self.accumulate_block_commit(super::PendingCommit {
+                self.accept_block_commit(PendingCommit {
                     block: Arc::new(block),
                     qc: Arc::new(qc),
                     source,
-                    committed_notified: false, // set by accumulate_block_commit
+                    committed_notified: false, // set by accumulate
                 });
             }
             Action::CommitBlockByQcOnly {
@@ -420,17 +419,12 @@ where
         }
     }
 
-    /// Accumulate a block commit for batched dispatch. Records metrics
-    /// immediately (on the pinned thread), feeds the sync protocol, fires
-    /// `BlockCommitted` to the state machine, then defers the heavy
-    /// JMT/metadata writes to [`Self::flush_block_commits`].
-    ///
-    /// `BlockCommitted` fires immediately — before `RocksDB` persistence —
-    /// because the QC is the proof of commit (2f+1 agreement). Subsystem
-    /// notifications use event-carried data, not storage reads. The async
-    /// persistence closure sends `BlockPersisted` when the write completes.
-    ///
     /// Handler for [`Action::CommitBlockByQcOnly`].
+    ///
+    /// Computes the prepared commit inline (unless the consensus path already
+    /// produced one), inserts the resulting JMT snapshot into `PendingChain`
+    /// so child blocks' `VerifyStateRoot` can resolve parent nodes through the
+    /// overlay, then feeds the block into the standard commit pipeline.
     ///
     /// The inline-computed `PreparedCommit`'s `base_root` may be stale by
     /// flush time (other blocks committed in between). `commit_prepared_blocks`
@@ -448,15 +442,15 @@ where
         let height = block.height();
 
         // Hard skip only if already persisted (consensus path got all the
-        // way through). We must still enqueue blocks whose `prepared_commits`
-        // entry was populated by the consensus path but that never had
+        // way through). We must still enqueue blocks whose prepared commit
+        // was populated by the consensus path but that never had
         // `BlockReadyToCommit` fire — e.g. a self-proposed block whose
         // child arrived via sync rather than consensus, so the 2-chain
         // commit rule never triggered. Dropping the block here leaves its
         // prepared commit orphaned in the cache, and the next block to
-        // reach `flush_block_commits` trips the strict ordering assert
-        // in `commit_block_inner` because its parent was never applied.
-        if height <= self.persisted_height {
+        // reach flush trips the strict ordering assert in
+        // `commit_block_inner` because its parent was never applied.
+        if height <= self.block_commit.persisted_height() {
             return;
         }
 
@@ -464,13 +458,7 @@ where
         // (VerifyStateRoot/ExecuteTransactions), reuse it — recomputing JMT
         // here can produce a transient root mismatch and trip the
         // byzantine-detection assert below on a self-inflicted race.
-        let already_prepared = self
-            .prepared_commits
-            .lock()
-            .unwrap()
-            .contains_key(&block_hash);
-
-        if already_prepared {
+        if self.block_commit.has_prepared(&block_hash) {
             debug!(
                 height = height.0,
                 ?block_hash,
@@ -521,11 +509,8 @@ where
                 },
             );
 
-            // Store PreparedCommit for flush_block_commits.
-            self.prepared_commits
-                .lock()
-                .unwrap()
-                .insert(block_hash, (height, prepared));
+            self.block_commit
+                .insert_prepared(block_hash, height, prepared);
 
             debug!(
                 height = height.0,
@@ -534,12 +519,12 @@ where
             );
         }
 
-        // Feed into the standard commit pipeline — accumulate_block_commit
+        // Feed into the standard commit pipeline — accept_block_commit
         // fires BlockCommitted immediately, flush_block_commits batches the
-        // RocksDB write with a single fsync. `accumulate_block_commit`
-        // dedups by block_hash so double-emission (consensus + sync both
-        // reaching commit) is safe.
-        self.accumulate_block_commit(super::PendingCommit {
+        // RocksDB write with a single fsync. The coordinator dedups by
+        // block_hash so double-emission (consensus + sync both reaching
+        // commit) is safe.
+        self.accept_block_commit(PendingCommit {
             block: Arc::new(block),
             qc: Arc::new(qc),
             source,
@@ -547,253 +532,35 @@ where
         });
     }
 
-    /// **Backpressure**: if the persistence lag exceeds
-    /// [`MAX_PERSISTENCE_LAG`] blocks, the immediate `BlockCommitted` is
-    /// suppressed and instead fires after the disk write (falling back to
-    /// the pre-decoupling behaviour). This bounds memory usage and the
-    /// crash-recovery window.
-    fn accumulate_block_commit(&mut self, mut commit: super::PendingCommit) {
-        let block_hash = commit.block.hash();
-        let height = commit.block.height();
-
-        // Skip blocks already persisted by the sync path.
-        if height <= self.persisted_height {
-            return;
+    /// Hand a commit to the [`BlockCommitCoordinator`] and act on its
+    /// decision: feed the sync protocol with the new committed height and,
+    /// unless persistence backpressure is active, fire `BlockCommitted`.
+    ///
+    /// [`BlockCommitCoordinator`]: super::block_commit::BlockCommitCoordinator
+    fn accept_block_commit(&mut self, commit: PendingCommit) {
+        let now = self.state.now();
+        let decision = self.block_commit.accumulate(commit, now);
+        match decision {
+            AccumulateDecision::Skip => {}
+            AccumulateDecision::Accepted { height, notify_now } => {
+                debug!(height = height.0, "Block committed");
+                let outputs = self
+                    .sync_protocol
+                    .handle(SyncInput::BlockCommitted { height });
+                self.process_sync_outputs(outputs);
+                if let Some((block, qc)) = notify_now {
+                    let certified = hyperscale_types::CertifiedBlock::new_unchecked(
+                        Arc::unwrap_or_clone(block),
+                        Arc::unwrap_or_clone(qc),
+                    );
+                    self.feed_event(ProtocolEvent::BlockCommitted { certified });
+                }
+            }
         }
-
-        // Dedup: consensus and sync paths can both reach commit for the same
-        // block (e.g. self-proposed block whose child arrived via sync). Push
-        // once; the prepared commit is also singular in `prepared_commits`.
-        if self
-            .pending_block_commits
-            .iter()
-            .any(|c| c.block.hash() == block_hash)
-        {
-            return;
-        }
-
-        debug!(height = height.0, ?block_hash, "Block committed");
-
-        // Block commit latency: time from proposal timestamp to now. Labeled
-        // by `source` so dashboards can separate the three commit paths
-        // (aggregator/header/sync), which have materially different latencies
-        // under the 2-chain rule.
-        let now_ms = self.state.now().as_millis();
-        #[allow(clippy::cast_precision_loss)] // latency readout for metrics; ms→f64 lossy is fine
-        let commit_latency_secs =
-            (now_ms.saturating_sub(commit.block.header().timestamp.as_millis())) as f64 / 1000.0;
-        metrics::record_block_committed(height.0, commit_latency_secs, commit.source.as_str());
-        metrics::set_block_height(height.0);
-        // Feed committed height to sync protocol (just tracks progress,
-        // doesn't need JMT state).
-        let outputs = self
-            .sync_protocol
-            .handle(SyncInput::BlockCommitted { height });
-        self.process_sync_outputs(outputs);
-
-        // Fire BlockCommitted immediately unless persistence is falling
-        // too far behind (backpressure). When deferred, flush_block_commits
-        // sends BlockCommitted after the disk write instead.
-        let persistence_lag = height.0.saturating_sub(self.persisted_height.0);
-        let notify_now = persistence_lag <= Self::MAX_PERSISTENCE_LAG;
-        if notify_now {
-            let certified = CertifiedBlock::new_unchecked(
-                Arc::unwrap_or_clone(Arc::clone(&commit.block)),
-                Arc::unwrap_or_clone(Arc::clone(&commit.qc)),
-            );
-            self.feed_event(ProtocolEvent::BlockCommitted { certified });
-        } else {
-            tracing::debug!(
-                height = height.0,
-                persisted = self.persisted_height.0,
-                lag = persistence_lag,
-                "Deferring BlockCommitted — persistence backpressure"
-            );
-        }
-
-        // Record the actual notification decision on the commit so the
-        // flush closure knows whether to send BlockCommitted after persist.
-        commit.committed_notified = notify_now;
-        self.pending_block_commits.push(commit);
     }
 
-    /// Maximum number of blocks consensus can advance ahead of persistence
-    /// before falling back to synchronous commit notification.
-    const MAX_PERSISTENCE_LAG: u64 = 5;
-
-    /// Flush accumulated block commits and any pending receipt bundles.
-    ///
-    /// Spawns a single closure on the execution pool that persists receipt
-    /// bundles first, then commits all blocks sequentially, sending
-    /// `BlockCommitted` events after each.
-    ///
-    /// Receipt bundles are drained into the same closure because the sync
-    /// path reconstructs `DatabaseUpdates` by reading receipts back from
-    /// storage. Writing receipts and committing in a single closure
-    /// guarantees ordering — Rayon does not guarantee FIFO ordering across
-    /// separate `spawn()` calls.
-    ///
-    /// If a previous async commit closure is still in flight, blocks and
-    /// receipt bundles remain pending to avoid spawning a second closure.
-    /// The in-flight closure clears the flag before sending its final
-    /// events, so the resulting `feed_event` → `flush_block_commits` picks
-    /// up the backlog.
-    #[allow(clippy::too_many_lines)] // single transactional commit pipeline; splitting would scatter shared state
     pub(super) fn flush_block_commits(&mut self) {
-        if self.pending_block_commits.is_empty() {
-            return;
-        }
-
-        // Defer if a previous async commit is still running on the exec pool.
-        if self.commit_in_flight.load(Ordering::Acquire) {
-            return;
-        }
-
-        let mut commits = std::mem::take(&mut self.pending_block_commits);
-
-        // Drop blocks already persisted by the sync path.
-        let persisted = self.persisted_height.0;
-        commits.retain(|c| c.block.height().0 > persisted);
-        if commits.is_empty() {
-            return;
-        }
-
-        // Sort by height to ensure parent blocks are flushed before children.
-        // Cascading commits (e.g. QC formation during BlockCommitted processing)
-        // can push child blocks into pending_block_commits before their parent
-        // (because the parent's push happens after feed_event returns). Without
-        // sorting, the child block (which may lack a PreparedCommit) would defer
-        // and block the ready parent, causing a deadlock where BlockPersisted
-        // never fires and sync_awaiting_persistence_height is never satisfied.
-        commits.sort_by_key(|c| c.block.height().0);
-
-        // Extract prepared commit handles for each block in the batch,
-        // then prune any stale entries at or below the highest committed
-        // height.
-        let max_committed_height = commits
-            .iter()
-            .map(|c| c.block.height())
-            .max()
-            .unwrap_or(BlockHeight::GENESIS);
-
-        // Blocks committed via CommitBlock need the PreparedCommit produced
-        // asynchronously by VerifyStateRoot. If it's not ready yet, defer —
-        // and defer all later blocks too to preserve height ordering. Blocks
-        // that came through CommitBlockByQcOnly already have their
-        // PreparedCommit cached inline so they don't hit this path.
-        let mut ready_commits: Vec<super::PendingCommit> = Vec::with_capacity(commits.len());
-        let mut prepared_map: Vec<S::PreparedCommit> = Vec::with_capacity(commits.len());
-        {
-            let mut cache = self.prepared_commits.lock().unwrap();
-            let mut deferring = false;
-            for commit in commits {
-                let prepared = if deferring {
-                    None
-                } else {
-                    cache.remove(&commit.block.hash()).map(|(_, p)| p)
-                };
-
-                let not_ready = prepared.is_none();
-
-                if deferring || not_ready {
-                    if !deferring {
-                        tracing::debug!(
-                            height = commit.block.height().0,
-                            certs = commit.block.certificates().len(),
-                            "Deferring block commit — awaiting PreparedCommit from VerifyStateRoot"
-                        );
-                        deferring = true;
-                    }
-                    // Put back prepared commit if we extracted one.
-                    if let Some(p) = prepared {
-                        let bh = commit.block.hash();
-                        let h = commit.block.height();
-                        cache.insert(bh, (h, p));
-                    }
-                    self.pending_block_commits.push(commit);
-                } else {
-                    prepared_map.push(prepared.unwrap());
-                    ready_commits.push(commit);
-                }
-            }
-            // Prune stale entries that outlived their blocks.
-            let before = cache.len();
-            cache.retain(|_, (h, _)| *h > max_committed_height);
-            let pruned = before - cache.len();
-            if pruned > 0 {
-                tracing::debug!(pruned, "Pruned stale prepared_commits entries");
-            }
-        }
-
-        if ready_commits.is_empty() {
-            return;
-        }
-
-        // Use the actual notification decision recorded at accumulation time,
-        // not a re-derived value that could disagree due to persisted_height drift.
-        let already_notified: Vec<bool> =
-            ready_commits.iter().map(|c| c.committed_notified).collect();
-
-        let commits = ready_commits;
-
-        let storage = Arc::clone(&self.storage);
-        let event_tx = self.event_sender.clone();
-        let in_flight = self.commit_in_flight.clone();
-
-        self.commit_in_flight.store(true, Ordering::Release);
-
-        self.pending_commit_task = Some(Box::new(move || {
-            // Build the batch for commit_prepared_blocks (single fsync for all).
-            let mut batch: Vec<(
-                S::PreparedCommit,
-                Arc<hyperscale_types::Block>,
-                Arc<hyperscale_types::QuorumCertificate>,
-            )> = Vec::with_capacity(commits.len());
-
-            let heights: Vec<BlockHeight> = commits.iter().map(|c| c.block.height()).collect();
-
-            // Wrap commits in Option so we can take() them for deferred notifications.
-            let mut commit_slots: Vec<Option<super::PendingCommit>> =
-                commits.into_iter().map(Some).collect();
-
-            for (i, prepared) in prepared_map.into_iter().enumerate() {
-                let commit = commit_slots[i].as_ref().unwrap();
-                batch.push((prepared, Arc::clone(&commit.block), Arc::clone(&commit.qc)));
-            }
-
-            let _roots = storage.commit_prepared_blocks(batch);
-
-            let max_persisted = heights
-                .iter()
-                .copied()
-                .max()
-                .unwrap_or(BlockHeight::GENESIS);
-
-            // Send deferred BlockCommitted events for blocks that weren't notified
-            // at accumulation time (due to persistence backpressure).
-            for (i, _) in heights.iter().enumerate() {
-                if !already_notified[i] {
-                    let commit = commit_slots[i].take().unwrap();
-                    let certified = CertifiedBlock::new_unchecked(
-                        Arc::unwrap_or_clone(commit.block),
-                        Arc::unwrap_or_clone(commit.qc),
-                    );
-                    let _ = event_tx.send(NodeInput::Protocol(ProtocolEvent::BlockCommitted {
-                        certified,
-                    }));
-                }
-            }
-
-            // Clear the in-flight flag before sending BlockPersisted.
-            // The channel send synchronizes-with recv on the main thread,
-            // so the flag is guaranteed visible when the resulting
-            // feed_event calls flush_block_commits to drain any backlog.
-            in_flight.store(false, Ordering::Release);
-
-            let _ = event_tx.send(NodeInput::Protocol(ProtocolEvent::BlockPersisted {
-                height: max_persisted,
-            }));
-        }));
+        self.block_commit.flush(&self.storage, &self.event_sender);
     }
 
     /// Process sync, fetch, and provision recovery actions.
@@ -1039,7 +806,7 @@ where
         // Clone cheap shared state for the 'static spawn closure.
         let executor = self.executor.clone();
         let topology_snapshot = self.topology.load_full();
-        let prepared_commits = Arc::clone(&self.prepared_commits);
+        let prepared_commits = self.block_commit.prepared_commits_handle();
         let pending_chain = Arc::clone(&self.pending_chain);
         let event_tx = self.event_sender.clone();
 

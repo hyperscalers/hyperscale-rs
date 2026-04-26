@@ -20,6 +20,7 @@
 
 mod actions;
 mod batches;
+mod block_commit;
 mod handlers;
 mod phase_times;
 mod protocols;
@@ -28,6 +29,7 @@ mod verify;
 use crate::NodeStateMachine;
 use crate::batch_accumulator::BatchAccumulator;
 use crate::config::NodeConfig;
+use crate::io_loop::block_commit::BlockCommitCoordinator;
 use crate::protocol::execution_cert_fetch::{ExecCertFetchInput, ExecCertFetchProtocol};
 use crate::protocol::finalized_wave_fetch::{FinalizedWaveFetchInput, FinalizedWaveFetchProtocol};
 use crate::protocol::header_fetch::{HeaderFetchInput, HeaderFetchProtocol};
@@ -38,7 +40,7 @@ use crate::protocol::provision_fetch::{ProvisionFetchInput, ProvisionFetchProtoc
 use crate::protocol::sync::{SyncInput, SyncProtocol, SyncStatus};
 use crate::protocol::transaction_fetch::{TransactionFetchInput, TransactionFetchProtocol};
 use arc_swap::ArcSwap;
-use hyperscale_core::{Action, CommitSource, NodeInput, ProtocolEvent, StateMachine, TimerId};
+use hyperscale_core::{Action, NodeInput, ProtocolEvent, StateMachine, TimerId};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::{Engine, RadixExecutor, TransactionValidation};
 use hyperscale_messages::TransactionGossip;
@@ -46,43 +48,14 @@ use hyperscale_metrics as metrics;
 use hyperscale_network::Network;
 use hyperscale_storage::{ChainReader, ChainWriter, JmtTreeReader, SubstateStore, VersionedStore};
 use hyperscale_types::{
-    Block, BlockHash, BlockHeight, Bls12381G1PrivateKey, Bls12381G1PublicKey, CommittedBlockHeader,
-    ExecutionCertificate, FinalizedWave, QuorumCertificate, RoutableTransaction, ShardGroupId,
-    StateRoot, TopologySnapshot, TxHash, ValidatorId, WaveId, WaveIdHash,
+    BlockHeight, Bls12381G1PrivateKey, Bls12381G1PublicKey, CommittedBlockHeader,
+    ExecutionCertificate, FinalizedWave, RoutableTransaction, ShardGroupId, StateRoot,
+    TopologySnapshot, TxHash, ValidatorId, WaveId, WaveIdHash,
 };
 use quick_cache::sync::Cache as QuickCache;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-
-/// Prepared commit cache: `block_hash → (block_height, prepared_commit)`.
-type PreparedCommitMap<S> = HashMap<
-    BlockHash,
-    (
-        BlockHeight,
-        <S as hyperscale_storage::ChainWriter>::PreparedCommit,
-    ),
->;
-
-/// A block commit waiting to be flushed to storage.
-///
-/// All blocks — consensus and sync — go through the same commit pipeline:
-/// `VerifyStateRoot` → `PreparedCommit` → `commit_prepared_blocks`.
-pub(crate) struct PendingCommit {
-    /// Block being committed.
-    pub block: Arc<Block>,
-    /// Quorum certificate certifying `block`.
-    pub qc: Arc<QuorumCertificate>,
-    /// How this node learned the certifying QC. Tagged into metrics so
-    /// dashboards can separate aggregator/header/sync commit paths.
-    pub source: CommitSource,
-    /// Whether `BlockCommitted` was already fired immediately
-    /// in `accumulate_block_commit` (true) or deferred due to
-    /// backpressure (false). The flush closure uses this to
-    /// decide whether to send `BlockCommitted` after persistence.
-    pub committed_notified: bool,
-}
 
 /// Lock-free shared topology snapshot for handler closures and dispatch.
 ///
@@ -270,10 +243,11 @@ where
     validator_id: ValidatorId,
     num_shards: u64,
 
-    // Prepared commit cache (shared with dispatch closures).
-    // Stores (block_height, prepared_commit) so stale entries can be pruned
-    // when they outlive the block they were prepared for.
-    prepared_commits: Arc<Mutex<PreparedCommitMap<S>>>,
+    /// Block commit pipeline: accumulates commits, applies persistence
+    /// backpressure, and drains them into a single async closure that
+    /// runs on the execution pool. Owns the prepared-commit cache shared
+    /// with delegated dispatch closures.
+    block_commit: BlockCommitCoordinator<S>,
 
     /// Chain-anchored pending state. Indexed by block hash; reads happen
     /// through `PendingChain::view_at(parent_hash)` which walks the
@@ -323,27 +297,6 @@ where
     validation_batch: BatchAccumulator<Arc<RoutableTransaction>>,
     committed_header_batch: BatchAccumulator<CommittedHeaderVerificationItem>,
 
-    // Block commit accumulator — collects CommitBlock
-    // actions within a single feed_event/handle_actions batch, then spawns
-    // a single closure on the execution pool to commit them sequentially.
-    // This keeps JMT writes off the pinned IoLoop thread while preserving
-    // commit ordering.
-    pending_block_commits: Vec<PendingCommit>,
-
-    /// Highest block height durably persisted to `RocksDB`. Updated when
-    /// `BlockPersisted` arrives. Used for backpressure: if consensus gets
-    /// too far ahead of persistence, we defer `BlockCommitted` until the
-    /// disk write completes (bounding memory and crash-recovery window).
-    persisted_height: BlockHeight,
-
-    // Guard against out-of-order block commits across separate flushes.
-    // When an async commit closure is in flight on the execution pool, new
-    // blocks accumulate in `pending_block_commits` instead of spawning a
-    // second closure (Rayon doesn't guarantee FIFO ordering of spawned tasks).
-    // The closure clears this flag before sending its final event, so the
-    // subsequent `feed_event` → `flush_block_commits` drains the backlog.
-    commit_in_flight: Arc<AtomicBool>,
-
     // Transaction status cache — retains the latest status for every transaction
     // that has emitted a status notification. Bounded LRU cache shared (via Arc)
     // with external consumers (e.g. RPC handlers in production).
@@ -361,10 +314,6 @@ where
     // Execution certificate cache for fallback serving.
     // Shared with request handler thread. Keyed by (wave_id_hash, wave_id).
     exec_cert_cache: ExecCertCache,
-
-    // Pending commit task — prepared by flush_block_commits, spawned by the runner.
-    // Production uses tokio::spawn_blocking; simulation runs inline.
-    pending_commit_task: Option<Box<dyn FnOnce() + Send>>,
 
     // Accumulated outputs from this step (for caller to drain)
     emitted_statuses: Vec<(TxHash, hyperscale_types::TransactionStatus)>,
@@ -429,7 +378,8 @@ where
             local_shard,
             validator_id,
             num_shards: topo.num_shards(),
-            prepared_commits: Arc::new(Mutex::new(HashMap::new())),
+            // At startup, everything committed is also persisted on disk.
+            block_commit: BlockCommitCoordinator::new(initial_persisted_height),
             pending_chain,
             tx_cache: Arc::new(QuickCache::new(DEFAULT_TX_CACHE_SIZE)),
             provision_store,
@@ -449,15 +399,10 @@ where
                 b.committed_header_max,
                 b.committed_header_window,
             ),
-            pending_block_commits: Vec::new(),
-            // At startup, everything committed is also persisted on disk.
-            persisted_height: initial_persisted_height,
-            commit_in_flight: Arc::new(AtomicBool::new(false)),
             exec_cert_cache: Arc::new(Mutex::new(HashMap::new())),
             tx_status_cache: Arc::new(QuickCache::new(DEFAULT_TX_STATUS_CACHE_SIZE)),
             last_slow_tx_warn: hyperscale_types::LocalTimestamp::ZERO,
             tx_phase_times: phase_times::TxPhaseTimesCache::default(),
-            pending_commit_task: None,
             emitted_statuses: Vec::new(),
             actions_generated: 0,
             pending_timer_ops: Vec::new(),
@@ -1018,10 +963,7 @@ where
 
             // ── Protocol events → state machine ────────────────────────
             NodeInput::Protocol(ProtocolEvent::BlockPersisted { height }) => {
-                // Update persistence tracking before forwarding to state machine.
-                if height > self.persisted_height {
-                    self.persisted_height = height;
-                }
+                self.block_commit.mark_persisted(height);
                 // Drop pending state for blocks now persisted to RocksDB.
                 self.pending_chain.prune(height);
                 self.feed_event(ProtocolEvent::BlockPersisted { height });
@@ -1042,7 +984,7 @@ where
             emitted_statuses: std::mem::take(&mut self.emitted_statuses),
             actions_generated: self.actions_generated,
             timer_ops: std::mem::take(&mut self.pending_timer_ops),
-            commit_task: self.pending_commit_task.take(),
+            commit_task: self.block_commit.drain_task(),
         }
     }
 
@@ -1247,10 +1189,10 @@ where
                 node_finalized_wave_cache: self.finalized_wave_cache.len(),
                 node_provision_cache: self.provision_store.len(),
                 node_exec_cert_cache: self.exec_cert_cache.lock().unwrap().len(),
-                node_prepared_commits: self.prepared_commits.lock().unwrap().len(),
+                node_prepared_commits: self.block_commit.prepared_len(),
                 node_pending_validation: self.pending_validation.len(),
                 node_locally_submitted: self.locally_submitted.len(),
-                node_pending_block_commits: self.pending_block_commits.len(),
+                node_pending_block_commits: self.block_commit.pending_len(),
                 node_validation_batch: self.validation_batch.len(),
                 node_committed_header_batch: self.committed_header_batch.len(),
                 node_sync_queued_heights: sync_status.queued_heights,
