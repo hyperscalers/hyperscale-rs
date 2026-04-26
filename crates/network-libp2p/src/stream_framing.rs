@@ -15,7 +15,7 @@
 //! [2-byte LE type_id_len][type_id bytes][4-byte BE length][LZ4-compressed SBOR]
 //! ```
 //!
-//! The type_id sits outside the compressed payload so the receiver can route
+//! The `type_id` sits outside the compressed payload so the receiver can route
 //! requests to per-type handlers without decompressing first.
 
 use futures::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -36,9 +36,9 @@ pub(crate) enum FrameError {
 impl std::fmt::Display for FrameError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            FrameError::Io(e) => write!(f, "frame I/O error: {}", e),
-            FrameError::TooLarge(len) => write!(f, "frame too large: {} bytes", len),
-            FrameError::Decompress(e) => write!(f, "decompression failed: {}", e),
+            FrameError::Io(e) => write!(f, "frame I/O error: {e}"),
+            FrameError::TooLarge(len) => write!(f, "frame too large: {len} bytes"),
+            FrameError::Decompress(e) => write!(f, "decompression failed: {e}"),
         }
     }
 }
@@ -113,10 +113,10 @@ pub(crate) async fn read_frame_len<S: AsyncReadExt + Unpin>(
     Ok(len)
 }
 
-/// Maximum type_id length (sanity bound to prevent allocation bombs).
+/// Maximum `type_id` length (sanity bound to prevent allocation bombs).
 const MAX_TYPE_ID_LEN: usize = 256;
 
-/// Write a typed request frame: type_id header followed by compressed SBOR payload.
+/// Write a typed request frame: `type_id` header followed by compressed SBOR payload.
 ///
 /// Writes and flushes, but does not close. The reader frames the request with
 /// `read_exact` against the length prefix, so no end-of-stream signal is needed.
@@ -189,7 +189,7 @@ pub(crate) async fn write_precompressed_typed_frame_no_close<S: AsyncWrite + Unp
     Ok(wire_len)
 }
 
-/// Read a typed request frame: type_id header followed by compressed SBOR payload.
+/// Read a typed request frame: `type_id` header followed by compressed SBOR payload.
 ///
 /// Returns `(type_id, decompressed_payload, wire_bytes_read)`.
 pub(crate) async fn read_typed_frame<S: AsyncReadExt + Unpin>(
@@ -210,7 +210,7 @@ pub(crate) async fn read_typed_frame<S: AsyncReadExt + Unpin>(
     let type_id = String::from_utf8(type_id_bytes).map_err(|e| {
         FrameError::Io(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("invalid type_id UTF-8: {}", e),
+            format!("invalid type_id UTF-8: {e}"),
         ))
     })?;
 
@@ -234,11 +234,11 @@ mod tests {
     use super::*;
 
     /// Write a frame into a Vec buffer, then read it back from a cursor.
-    /// `write_frame` calls close() so we can't use the same stream for both.
+    /// `write_frame` calls `close()` so we can't use the same stream for both.
     async fn write_to_buf(data: &[u8]) -> Vec<u8> {
         let mut buf = Vec::new();
         let compressed = compression::compress(data);
-        let len = compressed.len() as u32;
+        let len = u32::try_from(compressed.len()).unwrap_or(u32::MAX);
         // Manually write instead of write_frame (which calls close)
         futures::AsyncWriteExt::write_all(&mut buf, &len.to_be_bytes())
             .await
@@ -260,7 +260,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_read_frame_large_payload() {
-        let original: Vec<u8> = (0..100_000).map(|i| (i % 251) as u8).collect();
+        let original: Vec<u8> = (0..100_000)
+            .map(|i| u8::try_from(i % 251).unwrap_or(u8::MAX))
+            .collect();
         let buf = write_to_buf(&original).await;
         let mut cursor = futures::io::Cursor::new(buf);
         let decoded = read_frame(&mut cursor, MAX_FRAME_SIZE).await.unwrap();
@@ -304,9 +306,14 @@ mod tests {
         // Write valid length prefix + garbage bytes
         let garbage = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04];
         let mut buf = Vec::new();
-        futures::AsyncWriteExt::write_all(&mut buf, &(garbage.len() as u32).to_be_bytes())
-            .await
-            .unwrap();
+        futures::AsyncWriteExt::write_all(
+            &mut buf,
+            &u32::try_from(garbage.len())
+                .unwrap_or(u32::MAX)
+                .to_be_bytes(),
+        )
+        .await
+        .unwrap();
         buf.extend_from_slice(&garbage);
 
         let mut cursor = futures::io::Cursor::new(buf);
@@ -332,7 +339,7 @@ mod tests {
     async fn write_typed_to_buf(type_id: &str, sbor_data: &[u8]) -> Vec<u8> {
         let mut buf = Vec::new();
         let type_id_bytes = type_id.as_bytes();
-        let type_id_len = type_id_bytes.len() as u16;
+        let type_id_len = u16::try_from(type_id_bytes.len()).unwrap_or(u16::MAX);
         futures::AsyncWriteExt::write_all(&mut buf, &type_id_len.to_le_bytes())
             .await
             .unwrap();
@@ -340,7 +347,7 @@ mod tests {
             .await
             .unwrap();
         let compressed = compression::compress(sbor_data);
-        let len = compressed.len() as u32;
+        let len = u32::try_from(compressed.len()).unwrap_or(u32::MAX);
         futures::AsyncWriteExt::write_all(&mut buf, &len.to_be_bytes())
             .await
             .unwrap();

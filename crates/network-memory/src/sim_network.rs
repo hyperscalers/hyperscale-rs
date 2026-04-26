@@ -48,7 +48,7 @@ pub struct PendingNotification {
     pub data: Vec<u8>,
 }
 
-/// A buffered request from IoLoop, awaiting harness fulfillment.
+/// A buffered request from `IoLoop`, awaiting harness fulfillment.
 ///
 /// The simulation harness drains these after each step, looks up the
 /// per-type request handler on the target peer, passes the SBOR-encoded
@@ -92,8 +92,9 @@ pub struct SimNetworkAdapter {
 impl SimNetworkAdapter {
     /// Create a new adapter with a shared handler registry.
     ///
-    /// Use [`SimulatedNetwork::create_adapter`] to create adapters with
-    /// shared registries for request fulfillment and gossip delivery.
+    /// Use [`SimulatedNetwork::create_adapter`](crate::SimulatedNetwork::create_adapter)
+    /// to create adapters with shared registries for request fulfillment and gossip delivery.
+    #[must_use]
     pub fn new(registry: Arc<HandlerRegistry>) -> Self {
         Self {
             outbox: Mutex::new(Vec::new()),
@@ -107,6 +108,10 @@ impl SimNetworkAdapter {
     ///
     /// Returns the entries accumulated since the last drain. The harness calls
     /// this after each `IoLoop::step()` to process outbound messages.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal `Mutex` is poisoned.
     pub fn drain_outbox(&self) -> Vec<OutboxEntry> {
         std::mem::take(&mut self.outbox.lock().unwrap())
     }
@@ -115,6 +120,10 @@ impl SimNetworkAdapter {
     ///
     /// The harness calls this after each `IoLoop::step()` to fulfill
     /// requests by looking up data from peer nodes and calling the callbacks.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal `Mutex` is poisoned.
     pub fn drain_pending_requests(&self) -> Vec<PendingRequest> {
         std::mem::take(&mut self.pending_requests.lock().unwrap())
     }
@@ -123,6 +132,10 @@ impl SimNetworkAdapter {
     ///
     /// The harness calls this after each `IoLoop::step()` to deliver
     /// notifications to their recipients via per-type notification handlers.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal `Mutex` is poisoned.
     pub fn drain_pending_notifications(&self) -> Vec<PendingNotification> {
         std::mem::take(&mut self.pending_notifications.lock().unwrap())
     }
@@ -212,7 +225,7 @@ impl Network for SimNetworkAdapter {
                 Ok(bytes) => match sbor::basic_decode::<R::Response>(&bytes) {
                     Ok(response) => on_response(Ok(response)),
                     Err(e) => {
-                        on_response(Err(RequestError::PeerError(format!("decode error: {e:?}"))))
+                        on_response(Err(RequestError::PeerError(format!("decode error: {e:?}"))));
                     }
                 },
                 Err(e) => on_response(Err(e)),

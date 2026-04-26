@@ -46,3 +46,6 @@ rand.workspace = true
 
 [dev-dependencies]
 hyperscale-messages.workspace = true
+
+[lints]
+workspace = true

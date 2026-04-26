@@ -28,7 +28,8 @@ pub(super) struct ValidationReport {
 ///
 /// Sends a [`ValidationReport`] for each gossipsub message so the event loop can call
 /// `report_message_validation_result`, controlling forwarding and peer scoring.
-pub(super) async fn handle_gossipsub_event(
+#[allow(clippy::too_many_lines)] // single dispatch over gossipsub events; sub-events share local state
+pub(super) fn handle_gossipsub_event(
     event: SwarmEvent<BehaviourEvent>,
     local_shard: ShardGroupId,
     registry: &Arc<HandlerRegistry>,
@@ -43,22 +44,19 @@ pub(super) async fn handle_gossipsub_event(
         })) => {
             // Parse topic immediately to determine message type and shard
             let topic_str = message.topic.as_str();
-            let parsed = match hyperscale_network::parse_topic(topic_str) {
-                Some(t) => t,
-                None => {
-                    warn!(
-                        topic = %topic_str,
-                        peer = %propagation_source,
-                        "Received message with invalid topic format"
-                    );
-                    metrics::record_invalid_message();
-                    let _ = validation_tx.send(ValidationReport {
-                        message_id,
-                        propagation_source,
-                        acceptance: gossipsub::MessageAcceptance::Reject,
-                    });
-                    return;
-                }
+            let Some(parsed) = hyperscale_network::parse_topic(topic_str) else {
+                warn!(
+                    topic = %topic_str,
+                    peer = %propagation_source,
+                    "Received message with invalid topic format"
+                );
+                metrics::record_invalid_message();
+                let _ = validation_tx.send(ValidationReport {
+                    message_id,
+                    propagation_source,
+                    acceptance: gossipsub::MessageAcceptance::Reject,
+                });
+                return;
             };
 
             let data_len = message.data.len();
@@ -93,21 +91,18 @@ pub(super) async fn handle_gossipsub_event(
             }
 
             // Look up the per-type handler from the registry.
-            let handler = match registry.get_gossip(msg_type) {
-                Some(h) => h,
-                None => {
-                    warn!(
-                        msg_type = msg_type,
-                        "No gossip handler registered for message type, dropping"
-                    );
-                    // No handler is not the sender's fault — ignore rather than reject.
-                    let _ = validation_tx.send(ValidationReport {
-                        message_id,
-                        propagation_source,
-                        acceptance: gossipsub::MessageAcceptance::Ignore,
-                    });
-                    return;
-                }
+            let Some(handler) = registry.get_gossip(msg_type) else {
+                warn!(
+                    msg_type = msg_type,
+                    "No gossip handler registered for message type, dropping"
+                );
+                // No handler is not the sender's fault — ignore rather than reject.
+                let _ = validation_tx.send(ValidationReport {
+                    message_id,
+                    propagation_source,
+                    acceptance: gossipsub::MessageAcceptance::Ignore,
+                });
+                return;
             };
 
             // Spawn decompress + handler off the event loop.

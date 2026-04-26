@@ -25,9 +25,11 @@ pub const MAX_DECOMPRESSED_SIZE: usize = 64 * 1024 * 1024;
 /// Errors from compression/decompression.
 #[derive(Debug, Error)]
 pub enum CompressionError {
+    /// Underlying LZ4 decoder rejected the payload.
     #[error("decompression failed: {0}")]
     DecompressionFailed(String),
 
+    /// LZ4 size prefix claims more bytes than [`MAX_DECOMPRESSED_SIZE`] allows.
     #[error("claimed uncompressed size {0} exceeds limit {1}")]
     TooLarge(usize, usize),
 }
@@ -37,6 +39,7 @@ pub enum CompressionError {
 /// Uses LZ4 block compression with a prepended size header.
 /// LZ4 is chosen for its speed (~400 MB/s) with reasonable ratios (2-3x).
 #[inline]
+#[must_use]
 pub fn compress(data: &[u8]) -> Vec<u8> {
     lz4_flex::compress_prepend_size(data)
 }
@@ -46,6 +49,12 @@ pub fn compress(data: &[u8]) -> Vec<u8> {
 /// Expects LZ4 block format with prepended size header.
 /// Rejects payloads whose claimed uncompressed size exceeds
 /// [`MAX_DECOMPRESSED_SIZE`] to prevent allocation bombs.
+///
+/// # Errors
+///
+/// Returns [`CompressionError::TooLarge`] if the size prefix exceeds the
+/// cap, or [`CompressionError::DecompressionFailed`] if the LZ4 decoder
+/// rejects the payload.
 #[inline]
 pub fn decompress(data: &[u8]) -> Result<Vec<u8>, CompressionError> {
     let (claimed_size, _) = lz4_flex::block::uncompressed_size(data)
@@ -121,7 +130,9 @@ mod tests {
     #[test]
     fn test_compress_decompress_large_payload() {
         // ~1MB of semi-realistic data
-        let original: Vec<u8> = (0..1_000_000).map(|i| (i % 251) as u8).collect();
+        let original: Vec<u8> = (0..1_000_000)
+            .map(|i| u8::try_from(i % 251).unwrap_or(u8::MAX))
+            .collect();
         let compressed = compress(&original);
         let decompressed = decompress(&compressed).unwrap();
         assert_eq!(original, decompressed);

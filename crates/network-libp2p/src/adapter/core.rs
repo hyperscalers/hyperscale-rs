@@ -1,4 +1,4 @@
-//! Core Libp2pAdapter: construction, public API, and shutdown.
+//! Core `Libp2pAdapter`: construction, public API, and shutdown.
 
 use super::behaviour::{Behaviour, NOTIFY_PROTOCOL, REQUEST_PROTOCOL};
 use super::command::{PriorityCommandChannels, SwarmCommand};
@@ -23,8 +23,8 @@ use tracing::{info, trace};
 /// Uses gossipsub for efficient broadcast and Kademlia DHT for peer discovery.
 /// Commands are processed in priority order via [`PriorityCommandChannels`].
 ///
-/// Request/response uses raw streams via libp2p_stream. The adapter is a "dumb pipe" -
-/// all timeout logic is owned by RequestManager.
+/// Request/response uses raw streams via `libp2p_stream`. The adapter is a "dumb pipe" -
+/// all timeout logic is owned by `RequestManager`.
 pub struct Libp2pAdapter {
     /// Local peer ID.
     local_peer_id: Libp2pPeerId,
@@ -36,7 +36,7 @@ pub struct Libp2pAdapter {
     /// Commands are routed to the appropriate channel based on message priority.
     priority_channels: PriorityCommandChannels,
 
-    /// Known validators (ValidatorId -> PeerId).
+    /// Known validators (`ValidatorId` -> `PeerId`).
     /// Used by request-response to resolve peer addresses.
     validator_peers: Arc<DashMap<ValidatorId, Libp2pPeerId>>,
 
@@ -66,13 +66,22 @@ impl Libp2pAdapter {
     /// * `validator_id` - Local validator ID
     /// * `shard` - Local shard assignment
     /// * `registry` - Shared handler registry for per-type message dispatch
-    /// * `local_bind_signature` - Pre-computed BLS signature over our PeerId (for validator-bind)
+    /// * `local_bind_signature` - Pre-computed BLS signature over our `PeerId` (for validator-bind)
     /// * `validator_keys` - Initial validator key map for bind verification
     ///
     /// # Returns
     ///
     /// The adapter wrapped in an Arc for shared ownership.
-    pub async fn new(
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetworkError`] if swarm construction or transport setup fails.
+    // Single setup path mirroring the libp2p builder structure.
+    // `config` is taken by value: every caller constructs a fresh config and hands
+    // it over, and the body picks fields out, so converting to `&Libp2pConfig`
+    // would just force the body to copy each scalar field.
+    #[allow(clippy::too_many_lines, clippy::needless_pass_by_value)]
+    pub fn new(
         config: Libp2pConfig,
         keypair: identity::Keypair,
         validator_id: ValidatorId,
@@ -142,7 +151,7 @@ impl Libp2pAdapter {
         let version = option_env!("HYPERSCALE_VERSION").unwrap_or("localdev");
         let identify_config =
             identify::Config::new("/hyperscale/1.0.0".to_string(), keypair.public())
-                .with_agent_version(format!("hyperscale/{}", version));
+                .with_agent_version(format!("hyperscale/{version}"));
         let identify = identify::Behaviour::new(identify_config);
 
         // Create behaviour
@@ -161,8 +170,7 @@ impl Libp2pAdapter {
         for addr in &config.listen_addresses {
             swarm.listen_on(addr.clone()).map_err(|e| {
                 NetworkError::NetworkError(format!(
-                    "Failed to bind QUIC transport on {}: {:?}",
-                    addr, e
+                    "Failed to bind QUIC transport on {addr}: {e:?}"
                 ))
             })?;
             info!("Listening on: {}", addr);
@@ -171,15 +179,12 @@ impl Libp2pAdapter {
         // Listen on TCP fallback if enabled
         if config.tcp_fallback_enabled {
             if let Some(tcp_port) = config.tcp_fallback_port {
-                let tcp_addr: Multiaddr = format!("/ip4/0.0.0.0/tcp/{}", tcp_port)
+                let tcp_addr: Multiaddr = format!("/ip4/0.0.0.0/tcp/{tcp_port}")
                     .parse()
-                    .map_err(|e| {
-                        NetworkError::NetworkError(format!("Invalid TCP address: {}", e))
-                    })?;
+                    .map_err(|e| NetworkError::NetworkError(format!("Invalid TCP address: {e}")))?;
                 swarm.listen_on(tcp_addr.clone()).map_err(|e| {
                     NetworkError::NetworkError(format!(
-                        "Failed to bind TCP transport on {}: {:?}",
-                        tcp_addr, e
+                        "Failed to bind TCP transport on {tcp_addr}: {e:?}"
                     ))
                 })?;
                 info!("Listening on TCP fallback: {}", tcp_addr);
@@ -306,6 +311,10 @@ impl Libp2pAdapter {
     ///
     /// Called by `Libp2pNetwork::register_gossip_handler` to auto-subscribe
     /// when a handler is registered.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetworkError::NetworkShutdown`] if the swarm task has stopped.
     pub fn subscribe_topic(&self, topic: String) -> Result<(), NetworkError> {
         self.priority_channels
             .send(SwarmCommand::Subscribe { topic })
@@ -320,6 +329,10 @@ impl Libp2pAdapter {
     ///
     /// Callers are responsible for SBOR-encoding and compressing the message
     /// before calling this method (use `sbor::basic_encode` + `compression::compress`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetworkError::NetworkShutdown`] if the swarm task has stopped.
     pub fn publish(
         &self,
         topic: &hyperscale_network::Topic,
@@ -351,18 +364,24 @@ impl Libp2pAdapter {
     }
 
     /// Dial a peer address.
-    pub async fn dial(&self, address: Multiaddr) -> Result<(), NetworkError> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetworkError::NetworkShutdown`] if the swarm task has stopped.
+    pub fn dial(&self, address: Multiaddr) -> Result<(), NetworkError> {
         self.priority_channels
             .send(SwarmCommand::Dial { address })
             .map_err(|_| NetworkError::NetworkShutdown)
     }
 
     /// Get the local peer ID.
+    #[must_use]
     pub fn local_peer_id(&self) -> Libp2pPeerId {
         self.local_peer_id
     }
 
     /// Get the local validator ID.
+    #[must_use]
     pub fn local_validator_id(&self) -> ValidatorId {
         self.local_validator_id
     }
@@ -372,6 +391,7 @@ impl Libp2pAdapter {
     /// This returns instantly from an atomic counter that's updated by the
     /// network event loop whenever connections are established or closed.
     /// Use this in hot paths like the consensus event loop.
+    #[must_use]
     pub fn cached_peer_count(&self) -> usize {
         self.cached_peer_count.load(Ordering::Relaxed)
     }
@@ -407,40 +427,52 @@ impl Libp2pAdapter {
     /// Open a bidirectional stream to a peer.
     ///
     /// This is the low-level stream API. The caller is responsible for:
-    /// - All timeout logic (via tokio::time::timeout wrapping read/write)
+    /// - All timeout logic (via `tokio::time::timeout` wrapping read/write)
     /// - Framing (length-prefixed messages)
     /// - Closing the stream when done
     ///
-    /// RequestManager should be used for request/response patterns - it wraps
+    /// `RequestManager` should be used for request/response patterns - it wraps
     /// this method with proper timeout, retry, and peer selection logic.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetworkError::StreamOpenFailed`] if the underlying libp2p
+    /// stream control rejects the open (peer unknown, protocol unsupported, etc.).
     pub async fn open_request_stream(&self, peer: Libp2pPeerId) -> Result<Stream, NetworkError> {
         self.stream_control
             .clone()
             .open_stream(peer, REQUEST_PROTOCOL)
             .await
-            .map_err(|e| NetworkError::StreamOpenFailed(format!("{:?}", e)))
+            .map_err(|e| NetworkError::StreamOpenFailed(format!("{e:?}")))
     }
 
     /// Open a fire-and-forget notification stream to a peer.
     ///
     /// Uses `NOTIFY_PROTOCOL` — the receiver reads the typed frame and closes
     /// the stream (no response is sent back).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetworkError::StreamOpenFailed`] if the underlying libp2p
+    /// stream control rejects the open.
     pub async fn open_notify_stream(&self, peer: Libp2pPeerId) -> Result<Stream, NetworkError> {
         self.stream_control
             .clone()
             .open_stream(peer, NOTIFY_PROTOCOL)
             .await
-            .map_err(|e| NetworkError::StreamOpenFailed(format!("{:?}", e)))
+            .map_err(|e| NetworkError::StreamOpenFailed(format!("{e:?}")))
     }
 
     /// Get the peer ID for a validator (if known).
+    #[must_use]
     pub fn peer_for_validator(&self, validator_id: ValidatorId) -> Option<Libp2pPeerId> {
         self.validator_peers.get(&validator_id).map(|r| *r)
     }
 
     /// Get a clone of the stream control handle.
     ///
-    /// This allows external components (like InboundRouter) to accept incoming streams.
+    /// This allows external components (like `InboundRouter`) to accept incoming streams.
+    #[must_use]
     pub fn stream_control(&self) -> stream::Control {
         self.stream_control.clone()
     }

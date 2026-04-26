@@ -1,7 +1,7 @@
 //! Routes inbound network requests to per-type handlers.
 //!
 //! This component accepts incoming streams from peers and dispatches them to
-//! the appropriate handler based on the request type_id in the frame header.
+//! the appropriate handler based on the request `type_id` in the frame header.
 //! The handler registry is populated during node initialization.
 //!
 //! Concurrency is bounded by a global semaphore and per-peer counters to
@@ -30,7 +30,7 @@ const STREAM_IO_TIMEOUT: Duration = Duration::from_secs(5);
 /// more frames to send. Longer than QUIC idle timeout (30s) so QUIC
 /// keep-alive handles liveness detection; this just prevents resource
 /// leaks if a sender silently disappears.
-const PERSISTENT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const PERSISTENT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// Maximum number of inbound streams handled concurrently across all peers.
 const MAX_INBOUND_CONCURRENT: usize = 128;
@@ -56,7 +56,7 @@ const MAX_COOLDOWN: Duration = Duration::from_secs(30);
 
 /// Per-peer failure rate tracking state.
 ///
-/// Lives inside the `per_peer_failures` DashMap and is accessed from both the
+/// Lives inside the `per_peer_failures` `DashMap` and is accessed from both the
 /// accept loop (to check cooldown) and stream handler tasks (to record outcomes).
 struct PeerRateState {
     /// Failures observed in the current window.
@@ -95,7 +95,7 @@ pub(crate) struct InboundRouterHandle {
 ///
 /// The router accepts incoming streams and for each:
 /// 1. Checks per-peer and global concurrency limits
-/// 2. Reads the typed frame header (type_id) + compressed SBOR payload
+/// 2. Reads the typed frame header (`type_id`) + compressed SBOR payload
 /// 3. Looks up the handler in the registry and calls it with the SBOR payload
 /// 4. Compresses and writes the length-prefixed response
 /// 5. Closes the stream
@@ -113,7 +113,7 @@ impl InboundRouter {
     /// Spawn the inbound router as two background tasks (request + notification).
     ///
     /// The router will accept incoming streams until the stream control is dropped.
-    fn spawn(adapter: Arc<Libp2pAdapter>, registry: Arc<HandlerRegistry>) -> InboundRouterHandle {
+    fn spawn(adapter: &Arc<Libp2pAdapter>, registry: Arc<HandlerRegistry>) -> InboundRouterHandle {
         let router = Arc::new(InboundRouter {
             registry,
             global_semaphore: Arc::new(Semaphore::new(MAX_INBOUND_CONCURRENT)),
@@ -252,17 +252,16 @@ impl InboundRouter {
         }
 
         // ── Global concurrency check ──
-        match self.global_semaphore.clone().try_acquire_owned() {
-            Ok(permit) => Some(permit),
-            Err(_) => {
-                self.decrement_peer_count(peer_id);
-                warn!(
-                    peer = %peer_id,
-                    limit = MAX_INBOUND_CONCURRENT,
-                    "Dropping inbound stream: global concurrency limit reached"
-                );
-                None
-            }
+        if let Ok(permit) = self.global_semaphore.clone().try_acquire_owned() {
+            Some(permit)
+        } else {
+            self.decrement_peer_count(peer_id);
+            warn!(
+                peer = %peer_id,
+                limit = MAX_INBOUND_CONCURRENT,
+                "Dropping inbound stream: global concurrency limit reached"
+            );
+            None
         }
     }
 
@@ -438,7 +437,7 @@ impl InboundRouter {
 ///
 /// Used internally by `Libp2pNetwork`.
 pub(crate) fn spawn_inbound_router(
-    adapter: Arc<Libp2pAdapter>,
+    adapter: &Arc<Libp2pAdapter>,
     registry: Arc<HandlerRegistry>,
 ) -> InboundRouterHandle {
     InboundRouter::spawn(adapter, registry)
@@ -460,16 +459,17 @@ impl StreamError {
     /// these must not count toward the per-peer failure threshold.
     fn is_client_abandonment(&self) -> bool {
         let io_kind = match self {
-            StreamError::Io(e) => Some(e.kind()),
-            StreamError::Frame(FrameError::Io(e)) => Some(e.kind()),
+            StreamError::Io(e) | StreamError::Frame(FrameError::Io(e)) => Some(e.kind()),
             _ => None,
         };
         matches!(
             io_kind,
-            Some(std::io::ErrorKind::UnexpectedEof)
-                | Some(std::io::ErrorKind::BrokenPipe)
-                | Some(std::io::ErrorKind::ConnectionReset)
-                | Some(std::io::ErrorKind::ConnectionAborted)
+            Some(
+                std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+            )
         )
     }
 }
@@ -478,8 +478,8 @@ impl std::fmt::Display for StreamError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             StreamError::Timeout => write!(f, "stream timeout"),
-            StreamError::Io(e) => write!(f, "stream I/O error: {}", e),
-            StreamError::Frame(e) => write!(f, "stream frame error: {}", e),
+            StreamError::Io(e) => write!(f, "stream I/O error: {e}"),
+            StreamError::Frame(e) => write!(f, "stream frame error: {e}"),
             StreamError::UnknownMessageType => write!(f, "unknown message type"),
         }
     }

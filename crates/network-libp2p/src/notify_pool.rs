@@ -64,7 +64,7 @@ struct PeerStreamActor {
 /// task owns the actual `libp2p::Stream` and writes frames sequentially.
 pub(crate) struct NotifyStreamPool {
     adapter: Arc<Libp2pAdapter>,
-    /// Per-peer stream actors. Key = PeerId, Value = actor handle.
+    /// Per-peer stream actors. Key = `PeerId`, Value = actor handle.
     peers: Arc<DashMap<PeerId, PeerStreamActor>>,
     /// Backoff tracking for reconnection after failures.
     backoff: Arc<DashMap<PeerId, BackoffState>>,
@@ -202,10 +202,9 @@ impl NotifyStreamPool {
 
     /// Apply exponential backoff for a peer after a stream failure.
     fn apply_backoff(backoff_map: &DashMap<PeerId, BackoffState>, peer_id: &PeerId) {
-        let current_backoff = backoff_map
-            .get(peer_id)
-            .map(|state| (state.current_backoff * BACKOFF_MULTIPLIER).min(MAX_BACKOFF))
-            .unwrap_or(INITIAL_BACKOFF);
+        let current_backoff = backoff_map.get(peer_id).map_or(INITIAL_BACKOFF, |state| {
+            (state.current_backoff * BACKOFF_MULTIPLIER).min(MAX_BACKOFF)
+        });
 
         backoff_map.insert(
             *peer_id,

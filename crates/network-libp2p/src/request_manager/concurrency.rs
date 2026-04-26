@@ -27,6 +27,8 @@ fn compute_increased_concurrency(
         return None;
     }
 
+    #[allow(clippy::cast_precision_loss)]
+    // ratio used only for bucketed thresholds, precision irrelevant
     let headroom_ratio = current as f64 / max as f64;
     let increment = if headroom_ratio < 0.5 {
         4

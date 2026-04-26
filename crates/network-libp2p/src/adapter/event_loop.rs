@@ -32,7 +32,7 @@ const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(5);
 const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 
 /// Interval for periodic Kademlia refresh to discover new peers.
-const KADEMLIA_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+const KADEMLIA_REFRESH_INTERVAL: Duration = Duration::from_mins(1);
 
 /// Parse the hyperscale agent version format: `"hyperscale/<version>"`.
 ///
@@ -44,7 +44,7 @@ fn parse_hyperscale_version(agent_version: &str) -> Option<&str> {
 }
 
 /// Background event loop that processes swarm events and routes messages.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // single hot loop; splitting would scatter shared swarm state
 pub(super) async fn run(
     mut swarm: Swarm<Behaviour>,
     mut critical_rx: mpsc::UnboundedReceiver<SwarmCommand>,
@@ -249,7 +249,13 @@ pub(super) async fn run(
                         );
 
                         // Version compatibility check
-                        if !version_interop_mode.check(local_version, remote_version) {
+                        if version_interop_mode.check(local_version, remote_version) {
+                            // Version OK — trigger the validator-bind protocol.
+                            // The bind service will open a stream, exchange BLS-signed
+                            // PeerId proofs, and register the ValidatorId → PeerId
+                            // mapping on success.
+                            let _ = bind_trigger_tx.send(*peer_id);
+                        } else {
                             warn!(
                                 peer = %peer_id,
                                 local_version = %local_version,
@@ -260,12 +266,6 @@ pub(super) async fn run(
                             if swarm.disconnect_peer_id(*peer_id).is_err() {
                                 warn!(peer = %peer_id, "Failed to disconnect incompatible peer");
                             }
-                        } else {
-                            // Version OK — trigger the validator-bind protocol.
-                            // The bind service will open a stream, exchange BLS-signed
-                            // PeerId proofs, and register the ValidatorId → PeerId
-                            // mapping on success.
-                            let _ = bind_trigger_tx.send(*peer_id);
                         }
                     } else {
                         warn!(
@@ -316,7 +316,7 @@ pub(super) async fn run(
                 // Handle connection closed — reconnection scheduling + logging
                 if let SwarmEvent::ConnectionClosed { peer_id, cause, num_established, connection_id, .. } = &event {
                     let cause_str = match &cause {
-                        Some(e) => format!("{:?}", e),
+                        Some(e) => format!("{e:?}"),
                         None => "None (graceful)".to_string(),
                     };
                     warn!(
@@ -384,7 +384,7 @@ pub(super) async fn run(
                     local_shard,
                     &registry,
                     &validation_tx,
-                ).await;
+                );
 
                 // Update cached peer count after connection changes
                 if is_connection_event {
@@ -445,7 +445,7 @@ fn handle_command(swarm: &mut Swarm<Behaviour>, cmd: SwarmCommand) {
             let _ = response_tx.send(addrs);
         }
         SwarmCommand::GetConnectedPeers { response_tx } => {
-            let peers: Vec<Libp2pPeerId> = swarm.connected_peers().cloned().collect();
+            let peers: Vec<Libp2pPeerId> = swarm.connected_peers().copied().collect();
             let _ = response_tx.send(peers);
         }
     }

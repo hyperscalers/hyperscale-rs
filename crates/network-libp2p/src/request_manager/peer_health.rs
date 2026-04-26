@@ -126,12 +126,12 @@ impl PeerHealth {
 
         // In-flight penalty: prefer peers with fewer active requests
         // Each in-flight request reduces weight by 20%
-        let load_factor = 1.0 / (1.0 + self.in_flight as f64 * 0.2);
+        let load_factor = 1.0 / (1.0 + f64::from(self.in_flight) * 0.2);
 
         // Recency bonus: slight preference for peers with recent success
         let recency_factor = match self.last_success {
             Some(t) if t.elapsed() < Duration::from_secs(10) => 1.1,
-            Some(t) if t.elapsed() < Duration::from_secs(60) => 1.0,
+            Some(t) if t.elapsed() < Duration::from_mins(1) => 1.0,
             _ => 0.9,
         };
 
@@ -158,14 +158,14 @@ impl Default for PeerHealthConfig {
     fn default() -> Self {
         Self {
             max_in_flight_per_peer: 4,
-            stale_peer_timeout: Duration::from_secs(300),
+            stale_peer_timeout: Duration::from_mins(5),
         }
     }
 }
 
 /// Tracks health metrics for all known peers.
 ///
-/// Uses DashMap for concurrent access without explicit locking.
+/// Uses `DashMap` for concurrent access without explicit locking.
 /// Multiple tasks can record successes/failures and select peers simultaneously.
 pub struct PeerHealthTracker {
     config: PeerHealthConfig,
@@ -211,16 +211,17 @@ impl PeerHealthTracker {
     }
 
     /// Check if peer can accept more requests.
+    #[must_use]
     pub fn can_send_to(&self, peer: &PeerId) -> bool {
         self.peers
             .get(peer)
-            .map(|h| h.in_flight < self.config.max_in_flight_per_peer)
-            .unwrap_or(true) // Unknown peers can receive requests
+            .is_none_or(|h| h.in_flight < self.config.max_in_flight_per_peer)
     }
 
     /// Get current in-flight count for a peer.
+    #[must_use]
     pub fn in_flight(&self, peer: &PeerId) -> u32 {
-        self.peers.get(peer).map(|h| h.in_flight).unwrap_or(0)
+        self.peers.get(peer).map_or(0, |h| h.in_flight)
     }
 
     /// Select best peer from candidates using weighted random selection.
@@ -228,7 +229,9 @@ impl PeerHealthTracker {
     /// Returns None only if the candidate list is empty.
     /// Per-peer load is used as a soft weight factor, not a hard gate.
     /// This ensures requests never fail with "no peers" when peers exist.
+    #[must_use]
     pub fn select_peer(&self, candidates: &[PeerId]) -> Option<PeerId> {
+        use rand::Rng;
         if candidates.is_empty() {
             return None;
         }
@@ -240,11 +243,7 @@ impl PeerHealthTracker {
         let weights: Vec<(PeerId, f64)> = candidates
             .iter()
             .map(|&peer| {
-                let weight = self
-                    .peers
-                    .get(&peer)
-                    .map(|h| h.selection_weight())
-                    .unwrap_or(0.5); // Unknown peers get neutral weight
+                let weight = self.peers.get(&peer).map_or(0.5, |h| h.selection_weight()); // Unknown peers get neutral weight
                 (peer, weight)
             })
             .collect();
@@ -261,7 +260,6 @@ impl PeerHealthTracker {
         }
 
         // Use thread-local RNG for efficiency
-        use rand::Rng;
         let mut rng = rand::thread_rng();
         let mut target: f64 = rng.gen_range(0.0..total_weight);
 
@@ -298,6 +296,8 @@ impl PeerHealthTracker {
     }
 
     /// Get global success rate across all peers (for adaptive concurrency).
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)] // ratio is a soft signal for adaptive concurrency
     pub fn global_success_rate(&self) -> f64 {
         if self.peers.is_empty() {
             return 0.5; // Neutral when no data
@@ -308,6 +308,7 @@ impl PeerHealthTracker {
     }
 
     /// Get health metrics for a specific peer.
+    #[must_use]
     pub fn get_health(&self, peer: &PeerId) -> Option<PeerHealth> {
         self.peers.get(peer).map(|r| r.clone())
     }
@@ -344,6 +345,7 @@ impl PeerHealthTracker {
     }
 
     /// Get statistics for monitoring/metrics.
+    #[must_use]
     pub fn stats(&self) -> PeerHealthStats {
         let mut total_in_flight = 0u32;
         let mut total_successes = 0u64;
@@ -351,7 +353,7 @@ impl PeerHealthTracker {
         let mut min_success_rate = 1.0f64;
         let mut max_success_rate = 0.0f64;
 
-        for entry in self.peers.iter() {
+        for entry in &self.peers {
             total_in_flight += entry.in_flight;
             total_successes += entry.total_successes;
             total_failures += entry.total_failures;
@@ -590,9 +592,7 @@ mod tests {
         // Healthy should be selected significantly more often
         assert!(
             healthy_count > unhealthy_count * 2,
-            "healthy={} unhealthy={}",
-            healthy_count,
-            unhealthy_count
+            "healthy={healthy_count} unhealthy={unhealthy_count}",
         );
     }
 
@@ -713,7 +713,7 @@ mod tests {
     #[test]
     fn test_cleanup_stale_keeps_active_peers() {
         let config = PeerHealthConfig {
-            stale_peer_timeout: Duration::from_secs(60),
+            stale_peer_timeout: Duration::from_mins(1),
             ..Default::default()
         };
         let tracker = PeerHealthTracker::new(config);

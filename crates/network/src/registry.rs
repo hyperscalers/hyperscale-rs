@@ -11,7 +11,7 @@
 //! created by the typed registration methods in this module.
 //!
 //! All registrations happen at init (before any messages arrive), so
-//! the read-heavy RwLock pattern is ideal.
+//! the read-heavy `RwLock` pattern is ideal.
 
 use crate::traits::{GossipHandler, GossipVerdict, NotificationHandler, RequestHandler};
 use hyperscale_types::{NetworkMessage, Request};
@@ -43,6 +43,7 @@ pub struct HandlerRegistry {
 
 impl HandlerRegistry {
     /// Create an empty registry.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             gossip: RwLock::new(HashMap::new()),
@@ -57,6 +58,10 @@ impl HandlerRegistry {
     ///
     /// Wraps the handler in a closure that SBOR-decodes the payload before
     /// calling the handler. Decode errors are logged and the message is dropped.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the registry's internal `RwLock` is poisoned.
     pub fn register_gossip<M: NetworkMessage>(&self, handler: impl GossipHandler<M>) {
         let raw: Arc<RawGossipHandler> = Arc::new(
             move |payload: Vec<u8>| match sbor::basic_decode::<M>(&payload) {
@@ -81,6 +86,10 @@ impl HandlerRegistry {
     ///
     /// Wraps the handler in a closure that SBOR-decodes the request,
     /// calls the handler, and SBOR-encodes the response.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the registry's internal `RwLock` is poisoned.
     pub fn register_request<R: Request>(&self, handler: impl RequestHandler<R>) {
         let raw: Arc<RawRequestHandler> = Arc::new(move |payload: &[u8]| -> Vec<u8> {
             let req = match sbor::basic_decode::<R>(payload) {
@@ -118,6 +127,10 @@ impl HandlerRegistry {
     ///
     /// SBOR-decodes the payload before calling the handler. Stored in a separate
     /// map so a message type can be registered as both gossip and notification.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the registry's internal `RwLock` is poisoned.
     pub fn register_notification<M: NetworkMessage>(&self, handler: impl NotificationHandler<M>) {
         let raw: Arc<RawNotificationHandler> =
             Arc::new(
@@ -140,26 +153,38 @@ impl HandlerRegistry {
 
     // ── Raw registration (used by infrastructure tests) ──
 
-    /// Register a raw gossip handler by type_id string.
+    /// Register a raw gossip handler by `type_id` string.
     ///
     /// Prefer [`register_gossip`](Self::register_gossip) for production code.
     /// This is useful for infrastructure tests that work with raw bytes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the registry's internal `RwLock` is poisoned.
     pub fn register_raw_gossip(&self, type_id: &'static str, handler: Arc<RawGossipHandler>) {
         self.gossip.write().unwrap().insert(type_id, handler);
     }
 
-    /// Register a raw request handler by type_id string.
+    /// Register a raw request handler by `type_id` string.
     ///
     /// Prefer [`register_request`](Self::register_request) for production code.
     /// This is useful for infrastructure tests that work with raw bytes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the registry's internal `RwLock` is poisoned.
     pub fn register_raw_request(&self, type_id: &'static str, handler: Arc<RawRequestHandler>) {
         self.request.write().unwrap().insert(type_id, handler);
     }
 
-    /// Register a raw notification handler by type_id string.
+    /// Register a raw notification handler by `type_id` string.
     ///
     /// Prefer [`register_notification`](Self::register_notification) for production code.
     /// This is useful for infrastructure tests that work with raw bytes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the registry's internal `RwLock` is poisoned.
     pub fn register_raw_notification(
         &self,
         type_id: &'static str,
@@ -171,28 +196,31 @@ impl HandlerRegistry {
     // ── Transport-layer dispatch (used by inbound router / sim harness) ──
 
     /// Look up the gossip handler for a message type.
+    #[must_use]
     pub fn get_gossip(&self, message_type_id: &str) -> Option<Arc<RawGossipHandler>> {
         self.gossip
             .read()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(message_type_id)
             .cloned()
     }
 
     /// Look up the request handler for a message type.
+    #[must_use]
     pub fn get_request(&self, message_type_id: &str) -> Option<Arc<RawRequestHandler>> {
         self.request
             .read()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(message_type_id)
             .cloned()
     }
 
     /// Look up the notification handler for a message type.
+    #[must_use]
     pub fn get_notification(&self, message_type_id: &str) -> Option<Arc<RawNotificationHandler>> {
         self.notification
             .read()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(message_type_id)
             .cloned()
     }

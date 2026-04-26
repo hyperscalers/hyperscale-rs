@@ -25,6 +25,15 @@
 //! report.print_summary();
 //! ```
 
+// Bandwidth/throughput math is intentionally lossy: we convert byte counts to
+// Mbps, GB/hr, etc. for human-readable reports. Precision loss and saturating
+// conversions are part of the unit conversion, not bugs to fix.
+#![allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+
 use crate::NodeIndex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -64,6 +73,7 @@ impl Default for NetworkTrafficAnalyzer {
 
 impl NetworkTrafficAnalyzer {
     /// Create a new traffic analyzer.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             by_message_type: RwLock::new(HashMap::new()),
@@ -78,11 +88,15 @@ impl NetworkTrafficAnalyzer {
     ///
     /// # Arguments
     ///
-    /// * `msg_type` - The message type name (e.g., "BlockHeader", "StateProvision")
+    /// * `msg_type` - The message type name (e.g., `BlockHeader`, `StateProvision`)
     /// * `payload_size` - Size of the message payload in bytes
     /// * `wire_size` - Size on the wire including framing overhead
     /// * `from` - Sender node index
     /// * `to` - Receiver node index
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal `RwLock` is poisoned.
     pub fn record_message(
         &self,
         msg_type: &str,
@@ -136,6 +150,13 @@ impl NetworkTrafficAnalyzer {
     ///
     /// * `duration` - Total simulation duration
     /// * `num_nodes` - Number of nodes in the simulation
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal `RwLock` is poisoned.
+    // single-pass aggregation over per-type / per-node tables; deliberate
+    // family of `avg_node_*` bindings (same metric, different units).
+    #[allow(clippy::too_many_lines, clippy::similar_names)]
     pub fn generate_report(&self, duration: Duration, num_nodes: usize) -> BandwidthReport {
         let total_messages = self.total_messages.load(Ordering::Relaxed);
         let total_bytes = self.total_wire_bytes.load(Ordering::Relaxed);
@@ -228,17 +249,16 @@ impl NetworkTrafficAnalyzer {
         };
 
         let (avg_node_bps, avg_node_upload_bps, avg_node_download_bps, max_node_bps, min_node_bps) =
-            if !by_node.is_empty() {
+            if by_node.is_empty() {
+                (0.0, 0.0, 0.0, 0.0, 0.0)
+            } else {
                 let total_upload: f64 = by_node.values().map(|n| n.upload_bps).sum();
                 let total_download: f64 = by_node.values().map(|n| n.download_bps).sum();
-                let max = by_node
-                    .values()
-                    .map(|n| n.total_bps)
-                    .fold(0.0f64, |a, b| a.max(b));
+                let max = by_node.values().map(|n| n.total_bps).fold(0.0f64, f64::max);
                 let min = by_node
                     .values()
                     .map(|n| n.total_bps)
-                    .fold(f64::MAX, |a, b| a.min(b));
+                    .fold(f64::MAX, f64::min);
                 let avg_total = (total_upload + total_download) / num_nodes as f64;
 
                 (
@@ -246,10 +266,12 @@ impl NetworkTrafficAnalyzer {
                     total_upload / num_nodes as f64,
                     total_download / num_nodes as f64,
                     max,
-                    if min == f64::MAX { 0.0 } else { min },
+                    if (min - f64::MAX).abs() < f64::EPSILON {
+                        0.0
+                    } else {
+                        min
+                    },
                 )
-            } else {
-                (0.0, 0.0, 0.0, 0.0, 0.0)
             };
 
         // Calculate human-readable estimates
@@ -353,7 +375,7 @@ pub struct NodeTrafficStats {
     pub bytes_sent: u64,
     /// Bytes received (wire format).
     pub bytes_received: u64,
-    /// Breakdown by message type: (sent_count, recv_count, sent_bytes, recv_bytes).
+    /// Breakdown by message type: (`sent_count`, `recv_count`, `sent_bytes`, `recv_bytes`).
     pub by_type: HashMap<String, (u64, u64, u64, u64)>,
 }
 
@@ -612,7 +634,7 @@ fn format_bytes(bytes: u64) -> String {
     } else if bytes >= KB {
         format!("{:.2} KB", bytes as f64 / KB as f64)
     } else {
-        format!("{} B", bytes)
+        format!("{bytes} B")
     }
 }
 

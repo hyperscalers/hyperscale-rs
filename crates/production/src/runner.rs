@@ -403,8 +403,7 @@ impl ProductionRunnerBuilder {
             registry.clone(),
             local_bind_signature,
             initial_validator_keys,
-        )
-        .await?;
+        )?;
 
         // ── Create RequestManager ────────────────────────────────────────
         let request_pool = Arc::new(hyperscale_network_libp2p::RequestStreamPool::new(

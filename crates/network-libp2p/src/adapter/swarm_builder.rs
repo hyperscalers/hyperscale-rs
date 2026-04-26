@@ -34,7 +34,8 @@ fn apply_quic_tuning(quic_config: &mut libp2p::quic::Config, app_config: &Libp2p
     quic_config.keep_alive_interval = app_config.keep_alive_interval;
     // QUIC idle timeout: connections are closed after this duration of inactivity
     // Must be longer than keep_alive_interval to allow keep-alives to work
-    quic_config.max_idle_timeout = app_config.idle_connection_timeout.as_millis() as u32;
+    quic_config.max_idle_timeout =
+        u32::try_from(app_config.idle_connection_timeout.as_millis()).unwrap_or(u32::MAX);
 }
 
 /// Build a configured libp2p Swarm with QUIC transport and optional TCP fallback.
@@ -76,8 +77,9 @@ pub(super) fn build_swarm(
         // Prioritize QUIC by putting it first (Left side of OrTransport)
         let transport =
             OrTransport::new(quic_transport, tcp_transport).map(|either, _| match either {
-                Either::Left((peer_id, muxer)) => (peer_id, muxer),
-                Either::Right((peer_id, muxer)) => (peer_id, muxer),
+                Either::Left((peer_id, muxer)) | Either::Right((peer_id, muxer)) => {
+                    (peer_id, muxer)
+                }
             });
 
         Ok(SwarmBuilder::with_existing_identity(keypair)
@@ -86,7 +88,7 @@ pub(super) fn build_swarm(
             .unwrap() // Unwrap Infallible error from transport add
             .with_behaviour(|_| behaviour)
             .map_err(|e| {
-                NetworkError::NetworkError(format!("Failed to configure swarm behaviour: {:?}", e))
+                NetworkError::NetworkError(format!("Failed to configure swarm behaviour: {e:?}"))
             })?
             .with_swarm_config(|c| {
                 c.with_idle_connection_timeout(config.idle_connection_timeout)
@@ -103,7 +105,7 @@ pub(super) fn build_swarm(
             })
             .with_behaviour(|_| behaviour)
             .map_err(|e| {
-                NetworkError::NetworkError(format!("Failed to configure swarm behaviour: {:?}", e))
+                NetworkError::NetworkError(format!("Failed to configure swarm behaviour: {e:?}"))
             })?
             .with_swarm_config(|c| {
                 c.with_idle_connection_timeout(config.idle_connection_timeout)

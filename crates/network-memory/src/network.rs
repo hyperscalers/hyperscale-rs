@@ -1,5 +1,10 @@
 //! Simulated network with deterministic latency, packet loss, and partitions.
 
+// `NodeIndex = u32` and `ValidatorId = u64` are interchangeable identifiers in
+// the simulator (validator counts are bounded by the test harness, well under
+// `u32::MAX`); the casts between them are domain-sized.
+#![allow(clippy::cast_possible_truncation)]
+
 use crate::sim_network::{
     BroadcastTarget, OutboxEntry, PendingNotification, PendingRequest, SimNetworkAdapter,
 };
@@ -51,9 +56,13 @@ impl Default for NetworkConfig {
 /// [`SimulatedNetwork::accept_gossip`].
 #[derive(Debug, Default)]
 pub struct FulfillmentStats {
+    /// Messages successfully scheduled for delivery.
     pub messages_sent: u64,
+    /// Messages dropped because sender and receiver are partitioned.
     pub messages_dropped_partition: u64,
+    /// Messages dropped to model packet loss.
     pub messages_dropped_loss: u64,
+    /// Messages suppressed because the recipient already received that gossip ID.
     pub messages_deduplicated: u64,
 }
 
@@ -191,12 +200,13 @@ impl std::fmt::Debug for SimulatedNetwork {
             .field("pending_gossip", &self.pending_gossip.len())
             .field("pending_notifications", &self.pending_notifications.len())
             .field("pending_responses", &self.pending_responses.len())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
 impl SimulatedNetwork {
     /// Create a new simulated network with per-node handler registries.
+    #[must_use]
     pub fn new(config: NetworkConfig) -> Self {
         let num_nodes = (config.num_shards * config.validators_per_shard) as usize;
         let registries = (0..num_nodes)
@@ -228,6 +238,7 @@ impl SimulatedNetwork {
     /// calls populate the shared registry, making them visible to
     /// [`accept_requests`](Self::accept_requests), [`flush_notifications`](Self::flush_notifications),
     /// and [`flush_gossip`](Self::flush_gossip).
+    #[must_use]
     pub fn create_adapter(&self, node: NodeIndex) -> SimNetworkAdapter {
         SimNetworkAdapter::new(Arc::clone(&self.registries[node as usize]))
     }
@@ -235,6 +246,7 @@ impl SimulatedNetwork {
     // ─── Partition Management ───
 
     /// Check if two nodes are partitioned (message from `from` to `to` would be dropped).
+    #[must_use]
     pub fn is_partitioned(&self, from: NodeIndex, to: NodeIndex) -> bool {
         self.partitions.contains(&(from, to))
     }
@@ -251,7 +263,7 @@ impl SimulatedNetwork {
     }
 
     /// Create a bidirectional partition between two groups of nodes.
-    /// All messages between group_a and group_b are dropped (both directions).
+    /// All messages between `group_a` and `group_b` are dropped (both directions).
     pub fn partition_groups(&mut self, group_a: &[NodeIndex], group_b: &[NodeIndex]) {
         for &a in group_a {
             for &b in group_b {
@@ -288,6 +300,7 @@ impl SimulatedNetwork {
     }
 
     /// Get the number of active partition pairs.
+    #[must_use]
     pub fn partition_count(&self) -> usize {
         self.partitions.len()
     }
@@ -306,6 +319,7 @@ impl SimulatedNetwork {
     }
 
     /// Get the current packet loss rate.
+    #[must_use]
     pub fn packet_loss_rate(&self) -> f64 {
         self.config.packet_loss_rate
     }
@@ -355,11 +369,13 @@ impl SimulatedNetwork {
     }
 
     /// Get the shard for a node index.
+    #[must_use]
     pub fn shard_for_node(&self, node: NodeIndex) -> ShardGroupId {
-        ShardGroupId((node / self.config.validators_per_shard) as u64)
+        ShardGroupId(u64::from(node / self.config.validators_per_shard))
     }
 
     /// Get all nodes in a shard.
+    #[must_use]
     pub fn peers_in_shard(&self, shard: ShardGroupId) -> Vec<NodeIndex> {
         let start = (shard.0 as u32) * self.config.validators_per_shard;
         let end = start + self.config.validators_per_shard;
@@ -367,17 +383,20 @@ impl SimulatedNetwork {
     }
 
     /// Get all nodes in the network.
+    #[must_use]
     pub fn all_nodes(&self) -> Vec<NodeIndex> {
         let total = self.config.num_shards * self.config.validators_per_shard;
         (0..total).collect()
     }
 
     /// Get the total number of nodes.
+    #[must_use]
     pub fn total_nodes(&self) -> usize {
         (self.config.num_shards * self.config.validators_per_shard) as usize
     }
 
     /// Get network configuration.
+    #[must_use]
     pub fn config(&self) -> &NetworkConfig {
         &self.config
     }
@@ -388,7 +407,7 @@ impl SimulatedNetwork {
     /// with round-trip latency.
     ///
     /// For each request:
-    /// 1. Select a peer (preferred_peer if set, otherwise random from list)
+    /// 1. Select a peer (`preferred_peer` if set, otherwise random from list)
     /// 2. Check partition and packet loss (request + response directions)
     /// 3. On error (partition/loss/no handler/empty): invoke callback immediately
     /// 4. On success: invoke handler to get response bytes, sample two
@@ -413,22 +432,20 @@ impl SimulatedNetwork {
             } = request;
 
             // Select target peer from the caller-provided peer list.
-            let peer = match preferred_peer {
-                Some(vid) => vid.0 as NodeIndex,
-                None => {
-                    // Pick a random peer from the provided list.
-                    let mut candidates: Vec<NodeIndex> =
-                        peers.iter().map(|v| v.0 as NodeIndex).collect();
-                    candidates.shuffle(rng);
-                    match candidates.first() {
-                        Some(&p) => p,
-                        None => {
-                            on_response(Err(RequestError::PeerUnreachable(ValidatorId(
-                                requester as u64,
-                            ))));
-                            continue;
-                        }
-                    }
+            let peer = if let Some(vid) = preferred_peer {
+                vid.0 as NodeIndex
+            } else {
+                // Pick a random peer from the provided list.
+                let mut candidates: Vec<NodeIndex> =
+                    peers.iter().map(|v| v.0 as NodeIndex).collect();
+                candidates.shuffle(rng);
+                if let Some(&p) = candidates.first() {
+                    p
+                } else {
+                    on_response(Err(RequestError::PeerUnreachable(ValidatorId(u64::from(
+                        requester,
+                    )))));
+                    continue;
                 }
             };
 
@@ -436,7 +453,9 @@ impl SimulatedNetwork {
             if self.is_partitioned(requester, peer) {
                 stats.messages_dropped_partition += 1;
                 trace!(requester, peer, "Request dropped: partition");
-                on_response(Err(RequestError::PeerUnreachable(ValidatorId(peer as u64))));
+                on_response(Err(RequestError::PeerUnreachable(ValidatorId(u64::from(
+                    peer,
+                )))));
                 continue;
             }
 
@@ -444,7 +463,9 @@ impl SimulatedNetwork {
             if self.should_drop_packet(rng) {
                 stats.messages_dropped_loss += 1;
                 trace!(requester, peer, "Request dropped: packet loss");
-                on_response(Err(RequestError::PeerUnreachable(ValidatorId(peer as u64))));
+                on_response(Err(RequestError::PeerUnreachable(ValidatorId(u64::from(
+                    peer,
+                )))));
                 continue;
             }
 
@@ -452,7 +473,9 @@ impl SimulatedNetwork {
             if self.should_drop_packet(rng) {
                 stats.messages_dropped_loss += 1;
                 trace!(requester, peer, "Response dropped: packet loss");
-                on_response(Err(RequestError::PeerUnreachable(ValidatorId(peer as u64))));
+                on_response(Err(RequestError::PeerUnreachable(ValidatorId(u64::from(
+                    peer,
+                )))));
                 continue;
             }
 
@@ -470,18 +493,15 @@ impl SimulatedNetwork {
             }
 
             // Look up the per-type request handler from the peer's registry.
-            let handler = match self
+            let Some(handler) = self
                 .registries
                 .get(peer as usize)
                 .and_then(|r| r.get_request(type_id))
-            {
-                Some(h) => h,
-                None => {
-                    on_response(Err(RequestError::PeerError(format!(
-                        "no handler for {type_id} on node {peer}"
-                    ))));
-                    continue;
-                }
+            else {
+                on_response(Err(RequestError::PeerError(format!(
+                    "no handler for {type_id} on node {peer}"
+                ))));
+                continue;
             };
 
             // Invoke handler synchronously (data lookup).
@@ -501,7 +521,7 @@ impl SimulatedNetwork {
 
             if let Some(ref analyzer) = self.traffic_analyzer {
                 // Record response message (peer → requester)
-                let response_type = format!("{}.response", type_id);
+                let response_type = format!("{type_id}.response");
                 analyzer.record_message(
                     &response_type,
                     response_bytes.len(),
@@ -604,6 +624,7 @@ impl SimulatedNetwork {
     ///
     /// The harness calls [`flush_gossip()`](Self::flush_gossip) to deliver
     /// due messages via each target's registered `GossipHandler`.
+    #[allow(clippy::needless_pass_by_value)] // mirrors `accept_notifications` / `accept_requests` for symmetry
     pub fn accept_gossip(
         &mut self,
         from: NodeIndex,
@@ -697,6 +718,11 @@ impl SimulatedNetwork {
     ///
     /// Calls each target node's registered `GossipHandler`. Returns the
     /// number of messages delivered.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the heap reports a peek-able entry that disappears before
+    /// the matching `pop()` — never observed in practice.
     pub fn flush_gossip(&mut self, now: Duration) -> usize {
         let mut delivered = 0;
         while let Some(Reverse(scheduled)) = self.pending_gossip.peek() {
@@ -723,6 +749,7 @@ impl SimulatedNetwork {
     }
 
     /// Earliest pending gossip delivery time (for event loop scheduling).
+    #[must_use]
     pub fn next_gossip_delivery_time(&self) -> Option<Duration> {
         self.pending_gossip.peek().map(|Reverse(s)| s.delivery_time)
     }
@@ -740,6 +767,11 @@ impl SimulatedNetwork {
     ///
     /// Calls each target node's registered notification handler. Returns
     /// the number of notifications delivered.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the heap reports a peek-able entry that disappears before
+    /// the matching `pop()` — never observed in practice.
     pub fn flush_notifications(&mut self, now: Duration) -> usize {
         let mut delivered = 0;
         while let Some(Reverse(scheduled)) = self.pending_notifications.peek() {
@@ -766,6 +798,7 @@ impl SimulatedNetwork {
     }
 
     /// Earliest pending notification delivery time.
+    #[must_use]
     pub fn next_notification_delivery_time(&self) -> Option<Duration> {
         self.pending_notifications
             .peek()
@@ -778,6 +811,11 @@ impl SimulatedNetwork {
     ///
     /// Invokes each deferred `on_response` callback with the pre-computed
     /// response bytes. Returns the number of responses delivered.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the heap reports a peek-able entry that disappears before
+    /// the matching `pop()` — never observed in practice.
     pub fn flush_responses(&mut self, now: Duration) -> usize {
         let mut delivered = 0;
         while let Some(Reverse(scheduled)) = self.pending_responses.peek() {
@@ -792,6 +830,7 @@ impl SimulatedNetwork {
     }
 
     /// Earliest pending response delivery time.
+    #[must_use]
     pub fn next_response_delivery_time(&self) -> Option<Duration> {
         self.pending_responses
             .peek()
@@ -801,6 +840,7 @@ impl SimulatedNetwork {
     // ─── Unified Delivery Time ───
 
     /// Earliest pending delivery time across gossip, notifications, and responses.
+    #[must_use]
     pub fn next_delivery_time(&self) -> Option<Duration> {
         [
             self.next_gossip_delivery_time(),
@@ -960,8 +1000,8 @@ mod tests {
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
         // Count drops over many iterations
-        let mut drops = 0;
-        let iterations = 10000;
+        let mut drops: u32 = 0;
+        let iterations: u32 = 10000;
         for _ in 0..iterations {
             if network.should_drop_packet(&mut rng) {
                 drops += 1;
@@ -969,7 +1009,7 @@ mod tests {
         }
 
         // Should be roughly 50% (within reasonable variance)
-        let drop_rate = drops as f64 / iterations as f64;
+        let drop_rate = f64::from(drops) / f64::from(iterations);
         assert!(
             (0.45..0.55).contains(&drop_rate),
             "Expected ~50% drop rate, got {:.2}%",
@@ -978,14 +1018,14 @@ mod tests {
 
         // Test setting rate
         network.set_packet_loss_rate(0.0);
-        assert_eq!(network.packet_loss_rate(), 0.0);
+        assert!(network.packet_loss_rate().abs() < f64::EPSILON);
 
         // Clamping
         network.set_packet_loss_rate(1.5);
-        assert_eq!(network.packet_loss_rate(), 1.0);
+        assert!((network.packet_loss_rate() - 1.0).abs() < f64::EPSILON);
 
         network.set_packet_loss_rate(-0.5);
-        assert_eq!(network.packet_loss_rate(), 0.0);
+        assert!(network.packet_loss_rate().abs() < f64::EPSILON);
     }
 
     #[test]
@@ -1056,10 +1096,10 @@ mod tests {
 
     // ─── accept_requests() Tests ───
 
-    /// Helper: register an echo handler on a node's adapter for a given type_id.
+    /// Helper: register an echo handler on a node's adapter for a given `type_id`.
     ///
     /// Registers directly on the shared registry since these tests exercise
-    /// the SimulatedNetwork infrastructure (partitions, latency), not the
+    /// the `SimulatedNetwork` infrastructure (partitions, latency), not the
     /// typed handler registration API.
     fn register_echo(adapter: &SimNetworkAdapter, type_id: &'static str) {
         let handler: Arc<hyperscale_network::RawRequestHandler> =
@@ -1067,7 +1107,7 @@ mod tests {
         adapter.registry.register_raw_request(type_id, handler);
     }
 
-    /// Helper: build a PendingRequest with a callback that captures the result.
+    /// Helper: build a `PendingRequest` with a callback that captures the result.
     fn make_request_with_capture(
         peers: Vec<ValidatorId>,
         preferred_peer: Option<ValidatorId>,
@@ -1355,7 +1395,7 @@ mod tests {
     /// Register recording handlers on all nodes and return them.
     ///
     /// Registers directly on the shared registry since these tests exercise
-    /// the SimulatedNetwork infrastructure, not the typed handler API.
+    /// the `SimulatedNetwork` infrastructure, not the typed handler API.
     fn register_gossip_handlers(network: &SimulatedNetwork) -> Vec<Arc<RecordingHandler>> {
         use hyperscale_network::registry::RawGossipHandler;
         use hyperscale_network::GossipVerdict;
@@ -1376,7 +1416,7 @@ mod tests {
     }
 
     /// Far-future time that ensures all pending gossip is delivered.
-    const FAR_FUTURE: Duration = Duration::from_secs(60);
+    const FAR_FUTURE: Duration = Duration::from_mins(1);
 
     #[test]
     fn test_accept_gossip_shard_scoped() {
@@ -1658,6 +1698,8 @@ mod tests {
     #[test]
     fn test_full_gossip_roundtrip() {
         use hyperscale_messages::TransactionGossip;
+        use hyperscale_network::registry::RawGossipHandler;
+        use hyperscale_network::GossipVerdict;
         use hyperscale_types::{
             test_utils::{test_node, test_transaction_with_nodes},
             ShardGroupId,
@@ -1673,8 +1715,6 @@ mod tests {
 
         // Register per-type handlers for "transaction.gossip" on each node.
         // Register directly on registry since we want raw recording handlers.
-        use hyperscale_network::registry::RawGossipHandler;
-        use hyperscale_network::GossipVerdict;
         let handlers: Vec<Arc<RecordingHandler>> = (0..network.total_nodes() as NodeIndex)
             .map(|i| {
                 let handler = RecordingHandler::new();

@@ -3,6 +3,7 @@
 use libp2p::identity;
 
 /// Generate a random Ed25519 keypair for libp2p transport encryption.
+#[must_use]
 pub fn generate_random_keypair() -> identity::Keypair {
     identity::Keypair::generate_ed25519()
 }

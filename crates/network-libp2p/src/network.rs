@@ -30,7 +30,7 @@ use tracing::{info, warn};
 ///
 /// Also owns a `RequestManager` for request-response operations.
 /// The generic `request<R>()` method SBOR-encodes the request, dispatches
-/// to the RequestManager, and SBOR-decodes the response.
+/// to the `RequestManager`, and SBOR-decodes the response.
 pub struct Libp2pNetwork {
     adapter: Arc<Libp2pAdapter>,
     request_manager: Arc<RequestManager>,
@@ -39,7 +39,7 @@ pub struct Libp2pNetwork {
     registry: Arc<HandlerRegistry>,
     /// Local shard for deriving topic subscriptions.
     local_shard: ShardGroupId,
-    /// Count of PeerUnreachable errors (cold-start diagnostics).
+    /// Count of `PeerUnreachable` errors (cold-start diagnostics).
     peer_unreachable_count: AtomicUsize,
     /// Persistent per-peer notification stream pool.
     notify_pool: NotifyStreamPool,
@@ -49,6 +49,10 @@ pub struct Libp2pNetwork {
 }
 
 impl Libp2pNetwork {
+    /// Build a `Libp2pNetwork` over the supplied swarm adapter and request manager.
+    ///
+    /// Eagerly spawns the inbound router on `tokio_handle`; the router dispatches
+    /// inbound requests / notifications to handlers registered on `registry`.
     pub fn new(
         adapter: Arc<Libp2pAdapter>,
         request_manager: Arc<RequestManager>,
@@ -59,7 +63,7 @@ impl Libp2pNetwork {
         // Eagerly spawn the inbound router. It will dispatch incoming
         // requests to handlers as they are registered in the registry.
         let _guard = tokio_handle.enter();
-        let inbound_router = spawn_inbound_router(adapter.clone(), registry.clone());
+        let inbound_router = spawn_inbound_router(&adapter, registry.clone());
 
         let notify_pool = NotifyStreamPool::new(adapter.clone(), tokio_handle.clone());
 

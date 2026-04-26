@@ -18,8 +18,8 @@ pub(super) struct Behaviour {
     /// Kademlia DHT for peer discovery.
     pub(super) kademlia: kad::Behaviour<kad::store::MemoryStore>,
 
-    /// Raw streams for request/response (replaces request_response).
-    /// RequestManager owns all timeout logic; this is just a "dumb pipe".
+    /// Raw streams for request/response (replaces `request_response`).
+    /// `RequestManager` owns all timeout logic; this is just a "dumb pipe".
     pub(super) stream: stream::Behaviour,
 
     /// Identify protocol for peer versioning.

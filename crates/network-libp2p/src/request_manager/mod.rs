@@ -67,7 +67,7 @@ const MIN_STREAM_TIMEOUT_WARM: Duration = Duration::from_millis(300);
 const MIN_STREAM_TIMEOUT_COLD: Duration = Duration::from_secs(2);
 
 /// Multiplier for RTT to compute stream timeout.
-/// Timeout = RTT * multiplier, clamped to [MIN_WARM, MAX].
+/// Timeout = RTT * multiplier, clamped to `[MIN_WARM, MAX]`.
 const STREAM_TIMEOUT_RTT_MULTIPLIER: f64 = 5.0;
 
 /// Errors from request operations.
@@ -170,7 +170,7 @@ impl Default for RequestManagerConfig {
 pub struct RequestManager {
     pool: Arc<RequestStreamPool>,
     config: RequestManagerConfig,
-    /// Peer health tracker (uses DashMap internally, no external lock needed).
+    /// Peer health tracker (uses `DashMap` internally, no external lock needed).
     health: PeerHealthTracker,
     /// Current in-flight request count.
     in_flight: AtomicUsize,
@@ -180,6 +180,7 @@ pub struct RequestManager {
 
 impl RequestManager {
     /// Create a new request manager.
+    #[must_use]
     pub fn new(pool: Arc<RequestStreamPool>, config: RequestManagerConfig) -> Self {
         let effective = config.max_concurrent;
         Self {
@@ -208,6 +209,11 @@ impl RequestManager {
     /// # Returns
     ///
     /// The responding peer's ID and the response payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RequestError`] when retries are exhausted, the request times out,
+    /// or no peer in `peers` is reachable.
     pub async fn request(
         &self,
         peers: &[PeerId],
@@ -289,8 +295,8 @@ mod tests {
         assert_eq!(config.max_total_attempts, 15);
         assert_eq!(config.initial_backoff, Duration::from_millis(100));
         assert_eq!(config.max_backoff, Duration::from_millis(500));
-        assert_eq!(config.backoff_multiplier, 1.5);
-        assert_eq!(config.target_success_rate, 0.5);
+        assert!((config.backoff_multiplier - 1.5).abs() < f64::EPSILON);
+        assert!((config.target_success_rate - 0.5).abs() < f64::EPSILON);
         assert_eq!(config.min_concurrent, 4);
         assert!(config.min_concurrent <= config.max_concurrent);
     }

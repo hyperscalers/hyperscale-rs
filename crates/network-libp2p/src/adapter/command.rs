@@ -252,7 +252,7 @@ mod tests {
         for i in 0..5u8 {
             channels
                 .send(SwarmCommand::Broadcast {
-                    topic: format!("topic-{}", i),
+                    topic: format!("topic-{i}"),
                     data: vec![i],
                     priority: MessagePriority::Critical,
                 })

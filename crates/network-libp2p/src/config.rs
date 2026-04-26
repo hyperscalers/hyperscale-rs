@@ -61,7 +61,7 @@ pub struct Libp2pConfig {
     /// Default: true
     pub tcp_fallback_enabled: bool,
 
-    /// TCP fallback port (only used when tcp_fallback_enabled is true).
+    /// TCP fallback port (only used when `tcp_fallback_enabled` is true).
     ///
     /// Default: None (uses QUIC port + 21500 offset)
     pub tcp_fallback_port: Option<u16>,
@@ -97,6 +97,7 @@ pub enum VersionInteroperabilityMode {
 
 impl VersionInteroperabilityMode {
     /// Check if two versions are compatible according to this mode.
+    #[must_use]
     pub fn check(&self, local_version: &str, remote_version: &str) -> bool {
         match self {
             VersionInteroperabilityMode::Off => true,
@@ -136,42 +137,49 @@ impl Default for Libp2pConfig {
 
 impl Libp2pConfig {
     /// Set the listen addresses.
+    #[must_use]
     pub fn with_listen_addresses(mut self, addrs: Vec<Multiaddr>) -> Self {
         self.listen_addresses = addrs;
         self
     }
 
     /// Set the bootstrap peers.
+    #[must_use]
     pub fn with_bootstrap_peers(mut self, peers: Vec<Multiaddr>) -> Self {
         self.bootstrap_peers = peers;
         self
     }
 
     /// Set the maximum message size.
+    #[must_use]
     pub fn with_max_message_size(mut self, size: usize) -> Self {
         self.max_message_size = size;
         self
     }
 
     /// Set the gossipsub heartbeat interval.
+    #[must_use]
     pub fn with_gossipsub_heartbeat(mut self, interval: Duration) -> Self {
         self.gossipsub_heartbeat = interval;
         self
     }
 
     /// Set the idle connection timeout.
+    #[must_use]
     pub fn with_idle_connection_timeout(mut self, timeout: Duration) -> Self {
         self.idle_connection_timeout = timeout;
         self
     }
 
     /// Set the QUIC keep-alive interval.
+    #[must_use]
     pub fn with_keep_alive_interval(mut self, interval: Duration) -> Self {
         self.keep_alive_interval = interval;
         self
     }
 
     /// Enable or disable TCP fallback transport.
+    #[must_use]
     pub fn with_tcp_fallback(mut self, enabled: bool, port: Option<u16>) -> Self {
         self.tcp_fallback_enabled = enabled;
         self.tcp_fallback_port = port;
@@ -179,9 +187,15 @@ impl Libp2pConfig {
     }
 
     /// Create config for local testing with specified port.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the constructed multiaddr fails to parse — only possible
+    /// if the `format!` template is broken, which would be caught at test time.
+    #[must_use]
     pub fn for_testing(port: u16) -> Self {
         Self {
-            listen_addresses: vec![format!("/ip4/127.0.0.1/udp/{}/quic-v1", port)
+            listen_addresses: vec![format!("/ip4/127.0.0.1/udp/{port}/quic-v1")
                 .parse()
                 .unwrap()],
             bootstrap_peers: vec![],
@@ -196,6 +210,7 @@ impl Libp2pConfig {
     }
 
     /// Set the version interoperability mode.
+    #[must_use]
     pub fn with_version_interop_mode(mut self, mode: VersionInteroperabilityMode) -> Self {
         self.version_interop_mode = mode;
         self

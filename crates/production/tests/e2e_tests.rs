@@ -74,22 +74,16 @@ async fn test_network_adapter_starts() {
     };
 
     let (bind_sig, topo) = test_bind_args(&keypair, validator_id);
-    let result = timeout(
-        CONNECTION_TIMEOUT,
-        Libp2pAdapter::new(
-            config,
-            keypair,
-            validator_id,
-            shard,
-            Arc::new(hyperscale_network::HandlerRegistry::new()),
-            bind_sig,
-            topo,
-        ),
+    let adapter = Libp2pAdapter::new(
+        config,
+        keypair,
+        validator_id,
+        shard,
+        Arc::new(hyperscale_network::HandlerRegistry::new()),
+        bind_sig,
+        topo,
     )
-    .await;
-
-    assert!(result.is_ok(), "Adapter creation should not timeout");
-    let adapter = result.unwrap().unwrap();
+    .unwrap();
 
     // Verify adapter state
     assert_eq!(adapter.local_validator_id(), validator_id);
@@ -127,7 +121,6 @@ async fn test_two_node_connection() {
         bind_sig1,
         topo1,
     )
-    .await
     .unwrap();
 
     // Wait for node 1 to be ready and get its address
@@ -154,7 +147,6 @@ async fn test_two_node_connection() {
         bind_sig2,
         topo2,
     )
-    .await
     .unwrap();
 
     // Wait for connection to establish
@@ -209,7 +201,6 @@ async fn test_topic_subscription() {
         bind_sig,
         topo,
     )
-    .await
     .unwrap();
 
     // Subscribe to a topic via subscribe_topic (individual subscription)
@@ -250,7 +241,6 @@ async fn test_validator_bind_success() {
         bind_sig0,
         fixtures.validator_key_map(0),
     )
-    .await
     .unwrap();
 
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -275,7 +265,6 @@ async fn test_validator_bind_success() {
         bind_sig1,
         fixtures.validator_key_map(1),
     )
-    .await
     .unwrap();
 
     // Wait for validator-bind to complete on both sides.
@@ -331,7 +320,6 @@ async fn test_validator_bind_rejects_wrong_key() {
         bind_sig0,
         fixtures.validator_key_map(0),
     )
-    .await
     .unwrap();
 
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -358,7 +346,6 @@ async fn test_validator_bind_rejects_wrong_key() {
         wrong_sig,
         fixtures.validator_key_map(1),
     )
-    .await
     .unwrap();
 
     // Wait for transport connection to establish.
@@ -414,7 +401,6 @@ async fn test_validator_bind_evicted_on_disconnect() {
         bind_sig0,
         fixtures.validator_key_map(0),
     )
-    .await
     .unwrap();
 
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -439,7 +425,6 @@ async fn test_validator_bind_evicted_on_disconnect() {
         bind_sig1,
         fixtures.validator_key_map(1),
     )
-    .await
     .unwrap();
 
     // Wait for bind to complete.

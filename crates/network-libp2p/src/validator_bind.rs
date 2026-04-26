@@ -1,7 +1,7 @@
-//! Validator-bind protocol: cryptographic ValidatorId ↔ PeerId binding.
+//! Validator-bind protocol: cryptographic `ValidatorId` ↔ `PeerId` binding.
 //!
-//! After libp2p's Noise transport proves PeerId ownership, this protocol
-//! proves the peer also controls the BLS signing key for a given ValidatorId
+//! After libp2p's Noise transport proves `PeerId` ownership, this protocol
+//! proves the peer also controls the BLS signing key for a given `ValidatorId`
 //! (as known from the topology).
 //!
 //! # Protocol
@@ -77,8 +77,8 @@ fn decode_bind_message(data: &[u8]) -> Option<(ValidatorId, Bls12381G2Signature)
 
 // ─── Verification ───────────────────────────────────────────────────────
 
-/// Verify a bind message: the BLS signature over the peer's PeerId must be
-/// valid for the claimed ValidatorId's public key.
+/// Verify a bind message: the BLS signature over the peer's `PeerId` must be
+/// valid for the claimed `ValidatorId`'s public key.
 fn verify_bind(
     peer_id: &Libp2pPeerId,
     claimed_vid: ValidatorId,
@@ -117,9 +117,9 @@ impl std::fmt::Display for BindError {
                 write!(f, "invalid BLS signature for validator {}", v.0)
             }
             BindError::InvalidMessage => write!(f, "malformed bind message"),
-            BindError::StreamOpen(e) => write!(f, "stream open failed: {}", e),
-            BindError::Io(e) => write!(f, "I/O error: {}", e),
-            BindError::Frame(e) => write!(f, "frame error: {}", e),
+            BindError::StreamOpen(e) => write!(f, "stream open failed: {e}"),
+            BindError::Io(e) => write!(f, "I/O error: {e}"),
+            BindError::Frame(e) => write!(f, "frame error: {e}"),
             BindError::Timeout => write!(f, "bind exchange timed out"),
         }
     }
@@ -314,7 +314,7 @@ fn schedule_retry(retry_tx: mpsc::UnboundedSender<BindRetry>, peer_id: Libp2pPee
 ///
 /// 1. Read remote's bind message
 /// 2. Verify
-/// 3. Register in validator_peers
+/// 3. Register in `validator_peers`
 /// 4. Send our bind message as response
 async fn handle_inbound(
     peer_id: Libp2pPeerId,
@@ -366,7 +366,7 @@ async fn handle_inbound(
 /// 2. Send our bind message
 /// 3. Read remote's bind message
 /// 4. Verify
-/// 5. Register in validator_peers
+/// 5. Register in `validator_peers`
 async fn handle_outbound(
     peer_id: Libp2pPeerId,
     mut control: stream::Control,
@@ -380,7 +380,7 @@ async fn handle_outbound(
         let mut stream = control
             .open_stream(peer_id, VALIDATOR_BIND_PROTOCOL)
             .await
-            .map_err(|e| BindError::StreamOpen(format!("{:?}", e)))?;
+            .map_err(|e| BindError::StreamOpen(format!("{e:?}")))?;
 
         // Send our bind message.
         let our_bytes = encode_bind_message(local_vid, local_sig);
@@ -390,7 +390,7 @@ async fn handle_outbound(
         {
             use futures::AsyncWriteExt;
             let compressed = hyperscale_network::compression::compress(&our_bytes);
-            let len = compressed.len() as u32;
+            let len = u32::try_from(compressed.len()).unwrap_or(u32::MAX);
             stream
                 .write_all(&len.to_be_bytes())
                 .await

@@ -13,7 +13,7 @@ use hyperscale_types::{
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Maps ValidatorId to BLS public key for identity verification (e.g. validator-bind).
+/// Maps `ValidatorId` to BLS public key for identity verification (e.g. validator-bind).
 ///
 /// Extracted from the topology snapshot and pushed to the network layer via
 /// [`Network::update_validator_keys`] on epoch transitions.
@@ -22,12 +22,16 @@ pub type ValidatorKeyMap = HashMap<ValidatorId, Bls12381G1PublicKey>;
 /// Error returned when a network request fails.
 #[derive(Debug, thiserror::Error)]
 pub enum RequestError {
+    /// No response received within the configured timeout.
     #[error("Request timed out")]
     Timeout,
+    /// Network layer could not reach the named peer.
     #[error("Peer unreachable: {0}")]
     PeerUnreachable(ValidatorId),
+    /// Peer answered with an application-level error.
     #[error("Peer returned error: {0}")]
     PeerError(String),
+    /// Network is shutting down; the request will not complete.
     #[error("Network shutting down")]
     Shutdown,
 }
@@ -64,11 +68,12 @@ pub enum GossipVerdict {
 ///
 /// Called after the network layer SBOR-decodes the raw payload into `M`.
 /// Implementations typically convert the message into a `ProtocolEvent` and
-/// send it to the IoLoop via a captured channel sender.
+/// send it to the `IoLoop` via a captured channel sender.
 ///
 /// Returns [`GossipVerdict`] to indicate whether the message should be
 /// accepted (forwarded) or rejected (dropped with peer penalty).
 pub trait GossipHandler<M: NetworkMessage>: Send + Sync + 'static {
+    /// Process a decoded gossip message; return whether to forward it.
     fn on_message(&self, message: M) -> GossipVerdict;
 }
 
@@ -84,13 +89,14 @@ impl<M: NetworkMessage, F: Fn(M) -> GossipVerdict + Send + Sync + 'static> Gossi
 /// Called after the network layer SBOR-decodes the raw payload into `M`.
 /// No return value — notifications are one-way.
 pub trait NotificationHandler<M: NetworkMessage>: Send + Sync + 'static {
+    /// Process a decoded notification.
     fn on_notification(&self, message: M);
 }
 
 /// Blanket impl: any `Fn(M)` can serve as a typed notification handler.
 impl<M: NetworkMessage, F: Fn(M) + Send + Sync + 'static> NotificationHandler<M> for F {
     fn on_notification(&self, message: M) {
-        (self)(message)
+        (self)(message);
     }
 }
 
@@ -100,6 +106,7 @@ impl<M: NetworkMessage, F: Fn(M) + Send + Sync + 'static> NotificationHandler<M>
 /// The returned `R::Response` is SBOR-encoded by the network layer before
 /// sending back to the requester.
 pub trait RequestHandler<R: Request>: Send + Sync + 'static {
+    /// Produce a response for a decoded request.
     fn handle_request(&self, request: R) -> R::Response;
 }
 
@@ -172,7 +179,7 @@ pub trait Network: Send + Sync + 'static {
 
     /// Update the validator key map used for identity verification.
     ///
-    /// Called by the io_loop when topology changes (epoch transitions).
+    /// Called by the `io_loop` when topology changes (epoch transitions).
     /// Production implementations use this to update the validator-bind
     /// handshake's key lookup. Default is a no-op (simulation doesn't need it).
     fn update_validator_keys(&self, _keys: Arc<ValidatorKeyMap>) {}

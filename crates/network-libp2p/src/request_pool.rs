@@ -89,6 +89,8 @@ pub struct RequestStreamPool {
 }
 
 impl RequestStreamPool {
+    /// Build an empty pool that lazily spawns one per-peer request actor on demand.
+    #[must_use]
     pub fn new(adapter: Arc<Libp2pAdapter>, tokio_handle: tokio::runtime::Handle) -> Self {
         Self {
             adapter,
@@ -103,6 +105,11 @@ impl RequestStreamPool {
     /// `timeout` bounds the I/O for this request once the actor picks it up —
     /// it does not bound queueing delay behind other pending requests on the
     /// same peer (peer rotation at the request-manager layer handles that).
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying [`NetworkError`] if the per-peer actor cannot be
+    /// spawned, the stream open fails, or the request times out.
     pub async fn send(
         &self,
         peer: PeerId,
@@ -207,7 +214,7 @@ impl RequestStreamPool {
                     Some(r) => r,
                     None => break,
                 },
-                _ = tokio::time::sleep(CLIENT_IDLE_TIMEOUT) => {
+                () = tokio::time::sleep(CLIENT_IDLE_TIMEOUT) => {
                     debug!(peer = %peer, "Client idle timeout — closing persistent stream");
                     break;
                 }
@@ -250,7 +257,7 @@ impl RequestStreamPool {
                 Ok(IoOutcome::Ok(response)) => {
                     let _ = req.resp_tx.send(Ok(response));
                 }
-                Ok(IoOutcome::WriteFailed(e)) | Ok(IoOutcome::ResponseFailed(e)) => {
+                Ok(IoOutcome::WriteFailed(e) | IoOutcome::ResponseFailed(e)) => {
                     let msg = format!("{e:?}");
                     let _ = req.resp_tx.send(Err(e));
                     warn!(peer = %peer, error = %msg, "Persistent request stream I/O failed");
@@ -279,10 +286,9 @@ impl RequestStreamPool {
     }
 
     fn apply_backoff(backoff_map: &DashMap<PeerId, BackoffState>, peer: &PeerId) {
-        let current_backoff = backoff_map
-            .get(peer)
-            .map(|state| (state.current_backoff * BACKOFF_MULTIPLIER).min(MAX_BACKOFF))
-            .unwrap_or(INITIAL_BACKOFF);
+        let current_backoff = backoff_map.get(peer).map_or(INITIAL_BACKOFF, |state| {
+            (state.current_backoff * BACKOFF_MULTIPLIER).min(MAX_BACKOFF)
+        });
 
         backoff_map.insert(
             *peer,

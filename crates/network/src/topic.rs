@@ -63,6 +63,7 @@ impl Topic {
     /// Create a global topic (no shard targeting).
     ///
     /// Global topics reach all validators regardless of shard assignment.
+    #[must_use]
     pub fn global(message_type: &'static str) -> Self {
         Self {
             message_type,
@@ -74,6 +75,7 @@ impl Topic {
     /// Create a shard-specific topic.
     ///
     /// Shard topics only reach validators subscribed to that shard.
+    #[must_use]
     pub fn shard(message_type: &'static str, shard: ShardGroupId) -> Self {
         Self {
             message_type,
@@ -83,32 +85,38 @@ impl Topic {
     }
 
     /// Create a topic with a specific version.
+    #[must_use]
     pub fn with_version(mut self, version: ProtocolVersion) -> Self {
         self.version = version;
         self
     }
 
     /// Get the message type identifier.
+    #[must_use]
     pub fn message_type(&self) -> &'static str {
         self.message_type
     }
 
     /// Get the optional shard ID.
+    #[must_use]
     pub fn shard_id(&self) -> Option<ShardGroupId> {
         self.shard
     }
 
     /// Get the protocol version.
+    #[must_use]
     pub fn version(&self) -> ProtocolVersion {
         self.version
     }
 
     /// Check if this is a global (non-shard) topic.
+    #[must_use]
     pub fn is_global(&self) -> bool {
         self.shard.is_none()
     }
 
     /// Check if this is a shard-specific topic.
+    #[must_use]
     pub fn is_shard(&self) -> bool {
         self.shard.is_some()
     }
@@ -118,6 +126,7 @@ impl Topic {
     /// Format:
     /// - Global: `hyperscale/{message_type}/{major}.{minor}.0`
     /// - Shard: `hyperscale/{message_type}/shard-{id}/{major}.{minor}.0`
+    #[must_use]
     pub fn to_topic_string(&self) -> String {
         match self.shard {
             Some(shard) => format!(
@@ -159,6 +168,7 @@ pub struct ParsedTopic<'a> {
 /// Returns `None` if the topic format is invalid. Does **not** validate
 /// the message type against a known set — handler lookup serves as
 /// the validation step.
+#[must_use]
 pub fn parse_topic(topic_str: &str) -> Option<ParsedTopic<'_>> {
     let parts: Vec<&str> = topic_str.split('/').collect();
 

@@ -33,12 +33,10 @@ fn initial_backoff_from_rtt(
     default_backoff: Duration,
     priority: RequestPriority,
 ) -> Duration {
-    let base_backoff = rtt_ema_secs
-        .map(|rtt| {
-            let rtt_based = Duration::from_secs_f64(rtt * 0.5);
-            rtt_based.clamp(Duration::from_millis(50), Duration::from_secs(1))
-        })
-        .unwrap_or(default_backoff);
+    let base_backoff = rtt_ema_secs.map_or(default_backoff, |rtt| {
+        let rtt_based = Duration::from_secs_f64(rtt * 0.5);
+        rtt_based.clamp(Duration::from_millis(50), Duration::from_secs(1))
+    });
 
     match priority {
         RequestPriority::Critical => base_backoff.mul_f32(0.7),

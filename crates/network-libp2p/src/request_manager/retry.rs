@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use tracing::{debug, trace, warn};
 
 impl RequestManager {
+    #[allow(clippy::too_many_lines)] // single retry/backoff/peer-rotation loop; splitting would scatter shared state
     pub(super) async fn request_inner(
         &self,
         peers: &[PeerId],
