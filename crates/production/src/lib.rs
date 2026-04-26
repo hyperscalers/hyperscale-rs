@@ -37,7 +37,8 @@
 //! The number of threads for each pool is configurable:
 //!
 //! ```no_run
-//! use hyperscale_production::{ThreadPoolConfig, PooledDispatch, ProductionRunner};
+//! use hyperscale_dispatch_pooled::{PooledDispatch, ThreadPoolConfig};
+//! use hyperscale_production::ProductionRunner;
 //! use std::sync::Arc;
 //!
 //! // Configure thread pools with explicit counts
@@ -73,11 +74,6 @@ pub mod rpc;
 mod runner;
 mod status;
 mod telemetry;
-pub use hyperscale_dispatch_pooled::{PooledDispatch, ThreadPoolConfig};
-pub use hyperscale_network_libp2p::Libp2pConfig;
-pub use hyperscale_storage_rocksdb::{
-    CompressionType, RocksDbConfig, RocksDbStorage, StorageError,
-};
 pub use runner::{ProductionRunner, RunnerError};
-pub use status::{SyncStateKind, SyncStatus};
+pub use status::SyncStatus;
 pub use telemetry::{TelemetryConfig, TelemetryGuard, init_telemetry};

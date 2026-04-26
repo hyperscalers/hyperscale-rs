@@ -567,7 +567,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_sync_status_endpoint() {
-        use crate::status::{SyncStateKind, SyncStatus};
+        use crate::status::SyncStatus;
+        use hyperscale_node::SyncStateKind;
 
         let sync_status = Arc::new(ArcSwap::new(Arc::new(SyncStatus {
             state: SyncStateKind::Syncing,

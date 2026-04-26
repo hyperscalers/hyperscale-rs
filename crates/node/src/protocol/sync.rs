@@ -13,12 +13,12 @@
 //! Production: `SyncManager` wraps this, maps outputs to tokio tasks.
 //! Simulation: feeds inputs/outputs synchronously via event queue.
 
-use crate::ProvisionStore;
 use hyperscale_messages::request::{GetBlockRequest, GetBlockTopUpRequest};
 use hyperscale_messages::response::{
     ElidedCertifiedBlock, GetBlockResponse, GetBlockTopUpResponse,
 };
 use hyperscale_metrics as metrics;
+use hyperscale_provisions::ProvisionStore;
 use hyperscale_storage::ChainReader;
 use hyperscale_types::{BlockHash, BlockHeight, CertifiedBlock, Provisions, WAVE_TIMEOUT};
 use serde::Serialize;

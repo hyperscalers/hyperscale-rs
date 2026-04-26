@@ -14,15 +14,16 @@ use crate::protocol::transaction_fetch::TransactionFetchInput;
 use hyperscale_core::{Action, CommitSource, NodeInput, ProtocolEvent, StateMachine};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::Engine;
+use hyperscale_jmt::TreeReader;
 use hyperscale_metrics as metrics;
 use hyperscale_network::Network;
-use hyperscale_storage::{ChainReader, ChainWriter, JmtTreeReader, SubstateStore, VersionedStore};
+use hyperscale_storage::{ChainReader, ChainWriter, SubstateStore, VersionedStore};
 use hyperscale_types::{Block, BlockHeight, QuorumCertificate, StateRoot, ValidatorId};
 use std::sync::Arc;
 use tracing::{debug, trace, warn};
 impl<S, N, D, E> IoLoop<S, N, D, E>
 where
-    S: ChainWriter + SubstateStore + VersionedStore + ChainReader + JmtTreeReader + Send + Sync,
+    S: ChainWriter + SubstateStore + VersionedStore + ChainReader + TreeReader + Send + Sync,
     N: Network,
     D: Dispatch,
     E: Engine,

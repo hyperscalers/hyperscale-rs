@@ -74,10 +74,6 @@ use hyperscale_jmt::{Blake3Hasher, Tree};
 use hyperscale_types::{BlockHeight, Hash, StateRoot};
 use rayon::prelude::*;
 
-// Re-export JMT types used in public APIs (CollectedWrites, etc.)
-pub use jmt::Node as JmtNode;
-pub use jmt::NodeKey as JmtNodeKey;
-
 /// The JMT configuration this backend uses: binary arity, Blake3 hasher.
 /// Centralizing as a type alias so callers don't repeat the parameters.
 pub type Jmt = Tree<Blake3Hasher, 1>;

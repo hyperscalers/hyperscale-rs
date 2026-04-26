@@ -3,7 +3,6 @@
 //! Uses [`IoLoop`] to process all actions per-node, with the simulation harness
 //! controlling event scheduling, network delivery, and time.
 
-use crate::NodeIndex;
 use crate::event_queue::EventKey;
 use hyperscale_bft::{BftConfig, RecoveredState};
 use hyperscale_core::{NodeInput, ProtocolEvent, TimerId};
@@ -11,7 +10,7 @@ use hyperscale_dispatch_sync::SyncDispatch;
 use hyperscale_engine::{Engine, RadixExecutor, SimExecutionCache, SimulationEngine};
 use hyperscale_mempool::MempoolConfig;
 use hyperscale_network_memory::{
-    NetworkConfig, NetworkTrafficAnalyzer, SimNetworkAdapter, SimulatedNetwork,
+    NetworkConfig, NetworkTrafficAnalyzer, NodeIndex, SimNetworkAdapter, SimulatedNetwork,
 };
 use hyperscale_node::io_loop::{IoLoop, StepOutput};
 use hyperscale_node::{NodeConfig, NodeStateMachine, TimerOp};

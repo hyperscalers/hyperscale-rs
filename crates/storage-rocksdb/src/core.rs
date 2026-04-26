@@ -28,8 +28,9 @@ use hyperscale_jmt as jmt;
 use hyperscale_metrics as metrics;
 use hyperscale_storage::{
     DatabaseUpdate, DatabaseUpdates, DbPartitionKey, DbSortKey, DbSubstateValue, JmtSnapshot,
-    PartitionDatabaseUpdates, PartitionEntry, StateRoot, SubstateDatabase,
+    PartitionDatabaseUpdates, PartitionEntry, SubstateDatabase,
 };
+use hyperscale_types::StateRoot;
 use rocksdb::{ColumnFamilyDescriptor, DB, Options, WriteBatch};
 use sbor::prelude::*;
 use std::path::Path;

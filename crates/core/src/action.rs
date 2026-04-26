@@ -8,8 +8,8 @@ use hyperscale_types::{
     ExecutionCertificate, ExecutionVote, FinalizedWave, GlobalReceiptRoot, LocalReceiptRoot,
     NodeId, ProposerTimestamp, ProvisionHash, ProvisionTxRoot, Provisions, ProvisionsRoot,
     QuorumCertificate, ReceiptBundle, Round, RoutableTransaction, ShardGroupId, SignerBitfield,
-    StateProvision, StateRoot, TopologySnapshot, TransactionRoot, TxHash, TxOutcome, ValidatorId,
-    VotePower, WaveId, WaveIdHash, WeightedTimestamp,
+    StateProvision, StateRoot, TopologySnapshot, TransactionRoot, TransactionStatus, TxHash,
+    TxOutcome, ValidatorId, VotePower, WaveId, WaveIdHash, WeightedTimestamp,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -920,6 +920,3 @@ impl Action {
         self.into()
     }
 }
-
-// Re-export TransactionStatus from types crate
-pub use hyperscale_types::TransactionStatus;

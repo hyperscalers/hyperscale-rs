@@ -1,6 +1,6 @@
 //! Production-specific sync status types.
 
-pub use hyperscale_node::SyncStateKind;
+use hyperscale_node::SyncStateKind;
 use serde::Serialize;
 
 /// Sync status for external APIs.

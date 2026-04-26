@@ -10,11 +10,12 @@
 //! - Deterministic - same seed always produces same results
 //! - Inline execution - Radix Engine runs synchronously (not in thread pool)
 
-use hyperscale_core::{NodeInput, TransactionStatus};
-use hyperscale_simulation::{NetworkConfig, SimulationRunner};
+use hyperscale_core::NodeInput;
+use hyperscale_network_memory::NetworkConfig;
+use hyperscale_simulation::SimulationRunner;
 use hyperscale_types::test_utils::test_validity_range;
 use hyperscale_types::{
-    BlockHeight, Ed25519PrivateKey, NodeId, RoutableTransaction, ShardGroupId,
+    BlockHeight, Ed25519PrivateKey, NodeId, RoutableTransaction, ShardGroupId, TransactionStatus,
     ed25519_keypair_from_seed, routable_from_notarized_v1, shard_for_node, sign_and_notarize,
 };
 use radix_common::constants::XRD;

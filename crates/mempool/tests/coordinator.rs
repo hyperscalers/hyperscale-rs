@@ -5,12 +5,11 @@
 //! API is caught here rather than by inline tests that can reach into
 //! private fields.
 
-use hyperscale_core::TransactionStatus;
 use hyperscale_mempool::{MempoolConfig, MempoolCoordinator, MempoolMemoryStats};
 use hyperscale_test_helpers::{TestCommittee, certify, make_finalized_wave, make_live_block};
 use hyperscale_types::{
-    BlockHeight, Hash, LocalTimestamp, ShardGroupId, TopologySnapshot, TransactionDecision, TxHash,
-    ValidatorId, test_utils::test_transaction,
+    BlockHeight, Hash, LocalTimestamp, ShardGroupId, TopologySnapshot, TransactionDecision,
+    TransactionStatus, TxHash, ValidatorId, test_utils::test_transaction,
 };
 use std::sync::Arc;
 use std::time::Duration;

@@ -7,9 +7,8 @@
 
 use hyperscale_core::ProvisionRequest;
 use hyperscale_engine::{Engine, sharding::expand_nodes_with_owned_at_height};
-use hyperscale_storage::{
-    ChainReader, ChainWriter, JmtTreeReader, SubstateStore, SubstateView, VersionedStore,
-};
+use hyperscale_jmt::TreeReader as JmtTreeReader;
+use hyperscale_storage::{ChainReader, ChainWriter, SubstateStore, SubstateView, VersionedStore};
 use hyperscale_types::{
     BlockHeight, NodeId, Provisions, ShardGroupId, StateEntry, TxEntries, TxHash, ValidatorId,
 };

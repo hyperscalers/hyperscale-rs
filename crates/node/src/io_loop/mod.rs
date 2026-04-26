@@ -45,10 +45,11 @@ use arc_swap::ArcSwap;
 use hyperscale_core::{Action, NodeInput, ProtocolEvent, StateMachine, TimerId};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::{Engine, RadixExecutor, TransactionValidation};
+use hyperscale_jmt::TreeReader;
 use hyperscale_messages::TransactionGossip;
 use hyperscale_metrics as metrics;
 use hyperscale_network::Network;
-use hyperscale_storage::{ChainReader, ChainWriter, JmtTreeReader, SubstateStore, VersionedStore};
+use hyperscale_storage::{ChainReader, ChainWriter, SubstateStore, VersionedStore};
 use hyperscale_types::{
     BlockHeight, Bls12381G1PrivateKey, Bls12381G1PublicKey, CommittedBlockHeader, ShardGroupId,
     StateRoot, TopologySnapshot, TxHash, ValidatorId,
@@ -305,7 +306,7 @@ where
 
 impl<S, N, D, E> IoLoop<S, N, D, E>
 where
-    S: ChainWriter + SubstateStore + VersionedStore + ChainReader + JmtTreeReader + Send + Sync,
+    S: ChainWriter + SubstateStore + VersionedStore + ChainReader + TreeReader + Send + Sync,
     N: Network,
     D: Dispatch,
     E: Engine,

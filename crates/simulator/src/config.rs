@@ -1,6 +1,6 @@
 //! Configuration types for the simulator.
 
-use hyperscale_simulation::NetworkConfig;
+use hyperscale_network_memory::NetworkConfig;
 use hyperscale_spammer::SelectionMode;
 use radix_common::math::Decimal;
 use std::time::Duration;

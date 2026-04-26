@@ -133,7 +133,7 @@ pub fn handle_delegated_action<
         + SubstateStore
         + hyperscale_storage::VersionedStore
         + ChainReader
-        + hyperscale_storage::JmtTreeReader
+        + hyperscale_jmt::TreeReader
         + Sync,
     E: Engine,
 >(

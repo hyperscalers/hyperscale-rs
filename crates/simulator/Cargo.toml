@@ -7,6 +7,7 @@ description = "Long-running workload simulator"
 [dependencies]
 hyperscale-core.workspace = true
 hyperscale-mempool.workspace = true
+hyperscale-network-memory.workspace = true
 hyperscale-simulation.workspace = true
 hyperscale-spammer.workspace = true
 hyperscale-types.workspace = true

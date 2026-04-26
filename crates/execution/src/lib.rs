@@ -23,6 +23,5 @@ mod vote_tracker;
 mod waves;
 
 pub use coordinator::{CompletionData, ExecutionCoordinator, ExecutionMemoryStats};
-pub use hyperscale_types::{FinalizedWave, WAVE_TIMEOUT};
 pub use vote_tracker::VoteTracker;
 pub use wave_state::WaveState;

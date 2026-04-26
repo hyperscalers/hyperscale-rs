@@ -6,13 +6,12 @@ use crate::tree_store::SimTreeStore;
 
 use hyperscale_jmt as jmt;
 use hyperscale_storage::{
-    DatabaseUpdate, DatabaseUpdates, DbPartitionKey, JmtSnapshot, PartitionDatabaseUpdates,
-    StateRoot, keys,
+    DatabaseUpdate, DatabaseUpdates, DbPartitionKey, JmtSnapshot, PartitionDatabaseUpdates, keys,
 };
 use hyperscale_types::{
     BlockHash, BlockHeight, CertifiedBlock, ExecutionCertificate, ExecutionCertificateHash,
-    ExecutionMetadata, LocalReceipt, QuorumCertificate, RoutableTransaction, ShardGroupId, TxHash,
-    WaveCertificate, WaveIdHash,
+    ExecutionMetadata, LocalReceipt, QuorumCertificate, RoutableTransaction, ShardGroupId,
+    StateRoot, TxHash, WaveCertificate, WaveIdHash,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;

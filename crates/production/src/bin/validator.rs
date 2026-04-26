@@ -47,15 +47,13 @@ use anyhow::{Context, Result, bail};
 use arc_swap::ArcSwap;
 use clap::Parser;
 use hyperscale_bft::BftConfig;
+use hyperscale_dispatch_pooled::{PooledDispatch, ThreadPoolConfig};
 use hyperscale_mempool::MempoolConfig;
-use hyperscale_network_libp2p::VersionInteroperabilityMode;
-use hyperscale_production::Libp2pConfig;
+use hyperscale_network_libp2p::{Libp2pConfig, VersionInteroperabilityMode};
 use hyperscale_production::rpc::{MempoolSnapshot, NodeStatusState, RpcServer, RpcServerConfig};
-use hyperscale_production::{
-    PooledDispatch, ProductionRunner, RocksDbConfig, RocksDbStorage, TelemetryConfig,
-    ThreadPoolConfig, init_telemetry,
-};
+use hyperscale_production::{ProductionRunner, TelemetryConfig, init_telemetry};
 use hyperscale_provisions::ProvisionConfig;
+use hyperscale_storage_rocksdb::{RocksDbConfig, RocksDbStorage};
 use hyperscale_topology::TopologyState;
 use hyperscale_types::{
     Bls12381G1PrivateKey, Bls12381G1PublicKey, ShardGroupId, ValidatorId, ValidatorInfo,
@@ -350,7 +348,7 @@ pub enum CompressionType {
     Zstd,
 }
 
-impl From<CompressionType> for hyperscale_production::CompressionType {
+impl From<CompressionType> for hyperscale_storage_rocksdb::CompressionType {
     fn from(ct: CompressionType) -> Self {
         match ct {
             CompressionType::None => Self::None,

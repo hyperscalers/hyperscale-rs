@@ -5,24 +5,19 @@ use super::verify::{resolve_sender_key, verify_bls_with_metrics, verify_sender_s
 use hyperscale_core::{NodeInput, ProtocolEvent};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::Engine;
+use hyperscale_jmt::TreeReader;
 use hyperscale_messages::{
     BlockHeaderNotification, BlockVoteNotification, ExecutionCertificatesNotification,
     ExecutionVotesNotification, TransactionGossip,
 };
 use hyperscale_network::Network;
-use hyperscale_storage::{ChainReader, ChainWriter, SubstateStore};
+use hyperscale_storage::{ChainReader, ChainWriter, SubstateStore, VersionedStore};
 use hyperscale_types::BlockHeight;
 use tracing::warn;
 
 impl<S, N, D, E> IoLoop<S, N, D, E>
 where
-    S: ChainWriter
-        + SubstateStore
-        + hyperscale_storage::VersionedStore
-        + ChainReader
-        + hyperscale_storage::JmtTreeReader
-        + Send
-        + Sync,
+    S: ChainWriter + SubstateStore + VersionedStore + ChainReader + TreeReader + Send + Sync,
     N: Network,
     D: Dispatch,
     E: Engine,

@@ -12,7 +12,6 @@ use crate::core::RocksDbStorage;
 use crate::typed_cf::{self, TypedCf};
 
 use crate::jmt_stored::StaleTreePart;
-use hyperscale_jmt as jmt;
 use rocksdb::WriteBatch;
 
 impl RocksDbStorage {
@@ -228,10 +227,6 @@ impl RocksDbStorage {
         deleted
     }
 }
-
-// Re-export the jmt_key type alias for compatibility elsewhere if needed.
-#[allow(unused)]
-const fn _assert_jmt_key_stable(_k: &jmt::NodeKey) {}
 
 #[cfg(test)]
 mod tests {

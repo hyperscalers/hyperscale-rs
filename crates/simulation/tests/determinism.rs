@@ -5,7 +5,8 @@
 //! and replay.
 
 use hyperscale_core::NodeInput;
-use hyperscale_simulation::{NetworkConfig, SimulationRunner};
+use hyperscale_network_memory::NetworkConfig;
+use hyperscale_simulation::SimulationRunner;
 use hyperscale_types::{BlockHeight, Round};
 use std::sync::Arc;
 use std::time::Duration;

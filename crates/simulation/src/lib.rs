@@ -31,8 +31,4 @@
 mod event_queue;
 mod runner;
 
-pub use hyperscale_network_memory::{BandwidthReport, NetworkConfig};
 pub use runner::SimulationRunner;
-
-// Re-export NodeIndex from network-memory (canonical definition).
-pub use hyperscale_network_memory::NodeIndex;

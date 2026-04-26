@@ -2,8 +2,8 @@
 
 use crate::status::SyncStatus;
 use arc_swap::ArcSwap;
-use hyperscale_core::{NodeInput, TransactionStatus};
-use hyperscale_types::TxHash;
+use hyperscale_core::NodeInput;
+use hyperscale_types::{TransactionStatus, TxHash};
 use quick_cache::sync::Cache as QuickCache;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;

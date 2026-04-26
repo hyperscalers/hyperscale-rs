@@ -38,11 +38,10 @@ pub mod test_helpers;
 pub use chain_reader::{BlockForSync, ChainReader};
 pub use chain_writer::ChainWriter;
 pub use genesis::{GenesisWrapper, SubstatesOnlyCommit};
-pub use hyperscale_jmt::TreeReader as JmtTreeReader;
 pub use overlay::{SubstateDbLookup, SubstateLookup};
 pub use pending_chain::{BaseReadCache, ChainEntry, PendingChain, SubstateView};
 pub use store::{SubstateStore, VersionedStore};
-pub use tree::{CollectedWrites, JmtNodeKey, JmtSnapshot, LeafSubstateKeyAssociation};
+pub use tree::{CollectedWrites, JmtSnapshot, LeafSubstateKeyAssociation};
 pub use writes::{
     merge_database_updates, merge_database_updates_from_arcs, merge_into,
     merge_updates_from_receipts,
@@ -73,7 +72,6 @@ pub fn empty_substate_database() -> impl SubstateDatabase {
 }
 
 // Re-export commonly needed Radix types for storage implementations
-pub use hyperscale_types::StateRoot;
 pub use radix_common::prelude::{DatabaseUpdate, DbSubstateValue};
 pub use radix_substate_store_interface::interface::{
     CommittableSubstateDatabase, DatabaseUpdates, DbPartitionKey, DbSortKey, NodeDatabaseUpdates,

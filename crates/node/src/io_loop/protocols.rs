@@ -10,22 +10,17 @@ use crate::protocol::transaction_fetch::TransactionFetchOutput;
 use hyperscale_core::{NodeInput, ProtocolEvent, TimerId};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::Engine;
+use hyperscale_jmt::TreeReader;
 use hyperscale_metrics as metrics;
 use hyperscale_network::Network;
-use hyperscale_storage::{ChainReader, ChainWriter, SubstateStore};
+use hyperscale_storage::{ChainReader, ChainWriter, SubstateStore, VersionedStore};
 use hyperscale_types::ValidatorId;
 use std::sync::Arc;
 use std::time::Duration;
 
 impl<S, N, D, E> IoLoop<S, N, D, E>
 where
-    S: ChainWriter
-        + SubstateStore
-        + hyperscale_storage::VersionedStore
-        + ChainReader
-        + hyperscale_storage::JmtTreeReader
-        + Send
-        + Sync,
+    S: ChainWriter + SubstateStore + VersionedStore + ChainReader + TreeReader + Send + Sync,
     N: Network,
     D: Dispatch,
     E: Engine,

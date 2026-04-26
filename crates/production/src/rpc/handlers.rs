@@ -12,9 +12,9 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
-use hyperscale_core::{NodeInput, TransactionStatus};
+use hyperscale_core::NodeInput;
 use hyperscale_metrics as metrics;
-use hyperscale_types::{Hash, RoutableTransaction, TransactionDecision, TxHash};
+use hyperscale_types::{Hash, RoutableTransaction, TransactionDecision, TransactionStatus, TxHash};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -706,7 +706,7 @@ mod tests {
 
         // Create state with node that is 20 blocks behind (threshold is 10)
         let sync_status = crate::status::SyncStatus {
-            state: crate::status::SyncStateKind::Syncing,
+            state: hyperscale_node::SyncStateKind::Syncing,
             current_height: 80,
             target_height: Some(100),
             blocks_behind: 20,
@@ -769,7 +769,7 @@ mod tests {
 
         // Create state with node that is only 5 blocks behind (under threshold of 10)
         let sync_status = crate::status::SyncStatus {
-            state: crate::status::SyncStateKind::Syncing,
+            state: hyperscale_node::SyncStateKind::Syncing,
             current_height: 95,
             target_height: Some(100),
             blocks_behind: 5,

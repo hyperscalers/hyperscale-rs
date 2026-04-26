@@ -9,8 +9,7 @@ use crate::typed_cf::{
     ReadableStore,
 };
 
-use hyperscale_storage::StateRoot;
-use hyperscale_types::{BlockHeight, Hash, QuorumCertificate};
+use hyperscale_types::{BlockHeight, Hash, QuorumCertificate, StateRoot};
 use rocksdb::WriteBatch;
 
 // ─── Chain metadata ──────────────────────────────────────────────────────────

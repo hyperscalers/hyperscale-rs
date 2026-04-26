@@ -1,7 +1,7 @@
 //! Event queue with deterministic ordering.
 
-use crate::NodeIndex;
 use hyperscale_core::{EventPriority, NodeInput};
+use hyperscale_network_memory::NodeIndex;
 use std::cmp::Ordering;
 use std::time::Duration;
 

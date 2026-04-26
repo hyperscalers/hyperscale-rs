@@ -7,7 +7,7 @@ use crate::config::SimulatorConfig;
 use crate::metrics::{MetricsCollector, SimulationReport};
 use hyperscale_core::NodeInput;
 use hyperscale_mempool::LockContentionStats;
-use hyperscale_simulation::NodeIndex;
+use hyperscale_network_memory::NodeIndex;
 use hyperscale_simulation::SimulationRunner;
 use hyperscale_spammer::{
     AccountPool, AccountPoolError, FundingWorkload, TransferWorkload, WorkloadGenerator,
@@ -534,7 +534,7 @@ impl Simulator {
     /// Returns `None` if traffic analysis is not enabled.
     /// Call `enable_traffic_analysis()` before `run_for()` to collect data.
     #[must_use]
-    pub fn traffic_report(&self) -> Option<hyperscale_simulation::BandwidthReport> {
+    pub fn traffic_report(&self) -> Option<hyperscale_network_memory::BandwidthReport> {
         self.runner.traffic_report()
     }
 }
