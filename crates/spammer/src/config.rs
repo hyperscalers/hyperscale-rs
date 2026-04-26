@@ -88,6 +88,7 @@ impl Default for SpammerConfig {
 
 impl SpammerConfig {
     /// Create a new configuration with the given endpoints.
+    #[must_use]
     pub fn new(endpoints: Vec<String>) -> Self {
         Self {
             rpc_endpoints: endpoints,
@@ -96,90 +97,111 @@ impl SpammerConfig {
     }
 
     /// Set the number of shards.
+    #[must_use]
     pub fn with_num_shards(mut self, num_shards: u64) -> Self {
         self.num_shards = num_shards;
         self
     }
 
     /// Set the number of validators per shard.
+    #[must_use]
     pub fn with_validators_per_shard(mut self, validators: usize) -> Self {
         self.validators_per_shard = validators.max(1);
         self
     }
 
     /// Set accounts per shard.
+    #[must_use]
     pub fn with_accounts_per_shard(mut self, accounts: usize) -> Self {
         self.accounts_per_shard = accounts;
         self
     }
 
     /// Set target TPS.
+    #[must_use]
     pub fn with_target_tps(mut self, tps: u64) -> Self {
         self.target_tps = tps;
         self
     }
 
     /// Set cross-shard ratio.
+    #[must_use]
     pub fn with_cross_shard_ratio(mut self, ratio: f64) -> Self {
         self.cross_shard_ratio = ratio.clamp(0.0, 1.0);
         self
     }
 
     /// Set selection mode.
+    #[must_use]
     pub fn with_selection_mode(mut self, mode: SelectionMode) -> Self {
         self.selection_mode = mode;
         self
     }
 
     /// Set initial balance.
+    #[must_use]
     pub fn with_initial_balance(mut self, balance: Decimal) -> Self {
         self.initial_balance = balance;
         self
     }
 
     /// Set network definition.
+    #[must_use]
     pub fn with_network(mut self, network: NetworkDefinition) -> Self {
         self.network = network;
         self
     }
 
     /// Set batch size.
+    #[must_use]
     pub fn with_batch_size(mut self, size: usize) -> Self {
         self.batch_size = size;
         self
     }
 
     /// Enable or disable latency tracking.
+    #[must_use]
     pub fn with_latency_tracking(mut self, enabled: bool) -> Self {
         self.latency_tracking = enabled;
         self
     }
 
     /// Set the sample rate for latency tracking (0.0 to 1.0).
+    #[must_use]
     pub fn with_latency_sample_rate(mut self, rate: f64) -> Self {
         self.latency_sample_rate = rate.clamp(0.0, 1.0);
         self
     }
 
     /// Set the poll interval for latency tracking.
+    #[must_use]
     pub fn with_latency_poll_interval(mut self, interval: Duration) -> Self {
         self.latency_poll_interval = interval;
         self
     }
 
     /// Set the finalization timeout for latency tracking.
+    #[must_use]
     pub fn with_latency_finalization_timeout(mut self, timeout: Duration) -> Self {
         self.latency_finalization_timeout = timeout;
         self
     }
 
     /// Set the number of worker threads for parallel submission.
+    #[must_use]
     pub fn with_num_workers(mut self, num_workers: usize) -> Self {
         self.num_workers = num_workers.max(1);
         self
     }
 
     /// Calculate the sleep duration between batches to achieve target TPS.
+    #[must_use]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    // Heuristic for human-friendly TPS pacing; precision/sign aren't material.
     pub fn batch_interval(&self) -> Duration {
         if self.target_tps == 0 || self.batch_size == 0 {
             return Duration::from_millis(100);
@@ -190,6 +212,11 @@ impl SpammerConfig {
     }
 
     /// Validate the configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ConfigError`] if RPC endpoints are missing, shard count is
+    /// zero, or per-shard account count is zero.
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.rpc_endpoints.is_empty() {
             return Err(ConfigError::NoEndpoints);
@@ -207,12 +234,15 @@ impl SpammerConfig {
 /// Configuration errors.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
+    /// No RPC endpoints were configured.
     #[error("No RPC endpoints configured")]
     NoEndpoints,
 
+    /// Configured `num_shards` is zero.
     #[error("Number of shards must be greater than 0")]
     InvalidShards,
 
+    /// Configured `accounts_per_shard` is zero.
     #[error("Accounts per shard must be greater than 0")]
     InvalidAccounts,
 }

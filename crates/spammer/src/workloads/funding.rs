@@ -22,6 +22,7 @@ pub struct FundingWorkload {
 
 impl FundingWorkload {
     /// Create a new funding workload.
+    #[must_use]
     pub fn new(network: NetworkDefinition) -> Self {
         Self {
             network,
@@ -32,6 +33,7 @@ impl FundingWorkload {
     /// The per-transaction fee used by funding transactions.
     ///
     /// Callers need this to compute the extra genesis balance for funder accounts.
+    #[must_use]
     pub fn fee(&self) -> Decimal {
         self.fee
     }
@@ -53,12 +55,9 @@ impl FundingWorkload {
         let mut failed = 0u64;
 
         for op in plan {
-            let shard_accounts = match accounts.accounts_for_shard(op.source_shard) {
-                Some(a) => a,
-                None => {
-                    failed += 1;
-                    continue;
-                }
+            let Some(shard_accounts) = accounts.accounts_for_shard(op.source_shard) else {
+                failed += 1;
+                continue;
             };
 
             let source = &shard_accounts[op.source_idx];
@@ -71,15 +70,19 @@ impl FundingWorkload {
 
             let nonce = source.next_nonce();
 
-            let notarized =
-                match sign_and_notarize(manifest, &self.network, nonce as u32, &source.keypair) {
-                    Ok(n) => n,
-                    Err(e) => {
-                        warn!(error = ?e, "Failed to sign funding transaction");
-                        failed += 1;
-                        continue;
-                    }
-                };
+            let notarized = match sign_and_notarize(
+                manifest,
+                &self.network,
+                u32::try_from(nonce).unwrap_or(u32::MAX),
+                &source.keypair,
+            ) {
+                Ok(n) => n,
+                Err(e) => {
+                    warn!(error = ?e, "Failed to sign funding transaction");
+                    failed += 1;
+                    continue;
+                }
+            };
 
             let tx: RoutableTransaction = match routable_from_notarized_v1(
                 notarized,

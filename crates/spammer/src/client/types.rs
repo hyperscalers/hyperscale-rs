@@ -6,14 +6,18 @@ use serde::{Deserialize, Serialize};
 /// Request to submit a transaction.
 #[derive(Debug, Serialize)]
 pub struct SubmitTransactionRequest {
+    /// Hex-encoded SBOR-serialized `RoutableTransaction`.
     pub transaction_hex: String,
 }
 
 /// Response from transaction submission.
 #[derive(Debug, Deserialize)]
 pub struct SubmitTransactionResponse {
+    /// True if the node accepted the transaction into its mempool.
     pub accepted: bool,
+    /// Hex-encoded transaction hash returned by the node.
     pub hash: String,
+    /// Error message when `accepted == false`.
     pub error: Option<String>,
 }
 
@@ -32,12 +36,14 @@ pub struct SubmissionResult {
 
 impl SubmissionResult {
     /// Check if the submission was successful.
+    #[must_use]
     pub fn is_success(&self) -> bool {
         self.accepted && self.status_code >= 200 && self.status_code < 300
     }
 }
 
 /// Response from node status endpoint.
+#[allow(missing_docs)] // flat status readouts; field names are the documentation
 #[derive(Debug, Deserialize)]
 pub struct NodeStatusResponse {
     pub validator_id: u32,
@@ -57,6 +63,7 @@ pub struct NodeStatusResponse {
 }
 
 /// Simplified node status.
+#[allow(missing_docs)] // flat status readouts; field names are the documentation
 #[derive(Debug)]
 pub struct NodeStatus {
     pub validator_id: u32,
@@ -85,9 +92,10 @@ pub struct TransactionStatusResponse {
 }
 
 impl TransactionStatusResponse {
-    /// Convert to a typed TransactionStatus if possible.
+    /// Convert to a typed `TransactionStatus` if possible.
     ///
     /// Returns None for unknown statuses or parse errors.
+    #[must_use]
     pub fn to_status(&self) -> Option<TransactionStatus> {
         let decision = || -> Option<TransactionDecision> {
             match self.decision.as_deref()? {
@@ -113,8 +121,9 @@ impl TransactionStatusResponse {
 
     /// Check if the transaction has reached a terminal state.
     ///
-    /// Uses the typed TransactionStatus.is_final() when possible,
+    /// Uses the typed `TransactionStatus.is_final()` when possible,
     /// falls back to string matching for unknown statuses.
+    #[must_use]
     pub fn is_terminal(&self) -> bool {
         if let Some(status) = self.to_status() {
             status.is_final()
@@ -128,6 +137,7 @@ impl TransactionStatusResponse {
     ///
     /// A transaction is successful when it reaches `completed` status with
     /// an `accept` decision.
+    #[must_use]
     pub fn is_success(&self) -> bool {
         matches!(
             self.to_status(),

@@ -16,6 +16,11 @@ pub struct RpcClient {
 
 impl RpcClient {
     /// Create a new RPC client.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the underlying `reqwest::Client` fails to build (unreachable
+    /// for a default-feature build).
     pub fn new(base_url: impl Into<String>) -> Self {
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
@@ -29,13 +34,18 @@ impl RpcClient {
     }
 
     /// Submit a transaction to the node.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RpcError::EncodingFailed`] if SBOR encoding fails, or
+    /// [`RpcError::Http`] for any HTTP-level failure.
     pub async fn submit_transaction(
         &self,
         tx: &RoutableTransaction,
     ) -> Result<SubmissionResult, RpcError> {
         // Encode transaction as SBOR
         let tx_bytes = sbor::prelude::basic_encode(tx)
-            .map_err(|e| RpcError::EncodingFailed(format!("{:?}", e)))?;
+            .map_err(|e| RpcError::EncodingFailed(format!("{e:?}")))?;
 
         // Convert to hex
         let tx_hex = hex::encode(tx_bytes);
@@ -68,6 +78,10 @@ impl RpcClient {
     }
 
     /// Get node status.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RpcError::Http`] for any HTTP-level failure.
     pub async fn get_status(&self) -> Result<NodeStatus, RpcError> {
         let response = self
             .client
@@ -101,6 +115,11 @@ impl RpcClient {
     ///
     /// Returns the current status of a transaction, or an error if the
     /// transaction is not found or the request fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RpcError::TransactionNotFound`] if the node responds with
+    /// HTTP 404, or [`RpcError::Http`] for any other HTTP-level failure.
     pub async fn get_transaction_status(
         &self,
         tx_hash: &str,
@@ -124,6 +143,7 @@ impl RpcClient {
     }
 
     /// Get the base URL of this client.
+    #[must_use]
     pub fn base_url(&self) -> &str {
         &self.base_url
     }
@@ -132,18 +152,23 @@ impl RpcClient {
 /// RPC errors.
 #[derive(Debug, thiserror::Error)]
 pub enum RpcError {
+    /// Underlying `reqwest` HTTP failure.
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
 
+    /// SBOR encoding of the outgoing transaction failed.
     #[error("Failed to encode transaction: {0}")]
     EncodingFailed(String),
 
+    /// The node refused the transaction (e.g. invalid format, backpressure).
     #[error("Transaction rejected: {0}")]
     Rejected(String),
 
+    /// The node could not be reached (e.g. timeout, refused connection).
     #[error("Node unavailable")]
     Unavailable,
 
+    /// The node returned HTTP 404 for the requested transaction hash.
     #[error("Transaction not found: {0}")]
     TransactionNotFound(String),
 }

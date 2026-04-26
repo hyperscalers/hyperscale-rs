@@ -4,8 +4,8 @@
 //!
 //! # Modules
 //!
-//! - [`accounts`]: Account management (FundedAccount, AccountPool)
-//! - [`workloads`]: Transaction workload generation (WorkloadGenerator trait)
+//! - [`accounts`]: Account management (`FundedAccount`, `AccountPool`)
+//! - [`workloads`]: Transaction workload generation (`WorkloadGenerator` trait)
 //! - [`client`]: RPC client for transaction submission
 //! - [`runner`]: Spammer orchestrator
 //! - [`genesis`]: Genesis balance generation for cluster setup

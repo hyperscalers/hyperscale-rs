@@ -177,11 +177,12 @@ fn parse_selection_mode(s: &str) -> Result<SelectionMode, String> {
                 .map_err(|_| format!("Invalid zipf exponent: {}", &s[5..]))?;
             Ok(SelectionMode::Zipf { exponent: exp })
         }
-        _ => Err(format!("Unknown selection mode: {}", s)),
+        _ => Err(format!("Unknown selection mode: {s}")),
     }
 }
 
 #[tokio::main]
+#[allow(clippy::too_many_lines)] // straight-line CLI dispatch over the workload subcommands
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
@@ -203,7 +204,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 generate_genesis_toml(num_shards, accounts_per_shard, Decimal::from(balance))?
             };
-            print!("{}", toml);
+            print!("{toml}");
         }
 
         Commands::Run {
@@ -229,7 +230,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let selection_mode = parse_selection_mode(&selection)?;
 
             // Clamp batch size to target TPS to avoid sending more txns than intended
-            let effective_batch_size = batch_size.min(tps as usize).max(1);
+            let effective_batch_size = batch_size
+                .min(usize::try_from(tps).unwrap_or(usize::MAX))
+                .max(1);
 
             // Default to 1 worker if not specified (use --workers to enable multi-threading)
             let num_workers = workers.unwrap_or(1);
@@ -257,7 +260,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             if wait_ready {
                 println!("Waiting for nodes to be ready...");
-                spammer.wait_for_ready(Duration::from_secs(60)).await?;
+                spammer.wait_for_ready(Duration::from_mins(1)).await?;
                 println!("All nodes ready.");
             }
 
@@ -308,9 +311,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tracing_subscriber::fmt::init();
 
             println!("=== Smoke Test ===");
-            println!("Endpoints: {:?}", endpoints);
-            println!("Shards: {}", num_shards);
-            println!("Validators per shard: {}", validators_per_shard);
+            println!("Endpoints: {endpoints:?}");
+            println!("Shards: {num_shards}");
+            println!("Validators per shard: {validators_per_shard}");
 
             // Create RPC clients
             let clients: Vec<RpcClient> = endpoints
@@ -357,9 +360,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Load nonces from file to continue where previous runs left off
             match accounts.load_nonces_default() {
-                Ok(n) if n > 0 => println!("Loaded {} account nonces from file", n),
+                Ok(n) if n > 0 => println!("Loaded {n} account nonces from file"),
                 Ok(_) => {} // No file or empty, starting fresh
-                Err(e) => eprintln!("Warning: failed to load nonces: {}", e),
+                Err(e) => eprintln!("Warning: failed to load nonces: {e}"),
             }
 
             // Create a simple same-shard transfer targeting shard 0
@@ -368,10 +371,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 TransferWorkload::new(NetworkDefinition::simulator()).with_cross_shard_ratio(0.0); // Same-shard for simplicity
 
             // Use current time as seed to generate unique transactions each run
-            let seed = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos() as u64;
+            let seed = u64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
+            )
+            .unwrap_or(u64::MAX);
             let mut rng = ChaCha8Rng::seed_from_u64(seed);
 
             // Generate a transaction specifically for shard 0
@@ -391,7 +397,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let client = &clients[client_idx];
 
             // Submit the transaction
-            println!("Submitting transaction to shard {}...", target_shard);
+            println!("Submitting transaction to shard {target_shard}...");
             let submit_start = Instant::now();
 
             let result = client
@@ -408,7 +414,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             let tx_hash = &result.hash;
-            println!("Transaction submitted: {}", tx_hash);
+            println!("Transaction submitted: {tx_hash}");
             println!("Polling for status...");
 
             // Poll for transaction status
@@ -430,7 +436,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 submit_start.elapsed().as_millis(),
                                 status.status
                             );
-                            last_status = status.status.clone();
+                            last_status.clone_from(&status.status);
                         }
 
                         if status.is_terminal() {
@@ -440,22 +446,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             println!("Final status: {}", status.status);
 
                             if let Some(decision) = &status.decision {
-                                println!("Decision: {}", decision);
+                                println!("Decision: {decision}");
                             }
 
-                            println!("Total latency: {:?}", total_latency);
+                            println!("Total latency: {total_latency:?}");
                             println!("Latency (ms): {:.2}", total_latency.as_secs_f64() * 1000.0);
 
                             if status.is_success() {
                                 println!("Result: SUCCESS");
                                 // Save nonces for next run
                                 if let Err(e) = accounts.save_nonces_default() {
-                                    eprintln!("Warning: failed to save nonces: {}", e);
+                                    eprintln!("Warning: failed to save nonces: {e}");
                                 }
                             } else {
                                 println!("Result: FAILED");
                                 if let Some(error) = &status.error {
-                                    eprintln!("Error: {}", error);
+                                    eprintln!("Error: {error}");
                                 }
                                 std::process::exit(1);
                             }
@@ -466,7 +472,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Err(e) => {
                         // Transaction might not be in cache yet, continue polling
                         if submit_start.elapsed() > Duration::from_secs(5) {
-                            eprintln!("Warning: Error polling status: {}", e);
+                            eprintln!("Warning: Error polling status: {e}");
                         }
                     }
                 }

@@ -11,16 +11,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// Default forward budget for spammer-submitted transactions: how far
 /// into the future `end_timestamp_exclusive` is set from the submission
 /// instant. Comfortably under [`hyperscale_types::MAX_VALIDITY_RANGE`].
-pub const SPAMMER_VALIDITY_BUDGET: Duration = Duration::from_secs(60);
+pub const SPAMMER_VALIDITY_BUDGET: Duration = Duration::from_mins(1);
 
 /// Build a validity range anchored on the local wall clock with a 60s
 /// forward budget. `start_timestamp_inclusive = now`,
 /// `end_timestamp_exclusive = now + SPAMMER_VALIDITY_BUDGET`.
+#[must_use]
 pub fn validity_range_for_now() -> TimestampRange {
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
     let start = WeightedTimestamp::from_millis(now_ms);
     TimestampRange::new(start, start.plus(SPAMMER_VALIDITY_BUDGET))
 }

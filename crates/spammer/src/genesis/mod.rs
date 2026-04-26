@@ -18,6 +18,11 @@ use std::fmt::Write;
 /// address = "account_sim1..."
 /// balance = "1000000"
 /// ```
+///
+/// # Errors
+///
+/// Returns [`GenesisError::AccountGeneration`] if the underlying account pool
+/// can't be constructed for the requested shard/account counts.
 pub fn generate_genesis_toml(
     num_shards: u64,
     accounts_per_shard: usize,
@@ -33,6 +38,11 @@ pub fn generate_genesis_toml(
 ///
 /// This is useful for large clusters where including all accounts in every
 /// validator's config would cause memory issues during genesis.
+///
+/// # Errors
+///
+/// Returns [`GenesisError::AccountGeneration`] if the underlying account pool
+/// can't be constructed for the requested shard/account counts.
 pub fn generate_genesis_toml_for_shard(
     num_shards: u64,
     accounts_per_shard: usize,
@@ -49,6 +59,12 @@ pub fn generate_genesis_toml_for_shard(
 /// Format a list of (address, balance) pairs as TOML.
 ///
 /// If `shard` is provided, adds a comment indicating which shard these accounts belong to.
+///
+/// # Panics
+///
+/// Panics if `writeln!` to a `String` or `Bech32` address encoding fails — both
+/// are unreachable for valid `ComponentAddress` inputs.
+#[must_use]
 pub fn format_balances_toml(
     balances: &[(ComponentAddress, Decimal)],
     shard: Option<u64>,
@@ -73,8 +89,8 @@ pub fn format_balances_toml(
     for (address, balance) in balances {
         let address_str = encoder.encode(address.as_node_id().as_bytes()).unwrap();
         writeln!(output, "[[genesis.xrd_balances]]").unwrap();
-        writeln!(output, "address = \"{}\"", address_str).unwrap();
-        writeln!(output, "balance = \"{}\"", balance).unwrap();
+        writeln!(output, "address = \"{address_str}\"").unwrap();
+        writeln!(output, "balance = \"{balance}\"").unwrap();
         writeln!(output).unwrap();
     }
 
@@ -84,6 +100,7 @@ pub fn format_balances_toml(
 /// Errors during genesis generation.
 #[derive(Debug, thiserror::Error)]
 pub enum GenesisError {
+    /// The underlying account pool could not be generated.
     #[error("Account generation failed: {0}")]
     AccountGeneration(#[from] crate::accounts::AccountPoolError),
 }

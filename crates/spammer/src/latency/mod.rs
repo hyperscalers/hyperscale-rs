@@ -14,15 +14,15 @@ use tracing::debug;
 /// Tracks in-flight transactions and measures their latency.
 ///
 /// Uses lock-free data structures to minimize contention:
-/// - DashMap for in-flight transaction tracking (sharded concurrent map)
+/// - `DashMap` for in-flight transaction tracking (sharded concurrent map)
 /// - Atomics for stats counters
-/// - parking_lot::Mutex for histogram (only acquired when recording, not reading)
+/// - `parking_lot::Mutex` for histogram (only acquired when recording, not reading)
 pub struct LatencyTracker {
-    /// In-flight transactions: tx_hash -> (submit_time, client_index)
-    /// Uses DashMap for lock-free concurrent access from multiple threads.
+    /// In-flight transactions: `tx_hash` -> (`submit_time`, `client_index`)
+    /// Uses `DashMap` for lock-free concurrent access from multiple threads.
     in_flight: Arc<DashMap<String, (Instant, usize)>>,
     /// Latency histogram (microseconds).
-    /// Uses parking_lot::Mutex which is faster than tokio::sync::Mutex for short critical sections.
+    /// Uses `parking_lot::Mutex` which is faster than `tokio::sync::Mutex` for short critical sections.
     histogram: Arc<parking_lot::Mutex<Histogram<u64>>>,
     /// Completion counts - using atomics for lock-free updates.
     stats: Arc<LatencyStats>,
@@ -117,7 +117,8 @@ impl LatencyTracker {
                         Ok(status_response) => {
                             if status_response.is_terminal() {
                                 let latency = submit_time.elapsed();
-                                let latency_us = latency.as_micros() as u64;
+                                let latency_us =
+                                    u64::try_from(latency.as_micros()).unwrap_or(u64::MAX);
 
                                 // Remove from in-flight - lock-free
                                 in_flight.remove(&tx_hash);
@@ -258,8 +259,12 @@ impl LatencyReport {
     }
 
     /// Get the average latency.
+    #[must_use]
     pub fn avg_latency(&self) -> Duration {
-        Duration::from_micros(self.histogram.mean() as u64)
+        // Mean is bounded by `max()` (~hours of µs), so the cast is safe in practice.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let mean = self.histogram.mean() as u64;
+        Duration::from_micros(mean)
     }
 
     /// Get the minimum latency.

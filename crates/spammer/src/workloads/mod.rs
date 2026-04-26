@@ -39,12 +39,15 @@ pub trait WorkloadGenerator: Send + Sync {
 /// Error type for workload generation.
 #[derive(Debug, thiserror::Error)]
 pub enum WorkloadError {
+    /// Pool didn't yield a sender/recipient pair satisfying the workload constraints.
     #[error("No suitable accounts available")]
     NoAccounts,
 
+    /// Signing the manifest with the sender's private key failed.
     #[error("Transaction signing failed: {0}")]
     SigningFailed(String),
 
+    /// Conversion from notarized v1 transaction to `RoutableTransaction` failed.
     #[error("Transaction conversion failed: {0}")]
     ConversionFailed(String),
 }

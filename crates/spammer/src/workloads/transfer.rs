@@ -27,7 +27,7 @@ pub struct TransferWorkload {
     /// Network definition for transaction signing.
     network: NetworkDefinition,
 
-    /// Round-robin counter for shard selection in NoContention mode.
+    /// Round-robin counter for shard selection in `NoContention` mode.
     /// Ensures even distribution across shards to prevent one shard's
     /// account counter from advancing faster than others.
     shard_counter: AtomicU64,
@@ -35,6 +35,7 @@ pub struct TransferWorkload {
 
 impl TransferWorkload {
     /// Create a new transfer workload generator.
+    #[must_use]
     pub fn new(network: NetworkDefinition) -> Self {
         Self {
             cross_shard_ratio: 0.3,
@@ -46,18 +47,21 @@ impl TransferWorkload {
     }
 
     /// Set the cross-shard transaction ratio (0.0 to 1.0).
+    #[must_use]
     pub fn with_cross_shard_ratio(mut self, ratio: f64) -> Self {
         self.cross_shard_ratio = ratio.clamp(0.0, 1.0);
         self
     }
 
     /// Set the account selection mode.
+    #[must_use]
     pub fn with_selection_mode(mut self, mode: SelectionMode) -> Self {
         self.selection_mode = mode;
         self
     }
 
     /// Set the transfer amount.
+    #[must_use]
     pub fn with_amount(mut self, amount: Decimal) -> Self {
         self.amount = amount;
         self
@@ -110,14 +114,18 @@ impl TransferWorkload {
         let nonce = from.next_nonce();
 
         // Sign and notarize
-        let notarized =
-            match sign_and_notarize(manifest, &self.network, nonce as u32, &from.keypair) {
-                Ok(n) => n,
-                Err(e) => {
-                    warn!(error = ?e, "Failed to sign transaction");
-                    return None;
-                }
-            };
+        let notarized = match sign_and_notarize(
+            manifest,
+            &self.network,
+            u32::try_from(nonce).unwrap_or(u32::MAX),
+            &from.keypair,
+        ) {
+            Ok(n) => n,
+            Err(e) => {
+                warn!(error = ?e, "Failed to sign transaction");
+                return None;
+            }
+        };
 
         // Convert to RoutableTransaction
         let tx: RoutableTransaction = match routable_from_notarized_v1(

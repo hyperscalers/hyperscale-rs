@@ -62,6 +62,7 @@ impl FundedAccount {
     ///
     /// The seed is deterministically expanded to create a keypair,
     /// and the account's shard is determined by hashing the address.
+    #[must_use]
     pub fn from_seed(seed: u64, num_shards: u64) -> Self {
         // Create varied seed bytes from the u64 seed
         let mut seed_bytes = [0u8; 32];
@@ -88,11 +89,13 @@ impl FundedAccount {
     /// Get the next nonce and increment atomically.
     ///
     /// Thread-safe for concurrent transaction generation.
+    #[must_use]
     pub fn next_nonce(&self) -> u64 {
         self.nonce.fetch_add(1, Ordering::SeqCst)
     }
 
     /// Get current nonce without incrementing.
+    #[must_use]
     pub fn current_nonce(&self) -> u64 {
         self.nonce.load(Ordering::SeqCst)
     }
@@ -127,7 +130,10 @@ pub enum SelectionMode {
 
     /// Zipf distribution - realistic "popular accounts" pattern.
     /// Higher exponent = more skewed toward lower indices (hotspots).
-    Zipf { exponent: f64 },
+    Zipf {
+        /// Skew exponent — higher values concentrate selections on lower indices.
+        exponent: f64,
+    },
 
     /// No contention - each call gets a disjoint pair of accounts.
     /// Uses a global counter to ensure no conflicts between transactions.
@@ -145,7 +151,7 @@ pub struct AccountPool {
     num_shards: u64,
 
     /// Per-shard account allocation counters.
-    /// Used by RoundRobin and NoContention selection modes. In NoContention mode,
+    /// Used by `RoundRobin` and `NoContention` selection modes. In `NoContention` mode,
     /// both same-shard and cross-shard selections draw from the same per-shard
     /// counter, ensuring no two transactions ever get the same account.
     round_robin_counters: HashMap<ShardGroupId, std::sync::atomic::AtomicUsize>,
@@ -173,6 +179,7 @@ pub struct AccountPartition {
 
 impl AccountPool {
     /// Create an empty account pool.
+    #[must_use]
     pub fn new(num_shards: u64) -> Self {
         use std::sync::atomic::AtomicUsize;
 
@@ -199,6 +206,16 @@ impl AccountPool {
     ///
     /// This searches for keypair seeds whose derived accounts land on each shard.
     /// Seeds start at 100 (after reserved seeds) for compatibility with simulator.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AccountPoolError::GenerationFailed`] if no seed is found for
+    /// every requested shard within the iteration budget.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `num_shards * accounts_per_shard` overflows `usize` on a 32-bit
+    /// target — unreachable for any realistic configuration.
     pub fn generate(num_shards: u64, accounts_per_shard: usize) -> Result<Self, AccountPoolError> {
         use std::sync::atomic::AtomicU64;
 
@@ -208,8 +225,9 @@ impl AccountPool {
 
         // Find accounts for each shard - start at seed 100 for compatibility
         let mut seed = 100u64;
-        let mut found_per_shard = vec![0usize; num_shards as usize];
-        let max_iterations = accounts_per_shard * num_shards as usize * 10;
+        let num_shards_usize = usize::try_from(num_shards).unwrap_or(usize::MAX);
+        let mut found_per_shard = vec![0usize; num_shards_usize];
+        let max_iterations = accounts_per_shard * num_shards_usize * 10;
         let mut iterations = 0;
 
         while found_per_shard
@@ -217,7 +235,7 @@ impl AccountPool {
             .any(|&count| count < accounts_per_shard)
         {
             let account = FundedAccount::from_seed(seed, num_shards);
-            let shard_idx = account.shard.0 as usize;
+            let shard_idx = usize::try_from(account.shard.0).unwrap_or(usize::MAX);
 
             if found_per_shard[shard_idx] < accounts_per_shard {
                 pool.by_shard.get_mut(&account.shard).unwrap().push(account);
@@ -237,7 +255,7 @@ impl AccountPool {
         // Initialize usage counts for each shard
         for shard in 0..num_shards {
             let shard_id = ShardGroupId(shard);
-            let count = pool.by_shard.get(&shard_id).map(|v| v.len()).unwrap_or(0);
+            let count = pool.by_shard.get(&shard_id).map_or(0, std::vec::Vec::len);
             let counters: Vec<AtomicU64> = (0..count).map(|_| AtomicU64::new(0)).collect();
             pool.usage_counts.insert(shard_id, counters);
         }
@@ -251,6 +269,7 @@ impl AccountPool {
     }
 
     /// Get the XRD balances for a specific shard to configure in genesis.
+    #[must_use]
     pub fn genesis_balances_for_shard(
         &self,
         shard: ShardGroupId,
@@ -268,6 +287,7 @@ impl AccountPool {
     }
 
     /// Get all genesis balances across all shards.
+    #[must_use]
     pub fn all_genesis_balances(&self, balance: Decimal) -> Vec<(ComponentAddress, Decimal)> {
         self.by_shard
             .values()
@@ -279,6 +299,7 @@ impl AccountPool {
     ///
     /// When true, the caller must run a funding phase after genesis to create
     /// the remaining accounts via runtime transactions.
+    #[must_use]
     pub fn needs_runtime_funding(&self) -> bool {
         self.by_shard
             .values()
@@ -290,15 +311,15 @@ impl AccountPool {
     /// Returns balances for at most [`MAX_GENESIS_ACCOUNTS_PER_SHARD`] accounts.
     /// Accounts that will serve as funding sources for runtime-funded accounts
     /// receive extra balance to cover those transfers (amount + fee per funded account).
+    #[must_use]
     pub fn genesis_balances_capped(
         &self,
         shard: ShardGroupId,
         balance: Decimal,
         fee_per_funding_tx: Decimal,
     ) -> Vec<(ComponentAddress, Decimal)> {
-        let accounts = match self.by_shard.get(&shard) {
-            Some(a) => a,
-            None => return Vec::new(),
+        let Some(accounts) = self.by_shard.get(&shard) else {
+            return Vec::new();
         };
 
         let genesis_count = accounts.len().min(MAX_GENESIS_ACCOUNTS_PER_SHARD);
@@ -321,8 +342,9 @@ impl AccountPool {
             .iter()
             .enumerate()
             .map(|(i, account)| {
-                let num_to_fund = base_extra + if i < remainder { 1 } else { 0 };
-                let extra = cost_per_funded * Decimal::from(num_to_fund as u32);
+                let num_to_fund = base_extra + usize::from(i < remainder);
+                let extra =
+                    cost_per_funded * Decimal::from(u32::try_from(num_to_fund).unwrap_or(u32::MAX));
                 (account.address, balance + extra)
             })
             .collect()
@@ -332,6 +354,7 @@ impl AccountPool {
     ///
     /// Each operation pairs a genesis account (source) with an unfunded account
     /// (destination) on the same shard. Sources are assigned round-robin.
+    #[must_use]
     pub fn runtime_funding_plan(&self, funding_amount: Decimal) -> Vec<FundingOp> {
         let mut plan = Vec::new();
 
@@ -395,11 +418,16 @@ impl AccountPool {
 
     /// Get a pair of accounts from two specific shards (for cross-shard transactions).
     ///
-    /// Returns (from_account, to_account) where from is on `from_shard` and to is on `to_shard`.
+    /// Returns (`from_account`, `to_account`) where from is on `from_shard` and to is on `to_shard`.
     ///
     /// For `NoContention` mode, uses the per-shard counters to ensure no conflicts with
     /// same-shard transactions. Each cross-shard pair consumes one account from each shard's
     /// counter sequence, ensuring coordination between same-shard and cross-shard workloads.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `from_shard`'s round-robin counter is missing — unreachable
+    /// for any shard registered via [`Self::new`] / [`Self::generate`].
     pub fn cross_shard_pair_for(
         &self,
         from_shard: ShardGroupId,
@@ -416,23 +444,20 @@ impl AccountPool {
             return None;
         }
 
-        let (idx1, idx2) = match mode {
-            SelectionMode::NoContention => {
-                // Allocate 1 slot from each shard's unified counter.
-                // Same-shard and cross-shard both draw from the same per-shard
-                // counters, so no two transactions ever get the same account.
-                let counter1 = self.round_robin_counters.get(&from_shard).unwrap();
-                let counter2 = self.round_robin_counters.get(&to_shard).unwrap();
-                let c1 = counter1.fetch_add(1, Ordering::Relaxed);
-                let c2 = counter2.fetch_add(1, Ordering::Relaxed);
-                (c1 % num_accounts1, c2 % num_accounts2)
-            }
-            _ => {
-                // For other modes, use per-shard selection
-                let idx1 = self.select_single_index(from_shard, num_accounts1, rng, mode);
-                let idx2 = self.select_single_index(to_shard, num_accounts2, rng, mode);
-                (idx1, idx2)
-            }
+        let (idx1, idx2) = if mode == SelectionMode::NoContention {
+            // Allocate 1 slot from each shard's unified counter.
+            // Same-shard and cross-shard both draw from the same per-shard
+            // counters, so no two transactions ever get the same account.
+            let counter1 = self.round_robin_counters.get(&from_shard).unwrap();
+            let counter2 = self.round_robin_counters.get(&to_shard).unwrap();
+            let c1 = counter1.fetch_add(1, Ordering::Relaxed);
+            let c2 = counter2.fetch_add(1, Ordering::Relaxed);
+            (c1 % num_accounts1, c2 % num_accounts2)
+        } else {
+            // For other modes, use per-shard selection
+            let idx1 = self.select_single_index(from_shard, num_accounts1, rng, mode);
+            let idx2 = self.select_single_index(to_shard, num_accounts2, rng, mode);
+            (idx1, idx2)
         };
 
         // Track usage
@@ -494,10 +519,10 @@ impl AccountPool {
                 (idx1, idx2)
             }
             SelectionMode::Zipf { exponent } => {
-                let idx1 = self.zipf_index(num_accounts, exponent, rng);
-                let mut idx2 = self.zipf_index(num_accounts, exponent, rng);
+                let idx1 = Self::zipf_index(num_accounts, exponent, rng);
+                let mut idx2 = Self::zipf_index(num_accounts, exponent, rng);
                 while idx2 == idx1 {
-                    idx2 = self.zipf_index(num_accounts, exponent, rng);
+                    idx2 = Self::zipf_index(num_accounts, exponent, rng);
                 }
                 (idx1, idx2)
             }
@@ -536,7 +561,7 @@ impl AccountPool {
                 let counter = self.round_robin_counters.get(&shard).unwrap();
                 counter.fetch_add(1, Ordering::Relaxed) % num_accounts
             }
-            SelectionMode::Zipf { exponent } => self.zipf_index(num_accounts, exponent, rng),
+            SelectionMode::Zipf { exponent } => Self::zipf_index(num_accounts, exponent, rng),
             SelectionMode::NoContention => {
                 // Use per-shard counter for even distribution within each shard.
                 let counter = self.round_robin_counters.get(&shard).unwrap();
@@ -562,7 +587,13 @@ impl AccountPool {
     }
 
     /// Generate a Zipf-distributed index.
-    fn zipf_index(&self, n: usize, exponent: f64, rng: &mut (impl rand::Rng + ?Sized)) -> usize {
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    // Skewed sampling for benchmarks; precision/sign correctness aren't material.
+    fn zipf_index(n: usize, exponent: f64, rng: &mut (impl rand::Rng + ?Sized)) -> usize {
         let exp = exponent.max(1.0);
         let u: f64 = rng.gen();
         let idx = ((n as f64).powf(1.0 - u)).powf(1.0 / exp) as usize;
@@ -570,13 +601,15 @@ impl AccountPool {
     }
 
     /// Total number of accounts across all shards.
+    #[must_use]
     pub fn total_accounts(&self) -> usize {
-        self.by_shard.values().map(|v| v.len()).sum()
+        self.by_shard.values().map(std::vec::Vec::len).sum()
     }
 
     /// Number of accounts on a specific shard.
+    #[must_use]
     pub fn accounts_on_shard(&self, shard: ShardGroupId) -> usize {
-        self.by_shard.get(&shard).map(|v| v.len()).unwrap_or(0)
+        self.by_shard.get(&shard).map_or(0, std::vec::Vec::len)
     }
 
     /// Get all shards with accounts.
@@ -585,13 +618,15 @@ impl AccountPool {
     }
 
     /// Get the number of shards.
+    #[must_use]
     pub fn num_shards(&self) -> u64 {
         self.num_shards
     }
 
     /// Get accounts for a specific shard.
+    #[must_use]
     pub fn accounts_for_shard(&self, shard: ShardGroupId) -> Option<&[FundedAccount]> {
-        self.by_shard.get(&shard).map(|v| v.as_slice())
+        self.by_shard.get(&shard).map(std::vec::Vec::as_slice)
     }
 
     /// Partition the account pool into multiple disjoint partitions.
@@ -606,6 +641,7 @@ impl AccountPool {
     /// # Returns
     /// A vector of `AccountPartition`, each containing a disjoint subset of accounts.
     /// If there are fewer accounts than partitions, some partitions may be empty.
+    #[must_use]
     pub fn partition(&self, num_partitions: usize) -> Vec<AccountPartition> {
         let num_partitions = num_partitions.max(1);
 
@@ -630,6 +666,7 @@ impl AccountPool {
     }
 
     /// Get usage statistics for analysis.
+    #[must_use]
     pub fn usage_stats(&self) -> AccountUsageStats {
         use std::sync::atomic::Ordering;
 
@@ -654,6 +691,7 @@ impl AccountPool {
             min_selections = 0;
         }
 
+        #[allow(clippy::cast_precision_loss)] // headline ratio for human-readable stats
         let avg_selections = if account_count > 0 {
             total_selections as f64 / account_count as f64
         } else {
@@ -701,6 +739,8 @@ pub struct AccountUsageStats {
 
 impl AccountUsageStats {
     /// Calculate the skew ratio (max / avg). Higher = more uneven.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)] // headline ratio for human-readable stats
     pub fn skew_ratio(&self) -> f64 {
         if self.avg_selections > 0.0 {
             self.max_selections as f64 / self.avg_selections
@@ -713,13 +753,18 @@ impl AccountUsageStats {
 /// Errors that can occur during account pool operations.
 #[derive(Debug, thiserror::Error)]
 pub enum AccountPoolError {
+    /// Couldn't find seeds for every requested shard within the iteration budget.
     #[error("Could not generate enough accounts for {shards} shards with {accounts_per_shard} accounts each")]
     GenerationFailed {
+        /// Number of shards requested.
         shards: u64,
+        /// Accounts requested per shard.
         accounts_per_shard: usize,
     },
+    /// I/O or parse error while reading the nonce-state file.
     #[error("Failed to load nonces: {0}")]
     NonceLoadError(String),
+    /// I/O or serialization error while writing the nonce-state file.
     #[error("Failed to save nonces: {0}")]
     NonceSaveError(String),
 }
@@ -732,6 +777,11 @@ impl AccountPool {
     ///
     /// File format: `{"<address_hex>": <nonce>, ...}`
     /// Accounts not in the file keep their current nonce (0 for fresh pools).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AccountPoolError::NonceLoadError`] if the file exists but
+    /// can't be read or parsed as JSON.
     pub fn load_nonces(&self, path: &std::path::Path) -> Result<usize, AccountPoolError> {
         use std::sync::atomic::Ordering;
 
@@ -761,6 +811,11 @@ impl AccountPool {
     /// Save current nonces to a JSON file.
     ///
     /// Only saves accounts with nonce > 0 to keep the file small.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AccountPoolError::NonceSaveError`] if serialization or the
+    /// underlying file write fails.
     pub fn save_nonces(&self, path: &std::path::Path) -> Result<usize, AccountPoolError> {
         use std::sync::atomic::Ordering;
 
@@ -786,11 +841,21 @@ impl AccountPool {
     }
 
     /// Load nonces from the default file path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AccountPoolError::NonceLoadError`] if the file exists but
+    /// can't be read or parsed as JSON.
     pub fn load_nonces_default(&self) -> Result<usize, AccountPoolError> {
         self.load_nonces(std::path::Path::new(DEFAULT_NONCE_FILE))
     }
 
     /// Save nonces to the default file path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AccountPoolError::NonceSaveError`] if serialization or the
+    /// underlying file write fails.
     pub fn save_nonces_default(&self) -> Result<usize, AccountPoolError> {
         self.save_nonces(std::path::Path::new(DEFAULT_NONCE_FILE))
     }
@@ -811,28 +876,37 @@ impl AccountPartition {
     }
 
     /// Get the number of shards.
+    #[must_use]
     pub fn num_shards(&self) -> u64 {
         self.num_shards
     }
 
     /// Get total number of accounts in this partition.
+    #[must_use]
     pub fn total_accounts(&self) -> usize {
-        self.by_shard.values().map(|v| v.len()).sum()
+        self.by_shard.values().map(std::vec::Vec::len).sum()
     }
 
     /// Get number of accounts on a specific shard.
+    #[must_use]
     pub fn accounts_on_shard(&self, shard: ShardGroupId) -> usize {
-        self.by_shard.get(&shard).map(|v| v.len()).unwrap_or(0)
+        self.by_shard.get(&shard).map_or(0, std::vec::Vec::len)
     }
 
     /// Get accounts for a specific shard.
+    #[must_use]
     pub fn accounts_for_shard(&self, shard: ShardGroupId) -> Option<&[FundedAccount]> {
-        self.by_shard.get(&shard).map(|v| v.as_slice())
+        self.by_shard.get(&shard).map(std::vec::Vec::as_slice)
     }
 
     /// Get a pair of accounts on the same shard (mutable for counter updates).
     ///
-    /// Uses round-robin selection for NoContention mode to ensure no account reuse.
+    /// Uses round-robin selection for `NoContention` mode to ensure no account reuse.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `shard` has no counter — unreachable for any shard registered
+    /// via [`AccountPool::new`] / [`AccountPool::generate`].
     pub fn pair_for_shard(
         &mut self,
         shard: ShardGroupId,
@@ -896,6 +970,11 @@ impl AccountPartition {
     }
 
     /// Get a cross-shard pair for specific shards.
+    ///
+    /// # Panics
+    ///
+    /// Panics if either shard's counter is missing — unreachable for any
+    /// shard registered via [`AccountPool::new`] / [`AccountPool::generate`].
     pub fn cross_shard_pair_for(
         &mut self,
         from_shard: ShardGroupId,
@@ -943,6 +1022,12 @@ impl AccountPartition {
     }
 
     /// Generate a Zipf-distributed index.
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    // Skewed sampling for benchmarks; precision/sign correctness aren't material.
     fn zipf_index(n: usize, exponent: f64, rng: &mut impl rand::Rng) -> usize {
         let exp = exponent.max(1.0);
         let u: f64 = rng.gen();
@@ -1164,18 +1249,19 @@ mod tests {
             let shard1_count = partition.accounts_on_shard(ShardGroupId(1));
             assert!(
                 (24..=26).contains(&shard0_count),
-                "Expected ~25 accounts, got {} for shard 0",
-                shard0_count
+                "Expected ~25 accounts, got {shard0_count} for shard 0"
             );
             assert!(
                 (24..=26).contains(&shard1_count),
-                "Expected ~25 accounts, got {} for shard 1",
-                shard1_count
+                "Expected ~25 accounts, got {shard1_count} for shard 1"
             );
         }
 
         // Total accounts across all partitions should equal original
-        let total: usize = partitions.iter().map(|p| p.total_accounts()).sum();
+        let total: usize = partitions
+            .iter()
+            .map(super::AccountPartition::total_accounts)
+            .sum();
         assert_eq!(total, pool.total_accounts());
     }
 

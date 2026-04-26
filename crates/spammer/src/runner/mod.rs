@@ -40,6 +40,12 @@ pub struct Spammer {
 
 impl Spammer {
     /// Create a new spammer with the given configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpammerError::Config`] if the configuration is invalid, or
+    /// [`SpammerError::AccountGeneration`] if the underlying account pool
+    /// can't be constructed for the requested shard counts.
     pub fn new(config: SpammerConfig) -> Result<Self, SpammerError> {
         config.validate().map_err(SpammerError::Config)?;
 
@@ -98,7 +104,7 @@ impl Spammer {
     pub async fn run_until_cancelled(&mut self, cancel: CancellationToken) -> SpammerReport {
         let start = Instant::now();
         self.stats.start_time.store(
-            start.elapsed().as_nanos() as u64, // Store start reference
+            u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX), // Store start reference
             Ordering::SeqCst,
         );
 
@@ -149,18 +155,21 @@ impl Spammer {
         }
     }
 
-    /// Run in single-threaded mode with concurrent submission via join_all.
+    /// Run in single-threaded mode with concurrent submission via `join_all`.
     async fn run_single_threaded(&mut self, cancel: CancellationToken, start: Instant) {
         let mut last_progress = Instant::now();
         let batch_interval = self.config.batch_interval();
-        let num_shards = self.config.num_shards as usize;
+        let num_shards = usize::try_from(self.config.num_shards).unwrap_or(usize::MAX);
         let txs_per_shard = self.config.batch_size.div_ceil(num_shards);
 
         // Use current time as seed for RNG
-        let seed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as u64;
+        let seed = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        )
+        .unwrap_or(u64::MAX);
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
         let mut latency_rng = ChaCha8Rng::seed_from_u64(seed.wrapping_add(1));
 
@@ -229,7 +238,7 @@ impl Spammer {
         num_workers: usize,
     ) {
         let batch_interval = self.config.batch_interval();
-        let num_shards = self.config.num_shards as usize;
+        let num_shards = usize::try_from(self.config.num_shards).unwrap_or(usize::MAX);
 
         // Partition accounts across workers
         let partitions = self.accounts.partition(num_workers);
@@ -247,21 +256,26 @@ impl Spammer {
             latency_tracking = self.latency_tracker.is_some(),
             num_shards = num_shards,
             workers = num_workers,
-            accounts_per_partition = partitions.first().map(|p| p.total_accounts()).unwrap_or(0),
+            accounts_per_partition = partitions
+                .first()
+                .map_or(0, super::accounts::AccountPartition::total_accounts),
             "Starting spammer (multi-threaded mode)"
         );
 
         // Spawn worker tasks
         let mut handles = Vec::with_capacity(num_workers);
 
-        for (worker_id, partition) in partitions.into_iter().enumerate() {
+        for (id, partition) in partitions.into_iter().enumerate() {
             let worker = Worker {
-                worker_id,
+                id,
                 partition,
                 clients: Arc::clone(&self.clients),
                 stats: Arc::clone(&self.stats),
                 shard_round_robin: Arc::clone(&self.shard_round_robin),
-                latency_tracker: self.latency_tracker.as_ref().map(|t| t.clone_tracker()),
+                latency_tracker: self
+                    .latency_tracker
+                    .as_ref()
+                    .map(super::latency::LatencyTracker::clone_tracker),
                 config: WorkerConfig {
                     num_shards: num_shards as u64,
                     validators_per_shard: self.config.validators_per_shard,
@@ -283,7 +297,10 @@ impl Spammer {
 
         // Spawn progress reporter
         let stats_for_progress = Arc::clone(&self.stats);
-        let latency_tracker_for_progress = self.latency_tracker.as_ref().map(|t| t.clone_tracker());
+        let latency_tracker_for_progress = self
+            .latency_tracker
+            .as_ref()
+            .map(super::latency::LatencyTracker::clone_tracker);
         let progress_interval = self.config.progress_interval;
         let cancel_for_progress = cancel.clone();
 
@@ -329,7 +346,8 @@ impl Spammer {
         let base_idx = target_shard * validators_per_shard;
 
         let rr_counter = &self.shard_round_robin[target_shard];
-        let offset = rr_counter.fetch_add(1, Ordering::Relaxed) as usize % validators_per_shard;
+        let offset = usize::try_from(rr_counter.fetch_add(1, Ordering::Relaxed)).unwrap_or(0)
+            % validators_per_shard;
 
         let client_idx = (base_idx + offset) % self.clients.len();
         let client = &self.clients[client_idx];
@@ -362,6 +380,7 @@ impl Spammer {
         let rejected = self.stats.rejected.load(Ordering::SeqCst);
         let errors = self.stats.errors.load(Ordering::SeqCst);
 
+        #[allow(clippy::cast_precision_loss)] // headline TPS for human-readable progress logs
         let tps = if elapsed.as_secs_f64() > 0.0 {
             submitted as f64 / elapsed.as_secs_f64()
         } else {
@@ -370,7 +389,7 @@ impl Spammer {
 
         let in_flight_info = if let Some(ref tracker) = self.latency_tracker {
             let count = tracker.in_flight_count();
-            format!(" | tracking: {}", count)
+            format!(" | tracking: {count}")
         } else {
             String::new()
         };
@@ -388,16 +407,23 @@ impl Spammer {
     }
 
     /// Get current statistics.
+    #[must_use]
     pub fn stats(&self) -> &SpammerStats {
         &self.stats
     }
 
     /// Get genesis balances for all accounts.
+    #[must_use]
     pub fn genesis_balances(&self, balance: Decimal) -> Vec<(ComponentAddress, Decimal)> {
         self.accounts.all_genesis_balances(balance)
     }
 
     /// Wait for all RPC endpoints to be ready.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpammerError::EndpointNotReady`] if any configured RPC
+    /// endpoint never reports a non-zero block height before the timeout.
     pub async fn wait_for_ready(&self, timeout: Duration) -> Result<(), SpammerError> {
         let start = Instant::now();
 
@@ -441,7 +467,7 @@ fn print_progress_static(
 
     let in_flight_info = if let Some(tracker) = latency_tracker {
         let count = tracker.in_flight_count();
-        format!(" | tracking: {}", count)
+        format!(" | tracking: {count}")
     } else {
         String::new()
     };
@@ -473,7 +499,7 @@ struct WorkerConfig {
 
 /// A worker task that owns a partition of accounts and submits transactions.
 struct Worker {
-    worker_id: usize,
+    id: usize,
     partition: AccountPartition,
     clients: Arc<Vec<RpcClient>>,
     stats: Arc<SpammerStats>,
@@ -484,15 +510,18 @@ struct Worker {
 
 impl Worker {
     async fn run(mut self, cancel: CancellationToken) {
-        let num_shards = self.config.num_shards as usize;
+        let num_shards = usize::try_from(self.config.num_shards).unwrap_or(usize::MAX);
         let txs_per_shard = self.config.batch_size.div_ceil(num_shards);
 
         // Each worker has its own RNG with a unique seed
-        let seed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as u64
-            + self.worker_id as u64 * 1000;
+        let seed = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        )
+        .unwrap_or(u64::MAX)
+            + self.id as u64 * 1000;
 
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
         let mut latency_rng = ChaCha8Rng::seed_from_u64(seed.wrapping_add(1));
@@ -549,7 +578,8 @@ impl Worker {
         let base_idx = target_shard * validators_per_shard;
 
         let rr_counter = &self.shard_round_robin[target_shard];
-        let offset = rr_counter.fetch_add(1, Ordering::Relaxed) as usize % validators_per_shard;
+        let offset = usize::try_from(rr_counter.fetch_add(1, Ordering::Relaxed)).unwrap_or(0)
+            % validators_per_shard;
 
         let client_idx = (base_idx + offset) % self.clients.len();
         let client = &self.clients[client_idx];
@@ -575,7 +605,7 @@ impl Worker {
     }
 }
 
-/// Workload generator that uses AccountPartition (mutable, no locks).
+/// Workload generator that uses `AccountPartition` (mutable, no locks).
 struct PartitionWorkload {
     cross_shard_ratio: f64,
     selection_mode: crate::accounts::SelectionMode,
@@ -683,14 +713,13 @@ impl PartitionWorkload {
 
         let nonce = from.next_nonce();
 
-        let notarized = match hyperscale_types::sign_and_notarize(
+        let Ok(notarized) = hyperscale_types::sign_and_notarize(
             manifest,
             &self.network,
-            nonce as u32,
+            u32::try_from(nonce).unwrap_or(u32::MAX),
             &from.keypair,
-        ) {
-            Ok(n) => n,
-            Err(_) => return None,
+        ) else {
+            return None;
         };
 
         routable_from_notarized_v1(notarized, crate::validity::validity_range_for_now()).ok()
@@ -725,6 +754,8 @@ impl Default for SpammerStats {
 
 impl SpammerStats {
     /// Calculate current transactions per second.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)] // headline TPS for human-readable summary
     pub fn tps(&self, start: Instant) -> f64 {
         let elapsed = start.elapsed().as_secs_f64();
         if elapsed > 0.0 {
@@ -735,6 +766,8 @@ impl SpammerStats {
     }
 
     /// Calculate acceptance rate.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)] // headline ratio for human-readable summary
     pub fn acceptance_rate(&self) -> f64 {
         let submitted = self.submitted.load(Ordering::SeqCst);
         if submitted > 0 {
@@ -783,15 +816,19 @@ impl SpammerReport {
 /// Errors that can occur during spamming.
 #[derive(Debug, thiserror::Error)]
 pub enum SpammerError {
+    /// The provided [`SpammerConfig`] failed validation.
     #[error("Configuration error: {0}")]
     Config(#[from] crate::config::ConfigError),
 
+    /// The underlying account pool could not be generated.
     #[error("Account generation failed: {0}")]
     AccountGeneration(#[from] crate::accounts::AccountPoolError),
 
+    /// An RPC call to a configured node failed.
     #[error("RPC error: {0}")]
     Rpc(#[from] RpcError),
 
+    /// `wait_for_ready` exhausted its timeout before any node reported a non-zero block height.
     #[error("Nodes not ready within timeout")]
     NodesNotReady,
 }
