@@ -30,6 +30,7 @@ use tracing::{debug, info, trace, warn};
 const HEADER_LIVENESS_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Remote header coordinator memory statistics for monitoring collection sizes.
+#[allow(missing_docs)] // flat counters; field names are the documentation
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RemoteHeaderMemoryStats {
     pub pending_headers: usize,
@@ -130,6 +131,7 @@ impl Default for RemoteHeaderCoordinator {
 
 impl RemoteHeaderCoordinator {
     /// Create a new remote header coordinator.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             pending: HashMap::new(),
@@ -147,7 +149,7 @@ impl RemoteHeaderCoordinator {
 
     /// Handle a committed block header received from a remote shard (gossip or fetch).
     ///
-    /// The sender's BLS signature was already verified by IoLoop.
+    /// The sender's BLS signature was already verified by `IoLoop`.
     /// Performs structural pre-checks, stores as pending, and dispatches
     /// `VerifyRemoteHeaderQc` for async QC verification.
     pub fn on_remote_block_committed(
@@ -223,7 +225,7 @@ impl RemoteHeaderCoordinator {
 
         if first_for_key {
             // Emit QC verification for the first header at this (shard, height).
-            self.emit_verify_qc(topology, shard, height, committed_header)
+            Self::emit_verify_qc(topology, shard, height, committed_header)
         } else {
             vec![]
         }
@@ -262,7 +264,7 @@ impl RemoteHeaderCoordinator {
                 // Try next candidate if any remain.
                 if let Some((_, next_header)) = sender_map.iter().next() {
                     let next = Arc::clone(next_header);
-                    return self.emit_verify_qc(topology, shard, height, next);
+                    return Self::emit_verify_qc(topology, shard, height, next);
                 }
             }
 
@@ -373,7 +375,7 @@ impl RemoteHeaderCoordinator {
         let mut actions = vec![];
         let now = self.local_committed_ts;
 
-        for (&shard, expected) in self.expected.iter_mut() {
+        for (&shard, expected) in &mut self.expected {
             // Liveness baseline: when we last verified a header from this
             // shard, or the seeding time if we haven't seen one yet. Both
             // anchors are local weighted timestamps, so age is measured in
@@ -404,7 +406,7 @@ impl RemoteHeaderCoordinator {
             info!(
                 source_shard = shard.0,
                 from_height = from_height.0,
-                age_ms = now.elapsed_since(baseline).as_millis() as u64,
+                age_ms = u64::try_from(now.elapsed_since(baseline).as_millis()).unwrap_or(u64::MAX),
                 "Remote header liveness timeout — requesting missing headers via fallback"
             );
 
@@ -429,7 +431,7 @@ impl RemoteHeaderCoordinator {
         let mut actions = vec![];
         let now = self.local_committed_ts;
 
-        for (&shard, expected) in self.expected.iter_mut() {
+        for (&shard, expected) in &mut self.expected {
             if expected.requested {
                 continue;
             }
@@ -465,6 +467,7 @@ impl RemoteHeaderCoordinator {
     ///
     /// Used by BFT for deferral merkle proof validation and by Provision
     /// for state root verification.
+    #[must_use]
     pub fn get_verified(
         &self,
         shard: ShardGroupId,
@@ -477,6 +480,7 @@ impl RemoteHeaderCoordinator {
     ///
     /// Used by Provision when a provision arrives before QC verification
     /// completes — it can pass these as candidates to `VerifyProvisions`.
+    #[must_use]
     pub fn get_pending(
         &self,
         shard: ShardGroupId,
@@ -486,6 +490,7 @@ impl RemoteHeaderCoordinator {
     }
 
     /// Check if a verified header exists for (shard, height).
+    #[must_use]
     pub fn has_verified(&self, shard: ShardGroupId, height: BlockHeight) -> bool {
         self.verified.contains_key(&(shard, height))
     }
@@ -494,6 +499,7 @@ impl RemoteHeaderCoordinator {
     ///
     /// Used for cross-shard backpressure: RPC nodes can reject transactions
     /// targeting congested remote shards.
+    #[must_use]
     pub fn remote_shard_in_flight(&self) -> HashMap<ShardGroupId, u32> {
         self.tips
             .iter()
@@ -506,9 +512,10 @@ impl RemoteHeaderCoordinator {
     }
 
     /// Get memory statistics for monitoring.
+    #[must_use]
     pub fn memory_stats(&self) -> RemoteHeaderMemoryStats {
         RemoteHeaderMemoryStats {
-            pending_headers: self.pending.values().map(|m| m.len()).sum(),
+            pending_headers: self.pending.values().map(HashMap::len).sum(),
             verified_headers: self.verified.len(),
             expected_headers: self.expected.len(),
         }
@@ -566,7 +573,6 @@ impl RemoteHeaderCoordinator {
 
     /// Emit a `VerifyRemoteHeaderQc` action for the given header.
     fn emit_verify_qc(
-        &self,
         topology: &TopologySnapshot,
         shard: ShardGroupId,
         height: BlockHeight,
@@ -628,7 +634,7 @@ mod tests {
             parent_hash: BlockHash::ZERO,
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(0),
-            timestamp: hyperscale_types::ProposerTimestamp(1234567890),
+            timestamp: hyperscale_types::ProposerTimestamp(1_234_567_890),
             round: Round::INITIAL,
             is_fallback: false,
             state_root: StateRoot::ZERO,

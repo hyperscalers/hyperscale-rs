@@ -13,7 +13,7 @@
 //!
 //! ## Header Flow
 //!
-//! 1. Gossip arrives → IoLoop verifies sender BLS signature → `RemoteBlockCommitted` event
+//! 1. Gossip arrives → `IoLoop` verifies sender BLS signature → `RemoteBlockCommitted` event
 //! 2. Coordinator stores header as pending, emits `Action::VerifyRemoteHeaderQc`
 //! 3. Async QC verification completes → `RemoteHeaderQcVerified` event
 //! 4. Coordinator promotes to verified, emits `Action::Continuation(RemoteHeaderVerified)`
