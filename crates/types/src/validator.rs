@@ -25,27 +25,32 @@ pub struct ValidatorSet {
 
 impl ValidatorSet {
     /// Create a new validator set.
+    #[must_use]
     pub fn new(mut validators: Vec<ValidatorInfo>) -> Self {
         validators.sort_by_key(|v| v.validator_id);
         Self { validators }
     }
 
     /// Get the number of validators.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.validators.len()
     }
 
     /// Check if the set is empty.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.validators.is_empty()
     }
 
     /// Get total voting power.
+    #[must_use]
     pub fn total_voting_power(&self) -> u64 {
         self.validators.iter().map(|v| v.voting_power).sum()
     }
 
     /// Find a validator by ID.
+    #[must_use]
     pub fn get(&self, validator_id: ValidatorId) -> Option<&ValidatorInfo> {
         self.validators
             .iter()
@@ -53,11 +58,13 @@ impl ValidatorSet {
     }
 
     /// Get validator at a specific index.
+    #[must_use]
     pub fn get_by_index(&self, index: usize) -> Option<&ValidatorInfo> {
         self.validators.get(index)
     }
 
     /// Get the index of a validator.
+    #[must_use]
     pub fn index_of(&self, validator_id: ValidatorId) -> Option<usize> {
         self.validators
             .iter()
@@ -65,6 +72,7 @@ impl ValidatorSet {
     }
 
     /// Get all public keys.
+    #[must_use]
     pub fn public_keys(&self) -> Vec<Bls12381G1PublicKey> {
         self.validators.iter().map(|v| v.public_key).collect()
     }

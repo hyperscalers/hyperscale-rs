@@ -5,7 +5,7 @@ use std::fmt;
 
 /// A 32-byte cryptographic hash using Blake3.
 ///
-/// Provides constant-time comparison and is safe to use as a HashMap key.
+/// Provides constant-time comparison and is safe to use as a `HashMap` key.
 /// All hashing operations are deterministic.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, BasicSbor)]
 #[sbor(transparent)]
@@ -22,6 +22,7 @@ impl Hash {
     pub const MAX: Self = Self([0xFFu8; 32]);
 
     /// Create hash from bytes using Blake3.
+    #[must_use]
     pub fn from_bytes(bytes: &[u8]) -> Self {
         let hash = blake3::hash(bytes);
         Self(*hash.as_bytes())
@@ -32,6 +33,7 @@ impl Hash {
     /// # Panics
     ///
     /// Panics if bytes length is not exactly 32.
+    #[must_use]
     pub fn from_hash_bytes(bytes: &[u8]) -> Self {
         assert_eq!(bytes.len(), 32, "Hash must be exactly 32 bytes");
         let mut arr = [0u8; 32];
@@ -40,6 +42,7 @@ impl Hash {
     }
 
     /// Create hash from multiple byte slices.
+    #[must_use]
     pub fn from_parts(parts: &[&[u8]]) -> Self {
         let mut hasher = blake3::Hasher::new();
         for part in parts {
@@ -49,6 +52,11 @@ impl Hash {
     }
 
     /// Parse hash from hex string.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HexError::InvalidLength`] if `hex` is not 64 chars, or
+    /// [`HexError::InvalidHex`] if it contains non-hex characters.
     pub fn from_hex(hex: &str) -> Result<Self, HexError> {
         if hex.len() != 64 {
             return Err(HexError::InvalidLength {
@@ -64,21 +72,25 @@ impl Hash {
     }
 
     /// Convert hash to hex string.
+    #[must_use]
     pub fn to_hex(&self) -> String {
         hex::encode(self.0)
     }
 
     /// Get bytes as slice reference.
+    #[must_use]
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
 
     /// Convert to bytes array.
+    #[must_use]
     pub fn to_bytes(self) -> [u8; 32] {
         self.0
     }
 
     /// Count leading zero bits.
+    #[must_use]
     pub fn leading_zero_bits(&self) -> u32 {
         let mut count = 0u32;
         for &byte in &self.0 {
@@ -93,20 +105,27 @@ impl Hash {
     }
 
     /// Interpret first 8 bytes as u64 (little-endian).
+    ///
+    /// # Panics
+    ///
+    /// Cannot panic: a `Hash` is 32 bytes so the first 8 always exist.
+    #[must_use]
     pub fn as_u64(&self) -> u64 {
         u64::from_le_bytes(self.0[0..8].try_into().unwrap())
     }
 
     /// Check if this is the zero hash.
+    #[must_use]
     pub fn is_zero(&self) -> bool {
         self.0.iter().all(|&b| b == 0)
     }
 
     /// Compute a 64-bit value from all 32 bytes using polynomial hash.
+    #[must_use]
     pub fn as_long(&self) -> i64 {
         let mut hash: i64 = 17;
         for &byte in &self.0 {
-            hash = hash.wrapping_mul(31).wrapping_add(byte as i64);
+            hash = hash.wrapping_mul(31).wrapping_add(i64::from(byte));
         }
         hash
     }
@@ -127,6 +146,7 @@ impl Hash {
 /// Level 2:          [hash(L1_0||L1_1), H4]
 /// Level 3 (root):   [hash(L2_0||L2_1)]
 /// ```
+#[must_use]
 pub fn compute_merkle_root(hashes: &[Hash]) -> Hash {
     if hashes.is_empty() {
         return Hash::ZERO;
@@ -176,6 +196,7 @@ pub fn compute_merkle_root(hashes: &[Hash]) -> Hash {
 /// # Panics
 ///
 /// Panics if `index >= hashes.len()` or `hashes` is empty.
+#[must_use]
 pub fn compute_merkle_root_with_proof(hashes: &[Hash], index: usize) -> (Hash, Vec<Hash>, u32) {
     assert!(!hashes.is_empty(), "cannot prove in empty tree");
     assert!(index < hashes.len(), "index out of bounds");
@@ -206,14 +227,15 @@ pub fn compute_merkle_root_with_proof(hashes: &[Hash], index: usize) -> (Hash, V
         level = next_level;
     }
 
-    (level[0], siblings, index as u32)
+    (level[0], siblings, u32::try_from(index).unwrap_or(u32::MAX))
 }
 
-/// Compute a padded merkle root (power-of-2 padding with Hash::ZERO).
+/// Compute a padded merkle root (power-of-2 padding with `Hash::ZERO`).
 ///
 /// This produces the same root as [`compute_merkle_root_with_proof`] for the
 /// same input. Use this when you need to compute the root for verification
 /// but don't need a proof.
+#[must_use]
 pub fn compute_padded_merkle_root(hashes: &[Hash]) -> Hash {
     if hashes.is_empty() {
         return Hash::ZERO;
@@ -240,6 +262,7 @@ pub fn compute_padded_merkle_root(hashes: &[Hash]) -> Hash {
 ///
 /// Reconstructs the root from the leaf hash and sibling path, then compares
 /// against the expected root.
+#[must_use]
 pub fn verify_merkle_inclusion(
     root: Hash,
     leaf_hash: Hash,

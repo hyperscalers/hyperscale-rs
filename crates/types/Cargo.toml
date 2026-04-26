@@ -27,3 +27,6 @@ radix-substate-store-interface.workspace = true
 test-utils = []
 
 [dev-dependencies]
+
+[lints]
+workspace = true

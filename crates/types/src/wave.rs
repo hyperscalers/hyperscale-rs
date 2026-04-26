@@ -59,7 +59,8 @@ pub struct WaveId {
 }
 
 impl WaveId {
-    /// Create a new WaveId.
+    /// Create a new `WaveId`.
+    #[must_use]
     pub fn new(
         shard_group_id: ShardGroupId,
         block_height: BlockHeight,
@@ -73,19 +74,27 @@ impl WaveId {
     }
 
     /// Whether this is a single-shard wave (no remote dependencies).
+    #[must_use]
     pub fn is_zero(&self) -> bool {
         self.remote_shards.is_empty()
     }
 
     /// Number of provision source shards.
+    #[must_use]
     pub fn dependency_count(&self) -> usize {
         self.remote_shards.len()
     }
 
     /// Compute a deterministic identity hash for this wave.
     ///
-    /// Used for: BlockManifest cert_hashes, PendingBlock matching, storage keys,
+    /// Used for: `BlockManifest` `cert_hashes`, `PendingBlock` matching, storage keys,
     /// wave cert fetch requests. Computable without knowing EC content.
+    ///
+    /// # Panics
+    ///
+    /// Panics if SBOR encoding fails — `WaveId` is a closed SBOR type
+    /// and encoding is infallible in practice.
+    #[must_use]
     pub fn hash(&self) -> WaveIdHash {
         let bytes = basic_encode(self).expect("WaveId serialization should never fail");
         WaveIdHash::from_raw(Hash::from_bytes(&bytes))
@@ -128,7 +137,7 @@ impl std::fmt::Display for WaveId {
 /// the same wave. Wave-zero (single-shard txs) is excluded.
 ///
 /// Returns a sorted `Vec<WaveId>` with fully populated shard + height fields.
-/// (Deterministic via BTreeSet ordering.)
+/// (Deterministic via `BTreeSet` ordering.)
 /// Used in both block proposal (to populate `BlockHeader::waves`) and
 /// validation (to verify the header's waves field).
 pub fn compute_waves(
@@ -211,6 +220,7 @@ pub fn compute_provision_tx_roots(
 /// The wave leader collects execution votes, aggregates the EC, and
 /// broadcasts it to local peers and remote shards. Convenience wrapper
 /// for `wave_leader_at(wave_id, 0, committee)`.
+#[must_use]
 pub fn wave_leader(wave_id: &WaveId, committee: &[ValidatorId]) -> ValidatorId {
     wave_leader_at(wave_id, Attempt::INITIAL, committee)
 }
@@ -224,6 +234,11 @@ pub fn wave_leader(wave_id: &WaveId, committee: &[ValidatorId]) -> ValidatorId {
 ///
 /// Uses `Hash(sbor_encode(wave_id) ++ attempt.to_le_bytes()) % committee_size`
 /// for deterministic selection. All validators compute the same result.
+///
+/// # Panics
+///
+/// Panics if `committee` is empty.
+#[must_use]
 pub fn wave_leader_at(
     wave_id: &WaveId,
     attempt: Attempt,
@@ -237,7 +252,8 @@ pub fn wave_leader_at(
     let index_val = u64::from_le_bytes([
         bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
     ]);
-    let index = (index_val as usize) % committee.len();
+    let index = usize::try_from(index_val % committee.len() as u64)
+        .expect("modulo of usize len fits in usize");
     committee[index]
 }
 
@@ -259,6 +275,7 @@ pub struct TxOutcome {
 
 impl TxOutcome {
     /// Whether this outcome is an abort.
+    #[must_use]
     pub fn is_aborted(&self) -> bool {
         matches!(self.outcome, ExecutionOutcome::Aborted)
     }
@@ -271,7 +288,9 @@ pub enum ExecutionOutcome {
     /// `success=true` means the transaction's logic succeeded (writes applied).
     /// `success=false` means the transaction's logic failed (no writes).
     Executed {
+        /// Hash of the global receipt produced by this execution.
         receipt_hash: GlobalReceiptHash,
+        /// Whether the engine committed (`true`) or rejected (`false`) the tx.
         success: bool,
     },
     /// Transaction aborted before execution could complete.
@@ -280,16 +299,19 @@ pub enum ExecutionOutcome {
 
 impl ExecutionOutcome {
     /// Whether execution succeeded (executed with success=true).
+    #[must_use]
     pub fn is_success(&self) -> bool {
         matches!(self, ExecutionOutcome::Executed { success: true, .. })
     }
 
     /// Whether the transaction was aborted.
+    #[must_use]
     pub fn is_aborted(&self) -> bool {
         matches!(self, ExecutionOutcome::Aborted)
     }
 
     /// Get the receipt hash, or `GlobalReceiptHash::ZERO` for aborted outcomes.
+    #[must_use]
     pub fn receipt_hash_or_zero(&self) -> GlobalReceiptHash {
         match self {
             ExecutionOutcome::Executed { receipt_hash, .. } => *receipt_hash,
@@ -306,7 +328,7 @@ impl ExecutionOutcome {
 ///
 /// One vote covers all transactions sharing the same provision dependency set,
 /// with `global_receipt_root` being a padded merkle root over per-tx leaf hashes
-/// where each leaf = H(tx_hash || receipt_hash || success_byte).
+/// where each leaf = `H(tx_hash` || `receipt_hash` || `success_byte`).
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct ExecutionVote {
     /// Block this wave belongs to.
@@ -318,7 +340,7 @@ pub struct ExecutionVote {
     /// Validators vote at each block commit where the wave is complete.
     /// Including `vote_anchor_ts` in the BLS-signed message prevents
     /// cross-height aggregation, ensuring that if an abort intent changes
-    /// the global_receipt_root between heights, stale votes cannot combine.
+    /// the `global_receipt_root` between heights, stale votes cannot combine.
     pub vote_anchor_ts: WeightedTimestamp,
     /// Which wave within the block.
     pub wave_id: WaveId,
@@ -330,9 +352,9 @@ pub struct ExecutionVote {
     pub tx_count: u32,
     /// Per-tx execution outcomes in wave order.
     ///
-    /// Carried alongside the vote so any aggregator can extract tx_outcomes
+    /// Carried alongside the vote so any aggregator can extract `tx_outcomes`
     /// directly from quorum votes when building the EC. Not included in the
-    /// BLS-signed message (global_receipt_root already commits to the content).
+    /// BLS-signed message (`global_receipt_root` already commits to the content).
     /// This avoids relying on each aggregator's local accumulator, which may
     /// have diverged due to different abort timing.
     pub tx_outcomes: Vec<TxOutcome>,
@@ -383,7 +405,7 @@ impl std::fmt::Debug for ExecutionCertificate {
             .field("aggregated_signature", &self.aggregated_signature)
             .field("signers", &self.signers)
             .field("canonical_hash", &self.canonical_hash)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -495,6 +517,7 @@ impl sbor::Describe<sbor::NoCustomTypeKind> for ExecutionCertificate {
 
 impl ExecutionCertificate {
     /// Create a new execution certificate, computing the canonical hash eagerly.
+    #[must_use]
     pub fn new(
         wave_id: WaveId,
         vote_anchor_ts: WeightedTimestamp,
@@ -524,6 +547,7 @@ impl ExecutionCertificate {
     }
 
     /// The shard that produced this certificate.
+    #[must_use]
     pub fn shard_group_id(&self) -> ShardGroupId {
         self.wave_id.shard_group_id
     }
@@ -534,11 +558,13 @@ impl ExecutionCertificate {
     /// timestamp. Past `vote_anchor_ts + RETENTION_HORIZON` every tx in the
     /// wave has expired its `validity_range` and terminated (success or
     /// abort), so no shard can still reference this EC.
+    #[must_use]
     pub fn deadline(&self) -> WeightedTimestamp {
         self.vote_anchor_ts.plus(RETENTION_HORIZON)
     }
 
     /// Block height (the block containing the wave's transactions).
+    #[must_use]
     pub fn block_height(&self) -> BlockHeight {
         self.wave_id.block_height
     }
@@ -550,11 +576,13 @@ impl ExecutionCertificate {
     /// different 2f+1 subsets of votes, producing different signatures for the
     /// same wave — the canonical hash identifies the *logical* EC so that any
     /// valid aggregation resolves to the same hash.
+    #[must_use]
     pub fn canonical_hash(&self) -> ExecutionCertificateHash {
         self.canonical_hash
     }
 
     /// Pre-serialized SBOR bytes, if available.
+    #[must_use]
     pub fn cached_sbor_bytes(&self) -> Option<&[u8]> {
         self.cached_sbor.as_deref()
     }
@@ -584,11 +612,12 @@ impl ExecutionCertificate {
 
 /// Compute the leaf hash for a transaction outcome in the receipt tree.
 ///
-/// For executed outcomes: Leaf = H(tx_hash || receipt_hash || success_byte)
-/// For aborted outcomes: Leaf = H(tx_hash || "ABORTED:" || sbor_encode(reason))
+/// For executed outcomes: Leaf = `H(tx_hash` || `receipt_hash` || `success_byte`)
+/// For aborted outcomes: Leaf = `H(tx_hash` || "ABORTED:" || `sbor_encode(reason)`)
 ///
 /// The domain tag `b"ABORTED:"` ensures abort leaves can never collide with
 /// executed leaves.
+#[must_use]
 pub fn tx_outcome_leaf(outcome: &TxOutcome) -> Hash {
     match &outcome.outcome {
         ExecutionOutcome::Executed {
@@ -598,7 +627,7 @@ pub fn tx_outcome_leaf(outcome: &TxOutcome) -> Hash {
         } => Hash::from_parts(&[
             outcome.tx_hash.as_bytes(),
             receipt_hash.as_bytes(),
-            &[if *success { 1u8 } else { 0u8 }],
+            &[u8::from(*success)],
         ]),
         ExecutionOutcome::Aborted => Hash::from_parts(&[outcome.tx_hash.as_bytes(), b"ABORTED:"]),
     }
@@ -606,7 +635,7 @@ pub fn tx_outcome_leaf(outcome: &TxOutcome) -> Hash {
 
 /// Compute the receipt root from a list of transaction outcomes.
 ///
-/// Uses padded merkle tree (power-of-2 padding with Hash::ZERO) so that
+/// Uses padded merkle tree (power-of-2 padding with `Hash::ZERO`) so that
 /// merkle inclusion proofs have a fixed `ceil(log2(N))` siblings.
 ///
 /// Outcomes must be in wave order (= block order within the wave).
@@ -645,7 +674,7 @@ pub fn compute_global_receipt_root_with_proof(
 ///
 /// # Invariant (well-formed WC)
 ///
-/// A well-formed WaveCertificate always contains the **local EC** — the EC
+/// A well-formed `WaveCertificate` always contains the **local EC** — the EC
 /// where `ec.wave_id == wc.wave_id`. The local EC is the authoritative source
 /// for the wave's tx set and canonical (block) ordering. Remote ECs attest
 /// against their own wave decompositions and may cover only subsets.
@@ -661,18 +690,24 @@ pub struct WaveCertificate {
     /// May contain multiple ECs from the same remote shard — this happens when
     /// a remote shard committed this wave's transactions across multiple blocks,
     /// producing separate ECs.
-    /// Sorted by (shard_group_id, canonical_hash) for deterministic receipt_hash.
+    /// Sorted by (`shard_group_id`, `canonical_hash`) for deterministic `receipt_hash`.
     pub execution_certificates: Vec<Arc<ExecutionCertificate>>,
 }
 
 impl WaveCertificate {
     /// Compute the receipt hash for this wave certificate.
     ///
-    /// Hashes sorted (shard_group_id, canonical_hash) pairs. The vec is
+    /// Hashes sorted (`shard_group_id`, `canonical_hash`) pairs. The vec is
     /// pre-sorted at construction time for deterministic ordering.
-    /// canonical_hash already encodes the WaveId, vote_anchor_ts,
-    /// global_receipt_root, and all tx_outcomes — so this commits to
+    /// `canonical_hash` already encodes the `WaveId`, `vote_anchor_ts`,
+    /// `global_receipt_root`, and all `tx_outcomes` — so this commits to
     /// the full content of every contributing EC.
+    ///
+    /// # Panics
+    ///
+    /// Panics if SBOR encoding of a `ShardGroupId` fails — closed SBOR
+    /// type, infallible in practice.
+    #[must_use]
     pub fn receipt_hash(&self) -> WaveReceiptHash {
         let mut hasher = blake3::Hasher::new();
         for ec in &self.execution_certificates {
@@ -683,6 +718,7 @@ impl WaveCertificate {
     }
 
     /// Get the execution certificates.
+    #[must_use]
     pub fn execution_certificates(&self) -> &[Arc<ExecutionCertificate>] {
         &self.execution_certificates
     }
@@ -760,6 +796,10 @@ impl sbor::Describe<sbor::NoCustomTypeKind> for WaveCertificate {
 }
 
 /// Encode a `Vec<Arc<WaveCertificate>>` as an SBOR array.
+///
+/// # Errors
+///
+/// Forwards [`sbor::EncodeError`] from the underlying encoder.
 pub fn encode_wave_cert_vec<E: sbor::Encoder<sbor::NoCustomValueKind>>(
     encoder: &mut E,
     certs: &[Arc<WaveCertificate>],
@@ -774,6 +814,12 @@ pub fn encode_wave_cert_vec<E: sbor::Encoder<sbor::NoCustomValueKind>>(
 }
 
 /// Decode a `Vec<Arc<WaveCertificate>>` from an SBOR array.
+///
+/// # Errors
+///
+/// Returns [`sbor::DecodeError::UnexpectedSize`] if the encoded count
+/// exceeds `max_size`, or any decoder error from reading individual
+/// certificates.
 pub fn decode_wave_cert_vec<D: sbor::Decoder<sbor::NoCustomValueKind>>(
     decoder: &mut D,
     max_size: usize,
@@ -797,6 +843,10 @@ pub fn decode_wave_cert_vec<D: sbor::Decoder<sbor::NoCustomValueKind>>(
 }
 
 /// Encode a `Vec<Arc<FinalizedWave>>` as an SBOR array.
+///
+/// # Errors
+///
+/// Forwards [`sbor::EncodeError`] from the underlying encoder.
 pub fn encode_finalized_wave_vec<E: sbor::Encoder<sbor::NoCustomValueKind>>(
     encoder: &mut E,
     waves: &[Arc<FinalizedWave>],
@@ -811,6 +861,12 @@ pub fn encode_finalized_wave_vec<E: sbor::Encoder<sbor::NoCustomValueKind>>(
 }
 
 /// Decode a `Vec<Arc<FinalizedWave>>` from an SBOR array.
+///
+/// # Errors
+///
+/// Returns [`sbor::DecodeError::UnexpectedSize`] if the encoded count
+/// exceeds `max_size`, or any decoder error from reading individual
+/// finalized waves.
 pub fn decode_finalized_wave_vec<D: sbor::Decoder<sbor::NoCustomValueKind>>(
     decoder: &mut D,
     max_size: usize,
@@ -837,7 +893,7 @@ pub fn decode_finalized_wave_vec<D: sbor::Decoder<sbor::NoCustomValueKind>>(
 // FinalizedWave
 // ============================================================================
 
-/// A finalized wave — all participating shards have reported, WaveCertificate created.
+/// A finalized wave — all participating shards have reported, `WaveCertificate` created.
 ///
 /// Holds the wave certificate (which contains the execution certificates) plus the
 /// receipt bundles produced by local execution. Receipts are written atomically
@@ -846,7 +902,7 @@ pub fn decode_finalized_wave_vec<D: sbor::Decoder<sbor::NoCustomValueKind>>(
 /// # Derived views
 ///
 /// The wave's canonical tx list, ordering, and per-tx decisions are all **derived**
-/// from the WaveCertificate, not stored alongside it. See:
+/// from the `WaveCertificate`, not stored alongside it. See:
 /// - [`FinalizedWave::local_ec`] — the authoritative EC (where `ec.wave_id == wc.wave_id`)
 /// - [`FinalizedWave::tx_hashes`] — iterator over the wave's tx hashes in block order
 /// - [`FinalizedWave::tx_decisions`] — aggregated (Aborted > Reject > Accept) per tx
@@ -858,6 +914,7 @@ pub fn decode_finalized_wave_vec<D: sbor::Decoder<sbor::NoCustomValueKind>>(
 /// pending blocks, actions, and into the commit path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FinalizedWave {
+    /// The wave certificate carrying per-shard ECs and tx outcomes.
     pub certificate: Arc<WaveCertificate>,
     /// Receipt bundles for txs that executed. Aborted txs are absent —
     /// `receipts.len() <= tx_count()`. Preserves canonical block order.
@@ -869,48 +926,71 @@ pub struct FinalizedWave {
 /// Returned by [`FinalizedWave::validate_receipts_against_ec`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReceiptValidationError {
-    /// The WaveCertificate has no EC whose `wave_id == wc.wave_id`.
+    /// The `WaveCertificate` has no EC whose `wave_id == wc.wave_id`.
     /// Every committed WC carries exactly one such "local" EC per the
     /// `create_wave_certificate` invariant; this indicates a malformed
     /// or tampered certificate.
     MissingLocalEc,
     /// A non-aborted `tx_outcome` has no corresponding receipt.
-    MissingReceipt { tx_hash: TxHash },
+    MissingReceipt {
+        /// Hash of the tx whose receipt is missing.
+        tx_hash: TxHash,
+    },
     /// A receipt's `tx_hash` doesn't match the expected position in
     /// canonical order.
-    TxHashMismatch { expected: TxHash, actual: TxHash },
+    TxHashMismatch {
+        /// `tx_hash` the canonical order required at this position.
+        expected: TxHash,
+        /// `tx_hash` the receipt actually carried.
+        actual: TxHash,
+    },
     /// A receipt's outcome (Success/Failure) disagrees with the EC's
     /// attested outcome for that tx.
     OutcomeMismatch {
+        /// Hash of the tx whose outcomes disagree.
         tx_hash: TxHash,
+        /// Outcome attested by the EC.
         expected: TransactionOutcome,
+        /// Outcome carried by the receipt.
         actual: TransactionOutcome,
     },
     /// More receipts than non-aborted outcomes.
-    ExtraReceipt { tx_hash: TxHash },
+    ExtraReceipt {
+        /// Hash of the surplus receipt's tx.
+        tx_hash: TxHash,
+    },
 }
 
 impl FinalizedWave {
     /// Get the wave ID from the certificate.
+    #[must_use]
     pub fn wave_id(&self) -> &WaveId {
         &self.certificate.wave_id
     }
 
     /// Get the wave ID hash (used as key in pending block tracking).
+    #[must_use]
     pub fn wave_id_hash(&self) -> WaveIdHash {
         self.certificate.wave_id.hash()
     }
 
     /// Get the execution certificates (from the wave certificate).
+    #[must_use]
     pub fn execution_certificates(&self) -> &[Arc<ExecutionCertificate>] {
         &self.certificate.execution_certificates
     }
 
     /// The local shard's EC — authoritative for wave membership and ordering.
     ///
-    /// A well-formed WaveCertificate has exactly one EC with `ec.wave_id == wc.wave_id`
+    /// A well-formed `WaveCertificate` has exactly one EC with `ec.wave_id == wc.wave_id`
     /// (invariant established by `WaveCertificateTracker::create_wave_certificate`
     /// and the endorsement + convergence gate).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the local EC is missing — that indicates a malformed
+    /// or tampered `WaveCertificate`.
+    #[must_use]
     pub fn local_ec(&self) -> &ExecutionCertificate {
         self.certificate
             .execution_certificates
@@ -920,6 +1000,7 @@ impl FinalizedWave {
     }
 
     /// Number of transactions in this wave.
+    #[must_use]
     pub fn tx_count(&self) -> usize {
         self.local_ec().tx_outcomes.len()
     }
@@ -930,6 +1011,7 @@ impl FinalizedWave {
     }
 
     /// Whether the wave contains a given tx.
+    #[must_use]
     pub fn contains_tx(&self, tx_hash: &TxHash) -> bool {
         self.local_ec()
             .tx_outcomes
@@ -945,7 +1027,7 @@ impl FinalizedWave {
     /// they produce no receipt (matches the shape in `execution::finalize_wave`).
     ///
     /// Returns `None` if:
-    /// - The WaveCertificate lacks a local EC (malformed — should not happen
+    /// - The `WaveCertificate` lacks a local EC (malformed — should not happen
     ///   for a committed WC per the `create_wave_certificate` invariant).
     /// - Any non-aborted tx's receipt is missing from the lookup (peer/storage
     ///   has incomplete state — syncing peer should try a different source).
@@ -979,7 +1061,7 @@ impl FinalizedWave {
 
     /// Validate that `receipts` are consistent with the local EC's
     /// `tx_outcomes`: exactly one receipt per non-aborted outcome, in
-    /// tx_outcomes canonical order, with matching tx_hash and matching
+    /// `tx_outcomes` canonical order, with matching `tx_hash` and matching
     /// success/failure outcome.
     ///
     /// This does **not** verify `database_updates` or `writes_root` —
@@ -987,6 +1069,11 @@ impl FinalizedWave {
     /// `writes_root` the EC commits to can't be reconstructed from a
     /// local receipt alone. Use to catch gross drift (wrong tx, wrong
     /// success/fail, missing or surplus receipts) at peer-wave ingress.
+    ///
+    /// # Errors
+    ///
+    /// Returns the corresponding [`ReceiptValidationError`] variant on
+    /// the first inconsistency found.
     pub fn validate_receipts_against_ec(&self) -> Result<(), ReceiptValidationError> {
         let local_ec = self
             .certificate
@@ -1040,6 +1127,7 @@ impl FinalizedWave {
     /// Aggregate per-tx decisions across all ECs (Aborted > Reject > Accept).
     ///
     /// Iteration order follows the local EC's canonical (block) order.
+    #[must_use]
     pub fn tx_decisions(&self) -> Vec<(TxHash, TransactionDecision)> {
         let mut aborted: std::collections::HashSet<TxHash> = std::collections::HashSet::new();
         let mut failure: std::collections::HashSet<TxHash> = std::collections::HashSet::new();
@@ -1135,8 +1223,8 @@ impl sbor::Describe<sbor::NoCustomTypeKind> for FinalizedWave {
 mod tests {
     use super::*;
     use crate::{
-        generate_bls_keypair, test_utils::test_transaction_with_nodes, NodeId, ValidatorInfo,
-        ValidatorSet,
+        generate_bls_keypair, test_utils::test_transaction_with_nodes, DatabaseUpdates, NodeId,
+        ValidatorInfo, ValidatorSet,
     };
 
     /// Build a 2-shard topology with validator 0 on shard 0.
@@ -1159,7 +1247,7 @@ mod tests {
                 return node;
             }
         }
-        panic!("no node seed routes to {:?}", target_shard);
+        panic!("no node seed routes to {target_shard:?}");
     }
 
     fn make_outcome(seed: u8) -> TxOutcome {
@@ -1194,11 +1282,11 @@ mod tests {
         let zero = make_wave_id(0, BlockHeight(42), &[]);
         let wave_a = make_wave_id(0, BlockHeight(42), &[1]);
         let wave_b = make_wave_id(0, BlockHeight(42), &[2]);
-        let wave_ab = make_wave_id(0, BlockHeight(42), &[1, 2]);
+        let wave_pair = make_wave_id(0, BlockHeight(42), &[1, 2]);
 
         assert!(zero < wave_a);
         assert!(wave_a < wave_b);
-        assert!(wave_a < wave_ab);
+        assert!(wave_a < wave_pair);
     }
 
     #[test]
@@ -1482,11 +1570,11 @@ mod tests {
 
         // Decode
         let mut decoder = sbor::BasicDecoder::new(&buf, sbor::BASIC_SBOR_V1_MAX_DEPTH);
-        let decoded = decode_wave_cert_vec(&mut decoder, 100).unwrap();
+        let result = decode_wave_cert_vec(&mut decoder, 100).unwrap();
 
-        assert_eq!(decoded.len(), 2);
-        assert_eq!(decoded[0].as_ref(), certs[0].as_ref());
-        assert_eq!(decoded[1].as_ref(), certs[1].as_ref());
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].as_ref(), certs[0].as_ref());
+        assert_eq!(result[1].as_ref(), certs[1].as_ref());
     }
 
     #[test]
@@ -1563,7 +1651,7 @@ mod tests {
     fn make_success_receipt() -> Arc<LocalReceipt> {
         Arc::new(LocalReceipt {
             outcome: crate::TransactionOutcome::Success,
-            database_updates: Default::default(),
+            database_updates: DatabaseUpdates::default(),
             application_events: vec![],
         })
     }
@@ -1696,7 +1784,7 @@ mod tests {
     fn make_failure_receipt() -> Arc<LocalReceipt> {
         Arc::new(LocalReceipt {
             outcome: crate::TransactionOutcome::Failure,
-            database_updates: Default::default(),
+            database_updates: DatabaseUpdates::default(),
             application_events: vec![],
         })
     }

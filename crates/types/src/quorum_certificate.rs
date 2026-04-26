@@ -33,7 +33,7 @@ pub struct QuorumCertificate {
     pub aggregated_signature: Bls12381G2Signature,
 
     /// BFT-authenticated stake-weighted block timestamp.
-    /// Computed as: sum(timestamp_i * stake_i) / sum(stake_i)
+    /// Computed as: `sum(timestamp_i` * `stake_i`) / `sum(stake_i)`
     pub weighted_timestamp: WeightedTimestamp,
 }
 
@@ -41,6 +41,7 @@ impl QuorumCertificate {
     /// Create a genesis QC (for block 0).
     ///
     /// The genesis QC has a zero block hash and zero signature.
+    #[must_use]
     pub fn genesis() -> Self {
         Self {
             block_hash: BlockHash::ZERO,
@@ -58,6 +59,7 @@ impl QuorumCertificate {
     ///
     /// Uses `DOMAIN_BLOCK_VOTE` tag for domain separation.
     /// This is the same message used for individual block vote verification.
+    #[must_use]
     pub fn signing_message(&self) -> Vec<u8> {
         block_vote_message(
             self.shard_group_id,
@@ -68,11 +70,13 @@ impl QuorumCertificate {
     }
 
     /// Check if this is a genesis QC.
+    #[must_use]
     pub fn is_genesis(&self) -> bool {
         self.height.0 == 0 && self.block_hash == BlockHash::ZERO
     }
 
     /// Get the number of signers.
+    #[must_use]
     pub fn signer_count(&self) -> usize {
         self.signers.count_ones()
     }
@@ -81,6 +85,7 @@ impl QuorumCertificate {
     ///
     /// A QC for block at height N allows committing the block at height N-1.
     /// Genesis QC (height 0) doesn't enable any commit.
+    #[must_use]
     pub fn has_committable_block(&self) -> bool {
         self.height.0 > 0 && !self.is_genesis()
     }
@@ -88,6 +93,7 @@ impl QuorumCertificate {
     /// Get the height of the committable block (parent height).
     ///
     /// Returns None for genesis QC.
+    #[must_use]
     pub fn committable_height(&self) -> Option<BlockHeight> {
         if self.has_committable_block() {
             Some(BlockHeight(self.height.0 - 1))
@@ -99,6 +105,7 @@ impl QuorumCertificate {
     /// Get the hash of the committable block (parent hash).
     ///
     /// Returns None for genesis QC.
+    #[must_use]
     pub fn committable_hash(&self) -> Option<BlockHash> {
         if self.has_committable_block() {
             Some(self.parent_block_hash)

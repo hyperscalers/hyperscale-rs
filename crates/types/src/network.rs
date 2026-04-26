@@ -6,11 +6,11 @@
 //!
 //! Messages are classified into five priority tiers, from highest to lowest:
 //!
-//! 1. **Critical** - BFT consensus messages (BlockHeader, BlockVote) and
+//! 1. **Critical** - BFT consensus messages (`BlockHeader`, `BlockVote`) and
 //!    requests that unblock pending blocks. Never dropped.
 //!
-//! 2. **Coordination** - Cross-shard execution messages (StateProvision, ExecutionVote,
-//!    ExecutionCertificate). High priority, may be batched for efficiency.
+//! 2. **Coordination** - Cross-shard execution messages (`StateProvision`, `ExecutionVote`,
+//!    `ExecutionCertificate`). High priority, may be batched for efficiency.
 //!
 //! 3. **Finalization** - Wave certificate gossip. Important for progress
 //!    but not liveness-critical.
@@ -85,6 +85,7 @@ impl MessagePriority {
     /// Only `Propagation` and `Background` messages are droppable.
     /// Higher priority messages must be delivered.
     #[inline]
+    #[must_use]
     pub fn is_droppable(&self) -> bool {
         matches!(
             self,
@@ -96,7 +97,7 @@ impl MessagePriority {
 /// Marker trait for network messages.
 ///
 /// All messages sent over the network must implement this trait.
-/// Each message type declares its priority for network QoS.
+/// Each message type declares its priority for network `QoS`.
 pub trait NetworkMessage: Send + Sync + Sized + BasicEncode + BasicDecode {
     /// Unique message type identifier for routing.
     fn message_type_id() -> &'static str
@@ -107,6 +108,7 @@ pub trait NetworkMessage: Send + Sync + Sized + BasicEncode + BasicDecode {
     ///
     /// Used by the network adaptor for queue ordering and backpressure.
     /// Defaults to `Background` - override for higher priority messages.
+    #[must_use]
     fn priority() -> MessagePriority
     where
         Self: Sized,
@@ -115,6 +117,7 @@ pub trait NetworkMessage: Send + Sync + Sized + BasicEncode + BasicDecode {
     }
 
     /// Get the gossipsub topic for this message type.
+    #[must_use]
     fn topic() -> String
     where
         Self: Sized,

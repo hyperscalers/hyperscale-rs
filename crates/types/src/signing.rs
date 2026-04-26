@@ -14,7 +14,7 @@
 //! | `EXEC_VOTE` | Execution votes |
 //! | `COMMITTED_BLOCK_HEADER` | Committed block header gossip |
 //! | `BLOCK_HEADER` | Block header proposal gossip |
-//! | `VALIDATOR_BIND` | Validator-bind PeerId authentication |
+//! | `VALIDATOR_BIND` | Validator-bind `PeerId` authentication |
 //!
 //! # Usage
 //!
@@ -32,15 +32,15 @@ use crate::{
 
 /// Domain tag for BFT block votes.
 ///
-/// Format: `BLOCK_VOTE` || shard_group_id || height || round || block_hash
+/// Format: `BLOCK_VOTE` || `shard_group_id` || height || round || `block_hash`
 pub const DOMAIN_BLOCK_VOTE: &[u8] = b"BLOCK_VOTE";
 
 /// Domain tag for committed block header gossip.
 ///
-/// Format: `COMMITTED_BLOCK_HEADER` || shard_group_id || height || block_hash
+/// Format: `COMMITTED_BLOCK_HEADER` || `shard_group_id` || height || `block_hash`
 ///
 /// Signed by the sender (proposer) when broadcasting committed block headers
-/// globally. Verified by IoLoop before admitting to the state machine.
+/// globally. Verified by `IoLoop` before admitting to the state machine.
 pub const DOMAIN_COMMITTED_BLOCK_HEADER: &[u8] = b"COMMITTED_BLOCK_HEADER";
 
 /// Build the signing message for a block vote.
@@ -48,7 +48,8 @@ pub const DOMAIN_COMMITTED_BLOCK_HEADER: &[u8] = b"COMMITTED_BLOCK_HEADER";
 /// This is used for:
 /// - Individual block vote signatures
 /// - QC aggregated signature verification
-/// - View change highest_qc verification
+/// - View change `highest_qc` verification
+#[must_use]
 pub fn block_vote_message(
     shard_group: ShardGroupId,
     height: BlockHeight,
@@ -68,6 +69,7 @@ pub fn block_vote_message(
 ///
 /// This is used for verifying the sender's signature on globally broadcast
 /// committed block headers before admitting them to the state machine.
+#[must_use]
 pub fn committed_block_header_message(
     shard_group_id: ShardGroupId,
     height: BlockHeight,
@@ -83,7 +85,7 @@ pub fn committed_block_header_message(
 
 /// Domain tag for block header proposal gossip.
 ///
-/// Format: `BLOCK_HEADER` || shard_group_id || height || round || block_hash
+/// Format: `BLOCK_HEADER` || `shard_group_id` || height || round || `block_hash`
 ///
 /// Signed by the proposer when broadcasting block header proposals.
 /// Verified by receivers before admitting the proposal into BFT.
@@ -93,8 +95,9 @@ pub const DOMAIN_BLOCK_HEADER: &[u8] = b"BLOCK_HEADER";
 /// Build the signing message for a block header proposal.
 ///
 /// This is used for:
-/// - Proposer signature on BlockHeaderNotification (authenticated proposals)
+/// - Proposer signature on `BlockHeaderNotification` (authenticated proposals)
 /// - Verification before admitting proposals to the BFT state machine
+#[must_use]
 pub fn block_header_message(
     shard_group: ShardGroupId,
     height: BlockHeight,
@@ -112,7 +115,7 @@ pub fn block_header_message(
 
 /// Domain tag for state provisions gossip.
 ///
-/// Format: `STATE_PROVISION_BATCH` || source_shard || target_shard || block_height || H(tx_hashes)
+/// Format: `STATE_PROVISION_BATCH` || `source_shard` || `target_shard` || `block_height` || `H(tx_hashes)`
 ///
 /// Signed by the sender when broadcasting cross-shard state provisions.
 /// Verified by receivers to reject unauthenticated provision spam before
@@ -125,6 +128,7 @@ pub const DOMAIN_STATE_PROVISION_BATCH: &[u8] = b"STATE_PROVISION_BATCH";
 /// digest of the transaction hashes in the batch. This is cheap to
 /// reconstruct at verification (no re-serialization needed) while binding
 /// the signature to the specific batch contents.
+#[must_use]
 pub fn state_provisions_message(
     source_shard: ShardGroupId,
     target_shard: ShardGroupId,
@@ -149,18 +153,19 @@ pub fn state_provisions_message(
 
 /// Domain tag for validator-bind protocol.
 ///
-/// Format: `VALIDATOR_BIND` || peer_id_bytes
+/// Format: `VALIDATOR_BIND` || `peer_id_bytes`
 ///
 /// Signed by a validator's BLS key to cryptographically bind their
-/// consensus identity (ValidatorId) to their ephemeral libp2p PeerId.
+/// consensus identity (`ValidatorId`) to their ephemeral libp2p `PeerId`.
 /// Verified by peers using the BLS public key from the topology.
 pub const DOMAIN_VALIDATOR_BIND: &[u8] = b"VALIDATOR_BIND";
 
 /// Build the signing message for the validator-bind protocol.
 ///
-/// The message binds a validator's BLS identity to their ephemeral libp2p PeerId.
-/// The Noise handshake proves PeerId ownership; this signature proves the BLS key
-/// holder authorised that PeerId.
+/// The message binds a validator's BLS identity to their ephemeral libp2p `PeerId`.
+/// The Noise handshake proves `PeerId` ownership; this signature proves the BLS key
+/// holder authorised that `PeerId`.
+#[must_use]
 pub fn validator_bind_message(peer_id_bytes: &[u8]) -> Vec<u8> {
     let mut message = Vec::with_capacity(DOMAIN_VALIDATOR_BIND.len() + peer_id_bytes.len());
     message.extend_from_slice(DOMAIN_VALIDATOR_BIND);
@@ -170,7 +175,7 @@ pub fn validator_bind_message(peer_id_bytes: &[u8]) -> Vec<u8> {
 
 /// Domain tag for execution votes.
 ///
-/// Format: `EXEC_VOTE` || block_hash || block_height || wave_id_len || wave_id_shards... || shard_group || global_receipt_root || tx_count
+/// Format: `EXEC_VOTE` || `block_hash` || `block_height` || `wave_id_len` || `wave_id_shards`... || `shard_group` || `global_receipt_root` || `tx_count`
 ///
 /// Used for both individual `ExecutionVote` signatures and
 /// `ExecutionCertificate` aggregated signature verification.
@@ -178,12 +183,12 @@ pub const DOMAIN_EXEC_VOTE: &[u8] = b"EXEC_VOTE";
 
 /// Domain tag for execution vote batch gossip.
 ///
-/// Format: `EXEC_VOTE_BATCH` || shard_group_id || H(global_receipt_roots)
+/// Format: `EXEC_VOTE_BATCH` || `shard_group_id` || `H(global_receipt_roots)`
 pub const DOMAIN_EXEC_VOTE_BATCH: &[u8] = b"EXEC_VOTE_BATCH";
 
 /// Domain tag for execution certificate batch gossip.
 ///
-/// Format: `EXEC_CERT_BATCH` || shard_group_id || H(global_receipt_roots)
+/// Format: `EXEC_CERT_BATCH` || `shard_group_id` || `H(global_receipt_roots)`
 pub const DOMAIN_EXEC_CERT_BATCH: &[u8] = b"EXEC_CERT_BATCH";
 
 /// Build the signing message for an execution vote.
@@ -192,8 +197,9 @@ pub const DOMAIN_EXEC_CERT_BATCH: &[u8] = b"EXEC_CERT_BATCH";
 /// - Individual `ExecutionVote` signatures
 /// - `ExecutionCertificate` aggregated signature verification
 ///
-/// The wave_id is serialized as length-prefixed sorted shard IDs, making
+/// The `wave_id` is serialized as length-prefixed sorted shard IDs, making
 /// the message deterministic regardless of construction order.
+#[must_use]
 pub fn exec_vote_message(
     vote_anchor_ts: crate::WeightedTimestamp,
     wave_id: &WaveId,
@@ -208,7 +214,11 @@ pub fn exec_vote_message(
     // so no separate block_hash needed in the signing message.
     message.extend_from_slice(&wave_id.shard_group_id.0.to_le_bytes());
     message.extend_from_slice(&wave_id.block_height.to_le_bytes());
-    message.extend_from_slice(&(wave_id.remote_shards.len() as u32).to_le_bytes());
+    message.extend_from_slice(
+        &u32::try_from(wave_id.remote_shards.len())
+            .unwrap_or(u32::MAX)
+            .to_le_bytes(),
+    );
     for shard in &wave_id.remote_shards {
         message.extend_from_slice(&shard.0.to_le_bytes());
     }
@@ -219,6 +229,7 @@ pub fn exec_vote_message(
 }
 
 /// Build the signing message for an execution vote batch gossip.
+#[must_use]
 pub fn exec_vote_batch_message(
     shard_group: ShardGroupId,
     votes: &[crate::ExecutionVote],
@@ -237,6 +248,7 @@ pub fn exec_vote_batch_message(
 }
 
 /// Build the signing message for an execution certificate batch gossip.
+#[must_use]
 pub fn exec_cert_batch_message(
     shard_group: ShardGroupId,
     certificates: &[crate::ExecutionCertificate],

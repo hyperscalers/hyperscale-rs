@@ -4,9 +4,9 @@
 //! implementation:
 //!
 //! - **Primitives**: Hash, cryptographic keys and signatures
-//! - **Identifiers**: ValidatorId, ShardGroupId, BlockHeight, etc.
-//! - **Consensus types**: Block, BlockHeader, QuorumCertificate, etc.
-//! - **Wave types**: WaveId, ExecutionVote, ExecutionCertificate, WaveCertificate, etc.
+//! - **Identifiers**: `ValidatorId`, `ShardGroupId`, `BlockHeight`, etc.
+//! - **Consensus types**: Block, `BlockHeader`, `QuorumCertificate`, etc.
+//! - **Wave types**: `WaveId`, `ExecutionVote`, `ExecutionCertificate`, `WaveCertificate`, etc.
 //! - **Network traits**: Message markers for serialization
 //!
 //! # Design Philosophy
@@ -129,7 +129,7 @@ pub use radix_substate_store_interface::interface::DatabaseUpdates;
 /// Test utilities.
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_utils {
-    use super::*;
+    use super::{NodeId, RoutableTransaction, TimestampRange, WeightedTimestamp};
     use radix_common::crypto::{Ed25519PublicKey, Ed25519Signature, PublicKey as RadixPublicKey};
     use radix_common::prelude::Epoch;
     use radix_transactions::model::{
@@ -137,15 +137,17 @@ pub mod test_utils {
         NotarySignatureV1, SignatureV1, SignedIntentV1, TransactionHeaderV1, UserTransaction,
     };
 
-    /// Create a test NodeId from a seed byte.
+    /// Create a test `NodeId` from a seed byte.
+    #[must_use]
     pub fn test_node(seed: u8) -> NodeId {
         NodeId([seed; 30])
     }
 
-    /// Create a minimal test NotarizedTransactionV1 from seed bytes.
+    /// Create a minimal test `NotarizedTransactionV1` from seed bytes.
     ///
     /// This creates a valid but minimal transaction structure for testing.
     /// The transaction won't execute successfully but is structurally valid.
+    #[must_use]
     pub fn test_notarized_transaction_v1(seed_bytes: &[u8]) -> NotarizedTransactionV1 {
         // Create minimal header with unique nonce from seed
         let header = TransactionHeaderV1 {
@@ -186,6 +188,7 @@ pub mod test_utils {
     }
 
     /// Create a test transaction with specific read/write nodes.
+    #[must_use]
     pub fn test_transaction_with_nodes(
         seed_bytes: &[u8],
         read_nodes: Vec<NodeId>,
@@ -204,15 +207,17 @@ pub mod test_utils {
     /// `WeightedTimestamp::ZERO` so test fixtures don't need to thread a
     /// real anchor through every helper. Tests that exercise expiry should
     /// build their own range.
+    #[must_use]
     pub fn test_validity_range() -> TimestampRange {
         use std::time::Duration;
         TimestampRange::new(
             WeightedTimestamp::ZERO,
-            WeightedTimestamp::ZERO.plus(Duration::from_secs(60)),
+            WeightedTimestamp::ZERO.plus(Duration::from_mins(1)),
         )
     }
 
     /// Create a simple test transaction.
+    #[must_use]
     pub fn test_transaction(seed: u8) -> RoutableTransaction {
         test_transaction_with_nodes(
             &[seed, seed + 1, seed + 2],

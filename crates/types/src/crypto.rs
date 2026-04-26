@@ -24,8 +24,15 @@ pub use radix_common::crypto::{verify_bls12381_v1, verify_ed25519};
 
 // Re-export the BLS ciphersuite constant for batch verification
 use radix_common::crypto::BLS12381_CIPHERSITE_V1;
+use rand::SeedableRng;
 
 /// Generate a new random Ed25519 keypair.
+///
+/// # Panics
+///
+/// Cannot panic in practice: `ed25519_dalek::SigningKey::generate`
+/// always produces 32 valid bytes.
+#[must_use]
 pub fn generate_ed25519_keypair() -> Ed25519PrivateKey {
     let mut csprng = rand::rngs::OsRng;
     let signing_key = ed25519_dalek::SigningKey::generate(&mut csprng);
@@ -34,7 +41,7 @@ pub fn generate_ed25519_keypair() -> Ed25519PrivateKey {
 
 /// Generate a new random BLS12-381 keypair.
 ///
-/// Uses a random 32-byte seed with blst's key_gen for proper key derivation.
+/// Uses a random 32-byte seed with blst's `key_gen` for proper key derivation.
 pub fn generate_bls_keypair() -> Bls12381G1PrivateKey {
     let mut ikm = [0u8; 32];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut ikm);
@@ -42,14 +49,24 @@ pub fn generate_bls_keypair() -> Bls12381G1PrivateKey {
 }
 
 /// Generate an Ed25519 keypair from a seed (deterministic, for testing/simulation).
+///
+/// # Panics
+///
+/// Cannot panic: any 32 bytes form a valid Ed25519 private key.
+#[must_use]
 pub fn ed25519_keypair_from_seed(seed: &[u8; 32]) -> Ed25519PrivateKey {
     Ed25519PrivateKey::from_bytes(seed).expect("valid seed bytes")
 }
 
 /// Generate a BLS12-381 keypair from a seed (deterministic, for testing/simulation).
 ///
-/// Uses blst's key_gen which hashes the full seed to derive a valid BLS scalar.
+/// Uses blst's `key_gen` which hashes the full seed to derive a valid BLS scalar.
 /// This is the proper way to deterministically generate BLS keys from arbitrary seeds.
+///
+/// # Panics
+///
+/// Cannot panic: `blst::min_pk::SecretKey::key_gen` succeeds for any 32-byte seed.
+#[must_use]
 pub fn bls_keypair_from_seed(seed: &[u8; 32]) -> Bls12381G1PrivateKey {
     // Use blst's key_gen which properly hashes the seed to derive a valid scalar
     let blst_sk = blst::min_pk::SecretKey::key_gen(seed, &[]).expect("key_gen should not fail");
@@ -61,11 +78,13 @@ pub fn bls_keypair_from_seed(seed: &[u8; 32]) -> Bls12381G1PrivateKey {
 }
 
 /// Create a zero/placeholder Ed25519 signature for testing.
+#[must_use]
 pub fn zero_ed25519_signature() -> Ed25519Signature {
     Ed25519Signature([0u8; 64])
 }
 
 /// Create a zero/placeholder BLS signature for testing.
+#[must_use]
 pub fn zero_bls_signature() -> Bls12381G2Signature {
     Bls12381G2Signature([0u8; 96])
 }
@@ -77,6 +96,7 @@ pub fn zero_bls_signature() -> Bls12381G2Signature {
 ///
 /// Returns `true` only if ALL signatures are valid. If any signature is invalid,
 /// returns `false` without indicating which one failed.
+#[must_use]
 pub fn batch_verify_ed25519(
     messages: &[&[u8]],
     signatures: &[Ed25519Signature],
@@ -113,6 +133,7 @@ pub fn batch_verify_ed25519(
 /// we aggregate all signatures and public keys, then do a single pairing check.
 ///
 /// Returns `true` only if ALL signatures are valid.
+#[must_use]
 pub fn batch_verify_bls_same_message(
     message: &[u8],
     signatures: &[Bls12381G2Signature],
@@ -126,15 +147,13 @@ pub fn batch_verify_bls_same_message(
     }
 
     // Aggregate signatures (validate to catch malformed sigs)
-    let agg_sig = match Bls12381G2Signature::aggregate(signatures, true) {
-        Ok(s) => s,
-        Err(_) => return false,
+    let Ok(agg_sig) = Bls12381G2Signature::aggregate(signatures, true) else {
+        return false;
     };
 
     // Aggregate public keys (skip validation - keys come from trusted topology)
-    let agg_pk = match Bls12381G1PublicKey::aggregate(pubkeys, false) {
-        Ok(pk) => pk,
-        Err(_) => return false,
+    let Ok(agg_pk) = Bls12381G1PublicKey::aggregate(pubkeys, false) else {
+        return false;
     };
 
     // Single verification of aggregated sig against aggregated key
@@ -165,20 +184,17 @@ pub fn batch_verify_bls_different_messages_all_or_nothing(
     let mut bls_pks = Vec::with_capacity(pubkeys.len());
 
     for (sig, pk) in signatures.iter().zip(pubkeys.iter()) {
-        let sig = match blst::min_pk::Signature::from_bytes(&sig.0) {
-            Ok(s) => s,
-            Err(_) => return false,
+        let Ok(sig) = blst::min_pk::Signature::from_bytes(&sig.0) else {
+            return false;
         };
-        let pk = match blst::min_pk::PublicKey::from_bytes(&pk.0) {
-            Ok(p) => p,
-            Err(_) => return false,
+        let Ok(pk) = blst::min_pk::PublicKey::from_bytes(&pk.0) else {
+            return false;
         };
         bls_sigs.push(sig);
         bls_pks.push(pk);
     }
 
     // Generate random scalars for the linear combination
-    use rand::SeedableRng;
     let mut seed = [0u8; 32];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut seed);
     let mut rng = rand::rngs::StdRng::from_seed(seed);
@@ -192,7 +208,7 @@ pub fn batch_verify_bls_different_messages_all_or_nothing(
         // `rand_bytes` is a 32-byte array whose pointer is valid for 32 bytes.
         // `blst_scalar_from_bendian` reads exactly 32 bytes from the pointer.
         unsafe {
-            blst::blst_scalar_from_bendian(&mut scalar, rand_bytes.as_ptr());
+            blst::blst_scalar_from_bendian(&raw mut scalar, rand_bytes.as_ptr());
         }
         rands.push(scalar);
     }
@@ -221,6 +237,7 @@ pub fn batch_verify_bls_different_messages_all_or_nothing(
 /// Returns a Vec of bools indicating which signatures are valid.
 /// Uses batch verification first (fast path), then falls back to individual
 /// verification only if the batch fails (to identify which ones failed).
+#[must_use]
 pub fn batch_verify_bls_different_messages(
     messages: &[&[u8]],
     signatures: &[Bls12381G2Signature],

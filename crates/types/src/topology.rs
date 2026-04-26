@@ -1,7 +1,7 @@
 //! Immutable topology snapshot for shard committee queries.
 //!
 //! `TopologySnapshot` is the read-only view of topology state, passed by
-//! reference to subsystem methods and shared via `ArcSwap` with the io_loop.
+//! reference to subsystem methods and shared via `ArcSwap` with the `io_loop`.
 //! All query methods are `&self`; mutations happen in `TopologyState`
 //! (in the `hyperscale-topology` crate) which builds new snapshots.
 
@@ -12,7 +12,8 @@ use crate::{
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
-/// Hash a NodeId to a u64 using blake3 (first 8 bytes, little-endian).
+/// Hash a `NodeId` to a u64 using blake3 (first 8 bytes, little-endian).
+#[must_use]
 pub fn node_id_hash_u64(node_id: &NodeId) -> u64 {
     let hash = blake3::hash(&node_id.0);
     let bytes = hash.as_bytes();
@@ -21,7 +22,8 @@ pub fn node_id_hash_u64(node_id: &NodeId) -> u64 {
     ])
 }
 
-/// Compute which shard owns a NodeId (hash-modulo).
+/// Compute which shard owns a `NodeId` (hash-modulo).
+#[must_use]
 pub fn shard_for_node(node_id: &NodeId, num_shards: u64) -> ShardGroupId {
     ShardGroupId(node_id_hash_u64(node_id) % num_shards)
 }
@@ -59,6 +61,7 @@ impl TopologySnapshot {
     /// Create a snapshot with modulo-based shard assignment.
     ///
     /// Validators are assigned to shards by `id % num_shards`.
+    #[must_use]
     pub fn new(
         local_validator_id: ValidatorId,
         num_shards: u64,
@@ -72,6 +75,11 @@ impl TopologySnapshot {
     ///
     /// All validators are placed in `local_shard` regardless of their ID.
     /// Useful for tests where `validator_id % num_shards != desired_shard`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `local_shard` is not in range `[0, num_shards)`.
+    #[must_use]
     pub fn with_local_shard(
         local_validator_id: ValidatorId,
         local_shard: ShardGroupId,
@@ -108,6 +116,7 @@ impl TopologySnapshot {
     /// Create a snapshot with explicit shard committees.
     ///
     /// Shard membership is taken directly from the provided map.
+    #[must_use]
     pub fn with_shard_committees(
         local_validator_id: ValidatorId,
         local_shard: ShardGroupId,
@@ -124,8 +133,7 @@ impl TopologySnapshot {
                 for validator_id in validators {
                     let voting_power = validator_info
                         .get(&validator_id)
-                        .map(|v| v.voting_power)
-                        .unwrap_or(1);
+                        .map_or(1, |v| v.voting_power);
                     committee.active_validators.push(validator_id);
                     committee.total_voting_power += voting_power;
                 }
@@ -147,6 +155,12 @@ impl TopologySnapshot {
     }
 
     /// Create from an epoch configuration (production path).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TopologySnapshotError::ValidatorNotInEpoch`] if
+    /// `local_validator_id` is not present in any shard committee
+    /// of `epoch`.
     pub fn from_epoch_config(
         local_validator_id: ValidatorId,
         epoch: &EpochConfig,
@@ -218,6 +232,7 @@ impl TopologySnapshot {
     }
 
     /// Create a new snapshot with the given shard marked as splitting.
+    #[must_use]
     pub fn with_shard_splitting(&self, shard: ShardGroupId) -> Self {
         let mut snapshot = self.clone();
         snapshot.splitting_shards.insert(shard);
@@ -225,6 +240,7 @@ impl TopologySnapshot {
     }
 
     /// Create a new snapshot with the given shard's splitting state cleared.
+    #[must_use]
     pub fn without_shard_splitting(&self, shard: ShardGroupId) -> Self {
         let mut snapshot = self.clone();
         snapshot.splitting_shards.remove(&shard);
@@ -238,37 +254,41 @@ impl TopologySnapshot {
 
 impl TopologySnapshot {
     /// Get the local validator's ID.
+    #[must_use]
     pub fn local_validator_id(&self) -> ValidatorId {
         self.local_validator_id
     }
 
     /// Get the local shard group.
+    #[must_use]
     pub fn local_shard(&self) -> ShardGroupId {
         self.local_shard
     }
 
     /// Get the total number of shards.
+    #[must_use]
     pub fn num_shards(&self) -> u64 {
         self.num_shards
     }
 
     /// Get the ordered committee members for a shard.
+    #[must_use]
     pub fn committee_for_shard(&self, shard: ShardGroupId) -> &[ValidatorId] {
         self.shard_committees
             .get(&shard)
-            .map(|c| c.active_validators.as_slice())
-            .unwrap_or(&[])
+            .map_or(&[][..], |c| c.active_validators.as_slice())
     }
 
     /// Get total voting power for a shard's committee.
+    #[must_use]
     pub fn voting_power_for_shard(&self, shard: ShardGroupId) -> u64 {
         self.shard_committees
             .get(&shard)
-            .map(|c| c.total_voting_power)
-            .unwrap_or(0)
+            .map_or(0, |c| c.total_voting_power)
     }
 
     /// Get voting power for a specific validator.
+    #[must_use]
     pub fn voting_power(&self, validator_id: ValidatorId) -> Option<u64> {
         self.validator_info
             .get(&validator_id)
@@ -276,16 +296,19 @@ impl TopologySnapshot {
     }
 
     /// Get the public key for a validator.
+    #[must_use]
     pub fn public_key(&self, validator_id: ValidatorId) -> Option<Bls12381G1PublicKey> {
         self.validator_info.get(&validator_id).map(|v| v.public_key)
     }
 
     /// Get the global validator set.
+    #[must_use]
     pub fn global_validator_set(&self) -> &Arc<ValidatorSet> {
         &self.global_validator_set
     }
 
     /// Get the validator ID at a specific index in the local committee.
+    #[must_use]
     pub fn local_validator_at_index(&self, index: usize) -> Option<ValidatorId> {
         self.local_committee().get(index).copied()
     }
@@ -293,11 +316,13 @@ impl TopologySnapshot {
     // ── Derived committee queries ────────────────────────────────────────
 
     /// Get the number of committee members for a shard.
+    #[must_use]
     pub fn committee_size_for_shard(&self, shard: ShardGroupId) -> usize {
         self.committee_for_shard(shard).len()
     }
 
     /// Get the index of a validator in a shard's committee.
+    #[must_use]
     pub fn committee_index_for_shard(
         &self,
         shard: ShardGroupId,
@@ -309,11 +334,13 @@ impl TopologySnapshot {
     }
 
     /// Check if the given voting power meets quorum for a shard (> 2/3).
+    #[must_use]
     pub fn has_quorum_for_shard(&self, shard: ShardGroupId, voting_power: u64) -> bool {
         VotePower::has_quorum(voting_power, self.voting_power_for_shard(shard))
     }
 
     /// Get the minimum voting power required for quorum in a shard.
+    #[must_use]
     pub fn quorum_threshold_for_shard(&self, shard: ShardGroupId) -> u64 {
         (self.voting_power_for_shard(shard) * 2 / 3) + 1
     }
@@ -321,36 +348,43 @@ impl TopologySnapshot {
     // ── Local shard shortcuts ────────────────────────────────────────────
 
     /// Get the ordered committee members for the local shard.
+    #[must_use]
     pub fn local_committee(&self) -> &[ValidatorId] {
         self.committee_for_shard(self.local_shard)
     }
 
     /// Get total voting power for the local shard.
+    #[must_use]
     pub fn local_voting_power(&self) -> u64 {
         self.voting_power_for_shard(self.local_shard)
     }
 
     /// Get the number of committee members for the local shard.
+    #[must_use]
     pub fn local_committee_size(&self) -> usize {
         self.committee_size_for_shard(self.local_shard)
     }
 
     /// Get the index of a validator in the local shard's committee.
+    #[must_use]
     pub fn local_committee_index(&self, validator_id: ValidatorId) -> Option<usize> {
         self.committee_index_for_shard(self.local_shard, validator_id)
     }
 
     /// Check if the given voting power meets quorum for the local shard.
+    #[must_use]
     pub fn local_has_quorum(&self, voting_power: u64) -> bool {
         self.has_quorum_for_shard(self.local_shard, voting_power)
     }
 
     /// Get the minimum voting power required for quorum in the local shard.
+    #[must_use]
     pub fn local_quorum_threshold(&self) -> u64 {
         self.quorum_threshold_for_shard(self.local_shard)
     }
 
     /// Check if a validator is a member of the local shard's committee.
+    #[must_use]
     pub fn is_committee_member(&self, validator_id: ValidatorId) -> bool {
         self.local_committee_index(validator_id).is_some()
     }
@@ -361,6 +395,7 @@ impl TopologySnapshot {
     ///
     /// # Panics
     /// Panics if the local committee is empty (invariant violation).
+    #[must_use]
     pub fn proposer_for(&self, height: BlockHeight, round: Round) -> ValidatorId {
         let committee = self.local_committee();
         debug_assert!(
@@ -368,18 +403,21 @@ impl TopologySnapshot {
             "proposer_for called with empty committee for shard {:?}",
             self.local_shard
         );
-        let index = (height.0 + round.0) as usize % committee.len();
+        let index = usize::try_from((height.0 + round.0) % committee.len() as u64)
+            .expect("modulo of usize len fits in usize");
         committee[index]
     }
 
     /// Check if the local validator should propose at this height and round.
+    #[must_use]
     pub fn should_propose(&self, height: BlockHeight, round: Round) -> bool {
         self.proposer_for(height, round) == self.local_validator_id
     }
 
     // ── Node / transaction routing ───────────────────────────────────────
 
-    /// Determine which shard a NodeId belongs to (hash-modulo).
+    /// Determine which shard a `NodeId` belongs to (hash-modulo).
+    #[must_use]
     pub fn shard_for_node_id(&self, node_id: &NodeId) -> ShardGroupId {
         crate::shard_for_node(node_id, self.num_shards)
     }
@@ -448,11 +486,13 @@ impl TopologySnapshot {
     // ── Epoch awareness ──────────────────────────────────────────────────
 
     /// Get the current epoch identifier.
+    #[must_use]
     pub fn current_epoch(&self) -> EpochId {
         self.current_epoch
     }
 
     /// Get the block height at which the current epoch ends.
+    #[must_use]
     pub fn epoch_end_height(&self) -> BlockHeight {
         self.epoch_end_height
     }
@@ -460,16 +500,19 @@ impl TopologySnapshot {
     /// Check if this validator can participate in consensus.
     ///
     /// Returns `false` if the validator is in a "Waiting" state.
+    #[must_use]
     pub fn can_participate_in_consensus(&self) -> bool {
         matches!(self.local_state, ValidatorShardState::Active)
     }
 
     /// Check if a shard is currently in a splitting state.
+    #[must_use]
     pub fn is_shard_splitting(&self, shard: ShardGroupId) -> bool {
         self.splitting_shards.contains(&shard)
     }
 
-    /// Check if a NodeId belongs to a shard that is currently splitting.
+    /// Check if a `NodeId` belongs to a shard that is currently splitting.
+    #[must_use]
     pub fn is_node_in_splitting_shard(&self, node_id: &NodeId) -> bool {
         let shard = self.shard_for_node_id(node_id);
         self.is_shard_splitting(shard)
@@ -487,7 +530,7 @@ impl std::fmt::Debug for TopologySnapshot {
                 "committee_size",
                 &self.committee_for_shard(self.local_shard).len(),
             )
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

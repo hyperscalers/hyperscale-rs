@@ -14,34 +14,36 @@ use std::sync::Arc;
 /// database lookups without any key transformation at the receiving shard.
 ///
 /// The storage key format is: `db_node_key(50) + partition_num(1) + sort_key(var)`
-/// where `db_node_key` is the SpreadPrefixKeyMapper hash (expensive to compute).
+/// where `db_node_key` is the `SpreadPrefixKeyMapper` hash (expensive to compute).
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct StateEntry {
     /// Pre-computed full storage key (ready for direct DB lookup).
-    /// Format: db_node_key (50 bytes) + partition (1 byte) + sort_key
+    /// Format: `db_node_key` (50 bytes) + partition (1 byte) + `sort_key`
     pub storage_key: Vec<u8>,
 
     /// SBOR-encoded substate value (None if deleted/doesn't exist).
     pub value: Option<Vec<u8>>,
 }
 
-/// Hash prefix length in db_node_key (SpreadPrefixKeyMapper adds 20-byte hash)
+/// Hash prefix length in `db_node_key` (`SpreadPrefixKeyMapper` adds 20-byte hash)
 const HASH_PREFIX_LEN: usize = 20;
 
 impl StateEntry {
     /// Create a new DB state entry with pre-computed storage key.
+    #[must_use]
     pub fn new(storage_key: Vec<u8>, value: Option<Vec<u8>>) -> Self {
         Self { storage_key, value }
     }
 
-    /// Extract the NodeId from the storage key.
+    /// Extract the `NodeId` from the storage key.
     ///
     /// The storage key format is:
-    /// - db_node_key (50 bytes: 20-byte hash prefix + 30-byte node_id)
-    /// - partition_num (1 byte)
-    /// - sort_key (variable)
+    /// - `db_node_key` (50 bytes: 20-byte hash prefix + 30-byte `node_id`)
+    /// - `partition_num` (1 byte)
+    /// - `sort_key` (variable)
     ///
-    /// The NodeId is at bytes [20..50] (after hash prefix).
+    /// The `NodeId` is at bytes [20..50] (after hash prefix).
+    #[must_use]
     pub fn node_id(&self) -> Option<NodeId> {
         let start = HASH_PREFIX_LEN;
         let end = start + 30;
@@ -55,6 +57,7 @@ impl StateEntry {
     }
 
     /// Compute hash of this entry for signing/verification.
+    #[must_use]
     pub fn hash(&self) -> Hash {
         let mut data = Vec::with_capacity(self.storage_key.len() + 32);
         data.extend_from_slice(&self.storage_key);
@@ -76,12 +79,13 @@ impl StateEntry {
     ///
     /// Creates a storage key in the correct format so that `node_id()` can extract
     /// the node ID. Uses a dummy hash prefix (zeros) since tests don't need real
-    /// SpreadPrefixKeyMapper hashes.
+    /// `SpreadPrefixKeyMapper` hashes.
     #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
     pub fn test_entry(
         node_id: NodeId,
         partition: u8,
-        sort_key: Vec<u8>,
+        sort_key: &[u8],
         value: Option<Vec<u8>>,
     ) -> Self {
         // Format: hash_prefix (20) + node_id (30) + partition (1) + sort_key
@@ -89,7 +93,7 @@ impl StateEntry {
         storage_key.extend_from_slice(&[0u8; 20]); // Dummy hash prefix
         storage_key.extend_from_slice(&node_id.0); // Node ID
         storage_key.push(partition); // Partition number
-        storage_key.extend_from_slice(&sort_key); // Sort key
+        storage_key.extend_from_slice(sort_key); // Sort key
         Self { storage_key, value }
     }
 }
@@ -205,12 +209,7 @@ mod tests {
 
     #[test]
     fn test_db_state_entry_hash() {
-        let entry = StateEntry::test_entry(
-            NodeId([1u8; 30]),
-            0,
-            b"key".to_vec(),
-            Some(b"value".to_vec()),
-        );
+        let entry = StateEntry::test_entry(NodeId([1u8; 30]), 0, b"key", Some(b"value".to_vec()));
 
         let hash1 = entry.hash();
         let hash2 = entry.hash();

@@ -14,14 +14,14 @@ pub struct RoutableTransaction {
     /// The underlying Radix transaction.
     transaction: UserTransaction,
 
-    /// NodeIds that this transaction reads from.
+    /// `NodeIds` that this transaction reads from.
     pub declared_reads: Vec<NodeId>,
 
-    /// NodeIds that this transaction writes to.
+    /// `NodeIds` that this transaction writes to.
     pub declared_writes: Vec<NodeId>,
 
     /// Half-open `WeightedTimestamp` range during which this tx may be
-    /// included in a block. Anchored on the parent QC's weighted_timestamp
+    /// included in a block. Anchored on the parent QC's `weighted_timestamp`
     /// at every check site. Signer-chosen, chain-enforced.
     pub validity_range: TimestampRange,
 
@@ -88,10 +88,17 @@ impl std::fmt::Debug for RoutableTransaction {
 }
 
 impl RoutableTransaction {
-    /// Create a new routable transaction from a UserTransaction.
+    /// Create a new routable transaction from a `UserTransaction`.
     ///
     /// `validity_range` must be supplied explicitly — there is no chain-side
     /// default. The signer chooses the bounds; the chain enforces them.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the `UserTransaction` cannot be SBOR-encoded — that
+    /// indicates a programmer error since `UserTransaction` is a closed
+    /// SBOR type and its encoding is infallible in practice.
+    #[must_use]
     pub fn new(
         transaction: UserTransaction,
         declared_reads: Vec<NodeId>,
@@ -203,7 +210,7 @@ impl RoutableTransaction {
             .any(|node| crate::shard_for_node(node, num_shards) != first_shard)
     }
 
-    /// All NodeIds this transaction declares access to.
+    /// All `NodeIds` this transaction declares access to.
     pub fn all_declared_nodes(&self) -> impl Iterator<Item = &NodeId> {
         self.declared_reads
             .iter()
@@ -381,6 +388,7 @@ pub enum TransactionStatus {
     ///
     /// Still holds state locks until Completed.
     Executed {
+        /// Wave-finalized decision for this tx (Accept / Reject / Aborted).
         decision: TransactionDecision,
         /// Block height when the transaction was originally committed.
         /// Preserved from Committed state for timeout tracking - cross-shard
@@ -404,6 +412,7 @@ impl TransactionStatus {
     ///
     /// Terminal states:
     /// - `Completed`: Transaction executed and certificate committed
+    #[must_use]
     pub fn is_final(&self) -> bool {
         matches!(self, TransactionStatus::Completed(_))
     }
@@ -411,6 +420,7 @@ impl TransactionStatus {
     /// Check if transaction is ready to be included in a block.
     ///
     /// Only Pending transactions can be selected by the block proposer.
+    #[must_use]
     pub fn is_ready_for_block(&self) -> bool {
         matches!(self, TransactionStatus::Pending)
     }
@@ -426,6 +436,7 @@ impl TransactionStatus {
     /// The following statuses do NOT hold locks:
     /// - Pending: not yet committed into a block
     /// - Completed: certificate committed, transaction done
+    #[must_use]
     pub fn holds_state_lock(&self) -> bool {
         matches!(
             self,
@@ -532,7 +543,7 @@ fn parse_decision(s: &str) -> Result<TransactionDecision, TransactionStatusParse
     }
 }
 
-/// Error parsing a TransactionStatus from a string.
+/// Error parsing a `TransactionStatus` from a string.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransactionStatusParseError {
     /// Unknown status name.
@@ -548,10 +559,10 @@ pub enum TransactionStatusParseError {
 impl std::fmt::Display for TransactionStatusParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::UnknownStatus(s) => write!(f, "unknown status: {}", s),
-            Self::InvalidFormat(s) => write!(f, "invalid format: {}", s),
-            Self::MissingValue(s) => write!(f, "missing value for {}", s),
-            Self::InvalidValue(s) => write!(f, "invalid {}", s),
+            Self::UnknownStatus(s) => write!(f, "unknown status: {s}"),
+            Self::InvalidFormat(s) => write!(f, "invalid format: {s}"),
+            Self::MissingValue(s) => write!(f, "missing value for {s}"),
+            Self::InvalidValue(s) => write!(f, "invalid {s}"),
         }
     }
 }
@@ -583,7 +594,7 @@ pub enum TransactionError {
     #[error("Transaction must declare at least one write")]
     NoWritesDeclared,
 
-    /// A NodeId appears in both declared_reads and declared_writes.
+    /// A `NodeId` appears in both `declared_reads` and `declared_writes`.
     #[error("NodeId declared in both reads and writes")]
     DuplicateDeclaration,
 
@@ -605,6 +616,11 @@ pub enum TransactionError {
 // argument is a compile-time error rather than a silent default.
 
 /// Convert a `NotarizedTransactionV1` into a `RoutableTransaction`.
+///
+/// # Errors
+///
+/// Currently infallible; the `Result` is reserved for future
+/// validation paths (e.g. unsupported instruction kinds).
 pub fn routable_from_notarized_v1(
     notarized: NotarizedTransactionV1,
     validity_range: TimestampRange,
@@ -620,6 +636,11 @@ pub fn routable_from_notarized_v1(
 }
 
 /// Convert a `NotarizedTransactionV2` into a `RoutableTransaction`.
+///
+/// # Errors
+///
+/// Currently infallible; the `Result` is reserved for future
+/// validation paths (e.g. unsupported instruction kinds).
 pub fn routable_from_notarized_v2(
     notarized: NotarizedTransactionV2,
     validity_range: TimestampRange,
@@ -662,6 +683,12 @@ pub fn routable_from_notarized_v2(
 }
 
 /// Convert a `UserTransaction` (V1 or V2) into a `RoutableTransaction`.
+///
+/// # Errors
+///
+/// Forwards any error from
+/// [`routable_from_notarized_v1`] / [`routable_from_notarized_v2`];
+/// both are currently infallible.
 pub fn routable_from_user_transaction(
     transaction: UserTransaction,
     validity_range: TimestampRange,
@@ -676,24 +703,24 @@ pub fn routable_from_user_transaction(
 // Instruction Analysis
 // ============================================================================
 
-/// Analyze V1 transaction instructions to extract accessed NodeIds.
+/// Analyze V1 transaction instructions to extract accessed `NodeIds`.
 fn analyze_instructions_v1(instructions: &[InstructionV1]) -> (Vec<NodeId>, Vec<NodeId>) {
     let mut reads = HashSet::new();
     let mut writes = HashSet::new();
 
-    for instruction in instructions.iter() {
+    for instruction in instructions {
         extract_node_ids_from_instruction_v1(instruction, &mut reads, &mut writes);
     }
 
     filter_and_deduplicate(reads, writes)
 }
 
-/// Analyze V2 transaction instructions to extract accessed NodeIds.
+/// Analyze V2 transaction instructions to extract accessed `NodeIds`.
 fn analyze_instructions_v2(instructions: &[InstructionV2]) -> (Vec<NodeId>, Vec<NodeId>) {
     let mut reads = HashSet::new();
     let mut writes = HashSet::new();
 
-    for instruction in instructions.iter() {
+    for instruction in instructions {
         extract_node_ids_from_instruction_v2(instruction, &mut reads, &mut writes);
     }
 
@@ -722,7 +749,7 @@ fn filter_and_deduplicate(
     (reads, writes)
 }
 
-/// Extract NodeIds from a single V1 instruction.
+/// Extract `NodeIds` from a single V1 instruction.
 fn extract_node_ids_from_instruction_v1(
     instruction: &InstructionV1,
     reads: &mut HashSet<NodeId>,
@@ -796,7 +823,7 @@ fn extract_node_ids_from_instruction_v1(
     }
 }
 
-/// Extract NodeIds from a single V2 instruction.
+/// Extract `NodeIds` from a single V2 instruction.
 fn extract_node_ids_from_instruction_v2(
     instruction: &InstructionV2,
     reads: &mut HashSet<NodeId>,
@@ -866,14 +893,12 @@ fn extract_node_ids_from_instruction_v2(
         InstructionV2::AllocateGlobalAddress(inner) => {
             reads.insert(NodeId(inner.package_address.into_node_id().0));
         }
-        InstructionV2::YieldToParent(_)
-        | InstructionV2::YieldToChild(_)
-        | InstructionV2::VerifyParent(_) => {}
+        // Yield/verify ops touch no state; remaining variants conservatively touch nothing.
         _ => {}
     }
 }
 
-/// Convert a manifest global address to a NodeId if possible.
+/// Convert a manifest global address to a `NodeId` if possible.
 fn manifest_address_to_node_id(address: &ManifestGlobalAddress) -> Option<NodeId> {
     match address {
         ManifestGlobalAddress::Static(addr) => Some(NodeId(addr.into_node_id().0)),
@@ -881,7 +906,7 @@ fn manifest_address_to_node_id(address: &ManifestGlobalAddress) -> Option<NodeId
     }
 }
 
-/// Convert a manifest package address to a NodeId if possible.
+/// Convert a manifest package address to a `NodeId` if possible.
 fn manifest_package_to_node_id(address: &ManifestPackageAddress) -> Option<NodeId> {
     match address {
         ManifestPackageAddress::Static(addr) => Some(NodeId(addr.into_node_id().0)),
@@ -889,14 +914,19 @@ fn manifest_package_to_node_id(address: &ManifestPackageAddress) -> Option<NodeI
     }
 }
 
-/// Check if a NodeId is a system entity that should be replicated to all shards.
+/// Check if a `NodeId` is a system entity that should be replicated to all shards.
 fn is_system_entity(node_id: &NodeId) -> bool {
     is_system_package(node_id) || is_system_component(node_id) || is_system_resource(node_id)
 }
 
-/// Check if a NodeId belongs to a well-known system package.
+/// Check if a `NodeId` belongs to a well-known system package.
 fn is_system_package(node_id: &NodeId) -> bool {
-    use radix_common::constants::*;
+    use radix_common::constants::{
+        ACCESS_CONTROLLER_PACKAGE, ACCOUNT_PACKAGE, CONSENSUS_MANAGER_PACKAGE, FAUCET_PACKAGE,
+        GENESIS_HELPER_PACKAGE, IDENTITY_PACKAGE, LOCKER_PACKAGE, METADATA_MODULE_PACKAGE,
+        PACKAGE_PACKAGE, POOL_PACKAGE, RESOURCE_PACKAGE, ROLE_ASSIGNMENT_MODULE_PACKAGE,
+        ROYALTY_MODULE_PACKAGE, TRANSACTION_PROCESSOR_PACKAGE, TRANSACTION_TRACKER_PACKAGE,
+    };
 
     let radix_node_id = radix_common::types::NodeId(node_id.0);
     let well_known_packages = [
@@ -922,9 +952,9 @@ fn is_system_package(node_id: &NodeId) -> bool {
         .any(|pkg| pkg.as_node_id() == &radix_node_id)
 }
 
-/// Check if a NodeId belongs to a well-known system component.
+/// Check if a `NodeId` belongs to a well-known system component.
 fn is_system_component(node_id: &NodeId) -> bool {
-    use radix_common::constants::*;
+    use radix_common::constants::{CONSENSUS_MANAGER, FAUCET, GENESIS_HELPER, TRANSACTION_TRACKER};
 
     let radix_node_id = radix_common::types::NodeId(node_id.0);
     let well_known_components = [
@@ -939,9 +969,13 @@ fn is_system_component(node_id: &NodeId) -> bool {
         .any(|comp| comp.as_node_id() == &radix_node_id)
 }
 
-/// Check if a NodeId belongs to a well-known system resource.
+/// Check if a `NodeId` belongs to a well-known system resource.
 fn is_system_resource(node_id: &NodeId) -> bool {
-    use radix_common::constants::*;
+    use radix_common::constants::{
+        ACCOUNT_OWNER_BADGE, ED25519_SIGNATURE_RESOURCE, GLOBAL_CALLER_RESOURCE,
+        IDENTITY_OWNER_BADGE, PACKAGE_OF_DIRECT_CALLER_RESOURCE, PACKAGE_OWNER_BADGE,
+        SECP256K1_SIGNATURE_RESOURCE, SYSTEM_EXECUTION_RESOURCE, VALIDATOR_OWNER_BADGE, XRD,
+    };
 
     let radix_node_id = radix_common::types::NodeId(node_id.0);
     let well_known_resources = [
@@ -975,6 +1009,11 @@ fn is_system_resource(node_id: &NodeId) -> bool {
 /// * `signer` - The Ed25519 private key to sign with (acts as both signer and notary)
 ///
 /// Note: Only Ed25519 keys are supported for Radix transactions (not BLS).
+///
+/// # Errors
+///
+/// Forwards any error from [`sign_and_notarize_with_options`] (manifest
+/// build / hashing / signing).
 pub fn sign_and_notarize(
     manifest: TransactionManifestV1,
     network: &NetworkDefinition,
@@ -997,6 +1036,11 @@ pub fn sign_and_notarize(
 /// This provides full control over transaction header parameters.
 ///
 /// Note: Only Ed25519 keys are supported for Radix transactions (not BLS).
+///
+/// # Errors
+///
+/// Returns [`TransactionError`] if intent construction or hashing fails
+/// (these only fire on programmer error today: malformed manifests).
 pub fn sign_and_notarize_with_options(
     manifest: TransactionManifestV1,
     network: &NetworkDefinition,
@@ -1027,7 +1071,7 @@ pub fn sign_and_notarize_with_options(
     // Prepare and sign the intent
     let prepared_intent = intent
         .prepare(&PreparationSettings::latest())
-        .map_err(|e| TransactionError::EncodeFailed(format!("{:?}", e)))?;
+        .map_err(|e| TransactionError::EncodeFailed(format!("{e:?}")))?;
 
     let intent_hash = *prepared_intent
         .transaction_intent_hash()
@@ -1049,7 +1093,7 @@ pub fn sign_and_notarize_with_options(
     // Prepare and notarize the signed intent
     let prepared_signed = signed_intent
         .prepare(&PreparationSettings::latest())
-        .map_err(|e| TransactionError::EncodeFailed(format!("{:?}", e)))?;
+        .map_err(|e| TransactionError::EncodeFailed(format!("{e:?}")))?;
 
     let signed_intent_hash = *prepared_signed
         .signed_transaction_intent_hash()

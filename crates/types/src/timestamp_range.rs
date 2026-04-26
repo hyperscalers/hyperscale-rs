@@ -8,7 +8,7 @@
 //! check uses the QC the proposer attached to this block, not the QC
 //! that will eventually certify this block (which doesn't exist at vote
 //! time). The one-block lag — the certifying QC may carry a slightly
-//! later weighted_timestamp than the parent — is intentional, bounded,
+//! later `weighted_timestamp` than the parent — is intentional, bounded,
 //! and well under [`MAX_VALIDITY_RANGE`].
 //!
 //! Both range length and the forward edge are capped at
@@ -28,16 +28,22 @@ use std::time::Duration;
 /// anchoring `weighted_timestamp`. Equal to the EC retention horizon
 /// from Plan A by design — past this point, every artefact derived
 /// from the tx is provably unreferenceable on every shard.
-pub const MAX_VALIDITY_RANGE: Duration = Duration::from_secs(5 * 60);
+pub const MAX_VALIDITY_RANGE: Duration = Duration::from_mins(5);
 
 /// Half-open `[start, end)` range of [`WeightedTimestamp`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, BasicSbor)]
 pub struct TimestampRange {
+    /// Inclusive lower bound: a tx is in-range iff `start <= ts`.
     pub start_timestamp_inclusive: WeightedTimestamp,
+    /// Exclusive upper bound: a tx is in-range iff `ts < end`.
     pub end_timestamp_exclusive: WeightedTimestamp,
 }
 
 impl TimestampRange {
+    /// Construct a half-open `[start, end)` range. No validation —
+    /// callers can build malformed (empty/inverted) ranges; use
+    /// [`Self::is_well_formed`] to check.
+    #[must_use]
     pub const fn new(
         start_timestamp_inclusive: WeightedTimestamp,
         end_timestamp_exclusive: WeightedTimestamp,
@@ -49,12 +55,14 @@ impl TimestampRange {
     }
 
     /// True iff `ts` falls inside the half-open range.
+    #[must_use]
     pub fn contains(&self, ts: WeightedTimestamp) -> bool {
         self.start_timestamp_inclusive <= ts && ts < self.end_timestamp_exclusive
     }
 
     /// Range length, saturating at zero. Zero for malformed (empty or
     /// inverted) ranges; well-formed ranges return `end - start`.
+    #[must_use]
     pub fn length(&self) -> Duration {
         self.end_timestamp_exclusive
             .elapsed_since(self.start_timestamp_inclusive)
@@ -64,6 +72,7 @@ impl TimestampRange {
     /// `start < end`, length within cap, and forward edge within cap of
     /// the anchor. The anchor is the parent QC's `weighted_timestamp` —
     /// see the module-level note on the one-block lag.
+    #[must_use]
     pub fn is_well_formed(&self, anchor: WeightedTimestamp) -> bool {
         self.start_timestamp_inclusive < self.end_timestamp_exclusive
             && self.length() <= MAX_VALIDITY_RANGE
@@ -114,7 +123,7 @@ mod tests {
     #[test]
     fn well_formed_within_caps_passes() {
         let anchor = ts(1_000_000);
-        let r = TimestampRange::new(anchor, anchor.plus(Duration::from_secs(60)));
+        let r = TimestampRange::new(anchor, anchor.plus(Duration::from_mins(1)));
         assert!(r.is_well_formed(anchor));
     }
 
@@ -161,7 +170,7 @@ mod tests {
         // A start arbitrarily far in the past pushes range length past the
         // cap even when the forward edge is in budget.
         let anchor = ts(10_000_000);
-        let r = TimestampRange::new(ts(0), anchor.plus(Duration::from_secs(60)));
+        let r = TimestampRange::new(ts(0), anchor.plus(Duration::from_mins(1)));
         assert!(!r.is_well_formed(anchor));
     }
 

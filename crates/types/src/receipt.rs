@@ -4,7 +4,7 @@
 //!
 //! | Tier | Type | Contents | Cross-shard identical? |
 //! |------|------|----------|------------------------|
-//! | **Global** | [`GlobalReceipt`] | outcome + event_root + writes_root | Yes |
+//! | **Global** | [`GlobalReceipt`] | outcome + `event_root` + `writes_root` | Yes |
 //! | **Local** | [`LocalReceipt`] | outcome + shard-filtered state changes + events | No |
 //! | **Output** | [`ExecutionMetadata`] | fees, logs, errors | No |
 //!
@@ -23,7 +23,9 @@ use crate::{
 /// Whether a transaction committed successfully or was rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, sbor::prelude::BasicSbor)]
 pub enum TransactionOutcome {
+    /// Engine committed the transaction; state changes applied.
     Success,
+    /// Engine rejected the transaction; no state changes applied.
     Failure,
 }
 
@@ -43,6 +45,7 @@ pub struct ApplicationEvent {
 
 impl ApplicationEvent {
     /// Compute a deterministic hash of this event.
+    #[must_use]
     pub fn hash(&self) -> Hash {
         Hash::from_parts(&[&self.type_id, &self.data])
     }
@@ -54,6 +57,9 @@ impl ApplicationEvent {
 ///
 /// Cost fields are stored as SBOR-encoded Decimals (raw bytes) to avoid
 /// a direct dependency on the Decimal type in the types crate.
+//
+// Fee fields are SBOR-encoded `Decimal` raw bytes; the field names ARE the documentation.
+#[allow(missing_docs)]
 #[derive(Debug, Clone, PartialEq, Eq, sbor::prelude::BasicSbor)]
 pub struct FeeSummary {
     pub total_execution_cost: Vec<u8>,
@@ -64,7 +70,9 @@ pub struct FeeSummary {
 
 // ─── Logging ─────────────────────────────────────────────────────────────────
 
-/// Log severity level from transaction execution.
+/// Log severity level from transaction execution. Variants follow the
+/// standard `tracing` severity ordering.
+#[allow(missing_docs)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, sbor::prelude::BasicSbor)]
 pub enum LogLevel {
     Error,
@@ -87,6 +95,7 @@ pub enum LogLevel {
 /// Ephemeral — never written to storage, only lives for EC aggregation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, sbor::prelude::BasicSbor)]
 pub struct GlobalReceipt {
+    /// Whether the engine committed or rejected the transaction.
     pub outcome: TransactionOutcome,
     /// Merkle root of application event hashes.
     pub event_root: EventRoot,
@@ -103,6 +112,12 @@ impl GlobalReceipt {
     /// Compute the global receipt hash.
     ///
     /// This is the value signed over in execution votes and stored on certificates.
+    ///
+    /// # Panics
+    ///
+    /// Cannot panic: outcome maps to a fixed-size byte and roots are
+    /// fixed-size hashes.
+    #[must_use]
     pub fn receipt_hash(&self) -> GlobalReceiptHash {
         let outcome_byte = match self.outcome {
             TransactionOutcome::Success => [1u8],
@@ -130,19 +145,27 @@ impl GlobalReceipt {
 /// atomically with block metadata.
 #[derive(Debug, Clone, PartialEq, Eq, sbor::prelude::BasicSbor)]
 pub struct LocalReceipt {
+    /// Whether the engine committed or rejected the transaction.
     pub outcome: TransactionOutcome,
+    /// Shard-filtered substate writes produced by this transaction.
     pub database_updates: DatabaseUpdates,
+    /// Application events emitted during execution.
     pub application_events: Vec<ApplicationEvent>,
 }
 
 impl LocalReceipt {
-    /// Derive the global receipt from this local receipt with pre-computed writes_root.
+    /// Derive the global receipt from this local receipt with pre-computed `writes_root`.
     ///
     /// `writes_root` must be computed separately from unfiltered (global) writes
     /// via `filter_updates_for_global_receipt()`, since this local receipt only
     /// contains shard-filtered writes.
+    #[must_use]
     pub fn global_receipt(&self, writes_root: WritesRoot) -> GlobalReceipt {
-        let event_hashes: Vec<Hash> = self.application_events.iter().map(|e| e.hash()).collect();
+        let event_hashes: Vec<Hash> = self
+            .application_events
+            .iter()
+            .map(ApplicationEvent::hash)
+            .collect();
         GlobalReceipt {
             outcome: self.outcome,
             event_root: EventRoot::from_raw(compute_merkle_root(&event_hashes)),
@@ -151,12 +174,22 @@ impl LocalReceipt {
     }
 
     /// Compute a deterministic hash of this local receipt for `local_receipt_root`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if SBOR encoding of `database_updates` fails — `DatabaseUpdates`
+    /// is a closed SBOR type and encoding is infallible in practice.
+    #[must_use]
     pub fn receipt_hash(&self) -> Hash {
         let outcome_byte = match self.outcome {
             TransactionOutcome::Success => [1u8],
             TransactionOutcome::Failure => [0u8],
         };
-        let event_hashes: Vec<Hash> = self.application_events.iter().map(|e| e.hash()).collect();
+        let event_hashes: Vec<Hash> = self
+            .application_events
+            .iter()
+            .map(ApplicationEvent::hash)
+            .collect();
         let event_root = compute_merkle_root(&event_hashes);
         // Include database_updates hash so local_receipt_root commits to per-tx state deltas.
         let updates_bytes =
@@ -170,6 +203,7 @@ impl LocalReceipt {
     }
 
     /// Create a failure receipt with no database updates or events.
+    #[must_use]
     pub fn failure() -> Self {
         Self {
             outcome: TransactionOutcome::Failure,
@@ -187,16 +221,20 @@ impl LocalReceipt {
 /// transaction locally (not available for synced receipts).
 ///
 /// Written atomically with block commit but on a separate pruning cycle
-/// (can be pruned earlier than LocalReceipts since not needed for state verification).
+/// (can be pruned earlier than `LocalReceipts` since not needed for state verification).
 #[derive(Debug, Clone, PartialEq, Eq, sbor::prelude::BasicSbor)]
 pub struct ExecutionMetadata {
+    /// Fee breakdown reported by the engine.
     pub fee_summary: FeeSummary,
+    /// Engine log lines emitted during execution.
     pub log_messages: Vec<(LogLevel, String)>,
+    /// Engine error message when `outcome == Failure`.
     pub error_message: Option<String>,
 }
 
 impl ExecutionMetadata {
     /// Create a failure execution output.
+    #[must_use]
     pub fn failure(error: Option<String>) -> Self {
         Self {
             fee_summary: FeeSummary {
@@ -218,7 +256,9 @@ impl ExecutionMetadata {
 /// `execution_output` is `None` when the receipt was fetched from a peer (sync/catch-up).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReceiptBundle {
+    /// Hash of the executed transaction this bundle belongs to.
     pub tx_hash: TxHash,
+    /// Per-shard receipt produced by execution.
     pub local_receipt: Arc<LocalReceipt>,
     /// Only populated when this node executed the transaction locally.
     pub execution_output: Option<ExecutionMetadata>,
@@ -286,20 +326,20 @@ impl sbor::Describe<sbor::NoCustomTypeKind> for ReceiptBundle {
 
 // ─── Execution Result ────────────────────────────────────────────────────
 
-/// Execution output that travels alongside an ExecutionVote through the
-/// ProtocolEvent boundary from the thread pool to the state machine.
+/// Execution output that travels alongside an `ExecutionVote` through the
+/// `ProtocolEvent` boundary from the thread pool to the state machine.
 ///
 /// Separate from `SingleTxResult` (engine-internal) because `success` and
 /// `error` are not needed past the vote-signing boundary — the state machine
 /// determines outcome from the receipt's `outcome` field instead.
 ///
 /// The state machine holds receipts in-memory until block commit.
-/// DatabaseUpdates are on the local receipt.
+/// `DatabaseUpdates` are on the local receipt.
 #[derive(Debug, Clone)]
 pub struct LocalExecutionEntry {
     /// Hash of the executed transaction.
     pub tx_hash: TxHash,
-    /// Pre-computed global receipt hash (outcome + event_root + writes_root).
+    /// Pre-computed global receipt hash (outcome + `event_root` + `writes_root`).
     /// Computed on the execution thread pool to avoid recomputation on the state machine.
     pub receipt_hash: GlobalReceiptHash,
     /// Full local receipt with shard-filtered database updates and events.
@@ -344,7 +384,7 @@ mod tests {
         let global = receipt.global_receipt(WritesRoot::ZERO);
         assert_eq!(global.outcome, TransactionOutcome::Success);
 
-        let event_hashes: Vec<Hash> = events.iter().map(|e| e.hash()).collect();
+        let event_hashes: Vec<Hash> = events.iter().map(super::ApplicationEvent::hash).collect();
         let expected_root = EventRoot::from_raw(compute_merkle_root(&event_hashes));
         assert_eq!(global.event_root, expected_root);
     }

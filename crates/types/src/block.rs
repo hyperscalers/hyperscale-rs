@@ -1,4 +1,4 @@
-//! Block and BlockHeader types for consensus.
+//! Block and `BlockHeader` types for consensus.
 
 #[cfg(test)]
 use crate::GlobalReceiptHash;
@@ -18,6 +18,7 @@ use std::sync::Arc;
 ///
 /// Each underlying wave certificate's `receipt_hash` becomes a leaf.
 /// Returns `Hash::ZERO` if there are no certificates.
+#[must_use]
 pub fn compute_certificate_root(certificates: &[Arc<FinalizedWave>]) -> CertificateRoot {
     if certificates.is_empty() {
         return CertificateRoot::ZERO;
@@ -32,10 +33,11 @@ pub fn compute_certificate_root(certificates: &[Arc<FinalizedWave>]) -> Certific
 
 /// Compute the local receipt merkle root for a block's receipts.
 ///
-/// Each receipt's `receipt_hash()` (includes outcome + events + database_updates)
+/// Each receipt's `receipt_hash()` (includes outcome + events + `database_updates`)
 /// becomes a leaf. Receipts are sorted by `tx_hash` before computing the root
-/// to ensure determinism regardless of collection order (e.g. HashMap iteration).
+/// to ensure determinism regardless of collection order (e.g. `HashMap` iteration).
 /// Returns `Hash::ZERO` if there are no receipts.
+#[must_use]
 pub fn compute_local_receipt_root(receipts: &[ReceiptBundle]) -> LocalReceiptRoot {
     if receipts.is_empty() {
         return LocalReceiptRoot::ZERO;
@@ -58,6 +60,7 @@ pub fn compute_local_receipt_root(receipts: &[ReceiptBundle]) -> LocalReceiptRoo
 /// Compute the provisions merkle root for a block.
 ///
 /// Each provisions' hash becomes a leaf. Returns `Hash::ZERO` if empty.
+#[must_use]
 pub fn compute_provision_root(batch_hashes: &[Hash]) -> ProvisionsRoot {
     if batch_hashes.is_empty() {
         return ProvisionsRoot::ZERO;
@@ -133,7 +136,7 @@ pub struct BlockHeader {
 
     /// Merkle root of all certificate receipt hashes in this block.
     ///
-    /// Each certificate's `receipt_hash` (hash of outcome + event_root) is a leaf
+    /// Each certificate's `receipt_hash` (hash of outcome + `event_root`) is a leaf
     /// in a binary merkle tree. This enables light-client proof of "did transaction
     /// X succeed/fail in block N?" without replaying the block.
     ///
@@ -143,7 +146,7 @@ pub struct BlockHeader {
     /// Merkle root of per-tx `LocalReceipt` hashes for all transactions
     /// covered by this block's wave certificates.
     ///
-    /// Commits to the specific per-tx state deltas (shard-filtered DatabaseUpdates)
+    /// Commits to the specific per-tx state deltas (shard-filtered `DatabaseUpdates`)
     /// that were applied to produce `state_root`. Enables per-tx delta attribution
     /// and receipt integrity verification by sync nodes.
     ///
@@ -200,6 +203,7 @@ pub struct BlockHeader {
 
 impl BlockHeader {
     /// Create a genesis block header (height 0) with the given proposer and JMT state.
+    #[must_use]
     pub fn genesis(
         shard_group_id: ShardGroupId,
         proposer: ValidatorId,
@@ -228,6 +232,7 @@ impl BlockHeader {
     /// Derive provision targets from waves (union of all shards across all waves).
     ///
     /// Returns the sorted set of all remote shards that need provisions from this block.
+    #[must_use]
     pub fn provision_targets(&self) -> Vec<ShardGroupId> {
         let mut set = std::collections::BTreeSet::new();
         for wave in &self.waves {
@@ -237,17 +242,25 @@ impl BlockHeader {
     }
 
     /// Compute hash of this block header.
+    ///
+    /// # Panics
+    ///
+    /// Panics if SBOR encoding fails — `BlockHeader` is a closed SBOR
+    /// type and encoding is infallible in practice.
+    #[must_use]
     pub fn hash(&self) -> BlockHash {
         let bytes = basic_encode(self).expect("BlockHeader serialization should never fail");
         BlockHash::from_raw(Hash::from_bytes(&bytes))
     }
 
     /// Check if this is the genesis block header.
+    #[must_use]
     pub fn is_genesis(&self) -> bool {
         self.height.0 == 0
     }
 
     /// Get the expected proposer for this height (round-robin).
+    #[must_use]
     pub fn expected_proposer(&self, num_validators: u64) -> ValidatorId {
         ValidatorId((self.height.0 + self.round.0) % num_validators)
     }
@@ -270,15 +283,24 @@ impl BlockHeader {
 /// modulo the provision payload.
 #[derive(Debug, Clone)]
 pub enum Block {
+    /// Block within its cross-shard execution window — carries provisions.
     Live {
+        /// Block header (contains all merkle roots).
         header: BlockHeader,
+        /// Transactions in this block, sorted by hash.
         transactions: Vec<Arc<RoutableTransaction>>,
+        /// Wave certificates finalized in this block.
         certificates: Vec<Arc<FinalizedWave>>,
+        /// Provisions needed to execute cross-shard waves locally.
         provisions: Vec<Arc<Provisions>>,
     },
+    /// Block past its execution window — provisions dropped.
     Sealed {
+        /// Block header (contains all merkle roots).
         header: BlockHeader,
+        /// Transactions in this block, sorted by hash.
         transactions: Vec<Arc<RoutableTransaction>>,
+        /// Wave certificates finalized in this block.
         certificates: Vec<Arc<FinalizedWave>>,
     },
 }
@@ -502,6 +524,7 @@ impl Block {
     ///
     /// Genesis is born `Live` with no provisions — the temporality machinery
     /// activates only once there are cross-shard waves in flight.
+    #[must_use]
     pub fn genesis(
         shard_group_id: ShardGroupId,
         proposer: ValidatorId,
@@ -516,6 +539,7 @@ impl Block {
     }
 
     /// Block header — present in both variants.
+    #[must_use]
     pub fn header(&self) -> &BlockHeader {
         match self {
             Block::Live { header, .. } | Block::Sealed { header, .. } => header,
@@ -523,6 +547,7 @@ impl Block {
     }
 
     /// Transactions in the block — present in both variants.
+    #[must_use]
     pub fn transactions(&self) -> &[Arc<RoutableTransaction>] {
         match self {
             Block::Live { transactions, .. } | Block::Sealed { transactions, .. } => transactions,
@@ -530,6 +555,7 @@ impl Block {
     }
 
     /// Finalized waves (certificates) in the block — present in both variants.
+    #[must_use]
     pub fn certificates(&self) -> &[Arc<FinalizedWave>] {
         match self {
             Block::Live { certificates, .. } | Block::Sealed { certificates, .. } => certificates,
@@ -540,6 +566,7 @@ impl Block {
     /// dropped their provisions because the cross-shard execution window
     /// they served has passed. Use `is_live()` when the variant itself
     /// matters — this accessor flattens both cases to a slice.
+    #[must_use]
     pub fn provisions(&self) -> &[Arc<Provisions>] {
         match self {
             Block::Live { provisions, .. } => provisions,
@@ -548,6 +575,7 @@ impl Block {
     }
 
     /// True if this block is still in its `Live` variant.
+    #[must_use]
     pub fn is_live(&self) -> bool {
         matches!(self, Block::Live { .. })
     }
@@ -556,6 +584,7 @@ impl Block {
     /// sealed block. This is the canonical persisted shape; sync-serving
     /// glue re-attaches provisions (via `into_live`) when the requester
     /// needs them.
+    #[must_use]
     pub fn into_sealed(self) -> Block {
         match self {
             Block::Live {
@@ -574,8 +603,13 @@ impl Block {
 
     /// Attach provisions, promoting `Sealed` → `Live`. Used by sync-serving
     /// to upgrade a persisted block when the requester is still inside the
-    /// cross-shard execution window. Panics if invoked on a `Live` block —
-    /// that would silently discard the existing provision set.
+    /// cross-shard execution window.
+    ///
+    /// # Panics
+    ///
+    /// Panics if invoked on a `Live` block — that would silently discard
+    /// the existing provision set.
+    #[must_use]
     pub fn into_live(self, provisions: Vec<Arc<Provisions>>) -> Block {
         match self {
             Block::Sealed {
@@ -595,36 +629,43 @@ impl Block {
     }
 
     /// Compute hash of this block (hashes the header).
+    #[must_use]
     pub fn hash(&self) -> BlockHash {
         self.header().hash()
     }
 
     /// Get block height.
+    #[must_use]
     pub fn height(&self) -> BlockHeight {
         self.header().height
     }
 
     /// Get total number of transactions.
+    #[must_use]
     pub fn transaction_count(&self) -> usize {
         self.transactions().len()
     }
 
     /// Check if this block contains a specific transaction by hash.
+    #[must_use]
     pub fn contains_transaction(&self, tx_hash: &TxHash) -> bool {
         self.transactions().iter().any(|tx| tx.hash() == *tx_hash)
     }
 
     /// Get all transaction hashes.
+    #[must_use]
     pub fn transaction_hashes(&self) -> Vec<TxHash> {
         self.transactions().iter().map(|tx| tx.hash()).collect()
     }
 
     /// Check if this is the genesis block.
+    #[must_use]
     pub fn is_genesis(&self) -> bool {
         self.header().is_genesis()
     }
 
     /// Get number of wave certificates in this block.
+    #[must_use]
     pub fn certificate_count(&self) -> usize {
         self.certificates().len()
     }
@@ -644,7 +685,7 @@ pub struct BlockManifest {
     /// Transaction hashes in block order.
     pub tx_hashes: Vec<TxHash>,
 
-    /// Certificate hashes (wave_id hashes) in block order.
+    /// Certificate hashes (`wave_id` hashes) in block order.
     /// Validators use these to match against their locally finalized waves.
     pub cert_hashes: Vec<WaveIdHash>,
 
@@ -655,13 +696,15 @@ pub struct BlockManifest {
 
 impl BlockManifest {
     /// Get total transaction count.
+    #[must_use]
     pub fn transaction_count(&self) -> usize {
         self.tx_hashes.len()
     }
 
     /// Build a manifest from a full block (extracting hashes).
     ///
-    /// `cert_hashes` uses wave_id identity hashes (computable without EC knowledge).
+    /// `cert_hashes` uses `wave_id` identity hashes (computable without EC knowledge).
+    #[must_use]
     pub fn from_block(block: &Block) -> Self {
         Self {
             tx_hashes: block.transactions().iter().map(|tx| tx.hash()).collect(),
@@ -688,8 +731,8 @@ impl BlockManifest {
 /// # Storage Layout
 ///
 /// - `"blocks"` CF: `BlockMetadata` (this struct) keyed by height
-/// - `"transactions"` CF: `RoutableTransaction` keyed by tx_hash
-/// - `"wave_certificates"` CF: `WaveCertificate` keyed by wave_id hash
+/// - `"transactions"` CF: `RoutableTransaction` keyed by `tx_hash`
+/// - `"wave_certificates"` CF: `WaveCertificate` keyed by `wave_id` hash
 ///
 /// To reconstruct a full `Block`, fetch the metadata, then batch-fetch
 /// transactions and certificates using the stored hashes.
@@ -707,6 +750,7 @@ pub struct BlockMetadata {
 
 impl BlockMetadata {
     /// Create metadata from a full block and QC.
+    #[must_use]
     pub fn from_block(block: &Block, qc: QuorumCertificate) -> Self {
         Self {
             header: block.header().clone(),
@@ -716,16 +760,19 @@ impl BlockMetadata {
     }
 
     /// Get block height.
+    #[must_use]
     pub fn height(&self) -> BlockHeight {
         self.header.height
     }
 
     /// Compute hash of this block (hashes the header).
+    #[must_use]
     pub fn hash(&self) -> BlockHash {
         self.header.hash()
     }
 
     /// Get total transaction count.
+    #[must_use]
     pub fn transaction_count(&self) -> usize {
         self.manifest.transaction_count()
     }
@@ -752,26 +799,31 @@ pub struct CommittedBlockHeader {
 
 impl CommittedBlockHeader {
     /// Create a new committed block header.
+    #[must_use]
     pub fn new(header: BlockHeader, qc: QuorumCertificate) -> Self {
         Self { header, qc }
     }
 
     /// Compute the block hash (hashes the header).
+    #[must_use]
     pub fn block_hash(&self) -> BlockHash {
         self.header.hash()
     }
 
     /// Get the block height.
+    #[must_use]
     pub fn height(&self) -> BlockHeight {
         self.header.height
     }
 
     /// Get the shard group this block belongs to.
+    #[must_use]
     pub fn shard_group_id(&self) -> ShardGroupId {
         self.header.shard_group_id
     }
 
     /// Get the state root committed by this block.
+    #[must_use]
     pub fn state_root(&self) -> StateRoot {
         self.header.state_root
     }
@@ -789,7 +841,7 @@ mod tests {
             parent_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(0),
-            timestamp: ProposerTimestamp(1234567890),
+            timestamp: ProposerTimestamp(1_234_567_890),
             round: Round::INITIAL,
             is_fallback: false,
             state_root: StateRoot::ZERO,
@@ -970,6 +1022,7 @@ pub struct BlockVote {
 
 impl BlockVote {
     /// Create a new block vote with domain-separated signing.
+    #[must_use]
     pub fn new(
         block_hash: BlockHash,
         shard_group_id: ShardGroupId,
@@ -996,6 +1049,7 @@ impl BlockVote {
     ///
     /// Uses `DOMAIN_BLOCK_VOTE` tag for domain separation.
     /// This is the same message used for QC aggregated signature verification.
+    #[must_use]
     pub fn signing_message(&self) -> Vec<u8> {
         block_vote_message(
             self.shard_group_id,

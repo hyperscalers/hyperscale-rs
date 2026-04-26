@@ -43,12 +43,14 @@ impl WeightedTimestamp {
 
     /// Wrap a raw ms value. Prefer
     /// [`QuorumCertificate::weighted_timestamp`] at produce sites.
+    #[must_use]
     pub const fn from_millis(ms: u64) -> Self {
         WeightedTimestamp(ms)
     }
 
     /// Raw ms value — use sparingly, only at serialization / FFI boundaries
     /// (log fields, metrics, wire format that hasn't been migrated yet).
+    #[must_use]
     pub const fn as_millis(self) -> u64 {
         self.0
     }
@@ -57,11 +59,13 @@ impl WeightedTimestamp {
     ///
     /// Reads as "how long after `earlier` was `self` produced". Used for
     /// deadline checks like `committed.elapsed_since(wave_start) >= WAVE_TIMEOUT`.
+    #[must_use]
     pub fn elapsed_since(self, earlier: Self) -> Duration {
         Duration::from_millis(self.0.saturating_sub(earlier.0))
     }
 
     /// Return `self + duration`, saturating on overflow.
+    #[must_use]
     pub fn plus(self, duration: Duration) -> Self {
         let add = duration.as_millis().try_into().unwrap_or(u64::MAX);
         WeightedTimestamp(self.0.saturating_add(add))
@@ -71,6 +75,7 @@ impl WeightedTimestamp {
     ///
     /// Used for cutoff computations: `committed.minus(retention)` gives the
     /// lower edge of the retention window.
+    #[must_use]
     pub fn minus(self, duration: Duration) -> Self {
         let sub = duration.as_millis().try_into().unwrap_or(u64::MAX);
         WeightedTimestamp(self.0.saturating_sub(sub))
@@ -110,6 +115,7 @@ impl ProposerTimestamp {
 
     /// Wrap a raw ms value — callers must be producing a proposer wall-clock,
     /// not a derived / authenticated value.
+    #[must_use]
     pub const fn from_millis(ms: u64) -> Self {
         ProposerTimestamp(ms)
     }
@@ -120,11 +126,13 @@ impl ProposerTimestamp {
     /// stake-weighted aggregation will later combine 2f+1 of them into a
     /// `WeightedTimestamp`. No other `LocalTimestamp` → `ProposerTimestamp`
     /// path exists.
+    #[must_use]
     pub const fn from_local(local: LocalTimestamp) -> Self {
         ProposerTimestamp(local.as_millis())
     }
 
     /// Raw ms value — use at serialization / metrics boundaries only.
+    #[must_use]
     pub const fn as_millis(self) -> u64 {
         self.0
     }
@@ -138,14 +146,14 @@ impl fmt::Display for ProposerTimestamp {
 
 /// Single-validator monotonic wall-clock timestamp in milliseconds.
 ///
-/// Minted by the IO boundary (production io_loop or simulator driver) and
+/// Minted by the IO boundary (production `io_loop` or simulator driver) and
 /// fed into state machines via `StateMachine::set_time`. Anchors view-change
 /// timers, IO retry backoff, and the proposer-skew check on incoming
 /// headers — every use case where the question is "how much local
 /// wall-clock has passed?", not "what time do all validators agree it is?".
 ///
 /// Constructed once-per-process from `(SystemTime::now(), Instant::now())`
-/// at io_loop init: every subsequent `LocalTimestamp::now()` reads as
+/// at `io_loop` init: every subsequent `LocalTimestamp::now()` reads as
 /// `origin_system_ms + (Instant::now() - origin_instant)`. This gives ms
 /// values comparable in unit (and roughly in epoch) with `WeightedTimestamp`
 /// and `ProposerTimestamp` while preserving `Instant`-grade monotonicity
@@ -163,8 +171,9 @@ impl LocalTimestamp {
     pub const ZERO: Self = LocalTimestamp(0);
 
     /// Wrap a raw ms value. Production callers should mint via the
-    /// io_loop's clock origin; tests and simulator drivers may use this
+    /// `io_loop`'s clock origin; tests and simulator drivers may use this
     /// directly.
+    #[must_use]
     pub const fn from_millis(ms: u64) -> Self {
         LocalTimestamp(ms)
     }
@@ -172,6 +181,7 @@ impl LocalTimestamp {
     /// Raw ms value — use at the proposer-skew boundary (where it's
     /// compared against `ProposerTimestamp::as_millis()`) or at metrics
     /// emission. Never feed this into a `WeightedTimestamp` constructor.
+    #[must_use]
     pub const fn as_millis(self) -> u64 {
         self.0
     }
@@ -181,6 +191,7 @@ impl LocalTimestamp {
     /// Reads as "how long after `earlier` was `self` produced". Used for
     /// view-change deadline checks like
     /// `now.elapsed_since(last_leader_activity) >= timeout`.
+    #[must_use]
     pub fn elapsed_since(self, earlier: Self) -> Duration {
         Duration::from_millis(self.0.saturating_sub(earlier.0))
     }
@@ -188,17 +199,20 @@ impl LocalTimestamp {
     /// Saturating subtraction returning a `Duration`. Equivalent to
     /// `elapsed_since` but reads naturally at sites that frame the
     /// computation as "now minus origin".
+    #[must_use]
     pub fn saturating_sub(self, earlier: Self) -> Duration {
         Duration::from_millis(self.0.saturating_sub(earlier.0))
     }
 
     /// Return `self + duration`, saturating on overflow.
+    #[must_use]
     pub fn plus(self, duration: Duration) -> Self {
         let add = duration.as_millis().try_into().unwrap_or(u64::MAX);
         LocalTimestamp(self.0.saturating_add(add))
     }
 
     /// Return `self - duration`, saturating at zero.
+    #[must_use]
     pub fn minus(self, duration: Duration) -> Self {
         let sub = duration.as_millis().try_into().unwrap_or(u64::MAX);
         LocalTimestamp(self.0.saturating_sub(sub))
@@ -219,7 +233,7 @@ mod tests {
     fn elapsed_since_saturates_at_zero() {
         let a = WeightedTimestamp(1_000);
         let b = WeightedTimestamp(3_000);
-        assert_eq!(b.elapsed_since(a), Duration::from_millis(2_000));
+        assert_eq!(b.elapsed_since(a), Duration::from_secs(2));
         assert_eq!(a.elapsed_since(b), Duration::ZERO);
     }
 
@@ -240,7 +254,7 @@ mod tests {
     fn local_elapsed_since_saturates_at_zero() {
         let a = LocalTimestamp(1_000);
         let b = LocalTimestamp(3_000);
-        assert_eq!(b.elapsed_since(a), Duration::from_millis(2_000));
+        assert_eq!(b.elapsed_since(a), Duration::from_secs(2));
         assert_eq!(a.elapsed_since(b), Duration::ZERO);
     }
 

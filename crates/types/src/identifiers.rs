@@ -35,11 +35,13 @@ impl BlockHeight {
     pub const GENESIS: Self = BlockHeight(0);
 
     /// Get the next block height.
+    #[must_use]
     pub fn next(self) -> Self {
         BlockHeight(self.0 + 1)
     }
 
     /// Get the previous block height (returns None if at genesis).
+    #[must_use]
     pub fn prev(self) -> Option<Self> {
         if self.0 > 0 {
             Some(BlockHeight(self.0 - 1))
@@ -49,11 +51,13 @@ impl BlockHeight {
     }
 
     /// Saturating subtraction by a raw offset.
+    #[must_use]
     pub fn saturating_sub(self, rhs: u64) -> Self {
         BlockHeight(self.0.saturating_sub(rhs))
     }
 
     /// Little-endian byte representation of the inner value.
+    #[must_use]
     pub fn to_le_bytes(self) -> [u8; 8] {
         self.0.to_le_bytes()
     }
@@ -102,16 +106,19 @@ impl Round {
     pub const INITIAL: Self = Round(0);
 
     /// Get the next round.
+    #[must_use]
     pub fn next(self) -> Self {
         Round(self.0 + 1)
     }
 
     /// Saturating subtraction by a raw offset.
+    #[must_use]
     pub fn saturating_sub(self, rhs: u64) -> Self {
         Round(self.0.saturating_sub(rhs))
     }
 
     /// Little-endian byte representation of the inner value.
+    #[must_use]
     pub fn to_le_bytes(self) -> [u8; 8] {
         self.0.to_le_bytes()
     }
@@ -160,11 +167,13 @@ impl Attempt {
     pub const INITIAL: Self = Attempt(0);
 
     /// Get the next attempt.
+    #[must_use]
     pub fn next(self) -> Self {
         Attempt(self.0 + 1)
     }
 
     /// Little-endian byte representation of the inner value.
+    #[must_use]
     pub fn to_le_bytes(self) -> [u8; 4] {
         self.0.to_le_bytes()
     }
@@ -206,21 +215,25 @@ impl VotePower {
     pub const MIN: Self = VotePower(1);
 
     /// Create from u64, ensuring it's at least 1.
+    #[must_use]
     pub fn new(power: u64) -> Self {
         VotePower(power.max(1))
     }
 
     /// Get the raw value.
+    #[must_use]
     pub fn get(&self) -> u64 {
         self.0
     }
 
     /// Calculate total vote power from a list.
+    #[must_use]
     pub fn sum(powers: &[VotePower]) -> u64 {
         powers.iter().map(|p| p.0).sum()
     }
 
     /// Calculate if we have 2f+1 quorum (>2/3 of total).
+    #[must_use]
     pub fn has_quorum(voted: u64, total: u64) -> bool {
         voted * 3 > total * 2
     }
@@ -240,11 +253,12 @@ impl fmt::Display for VotePower {
 pub struct NodeId(pub [u8; 30]);
 
 impl NodeId {
-    /// Create a NodeId from bytes.
+    /// Create a `NodeId` from bytes.
     ///
     /// # Panics
     ///
     /// Panics if bytes length is not exactly 30.
+    #[must_use]
     pub fn from_bytes(bytes: &[u8]) -> Self {
         assert_eq!(bytes.len(), 30, "NodeId must be exactly 30 bytes");
         let mut arr = [0u8; 30];
@@ -253,6 +267,7 @@ impl NodeId {
     }
 
     /// Get the bytes as a slice.
+    #[must_use]
     pub fn as_bytes(&self) -> &[u8; 30] {
         &self.0
     }
@@ -271,6 +286,7 @@ pub struct PartitionNumber(pub u8);
 
 impl PartitionNumber {
     /// Create a new partition number.
+    #[must_use]
     pub fn new(n: u8) -> Self {
         Self(n)
     }

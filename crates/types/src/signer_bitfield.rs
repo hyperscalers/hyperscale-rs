@@ -4,7 +4,7 @@ use sbor::prelude::*;
 
 /// A compact bitfield representing which validators have signed.
 ///
-/// Used in QuorumCertificate and other aggregated structures to track
+/// Used in `QuorumCertificate` and other aggregated structures to track
 /// which validators contributed to the aggregated signature.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct SignerBitfield {
@@ -16,6 +16,7 @@ pub struct SignerBitfield {
 
 impl SignerBitfield {
     /// Create a new empty bitfield for the given number of validators.
+    #[must_use]
     pub fn new(num_validators: usize) -> Self {
         let num_bytes = num_validators.div_ceil(8);
         Self {
@@ -25,6 +26,7 @@ impl SignerBitfield {
     }
 
     /// Create an empty bitfield (for genesis).
+    #[must_use]
     pub fn empty() -> Self {
         Self {
             bits: Vec::new(),
@@ -51,6 +53,7 @@ impl SignerBitfield {
     }
 
     /// Check if a bit is set.
+    #[must_use]
     pub fn is_set(&self, index: usize) -> bool {
         if index >= self.num_validators {
             return false;
@@ -64,16 +67,19 @@ impl SignerBitfield {
     }
 
     /// Count the number of set bits.
+    #[must_use]
     pub fn count_ones(&self) -> usize {
         self.bits.iter().map(|b| b.count_ones() as usize).sum()
     }
 
-    /// Count the number of set bits (alias for count_ones).
+    /// Count the number of set bits (alias for `count_ones`).
+    #[must_use]
     pub fn count(&self) -> usize {
         self.count_ones()
     }
 
     /// Get the number of validators this bitfield can represent.
+    #[must_use]
     pub fn num_validators(&self) -> usize {
         self.num_validators
     }
@@ -84,6 +90,7 @@ impl SignerBitfield {
     }
 
     /// Check if the bitfield is empty (no bits set).
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.bits.iter().all(|&b| b == 0)
     }

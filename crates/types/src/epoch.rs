@@ -18,11 +18,13 @@ impl EpochId {
     pub const GENESIS: Self = EpochId(0);
 
     /// Get the next epoch.
+    #[must_use]
     pub fn next(self) -> Self {
         EpochId(self.0 + 1)
     }
 
     /// Get the previous epoch (returns None if at genesis).
+    #[must_use]
     pub fn prev(self) -> Option<Self> {
         if self.0 > 0 {
             Some(EpochId(self.0 - 1))
@@ -94,12 +96,13 @@ impl Default for ValidatorRating {
 
 impl ValidatorRating {
     /// Create a new rating with default score.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Update rating based on epoch performance using EMA with 0.9 decay.
-    /// new_rating = (current * 0.9) + (epoch_performance * 0.1)
+    /// `new_rating` = (current * 0.9) + (`epoch_performance` * 0.1)
     pub fn update_with_epoch_performance(&mut self, epoch_performance: u64) {
         // EMA: new = old * 0.9 + new * 0.1
         // Using integer math: new = (old * 9 + new) / 10
@@ -127,11 +130,17 @@ impl ValidatorRating {
 /// Extended validator info for global consensus.
 #[derive(Debug, Clone, BasicSbor)]
 pub struct GlobalValidatorInfo {
+    /// Globally unique validator identifier.
     pub validator_id: ValidatorId,
+    /// BLS public key for vote verification.
     pub public_key: Bls12381G1PublicKey,
+    /// Voting weight for this validator.
     pub voting_power: u64,
+    /// Performance score driving shard reassignment.
     pub rating: ValidatorRating,
+    /// Shard the validator is currently committee-member of.
     pub current_shard: ShardGroupId,
+    /// Lifecycle state within `current_shard` (Active / Waiting / etc.).
     pub state: ValidatorShardState,
     /// How many epochs this validator has been active in current shard.
     pub epochs_in_shard: u64,
@@ -139,6 +148,7 @@ pub struct GlobalValidatorInfo {
 
 impl GlobalValidatorInfo {
     /// Create new global validator info.
+    #[must_use]
     pub fn new(
         validator_id: ValidatorId,
         public_key: Bls12381G1PublicKey,
@@ -157,11 +167,13 @@ impl GlobalValidatorInfo {
     }
 
     /// Check if this validator can participate in consensus.
+    #[must_use]
     pub fn can_participate(&self) -> bool {
         matches!(self.state, ValidatorShardState::Active)
     }
 
     /// Check if this validator is eligible for shuffling.
+    #[must_use]
     pub fn is_shuffle_eligible(&self, min_epochs: u64) -> bool {
         self.state == ValidatorShardState::Active && self.epochs_in_shard >= min_epochs
     }
@@ -182,6 +194,7 @@ pub struct ShardCommitteeConfig {
 
 impl ShardCommitteeConfig {
     /// Create a new shard committee config.
+    #[must_use]
     pub fn new(validators: Vec<ValidatorId>, voting_powers: &HashMap<ValidatorId, u64>) -> Self {
         let total_voting_power = validators.iter().filter_map(|v| voting_powers.get(v)).sum();
         Self {
@@ -192,6 +205,7 @@ impl ShardCommitteeConfig {
     }
 
     /// Check if this committee has enough validators for BFT.
+    #[must_use]
     pub fn has_minimum_validators(&self, min: usize) -> bool {
         self.active_validators.len() >= min
     }
@@ -207,7 +221,7 @@ pub struct EpochConfig {
     pub num_shards: u64,
 
     /// Shard committee assignments.
-    /// Maps ShardGroupId -> ordered list of validators in that shard.
+    /// Maps `ShardGroupId` -> ordered list of validators in that shard.
     pub shard_committees: HashMap<ShardGroupId, ShardCommitteeConfig>,
 
     /// Validators in the "waiting" state (syncing to new shard).
@@ -224,12 +238,13 @@ pub struct EpochConfig {
     /// First shard-level block height of this epoch (per shard).
     pub start_heights: HashMap<ShardGroupId, BlockHeight>,
 
-    /// Expected end heights (start + EPOCH_LENGTH).
+    /// Expected end heights (start + `EPOCH_LENGTH`).
     pub expected_end_heights: HashMap<ShardGroupId, BlockHeight>,
 }
 
 impl EpochConfig {
     /// Create a genesis epoch configuration.
+    #[must_use]
     pub fn genesis(num_shards: u64, validator_set: ValidatorSet) -> Self {
         let mut shard_committees = HashMap::new();
         let mut start_heights = HashMap::new();
@@ -277,6 +292,7 @@ impl EpochConfig {
     }
 
     /// Find which shard a validator belongs to (returns None if not found).
+    #[must_use]
     pub fn find_validator_shard(&self, validator_id: ValidatorId) -> Option<ShardGroupId> {
         for (shard, committee) in &self.shard_committees {
             if committee.active_validators.contains(&validator_id) {
@@ -293,19 +309,21 @@ impl EpochConfig {
     }
 
     /// Check if a validator is in waiting state for a shard.
+    #[must_use]
     pub fn is_validator_waiting(&self, validator_id: ValidatorId, shard: ShardGroupId) -> bool {
         self.waiting_validators
             .get(&shard)
-            .map(|waiting| waiting.contains(&validator_id))
-            .unwrap_or(false)
+            .is_some_and(|waiting| waiting.contains(&validator_id))
     }
 
     /// Get the committee for a shard.
+    #[must_use]
     pub fn committee_for_shard(&self, shard: ShardGroupId) -> Option<&ShardCommitteeConfig> {
         self.shard_committees.get(&shard)
     }
 
-    /// Determine which shard a NodeId belongs to (hash-modulo).
+    /// Determine which shard a `NodeId` belongs to (hash-modulo).
+    #[must_use]
     pub fn shard_for_node_id(&self, node_id: &crate::NodeId) -> ShardGroupId {
         crate::shard_for_node(node_id, self.num_shards)
     }
@@ -345,8 +363,10 @@ impl Default for GlobalConsensusConfig {
 
 impl GlobalConsensusConfig {
     /// Calculate how many validators to shuffle given a committee size.
+    #[must_use]
     pub fn shuffle_count(&self, committee_size: usize) -> usize {
-        (committee_size * self.shuffle_percentage as usize / 100).max(1)
+        let pct = usize::try_from(self.shuffle_percentage).unwrap_or(usize::MAX);
+        (committee_size * pct / 100).max(1)
     }
 }
 

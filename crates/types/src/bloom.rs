@@ -58,6 +58,7 @@ impl<T> BloomFilter<T> {
     /// Returns `None` if the required bit count exceeds [`MAX_BITS`].
     ///
     /// `n == 0` yields a minimal one-word filter that never matches.
+    #[must_use]
     pub fn with_capacity(n: usize, fpr: f64) -> Option<Self> {
         let (m_bits, k) = size_for(n, fpr)?;
         let words = m_bits.div_ceil(64);
@@ -70,6 +71,7 @@ impl<T> BloomFilter<T> {
 
     /// Construct an empty filter that never matches. Wire-cheapest form;
     /// callers use this when they have nothing to declare as "already have."
+    #[must_use]
     pub fn empty() -> Self {
         Self {
             bits: vec![0u64; 1],
@@ -79,11 +81,13 @@ impl<T> BloomFilter<T> {
     }
 
     /// Number of bits in the backing array. Always a multiple of 64.
+    #[must_use]
     pub fn bit_len(&self) -> usize {
         self.bits.len() * 64
     }
 
     /// Number of hash probes per item.
+    #[must_use]
     pub fn k(&self) -> u8 {
         self.k
     }
@@ -91,6 +95,7 @@ impl<T> BloomFilter<T> {
     /// Whether the filter has any bits set. A freshly-constructed
     /// [`BloomFilter::empty`] or [`BloomFilter::with_capacity`] filter
     /// returns `true`.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.bits.iter().all(|&w| w == 0)
     }
@@ -102,7 +107,7 @@ impl<T: TypedHash> BloomFilter<T> {
     pub fn insert(&mut self, item: &T) {
         let (h1, h2) = split_hash(item);
         let m = self.bit_len() as u64;
-        for i in 0..self.k as u64 {
+        for i in 0..u64::from(self.k) {
             let bit = probe(h1, h2, i, m);
             let word = (bit / 64) as usize;
             let off = bit % 64;
@@ -116,7 +121,7 @@ impl<T: TypedHash> BloomFilter<T> {
     pub fn contains(&self, item: &T) -> bool {
         let (h1, h2) = split_hash(item);
         let m = self.bit_len() as u64;
-        for i in 0..self.k as u64 {
+        for i in 0..u64::from(self.k) {
             let bit = probe(h1, h2, i, m);
             let word = (bit / 64) as usize;
             let off = bit % 64;
@@ -130,6 +135,11 @@ impl<T: TypedHash> BloomFilter<T> {
 
 /// Compute `(m_bits_rounded_to_64, k)` for the requested `(n, fpr)`, or
 /// `None` if the computed size exceeds [`MAX_BITS`].
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)] // bloom-filter sizing math: inputs bounded by MAX_BITS / MAX_K, results clamped before truncation
 fn size_for(n: usize, fpr: f64) -> Option<(usize, u8)> {
     if n == 0 {
         return Some((64, 1));
@@ -143,7 +153,7 @@ fn size_for(n: usize, fpr: f64) -> Option<(usize, u8)> {
         return None;
     }
     let k_raw = (m_bits as f64 / n as f64) * ln2;
-    let k = (k_raw.ceil() as u32).clamp(1, MAX_K as u32) as u8;
+    let k = (k_raw.ceil() as u32).clamp(1, u32::from(MAX_K)) as u8;
     Some((m_bits, k))
 }
 
@@ -274,7 +284,7 @@ mod tests {
             bf.insert(&tx(i));
         }
         for i in 0..1_000 {
-            assert!(bf.contains(&tx(i)), "inserted item {} not found", i);
+            assert!(bf.contains(&tx(i)), "inserted item {i} not found");
         }
     }
 
@@ -293,14 +303,12 @@ mod tests {
                 false_positives += 1;
             }
         }
+        // headline ratio for human-readable test output; precision loss is fine.
+        #[allow(clippy::cast_precision_loss)]
         let observed = false_positives as f64 / probe_count as f64;
         assert!(
             observed < target_fpr * 3.0,
-            "observed FPR {} >> target {} (fp={}/{})",
-            observed,
-            target_fpr,
-            false_positives,
-            probe_count
+            "observed FPR {observed} >> target {target_fpr} (fp={false_positives}/{probe_count})"
         );
     }
 

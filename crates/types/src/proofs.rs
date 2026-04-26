@@ -4,7 +4,7 @@
 //!
 //! Provision data has three natural levels:
 //!
-//! 1. **Source block** ([`SourceBlockAttestation`]): QC + state_root + merkle proof.
+//! 1. **Source block** ([`SourceBlockAttestation`]): QC + `state_root` + merkle proof.
 //!    Shared across all transactions from the same block. Serialized once.
 //!
 //! 2. **Transaction** ([`TxEntries`]): Per-transaction state entries.
@@ -42,17 +42,20 @@ pub struct MerkleInclusionProof(pub Vec<u8>);
 
 impl MerkleInclusionProof {
     /// Create a new proof from raw bytes.
+    #[must_use]
     pub fn new(bytes: Vec<u8>) -> Self {
         Self(bytes)
     }
 
     /// Get the raw proof bytes.
+    #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
 
     /// Create a dummy (empty) proof for testing.
     #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
     pub fn dummy() -> Self {
         Self(Vec::new())
     }
@@ -84,8 +87,12 @@ pub struct TxEntries {
 
 impl TxEntries {
     /// Get the node IDs referenced by this transaction's entries.
+    #[must_use]
     pub fn node_ids(&self) -> HashSet<NodeId> {
-        self.entries.iter().filter_map(|e| e.node_id()).collect()
+        self.entries
+            .iter()
+            .filter_map(super::state::StateEntry::node_id)
+            .collect()
     }
 }
 
@@ -97,7 +104,7 @@ impl TxEntries {
 ///
 /// Identifies the source block (for joining with `CommittedBlockHeader`)
 /// and carries the merkle proof plus per-transaction state entries.
-/// The QC and state_root are obtained from `CommittedBlockHeader` received
+/// The QC and `state_root` are obtained from `CommittedBlockHeader` received
 /// via gossip — they don't travel with the provisions.
 ///
 /// The content hash is computed eagerly at construction and on deserialization.
@@ -125,7 +132,7 @@ impl std::fmt::Debug for Provisions {
             .field("source_shard", &self.source_shard)
             .field("block_height", &self.block_height)
             .field("transactions", &self.transactions.len())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -186,7 +193,7 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
         let block_height: BlockHeight = decoder.decode()?;
         let proof: MerkleInclusionProof = decoder.decode()?;
         let transactions: Vec<TxEntries> = decoder.decode()?;
-        let hash = Self::compute_hash(source_shard, &block_height, &proof, &transactions);
+        let hash = Self::compute_hash(source_shard, block_height, &proof, &transactions);
         Ok(Self {
             source_shard,
             block_height,
@@ -213,13 +220,14 @@ impl sbor::Describe<sbor::NoCustomTypeKind> for Provisions {
 
 impl Provisions {
     /// Create a new provisions, computing the content hash eagerly.
+    #[must_use]
     pub fn new(
         source_shard: ShardGroupId,
         block_height: BlockHeight,
         proof: MerkleInclusionProof,
         transactions: Vec<TxEntries>,
     ) -> Self {
-        let hash = Self::compute_hash(source_shard, &block_height, &proof, &transactions);
+        let hash = Self::compute_hash(source_shard, block_height, &proof, &transactions);
         Self {
             source_shard,
             block_height,
@@ -230,6 +238,7 @@ impl Provisions {
     }
 
     /// Content hash (precomputed at construction / deserialization).
+    #[must_use]
     pub fn hash(&self) -> ProvisionHash {
         self.hash
     }
@@ -243,13 +252,14 @@ impl Provisions {
     /// referenced this data has expired its `validity_range` and
     /// completed (or aborted via the all-abort fallback) — no shard can
     /// still reference these provisions.
+    #[must_use]
     pub fn deadline(&self, source_weighted_ts: WeightedTimestamp) -> WeightedTimestamp {
         source_weighted_ts.plus(RETENTION_HORIZON)
     }
 
     fn compute_hash(
         source_shard: ShardGroupId,
-        block_height: &BlockHeight,
+        block_height: BlockHeight,
         proof: &MerkleInclusionProof,
         transactions: &[TxEntries],
     ) -> ProvisionHash {
@@ -260,7 +270,8 @@ impl Provisions {
                 .expect("ShardGroupId serialization should never fail"),
         );
         bytes.extend_from_slice(
-            &sbor::basic_encode(block_height).expect("BlockHeight serialization should never fail"),
+            &sbor::basic_encode(&block_height)
+                .expect("BlockHeight serialization should never fail"),
         );
         bytes.extend_from_slice(
             &sbor::basic_encode(proof)
@@ -274,14 +285,20 @@ impl Provisions {
     }
 
     /// Get all node IDs across all transactions.
+    #[must_use]
     pub fn all_node_ids(&self) -> HashSet<NodeId> {
         self.transactions
             .iter()
-            .flat_map(|tx| tx.entries.iter().filter_map(|e| e.node_id()))
+            .flat_map(|tx| {
+                tx.entries
+                    .iter()
+                    .filter_map(super::state::StateEntry::node_id)
+            })
             .collect()
     }
 
-    /// Get all entries across all transactions, sorted and deduped by storage_key.
+    /// Get all entries across all transactions, sorted and deduped by `storage_key`.
+    #[must_use]
     pub fn all_entries_deduped(&self) -> Vec<StateEntry> {
         let mut entries: Vec<StateEntry> = self
             .transactions
@@ -294,12 +311,14 @@ impl Provisions {
     }
 
     /// Get the transaction hashes in these provisions.
+    #[must_use]
     pub fn tx_hashes(&self) -> Vec<TxHash> {
         self.transactions.iter().map(|tx| tx.tx_hash).collect()
     }
 
     /// Create a dummy `Provisions` for testing.
     #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
     pub fn dummy(source_shard: ShardGroupId, block_height: BlockHeight) -> Self {
         Self::new(
             source_shard,
