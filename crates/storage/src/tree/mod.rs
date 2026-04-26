@@ -278,7 +278,7 @@ pub fn put_at_version<S: jmt::TreeReader + Sync>(
 
     let updates_btree: BTreeMap<jmt::Key, Option<jmt::ValueHash>> = updates.into_iter().collect();
 
-    let result = Jmt::apply_updates(store, parent_version, new_version, updates_btree)
+    let result = Jmt::apply_updates(store, parent_version, new_version, &updates_btree)
         .expect("JMT apply_updates failed");
 
     let root_hash = if result.root_hash == [0u8; 32] {

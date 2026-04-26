@@ -55,7 +55,7 @@ fn build_tree(entries: &BTreeMap<Key, ValueHash>) -> (MemoryStore, Option<NodeKe
     }
     let updates: BTreeMap<Key, Option<ValueHash>> =
         entries.iter().map(|(k, v)| (*k, Some(*v))).collect();
-    let res = Jmt::apply_updates(&store, None, 1, updates).unwrap();
+    let res = Jmt::apply_updates(&store, None, 1, &updates).unwrap();
     let root_hash = res.root_hash;
     store.apply(&res);
     let root = store.get_root_key(1);
@@ -105,7 +105,7 @@ proptest! {
         let mut store_b = MemoryStore::new();
         let u1: BTreeMap<Key, Option<ValueHash>> =
             first_half.iter().map(|(k, v)| (*k, Some(*v))).collect();
-        let r1 = Jmt::apply_updates(&store_b, None, 1, u1).unwrap();
+        let r1 = Jmt::apply_updates(&store_b, None, 1, &u1).unwrap();
         store_b.apply(&r1);
 
         let u2: BTreeMap<Key, Option<ValueHash>> =
@@ -113,7 +113,7 @@ proptest! {
         let root_b = if u2.is_empty() {
             r1.root_hash
         } else {
-            let r2 = Jmt::apply_updates(&store_b, Some(1), 2, u2).unwrap();
+            let r2 = Jmt::apply_updates(&store_b, Some(1), 2, &u2).unwrap();
             store_b.apply(&r2);
             r2.root_hash
         };
@@ -275,23 +275,20 @@ proptest! {
 
         let updates: BTreeMap<Key, Option<ValueHash>> =
             [(target, None)].into_iter().collect();
-        let res = Jmt::apply_updates(&store, Some(1), 2, updates).unwrap();
+        let res = Jmt::apply_updates(&store, Some(1), 2, &updates).unwrap();
         store.apply(&res);
 
-        match store.get_root_key(2) {
-            Some(root2) => {
-                prop_assert_eq!(Jmt::get(&store, &root2, &target), None);
-                for (k, v) in &entries {
-                    if *k != target {
-                        prop_assert_eq!(Jmt::get(&store, &root2, k), Some(*v));
-                    }
+        if let Some(root2) = store.get_root_key(2) {
+            prop_assert_eq!(Jmt::get(&store, &root2, &target), None);
+            for (k, v) in &entries {
+                if *k != target {
+                    prop_assert_eq!(Jmt::get(&store, &root2, k), Some(*v));
                 }
             }
-            None => {
-                // Tree is empty — only possible when target was the only entry.
-                prop_assert_eq!(entries.len(), 1);
-                prop_assert_eq!(res.root_hash, EMPTY_HASH);
-            }
+        } else {
+            // Tree is empty — only possible when target was the only entry.
+            prop_assert_eq!(entries.len(), 1);
+            prop_assert_eq!(res.root_hash, EMPTY_HASH);
         }
     }
 
@@ -305,13 +302,13 @@ proptest! {
         let mut store = MemoryStore::new();
         let u1: BTreeMap<Key, Option<ValueHash>> =
             v1_entries.iter().map(|(k, v)| (*k, Some(*v))).collect();
-        let r1 = Jmt::apply_updates(&store, None, 1, u1).unwrap();
+        let r1 = Jmt::apply_updates(&store, None, 1, &u1).unwrap();
         store.apply(&r1);
 
         if !v2_updates.is_empty() {
             let u2: BTreeMap<Key, Option<ValueHash>> =
                 v2_updates.iter().map(|(k, v)| (*k, Some(*v))).collect();
-            let r2 = Jmt::apply_updates(&store, Some(1), 2, u2).unwrap();
+            let r2 = Jmt::apply_updates(&store, Some(1), 2, &u2).unwrap();
             store.apply(&r2);
         }
 
@@ -338,7 +335,7 @@ proptest! {
 
         let u2: BTreeMap<Key, Option<ValueHash>> =
             [(target, Some(new_value))].into_iter().collect();
-        let r2 = Jmt::apply_updates(&store, Some(1), 2, u2).unwrap();
+        let r2 = Jmt::apply_updates(&store, Some(1), 2, &u2).unwrap();
         store.apply(&r2);
 
         let root1 = store.get_root_key(1).unwrap();

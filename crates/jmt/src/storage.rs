@@ -4,7 +4,7 @@
 //! implementing [`TreeReader`] (required for reads and proofs) and
 //! [`TreeWriter`] (to persist [`TreeUpdateBatch`] results).
 //!
-//! A RocksDB backend should implement these against column families;
+//! A `RocksDB` backend should implement these against column families;
 //! the node-key encoding ([`NodeKey::encode`]) is LSM-friendly with
 //! version as the big-endian prefix.
 
@@ -33,8 +33,11 @@ pub trait TreeReader {
 /// Write storage interface. `TreeUpdateBatch` fields are applied via
 /// these three methods.
 pub trait TreeWriter {
+    /// Persist a node under its versioned key.
     fn put_node(&mut self, key: NodeKey, node: Node);
+    /// Record the root key that identifies the tree at the given version.
     fn set_root_key(&mut self, version: u64, key: NodeKey);
+    /// Record that a previously written node became stale at a version.
     fn record_stale(&mut self, entry: StaleNodeIndex);
 }
 
@@ -52,6 +55,8 @@ pub struct MemoryStore {
 }
 
 impl MemoryStore {
+    /// Create an empty in-memory store.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -84,24 +89,34 @@ impl MemoryStore {
         self.stale_index = to_keep;
     }
 
+    /// Number of stored nodes (across all versions).
+    #[must_use]
     pub fn node_count(&self) -> usize {
         self.nodes.len()
     }
 
+    /// Number of recorded stale-node entries pending pruning.
+    #[must_use]
     pub fn stale_count(&self) -> usize {
         self.stale_index.len()
     }
 
+    /// All committed versions, sorted ascending.
+    #[must_use]
     pub fn versions(&self) -> Vec<u64> {
         let mut vs: Vec<u64> = self.root_keys.keys().copied().collect();
-        vs.sort();
+        vs.sort_unstable();
         vs
     }
 
+    /// Highest committed version, if any.
+    #[must_use]
     pub fn latest_version(&self) -> Option<u64> {
         self.root_keys.keys().max().copied()
     }
 
+    /// Root key of the highest committed version, if any.
+    #[must_use]
     pub fn latest_root_key(&self) -> Option<NodeKey> {
         let v = self.latest_version()?;
         self.root_keys.get(&v).cloned()

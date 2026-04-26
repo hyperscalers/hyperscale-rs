@@ -43,11 +43,20 @@ impl<H: Hasher, const ARITY_BITS: u8> Tree<H, ARITY_BITS> {
     ///
     /// Returns an [`UpdateResult`] whose `batch` must be persisted to
     /// make the new version visible to reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UpdateError::NonMonotonicVersion`] if `new_version` is
+    /// not strictly greater than `parent_version`,
+    /// [`UpdateError::ParentVersionMissing`] if the parent root is not
+    /// in `store`, [`UpdateError::MissingNode`] if a referenced node
+    /// has been pruned, or [`UpdateError::Invariant`] if an internal
+    /// post-condition fails.
     pub fn apply_updates<S>(
         store: &S,
         parent_version: Option<u64>,
         new_version: u64,
-        updates: BTreeMap<Key, Option<ValueHash>>,
+        updates: &BTreeMap<Key, Option<ValueHash>>,
     ) -> Result<UpdateResult, UpdateError>
     where
         S: TreeReader,
@@ -122,9 +131,9 @@ impl<H: Hasher, const ARITY_BITS: u8> Tree<H, ARITY_BITS> {
                     };
                 }
                 Node::Internal(internal) => {
-                    let bucket = bits_at(key, current_path.len(), ARITY_BITS) as usize;
-                    let child = internal.children.get(bucket)?.as_ref()?;
-                    let next_path = child_path(&current_path, bucket as u8, ARITY_BITS);
+                    let bucket = bits_at(key, current_path.len(), ARITY_BITS);
+                    let child = internal.children.get(usize::from(bucket))?.as_ref()?;
+                    let next_path = child_path(&current_path, bucket, ARITY_BITS);
                     let child_key = NodeKey::new(child.version, next_path.clone());
                     current = store.get_node(&child_key)?;
                     current_path = next_path;
@@ -148,22 +157,38 @@ impl<H: Hasher, const ARITY_BITS: u8> Tree<H, ARITY_BITS> {
 /// Result of a successful [`Tree::apply_updates`] call.
 #[derive(Clone, Debug)]
 pub struct UpdateResult {
+    /// Hash of the new root (or [`EMPTY_HASH`] for an empty tree).
     pub root_hash: Hash,
+    /// Storage key of the new root node.
     pub root_key: NodeKey,
+    /// Batch of node writes/stale entries the caller must persist.
     pub batch: TreeUpdateBatch,
 }
 
+/// Errors produced by [`Tree::apply_updates`].
 #[derive(Debug, thiserror::Error)]
 pub enum UpdateError {
+    /// `parent_version` was supplied but no root is recorded for it.
     #[error("parent version {0} not found in store")]
     ParentVersionMissing(u64),
 
+    /// `new_version` is not strictly greater than `parent_version`.
     #[error("new version {new} must be greater than parent version {parent}")]
-    NonMonotonicVersion { parent: u64, new: u64 },
+    NonMonotonicVersion {
+        /// The parent version supplied by the caller.
+        parent: u64,
+        /// The (rejected) new version supplied by the caller.
+        new: u64,
+    },
 
+    /// A child node referenced by an internal node is absent from storage.
     #[error("storage corruption: node at {key:?} referenced but missing")]
-    MissingNode { key: NodeKey },
+    MissingNode {
+        /// Key of the missing node.
+        key: NodeKey,
+    },
 
+    /// An internal post-condition was violated (indicates a bug).
     #[error("internal invariant violated: {0}")]
     Invariant(&'static str),
 }
@@ -180,12 +205,12 @@ fn bits_at(key: &Key, depth_bits: u16, count: u8) -> u8 {
 
     let byte = (depth_bits / 8) as usize;
     let off = (depth_bits % 8) as usize;
-    let hi = key[byte] as u16;
-    let lo = *key.get(byte + 1).unwrap_or(&0) as u16;
+    let hi = u16::from(key[byte]);
+    let lo = u16::from(*key.get(byte + 1).unwrap_or(&0));
     let combined = (hi << 8) | lo;
     let shift = 16 - off - count as usize;
     let mask = (1u16 << count) - 1;
-    ((combined >> shift) & mask) as u8
+    u8::try_from((combined >> shift) & mask).unwrap_or(u8::MAX)
 }
 
 /// Build a child path by appending `count` bits of `bucket` to `parent`.
@@ -215,7 +240,7 @@ impl<'a> BitRangeIter<'a> {
     }
 }
 
-impl<'a> Iterator for BitRangeIter<'a> {
+impl Iterator for BitRangeIter<'_> {
     type Item = (u8, Range<usize>);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -542,7 +567,11 @@ where
                                 "fresh build produced a preserved leaf — impossible",
                             ));
                         }
-                        let preserved_path = child_path(parent_path, only_idx as u8, ARITY_BITS);
+                        let preserved_path = child_path(
+                            parent_path,
+                            u8::try_from(only_idx).unwrap_or(u8::MAX),
+                            ARITY_BITS,
+                        );
                         let preserved_key = NodeKey::new(only.version, preserved_path);
                         let loaded = store.get_node(&preserved_key).ok_or_else(|| {
                             UpdateError::MissingNode {
@@ -621,7 +650,7 @@ mod tests {
     fn single_insert_produces_leaf_root() {
         let store = MemoryStore::new();
         let updates: BTreeMap<Key, Option<ValueHash>> = [(k(1), Some(v(10)))].into_iter().collect();
-        let res = Jmt::apply_updates(&store, None, 1, updates).unwrap();
+        let res = Jmt::apply_updates(&store, None, 1, &updates).unwrap();
         let expected = Blake3Hasher::hash_leaf(&k(1), &v(10));
         assert_eq!(res.root_hash, expected);
     }
@@ -636,7 +665,7 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let res = Jmt::apply_updates(&store, None, 1, updates).unwrap();
+        let res = Jmt::apply_updates(&store, None, 1, &updates).unwrap();
         store.apply(&res);
 
         let root = store.get_root_key(1).unwrap();
@@ -652,11 +681,11 @@ mod tests {
         let v1: BTreeMap<Key, Option<ValueHash>> = [(k(1), Some(v(10))), (k(2), Some(v(20)))]
             .into_iter()
             .collect();
-        let r1 = Jmt::apply_updates(&store, None, 1, v1).unwrap();
+        let r1 = Jmt::apply_updates(&store, None, 1, &v1).unwrap();
         store.apply(&r1);
 
         let v2: BTreeMap<Key, Option<ValueHash>> = [(k(1), Some(v(99)))].into_iter().collect();
-        let r2 = Jmt::apply_updates(&store, Some(1), 2, v2).unwrap();
+        let r2 = Jmt::apply_updates(&store, Some(1), 2, &v2).unwrap();
         store.apply(&r2);
 
         assert_ne!(r1.root_hash, r2.root_hash);
@@ -671,11 +700,11 @@ mod tests {
         let v1: BTreeMap<Key, Option<ValueHash>> = [(k(1), Some(v(10))), (k(2), Some(v(20)))]
             .into_iter()
             .collect();
-        let r1 = Jmt::apply_updates(&store, None, 1, v1).unwrap();
+        let r1 = Jmt::apply_updates(&store, None, 1, &v1).unwrap();
         store.apply(&r1);
 
         let v2: BTreeMap<Key, Option<ValueHash>> = [(k(1), None)].into_iter().collect();
-        let r2 = Jmt::apply_updates(&store, Some(1), 2, v2).unwrap();
+        let r2 = Jmt::apply_updates(&store, Some(1), 2, &v2).unwrap();
         store.apply(&r2);
 
         // Deleting one of two keys should leave the root as a bare leaf
@@ -691,16 +720,11 @@ mod tests {
     #[test]
     fn historical_reads_see_prior_version() {
         let mut store = MemoryStore::new();
-        let r1 = Jmt::apply_updates(&store, None, 1, [(k(1), Some(v(10)))].into_iter().collect())
-            .unwrap();
+        let v1: BTreeMap<Key, Option<ValueHash>> = [(k(1), Some(v(10)))].into_iter().collect();
+        let r1 = Jmt::apply_updates(&store, None, 1, &v1).unwrap();
         store.apply(&r1);
-        let r2 = Jmt::apply_updates(
-            &store,
-            Some(1),
-            2,
-            [(k(1), Some(v(99)))].into_iter().collect(),
-        )
-        .unwrap();
+        let v2: BTreeMap<Key, Option<ValueHash>> = [(k(1), Some(v(99)))].into_iter().collect();
+        let r2 = Jmt::apply_updates(&store, Some(1), 2, &v2).unwrap();
         store.apply(&r2);
 
         let root1 = store.get_root_key(1).unwrap();
@@ -719,7 +743,7 @@ mod tests {
             key[31] = i.wrapping_mul(7);
             updates.insert(key, Some([i; 32]));
         }
-        let r = Jmt::apply_updates(&store, None, 1, updates.clone()).unwrap();
+        let r = Jmt::apply_updates(&store, None, 1, &updates).unwrap();
         store.apply(&r);
 
         let root = store.get_root_key(1).unwrap();
@@ -734,12 +758,12 @@ mod tests {
         let v1: BTreeMap<Key, Option<ValueHash>> = [(k(1), Some(v(10))), (k(2), Some(v(20)))]
             .into_iter()
             .collect();
-        let r1 = Jmt::apply_updates(&store, None, 1, v1).unwrap();
+        let r1 = Jmt::apply_updates(&store, None, 1, &v1).unwrap();
         store.apply(&r1);
 
         let v2: BTreeMap<Key, Option<ValueHash>> =
             [(k(1), None), (k(2), None)].into_iter().collect();
-        let r2 = Jmt::apply_updates(&store, Some(1), 2, v2).unwrap();
+        let r2 = Jmt::apply_updates(&store, Some(1), 2, &v2).unwrap();
         store.apply(&r2);
 
         assert_eq!(r2.root_hash, EMPTY_HASH);
@@ -750,12 +774,12 @@ mod tests {
     fn delete_nonexistent_is_noop() {
         let mut store = MemoryStore::new();
         let v1: BTreeMap<Key, Option<ValueHash>> = [(k(1), Some(v(10)))].into_iter().collect();
-        let r1 = Jmt::apply_updates(&store, None, 1, v1).unwrap();
+        let r1 = Jmt::apply_updates(&store, None, 1, &v1).unwrap();
         store.apply(&r1);
 
         // Delete a key that isn't in the tree.
         let v2: BTreeMap<Key, Option<ValueHash>> = [(k(99), None)].into_iter().collect();
-        let r2 = Jmt::apply_updates(&store, Some(1), 2, v2).unwrap();
+        let r2 = Jmt::apply_updates(&store, Some(1), 2, &v2).unwrap();
 
         assert_eq!(r1.root_hash, r2.root_hash);
     }
@@ -763,17 +787,12 @@ mod tests {
     #[test]
     fn non_monotonic_version_rejected() {
         let mut store = MemoryStore::new();
-        let r1 = Jmt::apply_updates(&store, None, 5, [(k(1), Some(v(10)))].into_iter().collect())
-            .unwrap();
+        let v1: BTreeMap<Key, Option<ValueHash>> = [(k(1), Some(v(10)))].into_iter().collect();
+        let r1 = Jmt::apply_updates(&store, None, 5, &v1).unwrap();
         store.apply(&r1);
 
-        let err = Jmt::apply_updates(
-            &store,
-            Some(5),
-            5,
-            [(k(2), Some(v(20)))].into_iter().collect(),
-        )
-        .unwrap_err();
+        let v2: BTreeMap<Key, Option<ValueHash>> = [(k(2), Some(v(20)))].into_iter().collect();
+        let err = Jmt::apply_updates(&store, Some(5), 5, &v2).unwrap_err();
         assert!(matches!(err, UpdateError::NonMonotonicVersion { .. }));
     }
 
@@ -794,7 +813,7 @@ mod tests {
 
         let updates: BTreeMap<Key, Option<ValueHash>> =
             [(k1, Some(v(1))), (k2, Some(v(2)))].into_iter().collect();
-        let r = Jmt::apply_updates(&store, None, 1, updates).unwrap();
+        let r = Jmt::apply_updates(&store, None, 1, &updates).unwrap();
         store.apply(&r);
 
         let root = store.get_root_key(1).unwrap();
@@ -818,7 +837,7 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let r = Jmt4::apply_updates(&store, None, 1, updates.clone()).unwrap();
+        let r = Jmt4::apply_updates(&store, None, 1, &updates).unwrap();
         store.apply(&r);
 
         let root = store.get_root_key(1).unwrap();

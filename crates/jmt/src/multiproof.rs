@@ -44,13 +44,16 @@ pub struct MultiProof {
     pub siblings: Vec<Hash>,
 }
 
+/// One key's outcome inside a [`MultiProof`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProofClaim {
+    /// The 32-byte key the claim is about.
     pub key: Key,
     /// `Some` iff the lookup hit a leaf whose key matches.
     pub value_hash: Option<ValueHash>,
     /// Depth (in bits) at which the lookup terminated.
     pub depth_bits: u16,
+    /// How the lookup ended (leaf, empty slot, or divergent leaf).
     pub termination: ClaimTermination,
 }
 
@@ -65,28 +68,40 @@ pub enum ClaimTermination {
     /// proof. Carries the stored leaf's data so the verifier can
     /// reconstruct its hash.
     LeafMismatch {
+        /// Key actually stored at the divergent leaf.
         stored_key: Key,
+        /// Value hash actually stored at the divergent leaf.
         stored_value_hash: ValueHash,
     },
 }
 
+/// Errors produced during proof construction or verification.
 #[derive(Debug, thiserror::Error)]
 pub enum ProofError {
+    /// The supplied root key is not present in storage.
     #[error("root key not found in store")]
     RootMissing,
 
+    /// A node referenced by the walk could not be loaded from storage.
     #[error("node at {key:?} referenced but missing")]
-    MissingNode { key: NodeKey },
+    MissingNode {
+        /// Key of the node that could not be loaded.
+        key: NodeKey,
+    },
 
+    /// The proof reconstructs to a hash that disagrees with the expected root.
     #[error("computed root does not match expected root")]
     RootMismatch,
 
+    /// The proof is internally inconsistent (structurally invalid).
     #[error("malformed proof: {0}")]
     Malformed(&'static str),
 
+    /// The verifier expected a claim the proof does not contain.
     #[error("claim for key not present in proof")]
     MissingClaim,
 
+    /// A claim's stored value disagrees with the verifier's expected value.
     #[error("claim asserts a value the proof does not support")]
     ValueMismatch,
 }
@@ -97,6 +112,12 @@ impl<H: Hasher, const ARITY_BITS: u8> Tree<H, ARITY_BITS> {
     /// Keys are internally sorted and deduplicated. The resulting proof
     /// authenticates each distinct key's value hash (or non-existence).
     /// An empty `keys` slice yields an empty proof.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProofError::RootMissing`] if `root_key` does not resolve
+    /// in `store`, or [`ProofError::MissingNode`] if a referenced child
+    /// node has been pruned underneath the walk.
     pub fn prove<S>(store: &S, root_key: &NodeKey, keys: &[Key]) -> Result<MultiProof, ProofError>
     where
         S: TreeReader,
@@ -134,6 +155,15 @@ impl<H: Hasher, const ARITY_BITS: u8> Tree<H, ARITY_BITS> {
     /// verifier checks both that the proof is self-consistent against
     /// `expected_root` and that the proved results match the caller's
     /// assertions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProofError::MissingClaim`] when `expected_claims`
+    /// names a key the proof does not authenticate;
+    /// [`ProofError::ValueMismatch`] when a claim disagrees with the
+    /// expected value; [`ProofError::Malformed`] when the proof is
+    /// structurally invalid; and [`ProofError::RootMismatch`] when the
+    /// reconstructed root differs from `expected_root`.
     pub fn verify(
         proof: &MultiProof,
         expected_root: Hash,
@@ -165,8 +195,7 @@ impl<H: Hasher, const ARITY_BITS: u8> Tree<H, ARITY_BITS> {
                         return Err(ProofError::ValueMismatch);
                     }
                 }
-                (None, ClaimTermination::EmptySubtree)
-                | (None, ClaimTermination::LeafMismatch { .. }) => {}
+                (None, ClaimTermination::EmptySubtree | ClaimTermination::LeafMismatch { .. }) => {}
                 _ => return Err(ProofError::ValueMismatch),
             }
             p += 1;
@@ -211,12 +240,12 @@ fn bits_at(key: &Key, depth_bits: u16, count: u8) -> u8 {
 
     let byte = (depth_bits / 8) as usize;
     let off = (depth_bits % 8) as usize;
-    let hi = key[byte] as u16;
-    let lo = *key.get(byte + 1).unwrap_or(&0) as u16;
+    let hi = u16::from(key[byte]);
+    let lo = u16::from(*key.get(byte + 1).unwrap_or(&0));
     let combined = (hi << 8) | lo;
     let shift = 16 - off - count as usize;
     let mask = (1u16 << count) - 1;
-    ((combined >> shift) & mask) as u8
+    u8::try_from((combined >> shift) & mask).unwrap_or(u8::MAX)
 }
 
 fn child_path(parent: &NibblePath, bucket: u8, count: u8) -> NibblePath {
@@ -298,33 +327,31 @@ where
                 let child = internal.children.get(bucket).and_then(|c| c.as_ref());
 
                 if claimed_here {
-                    match child {
-                        Some(child) => {
-                            let sub_path = child_path(&node_key.path, bucket as u8, ARITY_BITS);
-                            let sub_key = NodeKey::new(child.version, sub_path);
-                            prove_rec::<S, H, ARITY_BITS>(
-                                store,
-                                &sub_key,
-                                &claim_keys[start..pos],
-                                claims_out,
-                                siblings_out,
-                            )?;
-                        }
-                        None => {
-                            // Claimed path hits empty slot — emit non-inclusion.
-                            for key in &claim_keys[start..pos] {
-                                claims_out.push(ProofClaim {
-                                    key: **key,
-                                    value_hash: None,
-                                    depth_bits: depth + ARITY_BITS as u16,
-                                    termination: ClaimTermination::EmptySubtree,
-                                });
-                            }
+                    let bucket_byte = u8::try_from(bucket).unwrap_or(u8::MAX);
+                    if let Some(child) = child {
+                        let sub_path = child_path(&node_key.path, bucket_byte, ARITY_BITS);
+                        let sub_key = NodeKey::new(child.version, sub_path);
+                        prove_rec::<S, H, ARITY_BITS>(
+                            store,
+                            &sub_key,
+                            &claim_keys[start..pos],
+                            claims_out,
+                            siblings_out,
+                        )?;
+                    } else {
+                        // Claimed path hits empty slot — emit non-inclusion.
+                        for key in &claim_keys[start..pos] {
+                            claims_out.push(ProofClaim {
+                                key: **key,
+                                value_hash: None,
+                                depth_bits: depth + u16::from(ARITY_BITS),
+                                termination: ClaimTermination::EmptySubtree,
+                            });
                         }
                     }
                 } else {
                     // Unclaimed bucket → emit sibling for verifier.
-                    let sibling_hash = child.map(|c| c.hash).unwrap_or(EMPTY_HASH);
+                    let sibling_hash = child.map_or(EMPTY_HASH, |c| c.hash);
                     siblings_out.push(sibling_hash);
                 }
             }
@@ -333,10 +360,10 @@ where
     }
 }
 
-fn verify_rec<'a, H, const ARITY_BITS: u8>(
+fn verify_rec<H, const ARITY_BITS: u8>(
     claims: &[ProofClaim],
     depth: u16,
-    siblings: &mut std::slice::Iter<'a, Hash>,
+    siblings: &mut std::slice::Iter<'_, Hash>,
 ) -> Result<Hash, ProofError>
 where
     H: Hasher,
@@ -372,7 +399,7 @@ where
         if pos > start {
             *child = verify_rec::<H, ARITY_BITS>(
                 &claims[start..pos],
-                depth + ARITY_BITS as u16,
+                depth + u16::from(ARITY_BITS),
                 siblings,
             )?;
         } else {
@@ -434,15 +461,19 @@ const TERM_LEAF_MISMATCH: u8 = 0x03;
 /// Errors produced by [`MultiProof::decode`].
 #[derive(Debug, thiserror::Error)]
 pub enum DecodeError {
+    /// Wire-format version byte is not [`WIRE_VERSION`].
     #[error("unsupported proof format version {0:#04x}")]
     UnsupportedVersion(u8),
 
+    /// Buffer ended before the decode could finish.
     #[error("buffer truncated — not enough bytes to decode")]
     Truncated,
 
+    /// Decode succeeded but bytes remain past the structured payload.
     #[error("trailing bytes after successful decode")]
     TrailingBytes,
 
+    /// A claim's termination discriminator is not one of the defined values.
     #[error("unknown termination discriminator {0:#04x}")]
     InvalidTermination(u8),
 }
@@ -453,14 +484,23 @@ impl MultiProof {
     /// See the module-level wire format documentation for the exact
     /// layout. The output is deterministic: the same `MultiProof`
     /// always produces the same bytes.
+    #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(self.encoded_size_hint());
         buf.push(WIRE_VERSION);
-        buf.extend_from_slice(&(self.claims.len() as u32).to_be_bytes());
+        buf.extend_from_slice(
+            &u32::try_from(self.claims.len())
+                .unwrap_or(u32::MAX)
+                .to_be_bytes(),
+        );
         for claim in &self.claims {
             encode_claim(claim, &mut buf);
         }
-        buf.extend_from_slice(&(self.siblings.len() as u32).to_be_bytes());
+        buf.extend_from_slice(
+            &u32::try_from(self.siblings.len())
+                .unwrap_or(u32::MAX)
+                .to_be_bytes(),
+        );
         for sib in &self.siblings {
             buf.extend_from_slice(sib);
         }
@@ -468,6 +508,13 @@ impl MultiProof {
     }
 
     /// Decode a proof from the canonical wire format.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DecodeError`] if the version byte is unrecognized, the
+    /// buffer is truncated mid-claim, a claim carries an unknown
+    /// termination discriminator, or unexpected trailing bytes follow
+    /// the structured payload.
     pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
         let mut r = ByteReader::new(bytes);
         let version = r.u8()?;
@@ -643,7 +690,7 @@ mod tests {
         let mut store = MemoryStore::new();
         let updates: BTreeMap<Key, Option<ValueHash>> =
             entries.iter().map(|(k, v)| (*k, Some(*v))).collect();
-        let res = Jmt::apply_updates(&store, None, 1, updates).unwrap();
+        let res = Jmt::apply_updates(&store, None, 1, &updates).unwrap();
         store.apply(&res);
         let root = store.get_root_key(1).unwrap();
         (store, root, res.root_hash)
@@ -777,7 +824,7 @@ mod tests {
         let entries: Vec<(Key, ValueHash)> = (0u8..16).map(|i| (k(i), v(i * 3))).collect();
         let updates: BTreeMap<Key, Option<ValueHash>> =
             entries.iter().map(|(k, v)| (*k, Some(*v))).collect();
-        let res = Jmt4::apply_updates(&store, None, 1, updates).unwrap();
+        let res = Jmt4::apply_updates(&store, None, 1, &updates).unwrap();
         store.apply(&res);
         let root = store.get_root_key(1).unwrap();
 
