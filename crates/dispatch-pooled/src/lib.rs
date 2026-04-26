@@ -36,12 +36,15 @@ use hyperscale_metrics as metrics;
 /// Errors from thread pool configuration.
 #[derive(Debug, Error)]
 pub enum ThreadPoolError {
+    /// Underlying rayon thread-pool builder rejected the configuration.
     #[error("Failed to build rayon thread pool: {0}")]
     RayonBuildError(String),
 
+    /// User-supplied thread counts or core indices were invalid.
     #[error("Invalid configuration: {0}")]
     InvalidConfig(String),
 
+    /// `core_affinity` failed to pin a worker thread to its target core.
     #[error("Core pinning failed: {0}")]
     CorePinningError(String),
 }
@@ -101,11 +104,13 @@ pub struct ThreadPoolConfig {
 
 impl ThreadPoolConfig {
     /// Create a builder for custom configuration.
+    #[must_use]
     pub fn builder() -> ThreadPoolConfigBuilder {
         ThreadPoolConfigBuilder::new()
     }
 
     /// Create a minimal configuration for testing (1 thread per pool).
+    #[must_use]
     pub fn minimal() -> Self {
         Self {
             consensus_crypto_threads: 2,
@@ -123,6 +128,7 @@ impl ThreadPoolConfig {
     }
 
     /// Total number of rayon pool threads (excluding state machine and I/O).
+    #[must_use]
     pub fn total_threads(&self) -> usize {
         self.consensus_crypto_threads
             + self.crypto_threads
@@ -131,6 +137,13 @@ impl ThreadPoolConfig {
     }
 
     /// Validate the configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ThreadPoolError::InvalidConfig`] when any pool's thread count
+    /// is below its minimum (consensus and crypto pools require at least 2
+    /// threads; the others require at least 1) or when core pinning is enabled
+    /// but the configured cores exceed `available_parallelism()`.
     pub fn validate(&self) -> Result<(), ThreadPoolError> {
         if self.consensus_crypto_threads < 2 {
             return Err(ThreadPoolError::InvalidConfig(
@@ -157,9 +170,7 @@ impl ThreadPoolConfig {
 
         // If pinning is enabled, check that core assignments don't overlap
         if self.pin_cores {
-            let available = std::thread::available_parallelism()
-                .map(NonZeroUsize::get)
-                .unwrap_or(4);
+            let available = std::thread::available_parallelism().map_or(4, NonZeroUsize::get);
 
             // +1 for the state machine thread
             let total_needed = 1
@@ -169,8 +180,7 @@ impl ThreadPoolConfig {
                 + self.execution_threads;
             if total_needed > available {
                 return Err(ThreadPoolError::InvalidConfig(format!(
-                    "Configuration requires {} cores but only {} are available",
-                    total_needed, available
+                    "Configuration requires {total_needed} cores but only {available} are available"
                 )));
             }
         }
@@ -179,7 +189,7 @@ impl ThreadPoolConfig {
     }
 }
 
-/// Builder for ThreadPoolConfig.
+/// Builder for [`ThreadPoolConfig`].
 #[derive(Debug, Clone)]
 pub struct ThreadPoolConfigBuilder {
     config: ThreadPoolConfig,
@@ -187,6 +197,7 @@ pub struct ThreadPoolConfigBuilder {
 
 impl ThreadPoolConfigBuilder {
     /// Create a new builder starting from minimal defaults (1 thread per pool).
+    #[must_use]
     pub fn new() -> Self {
         Self {
             config: ThreadPoolConfig::minimal(),
@@ -195,36 +206,42 @@ impl ThreadPoolConfigBuilder {
 
     /// Set the number of consensus crypto threads (block votes, QC verification).
     /// These are liveness-critical and should not be set too low.
+    #[must_use]
     pub fn consensus_crypto_threads(mut self, count: usize) -> Self {
         self.config.consensus_crypto_threads = count;
         self
     }
 
     /// Set the number of general crypto verification threads (provisions, execution votes).
+    #[must_use]
     pub fn crypto_threads(mut self, count: usize) -> Self {
         self.config.crypto_threads = count;
         self
     }
 
     /// Set the number of transaction validation threads.
+    #[must_use]
     pub fn tx_validation_threads(mut self, count: usize) -> Self {
         self.config.tx_validation_threads = count;
         self
     }
 
     /// Set the number of execution threads.
+    #[must_use]
     pub fn execution_threads(mut self, count: usize) -> Self {
         self.config.execution_threads = count;
         self
     }
 
     /// Enable core pinning.
+    #[must_use]
     pub fn pin_cores(mut self, enabled: bool) -> Self {
         self.config.pin_cores = enabled;
         self
     }
 
     /// Set the core for the state machine thread.
+    #[must_use]
     pub fn state_machine_core(mut self, core: usize) -> Self {
         self.config.state_machine_core = Some(core);
         self.config.pin_cores = true;
@@ -232,6 +249,7 @@ impl ThreadPoolConfigBuilder {
     }
 
     /// Set the starting core for the consensus crypto pool.
+    #[must_use]
     pub fn consensus_crypto_core_start(mut self, core: usize) -> Self {
         self.config.consensus_crypto_core_start = Some(core);
         self.config.pin_cores = true;
@@ -239,6 +257,7 @@ impl ThreadPoolConfigBuilder {
     }
 
     /// Set the starting core for the crypto pool.
+    #[must_use]
     pub fn crypto_core_start(mut self, core: usize) -> Self {
         self.config.crypto_core_start = Some(core);
         self.config.pin_cores = true;
@@ -246,6 +265,7 @@ impl ThreadPoolConfigBuilder {
     }
 
     /// Set the starting core for the execution pool.
+    #[must_use]
     pub fn execution_core_start(mut self, core: usize) -> Self {
         self.config.execution_core_start = Some(core);
         self.config.pin_cores = true;
@@ -253,24 +273,31 @@ impl ThreadPoolConfigBuilder {
     }
 
     /// Set stack size for crypto threads.
+    #[must_use]
     pub fn crypto_stack_size(mut self, size: usize) -> Self {
         self.config.crypto_stack_size = size;
         self
     }
 
     /// Set stack size for execution threads.
+    #[must_use]
     pub fn execution_stack_size(mut self, size: usize) -> Self {
         self.config.execution_stack_size = size;
         self
     }
 
     /// Build the configuration, validating it first.
+    ///
+    /// # Errors
+    ///
+    /// Forwards any [`ThreadPoolError`] returned by [`ThreadPoolConfig::validate`].
     pub fn build(self) -> Result<ThreadPoolConfig, ThreadPoolError> {
         self.config.validate()?;
         Ok(self.config)
     }
 
     /// Build the configuration without validation.
+    #[must_use]
     pub fn build_unchecked(self) -> ThreadPoolConfig {
         self.config
     }
@@ -307,6 +334,11 @@ pub struct PooledDispatch {
 
 impl PooledDispatch {
     /// Create a new pooled dispatch with the given configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ThreadPoolError`] when validation fails or when any of the
+    /// underlying rayon thread pools cannot be built.
     pub fn new(config: ThreadPoolConfig) -> Result<Self, ThreadPoolError> {
         config.validate()?;
 
@@ -338,6 +370,7 @@ impl PooledDispatch {
     }
 
     /// Get the configuration.
+    #[must_use]
     pub fn config(&self) -> &ThreadPoolConfig {
         &self.config
     }
@@ -348,7 +381,7 @@ impl PooledDispatch {
         let mut builder = rayon::ThreadPoolBuilder::new()
             .num_threads(config.consensus_crypto_threads)
             .stack_size(config.crypto_stack_size)
-            .thread_name(|i| format!("consensus-crypto-{}", i));
+            .thread_name(|i| format!("consensus-crypto-{i}"));
 
         if config.pin_cores {
             let start_core = config.consensus_crypto_core_start.unwrap_or(1);
@@ -371,7 +404,7 @@ impl PooledDispatch {
         let mut builder = rayon::ThreadPoolBuilder::new()
             .num_threads(config.crypto_threads)
             .stack_size(config.crypto_stack_size)
-            .thread_name(|i| format!("crypto-{}", i));
+            .thread_name(|i| format!("crypto-{i}"));
 
         if config.pin_cores {
             let start_core = config
@@ -398,7 +431,7 @@ impl PooledDispatch {
         rayon::ThreadPoolBuilder::new()
             .num_threads(config.tx_validation_threads)
             .stack_size(config.crypto_stack_size)
-            .thread_name(|i| format!("tx-val-{}", i))
+            .thread_name(|i| format!("tx-val-{i}"))
             .build()
             .map_err(|e| ThreadPoolError::RayonBuildError(e.to_string()))
     }
@@ -409,7 +442,7 @@ impl PooledDispatch {
         let mut builder = rayon::ThreadPoolBuilder::new()
             .num_threads(config.execution_threads)
             .stack_size(config.execution_stack_size)
-            .thread_name(|i| format!("exec-{}", i));
+            .thread_name(|i| format!("exec-{i}"));
 
         if config.pin_cores {
             let start_core = config
@@ -459,10 +492,9 @@ impl Dispatch for PooledDispatch {
     }
 
     fn try_spawn_crypto(&self, f: impl FnOnce() + Send + 'static) -> bool {
-        let depth = self.crypto_pending.load(Ordering::Relaxed);
-
         const BACKPRESSURE_THRESHOLD: usize = 100;
 
+        let depth = self.crypto_pending.load(Ordering::Relaxed);
         if depth > BACKPRESSURE_THRESHOLD {
             return false;
         }
@@ -526,15 +558,14 @@ fn pin_thread_to_core(core_id: usize) -> Result<(), ThreadPoolError> {
         .into_iter()
         .find(|c| c.id == core_id)
         .ok_or_else(|| {
-            ThreadPoolError::CorePinningError(format!("core {} not in available core set", core_id))
+            ThreadPoolError::CorePinningError(format!("core {core_id} not in available core set"))
         })?;
 
     if core_affinity::set_for_current(target) {
         Ok(())
     } else {
         Err(ThreadPoolError::CorePinningError(format!(
-            "set_for_current failed for core {}",
-            core_id
+            "set_for_current failed for core {core_id}"
         )))
     }
 }

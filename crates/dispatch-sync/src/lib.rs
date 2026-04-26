@@ -13,6 +13,8 @@ use hyperscale_dispatch::Dispatch;
 pub struct SyncDispatch;
 
 impl SyncDispatch {
+    /// Create a new inline dispatcher (zero-sized; equivalent to `SyncDispatch::default()`).
+    #[must_use]
     pub fn new() -> Self {
         Self
     }

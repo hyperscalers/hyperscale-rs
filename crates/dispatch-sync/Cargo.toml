@@ -6,3 +6,6 @@ description = "Synchronous inline dispatch for deterministic simulation"
 
 [dependencies]
 hyperscale-dispatch.workspace = true
+
+[lints]
+workspace = true
