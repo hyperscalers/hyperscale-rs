@@ -2,7 +2,7 @@
 //!
 //! `TopologyState` is owned by `NodeStateMachine`. It holds epoch lifecycle
 //! state (`next_epoch`) and produces `Arc<TopologySnapshot>` snapshots that
-//! are passed by reference to subsystems and shared with the io_loop.
+//! are passed by reference to subsystems and shared with the `io_loop`.
 
 use hyperscale_types::{
     EpochConfig, ShardGroupId, TopologySnapshot, TopologySnapshotError, ValidatorId, ValidatorSet,
@@ -51,6 +51,7 @@ impl TopologyState {
     /// Create a topology with modulo-based shard assignment.
     ///
     /// Validators are assigned to shards by `id % num_shards`.
+    #[must_use]
     pub fn new(
         local_validator_id: ValidatorId,
         num_shards: u64,
@@ -70,6 +71,7 @@ impl TopologyState {
     ///
     /// All validators are placed in `local_shard` regardless of their ID.
     /// Useful for tests where `validator_id % num_shards != desired_shard`.
+    #[must_use]
     pub fn with_local_shard(
         local_validator_id: ValidatorId,
         local_shard: ShardGroupId,
@@ -90,6 +92,7 @@ impl TopologyState {
     /// Create a topology with explicit shard committees.
     ///
     /// Shard membership is taken directly from the provided map.
+    #[must_use]
     pub fn with_shard_committees(
         local_validator_id: ValidatorId,
         local_shard: ShardGroupId,
@@ -110,6 +113,11 @@ impl TopologyState {
     }
 
     /// Create from an epoch configuration (production path).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TopologyError`] if the epoch configuration is invalid
+    /// (e.g. a shard committee references unknown validators).
     pub fn from_epoch_config(
         local_validator_id: ValidatorId,
         epoch: &EpochConfig,
@@ -124,6 +132,7 @@ impl TopologyState {
     }
 
     /// Get the current immutable snapshot.
+    #[must_use]
     pub fn snapshot(&self) -> &Arc<TopologySnapshot> {
         &self.snapshot
     }
@@ -140,6 +149,11 @@ impl TopologyState {
     }
 
     /// Transition to the next epoch, building a fresh snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TopologyError::NoNextEpoch`] if no next epoch has been
+    /// set, or any [`TopologyError`] from rebuilding the snapshot.
     pub fn transition_to_next_epoch(&mut self) -> Result<(), TopologyError> {
         let next = self.next_epoch.take().ok_or(TopologyError::NoNextEpoch)?;
         self.snapshot = Arc::new(TopologySnapshot::from_epoch_config(

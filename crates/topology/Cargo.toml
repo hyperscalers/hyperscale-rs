@@ -11,3 +11,6 @@ thiserror.workspace = true
 
 [dev-dependencies]
 hyperscale-test-helpers.workspace = true
+
+[lints]
+workspace = true
