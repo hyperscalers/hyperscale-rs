@@ -43,7 +43,7 @@ impl std::fmt::Debug for TestCommittee {
         f.debug_struct("TestCommittee")
             .field("size", &self.keypairs.len())
             .field("validator_ids", &self.validator_ids)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -61,6 +61,7 @@ impl TestCommittee {
     /// let committee = TestCommittee::new(4, 42);
     /// assert_eq!(committee.size(), 4);
     /// ```
+    #[must_use]
     pub fn new(size: usize, seed: u64) -> Self {
         let mut keypairs = Vec::with_capacity(size);
         let mut public_keys = Vec::with_capacity(size);
@@ -69,7 +70,9 @@ impl TestCommittee {
         for i in 0..size {
             // Generate deterministic seed for this validator
             let mut seed_bytes = [0u8; 32];
-            let key_seed = seed.wrapping_add(i as u64).wrapping_mul(0x517cc1b727220a95);
+            let key_seed = seed
+                .wrapping_add(i as u64)
+                .wrapping_mul(0x517c_c1b7_2722_0a95);
             seed_bytes[..8].copy_from_slice(&key_seed.to_le_bytes());
             seed_bytes[8..16].copy_from_slice(&(i as u64).to_le_bytes());
             seed_bytes[16..24].copy_from_slice(&seed.to_le_bytes());
@@ -106,6 +109,7 @@ impl TestCommittee {
     /// let shard1 = TestCommittee::for_shard(4, 42, 1);
     /// assert_eq!(shard1.validator_id(0).0, 4);
     /// ```
+    #[must_use]
     pub fn for_shard(size: usize, seed: u64, shard_index: u64) -> Self {
         let mut committee = Self::new(size, seed.wrapping_add(shard_index * 1000));
 
@@ -119,6 +123,7 @@ impl TestCommittee {
     }
 
     /// Get the number of validators in the committee.
+    #[must_use]
     pub fn size(&self) -> usize {
         self.keypairs.len()
     }
@@ -128,6 +133,7 @@ impl TestCommittee {
     /// # Panics
     ///
     /// Panics if `idx >= size()`.
+    #[must_use]
     pub fn keypair(&self, idx: usize) -> &Bls12381G1PrivateKey {
         &self.keypairs[idx]
     }
@@ -137,6 +143,7 @@ impl TestCommittee {
     /// # Panics
     ///
     /// Panics if `idx >= size()`.
+    #[must_use]
     pub fn public_key(&self, idx: usize) -> &Bls12381G1PublicKey {
         &self.public_keys[idx]
     }
@@ -146,16 +153,19 @@ impl TestCommittee {
     /// # Panics
     ///
     /// Panics if `idx >= size()`.
+    #[must_use]
     pub fn validator_id(&self, idx: usize) -> ValidatorId {
         self.validator_ids[idx]
     }
 
     /// Get all public keys.
+    #[must_use]
     pub fn public_keys(&self) -> &[Bls12381G1PublicKey] {
         &self.public_keys
     }
 
     /// Get all validator IDs.
+    #[must_use]
     pub fn validator_ids(&self) -> &[ValidatorId] {
         &self.validator_ids
     }
@@ -163,6 +173,7 @@ impl TestCommittee {
     /// Calculate quorum threshold (2f+1 where n = 3f+1).
     ///
     /// For a committee of size n, quorum is ceil(2n/3) + 1.
+    #[must_use]
     pub fn quorum_threshold(&self) -> usize {
         (self.size() * 2 / 3) + 1
     }
@@ -170,6 +181,7 @@ impl TestCommittee {
     /// Get the indices needed for a minimal quorum.
     ///
     /// Returns the first `quorum_threshold()` indices.
+    #[must_use]
     pub fn quorum_indices(&self) -> Vec<usize> {
         (0..self.quorum_threshold()).collect()
     }
@@ -177,6 +189,7 @@ impl TestCommittee {
     /// Build a [`TopologySnapshot`] from this committee with uniform voting
     /// power. `local_idx` picks which validator the snapshot represents;
     /// `num_shards` sets the shard count for tx routing.
+    #[must_use]
     pub fn topology_snapshot(&self, local_idx: usize, num_shards: u64) -> TopologySnapshot {
         let validators: Vec<ValidatorInfo> = (0..self.size())
             .map(|i| ValidatorInfo {
@@ -196,6 +209,7 @@ impl TestCommittee {
 /// are `Hash::ZERO`, `parent_qc` is `QuorumCertificate::genesis()`, `round`
 /// is `Round::INITIAL`, and there are no wave roots or provisions. Callers
 /// pass only the bits that vary between tests.
+#[must_use]
 pub fn make_live_block(
     shard_group_id: ShardGroupId,
     height: BlockHeight,
@@ -234,6 +248,7 @@ pub fn make_live_block(
 /// the `CertifiedBlock` pairing invariant. `weighted_timestamp_ms` stamps
 /// the BFT-authenticated time anchor; pass `0` when retention-window
 /// behavior doesn't matter.
+#[must_use]
 pub fn certify(block: Block, weighted_timestamp_ms: u64) -> CertifiedBlock {
     let qc = QuorumCertificate {
         block_hash: block.hash(),
@@ -250,6 +265,7 @@ pub fn certify(block: Block, weighted_timestamp_ms: u64) -> CertifiedBlock {
 /// effects. The inner EC carries a zeroed BLS signature and a 4-seat
 /// signer bitfield, so callers should not feed the result through
 /// verification paths.
+#[must_use]
 pub fn make_finalized_wave(
     block_height: BlockHeight,
     tx_hash: TxHash,

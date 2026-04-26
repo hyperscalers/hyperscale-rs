@@ -6,3 +6,6 @@ description = "Test helpers for Hyperscale - provides properly-signed fixtures f
 
 [dependencies]
 hyperscale-types = { path = "../types", features = ["test-utils"] }
+
+[lints]
+workspace = true
