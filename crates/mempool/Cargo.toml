@@ -18,3 +18,6 @@ serde.workspace = true
 hyperscale-test-helpers.workspace = true
 hyperscale-types = { workspace = true, features = ["test-utils"] }
 proptest.workspace = true
+
+[lints]
+workspace = true

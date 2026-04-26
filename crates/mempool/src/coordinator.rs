@@ -103,6 +103,8 @@ pub struct LockContentionStats {
 
 impl LockContentionStats {
     /// Contention ratio: what fraction of pending transactions are deferred.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)] // ratio is a monitoring readout, precision loss is irrelevant
     pub fn contention_ratio(&self) -> f64 {
         if self.pending_count > 0 {
             self.pending_deferred as f64 / self.pending_count as f64
@@ -115,13 +117,21 @@ impl LockContentionStats {
 /// Mempool memory statistics for monitoring collection sizes.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MempoolMemoryStats {
+    /// Transactions held in the main pool.
     pub pool: usize,
+    /// Transactions currently in the ready set.
     pub ready: usize,
+    /// Tombstone entries (terminal-state dedup).
     pub tombstones: usize,
+    /// Recently-evicted transaction bodies cached for late fetches.
     pub recently_evicted: usize,
+    /// Nodes currently locked by in-flight transactions.
     pub locked_nodes: usize,
+    /// Distinct nodes with at least one deferred transaction.
     pub deferred_by_nodes: usize,
+    /// Total transaction-node entries in the deferred index.
     pub txs_deferred_by_node: usize,
+    /// Total transaction-node entries in the ready index.
     pub ready_txs_by_node: usize,
 }
 
@@ -140,7 +150,7 @@ struct PoolEntry {
     /// original dwell anchor — without this, every blocker release would
     /// reset the dwell clock and a chronically-deferred tx could be
     /// starved indefinitely. *Not* a telemetry stamp; phase-time tracking
-    /// for the slow-tx finalization log lives in the io_loop's
+    /// for the slow-tx finalization log lives in the `io_loop`'s
     /// `tx_phase_times` side cache.
     admitted_at: LocalTimestamp,
 }
@@ -149,7 +159,7 @@ struct PoolEntry {
 ///
 /// Handles transaction lifecycle from submission to completion.
 /// Uses `BTreeMap` for the pool to maintain hash ordering, which allows
-/// ready_transactions() to iterate in sorted order without sorting.
+/// `ready_transactions()` to iterate in sorted order without sorting.
 ///
 /// # Incremental Ready Set
 ///
@@ -160,7 +170,7 @@ struct PoolEntry {
 /// no conflicts with locked nodes) and removed when they are no longer ready
 /// (status changes, conflicts arise, or evicted).
 pub struct MempoolCoordinator {
-    /// Transaction pool sorted by hash (BTreeMap for ordered iteration).
+    /// Transaction pool sorted by hash (`BTreeMap` for ordered iteration).
     pool: BTreeMap<TxHash, PoolEntry>,
 
     /// Terminal-state dedup + recently-evicted body cache. Tombstones stop
@@ -210,11 +220,13 @@ impl Default for MempoolCoordinator {
 
 impl MempoolCoordinator {
     /// Create a new mempool state machine with default config.
+    #[must_use]
     pub fn new() -> Self {
         Self::with_config(MempoolConfig::default())
     }
 
     /// Create a new mempool state machine with custom config.
+    #[must_use]
     pub fn with_config(config: MempoolConfig) -> Self {
         Self {
             pool: BTreeMap::new(),
@@ -267,19 +279,18 @@ impl MempoolCoordinator {
         }
 
         let cross_shard = tx.is_cross_shard(topology.num_shards());
+        // Add to ready tracking before moving tx into the pool entry.
+        self.add_to_ready_tracking(hash, &tx, now);
         self.pool.insert(
             hash,
             PoolEntry {
-                tx: Arc::clone(&tx),
+                tx,
                 status: TransactionStatus::Pending,
                 cross_shard,
                 submitted_locally: true, // Submitted via RPC
                 admitted_at: now,
             },
         );
-
-        // Add to ready tracking
-        self.add_to_ready_tracking(hash, &tx, now);
 
         tracing::info!(tx_hash = ?hash, pool_size = self.pool.len(), "Transaction added to mempool via submit");
 
@@ -326,19 +337,18 @@ impl MempoolCoordinator {
         }
 
         let cross_shard = tx.is_cross_shard(topology.num_shards());
+        // Add to ready tracking before moving tx into the pool entry.
+        self.add_to_ready_tracking(hash, &tx, now);
         self.pool.insert(
             hash,
             PoolEntry {
-                tx: Arc::clone(&tx),
+                tx,
                 status: TransactionStatus::Pending,
                 cross_shard,
                 submitted_locally,
                 admitted_at: now,
             },
         );
-
-        // Add to ready tracking
-        self.add_to_ready_tracking(hash, &tx, now);
 
         tracing::trace!(tx_hash = ?hash, pool_size = self.pool.len(), "Transaction added to mempool via gossip");
 
@@ -350,7 +360,7 @@ impl MempoolCoordinator {
     /// Evict a transaction that has reached a terminal state.
     ///
     /// This removes the transaction from the pool and moves it to the
-    /// recently_evicted cache so slow peers can still fetch it. The cache
+    /// `recently_evicted` cache so slow peers can still fetch it. The cache
     /// is pruned after `TRANSACTION_RETENTION`.
     ///
     /// Also adds the transaction to the tombstone set to prevent it from
@@ -398,6 +408,7 @@ impl MempoolCoordinator {
     }
 
     /// Check if a transaction hash is tombstoned (reached terminal state).
+    #[must_use]
     pub fn is_tombstoned(&self, tx_hash: &TxHash) -> bool {
         self.tombstones.is_tombstoned(tx_hash)
     }
@@ -436,7 +447,7 @@ impl MempoolCoordinator {
         // This handles the case where we fetched transactions to vote on a block
         // but didn't receive them via gossip. We need them in the mempool for
         // status tracking (execution status updates).
-        for tx in block.transactions().iter() {
+        for tx in block.transactions() {
             let hash = tx.hash();
             let num_shards = topology.num_shards();
             self.pool.entry(hash).or_insert_with(|| {
@@ -461,7 +472,7 @@ impl MempoolCoordinator {
         // Update transaction status to Committed and add locks.
         // This must happen synchronously to prevent the same transactions from being
         // re-proposed before the status update is processed.
-        for tx in block.transactions().iter() {
+        for tx in block.transactions() {
             let hash = tx.hash();
             if let Some(entry) = self.pool.get_mut(&hash) {
                 // Only update if still Pending (avoid overwriting later states during sync)
@@ -530,9 +541,10 @@ impl MempoolCoordinator {
     }
 
     /// Record that local ECs were just formed for these transactions.
-    /// Pure telemetry — emits a `RecordTxEcCreated` action that the io_loop
+    /// Pure telemetry — emits a `RecordTxEcCreated` action that the `io_loop`
     /// stamps into its phase-time side cache for the slow-tx finalization
     /// log. State-machine state isn't touched.
+    #[must_use]
     pub fn on_ec_created(&self, tx_hashes: &[TxHash]) -> Vec<Action> {
         if tx_hashes.is_empty() {
             return vec![];
@@ -544,8 +556,8 @@ impl MempoolCoordinator {
 
     /// Mark a transaction as executed (execution complete, certificate created).
     ///
-    /// Called when ExecutionCoordinator finalizes a wave certificate.
-    #[instrument(skip(self), fields(tx_hash = ?tx_hash, accepted = accepted))]
+    /// Called when `ExecutionCoordinator` finalizes a wave certificate.
+    #[instrument(skip(self, _topology), fields(tx_hash = ?tx_hash, accepted = accepted))]
     pub fn on_transaction_executed(
         &mut self,
         _topology: &TopologySnapshot,
@@ -695,12 +707,13 @@ impl MempoolCoordinator {
     /// - `pending_commit_tx_count`: Transactions about to be committed (INCREASES in-flight)
     /// - `pending_commit_cert_count`: Certificates about to be committed (DECREASES in-flight)
     ///
-    /// The effective in-flight is: current + pending_txs - pending_certs
+    /// The effective in-flight is: `current + pending_txs - pending_certs`
     ///
     /// # Performance
     ///
-    /// This method is O(min(ready_set_size, max_count)) instead of O(pool_size) because
+    /// This method is `O(min(ready_set_size, max_count))` instead of `O(pool_size)` because
     /// it reads from a pre-computed ready set that is maintained incrementally.
+    #[must_use]
     pub fn ready_transactions(
         &self,
         max_count: usize,
@@ -741,7 +754,8 @@ impl MempoolCoordinator {
     /// - `committed_count`: Number of transactions in Committed status
     /// - `executed_count`: Number of transactions in Executed status
     ///
-    /// All stats are O(1) via cached counters and ready sets.
+    /// All stats are `O(1)` via cached counters and ready sets.
+    #[must_use]
     pub fn lock_contention_stats(&self) -> LockContentionStats {
         let locked_nodes = self.locks.locked_nodes_count() as u64;
 
@@ -767,8 +781,9 @@ impl MempoolCoordinator {
     ///
     /// Used for backpressure to control overall system load.
     ///
-    /// This is O(1) as it returns a cached count maintained incrementally
+    /// This is `O(1)` as it returns a cached count maintained incrementally
     /// when transaction status changes or transactions are evicted.
+    #[must_use]
     pub fn in_flight(&self) -> usize {
         self.locks.in_flight()
     }
@@ -776,6 +791,7 @@ impl MempoolCoordinator {
     /// Check if we're at the in-flight limit.
     ///
     /// At this limit, no new transactions are proposed.
+    #[must_use]
     pub fn at_in_flight_limit(&self) -> bool {
         self.in_flight() >= self.config.max_in_flight
     }
@@ -786,6 +802,7 @@ impl MempoolCoordinator {
     /// maintain the current in-flight count are always accepted, even when over
     /// the limit — this prevents deadlock when certificate-heavy blocks would
     /// relieve backpressure.
+    #[must_use]
     pub fn would_exceed_in_flight(&self, new_tx_count: usize, cert_count: usize) -> bool {
         let current = self.in_flight();
         let projected = current
@@ -799,7 +816,8 @@ impl MempoolCoordinator {
     /// Get the number of pending transactions.
     ///
     /// Every `Pending` pool entry lives in exactly one of the ready or
-    /// deferred sets, so the sum of those counts is equivalent and O(1).
+    /// deferred sets, so the sum of those counts is equivalent and `O(1)`.
+    #[must_use]
     pub fn pending_count(&self) -> usize {
         self.ready.ready_count() + self.ready.deferred_count()
     }
@@ -808,16 +826,19 @@ impl MempoolCoordinator {
     ///
     /// When at this limit, new RPC transaction submissions are rejected to
     /// prevent unbounded mempool growth when arrival rate exceeds processing.
+    #[must_use]
     pub fn at_pending_limit(&self) -> bool {
         self.pending_count() >= self.config.max_pending
     }
 
     /// Get the mempool configuration.
+    #[must_use]
     pub fn config(&self) -> &MempoolConfig {
         &self.config
     }
 
     /// Check if we have a transaction.
+    #[must_use]
     pub fn has_transaction(&self, hash: &TxHash) -> bool {
         self.pool.contains_key(hash)
     }
@@ -827,6 +848,7 @@ impl MempoolCoordinator {
     /// Checks the active pool first, then the evicted-body cache, so peer
     /// fetch requests for transactions that have already reached a terminal
     /// state can still be served.
+    #[must_use]
     pub fn get_transaction(&self, hash: &TxHash) -> Option<Arc<RoutableTransaction>> {
         if let Some(entry) = self.pool.get(hash) {
             return Some(Arc::clone(&entry.tx));
@@ -835,6 +857,7 @@ impl MempoolCoordinator {
     }
 
     /// Get transaction status.
+    #[must_use]
     pub fn status(&self, hash: &TxHash) -> Option<TransactionStatus> {
         self.pool.get(hash).map(|e| e.status.clone())
     }
@@ -847,6 +870,7 @@ impl MempoolCoordinator {
     /// Returns `None` when the combined set is too large to size a filter
     /// within the configured [`MAX_BITS`](hyperscale_types::MAX_BITS) cap;
     /// callers treat this as "send no inventory, accept the full response."
+    #[must_use]
     pub fn tx_bloom_snapshot(&self) -> Option<BloomFilter<TxHash>> {
         let n = self.pool.len() + self.tombstones.len_evicted();
         let mut bf = BloomFilter::with_capacity(n, DEFAULT_FPR)?;
@@ -860,6 +884,7 @@ impl MempoolCoordinator {
     }
 
     /// Get mempool memory statistics for monitoring collection sizes.
+    #[must_use]
     pub fn memory_stats(&self) -> MempoolMemoryStats {
         MempoolMemoryStats {
             pool: self.pool.len(),
@@ -874,11 +899,13 @@ impl MempoolCoordinator {
     }
 
     /// Get the number of transactions in the pool.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.pool.len()
     }
 
     /// Check if the pool is empty.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.pool.is_empty()
     }
@@ -886,6 +913,7 @@ impl MempoolCoordinator {
     /// Get all incomplete transactions (not yet finalized or completed).
     ///
     /// Returns tuples of (hash, status, transaction Arc) for analysis.
+    #[must_use]
     pub fn incomplete_transactions(
         &self,
     ) -> Vec<(TxHash, TransactionStatus, Arc<RoutableTransaction>)> {
@@ -943,6 +971,7 @@ impl MempoolCoordinator {
     }
 
     /// Get the number of tombstones currently tracked.
+    #[must_use]
     pub fn tombstone_count(&self) -> usize {
         self.tombstones.len_tombstones()
     }
@@ -1131,7 +1160,7 @@ mod tests {
     fn put_mempool_at_limit(mempool: &mut MempoolCoordinator, topology: &TopologySnapshot) {
         let limit = mempool.config.max_in_flight;
         let txs: Vec<Arc<RoutableTransaction>> = (0..limit)
-            .map(|i| Arc::new(test_transaction(100 + i as u8)))
+            .map(|i| Arc::new(test_transaction(100 + u8::try_from(i).unwrap_or(u8::MAX))))
             .collect();
         for tx in &txs {
             mempool.on_submit_transaction(topology, Arc::clone(tx), LocalTimestamp::ZERO);
@@ -1151,8 +1180,7 @@ mod tests {
 
         assert!(
             mempool.at_in_flight_limit(),
-            "Mempool should be at in-flight limit after adding {} committed TXs",
-            limit
+            "Mempool should be at in-flight limit after adding {limit} committed TXs",
         );
     }
 
@@ -1180,9 +1208,10 @@ mod tests {
                 break;
             }
             node2_seed = node2_seed.wrapping_add(1);
-            if node2_seed == seed {
-                panic!("Could not find nodes in different shards");
-            }
+            assert!(
+                node2_seed != seed,
+                "Could not find nodes in different shards"
+            );
         }
 
         // Create cross-shard transaction

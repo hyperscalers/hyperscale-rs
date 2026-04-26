@@ -531,7 +531,7 @@ mod tests {
             // Fixture: 8 txs over 4 declared-node seeds, heavy overlap so the
             // deferred path gets real exercise.
             let fixture: Vec<(TxHash, Arc<RoutableTransaction>)> = (0..8)
-                .map(|seed| tx_with(seed, &[0, 1, 2, 3][..(1 + (seed as usize) % 4)]))
+                .map(|seed| tx_with(seed, &[0, 1, 2, 3][..=((seed as usize) % 4)]))
                 .collect();
 
             let mut rs = ReadySet::new();

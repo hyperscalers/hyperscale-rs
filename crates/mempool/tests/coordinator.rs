@@ -105,7 +105,7 @@ fn lock_contention_stats_zero_on_fresh_coordinator() {
     assert_eq!(stats.pending_deferred, 0);
     assert_eq!(stats.committed_count, 0);
     assert_eq!(stats.executed_count, 0);
-    assert_eq!(stats.contention_ratio(), 0.0);
+    assert!(stats.contention_ratio().abs() < f64::EPSILON);
 }
 
 #[test]
