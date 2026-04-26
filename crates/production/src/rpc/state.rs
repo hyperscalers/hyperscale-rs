@@ -11,7 +11,7 @@ use std::time::Instant;
 
 /// Type alias for the transaction submission channel.
 ///
-/// RPC handlers send `Event::SubmitTransaction` directly to the IoLoop's
+/// RPC handlers send `Event::SubmitTransaction` directly to the `IoLoop`'s
 /// crossbeam event channel, bypassing tokio mpsc bridges entirely.
 pub type TxSubmissionSender = crossbeam::channel::Sender<NodeInput>;
 
@@ -24,10 +24,10 @@ pub struct RpcState {
     pub sync_status: Arc<ArcSwap<SyncStatus>>,
     /// Node status provider.
     pub node_status: Arc<ArcSwap<NodeStatusState>>,
-    /// Channel to submit transactions to the IoLoop.
+    /// Channel to submit transactions to the `IoLoop`.
     ///
     /// RPC-submitted transactions are sent as `Event::SubmitTransaction` directly
-    /// to the IoLoop's crossbeam event channel, which:
+    /// to the `IoLoop`'s crossbeam event channel, which:
     /// 1. Gossips to all relevant shards
     /// 2. Queues for batch validation (via Dispatch)
     /// 3. Dispatches to the mempool after validation
@@ -36,7 +36,7 @@ pub struct RpcState {
     pub start_time: Instant,
     /// Transaction status cache for querying transaction state.
     ///
-    /// Shared directly from IoLoop's internal QuickCache — writes happen on
+    /// Shared directly from `IoLoop`'s internal `QuickCache` — writes happen on
     /// the pinned thread, reads happen here on the RPC thread, no locking needed.
     pub tx_status_cache: Arc<QuickCache<TxHash, TransactionStatus>>,
     /// Mempool snapshot for querying mempool stats.
@@ -82,7 +82,7 @@ pub struct MempoolSnapshot {
     /// Per-remote-shard in-flight counts from latest verified block headers.
     /// Used for cross-shard backpressure: reject transactions targeting congested shards.
     pub remote_shard_in_flight: std::collections::HashMap<hyperscale_types::ShardGroupId, u32>,
-    /// Threshold for rejecting transactions due to remote shard congestion (80% of max_in_flight).
+    /// Threshold for rejecting transactions due to remote shard congestion (80% of `max_in_flight`).
     pub remote_congestion_threshold: u32,
 }
 
@@ -103,6 +103,7 @@ impl Default for MempoolSnapshot {
 }
 
 /// Mutable node status state updated by the runner.
+#[allow(missing_docs)] // flat readouts; field names are the documentation
 #[derive(Debug, Clone, Default)]
 pub struct NodeStatusState {
     pub validator_id: u64,

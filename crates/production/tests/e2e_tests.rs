@@ -1,18 +1,20 @@
 //! End-to-end tests for the production runner.
 //!
 //! These tests validate the production runner with real localhost QUIC networking
-//! and RocksDB storage. All tests use `#[serial]` to avoid port conflicts and
+//! and `RocksDB` storage. All tests use `#[serial]` to avoid port conflicts and
 //! state leakage.
 //!
-//! Note: The ProductionRunner requires both storage and network to be configured.
+//! Note: The `ProductionRunner` requires both storage and network to be configured.
 //! For simpler tests without full infrastructure, use the simulation crate.
 
 mod fixtures;
 
 use fixtures::TestFixtures;
 use hyperscale_bft::BftConfig;
+use hyperscale_network_libp2p::{Libp2pAdapter, Libp2pConfig};
 use hyperscale_production::{ProductionRunner, RocksDbStorage};
 use hyperscale_types::{generate_bls_keypair, validator_bind_message, ShardGroupId, ValidatorId};
+use libp2p::identity;
 use serial_test::serial;
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,7 +29,7 @@ const SINGLE_BLOCK_TIMEOUT: Duration = Duration::from_secs(10);
 #[allow(dead_code)]
 const SYNC_CATCH_UP_TIMEOUT: Duration = Duration::from_secs(30);
 #[allow(dead_code)]
-const OVERALL_TEST_TIMEOUT: Duration = Duration::from_secs(60);
+const OVERALL_TEST_TIMEOUT: Duration = Duration::from_mins(1);
 
 // ============================================================================
 // Network Tests (localhost QUIC)
@@ -54,9 +56,6 @@ fn test_bind_args(
 #[serial]
 async fn test_network_adapter_starts() {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
-
-    use hyperscale_network_libp2p::{Libp2pAdapter, Libp2pConfig};
-    use libp2p::identity;
 
     let keypair = identity::Keypair::generate_ed25519();
     let validator_id = ValidatorId(0);
@@ -96,9 +95,6 @@ async fn test_network_adapter_starts() {
 #[serial]
 async fn test_two_node_connection() {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
-
-    use hyperscale_network_libp2p::{Libp2pAdapter, Libp2pConfig};
-    use libp2p::identity;
 
     // Node 1
     let keypair1 = identity::Keypair::generate_ed25519();
@@ -178,9 +174,6 @@ async fn test_two_node_connection() {
 async fn test_topic_subscription() {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
-    use hyperscale_network_libp2p::{Libp2pAdapter, Libp2pConfig};
-    use libp2p::identity;
-
     let keypair = identity::Keypair::generate_ed25519();
     let (bind_sig, topo) = test_bind_args(&keypair, ValidatorId(0));
     let config = Libp2pConfig {
@@ -214,8 +207,6 @@ async fn test_topic_subscription() {
 #[serial]
 async fn test_validator_bind_success() {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
-
-    use hyperscale_network_libp2p::{Libp2pAdapter, Libp2pConfig};
 
     // Shared topology — both validators known to both nodes.
     let fixtures = TestFixtures::new(42, 2);
@@ -295,8 +286,6 @@ async fn test_validator_bind_success() {
 async fn test_validator_bind_rejects_wrong_key() {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
-    use hyperscale_network_libp2p::{Libp2pAdapter, Libp2pConfig};
-
     let fixtures = TestFixtures::new(42, 2);
 
     // Node 0 — legitimate
@@ -375,8 +364,6 @@ async fn test_validator_bind_rejects_wrong_key() {
 #[serial]
 async fn test_validator_bind_evicted_on_disconnect() {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
-
-    use hyperscale_network_libp2p::{Libp2pAdapter, Libp2pConfig};
 
     let fixtures = TestFixtures::new(42, 2);
 
@@ -468,8 +455,6 @@ async fn test_validator_bind_evicted_on_disconnect() {
 async fn test_production_runner_with_network() {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
-    use hyperscale_network_libp2p::Libp2pConfig;
-
     let fixtures = TestFixtures::new(42, 1);
 
     // Create temp storage
@@ -484,20 +469,17 @@ async fn test_production_runner_with_network() {
         ..Default::default()
     };
 
-    let runner = timeout(
-        CONNECTION_TIMEOUT,
-        ProductionRunner::builder()
-            .topology(fixtures.topology(0))
-            .signing_key(fixtures.signing_key(0))
-            .bft_config(BftConfig::default())
-            .storage(storage)
-            .network(network_config)
-            .build(),
-    )
-    .await;
+    let runner = ProductionRunner::builder()
+        .topology(fixtures.topology(0))
+        .signing_key(fixtures.signing_key(0))
+        .bft_config(BftConfig::default())
+        .storage(storage)
+        .network(network_config)
+        .build();
 
-    assert!(runner.is_ok(), "Runner creation should not timeout");
-    let mut runner = runner.unwrap().unwrap();
+    assert!(runner.is_ok(), "Runner creation should succeed");
+    let mut runner = runner.unwrap();
+    let _ = CONNECTION_TIMEOUT;
 
     // Verify network is configured
     let network = runner.network();
@@ -532,8 +514,6 @@ async fn test_production_runner_with_network() {
 async fn test_graceful_shutdown() {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
-    use hyperscale_network_libp2p::Libp2pConfig;
-
     let fixtures = TestFixtures::new(42, 1);
 
     // Create temp storage
@@ -555,7 +535,6 @@ async fn test_graceful_shutdown() {
         .storage(storage)
         .network(network_config)
         .build()
-        .await
         .unwrap();
 
     let shutdown = runner

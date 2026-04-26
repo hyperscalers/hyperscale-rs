@@ -1,7 +1,11 @@
 //! HTTP request handlers for the RPC API.
 
 use super::state::RpcState;
-use super::types::*;
+use super::types::{
+    HealthResponse, MempoolStatusResponse, NodeStatusResponse, ReadyResponse,
+    SubmitTransactionRequest, SubmitTransactionResponse, SyncStatusResponse,
+    TransactionStatusResponse,
+};
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -132,115 +136,13 @@ pub async fn submit_transaction_handler(
     State(state): State<RpcState>,
     Json(request): Json<SubmitTransactionRequest>,
 ) -> impl IntoResponse {
-    // Check if node is syncing and too far behind to accept transactions.
-    // This prevents a syncing node from falling further behind by processing
-    // new transactions instead of catching up.
-    if let Some(threshold) = state.sync_backpressure_threshold {
-        let sync_status = state.sync_status.load();
-        if sync_status.blocks_behind > threshold {
-            metrics::record_tx_ingress_rejected_syncing();
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(SubmitTransactionResponse {
-                    accepted: false,
-                    hash: String::new(),
-                    error: Some(format!(
-                        "Node is syncing ({} blocks behind). Try again later.",
-                        sync_status.blocks_behind
-                    )),
-                }),
-            );
-        }
+    if let Some(rejection) = check_backpressure(&state) {
+        return rejection;
     }
 
-    // Check mempool backpressure conditions.
-    // This prevents unbounded mempool growth when arrival rate exceeds processing.
-    {
-        let snapshot = state.mempool_snapshot.load();
-
-        // Check if in-flight hard limit reached
-        if !snapshot.accepting_rpc_transactions {
-            metrics::record_transaction_rejected("in_flight_limit");
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(SubmitTransactionResponse {
-                    accepted: false,
-                    hash: String::new(),
-                    error: Some(
-                        "Cross-shard transaction limit reached. Try again later.".to_string(),
-                    ),
-                }),
-            );
-        }
-
-        // Check if pending transaction count is too high
-        if snapshot.at_pending_limit {
-            metrics::record_tx_ingress_rejected_pending_limit();
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(SubmitTransactionResponse {
-                    accepted: false,
-                    hash: String::new(),
-                    error: Some("Too many pending transactions. Try again later.".to_string()),
-                }),
-            );
-        }
-
-        // Check cross-shard congestion from remote block headers.
-        // Reject if any remote shard reports high in-flight counts, preventing
-        // transactions from being committed locally only to stall on remote execution.
-        // Threshold is 80% of max_in_flight, derived from mempool config.
-        let threshold = snapshot.remote_congestion_threshold;
-        if let Some((&congested_shard, &count)) = snapshot
-            .remote_shard_in_flight
-            .iter()
-            .find(|(_, &count)| threshold > 0 && count >= threshold)
-        {
-            metrics::record_transaction_rejected("remote_shard_congestion");
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(SubmitTransactionResponse {
-                    accepted: false,
-                    hash: String::new(),
-                    error: Some(format!(
-                        "Remote shard {} is congested ({} in-flight). Try again later.",
-                        congested_shard.0, count
-                    )),
-                }),
-            );
-        }
-    }
-
-    // Decode hex - structural validation, return error immediately
-    let tx_bytes = match hex::decode(&request.transaction_hex) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            metrics::record_transaction_rejected("invalid_hex");
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(SubmitTransactionResponse {
-                    accepted: false,
-                    hash: String::new(),
-                    error: Some(format!("Invalid hex encoding: {}", e)),
-                }),
-            );
-        }
-    };
-
-    // Decode SBOR - structural validation, return error immediately
-    let transaction: RoutableTransaction = match sbor::prelude::basic_decode(&tx_bytes) {
+    let transaction = match decode_transaction(&request.transaction_hex) {
         Ok(tx) => tx,
-        Err(e) => {
-            metrics::record_transaction_rejected("invalid_format");
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(SubmitTransactionResponse {
-                    accepted: false,
-                    hash: String::new(),
-                    error: Some(format!("Invalid transaction format: {:?}", e)),
-                }),
-            );
-        }
+        Err(rejection) => return rejection,
     };
 
     let hash = hex::encode(transaction.hash().as_bytes());
@@ -330,8 +232,107 @@ pub async fn get_transaction_handler(
     }
 }
 
-/// Format a TransactionStatus into RPC response fields.
-/// Formatted status fields: (status, committed_height, decision, error).
+/// Reject the request if any sync or mempool backpressure condition is active.
+fn check_backpressure(state: &RpcState) -> Option<(StatusCode, Json<SubmitTransactionResponse>)> {
+    if let Some(threshold) = state.sync_backpressure_threshold {
+        let sync_status = state.sync_status.load();
+        if sync_status.blocks_behind > threshold {
+            metrics::record_tx_ingress_rejected_syncing();
+            return Some((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(SubmitTransactionResponse {
+                    accepted: false,
+                    hash: String::new(),
+                    error: Some(format!(
+                        "Node is syncing ({} blocks behind). Try again later.",
+                        sync_status.blocks_behind
+                    )),
+                }),
+            ));
+        }
+    }
+
+    let snapshot = state.mempool_snapshot.load();
+
+    if !snapshot.accepting_rpc_transactions {
+        metrics::record_transaction_rejected("in_flight_limit");
+        return Some((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(SubmitTransactionResponse {
+                accepted: false,
+                hash: String::new(),
+                error: Some("Cross-shard transaction limit reached. Try again later.".to_string()),
+            }),
+        ));
+    }
+
+    if snapshot.at_pending_limit {
+        metrics::record_tx_ingress_rejected_pending_limit();
+        return Some((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(SubmitTransactionResponse {
+                accepted: false,
+                hash: String::new(),
+                error: Some("Too many pending transactions. Try again later.".to_string()),
+            }),
+        ));
+    }
+
+    // Threshold is 80% of `max_in_flight`, derived from mempool config.
+    let threshold = snapshot.remote_congestion_threshold;
+    if let Some((&congested_shard, &count)) = snapshot
+        .remote_shard_in_flight
+        .iter()
+        .find(|(_, &count)| threshold > 0 && count >= threshold)
+    {
+        metrics::record_transaction_rejected("remote_shard_congestion");
+        return Some((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(SubmitTransactionResponse {
+                accepted: false,
+                hash: String::new(),
+                error: Some(format!(
+                    "Remote shard {} is congested ({count} in-flight). Try again later.",
+                    congested_shard.0
+                )),
+            }),
+        ));
+    }
+
+    None
+}
+
+/// Hex- and SBOR-decode a submitted transaction, recording metrics on failure.
+fn decode_transaction(
+    transaction_hex: &str,
+) -> Result<RoutableTransaction, (StatusCode, Json<SubmitTransactionResponse>)> {
+    let tx_bytes = hex::decode(transaction_hex).map_err(|e| {
+        metrics::record_transaction_rejected("invalid_hex");
+        (
+            StatusCode::BAD_REQUEST,
+            Json(SubmitTransactionResponse {
+                accepted: false,
+                hash: String::new(),
+                error: Some(format!("Invalid hex encoding: {e}")),
+            }),
+        )
+    })?;
+
+    sbor::prelude::basic_decode(&tx_bytes).map_err(|e| {
+        metrics::record_transaction_rejected("invalid_format");
+        (
+            StatusCode::BAD_REQUEST,
+            Json(SubmitTransactionResponse {
+                accepted: false,
+                hash: String::new(),
+                error: Some(format!("Invalid transaction format: {e:?}")),
+            }),
+        )
+    })
+}
+
+/// Format a `TransactionStatus` into RPC response fields.
+/// Formatted status fields: (status, `committed_height`, decision, error).
 fn format_transaction_status(
     status: &TransactionStatus,
 ) -> (String, Option<u64>, Option<String>, Option<String>) {
@@ -563,7 +564,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri(format!("/tx/{}", tx_hash))
+                    .uri(format!("/tx/{tx_hash}"))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -612,7 +613,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri(format!("/tx/{}", tx_hash_hex))
+                    .uri(format!("/tx/{tx_hash_hex}"))
                     .body(Body::empty())
                     .unwrap(),
             )

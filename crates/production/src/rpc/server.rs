@@ -18,6 +18,7 @@ use tracing::{error, info};
 /// Errors from the RPC server.
 #[derive(Debug, Error)]
 pub enum RpcServerError {
+    /// The server could not bind to the configured listen address.
     #[error("Failed to bind to address: {0}")]
     BindError(#[from] std::io::Error),
 }
@@ -60,7 +61,7 @@ pub struct RpcServerHandle {
     sync_status: Arc<ArcSwap<SyncStatus>>,
     /// Node status provider for updates.
     node_status: Arc<ArcSwap<NodeStatusState>>,
-    /// Transaction status cache (shared from IoLoop's QuickCache).
+    /// Transaction status cache (shared from `IoLoop`'s `QuickCache`).
     tx_status_cache: Arc<QuickCache<TxHash, TransactionStatus>>,
     /// Mempool snapshot for updates.
     mempool_snapshot: Arc<ArcSwap<MempoolSnapshot>>,
@@ -73,21 +74,25 @@ impl RpcServerHandle {
     }
 
     /// Get a reference to the sync status for updates.
+    #[must_use]
     pub fn sync_status(&self) -> &Arc<ArcSwap<SyncStatus>> {
         &self.sync_status
     }
 
     /// Get a reference to the node status for updates.
+    #[must_use]
     pub fn node_status(&self) -> &Arc<ArcSwap<NodeStatusState>> {
         &self.node_status
     }
 
     /// Get a reference to the transaction status cache.
+    #[must_use]
     pub fn tx_status_cache(&self) -> &Arc<QuickCache<TxHash, TransactionStatus>> {
         &self.tx_status_cache
     }
 
     /// Get a reference to the mempool snapshot for updates.
+    #[must_use]
     pub fn mempool_snapshot(&self) -> &Arc<ArcSwap<MempoolSnapshot>> {
         &self.mempool_snapshot
     }
@@ -98,6 +103,10 @@ impl RpcServerHandle {
     }
 
     /// Wait for the server to finish.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying `JoinError` if the server task panicked or was cancelled.
     pub async fn join(self) -> Result<(), tokio::task::JoinError> {
         self.task.await
     }
@@ -115,8 +124,9 @@ impl RpcServer {
     /// # Arguments
     ///
     /// * `config` - Server configuration
-    /// * `tx_submission_tx` - Crossbeam channel to submit transactions directly to IoLoop
-    /// * `tx_status_cache` - Transaction status cache shared from IoLoop
+    /// * `tx_submission_tx` - Crossbeam channel to submit transactions directly to `IoLoop`
+    /// * `tx_status_cache` - Transaction status cache shared from `IoLoop`
+    #[must_use]
     pub fn new(
         config: RpcServerConfig,
         tx_submission_tx: TxSubmissionSender,
@@ -141,6 +151,7 @@ impl RpcServer {
     ///
     /// This allows sharing state between the server and other components.
     #[allow(clippy::too_many_arguments)]
+    #[must_use]
     pub fn with_state(
         config: RpcServerConfig,
         ready: Arc<AtomicBool>,
@@ -166,6 +177,11 @@ impl RpcServer {
     }
 
     /// Start the server and return a handle for control.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RpcServerError::BindError`] if the listener cannot bind to
+    /// the configured address.
     pub async fn start(self) -> Result<RpcServerHandle, RpcServerError> {
         let addr = self.config.listen_addr;
         let ready_flag = self.state.ready.clone();
@@ -196,6 +212,11 @@ impl RpcServer {
     }
 
     /// Start and serve until shutdown (convenience method).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RpcServerError::BindError`] if the listener cannot bind. Errors
+    /// from the spawned server task itself are logged and discarded.
     pub async fn serve(self) -> Result<(), RpcServerError> {
         let handle = self.start().await?;
         let _ = handle.join().await;

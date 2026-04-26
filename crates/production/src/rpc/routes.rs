@@ -1,6 +1,9 @@
 //! Route configuration for the RPC API.
 
-use super::handlers::*;
+use super::handlers::{
+    get_transaction_handler, health_handler, mempool_handler, metrics_handler, ready_handler,
+    status_handler, submit_transaction_handler, sync_handler,
+};
 use super::state::RpcState;
 use axum::{
     routing::{get, post},

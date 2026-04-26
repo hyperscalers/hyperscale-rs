@@ -1,8 +1,8 @@
 //! Simple tool to generate validator keys and print public keys.
 //!
 //! Usage:
-//!   keygen <seed_hex>      - Print BLS public key for given 32-byte seed (hex)
-//!   keygen --generate      - Generate new random BLS keypair and print
+//!   `keygen <seed_hex>`      - Print BLS public key for given 32-byte seed (hex)
+//!   `keygen --generate`      - Generate new random BLS keypair and print
 
 use hyperscale_types::{bls_keypair_from_seed, generate_bls_keypair};
 use std::env;

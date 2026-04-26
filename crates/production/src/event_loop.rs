@@ -9,7 +9,7 @@
 //!
 //! When nothing is ready, blocks on `crossbeam::select!` with a timeout derived
 //! from the nearest batch deadline. Transaction statuses are written to
-//! IoLoop's internal `QuickCache`, shared with RPC handlers via `Arc`.
+//! `IoLoop`'s internal `QuickCache`, shared with RPC handlers via `Arc`.
 
 use crate::rpc::state::{MempoolSnapshot, NodeStatusState};
 use crate::status::SyncStatus;
@@ -27,17 +27,17 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-/// Concrete IoLoop type for the production runner.
+/// Concrete `IoLoop` type for the production runner.
 ///
 /// Storage is `SharedStorage`, a newtype around `Arc<RocksDbStorage>`.
 /// This allows the same underlying storage to be shared between the pinned
-/// IoLoop thread and async tasks (InboundRouter) via cheap Arc clones.
-/// Certificate and transaction caches live inside IoLoop itself.
+/// `IoLoop` thread and async tasks (`InboundRouter`) via cheap Arc clones.
+/// Certificate and transaction caches live inside `IoLoop` itself.
 pub type ProdIoLoop = IoLoop<SharedStorage, Libp2pNetwork, PooledDispatch>;
 
 /// Configuration for the pinned event loop.
 pub struct PinnedLoopConfig {
-    /// Timer-fired events sender (for ProdTimerManager to send timer events).
+    /// Timer-fired events sender (for `ProdTimerManager` to send timer events).
     pub timer_tx: crossbeam::channel::Sender<NodeInput>,
     /// Timer-fired events (highest priority).
     pub timer_rx: Receiver<NodeInput>,
@@ -50,10 +50,13 @@ pub struct PinnedLoopConfig {
     /// Tokio runtime handle for spawning timer sleep tasks.
     pub tokio_handle: tokio::runtime::Handle,
     /// Timer ops from genesis initialization that need to be processed
-    /// before the event loop starts (e.g. the initial ViewChange timer).
+    /// before the event loop starts (e.g. the initial `ViewChange` timer).
     pub initial_timer_ops: Vec<TimerOp>,
+    /// Optional shared `NodeStatusState` updated each metrics tick.
     pub rpc_status: Option<Arc<ArcSwap<NodeStatusState>>>,
+    /// Optional shared `SyncStatus` updated each metrics tick.
     pub sync_status: Option<Arc<ArcSwap<SyncStatus>>>,
+    /// Optional shared mempool snapshot updated each metrics tick.
     pub mempool_snapshot: Option<Arc<ArcSwap<MempoolSnapshot>>>,
 }
 
@@ -124,7 +127,7 @@ const GC_INTERVAL: Duration = Duration::from_secs(30);
 /// Fallback timeout when no batch deadlines are pending.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// Mint the io_loop's monotonic local clock as a `LocalTimestamp` (ms
+/// Mint the `io_loop`'s monotonic local clock as a `LocalTimestamp` (ms
 /// since UNIX epoch). Used to set the state machine's clock before each
 /// step. We use `SystemTime` rather than process-start `Instant` because
 /// the value sits next to `WeightedTimestamp` (also ms since UNIX epoch)
@@ -133,10 +136,13 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(1);
 /// arithmetic on `LocalTimestamp` — view-change timers can briefly fire
 /// faster than expected after a step but will never panic.
 fn wall_clock_local() -> hyperscale_types::LocalTimestamp {
-    let ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock before UNIX epoch")
-        .as_millis() as u64;
+    let ms = u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before UNIX epoch")
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX);
     hyperscale_types::LocalTimestamp::from_millis(ms)
 }
 
@@ -185,7 +191,7 @@ fn update_rpc_state(config: &PinnedLoopConfig, snapshot: &NodeStatusSnapshot) {
     }
 }
 
-/// Run the IoLoop on a pinned thread.
+/// Run the `IoLoop` on a pinned thread.
 ///
 /// This function blocks the calling thread until shutdown. It should be called
 /// from a dedicated `std::thread::spawn` with core affinity set.
@@ -196,7 +202,7 @@ fn update_rpc_state(config: &PinnedLoopConfig, snapshot: &NodeStatusSnapshot) {
 /// 3. Tries to receive events in priority order (timer > callback > consensus)
 /// 4. Falls back to `crossbeam::select!` with batch deadline timeout
 /// 5. Processes the event via `IoLoop::step()`
-/// 6. Writes emitted statuses to tx_status_cache and records RPC latency
+/// 6. Writes emitted statuses to `tx_status_cache` and records RPC latency
 /// 7. Flushes expired batches
 /// 8. Periodic metrics collection and JMT garbage collection
 pub fn run_pinned_loop(mut io_loop: ProdIoLoop, mut config: PinnedLoopConfig) {
@@ -239,8 +245,7 @@ pub fn run_pinned_loop(mut io_loop: ProdIoLoop, mut config: PinnedLoopConfig) {
             // Nothing ready — block with timeout from nearest batch deadline
             let timeout = io_loop
                 .nearest_batch_deadline()
-                .map(|deadline| deadline.saturating_sub(now))
-                .unwrap_or(DEFAULT_TIMEOUT);
+                .map_or(DEFAULT_TIMEOUT, |deadline| deadline.saturating_sub(now));
 
             crossbeam::channel::select! {
                 recv(config.shutdown_rx) -> _ => {
@@ -324,7 +329,7 @@ pub fn run_pinned_loop(mut io_loop: ProdIoLoop, mut config: PinnedLoopConfig) {
     info!("Pinned event loop exiting");
 }
 
-/// Spawn the IoLoop on a dedicated pinned thread.
+/// Spawn the `IoLoop` on a dedicated pinned thread.
 ///
 /// Returns a `JoinHandle` for the spawned thread. The caller should hold
 /// on to this and join on shutdown.

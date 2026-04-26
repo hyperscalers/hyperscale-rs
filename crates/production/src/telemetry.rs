@@ -25,17 +25,22 @@ use tracing_subscriber::{layer::SubscriberExt, EnvFilter, Layer, Registry};
 /// Provider for sync status, used by the telemetry HTTP server.
 pub type SyncStatusProvider = Arc<ArcSwap<SyncStatus>>;
 
+/// Errors that can occur while initialising telemetry.
 #[derive(Debug, Error)]
 pub enum TelemetryError {
+    /// The OTLP exporter could not be constructed (e.g. invalid endpoint URL).
     #[error("Failed to build OTLP exporter: {0}")]
     ExporterBuild(#[from] opentelemetry_otlp::ExporterBuildError),
 
+    /// The `OpenTelemetry` SDK reported an internal error.
     #[error("OpenTelemetry SDK error: {0}")]
     OtelSdk(#[from] opentelemetry_sdk::error::OTelSdkError),
 
+    /// The global tracing subscriber was already set by another component.
     #[error("Failed to set global subscriber: {0}")]
     SetSubscriber(#[from] tracing::subscriber::SetGlobalDefaultError),
 
+    /// I/O error while binding the metrics HTTP listener or preparing the log file.
     #[error("Failed to bind metrics port: {0}")]
     MetricsPort(#[from] std::io::Error),
 }
@@ -45,7 +50,7 @@ pub enum TelemetryError {
 pub struct TelemetryConfig {
     /// Service name for OTEL resource attributes.
     pub service_name: String,
-    /// OTLP endpoint (e.g., "http://localhost:4317").
+    /// OTLP endpoint (e.g., <http://localhost:4317>).
     pub otlp_endpoint: Option<String>,
     /// Sampling ratio (0.0 to 1.0). Default: 1.0 (sample everything).
     pub sampling_ratio: f64,
@@ -87,6 +92,12 @@ impl Default for TelemetryConfig {
 ///
 /// The `build()` call validates the endpoint URL format but does NOT
 /// establish a connection - that happens lazily on first export.
+///
+/// # Errors
+///
+/// Returns [`TelemetryError`] if the OTLP exporter or tracer provider cannot be
+/// constructed, the global tracing subscriber cannot be installed, or (when
+/// Prometheus is enabled) the log directory cannot be created.
 pub fn init_telemetry(config: &TelemetryConfig) -> Result<TelemetryGuard, TelemetryError> {
     // Build resource attributes
     let mut resource_attrs = vec![
@@ -130,7 +141,7 @@ pub fn init_telemetry(config: &TelemetryConfig) -> Result<TelemetryGuard, Teleme
     };
 
     // Initialize formatting layer (file or stdout)
-    let (fmt_layer, _appender_guard) = if let Some(log_file) = &config.log_file {
+    let (fmt_layer, appender_guard) = if let Some(log_file) = &config.log_file {
         if let Some(parent) = log_file.parent() {
             std::fs::create_dir_all(parent).map_err(TelemetryError::MetricsPort)?;
         }
@@ -193,7 +204,7 @@ pub fn init_telemetry(config: &TelemetryConfig) -> Result<TelemetryGuard, Teleme
         prometheus_handle,
         ready_flag,
         sync_status,
-        _appender_guard,
+        appender_guard,
     })
 }
 
@@ -206,7 +217,8 @@ pub struct TelemetryGuard {
     prometheus_handle: Option<tokio::task::JoinHandle<()>>,
     ready_flag: Option<Arc<AtomicBool>>,
     sync_status: Option<SyncStatusProvider>,
-    _appender_guard: Option<tracing_appender::non_blocking::WorkerGuard>,
+    #[allow(dead_code)] // kept alive to keep the non-blocking log appender worker running
+    appender_guard: Option<tracing_appender::non_blocking::WorkerGuard>,
 }
 
 impl TelemetryGuard {
@@ -262,6 +274,7 @@ impl TelemetryGuard {
     ///
     /// Returns `None` if Prometheus metrics are disabled.
     /// The runner should call this to get a handle for updating sync status.
+    #[must_use]
     pub fn sync_status_provider(&self) -> Option<SyncStatusProvider> {
         self.sync_status.clone()
     }
@@ -345,6 +358,7 @@ async fn health_handler() -> impl axum::response::IntoResponse {
 ///
 /// Returns 200 OK if the node is ready to participate in consensus.
 /// Returns 503 Service Unavailable if still initializing.
+#[allow(clippy::unused_async)] // axum::Handler requires fns returning a Future
 async fn ready_handler(ready_flag: Arc<AtomicBool>) -> impl axum::response::IntoResponse {
     if ready_flag.load(Ordering::SeqCst) {
         (
@@ -368,6 +382,7 @@ async fn ready_handler(ready_flag: Arc<AtomicBool>) -> impl axum::response::Into
 /// Handler for `/system/sync-status` - sync status endpoint.
 ///
 /// Returns the current sync status as JSON.
+#[allow(clippy::unused_async)] // axum::Handler requires fns returning a Future
 async fn sync_status_handler(sync_status: SyncStatusProvider) -> impl axum::response::IntoResponse {
     let status = sync_status.load();
     axum::Json((**status).clone())
@@ -408,7 +423,7 @@ mod tests {
         let config = TelemetryConfig::default();
         assert_eq!(config.service_name, "hyperscale-node");
         assert!(config.otlp_endpoint.is_none());
-        assert_eq!(config.sampling_ratio, 1.0);
+        assert!((config.sampling_ratio - 1.0).abs() < f64::EPSILON);
         assert!(!config.prometheus_enabled);
         assert_eq!(config.prometheus_port, 9090);
     }
@@ -535,7 +550,7 @@ mod tests {
             prometheus_handle: None,
             ready_flag: Some(ready_flag.clone()),
             sync_status: None,
-            _appender_guard: None,
+            appender_guard: None,
         };
 
         // Initially not ready

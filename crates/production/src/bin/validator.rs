@@ -44,11 +44,12 @@
 //! ```
 
 use anyhow::{bail, Context, Result};
+use arc_swap::ArcSwap;
 use clap::Parser;
 use hyperscale_bft::BftConfig;
 use hyperscale_mempool::MempoolConfig;
 use hyperscale_network_libp2p::VersionInteroperabilityMode;
-use hyperscale_production::rpc::{RpcServer, RpcServerConfig};
+use hyperscale_production::rpc::{MempoolSnapshot, NodeStatusState, RpcServer, RpcServerConfig};
 use hyperscale_production::Libp2pConfig;
 use hyperscale_production::{
     init_telemetry, PooledDispatch, ProductionRunner, RocksDbConfig, RocksDbStorage,
@@ -66,6 +67,7 @@ use serde::Deserialize;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::signal;
@@ -87,7 +89,7 @@ struct Cli {
     #[arg(long)]
     key: Option<PathBuf>,
 
-    /// Data directory for RocksDB (overrides config)
+    /// Data directory for `RocksDB` (overrides config)
     #[arg(long)]
     data_dir: Option<PathBuf>,
 
@@ -99,11 +101,11 @@ struct Cli {
     #[arg(long)]
     bootstrap: Vec<String>,
 
-    /// Log level filter (overrides RUST_LOG)
+    /// Log level filter (overrides `RUST_LOG`)
     #[arg(long, default_value = "info")]
     log_level: String,
 
-    /// Disable UPnP port forwarding (overrides config)
+    /// Disable `UPnP` port forwarding (overrides config)
     #[arg(long)]
     no_upnp: bool,
 
@@ -220,7 +222,7 @@ pub struct NetworkConfig {
     #[serde(default = "default_gossipsub_heartbeat_ms")]
     pub gossipsub_heartbeat_ms: u64,
 
-    /// Enable UPnP port forwarding
+    /// Enable `UPnP` port forwarding
     #[serde(default = "default_upnp_enabled")]
     pub upnp_enabled: bool,
 
@@ -334,7 +336,8 @@ pub struct ThreadsConfig {
     pub pin_cores: bool,
 }
 
-/// Compression type for storage (maps to RocksDB compression).
+/// Compression type for storage (maps to `RocksDB` compression).
+#[allow(missing_docs)] // codec names are self-explanatory
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CompressionType {
@@ -363,7 +366,7 @@ impl From<CompressionType> for hyperscale_production::CompressionType {
 /// Storage configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct StorageConfig {
-    /// Maximum background jobs for RocksDB
+    /// Maximum background jobs for `RocksDB`
     #[serde(default = "default_max_background_jobs")]
     pub max_background_jobs: i32,
 
@@ -523,10 +526,10 @@ pub struct GenesisConfig {
 /// An XRD balance entry for genesis configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct XrdBalanceEntry {
-    /// Bech32-encoded account address (e.g., "account_sim1...")
+    /// `Bech32`-encoded account address (e.g., `"account_sim1..."`).
     pub address: String,
 
-    /// Balance as a string (parsed as Decimal)
+    /// Balance as a string (parsed as `Decimal`)
     pub balance: String,
 }
 
@@ -554,6 +557,11 @@ fn default_voting_power() -> u64 {
 
 impl ValidatorConfig {
     /// Load configuration from a TOML file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be read or if its contents fail to
+    /// parse as TOML in the [`ValidatorConfig`] schema.
     pub fn load(path: &PathBuf) -> Result<Self> {
         let contents = fs::read_to_string(path)
             .with_context(|| format!("Failed to read config file: {}", path.display()))?;
@@ -569,11 +577,11 @@ impl ValidatorConfig {
         }
 
         if let Some(ref data_dir) = cli.data_dir {
-            self.node.data_dir = data_dir.clone();
+            self.node.data_dir.clone_from(data_dir);
         }
 
         if let Some(ref metrics_addr) = cli.metrics_addr {
-            self.metrics.listen_addr = metrics_addr.clone();
+            self.metrics.listen_addr.clone_from(metrics_addr);
         }
 
         if !cli.bootstrap.is_empty() {
@@ -604,57 +612,55 @@ fn format_public_key(pk: &Bls12381G1PublicKey) -> String {
 /// The key file stores a 32-byte seed that deterministically generates the keypair.
 /// This seed can be stored as raw bytes or hex-encoded.
 fn load_or_generate_keypair(key_path: Option<&PathBuf>) -> Result<Bls12381G1PrivateKey> {
-    match key_path {
-        Some(path) => {
-            if path.exists() {
-                let key_bytes = fs::read(path)
-                    .with_context(|| format!("Failed to read key file: {}", path.display()))?;
+    use rand::RngCore;
 
-                // Try to decode as hex first, then as raw bytes
-                let decoded = if key_bytes.len() == 64 {
-                    // Likely hex-encoded (64 hex chars = 32 bytes)
-                    hex::decode(&key_bytes).with_context(|| "Failed to decode hex key")?
-                } else if key_bytes.len() == 32 {
-                    // Raw bytes
-                    key_bytes
-                } else {
-                    bail!(
-                        "Invalid key file size: expected 32 bytes (raw) or 64 hex chars, got {} bytes",
-                        key_bytes.len()
-                    );
-                };
+    let Some(path) = key_path else {
+        warn!("No key path specified, generating ephemeral keypair");
+        return Ok(generate_bls_keypair());
+    };
 
-                // Convert to fixed array
-                let seed: [u8; 32] = decoded
-                    .try_into()
-                    .map_err(|_| anyhow::anyhow!("Key must be exactly 32 bytes"))?;
+    if path.exists() {
+        let key_bytes = fs::read(path)
+            .with_context(|| format!("Failed to read key file: {}", path.display()))?;
 
-                // Use BLS12-381 for consensus (supports signature aggregation)
-                Ok(bls_keypair_from_seed(&seed))
-            } else {
-                info!("Key file not found, generating new keypair");
+        // Try to decode as hex first, then as raw bytes
+        let decoded = if key_bytes.len() == 64 {
+            // Likely hex-encoded (64 hex chars = 32 bytes)
+            hex::decode(&key_bytes).with_context(|| "Failed to decode hex key")?
+        } else if key_bytes.len() == 32 {
+            // Raw bytes
+            key_bytes
+        } else {
+            bail!(
+                "Invalid key file size: expected 32 bytes (raw) or 64 hex chars, got {} bytes",
+                key_bytes.len()
+            );
+        };
 
-                // Generate random seed
-                let mut seed = [0u8; 32];
-                use rand::RngCore;
-                rand::rngs::OsRng.fill_bytes(&mut seed);
+        // Convert to fixed array
+        let seed: [u8; 32] = decoded
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("Key must be exactly 32 bytes"))?;
 
-                let keypair = bls_keypair_from_seed(&seed);
+        // Use BLS12-381 for consensus (supports signature aggregation)
+        Ok(bls_keypair_from_seed(&seed))
+    } else {
+        info!("Key file not found, generating new keypair");
 
-                // Save the seed
-                if let Some(parent) = path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                fs::write(path, seed)?;
-                info!("Saved new keypair seed to {}", path.display());
+        // Generate random seed
+        let mut seed = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut seed);
 
-                Ok(keypair)
-            }
+        let keypair = bls_keypair_from_seed(&seed);
+
+        // Save the seed
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
         }
-        None => {
-            warn!("No key path specified, generating ephemeral keypair");
-            Ok(generate_bls_keypair())
-        }
+        fs::write(path, seed)?;
+        info!("Saved new keypair seed to {}", path.display());
+
+        Ok(keypair)
     }
 }
 
@@ -770,7 +776,7 @@ fn build_topology(
 /// Build engine genesis configuration from TOML config.
 ///
 /// Converts the TOML-friendly genesis config (with string addresses and balances)
-/// to the engine's GenesisConfig type.
+/// to the engine's `GenesisConfig` type.
 fn build_engine_genesis_config(config: &GenesisConfig) -> Result<hyperscale_engine::GenesisConfig> {
     use radix_common::math::Decimal;
     use radix_common::types::ComponentAddress;
@@ -854,9 +860,7 @@ fn build_thread_pool_config(config: &ThreadsConfig) -> ThreadPoolConfig {
         && config.execution_threads == 0;
 
     let mut builder = if all_auto {
-        let available = std::thread::available_parallelism()
-            .map(std::num::NonZeroUsize::get)
-            .unwrap_or(4);
+        let available = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
         let (cc, crypto, tx_val, exec) = for_core_count(available);
         ThreadPoolConfig::builder()
             .consensus_crypto_threads(cc)
@@ -963,7 +967,7 @@ fn build_network_config(config: &NetworkConfig) -> Result<Libp2pConfig> {
         ))
 }
 
-/// Build RocksDB configuration from TOML config.
+/// Build `RocksDB` configuration from TOML config.
 fn build_rocksdb_config(config: &StorageConfig) -> RocksDbConfig {
     RocksDbConfig {
         max_background_jobs: config.max_background_jobs,
@@ -983,7 +987,8 @@ fn build_rocksdb_config(config: &StorageConfig) -> RocksDbConfig {
     }
 }
 
-/// Setup UPnP port forwarding.
+/// Setup `UPnP` port forwarding.
+#[allow(clippy::too_many_lines)] // mostly nested error logging branches; helpers obscure the flow
 async fn setup_upnp(config: &NetworkConfig) {
     if !config.upnp_enabled {
         info!("UPnP disabled in configuration");
@@ -997,7 +1002,7 @@ async fn setup_upnp(config: &NetworkConfig) {
     let dns_servers = ["8.8.8.8:80", "1.1.1.1:80", "9.9.9.9:80"];
     let mut local_ip = None;
 
-    for server in dns_servers.iter() {
+    for server in &dns_servers {
         match std::net::UdpSocket::bind("0.0.0.0:0") {
             Ok(socket) => {
                 if socket.connect(server).is_ok() {
@@ -1016,12 +1021,11 @@ async fn setup_upnp(config: &NetworkConfig) {
         }
     }
 
-    let local_ip = match local_ip {
-        Some(ip) => ip,
-        None => {
-            warn!("Could not determine local IP for UPnP: failed to connect to any external DNS server");
-            return;
-        }
+    let Some(local_ip) = local_ip else {
+        warn!(
+            "Could not determine local IP for UPnP: failed to connect to any external DNS server"
+        );
+        return;
     };
 
     // Parse listen address to get the port
@@ -1034,7 +1038,7 @@ async fn setup_upnp(config: &NetworkConfig) {
     };
 
     let mut quic_port = None;
-    for protocol in listen_addr_parsed.iter() {
+    for protocol in &listen_addr_parsed {
         if let libp2p::multiaddr::Protocol::Udp(port) = protocol {
             quic_port = Some(port);
             break;
@@ -1042,7 +1046,7 @@ async fn setup_upnp(config: &NetworkConfig) {
     }
 
     // Use igd-next for UPnP
-    match igd_next::aio::tokio::search_gateway(Default::default()).await {
+    match igd_next::aio::tokio::search_gateway(igd_next::SearchOptions::default()).await {
         Ok(gateway) => {
             let external_ip = match gateway.get_external_ip().await {
                 Ok(ip) => ip,
@@ -1066,7 +1070,7 @@ async fn setup_upnp(config: &NetworkConfig) {
                     )
                     .await
                 {
-                    Ok(_) => info!("Successfully mapped QUIC port {} (UDP) via UPnP", port),
+                    Ok(()) => info!("Successfully mapped QUIC port {} (UDP) via UPnP", port),
                     Err(e) => warn!("Failed to map QUIC port {} (UDP) via UPnP: {}", port, e),
                 }
             } else {
@@ -1087,7 +1091,7 @@ async fn setup_upnp(config: &NetworkConfig) {
                         )
                         .await
                     {
-                        Ok(_) => info!("Successfully mapped TCP fallback port {} via UPnP", port),
+                        Ok(()) => info!("Successfully mapped TCP fallback port {} via UPnP", port),
                         Err(e) => warn!("Failed to map TCP fallback port {} via UPnP: {}", port, e),
                     }
                 }
@@ -1123,6 +1127,7 @@ fn main() -> Result<()> {
     rt.block_on(async_main(cli, config))
 }
 
+#[allow(clippy::too_many_lines)] // straight-line startup wiring; helpers would just shuffle locals
 async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
     // Initialize telemetry/logging
     // If telemetry is enabled, init_telemetry sets up the global subscriber with OTLP export.
@@ -1256,12 +1261,7 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
     let storage = Arc::new(storage);
     info!("Storage opened at {}", db_path.display());
 
-    // Create shared RPC state objects that will be used by both runner and RPC server.
-    // These are created first so they can be wired into both components.
-    use arc_swap::ArcSwap;
-    use hyperscale_production::rpc::{MempoolSnapshot, NodeStatusState};
-    use std::sync::atomic::AtomicBool;
-
+    // Create shared RPC state objects used by both runner and RPC server.
     let rpc_ready = Arc::new(AtomicBool::new(false));
     // Use ArcSwap for lock-free reads of sync status from HTTP handlers
     let rpc_sync_status = Arc::new(ArcSwap::new(Arc::new(
@@ -1300,7 +1300,6 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
 
     let mut runner = runner_builder
         .build()
-        .await
         .context("Failed to create production runner")?;
 
     // Get the transaction submission sender from the runner
@@ -1367,8 +1366,8 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
         let terminate = std::future::pending::<()>();
 
         tokio::select! {
-            _ = ctrl_c => info!("Received Ctrl+C"),
-            _ = terminate => info!("Received SIGTERM"),
+            () = ctrl_c => info!("Received Ctrl+C"),
+            () = terminate => info!("Received SIGTERM"),
         }
 
         if let Some(handle) = shutdown_handle {
@@ -1386,7 +1385,7 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
 
     // Run the main event loop
     if let Err(e) = runner.run().await {
-        bail!("Runner error: {}", e);
+        bail!("Runner error: {e}");
     }
 
     // Cleanup RPC server

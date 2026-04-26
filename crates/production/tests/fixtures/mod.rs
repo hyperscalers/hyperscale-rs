@@ -45,27 +45,32 @@ impl TestFixtures {
 
     /// Create test fixtures with multiple shards.
     pub fn with_shards(seed: u64, validators_per_shard: u32, num_shards: u64) -> Self {
-        let num_validators = validators_per_shard * num_shards as u32;
+        let num_validators = validators_per_shard
+            * u32::try_from(num_shards).expect("num_shards fits in u32 for tests");
 
         // Generate BLS keys deterministically
         let bls_keys: Vec<Bls12381G1PrivateKey> = (0..num_validators)
             .map(|i| {
                 let mut seed_bytes = [0u8; 32];
-                let key_seed = seed.wrapping_add(i as u64).wrapping_mul(0x517cc1b727220a95);
+                let key_seed = seed
+                    .wrapping_add(u64::from(i))
+                    .wrapping_mul(0x517c_c1b7_2722_0a95);
                 seed_bytes[..8].copy_from_slice(&key_seed.to_le_bytes());
-                seed_bytes[8..16].copy_from_slice(&(i as u64).to_le_bytes());
+                seed_bytes[8..16].copy_from_slice(&u64::from(i).to_le_bytes());
                 bls_keypair_from_seed(&seed_bytes)
             })
             .collect();
 
-        // Generate Ed25519 keys deterministically
-        // We use a different derivation path to ensure independence
+        // Generate Ed25519 keys deterministically using a different derivation path
+        // for independence from the BLS keys above.
         let ed25519_keys: Vec<identity::Keypair> = (0..num_validators)
             .map(|i| {
                 let mut seed_bytes = [0u8; 32];
-                let key_seed = seed.wrapping_add(i as u64).wrapping_mul(0x9e3779b97f4a7c15); // Different constant
+                let key_seed = seed
+                    .wrapping_add(u64::from(i))
+                    .wrapping_mul(0x9e37_79b9_7f4a_7c15);
                 seed_bytes[..8].copy_from_slice(&key_seed.to_le_bytes());
-                seed_bytes[8..16].copy_from_slice(&(i as u64).to_le_bytes());
+                seed_bytes[8..16].copy_from_slice(&u64::from(i).to_le_bytes());
                 seed_bytes[16..24].copy_from_slice(b"ed25519k"); // Domain separation
 
                 // libp2p's ed25519 key from seed
@@ -75,13 +80,15 @@ impl TestFixtures {
             })
             .collect();
 
-        let public_keys: Vec<Bls12381G1PublicKey> =
-            bls_keys.iter().map(|k| k.public_key()).collect();
+        let public_keys: Vec<Bls12381G1PublicKey> = bls_keys
+            .iter()
+            .map(Bls12381G1PrivateKey::public_key)
+            .collect();
 
         // Build global validator set
         let global_validators: Vec<ValidatorInfo> = (0..num_validators)
             .map(|i| ValidatorInfo {
-                validator_id: ValidatorId(i as u64),
+                validator_id: ValidatorId(u64::from(i)),
                 public_key: public_keys[i as usize],
                 voting_power: 1,
             })
@@ -92,10 +99,11 @@ impl TestFixtures {
         let mut shard_committees: HashMap<ShardGroupId, Vec<ValidatorId>> = HashMap::new();
         for shard_id in 0..num_shards {
             let shard = ShardGroupId(shard_id);
-            let shard_start = shard_id as u32 * validators_per_shard;
+            let shard_start = u32::try_from(shard_id).expect("shard_id fits in u32 for tests")
+                * validators_per_shard;
             let shard_end = shard_start + validators_per_shard;
             let committee: Vec<ValidatorId> = (shard_start..shard_end)
-                .map(|i| ValidatorId(i as u64))
+                .map(|i| ValidatorId(u64::from(i)))
                 .collect();
             shard_committees.insert(shard, committee);
         }
@@ -103,9 +111,9 @@ impl TestFixtures {
         // Create per-validator topologies
         let topologies: Vec<TopologyState> = (0..num_validators)
             .map(|i| {
-                let shard_id = i as u64 / validators_per_shard as u64;
+                let shard_id = u64::from(i) / u64::from(validators_per_shard);
                 let shard = ShardGroupId(shard_id);
-                let validator_id = ValidatorId(i as u64);
+                let validator_id = ValidatorId(u64::from(i));
 
                 TopologyState::with_shard_committees(
                     validator_id,
@@ -166,12 +174,13 @@ impl TestFixtures {
 
     /// Get validators in a shard.
     pub fn validators_in_shard(&self, shard: ShardGroupId) -> Vec<u32> {
-        let start = shard.0 as u32 * self.validators_per_shard;
+        let start = u32::try_from(shard.0).expect("shard fits in u32 for tests")
+            * self.validators_per_shard;
         let end = start + self.validators_per_shard;
         (start..end).collect()
     }
 
-    /// Compute the BLS bind signature for a validator's PeerId.
+    /// Compute the BLS bind signature for a validator's `PeerId`.
     ///
     /// Used by the validator-bind protocol to prove identity.
     pub fn bind_signature(
@@ -194,7 +203,7 @@ impl TestFixtures {
     /// Create a listen address with a specific port.
     #[allow(dead_code)]
     pub fn listen_addr_with_port(port: u16) -> Multiaddr {
-        format!("/ip4/127.0.0.1/udp/{}/quic-v1", port)
+        format!("/ip4/127.0.0.1/udp/{port}/quic-v1")
             .parse()
             .unwrap()
     }
@@ -229,8 +238,8 @@ mod tests {
         }
 
         // Peer IDs should be identical
-        for i in 0..4 {
-            assert_eq!(fixtures1.peer_id(i as u32), fixtures2.peer_id(i as u32));
+        for i in 0..4u32 {
+            assert_eq!(fixtures1.peer_id(i), fixtures2.peer_id(i));
         }
     }
 

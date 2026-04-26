@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 /// Response for `/health` endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthResponse {
+    /// Always `"ok"` when the server is running.
     pub status: String,
 }
 
@@ -23,7 +24,9 @@ impl Default for HealthResponse {
 /// Response for `/ready` endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReadyResponse {
+    /// `"ready"` when the node has finished startup, otherwise `"not_ready"`.
     pub status: String,
+    /// True once the node has completed initial sync and can serve traffic.
     pub ready: bool,
 }
 
@@ -84,7 +87,7 @@ pub struct SyncStatusResponse {
 /// Accepts a transaction in hex-encoded SBOR format.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubmitTransactionRequest {
-    /// Hex-encoded SBOR-serialized RoutableTransaction.
+    /// Hex-encoded SBOR-serialized `RoutableTransaction`.
     pub transaction_hex: String,
 }
 
@@ -143,12 +146,15 @@ pub struct MempoolStatusResponse {
 /// Generic error response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorResponse {
+    /// Short error category (e.g. `"invalid_request"`).
     pub error: String,
+    /// Optional human-readable explanation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub details: Option<String>,
 }
 
 impl ErrorResponse {
+    /// Build an error response with no extra details.
     pub fn new(error: impl Into<String>) -> Self {
         Self {
             error: error.into(),
@@ -156,6 +162,7 @@ impl ErrorResponse {
         }
     }
 
+    /// Build an error response with both a category and a detailed message.
     pub fn with_details(error: impl Into<String>, details: impl Into<String>) -> Self {
         Self {
             error: error.into(),

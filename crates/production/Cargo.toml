@@ -105,3 +105,6 @@ tempfile.workspace = true
 serial_test = "3"
 tracing-subscriber = { workspace = true, features = ["fmt", "env-filter"] }
 tower = "0.5"
+
+[lints]
+workspace = true
