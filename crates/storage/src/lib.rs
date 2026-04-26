@@ -47,6 +47,36 @@ pub use writes::{
     merge_updates_from_receipts,
 };
 
+/// Umbrella bound for storage backends threaded as a generic `S` through
+/// node-side machinery (the `IoLoop` and its delegated action handler).
+///
+/// Use this only at sites that *thread* storage generically — i.e. the
+/// `IoLoop<S>` impls and entry points that must satisfy every capability
+/// `IoLoop` ultimately needs. For narrower scopes (block commit, BFT
+/// proposal building, provision handlers), bound on the specific traits
+/// directly so the signature reflects what the function actually touches.
+pub trait Storage:
+    ChainWriter
+    + SubstateStore
+    + VersionedStore
+    + ChainReader
+    + hyperscale_jmt::TreeReader
+    + Send
+    + Sync
+{
+}
+
+impl<S> Storage for S where
+    S: ChainWriter
+        + SubstateStore
+        + VersionedStore
+        + ChainReader
+        + hyperscale_jmt::TreeReader
+        + Send
+        + Sync
+{
+}
+
 /// An empty `SubstateDatabase` for use in tests and single-shard contexts
 /// where no storage reads are needed.
 #[must_use]

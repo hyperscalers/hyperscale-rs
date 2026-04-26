@@ -11,16 +11,12 @@
 use hyperscale_core::{Action, NodeInput, ProtocolEvent};
 use hyperscale_engine::Engine;
 use hyperscale_metrics as metrics;
-use hyperscale_storage::{ChainReader, ChainWriter, SubstateStore};
+use hyperscale_storage::Storage;
 use hyperscale_types::{BlockHash, BlockHeight, LocalExecutionEntry};
 use std::sync::Arc;
 
 /// Context for executing delegated actions.
-pub struct ActionContext<
-    'a,
-    S: ChainWriter + SubstateStore + hyperscale_storage::VersionedStore + ChainReader,
-    E: Engine,
-> {
+pub struct ActionContext<'a, S: Storage, E: Engine> {
     pub executor: &'a E,
     pub topology: &'a hyperscale_types::TopologySnapshot,
     /// Anchored read view over base storage + the chain of unpersisted
@@ -128,15 +124,7 @@ pub const fn parent_hash_for(action: &Action) -> Option<BlockHash> {
 /// The runner is responsible for additionally broadcasting votes to shard
 /// peers (network-specific).
 #[allow(clippy::too_many_lines)]
-pub fn handle_delegated_action<
-    S: ChainWriter
-        + SubstateStore
-        + hyperscale_storage::VersionedStore
-        + ChainReader
-        + hyperscale_jmt::TreeReader
-        + Sync,
-    E: Engine,
->(
+pub fn handle_delegated_action<S: Storage, E: Engine>(
     action: Action,
     ctx: &ActionContext<'_, S, E>,
 ) -> Option<DelegatedResult<S::PreparedCommit>> {

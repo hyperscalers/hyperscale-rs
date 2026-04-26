@@ -5,15 +5,14 @@ use super::verify::verify_bls_with_metrics;
 use hyperscale_core::{NodeInput, StateMachine};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::Engine;
-use hyperscale_jmt::TreeReader;
 use hyperscale_network::Network;
-use hyperscale_storage::{ChainReader, ChainWriter, SubstateStore, VersionedStore};
+use hyperscale_storage::Storage;
 use hyperscale_types::RoutableTransaction;
 use std::sync::Arc;
 
 impl<S, N, D, E> IoLoop<S, N, D, E>
 where
-    S: ChainWriter + SubstateStore + VersionedStore + ChainReader + TreeReader + Send + Sync,
+    S: Storage,
     N: Network,
     D: Dispatch,
     E: Engine,

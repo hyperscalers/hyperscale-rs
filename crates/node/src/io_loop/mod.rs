@@ -45,11 +45,10 @@ use arc_swap::ArcSwap;
 use hyperscale_core::{Action, NodeInput, ProtocolEvent, StateMachine, TimerId};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::{Engine, RadixExecutor, TransactionValidation};
-use hyperscale_jmt::TreeReader;
 use hyperscale_messages::TransactionGossip;
 use hyperscale_metrics as metrics;
 use hyperscale_network::Network;
-use hyperscale_storage::{ChainReader, ChainWriter, SubstateStore, VersionedStore};
+use hyperscale_storage::{ChainWriter, Storage};
 use hyperscale_types::{
     BlockHeight, Bls12381G1PrivateKey, Bls12381G1PublicKey, CommittedBlockHeader, ShardGroupId,
     StateRoot, TopologySnapshot, TxHash, ValidatorId,
@@ -212,13 +211,13 @@ pub fn record_metrics<S: ChainWriter>(snapshot: MetricsSnapshot, storage: &S) {
 /// Unified I/O loop that processes all actions from the state machine.
 ///
 /// Generic over:
-/// - `S`: Storage (`ChainWriter` + `SubstateStore` + `ChainReader`)
+/// - `S`: Storage (umbrella bound — see [`Storage`])
 /// - `N`: Network (message sending)
 /// - `D`: Dispatch (thread pool work scheduling)
 /// - `E`: Engine (transaction execution — defaults to `RadixExecutor`)
 pub struct IoLoop<S, N, D, E: Engine = RadixExecutor>
 where
-    S: ChainWriter + SubstateStore + VersionedStore + ChainReader,
+    S: Storage,
     D: Dispatch,
 {
     // Core components
@@ -306,7 +305,7 @@ where
 
 impl<S, N, D, E> IoLoop<S, N, D, E>
 where
-    S: ChainWriter + SubstateStore + VersionedStore + ChainReader + TreeReader + Send + Sync,
+    S: Storage,
     N: Network,
     D: Dispatch,
     E: Engine,

@@ -8,7 +8,7 @@
 use hyperscale_core::ProvisionRequest;
 use hyperscale_engine::{Engine, sharding::expand_nodes_with_owned_at_height};
 use hyperscale_jmt::TreeReader as JmtTreeReader;
-use hyperscale_storage::{ChainReader, ChainWriter, SubstateStore, SubstateView, VersionedStore};
+use hyperscale_storage::{SubstateStore, SubstateView, VersionedStore};
 use hyperscale_types::{
     BlockHeight, NodeId, Provisions, ShardGroupId, StateEntry, TxEntries, TxHash, ValidatorId,
 };
@@ -41,7 +41,7 @@ pub fn fetch_and_broadcast_provision<S, E, H>(
     shard_recipients: &HashMap<ShardGroupId, Vec<ValidatorId>, H>,
 ) -> Vec<ProvisionBatch>
 where
-    S: ChainWriter + SubstateStore + VersionedStore + ChainReader + JmtTreeReader + Sync,
+    S: SubstateStore + VersionedStore + JmtTreeReader + Sync,
     E: Engine,
     H: BuildHasher,
 {
@@ -71,7 +71,7 @@ fn fetch_entries_for_requests<S, E>(
     block_height: BlockHeight,
 ) -> Vec<FetchedTxEntries>
 where
-    S: ChainWriter + SubstateStore + VersionedStore + ChainReader,
+    S: SubstateStore + VersionedStore,
     E: Engine,
 {
     let mut per_tx = Vec::with_capacity(requests.len());
@@ -114,7 +114,7 @@ fn build_provision_groups<S, H>(
     shard_recipients: &HashMap<ShardGroupId, Vec<ValidatorId>, H>,
 ) -> Vec<ProvisionBatch>
 where
-    S: ChainWriter + SubstateStore + VersionedStore + ChainReader + JmtTreeReader + Sync,
+    S: SubstateStore + VersionedStore + JmtTreeReader + Sync,
     H: BuildHasher,
 {
     let mut shard_tx_entries: HashMap<ShardGroupId, Vec<TxEntries>> = HashMap::new();
