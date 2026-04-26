@@ -171,7 +171,7 @@ pub struct MemoryMetrics {
     pub node_finalized_wave_cache: usize,
     /// Time-bounded cache of provision bodies for cross-shard fetch service.
     pub node_provision_cache: usize,
-    /// Fallback execution certificate cache keyed by (wave_id_hash, wave_id).
+    /// Fallback execution certificate cache keyed by (`wave_id_hash`, `wave_id`).
     pub node_exec_cert_cache: usize,
     /// Blocks with prepared JMT state awaiting flush.
     pub node_prepared_commits: usize,
@@ -199,13 +199,13 @@ pub struct MemoryMetrics {
     pub node_provision_fetch_pending: usize,
     /// (shard, height) keys with pending cross-shard execution-cert fetches.
     pub node_exec_cert_fetch_pending: usize,
-    /// (shard, from_height) keys with pending cross-shard header fetches.
+    /// (shard, `from_height`) keys with pending cross-shard header fetches.
     pub node_header_fetch_pending: usize,
 
     // ── Storage (byte-level where available) ──
-    /// RocksDB block cache usage in bytes.
+    /// `RocksDB` block cache usage in bytes.
     pub rocksdb_block_cache_usage_bytes: u64,
-    /// RocksDB memtable usage in bytes.
+    /// `RocksDB` memtable usage in bytes.
     pub rocksdb_memtable_usage_bytes: u64,
 }
 
@@ -457,7 +457,9 @@ pub fn set_global_recorder(recorder: Box<dyn MetricsRecorder>) {
 /// Returns a no-op recorder if none has been installed.
 #[inline]
 fn recorder() -> &'static dyn MetricsRecorder {
-    RECORDER.get().map(|r| r.as_ref()).unwrap_or(&NoopRecorder)
+    RECORDER
+        .get()
+        .map_or(&NoopRecorder as &dyn MetricsRecorder, AsRef::as_ref)
 }
 
 // ═══════════════════════════════════════════════════════════════════════

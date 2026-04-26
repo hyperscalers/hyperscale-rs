@@ -10,6 +10,8 @@
 //! hyperscale_metrics_prometheus::install();
 //! ```
 #![allow(dead_code)]
+// Metrics values are display readouts; precision loss on usize/u64 → f64 is irrelevant.
+#![allow(clippy::cast_precision_loss)]
 
 use hyperscale_metrics::{ChannelDepths, MemoryMetrics, MetricsRecorder};
 use prometheus::{
@@ -18,6 +20,9 @@ use prometheus::{
 };
 
 /// Domain-specific Prometheus metrics for production monitoring.
+// Field names like `blocks_committed` and section comments serve as docs;
+// individual field doc-comments would just restate the names.
+#[allow(missing_docs)]
 pub struct Metrics {
     // === Consensus ===
     pub blocks_committed: Counter,
@@ -134,6 +139,7 @@ pub struct Metrics {
 }
 
 impl Metrics {
+    #[allow(clippy::too_many_lines)] // single registration table for every Prometheus metric
     fn new() -> Self {
         let latency_buckets = vec![
             0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5,
@@ -1079,6 +1085,7 @@ impl MetricsRecorder for PrometheusRecorder {
 
     // ── Memory ──────────────────────────────────────────────────────
 
+    #[allow(clippy::too_many_lines)] // flat dispatch over every memory-metrics field
     fn set_memory_metrics(&self, m: &MemoryMetrics) {
         // BFT
         self.metrics
@@ -1391,6 +1398,11 @@ pub fn install() {
 /// Gather and encode all registered Prometheus metrics as text format.
 ///
 /// Returns `(content_type, encoded_body)` suitable for an HTTP response.
+///
+/// # Errors
+///
+/// Returns the underlying Prometheus encoding error rendered as a string
+/// if `prometheus::Encoder::encode` fails.
 pub fn encode_metrics() -> Result<(String, Vec<u8>), String> {
     use prometheus::{Encoder, TextEncoder};
     let encoder = TextEncoder::new();
