@@ -19,7 +19,7 @@
 //! `tx_hashes()` list. Pruning the two sides atomically is the registry's
 //! job — see [`prune_resolved`](WaveRegistry::prune_resolved), which drops
 //! states whose keys no longer appear in `assignments.values()` and then
-//! drops assignments whose wave_ids no longer appear in `states`.
+//! drops assignments whose `wave_ids` no longer appear in `states`.
 //!
 //! ## Typed effects
 //!
@@ -87,7 +87,7 @@ pub(crate) struct RetryEffect {
 
 /// Classification of an incoming cross-shard [`ExecutionCertificate`].
 ///
-/// `routed_tx_hashes` are the tx_hashes covered by an existing local wave
+/// `routed_tx_hashes` are the `tx_hashes` covered by an existing local wave
 /// — the coordinator feeds the EC into each wave and clears them from the
 /// early-arrival buffer. `unrouted_tx_hashes` have no local wave yet —
 /// they're buffered for replay when their blocks commit.
@@ -264,7 +264,7 @@ impl WaveRegistry {
 
     // ─── Attestation routing ────────────────────────────────────────────
 
-    /// Classify `ec`'s tx_outcomes by whether they have a local wave
+    /// Classify `ec`'s `tx_outcomes` by whether they have a local wave
     /// assignment. Read-only — mutation happens through the coordinator's
     /// follow-up calls to [`WaveRegistry::get_wave_mut`] and to the
     /// early-arrival buffer.
@@ -296,7 +296,7 @@ impl WaveRegistry {
             .is_some_and(|w| !w.is_fully_provisioned())
     }
 
-    /// Count of unique tx_hashes across all cross-shard waves. Used by
+    /// Count of unique `tx_hashes` across all cross-shard waves. Used by
     /// observability to gauge the outstanding cross-shard backlog.
     pub fn cross_shard_pending_count(&self) -> usize {
         let mut pending_txs: HashSet<TxHash> = HashSet::new();
@@ -409,7 +409,7 @@ mod tests {
         WaveId {
             shard_group_id: shard(),
             block_height: BlockHeight(height),
-            remote_shards: Default::default(),
+            remote_shards: BTreeSet::new(),
         }
     }
 
@@ -528,17 +528,18 @@ mod tests {
         let wid = wave(1);
         r.record_vote_retry(wid.clone(), make_retry(ms(0)));
 
+        let timeout_ms = u64::try_from(VOTE_RETRY_TIMEOUT.as_millis()).unwrap_or(u64::MAX);
         // Before the window: no effect.
-        let effects = r.check_vote_retry_timeouts(ms(VOTE_RETRY_TIMEOUT.as_millis() as u64 - 1));
+        let effects = r.check_vote_retry_timeouts(ms(timeout_ms - 1));
         assert!(effects.is_empty());
 
         // At the window: one effect, attempt bumped.
-        let effects = r.check_vote_retry_timeouts(ms(VOTE_RETRY_TIMEOUT.as_millis() as u64));
+        let effects = r.check_vote_retry_timeouts(ms(timeout_ms));
         assert_eq!(effects.len(), 1);
         assert_eq!(effects[0].attempt, Attempt(1));
 
         // Retry cooldown restarts from the new sent_at.
-        let effects = r.check_vote_retry_timeouts(ms(VOTE_RETRY_TIMEOUT.as_millis() as u64 + 1));
+        let effects = r.check_vote_retry_timeouts(ms(timeout_ms + 1));
         assert!(effects.is_empty());
     }
 
@@ -660,7 +661,7 @@ mod tests {
             }
             // Assign some subset of txs to some subset of waves.
             for (i, idx) in assignment_indices.iter().enumerate() {
-                let tx = TxHash::from_raw(Hash::from_bytes(&[i as u8; 32]));
+                let tx = TxHash::from_raw(Hash::from_bytes(&[u8::try_from(i).unwrap_or(u8::MAX); 32]));
                 let wid = &wave_ids[idx % wave_ids.len()];
                 r.assign_tx(tx, wid.clone());
             }
@@ -668,8 +669,8 @@ mod tests {
             let _ = r.prune_resolved();
 
             // Invariant 1: every assignment points to a live wave.
-            for wid in (0..20).filter_map(|i| {
-                r.wave_assignment(&TxHash::from_raw(Hash::from_bytes(&[i as u8; 32])))
+            for wid in (0_u8..20).filter_map(|i| {
+                r.wave_assignment(&TxHash::from_raw(Hash::from_bytes(&[i; 32])))
             }) {
                 prop_assert!(r.contains_wave(&wid));
             }
@@ -678,12 +679,12 @@ mod tests {
             // which is the same invariant).
             for (wid, _) in r.waves_iter() {
                 // Surviving waves must have at least one assignment.
-                let referenced = (0..20).any(|i| {
-                    r.wave_assignment(&TxHash::from_raw(Hash::from_bytes(&[i as u8; 32])))
+                let referenced = (0_u8..20).any(|i| {
+                    r.wave_assignment(&TxHash::from_raw(Hash::from_bytes(&[i; 32])))
                         .as_ref()
                         == Some(wid)
                 });
-                prop_assert!(referenced, "surviving wave {:?} not referenced by any assignment", wid);
+                prop_assert!(referenced, "surviving wave {wid:?} not referenced by any assignment");
             }
         }
     }

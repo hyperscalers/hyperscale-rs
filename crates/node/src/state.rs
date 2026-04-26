@@ -660,7 +660,7 @@ impl StateMachine for NodeStateMachine {
                 // emission. Thread both through.
                 let mut actions =
                     self.execution
-                        .on_execution_batch_completed(wave_id, results, tx_outcomes);
+                        .on_execution_batch_completed(&wave_id, results, tx_outcomes);
                 actions.extend(self.execution.emit_vote_actions(self.topology.snapshot()));
                 actions
             }
@@ -684,7 +684,7 @@ impl StateMachine for NodeStateMachine {
                 certificate,
             } => self.execution.on_certificate_aggregated(
                 self.topology.snapshot(),
-                wave_id,
+                &wave_id,
                 certificate,
             ),
             ProtocolEvent::ExecutionCertificateReceived { cert } => self

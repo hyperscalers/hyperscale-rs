@@ -24,6 +24,7 @@ use std::collections::{HashMap, HashSet};
 /// A detected conflict: the loser tx should be aborted at the given commit.
 #[derive(Debug, Clone)]
 pub struct DetectedConflict {
+    /// Transaction the conflict resolution declares as the loser (to abort).
     pub loser_tx: TxHash,
     /// Weighted timestamp of the commit that detected this conflict.
     /// Anchors time-based wave state (vote anchor, provisioning timestamp).
@@ -57,22 +58,24 @@ struct StoredProvision {
 #[derive(Debug, Default)]
 pub struct ConflictDetector {
     // ── Local tx tracking ────────────────────────────────────────────
-    /// tx_hash → per-shard remote node needs (nodes this tx needs from each remote shard).
+    /// `tx_hash` → per-shard remote node needs (nodes this tx needs from each remote shard).
     tx_needs: HashMap<TxHash, HashMap<ShardGroupId, HashSet<NodeId>>>,
-    /// tx_hash → local owned nodes (nodes this tx owns on our shard).
+    /// `tx_hash` → local owned nodes (nodes this tx owns on our shard).
     tx_owned: HashMap<TxHash, HashSet<NodeId>>,
-    /// Reverse index: shard → tx_hashes needing provisions from that shard.
+    /// Reverse index: shard → `tx_hashes` needing provisions from that shard.
     txs_by_shard: HashMap<ShardGroupId, HashSet<TxHash>>,
 
     // ── Provision tracking (for reverse detection) ───────────────────
-    /// Stored provision node-IDs keyed by (remote_tx_hash, source_shard).
+    /// Stored provision node-IDs keyed by (`remote_tx_hash`, `source_shard`).
     /// Used when a local tx registers after provisions already committed.
     stored_provisions: HashMap<(TxHash, ShardGroupId), StoredProvision>,
-    /// Reverse index: source_shard → remote tx hashes with stored provisions.
+    /// Reverse index: `source_shard` → remote tx hashes with stored provisions.
     provisions_by_shard: HashMap<ShardGroupId, HashSet<TxHash>>,
 }
 
 impl ConflictDetector {
+    /// Create an empty detector with no registered txs or provisions.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -271,11 +274,13 @@ impl ConflictDetector {
     }
 
     /// Number of local transactions being tracked.
+    #[must_use]
     pub fn tracked_tx_count(&self) -> usize {
         self.tx_needs.len()
     }
 
     /// Number of stored provision entries.
+    #[must_use]
     pub fn stored_provision_count(&self) -> usize {
         self.stored_provisions.len()
     }
@@ -289,7 +294,7 @@ mod tests {
         TopologySnapshot, TxEntries, ValidatorId, ValidatorInfo, ValidatorSet,
     };
 
-    /// Create a NodeId that routes to `target_shard` under modulo-hash routing.
+    /// Create a `NodeId` that routes to `target_shard` under modulo-hash routing.
     fn node_on_shard(target_shard: ShardGroupId, num_shards: u64) -> NodeId {
         for i in 0u64.. {
             let mut bytes = [0u8; 30];
@@ -302,7 +307,7 @@ mod tests {
         unreachable!()
     }
 
-    /// Find two distinct NodeIds that both route to the given shard.
+    /// Find two distinct `NodeId`s that both route to the given shard.
     fn two_nodes_on_shard(target_shard: ShardGroupId, num_shards: u64) -> (NodeId, NodeId) {
         let mut found = Vec::new();
         for i in 0u64.. {

@@ -39,10 +39,11 @@ pub const REBROADCAST_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OutboundCertMemoryStats {
+    /// Number of (wave, target-shard) entries currently being retained for re-broadcast.
     pub tracked_certificates: usize,
 }
 
-/// A single tracked outbound EC for one (wave, target_shard) destination.
+/// A single tracked outbound EC for one (wave, `target_shard`) destination.
 struct OutboundCertEntry {
     certificate: Arc<ExecutionCertificate>,
     target_shard: ShardGroupId,
@@ -59,15 +60,18 @@ struct OutboundCertEntry {
 /// One re-broadcast directive emitted on a tick.
 #[derive(Debug)]
 pub struct RebroadcastDirective {
+    /// Shard the EC should be re-broadcast to.
     pub target_shard: ShardGroupId,
+    /// The execution certificate to re-broadcast.
     pub certificate: Arc<ExecutionCertificate>,
+    /// Per-shard recipients (peer pool) for the broadcast.
     pub recipients: Vec<ValidatorId>,
 }
 
 /// Sub-state machine that retains and periodically re-broadcasts ECs
 /// destined for remote shards until they ACK by finalizing the wave.
 pub struct OutboundExecutionCertificateTracker {
-    /// (wave_id, target_shard) → entry. One EC may be tracked once per
+    /// (`wave_id`, `target_shard`) → entry. One EC may be tracked once per
     /// remote target shard it was sent to.
     entries: HashMap<(WaveId, ShardGroupId), OutboundCertEntry>,
     now: WeightedTimestamp,
@@ -270,11 +274,15 @@ mod tests {
         t.on_broadcast(cert(w), ShardGroupId(1), vids(&[4]));
 
         // Just before interval — no directive.
-        let directives = t.on_block_committed(ts(REBROADCAST_INTERVAL.as_millis() as u64 - 1));
+        let directives = t.on_block_committed(ts(u64::try_from(REBROADCAST_INTERVAL.as_millis())
+            .unwrap_or(u64::MAX)
+            - 1));
         assert!(directives.is_empty());
 
         // At interval — one directive.
-        let directives = t.on_block_committed(ts(REBROADCAST_INTERVAL.as_millis() as u64));
+        let directives = t.on_block_committed(ts(
+            u64::try_from(REBROADCAST_INTERVAL.as_millis()).unwrap_or(u64::MAX)
+        ));
         assert_eq!(directives.len(), 1);
         assert_eq!(directives[0].target_shard, ShardGroupId(1));
         assert_eq!(directives[0].recipients, vids(&[4]));
@@ -288,7 +296,7 @@ mod tests {
         let w = wave(0, 100, &[1]);
         t.on_broadcast(cert(w), ShardGroupId(1), vids(&[4]));
 
-        let interval_ms = REBROADCAST_INTERVAL.as_millis() as u64;
+        let interval_ms = u64::try_from(REBROADCAST_INTERVAL.as_millis()).unwrap_or(u64::MAX);
         let d1 = t.on_block_committed(ts(interval_ms));
         let d2 = t.on_block_committed(ts(interval_ms + 1));
         let d3 = t.on_block_committed(ts(interval_ms * 2));
@@ -306,7 +314,9 @@ mod tests {
         t.on_broadcast(cert(w), ShardGroupId(1), vids(&[4]));
 
         let past = RETENTION_HORIZON + Duration::from_secs(1);
-        t.on_block_committed(ts(1_000 + past.as_millis() as u64));
+        t.on_block_committed(ts(
+            1_000 + u64::try_from(past.as_millis()).unwrap_or(u64::MAX)
+        ));
         assert_eq!(t.memory_stats().tracked_certificates, 0);
     }
 

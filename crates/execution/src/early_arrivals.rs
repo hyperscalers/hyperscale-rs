@@ -14,15 +14,15 @@
 //!
 //! ## ECs that arrive before the tx's wave assignment exists
 //!
-//! A cross-shard [`ExecutionCertificate`] covers tx_hashes from the remote
+//! A cross-shard [`ExecutionCertificate`] covers `tx_hashes` from the remote
 //! shard's wave decomposition. Some of those txs may land in local blocks
 //! that haven't committed yet, so we can't route the EC immediately. The
-//! buffer holds the EC by its `wave_id` with a pending-tx set; as tx_hashes
+//! buffer holds the EC by its `wave_id` with a pending-tx set; as `tx_hashes`
 //! land locally, we drain the EC back into the routing pipeline.
 //!
 //! The EC buffer has a two-level invariant: `pending_routing[wave_id]`
 //! holds one bookkeeping entry per EC with the set of still-unrouted
-//! tx_hashes; `tx_index[tx_hash]` holds the reverse index from tx_hash to
+//! `tx_hashes`; `tx_index[tx_hash]` holds the reverse index from `tx_hash` to
 //! the ECs that mention it. Both sides must stay consistent — inserts
 //! record into both, routed-clears decrement both, and stale-prunes remove
 //! from both.
@@ -32,7 +32,7 @@
 //! - [`EARLY_VOTE_RETENTION`]: how long to hold votes whose block has never
 //!   committed locally. Cleanup at commit time drops older entries since
 //!   failure to commit past this window signals BFT is broken.
-//! - [`EC_BUFFER_RETENTION`]: how long to hold ECs referencing tx_hashes
+//! - [`EC_BUFFER_RETENTION`]: how long to hold ECs referencing `tx_hashes`
 //!   that never land locally (orphaned txs or malicious remotes). Sized
 //!   well above plausible cross-shard inclusion lag.
 
@@ -53,8 +53,8 @@ use std::time::Duration;
 pub(crate) const EARLY_VOTE_RETENTION: Duration = WAVE_TIMEOUT;
 
 /// Maximum age before a buffered EC is considered stale and evicted. Bounds
-/// the leak from ECs whose tx_hashes never land in a local block (orphaned
-/// txs, malicious or buggy remotes referencing tx_hashes our shard will
+/// the leak from ECs whose `tx_hashes` never land in a local block (orphaned
+/// txs, malicious or buggy remotes referencing `tx_hashes` our shard will
 /// never see). Sized at `WAVE_TIMEOUT * 2` — twice the cross-shard execution
 /// window covers a slow remote committing locally well past its source
 /// commit, while still bounding the leak.
@@ -62,9 +62,9 @@ const EC_BUFFER_RETENTION: Duration = Duration::from_secs(WAVE_TIMEOUT.as_secs()
 
 /// Bookkeeping for an EC awaiting local routing.
 ///
-/// Holds a single owning reference to the EC plus the set of tx_hashes from
+/// Holds a single owning reference to the EC plus the set of `tx_hashes` from
 /// `tx_outcomes` that haven't yet been matched to a local wave. As each
-/// unrouted tx eventually commits locally, the tx_hash is removed from
+/// unrouted tx eventually commits locally, the `tx_hash` is removed from
 /// `pending_txs`; when the set drains to empty the EC has been fully routed
 /// and the entry is dropped.
 #[derive(Debug)]
@@ -81,8 +81,8 @@ pub(crate) struct EarlyArrivalBuffer {
     /// Execution votes that arrived before tracking started, keyed by wave.
     votes: HashMap<WaveId, Vec<ExecutionVote>>,
 
-    /// Reverse index from tx_hash to any buffered ECs mentioning it.
-    /// Multiple tx_hash entries may reference the same `Arc<EC>` (one EC
+    /// Reverse index from `tx_hash` to any buffered ECs mentioning it.
+    /// Multiple `tx_hash` entries may reference the same `Arc<EC>` (one EC
     /// covers many txs).
     tx_index: HashMap<TxHash, Vec<Arc<ExecutionCertificate>>>,
 
@@ -132,7 +132,7 @@ impl EarlyArrivalBuffer {
     // ─── ECs ────────────────────────────────────────────────────────────
 
     /// Buffer an EC under `tx_hashes` that don't yet have a local wave
-    /// assignment. Idempotent: tx_hashes already tracked for this EC's
+    /// assignment. Idempotent: `tx_hashes` already tracked for this EC's
     /// `wave_id` are skipped, so replaying a previously-buffered EC won't
     /// create duplicate entries in the reverse index.
     pub fn buffer_ec(
@@ -164,7 +164,7 @@ impl EarlyArrivalBuffer {
 
     /// Mark `tx_hashes` as routed for `ec`. When the pending set drains to
     /// empty the EC has been fully delivered and the entry is dropped.
-    /// The reverse index is NOT touched here — the EC's tx_hashes are
+    /// The reverse index is NOT touched here — the EC's `tx_hashes` are
     /// drained explicitly by [`drain_ecs_for_txs`] when those txs commit.
     pub fn clear_routed(&mut self, ec: &Arc<ExecutionCertificate>, tx_hashes: &[TxHash]) {
         let Some(entry) = self.pending_routing.get_mut(&ec.wave_id) else {
@@ -182,7 +182,7 @@ impl EarlyArrivalBuffer {
     /// returned vec is deduplicated by `Arc` identity — a single EC that
     /// covers multiple newly-committed txs appears once.
     ///
-    /// The reverse index is cleared for each drained tx_hash; the
+    /// The reverse index is cleared for each drained `tx_hash`; the
     /// `pending_routing` entry is left alone (the caller will typically
     /// feed the EC into `handle_wave_attestation`, which then calls
     /// `clear_routed` to drop the entry).
@@ -203,7 +203,7 @@ impl EarlyArrivalBuffer {
     }
 
     /// Drop buffered ECs older than [`EC_BUFFER_RETENTION`]. Covers the
-    /// leak from tx_hashes that never land locally (orphaned txs or
+    /// leak from `tx_hashes` that never land locally (orphaned txs or
     /// malicious remotes referencing unknown txs). Returns the number of
     /// ECs evicted.
     ///
@@ -211,7 +211,7 @@ impl EarlyArrivalBuffer {
     /// retention window), so pre-first-commit buffered entries aren't
     /// wiped on the very first timeout check.
     pub fn gc_stale_ecs(&mut self, now_ts: WeightedTimestamp) -> usize {
-        if now_ts.as_millis() < EC_BUFFER_RETENTION.as_millis() as u64 {
+        if now_ts.as_millis() < u64::try_from(EC_BUFFER_RETENTION.as_millis()).unwrap_or(u64::MAX) {
             return 0;
         }
         let cutoff = now_ts.minus(EC_BUFFER_RETENTION);
@@ -270,7 +270,7 @@ impl EarlyArrivalBuffer {
     /// How many buffered ECs mention `tx_hash` — the count surfaced by the
     /// coordinator's `certificate_tracking_debug` output.
     pub fn attestation_count_for_tx(&self, tx_hash: &TxHash) -> usize {
-        self.tx_index.get(tx_hash).map(|v| v.len()).unwrap_or(0)
+        self.tx_index.get(tx_hash).map_or(0, Vec::len)
     }
 }
 
@@ -282,6 +282,7 @@ mod tests {
         ExecutionOutcome, GlobalReceiptHash, ShardGroupId, SignerBitfield, TxHash, TxOutcome,
         ValidatorId,
     };
+    use std::collections::BTreeSet;
 
     fn shard() -> ShardGroupId {
         ShardGroupId(0)
@@ -291,7 +292,7 @@ mod tests {
         WaveId {
             shard_group_id: shard(),
             block_height: BlockHeight(height),
-            remote_shards: Default::default(),
+            remote_shards: BTreeSet::new(),
         }
     }
 
@@ -329,7 +330,7 @@ mod tests {
             &wave_id,
             wave_id.shard_group_id,
             &global_receipt_root,
-            tx_outcomes.len() as u32,
+            u32::try_from(tx_outcomes.len()).unwrap_or(u32::MAX),
         );
         let kp = bls_keypair_from_seed(&[7u8; 32]);
         let signature = kp.sign_v1(&msg);
@@ -340,7 +341,7 @@ mod tests {
             wave_id,
             shard_group_id: shard(),
             global_receipt_root,
-            tx_count: tx_outcomes.len() as u32,
+            tx_count: u32::try_from(tx_outcomes.len()).unwrap_or(u32::MAX),
             tx_outcomes,
             validator: ValidatorId(0),
             signature,
@@ -509,7 +510,7 @@ mod tests {
 
         // now_ts below EC_BUFFER_RETENTION → no-op, even though the entry
         // was buffered at timestamp 0.
-        let just_under = EC_BUFFER_RETENTION.as_millis() as u64 - 1;
+        let just_under = u64::try_from(EC_BUFFER_RETENTION.as_millis()).unwrap_or(u64::MAX) - 1;
         assert_eq!(b.gc_stale_ecs(ms(just_under)), 0);
         assert_eq!(b.pending_routing_len(), 1);
     }
@@ -582,7 +583,7 @@ mod tests {
             let mut b = EarlyArrivalBuffer::new();
             for (i, h) in heights.iter().enumerate() {
                 let w = wave(*h);
-                let tx = TxHash::from_raw(Hash::from_bytes(&[(i as u8); 32]));
+                let tx = TxHash::from_raw(Hash::from_bytes(&[u8::try_from(i).unwrap_or(u8::MAX); 32]));
                 let age = ages_ms[i % ages_ms.len()];
                 let ts = if age >= now_ms { ms(0) } else { ms(now_ms - age) };
                 b.buffer_ec(&make_ec(w.clone(), &[tx]), &[tx], ts);

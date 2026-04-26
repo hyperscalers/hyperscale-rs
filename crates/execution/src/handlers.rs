@@ -24,7 +24,8 @@ use crate::wave_state::WaveState;
 /// signer bitfield using the committee's indices.
 ///
 /// `tx_outcomes` are extracted from the first vote — all quorum votes carry
-/// identical outcomes (they share the same global_receipt_root).
+/// identical outcomes (they share the same `global_receipt_root`).
+#[must_use]
 pub fn aggregate_execution_certificate(
     wave_id: &WaveId,
     global_receipt_root: GlobalReceiptRoot,
@@ -46,11 +47,11 @@ pub fn aggregate_execution_certificate(
     let bls_signatures: Vec<Bls12381G2Signature> =
         unique_votes.iter().map(|vote| vote.signature).collect();
 
-    let aggregated_signature = if !bls_signatures.is_empty() {
+    let aggregated_signature = if bls_signatures.is_empty() {
+        zero_bls_signature()
+    } else {
         Bls12381G2Signature::aggregate(&bls_signatures, true)
             .unwrap_or_else(|_| zero_bls_signature())
-    } else {
-        zero_bls_signature()
     };
 
     // Create signer bitfield using committee ordering
@@ -68,8 +69,7 @@ pub fn aggregate_execution_certificate(
 
     let vote_anchor_ts = votes
         .first()
-        .map(|v| v.vote_anchor_ts)
-        .unwrap_or(WeightedTimestamp::ZERO);
+        .map_or(WeightedTimestamp::ZERO, |v| v.vote_anchor_ts);
 
     ExecutionCertificate::new(
         wave_id.clone(),
@@ -84,7 +84,7 @@ pub fn aggregate_execution_certificate(
 /// Batch verify execution votes.
 ///
 /// Uses BLS same-message batch verification since all votes in a wave
-/// should sign the same message (same global_receipt_root). Falls back to
+/// should sign the same message (same `global_receipt_root`). Falls back to
 /// individual verification on batch failure.
 ///
 /// Returns an iterator of `(vote, voting_power)` for verified votes.
@@ -144,6 +144,7 @@ pub fn batch_verify_execution_votes(
 /// Verify an execution certificate's aggregated signature.
 ///
 /// Verify an execution certificate's aggregated BLS signature.
+#[must_use]
 pub fn verify_execution_certificate_signature(
     certificate: &ExecutionCertificate,
     public_keys: &[Bls12381G1PublicKey],
@@ -153,7 +154,7 @@ pub fn verify_execution_certificate_signature(
         &certificate.wave_id,
         certificate.shard_group_id(),
         &certificate.global_receipt_root,
-        certificate.tx_outcomes.len() as u32,
+        u32::try_from(certificate.tx_outcomes.len()).unwrap_or(u32::MAX),
     );
 
     let signer_keys: Vec<_> = public_keys
@@ -255,7 +256,7 @@ mod tests {
         WaveId {
             shard_group_id: shard(),
             block_height: BlockHeight(height),
-            remote_shards: Default::default(),
+            remote_shards: BTreeSet::new(),
         }
     }
 
@@ -289,7 +290,7 @@ mod tests {
         anchor: WeightedTimestamp,
         tx_outcomes: Vec<TxOutcome>,
     ) -> ExecutionVote {
-        let tx_count = tx_outcomes.len() as u32;
+        let tx_count = u32::try_from(tx_outcomes.len()).unwrap_or(u32::MAX);
         let msg = exec_vote_message(anchor, wid, shard(), &global_receipt_root, tx_count);
         ExecutionVote {
             block_hash: BlockHash::ZERO,
@@ -513,12 +514,12 @@ mod tests {
         let wid = wave_id(1);
         let root = GlobalReceiptRoot::from_raw(Hash::from_bytes(b"root"));
         let outcomes = vec![outcome(TxHash::from_raw(Hash::from_bytes(b"tx")))];
-        let sks: Vec<_> = (0..4).map(|i| keypair(i as u8)).collect();
+        let sks: Vec<_> = (0_u8..4).map(keypair).collect();
 
-        let votes: Vec<ExecutionVote> = (0..4)
+        let votes: Vec<ExecutionVote> = (0_usize..4)
             .map(|i| {
                 signed_vote(
-                    ValidatorId(i as u64),
+                    ValidatorId(u64::try_from(i).unwrap()),
                     &sks[i],
                     &wid,
                     root,
@@ -529,7 +530,7 @@ mod tests {
             .collect();
         let ec = aggregate_execution_certificate(&wid, root, &votes, &committee);
 
-        let pubs: Vec<_> = sks.iter().map(|sk| sk.public_key()).collect();
+        let pubs: Vec<_> = sks.iter().map(Bls12381G1PrivateKey::public_key).collect();
         assert!(verify_execution_certificate_signature(&ec, &pubs));
     }
 
@@ -610,7 +611,7 @@ mod tests {
             Some(Action::ExecuteTransactions { transactions, .. }) => {
                 assert_eq!(transactions.len(), 2);
             }
-            other => panic!("expected ExecuteTransactions, got {:?}", other),
+            other => panic!("expected ExecuteTransactions, got {other:?}"),
         }
     }
 
@@ -644,7 +645,7 @@ mod tests {
                 assert_eq!(requests.len(), 1);
                 assert_eq!(requests[0].tx_hash, tx_hash);
             }
-            other => panic!("expected ExecuteCrossShardTransactions, got {:?}", other),
+            other => panic!("expected ExecuteCrossShardTransactions, got {other:?}"),
         }
     }
 
@@ -660,7 +661,7 @@ mod tests {
                 assert_eq!(transactions.len(), 1);
                 assert_ne!(transactions[0].hash(), aborted);
             }
-            other => panic!("expected ExecuteTransactions, got {:?}", other),
+            other => panic!("expected ExecuteTransactions, got {other:?}"),
         }
     }
 

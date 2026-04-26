@@ -35,7 +35,7 @@
 //!
 //! ## Phase 5: Finalization
 //! Validators collect shard execution proofs from all participating shards. When all
-//! proofs are received, a WaveCertificate is created.
+//! proofs are received, a `WaveCertificate` is created.
 
 use hyperscale_core::{Action, ProtocolEvent, ProvisionRequest};
 use hyperscale_types::{
@@ -64,13 +64,13 @@ use crate::waves::{PendingVoteRetry, RetryEffect, WaveRegistry};
 
 /// Data returned when a wave is ready for voting.
 ///
-/// The state machine produces this; the io_loop uses it to sign the execution vote
+/// The state machine produces this; the `io_loop` uses it to sign the execution vote
 /// and broadcast (since the state machine doesn't hold the signing key).
 #[derive(Debug)]
 pub struct CompletionData {
     /// Block this wave belongs to.
     pub block_hash: BlockHash,
-    /// Block height (= wave_starting_height).
+    /// Block height (= `wave_starting_height`).
     pub block_height: BlockHeight,
     /// BFT-authenticated weighted timestamp at which this wave's outcome is
     /// fixed. Included in the vote payload and the EC canonical hash, so all
@@ -91,20 +91,35 @@ use hyperscale_types::FinalizedWave;
 pub struct ExecutionMemoryStats {
     /// Total receipts held across all in-flight waves, awaiting finalization.
     pub wave_execution_receipts: usize,
+    /// Finalized waves cached in memory until their proposing block commits.
     pub finalized_wave_certificates: usize,
+    /// Active wave states being tracked.
     pub waves: usize,
+    /// Per-wave vote trackers awaiting quorum.
     pub vote_trackers: usize,
+    /// Buffered execution votes waiting for their wave to begin.
     pub early_votes: usize,
+    /// Expected EC arrivals from remote shards we're awaiting.
     pub expected_exec_certs: usize,
+    /// Verified provisions held per cross-shard tx.
     pub verified_provisions: usize,
+    /// Distinct (tx, source-shard) requirements awaiting provisioning.
     pub required_provision_shards: usize,
+    /// Distinct (tx, source-shard) provisions received so far.
     pub received_provision_shards: usize,
+    /// Waves whose local EC has been emitted.
     pub waves_with_ec: usize,
+    /// Vote retries scheduled for resend after rotation timeout.
     pub pending_vote_retries: usize,
+    /// Active tx → wave assignments in the registry.
     pub wave_assignments: usize,
+    /// Early wave attestations buffered before local routing.
     pub early_wave_attestations: usize,
+    /// Buffered ECs awaiting tx assignment routing.
     pub pending_routing: usize,
+    /// Expected ECs that have already been fulfilled (kept for diagnostics).
     pub fulfilled_exec_certs: usize,
+    /// Outbound ECs retained for re-broadcast to remote shards.
     pub outbound_certs: usize,
 }
 
@@ -203,6 +218,7 @@ type WaveAssignments = BTreeMap<WaveId, Vec<WaveTxEntry>>;
 
 impl ExecutionCoordinator {
     /// Create a new execution state machine.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             finalized: FinalizedWaveStore::new(),
@@ -225,10 +241,9 @@ impl ExecutionCoordinator {
     /// Partitions transactions by their provision dependency set (remote shards
     /// needed). All validators compute identical assignments from the same block.
     ///
-    /// Returns a map from WaveId to list of (tx, participating_shards) in
+    /// Returns a map from `WaveId` to list of (tx, `participating_shards`) in
     /// block order within each wave.
     fn assign_waves(
-        &self,
         topology: &TopologySnapshot,
         block_height: BlockHeight,
         transactions: &[Arc<RoutableTransaction>],
@@ -281,7 +296,7 @@ impl ExecutionCoordinator {
         block_ts: WeightedTimestamp,
         transactions: &[Arc<RoutableTransaction>],
     ) -> (Vec<Action>, Vec<ExecutionVote>) {
-        let waves = self.assign_waves(topology, block_height, transactions);
+        let waves = Self::assign_waves(topology, block_height, transactions);
         let quorum = topology.local_quorum_threshold();
         let local_shard = topology.local_shard();
         let mut dispatch_actions: Vec<Action> = Vec::new();
@@ -393,6 +408,11 @@ impl ExecutionCoordinator {
     /// 2. The `WAVE_TIMEOUT` deadline has passed (wave aborts entirely)
     ///
     /// Waves that already had an EC formed are skipped.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a wave reported in the votable set is missing from the
+    /// registry — the filter and lookup race-free, so this is unreachable.
     pub fn scan_complete_waves(&mut self) -> Vec<CompletionData> {
         let committed_ts = self.committed_ts;
 
@@ -446,7 +466,7 @@ impl ExecutionCoordinator {
     /// here rather than waiting for some unrelated trigger.
     pub fn on_execution_batch_completed(
         &mut self,
-        wave_id: WaveId,
+        wave_id: &WaveId,
         results: Vec<LocalExecutionEntry>,
         tx_outcomes: Vec<TxOutcome>,
     ) -> Vec<Action> {
@@ -458,7 +478,7 @@ impl ExecutionCoordinator {
             return Vec::new();
         }
 
-        let Some(wave) = self.waves.get_wave_mut(&wave_id) else {
+        let Some(wave) = self.waves.get_wave_mut(wave_id) else {
             tracing::warn!(
                 wave = %wave_id,
                 "ExecutionBatchCompleted for unknown wave — dropping (wave was pruned or never created)"
@@ -481,7 +501,7 @@ impl ExecutionCoordinator {
         // finalization from here so the deferred finalize happens on the
         // same event that unblocked it.
         if wave.is_complete() {
-            self.finalize_wave(&wave_id)
+            self.finalize_wave(wave_id)
         } else {
             Vec::new()
         }
@@ -656,8 +676,14 @@ impl ExecutionCoordinator {
     ///
     /// Only the wave leader (or a fallback leader via rotation) aggregates votes.
     /// If a vote arrives at a non-leader that has the accumulator but no tracker,
-    /// a fallback VoteTracker is created on-demand (the sender determined this
+    /// a fallback `VoteTracker` is created on-demand (the sender determined this
     /// validator is the rotated leader for their retry attempt).
+    ///
+    /// # Panics
+    ///
+    /// Panics if a vote tracker is created or recovered for a wave but is
+    /// missing on the immediate `take_unverified_votes` lookup — the tracker
+    /// is locked across `&mut self`, so this is unreachable.
     pub fn on_execution_vote(
         &mut self,
         topology: &TopologySnapshot,
@@ -890,7 +916,7 @@ impl ExecutionCoordinator {
     pub fn on_certificate_aggregated(
         &mut self,
         topology: &TopologySnapshot,
-        wave_id: WaveId,
+        wave_id: &WaveId,
         certificate: hyperscale_types::ExecutionCertificate,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
@@ -942,7 +968,7 @@ impl ExecutionCoordinator {
         );
 
         // Feed the EC to the wave-level certificate tracker for finalization.
-        actions.extend(self.handle_wave_attestation(topology, certificate));
+        actions.extend(self.handle_wave_attestation(topology, &certificate));
 
         actions
     }
@@ -1041,7 +1067,7 @@ impl ExecutionCoordinator {
             });
         }
 
-        actions.extend(self.handle_wave_attestation(topology, ec_arc));
+        actions.extend(self.handle_wave_attestation(topology, &ec_arc));
         actions
     }
 
@@ -1367,7 +1393,7 @@ impl ExecutionCoordinator {
 
     /// Sealed path: past the cross-shard execution window. Waves will
     /// finalize from the already-aggregated cert + receipts included
-    /// downstream, so we skip WaveState creation, dispatch, and vote
+    /// downstream, so we skip `WaveState` creation, dispatch, and vote
     /// tracking. Only the tx → wave mapping is recorded (plus any early
     /// ECs replayed) so a late-arriving cert still routes back to each
     /// tx for mempool terminal-state bookkeeping.
@@ -1403,14 +1429,14 @@ impl ExecutionCoordinator {
             "Replaying early wave attestations for newly committed txs"
         );
         let mut actions = Vec::new();
-        for ec in ecs_to_replay {
+        for ec in &ecs_to_replay {
             actions.extend(self.handle_wave_attestation(topology, ec));
         }
         actions
     }
 
     /// Register tx → wave assignments for a `Sealed` block without any of
-    /// the execution-side state setup (WaveState, vote tracker, conflict
+    /// the execution-side state setup (`WaveState`, vote tracker, conflict
     /// detector, required-provision tracking). The block's waves are
     /// already settled; we only need the mapping so a future cert can
     /// route back to the tx for mempool terminal-state bookkeeping.
@@ -1420,7 +1446,7 @@ impl ExecutionCoordinator {
         block_height: BlockHeight,
         transactions: &[Arc<RoutableTransaction>],
     ) {
-        let waves = self.assign_waves(topology, block_height, transactions);
+        let waves = Self::assign_waves(topology, block_height, transactions);
         for (wave_id, txs) in waves {
             for (tx, _) in &txs {
                 self.waves.assign_tx(tx.hash(), wave_id.clone());
@@ -1434,25 +1460,25 @@ impl ExecutionCoordinator {
 
     /// Handle a wave-level attestation (execution certificate) from any shard.
     ///
-    /// A remote EC's wave_id reflects the remote shard's wave decomposition,
+    /// A remote EC's `wave_id` reflects the remote shard's wave decomposition,
     /// which differs from the local shard's. A single remote EC may contain
     /// outcomes for transactions in MULTIPLE local waves.
     ///
-    /// Routing: iterate tx_outcomes → look up local wave via wave_assignments →
-    /// feed the EC to each affected local wave tracker. Tx_hashes without a
+    /// Routing: iterate `tx_outcomes` → look up local wave via `wave_assignments` →
+    /// feed the EC to each affected local wave tracker. `Tx_hashes` without a
     /// local assignment are buffered (or kept buffered) via `pending_routing`
-    /// until their blocks commit; routed tx_hashes are cleared from the
+    /// until their blocks commit; routed `tx_hashes` are cleared from the
     /// pending set, dropping the EC entirely once fully routed.
     fn handle_wave_attestation(
         &mut self,
         _topology: &TopologySnapshot,
-        ec: Arc<ExecutionCertificate>,
+        ec: &Arc<ExecutionCertificate>,
     ) -> Vec<Action> {
-        let routing = self.waves.classify_attestation(&ec);
+        let routing = self.waves.classify_attestation(ec);
 
-        self.early.clear_routed(&ec, &routing.routed_tx_hashes);
+        self.early.clear_routed(ec, &routing.routed_tx_hashes);
         self.early
-            .buffer_ec(&ec, &routing.unrouted_tx_hashes, self.committed_ts);
+            .buffer_ec(ec, &routing.unrouted_tx_hashes, self.committed_ts);
 
         if routing.affected_waves.is_empty() {
             return vec![];
@@ -1467,14 +1493,14 @@ impl ExecutionCoordinator {
             let Some(wave) = self.waves.get_wave_mut(wave_id) else {
                 continue;
             };
-            if wave.add_execution_certificate(Arc::clone(&ec)) && wave.is_complete() {
+            if wave.add_execution_certificate(Arc::clone(ec)) && wave.is_complete() {
                 actions.extend(self.finalize_wave(wave_id));
             }
         }
         actions
     }
 
-    /// Finalize a wave: create WaveCertificate, record FinalizedWave, emit events.
+    /// Finalize a wave: create `WaveCertificate`, record `FinalizedWave`, emit events.
     ///
     /// Called when the wave's local EC is present and every non-aborted tx is
     /// covered by all participating shards.
@@ -1507,14 +1533,15 @@ impl ExecutionCoordinator {
             if outcome.is_aborted() {
                 continue;
             }
-            match wave.take_receipt(&outcome.tx_hash) {
-                Some(bundle) => receipts.push(bundle),
-                None => tracing::error!(
+            if let Some(bundle) = wave.take_receipt(&outcome.tx_hash) {
+                receipts.push(bundle);
+            } else {
+                tracing::error!(
                     wave = %wave_id,
                     tx_hash = ?outcome.tx_hash,
                     "finalize_wave: non-aborted tx is missing its local receipt \
                      (is_complete gate bypassed)"
-                ),
+                );
             }
         }
 
@@ -1551,16 +1578,19 @@ impl ExecutionCoordinator {
     // ═══════════════════════════════════════════════════════════════════════════
 
     /// Get the local wave assignment for a transaction.
+    #[must_use]
     pub fn get_wave_assignment(&self, tx_hash: &TxHash) -> Option<WaveId> {
         self.waves.wave_assignment(tx_hash)
     }
 
     /// Get all finalized waves (for proposal building).
+    #[must_use]
     pub fn get_finalized_waves(&self) -> Vec<Arc<FinalizedWave>> {
         self.finalized.all_waves()
     }
 
-    /// Get a finalized wave by its wave_id hash (returns Arc for sharing).
+    /// Get a finalized wave by its `wave_id` hash (returns `Arc` for sharing).
+    #[must_use]
     pub fn get_finalized_wave_by_hash(
         &self,
         wave_id_hash: &WaveIdHash,
@@ -1572,6 +1602,7 @@ impl ExecutionCoordinator {
     /// outgoing `GetBlockRequest`s so the responder can elide wave
     /// certificates the requester already has. Returns `None` when the
     /// cached set is too large to size a filter within the configured cap.
+    #[must_use]
     pub fn cert_bloom_snapshot(&self) -> Option<BloomFilter<WaveIdHash>> {
         self.finalized.cert_bloom_snapshot()
     }
@@ -1580,6 +1611,7 @@ impl ExecutionCoordinator {
     ///
     /// Returns the wave certificate if the tx is part of a finalized wave.
     /// Once committed, certificates are persisted to storage and should be fetched from there.
+    #[must_use]
     pub fn get_finalized_certificate(&self, tx_hash: &TxHash) -> Option<Arc<WaveCertificate>> {
         self.finalized.get_certificate_for_tx(tx_hash)
     }
@@ -1638,10 +1670,7 @@ impl ExecutionCoordinator {
             if registry.contains_wave(key) {
                 return true;
             }
-            votes
-                .first()
-                .map(|v| v.vote_anchor_ts > ev_cutoff)
-                .unwrap_or(false)
+            votes.first().is_some_and(|v| v.vote_anchor_ts > ev_cutoff)
         });
         let pruned_ev = before_ev - self.early.vote_len();
 
@@ -1657,6 +1686,7 @@ impl ExecutionCoordinator {
     }
 
     /// Check if a transaction is finalized (part of a finalized wave).
+    #[must_use]
     pub fn is_finalized(&self, tx_hash: &TxHash) -> bool {
         self.finalized.is_finalized(tx_hash)
     }
@@ -1664,26 +1694,30 @@ impl ExecutionCoordinator {
     /// Returns the set of all finalized transaction hashes.
     ///
     /// Used by the node orchestrator to pass to BFT for conflict filtering.
+    #[must_use]
     pub fn finalized_tx_hashes(&self) -> std::collections::HashSet<TxHash> {
         self.finalized.all_tx_hashes()
     }
 
     /// Check if we're waiting for provisioning to complete for a transaction.
     ///
-    /// Note: Actual provision tracking is handled by ProvisionCoordinator.
+    /// Note: Actual provision tracking is handled by `ProvisionCoordinator`.
+    #[must_use]
     pub fn is_awaiting_provisioning(&self, tx_hash: &TxHash) -> bool {
         self.waves.is_awaiting_provisioning(tx_hash)
     }
 
     /// Get debug info about wave state for a transaction.
+    #[must_use]
     pub fn certificate_tracking_debug(&self, tx_hash: &TxHash) -> String {
         let wave_info = if let Some(wave_id) = self.waves.wave_assignment(tx_hash) {
             if let Some(wave) = self.waves.get_wave(&wave_id) {
-                format!("wave={}, complete={}", wave_id, wave.is_complete())
+                let complete = wave.is_complete();
+                format!("wave={wave_id}, complete={complete}")
             } else if self.finalized.contains(&wave_id) {
-                format!("wave={}, finalized", wave_id)
+                format!("wave={wave_id}, finalized")
             } else {
-                format!("wave={}, no tracker", wave_id)
+                format!("wave={wave_id}, no tracker")
             }
         } else {
             "no wave assignment".to_string()
@@ -1691,7 +1725,7 @@ impl ExecutionCoordinator {
 
         let early_count = self.early.attestation_count_for_tx(tx_hash);
 
-        format!("{}, early_wave_attestations={}", wave_info, early_count)
+        format!("{wave_info}, early_wave_attestations={early_count}")
     }
 
     /// Build provision requests and shard recipients for cross-shard transactions.
@@ -1774,6 +1808,7 @@ impl ExecutionCoordinator {
     }
 
     /// Get execution memory statistics for monitoring collection sizes.
+    #[must_use]
     pub fn memory_stats(&self) -> ExecutionMemoryStats {
         ExecutionMemoryStats {
             wave_execution_receipts: self
@@ -1804,6 +1839,7 @@ impl ExecutionCoordinator {
     /// Counts unique transaction hashes in cross-shard waves that haven't yet
     /// finalized. Covers provisioning, voting, and certificate collection
     /// phases uniformly (one `WaveState` tracks all of them).
+    #[must_use]
     pub fn cross_shard_pending_count(&self) -> usize {
         self.waves.cross_shard_pending_count()
     }
@@ -1814,7 +1850,7 @@ impl std::fmt::Debug for ExecutionCoordinator {
         f.debug_struct("ExecutionCoordinator")
             .field("finalized_wave_certificates", &self.finalized.len())
             .field("waves", &self.waves.waves_len())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -1899,7 +1935,7 @@ mod tests {
         assert!(state.waves.contains_wave(&wave_id.unwrap()));
     }
 
-    /// Build a topology where the given validator_id is the local validator.
+    /// Build a topology where the given `validator_id` is the local validator.
     fn make_topology_for(local_vid: u64) -> TopologySnapshot {
         let keys: Vec<Bls12381G1PrivateKey> = (0..4).map(|_| generate_bls_keypair()).collect();
         let validators: Vec<ValidatorInfo> = keys
@@ -2163,7 +2199,7 @@ mod tests {
             hyperscale_types::SignerBitfield::new(4),
         );
 
-        let actions = state.on_certificate_aggregated(&topo, wave_id, cert);
+        let actions = state.on_certificate_aggregated(&topo, &wave_id, cert);
 
         // Should have: TrackExecutionCertificate + BroadcastEC(local) + BroadcastEC(remote shard 1)
         let broadcast_actions: Vec<_> = actions
@@ -2390,6 +2426,7 @@ mod tests {
                 tx_hash: *h,
                 local_receipt: Arc::new(hyperscale_types::LocalReceipt {
                     outcome: hyperscale_types::TransactionOutcome::Success,
+                    #[allow(clippy::default_trait_access)]
                     database_updates: Default::default(),
                     application_events: vec![],
                 }),

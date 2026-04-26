@@ -277,7 +277,7 @@ mod tests {
         assert_eq!(t.verified_len(), 1);
         assert_eq!(t.received_len(), 1);
         assert_eq!(
-            t.verified.get(&tx).map(|v| v.len()).unwrap_or(0),
+            t.verified.get(&tx).map_or(0, Vec::len),
             1,
             "one provision recorded per provisions entry"
         );
@@ -298,9 +298,9 @@ mod tests {
 
         // Two distinct source shards → two StateProvisions and two received
         // entries.
-        assert_eq!(t.verified.get(&tx).map(|v| v.len()).unwrap_or(0), 2);
+        assert_eq!(t.verified.get(&tx).map_or(0, Vec::len), 2);
         assert_eq!(
-            t.received.get(&tx).map(|s| s.len()).unwrap_or(0),
+            t.received.get(&tx).map_or(0, BTreeSet::len),
             2,
             "received set contains both source shards"
         );
@@ -330,6 +330,6 @@ mod tests {
         t.record_required(tx, [shard(1)].into_iter().collect());
         // Re-record with a different requirement set.
         t.record_required(tx, [shard(1), shard(2)].into_iter().collect());
-        assert_eq!(t.required.get(&tx).map(|s| s.len()).unwrap_or(0), 2);
+        assert_eq!(t.required.get(&tx).map_or(0, BTreeSet::len), 2);
     }
 }

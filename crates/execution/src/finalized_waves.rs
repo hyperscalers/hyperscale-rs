@@ -81,6 +81,7 @@ impl FinalizedWaveStore {
     /// The node passes this to BFT for conflict filtering — a transaction
     /// whose wave is already finalized should not be re-proposed.
     pub fn all_tx_hashes(&self) -> HashSet<TxHash> {
+        #[allow(clippy::redundant_closure_for_method_calls)] // closure required for HRTB inference
         self.waves.values().flat_map(|fw| fw.tx_hashes()).collect()
     }
 
@@ -119,12 +120,13 @@ mod tests {
         GlobalReceiptRoot, Hash, ShardGroupId, SignerBitfield, TxHash, TxOutcome,
         WeightedTimestamp,
     };
+    use std::collections::BTreeSet;
 
     fn make_wave_id(block_height: u64) -> WaveId {
         WaveId {
             shard_group_id: ShardGroupId(0),
             block_height: BlockHeight(block_height),
-            remote_shards: Default::default(),
+            remote_shards: BTreeSet::new(),
         }
     }
 

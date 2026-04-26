@@ -48,6 +48,7 @@ pub const WAVE_OVERDUE_WARN: Duration = Duration::from_secs(WAVE_TIMEOUT.as_secs
 
 /// Per-wave state across the entire execution lifecycle.
 #[derive(Debug)]
+#[allow(clippy::struct_excessive_bools)] // independent lifecycle flags, not config knobs
 pub struct WaveState {
     // ── Identity ────────────────────────────────────────────────────────
     wave_id: WaveId,
@@ -126,6 +127,7 @@ impl WaveState {
     /// `single_shard` indicates whether this is a single-shard wave (`remote_shards` empty);
     /// if so, `all_provisioned_at` / `all_provisioned_at` are set to the
     /// wave-starting block's height/timestamp immediately.
+    #[must_use]
     pub fn new(
         wave_id: WaveId,
         block_hash: BlockHash,
@@ -188,23 +190,32 @@ impl WaveState {
 
     // ── Identity getters ────────────────────────────────────────────────
 
+    /// The wave's identity ([`WaveId`]).
+    #[must_use]
     pub fn wave_id(&self) -> &WaveId {
         &self.wave_id
     }
 
+    /// Hash of the wave-starting block.
+    #[must_use]
     pub fn block_hash(&self) -> BlockHash {
         self.block_hash
     }
 
+    /// Height of the wave-starting block (mirrors `wave_id.block_height`).
+    #[must_use]
     pub fn block_height(&self) -> BlockHeight {
         self.wave_id.block_height
     }
 
+    /// Transaction hashes in this wave, in block order.
+    #[must_use]
     pub fn tx_hashes(&self) -> &[TxHash] {
         &self.tx_hashes
     }
 
     /// Transaction data by hash (for building execution requests).
+    #[must_use]
     pub fn transaction(&self, tx_hash: &TxHash) -> Option<&Arc<RoutableTransaction>> {
         self.transactions.get(tx_hash)
     }
@@ -212,17 +223,20 @@ impl WaveState {
     // ── Provisioning ────────────────────────────────────────────────────
 
     /// Whether this wave has reached full provisioning.
+    #[must_use]
     pub fn is_fully_provisioned(&self) -> bool {
         self.all_provisioned_at.is_some()
     }
 
     /// Whether execution has been dispatched for this wave.
+    #[must_use]
     pub fn dispatched(&self) -> bool {
         self.dispatched
     }
 
     /// Whether the local EC has been fed into this wave (via
     /// `add_execution_certificate` with `ec.wave_id == self.wave_id`).
+    #[must_use]
     pub fn local_ec_emitted(&self) -> bool {
         self.local_ec_emitted
     }
@@ -298,6 +312,7 @@ impl WaveState {
 
     /// Number of receipts currently held by this wave. Exposed for memory
     /// stats; receipts drain at finalization.
+    #[must_use]
     pub fn receipt_count(&self) -> usize {
         self.execution_receipts.len()
     }
@@ -357,7 +372,7 @@ impl WaveState {
     /// as `Executed`. When this validator's local abort decision disagrees
     /// with the quorum's EC (e.g. its conflict detector aborted a tx peers
     /// executed), the gate blocks here rather than synthesizing a
-    /// FinalizedWave with missing receipts. Recovery flows through the
+    /// `FinalizedWave` with missing receipts. Recovery flows through the
     /// existing peer-fetch path.
     ///
     /// Returns false if the local EC hasn't arrived yet; `local_ec_emitted`
@@ -405,6 +420,7 @@ impl WaveState {
     /// - Not provisioned: wait until `committed_ts >= wave_start_ts +
     ///   WAVE_TIMEOUT`. Upon timeout, every tx in the wave is implicitly
     ///   aborted.
+    #[must_use]
     pub fn can_emit_vote(&self, committed_ts: WeightedTimestamp) -> bool {
         if self.voted {
             return false;
@@ -425,6 +441,12 @@ impl WaveState {
     /// In the timeout-abort branch (`all_provisioned_at = None`), every
     /// tx gets an `ExecutionOutcome::Aborted`. In the provisioned branch,
     /// each tx's outcome is its explicit abort (if any) or execution result.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `can_emit_vote` says yes for the provisioned branch but a tx
+    /// is missing its execution result. The `has_outcome_for_every_tx` gate
+    /// guards against this; the panic would indicate a bug in the gating logic.
     pub fn build_vote_data(
         &mut self,
         committed_ts: WeightedTimestamp,
@@ -508,7 +530,8 @@ impl WaveState {
     /// local EC arrives (aggregated from other validators' votes) before
     /// this validator's engine finishes executing — without it,
     /// `finalize_wave` silently drops the pending txs' receipt slots and
-    /// produces a divergent FinalizedWave.
+    /// produces a divergent `FinalizedWave`.
+    #[must_use]
     pub fn is_complete(&self) -> bool {
         if !self.local_ec_emitted {
             return false;
@@ -536,6 +559,7 @@ impl WaveState {
     /// Whether a tx was aborted before dispatch (pre-dispatch reverse-conflict).
     /// Used by dispatch to skip executing txs the wave has already decided to
     /// abort.
+    #[must_use]
     pub fn is_tx_explicitly_aborted(&self, tx_hash: &TxHash) -> bool {
         self.explicit_aborts.contains(tx_hash)
     }
@@ -591,11 +615,11 @@ impl WaveState {
             block_height = self.wave_id.block_height.0,
             wave_start_ts = self.wave_start_ts.as_millis(),
             committed_ts = committed_ts.as_millis(),
-            age_ms = age.as_millis() as u64,
-            timeout_ms = WAVE_TIMEOUT.as_millis() as u64,
+            age_ms = u64::try_from(age.as_millis()).unwrap_or(u64::MAX),
+            timeout_ms = u64::try_from(WAVE_TIMEOUT.as_millis()).unwrap_or(u64::MAX),
             num_txs = total,
             provisioned = format!("{}/{}", provisioned, total),
-            all_provisioned_at = ?self.all_provisioned_at.map(|t| t.as_millis()),
+            all_provisioned_at = ?self.all_provisioned_at.map(WeightedTimestamp::as_millis),
             dispatched = self.dispatched,
             voted = self.voted,
             local_ec_emitted = self.local_ec_emitted,
@@ -615,6 +639,7 @@ impl WaveState {
     /// tx. Deterministic order: `(shard_group_id, canonical_hash)`.
     ///
     /// Callers should invoke only when `is_complete()` is true.
+    #[must_use]
     pub fn create_wave_certificate(&self) -> WaveCertificate {
         let required_remote_ec_hashes: HashSet<ExecutionCertificateHash> = self
             .execution_certificates
@@ -652,6 +677,7 @@ impl WaveState {
 
     /// Per-tx terminal decisions derived from collected ECs.
     /// Priority: Aborted > Reject > Accept.
+    #[must_use]
     pub fn tx_decisions(&self) -> Vec<(TxHash, TransactionDecision)> {
         self.tx_hashes
             .iter()
@@ -698,7 +724,12 @@ mod tests {
 
     fn make_single_shard_wave(n: usize) -> WaveState {
         let txs: Vec<(Arc<RoutableTransaction>, BTreeSet<ShardGroupId>)> = (0..n)
-            .map(|i| (make_tx(i as u8), BTreeSet::from([ShardGroupId(0)])))
+            .map(|i| {
+                (
+                    make_tx(u8::try_from(i).unwrap_or(u8::MAX)),
+                    BTreeSet::from([ShardGroupId(0)]),
+                )
+            })
             .collect();
         WaveState::new(
             WaveId::new(ShardGroupId(0), WAVE_START, BTreeSet::new()),
@@ -711,8 +742,9 @@ mod tests {
 
     fn make_cross_shard_wave(n: usize) -> WaveState {
         let shards = BTreeSet::from([ShardGroupId(0), ShardGroupId(1)]);
-        let txs: Vec<(Arc<RoutableTransaction>, BTreeSet<ShardGroupId>)> =
-            (0..n).map(|i| (make_tx(i as u8), shards.clone())).collect();
+        let txs: Vec<(Arc<RoutableTransaction>, BTreeSet<ShardGroupId>)> = (0..n)
+            .map(|i| (make_tx(u8::try_from(i).unwrap_or(u8::MAX)), shards.clone()))
+            .collect();
         WaveState::new(
             WaveId::new(
                 ShardGroupId(0),
@@ -747,6 +779,7 @@ mod tests {
                 } else {
                     TransactionOutcome::Failure
                 },
+                #[allow(clippy::default_trait_access)]
                 database_updates: Default::default(),
                 application_events: vec![],
             }),

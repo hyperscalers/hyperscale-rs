@@ -401,7 +401,7 @@ mod tests {
             // Fulfill a subset BEFORE any deadline could fire. Using ms(1)
             // keeps us well inside the 5_000 ms window.
             for idx in &fulfill_indices {
-                let w = &waves[*idx as usize % waves.len()];
+                let w = &waves[usize::try_from(*idx).unwrap_or(usize::MAX) % waves.len()];
                 t.mark_fulfilled(shard, w.block_height, w, ms(1));
             }
 

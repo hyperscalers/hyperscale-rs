@@ -29,7 +29,7 @@ use std::collections::{BTreeMap, HashSet};
 ///
 /// Votes at different heights have different BLS signatures and cannot be
 /// aggregated together. This prevents stale votes from combining with new
-/// ones if an abort intent changes the global_receipt_root between heights.
+/// ones if an abort intent changes the `global_receipt_root` between heights.
 type VoteKey = (GlobalReceiptRoot, WeightedTimestamp);
 
 /// Tracks execution votes for a specific wave within a block.
@@ -49,21 +49,21 @@ pub struct VoteTracker {
     // ═══════════════════════════════════════════════════════════════════════
     // Verified votes (passed signature verification)
     // ═══════════════════════════════════════════════════════════════════════
-    /// Verified votes grouped by (global_receipt_root, vote_anchor_ts).
+    /// Verified votes grouped by (`global_receipt_root`, `vote_anchor_ts`).
     votes_by_key: BTreeMap<VoteKey, Vec<ExecutionVote>>,
-    /// Voting power per (global_receipt_root, vote_anchor_ts) (verified votes only).
+    /// Voting power per (`global_receipt_root`, `vote_anchor_ts`) (verified votes only).
     power_by_key: BTreeMap<VoteKey, u64>,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Unverified votes (buffered until quorum possible)
     // ═══════════════════════════════════════════════════════════════════════
     /// Unverified votes buffered for batch verification.
-    /// Each entry is (vote, public_key, voting_power).
+    /// Each entry is (vote, `public_key`, `voting_power`).
     unverified_votes: Vec<(ExecutionVote, Bls12381G1PublicKey, u64)>,
     /// Total voting power of unverified votes.
     unverified_power: u64,
-    /// Validators we've already seen votes from at each vote_anchor_ts (dedup).
-    /// Key is (validator_id, vote_anchor_ts).
+    /// Validators we've already seen votes from at each `vote_anchor_ts` (dedup).
+    /// Key is (`validator_id`, `vote_anchor_ts`).
     seen: HashSet<(ValidatorId, WeightedTimestamp)>,
     /// Whether a verification batch is currently in flight.
     pending_verification: bool,
@@ -71,6 +71,7 @@ pub struct VoteTracker {
 
 impl VoteTracker {
     /// Create a new execution vote tracker.
+    #[must_use]
     pub fn new(wave_id: WaveId, block_hash: BlockHash, quorum: u64) -> Self {
         Self {
             wave_id,
@@ -86,11 +87,13 @@ impl VoteTracker {
     }
 
     /// Get the wave ID.
+    #[must_use]
     pub fn wave_id(&self) -> &WaveId {
         &self.wave_id
     }
 
     /// Get the block hash.
+    #[must_use]
     pub fn block_hash(&self) -> BlockHash {
         self.block_hash
     }
@@ -102,7 +105,7 @@ impl VoteTracker {
     /// Buffer an unverified vote for later batch verification.
     ///
     /// Returns `true` if the vote was buffered, `false` if it was a duplicate.
-    /// Dedup is per (validator, vote_anchor_ts) — the same validator can vote at
+    /// Dedup is per (validator, `vote_anchor_ts`) — the same validator can vote at
     /// multiple heights (round voting), but only once per height.
     pub fn buffer_unverified_vote(
         &mut self,
@@ -128,6 +131,7 @@ impl VoteTracker {
     /// 1. We have unverified votes
     /// 2. No verification is already in flight
     /// 3. Total power (verified + unverified) could reach quorum
+    #[must_use]
     pub fn should_trigger_verification(&self) -> bool {
         if self.unverified_votes.is_empty() || self.pending_verification {
             return false;
@@ -155,6 +159,7 @@ impl VoteTracker {
 
     /// Check if verification is pending.
     #[cfg(test)]
+    #[must_use]
     pub fn is_verification_pending(&self) -> bool {
         self.pending_verification
     }
@@ -170,10 +175,11 @@ impl VoteTracker {
         *self.power_by_key.entry(key).or_insert(0) += power;
     }
 
-    /// Check if quorum is reached for any (global_receipt_root, vote_anchor_ts) pair.
+    /// Check if quorum is reached for any (`global_receipt_root`, `vote_anchor_ts`) pair.
     ///
     /// Returns `Some((global_receipt_root, vote_anchor_ts, total_power))` if quorum reached.
-    /// If multiple pairs have quorum, returns the one with the lowest vote_anchor_ts.
+    /// If multiple pairs have quorum, returns the one with the lowest `vote_anchor_ts`.
+    #[must_use]
     pub fn check_quorum(&self) -> Option<(GlobalReceiptRoot, WeightedTimestamp, u64)> {
         let mut best: Option<(GlobalReceiptRoot, WeightedTimestamp, u64)> = None;
         for (&(global_receipt_root, vote_anchor_ts), &power) in &self.power_by_key {
@@ -187,7 +193,7 @@ impl VoteTracker {
         best
     }
 
-    /// Take votes for a specific (global_receipt_root, vote_anchor_ts) pair.
+    /// Take votes for a specific (`global_receipt_root`, `vote_anchor_ts`) pair.
     pub fn take_votes(
         &mut self,
         global_receipt_root: &GlobalReceiptRoot,
@@ -197,12 +203,14 @@ impl VoteTracker {
         self.votes_by_key.remove(&key).unwrap_or_default()
     }
 
-    /// Return the total verified voting power across all (global_receipt_root, vote_anchor_ts) groups.
+    /// Return the total verified voting power across all (`global_receipt_root`, `vote_anchor_ts`) groups.
+    #[must_use]
     pub fn total_verified_power(&self) -> u64 {
         self.power_by_key.values().sum()
     }
 
     /// Return the number of distinct receipt roots across all verified vote groups.
+    #[must_use]
     pub fn distinct_global_receipt_root_count(&self) -> usize {
         self.power_by_key
             .keys()
@@ -213,6 +221,7 @@ impl VoteTracker {
 
     /// Return a summary of verified voting power per global receipt root (summed across vote heights).
     /// Used for diagnostics when quorum cannot be reached.
+    #[must_use]
     pub fn global_receipt_root_power_summary(&self) -> Vec<(GlobalReceiptRoot, u64)> {
         let mut by_root: BTreeMap<GlobalReceiptRoot, u64> = BTreeMap::new();
         for (&(root, _), &power) in &self.power_by_key {
@@ -223,6 +232,7 @@ impl VoteTracker {
 
     /// Get votes for a specific global receipt root at any height (for tests).
     #[cfg(test)]
+    #[must_use]
     pub fn votes_for_global_receipt_root(
         &self,
         global_receipt_root: &GlobalReceiptRoot,
