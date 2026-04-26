@@ -204,7 +204,7 @@ impl TransactionFetchProtocol {
                 transactions,
             } => self.handle_transactions_received(block_hash, transactions),
             TransactionFetchInput::FetchFailed { block_hash, hashes } => {
-                self.handle_fetch_failed(block_hash, hashes)
+                self.handle_fetch_failed(block_hash, &hashes)
             }
             TransactionFetchInput::CancelFetch { block_hash } => {
                 self.tx_fetches.remove(&block_hash);
@@ -307,10 +307,10 @@ impl TransactionFetchProtocol {
     fn handle_fetch_failed(
         &mut self,
         block_hash: BlockHash,
-        hashes: Vec<TxHash>,
+        hashes: &[TxHash],
     ) -> Vec<TransactionFetchOutput> {
         if let Some(state) = self.tx_fetches.get_mut(&block_hash) {
-            state.mark_fetch_failed(&hashes);
+            state.mark_fetch_failed(hashes);
             metrics::record_fetch_failed("transaction");
         }
 
@@ -367,7 +367,7 @@ const MAX_ITEMS_PER_RESPONSE: usize = 500;
 pub fn serve_transaction_request(
     storage: &impl ChainReader,
     tx_cache: &QuickCache<TxHash, Arc<RoutableTransaction>>,
-    req: GetTransactionsRequest,
+    req: &GetTransactionsRequest,
 ) -> GetTransactionsResponse {
     let requested_count = req.tx_hashes.len();
     trace!(

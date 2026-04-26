@@ -1,4 +1,4 @@
-//! Consolidated configuration for IoLoop.
+//! Consolidated configuration for `IoLoop`.
 
 use crate::protocol::execution_cert_fetch::ExecCertFetchConfig;
 use crate::protocol::provision_fetch::ProvisionFetchConfig;
@@ -11,10 +11,15 @@ use std::time::Duration;
 /// Bundles all sub-component configs so runners can pass a single value.
 #[derive(Debug, Default, Clone)]
 pub struct NodeConfig {
+    /// Sync (catch-up + rehydration) configuration.
     pub sync: SyncConfig,
+    /// Inbound transaction fetch configuration.
     pub transaction_fetch: TransactionFetchConfig,
+    /// Cross-shard provision fetch configuration.
     pub provision_fetch: ProvisionFetchConfig,
+    /// Execution-certificate fetch configuration.
     pub exec_cert_fetch: ExecCertFetchConfig,
+    /// Batch-window configuration.
     pub batch: BatchConfig,
 }
 
@@ -25,24 +30,29 @@ pub struct NodeConfig {
 /// constants.
 #[derive(Debug, Clone)]
 pub struct BatchConfig {
-    /// Execution vote verification batch.
+    /// Max items in the execution-vote verification batch.
     pub execution_vote_max: usize,
+    /// Flush window for the execution-vote verification batch.
     pub execution_vote_window: Duration,
 
-    /// Broadcast execution vote batch.
+    /// Max items in the outbound execution-vote broadcast batch.
     pub broadcast_vote_max: usize,
+    /// Flush window for the outbound execution-vote broadcast batch.
     pub broadcast_vote_window: Duration,
 
-    /// Broadcast execution certificate batch.
+    /// Max items in the outbound execution-certificate broadcast batch.
     pub broadcast_cert_max: usize,
+    /// Flush window for the outbound execution-certificate broadcast batch.
     pub broadcast_cert_window: Duration,
 
-    /// Transaction validation batch.
+    /// Max items in the transaction-validation batch.
     pub tx_validation_max: usize,
+    /// Flush window for the transaction-validation batch.
     pub tx_validation_window: Duration,
 
-    /// Committed block header sender signature verification batch.
+    /// Max items in the committed-block-header sender-signature batch.
     pub committed_header_max: usize,
+    /// Flush window for the committed-block-header sender-signature batch.
     pub committed_header_window: Duration,
 }
 

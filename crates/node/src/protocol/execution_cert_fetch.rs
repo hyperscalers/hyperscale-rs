@@ -103,7 +103,7 @@ struct PendingExecCertFetch {
 /// Execution certificate fetch protocol state machine.
 pub struct ExecCertFetchProtocol {
     config: ExecCertFetchConfig,
-    /// Pending fetches keyed by (source_shard, block_height).
+    /// Pending fetches keyed by (`source_shard`, `block_height`).
     pending: BTreeMap<(ShardGroupId, BlockHeight), PendingExecCertFetch>,
 }
 
@@ -334,47 +334,43 @@ impl ExecCertFetchProtocol {
                 .find(|p| !state.tried.contains(p))
                 .copied();
 
-            match peer {
-                Some(peer) => {
-                    state.tried.insert(peer);
-                    state.in_flight = true;
-                    available_slots -= 1;
-                    trace!(
-                        source_shard = source_shard.0,
-                        block_height = block_height.0,
-                        peer = peer.0,
-                        "Fetching exec certs from peer"
-                    );
-                    outputs.push(ExecCertFetchOutput::Fetch {
-                        source_shard,
-                        block_height,
-                        wave_ids: state.wave_ids.clone(),
-                        peer,
-                    });
-                }
-                None => {
-                    // All peers exhausted — start new round with exponential backoff.
-                    state.rounds += 1;
-                    state.tried.clear();
-                    let backoff = Duration::from_millis(
-                        (500u64 * 2u64.saturating_pow(state.rounds)).min(30_000),
-                    );
-                    state.next_retry_at = Some(now + backoff);
-                    info!(
-                        source_shard = source_shard.0,
-                        block_height = block_height.0,
-                        round = state.rounds,
-                        backoff_ms = backoff.as_millis(),
-                        "Exec cert fetch exhausted peers, backing off"
-                    );
-                }
+            if let Some(peer) = peer {
+                state.tried.insert(peer);
+                state.in_flight = true;
+                available_slots -= 1;
+                trace!(
+                    source_shard = source_shard.0,
+                    block_height = block_height.0,
+                    peer = peer.0,
+                    "Fetching exec certs from peer"
+                );
+                outputs.push(ExecCertFetchOutput::Fetch {
+                    source_shard,
+                    block_height,
+                    wave_ids: state.wave_ids.clone(),
+                    peer,
+                });
+            } else {
+                // All peers exhausted — start new round with exponential backoff.
+                state.rounds += 1;
+                state.tried.clear();
+                let backoff =
+                    Duration::from_millis((500u64 * 2u64.saturating_pow(state.rounds)).min(30_000));
+                state.next_retry_at = Some(now + backoff);
+                info!(
+                    source_shard = source_shard.0,
+                    block_height = block_height.0,
+                    round = state.rounds,
+                    backoff_ms = backoff.as_millis(),
+                    "Exec cert fetch exhausted peers, backing off"
+                );
             }
         }
 
         outputs
     }
 
-    /// Tiered eviction: prefer entries below committed_height (truly stale),
+    /// Tiered eviction: prefer entries below `committed_height` (truly stale),
     /// fall back to oldest-by-height.
     fn evict_one(&mut self, source_shard: ShardGroupId, committed_height: BlockHeight) {
         // Tier 1: below committed_height (truly stale)
@@ -479,7 +475,7 @@ mod tests {
                 assert_eq!(wave_ids.len(), 1);
                 assert_eq!(*peer, vid(1));
             }
-            _ => panic!("Expected Fetch output"),
+            ExecCertFetchOutput::Deliver { .. } => panic!("Expected Fetch output"),
         }
     }
 

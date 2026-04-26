@@ -3,7 +3,7 @@
 //! Fetches missing finalized wave data for a pending block from the proposer
 //! first, falling back to other local-committee peers when the proposer
 //! returns nothing or an empty response. Mirrors `LocalProvisionFetchProtocol`
-//! and `ExecCertFetchProtocol` — tracks missing wave_id_hashes per block,
+//! and `ExecCertFetchProtocol` — tracks missing `wave_id_hashes` per block,
 //! rotates peers on failure, and backs off exponentially when all peers
 //! have been exhausted.
 //!
@@ -232,7 +232,7 @@ impl FinalizedWaveFetchProtocol {
                 block_hash,
                 peer,
                 hashes,
-            } => self.handle_failed(block_hash, peer, hashes),
+            } => self.handle_failed(block_hash, peer, &hashes),
             FinalizedWaveFetchInput::CancelFetch { block_hash } => {
                 self.fetches.remove(&block_hash);
                 debug!(?block_hash, "Cancelled finalized wave fetch");
@@ -339,10 +339,10 @@ impl FinalizedWaveFetchProtocol {
         &mut self,
         block_hash: BlockHash,
         peer: ValidatorId,
-        hashes: Vec<WaveIdHash>,
+        hashes: &[WaveIdHash],
     ) -> Vec<FinalizedWaveFetchOutput> {
         if let Some(state) = self.fetches.get_mut(&block_hash) {
-            state.mark_fetch_failed(&hashes);
+            state.mark_fetch_failed(hashes);
             state.tried.insert(peer);
             metrics::record_fetch_failed("finalized_wave");
         }

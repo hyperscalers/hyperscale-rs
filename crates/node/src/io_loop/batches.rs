@@ -32,10 +32,10 @@ where
         }
     }
 
-    /// Flush the validation batch, dispatching to the tx_validation pool.
+    /// Flush the validation batch, dispatching to the `tx_validation` pool.
     ///
     /// Valid transactions are sent back as `TransactionGossipReceived` events
-    /// through the event channel. IoLoop recognises them via `pending_validation`
+    /// through the event channel. `IoLoop` recognises them via `pending_validation`
     /// and passes them through to the state machine.
     pub(super) fn flush_validation_batch(&mut self) {
         let batch = self.validation_batch.take();

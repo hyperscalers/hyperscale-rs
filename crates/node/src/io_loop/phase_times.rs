@@ -1,10 +1,10 @@
 //! Per-transaction phase-time tracking for the slow-tx finalization log.
 //!
-//! Stamps wall-clock at each lifecycle transition that the io_loop observes
+//! Stamps wall-clock at each lifecycle transition that the `io_loop` observes
 //! via `Action::EmitTransactionStatus` and `Action::RecordTxEcCreated`. The
 //! map is purely a diagnostic aid: it drives the
 //! `"Transaction finalization exceeded 10s"` warning's phase breakdown and is
-//! never exposed beyond logs. Lives entirely on the io_loop so the mempool
+//! never exposed beyond logs. Lives entirely on the `io_loop` so the mempool
 //! state machine stays free of telemetry plumbing.
 //!
 //! Entries are created on the first `Pending` status, stamped through the
@@ -14,7 +14,7 @@
 //! supports — see `process_certificate_committed` in the mempool.
 //!
 //! Stamps are ms-since-Unix-epoch (`LocalTimestamp`), the same unit the
-//! io_loop's clock origin is minted in. They're never compared across
+//! `io_loop`'s clock origin is minted in. They're never compared across
 //! validators; each node logs its own observed latency only.
 use hyperscale_types::{LocalTimestamp, TransactionStatus, TxHash};
 use std::collections::HashMap;
@@ -22,6 +22,7 @@ use std::fmt;
 
 /// Phase-time stamps for a single transaction's mempool → terminal flow.
 #[derive(Debug, Clone, Copy)]
+#[allow(clippy::struct_field_names)] // every field is a timestamp; suffix carries the role
 pub(super) struct TxPhaseTimes {
     /// First time this validator saw the tx (RPC submit or gossip arrival).
     added_at: LocalTimestamp,
@@ -46,8 +47,8 @@ impl TxPhaseTimes {
 
     /// Renders the phase breakdown for the slow-tx log, formatting the
     /// completed-at duration relative to `completed_at` (the terminal stamp
-    /// the io_loop computed when it observed the `Completed` status).
-    pub(super) fn display_at<'a>(&'a self, completed_at: LocalTimestamp) -> impl fmt::Display + 'a {
+    /// the `io_loop` computed when it observed the `Completed` status).
+    pub(super) fn display_at(&self, completed_at: LocalTimestamp) -> impl fmt::Display + '_ {
         TxPhaseTimesDisplay {
             phases: self,
             completed_at,
@@ -55,7 +56,7 @@ impl TxPhaseTimes {
     }
 }
 
-/// Per-tx side cache. Keys are `TxHash`, values are stamps the io_loop
+/// Per-tx side cache. Keys are `TxHash`, values are stamps the `io_loop`
 /// records as `EmitTransactionStatus` / `RecordTxEcCreated` actions arrive.
 #[derive(Default)]
 pub(super) struct TxPhaseTimesCache {
@@ -121,7 +122,7 @@ struct TxPhaseTimesDisplay<'a> {
     completed_at: LocalTimestamp,
 }
 
-impl<'a> fmt::Display for TxPhaseTimesDisplay<'a> {
+impl fmt::Display for TxPhaseTimesDisplay<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let p = self.phases;
         let dur = |start: LocalTimestamp, end: LocalTimestamp| -> f64 {

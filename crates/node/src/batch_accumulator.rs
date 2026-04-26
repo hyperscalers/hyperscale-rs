@@ -2,7 +2,7 @@
 //!
 //! Both [`BatchAccumulator`] and [`ShardedBatchAccumulator`] collect items until
 //! either a maximum count or a time window is reached, at which point the caller
-//! flushes the batch. Deadlines are tracked as `LocalTimestamp` (the io_loop's
+//! flushes the batch. Deadlines are tracked as `LocalTimestamp` (the `io_loop`'s
 //! monotonic local clock) so both production and simulation use the same paths.
 
 use hyperscale_types::{LocalTimestamp, ShardGroupId};

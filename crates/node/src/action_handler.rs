@@ -38,7 +38,7 @@ pub(crate) struct DelegatedResult<P: Send> {
     pub events: Vec<NodeInput>,
     /// Prepared commit + receipts to cache.
     ///
-    /// Receipts travel alongside the prepared handle so the io_loop can
+    /// Receipts travel alongside the prepared handle so the `io_loop` can
     /// build a `ChainEntry` and insert into `PendingChain` in one step
     /// — eliminating the prior separate `db_updates` plumbing that was
     /// always produced together with `prepared_commit` anyway.
@@ -72,27 +72,28 @@ pub(crate) enum DispatchPool {
 pub(crate) fn dispatch_pool_for(action: &Action) -> Option<DispatchPool> {
     match action {
         // Consensus-critical crypto + state root computation
-        Action::VerifyAndBuildQuorumCertificate { .. } => Some(DispatchPool::ConsensusCrypto),
-        Action::VerifyQcSignature { .. } => Some(DispatchPool::ConsensusCrypto),
-        Action::VerifyRemoteHeaderQc { .. } => Some(DispatchPool::ConsensusCrypto),
-        Action::VerifyTransactionRoot { .. } => Some(DispatchPool::ConsensusCrypto),
-        Action::VerifyProvisionRoot { .. } => Some(DispatchPool::ConsensusCrypto),
-        Action::VerifyCertificateRoot { .. } => Some(DispatchPool::ConsensusCrypto),
-        Action::VerifyLocalReceiptRoot { .. } => Some(DispatchPool::ConsensusCrypto),
-        Action::VerifyProvisionTxRoots { .. } => Some(DispatchPool::ConsensusCrypto),
-        Action::VerifyStateRoot { .. } => Some(DispatchPool::ConsensusCrypto),
-        Action::BuildProposal { .. } => Some(DispatchPool::ConsensusCrypto),
+        Action::VerifyAndBuildQuorumCertificate { .. }
+        | Action::VerifyQcSignature { .. }
+        | Action::VerifyRemoteHeaderQc { .. }
+        | Action::VerifyTransactionRoot { .. }
+        | Action::VerifyProvisionRoot { .. }
+        | Action::VerifyCertificateRoot { .. }
+        | Action::VerifyLocalReceiptRoot { .. }
+        | Action::VerifyProvisionTxRoots { .. }
+        | Action::VerifyStateRoot { .. }
+        | Action::BuildProposal { .. } => Some(DispatchPool::ConsensusCrypto),
 
         // General crypto (cert aggregation, provision proofs)
-        Action::AggregateExecutionCertificate { .. } => Some(DispatchPool::Crypto),
-        Action::VerifyAndAggregateExecutionVotes { .. } => Some(DispatchPool::Crypto),
-        Action::VerifyExecutionCertificateSignature { .. } => Some(DispatchPool::Crypto),
-        Action::VerifyProvisions { .. } => Some(DispatchPool::Crypto),
-        Action::FetchAndBroadcastProvision { .. } => Some(DispatchPool::Crypto),
+        Action::AggregateExecutionCertificate { .. }
+        | Action::VerifyAndAggregateExecutionVotes { .. }
+        | Action::VerifyExecutionCertificateSignature { .. }
+        | Action::VerifyProvisions { .. }
+        | Action::FetchAndBroadcastProvision { .. } => Some(DispatchPool::Crypto),
 
         // Execution
-        Action::ExecuteTransactions { .. } => Some(DispatchPool::Execution),
-        Action::ExecuteCrossShardTransactions { .. } => Some(DispatchPool::Execution),
+        Action::ExecuteTransactions { .. } | Action::ExecuteCrossShardTransactions { .. } => {
+            Some(DispatchPool::Execution)
+        }
         _ => None,
     }
 }
@@ -113,9 +114,9 @@ pub(crate) fn parent_hash_for(action: &Action) -> Option<BlockHash> {
             parent_block_hash, ..
         } => Some(*parent_block_hash),
         Action::BuildProposal { parent_hash, .. } => Some(*parent_hash),
-        Action::ExecuteTransactions { block_hash, .. } => Some(*block_hash),
-        Action::ExecuteCrossShardTransactions { block_hash, .. } => Some(*block_hash),
-        Action::FetchAndBroadcastProvision { block_hash, .. } => Some(*block_hash),
+        Action::ExecuteTransactions { block_hash, .. }
+        | Action::ExecuteCrossShardTransactions { block_hash, .. }
+        | Action::FetchAndBroadcastProvision { block_hash, .. } => Some(*block_hash),
         _ => None,
     }
 }
@@ -735,10 +736,10 @@ pub(crate) fn handle_delegated_action<
 
 /// Fetch state entries for each provision request at committed block height.
 ///
-/// Expands declared account NodeIds to include their owned vaults before
+/// Expands declared account `NodeId`s to include their owned vaults before
 /// fetching. The remote shard needs vault substates (balances) to execute
 /// transfers, not just the account's own substates.
-/// Per-tx fetched entries: (tx_hash, target_shards_with_nodes, state_entries).
+/// Per-tx fetched entries: (`tx_hash`, `target_shards_with_nodes`, `state_entries`).
 type FetchedTxEntries = (
     TxHash,
     Vec<(ShardGroupId, Vec<hyperscale_types::NodeId>)>,
@@ -759,39 +760,32 @@ fn fetch_entries_for_requests<
         // Expand account NodeIds to include owned vaults at the committed block height.
         // Must use historical reads — current state may have new vaults that don't
         // exist at block_height, causing the merkle proof to fail on the remote shard.
-        let expanded_nodes = match hyperscale_engine::sharding::expand_nodes_with_owned_at_height(
+        let Some(expanded_nodes) = hyperscale_engine::sharding::expand_nodes_with_owned_at_height(
             &*ctx.view,
             &req.nodes,
             block_height,
-        ) {
-            Some(nodes) => nodes,
-            None => {
-                warn!(
-                    source_shard = source_shard.0,
-                    block_height = block_height.0,
-                    tx_hash = %req.tx_hash,
-                    "expand_nodes_with_owned_at_height: JMT version unavailable"
-                );
-                continue;
-            }
+        ) else {
+            warn!(
+                source_shard = source_shard.0,
+                block_height = block_height.0,
+                tx_hash = %req.tx_hash,
+                "expand_nodes_with_owned_at_height: JMT version unavailable"
+            );
+            continue;
         };
-        let entries =
-            match ctx
-                .executor
+        let Some(entries) =
+            ctx.executor
                 .fetch_state_entries(&*ctx.view, &expanded_nodes, block_height)
-            {
-                Some(entries) => entries,
-                None => {
-                    warn!(
-                        source_shard = source_shard.0,
-                        block_height = block_height.0,
-                        tx_hash = %req.tx_hash,
-                        node_count = expanded_nodes.len(),
-                        "fetch_state_entries returned None — JMT version unavailable"
-                    );
-                    continue;
-                }
-            };
+        else {
+            warn!(
+                source_shard = source_shard.0,
+                block_height = block_height.0,
+                tx_hash = %req.tx_hash,
+                node_count = expanded_nodes.len(),
+                "fetch_state_entries returned None — JMT version unavailable"
+            );
+            continue;
+        };
         per_tx.push((req.tx_hash, req.targets.clone(), Arc::new(entries)));
     }
     per_tx
@@ -840,21 +834,18 @@ fn build_provision_groups<
         shard_keys.sort();
         shard_keys.dedup();
 
-        let proof = match ctx
+        let Some(proof) = ctx
             .view
             .generate_merkle_proofs_overlay(&shard_keys, block_height)
-        {
-            Some(p) => p,
-            None => {
-                warn!(
-                    source_shard = source_shard.0,
-                    block_height = block_height.0,
-                    target_shard = shard.0,
-                    key_count = shard_keys.len(),
-                    "generate_merkle_proofs returned None — JMT version unavailable"
-                );
-                continue;
-            }
+        else {
+            warn!(
+                source_shard = source_shard.0,
+                block_height = block_height.0,
+                target_shard = shard.0,
+                key_count = shard_keys.len(),
+                "generate_merkle_proofs returned None — JMT version unavailable"
+            );
+            continue;
         };
 
         let recipients = shard_recipients.get(&shard).cloned().unwrap_or_default();

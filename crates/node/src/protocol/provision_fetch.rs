@@ -102,7 +102,7 @@ struct PendingProvisionFetch {
 /// Provision fetch protocol state machine.
 pub struct ProvisionFetchProtocol {
     config: ProvisionFetchConfig,
-    /// Pending fetches keyed by (source_shard, block_height).
+    /// Pending fetches keyed by (`source_shard`, `block_height`).
     pending: BTreeMap<(ShardGroupId, BlockHeight), PendingProvisionFetch>,
 }
 
@@ -337,49 +337,46 @@ impl ProvisionFetchProtocol {
                 state.next_retry_at = None;
             }
 
-            let peer = if !state.tried.contains(&state.preferred_peer) {
-                Some(state.preferred_peer)
-            } else {
+            let peer = if state.tried.contains(&state.preferred_peer) {
                 state
                     .peers
                     .iter()
                     .find(|p| !state.tried.contains(p))
                     .copied()
+            } else {
+                Some(state.preferred_peer)
             };
 
-            match peer {
-                Some(peer) => {
-                    state.tried.insert(peer);
-                    state.in_flight = true;
-                    available_slots -= 1;
-                    trace!(
-                        source_shard = source_shard.0,
-                        block_height = block_height.0,
-                        peer = peer.0,
-                        "Fetching provisions from peer"
-                    );
-                    outputs.push(ProvisionFetchOutput::Fetch {
-                        source_shard,
-                        block_height,
-                        target_shard: state.target_shard,
-                        peer,
-                    });
-                }
-                None => {
-                    state.rounds += 1;
-                    state.tried.clear();
-                    let backoff = std::time::Duration::from_millis(
-                        (500u64 * 2u64.saturating_pow(state.rounds)).min(30_000),
-                    );
-                    state.next_retry_at = Some(now + backoff);
-                    info!(
-                        source_shard = source_shard.0,
-                        block_height = block_height.0,
-                        round = state.rounds,
-                        backoff_ms = backoff.as_millis(),
-                        "Provision fetch exhausted peers, backing off"
-                    );
-                }
+            if let Some(peer) = peer {
+                state.tried.insert(peer);
+                state.in_flight = true;
+                available_slots -= 1;
+                trace!(
+                    source_shard = source_shard.0,
+                    block_height = block_height.0,
+                    peer = peer.0,
+                    "Fetching provisions from peer"
+                );
+                outputs.push(ProvisionFetchOutput::Fetch {
+                    source_shard,
+                    block_height,
+                    target_shard: state.target_shard,
+                    peer,
+                });
+            } else {
+                state.rounds += 1;
+                state.tried.clear();
+                let backoff = std::time::Duration::from_millis(
+                    (500u64 * 2u64.saturating_pow(state.rounds)).min(30_000),
+                );
+                state.next_retry_at = Some(now + backoff);
+                info!(
+                    source_shard = source_shard.0,
+                    block_height = block_height.0,
+                    round = state.rounds,
+                    backoff_ms = backoff.as_millis(),
+                    "Provision fetch exhausted peers, backing off"
+                );
             }
         }
 
@@ -403,21 +400,19 @@ pub fn serve_provision_request(
     storage: &(impl ChainReader + SubstateStore),
     local_shard: ShardGroupId,
     num_shards: u64,
-    req: GetProvisionRequest,
+    req: &GetProvisionRequest,
 ) -> GetProvisionResponse {
-    let block = match storage.get_block(req.block_height) {
-        Some(certified) => certified.block,
-        None => {
-            warn!(
-                block_height = req.block_height.0,
-                "Provision request: block not found"
-            );
-            return GetProvisionResponse {
-                provisions: None,
-                proof: None,
-            };
-        }
+    let Some(certified) = storage.get_block(req.block_height) else {
+        warn!(
+            block_height = req.block_height.0,
+            "Provision request: block not found"
+        );
+        return GetProvisionResponse {
+            provisions: None,
+            proof: None,
+        };
     };
+    let block = certified.block;
 
     let jmt_height = block.height();
 
@@ -457,21 +452,19 @@ pub fn serve_provision_request(
             continue;
         }
 
-        let entries =
-            match hyperscale_engine::fetch_state_entries(storage, &owned_nodes, jmt_height) {
-                Some(entries) => entries,
-                None => {
-                    warn!(
-                        block_height = req.block_height.0,
-                        jmt_height = jmt_height.0,
-                        "Provision request: historical JMT version unavailable"
-                    );
-                    return GetProvisionResponse {
-                        provisions: None,
-                        proof: None,
-                    };
-                }
+        let Some(entries) =
+            hyperscale_engine::fetch_state_entries(storage, &owned_nodes, jmt_height)
+        else {
+            warn!(
+                block_height = req.block_height.0,
+                jmt_height = jmt_height.0,
+                "Provision request: historical JMT version unavailable"
+            );
+            return GetProvisionResponse {
+                provisions: None,
+                proof: None,
             };
+        };
         for e in &entries {
             all_storage_keys.push(e.storage_key.clone());
         }
@@ -488,18 +481,17 @@ pub fn serve_provision_request(
     // Phase 2: Generate ONE batched proof covering all entries.
     all_storage_keys.sort();
     all_storage_keys.dedup();
-    let proof = match storage.generate_merkle_proofs(&all_storage_keys, jmt_height) {
-        Some(p) => Arc::new(p),
-        None => {
-            tracing::warn!(
-                block_height = req.block_height.0,
-                "Fallback provision: batched proof generation failed (version unavailable)"
-            );
-            return GetProvisionResponse {
-                provisions: None,
-                proof: None,
-            };
-        }
+    let proof = if let Some(p) = storage.generate_merkle_proofs(&all_storage_keys, jmt_height) {
+        Arc::new(p)
+    } else {
+        tracing::warn!(
+            block_height = req.block_height.0,
+            "Fallback provision: batched proof generation failed (version unavailable)"
+        );
+        return GetProvisionResponse {
+            provisions: None,
+            proof: None,
+        };
     };
 
     // Phase 3: Build provisions sharing the single proof.
@@ -583,7 +575,7 @@ mod tests {
                 assert_eq!(*target_shard, shard(0));
                 assert_eq!(*peer, vid(1)); // preferred peer first
             }
-            _ => panic!("Expected Fetch output"),
+            ProvisionFetchOutput::Deliver { .. } => panic!("Expected Fetch output"),
         }
     }
 

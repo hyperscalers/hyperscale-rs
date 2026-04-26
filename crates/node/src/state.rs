@@ -16,7 +16,7 @@ use std::sync::Arc;
 use tracing::instrument;
 
 /// Index type for simulation-only node routing.
-/// Production uses ValidatorId (from message signatures) and PeerId (libp2p).
+/// Production uses `ValidatorId` (from message signatures) and `PeerId` (libp2p).
 pub type NodeIndex = u32;
 
 // ─── Constants ──────────────────────────────────────────────────────────
@@ -24,10 +24,10 @@ pub type NodeIndex = u32;
 /// Combined node state machine.
 ///
 /// Composes BFT, execution, mempool, and provisions into a single state machine.
-/// View changes are handled implicitly via local round advancement in BftCoordinator (HotStuff-2 style).
+/// View changes are handled implicitly via local round advancement in `BftCoordinator` (HotStuff-2 style).
 ///
-/// Note: Sync is handled entirely by the runner (production: SyncManager, simulation: runner logic).
-/// The runner sends SyncBlockReadyToApply events directly to BFT when synced blocks are ready.
+/// Note: Sync is handled entirely by the runner (production: `SyncManager`, simulation: runner logic).
+/// The runner sends `SyncBlockReadyToApply` events directly to BFT when synced blocks are ready.
 pub struct NodeStateMachine {
     /// This node's index (simulation-only, for routing).
     node_index: NodeIndex,
@@ -65,7 +65,7 @@ impl std::fmt::Debug for NodeStateMachine {
             .field("shard", &self.topology.snapshot().local_shard())
             .field("bft", &self.bft)
             .field("now", &self.now)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -91,10 +91,11 @@ impl NodeStateMachine {
     /// * `recovered` - State recovered from storage. Use `RecoveredState::default()` for fresh start.
     /// * `mempool_config` - Mempool configuration
     /// * `provision_config` - Provision coordinator configuration
+    #[must_use]
     pub fn new(
         node_index: NodeIndex,
         topology: TopologyState,
-        bft_config: BftConfig,
+        bft_config: &BftConfig,
         recovered: RecoveredState,
         mempool_config: MempoolConfig,
         provision_config: ProvisionConfig,
@@ -119,46 +120,55 @@ impl NodeStateMachine {
     // ─── Accessors ──────────────────────────────────────────────────────
 
     /// Get this node's index.
+    #[must_use]
     pub fn node_index(&self) -> NodeIndex {
         self.node_index
     }
 
     /// Get this node's shard.
+    #[must_use]
     pub fn shard(&self) -> ShardGroupId {
         self.topology.snapshot().local_shard()
     }
 
     /// Get the current topology snapshot.
+    #[must_use]
     pub fn topology(&self) -> &TopologySnapshot {
         self.topology.snapshot()
     }
 
     /// Get a reference to the mempool state.
+    #[must_use]
     pub fn mempool(&self) -> &MempoolCoordinator {
         &self.mempool
     }
 
     /// Get a reference to the BFT state.
+    #[must_use]
     pub fn bft(&self) -> &BftCoordinator {
         &self.bft
     }
 
     /// Get a reference to the execution state.
+    #[must_use]
     pub fn execution(&self) -> &ExecutionCoordinator {
         &self.execution
     }
 
     /// Get a reference to the provision coordinator.
+    #[must_use]
     pub fn provisions(&self) -> &ProvisionCoordinator {
         &self.provisions
     }
 
     /// Get a reference to the remote header coordinator.
+    #[must_use]
     pub fn remote_headers(&self) -> &RemoteHeaderCoordinator {
         &self.remote_headers
     }
 
     /// Get the last committed JMT root hash (delegated to BFT's verification pipeline).
+    #[must_use]
     pub fn last_committed_jmt_root(&self) -> StateRoot {
         self.bft.jmt_root()
     }
@@ -240,17 +250,16 @@ impl NodeStateMachine {
 
     /// Handle view change timer — check if the leader has timed out.
     fn on_view_change_timer(&mut self) -> Vec<Action> {
-        match self.bft.check_round_timeout(self.topology.snapshot()) {
-            Some(actions) => actions,
-            None => {
-                // Conditions not met yet. Reschedule for the remaining time
-                // until the actual timeout fires (relative to last_leader_activity).
-                let remaining = self.bft.remaining_view_change_timeout();
-                vec![Action::SetTimer {
-                    id: TimerId::ViewChange,
-                    duration: remaining,
-                }]
-            }
+        if let Some(actions) = self.bft.check_round_timeout(self.topology.snapshot()) {
+            actions
+        } else {
+            // Conditions not met yet. Reschedule for the remaining time
+            // until the actual timeout fires (relative to last_leader_activity).
+            let remaining = self.bft.remaining_view_change_timeout();
+            vec![Action::SetTimer {
+                id: TimerId::ViewChange,
+                duration: remaining,
+            }]
         }
     }
 
@@ -259,7 +268,7 @@ impl NodeStateMachine {
         self.try_event_driven_proposal()
     }
 
-    /// Shared proposal logic for ContentAvailable and QC-formed paths.
+    /// Shared proposal logic for `ContentAvailable` and QC-formed paths.
     fn try_event_driven_proposal(&mut self) -> Vec<Action> {
         let (pending_txs, pending_certs) = self.bft.pending_block_counts();
         let inputs = self.gather_proposal_inputs(pending_txs, pending_certs);
@@ -275,7 +284,7 @@ impl NodeStateMachine {
     /// Handle a received block header — validate in-flight limits.
     fn on_block_header_received(
         &mut self,
-        header: BlockHeader,
+        header: &BlockHeader,
         manifest: BlockManifest,
     ) -> Vec<Action> {
         // Total transaction count across all sections
@@ -302,7 +311,7 @@ impl NodeStateMachine {
 
         self.bft.on_block_header(
             self.topology.snapshot(),
-            &header,
+            header,
             manifest,
             |h| self.mempool.get_transaction(h),
             |h| self.execution.get_finalized_wave_by_hash(h),
@@ -311,21 +320,21 @@ impl NodeStateMachine {
     }
 
     /// Handle QC formed — may trigger immediate next proposal.
-    fn on_qc_formed(&mut self, block_hash: BlockHash, qc: QuorumCertificate) -> Vec<Action> {
+    fn on_qc_formed(&mut self, block_hash: BlockHash, qc: &QuorumCertificate) -> Vec<Action> {
         // Count transactions and certificates in the block that will be committed.
         // This is critical for respecting in-flight limits: the BlockCommitted
         // event won't be processed until after we select transactions, so we
         // need to preemptively account for:
         // - Transactions that will INCREASE in-flight (new commits)
         // - Certificates that will DECREASE in-flight (completed transactions)
-        let (pending_tx_count, pending_cert_count) = self.bft.pending_commit_counts(&qc);
+        let (pending_tx_count, pending_cert_count) = self.bft.pending_commit_counts(qc);
 
         let inputs = self.gather_proposal_inputs(pending_tx_count, pending_cert_count);
 
         self.bft.on_qc_formed(
             self.topology.snapshot(),
             block_hash,
-            &qc,
+            qc,
             &inputs.ready_txs,
             inputs.finalized_waves,
             inputs.provisions,
@@ -333,7 +342,7 @@ impl NodeStateMachine {
     }
 
     /// Handle block committed — notify all subsystems in the correct order.
-    fn on_block_committed(&mut self, certified: CertifiedBlock) -> Vec<Action> {
+    fn on_block_committed(&mut self, certified: &CertifiedBlock) -> Vec<Action> {
         let mut actions = Vec::new();
         let block_hash = certified.block.hash();
 
@@ -355,13 +364,13 @@ impl NodeStateMachine {
         // tombstone). Same behavior for consensus and sync commit paths.
         actions.extend(
             self.mempool
-                .on_block_committed(self.topology.snapshot(), &certified),
+                .on_block_committed(self.topology.snapshot(), certified),
         );
 
         // Remote header coordinator: update liveness and check for timeouts.
         actions.extend(
             self.remote_headers
-                .on_block_committed(self.topology.snapshot(), &certified),
+                .on_block_committed(self.topology.snapshot(), certified),
         );
 
         // Provisions coordinator: prune + schedule fallback timeouts. Reads
@@ -369,7 +378,7 @@ impl NodeStateMachine {
         // inline, Sealed has none (empty slice).
         actions.extend(
             self.provisions
-                .on_block_committed(self.topology.snapshot(), &certified),
+                .on_block_committed(self.topology.snapshot(), certified),
         );
 
         // Outbound provision safety sweep — runs on the BFT-authenticated
@@ -377,7 +386,7 @@ impl NodeStateMachine {
         self.outbound_provisions
             .on_block_committed(certified.qc.weighted_timestamp);
 
-        actions.extend(self.apply_block_to_execution(&certified));
+        actions.extend(self.apply_block_to_execution(certified));
 
         // Block committed changes in-flight counts — trigger proposal attempt
         // so the next proposer can include newly ready transactions.
@@ -437,8 +446,8 @@ impl NodeStateMachine {
         actions
     }
 
-    fn on_ec_created(&mut self, tx_hashes: Vec<TxHash>) -> Vec<Action> {
-        self.mempool.on_ec_created(&tx_hashes)
+    fn on_ec_created(&mut self, tx_hashes: &[TxHash]) -> Vec<Action> {
+        self.mempool.on_ec_created(tx_hashes)
     }
 
     /// Handle transaction gossip received — add to mempool and check pending blocks.
@@ -483,6 +492,7 @@ impl StateMachine for NodeStateMachine {
         event = %event.type_name(),
         height = self.bft.committed_height().0,
     ))]
+    #[allow(clippy::too_many_lines)] // single dispatch over the ProtocolEvent enum; one arm per variant
     fn handle(&mut self, event: ProtocolEvent) -> Vec<Action> {
         let mut actions = match event {
             // ── Timers ───────────────────────────────────────────────────
@@ -492,10 +502,10 @@ impl StateMachine for NodeStateMachine {
 
             // ── BFT Consensus ────────────────────────────────────────────
             ProtocolEvent::BlockHeaderReceived { header, manifest } => {
-                self.on_block_header_received(header, manifest)
+                self.on_block_header_received(&header, manifest)
             }
             ProtocolEvent::QuorumCertificateFormed { block_hash, qc } => {
-                self.on_qc_formed(block_hash, qc)
+                self.on_qc_formed(block_hash, &qc)
             }
             ProtocolEvent::RemoteBlockCommitted {
                 committed_header,
@@ -586,7 +596,7 @@ impl StateMachine for NodeStateMachine {
             ),
 
             // ── Block Committed ──────────────────────────────────────────
-            ProtocolEvent::BlockCommitted { certified } => self.on_block_committed(certified),
+            ProtocolEvent::BlockCommitted { certified } => self.on_block_committed(&certified),
 
             // ── Block Persisted (RocksDB write complete) ───────────────
             // Advances `last_persisted_height`, a fallback gate for deferred
@@ -728,7 +738,7 @@ impl StateMachine for NodeStateMachine {
                 self.on_transaction_executed(tx_hash, accepted)
             }
             ProtocolEvent::ExecutionCertificateCreated { tx_hashes } => {
-                self.on_ec_created(tx_hashes)
+                self.on_ec_created(&tx_hashes)
             }
             ProtocolEvent::WaveCompleted {
                 wave_cert: _,
@@ -755,6 +765,7 @@ impl StateMachine for NodeStateMachine {
                 .bft
                 .on_sync_block_ready_to_apply(self.topology.snapshot(), certified),
             // Handled by IoLoop directly (sync verification pipeline).
+            #[allow(clippy::match_same_arms)] // distinct from the global/epoch no-op group below
             ProtocolEvent::SyncEcVerificationComplete { .. } => vec![],
             // SyncProtocol finished fetching — tell BftCoordinator to exit sync
             // mode so it can re-enter sync if still behind, or resume

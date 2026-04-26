@@ -133,7 +133,7 @@ impl BlockFetchState {
 
     /// Move hashes the peer explicitly reported as missing back to the
     /// missing set so another `Tick` retries them — typically on a different
-    /// peer, since the RequestManager rotates on each request.
+    /// peer, since the `RequestManager` rotates on each request.
     fn reclaim_missing(&mut self, hashes: &[ProvisionHash]) {
         for h in hashes {
             if self.received_hashes.contains(h) {
@@ -187,9 +187,9 @@ impl LocalProvisionFetchProtocol {
                 block_hash,
                 batches,
                 missing_hashes,
-            } => self.handle_received(block_hash, batches, missing_hashes),
+            } => self.handle_received(block_hash, batches, &missing_hashes),
             LocalProvisionFetchInput::Failed { block_hash, hashes } => {
-                self.handle_failed(block_hash, hashes)
+                self.handle_failed(block_hash, &hashes)
             }
             LocalProvisionFetchInput::CancelFetch { block_hash } => {
                 self.fetches.remove(&block_hash);
@@ -249,7 +249,7 @@ impl LocalProvisionFetchProtocol {
         &mut self,
         block_hash: BlockHash,
         batches: Vec<Arc<Provisions>>,
-        missing_hashes: Vec<ProvisionHash>,
+        missing_hashes: &[ProvisionHash],
     ) -> Vec<LocalProvisionFetchOutput> {
         let Some(state) = self.fetches.get_mut(&block_hash) else {
             trace!(?block_hash, "Provision received for unknown fetch");
@@ -262,7 +262,7 @@ impl LocalProvisionFetchProtocol {
         let received_count = received_hashes.len();
         let missing_count = missing_hashes.len();
         state.mark_received(received_hashes);
-        state.reclaim_missing(&missing_hashes);
+        state.reclaim_missing(missing_hashes);
         // Catch-all for any in-flight hashes the peer didn't account for
         // (e.g. a legacy peer or a truncated response).
         state.reclaim_unreceived();
@@ -294,10 +294,10 @@ impl LocalProvisionFetchProtocol {
     fn handle_failed(
         &mut self,
         block_hash: BlockHash,
-        hashes: Vec<ProvisionHash>,
+        hashes: &[ProvisionHash],
     ) -> Vec<LocalProvisionFetchOutput> {
         if let Some(state) = self.fetches.get_mut(&block_hash) {
-            state.mark_fetch_failed(&hashes);
+            state.mark_fetch_failed(hashes);
             metrics::record_fetch_failed("local_provision");
         }
         vec![]

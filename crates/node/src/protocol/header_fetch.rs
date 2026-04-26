@@ -90,7 +90,7 @@ struct PendingHeaderFetch {
 /// Committed block header fetch protocol state machine.
 pub struct HeaderFetchProtocol {
     config: HeaderFetchConfig,
-    /// Pending fetches keyed by (source_shard, from_height).
+    /// Pending fetches keyed by (`source_shard`, `from_height`).
     pending: BTreeMap<(ShardGroupId, BlockHeight), PendingHeaderFetch>,
 }
 
@@ -144,7 +144,7 @@ impl HeaderFetchProtocol {
         self.pending.values().filter(|s| s.in_flight).count()
     }
 
-    /// Returns the number of (shard, from_height) keys with pending or in-flight fetches.
+    /// Returns the number of (shard, `from_height`) keys with pending or in-flight fetches.
     pub fn pending_count(&self) -> usize {
         self.pending.len()
     }
@@ -312,39 +312,36 @@ impl HeaderFetchProtocol {
                 .find(|p| !state.tried.contains(p))
                 .copied();
 
-            match peer {
-                Some(peer) => {
-                    state.tried.insert(peer);
-                    state.in_flight = true;
-                    available_slots -= 1;
-                    trace!(
-                        source_shard = source_shard.0,
-                        from_height = from_height.0,
-                        peer = peer.0,
-                        "Fetching committed block header from peer"
-                    );
-                    outputs.push(HeaderFetchOutput::Fetch {
-                        source_shard,
-                        from_height,
-                        peer,
-                    });
-                }
-                None => {
-                    // All peers exhausted — start new round with exponential backoff.
-                    state.rounds += 1;
-                    state.tried.clear();
-                    let backoff = std::time::Duration::from_millis(
-                        (500u64 * 2u64.saturating_pow(state.rounds)).min(30_000),
-                    );
-                    state.next_retry_at = Some(now + backoff);
-                    info!(
-                        source_shard = source_shard.0,
-                        from_height = from_height.0,
-                        round = state.rounds,
-                        backoff_ms = backoff.as_millis(),
-                        "Header fetch exhausted peers, backing off"
-                    );
-                }
+            if let Some(peer) = peer {
+                state.tried.insert(peer);
+                state.in_flight = true;
+                available_slots -= 1;
+                trace!(
+                    source_shard = source_shard.0,
+                    from_height = from_height.0,
+                    peer = peer.0,
+                    "Fetching committed block header from peer"
+                );
+                outputs.push(HeaderFetchOutput::Fetch {
+                    source_shard,
+                    from_height,
+                    peer,
+                });
+            } else {
+                // All peers exhausted — start new round with exponential backoff.
+                state.rounds += 1;
+                state.tried.clear();
+                let backoff = std::time::Duration::from_millis(
+                    (500u64 * 2u64.saturating_pow(state.rounds)).min(30_000),
+                );
+                state.next_retry_at = Some(now + backoff);
+                info!(
+                    source_shard = source_shard.0,
+                    from_height = from_height.0,
+                    round = state.rounds,
+                    backoff_ms = backoff.as_millis(),
+                    "Header fetch exhausted peers, backing off"
+                );
             }
         }
 
@@ -408,7 +405,7 @@ mod tests {
                 assert_eq!(*from_height, height(10));
                 assert_eq!(*peer, vid(1));
             }
-            _ => panic!("Expected Fetch output"),
+            HeaderFetchOutput::Deliver { .. } => panic!("Expected Fetch output"),
         }
     }
 

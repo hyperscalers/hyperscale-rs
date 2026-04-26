@@ -31,6 +31,7 @@ where
     ///
     /// Each handler is a closure that captures shared state and delegates to
     /// the serving function in the corresponding protocol module.
+    #[allow(clippy::too_many_lines)] // single registration table; one closure per request type
     pub(super) fn register_request_handler(&self) {
         use crate::protocol::provision_fetch::serve_provision_request;
         use crate::protocol::sync::{serve_block_request, serve_block_topup_request};
@@ -38,7 +39,19 @@ where
         use hyperscale_messages::request::{
             GetBlockRequest, GetBlockTopUpRequest, GetProvisionRequest, GetTransactionsRequest,
         };
+        use std::collections::HashMap;
         use std::sync::Arc;
+
+        type ProvisionResponse = hyperscale_messages::response::GetProvisionResponse;
+        type ProvisionWaiter = Arc<(
+            std::sync::Mutex<Option<ProvisionResponse>>,
+            std::sync::Condvar,
+        )>;
+
+        struct ProvisionRequestDedup {
+            cache: std::collections::BTreeMap<(u64, u64), ProvisionResponse>,
+            in_flight: HashMap<(u64, u64), ProvisionWaiter>,
+        }
 
         // ── block.request → sync protocol ────────────────────────────
 
@@ -46,7 +59,7 @@ where
         let provision_store = Arc::clone(&self.provision_store);
         self.network
             .register_request_handler::<GetBlockRequest>(move |req| {
-                serve_block_request(&*storage, &provision_store, req)
+                serve_block_request(&*storage, &provision_store, &req)
             });
 
         // ── block_topup.request → sync protocol ──────────────────────
@@ -55,7 +68,7 @@ where
         let provision_store = Arc::clone(&self.provision_store);
         self.network
             .register_request_handler::<GetBlockTopUpRequest>(move |req| {
-                serve_block_topup_request(&*storage, &provision_store, req)
+                serve_block_topup_request(&*storage, &provision_store, &req)
             });
 
         // ── transaction.request → fetch protocol ─────────────────────
@@ -64,7 +77,7 @@ where
         let tx_cache = Arc::clone(&self.tx_cache);
         self.network
             .register_request_handler::<GetTransactionsRequest>(move |req| {
-                serve_transaction_request(&*storage, &tx_cache, req)
+                serve_transaction_request(&*storage, &tx_cache, &req)
             });
 
         // ── provision.request → provision fetch protocol ─────────────
@@ -82,19 +95,6 @@ where
         let storage = Arc::clone(&self.storage);
         let topology = self.topology.clone();
         let outbound_cache = Arc::clone(&self.provision_store);
-
-        use std::collections::HashMap;
-
-        type ProvisionResponse = hyperscale_messages::response::GetProvisionResponse;
-        type ProvisionWaiter = Arc<(
-            std::sync::Mutex<Option<ProvisionResponse>>,
-            std::sync::Condvar,
-        )>;
-
-        struct ProvisionRequestDedup {
-            cache: std::collections::BTreeMap<(u64, u64), ProvisionResponse>,
-            in_flight: HashMap<(u64, u64), ProvisionWaiter>,
-        }
 
         let dedup: Arc<std::sync::Mutex<ProvisionRequestDedup>> =
             Arc::new(std::sync::Mutex::new(ProvisionRequestDedup {
@@ -166,7 +166,7 @@ where
                 // Compute
                 let topo = topology.load();
                 let response =
-                    serve_provision_request(&*storage, topo.local_shard(), topo.num_shards(), req);
+                    serve_provision_request(&*storage, topo.local_shard(), topo.num_shards(), &req);
 
                 // Store in cache, notify waiters, remove in-flight
                 {
@@ -355,6 +355,7 @@ where
 
     /// Register notification handlers for protocol messages sent via unicast
     /// to known committee members.
+    #[allow(clippy::too_many_lines)] // single registration table; one closure per notification type
     pub(super) fn register_notification_handlers(&self) {
         // ── block.vote → ProtocolEvent::BlockVoteReceived ────────────
 

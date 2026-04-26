@@ -33,10 +33,10 @@ where
     /// Interval for the periodic fetch tick timer.
     const FETCH_TICK_INTERVAL: Duration = Duration::from_millis(200);
 
-    /// Process SyncProtocol outputs internally.
+    /// Process `SyncProtocol` outputs internally.
     ///
-    /// DeliverBlock and SyncComplete are fed directly to the state machine
-    /// (no round-trip through the runner). FetchBlock uses the Network trait.
+    /// `DeliverBlock` and `SyncComplete` are fed directly to the state machine
+    /// (no round-trip through the runner). `FetchBlock` uses the `Network` trait.
     pub(super) fn process_sync_outputs(&mut self, outputs: Vec<SyncOutput>) {
         // Snapshot the sync inventory once per batch so every FetchBlock in
         // this tick shares a consistent view of mempool / cert-cache /
@@ -213,37 +213,36 @@ where
             Some(fetched) if !fetched.block.certificates().is_empty() => {
                 let computed =
                     hyperscale_types::compute_certificate_root(fetched.block.certificates());
-                if computed != fetched.block.header().certificate_root {
+                let matches = computed == fetched.block.header().certificate_root;
+                if !matches {
                     tracing::warn!(
                         height = height.0,
                         ?computed,
                         expected = ?fetched.block.header().certificate_root,
                         "Sync: certificate_root mismatch — rejecting response"
                     );
-                    false
-                } else {
-                    true
                 }
+                matches
             }
             _ => true, // Empty block or no block — no root to check
         };
 
-        if !certificate_root_valid {
-            let _ = self
-                .event_sender
-                .send(NodeInput::SyncBlockFetchFailed { height });
-        } else {
+        if certificate_root_valid {
             let outputs = self
                 .sync_protocol
                 .handle(SyncInput::BlockResponseReceived { height, block });
             self.process_sync_outputs(outputs);
+        } else {
+            let _ = self
+                .event_sender
+                .send(NodeInput::SyncBlockFetchFailed { height });
         }
     }
 
-    /// Process TransactionFetchProtocol outputs.
+    /// Process `TransactionFetchProtocol` outputs.
     ///
-    /// FetchTransactions uses the Network trait to make requests.
-    /// DeliverTransactions feeds events directly to the state machine.
+    /// `FetchTransactions` uses the `Network` trait to make requests.
+    /// `DeliverTransactions` feeds events directly to the state machine.
     pub(super) fn process_transaction_fetch_outputs(
         &mut self,
         outputs: Vec<TransactionFetchOutput>,
@@ -293,7 +292,7 @@ where
         }
     }
 
-    /// Process LocalProvisionFetchProtocol outputs.
+    /// Process `LocalProvisionFetchProtocol` outputs.
     ///
     /// `Fetch` uses the Network trait to request batches from the proposer/local peers.
     /// `Deliver` feeds each batch into the state machine via `ProvisionsVerified`.
@@ -353,7 +352,7 @@ where
         }
     }
 
-    /// Process ProvisionFetchProtocol outputs.
+    /// Process `ProvisionFetchProtocol` outputs.
     ///
     /// `Fetch` uses the Network trait to send a single-peer request.
     /// `Deliver` feeds provisions into the state machine via `StateProvisionsReceived`.
@@ -427,7 +426,7 @@ where
         }
     }
 
-    /// Process ExecCertFetchProtocol outputs.
+    /// Process `ExecCertFetchProtocol` outputs.
     ///
     /// `Fetch` sends a single-peer network request for execution certificates.
     /// `Deliver` feeds certificates into the state machine via `ExecutionCertificateReceived`.
@@ -484,7 +483,7 @@ where
         }
     }
 
-    /// Process HeaderFetchProtocol outputs.
+    /// Process `HeaderFetchProtocol` outputs.
     ///
     /// `Fetch` sends a single-peer network request for committed block headers.
     /// `Deliver` feeds the header into the state machine via `RemoteBlockCommitted`.
@@ -554,7 +553,7 @@ where
     /// When the fetch protocol has pending work, a recurring timer fires
     /// `NodeInput::FetchTick` to retry deferred or failed fetch operations.
     /// When all fetches are complete, the timer is cancelled.
-    /// Process FinalizedWaveFetchProtocol outputs.
+    /// Process `FinalizedWaveFetchProtocol` outputs.
     ///
     /// `Fetch` uses the Network trait to request finalized waves from the proposer/local peers.
     /// `Deliver` feeds each wave into the state machine for pending block completion.

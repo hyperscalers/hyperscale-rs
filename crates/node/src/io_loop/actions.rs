@@ -14,7 +14,7 @@ use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::Engine;
 use hyperscale_metrics as metrics;
 use hyperscale_network::Network;
-use hyperscale_storage::{ChainReader, ChainWriter, SubstateStore};
+use hyperscale_storage::{ChainReader, ChainWriter, JmtTreeReader, SubstateStore, VersionedStore};
 use hyperscale_types::{
     Block, BlockHeight, CertifiedBlock, QuorumCertificate, StateRoot, ValidatorId,
 };
@@ -23,13 +23,7 @@ use std::sync::Arc;
 use tracing::{debug, trace, warn};
 impl<S, N, D, E> IoLoop<S, N, D, E>
 where
-    S: ChainWriter
-        + SubstateStore
-        + hyperscale_storage::VersionedStore
-        + ChainReader
-        + hyperscale_storage::JmtTreeReader
-        + Send
-        + Sync,
+    S: ChainWriter + SubstateStore + VersionedStore + ChainReader + JmtTreeReader + Send + Sync,
     N: Network,
     D: Dispatch,
     E: Engine,
@@ -37,6 +31,7 @@ where
     // ─── Action Processing ──────────────────────────────────────────────
 
     /// Process a single action from the state machine.
+    #[allow(clippy::too_many_lines)] // single dispatch over the Action enum; one arm per variant
     pub(super) fn process_action(&mut self, action: Action) {
         match action {
             // ═══════════════════════════════════════════════════════════
@@ -167,7 +162,7 @@ where
                 let validator_id = self.validator_id;
 
                 self.dispatch.spawn_crypto(move || {
-                    let tx_count = tx_outcomes.len() as u32;
+                    let tx_count = u32::try_from(tx_outcomes.len()).unwrap_or(u32::MAX);
                     let msg = hyperscale_types::exec_vote_message(
                         vote_anchor_ts,
                         &wave_id,
@@ -254,26 +249,12 @@ where
                     }
                 }
             }
-            // ═══════════════════════════════════════════════════════════
-            // Delegated work — batched (accumulated for batch dispatch)
-            // ═══════════════════════════════════════════════════════════
-            // Wave delegated actions — dispatch immediately (same as AggregateExecutionCertificate)
+            // Delegated work — dispatch to the worker pools.
             Action::AggregateExecutionCertificate { .. }
             | Action::VerifyAndAggregateExecutionVotes { .. }
-            | Action::VerifyExecutionCertificateSignature { .. } => {
-                self.dispatch_delegated_action(action);
-            }
-            // ═══════════════════════════════════════════════════════════
-            // Delegated work — immediate dispatch
-            // ═══════════════════════════════════════════════════════════
-            Action::BuildProposal { .. } => {
-                // Provisions included in the proposal were already
-                // inserted into the shared `ProvisionStore` by the provisions
-                // coordinator at verify time and persist until the
-                // post-commit retention sweep drops them.
-                self.dispatch_delegated_action(action);
-            }
-            Action::VerifyAndBuildQuorumCertificate { .. }
+            | Action::VerifyExecutionCertificateSignature { .. }
+            | Action::BuildProposal { .. }
+            | Action::VerifyAndBuildQuorumCertificate { .. }
             | Action::VerifyQcSignature { .. }
             | Action::VerifyRemoteHeaderQc { .. }
             | Action::VerifyStateRoot { .. }
@@ -441,9 +422,9 @@ where
     /// Accumulate a block commit for batched dispatch. Records metrics
     /// immediately (on the pinned thread), feeds the sync protocol, fires
     /// `BlockCommitted` to the state machine, then defers the heavy
-    /// JMT/metadata writes to [`flush_block_commits`].
+    /// JMT/metadata writes to [`Self::flush_block_commits`].
     ///
-    /// `BlockCommitted` fires immediately — before RocksDB persistence —
+    /// `BlockCommitted` fires immediately — before `RocksDB` persistence —
     /// because the QC is the proof of commit (2f+1 agreement). Subsystem
     /// notifications use event-carried data, not storage reads. The async
     /// persistence closure sends `BlockPersisted` when the write completes.
@@ -488,7 +469,13 @@ where
             .unwrap()
             .contains_key(&block_hash);
 
-        if !already_prepared {
+        if already_prepared {
+            debug!(
+                height = height.0,
+                ?block_hash,
+                "Reusing prepared commit from consensus path"
+            );
+        } else {
             // Build view anchored at parent — includes prior synced blocks'
             // JMT snapshots so chained verification can find parent nodes.
             let view = self.pending_chain.view_at(block.header().parent_hash);
@@ -544,12 +531,6 @@ where
                 ?block_hash,
                 "Synced block prepared, queued for persist"
             );
-        } else {
-            debug!(
-                height = height.0,
-                ?block_hash,
-                "Reusing prepared commit from consensus path"
-            );
         }
 
         // Feed into the standard commit pipeline — accumulate_block_commit
@@ -597,6 +578,7 @@ where
         // (aggregator/header/sync), which have materially different latencies
         // under the 2-chain rule.
         let now_ms = self.state.now().as_millis();
+        #[allow(clippy::cast_precision_loss)] // latency readout for metrics; ms→f64 lossy is fine
         let commit_latency_secs =
             (now_ms.saturating_sub(commit.block.header().timestamp.as_millis())) as f64 / 1000.0;
         metrics::record_block_committed(height.0, commit_latency_secs, commit.source.as_str());
@@ -655,6 +637,7 @@ where
     /// The in-flight closure clears the flag before sending its final
     /// events, so the resulting `feed_event` → `flush_block_commits` picks
     /// up the backlog.
+    #[allow(clippy::too_many_lines)] // single transactional commit pipeline; splitting would scatter shared state
     pub(super) fn flush_block_commits(&mut self) {
         if self.pending_block_commits.is_empty() {
             return;
@@ -703,10 +686,10 @@ where
             let mut cache = self.prepared_commits.lock().unwrap();
             let mut deferring = false;
             for commit in commits {
-                let prepared = if !deferring {
-                    cache.remove(&commit.block.hash()).map(|(_, p)| p)
-                } else {
+                let prepared = if deferring {
                     None
+                } else {
+                    cache.remove(&commit.block.hash()).map(|(_, p)| p)
                 };
 
                 let not_ready = prepared.is_none();
@@ -813,6 +796,7 @@ where
     }
 
     /// Process sync, fetch, and provision recovery actions.
+    #[allow(clippy::too_many_lines)] // single dispatch over the sync/fetch action subset
     fn process_sync_fetch_action(&mut self, action: Action) {
         match action {
             Action::StartSync {

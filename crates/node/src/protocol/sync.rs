@@ -60,6 +60,7 @@ pub enum SyncStateKind {
 
 impl SyncStateKind {
     /// Returns a string representation for metrics/logging.
+    #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
             SyncStateKind::Idle => "idle",
@@ -184,8 +185,7 @@ impl SyncProtocol {
     /// Number of blocks behind target (for metrics).
     pub fn blocks_behind(&self) -> u64 {
         self.sync_target
-            .map(|(t, _)| t.0.saturating_sub(self.committed_height.0))
-            .unwrap_or(0)
+            .map_or(0, |(t, _)| t.0.saturating_sub(self.committed_height.0))
     }
 
     /// Get current sync status.
@@ -200,8 +200,7 @@ impl SyncProtocol {
             target_height: self.sync_target.map(|(h, _)| h.0),
             blocks_behind: self
                 .sync_target
-                .map(|(t, _)| t.0.saturating_sub(self.committed_height.0))
-                .unwrap_or(0),
+                .map_or(0, |(t, _)| t.0.saturating_sub(self.committed_height.0)),
             pending_fetches: self.heights_in_flight.len(),
             queued_heights: self.heights_queued.len(),
         }
@@ -239,51 +238,48 @@ impl SyncProtocol {
     ) -> Vec<SyncOutput> {
         self.heights_in_flight.remove(&height);
 
-        match response {
-            Some(CertifiedBlock { block, qc }) => {
-                // Validate
-                if block.height() != height {
-                    warn!(
-                        expected = height.0,
-                        got = block.height().0,
-                        "Height mismatch in sync response"
-                    );
-                    metrics::record_sync_block_filtered("height_mismatch");
-                    self.queue_height(height);
-                    return self.emit_fetch_outputs();
-                }
-
-                let block_hash = block.hash();
-                if qc.block_hash != block_hash {
-                    warn!(height = height.0, "QC block hash mismatch in sync response");
-                    metrics::record_sync_block_filtered("qc_hash_mismatch");
-                    self.queue_height(height);
-                    return self.emit_fetch_outputs();
-                }
-
-                if qc.height != height {
-                    warn!(height = height.0, "QC height mismatch in sync response");
-                    metrics::record_sync_block_filtered("qc_height_mismatch");
-                    self.queue_height(height);
-                    return self.emit_fetch_outputs();
-                }
-
-                trace!(height = height.0, "Valid sync block received");
-                metrics::record_sync_block_downloaded();
-                metrics::record_sync_block_verified();
-                let certified = CertifiedBlock::new_unchecked(block, qc);
-                let mut outputs = vec![SyncOutput::DeliverBlock {
-                    certified: Box::new(certified),
-                }];
-                outputs.extend(self.emit_fetch_outputs());
-                outputs
-            }
-            None => {
-                warn!(height = height.0, "Empty sync response, re-queuing");
-                metrics::record_sync_response_error("empty_response");
+        if let Some(CertifiedBlock { block, qc }) = response {
+            // Validate
+            if block.height() != height {
+                warn!(
+                    expected = height.0,
+                    got = block.height().0,
+                    "Height mismatch in sync response"
+                );
+                metrics::record_sync_block_filtered("height_mismatch");
                 self.queue_height(height);
-                self.emit_fetch_outputs()
+                return self.emit_fetch_outputs();
             }
+
+            let block_hash = block.hash();
+            if qc.block_hash != block_hash {
+                warn!(height = height.0, "QC block hash mismatch in sync response");
+                metrics::record_sync_block_filtered("qc_hash_mismatch");
+                self.queue_height(height);
+                return self.emit_fetch_outputs();
+            }
+
+            if qc.height != height {
+                warn!(height = height.0, "QC height mismatch in sync response");
+                metrics::record_sync_block_filtered("qc_height_mismatch");
+                self.queue_height(height);
+                return self.emit_fetch_outputs();
+            }
+
+            trace!(height = height.0, "Valid sync block received");
+            metrics::record_sync_block_downloaded();
+            metrics::record_sync_block_verified();
+            let certified = CertifiedBlock::new_unchecked(block, qc);
+            let mut outputs = vec![SyncOutput::DeliverBlock {
+                certified: Box::new(certified),
+            }];
+            outputs.extend(self.emit_fetch_outputs());
+            outputs
+        } else {
+            warn!(height = height.0, "Empty sync response, re-queuing");
+            metrics::record_sync_response_error("empty_response");
+            self.queue_height(height);
+            self.emit_fetch_outputs()
         }
     }
 
@@ -364,7 +360,7 @@ impl SyncProtocol {
         }
     }
 
-    /// Emit FetchBlock outputs for pending heights up to concurrent limit.
+    /// Emit `FetchBlock` outputs for pending heights up to concurrent limit.
     /// Short-circuits when no sync target is set — heights are only queued
     /// after `handle_start_sync`, so a missing target means nothing to
     /// fetch.
@@ -419,7 +415,7 @@ const LIVE_WINDOW: Duration = Duration::from_secs(WAVE_TIMEOUT.as_secs() + SERVE
 pub fn serve_block_request(
     storage: &impl ChainReader,
     provision_store: &ProvisionStore,
-    req: GetBlockRequest,
+    req: &GetBlockRequest,
 ) -> GetBlockResponse {
     trace!(
         height = req.height.0,
@@ -438,8 +434,7 @@ pub fn serve_block_request(
     let block_ts = qc.weighted_timestamp;
     let tip_ts = storage
         .latest_qc()
-        .map(|q| q.weighted_timestamp)
-        .unwrap_or(block_ts);
+        .map_or(block_ts, |q| q.weighted_timestamp);
     let wave_window_open = tip_ts.elapsed_since(block_ts) < LIVE_WINDOW;
 
     if !wave_window_open || provision_hashes.is_empty() {
@@ -451,24 +446,23 @@ pub fn serve_block_request(
         .map(|h| provision_store.get(h))
         .collect();
 
-    match resolved {
-        Some(provisions) => GetBlockResponse::found(ElidedCertifiedBlock::elide(
+    if let Some(provisions) = resolved {
+        GetBlockResponse::found(ElidedCertifiedBlock::elide(
             &block.into_live(provisions),
             qc,
             &req.inventory,
-        )),
-        None => {
-            // Cache miss inside the live window. Serve Sealed and let the
-            // requester pull provisions via the fetch protocol — avoids
-            // the peer-rotation retry storm the old `not_found` path caused
-            // when provisions had aged out everywhere.
-            trace!(
-                height = req.height.0,
-                "Cache miss for provisions inside live window — serving sealed"
-            );
-            metrics::record_sync_response_error("provision_cache_miss");
-            GetBlockResponse::found(ElidedCertifiedBlock::elide(&block, qc, &req.inventory))
-        }
+        ))
+    } else {
+        // Cache miss inside the live window. Serve Sealed and let the
+        // requester pull provisions via the fetch protocol — avoids
+        // the peer-rotation retry storm the old `not_found` path caused
+        // when provisions had aged out everywhere.
+        trace!(
+            height = req.height.0,
+            "Cache miss for provisions inside live window — serving sealed"
+        );
+        metrics::record_sync_response_error("provision_cache_miss");
+        GetBlockResponse::found(ElidedCertifiedBlock::elide(&block, qc, &req.inventory))
     }
 }
 
@@ -483,7 +477,7 @@ pub fn serve_block_request(
 pub fn serve_block_topup_request(
     storage: &impl ChainReader,
     provision_store: &ProvisionStore,
-    req: GetBlockTopUpRequest,
+    req: &GetBlockTopUpRequest,
 ) -> GetBlockTopUpResponse {
     let Some(hyperscale_storage::BlockForSync { block, .. }) =
         storage.get_block_for_sync(req.height)

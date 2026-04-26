@@ -14,7 +14,7 @@
 //!
 //! # Batching
 //!
-//! IoLoop batches execution-layer broadcasts and crypto verification for
+//! `IoLoop` batches execution-layer broadcasts and crypto verification for
 //! efficiency. Batch deadlines are tracked as logical time (`Duration`) so both
 //! production (wall clock) and simulation (logical clock) use the same paths.
 
@@ -68,9 +68,11 @@ type PreparedCommitMap<S> = HashMap<
 /// A block commit waiting to be flushed to storage.
 ///
 /// All blocks — consensus and sync — go through the same commit pipeline:
-/// VerifyStateRoot → PreparedCommit → commit_prepared_blocks.
+/// `VerifyStateRoot` → `PreparedCommit` → `commit_prepared_blocks`.
 pub(crate) struct PendingCommit {
+    /// Block being committed.
     pub block: Arc<Block>,
+    /// Quorum certificate certifying `block`.
     pub qc: Arc<QuorumCertificate>,
     /// How this node learned the certifying QC. Tagged into metrics so
     /// dashboards can separate aggregator/header/sync commit paths.
@@ -84,7 +86,7 @@ pub(crate) struct PendingCommit {
 
 /// Lock-free shared topology snapshot for handler closures and dispatch.
 ///
-/// Updated by the io_loop when `Action::TopologyChanged` is processed.
+/// Updated by the `io_loop` when `Action::TopologyChanged` is processed.
 /// Handler closures call `.load()` to get the current snapshot atomically.
 pub type SharedTopologySnapshot = Arc<ArcSwap<TopologySnapshot>>;
 
@@ -109,13 +111,21 @@ type CommittedHeaderVerificationItem = (
 // TimerOp — buffered timer operations for the runner
 // ═══════════════════════════════════════════════════════════════════════
 
-/// A timer operation buffered by IoLoop for the runner to process.
+/// A timer operation buffered by `IoLoop` for the runner to process.
 #[derive(Debug, Clone)]
 pub enum TimerOp {
     /// Set a timer to fire after `duration`.
-    Set { id: TimerId, duration: Duration },
+    Set {
+        /// Logical timer identifier (state-machine-side).
+        id: TimerId,
+        /// How long until the timer should fire.
+        duration: Duration,
+    },
     /// Cancel a previously set timer.
-    Cancel { id: TimerId },
+    Cancel {
+        /// Logical timer identifier to cancel.
+        id: TimerId,
+    },
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -124,7 +134,7 @@ pub enum TimerOp {
 
 /// Output from processing a single event via `IoLoop::step()`.
 ///
-/// IoLoop now handles all sync/fetch I/O internally via the Network trait.
+/// `IoLoop` now handles all sync/fetch I/O internally via the `Network` trait.
 /// The runner processes emitted transaction statuses and timer operations.
 pub struct StepOutput {
     /// Transaction status notifications emitted during this step.
@@ -147,7 +157,9 @@ pub struct StepOutput {
 ///
 /// Produced by [`IoLoop::status_snapshot()`] on the periodic metrics tick.
 /// The production runner maps this into its RPC shared state types.
+// Fields are flat metric/state readouts; their names are the documentation.
 #[derive(Debug, Clone)]
+#[allow(missing_docs)]
 pub struct NodeStatusSnapshot {
     pub committed_height: BlockHeight,
     pub view: u64,
@@ -163,7 +175,7 @@ pub struct NodeStatusSnapshot {
     pub at_pending_limit: bool,
     /// Per-remote-shard in-flight counts from latest verified headers.
     pub remote_shard_in_flight: HashMap<ShardGroupId, u32>,
-    /// Threshold for rejecting transactions due to remote shard congestion (80% of max_in_flight).
+    /// Threshold for rejecting transactions due to remote shard congestion (80% of `max_in_flight`).
     pub remote_congestion_threshold: u32,
 }
 
@@ -171,11 +183,14 @@ pub struct NodeStatusSnapshot {
 // MetricsSnapshot — cheap state capture for off-thread recording
 // ═══════════════════════════════════════════════════════════════════════
 
-/// Lightweight snapshot of io_loop state for metrics recording.
+/// Lightweight snapshot of `io_loop` state for metrics recording.
 ///
 /// All fields are plain integers collected via `.len()` calls on the pinned
-/// thread. The expensive work (RocksDB property queries, prometheus recording)
+/// thread. The expensive work (`RocksDB` property queries, prometheus recording)
 /// happens off-thread via [`record_metrics`].
+// Field names match the metric/gauge they feed; per-field doc comments would
+// just restate the name.
+#[allow(missing_docs)]
 pub struct MetricsSnapshot {
     pub bft_round: u64,
     pub view_changes: u64,
@@ -198,7 +213,7 @@ pub struct MetricsSnapshot {
 /// Record a [`MetricsSnapshot`] to the metrics backend.
 ///
 /// This performs the prometheus `set_*` calls (76 label lookups) plus
-/// the RocksDB property queries for storage memory usage. Designed to
+/// the `RocksDB` property queries for storage memory usage. Designed to
 /// run off the pinned thread via `spawn_blocking`.
 pub fn record_metrics<S: ChainWriter>(snapshot: MetricsSnapshot, storage: &S) {
     metrics::set_bft_round(snapshot.bft_round);
@@ -231,7 +246,7 @@ pub fn record_metrics<S: ChainWriter>(snapshot: MetricsSnapshot, storage: &S) {
 /// Unified I/O loop that processes all actions from the state machine.
 ///
 /// Generic over:
-/// - `S`: Storage (ChainWriter + SubstateStore + ChainReader)
+/// - `S`: Storage (`ChainWriter` + `SubstateStore` + `ChainReader`)
 /// - `N`: Network (message sending)
 /// - `D`: Dispatch (thread pool work scheduling)
 /// - `E`: Engine (transaction execution — defaults to `RadixExecutor`)
@@ -315,7 +330,7 @@ where
     // commit ordering.
     pending_block_commits: Vec<PendingCommit>,
 
-    /// Highest block height durably persisted to RocksDB. Updated when
+    /// Highest block height durably persisted to `RocksDB`. Updated when
     /// `BlockPersisted` arrives. Used for backpressure: if consensus gets
     /// too far ahead of persistence, we defer `BlockCommitted` until the
     /// disk write completes (bounding memory and crash-recovery window).
@@ -364,8 +379,11 @@ where
     D: Dispatch,
     E: Engine,
 {
-    /// Create a new IoLoop.
-    #[allow(clippy::too_many_arguments)]
+    /// Create a new `IoLoop`.
+    // `config: NodeConfig` is taken by value: every caller hands over a fresh
+    // config and we destructure sub-configs via `.clone()`, so a `&NodeConfig`
+    // would just force the body to clone each subfield.
+    #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
     pub fn new(
         state: NodeStateMachine,
         storage: S,
@@ -386,8 +404,12 @@ where
         let sync_protocol = SyncProtocol::new(config.sync.clone());
         let transaction_fetch_protocol =
             TransactionFetchProtocol::new(config.transaction_fetch.clone());
-        let local_provision_fetch_protocol = LocalProvisionFetchProtocol::new(Default::default());
-        let finalized_wave_fetch_protocol = FinalizedWaveFetchProtocol::new(Default::default());
+        let local_provision_fetch_protocol = LocalProvisionFetchProtocol::new(
+            crate::protocol::local_provision_fetch::LocalProvisionFetchConfig::default(),
+        );
+        let finalized_wave_fetch_protocol = FinalizedWaveFetchProtocol::new(
+            crate::protocol::finalized_wave_fetch::FinalizedWaveFetchConfig::default(),
+        );
         let provision_fetch_protocol = ProvisionFetchProtocol::new(config.provision_fetch.clone());
         let exec_cert_fetch_protocol = ExecCertFetchProtocol::new(config.exec_cert_fetch.clone());
         let header_fetch_protocol =
@@ -466,7 +488,7 @@ where
     /// Process actions from genesis initialization.
     ///
     /// `NodeStateMachine::initialize_genesis()` returns actions (timer sets)
-    /// that must be processed through the IoLoop's action handler.
+    /// that must be processed through the `IoLoop`.s action handler.
     pub fn handle_actions(&mut self, actions: Vec<Action>) {
         for action in actions {
             self.process_action(action);
@@ -557,6 +579,7 @@ where
     /// 3. Process `emitted_statuses` from the returned [`StepOutput`]
     /// 4. Drain any events produced through the event channel (simulation only —
     ///    production receives these via its crossbeam channel receivers)
+    #[allow(clippy::too_many_lines)] // single dispatch over NodeInput; one arm per event variant
     pub fn step(&mut self, event: NodeInput) -> StepOutput {
         self.emitted_statuses.clear();
         self.actions_generated = 0;
@@ -670,9 +693,10 @@ where
                     // delivered first). Silently drop.
                     return self.drain_pending_output();
                 };
-                let topup = response
-                    .map(|b| *b)
-                    .unwrap_or_else(hyperscale_messages::response::GetBlockTopUpResponse::empty);
+                let topup = response.map_or_else(
+                    hyperscale_messages::response::GetBlockTopUpResponse::empty,
+                    |b| *b,
+                );
                 match self.rehydrate_with_topup(&elided, topup) {
                     Ok(cert) => self.deliver_sync_block(height, Some(Box::new(cert))),
                     Err(miss) => {
@@ -1024,7 +1048,7 @@ where
 
     /// Feed a protocol event to the state machine and process all resulting actions.
     ///
-    /// This is the common pattern used throughout IoLoop: route an event through
+    /// This is the common pattern used throughout `IoLoop`: route an event through
     /// the state machine, then dispatch each resulting action.
     fn feed_event(&mut self, event: ProtocolEvent) {
         let actions = self.state.handle(event);
@@ -1067,7 +1091,7 @@ where
 
     /// Sign and broadcast provisions to target shard committees.
     ///
-    /// Signing is dispatched to the crypto pool to avoid blocking the io_loop.
+    /// Signing is dispatched to the crypto pool to avoid blocking the `io_loop`.
     pub(crate) fn broadcast_provisions(
         &self,
         batches: Vec<(
@@ -1126,7 +1150,13 @@ where
     ///
     /// Only reads `.len()` / `.stats()` from subsystems — no locks, no I/O,
     /// no prometheus calls. The caller dispatches [`record_metrics`] off-thread
-    /// to do the expensive work (RocksDB queries, prometheus recording).
+    /// to do the expensive work (`RocksDB` queries, prometheus recording).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal `Mutex`-protected caches are poisoned.
+    #[must_use]
+    #[allow(clippy::too_many_lines)] // single aggregation snapshot; cheap reads stitched together
     pub fn metrics_snapshot(&self) -> MetricsSnapshot {
         let bft_stats = self.state.bft().stats();
         let mempool = self.state.mempool();
@@ -1243,24 +1273,40 @@ where
     }
 
     /// Capture a snapshot of node state for external status APIs.
+    #[must_use]
     pub fn status_snapshot(&self) -> NodeStatusSnapshot {
         let state_root = self.state.last_committed_jmt_root();
         let mempool = self.state.mempool();
         let contention = mempool.lock_contention_stats();
+
+        // u64-counter → usize and 80% threshold → u32 are status-readout casts
+        // bounded by configured pool sizes; saturating coercions are fine.
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_precision_loss,
+            clippy::cast_sign_loss
+        )]
+        let remote_congestion_threshold = (mempool.config().max_in_flight as f64 * 0.8) as u32;
+        #[allow(clippy::cast_possible_truncation)]
+        let (pending, committed, executed) = (
+            contention.pending_count as usize,
+            contention.committed_count as usize,
+            contention.executed_count as usize,
+        );
 
         NodeStatusSnapshot {
             committed_height: self.state.bft().committed_height(),
             view: self.state.bft().view().0,
             state_root,
             sync: self.sync_protocol.status(),
-            mempool_pending: contention.pending_count as usize,
-            mempool_committed: contention.committed_count as usize,
-            mempool_executed: contention.executed_count as usize,
+            mempool_pending: pending,
+            mempool_committed: committed,
+            mempool_executed: executed,
             mempool_total: mempool.len(),
             accepting_rpc_transactions: !mempool.at_in_flight_limit(),
             at_pending_limit: mempool.at_pending_limit(),
             remote_shard_in_flight: self.state.remote_headers().remote_shard_in_flight(),
-            remote_congestion_threshold: (mempool.config().max_in_flight as f64 * 0.8) as u32,
+            remote_congestion_threshold,
         }
     }
 

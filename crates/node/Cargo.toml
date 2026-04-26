@@ -28,3 +28,6 @@ tracing.workspace = true
 serde.workspace = true
 
 [dev-dependencies]
+
+[lints]
+workspace = true

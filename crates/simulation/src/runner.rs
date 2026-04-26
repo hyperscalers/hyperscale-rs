@@ -207,7 +207,7 @@ impl SimulationRunner {
                 let state = NodeStateMachine::new(
                     node_index as NodeIndex,
                     topology_state,
-                    BftConfig::default(),
+                    &BftConfig::default(),
                     RecoveredState::default(),
                     MempoolConfig::default(),
                     hyperscale_provisions::ProvisionConfig::default(),
