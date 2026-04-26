@@ -98,10 +98,6 @@ hyperscale-topology = { path = "crates/topology" }
 hyperscale-types = { path = "crates/types" }
 
 # External dependencies
-ark-ec = "0.5"
-ark-ed-on-bls12-381-bandersnatch = "0.5"
-ark-ff = "0.5"
-ark-serialize = "0.5"
 arc-swap = "1.9.1"
 blake3 = "1.8.5"
 bytes = "1.9"
