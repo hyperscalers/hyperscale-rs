@@ -6,11 +6,8 @@ description = "Mempool state machine"
 
 [dependencies]
 hyperscale-core.workspace = true
-hyperscale-messages.workspace = true
 hyperscale-metrics.workspace = true
-hyperscale-provisions.workspace = true
 hyperscale-types.workspace = true
-thiserror.workspace = true
 tracing.workspace = true
 serde.workspace = true
 

@@ -7,9 +7,7 @@ description = "In-memory storage implementation for simulation"
 [dependencies]
 hyperscale-storage.workspace = true
 hyperscale-types.workspace = true
-im.workspace = true
 hyperscale-jmt.workspace = true
-tracing.workspace = true
 
 [dev-dependencies]
 hyperscale-storage = { workspace = true, features = ["test-utils"] }

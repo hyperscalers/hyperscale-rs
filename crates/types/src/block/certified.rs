@@ -1,9 +1,6 @@
 //! A block paired with the quorum certificate that certifies it.
 //!
 //! Every committed block has exactly one QC where `qc.block_hash == block.hash()`.
-//! This type makes the pairing explicit — previously we threaded
-//! `(Block, QuorumCertificate)` tuples through storage, sync, and the wire
-//! layer, which left the relationship between the two parts undocumented.
 
 use crate::{Block, BlockHash, BlockHeight, QuorumCertificate};
 use sbor::prelude::*;

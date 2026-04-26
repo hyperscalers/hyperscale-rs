@@ -41,10 +41,5 @@ pub const REMOTE_HEADER_RETENTION: Duration = Duration::from_secs(30);
 /// elapse, the tx is provably terminal everywhere — no shard can still
 /// need its provision data, EC, or any other artefact. Safe to drop on
 /// every node simultaneously.
-///
-/// Replaces the per-batch / per-cert / per-wave timers that previously
-/// scattered through provisions and execution: every retention site
-/// uses this single constant, derived from tx data, agreed on by every
-/// validator.
 pub const RETENTION_HORIZON: Duration =
     Duration::from_secs(MAX_VALIDITY_RANGE.as_secs() + WAVE_TIMEOUT.as_secs());

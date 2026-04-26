@@ -9,7 +9,6 @@ hyperscale-types.workspace = true
 
 sbor.workspace = true
 lz4_flex = "0.12.0"
-serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 

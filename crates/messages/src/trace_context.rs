@@ -30,7 +30,6 @@ impl TraceContext {
     /// OpenTelemetry context and serializes it to W3C Trace Context format.
     ///
     /// When disabled, returns an empty context.
-    #[allow(unused_variables)]
     #[must_use]
     pub const fn from_current() -> Self {
         #[cfg(feature = "trace-propagation")]

@@ -25,7 +25,6 @@ hyperscale-dispatch.workspace = true
 hyperscale-dispatch-pooled.workspace = true
 hyperscale-bft.workspace = true
 hyperscale-engine.workspace = true
-hyperscale-execution.workspace = true
 hyperscale-mempool.workspace = true
 hyperscale-metrics.workspace = true
 hyperscale-metrics-prometheus.workspace = true
@@ -35,16 +34,12 @@ hyperscale-node.workspace = true
 hyperscale-provisions.workspace = true
 hyperscale-topology.workspace = true
 hyperscale-types.workspace = true
-hyperscale-messages.workspace = true
 hyperscale-network.workspace = true
 hyperscale-network-libp2p.workspace = true
+hyperscale-messages.workspace = true
 
 # Networking - libp2p (used directly by validator/keygen binaries for Multiaddr/PeerId)
 libp2p.workspace = true
-libp2p-stream.workspace = true
-futures.workspace = true
-bytes.workspace = true
-async-trait = "0.1"
 
 # UPnP
 igd-next = { version = "0.14.3", features = ["aio_tokio"] }
@@ -56,13 +51,11 @@ sbor.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tokio.workspace = true
-parking_lot.workspace = true
 crossbeam.workspace = true
 core_affinity.workspace = true
 
 # Lock-free concurrent data structures
 arc-swap.workspace = true
-dashmap.workspace = true
 quick_cache.workspace = true
 
 # OpenTelemetry for distributed tracing
@@ -93,10 +86,6 @@ rand.workspace = true
 
 # Radix types for genesis configuration parsing
 radix-common.workspace = true
-
-# Cryptographic primitives for deterministic PeerId derivation
-sha2 = "0.10"
-ed25519-dalek.workspace = true
 tracing-appender = "0.2.4"
 
 [dev-dependencies]

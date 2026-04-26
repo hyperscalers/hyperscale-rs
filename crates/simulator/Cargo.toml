@@ -11,11 +11,9 @@ hyperscale-network-memory.workspace = true
 hyperscale-simulation.workspace = true
 hyperscale-spammer.workspace = true
 hyperscale-types.workspace = true
-hyperscale-engine.workspace = true
 
 # Radix dependencies for transaction building
 radix-common.workspace = true
-radix-transactions.workspace = true
 
 # Metrics
 hdrhistogram.workspace = true

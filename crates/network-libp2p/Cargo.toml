@@ -8,9 +8,6 @@ description = "Production libp2p network transport"
 default = []
 
 [dependencies]
-hyperscale-core.workspace = true
-hyperscale-dispatch.workspace = true
-hyperscale-dispatch-pooled.workspace = true
 hyperscale-metrics.workspace = true
 hyperscale-network.workspace = true
 hyperscale-types.workspace = true
@@ -35,13 +32,9 @@ clap.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tokio.workspace = true
-rayon.workspace = true
 
 # Lock-free concurrent data structures
 dashmap.workspace = true
-
-crossbeam.workspace = true
-hex.workspace = true
 rand.workspace = true
 
 [dev-dependencies]

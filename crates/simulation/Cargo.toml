@@ -8,9 +8,7 @@ description = "Simulation runner"
 hyperscale-core.workspace = true
 hyperscale-bft.workspace = true
 hyperscale-engine.workspace = true
-hyperscale-execution.workspace = true
 hyperscale-mempool.workspace = true
-hyperscale-network.workspace = true
 hyperscale-network-memory.workspace = true
 hyperscale-node.workspace = true
 hyperscale-provisions.workspace = true
@@ -18,9 +16,6 @@ hyperscale-storage.workspace = true
 hyperscale-storage-memory.workspace = true
 hyperscale-topology.workspace = true
 hyperscale-types.workspace = true
-
-# Dispatch (for future runner unification)
-hyperscale-dispatch.workspace = true
 hyperscale-dispatch-sync.workspace = true
 
 # Radix dependencies for real execution
@@ -28,7 +23,6 @@ radix-common.workspace = true
 
 arc-swap.workspace = true
 crossbeam.workspace = true
-thiserror.workspace = true
 tracing.workspace = true
 rand.workspace = true
 rand_chacha.workspace = true
