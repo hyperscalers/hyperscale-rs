@@ -38,20 +38,20 @@ pub struct VoteSet {
     // Verified votes (passed signature verification)
     // ═══════════════════════════════════════════════════════════════════════
     /// Verified votes with their committee indices.
-    /// Each tuple is (committee_index, vote, voting_power).
+    /// Each tuple is (`committee_index`, vote, `voting_power`).
     verified_votes: Vec<(usize, BlockVote, u64)>,
 
     /// Total voting power from verified votes.
     verified_power: u64,
 
-    /// Sum of (timestamp * stake_weight) for verified votes.
+    /// Sum of (timestamp * `stake_weight`) for verified votes.
     verified_timestamp_weight_sum: u128,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Unverified votes (buffered until quorum possible)
     // ═══════════════════════════════════════════════════════════════════════
     /// Unverified votes buffered for batch verification.
-    /// Each tuple is (committee_index, vote, public_key, voting_power).
+    /// Each tuple is (`committee_index`, vote, `public_key`, `voting_power`).
     unverified_votes: Vec<(usize, BlockVote, Bls12381G1PublicKey, u64)>,
 
     /// Total voting power of unverified votes.
@@ -70,8 +70,8 @@ pub struct VoteSet {
 
 impl VoteSet {
     /// Create a new vote set.
-    pub fn new(header: Option<BlockHeader>, num_validators: usize) -> Self {
-        let (block_hash, height, round, parent_block_hash) = if let Some(h) = &header {
+    pub fn new(header: Option<&BlockHeader>, num_validators: usize) -> Self {
+        let (block_hash, height, round, parent_block_hash) = if let Some(h) = header {
             (
                 Some(h.hash()),
                 Some(h.height),
@@ -127,7 +127,7 @@ impl VoteSet {
     ///
     /// This is needed when votes arrive before the header. The vote set
     /// can accumulate votes, but it needs the header info (particularly
-    /// parent_block_hash) to trigger verification.
+    /// `parent_block_hash`) to trigger verification.
     pub fn set_header(&mut self, header: &BlockHeader) {
         if self.height.is_none() {
             self.height = Some(header.height);
@@ -202,7 +202,7 @@ impl VoteSet {
     /// Take the unverified votes for batch verification.
     ///
     /// Returns the votes and marks the vote set as pending verification.
-    /// Each tuple is (committee_index, vote, public_key, voting_power).
+    /// Each tuple is (`committee_index`, vote, `public_key`, `voting_power`).
     pub fn take_unverified_votes(&mut self) -> Vec<(usize, BlockVote, Bls12381G1PublicKey, u64)> {
         self.pending_verification = true;
         self.unverified_power = 0;
@@ -219,7 +219,7 @@ impl VoteSet {
 
     /// Get data needed for verification action.
     ///
-    /// Returns (block_hash, height, round, parent_block_hash) or None if not ready.
+    /// Returns (`block_hash`, height, round, `parent_block_hash`) or None if not ready.
     pub fn verification_data(&self) -> Option<(BlockHash, BlockHeight, Round, BlockHash)> {
         Some((
             self.block_hash?,
@@ -250,7 +250,7 @@ impl VoteSet {
         for (committee_index, vote, voting_power) in verified_votes {
             // Accumulate weighted timestamp
             self.verified_timestamp_weight_sum +=
-                vote.timestamp.as_millis() as u128 * voting_power as u128;
+                u128::from(vote.timestamp.as_millis()) * u128::from(voting_power);
             self.verified_power += voting_power;
             self.verified_votes
                 .push((committee_index, vote, voting_power));
@@ -290,7 +290,7 @@ impl VoteSet {
 
         // Accumulate weighted timestamp
         self.verified_timestamp_weight_sum +=
-            vote.timestamp.as_millis() as u128 * voting_power as u128;
+            u128::from(vote.timestamp.as_millis()) * u128::from(voting_power);
         self.verified_power += voting_power;
         self.verified_votes
             .push((committee_index, vote, voting_power));
@@ -302,7 +302,7 @@ impl VoteSet {
     ///
     /// Two-chain rule (HotStuff-2): when creating a QC for block N,
     /// the committable block is at height N-1 (the parent). The committable
-    /// information is derived from the QC's height and parent_block_hash
+    /// information is derived from the QC's height and `parent_block_hash`
     /// via the `committable_height()` and `committable_hash()` methods.
     ///
     /// # Errors
@@ -350,13 +350,15 @@ impl VoteSet {
 
         // Aggregate BLS signatures
         let aggregated_signature = Bls12381G2Signature::aggregate(&signatures, true)
-            .map_err(|e| format!("failed to aggregate signatures: {:?}", e))?;
+            .map_err(|e| format!("failed to aggregate signatures: {e:?}"))?;
 
         // Compute stake-weighted timestamp: sum(timestamp * stake) / sum(stake)
         let weighted_timestamp_ms = if self.verified_power == 0 {
             0
         } else {
-            (self.verified_timestamp_weight_sum / self.verified_power as u128) as u64
+            // Mean of u64 timestamps weighted by u64 powers always fits in u64.
+            u64::try_from(self.verified_timestamp_weight_sum / u128::from(self.verified_power))
+                .unwrap_or(u64::MAX)
         };
 
         let height = self.height.ok_or("no height in vote set")?;
@@ -399,7 +401,7 @@ mod tests {
             parent_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(0),
-            timestamp: hyperscale_types::ProposerTimestamp(1234567890),
+            timestamp: hyperscale_types::ProposerTimestamp(1_234_567_890),
             round: Round::INITIAL,
             is_fallback: false,
             state_root: StateRoot::ZERO,
@@ -426,7 +428,7 @@ mod tests {
             Round::INITIAL,
             ValidatorId(voter_index as u64),
             &keys[voter_index],
-            hyperscale_types::ProposerTimestamp(1000000000000),
+            hyperscale_types::ProposerTimestamp(1_000_000_000_000),
         )
     }
 
@@ -435,7 +437,7 @@ mod tests {
         let keys: Vec<Bls12381G1PrivateKey> = (0..4).map(|_| generate_bls_keypair()).collect();
         let header = make_header(BlockHeight(1));
         let block_hash = header.hash();
-        let mut vote_set = VoteSet::new(Some(header), 4);
+        let mut vote_set = VoteSet::new(Some(&header), 4);
 
         // Buffer first vote
         let vote0 = make_vote(&keys, 0, block_hash, BlockHeight(1));
@@ -463,7 +465,7 @@ mod tests {
         let keys: Vec<Bls12381G1PrivateKey> = (0..4).map(|_| generate_bls_keypair()).collect();
         let header = make_header(BlockHeight(1));
         let block_hash = header.hash();
-        let mut vote_set = VoteSet::new(Some(header), 4);
+        let mut vote_set = VoteSet::new(Some(&header), 4);
 
         let total_power = 4u64;
 
@@ -488,7 +490,7 @@ mod tests {
         let keys: Vec<Bls12381G1PrivateKey> = (0..4).map(|_| generate_bls_keypair()).collect();
         let header = make_header(BlockHeight(1));
         let block_hash = header.hash();
-        let mut vote_set = VoteSet::new(Some(header), 4);
+        let mut vote_set = VoteSet::new(Some(&header), 4);
 
         // Add verified votes directly (e.g., own votes)
         for i in 0..3 {

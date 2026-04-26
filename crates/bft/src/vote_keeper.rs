@@ -33,7 +33,7 @@ pub use crate::vote_set::VoteSet;
 /// same-height re-voting across rounds when locked), and the received-vote
 /// record used for equivocation detection.
 pub(crate) struct VoteKeeper {
-    /// Vote sets for blocks being voted on (block_hash -> vote set).
+    /// Vote sets for blocks being voted on (`block_hash` -> vote set).
     pub(crate) vote_sets: HashMap<BlockHash, VoteSet>,
 
     /// Own-vote locking: tracks which block hash we voted for at each height.
@@ -41,11 +41,11 @@ pub(crate) struct VoteKeeper {
     /// same height and round. The lock may be released across rounds on
     /// timeout or when a QC proves the lock is irrelevant.
     ///
-    /// Key: height, Value: (block_hash, round)
+    /// Key: height, Value: (`block_hash`, round)
     pub(crate) voted_heights: HashMap<BlockHeight, (BlockHash, Round)>,
 
     /// Per-validator record of received verified votes for equivocation
-    /// detection. Key: (height, validator), Value: (block_hash, round).
+    /// detection. Key: (height, validator), Value: (`block_hash`, round).
     /// A different-block vote at the same (height, round) is equivocation;
     /// at a later round it's a legitimate revote after unlock.
     pub(crate) received_votes_by_height: HashMap<(BlockHeight, ValidatorId), (BlockHash, Round)>,
@@ -168,7 +168,7 @@ impl VoteKeeper {
         topology: &TopologySnapshot,
         vote: BlockVote,
         committed_height: BlockHeight,
-        header_for_vote: Option<BlockHeader>,
+        header_for_vote: Option<&BlockHeader>,
     ) -> Vec<Action> {
         let block_hash = vote.block_hash;
         let height = vote.height;
@@ -204,14 +204,11 @@ impl VoteKeeper {
 
         let public_key = if is_own_vote {
             None
+        } else if let Some(pk) = topology.public_key(vote.voter) {
+            Some(pk)
         } else {
-            match topology.public_key(vote.voter) {
-                Some(pk) => Some(pk),
-                None => {
-                    warn!("No public key for validator {:?}", vote.voter);
-                    return vec![];
-                }
-            }
+            warn!("No public key for validator {:?}", vote.voter);
+            return vec![];
         };
 
         let vote_set = self
@@ -450,7 +447,7 @@ mod tests {
             parent_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(0),
-            timestamp: hyperscale_types::ProposerTimestamp(1234567890),
+            timestamp: hyperscale_types::ProposerTimestamp(1_234_567_890),
             round: Round::INITIAL,
             is_fallback: false,
             state_root: StateRoot::ZERO,
@@ -504,11 +501,11 @@ mod tests {
         let hdr_r1 = header_at(Round(1));
         let hdr_r2 = header_at(Round(2));
         vk.vote_sets
-            .insert(hdr_r0.hash(), VoteSet::new(Some(hdr_r0.clone()), 4));
+            .insert(hdr_r0.hash(), VoteSet::new(Some(&hdr_r0), 4));
         vk.vote_sets
-            .insert(hdr_r1.hash(), VoteSet::new(Some(hdr_r1.clone()), 4));
+            .insert(hdr_r1.hash(), VoteSet::new(Some(&hdr_r1), 4));
         vk.vote_sets
-            .insert(hdr_r2.hash(), VoteSet::new(Some(hdr_r2.clone()), 4));
+            .insert(hdr_r2.hash(), VoteSet::new(Some(&hdr_r2), 4));
         vk.received_votes_by_height
             .insert((BlockHeight(5), ValidatorId(1)), (hdr_r0.hash(), Round(0)));
 
@@ -561,7 +558,7 @@ mod tests {
                 assert_eq!(existing_block, block_a);
                 assert_eq!(existing_round, Round(0));
             }
-            other => panic!("expected Equivocation, got {:?}", other),
+            other => panic!("expected Equivocation, got {other:?}"),
         }
         // Original vote preserved.
         let (stored_block, _) = vk.received_votes_by_height.get(&(h, v)).copied().unwrap();
@@ -686,7 +683,7 @@ mod tests {
                 assert_eq!(existing_block, block_a);
                 assert_eq!(existing_round, Round(0));
             }
-            other => panic!("expected LockedToOther, got {:?}", other),
+            other => panic!("expected LockedToOther, got {other:?}"),
         }
     }
 

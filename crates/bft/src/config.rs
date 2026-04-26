@@ -33,7 +33,7 @@ pub struct BftConfig {
     pub max_transactions_per_block: usize,
 
     /// Maximum finalized transactions per block (across all wave certificates).
-    /// Older waves (by kickoff block_height) are prioritized over newer ones.
+    /// Older waves (by kickoff `block_height`) are prioritized over newer ones.
     pub max_finalized_transactions_per_block: usize,
 
     /// Maximum remote-shard provision transactions per block, summed across
@@ -75,7 +75,7 @@ impl Default for BftConfig {
     fn default() -> Self {
         Self {
             view_change_timeout: Duration::from_secs(3),
-            view_change_timeout_increment: Duration::from_millis(1000),
+            view_change_timeout_increment: Duration::from_secs(1),
             view_change_timeout_max: Some(Duration::from_secs(30)),
             max_transactions_per_block: 4096,
             max_finalized_transactions_per_block: 8192,
@@ -92,17 +92,20 @@ impl Default for BftConfig {
 
 impl BftConfig {
     /// Create a new BFT configuration with default values.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Set the view change timeout.
+    #[must_use]
     pub fn with_view_change_timeout(mut self, timeout: Duration) -> Self {
         self.view_change_timeout = timeout;
         self
     }
 
     /// Set the view change timeout increment (linear backoff per round).
+    #[must_use]
     pub fn with_view_change_timeout_increment(mut self, increment: Duration) -> Self {
         self.view_change_timeout_increment = increment;
         self
@@ -111,18 +114,21 @@ impl BftConfig {
     /// Set the maximum view change timeout (caps the linear backoff).
     ///
     /// Pass `None` to disable the cap.
+    #[must_use]
     pub fn with_view_change_timeout_max(mut self, max: Option<Duration>) -> Self {
         self.view_change_timeout_max = max;
         self
     }
 
     /// Set the maximum transactions per block.
+    #[must_use]
     pub fn with_max_transactions(mut self, max: usize) -> Self {
         self.max_transactions_per_block = max;
         self
     }
 
     /// Set the maximum finalized transactions per block.
+    #[must_use]
     pub fn with_max_finalized_transactions(mut self, max: usize) -> Self {
         self.max_finalized_transactions_per_block = max;
         self
@@ -130,6 +136,7 @@ impl BftConfig {
 
     /// Set the maximum provision transactions per block (summed across all
     /// included provisions).
+    #[must_use]
     pub fn with_max_provision_transactions(mut self, max: usize) -> Self {
         self.max_provision_transactions_per_block = max;
         self

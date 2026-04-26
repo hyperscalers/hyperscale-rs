@@ -695,9 +695,7 @@ impl ProductionRunner {
         );
 
         // Initialize state machine with genesis (this sets up proposal timer).
-        let actions = io_loop
-            .state_mut()
-            .initialize_genesis(genesis_block.clone());
+        let actions = io_loop.state_mut().initialize_genesis(&genesis_block);
         info!(num_actions = actions.len(), "Genesis returned actions");
 
         // Process actions through IoLoop (timers, etc.).

@@ -176,14 +176,12 @@ pub(crate) fn validate_no_duplicate_transactions(
         let tx_hash = tx.hash();
         if qc_chain_tx_hashes.contains(&tx_hash) {
             return Err(format!(
-                "transaction {} already in QC chain ancestor",
-                tx_hash,
+                "transaction {tx_hash} already in QC chain ancestor"
             ));
         }
         if tx_cache.contains_tx(&tx_hash) {
             return Err(format!(
-                "transaction {} already committed within its validity window",
-                tx_hash,
+                "transaction {tx_hash} already committed within its validity window"
             ));
         }
     }
@@ -229,7 +227,7 @@ mod tests {
         compute_waves, test_utils, BlockHash, BlockHeader, ProposerTimestamp, QuorumCertificate,
         Round, RoutableTransaction, ShardGroupId, ValidatorId, ValidatorInfo, ValidatorSet,
     };
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     fn topology() -> TopologySnapshot {
         let committee = TestCommittee::new(4, 42);
@@ -308,7 +306,7 @@ mod tests {
             vec![hyperscale_types::WaveId::new(
                 ShardGroupId(99),
                 BlockHeight(1),
-                Default::default(),
+                BTreeSet::new(),
             )],
         );
         assert!(validate_waves(&topo, &block).is_err());

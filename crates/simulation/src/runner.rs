@@ -502,7 +502,7 @@ impl SimulationRunner {
                 let i = node_index as usize;
                 let actions = self.io_loops[i]
                     .state_mut()
-                    .initialize_genesis(genesis_block.clone());
+                    .initialize_genesis(&genesis_block);
                 self.io_loops[i].handle_actions(actions);
                 self.io_loops[i].flush_all_batches();
 

@@ -153,7 +153,7 @@ impl ProposalTracker {
 /// 2. Txs whose `validity_range` is malformed against `validity_anchor`, or
 ///    whose half-open range does not contain `validity_anchor`. This is the
 ///    same expression voters apply during block verification, anchored on
-///    the parent QC's weighted_timestamp; filtering here saves us from
+///    the parent QC's `weighted_timestamp`; filtering here saves us from
 ///    proposing blocks that will be rejected.
 ///
 /// Logs the dedup and expiry counts when non-zero.
@@ -201,8 +201,8 @@ pub(crate) fn select_transactions(
 /// manifest order), and cap the total finalized-tx count at the
 /// `max_finalized_txs` limit. Returns `(waves, total_tx_count)`.
 ///
-/// Canonical order matters: verifiers flatten receipts into JMT work_items
-/// in manifest order, and the BTreeMap collapse there is last-writer-wins,
+/// Canonical order matters: verifiers flatten receipts into JMT `work_items`
+/// in manifest order, and the `BTreeMap` collapse there is last-writer-wins,
 /// so the proposer must produce a deterministic order.
 pub(crate) fn select_finalized_waves(
     finalized_waves: Vec<Arc<FinalizedWave>>,
@@ -438,7 +438,7 @@ mod tests {
                 assert_eq!(expected.height, BlockHeight(5));
                 assert_eq!(expected.round, Round(1));
             }
-            other => panic!("expected Mismatch, got {:?}", other),
+            other => panic!("expected Mismatch, got {other:?}"),
         }
         assert!(
             tracker.pending().is_some(),
@@ -521,7 +521,7 @@ mod tests {
         // Anchor in the future of the tx's range.
         let anchor = ts(100_000);
         let expired_range = TimestampRange::new(ts(0), ts(1_000));
-        let valid_range = TimestampRange::new(anchor, anchor.plus(Duration::from_secs(60)));
+        let valid_range = TimestampRange::new(anchor, anchor.plus(Duration::from_mins(1)));
 
         let txs = vec![
             tx_with_range(1, expired_range),
@@ -553,7 +553,7 @@ mod tests {
     fn select_transactions_drops_malformed_ranges() {
         let anchor = ts(1_000);
         // Length over MAX_VALIDITY_RANGE (5 min).
-        let too_wide = TimestampRange::new(ts(0), anchor.plus(Duration::from_secs(10 * 60)));
+        let too_wide = TimestampRange::new(ts(0), anchor.plus(Duration::from_mins(10)));
         let txs = vec![tx_with_range(4, too_wide)];
 
         let selected = select_transactions(&txs, &HashSet::new(), &empty_tx_cache(), anchor);
@@ -580,7 +580,7 @@ mod tests {
     fn select_transactions_keeps_at_lower_bound_inclusive() {
         // Half-open: start_timestamp_inclusive == anchor must be kept.
         let anchor = ts(1_000);
-        let range = TimestampRange::new(anchor, anchor.plus(Duration::from_secs(60)));
+        let range = TimestampRange::new(anchor, anchor.plus(Duration::from_mins(1)));
         let txs = vec![tx_with_range(6, range)];
 
         let selected = select_transactions(&txs, &HashSet::new(), &empty_tx_cache(), anchor);

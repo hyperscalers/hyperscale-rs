@@ -1,7 +1,7 @@
 //! Async verification pipeline for block voting.
 //!
 //! Tracks QC signature, state root, transaction root, and receipt root
-//! verifications. BftCoordinator delegates verification bookkeeping here while
+//! verifications. `BftCoordinator` delegates verification bookkeeping here while
 //! retaining control-flow decisions (voting, block rejection).
 //!
 //! Pure pre-vote validation helpers (header structure, timestamp bounds,
@@ -24,7 +24,7 @@ use hyperscale_core::{Action, VerificationKind};
 
 /// Block header pending QC signature verification.
 ///
-/// When we receive a block header with a non-genesis parent_qc, we need to
+/// When we receive a block header with a non-genesis `parent_qc`, we need to
 /// verify the QC's aggregated BLS signature before voting. This struct
 /// tracks the block header while waiting for verification.
 #[derive(Debug, Clone)]
@@ -43,15 +43,20 @@ pub(crate) struct PendingQcVerification {
 /// parent committed would dispatch with the wrong `parent_state_root`.
 #[derive(Debug)]
 pub struct ReadyStateRootVerification {
+    /// Block whose state root is being verified.
     pub block_hash: BlockHash,
+    /// Parent block hash; the JMT computation chains on top of this parent's snapshot.
     pub parent_block_hash: BlockHash,
+    /// State root at the parent block, anchoring the JMT computation.
     pub parent_state_root: StateRoot,
     /// The committed height of the parent block (stable anchor for JMT computation).
     pub parent_block_height: BlockHeight,
+    /// State root the proposer claimed; the verifier rejects on mismatch.
     pub expected_root: StateRoot,
-    /// Finalized waves from the PendingBlock — these carry the proposer's receipts,
+    /// Finalized waves from the `PendingBlock` — these carry the proposer's receipts,
     /// ensuring all validators verify against the same execution outputs.
     pub finalized_waves: Vec<Arc<FinalizedWave>>,
+    /// Height of the block being verified.
     pub block_height: BlockHeight,
 }
 
@@ -84,16 +89,16 @@ pub(crate) struct PendingStateRootVerification {
 
 /// Tracks all async verification state for block voting.
 ///
-/// BftCoordinator owns this as a field and delegates verification bookkeeping
-/// to it. Control-flow decisions (vote, reject block) remain in BftCoordinator.
+/// `BftCoordinator` owns this as a field and delegates verification bookkeeping
+/// to it. Control-flow decisions (vote, reject block) remain in `BftCoordinator`.
 pub(crate) struct VerificationPipeline {
     // === QC signature verification ===
     /// Block headers pending QC signature verification.
-    /// Maps block_hash -> pending verification info.
+    /// Maps `block_hash` -> pending verification info.
     pending_qc_verifications: HashMap<BlockHash, PendingQcVerification>,
 
     /// Cache of already-verified QC signatures.
-    /// Maps QC's block_hash (the block the QC certifies) -> height.
+    /// Maps QC's `block_hash` (the block the QC certifies) -> height.
     verified_qcs: HashMap<BlockHash, BlockHeight>,
 
     // === State root verification ===
@@ -104,7 +109,7 @@ pub(crate) struct VerificationPipeline {
     verified_state_roots: HashSet<BlockHash>,
 
     /// Blocks waiting for their parent's tree nodes to become available (via
-    /// commit or prior verification). Keyed by parent_block_hash.
+    /// commit or prior verification). Keyed by `parent_block_hash`.
     deferred_state_root_verifications: HashMap<BlockHash, Vec<PendingStateRootVerification>>,
 
     /// Deferred proposal waiting for the parent's tree nodes to become
@@ -124,7 +129,7 @@ pub(crate) struct VerificationPipeline {
     last_persisted_height: BlockHeight,
 
     /// State root verifications ready to dispatch.
-    /// Drained by NodeStateMachine which emits `VerifyStateRoot` actions.
+    /// Drained by `NodeStateMachine` which emits `VerifyStateRoot` actions.
     /// The dispatched handler runs against a `SubstateView` anchored at
     /// the parent block, which sees prior unpersisted JMT snapshots so
     /// verification can chain from prior results without waiting for
@@ -289,7 +294,7 @@ impl VerificationPipeline {
     /// (vs. trusting it purely via the QC chain).
     ///
     /// Used by the commit path to decide between `CommitBlock` (fast path —
-    /// PreparedCommit from `VerifyStateRoot` already in the cache) and
+    /// `PreparedCommit` from `VerifyStateRoot` already in the cache) and
     /// `CommitBlockByQcOnly` (slow path — compute inline at commit time).
     pub fn is_state_root_verified(&self, block_hash: &BlockHash) -> bool {
         self.verified_state_roots.contains(block_hash)
@@ -419,7 +424,7 @@ impl VerificationPipeline {
     /// Check if a block needs state root verification before voting.
     ///
     /// Always returns true for blocks that haven't been verified yet —
-    /// even cert-less blocks verify (trivially) so their PreparedCommit
+    /// even cert-less blocks verify (trivially) so their `PreparedCommit`
     /// populates the overlay for child block verifications.
     pub fn needs_state_root_verification(&self, block: &Block) -> bool {
         let block_hash = block.hash();
@@ -469,7 +474,10 @@ impl VerificationPipeline {
         let parent_tree_available = parent_block_height <= self.last_persisted_height
             || self.verified_state_roots.contains(&parent_hash);
 
-        if !parent_tree_available {
+        if parent_tree_available {
+            self.state_root_verifications_in_flight.insert(block_hash);
+            self.ready_state_root_verifications.push(ready);
+        } else {
             debug!(
                 block_hash = ?block_hash,
                 parent_hash = ?parent_hash,
@@ -479,9 +487,6 @@ impl VerificationPipeline {
                 .entry(parent_hash)
                 .or_default()
                 .push(ready);
-        } else {
-            self.state_root_verifications_in_flight.insert(block_hash);
-            self.ready_state_root_verifications.push(ready);
         }
     }
 
@@ -562,7 +567,7 @@ impl VerificationPipeline {
     /// correct. This marks state root, transaction root, certificate root,
     /// local receipt root, provision root, and in-flight as verified so
     /// the verification pipeline is complete. Without this, a view change
-    /// would report these as NOT_STARTED since the proposer path bypasses
+    /// would report these as `NOT_STARTED` since the proposer path bypasses
     /// `try_vote_on_block`.
     pub fn mark_proposal_fully_verified(&mut self, block_hash: BlockHash) {
         self.mark_proposal_state_root_verified(block_hash);
@@ -803,16 +808,12 @@ impl VerificationPipeline {
             return InFlightCheck::SkipVote;
         };
 
-        let finalized_tx_count: u32 = chain
-            .pending
-            .get(&block_hash)
-            .map(|p| {
-                p.finalized_waves()
-                    .iter()
-                    .map(|fw| fw.tx_count() as u32)
-                    .sum()
-            })
-            .unwrap_or(0);
+        let finalized_tx_count: u32 = chain.pending.get(&block_hash).map_or(0, |p| {
+            p.finalized_waves()
+                .iter()
+                .map(|fw| u32::try_from(fw.tx_count()).unwrap_or(u32::MAX))
+                .sum()
+        });
 
         if self.verify_in_flight(block_hash, block, parent_in_flight, finalized_tx_count) {
             InFlightCheck::Proceed
@@ -823,7 +824,7 @@ impl VerificationPipeline {
 
     /// Verify the proposed in-flight count is deterministically correct.
     ///
-    /// in_flight = parent.in_flight + new_txs - finalized_txs
+    /// `in_flight` = `parent.in_flight` + `new_txs` - `finalized_txs`
     ///
     /// All validators can compute this from chain state, so it must be exact.
     /// Certificates are only counted when actually included (JMT was ready).
@@ -843,7 +844,7 @@ impl VerificationPipeline {
             finalized_tx_count
         };
         let expected = parent_in_flight
-            .saturating_add(block.transaction_count() as u32)
+            .saturating_add(u32::try_from(block.transaction_count()).unwrap_or(u32::MAX))
             .saturating_sub(certs_finalized);
 
         if proposed == expected {
@@ -887,7 +888,7 @@ impl VerificationPipeline {
                 let finalized_waves = chain
                     .pending
                     .get(&pending.block_hash)
-                    .and_then(|pb| pb.block())
+                    .and_then(PendingBlock::block)
                     .map(|b| b.certificates().to_vec())
                     .unwrap_or_default();
                 ReadyStateRootVerification {
@@ -1032,14 +1033,14 @@ impl VerificationPipeline {
     // Cleanup
     // ═══════════════════════════════════════════════════════════════════════
 
-    /// Remove verification state for blocks no longer in pending_blocks.
+    /// Remove verification state for blocks no longer in `pending_blocks`.
     ///
-    /// Called by BftCoordinator::cleanup_old_state() after it has cleaned up
-    /// pending_blocks. We use the surviving pending_blocks set to determine
+    /// Called by `BftCoordinator::cleanup_old_state()` after it has cleaned up
+    /// `pending_blocks`. We use the surviving `pending_blocks` set to determine
     /// which verification state to keep.
     ///
     /// Most verification state is keyed by block hash and cleaned up based on
-    /// pending_blocks membership (if the block is gone, its verification state
+    /// `pending_blocks` membership (if the block is gone, its verification state
     /// is stale). The `verified_qcs` cache is the exception: it's keyed by the
     /// QC's certified block hash (not the proposing block), so it uses
     /// height-based retention with a 2-block buffer to support view-change
@@ -1108,7 +1109,7 @@ impl VerificationPipeline {
     pub(crate) fn pending_state_root_verifications_len(&self) -> usize {
         self.deferred_state_root_verifications
             .values()
-            .map(|v| v.len())
+            .map(Vec::len)
             .sum()
     }
 }

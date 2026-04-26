@@ -102,21 +102,17 @@ fn is_current_proposer_matches_topology() {
     // At height 1, round 0 the proposer rotation picks committee[(1+0) % 4] = V1.
     // Each validator's coordinator should answer `is_current_proposer` consistently
     // with `topology.should_propose(height, round)` for that validator.
-    for local_idx in 0..4 {
-        let topology = committee.topology_snapshot(local_idx, 1);
-        let coordinator = BftCoordinator::new(
-            local_idx as u32,
-            BftConfig::default(),
-            RecoveredState::default(),
-        );
+    for local_idx in 0_u32..4 {
+        let topology = committee.topology_snapshot(local_idx as usize, 1);
+        let coordinator =
+            BftCoordinator::new(local_idx, BftConfig::default(), RecoveredState::default());
         // Fresh coordinator: latest_qc is None → next height = committed_height + 1 = 1.
         // view = Round::INITIAL = Round(0).
         let expected = topology.should_propose(BlockHeight(1), Round::INITIAL);
         assert_eq!(
             coordinator.is_current_proposer(&topology),
             expected,
-            "V{}: is_current_proposer must agree with topology.should_propose",
-            local_idx
+            "V{local_idx}: is_current_proposer must agree with topology.should_propose"
         );
     }
 }
@@ -128,13 +124,10 @@ fn will_propose_next_is_true_for_exactly_one_validator_in_fresh_committee() {
     // true across the committee rotation.
     let committee = TestCommittee::new(4, 42);
     let mut proposers = 0usize;
-    for local_idx in 0..4 {
-        let topology = committee.topology_snapshot(local_idx, 1);
-        let coordinator = BftCoordinator::new(
-            local_idx as u32,
-            BftConfig::default(),
-            RecoveredState::default(),
-        );
+    for local_idx in 0_u32..4 {
+        let topology = committee.topology_snapshot(local_idx as usize, 1);
+        let coordinator =
+            BftCoordinator::new(local_idx, BftConfig::default(), RecoveredState::default());
         if coordinator.will_propose_next(&topology) {
             proposers += 1;
         }

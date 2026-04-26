@@ -166,7 +166,7 @@ impl NodeStateMachine {
     /// Initialize the node with a genesis block.
     ///
     /// Returns actions to be processed (e.g., initial timers).
-    pub fn initialize_genesis(&mut self, genesis: Block) -> Vec<Action> {
+    pub fn initialize_genesis(&mut self, genesis: &Block) -> Vec<Action> {
         self.bft
             .initialize_genesis(self.topology.snapshot(), genesis)
         // Note: No separate view change timer - round advancement is handled
@@ -302,7 +302,7 @@ impl NodeStateMachine {
 
         self.bft.on_block_header(
             self.topology.snapshot(),
-            header,
+            &header,
             manifest,
             |h| self.mempool.get_transaction(h),
             |h| self.execution.get_finalized_wave_by_hash(h),
@@ -325,7 +325,7 @@ impl NodeStateMachine {
         self.bft.on_qc_formed(
             self.topology.snapshot(),
             block_hash,
-            qc,
+            &qc,
             &inputs.ready_txs,
             inputs.finalized_waves,
             inputs.provisions,
@@ -579,7 +579,7 @@ impl StateMachine for NodeStateMachine {
                 self.topology.snapshot(),
                 height,
                 round,
-                block.clone(),
+                &block,
                 block_hash,
                 finalized_waves,
                 provisions,

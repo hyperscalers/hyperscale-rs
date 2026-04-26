@@ -18,7 +18,9 @@ use std::sync::Arc;
 
 /// Result of QC verification and assembly.
 pub struct QcVerificationResult {
+    /// Block being voted on.
     pub block_hash: BlockHash,
+    /// Assembled QC, or `None` if quorum wasn't reached or aggregation failed.
     pub qc: Option<QuorumCertificate>,
     /// Verified votes returned when no QC was formed (for accumulation across rounds).
     /// Empty when a QC is successfully built.
@@ -35,6 +37,7 @@ pub struct QcVerificationResult {
 ///
 /// Called from the dispatch layer via `Action::VerifyAndBuildQuorumCertificate`;
 /// the split helpers exist for focused unit testing of each phase.
+#[must_use]
 #[allow(clippy::too_many_arguments)]
 pub fn verify_and_build_qc(
     block_hash: BlockHash,
@@ -168,14 +171,15 @@ pub fn build_qc_from_verified(
     let mut verified_power: u64 = 0;
     for (idx, vote, power) in &sorted {
         signers.set(*idx);
-        timestamp_weight_sum += vote.timestamp.as_millis() as u128 * *power as u128;
+        timestamp_weight_sum += u128::from(vote.timestamp.as_millis()) * u128::from(*power);
         verified_power += *power;
     }
 
     let weighted_timestamp_ms = if verified_power == 0 {
         0
     } else {
-        (timestamp_weight_sum / verified_power as u128) as u64
+        // Mean of u64 timestamps weighted by u64 powers always fits in u64.
+        u64::try_from(timestamp_weight_sum / u128::from(verified_power)).unwrap_or(u64::MAX)
     };
 
     Some(QuorumCertificate {
@@ -194,6 +198,7 @@ pub fn build_qc_from_verified(
 ///
 /// Filters public keys by the QC's signer bitfield, aggregates the filtered
 /// keys, and verifies the aggregated signature against the signing message.
+#[must_use]
 pub fn verify_qc_signature(qc: &QuorumCertificate, public_keys: &[Bls12381G1PublicKey]) -> bool {
     let signing_message = qc.signing_message();
     // Get signer keys based on QC's signer bitfield
@@ -356,7 +361,10 @@ pub fn verify_local_receipt_root(
 
 /// Result of state root verification.
 pub struct StateRootResult<P: Send> {
+    /// `true` when the computed state root matched the expected root.
     pub valid: bool,
+    /// Prepared commit handle from the JMT verifier — `Some` on success so the
+    /// commit pipeline can write it back without recomputing.
     pub prepared_commit: Option<P>,
 }
 
@@ -411,8 +419,12 @@ pub fn verify_state_root<S: ChainWriter + SubstateStore>(
 
 /// Result of building a proposal block.
 pub struct ProposalResult<P: Send> {
+    /// The constructed proposal block (header + payload).
     pub block: Block,
+    /// Hash of the constructed block, cached so callers don't recompute.
     pub block_hash: BlockHash,
+    /// JMT prepared-commit handle from the proposer's pre-commit, threaded
+    /// to the commit pipeline so the proposer doesn't recompute on commit.
     pub prepared_commit: Option<P>,
 }
 
@@ -422,9 +434,9 @@ pub struct ProposalResult<P: Send> {
 /// parent yet, so certificates are always included when available.
 ///
 /// Algorithm:
-/// 1. `prepare_block_commit()` with overlay snapshots → state_root + handle
+/// 1. `prepare_block_commit()` with overlay snapshots → `state_root` + handle
 /// 2. Compute tx/cert/receipt/provision roots
-/// 3. Build BlockHeader + Block, hash it
+/// 3. Build `BlockHeader` + `Block`, hash it
 /// 4. Return block, hash, prepared commit handle
 #[allow(clippy::too_many_arguments)]
 pub fn build_proposal<S: ChainWriter + SubstateStore>(
@@ -474,8 +486,9 @@ pub fn build_proposal<S: ChainWriter + SubstateStore>(
 
     // in_flight is deterministic from chain state:
     // parent's in_flight + new transactions committed - transactions finalized by certificates.
+    let new_tx_count = u32::try_from(transactions.len()).unwrap_or(u32::MAX);
     let in_flight = parent_in_flight
-        .saturating_add(transactions.len() as u32)
+        .saturating_add(new_tx_count)
         .saturating_sub(finalized_tx_count);
 
     let header = BlockHeader {
@@ -650,7 +663,7 @@ mod tests {
         let qc = build_qc_from_verified(block_hash, shard(), height, round, parent, &verified)
             .expect("build_qc should succeed");
 
-        let pubs: Vec<_> = keys.iter().map(|k| k.public_key()).collect();
+        let pubs: Vec<_> = keys.iter().map(Bls12381G1PrivateKey::public_key).collect();
         assert!(verify_qc_signature(&qc, &pubs));
         assert_eq!(qc.block_hash, block_hash);
         assert_eq!(qc.height, height);
@@ -804,7 +817,7 @@ mod tests {
         .unwrap();
         qc.signers = SignerBitfield::new(3);
 
-        let pubs: Vec<_> = keys.iter().map(|k| k.public_key()).collect();
+        let pubs: Vec<_> = keys.iter().map(Bls12381G1PrivateKey::public_key).collect();
         assert!(!verify_qc_signature(&qc, &pubs));
     }
 
@@ -829,7 +842,10 @@ mod tests {
         .unwrap();
 
         let wrong_keys = keypairs(3);
-        let wrong_pubs: Vec<_> = wrong_keys.iter().map(|k| k.public_key()).collect();
+        let wrong_pubs: Vec<_> = wrong_keys
+            .iter()
+            .map(Bls12381G1PrivateKey::public_key)
+            .collect();
         assert!(!verify_qc_signature(&qc, &wrong_pubs));
     }
 
@@ -872,7 +888,7 @@ mod tests {
         assert!(!verify_transaction_root(root, &txs, anchor));
 
         // Same root, anchor inside the range — verification passes.
-        let valid_range = TimestampRange::new(anchor, anchor.plus(Duration::from_secs(60)));
+        let valid_range = TimestampRange::new(anchor, anchor.plus(Duration::from_mins(1)));
         let notarized2 = test_notarized_transaction_v1(&[2]);
         let tx2 = Arc::new(
             routable_from_notarized_v1(notarized2, valid_range).expect("valid notarized fixture"),
@@ -892,7 +908,7 @@ mod tests {
         // Length over MAX_VALIDITY_RANGE.
         let too_wide = TimestampRange::new(
             WeightedTimestamp::ZERO,
-            anchor.plus(Duration::from_secs(10 * 60)),
+            anchor.plus(Duration::from_mins(10)),
         );
         let notarized = test_notarized_transaction_v1(&[3]);
         let tx = Arc::new(

@@ -32,7 +32,7 @@ pub(crate) struct ChainView<'a> {
     pub pending: &'a HashMap<BlockHash, PendingBlock>,
 }
 
-impl<'a> ChainView<'a> {
+impl ChainView<'_> {
     /// Look up a block by hash across certified, pending (if assembled), and
     /// genesis. Returns `None` if no source has the block.
     pub fn get_block(&self, block_hash: BlockHash) -> Option<Block> {
@@ -77,24 +77,23 @@ impl<'a> ChainView<'a> {
         if parent_hash == self.committed_hash {
             return self.committed_state_root;
         }
-        self.get_header(parent_hash)
-            .map(|h| h.state_root)
-            .unwrap_or_else(|| {
+        self.get_header(parent_hash).map_or_else(
+            || {
                 warn!(
                     ?parent_hash,
                     committed_hash = ?self.committed_hash,
                     "Parent header not found for state root lookup"
                 );
                 self.committed_state_root
-            })
+            },
+            |h| h.state_root,
+        )
     }
 
     /// In-flight count on the parent header. Returns `0` if the header is
     /// missing (parent pruned from in-memory caches).
     pub fn parent_in_flight(&self, parent_hash: BlockHash) -> u32 {
-        self.get_header(parent_hash)
-            .map(|h| h.in_flight)
-            .unwrap_or(0)
+        self.get_header(parent_hash).map_or(0, |h| h.in_flight)
     }
 
     /// Parent to use when building the next proposal: the latest QC's block
@@ -174,28 +173,28 @@ mod tests {
     };
     use std::collections::BTreeMap;
 
-    fn make_header(height: u64, parent_hash: BlockHash) -> BlockHeader {
+    fn make_header(height: u8, parent_hash: BlockHash) -> BlockHeader {
         BlockHeader {
             shard_group_id: ShardGroupId(0),
-            height: BlockHeight(height),
+            height: BlockHeight(u64::from(height)),
             parent_hash,
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(0),
             timestamp: ProposerTimestamp(1000),
             round: Round::INITIAL,
             is_fallback: false,
-            state_root: StateRoot::from_raw(Hash::from_bytes(&[height as u8; 32])),
+            state_root: StateRoot::from_raw(Hash::from_bytes(&[height; 32])),
             transaction_root: TransactionRoot::ZERO,
             certificate_root: CertificateRoot::ZERO,
             local_receipt_root: LocalReceiptRoot::ZERO,
             provision_root: ProvisionsRoot::ZERO,
             waves: vec![],
             provision_tx_roots: BTreeMap::new(),
-            in_flight: height as u32,
+            in_flight: u32::from(height),
         }
     }
 
-    fn make_block(height: u64, parent_hash: BlockHash) -> Block {
+    fn make_block(height: u8, parent_hash: BlockHash) -> Block {
         Block::Live {
             header: make_header(height, parent_hash),
             transactions: vec![],
@@ -211,20 +210,20 @@ mod tests {
         committed_height: u64,
         committed_hash: BlockHash,
         committed_state_root: StateRoot,
-        certified: HashMap<BlockHash, Block>,
-        pending: HashMap<BlockHash, PendingBlock>,
-        latest_qc: Option<QuorumCertificate>,
-        genesis: Option<Block>,
+        certified: &HashMap<BlockHash, Block>,
+        pending: &HashMap<BlockHash, PendingBlock>,
+        latest_qc: Option<&QuorumCertificate>,
+        genesis: Option<&Block>,
         f: impl FnOnce(&ChainView<'_>) -> R,
     ) -> R {
         let view = ChainView {
             committed_height: BlockHeight(committed_height),
             committed_hash,
             committed_state_root,
-            latest_qc: latest_qc.as_ref(),
-            genesis: genesis.as_ref(),
-            certified: &certified,
-            pending: &pending,
+            latest_qc,
+            genesis,
+            certified,
+            pending,
         };
         f(&view)
     }
@@ -262,10 +261,10 @@ mod tests {
             0,
             BlockHash::ZERO,
             StateRoot::ZERO,
-            certified,
-            pending,
+            &certified,
+            &pending,
             None,
-            Some(genesis),
+            Some(&genesis),
             |view| {
                 assert!(view.get_block(certified_hash).is_some());
                 assert!(view.get_block(pending_hash).is_some());
@@ -296,8 +295,8 @@ mod tests {
             0,
             BlockHash::ZERO,
             StateRoot::ZERO,
-            HashMap::new(),
-            pending,
+            &HashMap::new(),
+            &pending,
             None,
             None,
             |view| {
@@ -317,8 +316,8 @@ mod tests {
             10,
             tip_hash,
             tip_root,
-            HashMap::new(),
-            HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
             None,
             None,
             |view| {
@@ -343,8 +342,8 @@ mod tests {
             4,
             tip_hash,
             tip_root,
-            certified,
-            HashMap::new(),
+            &certified,
+            &HashMap::new(),
             None,
             None,
             |view| {
@@ -363,8 +362,8 @@ mod tests {
             10,
             tip_hash,
             tip_root,
-            HashMap::new(),
-            HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
             None,
             None,
             |view| {
@@ -387,8 +386,8 @@ mod tests {
             0,
             BlockHash::ZERO,
             StateRoot::ZERO,
-            certified,
-            HashMap::new(),
+            &certified,
+            &HashMap::new(),
             None,
             None,
             |view| {
@@ -410,9 +409,9 @@ mod tests {
             0,
             BlockHash::ZERO,
             StateRoot::ZERO,
-            HashMap::new(),
-            HashMap::new(),
-            Some(qc.clone()),
+            &HashMap::new(),
+            &HashMap::new(),
+            Some(&qc),
             None,
             |view| {
                 let (hash, returned_qc) = view.proposal_parent();
@@ -430,8 +429,8 @@ mod tests {
             0,
             tip_hash,
             StateRoot::ZERO,
-            HashMap::new(),
-            HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
             None,
             None,
             |view| {

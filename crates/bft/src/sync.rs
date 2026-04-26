@@ -1,7 +1,7 @@
 //! Sync coordination for catching up to the network.
 //!
 //! Manages the sync state flag, synced block buffering, and pending
-//! synced block QC verifications. BftCoordinator owns this as a field and
+//! synced block QC verifications. `BftCoordinator` owns this as a field and
 //! delegates sync-specific bookkeeping here.
 
 use hyperscale_core::Action;
@@ -28,9 +28,9 @@ pub(crate) struct PendingSyncedBlockVerification {
 
 /// Sync block coordination state.
 ///
-/// BftCoordinator owns this as a field and delegates sync-specific bookkeeping
-/// to it. Core protocol state changes (committed_height, latest_qc) remain
-/// on BftCoordinator.
+/// `BftCoordinator` owns this as a field and delegates sync-specific bookkeeping
+/// to it. Core protocol state changes (`committed_height`, `latest_qc`) remain
+/// on `BftCoordinator`.
 pub(crate) struct SyncManager {
     /// Whether we are currently syncing (catching up to the network).
     syncing: bool,
@@ -46,16 +46,16 @@ pub(crate) struct SyncManager {
     sync_applied_height: BlockHeight,
 
     /// Buffered out-of-order synced blocks waiting for earlier blocks.
-    /// Maps height -> CertifiedBlock.
+    /// Maps height -> `CertifiedBlock`.
     buffered_synced_blocks: BTreeMap<BlockHeight, CertifiedBlock>,
 
     /// Synced blocks pending QC signature verification.
-    /// Maps block_hash -> pending synced block info.
+    /// Maps `block_hash` -> pending synced block info.
     pending_synced_block_verifications: HashMap<BlockHash, PendingSyncedBlockVerification>,
 }
 
 impl SyncManager {
-    /// Create a new SyncManager.
+    /// Create a new `SyncManager`.
     pub fn new() -> Self {
         Self {
             syncing: false,
@@ -260,7 +260,7 @@ impl SyncManager {
     /// Handle QC verification result for a synced block.
     ///
     /// Returns `Some(pending)` if this was a synced block verification,
-    /// `None` if the block_hash wasn't found in pending synced verifications.
+    /// `None` if the `block_hash` wasn't found in pending synced verifications.
     pub fn on_qc_verified(
         &mut self,
         block_hash: BlockHash,
@@ -762,7 +762,9 @@ mod tests {
                 assert_eq!(target_height, BlockHeight(10));
                 assert_eq!(target_hash, qc.block_hash);
             }
-            _ => panic!("expected TriggerSync for missing-next-block gap"),
+            SyncHealthDecision::Idle => {
+                panic!("expected TriggerSync for missing-next-block gap")
+            }
         }
     }
 

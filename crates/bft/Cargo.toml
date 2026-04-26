@@ -18,3 +18,6 @@ tracing.workspace = true
 hyperscale-test-helpers.workspace = true
 proptest.workspace = true
 tracing-test.workspace = true
+
+[lints]
+workspace = true

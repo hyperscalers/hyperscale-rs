@@ -146,3 +146,9 @@ radix-engine-interface = { git = "https://github.com/hyperscalers/radixdlt-scryp
 radix-substate-store-interface = { git = "https://github.com/hyperscalers/radixdlt-scrypto", rev = "7d0b9a0", default-features = false, features = ["std"] }
 radix-transactions = { git = "https://github.com/hyperscalers/radixdlt-scrypto", rev = "7d0b9a0", default-features = false, features = ["std"] }
 sbor = { git = "https://github.com/hyperscalers/radixdlt-scrypto", rev = "7d0b9a0", default-features = false, features = ["std"] }
+
+[workspace.lints.rust]
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }

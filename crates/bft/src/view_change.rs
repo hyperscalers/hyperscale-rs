@@ -25,7 +25,7 @@ pub(crate) struct ViewChangeController {
 
     /// Round at the start of the current height. Used by the linear-backoff
     /// timeout formula: `rounds_at_height = view - view_at_height_start`.
-    /// Reset to `view` when committed_height advances.
+    /// Reset to `view` when `committed_height` advances.
     pub(crate) view_at_height_start: Round,
 
     /// Time of last leader activity (proposal, header receipt, QC, commit).
@@ -92,8 +92,9 @@ impl ViewChangeController {
     /// header-attested, so the formula is deterministic network-wide.
     pub fn current_timeout(&self, config: &BftConfig) -> Duration {
         let rounds_at_height = self.view.0.saturating_sub(self.view_at_height_start.0);
-        let timeout = config.view_change_timeout
-            + config.view_change_timeout_increment * rounds_at_height as u32;
+        let rounds_factor = u32::try_from(rounds_at_height).unwrap_or(u32::MAX);
+        let timeout =
+            config.view_change_timeout + config.view_change_timeout_increment * rounds_factor;
         match config.view_change_timeout_max {
             Some(max) => timeout.min(max),
             None => timeout,
@@ -172,13 +173,13 @@ mod tests {
         let mut vc = ViewChangeController::new();
         let config = cfg(1000, 500, None);
 
-        assert_eq!(vc.current_timeout(&config), Duration::from_millis(1000));
+        assert_eq!(vc.current_timeout(&config), Duration::from_secs(1));
 
         vc.view = Round(1);
         assert_eq!(vc.current_timeout(&config), Duration::from_millis(1500));
 
         vc.view = Round(4);
-        assert_eq!(vc.current_timeout(&config), Duration::from_millis(3000));
+        assert_eq!(vc.current_timeout(&config), Duration::from_secs(3));
     }
 
     #[test]
@@ -187,7 +188,7 @@ mod tests {
         let config = cfg(1000, 500, Some(2000));
 
         vc.view = Round(10);
-        assert_eq!(vc.current_timeout(&config), Duration::from_millis(2000));
+        assert_eq!(vc.current_timeout(&config), Duration::from_secs(2));
     }
 
     #[test]
@@ -199,7 +200,7 @@ mod tests {
         assert_eq!(vc.current_timeout(&config), Duration::from_millis(3500));
 
         vc.reset_for_height_advance();
-        assert_eq!(vc.current_timeout(&config), Duration::from_millis(1000));
+        assert_eq!(vc.current_timeout(&config), Duration::from_secs(1));
     }
 
     #[test]

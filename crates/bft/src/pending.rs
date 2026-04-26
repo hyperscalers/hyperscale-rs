@@ -18,9 +18,9 @@ use tracing::debug;
 ///
 /// # Lifecycle
 ///
-/// 1. Created from BlockHeader (all transactions/waves marked as absent by hash)
-/// 2. Full Transaction objects arrive via gossip (stored in received_transactions map)
-/// 3. FinalizedWaves arrive when verifier independently finalizes each wave
+/// 1. Created from `BlockHeader` (all transactions/waves marked as absent by hash)
+/// 2. Full `Transaction` objects arrive via gossip (stored in `received_transactions` map)
+/// 3. `FinalizedWave`s arrive when verifier independently finalizes each wave
 ///    (carries certificate + receipts + ECs)
 /// 4. When all transactions and finalized waves received, block can be constructed
 /// 5. Block stored to storage
@@ -36,19 +36,19 @@ pub struct PendingBlock {
     /// Map of transaction hash -> Arc<RoutableTransaction> (for received transactions).
     received_transactions: HashMap<TxHash, Arc<RoutableTransaction>>,
 
-    /// Set of transaction hashes we're still waiting for (HashSet for O(1) lookup).
+    /// Set of transaction hashes we're still waiting for (`HashSet` for O(1) lookup).
     missing_transaction_hashes: HashSet<TxHash>,
 
-    /// Map of wave_id hash -> Arc<FinalizedWave> (carries cert + receipts + ECs).
+    /// Map of `wave_id` hash -> `Arc<FinalizedWave>` (carries cert + receipts + ECs).
     ///
     /// A block is complete once
     /// all its waves have been independently finalized by this validator.
     received_waves: BTreeMap<WaveIdHash, Arc<FinalizedWave>>,
 
-    /// Set of wave_id hashes we're still waiting for.
+    /// Set of `wave_id` hashes we're still waiting for.
     missing_wave_hashes: HashSet<WaveIdHash>,
 
-    /// Received provisions keyed by provisions hash. BTreeMap so
+    /// Received provisions keyed by provisions hash. `BTreeMap` so
     /// `provisions()` iteration is deterministic across validators.
     received_provisions: BTreeMap<ProvisionHash, Arc<Provisions>>,
 
@@ -237,7 +237,7 @@ impl PendingBlock {
 
     /// Construct the block from header + received transactions + received waves.
     ///
-    /// Should only be called when is_complete() returns true.
+    /// Should only be called when `is_complete()` returns true.
     pub fn construct_block(&mut self) -> Result<Arc<Block>, String> {
         if !self.is_complete() {
             return Err(format!(
@@ -416,6 +416,7 @@ mod tests {
         BlockHeight, CertificateRoot, LocalReceiptRoot, ProvisionsRoot, QuorumCertificate, Round,
         ShardGroupId, StateRoot, TransactionRoot, ValidatorId,
     };
+    use std::collections::BTreeSet;
 
     fn make_header(height: BlockHeight) -> BlockHeader {
         BlockHeader {
@@ -424,7 +425,7 @@ mod tests {
             parent_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(0),
-            timestamp: hyperscale_types::ProposerTimestamp(1234567890),
+            timestamp: hyperscale_types::ProposerTimestamp(1_234_567_890),
             round: Round::INITIAL,
             is_fallback: false,
             state_root: StateRoot::ZERO,
@@ -497,7 +498,7 @@ mod tests {
     fn test_add_finalized_wave() {
         use hyperscale_types::{BlockHeight, WaveCertificate, WaveId};
 
-        let wave_id = WaveId::new(ShardGroupId(0), BlockHeight(1), Default::default());
+        let wave_id = WaveId::new(ShardGroupId(0), BlockHeight(1), BTreeSet::new());
         let wave_hash = wave_id.hash();
         let header = make_header(BlockHeight(1));
 
@@ -535,7 +536,7 @@ mod tests {
 
         let tx = Arc::new(test_transaction(1));
         let tx_hash = tx.hash();
-        let wave_id = WaveId::new(ShardGroupId(0), BlockHeight(1), Default::default());
+        let wave_id = WaveId::new(ShardGroupId(0), BlockHeight(1), BTreeSet::new());
         let wave_hash = wave_id.hash();
         let header = make_header(BlockHeight(1));
 
@@ -572,7 +573,7 @@ mod tests {
     fn test_from_complete_block_is_complete() {
         use hyperscale_types::{Block, BlockHeight, WaveCertificate, WaveId};
 
-        let wave_id = WaveId::new(ShardGroupId(0), BlockHeight(1), Default::default());
+        let wave_id = WaveId::new(ShardGroupId(0), BlockHeight(1), BTreeSet::new());
         let cert = Arc::new(WaveCertificate {
             wave_id: wave_id.clone(),
             execution_certificates: vec![],
