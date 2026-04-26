@@ -13,7 +13,12 @@ rayon = { workspace = true, optional = true }
 thiserror.workspace = true
 
 [dev-dependencies]
+criterion = { version = "0.8", features = ["html_reports"] }
 proptest.workspace = true
+
+[[bench]]
+name = "jmt_ops"
+harness = false
 
 [lints]
 workspace = true
