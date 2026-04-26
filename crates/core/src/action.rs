@@ -51,9 +51,11 @@ pub enum Action {
     // ═══════════════════════════════════════════════════════════════════════
     /// Sign and broadcast a block header (proposal) to the local shard.
     ///
-    /// The io_loop signs the header on the consensus crypto pool before sending.
+    /// The `io_loop` signs the header on the consensus crypto pool before sending.
     BroadcastBlockHeader {
+        /// Block header to sign and broadcast.
         header: Box<BlockHeader>,
+        /// Manifest listing the block's tx / cert / provision hashes.
         manifest: Box<BlockManifest>,
     },
 
@@ -62,7 +64,9 @@ pub enum Action {
     // ═══════════════════════════════════════════════════════════════════════
     /// Broadcast a transaction gossip to a shard.
     BroadcastTransaction {
+        /// Target shard for the gossip.
         shard: ShardGroupId,
+        /// Gossip envelope (sender + transaction payload).
         gossip: Box<TransactionGossip>,
     },
 
@@ -72,14 +76,18 @@ pub enum Action {
     /// Sign and send an execution vote to the wave leader for aggregation.
     ///
     /// Emitted by the state machine when a wave completes (all txs executed).
-    /// The io_loop signs the vote (it owns the signing key) and sends it to
+    /// The `io_loop` signs the vote (it owns the signing key) and sends it to
     /// the wave leader (unicast). The leader aggregates 2f+1 votes into an EC.
     SignAndSendExecutionVote {
+        /// Block whose wave is being voted on.
         block_hash: BlockHash,
+        /// Block height (for correlation).
         block_height: BlockHeight,
-        /// Consensus height at which this vote is being cast.
+        /// Consensus timestamp at which this vote is being cast.
         vote_anchor_ts: WeightedTimestamp,
+        /// Wave identifier whose execution is being attested to.
         wave_id: WaveId,
+        /// Global receipt root over the wave's per-tx outcomes.
         global_receipt_root: GlobalReceiptRoot,
         /// Per-tx outcomes in wave order. Carried on the vote so the
         /// leader can extract them directly when building the EC.
@@ -93,7 +101,9 @@ pub enum Action {
     /// The wave leader broadcasts to both local committee peers (who need the
     /// EC since they don't aggregate) and remote participating shard committees.
     BroadcastExecutionCertificate {
+        /// Target shard receiving the EC.
         shard: ShardGroupId,
+        /// Aggregated execution certificate.
         certificate: Arc<ExecutionCertificate>,
         /// Target shard peers (excluding self) for the broadcast.
         recipients: Vec<ValidatorId>,
@@ -102,11 +112,12 @@ pub enum Action {
     /// Cache an aggregated execution certificate for serving fetch requests.
     ///
     /// Emitted by the wave leader after aggregation and by non-leaders after
-    /// receiving and verifying the EC broadcast. The io_loop stores these in
+    /// receiving and verifying the EC broadcast. The `io_loop` stores these in
     /// the in-memory cache so remote shards can fetch ECs via fallback.
     /// Persistence is handled via wave certificates in `block.certificates`
     /// at commit time.
     TrackExecutionCertificate {
+        /// Execution certificate to cache for serving fetch requests.
         certificate: Arc<ExecutionCertificate>,
     },
 
@@ -123,7 +134,9 @@ pub enum Action {
         block_hash: BlockHash,
         /// One entry per cross-shard tx that needs provisioning.
         requests: Vec<ProvisionRequest>,
+        /// Shard producing the provisions (this validator's shard).
         source_shard: ShardGroupId,
+        /// Source-shard block height the provisions are anchored to.
         block_height: BlockHeight,
         /// Per-shard recipients for provision broadcasts (excluding self).
         shard_recipients: HashMap<ShardGroupId, Vec<ValidatorId>>,
@@ -133,8 +146,9 @@ pub enum Action {
     ///
     /// Used for the light-client provisions pattern. When a block commits,
     /// this broadcasts the header + QC so remote shards can verify state roots.
-    /// The io_loop signs on the consensus crypto pool before sending.
+    /// The `io_loop` signs on the consensus crypto pool before sending.
     BroadcastCommittedBlockHeader {
+        /// Header + QC bundle to broadcast globally.
         committed_header: CommittedBlockHeader,
     },
 
@@ -142,10 +156,18 @@ pub enum Action {
     // Timers
     // ═══════════════════════════════════════════════════════════════════════
     /// Set a timer to fire after a duration.
-    SetTimer { id: TimerId, duration: Duration },
+    SetTimer {
+        /// Timer slot to set; replaces any previous timer with the same id.
+        id: TimerId,
+        /// How long until the timer fires.
+        duration: Duration,
+    },
 
     /// Cancel a previously set timer.
-    CancelTimer { id: TimerId },
+    CancelTimer {
+        /// Timer slot to cancel.
+        id: TimerId,
+    },
 
     // ═══════════════════════════════════════════════════════════════════════
     // Continuation (fed back as ProtocolEvent with Internal priority)
@@ -185,10 +207,10 @@ pub enum Action {
         /// Parent block hash (from the block's header).
         parent_block_hash: BlockHash,
         /// Votes to verify and potentially aggregate.
-        /// Each tuple is (committee_index, vote, public_key, voting_power).
+        /// Each tuple is (`committee_index`, vote, `public_key`, `voting_power`).
         votes_to_verify: Vec<(usize, BlockVote, Bls12381G1PublicKey, u64)>,
         /// Already-verified votes (e.g., our own vote).
-        /// Each tuple is (committee_index, vote, voting_power).
+        /// Each tuple is (`committee_index`, vote, `voting_power`).
         verified_votes: Vec<(usize, BlockVote, u64)>,
         /// Total voting power in the committee (for quorum calculation).
         total_voting_power: u64,
@@ -205,11 +227,11 @@ pub enum Action {
     VerifyProvisions {
         /// The provisions to verify (all from the same source block).
         provisions: Provisions,
-        /// The QC-verified committed block header from RemoteHeaderCoordinator.
+        /// The QC-verified committed block header from `RemoteHeaderCoordinator`.
         committed_header: Arc<CommittedBlockHeader>,
     },
 
-    /// Aggregate execution votes into an ExecutionCertificate (quorum reached).
+    /// Aggregate execution votes into an `ExecutionCertificate` (quorum reached).
     ///
     /// Performs BLS signature aggregation on execution votes.
     /// Delegated to a thread pool in production, instant in simulation.
@@ -222,7 +244,7 @@ pub enum Action {
         /// Votes to aggregate (with quorum). The first vote's `tx_outcomes`
         /// is used for the EC payload (all quorum votes have identical outcomes).
         votes: Vec<ExecutionVote>,
-        /// Ordered committee for the shard (for SignerBitfield index mapping).
+        /// Ordered committee for the shard (for `SignerBitfield` index mapping).
         committee: Vec<ValidatorId>,
     },
 
@@ -258,19 +280,19 @@ pub enum Action {
     /// Delegated to a thread pool in production, instant in simulation.
     /// Returns `ProtocolEvent::QcSignatureVerified` when complete.
     VerifyQcSignature {
-        /// The QC to verify (carries shard_group_id for self-contained verification).
+        /// The QC to verify (carries `shard_group_id` for self-contained verification).
         qc: QuorumCertificate,
         /// Public keys of the signers (pre-resolved by state machine from QC's signer bitfield).
         public_keys: Vec<Bls12381G1PublicKey>,
         /// The block hash this QC verification is associated with (for correlation).
-        /// This is the hash of the block whose header contains this QC as parent_qc.
+        /// This is the hash of the block whose header contains this QC as `parent_qc`.
         block_hash: BlockHash,
     },
 
     /// Verify a remote block header's QC for cross-shard deferral validation.
     ///
     /// Verifies the aggregated BLS signature on the QC, checks voting power meets
-    /// quorum, and confirms block_hash matches hash(header).
+    /// quorum, and confirms `block_hash` matches `hash(header)`.
     ///
     /// Delegated to `ConsensusCrypto` thread pool.
     /// Returns `ProtocolEvent::RemoteHeaderQcVerified` when complete.
@@ -300,17 +322,18 @@ pub enum Action {
     /// `prepare_block_commit` which computes the JMT root and caches a
     /// `PreparedCommit` for efficient commit later.
     VerifyStateRoot {
+        /// Block whose state root is being verified.
         block_hash: BlockHash,
         /// Parent block hash — used to walk the snapshot chain for the overlay.
         parent_block_hash: BlockHash,
-        /// Base state root (parent block's state_root).
+        /// Base state root (parent block's `state_root`).
         parent_state_root: StateRoot,
         /// Height of the parent block (stable anchor for JMT computation).
         parent_block_height: BlockHeight,
         /// Expected state root after applying writes.
         expected_root: StateRoot,
         /// Finalized waves whose receipts contribute to the state root.
-        /// The thread pool merges DatabaseUpdates from these.
+        /// The thread pool merges `DatabaseUpdates` from these.
         finalized_waves: Vec<Arc<FinalizedWave>>,
         /// Block height being verified.
         block_height: BlockHeight,
@@ -328,6 +351,7 @@ pub enum Action {
     ///
     /// Pure CPU; no JMT dependency.
     VerifyTransactionRoot {
+        /// Block whose transaction root is being verified.
         block_hash: BlockHash,
         /// Expected transaction root from block header.
         expected_root: TransactionRoot,
@@ -346,7 +370,9 @@ pub enum Action {
     /// Recomputes the merkle root from the provisions hashes in the manifest
     /// and compares against the block header's `provision_root`.
     VerifyProvisionRoot {
+        /// Block whose provisions root is being verified.
         block_hash: BlockHash,
+        /// Expected provisions root from block header.
         expected_root: ProvisionsRoot,
         /// Provisions hashes from the block manifest.
         batch_hashes: Vec<ProvisionHash>,
@@ -360,6 +386,7 @@ pub enum Action {
     ///
     /// Pure CPU operation — verified in parallel with state root and transaction root.
     VerifyCertificateRoot {
+        /// Block whose certificate root is being verified.
         block_hash: BlockHash,
         /// Expected receipt root from block header.
         expected_root: CertificateRoot,
@@ -375,6 +402,7 @@ pub enum Action {
     ///
     /// Pure CPU operation — verified in parallel with other root verifications.
     VerifyLocalReceiptRoot {
+        /// Block whose local receipt root is being verified.
         block_hash: BlockHash,
         /// Expected local receipt root from block header.
         expected_root: LocalReceiptRoot,
@@ -391,6 +419,7 @@ pub enum Action {
     ///
     /// Pure CPU operation — verified in parallel with other root verifications.
     VerifyProvisionTxRoots {
+        /// Block whose provision-tx roots are being verified.
         block_hash: BlockHash,
         /// Expected per-target roots from block header.
         expected: std::collections::BTreeMap<ShardGroupId, ProvisionTxRoot>,
@@ -403,25 +432,34 @@ pub enum Action {
     /// Build a complete block proposal.
     ///
     /// Computes the new state root from certificates, builds the complete block,
-    /// and caches the WriteBatch for efficient commit later.
+    /// and caches the `WriteBatch` for efficient commit later.
     ///
     /// Returns `ProtocolEvent::ProposalBuilt` with the complete block.
     ///
     /// This combines state root computation and block building into a single
     /// round-trip, enabling the proposer to use the fast commit path (1 fsync).
     BuildProposal {
+        /// Local shard producing this proposal.
         shard_group_id: ShardGroupId,
+        /// Validator id of the proposer (this node).
         proposer: ValidatorId,
+        /// Height of the new block.
         height: BlockHeight,
+        /// Round at which the proposal is being made.
         round: Round,
+        /// Parent block hash; the new block extends this.
         parent_hash: BlockHash,
+        /// QC over the parent block (genesis QC for the first block).
         parent_qc: QuorumCertificate,
+        /// Proposer-supplied timestamp on the new block header.
         timestamp: ProposerTimestamp,
+        /// `true` if this is a fallback (empty) proposal during view changes.
         is_fallback: bool,
         /// Parent's state root (base for state root computation via overlay).
         parent_state_root: StateRoot,
         /// Height of the parent block (stable anchor for JMT computation).
         parent_block_height: BlockHeight,
+        /// Transactions to include in the proposal.
         transactions: Vec<Arc<RoutableTransaction>>,
         /// Finalized waves to include in the block (carries certs + receipts + ECs).
         finalized_waves: Vec<Arc<FinalizedWave>>,
@@ -445,7 +483,9 @@ pub enum Action {
         /// The committed block whose transactions are being executed.
         /// Anchors state reads via `PendingChain::view_at`.
         block_hash: BlockHash,
+        /// Transactions to execute (all members of the wave).
         transactions: Vec<Arc<RoutableTransaction>>,
+        /// State root to anchor reads against.
         state_root: StateRoot,
     },
 
@@ -470,10 +510,11 @@ pub enum Action {
     // ═══════════════════════════════════════════════════════════════════════
     // Block Commit
     // ═══════════════════════════════════════════════════════════════════════
-    /// Commit a consensus block via its PreparedCommit (from BuildProposal
-    /// or VerifyStateRoot). Block data + JMT + substates + receipts + ECs +
+    /// Commit a consensus block via its `PreparedCommit` (from `BuildProposal`
+    /// or `VerifyStateRoot`). Block data + JMT + substates + receipts + ECs +
     /// consensus metadata are written atomically.
     CommitBlock {
+        /// Block to commit.
         block: Block,
         /// The QC that certified this block.
         qc: QuorumCertificate,
@@ -481,16 +522,18 @@ pub enum Action {
         source: crate::CommitSource,
     },
 
-    /// Commit a block trusted via QC only — no cached PreparedCommit exists
+    /// Commit a block trusted via QC only — no cached `PreparedCommit` exists
     /// because we didn't run state root verification ourselves (sync path,
     /// or consensus path when we didn't participate in voting).
     ///
-    /// The io_loop computes the PreparedCommit inline and asserts the
+    /// The `io_loop` computes the `PreparedCommit` inline and asserts the
     /// computed root matches the block's declared root (same Byzantine
     /// detection as async `VerifyStateRoot`), then feeds into the normal
-    /// `flush_block_commits` pipeline for async RocksDB persistence.
+    /// `flush_block_commits` pipeline for async `RocksDB` persistence.
     CommitBlockByQcOnly {
+        /// Block to commit.
         block: Block,
+        /// The QC that certified this block.
         qc: QuorumCertificate,
         /// Parent block's state root — base state for JMT computation.
         parent_state_root: StateRoot,
@@ -514,12 +557,14 @@ pub enum Action {
     /// this action, allowing clients to query transaction status via the
     /// `GET /api/v1/transactions/{hash}` endpoint.
     ///
-    /// Latency tracking and phase-time stamping live in the io_loop, not
-    /// here — the mempool only emits the status itself, and the io_loop
+    /// Latency tracking and phase-time stamping live in the `io_loop`, not
+    /// here — the mempool only emits the status itself, and the `io_loop`
     /// stamps wall-clock against its own side cache (`tx_phase_times`)
     /// keyed by `tx_hash`.
     EmitTransactionStatus {
+        /// Transaction whose status changed.
         tx_hash: TxHash,
+        /// New transaction status.
         status: TransactionStatus,
         /// Whether this is a cross-shard transaction (for metrics labeling).
         cross_shard: bool,
@@ -528,24 +573,31 @@ pub enum Action {
         submitted_locally: bool,
     },
 
-    /// Notify the io_loop that a local execution certificate was just
-    /// formed for `tx_hashes`. The io_loop stamps `ec_created_at` in its
+    /// Notify the `io_loop` that a local execution certificate was just
+    /// formed for `tx_hashes`. The `io_loop` stamps `ec_created_at` in its
     /// per-tx phase-time side cache, used for the slow-tx finalization
     /// log. State-machine state isn't affected — this is pure telemetry.
-    RecordTxEcCreated { tx_hashes: Vec<TxHash> },
+    RecordTxEcCreated {
+        /// Transactions whose EC was just formed.
+        tx_hashes: Vec<TxHash>,
+    },
 
     // ═══════════════════════════════════════════════════════════════════════
     // Network: BFT Votes
     // ═══════════════════════════════════════════════════════════════════════
     /// Sign and broadcast a block vote to targeted recipients.
     ///
-    /// The io_loop signs the vote on the consensus crypto pool, then
+    /// The `io_loop` signs the vote on the consensus crypto pool, then
     /// broadcasts to the next proposer and feeds the signed vote back
-    /// to the state machine for local VoteSet tracking.
+    /// to the state machine for local `VoteSet` tracking.
     SignAndBroadcastBlockVote {
+        /// Block being voted on.
         block_hash: BlockHash,
+        /// Block height.
         height: BlockHeight,
+        /// Round at which the vote is being cast.
         round: Round,
+        /// Proposer timestamp from the block header (echoed in the vote).
         timestamp: ProposerTimestamp,
         /// Targeted vote recipients — the next proposer who needs this vote
         /// to build the QC for the next block.
@@ -558,11 +610,14 @@ pub enum Action {
     /// Cache a finalized wave so peers can fetch it.
     ///
     /// Emitted by `finalize_wave` in `ExecutionCoordinator` when a wave completes.
-    /// The io_loop inserts the `FinalizedWave` into `finalized_wave_cache`,
+    /// The `io_loop` inserts the `FinalizedWave` into `finalized_wave_cache`,
     /// keyed by `wave_id.hash()` (matches `BlockManifest.cert_hashes`).
-    CacheFinalizedWave { wave: Arc<FinalizedWave> },
+    CacheFinalizedWave {
+        /// Finalized wave to cache.
+        wave: Arc<FinalizedWave>,
+    },
 
-    /// Persist receipt bundles to disk. Fire-and-forget — no ProtocolEvent response.
+    /// Persist receipt bundles to disk. Fire-and-forget — no `ProtocolEvent` response.
     // ═══════════════════════════════════════════════════════════════════════
     // Global Consensus / Epoch Management
     // ═══════════════════════════════════════════════════════════════════════
@@ -596,7 +651,7 @@ pub enum Action {
 
     /// Initiate epoch transition.
     ///
-    /// Called when EpochTransitionReady event is received.
+    /// Called when `EpochTransitionReady` event is received.
     /// Updates the topology and notifies subsystems.
     TransitionEpoch {
         /// The epoch we're transitioning from.
@@ -607,13 +662,16 @@ pub enum Action {
         next_config: Box<EpochConfig>,
     },
 
-    /// Propagate updated topology to the io_loop / network layer.
+    /// Propagate updated topology to the `io_loop` / network layer.
     ///
     /// Emitted by the state machine after any topology mutation (epoch
-    /// transition, shard split/merge). The io_loop stores the snapshot
+    /// transition, shard split/merge). The `io_loop` stores the snapshot
     /// into its shared topology snapshot (`ArcSwap`), rebuilds
     /// `cached_local_peers`, and updates `local_shard` / `num_shards`.
-    TopologyChanged { topology: Arc<TopologySnapshot> },
+    TopologyChanged {
+        /// New topology snapshot to propagate.
+        topology: Arc<TopologySnapshot>,
+    },
 
     /// Mark this validator as ready for the new epoch.
     ///
@@ -671,7 +729,7 @@ pub enum Action {
 
     /// Fetch the latest epoch configuration from storage.
     ///
-    /// Returns via ProtocolEvent (to be added) when complete.
+    /// Returns via `ProtocolEvent` (to be added) when complete.
     FetchEpochConfig {
         /// Optional epoch ID to fetch (None = latest).
         epoch: Option<EpochId>,
@@ -719,7 +777,7 @@ pub enum Action {
 
     /// Fetch missing provision data for a pending block (pre-BFT-vote).
     ///
-    /// Same pattern as FetchTransactions: block header arrives, some provision
+    /// Same pattern as `FetchTransactions`: block header arrives, some provision
     /// hashes aren't in the local cache, fetch from proposer or local peers.
     FetchProvisionsLocal {
         /// Hash of the block that needs these provisions.
@@ -792,7 +850,9 @@ pub enum Action {
     /// Without this, the fetch protocol would keep retrying forever even
     /// after the expectation has been fulfilled via `on_wave_certificate`.
     CancelExecutionCertFetch {
+        /// Source shard whose EC fetch should be cancelled.
         source_shard: ShardGroupId,
+        /// Block height of the EC that no longer needs fetching.
         block_height: BlockHeight,
     },
 
@@ -802,7 +862,9 @@ pub enum Action {
     /// Without this, the fetch protocol would keep retrying forever even
     /// after the gap was closed by a gossip-delivered header.
     CancelCommittedHeaderFetch {
+        /// Source shard whose header fetch should be cancelled.
         source_shard: ShardGroupId,
+        /// Starting height of the header range that no longer needs fetching.
         from_height: BlockHeight,
     },
 
@@ -847,11 +909,13 @@ pub enum Action {
 
 impl Action {
     /// Check if this is a continuation action.
+    #[must_use]
     pub fn is_continuation(&self) -> bool {
         matches!(self, Action::Continuation(_))
     }
 
     /// Get the action type name for telemetry.
+    #[must_use]
     pub fn type_name(&self) -> &'static str {
         match self {
             // Network - BFT Consensus

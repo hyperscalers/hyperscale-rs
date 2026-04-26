@@ -22,11 +22,11 @@
 //! - **Pure-ish**: Mutates self, but performs no I/O
 //!
 //! All I/O is handled by the runner (simulation or production) which:
-//! 1. Delivers NodeInputs to the I/O loop
-//! 2. IoLoop intercepts I/O events (sync, fetch, validation) and forwards
-//!    ProtocolEvents to the state machine
+//! 1. Delivers `NodeInput`s to the I/O loop
+//! 2. `IoLoop` intercepts I/O events (sync, fetch, validation) and forwards
+//!    `ProtocolEvent`s to the state machine
 //! 3. Executes the returned actions
-//! 4. Converts action results back into NodeInputs
+//! 4. Converts action results back into `NodeInput`s
 
 mod action;
 mod input;

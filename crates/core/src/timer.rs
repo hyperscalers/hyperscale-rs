@@ -24,6 +24,7 @@ pub enum TimerId {
 
 impl TimerId {
     /// Convert this timer ID to the corresponding [`NodeInput`] event.
+    #[must_use]
     pub fn into_event(self) -> NodeInput {
         match self {
             TimerId::ViewChange => NodeInput::Protocol(ProtocolEvent::ViewChangeTimer),
@@ -40,6 +41,8 @@ impl TimerId {
 /// - [`TimerManager`](hyperscale_production) uses `tokio::spawn` + `tokio::time::sleep`
 /// - Simulation inserts into a seeded deterministic event queue
 pub trait TimerScheduler {
+    /// Schedule a timer to fire after `duration`. Replaces any existing timer with the same `id`.
     fn set_timer(&mut self, id: TimerId, duration: Duration);
+    /// Cancel a previously-scheduled timer; no-op if not set.
     fn cancel_timer(&mut self, id: TimerId);
 }

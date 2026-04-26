@@ -31,6 +31,8 @@ pub enum CommitSource {
 }
 
 impl CommitSource {
+    /// Telemetry-friendly tag identifying how the certifying QC was learned.
+    #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
             CommitSource::Aggregator => "aggregator",
@@ -49,11 +51,17 @@ impl CommitSource {
 /// record result → check if all verifications complete → vote.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum VerificationKind {
+    /// State root computed by replaying the block's database updates against the JMT.
     StateRoot,
+    /// Merkle root over the block's transactions plus per-tx validity-window check.
     TransactionRoot,
+    /// Merkle root over included wave certificates' receipt hashes.
     CertificateRoot,
+    /// Merkle root over the block's local receipts.
     LocalReceiptRoot,
+    /// Merkle root over the block's provision-batch hashes.
     ProvisionRoot,
+    /// Per-target-shard provision-tx merkle roots map.
     ProvisionTxRoots,
 }
 
@@ -87,7 +95,9 @@ pub enum ProtocolEvent {
     // ═══════════════════════════════════════════════════════════════════════
     /// Received a block header from another node.
     BlockHeaderReceived {
+        /// Block header received over gossip.
         header: BlockHeader,
+        /// Manifest listing the block's tx / cert / provision hashes.
         manifest: BlockManifest,
     },
 
@@ -96,59 +106,87 @@ pub enum ProtocolEvent {
     /// Used for the light-client provisions pattern: remote shards broadcast
     /// committed headers so we can verify state roots via merkle inclusion proofs.
     ///
-    /// The `sender` field is the authenticated sender identity — IoLoop
+    /// The `sender` field is the authenticated sender identity — `IoLoop`
     /// verified the sender's BLS signature before admitting this event.
     RemoteBlockCommitted {
+        /// Header + QC bundle from the remote shard.
         committed_header: CommittedBlockHeader,
+        /// Authenticated sender identity (BLS-verified by `IoLoop`).
         sender: ValidatorId,
     },
 
     /// Received a vote on a block header.
-    BlockVoteReceived { vote: BlockVote },
+    BlockVoteReceived {
+        /// Block vote received from a peer.
+        vote: BlockVote,
+    },
 
     /// A quorum certificate was formed for a block.
     QuorumCertificateFormed {
+        /// Block the QC certifies.
         block_hash: BlockHash,
+        /// The newly formed QC.
         qc: QuorumCertificate,
     },
 
     /// A block is ready to be committed.
     BlockReadyToCommit {
+        /// Block being committed.
         block_hash: BlockHash,
+        /// QC that triggers this commit (the next block's `parent_qc` under 2-chain).
         qc: QuorumCertificate,
+        /// How this node learned the certifying QC.
         source: CommitSource,
     },
 
     /// A block has been committed by consensus (QC formed, 2f+1 agreement).
     ///
     /// Fired immediately when the `CommitBlock` action arrives — before
-    /// durable RocksDB persistence. All event data is carried in-memory
+    /// durable `RocksDB` persistence. All event data is carried in-memory
     /// from the action payload. Delegated actions that read substates use
     /// `PendingChain::view_at` to see unpersisted state.
-    BlockCommitted { certified: CertifiedBlock },
+    BlockCommitted {
+        /// The committed block + its certifying QC.
+        certified: CertifiedBlock,
+    },
 
-    /// A block has been durably persisted to RocksDB.
+    /// A block has been durably persisted to `RocksDB`.
     ///
-    /// Fires after the async RocksDB write completes. Used for bookkeeping
+    /// Fires after the async `RocksDB` write completes. Used for bookkeeping
     /// (persistence lag tracking) — not consensus-critical.
     /// The `height` is the highest block height in the persistence batch.
-    BlockPersisted { height: BlockHeight },
+    BlockPersisted {
+        /// Highest block height in the persistence batch that just completed.
+        height: BlockHeight,
+    },
 
     /// Quorum Certificate verification and building result.
     QuorumCertificateResult {
+        /// Block hash the QC was assembled for.
         block_hash: BlockHash,
+        /// The QC if quorum was reached, or `None` if not.
         qc: Option<QuorumCertificate>,
+        /// Verified votes, returned for accumulation when no QC was built.
         verified_votes: Vec<(usize, BlockVote, u64)>,
     },
 
     /// QC signature verification completed.
-    QcSignatureVerified { block_hash: BlockHash, valid: bool },
+    QcSignatureVerified {
+        /// Block whose parent-QC signature was verified.
+        block_hash: BlockHash,
+        /// `true` when the aggregated signature passed verification.
+        valid: bool,
+    },
 
     /// Remote header QC verification completed.
     RemoteHeaderQcVerified {
+        /// Remote shard that produced the header.
         shard: ShardGroupId,
+        /// Remote block height (for correlation).
         height: BlockHeight,
+        /// The verified header.
         header: Arc<CommittedBlockHeader>,
+        /// `true` when the QC passed verification.
         valid: bool,
     },
 
@@ -158,6 +196,7 @@ pub enum ProtocolEvent {
     /// Downstream consumers (BFT, Provision, Execution) use this as their single
     /// source of verified remote headers.
     RemoteHeaderVerified {
+        /// The fully-verified committed header.
         committed_header: Arc<CommittedBlockHeader>,
     },
 
@@ -168,18 +207,27 @@ pub enum ProtocolEvent {
     /// verification pipeline, check if all verifications are complete, and
     /// vote if so. The `kind` field distinguishes which verification finished.
     BlockRootVerified {
+        /// Which root verification just completed.
         kind: VerificationKind,
+        /// Block whose root was verified.
         block_hash: BlockHash,
+        /// `true` when the computed root matched the header's claim.
         valid: bool,
     },
 
     /// Proposal block built by the runner.
     ProposalBuilt {
+        /// Height of the new block.
         height: BlockHeight,
+        /// Round at which the proposal was built.
         round: Round,
+        /// The constructed block.
         block: Arc<Block>,
+        /// Hash of the constructed block, cached for callers.
         block_hash: BlockHash,
+        /// Finalized waves included in the block (carry certs + receipts + ECs).
         finalized_waves: Vec<Arc<FinalizedWave>>,
+        /// Provisions included in the block.
         provisions: Vec<Arc<Provisions>>,
     },
 
@@ -193,7 +241,9 @@ pub enum ProtocolEvent {
     /// io-loop provision cache) anchor retention on this so eviction is
     /// deterministic across validators.
     ProvisionsVerified {
+        /// Verified provisions batch.
         provisions: Arc<Provisions>,
+        /// BFT-authenticated weighted timestamp of the source shard's committing QC.
         source_block_ts: WeightedTimestamp,
     },
 
@@ -201,14 +251,19 @@ pub enum ProtocolEvent {
     ///
     /// All transactions share the same `(source_shard, block_height)`
     /// because they originate from a single `FetchAndBroadcastProvision` action.
-    StateProvisionsReceived { provisions: Provisions },
+    StateProvisionsReceived {
+        /// Provisions batch received from a source shard.
+        provisions: Provisions,
+    },
 
     /// Provisions our proposer generated were broadcast to a target shard.
     /// Routed to the `OutboundProvisionTracker` so they can be retained
     /// (and served from cache) until the target shard's execution
     /// certificates acknowledge every transaction in them.
     OutboundProvisionBroadcast {
+        /// Provisions batch we just broadcast.
         provisions: Arc<Provisions>,
+        /// Shard the batch was broadcast to.
         target_shard: ShardGroupId,
     },
 
@@ -217,7 +272,9 @@ pub enum ProtocolEvent {
     /// The tracker uses `tx_outcomes` to drain pending transactions from
     /// outbound batches; `Executed` and `Aborted` are both terminal.
     OutboundEcObserved {
+        /// Shard whose EC was observed.
         target_shard: ShardGroupId,
+        /// Per-tx outcomes from the EC, used to drain matching outbound entries.
         tx_outcomes: Vec<TxOutcome>,
     },
 
@@ -240,9 +297,9 @@ pub enum ProtocolEvent {
     // ═══════════════════════════════════════════════════════════════════════
     // Execution
     // ═══════════════════════════════════════════════════════════════════════
-    /// Batch of execution results from an ExecuteTransactions / ExecuteCrossShardTransactions dispatch.
+    /// Batch of execution results from an `ExecuteTransactions` / `ExecuteCrossShardTransactions` dispatch.
     ///
-    /// Results carry the full execution output (DatabaseUpdates, receipts) — stays local.
+    /// Results carry the full execution output (`DatabaseUpdates`, receipts) — stays local.
     /// Every result in this batch belongs to `wave_id`; the wave gets exactly
     /// one `ExecutionBatchCompleted` and no further results arrive for it.
     ///
@@ -252,33 +309,47 @@ pub enum ProtocolEvent {
     ExecutionBatchCompleted {
         /// The wave whose execution produced these results.
         wave_id: WaveId,
+        /// Per-tx local execution entries (database updates + receipt).
         results: Vec<hyperscale_types::LocalExecutionEntry>,
         /// Per-tx outcomes extracted on the handler thread for vote signing.
         tx_outcomes: Vec<TxOutcome>,
     },
 
     /// Received an execution vote from another validator.
-    ExecutionVoteReceived { vote: ExecutionVote },
+    ExecutionVoteReceived {
+        /// Execution vote received from a peer.
+        vote: ExecutionVote,
+    },
 
     /// Batch execution vote verification completed.
     ExecutionVotesVerifiedAndAggregated {
+        /// Wave whose votes were verified.
         wave_id: WaveId,
+        /// Source block hash for correlation.
         block_hash: BlockHash,
+        /// Verified votes paired with their voting power.
         verified_votes: Vec<(ExecutionVote, u64)>,
     },
 
     /// Execution certificate aggregation completed.
     ExecutionCertificateAggregated {
+        /// Wave whose EC was aggregated.
         wave_id: WaveId,
+        /// The newly aggregated execution certificate.
         certificate: ExecutionCertificate,
     },
 
     /// Received an execution certificate from a remote shard.
-    ExecutionCertificateReceived { cert: ExecutionCertificate },
+    ExecutionCertificateReceived {
+        /// Execution certificate received from a remote shard.
+        cert: ExecutionCertificate,
+    },
 
     /// Execution certificate signature verification completed.
     ExecutionCertificateSignatureVerified {
+        /// The certificate whose signature was verified.
         certificate: ExecutionCertificate,
+        /// `true` when the aggregated signature passed verification.
         valid: bool,
     },
 
@@ -287,21 +358,33 @@ pub enum ProtocolEvent {
     // ═══════════════════════════════════════════════════════════════════════
     /// Received a transaction via gossip (or validated RPC submission).
     TransactionGossipReceived {
+        /// The transaction.
         tx: Arc<RoutableTransaction>,
+        /// `true` if this validator submitted the tx (don't gossip back to client).
         submitted_locally: bool,
     },
 
     /// A transaction's execution outcome has been resolved and certificate finalized.
     /// Used for per-tx mempool status updates.
-    TransactionExecuted { tx_hash: TxHash, accepted: bool },
+    TransactionExecuted {
+        /// Transaction whose execution outcome resolved.
+        tx_hash: TxHash,
+        /// `true` if the tx was accepted (state-changing) vs rejected.
+        accepted: bool,
+    },
 
     /// Local execution certificate created for a wave (local votes aggregated).
-    ExecutionCertificateCreated { tx_hashes: Vec<TxHash> },
+    ExecutionCertificateCreated {
+        /// Transaction hashes covered by the newly-created EC.
+        tx_hashes: Vec<TxHash>,
+    },
 
     /// A wave's execution has been finalized (all shards reported).
     /// Carries the wave cert (which contains the ECs) and per-tx hashes.
     WaveCompleted {
+        /// Finalized wave certificate (carries per-shard ECs).
         wave_cert: Arc<WaveCertificate>,
+        /// Transaction hashes covered by the wave.
         tx_hashes: Vec<TxHash>,
     },
 
@@ -310,20 +393,28 @@ pub enum ProtocolEvent {
     // ═══════════════════════════════════════════════════════════════════════
     /// Fetched transactions delivered to state machine.
     TransactionFetchDelivered {
+        /// Block whose transactions were fetched.
         block_hash: BlockHash,
+        /// Fetched transactions.
         transactions: Vec<Arc<RoutableTransaction>>,
     },
 
     /// Fetched finalized wave delivered to state machine for pending block completion.
-    FinalizedWaveFetchDelivered { wave: Arc<FinalizedWave> },
+    FinalizedWaveFetchDelivered {
+        /// Finalized wave delivered for pending-block completion.
+        wave: Arc<FinalizedWave>,
+    },
 
     // ═══════════════════════════════════════════════════════════════════════
     // Storage Callbacks
     // ═══════════════════════════════════════════════════════════════════════
     /// Chain metadata fetched from storage.
     ChainMetadataFetched {
+        /// Highest committed height found in storage (`0` for fresh start).
         height: BlockHeight,
+        /// Hash of the highest committed block, if present.
         hash: Option<BlockHash>,
+        /// Latest QC found in storage, if present.
         qc: Option<QuorumCertificate>,
     },
 
@@ -331,15 +422,26 @@ pub enum ProtocolEvent {
     // Sync Delivery (from IoLoop after sync protocol processing)
     // ═══════════════════════════════════════════════════════════════════════
     /// A synced block is ready to be applied to local state.
-    SyncBlockReadyToApply { certified: CertifiedBlock },
+    SyncBlockReadyToApply {
+        /// The synced block + its certifying QC, ready to apply.
+        certified: CertifiedBlock,
+    },
 
     /// Sync EC BLS verification completed (async callback from crypto pool).
-    SyncEcVerificationComplete { height: BlockHeight, valid: bool },
+    SyncEcVerificationComplete {
+        /// Height whose synced ECs were verified.
+        height: BlockHeight,
+        /// `true` when all ECs at this height passed verification.
+        valid: bool,
+    },
 
-    /// The io_loop's SyncProtocol has finished fetching all blocks up to
-    /// the sync target. BftCoordinator should exit sync mode so it can re-enter
+    /// The `io_loop`'s `SyncProtocol` has finished fetching all blocks up to
+    /// the sync target. `BftCoordinator` should exit sync mode so it can re-enter
     /// if still behind, or resume normal consensus.
-    SyncProtocolComplete { height: BlockHeight },
+    SyncProtocolComplete {
+        /// Height the sync protocol caught up to.
+        height: BlockHeight,
+    },
 
     /// Sync recovery complete — validator has caught up and is resuming consensus.
     /// Triggers immediate provision and remote header fetching so the validator
@@ -351,77 +453,114 @@ pub enum ProtocolEvent {
     // ═══════════════════════════════════════════════════════════════════════
     /// Received a global block proposal from another validator.
     GlobalBlockReceived {
+        /// Current epoch.
         epoch: EpochId,
+        /// Height within the global chain.
         height: BlockHeight,
+        /// Validator that proposed the block.
         proposer: ValidatorId,
+        /// Hash of the proposed global block.
         block_hash: BlockHash,
+        /// Next epoch configuration carried by this block, if it finalizes the epoch.
         next_epoch_config: Option<Box<EpochConfig>>,
     },
 
     /// Received a vote on a global block.
     GlobalBlockVoteReceived {
+        /// Block being voted on.
         block_hash: BlockHash,
+        /// Shard the vote came from.
         shard: ShardGroupId,
+        /// Aggregated BLS signature from the shard's local quorum.
         shard_signature: hyperscale_types::Bls12381G2Signature,
+        /// Bitfield of validators in the shard who signed.
         signers: hyperscale_types::SignerBitfield,
+        /// Total voting power covered by the shard signature.
         voting_power: hyperscale_types::VotePower,
     },
 
     /// Global quorum certificate formed.
     GlobalQcFormed {
+        /// Block the global QC certifies.
         block_hash: BlockHash,
+        /// Epoch in which the QC was formed.
         epoch: EpochId,
     },
 
     /// Epoch transition is imminent.
     EpochEndApproaching {
+        /// Epoch that's about to end.
         current_epoch: EpochId,
+        /// Height at which the current epoch ends.
         end_height: BlockHeight,
     },
 
     /// Ready to transition to next epoch.
     EpochTransitionReady {
+        /// Epoch we're transitioning from.
         from_epoch: EpochId,
+        /// Epoch we're transitioning to.
         to_epoch: EpochId,
+        /// Finalized configuration for the new epoch.
         next_config: Box<EpochConfig>,
     },
 
     /// Epoch transition completed.
     EpochTransitionComplete {
+        /// The new epoch.
         new_epoch: EpochId,
+        /// This validator's shard in the new epoch.
         new_shard: ShardGroupId,
+        /// `true` if this validator is still syncing to the new shard before resuming consensus.
         is_waiting: bool,
     },
 
     /// Validator finished syncing to new shard after shuffle.
-    ValidatorSyncComplete { epoch: EpochId, shard: ShardGroupId },
+    ValidatorSyncComplete {
+        /// Epoch this validator finished syncing for.
+        epoch: EpochId,
+        /// Shard this validator now serves.
+        shard: ShardGroupId,
+    },
 
     /// Shard split initiated.
     ShardSplitInitiated {
+        /// Shard being split.
         source_shard: ShardGroupId,
+        /// New shard ID being created from the split.
         new_shard: ShardGroupId,
+        /// Hash range split point — accounts above go to `new_shard`.
         split_point: u64,
     },
 
     /// Shard split completed.
     ShardSplitComplete {
+        /// Original shard whose split is complete.
         source_shard: ShardGroupId,
+        /// Newly created shard now serving its range.
         new_shard: ShardGroupId,
     },
 
     /// Shard merge initiated.
     ShardMergeInitiated {
+        /// First shard being merged.
         shard_a: ShardGroupId,
+        /// Second shard being merged.
         shard_b: ShardGroupId,
+        /// Resulting shard ID after merge.
         merged_shard: ShardGroupId,
     },
 
     /// Shard merge completed.
-    ShardMergeComplete { merged_shard: ShardGroupId },
+    ShardMergeComplete {
+        /// The merged shard now serving the combined range.
+        merged_shard: ShardGroupId,
+    },
 }
 
 impl ProtocolEvent {
     /// Get the event type name for telemetry.
+    #[must_use]
     pub fn type_name(&self) -> &'static str {
         match self {
             // Timers

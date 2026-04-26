@@ -56,7 +56,7 @@ pub trait StateMachine {
     /// Set the current local wall-clock time.
     ///
     /// Called by the runner before each `handle()` call. The clock is
-    /// minted by the IO boundary (production io_loop or simulator driver)
+    /// minted by the IO boundary (production `io_loop` or simulator driver)
     /// in milliseconds since a fixed origin captured at process start.
     /// Anchors view-change timers, IO retry backoff, and the proposer-skew
     /// check — never used as a deterministic consensus anchor (use
