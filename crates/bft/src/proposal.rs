@@ -16,8 +16,8 @@
 
 use hyperscale_core::Action;
 use hyperscale_types::{
-    BlockHash, BlockHeight, FinalizedWave, LocalTimestamp, ProposerTimestamp, Provision,
-    ProvisionHash, Round, RoutableTransaction, TopologySnapshot, TxHash, WaveIdHash,
+    BlockHash, BlockHeight, FinalizedWave, LocalTimestamp, ProposerTimestamp, ProvisionHash,
+    Provisions, Round, RoutableTransaction, TopologySnapshot, TxHash, WaveIdHash,
     WeightedTimestamp,
 };
 use std::collections::HashSet;
@@ -39,7 +39,7 @@ pub(crate) enum ProposalKind {
     Normal {
         transactions: Vec<Arc<RoutableTransaction>>,
         finalized_waves: Vec<Arc<FinalizedWave>>,
-        provision_batches: Vec<Arc<Provision>>,
+        provisions: Vec<Arc<Provisions>>,
         finalized_tx_count: u32,
     },
     /// View-change fallback: empty payload, parent's weighted timestamp
@@ -231,18 +231,18 @@ pub(crate) fn select_finalized_waves(
     (waves_to_propose, finalized_tx_count)
 }
 
-/// Select provision batches for inclusion: drop those already in the QC
+/// Select provisions for inclusion: drop those already in the QC
 /// chain, then take from the FIFO queue until the running tx-count total
 /// would exceed `max_provision_txs`. Oldest batches go first so the queue
 /// drains monotonically; unselected batches remain queued for the next
 /// proposal.
-pub(crate) fn select_provision_batches(
-    provision_batches: Vec<Arc<Provision>>,
+pub(crate) fn select_provisions(
+    provisions: Vec<Arc<Provisions>>,
     qc_chain_provision_hashes: &HashSet<ProvisionHash>,
     max_provision_txs: usize,
-) -> Vec<Arc<Provision>> {
+) -> Vec<Arc<Provisions>> {
     let mut running_tx_count = 0usize;
-    provision_batches
+    provisions
         .into_iter()
         .filter(|b| !qc_chain_provision_hashes.contains(&b.hash()))
         .take_while(|b| {
@@ -304,7 +304,7 @@ pub(crate) fn assemble_build_action(
         is_fallback,
         transactions,
         finalized_waves,
-        provision_batches,
+        provisions,
         finalized_tx_count,
         log_label,
         record_leader_activity,
@@ -312,14 +312,14 @@ pub(crate) fn assemble_build_action(
         ProposalKind::Normal {
             transactions,
             finalized_waves,
-            provision_batches,
+            provisions,
             finalized_tx_count,
         } => (
             ProposerTimestamp::from_local(now),
             false,
             transactions,
             finalized_waves,
-            provision_batches,
+            provisions,
             finalized_tx_count,
             "Requesting block build for proposal",
             false,
@@ -359,7 +359,7 @@ pub(crate) fn assemble_build_action(
         parent_block_height,
         transactions,
         finalized_waves,
-        provision_batches,
+        provisions,
         parent_in_flight,
         finalized_tx_count,
     };

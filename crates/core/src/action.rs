@@ -6,7 +6,7 @@ use hyperscale_types::{
     Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, BlockVote, Bls12381G1PublicKey,
     Bls12381G2Signature, CertificateRoot, CommittedBlockHeader, EpochConfig, EpochId,
     ExecutionCertificate, ExecutionVote, FinalizedWave, GlobalReceiptRoot, LocalReceiptRoot,
-    NodeId, ProposerTimestamp, Provision, ProvisionHash, ProvisionTxRoot, ProvisionsRoot,
+    NodeId, ProposerTimestamp, ProvisionHash, ProvisionTxRoot, Provisions, ProvisionsRoot,
     QuorumCertificate, ReceiptBundle, Round, RoutableTransaction, ShardGroupId, SignerBitfield,
     StateProvision, StateRoot, TopologySnapshot, TransactionRoot, TxHash, TxOutcome, ValidatorId,
     VotePower, WaveId, WaveIdHash, WeightedTimestamp,
@@ -28,7 +28,7 @@ pub struct CrossShardExecutionRequest {
 
 /// A single cross-shard transaction's provisioning needs.
 ///
-/// Collected per-block and sent as a batch in [`Action::FetchAndBroadcastProvision`].
+/// Collected per-block and emitted via [`Action::FetchAndBroadcastProvisions`].
 #[derive(Debug, Clone)]
 pub struct ProvisionRequest {
     /// Transaction hash (for correlation).
@@ -194,17 +194,17 @@ pub enum Action {
         total_voting_power: u64,
     },
 
-    /// Verify a provision batch's merkle inclusion proofs.
+    /// Verify provisions' merkle inclusion proofs.
     ///
     /// The QC was already verified by `RemoteHeaderCoordinator` when the header
     /// was promoted to verified, so this only checks merkle proofs against the
     /// committed header's state root.
     ///
     /// Delegated to a thread pool in production, instant in simulation.
-    /// Returns `ProtocolEvent::StateProvisionVerified` when complete.
-    VerifyProvision {
-        /// The provision batch to verify (all from the same source block).
-        batch: Provision,
+    /// Returns `ProtocolEvent::StateProvisionsVerified` when complete.
+    VerifyProvisions {
+        /// The provisions to verify (all from the same source block).
+        provisions: Provisions,
         /// The QC-verified committed block header from RemoteHeaderCoordinator.
         committed_header: Arc<CommittedBlockHeader>,
     },
@@ -343,12 +343,12 @@ pub enum Action {
 
     /// Verify a block's provisions root.
     ///
-    /// Recomputes the merkle root from the provision batch hashes in the manifest
+    /// Recomputes the merkle root from the provisions hashes in the manifest
     /// and compares against the block header's `provision_root`.
     VerifyProvisionRoot {
         block_hash: BlockHash,
         expected_root: ProvisionsRoot,
-        /// Provision batch hashes from the block manifest.
+        /// Provisions hashes from the block manifest.
         batch_hashes: Vec<ProvisionHash>,
     },
 
@@ -382,7 +382,7 @@ pub enum Action {
         receipts: Vec<ReceiptBundle>,
     },
 
-    /// Verify a block's per-target-shard provision-batch commitments.
+    /// Verify a block's per-target-shard provisions commitments.
     ///
     /// Recomputes `compute_provision_tx_roots(topology, transactions)` and
     /// compares against the block header's `provision_tx_roots` by full-map
@@ -425,8 +425,8 @@ pub enum Action {
         transactions: Vec<Arc<RoutableTransaction>>,
         /// Finalized waves to include in the block (carries certs + receipts + ECs).
         finalized_waves: Vec<Arc<FinalizedWave>>,
-        /// Provision batches from remote shards, included in this block.
-        provision_batches: Vec<Arc<Provision>>,
+        /// Provisions from remote shards, included in this block.
+        provisions: Vec<Arc<Provisions>>,
         /// Parent block's in-flight count (for deterministic computation).
         parent_in_flight: u32,
         /// Number of transactions finalized by wave certificates in this block.
@@ -720,13 +720,13 @@ pub enum Action {
     /// Fetch missing provision data for a pending block (pre-BFT-vote).
     ///
     /// Same pattern as FetchTransactions: block header arrives, some provision
-    /// batch hashes aren't in the local cache, fetch from proposer or local peers.
-    FetchProvisionLocal {
+    /// hashes aren't in the local cache, fetch from proposer or local peers.
+    FetchProvisionsLocal {
         /// Hash of the block that needs these provisions.
         block_hash: BlockHash,
         /// The proposer of the block (preferred fetch target).
         proposer: ValidatorId,
-        /// Hashes of the missing provision batches.
+        /// Hashes of the missing provisions.
         batch_hashes: Vec<ProvisionHash>,
     },
 
@@ -764,7 +764,7 @@ pub enum Action {
     /// Emitted by `ProvisionCoordinator` when proactive provisions are verified
     /// before the fallback fetch completes. This prevents the fallback response
     /// from delivering duplicate provisions that would leak memory.
-    CancelProvisionFetch {
+    CancelProvisionsFetch {
         /// The shard whose provisions were fetched.
         source_shard: ShardGroupId,
         /// The block height of the provisions.
@@ -814,8 +814,8 @@ pub enum Action {
     /// silently drop provisions.
     ///
     /// The runner sends a `GetProvisionRequest` to the source shard, and the
-    /// response is fed back as `StateProvisionReceived` for normal verification.
-    FetchProvisionRemote {
+    /// response is fed back as `StateProvisionsReceived` for normal verification.
+    FetchProvisionsRemote {
         /// The shard that should have sent provisions.
         source_shard: ShardGroupId,
         /// The block height whose provisions are missing.
@@ -875,7 +875,7 @@ impl Action {
 
             // Delegated Work - Crypto Verification
             Action::VerifyAndBuildQuorumCertificate { .. } => "VerifyAndBuildQuorumCertificate",
-            Action::VerifyProvision { .. } => "VerifyProvision",
+            Action::VerifyProvisions { .. } => "VerifyProvisions",
             Action::AggregateExecutionCertificate { .. } => "AggregateExecutionCertificate",
             Action::VerifyAndAggregateExecutionVotes { .. } => "VerifyAndAggregateExecutionVotes",
             Action::VerifyExecutionCertificateSignature { .. } => {
@@ -927,13 +927,13 @@ impl Action {
             // Runner I/O Requests
             Action::StartSync { .. } => "StartSync",
             Action::FetchTransactions { .. } => "FetchTransactions",
-            Action::FetchProvisionLocal { .. } => "FetchProvisionLocal",
+            Action::FetchProvisionsLocal { .. } => "FetchProvisionsLocal",
             Action::FetchFinalizedWave { .. } => "FetchFinalizedWave",
             Action::CancelFetch { .. } => "CancelFetch",
-            Action::FetchProvisionRemote { .. } => "FetchProvisionRemote",
+            Action::FetchProvisionsRemote { .. } => "FetchProvisionsRemote",
             Action::RequestMissingExecutionCert { .. } => "RequestMissingExecutionCert",
             Action::CancelExecutionCertFetch { .. } => "CancelExecutionCertFetch",
-            Action::CancelProvisionFetch { .. } => "CancelProvisionFetch",
+            Action::CancelProvisionsFetch { .. } => "CancelProvisionsFetch",
             Action::RequestMissingCommittedBlockHeader { .. } => {
                 "RequestMissingCommittedBlockHeader"
             }

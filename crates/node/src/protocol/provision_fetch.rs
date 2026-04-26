@@ -2,7 +2,7 @@
 //!
 //! Pure synchronous state machine for cross-shard provision fetching with
 //! per-peer rotation. Sits between the `ProvisionCoordinator`'s
-//! `FetchProvisionRemote` action and the actual `network.request()` call,
+//! `FetchProvisionsRemote` action and the actual `network.request()` call,
 //! rotating through available peers on failure before giving up.
 //!
 //! # Usage
@@ -15,7 +15,7 @@ use hyperscale_messages::request::GetProvisionRequest;
 use hyperscale_messages::response::GetProvisionResponse;
 use hyperscale_metrics as metrics;
 use hyperscale_storage::{ChainReader, SubstateStore};
-use hyperscale_types::{BlockHeight, Provision, ShardGroupId, StateProvision, ValidatorId};
+use hyperscale_types::{BlockHeight, Provisions, ShardGroupId, StateProvision, ValidatorId};
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
@@ -57,7 +57,7 @@ pub enum ProvisionFetchInput {
     Received {
         source_shard: ShardGroupId,
         block_height: BlockHeight,
-        batch: Provision,
+        provisions: Provisions,
     },
     /// A fetch attempt failed (network error or peer returned None).
     Failed {
@@ -84,7 +84,7 @@ pub enum ProvisionFetchOutput {
         peer: ValidatorId,
     },
     /// Deliver fetched provisions to the state machine.
-    Deliver { batch: Provision },
+    Deliver { provisions: Provisions },
 }
 
 /// State for a single pending provision fetch.
@@ -134,8 +134,8 @@ impl ProvisionFetchProtocol {
             ProvisionFetchInput::Received {
                 source_shard,
                 block_height,
-                batch,
-            } => self.handle_received(source_shard, block_height, batch),
+                provisions,
+            } => self.handle_received(source_shard, block_height, provisions),
             ProvisionFetchInput::Failed {
                 source_shard,
                 block_height,
@@ -258,18 +258,18 @@ impl ProvisionFetchProtocol {
         &mut self,
         source_shard: ShardGroupId,
         block_height: BlockHeight,
-        batch: Provision,
+        provisions: Provisions,
     ) -> Vec<ProvisionFetchOutput> {
         let key = (source_shard, block_height);
         if self.pending.remove(&key).is_some() {
             debug!(
                 source_shard = source_shard.0,
                 block_height = block_height.0,
-                count = batch.transactions.len(),
+                count = provisions.transactions.len(),
                 "Provision fetch complete"
             );
             metrics::record_fetch_completed("provision");
-            vec![ProvisionFetchOutput::Deliver { batch }]
+            vec![ProvisionFetchOutput::Deliver { provisions }]
         } else {
             trace!(
                 source_shard = source_shard.0,
@@ -691,13 +691,13 @@ mod tests {
         let outputs = protocol.handle(ProvisionFetchInput::Received {
             source_shard: shard(1),
             block_height: height(10),
-            batch: Provision::dummy(shard(1), height(10)),
+            provisions: Provisions::dummy(shard(1), height(10)),
         });
 
         assert_eq!(outputs.len(), 1);
         assert!(matches!(
             &outputs[0],
-            ProvisionFetchOutput::Deliver { batch } if batch.transactions.is_empty()
+            ProvisionFetchOutput::Deliver { provisions } if provisions.transactions.is_empty()
         ));
         assert!(!protocol.has_pending());
     }
@@ -772,7 +772,7 @@ mod tests {
         let outputs = protocol.handle(ProvisionFetchInput::Received {
             source_shard: shard(99),
             block_height: height(999),
-            batch: Provision::dummy(shard(99), height(999)),
+            provisions: Provisions::dummy(shard(99), height(999)),
         });
         assert!(outputs.is_empty());
     }
@@ -950,7 +950,7 @@ mod tests {
         protocol.handle(ProvisionFetchInput::Received {
             source_shard: shard(1),
             block_height: height(10),
-            batch: Provision::dummy(shard(1), height(10)),
+            provisions: Provisions::dummy(shard(1), height(10)),
         });
         assert!(!protocol.is_shard_saturated(shard(1)));
 

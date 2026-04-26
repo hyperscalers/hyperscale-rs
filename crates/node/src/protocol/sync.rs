@@ -20,7 +20,7 @@ use hyperscale_messages::response::{
 };
 use hyperscale_metrics as metrics;
 use hyperscale_storage::ChainReader;
-use hyperscale_types::{BlockHash, BlockHeight, CertifiedBlock, Provision, WAVE_TIMEOUT};
+use hyperscale_types::{BlockHash, BlockHeight, CertifiedBlock, Provisions, WAVE_TIMEOUT};
 use serde::Serialize;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
@@ -446,7 +446,7 @@ pub fn serve_block_request(
         return GetBlockResponse::found(ElidedCertifiedBlock::elide(block, qc, &req.inventory));
     }
 
-    let resolved: Option<Vec<Arc<Provision>>> = provision_hashes
+    let resolved: Option<Vec<Arc<Provisions>>> = provision_hashes
         .iter()
         .map(|h| provision_store.get(h))
         .collect();

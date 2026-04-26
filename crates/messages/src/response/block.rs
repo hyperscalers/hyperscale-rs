@@ -2,8 +2,8 @@
 
 use crate::request::Inventory;
 use hyperscale_types::{
-    Block, BlockHeader, CertifiedBlock, FinalizedWave, MessagePriority, NetworkMessage, Provision,
-    ProvisionHash, QuorumCertificate, RoutableTransaction, TxHash, WaveIdHash,
+    Block, BlockHeader, CertifiedBlock, FinalizedWave, MessagePriority, NetworkMessage,
+    ProvisionHash, Provisions, QuorumCertificate, RoutableTransaction, TxHash, WaveIdHash,
 };
 use sbor::prelude::BasicSbor;
 use std::sync::Arc;
@@ -25,7 +25,7 @@ pub struct ElidedCertifiedBlock {
     pub qc: QuorumCertificate,
     pub transactions: Vec<(TxHash, Option<RoutableTransaction>)>,
     pub certificates: Vec<(WaveIdHash, Option<FinalizedWave>)>,
-    pub provisions: Option<Vec<(ProvisionHash, Option<Provision>)>>,
+    pub provisions: Option<Vec<(ProvisionHash, Option<Provisions>)>>,
 }
 
 impl ElidedCertifiedBlock {
@@ -112,7 +112,7 @@ impl ElidedCertifiedBlock {
     where
         FTx: FnMut(&TxHash) -> Option<Arc<RoutableTransaction>>,
         FCert: FnMut(&WaveIdHash) -> Option<Arc<FinalizedWave>>,
-        FProv: FnMut(&ProvisionHash) -> Option<Arc<Provision>>,
+        FProv: FnMut(&ProvisionHash) -> Option<Arc<Provisions>>,
     {
         let mut miss = RehydrationMiss::default();
         let mut txs = Vec::with_capacity(self.transactions.len());
@@ -171,7 +171,7 @@ impl ElidedCertifiedBlock {
         let certs: Vec<Arc<FinalizedWave>> = certs.into_iter().map(Option::unwrap).collect();
         let block = match provs {
             Some(entries) => {
-                let provisions: Vec<Arc<Provision>> =
+                let provisions: Vec<Arc<Provisions>> =
                     entries.into_iter().map(Option::unwrap).collect();
                 Block::Live {
                     header: self.header.clone(),

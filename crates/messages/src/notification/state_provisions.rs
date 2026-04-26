@@ -6,22 +6,22 @@ use hyperscale_types::{
 };
 use sbor::prelude::BasicSbor;
 
-/// Batched state provisions for cross-shard transactions.
+/// State provisions for cross-shard transactions.
 ///
 /// Only the block proposer sends these. The sender signature authenticates
-/// the batch, allowing receivers to reject forged provisions before doing
-/// expensive merkle proof verification.
+/// the notification, allowing receivers to reject forged provisions before
+/// doing expensive merkle proof verification.
 ///
-/// The aggregated merkle proof is stored once at the batch level rather than
-/// per-provision, avoiding redundant serialization of the (potentially large)
-/// proof across N provisions.
+/// The aggregated merkle proof is stored once on the notification rather
+/// than per-provision, avoiding redundant serialization of the (potentially
+/// large) proof across N provisions.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct StateProvisionNotification {
     /// The state provisions being sent.
     pub provisions: Vec<hyperscale_types::StateProvision>,
     /// Aggregated merkle proof covering all entries across all provisions.
     pub proof: MerkleInclusionProof,
-    /// The validator who sent this batch.
+    /// The validator who sent this notification.
     pub sender: ValidatorId,
     /// BLS signature over the domain-separated signing message, by the sender.
     pub sender_signature: Bls12381G2Signature,
@@ -30,7 +30,7 @@ pub struct StateProvisionNotification {
 }
 
 impl StateProvisionNotification {
-    /// Create a new signed state provision batch.
+    /// Create a new signed state provisions.
     pub fn new(
         provisions: Vec<hyperscale_types::StateProvision>,
         proof: MerkleInclusionProof,
@@ -46,12 +46,12 @@ impl StateProvisionNotification {
         }
     }
 
-    /// Build the canonical signing message for this batch.
+    /// Build the canonical signing message for this notification.
     ///
-    /// Requires that the batch is non-empty (panics otherwise).
+    /// Requires that the provisions list is non-empty (panics otherwise).
     pub fn signing_message(&self) -> Vec<u8> {
         let first = &self.provisions[0];
-        hyperscale_types::state_provision_batch_message(
+        hyperscale_types::state_provisions_message(
             first.source_shard,
             first.target_shard,
             first.block_height,
@@ -74,12 +74,12 @@ impl StateProvisionNotification {
         &self.trace_context
     }
 
-    /// Check if the batch is empty.
+    /// Check if there are no provisions.
     pub fn is_empty(&self) -> bool {
         self.provisions.is_empty()
     }
 
-    /// Get the number of provisions in the batch.
+    /// Get the number of provisions.
     pub fn len(&self) -> usize {
         self.provisions.len()
     }

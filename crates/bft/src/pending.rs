@@ -6,8 +6,8 @@ use hyperscale_core::Action;
 #[cfg(test)]
 use hyperscale_types::Hash;
 use hyperscale_types::{
-    Block, BlockHash, BlockHeader, BlockManifest, FinalizedWave, LocalTimestamp, Provision,
-    ProvisionHash, RoutableTransaction, TopologySnapshot, TxHash, WaveIdHash,
+    Block, BlockHash, BlockHeader, BlockManifest, FinalizedWave, LocalTimestamp, ProvisionHash,
+    Provisions, RoutableTransaction, TopologySnapshot, TxHash, WaveIdHash,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -48,11 +48,11 @@ pub struct PendingBlock {
     /// Set of wave_id hashes we're still waiting for.
     missing_wave_hashes: HashSet<WaveIdHash>,
 
-    /// Received provision batches keyed by batch hash. BTreeMap so
+    /// Received provisions keyed by provisions hash. BTreeMap so
     /// `provisions()` iteration is deterministic across validators.
-    received_provisions: BTreeMap<ProvisionHash, Arc<Provision>>,
+    received_provisions: BTreeMap<ProvisionHash, Arc<Provisions>>,
 
-    /// Set of provision batch hashes we're still waiting for.
+    /// Set of provisions hashes we're still waiting for.
     missing_provision_hashes: HashSet<ProvisionHash>,
 
     /// The fully constructed block (None until all transactions/waves received).
@@ -101,7 +101,7 @@ impl PendingBlock {
     pub fn from_complete_block(
         block: &Block,
         finalized_waves: Vec<Arc<FinalizedWave>>,
-        provisions: Vec<Arc<Provision>>,
+        provisions: Vec<Arc<Provisions>>,
         created_at: LocalTimestamp,
     ) -> Self {
         let mut provision_hashes: Vec<ProvisionHash> =
@@ -109,9 +109,9 @@ impl PendingBlock {
         provision_hashes.sort();
         let mut manifest = BlockManifest::from_block(block);
         manifest.provision_hashes = provision_hashes;
-        let mut received_provisions: BTreeMap<ProvisionHash, Arc<Provision>> = BTreeMap::new();
-        for batch in provisions {
-            received_provisions.insert(batch.hash(), batch);
+        let mut received_provisions: BTreeMap<ProvisionHash, Arc<Provisions>> = BTreeMap::new();
+        for p in provisions {
+            received_provisions.insert(p.hash(), p);
         }
         let mut pending = Self {
             header: block.header().clone(),
@@ -202,25 +202,25 @@ impl PendingBlock {
         self.missing_wave_hashes.contains(wave_id_hash)
     }
 
-    /// Add a received provision batch.
+    /// Add a received provisions.
     ///
     /// Returns true if this provision was needed, false if duplicate or not in this block.
-    pub fn add_provision(&mut self, batch: Arc<Provision>) -> bool {
-        let hash = batch.hash();
+    pub fn add_provision(&mut self, provisions: Arc<Provisions>) -> bool {
+        let hash = provisions.hash();
         if self.missing_provision_hashes.remove(&hash) {
-            self.received_provisions.insert(hash, batch);
+            self.received_provisions.insert(hash, provisions);
             true
         } else {
             false
         }
     }
 
-    /// Get the missing provision batch hashes as a Vec.
+    /// Get the missing provisions hashes as a Vec.
     pub fn missing_provisions(&self) -> Vec<ProvisionHash> {
         self.missing_provision_hashes.iter().copied().collect()
     }
 
-    /// Check if this pending block needs a specific provision batch.
+    /// Check if this pending block needs a specific provisions.
     pub fn needs_provision(&self, batch_hash: &ProvisionHash) -> bool {
         self.missing_provision_hashes.contains(batch_hash)
     }
@@ -268,9 +268,9 @@ impl PendingBlock {
             .collect();
 
         // Attach provisions in manifest order. `received_provisions` is
-        // populated as provision batches arrive via gossip / local fetch,
+        // populated as provisions arrive via gossip / local fetch,
         // and `is_complete()` gates assembly on all of them being present.
-        let provisions: Vec<Arc<Provision>> = self
+        let provisions: Vec<Arc<Provisions>> = self
             .manifest
             .provision_hashes
             .iter()
@@ -374,7 +374,7 @@ pub(crate) fn check_fetches(
                 age_ms = age.as_millis(),
                 "Fetch timeout reached, requesting missing provisions"
             );
-            actions.push(Action::FetchProvisionLocal {
+            actions.push(Action::FetchProvisionsLocal {
                 block_hash: *block_hash,
                 proposer,
                 batch_hashes: missing_provisions,

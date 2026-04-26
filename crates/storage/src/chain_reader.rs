@@ -20,7 +20,7 @@ pub struct BlockForSync {
     pub block: Block,
     /// The QC that certified this block.
     pub qc: QuorumCertificate,
-    /// Provision batch hashes from the block's manifest — the sync-serving
+    /// Provisions hashes from the block's manifest — the sync-serving
     /// layer uses these to look up provisions in the in-memory cache.
     pub provision_hashes: Vec<ProvisionHash>,
 }

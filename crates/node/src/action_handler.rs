@@ -13,7 +13,7 @@ use hyperscale_engine::Engine;
 use hyperscale_metrics as metrics;
 use hyperscale_storage::{ChainReader, ChainWriter, SubstateStore};
 use hyperscale_types::{
-    BlockHash, BlockHeight, LocalExecutionEntry, Provision, ShardGroupId, TxEntries, TxHash,
+    BlockHash, BlockHeight, LocalExecutionEntry, Provisions, ShardGroupId, TxEntries, TxHash,
 };
 use std::sync::Arc;
 use tracing::warn;
@@ -87,7 +87,7 @@ pub(crate) fn dispatch_pool_for(action: &Action) -> Option<DispatchPool> {
         Action::AggregateExecutionCertificate { .. } => Some(DispatchPool::Crypto),
         Action::VerifyAndAggregateExecutionVotes { .. } => Some(DispatchPool::Crypto),
         Action::VerifyExecutionCertificateSignature { .. } => Some(DispatchPool::Crypto),
-        Action::VerifyProvision { .. } => Some(DispatchPool::Crypto),
+        Action::VerifyProvisions { .. } => Some(DispatchPool::Crypto),
         Action::FetchAndBroadcastProvision { .. } => Some(DispatchPool::Crypto),
 
         // Execution
@@ -418,7 +418,7 @@ pub(crate) fn handle_delegated_action<
             parent_block_height,
             transactions,
             finalized_waves,
-            provision_batches,
+            provisions,
             parent_in_flight,
             finalized_tx_count,
         } => {
@@ -440,7 +440,7 @@ pub(crate) fn handle_delegated_action<
                 finalized_waves.clone(),
                 shard_group_id,
                 ctx.topology,
-                provision_batches.clone(),
+                provisions.clone(),
                 parent_in_flight,
                 finalized_tx_count,
                 &pending_snapshots,
@@ -464,7 +464,7 @@ pub(crate) fn handle_delegated_action<
                     block: Arc::new(result.block),
                     block_hash,
                     finalized_waves,
-                    provisions: provision_batches,
+                    provisions,
                 })],
                 prepared_commit,
             })
@@ -536,30 +536,30 @@ pub(crate) fn handle_delegated_action<
         // --- State Provision Batch Verification ---
         // QC was already verified by RemoteHeaderCoordinator; only merkle
         // proofs need checking against the committed header's state root.
-        Action::VerifyProvision {
-            batch,
+        Action::VerifyProvisions {
+            provisions,
             committed_header,
         } => {
             let merkle_start = std::time::Instant::now();
             let all_valid = {
-                let all_entries = batch.all_entries_deduped();
+                let all_entries = provisions.all_entries_deduped();
                 if all_entries.is_empty() {
                     true
                 } else {
                     let valid = hyperscale_storage::tree::proofs::verify_proof(
-                        &batch.proof,
+                        &provisions.proof,
                         &all_entries,
                         committed_header.header.state_root,
                         |e| &e.storage_key,
                     );
                     if !valid {
                         tracing::warn!(
-                            source_shard = batch.source_shard.0,
-                            block_height = batch.block_height.0,
+                            source_shard = provisions.source_shard.0,
+                            block_height = provisions.block_height.0,
                             header_height = committed_header.header.height.0,
                             header_state_root = ?committed_header.header.state_root,
                             entry_count = all_entries.len(),
-                            proof_len = batch.proof.as_bytes().len(),
+                            proof_len = provisions.proof.as_bytes().len(),
                             "Provision merkle proof verification failed"
                         );
                     }
@@ -572,11 +572,13 @@ pub(crate) fn handle_delegated_action<
             );
 
             Some(DelegatedResult {
-                events: vec![NodeInput::Protocol(ProtocolEvent::StateProvisionVerified {
-                    batch,
-                    committed_header: Some(committed_header),
-                    valid: all_valid,
-                })],
+                events: vec![NodeInput::Protocol(
+                    ProtocolEvent::StateProvisionsVerified {
+                        provisions,
+                        committed_header: Some(committed_header),
+                        valid: all_valid,
+                    },
+                )],
                 prepared_commit: None,
             })
         }
@@ -720,7 +722,7 @@ pub(crate) fn handle_delegated_action<
 
             // Phase 2: Group by shard + generate proofs
             let batches =
-                build_provision_batches(ctx, per_tx, source_shard, block_height, &shard_recipients);
+                build_provision_groups(ctx, per_tx, source_shard, block_height, &shard_recipients);
             Some(DelegatedResult {
                 events: vec![NodeInput::ProvisionReady { batches }],
                 prepared_commit: None,
@@ -796,7 +798,7 @@ fn fetch_entries_for_requests<
 }
 
 /// Group fetched entries by target shard and generate merkle proofs per shard.
-fn build_provision_batches<
+fn build_provision_groups<
     S: ChainWriter
         + SubstateStore
         + hyperscale_storage::VersionedStore
@@ -810,7 +812,7 @@ fn build_provision_batches<
     source_shard: ShardGroupId,
     block_height: BlockHeight,
     shard_recipients: &std::collections::HashMap<ShardGroupId, Vec<hyperscale_types::ValidatorId>>,
-) -> Vec<(ShardGroupId, Provision, Vec<hyperscale_types::ValidatorId>)> {
+) -> Vec<(ShardGroupId, Provisions, Vec<hyperscale_types::ValidatorId>)> {
     use std::collections::HashMap;
 
     let mut shard_tx_entries: HashMap<ShardGroupId, Vec<TxEntries>> = HashMap::new();
@@ -856,8 +858,8 @@ fn build_provision_batches<
         };
 
         let recipients = shard_recipients.get(&shard).cloned().unwrap_or_default();
-        let batch = Provision::new(source_shard, block_height, proof, transactions);
-        batches.push((shard, batch, recipients));
+        let provisions = Provisions::new(source_shard, block_height, proof, transactions);
+        batches.push((shard, provisions, recipients));
     }
     batches
 }

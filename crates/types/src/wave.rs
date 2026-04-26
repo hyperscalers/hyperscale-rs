@@ -164,12 +164,12 @@ pub fn compute_waves(
 }
 
 /// Per-target-shard merkle commitment over the tx hashes destined for each
-/// target shard in a block's cross-shard provision batches.
+/// target shard in a block's cross-shard provisions.
 ///
 /// For each cross-shard tx, emit the tx hash into the bucket of every remote
 /// shard that tx touches. The resulting per-target leaves are merkle-committed
 /// in block order (already hash-ascending) so the target shard can verify a
-/// received `ProvisionBatch` contains the full set it was meant to receive.
+/// received `Provisions` contains the full set it was meant to receive.
 ///
 /// Only emits an entry for targets with ≥1 tx. Empty for blocks with no
 /// cross-shard txs.

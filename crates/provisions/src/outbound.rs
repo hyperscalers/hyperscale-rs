@@ -1,25 +1,25 @@
-//! Tracks provision batches this shard's proposer generated and broadcast
-//! to target shards, holding each batch until the target shard's execution
+//! Tracks provisions this shard's proposer generated and broadcast to
+//! target shards, holding each entry until the target shard's execution
 //! certificates acknowledge every transaction it contained.
 //!
-//! Each registered batch is kept in the shared [`ProvisionStore`]. When a
-//! remote shard's `ExecutionCertificate` arrives and we were a source for
-//! its wave, the target shard's `tx_outcomes` drain the batch's pending
-//! set — `Executed` and `Aborted` are both terminal, so either removes
-//! the tx from the pending set. When the pending set empties, the batch
-//! is evicted from the store.
+//! Each registered provisions entry is kept in the shared
+//! [`ProvisionStore`]. When a remote shard's `ExecutionCertificate`
+//! arrives and we were a source for its wave, the target shard's
+//! `tx_outcomes` drain the entry's pending set — `Executed` and `Aborted`
+//! are both terminal, so either removes the tx from the pending set.
+//! When the pending set empties, the entry is evicted from the store.
 //!
-//! A hard safety horizon ([`RETENTION_HORIZON`]) force-evicts batches
+//! A hard safety horizon ([`RETENTION_HORIZON`]) force-evicts entries
 //! that never reach a terminal EC; this is a bug-bound, not a nominal
 //! policy — every firing indicates an upstream liveness failure and is
 //! logged at `warn!`. The bound is principled: a tx included at the
 //! latest possible moment within its `validity_range` gets `WAVE_TIMEOUT`
-//! to terminate, so any batch unacked past `MAX_VALIDITY_RANGE +
-//! WAVE_TIMEOUT` references a tx no shard could still be processing.
+//! to terminate, so any provisions unacked past `MAX_VALIDITY_RANGE +
+//! WAVE_TIMEOUT` reference a tx no shard could still be processing.
 
 use crate::store::ProvisionStore;
 use hyperscale_types::{
-    BlockHeight, Provision, ProvisionHash, ShardGroupId, TxHash, TxOutcome, WeightedTimestamp,
+    BlockHeight, ProvisionHash, Provisions, ShardGroupId, TxHash, TxOutcome, WeightedTimestamp,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -27,7 +27,7 @@ use tracing::{debug, warn};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OutboundMemoryStats {
-    pub tracked_batches: usize,
+    pub tracked_provisions: usize,
     pub tracked_tx_entries: usize,
 }
 
@@ -35,25 +35,26 @@ struct OutboundEntry {
     target_shard: ShardGroupId,
     source_block_height: BlockHeight,
     pending_txs: HashSet<TxHash>,
-    /// Hard deadline past which the batch is provably useless: every tx in
-    /// it has expired its `validity_range` and terminated. Computed once at
-    /// insert from the latest BFT-authenticated `local_committed_ts` —
-    /// conservatively ≥ the source block's true ts, so eviction never fires
-    /// before the deadline has actually passed.
+    /// Hard deadline past which the provisions are provably useless: every
+    /// tx in them has expired its `validity_range` and terminated.
+    /// Computed once at insert from the latest BFT-authenticated
+    /// `local_committed_ts` — conservatively ≥ the source block's true ts,
+    /// so eviction never fires before the deadline has actually passed.
     deadline: WeightedTimestamp,
 }
 
-/// Sub-state machine that retains outbound provision batches until the
-/// target shard confirms every transaction or the safety horizon elapses.
+/// Sub-state machine that retains outbound provisions until the target
+/// shard confirms every transaction or the safety horizon elapses.
 pub struct OutboundProvisionTracker {
     store: Arc<ProvisionStore>,
-    /// Batch content hash → outbound tracking metadata.
+    /// Provision content hash → outbound tracking metadata.
     entries: HashMap<ProvisionHash, OutboundEntry>,
-    /// Reverse index: a tx hash points at every batch still waiting for it
-    /// to be acknowledged. One tx can appear in batches for multiple target
-    /// shards (e.g. a cross-shard tx that reads state from several sources
-    /// but only one target — the tx hash is the same across them). The set
-    /// lets a single EC drain every matching batch in O(matched).
+    /// Reverse index: a tx hash points at every provisions entry still
+    /// waiting for it to be acknowledged. One tx can appear in entries
+    /// for multiple target shards (e.g. a cross-shard tx that reads state
+    /// from several sources but only one target — the tx hash is the
+    /// same across them). The set lets a single EC drain every matching
+    /// entry in O(matched).
     by_tx: HashMap<TxHash, HashSet<ProvisionHash>>,
     /// Latest BFT-authenticated weighted timestamp seen on local commits.
     /// Drives the safety-timeout sweep deterministically across validators.
@@ -72,62 +73,67 @@ impl OutboundProvisionTracker {
 
     pub fn memory_stats(&self) -> OutboundMemoryStats {
         OutboundMemoryStats {
-            tracked_batches: self.entries.len(),
+            tracked_provisions: self.entries.len(),
             tracked_tx_entries: self.by_tx.values().map(|s| s.len()).sum(),
         }
     }
 
-    /// Register a batch our proposer just broadcast. Inserts into the
+    /// Register provisions our proposer just broadcast. Inserts into the
     /// shared store (which maintains the `(source_block, target)` index
     /// used by cross-shard fast-path serving); idempotent.
-    pub fn on_broadcast(&mut self, batch: Arc<Provision>, target_shard: ShardGroupId) {
-        let batch_hash = batch.hash();
-        if self.entries.contains_key(&batch_hash) {
+    pub fn on_broadcast(&mut self, provisions: Arc<Provisions>, target_shard: ShardGroupId) {
+        let provision_hash = provisions.hash();
+        if self.entries.contains_key(&provision_hash) {
             return;
         }
 
-        let tx_hashes: HashSet<TxHash> = batch.transactions.iter().map(|tx| tx.tx_hash).collect();
+        let tx_hashes: HashSet<TxHash> = provisions
+            .transactions
+            .iter()
+            .map(|tx| tx.tx_hash)
+            .collect();
         if tx_hashes.is_empty() {
             return;
         }
 
         for tx in &tx_hashes {
-            self.by_tx.entry(*tx).or_default().insert(batch_hash);
+            self.by_tx.entry(*tx).or_default().insert(provision_hash);
         }
 
-        self.store.insert_outbound(Arc::clone(&batch), target_shard);
+        self.store
+            .insert_outbound(Arc::clone(&provisions), target_shard);
 
         self.entries.insert(
-            batch_hash,
+            provision_hash,
             OutboundEntry {
                 target_shard,
-                source_block_height: batch.block_height,
+                source_block_height: provisions.block_height,
                 pending_txs: tx_hashes,
-                deadline: batch.deadline(self.now),
+                deadline: provisions.deadline(self.now),
             },
         );
 
         debug!(
-            batch_hash = ?batch_hash,
+            provision_hash = ?provision_hash,
             target_shard = target_shard.0,
-            source_block_height = batch.block_height.0,
-            tx_count = batch.transactions.len(),
-            "Tracking outbound provision batch"
+            source_block_height = provisions.block_height.0,
+            tx_count = provisions.transactions.len(),
+            "Tracking outbound provisions"
         );
     }
 
-    /// Drain every outbound batch awaiting any of `tx_outcomes` from
-    /// `target_shard`. Batches whose pending set empties are evicted
-    /// from the shared store.
+    /// Drain every outbound entry awaiting any of `tx_outcomes` from
+    /// `target_shard`. Entries whose pending set empties are evicted from
+    /// the shared store.
     pub fn on_ec_observed(&mut self, target_shard: ShardGroupId, tx_outcomes: &[TxOutcome]) {
         let mut to_evict: Vec<ProvisionHash> = Vec::new();
 
         for outcome in tx_outcomes {
-            let Some(batches) = self.by_tx.get_mut(&outcome.tx_hash) else {
+            let Some(hashes) = self.by_tx.get_mut(&outcome.tx_hash) else {
                 continue;
             };
-            batches.retain(|batch_hash| {
-                let Some(entry) = self.entries.get_mut(batch_hash) else {
+            hashes.retain(|provision_hash| {
+                let Some(entry) = self.entries.get_mut(provision_hash) else {
                     return false;
                 };
                 if entry.target_shard != target_shard {
@@ -135,21 +141,21 @@ impl OutboundProvisionTracker {
                 }
                 entry.pending_txs.remove(&outcome.tx_hash);
                 if entry.pending_txs.is_empty() {
-                    to_evict.push(*batch_hash);
+                    to_evict.push(*provision_hash);
                 }
                 false
             });
-            if batches.is_empty() {
+            if hashes.is_empty() {
                 self.by_tx.remove(&outcome.tx_hash);
             }
         }
 
-        for batch_hash in to_evict {
-            self.evict(&batch_hash, "acknowledged");
+        for provision_hash in to_evict {
+            self.evict(&provision_hash, "acknowledged");
         }
     }
 
-    /// Safety sweep: evict outbound batches whose deadline has passed.
+    /// Safety sweep: evict outbound entries whose deadline has passed.
     /// Fires with `warn!` — a hit indicates the target shard never produced
     /// a terminal EC (upstream bug).
     pub fn on_block_committed(&mut self, now: WeightedTimestamp) {
@@ -167,41 +173,41 @@ impl OutboundProvisionTracker {
             })
             .collect();
 
-        for batch_hash in stale {
+        for provision_hash in stale {
             let entry = self
                 .entries
-                .get(&batch_hash)
+                .get(&provision_hash)
                 .expect("entry exists by construction");
             warn!(
-                batch_hash = ?batch_hash,
+                provision_hash = ?provision_hash,
                 target_shard = entry.target_shard.0,
                 source_block_height = entry.source_block_height.0,
                 pending_txs = entry.pending_txs.len(),
                 past_deadline_secs = now.elapsed_since(entry.deadline).as_secs(),
-                "Evicting outbound provision past deadline — no terminal EC observed"
+                "Evicting outbound provisions past deadline — no terminal EC observed"
             );
-            self.evict(&batch_hash, "deadline-passed");
+            self.evict(&provision_hash, "deadline-passed");
         }
     }
 
-    fn evict(&mut self, batch_hash: &ProvisionHash, reason: &'static str) {
-        let Some(entry) = self.entries.remove(batch_hash) else {
+    fn evict(&mut self, provision_hash: &ProvisionHash, reason: &'static str) {
+        let Some(entry) = self.entries.remove(provision_hash) else {
             return;
         };
         for tx in &entry.pending_txs {
-            if let Some(batches) = self.by_tx.get_mut(tx) {
-                batches.remove(batch_hash);
-                if batches.is_empty() {
+            if let Some(hashes) = self.by_tx.get_mut(tx) {
+                hashes.remove(provision_hash);
+                if hashes.is_empty() {
                     self.by_tx.remove(tx);
                 }
             }
         }
-        self.store.evict(std::iter::once(*batch_hash));
+        self.store.evict(std::iter::once(*provision_hash));
         debug!(
-            batch_hash = ?batch_hash,
+            provision_hash = ?provision_hash,
             target_shard = entry.target_shard.0,
             reason,
-            "Evicted outbound provision"
+            "Evicted outbound provisions"
         );
     }
 }
@@ -223,7 +229,7 @@ mod tests {
         TxHash::from_raw(Hash::from_bytes(label))
     }
 
-    fn make_batch(source_block: BlockHeight, txs: &[TxHash]) -> Arc<Provision> {
+    fn make_provisions(source_block: BlockHeight, txs: &[TxHash]) -> Arc<Provisions> {
         let transactions = txs
             .iter()
             .map(|h| TxEntries {
@@ -232,7 +238,7 @@ mod tests {
                 target_nodes: vec![],
             })
             .collect();
-        Arc::new(Provision::new(
+        Arc::new(Provisions::new(
             ShardGroupId(0),
             source_block,
             MerkleInclusionProof::dummy(),
@@ -258,19 +264,19 @@ mod tests {
     }
 
     #[test]
-    fn on_broadcast_stores_batch_and_tracks_txs() {
+    fn on_broadcast_stores_provisions_and_tracks_txs() {
         let store = Arc::new(ProvisionStore::new());
         let mut tracker = OutboundProvisionTracker::new(Arc::clone(&store));
 
         let a = tx(b"a");
         let b = tx(b"b");
-        let batch = make_batch(BlockHeight(10), &[a, b]);
-        let batch_hash = batch.hash();
-        tracker.on_broadcast(Arc::clone(&batch), ShardGroupId(1));
+        let provisions = make_provisions(BlockHeight(10), &[a, b]);
+        let provision_hash = provisions.hash();
+        tracker.on_broadcast(Arc::clone(&provisions), ShardGroupId(1));
 
-        assert_eq!(tracker.memory_stats().tracked_batches, 1);
+        assert_eq!(tracker.memory_stats().tracked_provisions, 1);
         assert_eq!(tracker.memory_stats().tracked_tx_entries, 2);
-        assert!(store.get(&batch_hash).is_some());
+        assert!(store.get(&provision_hash).is_some());
         let hits = store.get_outbound(BlockHeight(10), ShardGroupId(1));
         assert_eq!(hits.len(), 1);
     }
@@ -282,17 +288,17 @@ mod tests {
 
         let a = tx(b"a");
         let b = tx(b"b");
-        let batch = make_batch(BlockHeight(10), &[a, b]);
-        let batch_hash = batch.hash();
-        tracker.on_broadcast(Arc::clone(&batch), ShardGroupId(1));
+        let provisions = make_provisions(BlockHeight(10), &[a, b]);
+        let provision_hash = provisions.hash();
+        tracker.on_broadcast(Arc::clone(&provisions), ShardGroupId(1));
 
         tracker.on_ec_observed(ShardGroupId(1), &[executed(a)]);
-        assert_eq!(tracker.memory_stats().tracked_batches, 1);
-        assert!(store.get(&batch_hash).is_some());
+        assert_eq!(tracker.memory_stats().tracked_provisions, 1);
+        assert!(store.get(&provision_hash).is_some());
 
         tracker.on_ec_observed(ShardGroupId(1), &[executed(b)]);
-        assert_eq!(tracker.memory_stats().tracked_batches, 0);
-        assert!(store.get(&batch_hash).is_none());
+        assert_eq!(tracker.memory_stats().tracked_provisions, 0);
+        assert!(store.get(&provision_hash).is_none());
     }
 
     #[test]
@@ -301,12 +307,12 @@ mod tests {
         let mut tracker = OutboundProvisionTracker::new(Arc::clone(&store));
 
         let a = tx(b"a");
-        let batch = make_batch(BlockHeight(7), &[a]);
-        let batch_hash = batch.hash();
-        tracker.on_broadcast(Arc::clone(&batch), ShardGroupId(2));
+        let provisions = make_provisions(BlockHeight(7), &[a]);
+        let provision_hash = provisions.hash();
+        tracker.on_broadcast(Arc::clone(&provisions), ShardGroupId(2));
 
         tracker.on_ec_observed(ShardGroupId(2), &[aborted(a)]);
-        assert!(store.get(&batch_hash).is_none());
+        assert!(store.get(&provision_hash).is_none());
     }
 
     #[test]
@@ -315,12 +321,12 @@ mod tests {
         let mut tracker = OutboundProvisionTracker::new(Arc::clone(&store));
 
         let a = tx(b"a");
-        let batch = make_batch(BlockHeight(5), &[a]);
-        tracker.on_broadcast(Arc::clone(&batch), ShardGroupId(1));
+        let provisions = make_provisions(BlockHeight(5), &[a]);
+        tracker.on_broadcast(Arc::clone(&provisions), ShardGroupId(1));
 
-        // EC from a different target shard must not acknowledge this batch.
+        // EC from a different target shard must not acknowledge these provisions.
         tracker.on_ec_observed(ShardGroupId(2), &[executed(a)]);
-        assert_eq!(tracker.memory_stats().tracked_batches, 1);
+        assert_eq!(tracker.memory_stats().tracked_provisions, 1);
     }
 
     #[test]
@@ -330,14 +336,14 @@ mod tests {
         tracker.on_block_committed(ts(1_000_000));
 
         let a = tx(b"a");
-        let batch = make_batch(BlockHeight(5), &[a]);
-        let batch_hash = batch.hash();
-        tracker.on_broadcast(Arc::clone(&batch), ShardGroupId(1));
+        let provisions = make_provisions(BlockHeight(5), &[a]);
+        let provision_hash = provisions.hash();
+        tracker.on_broadcast(Arc::clone(&provisions), ShardGroupId(1));
 
         let past_max = RETENTION_HORIZON + Duration::from_secs(1);
         tracker.on_block_committed(ts(1_000_000 + past_max.as_millis() as u64));
-        assert!(store.get(&batch_hash).is_none());
-        assert_eq!(tracker.memory_stats().tracked_batches, 0);
+        assert!(store.get(&provision_hash).is_none());
+        assert_eq!(tracker.memory_stats().tracked_provisions, 0);
     }
 
     #[test]
@@ -346,10 +352,10 @@ mod tests {
         let mut tracker = OutboundProvisionTracker::new(Arc::clone(&store));
 
         let a = tx(b"a");
-        let batch = make_batch(BlockHeight(10), &[a]);
-        tracker.on_broadcast(Arc::clone(&batch), ShardGroupId(1));
-        tracker.on_broadcast(Arc::clone(&batch), ShardGroupId(1));
-        assert_eq!(tracker.memory_stats().tracked_batches, 1);
+        let provisions = make_provisions(BlockHeight(10), &[a]);
+        tracker.on_broadcast(Arc::clone(&provisions), ShardGroupId(1));
+        tracker.on_broadcast(Arc::clone(&provisions), ShardGroupId(1));
+        assert_eq!(tracker.memory_stats().tracked_provisions, 1);
         assert_eq!(tracker.memory_stats().tracked_tx_entries, 1);
     }
 }

@@ -1,7 +1,7 @@
 //! Block top-up fetch response.
 
 use hyperscale_types::{
-    FinalizedWave, MessagePriority, NetworkMessage, Provision, ProvisionHash, RoutableTransaction,
+    FinalizedWave, MessagePriority, NetworkMessage, ProvisionHash, Provisions, RoutableTransaction,
     TxHash, WaveIdHash,
 };
 use std::sync::Arc;
@@ -20,7 +20,7 @@ use std::sync::Arc;
 pub struct GetBlockTopUpResponse {
     pub transactions: Vec<(TxHash, Arc<RoutableTransaction>)>,
     pub certificates: Vec<(WaveIdHash, Arc<FinalizedWave>)>,
-    pub provisions: Vec<(ProvisionHash, Arc<Provision>)>,
+    pub provisions: Vec<(ProvisionHash, Arc<Provisions>)>,
 }
 
 impl GetBlockTopUpResponse {
@@ -28,7 +28,7 @@ impl GetBlockTopUpResponse {
     pub fn new(
         transactions: Vec<(TxHash, Arc<RoutableTransaction>)>,
         certificates: Vec<(WaveIdHash, Arc<FinalizedWave>)>,
-        provisions: Vec<(ProvisionHash, Arc<Provision>)>,
+        provisions: Vec<(ProvisionHash, Arc<Provisions>)>,
     ) -> Self {
         Self {
             transactions,
@@ -73,8 +73,8 @@ impl PartialEq for GetBlockTopUpResponse {
                     .all(|((ha, fa), (hb, fb))| ha == hb && fa.as_ref() == fb.as_ref())
         }
         fn eq_prov(
-            a: &[(ProvisionHash, Arc<Provision>)],
-            b: &[(ProvisionHash, Arc<Provision>)],
+            a: &[(ProvisionHash, Arc<Provisions>)],
+            b: &[(ProvisionHash, Arc<Provisions>)],
         ) -> bool {
             a.len() == b.len()
                 && a.iter()
@@ -129,7 +129,7 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
         }
         let transactions = decode_pairs_arc::<_, TxHash, RoutableTransaction>(decoder)?;
         let certificates = decode_pairs_arc::<_, WaveIdHash, FinalizedWave>(decoder)?;
-        let provisions = decode_pairs_arc::<_, ProvisionHash, Provision>(decoder)?;
+        let provisions = decode_pairs_arc::<_, ProvisionHash, Provisions>(decoder)?;
         Ok(Self {
             transactions,
             certificates,

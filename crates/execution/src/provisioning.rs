@@ -9,7 +9,7 @@
 //! - `required` — the set of remote shards each cross-shard tx needs
 //!   provisions from. Populated when the tx's wave is created.
 //! - `received` — the set of remote shards whose provisions have actually
-//!   landed. Populated by [`absorb_batch`](ProvisioningTracker::absorb_batch).
+//!   landed. Populated by [`absorb_provisions`](ProvisioningTracker::absorb_provisions).
 //!
 //! A tx is fully provisioned when `required ⊆ received`; that predicate is
 //! surfaced as [`is_fully_provisioned`](ProvisioningTracker::is_fully_provisioned)
@@ -25,7 +25,7 @@
 #[cfg(test)]
 use hyperscale_types::Hash;
 use hyperscale_types::{
-    NodeId, Provision, ShardGroupId, StateProvision, TopologySnapshot, TxHash, WeightedTimestamp,
+    NodeId, Provisions, ShardGroupId, StateProvision, TopologySnapshot, TxHash, WeightedTimestamp,
 };
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -43,7 +43,7 @@ pub(crate) struct ProvisioningTracker {
     required: HashMap<TxHash, BTreeSet<ShardGroupId>>,
 
     /// Remote shards whose provisions have been received. Populated by
-    /// [`absorb_batch`].
+    /// [`absorb_provisions`].
     received: HashMap<TxHash, BTreeSet<ShardGroupId>>,
 
     /// Detects node-ID overlap conflicts between local cross-shard txs and
@@ -83,24 +83,28 @@ impl ProvisioningTracker {
 
     // ─── Batch absorption ───────────────────────────────────────────────
 
-    /// Absorb a committed provision batch. Adds one [`StateProvision`] per
-    /// `tx_entry` to the verified map and records `batch.source_shard`
+    /// Absorb a committed provisions. Adds one [`StateProvision`] per
+    /// `tx_entry` to the verified map and records `provisions.source_shard`
     /// under `received[tx_hash]`.
     ///
     /// Returns the `tx_hash`es touched — the caller uses these to compute
     /// which local waves are affected and to drive the dispatch check.
-    /// Preserves iteration order of `batch.transactions` (callers sort
+    /// Preserves iteration order of `provisions.transactions` (callers sort
     /// batches upstream for determinism).
-    pub fn absorb_batch(&mut self, batch: &Provision, local_shard: ShardGroupId) -> Vec<TxHash> {
-        let mut touched = Vec::with_capacity(batch.transactions.len());
-        let source_shard = batch.source_shard;
-        for tx_entry in &batch.transactions {
+    pub fn absorb_provisions(
+        &mut self,
+        provisions: &Provisions,
+        local_shard: ShardGroupId,
+    ) -> Vec<TxHash> {
+        let mut touched = Vec::with_capacity(provisions.transactions.len());
+        let source_shard = provisions.source_shard;
+        for tx_entry in &provisions.transactions {
             let tx_hash = tx_entry.tx_hash;
             let provision = StateProvision {
                 transaction_hash: tx_hash,
                 target_shard: local_shard,
                 source_shard,
-                block_height: batch.block_height,
+                block_height: provisions.block_height,
                 entries: Arc::new(tx_entry.entries.clone()),
             };
             self.verified.entry(tx_hash).or_default().push(provision);
@@ -132,15 +136,16 @@ impl ProvisioningTracker {
             .register_tx(tx_hash, topology, declared_reads, declared_writes)
     }
 
-    /// Forward-detect conflicts as a remote provision batch commits.
+    /// Forward-detect conflicts as a remote provisions commits.
     /// Returns any conflicts where a local tx loses against the incoming
-    /// batch.
+    /// provisions.
     pub fn detect_conflicts(
         &mut self,
-        batch: &Provision,
+        provisions: &Provisions,
         committed_at: WeightedTimestamp,
     ) -> Vec<DetectedConflict> {
-        self.conflict_detector.detect_conflicts(batch, committed_at)
+        self.conflict_detector
+            .detect_conflicts(provisions, committed_at)
     }
 
     /// Drop the conflict-detector's stored provision history older than
@@ -191,11 +196,11 @@ mod tests {
         ShardGroupId(n)
     }
 
-    fn make_provision_batch(
+    fn make_provisions(
         source: ShardGroupId,
         block_height: BlockHeight,
         tx_hashes: Vec<TxHash>,
-    ) -> Arc<Provision> {
+    ) -> Arc<Provisions> {
         let transactions: Vec<TxEntries> = tx_hashes
             .into_iter()
             .map(|tx_hash| TxEntries {
@@ -204,7 +209,7 @@ mod tests {
                 target_nodes: vec![],
             })
             .collect();
-        Arc::new(Provision::new(
+        Arc::new(Provisions::new(
             source,
             block_height,
             MerkleInclusionProof::dummy(),
@@ -230,13 +235,13 @@ mod tests {
         assert!(!t.is_fully_provisioned(&tx));
 
         // Only shard 1 landed.
-        let batch1 = make_provision_batch(shard(1), BlockHeight(5), vec![tx]);
-        t.absorb_batch(&batch1, shard(0));
+        let batch1 = make_provisions(shard(1), BlockHeight(5), vec![tx]);
+        t.absorb_provisions(&batch1, shard(0));
         assert!(!t.is_fully_provisioned(&tx));
 
         // Shard 2 lands → fully provisioned.
-        let batch2 = make_provision_batch(shard(2), BlockHeight(5), vec![tx]);
-        t.absorb_batch(&batch2, shard(0));
+        let batch2 = make_provisions(shard(2), BlockHeight(5), vec![tx]);
+        t.absorb_provisions(&batch2, shard(0));
         assert!(t.is_fully_provisioned(&tx));
     }
 
@@ -244,37 +249,37 @@ mod tests {
     fn is_fully_provisioned_false_without_required_entry() {
         let mut t = ProvisioningTracker::new();
         let tx = TxHash::from_raw(Hash::from_bytes(b"tx"));
-        // Absorbed batch records `received[tx]` but there's no `required` —
+        // Absorbed provisions records `received[tx]` but there's no `required` —
         // the query must not report fully-provisioned just because
         // anything landed.
-        let batch = make_provision_batch(shard(1), BlockHeight(5), vec![tx]);
-        t.absorb_batch(&batch, shard(0));
+        let provisions = make_provisions(shard(1), BlockHeight(5), vec![tx]);
+        t.absorb_provisions(&provisions, shard(0));
         assert!(!t.is_fully_provisioned(&tx));
     }
 
     #[test]
-    fn absorb_batch_returns_touched_tx_hashes_in_order() {
+    fn absorb_provisions_returns_touched_tx_hashes_in_order() {
         let mut t = ProvisioningTracker::new();
         let tx_a = TxHash::from_raw(Hash::from_bytes(b"a"));
         let tx_b = TxHash::from_raw(Hash::from_bytes(b"b"));
-        let batch = make_provision_batch(shard(1), BlockHeight(5), vec![tx_a, tx_b]);
-        let touched = t.absorb_batch(&batch, shard(0));
+        let provisions = make_provisions(shard(1), BlockHeight(5), vec![tx_a, tx_b]);
+        let touched = t.absorb_provisions(&provisions, shard(0));
         assert_eq!(touched, vec![tx_a, tx_b]);
     }
 
     #[test]
-    fn absorb_batch_populates_verified_and_received_maps() {
+    fn absorb_provisions_populates_verified_and_received_maps() {
         let mut t = ProvisioningTracker::new();
         let tx = TxHash::from_raw(Hash::from_bytes(b"tx"));
-        let batch = make_provision_batch(shard(1), BlockHeight(5), vec![tx]);
-        t.absorb_batch(&batch, shard(0));
+        let provisions = make_provisions(shard(1), BlockHeight(5), vec![tx]);
+        t.absorb_provisions(&provisions, shard(0));
 
         assert_eq!(t.verified_len(), 1);
         assert_eq!(t.received_len(), 1);
         assert_eq!(
             t.verified.get(&tx).map(|v| v.len()).unwrap_or(0),
             1,
-            "one provision recorded per batch entry"
+            "one provision recorded per provisions entry"
         );
     }
 
@@ -282,12 +287,12 @@ mod tests {
     fn absorb_multiple_batches_for_same_tx_accumulates() {
         let mut t = ProvisioningTracker::new();
         let tx = TxHash::from_raw(Hash::from_bytes(b"tx"));
-        t.absorb_batch(
-            &make_provision_batch(shard(1), BlockHeight(5), vec![tx]),
+        t.absorb_provisions(
+            &make_provisions(shard(1), BlockHeight(5), vec![tx]),
             shard(0),
         );
-        t.absorb_batch(
-            &make_provision_batch(shard(2), BlockHeight(5), vec![tx]),
+        t.absorb_provisions(
+            &make_provisions(shard(2), BlockHeight(5), vec![tx]),
             shard(0),
         );
 
@@ -306,8 +311,8 @@ mod tests {
         let mut t = ProvisioningTracker::new();
         let tx = TxHash::from_raw(Hash::from_bytes(b"tx"));
         t.record_required(tx, [shard(1)].into_iter().collect());
-        let batch = make_provision_batch(shard(1), BlockHeight(5), vec![tx]);
-        t.absorb_batch(&batch, shard(0));
+        let provisions = make_provisions(shard(1), BlockHeight(5), vec![tx]);
+        t.absorb_provisions(&provisions, shard(0));
         assert!(t.is_fully_provisioned(&tx));
 
         t.remove_tx(&tx);

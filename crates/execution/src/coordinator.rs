@@ -40,7 +40,7 @@
 use hyperscale_core::{Action, ProtocolEvent, ProvisionRequest};
 use hyperscale_types::{
     Attempt, Block, BlockHash, BlockHeight, BloomFilter, ExecutionCertificate, ExecutionVote,
-    GlobalReceiptRoot, LocalExecutionEntry, NodeId, Provision, ReceiptBundle, RoutableTransaction,
+    GlobalReceiptRoot, LocalExecutionEntry, NodeId, Provisions, ReceiptBundle, RoutableTransaction,
     ShardGroupId, TopologySnapshot, TransactionDecision, TxHash, TxOutcome, ValidatorId,
     WaveCertificate, WaveId, WaveIdHash, WeightedTimestamp, WAVE_TIMEOUT,
 };
@@ -434,15 +434,15 @@ impl ExecutionCoordinator {
         completions
     }
 
-    /// Absorb a completed execution batch: route receipts into the cache and
+    /// Absorb a completed execution provisions: route receipts into the cache and
     /// record per-tx outcomes on the wave.
     ///
-    /// Returns any actions that became newly possible because the batch
+    /// Returns any actions that became newly possible because the provisions
     /// unblocked a wave that was waiting only on local receipts. In
     /// particular, a cross-shard wave whose local EC arrived before this
     /// validator's engine finished will defer finalization under the
     /// `has_local_receipts_for_non_aborted` gate in `WaveState::is_complete`;
-    /// once the batch lands, the wave becomes complete and we finalize
+    /// once the provisions lands, the wave becomes complete and we finalize
     /// here rather than waiting for some unrelated trigger.
     pub fn on_execution_batch_completed(
         &mut self,
@@ -553,25 +553,25 @@ impl ExecutionCoordinator {
     ///
     /// Two phases — absorb all batches first, then detect conflicts. If
     /// interleaved, the `already_provisioned` guard in phase 2 reads a
-    /// partially-absorbed map whose contents depend on batch iteration order,
+    /// partially-absorbed map whose contents depend on provisions iteration order,
     /// which diverges abort decisions across validators.
     fn apply_committed_provisions(
         &mut self,
         topology: &TopologySnapshot,
-        batches: &[Arc<Provision>],
+        batches: &[Arc<Provisions>],
         committed_height: BlockHeight,
         committed_ts: WeightedTimestamp,
     ) -> Vec<Action> {
         // Sort for deterministic phase-2 iteration (logs, action vector order).
-        let mut ordered: Vec<&Arc<Provision>> = batches.iter().collect();
+        let mut ordered: Vec<&Arc<Provisions>> = batches.iter().collect();
         ordered.sort_by_key(|b| b.hash());
 
         // Phase 1: absorb all provisions. Populated unconditionally so
         // `setup_waves_and_dispatch` can replay them at wave-creation time.
         let local_shard = topology.local_shard();
         let mut affected_waves: BTreeSet<WaveId> = BTreeSet::new();
-        for batch in &ordered {
-            for tx_hash in self.provisioning.absorb_batch(batch, local_shard) {
+        for provisions in &ordered {
+            for tx_hash in self.provisioning.absorb_provisions(provisions, local_shard) {
                 if let Some(wave_id) = self.waves.wave_assignment(&tx_hash) {
                     affected_waves.insert(wave_id);
                 }
@@ -582,9 +582,9 @@ impl ExecutionCoordinator {
         // provisioned set. A conflict is skipped if the loser is already
         // fully provisioned (execution can proceed) or its wave has already
         // dispatched (inert to mid-flight input).
-        for batch in &ordered {
-            let source_shard = batch.source_shard;
-            for conflict in self.provisioning.detect_conflicts(batch, committed_ts) {
+        for provisions in &ordered {
+            let source_shard = provisions.source_shard;
+            for conflict in self.provisioning.detect_conflicts(provisions, committed_ts) {
                 let loser = conflict.loser_tx;
                 if self.provisioning.is_fully_provisioned(&loser) {
                     continue;
@@ -734,7 +734,7 @@ impl ExecutionCoordinator {
         self.maybe_trigger_vote_verification(wave_id)
     }
 
-    /// Check if we should trigger batch verification for a wave's votes.
+    /// Check if we should trigger provisions verification for a wave's votes.
     fn maybe_trigger_vote_verification(&mut self, wave_id: WaveId) -> Vec<Action> {
         let Some(tracker) = self.waves.get_tracker_mut(&wave_id) else {
             return vec![];
@@ -755,7 +755,7 @@ impl ExecutionCoordinator {
             block_hash = ?block_hash,
             wave = %wave_id,
             vote_count = votes.len(),
-            "Dispatching execution vote batch verification"
+            "Dispatching execution vote provisions verification"
         );
         vec![Action::VerifyAndAggregateExecutionVotes {
             wave_id,
@@ -784,7 +784,7 @@ impl ExecutionCoordinator {
         actions
     }
 
-    /// Handle batch execution vote verification completed.
+    /// Handle provisions execution vote verification completed.
     pub fn on_votes_verified(
         &mut self,
         topology: &TopologySnapshot,
@@ -1308,7 +1308,7 @@ impl ExecutionCoordinator {
         block_hash: BlockHash,
         header: &hyperscale_types::BlockHeader,
         transactions: &[Arc<RoutableTransaction>],
-        provisions: &[Arc<Provision>],
+        provisions: &[Arc<Provisions>],
     ) -> Vec<Action> {
         let height = header.height;
         let mut actions = Vec::new();

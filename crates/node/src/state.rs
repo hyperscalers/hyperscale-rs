@@ -9,7 +9,7 @@ use hyperscale_remote_headers::RemoteHeaderCoordinator;
 use hyperscale_topology::TopologyState;
 use hyperscale_types::{
     Block, BlockHash, BlockHeader, BlockManifest, CertifiedBlock, FinalizedWave, LocalTimestamp,
-    Provision, QuorumCertificate, RoutableTransaction, ShardGroupId, StateRoot, TopologySnapshot,
+    Provisions, QuorumCertificate, RoutableTransaction, ShardGroupId, StateRoot, TopologySnapshot,
     TxHash,
 };
 use std::sync::Arc;
@@ -47,7 +47,7 @@ pub struct NodeStateMachine {
     /// Provision coordination for cross-shard transactions.
     provisions: ProvisionCoordinator,
 
-    /// Retains outbound provision batches until the target shard's
+    /// Retains outbound provisions until the target shard's
     /// execution certificates ACK every transaction they contain.
     outbound_provisions: OutboundProvisionTracker,
 
@@ -76,7 +76,7 @@ impl std::fmt::Debug for NodeStateMachine {
 struct ProposalInputs {
     ready_txs: Vec<Arc<RoutableTransaction>>,
     finalized_waves: Vec<Arc<FinalizedWave>>,
-    provision_batches: Vec<Arc<Provision>>,
+    provisions: Vec<Arc<Provisions>>,
 }
 
 impl NodeStateMachine {
@@ -191,12 +191,12 @@ impl NodeStateMachine {
             self.mempool
                 .ready_transactions(max_txs, pending_txs, pending_certs, self.now);
         let finalized_waves = self.execution.get_finalized_waves();
-        let provision_batches = self.provisions.queued_provisions(self.now);
+        let provisions = self.provisions.queued_provisions(self.now);
 
         ProposalInputs {
             ready_txs,
             finalized_waves,
-            provision_batches,
+            provisions,
         }
     }
 
@@ -268,7 +268,7 @@ impl NodeStateMachine {
             self.topology.snapshot(),
             &inputs.ready_txs,
             inputs.finalized_waves,
-            inputs.provision_batches,
+            inputs.provisions,
         )
     }
 
@@ -306,7 +306,7 @@ impl NodeStateMachine {
             manifest,
             |h| self.mempool.get_transaction(h),
             |h| self.execution.get_finalized_wave_by_hash(h),
-            |h| self.provisions.get_batch_by_hash(h),
+            |h| self.provisions.get_provisions_by_hash(h),
         )
     }
 
@@ -328,7 +328,7 @@ impl NodeStateMachine {
             qc,
             &inputs.ready_txs,
             inputs.finalized_waves,
-            inputs.provision_batches,
+            inputs.provisions,
         )
     }
 
@@ -610,33 +610,34 @@ impl StateMachine for NodeStateMachine {
             }
 
             // ── Provision ───────────────────────────────────────────────
-            ProtocolEvent::StateProvisionReceived { batch } => self
+            ProtocolEvent::StateProvisionsReceived { provisions } => self
                 .provisions
-                .on_state_provisions_received(self.topology.snapshot(), batch),
-            ProtocolEvent::StateProvisionVerified {
-                batch,
+                .on_state_provisions_received(self.topology.snapshot(), provisions),
+            ProtocolEvent::StateProvisionsVerified {
+                provisions,
                 committed_header,
                 valid,
             } => self.provisions.on_state_provisions_verified(
                 self.topology.snapshot(),
-                batch,
+                provisions,
                 committed_header,
                 valid,
                 self.now,
             ),
-            ProtocolEvent::ProvisionVerified { batch, .. } => {
+            ProtocolEvent::ProvisionsVerified { provisions, .. } => {
                 let mut actions = self
                     .bft
-                    .check_pending_blocks_for_provision(self.topology.snapshot(), &batch);
-                // New provision batch queued — signal for event-driven proposal.
+                    .check_pending_blocks_for_provision(self.topology.snapshot(), &provisions);
+                // New provisions queued — signal for event-driven proposal.
                 actions.push(Action::Continuation(ProtocolEvent::ContentAvailable));
                 actions
             }
             ProtocolEvent::OutboundProvisionBroadcast {
-                batch,
+                provisions,
                 target_shard,
             } => {
-                self.outbound_provisions.on_broadcast(batch, target_shard);
+                self.outbound_provisions
+                    .on_broadcast(provisions, target_shard);
                 vec![]
             }
             ProtocolEvent::OutboundEcObserved {

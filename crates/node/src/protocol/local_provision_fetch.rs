@@ -1,11 +1,11 @@
 //! Local provision fetch protocol state machine.
 //!
-//! Fetches missing provision batch data from the block proposer or local peers.
+//! Fetches missing provisions data from the block proposer or local peers.
 //! Mirrors `TransactionFetchProtocol` — tracks missing hashes per block, rotates
 //! through peers on failure.
 
 use hyperscale_metrics as metrics;
-use hyperscale_types::{BlockHash, Provision, ProvisionHash, ValidatorId};
+use hyperscale_types::{BlockHash, ProvisionHash, Provisions, ValidatorId};
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use tracing::{debug, info, trace};
@@ -31,18 +31,18 @@ impl Default for LocalProvisionFetchConfig {
 /// Inputs to the local provision fetch protocol.
 #[derive(Debug)]
 pub enum LocalProvisionFetchInput {
-    /// Request provision batches for a pending block.
+    /// Request provisions for a pending block.
     Request {
         block_hash: BlockHash,
         proposer: ValidatorId,
         batch_hashes: Vec<ProvisionHash>,
     },
-    /// Provision batches were received. `missing_hashes` lists requested
+    /// Provisions were received. `missing_hashes` lists requested
     /// hashes the peer reported as absent, so the protocol can reclaim
     /// them for retry without a per-peer in-flight heuristic.
     Received {
         block_hash: BlockHash,
-        batches: Vec<Arc<Provision>>,
+        batches: Vec<Arc<Provisions>>,
         missing_hashes: Vec<ProvisionHash>,
     },
     /// A fetch operation failed.
@@ -59,14 +59,14 @@ pub enum LocalProvisionFetchInput {
 /// Outputs from the local provision fetch protocol.
 #[derive(Debug)]
 pub enum LocalProvisionFetchOutput {
-    /// Request the runner to fetch provision batches from a peer.
+    /// Request the runner to fetch provisions from a peer.
     Fetch {
         block_hash: BlockHash,
         proposer: ValidatorId,
         batch_hashes: Vec<ProvisionHash>,
     },
-    /// Deliver fetched provision batches to BFT.
-    Deliver { batches: Vec<Arc<Provision>> },
+    /// Deliver fetched provisions to BFT.
+    Deliver { batches: Vec<Arc<Provisions>> },
 }
 
 /// Per-block fetch state.
@@ -248,7 +248,7 @@ impl LocalProvisionFetchProtocol {
     fn handle_received(
         &mut self,
         block_hash: BlockHash,
-        batches: Vec<Arc<Provision>>,
+        batches: Vec<Arc<Provisions>>,
         missing_hashes: Vec<ProvisionHash>,
     ) -> Vec<LocalProvisionFetchOutput> {
         let Some(state) = self.fetches.get_mut(&block_hash) else {

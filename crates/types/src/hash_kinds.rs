@@ -53,17 +53,17 @@ hash_newtype!(
     ///
     /// Computed from the content fields (source shard, block height, proof,
     /// transactions) at construction / deserialization. Used as the fetch
-    /// key, cache key, and manifest leaf for cross-shard provision batches.
+    /// key, cache key, and manifest leaf for cross-shard provisions.
     pub ProvisionHash,
     "ProvisionHash"
 );
 
 hash_newtype!(
     /// Per-target-shard merkle root over the tx hashes destined for that
-    /// target in a block's cross-shard provision batches.
+    /// target in a block's cross-shard provisions.
     ///
     /// Populated in [`BlockHeader::provision_tx_roots`](crate::BlockHeader)
-    /// and verified by target shards against their received `ProvisionBatch`
+    /// and verified by target shards against their received `Provisions`
     /// to detect a proposer omitting transactions.
     pub ProvisionTxRoot,
     "ProvisionTxRoot"

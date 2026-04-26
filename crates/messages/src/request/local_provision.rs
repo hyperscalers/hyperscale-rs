@@ -1,4 +1,4 @@
-//! Local provision batch fetch request (intra-shard DA).
+//! Local provisions fetch request (intra-shard DA).
 
 use crate::response::GetLocalProvisionsResponse;
 #[cfg(test)]
@@ -6,17 +6,17 @@ use hyperscale_types::Hash;
 use hyperscale_types::{BlockHash, MessagePriority, NetworkMessage, ProvisionHash, Request};
 use sbor::prelude::BasicSbor;
 
-/// Request to fetch provision batch data for a pending block.
+/// Request to fetch provisions data for a pending block.
 ///
 /// Used when a validator receives a block header with `provision_hashes`
-/// but doesn't have the batch data locally (missed the gossip from the source shard).
+/// but doesn't have the provisions locally (missed the gossip from the source shard).
 /// Same pattern as `GetTransactionsRequest` — tries the proposer first, rotates to peers.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct GetLocalProvisionsRequest {
-    /// Hash of the block that needs these provision batches.
+    /// Hash of the block that needs these provisions.
     pub block_hash: BlockHash,
 
-    /// Hashes of the provision batches being requested.
+    /// Hashes of the provisions being requested.
     pub batch_hashes: Vec<ProvisionHash>,
 }
 

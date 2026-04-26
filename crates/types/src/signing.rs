@@ -110,7 +110,7 @@ pub fn block_header_message(
     message
 }
 
-/// Domain tag for state provision batch gossip.
+/// Domain tag for state provisions gossip.
 ///
 /// Format: `STATE_PROVISION_BATCH` || source_shard || target_shard || block_height || H(tx_hashes)
 ///
@@ -119,13 +119,13 @@ pub fn block_header_message(
 /// doing expensive merkle proof verification.
 pub const DOMAIN_STATE_PROVISION_BATCH: &[u8] = b"STATE_PROVISION_BATCH";
 
-/// Build the signing message for a state provision batch gossip.
+/// Build the signing message for a state provisions gossip.
 ///
 /// The message covers source shard, target shard, block height, and a
 /// digest of the transaction hashes in the batch. This is cheap to
 /// reconstruct at verification (no re-serialization needed) while binding
 /// the signature to the specific batch contents.
-pub fn state_provision_batch_message(
+pub fn state_provisions_message(
     source_shard: ShardGroupId,
     target_shard: ShardGroupId,
     block_height: BlockHeight,
@@ -307,7 +307,7 @@ mod tests {
     }
 
     #[test]
-    fn test_state_provision_batch_message_deterministic() {
+    fn test_state_provisions_message_deterministic() {
         use crate::StateProvision;
         use std::sync::Arc;
 
@@ -319,13 +319,13 @@ mod tests {
             entries: Arc::new(vec![]),
         }];
 
-        let msg1 = state_provision_batch_message(
+        let msg1 = state_provisions_message(
             ShardGroupId(1),
             ShardGroupId(2),
             BlockHeight(10),
             &provisions,
         );
-        let msg2 = state_provision_batch_message(
+        let msg2 = state_provisions_message(
             ShardGroupId(1),
             ShardGroupId(2),
             BlockHeight(10),

@@ -1,4 +1,4 @@
-//! Shared provision-batch store.
+//! Shared provision store.
 //!
 //! Single source of truth for provision bodies, keyed by content hash.
 //! Held behind an `Arc` so both the single-threaded provisions state
@@ -7,23 +7,23 @@
 //!
 //! Two writers drive this store:
 //!
-//! - Inbound path ([`crate::state::ProvisionCoordinator`]) inserts batches
-//!   received from remote shards via [`Self::insert`] and evicts them via
-//!   the post-commit retention sweep.
+//! - Inbound path ([`crate::coordinator::ProvisionCoordinator`]) inserts
+//!   provisions received from remote shards via [`Self::insert`] and
+//!   evicts them via the post-commit retention sweep.
 //! - Outbound path ([`crate::outbound::OutboundProvisionTracker`]) inserts
-//!   batches our proposer generated via [`Self::insert_outbound`], which
-//!   also populates a `(source_block_height, target_shard)` index used by
-//!   the cross-shard `provision.request` fast path. Eviction is gated on
-//!   terminal execution certificates from the target shard.
+//!   provisions our proposer generated via [`Self::insert_outbound`],
+//!   which also populates a `(source_block_height, target_shard)` index
+//!   used by the cross-shard `provision.request` fast path. Eviction is
+//!   gated on terminal execution certificates from the target shard.
 
 use hyperscale_types::{
-    BlockHeight, BloomFilter, Provision, ProvisionHash, ShardGroupId, DEFAULT_FPR,
+    BlockHeight, BloomFilter, ProvisionHash, Provisions, ShardGroupId, DEFAULT_FPR,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 pub struct ProvisionStore {
-    inner: Mutex<HashMap<ProvisionHash, Arc<Provision>>>,
+    inner: Mutex<HashMap<ProvisionHash, Arc<Provisions>>>,
     outbound_index: Mutex<HashMap<(BlockHeight, ShardGroupId), HashSet<ProvisionHash>>>,
 }
 
@@ -35,26 +35,26 @@ impl ProvisionStore {
         }
     }
 
-    /// Insert a batch. Idempotent: re-inserting the same hash is a no-op.
+    /// Insert provisions. Idempotent: re-inserting the same hash is a no-op.
     ///
     /// Inbound callers use this; the secondary outbound index is not
     /// touched.
-    pub fn insert(&self, batch: Arc<Provision>) {
-        let hash = batch.hash();
+    pub fn insert(&self, provisions: Arc<Provisions>) {
+        let hash = provisions.hash();
         let mut g = self.inner.lock().unwrap();
-        g.entry(hash).or_insert(batch);
+        g.entry(hash).or_insert(provisions);
     }
 
-    /// Insert a batch our proposer generated for `target_shard`. Populates
-    /// the `(source_block_height, target_shard)` index so cross-shard
-    /// `provision.request` handlers can serve from the cache before
-    /// regenerating from RocksDB. Idempotent.
-    pub fn insert_outbound(&self, batch: Arc<Provision>, target_shard: ShardGroupId) {
-        let hash = batch.hash();
-        let block_height = batch.block_height;
+    /// Insert provisions our proposer generated for `target_shard`.
+    /// Populates the `(source_block_height, target_shard)` index so
+    /// cross-shard `provision.request` handlers can serve from the cache
+    /// before regenerating from RocksDB. Idempotent.
+    pub fn insert_outbound(&self, provisions: Arc<Provisions>, target_shard: ShardGroupId) {
+        let hash = provisions.hash();
+        let block_height = provisions.block_height;
         {
             let mut g = self.inner.lock().unwrap();
-            g.entry(hash).or_insert(batch);
+            g.entry(hash).or_insert(provisions);
         }
         let mut idx = self.outbound_index.lock().unwrap();
         idx.entry((block_height, target_shard))
@@ -62,19 +62,19 @@ impl ProvisionStore {
             .insert(hash);
     }
 
-    /// Look up a batch by content hash.
-    pub fn get(&self, hash: &ProvisionHash) -> Option<Arc<Provision>> {
+    /// Look up provisions by content hash.
+    pub fn get(&self, hash: &ProvisionHash) -> Option<Arc<Provisions>> {
         self.inner.lock().unwrap().get(hash).cloned()
     }
 
-    /// Fetch every outbound batch registered for `(block_height, target_shard)`.
-    /// Returns an empty vec if nothing is cached — the caller should fall
-    /// through to RocksDB regeneration.
+    /// Fetch every outbound provisions entry registered for
+    /// `(block_height, target_shard)`. Returns an empty vec if nothing is
+    /// cached — the caller should fall through to RocksDB regeneration.
     pub fn get_outbound(
         &self,
         block_height: BlockHeight,
         target_shard: ShardGroupId,
-    ) -> Vec<Arc<Provision>> {
+    ) -> Vec<Arc<Provisions>> {
         let idx = self.outbound_index.lock().unwrap();
         let Some(hashes) = idx.get(&(block_height, target_shard)) else {
             return Vec::new();
@@ -88,9 +88,9 @@ impl ProvisionStore {
             .collect()
     }
 
-    /// Evict batches whose retention window has elapsed. Returns the number
-    /// of entries actually removed from the primary map. Also scrubs the
-    /// outbound secondary index for the evicted hashes.
+    /// Evict provisions whose retention window has elapsed. Returns the
+    /// number of entries actually removed from the primary map. Also
+    /// scrubs the outbound secondary index for the evicted hashes.
     pub fn evict(&self, hashes: impl IntoIterator<Item = ProvisionHash>) -> usize {
         let hashes: Vec<ProvisionHash> = hashes.into_iter().collect();
         let removed = {
@@ -141,8 +141,8 @@ mod tests {
     use super::*;
     use hyperscale_types::{MerkleInclusionProof, TxEntries, TxHash};
 
-    fn make_batch(tx_seed: u8, height: u64) -> Arc<Provision> {
-        Arc::new(Provision::new(
+    fn make_provisions(tx_seed: u8, height: u64) -> Arc<Provisions> {
+        Arc::new(Provisions::new(
             ShardGroupId(1),
             BlockHeight(height),
             MerkleInclusionProof::dummy(),
@@ -158,20 +158,22 @@ mod tests {
     fn empty_store_yields_filter_that_matches_nothing() {
         let store = ProvisionStore::new();
         let bf = store.provision_bloom_snapshot().expect("empty sizing ok");
-        let absent = make_batch(99, 1);
+        let absent = make_provisions(99, 1);
         assert!(!bf.contains(&absent.hash()));
     }
 
     #[test]
     fn snapshot_contains_every_cached_hash() {
         let store = ProvisionStore::new();
-        let batches: Vec<_> = (0u8..20).map(|i| make_batch(i, 1 + i as u64)).collect();
-        for b in &batches {
-            store.insert(b.clone());
+        let entries: Vec<_> = (0u8..20)
+            .map(|i| make_provisions(i, 1 + i as u64))
+            .collect();
+        for p in &entries {
+            store.insert(p.clone());
         }
         let bf = store.provision_bloom_snapshot().unwrap();
-        for b in &batches {
-            assert!(bf.contains(&b.hash()), "missing cached batch");
+        for p in &entries {
+            assert!(bf.contains(&p.hash()), "missing cached provisions");
         }
     }
 }

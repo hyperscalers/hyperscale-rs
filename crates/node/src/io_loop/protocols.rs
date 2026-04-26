@@ -296,7 +296,7 @@ where
     /// Process LocalProvisionFetchProtocol outputs.
     ///
     /// `Fetch` uses the Network trait to request batches from the proposer/local peers.
-    /// `Deliver` feeds each batch into the state machine via `ProvisionVerified`.
+    /// `Deliver` feeds each batch into the state machine via `ProvisionsVerified`.
     pub(super) fn process_local_provision_fetch_outputs(
         &mut self,
         outputs: Vec<LocalProvisionFetchOutput>,
@@ -343,9 +343,9 @@ where
                     // proves the batch matches what the proposer committed
                     // to in BlockManifest; it doesn't catch a proposer that
                     // committed to an incomplete batch.
-                    for batch in batches {
-                        self.feed_event(ProtocolEvent::StateProvisionReceived {
-                            batch: (*batch).clone(),
+                    for provisions in batches {
+                        self.feed_event(ProtocolEvent::StateProvisionsReceived {
+                            provisions: (*provisions).clone(),
                         });
                     }
                 }
@@ -356,7 +356,7 @@ where
     /// Process ProvisionFetchProtocol outputs.
     ///
     /// `Fetch` uses the Network trait to send a single-peer request.
-    /// `Deliver` feeds provisions into the state machine via `StateProvisionReceived`.
+    /// `Deliver` feeds provisions into the state machine via `StateProvisionsReceived`.
     pub(super) fn process_provision_fetch_outputs(&mut self, outputs: Vec<ProvisionFetchOutput>) {
         for output in outputs {
             match output {
@@ -391,14 +391,14 @@ where
                                             target_nodes: vec![],
                                         })
                                         .collect();
-                                    let batch = hyperscale_types::Provision::new(
+                                    let provisions = hyperscale_types::Provisions::new(
                                         source_shard,
                                         block_height,
                                         proof,
                                         transactions,
                                     );
-                                    let _ =
-                                        sender.send(NodeInput::ProvisionFetchReceived { batch });
+                                    let _ = sender
+                                        .send(NodeInput::ProvisionFetchReceived { provisions });
                                 }
                                 None => {
                                     // Peer cannot serve (state version GC'd) → fail
@@ -418,9 +418,9 @@ where
                         }),
                     );
                 }
-                ProvisionFetchOutput::Deliver { batch } => {
-                    if !batch.transactions.is_empty() {
-                        self.feed_event(ProtocolEvent::StateProvisionReceived { batch });
+                ProvisionFetchOutput::Deliver { provisions } => {
+                    if !provisions.transactions.is_empty() {
+                        self.feed_event(ProtocolEvent::StateProvisionsReceived { provisions });
                     }
                 }
             }

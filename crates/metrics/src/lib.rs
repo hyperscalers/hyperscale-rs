@@ -149,18 +149,18 @@ pub struct MemoryMetrics {
     // ── Provision ──
     /// Verified remote shard headers (provisions local cache).
     pub prov_verified_remote_headers: usize,
-    /// Provision batches waiting for corresponding header.
+    /// Provisions waiting for corresponding header.
     pub prov_pending_provisions: usize,
-    /// Verified provision batches.
-    pub prov_verified_batches: usize,
+    /// Verified provisions.
+    pub prov_verified_provisions: usize,
     /// Expected provisions that haven't arrived yet.
     pub prov_expected_provisions: usize,
-    /// Provision batch lookup by hash.
-    pub prov_batches_by_hash: usize,
-    /// Provision batches queued for processing.
-    pub prov_queued_provision_batches: usize,
-    /// Tombstones for committed provision batches.
-    pub prov_committed_batch_tombstones: usize,
+    /// Content-addressed lookup count.
+    pub prov_provisions_by_hash: usize,
+    /// Provisions queued for processing.
+    pub prov_queued_provisions: usize,
+    /// Tombstones for committed provisions.
+    pub prov_committed_tombstones: usize,
 
     // ── Node (io_loop) ──
     /// LRU cache of transaction bodies (fixed capacity, ~50k).

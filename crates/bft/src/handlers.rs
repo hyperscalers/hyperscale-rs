@@ -285,7 +285,7 @@ pub fn verify_transaction_root(
     root_valid && windows_valid
 }
 
-/// Verify a block's per-target-shard provision-batch commitments.
+/// Verify a block's per-target-shard provisions commitments.
 ///
 /// Recomputes the per-target merkle roots from the block's transactions and
 /// compares against the header's claimed map by full equality. A missing or
@@ -442,7 +442,7 @@ pub fn build_proposal<S: ChainWriter + SubstateStore>(
     certificates: Vec<Arc<FinalizedWave>>,
     local_shard: ShardGroupId,
     topology: &TopologySnapshot,
-    provisions: Vec<Arc<hyperscale_types::Provision>>,
+    provisions: Vec<Arc<hyperscale_types::Provisions>>,
     parent_in_flight: u32,
     finalized_tx_count: u32,
     pending_snapshots: &[Arc<hyperscale_storage::JmtSnapshot>],

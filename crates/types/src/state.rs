@@ -96,11 +96,11 @@ impl StateEntry {
 
 /// State provision from a source shard to a target shard.
 ///
-/// Only the block proposer sends these. Provision are always transported
-/// in a batch (per block) alongside a single aggregated merkle proof that
-/// covers all entries across all provisions in that batch. The proof lives
-/// at the batch level (e.g. `StateProvisionNotification`) to avoid
-/// duplicating it per provision during serialization.
+/// Only the block proposer sends these. Provisions are always transported
+/// per source block alongside a single aggregated merkle proof that
+/// covers every entry across all `StateProvision` items for that block.
+/// The proof lives once on the wrapper (e.g. `StateProvisionNotification`)
+/// to avoid duplicating it per item during serialization.
 #[derive(Debug, Clone)]
 pub struct StateProvision {
     /// Hash of the transaction this provision is for.

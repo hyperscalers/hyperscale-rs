@@ -8,7 +8,7 @@
 use hyperscale_types::{
     Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, BlockVote, CertifiedBlock,
     CommittedBlockHeader, EpochConfig, EpochId, ExecutionCertificate, ExecutionVote, FinalizedWave,
-    Provision, QuorumCertificate, Round, RoutableTransaction, ShardGroupId, TxHash, TxOutcome,
+    Provisions, QuorumCertificate, Round, RoutableTransaction, ShardGroupId, TxHash, TxOutcome,
     ValidatorId, WaveCertificate, WaveId, WeightedTimestamp,
 };
 use std::sync::Arc;
@@ -180,35 +180,35 @@ pub enum ProtocolEvent {
         block: Arc<Block>,
         block_hash: BlockHash,
         finalized_waves: Vec<Arc<FinalizedWave>>,
-        provisions: Vec<Arc<Provision>>,
+        provisions: Vec<Arc<Provisions>>,
     },
 
     // ═══════════════════════════════════════════════════════════════════════
     // Provision
     // ═══════════════════════════════════════════════════════════════════════
-    /// A provision batch has been verified — ready for downstream consumption.
+    /// A provisions has been verified — ready for downstream consumption.
     ///
     /// `source_block_ts` is the BFT-authenticated weighted timestamp of the
     /// source shard's committing QC. Downstream consumers (notably the
     /// io-loop provision cache) anchor retention on this so eviction is
     /// deterministic across validators.
-    ProvisionVerified {
-        batch: Arc<Provision>,
+    ProvisionsVerified {
+        provisions: Arc<Provisions>,
         source_block_ts: WeightedTimestamp,
     },
 
-    /// Received a provision batch from a source shard (light-client path).
+    /// Received provisions from a source shard (light-client path).
     ///
-    /// All provisions in a batch share the same `(source_shard, block_height)`
+    /// All transactions share the same `(source_shard, block_height)`
     /// because they originate from a single `FetchAndBroadcastProvision` action.
-    StateProvisionReceived { batch: Provision },
+    StateProvisionsReceived { provisions: Provisions },
 
-    /// A provision batch our proposer generated was broadcast to a target
-    /// shard. Routed to the `OutboundProvisionTracker` so the batch can be
-    /// retained (and served from cache) until the target shard's execution
-    /// certificates acknowledge every transaction in it.
+    /// Provisions our proposer generated were broadcast to a target shard.
+    /// Routed to the `OutboundProvisionTracker` so they can be retained
+    /// (and served from cache) until the target shard's execution
+    /// certificates acknowledge every transaction in them.
     OutboundProvisionBroadcast {
-        batch: Arc<Provision>,
+        provisions: Arc<Provisions>,
         target_shard: ShardGroupId,
     },
 
@@ -223,12 +223,13 @@ pub enum ProtocolEvent {
 
     /// Batch-level provision verification completed.
     ///
-    /// The QC is verified once for the batch's attestation; merkle proofs are
-    /// checked against the verified state root. The committed header is returned
-    /// so the state machine can promote it without re-lookup.
-    StateProvisionVerified {
-        /// The verified provision batch.
-        batch: Provision,
+    /// The QC is verified once for the source block's attestation; merkle
+    /// proofs are checked against the verified state root. The committed
+    /// header is returned so the state machine can promote it without
+    /// re-lookup.
+    StateProvisionsVerified {
+        /// The verified provisions.
+        provisions: Provisions,
         /// The committed header whose QC passed verification.
         /// `None` if no candidate header passed QC verification.
         committed_header: Option<Arc<CommittedBlockHeader>>,
@@ -452,9 +453,9 @@ impl ProtocolEvent {
             ProtocolEvent::ProposalBuilt { .. } => "ProposalBuilt",
 
             // Provision
-            ProtocolEvent::ProvisionVerified { .. } => "ProvisionVerified",
-            ProtocolEvent::StateProvisionReceived { .. } => "StateProvisionReceived",
-            ProtocolEvent::StateProvisionVerified { .. } => "StateProvisionVerified",
+            ProtocolEvent::ProvisionsVerified { .. } => "ProvisionsVerified",
+            ProtocolEvent::StateProvisionsReceived { .. } => "StateProvisionsReceived",
+            ProtocolEvent::StateProvisionsVerified { .. } => "StateProvisionsVerified",
             ProtocolEvent::OutboundProvisionBroadcast { .. } => "OutboundProvisionBroadcast",
             ProtocolEvent::OutboundEcObserved { .. } => "OutboundEcObserved",
 

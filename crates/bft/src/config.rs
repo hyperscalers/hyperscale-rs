@@ -37,7 +37,7 @@ pub struct BftConfig {
     pub max_finalized_transactions_per_block: usize,
 
     /// Maximum remote-shard provision transactions per block, summed across
-    /// all provision batches. Oldest batches (FIFO queue order) are included
+    /// all provisions. Oldest batches (FIFO queue order) are included
     /// first; once the running total would exceed this cap, the rest stay
     /// queued for the next proposal. Bounds build/verify work and the
     /// per-block `local_provision.request` fetch fan-out on voters who
@@ -129,7 +129,7 @@ impl BftConfig {
     }
 
     /// Set the maximum provision transactions per block (summed across all
-    /// included provision batches).
+    /// included provisions).
     pub fn with_max_provision_transactions(mut self, max: usize) -> Self {
         self.max_provision_transactions_per_block = max;
         self

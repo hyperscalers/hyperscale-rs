@@ -112,23 +112,23 @@ where
                 // no merkle-proof recomputation.
                 let cached_outbound =
                     outbound_cache.get_outbound(req.block_height, req.target_shard);
-                if let Some(batch) = cached_outbound.first() {
+                if let Some(provisions) = cached_outbound.first() {
                     use hyperscale_messages::response::GetProvisionResponse;
                     use hyperscale_types::StateProvision;
-                    let provisions: Vec<StateProvision> = batch
+                    let state_provisions: Vec<StateProvision> = provisions
                         .transactions
                         .iter()
                         .map(|tx| StateProvision {
                             transaction_hash: tx.tx_hash,
                             target_shard: req.target_shard,
-                            source_shard: batch.source_shard,
-                            block_height: batch.block_height,
+                            source_shard: provisions.source_shard,
+                            block_height: provisions.block_height,
                             entries: Arc::new(tx.entries.clone()),
                         })
                         .collect();
                     return GetProvisionResponse {
-                        provisions: Some(provisions),
-                        proof: Some(batch.proof.clone()),
+                        provisions: Some(state_provisions),
+                        proof: Some(provisions.proof.clone()),
                     };
                 }
 
@@ -404,7 +404,7 @@ where
                 },
             );
 
-        // ── state.provision.batch → verify sender sig, then ProtocolEvent::StateProvisionReceived ─
+        // ── state.provision.batch → verify sender sig, then ProtocolEvent::StateProvisionsReceived ─
 
         let tx = self.event_sender.clone();
         let topology = self.topology.clone();
@@ -425,7 +425,7 @@ where
                         source_shard,
                         &msg,
                         &batch.sender_signature,
-                        "state_provision_batch",
+                        "state_provisions",
                         "state provision",
                     ) {
                         return;
@@ -445,15 +445,15 @@ where
                             target_nodes: vec![],
                         })
                         .collect();
-                    let batch = hyperscale_types::Provision::new(
+                    let provisions = hyperscale_types::Provisions::new(
                         source_shard,
                         block_height,
                         proof,
                         transactions,
                     );
-                    let _ = tx.send(NodeInput::Protocol(ProtocolEvent::StateProvisionReceived {
-                        batch,
-                    }));
+                    let _ = tx.send(NodeInput::Protocol(
+                        ProtocolEvent::StateProvisionsReceived { provisions },
+                    ));
                 },
             );
 

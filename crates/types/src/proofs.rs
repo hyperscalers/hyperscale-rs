@@ -90,18 +90,18 @@ impl TxEntries {
 }
 
 // ============================================================================
-// Provision
+// Provisions
 // ============================================================================
 
-/// A batch of provisions from a single source block.
+/// All provisions from a single source block, bundled together.
 ///
 /// Identifies the source block (for joining with `CommittedBlockHeader`)
 /// and carries the merkle proof plus per-transaction state entries.
 /// The QC and state_root are obtained from `CommittedBlockHeader` received
-/// via gossip — they don't travel with the provision batch.
+/// via gossip — they don't travel with the provisions.
 ///
 /// The content hash is computed eagerly at construction and on deserialization.
-pub struct Provision {
+pub struct Provisions {
     /// Source shard that committed this block.
     pub source_shard: ShardGroupId,
 
@@ -118,7 +118,7 @@ pub struct Provision {
     hash: ProvisionHash,
 }
 
-impl std::fmt::Debug for Provision {
+impl std::fmt::Debug for Provisions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Provision")
             .field("hash", &self.hash)
@@ -129,7 +129,7 @@ impl std::fmt::Debug for Provision {
     }
 }
 
-impl Clone for Provision {
+impl Clone for Provisions {
     fn clone(&self) -> Self {
         Self {
             source_shard: self.source_shard,
@@ -141,17 +141,17 @@ impl Clone for Provision {
     }
 }
 
-impl PartialEq for Provision {
+impl PartialEq for Provisions {
     fn eq(&self, other: &Self) -> bool {
         self.hash == other.hash
     }
 }
 
-impl Eq for Provision {}
+impl Eq for Provisions {}
 
 // Manual SBOR: the cached hash is derived, not serialized.
 impl<E: sbor::Encoder<sbor::NoCustomValueKind>> sbor::Encode<sbor::NoCustomValueKind, E>
-    for Provision
+    for Provisions
 {
     fn encode_value_kind(&self, encoder: &mut E) -> Result<(), sbor::EncodeError> {
         encoder.write_value_kind(sbor::ValueKind::Tuple)
@@ -168,7 +168,7 @@ impl<E: sbor::Encoder<sbor::NoCustomValueKind>> sbor::Encode<sbor::NoCustomValue
 }
 
 impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValueKind, D>
-    for Provision
+    for Provisions
 {
     fn decode_body_with_value_kind(
         decoder: &mut D,
@@ -197,13 +197,13 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
     }
 }
 
-impl sbor::Categorize<sbor::NoCustomValueKind> for Provision {
+impl sbor::Categorize<sbor::NoCustomValueKind> for Provisions {
     fn value_kind() -> sbor::ValueKind<sbor::NoCustomValueKind> {
         sbor::ValueKind::Tuple
     }
 }
 
-impl sbor::Describe<sbor::NoCustomTypeKind> for Provision {
+impl sbor::Describe<sbor::NoCustomTypeKind> for Provisions {
     const TYPE_ID: sbor::RustTypeId = sbor::RustTypeId::novel_with_code("Provision", &[], &[]);
 
     fn type_data() -> sbor::TypeData<sbor::NoCustomTypeKind, sbor::RustTypeId> {
@@ -211,8 +211,8 @@ impl sbor::Describe<sbor::NoCustomTypeKind> for Provision {
     }
 }
 
-impl Provision {
-    /// Create a new provision batch, computing the content hash eagerly.
+impl Provisions {
+    /// Create a new provisions, computing the content hash eagerly.
     pub fn new(
         source_shard: ShardGroupId,
         block_height: BlockHeight,
@@ -234,14 +234,15 @@ impl Provision {
         self.hash
     }
 
-    /// Deadline past which this batch is provably useless on every shard.
+    /// Deadline past which these provisions are provably useless on every
+    /// shard.
     ///
     /// `source_weighted_ts` is the source block's QC `weighted_timestamp`,
     /// available from the paired remote header. Past
     /// `source_weighted_ts + RETENTION_HORIZON` every tx that could have
-    /// referenced this batch's data has expired its `validity_range` and
+    /// referenced this data has expired its `validity_range` and
     /// completed (or aborted via the all-abort fallback) — no shard can
-    /// still reference this batch.
+    /// still reference these provisions.
     pub fn deadline(&self, source_weighted_ts: WeightedTimestamp) -> WeightedTimestamp {
         source_weighted_ts.plus(RETENTION_HORIZON)
     }
@@ -292,12 +293,12 @@ impl Provision {
         entries
     }
 
-    /// Get transaction hashes in this batch.
+    /// Get the transaction hashes in these provisions.
     pub fn tx_hashes(&self) -> Vec<TxHash> {
         self.transactions.iter().map(|tx| tx.tx_hash).collect()
     }
 
-    /// Create a dummy batch for testing.
+    /// Create a dummy `Provisions` for testing.
     #[cfg(any(test, feature = "test-utils"))]
     pub fn dummy(source_shard: ShardGroupId, block_height: BlockHeight) -> Self {
         Self::new(
@@ -324,19 +325,22 @@ mod tests {
 
     #[test]
     fn test_provision_deadline_is_source_ts_plus_retention_horizon() {
-        let batch = Provision::new(
+        let provisions = Provisions::new(
             ShardGroupId(1),
             BlockHeight(100),
             MerkleInclusionProof::new(vec![]),
             vec![],
         );
         let source_ts = WeightedTimestamp::from_millis(1_000_000);
-        assert_eq!(batch.deadline(source_ts), source_ts.plus(RETENTION_HORIZON));
+        assert_eq!(
+            provisions.deadline(source_ts),
+            source_ts.plus(RETENTION_HORIZON)
+        );
     }
 
     #[test]
-    fn test_provision_batch_fields_roundtrip() {
-        let original = Provision::new(
+    fn test_provisions_fields_roundtrip() {
+        let original = Provisions::new(
             ShardGroupId(1),
             BlockHeight(42),
             MerkleInclusionProof::new(vec![1, 2, 3]),
@@ -344,7 +348,7 @@ mod tests {
         );
 
         let bytes = sbor::basic_encode(&original).unwrap();
-        let decoded: Provision = sbor::basic_decode(&bytes).unwrap();
+        let decoded: Provisions = sbor::basic_decode(&bytes).unwrap();
         assert_eq!(original, decoded);
     }
 
@@ -362,8 +366,8 @@ mod tests {
     }
 
     #[test]
-    fn test_provision_batch_roundtrip() {
-        let batch = Provision::new(
+    fn test_provisions_roundtrip() {
+        let provisions = Provisions::new(
             ShardGroupId(0),
             BlockHeight(10),
             MerkleInclusionProof::dummy(),
@@ -374,16 +378,16 @@ mod tests {
             }],
         );
 
-        let bytes = sbor::basic_encode(&batch).unwrap();
-        let decoded: Provision = sbor::basic_decode(&bytes).unwrap();
-        assert_eq!(batch, decoded);
+        let bytes = sbor::basic_encode(&provisions).unwrap();
+        let decoded: Provisions = sbor::basic_decode(&bytes).unwrap();
+        assert_eq!(provisions, decoded);
     }
 
     #[test]
-    fn test_provision_batch_all_entries_deduped() {
+    fn test_provisions_all_entries_deduped() {
         let entry = test_entry(1);
-        let mut batch = Provision::dummy(ShardGroupId(0), BlockHeight(10));
-        batch.transactions = vec![
+        let mut provisions = Provisions::dummy(ShardGroupId(0), BlockHeight(10));
+        provisions.transactions = vec![
             TxEntries {
                 tx_hash: TxHash::from_raw(Hash::from_bytes(b"tx1")),
                 entries: vec![entry.clone()],
@@ -396,7 +400,7 @@ mod tests {
             },
         ];
 
-        let deduped = batch.all_entries_deduped();
+        let deduped = provisions.all_entries_deduped();
         assert_eq!(deduped.len(), 2);
     }
 

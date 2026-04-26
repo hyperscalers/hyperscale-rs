@@ -1,7 +1,7 @@
 //! Deterministic conflict detection from committed provisions.
 //!
 //! Detects node-ID overlap between local cross-shard transactions and remote
-//! provision batches committed via `provision_root`. A bidirectional cycle
+//! provisions committed via `provision_root`. A bidirectional cycle
 //! exists when a local tx needs nodes from shard S, and a remote tx from S
 //! touches overlapping nodes.
 //!
@@ -17,7 +17,7 @@
 #[cfg(test)]
 use hyperscale_types::Hash;
 use hyperscale_types::{
-    NodeId, Provision, ShardGroupId, TopologySnapshot, TxHash, WeightedTimestamp,
+    NodeId, Provisions, ShardGroupId, TopologySnapshot, TxHash, WeightedTimestamp,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -138,20 +138,20 @@ impl ConflictDetector {
         conflicts
     }
 
-    /// Detect conflicts between a committed provision batch and local transactions.
+    /// Detect conflicts between a committed provisions and local transactions.
     ///
-    /// For each tx in the batch, extracts its node IDs, stores them for future
+    /// For each tx in the provisions, extracts its node IDs, stores them for future
     /// reverse detection, and checks against all local txs that need provisions
-    /// from the batch's source shard.
+    /// from the provisions's source shard.
     pub fn detect_conflicts(
         &mut self,
-        batch: &Provision,
+        provisions: &Provisions,
         committed_at: WeightedTimestamp,
     ) -> Vec<DetectedConflict> {
-        let source_shard = batch.source_shard;
+        let source_shard = provisions.source_shard;
         let mut conflicts = Vec::new();
 
-        for tx_entry in &batch.transactions {
+        for tx_entry in &provisions.transactions {
             let remote_tx = tx_entry.tx_hash;
             let source_nodes: HashSet<NodeId> = tx_entry.node_ids();
             let target_nodes: HashSet<NodeId> = tx_entry.target_nodes.iter().copied().collect();
@@ -341,12 +341,12 @@ mod tests {
     }
 
     /// Create a provision with source nodes (entries) and target nodes per tx.
-    fn make_batch(
+    fn make_provisions(
         source_shard: ShardGroupId,
         height: BlockHeight,
         txs: Vec<(TxHash, Vec<NodeId>, Vec<NodeId>)>,
-    ) -> Provision {
-        Provision::new(
+    ) -> Provisions {
+        Provisions::new(
             source_shard,
             height,
             MerkleInclusionProof::dummy(),
@@ -383,14 +383,14 @@ mod tests {
         let local_tx = TxHash::from_raw(Hash::from_bytes(b"tx_alpha"));
         detector.register_tx(local_tx, &topo, &[node_a, local_node], &[]);
 
-        // Remote batch touches node_b (different source node) — no source overlap
+        // Remote provisions touches node_b (different source node) — no source overlap
         let remote_tx = TxHash::from_raw(Hash::from_bytes(b"tx_beta"));
-        let batch = make_batch(
+        let provisions = make_provisions(
             ShardGroupId(1),
             BlockHeight(10),
             vec![(remote_tx, vec![node_b], vec![local_node])],
         );
-        let conflicts = detector.detect_conflicts(&batch, WeightedTimestamp(10 * 500));
+        let conflicts = detector.detect_conflicts(&provisions, WeightedTimestamp(10 * 500));
         assert!(conflicts.is_empty());
     }
 
@@ -406,14 +406,14 @@ mod tests {
         let local_tx = TxHash::from_raw(Hash::from_bytes(b"tx_alpha"));
         detector.register_tx(local_tx, &topo, &[remote_node, local_a], &[]);
 
-        // Remote batch: source nodes overlap (remote_node) but targets local_b (not local_a)
+        // Remote provisions: source nodes overlap (remote_node) but targets local_b (not local_a)
         let remote_tx = TxHash::from_raw(Hash::from_bytes(b"tx_beta"));
-        let batch = make_batch(
+        let provisions = make_provisions(
             ShardGroupId(1),
             BlockHeight(10),
             vec![(remote_tx, vec![remote_node], vec![local_b])],
         );
-        let conflicts = detector.detect_conflicts(&batch, WeightedTimestamp(10 * 500));
+        let conflicts = detector.detect_conflicts(&provisions, WeightedTimestamp(10 * 500));
         assert!(conflicts.is_empty());
     }
 
@@ -430,12 +430,12 @@ mod tests {
         detector.register_tx(higher, &topo, &[remote_node, local_node], &[]);
 
         // Remote provision: source has remote_node (overlap dir 1), targets local_node (overlap dir 2)
-        let batch = make_batch(
+        let provisions = make_provisions(
             ShardGroupId(1),
             BlockHeight(10),
             vec![(lower, vec![remote_node], vec![local_node])],
         );
-        let conflicts = detector.detect_conflicts(&batch, WeightedTimestamp(10 * 500));
+        let conflicts = detector.detect_conflicts(&provisions, WeightedTimestamp(10 * 500));
 
         assert_eq!(conflicts.len(), 1);
         assert_eq!(conflicts[0].loser_tx, higher);
@@ -454,12 +454,12 @@ mod tests {
         // Local tx (lower hash) — it wins
         detector.register_tx(lower, &topo, &[remote_node, local_node], &[]);
 
-        let batch = make_batch(
+        let provisions = make_provisions(
             ShardGroupId(1),
             BlockHeight(10),
             vec![(higher, vec![remote_node], vec![local_node])],
         );
-        let conflicts = detector.detect_conflicts(&batch, WeightedTimestamp(10 * 500));
+        let conflicts = detector.detect_conflicts(&provisions, WeightedTimestamp(10 * 500));
         assert!(conflicts.is_empty());
     }
 
@@ -473,12 +473,12 @@ mod tests {
         let (higher, lower) = ordered_hashes(b"tx_local", b"tx_remote");
 
         // Provisions commit FIRST
-        let batch = make_batch(
+        let provisions = make_provisions(
             ShardGroupId(1),
             BlockHeight(5),
             vec![(lower, vec![remote_node], vec![local_node])],
         );
-        let fwd_conflicts = detector.detect_conflicts(&batch, WeightedTimestamp(5 * 500));
+        let fwd_conflicts = detector.detect_conflicts(&provisions, WeightedTimestamp(5 * 500));
         assert!(fwd_conflicts.is_empty());
 
         // Local tx registers AFTER — reverse detection catches bidirectional overlap
@@ -498,12 +498,12 @@ mod tests {
         let (higher, lower) = ordered_hashes(b"tx_local", b"tx_remote");
 
         // Provisions commit first with the higher hash
-        let batch = make_batch(
+        let provisions = make_provisions(
             ShardGroupId(1),
             BlockHeight(5),
             vec![(higher, vec![remote_node], vec![local_node])],
         );
-        detector.detect_conflicts(&batch, WeightedTimestamp(5 * 500));
+        detector.detect_conflicts(&provisions, WeightedTimestamp(5 * 500));
 
         // Local tx registers with lower hash — wins, no conflict
         let rev_conflicts = detector.register_tx(lower, &topo, &[remote_node, local_node], &[]);
@@ -523,12 +523,12 @@ mod tests {
         assert_eq!(detector.tracked_tx_count(), 0);
 
         let remote_tx = TxHash::from_raw(Hash::from_bytes(b"tx_beta"));
-        let batch = make_batch(
+        let provisions = make_provisions(
             ShardGroupId(1),
             BlockHeight(10),
             vec![(remote_tx, vec![remote_node], vec![local_node])],
         );
-        let conflicts = detector.detect_conflicts(&batch, WeightedTimestamp(10 * 500));
+        let conflicts = detector.detect_conflicts(&provisions, WeightedTimestamp(10 * 500));
         assert!(conflicts.is_empty());
     }
 
@@ -544,12 +544,12 @@ mod tests {
 
         // Batch from shard 0 (our shard) — wrong source shard
         let remote_tx = TxHash::from_raw(Hash::from_bytes(b"tx_beta"));
-        let batch = make_batch(
+        let provisions = make_provisions(
             ShardGroupId(0),
             BlockHeight(10),
             vec![(remote_tx, vec![remote_node], vec![local_node])],
         );
-        let conflicts = detector.detect_conflicts(&batch, WeightedTimestamp(10 * 500));
+        let conflicts = detector.detect_conflicts(&provisions, WeightedTimestamp(10 * 500));
         assert!(conflicts.is_empty());
     }
 
@@ -562,12 +562,12 @@ mod tests {
 
         let (higher, lower) = ordered_hashes(b"tx_local", b"tx_remote");
 
-        let batch = make_batch(
+        let provisions = make_provisions(
             ShardGroupId(1),
             BlockHeight(5),
             vec![(lower, vec![remote_node], vec![local_node])],
         );
-        detector.detect_conflicts(&batch, WeightedTimestamp(5 * 500));
+        detector.detect_conflicts(&provisions, WeightedTimestamp(5 * 500));
         assert_eq!(detector.stored_provision_count(), 1);
 
         detector.remove_provision(&lower, ShardGroupId(1));

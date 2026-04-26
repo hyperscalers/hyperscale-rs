@@ -284,7 +284,7 @@ where
     // Fetch protocol (transaction/certificate fetching with chunking and retry)
     transaction_fetch_protocol: TransactionFetchProtocol,
 
-    // Local provision fetch protocol (intra-shard provision batch fetching)
+    // Local provision fetch protocol (intra-shard provisions fetching)
     local_provision_fetch_protocol: LocalProvisionFetchProtocol,
 
     // Finalized wave fetch protocol (intra-shard wave data fetching)
@@ -768,15 +768,15 @@ where
             }
 
             // ── Provision fetch protocol ──────────────────────────────
-            NodeInput::ProvisionFetchReceived { batch } => {
-                let source_shard = batch.source_shard;
-                let block_height = batch.block_height;
+            NodeInput::ProvisionFetchReceived { provisions } => {
+                let source_shard = provisions.source_shard;
+                let block_height = provisions.block_height;
                 let outputs = self
                     .provision_fetch_protocol
                     .handle(ProvisionFetchInput::Received {
                         source_shard,
                         block_height,
-                        batch,
+                        provisions,
                     });
                 self.process_provision_fetch_outputs(outputs);
                 self.update_fetch_tick_timer();
@@ -943,9 +943,9 @@ where
             // our own `local_provision.request` can serve the batch from
             // memory while we await target ECs.
             NodeInput::ProvisionReady { batches } => {
-                for (target_shard, batch, _recipients) in &batches {
+                for (target_shard, provisions, _recipients) in &batches {
                     self.feed_event(ProtocolEvent::OutboundProvisionBroadcast {
-                        batch: std::sync::Arc::new(batch.clone()),
+                        provisions: std::sync::Arc::new(provisions.clone()),
                         target_shard: *target_shard,
                     });
                 }
@@ -1065,14 +1065,14 @@ where
 
     // ─── Provision Broadcasting ────────────────────────────────────────
 
-    /// Sign and broadcast provision batches to target shard committees.
+    /// Sign and broadcast provisions to target shard committees.
     ///
     /// Signing is dispatched to the crypto pool to avoid blocking the io_loop.
     pub(crate) fn broadcast_provisions(
         &self,
         batches: Vec<(
             hyperscale_types::ShardGroupId,
-            hyperscale_types::Provision,
+            hyperscale_types::Provisions,
             Vec<hyperscale_types::ValidatorId>,
         )>,
     ) {
@@ -1082,11 +1082,11 @@ where
         let validator_id = self.validator_id;
 
         self.dispatch.spawn_crypto(move || {
-            for (shard, batch, recipients) in batches {
-                let block_height = batch.block_height;
-                let source_shard = batch.source_shard;
-                let proof = batch.proof.clone();
-                let provisions: Vec<hyperscale_types::StateProvision> = batch
+            for (shard, provisions, recipients) in batches {
+                let block_height = provisions.block_height;
+                let source_shard = provisions.source_shard;
+                let proof = provisions.proof.clone();
+                let state_provisions: Vec<hyperscale_types::StateProvision> = provisions
                     .transactions
                     .into_iter()
                     .map(|tx| hyperscale_types::StateProvision {
@@ -1097,18 +1097,18 @@ where
                         entries: std::sync::Arc::new(tx.entries),
                     })
                     .collect();
-                if provisions.is_empty() {
+                if state_provisions.is_empty() {
                     continue;
                 }
-                let msg = hyperscale_types::state_provision_batch_message(
+                let msg = hyperscale_types::state_provisions_message(
                     local_shard,
                     shard,
                     block_height,
-                    &provisions,
+                    &state_provisions,
                 );
                 let sig = signing_key.sign_v1(&msg);
                 let notification = hyperscale_messages::StateProvisionNotification::new(
-                    provisions,
+                    state_provisions,
                     proof,
                     validator_id,
                     sig,
@@ -1206,11 +1206,11 @@ where
                 // Provision
                 prov_verified_remote_headers: prov_mem.verified_remote_headers,
                 prov_pending_provisions: prov_mem.pending_provisions,
-                prov_verified_batches: prov_mem.verified_batches,
+                prov_verified_provisions: prov_mem.verified_provisions,
                 prov_expected_provisions: prov_mem.expected_provisions,
-                prov_batches_by_hash: prov_mem.batches_by_hash,
-                prov_queued_provision_batches: prov_mem.queued_provision_batches,
-                prov_committed_batch_tombstones: prov_mem.committed_batch_tombstones,
+                prov_provisions_by_hash: prov_mem.provisions_by_hash,
+                prov_queued_provisions: prov_mem.queued_provisions,
+                prov_committed_tombstones: prov_mem.committed_tombstones,
                 // Node (io_loop)
                 node_tx_cache: self.tx_cache.len(),
                 node_tx_status_cache: self.tx_status_cache.len(),

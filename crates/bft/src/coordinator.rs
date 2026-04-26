@@ -62,7 +62,7 @@ pub type NodeIndex = u32;
 use hyperscale_types::Hash;
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, BlockManifest, BlockVote, CertifiedBlock, FinalizedWave,
-    Provision, QuorumCertificate, Round, RoutableTransaction, StateRoot, TopologySnapshot, TxHash,
+    Provisions, QuorumCertificate, Round, RoutableTransaction, StateRoot, TopologySnapshot, TxHash,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -639,7 +639,7 @@ impl BftCoordinator {
         topology: &TopologySnapshot,
         ready_txs: &[Arc<RoutableTransaction>],
         finalized_waves: Vec<Arc<FinalizedWave>>,
-        provision_batches: Vec<Arc<Provision>>,
+        provisions: Vec<Arc<Provisions>>,
     ) -> Vec<Action> {
         // The next height to propose is one above the highest certified block,
         // not the committed block — this lets the chain grow while the
@@ -691,8 +691,8 @@ impl BftCoordinator {
             &qc_chain_cert_hashes,
             self.config.max_finalized_transactions_per_block,
         );
-        let provision_batches = crate::proposal::select_provision_batches(
-            provision_batches,
+        let provisions = crate::proposal::select_provisions(
+            provisions,
             &qc_chain_provision_hashes,
             self.config.max_provision_transactions_per_block,
         );
@@ -704,7 +704,7 @@ impl BftCoordinator {
             ProposalKind::Normal {
                 transactions,
                 finalized_waves,
-                provision_batches,
+                provisions,
                 finalized_tx_count: finalized_tx_count as u32,
             },
         )
@@ -924,7 +924,7 @@ impl BftCoordinator {
         manifest: BlockManifest,
         lookup_tx: impl Fn(&TxHash) -> Option<Arc<RoutableTransaction>>,
         lookup_finalized_wave: impl Fn(&WaveIdHash) -> Option<Arc<FinalizedWave>>,
-        lookup_provision: impl Fn(&ProvisionHash) -> Option<Arc<Provision>>,
+        lookup_provision: impl Fn(&ProvisionHash) -> Option<Arc<Provisions>>,
     ) -> Vec<Action> {
         let block_hash = header.hash();
         let height = header.height;
@@ -1096,7 +1096,7 @@ impl BftCoordinator {
         manifest: BlockManifest,
         lookup_tx: impl Fn(&TxHash) -> Option<Arc<RoutableTransaction>>,
         lookup_finalized_wave: impl Fn(&WaveIdHash) -> Option<Arc<FinalizedWave>>,
-        lookup_provision: impl Fn(&ProvisionHash) -> Option<Arc<Provision>>,
+        lookup_provision: impl Fn(&ProvisionHash) -> Option<Arc<Provisions>>,
     ) {
         let block_hash = header.hash();
         let mut pending = PendingBlock::from_manifest(header, manifest, self.now);
@@ -1111,9 +1111,9 @@ impl BftCoordinator {
                 pending.add_finalized_wave(fw);
             }
         }
-        for batch_hash in pending.manifest().provision_hashes.clone() {
-            if let Some(batch) = lookup_provision(&batch_hash) {
-                pending.add_provision(batch);
+        for provision_hash in pending.manifest().provision_hashes.clone() {
+            if let Some(p) = lookup_provision(&provision_hash) {
+                pending.add_provision(p);
             }
         }
 
@@ -1712,7 +1712,7 @@ impl BftCoordinator {
         block: Arc<Block>,
         block_hash: BlockHash,
         finalized_waves: Vec<Arc<FinalizedWave>>,
-        provisions: Vec<Arc<Provision>>,
+        provisions: Vec<Arc<Provisions>>,
     ) -> Vec<Action> {
         match self.proposal.take_matching(height, round) {
             TakeResult::Matched => {}
@@ -1920,7 +1920,7 @@ impl BftCoordinator {
         qc: QuorumCertificate,
         ready_txs: &[Arc<RoutableTransaction>],
         finalized_waves: Vec<Arc<FinalizedWave>>,
-        provision_batches: Vec<Arc<Provision>>,
+        provisions: Vec<Arc<Provisions>>,
     ) -> Vec<Action> {
         let height = qc.height;
 
@@ -1968,7 +1968,7 @@ impl BftCoordinator {
         // block N+1 is what certifies block N, so any gap in proposing N+1
         // stalls the finalization of N and everything pending behind it.
         // `try_propose` handles the should_propose / backpressure checks.
-        actions.extend(self.try_propose(topology, ready_txs, finalized_waves, provision_batches));
+        actions.extend(self.try_propose(topology, ready_txs, finalized_waves, provisions));
 
         actions
     }
@@ -2757,7 +2757,7 @@ impl BftCoordinator {
                     still_missing = missing_provisions.len(),
                     "Re-requesting remaining missing provisions"
                 );
-                actions.push(Action::FetchProvisionLocal {
+                actions.push(Action::FetchProvisionsLocal {
                     block_hash,
                     proposer,
                     batch_hashes: missing_provisions,
@@ -2857,19 +2857,19 @@ impl BftCoordinator {
         )
     }
 
-    /// Check if any pending blocks are now complete after a provision batch arrived.
+    /// Check if any pending blocks are now complete after a provisions arrived.
     pub fn check_pending_blocks_for_provision(
         &mut self,
         topology: &TopologySnapshot,
-        batch: &Arc<Provision>,
+        provisions: &Arc<Provisions>,
     ) -> Vec<Action> {
-        let batch_hash = batch.hash();
+        let provisions_hash = provisions.hash();
         self.check_pending_blocks_for_arrival(
             topology,
-            "provision batch",
-            |pending| pending.needs_provision(&batch_hash),
+            "provisions",
+            |pending| pending.needs_provision(&provisions_hash),
             |pending| {
-                pending.add_provision(Arc::clone(batch));
+                pending.add_provision(Arc::clone(provisions));
             },
         )
     }

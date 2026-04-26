@@ -1,53 +1,49 @@
-//! ProvisionCoordinator sub-state machine for centralized provision management.
+//! Centralized provision coordination.
 //!
-//! This module implements the provision coordination system that tracks all
-//! cross-shard provisions, manages QC + merkle proof verification, and emits
-//! verification events for downstream consumers.
+//! Tracks all cross-shard provisions, manages QC + merkle proof verification,
+//! and emits verification events for downstream consumers.
 //!
 //! ## Provision Flow
 //!
-//! The source shard proposer broadcasts a `StateProvision` batch containing JMT
-//! inclusion proofs. The target shard joins with remote block headers, then
-//! dispatches `VerifyStateProvision` to verify the QC signature once and
-//! merkle proofs per provision against the committed state root.
+//! The source shard proposer broadcasts `StateProvisions` notifications
+//! carrying JMT inclusion proofs. The target shard joins with remote block
+//! headers, then dispatches `VerifyStateProvision` to verify the QC
+//! signature once and merkle proofs per state entry against the committed
+//! state root.
 
+use crate::expected::ExpectedProvisionTracker;
+use crate::pipeline::ProvisionPipeline;
+use crate::queue::QueuedProvisionBuffer;
 use crate::store::ProvisionStore;
+use crate::verified_headers::VerifiedHeaderBuffer;
 use hyperscale_core::{Action, ProtocolEvent};
 use hyperscale_types::{
-    compute_padded_merkle_root, BlockHeight, CommittedBlockHeader, Hash, LocalTimestamp, Provision,
-    ProvisionHash, ProvisionTxRoot, ShardGroupId, TopologySnapshot, ValidatorId, WeightedTimestamp,
-    RETENTION_HORIZON,
+    compute_padded_merkle_root, BlockHeight, CommittedBlockHeader, Hash, LocalTimestamp,
+    ProvisionHash, ProvisionTxRoot, Provisions, ShardGroupId, TopologySnapshot, RETENTION_HORIZON,
 };
 #[cfg(test)]
 use hyperscale_types::{
     CertificateRoot, LocalReceiptRoot, ProvisionsRoot, StateRoot, TransactionRoot, TxHash,
+    ValidatorId,
 };
 use serde::Deserialize;
-use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
-/// Default minimum dwell time a verified provision batch sits in the queue
-/// before the proposer can include it in a block. Gives shard peers time to
-/// receive and verify the same batch via gossip, so they don't have to fetch
-/// it later. Also buys headroom for the fetch-serving cache since peers hit
-/// local state instead of requesting back.
+/// Default minimum dwell time verified provisions sit in the queue before
+/// the proposer can include them in a block. Gives shard peers time to
+/// receive and verify the same provisions via gossip, so they don't have
+/// to fetch later. Also buys headroom for the fetch-serving cache since
+/// peers hit local state instead of requesting back.
 pub const DEFAULT_MIN_DWELL_TIME: Duration = Duration::from_millis(500);
-
-/// How long to wait before falling back to peer-fetch for missing
-/// provisions. Proposers include provisions inline in `Block::Live` during
-/// assembly, so this timeout only triggers when gossip dropped a batch —
-/// in which case we fetch from a shard peer. Measured against the BFT-
-/// authenticated `weighted_timestamp_ms` of locally committed blocks.
-const PROVISION_FALLBACK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Provision coordinator configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProvisionConfig {
-    /// Minimum time a verified provision batch must sit in the proposal queue
-    /// before it becomes eligible for inclusion. Batches younger than this are
-    /// skipped by `queued_provisions()` but remain in the queue.
+    /// Minimum time verified provisions must sit in the proposal queue
+    /// before they become eligible for inclusion. Entries younger than
+    /// this are skipped by `queued_provisions()` but remain in the queue.
     ///
     /// Set to zero to disable.
     #[serde(default = "default_min_dwell_time")]
@@ -71,150 +67,63 @@ impl Default for ProvisionConfig {
 pub struct ProvisionMemoryStats {
     pub verified_remote_headers: usize,
     pub pending_provisions: usize,
-    pub verified_batches: usize,
+    pub verified_provisions: usize,
     pub expected_provisions: usize,
-    pub batches_by_hash: usize,
-    pub queued_provision_batches: usize,
-    pub committed_batch_tombstones: usize,
-}
-
-/// Tracks an expected provision that hasn't arrived yet.
-///
-/// Created when a remote block header's `waves` field targets our shard.
-/// Emits a single `FetchProvisionRemote` after the timeout; the fetch
-/// protocol owns retries from that point.
-#[derive(Debug, Clone)]
-struct ExpectedProvision {
-    /// Local weighted timestamp when we first expected this provision.
-    /// Used as the liveness baseline for both fallback-fetch and orphan
-    /// eviction.
-    discovered_at: WeightedTimestamp,
-    requested: bool,
-    proposer: ValidatorId,
-}
-
-/// A verified provision batch queued for inclusion, timestamped for dwell-time
-/// filtering at proposal time and deadline-anchored for retention sweeps.
-#[derive(Debug, Clone)]
-struct QueuedProvision {
-    batch: Arc<Provision>,
-    added_at: LocalTimestamp,
-    /// Source block's QC `weighted_timestamp` — paired in at verification.
-    /// Drives deadline-based eviction via `Provision::deadline()`.
-    source_block_ts: WeightedTimestamp,
-}
-
-/// A verified provision batch held in the central `verified_batches` map,
-/// paired with its source block's `weighted_timestamp` for deadline sweeps.
-#[derive(Debug, Clone)]
-struct VerifiedBatch {
-    batch: Arc<Provision>,
-    source_block_ts: WeightedTimestamp,
-}
-
-/// A provision batch buffered while waiting for the matching verified
-/// remote header. `received_at` is the local committed `WeightedTimestamp`
-/// at receipt and is provably ≥ the source block's `weighted_timestamp`,
-/// so the deadline sweep drops only entries whose true deadline has passed.
-#[derive(Debug, Clone)]
-struct PendingProvision {
-    batch: Provision,
-    received_at: WeightedTimestamp,
+    pub provisions_by_hash: usize,
+    pub queued_provisions: usize,
+    pub committed_tombstones: usize,
 }
 
 /// Centralized provision coordination.
 ///
 /// Responsibilities:
-/// - Receive provision batches from the source shard proposer
+/// - Receive provisions from the source shard proposer
 /// - Join provisions with remote block headers
-/// - Dispatch QC + merkle proof verification (QC once per batch, proofs per provision)
-/// - Queue verified batches for block inclusion
+/// - Dispatch QC + merkle proof verification (QC once per source block,
+///   merkle proofs per state entry)
+/// - Queue verified provisions for block inclusion
 /// - Request missing provisions after timeout (fallback recovery)
 pub struct ProvisionCoordinator {
     // ═══════════════════════════════════════════════════════════════════
-    // Configuration
-    // ═══════════════════════════════════════════════════════════════════
-    config: ProvisionConfig,
-
-    // ═══════════════════════════════════════════════════════════════════
     // Verified Remote Block Headers
     // ═══════════════════════════════════════════════════════════════════
-    /// Verified committed block headers from remote shards.
-    ///
-    /// Populated exclusively via `on_verified_remote_header()` from the
-    /// `RemoteHeaderCoordinator`. All headers here have passed QC verification.
-    /// Used to join with provision batches for merkle proof verification.
-    verified_remote_headers: HashMap<(ShardGroupId, BlockHeight), Arc<CommittedBlockHeader>>,
+    /// Verified committed block headers from remote shards. All entries have
+    /// passed QC verification by the `RemoteHeaderCoordinator`; this buffer
+    /// is the join point for matching provisions against their source
+    /// state root.
+    headers: VerifiedHeaderBuffer,
 
     // ═══════════════════════════════════════════════════════════════════
-    // Verified Provision
+    // Provision Verification Pipeline
     // ═══════════════════════════════════════════════════════════════════
-    /// Provision batches waiting for their corresponding remote block header.
-    /// Keyed by (source_shard, block_height) since that's how we match to headers.
-    /// Each entry remembers `received_at` (the local committed weighted ts at
-    /// receipt) so the deadline sweep can drop entries whose paired header
-    /// will never arrive within `RETENTION_HORIZON`. `received_at` is a
-    /// conservative upper bound on the source block's true ts (we received
-    /// the batch after it was committed at the source), so the sweep only
-    /// evicts entries whose true deadline has provably passed.
-    pending_provisions: HashMap<(ShardGroupId, BlockHeight), Vec<PendingProvision>>,
-
-    /// Verified provision batches keyed by (source_shard, block_height).
-    /// Stored whole after proof verification — no per-tx decomposition.
-    /// Paired with the source block's `weighted_timestamp` so the deadline
-    /// sweep can prune un-committed batches via `Provision::deadline()`.
-    verified_batches: BTreeMap<(ShardGroupId, BlockHeight), VerifiedBatch>,
-
-    /// Shared hash-keyed store for O(1) lookup by content hash, also used
-    /// by the io-loop request handler to serve `local_provision.request`.
-    /// Populated alongside `verified_batches`; drained from the same
-    /// post-commit retention path. Single source of truth — replaces the
-    /// separate time-based `ProvisionCache` that previously lived in the
-    /// io-loop and dropped batches before their owning block committed.
-    store: Arc<ProvisionStore>,
+    /// Pending → verified → store lifecycle for inbound provisions. Owns
+    /// the `Arc<ProvisionStore>` shared with the io-loop's
+    /// `local_provision.request` handler.
+    pipeline: ProvisionPipeline,
 
     // ═══════════════════════════════════════════════════════════════════
     // Expected Provision Tracking (fallback detection)
     // ═══════════════════════════════════════════════════════════════════
-    /// Current local committed height (updated on each block commit).
-    local_committed_height: BlockHeight,
-
-    /// BFT-authenticated weighted timestamp of the last locally committed
-    /// block. "Now" reference for liveness timeouts so they're independent
-    /// of local block production rate and deterministic across validators.
-    local_committed_ts: WeightedTimestamp,
-
-    /// Expected provisions that haven't arrived yet.
-    /// Keyed by `(source_shard, block_height)`. Populated when a remote
-    /// header's `waves` field targets our shard. Cleared when
-    /// provisions are verified or the associated transactions are cleaned up.
-    expected_provisions: BTreeMap<(ShardGroupId, BlockHeight), ExpectedProvision>,
+    /// Outstanding expectations driven by remote header arrivals. Owns
+    /// the local committed anchor every other sub-machine reads through
+    /// (`local_ts`, `local_height`).
+    expected: ExpectedProvisionTracker,
 
     // ═══════════════════════════════════════════════════════════════════
     // Proposal Queue + Tombstones
     // ═══════════════════════════════════════════════════════════════════
-    /// Provision batches received from remote shards, queued for inclusion
-    /// in the next block proposal. Proposer drains this queue when building
-    /// a proposal. Every validator queues (any might become next proposer).
-    /// Each entry is timestamped so `queued_provisions()` can apply the
-    /// configured `min_dwell_time`.
-    queued_provision_batches: Vec<QueuedProvision>,
-
-    /// Tombstone set: hashes of provision batches that have been committed.
-    /// Prevents re-queueing if a duplicate batch arrives via gossip after commit.
-    /// Maps hash → committing QC's `weighted_timestamp` for age-based
-    /// pruning anchored on BFT-authenticated time.
-    committed_batch_tombstones: HashMap<ProvisionHash, WeightedTimestamp>,
+    /// Verified provisions eligible for inclusion in the next block
+    /// proposal, gated by a configured dwell window so peers have time to
+    /// receive the same provisions via gossip. Tombstones for committed
+    /// provisions gate duplicate gossip after commit.
+    queue: QueuedProvisionBuffer,
 }
 
 impl std::fmt::Debug for ProvisionCoordinator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProvisionCoordinator")
-            .field(
-                "verified_remote_headers",
-                &self.verified_remote_headers.len(),
-            )
-            .field("verified_batches", &self.verified_batches.len())
+            .field("verified_remote_headers", &self.headers.len())
+            .field("verified_provisions", &self.pipeline.verified_len())
             .finish()
     }
 }
@@ -243,34 +152,41 @@ impl ProvisionCoordinator {
     /// io-loop so `local_provision.request` handlers read from the same
     /// source of truth this coordinator writes to.
     pub fn with_config_and_store(config: ProvisionConfig, store: Arc<ProvisionStore>) -> Self {
+        let queue = QueuedProvisionBuffer::new(config.min_dwell_time);
         Self {
-            config,
-            verified_remote_headers: HashMap::new(),
-            pending_provisions: HashMap::new(),
-            verified_batches: BTreeMap::new(),
-            store,
-            local_committed_height: BlockHeight(0),
-            local_committed_ts: WeightedTimestamp::ZERO,
-            expected_provisions: BTreeMap::new(),
-            queued_provision_batches: Vec::new(),
-            committed_batch_tombstones: HashMap::new(),
+            headers: VerifiedHeaderBuffer::new(),
+            pipeline: ProvisionPipeline::new(store),
+            expected: ExpectedProvisionTracker::new(),
+            queue,
         }
     }
 
     /// Get provision coordinator memory statistics for monitoring collection sizes.
     pub fn memory_stats(&self) -> ProvisionMemoryStats {
         ProvisionMemoryStats {
-            verified_remote_headers: self.verified_remote_headers.len(),
-            pending_provisions: self.pending_provisions.len(),
-            verified_batches: self.verified_batches.len(),
-            expected_provisions: self.expected_provisions.len(),
-            batches_by_hash: self.store.len(),
-            queued_provision_batches: self.queued_provision_batches.len(),
-            committed_batch_tombstones: self.committed_batch_tombstones.len(),
+            verified_remote_headers: self.headers.len(),
+            pending_provisions: self.pipeline.pending_len(),
+            verified_provisions: self.pipeline.verified_len(),
+            expected_provisions: self.expected.len(),
+            provisions_by_hash: self.pipeline.store().len(),
+            queued_provisions: self.queue.queue_len(),
+            committed_tombstones: self.queue.tombstone_len(),
         }
     }
 
-    /// Handle block committed - check for timed-out expected provisions.
+    /// Handle block committed.
+    ///
+    /// Orchestration order matters:
+    /// 1. `expected.record_block_committed` updates the local anchor and
+    ///    retro-stamps pre-genesis entries. Must precede any sweep that
+    ///    reads `local_ts`.
+    /// 2. `queue.on_block_committed` tombstones committed provisions and
+    ///    drops them from the proposer queue.
+    /// 3. Orphan cleanup evicts expectations whose fallback never resolved
+    ///    and prunes their matching headers.
+    /// 4. `queue.prune_tombstones` and `drop_past_deadline` use the same
+    ///    `local_ts` cutoff for retention sweeps.
+    /// 5. Timeout sweep emits fallback fetches for late expectations.
     pub fn on_block_committed(
         &mut self,
         topology: &TopologySnapshot,
@@ -278,102 +194,58 @@ impl ProvisionCoordinator {
     ) -> Vec<Action> {
         let block = &certified.block;
         let new_ts = certified.qc.weighted_timestamp;
-        let first_commit = self.local_committed_ts == WeightedTimestamp::ZERO;
-        self.local_committed_height = block.height();
-        self.local_committed_ts = new_ts;
-
-        // Retro-stamp `expected_provisions` entries recorded before the first
-        // local commit. Remote headers can arrive and register expectations
-        // while `local_committed_ts` is still zero; without this, every
-        // such entry would report a ~57-year age on the next commit and
-        // trigger a fallback fetch storm.
-        if first_commit {
-            for expected in self.expected_provisions.values_mut() {
-                if expected.discovered_at == WeightedTimestamp::ZERO {
-                    expected.discovered_at = new_ts;
-                }
-            }
-        }
+        self.expected.record_block_committed(block.height(), new_ts);
+        let local_ts = self.expected.local_ts();
 
         // Tombstone provisions committed in this block to prevent re-queueing
         // if duplicate gossip arrives later, and drop them from the proposer
-        // queue so we don't re-include the same batch in the next proposal.
-        // The deadline sweep below evicts the batch itself from
-        // `verified_batches` / `store` once its source has aged past
+        // queue so we don't re-include the same provisions in the next
+        // proposal. The deadline sweep below evicts the provisions themselves
+        // from the pipeline / store once the source has aged past
         // `RETENTION_HORIZON`.
         let committed: std::collections::HashSet<ProvisionHash> =
             block.provisions().iter().map(|p| p.hash()).collect();
-        if !committed.is_empty() {
-            for h in &committed {
-                self.committed_batch_tombstones
-                    .insert(*h, self.local_committed_ts);
-            }
-            self.queued_provision_batches
-                .retain(|q| !committed.contains(&q.batch.hash()));
-        }
+        self.queue.on_block_committed(&committed, local_ts);
 
-        // Drop truly orphaned `expected_provisions` entries (and their headers)
-        // whose fallback fetch never resolved within `RETENTION_HORIZON`. Under
-        // normal operation a header is retained exactly while its batch is
-        // outstanding; this only catches entries that would otherwise leak
-        // indefinitely.
-        let orphan_cutoff = self.local_committed_ts.minus(RETENTION_HORIZON);
-        if orphan_cutoff > WeightedTimestamp::ZERO {
-            let before = self.expected_provisions.len();
-            self.expected_provisions
-                .retain(|_, exp| exp.discovered_at >= orphan_cutoff);
-            if self.expected_provisions.len() != before {
-                // Drop matching headers — they're useless without an expected batch.
-                let live: std::collections::HashSet<_> =
-                    self.expected_provisions.keys().copied().collect();
-                self.verified_remote_headers
-                    .retain(|key, _| live.contains(key));
-            }
+        // Single retention cutoff for orphan and tombstone sweeps —
+        // `local_ts - RETENTION_HORIZON` is the conservative point past
+        // which any expectation, tombstone, or queued/verified entry is
+        // provably useless on every shard.
+        let retention_cutoff = local_ts.minus(RETENTION_HORIZON);
+
+        // Drop truly orphaned expectations (and their headers) whose
+        // fallback fetch never resolved within `RETENTION_HORIZON`. Under
+        // normal operation a header is retained exactly while its provisions
+        // are outstanding; this only catches entries that would otherwise
+        // leak indefinitely.
+        for key in self.expected.cleanup_orphans(retention_cutoff) {
+            self.headers.remove(key);
         }
 
         // Prune tombstones past `RETENTION_HORIZON`, measured against
         // BFT-authenticated time.
-        let tombstone_cutoff = self.local_committed_ts.minus(RETENTION_HORIZON);
-        self.committed_batch_tombstones
-            .retain(|_, committed_at_ts| *committed_at_ts > tombstone_cutoff);
+        self.queue.prune_tombstones(retention_cutoff);
 
-        // Drop batches whose deadline has passed but never reached commit.
-        // Without this, a verified batch whose source data has aged past
-        // `RETENTION_HORIZON` lingers indefinitely in the proposer queue and
-        // ends up in proposals that peers cannot verify (their paired remote
-        // header is gone). Drives the cluster into endless view changes.
+        // Drop provisions whose deadline has passed but never reached
+        // commit. Without this, verified provisions whose source data has
+        // aged past `RETENTION_HORIZON` linger indefinitely in the proposer
+        // queue and end up in proposals that peers cannot verify (their
+        // paired remote header is gone). Drives the cluster into endless
+        // view changes.
         self.drop_past_deadline();
 
-        // Check for timed-out expected provisions and emit fallback requests
-        let mut actions = vec![];
-        let now = self.local_committed_ts;
-
-        for (&(source_shard, block_height), expected) in self.expected_provisions.iter_mut() {
-            if expected.requested {
-                continue;
-            }
-
-            if now.elapsed_since(expected.discovered_at) < PROVISION_FALLBACK_TIMEOUT {
-                continue;
-            }
-
-            warn!(
-                source_shard = source_shard.0,
-                block_height = block_height.0,
-                age_ms = now.elapsed_since(expected.discovered_at).as_millis() as u64,
-                "Provision timeout — requesting missing provisions via fallback"
-            );
-
-            expected.requested = true;
-            actions.push(Action::FetchProvisionRemote {
-                source_shard,
-                block_height,
-                proposer: expected.proposer,
-                peers: topology.committee_for_shard(source_shard).to_vec(),
-            });
-        }
-
-        actions
+        // Lift each timed-out expectation into a fallback fetch action,
+        // attaching the source shard's committee from topology.
+        self.expected
+            .check_timeouts(local_ts)
+            .into_iter()
+            .map(|effect| Action::FetchProvisionsRemote {
+                source_shard: effect.source_shard,
+                block_height: effect.block_height,
+                proposer: effect.proposer,
+                peers: topology.committee_for_shard(effect.source_shard).to_vec(),
+            })
+            .collect()
     }
 
     /// Drop every artefact whose deadline has passed `local_committed_ts`.
@@ -385,40 +257,26 @@ impl ProvisionCoordinator {
     /// for `pending_provisions`, which is provably no earlier than the
     /// source ts).
     ///
-    /// Without this sweep a verified batch whose deadline has passed
-    /// stays in `queued_provision_batches` forever (the existing
-    /// commit-driven prune only fires when the batch lands in a locally
-    /// committed block — which it can't, because peers no longer have
-    /// the matching remote header to verify it). Proposers then keep
-    /// including the batch and the cluster falls into endless view
-    /// changes around the failing proposal.
+    /// Without this sweep verified provisions whose deadline has passed
+    /// stay in the proposer queue forever (the existing commit-driven
+    /// prune only fires when they land in a locally committed block —
+    /// which they can't, because peers no longer have the matching remote
+    /// header to verify them). Proposers then keep including them and the
+    /// cluster falls into endless view changes around the failing
+    /// proposal.
     fn drop_past_deadline(&mut self) {
-        let now = self.local_committed_ts;
+        let now = self.expected.local_ts();
 
-        self.queued_provision_batches
-            .retain(|q| q.batch.deadline(q.source_block_ts) > now);
+        self.queue.drop_past_deadline(now);
 
-        self.verified_batches.retain(|key, entry| {
-            let alive = entry.batch.deadline(entry.source_block_ts) > now;
-            if !alive {
-                self.store.evict(std::iter::once(entry.batch.hash()));
-                self.verified_remote_headers.remove(key);
-            }
-            alive
-        });
-
-        // `received_at` is a conservative upper bound on the source block's
-        // ts (we received the batch after the source committed it), so
-        // `received_at + RETENTION_HORIZON` is a conservative upper bound on
-        // the true deadline — past that, the deadline has provably passed.
-        self.pending_provisions.retain(|_, batches| {
-            batches.retain(|p| p.batch.deadline(p.received_at) > now);
-            !batches.is_empty()
-        });
+        let evicted_keys = self.pipeline.drop_past_deadline(now);
+        for key in evicted_keys {
+            self.headers.remove(key);
+        }
     }
 
-    /// Immediately emit `FetchProvisionRemote` for all outstanding expected
-    /// provisions, bypassing the normal `PROVISION_FALLBACK_TIMEOUT`.
+    /// Immediately emit `FetchProvisionsRemote` for all outstanding expected
+    /// provisions, bypassing the normal liveness timeout.
     ///
     /// Called when urgency overrides the default patience — sync completion
     /// (validator needs to catch up before `WAVE_TIMEOUT` runs out) and the
@@ -427,25 +285,23 @@ impl ProvisionCoordinator {
         &mut self,
         topology: &hyperscale_types::TopologySnapshot,
     ) -> Vec<Action> {
-        let mut actions = vec![];
-        for (&(source_shard, block_height), expected) in self.expected_provisions.iter_mut() {
-            if expected.requested {
-                continue;
-            }
-            info!(
-                source_shard = source_shard.0,
-                block_height = block_height.0,
-                "Eager fetch — immediately requesting missing provisions"
-            );
-            expected.requested = true;
-            actions.push(Action::FetchProvisionRemote {
-                source_shard,
-                block_height,
-                proposer: expected.proposer,
-                peers: topology.committee_for_shard(source_shard).to_vec(),
-            });
-        }
-        actions
+        self.expected
+            .flush_all()
+            .into_iter()
+            .map(|effect| {
+                info!(
+                    source_shard = effect.source_shard.0,
+                    block_height = effect.block_height.0,
+                    "Eager fetch — immediately requesting missing provisions"
+                );
+                Action::FetchProvisionsRemote {
+                    source_shard: effect.source_shard,
+                    block_height: effect.block_height,
+                    proposer: effect.proposer,
+                    peers: topology.committee_for_shard(effect.source_shard).to_vec(),
+                }
+            })
+            .collect()
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -457,7 +313,7 @@ impl ProvisionCoordinator {
     /// Called when `RemoteHeaderVerified` is received. The header has already
     /// passed QC verification, so we store it directly as verified and:
     /// 1. Register expected provisions if waves target our shard
-    /// 2. Join with any buffered provision batches waiting for this header
+    /// 2. Join with any buffered provisions waiting for this header
     pub fn on_verified_remote_header(
         &mut self,
         topology: &TopologySnapshot,
@@ -482,38 +338,32 @@ impl ProvisionCoordinator {
 
         if targets_us {
             // Store as verified (QC already checked by coordinator).
-            self.verified_remote_headers
-                .insert(key, Arc::clone(&committed_header));
+            self.headers.insert(key, Arc::clone(&committed_header));
 
             let proposer = committed_header.header.proposer;
-            self.expected_provisions.entry(key).or_insert_with(|| {
-                debug!(
-                    shard = shard.0,
-                    height = height.0,
-                    proposer = proposer.0,
-                    "Tracking expected provision (verified remote block targets our shard)"
-                );
-                ExpectedProvision {
-                    discovered_at: self.local_committed_ts,
-                    requested: false,
-                    proposer,
-                }
-            });
-        }
-
-        // Join with buffered provision batches waiting for this header.
-        let mut actions = vec![];
-        if let Some(batches) = self.pending_provisions.remove(&key) {
             debug!(
                 shard = shard.0,
                 height = height.0,
-                pending_count = batches.len(),
-                "Found buffered provision batches for verified header"
+                proposer = proposer.0,
+                "Tracking expected provisions (verified remote block targets our shard)"
             );
-            for pending in batches {
+            self.expected.register(shard, height, proposer);
+        }
+
+        // Join with buffered provisions waiting for this header.
+        let mut actions = vec![];
+        let drained = self.pipeline.drain_pending_for_key(key);
+        if !drained.is_empty() {
+            debug!(
+                shard = shard.0,
+                height = height.0,
+                pending_count = drained.len(),
+                "Found buffered provisions for verified header"
+            );
+            for provisions in drained {
                 actions.extend(self.emit_provision_verification(
                     topology,
-                    pending.batch,
+                    provisions,
                     committed_header.clone(),
                 ));
             }
@@ -526,30 +376,31 @@ impl ProvisionCoordinator {
     // State Provision Lifecycle
     // ═══════════════════════════════════════════════════════════════════════
 
-    /// Handle a provision batch received from a source shard proposer.
+    /// Handle provisions received from a source shard proposer.
     ///
-    /// All transactions in a batch share the same `(source_shard, block_height)`
-    /// via the batch's proof.
-    /// Joins with the corresponding verified remote block header:
+    /// All transactions in the entry share the same
+    /// `(source_shard, block_height)` via the entry's proof. Joins with
+    /// the corresponding verified remote block header:
     /// - If a verified header exists: emit verification with single candidate
-    /// - If no header yet: buffer the batch until `on_verified_remote_header` delivers it
+    /// - If no header yet: buffer the provisions until
+    ///   `on_verified_remote_header` delivers it
     pub fn on_state_provisions_received(
         &mut self,
         topology: &TopologySnapshot,
-        batch: Provision,
+        provisions: Provisions,
     ) -> Vec<Action> {
-        if batch.transactions.is_empty() {
+        if provisions.transactions.is_empty() {
             return vec![];
         }
 
-        let source_shard = batch.source_shard;
-        let block_height = batch.block_height;
+        let source_shard = provisions.source_shard;
+        let block_height = provisions.block_height;
 
         debug!(
             source_shard = source_shard.0,
             block_height = block_height.0,
-            count = batch.transactions.len(),
-            "Provision batch received"
+            count = provisions.transactions.len(),
+            "Provisions received"
         );
 
         // Ignore provisions from our own shard
@@ -561,63 +412,55 @@ impl ProvisionCoordinator {
 
         // Skip if this key was already verified (duplicate gossip/fetch) or
         // already committed (tombstoned by hash). Avoids re-dispatching
-        // verification work and buffering stale duplicates in
-        // `pending_provisions`.
-        if self.verified_batches.contains_key(&key)
-            || self.committed_batch_tombstones.contains_key(&batch.hash())
-        {
+        // verification work and buffering stale duplicates.
+        if self.pipeline.has_verified(key) || self.queue.is_tombstoned(&provisions.hash()) {
             return vec![];
         }
 
         // Look for matching verified remote header (pre-verified by RemoteHeaderCoordinator).
-        if let Some(verified_header) = self.verified_remote_headers.get(&key).cloned() {
+        if let Some(verified_header) = self.headers.get(key).cloned() {
             // Reject if the source block has aged past `RETENTION_HORIZON` —
             // every tx in it has expired and no shard can still need this data.
-            let deadline = batch.deadline(verified_header.qc.weighted_timestamp);
-            if deadline <= self.local_committed_ts {
+            let deadline = provisions.deadline(verified_header.qc.weighted_timestamp);
+            if deadline <= self.expected.local_ts() {
                 debug!(
                     source_shard = source_shard.0,
                     block_height = block_height.0,
-                    "Dropping provision batch past deadline at receipt"
+                    "Dropping provisions past deadline at receipt"
                 );
                 return vec![];
             }
-            return self.emit_provision_verification(topology, batch, verified_header);
+            return self.emit_provision_verification(topology, provisions, verified_header);
         }
 
-        // No verified header yet — buffer the batch
+        // No verified header yet — buffer the provisions
         debug!(
             source_shard = source_shard.0,
             block_height = block_height.0,
-            count = batch.transactions.len(),
-            "Buffering provision batch (waiting for remote header)"
+            count = provisions.transactions.len(),
+            "Buffering provisions (waiting for remote header)"
         );
-        self.pending_provisions
-            .entry(key)
-            .or_default()
-            .push(PendingProvision {
-                batch,
-                received_at: self.local_committed_ts,
-            });
+        self.pipeline
+            .buffer_pending(key, provisions, self.expected.local_ts());
         vec![]
     }
 
-    /// Emit a `VerifyProvision` action for async merkle proof verification.
+    /// Emit a `VerifyProvisions` action for async merkle proof verification.
     ///
-    /// Runs the provision-batch completeness check first: the source block's
+    /// Runs the provisions completeness check first: the source block's
     /// `provision_tx_roots[local_shard]` commits to the ordered tx hashes the
     /// target shard is meant to receive. A mismatch means the proposer
-    /// dropped txs on the broadcast path (or the batch was tampered with) —
-    /// reject the batch entirely so the 10-block fallback timer refetches a
-    /// complete one from a peer.
+    /// dropped txs on the broadcast path (or the provisions were tampered
+    /// with) — reject entirely so the 10-block fallback timer refetches a
+    /// complete set from a peer.
     ///
     /// The QC was already verified by `RemoteHeaderCoordinator`, so the
-    /// downstream `VerifyProvision` action only needs to check merkle proofs
+    /// downstream `VerifyProvisions` action only needs to check merkle proofs
     /// against the committed state root.
     fn emit_provision_verification(
         &self,
         topology: &TopologySnapshot,
-        batch: Provision,
+        provisions: Provisions,
         committed_header: Arc<CommittedBlockHeader>,
     ) -> Vec<Action> {
         let local_shard = topology.local_shard();
@@ -628,15 +471,15 @@ impl ProvisionCoordinator {
             .copied()
         else {
             warn!(
-                source_shard = batch.source_shard.0,
-                block_height = batch.block_height.0,
+                source_shard = provisions.source_shard.0,
+                block_height = provisions.block_height.0,
                 local_shard = local_shard.0,
-                "Dropping provision batch: source header has no provision_tx_root for us"
+                "Dropping provisions: source header has no provision_tx_root for us"
             );
             return vec![];
         };
 
-        let leaves: Vec<Hash> = batch
+        let leaves: Vec<Hash> = provisions
             .transactions
             .iter()
             .map(|t| t.tx_hash.into_raw())
@@ -645,51 +488,51 @@ impl ProvisionCoordinator {
 
         if computed_root != expected_root {
             warn!(
-                source_shard = batch.source_shard.0,
-                block_height = batch.block_height.0,
+                source_shard = provisions.source_shard.0,
+                block_height = provisions.block_height.0,
                 local_shard = local_shard.0,
-                tx_count = batch.transactions.len(),
+                tx_count = provisions.transactions.len(),
                 ?expected_root,
                 ?computed_root,
-                "Rejecting incomplete provision batch — tx-root mismatch; \
-                 fallback fetch will request a complete batch"
+                "Rejecting incomplete provisions — tx-root mismatch; \
+                 fallback fetch will request a complete set"
             );
             return vec![];
         }
 
-        vec![Action::VerifyProvision {
-            batch,
+        vec![Action::VerifyProvisions {
+            provisions,
             committed_header,
         }]
     }
 
-    /// Handle batch-level provision verification result.
+    /// Handle the verification result for a provisions entry.
     ///
-    /// If valid: store per-tx entries, emit events.
+    /// If valid: store, queue, emit events.
     /// Uses the verified header returned by the action handler directly (no re-lookup).
     pub fn on_state_provisions_verified(
         &mut self,
         _topology: &TopologySnapshot,
-        batch: Provision,
+        provisions: Provisions,
         committed_header: Option<Arc<CommittedBlockHeader>>,
         valid: bool,
         now: LocalTimestamp,
     ) -> Vec<Action> {
         let mut actions = vec![];
-        let source_shard = batch.source_shard;
+        let source_shard = provisions.source_shard;
 
         // Clear expected-provision tracking and the matching header. The
-        // header's only job — verify this batch — is done; hanging on to it
-        // wastes memory. Cancel any in-flight fallback fetch to prevent
-        // duplicate delivery.
+        // header's only job — verify these provisions — is done; hanging on
+        // to it wastes memory. Cancel any in-flight fallback fetch to
+        // prevent duplicate delivery.
         if let Some(ref header) = committed_header {
             let shard = header.header.shard_group_id;
             let height = header.header.height;
             let key = (shard, height);
 
-            if self.expected_provisions.remove(&key).is_some() {
-                self.verified_remote_headers.remove(&key);
-                actions.push(Action::CancelProvisionFetch {
+            if self.expected.on_provisions_verified(shard, height) {
+                self.headers.remove(key);
+                actions.push(Action::CancelProvisionsFetch {
                     source_shard: shard,
                     block_height: height,
                 });
@@ -699,8 +542,8 @@ impl ProvisionCoordinator {
         if !valid {
             warn!(
                 source_shard = source_shard.0,
-                tx_count = batch.transactions.len(),
-                "Provision batch verification failed"
+                tx_count = provisions.transactions.len(),
+                "Provisions verification failed"
             );
             return actions;
         }
@@ -708,55 +551,41 @@ impl ProvisionCoordinator {
         let Some(ref header) = committed_header else {
             warn!(
                 source_shard = source_shard.0,
-                "Provision batch marked valid but no committed header"
+                "Provisions marked valid but no committed header"
             );
             return actions;
         };
         let source_block_ts = header.qc.weighted_timestamp;
 
-        // Store the verified batch whole
-        let batch_key = (source_shard, batch.block_height);
-        let batch = Arc::new(batch);
-        let batch_hash = batch.hash();
-
-        // Skip if this batch was already committed (duplicate gossip after commit).
-        if self.committed_batch_tombstones.contains_key(&batch_hash) {
+        // Skip if these provisions were already committed (duplicate gossip after commit).
+        if self.queue.is_tombstoned(&provisions.hash()) {
             debug!(
                 source_shard = source_shard.0,
-                batch_hash = ?batch_hash,
-                "Skipping already-committed provision batch (tombstoned)"
+                provision_hash = ?provisions.hash(),
+                "Skipping already-committed provisions (tombstoned)"
             );
             return actions;
         }
 
-        self.verified_batches.insert(
-            batch_key,
-            VerifiedBatch {
-                batch: Arc::clone(&batch),
-                source_block_ts,
-            },
-        );
-        self.store.insert(Arc::clone(&batch));
+        let provisions = self.pipeline.insert_verified(provisions, source_block_ts);
 
         // Queue for inclusion in the next block proposal. Timestamp drives
-        // the dwell-time filter in `queued_provisions()` — peers need time to
-        // receive/verify the batch via gossip before the proposer commits it.
-        self.queued_provision_batches.push(QueuedProvision {
-            batch: Arc::clone(&batch),
-            added_at: now,
-            source_block_ts,
-        });
+        // the dwell-time filter in `queued_provisions()` — peers need time
+        // to receive/verify the provisions via gossip before the proposer
+        // commits them.
+        self.queue
+            .enqueue(Arc::clone(&provisions), source_block_ts, now);
 
         debug!(
             source_shard = source_shard.0,
-            tx_count = batch.transactions.len(),
-            "Provision batch verified and queued"
+            tx_count = provisions.transactions.len(),
+            "Provisions verified and queued"
         );
 
-        // Emit ProvisionVerified for downstream consumption. The source
+        // Emit ProvisionsVerified for downstream consumption. The source
         // block timestamp anchors retention in the io-loop provision cache.
-        actions.push(Action::Continuation(ProtocolEvent::ProvisionVerified {
-            batch: Arc::clone(&batch),
+        actions.push(Action::Continuation(ProtocolEvent::ProvisionsVerified {
+            provisions: Arc::clone(&provisions),
             source_block_ts,
         }));
 
@@ -767,28 +596,23 @@ impl ProvisionCoordinator {
     // Query Methods (for other modules)
     // ═══════════════════════════════════════════════════════════════════════
 
-    /// Get queued provision batches eligible for inclusion in a block
+    /// Get queued provisions eligible for inclusion in a block
     /// proposal. Skips batches that haven't met `min_dwell_time` yet — they
     /// stay queued for a later call. Batches remain in the underlying queue
     /// until pruned on block commit.
-    pub fn queued_provisions(&self, now: LocalTimestamp) -> Vec<Arc<Provision>> {
-        let min_dwell = self.config.min_dwell_time;
-        self.queued_provision_batches
-            .iter()
-            .filter(|q| now.saturating_sub(q.added_at) >= min_dwell)
-            .map(|q| Arc::clone(&q.batch))
-            .collect()
+    pub fn queued_provisions(&self, now: LocalTimestamp) -> Vec<Arc<Provisions>> {
+        self.queue.queued(now)
     }
 
-    /// Look up a verified provision batch by its content hash.
-    pub fn get_batch_by_hash(&self, hash: &ProvisionHash) -> Option<Arc<Provision>> {
-        self.store.get(hash)
+    /// Look up verified provisions by their content hash.
+    pub fn get_provisions_by_hash(&self, hash: &ProvisionHash) -> Option<Arc<Provisions>> {
+        self.pipeline.get_provisions_by_hash(hash)
     }
 
     /// Shared provision store — same `Arc` the io-loop request handler
     /// reads from to serve `local_provision.request` responses.
     pub fn store(&self) -> &Arc<ProvisionStore> {
-        &self.store
+        self.pipeline.store()
     }
 
     /// Look up a verified remote committed block header by shard and height.
@@ -797,12 +621,12 @@ impl ProvisionCoordinator {
         shard: ShardGroupId,
         height: BlockHeight,
     ) -> Option<&Arc<CommittedBlockHeader>> {
-        self.verified_remote_headers.get(&(shard, height))
+        self.headers.get((shard, height))
     }
 
     /// Get the number of verified remote headers.
     pub fn verified_remote_header_count(&self) -> usize {
-        self.verified_remote_headers.len()
+        self.headers.len()
     }
 }
 
@@ -859,7 +683,7 @@ mod tests {
 
     /// Build a CommittedBlockHeader whose `provision_tx_roots[local_shard]`
     /// commits to the provided tx hashes — used by tests that fire matching
-    /// provision batches through `on_state_provisions_received`.
+    /// provisions through `on_state_provisions_received`.
     fn make_committed_header_committing(
         shard: ShardGroupId,
         height: BlockHeight,
@@ -964,21 +788,21 @@ mod tests {
     // ═══════════════════════════════════════════════════════════════════════
 
     /// Build a Provision for testing with a single transaction.
-    fn make_batch(
+    fn make_provisions(
         tx_hash: TxHash,
         source_shard: ShardGroupId,
         _target_shard: ShardGroupId,
         height: BlockHeight,
-    ) -> Provision {
-        make_batch_multi(vec![tx_hash], source_shard, height)
+    ) -> Provisions {
+        make_provisions_multi(vec![tx_hash], source_shard, height)
     }
 
     /// Build a Provision for testing with multiple transactions.
-    fn make_batch_multi(
+    fn make_provisions_multi(
         tx_hashes: Vec<TxHash>,
         source_shard: ShardGroupId,
         height: BlockHeight,
-    ) -> Provision {
+    ) -> Provisions {
         let transactions = tx_hashes
             .into_iter()
             .map(|tx_hash| TxEntries {
@@ -987,7 +811,7 @@ mod tests {
                 target_nodes: vec![],
             })
             .collect();
-        Provision::new(
+        Provisions::new(
             source_shard,
             height,
             MerkleInclusionProof::dummy(),
@@ -1012,14 +836,14 @@ mod tests {
         );
         coordinator.on_verified_remote_header(&topology, header);
 
-        // Then: batch arrives — should emit VerifyProvision
-        let batch = make_batch(tx_hash, source_shard, ShardGroupId(0), BlockHeight(10));
-        let actions = coordinator.on_state_provisions_received(&topology, batch);
+        // Then: provisions arrives — should emit VerifyProvisions
+        let provisions = make_provisions(tx_hash, source_shard, ShardGroupId(0), BlockHeight(10));
+        let actions = coordinator.on_state_provisions_received(&topology, provisions);
 
         assert_eq!(actions.len(), 1);
         assert!(matches!(
             &actions[0],
-            Action::VerifyProvision { batch, .. } if batch.transactions[0].tx_hash == tx_hash
+            Action::VerifyProvisions { provisions, .. } if provisions.transactions[0].tx_hash == tx_hash
         ));
     }
 
@@ -1032,8 +856,8 @@ mod tests {
         let source_shard = ShardGroupId(1);
 
         // Batch arrives before header — should buffer
-        let batch = make_batch(tx_hash, source_shard, ShardGroupId(0), BlockHeight(10));
-        let actions = coordinator.on_state_provisions_received(&topology, batch);
+        let provisions = make_provisions(tx_hash, source_shard, ShardGroupId(0), BlockHeight(10));
+        let actions = coordinator.on_state_provisions_received(&topology, provisions);
 
         assert!(actions.is_empty());
     }
@@ -1047,8 +871,8 @@ mod tests {
         let source_shard = ShardGroupId(1);
 
         // Batch arrives first — buffered
-        let batch = make_batch(tx_hash, source_shard, ShardGroupId(0), BlockHeight(10));
-        coordinator.on_state_provisions_received(&topology, batch);
+        let provisions = make_provisions(tx_hash, source_shard, ShardGroupId(0), BlockHeight(10));
+        coordinator.on_state_provisions_received(&topology, provisions);
 
         // Then header arrives (commits to the buffered tx) — should trigger verification
         let header = make_committed_header_committing(
@@ -1062,7 +886,7 @@ mod tests {
         assert_eq!(actions.len(), 1);
         assert!(matches!(
             &actions[0],
-            Action::VerifyProvision { batch, .. } if batch.transactions[0].tx_hash == tx_hash
+            Action::VerifyProvisions { provisions, .. } if provisions.transactions[0].tx_hash == tx_hash
         ));
     }
 
@@ -1071,13 +895,13 @@ mod tests {
         let topology = make_test_topology(ShardGroupId(0));
         let mut coordinator = ProvisionCoordinator::new();
 
-        let batch = make_batch(
+        let provisions = make_provisions(
             TxHash::from_raw(Hash::from_bytes(b"tx1")),
             ShardGroupId(0), // own shard
             ShardGroupId(1),
             BlockHeight(10),
         );
-        let actions = coordinator.on_state_provisions_received(&topology, batch);
+        let actions = coordinator.on_state_provisions_received(&topology, provisions);
 
         assert!(actions.is_empty());
     }
@@ -1090,7 +914,7 @@ mod tests {
         let tx_hash = TxHash::from_raw(Hash::from_bytes(b"tx1"));
         let source_shard = ShardGroupId(1);
 
-        // Setup: header + batch + verification.
+        // Setup: header + provisions + verification.
         let header = make_committed_header_committing(
             source_shard,
             BlockHeight(10),
@@ -1098,22 +922,22 @@ mod tests {
             &[tx_hash],
         );
         coordinator.on_verified_remote_header(&topology, header.clone());
-        let batch = make_batch(tx_hash, source_shard, ShardGroupId(0), BlockHeight(10));
-        coordinator.on_state_provisions_received(&topology, batch.clone());
+        let provisions = make_provisions(tx_hash, source_shard, ShardGroupId(0), BlockHeight(10));
+        coordinator.on_state_provisions_received(&topology, provisions.clone());
         coordinator.on_state_provisions_verified(
             &topology,
-            batch,
+            provisions,
             Some(header),
             true,
             LocalTimestamp::ZERO,
         );
 
-        // A duplicate batch for the same (shard, height) must short-circuit —
+        // A duplicate provisions for the same (shard, height) must short-circuit —
         // no verification action, no buffering.
-        let batch2 = make_batch(tx_hash, source_shard, ShardGroupId(0), BlockHeight(10));
+        let batch2 = make_provisions(tx_hash, source_shard, ShardGroupId(0), BlockHeight(10));
         let actions = coordinator.on_state_provisions_received(&topology, batch2);
         assert!(actions.is_empty());
-        assert!(coordinator.pending_provisions.is_empty());
+        assert_eq!(coordinator.pipeline.pending_len(), 0);
     }
 
     #[test]
@@ -1127,23 +951,23 @@ mod tests {
         // Setup
         let header = make_committed_header(source_shard, BlockHeight(10));
         coordinator.on_verified_remote_header(&topology, header.clone());
-        let batch = make_batch(tx_hash, source_shard, ShardGroupId(0), BlockHeight(10));
-        coordinator.on_state_provisions_received(&topology, batch.clone());
+        let provisions = make_provisions(tx_hash, source_shard, ShardGroupId(0), BlockHeight(10));
+        coordinator.on_state_provisions_received(&topology, provisions.clone());
 
         // Verify
         let actions = coordinator.on_state_provisions_verified(
             &topology,
-            batch,
+            provisions,
             Some(header),
             true,
             LocalTimestamp::ZERO,
         );
 
-        // Should emit ProvisionVerified
+        // Should emit ProvisionsVerified
         assert!(actions.iter().any(|a| matches!(
             a,
-            Action::Continuation(ProtocolEvent::ProvisionVerified { batch, .. })
-            if batch.transactions[0].tx_hash == tx_hash
+            Action::Continuation(ProtocolEvent::ProvisionsVerified { provisions, .. })
+            if provisions.transactions[0].tx_hash == tx_hash
         )));
     }
 
@@ -1157,22 +981,22 @@ mod tests {
 
         let header = make_committed_header(source_shard, BlockHeight(10));
         coordinator.on_verified_remote_header(&topology, header);
-        let batch = make_batch(tx_hash, source_shard, ShardGroupId(0), BlockHeight(10));
-        coordinator.on_state_provisions_received(&topology, batch.clone());
+        let provisions = make_provisions(tx_hash, source_shard, ShardGroupId(0), BlockHeight(10));
+        coordinator.on_state_provisions_received(&topology, provisions.clone());
 
         // Verification fails — no committed_header returned
         let actions = coordinator.on_state_provisions_verified(
             &topology,
-            batch,
+            provisions,
             None,
             false,
             LocalTimestamp::ZERO,
         );
 
-        // Should NOT emit ProvisionVerified
+        // Should NOT emit ProvisionsVerified
         assert!(!actions.iter().any(|a| matches!(
             a,
-            Action::Continuation(ProtocolEvent::ProvisionVerified { .. })
+            Action::Continuation(ProtocolEvent::ProvisionsVerified { .. })
         )));
     }
 
@@ -1187,7 +1011,7 @@ mod tests {
 
         let source_shard = ShardGroupId(1);
 
-        // Send batch with 3 transactions from the same block; header commits to them.
+        // Send provisions with 3 transactions from the same block; header commits to them.
         let tx_hashes: Vec<_> = (0..3)
             .map(|i| TxHash::from_raw(Hash::from_bytes(format!("tx{i}").as_bytes())))
             .collect();
@@ -1199,17 +1023,17 @@ mod tests {
         );
         coordinator.on_verified_remote_header(&topology, header);
 
-        let batch = make_batch_multi(tx_hashes, source_shard, BlockHeight(10));
+        let provisions = make_provisions_multi(tx_hashes, source_shard, BlockHeight(10));
 
-        let actions = coordinator.on_state_provisions_received(&topology, batch);
+        let actions = coordinator.on_state_provisions_received(&topology, provisions);
 
-        // Should emit exactly ONE VerifyProvision action with all 3 transactions
+        // Should emit exactly ONE VerifyProvisions action with all 3 transactions
         assert_eq!(actions.len(), 1);
         match &actions[0] {
-            Action::VerifyProvision { batch, .. } => {
-                assert_eq!(batch.transactions.len(), 3);
+            Action::VerifyProvisions { provisions, .. } => {
+                assert_eq!(provisions.transactions.len(), 3);
             }
-            other => panic!("Expected VerifyProvision, got {:?}", other),
+            other => panic!("Expected VerifyProvisions, got {:?}", other),
         }
     }
 
@@ -1232,13 +1056,13 @@ mod tests {
         assert_eq!(coordinator.verified_remote_header_count(), 1);
 
         // Batch arrives — should send single verified candidate
-        let batch = make_batch(tx_hash, source_shard, ShardGroupId(0), BlockHeight(10));
-        let actions = coordinator.on_state_provisions_received(&topology, batch);
+        let provisions = make_provisions(tx_hash, source_shard, ShardGroupId(0), BlockHeight(10));
+        let actions = coordinator.on_state_provisions_received(&topology, provisions);
 
         assert_eq!(actions.len(), 1);
         assert!(matches!(
             &actions[0],
-            Action::VerifyProvision { committed_header, .. }
+            Action::VerifyProvisions { committed_header, .. }
                 if committed_header.height() == BlockHeight(10)
         ));
     }
@@ -1260,23 +1084,23 @@ mod tests {
         coordinator.on_verified_remote_header(&topology, header);
 
         // Batch arrives while the header is live — verification dispatches.
-        let batch = make_batch(tx_hash, source_shard, ShardGroupId(0), BlockHeight(10));
-        let actions = coordinator.on_state_provisions_received(&topology, batch);
+        let provisions = make_provisions(tx_hash, source_shard, ShardGroupId(0), BlockHeight(10));
+        let actions = coordinator.on_state_provisions_received(&topology, provisions);
 
         assert_eq!(actions.len(), 1);
         assert!(matches!(
             &actions[0],
-            Action::VerifyProvision { committed_header, .. }
+            Action::VerifyProvisions { committed_header, .. }
                 if committed_header.height() == BlockHeight(10)
         ));
     }
 
     #[test]
     fn test_partial_provision_batch_rejected() {
-        // Proposer's broadcast path drops a tx from a batch. The source block
-        // header commits to the full tx set; the arriving batch contains only
+        // Proposer's broadcast path drops a tx from a provisions. The source block
+        // header commits to the full tx set; the arriving provisions contains only
         // a subset. Completeness check must reject so the fallback fetch
-        // refetches a complete batch from a peer.
+        // refetches a complete provisions from a peer.
         let topology = make_test_topology(ShardGroupId(0));
         let mut coordinator = ProvisionCoordinator::new();
 
@@ -1294,20 +1118,20 @@ mod tests {
         );
         coordinator.on_verified_remote_header(&topology, header);
 
-        // Arriving batch is missing tx_c.
-        let partial = make_batch_multi(tx_full[..2].to_vec(), source_shard, BlockHeight(10));
+        // Arriving provisions is missing tx_c.
+        let partial = make_provisions_multi(tx_full[..2].to_vec(), source_shard, BlockHeight(10));
         let actions = coordinator.on_state_provisions_received(&topology, partial);
 
         assert!(
             actions.is_empty(),
-            "partial batch must be rejected, not dispatched"
+            "partial provisions must be rejected, not dispatched"
         );
     }
 
     #[test]
     fn test_batch_with_missing_header_entry_rejected() {
         // Source block has no provision_tx_roots entry for our shard, yet a
-        // batch arrived claiming to target us — reject.
+        // provisions arrived claiming to target us — reject.
         let topology = make_test_topology(ShardGroupId(0));
         let mut coordinator = ProvisionCoordinator::new();
 
@@ -1317,13 +1141,13 @@ mod tests {
         let header = make_committed_header(source_shard, BlockHeight(10));
         coordinator.on_verified_remote_header(&topology, header);
 
-        let batch = make_batch(
+        let provisions = make_provisions(
             TxHash::from_raw(Hash::from_bytes(b"tx1")),
             source_shard,
             ShardGroupId(0),
             BlockHeight(10),
         );
-        let actions = coordinator.on_state_provisions_received(&topology, batch);
+        let actions = coordinator.on_state_provisions_received(&topology, provisions);
 
         assert!(actions.is_empty());
     }
@@ -1346,23 +1170,23 @@ mod tests {
         );
         coordinator.on_verified_remote_header(&topology, header.clone());
 
-        let batch = make_batch_multi(tx_hashes, source_shard, BlockHeight(10));
+        let provisions = make_provisions_multi(tx_hashes, source_shard, BlockHeight(10));
 
-        coordinator.on_state_provisions_received(&topology, batch.clone());
+        coordinator.on_state_provisions_received(&topology, provisions.clone());
 
-        // Entire batch fails verification
+        // Entire provisions fails verification
         let actions = coordinator.on_state_provisions_verified(
             &topology,
-            batch,
+            provisions,
             Some(header),
             false,
             LocalTimestamp::ZERO,
         );
 
-        // Verification failed — no ProvisionVerified emitted
+        // Verification failed — no ProvisionsVerified emitted
         assert!(!actions.iter().any(|a| matches!(
             a,
-            Action::Continuation(ProtocolEvent::ProvisionVerified { .. })
+            Action::Continuation(ProtocolEvent::ProvisionsVerified { .. })
         )));
     }
 
@@ -1455,7 +1279,7 @@ mod tests {
         coordinator.on_verified_remote_header(&topology, header);
 
         // Should have one expected provision
-        assert_eq!(coordinator.expected_provisions.len(), 1);
+        assert_eq!(coordinator.expected.len(), 1);
     }
 
     #[test]
@@ -1473,7 +1297,7 @@ mod tests {
 
         // Header should NOT be stored (not expecting provisions from it)
         assert_eq!(coordinator.verified_remote_header_count(), 0);
-        assert_eq!(coordinator.expected_provisions.len(), 0);
+        assert_eq!(coordinator.expected.len(), 0);
     }
 
     #[test]
@@ -1488,26 +1312,26 @@ mod tests {
             vec![ShardGroupId(0)],
         );
         coordinator.on_verified_remote_header(&topology, header.clone());
-        assert_eq!(coordinator.expected_provisions.len(), 1);
+        assert_eq!(coordinator.expected.len(), 1);
 
         // Batch arrives and is verified
-        let batch = make_batch(
+        let provisions = make_provisions(
             TxHash::from_raw(Hash::from_bytes(b"tx1")),
             source_shard,
             ShardGroupId(0),
             BlockHeight(10),
         );
-        coordinator.on_state_provisions_received(&topology, batch.clone());
+        coordinator.on_state_provisions_received(&topology, provisions.clone());
         coordinator.on_state_provisions_verified(
             &topology,
-            batch,
+            provisions,
             Some(header),
             true,
             LocalTimestamp::ZERO,
         );
 
         // Expected provision should be cleared
-        assert_eq!(coordinator.expected_provisions.len(), 0);
+        assert_eq!(coordinator.expected.len(), 0);
     }
 
     #[test]
@@ -1541,7 +1365,7 @@ mod tests {
         assert_eq!(actions.len(), 1);
         assert!(matches!(
             &actions[0],
-            Action::FetchProvisionRemote {
+            Action::FetchProvisionsRemote {
                 source_shard,
                 block_height,
                 proposer,
@@ -1568,7 +1392,7 @@ mod tests {
             vec![ShardGroupId(0)],
         );
         coordinator.on_verified_remote_header(&topology, header);
-        assert_eq!(coordinator.expected_provisions.len(), 1);
+        assert_eq!(coordinator.expected.len(), 1);
 
         // First local commit at ts=500ms. Should NOT fire — the pre-genesis
         // entry has just been retro-stamped to 500ms.
@@ -1633,16 +1457,16 @@ mod tests {
         }
 
         // Batch arrives and is verified before timeout
-        let batch = make_batch(
+        let provisions = make_provisions(
             TxHash::from_raw(Hash::from_bytes(b"tx1")),
             source_shard,
             ShardGroupId(0),
             BlockHeight(10),
         );
-        coordinator.on_state_provisions_received(&topology, batch.clone());
+        coordinator.on_state_provisions_received(&topology, provisions.clone());
         coordinator.on_state_provisions_verified(
             &topology,
-            batch,
+            provisions,
             Some(header),
             true,
             LocalTimestamp::ZERO,
@@ -1659,7 +1483,7 @@ mod tests {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    // CancelProvisionFetch Tests
+    // CancelProvisionsFetch Tests
     // ═══════════════════════════════════════════════════════════════════════
 
     #[test]
@@ -1676,34 +1500,34 @@ mod tests {
             vec![ShardGroupId(0)],
         );
         coordinator.on_verified_remote_header(&topology, header.clone());
-        assert_eq!(coordinator.expected_provisions.len(), 1);
+        assert_eq!(coordinator.expected.len(), 1);
 
         // Batch arrives and is verified
-        let batch = make_batch(
+        let provisions = make_provisions(
             TxHash::from_raw(Hash::from_bytes(b"tx1")),
             source_shard,
             ShardGroupId(0),
             BlockHeight(10),
         );
-        coordinator.on_state_provisions_received(&topology, batch.clone());
+        coordinator.on_state_provisions_received(&topology, provisions.clone());
         let actions = coordinator.on_state_provisions_verified(
             &topology,
-            batch,
+            provisions,
             Some(header),
             true,
             LocalTimestamp::ZERO,
         );
 
-        // Should emit CancelProvisionFetch action
+        // Should emit CancelProvisionsFetch action
         assert!(
             actions.iter().any(|a| matches!(
                 a,
-                Action::CancelProvisionFetch {
+                Action::CancelProvisionsFetch {
                     source_shard: s,
                     block_height: h,
                 } if *s == source_shard && *h == BlockHeight(10)
             )),
-            "Should emit CancelProvisionFetch when expected provision is verified"
+            "Should emit CancelProvisionsFetch when expected provision is verified"
         );
     }
 
@@ -1725,7 +1549,7 @@ mod tests {
         assert_eq!(coordinator.verified_remote_header_count(), 1);
 
         // Advance local well past any old time-based cutoff but short of the
-        // orphan threshold. Header stays because its batch hasn't verified yet.
+        // orphan threshold. Header stays because its provisions hasn't verified yet.
         let orphan_cutoff_blocks = RETENTION_HORIZON.as_millis() as u64 / TEST_BLOCK_INTERVAL_MS;
         for h in 1..=(orphan_cutoff_blocks / 2) {
             coordinator.on_block_committed(&topology, &make_block(BlockHeight(h)));
@@ -1755,11 +1579,11 @@ mod tests {
         coordinator.on_verified_remote_header(&topology, header.clone());
         assert_eq!(coordinator.verified_remote_header_count(), 1);
 
-        let batch = make_batch(tx_hash, source_shard, ShardGroupId(0), BlockHeight(10));
-        coordinator.on_state_provisions_received(&topology, batch.clone());
+        let provisions = make_provisions(tx_hash, source_shard, ShardGroupId(0), BlockHeight(10));
+        coordinator.on_state_provisions_received(&topology, provisions.clone());
         coordinator.on_state_provisions_verified(
             &topology,
-            batch,
+            provisions,
             Some(header),
             true,
             LocalTimestamp::ZERO,
@@ -1768,7 +1592,7 @@ mod tests {
         assert_eq!(
             coordinator.verified_remote_header_count(),
             0,
-            "Header must be dropped once its batch is verified"
+            "Header must be dropped once its provisions is verified"
         );
     }
 
@@ -1781,7 +1605,7 @@ mod tests {
         // baseline rather than the zero sentinel retro-stamped on first commit.
         coordinator.on_block_committed(&topology, &make_block(BlockHeight(1)));
 
-        // Header arrives but the batch never does — this is the orphan case
+        // Header arrives but the provisions never does — this is the orphan case
         // the long-horizon sweep guards against.
         let header = make_committed_header_with_targets(
             ShardGroupId(1),
@@ -1789,7 +1613,7 @@ mod tests {
             vec![ShardGroupId(0)],
         );
         coordinator.on_verified_remote_header(&topology, header);
-        assert_eq!(coordinator.expected_provisions.len(), 1);
+        assert_eq!(coordinator.expected.len(), 1);
 
         // Not yet past the orphan cutoff — still retained.
         // discovered_at was stamped at ts=500ms (the priming commit).
@@ -1798,7 +1622,7 @@ mod tests {
             coordinator.on_block_committed(&topology, &make_block(BlockHeight(h)));
         }
         assert_eq!(coordinator.verified_remote_header_count(), 1);
-        assert_eq!(coordinator.expected_provisions.len(), 1);
+        assert_eq!(coordinator.expected.len(), 1);
 
         // One past — orphan sweep drops header and expected entry together.
         coordinator.on_block_committed(
@@ -1806,19 +1630,19 @@ mod tests {
             &make_block(BlockHeight(orphan_cutoff_blocks + 2)),
         );
         assert_eq!(coordinator.verified_remote_header_count(), 0);
-        assert_eq!(coordinator.expected_provisions.len(), 0);
+        assert_eq!(coordinator.expected.len(), 0);
     }
 
     #[test]
     fn test_queued_batch_dropped_when_source_aged_past_horizon() {
-        // Reproduces the cluster deadlock: a batch verified long ago whose
+        // Reproduces the cluster deadlock: a provisions verified long ago whose
         // source data has aged past `RETENTION_HORIZON` must be evicted from
         // the proposer queue, otherwise it gets re-proposed forever and
         // peers without the matching remote header view-change endlessly.
         let topology = make_test_topology(ShardGroupId(0));
         let mut coordinator = ProvisionCoordinator::new();
 
-        // Verify a batch sourced from shard 1 at height 10
+        // Verify a provisions sourced from shard 1 at height 10
         // (weighted_ts = 5_000ms in the test clock).
         let tx_hash = TxHash::from_raw(Hash::from_bytes(b"old-tx"));
         let header = make_committed_header_committing(
@@ -1828,17 +1652,18 @@ mod tests {
             &[tx_hash],
         );
         coordinator.on_verified_remote_header(&topology, header.clone());
-        let batch = make_batch(tx_hash, ShardGroupId(1), ShardGroupId(0), BlockHeight(10));
-        coordinator.on_state_provisions_received(&topology, batch.clone());
+        let provisions =
+            make_provisions(tx_hash, ShardGroupId(1), ShardGroupId(0), BlockHeight(10));
+        coordinator.on_state_provisions_received(&topology, provisions.clone());
         coordinator.on_state_provisions_verified(
             &topology,
-            batch,
+            provisions,
             Some(header),
             true,
             LocalTimestamp::ZERO,
         );
-        assert_eq!(coordinator.queued_provision_batches.len(), 1);
-        assert_eq!(coordinator.verified_batches.len(), 1);
+        assert_eq!(coordinator.queue.queue_len(), 1);
+        assert_eq!(coordinator.pipeline.verified_len(), 1);
 
         // Advance local commits until past `source_block_ts + RETENTION_HORIZON`.
         // Source ts = 10 * 500ms = 5_000ms. Deadline = 5_000ms + 324_000ms.
@@ -1848,20 +1673,20 @@ mod tests {
         }
 
         assert_eq!(
-            coordinator.queued_provision_batches.len(),
+            coordinator.queue.queue_len(),
             0,
-            "queued batch past deadline must be evicted"
+            "queued provisions past deadline must be evicted"
         );
         assert_eq!(
-            coordinator.verified_batches.len(),
+            coordinator.pipeline.verified_len(),
             0,
-            "verified batch past deadline must be evicted"
+            "verified provisions past deadline must be evicted"
         );
     }
 
     #[test]
     fn test_receive_drops_batch_when_paired_header_aged_out() {
-        // Header arrived long ago; receiving a fresh provision batch for that
+        // Header arrived long ago; receiving a fresh provisions for that
         // already-aged source must short-circuit instead of dispatching a
         // verification that no peer can use.
         let topology = make_test_topology(ShardGroupId(0));
@@ -1891,14 +1716,15 @@ mod tests {
             &[tx_hash],
         );
         coordinator
-            .verified_remote_headers
+            .headers
             .insert((ShardGroupId(1), BlockHeight(10)), header);
 
-        let batch = make_batch(tx_hash, ShardGroupId(1), ShardGroupId(0), BlockHeight(10));
-        let actions = coordinator.on_state_provisions_received(&topology, batch);
+        let provisions =
+            make_provisions(tx_hash, ShardGroupId(1), ShardGroupId(0), BlockHeight(10));
+        let actions = coordinator.on_state_provisions_received(&topology, provisions);
         assert!(
             actions.is_empty(),
-            "past-deadline batch must be dropped without dispatching verification"
+            "past-deadline provisions must be dropped without dispatching verification"
         );
     }
 
@@ -1914,9 +1740,10 @@ mod tests {
         coordinator.on_block_committed(&topology, &make_block(BlockHeight(1)));
 
         let tx_hash = TxHash::from_raw(Hash::from_bytes(b"tx-pending"));
-        let batch = make_batch(tx_hash, ShardGroupId(1), ShardGroupId(0), BlockHeight(10));
-        coordinator.on_state_provisions_received(&topology, batch);
-        assert_eq!(coordinator.pending_provisions.len(), 1);
+        let provisions =
+            make_provisions(tx_hash, ShardGroupId(1), ShardGroupId(0), BlockHeight(10));
+        coordinator.on_state_provisions_received(&topology, provisions);
+        assert_eq!(coordinator.pipeline.pending_len(), 1);
 
         // Advance past the deadline horizon measured from received_at.
         let cutoff_blocks = RETENTION_HORIZON.as_millis() as u64 / TEST_BLOCK_INTERVAL_MS;
@@ -1925,7 +1752,7 @@ mod tests {
         }
 
         assert_eq!(
-            coordinator.pending_provisions.len(),
+            coordinator.pipeline.pending_len(),
             0,
             "pending entry past `received_at + RETENTION_HORIZON` must be evicted"
         );
@@ -1935,7 +1762,7 @@ mod tests {
     // Dwell-time Tests
     // ═══════════════════════════════════════════════════════════════════════
 
-    /// Helper: verify a batch through the coordinator, stamping `added_at`
+    /// Helper: verify a provisions through the coordinator, stamping `added_at`
     /// at `now`.
     fn verify_batch_into_queue(
         coordinator: &mut ProvisionCoordinator,
@@ -1948,9 +1775,9 @@ mod tests {
         let header =
             make_committed_header_committing(source_shard, height, ShardGroupId(0), &[tx_hash]);
         coordinator.on_verified_remote_header(topology, header.clone());
-        let batch = make_batch(tx_hash, source_shard, ShardGroupId(0), height);
-        coordinator.on_state_provisions_received(topology, batch.clone());
-        coordinator.on_state_provisions_verified(topology, batch, Some(header), true, now);
+        let provisions = make_provisions(tx_hash, source_shard, ShardGroupId(0), height);
+        coordinator.on_state_provisions_received(topology, provisions.clone());
+        coordinator.on_state_provisions_verified(topology, provisions, Some(header), true, now);
     }
 
     #[test]
@@ -1972,7 +1799,7 @@ mod tests {
         assert_eq!(
             coordinator.queued_provisions(now).len(),
             1,
-            "Zero dwell time should expose the batch immediately"
+            "Zero dwell time should expose the provisions immediately"
         );
     }
 
@@ -2019,7 +1846,7 @@ mod tests {
             min_dwell_time: Duration::from_millis(200),
         });
 
-        // t=1.0s: verify old batch
+        // t=1.0s: verify old provisions
         verify_batch_into_queue(
             &mut coordinator,
             &topology,
@@ -2029,7 +1856,7 @@ mod tests {
             LocalTimestamp::from_millis(1_000),
         );
 
-        // t=1.3s: verify young batch
+        // t=1.3s: verify young provisions
         verify_batch_into_queue(
             &mut coordinator,
             &topology,
@@ -2039,7 +1866,7 @@ mod tests {
             LocalTimestamp::from_millis(1_300),
         );
 
-        // t=1.4s: old batch dwelled 400ms (eligible), young batch dwelled
+        // t=1.4s: old provisions dwelled 400ms (eligible), young provisions dwelled
         // 100ms (still blocked).
         let eligible = coordinator.queued_provisions(LocalTimestamp::from_millis(1_400));
         assert_eq!(eligible.len(), 1);
@@ -2051,7 +1878,7 @@ mod tests {
 
     proptest::proptest! {
         /// After enough commits to push `local_committed_ts` past every
-        /// inserted batch's deadline, every retention store must be empty.
+        /// inserted provisions's deadline, every retention store must be empty.
         /// Reproduces the cluster-deadlock invariant in property form: no
         /// matter the mix of (verified, queued, pending) batches and their
         /// source heights, the sweep eventually drains them.
@@ -2061,7 +1888,7 @@ mod tests {
             // their source ts (height * 500ms) anchors the deadline.
             source_heights in proptest::collection::vec(1u64..=50, 0..=16),
             // Some batches will be left pending (no header arrives), some
-            // will be verified. A bool per batch picks the path.
+            // will be verified. A bool per provisions picks the path.
             verify_path in proptest::collection::vec(proptest::bool::ANY, 0..=16),
         ) {
             let topology = make_test_topology(ShardGroupId(0));
@@ -2074,7 +1901,7 @@ mod tests {
                 let source_height = BlockHeight(source_heights[i]);
                 let tx_hash =
                     TxHash::from_raw(Hash::from_bytes(format!("tx-{}", i).as_bytes()));
-                let batch = make_batch(
+                let provisions = make_provisions(
                     tx_hash,
                     ShardGroupId(1),
                     ShardGroupId(0),
@@ -2082,7 +1909,7 @@ mod tests {
                 );
 
                 if verify_path[i] {
-                    // Verified path: header arrives, then the batch.
+                    // Verified path: header arrives, then the provisions.
                     let header = make_committed_header_committing(
                         ShardGroupId(1),
                         source_height,
@@ -2090,17 +1917,17 @@ mod tests {
                         &[tx_hash],
                     );
                     coordinator.on_verified_remote_header(&topology, header.clone());
-                    coordinator.on_state_provisions_received(&topology, batch.clone());
+                    coordinator.on_state_provisions_received(&topology, provisions.clone());
                     coordinator.on_state_provisions_verified(
                         &topology,
-                        batch,
+                        provisions,
                         Some(header),
                         true,
                         LocalTimestamp::ZERO,
                     );
                 } else {
-                    // Pending path: batch arrives without header.
-                    coordinator.on_state_provisions_received(&topology, batch);
+                    // Pending path: provisions arrives without header.
+                    coordinator.on_state_provisions_received(&topology, provisions);
                 }
             }
 
@@ -2113,9 +1940,9 @@ mod tests {
                 coordinator.on_block_committed(&topology, &make_block(BlockHeight(h)));
             }
 
-            proptest::prop_assert_eq!(coordinator.queued_provision_batches.len(), 0);
-            proptest::prop_assert_eq!(coordinator.verified_batches.len(), 0);
-            proptest::prop_assert_eq!(coordinator.pending_provisions.len(), 0);
+            proptest::prop_assert_eq!(coordinator.queue.queue_len(), 0);
+            proptest::prop_assert_eq!(coordinator.pipeline.verified_len(), 0);
+            proptest::prop_assert_eq!(coordinator.pipeline.pending_len(), 0);
         }
     }
 }

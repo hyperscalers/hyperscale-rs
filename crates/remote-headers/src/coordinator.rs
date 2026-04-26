@@ -476,7 +476,7 @@ impl RemoteHeaderCoordinator {
     /// Get all pending (unverified) headers for a (shard, height).
     ///
     /// Used by Provision when a provision arrives before QC verification
-    /// completes — it can pass these as candidates to `VerifyProvision`.
+    /// completes — it can pass these as candidates to `VerifyProvisions`.
     pub fn get_pending(
         &self,
         shard: ShardGroupId,

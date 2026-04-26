@@ -1267,24 +1267,24 @@ impl MetricsRecorder for PrometheusRecorder {
             .set(m.prov_pending_provisions as f64);
         self.metrics
             .memory_provisions
-            .with_label_values(&["verified_batches"])
-            .set(m.prov_verified_batches as f64);
+            .with_label_values(&["verified_provisions"])
+            .set(m.prov_verified_provisions as f64);
         self.metrics
             .memory_provisions
             .with_label_values(&["expected_provisions"])
             .set(m.prov_expected_provisions as f64);
         self.metrics
             .memory_provisions
-            .with_label_values(&["batches_by_hash"])
-            .set(m.prov_batches_by_hash as f64);
+            .with_label_values(&["provisions_by_hash"])
+            .set(m.prov_provisions_by_hash as f64);
         self.metrics
             .memory_provisions
-            .with_label_values(&["queued_provision_batches"])
-            .set(m.prov_queued_provision_batches as f64);
+            .with_label_values(&["queued_provisions"])
+            .set(m.prov_queued_provisions as f64);
         self.metrics
             .memory_provisions
-            .with_label_values(&["committed_batch_tombstones"])
-            .set(m.prov_committed_batch_tombstones as f64);
+            .with_label_values(&["committed_tombstones"])
+            .set(m.prov_committed_tombstones as f64);
 
         // Node (io_loop)
         self.metrics

@@ -267,7 +267,7 @@ where
             // Delegated work — immediate dispatch
             // ═══════════════════════════════════════════════════════════
             Action::BuildProposal { .. } => {
-                // Provision batches included in the proposal were already
+                // Provisions included in the proposal were already
                 // inserted into the shared `ProvisionStore` by the provisions
                 // coordinator at verify time and persist until the
                 // post-commit retention sweep drops them.
@@ -282,7 +282,7 @@ where
             | Action::VerifyCertificateRoot { .. }
             | Action::VerifyLocalReceiptRoot { .. }
             | Action::VerifyProvisionTxRoots { .. }
-            | Action::VerifyProvision { .. }
+            | Action::VerifyProvisions { .. }
             | Action::ExecuteTransactions { .. }
             | Action::ExecuteCrossShardTransactions { .. }
             | Action::FetchAndBroadcastProvision { .. } => {
@@ -366,13 +366,13 @@ where
             // ═══════════════════════════════════════════════════════════
             Action::StartSync { .. }
             | Action::FetchTransactions { .. }
-            | Action::FetchProvisionLocal { .. }
+            | Action::FetchProvisionsLocal { .. }
             | Action::FetchFinalizedWave { .. }
             | Action::CancelFetch { .. }
-            | Action::FetchProvisionRemote { .. }
+            | Action::FetchProvisionsRemote { .. }
             | Action::RequestMissingExecutionCert { .. }
             | Action::CancelExecutionCertFetch { .. }
-            | Action::CancelProvisionFetch { .. }
+            | Action::CancelProvisionsFetch { .. }
             | Action::RequestMissingCommittedBlockHeader { .. }
             | Action::CancelCommittedHeaderFetch { .. } => {
                 self.process_sync_fetch_action(action);
@@ -843,7 +843,7 @@ where
                 self.process_transaction_fetch_outputs(outputs);
                 self.update_fetch_tick_timer();
             }
-            Action::FetchProvisionLocal {
+            Action::FetchProvisionsLocal {
                 block_hash,
                 proposer,
                 batch_hashes,
@@ -889,7 +889,7 @@ where
                 self.finalized_wave_fetch_protocol
                     .handle(FinalizedWaveFetchInput::CancelFetch { block_hash });
             }
-            Action::FetchProvisionRemote {
+            Action::FetchProvisionsRemote {
                 source_shard,
                 block_height,
                 proposer,
@@ -897,7 +897,7 @@ where
             } => {
                 debug_assert!(
                     !peers.is_empty(),
-                    "FetchProvisionRemote for shard {} height {} has no peers — \
+                    "FetchProvisionsRemote for shard {} height {} has no peers — \
                      was the action enriched by NodeStateMachine?",
                     source_shard.0,
                     block_height.0,
@@ -927,7 +927,7 @@ where
                 self.process_provision_fetch_outputs(tick_outputs);
                 self.update_fetch_tick_timer();
             }
-            Action::CancelProvisionFetch {
+            Action::CancelProvisionsFetch {
                 source_shard,
                 block_height,
             } => {

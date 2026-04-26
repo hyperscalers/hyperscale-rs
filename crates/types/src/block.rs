@@ -5,8 +5,8 @@ use crate::GlobalReceiptHash;
 use crate::{
     block_vote_message, compute_merkle_root, compute_padded_merkle_root, decode_finalized_wave_vec,
     encode_finalized_wave_vec, BlockHash, BlockHeight, Bls12381G1PrivateKey, Bls12381G2Signature,
-    CertificateRoot, FinalizedWave, Hash, LocalReceiptRoot, ProposerTimestamp, Provision,
-    ProvisionHash, ProvisionTxRoot, ProvisionsRoot, QuorumCertificate, ReceiptBundle, Round,
+    CertificateRoot, FinalizedWave, Hash, LocalReceiptRoot, ProposerTimestamp, ProvisionHash,
+    ProvisionTxRoot, Provisions, ProvisionsRoot, QuorumCertificate, ReceiptBundle, Round,
     RoutableTransaction, ShardGroupId, StateRoot, TransactionRoot, TxHash, ValidatorId, WaveId,
     WaveIdHash,
 };
@@ -57,7 +57,7 @@ pub fn compute_local_receipt_root(receipts: &[ReceiptBundle]) -> LocalReceiptRoo
 
 /// Compute the provisions merkle root for a block.
 ///
-/// Each provision batch's hash becomes a leaf. Returns `Hash::ZERO` if empty.
+/// Each provisions' hash becomes a leaf. Returns `Hash::ZERO` if empty.
 pub fn compute_provision_root(batch_hashes: &[Hash]) -> ProvisionsRoot {
     if batch_hashes.is_empty() {
         return ProvisionsRoot::ZERO;
@@ -150,7 +150,7 @@ pub struct BlockHeader {
     /// For empty blocks (genesis, fallback, no certificates), this is `LocalReceiptRoot::ZERO`.
     pub local_receipt_root: LocalReceiptRoot,
 
-    /// Merkle root of provision batches included in this block.
+    /// Merkle root of provisions included in this block.
     ///
     /// Commits to which remote-shard provisions are available at this height.
     /// Validators who voted for the BFT proposal have this data locally.
@@ -168,7 +168,7 @@ pub struct BlockHeader {
     /// `validate_waves` recomputes this from `transactions` and compares.
     ///
     /// Used by remote shards to know which execution certificates to expect.
-    /// Provision-batch completeness is handled separately via
+    /// Provisions completeness is handled separately via
     /// [`BlockHeader::provision_tx_roots`]. Empty for genesis, fallback, and
     /// sync blocks.
     pub waves: Vec<WaveId>,
@@ -178,7 +178,7 @@ pub struct BlockHeader {
     ///
     /// Key = target shard; value = `compute_padded_merkle_root` over the
     /// ordered tx hashes destined for that target (block order, already
-    /// hash-ascending). Lets the target verify a received `ProvisionBatch`
+    /// hash-ascending). Lets the target verify a received `Provisions`
     /// contains the full set it was meant to receive — catches silently
     /// dropped txs on the broadcast path.
     ///
@@ -274,7 +274,7 @@ pub enum Block {
         header: BlockHeader,
         transactions: Vec<Arc<RoutableTransaction>>,
         certificates: Vec<Arc<FinalizedWave>>,
-        provisions: Vec<Arc<Provision>>,
+        provisions: Vec<Arc<Provisions>>,
     },
     Sealed {
         header: BlockHeader,
@@ -330,7 +330,7 @@ fn encode_tx_vec<E: sbor::Encoder<sbor::NoCustomValueKind>>(
 /// transaction / finalized-wave helpers.
 fn encode_provision_vec<E: sbor::Encoder<sbor::NoCustomValueKind>>(
     encoder: &mut E,
-    provisions: &[Arc<Provision>],
+    provisions: &[Arc<Provisions>],
 ) -> Result<(), sbor::EncodeError> {
     encoder.write_value_kind(sbor::ValueKind::Array)?;
     encoder.write_value_kind(sbor::ValueKind::Tuple)?;
@@ -416,7 +416,7 @@ fn decode_tx_vec<D: sbor::Decoder<sbor::NoCustomValueKind>>(
 /// Helper to decode a Vec<Arc<Provision>> from an SBOR array.
 fn decode_provision_vec<D: sbor::Decoder<sbor::NoCustomValueKind>>(
     decoder: &mut D,
-) -> Result<Vec<Arc<Provision>>, sbor::DecodeError> {
+) -> Result<Vec<Arc<Provisions>>, sbor::DecodeError> {
     decoder.read_and_check_value_kind(sbor::ValueKind::Array)?;
     decoder.read_and_check_value_kind(sbor::ValueKind::Tuple)?;
     let count = decoder.read_size()?;
@@ -428,7 +428,7 @@ fn decode_provision_vec<D: sbor::Decoder<sbor::NoCustomValueKind>>(
     }
     let mut out = Vec::with_capacity(count);
     for _ in 0..count {
-        let p: Provision = decoder.decode_deeper_body_with_value_kind(sbor::ValueKind::Tuple)?;
+        let p: Provisions = decoder.decode_deeper_body_with_value_kind(sbor::ValueKind::Tuple)?;
         out.push(Arc::new(p));
     }
     Ok(out)
@@ -536,11 +536,11 @@ impl Block {
         }
     }
 
-    /// Provision batches. Non-empty only for `Live`; `Sealed` blocks have
+    /// Provisions. Non-empty only for `Live`; `Sealed` blocks have
     /// dropped their provisions because the cross-shard execution window
     /// they served has passed. Use `is_live()` when the variant itself
     /// matters — this accessor flattens both cases to a slice.
-    pub fn provisions(&self) -> &[Arc<Provision>] {
+    pub fn provisions(&self) -> &[Arc<Provisions>] {
         match self {
             Block::Live { provisions, .. } => provisions,
             Block::Sealed { .. } => &[],
@@ -576,7 +576,7 @@ impl Block {
     /// to upgrade a persisted block when the requester is still inside the
     /// cross-shard execution window. Panics if invoked on a `Live` block —
     /// that would silently discard the existing provision set.
-    pub fn into_live(self, provisions: Vec<Arc<Provision>>) -> Block {
+    pub fn into_live(self, provisions: Vec<Arc<Provisions>>) -> Block {
         match self {
             Block::Sealed {
                 header,
@@ -648,7 +648,7 @@ pub struct BlockManifest {
     /// Validators use these to match against their locally finalized waves.
     pub cert_hashes: Vec<WaveIdHash>,
 
-    /// Hashes of provision batches included in this block.
+    /// Hashes of provisions included in this block.
     /// Used for provision data availability — validators fetch missing batches by hash.
     pub provision_hashes: Vec<ProvisionHash>,
 }

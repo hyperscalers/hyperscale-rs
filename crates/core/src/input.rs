@@ -3,7 +3,7 @@
 use crate::ProtocolEvent;
 use hyperscale_types::{
     BlockHash, BlockHeight, Bls12381G1PublicKey, Bls12381G2Signature, CommittedBlockHeader,
-    ExecutionCertificate, FinalizedWave, Provision, ProvisionHash, RoutableTransaction,
+    ExecutionCertificate, FinalizedWave, ProvisionHash, Provisions, RoutableTransaction,
     ShardGroupId, TxHash, ValidatorId, WaveIdHash,
 };
 use std::sync::Arc;
@@ -89,7 +89,7 @@ pub enum NodeInput {
         transactions: Vec<Arc<RoutableTransaction>>,
     },
 
-    /// Local provision batches received from a fetch request.
+    /// Local provisions received from a fetch request.
     ///
     /// `missing_hashes` lists requested hashes the peer did not have
     /// (evicted or never seen). Together with `batches` it fully partitions
@@ -97,7 +97,7 @@ pub enum NodeInput {
     /// retry without relying on a per-peer heuristic.
     LocalProvisionReceived {
         block_hash: BlockHash,
-        batches: Vec<Arc<Provision>>,
+        batches: Vec<Arc<Provisions>>,
         missing_hashes: Vec<ProvisionHash>,
     },
 
@@ -154,12 +154,12 @@ pub enum NodeInput {
     /// The I/O loop sends one `StateProvisionNotification` per target shard,
     /// targeted to the specific recipients embedded in each batch tuple.
     ProvisionReady {
-        /// (target_shard, provision_batch, recipients) per target shard.
-        batches: Vec<(ShardGroupId, Provision, Vec<ValidatorId>)>,
+        /// (target_shard, provisions, recipients) per target shard.
+        batches: Vec<(ShardGroupId, Provisions, Vec<ValidatorId>)>,
     },
 
     /// Provision successfully received from a provision fetch request.
-    ProvisionFetchReceived { batch: Provision },
+    ProvisionFetchReceived { provisions: Provisions },
 
     /// A provision fetch request failed (network error or peer returned None).
     ProvisionFetchFailed {
@@ -219,7 +219,7 @@ impl NodeInput {
                 | ProtocolEvent::TransactionGossipReceived { .. }
                 | ProtocolEvent::GlobalBlockReceived { .. }
                 | ProtocolEvent::GlobalBlockVoteReceived { .. }
-                | ProtocolEvent::StateProvisionReceived { .. } => EventPriority::Network,
+                | ProtocolEvent::StateProvisionsReceived { .. } => EventPriority::Network,
 
                 // Fetch delivery events are processed callbacks from the fetch
                 // protocol, not raw network messages (analogous to
