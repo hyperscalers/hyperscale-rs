@@ -56,7 +56,7 @@ where
         // ── block.request → sync protocol ────────────────────────────
 
         let storage = Arc::clone(&self.storage);
-        let provision_store = Arc::clone(&self.provision_store);
+        let provision_store = Arc::clone(&self.caches.provision_store);
         self.network
             .register_request_handler::<GetBlockRequest>(move |req| {
                 serve_block_request(&*storage, &provision_store, &req)
@@ -65,7 +65,7 @@ where
         // ── block_topup.request → sync protocol ──────────────────────
 
         let storage = Arc::clone(&self.storage);
-        let provision_store = Arc::clone(&self.provision_store);
+        let provision_store = Arc::clone(&self.caches.provision_store);
         self.network
             .register_request_handler::<GetBlockTopUpRequest>(move |req| {
                 serve_block_topup_request(&*storage, &provision_store, &req)
@@ -74,7 +74,7 @@ where
         // ── transaction.request → fetch protocol ─────────────────────
 
         let storage = Arc::clone(&self.storage);
-        let tx_cache = Arc::clone(&self.tx_cache);
+        let tx_cache = Arc::clone(&self.caches.tx);
         self.network
             .register_request_handler::<GetTransactionsRequest>(move |req| {
                 serve_transaction_request(&*storage, &tx_cache, &req)
@@ -94,7 +94,7 @@ where
 
         let storage = Arc::clone(&self.storage);
         let topology = self.topology.clone();
-        let outbound_cache = Arc::clone(&self.provision_store);
+        let outbound_cache = Arc::clone(&self.caches.provision_store);
 
         let dedup: Arc<std::sync::Mutex<ProvisionRequestDedup>> =
             Arc::new(std::sync::Mutex::new(ProvisionRequestDedup {
@@ -192,7 +192,7 @@ where
 
         // ── local_provision.request → provision cache lookup ─────────
 
-        let provision_store = Arc::clone(&self.provision_store);
+        let provision_store = Arc::clone(&self.caches.provision_store);
         self.network
             .register_request_handler::<hyperscale_messages::request::GetLocalProvisionsRequest>(
                 move |req: hyperscale_messages::request::GetLocalProvisionsRequest| {
@@ -213,7 +213,7 @@ where
 
         // ── finalized_wave.request → finalized wave cache lookup ─────
 
-        let fw_cache = Arc::clone(&self.finalized_wave_cache);
+        let fw_cache = Arc::clone(&self.caches.finalized_wave);
         self.network
             .register_request_handler::<hyperscale_messages::request::GetFinalizedWavesRequest>(
                 move |req: hyperscale_messages::request::GetFinalizedWavesRequest| {
@@ -231,7 +231,7 @@ where
 
         // ── execution_cert.request → cert cache lookup ────────────────
 
-        let cert_cache = Arc::clone(&self.exec_cert_cache);
+        let cert_cache = Arc::clone(&self.caches.exec_cert);
         let storage = Arc::clone(&self.storage);
         self.network
             .register_request_handler::<hyperscale_messages::request::GetExecutionCertsRequest>(

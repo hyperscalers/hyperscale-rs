@@ -104,7 +104,7 @@ where
         hyperscale_messages::request::Inventory {
             tx_have: self.state.mempool().tx_bloom_snapshot(),
             cert_have: self.state.execution().cert_bloom_snapshot(),
-            provision_have: self.provision_store.provision_bloom_snapshot(),
+            provision_have: self.caches.provision_store.provision_bloom_snapshot(),
         }
     }
 
@@ -119,7 +119,7 @@ where
     {
         let mempool = self.state.mempool();
         let execution = self.state.execution();
-        let provision_store = &self.provision_store;
+        let provision_store = &self.caches.provision_store;
         elided.try_rehydrate(
             |h| mempool.get_transaction(h),
             |h| execution.get_finalized_wave_by_hash(h),
@@ -146,7 +146,7 @@ where
         let mut topup_prov: HashMap<_, _> = topup.provisions.into_iter().collect();
         let mempool = self.state.mempool();
         let execution = self.state.execution();
-        let provision_store = &self.provision_store;
+        let provision_store = &self.caches.provision_store;
         elided.try_rehydrate(
             |h| topup_tx.remove(h).or_else(|| mempool.get_transaction(h)),
             |h| {

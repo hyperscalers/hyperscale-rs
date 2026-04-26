@@ -21,6 +21,7 @@
 mod actions;
 mod batches;
 mod block_commit;
+mod caches;
 mod handlers;
 mod phase_times;
 mod protocols;
@@ -30,6 +31,7 @@ use crate::NodeStateMachine;
 use crate::batch_accumulator::BatchAccumulator;
 use crate::config::NodeConfig;
 use crate::io_loop::block_commit::BlockCommitCoordinator;
+use crate::io_loop::caches::SharedCaches;
 use crate::protocol::execution_cert_fetch::{ExecCertFetchInput, ExecCertFetchProtocol};
 use crate::protocol::finalized_wave_fetch::{FinalizedWaveFetchInput, FinalizedWaveFetchProtocol};
 use crate::protocol::header_fetch::{HeaderFetchInput, HeaderFetchProtocol};
@@ -48,13 +50,12 @@ use hyperscale_metrics as metrics;
 use hyperscale_network::Network;
 use hyperscale_storage::{ChainReader, ChainWriter, JmtTreeReader, SubstateStore, VersionedStore};
 use hyperscale_types::{
-    BlockHeight, Bls12381G1PrivateKey, Bls12381G1PublicKey, CommittedBlockHeader,
-    ExecutionCertificate, FinalizedWave, RoutableTransaction, ShardGroupId, StateRoot,
-    TopologySnapshot, TxHash, ValidatorId, WaveId, WaveIdHash,
+    BlockHeight, Bls12381G1PrivateKey, Bls12381G1PublicKey, CommittedBlockHeader, ShardGroupId,
+    StateRoot, TopologySnapshot, TxHash, ValidatorId,
 };
 use quick_cache::sync::Cache as QuickCache;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Lock-free shared topology snapshot for handler closures and dispatch.
@@ -63,15 +64,6 @@ use std::time::Duration;
 /// Handler closures call `.load()` to get the current snapshot atomically.
 pub type SharedTopologySnapshot = Arc<ArcSwap<TopologySnapshot>>;
 
-/// Shared execution certificate cache for fallback serving.
-type ExecCertCache = Arc<Mutex<HashMap<(WaveIdHash, WaveId), Arc<ExecutionCertificate>>>>;
-
-/// Default certificate cache capacity.
-const DEFAULT_CERT_CACHE_SIZE: usize = 10_000;
-/// Default transaction cache capacity.
-const DEFAULT_TX_CACHE_SIZE: usize = 50_000;
-/// Default transaction status cache capacity.
-const DEFAULT_TX_STATUS_CACHE_SIZE: usize = 100_000;
 /// A committed header pending sender-signature verification.
 type CommittedHeaderVerificationItem = (
     CommittedBlockHeader,
@@ -255,10 +247,9 @@ where
     /// ancestors and are structurally invisible to anchored views.
     pending_chain: Arc<hyperscale_storage::PendingChain<S>>,
 
-    // In-memory caches (shared with inbound router in production)
-    tx_cache: Arc<QuickCache<TxHash, Arc<RoutableTransaction>>>,
-    provision_store: Arc<hyperscale_provisions::ProvisionStore>,
-    finalized_wave_cache: Arc<QuickCache<WaveIdHash, Arc<FinalizedWave>>>,
+    /// Inbound request-serving caches plus the cross-thread tx-status view
+    /// shared with external RPC consumers.
+    caches: SharedCaches,
 
     // Sync protocol
     sync_protocol: SyncProtocol,
@@ -294,13 +285,8 @@ where
     locally_submitted: HashSet<TxHash>,
 
     // Batch accumulators
-    validation_batch: BatchAccumulator<Arc<RoutableTransaction>>,
+    validation_batch: BatchAccumulator<Arc<hyperscale_types::RoutableTransaction>>,
     committed_header_batch: BatchAccumulator<CommittedHeaderVerificationItem>,
-
-    // Transaction status cache — retains the latest status for every transaction
-    // that has emitted a status notification. Bounded LRU cache shared (via Arc)
-    // with external consumers (e.g. RPC handlers in production).
-    tx_status_cache: Arc<QuickCache<TxHash, hyperscale_types::TransactionStatus>>,
 
     /// Last time a "transaction finalization exceeded 10s" warning was emitted.
     /// Rate-limited to avoid flooding logs during cross-shard latency spikes.
@@ -310,10 +296,6 @@ where
     /// from `EmitTransactionStatus` and `RecordTxEcCreated` actions; entries
     /// are dropped on terminal status.
     tx_phase_times: phase_times::TxPhaseTimesCache,
-
-    // Execution certificate cache for fallback serving.
-    // Shared with request handler thread. Keyed by (wave_id_hash, wave_id).
-    exec_cert_cache: ExecCertCache,
 
     // Accumulated outputs from this step (for caller to drain)
     emitted_statuses: Vec<(TxHash, hyperscale_types::TransactionStatus)>,
@@ -365,7 +347,7 @@ where
             HeaderFetchProtocol::new(crate::protocol::header_fetch::HeaderFetchConfig::default());
         let storage = Arc::new(storage);
         let pending_chain = Arc::new(hyperscale_storage::PendingChain::new(Arc::clone(&storage)));
-        let provision_store = Arc::clone(state.provisions().store());
+        let caches = SharedCaches::new(Arc::clone(state.provisions().store()));
         Self {
             state,
             storage,
@@ -381,9 +363,7 @@ where
             // At startup, everything committed is also persisted on disk.
             block_commit: BlockCommitCoordinator::new(initial_persisted_height),
             pending_chain,
-            tx_cache: Arc::new(QuickCache::new(DEFAULT_TX_CACHE_SIZE)),
-            provision_store,
-            finalized_wave_cache: Arc::new(QuickCache::new(DEFAULT_CERT_CACHE_SIZE)),
+            caches,
             tx_validator,
             pending_validation: HashSet::new(),
             locally_submitted: HashSet::new(),
@@ -399,8 +379,6 @@ where
                 b.committed_header_max,
                 b.committed_header_window,
             ),
-            exec_cert_cache: Arc::new(Mutex::new(HashMap::new())),
-            tx_status_cache: Arc::new(QuickCache::new(DEFAULT_TX_STATUS_CACHE_SIZE)),
             last_slow_tx_warn: hyperscale_types::LocalTimestamp::ZERO,
             tx_phase_times: phase_times::TxPhaseTimesCache::default(),
             emitted_statuses: Vec::new(),
@@ -497,7 +475,7 @@ where
     /// `StepOutput::emitted_statuses`, this cache persists across steps and
     /// survives mempool eviction.
     pub fn tx_status(&self, hash: &TxHash) -> Option<hyperscale_types::TransactionStatus> {
-        self.tx_status_cache.get(hash)
+        self.caches.tx_status.get(hash)
     }
 
     /// Access the transaction status cache.
@@ -505,7 +483,7 @@ where
     /// The cache is an `Arc<QuickCache>` so it can be shared with external
     /// consumers (e.g. RPC handlers) across threads without locking.
     pub fn tx_status_cache(&self) -> &Arc<QuickCache<TxHash, hyperscale_types::TransactionStatus>> {
-        &self.tx_status_cache
+        &self.caches.tx_status
     }
 
     // ─── Event Processing ───────────────────────────────────────────────
@@ -544,7 +522,7 @@ where
                 let tx_hash = tx.hash();
                 self.pending_validation.remove(&tx_hash);
                 let is_local = submitted_locally || self.locally_submitted.remove(&tx_hash);
-                self.tx_cache.insert(tx_hash, Arc::clone(&tx));
+                self.caches.tx.insert(tx_hash, Arc::clone(&tx));
                 self.actions_generated = 0;
                 self.feed_event(ProtocolEvent::TransactionGossipReceived {
                     tx,
@@ -563,7 +541,7 @@ where
             // Intercept gossip-received transactions for validation.
             NodeInput::Protocol(ProtocolEvent::TransactionGossipReceived { tx, .. }) => {
                 let tx_hash = tx.hash();
-                if self.tx_cache.get(&tx_hash).is_none()
+                if self.caches.tx.get(&tx_hash).is_none()
                     && !self.state.mempool().is_tombstoned(&tx_hash)
                 {
                     self.pending_validation.insert(tx_hash);
@@ -587,7 +565,7 @@ where
                 }
 
                 if !self.pending_validation.contains(&tx_hash)
-                    && self.tx_cache.get(&tx_hash).is_none()
+                    && self.caches.tx.get(&tx_hash).is_none()
                 {
                     // Paired with validation: only queued txs are removed on completion.
                     self.locally_submitted.insert(tx_hash);
@@ -1184,11 +1162,11 @@ where
                 prov_queued_provisions: prov_mem.queued_provisions,
                 prov_committed_tombstones: prov_mem.committed_tombstones,
                 // Node (io_loop)
-                node_tx_cache: self.tx_cache.len(),
-                node_tx_status_cache: self.tx_status_cache.len(),
-                node_finalized_wave_cache: self.finalized_wave_cache.len(),
-                node_provision_cache: self.provision_store.len(),
-                node_exec_cert_cache: self.exec_cert_cache.lock().unwrap().len(),
+                node_tx_cache: self.caches.tx.len(),
+                node_tx_status_cache: self.caches.tx_status.len(),
+                node_finalized_wave_cache: self.caches.finalized_wave.len(),
+                node_provision_cache: self.caches.provision_store.len(),
+                node_exec_cert_cache: self.caches.exec_cert.lock().unwrap().len(),
                 node_prepared_commits: self.block_commit.prepared_len(),
                 node_pending_validation: self.pending_validation.len(),
                 node_locally_submitted: self.locally_submitted.len(),

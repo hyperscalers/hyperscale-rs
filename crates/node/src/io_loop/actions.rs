@@ -235,7 +235,7 @@ where
                 let key = (certificate.wave_id.hash(), certificate.wave_id.clone());
                 // Cache for serving EC fetch requests from remote shards.
                 // Persistence is handled via wave certificates in block.certificates.
-                if let Ok(mut cache) = self.exec_cert_cache.lock() {
+                if let Ok(mut cache) = self.caches.exec_cert.lock() {
                     cache.insert(key, Arc::clone(&certificate));
                     if cache.len() > 2000 {
                         let cutoff = cache
@@ -334,7 +334,7 @@ where
                     }
                     metrics::record_transaction_finalized(latency_secs, cross_shard);
                 }
-                self.tx_status_cache.insert(tx_hash, status.clone());
+                self.caches.tx_status.insert(tx_hash, status.clone());
                 self.emitted_statuses.push((tx_hash, status));
             }
             Action::RecordTxEcCreated { tx_hashes } => {
@@ -405,7 +405,7 @@ where
         match action {
             Action::CacheFinalizedWave { wave } => {
                 let wave_id_hash = wave.wave_id_hash();
-                self.finalized_wave_cache.insert(wave_id_hash, wave);
+                self.caches.finalized_wave.insert(wave_id_hash, wave);
             }
             Action::FetchChainMetadata => {
                 let height = self.storage.committed_height();
