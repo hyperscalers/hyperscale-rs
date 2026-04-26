@@ -213,10 +213,9 @@ impl<H: Hasher, const ARITY_BITS: u8> Tree<H, ARITY_BITS> {
         }
 
         // Reconstruct root by walking the claim topology.
-        let mut sib_iter = proof.siblings.iter();
-        let computed = verify_rec::<H, ARITY_BITS>(&proof.claims, 0, &mut sib_iter)?;
+        let (computed, consumed) = verify_rec::<H, ARITY_BITS>(&proof.claims, 0, &proof.siblings)?;
 
-        if sib_iter.next().is_some() {
+        if consumed != proof.siblings.len() {
             return Err(ProofError::Malformed("trailing siblings"));
         }
 
@@ -360,11 +359,16 @@ where
     }
 }
 
+/// Reconstruct the subtree hash for `claims` and report how many
+/// siblings were consumed from the front of `siblings`.
+///
+/// The returned `usize` lets callers slice `siblings` for sibling
+/// subtrees independently — required for parallel reconstruction.
 fn verify_rec<H, const ARITY_BITS: u8>(
     claims: &[ProofClaim],
     depth: u16,
-    siblings: &mut std::slice::Iter<'_, Hash>,
-) -> Result<Hash, ProofError>
+    siblings: &[Hash],
+) -> Result<(Hash, usize), ProofError>
 where
     H: Hasher,
 {
@@ -383,35 +387,118 @@ where
         // the hash from the first claim; consistency checking across
         // claims is left to the application layer (expected_claims
         // matching in verify()).
-        return Ok(termination_hash::<H>(&claims[0]));
+        return Ok((termination_hash::<H>(&claims[0]), 0));
     }
 
     // Non-terminal: split claims by bucket at this depth.
     let arity = 1usize << ARITY_BITS as usize;
-    let mut children: Vec<Hash> = vec![EMPTY_HASH; arity];
+    let child_depth = depth + u16::from(ARITY_BITS);
+    let mut bucket_ranges: Vec<std::ops::Range<usize>> = Vec::with_capacity(arity);
     let mut pos = 0usize;
+    for bucket in 0..arity {
+        let start = pos;
+        while pos < claims.len() && bits_at(&claims[pos].key, depth, ARITY_BITS) as usize == bucket
+        {
+            pos += 1;
+        }
+        bucket_ranges.push(start..pos);
+    }
+    if pos != claims.len() {
+        return Err(ProofError::Malformed("claims not covered by bucket split"));
+    }
+
+    // Above the threshold, pre-compute sibling offsets and recurse on
+    // buckets in parallel. Below it, fall through to the sequential
+    // cursor walk — avoiding both the offset pre-pass and rayon spawn
+    // overhead on small subtrees.
+    #[cfg(feature = "parallel")]
+    if claims.len() >= 32 {
+        use rayon::prelude::*;
+
+        // Pre-compute each bucket's sibling consumption so subtrees can
+        // be verified independently. The global sibling order is
+        // preserved because buckets are walked in index order.
+        let mut bucket_offsets: Vec<usize> = Vec::with_capacity(arity + 1);
+        bucket_offsets.push(0);
+        for r in &bucket_ranges {
+            let needed = if r.is_empty() {
+                1
+            } else {
+                siblings_needed::<ARITY_BITS>(&claims[r.clone()], child_depth)
+            };
+            bucket_offsets.push(bucket_offsets.last().unwrap() + needed);
+        }
+        let total_consumed = *bucket_offsets.last().unwrap();
+        if siblings.len() < total_consumed {
+            return Err(ProofError::Malformed(
+                "not enough siblings to reconstruct internal node",
+            ));
+        }
+
+        let children: Vec<Hash> = (0..arity)
+            .into_par_iter()
+            .map(|bucket| -> Result<Hash, ProofError> {
+                let r = &bucket_ranges[bucket];
+                let sib = &siblings[bucket_offsets[bucket]..bucket_offsets[bucket + 1]];
+                if r.is_empty() {
+                    Ok(sib[0])
+                } else {
+                    verify_rec::<H, ARITY_BITS>(&claims[r.clone()], child_depth, sib)
+                        .map(|(h, _)| h)
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        return Ok((H::hash_internal(&children), total_consumed));
+    }
+
+    // Sequential: walk buckets with a running cursor over `siblings`.
+    let mut consumed = 0usize;
+    let mut children: Vec<Hash> = vec![EMPTY_HASH; arity];
     for (bucket, child) in children.iter_mut().enumerate() {
+        let r = &bucket_ranges[bucket];
+        if r.is_empty() {
+            *child = *siblings.get(consumed).ok_or(ProofError::Malformed(
+                "not enough siblings to reconstruct internal node",
+            ))?;
+            consumed += 1;
+        } else {
+            let (h, used) = verify_rec::<H, ARITY_BITS>(
+                &claims[r.clone()],
+                child_depth,
+                &siblings[consumed..],
+            )?;
+            *child = h;
+            consumed += used;
+        }
+    }
+    Ok((H::hash_internal(&children), consumed))
+}
+
+/// Count the siblings a non-empty subtree consumes when verified.
+#[cfg(feature = "parallel")]
+fn siblings_needed<const ARITY_BITS: u8>(claims: &[ProofClaim], depth: u16) -> usize {
+    debug_assert!(!claims.is_empty());
+    if claims.iter().all(|c| c.depth_bits == depth) {
+        return 0;
+    }
+    let arity = 1usize << ARITY_BITS as usize;
+    let mut total = 0usize;
+    let mut pos = 0usize;
+    for bucket in 0..arity {
         let start = pos;
         while pos < claims.len() && bits_at(&claims[pos].key, depth, ARITY_BITS) as usize == bucket
         {
             pos += 1;
         }
         if pos > start {
-            *child = verify_rec::<H, ARITY_BITS>(
-                &claims[start..pos],
-                depth + u16::from(ARITY_BITS),
-                siblings,
-            )?;
+            total +=
+                siblings_needed::<ARITY_BITS>(&claims[start..pos], depth + u16::from(ARITY_BITS));
         } else {
-            *child = *siblings.next().ok_or(ProofError::Malformed(
-                "not enough siblings to reconstruct internal node",
-            ))?;
+            total += 1;
         }
     }
-    if pos != claims.len() {
-        return Err(ProofError::Malformed("claims not covered by bucket split"));
-    }
-    Ok(H::hash_internal(&children))
+    total
 }
 
 // ============================================================

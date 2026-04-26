@@ -77,7 +77,7 @@ hyperscale-dispatch-pooled = { path = "crates/dispatch-pooled" }
 hyperscale-dispatch-sync = { path = "crates/dispatch-sync" }
 hyperscale-engine = { path = "crates/engine" }
 hyperscale-execution = { path = "crates/execution" }
-hyperscale-jmt = { path = "crates/jmt" }
+hyperscale-jmt = { path = "crates/jmt", features = ["parallel"] }
 hyperscale-mempool = { path = "crates/mempool" }
 hyperscale-messages = { path = "crates/messages" }
 hyperscale-network = { path = "crates/network" }

@@ -20,6 +20,24 @@ use crate::tree::UpdateResult;
 
 /// Read-only storage interface. Proof generation, reads, and the internal
 /// walks performed by `apply_updates` all go through this trait.
+///
+/// With the `parallel` feature enabled, implementations must be `Sync`
+/// so the recursive update walk can dispatch bucket sub-trees across
+/// rayon worker threads.
+#[cfg(feature = "parallel")]
+pub trait TreeReader: Sync {
+    /// Fetch a node by its key. Returns `None` if the node is absent
+    /// (valid for pruned or never-written paths).
+    fn get_node(&self, key: &NodeKey) -> Option<Arc<Node>>;
+
+    /// Look up the root key for a committed version. Returns `None` for
+    /// versions that were never committed or have been pruned.
+    fn get_root_key(&self, version: u64) -> Option<NodeKey>;
+}
+
+/// Read-only storage interface. Proof generation, reads, and the internal
+/// walks performed by `apply_updates` all go through this trait.
+#[cfg(not(feature = "parallel"))]
 pub trait TreeReader {
     /// Fetch a node by its key. Returns `None` if the node is absent
     /// (valid for pruned or never-written paths).
@@ -149,6 +167,21 @@ impl TreeWriter for MemoryStore {
 
 // Forward trait impls through Arc/Box so users can hand a shared store
 // to the stateless functions without needing to call as_ref() everywhere.
+//
+// `Arc<T>: Sync` requires `T: Send + Sync`, so when the `parallel`
+// feature gates `TreeReader: Sync`, the inner type must additionally be
+// `Send`.
+#[cfg(feature = "parallel")]
+impl<T: TreeReader + Send + ?Sized> TreeReader for Arc<T> {
+    fn get_node(&self, key: &NodeKey) -> Option<Arc<Node>> {
+        (**self).get_node(key)
+    }
+    fn get_root_key(&self, version: u64) -> Option<NodeKey> {
+        (**self).get_root_key(version)
+    }
+}
+
+#[cfg(not(feature = "parallel"))]
 impl<T: TreeReader + ?Sized> TreeReader for Arc<T> {
     fn get_node(&self, key: &NodeKey) -> Option<Arc<Node>> {
         (**self).get_node(key)

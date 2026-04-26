@@ -593,7 +593,7 @@ impl<S: SubstateStore + jmt::TreeReader + Sync> SubstateView<S> {
     }
 }
 
-impl<S: jmt::TreeReader + Sync> jmt::TreeReader for SubstateView<S> {
+impl<S: jmt::TreeReader + Send + Sync> jmt::TreeReader for SubstateView<S> {
     fn get_node(&self, key: &jmt::NodeKey) -> Option<Arc<jmt::Node>> {
         self.jmt_nodes
             .get(key)
