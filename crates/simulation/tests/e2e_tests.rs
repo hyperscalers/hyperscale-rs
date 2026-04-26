@@ -98,11 +98,12 @@ fn simulator_network() -> NetworkDefinition {
 /// ```
 #[traced_test]
 #[test]
+#[allow(clippy::too_many_lines)] // straight-line e2e scenario
 fn test_e2e_single_shard_transaction() {
     println!("\n=== E2E Test: Single-Shard Transaction (Deterministic) ===\n");
 
     let config = single_shard_config();
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = SimulationRunner::new(&config, 42);
 
     // Initialize genesis - creates genesis blocks and sets up timers
     runner.initialize_genesis();
@@ -115,8 +116,7 @@ fn test_e2e_single_shard_transaction() {
         assert_eq!(
             node.bft().committed_height(),
             BlockHeight(0),
-            "Node {} should be at genesis height",
-            node_idx
+            "Node {node_idx} should be at genesis height"
         );
     }
 
@@ -137,8 +137,8 @@ fn test_e2e_single_shard_transaction() {
         routable_from_notarized_v1(notarized, test_validity_range()).expect("valid transaction");
     let tx_hash = transaction.hash();
 
-    println!("Transaction created: {:?}", tx_hash);
-    println!("  Target account: {:?}", to_account);
+    println!("Transaction created: {tx_hash:?}");
+    println!("  Target account: {to_account:?}");
 
     // Submit transaction to node 0 BEFORE consensus runs
     // Use SubmitTransaction to trigger gossip to all validators in the shard
@@ -169,19 +169,13 @@ fn test_e2e_single_shard_transaction() {
         }
     }
 
-    println!(
-        "\n✓ Initial consensus established, blocks committed: {}\n",
-        any_committed
-    );
+    println!("\n✓ Initial consensus established, blocks committed: {any_committed}\n");
 
     // Check mempool status on node 0
     // Note: By this point (2s of consensus), the transaction may already be completed and evicted!
     let node0 = runner.node(0).expect("Node 0 should exist");
     let initial_status = node0.mempool().status(&tx_hash);
-    println!(
-        "Transaction status after initial consensus: {:?}",
-        initial_status
-    );
+    println!("Transaction status after initial consensus: {initial_status:?}");
 
     // If status is None, the transaction completed and was evicted from mempool.
     // This is the expected behavior for completed transactions.
@@ -204,7 +198,7 @@ fn test_e2e_single_shard_transaction() {
             println!("\n✅ E2E Single-Shard Test PASSED!");
             println!("   ✅ Genesis initialized");
             println!("   ✅ Transaction committed and executed");
-            println!("   ✅ Max committed height: {}", max_height);
+            println!("   ✅ Max committed height: {max_height}");
             return;
         }
         // If not executed, it might just not have been processed yet - continue with polling
@@ -214,7 +208,7 @@ fn test_e2e_single_shard_transaction() {
     // Executed means the TC has been created — the transaction was committed and executed successfully.
     if matches!(
         initial_status,
-        Some(TransactionStatus::Completed(_)) | Some(TransactionStatus::Executed { .. })
+        Some(TransactionStatus::Completed(_) | TransactionStatus::Executed { .. })
     ) {
         println!("✓ Transaction already completed after initial consensus!\n");
 
@@ -227,7 +221,7 @@ fn test_e2e_single_shard_transaction() {
         println!("\n✅ E2E Single-Shard Test PASSED!");
         println!("   ✅ Genesis initialized");
         println!("   ✅ Transaction committed and executed");
-        println!("   ✅ Max committed height: {}", max_height);
+        println!("   ✅ Max committed height: {max_height}");
         return;
     }
 
@@ -259,11 +253,8 @@ fn test_e2e_single_shard_transaction() {
         // Once evicted, status() returns None but is_tombstoned() returns true.
         if let Some(status) = node0.mempool().status(&tx_hash) {
             if !committed && status.holds_state_lock() {
-                let elapsed = runner.now() - start_time;
-                println!(
-                    "  ✓ Transaction committed to block (iteration {}, {:?})",
-                    iteration, elapsed
-                );
+                let elapsed = runner.now().checked_sub(start_time).unwrap();
+                println!("  ✓ Transaction committed to block (iteration {iteration}, {elapsed:?})");
                 committed = true;
             }
         } else if node0.mempool().is_tombstoned(&tx_hash) {
@@ -271,18 +262,16 @@ fn test_e2e_single_shard_transaction() {
             // Both finalized_certificates and mempool entry are cleaned up at this point,
             // but the tombstone confirms the transaction reached a terminal state.
             if !committed {
-                let elapsed = runner.now() - start_time;
+                let elapsed = runner.now().checked_sub(start_time).unwrap();
                 println!(
-                    "  ✓ Transaction committed and evicted (iteration {}, {:?})",
-                    iteration, elapsed
+                    "  ✓ Transaction committed and evicted (iteration {iteration}, {elapsed:?})"
                 );
                 committed = true;
             }
             if !executed {
-                let elapsed = runner.now() - start_time;
+                let elapsed = runner.now().checked_sub(start_time).unwrap();
                 println!(
-                    "  ✓ Transaction executed and evicted (iteration {}, {:?})",
-                    iteration, elapsed
+                    "  ✓ Transaction executed and evicted (iteration {iteration}, {elapsed:?})"
                 );
                 executed = true;
             }
@@ -290,11 +279,8 @@ fn test_e2e_single_shard_transaction() {
 
         // Check execution status
         if node0.execution().is_finalized(&tx_hash) && !executed {
-            let elapsed = runner.now() - start_time;
-            println!(
-                "  ✓ Transaction executed (iteration {}, {:?})",
-                iteration, elapsed
-            );
+            let elapsed = runner.now().checked_sub(start_time).unwrap();
+            println!("  ✓ Transaction executed (iteration {iteration}, {elapsed:?})");
             executed = true;
         }
 
@@ -305,7 +291,7 @@ fn test_e2e_single_shard_transaction() {
 
         // Progress report
         if (iteration + 1) % 20 == 0 {
-            let elapsed = runner.now() - start_time;
+            let elapsed = runner.now().checked_sub(start_time).unwrap();
             let height = node0.bft().committed_height();
             println!(
                 "  Iteration {}: elapsed={:?}, height={}, committed={}, executed={}",
@@ -318,10 +304,10 @@ fn test_e2e_single_shard_transaction() {
         }
     }
 
-    let elapsed = runner.now() - start_time;
+    let elapsed = runner.now().checked_sub(start_time).unwrap();
 
     // Check final state
-    println!("\n=== Final State After {:?} ===", elapsed);
+    println!("\n=== Final State After {elapsed:?} ===");
 
     let stats = runner.stats();
     println!("Events processed: {}", stats.events_processed);
@@ -365,7 +351,7 @@ fn test_e2e_single_shard_transaction() {
     println!("   ✅ Transaction entered mempool (Pending)");
     println!("   ✅ Transaction committed to block");
     println!("   ✅ Transaction executed");
-    println!("   ✅ Max committed height: {}", max_height);
+    println!("   ✅ Max committed height: {max_height}");
 }
 
 /// Test that single-shard transactions are deterministic.
@@ -396,7 +382,7 @@ fn test_e2e_single_shard_determinism() {
         routable_from_notarized_v1(notarized, test_validity_range()).expect("valid transaction");
 
     // First run
-    let mut runner1 = SimulationRunner::new(config.clone(), seed);
+    let mut runner1 = SimulationRunner::new(&config, seed);
     runner1.initialize_genesis();
     runner1.schedule_initial_event(
         0,
@@ -413,7 +399,7 @@ fn test_e2e_single_shard_determinism() {
         .collect();
 
     // Second run with same seed
-    let mut runner2 = SimulationRunner::new(config.clone(), seed);
+    let mut runner2 = SimulationRunner::new(&config, seed);
     runner2.initialize_genesis();
     runner2.schedule_initial_event(
         0,
@@ -447,7 +433,7 @@ fn test_e2e_single_shard_determinism() {
     println!("✅ Determinism verified!");
     println!("   Events: {}", stats1.events_processed);
     println!("   Messages: {}", stats1.messages_sent);
-    println!("   Heights: {:?}", heights1);
+    println!("   Heights: {heights1:?}");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -466,7 +452,7 @@ fn test_e2e_multi_shard_consensus() {
     println!("\n=== E2E Test: Multi-Shard Consensus (Deterministic) ===\n");
 
     let config = multi_shard_config();
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = SimulationRunner::new(&config, 42);
 
     // Initialize genesis for all shards
     runner.initialize_genesis();
@@ -478,7 +464,7 @@ fn test_e2e_multi_shard_consensus() {
     // Shard 1: nodes 3, 4, 5
     for node_idx in 0..6u32 {
         let node = runner.node(node_idx).expect("Node should exist");
-        let shard = if node_idx < 3 { 0 } else { 1 };
+        let shard = i32::from(node_idx >= 3);
         println!(
             "Node {} (Shard {}): committed_height={}",
             node_idx,
@@ -500,8 +486,8 @@ fn test_e2e_multi_shard_consensus() {
         .map(|i| runner.node(i).unwrap().bft().committed_height())
         .collect();
 
-    println!("Shard 0 heights: {:?}", shard0_heights);
-    println!("Shard 1 heights: {:?}", shard1_heights);
+    println!("Shard 0 heights: {shard0_heights:?}");
+    println!("Shard 1 heights: {shard1_heights:?}");
 
     // Validators within each shard should have similar heights
     // (may differ slightly due to message timing)
@@ -524,10 +510,7 @@ fn test_e2e_multi_shard_consensus() {
 
     println!("\n✅ E2E Multi-Shard Consensus Test PASSED!");
     println!("   ✅ Both shards initialized");
-    println!(
-        "   ✅ Shard 0 max height: {}, Shard 1 max height: {}",
-        shard0_max, shard1_max
-    );
+    println!("   ✅ Shard 0 max height: {shard0_max}, Shard 1 max height: {shard1_max}");
 }
 
 /// Test cross-shard transaction flow.
@@ -557,12 +540,13 @@ fn test_e2e_multi_shard_consensus() {
 /// ```
 #[traced_test]
 #[test]
+#[allow(clippy::too_many_lines)] // straight-line e2e scenario
 fn test_e2e_cross_shard_transaction() {
     println!("\n=== E2E Test: Cross-Shard Transaction (Deterministic) ===\n");
 
     let config = multi_shard_config();
-    let num_shards = config.num_shards as u64;
-    let mut runner = SimulationRunner::new(config, 42);
+    let num_shards = u64::from(config.num_shards);
+    let mut runner = SimulationRunner::new(&config, 42);
 
     // Find accounts that route to different shards
     let mut shard0_keypair = None;
@@ -593,12 +577,12 @@ fn test_e2e_cross_shard_transaction() {
         shard1_keypair.expect("Should find keypair for shard 1");
 
     println!("✓ Found accounts on different shards:");
-    println!("  Shard 0 account: seed={}", seed0);
-    println!("  Shard 1 account: seed={}\n", seed1);
+    println!("  Shard 0 account: seed={seed0}");
+    println!("  Shard 1 account: seed={seed1}\n");
 
     // Initialize genesis with pre-funded accounts (no funding transactions needed)
     let initial_balance = Decimal::from(10000);
-    runner.initialize_genesis_with_balances(vec![
+    runner.initialize_genesis_with_balances(&[
         (account_shard0, initial_balance),
         (account_shard1, initial_balance),
     ]);
@@ -620,7 +604,7 @@ fn test_e2e_cross_shard_transaction() {
         routable_from_notarized_v1(notarized, test_validity_range()).expect("valid transaction");
     let tx_hash = cross_shard_tx.hash();
 
-    println!("Cross-shard transaction: {:?}", tx_hash);
+    println!("Cross-shard transaction: {tx_hash:?}");
 
     // Submit cross-shard transaction
     runner.schedule_initial_event(
@@ -651,24 +635,18 @@ fn test_e2e_cross_shard_transaction() {
         if let Some(status) = node0.mempool().status(&tx_hash) {
             // If it's in the mempool at all (any status), it entered the mempool
             if !in_mempool {
-                println!("  ✓ Transaction in mempool ({:?})", status);
+                println!("  ✓ Transaction in mempool ({status:?})");
                 in_mempool = true;
             }
             if !committed && status.holds_state_lock() {
-                let elapsed = runner.now() - start_time;
-                println!(
-                    "  ✓ Transaction committed (iteration {}, {:?})",
-                    iteration, elapsed
-                );
+                let elapsed = runner.now().checked_sub(start_time).unwrap();
+                println!("  ✓ Transaction committed (iteration {iteration}, {elapsed:?})");
                 committed = true;
             }
             // Also check for Completed status (which implies it was committed)
             if !completed && matches!(status, TransactionStatus::Completed(_)) {
-                let elapsed = runner.now() - start_time;
-                println!(
-                    "  ✓ Transaction completed (iteration {}, {:?})",
-                    iteration, elapsed
-                );
+                let elapsed = runner.now().checked_sub(start_time).unwrap();
+                println!("  ✓ Transaction completed (iteration {iteration}, {elapsed:?})");
                 completed = true;
                 // If completed, it must have been committed at some point
                 committed = true;
@@ -677,20 +655,16 @@ fn test_e2e_cross_shard_transaction() {
 
         // Check execution status
         if !executed && node0.execution().is_finalized(&tx_hash) {
-            let elapsed = runner.now() - start_time;
-            println!(
-                "  ✓ Transaction executed (iteration {}, {:?})",
-                iteration, elapsed
-            );
+            let elapsed = runner.now().checked_sub(start_time).unwrap();
+            println!("  ✓ Transaction executed (iteration {iteration}, {elapsed:?})");
             executed = true;
         }
 
         // Check finalization status (for cross-shard, this means certificate created)
         if !finalized && node0.execution().is_finalized(&tx_hash) {
-            let elapsed = runner.now() - start_time;
+            let elapsed = runner.now().checked_sub(start_time).unwrap();
             println!(
-                "  ✓ Transaction finalized with certificate (iteration {}, {:?})",
-                iteration, elapsed
+                "  ✓ Transaction finalized with certificate (iteration {iteration}, {elapsed:?})"
             );
             finalized = true;
         }
@@ -702,7 +676,7 @@ fn test_e2e_cross_shard_transaction() {
 
         // Progress report
         if (iteration + 1) % 20 == 0 {
-            let elapsed = runner.now() - start_time;
+            let elapsed = runner.now().checked_sub(start_time).unwrap();
             println!(
                 "  Iteration {}: elapsed={:?}, committed={}, executed={}, finalized={}",
                 iteration + 1,
@@ -725,32 +699,28 @@ fn test_e2e_cross_shard_transaction() {
     println!("\nShard 0 validators:");
     for i in 0..3 {
         let node = runner.node(i).unwrap();
-        let status = node.mempool().status(&tx_hash);
-        let executed = node.execution().is_finalized(&tx_hash);
-        let finalized = node.execution().is_finalized(&tx_hash);
+        let tx_state = node.mempool().status(&tx_hash);
+        let is_final = node.execution().is_finalized(&tx_hash);
         println!(
-            "  Node {}: height={}, tx_status={:?}, executed={}, finalized={}",
+            "  Node {}: height={}, tx_status={:?}, finalized={}",
             i,
             node.bft().committed_height(),
-            status,
-            executed,
-            finalized
+            tx_state,
+            is_final
         );
     }
 
     println!("\nShard 1 validators:");
     for i in 3..6 {
         let node = runner.node(i).unwrap();
-        let status = node.mempool().status(&tx_hash);
-        let executed = node.execution().is_finalized(&tx_hash);
-        let finalized = node.execution().is_finalized(&tx_hash);
+        let tx_state = node.mempool().status(&tx_hash);
+        let is_final = node.execution().is_finalized(&tx_hash);
         println!(
-            "  Node {}: height={}, tx_status={:?}, executed={}, finalized={}",
+            "  Node {}: height={}, tx_status={:?}, finalized={}",
             i,
             node.bft().committed_height(),
-            status,
-            executed,
-            finalized
+            tx_state,
+            is_final
         );
     }
 
@@ -792,10 +762,7 @@ fn test_e2e_cross_shard_transaction() {
     } else {
         println!("   ⚠️  Cross-shard finalization not yet complete (execution still in progress)");
     }
-    println!(
-        "   ✅ Both shards made progress (S0: {}, S1: {})",
-        shard0_max, shard1_max
-    );
+    println!("   ✅ Both shards made progress (S0: {shard0_max}, S1: {shard1_max})");
 }
 
 /// Test determinism of cross-shard transactions.
@@ -822,7 +789,7 @@ fn test_e2e_cross_shard_determinism() {
         routable_from_notarized_v1(notarized, test_validity_range()).expect("valid transaction");
 
     // First run
-    let mut runner1 = SimulationRunner::new(config.clone(), seed);
+    let mut runner1 = SimulationRunner::new(&config, seed);
     runner1.initialize_genesis();
     runner1.schedule_initial_event(
         0,
@@ -839,7 +806,7 @@ fn test_e2e_cross_shard_determinism() {
         .collect();
 
     // Second run with same seed
-    let mut runner2 = SimulationRunner::new(config.clone(), seed);
+    let mut runner2 = SimulationRunner::new(&config, seed);
     runner2.initialize_genesis();
     runner2.schedule_initial_event(
         0,
@@ -869,7 +836,7 @@ fn test_e2e_cross_shard_determinism() {
     println!("✅ Cross-shard determinism verified!");
     println!("   Events: {}", stats1.events_processed);
     println!("   Messages: {}", stats1.messages_sent);
-    println!("   Heights: {:?}", heights1);
+    println!("   Heights: {heights1:?}");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -883,7 +850,7 @@ fn test_e2e_transaction_throughput() {
     println!("\n=== E2E Test: Transaction Throughput ===\n");
 
     let config = single_shard_config();
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = SimulationRunner::new(&config, 42);
 
     runner.initialize_genesis();
 
@@ -894,23 +861,28 @@ fn test_e2e_transaction_throughput() {
     let num_transactions = 10;
     let signer = test_keypair_from_seed(1);
 
-    println!("Submitting {} transactions...", num_transactions);
+    println!("Submitting {num_transactions} transactions...");
 
     for i in 0..num_transactions {
-        let to_account = test_account(i as u8 + 10);
+        let to_account = test_account(u8::try_from(i).unwrap_or(u8::MAX) + 10);
         let manifest = ManifestBuilder::new()
             .lock_fee_from_faucet()
             .get_free_xrd_from_faucet()
             .try_deposit_entire_worktop_or_abort(to_account, None)
             .build();
-        let notarized = sign_and_notarize(manifest, &simulator_network(), i as u32 + 1, &signer)
-            .expect("should sign");
+        let notarized = sign_and_notarize(
+            manifest,
+            &simulator_network(),
+            u32::try_from(i).unwrap_or(u32::MAX) + 1,
+            &signer,
+        )
+        .expect("should sign");
         let tx: RoutableTransaction = routable_from_notarized_v1(notarized, test_validity_range())
             .expect("valid transaction");
 
         runner.schedule_initial_event(
-            (i % 4) as u32, // Distribute across validators
-            Duration::from_millis(i as u64 * 50),
+            u32::try_from(i % 4).unwrap_or(0), // Distribute across validators
+            Duration::from_millis(u64::try_from(i).unwrap_or(u64::MAX) * 50),
             NodeInput::SubmitTransaction { tx: Arc::new(tx) },
         );
     }
@@ -918,7 +890,7 @@ fn test_e2e_transaction_throughput() {
     // Run simulation
     let start = runner.now();
     runner.run_until(Duration::from_secs(10));
-    let elapsed = runner.now() - start;
+    let elapsed = runner.now().checked_sub(start).unwrap();
 
     // Get final state
     let max_height: BlockHeight = (0..4)
@@ -929,14 +901,15 @@ fn test_e2e_transaction_throughput() {
     let stats = runner.stats();
 
     println!("\nThroughput results:");
-    println!("  Simulation time: {:?}", elapsed);
-    println!("  Max committed height: {}", max_height);
+    println!("  Simulation time: {elapsed:?}");
+    println!("  Max committed height: {max_height}");
     println!("  Events processed: {}", stats.events_processed);
     println!("  Messages sent: {}", stats.messages_sent);
 
     if max_height > BlockHeight::GENESIS {
+        #[allow(clippy::cast_precision_loss)] // headline throughput stat for human-readable output
         let blocks_per_second = max_height.0 as f64 / elapsed.as_secs_f64();
-        println!("  Blocks per second: {:.2}", blocks_per_second);
+        println!("  Blocks per second: {blocks_per_second:.2}");
     }
 
     assert!(
@@ -964,13 +937,10 @@ fn test_e2e_transaction_throughput() {
 #[test]
 fn test_wave_leader_failure_recovers_via_rotation() {
     for isolated_node in 0..4u32 {
-        println!(
-            "\n=== Wave Leader Failure Test: isolating node {} ===\n",
-            isolated_node
-        );
+        println!("\n=== Wave Leader Failure Test: isolating node {isolated_node} ===\n");
 
         let config = single_shard_config();
-        let mut runner = SimulationRunner::new(config, 42 + isolated_node as u64);
+        let mut runner = SimulationRunner::new(&config, 42 + u64::from(isolated_node));
         runner.initialize_genesis();
 
         // Let consensus establish first.
@@ -978,12 +948,12 @@ fn test_wave_leader_failure_recovers_via_rotation() {
 
         // Isolate one node — it can neither send nor receive.
         runner.network_mut().isolate_node(isolated_node);
-        println!("Node {} isolated", isolated_node);
+        println!("Node {isolated_node} isolated");
 
         // Submit a transaction to a non-isolated node.
-        let submit_node = if isolated_node == 0 { 1 } else { 0 };
-        let signer = test_keypair_from_seed(50 + isolated_node as u8);
-        let to_account = test_account(100 + isolated_node as u8);
+        let submit_node = u32::from(isolated_node == 0);
+        let signer = test_keypair_from_seed(50 + u8::try_from(isolated_node).unwrap_or(u8::MAX));
+        let to_account = test_account(100 + u8::try_from(isolated_node).unwrap_or(u8::MAX));
 
         let manifest = ManifestBuilder::new()
             .lock_fee_from_faucet()
@@ -1017,7 +987,7 @@ fn test_wave_leader_failure_recovers_via_rotation() {
             let status = runner.node(submit_node).unwrap().mempool().status(&tx_hash);
             match &status {
                 Some(s) if s.is_final() => {
-                    println!("Transaction reached terminal state: {:?}", s);
+                    println!("Transaction reached terminal state: {s:?}");
                     reached_terminal = true;
                     break;
                 }
@@ -1044,13 +1014,9 @@ fn test_wave_leader_failure_recovers_via_rotation() {
 
         assert!(
             reached_terminal,
-            "Transaction should reach terminal state even with node {} isolated (max_height={})",
-            isolated_node, max_height
+            "Transaction should reach terminal state even with node {isolated_node} isolated (max_height={max_height})"
         );
 
-        println!(
-            "✅ Node {} isolated — transaction completed via fallback\n",
-            isolated_node
-        );
+        println!("✅ Node {isolated_node} isolated — transaction completed via fallback\n");
     }
 }

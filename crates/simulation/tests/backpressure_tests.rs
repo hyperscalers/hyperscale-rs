@@ -2,9 +2,9 @@
 //!
 //! These tests verify that the backpressure system works correctly in the
 //! integrated simulation environment, testing the interaction between:
-//! - MempoolCoordinator (ready_transactions with backpressure, in_flight count)
-//! - ProvisionCoordinator (tracking provisions for livelock detection)
-//! - NodeStateMachine (attaching proofs to transactions)
+//! - `MempoolCoordinator` (`ready_transactions` with backpressure, `in_flight` count)
+//! - `ProvisionCoordinator` (tracking provisions for livelock detection)
+//! - `NodeStateMachine` (attaching proofs to transactions)
 //!
 //! Note: The backpressure limit (default 512 soft, 1024 hard) is based on ALL TXs
 //! holding state locks in the mempool (Committed or Executed status). Cross-shard
@@ -76,7 +76,7 @@ fn simulator_network() -> NetworkDefinition {
 #[test]
 fn test_single_shard_unaffected_by_backpressure() {
     let config = single_shard_config();
-    let mut runner = SimulationRunner::new(config.clone(), 12345);
+    let mut runner = SimulationRunner::new(&config, 12345);
 
     // Initialize genesis
     runner.initialize_genesis();
@@ -120,22 +120,20 @@ fn test_single_shard_unaffected_by_backpressure() {
     let in_flight = mempool.in_flight();
     let at_limit = mempool.at_in_flight_limit();
 
-    println!(
-        "Single-shard TX status: {:?}, in_flight: {}, at_limit: {}",
-        status, in_flight, at_limit
-    );
+    println!("Single-shard TX status: {status:?}, in_flight: {in_flight}, at_limit: {at_limit}");
 
     // Single-shard TX should have processed (not stuck in pending due to backpressure)
     assert!(
         status.is_none()
             || matches!(
                 status,
-                Some(TransactionStatus::Committed { .. })
-                    | Some(TransactionStatus::Executed { .. })
-                    | Some(TransactionStatus::Completed(_))
+                Some(
+                    TransactionStatus::Committed { .. }
+                        | TransactionStatus::Executed { .. }
+                        | TransactionStatus::Completed(_)
+                )
             ),
-        "Single-shard TX should not be deferred by backpressure: {:?}",
-        status
+        "Single-shard TX should not be deferred by backpressure: {status:?}",
     );
 }
 
@@ -143,7 +141,7 @@ fn test_single_shard_unaffected_by_backpressure() {
 #[test]
 fn test_provision_coordinator_tracking() {
     let config = multi_shard_config();
-    let mut runner = SimulationRunner::new(config.clone(), 12346);
+    let mut runner = SimulationRunner::new(&config, 12346);
 
     // Initialize genesis
     runner.initialize_genesis();
@@ -167,10 +165,7 @@ fn test_provision_coordinator_tracking() {
     let tx_hash = transaction.hash();
     let is_cross_shard = transaction.is_cross_shard(2);
 
-    println!(
-        "Transaction: hash={}, is_cross_shard={}",
-        tx_hash, is_cross_shard
-    );
+    println!("Transaction: hash={tx_hash}, is_cross_shard={is_cross_shard}");
 
     // Submit via event
     runner.schedule_initial_event(
@@ -191,10 +186,7 @@ fn test_provision_coordinator_tracking() {
     let in_flight = mempool.in_flight();
     let at_limit = mempool.at_in_flight_limit();
 
-    println!(
-        "After submission: mempool_in_flight={}, at_limit={}",
-        in_flight, at_limit
-    );
+    println!("After submission: mempool_in_flight={in_flight}, at_limit={at_limit}");
 
     // We shouldn't be at limit with small number of TXs
     assert!(
@@ -207,7 +199,7 @@ fn test_provision_coordinator_tracking() {
 #[test]
 fn test_mempool_backpressure_integration() {
     let config = multi_shard_config();
-    let mut runner = SimulationRunner::new(config.clone(), 12347);
+    let mut runner = SimulationRunner::new(&config, 12347);
 
     // Initialize genesis
     runner.initialize_genesis();
@@ -226,15 +218,16 @@ fn test_mempool_backpressure_integration() {
             .try_deposit_or_abort(recipient, None, "bucket")
             .build();
 
-        let notarized = sign_and_notarize(manifest, &simulator_network(), 3 + i as u32, &keypair)
-            .expect("should sign transaction");
+        let notarized =
+            sign_and_notarize(manifest, &simulator_network(), 3 + u32::from(i), &keypair)
+                .expect("should sign transaction");
         let transaction: RoutableTransaction =
             routable_from_notarized_v1(notarized, test_validity_range())
                 .expect("valid transaction");
 
         runner.schedule_initial_event(
             0,
-            Duration::from_millis(i as u64 * 10),
+            Duration::from_millis(u64::from(i) * 10),
             NodeInput::SubmitTransaction {
                 tx: Arc::new(transaction),
             },
@@ -252,10 +245,7 @@ fn test_mempool_backpressure_integration() {
     let in_flight = mempool.in_flight();
     let at_limit = mempool.at_in_flight_limit();
 
-    println!(
-        "Mempool size: {}, in_flight: {}, at_limit: {}",
-        mempool_size, in_flight, at_limit
-    );
+    println!("Mempool size: {mempool_size}, in_flight: {in_flight}, at_limit: {at_limit}");
 
     // Verify the system is working
     assert!(!at_limit, "Should not be at limit with small number of TXs");
@@ -265,7 +255,7 @@ fn test_mempool_backpressure_integration() {
 #[test]
 fn test_provision_lifecycle_tracking() {
     let config = multi_shard_config();
-    let mut runner = SimulationRunner::new(config.clone(), 12348);
+    let mut runner = SimulationRunner::new(&config, 12348);
 
     // Initialize genesis
     runner.initialize_genesis();
@@ -282,16 +272,12 @@ fn test_provision_lifecycle_tracking() {
         let in_flight = mempool.in_flight();
         let at_limit = mempool.at_in_flight_limit();
 
-        println!(
-            "Node {}: in_flight={}, at_limit={}",
-            node_idx, in_flight, at_limit
-        );
+        println!("Node {node_idx}: in_flight={in_flight}, at_limit={at_limit}");
 
         // None should be at limit in idle state
         assert!(
             !at_limit,
-            "Node {} should not be at backpressure limit in idle state",
-            node_idx
+            "Node {node_idx} should not be at backpressure limit in idle state",
         );
     }
 }
@@ -304,7 +290,7 @@ fn test_provision_lifecycle_tracking() {
 #[test]
 fn test_provision_metrics_accessible() {
     let config = multi_shard_config();
-    let mut runner = SimulationRunner::new(config.clone(), 12349);
+    let mut runner = SimulationRunner::new(&config, 12349);
 
     // Initialize genesis
     runner.initialize_genesis();
@@ -318,10 +304,7 @@ fn test_provision_metrics_accessible() {
     let in_flight = mempool.in_flight();
     let at_limit = mempool.at_in_flight_limit();
 
-    println!(
-        "Metrics check: in_flight={}, at_limit={}",
-        in_flight, at_limit
-    );
+    println!("Metrics check: in_flight={in_flight}, at_limit={at_limit}");
 
     // Basic sanity checks
     assert_eq!(in_flight, 0, "Should start with 0 in-flight");
@@ -336,7 +319,7 @@ fn test_provision_metrics_accessible() {
 #[test]
 fn test_provisions_pending_verification() {
     let config = multi_shard_config();
-    let mut runner = SimulationRunner::new(config.clone(), 12350);
+    let mut runner = SimulationRunner::new(&config, 12350);
 
     // Initialize genesis
     runner.initialize_genesis();
@@ -351,10 +334,7 @@ fn test_provisions_pending_verification() {
     let in_flight = mempool.in_flight();
     let at_limit = mempool.at_in_flight_limit();
 
-    println!(
-        "Early state: in_flight={}, at_limit={}",
-        in_flight, at_limit
-    );
+    println!("Early state: in_flight={in_flight}, at_limit={at_limit}");
 
     // These should be valid regardless of internal state
     assert!(!at_limit, "Should not be at limit early in simulation");
@@ -364,7 +344,7 @@ fn test_provisions_pending_verification() {
 #[test]
 fn test_completed_tx_cleanup() {
     let config = single_shard_config();
-    let mut runner = SimulationRunner::new(config.clone(), 12351);
+    let mut runner = SimulationRunner::new(&config, 12351);
 
     // Initialize genesis
     runner.initialize_genesis();
@@ -401,7 +381,7 @@ fn test_completed_tx_cleanup() {
     let status = node.mempool().status(&tx_hash);
     let in_flight = node.mempool().in_flight();
 
-    println!("Final state: status={:?}, in_flight={}", status, in_flight);
+    println!("Final state: status={status:?}, in_flight={in_flight}");
 
     // Completed TX shouldn't be counted in-flight (lock released)
     // Note: status might be None if evicted after completion
@@ -415,7 +395,7 @@ fn test_completed_tx_cleanup() {
 #[test]
 fn test_multi_node_provision_consistency() {
     let config = multi_shard_config();
-    let mut runner = SimulationRunner::new(config.clone(), 12352);
+    let mut runner = SimulationRunner::new(&config, 12352);
 
     // Initialize genesis
     runner.initialize_genesis();
@@ -429,7 +409,7 @@ fn test_multi_node_provision_consistency() {
         let node = runner.node(node_idx).unwrap();
         let at_limit = node.mempool().at_in_flight_limit();
         if at_limit {
-            println!("Node {} unexpectedly at backpressure limit", node_idx);
+            println!("Node {node_idx} unexpectedly at backpressure limit");
             all_consistent = false;
         }
     }

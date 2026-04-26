@@ -55,7 +55,7 @@ impl Simulator {
     /// Create a new simulator with the given configuration.
     pub fn new(config: SimulatorConfig) -> Result<Self, SimulatorError> {
         let network_config = config.to_network_config();
-        let runner = SimulationRunner::new(network_config, config.seed);
+        let runner = SimulationRunner::new(&network_config, config.seed);
 
         // Generate accounts
         let accounts = AccountPool::generate(config.num_shards as u64, config.accounts_per_shard)?;
@@ -126,7 +126,7 @@ impl Simulator {
             "Funding accounts at genesis"
         );
 
-        self.runner.initialize_genesis_with_balances(balances);
+        self.runner.initialize_genesis_with_balances(&balances);
         self.run_warmup();
         info!("Genesis initialized with funded accounts");
     }
@@ -157,7 +157,7 @@ impl Simulator {
             "Funding genesis accounts (capped)"
         );
 
-        self.runner.initialize_genesis_with_balances(balances);
+        self.runner.initialize_genesis_with_balances(&balances);
         self.run_warmup();
 
         // Phase 2: Fund remaining accounts via transactions.

@@ -27,7 +27,7 @@ fn test_network_config() -> NetworkConfig {
 #[test]
 fn test_simulation_runner_creation() {
     let config = test_network_config();
-    let runner = SimulationRunner::new(config, 42);
+    let runner = SimulationRunner::new(&config, 42);
 
     // Should have 4 nodes (1 shard * 4 validators)
     assert!(runner.node(0).is_some());
@@ -41,7 +41,7 @@ fn test_simulation_runner_creation() {
 #[test]
 fn test_schedule_initial_events() {
     let config = test_network_config();
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = SimulationRunner::new(&config, 42);
 
     // Schedule proposal timers for all nodes
     for node in 0..4 {
@@ -70,7 +70,7 @@ fn test_determinism_same_seed() {
     let seed = 12345u64;
 
     // Run simulation with seed
-    let mut runner1 = SimulationRunner::new(config.clone(), seed);
+    let mut runner1 = SimulationRunner::new(&config, seed);
     for node in 0..4 {
         runner1.schedule_initial_event(
             node,
@@ -82,7 +82,7 @@ fn test_determinism_same_seed() {
     let stats1 = runner1.stats().clone();
 
     // Run simulation again with same seed
-    let mut runner2 = SimulationRunner::new(config.clone(), seed);
+    let mut runner2 = SimulationRunner::new(&config, seed);
     for node in 0..4 {
         runner2.schedule_initial_event(
             node,
@@ -118,7 +118,7 @@ fn test_different_seeds_diverge() {
     let config = test_network_config();
 
     // Run simulation with seed 1
-    let mut runner1 = SimulationRunner::new(config.clone(), 111);
+    let mut runner1 = SimulationRunner::new(&config, 111);
     for node in 0..4 {
         runner1.schedule_initial_event(
             node,
@@ -129,7 +129,7 @@ fn test_different_seeds_diverge() {
     runner1.run_until(Duration::from_secs(1));
 
     // Run simulation with seed 2
-    let mut runner2 = SimulationRunner::new(config.clone(), 222);
+    let mut runner2 = SimulationRunner::new(&config, 222);
     for node in 0..4 {
         runner2.schedule_initial_event(
             node,
@@ -159,7 +159,7 @@ fn test_multi_shard_simulation() {
         ..Default::default()
     };
 
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = SimulationRunner::new(&config, 42);
 
     // Should have 6 nodes (2 shards * 3 validators)
     assert!(runner.node(0).is_some());
@@ -186,12 +186,12 @@ fn test_multi_shard_simulation() {
 
 /// Test that round advancement happens via view change timer (HotStuff-2 style).
 ///
-/// View changes are triggered by the ViewChange timer when the leader
+/// View changes are triggered by the `ViewChange` timer when the leader
 /// fails to produce a QC within the timeout.
 #[test]
 fn test_round_advancement_via_view_change_timer() {
     let config = test_network_config();
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = SimulationRunner::new(&config, 42);
 
     // Schedule proposal timers - these handle both proposals AND round advancement
     for node in 0..4 {
@@ -215,7 +215,7 @@ fn test_round_advancement_via_view_change_timer() {
 #[test]
 fn test_extended_simulation() {
     let config = test_network_config();
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = SimulationRunner::new(&config, 42);
 
     // Initialize genesis — sets up ViewChange timers and initial ContentAvailable
     runner.initialize_genesis();
@@ -246,7 +246,7 @@ fn test_extended_simulation_determinism() {
     let seed = 999u64;
 
     // First run
-    let mut runner1 = SimulationRunner::new(config.clone(), seed);
+    let mut runner1 = SimulationRunner::new(&config, seed);
     for node in 0..4 {
         runner1.schedule_initial_event(
             node,
@@ -258,7 +258,7 @@ fn test_extended_simulation_determinism() {
     let stats1 = runner1.stats().clone();
 
     // Second run with same seed
-    let mut runner2 = SimulationRunner::new(config.clone(), seed);
+    let mut runner2 = SimulationRunner::new(&config, seed);
     for node in 0..4 {
         runner2.schedule_initial_event(
             node,
@@ -286,7 +286,7 @@ fn test_extended_simulation_determinism() {
 #[test]
 fn test_genesis_initialization() {
     let config = test_network_config();
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = SimulationRunner::new(&config, 42);
 
     // Initialize genesis - this should set proposal timers for all nodes
     runner.initialize_genesis();
@@ -314,13 +314,13 @@ fn test_genesis_initialization_determinism() {
     let seed = 7777u64;
 
     // First run with genesis init
-    let mut runner1 = SimulationRunner::new(config.clone(), seed);
+    let mut runner1 = SimulationRunner::new(&config, seed);
     runner1.initialize_genesis();
     runner1.run_until(Duration::from_secs(2));
     let stats1 = runner1.stats().clone();
 
     // Second run with same seed and genesis init
-    let mut runner2 = SimulationRunner::new(config.clone(), seed);
+    let mut runner2 = SimulationRunner::new(&config, seed);
     runner2.initialize_genesis();
     runner2.run_until(Duration::from_secs(2));
     let stats2 = runner2.stats().clone();
@@ -337,7 +337,7 @@ fn test_genesis_initialization_determinism() {
 #[test]
 fn test_full_consensus_simulation() {
     let config = test_network_config();
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = SimulationRunner::new(&config, 42);
 
     // Initialize genesis
     runner.initialize_genesis();
@@ -373,8 +373,8 @@ fn test_full_consensus_simulation() {
 
     assert!(timer_events > 0, "Should have timer events");
     // Note: network_events might be 0 if blocks aren't being sent yet
-    println!("  Timer events: {}", timer_events);
-    println!("  Network events: {}", network_events);
+    println!("  Timer events: {timer_events}");
+    println!("  Network events: {network_events}");
 }
 
 /// Test multi-shard genesis initialization.
@@ -389,7 +389,7 @@ fn test_multi_shard_genesis() {
         ..Default::default()
     };
 
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = SimulationRunner::new(&config, 42);
 
     // Initialize genesis for all shards
     runner.initialize_genesis();
@@ -423,7 +423,7 @@ fn test_multi_shard_genesis() {
 #[test]
 fn test_proposal_timer_setup() {
     let config = test_network_config();
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = SimulationRunner::new(&config, 42);
 
     // Initialize genesis - this should set proposal timers (which also handle round advancement)
     runner.initialize_genesis();
@@ -441,7 +441,7 @@ fn test_proposal_timer_setup() {
 #[test]
 fn test_view_change_integration() {
     let config = test_network_config();
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = SimulationRunner::new(&config, 42);
 
     // Initialize genesis
     runner.initialize_genesis();
@@ -473,13 +473,13 @@ fn test_view_change_determinism() {
     let seed = 8888u64;
 
     // First run
-    let mut runner1 = SimulationRunner::new(config.clone(), seed);
+    let mut runner1 = SimulationRunner::new(&config, seed);
     runner1.initialize_genesis();
     runner1.run_until(Duration::from_secs(8));
     let stats1 = runner1.stats().clone();
 
     // Second run with same seed
-    let mut runner2 = SimulationRunner::new(config.clone(), seed);
+    let mut runner2 = SimulationRunner::new(&config, seed);
     runner2.initialize_genesis();
     runner2.run_until(Duration::from_secs(8));
     let stats2 = runner2.stats().clone();
@@ -507,7 +507,7 @@ fn test_view_change_determinism() {
 #[test]
 fn test_view_change_complete_flow() {
     let config = test_network_config();
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = SimulationRunner::new(&config, 42);
 
     // Initialize genesis
     runner.initialize_genesis();
@@ -519,14 +519,12 @@ fn test_view_change_complete_flow() {
         assert_eq!(
             node.bft().committed_height(),
             BlockHeight(0),
-            "Node {} should be at height 0",
-            node_idx
+            "Node {node_idx} should be at height 0"
         );
         assert_eq!(
             node.bft().view(),
             Round(0),
-            "Node {} should be at round 0",
-            node_idx
+            "Node {node_idx} should be at round 0"
         );
     }
 
@@ -539,8 +537,7 @@ fn test_view_change_complete_flow() {
         assert_eq!(
             node.bft().view(),
             Round(0),
-            "Node {} should still be at round 0 after 1 second",
-            node_idx
+            "Node {node_idx} should still be at round 0 after 1 second"
         );
     }
 
@@ -571,7 +568,7 @@ fn test_view_change_complete_flow() {
     println!("\nRound advancement flow test stats:");
     println!("  Events processed: {}", stats.events_processed);
     println!("  Messages sent: {}", stats.messages_sent);
-    println!("  Nodes with round change: {}", nodes_with_round_change);
+    println!("  Nodes with round change: {nodes_with_round_change}");
     println!("  Events by priority: {:?}", stats.events_by_priority);
 
     // The proposal timers should have fired multiple times
@@ -592,7 +589,7 @@ fn test_view_change_complete_flow() {
 #[test]
 fn test_view_change_quorum_after_commit() {
     let config = test_network_config();
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = SimulationRunner::new(&config, 42);
 
     // Initialize genesis
     runner.initialize_genesis();
@@ -617,7 +614,7 @@ fn test_view_change_quorum_after_commit() {
     }
 
     println!("\nAfter 2 seconds:");
-    println!("  Any blocks committed: {}", any_committed);
+    println!("  Any blocks committed: {any_committed}");
 
     // If blocks were committed, we have progress at height > 0
     // Now let's wait for view change timeout
@@ -647,7 +644,7 @@ fn test_view_change_quorum_after_commit() {
 #[test]
 fn test_view_change_vote_broadcast() {
     let config = test_network_config();
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = SimulationRunner::new(&config, 42);
 
     // Initialize genesis
     runner.initialize_genesis();
@@ -661,10 +658,7 @@ fn test_view_change_vote_broadcast() {
     let final_messages = runner.stats().messages_sent;
     let messages_during_view_change = final_messages - initial_messages;
 
-    println!(
-        "Messages sent during view change period: {}",
-        messages_during_view_change
-    );
+    println!("Messages sent during view change period: {messages_during_view_change}");
 
     // Should have sent messages - proposal timers fire every 100ms,
     // view change timers fire at 5s
@@ -677,7 +671,7 @@ fn test_view_change_vote_broadcast() {
 /// Test proposer rotation after view change.
 ///
 /// Verifies that after a view change, the proposer changes according to:
-/// proposer = (height + round) % committee_size
+/// proposer = (height + round) % `committee_size`
 #[traced_test]
 #[test]
 fn test_proposer_rotation_after_view_change() {
@@ -688,7 +682,7 @@ fn test_proposer_rotation_after_view_change() {
     // - Round 3: proposer = (1 + 3) % 4 = 0 -> Validator 0
 
     let config = test_network_config();
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = SimulationRunner::new(&config, 42);
     runner.initialize_genesis();
 
     // Get initial view for all nodes
@@ -696,7 +690,7 @@ fn test_proposer_rotation_after_view_change() {
         .map(|i| runner.node(i).unwrap().bft().view())
         .collect();
 
-    println!("Initial views: {:?}", initial_views);
+    println!("Initial views: {initial_views:?}");
 
     // Run for extended time to allow view changes
     runner.run_until(Duration::from_secs(15));
@@ -706,15 +700,14 @@ fn test_proposer_rotation_after_view_change() {
         .map(|i| runner.node(i).unwrap().bft().view())
         .collect();
 
-    println!("Final views after 15 seconds: {:?}", final_views);
+    println!("Final views after 15 seconds: {final_views:?}");
 
     // All nodes should have the same view (consensus on round)
     let first_view = final_views[0];
     for (i, &view) in final_views.iter().enumerate() {
         assert_eq!(
             view, first_view,
-            "Node {} has view {} but node 0 has view {}",
-            i, view, first_view
+            "Node {i} has view {view} but node 0 has view {first_view}"
         );
     }
 
@@ -734,7 +727,7 @@ fn test_proposer_rotation_after_view_change() {
 #[test]
 fn test_round_reset_on_commit() {
     let config = test_network_config();
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = SimulationRunner::new(&config, 42);
 
     // Initialize genesis
     runner.initialize_genesis();
@@ -749,17 +742,14 @@ fn test_round_reset_on_commit() {
         let committed = node.bft().committed_height();
         let round = node.bft().view();
 
-        println!(
-            "Node {}: committed={}, round/view={}",
-            node_idx, committed, round
-        );
+        println!("Node {node_idx}: committed={committed}, round/view={round}");
 
         // If blocks were committed, the system is making progress
         // Round advancement only happens when no QC forms within timeout
         if committed > BlockHeight::GENESIS {
             // Progress is being made, round may or may not have advanced
             // depending on timing of commits vs timeouts
-            println!("  -> Making progress with committed height {}", committed);
+            println!("  -> Making progress with committed height {committed}");
         }
     }
 }
@@ -775,7 +765,7 @@ fn test_round_reset_on_commit() {
 #[test]
 fn test_block_commit_diagnostic() {
     let config = test_network_config();
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = SimulationRunner::new(&config, 42);
 
     // Initialize genesis
     runner.initialize_genesis();
@@ -871,14 +861,14 @@ fn test_block_commit_diagnostic() {
 ///
 /// Runs the same simulation twice and verifies that the
 /// round numbers match exactly at every node.
-/// With HotStuff-2 style, round is tracked in BftCoordinator via view().
+/// With HotStuff-2 style, round is tracked in `BftCoordinator` via `view()`.
 #[test]
 fn test_round_determinism() {
     let config = test_network_config();
     let seed = 54321u64;
 
     // First run
-    let mut runner1 = SimulationRunner::new(config.clone(), seed);
+    let mut runner1 = SimulationRunner::new(&config, seed);
     runner1.initialize_genesis();
     runner1.run_until(Duration::from_secs(12));
 
@@ -890,7 +880,7 @@ fn test_round_determinism() {
         .collect();
 
     // Second run with same seed
-    let mut runner2 = SimulationRunner::new(config.clone(), seed);
+    let mut runner2 = SimulationRunner::new(&config, seed);
     runner2.initialize_genesis();
     runner2.run_until(Duration::from_secs(12));
 
@@ -911,10 +901,10 @@ fn test_round_determinism() {
         "Committed heights should be identical across runs"
     );
 
-    println!("BFT views/rounds (run1): {:?}", views1);
-    println!("BFT views/rounds (run2): {:?}", views2);
-    println!("Committed heights (run1): {:?}", heights1);
-    println!("Committed heights (run2): {:?}", heights2);
+    println!("BFT views/rounds (run1): {views1:?}");
+    println!("BFT views/rounds (run2): {views2:?}");
+    println!("Committed heights (run1): {heights1:?}");
+    println!("Committed heights (run2): {heights2:?}");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -929,7 +919,7 @@ fn test_round_determinism() {
 #[test]
 fn test_block_commit_verification() {
     let config = test_network_config();
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = SimulationRunner::new(&config, 42);
 
     // Initialize genesis
     runner.initialize_genesis();
@@ -942,7 +932,7 @@ fn test_block_commit_verification() {
         .map(|i| runner.node(i).unwrap().bft().committed_height())
         .collect();
 
-    println!("Committed heights: {:?}", committed_heights);
+    println!("Committed heights: {committed_heights:?}");
 
     // With targeted voting, nodes may differ by at most 1 committed height
     // at any snapshot. The last block's proposer learns about the QC for its
@@ -955,8 +945,7 @@ fn test_block_commit_verification() {
     );
     assert!(
         max_height - min_height <= 1,
-        "Committed heights should differ by at most 1, got {:?}",
-        committed_heights
+        "Committed heights should differ by at most 1, got {committed_heights:?}"
     );
 
     // QC heights also differ by at most 1 — the last proposer doesn't
@@ -968,8 +957,7 @@ fn test_block_commit_verification() {
                 .unwrap()
                 .bft()
                 .latest_qc()
-                .map(|qc| qc.height)
-                .unwrap_or(BlockHeight::GENESIS)
+                .map_or(BlockHeight::GENESIS, |qc| qc.height)
         })
         .collect();
 
@@ -977,8 +965,7 @@ fn test_block_commit_verification() {
     let min_qc = *qc_heights.iter().min().unwrap();
     assert!(
         max_qc - min_qc <= 1,
-        "QC heights should differ by at most 1, got {:?}",
-        qc_heights
+        "QC heights should differ by at most 1, got {qc_heights:?}"
     );
 
     println!("All nodes consistent:");
@@ -1004,7 +991,7 @@ fn test_block_commit_determinism() {
     let seed = 12345u64;
 
     // First run
-    let mut runner1 = SimulationRunner::new(config.clone(), seed);
+    let mut runner1 = SimulationRunner::new(&config, seed);
     runner1.initialize_genesis();
     runner1.run_until(Duration::from_secs(2));
 
@@ -1024,7 +1011,7 @@ fn test_block_commit_determinism() {
     let stats1 = runner1.stats().clone();
 
     // Second run with same seed
-    let mut runner2 = SimulationRunner::new(config.clone(), seed);
+    let mut runner2 = SimulationRunner::new(&config, seed);
     runner2.initialize_genesis();
     runner2.run_until(Duration::from_secs(2));
 
@@ -1050,8 +1037,8 @@ fn test_block_commit_determinism() {
     assert_eq!(stats1.messages_sent, stats2.messages_sent);
 
     println!("Determinism verified:");
-    println!("  Committed heights (run1): {:?}", heights1);
-    println!("  Committed heights (run2): {:?}", heights2);
+    println!("  Committed heights (run1): {heights1:?}");
+    println!("  Committed heights (run2): {heights2:?}");
     println!("  Events processed: {}", stats1.events_processed);
     println!("  Messages sent: {}", stats1.messages_sent);
 }
@@ -1067,7 +1054,7 @@ fn test_block_commit_determinism() {
 #[test]
 fn test_sequential_commit() {
     let config = test_network_config();
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = SimulationRunner::new(&config, 42);
 
     // Initialize genesis
     runner.initialize_genesis();
@@ -1100,20 +1087,15 @@ fn test_sequential_commit() {
     let min_h = *final_heights.iter().min().unwrap();
     assert!(
         max_h - min_h <= 1,
-        "Committed heights should differ by at most 1, got {:?}",
-        final_heights
+        "Committed heights should differ by at most 1, got {final_heights:?}"
     );
 
     // With 1000ms proposal interval, expect ~5 blocks in 7 seconds
     assert!(
         max_h >= BlockHeight(5),
-        "Should have committed at least 5 blocks in 7 seconds, got {}",
-        max_h
+        "Should have committed at least 5 blocks in 7 seconds, got {max_h}"
     );
-    println!(
-        "Sequential commit verified: {} blocks committed (heights: {:?})",
-        max_h, final_heights
-    );
+    println!("Sequential commit verified: {max_h} blocks committed (heights: {final_heights:?})");
 }
 
 /// Test throughput and latency characteristics.
@@ -1127,7 +1109,7 @@ fn test_sequential_commit() {
 #[test]
 fn test_consensus_throughput() {
     let config = test_network_config();
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = SimulationRunner::new(&config, 42);
 
     runner.initialize_genesis();
 
@@ -1137,7 +1119,9 @@ fn test_consensus_throughput() {
     let committed_height = runner.node(0).unwrap().bft().committed_height();
     let stats = runner.stats();
 
+    #[allow(clippy::cast_precision_loss)] // headline throughput metric for human-readable output
     let blocks_per_second = committed_height.0 as f64 / 10.0;
+    #[allow(clippy::cast_precision_loss)] // headline throughput metric for human-readable output
     let messages_per_block = if committed_height > BlockHeight::GENESIS {
         stats.messages_sent as f64 / committed_height.0 as f64
     } else {
@@ -1145,10 +1129,10 @@ fn test_consensus_throughput() {
     };
 
     println!("Throughput metrics:");
-    println!("  Blocks committed: {}", committed_height);
-    println!("  Blocks per second: {:.1}", blocks_per_second);
+    println!("  Blocks committed: {committed_height}");
+    println!("  Blocks per second: {blocks_per_second:.1}");
     println!("  Total messages: {}", stats.messages_sent);
-    println!("  Messages per block: {:.1}", messages_per_block);
+    println!("  Messages per block: {messages_per_block:.1}");
     println!("  Events processed: {}", stats.events_processed);
 
     // Pipeline-limited with no rate-limit floor; expect comfortable progress.
@@ -1178,7 +1162,7 @@ fn test_mempool_to_block_integration() {
     use hyperscale_types::test_utils::test_transaction;
 
     let config = test_network_config();
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = SimulationRunner::new(&config, 42);
 
     // Initialize genesis
     runner.initialize_genesis();
@@ -1239,14 +1223,14 @@ fn test_mempool_to_block_integration() {
 
     println!("Mempool state before dwell time elapses:");
     println!("  Total transactions: {}", node0.mempool().len());
-    println!("  Ready transactions: {}", ready_count);
+    println!("  Ready transactions: {ready_count}");
 
     // Run for 2 seconds - should commit several blocks with transactions
     runner.run_until(Duration::from_secs(2));
 
     let committed_height = runner.node(0).unwrap().bft().committed_height();
     println!("\nAfter 2 seconds:");
-    println!("  Committed height: {}", committed_height);
+    println!("  Committed height: {committed_height}");
 
     // Transactions should now be marked as committed in the mempool
     let node0 = runner.node(0).expect("Node 0 should exist");
@@ -1254,9 +1238,9 @@ fn test_mempool_to_block_integration() {
     let status2 = node0.mempool().status(&tx2_hash);
     let status3 = node0.mempool().status(&tx3_hash);
 
-    println!("  Transaction 1 status: {:?}", status1);
-    println!("  Transaction 2 status: {:?}", status2);
-    println!("  Transaction 3 status: {:?}", status3);
+    println!("  Transaction 1 status: {status1:?}");
+    println!("  Transaction 2 status: {status2:?}");
+    println!("  Transaction 3 status: {status3:?}");
 
     // At least one block should have been committed
     assert!(
@@ -1279,7 +1263,7 @@ fn test_execution_flow() {
     use hyperscale_types::test_utils::test_transaction;
 
     let config = test_network_config();
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = SimulationRunner::new(&config, 42);
 
     runner.initialize_genesis();
 
@@ -1302,7 +1286,7 @@ fn test_execution_flow() {
     // The cache captures all emitted statuses, even after eviction from mempool.
     let status = runner.tx_status(0, &tx_hash);
     println!("  Committed height: {}", node0.bft().committed_height());
-    println!("  Tx status: {:?}", status);
+    println!("  Tx status: {status:?}");
 
     // Transaction should reach Completed state (certificate committed in block).
     // This is the terminal success state for the full execution flow:
@@ -1312,8 +1296,7 @@ fn test_execution_flow() {
             status,
             Some(hyperscale_types::TransactionStatus::Completed(_))
         ),
-        "Transaction should be Completed (certificate committed), got {:?}",
-        status
+        "Transaction should be Completed (certificate committed), got {status:?}"
     );
 
     // Verify blocks were committed (transaction was processed)
@@ -1333,7 +1316,7 @@ fn test_transaction_gossip() {
     use hyperscale_types::test_utils::test_transaction;
 
     let config = test_network_config();
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = SimulationRunner::new(&config, 42);
 
     runner.initialize_genesis();
 
@@ -1355,8 +1338,8 @@ fn test_transaction_gossip() {
 
     // Note: Transaction gossip requires the mempool to emit BroadcastToShard actions
     // This is currently not implemented - this test documents expected behavior
-    println!("Transaction submitted to node 0: {}", tx_hash);
-    println!("Node 0 has transaction: {}", node0_has_tx);
+    println!("Transaction submitted to node 0: {tx_hash}");
+    println!("Node 0 has transaction: {node0_has_tx}");
 
     // Run for 500ms to allow gossip (if implemented)
     runner.run_until(Duration::from_millis(500));
@@ -1369,7 +1352,7 @@ fn test_transaction_gossip() {
             .unwrap()
             .mempool()
             .has_transaction(&tx_hash);
-        println!("Node {} has transaction: {}", node_idx, has_tx);
+        println!("Node {node_idx} has transaction: {has_tx}");
     }
 }
 
@@ -1393,7 +1376,7 @@ fn multi_shard_config() -> NetworkConfig {
 #[test]
 fn test_multi_shard_initialization() {
     let config = multi_shard_config();
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = SimulationRunner::new(&config, 42);
 
     // Should have 8 nodes (2 shards * 4 validators)
     assert!(runner.node(0).is_some());
@@ -1406,24 +1389,22 @@ fn test_multi_shard_initialization() {
     // Check nodes in shard 0 (nodes 0-3)
     for node_idx in 0..4u32 {
         let node = runner.node(node_idx).expect("Node should exist");
-        assert_eq!(node.shard().0, 0, "Node {} should be in shard 0", node_idx);
+        assert_eq!(node.shard().0, 0, "Node {node_idx} should be in shard 0");
         assert_eq!(
             node.bft().committed_height(),
             BlockHeight(0),
-            "Node {} should be at genesis",
-            node_idx
+            "Node {node_idx} should be at genesis"
         );
     }
 
     // Check nodes in shard 1 (nodes 4-7)
     for node_idx in 4..8u32 {
         let node = runner.node(node_idx).expect("Node should exist");
-        assert_eq!(node.shard().0, 1, "Node {} should be in shard 1", node_idx);
+        assert_eq!(node.shard().0, 1, "Node {node_idx} should be in shard 1");
         assert_eq!(
             node.bft().committed_height(),
             BlockHeight(0),
-            "Node {} should be at genesis",
-            node_idx
+            "Node {node_idx} should be at genesis"
         );
     }
 
@@ -1434,7 +1415,7 @@ fn test_multi_shard_initialization() {
 #[test]
 fn test_multi_shard_consensus_progress() {
     let config = multi_shard_config();
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = SimulationRunner::new(&config, 42);
     runner.initialize_genesis();
 
     // Run for 5 seconds
@@ -1454,8 +1435,8 @@ fn test_multi_shard_consensus_progress() {
         shard1_heights.push(height);
     }
 
-    println!("Shard 0 committed heights: {:?}", shard0_heights);
-    println!("Shard 1 committed heights: {:?}", shard1_heights);
+    println!("Shard 0 committed heights: {shard0_heights:?}");
+    println!("Shard 1 committed heights: {shard1_heights:?}");
 
     // With targeted voting, nodes may differ by at most 1 committed height
     // at any snapshot (the last proposer learns about its QC via the next header).
@@ -1463,16 +1444,14 @@ fn test_multi_shard_consensus_progress() {
     let shard0_min = *shard0_heights.iter().min().unwrap();
     assert!(
         shard0_max - shard0_min <= 1,
-        "Shard 0 committed heights should differ by at most 1, got {:?}",
-        shard0_heights
+        "Shard 0 committed heights should differ by at most 1, got {shard0_heights:?}"
     );
 
     let shard1_max = *shard1_heights.iter().max().unwrap();
     let shard1_min = *shard1_heights.iter().min().unwrap();
     assert!(
         shard1_max - shard1_min <= 1,
-        "Shard 1 committed heights should differ by at most 1, got {:?}",
-        shard1_heights
+        "Shard 1 committed heights should differ by at most 1, got {shard1_heights:?}"
     );
 
     // Both shards should have made progress
@@ -1495,7 +1474,7 @@ fn test_multi_shard_consensus_progress() {
 #[test]
 fn test_cross_shard_latency() {
     let config = multi_shard_config();
-    let runner = SimulationRunner::new(config.clone(), 42);
+    let runner = SimulationRunner::new(&config, 42);
 
     // Intra-shard: nodes in same shard
     let network = runner.network();
@@ -1571,9 +1550,9 @@ fn test_cross_shard_transaction_detection() {
     let shard_b = topology.snapshot().shard_for_node_id(&node_b);
     let shard_c = topology.snapshot().shard_for_node_id(&node_c);
 
-    println!("Node A shard: {:?}", shard_a);
-    println!("Node B shard: {:?}", shard_b);
-    println!("Node C shard: {:?}", shard_c);
+    println!("Node A shard: {shard_a:?}");
+    println!("Node B shard: {shard_b:?}");
+    println!("Node C shard: {shard_c:?}");
 
     // Create a single-shard transaction (all nodes in same shard)
     let same_shard_nodes: Vec<_> = (0..10u8)
@@ -1589,7 +1568,7 @@ fn test_cross_shard_transaction_detection() {
             vec![same_shard_nodes[1]],
         );
         let shards = topology.snapshot().all_shards_for_transaction(&tx);
-        println!("Single-shard tx touches shards: {:?}", shards);
+        println!("Single-shard tx touches shards: {shards:?}");
         assert_eq!(shards.len(), 1, "Single-shard tx should touch 1 shard");
     }
 
@@ -1604,7 +1583,7 @@ fn test_cross_shard_transaction_detection() {
     if let (Some(node0), Some(node1)) = (shard0_node, shard1_node) {
         let tx = test_transaction_with_nodes(b"cross_shard_tx", vec![node0], vec![node1]);
         let shards = topology.snapshot().all_shards_for_transaction(&tx);
-        println!("Cross-shard tx touches shards: {:?}", shards);
+        println!("Cross-shard tx touches shards: {shards:?}");
         assert_eq!(shards.len(), 2, "Cross-shard tx should touch 2 shards");
     }
 }
@@ -1616,7 +1595,7 @@ fn test_multi_shard_determinism() {
     let seed = 98765u64;
 
     // First run
-    let mut runner1 = SimulationRunner::new(config.clone(), seed);
+    let mut runner1 = SimulationRunner::new(&config, seed);
     runner1.initialize_genesis();
     runner1.run_until(Duration::from_secs(3));
 
@@ -1626,7 +1605,7 @@ fn test_multi_shard_determinism() {
     let stats1 = runner1.stats().clone();
 
     // Second run with same seed
-    let mut runner2 = SimulationRunner::new(config, seed);
+    let mut runner2 = SimulationRunner::new(&config, seed);
     runner2.initialize_genesis();
     runner2.run_until(Duration::from_secs(3));
 
@@ -1647,7 +1626,7 @@ fn test_multi_shard_determinism() {
     );
 
     println!("Multi-shard determinism verified:");
-    println!("  Heights: {:?}", heights1);
+    println!("  Heights: {heights1:?}");
     println!("  Events: {}", stats1.events_processed);
     println!("  Messages: {}", stats1.messages_sent);
 }
@@ -1666,14 +1645,14 @@ fn test_multi_shard_determinism() {
 #[test]
 fn test_consensus_with_isolated_node() {
     let config = test_network_config();
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = SimulationRunner::new(&config, 42);
 
     runner.initialize_genesis();
 
     // Run normally for 1 second to establish baseline
     runner.run_until(Duration::from_secs(1));
     let height_before = runner.node(0).unwrap().bft().committed_height();
-    println!("Height before isolation: {}", height_before);
+    println!("Height before isolation: {height_before}");
 
     // Isolate node 0 (it can neither send nor receive)
     runner.network_mut().isolate_node(0);
@@ -1694,9 +1673,9 @@ fn test_consensus_with_isolated_node() {
         "  Node 0 (isolated): {}",
         runner.node(0).unwrap().bft().committed_height()
     );
-    println!("  Node 1: {}", height_node1);
-    println!("  Node 2: {}", height_node2);
-    println!("  Node 3: {}", height_node3);
+    println!("  Node 1: {height_node1}");
+    println!("  Node 2: {height_node2}");
+    println!("  Node 3: {height_node3}");
 
     // With targeted voting and an isolated node causing asymmetric vote
     // distribution, non-isolated nodes may differ by at most 1 committed height.
@@ -1705,8 +1684,7 @@ fn test_consensus_with_isolated_node() {
     let min_h = *active_heights.iter().min().unwrap();
     assert!(
         max_h - min_h <= 1,
-        "Non-isolated nodes should differ by at most 1, got {:?}",
-        active_heights
+        "Non-isolated nodes should differ by at most 1, got {active_heights:?}"
     );
 
     // They should have made progress beyond the isolation point
@@ -1746,14 +1724,14 @@ fn test_consensus_with_isolated_node() {
 #[test]
 fn test_partition_recovery_hotstuff2() {
     let config = test_network_config();
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = SimulationRunner::new(&config, 42);
 
     runner.initialize_genesis();
 
     // Run normally for 1 second
     runner.run_until(Duration::from_secs(1));
     let height_before = runner.node(0).unwrap().bft().committed_height();
-    println!("Height before partition: {}", height_before);
+    println!("Height before partition: {height_before}");
 
     // Create a partition: nodes 0,1 can't talk to nodes 2,3
     runner.network_mut().partition_groups(&[0, 1], &[2, 3]);
@@ -1762,7 +1740,7 @@ fn test_partition_recovery_hotstuff2() {
     // Run during partition (1 second) - progress should halt (can't form QC with 2/4)
     runner.run_until(Duration::from_secs(2));
     let height_during = runner.node(0).unwrap().bft().committed_height();
-    println!("Height during partition: {}", height_during);
+    println!("Height during partition: {height_during}");
 
     // Debug: check BFT state (HotStuff-2 style - round tracked via view())
     let bft = runner.node(0).unwrap().bft();
@@ -1781,7 +1759,7 @@ fn test_partition_recovery_hotstuff2() {
     for i in 0..4u32 {
         let h = runner.node(i).unwrap().bft().committed_height();
         let v = runner.node(i).unwrap().bft().view();
-        println!("  Node {}: height={}, view={}", i, h, v);
+        println!("  Node {i}: height={h}, view={v}");
     }
 
     // Run for longer to allow round advancement and recovery
@@ -1800,7 +1778,7 @@ fn test_partition_recovery_hotstuff2() {
         let node = runner.node(i).unwrap();
         let h = node.bft().committed_height();
         let v = node.bft().view();
-        println!("  Node {}: bft(height={}, view/round={})", i, h, v);
+        println!("  Node {i}: bft(height={h}, view/round={v})");
     }
 
     let stats = runner.stats();
@@ -1818,17 +1796,17 @@ fn test_partition_recovery_hotstuff2() {
     );
 
     // Collect heights after partition heals
-    let heights_after: Vec<BlockHeight> = (0..4u32)
+    let post_heal_heights: Vec<BlockHeight> = (0..4u32)
         .map(|i| runner.node(i).unwrap().bft().committed_height())
         .collect();
 
     // Verify partition state
-    let max_height = *heights_after.iter().max().unwrap();
-    let min_height = *heights_after.iter().min().unwrap();
+    let max_height = *post_heal_heights.iter().max().unwrap();
+    let min_height = *post_heal_heights.iter().min().unwrap();
 
     println!("\nPartition effect:");
-    println!("  Max height: {}", max_height);
-    println!("  Min height: {}", min_height);
+    println!("  Max height: {max_height}");
+    println!("  Min height: {min_height}");
     println!("  Divergence: {}", max_height - min_height);
 
     // With HotStuff-2 style, nodes advance rounds locally without explicit vote exchange.
@@ -1842,7 +1820,7 @@ fn test_partition_recovery_hotstuff2() {
     let all_views: Vec<Round> = (0..4u32)
         .map(|i| runner.node(i).unwrap().bft().view())
         .collect();
-    println!("Final views: {:?}", all_views);
+    println!("Final views: {all_views:?}");
 
     // At minimum, nodes should not be deadlocked and should have valid state
     assert!(
@@ -1853,7 +1831,7 @@ fn test_partition_recovery_hotstuff2() {
     // After partition heals, nodes should resume making progress
     // The key assertion: max_height should be higher than height_during
     let height_diff = max_height.0.saturating_sub(min_height.0);
-    println!("Height difference: {}", height_diff);
+    println!("Height difference: {height_diff}");
 
     // With HotStuff-2 style view changes, recovery may be slower initially
     // as nodes need to synchronize rounds. We require meaningful progress.
@@ -1869,9 +1847,7 @@ fn test_partition_recovery_hotstuff2() {
     // Small divergence is expected due to in-flight messages and sync timing
     assert!(
         height_diff <= 5,
-        "Height divergence should be small after recovery. Got diff={}, heights={:?}",
-        height_diff,
-        heights_after
+        "Height divergence should be small after recovery. Got diff={height_diff}, heights={post_heal_heights:?}"
     );
 }
 
@@ -1885,14 +1861,14 @@ fn test_partition_recovery_hotstuff2() {
 #[test]
 fn test_consensus_during_partition() {
     let config = test_network_config();
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = SimulationRunner::new(&config, 42);
 
     runner.initialize_genesis();
 
     // Run normally for 1 second
     runner.run_until(Duration::from_secs(1));
     let height_before = runner.node(0).unwrap().bft().committed_height();
-    println!("Height before partition: {}", height_before);
+    println!("Height before partition: {height_before}");
 
     // Create a partition: nodes 0,1 can't talk to nodes 2,3
     runner.network_mut().partition_groups(&[0, 1], &[2, 3]);
@@ -1902,8 +1878,7 @@ fn test_consensus_during_partition() {
     runner.run_until(Duration::from_secs(2));
     let height_during_partition = runner.node(0).unwrap().bft().committed_height();
     println!(
-        "Height during partition: {} (expected ~{} due to no quorum)",
-        height_during_partition, height_before
+        "Height during partition: {height_during_partition} (expected ~{height_before} due to no quorum)"
     );
 
     // Progress should be minimal during partition
@@ -1948,7 +1923,7 @@ fn test_packet_loss_application() {
         packet_loss_rate: 0.10, // 10% packet loss
     };
 
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = SimulationRunner::new(&config, 42);
     runner.initialize_genesis();
 
     // Run with packet loss
@@ -1958,7 +1933,7 @@ fn test_packet_loss_application() {
         .map(|i| runner.node(i).unwrap().bft().committed_height())
         .collect();
 
-    println!("Heights with 10% packet loss: {:?}", heights);
+    println!("Heights with 10% packet loss: {heights:?}");
 
     let stats = runner.stats();
     println!("\nStats with 10% packet loss:");
@@ -1972,6 +1947,7 @@ fn test_packet_loss_application() {
     );
 
     let total_attempted = stats.messages_sent + stats.messages_dropped_loss;
+    #[allow(clippy::cast_precision_loss)] // sanity-check ratio for human-readable output
     let actual_loss_rate = stats.messages_dropped_loss as f64 / total_attempted as f64;
     println!("  Actual loss rate: {:.1}%", actual_loss_rate * 100.0);
 
@@ -2006,7 +1982,7 @@ fn test_packet_loss_determinism() {
     let seed = 12345u64;
 
     // Run 1
-    let mut runner1 = SimulationRunner::new(config.clone(), seed);
+    let mut runner1 = SimulationRunner::new(&config, seed);
     runner1.initialize_genesis();
     runner1.run_until(Duration::from_secs(3));
     let stats1 = runner1.stats().clone();
@@ -2015,7 +1991,7 @@ fn test_packet_loss_determinism() {
         .collect();
 
     // Run 2
-    let mut runner2 = SimulationRunner::new(config, seed);
+    let mut runner2 = SimulationRunner::new(&config, seed);
     runner2.initialize_genesis();
     runner2.run_until(Duration::from_secs(3));
     let stats2 = runner2.stats().clone();
@@ -2035,7 +2011,7 @@ fn test_packet_loss_determinism() {
     );
 
     println!("Packet loss determinism verified:");
-    println!("  Heights: {:?}", heights1);
+    println!("  Heights: {heights1:?}");
     println!("  Sent: {}", stats1.messages_sent);
     println!("  Dropped: {}", stats1.messages_dropped_loss);
 }
@@ -2052,7 +2028,7 @@ fn test_packet_loss_determinism() {
 #[test]
 fn test_sync_triggers_when_behind() {
     let config = test_network_config();
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = SimulationRunner::new(&config, 42);
 
     runner.initialize_genesis();
 
@@ -2064,7 +2040,7 @@ fn test_sync_triggers_when_behind() {
         .map(|i| runner.node(i).unwrap().bft().committed_height())
         .collect();
 
-    println!("Initial heights: {:?}", heights);
+    println!("Initial heights: {heights:?}");
 
     // All nodes should be synced at the same height
     let max_height = *heights.iter().max().unwrap();
@@ -2072,22 +2048,16 @@ fn test_sync_triggers_when_behind() {
 
     assert!(
         max_height >= BlockHeight(5),
-        "Should have committed at least 5 blocks, got {}",
-        max_height
+        "Should have committed at least 5 blocks, got {max_height}"
     );
     // With targeted voting, nodes may differ by at most 1 committed height
     // at any snapshot (the last proposer learns about its QC via the next header).
     assert!(
         max_height - min_height <= 1,
-        "All nodes should be within 1 block of each other, got max={} min={}",
-        max_height,
-        min_height
+        "All nodes should be within 1 block of each other, got max={max_height} min={min_height}"
     );
 
-    println!(
-        "Test passed: nodes progressed normally (heights: {:?})",
-        heights
-    );
+    println!("Test passed: nodes progressed normally (heights: {heights:?})");
 }
 
 /// Test sync detection threshold - sync only triggers when 2+ blocks behind.
@@ -2098,7 +2068,7 @@ fn test_sync_triggers_when_behind() {
 #[test]
 fn test_sync_detection_threshold() {
     let config = test_network_config();
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = SimulationRunner::new(&config, 42);
 
     runner.initialize_genesis();
 
@@ -2130,7 +2100,7 @@ fn test_sync_detection_threshold() {
 #[test]
 fn test_committed_blocks_stored_for_sync() {
     let config = test_network_config();
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = SimulationRunner::new(&config, 42);
 
     runner.initialize_genesis();
 
@@ -2146,7 +2116,7 @@ fn test_committed_blocks_stored_for_sync() {
 
     // The simulation stores committed blocks in the runner's committed_blocks cache
     // This is verified indirectly - if blocks weren't stored, sync requests would fail
-    println!("Test passed: committed {} blocks", height);
+    println!("Test passed: committed {height} blocks");
 }
 
 /// Test sync state is tracked per-node.
@@ -2157,7 +2127,7 @@ fn test_committed_blocks_stored_for_sync() {
 #[test]
 fn test_sync_state_isolation() {
     let config = test_network_config();
-    let runner = SimulationRunner::new(config, 42);
+    let runner = SimulationRunner::new(&config, 42);
 
     // Fresh nodes should all be at height 0 (before genesis)
     for i in 0..4u32 {
@@ -2165,8 +2135,7 @@ fn test_sync_state_isolation() {
         assert_eq!(
             node.bft().committed_height(),
             BlockHeight(0),
-            "Fresh node {} should be at height 0",
-            i
+            "Fresh node {i} should be at height 0"
         );
     }
 
@@ -2189,7 +2158,7 @@ fn test_sync_state_isolation() {
 #[test]
 fn test_isolated_node_divergence() {
     let config = test_network_config();
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = SimulationRunner::new(&config, 42);
 
     runner.initialize_genesis();
 
@@ -2197,7 +2166,7 @@ fn test_isolated_node_divergence() {
     runner.run_until(Duration::from_secs(1));
 
     let initial_height = runner.node(0).unwrap().bft().committed_height();
-    println!("Initial height: {}", initial_height);
+    println!("Initial height: {initial_height}");
 
     // Isolate node 3 - it can't receive from anyone
     runner.network_mut().partition_groups(&[3], &[0, 1, 2]);
@@ -2211,16 +2180,13 @@ fn test_isolated_node_divergence() {
     let heights_during: Vec<BlockHeight> = (0..4u32)
         .map(|i| runner.node(i).unwrap().bft().committed_height())
         .collect();
-    println!("Heights during isolation: {:?}", heights_during);
+    println!("Heights during isolation: {heights_during:?}");
 
     // Nodes 0,1,2 should have progressed, node 3 should be behind
     let majority_height = heights_during[0];
     let isolated_height = heights_during[3];
 
-    println!(
-        "Majority at height {}, isolated node at height {}",
-        majority_height, isolated_height
-    );
+    println!("Majority at height {majority_height}, isolated node at height {isolated_height}");
 
     // Verify divergence occurred
     assert!(
@@ -2242,8 +2208,7 @@ fn test_isolated_node_divergence() {
         let has_48 = runner.has_committed_block(i, BlockHeight(48));
         let has_49 = runner.has_committed_block(i, BlockHeight(49));
         println!(
-            "  Node {}: {} blocks, has 46={}, 47={}, 48={}, 49={}",
-            i, count, has_46, has_47, has_48, has_49
+            "  Node {i}: {count} blocks, has 46={has_46}, 47={has_47}, 48={has_48}, 49={has_49}"
         );
     }
 
@@ -2268,7 +2233,7 @@ fn test_isolated_node_divergence() {
     let final_heights: Vec<BlockHeight> = (0..4u32)
         .map(|i| runner.node(i).unwrap().bft().committed_height())
         .collect();
-    println!("Final heights: {:?}", final_heights);
+    println!("Final heights: {final_heights:?}");
 
     let max_final = *final_heights.iter().max().unwrap();
     let min_final = *final_heights.iter().min().unwrap();
@@ -2289,7 +2254,7 @@ fn test_isolated_node_divergence() {
 
     // Verify sync state
     let divergence = max_final - min_final;
-    println!("Height divergence after recovery attempt: {}", divergence);
+    println!("Height divergence after recovery attempt: {divergence}");
 
     // Note: With HotStuff-2 style view changes (no explicit view change votes),
     // sync is triggered by receiving block headers with higher QCs.
@@ -2300,9 +2265,8 @@ fn test_isolated_node_divergence() {
     // explicit sync requests), tighten this assertion.
     if divergence > 0 {
         println!(
-            "Note: Isolated node hasn't fully synced yet (divergence={}). \
-             This is expected behavior with HotStuff-2 style view changes.",
-            divergence
+            "Note: Isolated node hasn't fully synced yet (divergence={divergence}). \
+             This is expected behavior with HotStuff-2 style view changes."
         );
     }
 }

@@ -31,7 +31,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, trace, warn};
 
-/// Type alias for the simulation's concrete IoLoop.
+/// Type alias for the simulation's concrete `IoLoop`.
 type SimIoLoop = IoLoop<SimStorage, SimNetworkAdapter, SyncDispatch, SimulationEngine>;
 
 /// Type alias for the simulation's genesis wrapper.
@@ -46,10 +46,10 @@ type SimGenesisWrapper<'a> = GenesisWrapper<'a, SimStorage>;
 /// The harness controls the event queue, network delivery (latency, partitions,
 /// packet loss), and time advancement.
 pub struct SimulationRunner {
-    /// Per-node IoLoop instances. Index corresponds to NodeIndex.
+    /// Per-node `IoLoop` instances. Index corresponds to `NodeIndex`.
     io_loops: Vec<SimIoLoop>,
 
-    /// Per-node event receivers (from crossbeam channels passed to IoLoop).
+    /// Per-node event receivers (from crossbeam channels passed to `IoLoop`).
     event_rxs: Vec<crossbeam::channel::Receiver<NodeInput>>,
 
     /// Global event queue, ordered deterministically.
@@ -68,7 +68,7 @@ pub struct SimulationRunner {
     rng: ChaCha8Rng,
 
     /// Timer registry for cancellation support.
-    /// Maps (node, timer_id) -> event_key for removal.
+    /// Maps `(node, timer_id) -> event_key` for removal.
     timers: HashMap<(NodeIndex, TimerId), EventKey>,
 
     /// Statistics.
@@ -109,11 +109,14 @@ pub struct SimulationStats {
 
 impl SimulationStats {
     /// Total messages dropped (partition + packet loss).
+    #[must_use]
     pub fn messages_dropped(&self) -> u64 {
         self.messages_dropped_partition + self.messages_dropped_loss
     }
 
     /// Message delivery rate (sent / (sent + dropped)).
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)] // headline ratio for human-readable stats
     pub fn delivery_rate(&self) -> f64 {
         let total = self.messages_sent + self.messages_dropped();
         if total == 0 {
@@ -130,7 +133,14 @@ impl SimulationRunner {
     // ═══════════════════════════════════════════════════════════════════════
 
     /// Create a new simulation runner with the given configuration.
-    pub fn new(network_config: NetworkConfig, seed: u64) -> Self {
+    ///
+    /// # Panics
+    ///
+    /// Panics if generated key bytes round-trip fails (unreachable; the keypair
+    /// constructor produces canonical bytes).
+    #[must_use]
+    #[allow(clippy::too_many_lines)] // straight-line construction of per-shard io_loops
+    pub fn new(network_config: &NetworkConfig, seed: u64) -> Self {
         let network = SimulatedNetwork::new(network_config.clone());
         let rng = ChaCha8Rng::seed_from_u64(seed);
 
@@ -139,18 +149,21 @@ impl SimulationRunner {
         let keys: Vec<Bls12381G1PrivateKey> = (0..total_validators)
             .map(|i| {
                 let mut seed_bytes = [0u8; 32];
-                let key_seed = seed.wrapping_add(i as u64).wrapping_mul(0x517cc1b727220a95);
+                let key_seed = seed
+                    .wrapping_add(u64::from(i))
+                    .wrapping_mul(0x517c_c1b7_2722_0a95);
                 seed_bytes[..8].copy_from_slice(&key_seed.to_le_bytes());
-                seed_bytes[8..16].copy_from_slice(&(i as u64).to_le_bytes());
+                seed_bytes[8..16].copy_from_slice(&u64::from(i).to_le_bytes());
                 bls_keypair_from_seed(&seed_bytes)
             })
             .collect();
-        let public_keys: Vec<Bls12381G1PublicKey> = keys.iter().map(|k| k.public_key()).collect();
+        let public_keys: Vec<Bls12381G1PublicKey> =
+            keys.iter().map(Bls12381G1PrivateKey::public_key).collect();
 
         // Build global validator set
         let global_validators: Vec<ValidatorInfo> = (0..total_validators)
             .map(|i| ValidatorInfo {
-                validator_id: ValidatorId(i as u64),
+                validator_id: ValidatorId(u64::from(i)),
                 public_key: public_keys[i as usize],
                 voting_power: 1,
             })
@@ -160,11 +173,11 @@ impl SimulationRunner {
         // Build per-shard committee mappings
         let mut shard_committees: HashMap<ShardGroupId, Vec<ValidatorId>> = HashMap::new();
         for shard_id in 0..network_config.num_shards {
-            let shard = ShardGroupId(shard_id as u64);
+            let shard = ShardGroupId(u64::from(shard_id));
             let shard_start = shard_id * network_config.validators_per_shard;
             let shard_end = shard_start + network_config.validators_per_shard;
             let committee: Vec<ValidatorId> = (shard_start..shard_end)
-                .map(|i| ValidatorId(i as u64))
+                .map(|i| ValidatorId(u64::from(i)))
                 .collect();
             shard_committees.insert(shard, committee);
         }
@@ -175,22 +188,22 @@ impl SimulationRunner {
         let mut event_rxs = Vec::with_capacity(num_nodes);
 
         for shard_id in 0..network_config.num_shards {
-            let shard = ShardGroupId(shard_id as u64);
+            let shard = ShardGroupId(u64::from(shard_id));
             let shard_start = shard_id * network_config.validators_per_shard;
 
             // Shared execution cache for all validators in this shard.
             // Identical transactions against identical state produce identical
             // results — only the first validator computes; others get the cache.
-            let shard_cache: SimExecutionCache = Default::default();
+            let shard_cache: SimExecutionCache = Arc::default();
 
             for v in 0..network_config.validators_per_shard {
                 let node_index = shard_start + v;
-                let validator_id = ValidatorId(node_index as u64);
+                let validator_id = ValidatorId(u64::from(node_index));
 
                 let topology_state = TopologyState::with_shard_committees(
                     validator_id,
                     shard,
-                    network_config.num_shards as u64,
+                    u64::from(network_config.num_shards),
                     &global_validator_set,
                     shard_committees.clone(),
                 );
@@ -199,7 +212,7 @@ impl SimulationRunner {
                 let signing_key =
                     Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes");
 
-                // Clone the current snapshot for IoLoop (state machine owns TopologyState)
+                // ArcSwap so the io_loop sees `Action::TopologyChanged` snapshot updates.
                 let topology_arc = Arc::new(arc_swap::ArcSwap::from(Arc::clone(
                     topology_state.snapshot(),
                 )));
@@ -267,7 +280,8 @@ impl SimulationRunner {
     }
 
     /// Create a new simulation runner with traffic analysis enabled.
-    pub fn with_traffic_analysis(network_config: NetworkConfig, seed: u64) -> Self {
+    #[must_use]
+    pub fn with_traffic_analysis(network_config: &NetworkConfig, seed: u64) -> Self {
         let mut runner = Self::new(network_config, seed);
         let analyzer = Arc::new(NetworkTrafficAnalyzer::new());
         runner.network.set_traffic_analyzer(Arc::clone(&analyzer));
@@ -285,11 +299,13 @@ impl SimulationRunner {
     }
 
     /// Check if traffic analysis is enabled.
+    #[must_use]
     pub fn has_traffic_analysis(&self) -> bool {
         self.traffic_analyzer.is_some()
     }
 
     /// Get a bandwidth report from the traffic analyzer.
+    #[must_use]
     pub fn traffic_report(&self) -> Option<hyperscale_network_memory::BandwidthReport> {
         self.traffic_analyzer
             .as_ref()
@@ -301,11 +317,13 @@ impl SimulationRunner {
     // ═══════════════════════════════════════════════════════════════════════
 
     /// Get a reference to a node's storage.
+    #[must_use]
     pub fn node_storage(&self, node: NodeIndex) -> Option<&SimStorage> {
-        self.io_loops.get(node as usize).map(|nl| nl.storage())
+        self.io_loops.get(node as usize).map(IoLoop::storage)
     }
 
     /// Get the last emitted transaction status for a node.
+    #[must_use]
     pub fn tx_status(&self, node: NodeIndex, tx_hash: &TxHash) -> Option<TransactionStatus> {
         self.io_loops
             .get(node as usize)
@@ -313,21 +331,25 @@ impl SimulationRunner {
     }
 
     /// Get simulation statistics.
+    #[must_use]
     pub fn stats(&self) -> &SimulationStats {
         &self.stats
     }
 
     /// Get current simulation time.
+    #[must_use]
     pub fn now(&self) -> Duration {
         self.now
     }
 
     /// Get a reference to a node's state machine by index.
+    #[must_use]
     pub fn node(&self, index: NodeIndex) -> Option<&NodeStateMachine> {
-        self.io_loops.get(index as usize).map(|nl| nl.state())
+        self.io_loops.get(index as usize).map(IoLoop::state)
     }
 
     /// Get a reference to the network.
+    #[must_use]
     pub fn network(&self) -> &SimulatedNetwork {
         &self.network
     }
@@ -338,31 +360,25 @@ impl SimulationRunner {
     }
 
     /// Get the number of committed blocks stored for a specific node.
+    #[must_use]
     pub fn committed_block_count(&self, node: NodeIndex) -> usize {
-        self.io_loops
-            .get(node as usize)
-            .map(|nl| {
-                let s = nl.storage();
-                let committed = s.committed_height();
-                if committed.0 == 0 {
-                    if s.get_block(BlockHeight(0)).is_some() {
-                        1
-                    } else {
-                        0
-                    }
-                } else {
-                    (committed.0 + 1) as usize
-                }
-            })
-            .unwrap_or(0)
+        self.io_loops.get(node as usize).map_or(0, |nl| {
+            let s = nl.storage();
+            let committed = s.committed_height();
+            if committed.0 == 0 {
+                usize::from(s.get_block(BlockHeight(0)).is_some())
+            } else {
+                usize::try_from(committed.0 + 1).unwrap_or(usize::MAX)
+            }
+        })
     }
 
     /// Check if a specific block is stored for a node.
+    #[must_use]
     pub fn has_committed_block(&self, node: NodeIndex, height: BlockHeight) -> bool {
         self.io_loops
             .get(node as usize)
-            .map(|nl| nl.storage().get_block(height).is_some())
-            .unwrap_or(false)
+            .is_some_and(|nl| nl.storage().get_block(height).is_some())
     }
 
     /// Schedule an initial event (e.g., to start the simulation).
@@ -405,23 +421,28 @@ impl SimulationRunner {
     /// Initialize genesis with pre-funded accounts.
     ///
     /// Each node only receives the accounts that belong to its shard, avoiding
-    /// the Radix Engine genesis limit (~8000 accounts per node). The balances
+    /// the Radix Engine genesis limit (~8000 accounts per node). The `balances`
     /// list may contain accounts from all shards — they are filtered per-node.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a Radix `ComponentAddress` payload is shorter than 30 bytes
+    /// (unreachable: `ComponentAddress` is always 30 bytes).
     pub fn initialize_genesis_with_balances(
         &mut self,
-        balances: Vec<(
+        balances: &[(
             radix_common::types::ComponentAddress,
             radix_common::math::Decimal,
-        )>,
+        )],
     ) {
         use hyperscale_engine::GenesisConfig;
 
-        let num_shards = self.network.config().num_shards as u64;
+        let num_shards = u64::from(self.network.config().num_shards);
         let validators_per_shard = self.network.config().validators_per_shard;
 
         // Pre-group balances by shard so we don't re-filter for every node.
         let mut balances_by_shard: HashMap<ShardGroupId, Vec<_>> = HashMap::new();
-        for (address, balance) in &balances {
+        for (address, balance) in balances {
             let radix_node_id = address.into_node_id();
             let det_node_id = NodeId(radix_node_id.0[..30].try_into().unwrap());
             let shard = shard_for_node(&det_node_id, num_shards);
@@ -436,7 +457,7 @@ impl SimulationRunner {
         // then computes JMT once at version 0 to avoid collisions with block 1.
         for node_idx in 0..self.io_loops.len() {
             if !self.genesis_executed[node_idx] {
-                let shard_id = ShardGroupId(node_idx as u64 / validators_per_shard as u64);
+                let shard_id = ShardGroupId(node_idx as u64 / u64::from(validators_per_shard));
                 let shard_balances = balances_by_shard
                     .get(&shard_id)
                     .cloned()
@@ -490,9 +511,9 @@ impl SimulationRunner {
                 "JMT state after genesis bootstrap"
             );
 
-            let proposer = ValidatorId((shard_id * validators_per_shard) as u64);
+            let proposer = ValidatorId(u64::from(shard_id * validators_per_shard));
             let genesis_block = Block::genesis(
-                hyperscale_types::ShardGroupId(shard_id as u64),
+                hyperscale_types::ShardGroupId(u64::from(shard_id)),
                 proposer,
                 genesis_jmt_root,
             );
@@ -540,7 +561,17 @@ impl SimulationRunner {
     // ═══════════════════════════════════════════════════════════════════════
 
     /// Run simulation until no more events or time limit reached.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `event_queue.pop_first()` returns `None` after `first_key_value()`
+    /// returned `Some` (impossible: `&mut self` blocks any other writer).
     pub fn run_until(&mut self, end_time: Duration) {
+        // Prune gossip dedup caches every 5 simulated seconds.
+        // Dedup only needs to cover the window in which duplicate broadcasts
+        // arrive (~cross-shard latency), so 5s is very conservative.
+        const GOSSIP_DEDUP_PRUNE_INTERVAL: Duration = Duration::from_secs(5);
+
         trace!(
             end_time_secs = end_time.as_secs_f64(),
             "Running simulation step"
@@ -567,10 +598,6 @@ impl SimulationRunner {
 
             self.now = next_time;
 
-            // Prune gossip dedup caches every 5 simulated seconds.
-            // Dedup only needs to cover the window in which duplicate broadcasts
-            // arrive (~cross-shard latency), so 5s is very conservative.
-            const GOSSIP_DEDUP_PRUNE_INTERVAL: Duration = Duration::from_secs(5);
             if self.now.saturating_sub(self.last_gossip_dedup_prune) >= GOSSIP_DEDUP_PRUNE_INTERVAL
             {
                 self.network.prune_gossip_dedup();
@@ -585,7 +612,7 @@ impl SimulationRunner {
 
             if gossip_delivered + notif_delivered + response_delivered > 0 {
                 // Drain events that handlers pushed into channels.
-                for node_idx in 0..self.io_loops.len() as u32 {
+                for node_idx in 0..u32::try_from(self.io_loops.len()).unwrap_or(u32::MAX) {
                     while let Ok(event) = self.event_rxs[node_idx as usize].try_recv() {
                         self.schedule_event(node_idx, self.now, event);
                     }
@@ -611,7 +638,9 @@ impl SimulationRunner {
                 self.stats.events_by_priority[event.priority() as usize] += 1;
 
                 self.io_loops[node_index as usize].set_time(
-                    hyperscale_types::LocalTimestamp::from_millis(self.now.as_millis() as u64),
+                    hyperscale_types::LocalTimestamp::from_millis(
+                        u64::try_from(self.now.as_millis()).unwrap_or(u64::MAX),
+                    ),
                 );
                 let output = self.io_loops[node_index as usize].step(event);
                 self.io_loops[node_index as usize].flush_all_batches();
@@ -644,7 +673,7 @@ impl SimulationRunner {
     /// - Outbox entries → gossip latency queue
     /// - Pending requests → handler invoked, response callback deferred
     /// - Pending notifications → notification latency queue
-    /// - Buffered events (from error callbacks, IoLoop step) → event queue
+    /// - Buffered events (from error callbacks, `IoLoop` step) → event queue
     fn drain_node_io(&mut self, node: NodeIndex) {
         let i = node as usize;
         let outbox = self.io_loops[i].network().drain_outbox();
@@ -693,9 +722,9 @@ impl SimulationRunner {
         }
     }
 
-    /// Process StepOutput: stats and timer ops.
+    /// Process `StepOutput`: stats and timer ops.
     fn process_step_output(&mut self, node: NodeIndex, output: StepOutput) {
-        self.stats.actions_generated += output.actions_generated as u64;
+        self.stats.actions_generated += u64::try_from(output.actions_generated).unwrap_or(u64::MAX);
         if let Some(task) = output.commit_task {
             task();
         }
@@ -708,7 +737,7 @@ impl SimulationRunner {
     // Timer Handling
     // ═══════════════════════════════════════════════════════════════════════
 
-    /// Process a timer operation from SimTimer.
+    /// Process a timer operation from `SimTimer`.
     fn process_timer_op(&mut self, node: NodeIndex, op: TimerOp) {
         match op {
             TimerOp::Set { id, duration } => {

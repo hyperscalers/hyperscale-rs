@@ -133,10 +133,10 @@ fn poll_until_terminal(
 #[test]
 fn test_cycle_detection_aborts_loser() {
     let config = two_shard_config();
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = SimulationRunner::new(&config, 42);
 
     let (kp0, acc0, kp1, acc1) = accounts_on_different_shards(2);
-    runner.initialize_genesis_with_balances(vec![
+    runner.initialize_genesis_with_balances(&[
         (acc0, Decimal::from(10_000)),
         (acc1, Decimal::from(10_000)),
     ]);
@@ -199,13 +199,11 @@ fn test_cycle_detection_aborts_loser() {
     let h1 = n3.bft().committed_height();
     assert!(
         a_done,
-        "TX A should reach terminal state on shard 0, got {:?} at h={}",
-        status_a, h0,
+        "TX A should reach terminal state on shard 0, got {status_a:?} at h={h0}",
     );
     assert!(
         b_done,
-        "TX B should reach terminal state on shard 1, got {:?} at h={}",
-        status_b, h1,
+        "TX B should reach terminal state on shard 1, got {status_b:?} at h={h1}",
     );
 
     // Both transactions should be evicted from their home shards
@@ -225,10 +223,10 @@ fn test_cycle_detection_aborts_loser() {
 #[test]
 fn test_no_cycle_completes_normally() {
     let config = two_shard_config();
-    let mut runner = SimulationRunner::new(config, 99);
+    let mut runner = SimulationRunner::new(&config, 99);
 
     let (kp0, acc0, _kp1, acc1) = accounts_on_different_shards(2);
-    runner.initialize_genesis_with_balances(vec![
+    runner.initialize_genesis_with_balances(&[
         (acc0, Decimal::from(10_000)),
         (acc1, Decimal::from(10_000)),
     ]);
@@ -248,9 +246,8 @@ fn test_no_cycle_completes_normally() {
 
     // Should be None (evicted after Completed) or Completed(Accept)
     match final_status {
-        None => {} // evicted — correct
-        Some(TransactionStatus::Completed(TransactionDecision::Accept)) => {}
-        other => panic!("expected Completed(Accept) or evicted, got {:?}", other),
+        None | Some(TransactionStatus::Completed(TransactionDecision::Accept)) => {}
+        other => panic!("expected Completed(Accept) or evicted, got {other:?}"),
     }
 }
 
@@ -259,10 +256,10 @@ fn test_no_cycle_completes_normally() {
 #[test]
 fn test_timeout_abort() {
     let config = two_shard_config();
-    let mut runner = SimulationRunner::new(config, 777);
+    let mut runner = SimulationRunner::new(&config, 777);
 
     let (kp0, acc0, _kp1, acc1) = accounts_on_different_shards(2);
-    runner.initialize_genesis_with_balances(vec![
+    runner.initialize_genesis_with_balances(&[
         (acc0, Decimal::from(10_000)),
         (acc1, Decimal::from(10_000)),
     ]);
@@ -284,7 +281,7 @@ fn test_timeout_abort() {
     match final_status {
         None => {} // evicted — terminal
         Some(s) if s.is_final() => {}
-        other => panic!("expected terminal state, got {:?}", other),
+        other => panic!("expected terminal state, got {other:?}"),
     }
 }
 
@@ -293,10 +290,10 @@ fn test_timeout_abort() {
 #[test]
 fn test_livelock_resolves_promptly() {
     let config = two_shard_config();
-    let mut runner = SimulationRunner::new(config, 555);
+    let mut runner = SimulationRunner::new(&config, 555);
 
     let (kp0, acc0, kp1, acc1) = accounts_on_different_shards(2);
-    runner.initialize_genesis_with_balances(vec![
+    runner.initialize_genesis_with_balances(&[
         (acc0, Decimal::from(10_000)),
         (acc1, Decimal::from(10_000)),
     ]);
@@ -347,20 +344,17 @@ fn test_livelock_resolves_promptly() {
         }
     }
 
-    let elapsed = runner.now() - submit_time;
+    let elapsed = runner.now().checked_sub(submit_time).unwrap();
     assert!(
         a_done,
-        "TX A should resolve within 30s (elapsed: {:?})",
-        elapsed
+        "TX A should resolve within 30s (elapsed: {elapsed:?})"
     );
     assert!(
         b_done,
-        "TX B should resolve within 30s (elapsed: {:?})",
-        elapsed
+        "TX B should resolve within 30s (elapsed: {elapsed:?})"
     );
     assert!(
         elapsed < Duration::from_secs(30),
-        "cycle resolution took too long: {:?}",
-        elapsed
+        "cycle resolution took too long: {elapsed:?}",
     );
 }

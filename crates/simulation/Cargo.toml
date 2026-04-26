@@ -43,3 +43,6 @@ radix-transactions.workspace = true
 hyperscale-types = { workspace = true, features = ["test-utils"] }
 
 tracing-test.workspace = true
+
+[lints]
+workspace = true
