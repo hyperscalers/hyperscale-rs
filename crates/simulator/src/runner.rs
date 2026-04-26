@@ -238,9 +238,7 @@ impl Simulator {
                             && status.is_final()
                         {
                             pending.remove(&hash);
-                            if let TransactionStatus::Completed(TransactionDecision::Accept) =
-                                status
-                            {
+                            if status == TransactionStatus::Completed(TransactionDecision::Accept) {
                                 total_completed += 1;
                             } else {
                                 total_failed += 1;
@@ -488,12 +486,12 @@ impl Simulator {
 
     /// Get the underlying simulation runner (for advanced use).
     #[must_use]
-    pub fn runner(&self) -> &SimulationRunner {
+    pub const fn runner(&self) -> &SimulationRunner {
         &self.runner
     }
 
     /// Get mutable access to the simulation runner.
-    pub fn runner_mut(&mut self) -> &mut SimulationRunner {
+    pub const fn runner_mut(&mut self) -> &mut SimulationRunner {
         &mut self.runner
     }
 
@@ -527,7 +525,7 @@ impl Simulator {
 
     /// Check if traffic analysis is enabled.
     #[must_use]
-    pub fn has_traffic_analysis(&self) -> bool {
+    pub const fn has_traffic_analysis(&self) -> bool {
         self.runner.has_traffic_analysis()
     }
 

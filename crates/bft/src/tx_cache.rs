@@ -20,7 +20,7 @@ use hyperscale_types::{RoutableTransaction, TxHash, WaveIdHash, WeightedTimestam
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-pub(crate) struct CommittedTxCache {
+pub struct CommittedTxCache {
     /// `tx_hash → end_timestamp_exclusive`. Pruned when
     /// `end_timestamp_exclusive <= current_committed_ts`.
     tx_lookup: HashMap<TxHash, WeightedTimestamp>,

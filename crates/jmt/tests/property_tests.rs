@@ -274,7 +274,7 @@ proptest! {
         let target = keys[delete_idx % keys.len()];
 
         let updates: BTreeMap<Key, Option<ValueHash>> =
-            [(target, None)].into_iter().collect();
+            std::iter::once((target, None)).collect();
         let res = Jmt::apply_updates(&store, Some(1), 2, &updates).unwrap();
         store.apply(&res);
 
@@ -334,7 +334,7 @@ proptest! {
         prop_assume!(old_value != new_value);
 
         let u2: BTreeMap<Key, Option<ValueHash>> =
-            [(target, Some(new_value))].into_iter().collect();
+            std::iter::once((target, Some(new_value))).collect();
         let r2 = Jmt::apply_updates(&store, Some(1), 2, &u2).unwrap();
         store.apply(&r2);
 
@@ -362,7 +362,7 @@ proptest! {
 
         let bytes = proof.encode();
         let decoded = hyperscale_jmt::MultiProof::decode(&bytes).unwrap();
-        prop_assert_eq!(proof, decoded.clone());
+        prop_assert_eq!(&proof, &decoded);
 
         // Re-verify with the same expected claims the original proof
         // would satisfy.

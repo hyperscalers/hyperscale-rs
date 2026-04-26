@@ -27,7 +27,7 @@ pub struct BlockHeaderNotification {
 impl BlockHeaderNotification {
     /// Create a block header notification message.
     #[must_use]
-    pub fn new(
+    pub const fn new(
         header: BlockHeader,
         manifest: BlockManifest,
         proposer_signature: Bls12381G2Signature,
@@ -152,7 +152,7 @@ mod tests {
             zero_sig(),
         );
 
-        let all: Vec<TxHash> = gossip.manifest.tx_hashes.clone();
+        let all: Vec<TxHash> = gossip.manifest.tx_hashes;
         assert_eq!(all, vec![tx1, tx2, tx3]);
     }
 }

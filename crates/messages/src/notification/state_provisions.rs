@@ -77,19 +77,19 @@ impl StateProvisionNotification {
 
     /// Get the trace context.
     #[must_use]
-    pub fn trace_context(&self) -> &TraceContext {
+    pub const fn trace_context(&self) -> &TraceContext {
         &self.trace_context
     }
 
     /// Check if there are no provisions.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.provisions.is_empty()
     }
 
     /// Get the number of provisions.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.provisions.len()
     }
 }

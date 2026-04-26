@@ -33,15 +33,16 @@ pub fn make_database_update(
     updates.node_updates.insert(
         node_key,
         NodeDatabaseUpdates {
-            partition_updates: [(
+            partition_updates: std::iter::once((
                 partition,
                 PartitionDatabaseUpdates::Delta {
-                    substate_updates: [(DbSortKey(sort_key), DatabaseUpdate::Set(value))]
-                        .into_iter()
-                        .collect(),
+                    substate_updates: std::iter::once((
+                        DbSortKey(sort_key),
+                        DatabaseUpdate::Set(value),
+                    ))
+                    .collect(),
                 },
-            )]
-            .into_iter()
+            ))
             .collect(),
         },
     );
@@ -81,7 +82,10 @@ pub fn make_mapped_database_update(
 
 /// Build a test `WaveCertificate` at the given height.
 #[must_use]
-pub fn make_test_wave_certificate(height: BlockHeight, shard: ShardGroupId) -> WaveCertificate {
+pub const fn make_test_wave_certificate(
+    height: BlockHeight,
+    shard: ShardGroupId,
+) -> WaveCertificate {
     WaveCertificate {
         wave_id: WaveId::new(shard, height, BTreeSet::new()),
         execution_certificates: vec![],

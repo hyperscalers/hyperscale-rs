@@ -30,7 +30,7 @@ struct QueuedProvision {
 
 /// Proposal queue + tombstone set for committed provisions.
 #[derive(Debug)]
-pub(crate) struct QueuedProvisionBuffer {
+pub struct QueuedProvisionBuffer {
     queue: Vec<QueuedProvision>,
     tombstones: HashMap<ProvisionHash, WeightedTimestamp>,
     min_dwell_time: Duration,
@@ -105,7 +105,7 @@ impl QueuedProvisionBuffer {
             .collect()
     }
 
-    pub(crate) fn queue_len(&self) -> usize {
+    pub(crate) const fn queue_len(&self) -> usize {
         self.queue.len()
     }
 
@@ -178,7 +178,7 @@ mod tests {
         let hash = provisions.hash();
         buf.enqueue(Arc::clone(&provisions), ts(1_000), local(0));
 
-        let committed: HashSet<_> = [hash].into_iter().collect();
+        let committed: HashSet<_> = std::iter::once(hash).collect();
         buf.on_block_committed(&committed, ts(2_000));
 
         assert!(buf.is_tombstoned(&hash));
@@ -190,7 +190,7 @@ mod tests {
         let mut buf = QueuedProvisionBuffer::new(Duration::ZERO);
         let provisions = make_provisions(1, ShardGroupId(1), BlockHeight(10));
         let hash = provisions.hash();
-        let committed: HashSet<_> = [hash].into_iter().collect();
+        let committed: HashSet<_> = std::iter::once(hash).collect();
         buf.on_block_committed(&committed, ts(1_000));
         assert!(buf.is_tombstoned(&hash));
 

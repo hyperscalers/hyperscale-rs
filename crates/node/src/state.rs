@@ -121,7 +121,7 @@ impl NodeStateMachine {
 
     /// Get this node's index.
     #[must_use]
-    pub fn node_index(&self) -> NodeIndex {
+    pub const fn node_index(&self) -> NodeIndex {
         self.node_index
     }
 
@@ -139,37 +139,37 @@ impl NodeStateMachine {
 
     /// Get a reference to the mempool state.
     #[must_use]
-    pub fn mempool(&self) -> &MempoolCoordinator {
+    pub const fn mempool(&self) -> &MempoolCoordinator {
         &self.mempool
     }
 
     /// Get a reference to the BFT state.
     #[must_use]
-    pub fn bft(&self) -> &BftCoordinator {
+    pub const fn bft(&self) -> &BftCoordinator {
         &self.bft
     }
 
     /// Get a reference to the execution state.
     #[must_use]
-    pub fn execution(&self) -> &ExecutionCoordinator {
+    pub const fn execution(&self) -> &ExecutionCoordinator {
         &self.execution
     }
 
     /// Get a reference to the provision coordinator.
     #[must_use]
-    pub fn provisions(&self) -> &ProvisionCoordinator {
+    pub const fn provisions(&self) -> &ProvisionCoordinator {
         &self.provisions
     }
 
     /// Get a reference to the remote header coordinator.
     #[must_use]
-    pub fn remote_headers(&self) -> &RemoteHeaderCoordinator {
+    pub const fn remote_headers(&self) -> &RemoteHeaderCoordinator {
         &self.remote_headers
     }
 
     /// Get the last committed JMT root hash (delegated to BFT's verification pipeline).
     #[must_use]
-    pub fn last_committed_jmt_root(&self) -> StateRoot {
+    pub const fn last_committed_jmt_root(&self) -> StateRoot {
         self.bft.jmt_root()
     }
 
@@ -189,11 +189,7 @@ impl NodeStateMachine {
     ///
     /// Used by both `on_proposal_timer` and `on_qc_formed` to avoid duplicating
     /// the ready-transaction + abort intents + certificates gathering logic.
-    fn gather_proposal_inputs(
-        &mut self,
-        pending_txs: usize,
-        pending_certs: usize,
-    ) -> ProposalInputs {
+    fn gather_proposal_inputs(&self, pending_txs: usize, pending_certs: usize) -> ProposalInputs {
         // Request extra transactions from the mempool to compensate for QC-chain
         // duplicates that will be filtered by BFT during proposal building.
         let max_txs = self.bft.config().max_transactions_per_block + self.bft.dedup_overhead();
@@ -446,7 +442,7 @@ impl NodeStateMachine {
         actions
     }
 
-    fn on_ec_created(&mut self, tx_hashes: &[TxHash]) -> Vec<Action> {
+    fn on_ec_created(&self, tx_hashes: &[TxHash]) -> Vec<Action> {
         self.mempool.on_ec_created(tx_hashes)
     }
 

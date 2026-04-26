@@ -28,7 +28,7 @@ use hyperscale_core::{Action, VerificationKind};
 /// verify the QC's aggregated BLS signature before voting. This struct
 /// tracks the block header while waiting for verification.
 #[derive(Debug, Clone)]
-pub(crate) struct PendingQcVerification {
+pub struct PendingQcVerification {
     /// The block header we're considering voting on.
     pub header: BlockHeader,
 }
@@ -62,7 +62,7 @@ pub struct ReadyStateRootVerification {
 
 /// Classification of the in-flight check outcome for the vote path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum InFlightCheck {
+pub enum InFlightCheck {
     /// In-flight count passes — proceed with voting.
     Proceed,
     /// Run verifications but do not vote (vote-locked, or parent pruned).
@@ -75,7 +75,7 @@ pub(crate) enum InFlightCheck {
 /// — `parent_state_root` and `finalized_waves` are resolved freshly at drain
 /// time against the current chain view.
 #[derive(Debug, Clone)]
-pub(crate) struct PendingStateRootVerification {
+pub struct PendingStateRootVerification {
     pub block_hash: BlockHash,
     pub parent_block_hash: BlockHash,
     pub parent_block_height: BlockHeight,
@@ -91,7 +91,7 @@ pub(crate) struct PendingStateRootVerification {
 ///
 /// `BftCoordinator` owns this as a field and delegates verification bookkeeping
 /// to it. Control-flow decisions (vote, reject block) remain in `BftCoordinator`.
-pub(crate) struct VerificationPipeline {
+pub struct VerificationPipeline {
     // === QC signature verification ===
     /// Block headers pending QC signature verification.
     /// Maps `block_hash` -> pending verification info.

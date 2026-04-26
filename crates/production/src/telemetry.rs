@@ -127,7 +127,7 @@ pub fn init_telemetry(config: &TelemetryConfig) -> Result<TelemetryGuard, Teleme
             .with_batch_exporter(exporter)
             .with_sampler(Sampler::TraceIdRatioBased(config.sampling_ratio))
             .with_id_generator(RandomIdGenerator::default())
-            .with_resource(resource.clone())
+            .with_resource(resource)
             .build();
 
         let tracer = tracer_provider.tracer("hyperscale");
@@ -157,7 +157,7 @@ pub fn init_telemetry(config: &TelemetryConfig) -> Result<TelemetryGuard, Teleme
             .to_string();
         let directory = log_file
             .parent()
-            .unwrap_or(std::path::Path::new("."))
+            .unwrap_or_else(|| std::path::Path::new("."))
             .to_path_buf();
 
         let file_appender = tracing_appender::rolling::never(directory, file_name);

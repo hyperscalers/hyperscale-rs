@@ -167,12 +167,9 @@ pub fn verify_execution_certificate_signature(
     if signer_keys.is_empty() {
         certificate.aggregated_signature == zero_bls_signature()
     } else {
-        match Bls12381G1PublicKey::aggregate(&signer_keys, false) {
-            Ok(aggregated_pk) => {
-                verify_bls12381_v1(&msg, &aggregated_pk, &certificate.aggregated_signature)
-            }
-            Err(_) => false,
-        }
+        Bls12381G1PublicKey::aggregate(&signer_keys, false).is_ok_and(|aggregated_pk| {
+            verify_bls12381_v1(&msg, &aggregated_pk, &certificate.aggregated_signature)
+        })
     }
 }
 
@@ -376,7 +373,7 @@ mod tests {
                 &wid,
                 root,
                 WeightedTimestamp(100),
-                outcomes.clone(),
+                outcomes,
             ),
         ];
 
@@ -426,15 +423,14 @@ mod tests {
                     &wid,
                     root,
                     WeightedTimestamp(100),
-                    outcomes.clone(),
+                    outcomes,
                 ),
                 sk1.public_key(),
                 1u64,
             ),
         ];
 
-        let verified: Vec<_> = batch_verify_execution_votes(votes).collect();
-        assert_eq!(verified.len(), 2);
+        assert_eq!(batch_verify_execution_votes(votes).count(), 2);
     }
 
     #[test]
@@ -483,7 +479,7 @@ mod tests {
                     &wid,
                     root,
                     WeightedTimestamp(100),
-                    outcomes.clone(),
+                    outcomes,
                 ),
                 sk2.public_key(),
                 1u64,
@@ -497,8 +493,7 @@ mod tests {
 
     #[test]
     fn batch_verify_empty_input_returns_empty() {
-        let verified: Vec<_> = batch_verify_execution_votes(Vec::new()).collect();
-        assert!(verified.is_empty());
+        assert!(batch_verify_execution_votes(Vec::new()).next().is_none());
     }
 
     // ─── verify_execution_certificate_signature ──────────────────────────
@@ -558,7 +553,7 @@ mod tests {
                 &wid,
                 root,
                 WeightedTimestamp(100),
-                outcomes.clone(),
+                outcomes,
             ),
         ];
         let ec = aggregate_execution_certificate(&wid, root, &votes, &committee);

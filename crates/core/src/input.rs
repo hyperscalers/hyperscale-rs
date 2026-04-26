@@ -255,12 +255,12 @@ impl NodeInput {
     /// ensuring causality is preserved.
     #[must_use]
     #[allow(clippy::match_same_arms)] // explicit per-variant arms document intent
-    pub fn priority(&self) -> EventPriority {
+    pub const fn priority(&self) -> EventPriority {
         match self {
             // Priority is a scheduling concern, not a protocol concern.
             // Timers and network-received messages are classified explicitly;
             // everything else (callbacks, continuations, completions) defaults to Internal.
-            NodeInput::Protocol(pe) => match pe {
+            Self::Protocol(pe) => match pe {
                 ProtocolEvent::ViewChangeTimer
                 | ProtocolEvent::CleanupTimer
                 | ProtocolEvent::GlobalConsensusTimer => EventPriority::Timer,
@@ -282,29 +282,29 @@ impl NodeInput {
                 // CommittedHeaderValidated). They fall through to Internal.
                 _ => EventPriority::Internal,
             },
-            NodeInput::SubmitTransaction { .. } => EventPriority::Client,
-            NodeInput::SyncBlockResponseReceived { .. } => EventPriority::Internal,
-            NodeInput::SyncBlockFetchFailed { .. } => EventPriority::Internal,
-            NodeInput::SyncBlockTopUpReceived { .. } => EventPriority::Internal,
-            NodeInput::SyncBlockTopUpFailed { .. } => EventPriority::Internal,
-            NodeInput::FetchTick => EventPriority::Timer,
-            NodeInput::FetchTransactionsFailed { .. } => EventPriority::Internal,
-            NodeInput::TransactionReceived { .. } => EventPriority::Network,
-            NodeInput::TransactionValidated { .. } => EventPriority::Internal,
-            NodeInput::TransactionValidationsFailed { .. } => EventPriority::Internal,
-            NodeInput::CommittedHeaderValidated { .. } => EventPriority::Internal,
-            NodeInput::CommittedBlockGossipReceived { .. } => EventPriority::Network,
-            NodeInput::ProvisionReady { .. } => EventPriority::Internal,
-            NodeInput::ProvisionFetchReceived { .. } => EventPriority::Internal,
-            NodeInput::ProvisionFetchFailed { .. } => EventPriority::Internal,
-            NodeInput::ExecCertFetchReceived { .. } => EventPriority::Internal,
-            NodeInput::ExecCertFetchFailed { .. } => EventPriority::Internal,
-            NodeInput::HeaderFetchReceived { .. } => EventPriority::Internal,
-            NodeInput::HeaderFetchFailed { .. } => EventPriority::Internal,
-            NodeInput::LocalProvisionReceived { .. } => EventPriority::Internal,
-            NodeInput::LocalProvisionFetchFailed { .. } => EventPriority::Internal,
-            NodeInput::FinalizedWaveReceived { .. } => EventPriority::Internal,
-            NodeInput::FinalizedWaveFetchFailed { .. } => EventPriority::Internal,
+            Self::SubmitTransaction { .. } => EventPriority::Client,
+            Self::SyncBlockResponseReceived { .. } => EventPriority::Internal,
+            Self::SyncBlockFetchFailed { .. } => EventPriority::Internal,
+            Self::SyncBlockTopUpReceived { .. } => EventPriority::Internal,
+            Self::SyncBlockTopUpFailed { .. } => EventPriority::Internal,
+            Self::FetchTick => EventPriority::Timer,
+            Self::FetchTransactionsFailed { .. } => EventPriority::Internal,
+            Self::TransactionReceived { .. } => EventPriority::Network,
+            Self::TransactionValidated { .. } => EventPriority::Internal,
+            Self::TransactionValidationsFailed { .. } => EventPriority::Internal,
+            Self::CommittedHeaderValidated { .. } => EventPriority::Internal,
+            Self::CommittedBlockGossipReceived { .. } => EventPriority::Network,
+            Self::ProvisionReady { .. } => EventPriority::Internal,
+            Self::ProvisionFetchReceived { .. } => EventPriority::Internal,
+            Self::ProvisionFetchFailed { .. } => EventPriority::Internal,
+            Self::ExecCertFetchReceived { .. } => EventPriority::Internal,
+            Self::ExecCertFetchFailed { .. } => EventPriority::Internal,
+            Self::HeaderFetchReceived { .. } => EventPriority::Internal,
+            Self::HeaderFetchFailed { .. } => EventPriority::Internal,
+            Self::LocalProvisionReceived { .. } => EventPriority::Internal,
+            Self::LocalProvisionFetchFailed { .. } => EventPriority::Internal,
+            Self::FinalizedWaveReceived { .. } => EventPriority::Internal,
+            Self::FinalizedWaveFetchFailed { .. } => EventPriority::Internal,
         }
     }
 
@@ -330,36 +330,36 @@ impl NodeInput {
     #[must_use]
     pub fn type_name(&self) -> &'static str {
         match self {
-            NodeInput::Protocol(pe) => pe.type_name(),
-            NodeInput::SubmitTransaction { .. } => "SubmitTransaction",
-            NodeInput::SyncBlockResponseReceived { .. } => "SyncBlockResponseReceived",
-            NodeInput::SyncBlockFetchFailed { .. } => "SyncBlockFetchFailed",
-            NodeInput::SyncBlockTopUpReceived { .. } => "SyncBlockTopUpReceived",
-            NodeInput::SyncBlockTopUpFailed { .. } => "SyncBlockTopUpFailed",
-            NodeInput::FetchTick => "FetchTick",
-            NodeInput::FetchTransactionsFailed { .. } => "FetchTransactionsFailed",
-            NodeInput::TransactionReceived { .. } => "TransactionReceived",
-            NodeInput::TransactionValidated { .. } => "TransactionValidated",
-            NodeInput::TransactionValidationsFailed { .. } => "TransactionValidationsFailed",
-            NodeInput::CommittedHeaderValidated { .. } => "CommittedHeaderValidated",
-            NodeInput::CommittedBlockGossipReceived { .. } => "CommittedBlockGossipReceived",
-            NodeInput::ProvisionReady { .. } => "ProvisionReady",
-            NodeInput::ProvisionFetchReceived { .. } => "ProvisionFetchReceived",
-            NodeInput::ProvisionFetchFailed { .. } => "ProvisionFetchFailed",
-            NodeInput::ExecCertFetchReceived { .. } => "ExecCertFetchReceived",
-            NodeInput::ExecCertFetchFailed { .. } => "ExecCertFetchFailed",
-            NodeInput::HeaderFetchReceived { .. } => "HeaderFetchReceived",
-            NodeInput::HeaderFetchFailed { .. } => "HeaderFetchFailed",
-            NodeInput::LocalProvisionReceived { .. } => "LocalProvisionReceived",
-            NodeInput::LocalProvisionFetchFailed { .. } => "LocalProvisionFetchFailed",
-            NodeInput::FinalizedWaveReceived { .. } => "FinalizedWaveReceived",
-            NodeInput::FinalizedWaveFetchFailed { .. } => "FinalizedWaveFetchFailed",
+            Self::Protocol(pe) => pe.type_name(),
+            Self::SubmitTransaction { .. } => "SubmitTransaction",
+            Self::SyncBlockResponseReceived { .. } => "SyncBlockResponseReceived",
+            Self::SyncBlockFetchFailed { .. } => "SyncBlockFetchFailed",
+            Self::SyncBlockTopUpReceived { .. } => "SyncBlockTopUpReceived",
+            Self::SyncBlockTopUpFailed { .. } => "SyncBlockTopUpFailed",
+            Self::FetchTick => "FetchTick",
+            Self::FetchTransactionsFailed { .. } => "FetchTransactionsFailed",
+            Self::TransactionReceived { .. } => "TransactionReceived",
+            Self::TransactionValidated { .. } => "TransactionValidated",
+            Self::TransactionValidationsFailed { .. } => "TransactionValidationsFailed",
+            Self::CommittedHeaderValidated { .. } => "CommittedHeaderValidated",
+            Self::CommittedBlockGossipReceived { .. } => "CommittedBlockGossipReceived",
+            Self::ProvisionReady { .. } => "ProvisionReady",
+            Self::ProvisionFetchReceived { .. } => "ProvisionFetchReceived",
+            Self::ProvisionFetchFailed { .. } => "ProvisionFetchFailed",
+            Self::ExecCertFetchReceived { .. } => "ExecCertFetchReceived",
+            Self::ExecCertFetchFailed { .. } => "ExecCertFetchFailed",
+            Self::HeaderFetchReceived { .. } => "HeaderFetchReceived",
+            Self::HeaderFetchFailed { .. } => "HeaderFetchFailed",
+            Self::LocalProvisionReceived { .. } => "LocalProvisionReceived",
+            Self::LocalProvisionFetchFailed { .. } => "LocalProvisionFetchFailed",
+            Self::FinalizedWaveReceived { .. } => "FinalizedWaveReceived",
+            Self::FinalizedWaveFetchFailed { .. } => "FinalizedWaveFetchFailed",
         }
     }
 }
 
 impl From<ProtocolEvent> for NodeInput {
     fn from(event: ProtocolEvent) -> Self {
-        NodeInput::Protocol(event)
+        Self::Protocol(event)
     }
 }

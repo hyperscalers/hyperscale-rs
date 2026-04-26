@@ -263,13 +263,13 @@ impl BftCoordinator {
     /// synchronously at commit time and surfaced via the status API as the
     /// canonical current state root.
     #[must_use]
-    pub fn jmt_root(&self) -> StateRoot {
+    pub const fn jmt_root(&self) -> StateRoot {
         self.committed_state_root
     }
 
     /// Borrow-view of the node's knowledge of the chain. Short-lived; see
     /// [`ChainView`] for the lookup API.
-    fn chain_view(&self) -> ChainView<'_> {
+    const fn chain_view(&self) -> ChainView<'_> {
         ChainView {
             committed_height: self.committed_height,
             committed_hash: self.committed_hash,
@@ -286,7 +286,7 @@ impl BftCoordinator {
     // ═══════════════════════════════════════════════════════════════════════════
 
     /// Set the current time.
-    pub fn set_time(&mut self, now: LocalTimestamp) {
+    pub const fn set_time(&mut self, now: LocalTimestamp) {
         self.now = now;
     }
 
@@ -318,7 +318,7 @@ impl BftCoordinator {
 
     /// Check if this validator is currently syncing.
     #[must_use]
-    pub fn is_syncing(&self) -> bool {
+    pub const fn is_syncing(&self) -> bool {
         self.sync.is_syncing()
     }
 
@@ -423,7 +423,7 @@ impl BftCoordinator {
     /// - A QC forms
     /// - A block commits
     /// - We receive a valid header (rate-limited per height/round)
-    fn record_leader_activity(&mut self) {
+    const fn record_leader_activity(&mut self) {
         self.view_change.record_leader_activity(self.now);
     }
 
@@ -666,7 +666,7 @@ impl BftCoordinator {
         let next_height = self
             .latest_qc
             .as_ref()
-            .map_or(self.committed_height.next(), |qc| qc.height.next());
+            .map_or_else(|| self.committed_height.next(), |qc| qc.height.next());
         let round = self.view_change.view;
 
         if !self.can_propose(topology, next_height, round) {
@@ -1289,7 +1289,7 @@ impl BftCoordinator {
 
             // Delegate verification to runner
             return vec![Action::VerifyQcSignature {
-                qc: header.parent_qc.clone(),
+                qc: header.parent_qc,
                 public_keys,
                 block_hash,
             }];
@@ -1879,17 +1879,21 @@ impl BftCoordinator {
         }
 
         // Look up the block to count transactions and certificates
-        if let Some(pending) = self.pending_blocks.get(&committable_hash) {
-            if let Some(block) = pending.block() {
-                (block.transactions().len(), block.certificates().len())
-            } else {
-                (0, 0)
-            }
-        } else if let Some(block) = self.commits.certified_blocks.get(&committable_hash) {
-            (block.transactions().len(), block.certificates().len())
-        } else {
-            (0, 0)
-        }
+        self.pending_blocks.get(&committable_hash).map_or_else(
+            || {
+                self.commits
+                    .certified_blocks
+                    .get(&committable_hash)
+                    .map_or((0, 0), |block| {
+                        (block.transactions().len(), block.certificates().len())
+                    })
+            },
+            |pending| {
+                pending.block().map_or((0, 0), |block| {
+                    (block.transactions().len(), block.certificates().len())
+                })
+            },
+        )
     }
 
     /// Count transactions and certificates in ALL pending blocks above committed height.
@@ -2026,19 +2030,23 @@ impl BftCoordinator {
         // The certifying QC for the committable block (block N-1) is the
         // parent_qc of the block whose QC this is (block N).
         let block_hash = qc.block_hash;
-        let certifying_qc = if let Some(pending) = self.pending_blocks.get(&block_hash) {
-            pending.header().parent_qc.clone()
-        } else if let Some(block) = self.commits.certified_blocks.get(&block_hash) {
-            block.header().parent_qc.clone()
-        } else {
-            warn!(
-                validator = ?topology.local_validator_id(),
-                block_hash = ?block_hash,
-                committable_hash = ?committable_hash,
-                "Cannot find block to extract certifying QC for committable block"
-            );
-            qc.clone()
-        };
+        let certifying_qc = self.pending_blocks.get(&block_hash).map_or_else(
+            || {
+                self.commits.certified_blocks.get(&block_hash).map_or_else(
+                    || {
+                        warn!(
+                            validator = ?topology.local_validator_id(),
+                            block_hash = ?block_hash,
+                            committable_hash = ?committable_hash,
+                            "Cannot find block to extract certifying QC for committable block"
+                        );
+                        qc.clone()
+                    },
+                    |block| block.header().parent_qc.clone(),
+                )
+            },
+            |pending| pending.header().parent_qc.clone(),
+        );
 
         vec![Action::Continuation(ProtocolEvent::BlockReadyToCommit {
             block_hash: committable_hash,
@@ -2503,7 +2511,7 @@ impl BftCoordinator {
         let height = self
             .latest_qc
             .as_ref()
-            .map_or(self.committed_height.next(), |qc| qc.height.next());
+            .map_or_else(|| self.committed_height.next(), |qc| qc.height.next());
         let old_round = self.view_change.view;
         self.view_change.advance();
 
@@ -2922,8 +2930,10 @@ impl BftCoordinator {
         block_hashes.sort();
 
         for block_hash in block_hashes {
-            let became_ready = match self.pending_blocks.get_mut(&block_hash) {
-                Some(pending) => {
+            let became_ready = self
+                .pending_blocks
+                .get_mut(&block_hash)
+                .is_some_and(|pending| {
                     apply(pending);
                     if !pending.is_complete() {
                         false
@@ -2942,9 +2952,7 @@ impl BftCoordinator {
                             }
                         }
                     }
-                }
-                None => false,
-            };
+                });
 
             if became_ready {
                 debug!(
@@ -3134,31 +3142,31 @@ impl BftCoordinator {
 
     /// Get the current committed height.
     #[must_use]
-    pub fn committed_height(&self) -> BlockHeight {
+    pub const fn committed_height(&self) -> BlockHeight {
         self.committed_height
     }
 
     /// Get the committed block hash.
     #[must_use]
-    pub fn committed_hash(&self) -> BlockHash {
+    pub const fn committed_hash(&self) -> BlockHash {
         self.committed_hash
     }
 
     /// Get the latest QC.
     #[must_use]
-    pub fn latest_qc(&self) -> Option<&QuorumCertificate> {
+    pub const fn latest_qc(&self) -> Option<&QuorumCertificate> {
         self.latest_qc.as_ref()
     }
 
     /// Get the current view/round.
     #[must_use]
-    pub fn view(&self) -> Round {
+    pub const fn view(&self) -> Round {
         self.view_change.view
     }
 
     /// Get BFT statistics for monitoring.
     #[must_use]
-    pub fn stats(&self) -> BftStats {
+    pub const fn stats(&self) -> BftStats {
         BftStats {
             view_changes: self.view_change.view_changes,
             view_syncs: self.view_change.view_syncs,
@@ -3243,13 +3251,13 @@ impl BftCoordinator {
 
     /// Get the BFT configuration.
     #[must_use]
-    pub fn config(&self) -> &BftConfig {
+    pub const fn config(&self) -> &BftConfig {
         &self.config
     }
 
     /// Get the voted heights map (for testing/debugging).
     #[must_use]
-    pub fn voted_heights(&self) -> &HashMap<BlockHeight, (BlockHash, Round)> {
+    pub const fn voted_heights(&self) -> &HashMap<BlockHeight, (BlockHash, Round)> {
         self.votes.voted_heights()
     }
 
@@ -3316,7 +3324,7 @@ impl BftCoordinator {
         let next_height = self
             .latest_qc
             .as_ref()
-            .map_or(self.committed_height.next(), |qc| qc.height.next());
+            .map_or_else(|| self.committed_height.next(), |qc| qc.height.next());
         let round = self.view_change.view;
 
         topology.should_propose(next_height, round) && !self.votes.is_locked_at(next_height)

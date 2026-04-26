@@ -43,7 +43,7 @@ struct PendingProvision {
 }
 
 /// Pending → verified → store lifecycle for inbound provisions.
-pub(crate) struct ProvisionPipeline {
+pub struct ProvisionPipeline {
     pending: HashMap<Key, Vec<PendingProvision>>,
     verified: BTreeMap<Key, VerifiedProvision>,
     store: Arc<ProvisionStore>,
@@ -138,7 +138,7 @@ impl ProvisionPipeline {
         self.store.get(hash)
     }
 
-    pub(crate) fn store(&self) -> &Arc<ProvisionStore> {
+    pub(crate) const fn store(&self) -> &Arc<ProvisionStore> {
         &self.store
     }
 

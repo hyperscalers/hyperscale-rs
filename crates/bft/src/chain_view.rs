@@ -22,7 +22,7 @@ use tracing::warn;
 use crate::pending::PendingBlock;
 use crate::tx_cache::CommittedTxCache;
 
-pub(crate) struct ChainView<'a> {
+pub struct ChainView<'a> {
     pub committed_height: BlockHeight,
     pub committed_hash: BlockHash,
     pub committed_state_root: StateRoot,
@@ -99,11 +99,10 @@ impl ChainView<'_> {
     /// Parent to use when building the next proposal: the latest QC's block
     /// if any, otherwise the committed tip under a genesis QC.
     pub fn proposal_parent(&self) -> (BlockHash, QuorumCertificate) {
-        if let Some(qc) = self.latest_qc {
-            (qc.block_hash, qc.clone())
-        } else {
-            (self.committed_hash, QuorumCertificate::genesis())
-        }
+        self.latest_qc.map_or_else(
+            || (self.committed_hash, QuorumCertificate::genesis()),
+            |qc| (qc.block_hash, qc.clone()),
+        )
     }
 
     /// Walk the QC chain from `parent_hash` back to committed height,
@@ -283,11 +282,8 @@ mod tests {
 
         // Pending block without a constructed inner block — should still
         // yield a header.
-        let pending_block = PendingBlock::from_manifest(
-            header.clone(),
-            BlockManifest::default(),
-            LocalTimestamp::ZERO,
-        );
+        let pending_block =
+            PendingBlock::from_manifest(header, BlockManifest::default(), LocalTimestamp::ZERO);
         let mut pending = HashMap::new();
         pending.insert(block_hash, pending_block);
 

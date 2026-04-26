@@ -25,9 +25,11 @@ use sbor::prelude::*;
 use std::time::Duration;
 
 /// Hard upper bound on validity range length and forward edge from the
-/// anchoring `weighted_timestamp`. Equal to the EC retention horizon
-/// from Plan A by design — past this point, every artefact derived
-/// from the tx is provably unreferenceable on every shard.
+/// anchoring `weighted_timestamp`.
+///
+/// Equal to the EC retention horizon from Plan A by design — past this
+/// point, every artefact derived from the tx is provably unreferenceable
+/// on every shard.
 pub const MAX_VALIDITY_RANGE: Duration = Duration::from_mins(5);
 
 /// Half-open `[start, end)` range of [`WeightedTimestamp`].
@@ -63,7 +65,7 @@ impl TimestampRange {
     /// Range length, saturating at zero. Zero for malformed (empty or
     /// inverted) ranges; well-formed ranges return `end - start`.
     #[must_use]
-    pub fn length(&self) -> Duration {
+    pub const fn length(&self) -> Duration {
         self.end_timestamp_exclusive
             .elapsed_since(self.start_timestamp_inclusive)
     }

@@ -42,7 +42,7 @@ impl QuorumCertificate {
     ///
     /// The genesis QC has a zero block hash and zero signature.
     #[must_use]
-    pub fn genesis() -> Self {
+    pub const fn genesis() -> Self {
         Self {
             block_hash: BlockHash::ZERO,
             shard_group_id: ShardGroupId(0),

@@ -230,7 +230,11 @@ struct BitRangeIter<'a> {
 }
 
 impl<'a> BitRangeIter<'a> {
-    fn new(kvs: &'a [(&'a Key, Option<ValueHash>)], depth_bits: u16, bits_per_level: u8) -> Self {
+    const fn new(
+        kvs: &'a [(&'a Key, Option<ValueHash>)],
+        depth_bits: u16,
+        bits_per_level: u8,
+    ) -> Self {
         Self {
             kvs,
             depth_bits,
@@ -259,7 +263,7 @@ impl Iterator for BitRangeIter<'_> {
 }
 
 /// Classify a node as either a leaf or an internal, for [`ChildKind`].
-fn kind_of(node: &Node) -> ChildKind {
+const fn kind_of(node: &Node) -> ChildKind {
     match node {
         Node::Internal(_) => ChildKind::Internal,
         Node::Leaf(_) => ChildKind::Leaf,
@@ -649,7 +653,8 @@ mod tests {
     #[test]
     fn single_insert_produces_leaf_root() {
         let store = MemoryStore::new();
-        let updates: BTreeMap<Key, Option<ValueHash>> = [(k(1), Some(v(10)))].into_iter().collect();
+        let updates: BTreeMap<Key, Option<ValueHash>> =
+            std::iter::once((k(1), Some(v(10)))).collect();
         let res = Jmt::apply_updates(&store, None, 1, &updates).unwrap();
         let expected = Blake3Hasher::hash_leaf(&k(1), &v(10));
         assert_eq!(res.root_hash, expected);
@@ -684,7 +689,7 @@ mod tests {
         let r1 = Jmt::apply_updates(&store, None, 1, &v1).unwrap();
         store.apply(&r1);
 
-        let v2: BTreeMap<Key, Option<ValueHash>> = [(k(1), Some(v(99)))].into_iter().collect();
+        let v2: BTreeMap<Key, Option<ValueHash>> = std::iter::once((k(1), Some(v(99)))).collect();
         let r2 = Jmt::apply_updates(&store, Some(1), 2, &v2).unwrap();
         store.apply(&r2);
 
@@ -703,7 +708,7 @@ mod tests {
         let r1 = Jmt::apply_updates(&store, None, 1, &v1).unwrap();
         store.apply(&r1);
 
-        let v2: BTreeMap<Key, Option<ValueHash>> = [(k(1), None)].into_iter().collect();
+        let v2: BTreeMap<Key, Option<ValueHash>> = std::iter::once((k(1), None)).collect();
         let r2 = Jmt::apply_updates(&store, Some(1), 2, &v2).unwrap();
         store.apply(&r2);
 
@@ -720,10 +725,10 @@ mod tests {
     #[test]
     fn historical_reads_see_prior_version() {
         let mut store = MemoryStore::new();
-        let v1: BTreeMap<Key, Option<ValueHash>> = [(k(1), Some(v(10)))].into_iter().collect();
+        let v1: BTreeMap<Key, Option<ValueHash>> = std::iter::once((k(1), Some(v(10)))).collect();
         let r1 = Jmt::apply_updates(&store, None, 1, &v1).unwrap();
         store.apply(&r1);
-        let v2: BTreeMap<Key, Option<ValueHash>> = [(k(1), Some(v(99)))].into_iter().collect();
+        let v2: BTreeMap<Key, Option<ValueHash>> = std::iter::once((k(1), Some(v(99)))).collect();
         let r2 = Jmt::apply_updates(&store, Some(1), 2, &v2).unwrap();
         store.apply(&r2);
 
@@ -773,12 +778,12 @@ mod tests {
     #[test]
     fn delete_nonexistent_is_noop() {
         let mut store = MemoryStore::new();
-        let v1: BTreeMap<Key, Option<ValueHash>> = [(k(1), Some(v(10)))].into_iter().collect();
+        let v1: BTreeMap<Key, Option<ValueHash>> = std::iter::once((k(1), Some(v(10)))).collect();
         let r1 = Jmt::apply_updates(&store, None, 1, &v1).unwrap();
         store.apply(&r1);
 
         // Delete a key that isn't in the tree.
-        let v2: BTreeMap<Key, Option<ValueHash>> = [(k(99), None)].into_iter().collect();
+        let v2: BTreeMap<Key, Option<ValueHash>> = std::iter::once((k(99), None)).collect();
         let r2 = Jmt::apply_updates(&store, Some(1), 2, &v2).unwrap();
 
         assert_eq!(r1.root_hash, r2.root_hash);
@@ -787,11 +792,11 @@ mod tests {
     #[test]
     fn non_monotonic_version_rejected() {
         let mut store = MemoryStore::new();
-        let v1: BTreeMap<Key, Option<ValueHash>> = [(k(1), Some(v(10)))].into_iter().collect();
+        let v1: BTreeMap<Key, Option<ValueHash>> = std::iter::once((k(1), Some(v(10)))).collect();
         let r1 = Jmt::apply_updates(&store, None, 5, &v1).unwrap();
         store.apply(&r1);
 
-        let v2: BTreeMap<Key, Option<ValueHash>> = [(k(2), Some(v(20)))].into_iter().collect();
+        let v2: BTreeMap<Key, Option<ValueHash>> = std::iter::once((k(2), Some(v(20)))).collect();
         let err = Jmt::apply_updates(&store, Some(5), 5, &v2).unwrap_err();
         assert!(matches!(err, UpdateError::NonMonotonicVersion { .. }));
     }

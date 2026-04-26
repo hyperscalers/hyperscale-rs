@@ -71,16 +71,15 @@ pub struct VoteSet {
 impl VoteSet {
     /// Create a new vote set.
     pub fn new(header: Option<&BlockHeader>, num_validators: usize) -> Self {
-        let (block_hash, height, round, parent_block_hash) = if let Some(h) = header {
-            (
-                Some(h.hash()),
-                Some(h.height),
-                Some(h.round),
-                Some(h.parent_hash),
-            )
-        } else {
-            (None, None, None, None)
-        };
+        let (block_hash, height, round, parent_block_hash) =
+            header.map_or((None, None, None, None), |h| {
+                (
+                    Some(h.hash()),
+                    Some(h.height),
+                    Some(h.round),
+                    Some(h.parent_hash),
+                )
+            });
 
         Self {
             block_hash,
@@ -99,22 +98,22 @@ impl VoteSet {
     }
 
     /// Get the block height.
-    pub fn height(&self) -> Option<BlockHeight> {
+    pub const fn height(&self) -> Option<BlockHeight> {
         self.height
     }
 
     /// Get the round number.
-    pub fn round(&self) -> Option<Round> {
+    pub const fn round(&self) -> Option<Round> {
         self.round
     }
 
     /// Get the current verified voting power.
-    pub fn verified_power(&self) -> u64 {
+    pub const fn verified_power(&self) -> u64 {
         self.verified_power
     }
 
     /// Get the current unverified voting power.
-    pub fn unverified_power(&self) -> u64 {
+    pub const fn unverified_power(&self) -> u64 {
         self.unverified_power
     }
 
@@ -188,7 +187,7 @@ impl VoteSet {
     /// - We have unverified votes to verify
     /// - We're not already waiting for a verification result
     /// - We have the header info needed to build a QC
-    pub fn should_trigger_verification(&self, total_committee_power: u64) -> bool {
+    pub const fn should_trigger_verification(&self, total_committee_power: u64) -> bool {
         !self.pending_verification
             && !self.qc_built
             && !self.unverified_votes.is_empty()
@@ -236,7 +235,7 @@ impl VoteSet {
     /// Called when verification completes successfully with a QC.
     ///
     /// Marks the vote set as built.
-    pub fn on_qc_built(&mut self) {
+    pub const fn on_qc_built(&mut self) {
         self.qc_built = true;
         self.pending_verification = false;
     }

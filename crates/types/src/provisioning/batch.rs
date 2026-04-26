@@ -146,7 +146,7 @@ impl Provisions {
 
     /// Content hash (precomputed at construction / deserialization).
     #[must_use]
-    pub fn hash(&self) -> ProvisionHash {
+    pub const fn hash(&self) -> ProvisionHash {
         self.hash
     }
 

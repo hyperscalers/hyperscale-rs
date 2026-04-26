@@ -64,15 +64,15 @@ pub struct MempoolConfig {
     pub min_dwell_time: Duration,
 }
 
-fn default_max_in_flight() -> usize {
+const fn default_max_in_flight() -> usize {
     DEFAULT_IN_FLIGHT_LIMIT
 }
 
-fn default_max_pending() -> usize {
+const fn default_max_pending() -> usize {
     DEFAULT_MAX_PENDING
 }
 
-fn default_min_dwell_time() -> Duration {
+const fn default_min_dwell_time() -> Duration {
     DEFAULT_MIN_DWELL_TIME
 }
 
@@ -784,7 +784,7 @@ impl MempoolCoordinator {
     /// This is `O(1)` as it returns a cached count maintained incrementally
     /// when transaction status changes or transactions are evicted.
     #[must_use]
-    pub fn in_flight(&self) -> usize {
+    pub const fn in_flight(&self) -> usize {
         self.locks.in_flight()
     }
 
@@ -792,7 +792,7 @@ impl MempoolCoordinator {
     ///
     /// At this limit, no new transactions are proposed.
     #[must_use]
-    pub fn at_in_flight_limit(&self) -> bool {
+    pub const fn at_in_flight_limit(&self) -> bool {
         self.in_flight() >= self.config.max_in_flight
     }
 
@@ -803,7 +803,7 @@ impl MempoolCoordinator {
     /// the limit — this prevents deadlock when certificate-heavy blocks would
     /// relieve backpressure.
     #[must_use]
-    pub fn would_exceed_in_flight(&self, new_tx_count: usize, cert_count: usize) -> bool {
+    pub const fn would_exceed_in_flight(&self, new_tx_count: usize, cert_count: usize) -> bool {
         let current = self.in_flight();
         let projected = current
             .saturating_add(new_tx_count)
@@ -833,7 +833,7 @@ impl MempoolCoordinator {
 
     /// Get the mempool configuration.
     #[must_use]
-    pub fn config(&self) -> &MempoolConfig {
+    pub const fn config(&self) -> &MempoolConfig {
         &self.config
     }
 
@@ -1057,7 +1057,7 @@ mod tests {
         // A submitted-but-not-yet-committed tx lands in pool.
         let tx_live = test_transaction(1);
         let tx_live_hash = tx_live.hash();
-        mempool.on_submit_transaction(&topology, Arc::new(tx_live.clone()), LocalTimestamp::ZERO);
+        mempool.on_submit_transaction(&topology, Arc::new(tx_live), LocalTimestamp::ZERO);
 
         // A second tx commits and gets evicted to recently_evicted.
         let tx_done = test_transaction(2);
@@ -1065,7 +1065,7 @@ mod tests {
         mempool.on_submit_transaction(&topology, Arc::new(tx_done.clone()), LocalTimestamp::ZERO);
         let certified = certified_commit_block(
             BlockHeight(1),
-            tx_done.clone(),
+            tx_done,
             make_finalized_wave(BlockHeight(1), tx_done_hash, TransactionDecision::Accept),
         );
         mempool.on_block_committed(&topology, &certified);
@@ -1103,12 +1103,8 @@ mod tests {
         assert!(mempool.is_tombstoned(&tx_hash));
 
         // Try to re-add via gossip - should be rejected
-        let actions = mempool.on_transaction_gossip(
-            &topology,
-            Arc::new(tx.clone()),
-            false,
-            LocalTimestamp::ZERO,
-        );
+        let actions =
+            mempool.on_transaction_gossip(&topology, Arc::new(tx), false, LocalTimestamp::ZERO);
         assert!(actions.is_empty(), "Tombstoned tx should be rejected");
 
         // Should still not be in pool
@@ -1133,8 +1129,7 @@ mod tests {
         mempool.on_block_committed(&topology, &certified);
 
         // Try to re-submit - should be rejected (no status emitted)
-        let actions =
-            mempool.on_submit_transaction(&topology, Arc::new(tx.clone()), LocalTimestamp::ZERO);
+        let actions = mempool.on_submit_transaction(&topology, Arc::new(tx), LocalTimestamp::ZERO);
         assert!(actions.is_empty(), "Tombstoned tx should be rejected");
 
         // Should still not be in pool
@@ -1231,19 +1226,11 @@ mod tests {
 
         // Add a single-shard transaction
         let single_shard_tx = test_transaction(1);
-        mempool.on_submit_transaction(
-            &topology,
-            Arc::new(single_shard_tx.clone()),
-            LocalTimestamp::ZERO,
-        );
+        mempool.on_submit_transaction(&topology, Arc::new(single_shard_tx), LocalTimestamp::ZERO);
 
         // Add a cross-shard transaction
         let cross_shard_tx = test_cross_shard_transaction(50);
-        mempool.on_submit_transaction(
-            &topology,
-            Arc::new(cross_shard_tx.clone()),
-            LocalTimestamp::ZERO,
-        );
+        mempool.on_submit_transaction(&topology, Arc::new(cross_shard_tx), LocalTimestamp::ZERO);
 
         // Below limit: all TXs should be returned
         let ready = mempool.ready_transactions(10, 0, 0, LocalTimestamp::ZERO);
@@ -1262,7 +1249,7 @@ mod tests {
 
         // Add a transaction
         let tx = test_transaction(1);
-        mempool.on_submit_transaction(&topology, Arc::new(tx.clone()), LocalTimestamp::ZERO);
+        mempool.on_submit_transaction(&topology, Arc::new(tx), LocalTimestamp::ZERO);
 
         // At limit: no TXs should be returned
         let ready = mempool.ready_transactions(10, 0, 0, LocalTimestamp::ZERO);
@@ -1286,11 +1273,11 @@ mod tests {
 
         // Add a single-shard transaction
         let single_tx = test_transaction(1);
-        mempool.on_submit_transaction(&topology, Arc::new(single_tx.clone()), LocalTimestamp::ZERO);
+        mempool.on_submit_transaction(&topology, Arc::new(single_tx), LocalTimestamp::ZERO);
 
         // Add a cross-shard transaction
         let cross_tx = test_cross_shard_transaction(50);
-        mempool.on_submit_transaction(&topology, Arc::new(cross_tx.clone()), LocalTimestamp::ZERO);
+        mempool.on_submit_transaction(&topology, Arc::new(cross_tx), LocalTimestamp::ZERO);
 
         // Not at limit: all TXs should be allowed
         let ready = mempool.ready_transactions(10, 0, 0, LocalTimestamp::ZERO);

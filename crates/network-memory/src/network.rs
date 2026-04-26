@@ -314,13 +314,13 @@ impl SimulatedNetwork {
     }
 
     /// Set the packet loss rate (0.0 - 1.0).
-    pub fn set_packet_loss_rate(&mut self, rate: f64) {
+    pub const fn set_packet_loss_rate(&mut self, rate: f64) {
         self.config.packet_loss_rate = rate.clamp(0.0, 1.0);
     }
 
     /// Get the current packet loss rate.
     #[must_use]
-    pub fn packet_loss_rate(&self) -> f64 {
+    pub const fn packet_loss_rate(&self) -> f64 {
         self.config.packet_loss_rate
     }
 
@@ -391,13 +391,13 @@ impl SimulatedNetwork {
 
     /// Get the total number of nodes.
     #[must_use]
-    pub fn total_nodes(&self) -> usize {
+    pub const fn total_nodes(&self) -> usize {
         (self.config.num_shards * self.config.validators_per_shard) as usize
     }
 
     /// Get network configuration.
     #[must_use]
-    pub fn config(&self) -> &NetworkConfig {
+    pub const fn config(&self) -> &NetworkConfig {
         &self.config
     }
 

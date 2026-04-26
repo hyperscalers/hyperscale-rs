@@ -10,10 +10,12 @@ use hyperscale_types::{
 };
 use std::sync::Arc;
 
-/// A sync-ready block retrieved from storage. Always carries a `Sealed`
-/// block — the persisted shape never includes provisions. Sync-serving
-/// glue re-attaches provisions (promoting to `Live`) when the requester
-/// is still within the cross-shard execution window.
+/// A sync-ready block retrieved from storage.
+///
+/// Always carries a `Sealed` block — the persisted shape never includes
+/// provisions. Sync-serving glue re-attaches provisions (promoting to
+/// `Live`) when the requester is still within the cross-shard execution
+/// window.
 #[derive(Debug, Clone)]
 pub struct BlockForSync {
     /// The stored block in `Sealed` form.

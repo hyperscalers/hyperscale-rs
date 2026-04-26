@@ -34,7 +34,7 @@ pub fn extract_state_updates(receipt: &TransactionReceipt) -> Option<DatabaseUpd
 /// In Radix Engine, `Commit` means the transaction's state changes were applied
 /// (including fee payment). The transaction's own logic may still have failed
 /// (`Commit(Failure)`) — use `commit.outcome` to distinguish success from failure.
-pub fn is_committed(receipt: &TransactionReceipt) -> bool {
+pub const fn is_committed(receipt: &TransactionReceipt) -> bool {
     matches!(&receipt.result, TransactionResult::Commit(_))
 }
 
@@ -167,7 +167,7 @@ fn build_fee_summary(receipt: &TransactionReceipt) -> FeeSummary {
 }
 
 /// Convert Radix Engine log level to our `LogLevel`.
-fn convert_log_level(level: radix_engine_interface::types::Level) -> LogLevel {
+const fn convert_log_level(level: radix_engine_interface::types::Level) -> LogLevel {
     match level {
         radix_engine_interface::types::Level::Error => LogLevel::Error,
         radix_engine_interface::types::Level::Warn => LogLevel::Warn,
@@ -274,11 +274,11 @@ impl<S: SubstateDatabase> SubstateDatabase for ProvisionedSnapshot<'_, S> {
         // Build start key
         let start = match from_sort_key {
             Some(sk) => {
-                let mut s = prefix.clone();
+                let mut s = prefix;
                 s.extend_from_slice(&sk.0);
                 s
             }
-            None => prefix.clone(),
+            None => prefix,
         };
 
         // Get base iterator
@@ -289,7 +289,7 @@ impl<S: SubstateDatabase> SubstateDatabase for ProvisionedSnapshot<'_, S> {
         // Get provision entries in range (provisions are keyed by full storage key)
         let prov_entries: Vec<_> = self
             .provisions
-            .range(start.clone()..prefix_end.clone())
+            .range(start..prefix_end)
             .filter_map(|(k, v)| {
                 // Extract sort key from storage key (after prefix)
                 if k.len() > prefix_len {

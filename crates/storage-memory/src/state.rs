@@ -29,7 +29,7 @@ use std::sync::Arc;
 /// Using `RwLock` (instead of Mutex) allows concurrent read access: speculative
 /// JMT computations from `prepare_block_commit` take a read lock and can run
 /// concurrently with other readers, while commits take a write lock.
-pub(crate) struct SharedState {
+pub struct SharedState {
     pub tree_store: SimTreeStore,
     pub current_block_height: BlockHeight,
     pub current_root_hash: StateRoot,
@@ -95,7 +95,7 @@ impl SharedState {
 // ═══════════════════════════════════════════════════════════════════════
 
 /// All consensus-related metadata bundled into a single `RwLock`.
-pub(crate) struct ConsensusState {
+pub struct ConsensusState {
     /// Committed blocks indexed by height.
     pub blocks: BTreeMap<BlockHeight, CertifiedBlock>,
     /// Committed height.
@@ -181,7 +181,7 @@ impl ConsensusState {
 /// partition (via `current_state`) and treats each the same way:
 /// capture history, then set (if re-written by `new_substate_values`)
 /// or delete.
-pub(crate) fn apply_updates(
+pub fn apply_updates(
     state: &mut SharedState,
     updates: &DatabaseUpdates,
     version: u64,
@@ -250,7 +250,7 @@ pub(crate) fn apply_updates(
 }
 
 /// Return storage keys currently live in the given partition.
-pub(crate) fn live_partition_keys(
+pub fn live_partition_keys(
     current_state: &BTreeMap<Vec<u8>, Vec<u8>>,
     partition_key: &DbPartitionKey,
 ) -> Vec<Vec<u8>> {

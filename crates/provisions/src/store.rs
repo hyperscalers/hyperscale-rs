@@ -157,6 +157,7 @@ impl ProvisionStore {
     /// # Panics
     ///
     /// Panics if the internal mutex is poisoned.
+    #[allow(clippy::significant_drop_tightening)] // need the lock to iterate keys
     pub fn provision_bloom_snapshot(&self) -> Option<BloomFilter<ProvisionHash>> {
         let inner = self.inner.lock().unwrap();
         let mut bf = BloomFilter::with_capacity(inner.len(), DEFAULT_FPR)?;

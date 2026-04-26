@@ -50,7 +50,7 @@ use std::time::Duration;
 /// the vote belonged to has aborted (success or all-abort), so the vote can
 /// no longer contribute to a useful wave. Anchored on the committing QC's
 /// `weighted_timestamp_ms` so the bound is BFT-authenticated.
-pub(crate) const EARLY_VOTE_RETENTION: Duration = WAVE_TIMEOUT;
+pub const EARLY_VOTE_RETENTION: Duration = WAVE_TIMEOUT;
 
 /// Maximum age before a buffered EC is considered stale and evicted. Bounds
 /// the leak from ECs whose `tx_hashes` never land in a local block (orphaned
@@ -77,7 +77,7 @@ struct BufferedEc {
     buffered_at: WeightedTimestamp,
 }
 
-pub(crate) struct EarlyArrivalBuffer {
+pub struct EarlyArrivalBuffer {
     /// Execution votes that arrived before tracking started, keyed by wave.
     votes: HashMap<WaveId, Vec<ExecutionVote>>,
 
@@ -371,7 +371,7 @@ mod tests {
         let w1 = wave(1);
         let w2 = wave(2);
         b.buffer_vote(w1.clone(), make_vote(w1.clone(), ms(100)));
-        b.buffer_vote(w2.clone(), make_vote(w2.clone(), ms(100)));
+        b.buffer_vote(w2.clone(), make_vote(w2, ms(100)));
 
         let drained = b.drain_votes_for_wave(&w1);
         assert_eq!(drained.len(), 1);
@@ -401,7 +401,7 @@ mod tests {
         let w = wave(1);
         let tx_a = TxHash::from_raw(Hash::from_bytes(b"a"));
         let tx_b = TxHash::from_raw(Hash::from_bytes(b"b"));
-        let ec = make_ec(w.clone(), &[tx_a, tx_b]);
+        let ec = make_ec(w, &[tx_a, tx_b]);
 
         b.buffer_ec(&ec, &[tx_a, tx_b], ms(1_000));
 
@@ -415,7 +415,7 @@ mod tests {
         let mut b = EarlyArrivalBuffer::new();
         let w = wave(1);
         let tx = TxHash::from_raw(Hash::from_bytes(b"a"));
-        let ec = make_ec(w.clone(), &[tx]);
+        let ec = make_ec(w, &[tx]);
 
         b.buffer_ec(&ec, &[tx], ms(1_000));
         b.buffer_ec(&ec, &[tx], ms(2_000));
@@ -434,7 +434,7 @@ mod tests {
         let w = wave(1);
         let tx_a = TxHash::from_raw(Hash::from_bytes(b"a"));
         let tx_b = TxHash::from_raw(Hash::from_bytes(b"b"));
-        let ec = make_ec(w.clone(), &[tx_a, tx_b]);
+        let ec = make_ec(w, &[tx_a, tx_b]);
 
         b.buffer_ec(&ec, &[tx_a, tx_b], ms(1_000));
 
@@ -453,7 +453,7 @@ mod tests {
         let w = wave(1);
         let tx_a = TxHash::from_raw(Hash::from_bytes(b"a"));
         let tx_b = TxHash::from_raw(Hash::from_bytes(b"b"));
-        let ec = make_ec(w.clone(), &[tx_a, tx_b]);
+        let ec = make_ec(w, &[tx_a, tx_b]);
         b.buffer_ec(&ec, &[tx_a, tx_b], ms(1_000));
 
         let drained = b.drain_ecs_for_txs(&[tx_a]);
@@ -470,7 +470,7 @@ mod tests {
         let tx_a = TxHash::from_raw(Hash::from_bytes(b"a"));
         let tx_b = TxHash::from_raw(Hash::from_bytes(b"b"));
         // Single EC covers both txs; draining both hashes should yield one EC.
-        let ec = make_ec(w.clone(), &[tx_a, tx_b]);
+        let ec = make_ec(w, &[tx_a, tx_b]);
         b.buffer_ec(&ec, &[tx_a, tx_b], ms(1_000));
 
         let drained = b.drain_ecs_for_txs(&[tx_a, tx_b]);
@@ -485,12 +485,8 @@ mod tests {
         let tx_old = TxHash::from_raw(Hash::from_bytes(b"old"));
         let tx_fresh = TxHash::from_raw(Hash::from_bytes(b"fresh"));
 
-        b.buffer_ec(&make_ec(w_old.clone(), &[tx_old]), &[tx_old], ms(1_000));
-        b.buffer_ec(
-            &make_ec(w_fresh.clone(), &[tx_fresh]),
-            &[tx_fresh],
-            ms(50_000),
-        );
+        b.buffer_ec(&make_ec(w_old, &[tx_old]), &[tx_old], ms(1_000));
+        b.buffer_ec(&make_ec(w_fresh, &[tx_fresh]), &[tx_fresh], ms(50_000));
 
         // Retention = 60s. At now_ts = 65_000, cutoff = 5_000. The old
         // entry (buffered at 1_000) is evicted; the fresh one survives.
@@ -522,8 +518,8 @@ mod tests {
         let w_stamped = wave(2);
         let tx_z = TxHash::from_raw(Hash::from_bytes(b"z"));
         let tx_s = TxHash::from_raw(Hash::from_bytes(b"s"));
-        b.buffer_ec(&make_ec(w_zero.clone(), &[tx_z]), &[tx_z], ms(0));
-        b.buffer_ec(&make_ec(w_stamped.clone(), &[tx_s]), &[tx_s], ms(30_000));
+        b.buffer_ec(&make_ec(w_zero, &[tx_z]), &[tx_z], ms(0));
+        b.buffer_ec(&make_ec(w_stamped, &[tx_s]), &[tx_s], ms(30_000));
 
         b.retro_stamp_zero_timestamps(ms(50_000));
 

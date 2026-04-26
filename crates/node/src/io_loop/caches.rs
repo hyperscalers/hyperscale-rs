@@ -30,12 +30,11 @@ pub(super) const DEFAULT_TX_STATUS_CACHE_SIZE: usize = 100_000;
 
 /// Execution certificate cache shared between the `io_loop` (which inserts
 /// on `TrackExecutionCertificate`) and the inbound EC fetch handler.
-pub(crate) type ExecCertCache =
-    Arc<Mutex<HashMap<(WaveIdHash, WaveId), Arc<ExecutionCertificate>>>>;
+pub type ExecCertCache = Arc<Mutex<HashMap<(WaveIdHash, WaveId), Arc<ExecutionCertificate>>>>;
 
 /// Inbound request-serving caches plus the cross-thread transaction-status
 /// view exposed to external RPC consumers.
-pub(crate) struct SharedCaches {
+pub struct SharedCaches {
     /// Validated transactions, keyed by hash. Populated when the validation
     /// pipeline accepts a tx; queried by the inbound transaction request
     /// handler before falling through to `RocksDB`.

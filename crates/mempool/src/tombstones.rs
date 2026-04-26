@@ -28,7 +28,7 @@ use hyperscale_types::{RoutableTransaction, TxHash, WeightedTimestamp};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-pub(crate) struct TombstoneStore {
+pub struct TombstoneStore {
     /// `tx_hash → end_timestamp_exclusive`. Pruned when
     /// `end_timestamp_exclusive <= current_committed_ts`.
     tombstones: HashMap<TxHash, WeightedTimestamp>,

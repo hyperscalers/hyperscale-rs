@@ -79,13 +79,13 @@ impl Hash {
 
     /// Get bytes as slice reference.
     #[must_use]
-    pub fn as_bytes(&self) -> &[u8; 32] {
+    pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
 
     /// Convert to bytes array.
     #[must_use]
-    pub fn to_bytes(self) -> [u8; 32] {
+    pub const fn to_bytes(self) -> [u8; 32] {
         self.0
     }
 
@@ -217,7 +217,7 @@ macro_rules! hash_newtype {
 
             /// Borrow the raw 32-byte representation. Delegates to
             /// [`Hash::as_bytes`] for ergonomic use in signing/hashing code.
-            pub fn as_bytes(&self) -> &[u8; 32] {
+            pub const fn as_bytes(&self) -> &[u8; 32] {
                 self.0.as_bytes()
             }
 

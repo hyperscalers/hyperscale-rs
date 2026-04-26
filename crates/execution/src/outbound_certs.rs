@@ -244,7 +244,7 @@ mod tests {
         t.on_block_committed(ts(1_000));
 
         let w = wave(0, 100, &[1]);
-        t.on_broadcast(cert(w.clone()), ShardGroupId(1), vids(&[4, 5, 6, 7]));
+        t.on_broadcast(cert(w), ShardGroupId(1), vids(&[4, 5, 6, 7]));
         assert_eq!(t.memory_stats().tracked_certificates, 1);
     }
 
@@ -261,7 +261,7 @@ mod tests {
         let mut t = OutboundExecutionCertificateTracker::new();
         let w = wave(0, 100, &[1]);
         t.on_broadcast(cert(w.clone()), ShardGroupId(1), vids(&[4]));
-        t.on_broadcast(cert(w.clone()), ShardGroupId(1), vids(&[4, 5]));
+        t.on_broadcast(cert(w), ShardGroupId(1), vids(&[4, 5]));
         assert_eq!(t.memory_stats().tracked_certificates, 1);
     }
 

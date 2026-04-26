@@ -15,7 +15,7 @@ use std::sync::Arc;
 ///
 /// Extracts ECs from the block's wave certificates and folds them into the
 /// same atomic batch as JMT + block data (one fsync per block).
-pub(crate) fn append_block_certs_to_batch(
+pub fn append_block_certs_to_batch(
     storage: &RocksDbStorage,
     batch: &mut WriteBatch,
     block: &Arc<Block>,

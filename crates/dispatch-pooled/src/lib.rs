@@ -105,13 +105,13 @@ pub struct ThreadPoolConfig {
 impl ThreadPoolConfig {
     /// Create a builder for custom configuration.
     #[must_use]
-    pub fn builder() -> ThreadPoolConfigBuilder {
+    pub const fn builder() -> ThreadPoolConfigBuilder {
         ThreadPoolConfigBuilder::new()
     }
 
     /// Create a minimal configuration for testing (1 thread per pool).
     #[must_use]
-    pub fn minimal() -> Self {
+    pub const fn minimal() -> Self {
         Self {
             consensus_crypto_threads: 2,
             crypto_threads: 2,
@@ -129,7 +129,7 @@ impl ThreadPoolConfig {
 
     /// Total number of rayon pool threads (excluding state machine and I/O).
     #[must_use]
-    pub fn total_threads(&self) -> usize {
+    pub const fn total_threads(&self) -> usize {
         self.consensus_crypto_threads
             + self.crypto_threads
             + self.tx_validation_threads
@@ -198,7 +198,7 @@ pub struct ThreadPoolConfigBuilder {
 impl ThreadPoolConfigBuilder {
     /// Create a new builder starting from minimal defaults (1 thread per pool).
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             config: ThreadPoolConfig::minimal(),
         }
@@ -207,42 +207,42 @@ impl ThreadPoolConfigBuilder {
     /// Set the number of consensus crypto threads (block votes, QC verification).
     /// These are liveness-critical and should not be set too low.
     #[must_use]
-    pub fn consensus_crypto_threads(mut self, count: usize) -> Self {
+    pub const fn consensus_crypto_threads(mut self, count: usize) -> Self {
         self.config.consensus_crypto_threads = count;
         self
     }
 
     /// Set the number of general crypto verification threads (provisions, execution votes).
     #[must_use]
-    pub fn crypto_threads(mut self, count: usize) -> Self {
+    pub const fn crypto_threads(mut self, count: usize) -> Self {
         self.config.crypto_threads = count;
         self
     }
 
     /// Set the number of transaction validation threads.
     #[must_use]
-    pub fn tx_validation_threads(mut self, count: usize) -> Self {
+    pub const fn tx_validation_threads(mut self, count: usize) -> Self {
         self.config.tx_validation_threads = count;
         self
     }
 
     /// Set the number of execution threads.
     #[must_use]
-    pub fn execution_threads(mut self, count: usize) -> Self {
+    pub const fn execution_threads(mut self, count: usize) -> Self {
         self.config.execution_threads = count;
         self
     }
 
     /// Enable core pinning.
     #[must_use]
-    pub fn pin_cores(mut self, enabled: bool) -> Self {
+    pub const fn pin_cores(mut self, enabled: bool) -> Self {
         self.config.pin_cores = enabled;
         self
     }
 
     /// Set the core for the state machine thread.
     #[must_use]
-    pub fn state_machine_core(mut self, core: usize) -> Self {
+    pub const fn state_machine_core(mut self, core: usize) -> Self {
         self.config.state_machine_core = Some(core);
         self.config.pin_cores = true;
         self
@@ -250,7 +250,7 @@ impl ThreadPoolConfigBuilder {
 
     /// Set the starting core for the consensus crypto pool.
     #[must_use]
-    pub fn consensus_crypto_core_start(mut self, core: usize) -> Self {
+    pub const fn consensus_crypto_core_start(mut self, core: usize) -> Self {
         self.config.consensus_crypto_core_start = Some(core);
         self.config.pin_cores = true;
         self
@@ -258,7 +258,7 @@ impl ThreadPoolConfigBuilder {
 
     /// Set the starting core for the crypto pool.
     #[must_use]
-    pub fn crypto_core_start(mut self, core: usize) -> Self {
+    pub const fn crypto_core_start(mut self, core: usize) -> Self {
         self.config.crypto_core_start = Some(core);
         self.config.pin_cores = true;
         self
@@ -266,7 +266,7 @@ impl ThreadPoolConfigBuilder {
 
     /// Set the starting core for the execution pool.
     #[must_use]
-    pub fn execution_core_start(mut self, core: usize) -> Self {
+    pub const fn execution_core_start(mut self, core: usize) -> Self {
         self.config.execution_core_start = Some(core);
         self.config.pin_cores = true;
         self
@@ -274,14 +274,14 @@ impl ThreadPoolConfigBuilder {
 
     /// Set stack size for crypto threads.
     #[must_use]
-    pub fn crypto_stack_size(mut self, size: usize) -> Self {
+    pub const fn crypto_stack_size(mut self, size: usize) -> Self {
         self.config.crypto_stack_size = size;
         self
     }
 
     /// Set stack size for execution threads.
     #[must_use]
-    pub fn execution_stack_size(mut self, size: usize) -> Self {
+    pub const fn execution_stack_size(mut self, size: usize) -> Self {
         self.config.execution_stack_size = size;
         self
     }
@@ -298,7 +298,7 @@ impl ThreadPoolConfigBuilder {
 
     /// Build the configuration without validation.
     #[must_use]
-    pub fn build_unchecked(self) -> ThreadPoolConfig {
+    pub const fn build_unchecked(self) -> ThreadPoolConfig {
         self.config
     }
 }
@@ -371,7 +371,7 @@ impl PooledDispatch {
 
     /// Get the configuration.
     #[must_use]
-    pub fn config(&self) -> &ThreadPoolConfig {
+    pub const fn config(&self) -> &ThreadPoolConfig {
         &self.config
     }
 

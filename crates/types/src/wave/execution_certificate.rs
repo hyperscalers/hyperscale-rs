@@ -187,7 +187,7 @@ impl ExecutionCertificate {
 
     /// The shard that produced this certificate.
     #[must_use]
-    pub fn shard_group_id(&self) -> ShardGroupId {
+    pub const fn shard_group_id(&self) -> ShardGroupId {
         self.wave_id.shard_group_id
     }
 
@@ -204,7 +204,7 @@ impl ExecutionCertificate {
 
     /// Block height (the block containing the wave's transactions).
     #[must_use]
-    pub fn block_height(&self) -> BlockHeight {
+    pub const fn block_height(&self) -> BlockHeight {
         self.wave_id.block_height
     }
 
@@ -216,7 +216,7 @@ impl ExecutionCertificate {
     /// same wave — the canonical hash identifies the *logical* EC so that any
     /// valid aggregation resolves to the same hash.
     #[must_use]
-    pub fn canonical_hash(&self) -> ExecutionCertificateHash {
+    pub const fn canonical_hash(&self) -> ExecutionCertificateHash {
         self.canonical_hash
     }
 

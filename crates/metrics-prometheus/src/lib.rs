@@ -201,7 +201,7 @@ impl Metrics {
                 "hyperscale_transaction_latency_seconds",
                 "Transaction end-to-end latency",
                 &["cross_shard"],
-                latency_buckets.clone()
+                latency_buckets
             )
             .unwrap(),
 

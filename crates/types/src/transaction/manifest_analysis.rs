@@ -205,7 +205,7 @@ fn extract_node_ids_from_instruction_v2(
 }
 
 /// Convert a manifest global address to a `NodeId` if possible.
-fn manifest_address_to_node_id(address: &ManifestGlobalAddress) -> Option<NodeId> {
+const fn manifest_address_to_node_id(address: &ManifestGlobalAddress) -> Option<NodeId> {
     match address {
         ManifestGlobalAddress::Static(addr) => Some(NodeId(addr.into_node_id().0)),
         ManifestGlobalAddress::Named(_) => None,
@@ -213,7 +213,7 @@ fn manifest_address_to_node_id(address: &ManifestGlobalAddress) -> Option<NodeId
 }
 
 /// Convert a manifest package address to a `NodeId` if possible.
-fn manifest_package_to_node_id(address: &ManifestPackageAddress) -> Option<NodeId> {
+const fn manifest_package_to_node_id(address: &ManifestPackageAddress) -> Option<NodeId> {
     match address {
         ManifestPackageAddress::Static(addr) => Some(NodeId(addr.into_node_id().0)),
         ManifestPackageAddress::Named(_) => None,

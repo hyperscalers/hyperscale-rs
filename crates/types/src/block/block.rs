@@ -117,7 +117,7 @@ impl<E: sbor::Encoder<sbor::NoCustomValueKind>> sbor::Encode<sbor::NoCustomValue
 
     fn encode_body(&self, encoder: &mut E) -> Result<(), sbor::EncodeError> {
         match self {
-            Block::Live {
+            Self::Live {
                 header,
                 transactions,
                 certificates,
@@ -130,7 +130,7 @@ impl<E: sbor::Encoder<sbor::NoCustomValueKind>> sbor::Encode<sbor::NoCustomValue
                 encode_finalized_wave_vec(encoder, certificates)?;
                 encode_provision_vec(encoder, provisions)?;
             }
-            Block::Sealed {
+            Self::Sealed {
                 header,
                 transactions,
                 certificates,
@@ -219,7 +219,7 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
                 let transactions = decode_tx_vec(decoder)?;
                 let certificates = decode_finalized_wave_vec(decoder, MAX_SBOR_COLLECTION_SIZE)?;
                 let provisions = decode_provision_vec(decoder)?;
-                Ok(Block::Live {
+                Ok(Self::Live {
                     header,
                     transactions,
                     certificates,
@@ -236,7 +236,7 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
                 let header: BlockHeader = decoder.decode()?;
                 let transactions = decode_tx_vec(decoder)?;
                 let certificates = decode_finalized_wave_vec(decoder, MAX_SBOR_COLLECTION_SIZE)?;
-                Ok(Block::Sealed {
+                Ok(Self::Sealed {
                     header,
                     transactions,
                     certificates,
@@ -272,7 +272,7 @@ impl Block {
         proposer: ValidatorId,
         state_root: StateRoot,
     ) -> Self {
-        Block::Live {
+        Self::Live {
             header: BlockHeader::genesis(shard_group_id, proposer, state_root),
             transactions: vec![],
             certificates: vec![],
@@ -282,9 +282,9 @@ impl Block {
 
     /// Block header — present in both variants.
     #[must_use]
-    pub fn header(&self) -> &BlockHeader {
+    pub const fn header(&self) -> &BlockHeader {
         match self {
-            Block::Live { header, .. } | Block::Sealed { header, .. } => header,
+            Self::Live { header, .. } | Self::Sealed { header, .. } => header,
         }
     }
 
@@ -292,7 +292,7 @@ impl Block {
     #[must_use]
     pub fn transactions(&self) -> &[Arc<RoutableTransaction>] {
         match self {
-            Block::Live { transactions, .. } | Block::Sealed { transactions, .. } => transactions,
+            Self::Live { transactions, .. } | Self::Sealed { transactions, .. } => transactions,
         }
     }
 
@@ -300,7 +300,7 @@ impl Block {
     #[must_use]
     pub fn certificates(&self) -> &[Arc<FinalizedWave>] {
         match self {
-            Block::Live { certificates, .. } | Block::Sealed { certificates, .. } => certificates,
+            Self::Live { certificates, .. } | Self::Sealed { certificates, .. } => certificates,
         }
     }
 
@@ -311,15 +311,15 @@ impl Block {
     #[must_use]
     pub fn provisions(&self) -> &[Arc<Provisions>] {
         match self {
-            Block::Live { provisions, .. } => provisions,
-            Block::Sealed { .. } => &[],
+            Self::Live { provisions, .. } => provisions,
+            Self::Sealed { .. } => &[],
         }
     }
 
     /// True if this block is still in its `Live` variant.
     #[must_use]
-    pub fn is_live(&self) -> bool {
-        matches!(self, Block::Live { .. })
+    pub const fn is_live(&self) -> bool {
+        matches!(self, Self::Live { .. })
     }
 
     /// Convert to `Sealed` by dropping provisions. Identity on an already-
@@ -327,19 +327,19 @@ impl Block {
     /// glue re-attaches provisions (via `into_live`) when the requester
     /// needs them.
     #[must_use]
-    pub fn into_sealed(self) -> Block {
+    pub fn into_sealed(self) -> Self {
         match self {
-            Block::Live {
+            Self::Live {
                 header,
                 transactions,
                 certificates,
                 ..
-            } => Block::Sealed {
+            } => Self::Sealed {
                 header,
                 transactions,
                 certificates,
             },
-            sealed @ Block::Sealed { .. } => sealed,
+            sealed @ Self::Sealed { .. } => sealed,
         }
     }
 
@@ -352,19 +352,19 @@ impl Block {
     /// Panics if invoked on a `Live` block — that would silently discard
     /// the existing provision set.
     #[must_use]
-    pub fn into_live(self, provisions: Vec<Arc<Provisions>>) -> Block {
+    pub fn into_live(self, provisions: Vec<Arc<Provisions>>) -> Self {
         match self {
-            Block::Sealed {
+            Self::Sealed {
                 header,
                 transactions,
                 certificates,
-            } => Block::Live {
+            } => Self::Live {
                 header,
                 transactions,
                 certificates,
                 provisions,
             },
-            Block::Live { .. } => {
+            Self::Live { .. } => {
                 panic!("into_live called on an already-Live block")
             }
         }
@@ -378,7 +378,7 @@ impl Block {
 
     /// Get block height.
     #[must_use]
-    pub fn height(&self) -> BlockHeight {
+    pub const fn height(&self) -> BlockHeight {
         self.header().height
     }
 
@@ -402,7 +402,7 @@ impl Block {
 
     /// Check if this is the genesis block.
     #[must_use]
-    pub fn is_genesis(&self) -> bool {
+    pub const fn is_genesis(&self) -> bool {
         self.header().is_genesis()
     }
 

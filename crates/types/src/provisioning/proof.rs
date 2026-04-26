@@ -18,7 +18,7 @@ pub struct MerkleInclusionProof(pub Vec<u8>);
 impl MerkleInclusionProof {
     /// Create a new proof from raw bytes.
     #[must_use]
-    pub fn new(bytes: Vec<u8>) -> Self {
+    pub const fn new(bytes: Vec<u8>) -> Self {
         Self(bytes)
     }
 
@@ -31,7 +31,7 @@ impl MerkleInclusionProof {
     /// Create a dummy (empty) proof for testing.
     #[cfg(any(test, feature = "test-utils"))]
     #[must_use]
-    pub fn dummy() -> Self {
+    pub const fn dummy() -> Self {
         Self(Vec::new())
     }
 }

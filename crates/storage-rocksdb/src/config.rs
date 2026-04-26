@@ -25,14 +25,14 @@ pub enum CompressionType {
 }
 
 impl CompressionType {
-    pub(crate) fn to_rocksdb(self) -> rocksdb::DBCompressionType {
+    pub(crate) const fn to_rocksdb(self) -> rocksdb::DBCompressionType {
         match self {
-            CompressionType::None => rocksdb::DBCompressionType::None,
-            CompressionType::Snappy => rocksdb::DBCompressionType::Snappy,
-            CompressionType::Zlib => rocksdb::DBCompressionType::Zlib,
-            CompressionType::Lz4 => rocksdb::DBCompressionType::Lz4,
-            CompressionType::Lz4hc => rocksdb::DBCompressionType::Lz4hc,
-            CompressionType::Zstd => rocksdb::DBCompressionType::Zstd,
+            Self::None => rocksdb::DBCompressionType::None,
+            Self::Snappy => rocksdb::DBCompressionType::Snappy,
+            Self::Zlib => rocksdb::DBCompressionType::Zlib,
+            Self::Lz4 => rocksdb::DBCompressionType::Lz4,
+            Self::Lz4hc => rocksdb::DBCompressionType::Lz4hc,
+            Self::Zstd => rocksdb::DBCompressionType::Zstd,
         }
     }
 }

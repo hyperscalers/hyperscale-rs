@@ -15,11 +15,10 @@ use std::time::Duration;
 /// the self-reinforcing-trap where aggressive timeouts prevent the EMA
 /// from ever being seeded.
 fn stream_timeout_from_rtt(rtt_ema_secs: Option<f64>) -> Duration {
-    match rtt_ema_secs {
-        Some(rtt) => Duration::from_secs_f64(rtt * STREAM_TIMEOUT_RTT_MULTIPLIER)
-            .clamp(MIN_STREAM_TIMEOUT_WARM, MAX_STREAM_TIMEOUT),
-        None => MIN_STREAM_TIMEOUT_COLD,
-    }
+    rtt_ema_secs.map_or(MIN_STREAM_TIMEOUT_COLD, |rtt| {
+        Duration::from_secs_f64(rtt * STREAM_TIMEOUT_RTT_MULTIPLIER)
+            .clamp(MIN_STREAM_TIMEOUT_WARM, MAX_STREAM_TIMEOUT)
+    })
 }
 
 /// Compute initial backoff from optional RTT EMA and priority.

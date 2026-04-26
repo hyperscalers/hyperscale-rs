@@ -231,7 +231,7 @@ impl RocksDbStorage {
 
 // Re-export the jmt_key type alias for compatibility elsewhere if needed.
 #[allow(unused)]
-fn _assert_jmt_key_stable(_k: &jmt::NodeKey) {}
+const fn _assert_jmt_key_stable(_k: &jmt::NodeKey) {}
 
 #[cfg(test)]
 mod tests {
@@ -283,7 +283,7 @@ mod tests {
                 .insert(
                     pk.partition_num,
                     PartitionDatabaseUpdates::Delta {
-                        substate_updates: [(sk, DatabaseUpdate::Set(v))].into_iter().collect(),
+                        substate_updates: std::iter::once((sk, DatabaseUpdate::Set(v))).collect(),
                     },
                 );
         }

@@ -110,7 +110,7 @@ pub struct SimulationStats {
 impl SimulationStats {
     /// Total messages dropped (partition + packet loss).
     #[must_use]
-    pub fn messages_dropped(&self) -> u64 {
+    pub const fn messages_dropped(&self) -> u64 {
         self.messages_dropped_partition + self.messages_dropped_loss
     }
 
@@ -300,7 +300,7 @@ impl SimulationRunner {
 
     /// Check if traffic analysis is enabled.
     #[must_use]
-    pub fn has_traffic_analysis(&self) -> bool {
+    pub const fn has_traffic_analysis(&self) -> bool {
         self.traffic_analyzer.is_some()
     }
 
@@ -332,13 +332,13 @@ impl SimulationRunner {
 
     /// Get simulation statistics.
     #[must_use]
-    pub fn stats(&self) -> &SimulationStats {
+    pub const fn stats(&self) -> &SimulationStats {
         &self.stats
     }
 
     /// Get current simulation time.
     #[must_use]
-    pub fn now(&self) -> Duration {
+    pub const fn now(&self) -> Duration {
         self.now
     }
 
@@ -350,12 +350,12 @@ impl SimulationRunner {
 
     /// Get a reference to the network.
     #[must_use]
-    pub fn network(&self) -> &SimulatedNetwork {
+    pub const fn network(&self) -> &SimulatedNetwork {
         &self.network
     }
 
     /// Get a mutable reference to the network for partition/loss configuration.
-    pub fn network_mut(&mut self) -> &mut SimulatedNetwork {
+    pub const fn network_mut(&mut self) -> &mut SimulatedNetwork {
         &mut self.network
     }
 

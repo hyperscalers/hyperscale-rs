@@ -46,17 +46,17 @@ impl ValidatorRating {
     }
 
     /// Apply penalty for equivocation.
-    pub fn apply_equivocation_penalty(&mut self) {
+    pub const fn apply_equivocation_penalty(&mut self) {
         self.score = self.score.saturating_sub(50);
     }
 
     /// Apply penalty for missed proposals (>50%).
-    pub fn apply_missed_proposal_penalty(&mut self) {
+    pub const fn apply_missed_proposal_penalty(&mut self) {
         self.score = self.score.saturating_sub(10);
     }
 
     /// Apply penalty for sync failure.
-    pub fn apply_sync_failure_penalty(&mut self) {
+    pub const fn apply_sync_failure_penalty(&mut self) {
         self.score = self.score.saturating_sub(10);
     }
 }
@@ -102,7 +102,7 @@ impl GlobalValidatorInfo {
 
     /// Check if this validator can participate in consensus.
     #[must_use]
-    pub fn can_participate(&self) -> bool {
+    pub const fn can_participate(&self) -> bool {
         matches!(self.state, ValidatorShardState::Active)
     }
 
@@ -140,7 +140,7 @@ impl ShardCommitteeConfig {
 
     /// Check if this committee has enough validators for BFT.
     #[must_use]
-    pub fn has_minimum_validators(&self, min: usize) -> bool {
+    pub const fn has_minimum_validators(&self, min: usize) -> bool {
         self.active_validators.len() >= min
     }
 }

@@ -107,15 +107,16 @@ fn test_basic_substate_operations() {
     updates.node_updates.insert(
         partition_key.node_key.clone(),
         NodeDatabaseUpdates {
-            partition_updates: [(
+            partition_updates: std::iter::once((
                 partition_key.partition_num,
                 PartitionDatabaseUpdates::Delta {
-                    substate_updates: [(sort_key.clone(), DatabaseUpdate::Set(vec![99, 88, 77]))]
-                        .into_iter()
-                        .collect(),
+                    substate_updates: std::iter::once((
+                        sort_key.clone(),
+                        DatabaseUpdate::Set(vec![99, 88, 77]),
+                    ))
+                    .collect(),
                 },
-            )]
-            .into_iter()
+            ))
             .collect(),
         },
     );
@@ -141,15 +142,16 @@ fn test_snapshot_isolation() {
     updates.node_updates.insert(
         partition_key.node_key.clone(),
         NodeDatabaseUpdates {
-            partition_updates: [(
+            partition_updates: std::iter::once((
                 partition_key.partition_num,
                 PartitionDatabaseUpdates::Delta {
-                    substate_updates: [(sort_key.clone(), DatabaseUpdate::Set(vec![1]))]
-                        .into_iter()
-                        .collect(),
+                    substate_updates: std::iter::once((
+                        sort_key.clone(),
+                        DatabaseUpdate::Set(vec![1]),
+                    ))
+                    .collect(),
                 },
-            )]
-            .into_iter()
+            ))
             .collect(),
         },
     );
@@ -163,15 +165,16 @@ fn test_snapshot_isolation() {
     updates2.node_updates.insert(
         partition_key.node_key.clone(),
         NodeDatabaseUpdates {
-            partition_updates: [(
+            partition_updates: std::iter::once((
                 partition_key.partition_num,
                 PartitionDatabaseUpdates::Delta {
-                    substate_updates: [(sort_key.clone(), DatabaseUpdate::Set(vec![2]))]
-                        .into_iter()
-                        .collect(),
+                    substate_updates: std::iter::once((
+                        sort_key.clone(),
+                        DatabaseUpdate::Set(vec![2]),
+                    ))
+                    .collect(),
                 },
-            )]
-            .into_iter()
+            ))
             .collect(),
         },
     );
@@ -207,18 +210,16 @@ fn test_snapshot_structural_sharing_performance() {
         updates.node_updates.insert(
             partition_key.node_key.clone(),
             NodeDatabaseUpdates {
-                partition_updates: [(
+                partition_updates: std::iter::once((
                     partition_key.partition_num,
                     PartitionDatabaseUpdates::Delta {
-                        substate_updates: [(
+                        substate_updates: std::iter::once((
                             sort_key,
                             DatabaseUpdate::Set(vec![u8::try_from(i).unwrap_or(u8::MAX)]),
-                        )]
-                        .into_iter()
+                        ))
                         .collect(),
                     },
-                )]
-                .into_iter()
+                ))
                 .collect(),
             },
         );
@@ -752,20 +753,20 @@ fn test_state_history_create_delete_create() {
     v2.node_updates.insert(
         pk.node_key.clone(),
         NodeDatabaseUpdates {
-            partition_updates: [(
+            partition_updates: std::iter::once((
                 partition_num,
                 PartitionDatabaseUpdates::Delta {
-                    substate_updates: [(sk.clone(), DatabaseUpdate::Delete)].into_iter().collect(),
+                    substate_updates: std::iter::once((sk.clone(), DatabaseUpdate::Delete))
+                        .collect(),
                 },
-            )]
-            .into_iter()
+            ))
             .collect(),
         },
     );
     storage.commit_shared(&v2);
 
     // V3: create again with value B (=0xBB).
-    let v3 = make_mapped_database_update(7, partition_num, sort_key.clone(), vec![0xBB]);
+    let v3 = make_mapped_database_update(7, partition_num, sort_key, vec![0xBB]);
     storage.commit_shared(&v3);
 
     // Expected:
@@ -876,7 +877,7 @@ fn test_reset_partition_captures_history_for_all_removed_keys() {
         updates.node_updates.insert(
             node_key.clone(),
             NodeDatabaseUpdates {
-                partition_updates: [(
+                partition_updates: std::iter::once((
                     partition_num,
                     PartitionDatabaseUpdates::Delta {
                         substate_updates: [
@@ -887,8 +888,7 @@ fn test_reset_partition_captures_history_for_all_removed_keys() {
                         .into_iter()
                         .collect(),
                     },
-                )]
-                .into_iter()
+                ))
                 .collect(),
             },
         );
@@ -904,15 +904,14 @@ fn test_reset_partition_captures_history_for_all_removed_keys() {
         new_values.insert(DbSortKey(vec![0xD1]), vec![0xDD]);
         new_values.insert(DbSortKey(vec![0xE1]), vec![0xEE]);
         updates.node_updates.insert(
-            node_key.clone(),
+            node_key,
             NodeDatabaseUpdates {
-                partition_updates: [(
+                partition_updates: std::iter::once((
                     partition_num,
                     PartitionDatabaseUpdates::Reset {
                         new_substate_values: new_values,
                     },
-                )]
-                .into_iter()
+                ))
                 .collect(),
             },
         );

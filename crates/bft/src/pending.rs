@@ -294,27 +294,27 @@ impl PendingBlock {
     }
 
     /// Get the block header.
-    pub fn header(&self) -> &BlockHeader {
+    pub const fn header(&self) -> &BlockHeader {
         &self.header
     }
 
     /// Time at which this pending block was first observed.
-    pub fn created_at(&self) -> LocalTimestamp {
+    pub const fn created_at(&self) -> LocalTimestamp {
         self.created_at
     }
 
     /// Get the block manifest.
-    pub fn manifest(&self) -> &BlockManifest {
+    pub const fn manifest(&self) -> &BlockManifest {
         &self.manifest
     }
 
     /// Get total transaction count across all sections.
-    pub fn transaction_count(&self) -> usize {
+    pub const fn transaction_count(&self) -> usize {
         self.manifest.transaction_count()
     }
 
     /// Get certificate count.
-    pub fn certificate_count(&self) -> usize {
+    pub const fn certificate_count(&self) -> usize {
         self.manifest.cert_hashes.len()
     }
 }
@@ -326,7 +326,7 @@ impl PendingBlock {
 /// production have a chance to fill the data first. `force_immediate`
 /// bypasses the age check — used after sync resumes to pull any lingering
 /// holes without another timeout cycle.
-pub(crate) fn check_fetches(
+pub fn check_fetches(
     pending_blocks: &HashMap<BlockHash, PendingBlock>,
     topology: &TopologySnapshot,
     now: LocalTimestamp,
@@ -446,7 +446,7 @@ mod tests {
         let header = make_header(BlockHeight(1));
 
         let pb = PendingBlock::from_manifest(
-            header.clone(),
+            header,
             BlockManifest {
                 tx_hashes: vec![tx1, tx2],
                 ..Default::default()
@@ -575,7 +575,7 @@ mod tests {
 
         let wave_id = WaveId::new(ShardGroupId(0), BlockHeight(1), BTreeSet::new());
         let cert = Arc::new(WaveCertificate {
-            wave_id: wave_id.clone(),
+            wave_id,
             execution_certificates: vec![],
         });
 

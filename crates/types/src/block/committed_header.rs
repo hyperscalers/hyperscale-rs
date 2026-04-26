@@ -21,7 +21,7 @@ pub struct CommittedBlockHeader {
 impl CommittedBlockHeader {
     /// Create a new committed block header.
     #[must_use]
-    pub fn new(header: BlockHeader, qc: QuorumCertificate) -> Self {
+    pub const fn new(header: BlockHeader, qc: QuorumCertificate) -> Self {
         Self { header, qc }
     }
 
@@ -33,19 +33,19 @@ impl CommittedBlockHeader {
 
     /// Get the block height.
     #[must_use]
-    pub fn height(&self) -> BlockHeight {
+    pub const fn height(&self) -> BlockHeight {
         self.header.height
     }
 
     /// Get the shard group this block belongs to.
     #[must_use]
-    pub fn shard_group_id(&self) -> ShardGroupId {
+    pub const fn shard_group_id(&self) -> ShardGroupId {
         self.header.shard_group_id
     }
 
     /// Get the state root committed by this block.
     #[must_use]
-    pub fn state_root(&self) -> StateRoot {
+    pub const fn state_root(&self) -> StateRoot {
         self.header.state_root
     }
 }

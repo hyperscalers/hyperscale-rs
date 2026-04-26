@@ -8,10 +8,12 @@ use hyperscale_types::{
 use sbor::prelude::BasicSbor;
 use std::sync::Arc;
 
-/// A block in elided wire form: every item (tx / cert / provision) has its
-/// hash listed, but bodies may be omitted for items the requester declared
-/// in its [`Inventory`]. The requester rehydrates by looking up omitted
-/// bodies in its own mempool / cert cache / provision store.
+/// A block in elided wire form.
+///
+/// Every item (tx / cert / provision) has its hash listed, but bodies may
+/// be omitted for items the requester declared in its [`Inventory`]. The
+/// requester rehydrates by looking up omitted bodies in its own mempool /
+/// cert cache / provision store.
 ///
 /// `provisions: None` preserves the `Block::Sealed` shape; `Some(_)`
 /// preserves `Block::Live` (possibly with some bodies elided).
@@ -194,7 +196,9 @@ impl ElidedCertifiedBlock {
 }
 
 /// Hashes whose bodies [`ElidedCertifiedBlock::try_rehydrate`] couldn't
-/// resolve from the provided lookups. Used as the payload of a follow-up
+/// resolve from the provided lookups.
+///
+/// Used as the payload of a follow-up
 /// [`GetBlockTopUpRequest`](crate::request::GetBlockTopUpRequest).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RehydrationMiss {
@@ -209,7 +213,7 @@ pub struct RehydrationMiss {
 impl RehydrationMiss {
     /// Whether every category is empty.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.missing_tx.is_empty()
             && self.missing_cert.is_empty()
             && self.missing_provision.is_empty()
@@ -217,7 +221,7 @@ impl RehydrationMiss {
 
     /// Total number of missing hashes across categories.
     #[must_use]
-    pub fn total(&self) -> usize {
+    pub const fn total(&self) -> usize {
         self.missing_tx.len() + self.missing_cert.len() + self.missing_provision.len()
     }
 }
@@ -244,7 +248,7 @@ pub struct GetBlockResponse {
 impl GetBlockResponse {
     /// Create a response with a found block.
     #[must_use]
-    pub fn found(certified: ElidedCertifiedBlock) -> Self {
+    pub const fn found(certified: ElidedCertifiedBlock) -> Self {
         Self {
             certified: Some(certified),
         }
@@ -252,13 +256,13 @@ impl GetBlockResponse {
 
     /// Create a response for a block not found.
     #[must_use]
-    pub fn not_found() -> Self {
+    pub const fn not_found() -> Self {
         Self { certified: None }
     }
 
     /// Check if the block was found.
     #[must_use]
-    pub fn has_block(&self) -> bool {
+    pub const fn has_block(&self) -> bool {
         self.certified.is_some()
     }
 
@@ -376,7 +380,7 @@ mod tests {
             cert_have: None,
             provision_have: None,
         };
-        let elided = ElidedCertifiedBlock::elide(&block, qc.clone(), &inv);
+        let elided = ElidedCertifiedBlock::elide(&block, qc, &inv);
         let rehydrated = elided
             .try_rehydrate(
                 |h| {

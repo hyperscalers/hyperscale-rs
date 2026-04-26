@@ -21,7 +21,7 @@ use rocksdb::{DB, Snapshot};
 /// The snapshot must outlive all reads through this store. When dropped,
 /// the snapshot releases its hold on the `RocksDB` version, allowing
 /// garbage collection.
-pub(crate) struct SnapshotTreeStore<'a> {
+pub struct SnapshotTreeStore<'a> {
     snapshot: Snapshot<'a>,
     db: &'a DB,
 }

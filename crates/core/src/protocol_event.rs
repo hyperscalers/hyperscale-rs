@@ -33,11 +33,11 @@ pub enum CommitSource {
 impl CommitSource {
     /// Telemetry-friendly tag identifying how the certifying QC was learned.
     #[must_use]
-    pub fn as_str(&self) -> &'static str {
+    pub const fn as_str(&self) -> &'static str {
         match self {
-            CommitSource::Aggregator => "aggregator",
-            CommitSource::Header => "header",
-            CommitSource::Sync => "sync",
+            Self::Aggregator => "aggregator",
+            Self::Header => "header",
+            Self::Sync => "sync",
         }
     }
 }
@@ -567,7 +567,7 @@ impl ProtocolEvent {
     #[must_use]
     pub fn type_name(&self) -> &'static str {
         match self {
-            ProtocolEvent::BlockRootVerified { kind, .. } => match kind {
+            Self::BlockRootVerified { kind, .. } => match kind {
                 VerificationKind::StateRoot => "BlockRootVerified::StateRoot",
                 VerificationKind::TransactionRoot => "BlockRootVerified::TransactionRoot",
                 VerificationKind::CertificateRoot => "BlockRootVerified::CertificateRoot",

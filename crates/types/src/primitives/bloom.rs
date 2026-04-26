@@ -82,13 +82,13 @@ impl<T> BloomFilter<T> {
 
     /// Number of bits in the backing array. Always a multiple of 64.
     #[must_use]
-    pub fn bit_len(&self) -> usize {
+    pub const fn bit_len(&self) -> usize {
         self.bits.len() * 64
     }
 
     /// Number of hash probes per item.
     #[must_use]
-    pub fn k(&self) -> u8 {
+    pub const fn k(&self) -> u8 {
         self.k
     }
 
@@ -169,7 +169,7 @@ fn split_hash<T: TypedHash>(item: &T) -> (u64, u64) {
 }
 
 #[inline]
-fn probe(h1: u64, h2: u64, i: u64, m: u64) -> u64 {
+const fn probe(h1: u64, h2: u64, i: u64, m: u64) -> u64 {
     h1.wrapping_add(i.wrapping_mul(h2)) % m
 }
 

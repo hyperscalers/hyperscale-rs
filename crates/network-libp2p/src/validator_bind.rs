@@ -37,7 +37,7 @@ use tracing::{info, warn};
 type SharedValidatorKeys = Arc<ArcSwap<ValidatorKeyMap>>;
 
 /// Stream protocol identifier for the validator-bind handshake.
-pub(crate) const VALIDATOR_BIND_PROTOCOL: StreamProtocol =
+pub const VALIDATOR_BIND_PROTOCOL: StreamProtocol =
     StreamProtocol::new("/hyperscale/validator-bind/1.0.0");
 
 /// Timeout for the complete bind exchange (read + write).
@@ -112,15 +112,15 @@ enum BindError {
 impl std::fmt::Display for BindError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            BindError::UnknownValidator(v) => write!(f, "unknown validator {}", v.0),
-            BindError::InvalidSignature(v) => {
+            Self::UnknownValidator(v) => write!(f, "unknown validator {}", v.0),
+            Self::InvalidSignature(v) => {
                 write!(f, "invalid BLS signature for validator {}", v.0)
             }
-            BindError::InvalidMessage => write!(f, "malformed bind message"),
-            BindError::StreamOpen(e) => write!(f, "stream open failed: {e}"),
-            BindError::Io(e) => write!(f, "I/O error: {e}"),
-            BindError::Frame(e) => write!(f, "frame error: {e}"),
-            BindError::Timeout => write!(f, "bind exchange timed out"),
+            Self::InvalidMessage => write!(f, "malformed bind message"),
+            Self::StreamOpen(e) => write!(f, "stream open failed: {e}"),
+            Self::Io(e) => write!(f, "I/O error: {e}"),
+            Self::Frame(e) => write!(f, "frame error: {e}"),
+            Self::Timeout => write!(f, "bind exchange timed out"),
         }
     }
 }
@@ -132,7 +132,7 @@ impl std::fmt::Display for BindError {
 /// Kept alive inside `Libp2pAdapter` to prevent the background task from
 /// being aborted. Provides a channel to trigger outbound bind exchanges
 /// from the event loop.
-pub(crate) struct ValidatorBindHandle {
+pub struct ValidatorBindHandle {
     /// Trigger an outbound bind to a newly-identified peer.
     pub(crate) bind_tx: mpsc::UnboundedSender<Libp2pPeerId>,
     /// Keep the background task alive.
@@ -148,7 +148,7 @@ pub(crate) struct ValidatorBindHandle {
 /// 1. **Inbound**: accepts `/hyperscale/validator-bind/1.0.0` streams from peers.
 /// 2. **Outbound**: opens bind streams to peers when triggered by the event loop.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn spawn_validator_bind_service(
+pub fn spawn_validator_bind_service(
     mut control: stream::Control,
     validator_peers: Arc<DashMap<ValidatorId, Libp2pPeerId>>,
     local_validator_id: ValidatorId,
@@ -354,10 +354,7 @@ async fn handle_inbound(
     })
     .await;
 
-    match result {
-        Ok(inner) => inner,
-        Err(_) => Err(BindError::Timeout),
-    }
+    result.map_or(Err(BindError::Timeout), |inner| inner)
 }
 
 /// Handle an outbound bind (we are the initiator).
@@ -423,10 +420,7 @@ async fn handle_outbound(
     })
     .await;
 
-    match result {
-        Ok(inner) => inner,
-        Err(_) => Err(BindError::Timeout),
-    }
+    result.map_or(Err(BindError::Timeout), |inner| inner)
 }
 
 #[cfg(test)]

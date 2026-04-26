@@ -620,7 +620,7 @@ impl AccountPool {
 
     /// Get the number of shards.
     #[must_use]
-    pub fn num_shards(&self) -> u64 {
+    pub const fn num_shards(&self) -> u64 {
         self.num_shards
     }
 
@@ -880,7 +880,7 @@ impl AccountPartition {
 
     /// Get the number of shards.
     #[must_use]
-    pub fn num_shards(&self) -> u64 {
+    pub const fn num_shards(&self) -> u64 {
         self.num_shards
     }
 

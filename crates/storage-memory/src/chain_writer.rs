@@ -116,6 +116,7 @@ impl ChainWriter for SimStorage {
         (result_root, prepared)
     }
 
+    #[allow(clippy::significant_drop_tightening)] // every locked op needs the lock
     fn commit_prepared_blocks(
         &self,
         blocks: Vec<(

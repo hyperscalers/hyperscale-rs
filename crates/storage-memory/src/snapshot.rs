@@ -137,23 +137,23 @@ impl SubstateDatabase for SimSnapshot {
     ) -> Box<dyn Iterator<Item = PartitionEntry> + '_> {
         let prefix = keys::partition_prefix(partition_key);
         let prefix_len = prefix.len();
-        let entries: Vec<_> = self
-            .list_at_prefix(&prefix)
-            .into_iter()
-            .filter_map(|(k, v)| {
-                if k.len() < prefix_len {
-                    return None;
-                }
-                let sort_key_bytes = k[prefix_len..].to_vec();
-                let sort_key = DbSortKey(sort_key_bytes);
-                if let Some(from) = from_sort_key
-                    && sort_key < *from
-                {
-                    return None;
-                }
-                Some((sort_key, v))
-            })
-            .collect();
-        Box::new(entries.into_iter())
+        let from_sort_key = from_sort_key.cloned();
+        Box::new(
+            self.list_at_prefix(&prefix)
+                .into_iter()
+                .filter_map(move |(k, v)| {
+                    if k.len() < prefix_len {
+                        return None;
+                    }
+                    let sort_key_bytes = k[prefix_len..].to_vec();
+                    let sort_key = DbSortKey(sort_key_bytes);
+                    if let Some(from) = &from_sort_key
+                        && sort_key < *from
+                    {
+                        return None;
+                    }
+                    Some((sort_key, v))
+                }),
+        )
     }
 }

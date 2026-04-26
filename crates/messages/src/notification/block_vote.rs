@@ -16,19 +16,19 @@ pub struct BlockVoteNotification {
 impl BlockVoteNotification {
     /// Create a new block vote notification message.
     #[must_use]
-    pub fn new(vote: BlockVote) -> Self {
+    pub const fn new(vote: BlockVote) -> Self {
         Self { vote }
     }
 
     /// Get the inner block vote.
     #[must_use]
-    pub fn vote(&self) -> &BlockVote {
+    pub const fn vote(&self) -> &BlockVote {
         &self.vote
     }
 
     /// Consume and return the inner block vote.
     #[must_use]
-    pub fn into_vote(self) -> BlockVote {
+    pub const fn into_vote(self) -> BlockVote {
         self.vote
     }
 }

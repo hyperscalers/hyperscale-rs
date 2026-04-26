@@ -487,7 +487,7 @@ impl RadixExecutor {
 
     /// Get reference to the network definition.
     #[must_use]
-    pub fn network(&self) -> &NetworkDefinition {
+    pub const fn network(&self) -> &NetworkDefinition {
         &self.network
     }
 }
@@ -537,7 +537,7 @@ impl Engine for RadixExecutor {
         &self,
         storage: &mut S,
     ) -> Result<(), GenesisError> {
-        RadixExecutor::run_genesis(self, storage)
+        Self::run_genesis(self, storage)
     }
 
     fn run_genesis_with_config<S: SubstateDatabase + CommittableSubstateDatabase>(
@@ -545,10 +545,10 @@ impl Engine for RadixExecutor {
         storage: &mut S,
         config: GenesisConfig,
     ) -> Result<(), GenesisError> {
-        RadixExecutor::run_genesis_with_config(self, storage, config)
+        Self::run_genesis_with_config(self, storage, config)
     }
 
     fn network(&self) -> &NetworkDefinition {
-        RadixExecutor::network(self)
+        Self::network(self)
     }
 }

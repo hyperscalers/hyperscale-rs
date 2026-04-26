@@ -29,7 +29,7 @@ pub struct BlockManifest {
 impl BlockManifest {
     /// Get total transaction count.
     #[must_use]
-    pub fn transaction_count(&self) -> usize {
+    pub const fn transaction_count(&self) -> usize {
         self.tx_hashes.len()
     }
 
@@ -89,7 +89,7 @@ impl BlockMetadata {
 
     /// Get block height.
     #[must_use]
-    pub fn height(&self) -> BlockHeight {
+    pub const fn height(&self) -> BlockHeight {
         self.header.height
     }
 
@@ -101,7 +101,7 @@ impl BlockMetadata {
 
     /// Get total transaction count.
     #[must_use]
-    pub fn transaction_count(&self) -> usize {
+    pub const fn transaction_count(&self) -> usize {
         self.manifest.transaction_count()
     }
 }

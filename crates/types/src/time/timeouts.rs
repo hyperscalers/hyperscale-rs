@@ -10,8 +10,10 @@ use crate::MAX_VALIDITY_RANGE;
 use std::time::Duration;
 
 /// How long after wave start before a not-fully-provisioned wave is aborted
-/// in its entirety. This is the cross-shard execution window — every retention
-/// window that must outlive a live wave is sized in terms of this.
+/// in its entirety.
+///
+/// This is the cross-shard execution window — every retention window that
+/// must outlive a live wave is sized in terms of this.
 ///
 /// Sized at 3× `VOTE_RETRY_TIMEOUT` (8s) so at least two vote retries can
 /// fire against rotated wave leaders before the timeout-abort path takes over.
@@ -21,8 +23,9 @@ use std::time::Duration;
 /// the same abort anchor.
 pub const WAVE_TIMEOUT: Duration = Duration::from_secs(24);
 
-/// How long to retain remote block headers below each shard's tip. Shared
-/// by `hyperscale-bft` (deferral-proof verification) and
+/// How long to retain remote block headers below each shard's tip.
+///
+/// Shared by `hyperscale-bft` (deferral-proof verification) and
 /// `hyperscale-remote-headers` (provision/exec-cert verification). Measured
 /// against the BFT-authenticated `weighted_timestamp_ms` on the tip vs the
 /// stored header. Sized generously above `WAVE_TIMEOUT` so late-arriving

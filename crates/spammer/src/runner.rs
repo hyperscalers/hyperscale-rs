@@ -156,7 +156,7 @@ impl Spammer {
     }
 
     /// Run in single-threaded mode with concurrent submission via `join_all`.
-    async fn run_single_threaded(&mut self, cancel: CancellationToken, start: Instant) {
+    async fn run_single_threaded(&self, cancel: CancellationToken, start: Instant) {
         let mut last_progress = Instant::now();
         let batch_interval = self.config.batch_interval();
         let num_shards = usize::try_from(self.config.num_shards).unwrap_or(usize::MAX);
@@ -232,7 +232,7 @@ impl Spammer {
 
     /// Run in multi-threaded mode with partitioned accounts.
     async fn run_multi_threaded(
-        &mut self,
+        &self,
         cancel: CancellationToken,
         start: Instant,
         num_workers: usize,
@@ -385,12 +385,13 @@ impl Spammer {
             0.0
         };
 
-        let in_flight_info = if let Some(ref tracker) = self.latency_tracker {
-            let count = tracker.in_flight_count();
-            format!(" | tracking: {count}")
-        } else {
-            String::new()
-        };
+        let in_flight_info = self
+            .latency_tracker
+            .as_ref()
+            .map_or_else(String::new, |tracker| {
+                let count = tracker.in_flight_count();
+                format!(" | tracking: {count}")
+            });
 
         println!(
             "[{:>3}s] submitted: {} | accepted: {} | rejected: {} | errors: {} | tps: {:.0}{}",
@@ -463,12 +464,10 @@ fn print_progress_static(
 
     let tps = stats.tps(start);
 
-    let in_flight_info = if let Some(tracker) = latency_tracker {
+    let in_flight_info = latency_tracker.map_or_else(String::new, |tracker| {
         let count = tracker.in_flight_count();
         format!(" | tracking: {count}")
-    } else {
-        String::new()
-    };
+    });
 
     println!(
         "[{:>3}s] submitted: {} | accepted: {} | rejected: {} | errors: {} | tps: {:.0}{}",
@@ -619,12 +618,12 @@ impl PartitionWorkload {
         }
     }
 
-    fn with_cross_shard_ratio(mut self, ratio: f64) -> Self {
+    const fn with_cross_shard_ratio(mut self, ratio: f64) -> Self {
         self.cross_shard_ratio = ratio.clamp(0.0, 1.0);
         self
     }
 
-    fn with_selection_mode(mut self, mode: crate::accounts::SelectionMode) -> Self {
+    const fn with_selection_mode(mut self, mode: crate::accounts::SelectionMode) -> Self {
         self.selection_mode = mode;
         self
     }

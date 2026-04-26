@@ -34,7 +34,7 @@ use crate::verification::VerificationPipeline;
 /// (payload, timestamp source, `is_fallback` flag, logging label) to its
 /// unified build-and-dispatch helper.
 #[derive(Debug)]
-pub(crate) enum ProposalKind {
+pub enum ProposalKind {
     /// Normal proposal with a filtered payload and a real-clock timestamp.
     Normal {
         transactions: Vec<Arc<RoutableTransaction>>,
@@ -52,12 +52,12 @@ pub(crate) enum ProposalKind {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct PendingProposal {
+pub struct PendingProposal {
     pub height: BlockHeight,
     pub round: Round,
 }
 
-pub(crate) struct ProposalTracker {
+pub struct ProposalTracker {
     pending: Option<PendingProposal>,
     /// Slot for a proposal that `dispatch_or_defer` could not dispatch
     /// because the parent JMT tree wasn't available yet. Consulted from
@@ -69,7 +69,7 @@ pub(crate) struct ProposalTracker {
 
 /// Result of correlating a `ProposalBuilt` callback against the tracker.
 #[derive(Debug)]
-pub(crate) enum TakeResult {
+pub enum TakeResult {
     /// The callback matches the in-flight build; the slot has been cleared.
     Matched,
     /// No build was in flight when the callback arrived.
@@ -80,7 +80,7 @@ pub(crate) enum TakeResult {
 }
 
 impl ProposalTracker {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             pending: None,
             deferred: None,
@@ -89,13 +89,13 @@ impl ProposalTracker {
 
     /// Record a new in-flight build. A successful dispatch also invalidates
     /// any deferred slot for a prior attempt.
-    pub fn start(&mut self, height: BlockHeight, round: Round) {
+    pub const fn start(&mut self, height: BlockHeight, round: Round) {
         self.pending = Some(PendingProposal { height, round });
         self.deferred = None;
     }
 
     /// Read the in-flight build, if any.
-    pub fn pending(&self) -> Option<&PendingProposal> {
+    pub const fn pending(&self) -> Option<&PendingProposal> {
         self.pending.as_ref()
     }
 
@@ -103,7 +103,7 @@ impl ProposalTracker {
     /// so a stale build completing later is discarded by the next
     /// `take_matching` and the deferred slot doesn't gate the new round's
     /// `(height, round)` target.
-    pub fn clear(&mut self) {
+    pub const fn clear(&mut self) {
         self.pending = None;
         self.deferred = None;
     }
@@ -111,19 +111,19 @@ impl ProposalTracker {
     /// Record that a build for `(height, round)` could not dispatch because
     /// the parent JMT tree wasn't available. Consulted by `can_propose` to
     /// suppress re-entry until `clear_deferred` fires.
-    pub fn mark_deferred(&mut self, height: BlockHeight, round: Round) {
+    pub const fn mark_deferred(&mut self, height: BlockHeight, round: Round) {
         self.deferred = Some(PendingProposal { height, round });
     }
 
     /// Read the deferred slot, if any.
-    pub fn deferred(&self) -> Option<&PendingProposal> {
+    pub const fn deferred(&self) -> Option<&PendingProposal> {
         self.deferred.as_ref()
     }
 
     /// Drop the deferred slot. Called when the verification pipeline signals
     /// that the awaited parent tree has landed, so the next `try_propose`
     /// actually re-dispatches.
-    pub fn clear_deferred(&mut self) {
+    pub const fn clear_deferred(&mut self) {
         self.deferred = None;
     }
 
@@ -157,7 +157,7 @@ impl ProposalTracker {
 ///    proposing blocks that will be rejected.
 ///
 /// Logs the dedup and expiry counts when non-zero.
-pub(crate) fn select_transactions(
+pub fn select_transactions(
     ready_txs: &[Arc<RoutableTransaction>],
     qc_chain_tx_hashes: &HashSet<TxHash>,
     tx_cache: &CommittedTxCache,
@@ -204,7 +204,7 @@ pub(crate) fn select_transactions(
 /// Canonical order matters: verifiers flatten receipts into JMT `work_items`
 /// in manifest order, and the `BTreeMap` collapse there is last-writer-wins,
 /// so the proposer must produce a deterministic order.
-pub(crate) fn select_finalized_waves(
+pub fn select_finalized_waves(
     finalized_waves: Vec<Arc<FinalizedWave>>,
     qc_chain_cert_hashes: &HashSet<WaveIdHash>,
     max_finalized_txs: usize,
@@ -236,7 +236,7 @@ pub(crate) fn select_finalized_waves(
 /// would exceed `max_provision_txs`. Oldest batches go first so the queue
 /// drains monotonically; unselected batches remain queued for the next
 /// proposal.
-pub(crate) fn select_provisions(
+pub fn select_provisions(
     provisions: Vec<Arc<Provisions>>,
     qc_chain_provision_hashes: &HashSet<ProvisionHash>,
     max_provision_txs: usize,
@@ -266,7 +266,7 @@ pub(crate) fn select_provisions(
 /// `assemble_build_action` returns this so the coordinator can decide what
 /// mutations to apply (e.g. recording leader activity, starting the
 /// tracker, deferring if the parent tree isn't ready).
-pub(crate) struct BuildActionPlan {
+pub struct BuildActionPlan {
     /// The `BuildProposal` action ready for dispatch.
     pub action: Action,
     /// Parent hash, forwarded to the tracker / verification pipeline.
@@ -286,7 +286,7 @@ pub(crate) struct BuildActionPlan {
 /// Pure with respect to the coordinator — reads only from the chain view
 /// and the supplied inputs, writes nothing. The caller applies the returned
 /// mutations (leader activity, tracker.start, dispatch-or-defer).
-pub(crate) fn assemble_build_action(
+pub fn assemble_build_action(
     topology: &TopologySnapshot,
     chain: &ChainView,
     height: BlockHeight,
@@ -382,7 +382,7 @@ pub(crate) fn assemble_build_action(
 ///
 /// When deferred, the verification pipeline unblocks and re-enters
 /// `try_propose` via `ContentAvailable` when the parent tree lands.
-pub(crate) fn dispatch_or_defer(
+pub fn dispatch_or_defer(
     tracker: &mut ProposalTracker,
     verification: &mut VerificationPipeline,
     parent_hash: BlockHash,

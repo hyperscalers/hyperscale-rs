@@ -82,13 +82,13 @@ impl NibblePath {
 
     /// Number of meaningful bits.
     #[must_use]
-    pub fn len(&self) -> u16 {
+    pub const fn len(&self) -> u16 {
         self.bits
     }
 
     /// Whether this path has zero bits.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.bits == 0
     }
 
@@ -234,7 +234,7 @@ pub struct NodeKey {
 impl NodeKey {
     /// Build a key from an explicit version and path.
     #[must_use]
-    pub fn new(version: u64, path: NibblePath) -> Self {
+    pub const fn new(version: u64, path: NibblePath) -> Self {
         Self { version, path }
     }
 
@@ -249,7 +249,7 @@ impl NodeKey {
 
     /// Depth of this node measured in bits from the root.
     #[must_use]
-    pub fn depth_bits(&self) -> u16 {
+    pub const fn depth_bits(&self) -> u16 {
         self.path.bits
     }
 
@@ -308,8 +308,8 @@ impl Node {
     #[must_use]
     pub fn hash<H: crate::hasher::Hasher>(&self) -> Hash {
         match self {
-            Node::Internal(n) => n.hash,
-            Node::Leaf(n) => H::hash_leaf(&n.key, &n.value_hash),
+            Self::Internal(n) => n.hash,
+            Self::Leaf(n) => H::hash_leaf(&n.key, &n.value_hash),
         }
     }
 }
@@ -348,7 +348,7 @@ impl InternalNode {
 
     /// Length of the children slot vector (i.e. `ARITY`).
     #[must_use]
-    pub fn arity(&self) -> usize {
+    pub const fn arity(&self) -> usize {
         self.children.len()
     }
 
@@ -393,7 +393,7 @@ pub struct LeafNode {
 impl LeafNode {
     /// Construct a leaf node from its key and value hash.
     #[must_use]
-    pub fn new(key: Key, value_hash: ValueHash) -> Self {
+    pub const fn new(key: Key, value_hash: ValueHash) -> Self {
         Self { key, value_hash }
     }
 }

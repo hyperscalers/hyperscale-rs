@@ -21,7 +21,7 @@ pub struct GetLocalProvisionsResponse {
 impl GetLocalProvisionsResponse {
     /// Build a response carrying `batches` and a list of `missing_hashes`.
     #[must_use]
-    pub fn new(batches: Vec<Provisions>, missing_hashes: Vec<ProvisionHash>) -> Self {
+    pub const fn new(batches: Vec<Provisions>, missing_hashes: Vec<ProvisionHash>) -> Self {
         Self {
             batches,
             missing_hashes,
@@ -30,7 +30,7 @@ impl GetLocalProvisionsResponse {
 
     /// Build an empty response (responder had none of the requested batches).
     #[must_use]
-    pub fn empty() -> Self {
+    pub const fn empty() -> Self {
         Self {
             batches: vec![],
             missing_hashes: vec![],

@@ -97,7 +97,7 @@ impl MemoryStore {
 
     /// Number of recorded stale-node entries pending pruning.
     #[must_use]
-    pub fn stale_count(&self) -> usize {
+    pub const fn stale_count(&self) -> usize {
         self.stale_index.len()
     }
 

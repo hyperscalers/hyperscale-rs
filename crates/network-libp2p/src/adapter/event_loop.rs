@@ -315,10 +315,9 @@ pub(super) async fn run(
 
                 // Handle connection closed — reconnection scheduling + logging
                 if let SwarmEvent::ConnectionClosed { peer_id, cause, num_established, connection_id, .. } = &event {
-                    let cause_str = match &cause {
-                        Some(e) => format!("{e:?}"),
-                        None => "None (graceful)".to_string(),
-                    };
+                    let cause_str = cause
+                        .as_ref()
+                        .map_or_else(|| "None (graceful)".to_string(), |e| format!("{e:?}"));
                     warn!(
                         peer = %peer_id,
                         connection_id = ?connection_id,

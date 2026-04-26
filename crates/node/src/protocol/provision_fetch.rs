@@ -108,7 +108,7 @@ pub struct ProvisionFetchProtocol {
 
 impl ProvisionFetchProtocol {
     /// Create a new provision fetch protocol state machine.
-    pub fn new(config: ProvisionFetchConfig) -> Self {
+    pub const fn new(config: ProvisionFetchConfig) -> Self {
         Self {
             config,
             pending: BTreeMap::new(),

@@ -153,7 +153,7 @@ fn on_verified_remote_header_registers_expectation_for_wave_targeting_local_shar
     let wave = WaveId::new(
         remote_shard,
         BlockHeight(5),
-        [local_shard].into_iter().collect(),
+        std::iter::once(local_shard).collect(),
     );
     coord.on_verified_remote_header(&topology, remote_shard, BlockHeight(5), &[wave]);
 
@@ -172,7 +172,7 @@ fn on_verified_remote_header_ignores_waves_not_targeting_local_shard() {
     let wave = WaveId::new(
         ShardGroupId(99),
         BlockHeight(5),
-        [ShardGroupId(7)].into_iter().collect(),
+        std::iter::once(ShardGroupId(7)).collect(),
     );
     coord.on_verified_remote_header(&topology, ShardGroupId(99), BlockHeight(5), &[wave]);
 

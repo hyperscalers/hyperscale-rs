@@ -28,7 +28,7 @@ pub struct WaveId {
 impl WaveId {
     /// Create a new `WaveId`.
     #[must_use]
-    pub fn new(
+    pub const fn new(
         shard_group_id: ShardGroupId,
         block_height: BlockHeight,
         remote_shards: BTreeSet<ShardGroupId>,

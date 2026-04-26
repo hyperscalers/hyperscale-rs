@@ -26,7 +26,7 @@ struct ReadyEntry {
     added_at: LocalTimestamp,
 }
 
-pub(crate) struct ReadySet {
+pub struct ReadySet {
     ready: BTreeMap<TxHash, ReadyEntry>,
     deferred_by_nodes: HashMap<TxHash, HashSet<NodeId>>,
     txs_deferred_by_node: HashMap<NodeId, HashSet<TxHash>>,
@@ -417,15 +417,17 @@ mod tests {
         let (h, tx) = tx_with(1, &[10]);
         rs.add(h, tx, LocalTimestamp::from_millis(100), &locks);
 
-        let below: Vec<_> = rs
-            .iter_ready(Duration::from_millis(200), LocalTimestamp::from_millis(250))
-            .collect();
-        assert!(below.is_empty());
+        assert!(
+            rs.iter_ready(Duration::from_millis(200), LocalTimestamp::from_millis(250))
+                .next()
+                .is_none()
+        );
 
-        let above: Vec<_> = rs
-            .iter_ready(Duration::from_millis(100), LocalTimestamp::from_millis(250))
-            .collect();
-        assert_eq!(above.len(), 1);
+        assert_eq!(
+            rs.iter_ready(Duration::from_millis(100), LocalTimestamp::from_millis(250))
+                .count(),
+            1
+        );
     }
 
     #[test]

@@ -48,21 +48,21 @@ impl TransferWorkload {
 
     /// Set the cross-shard transaction ratio (0.0 to 1.0).
     #[must_use]
-    pub fn with_cross_shard_ratio(mut self, ratio: f64) -> Self {
+    pub const fn with_cross_shard_ratio(mut self, ratio: f64) -> Self {
         self.cross_shard_ratio = ratio.clamp(0.0, 1.0);
         self
     }
 
     /// Set the account selection mode.
     #[must_use]
-    pub fn with_selection_mode(mut self, mode: SelectionMode) -> Self {
+    pub const fn with_selection_mode(mut self, mode: SelectionMode) -> Self {
         self.selection_mode = mode;
         self
     }
 
     /// Set the transfer amount.
     #[must_use]
-    pub fn with_amount(mut self, amount: Decimal) -> Self {
+    pub const fn with_amount(mut self, amount: Decimal) -> Self {
         self.amount = amount;
         self
     }

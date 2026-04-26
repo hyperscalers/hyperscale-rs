@@ -65,7 +65,7 @@ struct ExpectedEntry {
 /// `Action::RequestMissingExecutionCert`. The tracker doesn't know about
 /// topology or peers — the coordinator attaches those.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct FallbackFetch {
+pub struct FallbackFetch {
     pub source_shard: ShardGroupId,
     pub block_height: BlockHeight,
     pub wave_id: WaveId,
@@ -75,7 +75,7 @@ pub(crate) struct FallbackFetch {
     pub is_retry: bool,
 }
 
-pub(crate) struct ExpectedCertTracker {
+pub struct ExpectedCertTracker {
     expected: HashMap<ExpectedCertKey, ExpectedEntry>,
     fulfilled: HashMap<ExpectedCertKey, WeightedTimestamp>,
 }
@@ -209,7 +209,7 @@ mod tests {
         WaveId {
             shard_group_id: ShardGroupId(1),
             block_height: BlockHeight(height),
-            remote_shards: [ShardGroupId(0)].into_iter().collect(),
+            remote_shards: std::iter::once(ShardGroupId(0)).collect(),
         }
     }
 
@@ -235,7 +235,7 @@ mod tests {
         // Second register at a later timestamp; discovery timestamp must
         // stick to the earlier value, otherwise the fallback deadline gets
         // perpetually pushed out.
-        t.register(ShardGroupId(1), BlockHeight(5), w.clone(), ms(9999));
+        t.register(ShardGroupId(1), BlockHeight(5), w, ms(9999));
         let fetches = t.check_timeouts(ms(1000 + 5_000));
         assert_eq!(fetches.len(), 1, "deadline anchors on first register");
     }
@@ -276,7 +276,7 @@ mod tests {
     fn check_timeouts_fires_after_initial_window_and_records_request_ts() {
         let mut t = ExpectedCertTracker::new();
         let w = wave(5);
-        t.register(ShardGroupId(1), BlockHeight(5), w.clone(), ms(1_000));
+        t.register(ShardGroupId(1), BlockHeight(5), w, ms(1_000));
 
         // Just before the deadline: no fetch.
         let fetches = t.check_timeouts(ms(1_000 + 4_999));
@@ -292,7 +292,7 @@ mod tests {
     fn check_timeouts_respects_retry_interval_after_first_request() {
         let mut t = ExpectedCertTracker::new();
         let w = wave(5);
-        t.register(ShardGroupId(1), BlockHeight(5), w.clone(), ms(0));
+        t.register(ShardGroupId(1), BlockHeight(5), w, ms(0));
 
         // First fetch fires.
         let _ = t.check_timeouts(ms(5_000));
@@ -314,7 +314,7 @@ mod tests {
         t.register(ShardGroupId(1), BlockHeight(5), w1.clone(), ms(0));
         t.register(ShardGroupId(2), BlockHeight(6), w2.clone(), ms(0));
 
-        let needed: HashSet<ShardGroupId> = [ShardGroupId(1)].into_iter().collect();
+        let needed: HashSet<ShardGroupId> = std::iter::once(ShardGroupId(1)).collect();
         t.retain_if_shard_needed(&needed);
 
         assert!(t.is_expected(ShardGroupId(1), BlockHeight(5), &w1));

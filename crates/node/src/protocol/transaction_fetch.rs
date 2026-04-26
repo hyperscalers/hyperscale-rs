@@ -155,7 +155,7 @@ impl BlockFetchState {
         self.in_flight_count = self.in_flight_count.saturating_sub(1);
     }
 
-    fn mark_fetch_complete(&mut self) {
+    const fn mark_fetch_complete(&mut self) {
         self.in_flight_count = self.in_flight_count.saturating_sub(1);
     }
 
@@ -184,7 +184,7 @@ pub struct TransactionFetchProtocol {
 
 impl TransactionFetchProtocol {
     /// Create a new fetch protocol state machine.
-    pub fn new(config: TransactionFetchConfig) -> Self {
+    pub const fn new(config: TransactionFetchConfig) -> Self {
         Self {
             config,
             tx_fetches: BTreeMap::new(),
@@ -435,7 +435,7 @@ mod tests {
         protocol.handle(TransactionFetchInput::RequestTransactions {
             block_hash,
             proposer: ValidatorId(1),
-            tx_hashes: hashes.clone(),
+            tx_hashes: hashes,
         });
 
         // Tick should emit FetchTransactions

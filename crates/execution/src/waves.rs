@@ -49,7 +49,7 @@ use crate::wave_state::WaveState;
 /// leader. Must exceed typical wave-leader aggregation latency so we don't
 /// rotate past a leader that's about to succeed. Measured against the
 /// BFT-authenticated `weighted_timestamp_ms` of locally committed blocks.
-pub(crate) const VOTE_RETRY_TIMEOUT: Duration = Duration::from_secs(8);
+pub const VOTE_RETRY_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Tracks a pending vote sent to a wave leader, for retry on timeout.
 ///
@@ -58,7 +58,7 @@ pub(crate) const VOTE_RETRY_TIMEOUT: Duration = Duration::from_secs(8);
 /// waves that haven't resolved yet (including timeout-abort waves, which
 /// still need a leader to aggregate the timeout votes).
 #[derive(Debug, Clone)]
-pub(crate) struct PendingVoteRetry {
+pub struct PendingVoteRetry {
     /// Local weighted timestamp when this vote was last dispatched.
     /// Compared against `committed_ts` to detect leader aggregation
     /// timeouts independently of block production rate.
@@ -75,7 +75,7 @@ pub(crate) struct PendingVoteRetry {
 /// `Action::SignAndSendExecutionVote` by resolving the rotated leader via
 /// topology.
 #[derive(Debug, Clone)]
-pub(crate) struct RetryEffect {
+pub struct RetryEffect {
     pub wave_id: WaveId,
     pub attempt: Attempt,
     pub block_hash: BlockHash,
@@ -92,7 +92,7 @@ pub(crate) struct RetryEffect {
 /// early-arrival buffer. `unrouted_tx_hashes` have no local wave yet —
 /// they're buffered for replay when their blocks commit.
 #[derive(Debug, Default, Clone)]
-pub(crate) struct AttestationRouting {
+pub struct AttestationRouting {
     pub affected_waves: BTreeSet<WaveId>,
     pub routed_tx_hashes: Vec<TxHash>,
     pub unrouted_tx_hashes: Vec<TxHash>,
@@ -101,13 +101,13 @@ pub(crate) struct AttestationRouting {
 /// Counts returned by [`WaveRegistry::prune_resolved`] so the coordinator
 /// can fold in its own early-vote pruning before the final log line.
 #[derive(Debug, Default, Clone, Copy)]
-pub(crate) struct PruneCounts {
+pub struct PruneCounts {
     pub waves: usize,
     pub trackers: usize,
     pub assignments: usize,
 }
 
-pub(crate) struct WaveRegistry {
+pub struct WaveRegistry {
     /// Per-wave state. The authoritative "wave exists" signal; every other
     /// field is keyed off this presence.
     states: HashMap<WaveId, WaveState>,
@@ -526,7 +526,7 @@ mod tests {
     fn check_vote_retry_timeouts_fires_after_window_and_bumps_attempt() {
         let mut r = WaveRegistry::new();
         let wid = wave(1);
-        r.record_vote_retry(wid.clone(), make_retry(ms(0)));
+        r.record_vote_retry(wid, make_retry(ms(0)));
 
         let timeout_ms = u64::try_from(VOTE_RETRY_TIMEOUT.as_millis()).unwrap_or(u64::MAX);
         // Before the window: no effect.
@@ -629,7 +629,7 @@ mod tests {
             wid1.clone(),
             make_wave_state(wid1.clone(), BlockHash::ZERO, 1),
         );
-        r.assign_tx(TxHash::from_raw(Hash::from_bytes(b"a")), wid1.clone());
+        r.assign_tx(TxHash::from_raw(Hash::from_bytes(b"a")), wid1);
         r.assign_tx(TxHash::from_raw(Hash::from_bytes(b"dangling")), wid_gone);
 
         let counts = r.prune_resolved();

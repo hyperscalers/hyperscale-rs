@@ -58,13 +58,13 @@ pub fn bls_keypair_from_seed(seed: &[u8; 32]) -> Bls12381G1PrivateKey {
 
 /// Create a zero/placeholder Ed25519 signature for testing.
 #[must_use]
-pub fn zero_ed25519_signature() -> Ed25519Signature {
+pub const fn zero_ed25519_signature() -> Ed25519Signature {
     Ed25519Signature([0u8; 64])
 }
 
 /// Create a zero/placeholder BLS signature for testing.
 #[must_use]
-pub fn zero_bls_signature() -> Bls12381G2Signature {
+pub const fn zero_bls_signature() -> Bls12381G2Signature {
     Bls12381G2Signature([0u8; 96])
 }
 

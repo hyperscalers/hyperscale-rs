@@ -124,7 +124,7 @@ impl TestCommittee {
 
     /// Get the number of validators in the committee.
     #[must_use]
-    pub fn size(&self) -> usize {
+    pub const fn size(&self) -> usize {
         self.keypairs.len()
     }
 
@@ -174,7 +174,7 @@ impl TestCommittee {
     ///
     /// For a committee of size n, quorum is ceil(2n/3) + 1.
     #[must_use]
-    pub fn quorum_threshold(&self) -> usize {
+    pub const fn quorum_threshold(&self) -> usize {
         (self.size() * 2 / 3) + 1
     }
 
@@ -210,7 +210,7 @@ impl TestCommittee {
 /// is `Round::INITIAL`, and there are no wave roots or provisions. Callers
 /// pass only the bits that vary between tests.
 #[must_use]
-pub fn make_live_block(
+pub const fn make_live_block(
     shard_group_id: ShardGroupId,
     height: BlockHeight,
     timestamp_ms: u64,
@@ -245,9 +245,10 @@ pub fn make_live_block(
 }
 
 /// Pair a block with a minimal valid `QuorumCertificate` so it satisfies
-/// the `CertifiedBlock` pairing invariant. `weighted_timestamp_ms` stamps
-/// the BFT-authenticated time anchor; pass `0` when retention-window
-/// behavior doesn't matter.
+/// the `CertifiedBlock` pairing invariant.
+///
+/// `weighted_timestamp_ms` stamps the BFT-authenticated time anchor; pass
+/// `0` when retention-window behavior doesn't matter.
 #[must_use]
 pub fn certify(block: Block, weighted_timestamp_ms: u64) -> CertifiedBlock {
     let qc = QuorumCertificate {
@@ -258,9 +259,10 @@ pub fn certify(block: Block, weighted_timestamp_ms: u64) -> CertifiedBlock {
     CertifiedBlock::new_unchecked(block, qc)
 }
 
-/// Build a minimal `FinalizedWave` carrying a single tx decision. The wave
-/// is anchored on `ShardGroupId(0)` with `block_height` as its identity
-/// and no remote shard dependencies — sufficient for driving
+/// Build a minimal `FinalizedWave` carrying a single tx decision.
+///
+/// The wave is anchored on `ShardGroupId(0)` with `block_height` as its
+/// identity and no remote shard dependencies — sufficient for driving
 /// `on_block_committed` when tests only care about tx-terminal-state side
 /// effects. The inner EC carries a zeroed BLS signature and a 4-seat
 /// signer bitfield, so callers should not feed the result through

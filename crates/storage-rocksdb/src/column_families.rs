@@ -14,7 +14,7 @@ use hyperscale_types::{
 // ─── CF name constants ───────────────────────────────────────────────────────
 
 /// Column family name for the default CF (chain metadata, JMT metadata).
-pub(crate) const DEFAULT_CF: &str = "default";
+pub const DEFAULT_CF: &str = "default";
 
 /// Column family name for substate data. Stores the current value per
 /// unversioned `(partition_key, sort_key)`. History for recent writes
@@ -23,32 +23,32 @@ pub(crate) const DEFAULT_CF: &str = "default";
 /// direct point lookup; historical reads at version V seek the smallest
 /// state-history entry for the key with `write_version > V` and return
 /// its prior value.
-pub(crate) const STATE_CF: &str = "state";
+pub const STATE_CF: &str = "state";
 
 /// Column family name for the per-write state-history log used by
 /// historical reads.
 /// Key: `((partition_key, sort_key), write_version)`; value: the prior
 /// value at that key immediately before the write at `write_version`.
 /// A `None` value means "key was absent before the write."
-pub(crate) const STATE_HISTORY_CF: &str = "state_history";
+pub const STATE_HISTORY_CF: &str = "state_history";
 
 /// Column family name for block metadata (header + manifest) keyed by height.
-pub(crate) const BLOCKS_CF: &str = "blocks";
+pub const BLOCKS_CF: &str = "blocks";
 
 /// Column family name for transactions keyed by hash.
-pub(crate) const TRANSACTIONS_CF: &str = "transactions";
+pub const TRANSACTIONS_CF: &str = "transactions";
 
 /// Column family name for wave certificates keyed by hash.
-pub(crate) const CERTIFICATES_CF: &str = "certificates";
+pub const CERTIFICATES_CF: &str = "certificates";
 
 /// Column family name for JMT tree nodes.
-pub(crate) const JMT_NODES_CF: &str = "jmt_nodes";
+pub const JMT_NODES_CF: &str = "jmt_nodes";
 
 /// Column family for stale JMT nodes pending garbage collection.
 /// Key: `version_BE_8B` (the version at which nodes became stale).
 /// Value: SBOR-encoded `Vec<StaleTreePart>`.
 /// GC deletes entries older than `current_version - jmt_history_length`.
-pub(crate) const STALE_JMT_NODES_CF: &str = "stale_jmt_nodes";
+pub const STALE_JMT_NODES_CF: &str = "stale_jmt_nodes";
 
 /// Column family indexing `state_history` entries by their write version so
 /// GC can delete retention-expired history without scanning the whole
@@ -63,30 +63,30 @@ pub(crate) const STALE_JMT_NODES_CF: &str = "stale_jmt_nodes";
 /// version order (cheap — version-keyed), breaks at `version >= cutoff`, and
 /// issues one `delete_cf` per listed history key plus one for the stale-set
 /// entry itself. Mirrors the `stale_jmt_nodes` pattern.
-pub(crate) const STALE_STATE_HISTORY_CF: &str = "stale_state_history";
+pub const STALE_STATE_HISTORY_CF: &str = "stale_state_history";
 
 /// Column family name for local receipts keyed by tx hash.
-pub(crate) const LOCAL_RECEIPTS_CF: &str = "local_receipts";
+pub const LOCAL_RECEIPTS_CF: &str = "local_receipts";
 
 /// Column family name for execution output details keyed by tx hash.
-pub(crate) const EXECUTION_OUTPUTS_CF: &str = "execution_outputs";
+pub const EXECUTION_OUTPUTS_CF: &str = "execution_outputs";
 
 /// Column family for execution certificates keyed by canonical hash.
-pub(crate) const EXECUTION_CERTS_CF: &str = "execution_certs";
+pub const EXECUTION_CERTS_CF: &str = "execution_certs";
 
 /// Column family for execution certificate height index.
 /// Key: `block_height_BE_8B ++ canonical_hash_32B`, Value: `()`.
-pub(crate) const EXECUTION_CERTS_BY_HEIGHT_CF: &str = "execution_certs_by_height";
+pub const EXECUTION_CERTS_BY_HEIGHT_CF: &str = "execution_certs_by_height";
 
 // Default-CF metadata keys are defined as MetadataEntry types in typed_cf.rs.
 // See CommittedHeightEntry, CommittedHashEntry, CommittedQcEntry, JmtMetadataEntry.
 
 /// CFs with high write throughput — get larger write buffers and tiered compression.
 /// State, state-history log, and JMT nodes are updated on every block commit.
-pub(crate) const HOT_WRITE_COLUMN_FAMILIES: &[&str] = &[STATE_CF, STATE_HISTORY_CF, JMT_NODES_CF];
+pub const HOT_WRITE_COLUMN_FAMILIES: &[&str] = &[STATE_CF, STATE_HISTORY_CF, JMT_NODES_CF];
 
 /// All column families used by the storage layer.
-pub(crate) const ALL_COLUMN_FAMILIES: &[&str] = &[
+pub const ALL_COLUMN_FAMILIES: &[&str] = &[
     DEFAULT_CF,
     BLOCKS_CF,
     TRANSACTIONS_CF,
@@ -110,7 +110,7 @@ pub(crate) const ALL_COLUMN_FAMILIES: &[&str] = &[
 /// `.cf_handle(NAME).expect(...)`. Cheap to construct (`HashMap` lookups only).
 /// Column family handles — fields are private, access only through
 /// [`TypedCf::handle()`](crate::typed_cf::TypedCf::handle).
-pub(crate) struct CfHandles<'a> {
+pub struct CfHandles<'a> {
     state: &'a rocksdb::ColumnFamily,
     state_history: &'a rocksdb::ColumnFamily,
     stale_state_history: &'a rocksdb::ColumnFamily,
@@ -156,7 +156,7 @@ impl<'a> CfHandles<'a> {
 
 // Block / Transaction storage
 
-pub(crate) struct BlocksCf;
+pub struct BlocksCf;
 impl TypedCf for BlocksCf {
     const NAME: &'static str = BLOCKS_CF;
     type Key = u64; // block height
@@ -168,7 +168,7 @@ impl TypedCf for BlocksCf {
     }
 }
 
-pub(crate) struct TransactionsCf;
+pub struct TransactionsCf;
 impl TypedCf for TransactionsCf {
     const NAME: &'static str = TRANSACTIONS_CF;
     type Key = Hash;
@@ -180,7 +180,7 @@ impl TypedCf for TransactionsCf {
     }
 }
 
-pub(crate) struct CertificatesCf;
+pub struct CertificatesCf;
 impl TypedCf for CertificatesCf {
     const NAME: &'static str = CERTIFICATES_CF;
     type Key = Hash;
@@ -194,7 +194,7 @@ impl TypedCf for CertificatesCf {
 
 // JMT
 
-pub(crate) struct JmtNodesCf;
+pub struct JmtNodesCf;
 impl TypedCf for JmtNodesCf {
     const NAME: &'static str = JMT_NODES_CF;
     type Key = StoredNodeKey;
@@ -206,7 +206,7 @@ impl TypedCf for JmtNodesCf {
     }
 }
 
-pub(crate) struct StaleJmtNodesCf;
+pub struct StaleJmtNodesCf;
 impl TypedCf for StaleJmtNodesCf {
     const NAME: &'static str = STALE_JMT_NODES_CF;
     type Key = u64; // version at which nodes became stale
@@ -222,7 +222,7 @@ impl TypedCf for StaleJmtNodesCf {
 /// Enables incremental GC of `state_history` — GC walks this CF in version
 /// order, deletes the listed history keys for each version ≤ cutoff, and
 /// drops the stale-set entry itself. No full `state_history` scan.
-pub(crate) struct StaleStateHistoryCf;
+pub struct StaleStateHistoryCf;
 impl TypedCf for StaleStateHistoryCf {
     const NAME: &'static str = STALE_STATE_HISTORY_CF;
     type Key = u64; // write_version
@@ -244,7 +244,7 @@ impl TypedCf for StaleStateHistoryCf {
 // Current reads are direct point lookups. Historical reads at version V
 // go through the companion `StateHistoryCf`: seek the smallest history
 // entry for K with `write_version > V` and return its stored prior value.
-pub(crate) struct StateCf;
+pub struct StateCf;
 impl TypedCf for StateCf {
     const NAME: &'static str = STATE_CF;
     type Key = (
@@ -275,7 +275,7 @@ impl TypedCf for StateCf {
 // Read-only: historical reads reconstruct the value-at-V by seeking the
 // smallest entry for K with `v' > V`. Nothing ever mutates `StateCf`
 // from this log.
-pub(crate) struct StateHistoryCf;
+pub struct StateHistoryCf;
 impl TypedCf for StateHistoryCf {
     const NAME: &'static str = STATE_HISTORY_CF;
     type Key = (
@@ -295,7 +295,7 @@ impl TypedCf for StateHistoryCf {
 
 // Receipts
 
-pub(crate) struct LocalReceiptsCf;
+pub struct LocalReceiptsCf;
 impl TypedCf for LocalReceiptsCf {
     const NAME: &'static str = LOCAL_RECEIPTS_CF;
     type Key = Hash;
@@ -307,7 +307,7 @@ impl TypedCf for LocalReceiptsCf {
     }
 }
 
-pub(crate) struct ExecutionOutputsCf;
+pub struct ExecutionOutputsCf;
 impl TypedCf for ExecutionOutputsCf {
     const NAME: &'static str = EXECUTION_OUTPUTS_CF;
     type Key = Hash;
@@ -321,7 +321,7 @@ impl TypedCf for ExecutionOutputsCf {
 
 // Execution Certificates
 
-pub(crate) struct ExecutionCertsCf;
+pub struct ExecutionCertsCf;
 impl TypedCf for ExecutionCertsCf {
     const NAME: &'static str = EXECUTION_CERTS_CF;
     type Key = Hash; // canonical hash
@@ -335,7 +335,7 @@ impl TypedCf for ExecutionCertsCf {
 
 /// Height index for execution certificates.
 /// Key: `(block_height, canonical_hash)`, Value: `()`.
-pub(crate) struct ExecutionCertsByHeightCf;
+pub struct ExecutionCertsByHeightCf;
 impl TypedCf for ExecutionCertsByHeightCf {
     const NAME: &'static str = EXECUTION_CERTS_BY_HEIGHT_CF;
     type Key = (u64, Hash); // (block_height, canonical_hash)
@@ -350,7 +350,7 @@ impl TypedCf for ExecutionCertsByHeightCf {
 /// Codec for `(u64, Hash)` composite key: `height_BE_8B ++ hash_32B`.
 /// Big-endian height ensures lexicographic ordering by height.
 #[derive(Default)]
-pub(crate) struct HeightHashCodec;
+pub struct HeightHashCodec;
 
 impl DbCodec<(u64, Hash)> for HeightHashCodec {
     fn encode_to(&self, value: &(u64, Hash), buf: &mut Vec<u8>) {
@@ -368,7 +368,7 @@ impl DbCodec<(u64, Hash)> for HeightHashCodec {
 
 /// Codec for `()` — empty value.
 #[derive(Default)]
-pub(crate) struct UnitCodec;
+pub struct UnitCodec;
 
 impl DbCodec<()> for UnitCodec {
     fn encode_to(&self, _value: &(), _buf: &mut Vec<u8>) {}

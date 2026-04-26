@@ -11,7 +11,7 @@ use std::marker::PhantomData;
 // ─── Codec trait ──────────────────────────────────────────────────────────────
 
 /// Codec for encoding/decoding typed values to/from `RocksDB` byte representations.
-pub(crate) trait DbCodec<T> {
+pub trait DbCodec<T> {
     fn encode_to(&self, value: &T, buf: &mut Vec<u8>);
     fn decode(&self, bytes: &[u8]) -> T;
 
@@ -26,7 +26,7 @@ pub(crate) trait DbCodec<T> {
 // ─── Codec implementations ───────────────────────────────────────────────────
 
 /// SBOR encode/decode. Covers most types in the codebase.
-pub(crate) struct SborCodec<T>(PhantomData<T>);
+pub struct SborCodec<T>(PhantomData<T>);
 
 impl<T> Default for SborCodec<T> {
     fn default() -> Self {
@@ -52,7 +52,7 @@ where
 /// Big-endian u64 codec for heights, versions, etc.
 /// Preserves lexicographic ordering in `RocksDB`.
 #[derive(Default)]
-pub(crate) struct BeU64Codec;
+pub struct BeU64Codec;
 
 impl DbCodec<u64> for BeU64Codec {
     fn encode_to(&self, value: &u64, buf: &mut Vec<u8>) {
@@ -66,7 +66,7 @@ impl DbCodec<u64> for BeU64Codec {
 
 /// 32-byte hash codec.
 #[derive(Default)]
-pub(crate) struct HashCodec;
+pub struct HashCodec;
 
 impl DbCodec<hyperscale_types::Hash> for HashCodec {
     fn encode_to(&self, value: &hyperscale_types::Hash, buf: &mut Vec<u8>) {
@@ -80,7 +80,7 @@ impl DbCodec<hyperscale_types::Hash> for HashCodec {
 
 /// Raw passthrough — value is already `Vec<u8>`.
 #[derive(Default)]
-pub(crate) struct RawCodec;
+pub struct RawCodec;
 
 impl DbCodec<Vec<u8>> for RawCodec {
     fn encode_to(&self, value: &Vec<u8>, buf: &mut Vec<u8>) {
@@ -94,7 +94,7 @@ impl DbCodec<Vec<u8>> for RawCodec {
 
 /// JMT node key codec — wraps the existing `encode_key` function.
 #[derive(Default)]
-pub(crate) struct JmtKeyCodec;
+pub struct JmtKeyCodec;
 
 impl DbCodec<crate::jmt_stored::StoredNodeKey> for JmtKeyCodec {
     fn encode_to(&self, value: &crate::jmt_stored::StoredNodeKey, buf: &mut Vec<u8>) {
@@ -116,7 +116,7 @@ impl DbCodec<crate::jmt_stored::StoredNodeKey> for JmtKeyCodec {
 /// Each CF is a zero-sized struct that declares the key/value types and their
 /// codecs. This is the single source of truth for "what lives in this CF and
 /// how it's encoded."
-pub(crate) trait TypedCf {
+pub trait TypedCf {
     /// CF name — must match the string used in `RocksDbConfig`.
     /// Not read at runtime by typed helpers (they use [`handle`](Self::handle)),
     /// but serves as documentation and is used by `ALL_COLUMN_FAMILIES`.
@@ -147,7 +147,7 @@ pub(crate) trait TypedCf {
 /// Both `DB` and `Snapshot` support the same `get_cf` / `multi_get_cf` operations
 /// but don't share a trait in the `rocksdb` crate. This trait bridges that gap
 /// so typed read functions work with either backend.
-pub(crate) trait ReadableStore {
+pub trait ReadableStore {
     fn raw_get_cf(&self, cf: &ColumnFamily, key: &[u8]) -> Option<Vec<u8>>;
     fn raw_multi_get_cf(&self, keys: Vec<(&ColumnFamily, Vec<u8>)>) -> Vec<Option<Vec<u8>>>;
     /// Read from the default column family (no CF handle needed).
@@ -197,7 +197,7 @@ impl ReadableStore for rocksdb::Snapshot<'_> {
 // The RocksDbStorage methods become thin wrappers over these.
 
 /// Typed get from any readable store.
-pub(crate) fn get<CF: TypedCf>(
+pub fn get<CF: TypedCf>(
     store: &impl ReadableStore,
     cf: &ColumnFamily,
     key: &CF::Key,
@@ -209,7 +209,7 @@ pub(crate) fn get<CF: TypedCf>(
 }
 
 /// Typed multi-get from any readable store.
-pub(crate) fn multi_get<CF: TypedCf>(
+pub fn multi_get<CF: TypedCf>(
     store: &impl ReadableStore,
     cf: &ColumnFamily,
     keys: &[CF::Key],
@@ -225,7 +225,7 @@ pub(crate) fn multi_get<CF: TypedCf>(
 }
 
 /// Typed put into a `WriteBatch`.
-pub(crate) fn batch_put<CF: TypedCf>(
+pub fn batch_put<CF: TypedCf>(
     batch: &mut WriteBatch,
     cf: &ColumnFamily,
     key: &CF::Key,
@@ -237,7 +237,7 @@ pub(crate) fn batch_put<CF: TypedCf>(
 }
 
 /// Typed put into a `WriteBatch`, using pre-serialized value bytes if available.
-pub(crate) fn batch_put_raw<CF: TypedCf>(
+pub fn batch_put_raw<CF: TypedCf>(
     batch: &mut WriteBatch,
     cf: &ColumnFamily,
     key: &CF::Key,
@@ -254,7 +254,7 @@ pub(crate) fn batch_put_raw<CF: TypedCf>(
 }
 
 /// Typed delete in a `WriteBatch`.
-pub(crate) fn batch_delete<CF: TypedCf>(batch: &mut WriteBatch, cf: &ColumnFamily, key: &CF::Key) {
+pub fn batch_delete<CF: TypedCf>(batch: &mut WriteBatch, cf: &ColumnFamily, key: &CF::Key) {
     let key_bytes = CF::KeyCodec::default().encode(key);
     batch.delete_cf(cf, &key_bytes);
 }
@@ -269,7 +269,7 @@ pub(crate) fn batch_delete<CF: TypedCf>(batch: &mut WriteBatch, cf: &ColumnFamil
 ///
 /// Iterates all entries from the beginning, decoding each key/value through
 /// the CF's codecs. Use for small or bounded CFs (votes, stale JMT nodes).
-pub(crate) fn iter_all<'a, CF: TypedCf>(
+pub fn iter_all<'a, CF: TypedCf>(
     db: &'a rocksdb::DB,
     cf: &ColumnFamily,
 ) -> impl Iterator<Item = (CF::Key, CF::Value)> + 'a {
@@ -283,7 +283,7 @@ pub(crate) fn iter_all<'a, CF: TypedCf>(
 /// Seeks to `prefix` and yields decoded entries until the key leaves the
 /// prefix range. The end bound is computed by incrementing the last byte
 /// of the prefix (standard `RocksDB` prefix scan pattern).
-pub(crate) fn prefix_iter<'a, CF: TypedCf>(
+pub fn prefix_iter<'a, CF: TypedCf>(
     db: &'a rocksdb::DB,
     cf: &ColumnFamily,
     prefix: &[u8],
@@ -295,7 +295,7 @@ pub(crate) fn prefix_iter<'a, CF: TypedCf>(
 ///
 /// Like [`prefix_iter`], but seeks to `start` instead of the prefix.
 /// `start` must be >= `prefix`. The end bound is still `next_prefix(prefix)`.
-pub(crate) fn prefix_iter_from<'a, CF: TypedCf>(
+pub fn prefix_iter_from<'a, CF: TypedCf>(
     db: &'a rocksdb::DB,
     cf: &ColumnFamily,
     prefix: &[u8],
@@ -310,7 +310,7 @@ pub(crate) fn prefix_iter_from<'a, CF: TypedCf>(
 /// Typed prefix-scan iterator over a `RocksDB` snapshot.
 ///
 /// Same as [`prefix_iter`] but reads from a point-in-time snapshot.
-pub(crate) fn prefix_iter_snap<'a, CF: TypedCf>(
+pub fn prefix_iter_snap<'a, CF: TypedCf>(
     snapshot: &'a rocksdb::Snapshot<'_>,
     cf: &ColumnFamily,
     prefix: &[u8],
@@ -319,7 +319,7 @@ pub(crate) fn prefix_iter_snap<'a, CF: TypedCf>(
 }
 
 /// Typed prefix-scan iterator over a `RocksDB` snapshot with custom seek position.
-pub(crate) fn prefix_iter_from_snap<'a, CF: TypedCf>(
+pub fn prefix_iter_from_snap<'a, CF: TypedCf>(
     snapshot: &'a rocksdb::Snapshot<'_>,
     cf: &ColumnFamily,
     prefix: &[u8],
@@ -422,7 +422,7 @@ fn next_prefix(prefix: &[u8]) -> Option<Vec<u8>> {
 /// Each entry is a zero-sized struct that declares the key bytes, value type,
 /// and codec. This gives the same compile-time key↔type binding as `TypedCf`
 /// but for the heterogeneous default CF.
-pub(crate) trait MetadataEntry {
+pub trait MetadataEntry {
     /// The well-known byte key in the default CF.
     const KEY: &'static [u8];
     /// The value type stored under this key.
@@ -432,14 +432,14 @@ pub(crate) trait MetadataEntry {
 }
 
 /// Read a metadata entry from any readable store.
-pub(crate) fn meta_read<E: MetadataEntry>(store: &impl ReadableStore) -> Option<E::Value> {
+pub fn meta_read<E: MetadataEntry>(store: &impl ReadableStore) -> Option<E::Value> {
     store
         .raw_get(E::KEY)
         .map(|bytes| E::Codec::default().decode(&bytes))
 }
 
 /// Write a metadata entry into a `WriteBatch`.
-pub(crate) fn meta_write<E: MetadataEntry>(batch: &mut WriteBatch, value: &E::Value) {
+pub fn meta_write<E: MetadataEntry>(batch: &mut WriteBatch, value: &E::Value) {
     let encoded = E::Codec::default().encode(value);
     batch.put(E::KEY, encoded);
 }
@@ -448,7 +448,7 @@ pub(crate) fn meta_write<E: MetadataEntry>(batch: &mut WriteBatch, value: &E::Va
 
 /// `BlockHeight` codec — wraps BE u64, maps through `BlockHeight(u64)`.
 #[derive(Default)]
-pub(crate) struct BlockHeightCodec;
+pub struct BlockHeightCodec;
 
 impl DbCodec<BlockHeight> for BlockHeightCodec {
     fn encode_to(&self, value: &BlockHeight, buf: &mut Vec<u8>) {
@@ -463,7 +463,7 @@ impl DbCodec<BlockHeight> for BlockHeightCodec {
 
 /// JMT metadata codec — packed 40-byte format: `[version_BE_8B][root_hash_32B]`.
 #[derive(Default)]
-pub(crate) struct JmtMetadataCodec;
+pub struct JmtMetadataCodec;
 
 impl DbCodec<(u64, hyperscale_types::StateRoot)> for JmtMetadataCodec {
     fn encode_to(&self, value: &(u64, hyperscale_types::StateRoot), buf: &mut Vec<u8>) {
@@ -483,28 +483,28 @@ impl DbCodec<(u64, hyperscale_types::StateRoot)> for JmtMetadataCodec {
 
 // ─── Metadata entry definitions ──────────────────────────────────────────────
 
-pub(crate) struct CommittedHeightEntry;
+pub struct CommittedHeightEntry;
 impl MetadataEntry for CommittedHeightEntry {
     const KEY: &'static [u8] = b"chain:committed_height";
     type Value = BlockHeight;
     type Codec = BlockHeightCodec;
 }
 
-pub(crate) struct CommittedHashEntry;
+pub struct CommittedHashEntry;
 impl MetadataEntry for CommittedHashEntry {
     const KEY: &'static [u8] = b"chain:committed_hash";
     type Value = hyperscale_types::Hash;
     type Codec = HashCodec;
 }
 
-pub(crate) struct CommittedQcEntry;
+pub struct CommittedQcEntry;
 impl MetadataEntry for CommittedQcEntry {
     const KEY: &'static [u8] = b"chain:committed_qc";
     type Value = hyperscale_types::QuorumCertificate;
     type Codec = SborCodec<hyperscale_types::QuorumCertificate>;
 }
 
-pub(crate) struct JmtMetadataEntry;
+pub struct JmtMetadataEntry;
 impl MetadataEntry for JmtMetadataEntry {
     const KEY: &'static [u8] = b"jmt:metadata";
     type Value = (u64, hyperscale_types::StateRoot);

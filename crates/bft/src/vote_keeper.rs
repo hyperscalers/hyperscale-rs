@@ -32,7 +32,7 @@ pub use crate::vote_set::VoteSet;
 /// Owns the per-block [`VoteSet`]s, the validator's own-vote locks (preventing
 /// same-height re-voting across rounds when locked), and the received-vote
 /// record used for equivocation detection.
-pub(crate) struct VoteKeeper {
+pub struct VoteKeeper {
     /// Vote sets for blocks being voted on (`block_hash` -> vote set).
     pub(crate) vote_sets: HashMap<BlockHash, VoteSet>,
 
@@ -139,7 +139,7 @@ impl VoteKeeper {
 
     /// Read-only view of own-vote locks, for callers that need to iterate
     /// (e.g., QC-based unlock iterates all heights ≤ qc.height).
-    pub fn voted_heights(&self) -> &HashMap<BlockHeight, (BlockHash, Round)> {
+    pub const fn voted_heights(&self) -> &HashMap<BlockHeight, (BlockHash, Round)> {
         &self.voted_heights
     }
 
@@ -402,7 +402,7 @@ impl VoteKeeper {
 
 /// Result of `VoteKeeper::lock_decision`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LockDecision {
+pub enum LockDecision {
     /// No vote recorded at this height — caller may vote.
     Unlocked,
     /// Already voted for the same block at this height; caller should not
@@ -417,7 +417,7 @@ pub(crate) enum LockDecision {
 
 /// Result of `VoteKeeper::record_received_vote`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RecordResult {
+pub enum RecordResult {
     /// Vote was accepted and recorded (first vote or legitimate later-round
     /// revote).
     Accepted,

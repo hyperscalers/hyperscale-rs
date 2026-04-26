@@ -18,7 +18,7 @@ use tracing::warn;
 /// `K = 2` provides redundancy: if the primary next proposer crashes before
 /// broadcasting its block, the secondary already has the votes and can form
 /// the QC on view change without re-collection.
-pub(crate) fn vote_recipients(
+pub fn vote_recipients(
     topology: &TopologySnapshot,
     height: BlockHeight,
     round: Round,
@@ -56,9 +56,7 @@ pub(crate) fn vote_recipients(
 ///
 /// Returns `None` if any committee index fails to resolve to a public key
 /// — a topology corruption indicating the snapshot is unsafe to use.
-pub(crate) fn committee_public_keys(
-    topology: &TopologySnapshot,
-) -> Option<Vec<Bls12381G1PublicKey>> {
+pub fn committee_public_keys(topology: &TopologySnapshot) -> Option<Vec<Bls12381G1PublicKey>> {
     let committee_size = topology.local_committee_size();
     let mut pubkeys = Vec::with_capacity(committee_size);
 

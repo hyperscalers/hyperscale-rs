@@ -45,7 +45,7 @@ fn account(kp: &Ed25519PrivateKey) -> ComponentAddress {
     ComponentAddress::preallocated_account_from_public_key(&kp.public_key())
 }
 
-fn network() -> NetworkDefinition {
+const fn network() -> NetworkDefinition {
     NetworkDefinition::simulator()
 }
 

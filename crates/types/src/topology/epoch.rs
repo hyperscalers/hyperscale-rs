@@ -17,19 +17,19 @@ pub struct EpochId(pub u64);
 
 impl EpochId {
     /// Genesis epoch.
-    pub const GENESIS: Self = EpochId(0);
+    pub const GENESIS: Self = Self(0);
 
     /// Get the next epoch.
     #[must_use]
-    pub fn next(self) -> Self {
-        EpochId(self.0 + 1)
+    pub const fn next(self) -> Self {
+        Self(self.0 + 1)
     }
 
     /// Get the previous epoch (returns None if at genesis).
     #[must_use]
-    pub fn prev(self) -> Option<Self> {
+    pub const fn prev(self) -> Option<Self> {
         if self.0 > 0 {
-            Some(EpochId(self.0 - 1))
+            Some(Self(self.0 - 1))
         } else {
             None
         }
@@ -67,10 +67,10 @@ pub enum ValidatorShardState {
 impl fmt::Display for ValidatorShardState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ValidatorShardState::Active => write!(f, "Active"),
-            ValidatorShardState::Waiting => write!(f, "Waiting"),
-            ValidatorShardState::ShufflingOut => write!(f, "ShufflingOut"),
-            ValidatorShardState::Leaving => write!(f, "Leaving"),
+            Self::Active => write!(f, "Active"),
+            Self::Waiting => write!(f, "Waiting"),
+            Self::ShufflingOut => write!(f, "ShufflingOut"),
+            Self::Leaving => write!(f, "Leaving"),
         }
     }
 }

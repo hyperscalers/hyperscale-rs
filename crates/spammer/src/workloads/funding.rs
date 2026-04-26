@@ -34,7 +34,7 @@ impl FundingWorkload {
     ///
     /// Callers need this to compute the extra genesis balance for funder accounts.
     #[must_use]
-    pub fn fee(&self) -> Decimal {
+    pub const fn fee(&self) -> Decimal {
         self.fee
     }
 

@@ -24,7 +24,7 @@ type VersionedKey = ((DbPartitionKey, DbSortKey), u64);
 /// lexicographic ordering so that for a given substate key prefix, versions
 /// sort ascending — enabling efficient "find latest version <= N" scans.
 #[derive(Default)]
-pub(crate) struct VersionedSubstateKeyCodec;
+pub struct VersionedSubstateKeyCodec;
 
 impl DbCodec<VersionedKey> for VersionedSubstateKeyCodec {
     fn encode_to(&self, value: &VersionedKey, buf: &mut Vec<u8>) {
@@ -65,7 +65,7 @@ mod tests {
         let substate_key = make_test_key(1, b"sort_key");
         let version = 42u64;
 
-        let encoded = VersionedSubstateKeyCodec.encode(&(substate_key.clone(), version));
+        let encoded = VersionedSubstateKeyCodec.encode(&(substate_key, version));
         let ((decoded_pk, decoded_sort), decoded_version) =
             VersionedSubstateKeyCodec.decode(&encoded);
 

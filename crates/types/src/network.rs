@@ -86,11 +86,8 @@ impl MessagePriority {
     /// Higher priority messages must be delivered.
     #[inline]
     #[must_use]
-    pub fn is_droppable(&self) -> bool {
-        matches!(
-            self,
-            MessagePriority::Propagation | MessagePriority::Background
-        )
+    pub const fn is_droppable(&self) -> bool {
+        matches!(self, Self::Propagation | Self::Background)
     }
 }
 
@@ -100,28 +97,20 @@ impl MessagePriority {
 /// Each message type declares its priority for network `QoS`.
 pub trait NetworkMessage: Send + Sync + Sized + BasicEncode + BasicDecode {
     /// Unique message type identifier for routing.
-    fn message_type_id() -> &'static str
-    where
-        Self: Sized;
+    fn message_type_id() -> &'static str;
 
     /// The priority level for this message type.
     ///
     /// Used by the network adaptor for queue ordering and backpressure.
     /// Defaults to `Background` - override for higher priority messages.
     #[must_use]
-    fn priority() -> MessagePriority
-    where
-        Self: Sized,
-    {
+    fn priority() -> MessagePriority {
         MessagePriority::Background
     }
 
     /// Get the gossipsub topic for this message type.
     #[must_use]
-    fn topic() -> String
-    where
-        Self: Sized,
-    {
+    fn topic() -> String {
         format!("hyperscale/{}/1.0.0", Self::message_type_id())
     }
 }

@@ -95,7 +95,7 @@ impl SimNetworkAdapter {
     /// Use [`SimulatedNetwork::create_adapter`](crate::SimulatedNetwork::create_adapter)
     /// to create adapters with shared registries for request fulfillment and gossip delivery.
     #[must_use]
-    pub fn new(registry: Arc<HandlerRegistry>) -> Self {
+    pub const fn new(registry: Arc<HandlerRegistry>) -> Self {
         Self {
             outbox: Mutex::new(Vec::new()),
             pending_requests: Mutex::new(Vec::new()),

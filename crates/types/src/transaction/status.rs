@@ -95,16 +95,16 @@ impl TransactionStatus {
     /// Terminal states:
     /// - `Completed`: Transaction executed and certificate committed
     #[must_use]
-    pub fn is_final(&self) -> bool {
-        matches!(self, TransactionStatus::Completed(_))
+    pub const fn is_final(&self) -> bool {
+        matches!(self, Self::Completed(_))
     }
 
     /// Check if transaction is ready to be included in a block.
     ///
     /// Only Pending transactions can be selected by the block proposer.
     #[must_use]
-    pub fn is_ready_for_block(&self) -> bool {
-        matches!(self, TransactionStatus::Pending)
+    pub const fn is_ready_for_block(&self) -> bool {
+        matches!(self, Self::Pending)
     }
 
     /// Check if this status means the transaction holds state locks.
@@ -119,44 +119,41 @@ impl TransactionStatus {
     /// - Pending: not yet committed into a block
     /// - Completed: certificate committed, transaction done
     #[must_use]
-    pub fn holds_state_lock(&self) -> bool {
-        matches!(
-            self,
-            TransactionStatus::Committed(_) | TransactionStatus::Executed { .. }
-        )
+    pub const fn holds_state_lock(&self) -> bool {
+        matches!(self, Self::Committed(_) | Self::Executed { .. })
     }
 }
 
 impl std::fmt::Display for TransactionStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            TransactionStatus::Pending => write!(f, "pending"),
-            TransactionStatus::Committed(height) => write!(f, "committed({})", height.0),
-            TransactionStatus::Executed {
+            Self::Pending => write!(f, "pending"),
+            Self::Committed(height) => write!(f, "committed({})", height.0),
+            Self::Executed {
                 decision: TransactionDecision::Accept,
                 ..
             } => {
                 write!(f, "executed(accept)")
             }
-            TransactionStatus::Executed {
+            Self::Executed {
                 decision: TransactionDecision::Reject,
                 ..
             } => {
                 write!(f, "executed(reject)")
             }
-            TransactionStatus::Executed {
+            Self::Executed {
                 decision: TransactionDecision::Aborted,
                 ..
             } => {
                 write!(f, "executed(aborted)")
             }
-            TransactionStatus::Completed(TransactionDecision::Accept) => {
+            Self::Completed(TransactionDecision::Accept) => {
                 write!(f, "completed(accept)")
             }
-            TransactionStatus::Completed(TransactionDecision::Reject) => {
+            Self::Completed(TransactionDecision::Reject) => {
                 write!(f, "completed(reject)")
             }
-            TransactionStatus::Completed(TransactionDecision::Aborted) => {
+            Self::Completed(TransactionDecision::Aborted) => {
                 write!(f, "completed(aborted)")
             }
         }
@@ -169,7 +166,7 @@ impl std::str::FromStr for TransactionStatus {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         // Handle simple cases first
         if s == "pending" {
-            return Ok(TransactionStatus::Pending);
+            return Ok(Self::Pending);
         }
 
         // Parse status(value) format
@@ -185,13 +182,13 @@ impl std::str::FromStr for TransactionStatus {
         };
 
         match name {
-            "pending" => Ok(TransactionStatus::Pending),
+            "pending" => Ok(Self::Pending),
             "committed" => {
                 let height = inner
                     .ok_or_else(|| TransactionStatusParseError::MissingValue("committed".into()))?
                     .parse::<u64>()
                     .map_err(|_| TransactionStatusParseError::InvalidValue("height".into()))?;
-                Ok(TransactionStatus::Committed(BlockHeight(height)))
+                Ok(Self::Committed(BlockHeight(height)))
             }
             "executed" => {
                 let decision = parse_decision(inner.ok_or_else(|| {
@@ -200,7 +197,7 @@ impl std::str::FromStr for TransactionStatus {
                 // Note: committed_at is not preserved in string representation as it's
                 // internal state for timeout tracking. Use 0 as placeholder - this status
                 // parsed from strings won't be used for timeout calculations anyway.
-                Ok(TransactionStatus::Executed {
+                Ok(Self::Executed {
                     decision,
                     committed_at: BlockHeight(0),
                 })
@@ -209,7 +206,7 @@ impl std::str::FromStr for TransactionStatus {
                 let decision = parse_decision(inner.ok_or_else(|| {
                     TransactionStatusParseError::MissingValue("completed".into())
                 })?)?;
-                Ok(TransactionStatus::Completed(decision))
+                Ok(Self::Completed(decision))
             }
             _ => Err(TransactionStatusParseError::UnknownStatus(name.to_string())),
         }

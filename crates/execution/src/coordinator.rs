@@ -1709,18 +1709,24 @@ impl ExecutionCoordinator {
     /// Get debug info about wave state for a transaction.
     #[must_use]
     pub fn certificate_tracking_debug(&self, tx_hash: &TxHash) -> String {
-        let wave_info = if let Some(wave_id) = self.waves.wave_assignment(tx_hash) {
-            if let Some(wave) = self.waves.get_wave(&wave_id) {
-                let complete = wave.is_complete();
-                format!("wave={wave_id}, complete={complete}")
-            } else if self.finalized.contains(&wave_id) {
-                format!("wave={wave_id}, finalized")
-            } else {
-                format!("wave={wave_id}, no tracker")
-            }
-        } else {
-            "no wave assignment".to_string()
-        };
+        let wave_info = self.waves.wave_assignment(tx_hash).map_or_else(
+            || "no wave assignment".to_string(),
+            |wave_id| {
+                self.waves.get_wave(&wave_id).map_or_else(
+                    || {
+                        if self.finalized.contains(&wave_id) {
+                            format!("wave={wave_id}, finalized")
+                        } else {
+                            format!("wave={wave_id}, no tracker")
+                        }
+                    },
+                    |wave| {
+                        let complete = wave.is_complete();
+                        format!("wave={wave_id}, complete={complete}")
+                    },
+                )
+            },
+        );
 
         let early_count = self.early.attestation_count_for_tx(tx_hash);
 
@@ -1915,11 +1921,11 @@ mod tests {
             BlockHeight(1),
             1000,
             ValidatorId(0),
-            vec![Arc::new(tx.clone())],
+            vec![Arc::new(tx)],
         );
 
         // Block committed with transaction
-        let actions = state.on_block_committed(&topology, &certify(block.clone()));
+        let actions = state.on_block_committed(&topology, &certify(block));
 
         // Should request execution (single-shard path) and set up wave tracking
         assert!(!actions.is_empty());
@@ -1969,7 +1975,7 @@ mod tests {
 
         // Commit the block as validator 0 to discover the wave_id.
         let mut state0 = make_test_state();
-        state0.on_block_committed(&topo0, &certify(block.clone()));
+        state0.on_block_committed(&topo0, &certify(block));
         let wave_id = state0
             .waves
             .waves_iter()
@@ -1989,7 +1995,7 @@ mod tests {
             vec![Arc::new(tx.clone())],
         );
         let mut state_leader = make_test_state();
-        state_leader.on_block_committed(&topo_leader, &certify(block_leader.clone()));
+        state_leader.on_block_committed(&topo_leader, &certify(block_leader));
         assert!(
             state_leader.waves.contains_tracker(&wave_id),
             "Leader should have VoteTracker"
@@ -2003,10 +2009,10 @@ mod tests {
             BlockHeight(1),
             1000,
             ValidatorId(0),
-            vec![Arc::new(tx.clone())],
+            vec![Arc::new(tx)],
         );
         let mut state_non = make_test_state();
-        state_non.on_block_committed(&topo_non, &certify(block_non.clone()));
+        state_non.on_block_committed(&topo_non, &certify(block_non));
         assert!(
             !state_non.waves.contains_tracker(&wave_id),
             "Non-leader should NOT have VoteTracker"
@@ -2028,7 +2034,7 @@ mod tests {
         let block_hash = block.hash();
 
         let mut state = make_test_state();
-        state.on_block_committed(&topo, &certify(block.clone()));
+        state.on_block_committed(&topo, &certify(block));
 
         let wave_id = state
             .waves
@@ -2046,10 +2052,10 @@ mod tests {
             BlockHeight(1),
             1000,
             ValidatorId(0),
-            vec![Arc::new(tx.clone())],
+            vec![Arc::new(tx)],
         );
         let mut state_non = make_test_state();
-        state_non.on_block_committed(&topo_non, &certify(block_non.clone()));
+        state_non.on_block_committed(&topo_non, &certify(block_non));
 
         assert!(!state_non.waves.contains_tracker(&wave_id));
         assert!(state_non.waves.contains_wave(&wave_id));
@@ -2161,7 +2167,7 @@ mod tests {
 
         // Simulate receiving a verified local shard EC.
         let cert = hyperscale_types::ExecutionCertificate::new(
-            wave_id.clone(),
+            wave_id,
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
             vec![],
@@ -2185,7 +2191,7 @@ mod tests {
         let wave_id = WaveId::new(
             ShardGroupId(0),
             BlockHeight(1),
-            [ShardGroupId(1)].into_iter().collect(),
+            std::iter::once(ShardGroupId(1)).collect(),
         );
         let topo = make_test_topology();
 
@@ -2243,7 +2249,7 @@ mod tests {
         let wave_id = WaveId::new(
             remote_shard,
             BlockHeight(5),
-            [ShardGroupId(0)].into_iter().collect(),
+            std::iter::once(ShardGroupId(0)).collect(),
         );
         // No local waves / trackers have been created for this tx.
         let cert = hyperscale_types::ExecutionCertificate::new(
@@ -2307,7 +2313,7 @@ mod tests {
         let remote_wave = WaveId::new(
             remote_shard,
             BlockHeight(5),
-            [ShardGroupId(0)].into_iter().collect(),
+            std::iter::once(ShardGroupId(0)).collect(),
         );
         state.on_verified_remote_header(
             &topo,
@@ -2325,7 +2331,7 @@ mod tests {
         let local_wave = WaveId::new(
             ShardGroupId(0),
             BlockHeight(10),
-            [remote_shard].into_iter().collect(),
+            std::iter::once(remote_shard).collect(),
         );
         let tx = Arc::new(test_transaction(7));
         let tx_hash = tx.hash();
@@ -2522,7 +2528,7 @@ mod tests {
         state.waves.assign_tx(tx_hash, wave_id.clone());
         state
             .provisioning
-            .record_required(tx_hash, [ShardGroupId(1)].into_iter().collect());
+            .record_required(tx_hash, std::iter::once(ShardGroupId(1)).collect());
         // Drive finalize_wave to populate the FinalizedWaveStore naturally.
         let _ = state.finalize_wave(&wave_id);
         let finalized = state
@@ -2564,7 +2570,7 @@ mod tests {
         let remote_wave = WaveId::new(
             remote_shard,
             BlockHeight(5),
-            [ShardGroupId(0)].into_iter().collect(),
+            std::iter::once(ShardGroupId(0)).collect(),
         );
         state.on_verified_remote_header(
             &topo,
@@ -2577,7 +2583,7 @@ mod tests {
         let local_wave = WaveId::new(
             ShardGroupId(0),
             BlockHeight(10),
-            [remote_shard].into_iter().collect(),
+            std::iter::once(remote_shard).collect(),
         );
         let tx = Arc::new(test_transaction(1));
         let mut participating = BTreeSet::new();

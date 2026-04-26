@@ -96,7 +96,7 @@ pub struct HeaderFetchProtocol {
 
 impl HeaderFetchProtocol {
     /// Create a new header fetch protocol state machine.
-    pub fn new(config: HeaderFetchConfig) -> Self {
+    pub const fn new(config: HeaderFetchConfig) -> Self {
         Self {
             config,
             pending: BTreeMap::new(),

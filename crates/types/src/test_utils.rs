@@ -10,7 +10,7 @@ use radix_transactions::model::{
 
 /// Create a test `NodeId` from a seed byte.
 #[must_use]
-pub fn test_node(seed: u8) -> NodeId {
+pub const fn test_node(seed: u8) -> NodeId {
     NodeId([seed; 30])
 }
 
@@ -74,10 +74,11 @@ pub fn test_transaction_with_nodes(
     )
 }
 
-/// Validity range used for test transactions: a wide window centred on
-/// `WeightedTimestamp::ZERO` so test fixtures don't need to thread a
-/// real anchor through every helper. Tests that exercise expiry should
-/// build their own range.
+/// Validity range used for test transactions.
+///
+/// A wide window centred on `WeightedTimestamp::ZERO` so test fixtures
+/// don't need to thread a real anchor through every helper. Tests that
+/// exercise expiry should build their own range.
 #[must_use]
 pub fn test_validity_range() -> TimestampRange {
     use std::time::Duration;

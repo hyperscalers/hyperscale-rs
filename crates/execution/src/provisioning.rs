@@ -32,7 +32,7 @@ use std::sync::Arc;
 
 use crate::conflict::{ConflictDetector, DetectedConflict};
 
-pub(crate) struct ProvisioningTracker {
+pub struct ProvisioningTracker {
     /// Verified provisions keyed by `tx_hash`. Written when provisions are
     /// absorbed; read when a cross-shard wave dispatches. Cleaned only when
     /// the wave certificate is committed (terminal state).
@@ -170,7 +170,7 @@ impl ProvisioningTracker {
     /// Borrow the verified-provisions map. Used by the coordinator when
     /// passing it to `handlers::build_dispatch_action`, which needs a
     /// per-tx lookup and doesn't care about the surrounding tracker state.
-    pub fn verified(&self) -> &HashMap<TxHash, Vec<StateProvision>> {
+    pub const fn verified(&self) -> &HashMap<TxHash, Vec<StateProvision>> {
         &self.verified
     }
 
@@ -310,7 +310,7 @@ mod tests {
     fn remove_tx_drops_state_from_every_owned_map() {
         let mut t = ProvisioningTracker::new();
         let tx = TxHash::from_raw(Hash::from_bytes(b"tx"));
-        t.record_required(tx, [shard(1)].into_iter().collect());
+        t.record_required(tx, std::iter::once(shard(1)).collect());
         let provisions = make_provisions(shard(1), BlockHeight(5), vec![tx]);
         t.absorb_provisions(&provisions, shard(0));
         assert!(t.is_fully_provisioned(&tx));
@@ -327,7 +327,7 @@ mod tests {
     fn record_required_overwrites_existing_entry() {
         let mut t = ProvisioningTracker::new();
         let tx = TxHash::from_raw(Hash::from_bytes(b"tx"));
-        t.record_required(tx, [shard(1)].into_iter().collect());
+        t.record_required(tx, std::iter::once(shard(1)).collect());
         // Re-record with a different requirement set.
         t.record_required(tx, [shard(1), shard(2)].into_iter().collect());
         assert_eq!(t.required.get(&tx).map_or(0, BTreeSet::len), 2);

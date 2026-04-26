@@ -17,13 +17,13 @@ pub struct GetTransactionsResponse {
 impl GetTransactionsResponse {
     /// Create a response with found transactions.
     #[must_use]
-    pub fn new(transactions: Vec<Arc<RoutableTransaction>>) -> Self {
+    pub const fn new(transactions: Vec<Arc<RoutableTransaction>>) -> Self {
         Self { transactions }
     }
 
     /// Create an empty response (no transactions found).
     #[must_use]
-    pub fn empty() -> Self {
+    pub const fn empty() -> Self {
         Self {
             transactions: vec![],
         }
@@ -31,13 +31,13 @@ impl GetTransactionsResponse {
 
     /// Get the number of transactions in the response.
     #[must_use]
-    pub fn count(&self) -> usize {
+    pub const fn count(&self) -> usize {
         self.transactions.len()
     }
 
     /// Check if the response is empty.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.transactions.is_empty()
     }
 
@@ -164,7 +164,7 @@ mod tests {
         let tx1 = Arc::new(test_transaction(1));
         let tx2 = Arc::new(test_transaction(2));
 
-        let response = GetTransactionsResponse::new(vec![tx1.clone(), tx2.clone()]);
+        let response = GetTransactionsResponse::new(vec![tx1, tx2]);
         assert_eq!(response.count(), 2);
         assert!(!response.is_empty());
     }
@@ -181,7 +181,7 @@ mod tests {
         let tx1 = Arc::new(test_transaction(1));
         let tx2 = Arc::new(test_transaction(2));
 
-        let response = GetTransactionsResponse::new(vec![tx1.clone(), tx2.clone()]);
+        let response = GetTransactionsResponse::new(vec![tx1, tx2]);
 
         let encoded = basic_encode(&response).expect("encode");
         let decoded: GetTransactionsResponse = basic_decode(&encoded).expect("decode");

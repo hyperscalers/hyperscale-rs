@@ -7,10 +7,11 @@ use hyperscale_types::{
 };
 use sbor::prelude::BasicSbor;
 
-/// Inventory of locally-known item hashes, grouped by category. All fields
-/// are optional so callers can skip categories that don't fit within the
-/// filter size cap — the responder treats absence as "send everything for
-/// this category."
+/// Inventory of locally-known item hashes, grouped by category.
+///
+/// All fields are optional so callers can skip categories that don't fit
+/// within the filter size cap — the responder treats absence as "send
+/// everything for this category."
 ///
 /// Phantom typing on [`BloomFilter`] keeps tx/cert/provision filters from
 /// being swapped by accident; wire bytes are identical regardless of `T`.
@@ -38,7 +39,7 @@ impl Inventory {
     /// Whether every category is absent. Responders can short-circuit the
     /// elision path entirely when this is true.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.tx_have.is_none() && self.cert_have.is_none() && self.provision_have.is_none()
     }
 }

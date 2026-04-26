@@ -16,7 +16,7 @@ use hyperscale_core::CommitSource;
 use hyperscale_types::{Block, BlockHash, BlockHeight, QuorumCertificate};
 use std::collections::{BTreeMap, HashMap};
 
-pub(crate) struct CommitPipeline {
+pub struct CommitPipeline {
     /// Blocks that have been certified (have QC) but not yet committed.
     /// Keyed by block hash.
     pub(crate) certified_blocks: HashMap<BlockHash, Block>,

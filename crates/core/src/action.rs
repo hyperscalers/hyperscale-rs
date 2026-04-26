@@ -910,8 +910,8 @@ pub enum Action {
 impl Action {
     /// Check if this is a continuation action.
     #[must_use]
-    pub fn is_continuation(&self) -> bool {
-        matches!(self, Action::Continuation(_))
+    pub const fn is_continuation(&self) -> bool {
+        matches!(self, Self::Continuation(_))
     }
 
     /// Get the action type name for telemetry.

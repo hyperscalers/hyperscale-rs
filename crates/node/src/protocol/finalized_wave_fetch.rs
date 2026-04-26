@@ -179,7 +179,7 @@ impl BlockFetchState {
         self.in_flight_count = self.in_flight_count.saturating_sub(1);
     }
 
-    fn mark_fetch_complete(&mut self) {
+    const fn mark_fetch_complete(&mut self) {
         self.in_flight_count = self.in_flight_count.saturating_sub(1);
     }
 
@@ -208,7 +208,7 @@ pub struct FinalizedWaveFetchProtocol {
 }
 
 impl FinalizedWaveFetchProtocol {
-    pub fn new(config: FinalizedWaveFetchConfig) -> Self {
+    pub const fn new(config: FinalizedWaveFetchConfig) -> Self {
         Self {
             config,
             fetches: BTreeMap::new(),

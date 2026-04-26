@@ -32,7 +32,7 @@ impl TraceContext {
     /// When disabled, returns an empty context.
     #[allow(unused_variables)]
     #[must_use]
-    pub fn from_current() -> Self {
+    pub const fn from_current() -> Self {
         #[cfg(feature = "trace-propagation")]
         {
             let propagator = TraceContextPropagator::new();
@@ -69,7 +69,7 @@ impl TraceContext {
 
     /// Returns true if this context contains trace data.
     #[must_use]
-    pub fn has_trace(&self) -> bool {
+    pub const fn has_trace(&self) -> bool {
         !self.headers.is_empty()
     }
 }

@@ -295,7 +295,7 @@ mod tests {
     fn test_merge_with_empty_is_identity() {
         let u1 = make_delta_updates(b"node1", 0, vec![1], DatabaseUpdate::Set(vec![10]));
         let empty = DatabaseUpdates::default();
-        let merged = merge_database_updates(&[u1.clone(), empty]);
+        let merged = merge_database_updates(&[u1, empty]);
         assert!(get_delta_value(&merged, b"node1", 0, &[1]).is_some());
     }
 

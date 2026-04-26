@@ -127,12 +127,11 @@ impl RequestStreamPool {
 
         self.dispatch(peer, req).await?;
 
-        match resp_rx.await {
-            Ok(result) => result,
-            Err(_) => Err(NetworkError::StreamIo(
+        resp_rx.await.unwrap_or_else(|_| {
+            Err(NetworkError::StreamIo(
                 "request actor dropped response channel".into(),
-            )),
-        }
+            ))
+        })
     }
 
     /// Route a request to a live actor, spawning one if necessary.

@@ -188,7 +188,7 @@ pub struct NodeConfig {
     pub data_dir: PathBuf,
 }
 
-fn default_num_shards() -> u64 {
+const fn default_num_shards() -> u64 {
     1
 }
 
@@ -242,27 +242,27 @@ fn default_listen_addr() -> String {
     "/ip4/0.0.0.0/udp/9000/quic-v1".to_string()
 }
 
-fn default_tcp_fallback_enabled() -> bool {
+const fn default_tcp_fallback_enabled() -> bool {
     true
 }
 
-fn default_max_message_size() -> usize {
+const fn default_max_message_size() -> usize {
     65536
 }
 
-fn default_gossipsub_heartbeat_ms() -> u64 {
+const fn default_gossipsub_heartbeat_ms() -> u64 {
     100
 }
 
-fn default_upnp_enabled() -> bool {
+const fn default_upnp_enabled() -> bool {
     true
 }
 
-fn default_idle_connection_timeout_ms() -> u64 {
+const fn default_idle_connection_timeout_ms() -> u64 {
     60_000
 }
 
-fn default_keep_alive_interval_ms() -> u64 {
+const fn default_keep_alive_interval_ms() -> u64 {
     15_000
 }
 
@@ -292,15 +292,15 @@ impl Default for ConsensusConfig {
     }
 }
 
-fn default_view_change_timeout_ms() -> u64 {
+const fn default_view_change_timeout_ms() -> u64 {
     3000
 }
 
-fn default_max_transactions_per_block() -> usize {
+const fn default_max_transactions_per_block() -> usize {
     4096
 }
 
-fn default_max_finalized_transactions_per_block() -> usize {
+const fn default_max_finalized_transactions_per_block() -> usize {
     8192
 }
 
@@ -353,12 +353,12 @@ pub enum CompressionType {
 impl From<CompressionType> for hyperscale_production::CompressionType {
     fn from(ct: CompressionType) -> Self {
         match ct {
-            CompressionType::None => hyperscale_production::CompressionType::None,
-            CompressionType::Snappy => hyperscale_production::CompressionType::Snappy,
-            CompressionType::Zlib => hyperscale_production::CompressionType::Zlib,
-            CompressionType::Lz4 => hyperscale_production::CompressionType::Lz4,
-            CompressionType::Lz4hc => hyperscale_production::CompressionType::Lz4hc,
-            CompressionType::Zstd => hyperscale_production::CompressionType::Zstd,
+            CompressionType::None => Self::None,
+            CompressionType::Snappy => Self::Snappy,
+            CompressionType::Zlib => Self::Zlib,
+            CompressionType::Lz4 => Self::Lz4,
+            CompressionType::Lz4hc => Self::Lz4hc,
+            CompressionType::Zstd => Self::Zstd,
         }
     }
 }
@@ -426,35 +426,35 @@ impl Default for StorageConfig {
     }
 }
 
-fn default_jmt_history_length() -> u64 {
+const fn default_jmt_history_length() -> u64 {
     256
 }
 
-fn default_max_background_jobs() -> i32 {
+const fn default_max_background_jobs() -> i32 {
     4
 }
 
-fn default_write_buffer_mb() -> usize {
+const fn default_write_buffer_mb() -> usize {
     128
 }
 
-fn default_max_write_buffer_number() -> i32 {
+const fn default_max_write_buffer_number() -> i32 {
     3
 }
 
-fn default_block_cache_mb() -> usize {
+const fn default_block_cache_mb() -> usize {
     512
 }
 
-fn default_bloom_filter_bits() -> f64 {
+const fn default_bloom_filter_bits() -> f64 {
     10.0
 }
 
-fn default_bytes_per_sync_mb() -> usize {
+const fn default_bytes_per_sync_mb() -> usize {
     1
 }
 
-fn default_keep_log_file_num() -> usize {
+const fn default_keep_log_file_num() -> usize {
     10
 }
 
@@ -479,7 +479,7 @@ impl Default for MetricsConfig {
     }
 }
 
-fn default_metrics_enabled() -> bool {
+const fn default_metrics_enabled() -> bool {
     true
 }
 
@@ -551,7 +551,7 @@ pub struct ValidatorEntry {
     pub voting_power: u64,
 }
 
-fn default_voting_power() -> u64 {
+const fn default_voting_power() -> u64 {
     1
 }
 
@@ -1164,7 +1164,7 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
                 .to_string();
             let directory = log_file
                 .parent()
-                .unwrap_or(std::path::Path::new("."))
+                .unwrap_or_else(|| std::path::Path::new("."))
                 .to_path_buf();
 
             let file_appender = tracing_appender::rolling::never(directory, file_name);

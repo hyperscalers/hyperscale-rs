@@ -62,7 +62,7 @@ struct PeerStreamActor {
 /// When `send()` is called, it looks up or creates a stream actor for the
 /// target peer and sends the frame through the actor's channel. The actor
 /// task owns the actual `libp2p::Stream` and writes frames sequentially.
-pub(crate) struct NotifyStreamPool {
+pub struct NotifyStreamPool {
     adapter: Arc<Libp2pAdapter>,
     /// Per-peer stream actors. Key = `PeerId`, Value = actor handle.
     peers: Arc<DashMap<PeerId, PeerStreamActor>>,

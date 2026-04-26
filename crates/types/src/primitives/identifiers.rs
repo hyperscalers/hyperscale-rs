@@ -32,19 +32,19 @@ pub struct BlockHeight(pub u64);
 
 impl BlockHeight {
     /// Genesis block height.
-    pub const GENESIS: Self = BlockHeight(0);
+    pub const GENESIS: Self = Self(0);
 
     /// Get the next block height.
     #[must_use]
-    pub fn next(self) -> Self {
-        BlockHeight(self.0 + 1)
+    pub const fn next(self) -> Self {
+        Self(self.0 + 1)
     }
 
     /// Get the previous block height (returns None if at genesis).
     #[must_use]
-    pub fn prev(self) -> Option<Self> {
+    pub const fn prev(self) -> Option<Self> {
         if self.0 > 0 {
-            Some(BlockHeight(self.0 - 1))
+            Some(Self(self.0 - 1))
         } else {
             None
         }
@@ -52,34 +52,34 @@ impl BlockHeight {
 
     /// Saturating subtraction by a raw offset.
     #[must_use]
-    pub fn saturating_sub(self, rhs: u64) -> Self {
-        BlockHeight(self.0.saturating_sub(rhs))
+    pub const fn saturating_sub(self, rhs: u64) -> Self {
+        Self(self.0.saturating_sub(rhs))
     }
 
     /// Little-endian byte representation of the inner value.
     #[must_use]
-    pub fn to_le_bytes(self) -> [u8; 8] {
+    pub const fn to_le_bytes(self) -> [u8; 8] {
         self.0.to_le_bytes()
     }
 }
 
 impl std::ops::Add<u64> for BlockHeight {
-    type Output = BlockHeight;
-    fn add(self, rhs: u64) -> BlockHeight {
-        BlockHeight(self.0 + rhs)
+    type Output = Self;
+    fn add(self, rhs: u64) -> Self {
+        Self(self.0 + rhs)
     }
 }
 
 impl std::ops::Sub<u64> for BlockHeight {
-    type Output = BlockHeight;
-    fn sub(self, rhs: u64) -> BlockHeight {
-        BlockHeight(self.0 - rhs)
+    type Output = Self;
+    fn sub(self, rhs: u64) -> Self {
+        Self(self.0 - rhs)
     }
 }
 
-impl std::ops::Sub<BlockHeight> for BlockHeight {
+impl std::ops::Sub<Self> for BlockHeight {
     type Output = u64;
-    fn sub(self, rhs: BlockHeight) -> u64 {
+    fn sub(self, rhs: Self) -> u64 {
         self.0 - rhs.0
     }
 }
@@ -103,44 +103,44 @@ pub struct Round(pub u64);
 
 impl Round {
     /// Initial round.
-    pub const INITIAL: Self = Round(0);
+    pub const INITIAL: Self = Self(0);
 
     /// Get the next round.
     #[must_use]
-    pub fn next(self) -> Self {
-        Round(self.0 + 1)
+    pub const fn next(self) -> Self {
+        Self(self.0 + 1)
     }
 
     /// Saturating subtraction by a raw offset.
     #[must_use]
-    pub fn saturating_sub(self, rhs: u64) -> Self {
-        Round(self.0.saturating_sub(rhs))
+    pub const fn saturating_sub(self, rhs: u64) -> Self {
+        Self(self.0.saturating_sub(rhs))
     }
 
     /// Little-endian byte representation of the inner value.
     #[must_use]
-    pub fn to_le_bytes(self) -> [u8; 8] {
+    pub const fn to_le_bytes(self) -> [u8; 8] {
         self.0.to_le_bytes()
     }
 }
 
 impl std::ops::Add<u64> for Round {
-    type Output = Round;
-    fn add(self, rhs: u64) -> Round {
-        Round(self.0 + rhs)
+    type Output = Self;
+    fn add(self, rhs: u64) -> Self {
+        Self(self.0 + rhs)
     }
 }
 
 impl std::ops::Sub<u64> for Round {
-    type Output = Round;
-    fn sub(self, rhs: u64) -> Round {
-        Round(self.0 - rhs)
+    type Output = Self;
+    fn sub(self, rhs: u64) -> Self {
+        Self(self.0 - rhs)
     }
 }
 
-impl std::ops::Sub<Round> for Round {
+impl std::ops::Sub<Self> for Round {
     type Output = u64;
-    fn sub(self, rhs: Round) -> u64 {
+    fn sub(self, rhs: Self) -> u64 {
         self.0 - rhs.0
     }
 }
@@ -164,32 +164,32 @@ pub struct Attempt(pub u32);
 
 impl Attempt {
     /// Initial attempt.
-    pub const INITIAL: Self = Attempt(0);
+    pub const INITIAL: Self = Self(0);
 
     /// Get the next attempt.
     #[must_use]
-    pub fn next(self) -> Self {
-        Attempt(self.0 + 1)
+    pub const fn next(self) -> Self {
+        Self(self.0 + 1)
     }
 
     /// Little-endian byte representation of the inner value.
     #[must_use]
-    pub fn to_le_bytes(self) -> [u8; 4] {
+    pub const fn to_le_bytes(self) -> [u8; 4] {
         self.0.to_le_bytes()
     }
 }
 
 impl std::ops::Add<u32> for Attempt {
-    type Output = Attempt;
-    fn add(self, rhs: u32) -> Attempt {
-        Attempt(self.0 + rhs)
+    type Output = Self;
+    fn add(self, rhs: u32) -> Self {
+        Self(self.0 + rhs)
     }
 }
 
 impl std::ops::Sub<u32> for Attempt {
-    type Output = Attempt;
-    fn sub(self, rhs: u32) -> Attempt {
-        Attempt(self.0 - rhs)
+    type Output = Self;
+    fn sub(self, rhs: u32) -> Self {
+        Self(self.0 - rhs)
     }
 }
 
@@ -212,29 +212,29 @@ pub struct VotePower(pub u64);
 
 impl VotePower {
     /// Minimum vote power.
-    pub const MIN: Self = VotePower(1);
+    pub const MIN: Self = Self(1);
 
     /// Create from u64, ensuring it's at least 1.
     #[must_use]
     pub fn new(power: u64) -> Self {
-        VotePower(power.max(1))
+        Self(power.max(1))
     }
 
     /// Get the raw value.
     #[must_use]
-    pub fn get(&self) -> u64 {
+    pub const fn get(&self) -> u64 {
         self.0
     }
 
     /// Calculate total vote power from a list.
     #[must_use]
-    pub fn sum(powers: &[VotePower]) -> u64 {
+    pub fn sum(powers: &[Self]) -> u64 {
         powers.iter().map(|p| p.0).sum()
     }
 
     /// Calculate if we have 2f+1 quorum (>2/3 of total).
     #[must_use]
-    pub fn has_quorum(voted: u64, total: u64) -> bool {
+    pub const fn has_quorum(voted: u64, total: u64) -> bool {
         voted * 3 > total * 2
     }
 }
@@ -268,7 +268,7 @@ impl NodeId {
 
     /// Get the bytes as a slice.
     #[must_use]
-    pub fn as_bytes(&self) -> &[u8; 30] {
+    pub const fn as_bytes(&self) -> &[u8; 30] {
         &self.0
     }
 }
@@ -287,7 +287,7 @@ pub struct PartitionNumber(pub u8);
 impl PartitionNumber {
     /// Create a new partition number.
     #[must_use]
-    pub fn new(n: u8) -> Self {
+    pub const fn new(n: u8) -> Self {
         Self(n)
     }
 }

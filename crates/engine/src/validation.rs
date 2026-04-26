@@ -49,9 +49,9 @@ impl From<TransactionValidationError> for ValidationError {
         // Categorize the error type for better error messages
         let msg = format!("{e:?}");
         if msg.contains("Signature") || msg.contains("signature") {
-            ValidationError::InvalidSignature(msg)
+            Self::InvalidSignature(msg)
         } else {
-            ValidationError::InvalidStructure(msg)
+            Self::InvalidStructure(msg)
         }
     }
 }
@@ -155,7 +155,7 @@ impl TransactionValidation {
 
     /// Get the network definition.
     #[must_use]
-    pub fn network(&self) -> &NetworkDefinition {
+    pub const fn network(&self) -> &NetworkDefinition {
         &self.network
     }
 }

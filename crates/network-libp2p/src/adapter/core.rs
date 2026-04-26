@@ -243,7 +243,7 @@ impl Libp2pAdapter {
 
         // Spawn with panic catching - network loop panics are critical but shouldn't
         // crash the entire node. The process supervisor (systemd/k8s) should restart.
-        let event_loop_validator_peers = validator_peers.clone();
+        let event_loop_validator_peers = validator_peers;
         let bind_trigger_tx = bind_handle.bind_tx.clone();
         let bootstrap_peers = config.bootstrap_peers.clone();
         tokio::spawn(async move {
@@ -276,14 +276,11 @@ impl Libp2pAdapter {
                     info!("Network event loop exited normally");
                 }
                 Err(panic_info) => {
-                    // Extract panic message if possible
-                    let panic_msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
-                        s.to_string()
-                    } else if let Some(s) = panic_info.downcast_ref::<String>() {
-                        s.clone()
-                    } else {
-                        "Unknown panic".to_string()
-                    };
+                    let panic_msg = panic_info
+                        .downcast_ref::<&str>()
+                        .map(ToString::to_string)
+                        .or_else(|| panic_info.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "Unknown panic".to_string());
 
                     // Log critical error - this should trigger alerts
                     tracing::error!(
@@ -376,13 +373,13 @@ impl Libp2pAdapter {
 
     /// Get the local peer ID.
     #[must_use]
-    pub fn local_peer_id(&self) -> Libp2pPeerId {
+    pub const fn local_peer_id(&self) -> Libp2pPeerId {
         self.local_peer_id
     }
 
     /// Get the local validator ID.
     #[must_use]
-    pub fn local_validator_id(&self) -> ValidatorId {
+    pub const fn local_validator_id(&self) -> ValidatorId {
         self.local_validator_id
     }
 

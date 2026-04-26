@@ -168,7 +168,7 @@ impl FinalizedWave {
             }
         }
 
-        Some(FinalizedWave {
+        Some(Self {
             certificate,
             receipts,
         })

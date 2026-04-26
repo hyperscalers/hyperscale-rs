@@ -55,7 +55,7 @@ impl TransactionGossip {
 
     /// Get the Arc to the transaction.
     #[must_use]
-    pub fn transaction_arc(&self) -> &Arc<RoutableTransaction> {
+    pub const fn transaction_arc(&self) -> &Arc<RoutableTransaction> {
         &self.transaction
     }
 
@@ -67,7 +67,7 @@ impl TransactionGossip {
 
     /// Get the trace context.
     #[must_use]
-    pub fn trace_context(&self) -> &TraceContext {
+    pub const fn trace_context(&self) -> &TraceContext {
         &self.trace_context
     }
 }

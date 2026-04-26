@@ -244,7 +244,7 @@ impl RequestManager {
     }
 
     /// Get the peer health tracker for external monitoring.
-    pub fn health_tracker(&self) -> &PeerHealthTracker {
+    pub const fn health_tracker(&self) -> &PeerHealthTracker {
         &self.health
     }
 

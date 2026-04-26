@@ -180,13 +180,13 @@ impl BlockHeader {
 
     /// Check if this is the genesis block header.
     #[must_use]
-    pub fn is_genesis(&self) -> bool {
+    pub const fn is_genesis(&self) -> bool {
         self.height.0 == 0
     }
 
     /// Get the expected proposer for this height (round-robin).
     #[must_use]
-    pub fn expected_proposer(&self, num_validators: u64) -> ValidatorId {
+    pub const fn expected_proposer(&self, num_validators: u64) -> ValidatorId {
         ValidatorId((self.height.0 + self.round.0) % num_validators)
     }
 }

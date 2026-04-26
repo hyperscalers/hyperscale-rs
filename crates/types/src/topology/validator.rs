@@ -33,13 +33,13 @@ impl ValidatorSet {
 
     /// Get the number of validators.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.validators.len()
     }
 
     /// Check if the set is empty.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.validators.is_empty()
     }
 

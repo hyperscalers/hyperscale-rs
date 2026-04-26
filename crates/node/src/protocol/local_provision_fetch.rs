@@ -127,7 +127,7 @@ impl BlockFetchState {
         self.in_flight_count = self.in_flight_count.saturating_sub(1);
     }
 
-    fn mark_fetch_complete(&mut self) {
+    const fn mark_fetch_complete(&mut self) {
         self.in_flight_count = self.in_flight_count.saturating_sub(1);
     }
 
@@ -169,7 +169,7 @@ pub struct LocalProvisionFetchProtocol {
 }
 
 impl LocalProvisionFetchProtocol {
-    pub fn new(config: LocalProvisionFetchConfig) -> Self {
+    pub const fn new(config: LocalProvisionFetchConfig) -> Self {
         Self {
             config,
             fetches: BTreeMap::new(),

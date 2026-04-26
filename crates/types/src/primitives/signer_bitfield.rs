@@ -27,7 +27,7 @@ impl SignerBitfield {
 
     /// Create an empty bitfield (for genesis).
     #[must_use]
-    pub fn empty() -> Self {
+    pub const fn empty() -> Self {
         Self {
             bits: Vec::new(),
             num_validators: 0,
@@ -80,7 +80,7 @@ impl SignerBitfield {
 
     /// Get the number of validators this bitfield can represent.
     #[must_use]
-    pub fn num_validators(&self) -> usize {
+    pub const fn num_validators(&self) -> usize {
         self.num_validators
     }
 

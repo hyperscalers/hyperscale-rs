@@ -38,13 +38,13 @@ pub struct SharedStorage(pub Arc<RocksDbStorage>);
 
 impl SharedStorage {
     /// Create a new shared storage handle.
-    pub fn new(storage: Arc<RocksDbStorage>) -> Self {
+    pub const fn new(storage: Arc<RocksDbStorage>) -> Self {
         Self(storage)
     }
 
     /// Get a reference to the underlying `Arc<RocksDbStorage>`.
     #[must_use]
-    pub fn arc(&self) -> &Arc<RocksDbStorage> {
+    pub const fn arc(&self) -> &Arc<RocksDbStorage> {
         &self.0
     }
 }

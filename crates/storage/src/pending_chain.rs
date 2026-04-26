@@ -128,13 +128,15 @@ where
     /// If no blocks have been committed yet, returns a view with no
     /// pending entries (reads fall through to base storage).
     pub fn view_at_committed_tip(self: &Arc<Self>) -> Arc<SubstateView<S>> {
-        match self.base.committed_hash() {
-            Some(h) => self.view_at(h),
-            None => Arc::new(SubstateView::base_only(
-                Arc::clone(&self.base),
-                self.base.jmt_height(),
-            )),
-        }
+        self.base.committed_hash().map_or_else(
+            || {
+                Arc::new(SubstateView::base_only(
+                    Arc::clone(&self.base),
+                    self.base.jmt_height(),
+                ))
+            },
+            |h| self.view_at(h),
+        )
     }
 
     /// Walk `parent_hash` back through ancestors and flatten the chain

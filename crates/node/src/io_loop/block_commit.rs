@@ -29,20 +29,20 @@ use std::sync::{Arc, Mutex};
 /// Block + QC pair handed back to the `io_loop` to build a [`CertifiedBlock`]
 /// for immediate `BlockCommitted` delivery. Cloned `Arc` handles to the
 /// commit just enqueued in the pending backlog.
-pub(crate) type NotifyHandles = (Arc<Block>, Arc<QuorumCertificate>);
+pub type NotifyHandles = (Arc<Block>, Arc<QuorumCertificate>);
 
 /// Prepared commit cache: `block_hash → (block_height, prepared_commit)`.
 ///
 /// Shared between the coordinator and the delegated-action dispatch closures
 /// that produce prepared commits asynchronously on the consensus crypto pool.
-pub(crate) type PreparedCommitMap<S> =
+pub type PreparedCommitMap<S> =
     HashMap<BlockHash, (BlockHeight, <S as ChainWriter>::PreparedCommit)>;
 
 /// A block commit waiting to be flushed to storage.
 ///
 /// All blocks — consensus and sync — go through the same commit pipeline:
 /// `VerifyStateRoot` → `PreparedCommit` → `commit_prepared_blocks`.
-pub(crate) struct PendingCommit {
+pub struct PendingCommit {
     /// Block being committed.
     pub block: Arc<Block>,
     /// Quorum certificate certifying `block`.
@@ -58,7 +58,7 @@ pub(crate) struct PendingCommit {
 }
 
 /// Outcome of accumulating a single commit.
-pub(crate) enum AccumulateDecision {
+pub enum AccumulateDecision {
     /// Block was already persisted or already pending; nothing to do.
     Skip,
     /// Block accepted into the pending backlog.
@@ -73,7 +73,7 @@ pub(crate) enum AccumulateDecision {
     },
 }
 
-pub(crate) struct BlockCommitCoordinator<S: ChainWriter> {
+pub struct BlockCommitCoordinator<S: ChainWriter> {
     /// Prepared commit cache shared with delegated dispatch closures.
     /// Stores `(block_height, prepared_commit)` keyed by block hash so
     /// stale entries can be pruned when they outlive their block.
@@ -126,7 +126,7 @@ where
         Arc::clone(&self.prepared_commits)
     }
 
-    pub fn persisted_height(&self) -> BlockHeight {
+    pub const fn persisted_height(&self) -> BlockHeight {
         self.persisted_height
     }
 
@@ -159,7 +159,7 @@ where
             .insert(block_hash, (height, prepared));
     }
 
-    pub fn pending_len(&self) -> usize {
+    pub const fn pending_len(&self) -> usize {
         self.pending.len()
     }
 
@@ -244,6 +244,7 @@ where
     /// each `PreparedCommit`. Writing them in a single closure guarantees
     /// ordering: Rayon does not guarantee FIFO ordering across separate
     /// `spawn()` calls.
+    #[allow(clippy::significant_drop_tightening, clippy::too_many_lines)]
     pub fn flush(&mut self, storage: &Arc<S>, event_tx: &Sender<NodeInput>) {
         if self.pending.is_empty() {
             return;

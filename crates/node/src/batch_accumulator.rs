@@ -14,7 +14,7 @@ use std::time::Duration;
 /// Items are stored in a flat `Vec`. For batches where the logical count differs
 /// from `items.len()` (e.g. counting individual votes rather than vote groups),
 /// use [`push_weighted`](Self::push_weighted).
-pub(crate) struct BatchAccumulator<T> {
+pub struct BatchAccumulator<T> {
     items: Vec<T>,
     count: usize,
     max_count: usize,
@@ -24,7 +24,7 @@ pub(crate) struct BatchAccumulator<T> {
 
 impl<T> BatchAccumulator<T> {
     /// Create a new accumulator that flushes after `max_count` items or `window` time.
-    pub fn new(max_count: usize, window: Duration) -> Self {
+    pub const fn new(max_count: usize, window: Duration) -> Self {
         Self {
             items: Vec::new(),
             count: 0,
@@ -65,12 +65,12 @@ impl<T> BatchAccumulator<T> {
     }
 
     /// The deadline for this batch, if non-empty.
-    pub fn deadline(&self) -> Option<LocalTimestamp> {
+    pub const fn deadline(&self) -> Option<LocalTimestamp> {
         self.deadline
     }
 
     /// Number of items currently buffered.
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.items.len()
     }
 }
@@ -80,7 +80,7 @@ impl<T> BatchAccumulator<T> {
 /// Items are collected into per-shard `Vec`s. The batch flushes when the total
 /// count across all shards reaches `max_count` or the time window expires.
 #[allow(dead_code)]
-pub(crate) struct ShardedBatchAccumulator<T> {
+pub struct ShardedBatchAccumulator<T> {
     by_shard: HashMap<ShardGroupId, Vec<T>>,
     total: usize,
     max_count: usize,
@@ -124,7 +124,7 @@ impl<T> ShardedBatchAccumulator<T> {
     }
 
     /// The deadline for this batch, if non-empty.
-    pub fn deadline(&self) -> Option<LocalTimestamp> {
+    pub const fn deadline(&self) -> Option<LocalTimestamp> {
         self.deadline
     }
 }

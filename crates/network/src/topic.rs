@@ -31,7 +31,7 @@ pub struct ProtocolVersion {
 
 impl ProtocolVersion {
     /// Current protocol version.
-    pub const CURRENT: ProtocolVersion = ProtocolVersion { major: 1, minor: 0 };
+    pub const CURRENT: Self = Self { major: 1, minor: 0 };
 }
 
 impl Default for ProtocolVersion {
@@ -64,7 +64,7 @@ impl Topic {
     ///
     /// Global topics reach all validators regardless of shard assignment.
     #[must_use]
-    pub fn global(message_type: &'static str) -> Self {
+    pub const fn global(message_type: &'static str) -> Self {
         Self {
             message_type,
             shard: None,
@@ -76,7 +76,7 @@ impl Topic {
     ///
     /// Shard topics only reach validators subscribed to that shard.
     #[must_use]
-    pub fn shard(message_type: &'static str, shard: ShardGroupId) -> Self {
+    pub const fn shard(message_type: &'static str, shard: ShardGroupId) -> Self {
         Self {
             message_type,
             shard: Some(shard),
@@ -86,38 +86,38 @@ impl Topic {
 
     /// Create a topic with a specific version.
     #[must_use]
-    pub fn with_version(mut self, version: ProtocolVersion) -> Self {
+    pub const fn with_version(mut self, version: ProtocolVersion) -> Self {
         self.version = version;
         self
     }
 
     /// Get the message type identifier.
     #[must_use]
-    pub fn message_type(&self) -> &'static str {
+    pub const fn message_type(&self) -> &'static str {
         self.message_type
     }
 
     /// Get the optional shard ID.
     #[must_use]
-    pub fn shard_id(&self) -> Option<ShardGroupId> {
+    pub const fn shard_id(&self) -> Option<ShardGroupId> {
         self.shard
     }
 
     /// Get the protocol version.
     #[must_use]
-    pub fn version(&self) -> ProtocolVersion {
+    pub const fn version(&self) -> ProtocolVersion {
         self.version
     }
 
     /// Check if this is a global (non-shard) topic.
     #[must_use]
-    pub fn is_global(&self) -> bool {
+    pub const fn is_global(&self) -> bool {
         self.shard.is_none()
     }
 
     /// Check if this is a shard-specific topic.
     #[must_use]
-    pub fn is_shard(&self) -> bool {
+    pub const fn is_shard(&self) -> bool {
         self.shard.is_some()
     }
 
@@ -128,16 +128,20 @@ impl Topic {
     /// - Shard: `hyperscale/{message_type}/shard-{id}/{major}.{minor}.0`
     #[must_use]
     pub fn to_topic_string(&self) -> String {
-        match self.shard {
-            Some(shard) => format!(
-                "hyperscale/{}/shard-{}/{}.{}.0",
-                self.message_type, shard.0, self.version.major, self.version.minor
-            ),
-            None => format!(
-                "hyperscale/{}/{}.{}.0",
-                self.message_type, self.version.major, self.version.minor
-            ),
-        }
+        self.shard.map_or_else(
+            || {
+                format!(
+                    "hyperscale/{}/{}.{}.0",
+                    self.message_type, self.version.major, self.version.minor
+                )
+            },
+            |shard| {
+                format!(
+                    "hyperscale/{}/shard-{}/{}.{}.0",
+                    self.message_type, shard.0, self.version.major, self.version.minor
+                )
+            },
+        )
     }
 }
 

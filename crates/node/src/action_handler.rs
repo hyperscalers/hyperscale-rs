@@ -16,7 +16,7 @@ use hyperscale_types::{BlockHash, BlockHeight, LocalExecutionEntry};
 use std::sync::Arc;
 
 /// Context for executing delegated actions.
-pub(crate) struct ActionContext<
+pub struct ActionContext<
     'a,
     S: ChainWriter + SubstateStore + hyperscale_storage::VersionedStore + ChainReader,
     E: Engine,
@@ -30,7 +30,7 @@ pub(crate) struct ActionContext<
 }
 
 /// Result of handling a delegated action.
-pub(crate) struct DelegatedResult<P: Send> {
+pub struct DelegatedResult<P: Send> {
     /// Events to deliver to the state machine.
     pub events: Vec<NodeInput>,
     /// Prepared commit + receipts to cache.
@@ -44,7 +44,7 @@ pub(crate) struct DelegatedResult<P: Send> {
 
 /// A successful prepare result, ready to insert into `PendingChain` and
 /// `prepared_commits`.
-pub(crate) struct PreparedBlock<P: Send> {
+pub struct PreparedBlock<P: Send> {
     pub block_hash: BlockHash,
     pub block_height: BlockHeight,
     pub prepared: P,
@@ -52,7 +52,7 @@ pub(crate) struct PreparedBlock<P: Send> {
 }
 
 /// Which dispatch pool an action should run on in production.
-pub(crate) enum DispatchPool {
+pub enum DispatchPool {
     /// Liveness-critical consensus crypto (QC verification, block votes,
     /// state root verification, proposal building).
     ConsensusCrypto,
@@ -66,7 +66,7 @@ pub(crate) enum DispatchPool {
 ///
 /// Returns `None` for actions that are not delegated (network, timers, etc.)
 /// and should be handled by the runner directly.
-pub(crate) fn dispatch_pool_for(action: &Action) -> Option<DispatchPool> {
+pub const fn dispatch_pool_for(action: &Action) -> Option<DispatchPool> {
     match action {
         // Consensus-critical crypto + state root computation
         Action::VerifyAndBuildQuorumCertificate { .. }
@@ -105,7 +105,7 @@ pub(crate) fn dispatch_pool_for(action: &Action) -> Option<DispatchPool> {
 ///   build on / verify against).
 /// - `Execute*` and `FetchAndBroadcastProvision` use the kicked-off
 ///   block (the committed block whose state these actions act on).
-pub(crate) fn parent_hash_for(action: &Action) -> Option<BlockHash> {
+pub const fn parent_hash_for(action: &Action) -> Option<BlockHash> {
     match action {
         Action::VerifyStateRoot {
             parent_block_hash, ..
@@ -128,7 +128,7 @@ pub(crate) fn parent_hash_for(action: &Action) -> Option<BlockHash> {
 /// The runner is responsible for additionally broadcasting votes to shard
 /// peers (network-specific).
 #[allow(clippy::too_many_lines)]
-pub(crate) fn handle_delegated_action<
+pub fn handle_delegated_action<
     S: ChainWriter
         + SubstateStore
         + hyperscale_storage::VersionedStore

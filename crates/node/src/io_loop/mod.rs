@@ -390,7 +390,7 @@ where
 
     /// Rebuild derived topology state from a topology snapshot.
     /// Called after storing a new topology via `Action::TopologyChanged`.
-    fn rebuild_topology_cache_from(&mut self, topology: &hyperscale_types::TopologySnapshot) {
+    const fn rebuild_topology_cache_from(&mut self, topology: &hyperscale_types::TopologySnapshot) {
         self.local_shard = topology.local_shard();
         self.validator_id = topology.local_validator_id();
         self.num_shards = topology.num_shards();
@@ -449,12 +449,12 @@ where
     // ─── Accessors ──────────────────────────────────────────────────────
 
     /// Access the state machine.
-    pub fn state(&self) -> &NodeStateMachine {
+    pub const fn state(&self) -> &NodeStateMachine {
         &self.state
     }
 
     /// Mutably access the state machine.
-    pub fn state_mut(&mut self) -> &mut NodeStateMachine {
+    pub const fn state_mut(&mut self) -> &mut NodeStateMachine {
         &mut self.state
     }
 
@@ -482,7 +482,9 @@ where
     ///
     /// The cache is an `Arc<QuickCache>` so it can be shared with external
     /// consumers (e.g. RPC handlers) across threads without locking.
-    pub fn tx_status_cache(&self) -> &Arc<QuickCache<TxHash, hyperscale_types::TransactionStatus>> {
+    pub const fn tx_status_cache(
+        &self,
+    ) -> &Arc<QuickCache<TxHash, hyperscale_types::TransactionStatus>> {
         &self.caches.tx_status
     }
 

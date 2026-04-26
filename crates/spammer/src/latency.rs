@@ -225,7 +225,7 @@ impl LatencyTracker {
 
 impl Clone for RpcClient {
     fn clone(&self) -> Self {
-        RpcClient::new(self.base_url().to_string())
+        Self::new(self.base_url().to_string())
     }
 }
 
@@ -273,22 +273,22 @@ impl LatencyReport {
     }
 
     /// Number of transactions tracked.
-    pub fn tracked(&self) -> u64 {
+    pub const fn tracked(&self) -> u64 {
         self.stats.tracked
     }
 
     /// Number of transactions completed successfully.
-    pub fn completed(&self) -> u64 {
+    pub const fn completed(&self) -> u64 {
         self.stats.completed
     }
 
     /// Number of transactions that failed.
-    pub fn failed(&self) -> u64 {
+    pub const fn failed(&self) -> u64 {
         self.stats.failed
     }
 
     /// Number of transactions that timed out.
-    pub fn timed_out(&self) -> u64 {
+    pub const fn timed_out(&self) -> u64 {
         self.stats.timed_out
     }
 

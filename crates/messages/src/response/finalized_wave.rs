@@ -18,13 +18,13 @@ pub struct GetFinalizedWavesResponse {
 impl GetFinalizedWavesResponse {
     /// Build a response carrying the supplied finalized waves.
     #[must_use]
-    pub fn new(waves: Vec<FinalizedWave>) -> Self {
+    pub const fn new(waves: Vec<FinalizedWave>) -> Self {
         Self { waves }
     }
 
     /// Build an empty response (responder had none of the requested waves).
     #[must_use]
-    pub fn empty() -> Self {
+    pub const fn empty() -> Self {
         Self { waves: vec![] }
     }
 }

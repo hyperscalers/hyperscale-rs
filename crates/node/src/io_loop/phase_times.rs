@@ -32,7 +32,7 @@ pub(super) struct TxPhaseTimes {
 }
 
 impl TxPhaseTimes {
-    fn new(added_at: LocalTimestamp) -> Self {
+    const fn new(added_at: LocalTimestamp) -> Self {
         Self {
             added_at,
             committed_at: None,
@@ -41,7 +41,7 @@ impl TxPhaseTimes {
         }
     }
 
-    pub(super) fn added_at(&self) -> LocalTimestamp {
+    pub(super) const fn added_at(&self) -> LocalTimestamp {
         self.added_at
     }
 

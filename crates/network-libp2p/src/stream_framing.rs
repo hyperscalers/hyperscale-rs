@@ -23,11 +23,11 @@ use hyperscale_network::compression;
 use std::io;
 
 /// Maximum frame size (compressed), shared across inbound and outbound paths.
-pub(crate) const MAX_FRAME_SIZE: usize = 10 * 1024 * 1024; // 10 MB
+pub const MAX_FRAME_SIZE: usize = 10 * 1024 * 1024; // 10 MB
 
 /// Errors from framing operations.
 #[derive(Debug)]
-pub(crate) enum FrameError {
+pub enum FrameError {
     Io(io::Error),
     TooLarge(usize),
     Decompress(hyperscale_network::CompressionError),
@@ -36,16 +36,16 @@ pub(crate) enum FrameError {
 impl std::fmt::Display for FrameError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            FrameError::Io(e) => write!(f, "frame I/O error: {e}"),
-            FrameError::TooLarge(len) => write!(f, "frame too large: {len} bytes"),
-            FrameError::Decompress(e) => write!(f, "decompression failed: {e}"),
+            Self::Io(e) => write!(f, "frame I/O error: {e}"),
+            Self::TooLarge(len) => write!(f, "frame too large: {len} bytes"),
+            Self::Decompress(e) => write!(f, "decompression failed: {e}"),
         }
     }
 }
 
 impl From<io::Error> for FrameError {
     fn from(e: io::Error) -> Self {
-        FrameError::Io(e)
+        Self::Io(e)
     }
 }
 
@@ -56,7 +56,7 @@ impl From<io::Error> for FrameError {
 /// the caller drops it.
 ///
 /// Returns the number of bytes written on the wire (length prefix + compressed payload).
-pub(crate) async fn write_frame<S: AsyncWrite + Unpin>(
+pub async fn write_frame<S: AsyncWrite + Unpin>(
     stream: &mut S,
     data: &[u8],
 ) -> Result<usize, io::Error> {
@@ -82,7 +82,7 @@ pub(crate) async fn write_frame<S: AsyncWrite + Unpin>(
 ///
 /// Uses `read_exact` — suitable for small-to-moderate messages where a single
 /// timeout around the whole call is sufficient (e.g. inbound requests).
-pub(crate) async fn read_frame<S: AsyncReadExt + Unpin>(
+pub async fn read_frame<S: AsyncReadExt + Unpin>(
     stream: &mut S,
     max_size: usize,
 ) -> Result<Vec<u8>, FrameError> {
@@ -98,7 +98,7 @@ pub(crate) async fn read_frame<S: AsyncReadExt + Unpin>(
 ///
 /// Returns the frame body length (compressed). For callers that need a custom
 /// read strategy (e.g. chunked reads with per-chunk timeout extension).
-pub(crate) async fn read_frame_len<S: AsyncReadExt + Unpin>(
+pub async fn read_frame_len<S: AsyncReadExt + Unpin>(
     stream: &mut S,
     max_size: usize,
 ) -> Result<usize, FrameError> {
@@ -121,7 +121,7 @@ const MAX_TYPE_ID_LEN: usize = 256;
 /// Writes and flushes, but does not close. The reader frames the request with
 /// `read_exact` against the length prefix, so no end-of-stream signal is needed.
 /// Returns the number of bytes written on the wire.
-pub(crate) async fn write_typed_frame<S: AsyncWrite + Unpin>(
+pub async fn write_typed_frame<S: AsyncWrite + Unpin>(
     stream: &mut S,
     type_id: &str,
     sbor_data: &[u8],
@@ -136,7 +136,7 @@ pub(crate) async fn write_typed_frame<S: AsyncWrite + Unpin>(
 /// immediately, but does NOT half-close the write side.
 ///
 /// Returns the number of bytes written on the wire (type header + compressed payload).
-pub(crate) async fn write_typed_frame_no_close<S: AsyncWrite + Unpin>(
+pub async fn write_typed_frame_no_close<S: AsyncWrite + Unpin>(
     stream: &mut S,
     type_id: &str,
     sbor_data: &[u8],
@@ -152,7 +152,7 @@ pub(crate) async fn write_typed_frame_no_close<S: AsyncWrite + Unpin>(
 /// This avoids redundant compression when the same payload is sent to many peers.
 ///
 /// Returns the number of bytes written on the wire (type header + compressed payload).
-pub(crate) async fn write_precompressed_typed_frame_no_close<S: AsyncWrite + Unpin>(
+pub async fn write_precompressed_typed_frame_no_close<S: AsyncWrite + Unpin>(
     stream: &mut S,
     type_id: &str,
     compressed_data: &[u8],
@@ -192,7 +192,7 @@ pub(crate) async fn write_precompressed_typed_frame_no_close<S: AsyncWrite + Unp
 /// Read a typed request frame: `type_id` header followed by compressed SBOR payload.
 ///
 /// Returns `(type_id, decompressed_payload, wire_bytes_read)`.
-pub(crate) async fn read_typed_frame<S: AsyncReadExt + Unpin>(
+pub async fn read_typed_frame<S: AsyncReadExt + Unpin>(
     stream: &mut S,
     max_size: usize,
 ) -> Result<(String, Vec<u8>, usize), FrameError> {

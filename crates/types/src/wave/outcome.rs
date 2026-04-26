@@ -19,7 +19,7 @@ pub struct TxOutcome {
 impl TxOutcome {
     /// Whether this outcome is an abort.
     #[must_use]
-    pub fn is_aborted(&self) -> bool {
+    pub const fn is_aborted(&self) -> bool {
         matches!(self.outcome, ExecutionOutcome::Aborted)
     }
 }
@@ -43,22 +43,22 @@ pub enum ExecutionOutcome {
 impl ExecutionOutcome {
     /// Whether execution succeeded (executed with success=true).
     #[must_use]
-    pub fn is_success(&self) -> bool {
-        matches!(self, ExecutionOutcome::Executed { success: true, .. })
+    pub const fn is_success(&self) -> bool {
+        matches!(self, Self::Executed { success: true, .. })
     }
 
     /// Whether the transaction was aborted.
     #[must_use]
-    pub fn is_aborted(&self) -> bool {
-        matches!(self, ExecutionOutcome::Aborted)
+    pub const fn is_aborted(&self) -> bool {
+        matches!(self, Self::Aborted)
     }
 
     /// Get the receipt hash, or `GlobalReceiptHash::ZERO` for aborted outcomes.
     #[must_use]
-    pub fn receipt_hash_or_zero(&self) -> GlobalReceiptHash {
+    pub const fn receipt_hash_or_zero(&self) -> GlobalReceiptHash {
         match self {
-            ExecutionOutcome::Executed { receipt_hash, .. } => *receipt_hash,
-            ExecutionOutcome::Aborted => GlobalReceiptHash::ZERO,
+            Self::Executed { receipt_hash, .. } => *receipt_hash,
+            Self::Aborted => GlobalReceiptHash::ZERO,
         }
     }
 }

@@ -28,25 +28,23 @@ impl hyperscale_storage::ChainReader for RocksDbStorage {
     }
 
     fn get_block_for_sync(&self, height: BlockHeight) -> Option<BlockForSync> {
-        RocksDbStorage::get_block_for_sync(self, height).map(|(block, qc, provision_hashes)| {
-            BlockForSync {
-                block,
-                qc,
-                provision_hashes,
-            }
+        Self::get_block_for_sync(self, height).map(|(block, qc, provision_hashes)| BlockForSync {
+            block,
+            qc,
+            provision_hashes,
         })
     }
 
     fn get_transactions_batch(&self, hashes: &[TxHash]) -> Vec<RoutableTransaction> {
-        RocksDbStorage::get_transactions_batch(self, hashes)
+        Self::get_transactions_batch(self, hashes)
     }
 
     fn get_certificates_batch(&self, hashes: &[WaveIdHash]) -> Vec<WaveCertificate> {
-        RocksDbStorage::get_certificates_batch(self, hashes)
+        Self::get_certificates_batch(self, hashes)
     }
 
     fn get_local_receipt(&self, tx_hash: &TxHash) -> Option<Arc<hyperscale_types::LocalReceipt>> {
-        RocksDbStorage::get_local_receipt(self, tx_hash)
+        Self::get_local_receipt(self, tx_hash)
     }
 
     fn get_execution_certificates_by_height(

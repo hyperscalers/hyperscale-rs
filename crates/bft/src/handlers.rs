@@ -138,10 +138,11 @@ pub fn verify_vote_batch(
     all_verified
 }
 
-/// Aggregate a verified vote set into a [`QuorumCertificate`]. Sorts by
-/// committee index so the signer bitfield matches the aggregation order
-/// the verifier will use, and computes the stake-weighted timestamp from
-/// the vote timestamps.
+/// Aggregate a verified vote set into a [`QuorumCertificate`].
+///
+/// Sorts by committee index so the signer bitfield matches the aggregation
+/// order the verifier will use, and computes the stake-weighted timestamp
+/// from the vote timestamps.
 ///
 /// Returns `None` only if BLS aggregation itself fails. Caller must ensure
 /// `verified_votes` is non-empty and that quorum has been reached.
@@ -215,12 +216,9 @@ pub fn verify_qc_signature(qc: &QuorumCertificate, public_keys: &[Bls12381G1Publ
     }
 
     // Aggregate the public keys and verify (skip PK validation - trusted topology)
-    match Bls12381G1PublicKey::aggregate(&signer_keys, false) {
-        Ok(aggregated_pk) => {
-            verify_bls12381_v1(&signing_message, &aggregated_pk, &qc.aggregated_signature)
-        }
-        Err(_) => false,
-    }
+    Bls12381G1PublicKey::aggregate(&signer_keys, false).is_ok_and(|aggregated_pk| {
+        verify_bls12381_v1(&signing_message, &aggregated_pk, &qc.aggregated_signature)
+    })
 }
 
 /// Verify that the computed transaction merkle root matches the expected root.

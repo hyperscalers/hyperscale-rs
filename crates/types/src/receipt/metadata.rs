@@ -69,7 +69,7 @@ pub struct ExecutionMetadata {
 impl ExecutionMetadata {
     /// Create a failure execution output.
     #[must_use]
-    pub fn failure(error: Option<String>) -> Self {
+    pub const fn failure(error: Option<String>) -> Self {
         Self {
             fee_summary: FeeSummary {
                 total_execution_cost: vec![],

@@ -13,10 +13,7 @@ use hyperscale_types::{Bls12381G1PublicKey, ShardGroupId, TopologySnapshot, Vali
 /// provision fetch) that fan out to every other member of a committee. Works
 /// for both the local shard (self is always a member, filter removes exactly
 /// one entry) and remote shards (filter is a no-op when self isn't a member).
-pub(crate) fn peers_excluding_self(
-    topology: &TopologySnapshot,
-    shard: ShardGroupId,
-) -> Vec<ValidatorId> {
+pub fn peers_excluding_self(topology: &TopologySnapshot, shard: ShardGroupId) -> Vec<ValidatorId> {
     let self_id = topology.local_validator_id();
     topology
         .committee_for_shard(shard)
@@ -31,7 +28,7 @@ pub(crate) fn peers_excluding_self(
 /// Returns `None` if any committee member's public key is missing from the
 /// topology — a signal the snapshot is corrupt and verification should not
 /// proceed with a partial key set.
-pub(crate) fn committee_public_keys_for_shard(
+pub fn committee_public_keys_for_shard(
     topology: &TopologySnapshot,
     shard: ShardGroupId,
 ) -> Option<Vec<Bls12381G1PublicKey>> {

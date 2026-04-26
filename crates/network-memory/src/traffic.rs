@@ -163,8 +163,10 @@ impl NetworkTrafficAnalyzer {
         let duration_secs = duration.as_secs_f64();
 
         // Build per-message-type reports
-        let by_type = self.by_message_type.read().unwrap();
-        let mut by_message_type: Vec<MessageTypeReport> = by_type
+        let mut by_message_type: Vec<MessageTypeReport> = self
+            .by_message_type
+            .read()
+            .unwrap()
             .iter()
             .map(|(msg_type, stats)| {
                 let pct_of_messages = if total_messages > 0 {
@@ -205,40 +207,41 @@ impl NetworkTrafficAnalyzer {
         by_message_type.sort_by_key(|b| std::cmp::Reverse(b.total_bytes));
 
         // Build per-node reports
-        let by_node_lock = self.by_node.read().unwrap();
         let mut by_node: HashMap<NodeIndex, NodeBandwidthReport> = HashMap::new();
+        {
+            let by_node_lock = self.by_node.read().unwrap();
+            for (&node_id, stats) in by_node_lock.iter() {
+                let total_bps = if duration_secs > 0.0 {
+                    (stats.bytes_sent + stats.bytes_received) as f64 / duration_secs
+                } else {
+                    0.0
+                };
+                let upload_bps = if duration_secs > 0.0 {
+                    stats.bytes_sent as f64 / duration_secs
+                } else {
+                    0.0
+                };
+                let download_bps = if duration_secs > 0.0 {
+                    stats.bytes_received as f64 / duration_secs
+                } else {
+                    0.0
+                };
 
-        for (&node_id, stats) in by_node_lock.iter() {
-            let total_bps = if duration_secs > 0.0 {
-                (stats.bytes_sent + stats.bytes_received) as f64 / duration_secs
-            } else {
-                0.0
-            };
-            let upload_bps = if duration_secs > 0.0 {
-                stats.bytes_sent as f64 / duration_secs
-            } else {
-                0.0
-            };
-            let download_bps = if duration_secs > 0.0 {
-                stats.bytes_received as f64 / duration_secs
-            } else {
-                0.0
-            };
-
-            by_node.insert(
-                node_id,
-                NodeBandwidthReport {
+                by_node.insert(
                     node_id,
-                    messages_sent: stats.messages_sent,
-                    messages_received: stats.messages_received,
-                    bytes_sent: stats.bytes_sent,
-                    bytes_received: stats.bytes_received,
-                    total_bytes: stats.bytes_sent + stats.bytes_received,
-                    total_bps,
-                    upload_bps,
-                    download_bps,
-                },
-            );
+                    NodeBandwidthReport {
+                        node_id,
+                        messages_sent: stats.messages_sent,
+                        messages_received: stats.messages_received,
+                        bytes_sent: stats.bytes_sent,
+                        bytes_received: stats.bytes_received,
+                        total_bytes: stats.bytes_sent + stats.bytes_received,
+                        total_bps,
+                        upload_bps,
+                        download_bps,
+                    },
+                );
+            }
         }
 
         // Calculate aggregate stats

@@ -47,7 +47,7 @@ struct ExpectedProvision {
 /// Lifted by the coordinator into an `Action::FetchProvisionsRemote` once
 /// peers are attached from the topology snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TimeoutEffect {
+pub struct TimeoutEffect {
     pub source_shard: ShardGroupId,
     pub block_height: BlockHeight,
     pub proposer: ValidatorId,
@@ -55,14 +55,14 @@ pub(crate) struct TimeoutEffect {
 
 /// Liveness tracker for cross-shard provisions we expect but haven't yet
 /// verified.
-pub(crate) struct ExpectedProvisionTracker {
+pub struct ExpectedProvisionTracker {
     expected: BTreeMap<Key, ExpectedProvision>,
     local_committed_height: BlockHeight,
     local_committed_ts: WeightedTimestamp,
 }
 
 impl ExpectedProvisionTracker {
-    pub(crate) fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
             expected: BTreeMap::new(),
             local_committed_height: BlockHeight(0),
@@ -73,7 +73,7 @@ impl ExpectedProvisionTracker {
     /// Local committed weighted timestamp — the "now" reference for every
     /// liveness decision. Read by the coordinator when stamping receipts
     /// and deadline-sweeping other sub-machines.
-    pub(crate) fn local_ts(&self) -> WeightedTimestamp {
+    pub(crate) const fn local_ts(&self) -> WeightedTimestamp {
         self.local_committed_ts
     }
 

@@ -63,12 +63,12 @@ impl StoredNodeKey {
     }
 
     #[must_use]
-    pub fn version(&self) -> Version {
+    pub const fn version(&self) -> Version {
         self.version
     }
 
     #[must_use]
-    pub fn path_bits(&self) -> u16 {
+    pub const fn path_bits(&self) -> u16 {
         self.path_bits
     }
 
@@ -105,7 +105,7 @@ pub enum VersionedStoredNode {
 
 impl VersionedStoredNode {
     #[must_use]
-    pub fn from_latest(node: StoredNode) -> Self {
+    pub const fn from_latest(node: StoredNode) -> Self {
         Self::V1(node)
     }
 
@@ -186,12 +186,12 @@ impl StoredNode {
                         })
                     })
                     .collect();
-                StoredNode::Internal(StoredInternalNode {
+                Self::Internal(StoredInternalNode {
                     children,
                     hash: internal.hash.to_vec(),
                 })
             }
-            jmt::Node::Leaf(leaf) => StoredNode::Leaf(StoredLeafNode {
+            jmt::Node::Leaf(leaf) => Self::Leaf(StoredLeafNode {
                 key: leaf.key.to_vec(),
                 value_hash: leaf.value_hash.to_vec(),
             }),
@@ -208,7 +208,7 @@ impl StoredNode {
     #[must_use]
     pub fn to_jmt(&self) -> jmt::Node {
         match self {
-            StoredNode::Internal(internal) => {
+            Self::Internal(internal) => {
                 let mut dense: Vec<Option<jmt::Child>> = vec![None; BACKEND_ARITY];
                 for entry in &internal.children {
                     let kind = if entry.is_leaf {
@@ -232,7 +232,7 @@ impl StoredNode {
                     hash: hash_from_bytes(&internal.hash),
                 })
             }
-            StoredNode::Leaf(leaf) => jmt::Node::Leaf(jmt::LeafNode {
+            Self::Leaf(leaf) => jmt::Node::Leaf(jmt::LeafNode {
                 key: key_from_bytes(&leaf.key),
                 value_hash: hash_from_bytes(&leaf.value_hash),
             }),

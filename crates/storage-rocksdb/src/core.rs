@@ -22,7 +22,7 @@ use crate::typed_cf::{DbCodec, TypedCf};
 /// Sort keys deleted by partition Reset operations, keyed by `(entity_key, partition_num)`.
 /// Passed to `put_at_version` so the JMT can reconstruct full storage keys and
 /// generate deletes for the hashed keys.
-pub(crate) type ResetOldKeys = std::collections::HashMap<(Vec<u8>, u8), Vec<DbSortKey>>;
+pub type ResetOldKeys = std::collections::HashMap<(Vec<u8>, u8), Vec<DbSortKey>>;
 
 use hyperscale_jmt as jmt;
 use hyperscale_metrics as metrics;
@@ -220,7 +220,7 @@ impl RocksDbStorage {
     }
 
     /// Get the configured JMT history retention length (in block heights).
-    pub fn jmt_history_length(&self) -> u64 {
+    pub const fn jmt_history_length(&self) -> u64 {
         self.jmt_history_length
     }
 
@@ -717,7 +717,7 @@ impl RocksDbStorage {
 impl hyperscale_storage::SubstatesOnlyCommit for RocksDbStorage {
     fn commit_substates_only(&self, updates: &DatabaseUpdates) {
         // Delegate to the inherent method.
-        RocksDbStorage::commit_substates_only(self, updates);
+        Self::commit_substates_only(self, updates);
     }
 }
 
@@ -867,7 +867,7 @@ impl RocksDbStorage {
 #[cfg(test)]
 impl hyperscale_storage::CommittableSubstateDatabase for RocksDbStorage {
     fn commit(&mut self, updates: &DatabaseUpdates) {
-        RocksDbStorage::commit(self, updates)
+        Self::commit(self, updates)
             .expect("Storage commit failed - cannot maintain consistent state");
     }
 }

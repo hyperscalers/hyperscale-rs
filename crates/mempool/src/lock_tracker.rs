@@ -15,7 +15,7 @@
 use hyperscale_types::NodeId;
 use std::collections::HashSet;
 
-pub(crate) struct LockTracker {
+pub struct LockTracker {
     locked_nodes: HashSet<NodeId>,
     committed_count: usize,
     executed_count: usize,
@@ -58,33 +58,33 @@ impl LockTracker {
         self.locked_nodes.len()
     }
 
-    pub fn inc_committed(&mut self) {
+    pub const fn inc_committed(&mut self) {
         self.committed_count += 1;
     }
 
-    pub fn dec_committed(&mut self) {
+    pub const fn dec_committed(&mut self) {
         self.committed_count = self.committed_count.saturating_sub(1);
     }
 
-    pub fn inc_executed(&mut self) {
+    pub const fn inc_executed(&mut self) {
         self.executed_count += 1;
     }
 
-    pub fn dec_executed(&mut self) {
+    pub const fn dec_executed(&mut self) {
         self.executed_count = self.executed_count.saturating_sub(1);
     }
 
-    pub fn committed_count(&self) -> usize {
+    pub const fn committed_count(&self) -> usize {
         self.committed_count
     }
 
-    pub fn executed_count(&self) -> usize {
+    pub const fn executed_count(&self) -> usize {
         self.executed_count
     }
 
     /// Sum of committed and executed counts — transactions currently holding
     /// state locks. Used for backpressure.
-    pub fn in_flight(&self) -> usize {
+    pub const fn in_flight(&self) -> usize {
         self.committed_count + self.executed_count
     }
 }

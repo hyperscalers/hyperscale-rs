@@ -22,7 +22,7 @@ pub struct ExecutionVotesNotification {
 impl ExecutionVotesNotification {
     /// Create a new signed execution vote batch.
     #[must_use]
-    pub fn new(
+    pub const fn new(
         votes: Vec<ExecutionVote>,
         sender: ValidatorId,
         sender_signature: Bls12381G2Signature,
@@ -54,13 +54,13 @@ impl ExecutionVotesNotification {
 
     /// Check if the batch is empty.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.votes.is_empty()
     }
 
     /// Get the number of votes in the batch.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.votes.len()
     }
 }

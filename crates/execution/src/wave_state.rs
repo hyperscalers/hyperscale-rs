@@ -192,19 +192,19 @@ impl WaveState {
 
     /// The wave's identity ([`WaveId`]).
     #[must_use]
-    pub fn wave_id(&self) -> &WaveId {
+    pub const fn wave_id(&self) -> &WaveId {
         &self.wave_id
     }
 
     /// Hash of the wave-starting block.
     #[must_use]
-    pub fn block_hash(&self) -> BlockHash {
+    pub const fn block_hash(&self) -> BlockHash {
         self.block_hash
     }
 
     /// Height of the wave-starting block (mirrors `wave_id.block_height`).
     #[must_use]
-    pub fn block_height(&self) -> BlockHeight {
+    pub const fn block_height(&self) -> BlockHeight {
         self.wave_id.block_height
     }
 
@@ -224,26 +224,26 @@ impl WaveState {
 
     /// Whether this wave has reached full provisioning.
     #[must_use]
-    pub fn is_fully_provisioned(&self) -> bool {
+    pub const fn is_fully_provisioned(&self) -> bool {
         self.all_provisioned_at.is_some()
     }
 
     /// Whether execution has been dispatched for this wave.
     #[must_use]
-    pub fn dispatched(&self) -> bool {
+    pub const fn dispatched(&self) -> bool {
         self.dispatched
     }
 
     /// Whether the local EC has been fed into this wave (via
     /// `add_execution_certificate` with `ec.wave_id == self.wave_id`).
     #[must_use]
-    pub fn local_ec_emitted(&self) -> bool {
+    pub const fn local_ec_emitted(&self) -> bool {
         self.local_ec_emitted
     }
 
     /// Mark the wave as having dispatched execution. Idempotent: second calls
     /// are no-ops. Returns whether this call flipped the flag.
-    pub fn mark_dispatched(&mut self) -> bool {
+    pub const fn mark_dispatched(&mut self) -> bool {
         if self.dispatched {
             false
         } else {
@@ -406,10 +406,8 @@ impl WaveState {
     /// Included in the vote payload and the EC canonical hash, so all
     /// validators aggregate under the same identifier.
     fn target_vote_anchor_ts(&self) -> WeightedTimestamp {
-        match self.all_provisioned_at {
-            Some(ts_ms) => ts_ms,
-            None => self.wave_start_ts.plus(WAVE_TIMEOUT),
-        }
+        self.all_provisioned_at
+            .unwrap_or_else(|| self.wave_start_ts.plus(WAVE_TIMEOUT))
     }
 
     /// Whether the local vote can be emitted at the given committed timestamp.
@@ -425,12 +423,10 @@ impl WaveState {
         if self.voted {
             return false;
         }
-        match self.all_provisioned_at {
-            Some(provisioned_at) => {
-                committed_ts >= provisioned_at && self.has_outcome_for_every_tx()
-            }
-            None => committed_ts >= self.wave_start_ts.plus(WAVE_TIMEOUT),
-        }
+        self.all_provisioned_at.map_or_else(
+            || committed_ts >= self.wave_start_ts.plus(WAVE_TIMEOUT),
+            |provisioned_at| committed_ts >= provisioned_at && self.has_outcome_for_every_tx(),
+        )
     }
 
     /// Build vote payload at the target anchor, consuming the one-shot vote.

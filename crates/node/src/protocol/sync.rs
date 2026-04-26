@@ -61,10 +61,10 @@ pub enum SyncStateKind {
 impl SyncStateKind {
     /// Returns a string representation for metrics/logging.
     #[must_use]
-    pub fn as_str(&self) -> &'static str {
+    pub const fn as_str(&self) -> &'static str {
         match self {
-            SyncStateKind::Idle => "idle",
-            SyncStateKind::Syncing => "syncing",
+            Self::Idle => "idle",
+            Self::Syncing => "syncing",
         }
     }
 }
@@ -178,7 +178,7 @@ impl SyncProtocol {
     }
 
     /// Check if currently syncing.
-    pub fn is_syncing(&self) -> bool {
+    pub const fn is_syncing(&self) -> bool {
         self.sync_target.is_some()
     }
 
@@ -553,14 +553,11 @@ mod tests {
 
         assert!(protocol.is_syncing());
         // Should emit FetchBlock for heights 1..=5
-        let fetch_heights: Vec<BlockHeight> = outputs
+        let fetch_count = outputs
             .iter()
-            .filter_map(|o| match o {
-                SyncOutput::FetchBlock { height, .. } => Some(*height),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(fetch_heights.len(), 4); // limited by max_concurrent_fetches
+            .filter(|o| matches!(o, SyncOutput::FetchBlock { .. }))
+            .count();
+        assert_eq!(fetch_count, 4); // limited by max_concurrent_fetches
     }
 
     #[test]

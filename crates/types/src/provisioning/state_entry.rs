@@ -31,7 +31,7 @@ const HASH_PREFIX_LEN: usize = 20;
 impl StateEntry {
     /// Create a new DB state entry with pre-computed storage key.
     #[must_use]
-    pub fn new(storage_key: Vec<u8>, value: Option<Vec<u8>>) -> Self {
+    pub const fn new(storage_key: Vec<u8>, value: Option<Vec<u8>>) -> Self {
         Self { storage_key, value }
     }
 

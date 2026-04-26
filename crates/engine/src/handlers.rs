@@ -25,13 +25,10 @@ pub fn execute_single_shard<S: SubstateStore, E: Engine>(
 ) -> SingleTxResult {
     match executor.execute_single_shard(storage, std::slice::from_ref(tx), local_shard, num_shards)
     {
-        Ok(output) => {
-            if let Some(r) = output.results().first() {
-                r.clone()
-            } else {
-                SingleTxResult::failure(tx.hash(), "No execution result returned")
-            }
-        }
+        Ok(output) => output.results().first().map_or_else(
+            || SingleTxResult::failure(tx.hash(), "No execution result returned"),
+            std::clone::Clone::clone,
+        ),
         Err(e) => {
             tracing::warn!(tx_hash = ?tx.hash(), error = %e, "Transaction execution failed");
             SingleTxResult::failure(tx.hash(), e.to_string())
@@ -59,13 +56,10 @@ pub fn execute_cross_shard<S: SubstateStore, E: Engine>(
         local_shard,
         num_shards,
     ) {
-        Ok(output) => {
-            if let Some(r) = output.results().first() {
-                r.clone()
-            } else {
-                SingleTxResult::failure(tx_hash, "No cross-shard execution result returned")
-            }
-        }
+        Ok(output) => output.results().first().map_or_else(
+            || SingleTxResult::failure(tx_hash, "No cross-shard execution result returned"),
+            std::clone::Clone::clone,
+        ),
         Err(e) => {
             tracing::warn!(?tx_hash, error = %e, "Cross-shard execution failed");
             SingleTxResult::failure(tx_hash, e.to_string())
@@ -78,7 +72,7 @@ pub fn execute_cross_shard<S: SubstateStore, E: Engine>(
 /// Builds a `TxOutcome` for the execution accumulator.
 /// Called on the handler thread (after execution, before returning to state machine).
 #[must_use]
-pub fn extract_execution_result(result: &SingleTxResult) -> TxOutcome {
+pub const fn extract_execution_result(result: &SingleTxResult) -> TxOutcome {
     TxOutcome {
         tx_hash: result.tx_hash,
         outcome: ExecutionOutcome::Executed {

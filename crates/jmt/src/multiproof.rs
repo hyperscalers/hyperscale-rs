@@ -620,7 +620,7 @@ struct ByteReader<'a> {
 }
 
 impl<'a> ByteReader<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
+    const fn new(bytes: &'a [u8]) -> Self {
         Self { bytes }
     }
 
@@ -661,7 +661,7 @@ impl<'a> ByteReader<'a> {
         Ok(arr)
     }
 
-    fn is_empty(&self) -> bool {
+    const fn is_empty(&self) -> bool {
         self.bytes.is_empty()
     }
 }

@@ -109,7 +109,7 @@ pub struct ExecCertFetchProtocol {
 
 impl ExecCertFetchProtocol {
     /// Create a new execution certificate fetch protocol state machine.
-    pub fn new(config: ExecCertFetchConfig) -> Self {
+    pub const fn new(config: ExecCertFetchConfig) -> Self {
         Self {
             config,
             pending: BTreeMap::new(),

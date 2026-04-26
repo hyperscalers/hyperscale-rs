@@ -25,7 +25,7 @@ pub enum TopologyError {
 impl From<TopologySnapshotError> for TopologyError {
     fn from(err: TopologySnapshotError) -> Self {
         match err {
-            TopologySnapshotError::ValidatorNotInEpoch(v) => TopologyError::ValidatorNotInEpoch(v),
+            TopologySnapshotError::ValidatorNotInEpoch(v) => Self::ValidatorNotInEpoch(v),
         }
     }
 }
@@ -133,7 +133,7 @@ impl TopologyState {
 
     /// Get the current immutable snapshot.
     #[must_use]
-    pub fn snapshot(&self) -> &Arc<TopologySnapshot> {
+    pub const fn snapshot(&self) -> &Arc<TopologySnapshot> {
         &self.snapshot
     }
 }

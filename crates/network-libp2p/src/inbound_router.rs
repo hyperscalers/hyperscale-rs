@@ -84,7 +84,7 @@ impl PeerRateState {
 ///
 /// Kept alive inside `Libp2pNetwork` to prevent the tokio tasks from being
 /// aborted when the `JoinHandle`s are dropped.
-pub(crate) struct InboundRouterHandle {
+pub struct InboundRouterHandle {
     #[allow(dead_code)]
     request_handle: tokio::task::JoinHandle<()>,
     #[allow(dead_code)]
@@ -114,7 +114,7 @@ impl InboundRouter {
     ///
     /// The router will accept incoming streams until the stream control is dropped.
     fn spawn(adapter: &Arc<Libp2pAdapter>, registry: Arc<HandlerRegistry>) -> InboundRouterHandle {
-        let router = Arc::new(InboundRouter {
+        let router = Arc::new(Self {
             registry,
             global_semaphore: Arc::new(Semaphore::new(MAX_INBOUND_CONCURRENT)),
             per_peer: Arc::new(DashMap::new()),
@@ -164,7 +164,7 @@ impl InboundRouter {
 
         // ── Notification accept loop (NOTIFY_PROTOCOL) ──
         let notify_handle = {
-            let router = router.clone();
+            let router = router;
             let mut control = adapter.stream_control();
             tokio::spawn(async move {
                 let mut incoming = match control.accept(NOTIFY_PROTOCOL) {
@@ -252,17 +252,16 @@ impl InboundRouter {
         }
 
         // ── Global concurrency check ──
-        if let Ok(permit) = self.global_semaphore.clone().try_acquire_owned() {
-            Some(permit)
-        } else {
+        let Ok(permit) = self.global_semaphore.clone().try_acquire_owned() else {
             self.decrement_peer_count(peer_id);
             warn!(
                 peer = %peer_id,
                 limit = MAX_INBOUND_CONCURRENT,
                 "Dropping inbound stream: global concurrency limit reached"
             );
-            None
-        }
+            return None;
+        };
+        Some(permit)
     }
 
     /// Decrement the per-peer active stream counter.
@@ -275,6 +274,7 @@ impl InboundRouter {
     /// Record a stream failure for a peer. If failures exceed the threshold
     /// within the time window, the peer enters an exponential-backoff cooldown
     /// during which all new streams are silently dropped.
+    #[allow(clippy::significant_drop_tightening)] // entry lock needed for full update
     fn record_failure(&self, peer_id: &PeerId) {
         let now = Instant::now();
         let mut entry = self
@@ -436,7 +436,7 @@ impl InboundRouter {
 /// Spawn an inbound router with the given handler registry.
 ///
 /// Used internally by `Libp2pNetwork`.
-pub(crate) fn spawn_inbound_router(
+pub fn spawn_inbound_router(
     adapter: &Arc<Libp2pAdapter>,
     registry: Arc<HandlerRegistry>,
 ) -> InboundRouterHandle {
@@ -459,7 +459,7 @@ impl StreamError {
     /// these must not count toward the per-peer failure threshold.
     fn is_client_abandonment(&self) -> bool {
         let io_kind = match self {
-            StreamError::Io(e) | StreamError::Frame(FrameError::Io(e)) => Some(e.kind()),
+            Self::Io(e) | Self::Frame(FrameError::Io(e)) => Some(e.kind()),
             _ => None,
         };
         matches!(
@@ -477,10 +477,10 @@ impl StreamError {
 impl std::fmt::Display for StreamError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            StreamError::Timeout => write!(f, "stream timeout"),
-            StreamError::Io(e) => write!(f, "stream I/O error: {e}"),
-            StreamError::Frame(e) => write!(f, "stream frame error: {e}"),
-            StreamError::UnknownMessageType => write!(f, "unknown message type"),
+            Self::Timeout => write!(f, "stream timeout"),
+            Self::Io(e) => write!(f, "stream I/O error: {e}"),
+            Self::Frame(e) => write!(f, "stream frame error: {e}"),
+            Self::UnknownMessageType => write!(f, "unknown message type"),
         }
     }
 }

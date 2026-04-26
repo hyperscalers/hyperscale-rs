@@ -35,7 +35,7 @@ pub struct SimulationEngine {
 impl SimulationEngine {
     /// Create a new simulation engine wrapping `inner` with a shared `cache`.
     #[must_use]
-    pub fn new(inner: RadixExecutor, cache: SimExecutionCache) -> Self {
+    pub const fn new(inner: RadixExecutor, cache: SimExecutionCache) -> Self {
         Self { inner, cache }
     }
 

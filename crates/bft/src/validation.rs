@@ -28,7 +28,7 @@ use std::sync::Arc;
 
 /// Validate block header structure, proposer, and parent QC quorum. Returns
 /// `Err(..)` with a human-readable reason on any check failure.
-pub(crate) fn validate_header(
+pub fn validate_header(
     topology: &TopologySnapshot,
     header: &BlockHeader,
     committed_height: BlockHeight,
@@ -100,7 +100,7 @@ pub(crate) fn validate_header(
 /// (they inherit parent weighted-timestamp, which can be older than the
 /// delay threshold during extended view changes). Fallback blocks are
 /// empty and carry a QC-validated timestamp, so this carve-out is safe.
-pub(crate) fn validate_timestamp(
+pub fn validate_timestamp(
     header: &BlockHeader,
     config: &BftConfig,
     now: LocalTimestamp,
@@ -135,14 +135,14 @@ pub(crate) fn validate_timestamp(
 /// Validate transaction ordering in a proposed block: transactions must be
 /// sorted by hash (ascending, strict). Intra-block duplicate detection falls
 /// out of the same check.
-pub(crate) fn validate_transaction_ordering(block: &Block) -> Result<(), String> {
+pub fn validate_transaction_ordering(block: &Block) -> Result<(), String> {
     verify_hash_sorted(block.transactions(), "transactions")
 }
 
 /// Validate that a block's `waves` field matches the value recomputed from
 /// its transactions. Prevents a Byzantine proposer from lying about which
 /// waves exist.
-pub(crate) fn validate_waves(topology: &TopologySnapshot, block: &Block) -> Result<(), String> {
+pub fn validate_waves(topology: &TopologySnapshot, block: &Block) -> Result<(), String> {
     let expected = hyperscale_types::compute_waves(topology, block.height(), block.transactions());
 
     if block.header().waves != expected {
@@ -163,7 +163,7 @@ pub(crate) fn validate_waves(topology: &TopologySnapshot, block: &Block) -> Resu
 /// Caller must precompute `qc_chain_tx_hashes` via the driver's QC-chain
 /// walk; this function keeps validation pure and does not reach into pending
 /// block storage itself.
-pub(crate) fn validate_no_duplicate_transactions(
+pub fn validate_no_duplicate_transactions(
     block: &Block,
     qc_chain_tx_hashes: &HashSet<TxHash>,
     tx_cache: &CommittedTxCache,
@@ -191,7 +191,7 @@ pub(crate) fn validate_no_duplicate_transactions(
 /// Run all pre-vote block-contents checks: transaction ordering, `waves`
 /// recomputation, and cross-ancestor transaction uniqueness. Returns a
 /// single diagnostic on the first failure so the caller can log once.
-pub(crate) fn validate_block_for_vote(
+pub fn validate_block_for_vote(
     topology: &TopologySnapshot,
     block: &Block,
     qc_chain_tx_hashes: &HashSet<TxHash>,
@@ -474,7 +474,7 @@ mod tests {
         let txs = sorted_txs(&[10, 20]);
         let dup_hash = txs[0].hash();
         let block = block_with_transactions(BlockHeight(6), txs);
-        let qc_chain: HashSet<_> = [dup_hash].into_iter().collect();
+        let qc_chain: HashSet<_> = std::iter::once(dup_hash).collect();
         let tx_cache = CommittedTxCache::new();
         let err = validate_no_duplicate_transactions(&block, &qc_chain, &tx_cache).unwrap_err();
         assert!(err.contains("already in QC chain ancestor"));

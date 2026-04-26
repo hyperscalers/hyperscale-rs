@@ -19,7 +19,7 @@ use crate::config::BftConfig;
 use hyperscale_types::{BlockHeight, LocalTimestamp, Round};
 use std::time::Duration;
 
-pub(crate) struct ViewChangeController {
+pub struct ViewChangeController {
     /// Current round.
     pub(crate) view: Round,
 
@@ -54,7 +54,7 @@ pub(crate) struct ViewChangeController {
 }
 
 impl ViewChangeController {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             view: Round::INITIAL,
             view_at_height_start: Round::INITIAL,
@@ -66,7 +66,7 @@ impl ViewChangeController {
     }
 
     /// Record a direct signal of leader progress (proposal, QC, commit).
-    pub fn record_leader_activity(&mut self, now: LocalTimestamp) {
+    pub const fn record_leader_activity(&mut self, now: LocalTimestamp) {
         self.last_leader_activity = Some(now);
     }
 
@@ -95,10 +95,9 @@ impl ViewChangeController {
         let rounds_factor = u32::try_from(rounds_at_height).unwrap_or(u32::MAX);
         let timeout =
             config.view_change_timeout + config.view_change_timeout_increment * rounds_factor;
-        match config.view_change_timeout_max {
-            Some(max) => timeout.min(max),
-            None => timeout,
-        }
+        config
+            .view_change_timeout_max
+            .map_or(timeout, |max| timeout.min(max))
     }
 
     /// Time remaining until the view change timer should fire.
@@ -126,7 +125,7 @@ impl ViewChangeController {
 
     /// Called when committed height advances: rebase linear-backoff tracking
     /// so the next height starts with a fresh round counter.
-    pub fn reset_for_height_advance(&mut self) {
+    pub const fn reset_for_height_advance(&mut self) {
         self.view_at_height_start = self.view;
     }
 

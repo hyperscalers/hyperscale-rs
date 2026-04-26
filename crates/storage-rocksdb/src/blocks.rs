@@ -316,12 +316,11 @@ impl RocksDbStorage {
             .into_iter()
             .zip(hashes.iter())
             .filter_map(|(result, hash)| {
-                if let Some(tx) = result {
-                    Some(Arc::new(tx))
-                } else {
+                let Some(tx) = result else {
                     tracing::trace!(?hash, "Transaction not found in storage");
-                    None
-                }
+                    return None;
+                };
+                Some(Arc::new(tx))
             })
             .collect()
     }
@@ -343,12 +342,13 @@ impl RocksDbStorage {
             .into_iter()
             .zip(hashes.iter())
             .filter_map(|(result, hash)| {
-                if let Some(cert) = result {
-                    Some(Arc::new(cert))
-                } else {
-                    tracing::trace!(?hash, "Certificate not found in storage");
-                    None
-                }
+                result.map_or_else(
+                    || {
+                        tracing::trace!(?hash, "Certificate not found in storage");
+                        None
+                    },
+                    |cert| Some(Arc::new(cert)),
+                )
             })
             .collect()
     }

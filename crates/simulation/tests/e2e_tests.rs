@@ -74,7 +74,7 @@ fn account_from_keypair(keypair: &Ed25519PrivateKey) -> ComponentAddress {
 }
 
 /// Get the simulator network definition.
-fn simulator_network() -> NetworkDefinition {
+const fn simulator_network() -> NetworkDefinition {
     NetworkDefinition::simulator()
 }
 
@@ -146,7 +146,7 @@ fn test_e2e_single_shard_transaction() {
         0,
         Duration::ZERO,
         NodeInput::SubmitTransaction {
-            tx: Arc::new(transaction.clone()),
+            tx: Arc::new(transaction),
         },
     );
 
@@ -405,7 +405,7 @@ fn test_e2e_single_shard_determinism() {
         0,
         Duration::from_millis(100),
         NodeInput::SubmitTransaction {
-            tx: Arc::new(transaction.clone()),
+            tx: Arc::new(transaction),
         },
     );
     runner2.run_until(Duration::from_secs(5));
@@ -812,7 +812,7 @@ fn test_e2e_cross_shard_determinism() {
         0,
         Duration::from_millis(100),
         NodeInput::SubmitTransaction {
-            tx: Arc::new(transaction.clone()),
+            tx: Arc::new(transaction),
         },
     );
     runner2.run_until(Duration::from_secs(5));

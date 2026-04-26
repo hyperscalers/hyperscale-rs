@@ -8,9 +8,11 @@
 use hyperscale_types::{TimestampRange, WeightedTimestamp};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// Default forward budget for spammer-submitted transactions: how far
-/// into the future `end_timestamp_exclusive` is set from the submission
-/// instant. Comfortably under [`hyperscale_types::MAX_VALIDITY_RANGE`].
+/// Default forward budget for spammer-submitted transactions.
+///
+/// Sets how far into the future `end_timestamp_exclusive` is from the
+/// submission instant. Comfortably under
+/// [`hyperscale_types::MAX_VALIDITY_RANGE`].
 pub const SPAMMER_VALIDITY_BUDGET: Duration = Duration::from_mins(1);
 
 /// Build a validity range anchored on the local wall clock with a 60s

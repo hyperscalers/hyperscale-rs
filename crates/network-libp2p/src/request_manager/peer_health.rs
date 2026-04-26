@@ -75,12 +75,14 @@ impl PeerHealth {
         self.in_flight = self.in_flight.saturating_sub(1);
 
         // Update success rate EMA toward 1.0
-        self.success_rate_ema = self.success_rate_ema * (1.0 - Self::EMA_ALPHA) + Self::EMA_ALPHA;
+        self.success_rate_ema = self
+            .success_rate_ema
+            .mul_add(1.0 - Self::EMA_ALPHA, Self::EMA_ALPHA);
 
         // Update RTT EMA
         let rtt_secs = rtt.as_secs_f64();
         self.rtt_ema_secs =
-            self.rtt_ema_secs * (1.0 - Self::EMA_ALPHA) + rtt_secs * Self::EMA_ALPHA;
+            rtt_secs.mul_add(Self::EMA_ALPHA, self.rtt_ema_secs * (1.0 - Self::EMA_ALPHA));
     }
 
     /// Record a failed request (timeout or error).
@@ -103,7 +105,7 @@ impl PeerHealth {
     }
 
     /// Record that a request was started.
-    pub fn record_request_started(&mut self) {
+    pub const fn record_request_started(&mut self) {
         self.in_flight += 1;
     }
 
@@ -126,7 +128,7 @@ impl PeerHealth {
 
         // In-flight penalty: prefer peers with fewer active requests
         // Each in-flight request reduces weight by 20%
-        let load_factor = 1.0 / (1.0 + f64::from(self.in_flight) * 0.2);
+        let load_factor = 1.0 / f64::from(self.in_flight).mul_add(0.2, 1.0);
 
         // Recency bonus: slight preference for peers with recent success
         let recency_factor = match self.last_success {
@@ -337,10 +339,8 @@ impl PeerHealthTracker {
 
         self.peers.retain(|_, health| {
             let last_activity = health.last_success.max(health.last_failure);
-            match last_activity {
-                Some(t) => now.duration_since(t) < stale_threshold,
-                None => true, // Keep peers we've never contacted (recently added)
-            }
+            // Keep peers we've never contacted (recently added).
+            last_activity.is_none_or(|t| now.duration_since(t) < stale_threshold)
         });
     }
 

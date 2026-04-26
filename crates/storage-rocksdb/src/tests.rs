@@ -61,15 +61,16 @@ fn test_basic_substate_operations() {
     updates.node_updates.insert(
         partition_key.node_key.clone(),
         NodeDatabaseUpdates {
-            partition_updates: [(
+            partition_updates: std::iter::once((
                 partition_key.partition_num,
                 PartitionDatabaseUpdates::Delta {
-                    substate_updates: [(sort_key.clone(), DatabaseUpdate::Set(vec![99, 88, 77]))]
-                        .into_iter()
-                        .collect(),
+                    substate_updates: std::iter::once((
+                        sort_key.clone(),
+                        DatabaseUpdate::Set(vec![99, 88, 77]),
+                    ))
+                    .collect(),
                 },
-            )]
-            .into_iter()
+            ))
             .collect(),
         },
     );
@@ -99,15 +100,16 @@ fn test_snapshot() {
     updates.node_updates.insert(
         partition_key.node_key.clone(),
         NodeDatabaseUpdates {
-            partition_updates: [(
+            partition_updates: std::iter::once((
                 partition_key.partition_num,
                 PartitionDatabaseUpdates::Delta {
-                    substate_updates: [(sort_key.clone(), DatabaseUpdate::Set(vec![1]))]
-                        .into_iter()
-                        .collect(),
+                    substate_updates: std::iter::once((
+                        sort_key.clone(),
+                        DatabaseUpdate::Set(vec![1]),
+                    ))
+                    .collect(),
                 },
-            )]
-            .into_iter()
+            ))
             .collect(),
         },
     );
@@ -952,13 +954,12 @@ fn test_state_history_create_delete_create() {
         u.node_updates.insert(
             nk.to_vec(),
             NodeDatabaseUpdates {
-                partition_updates: [(
+                partition_updates: std::iter::once((
                     p,
                     PartitionDatabaseUpdates::Delta {
-                        substate_updates: [(DbSortKey(sk_bytes), val)].into_iter().collect(),
+                        substate_updates: std::iter::once((DbSortKey(sk_bytes), val)).collect(),
                     },
-                )]
-                .into_iter()
+                ))
                 .collect(),
             },
         );
@@ -994,7 +995,7 @@ fn test_state_history_create_delete_create() {
     let v3 = mk_delta(
         &node_key,
         partition_num,
-        sort_key.clone(),
+        sort_key,
         DatabaseUpdate::Set(vec![0xBB]),
     );
     storage.commit(&v3).unwrap();
@@ -1114,7 +1115,7 @@ fn test_reset_partition_captures_history_for_all_removed_keys() {
         updates.node_updates.insert(
             node_key.clone(),
             NodeDatabaseUpdates {
-                partition_updates: [(
+                partition_updates: std::iter::once((
                     partition_num,
                     PartitionDatabaseUpdates::Delta {
                         substate_updates: [
@@ -1125,8 +1126,7 @@ fn test_reset_partition_captures_history_for_all_removed_keys() {
                         .into_iter()
                         .collect(),
                     },
-                )]
-                .into_iter()
+                ))
                 .collect(),
             },
         );
@@ -1140,15 +1140,14 @@ fn test_reset_partition_captures_history_for_all_removed_keys() {
         new_values.insert(DbSortKey(vec![0xD1]), vec![0xDD]);
         new_values.insert(DbSortKey(vec![0xE1]), vec![0xEE]);
         updates.node_updates.insert(
-            node_key.clone(),
+            node_key,
             NodeDatabaseUpdates {
-                partition_updates: [(
+                partition_updates: std::iter::once((
                     partition_num,
                     PartitionDatabaseUpdates::Reset {
                         new_substate_values: new_values,
                     },
-                )]
-                .into_iter()
+                ))
                 .collect(),
             },
         );

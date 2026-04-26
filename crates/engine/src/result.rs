@@ -11,25 +11,25 @@ pub struct ExecutionOutput {
 impl ExecutionOutput {
     /// Create a new execution output.
     #[must_use]
-    pub fn new(results: Vec<SingleTxResult>) -> Self {
+    pub const fn new(results: Vec<SingleTxResult>) -> Self {
         Self { results }
     }
 
     /// Create an empty output (no transactions).
     #[must_use]
-    pub fn empty() -> Self {
+    pub const fn empty() -> Self {
         Self { results: vec![] }
     }
 
     /// Get the number of results.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.results.len()
     }
 
     /// Check if the output is empty.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.results.is_empty()
     }
 
@@ -71,7 +71,7 @@ pub struct SingleTxResult {
 impl SingleTxResult {
     /// Create a successful result.
     #[must_use]
-    pub fn success(
+    pub const fn success(
         tx_hash: TxHash,
         receipt_hash: GlobalReceiptHash,
         local_receipt: LocalReceipt,
@@ -107,13 +107,13 @@ impl SingleTxResult {
 
     /// Check if this is a successful execution.
     #[must_use]
-    pub fn is_success(&self) -> bool {
+    pub const fn is_success(&self) -> bool {
         self.success
     }
 
     /// Check if this is a failed execution.
     #[must_use]
-    pub fn is_failure(&self) -> bool {
+    pub const fn is_failure(&self) -> bool {
         !self.success
     }
 }

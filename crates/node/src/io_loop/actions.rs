@@ -401,7 +401,7 @@ where
     // ─── Action Handler Groups ──────────────────────────────────────────
 
     /// Process storage read/write actions.
-    fn process_storage_action(&mut self, action: Action) {
+    fn process_storage_action(&self, action: Action) {
         match action {
             Action::CacheFinalizedWave { wave } => {
                 let wave_id_hash = wave.wave_id_hash();
@@ -776,7 +776,7 @@ where
     /// `event_sender` channel and are processed on a future `step()` call.
     /// With `SyncDispatch` (simulation), `spawn_*` runs inline so events
     /// enter the channel immediately and are drained by the harness.
-    fn dispatch_delegated_action(&mut self, action: Action) {
+    fn dispatch_delegated_action(&self, action: Action) {
         let is_execution = matches!(
             action,
             Action::ExecuteTransactions { .. } | Action::ExecuteCrossShardTransactions { .. }
@@ -787,10 +787,10 @@ where
         // Anchor + view for this action. Actions that don't read state
         // (no parent_hash_for) get the committed-tip view; the view is
         // unused but the construction is cheap (cache hit after first).
-        let view = match action_handler::parent_hash_for(&action) {
-            Some(parent_hash) => self.pending_chain.view_at(parent_hash),
-            None => self.pending_chain.view_at_committed_tip(),
-        };
+        let view = action_handler::parent_hash_for(&action).map_or_else(
+            || self.pending_chain.view_at_committed_tip(),
+            |parent_hash| self.pending_chain.view_at(parent_hash),
+        );
         // Anchor parent for inserting the resulting ChainEntry into
         // PendingChain. For BuildProposal/VerifyStateRoot this is the
         // block-being-built/verified's parent. Other actions don't

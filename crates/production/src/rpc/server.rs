@@ -75,25 +75,25 @@ impl RpcServerHandle {
 
     /// Get a reference to the sync status for updates.
     #[must_use]
-    pub fn sync_status(&self) -> &Arc<ArcSwap<SyncStatus>> {
+    pub const fn sync_status(&self) -> &Arc<ArcSwap<SyncStatus>> {
         &self.sync_status
     }
 
     /// Get a reference to the node status for updates.
     #[must_use]
-    pub fn node_status(&self) -> &Arc<ArcSwap<NodeStatusState>> {
+    pub const fn node_status(&self) -> &Arc<ArcSwap<NodeStatusState>> {
         &self.node_status
     }
 
     /// Get a reference to the transaction status cache.
     #[must_use]
-    pub fn tx_status_cache(&self) -> &Arc<QuickCache<TxHash, TransactionStatus>> {
+    pub const fn tx_status_cache(&self) -> &Arc<QuickCache<TxHash, TransactionStatus>> {
         &self.tx_status_cache
     }
 
     /// Get a reference to the mempool snapshot for updates.
     #[must_use]
-    pub fn mempool_snapshot(&self) -> &Arc<ArcSwap<MempoolSnapshot>> {
+    pub const fn mempool_snapshot(&self) -> &Arc<ArcSwap<MempoolSnapshot>> {
         &self.mempool_snapshot
     }
 

@@ -211,7 +211,7 @@ impl ProductionRunnerBuilder {
 
     /// Set the BFT consensus configuration.
     #[must_use]
-    pub fn bft_config(mut self, config: BftConfig) -> Self {
+    pub const fn bft_config(mut self, config: BftConfig) -> Self {
         self.bft_config = Some(config);
         self
     }
@@ -239,21 +239,24 @@ impl ProductionRunnerBuilder {
 
     /// Set the event channel capacity (default: 10,000).
     #[must_use]
-    pub fn channel_capacity(mut self, capacity: usize) -> Self {
+    pub const fn channel_capacity(mut self, capacity: usize) -> Self {
         self.channel_capacity = capacity;
         self
     }
 
     /// Set the mempool configuration.
     #[must_use]
-    pub fn mempool_config(mut self, config: MempoolConfig) -> Self {
+    pub const fn mempool_config(mut self, config: MempoolConfig) -> Self {
         self.mempool_config = config;
         self
     }
 
     /// Set the provision coordinator configuration.
     #[must_use]
-    pub fn provision_config(mut self, config: hyperscale_provisions::ProvisionConfig) -> Self {
+    pub const fn provision_config(
+        mut self,
+        config: hyperscale_provisions::ProvisionConfig,
+    ) -> Self {
         self.provision_config = config;
         self
     }
@@ -415,7 +418,7 @@ impl ProductionRunnerBuilder {
             io_loop: Some(io_loop),
             xb_timer_tx,
             xb_consensus_tx,
-            xb_callback_tx: xb_callback_tx.clone(),
+            xb_callback_tx,
             xb_shutdown_tx,
             xb_timer_rx: Some(xb_timer_rx),
             xb_callback_rx: Some(xb_callback_rx),
@@ -512,19 +515,19 @@ impl ProductionRunner {
 
     /// Get a reference to the dispatch implementation.
     #[must_use]
-    pub fn dispatch(&self) -> &Arc<PooledDispatch> {
+    pub const fn dispatch(&self) -> &Arc<PooledDispatch> {
         &self.dispatch
     }
 
     /// Get a reference to the network adapter.
     #[must_use]
-    pub fn network(&self) -> &Arc<Libp2pAdapter> {
+    pub const fn network(&self) -> &Arc<Libp2pAdapter> {
         &self.network
     }
 
     /// Get the local shard ID.
     #[must_use]
-    pub fn local_shard(&self) -> ShardGroupId {
+    pub const fn local_shard(&self) -> ShardGroupId {
         self.local_shard
     }
 

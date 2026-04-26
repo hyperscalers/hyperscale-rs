@@ -88,13 +88,13 @@ impl VoteTracker {
 
     /// Get the wave ID.
     #[must_use]
-    pub fn wave_id(&self) -> &WaveId {
+    pub const fn wave_id(&self) -> &WaveId {
         &self.wave_id
     }
 
     /// Get the block hash.
     #[must_use]
-    pub fn block_hash(&self) -> BlockHash {
+    pub const fn block_hash(&self) -> BlockHash {
         self.block_hash
     }
 
@@ -153,14 +153,14 @@ impl VoteTracker {
     }
 
     /// Handle verification completion.
-    pub fn on_verification_complete(&mut self) {
+    pub const fn on_verification_complete(&mut self) {
         self.pending_verification = false;
     }
 
     /// Check if verification is pending.
     #[cfg(test)]
     #[must_use]
-    pub fn is_verification_pending(&self) -> bool {
+    pub const fn is_verification_pending(&self) -> bool {
         self.pending_verification
     }
 

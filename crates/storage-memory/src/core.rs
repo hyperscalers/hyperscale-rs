@@ -124,6 +124,7 @@ impl SimStorage {
     ///
     /// Panics if either internal `RwLock` is poisoned.
     #[cfg(test)]
+    #[allow(clippy::significant_drop_tightening)] // both reads need the lock
     pub fn commit_certificate_with_writes(
         &self,
         certificate: &WaveCertificate,
@@ -248,7 +249,7 @@ impl SimStorage {
 
 impl hyperscale_storage::SubstatesOnlyCommit for SimStorage {
     fn commit_substates_only(&self, updates: &DatabaseUpdates) {
-        SimStorage::commit_substates_only(self, updates);
+        Self::commit_substates_only(self, updates);
     }
 }
 

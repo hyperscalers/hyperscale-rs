@@ -76,13 +76,13 @@ impl MetricsCollector {
     }
 
     /// Record a transaction submission.
-    pub fn record_submission(&mut self) {
+    pub const fn record_submission(&mut self) {
         self.submissions += 1;
     }
 
     /// Record multiple submissions.
     #[allow(dead_code)]
-    pub fn record_submissions(&mut self, count: u64) {
+    pub const fn record_submissions(&mut self, count: u64) {
         self.submissions += count;
     }
 
@@ -95,17 +95,17 @@ impl MetricsCollector {
     }
 
     /// Record a transaction rejection.
-    pub fn record_rejection(&mut self) {
+    pub const fn record_rejection(&mut self) {
         self.rejections += 1;
     }
 
     /// Set the submission end time for accurate TPS calculation.
-    pub fn set_submission_end_time(&mut self, time: Duration) {
+    pub const fn set_submission_end_time(&mut self, time: Duration) {
         self.submission_end_time = Some(time);
     }
 
     /// Set the number of in-flight transactions at simulation end.
-    pub fn set_in_flight_at_end(&mut self, count: u64) {
+    pub const fn set_in_flight_at_end(&mut self, count: u64) {
         self.in_flight_at_end = count;
     }
 
@@ -162,7 +162,7 @@ impl MetricsCollector {
 
     /// Current raw stats: (submitted, completed, rejected).
     #[must_use]
-    pub fn current_stats(&self) -> (u64, u64, u64) {
+    pub const fn current_stats(&self) -> (u64, u64, u64) {
         (self.submissions, self.completions, self.rejections)
     }
 

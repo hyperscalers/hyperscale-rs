@@ -130,12 +130,12 @@ impl RoutableTransaction {
     }
 
     /// Get the transaction hash (content-addressed).
-    pub fn hash(&self) -> TxHash {
+    pub const fn hash(&self) -> TxHash {
         TxHash::from_raw(self.hash)
     }
 
     /// Get a reference to the underlying Radix transaction.
-    pub fn transaction(&self) -> &UserTransaction {
+    pub const fn transaction(&self) -> &UserTransaction {
         &self.transaction
     }
 

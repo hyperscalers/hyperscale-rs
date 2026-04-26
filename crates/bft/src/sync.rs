@@ -19,7 +19,7 @@ use crate::commit_pipeline::CommitPipeline;
 /// When we receive a synced block, we must verify its QC signature before
 /// applying it to our state.
 #[derive(Debug, Clone)]
-pub(crate) struct PendingSyncedBlockVerification {
+pub struct PendingSyncedBlockVerification {
     /// The synced block + certifying QC awaiting QC-signature verification.
     pub certified: CertifiedBlock,
     /// Whether the QC signature has been verified.
@@ -31,7 +31,7 @@ pub(crate) struct PendingSyncedBlockVerification {
 /// `BftCoordinator` owns this as a field and delegates sync-specific bookkeeping
 /// to it. Core protocol state changes (`committed_height`, `latest_qc`) remain
 /// on `BftCoordinator`.
-pub(crate) struct SyncManager {
+pub struct SyncManager {
     /// Whether we are currently syncing (catching up to the network).
     syncing: bool,
 
@@ -71,12 +71,12 @@ impl SyncManager {
     // ═══════════════════════════════════════════════════════════════════════
 
     /// Check if this validator is currently syncing.
-    pub fn is_syncing(&self) -> bool {
+    pub const fn is_syncing(&self) -> bool {
         self.syncing
     }
 
     /// Set the syncing flag.
-    pub fn set_syncing(&mut self, syncing: bool) {
+    pub const fn set_syncing(&mut self, syncing: bool) {
         self.syncing = syncing;
         if !syncing {
             self.sync_target_height = None;
@@ -84,12 +84,12 @@ impl SyncManager {
     }
 
     /// Set the sync target height (called when sync starts).
-    pub fn set_sync_target(&mut self, height: BlockHeight) {
+    pub const fn set_sync_target(&mut self, height: BlockHeight) {
         self.sync_target_height = Some(height);
     }
 
     /// Get the sync target height, if syncing.
-    pub fn sync_target_height(&self) -> Option<BlockHeight> {
+    pub const fn sync_target_height(&self) -> Option<BlockHeight> {
         self.sync_target_height
     }
 
@@ -438,7 +438,7 @@ impl SyncManager {
 /// Classification of an incoming synced block. Returned by
 /// [`SyncManager::ingest`] so the coordinator doesn't have to replicate the
 /// stale/duplicate/ordering branching.
-pub(crate) enum IngestOutcome {
+pub enum IngestOutcome {
     /// Stale (already committed), duplicate of an in-flight verification,
     /// already-buffered, or arrived at a lower-than-needed height. The
     /// caller does nothing further. Reason is logged internally.
@@ -453,7 +453,7 @@ pub(crate) enum IngestOutcome {
 }
 
 /// Result of a synced block QC verification.
-pub(crate) enum SyncVerificationResult {
+pub enum SyncVerificationResult {
     /// QC verified successfully — ready to apply consecutive blocks.
     Verified,
     /// QC verification failed — the bad block is removed, other pending
@@ -463,7 +463,7 @@ pub(crate) enum SyncVerificationResult {
 }
 
 /// Decision returned by [`SyncManager::health_check`].
-pub(crate) enum SyncHealthDecision {
+pub enum SyncHealthDecision {
     /// No action needed — already synced, already syncing, or making progress.
     Idle,
     /// Trigger catch-up sync to the named target.

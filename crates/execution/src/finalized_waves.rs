@@ -22,12 +22,12 @@ use hyperscale_types::{
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
-pub(crate) struct FinalizedWaveStore {
+pub struct FinalizedWaveStore {
     waves: BTreeMap<WaveId, FinalizedWave>,
 }
 
 impl FinalizedWaveStore {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             waves: BTreeMap::new(),
         }

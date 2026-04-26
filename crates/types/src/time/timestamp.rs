@@ -39,13 +39,13 @@ pub struct WeightedTimestamp(pub u64);
 
 impl WeightedTimestamp {
     /// Genesis / zero timestamp.
-    pub const ZERO: Self = WeightedTimestamp(0);
+    pub const ZERO: Self = Self(0);
 
     /// Wrap a raw ms value. Prefer
     /// [`QuorumCertificate::weighted_timestamp`] at produce sites.
     #[must_use]
     pub const fn from_millis(ms: u64) -> Self {
-        WeightedTimestamp(ms)
+        Self(ms)
     }
 
     /// Raw ms value — use sparingly, only at serialization / FFI boundaries
@@ -60,7 +60,7 @@ impl WeightedTimestamp {
     /// Reads as "how long after `earlier` was `self` produced". Used for
     /// deadline checks like `committed.elapsed_since(wave_start) >= WAVE_TIMEOUT`.
     #[must_use]
-    pub fn elapsed_since(self, earlier: Self) -> Duration {
+    pub const fn elapsed_since(self, earlier: Self) -> Duration {
         Duration::from_millis(self.0.saturating_sub(earlier.0))
     }
 
@@ -68,7 +68,7 @@ impl WeightedTimestamp {
     #[must_use]
     pub fn plus(self, duration: Duration) -> Self {
         let add = duration.as_millis().try_into().unwrap_or(u64::MAX);
-        WeightedTimestamp(self.0.saturating_add(add))
+        Self(self.0.saturating_add(add))
     }
 
     /// Return `self - duration`, saturating at zero.
@@ -78,7 +78,7 @@ impl WeightedTimestamp {
     #[must_use]
     pub fn minus(self, duration: Duration) -> Self {
         let sub = duration.as_millis().try_into().unwrap_or(u64::MAX);
-        WeightedTimestamp(self.0.saturating_sub(sub))
+        Self(self.0.saturating_sub(sub))
     }
 }
 
@@ -111,13 +111,13 @@ pub struct ProposerTimestamp(pub u64);
 
 impl ProposerTimestamp {
     /// Genesis / zero timestamp.
-    pub const ZERO: Self = ProposerTimestamp(0);
+    pub const ZERO: Self = Self(0);
 
     /// Wrap a raw ms value — callers must be producing a proposer wall-clock,
     /// not a derived / authenticated value.
     #[must_use]
     pub const fn from_millis(ms: u64) -> Self {
-        ProposerTimestamp(ms)
+        Self(ms)
     }
 
     /// Mint a `ProposerTimestamp` from this validator's local wall-clock.
@@ -128,7 +128,7 @@ impl ProposerTimestamp {
     /// path exists.
     #[must_use]
     pub const fn from_local(local: LocalTimestamp) -> Self {
-        ProposerTimestamp(local.as_millis())
+        Self(local.as_millis())
     }
 
     /// Raw ms value — use at serialization / metrics boundaries only.
@@ -168,14 +168,14 @@ pub struct LocalTimestamp(pub u64);
 
 impl LocalTimestamp {
     /// Process-start / zero timestamp.
-    pub const ZERO: Self = LocalTimestamp(0);
+    pub const ZERO: Self = Self(0);
 
     /// Wrap a raw ms value. Production callers should mint via the
     /// `io_loop`'s clock origin; tests and simulator drivers may use this
     /// directly.
     #[must_use]
     pub const fn from_millis(ms: u64) -> Self {
-        LocalTimestamp(ms)
+        Self(ms)
     }
 
     /// Raw ms value — use at the proposer-skew boundary (where it's
@@ -192,7 +192,7 @@ impl LocalTimestamp {
     /// view-change deadline checks like
     /// `now.elapsed_since(last_leader_activity) >= timeout`.
     #[must_use]
-    pub fn elapsed_since(self, earlier: Self) -> Duration {
+    pub const fn elapsed_since(self, earlier: Self) -> Duration {
         Duration::from_millis(self.0.saturating_sub(earlier.0))
     }
 
@@ -200,7 +200,7 @@ impl LocalTimestamp {
     /// `elapsed_since` but reads naturally at sites that frame the
     /// computation as "now minus origin".
     #[must_use]
-    pub fn saturating_sub(self, earlier: Self) -> Duration {
+    pub const fn saturating_sub(self, earlier: Self) -> Duration {
         Duration::from_millis(self.0.saturating_sub(earlier.0))
     }
 
@@ -208,14 +208,14 @@ impl LocalTimestamp {
     #[must_use]
     pub fn plus(self, duration: Duration) -> Self {
         let add = duration.as_millis().try_into().unwrap_or(u64::MAX);
-        LocalTimestamp(self.0.saturating_add(add))
+        Self(self.0.saturating_add(add))
     }
 
     /// Return `self - duration`, saturating at zero.
     #[must_use]
     pub fn minus(self, duration: Duration) -> Self {
         let sub = duration.as_millis().try_into().unwrap_or(u64::MAX);
-        LocalTimestamp(self.0.saturating_sub(sub))
+        Self(self.0.saturating_sub(sub))
     }
 }
 

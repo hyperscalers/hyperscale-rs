@@ -64,7 +64,7 @@ fn test_account(seed: u8) -> ComponentAddress {
 }
 
 /// Get the simulator network definition.
-fn simulator_network() -> NetworkDefinition {
+const fn simulator_network() -> NetworkDefinition {
     NetworkDefinition::simulator()
 }
 

@@ -100,9 +100,9 @@ impl VersionInteroperabilityMode {
     #[must_use]
     pub fn check(&self, local_version: &str, remote_version: &str) -> bool {
         match self {
-            VersionInteroperabilityMode::Off => true,
-            VersionInteroperabilityMode::Strict => local_version == remote_version,
-            VersionInteroperabilityMode::Relaxed => {
+            Self::Off => true,
+            Self::Strict => local_version == remote_version,
+            Self::Relaxed => {
                 // Check if major/minor versions match (e.g., 1.3.x)
                 let local_parts: Vec<&str> = local_version.split('.').collect();
                 let remote_parts: Vec<&str> = remote_version.split('.').collect();
@@ -152,35 +152,35 @@ impl Libp2pConfig {
 
     /// Set the maximum message size.
     #[must_use]
-    pub fn with_max_message_size(mut self, size: usize) -> Self {
+    pub const fn with_max_message_size(mut self, size: usize) -> Self {
         self.max_message_size = size;
         self
     }
 
     /// Set the gossipsub heartbeat interval.
     #[must_use]
-    pub fn with_gossipsub_heartbeat(mut self, interval: Duration) -> Self {
+    pub const fn with_gossipsub_heartbeat(mut self, interval: Duration) -> Self {
         self.gossipsub_heartbeat = interval;
         self
     }
 
     /// Set the idle connection timeout.
     #[must_use]
-    pub fn with_idle_connection_timeout(mut self, timeout: Duration) -> Self {
+    pub const fn with_idle_connection_timeout(mut self, timeout: Duration) -> Self {
         self.idle_connection_timeout = timeout;
         self
     }
 
     /// Set the QUIC keep-alive interval.
     #[must_use]
-    pub fn with_keep_alive_interval(mut self, interval: Duration) -> Self {
+    pub const fn with_keep_alive_interval(mut self, interval: Duration) -> Self {
         self.keep_alive_interval = interval;
         self
     }
 
     /// Enable or disable TCP fallback transport.
     #[must_use]
-    pub fn with_tcp_fallback(mut self, enabled: bool, port: Option<u16>) -> Self {
+    pub const fn with_tcp_fallback(mut self, enabled: bool, port: Option<u16>) -> Self {
         self.tcp_fallback_enabled = enabled;
         self.tcp_fallback_port = port;
         self
@@ -213,7 +213,7 @@ impl Libp2pConfig {
 
     /// Set the version interoperability mode.
     #[must_use]
-    pub fn with_version_interop_mode(mut self, mode: VersionInteroperabilityMode) -> Self {
+    pub const fn with_version_interop_mode(mut self, mode: VersionInteroperabilityMode) -> Self {
         self.version_interop_mode = mode;
         self
     }

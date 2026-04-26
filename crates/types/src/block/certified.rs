@@ -74,7 +74,7 @@ impl CertifiedBlock {
 
     /// The block's height.
     #[must_use]
-    pub fn height(&self) -> BlockHeight {
+    pub const fn height(&self) -> BlockHeight {
         self.block.height()
     }
 

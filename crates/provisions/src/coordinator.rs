@@ -50,7 +50,7 @@ pub struct ProvisionConfig {
     pub min_dwell_time: Duration,
 }
 
-fn default_min_dwell_time() -> Duration {
+const fn default_min_dwell_time() -> Duration {
     DEFAULT_MIN_DWELL_TIME
 }
 
@@ -618,7 +618,7 @@ impl ProvisionCoordinator {
     /// Shared provision store — same `Arc` the io-loop request handler
     /// reads from to serve `local_provision.request` responses.
     #[must_use]
-    pub fn store(&self) -> &Arc<ProvisionStore> {
+    pub const fn store(&self) -> &Arc<ProvisionStore> {
         self.pipeline.store()
     }
 

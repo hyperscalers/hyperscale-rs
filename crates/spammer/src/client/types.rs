@@ -37,7 +37,7 @@ pub struct SubmissionResult {
 impl SubmissionResult {
     /// Check if the submission was successful.
     #[must_use]
-    pub fn is_success(&self) -> bool {
+    pub const fn is_success(&self) -> bool {
         self.accepted && self.status_code >= 200 && self.status_code < 300
     }
 }
@@ -125,12 +125,9 @@ impl TransactionStatusResponse {
     /// falls back to string matching for unknown statuses.
     #[must_use]
     pub fn is_terminal(&self) -> bool {
-        if let Some(status) = self.to_status() {
-            status.is_final()
-        } else {
-            // Fallback for unknown statuses like "error"
-            self.status == "error"
-        }
+        // Fallback for unknown statuses like "error".
+        self.to_status()
+            .map_or_else(|| self.status == "error", |s| s.is_final())
     }
 
     /// Check if the transaction completed successfully.

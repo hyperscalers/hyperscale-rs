@@ -24,7 +24,7 @@ type Key = (ShardGroupId, BlockHeight);
 
 /// Map of `(shard, height) → verified remote header`.
 #[derive(Debug, Default)]
-pub(crate) struct VerifiedHeaderBuffer {
+pub struct VerifiedHeaderBuffer {
     headers: HashMap<Key, Arc<CommittedBlockHeader>>,
 }
 

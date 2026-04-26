@@ -24,7 +24,7 @@ pub struct ExecutionCertificatesNotification {
 impl ExecutionCertificatesNotification {
     /// Create a new signed execution certificate batch.
     #[must_use]
-    pub fn new(
+    pub const fn new(
         certificates: Vec<ExecutionCertificate>,
         sender: ValidatorId,
         sender_signature: Bls12381G2Signature,
@@ -56,13 +56,13 @@ impl ExecutionCertificatesNotification {
 
     /// Check if the batch is empty.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.certificates.is_empty()
     }
 
     /// Get the number of certificates in the batch.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.certificates.len()
     }
 }

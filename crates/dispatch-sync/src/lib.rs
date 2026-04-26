@@ -15,7 +15,7 @@ pub struct SyncDispatch;
 impl SyncDispatch {
     /// Create a new inline dispatcher (zero-sized; equivalent to `SyncDispatch::default()`).
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self
     }
 }

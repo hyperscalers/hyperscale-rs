@@ -255,19 +255,19 @@ impl TopologySnapshot {
 impl TopologySnapshot {
     /// Get the local validator's ID.
     #[must_use]
-    pub fn local_validator_id(&self) -> ValidatorId {
+    pub const fn local_validator_id(&self) -> ValidatorId {
         self.local_validator_id
     }
 
     /// Get the local shard group.
     #[must_use]
-    pub fn local_shard(&self) -> ShardGroupId {
+    pub const fn local_shard(&self) -> ShardGroupId {
         self.local_shard
     }
 
     /// Get the total number of shards.
     #[must_use]
-    pub fn num_shards(&self) -> u64 {
+    pub const fn num_shards(&self) -> u64 {
         self.num_shards
     }
 
@@ -303,7 +303,7 @@ impl TopologySnapshot {
 
     /// Get the global validator set.
     #[must_use]
-    pub fn global_validator_set(&self) -> &Arc<ValidatorSet> {
+    pub const fn global_validator_set(&self) -> &Arc<ValidatorSet> {
         &self.global_validator_set
     }
 
@@ -487,13 +487,13 @@ impl TopologySnapshot {
 
     /// Get the current epoch identifier.
     #[must_use]
-    pub fn current_epoch(&self) -> EpochId {
+    pub const fn current_epoch(&self) -> EpochId {
         self.current_epoch
     }
 
     /// Get the block height at which the current epoch ends.
     #[must_use]
-    pub fn epoch_end_height(&self) -> BlockHeight {
+    pub const fn epoch_end_height(&self) -> BlockHeight {
         self.epoch_end_height
     }
 
@@ -501,7 +501,7 @@ impl TopologySnapshot {
     ///
     /// Returns `false` if the validator is in a "Waiting" state.
     #[must_use]
-    pub fn can_participate_in_consensus(&self) -> bool {
+    pub const fn can_participate_in_consensus(&self) -> bool {
         matches!(self.local_state, ValidatorShardState::Active)
     }
 

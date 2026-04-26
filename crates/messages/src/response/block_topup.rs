@@ -29,7 +29,7 @@ pub struct GetBlockTopUpResponse {
 impl GetBlockTopUpResponse {
     /// Construct a response from resolved bodies.
     #[must_use]
-    pub fn new(
+    pub const fn new(
         transactions: Vec<(TxHash, Arc<RoutableTransaction>)>,
         certificates: Vec<(WaveIdHash, Arc<FinalizedWave>)>,
         provisions: Vec<(ProvisionHash, Arc<Provisions>)>,
@@ -43,7 +43,7 @@ impl GetBlockTopUpResponse {
 
     /// Empty response — the responder had no requested bodies.
     #[must_use]
-    pub fn empty() -> Self {
+    pub const fn empty() -> Self {
         Self {
             transactions: Vec::new(),
             certificates: Vec::new(),
@@ -53,7 +53,7 @@ impl GetBlockTopUpResponse {
 
     /// Total number of bodies returned across categories.
     #[must_use]
-    pub fn total(&self) -> usize {
+    pub const fn total(&self) -> usize {
         self.transactions.len() + self.certificates.len() + self.provisions.len()
     }
 }
