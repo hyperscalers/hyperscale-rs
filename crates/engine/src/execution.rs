@@ -52,8 +52,8 @@ pub fn extract_database_updates(receipt: &TransactionReceipt) -> DatabaseUpdates
 /// Build a `LocalReceipt` from a Radix Engine receipt.
 ///
 /// Shard filtering is applied here so the receipt is always born with
-/// shard-specific `database_updates`. System entity writes (ConsensusManager,
-/// TransactionTracker, Validator) are always filtered regardless of shard count,
+/// shard-specific `database_updates`. System entity writes (`ConsensusManager`,
+/// `TransactionTracker`, Validator) are always filtered regardless of shard count,
 /// since their execution order is non-deterministic across validators.
 pub fn build_local_receipt<S: radix_substate_store_interface::interface::SubstateDatabase>(
     receipt: &TransactionReceipt,
@@ -100,13 +100,13 @@ pub fn build_execution_metadata(receipt: &TransactionReceipt) -> ExecutionMetada
             let logs = commit
                 .application_logs
                 .iter()
-                .map(|(level, msg)| (convert_log_level(level), msg.clone()))
+                .map(|(level, msg)| (convert_log_level(*level), msg.clone()))
                 .collect();
             let error = match &commit.outcome {
                 radix_engine::transaction::TransactionOutcome::Failure(err) => {
                     Some(format!("{err:?}"))
                 }
-                _ => None,
+                radix_engine::transaction::TransactionOutcome::Success(_) => None,
             };
             (logs, error)
         }
@@ -166,8 +166,8 @@ fn build_fee_summary(receipt: &TransactionReceipt) -> FeeSummary {
     }
 }
 
-/// Convert Radix Engine log level to our LogLevel.
-fn convert_log_level(level: &radix_engine_interface::types::Level) -> LogLevel {
+/// Convert Radix Engine log level to our `LogLevel`.
+fn convert_log_level(level: radix_engine_interface::types::Level) -> LogLevel {
     match level {
         radix_engine_interface::types::Level::Error => LogLevel::Error,
         radix_engine_interface::types::Level::Warn => LogLevel::Warn,
@@ -230,6 +230,7 @@ impl<'a, S: SubstateDatabase> ProvisionedSnapshot<'a, S> {
     }
 
     /// Execute a transaction against this provisioned snapshot.
+    #[must_use]
     pub fn execute(
         &self,
         executable: &ExecutableTransaction,
@@ -350,18 +351,18 @@ impl Iterator for MergedPartitionIterator<'_> {
                             // Same key - provision takes precedence
                             let _ = self.base.next(); // consume base
                             let (key, value) = self.provisions.next().unwrap();
-                            match value {
-                                Some(v) => return Some((key, v)),
-                                None => continue, // deleted - skip to next
+                            if let Some(v) = value {
+                                return Some((key, v));
                             }
+                            // deleted - skip to next
                         }
                         std::cmp::Ordering::Greater => {
                             // Provision key is smaller - it's a new entry or override
                             let (key, value) = self.provisions.next().unwrap();
-                            match value {
-                                Some(v) => return Some((key, v)),
-                                None => continue, // deleted (didn't exist in base anyway)
+                            if let Some(v) = value {
+                                return Some((key, v));
                             }
+                            // deleted (didn't exist in base anyway)
                         }
                     }
                 }
@@ -372,10 +373,10 @@ impl Iterator for MergedPartitionIterator<'_> {
                 // Only provisions have items
                 (None, Some(_)) => {
                     let (key, value) = self.provisions.next().unwrap();
-                    match value {
-                        Some(v) => return Some((key, v)),
-                        None => continue, // deleted
+                    if let Some(v) = value {
+                        return Some((key, v));
                     }
+                    // deleted
                 }
                 // Both exhausted
                 (None, None) => return None,

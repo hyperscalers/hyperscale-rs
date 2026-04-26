@@ -68,11 +68,11 @@ use hyperscale_storage::{DatabaseUpdates, DbPartitionKey, SubstateDatabase};
 use hyperscale_types::{BlockHeight, NodeId, ShardGroupId};
 use std::collections::{HashMap, HashSet};
 
-/// System entity type bytes that should be filtered from DatabaseUpdates.
+/// System entity type bytes that should be filtered from `DatabaseUpdates`.
 ///
 /// These are global system components whose state is replicated to all shards
 /// and not yet set up for sharded consensus. Writes to these nodes must be
-/// excluded from the per-shard state_root computation.
+/// excluded from the per-shard `state_root` computation.
 const SYSTEM_ENTITY_TYPES: &[u8] = &[
     0x86, // GlobalConsensusManager
     0x82, // GlobalTransactionTracker
@@ -94,10 +94,10 @@ const SBOR_OWN_TAG: u8 = 0x90;
 // Stage 1: Ownership Resolution
 // ============================================================================
 
-/// Maps internal NodeIds (vaults, KV stores) to their owning declared account.
+/// Maps internal `NodeId`s (vaults, KV stores) to their owning declared account.
 ///
 /// For each declared account, scans all partition substates looking for
-/// SBOR-encoded `Own(NodeId)` references. Returns a map from internal NodeId
+/// SBOR-encoded `Own(NodeId)` references. Returns a map from internal `NodeId`
 /// to the account that owns it.
 ///
 /// This is the "walk down" from accounts to vaults. It's necessary because
@@ -136,7 +136,7 @@ fn resolve_owned_nodes<S: SubstateDatabase>(
 ///
 /// SBOR encodes `Own` as: `[0x90, <30 bytes NodeId>]`.
 /// We look for this tag followed by a known internal entity type byte.
-/// False positives are near-impossible since NodeIds are random hashes.
+/// False positives are near-impossible since `NodeId`s are random hashes.
 fn extract_owned_node_ids(value: &[u8], owner: NodeId, ownership: &mut HashMap<NodeId, NodeId>) {
     if value.len() < 31 {
         return;
@@ -150,7 +150,7 @@ fn extract_owned_node_ids(value: &[u8], owner: NodeId, ownership: &mut HashMap<N
     }
 }
 
-/// Expand declared NodeIds to include owned internal nodes (vaults) at a
+/// Expand declared `NodeId`s to include owned internal nodes (vaults) at a
 /// specific block height.
 ///
 /// Reads substates via JMT historical traversal. This is critical for provision
@@ -200,14 +200,14 @@ fn resolve_owned_nodes_at_height<S: hyperscale_storage::SubstateStore>(
 // Stage 2: Shard Filtering
 // ============================================================================
 
-/// Filter DatabaseUpdates for a single shard.
+/// Filter `DatabaseUpdates` for a single shard.
 ///
 /// Keeps only writes that:
-/// 1. Are not system entities (ConsensusManager, TransactionTracker, Validator)
+/// 1. Are not system entities (`ConsensusManager`, `TransactionTracker`, Validator)
 /// 2. Belong to a declared account (directly or as an owned internal node)
 /// 3. Are assigned to `local_shard` based on the owning account's hash
 ///
-/// The `declared_nodes` parameter contains account NodeIds from the transaction
+/// The `declared_nodes` parameter contains account `NodeId`s from the transaction
 /// manifest's declared reads/writes. The function scans their substates to
 /// discover owned vaults, then filters accordingly.
 pub fn filter_updates_for_shard<S: SubstateDatabase>(
@@ -266,16 +266,16 @@ pub fn filter_updates_for_shard<S: SubstateDatabase>(
 // Stage 3: Global Receipt Filtering
 // ============================================================================
 
-/// Filter DatabaseUpdates for cross-shard agreement (GlobalReceipt).
+/// Filter `DatabaseUpdates` for cross-shard agreement (`GlobalReceipt`).
 ///
 /// Like [`filter_updates_for_shard`] but WITHOUT shard assignment — keeps
 /// declared writes across ALL shards. This produces a deterministic set of
 /// writes that is identical on every shard executing the same transaction,
-/// enabling cross-shard agreement via `writes_root` in the GlobalReceipt.
+/// enabling cross-shard agreement via `writes_root` in the `GlobalReceipt`.
 ///
 /// Filters applied:
-/// 1. Drop system entities (ConsensusManager, TransactionTracker, Validator)
-/// 2. Drop undeclared writes (not in declared_reads/declared_writes or their owned vaults)
+/// 1. Drop system entities (`ConsensusManager`, `TransactionTracker`, Validator)
+/// 2. Drop undeclared writes (not in `declared_reads`/`declared_writes` or their owned vaults)
 /// 3. [OMITTED] No shard filtering — keep writes for all shards
 pub fn filter_updates_for_global_receipt<S: SubstateDatabase>(
     updates: &DatabaseUpdates,
@@ -313,11 +313,17 @@ pub fn filter_updates_for_global_receipt<S: SubstateDatabase>(
     filtered
 }
 
-/// Compute the `writes_root` for a GlobalReceipt from filtered DatabaseUpdates.
+/// Compute the `writes_root` for a `GlobalReceipt` from filtered `DatabaseUpdates`.
 ///
-/// SBOR-encodes the entire DatabaseUpdates (which uses BTreeMap for deterministic
+/// SBOR-encodes the entire `DatabaseUpdates` (which uses `BTreeMap` for deterministic
 /// iteration order) and hashes to produce a single root. All validators executing
 /// the same transaction with the same declared nodes will produce identical output.
+///
+/// # Panics
+///
+/// Panics if SBOR encoding of [`DatabaseUpdates`] fails. The Radix SBOR encoder
+/// is infallible for these structures, so this is unreachable in practice.
+#[must_use]
 pub fn compute_writes_root(updates: &DatabaseUpdates) -> hyperscale_types::WritesRoot {
     use hyperscale_types::{Hash, WritesRoot};
 
@@ -336,10 +342,11 @@ pub fn compute_writes_root(updates: &DatabaseUpdates) -> hyperscale_types::Write
 // Utilities
 // ============================================================================
 
-/// Extract the NodeId from a SpreadPrefixKeyMapper db_node_key.
+/// Extract the `NodeId` from a `SpreadPrefixKeyMapper` `db_node_key`.
 ///
-/// DbNodeKey format: 20-byte hash prefix + 30-byte NodeId = 50 bytes.
+/// `DbNodeKey` format: 20-byte hash prefix + 30-byte `NodeId` = 50 bytes.
 /// Returns None if the key is too short.
+#[must_use]
 pub fn db_node_key_to_node_id(db_node_key: &[u8]) -> Option<NodeId> {
     const HASH_PREFIX_LEN: usize = 20;
     const NODE_ID_LEN: usize = 30;
@@ -352,13 +359,15 @@ pub fn db_node_key_to_node_id(db_node_key: &[u8]) -> Option<NodeId> {
 }
 
 /// Check if an entity type byte is an internal (child) entity.
+#[must_use]
 pub fn is_internal_entity(entity_type: u8) -> bool {
     INTERNAL_ENTITY_TYPES.contains(&entity_type)
 }
 
-/// Compute the SpreadPrefixKeyMapper db_node_key for a NodeId.
+/// Compute the `SpreadPrefixKeyMapper` `db_node_key` for a `NodeId`.
 ///
-/// Returns the 50-byte key: 20-byte hash prefix + 30-byte NodeId.
+/// Returns the 50-byte key: 20-byte hash prefix + 30-byte `NodeId`.
+#[must_use]
 pub fn node_entity_key(node_id: &NodeId) -> Vec<u8> {
     use radix_substate_store_interface::db_key_mapper::{DatabaseKeyMapper, SpreadPrefixKeyMapper};
     let radix_node_id = radix_common::types::NodeId(node_id.0);

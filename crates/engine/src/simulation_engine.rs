@@ -34,6 +34,7 @@ pub struct SimulationEngine {
 
 impl SimulationEngine {
     /// Create a new simulation engine wrapping `inner` with a shared `cache`.
+    #[must_use]
     pub fn new(inner: RadixExecutor, cache: SimExecutionCache) -> Self {
         Self { inner, cache }
     }
@@ -45,7 +46,7 @@ impl SimulationEngine {
         tx: &Arc<RoutableTransaction>,
         local_shard: ShardGroupId,
         num_shards: u64,
-    ) -> Result<SingleTxResult, ExecutionError> {
+    ) -> SingleTxResult {
         let tx_hash = tx.hash();
         let lock = self
             .cache
@@ -70,7 +71,7 @@ impl SimulationEngine {
             }
         });
 
-        Ok(result.clone())
+        result.clone()
     }
 
     /// Execute a single cross-shard transaction, returning a cached result if available.
@@ -81,7 +82,7 @@ impl SimulationEngine {
         provisions: &[StateProvision],
         local_shard: ShardGroupId,
         num_shards: u64,
-    ) -> Result<SingleTxResult, ExecutionError> {
+    ) -> SingleTxResult {
         let tx_hash = tx.hash();
         let lock = self
             .cache
@@ -106,7 +107,7 @@ impl SimulationEngine {
             }
         });
 
-        Ok(result.clone())
+        result.clone()
     }
 }
 
@@ -129,7 +130,7 @@ impl Engine for SimulationEngine {
     ) -> Result<ExecutionOutput, ExecutionError> {
         let mut results = Vec::with_capacity(transactions.len());
         for tx in transactions {
-            results.push(self.execute_cached(snapshot, tx, local_shard, num_shards)?);
+            results.push(self.execute_cached(snapshot, tx, local_shard, num_shards));
         }
         Ok(ExecutionOutput::new(results))
     }
@@ -150,7 +151,7 @@ impl Engine for SimulationEngine {
                 provisions,
                 local_shard,
                 num_shards,
-            )?);
+            ));
         }
         Ok(ExecutionOutput::new(results))
     }

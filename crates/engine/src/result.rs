@@ -10,21 +10,25 @@ pub struct ExecutionOutput {
 
 impl ExecutionOutput {
     /// Create a new execution output.
+    #[must_use]
     pub fn new(results: Vec<SingleTxResult>) -> Self {
         Self { results }
     }
 
     /// Create an empty output (no transactions).
+    #[must_use]
     pub fn empty() -> Self {
         Self { results: vec![] }
     }
 
     /// Get the number of results.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.results.len()
     }
 
     /// Check if the output is empty.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.results.is_empty()
     }
@@ -35,6 +39,7 @@ impl ExecutionOutput {
     }
 
     /// Get a reference to the results.
+    #[must_use]
     pub fn results(&self) -> &[SingleTxResult] {
         &self.results
     }
@@ -50,7 +55,7 @@ pub struct SingleTxResult {
     pub success: bool,
 
     // ─── Receipt fields ──────────────────────────────────────────────────
-    /// Hash of GlobalReceipt (outcome + event_root).
+    /// Hash of `GlobalReceipt` (outcome + `event_root`).
     pub receipt_hash: GlobalReceiptHash,
 
     /// Full local receipt with shard-filtered database updates and events.
@@ -65,6 +70,7 @@ pub struct SingleTxResult {
 
 impl SingleTxResult {
     /// Create a successful result.
+    #[must_use]
     pub fn success(
         tx_hash: TxHash,
         receipt_hash: GlobalReceiptHash,
@@ -82,6 +88,7 @@ impl SingleTxResult {
     }
 
     /// Create a failed result.
+    #[must_use]
     pub fn failure(tx_hash: TxHash, error: impl Into<String>) -> Self {
         let local_receipt = LocalReceipt::failure();
         // Failures have no writes, so writes_root is ZERO.
@@ -99,11 +106,13 @@ impl SingleTxResult {
     }
 
     /// Check if this is a successful execution.
+    #[must_use]
     pub fn is_success(&self) -> bool {
         self.success
     }
 
     /// Check if this is a failed execution.
+    #[must_use]
     pub fn is_failure(&self) -> bool {
         !self.success
     }

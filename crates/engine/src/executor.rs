@@ -107,6 +107,11 @@ pub trait Engine: Clone + Send + Sync + 'static {
     /// caller-provided snapshot. Snapshot hoisting lets the caller
     /// share one rocksdb snapshot across multiple engine calls in the
     /// same action batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecutionError`] if any transaction in the batch fails
+    /// engine validation or execution.
     fn execute_single_shard<D: SubstateDatabase>(
         &self,
         snapshot: &D,
@@ -122,6 +127,11 @@ pub trait Engine: Clone + Send + Sync + 'static {
     /// calls in the same action batch — each call avoids a fresh
     /// `storage.snapshot()` (which costs `db.snapshot()` +
     /// `read_jmt_metadata` against the default CF).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecutionError`] if any transaction in the batch fails
+    /// engine validation or execution.
     fn execute_cross_shard<D: SubstateDatabase>(
         &self,
         snapshot: &D,
@@ -140,12 +150,20 @@ pub trait Engine: Clone + Send + Sync + 'static {
     ) -> Option<Vec<hyperscale_types::StateEntry>>;
 
     /// Run genesis bootstrapping on the given storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GenesisError`] if the genesis bootstrap fails.
     fn run_genesis<S: SubstateDatabase + CommittableSubstateDatabase>(
         &self,
         storage: &mut S,
     ) -> Result<(), GenesisError>;
 
     /// Run genesis with custom configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GenesisError`] if the genesis bootstrap fails.
     fn run_genesis_with_config<S: SubstateDatabase + CommittableSubstateDatabase>(
         &self,
         storage: &mut S,
@@ -198,6 +216,7 @@ impl RadixExecutor {
     ///
     /// The executor does not own storage - storage is passed to each method.
     /// VM modules and execution config are cached to avoid per-transaction overhead.
+    #[must_use]
     pub fn new(network: NetworkDefinition) -> Self {
         let vm_modules = DefaultVmModules::default();
         let exec_config = ExecutionConfig::for_notarized_transaction(network.clone());
@@ -216,15 +235,23 @@ impl RadixExecutor {
     ///
     /// This initializes the Radix Engine state with system packages, faucet, etc.
     /// Should be called once per simulation before any transactions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GenesisError`] if the genesis bootstrap fails.
     pub fn run_genesis<S: SubstateDatabase + CommittableSubstateDatabase>(
         &self,
         storage: &mut S,
     ) -> Result<(), GenesisError> {
-        GenesisBuilder::new(self.network.clone()).build(storage)?;
+        GenesisBuilder::new(self.network.clone()).build(storage);
         Ok(())
     }
 
     /// Run genesis with custom configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GenesisError`] if the genesis bootstrap fails.
     pub fn run_genesis_with_config<S: SubstateDatabase + CommittableSubstateDatabase>(
         &self,
         storage: &mut S,
@@ -232,7 +259,7 @@ impl RadixExecutor {
     ) -> Result<(), GenesisError> {
         GenesisBuilder::new(self.network.clone())
             .with_config(config)
-            .build(storage)?;
+            .build(storage);
         Ok(())
     }
 
@@ -244,6 +271,11 @@ impl RadixExecutor {
     /// **IMPORTANT**: This method does NOT commit state changes. The writes
     /// are returned in the `ExecutionOutput` and should be committed later
     /// when the `WaveCertificate` is included in a committed block.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecutionError`] if any transaction in the batch fails
+    /// engine validation or execution.
     #[instrument(level = Level::DEBUG, skip_all, fields(
         tx_count = transactions.len(),
         latency_us = tracing::field::Empty,
@@ -269,7 +301,10 @@ impl RadixExecutor {
             results.push(result);
         }
 
-        tracing::Span::current().record("latency_us", start.elapsed().as_micros() as u64);
+        tracing::Span::current().record(
+            "latency_us",
+            u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX),
+        );
         Ok(ExecutionOutput::new(results))
     }
 
@@ -281,6 +316,11 @@ impl RadixExecutor {
     /// **IMPORTANT**: This method does NOT commit state changes. The writes
     /// are returned in the `ExecutionOutput` and should be committed later
     /// when the `WaveCertificate` is included in a committed block.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecutionError`] if any transaction in the batch fails
+    /// engine validation or execution.
     ///
     /// # Performance
     ///
@@ -327,7 +367,7 @@ impl RadixExecutor {
 
             // Same snapshot for receipt filtering — resolve_owned_nodes
             // must see the same ownership state as the execution.
-            let result = self.receipt_to_result(snapshot, tx, &receipt, local_shard, num_shards);
+            let result = Self::receipt_to_result(snapshot, tx, &receipt, local_shard, num_shards);
 
             // NO COMMIT HERE - DatabaseUpdates are cached by the state machine
             // and applied when the WaveCertificate is included in a block.
@@ -335,7 +375,10 @@ impl RadixExecutor {
             results.push(result);
         }
 
-        tracing::Span::current().record("latency_us", start.elapsed().as_micros() as u64);
+        tracing::Span::current().record(
+            "latency_us",
+            u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX),
+        );
         Ok(ExecutionOutput::new(results))
     }
 
@@ -377,7 +420,7 @@ impl RadixExecutor {
         // storage would race with concurrent cert commits, producing
         // different filtered DatabaseUpdates and receipt_hash divergence
         // across validators.
-        let result = self.receipt_to_result(snapshot, tx, &receipt, local_shard, num_shards);
+        let result = Self::receipt_to_result(snapshot, tx, &receipt, local_shard, num_shards);
 
         // NO COMMIT HERE - DatabaseUpdates are cached by the state machine
         // and applied when the WaveCertificate is included in a block.
@@ -391,7 +434,6 @@ impl RadixExecutor {
     /// shared storage or an execution snapshot. Using the same snapshot as
     /// execution ensures `resolve_owned_nodes` sees consistent ownership state.
     fn receipt_to_result<S: SubstateDatabase>(
-        &self,
         storage: &S,
         tx: &RoutableTransaction,
         receipt: &TransactionReceipt,
@@ -444,6 +486,7 @@ impl RadixExecutor {
     }
 
     /// Get reference to the network definition.
+    #[must_use]
     pub fn network(&self) -> &NetworkDefinition {
         &self.network
     }

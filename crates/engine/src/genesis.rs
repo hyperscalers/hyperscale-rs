@@ -71,6 +71,12 @@ impl Default for GenesisConfig {
 
 impl GenesisConfig {
     /// Create a minimal test configuration.
+    ///
+    /// # Panics
+    ///
+    /// Panics if [`DEFAULT_FAUCET_SUPPLY`] cannot be converted to a [`Decimal`] —
+    /// the constant is fixed, so this is unreachable in practice.
+    #[must_use]
     pub fn test_minimal() -> Self {
         Self {
             genesis_epoch: Epoch::of(1),
@@ -86,11 +92,13 @@ impl GenesisConfig {
     }
 
     /// Create a test configuration with default faucet supply.
+    #[must_use]
     pub fn test_default() -> Self {
         Self::test_minimal()
     }
 
     /// Create a production configuration (no faucet).
+    #[must_use]
     pub fn production() -> Self {
         Self {
             genesis_epoch: Epoch::of(1),
@@ -154,6 +162,7 @@ pub struct GenesisBuilder {
 
 impl GenesisBuilder {
     /// Create a new genesis builder.
+    #[must_use]
     pub fn new(network: NetworkDefinition) -> Self {
         Self {
             network,
@@ -162,13 +171,14 @@ impl GenesisBuilder {
     }
 
     /// Set the genesis configuration.
+    #[must_use]
     pub fn with_config(mut self, config: GenesisConfig) -> Self {
         self.config = config;
         self
     }
 
     /// Execute genesis on the provided database.
-    pub fn build<S>(self, store: &mut S) -> Result<GenesisReceipts, GenesisError>
+    pub fn build<S>(self, store: &mut S) -> GenesisReceipts
     where
         S: SubstateDatabase + CommittableSubstateDatabase,
     {
@@ -182,6 +192,6 @@ impl GenesisBuilder {
             .from_bootstrap_to(ProtocolVersion::CuttlefishPart2)
             .commit_each_protocol_update_advanced(store, &mut hooks, &vm_modules);
 
-        Ok(hooks.into_genesis_receipts())
+        hooks.into_genesis_receipts()
     }
 }

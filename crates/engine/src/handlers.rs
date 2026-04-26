@@ -73,10 +73,11 @@ pub fn execute_cross_shard<S: SubstateStore, E: Engine>(
     }
 }
 
-/// Extract execution-ready result data from a SingleTxResult.
+/// Extract execution-ready result data from a `SingleTxResult`.
 ///
 /// Builds a `TxOutcome` for the execution accumulator.
 /// Called on the handler thread (after execution, before returning to state machine).
+#[must_use]
 pub fn extract_execution_result(result: &SingleTxResult) -> TxOutcome {
     TxOutcome {
         tx_hash: result.tx_hash,

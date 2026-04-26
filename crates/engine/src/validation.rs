@@ -4,7 +4,7 @@
 //! enter the mempool. This is critical for:
 //!
 //! 1. **Security**: Reject invalid transactions at ingress, not execution
-//! 2. **DoS prevention**: Don't gossip or store invalid transactions
+//! 2. **`DoS` prevention**: Don't gossip or store invalid transactions
 //! 3. **Consistency**: Match Babylon node behavior (validate before mempool)
 //!
 //! # Usage
@@ -47,7 +47,7 @@ pub enum ValidationError {
 impl From<TransactionValidationError> for ValidationError {
     fn from(e: TransactionValidationError) -> Self {
         // Categorize the error type for better error messages
-        let msg = format!("{:?}", e);
+        let msg = format!("{e:?}");
         if msg.contains("Signature") || msg.contains("signature") {
             ValidationError::InvalidSignature(msg)
         } else {
@@ -82,6 +82,7 @@ pub struct TransactionValidation {
 
 impl TransactionValidation {
     /// Create a new transaction validator for the given network.
+    #[must_use]
     pub fn new(network: NetworkDefinition) -> Self {
         let validator = TransactionValidator::new_with_latest_config(&network);
         Self {
@@ -95,6 +96,7 @@ impl TransactionValidation {
     ///
     /// Used in simulation/test environments where synthetic transactions
     /// don't have valid cryptographic signatures.
+    #[must_use]
     pub fn permissive(network: NetworkDefinition) -> Self {
         let validator = TransactionValidator::new_with_latest_config(&network);
         Self {
@@ -115,6 +117,12 @@ impl TransactionValidation {
     ///
     /// - `Ok(())` if the transaction is valid
     /// - `Err(ValidationError)` if validation fails
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError::PreparationFailed`] when the transaction
+    /// fails Radix decoding or signature verification. Permissive validators
+    /// always return `Ok(())`.
     ///
     /// # Performance
     ///
@@ -146,6 +154,7 @@ impl TransactionValidation {
     }
 
     /// Get the network definition.
+    #[must_use]
     pub fn network(&self) -> &NetworkDefinition {
         &self.network
     }
@@ -196,7 +205,7 @@ mod tests {
     fn wide_validity_range() -> TimestampRange {
         TimestampRange::new(
             WeightedTimestamp::ZERO,
-            WeightedTimestamp::ZERO.plus(Duration::from_secs(60)),
+            WeightedTimestamp::ZERO.plus(Duration::from_mins(1)),
         )
     }
 
@@ -240,11 +249,7 @@ mod tests {
         let result = validator.validate_transaction(&routable);
 
         // Should pass validation
-        assert!(
-            result.is_ok(),
-            "Valid transaction should pass: {:?}",
-            result
-        );
+        assert!(result.is_ok(), "Valid transaction should pass: {result:?}");
     }
 
     #[test]
