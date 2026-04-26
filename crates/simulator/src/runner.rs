@@ -47,18 +47,24 @@ pub struct Simulator {
     /// RNG for workload generation.
     rng: ChaCha8Rng,
 
-    /// Tracks in-flight transactions: hash -> (submit_time, target_shard).
+    /// Tracks in-flight transactions: `hash -> (submit_time, target_shard)`.
     in_flight: HashMap<TxHash, (Duration, ShardGroupId)>,
 }
 
 impl Simulator {
     /// Create a new simulator with the given configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SimulatorError::AccountPool`] if the requested account pool
+    /// can't be allocated (e.g. zero-shard or zero-account configuration).
     pub fn new(config: SimulatorConfig) -> Result<Self, SimulatorError> {
         let network_config = config.to_network_config();
         let runner = SimulationRunner::new(&network_config, config.seed);
 
         // Generate accounts
-        let accounts = AccountPool::generate(config.num_shards as u64, config.accounts_per_shard)?;
+        let accounts =
+            AccountPool::generate(u64::from(config.num_shards), config.accounts_per_shard)?;
 
         // Create workload generator using spammer's TransferWorkload
         let workload = TransferWorkload::new(NetworkDefinition::simulator())
@@ -231,14 +237,13 @@ impl Simulator {
                         if let Some(status) = self.runner.tx_status(node_idx, &hash) {
                             if status.is_final() {
                                 pending.remove(&hash);
-                                match status {
-                                    TransactionStatus::Completed(TransactionDecision::Accept) => {
-                                        total_completed += 1;
-                                    }
-                                    _ => {
-                                        total_failed += 1;
-                                        warn!(?hash, %status, "Funding transaction failed");
-                                    }
+                                if let TransactionStatus::Completed(TransactionDecision::Accept) =
+                                    status
+                                {
+                                    total_completed += 1;
+                                } else {
+                                    total_failed += 1;
+                                    warn!(?hash, %status, "Funding transaction failed");
                                 }
                             }
                         }
@@ -328,7 +333,13 @@ impl Simulator {
             self.check_completions();
 
             // Progress logging
-            if self.runner.now() - last_progress_time >= progress_interval {
+            if self
+                .runner
+                .now()
+                .checked_sub(last_progress_time)
+                .unwrap_or_default()
+                >= progress_interval
+            {
                 self.log_progress(start_time, submission_end_time);
                 last_progress_time = self.runner.now();
             }
@@ -340,7 +351,10 @@ impl Simulator {
         self.metrics
             .set_in_flight_at_end(self.in_flight.len() as u64);
         info!(
-            total_time_secs = (end_time - start_time).as_secs_f64(),
+            total_time_secs = end_time
+                .checked_sub(start_time)
+                .unwrap_or_default()
+                .as_secs_f64(),
             "Simulation complete"
         );
 
@@ -380,8 +394,9 @@ impl Simulator {
                                     "Transaction completed"
                                 );
                             }
-                            TransactionStatus::Completed(TransactionDecision::Reject)
-                            | TransactionStatus::Completed(TransactionDecision::Aborted) => {
+                            TransactionStatus::Completed(
+                                TransactionDecision::Reject | TransactionDecision::Aborted,
+                            ) => {
                                 // Transaction was rejected or aborted
                                 self.metrics.record_rejection();
                                 debug!(?hash, %status, "Transaction rejected/aborted");
@@ -398,19 +413,20 @@ impl Simulator {
     fn get_target_shard(&self, tx: &hyperscale_types::RoutableTransaction) -> ShardGroupId {
         tx.declared_writes
             .first()
-            .map(|node_id| shard_for_node(node_id, self.config.num_shards as u64))
-            .unwrap_or(ShardGroupId(0))
+            .map_or(ShardGroupId(0), |node_id| {
+                shard_for_node(node_id, u64::from(self.config.num_shards))
+            })
     }
 
     /// Get a node index for submitting to a shard (for status checks).
     fn get_node_for_shard(&self, shard: ShardGroupId) -> u32 {
         // Return the first validator in the shard
-        shard.0 as u32 * self.config.validators_per_shard
+        u32::try_from(shard.0).unwrap_or(u32::MAX) * self.config.validators_per_shard
     }
 
     /// Get all node indices in a shard.
     fn nodes_for_shard(&self, shard: ShardGroupId) -> Vec<NodeIndex> {
-        let start = shard.0 as u32 * self.config.validators_per_shard;
+        let start = u32::try_from(shard.0).unwrap_or(u32::MAX) * self.config.validators_per_shard;
         let end = start + self.config.validators_per_shard;
         (start..end).collect()
     }
@@ -418,9 +434,14 @@ impl Simulator {
     /// Log progress during simulation.
     fn log_progress(&mut self, start_time: Duration, end_time: Duration) {
         let (submitted, completed, rejected) = self.metrics.current_stats();
-        let elapsed = self.runner.now() - start_time;
+        let elapsed = self
+            .runner
+            .now()
+            .checked_sub(start_time)
+            .unwrap_or_default();
         let remaining = end_time.saturating_sub(self.runner.now());
 
+        #[allow(clippy::cast_precision_loss)] // headline TPS metric for human-readable logging
         let tps = if elapsed.as_secs_f64() > 0.0 {
             completed as f64 / elapsed.as_secs_f64()
         } else {
@@ -466,6 +487,7 @@ impl Simulator {
     }
 
     /// Get the underlying simulation runner (for advanced use).
+    #[must_use]
     pub fn runner(&self) -> &SimulationRunner {
         &self.runner
     }
@@ -476,6 +498,7 @@ impl Simulator {
     }
 
     /// Get account usage statistics.
+    #[must_use]
     pub fn account_usage_stats(&self) -> hyperscale_spammer::AccountUsageStats {
         self.accounts.usage_stats()
     }
@@ -484,10 +507,11 @@ impl Simulator {
     ///
     /// Returns a report of all incomplete transactions, grouped by status
     /// and shard, with potential cycle detection.
+    #[must_use]
     pub fn analyze_livelocks(&self) -> crate::livelock::LivelockReport {
         let analyzer = crate::livelock::LivelockAnalyzer::from_runner(
             &self.runner,
-            self.config.num_shards as u64,
+            u64::from(self.config.num_shards),
             self.config.validators_per_shard,
         );
         analyzer.analyze()
@@ -502,6 +526,7 @@ impl Simulator {
     }
 
     /// Check if traffic analysis is enabled.
+    #[must_use]
     pub fn has_traffic_analysis(&self) -> bool {
         self.runner.has_traffic_analysis()
     }
@@ -510,6 +535,7 @@ impl Simulator {
     ///
     /// Returns `None` if traffic analysis is not enabled.
     /// Call `enable_traffic_analysis()` before `run_for()` to collect data.
+    #[must_use]
     pub fn traffic_report(&self) -> Option<hyperscale_simulation::BandwidthReport> {
         self.runner.traffic_report()
     }
@@ -518,6 +544,7 @@ impl Simulator {
 /// Errors that can occur during simulation.
 #[derive(Debug, thiserror::Error)]
 pub enum SimulatorError {
+    /// The account pool could not be constructed.
     #[error("Account pool error: {0}")]
     AccountPool(#[from] AccountPoolError),
 }

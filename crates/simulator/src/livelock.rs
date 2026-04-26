@@ -56,7 +56,7 @@ pub struct StuckTransaction {
 pub struct LivelockCycle {
     /// Transactions involved in the potential cycle
     pub transactions: Vec<TxHash>,
-    /// Addresses (NodeIds) that form the contention
+    /// Addresses (`NodeIds`) that form the contention
     pub contended_addresses: Vec<NodeId>,
     /// Shards involved in the cycle
     pub involved_shards: Vec<ShardGroupId>,
@@ -187,7 +187,8 @@ impl LivelockAnalyzer {
         // Collect from first validator of each shard (all validators see same mempool)
         for shard_idx in 0..num_shards {
             let shard = ShardGroupId(shard_idx);
-            let first_node_idx = shard_idx as u32 * validators_per_shard;
+            let first_node_idx =
+                u32::try_from(shard_idx).unwrap_or(u32::MAX) * validators_per_shard;
 
             if let Some(node) = runner.node(first_node_idx) {
                 let incomplete = node.mempool().incomplete_transactions();

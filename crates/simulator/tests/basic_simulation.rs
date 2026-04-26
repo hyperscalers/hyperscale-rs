@@ -45,6 +45,7 @@ fn test_single_shard_simulation() {
     );
 
     // With a well-configured simulation, some transactions should complete
+    #[allow(clippy::cast_precision_loss)] // sanity-check ratio for human-readable output
     let completion_rate = report.total_completed as f64 / report.total_submitted as f64;
     println!("Completion rate: {:.2}%", completion_rate * 100.0);
 

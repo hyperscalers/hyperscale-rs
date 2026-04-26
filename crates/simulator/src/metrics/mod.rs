@@ -51,6 +51,12 @@ pub struct MetricsCollector {
 
 impl MetricsCollector {
     /// Create a new metrics collector.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the `Histogram::new(3)` constructor fails (unreachable: `3` is
+    /// a valid significant-digits argument).
+    #[must_use]
     pub fn new(start_time: Duration) -> Self {
         Self {
             submissions: 0,
@@ -84,7 +90,7 @@ impl MetricsCollector {
     pub fn record_completion(&mut self, latency: Duration) {
         self.completions += 1;
         // Store latency in microseconds for better resolution
-        let latency_us = latency.as_micros() as u64;
+        let latency_us = u64::try_from(latency.as_micros()).unwrap_or(u64::MAX);
         let _ = self.latency_histogram.record(latency_us);
     }
 
@@ -118,6 +124,7 @@ impl MetricsCollector {
             .saturating_sub(self.last_sample_completions);
 
         // Calculate instantaneous TPS
+        #[allow(clippy::cast_precision_loss)] // headline TPS metric for human-readable output
         let instant_tps = if elapsed_since_last.as_secs_f64() > 0.0 {
             completions_since_last as f64 / elapsed_since_last.as_secs_f64()
         } else {
@@ -154,19 +161,21 @@ impl MetricsCollector {
     }
 
     /// Current raw stats: (submitted, completed, rejected).
+    #[must_use]
     pub fn current_stats(&self) -> (u64, u64, u64) {
         (self.submissions, self.completions, self.rejections)
     }
 
     /// Finalize and generate a report.
+    #[must_use]
     pub fn finalize(self, end_time: Duration) -> SimulationReport {
         let total_duration = end_time.saturating_sub(self.start_time);
         let submission_duration = self
             .submission_end_time
-            .map(|t| t.saturating_sub(self.start_time))
-            .unwrap_or(total_duration);
+            .map_or(total_duration, |t| t.saturating_sub(self.start_time));
 
         // Calculate TPS based on submission duration
+        #[allow(clippy::cast_precision_loss)] // headline TPS metric for human-readable output
         let average_tps = if submission_duration.as_secs_f64() > 0.0 {
             self.completions as f64 / submission_duration.as_secs_f64()
         } else {
@@ -207,7 +216,7 @@ pub struct MetricsSample {
     pub instant_tps: f64,
     /// Number of locked nodes at this point.
     pub locked_nodes: u64,
-    /// Contention ratio at this point (pending_deferred / pending_count).
+    /// Contention ratio at this point (`pending_deferred` / `pending_count`).
     pub contention_ratio: f64,
 }
 
@@ -241,37 +250,48 @@ pub struct SimulationReport {
 
 impl SimulationReport {
     /// Get the P50 (median) latency.
+    #[must_use]
     pub fn p50_latency(&self) -> Duration {
         Duration::from_micros(self.latency_histogram.value_at_quantile(0.50))
     }
 
     /// Get the P90 latency.
+    #[must_use]
     pub fn p90_latency(&self) -> Duration {
         Duration::from_micros(self.latency_histogram.value_at_quantile(0.90))
     }
 
     /// Get the P99 latency.
+    #[must_use]
     pub fn p99_latency(&self) -> Duration {
         Duration::from_micros(self.latency_histogram.value_at_quantile(0.99))
     }
 
     /// Get the maximum latency.
+    #[must_use]
     pub fn max_latency(&self) -> Duration {
         Duration::from_micros(self.latency_histogram.max())
     }
 
     /// Get the average latency.
+    #[must_use]
     pub fn avg_latency(&self) -> Duration {
-        Duration::from_micros(self.latency_histogram.mean() as u64)
+        // Mean is bounded by `max()` (~hours of µs), so the cast is safe in practice.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let mean = self.latency_histogram.mean() as u64;
+        Duration::from_micros(mean)
     }
 
     /// Get the minimum latency.
+    #[must_use]
     pub fn min_latency(&self) -> Duration {
         Duration::from_micros(self.latency_histogram.min())
     }
 
     /// Rejection rate (rejected / (completed + rejected)).
     /// This is the meaningful failure rate - how many decided transactions failed.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)] // headline failure rate for human-readable output
     pub fn rejection_rate(&self) -> f64 {
         let decided = self.total_completed + self.total_rejected;
         if decided > 0 {

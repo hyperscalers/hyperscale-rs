@@ -85,7 +85,7 @@ fn main() {
         if args.shards <= 1 {
             0.0
         } else {
-            1.0 - 1.0 / args.shards as f64
+            1.0 - 1.0 / f64::from(args.shards)
         }
     });
 
@@ -108,12 +108,12 @@ fn main() {
     // => batch_size = tps * batch_interval
     let batch_interval_ms = 50u64; // 50ms between batches = 20 batches/sec
     let batches_per_sec = 1000 / batch_interval_ms;
-    let batch_size = (args.tps as u64 / batches_per_sec).max(1) as usize;
+    let batch_size = usize::try_from((args.tps as u64 / batches_per_sec).max(1)).unwrap_or(1);
 
     info!(
         batch_size,
         batch_interval_ms,
-        effective_tps = batch_size * batches_per_sec as usize,
+        effective_tps = batch_size * usize::try_from(batches_per_sec).unwrap_or(usize::MAX),
         "Workload parameters"
     );
 
