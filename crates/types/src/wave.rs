@@ -23,11 +23,11 @@
 //! 5. [`FinalizedWave`] — all data needed for block commit
 
 use crate::{
-    compute_padded_merkle_root, Attempt, BlockHash, BlockHeight, Bls12381G2Signature,
-    ExecutionCertificateHash, GlobalReceiptHash, GlobalReceiptRoot, Hash, LocalReceipt,
-    ProvisionTxRoot, ReceiptBundle, RoutableTransaction, ShardGroupId, SignerBitfield,
-    TopologySnapshot, TransactionDecision, TransactionOutcome, TxHash, ValidatorId, WaveIdHash,
-    WaveReceiptHash, WeightedTimestamp, RETENTION_HORIZON,
+    Attempt, BlockHash, BlockHeight, Bls12381G2Signature, ExecutionCertificateHash,
+    GlobalReceiptHash, GlobalReceiptRoot, Hash, LocalReceipt, ProvisionTxRoot, RETENTION_HORIZON,
+    ReceiptBundle, RoutableTransaction, ShardGroupId, SignerBitfield, TopologySnapshot,
+    TransactionDecision, TransactionOutcome, TxHash, ValidatorId, WaveIdHash, WaveReceiptHash,
+    WeightedTimestamp, compute_padded_merkle_root,
 };
 use sbor::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
@@ -1223,8 +1223,8 @@ impl sbor::Describe<sbor::NoCustomTypeKind> for FinalizedWave {
 mod tests {
     use super::*;
     use crate::{
-        generate_bls_keypair, test_utils::test_transaction_with_nodes, DatabaseUpdates, NodeId,
-        ValidatorInfo, ValidatorSet,
+        DatabaseUpdates, NodeId, ValidatorInfo, ValidatorSet, generate_bls_keypair,
+        test_utils::test_transaction_with_nodes,
     };
 
     /// Build a 2-shard topology with validator 0 on shard 0.

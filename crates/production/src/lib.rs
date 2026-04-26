@@ -80,4 +80,4 @@ pub use hyperscale_storage_rocksdb::{
 };
 pub use runner::{ProductionRunner, RunnerError};
 pub use status::{SyncStateKind, SyncStatus};
-pub use telemetry::{init_telemetry, TelemetryConfig, TelemetryGuard};
+pub use telemetry::{TelemetryConfig, TelemetryGuard, init_telemetry};

@@ -12,8 +12,8 @@
 
 use hyperscale_core::{Action, ProtocolEvent};
 use hyperscale_types::{
-    BlockHeight, Bls12381G1PublicKey, CommittedBlockHeader, ShardGroupId, TopologySnapshot,
-    ValidatorId, WeightedTimestamp, REMOTE_HEADER_RETENTION,
+    BlockHeight, Bls12381G1PublicKey, CommittedBlockHeader, REMOTE_HEADER_RETENTION, ShardGroupId,
+    TopologySnapshot, ValidatorId, WeightedTimestamp,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -292,22 +292,22 @@ impl RemoteHeaderCoordinator {
         // If a fallback fetch was already dispatched for this gap, cancel it
         // now — otherwise the fetch protocol would keep retrying forever
         // even though gossip has closed the gap.
-        if let Some(expected) = self.expected.get_mut(&shard) {
-            if height > expected.last_verified_height {
-                let pending_fetch_from = if expected.requested {
-                    Some(BlockHeight(expected.last_verified_height.0 + 1))
-                } else {
-                    None
-                };
-                expected.last_verified_height = height;
-                expected.last_verified_at = Some(self.local_committed_ts);
-                expected.requested = false;
-                if let Some(from_height) = pending_fetch_from {
-                    actions.push(Action::CancelCommittedHeaderFetch {
-                        source_shard: shard,
-                        from_height,
-                    });
-                }
+        if let Some(expected) = self.expected.get_mut(&shard)
+            && height > expected.last_verified_height
+        {
+            let pending_fetch_from = if expected.requested {
+                Some(BlockHeight(expected.last_verified_height.0 + 1))
+            } else {
+                None
+            };
+            expected.last_verified_height = height;
+            expected.last_verified_at = Some(self.local_committed_ts);
+            expected.requested = false;
+            if let Some(from_height) = pending_fetch_from {
+                actions.push(Action::CancelCommittedHeaderFetch {
+                    source_shard: shard,
+                    from_height,
+                });
             }
         }
 
@@ -664,9 +664,11 @@ mod tests {
     #[test]
     fn test_get_verified_returns_none_when_empty() {
         let coord = RemoteHeaderCoordinator::new();
-        assert!(coord
-            .get_verified(ShardGroupId(1), BlockHeight(5))
-            .is_none());
+        assert!(
+            coord
+                .get_verified(ShardGroupId(1), BlockHeight(5))
+                .is_none()
+        );
         assert!(!coord.has_verified(ShardGroupId(1), BlockHeight(5)));
     }
 }

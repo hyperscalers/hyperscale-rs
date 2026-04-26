@@ -1,8 +1,8 @@
 //! `CommittedBlockHeader` gossip message for cross-shard header broadcast.
 
 use hyperscale_types::{
-    committed_block_header_message, Bls12381G2Signature, CommittedBlockHeader, MessagePriority,
-    NetworkMessage, ValidatorId,
+    Bls12381G2Signature, CommittedBlockHeader, MessagePriority, NetworkMessage, ValidatorId,
+    committed_block_header_message,
 };
 use sbor::prelude::BasicSbor;
 
@@ -64,9 +64,9 @@ mod tests {
     #[test]
     fn test_sbor_roundtrip() {
         use hyperscale_types::{
-            zero_bls_signature, BlockHeader, BlockHeight, CertificateRoot, Hash, LocalReceiptRoot,
-            ProvisionsRoot, QuorumCertificate, Round, ShardGroupId, StateRoot, TransactionRoot,
-            ValidatorId,
+            BlockHeader, BlockHeight, CertificateRoot, Hash, LocalReceiptRoot, ProvisionsRoot,
+            QuorumCertificate, Round, ShardGroupId, StateRoot, TransactionRoot, ValidatorId,
+            zero_bls_signature,
         };
         use std::collections::BTreeMap;
 

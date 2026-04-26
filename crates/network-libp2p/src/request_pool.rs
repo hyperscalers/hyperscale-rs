@@ -155,12 +155,12 @@ impl RequestStreamPool {
 
     /// Spawn a new actor for `peer` (respecting backoff) and enqueue `req`.
     async fn spawn_and_send(&self, peer: PeerId, req: PendingRequest) -> Result<(), NetworkError> {
-        if let Some(state) = self.backoff.get(&peer) {
-            if Instant::now() < state.next_attempt {
-                return Err(NetworkError::StreamIo(
-                    "peer in backoff after recent failure".into(),
-                ));
-            }
+        if let Some(state) = self.backoff.get(&peer)
+            && Instant::now() < state.next_attempt
+        {
+            return Err(NetworkError::StreamIo(
+                "peer in backoff after recent failure".into(),
+            ));
         }
 
         let (req_tx, req_rx) = mpsc::channel(PEER_CHANNEL_CAPACITY);
@@ -318,7 +318,7 @@ async fn do_request_response(stream: &mut Stream, type_id: &str, data: &[u8]) ->
     let wire_bytes = match stream_framing::write_typed_frame(stream, type_id, data).await {
         Ok(bytes) => bytes,
         Err(e) => {
-            return IoOutcome::WriteFailed(NetworkError::StreamIo(format!("write failed: {e}")))
+            return IoOutcome::WriteFailed(NetworkError::StreamIo(format!("write failed: {e}")));
         }
     };
     metrics::record_libp2p_bandwidth(0, wire_bytes as u64);
@@ -328,7 +328,7 @@ async fn do_request_response(stream: &mut Stream, type_id: &str, data: &[u8]) ->
         Err(e) => {
             return IoOutcome::ResponseFailed(NetworkError::StreamIo(format!(
                 "read length failed: {e}"
-            )))
+            )));
         }
     };
 

@@ -25,8 +25,8 @@
 //! ```
 
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use thiserror::Error;
 use tracing::instrument;
 

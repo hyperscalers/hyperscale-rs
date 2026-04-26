@@ -17,7 +17,7 @@
 //!   gated on terminal execution certificates from the target shard.
 
 use hyperscale_types::{
-    BlockHeight, BloomFilter, ProvisionHash, Provisions, ShardGroupId, DEFAULT_FPR,
+    BlockHeight, BloomFilter, DEFAULT_FPR, ProvisionHash, Provisions, ShardGroupId,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};

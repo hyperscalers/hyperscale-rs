@@ -6,7 +6,7 @@
 //! funded via runtime transactions before the main workload starts.
 
 use hyperscale_types::{
-    ed25519_keypair_from_seed, shard_for_node, Ed25519PrivateKey, NodeId, ShardGroupId,
+    Ed25519PrivateKey, NodeId, ShardGroupId, ed25519_keypair_from_seed, shard_for_node,
 };
 
 /// Maximum number of accounts that can be created per shard at genesis.
@@ -580,10 +580,10 @@ impl AccountPool {
     fn record_usage(&self, shard: ShardGroupId, idx: usize) {
         use std::sync::atomic::Ordering;
 
-        if let Some(counts) = self.usage_counts.get(&shard) {
-            if let Some(counter) = counts.get(idx) {
-                counter.fetch_add(1, Ordering::Relaxed);
-            }
+        if let Some(counts) = self.usage_counts.get(&shard)
+            && let Some(counter) = counts.get(idx)
+        {
+            counter.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -755,7 +755,9 @@ impl AccountUsageStats {
 #[derive(Debug, thiserror::Error)]
 pub enum AccountPoolError {
     /// Couldn't find seeds for every requested shard within the iteration budget.
-    #[error("Could not generate enough accounts for {shards} shards with {accounts_per_shard} accounts each")]
+    #[error(
+        "Could not generate enough accounts for {shards} shards with {accounts_per_shard} accounts each"
+    )]
     GenerationFailed {
         /// Number of shards requested.
         shards: u64,

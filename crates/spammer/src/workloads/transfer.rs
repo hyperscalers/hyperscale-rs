@@ -3,7 +3,7 @@
 use crate::accounts::{AccountPool, FundedAccount, SelectionMode};
 use crate::workloads::WorkloadGenerator;
 use hyperscale_types::{
-    routable_from_notarized_v1, sign_and_notarize, RoutableTransaction, ShardGroupId,
+    RoutableTransaction, ShardGroupId, routable_from_notarized_v1, sign_and_notarize,
 };
 use radix_common::constants::XRD;
 use radix_common::math::Decimal;

@@ -31,19 +31,19 @@
 
 use crate::error::ExecutionError;
 use crate::execution::{
-    build_execution_metadata, build_local_receipt, is_committed, ProvisionedSnapshot,
+    ProvisionedSnapshot, build_execution_metadata, build_local_receipt, is_committed,
 };
 use crate::genesis::{GenesisBuilder, GenesisConfig, GenesisError};
 use crate::result::{ExecutionOutput, SingleTxResult};
 use hyperscale_storage::{CommittableSubstateDatabase, SubstateDatabase, SubstateStore};
 use hyperscale_types::{BlockHeight, NodeId, RoutableTransaction, StateEntry, StateProvision};
 use radix_common::network::NetworkDefinition;
-use radix_engine::transaction::{execute_transaction, ExecutionConfig, TransactionReceipt};
+use radix_engine::transaction::{ExecutionConfig, TransactionReceipt, execute_transaction};
 use radix_engine::vm::DefaultVmModules;
 use radix_transactions::validation::TransactionValidator;
 use std::sync::Arc;
 use std::time::Instant;
-use tracing::{instrument, Level};
+use tracing::{Level, instrument};
 
 /// Fetch state entries for the given nodes from storage at a specific block height.
 ///

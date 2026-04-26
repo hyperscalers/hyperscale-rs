@@ -25,6 +25,7 @@ mod phase_times;
 mod protocols;
 mod verify;
 
+use crate::NodeStateMachine;
 use crate::batch_accumulator::BatchAccumulator;
 use crate::config::NodeConfig;
 use crate::protocol::execution_cert_fetch::{ExecCertFetchInput, ExecCertFetchProtocol};
@@ -36,7 +37,6 @@ use crate::protocol::local_provision_fetch::{
 use crate::protocol::provision_fetch::{ProvisionFetchInput, ProvisionFetchProtocol};
 use crate::protocol::sync::{SyncInput, SyncProtocol, SyncStatus};
 use crate::protocol::transaction_fetch::{TransactionFetchInput, TransactionFetchProtocol};
-use crate::NodeStateMachine;
 use arc_swap::ArcSwap;
 use hyperscale_core::{Action, CommitSource, NodeInput, ProtocolEvent, StateMachine, TimerId};
 use hyperscale_dispatch::Dispatch;

@@ -8,7 +8,7 @@
 //! 5. Background priority (sync operations)
 
 use super::behaviour::{Behaviour, BehaviourEvent};
-use super::command::{SwarmCommand, MAX_COMMANDS_PER_DRAIN};
+use super::command::{MAX_COMMANDS_PER_DRAIN, SwarmCommand};
 use super::gossipsub::ValidationReport;
 use crate::config::VersionInteroperabilityMode;
 use dashmap::DashMap;
@@ -16,11 +16,11 @@ use futures::StreamExt;
 use hyperscale_network::HandlerRegistry;
 use hyperscale_types::{ShardGroupId, ValidatorId};
 use libp2p::{
-    gossipsub, identify, kad, swarm::SwarmEvent, Multiaddr, PeerId as Libp2pPeerId, Swarm,
+    Multiaddr, PeerId as Libp2pPeerId, Swarm, gossipsub, identify, kad, swarm::SwarmEvent,
 };
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, info, trace, warn};

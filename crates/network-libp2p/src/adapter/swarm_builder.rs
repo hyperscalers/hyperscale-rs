@@ -7,7 +7,7 @@ use futures::future::Either;
 use libp2p::core::muxing::StreamMuxerBox;
 use libp2p::core::transport::{OrTransport, Transport};
 use libp2p::core::upgrade::Version;
-use libp2p::{identity, Swarm, SwarmBuilder};
+use libp2p::{Swarm, SwarmBuilder, identity};
 use std::time::Duration;
 use tracing::info;
 

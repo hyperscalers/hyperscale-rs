@@ -43,6 +43,13 @@ pub use bloom::{BloomFilter, DEFAULT_FPR, MAX_BITS};
 
 // Re-export crypto types and helpers
 pub use crypto::{
+    // Vendor types
+    Bls12381G1PrivateKey,
+    Bls12381G1PublicKey,
+    Bls12381G2Signature,
+    Ed25519PrivateKey,
+    Ed25519PublicKey,
+    Ed25519Signature,
     // Helper functions
     batch_verify_bls_different_messages,
     batch_verify_bls_different_messages_all_or_nothing,
@@ -56,21 +63,14 @@ pub use crypto::{
     verify_ed25519,
     zero_bls_signature,
     zero_ed25519_signature,
-    // Vendor types
-    Bls12381G1PrivateKey,
-    Bls12381G1PublicKey,
-    Bls12381G2Signature,
-    Ed25519PrivateKey,
-    Ed25519PublicKey,
-    Ed25519Signature,
 };
 pub use epoch::{
-    EpochConfig, EpochId, GlobalConsensusConfig, GlobalValidatorInfo, ShardCommitteeConfig,
-    ValidatorRating, ValidatorShardState, DEFAULT_EPOCH_LENGTH,
+    DEFAULT_EPOCH_LENGTH, EpochConfig, EpochId, GlobalConsensusConfig, GlobalValidatorInfo,
+    ShardCommitteeConfig, ValidatorRating, ValidatorShardState,
 };
 pub use hash::{
-    compute_merkle_root, compute_merkle_root_with_proof, compute_padded_merkle_root,
-    verify_merkle_inclusion, Hash, TypedHash,
+    Hash, TypedHash, compute_merkle_root, compute_merkle_root_with_proof,
+    compute_padded_merkle_root, verify_merkle_inclusion,
 };
 pub use hash_kinds::{
     BlockHash, CertificateRoot, EventRoot, ExecutionCertificateHash, GlobalReceiptHash,
@@ -83,17 +83,17 @@ pub use identifiers::{
 pub use network::{MessagePriority, NetworkMessage, Request, ShardMessage};
 pub use proofs::{MerkleInclusionProof, Provisions, TxEntries};
 pub use signing::{
+    DOMAIN_BLOCK_HEADER, DOMAIN_BLOCK_VOTE, DOMAIN_COMMITTED_BLOCK_HEADER, DOMAIN_EXEC_CERT_BATCH,
+    DOMAIN_EXEC_VOTE, DOMAIN_EXEC_VOTE_BATCH, DOMAIN_STATE_PROVISION_BATCH, DOMAIN_VALIDATOR_BIND,
     block_header_message, block_vote_message, committed_block_header_message,
     exec_cert_batch_message, exec_vote_batch_message, exec_vote_message, state_provisions_message,
-    validator_bind_message, DOMAIN_BLOCK_HEADER, DOMAIN_BLOCK_VOTE, DOMAIN_COMMITTED_BLOCK_HEADER,
-    DOMAIN_EXEC_CERT_BATCH, DOMAIN_EXEC_VOTE, DOMAIN_EXEC_VOTE_BATCH, DOMAIN_STATE_PROVISION_BATCH,
-    DOMAIN_VALIDATOR_BIND,
+    validator_bind_message,
 };
 
 pub use block::{
+    Block, BlockHeader, BlockManifest, BlockMetadata, BlockVote, CommittedBlockHeader,
     compute_certificate_root, compute_local_receipt_root, compute_provision_root,
-    compute_transaction_root, Block, BlockHeader, BlockManifest, BlockMetadata, BlockVote,
-    CommittedBlockHeader,
+    compute_transaction_root,
 };
 pub use certified_block::{CertifiedBlock, CertifiedBlockHashMismatch};
 pub use quorum_certificate::QuorumCertificate;
@@ -105,20 +105,19 @@ pub use signer_bitfield::SignerBitfield;
 pub use state::{StateEntry, StateProvision};
 pub use timeouts::{REMOTE_HEADER_RETENTION, RETENTION_HORIZON, WAVE_TIMEOUT};
 pub use timestamp::{LocalTimestamp, ProposerTimestamp, WeightedTimestamp};
-pub use timestamp_range::{TimestampRange, MAX_VALIDITY_RANGE};
-pub use topology::{node_id_hash_u64, shard_for_node, TopologySnapshot, TopologySnapshotError};
+pub use timestamp_range::{MAX_VALIDITY_RANGE, TimestampRange};
+pub use topology::{TopologySnapshot, TopologySnapshotError, node_id_hash_u64, shard_for_node};
 pub use transaction::{
-    routable_from_notarized_v1, routable_from_notarized_v2, routable_from_user_transaction,
-    sign_and_notarize, sign_and_notarize_with_options, RoutableTransaction, TransactionDecision,
-    TransactionError, TransactionStatus, TransactionStatusParseError,
+    RoutableTransaction, TransactionDecision, TransactionError, TransactionStatus,
+    TransactionStatusParseError, routable_from_notarized_v1, routable_from_notarized_v2,
+    routable_from_user_transaction, sign_and_notarize, sign_and_notarize_with_options,
 };
 pub use validator::{ValidatorInfo, ValidatorSet};
 pub use wave::{
-    compute_global_receipt_root_with_proof, compute_provision_tx_roots, compute_waves,
-    decode_finalized_wave_vec, decode_wave_cert_vec, encode_finalized_wave_vec,
-    encode_wave_cert_vec, tx_outcome_leaf, wave_leader, wave_leader_at, ExecutionCertificate,
-    ExecutionOutcome, ExecutionVote, FinalizedWave, ReceiptValidationError, TxOutcome,
-    WaveCertificate, WaveId,
+    ExecutionCertificate, ExecutionOutcome, ExecutionVote, FinalizedWave, ReceiptValidationError,
+    TxOutcome, WaveCertificate, WaveId, compute_global_receipt_root_with_proof,
+    compute_provision_tx_roots, compute_waves, decode_finalized_wave_vec, decode_wave_cert_vec,
+    encode_finalized_wave_vec, encode_wave_cert_vec, tx_outcome_leaf, wave_leader, wave_leader_at,
 };
 // Re-export with legacy alias for cross-crate use
 pub use wave::compute_global_receipt_root as compute_execution_receipt_root;

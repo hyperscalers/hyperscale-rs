@@ -37,7 +37,7 @@
 //!   well above plausible cross-shard inclusion lag.
 
 use hyperscale_types::{
-    ExecutionCertificate, ExecutionVote, TxHash, WaveId, WeightedTimestamp, WAVE_TIMEOUT,
+    ExecutionCertificate, ExecutionVote, TxHash, WAVE_TIMEOUT, WaveId, WeightedTimestamp,
 };
 #[cfg(test)]
 use hyperscale_types::{GlobalReceiptRoot, Hash};
@@ -278,9 +278,9 @@ impl EarlyArrivalBuffer {
 mod tests {
     use super::*;
     use hyperscale_types::{
-        bls_keypair_from_seed, exec_vote_message, zero_bls_signature, BlockHash, BlockHeight,
-        ExecutionOutcome, GlobalReceiptHash, ShardGroupId, SignerBitfield, TxHash, TxOutcome,
-        ValidatorId,
+        BlockHash, BlockHeight, ExecutionOutcome, GlobalReceiptHash, ShardGroupId, SignerBitfield,
+        TxHash, TxOutcome, ValidatorId, bls_keypair_from_seed, exec_vote_message,
+        zero_bls_signature,
     };
     use std::collections::BTreeSet;
 

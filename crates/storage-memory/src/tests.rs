@@ -96,9 +96,11 @@ fn test_basic_substate_operations() {
     let sort_key = DbSortKey(vec![10, 20]);
 
     // Initially empty
-    assert!(storage
-        .get_raw_substate_by_db_key(&partition_key, &sort_key)
-        .is_none());
+    assert!(
+        storage
+            .get_raw_substate_by_db_key(&partition_key, &sort_key)
+            .is_none()
+    );
 
     // Commit a value
     let mut updates = DatabaseUpdates::default();

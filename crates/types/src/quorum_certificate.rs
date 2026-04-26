@@ -1,8 +1,8 @@
 //! Quorum certificate for BFT consensus.
 
 use crate::{
-    block_vote_message, zero_bls_signature, BlockHash, BlockHeight, Bls12381G2Signature, Round,
-    ShardGroupId, SignerBitfield, WeightedTimestamp,
+    BlockHash, BlockHeight, Bls12381G2Signature, Round, ShardGroupId, SignerBitfield,
+    WeightedTimestamp, block_vote_message, zero_bls_signature,
 };
 use sbor::prelude::*;
 

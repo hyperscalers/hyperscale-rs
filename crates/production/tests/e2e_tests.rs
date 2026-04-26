@@ -13,7 +13,7 @@ use fixtures::TestFixtures;
 use hyperscale_bft::BftConfig;
 use hyperscale_network_libp2p::{Libp2pAdapter, Libp2pConfig};
 use hyperscale_production::{ProductionRunner, RocksDbStorage};
-use hyperscale_types::{generate_bls_keypair, validator_bind_message, ShardGroupId, ValidatorId};
+use hyperscale_types::{ShardGroupId, ValidatorId, generate_bls_keypair, validator_bind_message};
 use libp2p::identity;
 use serial_test::serial;
 use std::sync::Arc;

@@ -6,8 +6,8 @@
 use crate::client::RpcClient;
 use dashmap::DashMap;
 use hdrhistogram::Histogram;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tracing::debug;
 

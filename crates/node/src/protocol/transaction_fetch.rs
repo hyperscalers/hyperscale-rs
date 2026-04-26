@@ -441,8 +441,10 @@ mod tests {
         // Tick should emit FetchTransactions
         let outputs = protocol.handle(TransactionFetchInput::Tick);
         assert!(!outputs.is_empty());
-        assert!(outputs
-            .iter()
-            .any(|o| matches!(o, TransactionFetchOutput::FetchTransactions { .. })));
+        assert!(
+            outputs
+                .iter()
+                .any(|o| matches!(o, TransactionFetchOutput::FetchTransactions { .. }))
+        );
     }
 }

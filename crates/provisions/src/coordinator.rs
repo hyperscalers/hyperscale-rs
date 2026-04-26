@@ -18,8 +18,8 @@ use crate::store::ProvisionStore;
 use crate::verified_headers::VerifiedHeaderBuffer;
 use hyperscale_core::{Action, ProtocolEvent};
 use hyperscale_types::{
-    compute_padded_merkle_root, BlockHeight, CommittedBlockHeader, Hash, LocalTimestamp,
-    ProvisionHash, ProvisionTxRoot, Provisions, ShardGroupId, TopologySnapshot, RETENTION_HORIZON,
+    BlockHeight, CommittedBlockHeader, Hash, LocalTimestamp, ProvisionHash, ProvisionTxRoot,
+    Provisions, RETENTION_HORIZON, ShardGroupId, TopologySnapshot, compute_padded_merkle_root,
 };
 #[cfg(test)]
 use hyperscale_types::{
@@ -643,9 +643,9 @@ impl ProvisionCoordinator {
 mod tests {
     use super::*;
     use hyperscale_types::{
-        bls_keypair_from_seed, BlockHash, BlockHeader, Bls12381G1PrivateKey, Hash,
-        MerkleInclusionProof, QuorumCertificate, Round, TopologySnapshot, TxEntries, ValidatorInfo,
-        ValidatorSet, WaveId, WeightedTimestamp,
+        BlockHash, BlockHeader, Bls12381G1PrivateKey, Hash, MerkleInclusionProof,
+        QuorumCertificate, Round, TopologySnapshot, TxEntries, ValidatorInfo, ValidatorSet, WaveId,
+        WeightedTimestamp, bls_keypair_from_seed,
     };
 
     fn make_test_topology(local_shard: ShardGroupId) -> TopologySnapshot {
@@ -718,9 +718,11 @@ mod tests {
 
         // Should be in verified buffer (pre-verified by RemoteHeaderCoordinator)
         assert_eq!(coordinator.verified_remote_header_count(), 1);
-        assert!(coordinator
-            .get_remote_header(ShardGroupId(1), BlockHeight(10))
-            .is_some());
+        assert!(
+            coordinator
+                .get_remote_header(ShardGroupId(1), BlockHeight(10))
+                .is_some()
+        );
     }
 
     #[test]

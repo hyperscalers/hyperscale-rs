@@ -13,7 +13,7 @@ use hyperscale_storage::{
     DbPartitionKey, DbSortKey, DbSubstateValue, PartitionEntry, SubstateDatabase,
 };
 use hyperscale_types::NodeId;
-use rocksdb::{ReadOptions, Snapshot, DB};
+use rocksdb::{DB, ReadOptions, Snapshot};
 use std::collections::HashMap;
 
 /// Length of the version suffix on each state-history key (`u64` big-endian).
@@ -170,15 +170,15 @@ impl SubstateDatabase for RocksDbSnapshot<'_> {
         let mut iter = self.db.raw_iterator_cf_opt(history_cf, self.read_opts());
         iter.seek(&seek_target);
 
-        if iter.valid() {
-            if let Some(raw_key) = iter.key() {
-                // Entry must still belong to this storage_key's prefix group.
-                if raw_key.len() == storage_key_bytes.len() + VERSION_LEN
-                    && &raw_key[..storage_key_bytes.len()] == storage_key_bytes.as_slice()
-                {
-                    let value_codec: SborCodec<Option<Vec<u8>>> = SborCodec::default();
-                    return value_codec.decode(iter.value().unwrap_or_default());
-                }
+        if iter.valid()
+            && let Some(raw_key) = iter.key()
+        {
+            // Entry must still belong to this storage_key's prefix group.
+            if raw_key.len() == storage_key_bytes.len() + VERSION_LEN
+                && &raw_key[..storage_key_bytes.len()] == storage_key_bytes.as_slice()
+            {
+                let value_codec: SborCodec<Option<Vec<u8>>> = SborCodec::default();
+                return value_codec.decode(iter.value().unwrap_or_default());
             }
         }
 
@@ -203,10 +203,10 @@ impl SubstateDatabase for RocksDbSnapshot<'_> {
                     return None;
                 }
                 let sort_key = DbSortKey(k[prefix_len..].to_vec());
-                if let Some(from) = from_sort_key {
-                    if sort_key < *from {
-                        return None;
-                    }
+                if let Some(from) = from_sort_key
+                    && sort_key < *from
+                {
+                    return None;
                 }
                 Some((sort_key, v))
             })

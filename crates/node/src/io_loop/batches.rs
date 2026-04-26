@@ -1,7 +1,7 @@
 //! Batch accumulation and flushing for verification and broadcast.
 
-use super::verify::verify_bls_with_metrics;
 use super::IoLoop;
+use super::verify::verify_bls_with_metrics;
 use hyperscale_core::{NodeInput, StateMachine};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::Engine;

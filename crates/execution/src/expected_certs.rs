@@ -29,7 +29,7 @@
 //! [`retain_if_shard_needed`](ExpectedCertTracker::retain_if_shard_needed),
 //! because the tracker cannot see the wave set.
 
-use hyperscale_types::{BlockHeight, ShardGroupId, WaveId, WeightedTimestamp, WAVE_TIMEOUT};
+use hyperscale_types::{BlockHeight, ShardGroupId, WAVE_TIMEOUT, WaveId, WeightedTimestamp};
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 

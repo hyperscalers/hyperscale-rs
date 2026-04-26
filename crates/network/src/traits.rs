@@ -217,8 +217,8 @@ mod tests {
     fn test_closure_gossip_handler() {
         use hyperscale_types::NetworkMessage;
         use sbor::{Decode, Encode};
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         #[derive(Debug, Encode, Decode)]
         struct TestMsg(u32);

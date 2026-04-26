@@ -15,8 +15,9 @@
 
 use hyperscale_metrics::{ChannelDepths, MemoryMetrics, MetricsRecorder};
 use prometheus::{
-    register_counter, register_counter_vec, register_gauge, register_gauge_vec, register_histogram,
-    register_histogram_vec, Counter, CounterVec, Gauge, GaugeVec, Histogram, HistogramVec,
+    Counter, CounterVec, Gauge, GaugeVec, Histogram, HistogramVec, register_counter,
+    register_counter_vec, register_gauge, register_gauge_vec, register_histogram,
+    register_histogram_vec,
 };
 
 /// Domain-specific Prometheus metrics for production monitoring.
@@ -254,7 +255,9 @@ impl Metrics {
             execution_latency: register_histogram!(
                 "hyperscale_execution_latency_seconds",
                 "Transaction execution latency",
-                vec![0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 2.5, 5.0, 10.0]
+                vec![
+                    0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 2.5, 5.0, 10.0
+                ]
             )
             .unwrap(),
 
@@ -375,7 +378,9 @@ impl Metrics {
                 "hyperscale_storage_operation_latency_seconds",
                 "Storage operation latency by type",
                 &["operation"],
-                vec![0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 2.5, 5.0, 10.0]
+                vec![
+                    0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 2.5, 5.0, 10.0
+                ]
             )
             .unwrap(),
 
@@ -547,7 +552,9 @@ impl Metrics {
                 "hyperscale_fetch_latency_seconds",
                 "Fetch operation latency",
                 &["kind"],
-                vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0]
+                vec![
+                    0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0
+                ]
             )
             .unwrap(),
 

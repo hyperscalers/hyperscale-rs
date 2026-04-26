@@ -376,11 +376,11 @@ fn bounded_iter_to_typed<CF: TypedCf>(
         if iter.valid() {
             let raw_key = iter.key()?;
             // Check end bound
-            if let Some(ref end) = end {
-                if raw_key >= end.as_slice() {
-                    done = true;
-                    return None;
-                }
+            if let Some(ref end) = end
+                && raw_key >= end.as_slice()
+            {
+                done = true;
+                return None;
             }
             let key = key_codec.decode(raw_key);
             let value = value_codec.decode(iter.value()?);

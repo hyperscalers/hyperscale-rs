@@ -40,7 +40,7 @@
 //! ProdTimerManager ──crossbeam──→ pinned thread (timer events)
 //! ```
 
-use crate::event_loop::{spawn_pinned_loop, PinnedLoopConfig, ProdIoLoop};
+use crate::event_loop::{PinnedLoopConfig, ProdIoLoop, spawn_pinned_loop};
 use crate::rpc::{MempoolSnapshot, NodeStatusState};
 use arc_swap::ArcSwap;
 use hyperscale_bft::BftConfig;
@@ -51,15 +51,15 @@ use hyperscale_mempool::MempoolConfig;
 use hyperscale_metrics as metrics;
 use hyperscale_network_libp2p::Libp2pNetwork;
 use hyperscale_network_libp2p::{
-    generate_random_keypair, Libp2pAdapter, Libp2pConfig, NetworkError,
+    Libp2pAdapter, Libp2pConfig, NetworkError, generate_random_keypair,
 };
 use hyperscale_storage::{ChainReader, GenesisWrapper};
 use hyperscale_storage_rocksdb::{RocksDbStorage, SharedStorage};
 use quick_cache::sync::Cache as QuickCache;
 
 use hyperscale_core::NodeInput;
-use hyperscale_node::io_loop::{IoLoop, TimerOp};
 use hyperscale_node::SharedTopologySnapshot;
+use hyperscale_node::io_loop::{IoLoop, TimerOp};
 use hyperscale_node::{NodeConfig, NodeStateMachine};
 use hyperscale_topology::TopologyState;
 use hyperscale_types::{Block, Bls12381G1PrivateKey, ShardGroupId, TxHash, ValidatorId};

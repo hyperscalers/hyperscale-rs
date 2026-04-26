@@ -86,12 +86,16 @@ fn make_remote_header_targeting(
 fn fresh_coordinator_reports_no_state() {
     let coord = fresh_coordinator();
     assert_eq!(coord.verified_remote_header_count(), 0);
-    assert!(coord
-        .get_remote_header(ShardGroupId(1), BlockHeight(1))
-        .is_none());
-    assert!(coord
-        .get_provisions_by_hash(&ProvisionHash::from_raw(Hash::from_bytes(b"any")))
-        .is_none());
+    assert!(
+        coord
+            .get_remote_header(ShardGroupId(1), BlockHeight(1))
+            .is_none()
+    );
+    assert!(
+        coord
+            .get_provisions_by_hash(&ProvisionHash::from_raw(Hash::from_bytes(b"any")))
+            .is_none()
+    );
     assert!(coord.queued_provisions(LocalTimestamp::ZERO).is_empty());
     assert!(coord.store().is_empty());
 }

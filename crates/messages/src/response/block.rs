@@ -284,9 +284,9 @@ impl NetworkMessage for GetBlockResponse {
 mod tests {
     use super::*;
     use hyperscale_types::{
-        test_utils::test_transaction, zero_bls_signature, BlockHash, BlockHeight, CertificateRoot,
-        Hash, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, Round, ShardGroupId,
-        SignerBitfield, StateRoot, TransactionRoot, ValidatorId, WeightedTimestamp,
+        BlockHash, BlockHeight, CertificateRoot, Hash, LocalReceiptRoot, ProposerTimestamp,
+        ProvisionsRoot, Round, ShardGroupId, SignerBitfield, StateRoot, TransactionRoot,
+        ValidatorId, WeightedTimestamp, test_utils::test_transaction, zero_bls_signature,
     };
     use std::collections::BTreeMap;
 

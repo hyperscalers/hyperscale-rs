@@ -6,8 +6,8 @@ use super::handlers::{
 };
 use super::state::RpcState;
 use axum::{
-    routing::{get, post},
     Router,
+    routing::{get, post},
 };
 
 /// Create the full router with all RPC routes.
@@ -42,8 +42,8 @@ mod tests {
     use crate::rpc::{MempoolSnapshot, NodeStatusResponse, NodeStatusState};
     use arc_swap::ArcSwap;
     use axum::{body::Body, http::Request};
-    use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
     use std::time::Instant;
     use tower::ServiceExt;
 

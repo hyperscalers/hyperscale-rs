@@ -39,15 +39,15 @@ impl ChainView<'_> {
         if let Some(block) = self.certified.get(&block_hash) {
             return Some(block.clone());
         }
-        if let Some(pending) = self.pending.get(&block_hash) {
-            if let Some(block) = pending.block() {
-                return Some((*block).clone());
-            }
+        if let Some(pending) = self.pending.get(&block_hash)
+            && let Some(block) = pending.block()
+        {
+            return Some((*block).clone());
         }
-        if let Some(genesis) = self.genesis {
-            if genesis.hash() == block_hash {
-                return Some(genesis.clone());
-            }
+        if let Some(genesis) = self.genesis
+            && genesis.hash() == block_hash
+        {
+            return Some(genesis.clone());
         }
         None
     }
@@ -62,10 +62,10 @@ impl ChainView<'_> {
         if let Some(pending) = self.pending.get(&block_hash) {
             return Some(pending.header().clone());
         }
-        if let Some(genesis) = self.genesis {
-            if genesis.hash() == block_hash {
-                return Some(genesis.header().clone());
-            }
+        if let Some(genesis) = self.genesis
+            && genesis.hash() == block_hash
+        {
+            return Some(genesis.header().clone());
         }
         None
     }

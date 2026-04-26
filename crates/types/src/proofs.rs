@@ -17,8 +17,8 @@
 //! proof is flattened into each per-transaction struct.
 
 use crate::{
-    BlockHeight, Hash, NodeId, ProvisionHash, ShardGroupId, StateEntry, TxHash, WeightedTimestamp,
-    RETENTION_HORIZON,
+    BlockHeight, Hash, NodeId, ProvisionHash, RETENTION_HORIZON, ShardGroupId, StateEntry, TxHash,
+    WeightedTimestamp,
 };
 use sbor::prelude::*;
 use std::collections::HashSet;

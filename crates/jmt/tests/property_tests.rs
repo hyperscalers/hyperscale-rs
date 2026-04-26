@@ -14,7 +14,7 @@
 use std::collections::BTreeMap;
 
 use hyperscale_jmt::{
-    Blake3Hasher, Hash, Key, MemoryStore, NodeKey, Tree, TreeReader, ValueHash, EMPTY_HASH,
+    Blake3Hasher, EMPTY_HASH, Hash, Key, MemoryStore, NodeKey, Tree, TreeReader, ValueHash,
 };
 use proptest::prelude::*;
 

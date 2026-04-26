@@ -24,7 +24,7 @@ use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use hyperscale_network::ValidatorKeyMap;
 use hyperscale_types::{
-    validator_bind_message, verify_bls12381_v1, Bls12381G2Signature, ValidatorId,
+    Bls12381G2Signature, ValidatorId, validator_bind_message, verify_bls12381_v1,
 };
 use libp2p::{PeerId as Libp2pPeerId, StreamProtocol};
 use libp2p_stream as stream;

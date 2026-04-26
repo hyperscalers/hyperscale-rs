@@ -501,7 +501,7 @@ mod tests {
     // ─── select_transactions: validity-window filter ───────────────────
 
     use hyperscale_types::test_utils::test_notarized_transaction_v1;
-    use hyperscale_types::{routable_from_notarized_v1, TimestampRange};
+    use hyperscale_types::{TimestampRange, routable_from_notarized_v1};
 
     fn ts(ms: u64) -> WeightedTimestamp {
         WeightedTimestamp::from_millis(ms)

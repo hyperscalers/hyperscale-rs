@@ -204,9 +204,10 @@ mod tests {
     #[test]
     fn drain_for_unknown_key_returns_empty() {
         let mut pl = ProvisionPipeline::new(Arc::new(ProvisionStore::new()));
-        assert!(pl
-            .drain_pending_for_key((ShardGroupId(1), BlockHeight(10)))
-            .is_empty());
+        assert!(
+            pl.drain_pending_for_key((ShardGroupId(1), BlockHeight(10)))
+                .is_empty()
+        );
     }
 
     #[test]

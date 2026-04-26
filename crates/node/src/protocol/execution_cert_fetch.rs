@@ -392,7 +392,7 @@ impl ExecCertFetchProtocol {
         if let Some(key) = target {
             debug!(
                 source_shard = source_shard.0,
-                evicted_height = key.1 .0,
+                evicted_height = key.1.0,
                 committed_height = committed_height.0,
                 "Evicting exec cert fetch entry (tiered eviction)"
             );

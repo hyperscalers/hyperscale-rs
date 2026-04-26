@@ -109,7 +109,7 @@ impl TombstoneStore {
 mod tests {
     use super::*;
     use hyperscale_types::test_utils::test_notarized_transaction_v1;
-    use hyperscale_types::{routable_from_notarized_v1, TimestampRange};
+    use hyperscale_types::{TimestampRange, routable_from_notarized_v1};
 
     /// Build a test tx whose `validity_range.end_timestamp_exclusive == end`.
     fn tx_with_end(seed: u8, end_ms: u64) -> Arc<RoutableTransaction> {

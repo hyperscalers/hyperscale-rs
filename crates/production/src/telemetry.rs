@@ -6,21 +6,21 @@
 
 use crate::status::SyncStatus;
 use arc_swap::ArcSwap;
-use axum::{response::IntoResponse, routing::get, Router};
+use axum::{Router, response::IntoResponse, routing::get};
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::{
-    trace::{RandomIdGenerator, Sampler, SdkTracerProvider},
     Resource,
+    trace::{RandomIdGenerator, Sampler, SdkTracerProvider},
 };
 use opentelemetry_semantic_conventions::resource::{SERVICE_NAME, SERVICE_VERSION};
 use serde::Serialize;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
 use tracing_opentelemetry::OpenTelemetryLayer;
-use tracing_subscriber::{layer::SubscriberExt, EnvFilter, Layer, Registry};
+use tracing_subscriber::{EnvFilter, Layer, Registry, layer::SubscriberExt};
 
 /// Provider for sync status, used by the telemetry HTTP server.
 pub type SyncStatusProvider = Arc<ArcSwap<SyncStatus>>;

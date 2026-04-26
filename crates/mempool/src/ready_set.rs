@@ -129,12 +129,12 @@ impl ReadySet {
                 continue;
             };
             for other_node in entry.tx.all_declared_nodes() {
-                if *other_node != node {
-                    if let Some(txs) = self.ready_txs_by_node.get_mut(other_node) {
-                        txs.remove(&hash);
-                        if txs.is_empty() {
-                            self.ready_txs_by_node.remove(other_node);
-                        }
+                if *other_node != node
+                    && let Some(txs) = self.ready_txs_by_node.get_mut(other_node)
+                {
+                    txs.remove(&hash);
+                    if txs.is_empty() {
+                        self.ready_txs_by_node.remove(other_node);
                     }
                 }
             }

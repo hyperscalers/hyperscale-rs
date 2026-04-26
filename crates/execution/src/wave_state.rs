@@ -25,10 +25,10 @@
 //!    is terminal-covered), the wave is complete and ready for finalization.
 
 use hyperscale_types::{
-    compute_execution_receipt_root, BlockHash, BlockHeight, ExecutionCertificate,
-    ExecutionCertificateHash, ExecutionOutcome, GlobalReceiptRoot, ReceiptBundle,
-    RoutableTransaction, ShardGroupId, TransactionDecision, TxHash, TxOutcome, WaveCertificate,
-    WaveId, WeightedTimestamp, WAVE_TIMEOUT,
+    BlockHash, BlockHeight, ExecutionCertificate, ExecutionCertificateHash, ExecutionOutcome,
+    GlobalReceiptRoot, ReceiptBundle, RoutableTransaction, ShardGroupId, TransactionDecision,
+    TxHash, TxOutcome, WAVE_TIMEOUT, WaveCertificate, WaveId, WeightedTimestamp,
+    compute_execution_receipt_root,
 };
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -699,9 +699,9 @@ impl WaveState {
 mod tests {
     use super::*;
     use hyperscale_types::{
-        test_utils::{test_node, test_transaction_with_nodes},
         Bls12381G2Signature, GlobalReceiptHash, Hash, LocalReceipt, SignerBitfield,
         TransactionOutcome,
+        test_utils::{test_node, test_transaction_with_nodes},
     };
 
     const WAVE_START: BlockHeight = BlockHeight(10);
@@ -881,9 +881,11 @@ mod tests {
         let (anchor, _root, outcomes) = w.build_vote_data(at_timeout).unwrap();
         assert_eq!(anchor, at_timeout);
         assert_eq!(outcomes.len(), 2);
-        assert!(outcomes
-            .iter()
-            .all(|o| matches!(o.outcome, ExecutionOutcome::Aborted)));
+        assert!(
+            outcomes
+                .iter()
+                .all(|o| matches!(o.outcome, ExecutionOutcome::Aborted))
+        );
     }
 
     #[test]

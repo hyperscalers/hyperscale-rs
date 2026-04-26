@@ -11,10 +11,10 @@ use hyperscale_metrics as metrics;
 use hyperscale_network::HandlerRegistry;
 use hyperscale_network::ValidatorKeyMap;
 use hyperscale_types::{Bls12381G2Signature, MessagePriority, ShardGroupId, ValidatorId};
-use libp2p::{gossipsub, identify, identity, kad, Multiaddr, PeerId as Libp2pPeerId, Stream};
+use libp2p::{Multiaddr, PeerId as Libp2pPeerId, Stream, gossipsub, identify, identity, kad};
 use libp2p_stream as stream;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::mpsc;
 use tracing::{info, trace};
 
@@ -177,18 +177,18 @@ impl Libp2pAdapter {
         }
 
         // Listen on TCP fallback if enabled
-        if config.tcp_fallback_enabled {
-            if let Some(tcp_port) = config.tcp_fallback_port {
-                let tcp_addr: Multiaddr = format!("/ip4/0.0.0.0/tcp/{tcp_port}")
-                    .parse()
-                    .map_err(|e| NetworkError::NetworkError(format!("Invalid TCP address: {e}")))?;
-                swarm.listen_on(tcp_addr.clone()).map_err(|e| {
-                    NetworkError::NetworkError(format!(
-                        "Failed to bind TCP transport on {tcp_addr}: {e:?}"
-                    ))
-                })?;
-                info!("Listening on TCP fallback: {}", tcp_addr);
-            }
+        if config.tcp_fallback_enabled
+            && let Some(tcp_port) = config.tcp_fallback_port
+        {
+            let tcp_addr: Multiaddr = format!("/ip4/0.0.0.0/tcp/{tcp_port}")
+                .parse()
+                .map_err(|e| NetworkError::NetworkError(format!("Invalid TCP address: {e}")))?;
+            swarm.listen_on(tcp_addr.clone()).map_err(|e| {
+                NetworkError::NetworkError(format!(
+                    "Failed to bind TCP transport on {tcp_addr}: {e:?}"
+                ))
+            })?;
+            info!("Listening on TCP fallback: {}", tcp_addr);
         }
 
         // Connect to bootstrap peers

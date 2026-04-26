@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use std::marker::PhantomData;
 use std::ops::Range;
 
-use crate::hasher::{Hash, Hasher, EMPTY_HASH};
+use crate::hasher::{EMPTY_HASH, Hash, Hasher};
 use crate::node::{
     Child, ChildKind, InternalNode, Key, LeafNode, NibblePath, Node, NodeKey, StaleNodeIndex,
     TreeUpdateBatch, ValueHash,
@@ -61,13 +61,13 @@ impl<H: Hasher, const ARITY_BITS: u8> Tree<H, ARITY_BITS> {
     where
         S: TreeReader,
     {
-        if let Some(parent) = parent_version {
-            if new_version <= parent {
-                return Err(UpdateError::NonMonotonicVersion {
-                    parent,
-                    new: new_version,
-                });
-            }
+        if let Some(parent) = parent_version
+            && new_version <= parent
+        {
+            return Err(UpdateError::NonMonotonicVersion {
+                parent,
+                new: new_version,
+            });
         }
 
         // BTreeMap iteration is sorted by key.

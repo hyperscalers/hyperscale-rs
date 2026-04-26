@@ -7,7 +7,7 @@ use super::behaviour::BehaviourEvent;
 use hyperscale_metrics as metrics;
 use hyperscale_network::HandlerRegistry;
 use hyperscale_types::ShardGroupId;
-use libp2p::{gossipsub, swarm::SwarmEvent, PeerId as Libp2pPeerId};
+use libp2p::{PeerId as Libp2pPeerId, gossipsub, swarm::SwarmEvent};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
@@ -69,25 +69,24 @@ pub(super) fn handle_gossipsub_event(
             let is_shard_local_message =
                 matches!(msg_type, "block.header" | "block.vote" | "execution.vote");
 
-            if is_shard_local_message {
-                if let Some(topic_shard) = parsed.shard_id {
-                    if topic_shard != local_shard {
-                        warn!(
-                            topic = %topic_str,
-                            topic_shard = topic_shard.0,
-                            local_shard = local_shard.0,
-                            msg_type = msg_type,
-                            "Dropping shard-local message from wrong shard (cross-shard contamination attempt)"
-                        );
-                        metrics::record_invalid_message();
-                        let _ = validation_tx.send(ValidationReport {
-                            message_id,
-                            propagation_source,
-                            acceptance: gossipsub::MessageAcceptance::Reject,
-                        });
-                        return;
-                    }
-                }
+            if is_shard_local_message
+                && let Some(topic_shard) = parsed.shard_id
+                && topic_shard != local_shard
+            {
+                warn!(
+                    topic = %topic_str,
+                    topic_shard = topic_shard.0,
+                    local_shard = local_shard.0,
+                    msg_type = msg_type,
+                    "Dropping shard-local message from wrong shard (cross-shard contamination attempt)"
+                );
+                metrics::record_invalid_message();
+                let _ = validation_tx.send(ValidationReport {
+                    message_id,
+                    propagation_source,
+                    acceptance: gossipsub::MessageAcceptance::Reject,
+                });
+                return;
             }
 
             // Look up the per-type handler from the registry.

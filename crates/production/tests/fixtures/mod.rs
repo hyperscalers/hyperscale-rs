@@ -4,10 +4,10 @@
 
 use hyperscale_topology::TopologyState;
 use hyperscale_types::{
-    bls_keypair_from_seed, Bls12381G1PrivateKey, Bls12381G1PublicKey, ShardGroupId, ValidatorId,
-    ValidatorInfo, ValidatorSet,
+    Bls12381G1PrivateKey, Bls12381G1PublicKey, ShardGroupId, ValidatorId, ValidatorInfo,
+    ValidatorSet, bls_keypair_from_seed,
 };
-use libp2p::{identity, Multiaddr};
+use libp2p::{Multiaddr, identity};
 use std::collections::HashMap;
 
 /// Test fixtures for deterministic test setup.

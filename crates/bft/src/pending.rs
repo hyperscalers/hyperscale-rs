@@ -531,7 +531,7 @@ mod tests {
     #[test]
     fn test_block_needs_transactions_and_waves() {
         use hyperscale_types::{
-            test_utils::test_transaction, BlockHeight, WaveCertificate, WaveId,
+            BlockHeight, WaveCertificate, WaveId, test_utils::test_transaction,
         };
 
         let tx = Arc::new(test_transaction(1));

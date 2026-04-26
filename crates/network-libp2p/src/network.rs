@@ -4,17 +4,17 @@
 //! the [`Network`] interface used by `IoLoop` in the production runner.
 
 use crate::adapter::Libp2pAdapter;
-use crate::inbound_router::{spawn_inbound_router, InboundRouterHandle};
+use crate::inbound_router::{InboundRouterHandle, spawn_inbound_router};
 use crate::notify_pool::NotifyStreamPool;
 use crate::request_manager::{RequestManager, RequestPriority};
 use hyperscale_network::{
-    compression, GossipHandler, HandlerRegistry, Network, NotificationHandler, RequestError,
-    RequestHandler, Topic, TopicScope, ValidatorKeyMap,
+    GossipHandler, HandlerRegistry, Network, NotificationHandler, RequestError, RequestHandler,
+    Topic, TopicScope, ValidatorKeyMap, compression,
 };
 use hyperscale_types::{NetworkMessage, Request, ShardGroupId, ShardMessage, ValidatorId};
 use libp2p::PeerId;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tracing::{info, warn};
 
 // ═══════════════════════════════════════════════════════════════════════

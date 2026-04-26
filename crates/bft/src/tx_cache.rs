@@ -108,7 +108,7 @@ impl CommittedTxCache {
 mod tests {
     use super::*;
     use hyperscale_types::test_utils::test_notarized_transaction_v1;
-    use hyperscale_types::{routable_from_notarized_v1, Hash, TimestampRange};
+    use hyperscale_types::{Hash, TimestampRange, routable_from_notarized_v1};
 
     fn h(b: &[u8]) -> WaveIdHash {
         WaveIdHash::from_raw(Hash::from_bytes(b))

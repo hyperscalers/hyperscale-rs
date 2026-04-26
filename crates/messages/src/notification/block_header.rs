@@ -1,8 +1,8 @@
 //! `BlockHeader` notification message.
 
 use hyperscale_types::{
-    block_header_message, BlockHeader, BlockManifest, Bls12381G2Signature, MessagePriority,
-    NetworkMessage,
+    BlockHeader, BlockManifest, Bls12381G2Signature, MessagePriority, NetworkMessage,
+    block_header_message,
 };
 use sbor::prelude::BasicSbor;
 

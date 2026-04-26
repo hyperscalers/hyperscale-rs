@@ -30,12 +30,12 @@ use hyperscale_storage::{
     DatabaseUpdate, DatabaseUpdates, DbPartitionKey, DbSortKey, DbSubstateValue, JmtSnapshot,
     PartitionDatabaseUpdates, PartitionEntry, StateRoot, SubstateDatabase,
 };
-use rocksdb::{ColumnFamilyDescriptor, Options, WriteBatch, DB};
+use rocksdb::{ColumnFamilyDescriptor, DB, Options, WriteBatch};
 use sbor::prelude::*;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tracing::{instrument, Level};
+use tracing::{Level, instrument};
 
 /// RocksDB-based storage for production use.
 ///
@@ -411,7 +411,7 @@ impl RocksDbStorage {
         base_reads: Option<&hyperscale_storage::BaseReadCache>,
     ) -> ResetOldKeys {
         use crate::column_families::{StaleStateHistoryCf, StateCf, StateHistoryCf};
-        use crate::typed_cf::{batch_delete, batch_put, multi_get, DbCodec};
+        use crate::typed_cf::{DbCodec, batch_delete, batch_put, multi_get};
 
         let cf = self.cf();
         let state_cf = StateCf::handle(&cf);
@@ -449,11 +449,11 @@ impl RocksDbStorage {
                             miss_keys: &mut Vec<(DbPartitionKey, DbSortKey)>,
                             miss_indices: &mut Vec<usize>,
                             state_key: &(DbPartitionKey, DbSortKey)| {
-            if let Some(cache) = base_reads {
-                if let Some(cached) = cache.get(state_key) {
-                    priors.push(Some(cached.clone()));
-                    return;
-                }
+            if let Some(cache) = base_reads
+                && let Some(cached) = cache.get(state_key)
+            {
+                priors.push(Some(cached.clone()));
+                return;
             }
             // Cache miss (or no cache provided) — defer to multi_get.
             priors.push(None);

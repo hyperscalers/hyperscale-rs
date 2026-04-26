@@ -733,14 +733,13 @@ impl VerificationPipeline {
             block_hash,
             VerificationKind::ProvisionRoot,
             h.provision_root != ProvisionsRoot::ZERO,
-        ) {
-            if let Some(pending) = pending_blocks.get(&block_hash) {
-                actions.extend(self.initiate_provision_root_verification(
-                    block_hash,
-                    block,
-                    pending.manifest(),
-                ));
-            }
+        ) && let Some(pending) = pending_blocks.get(&block_hash)
+        {
+            actions.extend(self.initiate_provision_root_verification(
+                block_hash,
+                block,
+                pending.manifest(),
+            ));
         }
 
         if self.needs_root(
@@ -990,12 +989,12 @@ impl VerificationPipeline {
         }
 
         // Unblock deferred proposal if its parent height is now persisted.
-        if let Some((_, parent_block_height)) = &self.deferred_proposal {
-            if *parent_block_height <= block_height {
-                self.deferred_proposal.take();
-                debug!("Unblocking deferred proposal — parent persisted");
-                self.proposal_unblocked = true;
-            }
+        if let Some((_, parent_block_height)) = &self.deferred_proposal
+            && *parent_block_height <= block_height
+        {
+            self.deferred_proposal.take();
+            debug!("Unblocking deferred proposal — parent persisted");
+            self.proposal_unblocked = true;
         }
     }
 
@@ -1072,10 +1071,10 @@ impl VerificationPipeline {
 
         // Clear deferred proposal if its parent is at or below committed height
         // (the proposal is stale — a new round/view will generate a fresh one).
-        if let Some((_, parent_block_height)) = &self.deferred_proposal {
-            if *parent_block_height <= committed_height {
-                self.deferred_proposal = None;
-            }
+        if let Some((_, parent_block_height)) = &self.deferred_proposal
+            && *parent_block_height <= committed_height
+        {
+            self.deferred_proposal = None;
         }
 
         self.in_flight_roots

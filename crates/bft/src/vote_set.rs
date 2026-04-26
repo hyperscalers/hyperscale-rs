@@ -386,8 +386,9 @@ impl VoteSet {
 mod tests {
     use super::*;
     use hyperscale_types::{
-        generate_bls_keypair, Bls12381G1PrivateKey, CertificateRoot, Hash, LocalReceiptRoot,
-        ProvisionsRoot, QuorumCertificate, ShardGroupId, StateRoot, TransactionRoot, ValidatorId,
+        Bls12381G1PrivateKey, CertificateRoot, Hash, LocalReceiptRoot, ProvisionsRoot,
+        QuorumCertificate, ShardGroupId, StateRoot, TransactionRoot, ValidatorId,
+        generate_bls_keypair,
     };
 
     fn test_shard_group() -> ShardGroupId {

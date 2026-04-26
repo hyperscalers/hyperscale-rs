@@ -22,7 +22,7 @@ pub mod workloads;
 
 pub use accounts::{
     AccountPartition, AccountPool, AccountPoolError, AccountUsageStats, FundedAccount, FundingOp,
-    SelectionMode, MAX_GENESIS_ACCOUNTS_PER_SHARD,
+    MAX_GENESIS_ACCOUNTS_PER_SHARD, SelectionMode,
 };
 pub use client::RpcClient;
 pub use config::SpammerConfig;

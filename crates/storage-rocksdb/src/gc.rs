@@ -71,11 +71,11 @@ impl RocksDbStorage {
             processed_count += 1;
         }
 
-        if !batch.is_empty() {
-            if let Err(e) = self.db.write(batch) {
-                tracing::error!("JMT GC write failed: {}", e);
-                return 0;
-            }
+        if !batch.is_empty()
+            && let Err(e) = self.db.write(batch)
+        {
+            tracing::error!("JMT GC write failed: {}", e);
+            return 0;
         }
 
         // Force compaction over the just-tombstoned range of
@@ -195,13 +195,13 @@ impl RocksDbStorage {
             }
         }
 
-        if !batch.is_empty() {
-            if let Err(e) = self.db.write(batch) {
-                tracing::error!("State-history GC write failed: {}", e);
-                // Return the count we already persisted in prior batches
-                // rather than 0 — callers use this to log progress.
-                return deleted;
-            }
+        if !batch.is_empty()
+            && let Err(e) = self.db.write(batch)
+        {
+            tracing::error!("State-history GC write failed: {}", e);
+            // Return the count we already persisted in prior batches
+            // rather than 0 — callers use this to log progress.
+            return deleted;
         }
 
         // Tombstones only reclaim disk once compaction rewrites the

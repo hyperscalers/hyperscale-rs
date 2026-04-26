@@ -248,7 +248,7 @@ impl VoteTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hyperscale_types::{generate_bls_keypair, zero_bls_signature, BlockHeight, ShardGroupId};
+    use hyperscale_types::{BlockHeight, ShardGroupId, generate_bls_keypair, zero_bls_signature};
     use std::collections::BTreeSet;
 
     fn make_test_public_key() -> Bls12381G1PublicKey {

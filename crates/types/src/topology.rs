@@ -588,7 +588,7 @@ fn empty_committees(num_shards: u64) -> HashMap<ShardGroupId, ShardCommitteeConf
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{generate_bls_keypair, ValidatorInfo};
+    use crate::{ValidatorInfo, generate_bls_keypair};
 
     fn make_test_validator(id: u64, power: u64) -> ValidatorInfo {
         ValidatorInfo {

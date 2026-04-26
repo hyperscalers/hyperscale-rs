@@ -75,26 +75,32 @@ fn memory_stats_destructures_all_fields_for_fresh_coordinator() {
 #[test]
 fn fresh_get_wave_assignment_returns_none_for_any_tx() {
     let coord = fresh_coordinator();
-    assert!(coord
-        .get_wave_assignment(&TxHash::from_raw(Hash::from_bytes(b"tx1")))
-        .is_none());
+    assert!(
+        coord
+            .get_wave_assignment(&TxHash::from_raw(Hash::from_bytes(b"tx1")))
+            .is_none()
+    );
     assert!(coord.get_wave_assignment(&TxHash::ZERO).is_none());
 }
 
 #[test]
 fn fresh_get_finalized_certificate_returns_none_for_any_tx() {
     let coord = fresh_coordinator();
-    assert!(coord
-        .get_finalized_certificate(&TxHash::from_raw(Hash::from_bytes(b"tx1")))
-        .is_none());
+    assert!(
+        coord
+            .get_finalized_certificate(&TxHash::from_raw(Hash::from_bytes(b"tx1")))
+            .is_none()
+    );
 }
 
 #[test]
 fn fresh_get_finalized_wave_by_hash_returns_none_for_any_hash() {
     let coord = fresh_coordinator();
-    assert!(coord
-        .get_finalized_wave_by_hash(&WaveIdHash::from_raw(Hash::from_bytes(b"wave_hash")))
-        .is_none());
+    assert!(
+        coord
+            .get_finalized_wave_by_hash(&WaveIdHash::from_raw(Hash::from_bytes(b"wave_hash")))
+            .is_none()
+    );
 }
 
 #[test]

@@ -14,8 +14,8 @@ use futures::{AsyncWriteExt, StreamExt};
 use hyperscale_metrics as metrics;
 use hyperscale_network::HandlerRegistry;
 use libp2p::{PeerId, Stream};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 use tracing::{debug, warn};
@@ -217,20 +217,20 @@ impl InboundRouter {
     /// Returns `Some(permit)` if admitted, `None` if rejected.
     fn try_admit(self: &Arc<Self>, peer_id: &PeerId) -> Option<tokio::sync::OwnedSemaphorePermit> {
         // ── Failure-rate cooldown check ──
-        if let Some(mut state) = self.per_peer_failures.get_mut(peer_id) {
-            if let Some(until) = state.cooldown_until {
-                if Instant::now() < until {
-                    // Peer is in cooldown — silently drop without logging each
-                    // stream (the cooldown-start log is sufficient).
-                    return None;
-                }
-                // Cooldown expired — clear it and reset the failure window so
-                // the peer gets a fresh chance. Backoff is preserved so the
-                // next cooldown (if it re-triggers) uses a longer duration.
-                state.cooldown_until = None;
-                state.failures = 0;
-                state.window_start = Instant::now();
+        if let Some(mut state) = self.per_peer_failures.get_mut(peer_id)
+            && let Some(until) = state.cooldown_until
+        {
+            if Instant::now() < until {
+                // Peer is in cooldown — silently drop without logging each
+                // stream (the cooldown-start log is sufficient).
+                return None;
             }
+            // Cooldown expired — clear it and reset the failure window so
+            // the peer gets a fresh chance. Backoff is preserved so the
+            // next cooldown (if it re-triggers) uses a longer duration.
+            state.cooldown_until = None;
+            state.failures = 0;
+            state.window_start = Instant::now();
         }
 
         // ── Per-peer concurrency check ──

@@ -583,9 +583,11 @@ mod tests {
         });
 
         assert!(!protocol.is_syncing());
-        assert!(outputs
-            .iter()
-            .any(|o| matches!(o, SyncOutput::SyncComplete { height } if height.0 == 2)));
+        assert!(
+            outputs
+                .iter()
+                .any(|o| matches!(o, SyncOutput::SyncComplete { height } if height.0 == 2))
+        );
     }
 
     #[test]
@@ -606,8 +608,10 @@ mod tests {
         });
 
         // Should re-emit a FetchBlock for height 1
-        assert!(outputs
-            .iter()
-            .any(|o| matches!(o, SyncOutput::FetchBlock { height, .. } if height.0 == 1)));
+        assert!(
+            outputs
+                .iter()
+                .any(|o| matches!(o, SyncOutput::FetchBlock { height, .. } if height.0 == 1))
+        );
     }
 }

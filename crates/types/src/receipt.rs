@@ -15,7 +15,7 @@
 use std::sync::Arc;
 
 use crate::{
-    compute_merkle_root, DatabaseUpdates, EventRoot, GlobalReceiptHash, Hash, TxHash, WritesRoot,
+    DatabaseUpdates, EventRoot, GlobalReceiptHash, Hash, TxHash, WritesRoot, compute_merkle_root,
 };
 
 // ─── Outcome ─────────────────────────────────────────────────────────────────

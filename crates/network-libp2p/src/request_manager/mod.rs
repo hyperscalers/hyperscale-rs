@@ -41,8 +41,8 @@ use crate::request_pool::RequestStreamPool;
 use bytes::Bytes;
 use libp2p::PeerId;
 use peer_health::{PeerHealthConfig, PeerHealthTracker};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use thiserror::Error;
 

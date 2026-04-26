@@ -1,6 +1,6 @@
 //! libp2p network behaviour definition.
 
-use libp2p::{gossipsub, identify, kad, swarm::NetworkBehaviour, StreamProtocol};
+use libp2p::{StreamProtocol, gossipsub, identify, kad, swarm::NetworkBehaviour};
 use libp2p_stream as stream;
 
 /// Protocol identifier for request/response streams.

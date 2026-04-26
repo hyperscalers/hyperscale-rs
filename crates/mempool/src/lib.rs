@@ -17,6 +17,6 @@ mod ready_set;
 mod tombstones;
 
 pub use coordinator::{
-    LockContentionStats, MempoolConfig, MempoolCoordinator, MempoolMemoryStats,
-    DEFAULT_MIN_DWELL_TIME,
+    DEFAULT_MIN_DWELL_TIME, LockContentionStats, MempoolConfig, MempoolCoordinator,
+    MempoolMemoryStats,
 };

@@ -238,12 +238,11 @@ impl ConflictDetector {
             .stored_provisions
             .remove(&(*remote_tx, source_shard))
             .is_some()
+            && let Some(txs) = self.provisions_by_shard.get_mut(&source_shard)
         {
-            if let Some(txs) = self.provisions_by_shard.get_mut(&source_shard) {
-                txs.remove(remote_tx);
-                if txs.is_empty() {
-                    self.provisions_by_shard.remove(&source_shard);
-                }
+            txs.remove(remote_tx);
+            if txs.is_empty() {
+                self.provisions_by_shard.remove(&source_shard);
             }
         }
     }
@@ -290,8 +289,8 @@ impl ConflictDetector {
 mod tests {
     use super::*;
     use hyperscale_types::{
-        bls_keypair_from_seed, BlockHeight, MerkleInclusionProof, NodeId, ShardGroupId, StateEntry,
-        TopologySnapshot, TxEntries, ValidatorId, ValidatorInfo, ValidatorSet,
+        BlockHeight, MerkleInclusionProof, NodeId, ShardGroupId, StateEntry, TopologySnapshot,
+        TxEntries, ValidatorId, ValidatorInfo, ValidatorSet, bls_keypair_from_seed,
     };
 
     /// Create a `NodeId` that routes to `target_shard` under modulo-hash routing.

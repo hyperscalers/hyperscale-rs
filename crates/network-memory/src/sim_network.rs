@@ -11,8 +11,8 @@
 //! delivers due messages via each target's registered per-type gossip handler.
 
 use hyperscale_network::{
-    compression, GossipHandler, HandlerRegistry, Network, NotificationHandler, RequestError,
-    RequestHandler, TopicScope,
+    GossipHandler, HandlerRegistry, Network, NotificationHandler, RequestError, RequestHandler,
+    TopicScope, compression,
 };
 use hyperscale_types::{NetworkMessage, Request, ShardGroupId, ShardMessage, ValidatorId};
 use sbor::basic_encode;
@@ -246,8 +246,8 @@ mod tests {
     use super::*;
     use hyperscale_messages::TransactionGossip;
     use hyperscale_types::{
-        test_utils::{test_node, test_transaction_with_nodes},
         BlockHeight, ShardGroupId,
+        test_utils::{test_node, test_transaction_with_nodes},
     };
     use std::sync::Mutex as StdMutex;
 

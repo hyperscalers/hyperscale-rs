@@ -3,12 +3,12 @@
 #[cfg(test)]
 use crate::GlobalReceiptHash;
 use crate::{
+    BlockHash, BlockHeight, Bls12381G1PrivateKey, Bls12381G2Signature, CertificateRoot,
+    FinalizedWave, Hash, LocalReceiptRoot, ProposerTimestamp, ProvisionHash, ProvisionTxRoot,
+    Provisions, ProvisionsRoot, QuorumCertificate, ReceiptBundle, Round, RoutableTransaction,
+    ShardGroupId, StateRoot, TransactionRoot, TxHash, ValidatorId, WaveId, WaveIdHash,
     block_vote_message, compute_merkle_root, compute_padded_merkle_root, decode_finalized_wave_vec,
-    encode_finalized_wave_vec, BlockHash, BlockHeight, Bls12381G1PrivateKey, Bls12381G2Signature,
-    CertificateRoot, FinalizedWave, Hash, LocalReceiptRoot, ProposerTimestamp, ProvisionHash,
-    ProvisionTxRoot, Provisions, ProvisionsRoot, QuorumCertificate, ReceiptBundle, Round,
-    RoutableTransaction, ShardGroupId, StateRoot, TransactionRoot, TxHash, ValidatorId, WaveId,
-    WaveIdHash,
+    encode_finalized_wave_vec,
 };
 use sbor::prelude::*;
 use std::collections::BTreeMap;

@@ -16,7 +16,7 @@
 //! placed at the divergence point. This keeps tree depth proportional
 //! to `log_ARITY(n_active)` rather than the full key bit-width.
 
-use crate::hasher::{Hash, EMPTY_HASH};
+use crate::hasher::{EMPTY_HASH, Hash};
 
 /// Fixed 32-byte key. Callers hash variable-length application keys to
 /// 32 bytes before calling into the tree.
@@ -72,10 +72,10 @@ impl NibblePath {
         let mut bytes = key[..byte_len].to_vec();
         // Mask off unused trailing bits in the final byte.
         let trailing = (8 - (usize::from(bits) % 8)) % 8;
-        if trailing > 0 {
-            if let Some(last) = bytes.last_mut() {
-                *last &= 0xFFu8 << trailing;
-            }
+        if trailing > 0
+            && let Some(last) = bytes.last_mut()
+        {
+            *last &= 0xFFu8 << trailing;
         }
         Self { bytes, bits }
     }

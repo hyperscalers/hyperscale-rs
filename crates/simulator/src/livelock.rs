@@ -28,7 +28,7 @@
 
 use hyperscale_simulation::SimulationRunner;
 use hyperscale_types::{
-    shard_for_node, NodeId, RoutableTransaction, ShardGroupId, TransactionStatus, TxHash,
+    NodeId, RoutableTransaction, ShardGroupId, TransactionStatus, TxHash, shard_for_node,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -110,10 +110,10 @@ impl LivelockReport {
         println!("📈 By Status:");
         let status_order = ["Pending", "Committed"];
         for status in &status_order {
-            if let Some(txs) = self.by_status.get(*status) {
-                if !txs.is_empty() {
-                    println!("  {}: {} transactions", status, txs.len());
-                }
+            if let Some(txs) = self.by_status.get(*status)
+                && !txs.is_empty()
+            {
+                println!("  {}: {} transactions", status, txs.len());
             }
         }
         // Print any other statuses not in the predefined list
@@ -129,16 +129,16 @@ impl LivelockReport {
         let mut shard_ids: Vec<_> = self.by_shard.keys().collect();
         shard_ids.sort_by_key(|s| s.0);
         for shard_id in shard_ids {
-            if let Some(txs) = self.by_shard.get(shard_id) {
-                if !txs.is_empty() {
-                    let cross_shard_count = txs.iter().filter(|tx| tx.is_cross_shard).count();
-                    println!(
-                        "  Shard {}: {} transactions ({} cross-shard)",
-                        shard_id.0,
-                        txs.len(),
-                        cross_shard_count
-                    );
-                }
+            if let Some(txs) = self.by_shard.get(shard_id)
+                && !txs.is_empty()
+            {
+                let cross_shard_count = txs.iter().filter(|tx| tx.is_cross_shard).count();
+                println!(
+                    "  Shard {}: {} transactions ({} cross-shard)",
+                    shard_id.0,
+                    txs.len(),
+                    cross_shard_count
+                );
             }
         }
         println!();

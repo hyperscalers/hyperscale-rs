@@ -17,7 +17,7 @@
 //! order.
 
 use hyperscale_types::{
-    BloomFilter, FinalizedWave, TxHash, WaveCertificate, WaveId, WaveIdHash, DEFAULT_FPR,
+    BloomFilter, DEFAULT_FPR, FinalizedWave, TxHash, WaveCertificate, WaveId, WaveIdHash,
 };
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
@@ -116,9 +116,9 @@ impl FinalizedWaveStore {
 mod tests {
     use super::*;
     use hyperscale_types::{
-        zero_bls_signature, BlockHeight, ExecutionCertificate, ExecutionOutcome, GlobalReceiptHash,
-        GlobalReceiptRoot, Hash, ShardGroupId, SignerBitfield, TxHash, TxOutcome,
-        WeightedTimestamp,
+        BlockHeight, ExecutionCertificate, ExecutionOutcome, GlobalReceiptHash, GlobalReceiptRoot,
+        Hash, ShardGroupId, SignerBitfield, TxHash, TxOutcome, WeightedTimestamp,
+        zero_bls_signature,
     };
     use std::collections::BTreeSet;
 
@@ -203,9 +203,11 @@ mod tests {
         assert_eq!(looked_up.certificate.wave_id, wid);
 
         // Unknown hash returns None.
-        assert!(store
-            .get_by_wave_id_hash(&WaveIdHash::from_raw(Hash::from_bytes(b"unknown")))
-            .is_none());
+        assert!(
+            store
+                .get_by_wave_id_hash(&WaveIdHash::from_raw(Hash::from_bytes(b"unknown")))
+                .is_none()
+        );
     }
 
     #[test]

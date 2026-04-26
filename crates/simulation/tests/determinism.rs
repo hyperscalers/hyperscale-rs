@@ -1510,8 +1510,8 @@ fn test_cross_shard_transaction_detection() {
     use hyperscale_topology::TopologyState;
     use hyperscale_types::test_utils::{test_node, test_transaction_with_nodes};
     use hyperscale_types::{
-        generate_bls_keypair, Bls12381G1PrivateKey, ShardGroupId, ValidatorId, ValidatorInfo,
-        ValidatorSet,
+        Bls12381G1PrivateKey, ShardGroupId, ValidatorId, ValidatorInfo, ValidatorSet,
+        generate_bls_keypair,
     };
     use std::collections::HashMap;
 

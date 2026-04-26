@@ -224,8 +224,8 @@ mod tests {
     use super::*;
     use hyperscale_test_helpers::TestCommittee;
     use hyperscale_types::{
-        compute_waves, test_utils, BlockHash, BlockHeader, ProposerTimestamp, QuorumCertificate,
-        Round, RoutableTransaction, ShardGroupId, ValidatorId, ValidatorInfo, ValidatorSet,
+        BlockHash, BlockHeader, ProposerTimestamp, QuorumCertificate, Round, RoutableTransaction,
+        ShardGroupId, ValidatorId, ValidatorInfo, ValidatorSet, compute_waves, test_utils,
     };
     use std::collections::{BTreeMap, BTreeSet};
 

@@ -147,10 +147,10 @@ fn main() {
     let _report = simulator.run_for(Duration::from_secs(args.duration));
 
     // Network traffic analysis
-    if args.network_analysis {
-        if let Some(traffic_report) = simulator.traffic_report() {
-            traffic_report.print_summary();
-        }
+    if args.network_analysis
+        && let Some(traffic_report) = simulator.traffic_report()
+    {
+        traffic_report.print_summary();
     }
 
     // Livelock analysis

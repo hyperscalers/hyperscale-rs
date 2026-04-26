@@ -397,8 +397,8 @@ impl WaveRegistry {
 mod tests {
     use super::*;
     use hyperscale_types::{
-        test_utils::test_transaction, BlockHash, BlockHeight, ExecutionOutcome, GlobalReceiptHash,
-        ShardGroupId, SignerBitfield,
+        BlockHash, BlockHeight, ExecutionOutcome, GlobalReceiptHash, ShardGroupId, SignerBitfield,
+        test_utils::test_transaction,
     };
 
     fn shard() -> ShardGroupId {

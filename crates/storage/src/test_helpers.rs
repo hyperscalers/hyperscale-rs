@@ -9,13 +9,12 @@ use crate::{
     PartitionDatabaseUpdates,
 };
 use hyperscale_types::{
-    zero_bls_signature, ApplicationEvent, Block, BlockHash, BlockHeader, BlockHeight,
-    Bls12381G2Signature, CertificateRoot, ExecutionCertificate, ExecutionMetadata,
-    ExecutionOutcome, FeeSummary, FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, Hash,
-    LocalReceipt, LocalReceiptRoot, LogLevel, NodeId, ProposerTimestamp, ProvisionsRoot,
-    QuorumCertificate, ReceiptBundle, Round, ShardGroupId, SignerBitfield, StateRoot,
-    TransactionOutcome, TransactionRoot, TxHash, TxOutcome, ValidatorId, WaveCertificate, WaveId,
-    WeightedTimestamp,
+    ApplicationEvent, Block, BlockHash, BlockHeader, BlockHeight, Bls12381G2Signature,
+    CertificateRoot, ExecutionCertificate, ExecutionMetadata, ExecutionOutcome, FeeSummary,
+    FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, Hash, LocalReceipt, LocalReceiptRoot,
+    LogLevel, NodeId, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, ReceiptBundle, Round,
+    ShardGroupId, SignerBitfield, StateRoot, TransactionOutcome, TransactionRoot, TxHash,
+    TxOutcome, ValidatorId, WaveCertificate, WaveId, WeightedTimestamp, zero_bls_signature,
 };
 use radix_common::prelude::DatabaseUpdate;
 use radix_substate_store_interface::db_key_mapper::{DatabaseKeyMapper, SpreadPrefixKeyMapper};
@@ -254,9 +253,11 @@ pub fn test_ec_storage_roundtrip(storage: &(impl ChainReader + ChainWriter)) {
     let canonical_hash = ec.canonical_hash();
 
     // Initially empty
-    assert!(storage
-        .get_execution_certificates_by_height(BlockHeight(10))
-        .is_empty());
+    assert!(
+        storage
+            .get_execution_certificates_by_height(BlockHeight(10))
+            .is_empty()
+    );
 
     // Commit intermediate blocks, then block at height 10 carrying the EC
     commit_empty_blocks_up_to(storage, BlockHeight(10));
@@ -270,9 +271,11 @@ pub fn test_ec_storage_roundtrip(storage: &(impl ChainReader + ChainWriter)) {
     assert_eq!(by_height[0].canonical_hash(), canonical_hash);
 
     // Different height returns empty
-    assert!(storage
-        .get_execution_certificates_by_height(BlockHeight(11))
-        .is_empty());
+    assert!(
+        storage
+            .get_execution_certificates_by_height(BlockHeight(11))
+            .is_empty()
+    );
 }
 
 /// Shared EC batch test: multiple ECs at same and different heights.

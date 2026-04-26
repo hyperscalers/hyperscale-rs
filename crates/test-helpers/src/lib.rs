@@ -17,13 +17,13 @@
 //! ```
 
 use hyperscale_types::{
-    bls_keypair_from_seed, Block, BlockHash, BlockHeader, BlockHeight, Bls12381G1PrivateKey,
-    Bls12381G1PublicKey, Bls12381G2Signature, CertificateRoot, CertifiedBlock,
-    ExecutionCertificate, ExecutionOutcome, FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot,
-    LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round,
-    RoutableTransaction, ShardGroupId, SignerBitfield, StateRoot, TopologySnapshot,
-    TransactionDecision, TransactionRoot, TxHash, TxOutcome, ValidatorId, ValidatorInfo,
-    ValidatorSet, WaveCertificate, WaveId, WeightedTimestamp,
+    Block, BlockHash, BlockHeader, BlockHeight, Bls12381G1PrivateKey, Bls12381G1PublicKey,
+    Bls12381G2Signature, CertificateRoot, CertifiedBlock, ExecutionCertificate, ExecutionOutcome,
+    FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, LocalReceiptRoot, ProposerTimestamp,
+    ProvisionsRoot, QuorumCertificate, Round, RoutableTransaction, ShardGroupId, SignerBitfield,
+    StateRoot, TopologySnapshot, TransactionDecision, TransactionRoot, TxHash, TxOutcome,
+    ValidatorId, ValidatorInfo, ValidatorSet, WaveCertificate, WaveId, WeightedTimestamp,
+    bls_keypair_from_seed,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;

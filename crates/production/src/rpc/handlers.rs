@@ -7,16 +7,16 @@ use super::types::{
     TransactionStatusResponse,
 };
 use axum::{
+    Json,
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
-    Json,
 };
 use hyperscale_core::{NodeInput, TransactionStatus};
 use hyperscale_metrics as metrics;
 use hyperscale_types::{Hash, RoutableTransaction, TransactionDecision, TxHash};
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Health & Readiness Handlers
@@ -283,7 +283,7 @@ fn check_backpressure(state: &RpcState) -> Option<(StatusCode, Json<SubmitTransa
     if let Some((&congested_shard, &count)) = snapshot
         .remote_shard_in_flight
         .iter()
-        .find(|(_, &count)| threshold > 0 && count >= threshold)
+        .find(|&(_, &count)| threshold > 0 && count >= threshold)
     {
         metrics::record_transaction_rejected("remote_shard_congestion");
         return Some((
@@ -394,10 +394,10 @@ mod tests {
     use crate::rpc::state::{MempoolSnapshot, NodeStatusState};
     use crate::status::SyncStatus;
     use arc_swap::ArcSwap;
-    use axum::{body::Body, http::Request, Router};
+    use axum::{Router, body::Body, http::Request};
     use hyperscale_types::{BlockHeight, TransactionDecision};
-    use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
     use std::time::Instant;
     use tower::ServiceExt;
 

@@ -123,11 +123,11 @@ impl NotifyStreamPool {
     /// Spawn a new stream actor for a peer, subject to backoff.
     fn spawn_actor(&self, peer_id: PeerId, initial_frame: PendingFrame) {
         // Check backoff before creating a new stream.
-        if let Some(state) = self.backoff.get(&peer_id) {
-            if Instant::now() < state.next_attempt {
-                warn!(peer = %peer_id, "Skipping notify: in backoff period");
-                return;
-            }
+        if let Some(state) = self.backoff.get(&peer_id)
+            && Instant::now() < state.next_attempt
+        {
+            warn!(peer = %peer_id, "Skipping notify: in backoff period");
+            return;
         }
 
         let (frame_tx, frame_rx) = mpsc::channel(PEER_CHANNEL_CAPACITY);

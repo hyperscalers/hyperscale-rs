@@ -743,16 +743,17 @@ impl BftCoordinator {
             return false;
         }
 
-        if let Some(pending) = self.proposal.pending() {
-            if pending.height == next_height && pending.round == round {
-                trace!(
-                    validator = ?topology.local_validator_id(),
-                    height = next_height.0,
-                    round = round.0,
-                    "Proposal build already in-flight, skipping"
-                );
-                return false;
-            }
+        if let Some(pending) = self.proposal.pending()
+            && pending.height == next_height
+            && pending.round == round
+        {
+            trace!(
+                validator = ?topology.local_validator_id(),
+                height = next_height.0,
+                round = round.0,
+                "Proposal build already in-flight, skipping"
+            );
+            return false;
         }
 
         // Suppress re-entry while a prior dispatch for the same target is
@@ -761,16 +762,17 @@ impl BftCoordinator {
         // re-runs `assemble_build_action` and re-registers the defer,
         // burning CPU and log bandwidth while peers time out on the
         // proposer slot.
-        if let Some(deferred) = self.proposal.deferred() {
-            if deferred.height == next_height && deferred.round == round {
-                trace!(
-                    validator = ?topology.local_validator_id(),
-                    height = next_height.0,
-                    round = round.0,
-                    "Proposal deferred pending parent tree, skipping"
-                );
-                return false;
-            }
+        if let Some(deferred) = self.proposal.deferred()
+            && deferred.height == next_height
+            && deferred.round == round
+        {
+            trace!(
+                validator = ?topology.local_validator_id(),
+                height = next_height.0,
+                round = round.0,
+                "Proposal deferred pending parent tree, skipping"
+            );
+            return false;
         }
 
         if self.votes.is_locked_at(next_height) {
@@ -1198,13 +1200,12 @@ impl BftCoordinator {
             return false;
         }
 
-        if let Some(pending) = self.pending_blocks.get_mut(&block_hash) {
-            if pending.block().is_none() {
-                if let Err(e) = pending.construct_block() {
-                    warn!("Failed to construct block {}: {}", block_hash, e);
-                    return true;
-                }
-            }
+        if let Some(pending) = self.pending_blocks.get_mut(&block_hash)
+            && pending.block().is_none()
+            && let Err(e) = pending.construct_block()
+        {
+            warn!("Failed to construct block {}: {}", block_hash, e);
+            return true;
         }
 
         actions.extend(self.trigger_qc_verification_or_vote(topology, block_hash));
@@ -1826,12 +1827,11 @@ impl BftCoordinator {
         // Auto-resume from sync the moment persistence catches up to the
         // sync target: a single event carries the signal, so there's no
         // room for ordering races between sync completion and persistence.
-        if self.sync.is_syncing() {
-            if let Some(target) = self.sync.sync_target_height() {
-                if block_height >= target {
-                    return self.on_sync_complete(topology);
-                }
-            }
+        if self.sync.is_syncing()
+            && let Some(target) = self.sync.sync_target_height()
+            && block_height >= target
+        {
+            return self.on_sync_complete(topology);
         }
         vec![]
     }
@@ -2107,8 +2107,7 @@ impl BftCoordinator {
         if height <= self.committed_height {
             trace!(
                 "Block {} at height {} already committed",
-                block_hash,
-                height.0
+                block_hash, height.0
             );
             return vec![];
         }
@@ -2789,13 +2788,12 @@ impl BftCoordinator {
         }
 
         // Second phase: construct block if needed
-        if needs_construct {
-            if let Some(pending) = self.pending_blocks.get_mut(&block_hash) {
-                if let Err(e) = pending.construct_block() {
-                    warn!("Failed to construct block after tx fetch: {}", e);
-                    return vec![];
-                }
-            }
+        if needs_construct
+            && let Some(pending) = self.pending_blocks.get_mut(&block_hash)
+            && let Err(e) = pending.construct_block()
+        {
+            warn!("Failed to construct block after tx fetch: {}", e);
+            return vec![];
         }
 
         info!(
@@ -3329,10 +3327,10 @@ impl BftCoordinator {
 mod tests {
     use super::*;
     use hyperscale_types::{
-        generate_bls_keypair, zero_bls_signature, Bls12381G1PrivateKey, Bls12381G2Signature,
-        CertificateRoot, GlobalReceiptHash, GlobalReceiptRoot, LocalReceiptRoot, ProvisionsRoot,
-        ShardGroupId, SignerBitfield, TopologySnapshot, TransactionRoot, ValidatorId,
-        ValidatorInfo, ValidatorSet, WeightedTimestamp,
+        Bls12381G1PrivateKey, Bls12381G2Signature, CertificateRoot, GlobalReceiptHash,
+        GlobalReceiptRoot, LocalReceiptRoot, ProvisionsRoot, ShardGroupId, SignerBitfield,
+        TopologySnapshot, TransactionRoot, ValidatorId, ValidatorInfo, ValidatorSet,
+        WeightedTimestamp, generate_bls_keypair, zero_bls_signature,
     };
     use std::collections::BTreeMap;
 
@@ -3480,9 +3478,11 @@ mod tests {
             |_| None,
             |_| None,
         );
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, Action::VerifyQcSignature { .. })));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::VerifyQcSignature { .. }))
+        );
     }
 
     #[test]
@@ -3528,9 +3528,11 @@ mod tests {
 
         // QC verified — but state root verification is still pending, so no vote yet.
         let after_qc = state.on_qc_signature_verified(&topology, block_hash, true);
-        assert!(!after_qc
-            .iter()
-            .any(|a| matches!(a, Action::SignAndBroadcastBlockVote { .. })));
+        assert!(
+            !after_qc
+                .iter()
+                .any(|a| matches!(a, Action::SignAndBroadcastBlockVote { .. }))
+        );
 
         // State root completes — now we vote.
         let after_roots = state.on_block_root_verified(
@@ -3539,9 +3541,11 @@ mod tests {
             block_hash,
             true,
         );
-        assert!(after_roots
-            .iter()
-            .any(|a| matches!(a, Action::SignAndBroadcastBlockVote { .. })));
+        assert!(
+            after_roots
+                .iter()
+                .any(|a| matches!(a, Action::SignAndBroadcastBlockVote { .. }))
+        );
     }
 
     #[test]
@@ -3607,9 +3611,11 @@ mod tests {
             |_| None,
             |_| None,
         );
-        assert!(!actions
-            .iter()
-            .any(|a| matches!(a, Action::VerifyQcSignature { .. })));
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::VerifyQcSignature { .. }))
+        );
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -3853,14 +3859,16 @@ mod tests {
         let (state, topology) = make_multi_validator_state();
         let header = make_header_at_height(BlockHeight(1), state.now.as_millis());
 
-        assert!(crate::validation::validate_header(
-            &topology,
-            &header,
-            state.committed_height,
-            &state.config,
-            state.now,
-        )
-        .is_ok());
+        assert!(
+            crate::validation::validate_header(
+                &topology,
+                &header,
+                state.committed_height,
+                &state.config,
+                state.now,
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -4281,9 +4289,11 @@ mod tests {
         let height = BlockHeight(1);
         let actions = state.try_vote_on_block(&topology, block_hash, height, Round(0));
 
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, Action::SignAndBroadcastBlockVote { .. })));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::SignAndBroadcastBlockVote { .. }))
+        );
         assert!(state.votes.voted_heights.contains_key(&height));
     }
 
@@ -4331,14 +4341,18 @@ mod tests {
         let block_b = BlockHash::from_raw(Hash::from_bytes(b"block_b"));
 
         let actions = state.try_vote_on_block(&topology, block_a, height, Round(0));
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, Action::SignAndBroadcastBlockVote { .. })));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::SignAndBroadcastBlockVote { .. }))
+        );
 
         let actions = state.try_vote_on_block(&topology, block_b, height, Round(1));
-        assert!(!actions
-            .iter()
-            .any(|a| matches!(a, Action::SignAndBroadcastBlockVote { .. })));
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::SignAndBroadcastBlockVote { .. }))
+        );
         assert_eq!(
             state.votes.voted_heights.get(&height).map(|(h, _)| *h),
             Some(block_a)
@@ -4364,9 +4378,11 @@ mod tests {
         let actions = state.check_sync_health(&topology);
 
         assert!(state.is_syncing());
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, Action::StartSync { .. })));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::StartSync { .. }))
+        );
     }
 
     #[test]
@@ -4498,9 +4514,11 @@ mod tests {
         state.set_syncing(&topology, true);
 
         let actions = state.try_propose(&topology, &[], vec![], vec![]);
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, Action::BuildProposal { .. })));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::BuildProposal { .. }))
+        );
     }
 
     #[test]
@@ -4587,15 +4605,17 @@ mod tests {
         };
 
         // Ancestor is at committed height, so walk stops before checking it
-        assert!({
-            let (_, qc_chain, _) = state.collect_qc_chain_hashes(block.header().parent_hash);
-            crate::validation::validate_no_duplicate_transactions(
-                &block,
-                &qc_chain,
-                &state.tx_cache,
-            )
-        }
-        .is_ok());
+        assert!(
+            {
+                let (_, qc_chain, _) = state.collect_qc_chain_hashes(block.header().parent_hash);
+                crate::validation::validate_no_duplicate_transactions(
+                    &block,
+                    &qc_chain,
+                    &state.tx_cache,
+                )
+            }
+            .is_ok()
+        );
     }
 
     #[test]

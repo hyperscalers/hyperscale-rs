@@ -29,7 +29,7 @@
 //! together with the supplied siblings until a single root hash is
 //! derived. Compare against the signed root.
 
-use crate::hasher::{Hash, Hasher, EMPTY_HASH};
+use crate::hasher::{EMPTY_HASH, Hash, Hasher};
 use crate::node::{Key, NibblePath, Node, NodeKey, ValueHash};
 use crate::storage::TreeReader;
 use crate::tree::Tree;

@@ -5,15 +5,15 @@
 // `u32::MAX`); the casts between them are domain-sized.
 #![allow(clippy::cast_possible_truncation)]
 
+use crate::NodeIndex;
 use crate::sim_network::{
     BroadcastTarget, OutboxEntry, PendingNotification, PendingRequest, SimNetworkAdapter,
 };
 use crate::traffic::NetworkTrafficAnalyzer;
-use crate::NodeIndex;
 use hyperscale_network::{HandlerRegistry, RequestError};
 use hyperscale_types::{ShardGroupId, ValidatorId};
-use rand::seq::SliceRandom;
 use rand::RngExt;
+use rand::seq::SliceRandom;
 use rand_chacha::ChaCha8Rng;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
@@ -1397,8 +1397,8 @@ mod tests {
     /// Registers directly on the shared registry since these tests exercise
     /// the `SimulatedNetwork` infrastructure, not the typed handler API.
     fn register_gossip_handlers(network: &SimulatedNetwork) -> Vec<Arc<RecordingHandler>> {
-        use hyperscale_network::registry::RawGossipHandler;
         use hyperscale_network::GossipVerdict;
+        use hyperscale_network::registry::RawGossipHandler;
         let total = network.total_nodes();
         (0..total as NodeIndex)
             .map(|i| {
@@ -1698,11 +1698,11 @@ mod tests {
     #[test]
     fn test_full_gossip_roundtrip() {
         use hyperscale_messages::TransactionGossip;
-        use hyperscale_network::registry::RawGossipHandler;
         use hyperscale_network::GossipVerdict;
+        use hyperscale_network::registry::RawGossipHandler;
         use hyperscale_types::{
-            test_utils::{test_node, test_transaction_with_nodes},
             ShardGroupId,
+            test_utils::{test_node, test_transaction_with_nodes},
         };
 
         let mut network = SimulatedNetwork::new(NetworkConfig {

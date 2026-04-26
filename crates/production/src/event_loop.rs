@@ -341,13 +341,13 @@ pub fn spawn_pinned_loop(
         .name("io-loop".to_string())
         .spawn(move || {
             // Try to pin to core 0
-            if let Some(core_ids) = core_affinity::get_core_ids() {
-                if let Some(&core_id) = core_ids.first() {
-                    if core_affinity::set_for_current(core_id) {
-                        info!(?core_id, "Pinned io-loop thread to core");
-                    } else {
-                        warn!("Failed to pin io-loop thread to core 0");
-                    }
+            if let Some(core_ids) = core_affinity::get_core_ids()
+                && let Some(&core_id) = core_ids.first()
+            {
+                if core_affinity::set_for_current(core_id) {
+                    info!(?core_id, "Pinned io-loop thread to core");
+                } else {
+                    warn!("Failed to pin io-loop thread to core 0");
                 }
             }
 

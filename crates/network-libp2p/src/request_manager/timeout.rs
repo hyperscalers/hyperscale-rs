@@ -1,8 +1,8 @@
 //! Timeout and backoff computation based on peer RTT history.
 
 use super::{
-    RequestManager, RequestPriority, MAX_STREAM_TIMEOUT, MIN_STREAM_TIMEOUT_COLD,
-    MIN_STREAM_TIMEOUT_WARM, STREAM_TIMEOUT_RTT_MULTIPLIER,
+    MAX_STREAM_TIMEOUT, MIN_STREAM_TIMEOUT_COLD, MIN_STREAM_TIMEOUT_WARM, RequestManager,
+    RequestPriority, STREAM_TIMEOUT_RTT_MULTIPLIER,
 };
 use libp2p::PeerId;
 use std::time::Duration;

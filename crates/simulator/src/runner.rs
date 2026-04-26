@@ -13,7 +13,7 @@ use hyperscale_spammer::{
     AccountPool, AccountPoolError, FundingWorkload, TransferWorkload, WorkloadGenerator,
 };
 use hyperscale_types::{
-    shard_for_node, ShardGroupId, TransactionDecision, TransactionStatus, TxHash,
+    ShardGroupId, TransactionDecision, TransactionStatus, TxHash, shard_for_node,
 };
 use radix_common::math::Decimal;
 use radix_common::network::NetworkDefinition;
@@ -234,17 +234,17 @@ impl Simulator {
                 for hash in hashes {
                     if let Some(&shard) = pending.get(&hash) {
                         let node_idx = self.get_node_for_shard(shard);
-                        if let Some(status) = self.runner.tx_status(node_idx, &hash) {
-                            if status.is_final() {
-                                pending.remove(&hash);
-                                if let TransactionStatus::Completed(TransactionDecision::Accept) =
-                                    status
-                                {
-                                    total_completed += 1;
-                                } else {
-                                    total_failed += 1;
-                                    warn!(?hash, %status, "Funding transaction failed");
-                                }
+                        if let Some(status) = self.runner.tx_status(node_idx, &hash)
+                            && status.is_final()
+                        {
+                            pending.remove(&hash);
+                            if let TransactionStatus::Completed(TransactionDecision::Accept) =
+                                status
+                            {
+                                total_completed += 1;
+                            } else {
+                                total_failed += 1;
+                                warn!(?hash, %status, "Funding transaction failed");
                             }
                         }
                     }

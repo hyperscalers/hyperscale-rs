@@ -8,7 +8,7 @@
 use hyperscale_jmt::{self as jmt, Blake3Hasher, MultiProof, Tree};
 use hyperscale_types::{BlockHeight, MerkleInclusionProof, StateRoot};
 
-use super::{hash_storage_key, hash_value, Jmt};
+use super::{Jmt, hash_storage_key, hash_value};
 
 // ============================================================================
 // Proof generation

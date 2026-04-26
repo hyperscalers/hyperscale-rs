@@ -5,8 +5,8 @@ use arc_swap::ArcSwap;
 use hyperscale_core::{NodeInput, TransactionStatus};
 use hyperscale_types::TxHash;
 use quick_cache::sync::Cache as QuickCache;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 /// Type alias for the transaction submission channel.

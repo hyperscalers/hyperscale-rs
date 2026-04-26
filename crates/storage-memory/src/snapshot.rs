@@ -8,7 +8,7 @@
 //! answer.
 
 use hyperscale_storage::{
-    keys, DbPartitionKey, DbSortKey, DbSubstateValue, PartitionEntry, SubstateDatabase,
+    DbPartitionKey, DbSortKey, DbSubstateValue, PartitionEntry, SubstateDatabase, keys,
 };
 use hyperscale_types::NodeId;
 use std::collections::{BTreeMap, HashMap};
@@ -146,10 +146,10 @@ impl SubstateDatabase for SimSnapshot {
                 }
                 let sort_key_bytes = k[prefix_len..].to_vec();
                 let sort_key = DbSortKey(sort_key_bytes);
-                if let Some(from) = from_sort_key {
-                    if sort_key < *from {
-                        return None;
-                    }
+                if let Some(from) = from_sort_key
+                    && sort_key < *from
+                {
+                    return None;
                 }
                 Some((sort_key, v))
             })

@@ -50,9 +50,11 @@ fn test_basic_substate_operations() {
     let sort_key = DbSortKey(vec![10, 20]);
 
     // Initially empty
-    assert!(storage
-        .get_raw_substate_by_db_key(&partition_key, &sort_key)
-        .is_none());
+    assert!(
+        storage
+            .get_raw_substate_by_db_key(&partition_key, &sort_key)
+            .is_none()
+    );
 
     // Commit a value
     let mut updates = DatabaseUpdates::default();
@@ -218,7 +220,7 @@ fn test_block_range_retrieval() {
 
 #[test]
 fn test_recovery_with_qc() {
-    use hyperscale_types::{zero_bls_signature, SignerBitfield};
+    use hyperscale_types::{SignerBitfield, zero_bls_signature};
 
     let temp_dir = TempDir::new().unwrap();
     let expected_raw = Hash::from_hash_bytes(&[99; 32]);
@@ -645,9 +647,11 @@ fn test_certificate_store_and_retrieve() {
 fn test_certificate_get_missing() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
-    assert!(storage
-        .get_certificate(&WaveIdHash::from_raw(Hash::from_bytes(&[99; 32])))
-        .is_none());
+    assert!(
+        storage
+            .get_certificate(&WaveIdHash::from_raw(Hash::from_bytes(&[99; 32])))
+            .is_none()
+    );
 }
 
 #[test]

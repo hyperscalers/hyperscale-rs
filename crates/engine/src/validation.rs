@@ -196,7 +196,7 @@ impl TransactionValidation {
 mod tests {
     use super::*;
     use hyperscale_types::{
-        generate_ed25519_keypair, routable_from_notarized_v1, TimestampRange, WeightedTimestamp,
+        TimestampRange, WeightedTimestamp, generate_ed25519_keypair, routable_from_notarized_v1,
     };
     use radix_common::network::NetworkDefinition;
     use radix_transactions::builder::ManifestBuilder;

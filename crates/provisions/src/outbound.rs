@@ -226,8 +226,8 @@ impl OutboundProvisionTracker {
 mod tests {
     use super::*;
     use hyperscale_types::{
-        ExecutionOutcome, GlobalReceiptHash, Hash, MerkleInclusionProof, TxEntries,
-        RETENTION_HORIZON,
+        ExecutionOutcome, GlobalReceiptHash, Hash, MerkleInclusionProof, RETENTION_HORIZON,
+        TxEntries,
     };
     use std::time::Duration;
 

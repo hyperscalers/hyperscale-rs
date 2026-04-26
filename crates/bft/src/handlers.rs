@@ -6,13 +6,13 @@
 
 use hyperscale_storage::{ChainWriter, SubstateStore};
 use hyperscale_types::{
-    batch_verify_bls_same_message, compute_certificate_root, compute_local_receipt_root,
-    compute_provision_root, compute_provision_tx_roots, compute_transaction_root, compute_waves,
-    verify_bls12381_v1, Block, BlockHash, BlockHeader, BlockHeight, BlockVote, Bls12381G1PublicKey,
+    Block, BlockHash, BlockHeader, BlockHeight, BlockVote, Bls12381G1PublicKey,
     Bls12381G2Signature, CertificateRoot, FinalizedWave, Hash, LocalReceiptRoot, ProposerTimestamp,
     ProvisionHash, ProvisionTxRoot, ProvisionsRoot, QuorumCertificate, ReceiptBundle, Round,
     RoutableTransaction, ShardGroupId, SignerBitfield, StateRoot, TopologySnapshot,
-    TransactionRoot, ValidatorId, VotePower, WeightedTimestamp,
+    TransactionRoot, ValidatorId, VotePower, WeightedTimestamp, batch_verify_bls_same_message,
+    compute_certificate_root, compute_local_receipt_root, compute_provision_root,
+    compute_provision_tx_roots, compute_transaction_root, compute_waves, verify_bls12381_v1,
 };
 use std::sync::Arc;
 
@@ -530,9 +530,9 @@ pub fn build_proposal<S: ChainWriter + SubstateStore>(
 mod tests {
     use super::*;
     use hyperscale_types::{
-        compute_certificate_root, compute_local_receipt_root, compute_provision_root,
-        compute_transaction_root, generate_bls_keypair, Bls12381G1PrivateKey, ProposerTimestamp,
-        ReceiptBundle,
+        Bls12381G1PrivateKey, ProposerTimestamp, ReceiptBundle, compute_certificate_root,
+        compute_local_receipt_root, compute_provision_root, compute_transaction_root,
+        generate_bls_keypair,
     };
 
     fn shard() -> ShardGroupId {
@@ -867,7 +867,7 @@ mod tests {
     #[test]
     fn verify_transaction_root_rejects_expired_tx() {
         use hyperscale_types::test_utils::test_notarized_transaction_v1;
-        use hyperscale_types::{routable_from_notarized_v1, TimestampRange};
+        use hyperscale_types::{TimestampRange, routable_from_notarized_v1};
         use std::time::Duration;
 
         let anchor = WeightedTimestamp::from_millis(100_000);
@@ -901,7 +901,7 @@ mod tests {
     #[test]
     fn verify_transaction_root_rejects_malformed_range() {
         use hyperscale_types::test_utils::test_notarized_transaction_v1;
-        use hyperscale_types::{routable_from_notarized_v1, TimestampRange};
+        use hyperscale_types::{TimestampRange, routable_from_notarized_v1};
         use std::time::Duration;
 
         let anchor = WeightedTimestamp::from_millis(1_000);

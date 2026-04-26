@@ -8,7 +8,7 @@
 //! `state_history` to find the smallest write after V; its prior value
 //! is the state at V.
 
-use crate::state::{apply_updates, ConsensusState, SharedState};
+use crate::state::{ConsensusState, SharedState, apply_updates};
 
 use hyperscale_storage::{
     DatabaseUpdates, DbPartitionKey, DbSortKey, DbSubstateValue, PartitionEntry, SubstateDatabase,

@@ -223,13 +223,12 @@ impl hyperscale_storage::ChainWriter for RocksDbStorage {
             if let Some(cf) = self.db.cf_handle(cf_name) {
                 // Block cache is shared — reading from any CF gives the total.
                 // We read it once from the first CF we find.
-                if block_cache_usage == 0 {
-                    if let Ok(Some(val)) = self
+                if block_cache_usage == 0
+                    && let Ok(Some(val)) = self
                         .db
                         .property_int_value_cf(&cf, "rocksdb.block-cache-usage")
-                    {
-                        block_cache_usage = val;
-                    }
+                {
+                    block_cache_usage = val;
                 }
                 if let Ok(Some(val)) = self
                     .db

@@ -47,8 +47,8 @@ impl NetworkMessage for BlockVoteNotification {
 #[cfg(test)]
 mod tests {
     use hyperscale_types::{
-        zero_bls_signature, BlockHash, BlockHeight, Hash, ProposerTimestamp, Round, ShardGroupId,
-        ValidatorId,
+        BlockHash, BlockHeight, Hash, ProposerTimestamp, Round, ShardGroupId, ValidatorId,
+        zero_bls_signature,
     };
 
     use super::*;

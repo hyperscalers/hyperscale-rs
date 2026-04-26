@@ -7,10 +7,10 @@
 
 use hyperscale_core::TransactionStatus;
 use hyperscale_mempool::{MempoolConfig, MempoolCoordinator, MempoolMemoryStats};
-use hyperscale_test_helpers::{certify, make_finalized_wave, make_live_block, TestCommittee};
+use hyperscale_test_helpers::{TestCommittee, certify, make_finalized_wave, make_live_block};
 use hyperscale_types::{
-    test_utils::test_transaction, BlockHeight, Hash, LocalTimestamp, ShardGroupId,
-    TopologySnapshot, TransactionDecision, TxHash, ValidatorId,
+    BlockHeight, Hash, LocalTimestamp, ShardGroupId, TopologySnapshot, TransactionDecision, TxHash,
+    ValidatorId, test_utils::test_transaction,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -80,20 +80,26 @@ fn at_pending_limit_is_false_on_fresh_coordinator() {
 fn has_transaction_is_false_on_fresh_coordinator() {
     let coord = MempoolCoordinator::new();
     assert!(!coord.has_transaction(&TxHash::from_raw(Hash::from_bytes(b"unknown"))));
-    assert!(coord
-        .status(&TxHash::from_raw(Hash::from_bytes(b"unknown")))
-        .is_none());
-    assert!(coord
-        .get_transaction(&TxHash::from_raw(Hash::from_bytes(b"unknown")))
-        .is_none());
+    assert!(
+        coord
+            .status(&TxHash::from_raw(Hash::from_bytes(b"unknown")))
+            .is_none()
+    );
+    assert!(
+        coord
+            .get_transaction(&TxHash::from_raw(Hash::from_bytes(b"unknown")))
+            .is_none()
+    );
 }
 
 #[test]
 fn ready_transactions_is_empty_on_fresh_coordinator() {
     let coord = MempoolCoordinator::new();
-    assert!(coord
-        .ready_transactions(100, 0, 0, LocalTimestamp::ZERO)
-        .is_empty());
+    assert!(
+        coord
+            .ready_transactions(100, 0, 0, LocalTimestamp::ZERO)
+            .is_empty()
+    );
 }
 
 #[test]

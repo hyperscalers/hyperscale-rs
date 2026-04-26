@@ -3,8 +3,8 @@
 //! Uses [`IoLoop`] to process all actions per-node, with the simulation harness
 //! controlling event scheduling, network delivery, and time.
 
-use crate::event_queue::EventKey;
 use crate::NodeIndex;
+use crate::event_queue::EventKey;
 use hyperscale_bft::{BftConfig, RecoveredState};
 use hyperscale_core::{NodeInput, ProtocolEvent, TimerId};
 use hyperscale_dispatch_sync::SyncDispatch;
@@ -19,9 +19,9 @@ use hyperscale_storage::{ChainReader, GenesisWrapper};
 use hyperscale_storage_memory::SimStorage;
 use hyperscale_topology::TopologyState;
 use hyperscale_types::{
-    bls_keypair_from_seed, shard_for_node, BlockHeight, Bls12381G1PrivateKey, Bls12381G1PublicKey,
-    CertifiedBlock, NodeId, ShardGroupId, TransactionStatus, TxHash, ValidatorId, ValidatorInfo,
-    ValidatorSet,
+    BlockHeight, Bls12381G1PrivateKey, Bls12381G1PublicKey, CertifiedBlock, NodeId, ShardGroupId,
+    TransactionStatus, TxHash, ValidatorId, ValidatorInfo, ValidatorSet, bls_keypair_from_seed,
+    shard_for_node,
 };
 use radix_common::network::NetworkDefinition;
 use rand::SeedableRng;

@@ -207,8 +207,8 @@ impl OutboundExecutionCertificateTracker {
 mod tests {
     use super::*;
     use hyperscale_types::{
-        BlockHeight, Bls12381G2Signature, GlobalReceiptRoot, Hash, SignerBitfield,
-        RETENTION_HORIZON,
+        BlockHeight, Bls12381G2Signature, GlobalReceiptRoot, Hash, RETENTION_HORIZON,
+        SignerBitfield,
     };
 
     fn ts(ms: u64) -> WeightedTimestamp {

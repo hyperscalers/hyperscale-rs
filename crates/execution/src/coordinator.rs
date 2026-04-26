@@ -42,7 +42,7 @@ use hyperscale_types::{
     Attempt, Block, BlockHash, BlockHeight, BloomFilter, ExecutionCertificate, ExecutionVote,
     GlobalReceiptRoot, LocalExecutionEntry, NodeId, Provisions, ReceiptBundle, RoutableTransaction,
     ShardGroupId, TopologySnapshot, TransactionDecision, TxHash, TxOutcome, ValidatorId,
-    WaveCertificate, WaveId, WaveIdHash, WeightedTimestamp, WAVE_TIMEOUT,
+    WAVE_TIMEOUT, WaveCertificate, WaveId, WaveIdHash, WeightedTimestamp,
 };
 #[cfg(test)]
 use hyperscale_types::{ExecutionOutcome, Hash};
@@ -51,7 +51,7 @@ use std::sync::Arc;
 use tracing::instrument;
 
 use crate::conflict::DetectedConflict;
-use crate::early_arrivals::{EarlyArrivalBuffer, EARLY_VOTE_RETENTION};
+use crate::early_arrivals::{EARLY_VOTE_RETENTION, EarlyArrivalBuffer};
 use crate::expected_certs::{ExpectedCertTracker, FallbackFetch};
 use crate::finalized_waves::FinalizedWaveStore;
 use crate::handlers::build_dispatch_action;
@@ -365,13 +365,13 @@ impl ExecutionCoordinator {
             }
 
             // Dispatch execution if fully provisioned at creation.
-            if wave_state.is_fully_provisioned() && !wave_state.dispatched() {
-                if let Some(action) =
+            if wave_state.is_fully_provisioned()
+                && !wave_state.dispatched()
+                && let Some(action) =
                     build_dispatch_action(&wave_state, self.provisioning.verified(), block_hash)
-                {
-                    wave_state.mark_dispatched();
-                    dispatch_actions.push(action);
-                }
+            {
+                wave_state.mark_dispatched();
+                dispatch_actions.push(action);
             }
 
             self.waves.insert_wave(wave_id.clone(), wave_state);
@@ -655,13 +655,12 @@ impl ExecutionCoordinator {
             // blocks' cert writes in the view, and those writes come from
             // each validator's own local receipts — one validator's
             // divergence there seeds divergence everywhere downstream.
-            if wave.is_fully_provisioned() {
-                if let Some(action) =
+            if wave.is_fully_provisioned()
+                && let Some(action) =
                     build_dispatch_action(wave, self.provisioning.verified(), wave.block_hash())
-                {
-                    wave.mark_dispatched();
-                    actions.push(action);
-                }
+            {
+                wave.mark_dispatched();
+                actions.push(action);
             }
         }
 
@@ -1859,7 +1858,7 @@ mod tests {
     use super::*;
     use hyperscale_types::test_utils::test_transaction;
     use hyperscale_types::{
-        generate_bls_keypair, Bls12381G1PrivateKey, GlobalReceiptHash, ValidatorInfo, ValidatorSet,
+        Bls12381G1PrivateKey, GlobalReceiptHash, ValidatorInfo, ValidatorSet, generate_bls_keypair,
     };
 
     fn make_test_topology() -> TopologySnapshot {
@@ -1925,9 +1924,11 @@ mod tests {
         // Should request execution (single-shard path) and set up wave tracking
         assert!(!actions.is_empty());
         // First action should be ExecuteTransactions
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, Action::ExecuteTransactions { .. })));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::ExecuteTransactions { .. }))
+        );
 
         // WaveState should be set up for this wave.
         let wave_id = state.waves.wave_assignment(&tx_hash);

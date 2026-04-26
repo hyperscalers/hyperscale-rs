@@ -22,7 +22,7 @@ impl DbCodec<(DbPartitionKey, DbSortKey)> for SubstateKeyCodec {
     fn encode_to(&self, value: &(DbPartitionKey, DbSortKey), buf: &mut Vec<u8>) {
         buf.extend_from_slice(&value.0.node_key);
         buf.push(value.0.partition_num);
-        buf.extend_from_slice(&value.1 .0);
+        buf.extend_from_slice(&value.1.0);
     }
 
     fn decode(&self, bytes: &[u8]) -> (DbPartitionKey, DbSortKey) {

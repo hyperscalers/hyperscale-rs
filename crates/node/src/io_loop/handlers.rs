@@ -1,7 +1,7 @@
 //! Network handler registration (gossip, notifications, requests).
 
-use super::verify::{resolve_sender_key, verify_bls_with_metrics, verify_sender_signature};
 use super::IoLoop;
+use super::verify::{resolve_sender_key, verify_bls_with_metrics, verify_sender_signature};
 use hyperscale_core::{NodeInput, ProtocolEvent};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::Engine;

@@ -31,7 +31,7 @@ pub mod node;
 pub mod storage;
 pub mod tree;
 
-pub use hasher::{Blake3Hasher, Hash, Hasher, EMPTY_HASH};
+pub use hasher::{Blake3Hasher, EMPTY_HASH, Hash, Hasher};
 pub use multiproof::{ClaimTermination, DecodeError, MultiProof, ProofClaim, ProofError};
 pub use node::{
     Child, ChildKind, InternalNode, Key, LeafNode, NibblePath, Node, NodeKey, PathDecodeError,

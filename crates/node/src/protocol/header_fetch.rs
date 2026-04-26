@@ -190,7 +190,7 @@ impl HeaderFetchProtocol {
             if let Some(oldest) = oldest_key {
                 warn!(
                     source_shard = source_shard.0,
-                    evicted_height = oldest.1 .0,
+                    evicted_height = oldest.1.0,
                     new_height = from_height.0,
                     limit = self.config.max_pending_per_shard,
                     "Evicting oldest header fetch to make room (shard pending limit)"

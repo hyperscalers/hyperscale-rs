@@ -186,7 +186,7 @@ impl TopologyState {
 mod tests {
     use super::*;
     use hyperscale_types::{
-        generate_bls_keypair, BlockHeight, EpochId, ValidatorInfo, ValidatorSet,
+        BlockHeight, EpochId, ValidatorInfo, ValidatorSet, generate_bls_keypair,
     };
 
     fn make_test_validator(id: u64, power: u64) -> ValidatorInfo {

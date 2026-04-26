@@ -373,7 +373,7 @@ impl GlobalConsensusConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{generate_bls_keypair, ValidatorInfo};
+    use crate::{ValidatorInfo, generate_bls_keypair};
 
     fn make_test_validator(id: u64) -> ValidatorInfo {
         ValidatorInfo {

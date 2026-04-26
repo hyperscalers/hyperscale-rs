@@ -6,14 +6,14 @@ use crate::config::SpammerConfig;
 use crate::latency::{LatencyReport, LatencyTracker};
 use crate::workloads::TransferWorkload;
 use futures::future::join_all;
-use hyperscale_types::{routable_from_notarized_v1, RoutableTransaction, ShardGroupId};
+use hyperscale_types::{RoutableTransaction, ShardGroupId, routable_from_notarized_v1};
 use radix_common::math::Decimal;
 use radix_common::network::NetworkDefinition;
 use radix_common::types::ComponentAddress;
 use rand::{Rng, RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -357,10 +357,8 @@ impl Spammer {
                 if result.accepted {
                     self.stats.accepted.fetch_add(1, Ordering::SeqCst);
 
-                    if should_track {
-                        if let Some(ref tracker) = self.latency_tracker {
-                            tracker.track(result.hash, client_idx);
-                        }
+                    if should_track && let Some(ref tracker) = self.latency_tracker {
+                        tracker.track(result.hash, client_idx);
                     }
                 } else {
                     self.stats.rejected.fetch_add(1, Ordering::SeqCst);
@@ -589,10 +587,8 @@ impl Worker {
                 if result.accepted {
                     self.stats.accepted.fetch_add(1, Ordering::SeqCst);
 
-                    if should_track {
-                        if let Some(ref tracker) = self.latency_tracker {
-                            tracker.track(result.hash, client_idx);
-                        }
+                    if should_track && let Some(ref tracker) = self.latency_tracker {
+                        tracker.track(result.hash, client_idx);
                     }
                 } else {
                     self.stats.rejected.fetch_add(1, Ordering::SeqCst);

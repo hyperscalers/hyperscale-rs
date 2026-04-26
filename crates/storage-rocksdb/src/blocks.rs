@@ -12,7 +12,7 @@ use rocksdb::{WriteBatch, WriteOptions};
 use std::sync::Arc;
 use std::time::Instant;
 #[cfg(test)]
-use tracing::{instrument, Level};
+use tracing::{Level, instrument};
 
 impl RocksDbStorage {
     /// Get a range of committed blocks [from, to).

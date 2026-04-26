@@ -41,7 +41,7 @@ pub mod handlers;
 pub mod sharding;
 
 pub use execution::ProvisionedSnapshot;
-pub use executor::{fetch_state_entries, Engine, RadixExecutor};
+pub use executor::{Engine, RadixExecutor, fetch_state_entries};
 pub use genesis::GenesisConfig;
 pub use hyperscale_types::LocalExecutionEntry;
 pub use result::SingleTxResult;

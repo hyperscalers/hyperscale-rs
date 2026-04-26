@@ -5,8 +5,8 @@ use crate::ready_set::ReadySet;
 use crate::tombstones::TombstoneStore;
 use hyperscale_core::{Action, TransactionStatus};
 use hyperscale_types::{
-    BlockHeight, BloomFilter, CertifiedBlock, LocalTimestamp, NodeId, RoutableTransaction,
-    TopologySnapshot, TransactionDecision, TxHash, WeightedTimestamp, DEFAULT_FPR,
+    BlockHeight, BloomFilter, CertifiedBlock, DEFAULT_FPR, LocalTimestamp, NodeId,
+    RoutableTransaction, TopologySnapshot, TransactionDecision, TxHash, WeightedTimestamp,
 };
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -677,10 +677,10 @@ impl MempoolCoordinator {
         promotable.sort();
         let mut to_readd: Vec<(TxHash, Arc<RoutableTransaction>, LocalTimestamp)> = Vec::new();
         for tx_hash in promotable {
-            if let Some(entry) = self.pool.get(&tx_hash) {
-                if entry.status == TransactionStatus::Pending {
-                    to_readd.push((tx_hash, Arc::clone(&entry.tx), entry.admitted_at));
-                }
+            if let Some(entry) = self.pool.get(&tx_hash)
+                && entry.status == TransactionStatus::Pending
+            {
+                to_readd.push((tx_hash, Arc::clone(&entry.tx), entry.admitted_at));
             }
         }
         for (hash, tx, added_at) in to_readd {
@@ -980,9 +980,9 @@ impl MempoolCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hyperscale_test_helpers::{make_finalized_wave, TestCommittee};
+    use hyperscale_test_helpers::{TestCommittee, make_finalized_wave};
     use hyperscale_types::{
-        test_utils::test_transaction, FinalizedWave, ShardGroupId, ValidatorId,
+        FinalizedWave, ShardGroupId, ValidatorId, test_utils::test_transaction,
     };
 
     fn make_test_topology() -> TopologySnapshot {
@@ -1469,7 +1469,7 @@ mod tests {
 
     fn tx_with_end(seed: u8, end_ms: u64) -> Arc<RoutableTransaction> {
         use hyperscale_types::test_utils::test_notarized_transaction_v1;
-        use hyperscale_types::{routable_from_notarized_v1, TimestampRange};
+        use hyperscale_types::{TimestampRange, routable_from_notarized_v1};
         let notarized = test_notarized_transaction_v1(&[seed]);
         let range = TimestampRange::new(WeightedTimestamp::ZERO, WeightedTimestamp(end_ms));
         Arc::new(routable_from_notarized_v1(notarized, range).expect("valid notarized fixture"))

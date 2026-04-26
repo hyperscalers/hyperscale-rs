@@ -43,23 +43,23 @@
 //! listen_addr = "0.0.0.0:9090"
 //! ```
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use arc_swap::ArcSwap;
 use clap::Parser;
 use hyperscale_bft::BftConfig;
 use hyperscale_mempool::MempoolConfig;
 use hyperscale_network_libp2p::VersionInteroperabilityMode;
-use hyperscale_production::rpc::{MempoolSnapshot, NodeStatusState, RpcServer, RpcServerConfig};
 use hyperscale_production::Libp2pConfig;
+use hyperscale_production::rpc::{MempoolSnapshot, NodeStatusState, RpcServer, RpcServerConfig};
 use hyperscale_production::{
-    init_telemetry, PooledDispatch, ProductionRunner, RocksDbConfig, RocksDbStorage,
-    TelemetryConfig, ThreadPoolConfig,
+    PooledDispatch, ProductionRunner, RocksDbConfig, RocksDbStorage, TelemetryConfig,
+    ThreadPoolConfig, init_telemetry,
 };
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_topology::TopologyState;
 use hyperscale_types::{
-    bls_keypair_from_seed, generate_bls_keypair, Bls12381G1PrivateKey, Bls12381G1PublicKey,
-    ShardGroupId, ValidatorId, ValidatorInfo, ValidatorSet,
+    Bls12381G1PrivateKey, Bls12381G1PublicKey, ShardGroupId, ValidatorId, ValidatorInfo,
+    ValidatorSet, bls_keypair_from_seed, generate_bls_keypair,
 };
 use radix_common::network::NetworkDefinition;
 use radix_common::prelude::AddressBech32Decoder;
@@ -67,8 +67,8 @@ use serde::Deserialize;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 use tokio::signal;
 use tracing::{info, trace, warn};
@@ -1005,11 +1005,11 @@ async fn setup_upnp(config: &NetworkConfig) {
     for server in &dns_servers {
         match std::net::UdpSocket::bind("0.0.0.0:0") {
             Ok(socket) => {
-                if socket.connect(server).is_ok() {
-                    if let Ok(addr) = socket.local_addr() {
-                        local_ip = Some(addr.ip());
-                        break;
-                    }
+                if socket.connect(server).is_ok()
+                    && let Ok(addr) = socket.local_addr()
+                {
+                    local_ip = Some(addr.ip());
+                    break;
                 }
             }
             Err(e) => {
@@ -1078,22 +1078,22 @@ async fn setup_upnp(config: &NetworkConfig) {
             }
 
             // Map TCP fallback port
-            if config.tcp_fallback_enabled {
-                if let Some(port) = config.tcp_fallback_port {
-                    let local_addr = SocketAddr::new(local_ip, port);
-                    match gateway
-                        .add_port(
-                            igd_next::PortMappingProtocol::TCP,
-                            port,
-                            local_addr,
-                            60 * 60, // 1 hour lease
-                            "Hyperscale Validator TCP",
-                        )
-                        .await
-                    {
-                        Ok(()) => info!("Successfully mapped TCP fallback port {} via UPnP", port),
-                        Err(e) => warn!("Failed to map TCP fallback port {} via UPnP: {}", port, e),
-                    }
+            if config.tcp_fallback_enabled
+                && let Some(port) = config.tcp_fallback_port
+            {
+                let local_addr = SocketAddr::new(local_ip, port);
+                match gateway
+                    .add_port(
+                        igd_next::PortMappingProtocol::TCP,
+                        port,
+                        local_addr,
+                        60 * 60, // 1 hour lease
+                        "Hyperscale Validator TCP",
+                    )
+                    .await
+                {
+                    Ok(()) => info!("Successfully mapped TCP fallback port {} via UPnP", port),
+                    Err(e) => warn!("Failed to map TCP fallback port {} via UPnP: {}", port, e),
                 }
             }
         }

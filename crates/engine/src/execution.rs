@@ -12,7 +12,7 @@ use hyperscale_types::{
     TransactionOutcome,
 };
 use radix_engine::transaction::{
-    execute_transaction, ExecutionConfig, TransactionReceipt, TransactionResult,
+    ExecutionConfig, TransactionReceipt, TransactionResult, execute_transaction,
 };
 use radix_engine::vm::DefaultVmModules;
 use radix_substate_store_interface::interface::{

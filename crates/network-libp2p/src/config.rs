@@ -195,9 +195,11 @@ impl Libp2pConfig {
     #[must_use]
     pub fn for_testing(port: u16) -> Self {
         Self {
-            listen_addresses: vec![format!("/ip4/127.0.0.1/udp/{port}/quic-v1")
-                .parse()
-                .unwrap()],
+            listen_addresses: vec![
+                format!("/ip4/127.0.0.1/udp/{port}/quic-v1")
+                    .parse()
+                    .unwrap(),
+            ],
             bootstrap_peers: vec![],
             max_message_size: 1024 * 1024, // 1MB
             gossipsub_heartbeat: Duration::from_millis(500),
