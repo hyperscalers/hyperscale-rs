@@ -13,7 +13,7 @@ use crate::NodeIndex;
 use hyperscale_network::{HandlerRegistry, RequestError};
 use hyperscale_types::{ShardGroupId, ValidatorId};
 use rand::seq::SliceRandom;
-use rand::Rng;
+use rand::RngExt;
 use rand_chacha::ChaCha8Rng;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
@@ -310,7 +310,7 @@ impl SimulatedNetwork {
     /// Check if a packet should be dropped based on the configured loss rate.
     /// Returns true if the packet should be dropped.
     pub fn should_drop_packet(&self, rng: &mut ChaCha8Rng) -> bool {
-        self.config.packet_loss_rate > 0.0 && rng.gen::<f64>() < self.config.packet_loss_rate
+        self.config.packet_loss_rate > 0.0 && rng.random::<f64>() < self.config.packet_loss_rate
     }
 
     /// Set the packet loss rate (0.0 - 1.0).
@@ -362,7 +362,7 @@ impl SimulatedNetwork {
 
         // Add jitter
         let jitter_range = base.as_secs_f64() * self.config.jitter_fraction;
-        let jitter = rng.gen_range(-jitter_range..jitter_range);
+        let jitter = rng.random_range(-jitter_range..jitter_range);
         let latency_secs = (base.as_secs_f64() + jitter).max(0.001);
 
         Duration::from_secs_f64(latency_secs)

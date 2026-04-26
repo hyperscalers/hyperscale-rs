@@ -18,6 +18,7 @@ use hyperscale_types::{
 pub const MAX_GENESIS_ACCOUNTS_PER_SHARD: usize = 16_000;
 use radix_common::math::Decimal;
 use radix_common::types::ComponentAddress;
+use rand::RngExt;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::info;
@@ -384,7 +385,7 @@ impl AccountPool {
         rng: &mut impl rand::Rng,
         mode: SelectionMode,
     ) -> Option<(&FundedAccount, &FundedAccount)> {
-        let shard = ShardGroupId(rng.gen_range(0..self.num_shards));
+        let shard = ShardGroupId(rng.random_range(0..self.num_shards));
         let num_accounts = self.by_shard.get(&shard)?.len();
 
         if num_accounts < 2 {
@@ -407,10 +408,10 @@ impl AccountPool {
             return None;
         }
 
-        let shard1 = ShardGroupId(rng.gen_range(0..self.num_shards));
-        let mut shard2 = ShardGroupId(rng.gen_range(0..self.num_shards));
+        let shard1 = ShardGroupId(rng.random_range(0..self.num_shards));
+        let mut shard2 = ShardGroupId(rng.random_range(0..self.num_shards));
         while shard2 == shard1 {
-            shard2 = ShardGroupId(rng.gen_range(0..self.num_shards));
+            shard2 = ShardGroupId(rng.random_range(0..self.num_shards));
         }
 
         self.cross_shard_pair_for(shard1, shard2, rng, mode)
@@ -503,10 +504,10 @@ impl AccountPool {
 
         let (idx1, idx2) = match mode {
             SelectionMode::Random => {
-                let idx1 = rng.gen_range(0..num_accounts);
-                let mut idx2 = rng.gen_range(0..num_accounts);
+                let idx1 = rng.random_range(0..num_accounts);
+                let mut idx2 = rng.random_range(0..num_accounts);
                 while idx2 == idx1 {
-                    idx2 = rng.gen_range(0..num_accounts);
+                    idx2 = rng.random_range(0..num_accounts);
                 }
                 (idx1, idx2)
             }
@@ -556,7 +557,7 @@ impl AccountPool {
         use std::sync::atomic::Ordering;
 
         let idx = match mode {
-            SelectionMode::Random => rng.gen_range(0..num_accounts),
+            SelectionMode::Random => rng.random_range(0..num_accounts),
             SelectionMode::RoundRobin => {
                 let counter = self.round_robin_counters.get(&shard).unwrap();
                 counter.fetch_add(1, Ordering::Relaxed) % num_accounts
@@ -595,7 +596,7 @@ impl AccountPool {
     // Skewed sampling for benchmarks; precision/sign correctness aren't material.
     fn zipf_index(n: usize, exponent: f64, rng: &mut (impl rand::Rng + ?Sized)) -> usize {
         let exp = exponent.max(1.0);
-        let u: f64 = rng.gen();
+        let u: f64 = rng.random();
         let idx = ((n as f64).powf(1.0 - u)).powf(1.0 / exp) as usize;
         idx.min(n - 1)
     }
@@ -930,10 +931,10 @@ impl AccountPartition {
                 (val % num_accounts, (val + 1) % num_accounts)
             }
             SelectionMode::Random => {
-                let idx1 = rng.gen_range(0..num_accounts);
-                let mut idx2 = rng.gen_range(0..num_accounts);
+                let idx1 = rng.random_range(0..num_accounts);
+                let mut idx2 = rng.random_range(0..num_accounts);
                 while idx2 == idx1 {
-                    idx2 = rng.gen_range(0..num_accounts);
+                    idx2 = rng.random_range(0..num_accounts);
                 }
                 (idx1, idx2)
             }
@@ -960,10 +961,10 @@ impl AccountPartition {
             return None;
         }
 
-        let shard1 = ShardGroupId(rng.gen_range(0..self.num_shards));
-        let mut shard2 = ShardGroupId(rng.gen_range(0..self.num_shards));
+        let shard1 = ShardGroupId(rng.random_range(0..self.num_shards));
+        let mut shard2 = ShardGroupId(rng.random_range(0..self.num_shards));
         while shard2 == shard1 {
-            shard2 = ShardGroupId(rng.gen_range(0..self.num_shards));
+            shard2 = ShardGroupId(rng.random_range(0..self.num_shards));
         }
 
         self.cross_shard_pair_for(shard1, shard2, rng, mode)
@@ -1005,8 +1006,8 @@ impl AccountPartition {
                 (v1 % num_accounts1, v2 % num_accounts2)
             }
             SelectionMode::Random => (
-                rng.gen_range(0..num_accounts1),
-                rng.gen_range(0..num_accounts2),
+                rng.random_range(0..num_accounts1),
+                rng.random_range(0..num_accounts2),
             ),
             SelectionMode::Zipf { exponent } => (
                 Self::zipf_index(num_accounts1, exponent, rng),
@@ -1030,7 +1031,7 @@ impl AccountPartition {
     // Skewed sampling for benchmarks; precision/sign correctness aren't material.
     fn zipf_index(n: usize, exponent: f64, rng: &mut impl rand::Rng) -> usize {
         let exp = exponent.max(1.0);
-        let u: f64 = rng.gen();
+        let u: f64 = rng.random();
         let idx = ((n as f64).powf(1.0 - u)).powf(1.0 / exp) as usize;
         idx.min(n - 1)
     }

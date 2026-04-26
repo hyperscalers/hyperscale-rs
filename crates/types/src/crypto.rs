@@ -24,27 +24,27 @@ pub use radix_common::crypto::{verify_bls12381_v1, verify_ed25519};
 
 // Re-export the BLS ciphersuite constant for batch verification
 use radix_common::crypto::BLS12381_CIPHERSITE_V1;
-use rand::SeedableRng;
+use rand::{Rng, SeedableRng};
 
 /// Generate a new random Ed25519 keypair.
 ///
 /// # Panics
 ///
-/// Cannot panic in practice: `ed25519_dalek::SigningKey::generate`
-/// always produces 32 valid bytes.
+/// Cannot panic: any 32 bytes form a valid Ed25519 private key.
 #[must_use]
 pub fn generate_ed25519_keypair() -> Ed25519PrivateKey {
-    let mut csprng = rand::rngs::OsRng;
-    let signing_key = ed25519_dalek::SigningKey::generate(&mut csprng);
-    Ed25519PrivateKey::from_bytes(&signing_key.to_bytes()).expect("valid key bytes")
+    let mut secret = [0u8; 32];
+    rand::rng().fill_bytes(&mut secret);
+    Ed25519PrivateKey::from_bytes(&secret).expect("valid key bytes")
 }
 
 /// Generate a new random BLS12-381 keypair.
 ///
 /// Uses a random 32-byte seed with blst's `key_gen` for proper key derivation.
+#[must_use]
 pub fn generate_bls_keypair() -> Bls12381G1PrivateKey {
     let mut ikm = [0u8; 32];
-    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut ikm);
+    rand::rng().fill_bytes(&mut ikm);
     bls_keypair_from_seed(&ikm)
 }
 
@@ -167,6 +167,7 @@ pub fn batch_verify_bls_same_message(
 /// instead of N individual verifications.
 ///
 /// Returns `true` only if ALL signatures are valid. If any is invalid, returns `false`.
+#[must_use]
 pub fn batch_verify_bls_different_messages_all_or_nothing(
     messages: &[&[u8]],
     signatures: &[Bls12381G2Signature],
@@ -196,13 +197,13 @@ pub fn batch_verify_bls_different_messages_all_or_nothing(
 
     // Generate random scalars for the linear combination
     let mut seed = [0u8; 32];
-    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut seed);
+    rand::rng().fill_bytes(&mut seed);
     let mut rng = rand::rngs::StdRng::from_seed(seed);
 
     let mut rands = Vec::with_capacity(signatures.len());
     for _ in 0..signatures.len() {
         let mut rand_bytes = [0u8; 32];
-        rand::RngCore::fill_bytes(&mut rng, &mut rand_bytes);
+        rng.fill_bytes(&mut rand_bytes);
         let mut scalar = blst::blst_scalar::default();
         // SAFETY: `scalar` is a valid `blst_scalar` (zero-initialised above) and
         // `rand_bytes` is a 32-byte array whose pointer is valid for 32 bytes.

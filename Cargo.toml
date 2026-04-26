@@ -103,7 +103,7 @@ ark-ed-on-bls12-381-bandersnatch = "0.5"
 ark-ff = "0.5"
 ark-serialize = "0.5"
 arc-swap = "1.9.1"
-blake3 = "1.8.4"
+blake3 = "1.8.5"
 bytes = "1.9"
 clap = { version = "4.6.1", features = ["derive"] }
 core_affinity = "0.8"
@@ -119,13 +119,13 @@ libp2p = { version = "0.56.0", features = ["gossipsub", "kad", "quic", "tcp", "n
 libp2p-stream = "0.4.0-alpha"
 opentelemetry = "0.31.0"
 opentelemetry_sdk = "0.31.0"
-opentelemetry-otlp = { version = "0.31.0", features = ["grpc-tonic", "reqwest-rustls"] }
+opentelemetry-otlp = { version = "0.31.1", features = ["grpc-tonic", "reqwest-rustls"] }
 opentelemetry-semantic-conventions = "0.31.0"
 parking_lot = "0.12"
 proptest = "1"
 quick_cache = "0.6.21"
-rand = "0.8.5"
-rand_chacha = "0.3.1"
+rand = "0.10.1"
+rand_chacha = "0.10.0"
 rayon = "1.12.0"
 rocksdb = "0.24.0"
 serde = { version = "1.0", features = ["derive"] }
@@ -139,13 +139,13 @@ tracing-opentelemetry = "0.32.0"
 tracing-subscriber = "0.3.23"
 tracing-test = "0.2.5"
 
-# Radix dependencies (github.com/hyperscalers/radixdlt-scrypto @ 7d0b9a0)
-radix-common = { git = "https://github.com/hyperscalers/radixdlt-scrypto", rev = "7d0b9a0", default-features = false, features = ["std"] }
-radix-engine = { git = "https://github.com/hyperscalers/radixdlt-scrypto", rev = "7d0b9a0", default-features = false, features = ["std", "moka"] }
-radix-engine-interface = { git = "https://github.com/hyperscalers/radixdlt-scrypto", rev = "7d0b9a0", default-features = false, features = ["std"] }
-radix-substate-store-interface = { git = "https://github.com/hyperscalers/radixdlt-scrypto", rev = "7d0b9a0", default-features = false, features = ["std"] }
-radix-transactions = { git = "https://github.com/hyperscalers/radixdlt-scrypto", rev = "7d0b9a0", default-features = false, features = ["std"] }
-sbor = { git = "https://github.com/hyperscalers/radixdlt-scrypto", rev = "7d0b9a0", default-features = false, features = ["std"] }
+# Radix dependencies (github.com/hyperscalers/radixdlt-scrypto @ 21c0c4c)
+radix-common = { git = "https://github.com/hyperscalers/radixdlt-scrypto", rev = "21c0c4c", default-features = false, features = ["std"] }
+radix-engine = { git = "https://github.com/hyperscalers/radixdlt-scrypto", rev = "21c0c4c", default-features = false, features = ["std", "moka"] }
+radix-engine-interface = { git = "https://github.com/hyperscalers/radixdlt-scrypto", rev = "21c0c4c", default-features = false, features = ["std"] }
+radix-substate-store-interface = { git = "https://github.com/hyperscalers/radixdlt-scrypto", rev = "21c0c4c", default-features = false, features = ["std"] }
+radix-transactions = { git = "https://github.com/hyperscalers/radixdlt-scrypto", rev = "21c0c4c", default-features = false, features = ["std"] }
+sbor = { git = "https://github.com/hyperscalers/radixdlt-scrypto", rev = "21c0c4c", default-features = false, features = ["std"] }
 
 [workspace.lints.rust]
 missing_docs = "warn"

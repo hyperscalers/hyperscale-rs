@@ -10,7 +10,7 @@ use hyperscale_types::{routable_from_notarized_v1, RoutableTransaction, ShardGro
 use radix_common::math::Decimal;
 use radix_common::network::NetworkDefinition;
 use radix_common::types::ComponentAddress;
-use rand::{Rng, SeedableRng};
+use rand::{Rng, RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -211,7 +211,7 @@ impl Spammer {
                     .into_iter()
                     .map(|tx| {
                         let should_track = self.latency_tracker.is_some()
-                            && latency_rng.gen::<f64>() < self.config.latency_sample_rate;
+                            && latency_rng.random::<f64>() < self.config.latency_sample_rate;
                         self.submit_transaction_concurrent(tx, shard_idx, should_track)
                     })
                     .collect();
@@ -553,7 +553,7 @@ impl Worker {
                     .into_iter()
                     .map(|tx| {
                         let should_track = self.latency_tracker.is_some()
-                            && latency_rng.gen::<f64>() < self.config.latency_sample_rate;
+                            && latency_rng.random::<f64>() < self.config.latency_sample_rate;
                         self.submit_transaction(tx, shard_idx, should_track)
                     })
                     .collect();
@@ -652,7 +652,7 @@ impl PartitionWorkload {
         rng: &mut impl Rng,
     ) -> Option<RoutableTransaction> {
         let is_cross_shard =
-            partition.num_shards() >= 2 && rng.gen::<f64>() < self.cross_shard_ratio;
+            partition.num_shards() >= 2 && rng.random::<f64>() < self.cross_shard_ratio;
 
         if is_cross_shard {
             self.generate_cross_shard_for(partition, target_shard, rng)
@@ -681,12 +681,12 @@ impl PartitionWorkload {
             return None;
         }
 
-        let mut other_shard = ShardGroupId(rng.gen_range(0..partition.num_shards()));
+        let mut other_shard = ShardGroupId(rng.random_range(0..partition.num_shards()));
         while other_shard == target_shard {
-            other_shard = ShardGroupId(rng.gen_range(0..partition.num_shards()));
+            other_shard = ShardGroupId(rng.random_range(0..partition.num_shards()));
         }
 
-        let target_is_sender = rng.gen_bool(0.5);
+        let target_is_sender = rng.random_bool(0.5);
 
         let (from, to) = if target_is_sender {
             partition.cross_shard_pair_for(target_shard, other_shard, rng, self.selection_mode)?

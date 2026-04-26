@@ -9,7 +9,7 @@ use radix_common::constants::XRD;
 use radix_common::math::Decimal;
 use radix_common::network::NetworkDefinition;
 use radix_transactions::builder::ManifestBuilder;
-use rand::{Rng, RngCore};
+use rand::{Rng, RngExt};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::warn;
 
@@ -81,7 +81,7 @@ impl TransferWorkload {
             let counter = self.shard_counter.fetch_add(1, Ordering::Relaxed);
             ShardGroupId(counter % accounts.num_shards())
         } else {
-            ShardGroupId(rng.gen_range(0..accounts.num_shards()))
+            ShardGroupId(rng.random_range(0..accounts.num_shards()))
         };
         let (from, to) = accounts.pair_for_shard(shard, rng, self.selection_mode)?;
         self.build_transfer(from, to)
@@ -149,7 +149,7 @@ impl TransferWorkload {
         rng: &mut R,
     ) -> Option<RoutableTransaction> {
         let is_cross_shard =
-            accounts.num_shards() >= 2 && rng.gen::<f64>() < self.cross_shard_ratio;
+            accounts.num_shards() >= 2 && rng.random::<f64>() < self.cross_shard_ratio;
 
         if is_cross_shard {
             self.generate_cross_shard_inner(accounts, rng)
@@ -192,13 +192,13 @@ impl TransferWorkload {
         }
 
         // Pick another shard randomly (different from target)
-        let mut other_shard = ShardGroupId(rng.gen_range(0..accounts.num_shards()));
+        let mut other_shard = ShardGroupId(rng.random_range(0..accounts.num_shards()));
         while other_shard == target_shard {
-            other_shard = ShardGroupId(rng.gen_range(0..accounts.num_shards()));
+            other_shard = ShardGroupId(rng.random_range(0..accounts.num_shards()));
         }
 
         // Randomly decide if target shard is sender or receiver
-        let target_is_sender = rng.gen_bool(0.5);
+        let target_is_sender = rng.random_bool(0.5);
 
         // Use AccountPool's selection for stateful modes (NoContention, RoundRobin)
         let (from, to) = if target_is_sender {
@@ -221,7 +221,7 @@ impl TransferWorkload {
         rng: &mut R,
     ) -> Option<RoutableTransaction> {
         let is_cross_shard =
-            accounts.num_shards() >= 2 && rng.gen::<f64>() < self.cross_shard_ratio;
+            accounts.num_shards() >= 2 && rng.random::<f64>() < self.cross_shard_ratio;
 
         if is_cross_shard {
             self.generate_cross_shard_for(accounts, target_shard, rng)
@@ -251,9 +251,8 @@ impl WorkloadGenerator for TransferWorkload {
     fn generate_one(
         &self,
         accounts: &AccountPool,
-        rng: &mut dyn RngCore,
+        rng: &mut dyn Rng,
     ) -> Option<RoutableTransaction> {
-        // Wrap the dyn RngCore to get Rng trait
         self.generate_one_inner(accounts, rng)
     }
 
@@ -261,7 +260,7 @@ impl WorkloadGenerator for TransferWorkload {
         &self,
         accounts: &AccountPool,
         count: usize,
-        rng: &mut dyn RngCore,
+        rng: &mut dyn Rng,
     ) -> Vec<RoutableTransaction> {
         (0..count)
             .filter_map(|_| self.generate_one_inner(accounts, rng))

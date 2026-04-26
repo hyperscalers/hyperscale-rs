@@ -11,12 +11,12 @@ pub use transfer::TransferWorkload;
 
 use crate::accounts::AccountPool;
 use hyperscale_types::RoutableTransaction;
-use rand::RngCore;
+use rand::Rng;
 
 /// Trait for generating transaction workloads.
 ///
 /// Implementors generate transactions that can be submitted to the network.
-/// Uses `&mut dyn RngCore` for dyn-compatibility.
+/// Uses `&mut dyn Rng` for dyn-compatibility.
 pub trait WorkloadGenerator: Send + Sync {
     /// Generate a single transaction.
     ///
@@ -24,7 +24,7 @@ pub trait WorkloadGenerator: Send + Sync {
     fn generate_one(
         &self,
         accounts: &AccountPool,
-        rng: &mut dyn RngCore,
+        rng: &mut dyn Rng,
     ) -> Option<RoutableTransaction>;
 
     /// Generate a batch of transactions.
@@ -32,7 +32,7 @@ pub trait WorkloadGenerator: Send + Sync {
         &self,
         accounts: &AccountPool,
         count: usize,
-        rng: &mut dyn RngCore,
+        rng: &mut dyn Rng,
     ) -> Vec<RoutableTransaction>;
 }
 

@@ -612,7 +612,7 @@ fn format_public_key(pk: &Bls12381G1PublicKey) -> String {
 /// The key file stores a 32-byte seed that deterministically generates the keypair.
 /// This seed can be stored as raw bytes or hex-encoded.
 fn load_or_generate_keypair(key_path: Option<&PathBuf>) -> Result<Bls12381G1PrivateKey> {
-    use rand::RngCore;
+    use rand::Rng;
 
     let Some(path) = key_path else {
         warn!("No key path specified, generating ephemeral keypair");
@@ -649,7 +649,7 @@ fn load_or_generate_keypair(key_path: Option<&PathBuf>) -> Result<Bls12381G1Priv
 
         // Generate random seed
         let mut seed = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut seed);
+        rand::rng().fill_bytes(&mut seed);
 
         let keypair = bls_keypair_from_seed(&seed);
 

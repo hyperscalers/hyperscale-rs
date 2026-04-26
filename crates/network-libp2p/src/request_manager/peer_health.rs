@@ -231,7 +231,7 @@ impl PeerHealthTracker {
     /// This ensures requests never fail with "no peers" when peers exist.
     #[must_use]
     pub fn select_peer(&self, candidates: &[PeerId]) -> Option<PeerId> {
-        use rand::Rng;
+        use rand::RngExt;
         if candidates.is_empty() {
             return None;
         }
@@ -260,8 +260,8 @@ impl PeerHealthTracker {
         }
 
         // Use thread-local RNG for efficiency
-        let mut rng = rand::thread_rng();
-        let mut target: f64 = rng.gen_range(0.0..total_weight);
+        let mut rng = rand::rng();
+        let mut target: f64 = rng.random_range(0.0..total_weight);
 
         for (peer, weight) in weights {
             target -= weight;
