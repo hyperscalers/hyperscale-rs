@@ -22,12 +22,15 @@ use hyperscale_types::{
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
+/// Shared content-addressed store of `Provisions` bodies.
 pub struct ProvisionStore {
     inner: Mutex<HashMap<ProvisionHash, Arc<Provisions>>>,
     outbound_index: Mutex<HashMap<(BlockHeight, ShardGroupId), HashSet<ProvisionHash>>>,
 }
 
 impl ProvisionStore {
+    /// Create an empty store.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(HashMap::new()),
@@ -39,6 +42,10 @@ impl ProvisionStore {
     ///
     /// Inbound callers use this; the secondary outbound index is not
     /// touched.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned by a previously panicking writer.
     pub fn insert(&self, provisions: Arc<Provisions>) {
         let hash = provisions.hash();
         let mut g = self.inner.lock().unwrap();
@@ -48,7 +55,11 @@ impl ProvisionStore {
     /// Insert provisions our proposer generated for `target_shard`.
     /// Populates the `(source_block_height, target_shard)` index so
     /// cross-shard `provision.request` handlers can serve from the cache
-    /// before regenerating from RocksDB. Idempotent.
+    /// before regenerating from `RocksDB`. Idempotent.
+    ///
+    /// # Panics
+    ///
+    /// Panics if either internal mutex is poisoned.
     pub fn insert_outbound(&self, provisions: Arc<Provisions>, target_shard: ShardGroupId) {
         let hash = provisions.hash();
         let block_height = provisions.block_height;
@@ -63,13 +74,21 @@ impl ProvisionStore {
     }
 
     /// Look up provisions by content hash.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
     pub fn get(&self, hash: &ProvisionHash) -> Option<Arc<Provisions>> {
         self.inner.lock().unwrap().get(hash).cloned()
     }
 
     /// Fetch every outbound provisions entry registered for
     /// `(block_height, target_shard)`. Returns an empty vec if nothing is
-    /// cached — the caller should fall through to RocksDB regeneration.
+    /// cached — the caller should fall through to `RocksDB` regeneration.
+    ///
+    /// # Panics
+    ///
+    /// Panics if either internal mutex is poisoned.
     pub fn get_outbound(
         &self,
         block_height: BlockHeight,
@@ -91,6 +110,10 @@ impl ProvisionStore {
     /// Evict provisions whose retention window has elapsed. Returns the
     /// number of entries actually removed from the primary map. Also
     /// scrubs the outbound secondary index for the evicted hashes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if either internal mutex is poisoned.
     pub fn evict(&self, hashes: impl IntoIterator<Item = ProvisionHash>) -> usize {
         let hashes: Vec<ProvisionHash> = hashes.into_iter().collect();
         let removed = {
@@ -109,10 +132,20 @@ impl ProvisionStore {
         removed
     }
 
+    /// Number of provisions currently held in the primary map.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
     pub fn len(&self) -> usize {
         self.inner.lock().unwrap().len()
     }
 
+    /// True when the primary map holds no provisions.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
     pub fn is_empty(&self) -> bool {
         self.inner.lock().unwrap().is_empty()
     }
@@ -120,6 +153,10 @@ impl ProvisionStore {
     /// Build a bloom filter over every cached provision hash. Sync
     /// inventory attaches this to `GetBlockRequest` so the responder can
     /// elide provisions the requester already holds.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
     pub fn provision_bloom_snapshot(&self) -> Option<BloomFilter<ProvisionHash>> {
         let inner = self.inner.lock().unwrap();
         let mut bf = BloomFilter::with_capacity(inner.len(), DEFAULT_FPR)?;
@@ -166,7 +203,7 @@ mod tests {
     fn snapshot_contains_every_cached_hash() {
         let store = ProvisionStore::new();
         let entries: Vec<_> = (0u8..20)
-            .map(|i| make_provisions(i, 1 + i as u64))
+            .map(|i| make_provisions(i, 1 + u64::from(i)))
             .collect();
         for p in &entries {
             store.insert(p.clone());

@@ -25,6 +25,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::{debug, warn};
 
+/// Snapshot of how much state the outbound tracker is holding onto.
+#[allow(missing_docs)] // flat counters; field names are the documentation
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OutboundMemoryStats {
     pub tracked_provisions: usize,
@@ -62,6 +64,7 @@ pub struct OutboundProvisionTracker {
 }
 
 impl OutboundProvisionTracker {
+    /// Build a tracker that shares its provision bodies with `store`.
     pub fn new(store: Arc<ProvisionStore>) -> Self {
         Self {
             store,
@@ -71,17 +74,19 @@ impl OutboundProvisionTracker {
         }
     }
 
+    /// Snapshot of in-memory state for metrics export.
+    #[must_use]
     pub fn memory_stats(&self) -> OutboundMemoryStats {
         OutboundMemoryStats {
             tracked_provisions: self.entries.len(),
-            tracked_tx_entries: self.by_tx.values().map(|s| s.len()).sum(),
+            tracked_tx_entries: self.by_tx.values().map(HashSet::len).sum(),
         }
     }
 
     /// Register provisions our proposer just broadcast. Inserts into the
     /// shared store (which maintains the `(source_block, target)` index
     /// used by cross-shard fast-path serving); idempotent.
-    pub fn on_broadcast(&mut self, provisions: Arc<Provisions>, target_shard: ShardGroupId) {
+    pub fn on_broadcast(&mut self, provisions: &Arc<Provisions>, target_shard: ShardGroupId) {
         let provision_hash = provisions.hash();
         if self.entries.contains_key(&provision_hash) {
             return;
@@ -101,7 +106,7 @@ impl OutboundProvisionTracker {
         }
 
         self.store
-            .insert_outbound(Arc::clone(&provisions), target_shard);
+            .insert_outbound(Arc::clone(provisions), target_shard);
 
         self.entries.insert(
             provision_hash,
@@ -158,6 +163,11 @@ impl OutboundProvisionTracker {
     /// Safety sweep: evict outbound entries whose deadline has passed.
     /// Fires with `warn!` — a hit indicates the target shard never produced
     /// a terminal EC (upstream bug).
+    ///
+    /// # Panics
+    ///
+    /// Panics if a stale hash collected for eviction is no longer in `entries`.
+    /// Unreachable: the hashes are sourced from the same map under `&mut self`.
     pub fn on_block_committed(&mut self, now: WeightedTimestamp) {
         self.now = now;
 
@@ -272,7 +282,7 @@ mod tests {
         let b = tx(b"b");
         let provisions = make_provisions(BlockHeight(10), &[a, b]);
         let provision_hash = provisions.hash();
-        tracker.on_broadcast(Arc::clone(&provisions), ShardGroupId(1));
+        tracker.on_broadcast(&provisions, ShardGroupId(1));
 
         assert_eq!(tracker.memory_stats().tracked_provisions, 1);
         assert_eq!(tracker.memory_stats().tracked_tx_entries, 2);
@@ -290,7 +300,7 @@ mod tests {
         let b = tx(b"b");
         let provisions = make_provisions(BlockHeight(10), &[a, b]);
         let provision_hash = provisions.hash();
-        tracker.on_broadcast(Arc::clone(&provisions), ShardGroupId(1));
+        tracker.on_broadcast(&provisions, ShardGroupId(1));
 
         tracker.on_ec_observed(ShardGroupId(1), &[executed(a)]);
         assert_eq!(tracker.memory_stats().tracked_provisions, 1);
@@ -309,7 +319,7 @@ mod tests {
         let a = tx(b"a");
         let provisions = make_provisions(BlockHeight(7), &[a]);
         let provision_hash = provisions.hash();
-        tracker.on_broadcast(Arc::clone(&provisions), ShardGroupId(2));
+        tracker.on_broadcast(&provisions, ShardGroupId(2));
 
         tracker.on_ec_observed(ShardGroupId(2), &[aborted(a)]);
         assert!(store.get(&provision_hash).is_none());
@@ -322,7 +332,7 @@ mod tests {
 
         let a = tx(b"a");
         let provisions = make_provisions(BlockHeight(5), &[a]);
-        tracker.on_broadcast(Arc::clone(&provisions), ShardGroupId(1));
+        tracker.on_broadcast(&provisions, ShardGroupId(1));
 
         // EC from a different target shard must not acknowledge these provisions.
         tracker.on_ec_observed(ShardGroupId(2), &[executed(a)]);
@@ -338,10 +348,12 @@ mod tests {
         let a = tx(b"a");
         let provisions = make_provisions(BlockHeight(5), &[a]);
         let provision_hash = provisions.hash();
-        tracker.on_broadcast(Arc::clone(&provisions), ShardGroupId(1));
+        tracker.on_broadcast(&provisions, ShardGroupId(1));
 
         let past_max = RETENTION_HORIZON + Duration::from_secs(1);
-        tracker.on_block_committed(ts(1_000_000 + past_max.as_millis() as u64));
+        tracker.on_block_committed(ts(
+            1_000_000 + u64::try_from(past_max.as_millis()).unwrap_or(u64::MAX)
+        ));
         assert!(store.get(&provision_hash).is_none());
         assert_eq!(tracker.memory_stats().tracked_provisions, 0);
     }
@@ -353,8 +365,8 @@ mod tests {
 
         let a = tx(b"a");
         let provisions = make_provisions(BlockHeight(10), &[a]);
-        tracker.on_broadcast(Arc::clone(&provisions), ShardGroupId(1));
-        tracker.on_broadcast(Arc::clone(&provisions), ShardGroupId(1));
+        tracker.on_broadcast(&provisions, ShardGroupId(1));
+        tracker.on_broadcast(&provisions, ShardGroupId(1));
         assert_eq!(tracker.memory_stats().tracked_provisions, 1);
         assert_eq!(tracker.memory_stats().tracked_tx_entries, 1);
     }

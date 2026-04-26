@@ -1289,7 +1289,7 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
         .mempool_snapshot(rpc_mempool_snapshot.clone())
         .sync_status(rpc_sync_status.clone())
         .mempool_config(config.mempool.clone())
-        .provision_config(config.provisions.clone());
+        .provision_config(config.provisions);
 
     // Wire up genesis configuration if XRD balances are specified
     if !config.genesis.xrd_balances.is_empty() {

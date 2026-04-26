@@ -161,7 +161,7 @@ impl ExpectedProvisionTracker {
     /// `requested = true` on each effect so the next sweep skips it.
     pub(crate) fn check_timeouts(&mut self, now: WeightedTimestamp) -> Vec<TimeoutEffect> {
         let mut effects = Vec::new();
-        for (&(source_shard, block_height), expected) in self.expected.iter_mut() {
+        for (&(source_shard, block_height), expected) in &mut self.expected {
             if expected.requested {
                 continue;
             }
@@ -171,7 +171,8 @@ impl ExpectedProvisionTracker {
             warn!(
                 source_shard = source_shard.0,
                 block_height = block_height.0,
-                age_ms = now.elapsed_since(expected.discovered_at).as_millis() as u64,
+                age_ms = u64::try_from(now.elapsed_since(expected.discovered_at).as_millis())
+                    .unwrap_or(u64::MAX),
                 "Provision timeout — requesting missing provisions via fallback"
             );
             expected.requested = true;
@@ -189,7 +190,7 @@ impl ExpectedProvisionTracker {
     /// and the execution advance gate stalling on missing data.
     pub(crate) fn flush_all(&mut self) -> Vec<TimeoutEffect> {
         let mut effects = Vec::new();
-        for (&(source_shard, block_height), expected) in self.expected.iter_mut() {
+        for (&(source_shard, block_height), expected) in &mut self.expected {
             if expected.requested {
                 continue;
             }
@@ -272,11 +273,14 @@ mod tests {
         t.register(ShardGroupId(1), BlockHeight(10), ValidatorId(3));
 
         // Just under threshold: no firings.
-        let just_under = ts(1_000 + PROVISION_FALLBACK_TIMEOUT.as_millis() as u64 - 1);
+        let just_under = ts(1_000
+            + u64::try_from(PROVISION_FALLBACK_TIMEOUT.as_millis()).unwrap_or(u64::MAX)
+            - 1);
         assert!(t.check_timeouts(just_under).is_empty());
 
         // At threshold: one effect.
-        let at = ts(1_000 + PROVISION_FALLBACK_TIMEOUT.as_millis() as u64);
+        let at =
+            ts(1_000 + u64::try_from(PROVISION_FALLBACK_TIMEOUT.as_millis()).unwrap_or(u64::MAX));
         let effects = t.check_timeouts(at);
         assert_eq!(effects.len(), 1);
         assert_eq!(
@@ -301,7 +305,9 @@ mod tests {
         // Verify before the timeout fires.
         assert!(t.on_provisions_verified(ShardGroupId(1), BlockHeight(10)));
 
-        let well_past = ts(1_000 + 10 * PROVISION_FALLBACK_TIMEOUT.as_millis() as u64);
+        let well_past =
+            ts(1_000
+                + 10 * u64::try_from(PROVISION_FALLBACK_TIMEOUT.as_millis()).unwrap_or(u64::MAX));
         assert!(t.check_timeouts(well_past).is_empty());
     }
 
@@ -326,7 +332,8 @@ mod tests {
         t.register(ShardGroupId(1), BlockHeight(10), ValidatorId(3));
 
         // Advance well past RETENTION_HORIZON.
-        let far_future = ts(1_000 + 2 * RETENTION_HORIZON.as_millis() as u64);
+        let far_future =
+            ts(1_000 + 2 * u64::try_from(RETENTION_HORIZON.as_millis()).unwrap_or(u64::MAX));
         t.record_block_committed(BlockHeight(100), far_future);
 
         let cutoff = far_future.minus(RETENTION_HORIZON);

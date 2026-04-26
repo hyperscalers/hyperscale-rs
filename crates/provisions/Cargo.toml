@@ -14,3 +14,6 @@ tracing.workspace = true
 [dev-dependencies]
 hyperscale-test-helpers.workspace = true
 proptest.workspace = true
+
+[lints]
+workspace = true

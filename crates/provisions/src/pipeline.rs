@@ -87,7 +87,7 @@ impl ProvisionPipeline {
     }
 
     /// Insert verified provisions into the pipeline + store. Returns the
-    /// `Arc` the coordinator hands downstream (queue + ProvisionsVerified
+    /// `Arc` the coordinator hands downstream (queue + `ProvisionsVerified`
     /// emit). Idempotent if the same content hash is inserted twice.
     pub(crate) fn insert_verified(
         &mut self,

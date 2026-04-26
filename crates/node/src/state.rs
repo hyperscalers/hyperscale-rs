@@ -569,7 +569,7 @@ impl StateMachine for NodeStateMachine {
 
                 // Provision: register expected provisions and join with buffered batches.
                 self.provisions
-                    .on_verified_remote_header(topology, committed_header)
+                    .on_verified_remote_header(topology, &committed_header)
             }
             ProtocolEvent::BlockRootVerified {
                 kind,
@@ -630,7 +630,7 @@ impl StateMachine for NodeStateMachine {
             } => self.provisions.on_state_provisions_verified(
                 self.topology.snapshot(),
                 provisions,
-                committed_header,
+                committed_header.as_ref(),
                 valid,
                 self.now,
             ),
@@ -647,7 +647,7 @@ impl StateMachine for NodeStateMachine {
                 target_shard,
             } => {
                 self.outbound_provisions
-                    .on_broadcast(provisions, target_shard);
+                    .on_broadcast(&provisions, target_shard);
                 vec![]
             }
             ProtocolEvent::OutboundEcObserved {

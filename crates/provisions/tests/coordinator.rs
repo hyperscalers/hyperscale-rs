@@ -153,7 +153,7 @@ fn on_verified_remote_header_for_own_shard_is_no_op() {
     let local = topology.local_shard();
     // Header from our own shard must not register an expectation.
     let own_header = make_remote_header_targeting(local, BlockHeight(5), local);
-    let actions = coord.on_verified_remote_header(&topology, own_header);
+    let actions = coord.on_verified_remote_header(&topology, &own_header);
     assert!(actions.is_empty());
     assert_eq!(coord.memory_stats().expected_provisions, 0);
     assert_eq!(coord.verified_remote_header_count(), 0);
@@ -163,9 +163,9 @@ fn on_verified_remote_header_for_own_shard_is_no_op() {
 fn on_verified_remote_header_targeting_local_shard_registers_expectation() {
     let (mut coord, topology) = fresh_coordinator_with_topology();
     let local = topology.local_shard();
-    let remote = ShardGroupId(if local.0 == 0 { 1 } else { 0 });
+    let remote = ShardGroupId(u64::from(local.0 == 0));
     let header = make_remote_header_targeting(remote, BlockHeight(5), local);
-    coord.on_verified_remote_header(&topology, Arc::clone(&header));
+    coord.on_verified_remote_header(&topology, &header);
 
     let stats = coord.memory_stats();
     assert_eq!(
@@ -190,9 +190,9 @@ fn first_commit_retro_stamps_pre_genesis_expectations() {
     // committed_ts is suddenly ~now, age reports ~57 years).
     let (mut coord, topology) = fresh_coordinator_with_topology();
     let local = topology.local_shard();
-    let remote = ShardGroupId(if local.0 == 0 { 1 } else { 0 });
+    let remote = ShardGroupId(u64::from(local.0 == 0));
     let header = make_remote_header_targeting(remote, BlockHeight(5), local);
-    coord.on_verified_remote_header(&topology, header);
+    coord.on_verified_remote_header(&topology, &header);
 
     // First commit must NOT trigger a fallback fetch storm.
     let actions = coord.on_block_committed(&topology, &make_block(BlockHeight(1)));
