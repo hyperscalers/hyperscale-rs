@@ -28,7 +28,7 @@ use hyperscale_types::{
     BlockHash, BlockHeight, ExecutionCertificate, ExecutionCertificateHash, ExecutionOutcome,
     GlobalReceiptRoot, ReceiptBundle, RoutableTransaction, ShardGroupId, TransactionDecision,
     TxHash, TxOutcome, WAVE_TIMEOUT, WaveCertificate, WaveId, WeightedTimestamp,
-    compute_execution_receipt_root,
+    compute_global_receipt_root,
 };
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -478,7 +478,7 @@ impl WaveState {
             })
             .collect();
 
-        let root = compute_execution_receipt_root(&outcomes);
+        let root = compute_global_receipt_root(&outcomes);
         self.voted = true;
         Some((target, root, outcomes))
     }

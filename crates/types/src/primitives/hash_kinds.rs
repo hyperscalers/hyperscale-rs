@@ -5,9 +5,9 @@
 //! only — wire format and on-disk bytes are unchanged.
 //!
 //! See [`TypedHash`](crate::TypedHash) for the shared interface and the
-//! `hash_newtype!` macro in [`crate::hash`] for the declaration pattern.
+//! `hash_newtype!` macro in [`crate::primitives::hash`] for the declaration pattern.
 
-use crate::hash::hash_newtype;
+use crate::primitives::hash::hash_newtype;
 
 // ── Block layer ──────────────────────────────────────────────────────────────
 

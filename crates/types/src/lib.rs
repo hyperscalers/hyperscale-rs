@@ -14,74 +14,53 @@
 //! This crate is self-contained with minimal dependencies. It does not depend on
 //! any other workspace crates, making it the foundation layer.
 
-mod bloom;
 mod crypto;
-mod hash;
-mod hash_kinds;
-mod identifiers;
 mod network;
-mod proofs;
+mod primitives;
+mod provisioning;
 mod signing;
-mod timeouts;
-mod timestamp;
-mod timestamp_range;
+mod time;
 
 // Consensus types
 mod block;
-mod certified_block;
-mod epoch;
 mod quorum_certificate;
 mod receipt;
-mod signer_bitfield;
-mod state;
 mod topology;
 mod transaction;
-mod validator;
 mod wave;
 
-pub use bloom::{BloomFilter, DEFAULT_FPR, MAX_BITS};
+pub use primitives::bloom::{BloomFilter, DEFAULT_FPR, MAX_BITS};
 
-// Re-export crypto types and helpers
+pub use crypto::batch_verify::{
+    batch_verify_bls_different_messages, batch_verify_bls_different_messages_all_or_nothing,
+    batch_verify_bls_same_message, batch_verify_ed25519,
+};
+pub use crypto::keys::{
+    bls_keypair_from_seed, ed25519_keypair_from_seed, generate_bls_keypair,
+    generate_ed25519_keypair, zero_bls_signature, zero_ed25519_signature,
+};
 pub use crypto::{
-    // Vendor types
-    Bls12381G1PrivateKey,
-    Bls12381G1PublicKey,
-    Bls12381G2Signature,
-    Ed25519PrivateKey,
-    Ed25519PublicKey,
-    Ed25519Signature,
-    // Helper functions
-    batch_verify_bls_different_messages,
-    batch_verify_bls_different_messages_all_or_nothing,
-    batch_verify_bls_same_message,
-    batch_verify_ed25519,
-    bls_keypair_from_seed,
-    ed25519_keypair_from_seed,
-    generate_bls_keypair,
-    generate_ed25519_keypair,
-    verify_bls12381_v1,
-    verify_ed25519,
-    zero_bls_signature,
-    zero_ed25519_signature,
+    Bls12381G1PrivateKey, Bls12381G1PublicKey, Bls12381G2Signature, Ed25519PrivateKey,
+    Ed25519PublicKey, Ed25519Signature, verify_bls12381_v1, verify_ed25519,
 };
-pub use epoch::{
-    DEFAULT_EPOCH_LENGTH, EpochConfig, EpochId, GlobalConsensusConfig, GlobalValidatorInfo,
-    ShardCommitteeConfig, ValidatorRating, ValidatorShardState,
-};
-pub use hash::{
-    Hash, TypedHash, compute_merkle_root, compute_merkle_root_with_proof,
-    compute_padded_merkle_root, verify_merkle_inclusion,
-};
-pub use hash_kinds::{
+pub use network::{MessagePriority, NetworkMessage, Request, ShardMessage};
+pub use primitives::hash::{Hash, TypedHash};
+pub use primitives::hash_kinds::{
     BlockHash, CertificateRoot, EventRoot, ExecutionCertificateHash, GlobalReceiptHash,
     GlobalReceiptRoot, LocalReceiptRoot, ProvisionHash, ProvisionTxRoot, ProvisionsRoot, StateRoot,
     TransactionRoot, TxHash, WaveIdHash, WaveReceiptHash, WritesRoot,
 };
-pub use identifiers::{
+pub use primitives::identifiers::{
     Attempt, BlockHeight, NodeId, PartitionNumber, Round, ShardGroupId, ValidatorId, VotePower,
 };
-pub use network::{MessagePriority, NetworkMessage, Request, ShardMessage};
-pub use proofs::{MerkleInclusionProof, Provisions, TxEntries};
+pub use primitives::merkle::{
+    compute_merkle_root, compute_merkle_root_with_proof, compute_padded_merkle_root,
+    verify_merkle_inclusion,
+};
+pub use provisioning::batch::Provisions;
+pub use provisioning::proof::MerkleInclusionProof;
+pub use provisioning::state_entry::{StateEntry, StateProvision};
+pub use provisioning::tx_entries::TxEntries;
 pub use signing::{
     DOMAIN_BLOCK_HEADER, DOMAIN_BLOCK_VOTE, DOMAIN_COMMITTED_BLOCK_HEADER, DOMAIN_EXEC_CERT_BATCH,
     DOMAIN_EXEC_VOTE, DOMAIN_EXEC_VOTE_BATCH, DOMAIN_STATE_PROVISION_BATCH, DOMAIN_VALIDATOR_BIND,
@@ -89,139 +68,60 @@ pub use signing::{
     exec_cert_batch_message, exec_vote_batch_message, exec_vote_message, state_provisions_message,
     validator_bind_message,
 };
+pub use topology::consensus_config::{
+    GlobalConsensusConfig, GlobalValidatorInfo, ShardCommitteeConfig, ValidatorRating,
+};
+pub use topology::epoch::{DEFAULT_EPOCH_LENGTH, EpochConfig, EpochId, ValidatorShardState};
 
-pub use block::{
-    Block, BlockHeader, BlockManifest, BlockMetadata, BlockVote, CommittedBlockHeader,
+pub use block::Block;
+pub use block::certified::{CertifiedBlock, CertifiedBlockHashMismatch};
+pub use block::committed_header::CommittedBlockHeader;
+pub use block::header::BlockHeader;
+pub use block::manifest::{BlockManifest, BlockMetadata};
+pub use block::roots::{
     compute_certificate_root, compute_local_receipt_root, compute_provision_root,
     compute_transaction_root,
 };
-pub use certified_block::{CertifiedBlock, CertifiedBlockHashMismatch};
+pub use block::vote::BlockVote;
+pub use primitives::signer_bitfield::SignerBitfield;
 pub use quorum_certificate::QuorumCertificate;
-pub use receipt::{
-    ApplicationEvent, ExecutionMetadata, FeeSummary, GlobalReceipt, LocalExecutionEntry,
-    LocalReceipt, LogLevel, ReceiptBundle, TransactionOutcome,
+pub use receipt::bundle::ReceiptBundle;
+pub use receipt::global::GlobalReceipt;
+pub use receipt::local::{LocalExecutionEntry, LocalReceipt};
+pub use receipt::metadata::{ApplicationEvent, ExecutionMetadata, FeeSummary, LogLevel};
+pub use receipt::outcome::TransactionOutcome;
+pub use time::range::{MAX_VALIDITY_RANGE, TimestampRange};
+pub use time::timeouts::{REMOTE_HEADER_RETENTION, RETENTION_HORIZON, WAVE_TIMEOUT};
+pub use time::timestamp::{LocalTimestamp, ProposerTimestamp, WeightedTimestamp};
+pub use topology::snapshot::{
+    TopologySnapshot, TopologySnapshotError, node_id_hash_u64, shard_for_node,
 };
-pub use signer_bitfield::SignerBitfield;
-pub use state::{StateEntry, StateProvision};
-pub use timeouts::{REMOTE_HEADER_RETENTION, RETENTION_HORIZON, WAVE_TIMEOUT};
-pub use timestamp::{LocalTimestamp, ProposerTimestamp, WeightedTimestamp};
-pub use timestamp_range::{MAX_VALIDITY_RANGE, TimestampRange};
-pub use topology::{TopologySnapshot, TopologySnapshotError, node_id_hash_u64, shard_for_node};
-pub use transaction::{
-    RoutableTransaction, TransactionDecision, TransactionError, TransactionStatus,
-    TransactionStatusParseError, routable_from_notarized_v1, routable_from_notarized_v2,
-    routable_from_user_transaction, sign_and_notarize, sign_and_notarize_with_options,
+pub use topology::validator::{ValidatorInfo, ValidatorSet};
+pub use transaction::constructors::{
+    routable_from_notarized_v1, routable_from_notarized_v2, routable_from_user_transaction,
 };
-pub use validator::{ValidatorInfo, ValidatorSet};
-pub use wave::{
-    ExecutionCertificate, ExecutionOutcome, ExecutionVote, FinalizedWave, ReceiptValidationError,
-    TxOutcome, WaveCertificate, WaveId, compute_global_receipt_root_with_proof,
-    compute_provision_tx_roots, compute_waves, decode_finalized_wave_vec, decode_wave_cert_vec,
-    encode_finalized_wave_vec, encode_wave_cert_vec, tx_outcome_leaf, wave_leader, wave_leader_at,
+pub use transaction::notarize::{sign_and_notarize, sign_and_notarize_with_options};
+pub use transaction::routable::RoutableTransaction;
+pub use transaction::status::{
+    TransactionDecision, TransactionError, TransactionStatus, TransactionStatusParseError,
 };
-// Re-export with legacy alias for cross-crate use
-pub use wave::compute_global_receipt_root as compute_execution_receipt_root;
+pub use wave::certificate::{WaveCertificate, decode_wave_cert_vec, encode_wave_cert_vec};
+pub use wave::computation::{
+    compute_provision_tx_roots, compute_waves, wave_leader, wave_leader_at,
+};
+pub use wave::execution_certificate::ExecutionCertificate;
+pub use wave::finalized::{
+    FinalizedWave, ReceiptValidationError, decode_finalized_wave_vec, encode_finalized_wave_vec,
+};
+pub use wave::id::WaveId;
+pub use wave::outcome::{ExecutionOutcome, TxOutcome};
+pub use wave::receipt_tree::{
+    compute_global_receipt_root, compute_global_receipt_root_with_proof, tx_outcome_leaf,
+};
+pub use wave::vote::ExecutionVote;
 
 // Re-export DatabaseUpdates from radix for cross-crate use (execution cache, block commit)
 pub use radix_substate_store_interface::interface::DatabaseUpdates;
 
-/// Test utilities.
 #[cfg(any(test, feature = "test-utils"))]
-pub mod test_utils {
-    use super::{NodeId, RoutableTransaction, TimestampRange, WeightedTimestamp};
-    use radix_common::crypto::{Ed25519PublicKey, Ed25519Signature, PublicKey as RadixPublicKey};
-    use radix_common::prelude::Epoch;
-    use radix_transactions::model::{
-        BlobsV1, InstructionsV1, IntentSignaturesV1, IntentV1, MessageV1, NotarizedTransactionV1,
-        NotarySignatureV1, SignatureV1, SignedIntentV1, TransactionHeaderV1, UserTransaction,
-    };
-
-    /// Create a test `NodeId` from a seed byte.
-    #[must_use]
-    pub fn test_node(seed: u8) -> NodeId {
-        NodeId([seed; 30])
-    }
-
-    /// Create a minimal test `NotarizedTransactionV1` from seed bytes.
-    ///
-    /// This creates a valid but minimal transaction structure for testing.
-    /// The transaction won't execute successfully but is structurally valid.
-    #[must_use]
-    pub fn test_notarized_transaction_v1(seed_bytes: &[u8]) -> NotarizedTransactionV1 {
-        // Create minimal header with unique nonce from seed
-        let header = TransactionHeaderV1 {
-            network_id: 0xf2, // Simulator network
-            start_epoch_inclusive: Epoch::of(0),
-            end_epoch_exclusive: Epoch::of(100),
-            nonce: {
-                let mut nonce_bytes = [0u8; 4];
-                for (i, &b) in seed_bytes.iter().take(4).enumerate() {
-                    nonce_bytes[i] = b;
-                }
-                u32::from_le_bytes(nonce_bytes)
-            },
-            notary_public_key: RadixPublicKey::Ed25519(Ed25519PublicKey([0u8; 32])),
-            notary_is_signatory: false,
-            tip_percentage: 0,
-        };
-
-        // Create a minimal intent
-        let intent = IntentV1 {
-            header,
-            instructions: InstructionsV1(vec![]),
-            blobs: BlobsV1 { blobs: vec![] },
-            message: MessageV1::None,
-        };
-
-        // Create signed intent with no signatures
-        let signed_intent = SignedIntentV1 {
-            intent,
-            intent_signatures: IntentSignaturesV1 { signatures: vec![] },
-        };
-
-        // Create notarized transaction with a zero signature
-        NotarizedTransactionV1 {
-            signed_intent,
-            notary_signature: NotarySignatureV1(SignatureV1::Ed25519(Ed25519Signature([0u8; 64]))),
-        }
-    }
-
-    /// Create a test transaction with specific read/write nodes.
-    #[must_use]
-    pub fn test_transaction_with_nodes(
-        seed_bytes: &[u8],
-        read_nodes: Vec<NodeId>,
-        write_nodes: Vec<NodeId>,
-    ) -> RoutableTransaction {
-        let tx = test_notarized_transaction_v1(seed_bytes);
-        RoutableTransaction::new(
-            UserTransaction::V1(tx),
-            read_nodes,
-            write_nodes,
-            test_validity_range(),
-        )
-    }
-
-    /// Validity range used for test transactions: a wide window centred on
-    /// `WeightedTimestamp::ZERO` so test fixtures don't need to thread a
-    /// real anchor through every helper. Tests that exercise expiry should
-    /// build their own range.
-    #[must_use]
-    pub fn test_validity_range() -> TimestampRange {
-        use std::time::Duration;
-        TimestampRange::new(
-            WeightedTimestamp::ZERO,
-            WeightedTimestamp::ZERO.plus(Duration::from_mins(1)),
-        )
-    }
-
-    /// Create a simple test transaction.
-    #[must_use]
-    pub fn test_transaction(seed: u8) -> RoutableTransaction {
-        test_transaction_with_nodes(
-            &[seed, seed + 1, seed + 2],
-            vec![test_node(seed)],
-            vec![test_node(seed + 10)],
-        )
-    }
-}
+pub mod test_utils;

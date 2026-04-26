@@ -1,104 +1,11 @@
-//! Proof types for cross-shard provisioning and block validation.
-//!
-//! # Architecture
-//!
-//! Provision data has three natural levels:
-//!
-//! 1. **Source block** ([`SourceBlockAttestation`]): QC + `state_root` + merkle proof.
-//!    Shared across all transactions from the same block. Serialized once.
-//!
-//! 2. **Transaction** ([`TxEntries`]): Per-transaction state entries.
-//!    Lightweight — just a tx hash and the substates it touched.
-//!
-//! 3. **Routing**: Target shard, recipients. Handled at the network layer.
-//!
-//! [`Provision`] bundles level 1 + level 2 together as the natural unit
-//! of work. This eliminates the N× proof duplication that occurs when the
-//! proof is flattened into each per-transaction struct.
+//! Per-block bundle of transaction provisions with a shared merkle proof.
 
 use crate::{
-    BlockHeight, Hash, NodeId, ProvisionHash, RETENTION_HORIZON, ShardGroupId, StateEntry, TxHash,
-    WeightedTimestamp,
+    BlockHeight, Hash, MerkleInclusionProof, NodeId, ProvisionHash, RETENTION_HORIZON,
+    ShardGroupId, StateEntry, TxEntries, TxHash, WeightedTimestamp,
 };
 use sbor::prelude::*;
 use std::collections::HashSet;
-
-// ============================================================================
-// MerkleInclusionProof
-// ============================================================================
-
-/// Merkle multiproof authenticating substates' inclusion in the JMT state tree.
-///
-/// Opaque bytes containing an encoded `hyperscale_jmt::MultiProof`. Encoding,
-/// decoding and verification are handled by the storage crate, which owns
-/// the adapter between the JMT crate and on-wire SBOR types.
-///
-/// The proof contains:
-/// - Per-claimed-key termination metadata (leaf / empty-subtree / leaf-mismatch)
-/// - Sibling hashes for bottom-up verification
-#[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
-#[sbor(transparent)]
-pub struct MerkleInclusionProof(pub Vec<u8>);
-
-impl MerkleInclusionProof {
-    /// Create a new proof from raw bytes.
-    #[must_use]
-    pub fn new(bytes: Vec<u8>) -> Self {
-        Self(bytes)
-    }
-
-    /// Get the raw proof bytes.
-    #[must_use]
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.0
-    }
-
-    /// Create a dummy (empty) proof for testing.
-    #[cfg(any(test, feature = "test-utils"))]
-    #[must_use]
-    pub fn dummy() -> Self {
-        Self(Vec::new())
-    }
-}
-
-// ============================================================================
-// TxEntries
-// ============================================================================
-
-/// Per-transaction state entries within a provision.
-///
-/// Identifies which transaction, what state it touched on the source shard,
-/// and what nodes it needs from the target shard (for conflict detection).
-#[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
-pub struct TxEntries {
-    /// Hash of the transaction.
-    pub tx_hash: TxHash,
-
-    /// The state entries this transaction touched on the source shard.
-    pub entries: Vec<StateEntry>,
-
-    /// Node IDs this transaction needs from the target shard.
-    ///
-    /// Used for bidirectional conflict detection: a true deadlock requires
-    /// overlap in both directions (source nodes vs local needs, AND target
-    /// nodes vs local owns).
-    pub target_nodes: Vec<NodeId>,
-}
-
-impl TxEntries {
-    /// Get the node IDs referenced by this transaction's entries.
-    #[must_use]
-    pub fn node_ids(&self) -> HashSet<NodeId> {
-        self.entries
-            .iter()
-            .filter_map(super::state::StateEntry::node_id)
-            .collect()
-    }
-}
-
-// ============================================================================
-// Provisions
-// ============================================================================
 
 /// All provisions from a single source block, bundled together.
 ///
@@ -289,11 +196,7 @@ impl Provisions {
     pub fn all_node_ids(&self) -> HashSet<NodeId> {
         self.transactions
             .iter()
-            .flat_map(|tx| {
-                tx.entries
-                    .iter()
-                    .filter_map(super::state::StateEntry::node_id)
-            })
+            .flat_map(|tx| tx.entries.iter().filter_map(StateEntry::node_id))
             .collect()
     }
 
