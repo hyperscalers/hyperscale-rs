@@ -12,11 +12,8 @@ use hyperscale_core::{Action, NodeInput, ProtocolEvent};
 use hyperscale_engine::Engine;
 use hyperscale_metrics as metrics;
 use hyperscale_storage::{ChainReader, ChainWriter, SubstateStore};
-use hyperscale_types::{
-    BlockHash, BlockHeight, LocalExecutionEntry, Provisions, ShardGroupId, TxEntries, TxHash,
-};
+use hyperscale_types::{BlockHash, BlockHeight, LocalExecutionEntry};
 use std::sync::Arc;
-use tracing::warn;
 
 /// Context for executing delegated actions.
 pub(crate) struct ActionContext<
@@ -706,24 +703,14 @@ pub(crate) fn handle_delegated_action<
             block_height,
             shard_recipients,
         } => {
-            // Phase 1: Fetch state entries for all transactions.
-            let per_tx = fetch_entries_for_requests(ctx, &requests, source_shard, block_height);
-            if per_tx.is_empty() {
-                warn!(
-                    source_shard = source_shard.0,
-                    block_height = block_height.0,
-                    request_count = requests.len(),
-                    "All fetch_state_entries failed — no provisions to broadcast"
-                );
-                return Some(DelegatedResult {
-                    events: vec![NodeInput::ProvisionReady { batches: vec![] }],
-                    prepared_commit: None,
-                });
-            }
-
-            // Phase 2: Group by shard + generate proofs
-            let batches =
-                build_provision_groups(ctx, per_tx, source_shard, block_height, &shard_recipients);
+            let batches = hyperscale_provisions::handlers::fetch_and_broadcast_provision(
+                ctx.executor,
+                &ctx.view,
+                source_shard,
+                block_height,
+                &requests,
+                &shard_recipients,
+            );
             Some(DelegatedResult {
                 events: vec![NodeInput::ProvisionReady { batches }],
                 prepared_commit: None,
@@ -732,125 +719,4 @@ pub(crate) fn handle_delegated_action<
 
         _ => None,
     }
-}
-
-/// Fetch state entries for each provision request at committed block height.
-///
-/// Expands declared account `NodeId`s to include their owned vaults before
-/// fetching. The remote shard needs vault substates (balances) to execute
-/// transfers, not just the account's own substates.
-/// Per-tx fetched entries: (`tx_hash`, `target_shards_with_nodes`, `state_entries`).
-type FetchedTxEntries = (
-    TxHash,
-    Vec<(ShardGroupId, Vec<hyperscale_types::NodeId>)>,
-    Arc<Vec<hyperscale_types::StateEntry>>,
-);
-
-fn fetch_entries_for_requests<
-    S: ChainWriter + SubstateStore + hyperscale_storage::VersionedStore + ChainReader,
-    E: Engine,
->(
-    ctx: &ActionContext<'_, S, E>,
-    requests: &[hyperscale_core::ProvisionRequest],
-    source_shard: ShardGroupId,
-    block_height: BlockHeight,
-) -> Vec<FetchedTxEntries> {
-    let mut per_tx = Vec::with_capacity(requests.len());
-    for req in requests {
-        // Expand account NodeIds to include owned vaults at the committed block height.
-        // Must use historical reads — current state may have new vaults that don't
-        // exist at block_height, causing the merkle proof to fail on the remote shard.
-        let Some(expanded_nodes) = hyperscale_engine::sharding::expand_nodes_with_owned_at_height(
-            &*ctx.view,
-            &req.nodes,
-            block_height,
-        ) else {
-            warn!(
-                source_shard = source_shard.0,
-                block_height = block_height.0,
-                tx_hash = %req.tx_hash,
-                "expand_nodes_with_owned_at_height: JMT version unavailable"
-            );
-            continue;
-        };
-        let Some(entries) =
-            ctx.executor
-                .fetch_state_entries(&*ctx.view, &expanded_nodes, block_height)
-        else {
-            warn!(
-                source_shard = source_shard.0,
-                block_height = block_height.0,
-                tx_hash = %req.tx_hash,
-                node_count = expanded_nodes.len(),
-                "fetch_state_entries returned None — JMT version unavailable"
-            );
-            continue;
-        };
-        per_tx.push((req.tx_hash, req.targets.clone(), Arc::new(entries)));
-    }
-    per_tx
-}
-
-/// Group fetched entries by target shard and generate merkle proofs per shard.
-fn build_provision_groups<
-    S: ChainWriter
-        + SubstateStore
-        + hyperscale_storage::VersionedStore
-        + ChainReader
-        + hyperscale_storage::JmtTreeReader
-        + Sync,
-    E: Engine,
->(
-    ctx: &ActionContext<'_, S, E>,
-    per_tx: Vec<FetchedTxEntries>,
-    source_shard: ShardGroupId,
-    block_height: BlockHeight,
-    shard_recipients: &std::collections::HashMap<ShardGroupId, Vec<hyperscale_types::ValidatorId>>,
-) -> Vec<(ShardGroupId, Provisions, Vec<hyperscale_types::ValidatorId>)> {
-    use std::collections::HashMap;
-
-    let mut shard_tx_entries: HashMap<ShardGroupId, Vec<TxEntries>> = HashMap::new();
-    for (tx_hash, targets, entries) in per_tx {
-        for (target_shard, target_nodes) in targets {
-            shard_tx_entries
-                .entry(target_shard)
-                .or_default()
-                .push(TxEntries {
-                    tx_hash,
-                    entries: (*entries).clone(),
-                    target_nodes,
-                });
-        }
-    }
-
-    let mut sorted_shard_entries: Vec<_> = shard_tx_entries.into_iter().collect();
-    sorted_shard_entries.sort_by_key(|(shard, _)| *shard);
-    let mut batches = Vec::with_capacity(sorted_shard_entries.len());
-    for (shard, transactions) in sorted_shard_entries {
-        let mut shard_keys: Vec<Vec<u8>> = transactions
-            .iter()
-            .flat_map(|te| te.entries.iter().map(|e| e.storage_key.clone()))
-            .collect();
-        shard_keys.sort();
-        shard_keys.dedup();
-
-        let Some(proof) = ctx
-            .view
-            .generate_merkle_proofs_overlay(&shard_keys, block_height)
-        else {
-            warn!(
-                source_shard = source_shard.0,
-                block_height = block_height.0,
-                target_shard = shard.0,
-                key_count = shard_keys.len(),
-                "generate_merkle_proofs returned None — JMT version unavailable"
-            );
-            continue;
-        };
-
-        let recipients = shard_recipients.get(&shard).cloned().unwrap_or_default();
-        let provisions = Provisions::new(source_shard, block_height, proof, transactions);
-        batches.push((shard, provisions, recipients));
-    }
-    batches
 }

@@ -21,6 +21,7 @@
 
 mod coordinator;
 mod expected;
+pub mod handlers;
 mod outbound;
 mod pipeline;
 mod queue;
