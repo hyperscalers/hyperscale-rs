@@ -72,7 +72,7 @@ pub enum VerificationKind {
 ///
 /// [`IoLoop`] translates [`NodeInput`] into `ProtocolEvent` before passing
 /// to the state machine.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, strum::IntoStaticStr)]
 pub enum ProtocolEvent {
     // ═══════════════════════════════════════════════════════════════════════
     // Timers
@@ -560,27 +560,13 @@ pub enum ProtocolEvent {
 
 impl ProtocolEvent {
     /// Get the event type name for telemetry.
+    ///
+    /// Variant names come from the `IntoStaticStr` derive; `BlockRootVerified`
+    /// is sub-discriminated by `VerificationKind` so root-verification telemetry
+    /// is attributable per root.
     #[must_use]
     pub fn type_name(&self) -> &'static str {
         match self {
-            // Timers
-            ProtocolEvent::ViewChangeTimer => "ViewChangeTimer",
-            ProtocolEvent::ContentAvailable => "ContentAvailable",
-            ProtocolEvent::CleanupTimer => "CleanupTimer",
-            ProtocolEvent::GlobalConsensusTimer => "GlobalConsensusTimer",
-
-            // BFT Consensus
-            ProtocolEvent::BlockHeaderReceived { .. } => "BlockHeaderReceived",
-            ProtocolEvent::RemoteBlockCommitted { .. } => "RemoteBlockCommitted",
-            ProtocolEvent::BlockVoteReceived { .. } => "BlockVoteReceived",
-            ProtocolEvent::QuorumCertificateFormed { .. } => "QuorumCertificateFormed",
-            ProtocolEvent::BlockReadyToCommit { .. } => "BlockReadyToCommit",
-            ProtocolEvent::BlockCommitted { .. } => "BlockCommitted",
-            ProtocolEvent::BlockPersisted { .. } => "BlockPersisted",
-            ProtocolEvent::QuorumCertificateResult { .. } => "QuorumCertificateResult",
-            ProtocolEvent::QcSignatureVerified { .. } => "QcSignatureVerified",
-            ProtocolEvent::RemoteHeaderQcVerified { .. } => "RemoteHeaderQcVerified",
-            ProtocolEvent::RemoteHeaderVerified { .. } => "RemoteHeaderVerified",
             ProtocolEvent::BlockRootVerified { kind, .. } => match kind {
                 VerificationKind::StateRoot => "BlockRootVerified::StateRoot",
                 VerificationKind::TransactionRoot => "BlockRootVerified::TransactionRoot",
@@ -589,59 +575,7 @@ impl ProtocolEvent {
                 VerificationKind::ProvisionRoot => "BlockRootVerified::ProvisionRoot",
                 VerificationKind::ProvisionTxRoots => "BlockRootVerified::ProvisionTxRoots",
             },
-            ProtocolEvent::ProposalBuilt { .. } => "ProposalBuilt",
-
-            // Provision
-            ProtocolEvent::ProvisionsVerified { .. } => "ProvisionsVerified",
-            ProtocolEvent::StateProvisionsReceived { .. } => "StateProvisionsReceived",
-            ProtocolEvent::StateProvisionsVerified { .. } => "StateProvisionsVerified",
-            ProtocolEvent::OutboundProvisionBroadcast { .. } => "OutboundProvisionBroadcast",
-            ProtocolEvent::OutboundEcObserved { .. } => "OutboundEcObserved",
-
-            // Execution
-            ProtocolEvent::ExecutionBatchCompleted { .. } => "ExecutionBatchCompleted",
-            ProtocolEvent::ExecutionVoteReceived { .. } => "ExecutionVoteReceived",
-            ProtocolEvent::ExecutionVotesVerifiedAndAggregated { .. } => {
-                "ExecutionVotesVerifiedAndAggregated"
-            }
-            ProtocolEvent::ExecutionCertificateAggregated { .. } => {
-                "ExecutionCertificateAggregated"
-            }
-            ProtocolEvent::ExecutionCertificateReceived { .. } => "ExecutionCertificateReceived",
-            ProtocolEvent::ExecutionCertificateSignatureVerified { .. } => {
-                "ExecutionCertificateSignatureVerified"
-            }
-
-            // Mempool / Transactions
-            ProtocolEvent::TransactionGossipReceived { .. } => "TransactionGossipReceived",
-            ProtocolEvent::TransactionExecuted { .. } => "TransactionExecuted",
-            ProtocolEvent::ExecutionCertificateCreated { .. } => "ExecutionCertificateCreated",
-            ProtocolEvent::WaveCompleted { .. } => "WaveCompleted",
-
-            // Fetch Delivery
-            ProtocolEvent::TransactionFetchDelivered { .. } => "TransactionFetchDelivered",
-            ProtocolEvent::FinalizedWaveFetchDelivered { .. } => "FinalizedWaveFetchDelivered",
-            // Storage Callbacks
-            ProtocolEvent::ChainMetadataFetched { .. } => "ChainMetadataFetched",
-
-            // Sync Delivery
-            ProtocolEvent::SyncEcVerificationComplete { .. } => "SyncEcVerificationComplete",
-            ProtocolEvent::SyncBlockReadyToApply { .. } => "SyncBlockReadyToApply",
-            ProtocolEvent::SyncProtocolComplete { .. } => "SyncProtocolComplete",
-            ProtocolEvent::SyncResumed => "SyncResumed",
-
-            // Global Consensus / Epoch
-            ProtocolEvent::GlobalBlockReceived { .. } => "GlobalBlockReceived",
-            ProtocolEvent::GlobalBlockVoteReceived { .. } => "GlobalBlockVoteReceived",
-            ProtocolEvent::GlobalQcFormed { .. } => "GlobalQcFormed",
-            ProtocolEvent::EpochEndApproaching { .. } => "EpochEndApproaching",
-            ProtocolEvent::EpochTransitionReady { .. } => "EpochTransitionReady",
-            ProtocolEvent::EpochTransitionComplete { .. } => "EpochTransitionComplete",
-            ProtocolEvent::ValidatorSyncComplete { .. } => "ValidatorSyncComplete",
-            ProtocolEvent::ShardSplitInitiated { .. } => "ShardSplitInitiated",
-            ProtocolEvent::ShardSplitComplete { .. } => "ShardSplitComplete",
-            ProtocolEvent::ShardMergeInitiated { .. } => "ShardMergeInitiated",
-            ProtocolEvent::ShardMergeComplete { .. } => "ShardMergeComplete",
+            other => other.into(),
         }
     }
 }

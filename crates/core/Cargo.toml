@@ -8,6 +8,7 @@ description = "Core types for Hyperscale consensus: Event, Action, and StateMach
 hyperscale-types.workspace = true
 hyperscale-messages.workspace = true
 sbor.workspace = true
+strum.workspace = true
 thiserror.workspace = true
 
 [lints]

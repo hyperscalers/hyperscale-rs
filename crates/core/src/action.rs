@@ -44,7 +44,7 @@ pub struct ProvisionRequest {
 ///
 /// Actions are **commands** - they describe something to do.
 /// The runner executes actions and may convert results back into events.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, strum::IntoStaticStr)]
 pub enum Action {
     // ═══════════════════════════════════════════════════════════════════════
     // Network: BFT Consensus
@@ -917,92 +917,7 @@ impl Action {
     /// Get the action type name for telemetry.
     #[must_use]
     pub fn type_name(&self) -> &'static str {
-        match self {
-            // Network - BFT Consensus
-            Action::BroadcastBlockHeader { .. } => "BroadcastBlockHeader",
-
-            // Network - Mempool
-            Action::BroadcastTransaction { .. } => "BroadcastTransaction",
-
-            // Network - Execution Layer (batchable)
-            Action::SignAndSendExecutionVote { .. } => "SignAndSendExecutionVote",
-            Action::BroadcastExecutionCertificate { .. } => "BroadcastExecutionCertificate",
-            Action::TrackExecutionCertificate { .. } => "TrackExecutionCertificate",
-            Action::BroadcastCommittedBlockHeader { .. } => "BroadcastCommittedBlockHeader",
-
-            // Timers
-            Action::SetTimer { .. } => "SetTimer",
-            Action::CancelTimer { .. } => "CancelTimer",
-
-            // Continuation
-            Action::Continuation(_) => "Continuation",
-
-            // Delegated Work - Crypto Verification
-            Action::VerifyAndBuildQuorumCertificate { .. } => "VerifyAndBuildQuorumCertificate",
-            Action::VerifyProvisions { .. } => "VerifyProvisions",
-            Action::AggregateExecutionCertificate { .. } => "AggregateExecutionCertificate",
-            Action::VerifyAndAggregateExecutionVotes { .. } => "VerifyAndAggregateExecutionVotes",
-            Action::VerifyExecutionCertificateSignature { .. } => {
-                "VerifyExecutionCertificateSignature"
-            }
-            Action::VerifyQcSignature { .. } => "VerifyQcSignature",
-            Action::VerifyRemoteHeaderQc { .. } => "VerifyRemoteHeaderQc",
-            Action::VerifyStateRoot { .. } => "VerifyStateRoot",
-            Action::VerifyTransactionRoot { .. } => "VerifyTransactionRoot",
-            Action::VerifyProvisionRoot { .. } => "VerifyProvisionRoot",
-            Action::VerifyCertificateRoot { .. } => "VerifyCertificateRoot",
-            Action::VerifyLocalReceiptRoot { .. } => "VerifyLocalReceiptRoot",
-            Action::VerifyProvisionTxRoots { .. } => "VerifyProvisionTxRoots",
-            Action::BuildProposal { .. } => "BuildProposal",
-
-            // Delegated Work - Execution
-            Action::ExecuteTransactions { .. } => "ExecuteTransactions",
-            Action::ExecuteCrossShardTransactions { .. } => "ExecuteCrossShardTransactions",
-            Action::FetchAndBroadcastProvision { .. } => "FetchAndBroadcastProvision",
-
-            // External Notifications
-            Action::CommitBlock { .. } => "CommitBlock",
-            Action::CommitBlockByQcOnly { .. } => "CommitBlockByQcOnly",
-            Action::EmitTransactionStatus { .. } => "EmitTransactionStatus",
-            Action::RecordTxEcCreated { .. } => "RecordTxEcCreated",
-
-            // Storage - Consensus
-            Action::SignAndBroadcastBlockVote { .. } => "SignAndBroadcastBlockVote",
-
-            // Storage - Execution
-            Action::CacheFinalizedWave { .. } => "CacheFinalizedWave",
-
-            // Storage - Read Requests
-            Action::FetchChainMetadata => "FetchChainMetadata",
-
-            // Global Consensus / Epoch Management
-            Action::ProposeGlobalBlock { .. } => "ProposeGlobalBlock",
-            Action::BroadcastGlobalBlockVote { .. } => "BroadcastGlobalBlockVote",
-            Action::TransitionEpoch { .. } => "TransitionEpoch",
-            Action::TopologyChanged { .. } => "TopologyChanged",
-            Action::MarkValidatorReady { .. } => "MarkValidatorReady",
-            Action::InitiateShardSplit { .. } => "InitiateShardSplit",
-            Action::CompleteShardSplit { .. } => "CompleteShardSplit",
-            Action::InitiateShardMerge { .. } => "InitiateShardMerge",
-            Action::CompleteShardMerge { .. } => "CompleteShardMerge",
-            Action::PersistEpochConfig { .. } => "PersistEpochConfig",
-            Action::FetchEpochConfig { .. } => "FetchEpochConfig",
-
-            // Runner I/O Requests
-            Action::StartSync { .. } => "StartSync",
-            Action::FetchTransactions { .. } => "FetchTransactions",
-            Action::FetchProvisionsLocal { .. } => "FetchProvisionsLocal",
-            Action::FetchFinalizedWave { .. } => "FetchFinalizedWave",
-            Action::CancelFetch { .. } => "CancelFetch",
-            Action::FetchProvisionsRemote { .. } => "FetchProvisionsRemote",
-            Action::RequestMissingExecutionCert { .. } => "RequestMissingExecutionCert",
-            Action::CancelExecutionCertFetch { .. } => "CancelExecutionCertFetch",
-            Action::CancelProvisionsFetch { .. } => "CancelProvisionsFetch",
-            Action::RequestMissingCommittedBlockHeader { .. } => {
-                "RequestMissingCommittedBlockHeader"
-            }
-            Action::CancelCommittedHeaderFetch { .. } => "CancelCommittedHeaderFetch",
-        }
+        self.into()
     }
 }
 
