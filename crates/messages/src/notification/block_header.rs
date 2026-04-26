@@ -1,4 +1,4 @@
-//! BlockHeader notification message.
+//! `BlockHeader` notification message.
 
 use hyperscale_types::{
     block_header_message, BlockHeader, BlockManifest, Bls12381G2Signature, MessagePriority,
@@ -26,6 +26,7 @@ pub struct BlockHeaderNotification {
 
 impl BlockHeaderNotification {
     /// Create a block header notification message.
+    #[must_use]
     pub fn new(
         header: BlockHeader,
         manifest: BlockManifest,
@@ -39,6 +40,7 @@ impl BlockHeaderNotification {
     }
 
     /// Build the domain-separated signing message for this block header.
+    #[must_use]
     pub fn signing_message(&self) -> Vec<u8> {
         block_header_message(
             self.header.shard_group_id,
@@ -49,6 +51,7 @@ impl BlockHeaderNotification {
     }
 
     /// Consume and return header, manifest, and proposer signature.
+    #[must_use]
     pub fn into_parts(self) -> (BlockHeader, BlockManifest, Bls12381G2Signature) {
         (self.header, self.manifest, self.proposer_signature)
     }
@@ -83,7 +86,7 @@ mod tests {
             parent_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(0),
-            timestamp: ProposerTimestamp(1234567890),
+            timestamp: ProposerTimestamp(1_234_567_890),
             round: Round::INITIAL,
             is_fallback: false,
             state_root: StateRoot::ZERO,
@@ -149,7 +152,7 @@ mod tests {
             zero_sig(),
         );
 
-        let all: Vec<TxHash> = gossip.manifest.tx_hashes.to_vec();
+        let all: Vec<TxHash> = gossip.manifest.tx_hashes.clone();
         assert_eq!(all, vec![tx1, tx2, tx3]);
     }
 }

@@ -1,4 +1,4 @@
-//! ExecutionCertificatesNotification message.
+//! `ExecutionCertificatesNotification` message.
 
 use hyperscale_types::{
     Bls12381G2Signature, ExecutionCertificate, MessagePriority, NetworkMessage, ShardGroupId,
@@ -23,6 +23,7 @@ pub struct ExecutionCertificatesNotification {
 
 impl ExecutionCertificatesNotification {
     /// Create a new signed execution certificate batch.
+    #[must_use]
     pub fn new(
         certificates: Vec<ExecutionCertificate>,
         sender: ValidatorId,
@@ -36,26 +37,31 @@ impl ExecutionCertificatesNotification {
     }
 
     /// Build the canonical signing message for this batch.
+    #[must_use]
     pub fn signing_message(&self, shard: ShardGroupId) -> Vec<u8> {
         hyperscale_types::exec_cert_batch_message(shard, &self.certificates)
     }
 
     /// Get the certificates.
+    #[must_use]
     pub fn certificates(&self) -> &[ExecutionCertificate] {
         &self.certificates
     }
 
     /// Consume and return the certificates.
+    #[must_use]
     pub fn into_certificates(self) -> Vec<ExecutionCertificate> {
         self.certificates
     }
 
     /// Check if the batch is empty.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.certificates.is_empty()
     }
 
     /// Get the number of certificates in the batch.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.certificates.len()
     }

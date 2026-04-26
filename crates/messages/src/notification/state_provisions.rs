@@ -1,4 +1,4 @@
-//! StateProvisionNotification message for cross-shard provisions.
+//! `StateProvisionNotification` message for cross-shard provisions.
 
 use crate::trace_context::TraceContext;
 use hyperscale_types::{
@@ -31,6 +31,7 @@ pub struct StateProvisionNotification {
 
 impl StateProvisionNotification {
     /// Create a new signed state provisions.
+    #[must_use]
     pub fn new(
         provisions: Vec<hyperscale_types::StateProvision>,
         proof: MerkleInclusionProof,
@@ -48,7 +49,10 @@ impl StateProvisionNotification {
 
     /// Build the canonical signing message for this notification.
     ///
-    /// Requires that the provisions list is non-empty (panics otherwise).
+    /// # Panics
+    ///
+    /// Panics if `self.provisions` is empty.
+    #[must_use]
     pub fn signing_message(&self) -> Vec<u8> {
         let first = &self.provisions[0];
         hyperscale_types::state_provisions_message(
@@ -60,26 +64,31 @@ impl StateProvisionNotification {
     }
 
     /// Get the provisions.
+    #[must_use]
     pub fn provisions(&self) -> &[hyperscale_types::StateProvision] {
         &self.provisions
     }
 
     /// Consume and return the provisions and their shared proof.
+    #[must_use]
     pub fn into_parts(self) -> (Vec<hyperscale_types::StateProvision>, MerkleInclusionProof) {
         (self.provisions, self.proof)
     }
 
     /// Get the trace context.
+    #[must_use]
     pub fn trace_context(&self) -> &TraceContext {
         &self.trace_context
     }
 
     /// Check if there are no provisions.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.provisions.is_empty()
     }
 
     /// Get the number of provisions.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.provisions.len()
     }

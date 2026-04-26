@@ -1,9 +1,9 @@
-//! BlockVote notification message.
+//! `BlockVote` notification message.
 
 use hyperscale_types::{BlockVote, MessagePriority, NetworkMessage};
 use sbor::prelude::BasicSbor;
 
-/// Vote on a block proposal. 2f+1 matching votes create a QuorumCertificate.
+/// Vote on a block proposal. 2f+1 matching votes create a `QuorumCertificate`.
 ///
 /// Sent via unicast notification to committee members. The inner `BlockVote`
 /// contains the voter identity and BLS signature, making it self-authenticating.
@@ -15,16 +15,19 @@ pub struct BlockVoteNotification {
 
 impl BlockVoteNotification {
     /// Create a new block vote notification message.
+    #[must_use]
     pub fn new(vote: BlockVote) -> Self {
         Self { vote }
     }
 
     /// Get the inner block vote.
+    #[must_use]
     pub fn vote(&self) -> &BlockVote {
         &self.vote
     }
 
     /// Consume and return the inner block vote.
+    #[must_use]
     pub fn into_vote(self) -> BlockVote {
         self.vote
     }
@@ -59,7 +62,7 @@ mod tests {
             round: Round::INITIAL,
             voter: ValidatorId(2),
             signature: zero_bls_signature(),
-            timestamp: ProposerTimestamp(1000000000000),
+            timestamp: ProposerTimestamp(1_000_000_000_000),
         };
 
         let gossip = BlockVoteNotification::new(vote.clone());
@@ -75,7 +78,7 @@ mod tests {
             round: Round::INITIAL,
             voter: ValidatorId(1),
             signature: zero_bls_signature(),
-            timestamp: ProposerTimestamp(1000000000000),
+            timestamp: ProposerTimestamp(1_000_000_000_000),
         };
 
         let gossip = BlockVoteNotification::new(vote.clone());

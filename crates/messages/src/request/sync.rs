@@ -20,6 +20,7 @@ pub struct SyncCompleteAnnouncement {
 
 impl SyncCompleteAnnouncement {
     /// Create a new sync complete announcement.
+    #[must_use]
     pub fn new(
         synced_height: BlockHeight,
         validator: ValidatorId,

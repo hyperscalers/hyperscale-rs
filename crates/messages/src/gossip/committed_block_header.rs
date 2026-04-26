@@ -1,4 +1,4 @@
-//! CommittedBlockHeader gossip message for cross-shard header broadcast.
+//! `CommittedBlockHeader` gossip message for cross-shard header broadcast.
 
 use hyperscale_types::{
     committed_block_header_message, Bls12381G2Signature, CommittedBlockHeader, MessagePriority,
@@ -27,6 +27,7 @@ impl CommittedBlockHeaderGossip {
     /// Build the canonical signing message for this gossip.
     ///
     /// Uses `DOMAIN_COMMITTED_BLOCK_HEADER` tag for domain separation.
+    #[must_use]
     pub fn signing_message(&self) -> Vec<u8> {
         committed_block_header_message(
             self.committed_header.header.shard_group_id,
@@ -75,7 +76,7 @@ mod tests {
             parent_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(0),
-            timestamp: ProposerTimestamp(1234567890),
+            timestamp: ProposerTimestamp(1_234_567_890),
             round: Round::INITIAL,
             is_fallback: false,
             state_root: StateRoot::ZERO,

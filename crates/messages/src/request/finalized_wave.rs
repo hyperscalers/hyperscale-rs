@@ -21,6 +21,8 @@ pub struct GetFinalizedWavesRequest {
 }
 
 impl GetFinalizedWavesRequest {
+    /// Build a request for the listed `wave_id_hashes` against `block_hash`.
+    #[must_use]
     pub fn new(block_hash: BlockHash, wave_id_hashes: Vec<WaveIdHash>) -> Self {
         Self {
             block_hash,

@@ -5,7 +5,7 @@ use hyperscale_types::{MessagePriority, NetworkMessage, RoutableTransaction, Sha
 use std::sync::Arc;
 
 /// Gossips a transaction to all shard groups with state touched by it.
-/// Broadcast to union of write_shards (cross-shard execution) and read_shards (provisioning).
+/// Broadcast to union of `write_shards` (cross-shard execution) and `read_shards` (provisioning).
 ///
 /// When serializing for network transmission, the transaction data is fully copied.
 #[derive(Debug, Clone)]
@@ -48,21 +48,25 @@ impl TransactionGossip {
     }
 
     /// Get a reference to the inner transaction.
+    #[must_use]
     pub fn transaction(&self) -> &RoutableTransaction {
         &self.transaction
     }
 
     /// Get the Arc to the transaction.
+    #[must_use]
     pub fn transaction_arc(&self) -> &Arc<RoutableTransaction> {
         &self.transaction
     }
 
     /// Consume and return the inner transaction.
+    #[must_use]
     pub fn into_transaction(self) -> RoutableTransaction {
         Arc::try_unwrap(self.transaction).unwrap_or_else(|arc| (*arc).clone())
     }
 
     /// Get the trace context.
+    #[must_use]
     pub fn trace_context(&self) -> &TraceContext {
         &self.trace_context
     }

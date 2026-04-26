@@ -21,6 +21,8 @@ pub struct GetLocalProvisionsRequest {
 }
 
 impl GetLocalProvisionsRequest {
+    /// Build a request for the listed `batch_hashes` against `block_hash`.
+    #[must_use]
     pub fn new(block_hash: BlockHash, batch_hashes: Vec<ProvisionHash>) -> Self {
         Self {
             block_hash,

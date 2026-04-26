@@ -20,6 +20,7 @@ pub struct GetTransactionsRequest {
 
 impl GetTransactionsRequest {
     /// Create a new transaction fetch request.
+    #[must_use]
     pub fn new(block_hash: BlockHash, tx_hashes: Vec<TxHash>) -> Self {
         Self {
             block_hash,
@@ -28,6 +29,7 @@ impl GetTransactionsRequest {
     }
 
     /// Get the number of transactions being requested.
+    #[must_use]
     pub fn count(&self) -> usize {
         self.tx_hashes.len()
     }

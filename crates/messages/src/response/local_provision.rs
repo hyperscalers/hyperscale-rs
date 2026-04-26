@@ -12,11 +12,15 @@ use sbor::prelude::BasicSbor;
 /// copy" from a transport-level empty response.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct GetLocalProvisionsResponse {
+    /// Provision batches the responder had locally.
     pub batches: Vec<Provisions>,
+    /// Requested hashes the responder did not have (never seen or evicted).
     pub missing_hashes: Vec<ProvisionHash>,
 }
 
 impl GetLocalProvisionsResponse {
+    /// Build a response carrying `batches` and a list of `missing_hashes`.
+    #[must_use]
     pub fn new(batches: Vec<Provisions>, missing_hashes: Vec<ProvisionHash>) -> Self {
         Self {
             batches,
@@ -24,6 +28,8 @@ impl GetLocalProvisionsResponse {
         }
     }
 
+    /// Build an empty response (responder had none of the requested batches).
+    #[must_use]
     pub fn empty() -> Self {
         Self {
             batches: vec![],

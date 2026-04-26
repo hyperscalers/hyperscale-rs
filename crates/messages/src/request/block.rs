@@ -30,12 +30,14 @@ pub struct Inventory {
 
 impl Inventory {
     /// Inventory that advertises nothing — equivalent to "send everything."
+    #[must_use]
     pub fn empty() -> Self {
         Self::default()
     }
 
     /// Whether every category is absent. Responders can short-circuit the
     /// elision path entirely when this is true.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.tx_have.is_none() && self.cert_have.is_none() && self.provision_have.is_none()
     }
@@ -68,9 +70,12 @@ impl GetBlockRequest {
     /// Callers that participate in the elision scheme attach an inventory
     /// via [`Self::with_inventory`] immediately after construction.
     ///
+    /// # Panics
+    ///
     /// Panics if `target_height < height` — a request for a block past
     /// the stated sync target is a programming error in the caller (sync
     /// always catches up forward).
+    #[must_use]
     pub fn new(height: BlockHeight, target_height: BlockHeight) -> Self {
         assert!(
             target_height >= height,
@@ -88,6 +93,7 @@ impl GetBlockRequest {
     /// Attach the requester's inventory so the responder can elide bodies
     /// the requester already has. Typically called once per sync tick so
     /// every in-flight fetch in the batch shares a single snapshot.
+    #[must_use]
     pub fn with_inventory(mut self, inventory: Inventory) -> Self {
         self.inventory = inventory;
         self
@@ -106,7 +112,7 @@ impl NetworkMessage for GetBlockRequest {
 }
 
 /// Type-safe request/response pairing.
-/// GetBlockRequest expects GetBlockResponse.
+/// `GetBlockRequest` expects `GetBlockResponse`.
 impl Request for GetBlockRequest {
     type Response = GetBlockResponse;
 }

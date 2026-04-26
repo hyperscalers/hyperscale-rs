@@ -443,7 +443,7 @@ pub fn serve_block_request(
     let wave_window_open = tip_ts.elapsed_since(block_ts) < LIVE_WINDOW;
 
     if !wave_window_open || provision_hashes.is_empty() {
-        return GetBlockResponse::found(ElidedCertifiedBlock::elide(block, qc, &req.inventory));
+        return GetBlockResponse::found(ElidedCertifiedBlock::elide(&block, qc, &req.inventory));
     }
 
     let resolved: Option<Vec<Arc<Provisions>>> = provision_hashes
@@ -453,7 +453,7 @@ pub fn serve_block_request(
 
     match resolved {
         Some(provisions) => GetBlockResponse::found(ElidedCertifiedBlock::elide(
-            block.into_live(provisions),
+            &block.into_live(provisions),
             qc,
             &req.inventory,
         )),
@@ -467,7 +467,7 @@ pub fn serve_block_request(
                 "Cache miss for provisions inside live window — serving sealed"
             );
             metrics::record_sync_response_error("provision_cache_miss");
-            GetBlockResponse::found(ElidedCertifiedBlock::elide(block, qc, &req.inventory))
+            GetBlockResponse::found(ElidedCertifiedBlock::elide(&block, qc, &req.inventory))
         }
     }
 }

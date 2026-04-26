@@ -16,11 +16,13 @@ pub struct GetTransactionsResponse {
 
 impl GetTransactionsResponse {
     /// Create a response with found transactions.
+    #[must_use]
     pub fn new(transactions: Vec<Arc<RoutableTransaction>>) -> Self {
         Self { transactions }
     }
 
     /// Create an empty response (no transactions found).
+    #[must_use]
     pub fn empty() -> Self {
         Self {
             transactions: vec![],
@@ -28,16 +30,19 @@ impl GetTransactionsResponse {
     }
 
     /// Get the number of transactions in the response.
+    #[must_use]
     pub fn count(&self) -> usize {
         self.transactions.len()
     }
 
     /// Check if the response is empty.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.transactions.is_empty()
     }
 
     /// Consume and return the transactions.
+    #[must_use]
     pub fn into_transactions(self) -> Vec<Arc<RoutableTransaction>> {
         self.transactions
     }

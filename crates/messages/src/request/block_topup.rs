@@ -31,6 +31,7 @@ pub struct GetBlockTopUpRequest {
 impl GetBlockTopUpRequest {
     /// Create a new top-up request for the given block height and the
     /// per-category missing hashes.
+    #[must_use]
     pub fn new(
         height: BlockHeight,
         missing_tx: Vec<TxHash>,
@@ -46,12 +47,14 @@ impl GetBlockTopUpRequest {
     }
 
     /// Total number of bodies being requested across categories.
+    #[must_use]
     pub fn total(&self) -> usize {
         self.missing_tx.len() + self.missing_cert.len() + self.missing_provision.len()
     }
 
     /// Whether this request carries no hashes — a degenerate case the
     /// requester should skip rather than send.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.total() == 0
     }

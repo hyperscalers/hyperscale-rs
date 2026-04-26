@@ -21,10 +21,16 @@ use std::sync::Arc;
 /// missing.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct ElidedCertifiedBlock {
+    /// Block header (always inline).
     pub header: BlockHeader,
+    /// Certifying quorum certificate (always inline).
     pub qc: QuorumCertificate,
+    /// Per-transaction `(hash, optional body)` pairs; body is `None` when elided.
     pub transactions: Vec<(TxHash, Option<RoutableTransaction>)>,
+    /// Per-certificate `(wave-id hash, optional body)` pairs; body is `None` when elided.
     pub certificates: Vec<(WaveIdHash, Option<FinalizedWave>)>,
+    /// Per-provision `(hash, optional body)` pairs. `None` overall preserves the
+    /// `Block::Sealed` shape; `Some(_)` preserves `Block::Live`.
     pub provisions: Option<Vec<(ProvisionHash, Option<Provisions>)>>,
 }
 
@@ -33,7 +39,8 @@ impl ElidedCertifiedBlock {
     /// inventory. Bodies whose hashes appear in the inventory filters are
     /// replaced with `None`; hashes are always included so the requester
     /// can reconstruct the block.
-    pub fn elide(block: Block, qc: QuorumCertificate, inventory: &Inventory) -> Self {
+    #[must_use]
+    pub fn elide(block: &Block, qc: QuorumCertificate, inventory: &Inventory) -> Self {
         let header = block.header().clone();
         let is_live = block.is_live();
 
@@ -42,7 +49,7 @@ impl ElidedCertifiedBlock {
             .iter()
             .map(|tx| {
                 let hash = tx.hash();
-                let body = if matches_filter(&inventory.tx_have, &hash) {
+                let body = if matches_filter(inventory.tx_have.as_ref(), &hash) {
                     None
                 } else {
                     Some((**tx).clone())
@@ -56,7 +63,7 @@ impl ElidedCertifiedBlock {
             .iter()
             .map(|fw| {
                 let hash = fw.wave_id_hash();
-                let body = if matches_filter(&inventory.cert_have, &hash) {
+                let body = if matches_filter(inventory.cert_have.as_ref(), &hash) {
                     None
                 } else {
                     Some((**fw).clone())
@@ -72,7 +79,7 @@ impl ElidedCertifiedBlock {
                     .iter()
                     .map(|p| {
                         let hash = p.hash();
-                        let body = if matches_filter(&inventory.provision_have, &hash) {
+                        let body = if matches_filter(inventory.provision_have.as_ref(), &hash) {
                             None
                         } else {
                             Some((**p).clone())
@@ -103,6 +110,11 @@ impl ElidedCertifiedBlock {
     /// resolve — the caller uses that list to issue a top-up request and
     /// then retry rehydration with lookups augmented by the top-up
     /// bodies.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RehydrationMiss`] when one or more elided bodies could
+    /// not be resolved by the supplied lookup closures.
     pub fn try_rehydrate<FTx, FCert, FProv>(
         &self,
         mut tx_lookup: FTx,
@@ -117,51 +129,42 @@ impl ElidedCertifiedBlock {
         let mut miss = RehydrationMiss::default();
         let mut txs = Vec::with_capacity(self.transactions.len());
         for (hash, body) in &self.transactions {
-            match body {
-                Some(tx) => txs.push(Some(Arc::new(tx.clone()))),
-                None => match tx_lookup(hash) {
-                    Some(resolved) => txs.push(Some(resolved)),
-                    None => {
-                        txs.push(None);
-                        miss.missing_tx.push(*hash);
-                    }
-                },
+            if let Some(tx) = body {
+                txs.push(Some(Arc::new(tx.clone())));
+            } else if let Some(resolved) = tx_lookup(hash) {
+                txs.push(Some(resolved));
+            } else {
+                txs.push(None);
+                miss.missing_tx.push(*hash);
             }
         }
 
         let mut certs = Vec::with_capacity(self.certificates.len());
         for (hash, body) in &self.certificates {
-            match body {
-                Some(fw) => certs.push(Some(Arc::new(fw.clone()))),
-                None => match cert_lookup(hash) {
-                    Some(resolved) => certs.push(Some(resolved)),
-                    None => {
-                        certs.push(None);
-                        miss.missing_cert.push(*hash);
-                    }
-                },
+            if let Some(fw) = body {
+                certs.push(Some(Arc::new(fw.clone())));
+            } else if let Some(resolved) = cert_lookup(hash) {
+                certs.push(Some(resolved));
+            } else {
+                certs.push(None);
+                miss.missing_cert.push(*hash);
             }
         }
 
-        let provs = match &self.provisions {
-            Some(entries) => {
-                let mut out = Vec::with_capacity(entries.len());
-                for (hash, body) in entries {
-                    match body {
-                        Some(p) => out.push(Some(Arc::new(p.clone()))),
-                        None => match provision_lookup(hash) {
-                            Some(resolved) => out.push(Some(resolved)),
-                            None => {
-                                out.push(None);
-                                miss.missing_provision.push(*hash);
-                            }
-                        },
-                    }
+        let provs = self.provisions.as_ref().map(|entries| {
+            let mut out = Vec::with_capacity(entries.len());
+            for (hash, body) in entries {
+                if let Some(p) = body {
+                    out.push(Some(Arc::new(p.clone())));
+                } else if let Some(resolved) = provision_lookup(hash) {
+                    out.push(Some(resolved));
+                } else {
+                    out.push(None);
+                    miss.missing_provision.push(*hash);
                 }
-                Some(out)
             }
-            None => None,
-        };
+            out
+        });
 
         if !miss.is_empty() {
             return Err(miss);
@@ -195,13 +198,17 @@ impl ElidedCertifiedBlock {
 /// [`GetBlockTopUpRequest`](crate::request::GetBlockTopUpRequest).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RehydrationMiss {
+    /// Transaction hashes whose bodies could not be resolved.
     pub missing_tx: Vec<TxHash>,
+    /// Wave-id hashes whose finalized-wave bodies could not be resolved.
     pub missing_cert: Vec<WaveIdHash>,
+    /// Provision hashes whose bodies could not be resolved.
     pub missing_provision: Vec<ProvisionHash>,
 }
 
 impl RehydrationMiss {
     /// Whether every category is empty.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.missing_tx.is_empty()
             && self.missing_cert.is_empty()
@@ -209,16 +216,17 @@ impl RehydrationMiss {
     }
 
     /// Total number of missing hashes across categories.
+    #[must_use]
     pub fn total(&self) -> usize {
         self.missing_tx.len() + self.missing_cert.len() + self.missing_provision.len()
     }
 }
 
-fn matches_filter<T>(filter: &Option<hyperscale_types::BloomFilter<T>>, hash: &T) -> bool
+fn matches_filter<T>(filter: Option<&hyperscale_types::BloomFilter<T>>, hash: &T) -> bool
 where
     T: hyperscale_types::TypedHash,
 {
-    filter.as_ref().is_some_and(|bf| bf.contains(hash))
+    filter.is_some_and(|bf| bf.contains(hash))
 }
 
 /// Response to a block fetch request.
@@ -235,6 +243,7 @@ pub struct GetBlockResponse {
 
 impl GetBlockResponse {
     /// Create a response with a found block.
+    #[must_use]
     pub fn found(certified: ElidedCertifiedBlock) -> Self {
         Self {
             certified: Some(certified),
@@ -242,16 +251,19 @@ impl GetBlockResponse {
     }
 
     /// Create a response for a block not found.
+    #[must_use]
     pub fn not_found() -> Self {
         Self { certified: None }
     }
 
     /// Check if the block was found.
+    #[must_use]
     pub fn has_block(&self) -> bool {
         self.certified.is_some()
     }
 
     /// Consume and return the elided block.
+    #[must_use]
     pub fn into_elided(self) -> Option<ElidedCertifiedBlock> {
         self.certified
     }
@@ -288,7 +300,7 @@ mod tests {
                 parent_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
                 parent_qc: QuorumCertificate::genesis(),
                 proposer: ValidatorId(0),
-                timestamp: ProposerTimestamp(1234567890),
+                timestamp: ProposerTimestamp(1_234_567_890),
                 round: Round::INITIAL,
                 is_fallback: false,
                 state_root: StateRoot::ZERO,
@@ -324,7 +336,7 @@ mod tests {
         let block = create_test_block();
         let qc = create_test_qc(&block);
         let expected_tx_hash = block.transactions()[0].hash();
-        let elided = ElidedCertifiedBlock::elide(block, qc, &Inventory::empty());
+        let elided = ElidedCertifiedBlock::elide(&block, qc, &Inventory::empty());
         assert_eq!(elided.transactions.len(), 1);
         let (hash, body) = &elided.transactions[0];
         assert_eq!(*hash, expected_tx_hash);
@@ -344,7 +356,7 @@ mod tests {
             cert_have: None,
             provision_have: None,
         };
-        let elided = ElidedCertifiedBlock::elide(block, qc, &inv);
+        let elided = ElidedCertifiedBlock::elide(&block, qc, &inv);
         let (hash, body) = &elided.transactions[0];
         assert_eq!(*hash, tx_hash);
         assert!(body.is_none(), "requester already has this tx, elide body");
@@ -364,7 +376,7 @@ mod tests {
             cert_have: None,
             provision_have: None,
         };
-        let elided = ElidedCertifiedBlock::elide(block.clone(), qc.clone(), &inv);
+        let elided = ElidedCertifiedBlock::elide(&block, qc.clone(), &inv);
         let rehydrated = elided
             .try_rehydrate(
                 |h| {
@@ -395,7 +407,7 @@ mod tests {
             cert_have: None,
             provision_have: None,
         };
-        let elided = ElidedCertifiedBlock::elide(block, qc, &inv);
+        let elided = ElidedCertifiedBlock::elide(&block, qc, &inv);
         let miss = elided
             .try_rehydrate(|_| None, |_| None, |_| None)
             .expect_err("rehydration should fail when elided body has no local source");
@@ -419,7 +431,7 @@ mod tests {
             cert_have: None,
             provision_have: None,
         };
-        let elided = ElidedCertifiedBlock::elide(block.clone(), qc, &inv);
+        let elided = ElidedCertifiedBlock::elide(&block, qc, &inv);
 
         let miss = elided
             .try_rehydrate(|_| None, |_| None, |_| None)
@@ -447,7 +459,7 @@ mod tests {
     fn response_found_and_not_found_helpers() {
         let block = create_test_block();
         let qc = create_test_qc(&block);
-        let elided = ElidedCertifiedBlock::elide(block, qc, &Inventory::empty());
+        let elided = ElidedCertifiedBlock::elide(&block, qc, &Inventory::empty());
         let response = GetBlockResponse::found(elided.clone());
         assert!(response.has_block());
         assert_eq!(response.into_elided(), Some(elided));

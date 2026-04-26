@@ -18,13 +18,17 @@ use std::sync::Arc;
 /// recomputing hashes over large payloads.
 #[derive(Debug, Clone)]
 pub struct GetBlockTopUpResponse {
+    /// Resolved transaction bodies, paired with their hashes.
     pub transactions: Vec<(TxHash, Arc<RoutableTransaction>)>,
+    /// Resolved finalized-wave bodies, paired with their wave-id hashes.
     pub certificates: Vec<(WaveIdHash, Arc<FinalizedWave>)>,
+    /// Resolved provision batches, paired with their hashes.
     pub provisions: Vec<(ProvisionHash, Arc<Provisions>)>,
 }
 
 impl GetBlockTopUpResponse {
     /// Construct a response from resolved bodies.
+    #[must_use]
     pub fn new(
         transactions: Vec<(TxHash, Arc<RoutableTransaction>)>,
         certificates: Vec<(WaveIdHash, Arc<FinalizedWave>)>,
@@ -38,6 +42,7 @@ impl GetBlockTopUpResponse {
     }
 
     /// Empty response — the responder had no requested bodies.
+    #[must_use]
     pub fn empty() -> Self {
         Self {
             transactions: Vec::new(),
@@ -47,6 +52,7 @@ impl GetBlockTopUpResponse {
     }
 
     /// Total number of bodies returned across categories.
+    #[must_use]
     pub fn total(&self) -> usize {
         self.transactions.len() + self.certificates.len() + self.provisions.len()
     }
