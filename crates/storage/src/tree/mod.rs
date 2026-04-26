@@ -32,15 +32,15 @@ use std::sync::Arc;
 /// avoiding corruption from abandoned blocks (view changes / forks).
 pub struct OverlayTreeReader<'a, S> {
     base: &'a S,
-    /// Overlay nodes indexed by NodeKey for O(1) lookup.
+    /// Overlay nodes indexed by `NodeKey` for O(1) lookup.
     nodes: HashMap<jmt::NodeKey, Arc<jmt::Node>>,
 }
 
 impl<'a, S> OverlayTreeReader<'a, S> {
-    /// Create a new OverlayTreeReader.
+    /// Create a new `OverlayTreeReader`.
     pub fn new(base: &'a S, snapshots: &[Arc<JmtSnapshot>]) -> Self {
         let mut nodes = HashMap::new();
-        for snapshot in snapshots.iter() {
+        for snapshot in snapshots {
             for (key, node) in &snapshot.nodes {
                 nodes.insert(key.clone(), Arc::clone(node));
             }
@@ -86,17 +86,20 @@ pub type Jmt = Tree<Blake3Hasher, 1>;
 ///
 /// Storage keys are variable-length (`entity_key || partition_num || sort_key`).
 /// BLAKE3 hashing produces a fixed 32-byte key for uniform path depth.
+#[must_use]
 pub fn hash_storage_key(storage_key: &[u8]) -> jmt::Key {
     blake3::hash(storage_key).into()
 }
 
 /// Hash a raw value to a 32-byte value hash stored in leaves.
+#[must_use]
 pub fn hash_value(value: &[u8]) -> jmt::ValueHash {
     blake3::hash(value).into()
 }
 
 /// Returns `None` when the JMT is truly empty (height 0 with zero root),
 /// indicating no parent node exists. Otherwise returns `Some(block_height)`.
+#[must_use]
 pub fn jmt_parent_height(block_height: BlockHeight, root: StateRoot) -> Option<BlockHeight> {
     if block_height == BlockHeight::GENESIS && root == StateRoot::ZERO {
         None
@@ -105,7 +108,7 @@ pub fn jmt_parent_height(block_height: BlockHeight, root: StateRoot) -> Option<B
     }
 }
 
-/// Build a no-op JmtSnapshot for a block with no state changes (empty receipts).
+/// Build a no-op `JmtSnapshot` for a block with no state changes (empty receipts).
 ///
 /// The state root is unchanged (`parent_state_root`). We try to copy the
 /// parent's root node to the new version so the overlay chain stays intact.
@@ -161,7 +164,7 @@ pub fn noop_jmt_snapshot<S: jmt::TreeReader>(
     }
 }
 
-/// Build a storage key from entity_key + partition_num + sort_key.
+/// Build a storage key from `entity_key` + `partition_num` + `sort_key`.
 fn make_storage_key(entity_key: &[u8], partition_num: u8, sort_key: &[u8]) -> Vec<u8> {
     let mut key = Vec::with_capacity(entity_key.len() + 1 + sort_key.len());
     key.extend_from_slice(entity_key);
@@ -186,6 +189,11 @@ fn make_storage_key(entity_key: &[u8], partition_num: u8, sort_key: &[u8]) -> Ve
 /// Accepts multiple `DatabaseUpdates` slices — all are flattened directly
 /// into JMT work items without merging. Since transactions hold exclusive
 /// state locks, there are no key conflicts between updates.
+///
+/// # Panics
+///
+/// Panics if `new_version` is not strictly greater than `parent_version`.
+#[allow(clippy::implicit_hasher)] // call sites pass std `HashMap`s; generic hasher would require turbofishing every site
 pub fn put_at_version<S: jmt::TreeReader + Sync>(
     store: &S,
     parent_version: Option<u64>,
@@ -239,7 +247,7 @@ pub fn put_at_version<S: jmt::TreeReader + Sync>(
                             work_items.push((storage_key, Some(value.as_slice())));
                         }
                     }
-                };
+                }
             }
         }
     }

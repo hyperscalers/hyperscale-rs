@@ -1,6 +1,6 @@
-//! # RocksDB Storage
+//! # `RocksDB` Storage
 //!
-//! Production storage implementation using RocksDB.
+//! Production storage implementation using `RocksDB`.
 //!
 //! All operations are synchronous blocking I/O. Callers in async contexts
 //! should use `spawn_blocking` if needed to avoid blocking the runtime.

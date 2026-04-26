@@ -1,11 +1,11 @@
-//! SharedStorage newtype — Arc-wrapped RocksDbStorage with full trait impls.
+//! `SharedStorage` newtype — Arc-wrapped `RocksDbStorage` with full trait impls.
 //!
-//! Production uses `CachingStorage<SharedStorage>` on the pinned IoLoop
-//! thread while sharing the same underlying RocksDbStorage with async tasks
-//! (InboundRouter, FetchManager) via cheap Arc clones.
+//! Production uses `CachingStorage<SharedStorage>` on the pinned `IoLoop`
+//! thread while sharing the same underlying `RocksDbStorage` with async tasks
+//! (`InboundRouter`, `FetchManager`) via cheap Arc clones.
 //!
-//! The orphan rule prevents implementing foreign traits (SubstateDatabase,
-//! CommittableSubstateDatabase) for `Arc<RocksDbStorage>` directly.
+//! The orphan rule prevents implementing foreign traits (`SubstateDatabase`,
+//! `CommittableSubstateDatabase`) for `Arc<RocksDbStorage>` directly.
 //! This newtype sidesteps that while providing zero-cost delegation.
 
 use crate::chain_writer::RocksDbPreparedCommit;
@@ -22,7 +22,7 @@ use hyperscale_types::{
 };
 use std::sync::Arc;
 
-/// Shared RocksDB storage handle with full storage trait implementations.
+/// Shared `RocksDB` storage handle with full storage trait implementations.
 ///
 /// A cheap-to-clone wrapper around `Arc<RocksDbStorage>` that implements all
 /// storage traits needed by `IoLoop`. Use this as the storage type parameter
@@ -43,6 +43,7 @@ impl SharedStorage {
     }
 
     /// Get a reference to the underlying `Arc<RocksDbStorage>`.
+    #[must_use]
     pub fn arc(&self) -> &Arc<RocksDbStorage> {
         &self.0
     }

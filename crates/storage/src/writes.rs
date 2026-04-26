@@ -12,6 +12,7 @@ use std::sync::Arc;
 /// This is the canonical way to derive state updates from receipts for
 /// JMT computation and substate writes. Used internally by `ChainWriter`
 /// implementations.
+#[must_use]
 pub fn merge_updates_from_receipts(receipts: &[ReceiptBundle]) -> DatabaseUpdates {
     if receipts.is_empty() {
         return DatabaseUpdates::default();
@@ -30,6 +31,7 @@ pub fn merge_updates_from_receipts(receipts: &[ReceiptBundle]) -> DatabaseUpdate
 ///
 /// Later certificates take precedence for conflicting keys (last writer wins).
 /// This is deterministic: certificates are processed left-to-right.
+#[must_use]
 pub fn merge_database_updates(updates_list: &[DatabaseUpdates]) -> DatabaseUpdates {
     if updates_list.is_empty() {
         return DatabaseUpdates::default();
@@ -47,6 +49,7 @@ pub fn merge_database_updates(updates_list: &[DatabaseUpdates]) -> DatabaseUpdat
 /// Merge a slice of Arc-wrapped per-certificate `DatabaseUpdates` into a single combined update.
 ///
 /// Same semantics as [`merge_database_updates`] but dereferences through `Arc`.
+#[must_use]
 pub fn merge_database_updates_from_arcs(updates_list: &[Arc<DatabaseUpdates>]) -> DatabaseUpdates {
     if updates_list.is_empty() {
         return DatabaseUpdates::default();

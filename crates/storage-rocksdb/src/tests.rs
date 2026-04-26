@@ -15,7 +15,7 @@ use hyperscale_types::{
 use std::sync::Arc;
 use tempfile::TempDir;
 
-/// Helper: wrap DatabaseUpdates into a single ReceiptBundle for test commit calls.
+/// Helper: wrap `DatabaseUpdates` into a single `ReceiptBundle` for test commit calls.
 fn updates_to_receipts(updates: &DatabaseUpdates) -> Vec<ReceiptBundle> {
     if updates.node_updates.is_empty() {
         return vec![];
@@ -370,7 +370,7 @@ fn push_wave(block: &mut hyperscale_types::Block, fw: Arc<hyperscale_types::Fina
     };
 }
 
-/// Wrap receipts into a single FinalizedWave attached to `block.certificates`,
+/// Wrap receipts into a single `FinalizedWave` attached to `block.certificates`,
 /// so the new `commit_block` (which derives receipts from `block.certificates`)
 /// can apply them.
 fn attach_receipts(block: &mut hyperscale_types::Block, receipts: Vec<ReceiptBundle>) {
@@ -885,7 +885,7 @@ fn test_ec_atomic_with_block_commit() {
 // snapshot isolation, column family) so backend parity is not free.
 
 /// Helper: port of `commit_with` from the memory tests. Injects the updates
-/// as a single-tx FinalizedWave receipt inside a block and commits it.
+/// as a single-tx `FinalizedWave` receipt inside a block and commits it.
 fn rocks_commit_with(
     storage: &RocksDbStorage,
     updates: &DatabaseUpdates,
@@ -1055,8 +1055,12 @@ fn test_list_substates_at_height_respects_retention() {
     for h in 1..=10u64 {
         let block = make_test_block(BlockHeight(h));
         let qc = make_test_qc(&block);
-        let updates =
-            make_mapped_database_update(9, partition_num, sort_key.clone(), vec![h as u8]);
+        let updates = make_mapped_database_update(
+            9,
+            partition_num,
+            sort_key.clone(),
+            vec![u8::try_from(h).unwrap_or(u8::MAX)],
+        );
         rocks_commit_with(&storage, &updates, &block, &qc);
     }
     // current=10, floor=8.

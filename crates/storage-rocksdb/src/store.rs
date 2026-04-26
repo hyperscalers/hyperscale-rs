@@ -122,7 +122,7 @@ impl VersionedStore for RocksDbStorage {
 impl RocksDbStorage {
     /// Try to apply a prepared block commit with a single fsync.
     ///
-    /// This is the fast path for block commit. Applies the pre-built WriteBatch
+    /// This is the fast path for block commit. Applies the pre-built `WriteBatch`
     /// atomically with one fsync, including all JMT nodes from the snapshot.
     ///
     /// Returns `true` if successfully applied (fast path),
@@ -130,11 +130,11 @@ impl RocksDbStorage {
     /// (caller should fall back to slow path).
     ///
     /// # Panics
-    /// Only panics on unrecoverable errors (RocksDB write failure).
+    /// Only panics on unrecoverable errors (`RocksDB` write failure).
     pub(crate) fn try_apply_prepared_commit(
         &self,
         mut write_batch: WriteBatch,
-        jmt_snapshot: JmtSnapshot,
+        jmt_snapshot: &JmtSnapshot,
         block: &hyperscale_types::Block,
         qc: &hyperscale_types::QuorumCertificate,
         sync: bool,
@@ -169,7 +169,7 @@ impl RocksDbStorage {
         let new_version = jmt_snapshot.new_height.0;
         let new_root = jmt_snapshot.result_root;
 
-        self.append_jmt_to_batch(&mut write_batch, &jmt_snapshot, new_version);
+        self.append_jmt_to_batch(&mut write_batch, jmt_snapshot, new_version);
 
         // Fold consensus metadata into the same batch for crash-safe atomicity.
         Self::append_consensus_to_batch(&mut write_batch, block, qc);

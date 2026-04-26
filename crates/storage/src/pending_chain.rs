@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex, RwLock};
 ///
 /// Populated lazily on every overlay-miss read; captured at commit time
 /// and handed to `append_substate_writes_to_batch` so `capture_history`
-/// can source priors without a fresh `multi_get_cf` on StateCf. Entries
+/// can source priors without a fresh `multi_get_cf` on `StateCf`. Entries
 /// are `(partition_key, sort_key) → value-at-anchor`.
 pub type BaseReadCache = HashMap<(DbPartitionKey, DbSortKey), Option<Vec<u8>>>;
 
@@ -44,7 +44,7 @@ pub struct ChainEntry {
     pub jmt_snapshot: Arc<JmtSnapshot>,
 }
 
-/// Append-only index of pending block state, shared between the io_loop
+/// Append-only index of pending block state, shared between the `io_loop`
 /// and dispatch closures via `Arc`.
 ///
 /// **Anchored reads.** Reads happen through [`Self::view_at`], which
@@ -71,6 +71,10 @@ where
     }
 
     /// Append an entry.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal `RwLock` is poisoned.
     pub fn insert(&self, block_hash: BlockHash, entry: ChainEntry) {
         self.entries.write().unwrap().insert(block_hash, entry);
     }
@@ -78,6 +82,10 @@ where
     /// Drop all entries with `height ≤ committed_height`. Called on
     /// `BlockPersisted`. Also drops cache entries whose anchor is at or
     /// below the committed height — higher-anchor views remain valid.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal `RwLock` is poisoned.
     pub fn prune(&self, committed_height: BlockHeight) {
         self.entries
             .write()
@@ -86,11 +94,21 @@ where
     }
 
     /// Number of pending entries (for diagnostics / metrics).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal `RwLock` is poisoned.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.entries.read().unwrap().len()
     }
 
     /// Whether the chain has any pending entries.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal `RwLock` is poisoned.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.read().unwrap().is_empty()
     }
@@ -139,8 +157,7 @@ where
         // otherwise the base's committed tip (parent already persisted).
         let anchor_height = chain
             .last()
-            .map(|e| e.height)
-            .unwrap_or_else(|| self.base.jmt_height());
+            .map_or_else(|| self.base.jmt_height(), |e| e.height);
         SubstateView::from_chain(Arc::clone(&self.base), &chain, anchor_height)
     }
 }
@@ -191,7 +208,7 @@ pub struct SubstateView<S> {
     /// Lazy cache of base-storage reads observed through this view.
     /// Populated on every overlay-miss `get_raw_substate_by_db_key` call.
     /// Consumed at commit time by `take_base_reads` so `capture_history`
-    /// can skip a `multi_get_cf` on StateCf for keys execution already
+    /// can skip a `multi_get_cf` on `StateCf` for keys execution already
     /// read. Arc-shared with derived `ViewSnapshot`s so reads through
     /// either path populate the same cache.
     base_reads: Arc<Mutex<BaseReadCache>>,
@@ -201,6 +218,7 @@ impl<S> SubstateView<S> {
     /// Pending JMT snapshots from the anchored chain, in commit order.
     /// Pass to `prepare_block_commit` so chained verification can find
     /// tree nodes from prior unpersisted blocks.
+    #[must_use]
     pub fn pending_snapshots(&self) -> &[Arc<JmtSnapshot>] {
         &self.jmt_snapshots
     }
@@ -260,9 +278,14 @@ impl<S> SubstateView<S> {
     /// The returned map holds one entry per distinct `(partition_key,
     /// sort_key)` that was read from base (not overlay) during the view's
     /// lifetime — i.e. exactly the priors `capture_history` would
-    /// otherwise re-read from StateCf at commit time. Called by the
-    /// commit pipeline to skip the `multi_get_cf` on StateCf for keys
+    /// otherwise re-read from `StateCf` at commit time. Called by the
+    /// commit pipeline to skip the `multi_get_cf` on `StateCf` for keys
     /// already in the cache.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal `Mutex` is poisoned.
+    #[must_use]
     pub fn take_base_reads(&self) -> BaseReadCache {
         std::mem::take(&mut *self.base_reads.lock().unwrap())
     }
@@ -306,7 +329,7 @@ fn apply_database_updates(overlay: &mut OverlayEntries, updates: &DatabaseUpdate
 /// miss) is recorded there exactly once per key — the first observed
 /// value wins. The cache is handed to `capture_history` at commit time
 /// so priors for keys execution already read don't require a fresh
-/// `multi_get_cf` on StateCf.
+/// `multi_get_cf` on `StateCf`.
 fn overlay_get(
     overlay: &OverlayEntries,
     base: &dyn SubstateDatabase,
@@ -555,6 +578,7 @@ impl<S: SubstateStore + crate::VersionedStore> SubstateStore for SubstateView<S>
 impl<S: SubstateStore + jmt::TreeReader + Sync> SubstateView<S> {
     /// Generate merkle proofs, falling back to the JMT overlay for
     /// unpersisted block heights.
+    #[must_use]
     pub fn generate_merkle_proofs_overlay(
         &self,
         storage_keys: &[Vec<u8>],

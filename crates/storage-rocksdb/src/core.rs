@@ -1,6 +1,6 @@
-//! # RocksDB Storage
+//! # `RocksDB` Storage
 //!
-//! Production storage implementation using RocksDB.
+//! Production storage implementation using `RocksDB`.
 //!
 //! All operations are synchronous blocking I/O. Callers in async contexts
 //! should use `spawn_blocking` if needed to avoid blocking the runtime.
@@ -51,7 +51,7 @@ use tracing::{instrument, Level};
 ///
 /// JMT tree nodes are persisted in the `jmt_nodes` column family. JMT metadata
 /// (version and root hash) is in the default CF under `jmt:metadata` and read
-/// directly from RocksDB on demand — always hot in the memtable since they're
+/// directly from `RocksDB` on demand — always hot in the memtable since they're
 /// written on every commit.
 pub struct RocksDbStorage {
     pub(crate) db: Arc<DB>,
@@ -73,15 +73,23 @@ pub enum StorageError {
 }
 
 impl RocksDbStorage {
-    /// Open or create a RocksDB database at the given path.
+    /// Open or create a `RocksDB` database at the given path.
     ///
     /// Creates default column families: default, blocks, transactions, state, certificates.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if `RocksDB` fails to open the database.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, StorageError> {
         let config = RocksDbConfig::default();
         Self::open_with_config(path, config)
     }
 
     /// Open with custom configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if `RocksDB` fails to open the database.
     pub fn open_with_config<P: AsRef<Path>>(
         path: P,
         config: RocksDbConfig,
@@ -218,7 +226,7 @@ impl RocksDbStorage {
 
     /// Resolve all column family handles from the database.
     ///
-    /// This is cheap (HashMap lookups only, ~10ns per CF) and provides typed
+    /// This is cheap (`HashMap` lookups only, ~10ns per CF) and provides typed
     /// access to all column families without repeating
     /// `.cf_handle(NAME).expect(...)` at each call site.
     pub(crate) fn cf(&self) -> CfHandles<'_> {
@@ -235,7 +243,7 @@ impl RocksDbStorage {
         crate::typed_cf::get::<CF>(&*self.db, CF::handle(&self.cf()), key)
     }
 
-    /// Put a typed key/value into a WriteBatch.
+    /// Put a typed key/value into a `WriteBatch`.
     pub(crate) fn cf_put<CF: crate::typed_cf::TypedCf>(
         &self,
         batch: &mut WriteBatch,
@@ -245,7 +253,7 @@ impl RocksDbStorage {
         crate::typed_cf::batch_put::<CF>(batch, CF::handle(&self.cf()), key, value);
     }
 
-    /// Put a typed key/value into a WriteBatch, using pre-serialized bytes if available.
+    /// Put a typed key/value into a `WriteBatch`, using pre-serialized bytes if available.
     pub(crate) fn cf_put_raw<CF: crate::typed_cf::TypedCf>(
         &self,
         batch: &mut WriteBatch,
@@ -256,7 +264,7 @@ impl RocksDbStorage {
         crate::typed_cf::batch_put_raw::<CF>(batch, CF::handle(&self.cf()), key, value, raw_value);
     }
 
-    /// Batch get typed values (RocksDB multi_get_cf).
+    /// Batch get typed values (`RocksDB` `multi_get_cf`).
     pub(crate) fn cf_multi_get<CF: crate::typed_cf::TypedCf>(
         &self,
         keys: &[CF::Key],
@@ -264,7 +272,7 @@ impl RocksDbStorage {
         crate::typed_cf::multi_get::<CF>(&*self.db, CF::handle(&self.cf()), keys)
     }
 
-    /// Delete a typed key in a WriteBatch.
+    /// Delete a typed key in a `WriteBatch`.
     #[allow(dead_code)]
     pub(crate) fn cf_delete<CF: crate::typed_cf::TypedCf>(
         &self,
@@ -288,7 +296,7 @@ impl RocksDbStorage {
             .expect("BFT CRITICAL: write failed");
     }
 
-    /// Read JMT version and root hash directly from RocksDB.
+    /// Read JMT version and root hash directly from `RocksDB`.
     ///
     /// These are stored as a single 40-byte value under `jmt:metadata`:
     /// `[version_BE_8B][root_hash_32B]`. Always hot in the memtable since
@@ -297,7 +305,7 @@ impl RocksDbStorage {
         crate::metadata::read_jmt_metadata(&*self.db)
     }
 
-    /// Append JMT data from a snapshot to a WriteBatch.
+    /// Append JMT data from a snapshot to a `WriteBatch`.
     ///
     /// Writes JMT nodes, stale tree parts (for deferred GC), historical
     /// substate associations (if enabled), and JMT metadata (version + root hash).
@@ -342,7 +350,7 @@ impl RocksDbStorage {
         crate::metadata::write_jmt_metadata(batch, new_version, snapshot.result_root);
     }
 
-    /// Append consensus metadata (committed_height, committed_hash, committed_qc)
+    /// Append consensus metadata (`committed_height`, `committed_hash`, `committed_qc`)
     /// to a `WriteBatch` so it is persisted atomically with JMT + substate data.
     pub(crate) fn append_consensus_to_batch(
         batch: &mut WriteBatch,
@@ -392,7 +400,8 @@ impl RocksDbStorage {
     /// originating `SubstateView` during execution. Priors for keys
     /// already in the cache skip the fallback `multi_get_cf`; only keys
     /// NOT in the cache (typically blind writes that weren't preceded
-    /// by a read) require a StateCf lookup.
+    /// by a read) require a `StateCf` lookup.
+    #[allow(clippy::too_many_lines)] // single dispatch over read/write paths; splitting hurts locality
     pub(crate) fn append_substate_writes_to_batch(
         &self,
         batch: &mut WriteBatch,
@@ -413,6 +422,7 @@ impl RocksDbStorage {
         // Fast path: the view-cache (`base_reads`) already has it from
         // execution — zero extra reads. Slow path: collect keys with no
         // cache entry, batch-`multi_get_cf` them in one FFI call.
+        #[allow(clippy::items_after_statements)] // local enum is scoped to this function
         enum Op<'a> {
             Set {
                 state_key: (DbPartitionKey, DbSortKey),
@@ -631,8 +641,12 @@ impl RocksDbStorage {
     /// state-history entries, because genesis has no pre-state to
     /// preserve. Subsequent bootstrap calls read the accumulated state
     /// via `snapshot_at(0)`. After all genesis commits complete,
-    /// [`finalize_genesis_jmt`] computes the JMT once over the merged
-    /// updates — the substates are already in place by then.
+    /// [`Self::finalize_genesis_jmt`] computes the JMT once over the
+    /// merged updates — the substates are already in place by then.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the underlying `RocksDB` write fails.
     pub fn commit_substates_only(&self, updates: &DatabaseUpdates) {
         // Genesis writes at version 0. Repeat Sets to the same key
         // overwrite — idempotent by RocksDB write semantics. No history
@@ -656,6 +670,11 @@ impl RocksDbStorage {
     ///
     /// # Returns
     /// The genesis state root hash (JMT root at version 0).
+    ///
+    /// # Panics
+    ///
+    /// Panics if called after the JMT has already been initialized, or
+    /// if the underlying `RocksDB` write fails.
     pub fn finalize_genesis_jmt(&self, merged: &DatabaseUpdates) -> StateRoot {
         let _commit_guard = self.commit_lock.lock().unwrap();
 
@@ -674,7 +693,7 @@ impl RocksDbStorage {
             None,
             0,
             &[merged],
-            &Default::default(),
+            &std::collections::HashMap::new(),
         );
         let jmt_snapshot = JmtSnapshot::from_collected_writes(
             collected,
@@ -723,7 +742,10 @@ impl SubstateDatabase for RocksDbStorage {
 
         let span = tracing::Span::current();
         span.record("found", result.is_some());
-        span.record("latency_us", elapsed.as_micros() as u64);
+        span.record(
+            "latency_us",
+            u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX),
+        );
 
         result
     }
@@ -768,7 +790,15 @@ impl jmt::TreeReader for RocksDbStorage {
 #[cfg(test)]
 impl RocksDbStorage {
     /// Test helper: commits database updates with auto-incrementing JMT version.
-    /// Not used in production (use commit_block instead).
+    /// Not used in production (use `commit_block` instead).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if the underlying `RocksDB` write fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the commit lock is poisoned.
     #[instrument(level = Level::DEBUG, skip_all, fields(
         node_count = updates.node_updates.len(),
         latency_us = tracing::field::Empty,
@@ -824,7 +854,10 @@ impl RocksDbStorage {
 
         // Record span fields
         let span = tracing::Span::current();
-        span.record("latency_us", elapsed.as_micros() as u64);
+        span.record(
+            "latency_us",
+            u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX),
+        );
         tracing::debug!(new_version, "commit complete");
 
         Ok(())
@@ -835,6 +868,6 @@ impl RocksDbStorage {
 impl hyperscale_storage::CommittableSubstateDatabase for RocksDbStorage {
     fn commit(&mut self, updates: &DatabaseUpdates) {
         RocksDbStorage::commit(self, updates)
-            .expect("Storage commit failed - cannot maintain consistent state")
+            .expect("Storage commit failed - cannot maintain consistent state");
     }
 }

@@ -1,4 +1,4 @@
-//! State-history-based RocksDB snapshot.
+//! State-history-based `RocksDB` snapshot.
 //!
 //! Current-tip reads are a direct point lookup on `StateCf`. Historical
 //! reads at version V use a single forward seek on `StateHistoryCf` to
@@ -19,7 +19,7 @@ use std::collections::HashMap;
 /// Length of the version suffix on each state-history key (`u64` big-endian).
 const VERSION_LEN: usize = 8;
 
-/// Point-in-time RocksDB snapshot scoped to a specific version within
+/// Point-in-time `RocksDB` snapshot scoped to a specific version within
 /// the retention window. Retention enforcement happens at construction
 /// in `RocksDbStorage::snapshot_at`.
 pub struct RocksDbSnapshot<'a> {
@@ -34,7 +34,7 @@ pub struct RocksDbSnapshot<'a> {
 }
 
 impl RocksDbSnapshot<'_> {
-    /// Build a read_opts that pins this snapshot. Required so raw
+    /// Build a `read_opts` that pins this snapshot. Required so raw
     /// iterators observe our point-in-time view rather than the live DB.
     fn read_opts(&self) -> ReadOptions {
         let mut opts = ReadOptions::default();
@@ -44,7 +44,7 @@ impl RocksDbSnapshot<'_> {
 
     /// Shared 2-pass algorithm: list `(storage_key, value)` pairs for
     /// all keys under `prefix` at `self.version`. Returns live
-    /// (non-tombstoned) entries sorted by storage_key ascending.
+    /// (non-tombstoned) entries sorted by `storage_key` ascending.
     fn list_at_prefix(&self, prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
         let cf = CfHandles::resolve(self.db);
         let state_cf = StateCf::handle(&cf);
@@ -70,11 +70,10 @@ impl RocksDbSnapshot<'_> {
         // one that captured value-at-version.
         let mut history_iter = self.db.raw_iterator_cf_opt(history_cf, self.read_opts());
         history_iter.seek(prefix);
-        let value_codec: SborCodec<Option<Vec<u8>>> = Default::default();
+        let value_codec: SborCodec<Option<Vec<u8>>> = SborCodec::default();
         while history_iter.valid() {
-            let raw_key = match history_iter.key() {
-                Some(k) => k,
-                None => break,
+            let Some(raw_key) = history_iter.key() else {
+                break;
             };
             if !raw_key.starts_with(prefix) {
                 break;
@@ -118,7 +117,8 @@ impl RocksDbSnapshot<'_> {
     }
 
     /// Entity-scoped list used by cross-shard provisioning.
-    /// Decomposes each storage_key into `(partition_num, sort_key, value)`.
+    /// Decomposes each `storage_key` into `(partition_num, sort_key, value)`.
+    #[must_use]
     pub fn list_raw_values_for_node(&self, node_id: &NodeId) -> Vec<(u8, DbSortKey, Vec<u8>)> {
         let entity_key = substate_key::node_entity_key(node_id);
         let entity_len = entity_key.len();
@@ -176,7 +176,7 @@ impl SubstateDatabase for RocksDbSnapshot<'_> {
                 if raw_key.len() == storage_key_bytes.len() + VERSION_LEN
                     && &raw_key[..storage_key_bytes.len()] == storage_key_bytes.as_slice()
                 {
-                    let value_codec: SborCodec<Option<Vec<u8>>> = Default::default();
+                    let value_codec: SborCodec<Option<Vec<u8>>> = SborCodec::default();
                     return value_codec.decode(iter.value().unwrap_or_default());
                 }
             }

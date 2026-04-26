@@ -1,7 +1,7 @@
 //! Storage traits and shared types.
 //!
 //! This crate defines the storage abstraction used by runners to persist Radix state,
-//! along with shared types and utilities that both in-memory and RocksDB storage
+//! along with shared types and utilities that both in-memory and `RocksDB` storage
 //! implementations need.
 //!
 //! # Design
@@ -12,13 +12,13 @@
 //!
 //! Runners own storage and pass it to the executor:
 //! - `SimulationRunner` uses in-memory storage (`SimStorage`)
-//! - `ProductionRunner` uses RocksDB (`RocksDbStorage`)
+//! - `ProductionRunner` uses `RocksDB` (`RocksDbStorage`)
 //!
 //! # Jellyfish Merkle Tree (JMT)
 //!
 //! The `tree` module provides the binary Blake3 JMT state tree adapter.
 //! Storage backends implement `jmt::TreeReader` to provide tree access —
-//! both RocksDB and SimStorage hook into the same trait.
+//! both `RocksDB` and `SimStorage` hook into the same trait.
 
 #![warn(missing_docs)]
 
@@ -48,8 +48,9 @@ pub use writes::{
     merge_updates_from_receipts,
 };
 
-/// An empty SubstateDatabase for use in tests and single-shard contexts
+/// An empty `SubstateDatabase` for use in tests and single-shard contexts
 /// where no storage reads are needed.
+#[must_use]
 pub fn empty_substate_database() -> impl SubstateDatabase {
     struct Empty;
     impl SubstateDatabase for Empty {

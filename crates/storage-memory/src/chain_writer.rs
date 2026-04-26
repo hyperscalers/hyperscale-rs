@@ -7,7 +7,7 @@ use hyperscale_storage::{ChainWriter, DatabaseUpdates, JmtSnapshot};
 use hyperscale_types::{BlockHeight, CertifiedBlock, ReceiptBundle, StateRoot};
 use std::sync::Arc;
 
-/// Precomputed commit work for a SimStorage block commit.
+/// Precomputed commit work for a `SimStorage` block commit.
 ///
 /// Contains a `JmtSnapshot` (precomputed merkle tree nodes) plus the
 /// merged updates and receipts for substate application at commit time.
@@ -55,7 +55,7 @@ impl ChainWriter for SimStorage {
             drop(s);
             let prepared = SimPreparedCommit {
                 snapshot,
-                merged_updates: Default::default(),
+                merged_updates: DatabaseUpdates::default(),
                 receipts: vec![],
             };
             return (parent_state_root, prepared);
@@ -80,7 +80,7 @@ impl ChainWriter for SimStorage {
                 parent_version,
                 block_height.0,
                 &per_receipt_updates,
-                &Default::default(),
+                &std::collections::HashMap::new(),
             )
         } else {
             let overlay =
@@ -90,7 +90,7 @@ impl ChainWriter for SimStorage {
                 parent_version,
                 block_height.0,
                 &per_receipt_updates,
-                &Default::default(),
+                &std::collections::HashMap::new(),
             )
         };
 
@@ -144,7 +144,7 @@ impl ChainWriter for SimStorage {
                 }
 
                 let mut c = self.consensus.write().unwrap();
-                for tx in block.transactions().iter() {
+                for tx in block.transactions() {
                     c.transactions.insert(tx.hash(), tx.as_ref().clone());
                 }
                 c.blocks.insert(
@@ -204,7 +204,7 @@ impl ChainWriter for SimStorage {
 }
 
 impl SimStorage {
-    /// Internal commit path used by `commit_block` (sync blocks without a PreparedCommit).
+    /// Internal commit path used by `commit_block` (sync blocks without a `PreparedCommit`).
     fn commit_block_inner(
         &self,
         merged_updates: &DatabaseUpdates,
@@ -242,7 +242,7 @@ impl SimStorage {
             parent_version,
             block_height.0,
             &[merged_updates],
-            &Default::default(),
+            &std::collections::HashMap::new(),
         );
 
         for (key, node) in &collected.nodes {
@@ -261,7 +261,7 @@ impl SimStorage {
         // Store block + certificate + consensus state atomically.
         {
             let mut c = self.consensus.write().unwrap();
-            for tx in block.transactions().iter() {
+            for tx in block.transactions() {
                 c.transactions.insert(tx.hash(), tx.as_ref().clone());
             }
             c.blocks.insert(

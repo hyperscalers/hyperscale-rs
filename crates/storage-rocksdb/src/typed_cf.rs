@@ -1,4 +1,4 @@
-//! Typed column family API — compile-time key/value type safety for RocksDB operations.
+//! Typed column family API — compile-time key/value type safety for `RocksDB` operations.
 //!
 //! Each column family is a zero-sized struct implementing [`TypedCf`], which declares
 //! the key type, value type, and their encodings. The [`DbCodec`] trait abstracts
@@ -10,7 +10,7 @@ use std::marker::PhantomData;
 
 // ─── Codec trait ──────────────────────────────────────────────────────────────
 
-/// Codec for encoding/decoding typed values to/from RocksDB byte representations.
+/// Codec for encoding/decoding typed values to/from `RocksDB` byte representations.
 pub(crate) trait DbCodec<T> {
     fn encode_to(&self, value: &T, buf: &mut Vec<u8>);
     fn decode(&self, bytes: &[u8]) -> T;
@@ -50,7 +50,7 @@ where
 }
 
 /// Big-endian u64 codec for heights, versions, etc.
-/// Preserves lexicographic ordering in RocksDB.
+/// Preserves lexicographic ordering in `RocksDB`.
 #[derive(Default)]
 pub(crate) struct BeU64Codec;
 
@@ -117,7 +117,7 @@ impl DbCodec<crate::jmt_stored::StoredNodeKey> for JmtKeyCodec {
 /// codecs. This is the single source of truth for "what lives in this CF and
 /// how it's encoded."
 pub(crate) trait TypedCf {
-    /// CF name — must match the string used in RocksDbConfig.
+    /// CF name — must match the string used in `RocksDbConfig`.
     /// Not read at runtime by typed helpers (they use [`handle`](Self::handle)),
     /// but serves as documentation and is used by `ALL_COLUMN_FAMILIES`.
     #[allow(dead_code)]
@@ -142,7 +142,7 @@ pub(crate) trait TypedCf {
 
 // ─── ReadableStore trait ─────────────────────────────────────────────────────
 
-/// Abstraction over RocksDB `DB` and `Snapshot` for typed reads.
+/// Abstraction over `RocksDB` `DB` and `Snapshot` for typed reads.
 ///
 /// Both `DB` and `Snapshot` support the same `get_cf` / `multi_get_cf` operations
 /// but don't share a trait in the `rocksdb` crate. This trait bridges that gap
@@ -224,7 +224,7 @@ pub(crate) fn multi_get<CF: TypedCf>(
         .collect()
 }
 
-/// Typed put into a WriteBatch.
+/// Typed put into a `WriteBatch`.
 pub(crate) fn batch_put<CF: TypedCf>(
     batch: &mut WriteBatch,
     cf: &ColumnFamily,
@@ -236,7 +236,7 @@ pub(crate) fn batch_put<CF: TypedCf>(
     batch.put_cf(cf, &key_bytes, &value_bytes);
 }
 
-/// Typed put into a WriteBatch, using pre-serialized value bytes if available.
+/// Typed put into a `WriteBatch`, using pre-serialized value bytes if available.
 pub(crate) fn batch_put_raw<CF: TypedCf>(
     batch: &mut WriteBatch,
     cf: &ColumnFamily,
@@ -245,16 +245,15 @@ pub(crate) fn batch_put_raw<CF: TypedCf>(
     raw_value: Option<&[u8]>,
 ) {
     let key_bytes = CF::KeyCodec::default().encode(key);
-    match raw_value {
-        Some(bytes) => batch.put_cf(cf, &key_bytes, bytes),
-        None => {
-            let value_bytes = CF::ValueCodec::default().encode(value);
-            batch.put_cf(cf, &key_bytes, &value_bytes);
-        }
+    if let Some(bytes) = raw_value {
+        batch.put_cf(cf, &key_bytes, bytes);
+    } else {
+        let value_bytes = CF::ValueCodec::default().encode(value);
+        batch.put_cf(cf, &key_bytes, &value_bytes);
     }
 }
 
-/// Typed delete in a WriteBatch.
+/// Typed delete in a `WriteBatch`.
 pub(crate) fn batch_delete<CF: TypedCf>(batch: &mut WriteBatch, cf: &ColumnFamily, key: &CF::Key) {
     let key_bytes = CF::KeyCodec::default().encode(key);
     batch.delete_cf(cf, &key_bytes);
@@ -283,7 +282,7 @@ pub(crate) fn iter_all<'a, CF: TypedCf>(
 ///
 /// Seeks to `prefix` and yields decoded entries until the key leaves the
 /// prefix range. The end bound is computed by incrementing the last byte
-/// of the prefix (standard RocksDB prefix scan pattern).
+/// of the prefix (standard `RocksDB` prefix scan pattern).
 pub(crate) fn prefix_iter<'a, CF: TypedCf>(
     db: &'a rocksdb::DB,
     cf: &ColumnFamily,
@@ -308,7 +307,7 @@ pub(crate) fn prefix_iter_from<'a, CF: TypedCf>(
     bounded_iter_to_typed::<CF>(iter, end)
 }
 
-/// Typed prefix-scan iterator over a RocksDB snapshot.
+/// Typed prefix-scan iterator over a `RocksDB` snapshot.
 ///
 /// Same as [`prefix_iter`] but reads from a point-in-time snapshot.
 pub(crate) fn prefix_iter_snap<'a, CF: TypedCf>(
@@ -319,7 +318,7 @@ pub(crate) fn prefix_iter_snap<'a, CF: TypedCf>(
     prefix_iter_from_snap::<CF>(snapshot, cf, prefix, prefix)
 }
 
-/// Typed prefix-scan iterator over a RocksDB snapshot with custom seek position.
+/// Typed prefix-scan iterator over a `RocksDB` snapshot with custom seek position.
 pub(crate) fn prefix_iter_from_snap<'a, CF: TypedCf>(
     snapshot: &'a rocksdb::Snapshot<'_>,
     cf: &ColumnFamily,
@@ -334,9 +333,9 @@ pub(crate) fn prefix_iter_from_snap<'a, CF: TypedCf>(
 
 /// Convert a raw iterator (already seeked) into a typed iterator that yields
 /// all remaining entries.
-fn raw_iter_to_typed<'a, CF: TypedCf>(
-    mut iter: rocksdb::DBRawIteratorWithThreadMode<'a, rocksdb::DB>,
-) -> impl Iterator<Item = (CF::Key, CF::Value)> + 'a {
+fn raw_iter_to_typed<CF: TypedCf>(
+    mut iter: rocksdb::DBRawIteratorWithThreadMode<'_, rocksdb::DB>,
+) -> impl Iterator<Item = (CF::Key, CF::Value)> + '_ {
     let key_codec = CF::KeyCodec::default();
     let value_codec = CF::ValueCodec::default();
     let mut done = false;
@@ -362,10 +361,10 @@ fn raw_iter_to_typed<'a, CF: TypedCf>(
 
 /// Convert a raw iterator (already seeked) into a typed iterator bounded by
 /// an exclusive end key. `None` end means unbounded (iterate to end).
-fn bounded_iter_to_typed<'a, CF: TypedCf>(
-    mut iter: rocksdb::DBRawIteratorWithThreadMode<'a, rocksdb::DB>,
+fn bounded_iter_to_typed<CF: TypedCf>(
+    mut iter: rocksdb::DBRawIteratorWithThreadMode<'_, rocksdb::DB>,
     end: Option<Vec<u8>>,
-) -> impl Iterator<Item = (CF::Key, CF::Value)> + 'a {
+) -> impl Iterator<Item = (CF::Key, CF::Value)> + '_ {
     let key_codec = CF::KeyCodec::default();
     let value_codec = CF::ValueCodec::default();
     let mut done = false;
@@ -439,7 +438,7 @@ pub(crate) fn meta_read<E: MetadataEntry>(store: &impl ReadableStore) -> Option<
         .map(|bytes| E::Codec::default().decode(&bytes))
 }
 
-/// Write a metadata entry into a WriteBatch.
+/// Write a metadata entry into a `WriteBatch`.
 pub(crate) fn meta_write<E: MetadataEntry>(batch: &mut WriteBatch, value: &E::Value) {
     let encoded = E::Codec::default().encode(value);
     batch.put(E::KEY, encoded);
@@ -447,7 +446,7 @@ pub(crate) fn meta_write<E: MetadataEntry>(batch: &mut WriteBatch, value: &E::Va
 
 // ─── Metadata codecs ─────────────────────────────────────────────────────────
 
-/// BlockHeight codec — wraps BE u64, maps through `BlockHeight(u64)`.
+/// `BlockHeight` codec — wraps BE u64, maps through `BlockHeight(u64)`.
 #[derive(Default)]
 pub(crate) struct BlockHeightCodec;
 

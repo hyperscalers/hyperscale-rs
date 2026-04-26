@@ -35,6 +35,7 @@ impl<'a, S> GenesisWrapper<'a, S> {
     }
 
     /// Consume the wrapper and return the merged updates.
+    #[must_use]
     pub fn into_merged(self) -> DatabaseUpdates {
         self.merged
     }

@@ -66,11 +66,11 @@ mod tests {
         let version = 42u64;
 
         let encoded = VersionedSubstateKeyCodec.encode(&(substate_key.clone(), version));
-        let ((decoded_pk, decoded_sk), decoded_version) =
+        let ((decoded_pk, decoded_sort), decoded_version) =
             VersionedSubstateKeyCodec.decode(&encoded);
 
         assert_eq!(decoded_pk.partition_num, 1);
-        assert_eq!(decoded_sk.0, b"sort_key");
+        assert_eq!(decoded_sort.0, b"sort_key");
         assert_eq!(decoded_version, version);
     }
 

@@ -1,4 +1,4 @@
-//! Receipt storage for RocksDB.
+//! Receipt storage for `RocksDB`.
 
 use crate::column_families::{ExecutionOutputsCf, LocalReceiptsCf};
 use crate::core::RocksDbStorage;
@@ -10,6 +10,10 @@ use std::sync::Arc;
 
 impl RocksDbStorage {
     /// Store a receipt bundle (local receipt + optional execution output).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the underlying `RocksDB` write fails.
     pub fn store_receipt_bundle(&self, bundle: &hyperscale_types::ReceiptBundle) {
         let mut batch = WriteBatch::default();
         self.add_receipt_bundle_to_batch(&mut batch, bundle);
@@ -18,7 +22,11 @@ impl RocksDbStorage {
             .expect("failed to persist receipt bundle");
     }
 
-    /// Store multiple receipt bundles in a single atomic WriteBatch.
+    /// Store multiple receipt bundles in a single atomic `WriteBatch`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the underlying `RocksDB` write fails.
     pub fn store_receipt_bundles(&self, bundles: &[hyperscale_types::ReceiptBundle]) {
         if bundles.is_empty() {
             return;
@@ -37,7 +45,7 @@ impl RocksDbStorage {
             .expect("failed to persist receipt bundles");
     }
 
-    /// Add a single receipt bundle's writes to an existing WriteBatch.
+    /// Add a single receipt bundle's writes to an existing `WriteBatch`.
     pub(crate) fn add_receipt_bundle_to_batch(
         &self,
         batch: &mut WriteBatch,

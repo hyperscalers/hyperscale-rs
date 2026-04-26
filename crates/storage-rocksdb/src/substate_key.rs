@@ -1,4 +1,4 @@
-//! Substate key encoding for RocksDB.
+//! Substate key encoding for `RocksDB`.
 //!
 //! Constructs the composite byte keys used in the `state` and
 //! `state_history` column families. These are RocksDB-specific — the
@@ -6,9 +6,9 @@
 //!
 //! Key layout: `[node_key (50B)][partition_num (1B)][sort_key (var)]`
 //!
-//! The `node_key` is a SpreadPrefixKeyMapper-encoded NodeId (hash prefix + NodeId),
-//! ensuring even distribution across RocksDB's key space. The partition_num and
-//! sort_key are appended directly, preserving lexicographic ordering for prefix scans.
+//! The `node_key` is a SpreadPrefixKeyMapper-encoded `NodeId` (hash prefix + `NodeId`),
+//! ensuring even distribution across `RocksDB`'s key space. The `partition_num` and
+//! `sort_key` are appended directly, preserving lexicographic ordering for prefix scans.
 
 use crate::typed_cf::DbCodec;
 use radix_substate_store_interface::db_key_mapper::DatabaseKeyMapper;
@@ -46,7 +46,7 @@ pub(crate) fn partition_prefix(partition_key: &DbPartitionKey) -> Vec<u8> {
     prefix
 }
 
-/// Build the full storage-key prefix for a specific (partition, sort_key).
+/// Build the full storage-key prefix for a specific (partition, `sort_key`).
 /// Used by the versioned substates CF to scan the version history of a
 /// single substate (the per-substate key suffix is an 8-byte big-endian
 /// version appended by the versioned CF's codec).
@@ -58,9 +58,9 @@ pub(crate) fn substate_prefix(partition_key: &DbPartitionKey, sort_key: &DbSortK
     prefix
 }
 
-/// Build the storage key prefix for a given NodeId (for node-level iteration).
+/// Build the storage key prefix for a given `NodeId` (for node-level iteration).
 ///
-/// This is the hash-spread 50-byte representation of the NodeId (same as
+/// This is the hash-spread 50-byte representation of the `NodeId` (same as
 /// `node_entity_key` — the entity prefix IS the node prefix).
 pub(crate) fn node_prefix(node_id: &hyperscale_types::NodeId) -> Vec<u8> {
     let radix_node_id = radix_common::types::NodeId(node_id.0);
@@ -69,12 +69,12 @@ pub(crate) fn node_prefix(node_id: &hyperscale_types::NodeId) -> Vec<u8> {
     )
 }
 
-/// Get the entity key (db_node_key) for a NodeId. Same as `node_prefix`.
+/// Get the entity key (`db_node_key`) for a `NodeId`. Same as `node_prefix`.
 pub(crate) fn node_entity_key(node_id: &hyperscale_types::NodeId) -> Vec<u8> {
     node_prefix(node_id)
 }
 
-/// Entity key length in storage keys: 20 bytes hash prefix + 30 bytes NodeId.
+/// Entity key length in storage keys: 20 bytes hash prefix + 30 bytes `NodeId`.
 const ENTITY_KEY_LEN: usize = 50;
 
 /// Decompose a storage key into its three components.

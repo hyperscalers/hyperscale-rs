@@ -1,8 +1,9 @@
-//! Crash recovery for RocksDB storage.
+//! Crash recovery for `RocksDB` storage.
 
 use crate::core::RocksDbStorage;
 
 use hyperscale_metrics as metrics;
+use hyperscale_storage::SubstateStore;
 use hyperscale_types::{BlockHash, BlockHeight};
 
 impl RocksDbStorage {
@@ -21,7 +22,6 @@ impl RocksDbStorage {
         // Note: We always include JMT state, even at height 0, because genesis bootstrap
         // populates the JMT with initial Radix state at height 0 but with a non-zero root.
         // The height 0 case is handled correctly by the state machine.
-        use hyperscale_storage::SubstateStore;
         let jmt_block_height = self.jmt_height();
         let jmt_root = self.state_root();
         let jmt_root_opt = Some(jmt_root);

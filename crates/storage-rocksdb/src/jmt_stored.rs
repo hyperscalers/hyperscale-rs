@@ -2,11 +2,16 @@
 //!
 //! The `hyperscale-jmt` crate keeps its own types ecosystem-neutral (no
 //! serde, no SBOR). This module provides `Stored*` mirrors that derive
-//! SBOR and convert both ways, plus a RocksDB-key encoding tuned for
+//! SBOR and convert both ways, plus a `RocksDB`-key encoding tuned for
 //! LSM-friendly sort order (version-first).
 //!
 //! Tree arity is fixed at binary for this backend. Switching arities
 //! later would be a data migration.
+
+// Mirror types and their constructors/accessors are self-documenting:
+// fields name the JMT concept (version, path_bytes, hash, value_hash);
+// methods (`from_jmt`/`to_jmt`/`version()`/`path_bits()`) say what they do.
+#![allow(missing_docs)]
 
 use hyperscale_jmt as jmt;
 use sbor::prelude::*;
@@ -36,6 +41,7 @@ pub struct StoredNodeKey {
 }
 
 impl StoredNodeKey {
+    #[must_use]
     pub fn from_jmt(key: &jmt::NodeKey) -> Self {
         Self {
             version: key.version,
@@ -44,6 +50,10 @@ impl StoredNodeKey {
         }
     }
 
+    /// # Errors
+    ///
+    /// Returns [`jmt::PathDecodeError`] if `path_bits` and `path_bytes`
+    /// disagree (e.g. corrupted storage).
     pub fn to_jmt(&self) -> Result<jmt::NodeKey, jmt::PathDecodeError> {
         let mut encoded = Vec::with_capacity(8 + 2 + self.path_bytes.len());
         encoded.extend_from_slice(&self.version.to_be_bytes());
@@ -52,24 +62,28 @@ impl StoredNodeKey {
         jmt::NodeKey::decode(&encoded)
     }
 
+    #[must_use]
     pub fn version(&self) -> Version {
         self.version
     }
 
+    #[must_use]
     pub fn path_bits(&self) -> u16 {
         self.path_bits
     }
 
+    #[must_use]
     pub fn path_bytes(&self) -> &[u8] {
         &self.path_bytes
     }
 }
 
-/// Encode for RocksDB key storage.
+/// Encode for `RocksDB` key storage.
 ///
 /// Format: `version_be (8B) || path_bits_be (2B) || path_bytes`.
 /// Version-first ordering groups same-version writes together, which is
 /// friendly for LSM compaction and range deletes during pruning.
+#[must_use]
 pub fn encode_key(key: &StoredNodeKey) -> Vec<u8> {
     let mut buf = Vec::with_capacity(8 + 2 + key.path_bytes.len());
     buf.extend_from_slice(&key.version.to_be_bytes());
@@ -90,10 +104,12 @@ pub enum VersionedStoredNode {
 }
 
 impl VersionedStoredNode {
+    #[must_use]
     pub fn from_latest(node: StoredNode) -> Self {
         Self::V1(node)
     }
 
+    #[must_use]
     pub fn into_latest(self) -> StoredNode {
         match self {
             Self::V1(n) => n,
@@ -152,6 +168,7 @@ pub enum StaleTreePart {
 // ============================================================
 
 impl StoredNode {
+    #[must_use]
     pub fn from_jmt(node: &jmt::Node) -> Self {
         match node {
             jmt::Node::Internal(internal) => {
@@ -161,7 +178,8 @@ impl StoredNode {
                     .enumerate()
                     .filter_map(|(bucket, child_opt)| {
                         child_opt.as_ref().map(|c| StoredChildEntry {
-                            bucket: bucket as u8,
+                            // bucket index is bounded by BACKEND_ARITY (= 2 today, ≤ 256 forever).
+                            bucket: u8::try_from(bucket).unwrap_or(u8::MAX),
                             version: c.version,
                             hash: c.hash.to_vec(),
                             is_leaf: matches!(c.kind, jmt::ChildKind::Leaf),
@@ -180,9 +198,14 @@ impl StoredNode {
         }
     }
 
-    /// Convert back to a `jmt::Node`. Panics if stored hash or key bytes
-    /// are the wrong length — that indicates storage corruption and is
-    /// not recoverable.
+    /// Convert back to a `jmt::Node`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the stored hash or key bytes are the wrong length, or
+    /// if a stored child bucket exceeds the backend arity. All three
+    /// indicate storage corruption and are not recoverable.
+    #[must_use]
     pub fn to_jmt(&self) -> jmt::Node {
         match self {
             StoredNode::Internal(internal) => {
@@ -194,12 +217,10 @@ impl StoredNode {
                         jmt::ChildKind::Internal
                     };
                     let bucket = entry.bucket as usize;
-                    if bucket >= BACKEND_ARITY {
-                        panic!(
-                            "stored child bucket {} exceeds backend arity {}",
-                            bucket, BACKEND_ARITY
-                        );
-                    }
+                    assert!(
+                        bucket < BACKEND_ARITY,
+                        "stored child bucket {bucket} exceeds backend arity {BACKEND_ARITY}"
+                    );
                     dense[bucket] = Some(jmt::Child {
                         version: entry.version,
                         hash: hash_from_bytes(&entry.hash),
@@ -221,18 +242,22 @@ impl StoredNode {
 
 fn hash_from_bytes(bytes: &[u8]) -> jmt::Hash {
     let mut out = [0u8; 32];
-    if bytes.len() != 32 {
-        panic!("stored hash must be 32 bytes, got {}", bytes.len());
-    }
+    assert!(
+        bytes.len() == 32,
+        "stored hash must be 32 bytes, got {}",
+        bytes.len()
+    );
     out.copy_from_slice(bytes);
     out
 }
 
 fn key_from_bytes(bytes: &[u8]) -> jmt::Key {
     let mut out = [0u8; 32];
-    if bytes.len() != 32 {
-        panic!("stored key must be 32 bytes, got {}", bytes.len());
-    }
+    assert!(
+        bytes.len() == 32,
+        "stored key must be 32 bytes, got {}",
+        bytes.len()
+    );
     out.copy_from_slice(bytes);
     out
 }

@@ -24,8 +24,8 @@ use std::sync::Arc;
 pub trait ChainWriter: Send + Sync + 'static {
     /// Opaque handle carrying precomputed commit work.
     ///
-    /// For RocksDB this contains a `WriteBatch` + `JmtSnapshot`.
-    /// For SimStorage this contains a `JmtSnapshot` + pre-applied state.
+    /// For `RocksDB` this contains a `WriteBatch` + `JmtSnapshot`.
+    /// For `SimStorage` this contains a `JmtSnapshot` + pre-applied state.
     type PreparedCommit: Send + 'static;
 
     /// Compute speculative state root and return precomputed commit work.
@@ -47,10 +47,10 @@ pub trait ChainWriter: Send + Sync + 'static {
     ///
     /// `base_reads` is an optional cache of reads observed through the
     /// originating `SubstateView` during execution. When provided, it
-    /// lets the commit path skip a `multi_get_cf` on StateCf for keys
+    /// lets the commit path skip a `multi_get_cf` on `StateCf` for keys
     /// already read — a large fraction at high TPS. Callers without a
     /// view (e.g. sync / tests) pass `None`; implementations fall back
-    /// to reading StateCf for any key missing from the cache.
+    /// to reading `StateCf` for any key missing from the cache.
     ///
     /// Returns `(computed_state_root, prepared_commit_handle)`.
     fn prepare_block_commit(
@@ -97,7 +97,7 @@ pub trait ChainWriter: Send + Sync + 'static {
 
     /// Memory usage of storage caches in bytes: `(block_cache, memtable)`.
     ///
-    /// Returns `(0, 0)` by default. Overridden by RocksDB to report actual usage.
+    /// Returns `(0, 0)` by default. Overridden by `RocksDB` to report actual usage.
     fn memory_usage_bytes(&self) -> (u64, u64) {
         (0, 0)
     }

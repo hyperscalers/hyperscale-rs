@@ -23,6 +23,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 /// Build a `DatabaseUpdates` containing a single `Set` operation.
+#[must_use]
 pub fn make_database_update(
     node_key: Vec<u8>,
     partition: u8,
@@ -48,10 +49,11 @@ pub fn make_database_update(
     updates
 }
 
-/// Build `DatabaseUpdates` from a logical node seed, using SpreadPrefixKeyMapper
-/// to compute the correct db_node_key — matching the storage format used in production.
+/// Build `DatabaseUpdates` from a logical node seed, using `SpreadPrefixKeyMapper`
+/// to compute the correct `db_node_key` — matching the storage format used in production.
 ///
 /// The `NodeId` is `[node_seed; 30]`, consistent with other test helpers.
+#[must_use]
 pub fn make_mapped_database_update(
     node_seed: u8,
     partition: u8,
@@ -79,6 +81,7 @@ pub fn make_mapped_database_update(
 }
 
 /// Build a test `WaveCertificate` at the given height.
+#[must_use]
 pub fn make_test_wave_certificate(height: BlockHeight, shard: ShardGroupId) -> WaveCertificate {
     WaveCertificate {
         wave_id: WaveId::new(shard, height, BTreeSet::new()),
@@ -87,6 +90,7 @@ pub fn make_test_wave_certificate(height: BlockHeight, shard: ShardGroupId) -> W
 }
 
 /// Build a minimal `Block` at the given height.
+#[must_use]
 pub fn make_test_block(height: BlockHeight) -> Block {
     // Use the full u64 bytes for the parent hash so heights > 255 don't alias.
     let mut parent_bytes = [0u8; 32];
@@ -117,6 +121,7 @@ pub fn make_test_block(height: BlockHeight) -> Block {
 }
 
 /// Build a `QuorumCertificate` that references the given block.
+#[must_use]
 pub fn make_test_qc(block: &Block) -> QuorumCertificate {
     QuorumCertificate {
         block_hash: block.hash(),
@@ -131,6 +136,7 @@ pub fn make_test_qc(block: &Block) -> QuorumCertificate {
 }
 
 /// Build a `ReceiptBundle` with both local receipt and execution output.
+#[must_use]
 pub fn make_test_receipt_bundle(seed: u8) -> ReceiptBundle {
     let tx_hash = TxHash::from_raw(Hash::from_bytes(&[seed; 32]));
     let local_receipt = Arc::new(LocalReceipt {
@@ -164,6 +170,7 @@ pub fn make_test_receipt_bundle(seed: u8) -> ReceiptBundle {
 
 /// Build a test `ExecutionCertificate` at the given block height with a
 /// deterministic outcome derived from `seed`.
+#[must_use]
 pub fn make_test_execution_certificate(
     seed: u8,
     block_height: BlockHeight,
@@ -238,6 +245,10 @@ fn commit_empty_blocks_up_to(storage: &(impl ChainReader + ChainWriter), target:
 }
 
 /// Shared EC roundtrip test: commit block with ECs → get by height.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
 pub fn test_ec_storage_roundtrip(storage: &(impl ChainReader + ChainWriter)) {
     let ec = make_test_execution_certificate(1, BlockHeight(10));
     let canonical_hash = ec.canonical_hash();
@@ -265,6 +276,10 @@ pub fn test_ec_storage_roundtrip(storage: &(impl ChainReader + ChainWriter)) {
 }
 
 /// Shared EC batch test: multiple ECs at same and different heights.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
 pub fn test_ec_storage_batch(storage: &(impl ChainReader + ChainWriter)) {
     let ec1 = make_test_execution_certificate(1, BlockHeight(10));
     let ec2 = make_test_execution_certificate(2, BlockHeight(10));

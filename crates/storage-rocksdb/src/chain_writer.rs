@@ -10,7 +10,7 @@ use radix_substate_store_interface::interface::DatabaseUpdates;
 use rocksdb::WriteBatch;
 use std::sync::Arc;
 
-/// Precomputed commit work for a RocksDB block commit.
+/// Precomputed commit work for a `RocksDB` block commit.
 ///
 /// Contains a pre-built `WriteBatch` (substate + receipt writes) and a
 /// `JmtSnapshot` (precomputed Merkle tree nodes).
@@ -84,7 +84,7 @@ impl hyperscale_storage::ChainWriter for RocksDbStorage {
                 parent_version,
                 block_height.0,
                 &per_receipt_updates,
-                &Default::default(),
+                &std::collections::HashMap::new(),
             )
         } else {
             let overlay = hyperscale_storage::tree::OverlayTreeReader::new(
@@ -96,7 +96,7 @@ impl hyperscale_storage::ChainWriter for RocksDbStorage {
                 parent_version,
                 block_height.0,
                 &per_receipt_updates,
-                &Default::default(),
+                &std::collections::HashMap::new(),
             )
         };
 
@@ -162,7 +162,7 @@ impl hyperscale_storage::ChainWriter for RocksDbStorage {
             let sync = i == total - 1;
             let applied = self.try_apply_prepared_commit(
                 write_batch,
-                prepared.jmt_snapshot,
+                &prepared.jmt_snapshot,
                 &block,
                 &qc,
                 sync,
@@ -244,7 +244,7 @@ impl hyperscale_storage::ChainWriter for RocksDbStorage {
 }
 
 impl RocksDbStorage {
-    /// Internal commit path used by `commit_block` (sync blocks without a PreparedCommit).
+    /// Internal commit path used by `commit_block` (sync blocks without a `PreparedCommit`).
     fn commit_block_inner(
         &self,
         merged_updates: &DatabaseUpdates,
@@ -260,8 +260,7 @@ impl RocksDbStorage {
 
         assert!(
             block_height == base_version + 1 || (block_height == 0 && base_version == 0),
-            "commit_block: block_height ({block_height}) must be exactly current_version + 1 ({})",
-            base_version
+            "commit_block: block_height ({block_height}) must be exactly current_version + 1 ({base_version})"
         );
 
         // Sync path has no view → no base-read cache → fall through to

@@ -1,4 +1,4 @@
-//! Garbage collection for RocksDB storage.
+//! Garbage collection for `RocksDB` storage.
 //!
 //! Two independent GC passes:
 //! - **JMT GC**: deletes stale tree nodes older than `jmt_history_length`.
@@ -135,7 +135,7 @@ impl RocksDbStorage {
     ///
     /// Runs without `commit_lock`. Safe because concurrent readers hold
     /// a `rocksdb::Snapshot` whose sequence number predates any GC
-    /// delete-tombstones issued afterwards: RocksDB compaction preserves
+    /// delete-tombstones issued afterwards: `RocksDB` compaction preserves
     /// SSTs referenced by live snapshots, so readers see pre-delete
     /// values regardless of GC progress. This isolation is load-bearing.
     ///
@@ -143,6 +143,8 @@ impl RocksDbStorage {
     ///
     /// The number of entries deleted.
     pub fn run_state_history_gc(&self) -> usize {
+        const BATCH_FLUSH_THRESHOLD: usize = 10_000;
+
         let start = std::time::Instant::now();
 
         let (current_version, _) = self.read_jmt_metadata();
@@ -166,8 +168,6 @@ impl RocksDbStorage {
         let mut deleted = 0;
         let mut lowest_deleted_key: Option<Vec<u8>> = None;
         let mut highest_deleted_key: Option<Vec<u8>> = None;
-
-        const BATCH_FLUSH_THRESHOLD: usize = 10_000;
 
         for (version, history_keys) in
             typed_cf::iter_all::<StaleStateHistoryCf>(&self.db, stale_history_cf)
@@ -243,7 +243,7 @@ mod tests {
     use tempfile::TempDir;
 
     /// Aggressive state-history GC must not affect current-tip reads.
-    /// StateCf holds the authoritative current value per key; deleting
+    /// `StateCf` holds the authoritative current value per key; deleting
     /// history only costs the ability to serve historical reads below
     /// the retention floor.
     #[test]
@@ -276,6 +276,7 @@ mod tests {
                 .node_updates
                 .entry(pk.node_key.clone())
                 .or_insert_with(|| NodeDatabaseUpdates {
+                    #[allow(clippy::default_trait_access)] // foreign type alias varies by crate; concrete type not worth importing
                     partition_updates: Default::default(),
                 })
                 .partition_updates

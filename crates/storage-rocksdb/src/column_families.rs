@@ -3,7 +3,7 @@
 //! This is the single source of truth for what column families exist,
 //! what they store, and how their keys/values are encoded.
 
-use crate::typed_cf::*;
+use crate::typed_cf::{BeU64Codec, DbCodec, HashCodec, JmtKeyCodec, RawCodec, SborCodec, TypedCf};
 
 use crate::jmt_stored::{StoredNodeKey, VersionedStoredNode};
 use hyperscale_types::{
@@ -18,7 +18,7 @@ pub(crate) const DEFAULT_CF: &str = "default";
 
 /// Column family name for substate data. Stores the current value per
 /// unversioned `(partition_key, sort_key)`. History for recent writes
-/// lives in `STATE_HISTORY_CF` (same storage_key + write-version suffix,
+/// lives in `STATE_HISTORY_CF` (same `storage_key` + write-version suffix,
 /// value is the pre-write prior state). Current-state reads are a
 /// direct point lookup; historical reads at version V seek the smallest
 /// state-history entry for the key with `write_version > V` and return
@@ -54,7 +54,7 @@ pub(crate) const STALE_JMT_NODES_CF: &str = "stale_jmt_nodes";
 /// GC can delete retention-expired history without scanning the whole
 /// `state_history` CF.
 ///
-/// Key: `version_BE_8B` — the write_version at which these history entries
+/// Key: `version_BE_8B` — the `write_version` at which these history entries
 /// were created (one entry per block commit).
 /// Value: SBOR-encoded `Vec<Vec<u8>>` — the list of raw `state_history` keys
 /// (i.e. `storage_key_bytes ++ BE8(version)`) written at that version.
@@ -107,7 +107,7 @@ pub(crate) const ALL_COLUMN_FAMILIES: &[&str] = &[
 /// Column family handles resolved from a `DB` reference.
 ///
 /// Provides typed field access to all column families without repeating
-/// `.cf_handle(NAME).expect(...)`. Cheap to construct (HashMap lookups only).
+/// `.cf_handle(NAME).expect(...)`. Cheap to construct (`HashMap` lookups only).
 /// Column family handles — fields are private, access only through
 /// [`TypedCf::handle()`](crate::typed_cf::TypedCf::handle).
 pub(crate) struct CfHandles<'a> {

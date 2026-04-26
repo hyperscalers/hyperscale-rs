@@ -10,7 +10,7 @@ use hyperscale_jmt as jmt;
 use hyperscale_storage::{DbPartitionKey, DbSortKey, StateRoot, SubstateLookup};
 use rocksdb::{Snapshot, DB};
 
-/// A tree store that reads JMT nodes from a RocksDB snapshot.
+/// A tree store that reads JMT nodes from a `RocksDB` snapshot.
 ///
 /// Provides point-in-time isolation: any nodes deleted by concurrent
 /// block commits remain visible through this snapshot. This prevents
@@ -19,7 +19,7 @@ use rocksdb::{Snapshot, DB};
 ///
 /// # Lifetime
 /// The snapshot must outlive all reads through this store. When dropped,
-/// the snapshot releases its hold on the RocksDB version, allowing
+/// the snapshot releases its hold on the `RocksDB` version, allowing
 /// garbage collection.
 pub(crate) struct SnapshotTreeStore<'a> {
     snapshot: Snapshot<'a>,
@@ -34,7 +34,7 @@ impl<'a> SnapshotTreeStore<'a> {
         }
     }
 
-    /// Read the current substate value visible through this RocksDB
+    /// Read the current substate value visible through this `RocksDB`
     /// snapshot. Used when collecting historical state associations
     /// during proof generation.
     pub fn get_substate(

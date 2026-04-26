@@ -47,9 +47,8 @@ pub fn verify_proof(
         return entries.is_empty();
     }
 
-    let multi_proof = match MultiProof::decode(proof.as_bytes()) {
-        Ok(p) => p,
-        Err(_) => return false,
+    let Ok(multi_proof) = MultiProof::decode(proof.as_bytes()) else {
+        return false;
     };
 
     let expected: Vec<(jmt::Key, Option<jmt::ValueHash>)> = entries

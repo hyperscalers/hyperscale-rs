@@ -1,7 +1,7 @@
 //! Core `SimStorage` struct and basic implementations.
 //!
 //! In-memory storage for deterministic simulation testing (DST).
-//! Substates live in two BTreeMaps: `current_state: (storage_key →
+//! Substates live in two `BTreeMaps`: `current_state: (storage_key →
 //! value)` for current-tip reads, and `state_history: ((storage_key,
 //! write_version) → Option<prior>)` for historical reads. A read at
 //! version V below the current tip uses a single forward seek on
@@ -20,8 +20,8 @@ use std::sync::{Arc, RwLock};
 
 /// In-memory storage for simulation and testing.
 ///
-/// Substates live in a `current_state` BTreeMap (authoritative for
-/// current-tip reads) with a companion `state_history` BTreeMap
+/// Substates live in a `current_state` `BTreeMap` (authoritative for
+/// current-tip reads) with a companion `state_history` `BTreeMap`
 /// capturing per-write prior values for historical reads. This mirrors
 /// `RocksDbStorage`'s two-CF layout.
 ///
@@ -31,17 +31,17 @@ use std::sync::{Arc, RwLock};
 ///
 /// # Locking Strategy
 ///
-/// Two RwLocks with independent lifetimes — no ordering constraint:
-/// - `state`: current_state + state-history log + JMT tree store + version/root/associations.
+/// Two `RwLocks` with independent lifetimes — no ordering constraint:
+/// - `state`: `current_state` + state-history log + JMT tree store + version/root/associations.
 ///   Read lock for substate reads, JMT lookups, and speculative computation.
 ///   Write lock for commits (substate writes + JMT updates in one acquisition).
 /// - `consensus`: Block metadata, certificates, votes, committed state.
 ///   Separate because consensus metadata is independent of substate/JMT state.
 pub struct SimStorage {
-    /// Substate data + JMT state (single RwLock).
+    /// Substate data + JMT state (single `RwLock`).
     pub(crate) state: Arc<RwLock<SharedState>>,
 
-    /// Consensus metadata (single RwLock).
+    /// Consensus metadata (single `RwLock`).
     pub(crate) consensus: RwLock<ConsensusState>,
 
     /// Retention window for historical substate reads. `snapshot_at(V)`
@@ -60,6 +60,7 @@ impl Default for SimStorage {
 
 impl SimStorage {
     /// Create a new empty simulated storage.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             state: Arc::new(RwLock::new(SharedState::new())),
@@ -70,6 +71,7 @@ impl SimStorage {
 
     /// Create storage with a specific retention window. Used by tests
     /// that exercise the retention panic.
+    #[must_use]
     pub fn with_jmt_history_length(jmt_history_length: u64) -> Self {
         Self {
             state: Arc::new(RwLock::new(SharedState::new())),
@@ -79,6 +81,10 @@ impl SimStorage {
     }
 
     /// Clear all data (useful for testing).
+    ///
+    /// # Panics
+    ///
+    /// Panics if either internal `RwLock` is poisoned.
     pub fn clear(&mut self) {
         *self.state.write().unwrap() = SharedState::new();
         *self.consensus.write().unwrap() = ConsensusState::new();
@@ -87,11 +93,21 @@ impl SimStorage {
     /// Number of live substate entries (current tip). Historical
     /// state-history entries are not counted — use
     /// `.state.read().state_history.len()` for that.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal `RwLock` is poisoned.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.state.read().unwrap().current_state.len()
     }
 
     /// Whether the substate store has any live entries.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal `RwLock` is poisoned.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.state.read().unwrap().current_state.is_empty()
     }
@@ -103,6 +119,10 @@ impl SimStorage {
     /// `RocksDbStorage::commit_certificate_with_writes()` to ensure DST
     /// catches timing bugs where code incorrectly assumes state is available
     /// before certificate persistence.
+    ///
+    /// # Panics
+    ///
+    /// Panics if either internal `RwLock` is poisoned.
     #[cfg(test)]
     pub fn commit_certificate_with_writes(
         &self,
@@ -122,10 +142,14 @@ impl SimStorage {
     }
 
     /// Test helper: commits database updates with auto-incrementing JMT version.
-    /// Not used in production (use commit_block instead).
+    /// Not used in production (use `commit_block` instead).
     ///
     /// Computes JMT updates and applies them to the tree store, resolving
     /// leaf-substate associations for historical reads.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal `RwLock` is poisoned.
     #[cfg(test)]
     pub fn commit_shared(&self, updates: &DatabaseUpdates) {
         let mut s = self.state.write().unwrap();
@@ -145,7 +169,7 @@ impl SimStorage {
             parent_version,
             new_version,
             &[updates],
-            &Default::default(),
+            &std::collections::HashMap::new(),
         );
 
         for (key, node) in &collected.nodes {
@@ -165,8 +189,12 @@ impl SimStorage {
     /// commit. Writes land in `current_state` at version 0; **no
     /// state-history entries** are recorded — genesis has no pre-state
     /// to preserve.
-    /// After all genesis commits, [`finalize_genesis_jmt`] computes the
-    /// JMT once.
+    /// After all genesis commits, [`Self::finalize_genesis_jmt`] computes
+    /// the JMT once.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal `RwLock` is poisoned.
     pub fn commit_substates_only(&self, updates: &DatabaseUpdates) {
         let mut s = self.state.write().unwrap();
         apply_updates(&mut s, updates, 0, /* write_history */ false);
@@ -180,6 +208,11 @@ impl SimStorage {
     ///
     /// # Returns
     /// The genesis state root hash (JMT root at version 0).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal `RwLock` is poisoned, or if the JMT has
+    /// already been initialized.
     pub fn finalize_genesis_jmt(&self, merged: &DatabaseUpdates) -> StateRoot {
         let mut s = self.state.write().unwrap();
 
@@ -196,7 +229,7 @@ impl SimStorage {
             None,
             0,
             &[merged],
-            &Default::default(),
+            &std::collections::HashMap::new(),
         );
 
         for (key, node) in &collected.nodes {

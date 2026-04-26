@@ -54,7 +54,7 @@ impl RocksDbStorage {
 
     /// Get multiple transactions by hash (batch read).
     ///
-    /// Uses RocksDB's `multi_get_cf` for efficient batch retrieval.
+    /// Uses `RocksDB`'s `multi_get_cf` for efficient batch retrieval.
     /// Returns only transactions that were found (missing hashes are skipped).
     pub fn get_transactions_batch(&self, hashes: &[TxHash]) -> Vec<RoutableTransaction> {
         if hashes.is_empty() {
@@ -92,7 +92,7 @@ impl RocksDbStorage {
     ///
     /// Panics if the block cannot be persisted. This is intentional: committed blocks
     /// are essential for crash recovery.
-    /// Append block data to an existing WriteBatch (for atomic commit).
+    /// Append block data to an existing `WriteBatch` (for atomic commit).
     pub(crate) fn append_block_to_batch(
         &self,
         batch: &mut rocksdb::WriteBatch,
@@ -101,7 +101,7 @@ impl RocksDbStorage {
     ) {
         let metadata = BlockMetadata::from_block(block, qc.clone());
         self.cf_put::<BlocksCf>(batch, &block.height().0, &metadata);
-        for tx in block.transactions().iter() {
+        for tx in block.transactions() {
             self.cf_put_raw::<TransactionsCf>(
                 batch,
                 tx.hash().as_raw(),
@@ -315,9 +315,10 @@ impl RocksDbStorage {
         results
             .into_iter()
             .zip(hashes.iter())
-            .filter_map(|(result, hash)| match result {
-                Some(tx) => Some(Arc::new(tx)),
-                None => {
+            .filter_map(|(result, hash)| {
+                if let Some(tx) = result {
+                    Some(Arc::new(tx))
+                } else {
                     tracing::trace!(?hash, "Transaction not found in storage");
                     None
                 }
@@ -341,9 +342,10 @@ impl RocksDbStorage {
         results
             .into_iter()
             .zip(hashes.iter())
-            .filter_map(|(result, hash)| match result {
-                Some(cert) => Some(Arc::new(cert)),
-                None => {
+            .filter_map(|(result, hash)| {
+                if let Some(cert) = result {
+                    Some(Arc::new(cert))
+                } else {
                     tracing::trace!(?hash, "Certificate not found in storage");
                     None
                 }
@@ -356,6 +358,11 @@ impl RocksDbStorage {
     // ═══════════════════════════════════════════════════════════════════════
 
     /// Set the highest committed block height and hash.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the synced `WriteBatch` fails — chain metadata writes
+    /// must succeed for BFT safety, so this is treated as fatal.
     pub fn set_chain_metadata(
         &self,
         height: BlockHeight,
@@ -396,17 +403,17 @@ impl RocksDbStorage {
         (height, hash, qc)
     }
 
-    /// Read only the committed height from RocksDB.
+    /// Read only the committed height from `RocksDB`.
     pub(crate) fn read_committed_height(&self) -> BlockHeight {
         crate::metadata::read_committed_height(&*self.db)
     }
 
-    /// Read only the committed hash from RocksDB.
+    /// Read only the committed hash from `RocksDB`.
     pub(crate) fn read_committed_hash(&self) -> Option<Hash> {
         crate::metadata::read_committed_hash(&*self.db)
     }
 
-    /// Read only the latest QC from RocksDB.
+    /// Read only the latest QC from `RocksDB`.
     pub(crate) fn read_latest_qc(&self) -> Option<QuorumCertificate> {
         crate::metadata::read_committed_qc(&*self.db)
     }
@@ -420,14 +427,14 @@ impl RocksDbStorage {
         self.cf_put_sync::<CertificatesCf>(hash.as_raw(), cert);
     }
 
-    /// Get a wave certificate by wave_id hash.
+    /// Get a wave certificate by `wave_id` hash.
     pub fn get_certificate(&self, hash: &WaveIdHash) -> Option<WaveCertificate> {
         self.cf_get::<CertificatesCf>(hash.as_raw())
     }
 
     /// Get multiple certificates by hash (batch read).
     ///
-    /// Uses RocksDB's `multi_get_cf` for efficient batch retrieval.
+    /// Uses `RocksDB`'s `multi_get_cf` for efficient batch retrieval.
     /// Returns only certificates that were found (missing hashes are skipped).
     pub fn get_certificates_batch(&self, hashes: &[WaveIdHash]) -> Vec<WaveCertificate> {
         if hashes.is_empty() {
@@ -451,7 +458,7 @@ impl RocksDbStorage {
     /// This is the deferred commit operation that applies state writes when
     /// a `WaveCertificate` is included in a committed block.
     ///
-    /// Uses a RocksDB WriteBatch for atomicity - either both the certificate
+    /// Uses a `RocksDB` `WriteBatch` for atomicity - either both the certificate
     /// and state writes are persisted, or neither is.
     ///
     /// # Panics
@@ -517,6 +524,9 @@ impl RocksDbStorage {
         metrics::record_certificate_persisted();
 
         // Record span fields
-        tracing::Span::current().record("latency_us", elapsed.as_micros() as u64);
+        tracing::Span::current().record(
+            "latency_us",
+            u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX),
+        );
     }
 }

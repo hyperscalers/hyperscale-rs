@@ -39,7 +39,7 @@ impl SimSnapshot {
     ///   by pass 1, the current value IS the value at version (no
     ///   writes since).
     ///
-    /// Returns live (non-None) entries sorted by storage_key ascending.
+    /// Returns live (non-None) entries sorted by `storage_key` ascending.
     fn list_at_prefix(&self, prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
         let end = keys::next_prefix(prefix).expect("storage key prefix overflow");
 
@@ -83,7 +83,8 @@ impl SimSnapshot {
     }
 
     /// Entity-scoped list used by cross-shard provisioning.
-    /// Decomposes each storage_key into `(partition_num, sort_key, value)`.
+    /// Decomposes each `storage_key` into `(partition_num, sort_key, value)`.
+    #[must_use]
     pub fn list_raw_values_for_node(&self, node_id: &NodeId) -> Vec<(u8, DbSortKey, Vec<u8>)> {
         let entity_key = keys::node_entity_key(node_id);
         let entity_len = entity_key.len();

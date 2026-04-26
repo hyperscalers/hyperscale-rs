@@ -12,7 +12,7 @@ use hyperscale_types::{BlockHeight, Hash, NodeId, StateRoot, TxHash};
 use std::sync::Arc;
 
 /// Helper: commit a block with given updates by injecting them via a single-tx
-/// FinalizedWave inside `block.certificates`.
+/// `FinalizedWave` inside `block.certificates`.
 fn commit_with(
     storage: &SimStorage,
     updates: &DatabaseUpdates,
@@ -20,7 +20,9 @@ fn commit_with(
     qc: &hyperscale_types::QuorumCertificate,
 ) -> StateRoot {
     let block = block.clone();
-    let block = if !updates.node_updates.is_empty() {
+    let block = if updates.node_updates.is_empty() {
+        block
+    } else {
         let receipt = hyperscale_types::ReceiptBundle {
             tx_hash: TxHash::ZERO,
             local_receipt: Arc::new(hyperscale_types::LocalReceipt {
@@ -69,8 +71,6 @@ fn commit_with(
                 }
             }
         }
-    } else {
-        block
     };
     storage.commit_block(&Arc::new(block), &Arc::new(qc.clone()))
 }
@@ -208,9 +208,12 @@ fn test_snapshot_structural_sharing_performance() {
                 partition_updates: [(
                     partition_key.partition_num,
                     PartitionDatabaseUpdates::Delta {
-                        substate_updates: [(sort_key, DatabaseUpdate::Set(vec![i as u8]))]
-                            .into_iter()
-                            .collect(),
+                        substate_updates: [(
+                            sort_key,
+                            DatabaseUpdate::Set(vec![u8::try_from(i).unwrap_or(u8::MAX)]),
+                        )]
+                        .into_iter()
+                        .collect(),
                     },
                 )]
                 .into_iter()
@@ -233,8 +236,7 @@ fn test_snapshot_structural_sharing_performance() {
     // With BTreeMap clone this would take 10+ ms; with OrdMap it's < 1ms
     assert!(
         elapsed.as_millis() < 50,
-        "5 snapshots took {:?}, expected < 50ms",
-        elapsed
+        "5 snapshots took {elapsed:?}, expected < 50ms"
     );
 }
 
@@ -612,7 +614,7 @@ fn test_ec_storage_batch() {
 /// Regression test: two validators with different `persisted_height`
 /// but reading at the same historical version must observe identical substate
 /// values. This is the scenario that caused the shard-0 state-root
-/// divergence — base snapshots used to read "current StateCf" which
+/// divergence — base snapshots used to read "current `StateCf`" which
 /// leaked post-anchor writes on the faster-persisting validator.
 #[test]
 fn test_snapshot_at_version_is_deterministic_across_persistence_lag() {
@@ -632,14 +634,14 @@ fn test_snapshot_at_version_is_deterministic_across_persistence_lag() {
     // Validator A: persists through block 5.
     let a = SimStorage::new();
     for h in 1..=5u64 {
-        commit(&a, BlockHeight(h), vec![h as u8]);
+        commit(&a, BlockHeight(h), vec![u8::try_from(h).unwrap_or(u8::MAX)]);
     }
     assert_eq!(a.jmt_height(), BlockHeight(5));
 
     // Validator B: stops at block 3.
     let b = SimStorage::new();
     for h in 1..=3u64 {
-        commit(&b, BlockHeight(h), vec![h as u8]);
+        commit(&b, BlockHeight(h), vec![u8::try_from(h).unwrap_or(u8::MAX)]);
     }
     assert_eq!(b.jmt_height(), BlockHeight(3));
 
@@ -683,8 +685,12 @@ fn test_snapshot_resolves_floor_among_many_versions() {
     for h in 1..=50u64 {
         let block = make_test_block(BlockHeight(h));
         let qc = make_test_qc(&block);
-        let updates =
-            make_mapped_database_update(node_seed, partition_num, sort_key.clone(), vec![h as u8]);
+        let updates = make_mapped_database_update(
+            node_seed,
+            partition_num,
+            sort_key.clone(),
+            vec![u8::try_from(h).unwrap_or(u8::MAX)],
+        );
         commit_with(&storage, &updates, &block, &qc);
     }
 
@@ -700,7 +706,7 @@ fn test_snapshot_resolves_floor_among_many_versions() {
         let snap = storage.snapshot_at(BlockHeight(target));
         assert_eq!(
             snap.get_raw_substate_by_db_key(&pk, &sk),
-            Some(vec![target as u8]),
+            Some(vec![u8::try_from(target).unwrap_or(u8::MAX)]),
             "snapshot_at({target}) should resolve to block-{target} value"
         );
     }
@@ -821,8 +827,12 @@ fn test_list_substates_at_height_respects_retention() {
     for h in 1..=10u64 {
         let block = make_test_block(BlockHeight(h));
         let qc = make_test_qc(&block);
-        let updates =
-            make_mapped_database_update(9, partition_num, sort_key.clone(), vec![h as u8]);
+        let updates = make_mapped_database_update(
+            9,
+            partition_num,
+            sort_key.clone(),
+            vec![u8::try_from(h).unwrap_or(u8::MAX)],
+        );
         commit_with(&storage, &updates, &block, &qc);
     }
     // current=10, floor=8.

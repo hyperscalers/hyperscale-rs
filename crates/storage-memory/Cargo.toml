@@ -15,3 +15,6 @@ tracing.workspace = true
 hyperscale-storage = { workspace = true, features = ["test-utils"] }
 hyperscale-types = { workspace = true, features = ["test-utils"] }
 indexmap.workspace = true
+
+[lints]
+workspace = true

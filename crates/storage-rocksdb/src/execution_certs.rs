@@ -1,8 +1,8 @@
 //! Execution certificate persistence helpers.
 //!
 //! Writes ECs to two column families:
-//! - Primary: `EXECUTION_CERTS_CF` (key: canonical_hash, value: EC)
-//! - Index: `EXECUTION_CERTS_BY_HEIGHT_CF` (key: height_BE ++ canonical_hash, value: ())
+//! - Primary: `EXECUTION_CERTS_CF` (key: `canonical_hash`, value: EC)
+//! - Index: `EXECUTION_CERTS_BY_HEIGHT_CF` (key: `height_BE` ++ `canonical_hash`, value: ())
 
 use crate::column_families::{ExecutionCertsByHeightCf, ExecutionCertsCf};
 use crate::core::RocksDbStorage;

@@ -21,3 +21,6 @@ tracing.workspace = true
 [dev-dependencies]
 hyperscale-storage = { workspace = true, features = ["test-utils"] }
 tempfile.workspace = true
+
+[lints]
+workspace = true

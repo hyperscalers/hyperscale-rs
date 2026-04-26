@@ -1,6 +1,6 @@
 //! Shared state types for simulated storage.
 //!
-//! Contains the internal state structures protected by RwLocks in `SimStorage`.
+//! Contains the internal state structures protected by `RwLocks` in `SimStorage`.
 
 use crate::tree_store::SimTreeStore;
 
@@ -21,12 +21,12 @@ use std::sync::Arc;
 // Shared substate + JMT state (single RwLock)
 // ═══════════════════════════════════════════════════════════════════════
 
-/// Substate data and JMT state protected by a single RwLock.
+/// Substate data and JMT state protected by a single `RwLock`.
 ///
 /// A single lock ensures association resolution can read substate data
 /// atomically, avoiding deadlock.
 ///
-/// Using RwLock (instead of Mutex) allows concurrent read access: speculative
+/// Using `RwLock` (instead of Mutex) allows concurrent read access: speculative
 /// JMT computations from `prepare_block_commit` take a read lock and can run
 /// concurrently with other readers, while commits take a write lock.
 pub(crate) struct SharedState {
@@ -66,7 +66,7 @@ impl SharedState {
     /// The snapshot's tree nodes are consensus-verified (2f+1 validators
     /// agreed on the resulting state root). We apply unconditionally —
     /// the overlay may have computed from a base state ahead of the
-    /// tree store, so base_root mismatches are expected and safe.
+    /// tree store, so `base_root` mismatches are expected and safe.
     pub(crate) fn apply_jmt_snapshot(&mut self, snapshot: JmtSnapshot) {
         for (jmt_key, jmt_node) in &snapshot.nodes {
             self.tree_store
@@ -94,7 +94,7 @@ impl SharedState {
 // Consolidated consensus state (single RwLock)
 // ═══════════════════════════════════════════════════════════════════════
 
-/// All consensus-related metadata bundled into a single RwLock.
+/// All consensus-related metadata bundled into a single `RwLock`.
 pub(crate) struct ConsensusState {
     /// Committed blocks indexed by height.
     pub blocks: BTreeMap<BlockHeight, CertifiedBlock>,
@@ -116,13 +116,13 @@ pub(crate) struct ConsensusState {
     pub receipt_heights: HashMap<TxHash, BlockHeight>,
     /// Execution certificates keyed by canonical hash.
     pub execution_certs: HashMap<ExecutionCertificateHash, ExecutionCertificate>,
-    /// Index: block_height → set of canonical hashes for that height.
+    /// Index: `block_height` → set of canonical hashes for that height.
     pub execution_certs_by_height: HashMap<BlockHeight, Vec<ExecutionCertificateHash>>,
-    /// Index: block_height → wave_id hashes at that height.
+    /// Index: `block_height` → `wave_id` hashes at that height.
     pub wave_certs_by_height: HashMap<BlockHeight, Vec<WaveIdHash>>,
-    /// Index: tx_hash → wave_id hash of the wave cert that finalized it.
+    /// Index: `tx_hash` → `wave_id` hash of the wave cert that finalized it.
     pub tx_to_wave: HashMap<TxHash, WaveIdHash>,
-    /// Index: tx_hash → vec of (shard_group_id, ec_hash) pairs covering it.
+    /// Index: `tx_hash` → vec of (`shard_group_id`, `ec_hash`) pairs covering it.
     pub tx_to_ec: HashMap<TxHash, Vec<(ShardGroupId, ExecutionCertificateHash)>>,
 }
 

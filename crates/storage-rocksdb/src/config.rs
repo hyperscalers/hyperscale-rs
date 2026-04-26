@@ -1,19 +1,26 @@
-//! Configuration types for RocksDB storage.
+//! Configuration types for `RocksDB` storage.
 //!
 //! Pure tuning knobs and options. Column family definitions live in
 //! [`column_families`](crate::column_families).
 
 use crate::column_families::ALL_COLUMN_FAMILIES;
 
-/// Compression type for RocksDB.
+/// Compression type for `RocksDB`. Each variant maps 1:1 to the
+/// same-named [`rocksdb::DBCompressionType`].
 #[derive(Debug, Clone, Copy, Default)]
 pub enum CompressionType {
+    /// No compression.
     None,
+    /// Google Snappy.
     Snappy,
+    /// zlib (DEFLATE).
     Zlib,
+    /// LZ4 (default — fastest decompression at low ratios).
     #[default]
     Lz4,
+    /// LZ4 high-compression mode.
     Lz4hc,
+    /// Facebook Zstandard.
     Zstd,
 }
 
@@ -30,7 +37,7 @@ impl CompressionType {
     }
 }
 
-/// Configuration for RocksDB storage.
+/// Configuration for `RocksDB` storage.
 #[derive(Debug, Clone)]
 pub struct RocksDbConfig {
     /// Maximum number of background jobs
@@ -73,7 +80,10 @@ impl Default for RocksDbConfig {
             bloom_filter_bits: 10.0,
             bytes_per_sync: 1024 * 1024, // 1MB
             keep_log_file_num: 10,
-            column_families: ALL_COLUMN_FAMILIES.iter().map(|s| s.to_string()).collect(),
+            column_families: ALL_COLUMN_FAMILIES
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect(),
             jmt_history_length: 256,
         }
     }
