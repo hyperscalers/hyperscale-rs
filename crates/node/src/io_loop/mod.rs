@@ -33,16 +33,16 @@ use crate::config::NodeConfig;
 use crate::io_loop::block_commit::BlockCommitCoordinator;
 use crate::io_loop::caches::SharedCaches;
 use crate::protocol::execution_cert_fetch::{ExecCertFetchInput, ExecCertFetchProtocol};
-use crate::protocol::fetch::ScopeFetchInput;
 use crate::protocol::fetch::instances::headers::{self, HeaderFetch};
 use crate::protocol::fetch::instances::provisions::{self, ProvisionFetch};
+use crate::protocol::fetch::instances::transactions::TransactionFetch;
 use crate::protocol::fetch::scope_fetch::ScopeFetchConfig;
+use crate::protocol::fetch::{HashSetFetchInput, ScopeFetchInput};
 use crate::protocol::finalized_wave_fetch::{FinalizedWaveFetchInput, FinalizedWaveFetchProtocol};
 use crate::protocol::local_provision_fetch::{
     LocalProvisionFetchInput, LocalProvisionFetchProtocol,
 };
 use crate::protocol::sync::{SyncInput, SyncProtocol, SyncStatus};
-use crate::protocol::transaction_fetch::{TransactionFetchInput, TransactionFetchProtocol};
 use arc_swap::ArcSwap;
 use hyperscale_core::{Action, NodeInput, ProtocolEvent, StateMachine, TimerId};
 use hyperscale_dispatch::Dispatch;
@@ -263,7 +263,7 @@ where
         HashMap<BlockHeight, Box<hyperscale_messages::response::ElidedCertifiedBlock>>,
 
     // Fetch protocol (transaction/certificate fetching with chunking and retry)
-    transaction_fetch_protocol: TransactionFetchProtocol,
+    transaction_fetch: TransactionFetch,
 
     // Local provision fetch protocol (intra-shard provisions fetching)
     local_provision_fetch_protocol: LocalProvisionFetchProtocol,
@@ -334,8 +334,7 @@ where
         let initial_persisted_height = state.bft().committed_height();
         let b = &config.batch;
         let sync_protocol = SyncProtocol::new(config.sync.clone());
-        let transaction_fetch_protocol =
-            TransactionFetchProtocol::new(config.transaction_fetch.clone());
+        let transaction_fetch = TransactionFetch::new(config.transaction_fetch.clone());
         let local_provision_fetch_protocol = LocalProvisionFetchProtocol::new(
             crate::protocol::local_provision_fetch::LocalProvisionFetchConfig::default(),
         );
@@ -368,7 +367,7 @@ where
             pending_validation: HashSet::new(),
             locally_submitted: HashSet::new(),
             sync_protocol,
-            transaction_fetch_protocol,
+            transaction_fetch,
             local_provision_fetch_protocol,
             finalized_wave_fetch_protocol,
             provision_fetch,
@@ -656,31 +655,32 @@ where
                 block_hash,
                 transactions,
             } => {
-                let outputs = self.transaction_fetch_protocol.handle(
-                    TransactionFetchInput::TransactionsReceived {
+                // Drain delivered ids from the fetch protocol's in-flight
+                // tracking, then feed them to the state machine the same
+                // way gossip-delivered transactions arrive.
+                let ids: Vec<_> = transactions.iter().map(|tx| tx.hash()).collect();
+                self.transaction_fetch
+                    .handle(HashSetFetchInput::Admitted { ids });
+                if !transactions.is_empty() {
+                    self.feed_event(ProtocolEvent::TransactionFetchDelivered {
                         block_hash,
                         transactions,
-                    },
-                );
-                self.process_transaction_fetch_outputs(outputs);
+                    });
+                }
             }
 
             NodeInput::FetchTransactionsFailed { block_hash, hashes } => {
-                let outputs = self
-                    .transaction_fetch_protocol
-                    .handle(TransactionFetchInput::FetchFailed { block_hash, hashes });
-                self.process_transaction_fetch_outputs(outputs);
+                self.transaction_fetch.handle(HashSetFetchInput::Failed {
+                    scope: block_hash,
+                    ids: hashes,
+                });
                 // Tick to retry pending fetches.
-                let tick_outputs = self
-                    .transaction_fetch_protocol
-                    .handle(TransactionFetchInput::Tick);
+                let tick_outputs = self.transaction_fetch.handle(HashSetFetchInput::Tick);
                 self.process_transaction_fetch_outputs(tick_outputs);
             }
 
             NodeInput::FetchTick => {
-                let outputs = self
-                    .transaction_fetch_protocol
-                    .handle(TransactionFetchInput::Tick);
+                let outputs = self.transaction_fetch.handle(HashSetFetchInput::Tick);
                 self.process_transaction_fetch_outputs(outputs);
                 // Also tick the local provision fetch protocol.
                 let local_prov_outputs = self
@@ -1022,7 +1022,8 @@ where
         let bft_stats = self.state.bft().stats();
         let mempool = self.state.mempool();
         let contention = mempool.lock_contention_stats();
-        let fetch_status = self.transaction_fetch_protocol.status();
+        let fetch_in_flight = self.transaction_fetch.in_flight_count();
+        let fetch_pending_blocks = self.transaction_fetch.pending_count();
         let sync_status = self.sync_protocol.status();
 
         let bft_mem = self.state.bft().memory_stats();
@@ -1041,7 +1042,7 @@ where
             backpressure_active: mempool.at_in_flight_limit(),
             blocks_behind: self.sync_protocol.blocks_behind(),
             is_syncing: self.sync_protocol.is_syncing(),
-            fetch_transaction: fetch_status.in_flight_operations,
+            fetch_transaction: fetch_in_flight,
             fetch_provision: self.provision_fetch.in_flight_count(),
             fetch_local_provision: self.local_provision_fetch_protocol.in_flight_count(),
             fetch_exec_cert: self.exec_cert_fetch_protocol.in_flight_count(),
@@ -1116,7 +1117,7 @@ where
                 node_committed_header_batch: self.committed_header_batch.len(),
                 node_sync_queued_heights: sync_status.queued_heights,
                 node_sync_in_flight_fetches: sync_status.pending_fetches,
-                node_tx_fetch_blocks: fetch_status.pending_tx_blocks,
+                node_tx_fetch_blocks: fetch_pending_blocks,
                 node_local_provision_fetch_pending: self
                     .local_provision_fetch_protocol
                     .pending_count(),

@@ -5,7 +5,6 @@ use crate::protocol::execution_cert_fetch::ExecCertFetchOutput;
 use crate::protocol::finalized_wave_fetch::FinalizedWaveFetchOutput;
 use crate::protocol::local_provision_fetch::LocalProvisionFetchOutput;
 use crate::protocol::sync::{SyncInput, SyncOutput};
-use crate::protocol::transaction_fetch::TransactionFetchOutput;
 use hyperscale_core::{NodeInput, ProtocolEvent, TimerId};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::Engine;
@@ -232,24 +231,27 @@ where
         }
     }
 
-    /// Process `TransactionFetchProtocol` outputs.
-    ///
-    /// `FetchTransactions` uses the `Network` trait to make requests.
-    /// `DeliverTransactions` feeds events directly to the state machine.
+    /// Dispatch outputs from the per-block transaction fetch.
     pub(super) fn process_transaction_fetch_outputs(
-        &mut self,
-        outputs: Vec<TransactionFetchOutput>,
+        &self,
+        outputs: Vec<
+            crate::protocol::fetch::HashSetFetchOutput<
+                crate::protocol::fetch::instances::transactions::Scope,
+                hyperscale_types::TxHash,
+            >,
+        >,
     ) {
+        use crate::protocol::fetch::HashSetFetchOutput;
+
         for output in outputs {
             match output {
-                TransactionFetchOutput::FetchTransactions {
-                    block_hash,
-                    proposer,
-                    tx_hashes,
+                HashSetFetchOutput::Send {
+                    scope: block_hash,
+                    ids: tx_hashes,
+                    peer: proposer,
                 } => {
                     use hyperscale_messages::request::GetTransactionsRequest;
                     let es = self.event_sender.clone();
-                    let bh = block_hash;
                     let hs = tx_hashes.clone();
                     let peers = self.local_peers();
                     self.network.request(
@@ -259,27 +261,22 @@ where
                         Box::new(move |result| match result {
                             Ok(resp) => {
                                 let _ = es.send(NodeInput::TransactionReceived {
-                                    block_hash: bh,
+                                    block_hash,
                                     transactions: resp.into_transactions(),
                                 });
                             }
                             Err(_) => {
                                 let _ = es.send(NodeInput::FetchTransactionsFailed {
-                                    block_hash: bh,
+                                    block_hash,
                                     hashes: hs,
                                 });
                             }
                         }),
                     );
                 }
-                TransactionFetchOutput::DeliverTransactions {
-                    block_hash,
-                    transactions,
-                } => {
-                    self.feed_event(ProtocolEvent::TransactionFetchDelivered {
-                        block_hash,
-                        transactions,
-                    });
+                HashSetFetchOutput::ScopeComplete { .. } => {
+                    // Scope completion is purely an internal protocol signal;
+                    // BFT readiness is driven by `TransactionFetchDelivered`.
                 }
             }
         }
@@ -614,8 +611,7 @@ where
     }
 
     pub(super) fn update_fetch_tick_timer(&mut self) {
-        let status = self.transaction_fetch_protocol.status();
-        let has_fetch_work = status.pending_tx_blocks > 0;
+        let has_fetch_work = self.transaction_fetch.has_pending();
         let has_local_provision_work = self.local_provision_fetch_protocol.has_pending();
         let has_finalized_wave_work = self.finalized_wave_fetch_protocol.has_pending();
         let has_provision_work = self.provision_fetch.has_pending();

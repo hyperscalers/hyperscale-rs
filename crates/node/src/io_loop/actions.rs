@@ -5,12 +5,11 @@ use super::TimerOp;
 use super::block_commit::{AccumulateDecision, PendingCommit};
 use crate::action_handler::{self, ActionContext, DispatchPool};
 use crate::protocol::execution_cert_fetch::ExecCertFetchInput;
-use crate::protocol::fetch::ScopeFetchInput;
 use crate::protocol::fetch::instances::{headers, provisions};
+use crate::protocol::fetch::{HashSetFetchInput, PeerSource, ScopeFetchInput};
 use crate::protocol::finalized_wave_fetch::FinalizedWaveFetchInput;
 use crate::protocol::local_provision_fetch::LocalProvisionFetchInput;
 use crate::protocol::sync::SyncInput;
-use crate::protocol::transaction_fetch::TransactionFetchInput;
 use hyperscale_core::{Action, CommitSource, NodeInput, ProtocolEvent, StateMachine};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::Engine;
@@ -597,16 +596,12 @@ where
                 proposer,
                 tx_hashes,
             } => {
-                self.transaction_fetch_protocol.handle(
-                    TransactionFetchInput::RequestTransactions {
-                        block_hash,
-                        proposer,
-                        tx_hashes,
-                    },
-                );
-                let outputs = self
-                    .transaction_fetch_protocol
-                    .handle(TransactionFetchInput::Tick);
+                self.transaction_fetch.handle(HashSetFetchInput::Request {
+                    scope: block_hash,
+                    ids: tx_hashes,
+                    peers: PeerSource::Pinned(proposer),
+                });
+                let outputs = self.transaction_fetch.handle(HashSetFetchInput::Tick);
                 self.process_transaction_fetch_outputs(outputs);
                 self.update_fetch_tick_timer();
             }
@@ -649,8 +644,8 @@ where
                 self.update_fetch_tick_timer();
             }
             Action::CancelFetch { block_hash } => {
-                self.transaction_fetch_protocol
-                    .handle(TransactionFetchInput::CancelFetch { block_hash });
+                self.transaction_fetch
+                    .handle(HashSetFetchInput::AdmittedScope { scope: block_hash });
                 self.local_provision_fetch_protocol
                     .handle(LocalProvisionFetchInput::CancelFetch { block_hash });
                 self.finalized_wave_fetch_protocol
