@@ -4,33 +4,14 @@ use radix_common::math::Decimal;
 use radix_common::network::NetworkDefinition;
 use radix_common::prelude::Epoch;
 use radix_common::types::ComponentAddress;
-use radix_engine::system::bootstrap::{
-    GenesisDataChunk, GenesisReceipts, GenesisStakeAllocation, GenesisValidator,
-};
+use radix_engine::system::bootstrap::{GenesisDataChunk, GenesisStakeAllocation, GenesisValidator};
 use radix_engine::updates::{BabylonSettings, ProtocolBuilder, ProtocolVersion};
 use radix_engine::vm::VmModules;
 use radix_engine_interface::blueprints::consensus_manager::ConsensusManagerConfig;
 use radix_substate_store_interface::interface::{CommittableSubstateDatabase, SubstateDatabase};
-use thiserror::Error;
 
 /// Default faucet supply (100 billion XRD).
-pub const DEFAULT_FAUCET_SUPPLY: &str = "100000000000";
-
-/// Errors that can occur during genesis.
-#[derive(Debug, Error)]
-pub enum GenesisError {
-    /// Genesis has already been executed.
-    #[error("genesis already executed")]
-    AlreadyExecuted,
-
-    /// Invalid decimal value.
-    #[error("invalid decimal: {0}")]
-    InvalidDecimal(String),
-
-    /// Genesis execution failed.
-    #[error("genesis execution failed: {0}")]
-    ExecutionFailed(String),
-}
+const DEFAULT_FAUCET_SUPPLY: &str = "100000000000";
 
 /// Configuration for genesis bootstrapping.
 #[derive(Debug, Clone)]
@@ -63,21 +44,15 @@ pub struct GenesisConfig {
     pub xrd_balances: Vec<(ComponentAddress, Decimal)>,
 }
 
-impl Default for GenesisConfig {
-    fn default() -> Self {
-        Self::test_default()
-    }
-}
-
 impl GenesisConfig {
-    /// Create a minimal test configuration.
+    /// Minimal test configuration: faucet funded, no validators or accounts.
     ///
     /// # Panics
     ///
     /// Panics if [`DEFAULT_FAUCET_SUPPLY`] cannot be converted to a [`Decimal`] —
     /// the constant is fixed, so this is unreachable in practice.
     #[must_use]
-    pub fn test_minimal() -> Self {
+    pub fn test_default() -> Self {
         Self {
             genesis_epoch: Epoch::of(1),
             consensus_manager_config: ConsensusManagerConfig::test_default(),
@@ -91,13 +66,7 @@ impl GenesisConfig {
         }
     }
 
-    /// Create a test configuration with default faucet supply.
-    #[must_use]
-    pub fn test_default() -> Self {
-        Self::test_minimal()
-    }
-
-    /// Create a production configuration (no faucet).
+    /// Production configuration: no faucet, no preset leader.
     #[must_use]
     pub fn production() -> Self {
         Self {
@@ -111,6 +80,25 @@ impl GenesisConfig {
             staker_accounts: Vec::new(),
             xrd_balances: Vec::new(),
         }
+    }
+
+    /// Mix the canonical inputs to genesis bootstrap into the given hasher.
+    ///
+    /// Stable across runs of the same process; suitable as a cache key for
+    /// memoizing the resulting [`crate::DatabaseUpdates`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if SBOR encoding of [`BabylonSettings`] fails — unreachable in
+    /// practice; the type is fully Scrypto-encodable.
+    pub fn cache_hash<H: std::hash::Hasher>(&self, hasher: &mut H) {
+        use radix_common::prelude::scrypto_encode;
+        use std::hash::Hash;
+
+        let settings = self.to_babylon_settings();
+        scrypto_encode(&settings)
+            .expect("BabylonSettings is encodable")
+            .hash(hasher);
     }
 
     fn to_babylon_settings(&self) -> BabylonSettings {
@@ -154,44 +142,23 @@ impl GenesisConfig {
     }
 }
 
-/// Builder for genesis bootstrapping.
-pub struct GenesisBuilder {
-    network: NetworkDefinition,
-    config: GenesisConfig,
-}
+/// Run genesis bootstrap for `(network, config)` against `store`.
+///
+/// Drives the Radix Engine through bootstrap → `CuttlefishPart2`; the resulting
+/// substate writes land in `store`. Internal to the engine crate — callers
+/// should go through [`crate::prepared_genesis`], which memoizes the merged
+/// [`radix_substate_store_interface::interface::DatabaseUpdates`] per
+/// `(network, config)`.
+pub fn bootstrap<S>(network: &NetworkDefinition, config: &GenesisConfig, store: &mut S)
+where
+    S: SubstateDatabase + CommittableSubstateDatabase,
+{
+    let babylon_settings = config.to_babylon_settings();
+    let mut hooks = radix_engine::system::bootstrap::GenesisReceiptExtractionHooks::new();
+    let vm_modules = VmModules::default();
 
-impl GenesisBuilder {
-    /// Create a new genesis builder.
-    #[must_use]
-    pub fn new(network: NetworkDefinition) -> Self {
-        Self {
-            network,
-            config: GenesisConfig::default(),
-        }
-    }
-
-    /// Set the genesis configuration.
-    #[must_use]
-    pub fn with_config(mut self, config: GenesisConfig) -> Self {
-        self.config = config;
-        self
-    }
-
-    /// Execute genesis on the provided database.
-    pub fn build<S>(self, store: &mut S) -> GenesisReceipts
-    where
-        S: SubstateDatabase + CommittableSubstateDatabase,
-    {
-        let babylon_settings = self.config.to_babylon_settings();
-
-        let mut hooks = radix_engine::system::bootstrap::GenesisReceiptExtractionHooks::new();
-        let vm_modules = VmModules::default();
-
-        ProtocolBuilder::for_network(&self.network)
-            .configure_babylon(|_| babylon_settings)
-            .from_bootstrap_to(ProtocolVersion::CuttlefishPart2)
-            .commit_each_protocol_update_advanced(store, &mut hooks, &vm_modules);
-
-        hooks.into_genesis_receipts()
-    }
+    ProtocolBuilder::for_network(network)
+        .configure_babylon(|_| babylon_settings)
+        .from_bootstrap_to(ProtocolVersion::CuttlefishPart2)
+        .commit_each_protocol_update_advanced(store, &mut hooks, &vm_modules);
 }

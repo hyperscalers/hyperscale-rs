@@ -33,9 +33,8 @@ use crate::error::ExecutionError;
 use crate::execution::{
     ProvisionedSnapshot, build_execution_metadata, build_local_receipt, is_committed,
 };
-use crate::genesis::{GenesisBuilder, GenesisConfig, GenesisError};
 use crate::result::{ExecutionOutput, SingleTxResult};
-use hyperscale_storage::{CommittableSubstateDatabase, SubstateDatabase, SubstateStore};
+use hyperscale_storage::{SubstateDatabase, SubstateStore};
 use hyperscale_types::{BlockHeight, NodeId, RoutableTransaction, StateEntry, StateProvision};
 use radix_common::network::NetworkDefinition;
 use radix_engine::transaction::{ExecutionConfig, TransactionReceipt, execute_transaction};
@@ -149,27 +148,6 @@ pub trait Engine: Clone + Send + Sync + 'static {
         block_height: BlockHeight,
     ) -> Option<Vec<hyperscale_types::StateEntry>>;
 
-    /// Run genesis bootstrapping on the given storage.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`GenesisError`] if the genesis bootstrap fails.
-    fn run_genesis<S: SubstateDatabase + CommittableSubstateDatabase>(
-        &self,
-        storage: &mut S,
-    ) -> Result<(), GenesisError>;
-
-    /// Run genesis with custom configuration.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`GenesisError`] if the genesis bootstrap fails.
-    fn run_genesis_with_config<S: SubstateDatabase + CommittableSubstateDatabase>(
-        &self,
-        storage: &mut S,
-        config: GenesisConfig,
-    ) -> Result<(), GenesisError>;
-
     /// Get reference to the network definition.
     fn network(&self) -> &NetworkDefinition;
 }
@@ -189,8 +167,10 @@ pub trait Engine: Clone + Send + Sync + 'static {
 /// // Create executor (no storage parameter)
 /// let executor = RadixExecutor::new(network);
 ///
-/// // Run genesis (mutates storage)
-/// executor.run_genesis(&storage)?;
+/// // Bootstrap genesis: build (or reuse the cached) merged updates,
+/// // then install them on per-node storage.
+/// let merged = hyperscale_engine::prepared_genesis(executor.network(), &config);
+/// storage.install_genesis(&merged);
 ///
 /// // Execute transactions (reads/writes storage)
 /// let output = executor.execute_single_shard(&storage, &transactions)?;
@@ -229,38 +209,6 @@ impl RadixExecutor {
                 validator,
             }),
         }
-    }
-
-    /// Run genesis bootstrapping on the given storage.
-    ///
-    /// This initializes the Radix Engine state with system packages, faucet, etc.
-    /// Should be called once per simulation before any transactions.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`GenesisError`] if the genesis bootstrap fails.
-    pub fn run_genesis<S: SubstateDatabase + CommittableSubstateDatabase>(
-        &self,
-        storage: &mut S,
-    ) -> Result<(), GenesisError> {
-        GenesisBuilder::new(self.network.clone()).build(storage);
-        Ok(())
-    }
-
-    /// Run genesis with custom configuration.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`GenesisError`] if the genesis bootstrap fails.
-    pub fn run_genesis_with_config<S: SubstateDatabase + CommittableSubstateDatabase>(
-        &self,
-        storage: &mut S,
-        config: GenesisConfig,
-    ) -> Result<(), GenesisError> {
-        GenesisBuilder::new(self.network.clone())
-            .with_config(config)
-            .build(storage);
-        Ok(())
     }
 
     /// Execute single-shard transactions (READ-ONLY).
@@ -531,21 +479,6 @@ impl Engine for RadixExecutor {
         block_height: BlockHeight,
     ) -> Option<Vec<hyperscale_types::StateEntry>> {
         self.fetch_state_entries(storage, nodes, block_height)
-    }
-
-    fn run_genesis<S: SubstateDatabase + CommittableSubstateDatabase>(
-        &self,
-        storage: &mut S,
-    ) -> Result<(), GenesisError> {
-        Self::run_genesis(self, storage)
-    }
-
-    fn run_genesis_with_config<S: SubstateDatabase + CommittableSubstateDatabase>(
-        &self,
-        storage: &mut S,
-        config: GenesisConfig,
-    ) -> Result<(), GenesisError> {
-        Self::run_genesis_with_config(self, storage, config)
     }
 
     fn network(&self) -> &NetworkDefinition {

@@ -186,12 +186,11 @@ impl SimStorage {
 
     /// Write substate data at version 0 (no JMT computation).
     ///
-    /// Used during genesis bootstrap for each incremental Radix-engine
-    /// commit. Writes land in `current_state` at version 0; **no
-    /// state-history entries** are recorded — genesis has no pre-state
-    /// to preserve.
-    /// After all genesis commits, [`Self::finalize_genesis_jmt`] computes
-    /// the JMT once.
+    /// Genesis-install primitive: writes land in `current_state` at version 0
+    /// with **no state-history entries** — genesis has no pre-state to
+    /// preserve. Pair with [`Self::finalize_genesis_jmt`] to compute the JMT
+    /// root over the same updates; [`hyperscale_storage::GenesisCommit::install_genesis`]
+    /// composes both.
     ///
     /// # Panics
     ///
@@ -203,9 +202,9 @@ impl SimStorage {
 
     /// Compute the JMT once at version 0 from the merged genesis updates.
     ///
-    /// Called after all genesis bootstrap commits are complete. This avoids
-    /// computing intermediate JMT versions during genesis (which would collide
-    /// with block 1's version).
+    /// Called after [`Self::commit_substates_only`] has placed the substates
+    /// in `current_state`; this adds the JMT tree at version 0 so block 1
+    /// writes cleanly at version 1.
     ///
     /// # Returns
     /// The genesis state root hash (JMT root at version 0).
@@ -247,9 +246,10 @@ impl SimStorage {
     }
 }
 
-impl hyperscale_storage::SubstatesOnlyCommit for SimStorage {
-    fn commit_substates_only(&self, updates: &DatabaseUpdates) {
-        Self::commit_substates_only(self, updates);
+impl hyperscale_storage::GenesisCommit for SimStorage {
+    fn install_genesis(&self, merged: &DatabaseUpdates) -> StateRoot {
+        Self::commit_substates_only(self, merged);
+        Self::finalize_genesis_jmt(self, merged)
     }
 }
 

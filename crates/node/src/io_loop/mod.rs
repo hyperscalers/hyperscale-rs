@@ -44,7 +44,7 @@ use crate::protocol::transaction_fetch::{TransactionFetchInput, TransactionFetch
 use arc_swap::ArcSwap;
 use hyperscale_core::{Action, NodeInput, ProtocolEvent, StateMachine, TimerId};
 use hyperscale_dispatch::Dispatch;
-use hyperscale_engine::{Engine, RadixExecutor, TransactionValidation};
+use hyperscale_engine::{Engine, GenesisConfig, RadixExecutor, TransactionValidation};
 use hyperscale_messages::TransactionGossip;
 use hyperscale_metrics as metrics;
 use hyperscale_network::Network;
@@ -419,31 +419,32 @@ where
         self.flush_block_commits();
     }
 
-    /// Access storage mutably and executor simultaneously.
+    /// Install engine genesis on this node's storage.
     ///
-    /// Needed for operations like genesis that require both references.
-    /// Rust's borrow checker can't split borrows through separate method calls.
+    /// Builds (or reuses) the cached merged [`hyperscale_storage::DatabaseUpdates`]
+    /// for `(network, config)`, commits substates, and computes the JMT root
+    /// at version 0. Returns the genesis state root.
     ///
-    /// After the closure returns (releasing sole Arc ownership), the inbound
-    /// request handler is automatically registered with the network.
-    ///
-    /// # Genesis initialization ordering
-    ///
-    /// Runners must follow this sequence:
-    /// 1. **Engine genesis** via `with_storage_and_executor()` — requires sole Arc
-    ///    ownership, then registers the inbound handler automatically
-    /// 2. **State-machine genesis** via `state_mut().initialize_genesis()` followed by
-    ///    `handle_actions()`, `flush_all_batches()`, and a `BlockCommitted` event
-    ///
-    pub fn with_storage_and_executor<R>(&mut self, f: impl FnOnce(&S, &E) -> R) -> R {
-        let result = f(&self.storage, &self.executor);
+    /// Independent of network-handler registration — runners call
+    /// [`Self::register_inbound_handlers`] once their genesis-or-resume
+    /// decision is settled.
+    pub fn install_engine_genesis(&mut self, config: &GenesisConfig) -> StateRoot
+    where
+        S: hyperscale_storage::GenesisCommit,
+    {
+        let merged = hyperscale_engine::prepared_genesis(self.executor.network(), config);
+        self.storage.install_genesis(&merged)
+    }
 
-        // Register handlers after genesis so the network layer can serve requests.
+    /// Register inbound network handlers (requests, gossip, notifications).
+    ///
+    /// Must be called once per node before the `IoLoop` starts processing
+    /// events. Both genesis and resume paths reach this — registration is
+    /// not coupled to whether genesis ran.
+    pub fn register_inbound_handlers(&mut self) {
         self.register_request_handler();
         self.register_gossip_handlers();
         self.register_notification_handlers();
-
-        result
     }
 
     // ─── Accessors ──────────────────────────────────────────────────────

@@ -637,13 +637,11 @@ impl RocksDbStorage {
 
     /// Write substate data at version 0 (no JMT computation).
     ///
-    /// Used during genesis bootstrap for each incremental Radix-engine
-    /// commit. Writes land in the unversioned `state` CF directly — no
-    /// state-history entries, because genesis has no pre-state to
-    /// preserve. Subsequent bootstrap calls read the accumulated state
-    /// via `snapshot_at(0)`. After all genesis commits complete,
-    /// [`Self::finalize_genesis_jmt`] computes the JMT once over the
-    /// merged updates — the substates are already in place by then.
+    /// Genesis-install primitive: writes land in the unversioned `state` CF
+    /// with **no state-history entries** — genesis has no pre-state to
+    /// preserve. Pair with [`Self::finalize_genesis_jmt`] to compute the JMT
+    /// root over the same updates;
+    /// [`hyperscale_storage::GenesisCommit::install_genesis`] composes both.
     ///
     /// # Panics
     ///
@@ -664,10 +662,8 @@ impl RocksDbStorage {
 
     /// Compute the JMT once at version 0 from the merged genesis updates.
     ///
-    /// Called after all genesis bootstrap commits are complete. The
-    /// substates are already in the state CF at version 0 from the
-    /// incremental `commit_substates_only` calls; this just adds the
-    /// JMT tree for cryptographic commitment.
+    /// Called after [`Self::commit_substates_only`] has placed the substates
+    /// in the state CF; this adds the JMT tree for cryptographic commitment.
     ///
     /// # Returns
     /// The genesis state root hash (JMT root at version 0).
@@ -715,10 +711,10 @@ impl RocksDbStorage {
     }
 }
 
-impl hyperscale_storage::SubstatesOnlyCommit for RocksDbStorage {
-    fn commit_substates_only(&self, updates: &DatabaseUpdates) {
-        // Delegate to the inherent method.
-        Self::commit_substates_only(self, updates);
+impl hyperscale_storage::GenesisCommit for RocksDbStorage {
+    fn install_genesis(&self, merged: &DatabaseUpdates) -> StateRoot {
+        Self::commit_substates_only(self, merged);
+        Self::finalize_genesis_jmt(self, merged)
     }
 }
 

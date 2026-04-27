@@ -8,10 +8,9 @@
 use crate::RadixExecutor;
 use crate::error::ExecutionError;
 use crate::executor::Engine;
-use crate::genesis::{GenesisConfig, GenesisError};
 use crate::result::{ExecutionOutput, SingleTxResult};
 use dashmap::DashMap;
-use hyperscale_storage::{CommittableSubstateDatabase, SubstateDatabase, SubstateStore};
+use hyperscale_storage::{SubstateDatabase, SubstateStore};
 use hyperscale_types::{
     BlockHeight, NodeId, RoutableTransaction, ShardGroupId, StateEntry, StateProvision, TxHash,
 };
@@ -163,21 +162,6 @@ impl Engine for SimulationEngine {
         block_height: BlockHeight,
     ) -> Option<Vec<StateEntry>> {
         self.inner.fetch_state_entries(storage, nodes, block_height)
-    }
-
-    fn run_genesis<S: SubstateDatabase + CommittableSubstateDatabase>(
-        &self,
-        storage: &mut S,
-    ) -> Result<(), GenesisError> {
-        self.inner.run_genesis(storage)
-    }
-
-    fn run_genesis_with_config<S: SubstateDatabase + CommittableSubstateDatabase>(
-        &self,
-        storage: &mut S,
-        config: GenesisConfig,
-    ) -> Result<(), GenesisError> {
-        self.inner.run_genesis_with_config(storage, config)
     }
 
     fn network(&self) -> &NetworkDefinition {

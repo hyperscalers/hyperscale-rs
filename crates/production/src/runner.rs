@@ -53,7 +53,7 @@ use hyperscale_network_libp2p::Libp2pNetwork;
 use hyperscale_network_libp2p::{
     Libp2pAdapter, Libp2pConfig, NetworkError, generate_random_keypair,
 };
-use hyperscale_storage::{ChainReader, GenesisWrapper};
+use hyperscale_storage::ChainReader;
 use hyperscale_storage_rocksdb::{RocksDbStorage, SharedStorage};
 use quick_cache::sync::Cache as QuickCache;
 
@@ -68,9 +68,6 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::oneshot;
 use tracing::{info, warn};
-
-/// Type alias for the production genesis wrapper.
-type GenesisMutWrapper<'a> = GenesisWrapper<'a, RocksDbStorage>;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // RunnerError
@@ -593,6 +590,8 @@ impl ProductionRunner {
 
         if has_blocks {
             info!("Existing blocks found, skipping genesis initialization");
+            // Resume path: state machine already has recovered state.
+            io_loop.register_inbound_handlers();
             return Vec::new();
         }
 
@@ -601,33 +600,15 @@ impl ProductionRunner {
             "No committed blocks - initializing genesis"
         );
 
-        // Run Radix Engine genesis to set up initial state.
-        //
-        // GenesisMutWrapper writes substates only (no JMT) during bootstrap, then
-        // we compute the JMT once at version 0. This ensures block 1 cleanly
-        // writes at JMT version 1 without colliding with genesis versions.
-        let genesis_config = self.genesis_config.take();
-        let genesis_jmt_root = io_loop.with_storage_and_executor(|storage, executor| {
-            // SharedStorage derefs to &RocksDbStorage.
-            let mut wrapper = GenesisMutWrapper::new(storage);
-            let result = if let Some(config) = genesis_config {
-                info!(
-                    xrd_balances = config.xrd_balances.len(),
-                    "Running genesis with custom configuration"
-                );
-                executor.run_genesis_with_config(&mut wrapper, config)
-            } else {
-                executor.run_genesis(&mut wrapper)
-            };
-
-            if let Err(e) = result {
-                panic!("Radix Engine genesis failed: {e:?}");
-            }
-
-            // Compute JMT once at version 0 from merged genesis updates.
-            let merged = wrapper.into_merged();
-            storage.finalize_genesis_jmt(&merged)
-        });
+        let genesis_config = self
+            .genesis_config
+            .take()
+            .unwrap_or_else(hyperscale_engine::GenesisConfig::production);
+        info!(
+            xrd_balances = genesis_config.xrd_balances.len(),
+            "Running genesis"
+        );
+        let genesis_jmt_root = io_loop.install_engine_genesis(&genesis_config);
 
         info!(
             genesis_jmt_root = ?genesis_jmt_root,
@@ -691,6 +672,9 @@ impl ProductionRunner {
 
         // Flush any batches from the genesis commit step.
         io_loop.flush_all_batches();
+
+        // Genesis path: state machine is now in sync with the JMT root.
+        io_loop.register_inbound_handlers();
 
         timer_ops
     }

@@ -7,14 +7,14 @@ use crate::event_queue::EventKey;
 use hyperscale_bft::{BftConfig, RecoveredState};
 use hyperscale_core::{NodeInput, ProtocolEvent, TimerId};
 use hyperscale_dispatch_sync::SyncDispatch;
-use hyperscale_engine::{Engine, RadixExecutor, SimExecutionCache, SimulationEngine};
+use hyperscale_engine::{RadixExecutor, SimExecutionCache, SimulationEngine};
 use hyperscale_mempool::MempoolConfig;
 use hyperscale_network_memory::{
     NetworkConfig, NetworkTrafficAnalyzer, NodeIndex, SimNetworkAdapter, SimulatedNetwork,
 };
 use hyperscale_node::io_loop::{IoLoop, StepOutput};
 use hyperscale_node::{NodeConfig, NodeStateMachine, TimerOp};
-use hyperscale_storage::{ChainReader, GenesisWrapper};
+use hyperscale_storage::ChainReader;
 use hyperscale_storage_memory::SimStorage;
 use hyperscale_topology::TopologyState;
 use hyperscale_types::{
@@ -28,13 +28,10 @@ use rand_chacha::ChaCha8Rng;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, info, trace};
 
 /// Type alias for the simulation's concrete `IoLoop`.
 type SimIoLoop = IoLoop<SimStorage, SimNetworkAdapter, SyncDispatch, SimulationEngine>;
-
-/// Type alias for the simulation's genesis wrapper.
-type SimGenesisWrapper<'a> = GenesisWrapper<'a, SimStorage>;
 
 /// Deterministic simulation runner.
 ///
@@ -392,28 +389,11 @@ impl SimulationRunner {
 
     /// Initialize all nodes with genesis blocks and start consensus.
     pub fn initialize_genesis(&mut self) {
-        // Run Radix Engine genesis on each node's storage.
-        // SimGenesisWrapper writes substates only (no JMT) during bootstrap,
-        // then computes JMT once at version 0 to avoid collisions with block 1.
-        for node_idx in 0..self.io_loops.len() {
-            if !self.genesis_executed[node_idx] {
-                self.io_loops[node_idx].with_storage_and_executor(|storage, executor| {
-                    let mut wrapper = SimGenesisWrapper::new(storage);
-                    if let Err(e) = executor.run_genesis(&mut wrapper) {
-                        warn!(node = node_idx, "Radix Engine genesis failed: {:?}", e);
-                        return;
-                    }
-                    let merged = wrapper.into_merged();
-                    storage.finalize_genesis_jmt(&merged);
-                });
-                self.genesis_executed[node_idx] = true;
-            }
-        }
+        self.install_engine_genesis(&hyperscale_engine::GenesisConfig::test_default(), |_| true);
         info!(
             num_nodes = self.io_loops.len(),
             "Radix Engine genesis complete on all nodes"
         );
-
         self.finalize_genesis();
     }
 
@@ -434,8 +414,6 @@ impl SimulationRunner {
             radix_common::math::Decimal,
         )],
     ) {
-        use hyperscale_engine::GenesisConfig;
-
         let num_shards = u64::from(self.network.config().num_shards);
         let validators_per_shard = self.network.config().validators_per_shard;
 
@@ -451,33 +429,30 @@ impl SimulationRunner {
                 .push((*address, *balance));
         }
 
-        // Run Radix Engine genesis on each node's storage with only its shard's accounts.
-        // SimGenesisWrapper writes substates only (no JMT) during bootstrap,
-        // then computes JMT once at version 0 to avoid collisions with block 1.
-        for node_idx in 0..self.io_loops.len() {
-            if !self.genesis_executed[node_idx] {
-                let shard_id = ShardGroupId(node_idx as u64 / u64::from(validators_per_shard));
-                let shard_balances = balances_by_shard
-                    .get(&shard_id)
-                    .cloned()
-                    .unwrap_or_default();
-
-                self.io_loops[node_idx].with_storage_and_executor(|storage, executor| {
-                    let mut wrapper = SimGenesisWrapper::new(storage);
-                    let config = GenesisConfig {
+        // Each node receives only its own shard's balances. Build one
+        // GenesisConfig per shard up-front; the engine cache then memoizes
+        // the merged DatabaseUpdates per unique config across the process.
+        let configs_by_shard: HashMap<ShardGroupId, hyperscale_engine::GenesisConfig> =
+            balances_by_shard
+                .into_iter()
+                .map(|(shard_id, shard_balances)| {
+                    let config = hyperscale_engine::GenesisConfig {
                         xrd_balances: shard_balances,
-                        ..GenesisConfig::test_default()
+                        ..hyperscale_engine::GenesisConfig::test_default()
                     };
-                    if let Err(e) = executor.run_genesis_with_config(&mut wrapper, config) {
-                        warn!(node = node_idx, "Radix Engine genesis failed: {:?}", e);
-                        return;
-                    }
-                    let merged = wrapper.into_merged();
-                    storage.finalize_genesis_jmt(&merged);
-                });
-                self.genesis_executed[node_idx] = true;
-            }
+                    (shard_id, config)
+                })
+                .collect();
+        let empty_config = hyperscale_engine::GenesisConfig::test_default();
+
+        for shard_idx in 0..self.network.config().num_shards {
+            let shard_id = ShardGroupId(u64::from(shard_idx));
+            let config = configs_by_shard.get(&shard_id).unwrap_or(&empty_config);
+            self.install_engine_genesis(config, |node_idx| {
+                ShardGroupId(node_idx as u64 / u64::from(validators_per_shard)) == shard_id
+            });
         }
+
         info!(
             num_nodes = self.io_loops.len(),
             num_funded_accounts = balances.len(),
@@ -487,11 +462,25 @@ impl SimulationRunner {
         self.finalize_genesis();
     }
 
-    /// Initialize state-machine genesis on all nodes.
-    ///
-    /// Called after engine genesis via `with_storage_and_executor` (which also
-    /// registers inbound handlers). Creates genesis blocks per shard and
-    /// initializes each node's state machine.
+    /// Apply a prepared engine genesis snapshot to every node selected by
+    /// `select`. Inbound handler registration happens once for all nodes in
+    /// [`Self::finalize_genesis`].
+    fn install_engine_genesis(
+        &mut self,
+        config: &hyperscale_engine::GenesisConfig,
+        mut select: impl FnMut(usize) -> bool,
+    ) {
+        for node_idx in 0..self.io_loops.len() {
+            if self.genesis_executed[node_idx] || !select(node_idx) {
+                continue;
+            }
+            self.io_loops[node_idx].install_engine_genesis(config);
+            self.genesis_executed[node_idx] = true;
+        }
+    }
+
+    /// Initialize state-machine genesis on all nodes and register inbound
+    /// network handlers. Called after engine genesis on every node.
     fn finalize_genesis(&mut self) {
         use hyperscale_storage::SubstateStore;
         use hyperscale_types::Block;
@@ -552,6 +541,11 @@ impl SimulationRunner {
                 validators = validators_per_shard,
                 "Initialized genesis for shard"
             );
+        }
+
+        // Wire each node into the in-memory network now that genesis is settled.
+        for io_loop in &mut self.io_loops {
+            io_loop.register_inbound_handlers();
         }
     }
 

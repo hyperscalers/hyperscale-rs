@@ -1193,13 +1193,11 @@ fn test_reset_partition_captures_history_for_all_removed_keys() {
 /// state-history CF — there is no pre-state to preserve.
 #[test]
 fn test_genesis_skips_history_entries() {
-    use hyperscale_storage::SubstatesOnlyCommit;
-
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
 
     let updates = make_database_update(vec![1u8; 50], 0, vec![1], vec![0xAA]);
-    <RocksDbStorage as SubstatesOnlyCommit>::commit_substates_only(&storage, &updates);
+    storage.commit_substates_only(&updates);
 
     // StateHistoryCf must be empty after a genesis-style commit.
     let history_count = {

@@ -960,12 +960,10 @@ fn test_reset_partition_captures_history_for_all_removed_keys() {
 /// until GC.
 #[test]
 fn test_genesis_skips_history_entries() {
-    use hyperscale_storage::SubstatesOnlyCommit;
-
     let storage = SimStorage::new();
 
     let updates = make_database_update(vec![1u8; 50], 0, vec![1], vec![0xAA]);
-    <SimStorage as SubstatesOnlyCommit>::commit_substates_only(&storage, &updates);
+    storage.commit_substates_only(&updates);
 
     // History map must be empty after a genesis-style commit.
     assert_eq!(

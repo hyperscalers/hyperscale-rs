@@ -83,6 +83,16 @@ impl hyperscale_storage::CommittableSubstateDatabase for SharedStorage {
     }
 }
 
+impl hyperscale_storage::GenesisCommit for SharedStorage {
+    fn install_genesis(
+        &self,
+        merged: &hyperscale_storage::DatabaseUpdates,
+    ) -> hyperscale_types::StateRoot {
+        self.0.commit_substates_only(merged);
+        self.0.finalize_genesis_jmt(merged)
+    }
+}
+
 impl SubstateStore for SharedStorage {
     type Snapshot<'a>
         = RocksDbSnapshot<'a>

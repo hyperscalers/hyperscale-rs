@@ -37,7 +37,7 @@ pub mod test_helpers;
 
 pub use chain_reader::{BlockForSync, ChainReader};
 pub use chain_writer::ChainWriter;
-pub use genesis::{GenesisWrapper, SubstatesOnlyCommit};
+pub use genesis::GenesisCommit;
 pub use overlay::{SubstateDbLookup, SubstateLookup};
 pub use pending_chain::{BaseReadCache, ChainEntry, PendingChain, SubstateView};
 pub use store::{SubstateStore, VersionedStore};
