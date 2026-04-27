@@ -648,6 +648,14 @@ impl ProvisionCoordinator {
     pub fn verified_remote_header_count(&self) -> usize {
         self.headers.len()
     }
+
+    /// Whether cross-shard provisions for `(source_shard, block_height)` are
+    /// currently expected — i.e. a verified remote header has registered an
+    /// expectation that hasn't yet been satisfied.
+    #[must_use]
+    pub fn is_expected(&self, source_shard: ShardGroupId, block_height: BlockHeight) -> bool {
+        self.expected.contains(source_shard, block_height)
+    }
 }
 
 #[cfg(test)]

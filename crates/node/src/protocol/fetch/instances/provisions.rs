@@ -14,13 +14,13 @@ pub type Scope = (ShardGroupId, BlockHeight);
 /// The typed fetch protocol instance for cross-shard provisions.
 pub type ProvisionFetch = ScopeFetch<Scope>;
 
-/// Stale-scope predicate. Conservative for now: rely on `Admitted` to drop
-/// completed entries and the retry budget to drop unanswerable ones. A
-/// more aggressive predicate could consult `ProvisionCoordinator`'s
-/// expected-tracking once that exposes a public accessor.
+/// A scope is stale once `ProvisionCoordinator` no longer expects provisions
+/// for it: the verified remote header that registered the expectation has
+/// either been satisfied (provisions verified) or pruned.
 #[must_use]
-pub const fn is_stale(_state: &NodeStateMachine, _scope: &Scope) -> bool {
-    false
+pub fn is_stale(state: &NodeStateMachine, scope: &Scope) -> bool {
+    let (shard, height) = *scope;
+    !state.provisions().is_expected(shard, height)
 }
 
 /// Build the scope key for a `(source_shard, block_height)` pair.

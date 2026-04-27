@@ -34,11 +34,11 @@ use crate::io_loop::block_commit::BlockCommitCoordinator;
 use crate::io_loop::caches::SharedCaches;
 use crate::protocol::fetch::hashset_fetch::HashSetFetchConfig;
 use crate::protocol::fetch::instances::exec_certs::{self, ExecCertFetch};
-use crate::protocol::fetch::instances::finalized_waves::FinalizedWaveFetch;
+use crate::protocol::fetch::instances::finalized_waves::{self, FinalizedWaveFetch};
 use crate::protocol::fetch::instances::headers::{self, HeaderFetch};
-use crate::protocol::fetch::instances::local_provisions::LocalProvisionFetch;
+use crate::protocol::fetch::instances::local_provisions::{self, LocalProvisionFetch};
 use crate::protocol::fetch::instances::provisions::{self, ProvisionFetch};
-use crate::protocol::fetch::instances::transactions::TransactionFetch;
+use crate::protocol::fetch::instances::transactions::{self, TransactionFetch};
 use crate::protocol::fetch::scope_fetch::ScopeFetchConfig;
 use crate::protocol::fetch::{HashSetFetchInput, ScopeFetchInput};
 use crate::protocol::sync::{SyncInput, SyncProtocol, SyncStatus};
@@ -683,12 +683,18 @@ where
             }
 
             NodeInput::FetchTick => {
+                self.transaction_fetch
+                    .evict_stale(|s| transactions::is_stale(&self.state, s));
                 let outputs = self.transaction_fetch.handle(HashSetFetchInput::Tick);
                 self.process_transaction_fetch_outputs(outputs);
                 // Also tick the local provision fetch protocol.
+                self.local_provision_fetch
+                    .evict_stale(|s| local_provisions::is_stale(&self.state, s));
                 let local_prov_outputs = self.local_provision_fetch.handle(HashSetFetchInput::Tick);
                 self.process_local_provision_fetch_outputs(local_prov_outputs);
                 // Also tick the finalized wave fetch protocol.
+                self.finalized_wave_fetch
+                    .evict_stale(|s| finalized_waves::is_stale(&self.state, s));
                 let wave_outputs = self.finalized_wave_fetch.handle(HashSetFetchInput::Tick);
                 self.process_finalized_wave_fetch_outputs(wave_outputs);
                 // Also tick the provision fetch protocol.

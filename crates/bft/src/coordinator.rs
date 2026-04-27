@@ -3146,6 +3146,12 @@ impl BftCoordinator {
         self.committed_height
     }
 
+    /// Whether a pending block is currently being assembled for `block_hash`.
+    #[must_use]
+    pub fn has_pending_block(&self, block_hash: BlockHash) -> bool {
+        self.pending_blocks.contains_key(&block_hash)
+    }
+
     /// Get the committed block hash.
     #[must_use]
     pub const fn committed_hash(&self) -> BlockHash {

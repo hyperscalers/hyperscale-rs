@@ -81,6 +81,12 @@ impl ExpectedProvisionTracker {
         self.expected.len()
     }
 
+    /// Whether an expectation is currently registered for
+    /// `(source_shard, block_height)`.
+    pub(crate) fn contains(&self, source_shard: ShardGroupId, block_height: BlockHeight) -> bool {
+        self.expected.contains_key(&(source_shard, block_height))
+    }
+
     /// Register an expectation for provisions at `(source_shard, block_height)`.
     /// No-op if an expectation is already registered for the same key.
     pub(crate) fn register(
