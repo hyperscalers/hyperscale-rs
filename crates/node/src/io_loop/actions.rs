@@ -4,7 +4,9 @@ use super::IoLoop;
 use super::TimerOp;
 use super::block_commit::{AccumulateDecision, PendingCommit};
 use crate::action_handler::{self, ActionContext, DispatchPool};
-use crate::protocol::fetch::instances::{exec_certs, headers, provisions};
+use crate::protocol::fetch::instances::{
+    exec_certs, finalized_waves, headers, local_provisions, provisions, transactions,
+};
 use crate::protocol::fetch::{HashSetFetchInput, PeerSource, ScopeFetchInput};
 use crate::protocol::sync::SyncInput;
 use hyperscale_core::{Action, CommitSource, FetchRequest, NodeInput, ProtocolEvent, StateMachine};
@@ -13,7 +15,7 @@ use hyperscale_engine::Engine;
 use hyperscale_metrics as metrics;
 use hyperscale_network::Network;
 use hyperscale_storage::{ChainWriter, Storage};
-use hyperscale_types::{Block, BlockHeight, QuorumCertificate, StateRoot, TxHash, ValidatorId};
+use hyperscale_types::{Block, BlockHeight, QuorumCertificate, StateRoot, ValidatorId};
 use std::sync::Arc;
 use tracing::{debug, trace, warn};
 impl<S, N, D, E> IoLoop<S, N, D, E>
@@ -43,52 +45,26 @@ where
             // Internal events
             // ═══════════════════════════════════════════════════════════
             Action::Continuation(pe) => {
-                match &pe {
-                    ProtocolEvent::RemoteHeaderVerified { committed_header } => {
-                        let scope = headers::scope_for(
-                            committed_header.shard_group_id(),
-                            committed_header.height(),
-                        );
-                        self.header_fetch
-                            .handle(ScopeFetchInput::Admitted { scope });
+                // Each fetch instance owns its own admission predicate; the
+                // arm just dispatches the event through them. Adding a new
+                // payload is one new helper + one line here.
+                transactions::apply_admission(&mut self.transaction_fetch, &pe);
+                local_provisions::apply_admission(&mut self.local_provision_fetch, &pe);
+                finalized_waves::apply_admission(&mut self.finalized_wave_fetch, &pe);
+                provisions::apply_admission(&mut self.provision_fetch, &pe);
+                exec_certs::apply_admission(&mut self.exec_cert_fetch, &pe);
+                headers::apply_admission(&mut self.header_fetch, &pe);
+
+                // Serving-cache insertion is io_loop's own state, not an
+                // instance concern — keep it here.
+                if let ProtocolEvent::FinalizedWavesAdmitted { waves } = &pe {
+                    for wave in waves {
+                        self.caches
+                            .finalized_wave
+                            .insert(wave.wave_id_hash(), Arc::clone(wave));
                     }
-                    ProtocolEvent::ProvisionsVerified { provisions, .. } => {
-                        let scope =
-                            provisions::scope_for(provisions.source_shard, provisions.block_height);
-                        self.provision_fetch
-                            .handle(ScopeFetchInput::Admitted { scope });
-                        // Same canonical admission also drains the local
-                        // per-block fetch tracking — keyed by provision hash,
-                        // not source-shard scope.
-                        self.local_provision_fetch
-                            .handle(HashSetFetchInput::Admitted {
-                                ids: vec![provisions.hash()],
-                            });
-                    }
-                    ProtocolEvent::TransactionsAdmitted { txs } => {
-                        let ids: Vec<TxHash> = txs.iter().map(|tx| tx.hash()).collect();
-                        self.transaction_fetch
-                            .handle(HashSetFetchInput::Admitted { ids });
-                    }
-                    ProtocolEvent::FinalizedWavesAdmitted { waves } => {
-                        let ids: Vec<_> = waves.iter().map(|w| w.wave_id_hash()).collect();
-                        self.finalized_wave_fetch
-                            .handle(HashSetFetchInput::Admitted { ids });
-                        // Populate the serving cache so peers can fetch any
-                        // wave we admit — locally finalized or fetched.
-                        for wave in waves {
-                            self.caches
-                                .finalized_wave
-                                .insert(wave.wave_id_hash(), Arc::clone(wave));
-                        }
-                    }
-                    ProtocolEvent::ExecutionCertificateAdmitted { wave_id } => {
-                        self.exec_cert_fetch.handle(HashSetFetchInput::Admitted {
-                            ids: vec![wave_id.clone()],
-                        });
-                    }
-                    _ => {}
                 }
+
                 let _ = self.event_sender.send(NodeInput::Protocol(pe));
             }
 

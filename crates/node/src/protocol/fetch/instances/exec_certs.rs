@@ -5,8 +5,9 @@
 //! entries are evicted when the local committed height passes the source
 //! block height — older waves are unrecoverable.
 
-use crate::protocol::fetch::HashSetFetch;
+use crate::protocol::fetch::{HashSetFetch, HashSetFetchInput};
 use crate::state::NodeStateMachine;
+use hyperscale_core::ProtocolEvent;
 use hyperscale_types::{BlockHeight, ShardGroupId, WaveId};
 
 /// Composite scope key — source shard plus source block height.
@@ -22,6 +23,16 @@ pub type ExecCertFetch = HashSetFetch<Scope, WaveId>;
 pub fn is_stale(state: &NodeStateMachine, scope: &Scope) -> bool {
     let (_, height) = *scope;
     state.bft().committed_height() >= height
+}
+
+/// Drain the admitted `wave_id` from the fetch protocol on the canonical
+/// admission event.
+pub fn apply_admission(fetch: &mut ExecCertFetch, event: &ProtocolEvent) {
+    if let ProtocolEvent::ExecutionCertificateAdmitted { wave_id } = event {
+        fetch.handle(HashSetFetchInput::Admitted {
+            ids: vec![wave_id.clone()],
+        });
+    }
 }
 
 /// Build the scope key for a `(source_shard, block_height)` pair.

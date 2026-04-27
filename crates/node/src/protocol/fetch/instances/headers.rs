@@ -5,8 +5,9 @@
 //! payload-specific knowledge: scope-to-wire-request translation, stale
 //! predicate, admission triggers.
 
-use crate::protocol::fetch::ScopeFetch;
+use crate::protocol::fetch::{ScopeFetch, ScopeFetchInput};
 use crate::state::NodeStateMachine;
+use hyperscale_core::ProtocolEvent;
 use hyperscale_types::{BlockHeight, ShardGroupId};
 
 /// Composite scope key for cross-shard header fetches.
@@ -22,6 +23,14 @@ pub type HeaderFetch = ScopeFetch<Scope>;
 pub fn is_stale(state: &NodeStateMachine, scope: &Scope) -> bool {
     let (shard, height) = *scope;
     state.remote_headers().has_verified(shard, height)
+}
+
+/// Drain the matching scope on the canonical admission event.
+pub fn apply_admission(fetch: &mut HeaderFetch, event: &ProtocolEvent) {
+    if let ProtocolEvent::RemoteHeaderVerified { committed_header } = event {
+        let scope = scope_for(committed_header.shard_group_id(), committed_header.height());
+        fetch.handle(ScopeFetchInput::Admitted { scope });
+    }
 }
 
 /// Build the scope key for a verified header.
