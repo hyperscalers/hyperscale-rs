@@ -74,6 +74,13 @@ where
                         let ids: Vec<_> = waves.iter().map(|w| w.wave_id_hash()).collect();
                         self.finalized_wave_fetch
                             .handle(HashSetFetchInput::Admitted { ids });
+                        // Populate the serving cache so peers can fetch any
+                        // wave we admit — locally finalized or fetched.
+                        for wave in waves {
+                            self.caches
+                                .finalized_wave
+                                .insert(wave.wave_id_hash(), Arc::clone(wave));
+                        }
                     }
                     ProtocolEvent::ExecutionCertificateAdmitted { wave_id } => {
                         self.exec_cert_fetch.handle(HashSetFetchInput::Admitted {
@@ -307,8 +314,13 @@ where
             // ═══════════════════════════════════════════════════════════
             // Storage
             // ═══════════════════════════════════════════════════════════
-            Action::CacheFinalizedWave { .. } | Action::FetchChainMetadata => {
-                self.process_storage_action(action);
+            Action::FetchChainMetadata => {
+                let height = self.storage.committed_height();
+                let hash = self.storage.committed_hash();
+                let qc = self.storage.latest_qc();
+                let _ = self.event_sender.send(NodeInput::Protocol(
+                    ProtocolEvent::ChainMetadataFetched { height, hash, qc },
+                ));
             }
 
             // ═══════════════════════════════════════════════════════════
@@ -424,25 +436,6 @@ where
     }
 
     // ─── Action Handler Groups ──────────────────────────────────────────
-
-    /// Process storage read/write actions.
-    fn process_storage_action(&self, action: Action) {
-        match action {
-            Action::CacheFinalizedWave { wave } => {
-                let wave_id_hash = wave.wave_id_hash();
-                self.caches.finalized_wave.insert(wave_id_hash, wave);
-            }
-            Action::FetchChainMetadata => {
-                let height = self.storage.committed_height();
-                let hash = self.storage.committed_hash();
-                let qc = self.storage.latest_qc();
-                let _ = self.event_sender.send(NodeInput::Protocol(
-                    ProtocolEvent::ChainMetadataFetched { height, hash, qc },
-                ));
-            }
-            _ => unreachable!(),
-        }
-    }
 
     /// Handler for [`Action::CommitBlockByQcOnly`].
     ///

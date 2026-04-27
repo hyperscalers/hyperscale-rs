@@ -1561,16 +1561,13 @@ impl ExecutionCoordinator {
         let finalized_arc = Arc::new(finalized.clone());
         self.finalized.insert(wave_id.clone(), finalized);
 
-        // Cache the finalized wave so peers can fetch the complete data they
-        // need to vote on blocks containing this wave.
-        let mut actions = vec![
-            Action::CacheFinalizedWave {
-                wave: Arc::clone(&finalized_arc),
-            },
-            Action::Continuation(ProtocolEvent::FinalizedWavesAdmitted {
+        // Single admission event covers both the BFT subscriber and the
+        // io_loop serving cache (via the Continuation interception arm).
+        let mut actions = vec![Action::Continuation(
+            ProtocolEvent::FinalizedWavesAdmitted {
                 waves: vec![finalized_arc],
-            }),
-        ];
+            },
+        )];
 
         actions.push(Action::Continuation(ProtocolEvent::WaveCompleted {
             wave_cert: cert_arc,
@@ -2500,22 +2497,21 @@ mod tests {
     }
 
     #[test]
-    fn test_finalize_wave_emits_cache_wave_completed_and_per_tx_events() {
+    fn test_finalize_wave_emits_admission_and_completion_events() {
         let mut state = make_test_state();
         let (wave_id, wave) = make_ready_single_shard_wave(&[1, 2]);
         state.waves.insert_wave(wave_id.clone(), wave);
 
         let actions = state.finalize_wave(&wave_id);
 
-        // 1 CacheFinalizedWave + 1 FinalizedWavesAdmitted + 1 WaveCompleted = 3.
-        assert_eq!(actions.len(), 3);
-        assert!(matches!(actions[0], Action::CacheFinalizedWave { .. }));
+        // 1 FinalizedWavesAdmitted + 1 WaveCompleted = 2.
+        assert_eq!(actions.len(), 2);
         assert!(matches!(
-            actions[1],
+            actions[0],
             Action::Continuation(ProtocolEvent::FinalizedWavesAdmitted { .. })
         ));
         assert!(matches!(
-            actions[2],
+            actions[1],
             Action::Continuation(ProtocolEvent::WaveCompleted { .. })
         ));
     }

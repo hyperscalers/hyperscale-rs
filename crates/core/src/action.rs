@@ -607,16 +607,6 @@ pub enum Action {
     // ═══════════════════════════════════════════════════════════════════════
     // Storage: Execution
     // ═══════════════════════════════════════════════════════════════════════
-    /// Cache a finalized wave so peers can fetch it.
-    ///
-    /// Emitted by `finalize_wave` in `ExecutionCoordinator` when a wave completes.
-    /// The `io_loop` inserts the `FinalizedWave` into `finalized_wave_cache`,
-    /// keyed by `wave_id.hash()` (matches `BlockManifest.cert_hashes`).
-    CacheFinalizedWave {
-        /// Finalized wave to cache.
-        wave: Arc<FinalizedWave>,
-    },
-
     /// Persist receipt bundles to disk. Fire-and-forget — no `ProtocolEvent` response.
     // ═══════════════════════════════════════════════════════════════════════
     // Global Consensus / Epoch Management

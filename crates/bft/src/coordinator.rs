@@ -2453,12 +2453,16 @@ impl BftCoordinator {
             source: CommitSource::Sync,
         }];
 
-        // Cache constructed FinalizedWaves so other syncing nodes can fetch
-        // them via FinalizedWaveFetchProtocol.
-        for wave in block.certificates() {
-            actions.push(Action::CacheFinalizedWave {
-                wave: Arc::clone(wave),
-            });
+        // Admit the synced block's wave certs through the canonical pathway
+        // — io_loop's `Continuation(FinalizedWavesAdmitted)` interception
+        // populates the serving cache so other peers can fetch from us.
+        let synced_waves: Vec<_> = block.certificates().iter().map(Arc::clone).collect();
+        if !synced_waves.is_empty() {
+            actions.push(Action::Continuation(
+                ProtocolEvent::FinalizedWavesAdmitted {
+                    waves: synced_waves,
+                },
+            ));
         }
 
         actions

@@ -9,8 +9,8 @@
 //!
 //! The caches are independent of the consensus state machine; the `io_loop`
 //! mutates them in response to outbound events (`TrackExecutionCertificate`,
-//! `CacheFinalizedWave`, validated transactions, terminal status), and
-//! handlers read them on remote-peer requests.
+//! `Continuation(FinalizedWavesAdmitted)`, validated transactions, terminal
+//! status), and handlers read them on remote-peer requests.
 
 use hyperscale_provisions::ProvisionStore;
 use hyperscale_types::{
@@ -42,8 +42,9 @@ pub struct SharedCaches {
     /// Latest emitted status per transaction. Survives mempool eviction so
     /// RPC `tx_status` lookups can answer for finalized/expired txs.
     pub tx_status: Arc<QuickCache<TxHash, TransactionStatus>>,
-    /// Finalized waves, keyed by wave-id hash. Populated by
-    /// `CacheFinalizedWave`; queried by the inbound finalized-wave handler.
+    /// Finalized waves, keyed by wave-id hash. Populated by `io_loop`'s
+    /// `Continuation(FinalizedWavesAdmitted)` interception; queried by the
+    /// inbound finalized-wave handler.
     pub finalized_wave: Arc<QuickCache<WaveIdHash, Arc<FinalizedWave>>>,
     /// Outbound + local provision store, owned by the
     /// [`ProvisionCoordinator`]. Cloned here so handlers (block, block-topup,
