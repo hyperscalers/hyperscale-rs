@@ -412,8 +412,8 @@ const LIVE_WINDOW: Duration = Duration::from_secs(WAVE_TIMEOUT.as_secs() + SERVE
 /// depend on the requester's view.
 ///
 /// On cache miss inside the live window the block is still served as
-/// `Sealed`; the requester can fetch missing provisions via
-/// `ProvisionFetchProtocol` rather than round-robining peers.
+/// `Sealed`; the requester fetches missing provisions through the cross-shard
+/// provision fetch instead of round-robining peers.
 pub fn serve_block_request(
     storage: &impl ChainReader,
     provision_store: &ProvisionStore,

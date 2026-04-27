@@ -329,8 +329,6 @@ where
         }
     }
 
-    /// Process `ProvisionFetchProtocol` outputs.
-    ///
     /// Dispatch outputs from the cross-shard provision fetch.
     ///
     /// On a successful response, the verified-shape provisions are fed
