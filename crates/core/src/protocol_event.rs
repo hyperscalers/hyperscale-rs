@@ -364,6 +364,17 @@ pub enum ProtocolEvent {
         submitted_locally: bool,
     },
 
+    /// An execution certificate was just admitted to the canonical EC store.
+    ///
+    /// Emitted by `ExecutionCoordinator::on_wave_certificate` for both
+    /// broadcast-delivered and fetch-delivered certs. `io_loop` intercepts
+    /// the matching `Continuation` arm and drains the exec-cert fetch
+    /// protocol's in-flight tracking by `wave_id`.
+    ExecutionCertificateAdmitted {
+        /// Wave the certificate covers.
+        wave_id: WaveId,
+    },
+
     /// Finalized waves were just admitted to the canonical execution store.
     ///
     /// Emitted by `ExecutionCoordinator` (wrapped in `Action::Continuation`)

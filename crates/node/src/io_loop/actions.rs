@@ -75,6 +75,11 @@ where
                         self.finalized_wave_fetch
                             .handle(HashSetFetchInput::Admitted { ids });
                     }
+                    ProtocolEvent::ExecutionCertificateAdmitted { wave_id } => {
+                        self.exec_cert_fetch.handle(HashSetFetchInput::Admitted {
+                            ids: vec![wave_id.clone()],
+                        });
+                    }
                     _ => {}
                 }
                 let _ = self.event_sender.send(NodeInput::Protocol(pe));

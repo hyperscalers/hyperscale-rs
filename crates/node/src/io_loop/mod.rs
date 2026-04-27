@@ -733,17 +733,16 @@ where
             }
 
             // ── Execution certificate fetch protocol ─────────────────
+            //
+            // Each delivered cert flows through `on_wave_certificate`, which
+            // emits `Continuation(ExecutionCertificateAdmitted)`. io_loop's
+            // interception arm drains the exec-cert fetch protocol by
+            // wave_id — same shape as broadcast-delivered certs.
             NodeInput::ExecCertFetchReceived {
                 source_shard,
                 block_height,
                 certificates,
             } => {
-                // Drain delivered wave_ids from in-flight tracking, then feed
-                // certs into the state machine the same way broadcast-arrived
-                // certs are processed.
-                let ids: Vec<_> = certificates.iter().map(|c| c.wave_id.clone()).collect();
-                self.exec_cert_fetch
-                    .handle(HashSetFetchInput::Admitted { ids });
                 for cert in certificates {
                     self.feed_event(ProtocolEvent::ExecutionCertificateReceived { cert });
                 }

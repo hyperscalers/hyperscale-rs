@@ -789,7 +789,11 @@ impl StateMachine for NodeStateMachine {
             | ProtocolEvent::ShardSplitInitiated { .. }
             | ProtocolEvent::ShardSplitComplete { .. }
             | ProtocolEvent::ShardMergeInitiated { .. }
-            | ProtocolEvent::ShardMergeComplete { .. } => vec![],
+            | ProtocolEvent::ShardMergeComplete { .. }
+            // Pure admission signal — io_loop drains the exec-cert fetch
+            // protocol via the `Continuation` interception arm; the state
+            // machine itself has nothing to do here.
+            | ProtocolEvent::ExecutionCertificateAdmitted { .. } => vec![],
 
             ProtocolEvent::FinalizedWavesAdmitted { waves } => self
                 .bft

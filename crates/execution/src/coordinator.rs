@@ -996,7 +996,15 @@ impl ExecutionCoordinator {
             self.committed_ts,
         );
 
-        let mut actions = Vec::new();
+        // Canonical admission: drains the exec-cert fetch protocol via the
+        // matching `Continuation` arm in io_loop, regardless of whether the
+        // cert arrived by broadcast or fetch. Verification gates downstream
+        // effects, but the fetch-protocol drain happens at admission.
+        let mut actions = vec![Action::Continuation(
+            ProtocolEvent::ExecutionCertificateAdmitted {
+                wave_id: cert.wave_id.clone(),
+            },
+        )];
 
         // If a fallback fetch was already dispatched for this expectation, tell
         // the fetch protocol to drop it — otherwise it would keep retrying
