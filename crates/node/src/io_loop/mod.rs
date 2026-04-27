@@ -607,10 +607,12 @@ where
                 // the outer fetch is being re-attempted, and the topup
                 // round we scheduled for it is no longer relevant.
                 self.pending_block_topups.remove(&height);
-                let outputs = self
-                    .sync_protocol
-                    .handle(SyncInput::BlockFetchFailed { height });
+                let outputs = self.sync_protocol.handle(SyncInput::BlockFetchFailed {
+                    height,
+                    now: std::time::Instant::now(),
+                });
                 self.process_sync_outputs(outputs);
+                self.update_fetch_tick_timer();
             }
 
             NodeInput::SyncBlockTopUpReceived { height, response } => {
@@ -676,6 +678,10 @@ where
                 // instance's `is_abandoned` predicate, then drive any pending
                 // chunks via `Tick`.
                 let now = std::time::Instant::now();
+
+                // Promote any sync heights whose backoff has elapsed.
+                let outputs = self.sync_protocol.handle(SyncInput::Tick { now });
+                self.process_sync_outputs(outputs);
 
                 self.transaction_fetch
                     .evict_abandoned(|s| transactions::is_abandoned(&self.state, s));

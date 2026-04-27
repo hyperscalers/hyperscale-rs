@@ -13,7 +13,7 @@
 //! Production: `SyncManager` wraps this, maps outputs to tokio tasks.
 //! Simulation: feeds inputs/outputs synchronously via event queue.
 
-use super::fetch::SlotTracker;
+use super::fetch::{RetryClock, SlotTracker};
 use hyperscale_messages::request::{GetBlockRequest, GetBlockTopUpRequest};
 use hyperscale_messages::response::{
     ElidedCertifiedBlock, GetBlockResponse, GetBlockTopUpResponse,
@@ -24,9 +24,9 @@ use hyperscale_storage::ChainReader;
 use hyperscale_types::{BlockHash, BlockHeight, CertifiedBlock, Provisions, WAVE_TIMEOUT};
 use serde::Serialize;
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{info, trace, warn};
 
 /// Configuration for the sync protocol.
@@ -113,11 +113,15 @@ pub enum SyncInput {
     BlockResponseReceived {
         height: BlockHeight,
         block: Option<Box<CertifiedBlock>>,
+        now: Instant,
     },
     /// A block fetch failed after all retries.
-    BlockFetchFailed { height: BlockHeight },
+    BlockFetchFailed { height: BlockHeight, now: Instant },
     /// A block was committed by the state machine.
     BlockCommitted { height: BlockHeight },
+    /// Periodic tick: promotes deferred heights whose backoff has elapsed
+    /// back into the fetch queue.
+    Tick { now: Instant },
 }
 
 /// Outputs from the sync protocol state machine.
@@ -148,6 +152,9 @@ pub struct SyncProtocol {
     heights_to_fetch: BinaryHeap<Reverse<BlockHeight>>,
     heights_queued: HashSet<BlockHeight>,
     in_flight: SlotTracker<BlockHeight>,
+    /// Heights whose last fetch failed; held out of `heights_to_fetch`
+    /// until their `RetryClock` deadline elapses.
+    deferred: HashMap<BlockHeight, RetryClock>,
 }
 
 impl SyncProtocol {
@@ -161,7 +168,14 @@ impl SyncProtocol {
             heights_to_fetch: BinaryHeap::new(),
             heights_queued: HashSet::new(),
             in_flight,
+            deferred: HashMap::new(),
         }
+    }
+
+    /// True if any heights are parked awaiting backoff. Lets the runner
+    /// keep its periodic tick alive while the heap may be empty.
+    pub fn has_deferred(&self) -> bool {
+        !self.deferred.is_empty()
     }
 
     /// Process an input and return outputs.
@@ -171,11 +185,14 @@ impl SyncProtocol {
                 target_height,
                 target_hash,
             } => self.handle_start_sync(target_height, target_hash),
-            SyncInput::BlockResponseReceived { height, block } => {
-                self.handle_block_response(height, block.map(|b| *b))
+            SyncInput::BlockResponseReceived { height, block, now } => {
+                self.handle_block_response(height, block.map(|b| *b), now)
             }
-            SyncInput::BlockFetchFailed { height } => self.handle_block_fetch_failed(height),
+            SyncInput::BlockFetchFailed { height, now } => {
+                self.handle_block_fetch_failed(height, now)
+            }
             SyncInput::BlockCommitted { height } => self.handle_block_committed(height),
+            SyncInput::Tick { now } => self.handle_tick(now),
         }
     }
 
@@ -204,7 +221,7 @@ impl SyncProtocol {
                 .sync_target
                 .map_or(0, |(t, _)| t.0.saturating_sub(self.committed_height.0)),
             pending_fetches: self.in_flight.in_flight(),
-            queued_heights: self.heights_queued.len(),
+            queued_heights: self.heights_queued.len() + self.deferred.len(),
         }
     }
 
@@ -237,6 +254,7 @@ impl SyncProtocol {
         &mut self,
         height: BlockHeight,
         response: Option<CertifiedBlock>,
+        now: Instant,
     ) -> Vec<SyncOutput> {
         self.in_flight.release(&height);
 
@@ -249,7 +267,7 @@ impl SyncProtocol {
                     "Height mismatch in sync response"
                 );
                 metrics::record_sync_block_filtered("height_mismatch");
-                self.queue_height(height);
+                self.defer_height(height, now);
                 return self.emit_fetch_outputs();
             }
 
@@ -257,20 +275,22 @@ impl SyncProtocol {
             if qc.block_hash != block_hash {
                 warn!(height = height.0, "QC block hash mismatch in sync response");
                 metrics::record_sync_block_filtered("qc_hash_mismatch");
-                self.queue_height(height);
+                self.defer_height(height, now);
                 return self.emit_fetch_outputs();
             }
 
             if qc.height != height {
                 warn!(height = height.0, "QC height mismatch in sync response");
                 metrics::record_sync_block_filtered("qc_height_mismatch");
-                self.queue_height(height);
+                self.defer_height(height, now);
                 return self.emit_fetch_outputs();
             }
 
             trace!(height = height.0, "Valid sync block received");
             metrics::record_sync_block_downloaded();
             metrics::record_sync_block_verified();
+            // Block validated end-to-end — drop any prior backoff for this height.
+            self.deferred.remove(&height);
             let certified = CertifiedBlock::new_unchecked(block, qc);
             let mut outputs = vec![SyncOutput::DeliverBlock {
                 certified: Box::new(certified),
@@ -278,18 +298,46 @@ impl SyncProtocol {
             outputs.extend(self.emit_fetch_outputs());
             outputs
         } else {
-            warn!(height = height.0, "Empty sync response, re-queuing");
             metrics::record_sync_response_error("empty_response");
-            self.queue_height(height);
+            self.defer_height(height, now);
             self.emit_fetch_outputs()
         }
     }
 
-    fn handle_block_fetch_failed(&mut self, height: BlockHeight) -> Vec<SyncOutput> {
+    fn handle_block_fetch_failed(&mut self, height: BlockHeight, now: Instant) -> Vec<SyncOutput> {
         self.in_flight.release(&height);
-        warn!(height = height.0, "Sync fetch failed, re-queuing");
         metrics::record_sync_response_error("fetch_failed");
-        self.queue_height(height);
+        self.defer_height(height, now);
+        self.emit_fetch_outputs()
+    }
+
+    /// Park `height` on its `RetryClock` instead of re-queuing immediately.
+    /// A subsequent `Tick` whose `now` clears the deadline promotes it back
+    /// to `heights_to_fetch`.
+    fn defer_height(&mut self, height: BlockHeight, now: Instant) {
+        let clock = self.deferred.entry(height).or_default();
+        clock.advance_round(now);
+        warn!(
+            height = height.0,
+            "Sync fetch failed; deferring re-queue for backoff"
+        );
+    }
+
+    fn handle_tick(&mut self, now: Instant) -> Vec<SyncOutput> {
+        // Promote ready heights into the fetch queue, but keep the clock
+        // entry — consecutive failures must accumulate rounds, only a
+        // successful response clears the entry.
+        let promoted: Vec<BlockHeight> = self
+            .deferred
+            .iter()
+            .filter(|(_, clock)| clock.is_ready(now))
+            .map(|(h, _)| *h)
+            .collect();
+        for h in promoted {
+            if !self.in_flight.contains(&h) && self.heights_queued.insert(h) {
+                self.heights_to_fetch.push(Reverse(h));
+            }
+        }
         self.emit_fetch_outputs()
     }
 
@@ -318,7 +366,10 @@ impl SyncProtocol {
     // ═══════════════════════════════════════════════════════════════════════
 
     fn queue_height(&mut self, height: BlockHeight) {
-        if !self.in_flight.contains(&height) && self.heights_queued.insert(height) {
+        if !self.in_flight.contains(&height)
+            && !self.deferred.contains_key(&height)
+            && self.heights_queued.insert(height)
+        {
             self.heights_to_fetch.push(Reverse(height));
         }
     }
@@ -335,11 +386,13 @@ impl SyncProtocol {
     fn clear_height_queue(&mut self) {
         self.heights_to_fetch.clear();
         self.heights_queued.clear();
+        self.deferred.clear();
     }
 
     fn remove_heights_at_or_below(&mut self, threshold: BlockHeight) {
         self.heights_queued.retain(|&h| h > threshold);
         self.in_flight.retain(|&h| h > threshold);
+        self.deferred.retain(|&h, _| h > threshold);
     }
 
     fn queue_heights_in_window(&mut self) {
@@ -590,23 +643,97 @@ mod tests {
     }
 
     #[test]
-    fn test_failed_fetch_requeues() {
+    fn test_failed_fetch_defers_then_requeues_on_tick() {
         let mut protocol = SyncProtocol::new(SyncConfig {
             max_concurrent_fetches: 1,
             sync_window_size: 10,
         });
 
         protocol.handle(SyncInput::StartSync {
-            target_height: BlockHeight(3),
+            target_height: BlockHeight(1),
             target_hash: BlockHash::ZERO,
         });
 
-        // Fail the first fetch
+        let t0 = Instant::now();
+
+        // Failure parks the height — no fetch should be re-emitted yet.
         let outputs = protocol.handle(SyncInput::BlockFetchFailed {
             height: BlockHeight(1),
+            now: t0,
+        });
+        assert!(
+            outputs
+                .iter()
+                .all(|o| !matches!(o, SyncOutput::FetchBlock { height, .. } if height.0 == 1)),
+            "deferred height must not be re-fetched immediately"
+        );
+        assert!(protocol.has_deferred());
+
+        // Tick before the deadline — still parked.
+        let outputs = protocol.handle(SyncInput::Tick {
+            now: t0 + Duration::from_millis(100),
+        });
+        assert!(outputs.is_empty());
+
+        // Tick past the first-round backoff (1s) — height promoted and fetched.
+        let outputs = protocol.handle(SyncInput::Tick {
+            now: t0 + Duration::from_secs(2),
+        });
+        assert!(
+            outputs
+                .iter()
+                .any(|o| matches!(o, SyncOutput::FetchBlock { height, .. } if height.0 == 1))
+        );
+        // Clock entry persists across promotion — only a successful response
+        // (or commit/clear) drops it, so consecutive failures keep advancing.
+        assert!(protocol.has_deferred());
+    }
+
+    #[test]
+    fn test_repeated_failures_extend_backoff() {
+        let mut protocol = SyncProtocol::new(SyncConfig {
+            max_concurrent_fetches: 1,
+            sync_window_size: 10,
+        });
+        protocol.handle(SyncInput::StartSync {
+            target_height: BlockHeight(1),
+            target_hash: BlockHash::ZERO,
         });
 
-        // Should re-emit a FetchBlock for height 1
+        let t0 = Instant::now();
+        protocol.handle(SyncInput::BlockFetchFailed {
+            height: BlockHeight(1),
+            now: t0,
+        });
+        // Promote at t0+1s.
+        let outputs = protocol.handle(SyncInput::Tick {
+            now: t0 + Duration::from_secs(1),
+        });
+        assert!(
+            outputs
+                .iter()
+                .any(|o| matches!(o, SyncOutput::FetchBlock { height, .. } if height.0 == 1))
+        );
+
+        // Fail again — second round backoff is 2s.
+        let t1 = t0 + Duration::from_secs(1);
+        protocol.handle(SyncInput::BlockFetchFailed {
+            height: BlockHeight(1),
+            now: t1,
+        });
+        // 1s after second failure: still parked.
+        let outputs = protocol.handle(SyncInput::Tick {
+            now: t1 + Duration::from_millis(1500),
+        });
+        assert!(
+            outputs
+                .iter()
+                .all(|o| !matches!(o, SyncOutput::FetchBlock { height, .. } if height.0 == 1))
+        );
+        // 2s after second failure: ready.
+        let outputs = protocol.handle(SyncInput::Tick {
+            now: t1 + Duration::from_secs(3),
+        });
         assert!(
             outputs
                 .iter()

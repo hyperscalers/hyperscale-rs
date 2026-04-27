@@ -217,9 +217,11 @@ where
         };
 
         if certificate_root_valid {
-            let outputs = self
-                .sync_protocol
-                .handle(SyncInput::BlockResponseReceived { height, block });
+            let outputs = self.sync_protocol.handle(SyncInput::BlockResponseReceived {
+                height,
+                block,
+                now: std::time::Instant::now(),
+            });
             self.process_sync_outputs(outputs);
         } else {
             let _ = self
@@ -589,7 +591,8 @@ where
             || self.finalized_wave_fetch.has_pending()
             || self.provision_fetch.has_pending()
             || self.exec_cert_fetch.has_pending()
-            || self.header_fetch.has_pending();
+            || self.header_fetch.has_pending()
+            || self.sync_protocol.has_deferred();
         let op = if any_pending {
             TimerOp::Set {
                 id: TimerId::FetchTick,
