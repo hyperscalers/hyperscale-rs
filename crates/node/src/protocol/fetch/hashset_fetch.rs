@@ -75,11 +75,6 @@ pub enum HashSetFetchInput<S, Id> {
         /// Ids whose payloads have been admitted to their canonical store.
         ids: Vec<Id>,
     },
-    /// Scope-level admission: drop the scope entirely.
-    AdmittedScope {
-        /// Scope to evict.
-        scope: S,
-    },
     /// Drive pending fetches: emit chunks up to per-scope and per-tick caps.
     Tick,
 }
@@ -174,7 +169,6 @@ impl<S: Eq + Hash + Ord + Clone + std::fmt::Debug, Id: Eq + Hash + Clone + std::
             }
             HashSetFetchInput::Failed { scope, ids } => self.handle_failed(&scope, &ids),
             HashSetFetchInput::Admitted { ids } => self.handle_admitted(ids),
-            HashSetFetchInput::AdmittedScope { scope } => self.handle_admitted_scope(&scope),
             HashSetFetchInput::Tick => self.spawn_pending_fetches(Instant::now()),
         }
     }
@@ -284,25 +278,6 @@ impl<S: Eq + Hash + Ord + Clone + std::fmt::Debug, Id: Eq + Hash + Clone + std::
             }
         }
         outputs
-    }
-
-    fn handle_admitted_scope(&mut self, scope: &S) -> Vec<HashSetFetchOutput<S, Id>> {
-        let Some(set) = self.pending.remove(scope) else {
-            return vec![];
-        };
-        // Strip this scope from the reverse index for every id it owned.
-        for id in set.missing.iter().chain(set.in_flight.iter()) {
-            if let Some(scopes) = self.id_to_scopes.get_mut(id) {
-                scopes.retain(|s| s != scope);
-                if scopes.is_empty() {
-                    self.id_to_scopes.remove(id);
-                }
-            }
-        }
-        debug!(?scope, "Scope-level admission; dropping fetch entry");
-        vec![HashSetFetchOutput::ScopeComplete {
-            scope: scope.clone(),
-        }]
     }
 
     fn spawn_pending_fetches(&mut self, now: Instant) -> Vec<HashSetFetchOutput<S, Id>> {
@@ -461,20 +436,6 @@ mod tests {
         // tx(1) lands; both scopes should drop it.
         p.handle(HashSetFetchInput::Admitted { ids: vec![tx(1)] });
         assert_eq!(p.pending_count(), 2);
-    }
-
-    #[test]
-    fn admitted_scope_drops_the_entire_entry() {
-        let mut p = HashSetFetch::<BlockHash, TxHash>::new(config());
-        p.handle(HashSetFetchInput::Request {
-            scope: block(1),
-            ids: vec![tx(1), tx(2)],
-            peers: PeerSource::Pinned(vid(1)),
-        });
-
-        let out = p.handle(HashSetFetchInput::AdmittedScope { scope: block(1) });
-        assert_eq!(out.len(), 1);
-        assert!(!p.has_pending());
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Action types for the deterministic state machine.
 
-use crate::{ProtocolEvent, TimerId};
+use crate::{FetchRequest, ProtocolEvent, TimerId};
 use hyperscale_messages::TransactionGossip;
 use hyperscale_types::{
     Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, BlockVote, Bls12381G1PublicKey,
@@ -9,7 +9,7 @@ use hyperscale_types::{
     NodeId, ProposerTimestamp, ProvisionHash, ProvisionTxRoot, Provisions, ProvisionsRoot,
     QuorumCertificate, ReceiptBundle, Round, RoutableTransaction, ShardGroupId, SignerBitfield,
     StateProvision, StateRoot, TopologySnapshot, TransactionRoot, TransactionStatus, TxHash,
-    TxOutcome, ValidatorId, VotePower, WaveId, WaveIdHash, WeightedTimestamp,
+    TxOutcome, ValidatorId, VotePower, WaveId, WeightedTimestamp,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -761,117 +761,14 @@ pub enum Action {
         target_hash: BlockHash,
     },
 
-    /// Request the runner to fetch missing transactions for a pending block.
+    /// Issue a network fetch via one of the unified fetch protocols.
     ///
-    /// Emitted when a block header arrives but transactions are missing from
-    /// mempool. The runner fetches from the proposer or peers and delivers
-    /// results via `ProtocolEvent::TransactionsFetched`, which routes through
-    /// mempool admission and emits `Continuation(TransactionsAdmitted)`.
-    FetchTransactions {
-        /// Hash of the block that needs these transactions.
-        block_hash: BlockHash,
-        /// The proposer of the block (preferred fetch target).
-        proposer: ValidatorId,
-        /// Hashes of the missing transactions.
-        tx_hashes: Vec<TxHash>,
-    },
-
-    /// Fetch missing provision data for a pending block (pre-BFT-vote).
-    ///
-    /// Same pattern as `FetchTransactions`: block header arrives, some provision
-    /// hashes aren't in the local cache, fetch from proposer or local peers.
-    FetchProvisionsLocal {
-        /// Hash of the block that needs these provisions.
-        block_hash: BlockHash,
-        /// The proposer of the block (preferred fetch target).
-        proposer: ValidatorId,
-        /// Hashes of the missing provisions.
-        batch_hashes: Vec<ProvisionHash>,
-    },
-
-    /// Fetch missing finalized wave data for a pending block.
-    ///
-    /// Emitted by `check_pending_block_fetches()` when a pending block has
-    /// missing waves past the fetch timeout. The runner sends a
-    /// `GetFinalizedWavesRequest` to the proposer first, falling back to
-    /// other local-committee peers from `peers` on empty/failure responses.
-    FetchFinalizedWave {
-        /// Hash of the block that needs these finalized waves.
-        block_hash: BlockHash,
-        /// The proposer of the block (tried first).
-        proposer: ValidatorId,
-        /// Wave ID hashes (from `BlockManifest.cert_hashes`) of missing waves.
-        wave_id_hashes: Vec<WaveIdHash>,
-        /// Local-committee fallback peer pool (excluding self). The fetch
-        /// protocol rotates through these when the proposer doesn't have
-        /// the data cached.
-        peers: Vec<ValidatorId>,
-    },
-
-    /// Request a missing execution certificate from a source shard.
-    ///
-    /// Emitted when an expected execution cert hasn't arrived within the timeout.
-    /// Any peer in the source shard that received the wave leader's EC broadcast can serve it.
-    RequestMissingExecutionCert {
-        /// The shard that should have sent the execution cert.
-        source_shard: ShardGroupId,
-        /// The block height whose execution cert is missing.
-        block_height: BlockHeight,
-        /// Which wave's cert is missing.
-        wave_id: WaveId,
-        /// All validators in the source shard (candidate peers for the request).
-        peers: Vec<ValidatorId>,
-    },
-
-    /// Cancel an in-flight execution-cert fetch because the EC arrived
-    /// through another path (broadcast) or the wave no longer needs it.
-    ///
-    /// Without this, the fetch protocol would keep retrying forever even
-    /// after the expectation has been fulfilled via `on_wave_certificate`.
-    CancelExecutionCertFetch {
-        /// Source shard whose EC fetch should be cancelled.
-        source_shard: ShardGroupId,
-        /// Block height of the EC that no longer needs fetching.
-        block_height: BlockHeight,
-    },
-
-    /// Request missing provisions from a source shard via cross-shard request.
-    ///
-    /// Emitted by `ProvisionCoordinator` when a remote block's `waves` field
-    /// targets our shard but no provisions have arrived within the timeout window.
-    /// This is the fallback recovery mechanism for byzantine proposers that
-    /// silently drop provisions.
-    ///
-    /// The runner sends a `GetProvisionsRequest` to the source shard, and the
-    /// response is fed back as `ProvisionsReceived` for normal verification.
-    FetchProvisionsRemote {
-        /// The shard that should have sent provisions.
-        source_shard: ShardGroupId,
-        /// The block height whose provisions are missing.
-        block_height: BlockHeight,
-        /// The block proposer from the source shard (preferred peer for the request).
-        proposer: ValidatorId,
-        /// All validators in the source shard (candidate peers for the request).
-        peers: Vec<ValidatorId>,
-    },
-
-    /// Request missing committed block header from a remote shard.
-    ///
-    /// Emitted by `RemoteHeaderCoordinator` when a remote shard hasn't sent
-    /// committed block headers within the liveness timeout. This is the
-    /// fallback recovery mechanism for proposer-only gossip.
-    ///
-    /// The runner sends a `GetCommittedBlockHeaderRequest` to the source shard,
-    /// and the response is fed back as `RemoteBlockCommitted` for normal
-    /// verification through the coordinator.
-    RequestMissingCommittedBlockHeader {
-        /// The shard whose headers are missing.
-        source_shard: ShardGroupId,
-        /// Request headers starting from this height.
-        from_height: BlockHeight,
-        /// All validators in the source shard (candidate peers for the request).
-        peers: Vec<ValidatorId>,
-    },
+    /// Replaces the family of flat `Fetch*` / `RequestMissing*` variants —
+    /// `io_loop`'s dispatcher matches the inner [`FetchRequest`] and dispatches
+    /// to the corresponding `instances/*.rs` module. Cancellation is driven
+    /// by admission events (`Continuation(*Admitted/*Verified)`) and the
+    /// per-instance `is_stale` predicate, not by separate cancel actions.
+    Fetch(FetchRequest),
 }
 
 impl Action {

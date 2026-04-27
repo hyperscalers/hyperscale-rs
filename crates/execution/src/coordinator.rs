@@ -37,7 +37,7 @@
 //! Validators collect shard execution proofs from all participating shards. When all
 //! proofs are received, a `WaveCertificate` is created.
 
-use hyperscale_core::{Action, ProtocolEvent, ProvisionsRequest};
+use hyperscale_core::{Action, FetchRequest, ProtocolEvent, ProvisionsRequest};
 use hyperscale_types::{
     Attempt, Block, BlockHash, BlockHeight, BloomFilter, ExecutionCertificate, ExecutionVote,
     GlobalReceiptRoot, LocalExecutionEntry, NodeId, Provisions, ReceiptBundle, RoutableTransaction,
@@ -1017,10 +1017,11 @@ impl ExecutionCoordinator {
                 at_local_ts_ms = self.committed_ts.as_millis(),
                 "Fulfilled expected exec cert"
             );
-            actions.push(Action::CancelExecutionCertFetch {
-                source_shard: shard,
-                block_height: cert.block_height(),
-            });
+            // No explicit cancel needed: the wave_id we just received drains
+            // out of `exec_cert_fetch` via the
+            // `Continuation(ExecutionCertificateAdmitted)` interception.
+            // Remaining waves at this scope keep fetching until they admit
+            // or `is_stale` evicts the scope.
         }
 
         let Some(public_keys) = committee_public_keys_for_shard(topology, shard) else {
@@ -1132,12 +1133,12 @@ impl ExecutionCoordinator {
                 retry = is_retry,
                 "Execution cert timeout — requesting fallback"
             );
-            actions.push(Action::RequestMissingExecutionCert {
+            actions.push(Action::Fetch(FetchRequest::ExecutionCerts {
                 source_shard,
                 block_height,
                 wave_id,
                 peers,
-            });
+            }));
         }
 
         // Retain expectations while any local wave still needs an EC from
@@ -2394,7 +2395,7 @@ mod tests {
         assert!(
             actions
                 .iter()
-                .any(|a| matches!(a, Action::RequestMissingExecutionCert { .. })),
+                .any(|a| matches!(a, Action::Fetch(FetchRequest::ExecutionCerts { .. }))),
             "fallback fetch must keep firing while the expectation is retained"
         );
 
@@ -2644,7 +2645,7 @@ mod tests {
 
         let fallback_fired = actions
             .iter()
-            .any(|a| matches!(a, Action::RequestMissingExecutionCert { .. }));
+            .any(|a| matches!(a, Action::Fetch(FetchRequest::ExecutionCerts { .. })));
         assert!(
             !fallback_fired,
             "retro-stamp must suppress the first-commit fallback storm"

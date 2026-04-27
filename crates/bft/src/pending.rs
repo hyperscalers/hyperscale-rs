@@ -2,7 +2,7 @@
 //!
 //! Tracks blocks being assembled from headers + gossiped transactions + finalized waves.
 
-use hyperscale_core::Action;
+use hyperscale_core::{Action, FetchRequest};
 #[cfg(test)]
 use hyperscale_types::Hash;
 use hyperscale_types::{
@@ -358,11 +358,11 @@ pub fn check_fetches(
                 timeout_ms = timeout.as_millis(),
                 "Fetch timeout reached, requesting missing transactions"
             );
-            actions.push(Action::FetchTransactions {
+            actions.push(Action::Fetch(FetchRequest::Transactions {
                 block_hash: *block_hash,
                 proposer,
-                tx_hashes: missing_txs,
-            });
+                ids: missing_txs,
+            }));
         }
 
         let missing_provisions = pending.missing_provisions();
@@ -374,11 +374,11 @@ pub fn check_fetches(
                 age_ms = age.as_millis(),
                 "Fetch timeout reached, requesting missing provisions"
             );
-            actions.push(Action::FetchProvisionsLocal {
+            actions.push(Action::Fetch(FetchRequest::LocalProvisions {
                 block_hash: *block_hash,
                 proposer,
-                batch_hashes: missing_provisions,
-            });
+                ids: missing_provisions,
+            }));
         }
 
         let missing_waves = pending.missing_waves();
@@ -397,12 +397,12 @@ pub fn check_fetches(
                 .copied()
                 .filter(|v| *v != local_self)
                 .collect();
-            actions.push(Action::FetchFinalizedWave {
+            actions.push(Action::Fetch(FetchRequest::FinalizedWaves {
                 block_hash: *block_hash,
                 proposer,
-                wave_id_hashes: missing_waves,
+                ids: missing_waves,
                 peers,
-            });
+            }));
         }
     }
 

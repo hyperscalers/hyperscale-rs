@@ -10,7 +10,7 @@
 //! sent headers within the timeout window — enabling proposer-only gossip
 //! with fallback recovery.
 
-use hyperscale_core::{Action, ProtocolEvent};
+use hyperscale_core::{Action, FetchRequest, ProtocolEvent};
 use hyperscale_types::{
     BlockHeight, Bls12381G1PublicKey, CommittedBlockHeader, REMOTE_HEADER_RETENTION, ShardGroupId,
     TopologySnapshot, ValidatorId, WeightedTimestamp,
@@ -400,11 +400,11 @@ impl RemoteHeaderCoordinator {
 
             expected.requested = true;
             expected.requested_at = now;
-            actions.push(Action::RequestMissingCommittedBlockHeader {
+            actions.push(Action::Fetch(FetchRequest::RemoteHeader {
                 source_shard: shard,
                 from_height,
                 peers,
-            });
+            }));
         }
 
         actions
@@ -438,11 +438,11 @@ impl RemoteHeaderCoordinator {
 
             expected.requested = true;
             expected.requested_at = now;
-            actions.push(Action::RequestMissingCommittedBlockHeader {
+            actions.push(Action::Fetch(FetchRequest::RemoteHeader {
                 source_shard: shard,
                 from_height,
                 peers,
-            });
+            }));
         }
         actions
     }

@@ -16,7 +16,7 @@ use crate::pipeline::ProvisionPipeline;
 use crate::queue::QueuedProvisionBuffer;
 use crate::store::ProvisionStore;
 use crate::verified_headers::VerifiedHeaderBuffer;
-use hyperscale_core::{Action, ProtocolEvent};
+use hyperscale_core::{Action, FetchRequest, ProtocolEvent};
 use hyperscale_types::{
     BlockHeight, CommittedBlockHeader, Hash, LocalTimestamp, ProvisionHash, ProvisionTxRoot,
     Provisions, RETENTION_HORIZON, ShardGroupId, TopologySnapshot, compute_padded_merkle_root,
@@ -244,11 +244,13 @@ impl ProvisionCoordinator {
         self.expected
             .check_timeouts(local_ts)
             .into_iter()
-            .map(|effect| Action::FetchProvisionsRemote {
-                source_shard: effect.source_shard,
-                block_height: effect.block_height,
-                proposer: effect.proposer,
-                peers: topology.committee_for_shard(effect.source_shard).to_vec(),
+            .map(|effect| {
+                Action::Fetch(FetchRequest::RemoteProvisions {
+                    source_shard: effect.source_shard,
+                    block_height: effect.block_height,
+                    proposer: effect.proposer,
+                    peers: topology.committee_for_shard(effect.source_shard).to_vec(),
+                })
             })
             .collect()
     }
@@ -299,12 +301,12 @@ impl ProvisionCoordinator {
                     block_height = effect.block_height.0,
                     "Eager fetch — immediately requesting missing provisions"
                 );
-                Action::FetchProvisionsRemote {
+                Action::Fetch(FetchRequest::RemoteProvisions {
                     source_shard: effect.source_shard,
                     block_height: effect.block_height,
                     proposer: effect.proposer,
                     peers: topology.committee_for_shard(effect.source_shard).to_vec(),
-                }
+                })
             })
             .collect()
     }
@@ -1402,12 +1404,12 @@ mod tests {
         assert_eq!(actions.len(), 1);
         assert!(matches!(
             &actions[0],
-            Action::FetchProvisionsRemote {
+            Action::Fetch(FetchRequest::RemoteProvisions {
                 source_shard,
                 block_height,
                 proposer,
                 ..
-            } if *source_shard == ShardGroupId(1)
+            }) if *source_shard == ShardGroupId(1)
                 && *block_height == BlockHeight(10)
                 && *proposer == ValidatorId(0)
         ));
