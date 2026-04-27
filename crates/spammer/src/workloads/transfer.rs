@@ -1,6 +1,7 @@
 //! XRD transfer workload generator.
 
 use crate::accounts::{AccountPool, FundedAccount, SelectionMode};
+use crate::validity::{ValidityClock, wall_clock};
 use crate::workloads::WorkloadGenerator;
 use hyperscale_types::{
     RoutableTransaction, ShardGroupId, routable_from_notarized_v1, sign_and_notarize,
@@ -31,6 +32,10 @@ pub struct TransferWorkload {
     /// Ensures even distribution across shards to prevent one shard's
     /// account counter from advancing faster than others.
     shard_counter: AtomicU64,
+
+    /// Source of validity ranges. Defaults to wall clock; the simulator
+    /// substitutes a simulated-clock anchor.
+    validity_clock: ValidityClock,
 }
 
 impl TransferWorkload {
@@ -43,7 +48,16 @@ impl TransferWorkload {
             amount: Decimal::from(100u32),
             network,
             shard_counter: AtomicU64::new(0),
+            validity_clock: wall_clock(),
         }
+    }
+
+    /// Override the source of validity ranges. The simulator uses this to
+    /// anchor windows on its simulated clock instead of the wall clock.
+    #[must_use]
+    pub fn with_validity_clock(mut self, clock: ValidityClock) -> Self {
+        self.validity_clock = clock;
+        self
     }
 
     /// Set the cross-shard transaction ratio (0.0 to 1.0).
@@ -128,16 +142,14 @@ impl TransferWorkload {
         };
 
         // Convert to RoutableTransaction
-        let tx: RoutableTransaction = match routable_from_notarized_v1(
-            notarized,
-            crate::validity::validity_range_for_now(),
-        ) {
-            Ok(t) => t,
-            Err(e) => {
-                warn!(error = ?e, "Failed to convert to RoutableTransaction");
-                return None;
-            }
-        };
+        let tx: RoutableTransaction =
+            match routable_from_notarized_v1(notarized, (self.validity_clock)()) {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!(error = ?e, "Failed to convert to RoutableTransaction");
+                    return None;
+                }
+            };
 
         Some(tx)
     }

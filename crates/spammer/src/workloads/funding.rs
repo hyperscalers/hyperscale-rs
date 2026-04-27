@@ -4,6 +4,7 @@
 //! that couldn't be included in genesis due to engine limits.
 
 use crate::accounts::{AccountPool, FundingOp};
+use crate::validity::{ValidityClock, wall_clock};
 use hyperscale_types::{
     RoutableTransaction, ShardGroupId, routable_from_notarized_v1, sign_and_notarize,
 };
@@ -18,6 +19,7 @@ use tracing::{info, warn};
 pub struct FundingWorkload {
     network: NetworkDefinition,
     fee: Decimal,
+    validity_clock: ValidityClock,
 }
 
 impl FundingWorkload {
@@ -27,7 +29,16 @@ impl FundingWorkload {
         Self {
             network,
             fee: Decimal::from(10u32),
+            validity_clock: wall_clock(),
         }
+    }
+
+    /// Override the source of validity ranges. The simulator uses this to
+    /// anchor windows on its simulated clock instead of the wall clock.
+    #[must_use]
+    pub fn with_validity_clock(mut self, clock: ValidityClock) -> Self {
+        self.validity_clock = clock;
+        self
     }
 
     /// The per-transaction fee used by funding transactions.
@@ -84,17 +95,15 @@ impl FundingWorkload {
                 }
             };
 
-            let tx: RoutableTransaction = match routable_from_notarized_v1(
-                notarized,
-                crate::validity::validity_range_for_now(),
-            ) {
-                Ok(t) => t,
-                Err(e) => {
-                    warn!(error = ?e, "Failed to convert funding transaction");
-                    failed += 1;
-                    continue;
-                }
-            };
+            let tx: RoutableTransaction =
+                match routable_from_notarized_v1(notarized, (self.validity_clock)()) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        warn!(error = ?e, "Failed to convert funding transaction");
+                        failed += 1;
+                        continue;
+                    }
+                };
 
             by_shard.entry(op.source_shard).or_default().push(tx);
             generated += 1;

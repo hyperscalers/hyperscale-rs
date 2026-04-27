@@ -11,9 +11,10 @@ use hyperscale_network_memory::NodeIndex;
 use hyperscale_simulation::SimulationRunner;
 use hyperscale_spammer::{
     AccountPool, AccountPoolError, FundingWorkload, TransferWorkload, WorkloadGenerator,
+    validity::{ValidityClock, range_starting_at},
 };
 use hyperscale_types::{
-    ShardGroupId, TransactionDecision, TransactionStatus, TxHash, shard_for_node,
+    ShardGroupId, TransactionDecision, TransactionStatus, TxHash, WeightedTimestamp, shard_for_node,
 };
 use radix_common::math::Decimal;
 use radix_common::network::NetworkDefinition;
@@ -21,6 +22,7 @@ use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
@@ -49,6 +51,11 @@ pub struct Simulator {
 
     /// Tracks in-flight transactions: `hash -> (submit_time, target_shard)`.
     in_flight: HashMap<TxHash, (Duration, ShardGroupId)>,
+
+    /// Simulated millisecond clock shared with workload `ValidityClock`s so
+    /// generated transactions sit inside the chain's `weighted_timestamp`
+    /// window instead of wall-clock epoch.
+    sim_now_ms: Arc<AtomicU64>,
 }
 
 impl Simulator {
@@ -66,10 +73,24 @@ impl Simulator {
         let accounts =
             AccountPool::generate(u64::from(config.num_shards), config.accounts_per_shard)?;
 
-        // Create workload generator using spammer's TransferWorkload
+        // Workload generators must anchor validity ranges on simulated time,
+        // not wall clock — chain-side `weighted_timestamp` mirrors the
+        // simulation's millisecond counter (starting near zero), so
+        // wall-clock-anchored windows would land far in the future and the
+        // proposer would filter every tx out as expired.
+        let sim_now_ms = Arc::new(AtomicU64::new(0));
+        let validity_clock: ValidityClock = {
+            let clock = Arc::clone(&sim_now_ms);
+            Arc::new(move || {
+                let ms = clock.load(Ordering::Relaxed);
+                range_starting_at(WeightedTimestamp::from_millis(ms))
+            })
+        };
+
         let workload = TransferWorkload::new(NetworkDefinition::simulator())
             .with_cross_shard_ratio(config.workload.cross_shard_ratio)
-            .with_selection_mode(config.workload.selection_mode);
+            .with_selection_mode(config.workload.selection_mode)
+            .with_validity_clock(Arc::clone(&validity_clock));
 
         let batch_size = config.workload.batch_size;
 
@@ -95,6 +116,7 @@ impl Simulator {
             config,
             rng,
             in_flight: HashMap::new(),
+            sim_now_ms,
         })
     }
 
@@ -139,7 +161,21 @@ impl Simulator {
 
     /// Two-phase path: genesis for first 8000/shard, then runtime funding.
     fn initialize_with_runtime_funding(&mut self, balance: Decimal) {
-        let funding_workload = FundingWorkload::new(NetworkDefinition::simulator());
+        // Anchor funding-tx validity ranges on the simulated clock — same
+        // reasoning as the main TransferWorkload above.
+        self.sim_now_ms.store(
+            u64::try_from(self.runner.now().as_millis()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        let validity_clock: ValidityClock = {
+            let clock = Arc::clone(&self.sim_now_ms);
+            Arc::new(move || {
+                let ms = clock.load(Ordering::Relaxed);
+                range_starting_at(WeightedTimestamp::from_millis(ms))
+            })
+        };
+        let funding_workload = FundingWorkload::new(NetworkDefinition::simulator())
+            .with_validity_clock(validity_clock);
         let plan = self.accounts.runtime_funding_plan(balance);
 
         info!(
@@ -288,6 +324,10 @@ impl Simulator {
         while self.runner.now() < submission_end_time {
             // Generate and submit a batch of transactions
             let current_time = self.runner.now();
+            self.sim_now_ms.store(
+                u64::try_from(current_time.as_millis()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
             let batch =
                 self.workload
                     .generate_batch(&self.accounts, self.batch_size, &mut self.rng);
