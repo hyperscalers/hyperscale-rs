@@ -865,12 +865,8 @@ where
             NodeInput::FinalizedWaveReceived { waves } => {
                 for wave in waves {
                     let actions = self.state.execution().admit_finalized_wave(wave);
-                    self.actions_generated += actions.len();
-                    for action in actions {
-                        self.process_action(action);
-                    }
+                    self.process_actions(actions);
                 }
-                self.flush_block_commits();
                 self.update_fetch_tick_timer();
             }
 
@@ -922,6 +918,15 @@ where
     /// the state machine, then dispatch each resulting action.
     fn feed_event(&mut self, event: ProtocolEvent) {
         let actions = self.state.handle(event);
+        self.process_actions(actions);
+    }
+
+    /// Dispatch a `Vec<Action>` produced by a direct state-machine method
+    /// call. Mirrors [`Self::feed_event`]'s post-`handle` block — bumps
+    /// `actions_generated`, dispatches each action, and flushes pending
+    /// block commits. The flush is the load-bearing part: it's easy to
+    /// forget when copy-pasting the loop inline.
+    fn process_actions(&mut self, actions: Vec<Action>) {
         self.actions_generated += actions.len();
         for action in actions {
             self.process_action(action);
