@@ -419,28 +419,6 @@ impl NodeStateMachine {
         actions
     }
 
-    /// Handle transaction executed — notify mempool and check pending blocks.
-    fn on_transaction_executed(&mut self, tx_hash: TxHash, accepted: bool) -> Vec<Action> {
-        // Notify mempool
-        let mut actions =
-            self.mempool
-                .on_transaction_executed(self.topology.snapshot(), tx_hash, accepted);
-
-        // Check if any pending blocks are waiting for the finalized wave
-        // that contains this tx.
-        if let Some(wave_id) = self.execution.get_wave_assignment(&tx_hash) {
-            let wave_id_hash = wave_id.hash();
-            if let Some(fw) = self.execution.get_finalized_wave_by_hash(&wave_id_hash) {
-                actions.extend(
-                    self.bft
-                        .on_finalized_waves_admitted(self.topology.snapshot(), &[fw]),
-                );
-            }
-        }
-
-        actions
-    }
-
     fn on_ec_created(&self, tx_hashes: &[TxHash]) -> Vec<Action> {
         self.mempool.on_ec_created(tx_hashes)
     }
@@ -753,9 +731,6 @@ impl StateMachine for NodeStateMachine {
             }
 
             // ── Transactions ─────────────────────────────────────────────
-            ProtocolEvent::TransactionExecuted { tx_hash, accepted } => {
-                self.on_transaction_executed(tx_hash, accepted)
-            }
             ProtocolEvent::ExecutionCertificateCreated { tx_hashes } => {
                 self.on_ec_created(&tx_hashes)
             }

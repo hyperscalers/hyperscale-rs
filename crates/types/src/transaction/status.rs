@@ -23,104 +23,54 @@ pub enum TransactionDecision {
 ///
 /// Transactions progress through these states:
 ///
-/// **Normal Flow** (both single-shard and cross-shard):
 /// ```text
-/// Pending → Committed → Executed → Completed
+/// Pending → Committed → Completed
 /// ```
 ///
-/// # State Descriptions
-///
-/// - **Pending**: Transaction has been submitted but not yet included in a committed block
-/// - **Committed**: Block containing transaction has been committed; execution is in progress
-/// - **Executed**: Execution complete, certificate created (state NOT yet updated - waiting for block)
-/// - **Completed**: Certificate committed in block, state updated, transaction done
-///
-/// # Note on Intermediate States
-///
-/// The execution state machine internally tracks finer-grained progress (provisioning,
-/// executing, collecting votes/certificates), but the mempool only needs to know:
-/// - Is the transaction holding state locks? (Committed, Executed)
-/// - Is it done? (Completed, Aborted)
+/// All transitions are driven by committed blocks: `Pending → Committed`
+/// when the block containing the tx commits, and `Committed → Completed`
+/// when a block whose `block.certificates` covers the tx commits (the wave
+/// certificate carries the per-tx decision).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, BasicSbor)]
 pub enum TransactionStatus {
     /// Transaction submitted, waiting to be included in a block.
     Pending,
 
-    /// Block containing transaction has been committed.
+    /// Block containing transaction has been committed; the tx is in flight,
+    /// holding locks on its declared nodes until a committed block carries
+    /// the wave certificate that decides it.
     ///
-    /// The transaction is now being executed. This state holds locks on all
-    /// declared nodes until execution completes (Executed) or the transaction
-    /// is aborted.
-    ///
-    /// For cross-shard transactions, this encompasses:
+    /// For cross-shard transactions this encompasses:
     /// - State provisioning (collecting state from other shards)
     /// - Execution (running the transaction logic)
     /// - Vote collection (gathering 2f+1 votes for execution certificate)
     /// - Certificate collection (gathering certificates from all shards)
     Committed(BlockHeight),
 
-    /// Execution complete, wave certificate has been finalized.
-    ///
-    /// All shard execution proofs have been collected and the wave certificate
-    /// has been created with per-tx Accept or Reject decisions.
-    ///
-    /// **Important**: State is NOT yet updated at this point. The wave certificate
-    /// must be included in a block before state changes are applied. The
-    /// transaction is waiting for its wave certificate to be committed.
-    ///
-    /// Still holds state locks until Completed.
-    Executed {
-        /// Wave-finalized decision for this tx (Accept / Reject / Aborted).
-        decision: TransactionDecision,
-        /// Block height when the transaction was originally committed.
-        /// Preserved from Committed state for timeout tracking - cross-shard
-        /// transactions can get stuck in Executed state if certificate inclusion
-        /// fails on another shard.
-        committed_at: BlockHeight,
-    },
-
-    /// Transaction has been fully processed and can be evicted.
-    ///
-    /// The wave certificate has been committed in a block. State changes
-    /// have been applied (if accepted). This is the terminal state - the
-    /// transaction can now be safely removed from the mempool.
-    ///
-    /// Contains the final decision (Accept/Reject/Aborted) from execution.
+    /// Wave certificate has been committed in a block; locks released.
+    /// Carries the final decision from the wave's per-tx decisions.
     Completed(TransactionDecision),
 }
 
 impl TransactionStatus {
     /// Check if transaction is in a final state (won't transition further).
-    ///
-    /// Terminal states:
-    /// - `Completed`: Transaction executed and certificate committed
     #[must_use]
     pub const fn is_final(&self) -> bool {
         matches!(self, Self::Completed(_))
     }
 
     /// Check if transaction is ready to be included in a block.
-    ///
-    /// Only Pending transactions can be selected by the block proposer.
     #[must_use]
     pub const fn is_ready_for_block(&self) -> bool {
         matches!(self, Self::Pending)
     }
 
-    /// Check if this status means the transaction holds state locks.
-    ///
-    /// State locks are acquired when a transaction is committed in a block and
-    /// released when the wave certificate is committed in a block (Completed).
-    ///
-    /// The lock prevents conflicting transactions from being selected for blocks
-    /// while this transaction is being executed.
-    ///
-    /// The following statuses do NOT hold locks:
-    /// - Pending: not yet committed into a block
-    /// - Completed: certificate committed, transaction done
+    /// Whether this status holds state locks. Locks are taken on the
+    /// `Pending → Committed` transition and released on
+    /// `Committed → Completed`.
     #[must_use]
     pub const fn holds_state_lock(&self) -> bool {
-        matches!(self, Self::Committed(_) | Self::Executed { .. })
+        matches!(self, Self::Committed(_))
     }
 }
 
@@ -129,24 +79,6 @@ impl std::fmt::Display for TransactionStatus {
         match self {
             Self::Pending => write!(f, "pending"),
             Self::Committed(height) => write!(f, "committed({})", height.0),
-            Self::Executed {
-                decision: TransactionDecision::Accept,
-                ..
-            } => {
-                write!(f, "executed(accept)")
-            }
-            Self::Executed {
-                decision: TransactionDecision::Reject,
-                ..
-            } => {
-                write!(f, "executed(reject)")
-            }
-            Self::Executed {
-                decision: TransactionDecision::Aborted,
-                ..
-            } => {
-                write!(f, "executed(aborted)")
-            }
             Self::Completed(TransactionDecision::Accept) => {
                 write!(f, "completed(accept)")
             }
@@ -189,18 +121,6 @@ impl std::str::FromStr for TransactionStatus {
                     .parse::<u64>()
                     .map_err(|_| TransactionStatusParseError::InvalidValue("height".into()))?;
                 Ok(Self::Committed(BlockHeight(height)))
-            }
-            "executed" => {
-                let decision = parse_decision(inner.ok_or_else(|| {
-                    TransactionStatusParseError::MissingValue("executed".into())
-                })?)?;
-                // Note: committed_at is not preserved in string representation as it's
-                // internal state for timeout tracking. Use 0 as placeholder - this status
-                // parsed from strings won't be used for timeout calculations anyway.
-                Ok(Self::Executed {
-                    decision,
-                    committed_at: BlockHeight(0),
-                })
             }
             "completed" => {
                 let decision = parse_decision(inner.ok_or_else(|| {

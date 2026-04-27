@@ -131,10 +131,9 @@ pub struct NodeStatusSnapshot {
     pub state_root: StateRoot,
     pub sync: SyncStatus,
     pub mempool_pending: usize,
-    /// Block committed, being executed.
-    pub mempool_committed: usize,
-    /// Execution done, awaiting certificate.
-    pub mempool_executed: usize,
+    /// Block committed, holding state locks until the wave certificate
+    /// commits in a later block.
+    pub mempool_in_flight: usize,
     pub mempool_total: usize,
     pub accepting_rpc_transactions: bool,
     pub at_pending_limit: bool,
@@ -1132,10 +1131,9 @@ where
         )]
         let remote_congestion_threshold = (mempool.config().max_in_flight as f64 * 0.8) as u32;
         #[allow(clippy::cast_possible_truncation)]
-        let (pending, committed, executed) = (
+        let (pending, in_flight) = (
             contention.pending_count as usize,
-            contention.committed_count as usize,
-            contention.executed_count as usize,
+            contention.in_flight_count as usize,
         );
 
         NodeStatusSnapshot {
@@ -1144,8 +1142,7 @@ where
             state_root,
             sync: self.sync_protocol.status(),
             mempool_pending: pending,
-            mempool_committed: committed,
-            mempool_executed: executed,
+            mempool_in_flight: in_flight,
             mempool_total: mempool.len(),
             accepting_rpc_transactions: !mempool.at_in_flight_limit(),
             at_pending_limit: mempool.at_pending_limit(),

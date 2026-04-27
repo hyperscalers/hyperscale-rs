@@ -179,8 +179,7 @@ fn update_rpc_state(config: &PinnedLoopConfig, snapshot: &NodeStatusSnapshot) {
     if let Some(ref mempool_snapshot) = config.mempool_snapshot {
         mempool_snapshot.store(Arc::new(MempoolSnapshot {
             pending_count: snapshot.mempool_pending,
-            committed_count: snapshot.mempool_committed,
-            executed_count: snapshot.mempool_executed,
+            in_flight_count: snapshot.mempool_in_flight,
             total_count: snapshot.mempool_total,
             accepting_rpc_transactions: snapshot.accepting_rpc_transactions,
             at_pending_limit: snapshot.at_pending_limit,

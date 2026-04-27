@@ -96,10 +96,8 @@ pub struct LockContentionStats {
     pub pending_count: u64,
     /// Number of pending transactions that conflict with locked nodes.
     pub pending_deferred: u64,
-    /// Number of transactions in Committed status (block committed, being executed).
-    pub committed_count: u64,
-    /// Number of transactions in Executed status (execution done, awaiting certificate).
-    pub executed_count: u64,
+    /// Number of transactions in Committed status (holding state locks).
+    pub in_flight_count: u64,
 }
 
 impl LockContentionStats {
@@ -398,10 +396,8 @@ impl MempoolCoordinator {
         });
         if let Some((tx, status)) = info_to_unlock {
             self.remove_locked_nodes(topology, &tx);
-            match status {
-                TransactionStatus::Committed(_) => self.locks.dec_committed(),
-                TransactionStatus::Executed { .. } => self.locks.dec_executed(),
-                _ => {}
+            if matches!(status, TransactionStatus::Committed(_)) {
+                self.locks.dec_in_flight();
             }
         }
 
@@ -504,7 +500,7 @@ impl MempoolCoordinator {
                     self.remove_from_ready_tracking(&hash);
                     // Add locks for committed transactions and update counter
                     self.add_locked_nodes(topology, tx);
-                    self.locks.inc_committed();
+                    self.locks.inc_in_flight();
                     actions.push(Action::EmitTransactionStatus {
                         tx_hash: hash,
                         status: TransactionStatus::Committed(height),
@@ -572,60 +568,6 @@ impl MempoolCoordinator {
         vec![Action::RecordTxEcCreated {
             tx_hashes: tx_hashes.to_vec(),
         }]
-    }
-
-    /// Mark a transaction as executed (execution complete, certificate created).
-    ///
-    /// Called when `ExecutionCoordinator` finalizes a wave certificate.
-    #[instrument(skip(self, _topology), fields(tx_hash = ?tx_hash, accepted = accepted))]
-    pub fn on_transaction_executed(
-        &mut self,
-        _topology: &TopologySnapshot,
-        tx_hash: TxHash,
-        accepted: bool,
-    ) -> Vec<Action> {
-        let mut actions = Vec::new();
-
-        if let Some(entry) = self.pool.get_mut(&tx_hash) {
-            let decision = if accepted {
-                TransactionDecision::Accept
-            } else {
-                TransactionDecision::Reject
-            };
-            let cross_shard = entry.cross_shard;
-            let submitted_locally = entry.submitted_locally;
-
-            // Extract committed_at height before transitioning to Executed.
-            // This is needed for timeout tracking - cross-shard transactions can get
-            // stuck in Executed state if certificate inclusion fails on another shard.
-            let committed_at = match entry.status {
-                TransactionStatus::Committed(height) => {
-                    self.locks.dec_committed();
-                    self.locks.inc_executed();
-                    height
-                }
-                // If already Executed (idempotent call), preserve existing committed_at
-                TransactionStatus::Executed { committed_at, .. } => committed_at,
-                // Unexpected state - use current height as fallback
-                _ => self.current_height,
-            };
-
-            entry.status = TransactionStatus::Executed {
-                decision,
-                committed_at,
-            };
-            actions.push(Action::EmitTransactionStatus {
-                tx_hash,
-                status: TransactionStatus::Executed {
-                    decision,
-                    committed_at,
-                },
-                cross_shard,
-                submitted_locally,
-            });
-        }
-
-        actions
     }
 
     /// Add a transaction's nodes to the locked set.
@@ -771,8 +713,7 @@ impl MempoolCoordinator {
     /// - `locked_nodes`: Number of nodes currently locked by in-flight transactions
     /// - `pending_count`: Number of transactions in Pending status
     /// - `pending_deferred`: Number of pending transactions that conflict with locked nodes
-    /// - `committed_count`: Number of transactions in Committed status
-    /// - `executed_count`: Number of transactions in Executed status
+    /// - `in_flight_count`: Number of transactions in Committed status (holding locks)
     ///
     /// All stats are `O(1)` via cached counters and ready sets.
     #[must_use]
@@ -789,8 +730,7 @@ impl MempoolCoordinator {
             locked_nodes,
             pending_count,
             pending_deferred,
-            committed_count: self.locks.committed_count() as u64,
-            executed_count: self.locks.executed_count() as u64,
+            in_flight_count: self.locks.in_flight() as u64,
         }
     }
 
@@ -930,7 +870,7 @@ impl MempoolCoordinator {
         self.pool.is_empty()
     }
 
-    /// Get all incomplete transactions (not yet finalized or completed).
+    /// Get all incomplete transactions (not yet completed).
     ///
     /// Returns tuples of (hash, status, transaction Arc) for analysis.
     #[must_use]
@@ -939,12 +879,7 @@ impl MempoolCoordinator {
     ) -> Vec<(TxHash, TransactionStatus, Arc<RoutableTransaction>)> {
         self.pool
             .iter()
-            .filter(|(_, entry)| {
-                !matches!(
-                    entry.status,
-                    TransactionStatus::Executed { .. } | TransactionStatus::Completed(_)
-                )
-            })
+            .filter(|(_, entry)| !matches!(entry.status, TransactionStatus::Completed(_)))
             .map(|(hash, entry)| (*hash, entry.status.clone(), Arc::clone(&entry.tx)))
             .collect()
     }
@@ -1331,10 +1266,6 @@ mod tests {
         mempool.on_block_committed(&topology, &hyperscale_test_helpers::certify(block1, 1_000));
         assert_eq!(mempool.in_flight(), 2, "Committed TXs hold state locks");
 
-        // Execution completes for the cross-shard tx — Executed still holds locks.
-        mempool.on_transaction_executed(&topology, cross_hash, true);
-        assert_eq!(mempool.in_flight(), 2, "Executed TX still holds locks");
-
         // Block 2 carries the wave cert for the cross-shard tx — completes it.
         let block2 = hyperscale_test_helpers::make_live_block(
             ShardGroupId(0),
@@ -1350,10 +1281,6 @@ mod tests {
         );
         mempool.on_block_committed(&topology, &hyperscale_test_helpers::certify(block2, 2_000));
         assert_eq!(mempool.in_flight(), 1, "Completed TX releases its lock");
-
-        // Execute then finalize the single-shard tx.
-        mempool.on_transaction_executed(&topology, single_hash, true);
-        assert_eq!(mempool.in_flight(), 1);
 
         let block3 = hyperscale_test_helpers::make_live_block(
             ShardGroupId(0),

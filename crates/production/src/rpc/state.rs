@@ -55,10 +55,8 @@ pub struct RpcState {
 pub struct MempoolSnapshot {
     /// Number of pending transactions (waiting to be included in a block).
     pub pending_count: usize,
-    /// Number of transactions in Committed status (block committed, being executed).
-    pub committed_count: usize,
-    /// Number of transactions in Executed status (execution done, awaiting certificate).
-    pub executed_count: usize,
+    /// Number of transactions holding state locks (Committed status).
+    pub in_flight_count: usize,
     /// Total number of transactions in the mempool.
     pub total_count: usize,
     /// When this snapshot was taken.
@@ -90,8 +88,7 @@ impl Default for MempoolSnapshot {
     fn default() -> Self {
         Self {
             pending_count: 0,
-            committed_count: 0,
-            executed_count: 0,
+            in_flight_count: 0,
             total_count: 0,
             updated_at: None,
             accepting_rpc_transactions: true, // Default to accepting until we know otherwise
@@ -159,24 +156,7 @@ mod tests {
         let status = cache.get(&tx_hash).unwrap();
         assert!(matches!(status, TransactionStatus::Committed(h) if h.0 == 10));
 
-        // Committed -> Executed
-        cache.insert(
-            tx_hash,
-            TransactionStatus::Executed {
-                decision: TransactionDecision::Accept,
-                committed_at: BlockHeight(1),
-            },
-        );
-        let status = cache.get(&tx_hash).unwrap();
-        assert!(matches!(
-            status,
-            TransactionStatus::Executed {
-                decision: TransactionDecision::Accept,
-                ..
-            }
-        ));
-
-        // Executed -> Completed
+        // Committed -> Completed
         cache.insert(
             tx_hash,
             TransactionStatus::Completed(TransactionDecision::Accept),

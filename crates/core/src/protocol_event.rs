@@ -403,15 +403,6 @@ pub enum ProtocolEvent {
         txs: Vec<Arc<RoutableTransaction>>,
     },
 
-    /// A transaction's execution outcome has been resolved and certificate finalized.
-    /// Used for per-tx mempool status updates.
-    TransactionExecuted {
-        /// Transaction whose execution outcome resolved.
-        tx_hash: TxHash,
-        /// `true` if the tx was accepted (state-changing) vs rejected.
-        accepted: bool,
-    },
-
     /// Local execution certificate created for a wave (local votes aggregated).
     ExecutionCertificateCreated {
         /// Transaction hashes covered by the newly-created EC.

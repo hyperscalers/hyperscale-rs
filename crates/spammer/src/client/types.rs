@@ -110,10 +110,6 @@ impl TransactionStatusResponse {
             "committed" => Some(TransactionStatus::Committed(BlockHeight(
                 self.committed_height.unwrap_or(0),
             ))),
-            "executed" => Some(TransactionStatus::Executed {
-                decision: decision()?,
-                committed_at: BlockHeight(self.committed_height.unwrap_or(0)),
-            }),
             "completed" => Some(TransactionStatus::Completed(decision()?)),
             _ => None,
         }

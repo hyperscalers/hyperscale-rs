@@ -41,8 +41,8 @@ use hyperscale_core::{Action, FetchRequest, ProtocolEvent, ProvisionsRequest};
 use hyperscale_types::{
     Attempt, Block, BlockHash, BlockHeight, BloomFilter, ExecutionCertificate, ExecutionVote,
     GlobalReceiptRoot, LocalExecutionEntry, NodeId, Provisions, ReceiptBundle, RoutableTransaction,
-    ShardGroupId, TopologySnapshot, TransactionDecision, TxHash, TxOutcome, ValidatorId,
-    WAVE_TIMEOUT, WaveCertificate, WaveId, WaveIdHash, WeightedTimestamp,
+    ShardGroupId, TopologySnapshot, TxHash, TxOutcome, ValidatorId, WAVE_TIMEOUT, WaveCertificate,
+    WaveId, WaveIdHash, WeightedTimestamp,
 };
 #[cfg(test)]
 use hyperscale_types::{ExecutionOutcome, Hash};
@@ -1577,12 +1577,6 @@ impl ExecutionCoordinator {
             tx_hashes: wave.tx_hashes().to_vec(),
         }));
 
-        for (tx_hash, decision) in wave.tx_decisions() {
-            actions.push(Action::Continuation(ProtocolEvent::TransactionExecuted {
-                tx_hash,
-                accepted: decision == TransactionDecision::Accept,
-            }));
-        }
         actions
     }
 
@@ -2513,9 +2507,8 @@ mod tests {
 
         let actions = state.finalize_wave(&wave_id);
 
-        // 1 CacheFinalizedWave + 1 FinalizedWavesAdmitted + 1 WaveCompleted +
-        // 2 TransactionExecuted = 5.
-        assert_eq!(actions.len(), 5);
+        // 1 CacheFinalizedWave + 1 FinalizedWavesAdmitted + 1 WaveCompleted = 3.
+        assert_eq!(actions.len(), 3);
         assert!(matches!(actions[0], Action::CacheFinalizedWave { .. }));
         assert!(matches!(
             actions[1],
@@ -2525,16 +2518,6 @@ mod tests {
             actions[2],
             Action::Continuation(ProtocolEvent::WaveCompleted { .. })
         ));
-        let tx_events = actions
-            .iter()
-            .filter(|a| {
-                matches!(
-                    a,
-                    Action::Continuation(ProtocolEvent::TransactionExecuted { .. })
-                )
-            })
-            .count();
-        assert_eq!(tx_events, 2, "one TransactionExecuted per wave tx");
     }
 
     #[test]
