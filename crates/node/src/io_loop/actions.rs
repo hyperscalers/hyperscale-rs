@@ -5,8 +5,9 @@ use super::TimerOp;
 use super::block_commit::{AccumulateDecision, PendingCommit};
 use crate::action_handler::{self, ActionContext, DispatchPool};
 use crate::protocol::execution_cert_fetch::ExecCertFetchInput;
+use crate::protocol::fetch::ScopeFetchInput;
+use crate::protocol::fetch::instances::headers;
 use crate::protocol::finalized_wave_fetch::FinalizedWaveFetchInput;
-use crate::protocol::header_fetch::HeaderFetchInput;
 use crate::protocol::local_provision_fetch::LocalProvisionFetchInput;
 use crate::protocol::provision_fetch::ProvisionFetchInput;
 use crate::protocol::sync::SyncInput;
@@ -47,6 +48,14 @@ where
             // Internal events
             // ═══════════════════════════════════════════════════════════
             Action::Continuation(pe) => {
+                if let ProtocolEvent::RemoteHeaderVerified { committed_header } = &pe {
+                    let scope = headers::scope_for(
+                        committed_header.shard_group_id(),
+                        committed_header.height(),
+                    );
+                    self.header_fetch
+                        .handle(ScopeFetchInput::Admitted { scope });
+                }
                 let _ = self.event_sender.send(NodeInput::Protocol(pe));
             }
 
@@ -354,8 +363,7 @@ where
             | Action::RequestMissingExecutionCert { .. }
             | Action::CancelExecutionCertFetch { .. }
             | Action::CancelProvisionsFetch { .. }
-            | Action::RequestMissingCommittedBlockHeader { .. }
-            | Action::CancelCommittedHeaderFetch { .. } => {
+            | Action::RequestMissingCommittedBlockHeader { .. } => {
                 self.process_sync_fetch_action(action);
             }
 
@@ -730,15 +738,6 @@ where
                 self.process_exec_cert_fetch_outputs(tick_outputs);
                 self.update_fetch_tick_timer();
             }
-            Action::CancelCommittedHeaderFetch {
-                source_shard,
-                from_height,
-            } => {
-                self.header_fetch_protocol.handle(HeaderFetchInput::Cancel {
-                    source_shard,
-                    from_height,
-                });
-            }
             Action::RequestMissingCommittedBlockHeader {
                 source_shard,
                 from_height,
@@ -750,15 +749,12 @@ where
                     peer_count = peers.len(),
                     "Requesting missing committed block header from source shard"
                 );
+                let scope = headers::scope_for(source_shard, from_height);
                 let outputs = self
-                    .header_fetch_protocol
-                    .handle(HeaderFetchInput::Request {
-                        source_shard,
-                        from_height,
-                        peers,
-                    });
+                    .header_fetch
+                    .handle(ScopeFetchInput::Request { scope, peers });
                 self.process_header_fetch_outputs(outputs);
-                let tick_outputs = self.header_fetch_protocol.handle(HeaderFetchInput::Tick {
+                let tick_outputs = self.header_fetch.handle(ScopeFetchInput::Tick {
                     now: std::time::Instant::now(),
                 });
                 self.process_header_fetch_outputs(tick_outputs);

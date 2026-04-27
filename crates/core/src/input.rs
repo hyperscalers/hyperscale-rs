@@ -230,16 +230,6 @@ pub enum NodeInput {
         block_height: BlockHeight,
     },
 
-    /// Committed block header successfully fetched from a source shard.
-    HeaderFetchReceived {
-        /// Source shard the header was fetched from.
-        source_shard: ShardGroupId,
-        /// Starting height of the requested header range.
-        from_height: BlockHeight,
-        /// Committed block header returned.
-        header: CommittedBlockHeader,
-    },
-
     /// A committed block header fetch request failed.
     HeaderFetchFailed {
         /// Source shard the fetch targeted.
@@ -300,7 +290,6 @@ impl NodeInput {
             Self::ProvisionsFetchFailed { .. } => EventPriority::Internal,
             Self::ExecCertFetchReceived { .. } => EventPriority::Internal,
             Self::ExecCertFetchFailed { .. } => EventPriority::Internal,
-            Self::HeaderFetchReceived { .. } => EventPriority::Internal,
             Self::HeaderFetchFailed { .. } => EventPriority::Internal,
             Self::LocalProvisionReceived { .. } => EventPriority::Internal,
             Self::LocalProvisionsFetchFailed { .. } => EventPriority::Internal,
@@ -349,7 +338,6 @@ impl NodeInput {
             Self::ProvisionsFetchFailed { .. } => "ProvisionsFetchFailed",
             Self::ExecCertFetchReceived { .. } => "ExecCertFetchReceived",
             Self::ExecCertFetchFailed { .. } => "ExecCertFetchFailed",
-            Self::HeaderFetchReceived { .. } => "HeaderFetchReceived",
             Self::HeaderFetchFailed { .. } => "HeaderFetchFailed",
             Self::LocalProvisionReceived { .. } => "LocalProvisionReceived",
             Self::LocalProvisionsFetchFailed { .. } => "LocalProvisionsFetchFailed",

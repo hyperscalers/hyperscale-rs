@@ -33,8 +33,10 @@ use crate::config::NodeConfig;
 use crate::io_loop::block_commit::BlockCommitCoordinator;
 use crate::io_loop::caches::SharedCaches;
 use crate::protocol::execution_cert_fetch::{ExecCertFetchInput, ExecCertFetchProtocol};
+use crate::protocol::fetch::ScopeFetchInput;
+use crate::protocol::fetch::instances::headers::{self, HeaderFetch};
+use crate::protocol::fetch::scope_fetch::ScopeFetchConfig;
 use crate::protocol::finalized_wave_fetch::{FinalizedWaveFetchInput, FinalizedWaveFetchProtocol};
-use crate::protocol::header_fetch::{HeaderFetchInput, HeaderFetchProtocol};
 use crate::protocol::local_provision_fetch::{
     LocalProvisionFetchInput, LocalProvisionFetchProtocol,
 };
@@ -276,7 +278,7 @@ where
     exec_cert_fetch_protocol: ExecCertFetchProtocol,
 
     // Committed block header fetch protocol (cross-shard header fetching with peer rotation)
-    header_fetch_protocol: HeaderFetchProtocol,
+    header_fetch: HeaderFetch,
 
     // Transaction validation
     tx_validator: Arc<TransactionValidation>,
@@ -342,8 +344,7 @@ where
         );
         let provision_fetch_protocol = ProvisionFetchProtocol::new(config.provision_fetch.clone());
         let exec_cert_fetch_protocol = ExecCertFetchProtocol::new(config.exec_cert_fetch.clone());
-        let header_fetch_protocol =
-            HeaderFetchProtocol::new(crate::protocol::header_fetch::HeaderFetchConfig::default());
+        let header_fetch = HeaderFetch::new(&ScopeFetchConfig::default());
         let storage = Arc::new(storage);
         let pending_chain = Arc::new(hyperscale_storage::PendingChain::new(Arc::clone(&storage)));
         let caches = SharedCaches::new(Arc::clone(state.provisions().store()));
@@ -372,7 +373,7 @@ where
             finalized_wave_fetch_protocol,
             provision_fetch_protocol,
             exec_cert_fetch_protocol,
-            header_fetch_protocol,
+            header_fetch,
             validation_batch: BatchAccumulator::new(b.tx_validation_max, b.tx_validation_window),
             committed_header_batch: BatchAccumulator::new(
                 b.committed_header_max,
@@ -709,7 +710,9 @@ where
                     });
                 self.process_exec_cert_fetch_outputs(cert_outputs);
                 // Also tick the header fetch protocol.
-                let header_outputs = self.header_fetch_protocol.handle(HeaderFetchInput::Tick {
+                self.header_fetch
+                    .evict_stale(|s| headers::is_stale(&self.state, s));
+                let header_outputs = self.header_fetch.handle(ScopeFetchInput::Tick {
                     now: std::time::Instant::now(),
                 });
                 self.process_header_fetch_outputs(header_outputs);
@@ -792,33 +795,14 @@ where
             }
 
             // ── Committed block header fetch protocol ────────────────
-            NodeInput::HeaderFetchReceived {
-                source_shard,
-                from_height,
-                header,
-            } => {
-                let outputs = self
-                    .header_fetch_protocol
-                    .handle(HeaderFetchInput::Received {
-                        source_shard,
-                        from_height,
-                        header: Box::new(header),
-                    });
-                self.process_header_fetch_outputs(outputs);
-                self.update_fetch_tick_timer();
-            }
-
             NodeInput::HeaderFetchFailed {
                 source_shard,
                 from_height,
             } => {
-                let outputs = self.header_fetch_protocol.handle(HeaderFetchInput::Failed {
-                    source_shard,
-                    from_height,
-                });
-                self.process_header_fetch_outputs(outputs);
+                let scope = headers::scope_for(source_shard, from_height);
+                self.header_fetch.handle(ScopeFetchInput::Failed { scope });
                 // Tick to retry with next peer immediately.
-                let tick_outputs = self.header_fetch_protocol.handle(HeaderFetchInput::Tick {
+                let tick_outputs = self.header_fetch.handle(ScopeFetchInput::Tick {
                     now: std::time::Instant::now(),
                 });
                 self.process_header_fetch_outputs(tick_outputs);
@@ -1081,7 +1065,7 @@ where
             fetch_provision: self.provision_fetch_protocol.in_flight_count(),
             fetch_local_provision: self.local_provision_fetch_protocol.in_flight_count(),
             fetch_exec_cert: self.exec_cert_fetch_protocol.in_flight_count(),
-            fetch_header: self.header_fetch_protocol.in_flight_count(),
+            fetch_header: self.header_fetch.in_flight_count(),
             fetch_finalized_wave: self.finalized_wave_fetch_protocol.in_flight_count(),
             memory: metrics::MemoryMetrics {
                 // BFT
@@ -1161,7 +1145,7 @@ where
                     .pending_count(),
                 node_provision_fetch_pending: self.provision_fetch_protocol.pending_count(),
                 node_exec_cert_fetch_pending: self.exec_cert_fetch_protocol.pending_count(),
-                node_header_fetch_pending: self.header_fetch_protocol.pending_count(),
+                node_header_fetch_pending: self.header_fetch.pending_count(),
                 // Storage — filled in by record_metrics off-thread.
                 rocksdb_block_cache_usage_bytes: 0,
                 rocksdb_memtable_usage_bytes: 0,

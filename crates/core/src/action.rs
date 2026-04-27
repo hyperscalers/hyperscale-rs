@@ -856,18 +856,6 @@ pub enum Action {
         block_height: BlockHeight,
     },
 
-    /// Cancel an in-flight remote-header fetch because the header arrived
-    /// through another path (gossip).
-    ///
-    /// Without this, the fetch protocol would keep retrying forever even
-    /// after the gap was closed by a gossip-delivered header.
-    CancelCommittedHeaderFetch {
-        /// Source shard whose header fetch should be cancelled.
-        source_shard: ShardGroupId,
-        /// Starting height of the header range that no longer needs fetching.
-        from_height: BlockHeight,
-    },
-
     /// Request missing provisions from a source shard via cross-shard request.
     ///
     /// Emitted by `ProvisionCoordinator` when a remote block's `waves` field

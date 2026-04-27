@@ -286,29 +286,17 @@ impl RemoteHeaderCoordinator {
         let mut actions = Vec::new();
 
         // Update liveness tracking: advance the remote tip and record the
-        // local height at which we received it (the actual liveness signal).
-        // Reset the request flag so future gaps can trigger new requests.
-        //
-        // If a fallback fetch was already dispatched for this gap, cancel it
-        // now — otherwise the fetch protocol would keep retrying forever
-        // even though gossip has closed the gap.
+        // local height at which we received it. Reset the request flag so
+        // future gaps can trigger new requests. Any in-flight fallback fetch
+        // for this gap self-cancels via the `RemoteHeaderVerified`
+        // continuation, which the io_loop translates into an admission
+        // signal on the header fetch protocol.
         if let Some(expected) = self.expected.get_mut(&shard)
             && height > expected.last_verified_height
         {
-            let pending_fetch_from = if expected.requested {
-                Some(BlockHeight(expected.last_verified_height.0 + 1))
-            } else {
-                None
-            };
             expected.last_verified_height = height;
             expected.last_verified_at = Some(self.local_committed_ts);
             expected.requested = false;
-            if let Some(from_height) = pending_fetch_from {
-                actions.push(Action::CancelCommittedHeaderFetch {
-                    source_shard: shard,
-                    from_height,
-                });
-            }
         }
 
         // Emit continuation so downstream consumers receive the verified header.

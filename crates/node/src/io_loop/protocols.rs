@@ -481,21 +481,25 @@ where
         }
     }
 
-    /// Process `HeaderFetchProtocol` outputs.
+    /// Dispatch outputs from the cross-shard header fetch.
     ///
-    /// `Fetch` sends a single-peer network request for committed block headers.
-    /// `Deliver` feeds the header into the state machine via `RemoteBlockCommitted`.
+    /// On a successful response, the fetched header is fed straight into the
+    /// state machine as a `RemoteBlockCommitted` event — the same path taken
+    /// by gossiped headers — and the QC verification flow signals admission.
     pub(super) fn process_header_fetch_outputs(
-        &mut self,
-        outputs: Vec<crate::protocol::header_fetch::HeaderFetchOutput>,
+        &self,
+        outputs: Vec<
+            crate::protocol::fetch::ScopeFetchOutput<
+                crate::protocol::fetch::instances::headers::Scope,
+            >,
+        >,
     ) {
-        use crate::protocol::header_fetch::HeaderFetchOutput;
+        use crate::protocol::fetch::ScopeFetchOutput;
 
         for output in outputs {
             match output {
-                HeaderFetchOutput::Fetch {
-                    source_shard,
-                    from_height,
+                ScopeFetchOutput::Send {
+                    scope: (source_shard, from_height),
                     peer,
                 } => {
                     use hyperscale_messages::request::GetCommittedBlockHeaderRequest;
@@ -511,11 +515,12 @@ where
                         Box::new(move |result| match result {
                             Ok(response) => match response.header {
                                 Some(header) => {
-                                    let _ = sender.send(NodeInput::HeaderFetchReceived {
-                                        source_shard,
-                                        from_height,
-                                        header,
-                                    });
+                                    let _ = sender.send(NodeInput::Protocol(
+                                        ProtocolEvent::RemoteBlockCommitted {
+                                            committed_header: header,
+                                            sender: ValidatorId(0),
+                                        },
+                                    ));
                                 }
                                 None => {
                                     let _ = sender.send(NodeInput::HeaderFetchFailed {
@@ -532,15 +537,6 @@ where
                             }
                         }),
                     );
-                }
-                HeaderFetchOutput::Deliver { header } => {
-                    // Feed fetched header into the state machine as RemoteBlockCommitted.
-                    // The coordinator will verify and fan out as normal.
-                    // Use ValidatorId(0) as placeholder sender — the QC is what matters.
-                    self.feed_event(ProtocolEvent::RemoteBlockCommitted {
-                        committed_header: *header,
-                        sender: ValidatorId(0),
-                    });
                 }
             }
         }
@@ -615,7 +611,7 @@ where
         let has_finalized_wave_work = self.finalized_wave_fetch_protocol.has_pending();
         let has_provision_work = self.provision_fetch_protocol.has_pending();
         let has_exec_cert_work = self.exec_cert_fetch_protocol.has_pending();
-        let has_header_work = self.header_fetch_protocol.has_pending();
+        let has_header_work = self.header_fetch.has_pending();
         if has_fetch_work
             || has_local_provision_work
             || has_finalized_wave_work
