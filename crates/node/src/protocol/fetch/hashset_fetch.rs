@@ -36,7 +36,6 @@ impl Default for HashSetFetchConfig {
 
 /// Peer-selection policy for a hash-set fetch.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // `Rotation` is exercised by finalized-wave + exec-cert instances; pinned-only callers don't touch it.
 pub enum PeerSource {
     /// Pinned to a single peer for every chunk (no rotation).
     Pinned(ValidatorId),
@@ -196,6 +195,32 @@ impl<S: Eq + Hash + Ord + Clone + std::fmt::Debug, Id: Eq + Hash + Clone + std::
     #[must_use]
     pub fn pending_count(&self) -> usize {
         self.pending.len()
+    }
+
+    /// Drop every scope for which `is_stale` returns `true` and prune the
+    /// reverse index of the ids those scopes owned.
+    pub fn evict_stale<F>(&mut self, mut is_stale: F)
+    where
+        F: FnMut(&S) -> bool,
+    {
+        let evicted: Vec<S> = self
+            .pending
+            .keys()
+            .filter(|s| is_stale(s))
+            .cloned()
+            .collect();
+        for scope in evicted {
+            if let Some(set) = self.pending.remove(&scope) {
+                for id in set.missing.iter().chain(set.in_flight.iter()) {
+                    if let Some(scopes) = self.id_to_scopes.get_mut(id) {
+                        scopes.retain(|s| s != &scope);
+                        if scopes.is_empty() {
+                            self.id_to_scopes.remove(id);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn handle_request(

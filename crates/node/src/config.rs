@@ -1,6 +1,5 @@
 //! Consolidated configuration for `IoLoop`.
 
-use crate::protocol::execution_cert_fetch::ExecCertFetchConfig;
 use crate::protocol::fetch::hashset_fetch::HashSetFetchConfig;
 use crate::protocol::fetch::scope_fetch::ScopeFetchConfig;
 use crate::protocol::sync::SyncConfig;
@@ -18,7 +17,7 @@ pub struct NodeConfig {
     /// Cross-shard provision fetch configuration.
     pub provision_fetch: ScopeFetchConfig,
     /// Execution-certificate fetch configuration.
-    pub exec_cert_fetch: ExecCertFetchConfig,
+    pub exec_cert_fetch: HashSetFetchConfig,
     /// Batch-window configuration.
     pub batch: BatchConfig,
 }
