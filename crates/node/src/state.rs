@@ -470,6 +470,41 @@ impl NodeStateMachine {
 
         actions
     }
+
+    /// Admit a batch of fetch-delivered transactions through mempool. Called
+    /// directly from `io_loop` when a fetch response arrives — bypasses the
+    /// gossip-side validation pipeline (the txs came from a peer we asked, in
+    /// response to our own request). Mempool emits
+    /// `Continuation(ProtocolEvent::TransactionsAdmitted)` for the admitted
+    /// subset; `io_loop`'s interception arm drains the fetch protocol.
+    pub fn on_transactions_fetched(&mut self, txs: Vec<Arc<RoutableTransaction>>) -> Vec<Action> {
+        if txs.is_empty() {
+            return vec![];
+        }
+        let mut actions =
+            self.mempool
+                .on_fetched_transactions(self.topology.snapshot(), txs, self.now);
+        actions.push(Action::Continuation(ProtocolEvent::ContentAvailable));
+        actions
+    }
+
+    /// Hand a delivered execution certificate to the canonical EC store.
+    /// Called directly from `io_loop` for both fetch responses and
+    /// gossip-delivered cert batches (post sender-sig check). Each cert
+    /// flows through `ExecutionCoordinator::on_wave_certificate`, which
+    /// emits `Continuation(ProtocolEvent::ExecutionCertificateAdmitted)` so
+    /// the fetch protocol is drained per wave.
+    pub fn on_execution_certs_received(
+        &mut self,
+        certs: Vec<hyperscale_types::ExecutionCertificate>,
+    ) -> Vec<Action> {
+        let topology = self.topology.snapshot();
+        let mut actions = Vec::new();
+        for cert in certs {
+            actions.extend(self.execution.on_wave_certificate(topology, cert));
+        }
+        actions
+    }
 }
 
 impl StateMachine for NodeStateMachine {
@@ -684,9 +719,6 @@ impl StateMachine for NodeStateMachine {
                 &wave_id,
                 certificate,
             ),
-            ProtocolEvent::ExecutionCertificateReceived { cert } => self
-                .execution
-                .on_wave_certificate(self.topology.snapshot(), cert),
             ProtocolEvent::ExecutionCertificateSignatureVerified { certificate, valid } => {
                 // If the EC is for a remote wave where we were a source, the
                 // target shard's tx_outcomes acknowledge outbound batches we
@@ -741,9 +773,6 @@ impl StateMachine for NodeStateMachine {
             ProtocolEvent::TransactionsAdmitted { txs } => self
                 .bft
                 .on_transactions_admitted(self.topology.snapshot(), &txs),
-            ProtocolEvent::TransactionsFetched { txs } => self
-                .mempool
-                .on_fetched_transactions(self.topology.snapshot(), txs, self.now),
             // ── Storage / Sync ───────────────────────────────────────────
             ProtocolEvent::SyncBlockReadyToApply { certified } => self
                 .bft

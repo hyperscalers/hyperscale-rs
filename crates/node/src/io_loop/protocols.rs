@@ -446,7 +446,7 @@ where
                         Box::new(move |result| match result {
                             Ok(response) => match response.certificates {
                                 Some(certs) if !certs.is_empty() => {
-                                    let _ = sender.send(NodeInput::ExecCertFetchReceived {
+                                    let _ = sender.send(NodeInput::ExecutionCertsReceived {
                                         certificates: certs,
                                     });
                                 }

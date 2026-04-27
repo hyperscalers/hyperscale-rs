@@ -658,9 +658,8 @@ where
                 // Route delivered txs through mempool admission. The
                 // fetch-protocol drain happens via the resulting
                 // `Continuation(TransactionsAdmitted)` interception.
-                if !transactions.is_empty() {
-                    self.feed_event(ProtocolEvent::TransactionsFetched { txs: transactions });
-                }
+                let actions = self.state.on_transactions_fetched(transactions);
+                self.process_actions(actions);
             }
 
             NodeInput::FetchTransactionsFailed { block_hash, hashes } => {
@@ -726,16 +725,14 @@ where
                 self.update_fetch_tick_timer();
             }
 
-            // ── Execution certificate fetch protocol ─────────────────
+            // ── Execution certificate delivery (fetch + gossip) ──────
             //
             // Each delivered cert flows through `on_wave_certificate`, which
-            // emits `Continuation(ExecutionCertificateAdmitted)`. io_loop's
-            // interception arm drains the exec-cert fetch protocol by
-            // wave_id — same shape as broadcast-delivered certs.
-            NodeInput::ExecCertFetchReceived { certificates } => {
-                for cert in certificates {
-                    self.feed_event(ProtocolEvent::ExecutionCertificateReceived { cert });
-                }
+            // emits `Continuation(ExecutionCertificateAdmitted)`. `io_loop`'s
+            // interception arm drains the exec-cert fetch protocol per wave.
+            NodeInput::ExecutionCertsReceived { certificates } => {
+                let actions = self.state.on_execution_certs_received(certificates);
+                self.process_actions(actions);
                 self.update_fetch_tick_timer();
             }
 

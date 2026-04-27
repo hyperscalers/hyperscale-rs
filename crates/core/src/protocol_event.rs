@@ -339,12 +339,6 @@ pub enum ProtocolEvent {
         certificate: ExecutionCertificate,
     },
 
-    /// Received an execution certificate from a remote shard.
-    ExecutionCertificateReceived {
-        /// Execution certificate received from a remote shard.
-        cert: ExecutionCertificate,
-    },
-
     /// Execution certificate signature verification completed.
     ExecutionCertificateSignatureVerified {
         /// The certificate whose signature was verified.
@@ -389,15 +383,6 @@ pub enum ProtocolEvent {
     FinalizedWavesAdmitted {
         /// Finalized waves newly admitted on this admission call.
         waves: Vec<Arc<FinalizedWave>>,
-    },
-
-    /// Transactions delivered by a fetch response. Routed straight to
-    /// `MempoolCoordinator::on_fetched_transactions` for admission; the
-    /// fetch-protocol drain happens via the resulting
-    /// `Continuation(TransactionsAdmitted)` so all paths converge.
-    TransactionsFetched {
-        /// Fetched transactions to admit.
-        txs: Vec<Arc<RoutableTransaction>>,
     },
 
     /// One or more transactions were just admitted to the canonical mempool.

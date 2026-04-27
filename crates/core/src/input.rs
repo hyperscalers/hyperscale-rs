@@ -210,14 +210,15 @@ pub enum NodeInput {
         block_height: BlockHeight,
     },
 
-    /// Execution certificates successfully fetched from a source shard.
-    ///
-    /// Routed to `ExecutionCoordinator::on_wave_certificate`. Each cert
+    /// Execution certificates delivered from any source — fetch response or
+    /// peer broadcast (post sender-sig check). Routed to
+    /// `NodeStateMachine::on_execution_certs_received`, which delegates each
+    /// cert to `ExecutionCoordinator::on_wave_certificate`. Each cert
     /// carries its own `(shard_group_id, block_height, wave_id)`; `io_loop`'s
     /// `Continuation(ExecutionCertificateAdmitted)` interception drains the
     /// matching fetch protocol per wave.
-    ExecCertFetchReceived {
-        /// Execution certificates returned.
+    ExecutionCertsReceived {
+        /// Execution certificates to admit.
         certificates: Vec<ExecutionCertificate>,
     },
 
@@ -286,7 +287,7 @@ impl NodeInput {
             Self::CommittedBlockGossipReceived { .. } => EventPriority::Network,
             Self::ProvisionsReady { .. } => EventPriority::Internal,
             Self::ProvisionsFetchFailed { .. } => EventPriority::Internal,
-            Self::ExecCertFetchReceived { .. } => EventPriority::Internal,
+            Self::ExecutionCertsReceived { .. } => EventPriority::Internal,
             Self::ExecCertFetchFailed { .. } => EventPriority::Internal,
             Self::HeaderFetchFailed { .. } => EventPriority::Internal,
             Self::LocalProvisionReceived { .. } => EventPriority::Internal,
@@ -333,7 +334,7 @@ impl NodeInput {
             Self::CommittedBlockGossipReceived { .. } => "CommittedBlockGossipReceived",
             Self::ProvisionsReady { .. } => "ProvisionsReady",
             Self::ProvisionsFetchFailed { .. } => "ProvisionsFetchFailed",
-            Self::ExecCertFetchReceived { .. } => "ExecCertFetchReceived",
+            Self::ExecutionCertsReceived { .. } => "ExecutionCertsReceived",
             Self::ExecCertFetchFailed { .. } => "ExecCertFetchFailed",
             Self::HeaderFetchFailed { .. } => "HeaderFetchFailed",
             Self::LocalProvisionReceived { .. } => "LocalProvisionReceived",

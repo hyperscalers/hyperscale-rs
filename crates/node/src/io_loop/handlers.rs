@@ -464,7 +464,7 @@ where
                 },
             );
 
-        // ── execution.cert.batch → verify sender sig, then ProtocolEvent::ExecutionCertificateReceived ─
+        // ── execution.cert.batch → verify sender sig, then NodeInput::ExecutionCertsReceived ─
 
         let tx = self.event_sender.clone();
         let topology = self.topology.clone();
@@ -503,11 +503,9 @@ where
                         return;
                     }
 
-                    for cert in batch.into_certificates() {
-                        let _ = tx.send(NodeInput::Protocol(
-                            ProtocolEvent::ExecutionCertificateReceived { cert },
-                        ));
-                    }
+                    let _ = tx.send(NodeInput::ExecutionCertsReceived {
+                        certificates: batch.into_certificates(),
+                    });
                 },
             );
     }
