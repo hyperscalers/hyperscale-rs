@@ -1,4 +1,4 @@
-//! Sync, fetch, and provision fetch protocol output processing.
+//! Sync and fetch protocol output processing.
 
 use super::{IoLoop, TimerOp};
 use crate::protocol::sync::{SyncInput, SyncOutput};

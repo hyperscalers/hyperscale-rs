@@ -260,22 +260,22 @@ where
     pending_block_topups:
         HashMap<BlockHeight, Box<hyperscale_messages::response::ElidedCertifiedBlock>>,
 
-    // Fetch protocol (transaction/certificate fetching with chunking and retry)
+    // Per-block transaction fetch (intra-shard, pinned to proposer).
     transaction_fetch: TransactionFetch,
 
-    // Local provision fetch protocol (intra-shard provisions fetching)
+    // Per-block local-provision fetch (intra-shard, pinned to proposer).
     local_provision_fetch: LocalProvisionFetch,
 
-    // Finalized wave fetch protocol (intra-shard wave data fetching)
+    // Per-block finalized-wave fetch (intra-shard, rotates through committee).
     finalized_wave_fetch: FinalizedWaveFetch,
 
-    // Provision fetch protocol (cross-shard provision fetching with peer rotation)
+    // Cross-shard provision fetch (rotates through source committee).
     provision_fetch: ProvisionFetch,
 
-    // Execution certificate fetch protocol (cross-shard exec cert fetching with peer rotation)
+    // Cross-shard execution-cert fetch (rotates through source committee).
     exec_cert_fetch: ExecCertFetch,
 
-    // Committed block header fetch protocol (cross-shard header fetching with peer rotation)
+    // Cross-shard committed-block-header fetch (rotates through source committee).
     header_fetch: HeaderFetch,
 
     // Transaction validation
@@ -672,39 +672,41 @@ where
             }
 
             NodeInput::FetchTick => {
+                // Tick every fetch protocol: evict abandoned scopes via each
+                // instance's `is_stale` predicate, then drive any pending
+                // chunks via `Tick`.
+                let now = std::time::Instant::now();
+
                 self.transaction_fetch
                     .evict_stale(|s| transactions::is_stale(&self.state, s));
                 let outputs = self.transaction_fetch.handle(HashSetFetchInput::Tick);
                 self.process_transaction_fetch_outputs(outputs);
-                // Also tick the local provision fetch protocol.
+
                 self.local_provision_fetch
                     .evict_stale(|s| local_provisions::is_stale(&self.state, s));
-                let local_prov_outputs = self.local_provision_fetch.handle(HashSetFetchInput::Tick);
-                self.process_local_provision_fetch_outputs(local_prov_outputs);
-                // Also tick the finalized wave fetch protocol.
+                let outputs = self.local_provision_fetch.handle(HashSetFetchInput::Tick);
+                self.process_local_provision_fetch_outputs(outputs);
+
                 self.finalized_wave_fetch
                     .evict_stale(|s| finalized_waves::is_stale(&self.state, s));
-                let wave_outputs = self.finalized_wave_fetch.handle(HashSetFetchInput::Tick);
-                self.process_finalized_wave_fetch_outputs(wave_outputs);
-                // Also tick the provision fetch protocol.
+                let outputs = self.finalized_wave_fetch.handle(HashSetFetchInput::Tick);
+                self.process_finalized_wave_fetch_outputs(outputs);
+
                 self.provision_fetch
                     .evict_stale(|s| provisions::is_stale(&self.state, s));
-                let prov_outputs = self.provision_fetch.handle(ScopeFetchInput::Tick {
-                    now: std::time::Instant::now(),
-                });
-                self.process_provision_fetch_outputs(prov_outputs);
-                // Also tick the exec cert fetch protocol.
+                let outputs = self.provision_fetch.handle(ScopeFetchInput::Tick { now });
+                self.process_provision_fetch_outputs(outputs);
+
                 self.exec_cert_fetch
                     .evict_stale(|s| exec_certs::is_stale(&self.state, s));
-                let cert_outputs = self.exec_cert_fetch.handle(HashSetFetchInput::Tick);
-                self.process_exec_cert_fetch_outputs(cert_outputs);
-                // Also tick the header fetch protocol.
+                let outputs = self.exec_cert_fetch.handle(HashSetFetchInput::Tick);
+                self.process_exec_cert_fetch_outputs(outputs);
+
                 self.header_fetch
                     .evict_stale(|s| headers::is_stale(&self.state, s));
-                let header_outputs = self.header_fetch.handle(ScopeFetchInput::Tick {
-                    now: std::time::Instant::now(),
-                });
-                self.process_header_fetch_outputs(header_outputs);
+                let outputs = self.header_fetch.handle(ScopeFetchInput::Tick { now });
+                self.process_header_fetch_outputs(outputs);
+
                 self.update_fetch_tick_timer();
             }
 

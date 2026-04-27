@@ -74,7 +74,7 @@ where
                 serve_transaction_request(&*storage, &tx_cache, &req)
             });
 
-        // ── provision.request → provision fetch protocol ─────────────
+        // ── provision.request → serve from local store ───────────────
         //
         // Dedup + cache: the proof for (block_height, target_shard) is
         // deterministic. Multiple validators request the same provisions,

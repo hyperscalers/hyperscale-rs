@@ -1006,9 +1006,6 @@ impl ExecutionCoordinator {
             },
         )];
 
-        // If a fallback fetch was already dispatched for this expectation, tell
-        // the fetch protocol to drop it — otherwise it would keep retrying
-        // forever even after the EC has arrived here.
         if cleared {
             tracing::debug!(
                 source_shard = shard.0,
@@ -1017,11 +1014,6 @@ impl ExecutionCoordinator {
                 at_local_ts_ms = self.committed_ts.as_millis(),
                 "Fulfilled expected exec cert"
             );
-            // No explicit cancel needed: the wave_id we just received drains
-            // out of `exec_cert_fetch` via the
-            // `Continuation(ExecutionCertificateAdmitted)` interception.
-            // Remaining waves at this scope keep fetching until they admit
-            // or `is_stale` evicts the scope.
         }
 
         let Some(public_keys) = committee_public_keys_for_shard(topology, shard) else {
