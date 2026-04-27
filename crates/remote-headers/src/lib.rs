@@ -23,7 +23,7 @@
 //!
 //! With proposer-only gossip, headers may not arrive (proposer is byzantine/slow).
 //! The coordinator tracks per-shard liveness and emits
-//! `Action::RequestMissingCommittedBlockHeader` after a timeout, triggering a
+//! `Action::Fetch(FetchRequest::RemoteHeader)` after a timeout, triggering a
 //! point-to-point fetch from any validator in the source shard.
 
 mod coordinator;

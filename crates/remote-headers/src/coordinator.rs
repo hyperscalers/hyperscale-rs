@@ -6,7 +6,7 @@
 //! continuations for downstream consumers (BFT, Provision, Execution).
 //!
 //! It also tracks per-shard liveness and emits
-//! `Action::RequestMissingCommittedBlockHeader` when a remote shard hasn't
+//! `Action::Fetch(FetchRequest::RemoteHeader)` when a remote shard hasn't
 //! sent headers within the timeout window — enabling proposer-only gossip
 //! with fallback recovery.
 
@@ -109,7 +109,7 @@ pub struct RemoteHeaderCoordinator {
     /// Per-shard liveness tracking for fallback header requests.
     ///
     /// Populated when topology tells us remote shards exist.
-    /// Emits `RequestMissingCommittedBlockHeader` when a shard hasn't
+    /// Emits `Action::Fetch(FetchRequest::RemoteHeader)` when a shard hasn't
     /// sent headers within the timeout.
     expected: HashMap<ShardGroupId, ExpectedHeader>,
 

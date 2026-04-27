@@ -12,7 +12,7 @@
 //!    timeout via [`Self::flush_all`].
 //!
 //! Both produce [`TimeoutEffect`]s; the coordinator attaches peers from
-//! topology and lifts each effect into an `Action::FetchProvisionsRemote`.
+//! topology and lifts each effect into an `Action::Fetch(FetchRequest::RemoteProvisions)`.
 //!
 //! The tracker also owns `local_committed_height` and `local_committed_ts`
 //! because every other consumer of those values reads them through here
@@ -44,7 +44,7 @@ struct ExpectedProvision {
     proposer: ValidatorId,
 }
 
-/// Lifted by the coordinator into an `Action::FetchProvisionsRemote` once
+/// Lifted by the coordinator into an `Action::Fetch(FetchRequest::RemoteProvisions)` once
 /// peers are attached from the topology snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TimeoutEffect {

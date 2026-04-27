@@ -282,7 +282,7 @@ impl ProvisionCoordinator {
         }
     }
 
-    /// Immediately emit `FetchProvisionsRemote` for all outstanding expected
+    /// Immediately emit `Action::Fetch(FetchRequest::RemoteProvisions)` for all outstanding expected
     /// provisions, bypassing the normal liveness timeout.
     ///
     /// Called when urgency overrides the default patience — sync completion
