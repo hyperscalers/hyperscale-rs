@@ -1,11 +1,11 @@
 //! Pure provision functions invoked from the node's delegated-action dispatcher.
 //!
-//! These functions implement the source-side work for `FetchAndBroadcastProvision`:
+//! These functions implement the source-side work for `FetchAndBroadcastProvisions`:
 //! reading state entries at a committed block height (via the JMT history) and
 //! grouping them by target shard with merkle inclusion proofs. They are kept
 //! free of node/runner concerns so the dispatcher only handles event plumbing.
 
-use hyperscale_core::ProvisionRequest;
+use hyperscale_core::ProvisionsRequest;
 use hyperscale_engine::{Engine, sharding::expand_nodes_with_owned_at_height};
 use hyperscale_jmt::TreeReader as JmtTreeReader;
 use hyperscale_storage::{SubstateStore, SubstateView, VersionedStore};
@@ -25,19 +25,19 @@ type FetchedTxEntries = (
 );
 
 /// One outbound provision batch destined for a single target shard.
-pub type ProvisionBatch = (ShardGroupId, Provisions, Vec<ValidatorId>);
+pub type ProvisionBatch = (Provisions, Vec<ValidatorId>);
 
 /// Fetch state entries and assemble per-shard provision batches with merkle proofs.
 ///
 /// Returns an empty `Vec` when no entries could be fetched (e.g. JMT version
-/// unavailable for `block_height`); callers still emit a `ProvisionReady` event
+/// unavailable for `block_height`); callers still emit a `ProvisionsReady` event
 /// so the state machine can mark the action complete.
 pub fn fetch_and_broadcast_provision<S, E, H>(
     executor: &E,
     view: &SubstateView<S>,
     source_shard: ShardGroupId,
     block_height: BlockHeight,
-    requests: &[ProvisionRequest],
+    requests: &[ProvisionsRequest],
     shard_recipients: &HashMap<ShardGroupId, Vec<ValidatorId>, H>,
 ) -> Vec<ProvisionBatch>
 where
@@ -66,7 +66,7 @@ where
 fn fetch_entries_for_requests<S, E>(
     executor: &E,
     view: &SubstateView<S>,
-    requests: &[ProvisionRequest],
+    requests: &[ProvisionsRequest],
     source_shard: ShardGroupId,
     block_height: BlockHeight,
 ) -> Vec<FetchedTxEntries>
@@ -154,8 +154,8 @@ where
         };
 
         let recipients = shard_recipients.get(&shard).cloned().unwrap_or_default();
-        let provisions = Provisions::new(source_shard, block_height, proof, transactions);
-        batches.push((shard, provisions, recipients));
+        let provisions = Provisions::new(source_shard, shard, block_height, proof, transactions);
+        batches.push((provisions, recipients));
     }
     batches
 }

@@ -250,8 +250,8 @@ pub enum ProtocolEvent {
     /// Received provisions from a source shard (light-client path).
     ///
     /// All transactions share the same `(source_shard, block_height)`
-    /// because they originate from a single `FetchAndBroadcastProvision` action.
-    StateProvisionsReceived {
+    /// because they originate from a single `FetchAndBroadcastProvisions` action.
+    ProvisionsReceived {
         /// Provisions batch received from a source shard.
         provisions: Provisions,
     },

@@ -7,10 +7,15 @@ use crate::{
 use sbor::prelude::*;
 use std::collections::HashSet;
 
-/// All provisions from a single source block, bundled together.
+/// All provisions from a single source block, scoped to a single target shard.
 ///
-/// Identifies the source block (for joining with `CommittedBlockHeader`)
-/// and carries the merkle proof plus per-transaction state entries.
+/// Identifies the (source block, target shard) pair: source identifies what
+/// state was committed and where to verify it; target identifies which shard
+/// the bundle is destined for. One `Provisions` per (`source_block`, `target_shard`)
+/// — a source block contributing state to multiple target shards produces
+/// multiple `Provisions`, each with its own merkle proof scoped to that
+/// shard's slice of entries.
+///
 /// The QC and `state_root` are obtained from `CommittedBlockHeader` received
 /// via gossip — they don't travel with the provisions.
 ///
@@ -18,6 +23,9 @@ use std::collections::HashSet;
 pub struct Provisions {
     /// Source shard that committed this block.
     pub source_shard: ShardGroupId,
+
+    /// Target shard the bundle is destined for.
+    pub target_shard: ShardGroupId,
 
     /// Block height at which the state was committed.
     pub block_height: BlockHeight,
@@ -37,6 +45,7 @@ impl std::fmt::Debug for Provisions {
         f.debug_struct("Provision")
             .field("hash", &self.hash)
             .field("source_shard", &self.source_shard)
+            .field("target_shard", &self.target_shard)
             .field("block_height", &self.block_height)
             .field("transactions", &self.transactions.len())
             .finish_non_exhaustive()
@@ -47,6 +56,7 @@ impl Clone for Provisions {
     fn clone(&self) -> Self {
         Self {
             source_shard: self.source_shard,
+            target_shard: self.target_shard,
             block_height: self.block_height,
             proof: self.proof.clone(),
             transactions: self.transactions.clone(),
@@ -72,8 +82,9 @@ impl<E: sbor::Encoder<sbor::NoCustomValueKind>> sbor::Encode<sbor::NoCustomValue
     }
 
     fn encode_body(&self, encoder: &mut E) -> Result<(), sbor::EncodeError> {
-        encoder.write_size(4)?;
+        encoder.write_size(5)?;
         encoder.encode(&self.source_shard)?;
+        encoder.encode(&self.target_shard)?;
         encoder.encode(&self.block_height)?;
         encoder.encode(&self.proof)?;
         encoder.encode(&self.transactions)?;
@@ -90,19 +101,27 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
     ) -> Result<Self, sbor::DecodeError> {
         decoder.check_preloaded_value_kind(value_kind, sbor::ValueKind::Tuple)?;
         let length = decoder.read_size()?;
-        if length != 4 {
+        if length != 5 {
             return Err(sbor::DecodeError::UnexpectedSize {
-                expected: 4,
+                expected: 5,
                 actual: length,
             });
         }
         let source_shard: ShardGroupId = decoder.decode()?;
+        let target_shard: ShardGroupId = decoder.decode()?;
         let block_height: BlockHeight = decoder.decode()?;
         let proof: MerkleInclusionProof = decoder.decode()?;
         let transactions: Vec<TxEntries> = decoder.decode()?;
-        let hash = Self::compute_hash(source_shard, block_height, &proof, &transactions);
+        let hash = Self::compute_hash(
+            source_shard,
+            target_shard,
+            block_height,
+            &proof,
+            &transactions,
+        );
         Ok(Self {
             source_shard,
+            target_shard,
             block_height,
             proof,
             transactions,
@@ -130,13 +149,21 @@ impl Provisions {
     #[must_use]
     pub fn new(
         source_shard: ShardGroupId,
+        target_shard: ShardGroupId,
         block_height: BlockHeight,
         proof: MerkleInclusionProof,
         transactions: Vec<TxEntries>,
     ) -> Self {
-        let hash = Self::compute_hash(source_shard, block_height, &proof, &transactions);
+        let hash = Self::compute_hash(
+            source_shard,
+            target_shard,
+            block_height,
+            &proof,
+            &transactions,
+        );
         Self {
             source_shard,
+            target_shard,
             block_height,
             proof,
             transactions,
@@ -166,6 +193,7 @@ impl Provisions {
 
     fn compute_hash(
         source_shard: ShardGroupId,
+        target_shard: ShardGroupId,
         block_height: BlockHeight,
         proof: &MerkleInclusionProof,
         transactions: &[TxEntries],
@@ -174,6 +202,10 @@ impl Provisions {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(
             &sbor::basic_encode(&source_shard)
+                .expect("ShardGroupId serialization should never fail"),
+        );
+        bytes.extend_from_slice(
+            &sbor::basic_encode(&target_shard)
                 .expect("ShardGroupId serialization should never fail"),
         );
         bytes.extend_from_slice(
@@ -222,9 +254,14 @@ impl Provisions {
     /// Create a dummy `Provisions` for testing.
     #[cfg(any(test, feature = "test-utils"))]
     #[must_use]
-    pub fn dummy(source_shard: ShardGroupId, block_height: BlockHeight) -> Self {
+    pub fn dummy(
+        source_shard: ShardGroupId,
+        target_shard: ShardGroupId,
+        block_height: BlockHeight,
+    ) -> Self {
         Self::new(
             source_shard,
+            target_shard,
             block_height,
             MerkleInclusionProof::dummy(),
             vec![],
@@ -249,6 +286,7 @@ mod tests {
     fn test_provision_deadline_is_source_ts_plus_retention_horizon() {
         let provisions = Provisions::new(
             ShardGroupId(1),
+            ShardGroupId(2),
             BlockHeight(100),
             MerkleInclusionProof::new(vec![]),
             vec![],
@@ -264,6 +302,7 @@ mod tests {
     fn test_provisions_fields_roundtrip() {
         let original = Provisions::new(
             ShardGroupId(1),
+            ShardGroupId(2),
             BlockHeight(42),
             MerkleInclusionProof::new(vec![1, 2, 3]),
             vec![],
@@ -272,6 +311,7 @@ mod tests {
         let bytes = sbor::basic_encode(&original).unwrap();
         let decoded: Provisions = sbor::basic_decode(&bytes).unwrap();
         assert_eq!(original, decoded);
+        assert_eq!(decoded.target_shard, ShardGroupId(2));
     }
 
     #[test]
@@ -291,6 +331,7 @@ mod tests {
     fn test_provisions_roundtrip() {
         let provisions = Provisions::new(
             ShardGroupId(0),
+            ShardGroupId(1),
             BlockHeight(10),
             MerkleInclusionProof::dummy(),
             vec![TxEntries {
@@ -308,7 +349,7 @@ mod tests {
     #[test]
     fn test_provisions_all_entries_deduped() {
         let entry = test_entry(1);
-        let mut provisions = Provisions::dummy(ShardGroupId(0), BlockHeight(10));
+        let mut provisions = Provisions::dummy(ShardGroupId(0), ShardGroupId(1), BlockHeight(10));
         provisions.transactions = vec![
             TxEntries {
                 tx_hash: TxHash::from_raw(Hash::from_bytes(b"tx1")),

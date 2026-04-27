@@ -413,6 +413,20 @@ impl ProvisionCoordinator {
             return vec![];
         }
 
+        // Reject provisions not destined for our shard. Indicates a proposer
+        // bug, a network misroute, or an adversarial attempt — log loudly so
+        // it's visible but don't propagate.
+        if provisions.target_shard != topology.local_shard() {
+            warn!(
+                source_shard = source_shard.0,
+                target_shard = provisions.target_shard.0,
+                local_shard = topology.local_shard().0,
+                block_height = block_height.0,
+                "Dropping provisions: target_shard does not match local shard"
+            );
+            return vec![];
+        }
+
         let key = (source_shard, block_height);
 
         // Skip if this key was already verified (duplicate gossip/fetch) or
@@ -800,16 +814,17 @@ mod tests {
     fn make_provisions(
         tx_hash: TxHash,
         source_shard: ShardGroupId,
-        _target_shard: ShardGroupId,
+        target_shard: ShardGroupId,
         height: BlockHeight,
     ) -> Provisions {
-        make_provisions_multi(vec![tx_hash], source_shard, height)
+        make_provisions_multi(vec![tx_hash], source_shard, target_shard, height)
     }
 
     /// Build a Provision for testing with multiple transactions.
     fn make_provisions_multi(
         tx_hashes: Vec<TxHash>,
         source_shard: ShardGroupId,
+        target_shard: ShardGroupId,
         height: BlockHeight,
     ) -> Provisions {
         let transactions = tx_hashes
@@ -822,6 +837,7 @@ mod tests {
             .collect();
         Provisions::new(
             source_shard,
+            target_shard,
             height,
             MerkleInclusionProof::dummy(),
             transactions,
@@ -1032,7 +1048,8 @@ mod tests {
         );
         coordinator.on_verified_remote_header(&topology, &header);
 
-        let provisions = make_provisions_multi(tx_hashes, source_shard, BlockHeight(10));
+        let provisions =
+            make_provisions_multi(tx_hashes, source_shard, ShardGroupId(0), BlockHeight(10));
 
         let actions = coordinator.on_state_provisions_received(&topology, provisions);
 
@@ -1128,7 +1145,12 @@ mod tests {
         coordinator.on_verified_remote_header(&topology, &header);
 
         // Arriving provisions is missing tx_c.
-        let partial = make_provisions_multi(tx_full[..2].to_vec(), source_shard, BlockHeight(10));
+        let partial = make_provisions_multi(
+            tx_full[..2].to_vec(),
+            source_shard,
+            ShardGroupId(0),
+            BlockHeight(10),
+        );
         let actions = coordinator.on_state_provisions_received(&topology, partial);
 
         assert!(
@@ -1179,7 +1201,8 @@ mod tests {
         );
         coordinator.on_verified_remote_header(&topology, &header);
 
-        let provisions = make_provisions_multi(tx_hashes, source_shard, BlockHeight(10));
+        let provisions =
+            make_provisions_multi(tx_hashes, source_shard, ShardGroupId(0), BlockHeight(10));
 
         coordinator.on_state_provisions_received(&topology, provisions.clone());
 

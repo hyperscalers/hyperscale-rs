@@ -30,7 +30,7 @@ pub struct CrossShardExecutionRequest {
 ///
 /// Collected per-block and emitted via [`Action::FetchAndBroadcastProvisions`].
 #[derive(Debug, Clone)]
-pub struct ProvisionRequest {
+pub struct ProvisionsRequest {
     /// Transaction hash (for correlation).
     pub tx_hash: TxHash,
     /// Nodes owned by our shard whose state we need to provision.
@@ -126,14 +126,14 @@ pub enum Action {
     /// Only the block proposer emits this (once per block). Delegated to the
     /// execution pool where it fetches entries, generates merkle proofs, builds
     /// `StateProvision`s, groups by target shard, and returns batches via
-    /// `NodeInput::ProvisionReady` for network broadcast.
-    FetchAndBroadcastProvision {
+    /// `NodeInput::ProvisionsReady` for network broadcast.
+    FetchAndBroadcastProvisions {
         /// The committed block whose state is being attested to. Anchors
         /// state reads via `PendingChain::view_at`. Merkle proofs are
         /// generated against this block's state root.
         block_hash: BlockHash,
         /// One entry per cross-shard tx that needs provisioning.
-        requests: Vec<ProvisionRequest>,
+        requests: Vec<ProvisionsRequest>,
         /// Shard producing the provisions (this validator's shard).
         source_shard: ShardGroupId,
         /// Source-shard block height the provisions are anchored to.
@@ -875,8 +875,8 @@ pub enum Action {
     /// This is the fallback recovery mechanism for byzantine proposers that
     /// silently drop provisions.
     ///
-    /// The runner sends a `GetProvisionRequest` to the source shard, and the
-    /// response is fed back as `StateProvisionsReceived` for normal verification.
+    /// The runner sends a `GetProvisionsRequest` to the source shard, and the
+    /// response is fed back as `ProvisionsReceived` for normal verification.
     FetchProvisionsRemote {
         /// The shard that should have sent provisions.
         source_shard: ShardGroupId,

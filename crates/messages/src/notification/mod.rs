@@ -7,10 +7,10 @@ mod block_header;
 mod block_vote;
 mod execution_certificates;
 mod execution_votes;
-mod state_provisions;
+mod provisions;
 
 pub use block_header::BlockHeaderNotification;
 pub use block_vote::BlockVoteNotification;
 pub use execution_certificates::ExecutionCertificatesNotification;
 pub use execution_votes::ExecutionVotesNotification;
-pub use state_provisions::StateProvisionNotification;
+pub use provisions::ProvisionsNotification;

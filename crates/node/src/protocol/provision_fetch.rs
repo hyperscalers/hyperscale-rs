@@ -11,13 +11,12 @@
 //! Runner ──► ProvisionFetchProtocol::handle(Input) ──► Vec<Output>
 //! ```
 
-use hyperscale_messages::request::GetProvisionRequest;
+use hyperscale_messages::request::GetProvisionsRequest;
 use hyperscale_messages::response::GetProvisionResponse;
 use hyperscale_metrics as metrics;
 use hyperscale_storage::{ChainReader, SubstateStore};
-use hyperscale_types::{BlockHeight, Provisions, ShardGroupId, StateProvision, ValidatorId};
+use hyperscale_types::{BlockHeight, Provisions, ShardGroupId, ValidatorId};
 use std::collections::{BTreeMap, HashSet};
-use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, info, trace, warn};
 
@@ -400,17 +399,14 @@ pub fn serve_provision_request(
     storage: &(impl ChainReader + SubstateStore),
     local_shard: ShardGroupId,
     num_shards: u64,
-    req: &GetProvisionRequest,
+    req: &GetProvisionsRequest,
 ) -> GetProvisionResponse {
     let Some(certified) = storage.get_block(req.block_height) else {
         warn!(
             block_height = req.block_height.0,
             "Provision request: block not found"
         );
-        return GetProvisionResponse {
-            provisions: None,
-            proof: None,
-        };
+        return GetProvisionResponse { provisions: None };
     };
     let block = certified.block;
 
@@ -419,10 +415,7 @@ pub fn serve_provision_request(
     let all_txs = block.transactions().iter();
 
     // Phase 1: Fetch state entries for all matching transactions.
-    let mut per_tx: Vec<(
-        hyperscale_types::TxHash,
-        Arc<Vec<hyperscale_types::StateEntry>>,
-    )> = Vec::new();
+    let mut per_tx: Vec<(hyperscale_types::TxHash, Vec<hyperscale_types::StateEntry>)> = Vec::new();
     let mut all_storage_keys: Vec<Vec<u8>> = Vec::new();
 
     for tx in all_txs {
@@ -460,55 +453,47 @@ pub fn serve_provision_request(
                 jmt_height = jmt_height.0,
                 "Provision request: historical JMT version unavailable"
             );
-            return GetProvisionResponse {
-                provisions: None,
-                proof: None,
-            };
+            return GetProvisionResponse { provisions: None };
         };
         for e in &entries {
             all_storage_keys.push(e.storage_key.clone());
         }
-        per_tx.push((tx.hash(), Arc::new(entries)));
-    }
-
-    if per_tx.is_empty() {
-        return GetProvisionResponse {
-            provisions: Some(vec![]),
-            proof: None,
-        };
+        per_tx.push((tx.hash(), entries));
     }
 
     // Phase 2: Generate ONE batched proof covering all entries.
     all_storage_keys.sort();
     all_storage_keys.dedup();
-    let proof = if let Some(p) = storage.generate_merkle_proofs(&all_storage_keys, jmt_height) {
-        Arc::new(p)
+    let proof = if per_tx.is_empty() {
+        hyperscale_types::MerkleInclusionProof::dummy()
+    } else if let Some(p) = storage.generate_merkle_proofs(&all_storage_keys, jmt_height) {
+        p
     } else {
         tracing::warn!(
             block_height = req.block_height.0,
             "Fallback provision: batched proof generation failed (version unavailable)"
         );
-        return GetProvisionResponse {
-            provisions: None,
-            proof: None,
-        };
+        return GetProvisionResponse { provisions: None };
     };
 
-    // Phase 3: Build provisions sharing the single proof.
-    let mut provisions = Vec::with_capacity(per_tx.len());
-    for (tx_hash, entries) in per_tx {
-        provisions.push(StateProvision {
-            transaction_hash: tx_hash,
-            target_shard: req.target_shard,
-            source_shard: local_shard,
-            block_height: req.block_height,
+    // Phase 3: Build the bundle.
+    let transactions = per_tx
+        .into_iter()
+        .map(|(tx_hash, entries)| hyperscale_types::TxEntries {
+            tx_hash,
             entries,
-        });
-    }
+            target_nodes: vec![],
+        })
+        .collect();
 
     GetProvisionResponse {
-        provisions: Some(provisions),
-        proof: Some((*proof).clone()),
+        provisions: Some(hyperscale_types::Provisions::new(
+            local_shard,
+            req.target_shard,
+            req.block_height,
+            proof,
+            transactions,
+        )),
     }
 }
 
@@ -683,7 +668,7 @@ mod tests {
         let outputs = protocol.handle(ProvisionFetchInput::Received {
             source_shard: shard(1),
             block_height: height(10),
-            provisions: Provisions::dummy(shard(1), height(10)),
+            provisions: Provisions::dummy(shard(1), shard(0), height(10)),
         });
 
         assert_eq!(outputs.len(), 1);
@@ -764,7 +749,7 @@ mod tests {
         let outputs = protocol.handle(ProvisionFetchInput::Received {
             source_shard: shard(99),
             block_height: height(999),
-            provisions: Provisions::dummy(shard(99), height(999)),
+            provisions: Provisions::dummy(shard(99), shard(0), height(999)),
         });
         assert!(outputs.is_empty());
     }
@@ -942,7 +927,7 @@ mod tests {
         protocol.handle(ProvisionFetchInput::Received {
             source_shard: shard(1),
             block_height: height(10),
-            provisions: Provisions::dummy(shard(1), height(10)),
+            provisions: Provisions::dummy(shard(1), shard(0), height(10)),
         });
         assert!(!protocol.is_shard_saturated(shard(1)));
 

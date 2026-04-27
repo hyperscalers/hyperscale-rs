@@ -11,7 +11,7 @@ use sbor::prelude::BasicSbor;
 /// This is the fallback recovery mechanism for byzantine proposers that
 /// silently drop provisions.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
-pub struct GetProvisionRequest {
+pub struct GetProvisionsRequest {
     /// Height of the source block whose provisions are needed.
     pub block_height: BlockHeight,
     /// The shard requesting provisions (so the source knows which
@@ -19,7 +19,7 @@ pub struct GetProvisionRequest {
     pub target_shard: ShardGroupId,
 }
 
-impl NetworkMessage for GetProvisionRequest {
+impl NetworkMessage for GetProvisionsRequest {
     fn message_type_id() -> &'static str {
         "provision.request"
     }
@@ -29,7 +29,7 @@ impl NetworkMessage for GetProvisionRequest {
     }
 }
 
-impl Request for GetProvisionRequest {
+impl Request for GetProvisionsRequest {
     type Response = GetProvisionResponse;
 }
 
@@ -39,13 +39,13 @@ mod tests {
 
     #[test]
     fn test_sbor_roundtrip() {
-        let request = GetProvisionRequest {
+        let request = GetProvisionsRequest {
             block_height: BlockHeight(42),
             target_shard: ShardGroupId(1),
         };
 
         let encoded = sbor::basic_encode(&request).unwrap();
-        let decoded: GetProvisionRequest = sbor::basic_decode(&encoded).unwrap();
+        let decoded: GetProvisionsRequest = sbor::basic_decode(&encoded).unwrap();
         assert_eq!(request, decoded);
     }
 }

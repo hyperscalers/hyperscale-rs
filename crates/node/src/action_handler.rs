@@ -81,7 +81,7 @@ pub const fn dispatch_pool_for(action: &Action) -> Option<DispatchPool> {
         | Action::VerifyAndAggregateExecutionVotes { .. }
         | Action::VerifyExecutionCertificateSignature { .. }
         | Action::VerifyProvisions { .. }
-        | Action::FetchAndBroadcastProvision { .. } => Some(DispatchPool::Crypto),
+        | Action::FetchAndBroadcastProvisions { .. } => Some(DispatchPool::Crypto),
 
         // Execution
         Action::ExecuteTransactions { .. } | Action::ExecuteCrossShardTransactions { .. } => {
@@ -99,7 +99,7 @@ pub const fn dispatch_pool_for(action: &Action) -> Option<DispatchPool> {
 /// The anchor names the block whose state the action reads against:
 /// - `BuildProposal`/`VerifyStateRoot` use the parent block (state we
 ///   build on / verify against).
-/// - `Execute*` and `FetchAndBroadcastProvision` use the kicked-off
+/// - `Execute*` and `FetchAndBroadcastProvisions` use the kicked-off
 ///   block (the committed block whose state these actions act on).
 pub const fn parent_hash_for(action: &Action) -> Option<BlockHash> {
     match action {
@@ -109,7 +109,7 @@ pub const fn parent_hash_for(action: &Action) -> Option<BlockHash> {
         Action::BuildProposal { parent_hash, .. } => Some(*parent_hash),
         Action::ExecuteTransactions { block_hash, .. }
         | Action::ExecuteCrossShardTransactions { block_hash, .. }
-        | Action::FetchAndBroadcastProvision { block_hash, .. } => Some(*block_hash),
+        | Action::FetchAndBroadcastProvisions { block_hash, .. } => Some(*block_hash),
         _ => None,
     }
 }
@@ -684,7 +684,7 @@ pub fn handle_delegated_action<S: Storage, E: Engine>(
         }
 
         // --- Provision fetch + broadcast ---
-        Action::FetchAndBroadcastProvision {
+        Action::FetchAndBroadcastProvisions {
             block_hash: _,
             requests,
             source_shard,
@@ -700,7 +700,7 @@ pub fn handle_delegated_action<S: Storage, E: Engine>(
                 &shard_recipients,
             );
             Some(DelegatedResult {
-                events: vec![NodeInput::ProvisionReady { batches }],
+                events: vec![NodeInput::ProvisionsReady { batches }],
                 prepared_commit: None,
             })
         }

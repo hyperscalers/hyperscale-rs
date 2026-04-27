@@ -136,6 +136,7 @@ mod tests {
     ) -> Arc<Provisions> {
         Arc::new(Provisions::new(
             source_shard,
+            ShardGroupId(0),
             height,
             MerkleInclusionProof::dummy(),
             vec![TxEntries {

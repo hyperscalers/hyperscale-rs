@@ -718,7 +718,7 @@ where
             }
 
             // ── Provision fetch protocol ──────────────────────────────
-            NodeInput::ProvisionFetchReceived { provisions } => {
+            NodeInput::ProvisionsFetchReceived { provisions } => {
                 let source_shard = provisions.source_shard;
                 let block_height = provisions.block_height;
                 let outputs = self
@@ -732,7 +732,7 @@ where
                 self.update_fetch_tick_timer();
             }
 
-            NodeInput::ProvisionFetchFailed {
+            NodeInput::ProvisionsFetchFailed {
                 source_shard,
                 block_height,
             } => {
@@ -871,7 +871,7 @@ where
                 self.update_fetch_tick_timer();
             }
 
-            NodeInput::LocalProvisionFetchFailed { block_hash, hashes } => {
+            NodeInput::LocalProvisionsFetchFailed { block_hash, hashes } => {
                 let outputs = self
                     .local_provision_fetch_protocol
                     .handle(LocalProvisionFetchInput::Failed { block_hash, hashes });
@@ -886,17 +886,17 @@ where
 
             // ── Provision ready (from execution pool) ─────────────────
             //
-            // The FetchAndBroadcastProvision delegated action built provisions
+            // The FetchAndBroadcastProvisions delegated action built provisions
             // grouped by target shard. Register each with the outbound
             // tracker (which also inserts into the shared ProvisionStore)
             // before broadcasting, so cross-shard `provision.request` and
             // our own `local_provision.request` can serve the batch from
             // memory while we await target ECs.
-            NodeInput::ProvisionReady { batches } => {
-                for (target_shard, provisions, _recipients) in &batches {
+            NodeInput::ProvisionsReady { batches } => {
+                for (provisions, _recipients) in &batches {
                     self.feed_event(ProtocolEvent::OutboundProvisionBroadcast {
                         provisions: std::sync::Arc::new(provisions.clone()),
-                        target_shard: *target_shard,
+                        target_shard: provisions.target_shard,
                     });
                 }
                 self.broadcast_provisions(batches);
@@ -1018,48 +1018,23 @@ where
     pub(crate) fn broadcast_provisions(
         &self,
         batches: Vec<(
-            hyperscale_types::ShardGroupId,
             hyperscale_types::Provisions,
             Vec<hyperscale_types::ValidatorId>,
         )>,
     ) {
         let signing_key = Arc::clone(&self.signing_key);
         let network = Arc::clone(&self.network);
-        let local_shard = self.local_shard;
         let validator_id = self.validator_id;
 
         self.dispatch.spawn_crypto(move || {
-            for (shard, provisions, recipients) in batches {
-                let block_height = provisions.block_height;
-                let source_shard = provisions.source_shard;
-                let proof = provisions.proof.clone();
-                let state_provisions: Vec<hyperscale_types::StateProvision> = provisions
-                    .transactions
-                    .into_iter()
-                    .map(|tx| hyperscale_types::StateProvision {
-                        transaction_hash: tx.tx_hash,
-                        target_shard: shard,
-                        source_shard,
-                        block_height,
-                        entries: std::sync::Arc::new(tx.entries),
-                    })
-                    .collect();
-                if state_provisions.is_empty() {
+            for (provisions, recipients) in batches {
+                if provisions.transactions.is_empty() {
                     continue;
                 }
-                let msg = hyperscale_types::state_provisions_message(
-                    local_shard,
-                    shard,
-                    block_height,
-                    &state_provisions,
-                );
+                let msg = hyperscale_types::state_provisions_message(&provisions);
                 let sig = signing_key.sign_v1(&msg);
-                let notification = hyperscale_messages::StateProvisionNotification::new(
-                    state_provisions,
-                    proof,
-                    validator_id,
-                    sig,
-                );
+                let notification =
+                    hyperscale_messages::ProvisionsNotification::new(provisions, validator_id, sig);
                 network.notify(&recipients, &notification);
             }
         });

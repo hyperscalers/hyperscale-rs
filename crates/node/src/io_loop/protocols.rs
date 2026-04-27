@@ -320,7 +320,7 @@ where
                                 });
                             }
                             Err(_) => {
-                                let _ = es.send(NodeInput::LocalProvisionFetchFailed {
+                                let _ = es.send(NodeInput::LocalProvisionsFetchFailed {
                                     block_hash: bh,
                                     hashes: hs,
                                 });
@@ -337,7 +337,7 @@ where
                     // to in BlockManifest; it doesn't catch a proposer that
                     // committed to an incomplete batch.
                     for provisions in batches {
-                        self.feed_event(ProtocolEvent::StateProvisionsReceived {
+                        self.feed_event(ProtocolEvent::ProvisionsReceived {
                             provisions: (*provisions).clone(),
                         });
                     }
@@ -349,7 +349,7 @@ where
     /// Process `ProvisionFetchProtocol` outputs.
     ///
     /// `Fetch` uses the Network trait to send a single-peer request.
-    /// `Deliver` feeds provisions into the state machine via `StateProvisionsReceived`.
+    /// `Deliver` feeds provisions into the state machine via `ProvisionsReceived`.
     pub(super) fn process_provision_fetch_outputs(&mut self, outputs: Vec<ProvisionFetchOutput>) {
         for output in outputs {
             match output {
@@ -359,8 +359,8 @@ where
                     target_shard,
                     peer,
                 } => {
-                    use hyperscale_messages::request::GetProvisionRequest;
-                    let request = GetProvisionRequest {
+                    use hyperscale_messages::request::GetProvisionsRequest;
+                    let request = GetProvisionsRequest {
                         block_height,
                         target_shard,
                     };
@@ -372,38 +372,42 @@ where
                         Box::new(move |result| match result {
                             Ok(response) => match response.provisions {
                                 Some(provisions) => {
-                                    // Build a Provision from the response.
-                                    let proof = response.proof.unwrap_or_else(
-                                        hyperscale_types::MerkleInclusionProof::dummy,
-                                    );
-                                    let transactions: Vec<hyperscale_types::TxEntries> = provisions
-                                        .into_iter()
-                                        .map(|p| hyperscale_types::TxEntries {
-                                            tx_hash: p.transaction_hash,
-                                            entries: (*p.entries).clone(),
-                                            target_nodes: vec![],
-                                        })
-                                        .collect();
-                                    let provisions = hyperscale_types::Provisions::new(
-                                        source_shard,
-                                        block_height,
-                                        proof,
-                                        transactions,
-                                    );
+                                    // A peer responded with a bundle scoped to the
+                                    // wrong (source, target) pair — treat as a fetch
+                                    // failure so the protocol tries the next peer.
+                                    if provisions.source_shard != source_shard
+                                        || provisions.target_shard != target_shard
+                                        || provisions.block_height != block_height
+                                    {
+                                        tracing::warn!(
+                                            expected_source = source_shard.0,
+                                            got_source = provisions.source_shard.0,
+                                            expected_target = target_shard.0,
+                                            got_target = provisions.target_shard.0,
+                                            expected_height = block_height.0,
+                                            got_height = provisions.block_height.0,
+                                            "Dropping provision fetch response: scope mismatch"
+                                        );
+                                        let _ = sender.send(NodeInput::ProvisionsFetchFailed {
+                                            source_shard,
+                                            block_height,
+                                        });
+                                        return;
+                                    }
                                     let _ = sender
-                                        .send(NodeInput::ProvisionFetchReceived { provisions });
+                                        .send(NodeInput::ProvisionsFetchReceived { provisions });
                                 }
                                 None => {
                                     // Peer cannot serve (state version GC'd) → fail
                                     // so the protocol tries the next peer.
-                                    let _ = sender.send(NodeInput::ProvisionFetchFailed {
+                                    let _ = sender.send(NodeInput::ProvisionsFetchFailed {
                                         source_shard,
                                         block_height,
                                     });
                                 }
                             },
                             Err(_) => {
-                                let _ = sender.send(NodeInput::ProvisionFetchFailed {
+                                let _ = sender.send(NodeInput::ProvisionsFetchFailed {
                                     source_shard,
                                     block_height,
                                 });
@@ -413,7 +417,7 @@ where
                 }
                 ProvisionFetchOutput::Deliver { provisions } => {
                     if !provisions.transactions.is_empty() {
-                        self.feed_event(ProtocolEvent::StateProvisionsReceived { provisions });
+                        self.feed_event(ProtocolEvent::ProvisionsReceived { provisions });
                     }
                 }
             }

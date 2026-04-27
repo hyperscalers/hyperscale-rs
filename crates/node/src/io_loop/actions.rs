@@ -265,7 +265,7 @@ where
             | Action::VerifyProvisions { .. }
             | Action::ExecuteTransactions { .. }
             | Action::ExecuteCrossShardTransactions { .. }
-            | Action::FetchAndBroadcastProvision { .. } => {
+            | Action::FetchAndBroadcastProvisions { .. } => {
                 self.dispatch_delegated_action(action);
             }
 

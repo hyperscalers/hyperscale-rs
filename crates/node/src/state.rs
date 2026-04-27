@@ -616,7 +616,7 @@ impl StateMachine for NodeStateMachine {
             }
 
             // ── Provision ───────────────────────────────────────────────
-            ProtocolEvent::StateProvisionsReceived { provisions } => self
+            ProtocolEvent::ProvisionsReceived { provisions } => self
                 .provisions
                 .on_state_provisions_received(self.topology.snapshot(), provisions),
             ProtocolEvent::StateProvisionsVerified {

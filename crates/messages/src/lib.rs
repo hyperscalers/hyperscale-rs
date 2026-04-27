@@ -10,6 +10,6 @@ mod trace_context;
 pub use gossip::{CommittedBlockHeaderGossip, TransactionGossip};
 pub use notification::{
     BlockHeaderNotification, BlockVoteNotification, ExecutionCertificatesNotification,
-    ExecutionVotesNotification, StateProvisionNotification,
+    ExecutionVotesNotification, ProvisionsNotification,
 };
 pub use trace_context::TraceContext;

@@ -352,6 +352,7 @@ mod tests {
     ) -> Provisions {
         Provisions::new(
             source_shard,
+            ShardGroupId(0),
             height,
             MerkleInclusionProof::dummy(),
             txs.into_iter()

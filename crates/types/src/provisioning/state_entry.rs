@@ -98,13 +98,12 @@ impl StateEntry {
     }
 }
 
-/// State provision from a source shard to a target shard.
+/// Per-tx provision view used inside the execution path.
 ///
-/// Only the block proposer sends these. Provisions are always transported
-/// per source block alongside a single aggregated merkle proof that
-/// covers every entry across all `StateProvision` items for that block.
-/// The proof lives once on the wrapper (e.g. `StateProvisionNotification`)
-/// to avoid duplicating it per item during serialization.
+/// Built from a [`crate::Provisions`] bundle when it lands at the execution
+/// coordinator: each `TxEntries` in the bundle becomes one `StateProvision`
+/// keyed to the tx, carrying the bundle's source/target shard and block
+/// height alongside the tx's slice of state entries. Not on the wire.
 #[derive(Debug, Clone)]
 pub struct StateProvision {
     /// Hash of the transaction this provision is for.
@@ -120,11 +119,10 @@ pub struct StateProvision {
     pub block_height: BlockHeight,
 
     /// The state entries with pre-computed storage keys.
-    /// Wrapped in Arc for efficient sharing when broadcasting to multiple shards.
+    /// Wrapped in Arc for efficient sharing.
     pub entries: Arc<Vec<StateEntry>>,
 }
 
-// Manual PartialEq (compare Arc contents, not pointer identity)
 impl PartialEq for StateProvision {
     fn eq(&self, other: &Self) -> bool {
         self.transaction_hash == other.transaction_hash
@@ -136,72 +134,6 @@ impl PartialEq for StateProvision {
 }
 
 impl Eq for StateProvision {}
-
-// Manual SBOR implementation (since Arc doesn't derive BasicSbor)
-impl<E: sbor::Encoder<sbor::NoCustomValueKind>> sbor::Encode<sbor::NoCustomValueKind, E>
-    for StateProvision
-{
-    fn encode_value_kind(&self, encoder: &mut E) -> Result<(), sbor::EncodeError> {
-        encoder.write_value_kind(sbor::ValueKind::Tuple)
-    }
-
-    fn encode_body(&self, encoder: &mut E) -> Result<(), sbor::EncodeError> {
-        encoder.write_size(5)?;
-        encoder.encode(&self.transaction_hash)?;
-        encoder.encode(&self.target_shard)?;
-        encoder.encode(&self.source_shard)?;
-        encoder.encode(&self.block_height)?;
-        encoder.encode(self.entries.as_ref())?;
-        Ok(())
-    }
-}
-
-impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValueKind, D>
-    for StateProvision
-{
-    fn decode_body_with_value_kind(
-        decoder: &mut D,
-        value_kind: sbor::ValueKind<sbor::NoCustomValueKind>,
-    ) -> Result<Self, sbor::DecodeError> {
-        decoder.check_preloaded_value_kind(value_kind, sbor::ValueKind::Tuple)?;
-        let length = decoder.read_size()?;
-
-        if length != 5 {
-            return Err(sbor::DecodeError::UnexpectedSize {
-                expected: 5,
-                actual: length,
-            });
-        }
-
-        let transaction_hash: TxHash = decoder.decode()?;
-        let target_shard: ShardGroupId = decoder.decode()?;
-        let source_shard: ShardGroupId = decoder.decode()?;
-        let block_height: BlockHeight = decoder.decode()?;
-        let entries: Vec<StateEntry> = decoder.decode()?;
-
-        Ok(Self {
-            transaction_hash,
-            target_shard,
-            source_shard,
-            block_height,
-            entries: Arc::new(entries),
-        })
-    }
-}
-
-impl sbor::Categorize<sbor::NoCustomValueKind> for StateProvision {
-    fn value_kind() -> sbor::ValueKind<sbor::NoCustomValueKind> {
-        sbor::ValueKind::Tuple
-    }
-}
-
-impl sbor::Describe<sbor::NoCustomTypeKind> for StateProvision {
-    const TYPE_ID: sbor::RustTypeId = sbor::RustTypeId::novel_with_code("StateProvision", &[], &[]);
-
-    fn type_data() -> sbor::TypeData<sbor::NoCustomTypeKind, sbor::RustTypeId> {
-        sbor::TypeData::unnamed(sbor::TypeKind::Any)
-    }
-}
 
 #[cfg(test)]
 mod tests {

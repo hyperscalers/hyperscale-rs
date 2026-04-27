@@ -211,6 +211,7 @@ mod tests {
             .collect();
         Arc::new(Provisions::new(
             source,
+            ShardGroupId(0),
             block_height,
             MerkleInclusionProof::dummy(),
             transactions,

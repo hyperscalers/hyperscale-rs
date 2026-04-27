@@ -26,9 +26,7 @@
 use crate::Hash;
 #[cfg(test)]
 use crate::TxHash;
-use crate::{
-    BlockHash, BlockHeight, GlobalReceiptRoot, Round, ShardGroupId, StateProvision, WaveId,
-};
+use crate::{BlockHash, BlockHeight, GlobalReceiptRoot, Provisions, Round, ShardGroupId, WaveId};
 
 /// Domain tag for BFT block votes.
 ///
@@ -125,28 +123,21 @@ pub const DOMAIN_STATE_PROVISION_BATCH: &[u8] = b"STATE_PROVISION_BATCH";
 /// Build the signing message for a state provisions gossip.
 ///
 /// The message covers source shard, target shard, block height, and a
-/// digest of the transaction hashes in the batch. This is cheap to
-/// reconstruct at verification (no re-serialization needed) while binding
-/// the signature to the specific batch contents.
+/// digest of the transaction hashes in the bundle. Cheap to reconstruct at
+/// verification while binding the signature to the specific bundle contents.
 #[must_use]
-pub fn state_provisions_message(
-    source_shard: ShardGroupId,
-    target_shard: ShardGroupId,
-    block_height: BlockHeight,
-    provisions: &[StateProvision],
-) -> Vec<u8> {
-    // Hash the concatenated transaction hashes to produce a batch digest.
+pub fn state_provisions_message(provisions: &Provisions) -> Vec<u8> {
     let mut hasher = blake3::Hasher::new();
-    for p in provisions {
-        hasher.update(p.transaction_hash.as_bytes());
+    for tx in &provisions.transactions {
+        hasher.update(tx.tx_hash.as_bytes());
     }
     let tx_digest = hasher.finalize();
 
     let mut message = Vec::with_capacity(96);
     message.extend_from_slice(DOMAIN_STATE_PROVISION_BATCH);
-    message.extend_from_slice(&source_shard.0.to_le_bytes());
-    message.extend_from_slice(&target_shard.0.to_le_bytes());
-    message.extend_from_slice(&block_height.0.to_le_bytes());
+    message.extend_from_slice(&provisions.source_shard.0.to_le_bytes());
+    message.extend_from_slice(&provisions.target_shard.0.to_le_bytes());
+    message.extend_from_slice(&provisions.block_height.0.to_le_bytes());
     message.extend_from_slice(tx_digest.as_bytes());
     message
 }
@@ -320,29 +311,22 @@ mod tests {
 
     #[test]
     fn test_state_provisions_message_deterministic() {
-        use crate::StateProvision;
-        use std::sync::Arc;
+        use crate::{MerkleInclusionProof, TxEntries};
 
-        let provisions = vec![StateProvision {
-            transaction_hash: TxHash::from_raw(Hash::from_bytes(b"tx1")),
-            target_shard: ShardGroupId(2),
-            source_shard: ShardGroupId(1),
-            block_height: BlockHeight(10),
-            entries: Arc::new(vec![]),
-        }];
-
-        let msg1 = state_provisions_message(
+        let provisions = Provisions::new(
             ShardGroupId(1),
             ShardGroupId(2),
             BlockHeight(10),
-            &provisions,
+            MerkleInclusionProof::dummy(),
+            vec![TxEntries {
+                tx_hash: TxHash::from_raw(Hash::from_bytes(b"tx1")),
+                entries: vec![],
+                target_nodes: vec![],
+            }],
         );
-        let msg2 = state_provisions_message(
-            ShardGroupId(1),
-            ShardGroupId(2),
-            BlockHeight(10),
-            &provisions,
-        );
+
+        let msg1 = state_provisions_message(&provisions);
+        let msg2 = state_provisions_message(&provisions);
 
         assert_eq!(msg1, msg2);
         assert!(msg1.starts_with(DOMAIN_STATE_PROVISION_BATCH));

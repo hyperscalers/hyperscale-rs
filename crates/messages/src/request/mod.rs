@@ -18,6 +18,6 @@ pub use committed_header::GetCommittedBlockHeaderRequest;
 pub use execution_cert::GetExecutionCertsRequest;
 pub use finalized_wave::GetFinalizedWavesRequest;
 pub use local_provision::GetLocalProvisionsRequest;
-pub use provision::GetProvisionRequest;
+pub use provision::GetProvisionsRequest;
 pub use sync::SyncCompleteAnnouncement;
 pub use transaction::GetTransactionsRequest;

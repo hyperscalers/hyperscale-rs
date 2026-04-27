@@ -37,7 +37,7 @@
 //! Validators collect shard execution proofs from all participating shards. When all
 //! proofs are received, a `WaveCertificate` is created.
 
-use hyperscale_core::{Action, ProtocolEvent, ProvisionRequest};
+use hyperscale_core::{Action, ProtocolEvent, ProvisionsRequest};
 use hyperscale_types::{
     Attempt, Block, BlockHash, BlockHeight, BloomFilter, ExecutionCertificate, ExecutionVote,
     GlobalReceiptRoot, LocalExecutionEntry, NodeId, Provisions, ReceiptBundle, RoutableTransaction,
@@ -1344,7 +1344,7 @@ impl ExecutionCoordinator {
             if let Some((requests, shard_recipients)) =
                 Self::build_provision_requests(topology, transactions, local_shard)
             {
-                actions.push(Action::FetchAndBroadcastProvision {
+                actions.push(Action::FetchAndBroadcastProvisions {
                     block_hash,
                     requests,
                     source_shard: local_shard,
@@ -1740,7 +1740,7 @@ impl ExecutionCoordinator {
         topology: &TopologySnapshot,
         transactions: &[Arc<RoutableTransaction>],
         local_shard: ShardGroupId,
-    ) -> Option<(Vec<ProvisionRequest>, ShardRecipients)> {
+    ) -> Option<(Vec<ProvisionsRequest>, ShardRecipients)> {
         let local_vid = topology.local_validator_id();
 
         let mut provision_requests = Vec::new();
@@ -1782,7 +1782,7 @@ impl ExecutionCoordinator {
                 }
 
                 if !targets.is_empty() {
-                    provision_requests.push(ProvisionRequest {
+                    provision_requests.push(ProvisionsRequest {
                         tx_hash: tx.hash(),
                         nodes: owned_nodes,
                         targets,

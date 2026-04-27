@@ -166,10 +166,12 @@ fn test_cycle_detection_aborts_loser() {
 
     // Poll until both reach terminal state.
     // Check each tx on its home shard (where it was committed).
+    // Conflict detection short-circuits the wave timeout, so resolution
+    // happens within a few blocks of cycle detection.
     let mut a_done = false;
     let mut b_done = false;
 
-    for _ in 0..800 {
+    for _ in 0..50 {
         runner.run_until(runner.now() + Duration::from_millis(100));
 
         if !a_done {
@@ -318,8 +320,11 @@ fn test_livelock_resolves_promptly() {
         NodeInput::SubmitTransaction { tx: Arc::new(tx_b) },
     );
 
-    // Both should resolve within 30 seconds of simulated time
-    let deadline = submit_time + Duration::from_secs(30);
+    // Conflict detection short-circuits the wave timeout. Resolution should
+    // land within a few blocks of cycle detection — the 5s deadline is a
+    // tight regression signal, not a generous SLA: a fall-back to the wave
+    // timeout (~24s) would blow past it.
+    let deadline = submit_time + Duration::from_secs(5);
     let mut a_done = false;
     let mut b_done = false;
 
@@ -349,14 +354,10 @@ fn test_livelock_resolves_promptly() {
     let elapsed = runner.now().checked_sub(submit_time).unwrap();
     assert!(
         a_done,
-        "TX A should resolve within 30s (elapsed: {elapsed:?})"
+        "TX A should resolve via conflict detection (elapsed: {elapsed:?})"
     );
     assert!(
         b_done,
-        "TX B should resolve within 30s (elapsed: {elapsed:?})"
-    );
-    assert!(
-        elapsed < Duration::from_secs(30),
-        "cycle resolution took too long: {elapsed:?}",
+        "TX B should resolve via conflict detection (elapsed: {elapsed:?})"
     );
 }

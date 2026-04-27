@@ -163,6 +163,7 @@ mod tests {
     fn make_provisions(seed: u8, source_shard: ShardGroupId, height: BlockHeight) -> Provisions {
         Provisions::new(
             source_shard,
+            ShardGroupId(0),
             height,
             MerkleInclusionProof::dummy(),
             vec![TxEntries {

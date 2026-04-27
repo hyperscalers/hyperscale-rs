@@ -31,7 +31,7 @@ where
         use crate::protocol::sync::{serve_block_request, serve_block_topup_request};
         use crate::protocol::transaction_fetch::serve_transaction_request;
         use hyperscale_messages::request::{
-            GetBlockRequest, GetBlockTopUpRequest, GetProvisionRequest, GetTransactionsRequest,
+            GetBlockRequest, GetBlockTopUpRequest, GetProvisionsRequest, GetTransactionsRequest,
         };
         use std::collections::HashMap;
         use std::sync::Arc;
@@ -42,7 +42,7 @@ where
             std::sync::Condvar,
         )>;
 
-        struct ProvisionRequestDedup {
+        struct ProvisionsRequestDedup {
             cache: std::collections::BTreeMap<(u64, u64), ProvisionResponse>,
             in_flight: HashMap<(u64, u64), ProvisionWaiter>,
         }
@@ -90,14 +90,14 @@ where
         let topology = self.topology.clone();
         let outbound_cache = Arc::clone(&self.caches.provision_store);
 
-        let dedup: Arc<std::sync::Mutex<ProvisionRequestDedup>> =
-            Arc::new(std::sync::Mutex::new(ProvisionRequestDedup {
+        let dedup: Arc<std::sync::Mutex<ProvisionsRequestDedup>> =
+            Arc::new(std::sync::Mutex::new(ProvisionsRequestDedup {
                 cache: std::collections::BTreeMap::new(),
                 in_flight: HashMap::new(),
             }));
 
         self.network
-            .register_request_handler::<GetProvisionRequest>(move |req: GetProvisionRequest| {
+            .register_request_handler::<GetProvisionsRequest>(move |req: GetProvisionsRequest| {
                 let cache_key = (req.block_height.0, req.target_shard.0);
 
                 // Outbound fast path: if we still hold the exact batch we
@@ -108,21 +108,8 @@ where
                     outbound_cache.get_outbound(req.block_height, req.target_shard);
                 if let Some(provisions) = cached_outbound.first() {
                     use hyperscale_messages::response::GetProvisionResponse;
-                    use hyperscale_types::StateProvision;
-                    let state_provisions: Vec<StateProvision> = provisions
-                        .transactions
-                        .iter()
-                        .map(|tx| StateProvision {
-                            transaction_hash: tx.tx_hash,
-                            target_shard: req.target_shard,
-                            source_shard: provisions.source_shard,
-                            block_height: provisions.block_height,
-                            entries: Arc::new(tx.entries.clone()),
-                        })
-                        .collect();
                     return GetProvisionResponse {
-                        provisions: Some(state_provisions),
-                        proof: Some(provisions.proof.clone()),
+                        provisions: Some((**provisions).clone()),
                     };
                 }
 
@@ -399,56 +386,45 @@ where
                 },
             );
 
-        // ── state.provision.batch → verify sender sig, then ProtocolEvent::StateProvisionsReceived ─
+        // ── provisions.broadcast → verify sender sig, then ProtocolEvent::ProvisionsReceived ─
 
         let tx = self.event_sender.clone();
         let topology = self.topology.clone();
         self.network
-            .register_notification_handler::<hyperscale_messages::StateProvisionNotification>(
-                move |batch: hyperscale_messages::StateProvisionNotification| {
-                    if batch.provisions.is_empty() {
+            .register_notification_handler::<hyperscale_messages::ProvisionsNotification>(
+                move |notification: hyperscale_messages::ProvisionsNotification| {
+                    let topo = topology.load();
+
+                    // Drop provisions not destined for our shard before paying
+                    // the BLS verification cost. Catches misroutes and spam early.
+                    if notification.provisions.target_shard != topo.local_shard() {
+                        tracing::warn!(
+                            source_shard = notification.provisions.source_shard.0,
+                            target_shard = notification.provisions.target_shard.0,
+                            local_shard = topo.local_shard().0,
+                            "Dropping provisions notification: target_shard mismatch"
+                        );
                         return;
                     }
 
-                    let topo = topology.load();
-                    let sender = batch.sender;
-                    let source_shard = batch.provisions[0].source_shard;
-                    let msg = batch.signing_message();
+                    let sender = notification.sender;
+                    let source_shard = notification.provisions.source_shard;
+                    let msg = notification.signing_message();
                     if !verify_sender_signature(
                         &topo,
                         sender,
                         source_shard,
                         &msg,
-                        &batch.sender_signature,
+                        &notification.sender_signature,
                         "state_provisions",
                         "state provision",
                     ) {
                         return;
                     }
 
-                    let (provisions, proof) = batch.into_parts();
-                    if provisions.is_empty() {
-                        return;
-                    }
-                    let source_shard = provisions[0].source_shard;
-                    let block_height = provisions[0].block_height;
-                    let transactions: Vec<hyperscale_types::TxEntries> = provisions
-                        .into_iter()
-                        .map(|p| hyperscale_types::TxEntries {
-                            tx_hash: p.transaction_hash,
-                            entries: (*p.entries).clone(),
-                            target_nodes: vec![],
-                        })
-                        .collect();
-                    let provisions = hyperscale_types::Provisions::new(
-                        source_shard,
-                        block_height,
-                        proof,
-                        transactions,
-                    );
-                    let _ = tx.send(NodeInput::Protocol(
-                        ProtocolEvent::StateProvisionsReceived { provisions },
-                    ));
+                    let _ = tx.send(NodeInput::Protocol(ProtocolEvent::ProvisionsReceived {
+                        provisions: notification.provisions,
+                    }));
                 },
             );
 

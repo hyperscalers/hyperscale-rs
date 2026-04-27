@@ -122,7 +122,7 @@ pub enum NodeInput {
     },
 
     /// Local provision fetch failed.
-    LocalProvisionFetchFailed {
+    LocalProvisionsFetchFailed {
         /// Block whose provision fetch failed.
         block_hash: BlockHash,
         /// Provision hashes that failed to fetch.
@@ -189,22 +189,23 @@ pub enum NodeInput {
 
     /// Provision built by the execution pool, ready for network broadcast.
     ///
-    /// Returned from delegated `FetchAndBroadcastProvision` action.
-    /// The I/O loop sends one `StateProvisionNotification` per target shard,
-    /// targeted to the specific recipients embedded in each batch tuple.
-    ProvisionReady {
-        /// (`target_shard`, provisions, recipients) per target shard.
-        batches: Vec<(ShardGroupId, Provisions, Vec<ValidatorId>)>,
+    /// Returned from the delegated `FetchAndBroadcastProvisions` action. The
+    /// I/O loop sends one `ProvisionsNotification` per bundle, targeted to
+    /// the specific recipients embedded in each tuple. Target shard is
+    /// carried inside `Provisions.target_shard`.
+    ProvisionsReady {
+        /// (provisions, recipients) per target shard.
+        batches: Vec<(Provisions, Vec<ValidatorId>)>,
     },
 
     /// Provision successfully received from a provision fetch request.
-    ProvisionFetchReceived {
+    ProvisionsFetchReceived {
         /// Provision batch returned by the peer.
         provisions: Provisions,
     },
 
     /// A provision fetch request failed (network error or peer returned None).
-    ProvisionFetchFailed {
+    ProvisionsFetchFailed {
         /// Source shard whose provisions were being fetched.
         source_shard: ShardGroupId,
         /// Source-shard block height the provisions were anchored to.
@@ -275,7 +276,7 @@ impl NodeInput {
                 | ProtocolEvent::TransactionGossipReceived { .. }
                 | ProtocolEvent::GlobalBlockReceived { .. }
                 | ProtocolEvent::GlobalBlockVoteReceived { .. }
-                | ProtocolEvent::StateProvisionsReceived { .. } => EventPriority::Network,
+                | ProtocolEvent::ProvisionsReceived { .. } => EventPriority::Network,
 
                 // Fetch delivery events are processed callbacks from the fetch
                 // protocol, not raw network messages (analogous to
@@ -294,15 +295,15 @@ impl NodeInput {
             Self::TransactionValidationsFailed { .. } => EventPriority::Internal,
             Self::CommittedHeaderValidated { .. } => EventPriority::Internal,
             Self::CommittedBlockGossipReceived { .. } => EventPriority::Network,
-            Self::ProvisionReady { .. } => EventPriority::Internal,
-            Self::ProvisionFetchReceived { .. } => EventPriority::Internal,
-            Self::ProvisionFetchFailed { .. } => EventPriority::Internal,
+            Self::ProvisionsReady { .. } => EventPriority::Internal,
+            Self::ProvisionsFetchReceived { .. } => EventPriority::Internal,
+            Self::ProvisionsFetchFailed { .. } => EventPriority::Internal,
             Self::ExecCertFetchReceived { .. } => EventPriority::Internal,
             Self::ExecCertFetchFailed { .. } => EventPriority::Internal,
             Self::HeaderFetchReceived { .. } => EventPriority::Internal,
             Self::HeaderFetchFailed { .. } => EventPriority::Internal,
             Self::LocalProvisionReceived { .. } => EventPriority::Internal,
-            Self::LocalProvisionFetchFailed { .. } => EventPriority::Internal,
+            Self::LocalProvisionsFetchFailed { .. } => EventPriority::Internal,
             Self::FinalizedWaveReceived { .. } => EventPriority::Internal,
             Self::FinalizedWaveFetchFailed { .. } => EventPriority::Internal,
         }
@@ -343,15 +344,15 @@ impl NodeInput {
             Self::TransactionValidationsFailed { .. } => "TransactionValidationsFailed",
             Self::CommittedHeaderValidated { .. } => "CommittedHeaderValidated",
             Self::CommittedBlockGossipReceived { .. } => "CommittedBlockGossipReceived",
-            Self::ProvisionReady { .. } => "ProvisionReady",
-            Self::ProvisionFetchReceived { .. } => "ProvisionFetchReceived",
-            Self::ProvisionFetchFailed { .. } => "ProvisionFetchFailed",
+            Self::ProvisionsReady { .. } => "ProvisionsReady",
+            Self::ProvisionsFetchReceived { .. } => "ProvisionsFetchReceived",
+            Self::ProvisionsFetchFailed { .. } => "ProvisionsFetchFailed",
             Self::ExecCertFetchReceived { .. } => "ExecCertFetchReceived",
             Self::ExecCertFetchFailed { .. } => "ExecCertFetchFailed",
             Self::HeaderFetchReceived { .. } => "HeaderFetchReceived",
             Self::HeaderFetchFailed { .. } => "HeaderFetchFailed",
             Self::LocalProvisionReceived { .. } => "LocalProvisionReceived",
-            Self::LocalProvisionFetchFailed { .. } => "LocalProvisionFetchFailed",
+            Self::LocalProvisionsFetchFailed { .. } => "LocalProvisionsFetchFailed",
             Self::FinalizedWaveReceived { .. } => "FinalizedWaveReceived",
             Self::FinalizedWaveFetchFailed { .. } => "FinalizedWaveFetchFailed",
         }
