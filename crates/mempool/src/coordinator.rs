@@ -3,7 +3,7 @@
 use crate::lock_tracker::LockTracker;
 use crate::ready_set::ReadySet;
 use crate::tombstones::TombstoneStore;
-use hyperscale_core::Action;
+use hyperscale_core::{Action, ProtocolEvent};
 use hyperscale_types::{
     BlockHeight, BloomFilter, CertifiedBlock, DEFAULT_FPR, LocalTimestamp, NodeId,
     RoutableTransaction, TopologySnapshot, TransactionDecision, TransactionStatus, TxHash,
@@ -240,7 +240,54 @@ impl MempoolCoordinator {
         }
     }
 
-    /// Handle transaction submission from client.
+    /// Try to admit a single transaction. Returns `(was_newly_admitted,
+    /// cross_shard)`. Source-agnostic: callers append the appropriate
+    /// `Continuation(TransactionsAdmitted)` and any source-specific actions.
+    fn admit_internal(
+        &mut self,
+        topology: &TopologySnapshot,
+        tx: &Arc<RoutableTransaction>,
+        submitted_locally: bool,
+        now: LocalTimestamp,
+    ) -> Option<bool> {
+        let hash = tx.hash();
+
+        if self.pool.contains_key(&hash) || self.is_tombstoned(&hash) {
+            return None;
+        }
+
+        // Reject if past `validity_range.end_timestamp_exclusive`. Same
+        // expression the proposer/validator apply, enforced at the admission
+        // boundary so expired txs never enter the pool.
+        if tx.validity_range.end_timestamp_exclusive <= self.current_ts {
+            tracing::debug!(
+                tx_hash = ?hash,
+                end_ms = tx.validity_range.end_timestamp_exclusive.as_millis(),
+                now_ms = self.current_ts.as_millis(),
+                "Rejecting expired transaction"
+            );
+            return None;
+        }
+
+        let cross_shard = tx.is_cross_shard(topology.num_shards());
+        self.add_to_ready_tracking(hash, tx, now);
+        self.pool.insert(
+            hash,
+            PoolEntry {
+                tx: Arc::clone(tx),
+                status: TransactionStatus::Pending,
+                cross_shard,
+                submitted_locally,
+                admitted_at: now,
+            },
+        );
+
+        Some(cross_shard)
+    }
+
+    /// RPC submit path. Emits `EmitTransactionStatus` for the client
+    /// regardless of dedup, plus `Continuation(TransactionsAdmitted)` when
+    /// the tx is newly admitted.
     #[instrument(skip(self, topology, tx), fields(tx_hash = ?tx.hash()))]
     pub fn on_submit_transaction(
         &mut self,
@@ -250,68 +297,40 @@ impl MempoolCoordinator {
     ) -> Vec<Action> {
         let hash = tx.hash();
 
-        // Check for duplicate
         if let Some(entry) = self.pool.get(&hash) {
             return vec![Action::EmitTransactionStatus {
                 tx_hash: hash,
-                status: TransactionStatus::Pending, // Already exists
+                status: TransactionStatus::Pending,
                 cross_shard: entry.cross_shard,
                 submitted_locally: entry.submitted_locally,
             }];
         }
 
-        // Reject if tombstoned (already completed/aborted)
-        if self.is_tombstoned(&hash) {
-            tracing::debug!(tx_hash = ?hash, "Rejecting tombstoned transaction submission");
-            return vec![];
+        match self.admit_internal(topology, &tx, true, now) {
+            Some(cross_shard) => {
+                tracing::info!(
+                    tx_hash = ?hash,
+                    pool_size = self.pool.len(),
+                    "Transaction admitted via RPC submit"
+                );
+                vec![
+                    Action::EmitTransactionStatus {
+                        tx_hash: hash,
+                        status: TransactionStatus::Pending,
+                        cross_shard,
+                        submitted_locally: true,
+                    },
+                    Action::Continuation(ProtocolEvent::TransactionsAdmitted { txs: vec![tx] }),
+                ]
+            }
+            None => vec![],
         }
-
-        // Reject if already past `validity_range.end_timestamp_exclusive`.
-        // Same expression the proposer/validator apply, just at the
-        // admission boundary so expired txs never enter the pool.
-        if tx.validity_range.end_timestamp_exclusive <= self.current_ts {
-            tracing::debug!(
-                tx_hash = ?hash,
-                end_ms = tx.validity_range.end_timestamp_exclusive.as_millis(),
-                now_ms = self.current_ts.as_millis(),
-                "Rejecting expired transaction submission"
-            );
-            return vec![];
-        }
-
-        let cross_shard = tx.is_cross_shard(topology.num_shards());
-        // Add to ready tracking before moving tx into the pool entry.
-        self.add_to_ready_tracking(hash, &tx, now);
-        self.pool.insert(
-            hash,
-            PoolEntry {
-                tx,
-                status: TransactionStatus::Pending,
-                cross_shard,
-                submitted_locally: true, // Submitted via RPC
-                admitted_at: now,
-            },
-        );
-
-        tracing::info!(tx_hash = ?hash, pool_size = self.pool.len(), "Transaction added to mempool via submit");
-
-        // Note: Broadcasting is handled by NodeStateMachine which broadcasts to all
-        // involved shards. Mempool just manages state.
-        vec![Action::EmitTransactionStatus {
-            tx_hash: hash,
-            status: TransactionStatus::Pending,
-            cross_shard,
-            submitted_locally: true,
-        }]
     }
 
-    /// Handle transaction received via gossip (or validated RPC submission).
-    ///
-    /// `submitted_locally` is `true` when the transaction originated from this
-    /// node's RPC endpoint and was validated through the batcher.  The flag is
-    /// propagated to `PoolEntry` so that finalization metrics are recorded only
-    /// on the submitting node.
-    #[instrument(skip(self, tx), fields(tx_hash = ?tx.hash()))]
+    /// Gossip path (or validated RPC submission, post-validation). Silent
+    /// on dedup; emits `Continuation(TransactionsAdmitted)` when the tx is
+    /// newly admitted.
+    #[instrument(skip(self, topology, tx), fields(tx_hash = ?tx.hash()))]
     pub fn on_transaction_gossip(
         &mut self,
         topology: &TopologySnapshot,
@@ -319,43 +338,43 @@ impl MempoolCoordinator {
         submitted_locally: bool,
         now: LocalTimestamp,
     ) -> Vec<Action> {
-        let hash = tx.hash();
-
-        // Ignore if already have it or if tombstoned (completed/aborted)
-        if self.pool.contains_key(&hash) || self.is_tombstoned(&hash) {
-            return vec![];
+        match self.admit_internal(topology, &tx, submitted_locally, now) {
+            Some(_) => {
+                tracing::trace!(
+                    tx_hash = ?tx.hash(),
+                    pool_size = self.pool.len(),
+                    "Transaction admitted via gossip"
+                );
+                vec![Action::Continuation(ProtocolEvent::TransactionsAdmitted {
+                    txs: vec![tx],
+                })]
+            }
+            None => vec![],
         }
+    }
 
-        // Reject if past expiry — same admission rule as the RPC submit path.
-        if tx.validity_range.end_timestamp_exclusive <= self.current_ts {
-            tracing::trace!(
-                tx_hash = ?hash,
-                end_ms = tx.validity_range.end_timestamp_exclusive.as_millis(),
-                now_ms = self.current_ts.as_millis(),
-                "Dropping expired gossiped transaction"
-            );
-            return vec![];
+    /// Fetch-response path. Iterates [`Self::admit_internal`] for each tx and
+    /// emits one batched `Continuation(TransactionsAdmitted)` for the
+    /// admitted subset (empty `Vec<Action>` if nothing was admitted).
+    pub fn on_fetched_transactions(
+        &mut self,
+        topology: &TopologySnapshot,
+        txs: Vec<Arc<RoutableTransaction>>,
+        now: LocalTimestamp,
+    ) -> Vec<Action> {
+        let mut admitted = Vec::with_capacity(txs.len());
+        for tx in txs {
+            if self.admit_internal(topology, &tx, false, now).is_some() {
+                admitted.push(tx);
+            }
         }
-
-        let cross_shard = tx.is_cross_shard(topology.num_shards());
-        // Add to ready tracking before moving tx into the pool entry.
-        self.add_to_ready_tracking(hash, &tx, now);
-        self.pool.insert(
-            hash,
-            PoolEntry {
-                tx,
-                status: TransactionStatus::Pending,
-                cross_shard,
-                submitted_locally,
-                admitted_at: now,
-            },
-        );
-
-        tracing::trace!(tx_hash = ?hash, pool_size = self.pool.len(), "Transaction added to mempool via gossip");
-
-        // No events emitted — gossip acceptance is silent to avoid flooding
-        // the consensus channel under high transaction load.
-        vec![]
+        if admitted.is_empty() {
+            vec![]
+        } else {
+            vec![Action::Continuation(ProtocolEvent::TransactionsAdmitted {
+                txs: admitted,
+            })]
+        }
     }
 
     /// Evict a transaction that has reached a terminal state.

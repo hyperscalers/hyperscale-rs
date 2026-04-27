@@ -765,7 +765,8 @@ pub enum Action {
     ///
     /// Emitted when a block header arrives but transactions are missing from
     /// mempool. The runner fetches from the proposer or peers and delivers
-    /// results via `ProtocolEvent::TransactionFetchDelivered`.
+    /// results via `ProtocolEvent::TransactionsFetched`, which routes through
+    /// mempool admission and emits `Continuation(TransactionsAdmitted)`.
     FetchTransactions {
         /// Hash of the block that needs these transactions.
         block_hash: BlockHash,
@@ -805,16 +806,6 @@ pub enum Action {
         /// protocol rotates through these when the proposer doesn't have
         /// the data cached.
         peers: Vec<ValidatorId>,
-    },
-
-    /// Cancel any pending fetch operations for a block.
-    ///
-    /// Emitted when a pending block is removed from BFT state (committed, stale,
-    /// or superseded by sync). The runner should cancel any in-flight fetch
-    /// operations for this block to free up resources.
-    CancelFetch {
-        /// Hash of the block whose fetches should be cancelled.
-        block_hash: BlockHash,
     },
 
     /// Request a missing execution certificate from a source shard.

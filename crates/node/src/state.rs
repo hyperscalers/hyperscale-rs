@@ -446,33 +446,25 @@ impl NodeStateMachine {
         self.mempool.on_ec_created(tx_hashes)
     }
 
-    /// Handle transaction gossip received — add to mempool and check pending blocks.
+    /// Hand a gossiped transaction to the canonical mempool. Mempool emits
+    /// `Continuation(ProtocolEvent::TransactionsAdmitted)` for whatever it
+    /// admits; `io_loop` drains the fetch protocol and BFT's pending-block
+    /// subscriber receives the txs from there.
     fn on_transaction_gossip_received(
         &mut self,
         tx: Arc<RoutableTransaction>,
         submitted_locally: bool,
     ) -> Vec<Action> {
-        // Only add to our mempool if this transaction involves our shard.
-        // Cross-shard transactions that don't touch our shard should be ignored.
         if !self.topology.snapshot().involves_local_shard(&tx) {
             return vec![];
         }
 
-        let tx_hash = tx.hash();
-        let tx_for_pending = Arc::clone(&tx);
         let mut actions = self.mempool.on_transaction_gossip(
             self.topology.snapshot(),
             tx,
             submitted_locally,
             self.now,
         );
-
-        // Check if any pending blocks are now complete
-        actions.extend(self.bft.check_pending_blocks_for_transaction(
-            self.topology.snapshot(),
-            tx_hash,
-            &tx_for_pending,
-        ));
 
         // New transaction available — signal for event-driven proposal.
         actions.push(Action::Continuation(ProtocolEvent::ContentAvailable));
@@ -747,15 +739,12 @@ impl StateMachine for NodeStateMachine {
                 tx,
                 submitted_locally,
             } => self.on_transaction_gossip_received(tx, submitted_locally),
-            // ── Fetch Protocol ───────────────────────────────────────────
-            ProtocolEvent::TransactionFetchDelivered {
-                block_hash,
-                transactions,
-            } => self.bft.on_transaction_fetch_received(
-                self.topology.snapshot(),
-                block_hash,
-                transactions,
-            ),
+            ProtocolEvent::TransactionsAdmitted { txs } => self
+                .bft
+                .on_transactions_admitted(self.topology.snapshot(), &txs),
+            ProtocolEvent::TransactionsFetched { block_hash: _, txs } => self
+                .mempool
+                .on_fetched_transactions(self.topology.snapshot(), txs, self.now),
             // ── Storage / Sync ───────────────────────────────────────────
             ProtocolEvent::SyncBlockReadyToApply { certified } => self
                 .bft

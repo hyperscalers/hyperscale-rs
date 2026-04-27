@@ -13,7 +13,7 @@ use hyperscale_engine::Engine;
 use hyperscale_metrics as metrics;
 use hyperscale_network::Network;
 use hyperscale_storage::{ChainWriter, Storage};
-use hyperscale_types::{Block, BlockHeight, QuorumCertificate, StateRoot, ValidatorId};
+use hyperscale_types::{Block, BlockHeight, QuorumCertificate, StateRoot, TxHash, ValidatorId};
 use std::sync::Arc;
 use tracing::{debug, trace, warn};
 impl<S, N, D, E> IoLoop<S, N, D, E>
@@ -57,6 +57,11 @@ where
                             provisions::scope_for(provisions.source_shard, provisions.block_height);
                         self.provision_fetch
                             .handle(ScopeFetchInput::Admitted { scope });
+                    }
+                    ProtocolEvent::TransactionsAdmitted { txs } => {
+                        let ids: Vec<TxHash> = txs.iter().map(|tx| tx.hash()).collect();
+                        self.transaction_fetch
+                            .handle(HashSetFetchInput::Admitted { ids });
                     }
                     _ => {}
                 }
@@ -362,7 +367,6 @@ where
             | Action::FetchTransactions { .. }
             | Action::FetchProvisionsLocal { .. }
             | Action::FetchFinalizedWave { .. }
-            | Action::CancelFetch { .. }
             | Action::FetchProvisionsRemote { .. }
             | Action::RequestMissingExecutionCert { .. }
             | Action::CancelExecutionCertFetch { .. }
@@ -635,14 +639,6 @@ where
                 let tick_outputs = self.finalized_wave_fetch.handle(HashSetFetchInput::Tick);
                 self.process_finalized_wave_fetch_outputs(tick_outputs);
                 self.update_fetch_tick_timer();
-            }
-            Action::CancelFetch { block_hash } => {
-                self.transaction_fetch
-                    .handle(HashSetFetchInput::AdmittedScope { scope: block_hash });
-                self.local_provision_fetch
-                    .handle(HashSetFetchInput::AdmittedScope { scope: block_hash });
-                self.finalized_wave_fetch
-                    .handle(HashSetFetchInput::AdmittedScope { scope: block_hash });
             }
             Action::FetchProvisionsRemote {
                 source_shard,

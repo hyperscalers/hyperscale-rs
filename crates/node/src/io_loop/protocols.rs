@@ -273,7 +273,7 @@ where
                 }
                 HashSetFetchOutput::ScopeComplete { .. } => {
                     // Scope completion is purely an internal protocol signal;
-                    // BFT readiness is driven by `TransactionFetchDelivered`.
+                    // BFT readiness is driven by `Continuation(TransactionsAdmitted)`.
                 }
             }
         }

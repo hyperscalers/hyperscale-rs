@@ -364,6 +364,36 @@ pub enum ProtocolEvent {
         submitted_locally: bool,
     },
 
+    /// Transactions delivered by a fetch response. Routed straight to
+    /// `MempoolCoordinator::on_fetched_transactions` for admission; the
+    /// fetch-protocol drain happens via the resulting
+    /// `Continuation(TransactionsAdmitted)` so all paths converge.
+    TransactionsFetched {
+        /// Block whose transactions were fetched (informational; not used by
+        /// the admission path).
+        block_hash: BlockHash,
+        /// Fetched transactions to admit.
+        txs: Vec<Arc<RoutableTransaction>>,
+    },
+
+    /// One or more transactions were just admitted to the canonical mempool.
+    ///
+    /// Emitted by `MempoolCoordinator` (wrapped in `Action::Continuation`) for
+    /// every newly admitted batch, regardless of source (RPC, gossip, fetch,
+    /// local production). Drives two downstream consumers:
+    ///
+    /// - `io_loop` intercepts the matching `Continuation` arm and drains the
+    ///   transaction-fetch protocol's in-flight tracking.
+    /// - state.rs forwards the event to `bft.on_transactions_admitted`, which
+    ///   populates any pending block waiting on these hashes.
+    ///
+    /// Same shape as `RemoteHeaderVerified` / `ProvisionsVerified` —
+    /// the canonical-store admission story is uniform across payloads.
+    TransactionsAdmitted {
+        /// Transactions newly admitted to mempool on this admission call.
+        txs: Vec<Arc<RoutableTransaction>>,
+    },
+
     /// A transaction's execution outcome has been resolved and certificate finalized.
     /// Used for per-tx mempool status updates.
     TransactionExecuted {
@@ -391,14 +421,6 @@ pub enum ProtocolEvent {
     // ═══════════════════════════════════════════════════════════════════════
     // Fetch Delivery (from IoLoop after fetch protocol processing)
     // ═══════════════════════════════════════════════════════════════════════
-    /// Fetched transactions delivered to state machine.
-    TransactionFetchDelivered {
-        /// Block whose transactions were fetched.
-        block_hash: BlockHash,
-        /// Fetched transactions.
-        transactions: Vec<Arc<RoutableTransaction>>,
-    },
-
     /// Fetched finalized wave delivered to state machine for pending block completion.
     FinalizedWaveFetchDelivered {
         /// Finalized wave delivered for pending-block completion.

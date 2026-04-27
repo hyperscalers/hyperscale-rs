@@ -658,16 +658,13 @@ where
                 block_hash,
                 transactions,
             } => {
-                // Drain delivered ids from the fetch protocol's in-flight
-                // tracking, then feed them to the state machine the same
-                // way gossip-delivered transactions arrive.
-                let ids: Vec<_> = transactions.iter().map(|tx| tx.hash()).collect();
-                self.transaction_fetch
-                    .handle(HashSetFetchInput::Admitted { ids });
+                // Route delivered txs through mempool admission. The
+                // fetch-protocol drain happens via the resulting
+                // `Continuation(TransactionsAdmitted)` interception.
                 if !transactions.is_empty() {
-                    self.feed_event(ProtocolEvent::TransactionFetchDelivered {
+                    self.feed_event(ProtocolEvent::TransactionsFetched {
                         block_hash,
-                        transactions,
+                        txs: transactions,
                     });
                 }
             }
