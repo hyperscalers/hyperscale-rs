@@ -23,7 +23,6 @@ pub fn serve_transaction_request(
 ) -> GetTransactionsResponse {
     let requested_count = req.tx_hashes.len();
     trace!(
-        block_hash = ?req.block_hash,
         tx_count = requested_count,
         "Handling transaction fetch request"
     );
@@ -54,7 +53,6 @@ pub fn serve_transaction_request(
 
     let found_count = found.len();
     debug!(
-        block_hash = ?req.block_hash,
         requested = requested_count,
         found = found_count,
         "Responding to transaction fetch request"

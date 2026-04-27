@@ -3,31 +3,25 @@
 use crate::response::GetLocalProvisionsResponse;
 #[cfg(test)]
 use hyperscale_types::Hash;
-use hyperscale_types::{BlockHash, MessagePriority, NetworkMessage, ProvisionHash, Request};
+use hyperscale_types::{MessagePriority, NetworkMessage, ProvisionHash, Request};
 use sbor::prelude::BasicSbor;
 
-/// Request to fetch provisions data for a pending block.
+/// Request to fetch provision batches by hash.
 ///
-/// Used when a validator receives a block header with `provision_hashes`
-/// but doesn't have the provisions locally (missed the gossip from the source shard).
-/// Same pattern as `GetTransactionsRequest` — tries the proposer first, rotates to peers.
+/// Used when a validator is missing provisions referenced by a pending
+/// block. The responder resolves each hash from the local provision store
+/// — no scope information is needed.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct GetLocalProvisionsRequest {
-    /// Hash of the block that needs these provisions.
-    pub block_hash: BlockHash,
-
     /// Hashes of the provisions being requested.
     pub batch_hashes: Vec<ProvisionHash>,
 }
 
 impl GetLocalProvisionsRequest {
-    /// Build a request for the listed `batch_hashes` against `block_hash`.
+    /// Build a request for the listed `batch_hashes`.
     #[must_use]
-    pub const fn new(block_hash: BlockHash, batch_hashes: Vec<ProvisionHash>) -> Self {
-        Self {
-            block_hash,
-            batch_hashes,
-        }
+    pub const fn new(batch_hashes: Vec<ProvisionHash>) -> Self {
+        Self { batch_hashes }
     }
 }
 
@@ -52,7 +46,6 @@ mod tests {
     #[test]
     fn test_sbor_roundtrip() {
         let request = GetLocalProvisionsRequest {
-            block_hash: BlockHash::from_raw(Hash::from_bytes(b"block")),
             batch_hashes: vec![
                 ProvisionHash::from_raw(Hash::from_bytes(b"batch1")),
                 ProvisionHash::from_raw(Hash::from_bytes(b"batch2")),

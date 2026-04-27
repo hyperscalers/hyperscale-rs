@@ -2,9 +2,9 @@
 
 use crate::ProtocolEvent;
 use hyperscale_types::{
-    BlockHash, BlockHeight, Bls12381G1PublicKey, Bls12381G2Signature, CommittedBlockHeader,
+    BlockHeight, Bls12381G1PublicKey, Bls12381G2Signature, CommittedBlockHeader,
     ExecutionCertificate, FinalizedWave, ProvisionHash, Provisions, RoutableTransaction,
-    ShardGroupId, TxHash, ValidatorId, WaveIdHash,
+    ShardGroupId, TxHash, ValidatorId, WaveId, WaveIdHash,
 };
 use std::sync::Arc;
 
@@ -92,8 +92,6 @@ pub enum NodeInput {
 
     /// Fetch transactions failed from network callback.
     FetchTransactionsFailed {
-        /// Block whose transactions were being fetched.
-        block_hash: BlockHash,
         /// Transaction hashes that failed to fetch.
         hashes: Vec<TxHash>,
     },
@@ -116,8 +114,6 @@ pub enum NodeInput {
     /// the request, so the fetch protocol can reclaim missing hashes for
     /// retry without relying on a per-peer heuristic.
     LocalProvisionReceived {
-        /// Block whose provisions were fetched.
-        block_hash: BlockHash,
         /// Provision batches the peer returned.
         batches: Vec<Arc<Provisions>>,
         /// Hashes the peer didn't have — caller retries these elsewhere.
@@ -126,8 +122,6 @@ pub enum NodeInput {
 
     /// Local provision fetch failed.
     LocalProvisionsFetchFailed {
-        /// Block whose provision fetch failed.
-        block_hash: BlockHash,
         /// Provision hashes that failed to fetch.
         hashes: Vec<ProvisionHash>,
     },
@@ -145,10 +139,6 @@ pub enum NodeInput {
 
     /// A finalized wave fetch request failed.
     FinalizedWaveFetchFailed {
-        /// Block whose finalized-wave fetch failed.
-        block_hash: BlockHash,
-        /// Peer that failed to serve the request.
-        peer: ValidatorId,
         /// Wave-id hashes that weren't returned.
         hashes: Vec<WaveIdHash>,
     },
@@ -224,10 +214,8 @@ pub enum NodeInput {
 
     /// An execution certificate fetch request failed.
     ExecCertFetchFailed {
-        /// Source shard the fetch targeted.
-        source_shard: ShardGroupId,
-        /// Block height that failed to return certs.
-        block_height: BlockHeight,
+        /// Wave ids that weren't returned.
+        hashes: Vec<WaveId>,
     },
 
     /// A committed block header fetch request failed.

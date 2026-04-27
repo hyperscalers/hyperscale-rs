@@ -4,44 +4,40 @@
 //! when they need the runner to issue a network fetch. `io_loop`'s dispatcher
 //! has a single `Action::Fetch(req)` arm that matches on the inner enum and
 //! calls into the corresponding `instances/*.rs` module.
+//!
+//! Per-payload variants are keyless (just `ids + peers`); admission events
+//! drive cancellation rather than scope-keyed eviction. Cross-shard variants
+//! retain `(source_shard, block_height)` because that scope IS the fetch
+//! key (no id-set to enumerate).
 
 use hyperscale_types::{
-    BlockHash, BlockHeight, ProvisionHash, ShardGroupId, TxHash, ValidatorId, WaveId, WaveIdHash,
+    BlockHeight, ProvisionHash, ShardGroupId, TxHash, ValidatorId, WaveId, WaveIdHash,
 };
 
 /// Fetch family — one variant per payload type.
 #[derive(Debug, Clone)]
 pub enum FetchRequest {
-    /// Per-block transaction fetch (`HashSetFetch` keyed by `BlockHash`,
-    /// id = `TxHash`). Pinned to the proposer.
+    /// Transaction fetch by id. Pinned to the proposer (no rotation).
     Transactions {
-        /// Pending block waiting on these transactions.
-        block_hash: BlockHash,
-        /// Block proposer (single fetch target — no peer rotation).
-        proposer: ValidatorId,
         /// Transaction hashes to fetch.
         ids: Vec<TxHash>,
-    },
-    /// Per-block local-provision fetch (`HashSetFetch` keyed by `BlockHash`,
-    /// id = `ProvisionHash`). Pinned to the proposer.
-    LocalProvisions {
-        /// Pending block waiting on these provisions.
-        block_hash: BlockHash,
-        /// Block proposer (single fetch target).
+        /// Block proposer (single fetch target — no peer rotation).
         proposer: ValidatorId,
+    },
+    /// Local-provision fetch by id. Pinned to the proposer.
+    LocalProvisions {
         /// Provision hashes to fetch.
         ids: Vec<ProvisionHash>,
-    },
-    /// Per-block finalized-wave fetch (`HashSetFetch` keyed by `BlockHash`,
-    /// id = `WaveIdHash`). Rotates from the proposer through local-committee
-    /// peers.
-    FinalizedWaves {
-        /// Pending block waiting on these waves.
-        block_hash: BlockHash,
-        /// Block proposer (tried first).
+        /// Block proposer (single fetch target).
         proposer: ValidatorId,
+    },
+    /// Finalized-wave fetch by id. Rotates from the proposer through
+    /// local-committee peers.
+    FinalizedWaves {
         /// Wave-id hashes to fetch.
         ids: Vec<WaveIdHash>,
+        /// Block proposer (tried first).
+        proposer: ValidatorId,
         /// Local-committee fallback peers.
         peers: Vec<ValidatorId>,
     },
@@ -57,17 +53,12 @@ pub enum FetchRequest {
         /// Source-shard committee (fallback peers).
         peers: Vec<ValidatorId>,
     },
-    /// Cross-shard execution-cert fetch (`HashSetFetch` keyed by
-    /// `(ShardGroupId, BlockHeight)`, id = `WaveId`). Rotates through
+    /// Cross-shard execution-cert fetch by `WaveId`. Rotates through
     /// source-shard committee.
     ExecutionCerts {
-        /// Source shard whose EC is missing.
-        source_shard: ShardGroupId,
-        /// Source-shard block height for the missing EC.
-        block_height: BlockHeight,
         /// Wave whose EC is missing.
         wave_id: WaveId,
-        /// Source-shard committee (candidate peers).
+        /// Source-shard committee (rotation pool).
         peers: Vec<ValidatorId>,
     },
     /// Cross-shard committed-block-header fetch (`ScopeFetch` keyed by

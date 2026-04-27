@@ -7,7 +7,7 @@ use crate::action_handler::{self, ActionContext, DispatchPool};
 use crate::protocol::fetch::instances::{
     exec_certs, finalized_waves, headers, local_provisions, provisions, transactions,
 };
-use crate::protocol::fetch::{HashSetFetchInput, PeerSource, ScopeFetchInput};
+use crate::protocol::fetch::{IdFetchInput, PeerSource, ScopeFetchInput};
 use crate::protocol::sync::SyncInput;
 use hyperscale_core::{Action, CommitSource, FetchRequest, NodeInput, ProtocolEvent, StateMachine};
 use hyperscale_dispatch::Dispatch;
@@ -577,56 +577,42 @@ where
 
     /// Dispatch a typed fetch request to the corresponding instance binding.
     ///
-    /// `Request` never emits `Send`s on its own — it only registers/merges the
-    /// scope; chunks fan out under the per-tick cap. Each arm therefore feeds
-    /// `Request`, then drives `Tick` and dispatches its outputs through the
-    /// per-instance processor. The tick timer is refreshed once at the end.
+    /// `Request` never emits `Send`s on its own — it only adds the ids to the
+    /// pending set; chunks fan out under the per-tick cap. Each arm therefore
+    /// feeds `Request`, then drives `Tick` and dispatches its outputs through
+    /// the per-instance processor. The tick timer is refreshed once at the end.
     #[allow(clippy::too_many_lines)] // single dispatch, one arm per FetchRequest variant
     fn process_fetch_request(&mut self, req: FetchRequest) {
         match req {
-            FetchRequest::Transactions {
-                block_hash,
-                proposer,
-                ids,
-            } => {
-                self.transaction_fetch.handle(HashSetFetchInput::Request {
-                    scope: block_hash,
+            FetchRequest::Transactions { ids, proposer } => {
+                self.transaction_fetch.handle(IdFetchInput::Request {
                     ids,
                     peers: PeerSource::Pinned(proposer),
                 });
-                let outputs = self.transaction_fetch.handle(HashSetFetchInput::Tick);
+                let outputs = self.transaction_fetch.handle(IdFetchInput::Tick);
                 self.process_transaction_fetch_outputs(outputs);
             }
-            FetchRequest::LocalProvisions {
-                block_hash,
-                proposer,
-                ids,
-            } => {
-                self.local_provision_fetch
-                    .handle(HashSetFetchInput::Request {
-                        scope: block_hash,
-                        ids,
-                        peers: PeerSource::Pinned(proposer),
-                    });
-                let outputs = self.local_provision_fetch.handle(HashSetFetchInput::Tick);
+            FetchRequest::LocalProvisions { ids, proposer } => {
+                self.local_provision_fetch.handle(IdFetchInput::Request {
+                    ids,
+                    peers: PeerSource::Pinned(proposer),
+                });
+                let outputs = self.local_provision_fetch.handle(IdFetchInput::Tick);
                 self.process_local_provision_fetch_outputs(outputs);
             }
             FetchRequest::FinalizedWaves {
-                block_hash,
-                proposer,
                 ids,
+                proposer,
                 peers,
             } => {
-                self.finalized_wave_fetch
-                    .handle(HashSetFetchInput::Request {
-                        scope: block_hash,
-                        ids,
-                        peers: PeerSource::Rotation {
-                            preferred: proposer,
-                            rest: peers,
-                        },
-                    });
-                let outputs = self.finalized_wave_fetch.handle(HashSetFetchInput::Tick);
+                self.finalized_wave_fetch.handle(IdFetchInput::Request {
+                    ids,
+                    peers: PeerSource::Rotation {
+                        preferred: proposer,
+                        rest: peers,
+                    },
+                });
+                let outputs = self.finalized_wave_fetch.handle(IdFetchInput::Tick);
                 self.process_finalized_wave_fetch_outputs(outputs);
             }
             FetchRequest::RemoteProvisions {
@@ -663,15 +649,8 @@ where
                 });
                 self.process_provision_fetch_outputs(outputs);
             }
-            FetchRequest::ExecutionCerts {
-                source_shard,
-                block_height,
-                wave_id,
-                peers,
-            } => {
+            FetchRequest::ExecutionCerts { wave_id, peers } => {
                 debug!(
-                    source_shard = source_shard.0,
-                    block_height = block_height.0,
                     wave = %wave_id,
                     peer_count = peers.len(),
                     "Requesting missing execution cert from source shard"
@@ -683,12 +662,11 @@ where
                     .map_or((hyperscale_types::ValidatorId(0), vec![]), |(p, r)| {
                         (*p, r.to_vec())
                     });
-                self.exec_cert_fetch.handle(HashSetFetchInput::Request {
-                    scope: exec_certs::scope_for(source_shard, block_height),
+                self.exec_cert_fetch.handle(IdFetchInput::Request {
                     ids: vec![wave_id],
                     peers: PeerSource::Rotation { preferred, rest },
                 });
-                let outputs = self.exec_cert_fetch.handle(HashSetFetchInput::Tick);
+                let outputs = self.exec_cert_fetch.handle(IdFetchInput::Tick);
                 self.process_exec_cert_fetch_outputs(outputs);
             }
             FetchRequest::RemoteHeader {

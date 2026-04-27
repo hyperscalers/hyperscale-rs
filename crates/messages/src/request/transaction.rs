@@ -1,19 +1,16 @@
 //! Transaction fetch request.
 
 use crate::response::GetTransactionsResponse;
-use hyperscale_types::{BlockHash, MessagePriority, NetworkMessage, Request, TxHash};
+use hyperscale_types::{MessagePriority, NetworkMessage, Request, TxHash};
 use sbor::prelude::BasicSbor;
 
-/// Request to fetch transactions by hash for a pending block.
+/// Request to fetch transactions by hash.
 ///
-/// Used when a validator receives a block header but is missing some
-/// transactions that weren't in their mempool or didn't arrive via gossip.
+/// Used when a validator is missing transactions referenced by a pending
+/// block (or by any other consumer waiting on tx data). The responder
+/// resolves each hash from local state — no scope information is needed.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct GetTransactionsRequest {
-    /// Hash of the block that needs these transactions.
-    /// Used by the responder to prioritize and validate the request.
-    pub block_hash: BlockHash,
-
     /// Hashes of the transactions being requested.
     pub tx_hashes: Vec<TxHash>,
 }
@@ -21,11 +18,8 @@ pub struct GetTransactionsRequest {
 impl GetTransactionsRequest {
     /// Create a new transaction fetch request.
     #[must_use]
-    pub const fn new(block_hash: BlockHash, tx_hashes: Vec<TxHash>) -> Self {
-        Self {
-            block_hash,
-            tx_hashes,
-        }
+    pub const fn new(tx_hashes: Vec<TxHash>) -> Self {
+        Self { tx_hashes }
     }
 
     /// Get the number of transactions being requested.
@@ -59,25 +53,20 @@ mod tests {
 
     #[test]
     fn test_get_transactions_request() {
-        let block_hash = BlockHash::from_raw(Hash::from_bytes(b"block123"));
         let tx_hashes = vec![
             TxHash::from_raw(Hash::from_bytes(b"tx1")),
             TxHash::from_raw(Hash::from_bytes(b"tx2")),
             TxHash::from_raw(Hash::from_bytes(b"tx3")),
         ];
 
-        let request = GetTransactionsRequest::new(block_hash, tx_hashes.clone());
-        assert_eq!(request.block_hash, block_hash);
+        let request = GetTransactionsRequest::new(tx_hashes.clone());
         assert_eq!(request.tx_hashes, tx_hashes);
         assert_eq!(request.count(), 3);
     }
 
     #[test]
     fn test_sbor_roundtrip() {
-        let request = GetTransactionsRequest::new(
-            BlockHash::from_raw(Hash::from_bytes(b"block")),
-            vec![TxHash::from_raw(Hash::from_bytes(b"tx1"))],
-        );
+        let request = GetTransactionsRequest::new(vec![TxHash::from_raw(Hash::from_bytes(b"tx1"))]);
         let bytes = basic_encode(&request).unwrap();
         let decoded: GetTransactionsRequest = sbor::prelude::basic_decode(&bytes).unwrap();
         assert_eq!(request, decoded);

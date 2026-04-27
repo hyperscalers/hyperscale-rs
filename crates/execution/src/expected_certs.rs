@@ -61,20 +61,6 @@ struct ExpectedEntry {
     last_requested_at: Option<WeightedTimestamp>,
 }
 
-/// A fallback fetch the coordinator should emit as
-/// `Action::Fetch(FetchRequest::ExecutionCerts)`. The tracker doesn't know
-/// about topology or peers — the coordinator attaches those.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FallbackFetch {
-    pub source_shard: ShardGroupId,
-    pub block_height: BlockHeight,
-    pub wave_id: WaveId,
-    /// `true` iff a fallback request for this key has already fired and
-    /// this is a repeat. Logged by the coordinator but not part of the
-    /// wire action.
-    pub is_retry: bool,
-}
-
 pub struct ExpectedCertTracker {
     expected: HashMap<ExpectedCertKey, ExpectedEntry>,
     fulfilled: HashMap<ExpectedCertKey, WeightedTimestamp>,
@@ -127,13 +113,15 @@ impl ExpectedCertTracker {
         cleared
     }
 
-    /// Drive the timeout state machine. Returns a `FallbackFetch` for each
-    /// expectation that has crossed either the initial or the retry deadline
-    /// at `now_ts`. Records `last_requested_at = now_ts` on each
-    /// returned entry so the retry cooldown starts ticking.
-    pub fn check_timeouts(&mut self, now_ts: WeightedTimestamp) -> Vec<FallbackFetch> {
+    /// Drive the timeout state machine. Returns `(wave_id, is_retry)` for
+    /// each expectation that has crossed either the initial or the retry
+    /// deadline at `now_ts`. Records `last_requested_at = now_ts` on each
+    /// returned entry so the retry cooldown starts ticking. Source shard
+    /// and block height are derivable from `wave_id` if the caller needs
+    /// them.
+    pub fn check_timeouts(&mut self, now_ts: WeightedTimestamp) -> Vec<(WaveId, bool)> {
         let mut fetches = Vec::new();
-        for ((source_shard, block_height, wave_id), entry) in &mut self.expected {
+        for ((_, _, wave_id), entry) in &mut self.expected {
             let should_request = match entry.last_requested_at {
                 None => now_ts.elapsed_since(entry.discovered_at) >= EXEC_CERT_FALLBACK_TIMEOUT,
                 Some(last) => now_ts.elapsed_since(last) >= EXEC_CERT_RETRY_INTERVAL,
@@ -141,12 +129,7 @@ impl ExpectedCertTracker {
             if should_request {
                 let is_retry = entry.last_requested_at.is_some();
                 entry.last_requested_at = Some(now_ts);
-                fetches.push(FallbackFetch {
-                    source_shard: *source_shard,
-                    block_height: *block_height,
-                    wave_id: wave_id.clone(),
-                    is_retry,
-                });
+                fetches.push((wave_id.clone(), is_retry));
             }
         }
         fetches
@@ -285,7 +268,7 @@ mod tests {
         // Crossing the deadline: exactly one fetch, not a retry.
         let fetches = t.check_timeouts(ms(1_000 + 5_000));
         assert_eq!(fetches.len(), 1);
-        assert!(!fetches[0].is_retry);
+        assert!(!fetches[0].1);
     }
 
     #[test]
@@ -303,7 +286,7 @@ mod tests {
         // After retry interval: is_retry = true.
         let fetches = t.check_timeouts(ms(5_000 + 10_000));
         assert_eq!(fetches.len(), 1);
-        assert!(fetches[0].is_retry);
+        assert!(fetches[0].1);
     }
 
     #[test]
@@ -366,12 +349,12 @@ mod tests {
         // (its new anchor is 10_000, deadline 15_000).
         let fetches = t.check_timeouts(ms(14_000));
         assert_eq!(fetches.len(), 1);
-        assert_eq!(fetches[0].wave_id, w_stamped);
+        assert_eq!(fetches[0].0, w_stamped);
 
         // And finally cross the retro-stamped entry's deadline.
         let fetches = t.check_timeouts(ms(15_000));
         assert_eq!(fetches.len(), 1);
-        assert_eq!(fetches[0].wave_id, w_zero);
+        assert_eq!(fetches[0].0, w_zero);
     }
 
     // ─── Property test ──────────────────────────────────────────────────
@@ -410,8 +393,8 @@ mod tests {
                 let now = ms(*now_ms);
                 let fetches = t.check_timeouts(now);
                 // Any fetch emitted must correspond to a still-expected key.
-                for f in &fetches {
-                    let key = (f.source_shard, f.block_height, f.wave_id.clone());
+                for (wave_id, _) in &fetches {
+                    let key = (wave_id.shard_group_id, wave_id.block_height, wave_id.clone());
                     prop_assert!(
                         !t.fulfilled.contains_key(&key),
                         "fallback fetch emitted for a fulfilled key: {:?}",

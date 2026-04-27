@@ -359,9 +359,8 @@ pub fn check_fetches(
                 "Fetch timeout reached, requesting missing transactions"
             );
             actions.push(Action::Fetch(FetchRequest::Transactions {
-                block_hash: *block_hash,
-                proposer,
                 ids: missing_txs,
+                proposer,
             }));
         }
 
@@ -375,9 +374,8 @@ pub fn check_fetches(
                 "Fetch timeout reached, requesting missing provisions"
             );
             actions.push(Action::Fetch(FetchRequest::LocalProvisions {
-                block_hash: *block_hash,
-                proposer,
                 ids: missing_provisions,
+                proposer,
             }));
         }
 
@@ -398,9 +396,8 @@ pub fn check_fetches(
                 .filter(|v| *v != local_self)
                 .collect();
             actions.push(Action::Fetch(FetchRequest::FinalizedWaves {
-                block_hash: *block_hash,
-                proposer,
                 ids: missing_waves,
+                proposer,
                 peers,
             }));
         }

@@ -52,7 +52,7 @@ use tracing::instrument;
 
 use crate::conflict::DetectedConflict;
 use crate::early_arrivals::{EARLY_VOTE_RETENTION, EarlyArrivalBuffer};
-use crate::expected_certs::{ExpectedCertTracker, FallbackFetch};
+use crate::expected_certs::ExpectedCertTracker;
 use crate::finalized_waves::FinalizedWaveStore;
 use crate::handlers::build_dispatch_action;
 use crate::lookups::{committee_public_keys_for_shard, peers_excluding_self};
@@ -1110,24 +1110,18 @@ impl ExecutionCoordinator {
         let fetches = self.expected_certs.check_timeouts(now_ts);
 
         let mut actions = Vec::with_capacity(fetches.len());
-        for FallbackFetch {
-            source_shard,
-            block_height,
-            wave_id,
-            is_retry,
-        } in fetches
-        {
-            let peers = topology.committee_for_shard(source_shard).to_vec();
+        for (wave_id, is_retry) in fetches {
+            let peers = topology
+                .committee_for_shard(wave_id.shard_group_id)
+                .to_vec();
             tracing::info!(
-                source_shard = source_shard.0,
-                block_height = block_height.0,
+                source_shard = wave_id.shard_group_id.0,
+                block_height = wave_id.block_height.0,
                 wave = %wave_id,
                 retry = is_retry,
                 "Execution cert timeout — requesting fallback"
             );
             actions.push(Action::Fetch(FetchRequest::ExecutionCerts {
-                source_shard,
-                block_height,
                 wave_id,
                 peers,
             }));
