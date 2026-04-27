@@ -35,12 +35,12 @@ use crate::io_loop::caches::SharedCaches;
 use crate::protocol::execution_cert_fetch::{ExecCertFetchInput, ExecCertFetchProtocol};
 use crate::protocol::fetch::ScopeFetchInput;
 use crate::protocol::fetch::instances::headers::{self, HeaderFetch};
+use crate::protocol::fetch::instances::provisions::{self, ProvisionFetch};
 use crate::protocol::fetch::scope_fetch::ScopeFetchConfig;
 use crate::protocol::finalized_wave_fetch::{FinalizedWaveFetchInput, FinalizedWaveFetchProtocol};
 use crate::protocol::local_provision_fetch::{
     LocalProvisionFetchInput, LocalProvisionFetchProtocol,
 };
-use crate::protocol::provision_fetch::{ProvisionFetchInput, ProvisionFetchProtocol};
 use crate::protocol::sync::{SyncInput, SyncProtocol, SyncStatus};
 use crate::protocol::transaction_fetch::{TransactionFetchInput, TransactionFetchProtocol};
 use arc_swap::ArcSwap;
@@ -272,7 +272,7 @@ where
     finalized_wave_fetch_protocol: FinalizedWaveFetchProtocol,
 
     // Provision fetch protocol (cross-shard provision fetching with peer rotation)
-    provision_fetch_protocol: ProvisionFetchProtocol,
+    provision_fetch: ProvisionFetch,
 
     // Execution certificate fetch protocol (cross-shard exec cert fetching with peer rotation)
     exec_cert_fetch_protocol: ExecCertFetchProtocol,
@@ -342,7 +342,7 @@ where
         let finalized_wave_fetch_protocol = FinalizedWaveFetchProtocol::new(
             crate::protocol::finalized_wave_fetch::FinalizedWaveFetchConfig::default(),
         );
-        let provision_fetch_protocol = ProvisionFetchProtocol::new(config.provision_fetch.clone());
+        let provision_fetch = ProvisionFetch::new(&config.provision_fetch);
         let exec_cert_fetch_protocol = ExecCertFetchProtocol::new(config.exec_cert_fetch.clone());
         let header_fetch = HeaderFetch::new(&ScopeFetchConfig::default());
         let storage = Arc::new(storage);
@@ -371,7 +371,7 @@ where
             transaction_fetch_protocol,
             local_provision_fetch_protocol,
             finalized_wave_fetch_protocol,
-            provision_fetch_protocol,
+            provision_fetch,
             exec_cert_fetch_protocol,
             header_fetch,
             validation_batch: BatchAccumulator::new(b.tx_validation_max, b.tx_validation_window),
@@ -695,11 +695,11 @@ where
                         });
                 self.process_finalized_wave_fetch_outputs(wave_outputs);
                 // Also tick the provision fetch protocol.
-                let prov_outputs =
-                    self.provision_fetch_protocol
-                        .handle(ProvisionFetchInput::Tick {
-                            now: std::time::Instant::now(),
-                        });
+                self.provision_fetch
+                    .evict_stale(|s| provisions::is_stale(&self.state, s));
+                let prov_outputs = self.provision_fetch.handle(ScopeFetchInput::Tick {
+                    now: std::time::Instant::now(),
+                });
                 self.process_provision_fetch_outputs(prov_outputs);
                 // Also tick the exec cert fetch protocol.
                 let cert_outputs = self
@@ -720,37 +720,17 @@ where
             }
 
             // ── Provision fetch protocol ──────────────────────────────
-            NodeInput::ProvisionsFetchReceived { provisions } => {
-                let source_shard = provisions.source_shard;
-                let block_height = provisions.block_height;
-                let outputs = self
-                    .provision_fetch_protocol
-                    .handle(ProvisionFetchInput::Received {
-                        source_shard,
-                        block_height,
-                        provisions,
-                    });
-                self.process_provision_fetch_outputs(outputs);
-                self.update_fetch_tick_timer();
-            }
-
             NodeInput::ProvisionsFetchFailed {
                 source_shard,
                 block_height,
             } => {
-                let outputs = self
-                    .provision_fetch_protocol
-                    .handle(ProvisionFetchInput::Failed {
-                        source_shard,
-                        block_height,
-                    });
-                self.process_provision_fetch_outputs(outputs);
+                let scope = provisions::scope_for(source_shard, block_height);
+                self.provision_fetch
+                    .handle(ScopeFetchInput::Failed { scope });
                 // Tick to retry with next peer immediately.
-                let tick_outputs =
-                    self.provision_fetch_protocol
-                        .handle(ProvisionFetchInput::Tick {
-                            now: std::time::Instant::now(),
-                        });
+                let tick_outputs = self.provision_fetch.handle(ScopeFetchInput::Tick {
+                    now: std::time::Instant::now(),
+                });
                 self.process_provision_fetch_outputs(tick_outputs);
                 self.update_fetch_tick_timer();
             }
@@ -1062,7 +1042,7 @@ where
             blocks_behind: self.sync_protocol.blocks_behind(),
             is_syncing: self.sync_protocol.is_syncing(),
             fetch_transaction: fetch_status.in_flight_operations,
-            fetch_provision: self.provision_fetch_protocol.in_flight_count(),
+            fetch_provision: self.provision_fetch.in_flight_count(),
             fetch_local_provision: self.local_provision_fetch_protocol.in_flight_count(),
             fetch_exec_cert: self.exec_cert_fetch_protocol.in_flight_count(),
             fetch_header: self.header_fetch.in_flight_count(),
@@ -1143,7 +1123,7 @@ where
                 node_finalized_wave_fetch_pending: self
                     .finalized_wave_fetch_protocol
                     .pending_count(),
-                node_provision_fetch_pending: self.provision_fetch_protocol.pending_count(),
+                node_provision_fetch_pending: self.provision_fetch.pending_count(),
                 node_exec_cert_fetch_pending: self.exec_cert_fetch_protocol.pending_count(),
                 node_header_fetch_pending: self.header_fetch.pending_count(),
                 // Storage — filled in by record_metrics off-thread.

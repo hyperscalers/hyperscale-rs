@@ -817,18 +817,6 @@ pub enum Action {
         block_hash: BlockHash,
     },
 
-    /// Cancel a pending provision fetch request.
-    ///
-    /// Emitted by `ProvisionCoordinator` when proactive provisions are verified
-    /// before the fallback fetch completes. This prevents the fallback response
-    /// from delivering duplicate provisions that would leak memory.
-    CancelProvisionsFetch {
-        /// The shard whose provisions were fetched.
-        source_shard: ShardGroupId,
-        /// The block height of the provisions.
-        block_height: BlockHeight,
-    },
-
     /// Request a missing execution certificate from a source shard.
     ///
     /// Emitted when an expected execution cert hasn't arrived within the timeout.

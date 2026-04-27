@@ -6,10 +6,9 @@ use super::block_commit::{AccumulateDecision, PendingCommit};
 use crate::action_handler::{self, ActionContext, DispatchPool};
 use crate::protocol::execution_cert_fetch::ExecCertFetchInput;
 use crate::protocol::fetch::ScopeFetchInput;
-use crate::protocol::fetch::instances::headers;
+use crate::protocol::fetch::instances::{headers, provisions};
 use crate::protocol::finalized_wave_fetch::FinalizedWaveFetchInput;
 use crate::protocol::local_provision_fetch::LocalProvisionFetchInput;
-use crate::protocol::provision_fetch::ProvisionFetchInput;
 use crate::protocol::sync::SyncInput;
 use crate::protocol::transaction_fetch::TransactionFetchInput;
 use hyperscale_core::{Action, CommitSource, NodeInput, ProtocolEvent, StateMachine};
@@ -48,13 +47,22 @@ where
             // Internal events
             // ═══════════════════════════════════════════════════════════
             Action::Continuation(pe) => {
-                if let ProtocolEvent::RemoteHeaderVerified { committed_header } = &pe {
-                    let scope = headers::scope_for(
-                        committed_header.shard_group_id(),
-                        committed_header.height(),
-                    );
-                    self.header_fetch
-                        .handle(ScopeFetchInput::Admitted { scope });
+                match &pe {
+                    ProtocolEvent::RemoteHeaderVerified { committed_header } => {
+                        let scope = headers::scope_for(
+                            committed_header.shard_group_id(),
+                            committed_header.height(),
+                        );
+                        self.header_fetch
+                            .handle(ScopeFetchInput::Admitted { scope });
+                    }
+                    ProtocolEvent::ProvisionsVerified { provisions, .. } => {
+                        let scope =
+                            provisions::scope_for(provisions.source_shard, provisions.block_height);
+                        self.provision_fetch
+                            .handle(ScopeFetchInput::Admitted { scope });
+                    }
+                    _ => {}
                 }
                 let _ = self.event_sender.send(NodeInput::Protocol(pe));
             }
@@ -362,7 +370,6 @@ where
             | Action::FetchProvisionsRemote { .. }
             | Action::RequestMissingExecutionCert { .. }
             | Action::CancelExecutionCertFetch { .. }
-            | Action::CancelProvisionsFetch { .. }
             | Action::RequestMissingCommittedBlockHeader { .. } => {
                 self.process_sync_fetch_action(action);
             }
@@ -669,33 +676,22 @@ where
                     peer_count = peers.len(),
                     "Requesting missing provisions from source shard"
                 );
-                let outputs = self
-                    .provision_fetch_protocol
-                    .handle(ProvisionFetchInput::Request {
-                        source_shard,
-                        block_height,
-                        target_shard: self.local_shard,
-                        peers,
-                        preferred_peer: proposer,
-                    });
+                // Put the proposer first so the rotator tries them on the
+                // first attempt; everyone else fills out the fallback order.
+                let mut ordered_peers = Vec::with_capacity(peers.len());
+                ordered_peers.push(proposer);
+                ordered_peers.extend(peers.into_iter().filter(|p| *p != proposer));
+                let scope = provisions::scope_for(source_shard, block_height);
+                let outputs = self.provision_fetch.handle(ScopeFetchInput::Request {
+                    scope,
+                    peers: ordered_peers,
+                });
                 self.process_provision_fetch_outputs(outputs);
-                let tick_outputs =
-                    self.provision_fetch_protocol
-                        .handle(ProvisionFetchInput::Tick {
-                            now: std::time::Instant::now(),
-                        });
+                let tick_outputs = self.provision_fetch.handle(ScopeFetchInput::Tick {
+                    now: std::time::Instant::now(),
+                });
                 self.process_provision_fetch_outputs(tick_outputs);
                 self.update_fetch_tick_timer();
-            }
-            Action::CancelProvisionsFetch {
-                source_shard,
-                block_height,
-            } => {
-                self.provision_fetch_protocol
-                    .handle(ProvisionFetchInput::Cancel {
-                        source_shard,
-                        block_height,
-                    });
             }
             Action::CancelExecutionCertFetch {
                 source_shard,

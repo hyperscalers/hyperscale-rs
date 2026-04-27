@@ -198,12 +198,6 @@ pub enum NodeInput {
         batches: Vec<(Provisions, Vec<ValidatorId>)>,
     },
 
-    /// Provision successfully received from a provision fetch request.
-    ProvisionsFetchReceived {
-        /// Provision batch returned by the peer.
-        provisions: Provisions,
-    },
-
     /// A provision fetch request failed (network error or peer returned None).
     ProvisionsFetchFailed {
         /// Source shard whose provisions were being fetched.
@@ -286,7 +280,6 @@ impl NodeInput {
             Self::CommittedHeaderValidated { .. } => EventPriority::Internal,
             Self::CommittedBlockGossipReceived { .. } => EventPriority::Network,
             Self::ProvisionsReady { .. } => EventPriority::Internal,
-            Self::ProvisionsFetchReceived { .. } => EventPriority::Internal,
             Self::ProvisionsFetchFailed { .. } => EventPriority::Internal,
             Self::ExecCertFetchReceived { .. } => EventPriority::Internal,
             Self::ExecCertFetchFailed { .. } => EventPriority::Internal,
@@ -334,7 +327,6 @@ impl NodeInput {
             Self::CommittedHeaderValidated { .. } => "CommittedHeaderValidated",
             Self::CommittedBlockGossipReceived { .. } => "CommittedBlockGossipReceived",
             Self::ProvisionsReady { .. } => "ProvisionsReady",
-            Self::ProvisionsFetchReceived { .. } => "ProvisionsFetchReceived",
             Self::ProvisionsFetchFailed { .. } => "ProvisionsFetchFailed",
             Self::ExecCertFetchReceived { .. } => "ExecCertFetchReceived",
             Self::ExecCertFetchFailed { .. } => "ExecCertFetchFailed",

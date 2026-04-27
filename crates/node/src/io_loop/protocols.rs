@@ -4,7 +4,6 @@ use super::{IoLoop, TimerOp};
 use crate::protocol::execution_cert_fetch::ExecCertFetchOutput;
 use crate::protocol::finalized_wave_fetch::FinalizedWaveFetchOutput;
 use crate::protocol::local_provision_fetch::LocalProvisionFetchOutput;
-use crate::protocol::provision_fetch::ProvisionFetchOutput;
 use crate::protocol::sync::{SyncInput, SyncOutput};
 use crate::protocol::transaction_fetch::TransactionFetchOutput;
 use hyperscale_core::{NodeInput, ProtocolEvent, TimerId};
@@ -348,18 +347,29 @@ where
 
     /// Process `ProvisionFetchProtocol` outputs.
     ///
-    /// `Fetch` uses the Network trait to send a single-peer request.
-    /// `Deliver` feeds provisions into the state machine via `ProvisionsReceived`.
-    pub(super) fn process_provision_fetch_outputs(&mut self, outputs: Vec<ProvisionFetchOutput>) {
+    /// Dispatch outputs from the cross-shard provision fetch.
+    ///
+    /// On a successful response, the verified-shape provisions are fed
+    /// straight into the state machine as `ProvisionsReceived` and the
+    /// `ProvisionsVerified` continuation triggers admission.
+    pub(super) fn process_provision_fetch_outputs(
+        &self,
+        outputs: Vec<
+            crate::protocol::fetch::ScopeFetchOutput<
+                crate::protocol::fetch::instances::provisions::Scope,
+            >,
+        >,
+    ) {
+        use crate::protocol::fetch::ScopeFetchOutput;
+
         for output in outputs {
             match output {
-                ProvisionFetchOutput::Fetch {
-                    source_shard,
-                    block_height,
-                    target_shard,
+                ScopeFetchOutput::Send {
+                    scope: (source_shard, block_height),
                     peer,
                 } => {
                     use hyperscale_messages::request::GetProvisionsRequest;
+                    let target_shard = self.local_shard;
                     let request = GetProvisionsRequest {
                         block_height,
                         target_shard,
@@ -394,8 +404,12 @@ where
                                         });
                                         return;
                                     }
-                                    let _ = sender
-                                        .send(NodeInput::ProvisionsFetchReceived { provisions });
+                                    if provisions.transactions.is_empty() {
+                                        return;
+                                    }
+                                    let _ = sender.send(NodeInput::Protocol(
+                                        ProtocolEvent::ProvisionsReceived { provisions },
+                                    ));
                                 }
                                 None => {
                                     // Peer cannot serve (state version GC'd) → fail
@@ -414,11 +428,6 @@ where
                             }
                         }),
                     );
-                }
-                ProvisionFetchOutput::Deliver { provisions } => {
-                    if !provisions.transactions.is_empty() {
-                        self.feed_event(ProtocolEvent::ProvisionsReceived { provisions });
-                    }
                 }
             }
         }
@@ -609,7 +618,7 @@ where
         let has_fetch_work = status.pending_tx_blocks > 0;
         let has_local_provision_work = self.local_provision_fetch_protocol.has_pending();
         let has_finalized_wave_work = self.finalized_wave_fetch_protocol.has_pending();
-        let has_provision_work = self.provision_fetch_protocol.has_pending();
+        let has_provision_work = self.provision_fetch.has_pending();
         let has_exec_cert_work = self.exec_cert_fetch_protocol.has_pending();
         let has_header_work = self.header_fetch.has_pending();
         if has_fetch_work
