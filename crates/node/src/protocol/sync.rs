@@ -13,6 +13,7 @@
 //! Production: `SyncManager` wraps this, maps outputs to tokio tasks.
 //! Simulation: feeds inputs/outputs synchronously via event queue.
 
+use super::fetch::SlotTracker;
 use hyperscale_messages::request::{GetBlockRequest, GetBlockTopUpRequest};
 use hyperscale_messages::response::{
     ElidedCertifiedBlock, GetBlockResponse, GetBlockTopUpResponse,
@@ -146,19 +147,20 @@ pub struct SyncProtocol {
     committed_height: BlockHeight,
     heights_to_fetch: BinaryHeap<Reverse<BlockHeight>>,
     heights_queued: HashSet<BlockHeight>,
-    heights_in_flight: HashSet<BlockHeight>,
+    in_flight: SlotTracker<BlockHeight>,
 }
 
 impl SyncProtocol {
     /// Create a new sync protocol state machine.
     pub fn new(config: SyncConfig) -> Self {
+        let in_flight = SlotTracker::new(config.max_concurrent_fetches);
         Self {
             config,
             sync_target: None,
             committed_height: BlockHeight::GENESIS,
             heights_to_fetch: BinaryHeap::new(),
             heights_queued: HashSet::new(),
-            heights_in_flight: HashSet::new(),
+            in_flight,
         }
     }
 
@@ -201,7 +203,7 @@ impl SyncProtocol {
             blocks_behind: self
                 .sync_target
                 .map_or(0, |(t, _)| t.0.saturating_sub(self.committed_height.0)),
-            pending_fetches: self.heights_in_flight.len(),
+            pending_fetches: self.in_flight.in_flight(),
             queued_heights: self.heights_queued.len(),
         }
     }
@@ -236,7 +238,7 @@ impl SyncProtocol {
         height: BlockHeight,
         response: Option<CertifiedBlock>,
     ) -> Vec<SyncOutput> {
-        self.heights_in_flight.remove(&height);
+        self.in_flight.release(&height);
 
         if let Some(CertifiedBlock { block, qc }) = response {
             // Validate
@@ -284,7 +286,7 @@ impl SyncProtocol {
     }
 
     fn handle_block_fetch_failed(&mut self, height: BlockHeight) -> Vec<SyncOutput> {
-        self.heights_in_flight.remove(&height);
+        self.in_flight.release(&height);
         warn!(height = height.0, "Sync fetch failed, re-queuing");
         metrics::record_sync_response_error("fetch_failed");
         self.queue_height(height);
@@ -316,14 +318,14 @@ impl SyncProtocol {
     // ═══════════════════════════════════════════════════════════════════════
 
     fn queue_height(&mut self, height: BlockHeight) {
-        if !self.heights_in_flight.contains(&height) && self.heights_queued.insert(height) {
+        if !self.in_flight.contains(&height) && self.heights_queued.insert(height) {
             self.heights_to_fetch.push(Reverse(height));
         }
     }
 
     fn pop_next_height(&mut self) -> Option<BlockHeight> {
         while let Some(Reverse(height)) = self.heights_to_fetch.pop() {
-            if self.heights_queued.remove(&height) && !self.heights_in_flight.contains(&height) {
+            if self.heights_queued.remove(&height) && !self.in_flight.contains(&height) {
                 return Some(height);
             }
         }
@@ -337,7 +339,7 @@ impl SyncProtocol {
 
     fn remove_heights_at_or_below(&mut self, threshold: BlockHeight) {
         self.heights_queued.retain(|&h| h > threshold);
-        self.heights_in_flight.retain(|&h| h > threshold);
+        self.in_flight.retain(|&h| h > threshold);
     }
 
     fn queue_heights_in_window(&mut self) {
@@ -354,7 +356,7 @@ impl SyncProtocol {
 
         for height in first_height..=window_end {
             let h = BlockHeight(height);
-            if !self.heights_in_flight.contains(&h) {
+            if !self.in_flight.contains(&h) {
                 self.queue_height(h);
             }
         }
@@ -369,9 +371,9 @@ impl SyncProtocol {
             return Vec::new();
         };
         let mut outputs = Vec::new();
-        while self.heights_in_flight.len() < self.config.max_concurrent_fetches {
+        while self.in_flight.has_capacity() {
             if let Some(height) = self.pop_next_height() {
-                self.heights_in_flight.insert(height);
+                self.in_flight.try_acquire(height);
                 outputs.push(SyncOutput::FetchBlock {
                     height,
                     target_height,
