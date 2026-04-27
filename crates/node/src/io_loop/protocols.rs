@@ -258,7 +258,6 @@ where
                         Box::new(move |result| match result {
                             Ok(resp) => {
                                 let _ = es.send(NodeInput::TransactionReceived {
-                                    block_hash,
                                     transactions: resp.into_transactions(),
                                 });
                             }
@@ -448,8 +447,6 @@ where
                             Ok(response) => match response.certificates {
                                 Some(certs) if !certs.is_empty() => {
                                     let _ = sender.send(NodeInput::ExecCertFetchReceived {
-                                        source_shard,
-                                        block_height,
                                         certificates: certs,
                                     });
                                 }
@@ -569,11 +566,7 @@ where
                         Box::new(move |result| match result {
                             Ok(resp) => {
                                 let waves = resp.waves.into_iter().map(Arc::new).collect();
-                                let _ = es.send(NodeInput::FinalizedWaveReceived {
-                                    block_hash,
-                                    peer,
-                                    waves,
-                                });
+                                let _ = es.send(NodeInput::FinalizedWaveReceived { waves });
                             }
                             Err(_) => {
                                 let _ = es.send(NodeInput::FinalizedWaveFetchFailed {

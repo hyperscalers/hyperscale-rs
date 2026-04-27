@@ -396,9 +396,6 @@ pub enum ProtocolEvent {
     /// fetch-protocol drain happens via the resulting
     /// `Continuation(TransactionsAdmitted)` so all paths converge.
     TransactionsFetched {
-        /// Block whose transactions were fetched (informational; not used by
-        /// the admission path).
-        block_hash: BlockHash,
         /// Fetched transactions to admit.
         txs: Vec<Arc<RoutableTransaction>>,
     },

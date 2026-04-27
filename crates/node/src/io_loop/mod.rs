@@ -654,18 +654,12 @@ where
             }
 
             // ── Fetch protocol ─────────────────────────────────────────
-            NodeInput::TransactionReceived {
-                block_hash,
-                transactions,
-            } => {
+            NodeInput::TransactionReceived { transactions } => {
                 // Route delivered txs through mempool admission. The
                 // fetch-protocol drain happens via the resulting
                 // `Continuation(TransactionsAdmitted)` interception.
                 if !transactions.is_empty() {
-                    self.feed_event(ProtocolEvent::TransactionsFetched {
-                        block_hash,
-                        txs: transactions,
-                    });
+                    self.feed_event(ProtocolEvent::TransactionsFetched { txs: transactions });
                 }
             }
 
@@ -738,16 +732,10 @@ where
             // emits `Continuation(ExecutionCertificateAdmitted)`. io_loop's
             // interception arm drains the exec-cert fetch protocol by
             // wave_id — same shape as broadcast-delivered certs.
-            NodeInput::ExecCertFetchReceived {
-                source_shard,
-                block_height,
-                certificates,
-            } => {
+            NodeInput::ExecCertFetchReceived { certificates } => {
                 for cert in certificates {
                     self.feed_event(ProtocolEvent::ExecutionCertificateReceived { cert });
                 }
-                let _ = source_shard;
-                let _ = block_height;
                 self.update_fetch_tick_timer();
             }
 
@@ -874,11 +862,7 @@ where
             // `Continuation(FinalizedWavesAdmitted)`. io_loop's interception
             // arm drains the fetch protocol; state.rs forwards to the BFT
             // subscriber.
-            NodeInput::FinalizedWaveReceived {
-                block_hash,
-                peer,
-                waves,
-            } => {
+            NodeInput::FinalizedWaveReceived { waves } => {
                 for wave in waves {
                     let actions = self.state.execution().admit_finalized_wave(wave);
                     self.actions_generated += actions.len();
@@ -887,7 +871,6 @@ where
                     }
                 }
                 self.flush_block_commits();
-                let _ = (block_hash, peer);
                 self.update_fetch_tick_timer();
             }
 

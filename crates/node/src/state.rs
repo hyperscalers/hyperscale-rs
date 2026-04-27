@@ -741,7 +741,7 @@ impl StateMachine for NodeStateMachine {
             ProtocolEvent::TransactionsAdmitted { txs } => self
                 .bft
                 .on_transactions_admitted(self.topology.snapshot(), &txs),
-            ProtocolEvent::TransactionsFetched { block_hash: _, txs } => self
+            ProtocolEvent::TransactionsFetched { txs } => self
                 .mempool
                 .on_fetched_transactions(self.topology.snapshot(), txs, self.now),
             // ── Storage / Sync ───────────────────────────────────────────
