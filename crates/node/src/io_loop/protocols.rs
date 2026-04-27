@@ -584,27 +584,22 @@ where
     }
 
     pub(super) fn update_fetch_tick_timer(&mut self) {
-        let has_fetch_work = self.transaction_fetch.has_pending();
-        let has_local_provision_work = self.local_provision_fetch.has_pending();
-        let has_finalized_wave_work = self.finalized_wave_fetch.has_pending();
-        let has_provision_work = self.provision_fetch.has_pending();
-        let has_exec_cert_work = self.exec_cert_fetch.has_pending();
-        let has_header_work = self.header_fetch.has_pending();
-        if has_fetch_work
-            || has_local_provision_work
-            || has_finalized_wave_work
-            || has_provision_work
-            || has_exec_cert_work
-            || has_header_work
-        {
-            self.pending_timer_ops.push(TimerOp::Set {
+        let any_pending = self.transaction_fetch.has_pending()
+            || self.local_provision_fetch.has_pending()
+            || self.finalized_wave_fetch.has_pending()
+            || self.provision_fetch.has_pending()
+            || self.exec_cert_fetch.has_pending()
+            || self.header_fetch.has_pending();
+        let op = if any_pending {
+            TimerOp::Set {
                 id: TimerId::FetchTick,
                 duration: Self::FETCH_TICK_INTERVAL,
-            });
+            }
         } else {
-            self.pending_timer_ops.push(TimerOp::Cancel {
+            TimerOp::Cancel {
                 id: TimerId::FetchTick,
-            });
-        }
+            }
+        };
+        self.pending_timer_ops.push(op);
     }
 }

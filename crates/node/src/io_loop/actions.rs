@@ -558,7 +558,6 @@ where
     }
 
     /// Process sync and unified-fetch actions.
-    #[allow(clippy::too_many_lines)] // single dispatch over the sync/fetch action subset
     fn process_sync_fetch_action(&mut self, action: Action) {
         match action {
             Action::StartSync {
@@ -577,6 +576,11 @@ where
     }
 
     /// Dispatch a typed fetch request to the corresponding instance binding.
+    ///
+    /// `Request` never emits `Send`s on its own — it only registers/merges the
+    /// scope; chunks fan out under the per-tick cap. Each arm therefore feeds
+    /// `Request`, then drives `Tick` and dispatches its outputs through the
+    /// per-instance processor. The tick timer is refreshed once at the end.
     #[allow(clippy::too_many_lines)] // single dispatch, one arm per FetchRequest variant
     fn process_fetch_request(&mut self, req: FetchRequest) {
         match req {
@@ -592,7 +596,6 @@ where
                 });
                 let outputs = self.transaction_fetch.handle(HashSetFetchInput::Tick);
                 self.process_transaction_fetch_outputs(outputs);
-                self.update_fetch_tick_timer();
             }
             FetchRequest::LocalProvisions {
                 block_hash,
@@ -605,9 +608,8 @@ where
                         ids,
                         peers: PeerSource::Pinned(proposer),
                     });
-                let tick_outputs = self.local_provision_fetch.handle(HashSetFetchInput::Tick);
-                self.process_local_provision_fetch_outputs(tick_outputs);
-                self.update_fetch_tick_timer();
+                let outputs = self.local_provision_fetch.handle(HashSetFetchInput::Tick);
+                self.process_local_provision_fetch_outputs(outputs);
             }
             FetchRequest::FinalizedWaves {
                 block_hash,
@@ -624,9 +626,8 @@ where
                             rest: peers,
                         },
                     });
-                let tick_outputs = self.finalized_wave_fetch.handle(HashSetFetchInput::Tick);
-                self.process_finalized_wave_fetch_outputs(tick_outputs);
-                self.update_fetch_tick_timer();
+                let outputs = self.finalized_wave_fetch.handle(HashSetFetchInput::Tick);
+                self.process_finalized_wave_fetch_outputs(outputs);
             }
             FetchRequest::RemoteProvisions {
                 source_shard,
@@ -653,17 +654,14 @@ where
                 let mut ordered_peers = Vec::with_capacity(peers.len());
                 ordered_peers.push(proposer);
                 ordered_peers.extend(peers.into_iter().filter(|p| *p != proposer));
-                let scope = provisions::scope_for(source_shard, block_height);
-                let outputs = self.provision_fetch.handle(ScopeFetchInput::Request {
-                    scope,
+                self.provision_fetch.handle(ScopeFetchInput::Request {
+                    scope: provisions::scope_for(source_shard, block_height),
                     peers: ordered_peers,
                 });
-                self.process_provision_fetch_outputs(outputs);
-                let tick_outputs = self.provision_fetch.handle(ScopeFetchInput::Tick {
+                let outputs = self.provision_fetch.handle(ScopeFetchInput::Tick {
                     now: std::time::Instant::now(),
                 });
-                self.process_provision_fetch_outputs(tick_outputs);
-                self.update_fetch_tick_timer();
+                self.process_provision_fetch_outputs(outputs);
             }
             FetchRequest::ExecutionCerts {
                 source_shard,
@@ -678,7 +676,6 @@ where
                     peer_count = peers.len(),
                     "Requesting missing execution cert from source shard"
                 );
-                let scope = exec_certs::scope_for(source_shard, block_height);
                 // Rotation pool, shuffled with no preferred head — every peer
                 // in the source committee can serve any wave's cert equally.
                 let (preferred, rest) = peers
@@ -686,15 +683,13 @@ where
                     .map_or((hyperscale_types::ValidatorId(0), vec![]), |(p, r)| {
                         (*p, r.to_vec())
                     });
-                let outputs = self.exec_cert_fetch.handle(HashSetFetchInput::Request {
-                    scope,
+                self.exec_cert_fetch.handle(HashSetFetchInput::Request {
+                    scope: exec_certs::scope_for(source_shard, block_height),
                     ids: vec![wave_id],
                     peers: PeerSource::Rotation { preferred, rest },
                 });
+                let outputs = self.exec_cert_fetch.handle(HashSetFetchInput::Tick);
                 self.process_exec_cert_fetch_outputs(outputs);
-                let tick_outputs = self.exec_cert_fetch.handle(HashSetFetchInput::Tick);
-                self.process_exec_cert_fetch_outputs(tick_outputs);
-                self.update_fetch_tick_timer();
             }
             FetchRequest::RemoteHeader {
                 source_shard,
@@ -707,18 +702,18 @@ where
                     peer_count = peers.len(),
                     "Requesting missing committed block header from source shard"
                 );
-                let scope = headers::scope_for(source_shard, from_height);
-                let outputs = self
-                    .header_fetch
-                    .handle(ScopeFetchInput::Request { scope, peers });
-                self.process_header_fetch_outputs(outputs);
-                let tick_outputs = self.header_fetch.handle(ScopeFetchInput::Tick {
+                self.header_fetch.handle(ScopeFetchInput::Request {
+                    scope: headers::scope_for(source_shard, from_height),
+                    peers,
+                });
+                let outputs = self.header_fetch.handle(ScopeFetchInput::Tick {
                     now: std::time::Instant::now(),
                 });
-                self.process_header_fetch_outputs(tick_outputs);
-                self.update_fetch_tick_timer();
+                self.process_header_fetch_outputs(outputs);
             }
         }
+
+        self.update_fetch_tick_timer();
     }
 
     // ─── Delegated Work ─────────────────────────────────────────────────
