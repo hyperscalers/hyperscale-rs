@@ -29,12 +29,14 @@
 //! 4. Converts action results back into `NodeInput`s
 
 mod action;
+mod fetch_request;
 mod input;
 mod protocol_event;
 mod timer;
 mod traits;
 
 pub use action::{Action, CrossShardExecutionRequest, ProvisionsRequest};
+pub use fetch_request::FetchRequest;
 pub use input::{EventPriority, NodeInput};
 pub use protocol_event::{CommitSource, ProtocolEvent, VerificationKind};
 pub use timer::{TimerId, TimerScheduler};

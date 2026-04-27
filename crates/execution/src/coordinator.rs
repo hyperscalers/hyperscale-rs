@@ -37,12 +37,12 @@
 //! Validators collect shard execution proofs from all participating shards. When all
 //! proofs are received, a `WaveCertificate` is created.
 
-use hyperscale_core::{Action, ProtocolEvent, ProvisionsRequest};
+use hyperscale_core::{Action, FetchRequest, ProtocolEvent, ProvisionsRequest};
 use hyperscale_types::{
     Attempt, Block, BlockHash, BlockHeight, BloomFilter, ExecutionCertificate, ExecutionVote,
     GlobalReceiptRoot, LocalExecutionEntry, NodeId, Provisions, ReceiptBundle, RoutableTransaction,
-    ShardGroupId, TopologySnapshot, TransactionDecision, TxHash, TxOutcome, ValidatorId,
-    WAVE_TIMEOUT, WaveCertificate, WaveId, WaveIdHash, WeightedTimestamp,
+    ShardGroupId, TopologySnapshot, TxHash, TxOutcome, ValidatorId, WAVE_TIMEOUT, WaveCertificate,
+    WaveId, WaveIdHash, WeightedTimestamp,
 };
 #[cfg(test)]
 use hyperscale_types::{ExecutionOutcome, Hash};
@@ -996,11 +996,16 @@ impl ExecutionCoordinator {
             self.committed_ts,
         );
 
-        let mut actions = Vec::new();
+        // Canonical admission: drains the exec-cert fetch protocol via the
+        // matching `Continuation` arm in io_loop, regardless of whether the
+        // cert arrived by broadcast or fetch. Verification gates downstream
+        // effects, but the fetch-protocol drain happens at admission.
+        let mut actions = vec![Action::Continuation(
+            ProtocolEvent::ExecutionCertificateAdmitted {
+                wave_id: cert.wave_id.clone(),
+            },
+        )];
 
-        // If a fallback fetch was already dispatched for this expectation, tell
-        // the fetch protocol to drop it — otherwise it would keep retrying
-        // forever even after the EC has arrived here.
         if cleared {
             tracing::debug!(
                 source_shard = shard.0,
@@ -1009,10 +1014,6 @@ impl ExecutionCoordinator {
                 at_local_ts_ms = self.committed_ts.as_millis(),
                 "Fulfilled expected exec cert"
             );
-            actions.push(Action::CancelExecutionCertFetch {
-                source_shard: shard,
-                block_height: cert.block_height(),
-            });
         }
 
         let Some(public_keys) = committee_public_keys_for_shard(topology, shard) else {
@@ -1124,12 +1125,12 @@ impl ExecutionCoordinator {
                 retry = is_retry,
                 "Execution cert timeout — requesting fallback"
             );
-            actions.push(Action::RequestMissingExecutionCert {
+            actions.push(Action::Fetch(FetchRequest::ExecutionCerts {
                 source_shard,
                 block_height,
                 wave_id,
                 peers,
-            });
+            }));
         }
 
         // Retain expectations while any local wave still needs an EC from
@@ -1552,24 +1553,36 @@ impl ExecutionCoordinator {
         let finalized_arc = Arc::new(finalized.clone());
         self.finalized.insert(wave_id.clone(), finalized);
 
-        // Cache the finalized wave so peers can fetch the complete data they
-        // need to vote on blocks containing this wave.
-        let mut actions = vec![Action::CacheFinalizedWave {
-            wave: finalized_arc,
-        }];
+        // Single admission event covers both the BFT subscriber and the
+        // io_loop serving cache (via the Continuation interception arm).
+        let mut actions = vec![Action::Continuation(
+            ProtocolEvent::FinalizedWavesAdmitted {
+                waves: vec![finalized_arc],
+            },
+        )];
 
         actions.push(Action::Continuation(ProtocolEvent::WaveCompleted {
             wave_cert: cert_arc,
             tx_hashes: wave.tx_hashes().to_vec(),
         }));
 
-        for (tx_hash, decision) in wave.tx_decisions() {
-            actions.push(Action::Continuation(ProtocolEvent::TransactionExecuted {
-                tx_hash,
-                accepted: decision == TransactionDecision::Accept,
-            }));
-        }
         actions
+    }
+
+    /// Admission entry point for fetch-delivered (or otherwise externally
+    /// sourced) finalized waves. Emits
+    /// `Continuation(FinalizedWavesAdmitted)` so `io_loop` drains the fetch
+    /// protocol and BFT's pending-block subscriber receives the wave.
+    ///
+    /// Locally finalized waves emit the same event from `finalize_wave`, so
+    /// gossip, fetch, and local-finalize all converge on the same path.
+    /// Validation against the wave's EC happens at the BFT subscriber so
+    /// invalid waves don't poison the pending-block view.
+    #[must_use]
+    pub fn admit_finalized_wave(&self, wave: Arc<FinalizedWave>) -> Vec<Action> {
+        vec![Action::Continuation(
+            ProtocolEvent::FinalizedWavesAdmitted { waves: vec![wave] },
+        )]
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -2365,7 +2378,7 @@ mod tests {
         assert!(
             actions
                 .iter()
-                .any(|a| matches!(a, Action::RequestMissingExecutionCert { .. })),
+                .any(|a| matches!(a, Action::Fetch(FetchRequest::ExecutionCerts { .. }))),
             "fallback fetch must keep firing while the expectation is retained"
         );
 
@@ -2476,30 +2489,23 @@ mod tests {
     }
 
     #[test]
-    fn test_finalize_wave_emits_cache_wave_completed_and_per_tx_events() {
+    fn test_finalize_wave_emits_admission_and_completion_events() {
         let mut state = make_test_state();
         let (wave_id, wave) = make_ready_single_shard_wave(&[1, 2]);
         state.waves.insert_wave(wave_id.clone(), wave);
 
         let actions = state.finalize_wave(&wave_id);
 
-        // 1 CacheFinalizedWave + 1 WaveCompleted + 2 TransactionExecuted = 4.
-        assert_eq!(actions.len(), 4);
-        assert!(matches!(actions[0], Action::CacheFinalizedWave { .. }));
+        // 1 FinalizedWavesAdmitted + 1 WaveCompleted = 2.
+        assert_eq!(actions.len(), 2);
+        assert!(matches!(
+            actions[0],
+            Action::Continuation(ProtocolEvent::FinalizedWavesAdmitted { .. })
+        ));
         assert!(matches!(
             actions[1],
             Action::Continuation(ProtocolEvent::WaveCompleted { .. })
         ));
-        let tx_events = actions
-            .iter()
-            .filter(|a| {
-                matches!(
-                    a,
-                    Action::Continuation(ProtocolEvent::TransactionExecuted { .. })
-                )
-            })
-            .count();
-        assert_eq!(tx_events, 2, "one TransactionExecuted per wave tx");
     }
 
     #[test]
@@ -2610,7 +2616,7 @@ mod tests {
 
         let fallback_fired = actions
             .iter()
-            .any(|a| matches!(a, Action::RequestMissingExecutionCert { .. }));
+            .any(|a| matches!(a, Action::Fetch(FetchRequest::ExecutionCerts { .. })));
         assert!(
             !fallback_fired,
             "retro-stamp must suppress the first-commit fallback storm"

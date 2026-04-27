@@ -601,7 +601,7 @@ impl BftCoordinator {
 
         // Clean up any votes for heights at or below the committed height.
         // This handles the case where we loaded votes from storage that are now stale.
-        let removed_blocks = self.cleanup_old_state(height);
+        self.cleanup_old_state(height);
 
         // Record recovery time as initial leader activity so that the view
         // change timeout counts from startup rather than being disabled.
@@ -615,8 +615,11 @@ impl BftCoordinator {
             "Recovered chain state from storage"
         );
 
+        // Pending blocks at or below the recovered committed height self-evict
+        // from fetch protocols on the next tick via the `is_abandoned` predicate.
+
         // Set timers to resume consensus and trigger first proposal attempt
-        let mut actions = vec![
+        vec![
             Action::Continuation(ProtocolEvent::ContentAvailable),
             Action::SetTimer {
                 id: TimerId::ViewChange,
@@ -626,14 +629,7 @@ impl BftCoordinator {
                 id: TimerId::Cleanup,
                 duration: self.config.cleanup_interval,
             },
-        ];
-
-        // Cancel any pending fetches for removed blocks
-        for block_hash in removed_blocks {
-            actions.push(Action::CancelFetch { block_hash });
-        }
-
-        actions
+        ]
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -1631,7 +1627,7 @@ impl BftCoordinator {
                 "QC signature verification FAILED - potential Byzantine attack! Rejecting block."
             );
             // Remove the pending block since we can't trust it
-            self.pending_blocks.remove(&block_hash);
+            self.remove_pending_block(block_hash);
             return vec![];
         }
 
@@ -1686,7 +1682,7 @@ impl BftCoordinator {
                 ?kind,
                 "Block root verification FAILED"
             );
-            self.pending_blocks.remove(&block_hash);
+            self.remove_pending_block(block_hash);
             return vec![];
         }
 
@@ -2162,19 +2158,16 @@ impl BftCoordinator {
         }
     }
 
-    /// Commit a block and any buffered subsequent blocks that are now ready.
-    ///
-    /// Common bookkeeping for committing a block (shared between consensus and sync paths).
-    ///
-    /// Updates `committed_height`/`hash`, buffers recently committed hashes for dedup,
-    /// resets backoff tracking, and cleans up old state. Returns removed block hashes
-    /// for fetch cancellation.
+    /// Common bookkeeping for committing a block (shared between consensus and
+    /// sync paths). Updates `committed_height`/`hash`, buffers recently
+    /// committed hashes for dedup, resets backoff tracking, and cleans up old
+    /// state.
     fn record_block_committed(
         &mut self,
         block: &Block,
         block_hash: BlockHash,
         commit_ts: WeightedTimestamp,
-    ) -> Vec<BlockHash> {
+    ) {
         let height = block.height();
 
         self.committed_height = height;
@@ -2195,8 +2188,7 @@ impl BftCoordinator {
         // Reset backoff tracking — new height means fresh round counting.
         self.view_change.reset_for_height_advance();
 
-        // Clean up old state, return removed block hashes.
-        self.cleanup_old_state(height)
+        self.cleanup_old_state(height);
     }
 
     /// Drive the commit chain: commit the given block, then any buffered
@@ -2298,14 +2290,10 @@ impl BftCoordinator {
         let parent_state_root = self.committed_state_root;
         let parent_block_height = self.committed_height;
 
-        let removed_blocks = self.record_block_committed(&block, block_hash, qc.weighted_timestamp);
+        // Removed blocks self-evict from fetch protocols on the next tick
+        // via the `is_abandoned` predicate.
+        self.record_block_committed(&block, block_hash, qc.weighted_timestamp);
         self.record_leader_activity();
-
-        for removed in removed_blocks {
-            actions.push(Action::CancelFetch {
-                block_hash: removed,
-            });
-        }
 
         actions.push(if state_root_verified {
             Action::CommitBlock {
@@ -2429,7 +2417,9 @@ impl BftCoordinator {
 
         // Advance committed_height. The QC is the proof of commit — same
         // timing as the consensus path.
-        let removed_blocks = self.record_block_committed(&block, block_hash, qc.weighted_timestamp);
+        // Removed blocks self-evict from fetch protocols on the next tick
+        // via the `is_abandoned` predicate.
+        self.record_block_committed(&block, block_hash, qc.weighted_timestamp);
 
         // Track sync progress for the loop iterator.
         self.sync.set_sync_applied_height(height);
@@ -2463,16 +2453,16 @@ impl BftCoordinator {
             source: CommitSource::Sync,
         }];
 
-        for bh in removed_blocks {
-            actions.push(Action::CancelFetch { block_hash: bh });
-        }
-
-        // Cache constructed FinalizedWaves so other syncing nodes can fetch
-        // them via FinalizedWaveFetchProtocol.
-        for wave in block.certificates() {
-            actions.push(Action::CacheFinalizedWave {
-                wave: Arc::clone(wave),
-            });
+        // Admit the synced block's wave certs through the canonical pathway
+        // — io_loop's `Continuation(FinalizedWavesAdmitted)` interception
+        // populates the serving cache so other peers can fetch from us.
+        let synced_waves: Vec<_> = block.certificates().iter().map(Arc::clone).collect();
+        if !synced_waves.is_empty() {
+            actions.push(Action::Continuation(
+                ProtocolEvent::FinalizedWavesAdmitted {
+                    waves: synced_waves,
+                },
+            ));
         }
 
         actions
@@ -2701,121 +2691,36 @@ impl BftCoordinator {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // Transaction Fetch Protocol
+    // Transaction admission subscriber
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /// Handle transactions received from a fetch request.
+    /// React to transactions newly admitted to the canonical mempool.
     ///
-    /// Adds the fetched transactions to the pending block and triggers
-    /// voting if the block is now complete.
-    #[instrument(skip(self, transactions), fields(block_hash = ?block_hash, tx_count = transactions.len()))]
-    pub fn on_transaction_fetch_received(
+    /// Every gossip arrival, fetch response, RPC submit, and locally produced
+    /// tx funnels through `MempoolCoordinator` first; the resulting
+    /// `Continuation(ProtocolEvent::TransactionsAdmitted { txs })` event
+    /// reaches BFT here. Walks pending blocks, populates each one's
+    /// `received_transactions` cache for hashes it was waiting on, and
+    /// emits any unblocked vote / commit-resume actions via the shared
+    /// `check_pending_blocks_for_arrival` machinery.
+    #[instrument(skip(self, topology, txs), fields(count = txs.len()))]
+    pub fn on_transactions_admitted(
         &mut self,
         topology: &TopologySnapshot,
-        block_hash: BlockHash,
-        transactions: Vec<Arc<RoutableTransaction>>,
+        txs: &[Arc<RoutableTransaction>],
     ) -> Vec<Action> {
-        let validator_id = topology.local_validator_id();
-
-        // First phase: add transactions and check state
-        let (added, still_missing, is_complete, needs_construct) = {
-            let Some(pending) = self.pending_blocks.get_mut(&block_hash) else {
-                warn!(
-                    block_hash = ?block_hash,
-                    "Received fetched transactions for unknown/completed block"
-                );
-                return vec![];
-            };
-
-            let mut added = 0;
-            for tx in transactions {
-                if pending.add_transaction_arc(tx) {
-                    added += 1;
-                }
-            }
-
-            let still_missing = pending.missing_transaction_count();
-            let is_complete = pending.is_complete();
-            let needs_construct = is_complete && pending.block().is_none();
-
-            (added, still_missing, is_complete, needs_construct)
-        };
-
-        debug!(
-            validator = ?validator_id,
-            block_hash = ?block_hash,
-            added = added,
-            still_missing = still_missing,
-            "Added fetched transactions to pending block"
-        );
-
-        // Check if block is now complete
-        if !is_complete {
-            // Still missing data - request remaining items
-            // The runner handles retries, so we just re-emit the request
-            let Some(pending) = self.pending_blocks.get(&block_hash) else {
-                return vec![];
-            };
-
-            let mut actions = Vec::new();
-            let proposer = pending.header().proposer;
-
-            // Request still-missing transactions
-            let missing_txs = pending.missing_transactions();
-            if !missing_txs.is_empty() {
-                warn!(
-                    validator = ?validator_id,
-                    block_hash = ?block_hash,
-                    still_missing = missing_txs.len(),
-                    "Re-requesting remaining missing transactions"
-                );
-                actions.push(Action::FetchTransactions {
-                    block_hash,
-                    proposer,
-                    tx_hashes: missing_txs,
-                });
-            }
-
-            // Re-request still-missing provisions
-            let missing_provisions = pending.missing_provisions();
-            if !missing_provisions.is_empty() {
-                warn!(
-                    validator = ?validator_id,
-                    block_hash = ?block_hash,
-                    still_missing = missing_provisions.len(),
-                    "Re-requesting remaining missing provisions"
-                );
-                actions.push(Action::FetchProvisionsLocal {
-                    block_hash,
-                    proposer,
-                    batch_hashes: missing_provisions,
-                });
-            }
-
-            return actions;
+        let mut actions = Vec::new();
+        for tx in txs {
+            let tx_hash = tx.hash();
+            actions.extend(self.check_pending_blocks_for_arrival(
+                topology,
+                "transaction",
+                |pending| pending.needs_transaction(&tx_hash),
+                |pending| {
+                    pending.add_transaction_arc(Arc::clone(tx));
+                },
+            ));
         }
-
-        // Second phase: construct block if needed
-        if needs_construct
-            && let Some(pending) = self.pending_blocks.get_mut(&block_hash)
-            && let Err(e) = pending.construct_block()
-        {
-            warn!("Failed to construct block after tx fetch: {}", e);
-            return vec![];
-        }
-
-        info!(
-            validator = ?validator_id,
-            block_hash = ?block_hash,
-            "Pending block completed after transaction fetch"
-        );
-
-        // Trigger QC verification (for non-genesis) or vote directly (for genesis)
-        let mut actions = self.trigger_qc_verification_or_vote(topology, block_hash);
-
-        // Check if this block had a pending commit waiting for data
-        actions.extend(self.try_commit_pending_data(topology, block_hash));
-
         actions
     }
 
@@ -2823,82 +2728,68 @@ impl BftCoordinator {
     // Receipt Availability
     // ═══════════════════════════════════════════════════════════════════════════
 
-    // ═══════════════════════════════════════════════════════════════════════════
-    // Transaction Monitoring
-    // ═══════════════════════════════════════════════════════════════════════════
-
-    /// Check if any pending blocks are now complete after a transaction arrived.
+    /// React to finalized waves newly admitted to the canonical execution
+    /// store. Same shape as `on_transactions_admitted` and
+    /// `on_provisions_admitted`.
     ///
-    /// When a transaction arrives via gossip, it might complete a pending block
-    /// that was waiting for that transaction. This method checks all pending
-    /// blocks and triggers voting if any are now complete.
-    pub fn check_pending_blocks_for_transaction(
+    /// Each wave is validated against its own EC before use: a peer with
+    /// divergent local execution could serve a wave whose receipts disagree
+    /// with the outcomes the EC attests to. Rejecting such a wave leaves the
+    /// pending block incomplete; the fetch protocol retries from a different
+    /// peer.
+    pub fn on_finalized_waves_admitted(
         &mut self,
         topology: &TopologySnapshot,
-        tx_hash: TxHash,
-        tx: &Arc<RoutableTransaction>,
+        waves: &[Arc<FinalizedWave>],
     ) -> Vec<Action> {
-        self.check_pending_blocks_for_arrival(
-            topology,
-            "transaction",
-            |pending| pending.needs_transaction(&tx_hash),
-            |pending| {
-                pending.add_transaction_arc(Arc::clone(tx));
-            },
-        )
-    }
-
-    /// Check if any pending blocks are now complete after a finalized wave arrived.
-    ///
-    /// When a `FinalizedWave` is produced locally, it might complete a pending block
-    /// that was waiting for that wave. This method checks all pending blocks and
-    /// triggers voting if any are now complete.
-    ///
-    /// Fetched/broadcast waves are validated against their own EC before use:
-    /// a peer with divergent local execution could serve a wave whose receipts
-    /// disagree with the outcomes the EC attests to. Rejecting such a wave
-    /// leaves the pending block incomplete; the fetch protocol retries from a
-    /// different peer.
-    pub fn check_pending_blocks_for_finalized_wave(
-        &mut self,
-        topology: &TopologySnapshot,
-        wave_id_hash: WaveIdHash,
-        fw: &Arc<FinalizedWave>,
-    ) -> Vec<Action> {
-        if let Err(err) = fw.validate_receipts_against_ec() {
-            warn!(
-                ?wave_id_hash,
-                ?err,
-                "Rejecting FinalizedWave: receipts inconsistent with its EC"
-            );
-            return Vec::new();
+        let mut actions = Vec::new();
+        for fw in waves {
+            let wave_id_hash = fw.wave_id_hash();
+            if let Err(err) = fw.validate_receipts_against_ec() {
+                warn!(
+                    ?wave_id_hash,
+                    ?err,
+                    "Rejecting FinalizedWave: receipts inconsistent with its EC"
+                );
+                continue;
+            }
+            actions.extend(self.check_pending_blocks_for_arrival(
+                topology,
+                "finalized wave",
+                |pending| pending.needs_wave(&wave_id_hash),
+                |pending| {
+                    pending.add_finalized_wave(Arc::clone(fw));
+                },
+            ));
         }
-
-        self.check_pending_blocks_for_arrival(
-            topology,
-            "finalized wave",
-            |pending| pending.needs_wave(&wave_id_hash),
-            |pending| {
-                pending.add_finalized_wave(Arc::clone(fw));
-            },
-        )
+        actions
     }
 
-    /// Check if any pending blocks are now complete after a provisions arrived.
-    pub fn check_pending_blocks_for_provision(
+    /// React to provisions newly admitted to the canonical store.
+    ///
+    /// Called via state.rs when a `Continuation(ProvisionsAdmitted)` event
+    /// reaches the dispatcher — same shape as `on_transactions_admitted`.
+    /// Walks pending blocks, populates `received_provisions` for each block
+    /// waiting on these hashes, and emits any unblocked vote / commit-resume
+    /// actions.
+    pub fn on_provisions_admitted(
         &mut self,
         topology: &TopologySnapshot,
-        provisions: &Arc<Provisions>,
+        provisions: &[Arc<Provisions>],
     ) -> Vec<Action> {
-        let provisions_hash = provisions.hash();
-        self.check_pending_blocks_for_arrival(
-            topology,
-            "provisions",
-            |pending| pending.needs_provision(&provisions_hash),
-            |pending| {
-                pending.add_provision(Arc::clone(provisions));
-            },
-        )
+        let mut actions = Vec::new();
+        for batch in provisions {
+            let provisions_hash = batch.hash();
+            actions.extend(self.check_pending_blocks_for_arrival(
+                topology,
+                "provisions",
+                |pending| pending.needs_provision(&provisions_hash),
+                |pending| {
+                    pending.add_provision(Arc::clone(batch));
+                },
+            ));
+        }
+        actions
     }
 
     /// Shared machinery for post-arrival pending-block completion.
@@ -2991,46 +2882,28 @@ impl BftCoordinator {
         self.votes.clear_for_height(height, new_round)
     }
 
-    /// Clean up old state after commit.
-    ///
-    /// Returns the hashes of pending blocks that were removed, so callers can
-    /// emit `CancelFetch` actions to clean up any in-flight fetch operations.
-    fn cleanup_old_state(&mut self, committed_height: BlockHeight) -> Vec<BlockHash> {
-        // Collect hashes of pending blocks that will be removed
-        let removed_hashes: Vec<BlockHash> = self
-            .pending_blocks
-            .iter()
-            .filter(|(_, pending)| pending.header().height <= committed_height)
-            .map(|(hash, _)| *hash)
-            .collect();
-
-        // Remove pending blocks at or below committed height
+    /// Clean up old state after commit. Pending blocks at or below the
+    /// committed height self-evict from fetch protocols on the next tick via
+    /// the `is_abandoned` predicate (`has_pending_block` returns false).
+    fn cleanup_old_state(&mut self, committed_height: BlockHeight) {
         self.pending_blocks
             .retain(|_, pending| pending.header().height > committed_height);
 
-        // Drop vote accounting at or below committed height.
         self.votes.cleanup_committed(committed_height);
-
-        // Drop commit-pipeline entries at or below committed height.
         self.commits.cleanup_committed(committed_height);
 
-        // Prune committed tx entries older than the retention window.
-        // Used for proposal dedup — transactions committed far in the past
-        // will have been evicted from mempool already, so stale entries just
-        // waste memory.
+        // Prune committed tx entries older than the retention window. Used
+        // for proposal dedup — transactions committed far in the past will
+        // have been evicted from mempool already, so stale entries just waste
+        // memory.
         self.tx_cache.prune(self.committed_ts);
 
         // Remote headers are pruned per-shard-tip at insertion time, not by
         // local committed height (remote shards have independent heights).
 
-        // Delegate sync state cleanup to the SyncManager
         self.sync.cleanup(committed_height);
-
-        // Delegate verification state cleanup to the pipeline
         self.verification
             .cleanup(&self.pending_blocks, committed_height);
-
-        removed_hashes
     }
 
     /// Check pending blocks and emit fetch requests for those that have been
@@ -3144,6 +3017,21 @@ impl BftCoordinator {
     #[must_use]
     pub const fn committed_height(&self) -> BlockHeight {
         self.committed_height
+    }
+
+    /// Whether a pending block is currently being assembled for `block_hash`.
+    #[must_use]
+    pub fn has_pending_block(&self, block_hash: BlockHash) -> bool {
+        self.pending_blocks.contains_key(&block_hash)
+    }
+
+    /// Single chokepoint for dropping a pending block. All single-block
+    /// removals (failed verification, abort, view-change drop) go through
+    /// here so future bookkeeping (metrics, indices, etc.) has one place to
+    /// hook. Bulk pruning at commit time uses `cleanup_old_state` which
+    /// retains in-place.
+    fn remove_pending_block(&mut self, block_hash: BlockHash) -> Option<PendingBlock> {
+        self.pending_blocks.remove(&block_hash)
     }
 
     /// Get the committed block hash.

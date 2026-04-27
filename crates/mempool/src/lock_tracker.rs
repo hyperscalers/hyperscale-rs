@@ -1,32 +1,29 @@
-//! Node-level state locks + in-flight transaction counters.
+//! Node-level state locks + in-flight transaction counter.
 //!
-//! A node is locked while any transaction that declares it is in a
-//! lock-holding status (`Committed` or `Executed`). The tracker owns:
+//! A node is locked while any transaction that declares it is `Committed`.
+//! The tracker owns:
 //!
 //! - **`locked_nodes`** — the current set of locked `NodeId`s. `lock_nodes`
 //!   and `unlock_nodes` return the *newly*-locked / *newly*-unlocked subsets
 //!   so the coordinator can drive the ready-set cascade (blocking deferred
 //!   txs, promoting them on release).
-//! - **`committed_count` / `executed_count`** — cached counters maintained
-//!   incrementally through status transitions. Summed by `in_flight()` for
-//!   backpressure checks; both reported individually by the contention
-//!   stats.
+//! - **`in_flight_count`** — cached counter maintained incrementally on the
+//!   `Pending → Committed` and `Committed → Completed` transitions. Read by
+//!   backpressure checks.
 
 use hyperscale_types::NodeId;
 use std::collections::HashSet;
 
 pub struct LockTracker {
     locked_nodes: HashSet<NodeId>,
-    committed_count: usize,
-    executed_count: usize,
+    in_flight_count: usize,
 }
 
 impl LockTracker {
     pub fn new() -> Self {
         Self {
             locked_nodes: HashSet::new(),
-            committed_count: 0,
-            executed_count: 0,
+            in_flight_count: 0,
         }
     }
 
@@ -58,34 +55,17 @@ impl LockTracker {
         self.locked_nodes.len()
     }
 
-    pub const fn inc_committed(&mut self) {
-        self.committed_count += 1;
+    pub const fn inc_in_flight(&mut self) {
+        self.in_flight_count += 1;
     }
 
-    pub const fn dec_committed(&mut self) {
-        self.committed_count = self.committed_count.saturating_sub(1);
+    pub const fn dec_in_flight(&mut self) {
+        self.in_flight_count = self.in_flight_count.saturating_sub(1);
     }
 
-    pub const fn inc_executed(&mut self) {
-        self.executed_count += 1;
-    }
-
-    pub const fn dec_executed(&mut self) {
-        self.executed_count = self.executed_count.saturating_sub(1);
-    }
-
-    pub const fn committed_count(&self) -> usize {
-        self.committed_count
-    }
-
-    pub const fn executed_count(&self) -> usize {
-        self.executed_count
-    }
-
-    /// Sum of committed and executed counts — transactions currently holding
-    /// state locks. Used for backpressure.
+    /// Transactions currently holding state locks. Used for backpressure.
     pub const fn in_flight(&self) -> usize {
-        self.committed_count + self.executed_count
+        self.in_flight_count
     }
 }
 
@@ -98,8 +78,6 @@ mod tests {
     fn fresh_tracker_is_empty() {
         let tracker = LockTracker::new();
         assert_eq!(tracker.locked_nodes_count(), 0);
-        assert_eq!(tracker.committed_count(), 0);
-        assert_eq!(tracker.executed_count(), 0);
         assert_eq!(tracker.in_flight(), 0);
         assert!(!tracker.is_locked(&test_node(1)));
     }
@@ -167,41 +145,17 @@ mod tests {
     fn counter_increments_and_saturates_on_decrement() {
         let mut tracker = LockTracker::new();
 
-        tracker.inc_committed();
-        tracker.inc_committed();
-        assert_eq!(tracker.committed_count(), 2);
+        tracker.inc_in_flight();
+        tracker.inc_in_flight();
+        assert_eq!(tracker.in_flight(), 2);
 
-        tracker.dec_committed();
-        assert_eq!(tracker.committed_count(), 1);
+        tracker.dec_in_flight();
+        assert_eq!(tracker.in_flight(), 1);
 
         // Over-decrementing saturates at 0 rather than wrapping.
-        tracker.dec_committed();
-        tracker.dec_committed();
-        tracker.dec_committed();
-        assert_eq!(tracker.committed_count(), 0);
-    }
-
-    #[test]
-    fn in_flight_sums_committed_and_executed() {
-        let mut tracker = LockTracker::new();
-        tracker.inc_committed();
-        tracker.inc_committed();
-        tracker.inc_executed();
-        assert_eq!(tracker.in_flight(), 3);
-
-        tracker.dec_committed();
-        assert_eq!(tracker.in_flight(), 2);
-    }
-
-    #[test]
-    fn committed_and_executed_counters_are_independent() {
-        let mut tracker = LockTracker::new();
-        tracker.inc_committed();
-        tracker.inc_executed();
-        tracker.inc_executed();
-
-        tracker.dec_committed();
-        assert_eq!(tracker.committed_count(), 0);
-        assert_eq!(tracker.executed_count(), 2);
+        tracker.dec_in_flight();
+        tracker.dec_in_flight();
+        tracker.dec_in_flight();
+        assert_eq!(tracker.in_flight(), 0);
     }
 }

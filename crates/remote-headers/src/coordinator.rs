@@ -2,15 +2,15 @@
 //!
 //! This module is the single source of truth for remote committed block headers.
 //! It receives raw headers from gossip (or fallback fetch), dispatches QC
-//! verification, stores verified headers, and emits `RemoteHeaderVerified`
+//! verification, stores verified headers, and emits `RemoteHeaderAdmitted`
 //! continuations for downstream consumers (BFT, Provision, Execution).
 //!
 //! It also tracks per-shard liveness and emits
-//! `Action::RequestMissingCommittedBlockHeader` when a remote shard hasn't
+//! `Action::Fetch(FetchRequest::RemoteHeader)` when a remote shard hasn't
 //! sent headers within the timeout window — enabling proposer-only gossip
 //! with fallback recovery.
 
-use hyperscale_core::{Action, ProtocolEvent};
+use hyperscale_core::{Action, FetchRequest, ProtocolEvent};
 use hyperscale_types::{
     BlockHeight, Bls12381G1PublicKey, CommittedBlockHeader, REMOTE_HEADER_RETENTION, ShardGroupId,
     TopologySnapshot, ValidatorId, WeightedTimestamp,
@@ -70,7 +70,7 @@ struct ExpectedHeader {
 /// - Perform structural pre-checks (QC hash match, shard consistency)
 /// - Dispatch `VerifyRemoteHeaderQc` for async QC verification
 /// - Store verified headers with per-shard tip tracking and pruning
-/// - Emit `RemoteHeaderVerified` continuations for downstream consumers
+/// - Emit `RemoteHeaderAdmitted` continuations for downstream consumers
 /// - Track per-shard liveness and emit fallback requests on timeout
 ///
 /// Downstream consumers:
@@ -109,7 +109,7 @@ pub struct RemoteHeaderCoordinator {
     /// Per-shard liveness tracking for fallback header requests.
     ///
     /// Populated when topology tells us remote shards exist.
-    /// Emits `RequestMissingCommittedBlockHeader` when a shard hasn't
+    /// Emits `Action::Fetch(FetchRequest::RemoteHeader)` when a shard hasn't
     /// sent headers within the timeout.
     expected: HashMap<ShardGroupId, ExpectedHeader>,
 
@@ -237,7 +237,7 @@ impl RemoteHeaderCoordinator {
 
     /// Handle QC verification result for a remote header.
     ///
-    /// On success: promotes to verified, emits `RemoteHeaderVerified` continuation.
+    /// On success: promotes to verified, emits `RemoteHeaderAdmitted` continuation.
     /// On failure: removes the failed candidate and tries the next sender's header.
     pub fn on_remote_header_qc_verified(
         &mut self,
@@ -288,7 +288,7 @@ impl RemoteHeaderCoordinator {
         // Update liveness tracking: advance the remote tip and record the
         // local height at which we received it. Reset the request flag so
         // future gaps can trigger new requests. Any in-flight fallback fetch
-        // for this gap self-cancels via the `RemoteHeaderVerified`
+        // for this gap self-cancels via the `RemoteHeaderAdmitted`
         // continuation, which the io_loop translates into an admission
         // signal on the header fetch protocol.
         if let Some(expected) = self.expected.get_mut(&shard)
@@ -300,7 +300,7 @@ impl RemoteHeaderCoordinator {
         }
 
         // Emit continuation so downstream consumers receive the verified header.
-        actions.push(Action::Continuation(ProtocolEvent::RemoteHeaderVerified {
+        actions.push(Action::Continuation(ProtocolEvent::RemoteHeaderAdmitted {
             committed_header: header,
         }));
         actions
@@ -400,11 +400,11 @@ impl RemoteHeaderCoordinator {
 
             expected.requested = true;
             expected.requested_at = now;
-            actions.push(Action::RequestMissingCommittedBlockHeader {
+            actions.push(Action::Fetch(FetchRequest::RemoteHeader {
                 source_shard: shard,
                 from_height,
                 peers,
-            });
+            }));
         }
 
         actions
@@ -438,11 +438,11 @@ impl RemoteHeaderCoordinator {
 
             expected.requested = true;
             expected.requested_at = now;
-            actions.push(Action::RequestMissingCommittedBlockHeader {
+            actions.push(Action::Fetch(FetchRequest::RemoteHeader {
                 source_shard: shard,
                 from_height,
                 peers,
-            });
+            }));
         }
         actions
     }

@@ -34,11 +34,11 @@ use crate::io_loop::block_commit::BlockCommitCoordinator;
 use crate::io_loop::caches::SharedCaches;
 use crate::protocol::fetch::hashset_fetch::HashSetFetchConfig;
 use crate::protocol::fetch::instances::exec_certs::{self, ExecCertFetch};
-use crate::protocol::fetch::instances::finalized_waves::FinalizedWaveFetch;
+use crate::protocol::fetch::instances::finalized_waves::{self, FinalizedWaveFetch};
 use crate::protocol::fetch::instances::headers::{self, HeaderFetch};
-use crate::protocol::fetch::instances::local_provisions::LocalProvisionFetch;
+use crate::protocol::fetch::instances::local_provisions::{self, LocalProvisionFetch};
 use crate::protocol::fetch::instances::provisions::{self, ProvisionFetch};
-use crate::protocol::fetch::instances::transactions::TransactionFetch;
+use crate::protocol::fetch::instances::transactions::{self, TransactionFetch};
 use crate::protocol::fetch::scope_fetch::ScopeFetchConfig;
 use crate::protocol::fetch::{HashSetFetchInput, ScopeFetchInput};
 use crate::protocol::sync::{SyncInput, SyncProtocol, SyncStatus};
@@ -131,10 +131,9 @@ pub struct NodeStatusSnapshot {
     pub state_root: StateRoot,
     pub sync: SyncStatus,
     pub mempool_pending: usize,
-    /// Block committed, being executed.
-    pub mempool_committed: usize,
-    /// Execution done, awaiting certificate.
-    pub mempool_executed: usize,
+    /// Block committed, holding state locks until the wave certificate
+    /// commits in a later block.
+    pub mempool_in_flight: usize,
     pub mempool_total: usize,
     pub accepting_rpc_transactions: bool,
     pub at_pending_limit: bool,
@@ -261,22 +260,22 @@ where
     pending_block_topups:
         HashMap<BlockHeight, Box<hyperscale_messages::response::ElidedCertifiedBlock>>,
 
-    // Fetch protocol (transaction/certificate fetching with chunking and retry)
+    // Per-block transaction fetch (intra-shard, pinned to proposer).
     transaction_fetch: TransactionFetch,
 
-    // Local provision fetch protocol (intra-shard provisions fetching)
+    // Per-block local-provision fetch (intra-shard, pinned to proposer).
     local_provision_fetch: LocalProvisionFetch,
 
-    // Finalized wave fetch protocol (intra-shard wave data fetching)
+    // Per-block finalized-wave fetch (intra-shard, rotates through committee).
     finalized_wave_fetch: FinalizedWaveFetch,
 
-    // Provision fetch protocol (cross-shard provision fetching with peer rotation)
+    // Cross-shard provision fetch (rotates through source committee).
     provision_fetch: ProvisionFetch,
 
-    // Execution certificate fetch protocol (cross-shard exec cert fetching with peer rotation)
+    // Cross-shard execution-cert fetch (rotates through source committee).
     exec_cert_fetch: ExecCertFetch,
 
-    // Committed block header fetch protocol (cross-shard header fetching with peer rotation)
+    // Cross-shard committed-block-header fetch (rotates through source committee).
     header_fetch: HeaderFetch,
 
     // Transaction validation
@@ -654,22 +653,12 @@ where
             }
 
             // ── Fetch protocol ─────────────────────────────────────────
-            NodeInput::TransactionReceived {
-                block_hash,
-                transactions,
-            } => {
-                // Drain delivered ids from the fetch protocol's in-flight
-                // tracking, then feed them to the state machine the same
-                // way gossip-delivered transactions arrive.
-                let ids: Vec<_> = transactions.iter().map(|tx| tx.hash()).collect();
-                self.transaction_fetch
-                    .handle(HashSetFetchInput::Admitted { ids });
-                if !transactions.is_empty() {
-                    self.feed_event(ProtocolEvent::TransactionFetchDelivered {
-                        block_hash,
-                        transactions,
-                    });
-                }
+            NodeInput::TransactionReceived { transactions } => {
+                // Route delivered txs through mempool admission. The
+                // fetch-protocol drain happens via the resulting
+                // `Continuation(TransactionsAdmitted)` interception.
+                let actions = self.state.on_transactions_fetched(transactions);
+                self.process_actions(actions);
             }
 
             NodeInput::FetchTransactionsFailed { block_hash, hashes } => {
@@ -683,33 +672,42 @@ where
             }
 
             NodeInput::FetchTick => {
+                // Tick every fetch protocol: evict abandoned scopes via each
+                // instance's `is_abandoned` predicate, then drive any pending
+                // chunks via `Tick`.
+                let now = std::time::Instant::now();
+
+                self.transaction_fetch
+                    .evict_abandoned(|s| transactions::is_abandoned(&self.state, s));
                 let outputs = self.transaction_fetch.handle(HashSetFetchInput::Tick);
                 self.process_transaction_fetch_outputs(outputs);
-                // Also tick the local provision fetch protocol.
-                let local_prov_outputs = self.local_provision_fetch.handle(HashSetFetchInput::Tick);
-                self.process_local_provision_fetch_outputs(local_prov_outputs);
-                // Also tick the finalized wave fetch protocol.
-                let wave_outputs = self.finalized_wave_fetch.handle(HashSetFetchInput::Tick);
-                self.process_finalized_wave_fetch_outputs(wave_outputs);
-                // Also tick the provision fetch protocol.
+
+                self.local_provision_fetch
+                    .evict_abandoned(|s| local_provisions::is_abandoned(&self.state, s));
+                let outputs = self.local_provision_fetch.handle(HashSetFetchInput::Tick);
+                self.process_local_provision_fetch_outputs(outputs);
+
+                self.finalized_wave_fetch
+                    .evict_abandoned(|s| finalized_waves::is_abandoned(&self.state, s));
+                let outputs = self.finalized_wave_fetch.handle(HashSetFetchInput::Tick);
+                self.process_finalized_wave_fetch_outputs(outputs);
+
                 self.provision_fetch
-                    .evict_stale(|s| provisions::is_stale(&self.state, s));
-                let prov_outputs = self.provision_fetch.handle(ScopeFetchInput::Tick {
-                    now: std::time::Instant::now(),
-                });
-                self.process_provision_fetch_outputs(prov_outputs);
-                // Also tick the exec cert fetch protocol.
+                    .evict_abandoned(|s| provisions::is_abandoned(&self.state, s));
+                let outputs = self.provision_fetch.handle(ScopeFetchInput::Tick { now });
+                self.process_provision_fetch_outputs(outputs);
+
                 self.exec_cert_fetch
-                    .evict_stale(|s| exec_certs::is_stale(&self.state, s));
-                let cert_outputs = self.exec_cert_fetch.handle(HashSetFetchInput::Tick);
-                self.process_exec_cert_fetch_outputs(cert_outputs);
-                // Also tick the header fetch protocol.
-                self.header_fetch
-                    .evict_stale(|s| headers::is_stale(&self.state, s));
-                let header_outputs = self.header_fetch.handle(ScopeFetchInput::Tick {
-                    now: std::time::Instant::now(),
-                });
-                self.process_header_fetch_outputs(header_outputs);
+                    .evict_abandoned(|s| exec_certs::is_abandoned(&self.state, s));
+                let outputs = self.exec_cert_fetch.handle(HashSetFetchInput::Tick);
+                self.process_exec_cert_fetch_outputs(outputs);
+
+                // Header fetch has no abandonment predicate: every verified
+                // header emits `Continuation(RemoteHeaderAdmitted)`, which
+                // drains the scope via `apply_admission`.
+                let outputs = self.header_fetch.handle(ScopeFetchInput::Tick { now });
+                self.process_header_fetch_outputs(outputs);
+
                 self.update_fetch_tick_timer();
             }
 
@@ -729,23 +727,14 @@ where
                 self.update_fetch_tick_timer();
             }
 
-            // ── Execution certificate fetch protocol ─────────────────
-            NodeInput::ExecCertFetchReceived {
-                source_shard,
-                block_height,
-                certificates,
-            } => {
-                // Drain delivered wave_ids from in-flight tracking, then feed
-                // certs into the state machine the same way broadcast-arrived
-                // certs are processed.
-                let ids: Vec<_> = certificates.iter().map(|c| c.wave_id.clone()).collect();
-                self.exec_cert_fetch
-                    .handle(HashSetFetchInput::Admitted { ids });
-                for cert in certificates {
-                    self.feed_event(ProtocolEvent::ExecutionCertificateReceived { cert });
-                }
-                let _ = source_shard;
-                let _ = block_height;
+            // ── Execution certificate delivery (fetch + gossip) ──────
+            //
+            // Each delivered cert flows through `on_wave_certificate`, which
+            // emits `Continuation(ExecutionCertificateAdmitted)`. `io_loop`'s
+            // interception arm drains the exec-cert fetch protocol per wave.
+            NodeInput::ExecutionCertsReceived { certificates } => {
+                let actions = self.state.on_execution_certs_received(certificates);
+                self.process_actions(actions);
                 self.update_fetch_tick_timer();
             }
 
@@ -809,14 +798,18 @@ where
             }
 
             // ── Local provision fetch protocol ────────────────────────
+            //
+            // Fetched batches enter the verification pipeline. Successful
+            // verification emits `Continuation(ProvisionsAdmitted)`, which
+            // drains both the cross-shard `provision_fetch` (by scope) and
+            // the local-block `local_provision_fetch` (by hash). Missing
+            // hashes still need a `Failed` signal so the in-flight set can
+            // retry; admission events drain the rest.
             NodeInput::LocalProvisionReceived {
                 block_hash,
                 batches,
                 missing_hashes,
             } => {
-                let admitted: Vec<_> = batches.iter().map(|b| b.hash()).collect();
-                self.local_provision_fetch
-                    .handle(HashSetFetchInput::Admitted { ids: admitted });
                 if !missing_hashes.is_empty() {
                     self.local_provision_fetch
                         .handle(HashSetFetchInput::Failed {
@@ -862,18 +855,17 @@ where
             }
 
             // ── Finalized wave fetch ─────────────────────────────────
-            NodeInput::FinalizedWaveReceived {
-                block_hash,
-                peer,
-                waves,
-            } => {
-                let admitted: Vec<_> = waves.iter().map(|w| w.wave_id_hash()).collect();
-                self.finalized_wave_fetch
-                    .handle(HashSetFetchInput::Admitted { ids: admitted });
+            //
+            // Each delivered wave is funnelled through
+            // `ExecutionCoordinator::admit_finalized_wave`, which emits
+            // `Continuation(FinalizedWavesAdmitted)`. io_loop's interception
+            // arm drains the fetch protocol; state.rs forwards to the BFT
+            // subscriber.
+            NodeInput::FinalizedWaveReceived { waves } => {
                 for wave in waves {
-                    self.feed_event(ProtocolEvent::FinalizedWaveFetchDelivered { wave });
+                    let actions = self.state.execution().admit_finalized_wave(wave);
+                    self.process_actions(actions);
                 }
-                let _ = (block_hash, peer);
                 self.update_fetch_tick_timer();
             }
 
@@ -925,6 +917,15 @@ where
     /// the state machine, then dispatch each resulting action.
     fn feed_event(&mut self, event: ProtocolEvent) {
         let actions = self.state.handle(event);
+        self.process_actions(actions);
+    }
+
+    /// Dispatch a `Vec<Action>` produced by a direct state-machine method
+    /// call. Mirrors [`Self::feed_event`]'s post-`handle` block — bumps
+    /// `actions_generated`, dispatches each action, and flushes pending
+    /// block commits. The flush is the load-bearing part: it's easy to
+    /// forget when copy-pasting the loop inline.
+    fn process_actions(&mut self, actions: Vec<Action>) {
         self.actions_generated += actions.len();
         for action in actions {
             self.process_action(action);
@@ -1133,10 +1134,9 @@ where
         )]
         let remote_congestion_threshold = (mempool.config().max_in_flight as f64 * 0.8) as u32;
         #[allow(clippy::cast_possible_truncation)]
-        let (pending, committed, executed) = (
+        let (pending, in_flight) = (
             contention.pending_count as usize,
-            contention.committed_count as usize,
-            contention.executed_count as usize,
+            contention.in_flight_count as usize,
         );
 
         NodeStatusSnapshot {
@@ -1145,8 +1145,7 @@ where
             state_root,
             sync: self.sync_protocol.status(),
             mempool_pending: pending,
-            mempool_committed: committed,
-            mempool_executed: executed,
+            mempool_in_flight: in_flight,
             mempool_total: mempool.len(),
             accepting_rpc_transactions: !mempool.at_in_flight_limit(),
             at_pending_limit: mempool.at_pending_limit(),

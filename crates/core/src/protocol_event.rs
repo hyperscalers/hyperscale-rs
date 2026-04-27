@@ -195,7 +195,7 @@ pub enum ProtocolEvent {
     /// Emitted by `RemoteHeaderCoordinator` as a continuation after QC verification.
     /// Downstream consumers (BFT, Provision, Execution) use this as their single
     /// source of verified remote headers.
-    RemoteHeaderVerified {
+    RemoteHeaderAdmitted {
         /// The fully-verified committed header.
         committed_header: Arc<CommittedBlockHeader>,
     },
@@ -240,7 +240,7 @@ pub enum ProtocolEvent {
     /// source shard's committing QC. Downstream consumers (notably the
     /// io-loop provision cache) anchor retention on this so eviction is
     /// deterministic across validators.
-    ProvisionsVerified {
+    ProvisionsAdmitted {
         /// Verified provisions batch.
         provisions: Arc<Provisions>,
         /// BFT-authenticated weighted timestamp of the source shard's committing QC.
@@ -339,12 +339,6 @@ pub enum ProtocolEvent {
         certificate: ExecutionCertificate,
     },
 
-    /// Received an execution certificate from a remote shard.
-    ExecutionCertificateReceived {
-        /// Execution certificate received from a remote shard.
-        cert: ExecutionCertificate,
-    },
-
     /// Execution certificate signature verification completed.
     ExecutionCertificateSignatureVerified {
         /// The certificate whose signature was verified.
@@ -364,13 +358,49 @@ pub enum ProtocolEvent {
         submitted_locally: bool,
     },
 
-    /// A transaction's execution outcome has been resolved and certificate finalized.
-    /// Used for per-tx mempool status updates.
-    TransactionExecuted {
-        /// Transaction whose execution outcome resolved.
-        tx_hash: TxHash,
-        /// `true` if the tx was accepted (state-changing) vs rejected.
-        accepted: bool,
+    /// An execution certificate was just admitted to the canonical EC store.
+    ///
+    /// Emitted by `ExecutionCoordinator::on_wave_certificate` for both
+    /// broadcast-delivered and fetch-delivered certs. `io_loop` intercepts
+    /// the matching `Continuation` arm and drains the exec-cert fetch
+    /// protocol's in-flight tracking by `wave_id`.
+    ExecutionCertificateAdmitted {
+        /// Wave the certificate covers.
+        wave_id: WaveId,
+    },
+
+    /// Finalized waves were just admitted to the canonical execution store.
+    ///
+    /// Emitted by `ExecutionCoordinator` (wrapped in `Action::Continuation`)
+    /// for both locally finalized waves and fetch-delivered waves. Drives
+    /// two consumers:
+    ///
+    /// - `io_loop` intercepts the matching `Continuation` arm and drains the
+    ///   finalized-wave fetch protocol's in-flight tracking.
+    /// - state.rs forwards the event to `bft.on_finalized_waves_admitted`,
+    ///   which validates each wave's receipts against its EC and populates
+    ///   any pending block waiting on its hash.
+    FinalizedWavesAdmitted {
+        /// Finalized waves newly admitted on this admission call.
+        waves: Vec<Arc<FinalizedWave>>,
+    },
+
+    /// One or more transactions were just admitted to the canonical mempool.
+    ///
+    /// Emitted by `MempoolCoordinator` (wrapped in `Action::Continuation`) for
+    /// every newly admitted batch, regardless of source (RPC, gossip, fetch,
+    /// local production). Drives two downstream consumers:
+    ///
+    /// - `io_loop` intercepts the matching `Continuation` arm and drains the
+    ///   transaction-fetch protocol's in-flight tracking.
+    /// - state.rs forwards the event to `bft.on_transactions_admitted`, which
+    ///   populates any pending block waiting on these hashes.
+    ///
+    /// Same shape as `RemoteHeaderAdmitted` / `ProvisionsAdmitted` —
+    /// the canonical-store admission story is uniform across payloads.
+    TransactionsAdmitted {
+        /// Transactions newly admitted to mempool on this admission call.
+        txs: Vec<Arc<RoutableTransaction>>,
     },
 
     /// Local execution certificate created for a wave (local votes aggregated).
@@ -386,23 +416,6 @@ pub enum ProtocolEvent {
         wave_cert: Arc<WaveCertificate>,
         /// Transaction hashes covered by the wave.
         tx_hashes: Vec<TxHash>,
-    },
-
-    // ═══════════════════════════════════════════════════════════════════════
-    // Fetch Delivery (from IoLoop after fetch protocol processing)
-    // ═══════════════════════════════════════════════════════════════════════
-    /// Fetched transactions delivered to state machine.
-    TransactionFetchDelivered {
-        /// Block whose transactions were fetched.
-        block_hash: BlockHash,
-        /// Fetched transactions.
-        transactions: Vec<Arc<RoutableTransaction>>,
-    },
-
-    /// Fetched finalized wave delivered to state machine for pending block completion.
-    FinalizedWaveFetchDelivered {
-        /// Finalized wave delivered for pending-block completion.
-        wave: Arc<FinalizedWave>,
     },
 
     // ═══════════════════════════════════════════════════════════════════════

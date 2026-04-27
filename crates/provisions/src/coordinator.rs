@@ -16,7 +16,7 @@ use crate::pipeline::ProvisionPipeline;
 use crate::queue::QueuedProvisionBuffer;
 use crate::store::ProvisionStore;
 use crate::verified_headers::VerifiedHeaderBuffer;
-use hyperscale_core::{Action, ProtocolEvent};
+use hyperscale_core::{Action, FetchRequest, ProtocolEvent};
 use hyperscale_types::{
     BlockHeight, CommittedBlockHeader, Hash, LocalTimestamp, ProvisionHash, ProvisionTxRoot,
     Provisions, RETENTION_HORIZON, ShardGroupId, TopologySnapshot, compute_padded_merkle_root,
@@ -244,11 +244,13 @@ impl ProvisionCoordinator {
         self.expected
             .check_timeouts(local_ts)
             .into_iter()
-            .map(|effect| Action::FetchProvisionsRemote {
-                source_shard: effect.source_shard,
-                block_height: effect.block_height,
-                proposer: effect.proposer,
-                peers: topology.committee_for_shard(effect.source_shard).to_vec(),
+            .map(|effect| {
+                Action::Fetch(FetchRequest::RemoteProvisions {
+                    source_shard: effect.source_shard,
+                    block_height: effect.block_height,
+                    proposer: effect.proposer,
+                    peers: topology.committee_for_shard(effect.source_shard).to_vec(),
+                })
             })
             .collect()
     }
@@ -280,7 +282,7 @@ impl ProvisionCoordinator {
         }
     }
 
-    /// Immediately emit `FetchProvisionsRemote` for all outstanding expected
+    /// Immediately emit `Action::Fetch(FetchRequest::RemoteProvisions)` for all outstanding expected
     /// provisions, bypassing the normal liveness timeout.
     ///
     /// Called when urgency overrides the default patience — sync completion
@@ -299,12 +301,12 @@ impl ProvisionCoordinator {
                     block_height = effect.block_height.0,
                     "Eager fetch — immediately requesting missing provisions"
                 );
-                Action::FetchProvisionsRemote {
+                Action::Fetch(FetchRequest::RemoteProvisions {
                     source_shard: effect.source_shard,
                     block_height: effect.block_height,
                     proposer: effect.proposer,
                     peers: topology.committee_for_shard(effect.source_shard).to_vec(),
-                }
+                })
             })
             .collect()
     }
@@ -315,7 +317,7 @@ impl ProvisionCoordinator {
 
     /// Handle a verified remote header from the `RemoteHeaderCoordinator`.
     ///
-    /// Called when `RemoteHeaderVerified` is received. The header has already
+    /// Called when `RemoteHeaderAdmitted` is received. The header has already
     /// passed QC verification, so we store it directly as verified and:
     /// 1. Register expected provisions if waves target our shard
     /// 2. Join with any buffered provisions waiting for this header
@@ -542,7 +544,7 @@ impl ProvisionCoordinator {
         // Clear expected-provision tracking and the matching header. The
         // header's only job — verify these provisions — is done; hanging on
         // to it wastes memory. Any in-flight fallback fetch self-cancels
-        // via the `ProvisionsVerified` continuation, which the io_loop
+        // via the `ProvisionsAdmitted` continuation, which the io_loop
         // turns into an admission signal on the provision fetch protocol.
         if let Some(header) = committed_header {
             let shard = header.header.shard_group_id;
@@ -597,9 +599,9 @@ impl ProvisionCoordinator {
             "Provisions verified and queued"
         );
 
-        // Emit ProvisionsVerified for downstream consumption. The source
+        // Emit ProvisionsAdmitted for downstream consumption. The source
         // block timestamp anchors retention in the io-loop provision cache.
-        actions.push(Action::Continuation(ProtocolEvent::ProvisionsVerified {
+        actions.push(Action::Continuation(ProtocolEvent::ProvisionsAdmitted {
             provisions: Arc::clone(&provisions),
             source_block_ts,
         }));
@@ -647,6 +649,14 @@ impl ProvisionCoordinator {
     #[must_use]
     pub fn verified_remote_header_count(&self) -> usize {
         self.headers.len()
+    }
+
+    /// Whether cross-shard provisions for `(source_shard, block_height)` are
+    /// currently expected — i.e. a verified remote header has registered an
+    /// expectation that hasn't yet been satisfied.
+    #[must_use]
+    pub fn is_expected(&self, source_shard: ShardGroupId, block_height: BlockHeight) -> bool {
+        self.expected.contains(source_shard, block_height)
     }
 }
 
@@ -985,10 +995,10 @@ mod tests {
             LocalTimestamp::ZERO,
         );
 
-        // Should emit ProvisionsVerified
+        // Should emit ProvisionsAdmitted
         assert!(actions.iter().any(|a| matches!(
             a,
-            Action::Continuation(ProtocolEvent::ProvisionsVerified { provisions, .. })
+            Action::Continuation(ProtocolEvent::ProvisionsAdmitted { provisions, .. })
             if provisions.transactions[0].tx_hash == tx_hash
         )));
     }
@@ -1015,10 +1025,10 @@ mod tests {
             LocalTimestamp::ZERO,
         );
 
-        // Should NOT emit ProvisionsVerified
+        // Should NOT emit ProvisionsAdmitted
         assert!(!actions.iter().any(|a| matches!(
             a,
-            Action::Continuation(ProtocolEvent::ProvisionsVerified { .. })
+            Action::Continuation(ProtocolEvent::ProvisionsAdmitted { .. })
         )));
     }
 
@@ -1212,10 +1222,10 @@ mod tests {
             LocalTimestamp::ZERO,
         );
 
-        // Verification failed — no ProvisionsVerified emitted
+        // Verification failed — no ProvisionsAdmitted emitted
         assert!(!actions.iter().any(|a| matches!(
             a,
-            Action::Continuation(ProtocolEvent::ProvisionsVerified { .. })
+            Action::Continuation(ProtocolEvent::ProvisionsAdmitted { .. })
         )));
     }
 
@@ -1394,12 +1404,12 @@ mod tests {
         assert_eq!(actions.len(), 1);
         assert!(matches!(
             &actions[0],
-            Action::FetchProvisionsRemote {
+            Action::Fetch(FetchRequest::RemoteProvisions {
                 source_shard,
                 block_height,
                 proposer,
                 ..
-            } if *source_shard == ShardGroupId(1)
+            }) if *source_shard == ShardGroupId(1)
                 && *block_height == BlockHeight(10)
                 && *proposer == ValidatorId(0)
         ));
@@ -1546,7 +1556,7 @@ mod tests {
         );
 
         // Expected-tracking entry is cleared; the io_loop's
-        // `ProvisionsVerified` interception drives any in-flight fetch
+        // `ProvisionsAdmitted` interception drives any in-flight fetch
         // admission downstream.
         assert_eq!(coordinator.expected.len(), 0);
     }

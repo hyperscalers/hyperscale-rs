@@ -28,7 +28,6 @@ pub(super) struct TxPhaseTimes {
     added_at: LocalTimestamp,
     committed_at: Option<LocalTimestamp>,
     ec_created_at: Option<LocalTimestamp>,
-    executed_at: Option<LocalTimestamp>,
 }
 
 impl TxPhaseTimes {
@@ -37,7 +36,6 @@ impl TxPhaseTimes {
             added_at,
             committed_at: None,
             ec_created_at: None,
-            executed_at: None,
         }
     }
 
@@ -89,14 +87,6 @@ impl TxPhaseTimesCache {
                 entry.committed_at.get_or_insert(now);
                 None
             }
-            TransactionStatus::Executed { .. } => {
-                let entry = self
-                    .entries
-                    .entry(tx_hash)
-                    .or_insert_with(|| TxPhaseTimes::new(now));
-                entry.executed_at.get_or_insert(now);
-                None
-            }
             TransactionStatus::Completed(_) => {
                 // Terminal — pull the entry so the caller can log.
                 self.entries.remove(&tx_hash)
@@ -132,21 +122,10 @@ impl fmt::Display for TxPhaseTimesDisplay<'_> {
         write!(f, "total={total:.3}s")?;
         if let Some(c) = p.committed_at {
             write!(f, " mempool={:.3}s", dur(p.added_at, c))?;
+            write!(f, " commit_to_complete={:.3}s", dur(c, self.completed_at))?;
         }
-        match (p.committed_at, p.executed_at) {
-            (Some(c), Some(x)) => {
-                write!(f, " execution={:.3}s", dur(c, x))?;
-            }
-            (Some(c), None) => {
-                write!(f, " commit_to_complete={:.3}s", dur(c, self.completed_at))?;
-            }
-            _ => {}
-        }
-        if let (Some(e), Some(x)) = (p.ec_created_at, p.executed_at) {
-            write!(f, " ec_collection={:.3}s", dur(e, x))?;
-        }
-        if let Some(x) = p.executed_at {
-            write!(f, " tc_inclusion={:.3}s", dur(x, self.completed_at))?;
+        if let Some(e) = p.ec_created_at {
+            write!(f, " ec_to_complete={:.3}s", dur(e, self.completed_at))?;
         }
         Ok(())
     }

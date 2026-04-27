@@ -93,8 +93,7 @@ pub async fn status_handler(State(state): State<RpcState>) -> impl IntoResponse 
         state_root_hash: node_status.state_root_hash.clone(),
         mempool: MempoolStatusResponse {
             pending_count: mempool_snapshot.pending_count,
-            committed_count: mempool_snapshot.committed_count,
-            executed_count: mempool_snapshot.executed_count,
+            in_flight_count: mempool_snapshot.in_flight_count,
             total_count: mempool_snapshot.total_count,
         },
     })
@@ -341,22 +340,6 @@ fn format_transaction_status(
         TransactionStatus::Committed(height) => {
             ("committed".to_string(), Some(height.0), None, None)
         }
-        TransactionStatus::Executed {
-            decision,
-            committed_at,
-        } => {
-            let decision_str = match decision {
-                TransactionDecision::Accept => "accept",
-                TransactionDecision::Reject => "reject",
-                TransactionDecision::Aborted => "aborted",
-            };
-            (
-                "executed".to_string(),
-                Some(committed_at.0),
-                Some(decision_str.to_string()),
-                None,
-            )
-        }
         TransactionStatus::Completed(decision) => {
             let decision_str = match decision {
                 TransactionDecision::Accept => "accept",
@@ -382,8 +365,7 @@ pub async fn mempool_handler(State(state): State<RpcState>) -> impl IntoResponse
     let snapshot = state.mempool_snapshot.load();
     Json(MempoolStatusResponse {
         pending_count: snapshot.pending_count,
-        committed_count: snapshot.committed_count,
-        executed_count: snapshot.executed_count,
+        in_flight_count: snapshot.in_flight_count,
         total_count: snapshot.total_count,
     })
 }
@@ -500,32 +482,6 @@ mod tests {
         assert_eq!(status, "committed");
         assert_eq!(height, Some(42));
         assert!(decision.is_none());
-        assert!(error.is_none());
-    }
-
-    #[test]
-    fn test_format_executed_accept() {
-        let (status, height, decision, error) =
-            format_transaction_status(&TransactionStatus::Executed {
-                decision: TransactionDecision::Accept,
-                committed_at: BlockHeight(5),
-            });
-        assert_eq!(status, "executed");
-        assert_eq!(height, Some(5));
-        assert_eq!(decision, Some("accept".to_string()));
-        assert!(error.is_none());
-    }
-
-    #[test]
-    fn test_format_executed_reject() {
-        let (status, height, decision, error) =
-            format_transaction_status(&TransactionStatus::Executed {
-                decision: TransactionDecision::Reject,
-                committed_at: BlockHeight(10),
-            });
-        assert_eq!(status, "executed");
-        assert_eq!(height, Some(10));
-        assert_eq!(decision, Some("reject".to_string()));
         assert!(error.is_none());
     }
 
@@ -662,8 +618,7 @@ mod tests {
         // Update the mempool snapshot
         state.mempool_snapshot.store(Arc::new(MempoolSnapshot {
             pending_count: 10,
-            committed_count: 3,
-            executed_count: 2,
+            in_flight_count: 5,
             total_count: 17,
             ..MempoolSnapshot::default()
         }));
@@ -691,8 +646,7 @@ mod tests {
         let resp: MempoolStatusResponse = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(resp.pending_count, 10);
-        assert_eq!(resp.committed_count, 3);
-        assert_eq!(resp.executed_count, 2);
+        assert_eq!(resp.in_flight_count, 5);
         assert_eq!(resp.total_count, 17);
     }
 

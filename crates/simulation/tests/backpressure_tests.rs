@@ -128,11 +128,7 @@ fn test_single_shard_unaffected_by_backpressure() {
         status.is_none()
             || matches!(
                 status,
-                Some(
-                    TransactionStatus::Committed { .. }
-                        | TransactionStatus::Executed { .. }
-                        | TransactionStatus::Completed(_)
-                )
+                Some(TransactionStatus::Committed { .. } | TransactionStatus::Completed(_))
             ),
         "Single-shard TX should not be deferred by backpressure: {status:?}",
     );

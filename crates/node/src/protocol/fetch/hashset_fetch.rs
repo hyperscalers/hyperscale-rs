@@ -3,8 +3,9 @@
 //! Tracks a set of items per scope (e.g. tx hashes per block). Each `Send`
 //! output covers a *chunk* of the missing set; the protocol limits both the
 //! per-scope concurrency and the parallel-chunks-per-tick fan-out. The
-//! scope's entry self-evicts when its missing set drains, either by direct
-//! per-id admission or a scope-level admission signal.
+//! scope's entry self-evicts once its missing set drains via per-id
+//! `Admitted` signals; abandoned scopes are evicted by callers via
+//! `evict_abandoned`.
 
 use super::peer_rotator::PeerRotator;
 use hyperscale_types::ValidatorId;
@@ -74,11 +75,6 @@ pub enum HashSetFetchInput<S, Id> {
     Admitted {
         /// Ids whose payloads have been admitted to their canonical store.
         ids: Vec<Id>,
-    },
-    /// Scope-level admission: drop the scope entirely.
-    AdmittedScope {
-        /// Scope to evict.
-        scope: S,
     },
     /// Drive pending fetches: emit chunks up to per-scope and per-tick caps.
     Tick,
@@ -174,7 +170,6 @@ impl<S: Eq + Hash + Ord + Clone + std::fmt::Debug, Id: Eq + Hash + Clone + std::
             }
             HashSetFetchInput::Failed { scope, ids } => self.handle_failed(&scope, &ids),
             HashSetFetchInput::Admitted { ids } => self.handle_admitted(ids),
-            HashSetFetchInput::AdmittedScope { scope } => self.handle_admitted_scope(&scope),
             HashSetFetchInput::Tick => self.spawn_pending_fetches(Instant::now()),
         }
     }
@@ -197,16 +192,16 @@ impl<S: Eq + Hash + Ord + Clone + std::fmt::Debug, Id: Eq + Hash + Clone + std::
         self.pending.len()
     }
 
-    /// Drop every scope for which `is_stale` returns `true` and prune the
+    /// Drop every scope for which `is_abandoned` returns `true` and prune the
     /// reverse index of the ids those scopes owned.
-    pub fn evict_stale<F>(&mut self, mut is_stale: F)
+    pub fn evict_abandoned<F>(&mut self, mut is_abandoned: F)
     where
         F: FnMut(&S) -> bool,
     {
         let evicted: Vec<S> = self
             .pending
             .keys()
-            .filter(|s| is_stale(s))
+            .filter(|s| is_abandoned(s))
             .cloned()
             .collect();
         for scope in evicted {
@@ -284,25 +279,6 @@ impl<S: Eq + Hash + Ord + Clone + std::fmt::Debug, Id: Eq + Hash + Clone + std::
             }
         }
         outputs
-    }
-
-    fn handle_admitted_scope(&mut self, scope: &S) -> Vec<HashSetFetchOutput<S, Id>> {
-        let Some(set) = self.pending.remove(scope) else {
-            return vec![];
-        };
-        // Strip this scope from the reverse index for every id it owned.
-        for id in set.missing.iter().chain(set.in_flight.iter()) {
-            if let Some(scopes) = self.id_to_scopes.get_mut(id) {
-                scopes.retain(|s| s != scope);
-                if scopes.is_empty() {
-                    self.id_to_scopes.remove(id);
-                }
-            }
-        }
-        debug!(?scope, "Scope-level admission; dropping fetch entry");
-        vec![HashSetFetchOutput::ScopeComplete {
-            scope: scope.clone(),
-        }]
     }
 
     fn spawn_pending_fetches(&mut self, now: Instant) -> Vec<HashSetFetchOutput<S, Id>> {
@@ -461,20 +437,6 @@ mod tests {
         // tx(1) lands; both scopes should drop it.
         p.handle(HashSetFetchInput::Admitted { ids: vec![tx(1)] });
         assert_eq!(p.pending_count(), 2);
-    }
-
-    #[test]
-    fn admitted_scope_drops_the_entire_entry() {
-        let mut p = HashSetFetch::<BlockHash, TxHash>::new(config());
-        p.handle(HashSetFetchInput::Request {
-            scope: block(1),
-            ids: vec![tx(1), tx(2)],
-            peers: PeerSource::Pinned(vid(1)),
-        });
-
-        let out = p.handle(HashSetFetchInput::AdmittedScope { scope: block(1) });
-        assert_eq!(out.len(), 1);
-        assert!(!p.has_pending());
     }
 
     #[test]

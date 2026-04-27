@@ -61,7 +61,7 @@ impl<K: Eq + Hash + Clone> SlotTracker<K> {
     }
 
     /// Drop every key for which `f` returns false. Used by callers that need
-    /// to evict stale or no-longer-relevant scopes from the tracker.
+    /// to evict abandoned or no-longer-relevant scopes from the tracker.
     pub fn retain<F>(&mut self, mut f: F)
     where
         F: FnMut(&K) -> bool,

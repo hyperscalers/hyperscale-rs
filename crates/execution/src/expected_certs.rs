@@ -62,8 +62,8 @@ struct ExpectedEntry {
 }
 
 /// A fallback fetch the coordinator should emit as
-/// `Action::RequestMissingExecutionCert`. The tracker doesn't know about
-/// topology or peers — the coordinator attaches those.
+/// `Action::Fetch(FetchRequest::ExecutionCerts)`. The tracker doesn't know
+/// about topology or peers — the coordinator attaches those.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FallbackFetch {
     pub source_shard: ShardGroupId,
@@ -112,8 +112,8 @@ impl ExpectedCertTracker {
     }
 
     /// Record that the expected EC arrived. Returns `true` if an active
-    /// expectation was cleared — the coordinator uses this to emit
-    /// `Action::CancelExecutionCertFetch` so an in-flight retry loop stops.
+    /// expectation was cleared — the per-id `Continuation(ExecutionCertificateAdmitted)`
+    /// drains the matching `exec_cert_fetch` entry so the retry loop stops.
     pub fn mark_fulfilled(
         &mut self,
         source_shard: ShardGroupId,

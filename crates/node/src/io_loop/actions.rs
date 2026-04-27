@@ -4,10 +4,12 @@ use super::IoLoop;
 use super::TimerOp;
 use super::block_commit::{AccumulateDecision, PendingCommit};
 use crate::action_handler::{self, ActionContext, DispatchPool};
-use crate::protocol::fetch::instances::{exec_certs, headers, provisions};
+use crate::protocol::fetch::instances::{
+    exec_certs, finalized_waves, headers, local_provisions, provisions, transactions,
+};
 use crate::protocol::fetch::{HashSetFetchInput, PeerSource, ScopeFetchInput};
 use crate::protocol::sync::SyncInput;
-use hyperscale_core::{Action, CommitSource, NodeInput, ProtocolEvent, StateMachine};
+use hyperscale_core::{Action, CommitSource, FetchRequest, NodeInput, ProtocolEvent, StateMachine};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::Engine;
 use hyperscale_metrics as metrics;
@@ -43,23 +45,26 @@ where
             // Internal events
             // ═══════════════════════════════════════════════════════════
             Action::Continuation(pe) => {
-                match &pe {
-                    ProtocolEvent::RemoteHeaderVerified { committed_header } => {
-                        let scope = headers::scope_for(
-                            committed_header.shard_group_id(),
-                            committed_header.height(),
-                        );
-                        self.header_fetch
-                            .handle(ScopeFetchInput::Admitted { scope });
+                // Each fetch instance owns its own admission predicate; the
+                // arm just dispatches the event through them. Adding a new
+                // payload is one new helper + one line here.
+                transactions::apply_admission(&mut self.transaction_fetch, &pe);
+                local_provisions::apply_admission(&mut self.local_provision_fetch, &pe);
+                finalized_waves::apply_admission(&mut self.finalized_wave_fetch, &pe);
+                provisions::apply_admission(&mut self.provision_fetch, &pe);
+                exec_certs::apply_admission(&mut self.exec_cert_fetch, &pe);
+                headers::apply_admission(&mut self.header_fetch, &pe);
+
+                // Serving-cache insertion is io_loop's own state, not an
+                // instance concern — keep it here.
+                if let ProtocolEvent::FinalizedWavesAdmitted { waves } = &pe {
+                    for wave in waves {
+                        self.caches
+                            .finalized_wave
+                            .insert(wave.wave_id_hash(), Arc::clone(wave));
                     }
-                    ProtocolEvent::ProvisionsVerified { provisions, .. } => {
-                        let scope =
-                            provisions::scope_for(provisions.source_shard, provisions.block_height);
-                        self.provision_fetch
-                            .handle(ScopeFetchInput::Admitted { scope });
-                    }
-                    _ => {}
                 }
+
                 let _ = self.event_sender.send(NodeInput::Protocol(pe));
             }
 
@@ -285,8 +290,13 @@ where
             // ═══════════════════════════════════════════════════════════
             // Storage
             // ═══════════════════════════════════════════════════════════
-            Action::CacheFinalizedWave { .. } | Action::FetchChainMetadata => {
-                self.process_storage_action(action);
+            Action::FetchChainMetadata => {
+                let height = self.storage.committed_height();
+                let hash = self.storage.committed_hash();
+                let qc = self.storage.latest_qc();
+                let _ = self.event_sender.send(NodeInput::Protocol(
+                    ProtocolEvent::ChainMetadataFetched { height, hash, qc },
+                ));
             }
 
             // ═══════════════════════════════════════════════════════════
@@ -356,17 +366,9 @@ where
             }
 
             // ═══════════════════════════════════════════════════════════
-            // Sync / Fetch / Provision recovery
+            // Sync / Fetch
             // ═══════════════════════════════════════════════════════════
-            Action::StartSync { .. }
-            | Action::FetchTransactions { .. }
-            | Action::FetchProvisionsLocal { .. }
-            | Action::FetchFinalizedWave { .. }
-            | Action::CancelFetch { .. }
-            | Action::FetchProvisionsRemote { .. }
-            | Action::RequestMissingExecutionCert { .. }
-            | Action::CancelExecutionCertFetch { .. }
-            | Action::RequestMissingCommittedBlockHeader { .. } => {
+            Action::StartSync { .. } | Action::Fetch(_) => {
                 self.process_sync_fetch_action(action);
             }
 
@@ -410,25 +412,6 @@ where
     }
 
     // ─── Action Handler Groups ──────────────────────────────────────────
-
-    /// Process storage read/write actions.
-    fn process_storage_action(&self, action: Action) {
-        match action {
-            Action::CacheFinalizedWave { wave } => {
-                let wave_id_hash = wave.wave_id_hash();
-                self.caches.finalized_wave.insert(wave_id_hash, wave);
-            }
-            Action::FetchChainMetadata => {
-                let height = self.storage.committed_height();
-                let hash = self.storage.committed_hash();
-                let qc = self.storage.latest_qc();
-                let _ = self.event_sender.send(NodeInput::Protocol(
-                    ProtocolEvent::ChainMetadataFetched { height, hash, qc },
-                ));
-            }
-            _ => unreachable!(),
-        }
-    }
 
     /// Handler for [`Action::CommitBlockByQcOnly`].
     ///
@@ -574,7 +557,7 @@ where
         self.block_commit.flush(&self.storage, &self.event_sender);
     }
 
-    /// Process sync, fetch, and provision recovery actions.
+    /// Process sync and unified-fetch actions.
     #[allow(clippy::too_many_lines)] // single dispatch over the sync/fetch action subset
     fn process_sync_fetch_action(&mut self, action: Action) {
         match action {
@@ -588,45 +571,54 @@ where
                 });
                 self.process_sync_outputs(outputs);
             }
-            Action::FetchTransactions {
+            Action::Fetch(req) => self.process_fetch_request(req),
+            _ => unreachable!(),
+        }
+    }
+
+    /// Dispatch a typed fetch request to the corresponding instance binding.
+    #[allow(clippy::too_many_lines)] // single dispatch, one arm per FetchRequest variant
+    fn process_fetch_request(&mut self, req: FetchRequest) {
+        match req {
+            FetchRequest::Transactions {
                 block_hash,
                 proposer,
-                tx_hashes,
+                ids,
             } => {
                 self.transaction_fetch.handle(HashSetFetchInput::Request {
                     scope: block_hash,
-                    ids: tx_hashes,
+                    ids,
                     peers: PeerSource::Pinned(proposer),
                 });
                 let outputs = self.transaction_fetch.handle(HashSetFetchInput::Tick);
                 self.process_transaction_fetch_outputs(outputs);
                 self.update_fetch_tick_timer();
             }
-            Action::FetchProvisionsLocal {
+            FetchRequest::LocalProvisions {
                 block_hash,
                 proposer,
-                batch_hashes,
+                ids,
             } => {
                 self.local_provision_fetch
                     .handle(HashSetFetchInput::Request {
                         scope: block_hash,
-                        ids: batch_hashes,
+                        ids,
                         peers: PeerSource::Pinned(proposer),
                     });
                 let tick_outputs = self.local_provision_fetch.handle(HashSetFetchInput::Tick);
                 self.process_local_provision_fetch_outputs(tick_outputs);
                 self.update_fetch_tick_timer();
             }
-            Action::FetchFinalizedWave {
+            FetchRequest::FinalizedWaves {
                 block_hash,
                 proposer,
-                wave_id_hashes,
+                ids,
                 peers,
             } => {
                 self.finalized_wave_fetch
                     .handle(HashSetFetchInput::Request {
                         scope: block_hash,
-                        ids: wave_id_hashes,
+                        ids,
                         peers: PeerSource::Rotation {
                             preferred: proposer,
                             rest: peers,
@@ -636,15 +628,7 @@ where
                 self.process_finalized_wave_fetch_outputs(tick_outputs);
                 self.update_fetch_tick_timer();
             }
-            Action::CancelFetch { block_hash } => {
-                self.transaction_fetch
-                    .handle(HashSetFetchInput::AdmittedScope { scope: block_hash });
-                self.local_provision_fetch
-                    .handle(HashSetFetchInput::AdmittedScope { scope: block_hash });
-                self.finalized_wave_fetch
-                    .handle(HashSetFetchInput::AdmittedScope { scope: block_hash });
-            }
-            Action::FetchProvisionsRemote {
+            FetchRequest::RemoteProvisions {
                 source_shard,
                 block_height,
                 proposer,
@@ -652,7 +636,7 @@ where
             } => {
                 debug_assert!(
                     !peers.is_empty(),
-                    "FetchProvisionsRemote for shard {} height {} has no peers — \
+                    "RemoteProvisions for shard {} height {} has no peers — \
                      was the action enriched by NodeStateMachine?",
                     source_shard.0,
                     block_height.0,
@@ -681,15 +665,7 @@ where
                 self.process_provision_fetch_outputs(tick_outputs);
                 self.update_fetch_tick_timer();
             }
-            Action::CancelExecutionCertFetch {
-                source_shard,
-                block_height,
-            } => {
-                let scope = exec_certs::scope_for(source_shard, block_height);
-                self.exec_cert_fetch
-                    .handle(HashSetFetchInput::AdmittedScope { scope });
-            }
-            Action::RequestMissingExecutionCert {
+            FetchRequest::ExecutionCerts {
                 source_shard,
                 block_height,
                 wave_id,
@@ -720,7 +696,7 @@ where
                 self.process_exec_cert_fetch_outputs(tick_outputs);
                 self.update_fetch_tick_timer();
             }
-            Action::RequestMissingCommittedBlockHeader {
+            FetchRequest::RemoteHeader {
                 source_shard,
                 from_height,
                 peers,
@@ -742,7 +718,6 @@ where
                 self.process_header_fetch_outputs(tick_outputs);
                 self.update_fetch_tick_timer();
             }
-            _ => unreachable!(),
         }
     }
 

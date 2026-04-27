@@ -99,9 +99,12 @@ pub enum NodeInput {
     },
 
     /// Received transactions from a fetch request (raw, before protocol processing).
+    ///
+    /// Routed to `NodeStateMachine::on_transactions_fetched`, which funnels
+    /// them through mempool admission. The block-hash association is reported
+    /// at admission time via the `Continuation(TransactionsAdmitted)` event;
+    /// `io_loop`'s drain doesn't need it here.
     TransactionReceived {
-        /// Block these transactions complete.
-        block_hash: BlockHash,
         /// Transactions returned by the peer.
         transactions: Vec<Arc<RoutableTransaction>>,
     },
@@ -130,11 +133,12 @@ pub enum NodeInput {
     },
 
     /// Finalized waves received from a peer in response to a fetch request.
+    ///
+    /// Routed to `ExecutionCoordinator::admit_finalized_wave`. `io_loop`'s
+    /// `Continuation(FinalizedWavesAdmitted)` interception drains the matching
+    /// fetch protocol — the block-hash association and serving peer aren't
+    /// needed at `io_loop`'s level once the cert is in the wave's EC.
     FinalizedWaveReceived {
-        /// Block these finalized waves complete.
-        block_hash: BlockHash,
-        /// Peer that served the response.
-        peer: ValidatorId,
         /// Finalized waves returned by the peer.
         waves: Vec<Arc<FinalizedWave>>,
     },
@@ -206,13 +210,15 @@ pub enum NodeInput {
         block_height: BlockHeight,
     },
 
-    /// Execution certificates successfully fetched from a source shard.
-    ExecCertFetchReceived {
-        /// Source shard the certs were fetched from.
-        source_shard: ShardGroupId,
-        /// Block height the certs are anchored to.
-        block_height: BlockHeight,
-        /// Execution certificates returned.
+    /// Execution certificates delivered from any source — fetch response or
+    /// peer broadcast (post sender-sig check). Routed to
+    /// `NodeStateMachine::on_execution_certs_received`, which delegates each
+    /// cert to `ExecutionCoordinator::on_wave_certificate`. Each cert
+    /// carries its own `(shard_group_id, block_height, wave_id)`; `io_loop`'s
+    /// `Continuation(ExecutionCertificateAdmitted)` interception drains the
+    /// matching fetch protocol per wave.
+    ExecutionCertsReceived {
+        /// Execution certificates to admit.
         certificates: Vec<ExecutionCertificate>,
     },
 
@@ -281,7 +287,7 @@ impl NodeInput {
             Self::CommittedBlockGossipReceived { .. } => EventPriority::Network,
             Self::ProvisionsReady { .. } => EventPriority::Internal,
             Self::ProvisionsFetchFailed { .. } => EventPriority::Internal,
-            Self::ExecCertFetchReceived { .. } => EventPriority::Internal,
+            Self::ExecutionCertsReceived { .. } => EventPriority::Internal,
             Self::ExecCertFetchFailed { .. } => EventPriority::Internal,
             Self::HeaderFetchFailed { .. } => EventPriority::Internal,
             Self::LocalProvisionReceived { .. } => EventPriority::Internal,
@@ -328,7 +334,7 @@ impl NodeInput {
             Self::CommittedBlockGossipReceived { .. } => "CommittedBlockGossipReceived",
             Self::ProvisionsReady { .. } => "ProvisionsReady",
             Self::ProvisionsFetchFailed { .. } => "ProvisionsFetchFailed",
-            Self::ExecCertFetchReceived { .. } => "ExecCertFetchReceived",
+            Self::ExecutionCertsReceived { .. } => "ExecutionCertsReceived",
             Self::ExecCertFetchFailed { .. } => "ExecCertFetchFailed",
             Self::HeaderFetchFailed { .. } => "HeaderFetchFailed",
             Self::LocalProvisionReceived { .. } => "LocalProvisionReceived",

@@ -1,4 +1,4 @@
-//! Sync, fetch, and provision fetch protocol output processing.
+//! Sync and fetch protocol output processing.
 
 use super::{IoLoop, TimerOp};
 use crate::protocol::sync::{SyncInput, SyncOutput};
@@ -258,7 +258,6 @@ where
                         Box::new(move |result| match result {
                             Ok(resp) => {
                                 let _ = es.send(NodeInput::TransactionReceived {
-                                    block_hash,
                                     transactions: resp.into_transactions(),
                                 });
                             }
@@ -273,7 +272,7 @@ where
                 }
                 HashSetFetchOutput::ScopeComplete { .. } => {
                     // Scope completion is purely an internal protocol signal;
-                    // BFT readiness is driven by `TransactionFetchDelivered`.
+                    // BFT readiness is driven by `Continuation(TransactionsAdmitted)`.
                 }
             }
         }
@@ -333,7 +332,7 @@ where
     ///
     /// On a successful response, the verified-shape provisions are fed
     /// straight into the state machine as `ProvisionsReceived` and the
-    /// `ProvisionsVerified` continuation triggers admission.
+    /// `ProvisionsAdmitted` continuation triggers admission.
     pub(super) fn process_provision_fetch_outputs(
         &self,
         outputs: Vec<
@@ -447,9 +446,7 @@ where
                         Box::new(move |result| match result {
                             Ok(response) => match response.certificates {
                                 Some(certs) if !certs.is_empty() => {
-                                    let _ = sender.send(NodeInput::ExecCertFetchReceived {
-                                        source_shard,
-                                        block_height,
+                                    let _ = sender.send(NodeInput::ExecutionCertsReceived {
                                         certificates: certs,
                                     });
                                 }
@@ -569,11 +566,7 @@ where
                         Box::new(move |result| match result {
                             Ok(resp) => {
                                 let waves = resp.waves.into_iter().map(Arc::new).collect();
-                                let _ = es.send(NodeInput::FinalizedWaveReceived {
-                                    block_hash,
-                                    peer,
-                                    waves,
-                                });
+                                let _ = es.send(NodeInput::FinalizedWaveReceived { waves });
                             }
                             Err(_) => {
                                 let _ = es.send(NodeInput::FinalizedWaveFetchFailed {

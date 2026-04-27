@@ -205,12 +205,8 @@ fn test_e2e_single_shard_transaction() {
         // If not executed, it might just not have been processed yet - continue with polling
     }
 
-    // If already completed or executed (but not yet evicted due to timing), we can skip the polling loop.
-    // Executed means the TC has been created — the transaction was committed and executed successfully.
-    if matches!(
-        initial_status,
-        Some(TransactionStatus::Completed(_) | TransactionStatus::Executed { .. })
-    ) {
+    // If already completed (but not yet evicted due to timing), we can skip the polling loop.
+    if matches!(initial_status, Some(TransactionStatus::Completed(_))) {
         println!("✓ Transaction already completed after initial consensus!\n");
 
         // Print final state

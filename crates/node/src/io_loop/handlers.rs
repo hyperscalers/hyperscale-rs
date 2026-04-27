@@ -74,7 +74,7 @@ where
                 serve_transaction_request(&*storage, &tx_cache, &req)
             });
 
-        // ── provision.request → provision fetch protocol ─────────────
+        // ── provision.request → serve from local store ───────────────
         //
         // Dedup + cache: the proof for (block_height, target_shard) is
         // deterministic. Multiple validators request the same provisions,
@@ -464,7 +464,7 @@ where
                 },
             );
 
-        // ── execution.cert.batch → verify sender sig, then ProtocolEvent::ExecutionCertificateReceived ─
+        // ── execution.cert.batch → verify sender sig, then NodeInput::ExecutionCertsReceived ─
 
         let tx = self.event_sender.clone();
         let topology = self.topology.clone();
@@ -503,11 +503,9 @@ where
                         return;
                     }
 
-                    for cert in batch.into_certificates() {
-                        let _ = tx.send(NodeInput::Protocol(
-                            ProtocolEvent::ExecutionCertificateReceived { cert },
-                        ));
-                    }
+                    let _ = tx.send(NodeInput::ExecutionCertsReceived {
+                        certificates: batch.into_certificates(),
+                    });
                 },
             );
     }
