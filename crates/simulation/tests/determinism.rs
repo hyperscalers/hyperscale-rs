@@ -1226,8 +1226,8 @@ fn test_mempool_to_block_integration() {
     println!("  Total transactions: {}", node0.mempool().len());
     println!("  Ready transactions: {ready_count}");
 
-    // Run for 2 seconds - should commit several blocks with transactions
-    runner.run_until(Duration::from_secs(2));
+    // One second is enough to commit a block past the dwell-time barrier.
+    runner.run_until(Duration::from_secs(1));
 
     let committed_height = runner.node(0).unwrap().bft().committed_height();
     println!("\nAfter 2 seconds:");
@@ -1278,8 +1278,9 @@ fn test_execution_flow() {
         NodeInput::SubmitTransaction { tx: Arc::new(tx) },
     );
 
-    // Run for 7 seconds - should commit blocks and execute transactions
-    runner.run_until(Duration::from_secs(7));
+    // Single tx happy path: a couple of blocks is enough to drive the full
+    // Pending → Completed flow.
+    runner.run_until(Duration::from_secs(3));
 
     let node0 = runner.node(0).expect("Node 0 should exist");
 
@@ -1342,8 +1343,9 @@ fn test_transaction_gossip() {
     println!("Transaction submitted to node 0: {tx_hash}");
     println!("Node 0 has transaction: {node0_has_tx}");
 
-    // Run for 500ms to allow gossip (if implemented)
-    runner.run_until(Duration::from_millis(500));
+    // Allow time for gossip if/when implemented; intra-shard latency is 10ms,
+    // so 200ms is comfortably enough for a single hop.
+    runner.run_until(Duration::from_millis(200));
 
     // Check if other nodes have the transaction
     // (Currently they won't because gossip isn't implemented)

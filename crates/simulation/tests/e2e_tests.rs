@@ -888,9 +888,10 @@ fn test_e2e_transaction_throughput() {
         );
     }
 
-    // Run simulation
+    // Run simulation. After the 3s warmup we only need a few more blocks past
+    // the BlockHeight(5) assertion floor; ~1 block/sec means 5s is sufficient.
     let start = runner.now();
-    runner.run_until(Duration::from_secs(10));
+    runner.run_until(Duration::from_secs(5));
     let elapsed = runner.now().checked_sub(start).unwrap();
 
     // Get final state
