@@ -107,15 +107,15 @@ impl<S: Eq + Hash + Ord + Clone + std::fmt::Debug> ScopeFetch<S> {
         self.pending.len()
     }
 
-    /// Drop every scope for which `is_stale` returns `true`. Called by the
+    /// Drop every scope for which `is_abandoned` returns `true`. Called by the
     /// instance from the tick handler with whatever state-machine read is
     /// relevant (committed height, etc.).
-    pub fn evict_stale<F>(&mut self, mut is_stale: F)
+    pub fn evict_abandoned<F>(&mut self, mut is_abandoned: F)
     where
         F: FnMut(&S) -> bool,
     {
-        self.pending.retain(|s, _| !is_stale(s));
-        self.in_flight.retain(|s| !is_stale(s));
+        self.pending.retain(|s, _| !is_abandoned(s));
+        self.in_flight.retain(|s| !is_abandoned(s));
     }
 
     fn handle_request(&mut self, scope: S, peers: Vec<ValidatorId>) -> Vec<ScopeFetchOutput<S>> {
@@ -314,7 +314,7 @@ mod tests {
     }
 
     #[test]
-    fn evict_stale_drops_matching_scopes() {
+    fn evict_abandoned_drops_matching_scopes() {
         let mut p = ScopeFetch::<Scope>::new(&config());
         for h in 1..=4 {
             p.handle(ScopeFetchInput::Request {
@@ -325,7 +325,7 @@ mod tests {
         p.handle(ScopeFetchInput::Tick {
             now: Instant::now(),
         });
-        p.evict_stale(|s| s.1.0 <= 2);
+        p.evict_abandoned(|s| s.1.0 <= 2);
         // Heights 1 and 2 drop from both maps; 3 and 4 remain in-flight.
         assert_eq!(p.pending_count(), 2);
         assert_eq!(p.in_flight_count(), 2);

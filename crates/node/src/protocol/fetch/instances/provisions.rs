@@ -2,7 +2,7 @@
 //!
 //! Wires `ScopeFetch<(ShardGroupId, BlockHeight)>` to cross-shard provision
 //! requests served by other shards' validators. The instance owns the
-//! scope-to-wire-request translation and the stale-scope predicate.
+//! scope-to-wire-request translation and the abandonment predicate.
 
 use crate::protocol::fetch::{ScopeFetch, ScopeFetchInput};
 use crate::state::NodeStateMachine;
@@ -15,18 +15,18 @@ pub type Scope = (ShardGroupId, BlockHeight);
 /// The typed fetch protocol instance for cross-shard provisions.
 pub type ProvisionFetch = ScopeFetch<Scope>;
 
-/// A scope is stale once `ProvisionCoordinator` no longer expects provisions
+/// A scope is abandoned once `ProvisionCoordinator` no longer expects provisions
 /// for it: the verified remote header that registered the expectation has
 /// either been satisfied (provisions verified) or pruned.
 #[must_use]
-pub fn is_stale(state: &NodeStateMachine, scope: &Scope) -> bool {
+pub fn is_abandoned(state: &NodeStateMachine, scope: &Scope) -> bool {
     let (shard, height) = *scope;
     !state.provisions().is_expected(shard, height)
 }
 
 /// Drain the matching scope on the canonical admission event.
 pub fn apply_admission(fetch: &mut ProvisionFetch, event: &ProtocolEvent) {
-    if let ProtocolEvent::ProvisionsVerified { provisions, .. } = event {
+    if let ProtocolEvent::ProvisionsAdmitted { provisions, .. } = event {
         let scope = scope_for(provisions.source_shard, provisions.block_height);
         fetch.handle(ScopeFetchInput::Admitted { scope });
     }

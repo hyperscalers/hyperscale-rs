@@ -616,7 +616,7 @@ impl BftCoordinator {
         );
 
         // Pending blocks at or below the recovered committed height self-evict
-        // from fetch protocols on the next tick via the `is_stale` predicate.
+        // from fetch protocols on the next tick via the `is_abandoned` predicate.
 
         // Set timers to resume consensus and trigger first proposal attempt
         vec![
@@ -2291,7 +2291,7 @@ impl BftCoordinator {
         let parent_block_height = self.committed_height;
 
         // Removed blocks self-evict from fetch protocols on the next tick
-        // via the `is_stale` predicate.
+        // via the `is_abandoned` predicate.
         self.record_block_committed(&block, block_hash, qc.weighted_timestamp);
         self.record_leader_activity();
 
@@ -2418,7 +2418,7 @@ impl BftCoordinator {
         // Advance committed_height. The QC is the proof of commit — same
         // timing as the consensus path.
         // Removed blocks self-evict from fetch protocols on the next tick
-        // via the `is_stale` predicate.
+        // via the `is_abandoned` predicate.
         self.record_block_committed(&block, block_hash, qc.weighted_timestamp);
 
         // Track sync progress for the loop iterator.
@@ -2767,7 +2767,7 @@ impl BftCoordinator {
 
     /// React to provisions newly admitted to the canonical store.
     ///
-    /// Called via state.rs when a `Continuation(ProvisionsVerified)` event
+    /// Called via state.rs when a `Continuation(ProvisionsAdmitted)` event
     /// reaches the dispatcher — same shape as `on_transactions_admitted`.
     /// Walks pending blocks, populates `received_provisions` for each block
     /// waiting on these hashes, and emits any unblocked vote / commit-resume
@@ -2884,7 +2884,7 @@ impl BftCoordinator {
 
     /// Clean up old state after commit. Pending blocks at or below the
     /// committed height self-evict from fetch protocols on the next tick via
-    /// the `is_stale` predicate (`has_pending_block` returns false).
+    /// the `is_abandoned` predicate (`has_pending_block` returns false).
     fn cleanup_old_state(&mut self, committed_height: BlockHeight) {
         self.pending_blocks
             .retain(|_, pending| pending.header().height > committed_height);

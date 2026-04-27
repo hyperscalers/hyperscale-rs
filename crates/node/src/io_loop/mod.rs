@@ -673,37 +673,38 @@ where
 
             NodeInput::FetchTick => {
                 // Tick every fetch protocol: evict abandoned scopes via each
-                // instance's `is_stale` predicate, then drive any pending
+                // instance's `is_abandoned` predicate, then drive any pending
                 // chunks via `Tick`.
                 let now = std::time::Instant::now();
 
                 self.transaction_fetch
-                    .evict_stale(|s| transactions::is_stale(&self.state, s));
+                    .evict_abandoned(|s| transactions::is_abandoned(&self.state, s));
                 let outputs = self.transaction_fetch.handle(HashSetFetchInput::Tick);
                 self.process_transaction_fetch_outputs(outputs);
 
                 self.local_provision_fetch
-                    .evict_stale(|s| local_provisions::is_stale(&self.state, s));
+                    .evict_abandoned(|s| local_provisions::is_abandoned(&self.state, s));
                 let outputs = self.local_provision_fetch.handle(HashSetFetchInput::Tick);
                 self.process_local_provision_fetch_outputs(outputs);
 
                 self.finalized_wave_fetch
-                    .evict_stale(|s| finalized_waves::is_stale(&self.state, s));
+                    .evict_abandoned(|s| finalized_waves::is_abandoned(&self.state, s));
                 let outputs = self.finalized_wave_fetch.handle(HashSetFetchInput::Tick);
                 self.process_finalized_wave_fetch_outputs(outputs);
 
                 self.provision_fetch
-                    .evict_stale(|s| provisions::is_stale(&self.state, s));
+                    .evict_abandoned(|s| provisions::is_abandoned(&self.state, s));
                 let outputs = self.provision_fetch.handle(ScopeFetchInput::Tick { now });
                 self.process_provision_fetch_outputs(outputs);
 
                 self.exec_cert_fetch
-                    .evict_stale(|s| exec_certs::is_stale(&self.state, s));
+                    .evict_abandoned(|s| exec_certs::is_abandoned(&self.state, s));
                 let outputs = self.exec_cert_fetch.handle(HashSetFetchInput::Tick);
                 self.process_exec_cert_fetch_outputs(outputs);
 
-                self.header_fetch
-                    .evict_stale(|s| headers::is_stale(&self.state, s));
+                // Header fetch has no abandonment predicate: every verified
+                // header emits `Continuation(RemoteHeaderAdmitted)`, which
+                // drains the scope via `apply_admission`.
                 let outputs = self.header_fetch.handle(ScopeFetchInput::Tick { now });
                 self.process_header_fetch_outputs(outputs);
 
@@ -799,7 +800,7 @@ where
             // ── Local provision fetch protocol ────────────────────────
             //
             // Fetched batches enter the verification pipeline. Successful
-            // verification emits `Continuation(ProvisionsVerified)`, which
+            // verification emits `Continuation(ProvisionsAdmitted)`, which
             // drains both the cross-shard `provision_fetch` (by scope) and
             // the local-block `local_provision_fetch` (by hash). Missing
             // hashes still need a `Failed` signal so the in-flight set can

@@ -332,7 +332,7 @@ where
     ///
     /// On a successful response, the verified-shape provisions are fed
     /// straight into the state machine as `ProvisionsReceived` and the
-    /// `ProvisionsVerified` continuation triggers admission.
+    /// `ProvisionsAdmitted` continuation triggers admission.
     pub(super) fn process_provision_fetch_outputs(
         &self,
         outputs: Vec<

@@ -513,7 +513,7 @@ impl StateMachine for NodeStateMachine {
             } => {
                 // Route through the centralized remote header coordinator.
                 // It performs structural pre-checks and dispatches QC verification.
-                // Downstream consumers receive headers via RemoteHeaderVerified.
+                // Downstream consumers receive headers via RemoteHeaderAdmitted.
                 let header = Arc::new(committed_header);
                 let topology = self.topology.snapshot();
                 self.remote_headers
@@ -552,7 +552,7 @@ impl StateMachine for NodeStateMachine {
                 header,
                 valid,
             ),
-            ProtocolEvent::RemoteHeaderVerified { committed_header } => {
+            ProtocolEvent::RemoteHeaderAdmitted { committed_header } => {
                 // Fan out verified header to downstream consumers.
                 // BFT already received the header in RemoteHeaderQcVerified
                 // (early insertion for deferral proof validation).
@@ -634,7 +634,7 @@ impl StateMachine for NodeStateMachine {
                 valid,
                 self.now,
             ),
-            ProtocolEvent::ProvisionsVerified { provisions, .. } => {
+            ProtocolEvent::ProvisionsAdmitted { provisions, .. } => {
                 let mut actions = self
                     .bft
                     .on_provisions_admitted(self.topology.snapshot(), &[provisions]);
@@ -794,9 +794,9 @@ impl StateMachine for NodeStateMachine {
             | ProtocolEvent::ShardSplitComplete { .. }
             | ProtocolEvent::ShardMergeInitiated { .. }
             | ProtocolEvent::ShardMergeComplete { .. }
-            // Pure admission signal — io_loop drains the exec-cert fetch
-            // protocol via the `Continuation` interception arm; the state
-            // machine itself has nothing to do here.
+            // Pure admission signal — `io_loop`'s `Continuation` interception
+            // arm drains the exec-cert fetch protocol; the state machine
+            // itself has nothing to do here.
             | ProtocolEvent::ExecutionCertificateAdmitted { .. } => vec![],
 
             ProtocolEvent::FinalizedWavesAdmitted { waves } => self

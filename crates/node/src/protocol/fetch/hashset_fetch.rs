@@ -3,8 +3,9 @@
 //! Tracks a set of items per scope (e.g. tx hashes per block). Each `Send`
 //! output covers a *chunk* of the missing set; the protocol limits both the
 //! per-scope concurrency and the parallel-chunks-per-tick fan-out. The
-//! scope's entry self-evicts when its missing set drains, either by direct
-//! per-id admission or a scope-level admission signal.
+//! scope's entry self-evicts once its missing set drains via per-id
+//! `Admitted` signals; abandoned scopes are evicted by callers via
+//! `evict_abandoned`.
 
 use super::peer_rotator::PeerRotator;
 use hyperscale_types::ValidatorId;
@@ -191,16 +192,16 @@ impl<S: Eq + Hash + Ord + Clone + std::fmt::Debug, Id: Eq + Hash + Clone + std::
         self.pending.len()
     }
 
-    /// Drop every scope for which `is_stale` returns `true` and prune the
+    /// Drop every scope for which `is_abandoned` returns `true` and prune the
     /// reverse index of the ids those scopes owned.
-    pub fn evict_stale<F>(&mut self, mut is_stale: F)
+    pub fn evict_abandoned<F>(&mut self, mut is_abandoned: F)
     where
         F: FnMut(&S) -> bool,
     {
         let evicted: Vec<S> = self
             .pending
             .keys()
-            .filter(|s| is_stale(s))
+            .filter(|s| is_abandoned(s))
             .cloned()
             .collect();
         for scope in evicted {

@@ -317,7 +317,7 @@ impl ProvisionCoordinator {
 
     /// Handle a verified remote header from the `RemoteHeaderCoordinator`.
     ///
-    /// Called when `RemoteHeaderVerified` is received. The header has already
+    /// Called when `RemoteHeaderAdmitted` is received. The header has already
     /// passed QC verification, so we store it directly as verified and:
     /// 1. Register expected provisions if waves target our shard
     /// 2. Join with any buffered provisions waiting for this header
@@ -544,7 +544,7 @@ impl ProvisionCoordinator {
         // Clear expected-provision tracking and the matching header. The
         // header's only job — verify these provisions — is done; hanging on
         // to it wastes memory. Any in-flight fallback fetch self-cancels
-        // via the `ProvisionsVerified` continuation, which the io_loop
+        // via the `ProvisionsAdmitted` continuation, which the io_loop
         // turns into an admission signal on the provision fetch protocol.
         if let Some(header) = committed_header {
             let shard = header.header.shard_group_id;
@@ -599,9 +599,9 @@ impl ProvisionCoordinator {
             "Provisions verified and queued"
         );
 
-        // Emit ProvisionsVerified for downstream consumption. The source
+        // Emit ProvisionsAdmitted for downstream consumption. The source
         // block timestamp anchors retention in the io-loop provision cache.
-        actions.push(Action::Continuation(ProtocolEvent::ProvisionsVerified {
+        actions.push(Action::Continuation(ProtocolEvent::ProvisionsAdmitted {
             provisions: Arc::clone(&provisions),
             source_block_ts,
         }));
@@ -995,10 +995,10 @@ mod tests {
             LocalTimestamp::ZERO,
         );
 
-        // Should emit ProvisionsVerified
+        // Should emit ProvisionsAdmitted
         assert!(actions.iter().any(|a| matches!(
             a,
-            Action::Continuation(ProtocolEvent::ProvisionsVerified { provisions, .. })
+            Action::Continuation(ProtocolEvent::ProvisionsAdmitted { provisions, .. })
             if provisions.transactions[0].tx_hash == tx_hash
         )));
     }
@@ -1025,10 +1025,10 @@ mod tests {
             LocalTimestamp::ZERO,
         );
 
-        // Should NOT emit ProvisionsVerified
+        // Should NOT emit ProvisionsAdmitted
         assert!(!actions.iter().any(|a| matches!(
             a,
-            Action::Continuation(ProtocolEvent::ProvisionsVerified { .. })
+            Action::Continuation(ProtocolEvent::ProvisionsAdmitted { .. })
         )));
     }
 
@@ -1222,10 +1222,10 @@ mod tests {
             LocalTimestamp::ZERO,
         );
 
-        // Verification failed — no ProvisionsVerified emitted
+        // Verification failed — no ProvisionsAdmitted emitted
         assert!(!actions.iter().any(|a| matches!(
             a,
-            Action::Continuation(ProtocolEvent::ProvisionsVerified { .. })
+            Action::Continuation(ProtocolEvent::ProvisionsAdmitted { .. })
         )));
     }
 
@@ -1556,7 +1556,7 @@ mod tests {
         );
 
         // Expected-tracking entry is cleared; the io_loop's
-        // `ProvisionsVerified` interception drives any in-flight fetch
+        // `ProvisionsAdmitted` interception drives any in-flight fetch
         // admission downstream.
         assert_eq!(coordinator.expected.len(), 0);
     }

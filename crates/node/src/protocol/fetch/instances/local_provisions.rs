@@ -14,18 +14,18 @@ pub type Scope = BlockHash;
 /// The typed fetch protocol instance for local provisions.
 pub type LocalProvisionFetch = HashSetFetch<Scope, ProvisionHash>;
 
-/// A scope is stale once BFT no longer holds a pending block for it.
+/// A scope is abandoned once BFT no longer holds a pending block for it.
 #[must_use]
-pub fn is_stale(state: &NodeStateMachine, scope: &Scope) -> bool {
+pub fn is_abandoned(state: &NodeStateMachine, scope: &Scope) -> bool {
     !state.bft().has_pending_block(*scope)
 }
 
 /// Drain admitted ids from the fetch protocol on the canonical admission
-/// event. Listens to `ProvisionsVerified` (per-provision admission) — same
+/// event. Listens to `ProvisionsAdmitted` (per-provision admission) — same
 /// event the cross-shard `ProvisionFetch` uses, but keyed by provision hash
 /// rather than `(source_shard, block_height)` scope.
 pub fn apply_admission(fetch: &mut LocalProvisionFetch, event: &ProtocolEvent) {
-    if let ProtocolEvent::ProvisionsVerified { provisions, .. } = event {
+    if let ProtocolEvent::ProvisionsAdmitted { provisions, .. } = event {
         fetch.handle(HashSetFetchInput::Admitted {
             ids: vec![provisions.hash()],
         });

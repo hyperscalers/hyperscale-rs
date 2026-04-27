@@ -14,9 +14,9 @@ pub type Scope = BlockHash;
 /// The typed fetch protocol instance for finalized waves.
 pub type FinalizedWaveFetch = HashSetFetch<Scope, WaveIdHash>;
 
-/// A scope is stale once BFT no longer holds a pending block for it.
+/// A scope is abandoned once BFT no longer holds a pending block for it.
 #[must_use]
-pub fn is_stale(state: &NodeStateMachine, scope: &Scope) -> bool {
+pub fn is_abandoned(state: &NodeStateMachine, scope: &Scope) -> bool {
     !state.bft().has_pending_block(*scope)
 }
 

@@ -195,7 +195,7 @@ pub enum ProtocolEvent {
     /// Emitted by `RemoteHeaderCoordinator` as a continuation after QC verification.
     /// Downstream consumers (BFT, Provision, Execution) use this as their single
     /// source of verified remote headers.
-    RemoteHeaderVerified {
+    RemoteHeaderAdmitted {
         /// The fully-verified committed header.
         committed_header: Arc<CommittedBlockHeader>,
     },
@@ -240,7 +240,7 @@ pub enum ProtocolEvent {
     /// source shard's committing QC. Downstream consumers (notably the
     /// io-loop provision cache) anchor retention on this so eviction is
     /// deterministic across validators.
-    ProvisionsVerified {
+    ProvisionsAdmitted {
         /// Verified provisions batch.
         provisions: Arc<Provisions>,
         /// BFT-authenticated weighted timestamp of the source shard's committing QC.
@@ -396,7 +396,7 @@ pub enum ProtocolEvent {
     /// - state.rs forwards the event to `bft.on_transactions_admitted`, which
     ///   populates any pending block waiting on these hashes.
     ///
-    /// Same shape as `RemoteHeaderVerified` / `ProvisionsVerified` —
+    /// Same shape as `RemoteHeaderAdmitted` / `ProvisionsAdmitted` —
     /// the canonical-store admission story is uniform across payloads.
     TransactionsAdmitted {
         /// Transactions newly admitted to mempool on this admission call.

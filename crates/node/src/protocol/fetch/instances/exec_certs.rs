@@ -16,11 +16,11 @@ pub type Scope = (ShardGroupId, BlockHeight);
 /// The typed fetch protocol instance for execution certificates.
 pub type ExecCertFetch = HashSetFetch<Scope, WaveId>;
 
-/// A scope is stale once the local committed height has advanced past it:
+/// A scope is abandoned once the local committed height has advanced past it:
 /// the source block has been superseded and any cert we'd fetch can no
 /// longer make a difference.
 #[must_use]
-pub fn is_stale(state: &NodeStateMachine, scope: &Scope) -> bool {
+pub fn is_abandoned(state: &NodeStateMachine, scope: &Scope) -> bool {
     let (_, height) = *scope;
     state.bft().committed_height() >= height
 }

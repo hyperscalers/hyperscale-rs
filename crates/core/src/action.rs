@@ -757,7 +757,7 @@ pub enum Action {
     /// `io_loop`'s dispatcher matches the inner [`FetchRequest`] and dispatches
     /// to the corresponding `instances/*.rs` module. Cancellation is driven
     /// by admission events (`Continuation(*Admitted/*Verified)`) and the
-    /// per-instance `is_stale` predicate, not by separate cancel actions.
+    /// per-instance `is_abandoned` predicate, not by separate cancel actions.
     Fetch(FetchRequest),
 }
 
