@@ -26,9 +26,7 @@ impl ApplicationEvent {
 ///
 /// Cost fields are stored as SBOR-encoded Decimals (raw bytes) to avoid
 /// a direct dependency on the Decimal type in the types crate.
-//
-// Fee fields are SBOR-encoded `Decimal` raw bytes; the field names ARE the documentation.
-#[allow(missing_docs)]
+#[allow(missing_docs)] // the field names are the documentation
 #[derive(Debug, Clone, PartialEq, Eq, sbor::prelude::BasicSbor)]
 pub struct FeeSummary {
     pub total_execution_cost: Vec<u8>,

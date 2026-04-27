@@ -122,9 +122,8 @@ pub struct StepOutput {
 ///
 /// Produced by [`IoLoop::status_snapshot()`] on the periodic metrics tick.
 /// The production runner maps this into its RPC shared state types.
-// Fields are flat metric/state readouts; their names are the documentation.
 #[derive(Debug, Clone)]
-#[allow(missing_docs)]
+#[allow(missing_docs)] // flat readouts; field names are the documentation
 pub struct NodeStatusSnapshot {
     pub committed_height: BlockHeight,
     pub view: u64,
