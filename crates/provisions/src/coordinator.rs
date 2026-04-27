@@ -541,8 +541,9 @@ impl ProvisionCoordinator {
 
         // Clear expected-provision tracking and the matching header. The
         // header's only job — verify these provisions — is done; hanging on
-        // to it wastes memory. Cancel any in-flight fallback fetch to
-        // prevent duplicate delivery.
+        // to it wastes memory. Any in-flight fallback fetch self-cancels
+        // via the `ProvisionsVerified` continuation, which the io_loop
+        // turns into an admission signal on the provision fetch protocol.
         if let Some(header) = committed_header {
             let shard = header.header.shard_group_id;
             let height = header.header.height;
@@ -550,10 +551,6 @@ impl ProvisionCoordinator {
 
             if self.expected.on_provisions_verified(shard, height) {
                 self.headers.remove(key);
-                actions.push(Action::CancelProvisionsFetch {
-                    source_shard: shard,
-                    block_height: height,
-                });
             }
         }
 
@@ -1515,17 +1512,16 @@ mod tests {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    // CancelProvisionsFetch Tests
+    // Verified-provisions clear expected tracking
     // ═══════════════════════════════════════════════════════════════════════
 
     #[test]
-    fn test_verified_provisions_emit_cancel_fetch() {
+    fn test_verified_provisions_clear_expected_tracking() {
         let topology = make_test_topology(ShardGroupId(0));
         let mut coordinator = ProvisionCoordinator::new();
 
         let source_shard = ShardGroupId(1);
 
-        // Remote header targeting our shard — creates expected_provision entry
         let header = make_committed_header_with_targets(
             source_shard,
             BlockHeight(10),
@@ -1534,7 +1530,6 @@ mod tests {
         coordinator.on_verified_remote_header(&topology, &header);
         assert_eq!(coordinator.expected.len(), 1);
 
-        // Batch arrives and is verified
         let provisions = make_provisions(
             TxHash::from_raw(Hash::from_bytes(b"tx1")),
             source_shard,
@@ -1542,7 +1537,7 @@ mod tests {
             BlockHeight(10),
         );
         coordinator.on_state_provisions_received(&topology, provisions.clone());
-        let actions = coordinator.on_state_provisions_verified(
+        coordinator.on_state_provisions_verified(
             &topology,
             provisions,
             Some(&header),
@@ -1550,17 +1545,10 @@ mod tests {
             LocalTimestamp::ZERO,
         );
 
-        // Should emit CancelProvisionsFetch action
-        assert!(
-            actions.iter().any(|a| matches!(
-                a,
-                Action::CancelProvisionsFetch {
-                    source_shard: s,
-                    block_height: h,
-                } if *s == source_shard && *h == BlockHeight(10)
-            )),
-            "Should emit CancelProvisionsFetch when expected provision is verified"
-        );
+        // Expected-tracking entry is cleared; the io_loop's
+        // `ProvisionsVerified` interception drives any in-flight fetch
+        // admission downstream.
+        assert_eq!(coordinator.expected.len(), 0);
     }
 
     // ═══════════════════════════════════════════════════════════════════════

@@ -198,12 +198,6 @@ pub enum NodeInput {
         batches: Vec<(Provisions, Vec<ValidatorId>)>,
     },
 
-    /// Provision successfully received from a provision fetch request.
-    ProvisionsFetchReceived {
-        /// Provision batch returned by the peer.
-        provisions: Provisions,
-    },
-
     /// A provision fetch request failed (network error or peer returned None).
     ProvisionsFetchFailed {
         /// Source shard whose provisions were being fetched.
@@ -228,16 +222,6 @@ pub enum NodeInput {
         source_shard: ShardGroupId,
         /// Block height that failed to return certs.
         block_height: BlockHeight,
-    },
-
-    /// Committed block header successfully fetched from a source shard.
-    HeaderFetchReceived {
-        /// Source shard the header was fetched from.
-        source_shard: ShardGroupId,
-        /// Starting height of the requested header range.
-        from_height: BlockHeight,
-        /// Committed block header returned.
-        header: CommittedBlockHeader,
     },
 
     /// A committed block header fetch request failed.
@@ -296,11 +280,9 @@ impl NodeInput {
             Self::CommittedHeaderValidated { .. } => EventPriority::Internal,
             Self::CommittedBlockGossipReceived { .. } => EventPriority::Network,
             Self::ProvisionsReady { .. } => EventPriority::Internal,
-            Self::ProvisionsFetchReceived { .. } => EventPriority::Internal,
             Self::ProvisionsFetchFailed { .. } => EventPriority::Internal,
             Self::ExecCertFetchReceived { .. } => EventPriority::Internal,
             Self::ExecCertFetchFailed { .. } => EventPriority::Internal,
-            Self::HeaderFetchReceived { .. } => EventPriority::Internal,
             Self::HeaderFetchFailed { .. } => EventPriority::Internal,
             Self::LocalProvisionReceived { .. } => EventPriority::Internal,
             Self::LocalProvisionsFetchFailed { .. } => EventPriority::Internal,
@@ -345,11 +327,9 @@ impl NodeInput {
             Self::CommittedHeaderValidated { .. } => "CommittedHeaderValidated",
             Self::CommittedBlockGossipReceived { .. } => "CommittedBlockGossipReceived",
             Self::ProvisionsReady { .. } => "ProvisionsReady",
-            Self::ProvisionsFetchReceived { .. } => "ProvisionsFetchReceived",
             Self::ProvisionsFetchFailed { .. } => "ProvisionsFetchFailed",
             Self::ExecCertFetchReceived { .. } => "ExecCertFetchReceived",
             Self::ExecCertFetchFailed { .. } => "ExecCertFetchFailed",
-            Self::HeaderFetchReceived { .. } => "HeaderFetchReceived",
             Self::HeaderFetchFailed { .. } => "HeaderFetchFailed",
             Self::LocalProvisionReceived { .. } => "LocalProvisionReceived",
             Self::LocalProvisionsFetchFailed { .. } => "LocalProvisionsFetchFailed",

@@ -817,18 +817,6 @@ pub enum Action {
         block_hash: BlockHash,
     },
 
-    /// Cancel a pending provision fetch request.
-    ///
-    /// Emitted by `ProvisionCoordinator` when proactive provisions are verified
-    /// before the fallback fetch completes. This prevents the fallback response
-    /// from delivering duplicate provisions that would leak memory.
-    CancelProvisionsFetch {
-        /// The shard whose provisions were fetched.
-        source_shard: ShardGroupId,
-        /// The block height of the provisions.
-        block_height: BlockHeight,
-    },
-
     /// Request a missing execution certificate from a source shard.
     ///
     /// Emitted when an expected execution cert hasn't arrived within the timeout.
@@ -854,18 +842,6 @@ pub enum Action {
         source_shard: ShardGroupId,
         /// Block height of the EC that no longer needs fetching.
         block_height: BlockHeight,
-    },
-
-    /// Cancel an in-flight remote-header fetch because the header arrived
-    /// through another path (gossip).
-    ///
-    /// Without this, the fetch protocol would keep retrying forever even
-    /// after the gap was closed by a gossip-delivered header.
-    CancelCommittedHeaderFetch {
-        /// Source shard whose header fetch should be cancelled.
-        source_shard: ShardGroupId,
-        /// Starting height of the header range that no longer needs fetching.
-        from_height: BlockHeight,
     },
 
     /// Request missing provisions from a source shard via cross-shard request.

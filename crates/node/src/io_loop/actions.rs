@@ -4,13 +4,9 @@ use super::IoLoop;
 use super::TimerOp;
 use super::block_commit::{AccumulateDecision, PendingCommit};
 use crate::action_handler::{self, ActionContext, DispatchPool};
-use crate::protocol::execution_cert_fetch::ExecCertFetchInput;
-use crate::protocol::finalized_wave_fetch::FinalizedWaveFetchInput;
-use crate::protocol::header_fetch::HeaderFetchInput;
-use crate::protocol::local_provision_fetch::LocalProvisionFetchInput;
-use crate::protocol::provision_fetch::ProvisionFetchInput;
+use crate::protocol::fetch::instances::{exec_certs, headers, provisions};
+use crate::protocol::fetch::{HashSetFetchInput, PeerSource, ScopeFetchInput};
 use crate::protocol::sync::SyncInput;
-use crate::protocol::transaction_fetch::TransactionFetchInput;
 use hyperscale_core::{Action, CommitSource, NodeInput, ProtocolEvent, StateMachine};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::Engine;
@@ -47,6 +43,23 @@ where
             // Internal events
             // ═══════════════════════════════════════════════════════════
             Action::Continuation(pe) => {
+                match &pe {
+                    ProtocolEvent::RemoteHeaderVerified { committed_header } => {
+                        let scope = headers::scope_for(
+                            committed_header.shard_group_id(),
+                            committed_header.height(),
+                        );
+                        self.header_fetch
+                            .handle(ScopeFetchInput::Admitted { scope });
+                    }
+                    ProtocolEvent::ProvisionsVerified { provisions, .. } => {
+                        let scope =
+                            provisions::scope_for(provisions.source_shard, provisions.block_height);
+                        self.provision_fetch
+                            .handle(ScopeFetchInput::Admitted { scope });
+                    }
+                    _ => {}
+                }
                 let _ = self.event_sender.send(NodeInput::Protocol(pe));
             }
 
@@ -353,9 +366,7 @@ where
             | Action::FetchProvisionsRemote { .. }
             | Action::RequestMissingExecutionCert { .. }
             | Action::CancelExecutionCertFetch { .. }
-            | Action::CancelProvisionsFetch { .. }
-            | Action::RequestMissingCommittedBlockHeader { .. }
-            | Action::CancelCommittedHeaderFetch { .. } => {
+            | Action::RequestMissingCommittedBlockHeader { .. } => {
                 self.process_sync_fetch_action(action);
             }
 
@@ -582,16 +593,12 @@ where
                 proposer,
                 tx_hashes,
             } => {
-                self.transaction_fetch_protocol.handle(
-                    TransactionFetchInput::RequestTransactions {
-                        block_hash,
-                        proposer,
-                        tx_hashes,
-                    },
-                );
-                let outputs = self
-                    .transaction_fetch_protocol
-                    .handle(TransactionFetchInput::Tick);
+                self.transaction_fetch.handle(HashSetFetchInput::Request {
+                    scope: block_hash,
+                    ids: tx_hashes,
+                    peers: PeerSource::Pinned(proposer),
+                });
+                let outputs = self.transaction_fetch.handle(HashSetFetchInput::Tick);
                 self.process_transaction_fetch_outputs(outputs);
                 self.update_fetch_tick_timer();
             }
@@ -600,15 +607,13 @@ where
                 proposer,
                 batch_hashes,
             } => {
-                self.local_provision_fetch_protocol
-                    .handle(LocalProvisionFetchInput::Request {
-                        block_hash,
-                        proposer,
-                        batch_hashes,
+                self.local_provision_fetch
+                    .handle(HashSetFetchInput::Request {
+                        scope: block_hash,
+                        ids: batch_hashes,
+                        peers: PeerSource::Pinned(proposer),
                     });
-                let tick_outputs = self
-                    .local_provision_fetch_protocol
-                    .handle(LocalProvisionFetchInput::Tick);
+                let tick_outputs = self.local_provision_fetch.handle(HashSetFetchInput::Tick);
                 self.process_local_provision_fetch_outputs(tick_outputs);
                 self.update_fetch_tick_timer();
             }
@@ -618,28 +623,26 @@ where
                 wave_id_hashes,
                 peers,
             } => {
-                self.finalized_wave_fetch_protocol
-                    .handle(FinalizedWaveFetchInput::Request {
-                        block_hash,
-                        proposer,
-                        wave_id_hashes,
-                        peers,
+                self.finalized_wave_fetch
+                    .handle(HashSetFetchInput::Request {
+                        scope: block_hash,
+                        ids: wave_id_hashes,
+                        peers: PeerSource::Rotation {
+                            preferred: proposer,
+                            rest: peers,
+                        },
                     });
-                let tick_outputs =
-                    self.finalized_wave_fetch_protocol
-                        .handle(FinalizedWaveFetchInput::Tick {
-                            now: std::time::Instant::now(),
-                        });
+                let tick_outputs = self.finalized_wave_fetch.handle(HashSetFetchInput::Tick);
                 self.process_finalized_wave_fetch_outputs(tick_outputs);
                 self.update_fetch_tick_timer();
             }
             Action::CancelFetch { block_hash } => {
-                self.transaction_fetch_protocol
-                    .handle(TransactionFetchInput::CancelFetch { block_hash });
-                self.local_provision_fetch_protocol
-                    .handle(LocalProvisionFetchInput::CancelFetch { block_hash });
-                self.finalized_wave_fetch_protocol
-                    .handle(FinalizedWaveFetchInput::CancelFetch { block_hash });
+                self.transaction_fetch
+                    .handle(HashSetFetchInput::AdmittedScope { scope: block_hash });
+                self.local_provision_fetch
+                    .handle(HashSetFetchInput::AdmittedScope { scope: block_hash });
+                self.finalized_wave_fetch
+                    .handle(HashSetFetchInput::AdmittedScope { scope: block_hash });
             }
             Action::FetchProvisionsRemote {
                 source_shard,
@@ -661,43 +664,30 @@ where
                     peer_count = peers.len(),
                     "Requesting missing provisions from source shard"
                 );
-                let outputs = self
-                    .provision_fetch_protocol
-                    .handle(ProvisionFetchInput::Request {
-                        source_shard,
-                        block_height,
-                        target_shard: self.local_shard,
-                        peers,
-                        preferred_peer: proposer,
-                    });
+                // Put the proposer first so the rotator tries them on the
+                // first attempt; everyone else fills out the fallback order.
+                let mut ordered_peers = Vec::with_capacity(peers.len());
+                ordered_peers.push(proposer);
+                ordered_peers.extend(peers.into_iter().filter(|p| *p != proposer));
+                let scope = provisions::scope_for(source_shard, block_height);
+                let outputs = self.provision_fetch.handle(ScopeFetchInput::Request {
+                    scope,
+                    peers: ordered_peers,
+                });
                 self.process_provision_fetch_outputs(outputs);
-                let tick_outputs =
-                    self.provision_fetch_protocol
-                        .handle(ProvisionFetchInput::Tick {
-                            now: std::time::Instant::now(),
-                        });
+                let tick_outputs = self.provision_fetch.handle(ScopeFetchInput::Tick {
+                    now: std::time::Instant::now(),
+                });
                 self.process_provision_fetch_outputs(tick_outputs);
                 self.update_fetch_tick_timer();
-            }
-            Action::CancelProvisionsFetch {
-                source_shard,
-                block_height,
-            } => {
-                self.provision_fetch_protocol
-                    .handle(ProvisionFetchInput::Cancel {
-                        source_shard,
-                        block_height,
-                    });
             }
             Action::CancelExecutionCertFetch {
                 source_shard,
                 block_height,
             } => {
-                self.exec_cert_fetch_protocol
-                    .handle(ExecCertFetchInput::Cancel {
-                        source_shard,
-                        block_height,
-                    });
+                let scope = exec_certs::scope_for(source_shard, block_height);
+                self.exec_cert_fetch
+                    .handle(HashSetFetchInput::AdmittedScope { scope });
             }
             Action::RequestMissingExecutionCert {
                 source_shard,
@@ -712,32 +702,23 @@ where
                     peer_count = peers.len(),
                     "Requesting missing execution cert from source shard"
                 );
-                let outputs = self
-                    .exec_cert_fetch_protocol
-                    .handle(ExecCertFetchInput::Request {
-                        source_shard,
-                        block_height,
-                        wave_id,
-                        peers,
+                let scope = exec_certs::scope_for(source_shard, block_height);
+                // Rotation pool, shuffled with no preferred head — every peer
+                // in the source committee can serve any wave's cert equally.
+                let (preferred, rest) = peers
+                    .split_first()
+                    .map_or((hyperscale_types::ValidatorId(0), vec![]), |(p, r)| {
+                        (*p, r.to_vec())
                     });
+                let outputs = self.exec_cert_fetch.handle(HashSetFetchInput::Request {
+                    scope,
+                    ids: vec![wave_id],
+                    peers: PeerSource::Rotation { preferred, rest },
+                });
                 self.process_exec_cert_fetch_outputs(outputs);
-                let tick_outputs = self
-                    .exec_cert_fetch_protocol
-                    .handle(ExecCertFetchInput::Tick {
-                        now: std::time::Instant::now(),
-                        committed_height: self.state.bft().committed_height(),
-                    });
+                let tick_outputs = self.exec_cert_fetch.handle(HashSetFetchInput::Tick);
                 self.process_exec_cert_fetch_outputs(tick_outputs);
                 self.update_fetch_tick_timer();
-            }
-            Action::CancelCommittedHeaderFetch {
-                source_shard,
-                from_height,
-            } => {
-                self.header_fetch_protocol.handle(HeaderFetchInput::Cancel {
-                    source_shard,
-                    from_height,
-                });
             }
             Action::RequestMissingCommittedBlockHeader {
                 source_shard,
@@ -750,15 +731,12 @@ where
                     peer_count = peers.len(),
                     "Requesting missing committed block header from source shard"
                 );
+                let scope = headers::scope_for(source_shard, from_height);
                 let outputs = self
-                    .header_fetch_protocol
-                    .handle(HeaderFetchInput::Request {
-                        source_shard,
-                        from_height,
-                        peers,
-                    });
+                    .header_fetch
+                    .handle(ScopeFetchInput::Request { scope, peers });
                 self.process_header_fetch_outputs(outputs);
-                let tick_outputs = self.header_fetch_protocol.handle(HeaderFetchInput::Tick {
+                let tick_outputs = self.header_fetch.handle(ScopeFetchInput::Tick {
                     now: std::time::Instant::now(),
                 });
                 self.process_header_fetch_outputs(tick_outputs);

@@ -32,15 +32,16 @@ use crate::batch_accumulator::BatchAccumulator;
 use crate::config::NodeConfig;
 use crate::io_loop::block_commit::BlockCommitCoordinator;
 use crate::io_loop::caches::SharedCaches;
-use crate::protocol::execution_cert_fetch::{ExecCertFetchInput, ExecCertFetchProtocol};
-use crate::protocol::finalized_wave_fetch::{FinalizedWaveFetchInput, FinalizedWaveFetchProtocol};
-use crate::protocol::header_fetch::{HeaderFetchInput, HeaderFetchProtocol};
-use crate::protocol::local_provision_fetch::{
-    LocalProvisionFetchInput, LocalProvisionFetchProtocol,
-};
-use crate::protocol::provision_fetch::{ProvisionFetchInput, ProvisionFetchProtocol};
+use crate::protocol::fetch::hashset_fetch::HashSetFetchConfig;
+use crate::protocol::fetch::instances::exec_certs::{self, ExecCertFetch};
+use crate::protocol::fetch::instances::finalized_waves::FinalizedWaveFetch;
+use crate::protocol::fetch::instances::headers::{self, HeaderFetch};
+use crate::protocol::fetch::instances::local_provisions::LocalProvisionFetch;
+use crate::protocol::fetch::instances::provisions::{self, ProvisionFetch};
+use crate::protocol::fetch::instances::transactions::TransactionFetch;
+use crate::protocol::fetch::scope_fetch::ScopeFetchConfig;
+use crate::protocol::fetch::{HashSetFetchInput, ScopeFetchInput};
 use crate::protocol::sync::{SyncInput, SyncProtocol, SyncStatus};
-use crate::protocol::transaction_fetch::{TransactionFetchInput, TransactionFetchProtocol};
 use arc_swap::ArcSwap;
 use hyperscale_core::{Action, NodeInput, ProtocolEvent, StateMachine, TimerId};
 use hyperscale_dispatch::Dispatch;
@@ -261,22 +262,22 @@ where
         HashMap<BlockHeight, Box<hyperscale_messages::response::ElidedCertifiedBlock>>,
 
     // Fetch protocol (transaction/certificate fetching with chunking and retry)
-    transaction_fetch_protocol: TransactionFetchProtocol,
+    transaction_fetch: TransactionFetch,
 
     // Local provision fetch protocol (intra-shard provisions fetching)
-    local_provision_fetch_protocol: LocalProvisionFetchProtocol,
+    local_provision_fetch: LocalProvisionFetch,
 
     // Finalized wave fetch protocol (intra-shard wave data fetching)
-    finalized_wave_fetch_protocol: FinalizedWaveFetchProtocol,
+    finalized_wave_fetch: FinalizedWaveFetch,
 
     // Provision fetch protocol (cross-shard provision fetching with peer rotation)
-    provision_fetch_protocol: ProvisionFetchProtocol,
+    provision_fetch: ProvisionFetch,
 
     // Execution certificate fetch protocol (cross-shard exec cert fetching with peer rotation)
-    exec_cert_fetch_protocol: ExecCertFetchProtocol,
+    exec_cert_fetch: ExecCertFetch,
 
     // Committed block header fetch protocol (cross-shard header fetching with peer rotation)
-    header_fetch_protocol: HeaderFetchProtocol,
+    header_fetch: HeaderFetch,
 
     // Transaction validation
     tx_validator: Arc<TransactionValidation>,
@@ -332,18 +333,20 @@ where
         let initial_persisted_height = state.bft().committed_height();
         let b = &config.batch;
         let sync_protocol = SyncProtocol::new(config.sync.clone());
-        let transaction_fetch_protocol =
-            TransactionFetchProtocol::new(config.transaction_fetch.clone());
-        let local_provision_fetch_protocol = LocalProvisionFetchProtocol::new(
-            crate::protocol::local_provision_fetch::LocalProvisionFetchConfig::default(),
-        );
-        let finalized_wave_fetch_protocol = FinalizedWaveFetchProtocol::new(
-            crate::protocol::finalized_wave_fetch::FinalizedWaveFetchConfig::default(),
-        );
-        let provision_fetch_protocol = ProvisionFetchProtocol::new(config.provision_fetch.clone());
-        let exec_cert_fetch_protocol = ExecCertFetchProtocol::new(config.exec_cert_fetch.clone());
-        let header_fetch_protocol =
-            HeaderFetchProtocol::new(crate::protocol::header_fetch::HeaderFetchConfig::default());
+        let transaction_fetch = TransactionFetch::new(config.transaction_fetch.clone());
+        let local_provision_fetch = LocalProvisionFetch::new(HashSetFetchConfig {
+            max_concurrent_per_scope: 4,
+            max_ids_per_request: 16,
+            parallel_chunks_per_tick: 2,
+        });
+        let finalized_wave_fetch = FinalizedWaveFetch::new(HashSetFetchConfig {
+            max_concurrent_per_scope: 2,
+            max_ids_per_request: 4,
+            parallel_chunks_per_tick: 1,
+        });
+        let provision_fetch = ProvisionFetch::new(&config.provision_fetch);
+        let exec_cert_fetch = ExecCertFetch::new(config.exec_cert_fetch.clone());
+        let header_fetch = HeaderFetch::new(&ScopeFetchConfig::default());
         let storage = Arc::new(storage);
         let pending_chain = Arc::new(hyperscale_storage::PendingChain::new(Arc::clone(&storage)));
         let caches = SharedCaches::new(Arc::clone(state.provisions().store()));
@@ -367,12 +370,12 @@ where
             pending_validation: HashSet::new(),
             locally_submitted: HashSet::new(),
             sync_protocol,
-            transaction_fetch_protocol,
-            local_provision_fetch_protocol,
-            finalized_wave_fetch_protocol,
-            provision_fetch_protocol,
-            exec_cert_fetch_protocol,
-            header_fetch_protocol,
+            transaction_fetch,
+            local_provision_fetch,
+            finalized_wave_fetch,
+            provision_fetch,
+            exec_cert_fetch,
+            header_fetch,
             validation_batch: BatchAccumulator::new(b.tx_validation_max, b.tx_validation_window),
             committed_header_batch: BatchAccumulator::new(
                 b.committed_header_max,
@@ -655,61 +658,55 @@ where
                 block_hash,
                 transactions,
             } => {
-                let outputs = self.transaction_fetch_protocol.handle(
-                    TransactionFetchInput::TransactionsReceived {
+                // Drain delivered ids from the fetch protocol's in-flight
+                // tracking, then feed them to the state machine the same
+                // way gossip-delivered transactions arrive.
+                let ids: Vec<_> = transactions.iter().map(|tx| tx.hash()).collect();
+                self.transaction_fetch
+                    .handle(HashSetFetchInput::Admitted { ids });
+                if !transactions.is_empty() {
+                    self.feed_event(ProtocolEvent::TransactionFetchDelivered {
                         block_hash,
                         transactions,
-                    },
-                );
-                self.process_transaction_fetch_outputs(outputs);
+                    });
+                }
             }
 
             NodeInput::FetchTransactionsFailed { block_hash, hashes } => {
-                let outputs = self
-                    .transaction_fetch_protocol
-                    .handle(TransactionFetchInput::FetchFailed { block_hash, hashes });
-                self.process_transaction_fetch_outputs(outputs);
+                self.transaction_fetch.handle(HashSetFetchInput::Failed {
+                    scope: block_hash,
+                    ids: hashes,
+                });
                 // Tick to retry pending fetches.
-                let tick_outputs = self
-                    .transaction_fetch_protocol
-                    .handle(TransactionFetchInput::Tick);
+                let tick_outputs = self.transaction_fetch.handle(HashSetFetchInput::Tick);
                 self.process_transaction_fetch_outputs(tick_outputs);
             }
 
             NodeInput::FetchTick => {
-                let outputs = self
-                    .transaction_fetch_protocol
-                    .handle(TransactionFetchInput::Tick);
+                let outputs = self.transaction_fetch.handle(HashSetFetchInput::Tick);
                 self.process_transaction_fetch_outputs(outputs);
                 // Also tick the local provision fetch protocol.
-                let local_prov_outputs = self
-                    .local_provision_fetch_protocol
-                    .handle(LocalProvisionFetchInput::Tick);
+                let local_prov_outputs = self.local_provision_fetch.handle(HashSetFetchInput::Tick);
                 self.process_local_provision_fetch_outputs(local_prov_outputs);
                 // Also tick the finalized wave fetch protocol.
-                let wave_outputs =
-                    self.finalized_wave_fetch_protocol
-                        .handle(FinalizedWaveFetchInput::Tick {
-                            now: std::time::Instant::now(),
-                        });
+                let wave_outputs = self.finalized_wave_fetch.handle(HashSetFetchInput::Tick);
                 self.process_finalized_wave_fetch_outputs(wave_outputs);
                 // Also tick the provision fetch protocol.
-                let prov_outputs =
-                    self.provision_fetch_protocol
-                        .handle(ProvisionFetchInput::Tick {
-                            now: std::time::Instant::now(),
-                        });
+                self.provision_fetch
+                    .evict_stale(|s| provisions::is_stale(&self.state, s));
+                let prov_outputs = self.provision_fetch.handle(ScopeFetchInput::Tick {
+                    now: std::time::Instant::now(),
+                });
                 self.process_provision_fetch_outputs(prov_outputs);
                 // Also tick the exec cert fetch protocol.
-                let cert_outputs = self
-                    .exec_cert_fetch_protocol
-                    .handle(ExecCertFetchInput::Tick {
-                        now: std::time::Instant::now(),
-                        committed_height: self.state.bft().committed_height(),
-                    });
+                self.exec_cert_fetch
+                    .evict_stale(|s| exec_certs::is_stale(&self.state, s));
+                let cert_outputs = self.exec_cert_fetch.handle(HashSetFetchInput::Tick);
                 self.process_exec_cert_fetch_outputs(cert_outputs);
                 // Also tick the header fetch protocol.
-                let header_outputs = self.header_fetch_protocol.handle(HeaderFetchInput::Tick {
+                self.header_fetch
+                    .evict_stale(|s| headers::is_stale(&self.state, s));
+                let header_outputs = self.header_fetch.handle(ScopeFetchInput::Tick {
                     now: std::time::Instant::now(),
                 });
                 self.process_header_fetch_outputs(header_outputs);
@@ -717,37 +714,17 @@ where
             }
 
             // ── Provision fetch protocol ──────────────────────────────
-            NodeInput::ProvisionsFetchReceived { provisions } => {
-                let source_shard = provisions.source_shard;
-                let block_height = provisions.block_height;
-                let outputs = self
-                    .provision_fetch_protocol
-                    .handle(ProvisionFetchInput::Received {
-                        source_shard,
-                        block_height,
-                        provisions,
-                    });
-                self.process_provision_fetch_outputs(outputs);
-                self.update_fetch_tick_timer();
-            }
-
             NodeInput::ProvisionsFetchFailed {
                 source_shard,
                 block_height,
             } => {
-                let outputs = self
-                    .provision_fetch_protocol
-                    .handle(ProvisionFetchInput::Failed {
-                        source_shard,
-                        block_height,
-                    });
-                self.process_provision_fetch_outputs(outputs);
+                let scope = provisions::scope_for(source_shard, block_height);
+                self.provision_fetch
+                    .handle(ScopeFetchInput::Failed { scope });
                 // Tick to retry with next peer immediately.
-                let tick_outputs =
-                    self.provision_fetch_protocol
-                        .handle(ProvisionFetchInput::Tick {
-                            now: std::time::Instant::now(),
-                        });
+                let tick_outputs = self.provision_fetch.handle(ScopeFetchInput::Tick {
+                    now: std::time::Instant::now(),
+                });
                 self.process_provision_fetch_outputs(tick_outputs);
                 self.update_fetch_tick_timer();
             }
@@ -758,14 +735,17 @@ where
                 block_height,
                 certificates,
             } => {
-                let outputs = self
-                    .exec_cert_fetch_protocol
-                    .handle(ExecCertFetchInput::Received {
-                        source_shard,
-                        block_height,
-                        certificates,
-                    });
-                self.process_exec_cert_fetch_outputs(outputs);
+                // Drain delivered wave_ids from in-flight tracking, then feed
+                // certs into the state machine the same way broadcast-arrived
+                // certs are processed.
+                let ids: Vec<_> = certificates.iter().map(|c| c.wave_id.clone()).collect();
+                self.exec_cert_fetch
+                    .handle(HashSetFetchInput::Admitted { ids });
+                for cert in certificates {
+                    self.feed_event(ProtocolEvent::ExecutionCertificateReceived { cert });
+                }
+                let _ = source_shard;
+                let _ = block_height;
                 self.update_fetch_tick_timer();
             }
 
@@ -773,52 +753,27 @@ where
                 source_shard,
                 block_height,
             } => {
-                let outputs = self
-                    .exec_cert_fetch_protocol
-                    .handle(ExecCertFetchInput::Failed {
-                        source_shard,
-                        block_height,
-                    });
-                self.process_exec_cert_fetch_outputs(outputs);
-                // Tick to retry with next peer immediately.
-                let tick_outputs = self
-                    .exec_cert_fetch_protocol
-                    .handle(ExecCertFetchInput::Tick {
-                        now: std::time::Instant::now(),
-                        committed_height: self.state.bft().committed_height(),
-                    });
+                let scope = exec_certs::scope_for(source_shard, block_height);
+                // We don't track which wave_ids the failed chunk carried — the
+                // network response just signals "nothing came back" — so
+                // surface the failure via an empty-ids `Failed`. The protocol
+                // will retry on the next tick using the rotation's next peer.
+                self.exec_cert_fetch
+                    .handle(HashSetFetchInput::Failed { scope, ids: vec![] });
+                let tick_outputs = self.exec_cert_fetch.handle(HashSetFetchInput::Tick);
                 self.process_exec_cert_fetch_outputs(tick_outputs);
                 self.update_fetch_tick_timer();
             }
 
             // ── Committed block header fetch protocol ────────────────
-            NodeInput::HeaderFetchReceived {
-                source_shard,
-                from_height,
-                header,
-            } => {
-                let outputs = self
-                    .header_fetch_protocol
-                    .handle(HeaderFetchInput::Received {
-                        source_shard,
-                        from_height,
-                        header: Box::new(header),
-                    });
-                self.process_header_fetch_outputs(outputs);
-                self.update_fetch_tick_timer();
-            }
-
             NodeInput::HeaderFetchFailed {
                 source_shard,
                 from_height,
             } => {
-                let outputs = self.header_fetch_protocol.handle(HeaderFetchInput::Failed {
-                    source_shard,
-                    from_height,
-                });
-                self.process_header_fetch_outputs(outputs);
+                let scope = headers::scope_for(source_shard, from_height);
+                self.header_fetch.handle(ScopeFetchInput::Failed { scope });
                 // Tick to retry with next peer immediately.
-                let tick_outputs = self.header_fetch_protocol.handle(HeaderFetchInput::Tick {
+                let tick_outputs = self.header_fetch.handle(ScopeFetchInput::Tick {
                     now: std::time::Instant::now(),
                 });
                 self.process_header_fetch_outputs(tick_outputs);
@@ -859,26 +814,31 @@ where
                 batches,
                 missing_hashes,
             } => {
-                let outputs = self.local_provision_fetch_protocol.handle(
-                    LocalProvisionFetchInput::Received {
-                        block_hash,
-                        batches,
-                        missing_hashes,
-                    },
-                );
-                self.process_local_provision_fetch_outputs(outputs);
+                let admitted: Vec<_> = batches.iter().map(|b| b.hash()).collect();
+                self.local_provision_fetch
+                    .handle(HashSetFetchInput::Admitted { ids: admitted });
+                if !missing_hashes.is_empty() {
+                    self.local_provision_fetch
+                        .handle(HashSetFetchInput::Failed {
+                            scope: block_hash,
+                            ids: missing_hashes,
+                        });
+                }
+                for provisions in batches {
+                    self.feed_event(ProtocolEvent::ProvisionsReceived {
+                        provisions: (*provisions).clone(),
+                    });
+                }
                 self.update_fetch_tick_timer();
             }
 
             NodeInput::LocalProvisionsFetchFailed { block_hash, hashes } => {
-                let outputs = self
-                    .local_provision_fetch_protocol
-                    .handle(LocalProvisionFetchInput::Failed { block_hash, hashes });
-                self.process_local_provision_fetch_outputs(outputs);
-                // Tick to retry pending fetches.
-                let tick_outputs = self
-                    .local_provision_fetch_protocol
-                    .handle(LocalProvisionFetchInput::Tick);
+                self.local_provision_fetch
+                    .handle(HashSetFetchInput::Failed {
+                        scope: block_hash,
+                        ids: hashes,
+                    });
+                let tick_outputs = self.local_provision_fetch.handle(HashSetFetchInput::Tick);
                 self.process_local_provision_fetch_outputs(tick_outputs);
                 self.update_fetch_tick_timer();
             }
@@ -907,14 +867,13 @@ where
                 peer,
                 waves,
             } => {
-                let outputs =
-                    self.finalized_wave_fetch_protocol
-                        .handle(FinalizedWaveFetchInput::Received {
-                            block_hash,
-                            peer,
-                            waves,
-                        });
-                self.process_finalized_wave_fetch_outputs(outputs);
+                let admitted: Vec<_> = waves.iter().map(|w| w.wave_id_hash()).collect();
+                self.finalized_wave_fetch
+                    .handle(HashSetFetchInput::Admitted { ids: admitted });
+                for wave in waves {
+                    self.feed_event(ProtocolEvent::FinalizedWaveFetchDelivered { wave });
+                }
+                let _ = (block_hash, peer);
                 self.update_fetch_tick_timer();
             }
 
@@ -923,20 +882,12 @@ where
                 peer,
                 hashes,
             } => {
-                let outputs =
-                    self.finalized_wave_fetch_protocol
-                        .handle(FinalizedWaveFetchInput::Failed {
-                            block_hash,
-                            peer,
-                            hashes,
-                        });
-                self.process_finalized_wave_fetch_outputs(outputs);
-                // Tick to retry pending fetches.
-                let tick_outputs =
-                    self.finalized_wave_fetch_protocol
-                        .handle(FinalizedWaveFetchInput::Tick {
-                            now: std::time::Instant::now(),
-                        });
+                self.finalized_wave_fetch.handle(HashSetFetchInput::Failed {
+                    scope: block_hash,
+                    ids: hashes,
+                });
+                let _ = peer;
+                let tick_outputs = self.finalized_wave_fetch.handle(HashSetFetchInput::Tick);
                 self.process_finalized_wave_fetch_outputs(tick_outputs);
                 self.update_fetch_tick_timer();
             }
@@ -1058,7 +1009,8 @@ where
         let bft_stats = self.state.bft().stats();
         let mempool = self.state.mempool();
         let contention = mempool.lock_contention_stats();
-        let fetch_status = self.transaction_fetch_protocol.status();
+        let fetch_in_flight = self.transaction_fetch.in_flight_count();
+        let fetch_pending_blocks = self.transaction_fetch.pending_count();
         let sync_status = self.sync_protocol.status();
 
         let bft_mem = self.state.bft().memory_stats();
@@ -1077,12 +1029,12 @@ where
             backpressure_active: mempool.at_in_flight_limit(),
             blocks_behind: self.sync_protocol.blocks_behind(),
             is_syncing: self.sync_protocol.is_syncing(),
-            fetch_transaction: fetch_status.in_flight_operations,
-            fetch_provision: self.provision_fetch_protocol.in_flight_count(),
-            fetch_local_provision: self.local_provision_fetch_protocol.in_flight_count(),
-            fetch_exec_cert: self.exec_cert_fetch_protocol.in_flight_count(),
-            fetch_header: self.header_fetch_protocol.in_flight_count(),
-            fetch_finalized_wave: self.finalized_wave_fetch_protocol.in_flight_count(),
+            fetch_transaction: fetch_in_flight,
+            fetch_provision: self.provision_fetch.in_flight_count(),
+            fetch_local_provision: self.local_provision_fetch.in_flight_count(),
+            fetch_exec_cert: self.exec_cert_fetch.in_flight_count(),
+            fetch_header: self.header_fetch.in_flight_count(),
+            fetch_finalized_wave: self.finalized_wave_fetch.in_flight_count(),
             memory: metrics::MemoryMetrics {
                 // BFT
                 bft_pending_blocks: bft_mem.pending_blocks,
@@ -1152,16 +1104,12 @@ where
                 node_committed_header_batch: self.committed_header_batch.len(),
                 node_sync_queued_heights: sync_status.queued_heights,
                 node_sync_in_flight_fetches: sync_status.pending_fetches,
-                node_tx_fetch_blocks: fetch_status.pending_tx_blocks,
-                node_local_provision_fetch_pending: self
-                    .local_provision_fetch_protocol
-                    .pending_count(),
-                node_finalized_wave_fetch_pending: self
-                    .finalized_wave_fetch_protocol
-                    .pending_count(),
-                node_provision_fetch_pending: self.provision_fetch_protocol.pending_count(),
-                node_exec_cert_fetch_pending: self.exec_cert_fetch_protocol.pending_count(),
-                node_header_fetch_pending: self.header_fetch_protocol.pending_count(),
+                node_tx_fetch_blocks: fetch_pending_blocks,
+                node_local_provision_fetch_pending: self.local_provision_fetch.pending_count(),
+                node_finalized_wave_fetch_pending: self.finalized_wave_fetch.pending_count(),
+                node_provision_fetch_pending: self.provision_fetch.pending_count(),
+                node_exec_cert_fetch_pending: self.exec_cert_fetch.pending_count(),
+                node_header_fetch_pending: self.header_fetch.pending_count(),
                 // Storage — filled in by record_metrics off-thread.
                 rocksdb_block_cache_usage_bytes: 0,
                 rocksdb_memtable_usage_bytes: 0,

@@ -1,9 +1,8 @@
 //! Consolidated configuration for `IoLoop`.
 
-use crate::protocol::execution_cert_fetch::ExecCertFetchConfig;
-use crate::protocol::provision_fetch::ProvisionFetchConfig;
+use crate::protocol::fetch::hashset_fetch::HashSetFetchConfig;
+use crate::protocol::fetch::scope_fetch::ScopeFetchConfig;
 use crate::protocol::sync::SyncConfig;
-use crate::protocol::transaction_fetch::TransactionFetchConfig;
 use std::time::Duration;
 
 /// Configuration for [`IoLoop`](crate::io_loop::IoLoop).
@@ -14,11 +13,11 @@ pub struct NodeConfig {
     /// Sync (catch-up + rehydration) configuration.
     pub sync: SyncConfig,
     /// Inbound transaction fetch configuration.
-    pub transaction_fetch: TransactionFetchConfig,
+    pub transaction_fetch: HashSetFetchConfig,
     /// Cross-shard provision fetch configuration.
-    pub provision_fetch: ProvisionFetchConfig,
+    pub provision_fetch: ScopeFetchConfig,
     /// Execution-certificate fetch configuration.
-    pub exec_cert_fetch: ExecCertFetchConfig,
+    pub exec_cert_fetch: HashSetFetchConfig,
     /// Batch-window configuration.
     pub batch: BatchConfig,
 }

@@ -1,12 +1,7 @@
 //! Sync, fetch, and provision fetch protocol output processing.
 
 use super::{IoLoop, TimerOp};
-use crate::protocol::execution_cert_fetch::ExecCertFetchOutput;
-use crate::protocol::finalized_wave_fetch::FinalizedWaveFetchOutput;
-use crate::protocol::local_provision_fetch::LocalProvisionFetchOutput;
-use crate::protocol::provision_fetch::ProvisionFetchOutput;
 use crate::protocol::sync::{SyncInput, SyncOutput};
-use crate::protocol::transaction_fetch::TransactionFetchOutput;
 use hyperscale_core::{NodeInput, ProtocolEvent, TimerId};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::Engine;
@@ -233,24 +228,27 @@ where
         }
     }
 
-    /// Process `TransactionFetchProtocol` outputs.
-    ///
-    /// `FetchTransactions` uses the `Network` trait to make requests.
-    /// `DeliverTransactions` feeds events directly to the state machine.
+    /// Dispatch outputs from the per-block transaction fetch.
     pub(super) fn process_transaction_fetch_outputs(
-        &mut self,
-        outputs: Vec<TransactionFetchOutput>,
+        &self,
+        outputs: Vec<
+            crate::protocol::fetch::HashSetFetchOutput<
+                crate::protocol::fetch::instances::transactions::Scope,
+                hyperscale_types::TxHash,
+            >,
+        >,
     ) {
+        use crate::protocol::fetch::HashSetFetchOutput;
+
         for output in outputs {
             match output {
-                TransactionFetchOutput::FetchTransactions {
-                    block_hash,
-                    proposer,
-                    tx_hashes,
+                HashSetFetchOutput::Send {
+                    scope: block_hash,
+                    ids: tx_hashes,
+                    peer: proposer,
                 } => {
                     use hyperscale_messages::request::GetTransactionsRequest;
                     let es = self.event_sender.clone();
-                    let bh = block_hash;
                     let hs = tx_hashes.clone();
                     let peers = self.local_peers();
                     self.network.request(
@@ -260,50 +258,48 @@ where
                         Box::new(move |result| match result {
                             Ok(resp) => {
                                 let _ = es.send(NodeInput::TransactionReceived {
-                                    block_hash: bh,
+                                    block_hash,
                                     transactions: resp.into_transactions(),
                                 });
                             }
                             Err(_) => {
                                 let _ = es.send(NodeInput::FetchTransactionsFailed {
-                                    block_hash: bh,
+                                    block_hash,
                                     hashes: hs,
                                 });
                             }
                         }),
                     );
                 }
-                TransactionFetchOutput::DeliverTransactions {
-                    block_hash,
-                    transactions,
-                } => {
-                    self.feed_event(ProtocolEvent::TransactionFetchDelivered {
-                        block_hash,
-                        transactions,
-                    });
+                HashSetFetchOutput::ScopeComplete { .. } => {
+                    // Scope completion is purely an internal protocol signal;
+                    // BFT readiness is driven by `TransactionFetchDelivered`.
                 }
             }
         }
     }
 
-    /// Process `LocalProvisionFetchProtocol` outputs.
-    ///
-    /// `Fetch` uses the Network trait to request batches from the proposer/local peers.
-    /// `Deliver` feeds each batch into the state machine via `ProvisionsVerified`.
+    /// Dispatch outputs from the per-block local-provision fetch.
     pub(super) fn process_local_provision_fetch_outputs(
-        &mut self,
-        outputs: Vec<LocalProvisionFetchOutput>,
+        &self,
+        outputs: Vec<
+            crate::protocol::fetch::HashSetFetchOutput<
+                crate::protocol::fetch::instances::local_provisions::Scope,
+                hyperscale_types::ProvisionHash,
+            >,
+        >,
     ) {
+        use crate::protocol::fetch::HashSetFetchOutput;
+
         for output in outputs {
             match output {
-                LocalProvisionFetchOutput::Fetch {
-                    block_hash,
-                    proposer,
-                    batch_hashes,
+                HashSetFetchOutput::Send {
+                    scope: block_hash,
+                    ids: batch_hashes,
+                    peer: proposer,
                 } => {
                     use hyperscale_messages::request::GetLocalProvisionsRequest;
                     let es = self.event_sender.clone();
-                    let bh = block_hash;
                     let hs = batch_hashes.clone();
                     let peers = self.local_peers();
                     self.network.request(
@@ -314,52 +310,48 @@ where
                             Ok(resp) => {
                                 let batches = resp.batches.into_iter().map(Arc::new).collect();
                                 let _ = es.send(NodeInput::LocalProvisionReceived {
-                                    block_hash: bh,
+                                    block_hash,
                                     batches,
                                     missing_hashes: resp.missing_hashes,
                                 });
                             }
                             Err(_) => {
                                 let _ = es.send(NodeInput::LocalProvisionsFetchFailed {
-                                    block_hash: bh,
+                                    block_hash,
                                     hashes: hs,
                                 });
                             }
                         }),
                     );
                 }
-                LocalProvisionFetchOutput::Deliver { batches } => {
-                    // Route through the coordinator's receive path so each
-                    // batch hits the per-target completeness check against
-                    // the source header's `provision_tx_roots`. The content-
-                    // hash match inside `LocalProvisionFetchProtocol` only
-                    // proves the batch matches what the proposer committed
-                    // to in BlockManifest; it doesn't catch a proposer that
-                    // committed to an incomplete batch.
-                    for provisions in batches {
-                        self.feed_event(ProtocolEvent::ProvisionsReceived {
-                            provisions: (*provisions).clone(),
-                        });
-                    }
-                }
+                HashSetFetchOutput::ScopeComplete { .. } => {}
             }
         }
     }
 
-    /// Process `ProvisionFetchProtocol` outputs.
+    /// Dispatch outputs from the cross-shard provision fetch.
     ///
-    /// `Fetch` uses the Network trait to send a single-peer request.
-    /// `Deliver` feeds provisions into the state machine via `ProvisionsReceived`.
-    pub(super) fn process_provision_fetch_outputs(&mut self, outputs: Vec<ProvisionFetchOutput>) {
+    /// On a successful response, the verified-shape provisions are fed
+    /// straight into the state machine as `ProvisionsReceived` and the
+    /// `ProvisionsVerified` continuation triggers admission.
+    pub(super) fn process_provision_fetch_outputs(
+        &self,
+        outputs: Vec<
+            crate::protocol::fetch::ScopeFetchOutput<
+                crate::protocol::fetch::instances::provisions::Scope,
+            >,
+        >,
+    ) {
+        use crate::protocol::fetch::ScopeFetchOutput;
+
         for output in outputs {
             match output {
-                ProvisionFetchOutput::Fetch {
-                    source_shard,
-                    block_height,
-                    target_shard,
+                ScopeFetchOutput::Send {
+                    scope: (source_shard, block_height),
                     peer,
                 } => {
                     use hyperscale_messages::request::GetProvisionsRequest;
+                    let target_shard = self.local_shard;
                     let request = GetProvisionsRequest {
                         block_height,
                         target_shard,
@@ -394,8 +386,12 @@ where
                                         });
                                         return;
                                     }
-                                    let _ = sender
-                                        .send(NodeInput::ProvisionsFetchReceived { provisions });
+                                    if provisions.transactions.is_empty() {
+                                        return;
+                                    }
+                                    let _ = sender.send(NodeInput::Protocol(
+                                        ProtocolEvent::ProvisionsReceived { provisions },
+                                    ));
                                 }
                                 None => {
                                     // Peer cannot serve (state version GC'd) → fail
@@ -415,26 +411,27 @@ where
                         }),
                     );
                 }
-                ProvisionFetchOutput::Deliver { provisions } => {
-                    if !provisions.transactions.is_empty() {
-                        self.feed_event(ProtocolEvent::ProvisionsReceived { provisions });
-                    }
-                }
             }
         }
     }
 
-    /// Process `ExecCertFetchProtocol` outputs.
-    ///
-    /// `Fetch` sends a single-peer network request for execution certificates.
-    /// `Deliver` feeds certificates into the state machine via `ExecutionCertificateReceived`.
-    pub(super) fn process_exec_cert_fetch_outputs(&mut self, outputs: Vec<ExecCertFetchOutput>) {
+    /// Dispatch outputs from the cross-shard execution-cert fetch.
+    pub(super) fn process_exec_cert_fetch_outputs(
+        &self,
+        outputs: Vec<
+            crate::protocol::fetch::HashSetFetchOutput<
+                crate::protocol::fetch::instances::exec_certs::Scope,
+                hyperscale_types::WaveId,
+            >,
+        >,
+    ) {
+        use crate::protocol::fetch::HashSetFetchOutput;
+
         for output in outputs {
             match output {
-                ExecCertFetchOutput::Fetch {
-                    source_shard,
-                    block_height,
-                    wave_ids,
+                HashSetFetchOutput::Send {
+                    scope: (source_shard, block_height),
+                    ids: wave_ids,
                     peer,
                 } => {
                     use hyperscale_messages::request::GetExecutionCertsRequest;
@@ -472,30 +469,30 @@ where
                         }),
                     );
                 }
-                ExecCertFetchOutput::Deliver { certificates } => {
-                    for cert in certificates {
-                        self.feed_event(ProtocolEvent::ExecutionCertificateReceived { cert });
-                    }
-                }
+                HashSetFetchOutput::ScopeComplete { .. } => {}
             }
         }
     }
 
-    /// Process `HeaderFetchProtocol` outputs.
+    /// Dispatch outputs from the cross-shard header fetch.
     ///
-    /// `Fetch` sends a single-peer network request for committed block headers.
-    /// `Deliver` feeds the header into the state machine via `RemoteBlockCommitted`.
+    /// On a successful response, the fetched header is fed straight into the
+    /// state machine as a `RemoteBlockCommitted` event — the same path taken
+    /// by gossiped headers — and the QC verification flow signals admission.
     pub(super) fn process_header_fetch_outputs(
-        &mut self,
-        outputs: Vec<crate::protocol::header_fetch::HeaderFetchOutput>,
+        &self,
+        outputs: Vec<
+            crate::protocol::fetch::ScopeFetchOutput<
+                crate::protocol::fetch::instances::headers::Scope,
+            >,
+        >,
     ) {
-        use crate::protocol::header_fetch::HeaderFetchOutput;
+        use crate::protocol::fetch::ScopeFetchOutput;
 
         for output in outputs {
             match output {
-                HeaderFetchOutput::Fetch {
-                    source_shard,
-                    from_height,
+                ScopeFetchOutput::Send {
+                    scope: (source_shard, from_height),
                     peer,
                 } => {
                     use hyperscale_messages::request::GetCommittedBlockHeaderRequest;
@@ -511,11 +508,12 @@ where
                         Box::new(move |result| match result {
                             Ok(response) => match response.header {
                                 Some(header) => {
-                                    let _ = sender.send(NodeInput::HeaderFetchReceived {
-                                        source_shard,
-                                        from_height,
-                                        header,
-                                    });
+                                    let _ = sender.send(NodeInput::Protocol(
+                                        ProtocolEvent::RemoteBlockCommitted {
+                                            committed_header: header,
+                                            sender: ValidatorId(0),
+                                        },
+                                    ));
                                 }
                                 None => {
                                     let _ = sender.send(NodeInput::HeaderFetchFailed {
@@ -533,48 +531,36 @@ where
                         }),
                     );
                 }
-                HeaderFetchOutput::Deliver { header } => {
-                    // Feed fetched header into the state machine as RemoteBlockCommitted.
-                    // The coordinator will verify and fan out as normal.
-                    // Use ValidatorId(0) as placeholder sender — the QC is what matters.
-                    self.feed_event(ProtocolEvent::RemoteBlockCommitted {
-                        committed_header: *header,
-                        sender: ValidatorId(0),
-                    });
-                }
             }
         }
     }
 
-    /// Set or cancel the periodic fetch tick timer based on protocol state.
+    /// Dispatch outputs from the per-block finalized-wave fetch.
     ///
-    /// When the fetch protocol has pending work, a recurring timer fires
-    /// `NodeInput::FetchTick` to retry deferred or failed fetch operations.
-    /// When all fetches are complete, the timer is cancelled.
-    /// Process `FinalizedWaveFetchProtocol` outputs.
-    ///
-    /// `Fetch` uses the Network trait to request finalized waves from the proposer/local peers.
-    /// `Deliver` feeds each wave into the state machine for pending block completion.
+    /// Pin each request to the chosen peer (the protocol drives rotation
+    /// itself; letting `Network::request` rotate would defeat per-peer
+    /// tried-set tracking).
     pub(super) fn process_finalized_wave_fetch_outputs(
-        &mut self,
-        outputs: Vec<FinalizedWaveFetchOutput>,
+        &self,
+        outputs: Vec<
+            crate::protocol::fetch::HashSetFetchOutput<
+                crate::protocol::fetch::instances::finalized_waves::Scope,
+                hyperscale_types::WaveIdHash,
+            >,
+        >,
     ) {
+        use crate::protocol::fetch::HashSetFetchOutput;
+
         for output in outputs {
             match output {
-                FinalizedWaveFetchOutput::Fetch {
-                    block_hash,
+                HashSetFetchOutput::Send {
+                    scope: block_hash,
+                    ids: wave_id_hashes,
                     peer,
-                    wave_id_hashes,
                 } => {
                     use hyperscale_messages::request::GetFinalizedWavesRequest;
                     let es = self.event_sender.clone();
-                    let bh = block_hash;
                     let hs = wave_id_hashes.clone();
-                    // Pin the request to the chosen peer (no fallback set):
-                    // the protocol drives rotation itself, retrying with the
-                    // next peer on `Failed` / empty `Received`. Letting the
-                    // network's request manager rotate would defeat the
-                    // protocol-level tried-peer tracking.
                     let pinned = [peer];
                     self.network.request(
                         &pinned,
@@ -584,14 +570,14 @@ where
                             Ok(resp) => {
                                 let waves = resp.waves.into_iter().map(Arc::new).collect();
                                 let _ = es.send(NodeInput::FinalizedWaveReceived {
-                                    block_hash: bh,
+                                    block_hash,
                                     peer,
                                     waves,
                                 });
                             }
                             Err(_) => {
                                 let _ = es.send(NodeInput::FinalizedWaveFetchFailed {
-                                    block_hash: bh,
+                                    block_hash,
                                     peer,
                                     hashes: hs,
                                 });
@@ -599,23 +585,18 @@ where
                         }),
                     );
                 }
-                FinalizedWaveFetchOutput::Deliver { waves } => {
-                    for wave in waves {
-                        self.feed_event(ProtocolEvent::FinalizedWaveFetchDelivered { wave });
-                    }
-                }
+                HashSetFetchOutput::ScopeComplete { .. } => {}
             }
         }
     }
 
     pub(super) fn update_fetch_tick_timer(&mut self) {
-        let status = self.transaction_fetch_protocol.status();
-        let has_fetch_work = status.pending_tx_blocks > 0;
-        let has_local_provision_work = self.local_provision_fetch_protocol.has_pending();
-        let has_finalized_wave_work = self.finalized_wave_fetch_protocol.has_pending();
-        let has_provision_work = self.provision_fetch_protocol.has_pending();
-        let has_exec_cert_work = self.exec_cert_fetch_protocol.has_pending();
-        let has_header_work = self.header_fetch_protocol.has_pending();
+        let has_fetch_work = self.transaction_fetch.has_pending();
+        let has_local_provision_work = self.local_provision_fetch.has_pending();
+        let has_finalized_wave_work = self.finalized_wave_fetch.has_pending();
+        let has_provision_work = self.provision_fetch.has_pending();
+        let has_exec_cert_work = self.exec_cert_fetch.has_pending();
+        let has_header_work = self.header_fetch.has_pending();
         if has_fetch_work
             || has_local_provision_work
             || has_finalized_wave_work
