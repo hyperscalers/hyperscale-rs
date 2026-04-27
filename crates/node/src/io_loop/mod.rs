@@ -812,14 +812,18 @@ where
             }
 
             // ── Local provision fetch protocol ────────────────────────
+            //
+            // Fetched batches enter the verification pipeline. Successful
+            // verification emits `Continuation(ProvisionsVerified)`, which
+            // drains both the cross-shard `provision_fetch` (by scope) and
+            // the local-block `local_provision_fetch` (by hash). Missing
+            // hashes still need a `Failed` signal so the in-flight set can
+            // retry; admission events drain the rest.
             NodeInput::LocalProvisionReceived {
                 block_hash,
                 batches,
                 missing_hashes,
             } => {
-                let admitted: Vec<_> = batches.iter().map(|b| b.hash()).collect();
-                self.local_provision_fetch
-                    .handle(HashSetFetchInput::Admitted { ids: admitted });
                 if !missing_hashes.is_empty() {
                     self.local_provision_fetch
                         .handle(HashSetFetchInput::Failed {
@@ -865,17 +869,25 @@ where
             }
 
             // ── Finalized wave fetch ─────────────────────────────────
+            //
+            // Each delivered wave is funnelled through
+            // `ExecutionCoordinator::admit_finalized_wave`, which emits
+            // `Continuation(FinalizedWavesAdmitted)`. io_loop's interception
+            // arm drains the fetch protocol; state.rs forwards to the BFT
+            // subscriber.
             NodeInput::FinalizedWaveReceived {
                 block_hash,
                 peer,
                 waves,
             } => {
-                let admitted: Vec<_> = waves.iter().map(|w| w.wave_id_hash()).collect();
-                self.finalized_wave_fetch
-                    .handle(HashSetFetchInput::Admitted { ids: admitted });
                 for wave in waves {
-                    self.feed_event(ProtocolEvent::FinalizedWaveFetchDelivered { wave });
+                    let actions = self.state.execution().admit_finalized_wave(wave);
+                    self.actions_generated += actions.len();
+                    for action in actions {
+                        self.process_action(action);
+                    }
                 }
+                self.flush_block_commits();
                 let _ = (block_hash, peer);
                 self.update_fetch_tick_timer();
             }

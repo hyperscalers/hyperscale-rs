@@ -1554,9 +1554,14 @@ impl ExecutionCoordinator {
 
         // Cache the finalized wave so peers can fetch the complete data they
         // need to vote on blocks containing this wave.
-        let mut actions = vec![Action::CacheFinalizedWave {
-            wave: finalized_arc,
-        }];
+        let mut actions = vec![
+            Action::CacheFinalizedWave {
+                wave: Arc::clone(&finalized_arc),
+            },
+            Action::Continuation(ProtocolEvent::FinalizedWavesAdmitted {
+                waves: vec![finalized_arc],
+            }),
+        ];
 
         actions.push(Action::Continuation(ProtocolEvent::WaveCompleted {
             wave_cert: cert_arc,
@@ -1570,6 +1575,22 @@ impl ExecutionCoordinator {
             }));
         }
         actions
+    }
+
+    /// Admission entry point for fetch-delivered (or otherwise externally
+    /// sourced) finalized waves. Emits
+    /// `Continuation(FinalizedWavesAdmitted)` so `io_loop` drains the fetch
+    /// protocol and BFT's pending-block subscriber receives the wave.
+    ///
+    /// Locally finalized waves emit the same event from `finalize_wave`, so
+    /// gossip, fetch, and local-finalize all converge on the same path.
+    /// Validation against the wave's EC happens at the BFT subscriber so
+    /// invalid waves don't poison the pending-block view.
+    #[must_use]
+    pub fn admit_finalized_wave(&self, wave: Arc<FinalizedWave>) -> Vec<Action> {
+        vec![Action::Continuation(
+            ProtocolEvent::FinalizedWavesAdmitted { waves: vec![wave] },
+        )]
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -2483,11 +2504,16 @@ mod tests {
 
         let actions = state.finalize_wave(&wave_id);
 
-        // 1 CacheFinalizedWave + 1 WaveCompleted + 2 TransactionExecuted = 4.
-        assert_eq!(actions.len(), 4);
+        // 1 CacheFinalizedWave + 1 FinalizedWavesAdmitted + 1 WaveCompleted +
+        // 2 TransactionExecuted = 5.
+        assert_eq!(actions.len(), 5);
         assert!(matches!(actions[0], Action::CacheFinalizedWave { .. }));
         assert!(matches!(
             actions[1],
+            Action::Continuation(ProtocolEvent::FinalizedWavesAdmitted { .. })
+        ));
+        assert!(matches!(
+            actions[2],
             Action::Continuation(ProtocolEvent::WaveCompleted { .. })
         ));
         let tx_events = actions

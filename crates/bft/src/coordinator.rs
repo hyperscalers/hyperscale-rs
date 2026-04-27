@@ -2724,57 +2724,68 @@ impl BftCoordinator {
     // Receipt Availability
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /// Check if any pending blocks are now complete after a finalized wave arrived.
+    /// React to finalized waves newly admitted to the canonical execution
+    /// store. Same shape as `on_transactions_admitted` and
+    /// `on_provisions_admitted`.
     ///
-    /// When a `FinalizedWave` is produced locally, it might complete a pending block
-    /// that was waiting for that wave. This method checks all pending blocks and
-    /// triggers voting if any are now complete.
-    ///
-    /// Fetched/broadcast waves are validated against their own EC before use:
-    /// a peer with divergent local execution could serve a wave whose receipts
-    /// disagree with the outcomes the EC attests to. Rejecting such a wave
-    /// leaves the pending block incomplete; the fetch protocol retries from a
-    /// different peer.
-    pub fn check_pending_blocks_for_finalized_wave(
+    /// Each wave is validated against its own EC before use: a peer with
+    /// divergent local execution could serve a wave whose receipts disagree
+    /// with the outcomes the EC attests to. Rejecting such a wave leaves the
+    /// pending block incomplete; the fetch protocol retries from a different
+    /// peer.
+    pub fn on_finalized_waves_admitted(
         &mut self,
         topology: &TopologySnapshot,
-        wave_id_hash: WaveIdHash,
-        fw: &Arc<FinalizedWave>,
+        waves: &[Arc<FinalizedWave>],
     ) -> Vec<Action> {
-        if let Err(err) = fw.validate_receipts_against_ec() {
-            warn!(
-                ?wave_id_hash,
-                ?err,
-                "Rejecting FinalizedWave: receipts inconsistent with its EC"
-            );
-            return Vec::new();
+        let mut actions = Vec::new();
+        for fw in waves {
+            let wave_id_hash = fw.wave_id_hash();
+            if let Err(err) = fw.validate_receipts_against_ec() {
+                warn!(
+                    ?wave_id_hash,
+                    ?err,
+                    "Rejecting FinalizedWave: receipts inconsistent with its EC"
+                );
+                continue;
+            }
+            actions.extend(self.check_pending_blocks_for_arrival(
+                topology,
+                "finalized wave",
+                |pending| pending.needs_wave(&wave_id_hash),
+                |pending| {
+                    pending.add_finalized_wave(Arc::clone(fw));
+                },
+            ));
         }
-
-        self.check_pending_blocks_for_arrival(
-            topology,
-            "finalized wave",
-            |pending| pending.needs_wave(&wave_id_hash),
-            |pending| {
-                pending.add_finalized_wave(Arc::clone(fw));
-            },
-        )
+        actions
     }
 
-    /// Check if any pending blocks are now complete after a provisions arrived.
-    pub fn check_pending_blocks_for_provision(
+    /// React to provisions newly admitted to the canonical store.
+    ///
+    /// Called via state.rs when a `Continuation(ProvisionsVerified)` event
+    /// reaches the dispatcher — same shape as `on_transactions_admitted`.
+    /// Walks pending blocks, populates `received_provisions` for each block
+    /// waiting on these hashes, and emits any unblocked vote / commit-resume
+    /// actions.
+    pub fn on_provisions_admitted(
         &mut self,
         topology: &TopologySnapshot,
-        provisions: &Arc<Provisions>,
+        provisions: &[Arc<Provisions>],
     ) -> Vec<Action> {
-        let provisions_hash = provisions.hash();
-        self.check_pending_blocks_for_arrival(
-            topology,
-            "provisions",
-            |pending| pending.needs_provision(&provisions_hash),
-            |pending| {
-                pending.add_provision(Arc::clone(provisions));
-            },
-        )
+        let mut actions = Vec::new();
+        for batch in provisions {
+            let provisions_hash = batch.hash();
+            actions.extend(self.check_pending_blocks_for_arrival(
+                topology,
+                "provisions",
+                |pending| pending.needs_provision(&provisions_hash),
+                |pending| {
+                    pending.add_provision(Arc::clone(batch));
+                },
+            ));
+        }
+        actions
     }
 
     /// Shared machinery for post-arrival pending-block completion.

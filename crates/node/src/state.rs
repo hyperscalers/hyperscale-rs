@@ -431,11 +431,10 @@ impl NodeStateMachine {
         if let Some(wave_id) = self.execution.get_wave_assignment(&tx_hash) {
             let wave_id_hash = wave_id.hash();
             if let Some(fw) = self.execution.get_finalized_wave_by_hash(&wave_id_hash) {
-                actions.extend(self.bft.check_pending_blocks_for_finalized_wave(
-                    self.topology.snapshot(),
-                    wave_id_hash,
-                    &fw,
-                ));
+                actions.extend(
+                    self.bft
+                        .on_finalized_waves_admitted(self.topology.snapshot(), &[fw]),
+                );
             }
         }
 
@@ -625,7 +624,7 @@ impl StateMachine for NodeStateMachine {
             ProtocolEvent::ProvisionsVerified { provisions, .. } => {
                 let mut actions = self
                     .bft
-                    .check_pending_blocks_for_provision(self.topology.snapshot(), &provisions);
+                    .on_provisions_admitted(self.topology.snapshot(), &[provisions]);
                 // New provisions queued — signal for event-driven proposal.
                 actions.push(Action::Continuation(ProtocolEvent::ContentAvailable));
                 actions
@@ -792,15 +791,9 @@ impl StateMachine for NodeStateMachine {
             | ProtocolEvent::ShardMergeInitiated { .. }
             | ProtocolEvent::ShardMergeComplete { .. } => vec![],
 
-            // ── Finalized Wave Fetch Delivery ────────────────────────────
-            ProtocolEvent::FinalizedWaveFetchDelivered { wave } => {
-                let wave_id_hash = wave.wave_id_hash();
-                self.bft.check_pending_blocks_for_finalized_wave(
-                    self.topology.snapshot(),
-                    wave_id_hash,
-                    &wave,
-                )
-            }
+            ProtocolEvent::FinalizedWavesAdmitted { waves } => self
+                .bft
+                .on_finalized_waves_admitted(self.topology.snapshot(), &waves),
         };
 
         // Drain any state root verifications that became ready during this event.

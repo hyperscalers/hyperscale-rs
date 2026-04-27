@@ -364,6 +364,22 @@ pub enum ProtocolEvent {
         submitted_locally: bool,
     },
 
+    /// Finalized waves were just admitted to the canonical execution store.
+    ///
+    /// Emitted by `ExecutionCoordinator` (wrapped in `Action::Continuation`)
+    /// for both locally finalized waves and fetch-delivered waves. Drives
+    /// two consumers:
+    ///
+    /// - `io_loop` intercepts the matching `Continuation` arm and drains the
+    ///   finalized-wave fetch protocol's in-flight tracking.
+    /// - state.rs forwards the event to `bft.on_finalized_waves_admitted`,
+    ///   which validates each wave's receipts against its EC and populates
+    ///   any pending block waiting on its hash.
+    FinalizedWavesAdmitted {
+        /// Finalized waves newly admitted on this admission call.
+        waves: Vec<Arc<FinalizedWave>>,
+    },
+
     /// Transactions delivered by a fetch response. Routed straight to
     /// `MempoolCoordinator::on_fetched_transactions` for admission; the
     /// fetch-protocol drain happens via the resulting
@@ -416,15 +432,6 @@ pub enum ProtocolEvent {
         wave_cert: Arc<WaveCertificate>,
         /// Transaction hashes covered by the wave.
         tx_hashes: Vec<TxHash>,
-    },
-
-    // ═══════════════════════════════════════════════════════════════════════
-    // Fetch Delivery (from IoLoop after fetch protocol processing)
-    // ═══════════════════════════════════════════════════════════════════════
-    /// Fetched finalized wave delivered to state machine for pending block completion.
-    FinalizedWaveFetchDelivered {
-        /// Finalized wave delivered for pending-block completion.
-        wave: Arc<FinalizedWave>,
     },
 
     // ═══════════════════════════════════════════════════════════════════════

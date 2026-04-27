@@ -57,10 +57,22 @@ where
                             provisions::scope_for(provisions.source_shard, provisions.block_height);
                         self.provision_fetch
                             .handle(ScopeFetchInput::Admitted { scope });
+                        // Same canonical admission also drains the local
+                        // per-block fetch tracking — keyed by provision hash,
+                        // not source-shard scope.
+                        self.local_provision_fetch
+                            .handle(HashSetFetchInput::Admitted {
+                                ids: vec![provisions.hash()],
+                            });
                     }
                     ProtocolEvent::TransactionsAdmitted { txs } => {
                         let ids: Vec<TxHash> = txs.iter().map(|tx| tx.hash()).collect();
                         self.transaction_fetch
+                            .handle(HashSetFetchInput::Admitted { ids });
+                    }
+                    ProtocolEvent::FinalizedWavesAdmitted { waves } => {
+                        let ids: Vec<_> = waves.iter().map(|w| w.wave_id_hash()).collect();
+                        self.finalized_wave_fetch
                             .handle(HashSetFetchInput::Admitted { ids });
                     }
                     _ => {}
