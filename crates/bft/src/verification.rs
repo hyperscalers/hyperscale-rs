@@ -115,7 +115,7 @@ pub struct VerificationPipeline {
     /// Deferred proposal waiting for the parent's tree nodes to become
     /// available. At most one pending at a time (new proposals replace old).
     /// Stores `(parent_block_hash, parent_block_height)` for unblocking.
-    /// When unblocked, we re-enter `try_propose` via `ContentAvailable`
+    /// When unblocked, we re-enter `try_propose` via the proposal-retry latch
     /// rather than dispatching a stale `BuildProposal` — transaction
     /// selection must use current state to avoid including txs that were
     /// committed between deferral and dispatch.
@@ -137,7 +137,7 @@ pub struct VerificationPipeline {
     ready_state_root_verifications: Vec<PendingStateRootVerification>,
 
     /// Set when a deferred proposal's parent tree became available.
-    /// Consumed by `take_ready_proposal` which emits `ContentAvailable`
+    /// Consumed by `take_ready_proposal`, which the state machine drains post-dispatch
     /// to re-enter `try_propose` with fresh transaction selection.
     proposal_unblocked: bool,
 
@@ -904,10 +904,17 @@ impl VerificationPipeline {
     }
 
     /// Check whether a deferred proposal was unblocked and should be retried.
-    /// Returns `true` once, then resets. The caller emits `ContentAvailable`
-    /// to re-enter `try_propose` with fresh transaction selection.
+    /// Returns `true` once, then resets. Caller re-enters `try_propose` with
+    /// fresh transaction selection.
     pub fn take_ready_proposal(&mut self) -> bool {
         std::mem::take(&mut self.proposal_unblocked)
+    }
+
+    /// Latch a proposal-retry attempt for after the current dispatch.
+    /// Idempotent within a single dispatch; the post-dispatch drain calls
+    /// `try_propose` once regardless of how many times this is set.
+    pub const fn queue_ready_proposal(&mut self) {
+        self.proposal_unblocked = true;
     }
 
     /// Check if a parent's tree nodes are available (persisted or verified

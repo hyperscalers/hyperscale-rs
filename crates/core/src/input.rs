@@ -244,12 +244,8 @@ impl NodeInput {
                 | ProtocolEvent::CleanupTimer
                 | ProtocolEvent::GlobalConsensusTimer => EventPriority::Timer,
 
-                // ContentAvailable is an internal signal (from continuations
-                // or rate-limit retry timers), not a network or timer event.
-                ProtocolEvent::ContentAvailable => EventPriority::Internal,
-
                 ProtocolEvent::BlockHeaderReceived { .. }
-                | ProtocolEvent::RemoteBlockCommitted { .. }
+                | ProtocolEvent::RemoteHeaderReceived { .. }
                 | ProtocolEvent::BlockVoteReceived { .. }
                 | ProtocolEvent::TransactionGossipReceived { .. }
                 | ProtocolEvent::GlobalBlockReceived { .. }

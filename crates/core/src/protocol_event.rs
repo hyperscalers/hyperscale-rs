@@ -8,8 +8,8 @@
 use hyperscale_types::{
     Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, BlockVote, CertifiedBlock,
     CommittedBlockHeader, EpochConfig, EpochId, ExecutionCertificate, ExecutionVote, FinalizedWave,
-    Provisions, QuorumCertificate, Round, RoutableTransaction, ShardGroupId, TxHash, TxOutcome,
-    ValidatorId, WaveCertificate, WaveId, WeightedTimestamp,
+    Provisions, QuorumCertificate, Round, RoutableTransaction, ShardGroupId, TxOutcome,
+    ValidatorId, WaveId, WeightedTimestamp,
 };
 use std::sync::Arc;
 
@@ -80,10 +80,6 @@ pub enum ProtocolEvent {
     /// View change timeout fired — check if the leader has timed out.
     ViewChangeTimer,
 
-    /// New proposable content is available (transactions, finalized waves, or provisions).
-    /// Triggers event-driven proposal building.
-    ContentAvailable,
-
     /// Periodic cleanup of stale state.
     CleanupTimer,
 
@@ -108,7 +104,7 @@ pub enum ProtocolEvent {
     ///
     /// The `sender` field is the authenticated sender identity — `IoLoop`
     /// verified the sender's BLS signature before admitting this event.
-    RemoteBlockCommitted {
+    RemoteHeaderReceived {
         /// Header + QC bundle from the remote shard.
         committed_header: CommittedBlockHeader,
         /// Authenticated sender identity (BLS-verified by `IoLoop`).
@@ -403,21 +399,6 @@ pub enum ProtocolEvent {
         txs: Vec<Arc<RoutableTransaction>>,
     },
 
-    /// Local execution certificate created for a wave (local votes aggregated).
-    ExecutionCertificateCreated {
-        /// Transaction hashes covered by the newly-created EC.
-        tx_hashes: Vec<TxHash>,
-    },
-
-    /// A wave's execution has been finalized (all shards reported).
-    /// Carries the wave cert (which contains the ECs) and per-tx hashes.
-    WaveCompleted {
-        /// Finalized wave certificate (carries per-shard ECs).
-        wave_cert: Arc<WaveCertificate>,
-        /// Transaction hashes covered by the wave.
-        tx_hashes: Vec<TxHash>,
-    },
-
     // ═══════════════════════════════════════════════════════════════════════
     // Storage Callbacks
     // ═══════════════════════════════════════════════════════════════════════
@@ -438,14 +419,6 @@ pub enum ProtocolEvent {
     SyncBlockReadyToApply {
         /// The synced block + its certifying QC, ready to apply.
         certified: CertifiedBlock,
-    },
-
-    /// Sync EC BLS verification completed (async callback from crypto pool).
-    SyncEcVerificationComplete {
-        /// Height whose synced ECs were verified.
-        height: BlockHeight,
-        /// `true` when all ECs at this height passed verification.
-        valid: bool,
     },
 
     /// The `io_loop`'s `SyncProtocol` has finished fetching all blocks up to

@@ -557,19 +557,6 @@ impl MempoolCoordinator {
     }
 
     /// Record that local ECs were just formed for these transactions.
-    /// Pure telemetry — emits a `RecordTxEcCreated` action that the `io_loop`
-    /// stamps into its phase-time side cache for the slow-tx finalization
-    /// log. State-machine state isn't touched.
-    #[must_use]
-    pub fn on_ec_created(&self, tx_hashes: &[TxHash]) -> Vec<Action> {
-        if tx_hashes.is_empty() {
-            return vec![];
-        }
-        vec![Action::RecordTxEcCreated {
-            tx_hashes: tx_hashes.to_vec(),
-        }]
-    }
-
     /// Add a transaction's nodes to the locked set.
     /// Called when a transaction transitions TO a lock-holding state (Committed/Executed).
     ///
