@@ -1,7 +1,7 @@
 //! Protocol state machines and inbound serve handlers used by the I/O loop.
 //!
 //! - [`fetch`] generic per-id fetch state machine, with per-payload bindings
-//!   in [`fetch_instances`].
+//!   in [`binding`] and the I/O-loop-owned bundle in [`host`].
 //! - [`sync`] block sync state machine + inbound block-request server handlers.
 //! - [`provision_serve`] / [`transaction_serve`] inbound request handlers
 //!   that serve cached state to peers.
