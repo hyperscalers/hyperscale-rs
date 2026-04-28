@@ -19,7 +19,6 @@
 //! production (wall clock) and simulation (logical clock) use the same paths.
 
 mod actions;
-mod batches;
 mod block_commit;
 mod caches;
 mod network_handlers;
@@ -41,6 +40,7 @@ use crate::io_loop::protocol::binding::{
 use crate::io_loop::protocol::fetch::FetchInput;
 use crate::io_loop::protocol::host::ProtocolHost;
 use crate::io_loop::protocol::sync::SyncStatus;
+use crate::io_loop::step::CommittedHeaderVerificationItem;
 use arc_swap::ArcSwap;
 use hyperscale_core::{Action, NodeInput, ProtocolEvent, StateMachine, TimerId};
 use hyperscale_dispatch::{Dispatch, DispatchPool};
@@ -49,8 +49,8 @@ use hyperscale_metrics as metrics;
 use hyperscale_network::Network;
 use hyperscale_storage::{ChainWriter, Storage};
 use hyperscale_types::{
-    BlockHeight, Bls12381G1PrivateKey, Bls12381G1PublicKey, CommittedBlockHeader, ShardGroupId,
-    StateRoot, TopologySnapshot, TxHash, ValidatorId,
+    BlockHeight, Bls12381G1PrivateKey, ShardGroupId, StateRoot, TopologySnapshot, TxHash,
+    ValidatorId,
 };
 use quick_cache::sync::Cache as QuickCache;
 use std::collections::{HashMap, HashSet};
@@ -62,14 +62,6 @@ use std::time::Duration;
 /// Updated by the `io_loop` when `Action::TopologyChanged` is processed.
 /// Handler closures call `.load()` to get the current snapshot atomically.
 pub type SharedTopologySnapshot = Arc<ArcSwap<TopologySnapshot>>;
-
-/// A committed header pending sender-signature verification.
-type CommittedHeaderVerificationItem = (
-    CommittedBlockHeader,
-    ValidatorId,
-    Bls12381G1PublicKey,
-    hyperscale_types::Bls12381G2Signature,
-);
 
 // ═══════════════════════════════════════════════════════════════════════
 // TimerOp — buffered timer operations for the runner
@@ -537,33 +529,22 @@ where
                 from_height,
             } => self.handle_header_fetch_failed(source_shard, from_height),
 
-            // ── Committed header validated (sender sig verified) ────────
+            // ── Committed header (gossip → BLS verify → state machine) ──
             NodeInput::CommittedHeaderValidated {
                 committed_header,
                 sender,
-            } => {
-                self.feed_event(ProtocolEvent::RemoteHeaderReceived {
-                    committed_header,
-                    sender,
-                });
-            }
-
-            // ── Committed block gossip (pre-filtered) ─────────────────
-            //
-            // Handler closure already verified sender's committee membership
-            // and resolved the public key. Queue for batched BLS verification.
+            } => self.handle_committed_header_validated(committed_header, sender),
             NodeInput::CommittedBlockGossipReceived {
                 committed_header,
                 sender,
                 public_key,
                 sender_signature,
-            } => {
-                let item: CommittedHeaderVerificationItem =
-                    (committed_header, sender, public_key, sender_signature);
-                if self.committed_header_batch.push(item, self.state.now()) {
-                    self.flush_committed_header_verifications();
-                }
-            }
+            } => self.handle_committed_block_gossip_received(
+                committed_header,
+                sender,
+                public_key,
+                sender_signature,
+            ),
 
             NodeInput::LocalProvisionReceived {
                 batches,
