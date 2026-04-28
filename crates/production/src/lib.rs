@@ -63,7 +63,7 @@
 //!     .build()
 //!     .unwrap();
 //!
-//! let dispatch = PooledDispatch::new(config).unwrap();
+//! let dispatch = PooledDispatch::new(config, tokio::runtime::Handle::current()).unwrap();
 //!
 //! // Share dispatch across multiple runners (e.g., multi-shard node)
 //! let shared_dispatch = Arc::new(dispatch);

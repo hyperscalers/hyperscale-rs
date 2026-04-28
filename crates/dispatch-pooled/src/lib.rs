@@ -21,7 +21,8 @@
 //!     .build()
 //!     .unwrap();
 //!
-//! let dispatch = PooledDispatch::new(config).unwrap();
+//! // Must be called from inside a tokio runtime; pass the handle explicitly.
+//! let dispatch = PooledDispatch::new(config, tokio::runtime::Handle::current()).unwrap();
 //! ```
 
 use std::num::NonZeroUsize;
@@ -326,20 +327,32 @@ pub struct PooledDispatch {
     crypto_pool: Arc<rayon::ThreadPool>,
     tx_validation_pool: Arc<rayon::ThreadPool>,
     execution_pool: Arc<rayon::ThreadPool>,
+    /// Tokio handle for [`DispatchPool::Io`] tasks. Captured at construction
+    /// time, so [`PooledDispatch::new`] must be called from inside a tokio
+    /// runtime context.
+    tokio_handle: tokio::runtime::Handle,
     consensus_crypto_pending: Arc<AtomicUsize>,
     crypto_pending: Arc<AtomicUsize>,
     tx_validation_pending: Arc<AtomicUsize>,
     execution_pending: Arc<AtomicUsize>,
+    io_pending: Arc<AtomicUsize>,
 }
 
 impl PooledDispatch {
     /// Create a new pooled dispatch with the given configuration.
     ///
+    /// `tokio_handle` is used to route [`DispatchPool::Io`] tasks. Pass
+    /// [`tokio::runtime::Handle::current`] from inside a runtime, or a handle
+    /// from a runtime constructed by the caller.
+    ///
     /// # Errors
     ///
     /// Returns a [`ThreadPoolError`] when validation fails or when any of the
     /// underlying rayon thread pools cannot be built.
-    pub fn new(config: ThreadPoolConfig) -> Result<Self, ThreadPoolError> {
+    pub fn new(
+        config: ThreadPoolConfig,
+        tokio_handle: tokio::runtime::Handle,
+    ) -> Result<Self, ThreadPoolError> {
         config.validate()?;
 
         let consensus_crypto_pool = Arc::new(Self::build_consensus_crypto_pool(&config)?);
@@ -362,10 +375,12 @@ impl PooledDispatch {
             crypto_pool,
             tx_validation_pool,
             execution_pool,
+            tokio_handle,
             consensus_crypto_pending: Arc::new(AtomicUsize::new(0)),
             crypto_pending: Arc::new(AtomicUsize::new(0)),
             tx_validation_pending: Arc::new(AtomicUsize::new(0)),
             execution_pending: Arc::new(AtomicUsize::new(0)),
+            io_pending: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -465,23 +480,38 @@ impl PooledDispatch {
 }
 
 impl PooledDispatch {
-    const fn pool_state(
+    /// Rayon pool + pending counter + metric label for CPU pools.
+    /// Returns `None` for [`DispatchPool::Io`] which routes to tokio.
+    const fn rayon_pool_state(
         &self,
         pool: DispatchPool,
-    ) -> (&Arc<rayon::ThreadPool>, &Arc<AtomicUsize>, &'static str) {
+    ) -> Option<(&Arc<rayon::ThreadPool>, &Arc<AtomicUsize>, &'static str)> {
         match pool {
-            DispatchPool::ConsensusCrypto => (
+            DispatchPool::ConsensusCrypto => Some((
                 &self.consensus_crypto_pool,
                 &self.consensus_crypto_pending,
                 "consensus_crypto",
-            ),
-            DispatchPool::Crypto => (&self.crypto_pool, &self.crypto_pending, "crypto"),
-            DispatchPool::TxValidation => (
+            )),
+            DispatchPool::Crypto => Some((&self.crypto_pool, &self.crypto_pending, "crypto")),
+            DispatchPool::TxValidation => Some((
                 &self.tx_validation_pool,
                 &self.tx_validation_pending,
                 "tx_validation",
-            ),
-            DispatchPool::Execution => (&self.execution_pool, &self.execution_pending, "execution"),
+            )),
+            DispatchPool::Execution => {
+                Some((&self.execution_pool, &self.execution_pending, "execution"))
+            }
+            DispatchPool::Io => None,
+        }
+    }
+
+    const fn pending_counter(&self, pool: DispatchPool) -> &Arc<AtomicUsize> {
+        match pool {
+            DispatchPool::ConsensusCrypto => &self.consensus_crypto_pending,
+            DispatchPool::Crypto => &self.crypto_pending,
+            DispatchPool::TxValidation => &self.tx_validation_pending,
+            DispatchPool::Execution => &self.execution_pending,
+            DispatchPool::Io => &self.io_pending,
         }
     }
 }
@@ -489,20 +519,34 @@ impl PooledDispatch {
 impl Dispatch for PooledDispatch {
     #[instrument(level = "debug", skip_all, fields(?pool))]
     fn spawn(&self, pool: DispatchPool, f: impl FnOnce() + Send + 'static) {
-        let (rayon_pool, pending, label) = self.pool_state(pool);
-        pending.fetch_add(1, Ordering::Relaxed);
-        let pending = pending.clone();
-        let rayon_pool_owned = Arc::clone(rayon_pool);
-        rayon_pool.spawn_fifo(move || {
-            let start = std::time::Instant::now();
-            rayon_pool_owned.install(f);
-            pending.fetch_sub(1, Ordering::Relaxed);
-            metrics::record_pool_task_completed(label, start.elapsed().as_secs_f64());
-        });
+        if let Some((rayon_pool, pending, label)) = self.rayon_pool_state(pool) {
+            pending.fetch_add(1, Ordering::Relaxed);
+            let pending = pending.clone();
+            let rayon_pool_owned = Arc::clone(rayon_pool);
+            rayon_pool.spawn_fifo(move || {
+                let start = std::time::Instant::now();
+                rayon_pool_owned.install(f);
+                pending.fetch_sub(1, Ordering::Relaxed);
+                metrics::record_pool_task_completed(label, start.elapsed().as_secs_f64());
+            });
+        } else {
+            // DispatchPool::Io — route to tokio. Wrap the sync closure in a
+            // future so it runs on the worker pool (network sends, channel
+            // posts). For genuinely blocking work (fsync), callers should
+            // use spawn_blocking themselves inside the closure.
+            let pending = Arc::clone(&self.io_pending);
+            pending.fetch_add(1, Ordering::Relaxed);
+            self.tokio_handle.spawn(async move {
+                let start = std::time::Instant::now();
+                f();
+                pending.fetch_sub(1, Ordering::Relaxed);
+                metrics::record_pool_task_completed("io", start.elapsed().as_secs_f64());
+            });
+        }
     }
 
     fn queue_depth(&self, pool: DispatchPool) -> usize {
-        self.pool_state(pool).1.load(Ordering::Relaxed)
+        self.pending_counter(pool).load(Ordering::Relaxed)
     }
 }
 
@@ -584,10 +628,17 @@ mod tests {
         assert!(result.is_err());
     }
 
+    fn test_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+    }
+
     #[test]
     fn test_pooled_dispatch_creation() {
+        let rt = test_runtime();
         let config = ThreadPoolConfig::minimal();
-        let dispatch = PooledDispatch::new(config).unwrap();
+        let dispatch = PooledDispatch::new(config, rt.handle().clone()).unwrap();
 
         assert_eq!(dispatch.config().consensus_crypto_threads, 2);
         assert_eq!(dispatch.config().crypto_threads, 2);
@@ -598,8 +649,9 @@ mod tests {
     fn test_spawn_on_pools() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
+        let rt = test_runtime();
         let config = ThreadPoolConfig::minimal();
-        let dispatch = PooledDispatch::new(config).unwrap();
+        let dispatch = PooledDispatch::new(config, rt.handle().clone()).unwrap();
 
         let consensus_crypto_counter = Arc::new(AtomicUsize::new(0));
         let crypto_counter = Arc::new(AtomicUsize::new(0));

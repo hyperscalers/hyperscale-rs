@@ -36,6 +36,10 @@ pub enum DispatchPool {
     TxValidation,
     /// Radix Engine transaction execution.
     Execution,
+    /// Network I/O and other non-CPU work. Production routes to the tokio
+    /// runtime; simulation runs inline. Use for broadcasts, request sends,
+    /// and any path that posts to the network or filesystem.
+    Io,
 }
 
 /// Trait for dispatching CPU-intensive work to priority-isolated pools.

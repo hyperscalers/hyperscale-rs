@@ -842,8 +842,11 @@ fn take_required_fields(
     let dispatch = match dispatch {
         Some(pools) => pools,
         None => Arc::new(
-            PooledDispatch::new(hyperscale_dispatch_pooled::ThreadPoolConfig::minimal())
-                .map_err(|e| RunnerError::SendError(e.to_string()))?,
+            PooledDispatch::new(
+                hyperscale_dispatch_pooled::ThreadPoolConfig::minimal(),
+                tokio::runtime::Handle::current(),
+            )
+            .map_err(|e| RunnerError::SendError(e.to_string()))?,
         ),
     };
     Ok(RequiredFields {
