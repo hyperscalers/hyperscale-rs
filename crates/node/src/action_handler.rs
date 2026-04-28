@@ -141,7 +141,7 @@ pub fn handle_delegated_action<S: Storage, E: Engine>(
             total_voting_power,
         } => {
             let start = std::time::Instant::now();
-            let result = hyperscale_bft::handlers::verify_and_build_qc(
+            let result = hyperscale_bft::action_handlers::verify_and_build_qc(
                 block_hash,
                 shard_group_id,
                 height,
@@ -170,7 +170,7 @@ pub fn handle_delegated_action<S: Storage, E: Engine>(
             block_hash,
         } => {
             let start = std::time::Instant::now();
-            let valid = hyperscale_bft::handlers::verify_qc_signature(&qc, &public_keys);
+            let valid = hyperscale_bft::action_handlers::verify_qc_signature(&qc, &public_keys);
             metrics::record_signature_verification_latency("qc", start.elapsed().as_secs_f64());
             Some(DelegatedResult {
                 events: vec![NodeInput::Protocol(ProtocolEvent::QcSignatureVerified {
@@ -192,8 +192,10 @@ pub fn handle_delegated_action<S: Storage, E: Engine>(
             let start = std::time::Instant::now();
 
             // Verify QC signature (BLS pairing)
-            let qc_valid =
-                hyperscale_bft::handlers::verify_qc_signature(&header.qc, &committee_public_keys);
+            let qc_valid = hyperscale_bft::action_handlers::verify_qc_signature(
+                &header.qc,
+                &committee_public_keys,
+            );
 
             // Verify voting power meets quorum and block_hash matches header
             let valid = if qc_valid {
@@ -231,7 +233,7 @@ pub fn handle_delegated_action<S: Storage, E: Engine>(
             validity_anchor,
         } => {
             let start = std::time::Instant::now();
-            let valid = hyperscale_bft::handlers::verify_transaction_root(
+            let valid = hyperscale_bft::action_handlers::verify_transaction_root(
                 expected_root,
                 &transactions,
                 validity_anchor,
@@ -257,7 +259,7 @@ pub fn handle_delegated_action<S: Storage, E: Engine>(
             topology,
         } => {
             let start = std::time::Instant::now();
-            let valid = hyperscale_bft::handlers::verify_provision_tx_roots(
+            let valid = hyperscale_bft::action_handlers::verify_provision_tx_roots(
                 &expected,
                 &transactions,
                 &topology,
@@ -284,8 +286,10 @@ pub fn handle_delegated_action<S: Storage, E: Engine>(
             let start = std::time::Instant::now();
             let raw_batch_hashes: Vec<hyperscale_types::Hash> =
                 batch_hashes.iter().map(|h| h.into_raw()).collect();
-            let valid =
-                hyperscale_bft::handlers::verify_provision_root(expected_root, &raw_batch_hashes);
+            let valid = hyperscale_bft::action_handlers::verify_provision_root(
+                expected_root,
+                &raw_batch_hashes,
+            );
             metrics::record_signature_verification_latency(
                 "provision_root",
                 start.elapsed().as_secs_f64(),
@@ -306,8 +310,10 @@ pub fn handle_delegated_action<S: Storage, E: Engine>(
             certificates,
         } => {
             let start = std::time::Instant::now();
-            let valid =
-                hyperscale_bft::handlers::verify_certificate_root(expected_root, &certificates);
+            let valid = hyperscale_bft::action_handlers::verify_certificate_root(
+                expected_root,
+                &certificates,
+            );
             metrics::record_signature_verification_latency(
                 "certificate_root",
                 start.elapsed().as_secs_f64(),
@@ -328,8 +334,10 @@ pub fn handle_delegated_action<S: Storage, E: Engine>(
             receipts,
         } => {
             let start = std::time::Instant::now();
-            let valid =
-                hyperscale_bft::handlers::verify_local_receipt_root(expected_root, &receipts);
+            let valid = hyperscale_bft::action_handlers::verify_local_receipt_root(
+                expected_root,
+                &receipts,
+            );
             metrics::record_signature_verification_latency(
                 "local_receipt_root",
                 start.elapsed().as_secs_f64(),
@@ -357,7 +365,7 @@ pub fn handle_delegated_action<S: Storage, E: Engine>(
         } => {
             let start = std::time::Instant::now();
             let pending_snapshots = ctx.view.pending_snapshots().to_vec();
-            let result = hyperscale_bft::handlers::verify_state_root(
+            let result = hyperscale_bft::action_handlers::verify_state_root(
                 &*ctx.view,
                 parent_state_root,
                 parent_block_height,
@@ -411,7 +419,7 @@ pub fn handle_delegated_action<S: Storage, E: Engine>(
             // Anchor (parent_hash) already applied via ctx.view.
             let pending_snapshots = ctx.view.pending_snapshots().to_vec();
 
-            let result = hyperscale_bft::handlers::build_proposal(
+            let result = hyperscale_bft::action_handlers::build_proposal(
                 &*ctx.view,
                 proposer,
                 height,
@@ -465,12 +473,13 @@ pub fn handle_delegated_action<S: Storage, E: Engine>(
         } => {
             // Aggregate BLS signatures from execution votes into an execution certificate.
             // tx_outcomes extracted from votes by the handler (all quorum votes carry identical outcomes).
-            let certificate = hyperscale_execution::handlers::aggregate_execution_certificate(
-                &wave_id,
-                global_receipt_root,
-                &votes,
-                &committee,
-            );
+            let certificate =
+                hyperscale_execution::action_handlers::aggregate_execution_certificate(
+                    &wave_id,
+                    global_receipt_root,
+                    &votes,
+                    &committee,
+                );
             Some(DelegatedResult {
                 events: vec![NodeInput::Protocol(
                     ProtocolEvent::ExecutionCertificateAggregated {
@@ -488,7 +497,8 @@ pub fn handle_delegated_action<S: Storage, E: Engine>(
             votes,
         } => {
             // Batch-verify execution vote signatures.
-            let verified = hyperscale_execution::handlers::batch_verify_execution_votes(votes);
+            let verified =
+                hyperscale_execution::action_handlers::batch_verify_execution_votes(votes);
             let verified_votes: Vec<_> = verified.collect();
             Some(DelegatedResult {
                 events: vec![NodeInput::Protocol(
@@ -507,10 +517,11 @@ pub fn handle_delegated_action<S: Storage, E: Engine>(
             public_keys,
             ..
         } => {
-            let valid = hyperscale_execution::handlers::verify_execution_certificate_signature(
-                &certificate,
-                &public_keys,
-            );
+            let valid =
+                hyperscale_execution::action_handlers::verify_execution_certificate_signature(
+                    &certificate,
+                    &public_keys,
+                );
             Some(DelegatedResult {
                 events: vec![NodeInput::Protocol(
                     ProtocolEvent::ExecutionCertificateSignatureVerified { certificate, valid },
@@ -611,7 +622,7 @@ pub fn handle_delegated_action<S: Storage, E: Engine>(
             let (tx_outcomes, results): (Vec<_>, Vec<_>) = per_tx
                 .into_iter()
                 .map(|r| {
-                    let outcome = hyperscale_engine::handlers::extract_execution_result(&r);
+                    let outcome = hyperscale_engine::action_handlers::extract_execution_result(&r);
                     (outcome, LocalExecutionEntry::from(r))
                 })
                 .unzip();
@@ -666,7 +677,7 @@ pub fn handle_delegated_action<S: Storage, E: Engine>(
                             hyperscale_engine::SingleTxResult::failure(req.tx_hash, e.to_string())
                         }
                     };
-                    let outcome = hyperscale_engine::handlers::extract_execution_result(&r);
+                    let outcome = hyperscale_engine::action_handlers::extract_execution_result(&r);
                     (outcome, LocalExecutionEntry::from(r))
                 })
                 .unzip();
@@ -691,7 +702,7 @@ pub fn handle_delegated_action<S: Storage, E: Engine>(
             block_height,
             shard_recipients,
         } => {
-            let batches = hyperscale_provisions::handlers::fetch_and_broadcast_provision(
+            let batches = hyperscale_provisions::action_handlers::fetch_and_broadcast_provision(
                 ctx.executor,
                 &ctx.view,
                 source_shard,

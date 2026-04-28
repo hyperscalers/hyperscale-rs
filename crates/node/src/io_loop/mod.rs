@@ -22,7 +22,7 @@ mod actions;
 mod batches;
 mod block_commit;
 mod caches;
-mod handlers;
+mod network_handlers;
 mod phase_times;
 mod protocols;
 mod verify;

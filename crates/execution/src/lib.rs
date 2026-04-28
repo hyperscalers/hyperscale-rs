@@ -8,8 +8,8 @@
 //! - State provisioning
 //! - Vote aggregation and certificate formation
 
+pub mod action_handlers;
 pub mod conflict;
-pub mod handlers;
 pub mod wave_state;
 
 mod coordinator;

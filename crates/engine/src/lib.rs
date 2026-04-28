@@ -26,7 +26,6 @@
 //! Both use the real Radix Engine - the difference is the calling convention.
 
 #![warn(missing_docs)]
-
 mod error;
 mod execution;
 mod executor;
@@ -37,7 +36,7 @@ mod simulation_engine;
 mod validation;
 
 /// Transaction execution handlers with integrated shard filtering.
-pub mod handlers;
+pub mod action_handlers;
 /// Shard assignment and write filtering for Radix Engine DatabaseUpdates.
 pub mod sharding;
 

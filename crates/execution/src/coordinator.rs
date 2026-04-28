@@ -50,11 +50,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use tracing::instrument;
 
+use crate::action_handlers::build_dispatch_action;
 use crate::conflict::DetectedConflict;
 use crate::early_arrivals::{EARLY_VOTE_RETENTION, EarlyArrivalBuffer};
 use crate::expected_certs::ExpectedCertTracker;
 use crate::finalized_waves::FinalizedWaveStore;
-use crate::handlers::build_dispatch_action;
 use crate::lookups::{committee_public_keys_for_shard, peers_excluding_self};
 use crate::outbound_certs::OutboundExecutionCertificateTracker;
 use crate::provisioning::ProvisioningTracker;
