@@ -22,6 +22,7 @@ mod actions;
 mod block_commit;
 mod caches;
 mod fetch_io;
+mod init;
 mod metrics;
 mod network_handlers;
 mod phase_times;
@@ -42,7 +43,7 @@ use crate::io_loop::step::CommittedHeaderVerificationItem;
 use arc_swap::ArcSwap;
 use hyperscale_core::{Action, NodeInput, ProtocolEvent, StateMachine, TimerId};
 use hyperscale_dispatch::Dispatch;
-use hyperscale_engine::{Engine, GenesisConfig, RadixExecutor, TransactionValidation};
+use hyperscale_engine::{Engine, RadixExecutor, TransactionValidation};
 use hyperscale_network::Network;
 use hyperscale_storage::Storage;
 use hyperscale_types::{
@@ -283,47 +284,6 @@ where
     /// in sync with the driving environment.
     pub fn set_time(&mut self, now: hyperscale_types::LocalTimestamp) {
         self.state.set_time(now);
-    }
-
-    // ─── Genesis ─────────────────────────────────────────────────────────
-
-    /// Process actions from genesis initialization.
-    ///
-    /// `NodeStateMachine::initialize_genesis()` returns actions (timer sets)
-    /// that must be processed through the `IoLoop`.s action handler.
-    pub fn handle_actions(&mut self, actions: Vec<Action>) {
-        for action in actions {
-            self.process_action(action);
-        }
-        self.flush_block_commits();
-    }
-
-    /// Install engine genesis on this node's storage.
-    ///
-    /// Builds (or reuses) the cached merged [`hyperscale_storage::DatabaseUpdates`]
-    /// for `(network, config)`, commits substates, and computes the JMT root
-    /// at version 0. Returns the genesis state root.
-    ///
-    /// Independent of network-handler registration — runners call
-    /// [`Self::register_inbound_handlers`] once their genesis-or-resume
-    /// decision is settled.
-    pub fn install_engine_genesis(&mut self, config: &GenesisConfig) -> StateRoot
-    where
-        S: hyperscale_storage::GenesisCommit,
-    {
-        let merged = hyperscale_engine::prepared_genesis(self.executor.network(), config);
-        self.storage.install_genesis(&merged)
-    }
-
-    /// Register inbound network handlers (requests, gossip, notifications).
-    ///
-    /// Must be called once per node before the `IoLoop` starts processing
-    /// events. Both genesis and resume paths reach this — registration is
-    /// not coupled to whether genesis ran.
-    pub fn register_inbound_handlers(&mut self) {
-        self.register_request_handler();
-        self.register_gossip_handlers();
-        self.register_notification_handlers();
     }
 
     // ─── Accessors ──────────────────────────────────────────────────────
