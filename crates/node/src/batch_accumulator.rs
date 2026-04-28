@@ -1,12 +1,11 @@
-//! Batch accumulators for time-and-count-based flushing.
+//! Batch accumulator for time-and-count-based flushing.
 //!
-//! Both [`BatchAccumulator`] and [`ShardedBatchAccumulator`] collect items until
-//! either a maximum count or a time window is reached, at which point the caller
-//! flushes the batch. Deadlines are tracked as `LocalTimestamp` (the `io_loop`'s
-//! monotonic local clock) so both production and simulation use the same paths.
+//! [`BatchAccumulator`] collects items until either a maximum count or a time
+//! window is reached, at which point the caller flushes the batch. Deadlines are
+//! tracked as `LocalTimestamp` (the `io_loop`'s monotonic local clock) so both
+//! production and simulation use the same paths.
 
-use hyperscale_types::{LocalTimestamp, ShardGroupId};
-use std::collections::HashMap;
+use hyperscale_types::LocalTimestamp;
 use std::time::Duration;
 
 /// A batch accumulator that collects items until a count or time limit is reached.
@@ -72,60 +71,6 @@ impl<T> BatchAccumulator<T> {
     /// Number of items currently buffered.
     pub const fn len(&self) -> usize {
         self.items.len()
-    }
-}
-
-/// A sharded batch accumulator that groups items by [`ShardGroupId`].
-///
-/// Items are collected into per-shard `Vec`s. The batch flushes when the total
-/// count across all shards reaches `max_count` or the time window expires.
-#[allow(dead_code)]
-pub struct ShardedBatchAccumulator<T> {
-    by_shard: HashMap<ShardGroupId, Vec<T>>,
-    total: usize,
-    max_count: usize,
-    window: Duration,
-    deadline: Option<LocalTimestamp>,
-}
-
-#[allow(dead_code)]
-impl<T> ShardedBatchAccumulator<T> {
-    /// Create a new sharded accumulator.
-    pub fn new(max_count: usize, window: Duration) -> Self {
-        Self {
-            by_shard: HashMap::new(),
-            total: 0,
-            max_count,
-            window,
-            deadline: None,
-        }
-    }
-
-    /// Push an item for a specific shard. Returns `true` if the batch is full.
-    pub fn push(&mut self, shard: ShardGroupId, item: T, now: LocalTimestamp) -> bool {
-        if self.total == 0 {
-            self.deadline = Some(now.plus(self.window));
-        }
-        self.by_shard.entry(shard).or_default().push(item);
-        self.total += 1;
-        self.total >= self.max_count
-    }
-
-    /// Take all items grouped by shard, resetting the accumulator.
-    pub fn take(&mut self) -> HashMap<ShardGroupId, Vec<T>> {
-        self.total = 0;
-        self.deadline = None;
-        std::mem::take(&mut self.by_shard)
-    }
-
-    /// Whether the batch deadline has expired.
-    pub fn is_expired(&self, now: LocalTimestamp) -> bool {
-        self.deadline.is_some_and(|d| now >= d)
-    }
-
-    /// The deadline for this batch, if non-empty.
-    pub const fn deadline(&self) -> Option<LocalTimestamp> {
-        self.deadline
     }
 }
 
@@ -199,32 +144,5 @@ mod tests {
 
         let items = batch.take();
         assert_eq!(items.len(), 3); // 3 items, but weight was 10
-    }
-
-    #[test]
-    fn sharded_push_and_take() {
-        let mut batch = ShardedBatchAccumulator::new(5, Duration::from_millis(100));
-        let now = LocalTimestamp::from_millis(1_000);
-        let shard_a = ShardGroupId(0);
-        let shard_b = ShardGroupId(1);
-
-        assert!(!batch.push(shard_a, "x", now));
-        assert!(!batch.push(shard_b, "y", now));
-        assert!(!batch.push(shard_a, "z", now));
-
-        let by_shard = batch.take();
-        assert_eq!(by_shard[&shard_a], vec!["x", "z"]);
-        assert_eq!(by_shard[&shard_b], vec!["y"]);
-        assert!(batch.deadline().is_none());
-    }
-
-    #[test]
-    fn sharded_full() {
-        let mut batch = ShardedBatchAccumulator::new(2, Duration::from_millis(100));
-        let now = LocalTimestamp::from_millis(1_000);
-        let shard = ShardGroupId(0);
-
-        assert!(!batch.push(shard, 1, now));
-        assert!(batch.push(shard, 2, now));
     }
 }
