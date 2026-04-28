@@ -4,7 +4,6 @@
 //! into a complete consensus node. It also contains the transport-independent
 //! sync and fetch protocol state machines.
 
-mod action_handler;
 mod batch_accumulator;
 mod config;
 pub mod io_loop;

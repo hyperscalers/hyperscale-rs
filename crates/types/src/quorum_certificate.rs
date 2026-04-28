@@ -140,12 +140,12 @@ mod tests {
         signers.set(1);
         signers.set(2);
 
-        let parent_hash = BlockHash::from_raw(Hash::from_bytes(b"parent"));
+        let parent_block_hash = BlockHash::from_raw(Hash::from_bytes(b"parent"));
         let qc = QuorumCertificate {
             block_hash: BlockHash::from_raw(Hash::from_bytes(b"block1")),
             shard_group_id: ShardGroupId(0),
             height: BlockHeight(1),
-            parent_block_hash: parent_hash,
+            parent_block_hash,
             round: Round::INITIAL,
             signers,
             aggregated_signature: zero_bls_signature(),
@@ -156,6 +156,6 @@ mod tests {
         assert_eq!(qc.signer_count(), 3);
         assert!(qc.has_committable_block());
         assert_eq!(qc.committable_height(), Some(BlockHeight(0)));
-        assert_eq!(qc.committable_hash(), Some(parent_hash));
+        assert_eq!(qc.committable_hash(), Some(parent_block_hash));
     }
 }

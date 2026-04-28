@@ -40,7 +40,7 @@ use crate::protocol::fetch_instances::{
 use crate::protocol::sync::{SyncInput, SyncProtocol, SyncStatus};
 use arc_swap::ArcSwap;
 use hyperscale_core::{Action, NodeInput, ProtocolEvent, StateMachine, TimerId};
-use hyperscale_dispatch::Dispatch;
+use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_engine::{Engine, GenesisConfig, RadixExecutor, TransactionValidation};
 use hyperscale_messages::TransactionGossip;
 use hyperscale_metrics as metrics;
@@ -96,8 +96,9 @@ pub enum TimerOp {
 
 /// Output from processing a single event via `IoLoop::step()`.
 ///
-/// `IoLoop` now handles all sync/fetch I/O internally via the `Network` trait.
-/// The runner processes emitted transaction statuses and timer operations.
+/// `IoLoop` now handles all sync/fetch I/O and block-commit dispatch
+/// internally via the `Network` and `Dispatch` traits. The runner only
+/// processes emitted transaction statuses and timer operations.
 pub struct StepOutput {
     /// Transaction status notifications emitted during this step.
     pub emitted_statuses: Vec<(TxHash, hyperscale_types::TransactionStatus)>,
@@ -105,10 +106,6 @@ pub struct StepOutput {
     pub actions_generated: usize,
     /// Timer operations (set/cancel) to be processed by the runner.
     pub timer_ops: Vec<TimerOp>,
-    /// Block commit task prepared by `flush_block_commits`. The runner decides
-    /// where to execute: production uses `tokio::spawn_blocking`, simulation
-    /// runs inline.
-    pub commit_task: Option<Box<dyn FnOnce() + Send>>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -237,7 +234,7 @@ where
     block_commit: BlockCommitCoordinator<S>,
 
     /// Chain-anchored pending state. Indexed by block hash; reads happen
-    /// through `PendingChain::view_at(parent_hash)` which walks the
+    /// through `PendingChain::view_at(parent_block_hash)` which walks the
     /// parent chain back to the committed tip. Orphaned blocks are not
     /// ancestors and are structurally invisible to anchored views.
     pending_chain: Arc<hyperscale_storage::PendingChain<S>>,
@@ -880,7 +877,6 @@ where
             emitted_statuses: std::mem::take(&mut self.emitted_statuses),
             actions_generated: self.actions_generated,
             timer_ops: std::mem::take(&mut self.pending_timer_ops),
-            commit_task: self.block_commit.drain_task(),
         }
     }
 
@@ -950,7 +946,7 @@ where
         let network = Arc::clone(&self.network);
         let validator_id = self.validator_id;
 
-        self.dispatch.spawn_crypto(move || {
+        self.dispatch.spawn(DispatchPool::Crypto, move || {
             for (provisions, recipients) in batches {
                 if provisions.transactions.is_empty() {
                     continue;

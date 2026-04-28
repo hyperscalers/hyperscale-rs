@@ -270,7 +270,7 @@ pub struct BuildActionPlan {
     /// The `BuildProposal` action ready for dispatch.
     pub action: Action,
     /// Parent hash, forwarded to the tracker / verification pipeline.
-    pub parent_hash: BlockHash,
+    pub parent_block_hash: BlockHash,
     /// Parent block height, same rationale.
     pub parent_block_height: BlockHeight,
     /// Whether to record leader activity: `Fallback` / `Sync` count as
@@ -294,10 +294,10 @@ pub fn assemble_build_action(
     now: LocalTimestamp,
     kind: ProposalKind,
 ) -> BuildActionPlan {
-    let (parent_hash, parent_qc) = chain.proposal_parent();
+    let (parent_block_hash, parent_qc) = chain.proposal_parent();
     let parent_block_height = parent_qc.height;
-    let parent_state_root = chain.parent_state_root(parent_hash);
-    let parent_in_flight = chain.parent_in_flight(parent_hash);
+    let parent_state_root = chain.parent_state_root(parent_block_hash);
+    let parent_in_flight = chain.parent_in_flight(parent_block_hash);
 
     let (
         timestamp,
@@ -351,7 +351,7 @@ pub fn assemble_build_action(
         proposer: topology.local_validator_id(),
         height,
         round,
-        parent_hash,
+        parent_block_hash,
         parent_qc,
         timestamp,
         is_fallback,
@@ -366,7 +366,7 @@ pub fn assemble_build_action(
 
     BuildActionPlan {
         action,
-        parent_hash,
+        parent_block_hash,
         parent_block_height,
         record_leader_activity,
         log_label,
@@ -385,17 +385,17 @@ pub fn assemble_build_action(
 pub fn dispatch_or_defer(
     tracker: &mut ProposalTracker,
     verification: &mut VerificationPipeline,
-    parent_hash: BlockHash,
+    parent_block_hash: BlockHash,
     parent_block_height: BlockHeight,
     block_height: BlockHeight,
     round: Round,
     action: Action,
 ) -> Vec<Action> {
-    if verification.parent_tree_available(parent_block_height, parent_hash) {
+    if verification.parent_tree_available(parent_block_height, parent_block_hash) {
         tracker.start(block_height, round);
         vec![action]
     } else {
-        verification.defer_proposal(parent_hash, parent_block_height);
+        verification.defer_proposal(parent_block_hash, parent_block_height);
         tracker.mark_deferred(block_height, round);
         vec![]
     }

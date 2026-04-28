@@ -718,9 +718,6 @@ impl SimulationRunner {
     /// Process `StepOutput`: stats and timer ops.
     fn process_step_output(&mut self, node: NodeIndex, output: StepOutput) {
         self.stats.actions_generated += u64::try_from(output.actions_generated).unwrap_or(u64::MAX);
-        if let Some(task) = output.commit_task {
-            task();
-        }
         for op in output.timer_ops {
             self.process_timer_op(node, op);
         }

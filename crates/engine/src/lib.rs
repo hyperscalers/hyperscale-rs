@@ -35,8 +35,6 @@ mod result;
 mod simulation_engine;
 mod validation;
 
-/// Transaction execution handlers with integrated shard filtering.
-pub mod action_handlers;
 /// Shard assignment and write filtering for Radix Engine DatabaseUpdates.
 pub mod sharding;
 
@@ -44,7 +42,7 @@ pub use execution::ProvisionedSnapshot;
 pub use executor::{Engine, RadixExecutor, fetch_state_entries};
 pub use genesis::GenesisConfig;
 pub use genesis_cache::prepared_genesis;
-pub use result::SingleTxResult;
+pub use result::{ExecutedTx, ExecutionOutput};
 pub use simulation_engine::{SimExecutionCache, SimulationEngine};
 pub use validation::TransactionValidation;
 

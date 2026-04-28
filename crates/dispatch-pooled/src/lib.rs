@@ -21,7 +21,8 @@
 //!     .build()
 //!     .unwrap();
 //!
-//! let dispatch = PooledDispatch::new(config).unwrap();
+//! // Must be called from inside a tokio runtime; pass the handle explicitly.
+//! let dispatch = PooledDispatch::new(config, tokio::runtime::Handle::current()).unwrap();
 //! ```
 
 use std::num::NonZeroUsize;
@@ -30,7 +31,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use thiserror::Error;
 use tracing::instrument;
 
-use hyperscale_dispatch::Dispatch;
+use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_metrics as metrics;
 
 /// Errors from thread pool configuration.
@@ -326,20 +327,32 @@ pub struct PooledDispatch {
     crypto_pool: Arc<rayon::ThreadPool>,
     tx_validation_pool: Arc<rayon::ThreadPool>,
     execution_pool: Arc<rayon::ThreadPool>,
+    /// Tokio handle for [`DispatchPool::Io`] tasks. Captured at construction
+    /// time, so [`PooledDispatch::new`] must be called from inside a tokio
+    /// runtime context.
+    tokio_handle: tokio::runtime::Handle,
     consensus_crypto_pending: Arc<AtomicUsize>,
     crypto_pending: Arc<AtomicUsize>,
     tx_validation_pending: Arc<AtomicUsize>,
     execution_pending: Arc<AtomicUsize>,
+    io_pending: Arc<AtomicUsize>,
 }
 
 impl PooledDispatch {
     /// Create a new pooled dispatch with the given configuration.
     ///
+    /// `tokio_handle` is used to route [`DispatchPool::Io`] tasks. Pass
+    /// [`tokio::runtime::Handle::current`] from inside a runtime, or a handle
+    /// from a runtime constructed by the caller.
+    ///
     /// # Errors
     ///
     /// Returns a [`ThreadPoolError`] when validation fails or when any of the
     /// underlying rayon thread pools cannot be built.
-    pub fn new(config: ThreadPoolConfig) -> Result<Self, ThreadPoolError> {
+    pub fn new(
+        config: ThreadPoolConfig,
+        tokio_handle: tokio::runtime::Handle,
+    ) -> Result<Self, ThreadPoolError> {
         config.validate()?;
 
         let consensus_crypto_pool = Arc::new(Self::build_consensus_crypto_pool(&config)?);
@@ -362,10 +375,12 @@ impl PooledDispatch {
             crypto_pool,
             tx_validation_pool,
             execution_pool,
+            tokio_handle,
             consensus_crypto_pending: Arc::new(AtomicUsize::new(0)),
             crypto_pending: Arc::new(AtomicUsize::new(0)),
             tx_validation_pending: Arc::new(AtomicUsize::new(0)),
             execution_pending: Arc::new(AtomicUsize::new(0)),
+            io_pending: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -464,84 +479,74 @@ impl PooledDispatch {
     }
 }
 
-impl Dispatch for PooledDispatch {
-    #[instrument(level = "debug", skip_all)]
-    fn spawn_consensus_crypto(&self, f: impl FnOnce() + Send + 'static) {
-        self.consensus_crypto_pending
-            .fetch_add(1, Ordering::Relaxed);
-        let pending = self.consensus_crypto_pending.clone();
-        let pool = Arc::clone(&self.consensus_crypto_pool);
-        self.consensus_crypto_pool.spawn_fifo(move || {
-            let start = std::time::Instant::now();
-            pool.install(f);
-            pending.fetch_sub(1, Ordering::Relaxed);
-            metrics::record_pool_task_completed("consensus_crypto", start.elapsed().as_secs_f64());
-        });
-    }
-
-    fn spawn_crypto(&self, f: impl FnOnce() + Send + 'static) {
-        self.crypto_pending.fetch_add(1, Ordering::Relaxed);
-        let pending = self.crypto_pending.clone();
-        let pool = Arc::clone(&self.crypto_pool);
-        self.crypto_pool.spawn_fifo(move || {
-            let start = std::time::Instant::now();
-            pool.install(f);
-            pending.fetch_sub(1, Ordering::Relaxed);
-            metrics::record_pool_task_completed("crypto", start.elapsed().as_secs_f64());
-        });
-    }
-
-    fn try_spawn_crypto(&self, f: impl FnOnce() + Send + 'static) -> bool {
-        const BACKPRESSURE_THRESHOLD: usize = 100;
-
-        let depth = self.crypto_pending.load(Ordering::Relaxed);
-        if depth > BACKPRESSURE_THRESHOLD {
-            return false;
+impl PooledDispatch {
+    /// Rayon pool + pending counter + metric label for CPU pools.
+    /// Returns `None` for [`DispatchPool::Io`] which routes to tokio.
+    const fn rayon_pool_state(
+        &self,
+        pool: DispatchPool,
+    ) -> Option<(&Arc<rayon::ThreadPool>, &Arc<AtomicUsize>, &'static str)> {
+        match pool {
+            DispatchPool::ConsensusCrypto => Some((
+                &self.consensus_crypto_pool,
+                &self.consensus_crypto_pending,
+                "consensus_crypto",
+            )),
+            DispatchPool::Crypto => Some((&self.crypto_pool, &self.crypto_pending, "crypto")),
+            DispatchPool::TxValidation => Some((
+                &self.tx_validation_pool,
+                &self.tx_validation_pending,
+                "tx_validation",
+            )),
+            DispatchPool::Execution => {
+                Some((&self.execution_pool, &self.execution_pending, "execution"))
+            }
+            DispatchPool::Io => None,
         }
-
-        self.spawn_crypto(f);
-        true
     }
 
-    fn spawn_tx_validation(&self, f: impl FnOnce() + Send + 'static) {
-        self.tx_validation_pending.fetch_add(1, Ordering::Relaxed);
-        let pending = self.tx_validation_pending.clone();
-        let pool = Arc::clone(&self.tx_validation_pool);
-        self.tx_validation_pool.spawn_fifo(move || {
-            let start = std::time::Instant::now();
-            pool.install(f);
-            pending.fetch_sub(1, Ordering::Relaxed);
-            metrics::record_pool_task_completed("tx_validation", start.elapsed().as_secs_f64());
-        });
+    const fn pending_counter(&self, pool: DispatchPool) -> &Arc<AtomicUsize> {
+        match pool {
+            DispatchPool::ConsensusCrypto => &self.consensus_crypto_pending,
+            DispatchPool::Crypto => &self.crypto_pending,
+            DispatchPool::TxValidation => &self.tx_validation_pending,
+            DispatchPool::Execution => &self.execution_pending,
+            DispatchPool::Io => &self.io_pending,
+        }
+    }
+}
+
+impl Dispatch for PooledDispatch {
+    #[instrument(level = "debug", skip_all, fields(?pool))]
+    fn spawn(&self, pool: DispatchPool, f: impl FnOnce() + Send + 'static) {
+        if let Some((rayon_pool, pending, label)) = self.rayon_pool_state(pool) {
+            pending.fetch_add(1, Ordering::Relaxed);
+            let pending = pending.clone();
+            let rayon_pool_owned = Arc::clone(rayon_pool);
+            rayon_pool.spawn_fifo(move || {
+                let start = std::time::Instant::now();
+                rayon_pool_owned.install(f);
+                pending.fetch_sub(1, Ordering::Relaxed);
+                metrics::record_pool_task_completed(label, start.elapsed().as_secs_f64());
+            });
+        } else {
+            // DispatchPool::Io — route to tokio's blocking pool. Sized for
+            // work that doesn't yield (fsync, network sends behind sync
+            // libp2p adapters, GC). Non-blocking ops tolerate it fine; the
+            // blocking pool just runs them straight through.
+            let pending = Arc::clone(&self.io_pending);
+            pending.fetch_add(1, Ordering::Relaxed);
+            self.tokio_handle.spawn_blocking(move || {
+                let start = std::time::Instant::now();
+                f();
+                pending.fetch_sub(1, Ordering::Relaxed);
+                metrics::record_pool_task_completed("io", start.elapsed().as_secs_f64());
+            });
+        }
     }
 
-    #[instrument(level = "debug", skip_all)]
-    fn spawn_execution(&self, f: impl FnOnce() + Send + 'static) {
-        self.execution_pending.fetch_add(1, Ordering::Relaxed);
-        let pending = self.execution_pending.clone();
-        let pool = Arc::clone(&self.execution_pool);
-        self.execution_pool.spawn_fifo(move || {
-            let start = std::time::Instant::now();
-            pool.install(f);
-            pending.fetch_sub(1, Ordering::Relaxed);
-            metrics::record_pool_task_completed("execution", start.elapsed().as_secs_f64());
-        });
-    }
-
-    fn consensus_crypto_queue_depth(&self) -> usize {
-        self.consensus_crypto_pending.load(Ordering::Relaxed)
-    }
-
-    fn crypto_queue_depth(&self) -> usize {
-        self.crypto_pending.load(Ordering::Relaxed)
-    }
-
-    fn tx_validation_queue_depth(&self) -> usize {
-        self.tx_validation_pending.load(Ordering::Relaxed)
-    }
-
-    fn execution_queue_depth(&self) -> usize {
-        self.execution_pending.load(Ordering::Relaxed)
+    fn queue_depth(&self, pool: DispatchPool) -> usize {
+        self.pending_counter(pool).load(Ordering::Relaxed)
     }
 }
 
@@ -623,10 +628,17 @@ mod tests {
         assert!(result.is_err());
     }
 
+    fn test_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+    }
+
     #[test]
     fn test_pooled_dispatch_creation() {
+        let rt = test_runtime();
         let config = ThreadPoolConfig::minimal();
-        let dispatch = PooledDispatch::new(config).unwrap();
+        let dispatch = PooledDispatch::new(config, rt.handle().clone()).unwrap();
 
         assert_eq!(dispatch.config().consensus_crypto_threads, 2);
         assert_eq!(dispatch.config().crypto_threads, 2);
@@ -637,8 +649,9 @@ mod tests {
     fn test_spawn_on_pools() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
+        let rt = test_runtime();
         let config = ThreadPoolConfig::minimal();
-        let dispatch = PooledDispatch::new(config).unwrap();
+        let dispatch = PooledDispatch::new(config, rt.handle().clone()).unwrap();
 
         let consensus_crypto_counter = Arc::new(AtomicUsize::new(0));
         let crypto_counter = Arc::new(AtomicUsize::new(0));
@@ -646,22 +659,22 @@ mod tests {
         let exec_counter = Arc::new(AtomicUsize::new(0));
 
         let counter = consensus_crypto_counter.clone();
-        dispatch.spawn_consensus_crypto(move || {
+        dispatch.spawn(DispatchPool::ConsensusCrypto, move || {
             counter.fetch_add(1, Ordering::SeqCst);
         });
 
         let counter = crypto_counter.clone();
-        dispatch.spawn_crypto(move || {
+        dispatch.spawn(DispatchPool::Crypto, move || {
             counter.fetch_add(1, Ordering::SeqCst);
         });
 
         let counter = tx_validation_counter.clone();
-        dispatch.spawn_tx_validation(move || {
+        dispatch.spawn(DispatchPool::TxValidation, move || {
             counter.fetch_add(1, Ordering::SeqCst);
         });
 
         let counter = exec_counter.clone();
-        dispatch.spawn_execution(move || {
+        dispatch.spawn(DispatchPool::Execution, move || {
             counter.fetch_add(1, Ordering::SeqCst);
         });
 
