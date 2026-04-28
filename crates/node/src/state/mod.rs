@@ -23,15 +23,16 @@ use tracing::instrument;
 /// Production uses `ValidatorId` (from message signatures) and `PeerId` (libp2p).
 pub type NodeIndex = u32;
 
-// ─── Constants ──────────────────────────────────────────────────────────
-
 /// Combined node state machine.
 ///
-/// Composes BFT, execution, mempool, and provisions into a single state machine.
-/// View changes are handled implicitly via local round advancement in `BftCoordinator` (HotStuff-2 style).
+/// Composes BFT, execution, mempool, and provisions into a single state
+/// machine. View changes are handled implicitly via local round advancement
+/// in `BftCoordinator` (HotStuff-2 style).
 ///
-/// Note: Sync is handled entirely by the runner (production: `SyncManager`, simulation: runner logic).
-/// The runner sends `SyncBlockReadyToApply` events directly to BFT when synced blocks are ready.
+/// The block-sync protocol itself lives on `IoLoop` (in
+/// `io_loop::protocol::sync`); when a synced block is ready to apply,
+/// `IoLoop` fires a `SyncBlockReadyToApply` event into this state machine,
+/// which routes it to BFT.
 pub struct NodeStateMachine {
     /// This node's index (simulation-only, for routing).
     node_index: NodeIndex,
@@ -173,8 +174,6 @@ impl NodeStateMachine {
     pub fn initialize_genesis(&mut self, genesis: &Block) -> Vec<Action> {
         self.bft
             .initialize_genesis(self.topology.snapshot(), genesis)
-        // Note: No separate view change timer - round advancement is handled
-        // implicitly via the proposal timer (HotStuff-2 style)
     }
 }
 

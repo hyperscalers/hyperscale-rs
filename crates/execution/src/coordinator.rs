@@ -1541,9 +1541,8 @@ impl ExecutionCoordinator {
             }
         }
 
-        let cert_arc = Arc::new(wc);
         let finalized = FinalizedWave {
-            certificate: Arc::clone(&cert_arc),
+            certificate: Arc::new(wc),
             receipts,
         };
         let finalized_arc = Arc::new(finalized.clone());

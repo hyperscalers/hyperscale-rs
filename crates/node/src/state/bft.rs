@@ -11,6 +11,50 @@
 //! - `on_block_committed` fans out to mempool, remote-headers, provisions,
 //!   outbound-provisions, and execution in commit order;
 //! - `RemoteHeaderAdmitted` fans verified headers to execution + provisions.
+//!
+//! # Orchestration ordering — `on_block_committed`
+//!
+//! The fanout sequence has load-bearing dependencies. Reordering will
+//! silently break invariants the downstream coordinators rely on; the edges
+//! are not enforced by the type system.
+//!
+//! The order is, with the dependency edge that motivates each step:
+//!
+//! 1. `bft.register_committed_transactions` — populates the dedup
+//!    `tx_cache` that mempool's tombstone-retention pass reads in step 3.
+//!    Must precede mempool's commit transition.
+//! 2. `bft.on_block_committed_verification` — marks the block's JMT
+//!    snapshot as a usable parent in `PendingChain`. Child state-root
+//!    verifications in subsequent dispatches need this; if any are pending
+//!    against this block as their parent, they unblock here. Must precede
+//!    any path that may emit child verifications.
+//! 3. `mempool.on_block_committed` — Pending → Committed → Completed
+//!    transitions for `block.transactions` and `block.certificates`.
+//!    Reads BFT's `tx_cache` (set in step 1) for tombstone retention bounds.
+//! 4. `remote_headers.on_block_committed` — liveness updates and
+//!    cross-shard timeout scheduling. Independent of the local coordinators
+//!    above; ordered here so all "cross-shard" work runs before execution.
+//! 5. `provisions.on_block_committed` — pruning + fallback timeouts. Reads
+//!    provision hashes directly off the block (`Block::Live` carries them
+//!    inline; `Block::Sealed` has none). Independent of mempool and
+//!    remote-headers; sequenced before execution because execution may
+//!    consume provisions queued here on the next proposal attempt.
+//! 6. `outbound_provisions.on_block_committed(qc.weighted_timestamp)` —
+//!    deterministic eviction sweep. Uses the BFT-authenticated weighted
+//!    timestamp from the QC so every validator evicts identically. Must
+//!    follow steps 1-5 because eviction reads the now-up-to-date provisions
+//!    state.
+//! 7. `apply_block_to_execution` — per-wave cleanup, wave dispatch (Live)
+//!    or wave-assignment recording (Sealed), and vote emission. Last
+//!    because (a) execution's wave-cleanup reads `block.certificates` after
+//!    mempool has finished its terminal-state transitions, and (b) vote
+//!    emission may produce actions whose ordering with respect to mempool
+//!    state matters.
+//!
+//! Finally, the function latches a proposal-retry via
+//! `bft.queue_ready_proposal()` — in-flight counts changed, so the next
+//! proposer needs to re-evaluate. The post-dispatch drain in `mod.rs::handle`
+//! invokes `try_event_driven_proposal` once.
 
 use super::NodeStateMachine;
 use hyperscale_core::{Action, ProtocolEvent, TimerId};
