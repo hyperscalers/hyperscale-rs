@@ -1,0 +1,40 @@
+//! Protocol-event passthrough step handlers.
+//!
+//! `NodeInput::Protocol(_)` is the channel for state-machine events that
+//! re-enter `IoLoop` via `feed_event` (continuation-style). Most are pure
+//! passthrough — feed the variant straight into the state machine. The
+//! one exception is `BlockPersisted`, which carries IoLoop-side commit
+//! pipeline state (`block_commit`, `pending_chain`) that needs updating
+//! before the state machine sees the event.
+
+use crate::io_loop::IoLoop;
+use hyperscale_core::ProtocolEvent;
+use hyperscale_dispatch::Dispatch;
+use hyperscale_engine::Engine;
+use hyperscale_network::Network;
+use hyperscale_storage::Storage;
+use hyperscale_types::BlockHeight;
+
+impl<S, N, D, E> IoLoop<S, N, D, E>
+where
+    S: Storage,
+    N: Network,
+    D: Dispatch,
+    E: Engine,
+{
+    /// Update `IoLoop`'s commit pipeline before forwarding `BlockPersisted`
+    /// to the state machine: the persisted height advances `block_commit`'s
+    /// gate and `pending_chain`'s pruning watermark.
+    pub(in crate::io_loop) fn handle_block_persisted(&mut self, height: BlockHeight) {
+        self.block_commit.mark_persisted(height);
+        // Drop pending state for blocks now persisted to RocksDB.
+        self.pending_chain.prune(height);
+        self.feed_event(ProtocolEvent::BlockPersisted { height });
+    }
+
+    /// Default `Protocol(_)` passthrough — feed the variant into the state
+    /// machine without IoLoop-side side effects.
+    pub(in crate::io_loop) fn handle_protocol_passthrough(&mut self, event: ProtocolEvent) {
+        self.feed_event(event);
+    }
+}

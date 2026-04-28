@@ -1,0 +1,112 @@
+//! Committed-block-gossip step handlers.
+//!
+//! Gossip-delivered committed block headers go through a sender-signature
+//! BLS verification pass before reaching the state machine. The flow is:
+//!
+//! 1. `CommittedBlockGossipReceived` — the inbound handler closure has
+//!    already verified the sender's committee membership and resolved the
+//!    public key. The header is queued in a batch accumulator for amortized
+//!    BLS verification.
+//! 2. `flush_committed_header_verifications` — fires when the batch fills
+//!    or its window expires. Spawns one closure on the crypto pool that
+//!    verifies each sender's BLS signature. Valid headers are sent back as
+//!    `CommittedHeaderValidated`.
+//! 3. `CommittedHeaderValidated` — the verified header is fed into the
+//!    state machine as `RemoteHeaderReceived`.
+
+use crate::io_loop::IoLoop;
+use crate::io_loop::verify::verify_bls_with_metrics;
+use hyperscale_core::{NodeInput, ProtocolEvent, StateMachine};
+use hyperscale_dispatch::{Dispatch, DispatchPool};
+use hyperscale_engine::Engine;
+use hyperscale_network::Network;
+use hyperscale_storage::Storage;
+use hyperscale_types::{
+    Bls12381G1PublicKey, Bls12381G2Signature, CommittedBlockHeader, ValidatorId,
+};
+
+/// A committed header pending sender-signature verification.
+pub(in crate::io_loop) type CommittedHeaderVerificationItem = (
+    CommittedBlockHeader,
+    ValidatorId,
+    Bls12381G1PublicKey,
+    Bls12381G2Signature,
+);
+
+impl<S, N, D, E> IoLoop<S, N, D, E>
+where
+    S: Storage,
+    N: Network,
+    D: Dispatch,
+    E: Engine,
+{
+    /// Sender signature already verified — feed the header into the state
+    /// machine for QC-verification dispatch.
+    pub(in crate::io_loop) fn handle_committed_header_validated(
+        &mut self,
+        committed_header: CommittedBlockHeader,
+        sender: ValidatorId,
+    ) {
+        self.feed_event(ProtocolEvent::RemoteHeaderReceived {
+            committed_header,
+            sender,
+        });
+    }
+
+    /// Inbound handler closure already verified sender's committee
+    /// membership and resolved the public key. Queue for batched BLS
+    /// verification; fires `flush_committed_header_verifications` when full.
+    pub(in crate::io_loop) fn handle_committed_block_gossip_received(
+        &mut self,
+        committed_header: CommittedBlockHeader,
+        sender: ValidatorId,
+        public_key: Bls12381G1PublicKey,
+        sender_signature: Bls12381G2Signature,
+    ) {
+        let item: CommittedHeaderVerificationItem =
+            (committed_header, sender, public_key, sender_signature);
+        if self.committed_header_batch.push(item, self.state.now()) {
+            self.flush_committed_header_verifications();
+        }
+    }
+
+    /// Flush accumulated committed-header sender-signature verifications.
+    ///
+    /// Spawns one closure on the crypto pool that verifies each sender's
+    /// BLS signature. Valid headers are sent back as `CommittedHeaderValidated`.
+    pub(in crate::io_loop) fn flush_committed_header_verifications(&mut self) {
+        let items = self.committed_header_batch.take();
+        if items.is_empty() {
+            return;
+        }
+
+        let event_tx = self.event_sender.clone();
+        self.dispatch.spawn(DispatchPool::Crypto, move || {
+            for (committed_header, sender, public_key, sender_signature) in items {
+                let msg = hyperscale_types::committed_block_header_message(
+                    committed_header.header.shard_group_id,
+                    committed_header.header.height,
+                    &committed_header.header.hash(),
+                );
+                let valid = verify_bls_with_metrics(
+                    &msg,
+                    &public_key,
+                    &sender_signature,
+                    "committed_header",
+                );
+                if valid {
+                    let _ = event_tx.send(NodeInput::CommittedHeaderValidated {
+                        committed_header,
+                        sender,
+                    });
+                } else {
+                    tracing::warn!(
+                        sender = sender.0,
+                        height = committed_header.header.height.0,
+                        "Committed header sender signature verification failed"
+                    );
+                }
+            }
+        });
+    }
+}

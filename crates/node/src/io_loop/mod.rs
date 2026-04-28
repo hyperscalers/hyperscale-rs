@@ -19,13 +19,13 @@
 //! production (wall clock) and simulation (logical clock) use the same paths.
 
 mod actions;
-mod batches;
 mod block_commit;
 mod caches;
+mod fetch_io;
 mod network_handlers;
 mod phase_times;
 pub mod protocol;
-mod protocols;
+mod step;
 mod verify;
 
 use crate::NodeStateMachine;
@@ -33,24 +33,19 @@ use crate::batch_accumulator::BatchAccumulator;
 use crate::config::NodeConfig;
 use crate::io_loop::block_commit::BlockCommitCoordinator;
 use crate::io_loop::caches::SharedCaches;
-use crate::io_loop::protocol::binding::{
-    ExecCertBinding, FinalizedWaveBinding, HeaderBinding, LocalProvisionBinding, ProvisionBinding,
-    TransactionBinding,
-};
-use crate::io_loop::protocol::fetch::FetchInput;
 use crate::io_loop::protocol::host::ProtocolHost;
-use crate::io_loop::protocol::sync::{SyncInput, SyncStatus};
+use crate::io_loop::protocol::sync::SyncStatus;
+use crate::io_loop::step::CommittedHeaderVerificationItem;
 use arc_swap::ArcSwap;
 use hyperscale_core::{Action, NodeInput, ProtocolEvent, StateMachine, TimerId};
 use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_engine::{Engine, GenesisConfig, RadixExecutor, TransactionValidation};
-use hyperscale_messages::TransactionGossip;
 use hyperscale_metrics as metrics;
 use hyperscale_network::Network;
 use hyperscale_storage::{ChainWriter, Storage};
 use hyperscale_types::{
-    BlockHeight, Bls12381G1PrivateKey, Bls12381G1PublicKey, CommittedBlockHeader, ShardGroupId,
-    StateRoot, TopologySnapshot, TxHash, ValidatorId,
+    BlockHeight, Bls12381G1PrivateKey, ShardGroupId, StateRoot, TopologySnapshot, TxHash,
+    ValidatorId,
 };
 use quick_cache::sync::Cache as QuickCache;
 use std::collections::{HashMap, HashSet};
@@ -62,14 +57,6 @@ use std::time::Duration;
 /// Updated by the `io_loop` when `Action::TopologyChanged` is processed.
 /// Handler closures call `.load()` to get the current snapshot atomically.
 pub type SharedTopologySnapshot = Arc<ArcSwap<TopologySnapshot>>;
-
-/// A committed header pending sender-signature verification.
-type CommittedHeaderVerificationItem = (
-    CommittedBlockHeader,
-    ValidatorId,
-    Bls12381G1PublicKey,
-    hyperscale_types::Bls12381G2Signature,
-);
 
 // ═══════════════════════════════════════════════════════════════════════
 // TimerOp — buffered timer operations for the runner
@@ -463,326 +450,100 @@ where
 
         match event {
             // ── Transaction validation pipeline ────────────────────────
-            //
-            // TransactionGossipReceived and SubmitTransaction are routed
-            // through the validation batch pipeline. Validated transactions
-            // re-enter as TransactionValidated, which is converted into
-            // TransactionGossipReceived for the state machine.
             NodeInput::TransactionValidated {
                 tx,
                 submitted_locally,
-            } => {
-                let tx_hash = tx.hash();
-                self.pending_validation.remove(&tx_hash);
-                let is_local = submitted_locally || self.locally_submitted.remove(&tx_hash);
-                self.caches.tx.insert(tx_hash, Arc::clone(&tx));
-                self.actions_generated = 0;
-                self.feed_event(ProtocolEvent::TransactionGossipReceived {
-                    tx,
-                    submitted_locally: is_local,
-                });
-            }
-
-            // Clean up tracking sets for transactions that failed validation.
+            } => self.handle_transaction_validated(tx, submitted_locally),
             NodeInput::TransactionValidationsFailed { hashes } => {
-                for hash in &hashes {
-                    self.pending_validation.remove(hash);
-                    self.locally_submitted.remove(hash);
-                }
+                self.handle_transaction_validations_failed(&hashes);
             }
-
-            // Intercept gossip-received transactions for validation.
             NodeInput::Protocol(ProtocolEvent::TransactionGossipReceived { tx, .. }) => {
-                let tx_hash = tx.hash();
-                if self.caches.tx.get(&tx_hash).is_none()
-                    && !self.state.mempool().is_tombstoned(&tx_hash)
-                {
-                    self.pending_validation.insert(tx_hash);
-                    self.queue_validation(tx);
-                }
+                self.handle_gossip_received_tx_for_validation(tx);
             }
-
-            NodeInput::SubmitTransaction { tx } => {
-                let tx_hash = tx.hash();
-
-                // Gossip to all relevant shards (reads + writes).
-                let shards: std::collections::BTreeSet<ShardGroupId> = tx
-                    .declared_reads
-                    .iter()
-                    .chain(tx.declared_writes.iter())
-                    .map(|node_id| hyperscale_types::shard_for_node(node_id, self.num_shards))
-                    .collect();
-                for shard in shards {
-                    let gossip = TransactionGossip::from_arc(Arc::clone(&tx));
-                    self.network.broadcast_to_shard(shard, &gossip);
-                }
-
-                if !self.pending_validation.contains(&tx_hash)
-                    && self.caches.tx.get(&tx_hash).is_none()
-                {
-                    // Paired with validation: only queued txs are removed on completion.
-                    self.locally_submitted.insert(tx_hash);
-                    self.pending_validation.insert(tx_hash);
-                    self.queue_validation(tx);
-                }
-            }
+            NodeInput::SubmitTransaction { tx } => self.handle_submit_transaction(tx),
 
             // ── Sync protocol ──────────────────────────────────────────
             NodeInput::SyncBlockResponseReceived { height, block } => {
-                let Some(elided) = block else {
-                    // Peer didn't have the block — pass through as `None`
-                    // to the sync state machine, which re-queues the height.
-                    self.deliver_sync_block(height, None);
-                    return self.drain_pending_output();
-                };
-                match self.rehydrate_elided_block(&elided) {
-                    Ok(cert) => self.deliver_sync_block(height, Some(Box::new(cert))),
-                    Err(miss) => {
-                        // Inventory bloom said we had bodies we couldn't
-                        // resolve. Buffer the elided block, fire a top-up
-                        // request for just the missing hashes. If the
-                        // response comes back with bodies that cover the
-                        // miss, we rehydrate and proceed normally; if it
-                        // fails, the buffered state is dropped and we
-                        // refetch from scratch via the existing retry path.
-                        metrics::record_sync_response_error("rehydration_miss");
-                        self.issue_sync_topup(height, elided, miss);
-                    }
-                }
+                self.handle_sync_block_response_received(height, block);
             }
-
             NodeInput::SyncBlockFetchFailed { height } => {
-                // Evict any buffered topup state keyed on this height —
-                // the outer fetch is being re-attempted, and the topup
-                // round we scheduled for it is no longer relevant.
-                self.protocols.pending_block_topups.remove(&height);
-                let outputs = self.protocols.sync.handle(SyncInput::BlockFetchFailed {
-                    height,
-                    now: std::time::Instant::now(),
-                });
-                self.process_sync_outputs(outputs);
-                self.update_fetch_tick_timer();
+                self.handle_sync_block_fetch_failed(height);
             }
-
             NodeInput::SyncBlockTopUpReceived { height, response } => {
-                let Some(elided) = self.protocols.pending_block_topups.remove(&height) else {
-                    // Topup arrived after the pending state was already
-                    // evicted (e.g. the outer fetch was retried and
-                    // delivered first). Silently drop.
-                    return self.drain_pending_output();
-                };
-                let topup = response.map_or_else(
-                    hyperscale_messages::response::GetBlockTopUpResponse::empty,
-                    |b| *b,
-                );
-                match self.rehydrate_with_topup(&elided, topup) {
-                    Ok(cert) => self.deliver_sync_block(height, Some(Box::new(cert))),
-                    Err(miss) => {
-                        tracing::warn!(
-                            height = height.0,
-                            missing_total = miss.total(),
-                            "Sync: topup still short of bodies, refetching block"
-                        );
-                        metrics::record_sync_response_error("topup_short");
-                        let _ = self
-                            .event_sender
-                            .send(NodeInput::SyncBlockFetchFailed { height });
-                    }
-                }
+                self.handle_sync_block_topup_received(height, response);
             }
-
             NodeInput::SyncBlockTopUpFailed { height } => {
-                self.protocols.pending_block_topups.remove(&height);
-                tracing::warn!(
-                    height = height.0,
-                    "Sync: topup request failed, refetching block"
-                );
-                metrics::record_sync_response_error("topup_failed");
-                let _ = self
-                    .event_sender
-                    .send(NodeInput::SyncBlockFetchFailed { height });
+                self.handle_sync_block_topup_failed(height);
             }
 
             // ── Fetch protocol ─────────────────────────────────────────
             NodeInput::TransactionReceived { transactions } => {
-                // Route delivered txs through mempool admission. The
-                // fetch-protocol drain happens via the resulting
-                // `Continuation(TransactionsAdmitted)` interception.
-                let actions = self.state.on_transactions_fetched(transactions);
-                self.process_actions(actions);
+                self.handle_transactions_received(transactions);
             }
 
             NodeInput::FetchTransactionsFailed { hashes } => {
-                self.drive_fetch::<TransactionBinding>(FetchInput::Failed { ids: hashes });
+                self.handle_fetch_transactions_failed(hashes);
             }
 
-            NodeInput::FetchTick => {
-                // Tick every fetch protocol. Per-payload bindings drain via
-                // `apply_admission` on canonical admission events; cross-shard
-                // provisions also evict abandoned scopes via a predicate.
-                let now = std::time::Instant::now();
-                let outputs = self.protocols.sync_tick(now);
-                self.process_sync_outputs(outputs);
+            NodeInput::FetchTick => self.handle_fetch_tick(),
 
-                self.drive_fetch::<TransactionBinding>(FetchInput::Tick);
-                self.drive_fetch::<LocalProvisionBinding>(FetchInput::Tick);
-                self.drive_fetch::<FinalizedWaveBinding>(FetchInput::Tick);
-
-                self.protocols.provision.evict_abandoned(|id| {
-                    crate::io_loop::protocol::binding::provisions_is_abandoned(&self.state, id)
-                });
-                self.drive_fetch::<ProvisionBinding>(FetchInput::Tick);
-
-                self.drive_fetch::<ExecCertBinding>(FetchInput::Tick);
-                self.drive_fetch::<HeaderBinding>(FetchInput::Tick);
-
-                self.update_fetch_tick_timer();
-            }
-
-            // ── Provision fetch protocol ──────────────────────────────
             NodeInput::ProvisionsFetchFailed {
                 source_shard,
                 block_height,
-            } => {
-                self.drive_fetch::<ProvisionBinding>(FetchInput::Failed {
-                    ids: vec![(source_shard, block_height)],
-                });
-                self.update_fetch_tick_timer();
-            }
+            } => self.handle_provisions_fetch_failed(source_shard, block_height),
 
-            // ── Execution certificate delivery (fetch + gossip) ──────
-            //
-            // Each delivered cert flows through `on_wave_certificate`, which
-            // emits `Continuation(ExecutionCertificateAdmitted)`. `io_loop`'s
-            // interception arm drains the exec-cert fetch protocol per wave.
             NodeInput::ExecutionCertsReceived { certificates } => {
-                let actions = self.state.on_execution_certs_received(certificates);
-                self.process_actions(actions);
-                self.update_fetch_tick_timer();
+                self.handle_execution_certs_received(certificates);
             }
 
-            NodeInput::ExecCertFetchFailed { hashes } => {
-                self.drive_fetch::<ExecCertBinding>(FetchInput::Failed { ids: hashes });
-                self.update_fetch_tick_timer();
-            }
+            NodeInput::ExecCertFetchFailed { hashes } => self.handle_exec_cert_fetch_failed(hashes),
 
-            // ── Committed block header fetch protocol ────────────────
             NodeInput::HeaderFetchFailed {
                 source_shard,
                 from_height,
-            } => {
-                self.drive_fetch::<HeaderBinding>(FetchInput::Failed {
-                    ids: vec![(source_shard, from_height)],
-                });
-                self.update_fetch_tick_timer();
-            }
+            } => self.handle_header_fetch_failed(source_shard, from_height),
 
-            // ── Committed header validated (sender sig verified) ────────
+            // ── Committed header (gossip → BLS verify → state machine) ──
             NodeInput::CommittedHeaderValidated {
                 committed_header,
                 sender,
-            } => {
-                self.feed_event(ProtocolEvent::RemoteHeaderReceived {
-                    committed_header,
-                    sender,
-                });
-            }
-
-            // ── Committed block gossip (pre-filtered) ─────────────────
-            //
-            // Handler closure already verified sender's committee membership
-            // and resolved the public key. Queue for batched BLS verification.
+            } => self.handle_committed_header_validated(committed_header, sender),
             NodeInput::CommittedBlockGossipReceived {
                 committed_header,
                 sender,
                 public_key,
                 sender_signature,
-            } => {
-                let item: CommittedHeaderVerificationItem =
-                    (committed_header, sender, public_key, sender_signature);
-                if self.committed_header_batch.push(item, self.state.now()) {
-                    self.flush_committed_header_verifications();
-                }
-            }
+            } => self.handle_committed_block_gossip_received(
+                committed_header,
+                sender,
+                public_key,
+                sender_signature,
+            ),
 
-            // ── Local provision fetch protocol ────────────────────────
-            //
-            // Fetched batches enter the verification pipeline. Successful
-            // verification emits `Continuation(ProvisionsAdmitted)`, which
-            // drains both the cross-shard `provision_fetch` (by scope) and
-            // the local-block `local_provision_fetch` (by hash). Missing
-            // hashes still need a `Failed` signal so the in-flight set can
-            // retry; admission events drain the rest.
             NodeInput::LocalProvisionReceived {
                 batches,
                 missing_hashes,
-            } => {
-                if !missing_hashes.is_empty() {
-                    self.protocols.local_provision.handle(FetchInput::Failed {
-                        ids: missing_hashes,
-                    });
-                }
-                for provisions in batches {
-                    self.feed_event(ProtocolEvent::ProvisionsReceived {
-                        provisions: (*provisions).clone(),
-                    });
-                }
-                self.update_fetch_tick_timer();
-            }
+            } => self.handle_local_provision_received(batches, missing_hashes),
 
             NodeInput::LocalProvisionsFetchFailed { hashes } => {
-                self.drive_fetch::<LocalProvisionBinding>(FetchInput::Failed { ids: hashes });
-                self.update_fetch_tick_timer();
+                self.handle_local_provisions_fetch_failed(hashes);
             }
 
-            // ── Provision ready (from execution pool) ─────────────────
-            //
-            // The FetchAndBroadcastProvisions delegated action built provisions
-            // grouped by target shard. Register each with the outbound
-            // tracker (which also inserts into the shared ProvisionStore)
-            // before broadcasting, so cross-shard `provision.request` and
-            // our own `local_provision.request` can serve the batch from
-            // memory while we await target ECs.
-            NodeInput::ProvisionsReady { batches } => {
-                for (provisions, _recipients) in &batches {
-                    self.feed_event(ProtocolEvent::OutboundProvisionBroadcast {
-                        provisions: std::sync::Arc::new(provisions.clone()),
-                        target_shard: provisions.target_shard,
-                    });
-                }
-                self.broadcast_provisions(batches);
-            }
+            NodeInput::ProvisionsReady { batches } => self.handle_provisions_ready(batches),
 
-            // ── Finalized wave fetch ─────────────────────────────────
-            //
-            // Each delivered wave is funnelled through
-            // `ExecutionCoordinator::admit_finalized_wave`, which emits
-            // `Continuation(FinalizedWavesAdmitted)`. io_loop's interception
-            // arm drains the fetch protocol; state.rs forwards to the BFT
-            // subscriber.
             NodeInput::FinalizedWaveReceived { waves } => {
-                for wave in waves {
-                    let actions = self.state.execution().admit_finalized_wave(wave);
-                    self.process_actions(actions);
-                }
-                self.update_fetch_tick_timer();
+                self.handle_finalized_wave_received(waves);
             }
 
             NodeInput::FinalizedWaveFetchFailed { hashes } => {
-                self.drive_fetch::<FinalizedWaveBinding>(FetchInput::Failed { ids: hashes });
-                self.update_fetch_tick_timer();
+                self.handle_finalized_wave_fetch_failed(hashes);
             }
 
             // ── Protocol events → state machine ────────────────────────
             NodeInput::Protocol(ProtocolEvent::BlockPersisted { height }) => {
-                self.block_commit.mark_persisted(height);
-                // Drop pending state for blocks now persisted to RocksDB.
-                self.pending_chain.prune(height);
-                self.feed_event(ProtocolEvent::BlockPersisted { height });
+                self.handle_block_persisted(height);
             }
-            NodeInput::Protocol(pe) => {
-                self.feed_event(pe);
-            }
+            NodeInput::Protocol(pe) => self.handle_protocol_passthrough(pe),
         }
 
         self.drain_pending_output()

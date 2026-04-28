@@ -1,15 +1,30 @@
-//! Sync and fetch protocol output processing.
+//! Sync-protocol step handlers.
+//!
+//! The block-sync protocol's I/O glue: rehydrate elided block responses
+//! against local caches, fall back to a top-up request on a partial miss,
+//! and recursively retry from scratch on residual failure.
+//!
+//! Four `step()` arms route here:
+//! - `SyncBlockResponseReceived` — first-pass rehydration of the elided block;
+//! - `SyncBlockFetchFailed` — drop topup state, signal failure to the sync FSM;
+//! - `SyncBlockTopUpReceived` — second-pass rehydration with topup bodies;
+//! - `SyncBlockTopUpFailed` — drop topup state, retry from scratch.
+//!
+//! The sync FSM (`super::super::protocol::sync::SyncProtocol`) is owned by
+//! `ProtocolHost`. This module bridges its outputs to the network and
+//! threads `NodeInput::SyncBlock*` callbacks back through the event sender.
 
-use super::{IoLoop, TimerOp};
-use crate::io_loop::protocol::binding::FetchBinding;
+use crate::io_loop::IoLoop;
 use crate::io_loop::protocol::sync::{SyncInput, SyncOutput};
-use hyperscale_core::{NodeInput, ProtocolEvent, TimerId};
+use hyperscale_core::{NodeInput, ProtocolEvent};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::Engine;
+use hyperscale_messages::request::Inventory;
+use hyperscale_messages::response::{ElidedCertifiedBlock, GetBlockTopUpResponse, RehydrationMiss};
 use hyperscale_metrics as metrics;
 use hyperscale_network::{Network, ResponseVerdict};
 use hyperscale_storage::Storage;
-use std::time::Duration;
+use hyperscale_types::{BlockHeight, CertifiedBlock};
 
 impl<S, N, D, E> IoLoop<S, N, D, E>
 where
@@ -18,19 +33,106 @@ where
     D: Dispatch,
     E: Engine,
 {
-    /// Interval for the periodic fetch tick timer.
-    const FETCH_TICK_INTERVAL: Duration = Duration::from_millis(200);
+    // ─── step() handlers ────────────────────────────────────────────────
+
+    /// Handle a sync block response: rehydrate the elided block against
+    /// local caches; on a miss, buffer it and fire a top-up request.
+    pub(in crate::io_loop) fn handle_sync_block_response_received(
+        &mut self,
+        height: BlockHeight,
+        block: Option<Box<ElidedCertifiedBlock>>,
+    ) {
+        let Some(elided) = block else {
+            // Peer didn't have the block — pass `None` through to the sync
+            // state machine, which re-queues the height.
+            self.deliver_sync_block(height, None);
+            return;
+        };
+        match self.rehydrate_elided_block(&elided) {
+            Ok(cert) => self.deliver_sync_block(height, Some(Box::new(cert))),
+            Err(miss) => {
+                // Inventory bloom said we had bodies we couldn't resolve.
+                // Buffer the elided block, fire a top-up for just the
+                // missing hashes. If the topup response covers the miss we
+                // rehydrate and proceed normally; if it fails, the buffered
+                // state is dropped and we refetch from scratch via the
+                // existing retry path.
+                metrics::record_sync_response_error("rehydration_miss");
+                self.issue_sync_topup(height, elided, miss);
+            }
+        }
+    }
+
+    /// Handle a sync block fetch failure: evict any buffered topup state
+    /// for this height (the outer fetch is being re-attempted) and signal
+    /// the sync state machine.
+    pub(in crate::io_loop) fn handle_sync_block_fetch_failed(&mut self, height: BlockHeight) {
+        self.protocols.pending_block_topups.remove(&height);
+        let outputs = self.protocols.sync.handle(SyncInput::BlockFetchFailed {
+            height,
+            now: std::time::Instant::now(),
+        });
+        self.process_sync_outputs(outputs);
+        self.update_fetch_tick_timer();
+    }
+
+    /// Handle a sync top-up response: second-pass rehydrate the buffered
+    /// elided block with the topup bodies.
+    pub(in crate::io_loop) fn handle_sync_block_topup_received(
+        &mut self,
+        height: BlockHeight,
+        response: Option<Box<GetBlockTopUpResponse>>,
+    ) {
+        let Some(elided) = self.protocols.pending_block_topups.remove(&height) else {
+            // Topup arrived after the pending state was already evicted
+            // (e.g. the outer fetch was retried and delivered first).
+            // Silently drop.
+            return;
+        };
+        let topup = response.map_or_else(GetBlockTopUpResponse::empty, |b| *b);
+        match self.rehydrate_with_topup(&elided, topup) {
+            Ok(cert) => self.deliver_sync_block(height, Some(Box::new(cert))),
+            Err(miss) => {
+                tracing::warn!(
+                    height = height.0,
+                    missing_total = miss.total(),
+                    "Sync: topup still short of bodies, refetching block"
+                );
+                metrics::record_sync_response_error("topup_short");
+                let _ = self
+                    .event_sender
+                    .send(NodeInput::SyncBlockFetchFailed { height });
+            }
+        }
+    }
+
+    /// Handle a sync top-up fetch failure: drop the buffered state and
+    /// schedule a fresh fetch.
+    pub(in crate::io_loop) fn handle_sync_block_topup_failed(&mut self, height: BlockHeight) {
+        self.protocols.pending_block_topups.remove(&height);
+        tracing::warn!(
+            height = height.0,
+            "Sync: topup request failed, refetching block"
+        );
+        metrics::record_sync_response_error("topup_failed");
+        let _ = self
+            .event_sender
+            .send(NodeInput::SyncBlockFetchFailed { height });
+    }
+
+    // ─── Sync output processing + helpers ───────────────────────────────
 
     /// Process `SyncProtocol` outputs internally.
     ///
-    /// `DeliverBlock` and `SyncComplete` are fed directly to the state machine
-    /// (no round-trip through the runner). `FetchBlock` uses the `Network` trait.
-    pub(super) fn process_sync_outputs(&mut self, outputs: Vec<SyncOutput>) {
+    /// `DeliverBlock` and `SyncComplete` are fed directly to the state
+    /// machine (no round-trip through the runner). `FetchBlock` uses the
+    /// `Network` trait.
+    pub(in crate::io_loop) fn process_sync_outputs(&mut self, outputs: Vec<SyncOutput>) {
         // Snapshot the sync inventory once per batch so every FetchBlock in
         // this tick shares a consistent view of mempool / cert-cache /
-        // provision-store membership. Built lazily: if the batch contains
-        // no FetchBlock outputs the snapshot is skipped entirely.
-        let mut inventory_cache: Option<hyperscale_messages::request::Inventory> = None;
+        // provision-store membership. Built lazily: skipped entirely if
+        // the batch contains no FetchBlock outputs.
+        let mut inventory_cache: Option<Inventory> = None;
         for output in outputs {
             match output {
                 SyncOutput::FetchBlock {
@@ -60,8 +162,9 @@ where
                                     let _ = es.send(NodeInput::SyncBlockFetchFailed { height });
                                 }
                             }
-                            // Sync's "peer doesn't have this height" is ambiguous
-                            // (peer may simply be behind us) — never Reject.
+                            // Sync's "peer doesn't have this height" is
+                            // ambiguous (peer may simply be behind us) —
+                            // never Reject.
                             ResponseVerdict::Accept
                         }),
                     );
@@ -89,14 +192,14 @@ where
     }
 
     /// Snapshot local mempool / finalized-wave cache / provision store
-    /// into an [`Inventory`](hyperscale_messages::request::Inventory) so
-    /// sync requests can tell the responder which bodies to elide.
+    /// into an [`Inventory`] so sync requests can tell the responder which
+    /// bodies to elide.
     ///
     /// Each category degrades independently to `None` when the cached set
     /// exceeds the filter size cap — the responder treats absence as
     /// "send everything for this category."
-    fn build_sync_inventory(&self) -> hyperscale_messages::request::Inventory {
-        hyperscale_messages::request::Inventory {
+    fn build_sync_inventory(&self) -> Inventory {
+        Inventory {
             tx_have: self.state.mempool().tx_bloom_snapshot(),
             cert_have: self.state.execution().cert_bloom_snapshot(),
             provision_have: self.caches.provision_store.provision_bloom_snapshot(),
@@ -106,12 +209,11 @@ where
     /// Rehydrate an elided sync response into a full `CertifiedBlock` by
     /// resolving any omitted body against local caches. On miss returns
     /// the list of hashes the lookups couldn't resolve — the caller uses
-    /// that list to issue a [`GetBlockTopUpRequest`] and retry.
-    pub(super) fn rehydrate_elided_block(
+    /// that list to issue a top-up request and retry.
+    fn rehydrate_elided_block(
         &self,
-        elided: &hyperscale_messages::response::ElidedCertifiedBlock,
-    ) -> Result<hyperscale_types::CertifiedBlock, hyperscale_messages::response::RehydrationMiss>
-    {
+        elided: &ElidedCertifiedBlock,
+    ) -> Result<CertifiedBlock, RehydrationMiss> {
         let mempool = self.state.mempool();
         let execution = self.state.execution();
         let provision_store = &self.caches.provision_store;
@@ -122,18 +224,16 @@ where
         )
     }
 
-    /// Second-pass rehydration after a [`GetBlockTopUpResponse`] arrives:
-    /// augment the local-cache lookups with the topup bodies so hashes
-    /// that missed the first pass can be resolved. On any residual miss
-    /// the block is dropped — the sync retry machinery refetches it from
-    /// scratch (losing the inventory win for this block but making
-    /// forward progress).
-    pub(super) fn rehydrate_with_topup(
+    /// Second-pass rehydration after a `GetBlockTopUpResponse` arrives:
+    /// augment local-cache lookups with the topup bodies so hashes that
+    /// missed the first pass can be resolved. On any residual miss the
+    /// block is dropped — the sync retry machinery refetches from scratch
+    /// (losing the inventory win for this block but making forward progress).
+    fn rehydrate_with_topup(
         &self,
-        elided: &hyperscale_messages::response::ElidedCertifiedBlock,
-        topup: hyperscale_messages::response::GetBlockTopUpResponse,
-    ) -> Result<hyperscale_types::CertifiedBlock, hyperscale_messages::response::RehydrationMiss>
-    {
+        elided: &ElidedCertifiedBlock,
+        topup: GetBlockTopUpResponse,
+    ) -> Result<CertifiedBlock, RehydrationMiss> {
         use std::collections::HashMap;
 
         let mut topup_tx: HashMap<_, _> = topup.transactions.into_iter().collect();
@@ -153,17 +253,16 @@ where
         )
     }
 
-    /// Fire off a [`GetBlockTopUpRequest`] targeting `miss`, stashing
+    /// Fire off a `GetBlockTopUpRequest` targeting `miss`, stashing
     /// `elided` for rehydration when the response arrives. The closure
-    /// translates the network callback into
-    /// [`NodeInput::SyncBlockTopUpReceived`] / [`SyncBlockTopUpFailed`]
-    /// so the state handler does the actual rehydration on the main
-    /// thread.
-    pub(super) fn issue_sync_topup(
+    /// translates the network callback into `NodeInput::SyncBlockTopUpReceived`
+    /// / `SyncBlockTopUpFailed` so the state handler does the actual
+    /// rehydration on the main thread.
+    fn issue_sync_topup(
         &mut self,
-        height: hyperscale_types::BlockHeight,
-        elided: Box<hyperscale_messages::response::ElidedCertifiedBlock>,
-        miss: hyperscale_messages::response::RehydrationMiss,
+        height: BlockHeight,
+        elided: Box<ElidedCertifiedBlock>,
+        miss: RehydrationMiss,
     ) {
         use hyperscale_messages::request::GetBlockTopUpRequest;
 
@@ -199,11 +298,7 @@ where
     /// then feed the block into the sync state machine (or pass through
     /// `None` for not-found). Shared between the main-response path and
     /// the top-up completion path.
-    pub(super) fn deliver_sync_block(
-        &mut self,
-        height: hyperscale_types::BlockHeight,
-        block: Option<Box<hyperscale_types::CertifiedBlock>>,
-    ) {
+    fn deliver_sync_block(&mut self, height: BlockHeight, block: Option<Box<CertifiedBlock>>) {
         let certificate_root_valid = match block.as_deref() {
             Some(fetched) if !fetched.block.certificates().is_empty() => {
                 let computed =
@@ -237,75 +332,5 @@ where
                 .event_sender
                 .send(NodeInput::SyncBlockFetchFailed { height });
         }
-    }
-
-    /// Dispatch outputs from any [`FetchBinding`]'s state machine: emit one
-    /// network request per chunk (or per id, for `PER_ID` bindings) and
-    /// route the response through the binding's callback.
-    pub(super) fn process_fetch_outputs<B: FetchBinding>(
-        &self,
-        outputs: Vec<crate::io_loop::protocol::fetch::FetchOutput<B::Id>>,
-    ) {
-        use crate::io_loop::protocol::fetch::FetchOutput;
-
-        for FetchOutput::Send { ids, peers } in outputs {
-            if B::PER_ID {
-                for id in ids {
-                    B::dispatch_chunk(
-                        vec![id],
-                        &peers,
-                        self.local_shard,
-                        &*self.network,
-                        &self.event_sender,
-                    );
-                }
-            } else {
-                B::dispatch_chunk(
-                    ids,
-                    &peers,
-                    self.local_shard,
-                    &*self.network,
-                    &self.event_sender,
-                );
-            }
-        }
-    }
-
-    /// Drive a single fetch binding: feed a `Request`, drain the resulting
-    /// `Tick` outputs through `process_fetch_outputs`. Used by both the
-    /// `Action::Fetch` arms and the `*FetchFailed` step arms.
-    pub(super) fn drive_fetch<B: FetchBinding>(
-        &mut self,
-        input: crate::io_loop::protocol::fetch::FetchInput<B::Id>,
-    ) {
-        use crate::io_loop::protocol::fetch::FetchInput;
-        if let FetchInput::Request { ids, peers } = &input {
-            tracing::trace!(
-                binding = B::NAME,
-                ids = ids.len(),
-                peer_count = peers.peers.len() + usize::from(peers.preferred.is_some()),
-                "Dispatching fetch request"
-            );
-        }
-        let outputs = {
-            let fetch = B::fetch_mut(&mut self.protocols);
-            fetch.handle(input);
-            fetch.handle(FetchInput::Tick)
-        };
-        self.process_fetch_outputs::<B>(outputs);
-    }
-
-    pub(super) fn update_fetch_tick_timer(&mut self) {
-        let op = if self.protocols.has_any_pending() {
-            TimerOp::Set {
-                id: TimerId::FetchTick,
-                duration: Self::FETCH_TICK_INTERVAL,
-            }
-        } else {
-            TimerOp::Cancel {
-                id: TimerId::FetchTick,
-            }
-        };
-        self.pending_timer_ops.push(op);
     }
 }
