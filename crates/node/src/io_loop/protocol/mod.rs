@@ -6,8 +6,8 @@
 //! - [`provision_serve`] / [`transaction_serve`] inbound request handlers
 //!   that serve cached state to peers.
 
+pub mod binding;
 pub mod fetch;
-pub mod fetch_instances;
 pub mod host;
 pub mod provision_serve;
 pub mod sync;

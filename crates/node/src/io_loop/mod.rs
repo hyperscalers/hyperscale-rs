@@ -33,6 +33,10 @@ use crate::batch_accumulator::BatchAccumulator;
 use crate::config::NodeConfig;
 use crate::io_loop::block_commit::BlockCommitCoordinator;
 use crate::io_loop::caches::SharedCaches;
+use crate::io_loop::protocol::binding::{
+    ExecCertBinding, FinalizedWaveBinding, HeaderBinding, LocalProvisionBinding, ProvisionBinding,
+    TransactionBinding,
+};
 use crate::io_loop::protocol::fetch::FetchInput;
 use crate::io_loop::protocol::host::ProtocolHost;
 use crate::io_loop::protocol::sync::{SyncInput, SyncStatus};
@@ -609,12 +613,7 @@ where
             }
 
             NodeInput::FetchTransactionsFailed { hashes } => {
-                self.protocols
-                    .transaction
-                    .handle(FetchInput::Failed { ids: hashes });
-                // Tick to retry pending fetches.
-                let tick_outputs = self.protocols.transaction.handle(FetchInput::Tick);
-                self.process_transaction_fetch_outputs(tick_outputs);
+                self.drive_fetch::<TransactionBinding>(FetchInput::Failed { ids: hashes });
             }
 
             NodeInput::FetchTick => {
@@ -627,31 +626,19 @@ where
                 let outputs = self.protocols.sync.handle(SyncInput::Tick { now });
                 self.process_sync_outputs(outputs);
 
-                let outputs = self.protocols.transaction.handle(FetchInput::Tick);
-                self.process_transaction_fetch_outputs(outputs);
-
-                let outputs = self.protocols.local_provision.handle(FetchInput::Tick);
-                self.process_local_provision_fetch_outputs(outputs);
-
-                let outputs = self.protocols.finalized_wave.handle(FetchInput::Tick);
-                self.process_finalized_wave_fetch_outputs(outputs);
+                self.drive_fetch::<TransactionBinding>(FetchInput::Tick);
+                self.drive_fetch::<LocalProvisionBinding>(FetchInput::Tick);
+                self.drive_fetch::<FinalizedWaveBinding>(FetchInput::Tick);
 
                 self.protocols.provision.evict_abandoned(|id| {
-                    crate::io_loop::protocol::fetch_instances::provisions_is_abandoned(
-                        &self.state,
-                        id,
-                    )
+                    crate::io_loop::protocol::binding::provisions_is_abandoned(&self.state, id)
                 });
-                let outputs = self.protocols.provision.handle(FetchInput::Tick);
-                self.process_provision_fetch_outputs(outputs);
+                self.drive_fetch::<ProvisionBinding>(FetchInput::Tick);
 
-                let outputs = self.protocols.exec_cert.handle(FetchInput::Tick);
-                self.process_exec_cert_fetch_outputs(outputs);
-
+                self.drive_fetch::<ExecCertBinding>(FetchInput::Tick);
                 // Header fetch drains via `Continuation(RemoteHeaderAdmitted)`
                 // through `apply_admission`.
-                let outputs = self.protocols.header.handle(FetchInput::Tick);
-                self.process_header_fetch_outputs(outputs);
+                self.drive_fetch::<HeaderBinding>(FetchInput::Tick);
 
                 self.update_fetch_tick_timer();
             }
@@ -661,12 +648,9 @@ where
                 source_shard,
                 block_height,
             } => {
-                self.protocols.provision.handle(FetchInput::Failed {
+                self.drive_fetch::<ProvisionBinding>(FetchInput::Failed {
                     ids: vec![(source_shard, block_height)],
                 });
-                // Tick to re-issue immediately; network handles peer rotation.
-                let tick_outputs = self.protocols.provision.handle(FetchInput::Tick);
-                self.process_provision_fetch_outputs(tick_outputs);
                 self.update_fetch_tick_timer();
             }
 
@@ -682,11 +666,7 @@ where
             }
 
             NodeInput::ExecCertFetchFailed { hashes } => {
-                self.protocols
-                    .exec_cert
-                    .handle(FetchInput::Failed { ids: hashes });
-                let tick_outputs = self.protocols.exec_cert.handle(FetchInput::Tick);
-                self.process_exec_cert_fetch_outputs(tick_outputs);
+                self.drive_fetch::<ExecCertBinding>(FetchInput::Failed { ids: hashes });
                 self.update_fetch_tick_timer();
             }
 
@@ -695,12 +675,9 @@ where
                 source_shard,
                 from_height,
             } => {
-                self.protocols.header.handle(FetchInput::Failed {
+                self.drive_fetch::<HeaderBinding>(FetchInput::Failed {
                     ids: vec![(source_shard, from_height)],
                 });
-                // Tick to re-issue immediately; network handles peer rotation.
-                let tick_outputs = self.protocols.header.handle(FetchInput::Tick);
-                self.process_header_fetch_outputs(tick_outputs);
                 self.update_fetch_tick_timer();
             }
 
@@ -758,11 +735,7 @@ where
             }
 
             NodeInput::LocalProvisionsFetchFailed { hashes } => {
-                self.protocols
-                    .local_provision
-                    .handle(FetchInput::Failed { ids: hashes });
-                let tick_outputs = self.protocols.local_provision.handle(FetchInput::Tick);
-                self.process_local_provision_fetch_outputs(tick_outputs);
+                self.drive_fetch::<LocalProvisionBinding>(FetchInput::Failed { ids: hashes });
                 self.update_fetch_tick_timer();
             }
 
@@ -800,11 +773,7 @@ where
             }
 
             NodeInput::FinalizedWaveFetchFailed { hashes } => {
-                self.protocols
-                    .finalized_wave
-                    .handle(FetchInput::Failed { ids: hashes });
-                let tick_outputs = self.protocols.finalized_wave.handle(FetchInput::Tick);
-                self.process_finalized_wave_fetch_outputs(tick_outputs);
+                self.drive_fetch::<FinalizedWaveBinding>(FetchInput::Failed { ids: hashes });
                 self.update_fetch_tick_timer();
             }
 

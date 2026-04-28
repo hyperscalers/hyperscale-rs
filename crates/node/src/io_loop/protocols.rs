@@ -1,6 +1,7 @@
 //! Sync and fetch protocol output processing.
 
 use super::{IoLoop, TimerOp};
+use crate::io_loop::protocol::binding::FetchBinding;
 use crate::io_loop::protocol::sync::{SyncInput, SyncOutput};
 use hyperscale_core::{NodeInput, ProtocolEvent, TimerId};
 use hyperscale_dispatch::Dispatch;
@@ -8,8 +9,6 @@ use hyperscale_engine::Engine;
 use hyperscale_metrics as metrics;
 use hyperscale_network::{Network, ResponseVerdict};
 use hyperscale_storage::Storage;
-use hyperscale_types::ValidatorId;
-use std::sync::Arc;
 use std::time::Duration;
 
 impl<S, N, D, E> IoLoop<S, N, D, E>
@@ -240,305 +239,60 @@ where
         }
     }
 
-    /// Dispatch outputs from the transaction fetch.
-    pub(super) fn process_transaction_fetch_outputs(
+    /// Dispatch outputs from any [`FetchBinding`]'s state machine: emit one
+    /// network request per chunk (or per id, for `PER_ID` bindings) and
+    /// route the response through the binding's callback.
+    pub(super) fn process_fetch_outputs<B: FetchBinding>(
         &self,
-        outputs: Vec<crate::io_loop::protocol::fetch::FetchOutput<hyperscale_types::TxHash>>,
-    ) {
-        use crate::io_loop::protocol::fetch::FetchOutput;
-        use hyperscale_messages::request::GetTransactionsRequest;
-
-        for output in outputs {
-            let FetchOutput::Send {
-                ids: tx_hashes,
-                peers,
-            } = output;
-            let es = self.event_sender.clone();
-            let hs = tx_hashes.clone();
-            self.network.request(
-                &peers.peers,
-                peers.preferred,
-                GetTransactionsRequest::new(tx_hashes),
-                Box::new(move |result| {
-                    if let Ok(resp) = result {
-                        let txs = resp.into_transactions();
-                        let returned = txs.len();
-                        let requested = hs.len();
-                        let _ = es.send(NodeInput::TransactionReceived { transactions: txs });
-                        // Peer returned strictly fewer txs than requested →
-                        // they don't have part of the set we asked for.
-                        if returned < requested {
-                            ResponseVerdict::Reject
-                        } else {
-                            ResponseVerdict::Accept
-                        }
-                    } else {
-                        let _ = es.send(NodeInput::FetchTransactionsFailed { hashes: hs });
-                        ResponseVerdict::Accept
-                    }
-                }),
-            );
-        }
-    }
-
-    /// Dispatch outputs from the local-provision fetch.
-    pub(super) fn process_local_provision_fetch_outputs(
-        &self,
-        outputs: Vec<crate::io_loop::protocol::fetch::FetchOutput<hyperscale_types::ProvisionHash>>,
-    ) {
-        use crate::io_loop::protocol::fetch::FetchOutput;
-        use hyperscale_messages::request::GetLocalProvisionsRequest;
-
-        for output in outputs {
-            let FetchOutput::Send {
-                ids: batch_hashes,
-                peers,
-            } = output;
-            let es = self.event_sender.clone();
-            let hs = batch_hashes.clone();
-            self.network.request(
-                &peers.peers,
-                peers.preferred,
-                GetLocalProvisionsRequest::new(batch_hashes),
-                Box::new(move |result| {
-                    if let Ok(resp) = result {
-                        let had_misses = !resp.missing_hashes.is_empty();
-                        let batches = resp.batches.into_iter().map(Arc::new).collect();
-                        let _ = es.send(NodeInput::LocalProvisionReceived {
-                            batches,
-                            missing_hashes: resp.missing_hashes,
-                        });
-                        if had_misses {
-                            ResponseVerdict::Reject
-                        } else {
-                            ResponseVerdict::Accept
-                        }
-                    } else {
-                        let _ = es.send(NodeInput::LocalProvisionsFetchFailed { hashes: hs });
-                        ResponseVerdict::Accept
-                    }
-                }),
-            );
-        }
-    }
-
-    /// Dispatch outputs from the cross-shard provision fetch.
-    ///
-    /// On a successful response, the verified-shape provisions are fed
-    /// straight into the state machine as `ProvisionsReceived` and the
-    /// `ProvisionsAdmitted` continuation triggers admission.
-    pub(super) fn process_provision_fetch_outputs(
-        &self,
-        outputs: Vec<
-            crate::io_loop::protocol::fetch::FetchOutput<(
-                hyperscale_types::ShardGroupId,
-                hyperscale_types::BlockHeight,
-            )>,
-        >,
+        outputs: Vec<crate::io_loop::protocol::fetch::FetchOutput<B::Id>>,
     ) {
         use crate::io_loop::protocol::fetch::FetchOutput;
 
-        for output in outputs {
-            let FetchOutput::Send { ids, peers } = output;
-            for (source_shard, block_height) in ids {
-                use hyperscale_messages::request::GetProvisionsRequest;
-                let target_shard = self.local_shard;
-                let request = GetProvisionsRequest {
-                    block_height,
-                    target_shard,
-                };
-                let sender = self.event_sender.clone();
-                self.network.request(
-                    &peers.peers,
-                    peers.preferred,
-                    request,
-                    Box::new(move |result| {
-                        let Ok(response) = result else {
-                            let _ = sender.send(NodeInput::ProvisionsFetchFailed {
-                                source_shard,
-                                block_height,
-                            });
-                            return ResponseVerdict::Accept;
-                        };
-                        let Some(provisions) = response.provisions else {
-                            // Peer cannot serve (state version GC'd).
-                            let _ = sender.send(NodeInput::ProvisionsFetchFailed {
-                                source_shard,
-                                block_height,
-                            });
-                            return ResponseVerdict::Reject;
-                        };
-                        if provisions.source_shard != source_shard
-                            || provisions.target_shard != target_shard
-                            || provisions.block_height != block_height
-                        {
-                            tracing::warn!(
-                                expected_source = source_shard.0,
-                                got_source = provisions.source_shard.0,
-                                expected_target = target_shard.0,
-                                got_target = provisions.target_shard.0,
-                                expected_height = block_height.0,
-                                got_height = provisions.block_height.0,
-                                "Dropping provision fetch response: scope mismatch"
-                            );
-                            let _ = sender.send(NodeInput::ProvisionsFetchFailed {
-                                source_shard,
-                                block_height,
-                            });
-                            return ResponseVerdict::Reject;
-                        }
-                        if provisions.transactions.is_empty() {
-                            return ResponseVerdict::Reject;
-                        }
-                        let _ =
-                            sender.send(NodeInput::Protocol(ProtocolEvent::ProvisionsReceived {
-                                provisions,
-                            }));
-                        ResponseVerdict::Accept
-                    }),
+        for FetchOutput::Send { ids, peers } in outputs {
+            if B::PER_ID {
+                for id in ids {
+                    B::dispatch_chunk(
+                        vec![id],
+                        &peers,
+                        self.local_shard,
+                        &*self.network,
+                        &self.event_sender,
+                    );
+                }
+            } else {
+                B::dispatch_chunk(
+                    ids,
+                    &peers,
+                    self.local_shard,
+                    &*self.network,
+                    &self.event_sender,
                 );
             }
         }
     }
 
-    /// Dispatch outputs from the cross-shard execution-cert fetch.
-    pub(super) fn process_exec_cert_fetch_outputs(
-        &self,
-        outputs: Vec<crate::io_loop::protocol::fetch::FetchOutput<hyperscale_types::WaveId>>,
+    /// Drive a single fetch binding: feed a `Request`, drain the resulting
+    /// `Tick` outputs through `process_fetch_outputs`. Used by both the
+    /// `Action::Fetch` arms and the `*FetchFailed` step arms.
+    pub(super) fn drive_fetch<B: FetchBinding>(
+        &mut self,
+        input: crate::io_loop::protocol::fetch::FetchInput<B::Id>,
     ) {
-        use crate::io_loop::protocol::fetch::FetchOutput;
-        use hyperscale_messages::request::GetExecutionCertsRequest;
-
-        for output in outputs {
-            let FetchOutput::Send {
-                ids: wave_ids,
-                peers,
-            } = output;
-            let failed_ids = wave_ids.clone();
-            let request = GetExecutionCertsRequest { wave_ids };
-            let sender = self.event_sender.clone();
-            self.network.request(
-                &peers.peers,
-                peers.preferred,
-                request,
-                Box::new(move |result| {
-                    if let Ok(response) = result {
-                        match response.certificates {
-                            Some(certs) if !certs.is_empty() => {
-                                let _ = sender.send(NodeInput::ExecutionCertsReceived {
-                                    certificates: certs,
-                                });
-                                ResponseVerdict::Accept
-                            }
-                            _ => {
-                                let _ = sender
-                                    .send(NodeInput::ExecCertFetchFailed { hashes: failed_ids });
-                                ResponseVerdict::Reject
-                            }
-                        }
-                    } else {
-                        let _ = sender.send(NodeInput::ExecCertFetchFailed { hashes: failed_ids });
-                        ResponseVerdict::Accept
-                    }
-                }),
+        use crate::io_loop::protocol::fetch::FetchInput;
+        if let FetchInput::Request { ids, peers } = &input {
+            tracing::trace!(
+                binding = B::NAME,
+                ids = ids.len(),
+                peer_count = peers.peers.len() + usize::from(peers.preferred.is_some()),
+                "Dispatching fetch request"
             );
         }
-    }
-
-    /// Dispatch outputs from the cross-shard header fetch.
-    ///
-    /// On a successful response, the fetched header is fed straight into the
-    /// state machine as a `RemoteBlockCommitted` event — the same path taken
-    /// by gossiped headers — and the QC verification flow signals admission.
-    pub(super) fn process_header_fetch_outputs(
-        &self,
-        outputs: Vec<
-            crate::io_loop::protocol::fetch::FetchOutput<(
-                hyperscale_types::ShardGroupId,
-                hyperscale_types::BlockHeight,
-            )>,
-        >,
-    ) {
-        use crate::io_loop::protocol::fetch::FetchOutput;
-
-        for output in outputs {
-            let FetchOutput::Send { ids, peers } = output;
-            for (source_shard, from_height) in ids {
-                use hyperscale_messages::request::GetCommittedBlockHeaderRequest;
-                let request = GetCommittedBlockHeaderRequest {
-                    shard: source_shard,
-                    height: from_height,
-                };
-                let sender = self.event_sender.clone();
-                self.network.request(
-                    &peers.peers,
-                    peers.preferred,
-                    request,
-                    Box::new(move |result| {
-                        let Ok(response) = result else {
-                            let _ = sender.send(NodeInput::HeaderFetchFailed {
-                                source_shard,
-                                from_height,
-                            });
-                            return ResponseVerdict::Accept;
-                        };
-                        let Some(header) = response.header else {
-                            let _ = sender.send(NodeInput::HeaderFetchFailed {
-                                source_shard,
-                                from_height,
-                            });
-                            return ResponseVerdict::Reject;
-                        };
-                        let _ =
-                            sender.send(NodeInput::Protocol(ProtocolEvent::RemoteBlockCommitted {
-                                committed_header: header,
-                                sender: ValidatorId(0),
-                            }));
-                        ResponseVerdict::Accept
-                    }),
-                );
-            }
-        }
-    }
-
-    /// Dispatch outputs from the finalized-wave fetch.
-    pub(super) fn process_finalized_wave_fetch_outputs(
-        &self,
-        outputs: Vec<crate::io_loop::protocol::fetch::FetchOutput<hyperscale_types::WaveIdHash>>,
-    ) {
-        use crate::io_loop::protocol::fetch::FetchOutput;
-        use hyperscale_messages::request::GetFinalizedWavesRequest;
-
-        for output in outputs {
-            let FetchOutput::Send {
-                ids: wave_id_hashes,
-                peers,
-            } = output;
-            let es = self.event_sender.clone();
-            let hs = wave_id_hashes.clone();
-            self.network.request(
-                &peers.peers,
-                peers.preferred,
-                GetFinalizedWavesRequest::new(wave_id_hashes),
-                Box::new(move |result| {
-                    if let Ok(resp) = result {
-                        let returned = resp.waves.len();
-                        let requested = hs.len();
-                        let waves = resp.waves.into_iter().map(Arc::new).collect();
-                        let _ = es.send(NodeInput::FinalizedWaveReceived { waves });
-                        // Peer didn't have all the waves we asked for.
-                        if returned < requested {
-                            ResponseVerdict::Reject
-                        } else {
-                            ResponseVerdict::Accept
-                        }
-                    } else {
-                        let _ = es.send(NodeInput::FinalizedWaveFetchFailed { hashes: hs });
-                        ResponseVerdict::Accept
-                    }
-                }),
-            );
-        }
+        let outputs = {
+            let fetch = B::fetch_mut(&mut self.protocols);
+            fetch.handle(input);
+            fetch.handle(FetchInput::Tick)
+        };
+        self.process_fetch_outputs::<B>(outputs);
     }
 
     pub(super) fn update_fetch_tick_timer(&mut self) {

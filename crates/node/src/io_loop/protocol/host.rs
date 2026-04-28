@@ -5,11 +5,11 @@
 //! `IoLoop` collapses 8 fields into one and makes "what the I/O loop is
 //! orchestrating" explicit.
 
-use super::fetch::FetchConfig;
-use super::fetch_instances::{
+use super::binding::{
     ExecCertFetch, FinalizedWaveFetch, HeaderFetch, LocalProvisionFetch, ProvisionFetch,
     TransactionFetch,
 };
+use super::fetch::FetchConfig;
 use super::sync::SyncProtocol;
 use crate::config::NodeConfig;
 use hyperscale_messages::response::ElidedCertifiedBlock;
@@ -17,7 +17,7 @@ use hyperscale_types::BlockHeight;
 use std::collections::HashMap;
 
 /// Sync + per-payload fetch protocols owned by the I/O loop.
-pub(crate) struct ProtocolHost {
+pub struct ProtocolHost {
     /// Block-sync state machine.
     pub sync: SyncProtocol,
 
@@ -47,6 +47,7 @@ pub(crate) struct ProtocolHost {
 
 impl ProtocolHost {
     /// Build the protocol host from a node config.
+    #[must_use]
     pub fn new(config: &NodeConfig) -> Self {
         Self {
             sync: SyncProtocol::new(config.sync.clone()),
@@ -84,6 +85,7 @@ impl ProtocolHost {
 
     /// True if any fetch protocol has work outstanding (in-flight or
     /// queued), or if sync has heights parked behind a backoff.
+    #[must_use]
     pub fn has_any_pending(&self) -> bool {
         self.transaction.has_pending()
             || self.local_provision.has_pending()
