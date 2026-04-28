@@ -96,8 +96,9 @@ pub enum TimerOp {
 
 /// Output from processing a single event via `IoLoop::step()`.
 ///
-/// `IoLoop` now handles all sync/fetch I/O internally via the `Network` trait.
-/// The runner processes emitted transaction statuses and timer operations.
+/// `IoLoop` now handles all sync/fetch I/O and block-commit dispatch
+/// internally via the `Network` and `Dispatch` traits. The runner only
+/// processes emitted transaction statuses and timer operations.
 pub struct StepOutput {
     /// Transaction status notifications emitted during this step.
     pub emitted_statuses: Vec<(TxHash, hyperscale_types::TransactionStatus)>,
@@ -105,10 +106,6 @@ pub struct StepOutput {
     pub actions_generated: usize,
     /// Timer operations (set/cancel) to be processed by the runner.
     pub timer_ops: Vec<TimerOp>,
-    /// Block commit task prepared by `flush_block_commits`. The runner decides
-    /// where to execute: production uses `tokio::spawn_blocking`, simulation
-    /// runs inline.
-    pub commit_task: Option<Box<dyn FnOnce() + Send>>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -880,7 +877,6 @@ where
             emitted_statuses: std::mem::take(&mut self.emitted_statuses),
             actions_generated: self.actions_generated,
             timer_ops: std::mem::take(&mut self.pending_timer_ops),
-            commit_task: self.block_commit.drain_task(),
         }
     }
 

@@ -384,7 +384,8 @@ where
     }
 
     pub(super) fn flush_block_commits(&mut self) {
-        self.block_commit.flush(&self.storage, &self.event_sender);
+        self.block_commit
+            .flush(&self.storage, &self.event_sender, &self.dispatch);
     }
 
     /// Process sync and unified-fetch actions.

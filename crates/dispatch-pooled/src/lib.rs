@@ -530,13 +530,13 @@ impl Dispatch for PooledDispatch {
                 metrics::record_pool_task_completed(label, start.elapsed().as_secs_f64());
             });
         } else {
-            // DispatchPool::Io — route to tokio. Wrap the sync closure in a
-            // future so it runs on the worker pool (network sends, channel
-            // posts). For genuinely blocking work (fsync), callers should
-            // use spawn_blocking themselves inside the closure.
+            // DispatchPool::Io — route to tokio's blocking pool. Sized for
+            // work that doesn't yield (fsync, network sends behind sync
+            // libp2p adapters, GC). Non-blocking ops tolerate it fine; the
+            // blocking pool just runs them straight through.
             let pending = Arc::clone(&self.io_pending);
             pending.fetch_add(1, Ordering::Relaxed);
-            self.tokio_handle.spawn(async move {
+            self.tokio_handle.spawn_blocking(move || {
                 let start = std::time::Instant::now();
                 f();
                 pending.fetch_sub(1, Ordering::Relaxed);
