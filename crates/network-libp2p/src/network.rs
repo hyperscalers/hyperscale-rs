@@ -9,7 +9,7 @@ use crate::notify_pool::NotifyStreamPool;
 use crate::request_manager::{RequestManager, RequestPriority};
 use hyperscale_network::{
     GossipHandler, HandlerRegistry, Network, NotificationHandler, RequestError, RequestHandler,
-    Topic, TopicScope, ValidatorKeyMap, compression,
+    ResponseVerdict, Topic, TopicScope, ValidatorKeyMap, compression,
 };
 use hyperscale_types::{NetworkMessage, Request, ShardGroupId, ShardMessage, ValidatorId};
 use libp2p::PeerId;
@@ -162,7 +162,7 @@ impl Network for Libp2pNetwork {
         peers: &[ValidatorId],
         preferred_peer: Option<ValidatorId>,
         request: R,
-        on_response: Box<dyn FnOnce(Result<R::Response, RequestError>) + Send>,
+        on_response: Box<dyn FnOnce(Result<R::Response, RequestError>) -> ResponseVerdict + Send>,
     ) {
         // Resolve ValidatorIds → PeerIds via the adapter's global registry
         let resolved_peers: Vec<PeerId> = peers
@@ -186,7 +186,9 @@ impl Network for Libp2pNetwork {
                     "PeerUnreachable errors continue (validator-bind still in progress)"
                 );
             }
-            on_response(Err(RequestError::PeerUnreachable(
+            // Verdict ignored on the Err path — the network already recorded
+            // the failure (or there's nothing to penalize).
+            let _ = on_response(Err(RequestError::PeerUnreachable(
                 preferred_peer.unwrap_or(ValidatorId(0)),
             )));
             return;
@@ -204,7 +206,7 @@ impl Network for Libp2pNetwork {
             Ok(bytes) => bytes,
             Err(e) => {
                 warn!(error = ?e, "Libp2pNetwork: failed to encode request");
-                on_response(Err(RequestError::PeerError(format!("encode error: {e:?}"))));
+                let _ = on_response(Err(RequestError::PeerError(format!("encode error: {e:?}"))));
                 return;
             }
         };
@@ -226,20 +228,26 @@ impl Network for Libp2pNetwork {
                 )
                 .await
             {
-                Ok((_peer, bytes)) => {
-                    // RequestManager returns decompressed SBOR response bytes
-                    match sbor::basic_decode::<R::Response>(&bytes) {
+                Ok((peer, bytes)) => {
+                    // RequestManager returns decompressed SBOR response bytes.
+                    // The serving peer is captured so we can deprioritize it
+                    // in the health tracker if the app rejects the response.
+                    let verdict = match sbor::basic_decode::<R::Response>(&bytes) {
                         Ok(response) => on_response(Ok(response)),
                         Err(e) => {
                             warn!(error = ?e, "Failed to decode response");
                             on_response(Err(RequestError::PeerError(format!(
                                 "decode error: {e:?}"
-                            ))));
+                            ))))
                         }
+                    };
+                    if matches!(verdict, ResponseVerdict::Reject) {
+                        rm.health_tracker().record_failure(&peer, false);
+                        hyperscale_metrics::record_request_retry("app_rejected");
                     }
                 }
                 Err(e) => {
-                    on_response(Err(RequestError::PeerError(format!("{e}"))));
+                    let _ = on_response(Err(RequestError::PeerError(format!("{e}"))));
                 }
             }
         });

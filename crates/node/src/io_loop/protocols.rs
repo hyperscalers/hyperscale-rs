@@ -6,7 +6,7 @@ use hyperscale_core::{NodeInput, ProtocolEvent, TimerId};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::Engine;
 use hyperscale_metrics as metrics;
-use hyperscale_network::Network;
+use hyperscale_network::{Network, ResponseVerdict};
 use hyperscale_storage::Storage;
 use hyperscale_types::ValidatorId;
 use std::sync::Arc;
@@ -48,15 +48,22 @@ where
                         &peers,
                         None,
                         GetBlockRequest::new(height, target_height).with_inventory(inventory),
-                        Box::new(move |result| match result {
-                            Ok(resp) => {
-                                let block = resp.into_elided().map(Box::new);
-                                let _ =
-                                    es.send(NodeInput::SyncBlockResponseReceived { height, block });
+                        Box::new(move |result| {
+                            match result {
+                                Ok(resp) => {
+                                    let block = resp.into_elided().map(Box::new);
+                                    let _ = es.send(NodeInput::SyncBlockResponseReceived {
+                                        height,
+                                        block,
+                                    });
+                                }
+                                Err(_) => {
+                                    let _ = es.send(NodeInput::SyncBlockFetchFailed { height });
+                                }
                             }
-                            Err(_) => {
-                                let _ = es.send(NodeInput::SyncBlockFetchFailed { height });
-                            }
+                            // Sync's "peer doesn't have this height" is ambiguous
+                            // (peer may simply be behind us) — never Reject.
+                            ResponseVerdict::Accept
                         }),
                     );
                 }
@@ -175,16 +182,16 @@ where
             &peers,
             None,
             req,
-            Box::new(move |result| match result {
-                Ok(resp) => {
+            Box::new(move |result| {
+                if let Ok(resp) = result {
                     let _ = es.send(NodeInput::SyncBlockTopUpReceived {
                         height,
                         response: Some(Box::new(resp)),
                     });
-                }
-                Err(_) => {
+                } else {
                     let _ = es.send(NodeInput::SyncBlockTopUpFailed { height });
                 }
+                ResponseVerdict::Accept
             }),
         );
     }
@@ -250,14 +257,22 @@ where
                 &peers,
                 Some(proposer),
                 GetTransactionsRequest::new(tx_hashes),
-                Box::new(move |result| match result {
-                    Ok(resp) => {
-                        let _ = es.send(NodeInput::TransactionReceived {
-                            transactions: resp.into_transactions(),
-                        });
-                    }
-                    Err(_) => {
+                Box::new(move |result| {
+                    if let Ok(resp) = result {
+                        let txs = resp.into_transactions();
+                        let returned = txs.len();
+                        let requested = hs.len();
+                        let _ = es.send(NodeInput::TransactionReceived { transactions: txs });
+                        // Peer returned strictly fewer txs than requested →
+                        // they don't have part of the set we asked for.
+                        if returned < requested {
+                            ResponseVerdict::Reject
+                        } else {
+                            ResponseVerdict::Accept
+                        }
+                    } else {
                         let _ = es.send(NodeInput::FetchTransactionsFailed { hashes: hs });
+                        ResponseVerdict::Accept
                     }
                 }),
             );
@@ -284,16 +299,22 @@ where
                 &peers,
                 Some(proposer),
                 GetLocalProvisionsRequest::new(batch_hashes),
-                Box::new(move |result| match result {
-                    Ok(resp) => {
+                Box::new(move |result| {
+                    if let Ok(resp) = result {
+                        let had_misses = !resp.missing_hashes.is_empty();
                         let batches = resp.batches.into_iter().map(Arc::new).collect();
                         let _ = es.send(NodeInput::LocalProvisionReceived {
                             batches,
                             missing_hashes: resp.missing_hashes,
                         });
-                    }
-                    Err(_) => {
+                        if had_misses {
+                            ResponseVerdict::Reject
+                        } else {
+                            ResponseVerdict::Accept
+                        }
+                    } else {
                         let _ = es.send(NodeInput::LocalProvisionsFetchFailed { hashes: hs });
+                        ResponseVerdict::Accept
                     }
                 }),
             );
@@ -332,53 +353,48 @@ where
                         &[peer],
                         None,
                         request,
-                        Box::new(move |result| match result {
-                            Ok(response) => match response.provisions {
-                                Some(provisions) => {
-                                    // A peer responded with a bundle scoped to the
-                                    // wrong (source, target) pair — treat as a fetch
-                                    // failure so the protocol tries the next peer.
-                                    if provisions.source_shard != source_shard
-                                        || provisions.target_shard != target_shard
-                                        || provisions.block_height != block_height
-                                    {
-                                        tracing::warn!(
-                                            expected_source = source_shard.0,
-                                            got_source = provisions.source_shard.0,
-                                            expected_target = target_shard.0,
-                                            got_target = provisions.target_shard.0,
-                                            expected_height = block_height.0,
-                                            got_height = provisions.block_height.0,
-                                            "Dropping provision fetch response: scope mismatch"
-                                        );
-                                        let _ = sender.send(NodeInput::ProvisionsFetchFailed {
-                                            source_shard,
-                                            block_height,
-                                        });
-                                        return;
-                                    }
-                                    if provisions.transactions.is_empty() {
-                                        return;
-                                    }
-                                    let _ = sender.send(NodeInput::Protocol(
-                                        ProtocolEvent::ProvisionsReceived { provisions },
-                                    ));
-                                }
-                                None => {
-                                    // Peer cannot serve (state version GC'd) → fail
-                                    // so the protocol tries the next peer.
-                                    let _ = sender.send(NodeInput::ProvisionsFetchFailed {
-                                        source_shard,
-                                        block_height,
-                                    });
-                                }
-                            },
-                            Err(_) => {
+                        Box::new(move |result| {
+                            let Ok(response) = result else {
                                 let _ = sender.send(NodeInput::ProvisionsFetchFailed {
                                     source_shard,
                                     block_height,
                                 });
+                                return ResponseVerdict::Accept;
+                            };
+                            let Some(provisions) = response.provisions else {
+                                // Peer cannot serve (state version GC'd).
+                                let _ = sender.send(NodeInput::ProvisionsFetchFailed {
+                                    source_shard,
+                                    block_height,
+                                });
+                                return ResponseVerdict::Reject;
+                            };
+                            if provisions.source_shard != source_shard
+                                || provisions.target_shard != target_shard
+                                || provisions.block_height != block_height
+                            {
+                                tracing::warn!(
+                                    expected_source = source_shard.0,
+                                    got_source = provisions.source_shard.0,
+                                    expected_target = target_shard.0,
+                                    got_target = provisions.target_shard.0,
+                                    expected_height = block_height.0,
+                                    got_height = provisions.block_height.0,
+                                    "Dropping provision fetch response: scope mismatch"
+                                );
+                                let _ = sender.send(NodeInput::ProvisionsFetchFailed {
+                                    source_shard,
+                                    block_height,
+                                });
+                                return ResponseVerdict::Reject;
                             }
+                            if provisions.transactions.is_empty() {
+                                return ResponseVerdict::Reject;
+                            }
+                            let _ = sender.send(NodeInput::Protocol(
+                                ProtocolEvent::ProvisionsReceived { provisions },
+                            ));
+                            ResponseVerdict::Accept
                         }),
                     );
                 }
@@ -406,20 +422,24 @@ where
                 &[peer],
                 None,
                 request,
-                Box::new(move |result| match result {
-                    Ok(response) => match response.certificates {
-                        Some(certs) if !certs.is_empty() => {
-                            let _ = sender.send(NodeInput::ExecutionCertsReceived {
-                                certificates: certs,
-                            });
+                Box::new(move |result| {
+                    if let Ok(response) = result {
+                        match response.certificates {
+                            Some(certs) if !certs.is_empty() => {
+                                let _ = sender.send(NodeInput::ExecutionCertsReceived {
+                                    certificates: certs,
+                                });
+                                ResponseVerdict::Accept
+                            }
+                            _ => {
+                                let _ = sender
+                                    .send(NodeInput::ExecCertFetchFailed { hashes: failed_ids });
+                                ResponseVerdict::Reject
+                            }
                         }
-                        _ => {
-                            let _ =
-                                sender.send(NodeInput::ExecCertFetchFailed { hashes: failed_ids });
-                        }
-                    },
-                    Err(_) => {
+                    } else {
                         let _ = sender.send(NodeInput::ExecCertFetchFailed { hashes: failed_ids });
+                        ResponseVerdict::Accept
                     }
                 }),
             );
@@ -457,29 +477,28 @@ where
                         &[peer],
                         None,
                         request,
-                        Box::new(move |result| match result {
-                            Ok(response) => match response.header {
-                                Some(header) => {
-                                    let _ = sender.send(NodeInput::Protocol(
-                                        ProtocolEvent::RemoteBlockCommitted {
-                                            committed_header: header,
-                                            sender: ValidatorId(0),
-                                        },
-                                    ));
-                                }
-                                None => {
-                                    let _ = sender.send(NodeInput::HeaderFetchFailed {
-                                        source_shard,
-                                        from_height,
-                                    });
-                                }
-                            },
-                            Err(_) => {
+                        Box::new(move |result| {
+                            let Ok(response) = result else {
                                 let _ = sender.send(NodeInput::HeaderFetchFailed {
                                     source_shard,
                                     from_height,
                                 });
-                            }
+                                return ResponseVerdict::Accept;
+                            };
+                            let Some(header) = response.header else {
+                                let _ = sender.send(NodeInput::HeaderFetchFailed {
+                                    source_shard,
+                                    from_height,
+                                });
+                                return ResponseVerdict::Reject;
+                            };
+                            let _ = sender.send(NodeInput::Protocol(
+                                ProtocolEvent::RemoteBlockCommitted {
+                                    committed_header: header,
+                                    sender: ValidatorId(0),
+                                },
+                            ));
+                            ResponseVerdict::Accept
                         }),
                     );
                 }
@@ -511,13 +530,21 @@ where
                 &pinned,
                 Some(peer),
                 GetFinalizedWavesRequest::new(wave_id_hashes),
-                Box::new(move |result| match result {
-                    Ok(resp) => {
+                Box::new(move |result| {
+                    if let Ok(resp) = result {
+                        let returned = resp.waves.len();
+                        let requested = hs.len();
                         let waves = resp.waves.into_iter().map(Arc::new).collect();
                         let _ = es.send(NodeInput::FinalizedWaveReceived { waves });
-                    }
-                    Err(_) => {
+                        // Peer didn't have all the waves we asked for.
+                        if returned < requested {
+                            ResponseVerdict::Reject
+                        } else {
+                            ResponseVerdict::Accept
+                        }
+                    } else {
                         let _ = es.send(NodeInput::FinalizedWaveFetchFailed { hashes: hs });
+                        ResponseVerdict::Accept
                     }
                 }),
             );

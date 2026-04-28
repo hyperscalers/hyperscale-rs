@@ -64,6 +64,23 @@ pub enum GossipVerdict {
     Reject,
 }
 
+/// Result of request-response evaluation by the application callback.
+///
+/// Returned by the `on_response` closure passed to [`Network::request`] so
+/// the network layer can feed app-level success/failure into the same
+/// peer-health tracker that timeouts and connection errors already use.
+/// Use `Reject` whenever the response decoded fine at the wire layer but
+/// was unusable to the app (peer returned `None`/empty, scope mismatch,
+/// partial response, malformed payload). This deprioritizes the peer for
+/// future selection without any extra plumbing from the call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseVerdict {
+    /// Response was usable — record success.
+    Accept,
+    /// Response was unusable — penalize the serving peer.
+    Reject,
+}
+
 /// Typed handler for a single gossip message type.
 ///
 /// Called after the network layer SBOR-decodes the raw payload into `M`.
@@ -198,13 +215,18 @@ pub trait Network: Send + Sync + 'static {
     ///
     /// The callback is called on a network thread when the response arrives,
     /// or with an error on timeout/failure. Compatible with sync main loops —
-    /// the callback typically pushes into the main loop's event channel.
+    /// the callback typically pushes into the main loop's event channel. The
+    /// callback returns a [`ResponseVerdict`] so app-level rejections (peer
+    /// returned `None`/empty/wrong-scope) feed back into the same peer-health
+    /// tracker that timeouts use, deprioritizing the serving peer for future
+    /// selection. Verdict is ignored on the `Err` path (the network already
+    /// recorded the failure).
     fn request<R: Request + 'static>(
         &self,
         peers: &[ValidatorId],
         preferred_peer: Option<ValidatorId>,
         request: R,
-        on_response: Box<dyn FnOnce(Result<R::Response, RequestError>) + Send>,
+        on_response: Box<dyn FnOnce(Result<R::Response, RequestError>) -> ResponseVerdict + Send>,
     );
 }
 

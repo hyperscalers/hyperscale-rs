@@ -12,7 +12,7 @@
 
 use hyperscale_network::{
     GossipHandler, HandlerRegistry, Network, NotificationHandler, RequestError, RequestHandler,
-    TopicScope, compression,
+    ResponseVerdict, TopicScope, compression,
 };
 use hyperscale_types::{NetworkMessage, Request, ShardGroupId, ShardMessage, ValidatorId};
 use sbor::basic_encode;
@@ -63,8 +63,11 @@ pub struct PendingRequest {
     pub type_id: &'static str,
     /// SBOR-encoded request bytes.
     pub request_bytes: Vec<u8>,
-    /// Callback that receives SBOR-encoded response bytes (or error).
-    pub on_response: Box<dyn FnOnce(Result<Vec<u8>, RequestError>) + Send>,
+    /// Callback that receives SBOR-encoded response bytes (or error). Returns
+    /// a [`ResponseVerdict`] for parity with the production `Network::request`
+    /// signature; the simulation discards the verdict (deterministic harness
+    /// owns peer behaviour directly).
+    pub on_response: Box<dyn FnOnce(Result<Vec<u8>, RequestError>) -> ResponseVerdict + Send>,
 }
 
 /// Network implementation for simulation.
@@ -214,22 +217,21 @@ impl Network for SimNetworkAdapter {
         peers: &[ValidatorId],
         preferred_peer: Option<ValidatorId>,
         request: R,
-        on_response: Box<dyn FnOnce(Result<R::Response, RequestError>) + Send>,
+        on_response: Box<dyn FnOnce(Result<R::Response, RequestError>) -> ResponseVerdict + Send>,
     ) {
         let request_bytes =
             sbor::basic_encode(&request).expect("SimNetworkAdapter: failed to encode request");
 
         // Wrap the typed callback: decode raw response bytes → R::Response
-        let typed_callback: Box<dyn FnOnce(Result<Vec<u8>, RequestError>) + Send> =
-            Box::new(move |result| match result {
-                Ok(bytes) => match sbor::basic_decode::<R::Response>(&bytes) {
-                    Ok(response) => on_response(Ok(response)),
-                    Err(e) => {
-                        on_response(Err(RequestError::PeerError(format!("decode error: {e:?}"))));
-                    }
-                },
-                Err(e) => on_response(Err(e)),
-            });
+        let typed_callback: Box<
+            dyn FnOnce(Result<Vec<u8>, RequestError>) -> ResponseVerdict + Send,
+        > = Box::new(move |result| match result {
+            Ok(bytes) => match sbor::basic_decode::<R::Response>(&bytes) {
+                Ok(response) => on_response(Ok(response)),
+                Err(e) => on_response(Err(RequestError::PeerError(format!("decode error: {e:?}")))),
+            },
+            Err(e) => on_response(Err(e)),
+        });
 
         self.pending_requests.lock().unwrap().push(PendingRequest {
             peers: peers.to_vec(),
@@ -348,7 +350,7 @@ mod tests {
             peers,
             preferred,
             GetBlockRequest::new(BlockHeight(42), BlockHeight(42)),
-            Box::new(|_| {}),
+            Box::new(|_| ResponseVerdict::Accept),
         );
 
         let requests = adapter.drain_pending_requests();
@@ -379,6 +381,7 @@ mod tests {
             GetBlockRequest::new(BlockHeight(1), BlockHeight(1)),
             Box::new(move |r| {
                 *result_clone.lock().unwrap() = Some(r);
+                ResponseVerdict::Accept
             }),
         );
 
@@ -411,6 +414,7 @@ mod tests {
             GetBlockRequest::new(BlockHeight(1), BlockHeight(1)),
             Box::new(move |r| {
                 *result_clone.lock().unwrap() = Some(r);
+                ResponseVerdict::Accept
             }),
         );
 

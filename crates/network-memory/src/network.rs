@@ -10,7 +10,7 @@ use crate::sim_network::{
     BroadcastTarget, OutboxEntry, PendingNotification, PendingRequest, SimNetworkAdapter,
 };
 use crate::traffic::NetworkTrafficAnalyzer;
-use hyperscale_network::{HandlerRegistry, RequestError};
+use hyperscale_network::{HandlerRegistry, RequestError, ResponseVerdict};
 use hyperscale_types::{ShardGroupId, ValidatorId};
 use rand::RngExt;
 use rand::seq::SliceRandom;
@@ -131,7 +131,7 @@ struct ScheduledResponse {
     sequence: u64,
     #[allow(dead_code)]
     requester_node: NodeIndex,
-    on_response: Box<dyn FnOnce(Result<Vec<u8>, RequestError>) + Send>,
+    on_response: Box<dyn FnOnce(Result<Vec<u8>, RequestError>) -> ResponseVerdict + Send>,
     response: Vec<u8>,
 }
 
@@ -442,9 +442,9 @@ impl SimulatedNetwork {
                 if let Some(&p) = candidates.first() {
                     p
                 } else {
-                    on_response(Err(RequestError::PeerUnreachable(ValidatorId(u64::from(
-                        requester,
-                    )))));
+                    let _ = on_response(Err(RequestError::PeerUnreachable(ValidatorId(
+                        u64::from(requester),
+                    ))));
                     continue;
                 }
             };
@@ -453,7 +453,7 @@ impl SimulatedNetwork {
             if self.is_partitioned(requester, peer) {
                 stats.messages_dropped_partition += 1;
                 trace!(requester, peer, "Request dropped: partition");
-                on_response(Err(RequestError::PeerUnreachable(ValidatorId(u64::from(
+                let _ = on_response(Err(RequestError::PeerUnreachable(ValidatorId(u64::from(
                     peer,
                 )))));
                 continue;
@@ -463,7 +463,7 @@ impl SimulatedNetwork {
             if self.should_drop_packet(rng) {
                 stats.messages_dropped_loss += 1;
                 trace!(requester, peer, "Request dropped: packet loss");
-                on_response(Err(RequestError::PeerUnreachable(ValidatorId(u64::from(
+                let _ = on_response(Err(RequestError::PeerUnreachable(ValidatorId(u64::from(
                     peer,
                 )))));
                 continue;
@@ -473,7 +473,7 @@ impl SimulatedNetwork {
             if self.should_drop_packet(rng) {
                 stats.messages_dropped_loss += 1;
                 trace!(requester, peer, "Response dropped: packet loss");
-                on_response(Err(RequestError::PeerUnreachable(ValidatorId(u64::from(
+                let _ = on_response(Err(RequestError::PeerUnreachable(ValidatorId(u64::from(
                     peer,
                 )))));
                 continue;
@@ -498,7 +498,7 @@ impl SimulatedNetwork {
                 .get(peer as usize)
                 .and_then(|r| r.get_request(type_id))
             else {
-                on_response(Err(RequestError::PeerError(format!(
+                let _ = on_response(Err(RequestError::PeerError(format!(
                     "no handler for {type_id} on node {peer}"
                 ))));
                 continue;
@@ -508,7 +508,7 @@ impl SimulatedNetwork {
             let response_bytes = handler(&request_bytes);
 
             if response_bytes.is_empty() {
-                on_response(Err(RequestError::PeerError(
+                let _ = on_response(Err(RequestError::PeerError(
                     "handler returned empty response".to_string(),
                 )));
                 continue;
@@ -1121,6 +1121,7 @@ mod tests {
             request_bytes: vec![1, 2, 3],
             on_response: Box::new(move |r| {
                 *result_clone.lock().unwrap() = Some(r);
+                ResponseVerdict::Accept
             }),
         };
         (request, result)
