@@ -26,6 +26,7 @@ mod network_handlers;
 mod phase_times;
 pub mod protocol;
 mod protocols;
+mod step;
 mod verify;
 
 use crate::NodeStateMachine;
@@ -39,7 +40,7 @@ use crate::io_loop::protocol::binding::{
 };
 use crate::io_loop::protocol::fetch::FetchInput;
 use crate::io_loop::protocol::host::ProtocolHost;
-use crate::io_loop::protocol::sync::{SyncInput, SyncStatus};
+use crate::io_loop::protocol::sync::SyncStatus;
 use arc_swap::ArcSwap;
 use hyperscale_core::{Action, NodeInput, ProtocolEvent, StateMachine, TimerId};
 use hyperscale_dispatch::{Dispatch, DispatchPool};
@@ -529,78 +530,16 @@ where
 
             // ── Sync protocol ──────────────────────────────────────────
             NodeInput::SyncBlockResponseReceived { height, block } => {
-                let Some(elided) = block else {
-                    // Peer didn't have the block — pass through as `None`
-                    // to the sync state machine, which re-queues the height.
-                    self.deliver_sync_block(height, None);
-                    return self.drain_pending_output();
-                };
-                match self.rehydrate_elided_block(&elided) {
-                    Ok(cert) => self.deliver_sync_block(height, Some(Box::new(cert))),
-                    Err(miss) => {
-                        // Inventory bloom said we had bodies we couldn't
-                        // resolve. Buffer the elided block, fire a top-up
-                        // request for just the missing hashes. If the
-                        // response comes back with bodies that cover the
-                        // miss, we rehydrate and proceed normally; if it
-                        // fails, the buffered state is dropped and we
-                        // refetch from scratch via the existing retry path.
-                        metrics::record_sync_response_error("rehydration_miss");
-                        self.issue_sync_topup(height, elided, miss);
-                    }
-                }
+                self.handle_sync_block_response_received(height, block);
             }
-
             NodeInput::SyncBlockFetchFailed { height } => {
-                // Evict any buffered topup state keyed on this height —
-                // the outer fetch is being re-attempted, and the topup
-                // round we scheduled for it is no longer relevant.
-                self.protocols.pending_block_topups.remove(&height);
-                let outputs = self.protocols.sync.handle(SyncInput::BlockFetchFailed {
-                    height,
-                    now: std::time::Instant::now(),
-                });
-                self.process_sync_outputs(outputs);
-                self.update_fetch_tick_timer();
+                self.handle_sync_block_fetch_failed(height);
             }
-
             NodeInput::SyncBlockTopUpReceived { height, response } => {
-                let Some(elided) = self.protocols.pending_block_topups.remove(&height) else {
-                    // Topup arrived after the pending state was already
-                    // evicted (e.g. the outer fetch was retried and
-                    // delivered first). Silently drop.
-                    return self.drain_pending_output();
-                };
-                let topup = response.map_or_else(
-                    hyperscale_messages::response::GetBlockTopUpResponse::empty,
-                    |b| *b,
-                );
-                match self.rehydrate_with_topup(&elided, topup) {
-                    Ok(cert) => self.deliver_sync_block(height, Some(Box::new(cert))),
-                    Err(miss) => {
-                        tracing::warn!(
-                            height = height.0,
-                            missing_total = miss.total(),
-                            "Sync: topup still short of bodies, refetching block"
-                        );
-                        metrics::record_sync_response_error("topup_short");
-                        let _ = self
-                            .event_sender
-                            .send(NodeInput::SyncBlockFetchFailed { height });
-                    }
-                }
+                self.handle_sync_block_topup_received(height, response);
             }
-
             NodeInput::SyncBlockTopUpFailed { height } => {
-                self.protocols.pending_block_topups.remove(&height);
-                tracing::warn!(
-                    height = height.0,
-                    "Sync: topup request failed, refetching block"
-                );
-                metrics::record_sync_response_error("topup_failed");
-                let _ = self
-                    .event_sender
-                    .send(NodeInput::SyncBlockFetchFailed { height });
+                self.handle_sync_block_topup_failed(height);
             }
 
             // ── Fetch protocol ─────────────────────────────────────────
