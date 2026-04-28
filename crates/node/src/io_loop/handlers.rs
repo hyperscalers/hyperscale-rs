@@ -230,9 +230,14 @@ where
                     }
 
                     // Storage fallback: if cache miss, try durable storage.
-                    if certs.is_empty() {
+                    // Every WaveId in a single request shares its source
+                    // block by construction; pick the first as the height
+                    // hint for the by-height index lookup.
+                    if certs.is_empty()
+                        && let Some(block_height) = req.wave_ids.first().map(|w| w.block_height)
+                    {
                         drop(guard); // Release lock before storage I/O
-                        let stored = storage.get_execution_certificates_by_height(req.block_height);
+                        let stored = storage.get_execution_certificates_by_height(block_height);
                         for cert in stored {
                             if req.wave_ids.contains(&cert.wave_id) {
                                 certs.push(cert);

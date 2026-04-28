@@ -399,16 +399,8 @@ where
                 ids: wave_ids,
                 peer,
             } = output;
-            // Pull the source-shard block height from any wave (all share it
-            // by construction of the request) for the storage-fallback hint.
-            let block_height = wave_ids
-                .first()
-                .map_or(hyperscale_types::BlockHeight::GENESIS, |w| w.block_height);
             let failed_ids = wave_ids.clone();
-            let request = GetExecutionCertsRequest {
-                block_height,
-                wave_ids,
-            };
+            let request = GetExecutionCertsRequest { wave_ids };
             let sender = self.event_sender.clone();
             self.network.request(
                 &[peer],
