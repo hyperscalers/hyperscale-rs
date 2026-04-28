@@ -663,11 +663,11 @@ impl ProductionRunner {
         };
         let genesis_certified =
             hyperscale_types::CertifiedBlock::new_unchecked(genesis_block, genesis_qc);
-        let genesis_commit_output = io_loop.step(NodeInput::Protocol(
+        let genesis_commit_output = io_loop.step(NodeInput::Protocol(Box::new(
             hyperscale_core::ProtocolEvent::BlockCommitted {
                 certified: genesis_certified,
             },
-        ));
+        )));
 
         info!(
             genesis_jmt_root = ?genesis_jmt_root,

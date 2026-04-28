@@ -161,7 +161,7 @@ where
             }
         }
 
-        let _ = self.event_sender.send(NodeInput::Protocol(pe));
+        let _ = self.event_sender.send(NodeInput::Protocol(Box::new(pe)));
     }
 
     fn handle_track_execution_certificate(
@@ -189,13 +189,9 @@ where
         let height = self.storage.committed_height();
         let hash = self.storage.committed_hash();
         let qc = self.storage.latest_qc();
-        let _ = self
-            .event_sender
-            .send(NodeInput::Protocol(ProtocolEvent::ChainMetadataFetched {
-                height,
-                hash,
-                qc,
-            }));
+        let _ = self.event_sender.send(NodeInput::Protocol(Box::new(
+            ProtocolEvent::ChainMetadataFetched { height, hash, qc },
+        )));
     }
 
     fn handle_emit_transaction_status(

@@ -529,9 +529,10 @@ impl SimulationRunner {
                 };
                 let genesis_certified =
                     CertifiedBlock::new_unchecked(genesis_block.clone(), genesis_qc);
-                let genesis_commit_event = NodeInput::Protocol(ProtocolEvent::BlockCommitted {
-                    certified: genesis_certified,
-                });
+                let genesis_commit_event =
+                    NodeInput::Protocol(Box::new(ProtocolEvent::BlockCommitted {
+                        certified: genesis_certified,
+                    }));
                 self.schedule_event(node_index, self.now, genesis_commit_event);
             }
 

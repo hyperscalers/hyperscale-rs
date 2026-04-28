@@ -329,9 +329,15 @@ where
             NodeInput::TransactionValidationsFailed { hashes } => {
                 self.handle_transaction_validations_failed(&hashes);
             }
-            NodeInput::Protocol(ProtocolEvent::TransactionGossipReceived { tx, .. }) => {
-                self.handle_gossip_received_tx_for_validation(tx);
-            }
+            NodeInput::Protocol(pe) => match *pe {
+                ProtocolEvent::TransactionGossipReceived { tx, .. } => {
+                    self.handle_gossip_received_tx_for_validation(tx);
+                }
+                ProtocolEvent::BlockPersisted { height } => {
+                    self.handle_block_persisted(height);
+                }
+                other => self.handle_protocol_passthrough(other),
+            },
             NodeInput::SubmitTransaction { tx } => self.handle_submit_transaction(tx),
 
             // ── Sync protocol ──────────────────────────────────────────
@@ -408,12 +414,6 @@ where
             NodeInput::FinalizedWaveFetchFailed { hashes } => {
                 self.handle_finalized_wave_fetch_failed(hashes);
             }
-
-            // ── Protocol events → state machine ────────────────────────
-            NodeInput::Protocol(ProtocolEvent::BlockPersisted { height }) => {
-                self.handle_block_persisted(height);
-            }
-            NodeInput::Protocol(pe) => self.handle_protocol_passthrough(pe),
         }
 
         self.drain_pending_output()

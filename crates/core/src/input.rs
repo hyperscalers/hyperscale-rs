@@ -40,12 +40,12 @@ pub enum EventPriority {
 /// - `NodeInput`-specific variants: events that `IoLoop` handles internally
 ///   (sync, fetch, validation pipeline) before potentially converting them
 ///   into `ProtocolEvent`s.
-#[allow(clippy::large_enum_variant)] // TODO: Box ProtocolEvent
 #[derive(Debug, Clone, strum::IntoStaticStr)]
 pub enum NodeInput {
     /// Pass-through to state machine. `IoLoop` extracts the `ProtocolEvent` and
-    /// passes it to `state.handle()` directly.
-    Protocol(ProtocolEvent),
+    /// passes it to `state.handle()` directly. Boxed because `ProtocolEvent`
+    /// dwarfs every other variant and would inflate the event queue otherwise.
+    Protocol(Box<ProtocolEvent>),
 
     /// Client submitted a transaction.
     SubmitTransaction {
@@ -223,12 +223,12 @@ impl NodeInput {
     /// ensuring causality is preserved.
     #[must_use]
     #[allow(clippy::match_same_arms)] // explicit per-variant arms document intent
-    pub const fn priority(&self) -> EventPriority {
+    pub fn priority(&self) -> EventPriority {
         match self {
             // Priority is a scheduling concern, not a protocol concern.
             // Timers and network-received messages are classified explicitly;
             // everything else (callbacks, continuations, completions) defaults to Internal.
-            Self::Protocol(pe) => match pe {
+            Self::Protocol(pe) => match pe.as_ref() {
                 ProtocolEvent::ViewChangeTimer
                 | ProtocolEvent::CleanupTimer
                 | ProtocolEvent::GlobalConsensusTimer => EventPriority::Timer,
@@ -303,6 +303,6 @@ impl NodeInput {
 
 impl From<ProtocolEvent> for NodeInput {
     fn from(event: ProtocolEvent) -> Self {
-        Self::Protocol(event)
+        Self::Protocol(Box::new(event))
     }
 }

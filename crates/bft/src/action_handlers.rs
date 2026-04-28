@@ -575,13 +575,13 @@ pub fn handle_action<S, E, N>(
                 total_voting_power,
             );
             metrics::record_signature_verification_latency("vote", start.elapsed().as_secs_f64());
-            (ctx.notify)(NodeInput::Protocol(
+            (ctx.notify)(NodeInput::Protocol(Box::new(
                 ProtocolEvent::QuorumCertificateResult {
                     block_hash: result.block_hash,
                     qc: result.qc,
                     verified_votes: result.verified_votes,
                 },
-            ));
+            )));
         }
 
         Action::VerifyQcSignature {
@@ -592,10 +592,9 @@ pub fn handle_action<S, E, N>(
             let start = std::time::Instant::now();
             let valid = verify_qc_signature(&qc, &public_keys);
             metrics::record_signature_verification_latency("qc", start.elapsed().as_secs_f64());
-            (ctx.notify)(NodeInput::Protocol(ProtocolEvent::QcSignatureVerified {
-                block_hash,
-                valid,
-            }));
+            (ctx.notify)(NodeInput::Protocol(Box::new(
+                ProtocolEvent::QcSignatureVerified { block_hash, valid },
+            )));
         }
 
         Action::VerifyRemoteHeaderQc {
@@ -623,12 +622,14 @@ pub fn handle_action<S, E, N>(
                 "remote_header_qc",
                 start.elapsed().as_secs_f64(),
             );
-            (ctx.notify)(NodeInput::Protocol(ProtocolEvent::RemoteHeaderQcVerified {
-                shard,
-                height,
-                header,
-                valid,
-            }));
+            (ctx.notify)(NodeInput::Protocol(Box::new(
+                ProtocolEvent::RemoteHeaderQcVerified {
+                    shard,
+                    height,
+                    header,
+                    valid,
+                },
+            )));
         }
 
         Action::VerifyTransactionRoot {
@@ -643,11 +644,13 @@ pub fn handle_action<S, E, N>(
                 "transaction_root",
                 start.elapsed().as_secs_f64(),
             );
-            (ctx.notify)(NodeInput::Protocol(ProtocolEvent::BlockRootVerified {
-                kind: VerificationKind::TransactionRoot,
-                block_hash,
-                valid,
-            }));
+            (ctx.notify)(NodeInput::Protocol(Box::new(
+                ProtocolEvent::BlockRootVerified {
+                    kind: VerificationKind::TransactionRoot,
+                    block_hash,
+                    valid,
+                },
+            )));
         }
 
         Action::VerifyProvisionTxRoots {
@@ -662,11 +665,13 @@ pub fn handle_action<S, E, N>(
                 "provision_tx_roots",
                 start.elapsed().as_secs_f64(),
             );
-            (ctx.notify)(NodeInput::Protocol(ProtocolEvent::BlockRootVerified {
-                kind: VerificationKind::ProvisionTxRoots,
-                block_hash,
-                valid,
-            }));
+            (ctx.notify)(NodeInput::Protocol(Box::new(
+                ProtocolEvent::BlockRootVerified {
+                    kind: VerificationKind::ProvisionTxRoots,
+                    block_hash,
+                    valid,
+                },
+            )));
         }
 
         Action::VerifyProvisionRoot {
@@ -681,11 +686,13 @@ pub fn handle_action<S, E, N>(
                 "provision_root",
                 start.elapsed().as_secs_f64(),
             );
-            (ctx.notify)(NodeInput::Protocol(ProtocolEvent::BlockRootVerified {
-                kind: VerificationKind::ProvisionRoot,
-                block_hash,
-                valid,
-            }));
+            (ctx.notify)(NodeInput::Protocol(Box::new(
+                ProtocolEvent::BlockRootVerified {
+                    kind: VerificationKind::ProvisionRoot,
+                    block_hash,
+                    valid,
+                },
+            )));
         }
 
         Action::VerifyCertificateRoot {
@@ -699,11 +706,13 @@ pub fn handle_action<S, E, N>(
                 "certificate_root",
                 start.elapsed().as_secs_f64(),
             );
-            (ctx.notify)(NodeInput::Protocol(ProtocolEvent::BlockRootVerified {
-                kind: VerificationKind::CertificateRoot,
-                block_hash,
-                valid,
-            }));
+            (ctx.notify)(NodeInput::Protocol(Box::new(
+                ProtocolEvent::BlockRootVerified {
+                    kind: VerificationKind::CertificateRoot,
+                    block_hash,
+                    valid,
+                },
+            )));
         }
 
         Action::VerifyLocalReceiptRoot {
@@ -717,11 +726,13 @@ pub fn handle_action<S, E, N>(
                 "local_receipt_root",
                 start.elapsed().as_secs_f64(),
             );
-            (ctx.notify)(NodeInput::Protocol(ProtocolEvent::BlockRootVerified {
-                kind: VerificationKind::LocalReceiptRoot,
-                block_hash,
-                valid,
-            }));
+            (ctx.notify)(NodeInput::Protocol(Box::new(
+                ProtocolEvent::BlockRootVerified {
+                    kind: VerificationKind::LocalReceiptRoot,
+                    block_hash,
+                    valid,
+                },
+            )));
         }
 
         Action::VerifyStateRoot {
@@ -758,11 +769,13 @@ pub fn handle_action<S, E, N>(
                     receipts: collect_finalized_receipts(&finalized_waves),
                 });
             }
-            (ctx.notify)(NodeInput::Protocol(ProtocolEvent::BlockRootVerified {
-                kind: VerificationKind::StateRoot,
-                block_hash,
-                valid: result.valid,
-            }));
+            (ctx.notify)(NodeInput::Protocol(Box::new(
+                ProtocolEvent::BlockRootVerified {
+                    kind: VerificationKind::StateRoot,
+                    block_hash,
+                    valid: result.valid,
+                },
+            )));
         }
 
         Action::BuildProposal {
@@ -814,14 +827,16 @@ pub fn handle_action<S, E, N>(
                     receipts: collect_finalized_receipts(&finalized_waves),
                 });
             }
-            (ctx.notify)(NodeInput::Protocol(ProtocolEvent::ProposalBuilt {
-                height,
-                round,
-                block: Arc::new(result.block),
-                block_hash,
-                finalized_waves,
-                provisions,
-            }));
+            (ctx.notify)(NodeInput::Protocol(Box::new(
+                ProtocolEvent::ProposalBuilt {
+                    height,
+                    round,
+                    block: Arc::new(result.block),
+                    block_hash,
+                    finalized_waves,
+                    provisions,
+                },
+            )));
         }
 
         // ── Sign + broadcast actions ──────────────────────────────────────
@@ -864,9 +879,9 @@ pub fn handle_action<S, E, N>(
             let gossip = hyperscale_messages::BlockVoteNotification { vote: vote.clone() };
             ctx.network.notify(&recipients, &gossip);
             // Feed our own signed vote back for local VoteSet tracking.
-            (ctx.notify)(NodeInput::Protocol(ProtocolEvent::BlockVoteReceived {
-                vote,
-            }));
+            (ctx.notify)(NodeInput::Protocol(Box::new(
+                ProtocolEvent::BlockVoteReceived { vote },
+            )));
         }
 
         Action::BroadcastCommittedBlockHeader { committed_header } => {

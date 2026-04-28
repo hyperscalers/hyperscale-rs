@@ -372,9 +372,9 @@ where
                         Arc::unwrap_or_clone(commit.block),
                         Arc::unwrap_or_clone(commit.qc),
                     );
-                    let _ = event_tx.send(NodeInput::Protocol(ProtocolEvent::BlockCommitted {
-                        certified,
-                    }));
+                    let _ = event_tx.send(NodeInput::Protocol(Box::new(
+                        ProtocolEvent::BlockCommitted { certified },
+                    )));
                 }
             }
 
@@ -384,9 +384,11 @@ where
             // calls flush to drain any backlog.
             in_flight.store(false, Ordering::Release);
 
-            let _ = event_tx.send(NodeInput::Protocol(ProtocolEvent::BlockPersisted {
-                height: max_persisted,
-            }));
+            let _ = event_tx.send(NodeInput::Protocol(Box::new(
+                ProtocolEvent::BlockPersisted {
+                    height: max_persisted,
+                },
+            )));
         });
     }
 }

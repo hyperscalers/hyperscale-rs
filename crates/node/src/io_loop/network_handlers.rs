@@ -313,12 +313,12 @@ where
         self.network.register_gossip_handler::<TransactionGossip>(
             TopicScope::Shard,
             move |gossip: TransactionGossip| -> GossipVerdict {
-                let _ = tx.send(NodeInput::Protocol(
+                let _ = tx.send(NodeInput::Protocol(Box::new(
                     ProtocolEvent::TransactionGossipReceived {
                         tx: gossip.transaction,
                         submitted_locally: false,
                     },
-                ));
+                )));
                 GossipVerdict::Accept
             },
         );
@@ -367,9 +367,9 @@ where
         self.network
             .register_notification_handler::<BlockVoteNotification>(
                 move |gossip: BlockVoteNotification| {
-                    let _ = tx.send(NodeInput::Protocol(ProtocolEvent::BlockVoteReceived {
-                        vote: gossip.vote,
-                    }));
+                    let _ = tx.send(NodeInput::Protocol(Box::new(
+                        ProtocolEvent::BlockVoteReceived { vote: gossip.vote },
+                    )));
                 },
             );
 
@@ -402,10 +402,9 @@ where
                         return;
                     }
                     let (header, manifest, _sig) = gossip.into_parts();
-                    let _ = tx.send(NodeInput::Protocol(ProtocolEvent::BlockHeaderReceived {
-                        header,
-                        manifest,
-                    }));
+                    let _ = tx.send(NodeInput::Protocol(Box::new(
+                        ProtocolEvent::BlockHeaderReceived { header, manifest },
+                    )));
                 },
             );
 
@@ -445,9 +444,11 @@ where
                         return;
                     }
 
-                    let _ = tx.send(NodeInput::Protocol(ProtocolEvent::ProvisionsReceived {
-                        provisions: notification.provisions,
-                    }));
+                    let _ = tx.send(NodeInput::Protocol(Box::new(
+                        ProtocolEvent::ProvisionsReceived {
+                            provisions: notification.provisions,
+                        },
+                    )));
                 },
             );
 
@@ -479,10 +480,9 @@ where
                     }
 
                     for vote in batch.into_votes() {
-                        let _ =
-                            tx.send(NodeInput::Protocol(ProtocolEvent::ExecutionVoteReceived {
-                                vote,
-                            }));
+                        let _ = tx.send(NodeInput::Protocol(Box::new(
+                            ProtocolEvent::ExecutionVoteReceived { vote },
+                        )));
                     }
                 },
             );

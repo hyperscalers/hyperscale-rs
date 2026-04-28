@@ -261,12 +261,12 @@ where
         } => {
             let certificate =
                 aggregate_execution_certificate(&wave_id, global_receipt_root, &votes, &committee);
-            (ctx.notify)(NodeInput::Protocol(
+            (ctx.notify)(NodeInput::Protocol(Box::new(
                 ProtocolEvent::ExecutionCertificateAggregated {
                     wave_id,
                     certificate,
                 },
-            ));
+            )));
         }
         Action::VerifyAndAggregateExecutionVotes {
             wave_id,
@@ -274,13 +274,13 @@ where
             votes,
         } => {
             let verified_votes: Vec<_> = batch_verify_execution_votes(votes).collect();
-            (ctx.notify)(NodeInput::Protocol(
+            (ctx.notify)(NodeInput::Protocol(Box::new(
                 ProtocolEvent::ExecutionVotesVerifiedAndAggregated {
                     wave_id,
                     block_hash,
                     verified_votes,
                 },
-            ));
+            )));
         }
         Action::VerifyExecutionCertificateSignature {
             certificate,
@@ -288,9 +288,9 @@ where
             ..
         } => {
             let valid = verify_execution_certificate_signature(&certificate, &public_keys);
-            (ctx.notify)(NodeInput::Protocol(
+            (ctx.notify)(NodeInput::Protocol(Box::new(
                 ProtocolEvent::ExecutionCertificateSignatureVerified { certificate, valid },
-            ));
+            )));
         }
         Action::ExecuteTransactions {
             wave_id,
@@ -323,13 +323,13 @@ where
             let (tx_outcomes, results): (Vec<_>, Vec<_>) =
                 per_tx.into_iter().map(|tx| (tx.outcome, tx.entry)).unzip();
             metrics::record_execution_latency(start.elapsed().as_secs_f64());
-            (ctx.notify)(NodeInput::Protocol(
+            (ctx.notify)(NodeInput::Protocol(Box::new(
                 ProtocolEvent::ExecutionBatchCompleted {
                     wave_id,
                     results,
                     tx_outcomes,
                 },
-            ));
+            )));
         }
         Action::ExecuteCrossShardTransactions {
             wave_id,
@@ -368,13 +368,13 @@ where
                 })
                 .unzip();
             metrics::record_execution_latency(start.elapsed().as_secs_f64());
-            (ctx.notify)(NodeInput::Protocol(
+            (ctx.notify)(NodeInput::Protocol(Box::new(
                 ProtocolEvent::ExecutionBatchCompleted {
                     wave_id,
                     results,
                     tx_outcomes,
                 },
-            ));
+            )));
         }
 
         // ── Sign + broadcast actions ──────────────────────────────────────
@@ -428,9 +428,9 @@ where
 
             // Feed own vote to state machine only if we are the leader.
             if leader == validator_id {
-                (ctx.notify)(hyperscale_core::NodeInput::Protocol(
+                (ctx.notify)(hyperscale_core::NodeInput::Protocol(Box::new(
                     hyperscale_core::ProtocolEvent::ExecutionVoteReceived { vote },
-                ));
+                )));
             }
         }
 

@@ -368,9 +368,9 @@ impl FetchBinding for ProvisionBinding {
                 if provisions.transactions.is_empty() {
                     return ResponseVerdict::Reject;
                 }
-                let _ = es.send(NodeInput::Protocol(ProtocolEvent::ProvisionsReceived {
-                    provisions,
-                }));
+                let _ = es.send(NodeInput::Protocol(Box::new(
+                    ProtocolEvent::ProvisionsReceived { provisions },
+                )));
                 ResponseVerdict::Accept
             }),
         );
@@ -447,10 +447,12 @@ impl FetchBinding for HeaderBinding {
                     });
                     return ResponseVerdict::Reject;
                 };
-                let _ = es.send(NodeInput::Protocol(ProtocolEvent::RemoteHeaderReceived {
-                    committed_header: header,
-                    sender: ValidatorId(0),
-                }));
+                let _ = es.send(NodeInput::Protocol(Box::new(
+                    ProtocolEvent::RemoteHeaderReceived {
+                        committed_header: header,
+                        sender: ValidatorId(0),
+                    },
+                )));
                 ResponseVerdict::Accept
             }),
         );

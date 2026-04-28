@@ -25,11 +25,13 @@ pub enum TimerId {
 impl TimerId {
     /// Convert this timer ID to the corresponding [`NodeInput`] event.
     #[must_use]
-    pub const fn into_event(self) -> NodeInput {
+    pub fn into_event(self) -> NodeInput {
         match self {
-            Self::ViewChange => NodeInput::Protocol(ProtocolEvent::ViewChangeTimer),
-            Self::Cleanup => NodeInput::Protocol(ProtocolEvent::CleanupTimer),
-            Self::GlobalConsensus => NodeInput::Protocol(ProtocolEvent::GlobalConsensusTimer),
+            Self::ViewChange => NodeInput::Protocol(Box::new(ProtocolEvent::ViewChangeTimer)),
+            Self::Cleanup => NodeInput::Protocol(Box::new(ProtocolEvent::CleanupTimer)),
+            Self::GlobalConsensus => {
+                NodeInput::Protocol(Box::new(ProtocolEvent::GlobalConsensusTimer))
+            }
             Self::FetchTick => NodeInput::FetchTick,
         }
     }
