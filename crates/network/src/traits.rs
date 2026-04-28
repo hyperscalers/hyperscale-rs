@@ -137,8 +137,8 @@ impl<R: Request, F: Fn(R) -> R::Response + Send + Sync + 'static> RequestHandler
 /// Network interface for sending typed messages and handling inbound traffic.
 ///
 /// Generic methods make this NOT object-safe — use `N: Network` bounds.
-/// This is consistent with how storage and dispatch are already used:
-/// `ActionContext<S: ChainWriter + SubstateStore, D: Dispatch>`.
+/// This is consistent with how storage and the engine are already used:
+/// `ActionContext<S: Storage, E: Engine>`.
 ///
 /// All sends are fire-and-forget. Responses to requests arrive via callback.
 pub trait Network: Send + Sync + 'static {

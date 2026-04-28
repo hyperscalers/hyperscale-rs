@@ -8,22 +8,12 @@
 //! Batched work (execution votes, execution certs) and block commits are
 //! handled inline by the I/O loop's flush closures.
 
-use hyperscale_core::{Action, NodeInput, ProtocolEvent};
+use hyperscale_core::{Action, ActionContext, NodeInput, ProtocolEvent};
 use hyperscale_engine::Engine;
 use hyperscale_metrics as metrics;
 use hyperscale_storage::Storage;
 use hyperscale_types::{BlockHash, BlockHeight, LocalExecutionEntry};
 use std::sync::Arc;
-
-/// Context for executing delegated actions.
-pub struct ActionContext<'a, S: Storage, E: Engine> {
-    pub executor: &'a E,
-    pub topology: &'a hyperscale_types::TopologySnapshot,
-    /// Anchored read view over base storage + the chain of unpersisted
-    /// blocks back to the committed tip. Built per-dispatch by
-    /// `PendingChain::view_at(parent_hash_for(action))`.
-    pub view: Arc<hyperscale_storage::SubstateView<S>>,
-}
 
 /// Result of handling a delegated action.
 pub struct DelegatedResult<P: Send> {
