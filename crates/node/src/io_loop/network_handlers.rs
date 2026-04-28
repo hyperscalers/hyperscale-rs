@@ -290,6 +290,7 @@ where
                                 certified.block.header().clone(),
                                 certified.qc,
                             );
+                            hyperscale_metrics::record_fetch_response_sent("header", 1);
                             GetCommittedBlockHeaderResponse {
                                 header: Some(committed),
                             }
