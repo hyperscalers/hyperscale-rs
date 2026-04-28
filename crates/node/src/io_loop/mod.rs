@@ -38,7 +38,7 @@ use crate::io_loop::protocol::sync::SyncStatus;
 use crate::io_loop::step::CommittedHeaderVerificationItem;
 use arc_swap::ArcSwap;
 use hyperscale_core::{Action, NodeInput, ProtocolEvent, StateMachine, TimerId};
-use hyperscale_dispatch::{Dispatch, DispatchPool};
+use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::{Engine, GenesisConfig, RadixExecutor, TransactionValidation};
 use hyperscale_metrics as metrics;
 use hyperscale_network::Network;
@@ -529,8 +529,6 @@ where
                 self.handle_local_provisions_fetch_failed(hashes);
             }
 
-            NodeInput::ProvisionsReady { batches } => self.handle_provisions_ready(batches),
-
             NodeInput::FinalizedWaveReceived { waves } => {
                 self.handle_finalized_wave_received(waves);
             }
@@ -608,36 +606,6 @@ where
         .into_iter()
         .flatten()
         .min()
-    }
-
-    // ─── Provision Broadcasting ────────────────────────────────────────
-
-    /// Sign and broadcast provisions to target shard committees.
-    ///
-    /// Signing is dispatched to the crypto pool to avoid blocking the `io_loop`.
-    pub(crate) fn broadcast_provisions(
-        &self,
-        batches: Vec<(
-            hyperscale_types::Provisions,
-            Vec<hyperscale_types::ValidatorId>,
-        )>,
-    ) {
-        let signing_key = Arc::clone(&self.signing_key);
-        let network = Arc::clone(&self.network);
-        let validator_id = self.validator_id;
-
-        self.dispatch.spawn(DispatchPool::Crypto, move || {
-            for (provisions, recipients) in batches {
-                if provisions.transactions.is_empty() {
-                    continue;
-                }
-                let msg = hyperscale_types::state_provisions_message(&provisions);
-                let sig = signing_key.sign_v1(&msg);
-                let notification =
-                    hyperscale_messages::ProvisionsNotification::new(provisions, validator_id, sig);
-                network.notify(&recipients, &notification);
-            }
-        });
     }
 
     // ─── Metrics ────────────────────────────────────────────────────────

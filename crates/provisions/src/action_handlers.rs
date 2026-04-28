@@ -234,7 +234,35 @@ pub fn handle_action<S, E, N>(
                 &requests,
                 &shard_recipients,
             );
-            (ctx.notify)(NodeInput::ProvisionsReady { batches });
+            let validator_id = ctx.topology.local_validator_id();
+            for (provisions, recipients) in batches {
+                if provisions.transactions.is_empty() {
+                    continue;
+                }
+                let provisions_arc = Arc::new(provisions);
+
+                // Register with the outbound tracker (populates the
+                // serving cache) on the main thread. A peer's
+                // provision.request that arrives between this notify and
+                // the main thread draining it will miss the cache and
+                // either hit RocksDB regen (post-persist) or trigger a
+                // fetch retry (pre-persist) — recoverable both ways.
+                (ctx.notify)(NodeInput::Protocol(
+                    ProtocolEvent::OutboundProvisionBroadcast {
+                        provisions: Arc::clone(&provisions_arc),
+                        target_shard: provisions_arc.target_shard,
+                    },
+                ));
+
+                let msg = hyperscale_types::state_provisions_message(&provisions_arc);
+                let sig = ctx.signing_key.sign_v1(&msg);
+                let notification = hyperscale_messages::ProvisionsNotification::new(
+                    (*provisions_arc).clone(),
+                    validator_id,
+                    sig,
+                );
+                ctx.network.notify(&recipients, &notification);
+            }
         }
         _ => unreachable!("hyperscale_provisions::handle_action called with non-provisions action"),
     }

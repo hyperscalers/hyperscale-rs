@@ -16,7 +16,6 @@ use hyperscale_network::Network;
 use hyperscale_storage::Storage;
 use hyperscale_types::{
     ExecutionCertificate, FinalizedWave, ProvisionHash, Provisions, RoutableTransaction,
-    ValidatorId,
 };
 use std::sync::Arc;
 
@@ -72,25 +71,6 @@ where
             });
         }
         self.update_fetch_tick_timer();
-    }
-
-    /// The `FetchAndBroadcastProvisions` delegated action built provisions
-    /// grouped by target shard. Register each with the outbound tracker
-    /// (which also inserts into the shared `ProvisionStore`) before
-    /// broadcasting, so cross-shard `provision.request` and our own
-    /// `local_provision.request` can serve the batch from memory while we
-    /// await target ECs.
-    pub(in crate::io_loop) fn handle_provisions_ready(
-        &mut self,
-        batches: Vec<(Provisions, Vec<ValidatorId>)>,
-    ) {
-        for (provisions, _recipients) in &batches {
-            self.feed_event(ProtocolEvent::OutboundProvisionBroadcast {
-                provisions: Arc::new(provisions.clone()),
-                target_shard: provisions.target_shard,
-            });
-        }
-        self.broadcast_provisions(batches);
     }
 
     /// Each delivered wave is funnelled through

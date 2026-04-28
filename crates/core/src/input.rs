@@ -181,17 +181,6 @@ pub enum NodeInput {
         sender_signature: Bls12381G2Signature,
     },
 
-    /// Provision built by the execution pool, ready for network broadcast.
-    ///
-    /// Returned from the delegated `FetchAndBroadcastProvisions` action. The
-    /// I/O loop sends one `ProvisionsNotification` per bundle, targeted to
-    /// the specific recipients embedded in each tuple. Target shard is
-    /// carried inside `Provisions.target_shard`.
-    ProvisionsReady {
-        /// (provisions, recipients) per target shard.
-        batches: Vec<(Provisions, Vec<ValidatorId>)>,
-    },
-
     /// A provision fetch request failed (network error or peer returned None).
     ProvisionsFetchFailed {
         /// Source shard whose provisions were being fetched.
@@ -269,7 +258,6 @@ impl NodeInput {
             Self::TransactionValidationsFailed { .. } => EventPriority::Internal,
             Self::CommittedHeaderValidated { .. } => EventPriority::Internal,
             Self::CommittedBlockGossipReceived { .. } => EventPriority::Network,
-            Self::ProvisionsReady { .. } => EventPriority::Internal,
             Self::ProvisionsFetchFailed { .. } => EventPriority::Internal,
             Self::ExecutionCertsReceived { .. } => EventPriority::Internal,
             Self::ExecCertFetchFailed { .. } => EventPriority::Internal,
@@ -316,7 +304,6 @@ impl NodeInput {
             Self::TransactionValidationsFailed { .. } => "TransactionValidationsFailed",
             Self::CommittedHeaderValidated { .. } => "CommittedHeaderValidated",
             Self::CommittedBlockGossipReceived { .. } => "CommittedBlockGossipReceived",
-            Self::ProvisionsReady { .. } => "ProvisionsReady",
             Self::ProvisionsFetchFailed { .. } => "ProvisionsFetchFailed",
             Self::ExecutionCertsReceived { .. } => "ExecutionCertsReceived",
             Self::ExecCertFetchFailed { .. } => "ExecCertFetchFailed",
