@@ -15,7 +15,7 @@ use hyperscale_engine::Engine;
 use hyperscale_metrics as metrics;
 use hyperscale_network::Network;
 use hyperscale_storage::{ChainWriter, Storage};
-use hyperscale_types::{Block, BlockHeight, QuorumCertificate, StateRoot, ValidatorId};
+use hyperscale_types::{Block, BlockHeight, QuorumCertificate, StateRoot, TxHash, ValidatorId};
 use std::sync::Arc;
 use tracing::{debug, trace, warn};
 impl<S, N, D, E> IoLoop<S, N, D, E>
@@ -28,70 +28,17 @@ where
     // ─── Action Processing ──────────────────────────────────────────────
 
     /// Process a single action from the state machine.
-    #[allow(clippy::too_many_lines)] // single dispatch over the Action enum; one arm per variant
+    ///
+    /// Two categories of arm:
+    /// - **Coordinator policy** — delegated to coordinator crates via
+    ///   `dispatch_delegated_action`. Crypto, execution, broadcasts.
+    /// - **`io_loop`-internal effects** — handled inline because the work IS
+    ///   `io_loop` machinery (timers, caches consumed by `io_loop`-side
+    ///   serving, RPC observability, block commit pipeline, topology
+    ///   plumbing).
     pub(super) fn process_action(&mut self, action: Action) {
         match action {
-            // ═══════════════════════════════════════════════════════════
-            // Timers
-            // ═══════════════════════════════════════════════════════════
-            Action::SetTimer { id, duration } => {
-                self.pending_timer_ops.push(TimerOp::Set { id, duration });
-            }
-            Action::CancelTimer { id } => {
-                self.pending_timer_ops.push(TimerOp::Cancel { id });
-            }
-
-            // ═══════════════════════════════════════════════════════════
-            // Internal events
-            // ═══════════════════════════════════════════════════════════
-            Action::Continuation(pe) => {
-                // Each fetch instance owns its own admission predicate; the
-                // arm just dispatches the event through them. Adding a new
-                // payload is one new helper + one line here.
-                fetch_instances::apply_transactions_admission(&mut self.transaction_fetch, &pe);
-                fetch_instances::apply_local_provisions_admission(
-                    &mut self.local_provision_fetch,
-                    &pe,
-                );
-                fetch_instances::apply_finalized_waves_admission(
-                    &mut self.finalized_wave_fetch,
-                    &pe,
-                );
-                fetch_instances::apply_provisions_admission(&mut self.provision_fetch, &pe);
-                fetch_instances::apply_exec_certs_admission(&mut self.exec_cert_fetch, &pe);
-                fetch_instances::apply_headers_admission(&mut self.header_fetch, &pe);
-
-                // Serving-cache insertion is io_loop's own state, not an
-                // instance concern — keep it here.
-                if let ProtocolEvent::FinalizedWavesAdmitted { waves } = &pe {
-                    for wave in waves {
-                        self.caches
-                            .finalized_wave
-                            .insert(wave.wave_id_hash(), Arc::clone(wave));
-                    }
-                }
-
-                let _ = self.event_sender.send(NodeInput::Protocol(pe));
-            }
-
-            Action::TrackExecutionCertificate { certificate } => {
-                let key = (certificate.wave_id.hash(), certificate.wave_id.clone());
-                // Cache for serving EC fetch requests from remote shards.
-                // Persistence is handled via wave certificates in block.certificates.
-                if let Ok(mut cache) = self.caches.exec_cert.lock() {
-                    cache.insert(key, Arc::clone(&certificate));
-                    if cache.len() > 2000 {
-                        let cutoff = cache
-                            .values()
-                            .map(|c| c.block_height())
-                            .max()
-                            .unwrap_or(BlockHeight::GENESIS)
-                            .saturating_sub(500);
-                        cache.retain(|_, c| c.block_height() > cutoff);
-                    }
-                }
-            }
-            // Delegated work — dispatch to the worker pools.
+            // ─── Coordinator policy: delegated to worker pools ─────────────
             Action::AggregateExecutionCertificate { .. }
             | Action::VerifyAndAggregateExecutionVotes { .. }
             | Action::VerifyExecutionCertificateSignature { .. }
@@ -117,21 +64,23 @@ where
                 self.dispatch_delegated_action(action);
             }
 
-            // ═══════════════════════════════════════════════════════════
-            // Storage
-            // ═══════════════════════════════════════════════════════════
-            Action::FetchChainMetadata => {
-                let height = self.storage.committed_height();
-                let hash = self.storage.committed_hash();
-                let qc = self.storage.latest_qc();
-                let _ = self.event_sender.send(NodeInput::Protocol(
-                    ProtocolEvent::ChainMetadataFetched { height, hash, qc },
-                ));
+            // ─── Sync / fetch protocol drive ───────────────────────────────
+            Action::StartSync { .. } | Action::Fetch(_) => {
+                self.process_sync_fetch_action(action);
             }
 
-            // ═══════════════════════════════════════════════════════════
-            // Block commit + notifications
-            // ═══════════════════════════════════════════════════════════
+            // ─── io_loop-internal effects ──────────────────────────────────
+            Action::SetTimer { id, duration } => {
+                self.pending_timer_ops.push(TimerOp::Set { id, duration });
+            }
+            Action::CancelTimer { id } => {
+                self.pending_timer_ops.push(TimerOp::Cancel { id });
+            }
+            Action::Continuation(pe) => self.handle_continuation(pe),
+            Action::TrackExecutionCertificate { certificate } => {
+                self.handle_track_execution_certificate(&certificate);
+            }
+            Action::FetchChainMetadata => self.handle_fetch_chain_metadata(),
             Action::CommitBlock { block, qc, source } => {
                 self.accept_block_commit(PendingCommit {
                     block: Arc::new(block),
@@ -161,73 +110,20 @@ where
                 cross_shard,
                 submitted_locally,
             } => {
-                trace!(?tx_hash, ?status, "Transaction status");
-                let now = self.state.now();
-                let terminal_phases = self.tx_phase_times.observe_status(tx_hash, &status, now);
-                if status.is_final()
-                    && submitted_locally
-                    && let Some(phases) = terminal_phases
-                {
-                    let latency_secs = now.saturating_sub(phases.added_at()).as_secs_f64();
-                    if latency_secs > 10.0 {
-                        // Rate-limit slow tx warnings to avoid log floods during
-                        // cross-shard latency spikes.
-                        let since_last_warn = now.saturating_sub(self.last_slow_tx_warn);
-                        if since_last_warn >= std::time::Duration::from_secs(30) {
-                            self.last_slow_tx_warn = now;
-                            let phases_display = phases.display_at(now);
-                            warn!(
-                                ?tx_hash,
-                                latency_secs,
-                                cross_shard,
-                                %phases_display,
-                                "Transaction finalization exceeded 10s"
-                            );
-                        }
-                    }
-                    metrics::record_transaction_finalized(latency_secs, cross_shard);
-                }
-                self.caches.tx_status.insert(tx_hash, status.clone());
-                self.emitted_statuses.push((tx_hash, status));
+                self.handle_emit_transaction_status(
+                    tx_hash,
+                    status,
+                    cross_shard,
+                    submitted_locally,
+                );
             }
             Action::RecordTxEcCreated { tx_hashes } => {
                 self.tx_phase_times
                     .record_ec_created(&tx_hashes, self.state.now());
             }
+            Action::TopologyChanged { topology } => self.handle_topology_changed(&topology),
 
-            // ═══════════════════════════════════════════════════════════
-            // Sync / Fetch
-            // ═══════════════════════════════════════════════════════════
-            Action::StartSync { .. } | Action::Fetch(_) => {
-                self.process_sync_fetch_action(action);
-            }
-
-            // ═══════════════════════════════════════════════════════════
-            // Topology propagation
-            // ═══════════════════════════════════════════════════════════
-            Action::TopologyChanged { topology } => {
-                self.topology.store(Arc::clone(&topology));
-                self.rebuild_topology_cache_from(&topology);
-
-                // Push updated validator keys to the network layer for bind verification.
-                let keys: hyperscale_network::ValidatorKeyMap = topology
-                    .global_validator_set()
-                    .validators
-                    .iter()
-                    .map(|v| (v.validator_id, v.public_key))
-                    .collect();
-                self.network.update_validator_keys(Arc::new(keys));
-
-                tracing::info!(
-                    local_shard = self.local_shard.0,
-                    local_peers = self.local_peers().len(),
-                    "Network topology updated"
-                );
-            }
-
-            // ═══════════════════════════════════════════════════════════
-            // Global consensus / epoch (not yet implemented)
-            // ═══════════════════════════════════════════════════════════
+            // ─── Global consensus / epoch (not yet implemented) ────────────
             Action::ProposeGlobalBlock { .. }
             | Action::BroadcastGlobalBlockVote { .. }
             | Action::TransitionEpoch { .. }
@@ -239,6 +135,129 @@ where
             | Action::PersistEpochConfig { .. }
             | Action::FetchEpochConfig { .. } => {}
         }
+    }
+
+    // ─── io_loop-internal effect handlers ────────────────────────────────
+    //
+    // These arms are handled inline (not delegated) because the work IS
+    // `io_loop` state — caches consumed by `io_loop`-side serving, RPC
+    // observability, topology plumbing. Migrating them to coordinator
+    // crates would force a typed cache reference onto `ActionContext` per
+    // arm, with no architectural payoff.
+
+    fn handle_continuation(&mut self, pe: ProtocolEvent) {
+        // Each fetch instance owns its own admission predicate; the
+        // arm just dispatches the event through them. Adding a new
+        // payload is one new helper + one line here.
+        fetch_instances::apply_transactions_admission(&mut self.transaction_fetch, &pe);
+        fetch_instances::apply_local_provisions_admission(&mut self.local_provision_fetch, &pe);
+        fetch_instances::apply_finalized_waves_admission(&mut self.finalized_wave_fetch, &pe);
+        fetch_instances::apply_provisions_admission(&mut self.provision_fetch, &pe);
+        fetch_instances::apply_exec_certs_admission(&mut self.exec_cert_fetch, &pe);
+        fetch_instances::apply_headers_admission(&mut self.header_fetch, &pe);
+
+        // Serving-cache insertion is io_loop's own state, not an
+        // instance concern — keep it here.
+        if let ProtocolEvent::FinalizedWavesAdmitted { waves } = &pe {
+            for wave in waves {
+                self.caches
+                    .finalized_wave
+                    .insert(wave.wave_id_hash(), Arc::clone(wave));
+            }
+        }
+
+        let _ = self.event_sender.send(NodeInput::Protocol(pe));
+    }
+
+    fn handle_track_execution_certificate(
+        &self,
+        certificate: &Arc<hyperscale_types::ExecutionCertificate>,
+    ) {
+        // Cache for serving EC fetch requests from remote shards.
+        // Persistence is handled via wave certificates in block.certificates.
+        let key = (certificate.wave_id.hash(), certificate.wave_id.clone());
+        if let Ok(mut cache) = self.caches.exec_cert.lock() {
+            cache.insert(key, Arc::clone(certificate));
+            if cache.len() > 2000 {
+                let cutoff = cache
+                    .values()
+                    .map(|c| c.block_height())
+                    .max()
+                    .unwrap_or(BlockHeight::GENESIS)
+                    .saturating_sub(500);
+                cache.retain(|_, c| c.block_height() > cutoff);
+            }
+        }
+    }
+
+    fn handle_fetch_chain_metadata(&self) {
+        let height = self.storage.committed_height();
+        let hash = self.storage.committed_hash();
+        let qc = self.storage.latest_qc();
+        let _ = self
+            .event_sender
+            .send(NodeInput::Protocol(ProtocolEvent::ChainMetadataFetched {
+                height,
+                hash,
+                qc,
+            }));
+    }
+
+    fn handle_emit_transaction_status(
+        &mut self,
+        tx_hash: TxHash,
+        status: hyperscale_types::TransactionStatus,
+        cross_shard: bool,
+        submitted_locally: bool,
+    ) {
+        trace!(?tx_hash, ?status, "Transaction status");
+        let now = self.state.now();
+        let terminal_phases = self.tx_phase_times.observe_status(tx_hash, &status, now);
+        if status.is_final()
+            && submitted_locally
+            && let Some(phases) = terminal_phases
+        {
+            let latency_secs = now.saturating_sub(phases.added_at()).as_secs_f64();
+            if latency_secs > 10.0 {
+                // Rate-limit slow tx warnings to avoid log floods during
+                // cross-shard latency spikes.
+                let since_last_warn = now.saturating_sub(self.last_slow_tx_warn);
+                if since_last_warn >= std::time::Duration::from_secs(30) {
+                    self.last_slow_tx_warn = now;
+                    let phases_display = phases.display_at(now);
+                    warn!(
+                        ?tx_hash,
+                        latency_secs,
+                        cross_shard,
+                        %phases_display,
+                        "Transaction finalization exceeded 10s"
+                    );
+                }
+            }
+            metrics::record_transaction_finalized(latency_secs, cross_shard);
+        }
+        self.caches.tx_status.insert(tx_hash, status.clone());
+        self.emitted_statuses.push((tx_hash, status));
+    }
+
+    fn handle_topology_changed(&mut self, topology: &Arc<hyperscale_types::TopologySnapshot>) {
+        self.topology.store(Arc::clone(topology));
+        self.rebuild_topology_cache_from(topology);
+
+        // Push updated validator keys to the network layer for bind verification.
+        let keys: hyperscale_network::ValidatorKeyMap = topology
+            .global_validator_set()
+            .validators
+            .iter()
+            .map(|v| (v.validator_id, v.public_key))
+            .collect();
+        self.network.update_validator_keys(Arc::new(keys));
+
+        tracing::info!(
+            local_shard = self.local_shard.0,
+            local_peers = self.local_peers().len(),
+            "Network topology updated"
+        );
     }
 
     // ─── Action Handler Groups ──────────────────────────────────────────
