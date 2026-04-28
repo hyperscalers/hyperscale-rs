@@ -1,7 +1,11 @@
 //! Node state machine.
 
+mod execution;
 mod proposal;
+mod provisions;
+mod sync;
 mod timers;
+mod transactions;
 
 use hyperscale_bft::{BftConfig, BftCoordinator, RecoveredState};
 use hyperscale_core::{Action, ProtocolEvent, StateMachine, TimerId};
@@ -12,7 +16,7 @@ use hyperscale_remote_headers::RemoteHeaderCoordinator;
 use hyperscale_topology::TopologyCoordinator;
 use hyperscale_types::{
     Block, BlockHash, BlockHeader, BlockManifest, CertifiedBlock, LocalTimestamp,
-    QuorumCertificate, RoutableTransaction, ShardGroupId, StateRoot, TopologySnapshot, TxHash,
+    QuorumCertificate, ShardGroupId, StateRoot, TopologySnapshot,
 };
 use std::sync::Arc;
 use tracing::instrument;
@@ -318,71 +322,6 @@ impl NodeStateMachine {
 
         actions
     }
-
-    fn on_ec_created(&self, tx_hashes: &[TxHash]) -> Vec<Action> {
-        self.mempool.on_ec_created(tx_hashes)
-    }
-
-    /// Hand a gossiped transaction to the canonical mempool. Mempool emits
-    /// `Continuation(ProtocolEvent::TransactionsAdmitted)` for whatever it
-    /// admits; `io_loop` drains the fetch protocol and BFT's pending-block
-    /// subscriber receives the txs from there.
-    fn on_transaction_gossip_received(
-        &mut self,
-        tx: Arc<RoutableTransaction>,
-        submitted_locally: bool,
-    ) -> Vec<Action> {
-        if !self.topology.snapshot().involves_local_shard(&tx) {
-            return vec![];
-        }
-
-        let mut actions = self.mempool.on_transaction_gossip(
-            self.topology.snapshot(),
-            tx,
-            submitted_locally,
-            self.now,
-        );
-
-        // New transaction available — signal for event-driven proposal.
-        actions.push(Action::Continuation(ProtocolEvent::ContentAvailable));
-
-        actions
-    }
-
-    /// Admit a batch of fetch-delivered transactions through mempool. Called
-    /// directly from `io_loop` when a fetch response arrives — bypasses the
-    /// gossip-side validation pipeline (the txs came from a peer we asked, in
-    /// response to our own request). Mempool emits
-    /// `Continuation(ProtocolEvent::TransactionsAdmitted)` for the admitted
-    /// subset; `io_loop`'s interception arm drains the fetch protocol.
-    pub fn on_transactions_fetched(&mut self, txs: Vec<Arc<RoutableTransaction>>) -> Vec<Action> {
-        if txs.is_empty() {
-            return vec![];
-        }
-        let mut actions =
-            self.mempool
-                .on_fetched_transactions(self.topology.snapshot(), txs, self.now);
-        actions.push(Action::Continuation(ProtocolEvent::ContentAvailable));
-        actions
-    }
-
-    /// Hand a delivered execution certificate to the canonical EC store.
-    /// Called directly from `io_loop` for both fetch responses and
-    /// gossip-delivered cert batches (post sender-sig check). Each cert
-    /// flows through `ExecutionCoordinator::on_wave_certificate`, which
-    /// emits `Continuation(ProtocolEvent::ExecutionCertificateAdmitted)` so
-    /// the fetch protocol is drained per wave.
-    pub fn on_execution_certs_received(
-        &mut self,
-        certs: Vec<hyperscale_types::ExecutionCertificate>,
-    ) -> Vec<Action> {
-        let topology = self.topology.snapshot();
-        let mut actions = Vec::new();
-        for cert in certs {
-            actions.extend(self.execution.on_wave_certificate(topology, cert));
-        }
-        actions
-    }
 }
 
 impl StateMachine for NodeStateMachine {
@@ -519,160 +458,33 @@ impl StateMachine for NodeStateMachine {
                 actions
             }
 
-            // ── Provision ───────────────────────────────────────────────
-            ProtocolEvent::ProvisionsReceived { provisions } => self
-                .provisions
-                .on_state_provisions_received(self.topology.snapshot(), provisions),
-            ProtocolEvent::StateProvisionsVerified {
-                provisions,
-                committed_header,
-                valid,
-            } => self.provisions.on_state_provisions_verified(
-                self.topology.snapshot(),
-                provisions,
-                committed_header.as_ref(),
-                valid,
-                self.now,
-            ),
-            ProtocolEvent::ProvisionsAdmitted { provisions, .. } => {
-                let mut actions = self
-                    .bft
-                    .on_provisions_admitted(self.topology.snapshot(), &[provisions]);
-                // New provisions queued — signal for event-driven proposal.
-                actions.push(Action::Continuation(ProtocolEvent::ContentAvailable));
-                actions
-            }
-            ProtocolEvent::OutboundProvisionBroadcast {
-                provisions,
-                target_shard,
-            } => {
-                self.outbound_provisions
-                    .on_broadcast(&provisions, target_shard);
-                vec![]
-            }
-            ProtocolEvent::OutboundEcObserved {
-                target_shard,
-                tx_outcomes,
-            } => {
-                self.outbound_provisions
-                    .on_ec_observed(target_shard, &tx_outcomes);
-                vec![]
-            }
+            // ── Provisions ───────────────────────────────────────────────
+            evt @ (ProtocolEvent::ProvisionsReceived { .. }
+            | ProtocolEvent::StateProvisionsVerified { .. }
+            | ProtocolEvent::ProvisionsAdmitted { .. }
+            | ProtocolEvent::OutboundProvisionBroadcast { .. }
+            | ProtocolEvent::OutboundEcObserved { .. }) => self.handle_provisions(evt),
 
             // ── Execution ────────────────────────────────────────────────
-            ProtocolEvent::ExecutionBatchCompleted {
-                wave_id,
-                results,
-                tx_outcomes,
-            } => {
-                // Results arriving can (a) finalize a wave whose local EC
-                // landed ahead of the engine, (b) unblock new vote
-                // emission. Thread both through.
-                let mut actions =
-                    self.execution
-                        .on_execution_batch_completed(&wave_id, results, tx_outcomes);
-                actions.extend(self.execution.emit_vote_actions(self.topology.snapshot()));
-                actions
-            }
-
-            // ── Wave Execution (wave-based voting) ────────────────────────
-            ProtocolEvent::ExecutionVoteReceived { vote } => self
-                .execution
-                .on_execution_vote(self.topology.snapshot(), vote),
-            ProtocolEvent::ExecutionVotesVerifiedAndAggregated {
-                wave_id,
-                block_hash,
-                verified_votes,
-            } => self.execution.on_votes_verified(
-                self.topology.snapshot(),
-                wave_id,
-                block_hash,
-                verified_votes,
-            ),
-            ProtocolEvent::ExecutionCertificateAggregated {
-                wave_id,
-                certificate,
-            } => self.execution.on_certificate_aggregated(
-                self.topology.snapshot(),
-                &wave_id,
-                certificate,
-            ),
-            ProtocolEvent::ExecutionCertificateSignatureVerified { certificate, valid } => {
-                // If the EC is for a remote wave where we were a source, the
-                // target shard's tx_outcomes acknowledge outbound batches we
-                // sent. Capture the ACK signal before the cert is consumed.
-                let local_shard = self.topology.snapshot().local_shard();
-                let outbound_ack = if valid
-                    && certificate.shard_group_id() != local_shard
-                    && certificate.wave_id.remote_shards.contains(&local_shard)
-                {
-                    Some((
-                        certificate.shard_group_id(),
-                        certificate.tx_outcomes.clone(),
-                    ))
-                } else {
-                    None
-                };
-
-                let mut actions = self.execution.on_certificate_verified(
-                    self.topology.snapshot(),
-                    certificate,
-                    valid,
-                );
-                if let Some((target_shard, tx_outcomes)) = outbound_ack {
-                    actions.push(Action::Continuation(ProtocolEvent::OutboundEcObserved {
-                        target_shard,
-                        tx_outcomes,
-                    }));
-                }
-                // Remote EC abort propagation may unlock local accumulators — re-scan.
-                actions.extend(self.execution.emit_vote_actions(self.topology.snapshot()));
-                actions
-            }
+            evt @ (ProtocolEvent::ExecutionBatchCompleted { .. }
+            | ProtocolEvent::ExecutionVoteReceived { .. }
+            | ProtocolEvent::ExecutionVotesVerifiedAndAggregated { .. }
+            | ProtocolEvent::ExecutionCertificateAggregated { .. }
+            | ProtocolEvent::ExecutionCertificateSignatureVerified { .. }
+            | ProtocolEvent::WaveCompleted { .. }
+            | ProtocolEvent::ExecutionCertificateAdmitted { .. }) => self.handle_execution(evt),
 
             // ── Transactions ─────────────────────────────────────────────
-            ProtocolEvent::ExecutionCertificateCreated { tx_hashes } => {
-                self.on_ec_created(&tx_hashes)
-            }
-            ProtocolEvent::WaveCompleted {
-                wave_cert: _,
-                tx_hashes: _,
-            } => {
-                // New finalized wave available — signal for event-driven proposal.
-                vec![Action::Continuation(ProtocolEvent::ContentAvailable)]
-            }
-            ProtocolEvent::TransactionGossipReceived {
-                tx,
-                submitted_locally,
-            } => self.on_transaction_gossip_received(tx, submitted_locally),
-            ProtocolEvent::TransactionsAdmitted { txs } => self
-                .bft
-                .on_transactions_admitted(self.topology.snapshot(), &txs),
-            // ── Storage / Sync ───────────────────────────────────────────
-            ProtocolEvent::SyncBlockReadyToApply { certified } => self
-                .bft
-                .on_sync_block_ready_to_apply(self.topology.snapshot(), certified),
-            // Handled by IoLoop directly (sync verification pipeline).
-            #[allow(clippy::match_same_arms)] // distinct from the global/epoch no-op group below
-            ProtocolEvent::SyncEcVerificationComplete { .. } => vec![],
-            // SyncProtocol finished fetching — tell BftCoordinator to exit sync
-            // mode so it can re-enter sync if still behind, or resume
-            // normal consensus.
-            ProtocolEvent::SyncProtocolComplete { .. } => {
-                self.bft.on_sync_complete(self.topology.snapshot())
-            }
-            // Sync recovery complete — flush expected provisions and remote
-            // headers immediately so we can participate in execution for
-            // recent blocks within the WAVE_TIMEOUT window.
-            ProtocolEvent::SyncResumed => {
-                let topo = self.topology.snapshot();
-                let mut actions = self.remote_headers.flush_expected_headers(topo);
-                actions.extend(self.provisions.flush_expected_provisions(topo));
-                actions
-            }
-            ProtocolEvent::ChainMetadataFetched { height, hash, qc } => self
-                .bft
-                .on_chain_metadata_fetched(self.topology.snapshot(), height, hash, qc),
+            evt @ (ProtocolEvent::ExecutionCertificateCreated { .. }
+            | ProtocolEvent::TransactionGossipReceived { .. }
+            | ProtocolEvent::TransactionsAdmitted { .. }) => self.handle_transaction(evt),
+
+            // ── Sync ─────────────────────────────────────────────────────
+            evt @ (ProtocolEvent::SyncBlockReadyToApply { .. }
+            | ProtocolEvent::SyncEcVerificationComplete { .. }
+            | ProtocolEvent::SyncProtocolComplete { .. }
+            | ProtocolEvent::SyncResumed
+            | ProtocolEvent::ChainMetadataFetched { .. }) => self.handle_sync(evt),
 
             // ── Global Consensus / Epoch (not yet implemented) ───────────
             // When implemented, route to GlobalConsensusState.
@@ -693,11 +505,7 @@ impl StateMachine for NodeStateMachine {
             | ProtocolEvent::ShardSplitInitiated { .. }
             | ProtocolEvent::ShardSplitComplete { .. }
             | ProtocolEvent::ShardMergeInitiated { .. }
-            | ProtocolEvent::ShardMergeComplete { .. }
-            // Pure admission signal — `io_loop`'s `Continuation` interception
-            // arm drains the exec-cert fetch protocol; the state machine
-            // itself has nothing to do here.
-            | ProtocolEvent::ExecutionCertificateAdmitted { .. } => vec![],
+            | ProtocolEvent::ShardMergeComplete { .. } => vec![],
 
             ProtocolEvent::FinalizedWavesAdmitted { waves } => self
                 .bft
