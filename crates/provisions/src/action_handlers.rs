@@ -164,12 +164,13 @@ where
 ///
 /// Outcomes flow through `ctx.notify`. Variants owned by other coordinator
 /// crates hit `unreachable!()` — node's dispatcher routes by variant prefix.
-pub fn handle_action<S, E>(
+pub fn handle_action<S, E, N>(
     action: hyperscale_core::Action,
-    ctx: &hyperscale_core::ActionContext<'_, S, E>,
+    ctx: &hyperscale_core::ActionContext<'_, S, E, N>,
 ) where
     S: hyperscale_storage::Storage,
     E: Engine,
+    N: hyperscale_network::Network,
 {
     use hyperscale_core::{Action, NodeInput, ProtocolEvent};
     use hyperscale_metrics as metrics;

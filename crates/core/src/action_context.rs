@@ -7,8 +7,11 @@
 
 use crate::NodeInput;
 use hyperscale_engine::Engine;
+use hyperscale_network::Network;
 use hyperscale_storage::{PendingChain, Storage};
-use hyperscale_types::{BlockHash, BlockHeight, LocalReceipt, TopologySnapshot};
+use hyperscale_types::{
+    BlockHash, BlockHeight, Bls12381G1PrivateKey, LocalReceipt, TopologySnapshot,
+};
 use std::sync::Arc;
 
 /// Context for executing delegated actions.
@@ -18,12 +21,19 @@ use std::sync::Arc;
 /// block lives on the `Action` variant itself, so the dispatcher doesn't
 /// need to know which actions read state at which anchor.
 #[allow(missing_docs)] // bag of references; field names match the borrowed types
-pub struct ActionContext<'a, S: Storage, E: Engine> {
+pub struct ActionContext<'a, S: Storage, E: Engine, N: Network> {
     pub executor: &'a E,
     pub topology: &'a TopologySnapshot,
     /// Chain-state lookup. Handlers that read state call
     /// `pending_chain.view_at(block_hash)` to build an anchored view.
     pub pending_chain: &'a Arc<PendingChain<S>>,
+    /// Network handle for broadcast/notify/request actions. The local
+    /// validator's identity and shard are read from `topology` (see
+    /// [`TopologySnapshot::local_validator_id`] / [`local_shard`]).
+    pub network: &'a Arc<N>,
+    /// Local validator's BLS signing key. Used by handlers that sign
+    /// votes/headers before broadcast.
+    pub signing_key: &'a Arc<Bls12381G1PrivateKey>,
     /// Send a `NodeInput` (typically a `ProtocolEvent`) back to the state
     /// machine. The single sink for delegated-action outcomes.
     pub notify: &'a (dyn Fn(NodeInput) + Send + Sync),

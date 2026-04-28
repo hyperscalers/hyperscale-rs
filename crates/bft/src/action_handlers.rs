@@ -541,12 +541,13 @@ fn collect_finalized_receipts(
 /// owned by other coordinator crates hit `unreachable!()` — the caller
 /// (node's dispatcher) routes by variant prefix.
 #[allow(clippy::too_many_lines)] // single dispatch over BFT-owned Action variants
-pub fn handle_action<S, E>(
+pub fn handle_action<S, E, N>(
     action: hyperscale_core::Action,
-    ctx: &hyperscale_core::ActionContext<'_, S, E>,
+    ctx: &hyperscale_core::ActionContext<'_, S, E, N>,
 ) where
     S: hyperscale_storage::Storage,
     E: hyperscale_engine::Engine,
+    N: hyperscale_network::Network,
 {
     use hyperscale_core::{Action, NodeInput, PreparedBlock, ProtocolEvent, VerificationKind};
     use hyperscale_metrics as metrics;
@@ -821,6 +822,66 @@ pub fn handle_action<S, E>(
                 finalized_waves,
                 provisions,
             }));
+        }
+
+        // ── Sign + broadcast actions ──────────────────────────────────────
+        Action::BroadcastBlockHeader { header, manifest } => {
+            let block_hash = header.hash();
+            let msg = hyperscale_types::block_header_message(
+                header.shard_group_id,
+                header.height,
+                header.round,
+                &block_hash,
+            );
+            let sig = ctx.signing_key.sign_v1(&msg);
+            let gossip = hyperscale_messages::BlockHeaderNotification::new(*header, *manifest, sig);
+            let local_peers: Vec<ValidatorId> = ctx
+                .topology
+                .committee_for_shard(ctx.topology.local_shard())
+                .iter()
+                .filter(|&&v| v != ctx.topology.local_validator_id())
+                .copied()
+                .collect();
+            ctx.network.notify(&local_peers, &gossip);
+        }
+
+        Action::SignAndBroadcastBlockVote {
+            block_hash,
+            height,
+            round,
+            timestamp,
+            recipients,
+        } => {
+            let vote = BlockVote::new(
+                block_hash,
+                ctx.topology.local_shard(),
+                height,
+                round,
+                ctx.topology.local_validator_id(),
+                ctx.signing_key,
+                timestamp,
+            );
+            let gossip = hyperscale_messages::BlockVoteNotification { vote: vote.clone() };
+            ctx.network.notify(&recipients, &gossip);
+            // Feed our own signed vote back for local VoteSet tracking.
+            (ctx.notify)(NodeInput::Protocol(ProtocolEvent::BlockVoteReceived {
+                vote,
+            }));
+        }
+
+        Action::BroadcastCommittedBlockHeader { committed_header } => {
+            let msg = hyperscale_types::committed_block_header_message(
+                committed_header.header.shard_group_id,
+                committed_header.header.height,
+                &committed_header.header.hash(),
+            );
+            let sig = ctx.signing_key.sign_v1(&msg);
+            let gossip = hyperscale_messages::CommittedBlockHeaderGossip {
+                committed_header,
+                sender: ctx.topology.local_validator_id(),
+                sender_signature: sig,
+            };
+            ctx.network.broadcast_global(&gossip);
         }
 
         _ => unreachable!("hyperscale_bft::handle_action called with non-BFT action"),

@@ -1,7 +1,6 @@
 //! Action types for the deterministic state machine.
 
 use crate::{FetchRequest, ProtocolEvent, TimerId};
-use hyperscale_messages::TransactionGossip;
 use hyperscale_types::{
     Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, BlockVote, Bls12381G1PublicKey,
     Bls12381G2Signature, CertificateRoot, CommittedBlockHeader, EpochConfig, EpochId,
@@ -57,17 +56,6 @@ pub enum Action {
         header: Box<BlockHeader>,
         /// Manifest listing the block's tx / cert / provision hashes.
         manifest: Box<BlockManifest>,
-    },
-
-    // ═══════════════════════════════════════════════════════════════════════
-    // Network: Mempool & Certificates
-    // ═══════════════════════════════════════════════════════════════════════
-    /// Broadcast a transaction gossip to a shard.
-    BroadcastTransaction {
-        /// Target shard for the gossip.
-        shard: ShardGroupId,
-        /// Gossip envelope (sender + transaction payload).
-        gossip: Box<TransactionGossip>,
     },
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -781,7 +769,7 @@ impl Action {
     pub const fn dispatch_pool(&self) -> Option<hyperscale_dispatch::DispatchPool> {
         use hyperscale_dispatch::DispatchPool;
         match self {
-            // Consensus-critical crypto + state root computation.
+            // Consensus-critical crypto + state root computation + sign-and-broadcast.
             Self::VerifyAndBuildQuorumCertificate { .. }
             | Self::VerifyQcSignature { .. }
             | Self::VerifyRemoteHeaderQc { .. }
@@ -791,14 +779,19 @@ impl Action {
             | Self::VerifyLocalReceiptRoot { .. }
             | Self::VerifyProvisionTxRoots { .. }
             | Self::VerifyStateRoot { .. }
-            | Self::BuildProposal { .. } => Some(DispatchPool::ConsensusCrypto),
+            | Self::BuildProposal { .. }
+            | Self::BroadcastBlockHeader { .. }
+            | Self::SignAndBroadcastBlockVote { .. }
+            | Self::BroadcastCommittedBlockHeader { .. } => Some(DispatchPool::ConsensusCrypto),
 
-            // General crypto (cert aggregation, provision proofs).
+            // General crypto (cert aggregation, provision proofs, exec vote/cert sign+send).
             Self::AggregateExecutionCertificate { .. }
             | Self::VerifyAndAggregateExecutionVotes { .. }
             | Self::VerifyExecutionCertificateSignature { .. }
             | Self::VerifyProvisions { .. }
-            | Self::FetchAndBroadcastProvisions { .. } => Some(DispatchPool::Crypto),
+            | Self::FetchAndBroadcastProvisions { .. }
+            | Self::SignAndSendExecutionVote { .. }
+            | Self::BroadcastExecutionCertificate { .. } => Some(DispatchPool::Crypto),
 
             // Transaction execution.
             Self::ExecuteTransactions { .. } | Self::ExecuteCrossShardTransactions { .. } => {

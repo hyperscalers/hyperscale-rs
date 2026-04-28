@@ -10,7 +10,7 @@ use hyperscale_core::{
     Action, ActionContext, CommitSource, FetchRequest, NodeInput, PreparedBlock, ProtocolEvent,
     StateMachine,
 };
-use hyperscale_dispatch::{Dispatch, DispatchPool};
+use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::Engine;
 use hyperscale_metrics as metrics;
 use hyperscale_network::Network;
@@ -74,187 +74,6 @@ where
                 let _ = self.event_sender.send(NodeInput::Protocol(pe));
             }
 
-            // ═══════════════════════════════════════════════════════════
-            // Network broadcasts — immediate (non-batched)
-            // ═══════════════════════════════════════════════════════════
-            Action::BroadcastBlockHeader { header, manifest } => {
-                // Sign proposal on consensus crypto pool, then broadcast.
-                let signing_key = Arc::clone(&self.signing_key);
-                let network = Arc::clone(&self.network);
-                let topology = Arc::clone(&self.topology);
-                let validator_id = self.validator_id;
-
-                self.dispatch.spawn(DispatchPool::ConsensusCrypto, move || {
-                    let block_hash = header.hash();
-                    let msg = hyperscale_types::block_header_message(
-                        header.shard_group_id,
-                        header.height,
-                        header.round,
-                        &block_hash,
-                    );
-                    let sig = signing_key.sign_v1(&msg);
-                    let gossip =
-                        hyperscale_messages::BlockHeaderNotification::new(*header, *manifest, sig);
-                    let topo = topology.load();
-                    let local_peers: Vec<ValidatorId> = topo
-                        .committee_for_shard(topo.local_shard())
-                        .iter()
-                        .filter(|&&v| v != validator_id)
-                        .copied()
-                        .collect();
-                    network.notify(&local_peers, &gossip);
-                });
-            }
-            Action::SignAndBroadcastBlockVote {
-                block_hash,
-                height,
-                round,
-                timestamp,
-                recipients,
-            } => {
-                // Sign vote on consensus crypto pool, then broadcast + loopback.
-                let signing_key = Arc::clone(&self.signing_key);
-                let network = Arc::clone(&self.network);
-                let event_tx = self.event_sender.clone();
-                let local_shard = self.local_shard;
-                let validator_id = self.validator_id;
-
-                self.dispatch.spawn(DispatchPool::ConsensusCrypto, move || {
-                    let vote = hyperscale_types::BlockVote::new(
-                        block_hash,
-                        local_shard,
-                        height,
-                        round,
-                        validator_id,
-                        &signing_key,
-                        timestamp,
-                    );
-                    let gossip = hyperscale_messages::BlockVoteNotification { vote: vote.clone() };
-                    network.notify(&recipients, &gossip);
-
-                    // Feed our own signed vote back for local VoteSet tracking.
-                    let _ = event_tx.send(hyperscale_core::NodeInput::Protocol(
-                        hyperscale_core::ProtocolEvent::BlockVoteReceived { vote },
-                    ));
-                });
-            }
-            Action::BroadcastTransaction { shard, gossip } => {
-                self.network.broadcast_to_shard(shard, &*gossip);
-            }
-            Action::BroadcastCommittedBlockHeader { committed_header } => {
-                // Sign committed header on consensus crypto pool, then broadcast.
-                let signing_key = Arc::clone(&self.signing_key);
-                let network = Arc::clone(&self.network);
-                let validator_id = self.validator_id;
-
-                self.dispatch.spawn(DispatchPool::ConsensusCrypto, move || {
-                    let msg = hyperscale_types::committed_block_header_message(
-                        committed_header.header.shard_group_id,
-                        committed_header.header.height,
-                        &committed_header.header.hash(),
-                    );
-                    let sig = signing_key.sign_v1(&msg);
-                    let gossip = hyperscale_messages::CommittedBlockHeaderGossip {
-                        committed_header,
-                        sender: validator_id,
-                        sender_signature: sig,
-                    };
-                    network.broadcast_global(&gossip);
-                });
-            }
-
-            // ═══════════════════════════════════════════════════════════
-            // Network broadcasts — batched
-            // ═══════════════════════════════════════════════════════════
-            Action::SignAndSendExecutionVote {
-                block_hash,
-                block_height,
-                vote_anchor_ts,
-                wave_id,
-                global_receipt_root,
-                tx_outcomes,
-                leader,
-            } => {
-                // Spawn BLS signing + network send on crypto pool to avoid
-                // blocking the io_loop. The closure owns Arc-cloned handles
-                // to the signing key, network, and event sender.
-                let signing_key = Arc::clone(&self.signing_key);
-                let network = Arc::clone(&self.network);
-                let event_tx = self.event_sender.clone();
-                let local_shard = self.local_shard;
-                let validator_id = self.validator_id;
-
-                self.dispatch.spawn(DispatchPool::Crypto, move || {
-                    let tx_count = u32::try_from(tx_outcomes.len()).unwrap_or(u32::MAX);
-                    let msg = hyperscale_types::exec_vote_message(
-                        vote_anchor_ts,
-                        &wave_id,
-                        local_shard,
-                        &global_receipt_root,
-                        tx_count,
-                    );
-                    let sig = signing_key.sign_v1(&msg);
-                    let vote = hyperscale_types::ExecutionVote {
-                        block_hash,
-                        block_height,
-                        vote_anchor_ts,
-                        wave_id,
-                        shard_group_id: local_shard,
-                        global_receipt_root,
-                        tx_count,
-                        tx_outcomes,
-                        validator: validator_id,
-                        signature: sig,
-                    };
-
-                    // Send vote to the wave leader (unicast).
-                    if leader != validator_id {
-                        let batch_msg = hyperscale_types::exec_vote_batch_message(
-                            local_shard,
-                            std::slice::from_ref(&vote),
-                        );
-                        let batch_sig = signing_key.sign_v1(&batch_msg);
-                        let batch = hyperscale_messages::ExecutionVotesNotification::new(
-                            vec![vote.clone()],
-                            validator_id,
-                            batch_sig,
-                        );
-                        network.notify(&[leader], &batch);
-                    }
-
-                    // Feed own vote to state machine only if we are the leader.
-                    if leader == validator_id {
-                        let _ = event_tx.send(hyperscale_core::NodeInput::Protocol(
-                            hyperscale_core::ProtocolEvent::ExecutionVoteReceived { vote },
-                        ));
-                    }
-                });
-            }
-            Action::BroadcastExecutionCertificate {
-                shard: _,
-                certificate,
-                recipients,
-            } => {
-                // Spawn BLS signing + network send on crypto pool.
-                let signing_key = Arc::clone(&self.signing_key);
-                let network = Arc::clone(&self.network);
-                let validator_id = self.validator_id;
-
-                self.dispatch.spawn(DispatchPool::Crypto, move || {
-                    let cert = std::sync::Arc::unwrap_or_clone(certificate);
-                    let msg = hyperscale_types::exec_cert_batch_message(
-                        cert.shard_group_id(),
-                        std::slice::from_ref(&cert),
-                    );
-                    let sig = signing_key.sign_v1(&msg);
-                    let batch = hyperscale_messages::ExecutionCertificatesNotification::new(
-                        vec![cert],
-                        validator_id,
-                        sig,
-                    );
-                    network.notify(&recipients, &batch);
-                });
-            }
             Action::TrackExecutionCertificate { certificate } => {
                 let key = (certificate.wave_id.hash(), certificate.wave_id.clone());
                 // Cache for serving EC fetch requests from remote shards.
@@ -289,7 +108,12 @@ where
             | Action::VerifyProvisions { .. }
             | Action::ExecuteTransactions { .. }
             | Action::ExecuteCrossShardTransactions { .. }
-            | Action::FetchAndBroadcastProvisions { .. } => {
+            | Action::FetchAndBroadcastProvisions { .. }
+            | Action::BroadcastBlockHeader { .. }
+            | Action::SignAndBroadcastBlockVote { .. }
+            | Action::BroadcastCommittedBlockHeader { .. }
+            | Action::SignAndSendExecutionVote { .. }
+            | Action::BroadcastExecutionCertificate { .. } => {
                 self.dispatch_delegated_action(action);
             }
 
@@ -687,6 +511,8 @@ where
         let topology_snapshot = self.topology.load_full();
         let prepared_commits = self.block_commit.prepared_commits_handle();
         let pending_chain = Arc::clone(&self.pending_chain);
+        let network = Arc::clone(&self.network);
+        let signing_key = Arc::clone(&self.signing_key);
         let event_tx = self.event_sender.clone();
 
         self.dispatch.spawn(pool, move || {
@@ -721,6 +547,8 @@ where
                 executor: &executor,
                 topology: &topology_snapshot,
                 pending_chain: &pending_chain,
+                network: &network,
+                signing_key: &signing_key,
                 notify: &notify,
                 commit_prepared: &commit_prepared,
             };
@@ -735,7 +563,10 @@ where
                 | Action::VerifyCertificateRoot { .. }
                 | Action::VerifyLocalReceiptRoot { .. }
                 | Action::VerifyStateRoot { .. }
-                | Action::BuildProposal { .. } => {
+                | Action::BuildProposal { .. }
+                | Action::BroadcastBlockHeader { .. }
+                | Action::SignAndBroadcastBlockVote { .. }
+                | Action::BroadcastCommittedBlockHeader { .. } => {
                     hyperscale_bft::action_handlers::handle_action(action, &ctx);
                 }
 
@@ -743,7 +574,9 @@ where
                 | Action::VerifyAndAggregateExecutionVotes { .. }
                 | Action::VerifyExecutionCertificateSignature { .. }
                 | Action::ExecuteTransactions { .. }
-                | Action::ExecuteCrossShardTransactions { .. } => {
+                | Action::ExecuteCrossShardTransactions { .. }
+                | Action::SignAndSendExecutionVote { .. }
+                | Action::BroadcastExecutionCertificate { .. } => {
                     hyperscale_execution::action_handlers::handle_action(action, &ctx);
                 }
 
