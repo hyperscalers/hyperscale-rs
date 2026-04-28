@@ -544,11 +544,7 @@ where
 
             // ── Fetch protocol ─────────────────────────────────────────
             NodeInput::TransactionReceived { transactions } => {
-                // Route delivered txs through mempool admission. The
-                // fetch-protocol drain happens via the resulting
-                // `Continuation(TransactionsAdmitted)` interception.
-                let actions = self.state.on_transactions_fetched(transactions);
-                self.process_actions(actions);
+                self.handle_transactions_received(transactions);
             }
 
             NodeInput::FetchTransactionsFailed { hashes } => {
@@ -583,15 +579,8 @@ where
                 block_height,
             } => self.handle_provisions_fetch_failed(source_shard, block_height),
 
-            // ── Execution certificate delivery (fetch + gossip) ──────
-            //
-            // Each delivered cert flows through `on_wave_certificate`, which
-            // emits `Continuation(ExecutionCertificateAdmitted)`. `io_loop`'s
-            // interception arm drains the exec-cert fetch protocol per wave.
             NodeInput::ExecutionCertsReceived { certificates } => {
-                let actions = self.state.on_execution_certs_received(certificates);
-                self.process_actions(actions);
-                self.update_fetch_tick_timer();
+                self.handle_execution_certs_received(certificates);
             }
 
             NodeInput::ExecCertFetchFailed { hashes } => self.handle_exec_cert_fetch_failed(hashes),
@@ -629,66 +618,19 @@ where
                 }
             }
 
-            // ── Local provision fetch protocol ────────────────────────
-            //
-            // Fetched batches enter the verification pipeline. Successful
-            // verification emits `Continuation(ProvisionsAdmitted)`, which
-            // drains both the cross-shard `provision_fetch` (by scope) and
-            // the local-block `local_provision_fetch` (by hash). Missing
-            // hashes still need a `Failed` signal so the in-flight set can
-            // retry; admission events drain the rest.
             NodeInput::LocalProvisionReceived {
                 batches,
                 missing_hashes,
-            } => {
-                if !missing_hashes.is_empty() {
-                    self.protocols.local_provision.handle(FetchInput::Failed {
-                        ids: missing_hashes,
-                    });
-                }
-                for provisions in batches {
-                    self.feed_event(ProtocolEvent::ProvisionsReceived {
-                        provisions: (*provisions).clone(),
-                    });
-                }
-                self.update_fetch_tick_timer();
-            }
+            } => self.handle_local_provision_received(batches, missing_hashes),
 
             NodeInput::LocalProvisionsFetchFailed { hashes } => {
                 self.handle_local_provisions_fetch_failed(hashes);
             }
 
-            // ── Provision ready (from execution pool) ─────────────────
-            //
-            // The FetchAndBroadcastProvisions delegated action built provisions
-            // grouped by target shard. Register each with the outbound
-            // tracker (which also inserts into the shared ProvisionStore)
-            // before broadcasting, so cross-shard `provision.request` and
-            // our own `local_provision.request` can serve the batch from
-            // memory while we await target ECs.
-            NodeInput::ProvisionsReady { batches } => {
-                for (provisions, _recipients) in &batches {
-                    self.feed_event(ProtocolEvent::OutboundProvisionBroadcast {
-                        provisions: std::sync::Arc::new(provisions.clone()),
-                        target_shard: provisions.target_shard,
-                    });
-                }
-                self.broadcast_provisions(batches);
-            }
+            NodeInput::ProvisionsReady { batches } => self.handle_provisions_ready(batches),
 
-            // ── Finalized wave fetch ─────────────────────────────────
-            //
-            // Each delivered wave is funnelled through
-            // `ExecutionCoordinator::admit_finalized_wave`, which emits
-            // `Continuation(FinalizedWavesAdmitted)`. io_loop's interception
-            // arm drains the fetch protocol; state.rs forwards to the BFT
-            // subscriber.
             NodeInput::FinalizedWaveReceived { waves } => {
-                for wave in waves {
-                    let actions = self.state.execution().admit_finalized_wave(wave);
-                    self.process_actions(actions);
-                }
-                self.update_fetch_tick_timer();
+                self.handle_finalized_wave_received(waves);
             }
 
             NodeInput::FinalizedWaveFetchFailed { hashes } => {
