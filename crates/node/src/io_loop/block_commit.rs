@@ -17,6 +17,7 @@
 
 use crossbeam::channel::Sender;
 use hyperscale_core::{CommitSource, NodeInput, ProtocolEvent};
+use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_metrics as metrics;
 use hyperscale_storage::ChainWriter;
 use hyperscale_types::{
@@ -90,16 +91,12 @@ pub struct BlockCommitCoordinator<S: ChainWriter> {
     /// `BlockCommitted` is deferred until the disk write completes.
     persisted_height: BlockHeight,
 
-    /// Set while an async commit closure is running on the execution pool.
-    /// Bouncing this prevents spawning a second closure (Rayon does not
-    /// guarantee FIFO ordering across separate `spawn()` calls). The closure
+    /// Set while an async commit task is running on the I/O pool. Bouncing
+    /// this prevents spawning a second task (the I/O pool does not
+    /// guarantee FIFO ordering across separate `spawn()` calls). The task
     /// clears the flag before sending its final event so the resulting
     /// `feed_event` → `flush` drains any backlog.
     commit_in_flight: Arc<AtomicBool>,
-
-    /// Closure prepared by [`flush`](Self::flush), drained by the runner.
-    /// Production uses `tokio::spawn_blocking`; simulation runs inline.
-    pending_task: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl<S> BlockCommitCoordinator<S>
@@ -116,7 +113,6 @@ where
             pending: Vec::new(),
             persisted_height: initial_persisted_height,
             commit_in_flight: Arc::new(AtomicBool::new(false)),
-            pending_task: None,
         }
     }
 
@@ -165,10 +161,6 @@ where
 
     pub fn prepared_len(&self) -> usize {
         self.prepared_commits.lock().unwrap().len()
-    }
-
-    pub fn drain_task(&mut self) -> Option<Box<dyn FnOnce() + Send>> {
-        self.pending_task.take()
     }
 
     /// Decide whether to accept a commit and whether to notify immediately.
@@ -234,18 +226,23 @@ where
         AccumulateDecision::Accepted { height, notify_now }
     }
 
-    /// Drain pending commits into a single async closure.
+    /// Drain pending commits into a single async task on the I/O pool.
     ///
-    /// Spawns the closure on success; sets `commit_in_flight` so subsequent
-    /// flushes defer until the closure clears it. If a previous closure is
-    /// still running, all pending commits remain queued for a future flush.
+    /// Spawns on success; sets `commit_in_flight` so subsequent flushes defer
+    /// until the task clears it. If a previous task is still running, all
+    /// pending commits remain queued for a future flush.
     ///
     /// Receipt bundles are not drained here — they're already embedded in
-    /// each `PreparedCommit`. Writing them in a single closure guarantees
-    /// ordering: Rayon does not guarantee FIFO ordering across separate
+    /// each `PreparedCommit`. Writing them in a single task guarantees
+    /// ordering: the I/O pool does not guarantee FIFO across separate
     /// `spawn()` calls.
     #[allow(clippy::significant_drop_tightening, clippy::too_many_lines)]
-    pub fn flush(&mut self, storage: &Arc<S>, event_tx: &Sender<NodeInput>) {
+    pub fn flush<D: Dispatch>(
+        &mut self,
+        storage: &Arc<S>,
+        event_tx: &Sender<NodeInput>,
+        dispatch: &D,
+    ) {
         if self.pending.is_empty() {
             return;
         }
@@ -343,7 +340,7 @@ where
 
         self.commit_in_flight.store(true, Ordering::Release);
 
-        self.pending_task = Some(Box::new(move || {
+        dispatch.spawn(DispatchPool::Io, move || {
             let mut batch: Vec<(S::PreparedCommit, Arc<Block>, Arc<QuorumCertificate>)> =
                 Vec::with_capacity(commits.len());
 
@@ -390,6 +387,6 @@ where
             let _ = event_tx.send(NodeInput::Protocol(ProtocolEvent::BlockPersisted {
                 height: max_persisted,
             }));
-        }));
+        });
     }
 }

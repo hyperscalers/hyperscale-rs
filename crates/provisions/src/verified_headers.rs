@@ -68,7 +68,7 @@ mod tests {
         let header = BlockHeader {
             shard_group_id: shard,
             height,
-            parent_hash: BlockHash::ZERO,
+            parent_block_hash: BlockHash::ZERO,
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(0),
             timestamp: hyperscale_types::ProposerTimestamp(0),

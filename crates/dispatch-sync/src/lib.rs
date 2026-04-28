@@ -3,7 +3,7 @@
 //! [`SyncDispatch`] runs all closures inline on the calling thread,
 //! ensuring deterministic execution order. Queue depths are always 0.
 
-use hyperscale_dispatch::Dispatch;
+use hyperscale_dispatch::{Dispatch, DispatchPool};
 
 /// Synchronous dispatch that runs closures inline.
 ///
@@ -21,40 +21,11 @@ impl SyncDispatch {
 }
 
 impl Dispatch for SyncDispatch {
-    fn spawn_consensus_crypto(&self, f: impl FnOnce() + Send + 'static) {
+    fn spawn(&self, _pool: DispatchPool, f: impl FnOnce() + Send + 'static) {
         f();
     }
 
-    fn spawn_crypto(&self, f: impl FnOnce() + Send + 'static) {
-        f();
-    }
-
-    fn try_spawn_crypto(&self, f: impl FnOnce() + Send + 'static) -> bool {
-        f();
-        true
-    }
-
-    fn spawn_tx_validation(&self, f: impl FnOnce() + Send + 'static) {
-        f();
-    }
-
-    fn spawn_execution(&self, f: impl FnOnce() + Send + 'static) {
-        f();
-    }
-
-    fn consensus_crypto_queue_depth(&self) -> usize {
-        0
-    }
-
-    fn crypto_queue_depth(&self) -> usize {
-        0
-    }
-
-    fn tx_validation_queue_depth(&self) -> usize {
-        0
-    }
-
-    fn execution_queue_depth(&self) -> usize {
+    fn queue_depth(&self, _pool: DispatchPool) -> usize {
         0
     }
 }
@@ -70,46 +41,30 @@ mod tests {
         let dispatch = SyncDispatch::new();
         let counter = Arc::new(AtomicUsize::new(0));
 
-        let c = counter.clone();
-        dispatch.spawn_consensus_crypto(move || {
-            c.fetch_add(1, Ordering::SeqCst);
-        });
-        // Runs synchronously — already incremented
-        assert_eq!(counter.load(Ordering::SeqCst), 1);
-
-        let c = counter.clone();
-        dispatch.spawn_crypto(move || {
-            c.fetch_add(1, Ordering::SeqCst);
-        });
-        assert_eq!(counter.load(Ordering::SeqCst), 2);
-
-        let c = counter.clone();
-        assert!(dispatch.try_spawn_crypto(move || {
-            c.fetch_add(1, Ordering::SeqCst);
-        }));
-        assert_eq!(counter.load(Ordering::SeqCst), 3);
-
-        let c = counter.clone();
-        dispatch.spawn_tx_validation(move || {
-            c.fetch_add(1, Ordering::SeqCst);
-        });
+        for pool in [
+            DispatchPool::ConsensusCrypto,
+            DispatchPool::Crypto,
+            DispatchPool::TxValidation,
+            DispatchPool::Execution,
+        ] {
+            let c = counter.clone();
+            dispatch.spawn(pool, move || {
+                c.fetch_add(1, Ordering::SeqCst);
+            });
+        }
         assert_eq!(counter.load(Ordering::SeqCst), 4);
-
-        let c = counter.clone();
-        dispatch.spawn_execution(move || {
-            c.fetch_add(1, Ordering::SeqCst);
-        });
-        assert_eq!(counter.load(Ordering::SeqCst), 5);
-
-        assert_eq!(counter.load(Ordering::SeqCst), 5);
     }
 
     #[test]
     fn test_queue_depths_always_zero() {
         let dispatch = SyncDispatch::new();
-        assert_eq!(dispatch.consensus_crypto_queue_depth(), 0);
-        assert_eq!(dispatch.crypto_queue_depth(), 0);
-        assert_eq!(dispatch.tx_validation_queue_depth(), 0);
-        assert_eq!(dispatch.execution_queue_depth(), 0);
+        for pool in [
+            DispatchPool::ConsensusCrypto,
+            DispatchPool::Crypto,
+            DispatchPool::TxValidation,
+            DispatchPool::Execution,
+        ] {
+            assert_eq!(dispatch.queue_depth(pool), 0);
+        }
     }
 }

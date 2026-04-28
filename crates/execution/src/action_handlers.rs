@@ -236,6 +236,227 @@ pub(crate) fn build_dispatch_action(
     })
 }
 
+/// Handle the execution-owned delegated [`Action`] variants.
+///
+/// Outcomes flow through `ctx.notify`. Variants owned by other coordinator
+/// crates hit `unreachable!()` — node's dispatcher routes by variant prefix.
+#[allow(clippy::too_many_lines)] // single dispatch over execution-owned Action variants
+pub fn handle_action<S, E, N>(action: Action, ctx: &hyperscale_core::ActionContext<'_, S, E, N>)
+where
+    S: hyperscale_storage::Storage,
+    E: hyperscale_engine::Engine,
+    N: hyperscale_network::Network,
+{
+    use hyperscale_core::{NodeInput, ProtocolEvent};
+    use hyperscale_engine::ExecutedTx;
+    use hyperscale_metrics as metrics;
+    use hyperscale_storage::SubstateStore;
+
+    match action {
+        Action::AggregateExecutionCertificate {
+            wave_id,
+            global_receipt_root,
+            votes,
+            committee,
+        } => {
+            let certificate =
+                aggregate_execution_certificate(&wave_id, global_receipt_root, &votes, &committee);
+            (ctx.notify)(NodeInput::Protocol(
+                ProtocolEvent::ExecutionCertificateAggregated {
+                    wave_id,
+                    certificate,
+                },
+            ));
+        }
+        Action::VerifyAndAggregateExecutionVotes {
+            wave_id,
+            block_hash,
+            votes,
+        } => {
+            let verified_votes: Vec<_> = batch_verify_execution_votes(votes).collect();
+            (ctx.notify)(NodeInput::Protocol(
+                ProtocolEvent::ExecutionVotesVerifiedAndAggregated {
+                    wave_id,
+                    block_hash,
+                    verified_votes,
+                },
+            ));
+        }
+        Action::VerifyExecutionCertificateSignature {
+            certificate,
+            public_keys,
+            ..
+        } => {
+            let valid = verify_execution_certificate_signature(&certificate, &public_keys);
+            (ctx.notify)(NodeInput::Protocol(
+                ProtocolEvent::ExecutionCertificateSignatureVerified { certificate, valid },
+            ));
+        }
+        Action::ExecuteTransactions {
+            wave_id,
+            block_hash,
+            transactions,
+            state_root: _,
+        } => {
+            let start = std::time::Instant::now();
+            let local_shard = ctx.topology.local_shard();
+            let num_shards = ctx.topology.num_shards();
+            let view = ctx.pending_chain.view_at(block_hash);
+            let view_snap =
+                <hyperscale_storage::SubstateView<_> as SubstateStore>::snapshot(&*view);
+            let batch_result = ctx.executor.execute_single_shard(
+                &view_snap,
+                transactions.as_slice(),
+                local_shard,
+                num_shards,
+            );
+            let per_tx: Vec<_> = match batch_result {
+                Ok(output) => output.results,
+                Err(e) => {
+                    tracing::warn!(error = %e, "single-shard batch execution failed");
+                    transactions
+                        .iter()
+                        .map(|tx| ExecutedTx::failure(tx.hash(), e.to_string()))
+                        .collect()
+                }
+            };
+            let (tx_outcomes, results): (Vec<_>, Vec<_>) =
+                per_tx.into_iter().map(|tx| (tx.outcome, tx.entry)).unzip();
+            metrics::record_execution_latency(start.elapsed().as_secs_f64());
+            (ctx.notify)(NodeInput::Protocol(
+                ProtocolEvent::ExecutionBatchCompleted {
+                    wave_id,
+                    results,
+                    tx_outcomes,
+                },
+            ));
+        }
+        Action::ExecuteCrossShardTransactions {
+            wave_id,
+            block_hash,
+            requests,
+        } => {
+            let start = std::time::Instant::now();
+            let local_shard = ctx.topology.local_shard();
+            let num_shards = ctx.topology.num_shards();
+            let view = ctx.pending_chain.view_at(block_hash);
+            let view_snap =
+                <hyperscale_storage::SubstateView<_> as SubstateStore>::snapshot(&*view);
+            let (tx_outcomes, results): (Vec<_>, Vec<_>) = requests
+                .iter()
+                .map(|req| {
+                    let output = ctx.executor.execute_cross_shard(
+                        &view_snap,
+                        std::slice::from_ref(&req.transaction),
+                        &req.provisions,
+                        local_shard,
+                        num_shards,
+                    );
+                    let tx = match output {
+                        Ok(mut o) => o.results.pop().unwrap_or_else(|| {
+                            ExecutedTx::failure(
+                                req.tx_hash,
+                                "No cross-shard execution result returned",
+                            )
+                        }),
+                        Err(e) => {
+                            tracing::warn!(tx_hash = ?req.tx_hash, error = %e, "cross-shard execution failed");
+                            ExecutedTx::failure(req.tx_hash, e.to_string())
+                        }
+                    };
+                    (tx.outcome, tx.entry)
+                })
+                .unzip();
+            metrics::record_execution_latency(start.elapsed().as_secs_f64());
+            (ctx.notify)(NodeInput::Protocol(
+                ProtocolEvent::ExecutionBatchCompleted {
+                    wave_id,
+                    results,
+                    tx_outcomes,
+                },
+            ));
+        }
+
+        // ── Sign + broadcast actions ──────────────────────────────────────
+        Action::SignAndSendExecutionVote {
+            block_hash,
+            block_height,
+            vote_anchor_ts,
+            wave_id,
+            global_receipt_root,
+            tx_outcomes,
+            leader,
+        } => {
+            let local_shard = ctx.topology.local_shard();
+            let validator_id = ctx.topology.local_validator_id();
+            let tx_count = u32::try_from(tx_outcomes.len()).unwrap_or(u32::MAX);
+            let msg = hyperscale_types::exec_vote_message(
+                vote_anchor_ts,
+                &wave_id,
+                local_shard,
+                &global_receipt_root,
+                tx_count,
+            );
+            let sig = ctx.signing_key.sign_v1(&msg);
+            let vote = ExecutionVote {
+                block_hash,
+                block_height,
+                vote_anchor_ts,
+                wave_id,
+                shard_group_id: local_shard,
+                global_receipt_root,
+                tx_count,
+                tx_outcomes,
+                validator: validator_id,
+                signature: sig,
+            };
+
+            // Send vote to the wave leader (unicast).
+            if leader != validator_id {
+                let batch_msg = hyperscale_types::exec_vote_batch_message(
+                    local_shard,
+                    std::slice::from_ref(&vote),
+                );
+                let batch_sig = ctx.signing_key.sign_v1(&batch_msg);
+                let batch = hyperscale_messages::ExecutionVotesNotification::new(
+                    vec![vote.clone()],
+                    validator_id,
+                    batch_sig,
+                );
+                ctx.network.notify(&[leader], &batch);
+            }
+
+            // Feed own vote to state machine only if we are the leader.
+            if leader == validator_id {
+                (ctx.notify)(hyperscale_core::NodeInput::Protocol(
+                    hyperscale_core::ProtocolEvent::ExecutionVoteReceived { vote },
+                ));
+            }
+        }
+
+        Action::BroadcastExecutionCertificate {
+            shard: _,
+            certificate,
+            recipients,
+        } => {
+            let cert = std::sync::Arc::unwrap_or_clone(certificate);
+            let msg = hyperscale_types::exec_cert_batch_message(
+                cert.shard_group_id(),
+                std::slice::from_ref(&cert),
+            );
+            let sig = ctx.signing_key.sign_v1(&msg);
+            let batch = hyperscale_messages::ExecutionCertificatesNotification::new(
+                vec![cert],
+                ctx.topology.local_validator_id(),
+                sig,
+            );
+            ctx.network.notify(&recipients, &batch);
+        }
+
+        _ => unreachable!("hyperscale_execution::handle_action called with non-execution action"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -3,7 +3,7 @@
 use super::IoLoop;
 use super::verify::verify_bls_with_metrics;
 use hyperscale_core::{NodeInput, StateMachine};
-use hyperscale_dispatch::Dispatch;
+use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_engine::Engine;
 use hyperscale_network::Network;
 use hyperscale_storage::Storage;
@@ -39,7 +39,7 @@ where
 
         let validator = self.tx_validator.clone();
         let event_tx = self.event_sender.clone();
-        self.dispatch.spawn_tx_validation(move || {
+        self.dispatch.spawn(DispatchPool::TxValidation, move || {
             let results: Vec<bool> = batch
                 .iter()
                 .map(|tx| validator.validate_transaction(tx).is_ok())
@@ -75,7 +75,7 @@ where
         }
 
         let event_tx = self.event_sender.clone();
-        self.dispatch.spawn_crypto(move || {
+        self.dispatch.spawn(DispatchPool::Crypto, move || {
             for (committed_header, sender, public_key, sender_signature) in items {
                 let msg = hyperscale_types::committed_block_header_message(
                     committed_header.header.shard_group_id,

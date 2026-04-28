@@ -458,10 +458,10 @@ impl VerificationPipeline {
         block: &Block,
         parent_block_height: BlockHeight,
     ) {
-        let parent_hash = block.header().parent_hash;
+        let parent_block_hash = block.header().parent_block_hash;
         let ready = PendingStateRootVerification {
             block_hash,
-            parent_block_hash: parent_hash,
+            parent_block_hash,
             parent_block_height,
             expected_root: block.header().state_root,
             block_height: block.height(),
@@ -472,7 +472,7 @@ impl VerificationPipeline {
         // Defer if: parent height exceeds committed JMT AND parent hasn't
         // been verified (no snapshot in the overlay).
         let parent_tree_available = parent_block_height <= self.last_persisted_height
-            || self.verified_state_roots.contains(&parent_hash);
+            || self.verified_state_roots.contains(&parent_block_hash);
 
         if parent_tree_available {
             self.state_root_verifications_in_flight.insert(block_hash);
@@ -480,11 +480,11 @@ impl VerificationPipeline {
         } else {
             debug!(
                 block_hash = ?block_hash,
-                parent_hash = ?parent_hash,
+                parent_block_hash = ?parent_block_hash,
                 "Deferring state root verification — parent not yet verified"
             );
             self.deferred_state_root_verifications
-                .entry(parent_hash)
+                .entry(parent_block_hash)
                 .or_default()
                 .push(ready);
         }
@@ -797,7 +797,7 @@ impl VerificationPipeline {
 
         let parent_in_flight = if block.header().parent_qc.is_genesis() {
             0
-        } else if let Some(h) = chain.get_header(block.header().parent_hash) {
+        } else if let Some(h) = chain.get_header(block.header().parent_block_hash) {
             h.in_flight
         } else {
             trace!(
@@ -916,30 +916,34 @@ impl VerificationPipeline {
     pub fn parent_tree_available(
         &self,
         parent_block_height: BlockHeight,
-        parent_hash: BlockHash,
+        parent_block_hash: BlockHash,
     ) -> bool {
         parent_block_height <= self.last_persisted_height
-            || self.verified_state_roots.contains(&parent_hash)
+            || self.verified_state_roots.contains(&parent_block_hash)
     }
 
     /// Record that a proposal is deferred until the parent's tree nodes are
     /// available. Only the parent identity is stored — when unblocked, the
     /// caller re-enters `try_propose` with fresh state rather than replaying
     /// a stale `BuildProposal` action.
-    pub fn defer_proposal(&mut self, parent_hash: BlockHash, parent_block_height: BlockHeight) {
+    pub fn defer_proposal(
+        &mut self,
+        parent_block_hash: BlockHash,
+        parent_block_height: BlockHeight,
+    ) {
         debug!(
-            parent_hash = ?parent_hash,
+            parent_block_hash = ?parent_block_hash,
             parent_block_height = parent_block_height.0,
             "Deferring proposal — parent tree not yet available"
         );
-        self.deferred_proposal = Some((parent_hash, parent_block_height));
+        self.deferred_proposal = Some((parent_block_hash, parent_block_height));
     }
 
     /// If the deferred proposal was waiting for `unblocked_hash`, mark it ready.
     fn try_unblock_proposal(&mut self, unblocked_hash: BlockHash) {
         if matches!(&self.deferred_proposal, Some((parent, _)) if *parent == unblocked_hash) {
             self.deferred_proposal.take();
-            debug!(parent_hash = ?unblocked_hash, "Unblocking deferred proposal");
+            debug!(parent_block_hash = ?unblocked_hash, "Unblocking deferred proposal");
             self.proposal_unblocked = true;
         }
     }
@@ -968,11 +972,14 @@ impl VerificationPipeline {
                     .iter()
                     .any(|r| r.parent_block_height <= block_height)
             })
-            .map(|(parent_hash, _)| *parent_hash)
+            .map(|(parent_block_hash, _)| *parent_block_hash)
             .collect();
 
-        for parent_hash in unblocked_parents {
-            if let Some(entries) = self.deferred_state_root_verifications.remove(&parent_hash) {
+        for parent_block_hash in unblocked_parents {
+            if let Some(entries) = self
+                .deferred_state_root_verifications
+                .remove(&parent_block_hash)
+            {
                 for ready in entries {
                     if ready.parent_block_height <= block_height {
                         self.state_root_verifications_in_flight
@@ -980,7 +987,7 @@ impl VerificationPipeline {
                         self.ready_state_root_verifications.push(ready);
                     } else {
                         self.deferred_state_root_verifications
-                            .entry(parent_hash)
+                            .entry(parent_block_hash)
                             .or_default()
                             .push(ready);
                     }
@@ -1123,11 +1130,11 @@ mod tests {
     };
     use std::collections::BTreeMap;
 
-    fn header(height: BlockHeight, parent_hash: BlockHash, in_flight: u32) -> BlockHeader {
+    fn header(height: BlockHeight, parent_block_hash: BlockHash, in_flight: u32) -> BlockHeader {
         BlockHeader {
             shard_group_id: ShardGroupId(0),
             height,
-            parent_hash,
+            parent_block_hash,
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(0),
             timestamp: ProposerTimestamp(0),
@@ -1146,12 +1153,12 @@ mod tests {
 
     fn block_with(
         height: BlockHeight,
-        parent_hash: BlockHash,
+        parent_block_hash: BlockHash,
         in_flight: u32,
         transactions: Vec<Arc<RoutableTransaction>>,
     ) -> Block {
         Block::Live {
-            header: header(height, parent_hash, in_flight),
+            header: header(height, parent_block_hash, in_flight),
             transactions,
             certificates: Vec::new(),
             provisions: Vec::new(),
@@ -1291,8 +1298,8 @@ mod tests {
         // Parent is at GENESIS height ≤ last_persisted_height, so initiate
         // queues this entry directly into ready_state_root_verifications.
         let mut vp = VerificationPipeline::new(BlockHeight::GENESIS);
-        let parent_hash = bh(b"parent");
-        let block = block_with(BlockHeight(1), parent_hash, 0, vec![]);
+        let parent_block_hash = bh(b"parent");
+        let block = block_with(BlockHeight(1), parent_block_hash, 0, vec![]);
         let block_hash = block.hash();
 
         vp.initiate_state_root_verification(block_hash, &block, BlockHeight::GENESIS);
@@ -1312,7 +1319,7 @@ mod tests {
         let out = vp.drain_ready_state_root_verifications(&chain);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].block_hash, block_hash);
-        assert_eq!(out[0].parent_block_hash, parent_hash);
+        assert_eq!(out[0].parent_block_hash, parent_block_hash);
         assert_eq!(out[0].parent_block_height, BlockHeight::GENESIS);
 
         // Draining again without another initiate yields nothing.

@@ -139,12 +139,12 @@ fn will_propose_next_is_true_for_exactly_one_validator_in_fresh_committee() {
 }
 
 #[test]
-fn proposal_parent_hash_falls_back_to_committed_hash_without_qc() {
+fn proposal_parent_block_hash_falls_back_to_committed_hash_without_qc() {
     let coordinator = fresh_coordinator(BftConfig::default());
 
     assert!(coordinator.latest_qc().is_none());
     assert_eq!(
-        coordinator.proposal_parent_hash(),
+        coordinator.proposal_parent_block_hash(),
         coordinator.committed_hash()
     );
 }

@@ -1249,8 +1249,10 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
     let rocksdb_config = build_rocksdb_config(&config.storage);
 
     // Initialize dispatch pools
-    let dispatch =
-        Arc::new(PooledDispatch::new(thread_config).context("Failed to initialize thread pools")?);
+    let dispatch = Arc::new(
+        PooledDispatch::new(thread_config, tokio::runtime::Handle::current())
+            .context("Failed to initialize thread pools")?,
+    );
 
     // Open storage
     let db_path = config.node.data_dir.join("db");

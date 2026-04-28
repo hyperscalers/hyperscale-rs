@@ -9,8 +9,9 @@ core_affinity.workspace = true
 hyperscale-dispatch.workspace = true
 hyperscale-metrics.workspace = true
 rayon.workspace = true
-tracing.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, features = ["rt"] }
+tracing.workspace = true
 
 [lints]
 workspace = true

@@ -73,10 +73,10 @@ pub fn validate_header(
             ));
         }
 
-        if header.parent_hash != header.parent_qc.block_hash {
+        if header.parent_block_hash != header.parent_qc.block_hash {
             return Err(format!(
-                "parent_hash {:?} doesn't match parent_qc.block_hash {:?}",
-                header.parent_hash, header.parent_qc.block_hash
+                "parent_block_hash {:?} doesn't match parent_qc.block_hash {:?}",
+                header.parent_block_hash, header.parent_qc.block_hash
             ));
         }
     } else if height.0 != committed_height.0 + 1 {
@@ -245,7 +245,7 @@ mod tests {
         BlockHeader {
             shard_group_id: ShardGroupId(0),
             height,
-            parent_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
+            parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(height.0 % 4),
             timestamp: ProposerTimestamp(timestamp_ms),
@@ -266,7 +266,7 @@ mod tests {
         let header = BlockHeader {
             shard_group_id: ShardGroupId(0),
             height,
-            parent_hash: BlockHash::ZERO,
+            parent_block_hash: BlockHash::ZERO,
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(0),
             timestamp: ProposerTimestamp(0),
@@ -321,7 +321,7 @@ mod tests {
         let config = BftConfig::default();
         let now = LocalTimestamp::from_millis(100_000);
         let mut header = header_at_height(BlockHeight(0), 0);
-        header.parent_hash = BlockHash::from_raw(Hash::from_bytes(b"genesis_parent"));
+        header.parent_block_hash = BlockHash::from_raw(Hash::from_bytes(b"genesis_parent"));
         header.proposer = ValidatorId(0);
         assert!(validate_timestamp(&header, &config, now).is_ok());
     }

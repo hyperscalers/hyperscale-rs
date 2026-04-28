@@ -221,7 +221,7 @@ pub const fn make_live_block(
     let header = BlockHeader {
         shard_group_id,
         height,
-        parent_hash: BlockHash::ZERO,
+        parent_block_hash: BlockHash::ZERO,
         parent_qc: QuorumCertificate::genesis(),
         proposer,
         timestamp: ProposerTimestamp(timestamp_ms),

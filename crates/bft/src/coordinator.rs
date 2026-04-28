@@ -685,9 +685,9 @@ impl BftCoordinator {
         // height — the two-chain commit window leaves them visible and the
         // mempool doesn't clear its ready-set until commit, so we must dedup
         // here to avoid repeating items across consecutive blocks.
-        let (parent_hash, parent_qc) = self.chain_view().proposal_parent();
+        let (parent_block_hash, parent_qc) = self.chain_view().proposal_parent();
         let (qc_chain_cert_hashes, qc_chain_tx_hashes, qc_chain_provision_hashes) =
-            self.collect_qc_chain_hashes(parent_hash);
+            self.collect_qc_chain_hashes(parent_block_hash);
 
         // Anchor validity-window filtering on the parent QC's weighted
         // timestamp — the deterministic clock voters will use to verify
@@ -828,7 +828,7 @@ impl BftCoordinator {
         crate::proposal::dispatch_or_defer(
             &mut self.proposal,
             &mut self.verification,
-            plan.parent_hash,
+            plan.parent_block_hash,
             plan.parent_block_height,
             height,
             round,
@@ -1413,7 +1413,8 @@ impl BftCoordinator {
         block_hash: BlockHash,
         block: &Block,
     ) -> bool {
-        let (_, qc_chain_tx_hashes, _) = self.collect_qc_chain_hashes(block.header().parent_hash);
+        let (_, qc_chain_tx_hashes, _) =
+            self.collect_qc_chain_hashes(block.header().parent_block_hash);
         if let Err(e) = crate::validation::validate_block_for_vote(
             topology,
             block,
@@ -2412,7 +2413,7 @@ impl BftCoordinator {
         // Capture parent state BEFORE record_block_committed advances heights.
         let parent_state_root = self
             .chain_view()
-            .parent_state_root(block.header().parent_hash);
+            .parent_state_root(block.header().parent_block_hash);
         let parent_block_height = self.committed_height;
 
         // Advance committed_height. The QC is the proof of commit — same
@@ -3102,7 +3103,7 @@ impl BftCoordinator {
     /// This is the latest certified block hash, or the committed hash if no QC
     /// exists yet (genesis case).
     #[must_use]
-    pub fn proposal_parent_hash(&self) -> BlockHash {
+    pub fn proposal_parent_block_hash(&self) -> BlockHash {
         self.latest_qc
             .as_ref()
             .map_or(self.committed_hash, |qc| qc.block_hash)
@@ -3115,26 +3116,26 @@ impl BftCoordinator {
     /// This avoids the caller needing to call `collect_qc_chain_hashes` separately.
     #[must_use]
     pub fn dedup_overhead(&self) -> usize {
-        let parent_hash = self.proposal_parent_hash();
-        let (_, tx_hashes, _) = self.collect_qc_chain_hashes(parent_hash);
+        let parent_block_hash = self.proposal_parent_block_hash();
+        let (_, tx_hashes, _) = self.collect_qc_chain_hashes(parent_block_hash);
         tx_hashes.len()
     }
 
-    /// Walk the QC chain from `parent_hash` back to committed height,
+    /// Walk the QC chain from `parent_block_hash` back to committed height,
     /// collecting certificate, transaction, and provision hashes from
     /// ancestor blocks. Thin wrapper over [`ChainView::collect_ancestor_hashes`]
     /// that supplies the coordinator's `tx_cache`.
     #[must_use]
     pub fn collect_qc_chain_hashes(
         &self,
-        parent_hash: BlockHash,
+        parent_block_hash: BlockHash,
     ) -> (
         std::collections::HashSet<WaveIdHash>,
         std::collections::HashSet<TxHash>,
         std::collections::HashSet<ProvisionHash>,
     ) {
         self.chain_view()
-            .collect_ancestor_hashes(parent_hash, &self.tx_cache)
+            .collect_ancestor_hashes(parent_block_hash, &self.tx_cache)
     }
 
     /// Get the BFT configuration.
@@ -3295,7 +3296,7 @@ mod tests {
         BlockHeader {
             shard_group_id: ShardGroupId(0),
             height,
-            parent_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
+            parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(height.0 % 4), // Round-robin
             timestamp: ProposerTimestamp(timestamp_ms),
@@ -3347,9 +3348,9 @@ mod tests {
         state.set_time(LocalTimestamp::from_millis(100_000));
 
         // committed_height = 1 avoids triggering sync on the non-genesis parent QC.
-        let parent_hash = BlockHash::from_raw(Hash::from_bytes(b"parent_block"));
+        let parent_block_hash = BlockHash::from_raw(Hash::from_bytes(b"parent_block"));
         state.committed_height = BlockHeight(1);
-        state.committed_hash = parent_hash;
+        state.committed_hash = parent_block_hash;
 
         let mut signers = SignerBitfield::new(4);
         signers.set(0);
@@ -3358,10 +3359,10 @@ mod tests {
         let parent_qc = QuorumCertificate {
             signers,
             weighted_timestamp: WeightedTimestamp(99_000),
-            ..make_test_qc(parent_hash, BlockHeight(1))
+            ..make_test_qc(parent_block_hash, BlockHeight(1))
         };
         let header = BlockHeader {
-            parent_hash,
+            parent_block_hash,
             parent_qc,
             ..make_header_at_height(BlockHeight(2), 100_000)
         };
@@ -3389,13 +3390,13 @@ mod tests {
         let (mut state, topology) = make_multi_validator_state_at(1);
         state.set_time(LocalTimestamp::from_millis(100_000));
 
-        let parent_hash = BlockHash::from_raw(Hash::from_bytes(b"parent_block"));
+        let parent_block_hash = BlockHash::from_raw(Hash::from_bytes(b"parent_block"));
         state.committed_height = BlockHeight(1);
-        state.committed_hash = parent_hash;
+        state.committed_hash = parent_block_hash;
         state
             .commits
             .certified_blocks
-            .insert(parent_hash, make_empty_block(BlockHeight(1)));
+            .insert(parent_block_hash, make_empty_block(BlockHeight(1)));
 
         let mut signers = SignerBitfield::new(4);
         signers.set(0);
@@ -3404,10 +3405,10 @@ mod tests {
         let parent_qc = QuorumCertificate {
             signers,
             weighted_timestamp: WeightedTimestamp(99_000),
-            ..make_test_qc(parent_hash, BlockHeight(1))
+            ..make_test_qc(parent_block_hash, BlockHeight(1))
         };
         let header = BlockHeader {
-            parent_hash,
+            parent_block_hash,
             parent_qc,
             ..make_header_at_height(BlockHeight(2), 100_000)
         };
@@ -3451,9 +3452,9 @@ mod tests {
         let (mut state, topology) = make_multi_validator_state_at(1);
         state.set_time(LocalTimestamp::from_millis(100_000));
 
-        let parent_hash = BlockHash::from_raw(Hash::from_bytes(b"parent_block"));
+        let parent_block_hash = BlockHash::from_raw(Hash::from_bytes(b"parent_block"));
         state.committed_height = BlockHeight(1);
-        state.committed_hash = parent_hash;
+        state.committed_hash = parent_block_hash;
 
         let mut signers = SignerBitfield::new(4);
         signers.set(0);
@@ -3462,10 +3463,10 @@ mod tests {
         let parent_qc = QuorumCertificate {
             signers,
             weighted_timestamp: WeightedTimestamp(99_000),
-            ..make_test_qc(parent_hash, BlockHeight(1))
+            ..make_test_qc(parent_block_hash, BlockHeight(1))
         };
         let header = BlockHeader {
-            parent_hash,
+            parent_block_hash,
             parent_qc,
             ..make_header_at_height(BlockHeight(2), 100_000)
         };
@@ -3496,7 +3497,7 @@ mod tests {
 
         // Genesis QC has no signature — verification must be skipped, not queued.
         let header = BlockHeader {
-            parent_hash: BlockHash::ZERO,
+            parent_block_hash: BlockHash::ZERO,
             ..make_header_at_height(BlockHeight(1), 100_000)
         };
         let actions = state.on_block_header(
@@ -3939,14 +3940,14 @@ mod tests {
         // Local validator is ValidatorId(0). Proposer for (h=1, r=0) is
         // ValidatorId((1+0)%4)=ValidatorId(1) — not us. Point the chain at
         // (h=4, r=0) where proposer = (4+0)%4 = ValidatorId(0).
-        let parent_hash = BlockHash::from_raw(Hash::from_bytes(b"parent_tree_missing"));
+        let parent_block_hash = BlockHash::from_raw(Hash::from_bytes(b"parent_tree_missing"));
         state.committed_height = BlockHeight(3);
-        state.committed_hash = parent_hash;
+        state.committed_hash = parent_block_hash;
         state
             .commits
             .certified_blocks
-            .insert(parent_hash, make_empty_block(BlockHeight(3)));
-        state.latest_qc = Some(make_test_qc(parent_hash, BlockHeight(3)));
+            .insert(parent_block_hash, make_empty_block(BlockHeight(3)));
+        state.latest_qc = Some(make_test_qc(parent_block_hash, BlockHeight(3)));
         // Intentionally do NOT call on_block_persisted — parent tree
         // unavailable forces the defer branch.
 
@@ -3999,13 +4000,13 @@ mod tests {
         let (mut state, topology) = make_multi_validator_state_at(0);
         state.set_time(LocalTimestamp::from_millis(100_000));
 
-        let parent_hash = BlockHash::from_raw(Hash::from_bytes(b"parent_block"));
+        let parent_block_hash = BlockHash::from_raw(Hash::from_bytes(b"parent_block"));
         state.committed_height = BlockHeight(1);
-        state.committed_hash = parent_hash;
+        state.committed_hash = parent_block_hash;
         state
             .commits
             .certified_blocks
-            .insert(parent_hash, make_empty_block(BlockHeight(1)));
+            .insert(parent_block_hash, make_empty_block(BlockHeight(1)));
 
         let mut signers = SignerBitfield::new(4);
         signers.set(0);
@@ -4014,11 +4015,11 @@ mod tests {
         let parent_qc = QuorumCertificate {
             signers,
             weighted_timestamp: WeightedTimestamp(99_000),
-            ..make_test_qc(parent_hash, BlockHeight(1))
+            ..make_test_qc(parent_block_hash, BlockHeight(1))
         };
 
         let header1 = BlockHeader {
-            parent_hash,
+            parent_block_hash,
             parent_qc: parent_qc.clone(),
             ..make_header_at_height(BlockHeight(2), 100_000)
         };
@@ -4040,11 +4041,11 @@ mod tests {
         // Simulate verification success; same path as on_qc_signature_verified(valid=true).
         state
             .verification
-            .cache_verified_qc(parent_hash, BlockHeight(1));
+            .cache_verified_qc(parent_block_hash, BlockHeight(1));
 
         // Second block at round 1 sharing the same parent QC.
         let header2 = BlockHeader {
-            parent_hash,
+            parent_block_hash,
             parent_qc,
             proposer: ValidatorId(3),
             round: Round(1),
@@ -4291,7 +4292,7 @@ mod tests {
 
         let block = Block::Live {
             header: BlockHeader {
-                parent_hash: BlockHash::ZERO,
+                parent_block_hash: BlockHash::ZERO,
                 timestamp: ProposerTimestamp(1000),
                 ..make_header_at_height(BlockHeight(1), 1000)
             },
@@ -4427,7 +4428,7 @@ mod tests {
         // Ancestor block at height 5 contains tx1
         let ancestor_block = Block::Live {
             header: BlockHeader {
-                parent_hash: BlockHash::from_raw(Hash::from_bytes(b"grandparent")),
+                parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"grandparent")),
                 ..make_header_at_height(BlockHeight(5), 100_000)
             },
             transactions: vec![tx1.clone()],
@@ -4445,7 +4446,7 @@ mod tests {
         sort_txs_by_hash(&mut txs);
         let block = Block::Live {
             header: BlockHeader {
-                parent_hash: ancestor_hash,
+                parent_block_hash: ancestor_hash,
                 ..make_header_at_height(BlockHeight(6), 100_001)
             },
             transactions: txs,
@@ -4454,7 +4455,7 @@ mod tests {
         };
 
         let result = {
-            let (_, qc_chain, _) = state.collect_qc_chain_hashes(block.header().parent_hash);
+            let (_, qc_chain, _) = state.collect_qc_chain_hashes(block.header().parent_block_hash);
             crate::validation::validate_no_duplicate_transactions(
                 &block,
                 &qc_chain,
@@ -4475,7 +4476,7 @@ mod tests {
         // Ancestor at height 5 (== committed_height) contains tx1
         let ancestor_block = Block::Live {
             header: BlockHeader {
-                parent_hash: BlockHash::from_raw(Hash::from_bytes(b"grandparent")),
+                parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"grandparent")),
                 ..make_header_at_height(BlockHeight(5), 100_000)
             },
             transactions: vec![tx1.clone()],
@@ -4492,7 +4493,7 @@ mod tests {
         // is at committed height so the walk stops — this should be allowed.
         let block = Block::Live {
             header: BlockHeader {
-                parent_hash: ancestor_hash,
+                parent_block_hash: ancestor_hash,
                 ..make_header_at_height(BlockHeight(6), 100_001)
             },
             transactions: vec![tx1],
@@ -4503,7 +4504,8 @@ mod tests {
         // Ancestor is at committed height, so walk stops before checking it
         assert!(
             {
-                let (_, qc_chain, _) = state.collect_qc_chain_hashes(block.header().parent_hash);
+                let (_, qc_chain, _) =
+                    state.collect_qc_chain_hashes(block.header().parent_block_hash);
                 crate::validation::validate_no_duplicate_transactions(
                     &block,
                     &qc_chain,
@@ -4566,7 +4568,7 @@ mod tests {
 
         let block = Block::Live {
             header: BlockHeader {
-                parent_hash: BlockHash::ZERO,
+                parent_block_hash: BlockHash::ZERO,
                 ..make_header_at_height(BlockHeight(1), 1000)
             },
             transactions: vec![],

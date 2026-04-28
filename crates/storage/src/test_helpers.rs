@@ -102,7 +102,7 @@ pub fn make_test_block(height: BlockHeight) -> Block {
         header: BlockHeader {
             shard_group_id: ShardGroupId(0),
             height,
-            parent_hash: BlockHash::from_raw(Hash::from_bytes(&parent_bytes)),
+            parent_block_hash: BlockHash::from_raw(Hash::from_bytes(&parent_bytes)),
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(0),
             timestamp: ProposerTimestamp(height.0 * 1000),
@@ -130,7 +130,7 @@ pub fn make_test_qc(block: &Block) -> QuorumCertificate {
         block_hash: block.hash(),
         shard_group_id: ShardGroupId(0),
         height: block.height(),
-        parent_block_hash: block.header().parent_hash,
+        parent_block_hash: block.header().parent_block_hash,
         round: Round::INITIAL,
         aggregated_signature: zero_bls_signature(),
         signers: SignerBitfield::new(4),

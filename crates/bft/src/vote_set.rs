@@ -77,7 +77,7 @@ impl VoteSet {
                     Some(h.hash()),
                     Some(h.height),
                     Some(h.round),
-                    Some(h.parent_hash),
+                    Some(h.parent_block_hash),
                 )
             });
 
@@ -135,7 +135,7 @@ impl VoteSet {
             self.round = Some(header.round);
         }
         if self.parent_block_hash.is_none() {
-            self.parent_block_hash = Some(header.parent_hash);
+            self.parent_block_hash = Some(header.parent_block_hash);
         }
         if self.block_hash.is_none() {
             self.block_hash = Some(header.hash());
@@ -398,7 +398,7 @@ mod tests {
         BlockHeader {
             shard_group_id: ShardGroupId(0),
             height,
-            parent_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
+            parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(0),
             timestamp: hyperscale_types::ProposerTimestamp(1_234_567_890),

@@ -8,6 +8,8 @@ description = "Centralized provision coordination for cross-shard transactions"
 hyperscale-core.workspace = true
 hyperscale-engine.workspace = true
 hyperscale-jmt.workspace = true
+hyperscale-metrics.workspace = true
+hyperscale-network.workspace = true
 hyperscale-storage.workspace = true
 hyperscale-types.workspace = true
 

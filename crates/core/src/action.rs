@@ -1,7 +1,6 @@
 //! Action types for the deterministic state machine.
 
 use crate::{FetchRequest, ProtocolEvent, TimerId};
-use hyperscale_messages::TransactionGossip;
 use hyperscale_types::{
     Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, BlockVote, Bls12381G1PublicKey,
     Bls12381G2Signature, CertificateRoot, CommittedBlockHeader, EpochConfig, EpochId,
@@ -57,17 +56,6 @@ pub enum Action {
         header: Box<BlockHeader>,
         /// Manifest listing the block's tx / cert / provision hashes.
         manifest: Box<BlockManifest>,
-    },
-
-    // ═══════════════════════════════════════════════════════════════════════
-    // Network: Mempool & Certificates
-    // ═══════════════════════════════════════════════════════════════════════
-    /// Broadcast a transaction gossip to a shard.
-    BroadcastTransaction {
-        /// Target shard for the gossip.
-        shard: ShardGroupId,
-        /// Gossip envelope (sender + transaction payload).
-        gossip: Box<TransactionGossip>,
     },
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -448,7 +436,7 @@ pub enum Action {
         /// Round at which the proposal is being made.
         round: Round,
         /// Parent block hash; the new block extends this.
-        parent_hash: BlockHash,
+        parent_block_hash: BlockHash,
         /// QC over the parent block (genesis QC for the first block).
         parent_qc: QuorumCertificate,
         /// Proposer-supplied timestamp on the new block header.
@@ -772,5 +760,45 @@ impl Action {
     #[must_use]
     pub fn type_name(&self) -> &'static str {
         self.into()
+    }
+
+    /// Which thread pool this action should run on, or `None` if it's not
+    /// delegated (timers, network broadcasts, persist — handled inline by
+    /// the runner).
+    #[must_use]
+    pub const fn dispatch_pool(&self) -> Option<hyperscale_dispatch::DispatchPool> {
+        use hyperscale_dispatch::DispatchPool;
+        match self {
+            // Consensus-critical crypto + state root computation + sign-and-broadcast.
+            Self::VerifyAndBuildQuorumCertificate { .. }
+            | Self::VerifyQcSignature { .. }
+            | Self::VerifyRemoteHeaderQc { .. }
+            | Self::VerifyTransactionRoot { .. }
+            | Self::VerifyProvisionRoot { .. }
+            | Self::VerifyCertificateRoot { .. }
+            | Self::VerifyLocalReceiptRoot { .. }
+            | Self::VerifyProvisionTxRoots { .. }
+            | Self::VerifyStateRoot { .. }
+            | Self::BuildProposal { .. }
+            | Self::BroadcastBlockHeader { .. }
+            | Self::SignAndBroadcastBlockVote { .. }
+            | Self::BroadcastCommittedBlockHeader { .. } => Some(DispatchPool::ConsensusCrypto),
+
+            // General crypto (cert aggregation, provision proofs, exec vote/cert sign+send).
+            Self::AggregateExecutionCertificate { .. }
+            | Self::VerifyAndAggregateExecutionVotes { .. }
+            | Self::VerifyExecutionCertificateSignature { .. }
+            | Self::VerifyProvisions { .. }
+            | Self::FetchAndBroadcastProvisions { .. }
+            | Self::SignAndSendExecutionVote { .. }
+            | Self::BroadcastExecutionCertificate { .. } => Some(DispatchPool::Crypto),
+
+            // Transaction execution.
+            Self::ExecuteTransactions { .. } | Self::ExecuteCrossShardTransactions { .. } => {
+                Some(DispatchPool::Execution)
+            }
+
+            _ => None,
+        }
     }
 }
