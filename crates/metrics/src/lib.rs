@@ -21,7 +21,8 @@
 //! hyperscale_metrics_noop::install();
 //! ```
 
-use std::sync::OnceLock;
+use std::cell::RefCell;
+use std::sync::{Arc, OnceLock};
 
 // ═══════════════════════════════════════════════════════════════════════
 // Types
@@ -444,6 +445,12 @@ struct NoopRecorder;
 impl MetricsRecorder for NoopRecorder {}
 
 static RECORDER: OnceLock<Box<dyn MetricsRecorder>> = OnceLock::new();
+static NOOP: NoopRecorder = NoopRecorder;
+
+thread_local! {
+    static SCOPED_RECORDER: RefCell<Option<Arc<dyn MetricsRecorder>>> =
+        const { RefCell::new(None) };
+}
 
 /// Install a global metrics recorder.
 ///
@@ -452,14 +459,56 @@ pub fn set_global_recorder(recorder: Box<dyn MetricsRecorder>) {
     let _ = RECORDER.set(recorder);
 }
 
-/// Get the global metrics recorder.
+/// Run `f` with `recorder` installed as the thread-local metrics recorder.
 ///
-/// Returns a no-op recorder if none has been installed.
+/// All emissions on this thread for the duration of `f` route to `recorder`
+/// instead of the global. Used in tests so concurrent simulations (cargo
+/// runs each test on its own thread) don't share counters. Thread-local
+/// scoping does not propagate across `spawn_blocking` / rayon workers.
+pub fn with_scoped_recorder<R>(recorder: Arc<dyn MetricsRecorder>, f: impl FnOnce() -> R) -> R {
+    struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            SCOPED_RECORDER.with(|cell| cell.borrow_mut().take());
+        }
+    }
+    SCOPED_RECORDER.with(|cell| *cell.borrow_mut() = Some(recorder));
+    let _guard = Guard;
+    f()
+}
+
+/// Handle to the active metrics recorder. Holds either a thread-local `Arc`
+/// (when a scoped recorder is installed) or a static reference to the global.
+enum RecorderHandle {
+    Scoped(Arc<dyn MetricsRecorder>),
+    Static(&'static dyn MetricsRecorder),
+}
+
+impl std::ops::Deref for RecorderHandle {
+    type Target = dyn MetricsRecorder;
+    #[inline]
+    fn deref(&self) -> &(dyn MetricsRecorder + 'static) {
+        match self {
+            Self::Scoped(arc) => &**arc,
+            Self::Static(r) => *r,
+        }
+    }
+}
+
+/// Get the active metrics recorder.
+///
+/// Prefers the thread-local scoped recorder if set; otherwise falls back to
+/// the global recorder, or a no-op if none has been installed.
 #[inline]
-fn recorder() -> &'static dyn MetricsRecorder {
-    RECORDER
-        .get()
-        .map_or(&NoopRecorder as &dyn MetricsRecorder, AsRef::as_ref)
+fn recorder() -> RecorderHandle {
+    if let Some(scoped) = SCOPED_RECORDER.with(|cell| cell.borrow().clone()) {
+        return RecorderHandle::Scoped(scoped);
+    }
+    RecorderHandle::Static(
+        RECORDER
+            .get()
+            .map_or(&NOOP as &dyn MetricsRecorder, AsRef::as_ref),
+    )
 }
 
 // ═══════════════════════════════════════════════════════════════════════

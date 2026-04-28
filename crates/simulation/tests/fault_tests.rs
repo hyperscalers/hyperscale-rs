@@ -7,7 +7,7 @@
 //! 3. End-to-end liveness: submitted transactions reach a terminal
 //!    state on every node.
 
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_core::NodeInput;
@@ -27,24 +27,14 @@ use radix_common::types::ComponentAddress;
 use radix_transactions::builder::ManifestBuilder;
 use tracing_test::traced_test;
 
-/// Serialize tests in this binary: the global metrics recorder is a
-/// process-wide `OnceLock`, and counters from one test would otherwise
-/// leak into another running in parallel.
-fn test_setup() -> (MutexGuard<'static, ()>, MemoryRecorder) {
-    static LOCK: Mutex<()> = Mutex::new(());
-    static RECORDER: OnceLock<MemoryRecorder> = OnceLock::new();
-    let guard = LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let recorder = RECORDER
-        .get_or_init(|| {
-            let r = MemoryRecorder::new();
-            hyperscale_metrics::set_global_recorder(Box::new(r.clone()));
-            r
-        })
-        .clone();
-    recorder.reset();
-    (guard, recorder)
+/// Run `f` against a fresh per-test `MemoryRecorder` installed as the
+/// thread-local metrics recorder. Cargo runs each test on its own thread,
+/// so concurrent tests get fully isolated counters and the binary can run
+/// with the default parallelism.
+fn with_test_recorder<R>(f: impl FnOnce(&MemoryRecorder) -> R) -> R {
+    let recorder = MemoryRecorder::new();
+    let arc: Arc<dyn hyperscale_metrics::MetricsRecorder> = Arc::new(recorder.clone());
+    hyperscale_metrics::with_scoped_recorder(arc, || f(&recorder))
 }
 
 fn single_shard_config() -> NetworkConfig {
@@ -146,67 +136,67 @@ fn tx_reached_terminal_state(
 #[traced_test]
 #[test]
 fn transaction_fetch_fallback_when_gossip_dropped() {
-    let (_guard, recorder) = test_setup();
+    with_test_recorder(|recorder| {
+        let mut runner = SimulationRunner::new(&single_shard_config(), 42);
+        runner.initialize_genesis();
 
-    let mut runner = SimulationRunner::new(&single_shard_config(), 42);
-    runner.initialize_genesis();
+        // Suppress all transaction.gossip across the network. The submitting
+        // node (0) still admits the tx locally, includes it in any block it
+        // proposes, and serves it to followers via GetTransactionsRequest.
+        let rule = runner
+            .network_mut()
+            .fault()
+            .drop_type("transaction.gossip")
+            .install();
 
-    // Suppress all transaction.gossip across the network. The submitting
-    // node (0) still admits the tx locally, includes it in any block it
-    // proposes, and serves it to followers via GetTransactionsRequest.
-    let rule = runner
-        .network_mut()
-        .fault()
-        .drop_type("transaction.gossip")
-        .install();
+        let tx = build_transfer_tx(1, 2);
+        let tx_hash = tx.hash();
+        runner.schedule_initial_event(
+            0,
+            Duration::ZERO,
+            NodeInput::SubmitTransaction { tx: Arc::new(tx) },
+        );
 
-    let tx = build_transfer_tx(1, 2);
-    let tx_hash = tx.hash();
-    runner.schedule_initial_event(
-        0,
-        Duration::ZERO,
-        NodeInput::SubmitTransaction { tx: Arc::new(tx) },
-    );
+        runner.run_until(Duration::from_secs(10));
 
-    runner.run_until(Duration::from_secs(10));
-
-    // Layer 1: fault rule actually intercepted gossip.
-    assert!(
-        rule.fired() >= 1,
-        "expected drop_type(\"transaction.gossip\") rule to fire at least once, got {}",
-        rule.fired()
-    );
-
-    // Layer 2: the fetch fallback path engaged. `fetch_items_sent` is
-    // recorded by the serve handler when it answers a fetch request, so a
-    // non-zero value proves at least one fetch round-trip completed
-    // successfully. (`fetch_started`/`fetch_completed` are not yet wired
-    // client-side; see `crates/node/src/protocol/fetch.rs`.)
-    let fetch_items_sent = recorder.counter("fetch_items_sent", Some("transaction"));
-    assert!(
-        fetch_items_sent >= 1,
-        "expected fetch_items_sent{{kind=\"transaction\"}} >= 1, got {fetch_items_sent}"
-    );
-
-    // Layer 3: end-to-end — every node finalized the tx and the chain
-    // advanced past genesis.
-    for node_idx in 0..4u32 {
+        // Layer 1: fault rule actually intercepted gossip.
         assert!(
-            tx_reached_terminal_state(&runner, node_idx, &tx_hash),
-            "node {node_idx} did not reach terminal state for tx {tx_hash:?}; \
-             gossip drops fired {} times, fetch_items_sent={fetch_items_sent}",
+            rule.fired() >= 1,
+            "expected drop_type(\"transaction.gossip\") rule to fire at least once, got {}",
             rule.fired()
         );
-    }
 
-    let max_height = (0..4)
-        .map(|i| runner.node(i).unwrap().bft().committed_height())
-        .max()
-        .unwrap();
-    assert!(
-        max_height > BlockHeight(0),
-        "expected chain to advance past genesis, got max height {max_height}"
-    );
+        // Layer 2: the fetch fallback path engaged. `fetch_items_sent` is
+        // recorded by the serve handler when it answers a fetch request, so a
+        // non-zero value proves at least one fetch round-trip completed
+        // successfully. (`fetch_started`/`fetch_completed` are not yet wired
+        // client-side; see `crates/node/src/protocol/fetch.rs`.)
+        let fetch_items_sent = recorder.counter("fetch_items_sent", Some("transaction"));
+        assert!(
+            fetch_items_sent >= 1,
+            "expected fetch_items_sent{{kind=\"transaction\"}} >= 1, got {fetch_items_sent}"
+        );
+
+        // Layer 3: end-to-end — every node finalized the tx and the chain
+        // advanced past genesis.
+        for node_idx in 0..4u32 {
+            assert!(
+                tx_reached_terminal_state(&runner, node_idx, &tx_hash),
+                "node {node_idx} did not reach terminal state for tx {tx_hash:?}; \
+             gossip drops fired {} times, fetch_items_sent={fetch_items_sent}",
+                rule.fired()
+            );
+        }
+
+        let max_height = (0..4)
+            .map(|i| runner.node(i).unwrap().bft().committed_height())
+            .max()
+            .unwrap();
+        assert!(
+            max_height > BlockHeight(0),
+            "expected chain to advance past genesis, got max height {max_height}"
+        );
+    });
 }
 
 /// Run a multi-shard fault scenario end-to-end and assert universal
@@ -236,89 +226,92 @@ fn run_cross_shard_fault_scenario_with_seed<F>(
 ) where
     F: FnOnce(&mut SimulationRunner) -> Vec<RuleHandle>,
 {
-    let (_guard, recorder) = test_setup();
+    with_test_recorder(|recorder| {
+        let config = multi_shard_config();
+        let num_shards = u64::from(config.num_shards);
+        let mut runner = SimulationRunner::new(&config, seed);
 
-    let config = multi_shard_config();
-    let num_shards = u64::from(config.num_shards);
-    let mut runner = SimulationRunner::new(&config, seed);
+        let ((kp_a, acc_a), (_kp_b, acc_b)) = find_accounts_on_each_shard(num_shards);
+        let initial_balance = Decimal::from(10_000);
+        runner.initialize_genesis_with_balances(&[
+            (acc_a, initial_balance),
+            (acc_b, initial_balance),
+        ]);
 
-    let ((kp_a, acc_a), (_kp_b, acc_b)) = find_accounts_on_each_shard(num_shards);
-    let initial_balance = Decimal::from(10_000);
-    runner.initialize_genesis_with_balances(&[(acc_a, initial_balance), (acc_b, initial_balance)]);
-
-    runner.run_until(Duration::from_secs(1));
-    let rules = install_faults(&mut runner);
-    assert!(
-        !rules.is_empty(),
-        "install_faults must return at least one rule handle"
-    );
-
-    let manifest = ManifestBuilder::new()
-        .lock_fee(acc_a, Decimal::from(10))
-        .withdraw_from_account(acc_a, XRD, Decimal::from(500))
-        .try_deposit_entire_worktop_or_abort(acc_b, None)
-        .build();
-    let notarized =
-        sign_and_notarize(manifest, &NetworkDefinition::simulator(), 200, &kp_a).expect("sign tx");
-    let tx: RoutableTransaction =
-        routable_from_notarized_v1(notarized, test_validity_range()).expect("valid tx");
-    let tx_hash = tx.hash();
-
-    let touched_shards: std::collections::BTreeSet<ShardGroupId> = tx
-        .declared_reads
-        .iter()
-        .chain(tx.declared_writes.iter())
-        .map(|nid| shard_for_node(nid, num_shards))
-        .collect();
-    assert!(
-        touched_shards.len() >= 2,
-        "tx is not cross-shard: only touches {touched_shards:?}"
-    );
-
-    runner.schedule_initial_event(
-        0,
-        runner.now(),
-        NodeInput::SubmitTransaction { tx: Arc::new(tx) },
-    );
-
-    runner.run_until(runner.now() + Duration::from_secs(30));
-
-    // Layer 1: every installed rule actually intercepted at least one
-    // message. Catches misconfigured matchers that silently match nothing.
-    for (i, rule) in rules.iter().enumerate() {
+        runner.run_until(Duration::from_secs(1));
+        let rules = install_faults(&mut runner);
         assert!(
-            rule.fired() >= 1,
-            "fault rule {i} did not fire — test premise broken (rule matched no messages)"
+            !rules.is_empty(),
+            "install_faults must return at least one rule handle"
         );
-    }
 
-    // Layer 2: each fetch protocol engaged client-side and server-side.
-    for kind in fetch_kinds {
-        let started = recorder.counter("fetch_started", Some(kind));
-        let completed = recorder.counter("fetch_completed", Some(kind));
-        let items_sent = recorder.counter("fetch_items_sent", Some(kind));
+        let manifest = ManifestBuilder::new()
+            .lock_fee(acc_a, Decimal::from(10))
+            .withdraw_from_account(acc_a, XRD, Decimal::from(500))
+            .try_deposit_entire_worktop_or_abort(acc_b, None)
+            .build();
+        let notarized = sign_and_notarize(manifest, &NetworkDefinition::simulator(), 200, &kp_a)
+            .expect("sign tx");
+        let tx: RoutableTransaction =
+            routable_from_notarized_v1(notarized, test_validity_range()).expect("valid tx");
+        let tx_hash = tx.hash();
+
+        let touched_shards: std::collections::BTreeSet<ShardGroupId> = tx
+            .declared_reads
+            .iter()
+            .chain(tx.declared_writes.iter())
+            .map(|nid| shard_for_node(nid, num_shards))
+            .collect();
         assert!(
-            started >= 1 && completed >= 1 && items_sent >= 1,
-            "{kind} fetch fallback didn't engage: started={started} \
+            touched_shards.len() >= 2,
+            "tx is not cross-shard: only touches {touched_shards:?}"
+        );
+
+        runner.schedule_initial_event(
+            0,
+            runner.now(),
+            NodeInput::SubmitTransaction { tx: Arc::new(tx) },
+        );
+
+        runner.run_until(runner.now() + Duration::from_secs(30));
+
+        // Layer 1: every installed rule actually intercepted at least one
+        // message. Catches misconfigured matchers that silently match nothing.
+        for (i, rule) in rules.iter().enumerate() {
+            assert!(
+                rule.fired() >= 1,
+                "fault rule {i} did not fire — test premise broken (rule matched no messages)"
+            );
+        }
+
+        // Layer 2: each fetch protocol engaged client-side and server-side.
+        for kind in fetch_kinds {
+            let started = recorder.counter("fetch_started", Some(kind));
+            let completed = recorder.counter("fetch_completed", Some(kind));
+            let items_sent = recorder.counter("fetch_items_sent", Some(kind));
+            assert!(
+                started >= 1 && completed >= 1 && items_sent >= 1,
+                "{kind} fetch fallback didn't engage: started={started} \
              completed={completed} items_sent={items_sent}"
-        );
-    }
+            );
+        }
 
-    // Layer 3: every validator reaches terminal state for the tx, and
-    // the tx was successfully executed (not aborted).
-    let total_nodes = config.num_shards * config.validators_per_shard;
-    for node_idx in 0..total_nodes {
-        assert!(
-            tx_reached_terminal_state(&runner, node_idx, &tx_hash),
-            "node {node_idx} did not reach terminal state for tx {tx_hash:?}",
-        );
-    }
-    let aborts = recorder.counter("transactions_aborted", None);
-    assert_eq!(
-        aborts, 0,
-        "expected zero abort events, got {aborts} (fetch fallback \
+        // Layer 3: every validator reaches terminal state for the tx, and
+        // the tx was successfully executed (not aborted).
+        let total_nodes = config.num_shards * config.validators_per_shard;
+        for node_idx in 0..total_nodes {
+            assert!(
+                tx_reached_terminal_state(&runner, node_idx, &tx_hash),
+                "node {node_idx} did not reach terminal state for tx {tx_hash:?}",
+            );
+        }
+        let aborts = recorder.counter("transactions_aborted", None);
+        assert_eq!(
+            aborts, 0,
+            "expected zero abort events, got {aborts} (fetch fallback \
          delivered data but tx still aborted somewhere)"
-    );
+        );
+    });
 }
 
 /// Cross-shard provisions fetch fallback. The source-shard proposer
