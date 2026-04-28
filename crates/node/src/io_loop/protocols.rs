@@ -1,7 +1,7 @@
 //! Sync and fetch protocol output processing.
 
 use super::{IoLoop, TimerOp};
-use crate::protocol::sync::{SyncInput, SyncOutput};
+use crate::io_loop::protocol::sync::{SyncInput, SyncOutput};
 use hyperscale_core::{NodeInput, ProtocolEvent, TimerId};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::Engine;
@@ -168,7 +168,7 @@ where
     ) {
         use hyperscale_messages::request::GetBlockTopUpRequest;
 
-        self.pending_block_topups.insert(height, elided);
+        self.protocols.pending_block_topups.insert(height, elided);
 
         let req = GetBlockTopUpRequest::new(
             height,
@@ -224,11 +224,14 @@ where
         };
 
         if certificate_root_valid {
-            let outputs = self.sync_protocol.handle(SyncInput::BlockResponseReceived {
-                height,
-                block,
-                now: std::time::Instant::now(),
-            });
+            let outputs = self
+                .protocols
+                .sync
+                .handle(SyncInput::BlockResponseReceived {
+                    height,
+                    block,
+                    now: std::time::Instant::now(),
+                });
             self.process_sync_outputs(outputs);
         } else {
             let _ = self
@@ -240,9 +243,9 @@ where
     /// Dispatch outputs from the transaction fetch.
     pub(super) fn process_transaction_fetch_outputs(
         &self,
-        outputs: Vec<crate::protocol::fetch::FetchOutput<hyperscale_types::TxHash>>,
+        outputs: Vec<crate::io_loop::protocol::fetch::FetchOutput<hyperscale_types::TxHash>>,
     ) {
-        use crate::protocol::fetch::FetchOutput;
+        use crate::io_loop::protocol::fetch::FetchOutput;
         use hyperscale_messages::request::GetTransactionsRequest;
 
         for output in outputs {
@@ -281,9 +284,9 @@ where
     /// Dispatch outputs from the local-provision fetch.
     pub(super) fn process_local_provision_fetch_outputs(
         &self,
-        outputs: Vec<crate::protocol::fetch::FetchOutput<hyperscale_types::ProvisionHash>>,
+        outputs: Vec<crate::io_loop::protocol::fetch::FetchOutput<hyperscale_types::ProvisionHash>>,
     ) {
-        use crate::protocol::fetch::FetchOutput;
+        use crate::io_loop::protocol::fetch::FetchOutput;
         use hyperscale_messages::request::GetLocalProvisionsRequest;
 
         for output in outputs {
@@ -327,13 +330,13 @@ where
     pub(super) fn process_provision_fetch_outputs(
         &self,
         outputs: Vec<
-            crate::protocol::fetch::FetchOutput<(
+            crate::io_loop::protocol::fetch::FetchOutput<(
                 hyperscale_types::ShardGroupId,
                 hyperscale_types::BlockHeight,
             )>,
         >,
     ) {
-        use crate::protocol::fetch::FetchOutput;
+        use crate::io_loop::protocol::fetch::FetchOutput;
 
         for output in outputs {
             let FetchOutput::Send { ids, peers } = output;
@@ -401,9 +404,9 @@ where
     /// Dispatch outputs from the cross-shard execution-cert fetch.
     pub(super) fn process_exec_cert_fetch_outputs(
         &self,
-        outputs: Vec<crate::protocol::fetch::FetchOutput<hyperscale_types::WaveId>>,
+        outputs: Vec<crate::io_loop::protocol::fetch::FetchOutput<hyperscale_types::WaveId>>,
     ) {
-        use crate::protocol::fetch::FetchOutput;
+        use crate::io_loop::protocol::fetch::FetchOutput;
         use hyperscale_messages::request::GetExecutionCertsRequest;
 
         for output in outputs {
@@ -450,13 +453,13 @@ where
     pub(super) fn process_header_fetch_outputs(
         &self,
         outputs: Vec<
-            crate::protocol::fetch::FetchOutput<(
+            crate::io_loop::protocol::fetch::FetchOutput<(
                 hyperscale_types::ShardGroupId,
                 hyperscale_types::BlockHeight,
             )>,
         >,
     ) {
-        use crate::protocol::fetch::FetchOutput;
+        use crate::io_loop::protocol::fetch::FetchOutput;
 
         for output in outputs {
             let FetchOutput::Send { ids, peers } = output;
@@ -501,9 +504,9 @@ where
     /// Dispatch outputs from the finalized-wave fetch.
     pub(super) fn process_finalized_wave_fetch_outputs(
         &self,
-        outputs: Vec<crate::protocol::fetch::FetchOutput<hyperscale_types::WaveIdHash>>,
+        outputs: Vec<crate::io_loop::protocol::fetch::FetchOutput<hyperscale_types::WaveIdHash>>,
     ) {
-        use crate::protocol::fetch::FetchOutput;
+        use crate::io_loop::protocol::fetch::FetchOutput;
         use hyperscale_messages::request::GetFinalizedWavesRequest;
 
         for output in outputs {
@@ -539,14 +542,7 @@ where
     }
 
     pub(super) fn update_fetch_tick_timer(&mut self) {
-        let any_pending = self.transaction_fetch.has_pending()
-            || self.local_provision_fetch.has_pending()
-            || self.finalized_wave_fetch.has_pending()
-            || self.provision_fetch.has_pending()
-            || self.exec_cert_fetch.has_pending()
-            || self.header_fetch.has_pending()
-            || self.sync_protocol.has_deferred();
-        let op = if any_pending {
+        let op = if self.protocols.has_any_pending() {
             TimerOp::Set {
                 id: TimerId::FetchTick,
                 duration: Self::FETCH_TICK_INTERVAL,

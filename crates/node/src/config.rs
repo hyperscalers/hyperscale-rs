@@ -1,7 +1,7 @@
 //! Consolidated configuration for `IoLoop`.
 
-use crate::protocol::fetch::FetchConfig;
-use crate::protocol::sync::SyncConfig;
+use crate::io_loop::protocol::fetch::FetchConfig;
+use crate::io_loop::protocol::sync::SyncConfig;
 use std::time::Duration;
 
 /// Configuration for [`IoLoop`](crate::io_loop::IoLoop).

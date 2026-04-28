@@ -137,6 +137,7 @@ impl Default for SyncStatus {
 
 /// Inputs to the sync protocol state machine.
 #[derive(Debug)]
+#[allow(missing_docs)] // variant payloads are self-describing (height, now, block)
 pub enum SyncInput {
     /// Start or update sync target.
     StartSync {
@@ -161,6 +162,7 @@ pub enum SyncInput {
 
 /// Outputs from the sync protocol state machine.
 #[derive(Debug)]
+#[allow(missing_docs)] // variant payloads are self-describing (height, certified)
 pub enum SyncOutput {
     /// Request the runner to fetch a block at this height. `target_height`
     /// is the sync target, passed through to the serving peer so it can
@@ -194,6 +196,7 @@ pub struct SyncProtocol {
 
 impl SyncProtocol {
     /// Create a new sync protocol state machine.
+    #[must_use]
     pub fn new(config: SyncConfig) -> Self {
         Self {
             config,
@@ -208,6 +211,7 @@ impl SyncProtocol {
 
     /// True if any heights are parked awaiting backoff. Lets the runner
     /// keep its periodic tick alive while the heap may be empty.
+    #[must_use]
     pub fn has_deferred(&self) -> bool {
         !self.deferred.is_empty()
     }
@@ -231,17 +235,20 @@ impl SyncProtocol {
     }
 
     /// Check if currently syncing.
+    #[must_use]
     pub const fn is_syncing(&self) -> bool {
         self.sync_target.is_some()
     }
 
     /// Number of blocks behind target (for metrics).
+    #[must_use]
     pub fn blocks_behind(&self) -> u64 {
         self.sync_target
             .map_or(0, |(t, _)| t.0.saturating_sub(self.committed_height.0))
     }
 
     /// Get current sync status.
+    #[must_use]
     pub fn status(&self) -> SyncStatus {
         SyncStatus {
             state: if self.sync_target.is_some() {

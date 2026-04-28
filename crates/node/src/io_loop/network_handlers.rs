@@ -27,9 +27,9 @@ where
     /// the serving function in the corresponding protocol module.
     #[allow(clippy::too_many_lines)] // single registration table; one closure per request type
     pub(super) fn register_request_handler(&self) {
-        use crate::protocol::provision_serve::serve_provision_request;
-        use crate::protocol::sync::{serve_block_request, serve_block_topup_request};
-        use crate::protocol::transaction_serve::serve_transaction_request;
+        use crate::io_loop::protocol::provision_serve::serve_provision_request;
+        use crate::io_loop::protocol::sync::{serve_block_request, serve_block_topup_request};
+        use crate::io_loop::protocol::transaction_serve::serve_transaction_request;
         use hyperscale_messages::request::{
             GetBlockRequest, GetBlockTopUpRequest, GetProvisionsRequest, GetTransactionsRequest,
         };

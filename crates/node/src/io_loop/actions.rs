@@ -3,9 +3,9 @@
 use super::IoLoop;
 use super::TimerOp;
 use super::block_commit::{AccumulateDecision, PendingCommit};
-use crate::protocol::fetch::FetchInput;
-use crate::protocol::fetch_instances;
-use crate::protocol::sync::SyncInput;
+use crate::io_loop::protocol::fetch::FetchInput;
+use crate::io_loop::protocol::fetch_instances;
+use crate::io_loop::protocol::sync::SyncInput;
 use hyperscale_core::{
     Action, ActionContext, CommitSource, FetchRequest, NodeInput, PreparedBlock, ProtocolEvent,
     StateMachine,
@@ -149,12 +149,12 @@ where
         // Each fetch instance owns its own admission predicate; the
         // arm just dispatches the event through them. Adding a new
         // payload is one new helper + one line here.
-        fetch_instances::apply_transactions_admission(&mut self.transaction_fetch, &pe);
-        fetch_instances::apply_local_provisions_admission(&mut self.local_provision_fetch, &pe);
-        fetch_instances::apply_finalized_waves_admission(&mut self.finalized_wave_fetch, &pe);
-        fetch_instances::apply_provisions_admission(&mut self.provision_fetch, &pe);
-        fetch_instances::apply_exec_certs_admission(&mut self.exec_cert_fetch, &pe);
-        fetch_instances::apply_headers_admission(&mut self.header_fetch, &pe);
+        fetch_instances::apply_transactions_admission(&mut self.protocols.transaction, &pe);
+        fetch_instances::apply_local_provisions_admission(&mut self.protocols.local_provision, &pe);
+        fetch_instances::apply_finalized_waves_admission(&mut self.protocols.finalized_wave, &pe);
+        fetch_instances::apply_provisions_admission(&mut self.protocols.provision, &pe);
+        fetch_instances::apply_exec_certs_admission(&mut self.protocols.exec_cert, &pe);
+        fetch_instances::apply_headers_admission(&mut self.protocols.header, &pe);
 
         // Serving-cache insertion is io_loop's own state, not an
         // instance concern — keep it here.
@@ -388,7 +388,8 @@ where
             AccumulateDecision::Accepted { height, notify_now } => {
                 debug!(height = height.0, "Block committed");
                 let outputs = self
-                    .sync_protocol
+                    .protocols
+                    .sync
                     .handle(SyncInput::BlockCommitted { height });
                 self.process_sync_outputs(outputs);
                 if let Some((block, qc)) = notify_now {
@@ -414,7 +415,7 @@ where
                 target_height,
                 target_hash,
             } => {
-                let outputs = self.sync_protocol.handle(SyncInput::StartSync {
+                let outputs = self.protocols.sync.handle(SyncInput::StartSync {
                     target_height,
                     target_hash,
                 });
@@ -435,21 +436,24 @@ where
     fn process_fetch_request(&mut self, req: FetchRequest) {
         match req {
             FetchRequest::Transactions { ids, peers } => {
-                self.transaction_fetch
+                self.protocols
+                    .transaction
                     .handle(FetchInput::Request { ids, peers });
-                let outputs = self.transaction_fetch.handle(FetchInput::Tick);
+                let outputs = self.protocols.transaction.handle(FetchInput::Tick);
                 self.process_transaction_fetch_outputs(outputs);
             }
             FetchRequest::LocalProvisions { ids, peers } => {
-                self.local_provision_fetch
+                self.protocols
+                    .local_provision
                     .handle(FetchInput::Request { ids, peers });
-                let outputs = self.local_provision_fetch.handle(FetchInput::Tick);
+                let outputs = self.protocols.local_provision.handle(FetchInput::Tick);
                 self.process_local_provision_fetch_outputs(outputs);
             }
             FetchRequest::FinalizedWaves { ids, peers } => {
-                self.finalized_wave_fetch
+                self.protocols
+                    .finalized_wave
                     .handle(FetchInput::Request { ids, peers });
-                let outputs = self.finalized_wave_fetch.handle(FetchInput::Tick);
+                let outputs = self.protocols.finalized_wave.handle(FetchInput::Tick);
                 self.process_finalized_wave_fetch_outputs(outputs);
             }
             FetchRequest::RemoteProvisions {
@@ -470,11 +474,11 @@ where
                     peer_count = peers.peers.len() + usize::from(peers.preferred.is_some()),
                     "Requesting missing provisions from source shard"
                 );
-                self.provision_fetch.handle(FetchInput::Request {
+                self.protocols.provision.handle(FetchInput::Request {
                     ids: vec![(source_shard, block_height)],
                     peers,
                 });
-                let outputs = self.provision_fetch.handle(FetchInput::Tick);
+                let outputs = self.protocols.provision.handle(FetchInput::Tick);
                 self.process_provision_fetch_outputs(outputs);
             }
             FetchRequest::ExecutionCerts { wave_id, peers } => {
@@ -483,11 +487,11 @@ where
                     peer_count = peers.peers.len() + usize::from(peers.preferred.is_some()),
                     "Requesting missing execution cert from source shard"
                 );
-                self.exec_cert_fetch.handle(FetchInput::Request {
+                self.protocols.exec_cert.handle(FetchInput::Request {
                     ids: vec![wave_id],
                     peers,
                 });
-                let outputs = self.exec_cert_fetch.handle(FetchInput::Tick);
+                let outputs = self.protocols.exec_cert.handle(FetchInput::Tick);
                 self.process_exec_cert_fetch_outputs(outputs);
             }
             FetchRequest::RemoteHeader {
@@ -501,11 +505,11 @@ where
                     peer_count = peers.peers.len() + usize::from(peers.preferred.is_some()),
                     "Requesting missing committed block header from source shard"
                 );
-                self.header_fetch.handle(FetchInput::Request {
+                self.protocols.header.handle(FetchInput::Request {
                     ids: vec![(source_shard, from_height)],
                     peers,
                 });
-                let outputs = self.header_fetch.handle(FetchInput::Tick);
+                let outputs = self.protocols.header.handle(FetchInput::Tick);
                 self.process_header_fetch_outputs(outputs);
             }
         }

@@ -6,7 +6,7 @@
 //! `Action::Continuation` interception arm; they are no-ops for events the
 //! instance doesn't subscribe to.
 
-use crate::protocol::fetch::{Fetch, FetchInput};
+use super::fetch::{Fetch, FetchInput};
 use crate::state::NodeStateMachine;
 use hyperscale_core::ProtocolEvent;
 use hyperscale_types::{BlockHeight, ProvisionHash, ShardGroupId, TxHash, WaveId, WaveIdHash};
@@ -79,11 +79,11 @@ pub fn apply_provisions_admission(fetch: &mut ProvisionFetch, event: &ProtocolEv
     }
 }
 
-/// A cross-shard provision id is abandoned once `ProvisionCoordinator` no
-/// longer expects provisions for it — the verified remote header that
-/// registered the expectation has either been satisfied or pruned.
-/// Lifetime is bound by `ProvisionCoordinator`'s expected-set, not by
-/// admission events alone.
+/// True once `ProvisionCoordinator` no longer expects provisions for `id`.
+///
+/// The verified remote header that registered the expectation has either
+/// been satisfied or pruned. Lifetime is bound by `ProvisionCoordinator`'s
+/// expected-set, not by admission events alone.
 #[must_use]
 pub fn provisions_is_abandoned(state: &NodeStateMachine, id: &(ShardGroupId, BlockHeight)) -> bool {
     let (shard, height) = *id;
