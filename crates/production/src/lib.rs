@@ -69,7 +69,6 @@
 //! let shared_dispatch = Arc::new(dispatch);
 //! ```
 
-mod event_loop;
 pub mod rpc;
 mod runner;
 mod status;
