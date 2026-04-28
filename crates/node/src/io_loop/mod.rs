@@ -552,7 +552,7 @@ where
             }
 
             NodeInput::FetchTransactionsFailed { hashes } => {
-                self.drive_fetch::<TransactionBinding>(FetchInput::Failed { ids: hashes });
+                self.handle_fetch_transactions_failed(hashes);
             }
 
             NodeInput::FetchTick => {
@@ -578,16 +578,10 @@ where
                 self.update_fetch_tick_timer();
             }
 
-            // ── Provision fetch protocol ──────────────────────────────
             NodeInput::ProvisionsFetchFailed {
                 source_shard,
                 block_height,
-            } => {
-                self.drive_fetch::<ProvisionBinding>(FetchInput::Failed {
-                    ids: vec![(source_shard, block_height)],
-                });
-                self.update_fetch_tick_timer();
-            }
+            } => self.handle_provisions_fetch_failed(source_shard, block_height),
 
             // ── Execution certificate delivery (fetch + gossip) ──────
             //
@@ -600,21 +594,12 @@ where
                 self.update_fetch_tick_timer();
             }
 
-            NodeInput::ExecCertFetchFailed { hashes } => {
-                self.drive_fetch::<ExecCertBinding>(FetchInput::Failed { ids: hashes });
-                self.update_fetch_tick_timer();
-            }
+            NodeInput::ExecCertFetchFailed { hashes } => self.handle_exec_cert_fetch_failed(hashes),
 
-            // ── Committed block header fetch protocol ────────────────
             NodeInput::HeaderFetchFailed {
                 source_shard,
                 from_height,
-            } => {
-                self.drive_fetch::<HeaderBinding>(FetchInput::Failed {
-                    ids: vec![(source_shard, from_height)],
-                });
-                self.update_fetch_tick_timer();
-            }
+            } => self.handle_header_fetch_failed(source_shard, from_height),
 
             // ── Committed header validated (sender sig verified) ────────
             NodeInput::CommittedHeaderValidated {
@@ -670,8 +655,7 @@ where
             }
 
             NodeInput::LocalProvisionsFetchFailed { hashes } => {
-                self.drive_fetch::<LocalProvisionBinding>(FetchInput::Failed { ids: hashes });
-                self.update_fetch_tick_timer();
+                self.handle_local_provisions_fetch_failed(hashes);
             }
 
             // ── Provision ready (from execution pool) ─────────────────
@@ -708,8 +692,7 @@ where
             }
 
             NodeInput::FinalizedWaveFetchFailed { hashes } => {
-                self.drive_fetch::<FinalizedWaveBinding>(FetchInput::Failed { ids: hashes });
-                self.update_fetch_tick_timer();
+                self.handle_finalized_wave_fetch_failed(hashes);
             }
 
             // ── Protocol events → state machine ────────────────────────
