@@ -61,7 +61,7 @@ use hyperscale_core::NodeInput;
 use hyperscale_node::SharedTopologySnapshot;
 use hyperscale_node::io_loop::{IoLoop, TimerOp};
 use hyperscale_node::{NodeConfig, NodeStateMachine};
-use hyperscale_topology::TopologyState;
+use hyperscale_topology::TopologyCoordinator;
 use hyperscale_types::{Block, Bls12381G1PrivateKey, ShardGroupId, TxHash, ValidatorId};
 use std::sync::Arc;
 use std::time::Duration;
@@ -136,7 +136,7 @@ impl Drop for ShutdownHandle {
 /// - `dispatch` - Dispatch implementation (defaults to auto-configured)
 /// - `channel_capacity` - Event channel capacity (defaults to 10,000)
 pub struct ProductionRunnerBuilder {
-    topology: Option<TopologyState>,
+    topology: Option<TopologyCoordinator>,
     signing_key: Option<Bls12381G1PrivateKey>,
     bft_config: Option<BftConfig>,
     dispatch: Option<Arc<PooledDispatch>>,
@@ -194,7 +194,7 @@ impl ProductionRunnerBuilder {
 
     /// Set the network topology.
     #[must_use]
-    pub fn topology(mut self, topology: TopologyState) -> Self {
+    pub fn topology(mut self, topology: TopologyCoordinator) -> Self {
         self.topology = Some(topology);
         self
     }
@@ -823,7 +823,7 @@ impl ProductionRunner {
 // ═══════════════════════════════════════════════════════════════════════════
 
 struct RequiredFields {
-    topology_state: TopologyState,
+    topology_state: TopologyCoordinator,
     signing_key: Bls12381G1PrivateKey,
     bft_config: BftConfig,
     dispatch: Arc<PooledDispatch>,
@@ -832,7 +832,7 @@ struct RequiredFields {
 }
 
 fn take_required_fields(
-    topology: Option<TopologyState>,
+    topology: Option<TopologyCoordinator>,
     signing_key: Option<Bls12381G1PrivateKey>,
     bft_config: Option<BftConfig>,
     dispatch: Option<Arc<PooledDispatch>>,

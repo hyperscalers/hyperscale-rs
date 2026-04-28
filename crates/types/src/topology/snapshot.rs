@@ -2,7 +2,7 @@
 //!
 //! `TopologySnapshot` is the read-only view of topology state, passed by
 //! reference to subsystem methods and shared via `ArcSwap` with the `io_loop`.
-//! All query methods are `&self`; mutations happen in `TopologyState`
+//! All query methods are `&self`; mutations happen in `TopologyCoordinator`
 //! (in the `hyperscale-topology` crate) which builds new snapshots.
 
 use crate::{

@@ -2,7 +2,7 @@
 //!
 //! Provides deterministic test setup including key generation and topology construction.
 
-use hyperscale_topology::TopologyState;
+use hyperscale_topology::TopologyCoordinator;
 use hyperscale_types::{
     Bls12381G1PrivateKey, Bls12381G1PublicKey, ShardGroupId, ValidatorId, ValidatorInfo,
     ValidatorSet, bls_keypair_from_seed,
@@ -22,7 +22,7 @@ pub struct TestFixtures {
     pub ed25519_keys: Vec<identity::Keypair>,
 
     /// Per-validator topologies.
-    topologies: Vec<TopologyState>,
+    topologies: Vec<TopologyCoordinator>,
 
     /// Number of validators.
     pub num_validators: u32,
@@ -109,13 +109,13 @@ impl TestFixtures {
         }
 
         // Create per-validator topologies
-        let topologies: Vec<TopologyState> = (0..num_validators)
+        let topologies: Vec<TopologyCoordinator> = (0..num_validators)
             .map(|i| {
                 let shard_id = u64::from(i) / u64::from(validators_per_shard);
                 let shard = ShardGroupId(shard_id);
                 let validator_id = ValidatorId(u64::from(i));
 
-                TopologyState::with_shard_committees(
+                TopologyCoordinator::with_shard_committees(
                     validator_id,
                     shard,
                     num_shards,
@@ -136,7 +136,7 @@ impl TestFixtures {
     }
 
     /// Get the topology for a validator by index.
-    pub fn topology(&self, index: u32) -> TopologyState {
+    pub fn topology(&self, index: u32) -> TopologyCoordinator {
         self.topologies[index as usize].clone()
     }
 

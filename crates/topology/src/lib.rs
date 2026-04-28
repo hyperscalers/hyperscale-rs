@@ -1,6 +1,6 @@
 //! Topology state for shard committee management.
 //!
-//! `TopologyState` is owned by `NodeStateMachine` and wraps an immutable
+//! `TopologyCoordinator` is owned by `NodeStateMachine` and wraps an immutable
 //! `TopologySnapshot` (from `hyperscale-types`) plus epoch lifecycle state.
 //!
 //! Consumers that need concurrent read access to the current snapshot (e.g.
@@ -8,6 +8,6 @@
 //! `ArcSwap` at their own layer and update it when the state machine emits
 //! `Action::TopologyChanged`.
 
-mod state;
+mod coordinator;
 
-pub use state::{TopologyError, TopologyState};
+pub use coordinator::{TopologyCoordinator, TopologyError};

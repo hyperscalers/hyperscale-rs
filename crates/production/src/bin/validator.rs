@@ -54,7 +54,7 @@ use hyperscale_production::rpc::{MempoolSnapshot, NodeStatusState, RpcServer, Rp
 use hyperscale_production::{ProductionRunner, TelemetryConfig, init_telemetry};
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_storage_rocksdb::{RocksDbConfig, RocksDbStorage};
-use hyperscale_topology::TopologyState;
+use hyperscale_topology::TopologyCoordinator;
 use hyperscale_types::{
     Bls12381G1PrivateKey, Bls12381G1PublicKey, ShardGroupId, ValidatorId, ValidatorInfo,
     ValidatorSet, bls_keypair_from_seed, generate_bls_keypair,
@@ -666,7 +666,7 @@ fn load_or_generate_keypair(key_path: Option<&PathBuf>) -> Result<Bls12381G1Priv
 fn build_topology(
     config: &ValidatorConfig,
     local_keypair: &Bls12381G1PrivateKey,
-) -> Result<TopologyState> {
+) -> Result<TopologyCoordinator> {
     use std::collections::HashMap;
 
     let local_validator_id = ValidatorId(config.node.validator_id);
@@ -745,7 +745,7 @@ fn build_topology(
             "Building topology with explicit shard assignments"
         );
 
-        Ok(TopologyState::with_shard_committees(
+        Ok(TopologyCoordinator::with_shard_committees(
             local_validator_id,
             local_shard,
             num_shards,
@@ -762,7 +762,7 @@ fn build_topology(
             );
         }
 
-        Ok(TopologyState::with_local_shard(
+        Ok(TopologyCoordinator::with_local_shard(
             local_validator_id,
             local_shard,
             num_shards,

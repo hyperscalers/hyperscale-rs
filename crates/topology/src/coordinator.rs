@@ -1,6 +1,6 @@
 //! Mutable topology state wrapping an immutable [`TopologySnapshot`].
 //!
-//! `TopologyState` is owned by `NodeStateMachine`. It holds epoch lifecycle
+//! `TopologyCoordinator` is owned by `NodeStateMachine`. It holds epoch lifecycle
 //! state (`next_epoch`) and produces `Arc<TopologySnapshot>` snapshots that
 //! are passed by reference to subsystems and shared with the `io_loop`.
 
@@ -38,7 +38,7 @@ impl From<TopologySnapshotError> for TopologyError {
 /// Only `NodeStateMachine` owns this; subsystems receive `&TopologySnapshot`
 /// via `snapshot()`.
 #[derive(Debug, Clone)]
-pub struct TopologyState {
+pub struct TopologyCoordinator {
     snapshot: Arc<TopologySnapshot>,
     next_epoch: Option<EpochConfig>,
 }
@@ -47,7 +47,7 @@ pub struct TopologyState {
 // Constructors
 // ═══════════════════════════════════════════════════════════════════════════
 
-impl TopologyState {
+impl TopologyCoordinator {
     /// Create a topology with modulo-based shard assignment.
     ///
     /// Validators are assigned to shards by `id % num_shards`.
@@ -142,7 +142,7 @@ impl TopologyState {
 // Mutation methods (&mut self)
 // ═══════════════════════════════════════════════════════════════════════════
 
-impl TopologyState {
+impl TopologyCoordinator {
     /// Set the next epoch configuration (called when global consensus finalizes it).
     pub fn set_next_epoch(&mut self, next: EpochConfig) {
         self.next_epoch = Some(next);
@@ -197,11 +197,11 @@ mod tests {
         }
     }
 
-    fn make_topology(num_validators: u64, local_id: u64) -> TopologyState {
+    fn make_topology(num_validators: u64, local_id: u64) -> TopologyCoordinator {
         let validators: Vec<_> = (0..num_validators)
             .map(|i| make_test_validator(i, 1))
             .collect();
-        TopologyState::new(ValidatorId(local_id), 1, ValidatorSet::new(validators))
+        TopologyCoordinator::new(ValidatorId(local_id), 1, ValidatorSet::new(validators))
     }
 
     #[test]
@@ -220,7 +220,7 @@ mod tests {
         let vs = ValidatorSet::new(validators);
         let epoch0 = EpochConfig::genesis(2, vs.clone());
 
-        let mut topology = TopologyState::from_epoch_config(ValidatorId(0), &epoch0).unwrap();
+        let mut topology = TopologyCoordinator::from_epoch_config(ValidatorId(0), &epoch0).unwrap();
         assert_eq!(topology.snapshot().current_epoch(), EpochId::GENESIS);
 
         // Transition without setting next epoch should fail.
@@ -252,7 +252,7 @@ mod tests {
     fn test_constructors() {
         // with_local_shard
         let validators: Vec<_> = (0..4).map(|i| make_test_validator(i, 1)).collect();
-        let topology = TopologyState::with_local_shard(
+        let topology = TopologyCoordinator::with_local_shard(
             ValidatorId(0),
             ShardGroupId(1),
             2,
@@ -268,7 +268,7 @@ mod tests {
         committees.insert(ShardGroupId(0), vec![ValidatorId(0), ValidatorId(2)]);
         committees.insert(ShardGroupId(1), vec![ValidatorId(1), ValidatorId(3)]);
 
-        let topology = TopologyState::with_shard_committees(
+        let topology = TopologyCoordinator::with_shard_committees(
             ValidatorId(0),
             ShardGroupId(0),
             2,
@@ -290,7 +290,7 @@ mod tests {
         let vs = ValidatorSet::new(validators);
         let epoch = EpochConfig::genesis(2, vs);
 
-        let topology = TopologyState::from_epoch_config(ValidatorId(0), &epoch).unwrap();
+        let topology = TopologyCoordinator::from_epoch_config(ValidatorId(0), &epoch).unwrap();
         assert_eq!(topology.snapshot().local_shard(), ShardGroupId(0));
         assert_eq!(topology.snapshot().num_shards(), 2);
         assert_eq!(topology.snapshot().current_epoch(), EpochId::GENESIS);
@@ -303,7 +303,7 @@ mod tests {
         let vs = ValidatorSet::new(validators);
         let epoch = EpochConfig::genesis(2, vs);
 
-        let result = TopologyState::from_epoch_config(ValidatorId(100), &epoch);
+        let result = TopologyCoordinator::from_epoch_config(ValidatorId(100), &epoch);
         assert!(result.is_err());
         assert_eq!(
             result.unwrap_err(),

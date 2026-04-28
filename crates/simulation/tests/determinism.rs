@@ -1510,7 +1510,7 @@ fn test_cross_shard_latency() {
 /// Test that Topology correctly identifies cross-shard transactions.
 #[test]
 fn test_cross_shard_transaction_detection() {
-    use hyperscale_topology::TopologyState;
+    use hyperscale_topology::TopologyCoordinator;
     use hyperscale_types::test_utils::{test_node, test_transaction_with_nodes};
     use hyperscale_types::{
         Bls12381G1PrivateKey, ShardGroupId, ValidatorId, ValidatorInfo, ValidatorSet,
@@ -1536,7 +1536,7 @@ fn test_cross_shard_transaction_detection() {
     shard_committees.insert(ShardGroupId(0), vec![ValidatorId(0), ValidatorId(1)]);
     shard_committees.insert(ShardGroupId(1), vec![ValidatorId(2), ValidatorId(3)]);
 
-    let topology = TopologyState::with_shard_committees(
+    let topology = TopologyCoordinator::with_shard_committees(
         ValidatorId(0),
         ShardGroupId(0),
         2, // num_shards

@@ -12,7 +12,7 @@ use tracing::warn;
 /// that involve the requesting shard, collects the local state entries
 /// and merkle proofs, and returns them as `StateProvision`s.
 ///
-/// Takes `local_shard` and `num_shards` instead of `&TopologyState`
+/// Takes `local_shard` and `num_shards` instead of `&TopologyCoordinator`
 /// to avoid topology dependency in the I/O layer.
 pub fn serve_provision_request(
     storage: &(impl ChainReader + SubstateStore),

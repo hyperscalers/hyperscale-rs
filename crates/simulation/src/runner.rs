@@ -16,7 +16,7 @@ use hyperscale_node::io_loop::{IoLoop, StepOutput};
 use hyperscale_node::{NodeConfig, NodeStateMachine, TimerOp};
 use hyperscale_storage::ChainReader;
 use hyperscale_storage_memory::SimStorage;
-use hyperscale_topology::TopologyState;
+use hyperscale_topology::TopologyCoordinator;
 use hyperscale_types::{
     BlockHeight, Bls12381G1PrivateKey, Bls12381G1PublicKey, CertifiedBlock, NodeId, ShardGroupId,
     TransactionStatus, TxHash, ValidatorId, ValidatorInfo, ValidatorSet, bls_keypair_from_seed,
@@ -196,7 +196,7 @@ impl SimulationRunner {
                 let node_index = shard_start + v;
                 let validator_id = ValidatorId(u64::from(node_index));
 
-                let topology_state = TopologyState::with_shard_committees(
+                let topology_state = TopologyCoordinator::with_shard_committees(
                     validator_id,
                     shard,
                     u64::from(network_config.num_shards),

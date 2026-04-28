@@ -6,7 +6,7 @@ use hyperscale_execution::ExecutionCoordinator;
 use hyperscale_mempool::{MempoolConfig, MempoolCoordinator};
 use hyperscale_provisions::{OutboundProvisionTracker, ProvisionConfig, ProvisionCoordinator};
 use hyperscale_remote_headers::RemoteHeaderCoordinator;
-use hyperscale_topology::TopologyState;
+use hyperscale_topology::TopologyCoordinator;
 use hyperscale_types::{
     Block, BlockHash, BlockHeader, BlockManifest, CertifiedBlock, FinalizedWave, LocalTimestamp,
     Provisions, QuorumCertificate, RoutableTransaction, ShardGroupId, StateRoot, TopologySnapshot,
@@ -33,7 +33,7 @@ pub struct NodeStateMachine {
     node_index: NodeIndex,
 
     /// Network topology — passed by reference to subsystem methods.
-    topology: TopologyState,
+    topology: TopologyCoordinator,
 
     /// BFT consensus state (includes implicit round advancement).
     bft: BftCoordinator,
@@ -94,7 +94,7 @@ impl NodeStateMachine {
     #[must_use]
     pub fn new(
         node_index: NodeIndex,
-        topology: TopologyState,
+        topology: TopologyCoordinator,
         bft_config: &BftConfig,
         recovered: RecoveredState,
         mempool_config: MempoolConfig,
