@@ -725,8 +725,7 @@ pub fn handle_action<S, E>(
 
         Action::VerifyStateRoot {
             block_hash,
-            // Anchor already applied via ctx.view (see `parent_hash_for`).
-            parent_block_hash: _,
+            parent_block_hash,
             parent_state_root,
             parent_block_height,
             expected_root,
@@ -734,9 +733,10 @@ pub fn handle_action<S, E>(
             block_height,
         } => {
             let start = std::time::Instant::now();
-            let pending_snapshots = ctx.view.pending_snapshots().to_vec();
+            let view = ctx.pending_chain.view_at(parent_block_hash);
+            let pending_snapshots = view.pending_snapshots().to_vec();
             let result = verify_state_root(
-                &*ctx.view,
+                &*view,
                 parent_state_root,
                 parent_block_height,
                 expected_root,
@@ -751,6 +751,7 @@ pub fn handle_action<S, E>(
             if let Some(prepared) = result.prepared_commit {
                 (ctx.commit_prepared)(PreparedBlock {
                     block_hash,
+                    parent_block_hash,
                     block_height,
                     prepared,
                     receipts: collect_finalized_receipts(&finalized_waves),
@@ -780,9 +781,10 @@ pub fn handle_action<S, E>(
             parent_in_flight,
             finalized_tx_count,
         } => {
-            let pending_snapshots = ctx.view.pending_snapshots().to_vec();
+            let view = ctx.pending_chain.view_at(parent_hash);
+            let pending_snapshots = view.pending_snapshots().to_vec();
             let result = build_proposal(
-                &*ctx.view,
+                &*view,
                 proposer,
                 height,
                 round,
@@ -805,6 +807,7 @@ pub fn handle_action<S, E>(
             if let Some(prepared) = result.prepared_commit {
                 (ctx.commit_prepared)(PreparedBlock {
                     block_hash,
+                    parent_block_hash: parent_hash,
                     block_height: height,
                     prepared,
                     receipts: collect_finalized_receipts(&finalized_waves),

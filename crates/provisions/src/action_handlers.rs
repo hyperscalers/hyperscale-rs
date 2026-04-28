@@ -218,15 +218,16 @@ pub fn handle_action<S, E>(
             ));
         }
         Action::FetchAndBroadcastProvisions {
-            block_hash: _,
+            block_hash,
             requests,
             source_shard,
             block_height,
             shard_recipients,
         } => {
+            let view = ctx.pending_chain.view_at(block_hash);
             let batches = fetch_and_broadcast_provision(
                 ctx.executor,
-                &ctx.view,
+                &view,
                 source_shard,
                 block_height,
                 &requests,

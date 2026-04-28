@@ -10,7 +10,6 @@
 use hyperscale_core::{Action, ActionContext};
 use hyperscale_engine::Engine;
 use hyperscale_storage::Storage;
-use hyperscale_types::BlockHash;
 
 /// Which dispatch pool an action should run on in production.
 pub enum DispatchPool {
@@ -52,29 +51,6 @@ pub const fn dispatch_pool_for(action: &Action) -> Option<DispatchPool> {
         Action::ExecuteTransactions { .. } | Action::ExecuteCrossShardTransactions { .. } => {
             Some(DispatchPool::Execution)
         }
-        _ => None,
-    }
-}
-
-/// Anchor block hash for `PendingChain::view_at` for actions that read
-/// state via the substate overlay. Returns `None` for actions that
-/// don't read state, in which case the dispatcher falls back to
-/// `view_at_committed_tip()`.
-///
-/// The anchor names the block whose state the action reads against:
-/// - `BuildProposal`/`VerifyStateRoot` use the parent block (state we
-///   build on / verify against).
-/// - `Execute*` and `FetchAndBroadcastProvisions` use the kicked-off
-///   block (the committed block whose state these actions act on).
-pub const fn parent_hash_for(action: &Action) -> Option<BlockHash> {
-    match action {
-        Action::VerifyStateRoot {
-            parent_block_hash, ..
-        } => Some(*parent_block_hash),
-        Action::BuildProposal { parent_hash, .. } => Some(*parent_hash),
-        Action::ExecuteTransactions { block_hash, .. }
-        | Action::ExecuteCrossShardTransactions { block_hash, .. }
-        | Action::FetchAndBroadcastProvisions { block_hash, .. } => Some(*block_hash),
         _ => None,
     }
 }

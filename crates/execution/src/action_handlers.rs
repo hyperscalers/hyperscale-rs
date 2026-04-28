@@ -293,15 +293,16 @@ where
         }
         Action::ExecuteTransactions {
             wave_id,
-            block_hash: _,
+            block_hash,
             transactions,
             state_root: _,
         } => {
             let start = std::time::Instant::now();
             let local_shard = ctx.topology.local_shard();
             let num_shards = ctx.topology.num_shards();
+            let view = ctx.pending_chain.view_at(block_hash);
             let view_snap =
-                <hyperscale_storage::SubstateView<_> as SubstateStore>::snapshot(&*ctx.view);
+                <hyperscale_storage::SubstateView<_> as SubstateStore>::snapshot(&*view);
             let batch_result = ctx.executor.execute_single_shard(
                 &view_snap,
                 transactions.as_slice(),
@@ -331,14 +332,15 @@ where
         }
         Action::ExecuteCrossShardTransactions {
             wave_id,
-            block_hash: _,
+            block_hash,
             requests,
         } => {
             let start = std::time::Instant::now();
             let local_shard = ctx.topology.local_shard();
             let num_shards = ctx.topology.num_shards();
+            let view = ctx.pending_chain.view_at(block_hash);
             let view_snap =
-                <hyperscale_storage::SubstateView<_> as SubstateStore>::snapshot(&*ctx.view);
+                <hyperscale_storage::SubstateView<_> as SubstateStore>::snapshot(&*view);
             let (tx_outcomes, results): (Vec<_>, Vec<_>) = requests
                 .iter()
                 .map(|req| {

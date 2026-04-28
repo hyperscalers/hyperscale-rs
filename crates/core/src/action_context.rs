@@ -7,19 +7,23 @@
 
 use crate::NodeInput;
 use hyperscale_engine::Engine;
-use hyperscale_storage::{Storage, SubstateView};
+use hyperscale_storage::{PendingChain, Storage};
 use hyperscale_types::{BlockHash, BlockHeight, LocalReceipt, TopologySnapshot};
 use std::sync::Arc;
 
 /// Context for executing delegated actions.
+///
+/// Handlers anchor their own read view on the chain via
+/// `ctx.pending_chain.view_at(block_hash)` — the field naming the relevant
+/// block lives on the `Action` variant itself, so the dispatcher doesn't
+/// need to know which actions read state at which anchor.
 #[allow(missing_docs)] // bag of references; field names match the borrowed types
 pub struct ActionContext<'a, S: Storage, E: Engine> {
     pub executor: &'a E,
     pub topology: &'a TopologySnapshot,
-    /// Anchored read view over base storage + the chain of unpersisted
-    /// blocks back to the committed tip. Built per-dispatch by
-    /// `PendingChain::view_at(parent_hash_for(action))`.
-    pub view: Arc<SubstateView<S>>,
+    /// Chain-state lookup. Handlers that read state call
+    /// `pending_chain.view_at(block_hash)` to build an anchored view.
+    pub pending_chain: &'a Arc<PendingChain<S>>,
     /// Send a `NodeInput` (typically a `ProtocolEvent`) back to the state
     /// machine. The single sink for delegated-action outcomes.
     pub notify: &'a (dyn Fn(NodeInput) + Send + Sync),
@@ -34,6 +38,7 @@ pub struct ActionContext<'a, S: Storage, E: Engine> {
 #[allow(missing_docs)] // flat bundle threaded straight to the chain insert site
 pub struct PreparedBlock<P: Send> {
     pub block_hash: BlockHash,
+    pub parent_block_hash: BlockHash,
     pub block_height: BlockHeight,
     pub prepared: P,
     pub receipts: Vec<Arc<LocalReceipt>>,

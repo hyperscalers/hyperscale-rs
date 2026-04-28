@@ -682,25 +682,6 @@ where
         let pool = action_handler::dispatch_pool_for(&action)
             .expect("dispatch_delegated_action called for delegated actions only");
 
-        // Anchor + view for this action. Actions that don't read state
-        // (no parent_hash_for) get the committed-tip view; the view is
-        // unused but the construction is cheap (cache hit after first).
-        let view = action_handler::parent_hash_for(&action).map_or_else(
-            || self.pending_chain.view_at_committed_tip(),
-            |parent_hash| self.pending_chain.view_at(parent_hash),
-        );
-        // Anchor parent for inserting the resulting ChainEntry into
-        // PendingChain. For BuildProposal/VerifyStateRoot this is the
-        // block-being-built/verified's parent. Other actions don't
-        // produce prepared_commit so this is unused.
-        let anchor_parent_hash = match &action {
-            Action::VerifyStateRoot {
-                parent_block_hash, ..
-            } => Some(*parent_block_hash),
-            Action::BuildProposal { parent_hash, .. } => Some(*parent_hash),
-            _ => None,
-        };
-
         // Clone cheap shared state for the 'static spawn closure.
         let executor = self.executor.clone();
         let topology_snapshot = self.topology.load_full();
@@ -712,25 +693,25 @@ where
             let notify = move |event: NodeInput| {
                 let _ = event_tx.send(event);
             };
+            let pending_chain_for_commit = Arc::clone(&pending_chain);
             let commit_prepared = move |prep: PreparedBlock<S::PreparedCommit>| {
                 let PreparedBlock {
                     block_hash,
+                    parent_block_hash: parent_hash,
                     block_height,
                     prepared,
                     receipts,
                 } = prep;
-                if let Some(parent_hash) = anchor_parent_hash {
-                    let jmt_snapshot = Arc::new(S::jmt_snapshot(&prepared).clone());
-                    pending_chain.insert(
-                        block_hash,
-                        hyperscale_storage::ChainEntry {
-                            parent_hash,
-                            height: block_height,
-                            receipts,
-                            jmt_snapshot,
-                        },
-                    );
-                }
+                let jmt_snapshot = Arc::new(S::jmt_snapshot(&prepared).clone());
+                pending_chain_for_commit.insert(
+                    block_hash,
+                    hyperscale_storage::ChainEntry {
+                        parent_hash,
+                        height: block_height,
+                        receipts,
+                        jmt_snapshot,
+                    },
+                );
                 prepared_commits
                     .lock()
                     .unwrap()
@@ -739,7 +720,7 @@ where
             let ctx = ActionContext {
                 executor: &executor,
                 topology: &topology_snapshot,
-                view,
+                pending_chain: &pending_chain,
                 notify: &notify,
                 commit_prepared: &commit_prepared,
             };
