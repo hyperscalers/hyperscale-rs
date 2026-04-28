@@ -618,12 +618,10 @@ where
 
             NodeInput::FetchTick => {
                 // Tick every fetch protocol. Per-payload bindings drain via
-                // `apply_admission` on canonical admission events; the scope
-                // protocols still evict abandoned scopes via predicates.
+                // `apply_admission` on canonical admission events; cross-shard
+                // provisions also evict abandoned scopes via a predicate.
                 let now = std::time::Instant::now();
-
-                // Promote any sync heights whose backoff has elapsed.
-                let outputs = self.protocols.sync.handle(SyncInput::Tick { now });
+                let outputs = self.protocols.sync_tick(now);
                 self.process_sync_outputs(outputs);
 
                 self.drive_fetch::<TransactionBinding>(FetchInput::Tick);
@@ -636,8 +634,6 @@ where
                 self.drive_fetch::<ProvisionBinding>(FetchInput::Tick);
 
                 self.drive_fetch::<ExecCertBinding>(FetchInput::Tick);
-                // Header fetch drains via `Continuation(RemoteHeaderAdmitted)`
-                // through `apply_admission`.
                 self.drive_fetch::<HeaderBinding>(FetchInput::Tick);
 
                 self.update_fetch_tick_timer();
@@ -902,9 +898,8 @@ where
         let bft_stats = self.state.bft().stats();
         let mempool = self.state.mempool();
         let contention = mempool.lock_contention_stats();
-        let fetch_in_flight = self.protocols.transaction.in_flight_count();
-        let fetch_pending_blocks = self.protocols.transaction.pending_count();
-        let sync_status = self.protocols.sync.status();
+        let proto = self.protocols.metrics();
+        let sync_status = &proto.sync_status;
 
         let bft_mem = self.state.bft().memory_stats();
         let exec_mem = self.state.execution().memory_stats();
@@ -922,12 +917,12 @@ where
             backpressure_active: mempool.at_in_flight_limit(),
             blocks_behind: self.protocols.sync.blocks_behind(),
             is_syncing: self.protocols.sync.is_syncing(),
-            fetch_transaction: fetch_in_flight,
-            fetch_provision: self.protocols.provision.in_flight_count(),
-            fetch_local_provision: self.protocols.local_provision.in_flight_count(),
-            fetch_exec_cert: self.protocols.exec_cert.in_flight_count(),
-            fetch_header: self.protocols.header.in_flight_count(),
-            fetch_finalized_wave: self.protocols.finalized_wave.in_flight_count(),
+            fetch_transaction: proto.transaction_in_flight,
+            fetch_provision: proto.provision_in_flight,
+            fetch_local_provision: proto.local_provision_in_flight,
+            fetch_exec_cert: proto.exec_cert_in_flight,
+            fetch_header: proto.header_in_flight,
+            fetch_finalized_wave: proto.finalized_wave_in_flight,
             memory: metrics::MemoryMetrics {
                 // BFT
                 bft_pending_blocks: bft_mem.pending_blocks,
@@ -997,12 +992,12 @@ where
                 node_committed_header_batch: self.committed_header_batch.len(),
                 node_sync_queued_heights: sync_status.queued_heights,
                 node_sync_in_flight_fetches: sync_status.pending_fetches,
-                node_tx_fetch_blocks: fetch_pending_blocks,
-                node_local_provision_fetch_pending: self.protocols.local_provision.pending_count(),
-                node_finalized_wave_fetch_pending: self.protocols.finalized_wave.pending_count(),
-                node_provision_fetch_pending: self.protocols.provision.pending_count(),
-                node_exec_cert_fetch_pending: self.protocols.exec_cert.pending_count(),
-                node_header_fetch_pending: self.protocols.header.pending_count(),
+                node_tx_fetch_blocks: proto.transaction_pending,
+                node_local_provision_fetch_pending: proto.local_provision_pending,
+                node_finalized_wave_fetch_pending: proto.finalized_wave_pending,
+                node_provision_fetch_pending: proto.provision_pending,
+                node_exec_cert_fetch_pending: proto.exec_cert_pending,
+                node_header_fetch_pending: proto.header_pending,
                 // Storage — filled in by record_metrics off-thread.
                 rocksdb_block_cache_usage_bytes: 0,
                 rocksdb_memtable_usage_bytes: 0,

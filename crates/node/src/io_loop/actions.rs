@@ -4,8 +4,8 @@ use super::IoLoop;
 use super::TimerOp;
 use super::block_commit::{AccumulateDecision, PendingCommit};
 use crate::io_loop::protocol::binding::{
-    ExecCertBinding, FetchBinding, FinalizedWaveBinding, HeaderBinding, LocalProvisionBinding,
-    ProvisionBinding, TransactionBinding,
+    ExecCertBinding, FinalizedWaveBinding, HeaderBinding, LocalProvisionBinding, ProvisionBinding,
+    TransactionBinding,
 };
 use crate::io_loop::protocol::fetch::FetchInput;
 use crate::io_loop::protocol::sync::SyncInput;
@@ -149,14 +149,7 @@ where
     // arm, with no architectural payoff.
 
     fn handle_continuation(&mut self, pe: ProtocolEvent) {
-        // Fan out the admission event across every binding; each impl is a
-        // no-op for events it doesn't subscribe to.
-        TransactionBinding::apply_admission(&mut self.protocols.transaction, &pe);
-        LocalProvisionBinding::apply_admission(&mut self.protocols.local_provision, &pe);
-        FinalizedWaveBinding::apply_admission(&mut self.protocols.finalized_wave, &pe);
-        ProvisionBinding::apply_admission(&mut self.protocols.provision, &pe);
-        ExecCertBinding::apply_admission(&mut self.protocols.exec_cert, &pe);
-        HeaderBinding::apply_admission(&mut self.protocols.header, &pe);
+        self.protocols.apply_admission(&pe);
 
         // Serving-cache insertion is io_loop's own state, not an
         // instance concern — keep it here.
