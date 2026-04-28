@@ -8,7 +8,9 @@
 mod fetch_delivery;
 mod fetch_failure;
 mod gossip;
+mod protocol;
 mod sync;
+mod tick;
 mod tx_validation;
 
 pub(super) use gossip::CommittedHeaderVerificationItem;

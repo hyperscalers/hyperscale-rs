@@ -33,11 +33,6 @@ use crate::batch_accumulator::BatchAccumulator;
 use crate::config::NodeConfig;
 use crate::io_loop::block_commit::BlockCommitCoordinator;
 use crate::io_loop::caches::SharedCaches;
-use crate::io_loop::protocol::binding::{
-    ExecCertBinding, FinalizedWaveBinding, HeaderBinding, LocalProvisionBinding, ProvisionBinding,
-    TransactionBinding,
-};
-use crate::io_loop::protocol::fetch::FetchInput;
 use crate::io_loop::protocol::host::ProtocolHost;
 use crate::io_loop::protocol::sync::SyncStatus;
 use crate::io_loop::step::CommittedHeaderVerificationItem;
@@ -490,28 +485,7 @@ where
                 self.handle_fetch_transactions_failed(hashes);
             }
 
-            NodeInput::FetchTick => {
-                // Tick every fetch protocol. Per-payload bindings drain via
-                // `apply_admission` on canonical admission events; cross-shard
-                // provisions also evict abandoned scopes via a predicate.
-                let now = std::time::Instant::now();
-                let outputs = self.protocols.sync_tick(now);
-                self.process_sync_outputs(outputs);
-
-                self.drive_fetch::<TransactionBinding>(FetchInput::Tick);
-                self.drive_fetch::<LocalProvisionBinding>(FetchInput::Tick);
-                self.drive_fetch::<FinalizedWaveBinding>(FetchInput::Tick);
-
-                self.protocols.provision.evict_abandoned(|id| {
-                    crate::io_loop::protocol::binding::provisions_is_abandoned(&self.state, id)
-                });
-                self.drive_fetch::<ProvisionBinding>(FetchInput::Tick);
-
-                self.drive_fetch::<ExecCertBinding>(FetchInput::Tick);
-                self.drive_fetch::<HeaderBinding>(FetchInput::Tick);
-
-                self.update_fetch_tick_timer();
-            }
+            NodeInput::FetchTick => self.handle_fetch_tick(),
 
             NodeInput::ProvisionsFetchFailed {
                 source_shard,
@@ -567,14 +541,9 @@ where
 
             // ── Protocol events → state machine ────────────────────────
             NodeInput::Protocol(ProtocolEvent::BlockPersisted { height }) => {
-                self.block_commit.mark_persisted(height);
-                // Drop pending state for blocks now persisted to RocksDB.
-                self.pending_chain.prune(height);
-                self.feed_event(ProtocolEvent::BlockPersisted { height });
+                self.handle_block_persisted(height);
             }
-            NodeInput::Protocol(pe) => {
-                self.feed_event(pe);
-            }
+            NodeInput::Protocol(pe) => self.handle_protocol_passthrough(pe),
         }
 
         self.drain_pending_output()
