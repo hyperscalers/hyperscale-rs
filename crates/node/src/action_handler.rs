@@ -1,20 +1,17 @@
 //! Action handler for immediately-dispatched computation.
 //!
-//! [`handle_delegated_action`] bridges individual [`Action`] variants to pure
-//! computation (crypto verification, execution, proposal building). The node
-//! loop's `dispatch_delegated_action` spawns closures that call this function
-//! on the appropriate thread pool. Outcomes flow back via `ctx.notify` and
-//! `ctx.commit_prepared`.
+//! [`handle_delegated_action`] routes each delegated [`Action`] variant to the
+//! coordinator crate that owns it. Each crate's `handle_action` runs the pure
+//! computation and pushes outcomes via `ctx.notify` and `ctx.commit_prepared`.
 //!
 //! Batched work (execution votes, execution certs) and block commits are
 //! handled inline by the I/O loop's flush closures.
 
-use hyperscale_core::{Action, ActionContext, NodeInput, PreparedBlock, ProtocolEvent};
+use hyperscale_core::{Action, ActionContext, NodeInput, ProtocolEvent};
 use hyperscale_engine::Engine;
 use hyperscale_metrics as metrics;
 use hyperscale_storage::Storage;
-use hyperscale_types::{BlockHash, LocalExecutionEntry, LocalReceipt};
-use std::sync::Arc;
+use hyperscale_types::{BlockHash, LocalExecutionEntry};
 
 /// Which dispatch pool an action should run on in production.
 pub enum DispatchPool {
@@ -83,17 +80,7 @@ pub const fn parent_hash_for(action: &Action) -> Option<BlockHash> {
     }
 }
 
-fn collect_finalized_receipts(
-    waves: &[Arc<hyperscale_types::FinalizedWave>],
-) -> Vec<Arc<LocalReceipt>> {
-    waves
-        .iter()
-        .flat_map(|fw| fw.receipts.iter())
-        .map(|b| Arc::clone(&b.local_receipt))
-        .collect()
-}
-
-/// Handle a delegated action using the shared pure functions.
+/// Route a delegated action to the coordinator crate that owns it.
 ///
 /// Outcomes flow through `ctx.notify` (state-machine inputs) and
 /// `ctx.commit_prepared` (prepared blocks for the `io_loop`'s chain).
@@ -103,298 +90,23 @@ pub fn handle_delegated_action<S: Storage, E: Engine>(
     action: Action,
     ctx: &ActionContext<'_, S, E>,
 ) {
+    match &action {
+        Action::VerifyAndBuildQuorumCertificate { .. }
+        | Action::VerifyQcSignature { .. }
+        | Action::VerifyRemoteHeaderQc { .. }
+        | Action::VerifyTransactionRoot { .. }
+        | Action::VerifyProvisionTxRoots { .. }
+        | Action::VerifyProvisionRoot { .. }
+        | Action::VerifyCertificateRoot { .. }
+        | Action::VerifyLocalReceiptRoot { .. }
+        | Action::VerifyStateRoot { .. }
+        | Action::BuildProposal { .. } => {
+            return hyperscale_bft::action_handlers::handle_action(action, ctx);
+        }
+        _ => {}
+    }
+
     match action {
-        // --- BFT crypto verification ---
-        Action::VerifyAndBuildQuorumCertificate {
-            block_hash,
-            shard_group_id,
-            height,
-            round,
-            parent_block_hash,
-            votes_to_verify,
-            verified_votes,
-            total_voting_power,
-        } => {
-            let start = std::time::Instant::now();
-            let result = hyperscale_bft::action_handlers::verify_and_build_qc(
-                block_hash,
-                shard_group_id,
-                height,
-                round,
-                parent_block_hash,
-                votes_to_verify,
-                verified_votes,
-                total_voting_power,
-            );
-            metrics::record_signature_verification_latency("vote", start.elapsed().as_secs_f64());
-            (ctx.notify)(NodeInput::Protocol(
-                ProtocolEvent::QuorumCertificateResult {
-                    block_hash: result.block_hash,
-                    qc: result.qc,
-                    verified_votes: result.verified_votes,
-                },
-            ));
-        }
-
-        Action::VerifyQcSignature {
-            qc,
-            public_keys,
-            block_hash,
-        } => {
-            let start = std::time::Instant::now();
-            let valid = hyperscale_bft::action_handlers::verify_qc_signature(&qc, &public_keys);
-            metrics::record_signature_verification_latency("qc", start.elapsed().as_secs_f64());
-            (ctx.notify)(NodeInput::Protocol(ProtocolEvent::QcSignatureVerified {
-                block_hash,
-                valid,
-            }));
-        }
-
-        Action::VerifyRemoteHeaderQc {
-            header,
-            committee_public_keys,
-            committee_voting_power,
-            quorum_threshold,
-            shard,
-            height,
-        } => {
-            let start = std::time::Instant::now();
-            let qc_valid = hyperscale_bft::action_handlers::verify_qc_signature(
-                &header.qc,
-                &committee_public_keys,
-            );
-            let valid = if qc_valid {
-                let total_power: u64 = header
-                    .qc
-                    .signers
-                    .set_indices()
-                    .filter_map(|idx| committee_voting_power.get(idx).copied())
-                    .sum();
-                total_power >= quorum_threshold && header.qc.block_hash == header.header.hash()
-            } else {
-                false
-            };
-            metrics::record_signature_verification_latency(
-                "remote_header_qc",
-                start.elapsed().as_secs_f64(),
-            );
-            (ctx.notify)(NodeInput::Protocol(ProtocolEvent::RemoteHeaderQcVerified {
-                shard,
-                height,
-                header,
-                valid,
-            }));
-        }
-
-        Action::VerifyTransactionRoot {
-            block_hash,
-            expected_root,
-            transactions,
-            validity_anchor,
-        } => {
-            let start = std::time::Instant::now();
-            let valid = hyperscale_bft::action_handlers::verify_transaction_root(
-                expected_root,
-                &transactions,
-                validity_anchor,
-            );
-            metrics::record_signature_verification_latency(
-                "transaction_root",
-                start.elapsed().as_secs_f64(),
-            );
-            (ctx.notify)(NodeInput::Protocol(ProtocolEvent::BlockRootVerified {
-                kind: hyperscale_core::VerificationKind::TransactionRoot,
-                block_hash,
-                valid,
-            }));
-        }
-
-        Action::VerifyProvisionTxRoots {
-            block_hash,
-            expected,
-            transactions,
-            topology,
-        } => {
-            let start = std::time::Instant::now();
-            let valid = hyperscale_bft::action_handlers::verify_provision_tx_roots(
-                &expected,
-                &transactions,
-                &topology,
-            );
-            metrics::record_signature_verification_latency(
-                "provision_tx_roots",
-                start.elapsed().as_secs_f64(),
-            );
-            (ctx.notify)(NodeInput::Protocol(ProtocolEvent::BlockRootVerified {
-                kind: hyperscale_core::VerificationKind::ProvisionTxRoots,
-                block_hash,
-                valid,
-            }));
-        }
-
-        Action::VerifyProvisionRoot {
-            block_hash,
-            expected_root,
-            batch_hashes,
-        } => {
-            let start = std::time::Instant::now();
-            let raw_batch_hashes: Vec<hyperscale_types::Hash> =
-                batch_hashes.iter().map(|h| h.into_raw()).collect();
-            let valid = hyperscale_bft::action_handlers::verify_provision_root(
-                expected_root,
-                &raw_batch_hashes,
-            );
-            metrics::record_signature_verification_latency(
-                "provision_root",
-                start.elapsed().as_secs_f64(),
-            );
-            (ctx.notify)(NodeInput::Protocol(ProtocolEvent::BlockRootVerified {
-                kind: hyperscale_core::VerificationKind::ProvisionRoot,
-                block_hash,
-                valid,
-            }));
-        }
-
-        Action::VerifyCertificateRoot {
-            block_hash,
-            expected_root,
-            certificates,
-        } => {
-            let start = std::time::Instant::now();
-            let valid = hyperscale_bft::action_handlers::verify_certificate_root(
-                expected_root,
-                &certificates,
-            );
-            metrics::record_signature_verification_latency(
-                "certificate_root",
-                start.elapsed().as_secs_f64(),
-            );
-            (ctx.notify)(NodeInput::Protocol(ProtocolEvent::BlockRootVerified {
-                kind: hyperscale_core::VerificationKind::CertificateRoot,
-                block_hash,
-                valid,
-            }));
-        }
-
-        Action::VerifyLocalReceiptRoot {
-            block_hash,
-            expected_root,
-            receipts,
-        } => {
-            let start = std::time::Instant::now();
-            let valid = hyperscale_bft::action_handlers::verify_local_receipt_root(
-                expected_root,
-                &receipts,
-            );
-            metrics::record_signature_verification_latency(
-                "local_receipt_root",
-                start.elapsed().as_secs_f64(),
-            );
-            (ctx.notify)(NodeInput::Protocol(ProtocolEvent::BlockRootVerified {
-                kind: hyperscale_core::VerificationKind::LocalReceiptRoot,
-                block_hash,
-                valid,
-            }));
-        }
-
-        // --- BFT state root and proposal ---
-        Action::VerifyStateRoot {
-            block_hash,
-            // Anchor already applied via ctx.view (see parent_hash_for).
-            parent_block_hash: _,
-            parent_state_root,
-            parent_block_height,
-            expected_root,
-            finalized_waves,
-            block_height,
-        } => {
-            let start = std::time::Instant::now();
-            let pending_snapshots = ctx.view.pending_snapshots().to_vec();
-            let result = hyperscale_bft::action_handlers::verify_state_root(
-                &*ctx.view,
-                parent_state_root,
-                parent_block_height,
-                expected_root,
-                &finalized_waves,
-                block_height,
-                &pending_snapshots,
-            );
-            metrics::record_signature_verification_latency(
-                "state_root",
-                start.elapsed().as_secs_f64(),
-            );
-            if let Some(prepared) = result.prepared_commit {
-                (ctx.commit_prepared)(PreparedBlock {
-                    block_hash,
-                    block_height,
-                    prepared,
-                    receipts: collect_finalized_receipts(&finalized_waves),
-                });
-            }
-            (ctx.notify)(NodeInput::Protocol(ProtocolEvent::BlockRootVerified {
-                kind: hyperscale_core::VerificationKind::StateRoot,
-                block_hash,
-                valid: result.valid,
-            }));
-        }
-
-        Action::BuildProposal {
-            shard_group_id,
-            proposer,
-            height,
-            round,
-            parent_hash,
-            parent_qc,
-            timestamp,
-            is_fallback,
-            parent_state_root,
-            parent_block_height,
-            transactions,
-            finalized_waves,
-            provisions,
-            parent_in_flight,
-            finalized_tx_count,
-        } => {
-            let pending_snapshots = ctx.view.pending_snapshots().to_vec();
-            let result = hyperscale_bft::action_handlers::build_proposal(
-                &*ctx.view,
-                proposer,
-                height,
-                round,
-                parent_hash,
-                parent_qc,
-                timestamp,
-                is_fallback,
-                parent_state_root,
-                parent_block_height,
-                transactions,
-                finalized_waves.clone(),
-                shard_group_id,
-                ctx.topology,
-                provisions.clone(),
-                parent_in_flight,
-                finalized_tx_count,
-                &pending_snapshots,
-            );
-            let block_hash = result.block_hash;
-            if let Some(prepared) = result.prepared_commit {
-                (ctx.commit_prepared)(PreparedBlock {
-                    block_hash,
-                    block_height: height,
-                    prepared,
-                    receipts: collect_finalized_receipts(&finalized_waves),
-                });
-            }
-            (ctx.notify)(NodeInput::Protocol(ProtocolEvent::ProposalBuilt {
-                height,
-                round,
-                block: Arc::new(result.block),
-                block_hash,
-                finalized_waves,
-                provisions,
-            }));
-        }
-
         // --- Execution Vote Aggregation and Verification ---
         Action::AggregateExecutionCertificate {
             wave_id,
