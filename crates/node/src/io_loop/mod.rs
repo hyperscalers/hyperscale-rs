@@ -27,10 +27,12 @@ mod metrics;
 mod network_handlers;
 mod phase_times;
 pub mod protocol;
+mod status;
 mod step;
 mod verify;
 
 pub use metrics::{MetricsSnapshot, record_metrics};
+pub use status::NodeStatusSnapshot;
 
 use crate::NodeStateMachine;
 use crate::batch_accumulator::BatchAccumulator;
@@ -38,7 +40,6 @@ use crate::config::NodeConfig;
 use crate::io_loop::block_commit::BlockCommitCoordinator;
 use crate::io_loop::caches::SharedCaches;
 use crate::io_loop::protocol::host::ProtocolHost;
-use crate::io_loop::protocol::sync::SyncStatus;
 use crate::io_loop::step::CommittedHeaderVerificationItem;
 use arc_swap::ArcSwap;
 use hyperscale_core::{Action, NodeInput, ProtocolEvent, StateMachine, TimerId};
@@ -46,12 +47,9 @@ use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::{Engine, RadixExecutor, TransactionValidation};
 use hyperscale_network::Network;
 use hyperscale_storage::Storage;
-use hyperscale_types::{
-    BlockHeight, Bls12381G1PrivateKey, ShardGroupId, StateRoot, TopologySnapshot, TxHash,
-    ValidatorId,
-};
+use hyperscale_types::{Bls12381G1PrivateKey, ShardGroupId, TopologySnapshot, TxHash, ValidatorId};
 use quick_cache::sync::Cache as QuickCache;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -98,34 +96,6 @@ pub struct StepOutput {
     pub actions_generated: usize,
     /// Timer operations (set/cancel) to be processed by the runner.
     pub timer_ops: Vec<TimerOp>,
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-// NodeStatusSnapshot — periodic status for external APIs
-// ═══════════════════════════════════════════════════════════════════════
-
-/// Snapshot of node state for external status APIs.
-///
-/// Produced by [`IoLoop::status_snapshot()`] on the periodic metrics tick.
-/// The production runner maps this into its RPC shared state types.
-#[derive(Debug, Clone)]
-#[allow(missing_docs)] // flat readouts; field names are the documentation
-pub struct NodeStatusSnapshot {
-    pub committed_height: BlockHeight,
-    pub view: u64,
-    pub state_root: StateRoot,
-    pub sync: SyncStatus,
-    pub mempool_pending: usize,
-    /// Block committed, holding state locks until the wave certificate
-    /// commits in a later block.
-    pub mempool_in_flight: usize,
-    pub mempool_total: usize,
-    pub accepting_rpc_transactions: bool,
-    pub at_pending_limit: bool,
-    /// Per-remote-shard in-flight counts from latest verified headers.
-    pub remote_shard_in_flight: HashMap<ShardGroupId, u32>,
-    /// Threshold for rejecting transactions due to remote shard congestion (80% of `max_in_flight`).
-    pub remote_congestion_threshold: u32,
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -508,42 +478,6 @@ where
         .into_iter()
         .flatten()
         .min()
-    }
-
-    /// Capture a snapshot of node state for external status APIs.
-    #[must_use]
-    pub fn status_snapshot(&self) -> NodeStatusSnapshot {
-        let state_root = self.state.last_committed_jmt_root();
-        let mempool = self.state.mempool();
-        let contention = mempool.lock_contention_stats();
-
-        // u64-counter → usize and 80% threshold → u32 are status-readout casts
-        // bounded by configured pool sizes; saturating coercions are fine.
-        #[allow(
-            clippy::cast_possible_truncation,
-            clippy::cast_precision_loss,
-            clippy::cast_sign_loss
-        )]
-        let remote_congestion_threshold = (mempool.config().max_in_flight as f64 * 0.8) as u32;
-        #[allow(clippy::cast_possible_truncation)]
-        let (pending, in_flight) = (
-            contention.pending_count as usize,
-            contention.in_flight_count as usize,
-        );
-
-        NodeStatusSnapshot {
-            committed_height: self.state.bft().committed_height(),
-            view: self.state.bft().view().0,
-            state_root,
-            sync: self.protocols.sync.status(),
-            mempool_pending: pending,
-            mempool_in_flight: in_flight,
-            mempool_total: mempool.len(),
-            accepting_rpc_transactions: !mempool.at_in_flight_limit(),
-            at_pending_limit: mempool.at_pending_limit(),
-            remote_shard_in_flight: self.state.remote_headers().remote_shard_in_flight(),
-            remote_congestion_threshold,
-        }
     }
 
     /// Flush ALL pending batches immediately, regardless of deadlines.
