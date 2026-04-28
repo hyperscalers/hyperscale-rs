@@ -15,8 +15,6 @@ impl NodeStateMachine {
             ProtocolEvent::SyncBlockReadyToApply { certified } => self
                 .bft
                 .on_sync_block_ready_to_apply(self.topology.snapshot(), certified),
-            // Verification completion is handled by IoLoop directly.
-            ProtocolEvent::SyncEcVerificationComplete { .. } => vec![],
             // SyncProtocol finished fetching — tell BFT to exit sync mode so
             // it can re-enter sync if still behind, or resume normal consensus.
             ProtocolEvent::SyncProtocolComplete { .. } => {

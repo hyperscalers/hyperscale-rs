@@ -28,7 +28,7 @@ impl NodeStateMachine {
             ProtocolEvent::QuorumCertificateFormed { block_hash, qc } => {
                 self.on_qc_formed(block_hash, &qc)
             }
-            ProtocolEvent::RemoteBlockCommitted {
+            ProtocolEvent::RemoteHeaderReceived {
                 committed_header,
                 sender,
             } => {
@@ -38,7 +38,7 @@ impl NodeStateMachine {
                 let header = Arc::new(committed_header);
                 let topology = self.topology.snapshot();
                 self.remote_headers
-                    .on_remote_block_committed(topology, header, sender)
+                    .on_remote_header_received(topology, header, sender)
             }
             ProtocolEvent::BlockVoteReceived { vote } => {
                 self.bft.on_block_vote(self.topology.snapshot(), vote)
@@ -247,9 +247,9 @@ impl NodeStateMachine {
 
         actions.extend(self.apply_block_to_execution(certified));
 
-        // Block committed changes in-flight counts — trigger proposal
-        // attempt so the next proposer can include newly ready transactions.
-        actions.push(Action::Continuation(ProtocolEvent::ContentAvailable));
+        // In-flight counts changed — latch a proposal attempt so the next
+        // proposer can include newly ready transactions.
+        self.bft.queue_ready_proposal();
 
         actions
     }

@@ -447,7 +447,7 @@ impl FetchBinding for HeaderBinding {
                     });
                     return ResponseVerdict::Reject;
                 };
-                let _ = es.send(NodeInput::Protocol(ProtocolEvent::RemoteBlockCommitted {
+                let _ = es.send(NodeInput::Protocol(ProtocolEvent::RemoteHeaderReceived {
                     committed_header: header,
                     sender: ValidatorId(0),
                 }));

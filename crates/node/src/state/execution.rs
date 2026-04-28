@@ -2,8 +2,8 @@
 //!
 //! Covers wave-based voting (votes received, aggregated, certificate
 //! verified) and the engine results path (`ExecutionBatchCompleted`).
-//! `WaveCompleted` re-triggers proposal building; `ExecutionCertificateAdmitted`
-//! is a pure admission signal drained by `IoLoop`.
+//! `ExecutionCertificateAdmitted` is a pure admission signal drained by
+//! `IoLoop`.
 //!
 //! Cross-shard EC verification has a quirk: if a remote target's EC names
 //! the local shard among `wave_id.remote_shards`, that EC's `tx_outcomes`
@@ -83,10 +83,6 @@ impl NodeStateMachine {
                 // Remote EC abort propagation may unlock local accumulators — re-scan.
                 actions.extend(self.execution.emit_vote_actions(self.topology.snapshot()));
                 actions
-            }
-            ProtocolEvent::WaveCompleted { .. } => {
-                // New finalized wave available — signal for event-driven proposal.
-                vec![Action::Continuation(ProtocolEvent::ContentAvailable)]
             }
             // Pure admission signal — `io_loop`'s `Continuation` interception
             // arm drains the exec-cert fetch protocol; nothing for the state

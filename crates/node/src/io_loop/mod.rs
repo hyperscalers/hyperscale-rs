@@ -682,7 +682,7 @@ where
                 committed_header,
                 sender,
             } => {
-                self.feed_event(ProtocolEvent::RemoteBlockCommitted {
+                self.feed_event(ProtocolEvent::RemoteHeaderReceived {
                     committed_header,
                     sender,
                 });

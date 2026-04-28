@@ -884,7 +884,8 @@ impl ExecutionCoordinator {
             "Delegating BLS aggregation to crypto pool"
         );
 
-        // Notify mempool that the local EC was created for these txs.
+        // Stamp phase times for txs covered by the new local EC. Pure
+        // telemetry — IoLoop's slow-tx finalization log reads it.
         let ec_tx_hashes = self
             .waves
             .get_wave(&wave_id)
@@ -893,17 +894,18 @@ impl ExecutionCoordinator {
 
         // tx_outcomes are extracted from votes by the aggregation handler
         // (all quorum votes carry identical outcomes).
-        vec![
-            Action::AggregateExecutionCertificate {
-                wave_id,
-                global_receipt_root,
-                votes,
-                committee,
-            },
-            Action::Continuation(ProtocolEvent::ExecutionCertificateCreated {
+        let mut actions = vec![Action::AggregateExecutionCertificate {
+            wave_id,
+            global_receipt_root,
+            votes,
+            committee,
+        }];
+        if !ec_tx_hashes.is_empty() {
+            actions.push(Action::RecordTxEcCreated {
                 tx_hashes: ec_tx_hashes,
-            }),
-        ]
+            });
+        }
+        actions
     }
 
     /// Handle execution certificate aggregation completed.
@@ -1549,18 +1551,12 @@ impl ExecutionCoordinator {
 
         // Single admission event covers both the BFT subscriber and the
         // io_loop serving cache (via the Continuation interception arm).
-        let mut actions = vec![Action::Continuation(
+        // The state machine latches a proposal-retry on this event.
+        vec![Action::Continuation(
             ProtocolEvent::FinalizedWavesAdmitted {
                 waves: vec![finalized_arc],
             },
-        )];
-
-        actions.push(Action::Continuation(ProtocolEvent::WaveCompleted {
-            wave_cert: cert_arc,
-            tx_hashes: wave.tx_hashes().to_vec(),
-        }));
-
-        actions
+        )]
     }
 
     /// Admission entry point for fetch-delivered (or otherwise externally
@@ -2483,22 +2479,17 @@ mod tests {
     }
 
     #[test]
-    fn test_finalize_wave_emits_admission_and_completion_events() {
+    fn test_finalize_wave_emits_admission_event() {
         let mut state = make_test_state();
         let (wave_id, wave) = make_ready_single_shard_wave(&[1, 2]);
         state.waves.insert_wave(wave_id.clone(), wave);
 
         let actions = state.finalize_wave(&wave_id);
 
-        // 1 FinalizedWavesAdmitted + 1 WaveCompleted = 2.
-        assert_eq!(actions.len(), 2);
+        assert_eq!(actions.len(), 1);
         assert!(matches!(
             actions[0],
             Action::Continuation(ProtocolEvent::FinalizedWavesAdmitted { .. })
-        ));
-        assert!(matches!(
-            actions[1],
-            Action::Continuation(ProtocolEvent::WaveCompleted { .. })
         ));
     }
 

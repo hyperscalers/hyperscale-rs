@@ -1,8 +1,8 @@
 //! Block-proposal helpers used by the BFT-driven dispatch arms.
 //!
-//! Both `ContentAvailable` and the QC-formed path build proposals from the
-//! same triple — ready txs from mempool, finalized waves from execution,
-//! queued provisions — so the gather logic lives once here.
+//! Both the post-dispatch proposal-retry hook and the QC-formed path build
+//! proposals from the same triple — ready txs from mempool, finalized waves
+//! from execution, queued provisions — so the gather logic lives once here.
 
 use super::NodeStateMachine;
 use hyperscale_core::Action;
@@ -42,7 +42,8 @@ impl NodeStateMachine {
         }
     }
 
-    /// Shared proposal logic for `ContentAvailable` and QC-formed paths.
+    /// Shared proposal logic for the post-dispatch retry hook and the
+    /// QC-formed path.
     pub(super) fn try_event_driven_proposal(&mut self) -> Vec<Action> {
         let (pending_txs, pending_certs) = self.bft.pending_block_counts();
         let inputs = self.gather_proposal_inputs(pending_txs, pending_certs);

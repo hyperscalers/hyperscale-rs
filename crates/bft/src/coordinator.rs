@@ -543,8 +543,8 @@ impl BftCoordinator {
         );
 
         // Set initial timers and trigger first proposal attempt
+        self.queue_ready_proposal();
         vec![
-            Action::Continuation(ProtocolEvent::ContentAvailable),
             Action::SetTimer {
                 id: TimerId::ViewChange,
                 duration: self.current_view_change_timeout(),
@@ -619,8 +619,8 @@ impl BftCoordinator {
         // from fetch protocols on the next tick via the `is_abandoned` predicate.
 
         // Set timers to resume consensus and trigger first proposal attempt
+        self.queue_ready_proposal();
         vec![
-            Action::Continuation(ProtocolEvent::ContentAvailable),
             Action::SetTimer {
                 id: TimerId::ViewChange,
                 duration: self.current_view_change_timeout(),
@@ -639,7 +639,7 @@ impl BftCoordinator {
     /// Try to build and broadcast a new block proposal.
     ///
     /// This is the unified proposal entry point, called from:
-    /// - `ContentAvailable` events (new transactions, waves, or provisions)
+    /// - new-content events (transactions, waves, or provisions)
     /// - `on_qc_formed` (eager next-block proposal)
     ///
     /// Returns empty if preconditions aren't met (not proposer, build in-flight,
@@ -754,7 +754,7 @@ impl BftCoordinator {
 
         // Suppress re-entry while a prior dispatch for the same target is
         // parked on the verification pipeline waiting for the parent JMT
-        // tree. Without this, every `ContentAvailable` / `on_qc_formed` hit
+        // tree. Without this, every proposal-retry / `on_qc_formed` hit
         // re-runs `assemble_build_action` and re-registers the defer,
         // burning CPU and log bandwidth while peers time out on the
         // proposer slot.
@@ -955,7 +955,7 @@ impl BftCoordinator {
             "Received block header"
         );
 
-        let mut sync_actions = self.absorb_parent_qc_from_header(topology, header);
+        let sync_actions = self.absorb_parent_qc_from_header(topology, header);
         self.sync_view_to_header_round(topology, header);
 
         if self.reject_invalid_header(topology, header) {
@@ -976,7 +976,7 @@ impl BftCoordinator {
             lookup_finalized_wave,
             lookup_provision,
         );
-        self.adopt_deferred_qc_if_matches(topology, block_hash, &mut sync_actions);
+        self.adopt_deferred_qc_if_matches(topology, block_hash);
         self.link_buffered_votes_to_header(block_hash, header);
 
         let mut actions = self.votes.maybe_trigger_verification(topology, block_hash);
@@ -1061,7 +1061,7 @@ impl BftCoordinator {
                 &header.parent_qc,
                 CommitSource::Header,
             ));
-            actions.push(Action::Continuation(ProtocolEvent::ContentAvailable));
+            self.queue_ready_proposal();
         }
 
         actions
@@ -1137,15 +1137,10 @@ impl BftCoordinator {
     }
 
     /// If we have a `deferred_qc` whose `block_hash` matches `block_hash`
-    /// (votes arrived before this header), adopt it now. Appends a
-    /// `ContentAvailable` continuation on adoption so the proposal path
-    /// re-enters. If the deferred QC is for a different block, it's put back.
-    fn adopt_deferred_qc_if_matches(
-        &mut self,
-        topology: &TopologySnapshot,
-        block_hash: BlockHash,
-        actions: &mut Vec<Action>,
-    ) {
+    /// (votes arrived before this header), adopt it now. Latches a
+    /// proposal-retry on adoption. If the deferred QC is for a different
+    /// block, it's put back.
+    fn adopt_deferred_qc_if_matches(&mut self, topology: &TopologySnapshot, block_hash: BlockHash) {
         let Some((deferred_hash, deferred_qc)) = self.deferred_qc.take() else {
             return;
         };
@@ -1162,7 +1157,7 @@ impl BftCoordinator {
         if should_adopt {
             self.latest_qc = Some(deferred_qc.clone());
             self.maybe_unlock_for_qc(topology, &deferred_qc);
-            actions.push(Action::Continuation(ProtocolEvent::ContentAvailable));
+            self.queue_ready_proposal();
         }
     }
 
@@ -2978,11 +2973,16 @@ impl BftCoordinator {
             .drain_ready_state_root_verifications(&chain)
     }
 
-    /// Check whether a deferred proposal was unblocked and should be retried.
-    ///
-    /// Returns `true` once when the parent tree becomes available. The caller
-    /// emits `ContentAvailable` to re-enter `try_propose` with fresh tx
-    /// selection — avoiding stale transactions from the original deferral.
+    /// Latch a proposal-retry attempt for after the current dispatch.
+    /// Coalesces with any other emitter in the same dispatch; the
+    /// post-dispatch drain runs `try_propose` once.
+    pub const fn queue_ready_proposal(&mut self) {
+        self.verification.queue_ready_proposal();
+    }
+
+    /// Drain the proposal-retry latch. Returns `true` once if any emitter
+    /// queued a retry during the current dispatch (or BFT's internal
+    /// verification path unblocked a deferred proposal).
     pub fn take_ready_proposal(&mut self) -> bool {
         let ready = self.verification.take_ready_proposal();
         if ready {

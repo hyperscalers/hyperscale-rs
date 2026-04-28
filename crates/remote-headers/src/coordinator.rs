@@ -152,7 +152,7 @@ impl RemoteHeaderCoordinator {
     /// The sender's BLS signature was already verified by `IoLoop`.
     /// Performs structural pre-checks, stores as pending, and dispatches
     /// `VerifyRemoteHeaderQc` for async QC verification.
-    pub fn on_remote_block_committed(
+    pub fn on_remote_header_received(
         &mut self,
         topology: &TopologySnapshot,
         committed_header: Arc<CommittedBlockHeader>,
@@ -643,7 +643,7 @@ mod tests {
         let committed = CommittedBlockHeader::new(header, qc);
         let _coord = RemoteHeaderCoordinator::new();
 
-        // The structural check happens inside on_remote_block_committed which
+        // The structural check happens inside on_remote_header_received which
         // needs a topology. We test the logic directly here by checking the
         // condition that would cause rejection.
         assert_ne!(committed.qc.block_hash, committed.header.hash());

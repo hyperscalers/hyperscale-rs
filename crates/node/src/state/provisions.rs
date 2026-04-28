@@ -26,10 +26,10 @@ impl NodeStateMachine {
                 self.now,
             ),
             ProtocolEvent::ProvisionsAdmitted { provisions, .. } => {
-                let mut actions = self
+                let actions = self
                     .bft
                     .on_provisions_admitted(self.topology.snapshot(), &[provisions]);
-                actions.push(Action::Continuation(ProtocolEvent::ContentAvailable));
+                self.bft.queue_ready_proposal();
                 actions
             }
             ProtocolEvent::OutboundProvisionBroadcast {

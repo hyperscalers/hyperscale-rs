@@ -191,12 +191,11 @@ impl StateMachine for NodeStateMachine {
             // ── Timers ───────────────────────────────────────────────────
             ProtocolEvent::CleanupTimer => self.on_cleanup_timer(),
             ProtocolEvent::ViewChangeTimer => self.on_view_change_timer(),
-            ProtocolEvent::ContentAvailable => self.try_event_driven_proposal(),
 
             // ── BFT Consensus ────────────────────────────────────────────
             evt @ (ProtocolEvent::BlockHeaderReceived { .. }
             | ProtocolEvent::QuorumCertificateFormed { .. }
-            | ProtocolEvent::RemoteBlockCommitted { .. }
+            | ProtocolEvent::RemoteHeaderReceived { .. }
             | ProtocolEvent::BlockVoteReceived { .. }
             | ProtocolEvent::BlockReadyToCommit { .. }
             | ProtocolEvent::QuorumCertificateResult { .. }
@@ -222,17 +221,14 @@ impl StateMachine for NodeStateMachine {
             | ProtocolEvent::ExecutionVotesVerifiedAndAggregated { .. }
             | ProtocolEvent::ExecutionCertificateAggregated { .. }
             | ProtocolEvent::ExecutionCertificateSignatureVerified { .. }
-            | ProtocolEvent::WaveCompleted { .. }
             | ProtocolEvent::ExecutionCertificateAdmitted { .. }) => self.handle_execution(evt),
 
             // ── Transactions ─────────────────────────────────────────────
-            evt @ (ProtocolEvent::ExecutionCertificateCreated { .. }
-            | ProtocolEvent::TransactionGossipReceived { .. }
+            evt @ (ProtocolEvent::TransactionGossipReceived { .. }
             | ProtocolEvent::TransactionsAdmitted { .. }) => self.handle_transaction(evt),
 
             // ── Sync ─────────────────────────────────────────────────────
             evt @ (ProtocolEvent::SyncBlockReadyToApply { .. }
-            | ProtocolEvent::SyncEcVerificationComplete { .. }
             | ProtocolEvent::SyncProtocolComplete { .. }
             | ProtocolEvent::SyncResumed
             | ProtocolEvent::ChainMetadataFetched { .. }) => self.handle_sync(evt),
@@ -272,11 +268,12 @@ impl StateMachine for NodeStateMachine {
             });
         }
 
-        // Re-enter try_propose if a deferred proposal was unblocked.
-        // ContentAvailable triggers fresh tx selection against current state,
-        // avoiding stale transactions from the original deferral.
+        // If any emitter latched a proposal-retry during this dispatch (or
+        // BFT's verification path unblocked a deferred proposal), re-enter
+        // `try_propose` once with fresh transaction selection — avoids
+        // stale txs from the original deferral.
         if self.bft.take_ready_proposal() {
-            actions.push(Action::Continuation(ProtocolEvent::ContentAvailable));
+            actions.extend(self.try_event_driven_proposal());
         }
 
         actions

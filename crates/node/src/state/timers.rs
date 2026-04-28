@@ -1,9 +1,9 @@
 //! Timer-driven dispatch arms.
 //!
-//! Three `ProtocolEvent` variants drive the periodic and event-driven timers:
-//! `CleanupTimer` (mempool / BFT housekeeping), `ViewChangeTimer` (leader
-//! liveness), and `ContentAvailable` (re-trigger proposal building once new
-//! content lands).
+//! Two `ProtocolEvent` variants drive the periodic timers: `CleanupTimer`
+//! (mempool / BFT housekeeping) and `ViewChangeTimer` (leader liveness).
+//! Proposal-retry-on-new-content uses the post-dispatch latch on BFT, not
+//! a timer.
 
 use super::NodeStateMachine;
 use hyperscale_core::{Action, TimerId};

@@ -5,7 +5,7 @@
 //! `BuildProposal` action, the runner executes it on a worker thread, and
 //! the result comes back as a `ProposalBuilt` event. Between those two
 //! moments, another `try_propose` could fire (e.g. a repeated
-//! `ContentAvailable`) or the round could advance. [`ProposalTracker`]
+//! proposal-retry latch) or the round could advance. [`ProposalTracker`]
 //! holds the `(height, round)` of the in-flight build so the
 //! `ProposalBuilt` handler can detect stale callbacks and the `try_propose`
 //! path can back off while a build is already pending.
@@ -61,7 +61,7 @@ pub struct ProposalTracker {
     pending: Option<PendingProposal>,
     /// Slot for a proposal that `dispatch_or_defer` could not dispatch
     /// because the parent JMT tree wasn't available yet. Consulted from
-    /// `can_propose` so repeated `ContentAvailable` / QC-formed events for
+    /// `can_propose` so repeated proposal-retry / QC-formed events for
     /// the same `(height, round)` don't spin through `assemble_build_action`
     /// while we're blocked waiting on `VerificationPipeline` to unblock.
     deferred: Option<PendingProposal>,
@@ -381,7 +381,7 @@ pub fn assemble_build_action(
 /// child block's `VerifyStateRoot` hits `ParentVersionMissing`.
 ///
 /// When deferred, the verification pipeline unblocks and re-enters
-/// `try_propose` via `ContentAvailable` when the parent tree lands.
+/// `try_propose` via the proposal-retry latch when the parent tree lands.
 pub fn dispatch_or_defer(
     tracker: &mut ProposalTracker,
     verification: &mut VerificationPipeline,
