@@ -8,7 +8,8 @@ use crate::protocol::fetch::FetchInput;
 use crate::protocol::fetch_instances;
 use crate::protocol::sync::SyncInput;
 use hyperscale_core::{
-    Action, ActionContext, CommitSource, FetchRequest, NodeInput, ProtocolEvent, StateMachine,
+    Action, ActionContext, CommitSource, FetchRequest, NodeInput, PreparedBlock, ProtocolEvent,
+    StateMachine,
 };
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::Engine;
@@ -678,10 +679,6 @@ where
     /// With `SyncDispatch` (simulation), `spawn_*` runs inline so events
     /// enter the channel immediately and are drained by the harness.
     fn dispatch_delegated_action(&self, action: Action) {
-        let is_execution = matches!(
-            action,
-            Action::ExecuteTransactions { .. } | Action::ExecuteCrossShardTransactions { .. }
-        );
         let pool = action_handler::dispatch_pool_for(&action)
             .expect("dispatch_delegated_action called for delegated actions only");
 
@@ -712,45 +709,41 @@ where
         let event_tx = self.event_sender.clone();
 
         let spawn_fn = move || {
-            let start = std::time::Instant::now();
+            let notify = move |event: NodeInput| {
+                let _ = event_tx.send(event);
+            };
+            let commit_prepared = move |prep: PreparedBlock<S::PreparedCommit>| {
+                let PreparedBlock {
+                    block_hash,
+                    block_height,
+                    prepared,
+                    receipts,
+                } = prep;
+                if let Some(parent_hash) = anchor_parent_hash {
+                    let jmt_snapshot = Arc::new(S::jmt_snapshot(&prepared).clone());
+                    pending_chain.insert(
+                        block_hash,
+                        hyperscale_storage::ChainEntry {
+                            parent_hash,
+                            height: block_height,
+                            receipts,
+                            jmt_snapshot,
+                        },
+                    );
+                }
+                prepared_commits
+                    .lock()
+                    .unwrap()
+                    .insert(block_hash, (block_height, prepared));
+            };
             let ctx = ActionContext {
                 executor: &executor,
                 topology: &topology_snapshot,
                 view,
+                notify: &notify,
+                commit_prepared: &commit_prepared,
             };
-            if let Some(result) = action_handler::handle_delegated_action(action, &ctx) {
-                if is_execution {
-                    let elapsed = start.elapsed().as_secs_f64();
-                    metrics::record_execution_latency(elapsed);
-                }
-                if let Some(prep) = result.prepared_commit {
-                    let action_handler::PreparedBlock {
-                        block_hash,
-                        block_height,
-                        prepared,
-                        receipts,
-                    } = prep;
-                    if let Some(parent_hash) = anchor_parent_hash {
-                        let jmt_snapshot = Arc::new(S::jmt_snapshot(&prepared).clone());
-                        pending_chain.insert(
-                            block_hash,
-                            hyperscale_storage::ChainEntry {
-                                parent_hash,
-                                height: block_height,
-                                receipts,
-                                jmt_snapshot,
-                            },
-                        );
-                    }
-                    prepared_commits
-                        .lock()
-                        .unwrap()
-                        .insert(block_hash, (block_height, prepared));
-                }
-                for event in result.events {
-                    let _ = event_tx.send(event);
-                }
-            }
+            action_handler::handle_delegated_action(action, &ctx);
         };
 
         match pool {

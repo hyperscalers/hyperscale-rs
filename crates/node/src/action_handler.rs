@@ -3,39 +3,18 @@
 //! [`handle_delegated_action`] bridges individual [`Action`] variants to pure
 //! computation (crypto verification, execution, proposal building). The node
 //! loop's `dispatch_delegated_action` spawns closures that call this function
-//! on the appropriate thread pool.
+//! on the appropriate thread pool. Outcomes flow back via `ctx.notify` and
+//! `ctx.commit_prepared`.
 //!
 //! Batched work (execution votes, execution certs) and block commits are
 //! handled inline by the I/O loop's flush closures.
 
-use hyperscale_core::{Action, ActionContext, NodeInput, ProtocolEvent};
+use hyperscale_core::{Action, ActionContext, NodeInput, PreparedBlock, ProtocolEvent};
 use hyperscale_engine::Engine;
 use hyperscale_metrics as metrics;
 use hyperscale_storage::Storage;
-use hyperscale_types::{BlockHash, BlockHeight, LocalExecutionEntry};
+use hyperscale_types::{BlockHash, LocalExecutionEntry, LocalReceipt};
 use std::sync::Arc;
-
-/// Result of handling a delegated action.
-pub struct DelegatedResult<P: Send> {
-    /// Events to deliver to the state machine.
-    pub events: Vec<NodeInput>,
-    /// Prepared commit + receipts to cache.
-    ///
-    /// Receipts travel alongside the prepared handle so the `io_loop` can
-    /// build a `ChainEntry` and insert into `PendingChain` in one step
-    /// — eliminating the prior separate `db_updates` plumbing that was
-    /// always produced together with `prepared_commit` anyway.
-    pub prepared_commit: Option<PreparedBlock<P>>,
-}
-
-/// A successful prepare result, ready to insert into `PendingChain` and
-/// `prepared_commits`.
-pub struct PreparedBlock<P: Send> {
-    pub block_hash: BlockHash,
-    pub block_height: BlockHeight,
-    pub prepared: P,
-    pub receipts: Vec<Arc<hyperscale_types::LocalReceipt>>,
-}
 
 /// Which dispatch pool an action should run on in production.
 pub enum DispatchPool {
@@ -104,20 +83,26 @@ pub const fn parent_hash_for(action: &Action) -> Option<BlockHash> {
     }
 }
 
+fn collect_finalized_receipts(
+    waves: &[Arc<hyperscale_types::FinalizedWave>],
+) -> Vec<Arc<LocalReceipt>> {
+    waves
+        .iter()
+        .flat_map(|fw| fw.receipts.iter())
+        .map(|b| Arc::clone(&b.local_receipt))
+        .collect()
+}
+
 /// Handle a delegated action using the shared pure functions.
 ///
-/// Returns `None` for non-delegated actions (timers, broadcasts, persist, etc.)
-/// that the runner must handle directly.
-///
-/// For execution actions (`ExecuteTransactions`), the
-/// returned events include `ProtocolEvent::ExecutionBatchCompleted`.
-/// The runner is responsible for additionally broadcasting votes to shard
-/// peers (network-specific).
-#[allow(clippy::too_many_lines)]
+/// Outcomes flow through `ctx.notify` (state-machine inputs) and
+/// `ctx.commit_prepared` (prepared blocks for the `io_loop`'s chain).
+/// No-ops for non-delegated actions; callers gate via [`dispatch_pool_for`].
+#[allow(clippy::too_many_lines)] // single dispatch over delegated Action variants
 pub fn handle_delegated_action<S: Storage, E: Engine>(
     action: Action,
     ctx: &ActionContext<'_, S, E>,
-) -> Option<DelegatedResult<S::PreparedCommit>> {
+) {
     match action {
         // --- BFT crypto verification ---
         Action::VerifyAndBuildQuorumCertificate {
@@ -142,16 +127,13 @@ pub fn handle_delegated_action<S: Storage, E: Engine>(
                 total_voting_power,
             );
             metrics::record_signature_verification_latency("vote", start.elapsed().as_secs_f64());
-            Some(DelegatedResult {
-                events: vec![NodeInput::Protocol(
-                    ProtocolEvent::QuorumCertificateResult {
-                        block_hash: result.block_hash,
-                        qc: result.qc,
-                        verified_votes: result.verified_votes,
-                    },
-                )],
-                prepared_commit: None,
-            })
+            (ctx.notify)(NodeInput::Protocol(
+                ProtocolEvent::QuorumCertificateResult {
+                    block_hash: result.block_hash,
+                    qc: result.qc,
+                    verified_votes: result.verified_votes,
+                },
+            ));
         }
 
         Action::VerifyQcSignature {
@@ -162,13 +144,10 @@ pub fn handle_delegated_action<S: Storage, E: Engine>(
             let start = std::time::Instant::now();
             let valid = hyperscale_bft::action_handlers::verify_qc_signature(&qc, &public_keys);
             metrics::record_signature_verification_latency("qc", start.elapsed().as_secs_f64());
-            Some(DelegatedResult {
-                events: vec![NodeInput::Protocol(ProtocolEvent::QcSignatureVerified {
-                    block_hash,
-                    valid,
-                })],
-                prepared_commit: None,
-            })
+            (ctx.notify)(NodeInput::Protocol(ProtocolEvent::QcSignatureVerified {
+                block_hash,
+                valid,
+            }));
         }
 
         Action::VerifyRemoteHeaderQc {
@@ -180,14 +159,10 @@ pub fn handle_delegated_action<S: Storage, E: Engine>(
             height,
         } => {
             let start = std::time::Instant::now();
-
-            // Verify QC signature (BLS pairing)
             let qc_valid = hyperscale_bft::action_handlers::verify_qc_signature(
                 &header.qc,
                 &committee_public_keys,
             );
-
-            // Verify voting power meets quorum and block_hash matches header
             let valid = if qc_valid {
                 let total_power: u64 = header
                     .qc
@@ -199,21 +174,16 @@ pub fn handle_delegated_action<S: Storage, E: Engine>(
             } else {
                 false
             };
-
             metrics::record_signature_verification_latency(
                 "remote_header_qc",
                 start.elapsed().as_secs_f64(),
             );
-
-            Some(DelegatedResult {
-                events: vec![NodeInput::Protocol(ProtocolEvent::RemoteHeaderQcVerified {
-                    shard,
-                    height,
-                    header,
-                    valid,
-                })],
-                prepared_commit: None,
-            })
+            (ctx.notify)(NodeInput::Protocol(ProtocolEvent::RemoteHeaderQcVerified {
+                shard,
+                height,
+                header,
+                valid,
+            }));
         }
 
         Action::VerifyTransactionRoot {
@@ -232,14 +202,11 @@ pub fn handle_delegated_action<S: Storage, E: Engine>(
                 "transaction_root",
                 start.elapsed().as_secs_f64(),
             );
-            Some(DelegatedResult {
-                events: vec![NodeInput::Protocol(ProtocolEvent::BlockRootVerified {
-                    kind: hyperscale_core::VerificationKind::TransactionRoot,
-                    block_hash,
-                    valid,
-                })],
-                prepared_commit: None,
-            })
+            (ctx.notify)(NodeInput::Protocol(ProtocolEvent::BlockRootVerified {
+                kind: hyperscale_core::VerificationKind::TransactionRoot,
+                block_hash,
+                valid,
+            }));
         }
 
         Action::VerifyProvisionTxRoots {
@@ -258,14 +225,11 @@ pub fn handle_delegated_action<S: Storage, E: Engine>(
                 "provision_tx_roots",
                 start.elapsed().as_secs_f64(),
             );
-            Some(DelegatedResult {
-                events: vec![NodeInput::Protocol(ProtocolEvent::BlockRootVerified {
-                    kind: hyperscale_core::VerificationKind::ProvisionTxRoots,
-                    block_hash,
-                    valid,
-                })],
-                prepared_commit: None,
-            })
+            (ctx.notify)(NodeInput::Protocol(ProtocolEvent::BlockRootVerified {
+                kind: hyperscale_core::VerificationKind::ProvisionTxRoots,
+                block_hash,
+                valid,
+            }));
         }
 
         Action::VerifyProvisionRoot {
@@ -284,14 +248,11 @@ pub fn handle_delegated_action<S: Storage, E: Engine>(
                 "provision_root",
                 start.elapsed().as_secs_f64(),
             );
-            Some(DelegatedResult {
-                events: vec![NodeInput::Protocol(ProtocolEvent::BlockRootVerified {
-                    kind: hyperscale_core::VerificationKind::ProvisionRoot,
-                    block_hash,
-                    valid,
-                })],
-                prepared_commit: None,
-            })
+            (ctx.notify)(NodeInput::Protocol(ProtocolEvent::BlockRootVerified {
+                kind: hyperscale_core::VerificationKind::ProvisionRoot,
+                block_hash,
+                valid,
+            }));
         }
 
         Action::VerifyCertificateRoot {
@@ -308,14 +269,11 @@ pub fn handle_delegated_action<S: Storage, E: Engine>(
                 "certificate_root",
                 start.elapsed().as_secs_f64(),
             );
-            Some(DelegatedResult {
-                events: vec![NodeInput::Protocol(ProtocolEvent::BlockRootVerified {
-                    kind: hyperscale_core::VerificationKind::CertificateRoot,
-                    block_hash,
-                    valid,
-                })],
-                prepared_commit: None,
-            })
+            (ctx.notify)(NodeInput::Protocol(ProtocolEvent::BlockRootVerified {
+                kind: hyperscale_core::VerificationKind::CertificateRoot,
+                block_hash,
+                valid,
+            }));
         }
 
         Action::VerifyLocalReceiptRoot {
@@ -332,14 +290,11 @@ pub fn handle_delegated_action<S: Storage, E: Engine>(
                 "local_receipt_root",
                 start.elapsed().as_secs_f64(),
             );
-            Some(DelegatedResult {
-                events: vec![NodeInput::Protocol(ProtocolEvent::BlockRootVerified {
-                    kind: hyperscale_core::VerificationKind::LocalReceiptRoot,
-                    block_hash,
-                    valid,
-                })],
-                prepared_commit: None,
-            })
+            (ctx.notify)(NodeInput::Protocol(ProtocolEvent::BlockRootVerified {
+                kind: hyperscale_core::VerificationKind::LocalReceiptRoot,
+                block_hash,
+                valid,
+            }));
         }
 
         // --- BFT state root and proposal ---
@@ -368,25 +323,19 @@ pub fn handle_delegated_action<S: Storage, E: Engine>(
                 "state_root",
                 start.elapsed().as_secs_f64(),
             );
-            let receipts: Vec<Arc<hyperscale_types::LocalReceipt>> = finalized_waves
-                .iter()
-                .flat_map(|fw| fw.receipts.iter())
-                .map(|b| Arc::clone(&b.local_receipt))
-                .collect();
-            let prepared_commit = result.prepared_commit.map(|p| PreparedBlock {
-                block_hash,
-                block_height,
-                prepared: p,
-                receipts,
-            });
-            Some(DelegatedResult {
-                events: vec![NodeInput::Protocol(ProtocolEvent::BlockRootVerified {
-                    kind: hyperscale_core::VerificationKind::StateRoot,
+            if let Some(prepared) = result.prepared_commit {
+                (ctx.commit_prepared)(PreparedBlock {
                     block_hash,
-                    valid: result.valid,
-                })],
-                prepared_commit,
-            })
+                    block_height,
+                    prepared,
+                    receipts: collect_finalized_receipts(&finalized_waves),
+                });
+            }
+            (ctx.notify)(NodeInput::Protocol(ProtocolEvent::BlockRootVerified {
+                kind: hyperscale_core::VerificationKind::StateRoot,
+                block_hash,
+                valid: result.valid,
+            }));
         }
 
         Action::BuildProposal {
@@ -406,9 +355,7 @@ pub fn handle_delegated_action<S: Storage, E: Engine>(
             parent_in_flight,
             finalized_tx_count,
         } => {
-            // Anchor (parent_hash) already applied via ctx.view.
             let pending_snapshots = ctx.view.pending_snapshots().to_vec();
-
             let result = hyperscale_bft::action_handlers::build_proposal(
                 &*ctx.view,
                 proposer,
@@ -429,29 +376,23 @@ pub fn handle_delegated_action<S: Storage, E: Engine>(
                 finalized_tx_count,
                 &pending_snapshots,
             );
-            let receipts: Vec<Arc<hyperscale_types::LocalReceipt>> = finalized_waves
-                .iter()
-                .flat_map(|fw| fw.receipts.iter())
-                .map(|b| Arc::clone(&b.local_receipt))
-                .collect();
             let block_hash = result.block_hash;
-            let prepared_commit = result.prepared_commit.map(|p| PreparedBlock {
-                block_hash,
-                block_height: height,
-                prepared: p,
-                receipts,
-            });
-            Some(DelegatedResult {
-                events: vec![NodeInput::Protocol(ProtocolEvent::ProposalBuilt {
-                    height,
-                    round,
-                    block: Arc::new(result.block),
+            if let Some(prepared) = result.prepared_commit {
+                (ctx.commit_prepared)(PreparedBlock {
                     block_hash,
-                    finalized_waves,
-                    provisions,
-                })],
-                prepared_commit,
-            })
+                    block_height: height,
+                    prepared,
+                    receipts: collect_finalized_receipts(&finalized_waves),
+                });
+            }
+            (ctx.notify)(NodeInput::Protocol(ProtocolEvent::ProposalBuilt {
+                height,
+                round,
+                block: Arc::new(result.block),
+                block_hash,
+                finalized_waves,
+                provisions,
+            }));
         }
 
         // --- Execution Vote Aggregation and Verification ---
@@ -461,8 +402,6 @@ pub fn handle_delegated_action<S: Storage, E: Engine>(
             votes,
             committee,
         } => {
-            // Aggregate BLS signatures from execution votes into an execution certificate.
-            // tx_outcomes extracted from votes by the handler (all quorum votes carry identical outcomes).
             let certificate =
                 hyperscale_execution::action_handlers::aggregate_execution_certificate(
                     &wave_id,
@@ -470,15 +409,12 @@ pub fn handle_delegated_action<S: Storage, E: Engine>(
                     &votes,
                     &committee,
                 );
-            Some(DelegatedResult {
-                events: vec![NodeInput::Protocol(
-                    ProtocolEvent::ExecutionCertificateAggregated {
-                        wave_id,
-                        certificate,
-                    },
-                )],
-                prepared_commit: None,
-            })
+            (ctx.notify)(NodeInput::Protocol(
+                ProtocolEvent::ExecutionCertificateAggregated {
+                    wave_id,
+                    certificate,
+                },
+            ));
         }
 
         Action::VerifyAndAggregateExecutionVotes {
@@ -486,20 +422,16 @@ pub fn handle_delegated_action<S: Storage, E: Engine>(
             block_hash,
             votes,
         } => {
-            // Batch-verify execution vote signatures.
             let verified =
                 hyperscale_execution::action_handlers::batch_verify_execution_votes(votes);
             let verified_votes: Vec<_> = verified.collect();
-            Some(DelegatedResult {
-                events: vec![NodeInput::Protocol(
-                    ProtocolEvent::ExecutionVotesVerifiedAndAggregated {
-                        wave_id,
-                        block_hash,
-                        verified_votes,
-                    },
-                )],
-                prepared_commit: None,
-            })
+            (ctx.notify)(NodeInput::Protocol(
+                ProtocolEvent::ExecutionVotesVerifiedAndAggregated {
+                    wave_id,
+                    block_hash,
+                    verified_votes,
+                },
+            ));
         }
 
         Action::VerifyExecutionCertificateSignature {
@@ -512,17 +444,12 @@ pub fn handle_delegated_action<S: Storage, E: Engine>(
                     &certificate,
                     &public_keys,
                 );
-            Some(DelegatedResult {
-                events: vec![NodeInput::Protocol(
-                    ProtocolEvent::ExecutionCertificateSignatureVerified { certificate, valid },
-                )],
-                prepared_commit: None,
-            })
+            (ctx.notify)(NodeInput::Protocol(
+                ProtocolEvent::ExecutionCertificateSignatureVerified { certificate, valid },
+            ));
         }
 
         // --- State Provision Batch Verification ---
-        // QC was already verified by RemoteHeaderCoordinator; only merkle
-        // proofs need checking against the committed header's state root.
         Action::VerifyProvisions {
             provisions,
             committed_header,
@@ -557,33 +484,25 @@ pub fn handle_delegated_action<S: Storage, E: Engine>(
                 "inclusion_proof",
                 merkle_start.elapsed().as_secs_f64(),
             );
-
-            Some(DelegatedResult {
-                events: vec![NodeInput::Protocol(
-                    ProtocolEvent::StateProvisionsVerified {
-                        provisions,
-                        committed_header: Some(committed_header),
-                        valid: all_valid,
-                    },
-                )],
-                prepared_commit: None,
-            })
+            (ctx.notify)(NodeInput::Protocol(
+                ProtocolEvent::StateProvisionsVerified {
+                    provisions,
+                    committed_header: Some(committed_header),
+                    valid: all_valid,
+                },
+            ));
         }
 
         // --- Transaction execution ---
-        // The returned event is ExecutionBatchCompleted with results and tx_outcomes.
         Action::ExecuteTransactions {
             wave_id,
             block_hash: _,
             transactions,
             state_root: _,
         } => {
+            let start = std::time::Instant::now();
             let local_shard = ctx.topology.local_shard();
             let num_shards = ctx.topology.num_shards();
-            // ONE anchored snapshot for the whole batch. State doesn't
-            // change during execution (commits serialize elsewhere), so
-            // one rocksdb snapshot serves every tx — avoids per-tx
-            // `db.snapshot()` + `read_jmt_metadata` overhead.
             let view_snap =
                 <hyperscale_storage::SubstateView<_> as hyperscale_storage::SubstateStore>::snapshot(
                     &*ctx.view,
@@ -597,9 +516,6 @@ pub fn handle_delegated_action<S: Storage, E: Engine>(
             let per_tx: Vec<_> = match batch_result {
                 Ok(output) => output.results,
                 Err(e) => {
-                    // Whole-batch failure is rare and fatal-ish; produce
-                    // one failure entry per tx so the state machine can
-                    // still advance without losing transactions.
                     tracing::warn!(error = %e, "single-shard batch execution failed");
                     transactions
                         .iter()
@@ -616,17 +532,14 @@ pub fn handle_delegated_action<S: Storage, E: Engine>(
                     (outcome, LocalExecutionEntry::from(r))
                 })
                 .unzip();
-
-            Some(DelegatedResult {
-                events: vec![NodeInput::Protocol(
-                    ProtocolEvent::ExecutionBatchCompleted {
-                        wave_id,
-                        results,
-                        tx_outcomes,
-                    },
-                )],
-                prepared_commit: None,
-            })
+            metrics::record_execution_latency(start.elapsed().as_secs_f64());
+            (ctx.notify)(NodeInput::Protocol(
+                ProtocolEvent::ExecutionBatchCompleted {
+                    wave_id,
+                    results,
+                    tx_outcomes,
+                },
+            ));
         }
 
         // --- Cross-shard transaction execution ---
@@ -635,12 +548,9 @@ pub fn handle_delegated_action<S: Storage, E: Engine>(
             block_hash: _,
             requests,
         } => {
+            let start = std::time::Instant::now();
             let local_shard = ctx.topology.local_shard();
             let num_shards = ctx.topology.num_shards();
-            // ONE anchored snapshot shared across every request's
-            // execution — avoids per-request `storage.snapshot()`.
-            // Each request still applies its OWN provisions (as its
-            // own overlay) on top of this shared base snapshot.
             let view_snap =
                 <hyperscale_storage::SubstateView<_> as hyperscale_storage::SubstateStore>::snapshot(
                     &*ctx.view,
@@ -671,17 +581,14 @@ pub fn handle_delegated_action<S: Storage, E: Engine>(
                     (outcome, LocalExecutionEntry::from(r))
                 })
                 .unzip();
-
-            Some(DelegatedResult {
-                events: vec![NodeInput::Protocol(
-                    ProtocolEvent::ExecutionBatchCompleted {
-                        wave_id,
-                        results,
-                        tx_outcomes,
-                    },
-                )],
-                prepared_commit: None,
-            })
+            metrics::record_execution_latency(start.elapsed().as_secs_f64());
+            (ctx.notify)(NodeInput::Protocol(
+                ProtocolEvent::ExecutionBatchCompleted {
+                    wave_id,
+                    results,
+                    tx_outcomes,
+                },
+            ));
         }
 
         // --- Provision fetch + broadcast ---
@@ -700,12 +607,9 @@ pub fn handle_delegated_action<S: Storage, E: Engine>(
                 &requests,
                 &shard_recipients,
             );
-            Some(DelegatedResult {
-                events: vec![NodeInput::ProvisionsReady { batches }],
-                prepared_commit: None,
-            })
+            (ctx.notify)(NodeInput::ProvisionsReady { batches });
         }
 
-        _ => None,
+        _ => {}
     }
 }
