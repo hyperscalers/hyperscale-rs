@@ -36,6 +36,9 @@ radix-transactions.workspace = true
 # `test_validity_range()` rather than redefining it per test file.
 hyperscale-types = { workspace = true, features = ["test-utils"] }
 
+hyperscale-metrics.workspace = true
+hyperscale-metrics-memory.workspace = true
+
 tracing-test.workspace = true
 
 [lints]

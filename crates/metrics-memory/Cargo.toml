@@ -1,0 +1,12 @@
+[package]
+name = "hyperscale-metrics-memory"
+version.workspace = true
+edition.workspace = true
+description = "In-memory metrics recorder for hyperscale tests and simulation"
+
+[dependencies]
+hyperscale-metrics.workspace = true
+parking_lot.workspace = true
+
+[lints]
+workspace = true

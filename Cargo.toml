@@ -11,6 +11,7 @@ members = [
     "crates/mempool",
     "crates/messages",
     "crates/metrics",
+    "crates/metrics-memory",
     "crates/metrics-prometheus",
     "crates/network",
     "crates/network-libp2p",
@@ -42,6 +43,7 @@ default-members = [
     "crates/mempool",
     "crates/messages",
     "crates/metrics",
+    "crates/metrics-memory",
     "crates/metrics-prometheus",
     "crates/network",
     "crates/network-libp2p",
@@ -70,6 +72,7 @@ edition = "2024"
 # Internal crates
 hyperscale-bft = { path = "crates/bft" }
 hyperscale-metrics = { path = "crates/metrics" }
+hyperscale-metrics-memory = { path = "crates/metrics-memory" }
 hyperscale-metrics-prometheus = { path = "crates/metrics-prometheus" }
 hyperscale-core = { path = "crates/core" }
 hyperscale-dispatch = { path = "crates/dispatch" }
