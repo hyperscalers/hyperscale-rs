@@ -45,7 +45,6 @@ use arc_swap::ArcSwap;
 use hyperscale_core::{Action, NodeInput, ProtocolEvent, StateMachine, TimerId};
 use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_engine::{Engine, GenesisConfig, RadixExecutor, TransactionValidation};
-use hyperscale_messages::TransactionGossip;
 use hyperscale_metrics as metrics;
 use hyperscale_network::Network;
 use hyperscale_storage::{ChainWriter, Storage};
@@ -464,69 +463,17 @@ where
 
         match event {
             // ── Transaction validation pipeline ────────────────────────
-            //
-            // TransactionGossipReceived and SubmitTransaction are routed
-            // through the validation batch pipeline. Validated transactions
-            // re-enter as TransactionValidated, which is converted into
-            // TransactionGossipReceived for the state machine.
             NodeInput::TransactionValidated {
                 tx,
                 submitted_locally,
-            } => {
-                let tx_hash = tx.hash();
-                self.pending_validation.remove(&tx_hash);
-                let is_local = submitted_locally || self.locally_submitted.remove(&tx_hash);
-                self.caches.tx.insert(tx_hash, Arc::clone(&tx));
-                self.actions_generated = 0;
-                self.feed_event(ProtocolEvent::TransactionGossipReceived {
-                    tx,
-                    submitted_locally: is_local,
-                });
-            }
-
-            // Clean up tracking sets for transactions that failed validation.
+            } => self.handle_transaction_validated(tx, submitted_locally),
             NodeInput::TransactionValidationsFailed { hashes } => {
-                for hash in &hashes {
-                    self.pending_validation.remove(hash);
-                    self.locally_submitted.remove(hash);
-                }
+                self.handle_transaction_validations_failed(&hashes);
             }
-
-            // Intercept gossip-received transactions for validation.
             NodeInput::Protocol(ProtocolEvent::TransactionGossipReceived { tx, .. }) => {
-                let tx_hash = tx.hash();
-                if self.caches.tx.get(&tx_hash).is_none()
-                    && !self.state.mempool().is_tombstoned(&tx_hash)
-                {
-                    self.pending_validation.insert(tx_hash);
-                    self.queue_validation(tx);
-                }
+                self.handle_gossip_received_tx_for_validation(tx);
             }
-
-            NodeInput::SubmitTransaction { tx } => {
-                let tx_hash = tx.hash();
-
-                // Gossip to all relevant shards (reads + writes).
-                let shards: std::collections::BTreeSet<ShardGroupId> = tx
-                    .declared_reads
-                    .iter()
-                    .chain(tx.declared_writes.iter())
-                    .map(|node_id| hyperscale_types::shard_for_node(node_id, self.num_shards))
-                    .collect();
-                for shard in shards {
-                    let gossip = TransactionGossip::from_arc(Arc::clone(&tx));
-                    self.network.broadcast_to_shard(shard, &gossip);
-                }
-
-                if !self.pending_validation.contains(&tx_hash)
-                    && self.caches.tx.get(&tx_hash).is_none()
-                {
-                    // Paired with validation: only queued txs are removed on completion.
-                    self.locally_submitted.insert(tx_hash);
-                    self.pending_validation.insert(tx_hash);
-                    self.queue_validation(tx);
-                }
-            }
+            NodeInput::SubmitTransaction { tx } => self.handle_submit_transaction(tx),
 
             // ── Sync protocol ──────────────────────────────────────────
             NodeInput::SyncBlockResponseReceived { height, block } => {
