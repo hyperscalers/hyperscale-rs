@@ -28,7 +28,7 @@ pub struct BlockHeader {
     pub height: BlockHeight,
 
     /// Hash of parent block.
-    pub parent_hash: BlockHash,
+    pub parent_block_hash: BlockHash,
 
     /// Quorum certificate proving parent block was committed.
     pub parent_qc: QuorumCertificate,
@@ -137,7 +137,7 @@ impl BlockHeader {
         Self {
             shard_group_id,
             height: BlockHeight(0),
-            parent_hash: BlockHash::from_raw(Hash::from_bytes(&[0u8; 32])),
+            parent_block_hash: BlockHash::from_raw(Hash::from_bytes(&[0u8; 32])),
             parent_qc: QuorumCertificate::genesis(),
             proposer,
             timestamp: ProposerTimestamp::ZERO,

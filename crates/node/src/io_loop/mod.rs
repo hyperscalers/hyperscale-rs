@@ -237,7 +237,7 @@ where
     block_commit: BlockCommitCoordinator<S>,
 
     /// Chain-anchored pending state. Indexed by block hash; reads happen
-    /// through `PendingChain::view_at(parent_hash)` which walks the
+    /// through `PendingChain::view_at(parent_block_hash)` which walks the
     /// parent chain back to the committed tip. Orphaned blocks are not
     /// ancestors and are structurally invisible to anchored views.
     pending_chain: Arc<hyperscale_storage::PendingChain<S>>,

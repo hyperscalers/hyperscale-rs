@@ -35,7 +35,7 @@ pub type BaseReadCache = HashMap<(DbPartitionKey, DbSortKey), Option<Vec<u8>>>;
 #[derive(Clone)]
 pub struct ChainEntry {
     /// Parent block hash. Used to walk the chain back to the committed tip.
-    pub parent_hash: BlockHash,
+    pub parent_block_hash: BlockHash,
     /// Block height. Used for pruning and version-aware reads.
     pub height: BlockHeight,
     /// Per-tx receipts produced by this block.
@@ -48,9 +48,9 @@ pub struct ChainEntry {
 /// and dispatch closures via `Arc`.
 ///
 /// **Anchored reads.** Reads happen through [`Self::view_at`], which
-/// walks `parent_hash` back to the committed tip and flattens that
+/// walks `parent_block_hash` back to the committed tip and flattens that
 /// chain's pending state into a [`SubstateView`]. Orphaned blocks (whose
-/// `parent_hash` doesn't lead back to the committed chain) are not
+/// `parent_block_hash` doesn't lead back to the committed chain) are not
 /// visited and contribute nothing — the orphan-corruption bug becomes
 /// impossible by construction.
 pub struct PendingChain<S> {
@@ -113,13 +113,13 @@ where
         self.entries.read().unwrap().is_empty()
     }
 
-    /// Build a view anchored at `parent_hash`.
+    /// Build a view anchored at `parent_block_hash`.
     ///
-    /// The view sees state through `parent_hash` and all of its committed
+    /// The view sees state through `parent_block_hash` and all of its committed
     /// ancestors back to the persisted tip. Orphaned blocks not on this
     /// chain are invisible.
-    pub fn view_at(self: &Arc<Self>, parent_hash: BlockHash) -> Arc<SubstateView<S>> {
-        Arc::new(self.build_view(parent_hash))
+    pub fn view_at(self: &Arc<Self>, parent_block_hash: BlockHash) -> Arc<SubstateView<S>> {
+        Arc::new(self.build_view(parent_block_hash))
     }
 
     /// Build a view anchored at the latest committed block.
@@ -139,18 +139,18 @@ where
         )
     }
 
-    /// Walk `parent_hash` back through ancestors and flatten the chain
+    /// Walk `parent_block_hash` back through ancestors and flatten the chain
     /// into a `SubstateView`. Stops when an entry's parent is not in the
     /// index (it's been persisted, or it's the committed tip).
     ///
     /// Holds the read lock for the duration of the walk; no per-entry
     /// clones.
-    fn build_view(&self, parent_hash: BlockHash) -> SubstateView<S> {
+    fn build_view(&self, parent_block_hash: BlockHash) -> SubstateView<S> {
         let entries = self.entries.read().unwrap();
         let mut chain: Vec<&ChainEntry> = Vec::new();
-        let mut cursor = parent_hash;
+        let mut cursor = parent_block_hash;
         while let Some(entry) = entries.get(&cursor) {
-            cursor = entry.parent_hash;
+            cursor = entry.parent_block_hash;
             chain.push(entry);
         }
         // Walk produces deepest-first; flip to commit order.
@@ -858,7 +858,7 @@ mod tests {
 
     fn entry_at(parent: BlockHash, height: BlockHeight, updates: DatabaseUpdates) -> ChainEntry {
         ChainEntry {
-            parent_hash: parent,
+            parent_block_hash: parent,
             height,
             receipts: vec![make_receipt(updates)],
             jmt_snapshot: empty_snapshot(),

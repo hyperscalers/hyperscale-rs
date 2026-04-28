@@ -442,7 +442,7 @@ pub fn build_proposal<S: ChainWriter + SubstateStore>(
     proposer: ValidatorId,
     height: BlockHeight,
     round: Round,
-    parent_hash: BlockHash,
+    parent_block_hash: BlockHash,
     parent_qc: QuorumCertificate,
     timestamp: ProposerTimestamp,
     is_fallback: bool,
@@ -492,7 +492,7 @@ pub fn build_proposal<S: ChainWriter + SubstateStore>(
     let header = BlockHeader {
         shard_group_id: local_shard,
         height,
-        parent_hash,
+        parent_block_hash,
         parent_qc,
         proposer,
         timestamp,
@@ -769,7 +769,7 @@ pub fn handle_action<S, E>(
             proposer,
             height,
             round,
-            parent_hash,
+            parent_block_hash,
             parent_qc,
             timestamp,
             is_fallback,
@@ -781,14 +781,14 @@ pub fn handle_action<S, E>(
             parent_in_flight,
             finalized_tx_count,
         } => {
-            let view = ctx.pending_chain.view_at(parent_hash);
+            let view = ctx.pending_chain.view_at(parent_block_hash);
             let pending_snapshots = view.pending_snapshots().to_vec();
             let result = build_proposal(
                 &*view,
                 proposer,
                 height,
                 round,
-                parent_hash,
+                parent_block_hash,
                 parent_qc,
                 timestamp,
                 is_fallback,
@@ -807,7 +807,7 @@ pub fn handle_action<S, E>(
             if let Some(prepared) = result.prepared_commit {
                 (ctx.commit_prepared)(PreparedBlock {
                     block_hash,
-                    parent_block_hash: parent_hash,
+                    parent_block_hash,
                     block_height: height,
                     prepared,
                     receipts: collect_finalized_receipts(&finalized_waves),

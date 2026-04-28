@@ -448,7 +448,7 @@ pub enum Action {
         /// Round at which the proposal is being made.
         round: Round,
         /// Parent block hash; the new block extends this.
-        parent_hash: BlockHash,
+        parent_block_hash: BlockHash,
         /// QC over the parent block (genesis QC for the first block).
         parent_qc: QuorumCertificate,
         /// Proposer-supplied timestamp on the new block header.

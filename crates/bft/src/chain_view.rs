@@ -71,16 +71,16 @@ impl ChainView<'_> {
     }
 
     /// State root of the parent block. Returns the committed-tip state root
-    /// when `parent_hash` IS the committed tip (may have been pruned from
+    /// when `parent_block_hash` IS the committed tip (may have been pruned from
     /// the in-memory caches by cleanup) or when lookup otherwise fails.
-    pub fn parent_state_root(&self, parent_hash: BlockHash) -> StateRoot {
-        if parent_hash == self.committed_hash {
+    pub fn parent_state_root(&self, parent_block_hash: BlockHash) -> StateRoot {
+        if parent_block_hash == self.committed_hash {
             return self.committed_state_root;
         }
-        self.get_header(parent_hash).map_or_else(
+        self.get_header(parent_block_hash).map_or_else(
             || {
                 warn!(
-                    ?parent_hash,
+                    ?parent_block_hash,
                     committed_hash = ?self.committed_hash,
                     "Parent header not found for state root lookup"
                 );
@@ -92,8 +92,9 @@ impl ChainView<'_> {
 
     /// In-flight count on the parent header. Returns `0` if the header is
     /// missing (parent pruned from in-memory caches).
-    pub fn parent_in_flight(&self, parent_hash: BlockHash) -> u32 {
-        self.get_header(parent_hash).map_or(0, |h| h.in_flight)
+    pub fn parent_in_flight(&self, parent_block_hash: BlockHash) -> u32 {
+        self.get_header(parent_block_hash)
+            .map_or(0, |h| h.in_flight)
     }
 
     /// Parent to use when building the next proposal: the latest QC's block
@@ -105,7 +106,7 @@ impl ChainView<'_> {
         )
     }
 
-    /// Walk the QC chain from `parent_hash` back to committed height,
+    /// Walk the QC chain from `parent_block_hash` back to committed height,
     /// collecting certificate, transaction, and provision hashes from
     /// ancestor blocks. Used by the proposer (to filter duplicates) and
     /// validators (to reject blocks containing already-included items).
@@ -117,7 +118,7 @@ impl ChainView<'_> {
     /// `BlockCommitted` event clears the mempool.
     pub fn collect_ancestor_hashes(
         &self,
-        parent_hash: BlockHash,
+        parent_block_hash: BlockHash,
         tx_cache: &CommittedTxCache,
     ) -> (HashSet<WaveIdHash>, HashSet<TxHash>, HashSet<ProvisionHash>) {
         let mut cert_hashes: HashSet<WaveIdHash> = HashSet::new();
@@ -127,7 +128,7 @@ impl ChainView<'_> {
         tx_hashes.extend(tx_cache.recent_tx_hashes());
         cert_hashes.extend(tx_cache.recent_cert_hashes());
 
-        let mut current_hash = parent_hash;
+        let mut current_hash = parent_block_hash;
         while let Some(block) = self.get_block(current_hash) {
             if block.height() <= self.committed_height {
                 break;
@@ -138,10 +139,10 @@ impl ChainView<'_> {
             for tx in block.transactions() {
                 tx_hashes.insert(tx.hash());
             }
-            current_hash = block.header().parent_hash;
+            current_hash = block.header().parent_block_hash;
         }
 
-        let mut current_hash = parent_hash;
+        let mut current_hash = parent_block_hash;
         while let Some(pending) = self.pending.get(&current_hash) {
             let h = pending.header().height;
             if h <= self.committed_height {
@@ -156,7 +157,7 @@ impl ChainView<'_> {
             for batch_hash in &manifest.provision_hashes {
                 provision_hashes.insert(*batch_hash);
             }
-            current_hash = pending.header().parent_hash;
+            current_hash = pending.header().parent_block_hash;
         }
 
         (cert_hashes, tx_hashes, provision_hashes)
@@ -172,11 +173,11 @@ mod tests {
     };
     use std::collections::BTreeMap;
 
-    fn make_header(height: u8, parent_hash: BlockHash) -> BlockHeader {
+    fn make_header(height: u8, parent_block_hash: BlockHash) -> BlockHeader {
         BlockHeader {
             shard_group_id: ShardGroupId(0),
             height: BlockHeight(u64::from(height)),
-            parent_hash,
+            parent_block_hash,
             parent_qc: QuorumCertificate::genesis(),
             proposer: ValidatorId(0),
             timestamp: ProposerTimestamp(1000),
@@ -193,9 +194,9 @@ mod tests {
         }
     }
 
-    fn make_block(height: u8, parent_hash: BlockHash) -> Block {
+    fn make_block(height: u8, parent_block_hash: BlockHash) -> Block {
         Block::Live {
-            header: make_header(height, parent_hash),
+            header: make_header(height, parent_block_hash),
             transactions: vec![],
             certificates: vec![],
             provisions: vec![],

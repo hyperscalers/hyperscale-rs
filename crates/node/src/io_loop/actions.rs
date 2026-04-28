@@ -468,7 +468,7 @@ where
         } else {
             // Build view anchored at parent — includes prior synced blocks'
             // JMT snapshots so chained verification can find parent nodes.
-            let view = self.pending_chain.view_at(block.header().parent_hash);
+            let view = self.pending_chain.view_at(block.header().parent_block_hash);
             let pending_snapshots = view.pending_snapshots().to_vec();
 
             // Inline JMT computation (no commit_lock — only reads).
@@ -503,7 +503,7 @@ where
             self.pending_chain.insert(
                 block_hash,
                 hyperscale_storage::ChainEntry {
-                    parent_hash: block.header().parent_hash,
+                    parent_block_hash: block.header().parent_block_hash,
                     height,
                     receipts,
                     jmt_snapshot,
@@ -697,7 +697,7 @@ where
             let commit_prepared = move |prep: PreparedBlock<S::PreparedCommit>| {
                 let PreparedBlock {
                     block_hash,
-                    parent_block_hash: parent_hash,
+                    parent_block_hash,
                     block_height,
                     prepared,
                     receipts,
@@ -706,7 +706,7 @@ where
                 pending_chain_for_commit.insert(
                     block_hash,
                     hyperscale_storage::ChainEntry {
-                        parent_hash,
+                        parent_block_hash,
                         height: block_height,
                         receipts,
                         jmt_snapshot,
