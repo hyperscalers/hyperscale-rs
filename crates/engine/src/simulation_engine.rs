@@ -8,7 +8,7 @@
 use crate::RadixExecutor;
 use crate::error::ExecutionError;
 use crate::executor::Engine;
-use crate::result::{ExecutionOutput, SingleTxResult};
+use crate::result::{ExecutedTx, ExecutionOutput};
 use dashmap::DashMap;
 use hyperscale_storage::{SubstateDatabase, SubstateStore};
 use hyperscale_types::{
@@ -20,7 +20,7 @@ use std::sync::{Arc, OnceLock};
 /// Shared execution cache — one per shard group in simulation.
 ///
 /// Key: transaction hash.  Value: `OnceLock` ensuring compute-once semantics.
-pub type SimExecutionCache = Arc<DashMap<TxHash, Arc<OnceLock<SingleTxResult>>>>;
+pub type SimExecutionCache = Arc<DashMap<TxHash, Arc<OnceLock<ExecutedTx>>>>;
 
 /// Caching wrapper around [`RadixExecutor`] for simulation.
 ///
@@ -45,7 +45,7 @@ impl SimulationEngine {
         tx: &Arc<RoutableTransaction>,
         local_shard: ShardGroupId,
         num_shards: u64,
-    ) -> SingleTxResult {
+    ) -> ExecutedTx {
         let tx_hash = tx.hash();
         let lock = self
             .cache
@@ -65,8 +65,8 @@ impl SimulationEngine {
                     .results
                     .into_iter()
                     .next()
-                    .unwrap_or_else(|| SingleTxResult::failure(tx_hash, "No result returned")),
-                Err(e) => SingleTxResult::failure(tx_hash, e.to_string()),
+                    .unwrap_or_else(|| ExecutedTx::failure(tx_hash, "No result returned")),
+                Err(e) => ExecutedTx::failure(tx_hash, e.to_string()),
             }
         });
 
@@ -81,7 +81,7 @@ impl SimulationEngine {
         provisions: &[StateProvision],
         local_shard: ShardGroupId,
         num_shards: u64,
-    ) -> SingleTxResult {
+    ) -> ExecutedTx {
         let tx_hash = tx.hash();
         let lock = self
             .cache
@@ -101,8 +101,8 @@ impl SimulationEngine {
                     .results
                     .into_iter()
                     .next()
-                    .unwrap_or_else(|| SingleTxResult::failure(tx_hash, "No result returned")),
-                Err(e) => SingleTxResult::failure(tx_hash, e.to_string()),
+                    .unwrap_or_else(|| ExecutedTx::failure(tx_hash, "No result returned")),
+                Err(e) => ExecutedTx::failure(tx_hash, e.to_string()),
             }
         });
 

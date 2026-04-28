@@ -33,7 +33,7 @@ use crate::error::ExecutionError;
 use crate::execution::{
     ProvisionedSnapshot, build_execution_metadata, build_local_receipt, is_committed,
 };
-use crate::result::{ExecutionOutput, SingleTxResult};
+use crate::result::{ExecutedTx, ExecutionOutput};
 use hyperscale_storage::{SubstateDatabase, SubstateStore};
 use hyperscale_types::{BlockHeight, NodeId, RoutableTransaction, StateEntry, StateProvision};
 use radix_common::network::NetworkDefinition;
@@ -347,7 +347,7 @@ impl RadixExecutor {
         tx: &RoutableTransaction,
         local_shard: hyperscale_types::ShardGroupId,
         num_shards: u64,
-    ) -> Result<SingleTxResult, ExecutionError> {
+    ) -> Result<ExecutedTx, ExecutionError> {
         // Get or create validated transaction (cached on RoutableTransaction)
         // This avoids re-validating signatures if already validated at RPC submission
         let validated = tx
@@ -387,7 +387,7 @@ impl RadixExecutor {
         receipt: &TransactionReceipt,
         local_shard: hyperscale_types::ShardGroupId,
         num_shards: u64,
-    ) -> SingleTxResult {
+    ) -> ExecutedTx {
         let success = is_committed(receipt);
 
         if success {
@@ -412,10 +412,10 @@ impl RadixExecutor {
             let writes_root = crate::sharding::compute_writes_root(&global_updates);
             let receipt_hash = local_receipt.global_receipt(writes_root).receipt_hash();
 
-            SingleTxResult::success(tx.hash(), receipt_hash, local_receipt, execution_output)
+            ExecutedTx::success(tx.hash(), receipt_hash, local_receipt, execution_output)
         } else {
             let error = format!("{:?}", receipt.result);
-            SingleTxResult::failure(tx.hash(), error)
+            ExecutedTx::failure(tx.hash(), error)
         }
     }
 

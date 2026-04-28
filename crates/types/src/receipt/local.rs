@@ -90,12 +90,11 @@ impl LocalReceipt {
 /// Execution output that travels alongside an `ExecutionVote` through the
 /// `ProtocolEvent` boundary from the thread pool to the state machine.
 ///
-/// Separate from `SingleTxResult` (engine-internal) because `success` and
-/// `error` are not needed past the vote-signing boundary — the state machine
-/// determines outcome from the receipt's `outcome` field instead.
-///
-/// The state machine holds receipts in-memory until block commit.
-/// `DatabaseUpdates` are on the local receipt.
+/// The state machine holds receipts in-memory until block commit;
+/// `DatabaseUpdates` live on the local receipt. Outcome is determined from
+/// the receipt's `outcome` field rather than a separate flag — the engine
+/// produces `LocalExecutionEntry` directly alongside a `TxOutcome` for
+/// vote aggregation (see `hyperscale_engine::ExecutedTx`).
 #[derive(Debug, Clone)]
 pub struct LocalExecutionEntry {
     /// Hash of the executed transaction.

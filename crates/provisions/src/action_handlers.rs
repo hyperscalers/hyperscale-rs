@@ -159,3 +159,81 @@ where
     }
     batches
 }
+
+/// Handle the provisions-owned delegated [`hyperscale_core::Action`] variants.
+///
+/// Outcomes flow through `ctx.notify`. Variants owned by other coordinator
+/// crates hit `unreachable!()` — node's dispatcher routes by variant prefix.
+pub fn handle_action<S, E>(
+    action: hyperscale_core::Action,
+    ctx: &hyperscale_core::ActionContext<'_, S, E>,
+) where
+    S: hyperscale_storage::Storage,
+    E: Engine,
+{
+    use hyperscale_core::{Action, NodeInput, ProtocolEvent};
+    use hyperscale_metrics as metrics;
+
+    match action {
+        Action::VerifyProvisions {
+            provisions,
+            committed_header,
+        } => {
+            let merkle_start = std::time::Instant::now();
+            let all_valid = {
+                let all_entries = provisions.all_entries_deduped();
+                if all_entries.is_empty() {
+                    true
+                } else {
+                    let valid = hyperscale_storage::tree::proofs::verify_proof(
+                        &provisions.proof,
+                        &all_entries,
+                        committed_header.header.state_root,
+                        |e| &e.storage_key,
+                    );
+                    if !valid {
+                        warn!(
+                            source_shard = provisions.source_shard.0,
+                            block_height = provisions.block_height.0,
+                            header_height = committed_header.header.height.0,
+                            header_state_root = ?committed_header.header.state_root,
+                            entry_count = all_entries.len(),
+                            proof_len = provisions.proof.as_bytes().len(),
+                            "Provision merkle proof verification failed"
+                        );
+                    }
+                    valid
+                }
+            };
+            metrics::record_signature_verification_latency(
+                "inclusion_proof",
+                merkle_start.elapsed().as_secs_f64(),
+            );
+            (ctx.notify)(NodeInput::Protocol(
+                ProtocolEvent::StateProvisionsVerified {
+                    provisions,
+                    committed_header: Some(committed_header),
+                    valid: all_valid,
+                },
+            ));
+        }
+        Action::FetchAndBroadcastProvisions {
+            block_hash: _,
+            requests,
+            source_shard,
+            block_height,
+            shard_recipients,
+        } => {
+            let batches = fetch_and_broadcast_provision(
+                ctx.executor,
+                &ctx.view,
+                source_shard,
+                block_height,
+                &requests,
+                &shard_recipients,
+            );
+            (ctx.notify)(NodeInput::ProvisionsReady { batches });
+        }
+        _ => unreachable!("hyperscale_provisions::handle_action called with non-provisions action"),
+    }
+}
