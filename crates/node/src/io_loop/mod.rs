@@ -32,15 +32,11 @@ use crate::batch_accumulator::BatchAccumulator;
 use crate::config::NodeConfig;
 use crate::io_loop::block_commit::BlockCommitCoordinator;
 use crate::io_loop::caches::SharedCaches;
-use crate::protocol::fetch::id_fetch::IdFetchConfig;
-use crate::protocol::fetch::instances::exec_certs::ExecCertFetch;
-use crate::protocol::fetch::instances::finalized_waves::FinalizedWaveFetch;
-use crate::protocol::fetch::instances::headers::{self, HeaderFetch};
-use crate::protocol::fetch::instances::local_provisions::LocalProvisionFetch;
-use crate::protocol::fetch::instances::provisions::{self, ProvisionFetch};
-use crate::protocol::fetch::instances::transactions::TransactionFetch;
-use crate::protocol::fetch::scope_fetch::ScopeFetchConfig;
-use crate::protocol::fetch::{IdFetchInput, ScopeFetchInput};
+use crate::protocol::fetch::{FetchConfig, FetchInput};
+use crate::protocol::fetch_instances::{
+    ExecCertFetch, FinalizedWaveFetch, HeaderFetch, LocalProvisionFetch, ProvisionFetch,
+    TransactionFetch,
+};
 use crate::protocol::sync::{SyncInput, SyncProtocol, SyncStatus};
 use arc_swap::ArcSwap;
 use hyperscale_core::{Action, NodeInput, ProtocolEvent, StateMachine, TimerId};
@@ -333,19 +329,24 @@ where
         let b = &config.batch;
         let sync_protocol = SyncProtocol::new(config.sync.clone());
         let transaction_fetch = TransactionFetch::new(config.transaction_fetch.clone());
-        let local_provision_fetch = LocalProvisionFetch::new(IdFetchConfig {
+        let local_provision_fetch = LocalProvisionFetch::new(FetchConfig {
             max_in_flight: 64,
             max_ids_per_request: 16,
             parallel_chunks_per_tick: 2,
         });
-        let finalized_wave_fetch = FinalizedWaveFetch::new(IdFetchConfig {
+        let finalized_wave_fetch = FinalizedWaveFetch::new(FetchConfig {
             max_in_flight: 8,
             max_ids_per_request: 4,
             parallel_chunks_per_tick: 1,
         });
-        let provision_fetch = ProvisionFetch::new(&config.provision_fetch);
+        let provision_fetch = ProvisionFetch::new(config.provision_fetch.clone());
         let exec_cert_fetch = ExecCertFetch::new(config.exec_cert_fetch.clone());
-        let header_fetch = HeaderFetch::new(&ScopeFetchConfig::default());
+        // Header fetches are scope-id (one per height); single-id chunks suffice.
+        let header_fetch = HeaderFetch::new(FetchConfig {
+            max_in_flight: 16,
+            max_ids_per_request: 1,
+            parallel_chunks_per_tick: 4,
+        });
         let storage = Arc::new(storage);
         let pending_chain = Arc::new(hyperscale_storage::PendingChain::new(Arc::clone(&storage)));
         let caches = SharedCaches::new(Arc::clone(state.provisions().store()));
@@ -665,9 +666,9 @@ where
 
             NodeInput::FetchTransactionsFailed { hashes } => {
                 self.transaction_fetch
-                    .handle(IdFetchInput::Failed { ids: hashes });
+                    .handle(FetchInput::Failed { ids: hashes });
                 // Tick to retry pending fetches.
-                let tick_outputs = self.transaction_fetch.handle(IdFetchInput::Tick);
+                let tick_outputs = self.transaction_fetch.handle(FetchInput::Tick);
                 self.process_transaction_fetch_outputs(tick_outputs);
             }
 
@@ -681,26 +682,27 @@ where
                 let outputs = self.sync_protocol.handle(SyncInput::Tick { now });
                 self.process_sync_outputs(outputs);
 
-                let outputs = self.transaction_fetch.handle(IdFetchInput::Tick);
+                let outputs = self.transaction_fetch.handle(FetchInput::Tick);
                 self.process_transaction_fetch_outputs(outputs);
 
-                let outputs = self.local_provision_fetch.handle(IdFetchInput::Tick);
+                let outputs = self.local_provision_fetch.handle(FetchInput::Tick);
                 self.process_local_provision_fetch_outputs(outputs);
 
-                let outputs = self.finalized_wave_fetch.handle(IdFetchInput::Tick);
+                let outputs = self.finalized_wave_fetch.handle(FetchInput::Tick);
                 self.process_finalized_wave_fetch_outputs(outputs);
 
-                self.provision_fetch
-                    .evict_abandoned(|s| provisions::is_abandoned(&self.state, s));
-                let outputs = self.provision_fetch.handle(ScopeFetchInput::Tick);
+                self.provision_fetch.evict_abandoned(|id| {
+                    crate::protocol::fetch_instances::provisions_is_abandoned(&self.state, id)
+                });
+                let outputs = self.provision_fetch.handle(FetchInput::Tick);
                 self.process_provision_fetch_outputs(outputs);
 
-                let outputs = self.exec_cert_fetch.handle(IdFetchInput::Tick);
+                let outputs = self.exec_cert_fetch.handle(FetchInput::Tick);
                 self.process_exec_cert_fetch_outputs(outputs);
 
                 // Header fetch drains via `Continuation(RemoteHeaderAdmitted)`
                 // through `apply_admission`.
-                let outputs = self.header_fetch.handle(ScopeFetchInput::Tick);
+                let outputs = self.header_fetch.handle(FetchInput::Tick);
                 self.process_header_fetch_outputs(outputs);
 
                 self.update_fetch_tick_timer();
@@ -711,11 +713,11 @@ where
                 source_shard,
                 block_height,
             } => {
-                let scope = provisions::scope_for(source_shard, block_height);
-                self.provision_fetch
-                    .handle(ScopeFetchInput::Failed { scope });
+                self.provision_fetch.handle(FetchInput::Failed {
+                    ids: vec![(source_shard, block_height)],
+                });
                 // Tick to re-issue immediately; network handles peer rotation.
-                let tick_outputs = self.provision_fetch.handle(ScopeFetchInput::Tick);
+                let tick_outputs = self.provision_fetch.handle(FetchInput::Tick);
                 self.process_provision_fetch_outputs(tick_outputs);
                 self.update_fetch_tick_timer();
             }
@@ -733,8 +735,8 @@ where
 
             NodeInput::ExecCertFetchFailed { hashes } => {
                 self.exec_cert_fetch
-                    .handle(IdFetchInput::Failed { ids: hashes });
-                let tick_outputs = self.exec_cert_fetch.handle(IdFetchInput::Tick);
+                    .handle(FetchInput::Failed { ids: hashes });
+                let tick_outputs = self.exec_cert_fetch.handle(FetchInput::Tick);
                 self.process_exec_cert_fetch_outputs(tick_outputs);
                 self.update_fetch_tick_timer();
             }
@@ -744,10 +746,11 @@ where
                 source_shard,
                 from_height,
             } => {
-                let scope = headers::scope_for(source_shard, from_height);
-                self.header_fetch.handle(ScopeFetchInput::Failed { scope });
+                self.header_fetch.handle(FetchInput::Failed {
+                    ids: vec![(source_shard, from_height)],
+                });
                 // Tick to re-issue immediately; network handles peer rotation.
-                let tick_outputs = self.header_fetch.handle(ScopeFetchInput::Tick);
+                let tick_outputs = self.header_fetch.handle(FetchInput::Tick);
                 self.process_header_fetch_outputs(tick_outputs);
                 self.update_fetch_tick_timer();
             }
@@ -793,7 +796,7 @@ where
                 missing_hashes,
             } => {
                 if !missing_hashes.is_empty() {
-                    self.local_provision_fetch.handle(IdFetchInput::Failed {
+                    self.local_provision_fetch.handle(FetchInput::Failed {
                         ids: missing_hashes,
                     });
                 }
@@ -807,8 +810,8 @@ where
 
             NodeInput::LocalProvisionsFetchFailed { hashes } => {
                 self.local_provision_fetch
-                    .handle(IdFetchInput::Failed { ids: hashes });
-                let tick_outputs = self.local_provision_fetch.handle(IdFetchInput::Tick);
+                    .handle(FetchInput::Failed { ids: hashes });
+                let tick_outputs = self.local_provision_fetch.handle(FetchInput::Tick);
                 self.process_local_provision_fetch_outputs(tick_outputs);
                 self.update_fetch_tick_timer();
             }
@@ -848,8 +851,8 @@ where
 
             NodeInput::FinalizedWaveFetchFailed { hashes } => {
                 self.finalized_wave_fetch
-                    .handle(IdFetchInput::Failed { ids: hashes });
-                let tick_outputs = self.finalized_wave_fetch.handle(IdFetchInput::Tick);
+                    .handle(FetchInput::Failed { ids: hashes });
+                let tick_outputs = self.finalized_wave_fetch.handle(FetchInput::Tick);
                 self.process_finalized_wave_fetch_outputs(tick_outputs);
                 self.update_fetch_tick_timer();
             }

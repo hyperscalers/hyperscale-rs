@@ -4,10 +4,8 @@ use super::IoLoop;
 use super::TimerOp;
 use super::block_commit::{AccumulateDecision, PendingCommit};
 use crate::action_handler::{self, ActionContext, DispatchPool};
-use crate::protocol::fetch::instances::{
-    exec_certs, finalized_waves, headers, local_provisions, provisions, transactions,
-};
-use crate::protocol::fetch::{IdFetchInput, ScopeFetchInput};
+use crate::protocol::fetch::FetchInput;
+use crate::protocol::fetch_instances;
 use crate::protocol::sync::SyncInput;
 use hyperscale_core::{Action, CommitSource, FetchRequest, NodeInput, ProtocolEvent, StateMachine};
 use hyperscale_dispatch::Dispatch;
@@ -48,12 +46,18 @@ where
                 // Each fetch instance owns its own admission predicate; the
                 // arm just dispatches the event through them. Adding a new
                 // payload is one new helper + one line here.
-                transactions::apply_admission(&mut self.transaction_fetch, &pe);
-                local_provisions::apply_admission(&mut self.local_provision_fetch, &pe);
-                finalized_waves::apply_admission(&mut self.finalized_wave_fetch, &pe);
-                provisions::apply_admission(&mut self.provision_fetch, &pe);
-                exec_certs::apply_admission(&mut self.exec_cert_fetch, &pe);
-                headers::apply_admission(&mut self.header_fetch, &pe);
+                fetch_instances::apply_transactions_admission(&mut self.transaction_fetch, &pe);
+                fetch_instances::apply_local_provisions_admission(
+                    &mut self.local_provision_fetch,
+                    &pe,
+                );
+                fetch_instances::apply_finalized_waves_admission(
+                    &mut self.finalized_wave_fetch,
+                    &pe,
+                );
+                fetch_instances::apply_provisions_admission(&mut self.provision_fetch, &pe);
+                fetch_instances::apply_exec_certs_admission(&mut self.exec_cert_fetch, &pe);
+                fetch_instances::apply_headers_admission(&mut self.header_fetch, &pe);
 
                 // Serving-cache insertion is io_loop's own state, not an
                 // instance concern — keep it here.
@@ -586,20 +590,20 @@ where
         match req {
             FetchRequest::Transactions { ids, peers } => {
                 self.transaction_fetch
-                    .handle(IdFetchInput::Request { ids, peers });
-                let outputs = self.transaction_fetch.handle(IdFetchInput::Tick);
+                    .handle(FetchInput::Request { ids, peers });
+                let outputs = self.transaction_fetch.handle(FetchInput::Tick);
                 self.process_transaction_fetch_outputs(outputs);
             }
             FetchRequest::LocalProvisions { ids, peers } => {
                 self.local_provision_fetch
-                    .handle(IdFetchInput::Request { ids, peers });
-                let outputs = self.local_provision_fetch.handle(IdFetchInput::Tick);
+                    .handle(FetchInput::Request { ids, peers });
+                let outputs = self.local_provision_fetch.handle(FetchInput::Tick);
                 self.process_local_provision_fetch_outputs(outputs);
             }
             FetchRequest::FinalizedWaves { ids, peers } => {
                 self.finalized_wave_fetch
-                    .handle(IdFetchInput::Request { ids, peers });
-                let outputs = self.finalized_wave_fetch.handle(IdFetchInput::Tick);
+                    .handle(FetchInput::Request { ids, peers });
+                let outputs = self.finalized_wave_fetch.handle(FetchInput::Tick);
                 self.process_finalized_wave_fetch_outputs(outputs);
             }
             FetchRequest::RemoteProvisions {
@@ -620,11 +624,11 @@ where
                     peer_count = peers.peers.len() + usize::from(peers.preferred.is_some()),
                     "Requesting missing provisions from source shard"
                 );
-                self.provision_fetch.handle(ScopeFetchInput::Request {
-                    scope: provisions::scope_for(source_shard, block_height),
+                self.provision_fetch.handle(FetchInput::Request {
+                    ids: vec![(source_shard, block_height)],
                     peers,
                 });
-                let outputs = self.provision_fetch.handle(ScopeFetchInput::Tick);
+                let outputs = self.provision_fetch.handle(FetchInput::Tick);
                 self.process_provision_fetch_outputs(outputs);
             }
             FetchRequest::ExecutionCerts { wave_id, peers } => {
@@ -633,11 +637,11 @@ where
                     peer_count = peers.peers.len() + usize::from(peers.preferred.is_some()),
                     "Requesting missing execution cert from source shard"
                 );
-                self.exec_cert_fetch.handle(IdFetchInput::Request {
+                self.exec_cert_fetch.handle(FetchInput::Request {
                     ids: vec![wave_id],
                     peers,
                 });
-                let outputs = self.exec_cert_fetch.handle(IdFetchInput::Tick);
+                let outputs = self.exec_cert_fetch.handle(FetchInput::Tick);
                 self.process_exec_cert_fetch_outputs(outputs);
             }
             FetchRequest::RemoteHeader {
@@ -651,11 +655,11 @@ where
                     peer_count = peers.peers.len() + usize::from(peers.preferred.is_some()),
                     "Requesting missing committed block header from source shard"
                 );
-                self.header_fetch.handle(ScopeFetchInput::Request {
-                    scope: headers::scope_for(source_shard, from_height),
+                self.header_fetch.handle(FetchInput::Request {
+                    ids: vec![(source_shard, from_height)],
                     peers,
                 });
-                let outputs = self.header_fetch.handle(ScopeFetchInput::Tick);
+                let outputs = self.header_fetch.handle(FetchInput::Tick);
                 self.process_header_fetch_outputs(outputs);
             }
         }

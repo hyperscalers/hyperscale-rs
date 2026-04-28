@@ -13,7 +13,8 @@
 //! Production: `SyncManager` wraps this, maps outputs to tokio tasks.
 //! Simulation: feeds inputs/outputs synchronously via event queue.
 
-use super::fetch::{RetryClock, SlotTracker};
+use self::retry_clock::RetryClock;
+use self::slot_tracker::SlotTracker;
 use hyperscale_messages::request::{GetBlockRequest, GetBlockTopUpRequest};
 use hyperscale_messages::response::{
     ElidedCertifiedBlock, GetBlockResponse, GetBlockTopUpResponse,
@@ -739,5 +740,224 @@ mod tests {
                 .iter()
                 .any(|o| matches!(o, SyncOutput::FetchBlock { height, .. } if height.0 == 1))
         );
+    }
+}
+
+mod retry_clock {
+    //! Per-key exponential-backoff clock used by the sync protocol's
+    //! per-height retry deferral.
+
+    use std::time::{Duration, Instant};
+
+    /// Tracks how many retry rounds have elapsed and computes the next
+    /// allowed retry deadline using exponential backoff.
+    #[derive(Debug)]
+    pub struct RetryClock {
+        rounds: u32,
+        next_retry_at: Option<Instant>,
+        base_ms: u64,
+        multiplier: f64,
+        max_ms: u64,
+    }
+
+    impl Default for RetryClock {
+        fn default() -> Self {
+            Self {
+                rounds: 0,
+                next_retry_at: None,
+                base_ms: 1_000,
+                multiplier: 2.0,
+                max_ms: 30_000,
+            }
+        }
+    }
+
+    impl RetryClock {
+        /// Whether the clock is past its next-retry deadline (or has none yet).
+        #[must_use]
+        pub fn is_ready(&self, now: Instant) -> bool {
+            self.next_retry_at.is_none_or(|deadline| now >= deadline)
+        }
+
+        /// Advance to the next retry round, computing the new deadline from the
+        /// current round count. Bound by `max_ms`.
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss,
+            clippy::cast_possible_wrap
+        )] // backoff ms fits u64 in practice; rounds is small
+        pub fn advance_round(&mut self, now: Instant) {
+            self.rounds = self.rounds.saturating_add(1);
+            let backoff_ms =
+                ((self.base_ms as f64) * self.multiplier.powi(self.rounds as i32 - 1)) as u64;
+            let backoff_ms = backoff_ms.min(self.max_ms);
+            self.next_retry_at = Some(now + Duration::from_millis(backoff_ms));
+        }
+
+        #[cfg(test)]
+        pub(super) const fn rounds(&self) -> u32 {
+            self.rounds
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn fresh_clock_is_ready() {
+            let clock = RetryClock::default();
+            assert!(clock.is_ready(Instant::now()));
+        }
+
+        #[test]
+        fn advance_round_sets_deadline() {
+            let mut clock = RetryClock::default();
+            let t0 = Instant::now();
+            clock.advance_round(t0);
+            assert!(!clock.is_ready(t0));
+            assert!(clock.is_ready(t0 + Duration::from_secs(2)));
+        }
+
+        #[test]
+        fn rounds_count_increments() {
+            let mut clock = RetryClock::default();
+            let t0 = Instant::now();
+            clock.advance_round(t0);
+            clock.advance_round(t0);
+            clock.advance_round(t0);
+            assert_eq!(clock.rounds(), 3);
+        }
+
+        #[test]
+        fn backoff_clamps_at_max() {
+            let mut clock = RetryClock::default();
+            let t0 = Instant::now();
+            for _ in 0..20 {
+                clock.advance_round(t0);
+            }
+            assert!(clock.is_ready(t0 + Duration::from_secs(30)));
+        }
+    }
+}
+
+mod slot_tracker {
+    //! Cap-enforced set of in-flight keys, used by the sync protocol to
+    //! bound concurrent in-flight block fetches and answer membership
+    //! queries.
+
+    use std::collections::HashSet;
+    use std::hash::Hash;
+
+    #[derive(Debug)]
+    pub struct SlotTracker<K: Eq + Hash + Clone> {
+        capacity: usize,
+        in_flight: HashSet<K>,
+    }
+
+    impl<K: Eq + Hash + Clone> SlotTracker<K> {
+        /// Build a tracker that allows up to `capacity` concurrent in-flight keys.
+        /// `capacity = 0` disables the cap (any number of acquires succeed).
+        #[must_use]
+        pub fn new(capacity: usize) -> Self {
+            Self {
+                capacity,
+                in_flight: HashSet::new(),
+            }
+        }
+
+        /// Try to claim a slot for `key`. Returns `true` if the slot was
+        /// acquired, `false` if the cap is reached or `key` was already in-flight.
+        pub fn try_acquire(&mut self, key: K) -> bool {
+            if self.capacity > 0 && self.in_flight.len() >= self.capacity {
+                return false;
+            }
+            self.in_flight.insert(key)
+        }
+
+        /// Release the slot held by `key`. Returns `true` if a slot was actually
+        /// freed, `false` if `key` wasn't in-flight.
+        pub fn release(&mut self, key: &K) -> bool {
+            self.in_flight.remove(key)
+        }
+
+        /// Whether `key` currently holds a slot.
+        #[must_use]
+        pub fn contains(&self, key: &K) -> bool {
+            self.in_flight.contains(key)
+        }
+
+        /// Count of slots currently held.
+        #[must_use]
+        pub fn in_flight(&self) -> usize {
+            self.in_flight.len()
+        }
+
+        /// Whether at least one slot is free.
+        #[must_use]
+        pub fn has_capacity(&self) -> bool {
+            self.capacity == 0 || self.in_flight.len() < self.capacity
+        }
+
+        /// Drop every key for which `f` returns false.
+        pub fn retain<F>(&mut self, mut f: F)
+        where
+            F: FnMut(&K) -> bool,
+        {
+            self.in_flight.retain(|k| f(k));
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn acquire_and_release_round_trip() {
+            let mut s = SlotTracker::<u32>::new(3);
+            assert!(s.try_acquire(1));
+            assert!(s.try_acquire(2));
+            assert_eq!(s.in_flight(), 2);
+            assert!(s.contains(&1));
+
+            assert!(s.release(&1));
+            assert!(!s.contains(&1));
+            assert_eq!(s.in_flight(), 1);
+        }
+
+        #[test]
+        fn cap_blocks_acquire_when_full() {
+            let mut s = SlotTracker::<u32>::new(2);
+            assert!(s.try_acquire(1));
+            assert!(s.try_acquire(2));
+            assert!(!s.try_acquire(3));
+            assert_eq!(s.in_flight(), 2);
+            assert!(!s.contains(&3));
+        }
+
+        #[test]
+        fn duplicate_acquire_returns_false() {
+            let mut s = SlotTracker::<u32>::new(5);
+            assert!(s.try_acquire(1));
+            assert!(!s.try_acquire(1));
+            assert_eq!(s.in_flight(), 1);
+        }
+
+        #[test]
+        fn capacity_zero_is_uncapped() {
+            let mut s = SlotTracker::<u32>::new(0);
+            for k in 0..1000 {
+                assert!(s.try_acquire(k));
+            }
+            assert_eq!(s.in_flight(), 1000);
+            assert!(s.has_capacity());
+        }
+
+        #[test]
+        fn release_unknown_returns_false() {
+            let mut s = SlotTracker::<u32>::new(5);
+            assert!(!s.release(&42));
+        }
     }
 }

@@ -9,9 +9,11 @@
 //! through to the output handler, which calls `Network::request` and lets
 //! the network's health-weighted selector pick.
 //!
-//! Entries self-evict on `Admitted`. There is no consumer-side `is_abandoned`
-//! predicate — emitters that decide an id is no longer needed feed the id
-//! back through `Admitted` to drop it.
+//! Entries self-evict on `Admitted`. Emitters that decide an id is no
+//! longer needed feed the id back through `Admitted` to drop it without a
+//! fetch ever returning. Cross-shard payloads instantiate this with
+//! `Id = (ShardGroupId, BlockHeight)` — one id per request; the chunking
+//! machinery handles that as a special case of a one-element batch.
 
 use hyperscale_core::FetchPeers;
 use std::collections::{BTreeMap, HashMap};
@@ -19,9 +21,9 @@ use std::hash::Hash;
 use std::sync::Arc;
 use tracing::{debug, trace};
 
-/// Tunables for an [`IdFetch`] instance.
+/// Tunables for a [`Fetch`] instance.
 #[derive(Debug, Clone)]
-pub struct IdFetchConfig {
+pub struct FetchConfig {
     /// Maximum ids in flight across all entries simultaneously.
     pub max_in_flight: usize,
     /// Maximum ids in a single chunked request.
@@ -30,7 +32,7 @@ pub struct IdFetchConfig {
     pub parallel_chunks_per_tick: usize,
 }
 
-impl Default for IdFetchConfig {
+impl Default for FetchConfig {
     fn default() -> Self {
         Self {
             max_in_flight: 400,
@@ -42,7 +44,7 @@ impl Default for IdFetchConfig {
 
 /// Inputs to the protocol state machine.
 #[derive(Debug)]
-pub enum IdFetchInput<Id> {
+pub enum FetchInput<Id> {
     /// Request `ids` using `peers`. Idempotent: ids already pending keep
     /// their existing peer pool; new ids are added with the supplied one.
     Request {
@@ -71,7 +73,7 @@ pub enum IdFetchInput<Id> {
 
 /// Outputs from the protocol state machine.
 #[derive(Debug)]
-pub enum IdFetchOutput<Id> {
+pub enum FetchOutput<Id> {
     /// Issue a network request for `ids` against `peers`. The output handler
     /// translates this into `Network::request(&peers.peers, peers.preferred,
     /// ..)`. The network's health-weighted selector picks the actual target.
@@ -90,16 +92,16 @@ struct Entry {
 }
 
 /// Id-keyed fetch state machine.
-pub struct IdFetch<Id: Eq + Hash + Ord + Clone> {
-    config: IdFetchConfig,
+pub struct Fetch<Id: Eq + Hash + Ord + Clone> {
+    config: FetchConfig,
     /// `BTreeMap` for deterministic iteration order during chunk assembly.
     pending: BTreeMap<Id, Entry>,
 }
 
-impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> IdFetch<Id> {
+impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
     /// Create a new protocol instance with the given config.
     #[must_use]
-    pub const fn new(config: IdFetchConfig) -> Self {
+    pub const fn new(config: FetchConfig) -> Self {
         Self {
             config,
             pending: BTreeMap::new(),
@@ -107,12 +109,12 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> IdFetch<Id> {
     }
 
     /// Process an input and return outputs.
-    pub fn handle(&mut self, input: IdFetchInput<Id>) -> Vec<IdFetchOutput<Id>> {
+    pub fn handle(&mut self, input: FetchInput<Id>) -> Vec<FetchOutput<Id>> {
         match input {
-            IdFetchInput::Request { ids, peers } => self.handle_request(ids, peers),
-            IdFetchInput::Failed { ids } => self.handle_failed(&ids),
-            IdFetchInput::Admitted { ids } => self.handle_drop(&ids),
-            IdFetchInput::Tick => self.spawn_pending_fetches(),
+            FetchInput::Request { ids, peers } => self.handle_request(ids, peers),
+            FetchInput::Failed { ids } => self.handle_failed(&ids),
+            FetchInput::Admitted { ids } => self.handle_drop(&ids),
+            FetchInput::Tick => self.spawn_pending_fetches(),
         }
     }
 
@@ -134,7 +136,18 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> IdFetch<Id> {
         self.pending.len()
     }
 
-    fn handle_request(&mut self, ids: Vec<Id>, peers: FetchPeers) -> Vec<IdFetchOutput<Id>> {
+    /// Drop every id for which `is_abandoned` returns `true`. Lets an
+    /// instance prune ids whose lifetime is bound by consumer state rather
+    /// than admission (e.g. cross-shard provisions follow
+    /// `ProvisionCoordinator`'s expected-set).
+    pub fn evict_abandoned<F>(&mut self, mut is_abandoned: F)
+    where
+        F: FnMut(&Id) -> bool,
+    {
+        self.pending.retain(|id, _| !is_abandoned(id));
+    }
+
+    fn handle_request(&mut self, ids: Vec<Id>, peers: FetchPeers) -> Vec<FetchOutput<Id>> {
         if ids.is_empty() {
             return vec![];
         }
@@ -155,7 +168,7 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> IdFetch<Id> {
         vec![]
     }
 
-    fn handle_failed(&mut self, ids: &[Id]) -> Vec<IdFetchOutput<Id>> {
+    fn handle_failed(&mut self, ids: &[Id]) -> Vec<FetchOutput<Id>> {
         let mut released = 0usize;
         for id in ids {
             if let Some(entry) = self.pending.get_mut(id)
@@ -171,14 +184,14 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> IdFetch<Id> {
         vec![]
     }
 
-    fn handle_drop(&mut self, ids: &[Id]) -> Vec<IdFetchOutput<Id>> {
+    fn handle_drop(&mut self, ids: &[Id]) -> Vec<FetchOutput<Id>> {
         for id in ids {
             self.pending.remove(id);
         }
         vec![]
     }
 
-    fn spawn_pending_fetches(&mut self) -> Vec<IdFetchOutput<Id>> {
+    fn spawn_pending_fetches(&mut self) -> Vec<FetchOutput<Id>> {
         let in_flight_now = self.in_flight_count();
         let global_room = self.config.max_in_flight.saturating_sub(in_flight_now);
         if global_room == 0 {
@@ -223,7 +236,7 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> IdFetch<Id> {
                         entry.in_flight = true;
                     }
                 }
-                outputs.push(IdFetchOutput::Send {
+                outputs.push(FetchOutput::Send {
                     ids: chunk.to_vec(),
                     peers: (*peers).clone(),
                 });
@@ -247,8 +260,8 @@ mod tests {
         ValidatorId(n)
     }
 
-    fn config() -> IdFetchConfig {
-        IdFetchConfig {
+    fn config() -> FetchConfig {
+        FetchConfig {
             max_in_flight: 100,
             max_ids_per_request: 2,
             parallel_chunks_per_tick: 4,
@@ -261,17 +274,16 @@ mod tests {
 
     #[test]
     fn request_then_tick_emits_chunked_sends() {
-        let mut p = IdFetch::<TxHash>::new(config());
-        p.handle(IdFetchInput::Request {
+        let mut p = Fetch::<TxHash>::new(config());
+        p.handle(FetchInput::Request {
             ids: vec![tx(1), tx(2), tx(3), tx(4), tx(5)],
             peers: pinned(vid(1)),
         });
 
-        let out = p.handle(IdFetchInput::Tick);
-        // 5 ids @ 2/chunk = 3 chunks, all carrying the same peer pool.
+        let out = p.handle(FetchInput::Tick);
         assert_eq!(out.len(), 3);
         for o in &out {
-            let IdFetchOutput::Send { peers, .. } = o;
+            let FetchOutput::Send { peers, .. } = o;
             assert_eq!(peers.preferred, Some(vid(1)));
         }
         assert_eq!(p.in_flight_count(), 5);
@@ -279,33 +291,33 @@ mod tests {
 
     #[test]
     fn failed_releases_chunk_for_retry() {
-        let mut p = IdFetch::<TxHash>::new(config());
-        p.handle(IdFetchInput::Request {
+        let mut p = Fetch::<TxHash>::new(config());
+        p.handle(FetchInput::Request {
             ids: vec![tx(1), tx(2)],
             peers: pinned(vid(1)),
         });
-        let out = p.handle(IdFetchInput::Tick);
+        let out = p.handle(FetchInput::Tick);
         assert_eq!(out.len(), 1);
-        let IdFetchOutput::Send { ids, .. } = &out[0];
+        let FetchOutput::Send { ids, .. } = &out[0];
         let chunk_ids = ids.clone();
 
-        p.handle(IdFetchInput::Failed { ids: chunk_ids });
+        p.handle(FetchInput::Failed { ids: chunk_ids });
         assert_eq!(p.in_flight_count(), 0);
 
-        let out = p.handle(IdFetchInput::Tick);
+        let out = p.handle(FetchInput::Tick);
         assert_eq!(out.len(), 1);
     }
 
     #[test]
     fn admitted_drops_ids() {
-        let mut p = IdFetch::<TxHash>::new(config());
-        p.handle(IdFetchInput::Request {
+        let mut p = Fetch::<TxHash>::new(config());
+        p.handle(FetchInput::Request {
             ids: vec![tx(1), tx(2)],
             peers: pinned(vid(1)),
         });
-        p.handle(IdFetchInput::Tick);
+        p.handle(FetchInput::Tick);
 
-        p.handle(IdFetchInput::Admitted {
+        p.handle(FetchInput::Admitted {
             ids: vec![tx(1), tx(2)],
         });
         assert!(!p.has_pending());
@@ -313,31 +325,28 @@ mod tests {
 
     #[test]
     fn admitted_unknown_id_is_silent_noop() {
-        let mut p = IdFetch::<TxHash>::new(config());
-        let out = p.handle(IdFetchInput::Admitted { ids: vec![tx(99)] });
+        let mut p = Fetch::<TxHash>::new(config());
+        let out = p.handle(FetchInput::Admitted { ids: vec![tx(99)] });
         assert!(out.is_empty());
     }
 
     #[test]
     fn duplicate_request_keeps_existing_peers() {
-        let mut p = IdFetch::<TxHash>::new(config());
-        p.handle(IdFetchInput::Request {
+        let mut p = Fetch::<TxHash>::new(config());
+        p.handle(FetchInput::Request {
             ids: vec![tx(1)],
             peers: pinned(vid(1)),
         });
-        // Second request adds tx(2) under a fresh peer pool. tx(1) keeps its
-        // existing pool; tx(2) gets the new one.
-        p.handle(IdFetchInput::Request {
+        p.handle(FetchInput::Request {
             ids: vec![tx(1), tx(2)],
             peers: pinned(vid(2)),
         });
-        let out = p.handle(IdFetchInput::Tick);
-        // Two distinct peer pools → two Sends.
+        let out = p.handle(FetchInput::Tick);
         assert_eq!(out.len(), 2);
         let mut preferreds: Vec<_> = out
             .iter()
             .map(|o| match o {
-                IdFetchOutput::Send { peers, .. } => peers.preferred.unwrap(),
+                FetchOutput::Send { peers, .. } => peers.preferred.unwrap(),
             })
             .collect();
         preferreds.sort_by_key(|v| v.0);
@@ -346,34 +355,33 @@ mod tests {
 
     #[test]
     fn siblings_share_peer_pool_via_arc_grouping() {
-        let mut p = IdFetch::<TxHash>::new(IdFetchConfig {
+        let mut p = Fetch::<TxHash>::new(FetchConfig {
             max_in_flight: 100,
             max_ids_per_request: 50,
             parallel_chunks_per_tick: 8,
         });
-        // 30 ids in one Request — should emit a single Send carrying all 30.
-        p.handle(IdFetchInput::Request {
+        p.handle(FetchInput::Request {
             ids: (0..30).map(tx).collect(),
             peers: pinned(vid(1)),
         });
-        let out = p.handle(IdFetchInput::Tick);
+        let out = p.handle(FetchInput::Tick);
         assert_eq!(out.len(), 1);
-        let IdFetchOutput::Send { ids, .. } = &out[0];
+        let FetchOutput::Send { ids, .. } = &out[0];
         assert_eq!(ids.len(), 30);
     }
 
     #[test]
     fn global_in_flight_cap_bounds_emissions() {
-        let mut p = IdFetch::<TxHash>::new(IdFetchConfig {
+        let mut p = Fetch::<TxHash>::new(FetchConfig {
             max_in_flight: 3,
             max_ids_per_request: 10,
             parallel_chunks_per_tick: 4,
         });
-        p.handle(IdFetchInput::Request {
+        p.handle(FetchInput::Request {
             ids: (0..10).map(tx).collect(),
             peers: pinned(vid(1)),
         });
-        p.handle(IdFetchInput::Tick);
+        p.handle(FetchInput::Tick);
         assert_eq!(p.in_flight_count(), 3, "global cap honoured");
     }
 }

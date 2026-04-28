@@ -240,13 +240,13 @@ where
     /// Dispatch outputs from the transaction fetch.
     pub(super) fn process_transaction_fetch_outputs(
         &self,
-        outputs: Vec<crate::protocol::fetch::IdFetchOutput<hyperscale_types::TxHash>>,
+        outputs: Vec<crate::protocol::fetch::FetchOutput<hyperscale_types::TxHash>>,
     ) {
-        use crate::protocol::fetch::IdFetchOutput;
+        use crate::protocol::fetch::FetchOutput;
         use hyperscale_messages::request::GetTransactionsRequest;
 
         for output in outputs {
-            let IdFetchOutput::Send {
+            let FetchOutput::Send {
                 ids: tx_hashes,
                 peers,
             } = output;
@@ -281,13 +281,13 @@ where
     /// Dispatch outputs from the local-provision fetch.
     pub(super) fn process_local_provision_fetch_outputs(
         &self,
-        outputs: Vec<crate::protocol::fetch::IdFetchOutput<hyperscale_types::ProvisionHash>>,
+        outputs: Vec<crate::protocol::fetch::FetchOutput<hyperscale_types::ProvisionHash>>,
     ) {
-        use crate::protocol::fetch::IdFetchOutput;
+        use crate::protocol::fetch::FetchOutput;
         use hyperscale_messages::request::GetLocalProvisionsRequest;
 
         for output in outputs {
-            let IdFetchOutput::Send {
+            let FetchOutput::Send {
                 ids: batch_hashes,
                 peers,
             } = output;
@@ -327,75 +327,73 @@ where
     pub(super) fn process_provision_fetch_outputs(
         &self,
         outputs: Vec<
-            crate::protocol::fetch::ScopeFetchOutput<
-                crate::protocol::fetch::instances::provisions::Scope,
-            >,
+            crate::protocol::fetch::FetchOutput<(
+                hyperscale_types::ShardGroupId,
+                hyperscale_types::BlockHeight,
+            )>,
         >,
     ) {
-        use crate::protocol::fetch::ScopeFetchOutput;
+        use crate::protocol::fetch::FetchOutput;
 
         for output in outputs {
-            match output {
-                ScopeFetchOutput::Send {
-                    scope: (source_shard, block_height),
-                    peers,
-                } => {
-                    use hyperscale_messages::request::GetProvisionsRequest;
-                    let target_shard = self.local_shard;
-                    let request = GetProvisionsRequest {
-                        block_height,
-                        target_shard,
-                    };
-                    let sender = self.event_sender.clone();
-                    self.network.request(
-                        &peers.peers,
-                        peers.preferred,
-                        request,
-                        Box::new(move |result| {
-                            let Ok(response) = result else {
-                                let _ = sender.send(NodeInput::ProvisionsFetchFailed {
-                                    source_shard,
-                                    block_height,
-                                });
-                                return ResponseVerdict::Accept;
-                            };
-                            let Some(provisions) = response.provisions else {
-                                // Peer cannot serve (state version GC'd).
-                                let _ = sender.send(NodeInput::ProvisionsFetchFailed {
-                                    source_shard,
-                                    block_height,
-                                });
-                                return ResponseVerdict::Reject;
-                            };
-                            if provisions.source_shard != source_shard
-                                || provisions.target_shard != target_shard
-                                || provisions.block_height != block_height
-                            {
-                                tracing::warn!(
-                                    expected_source = source_shard.0,
-                                    got_source = provisions.source_shard.0,
-                                    expected_target = target_shard.0,
-                                    got_target = provisions.target_shard.0,
-                                    expected_height = block_height.0,
-                                    got_height = provisions.block_height.0,
-                                    "Dropping provision fetch response: scope mismatch"
-                                );
-                                let _ = sender.send(NodeInput::ProvisionsFetchFailed {
-                                    source_shard,
-                                    block_height,
-                                });
-                                return ResponseVerdict::Reject;
-                            }
-                            if provisions.transactions.is_empty() {
-                                return ResponseVerdict::Reject;
-                            }
-                            let _ = sender.send(NodeInput::Protocol(
-                                ProtocolEvent::ProvisionsReceived { provisions },
-                            ));
-                            ResponseVerdict::Accept
-                        }),
-                    );
-                }
+            let FetchOutput::Send { ids, peers } = output;
+            for (source_shard, block_height) in ids {
+                use hyperscale_messages::request::GetProvisionsRequest;
+                let target_shard = self.local_shard;
+                let request = GetProvisionsRequest {
+                    block_height,
+                    target_shard,
+                };
+                let sender = self.event_sender.clone();
+                self.network.request(
+                    &peers.peers,
+                    peers.preferred,
+                    request,
+                    Box::new(move |result| {
+                        let Ok(response) = result else {
+                            let _ = sender.send(NodeInput::ProvisionsFetchFailed {
+                                source_shard,
+                                block_height,
+                            });
+                            return ResponseVerdict::Accept;
+                        };
+                        let Some(provisions) = response.provisions else {
+                            // Peer cannot serve (state version GC'd).
+                            let _ = sender.send(NodeInput::ProvisionsFetchFailed {
+                                source_shard,
+                                block_height,
+                            });
+                            return ResponseVerdict::Reject;
+                        };
+                        if provisions.source_shard != source_shard
+                            || provisions.target_shard != target_shard
+                            || provisions.block_height != block_height
+                        {
+                            tracing::warn!(
+                                expected_source = source_shard.0,
+                                got_source = provisions.source_shard.0,
+                                expected_target = target_shard.0,
+                                got_target = provisions.target_shard.0,
+                                expected_height = block_height.0,
+                                got_height = provisions.block_height.0,
+                                "Dropping provision fetch response: scope mismatch"
+                            );
+                            let _ = sender.send(NodeInput::ProvisionsFetchFailed {
+                                source_shard,
+                                block_height,
+                            });
+                            return ResponseVerdict::Reject;
+                        }
+                        if provisions.transactions.is_empty() {
+                            return ResponseVerdict::Reject;
+                        }
+                        let _ =
+                            sender.send(NodeInput::Protocol(ProtocolEvent::ProvisionsReceived {
+                                provisions,
+                            }));
+                        ResponseVerdict::Accept
+                    }),
+                );
             }
         }
     }
@@ -403,13 +401,13 @@ where
     /// Dispatch outputs from the cross-shard execution-cert fetch.
     pub(super) fn process_exec_cert_fetch_outputs(
         &self,
-        outputs: Vec<crate::protocol::fetch::IdFetchOutput<hyperscale_types::WaveId>>,
+        outputs: Vec<crate::protocol::fetch::FetchOutput<hyperscale_types::WaveId>>,
     ) {
-        use crate::protocol::fetch::IdFetchOutput;
+        use crate::protocol::fetch::FetchOutput;
         use hyperscale_messages::request::GetExecutionCertsRequest;
 
         for output in outputs {
-            let IdFetchOutput::Send {
+            let FetchOutput::Send {
                 ids: wave_ids,
                 peers,
             } = output;
@@ -452,54 +450,50 @@ where
     pub(super) fn process_header_fetch_outputs(
         &self,
         outputs: Vec<
-            crate::protocol::fetch::ScopeFetchOutput<
-                crate::protocol::fetch::instances::headers::Scope,
-            >,
+            crate::protocol::fetch::FetchOutput<(
+                hyperscale_types::ShardGroupId,
+                hyperscale_types::BlockHeight,
+            )>,
         >,
     ) {
-        use crate::protocol::fetch::ScopeFetchOutput;
+        use crate::protocol::fetch::FetchOutput;
 
         for output in outputs {
-            match output {
-                ScopeFetchOutput::Send {
-                    scope: (source_shard, from_height),
-                    peers,
-                } => {
-                    use hyperscale_messages::request::GetCommittedBlockHeaderRequest;
-                    let request = GetCommittedBlockHeaderRequest {
-                        shard: source_shard,
-                        height: from_height,
-                    };
-                    let sender = self.event_sender.clone();
-                    self.network.request(
-                        &peers.peers,
-                        peers.preferred,
-                        request,
-                        Box::new(move |result| {
-                            let Ok(response) = result else {
-                                let _ = sender.send(NodeInput::HeaderFetchFailed {
-                                    source_shard,
-                                    from_height,
-                                });
-                                return ResponseVerdict::Accept;
-                            };
-                            let Some(header) = response.header else {
-                                let _ = sender.send(NodeInput::HeaderFetchFailed {
-                                    source_shard,
-                                    from_height,
-                                });
-                                return ResponseVerdict::Reject;
-                            };
-                            let _ = sender.send(NodeInput::Protocol(
-                                ProtocolEvent::RemoteBlockCommitted {
-                                    committed_header: header,
-                                    sender: ValidatorId(0),
-                                },
-                            ));
-                            ResponseVerdict::Accept
-                        }),
-                    );
-                }
+            let FetchOutput::Send { ids, peers } = output;
+            for (source_shard, from_height) in ids {
+                use hyperscale_messages::request::GetCommittedBlockHeaderRequest;
+                let request = GetCommittedBlockHeaderRequest {
+                    shard: source_shard,
+                    height: from_height,
+                };
+                let sender = self.event_sender.clone();
+                self.network.request(
+                    &peers.peers,
+                    peers.preferred,
+                    request,
+                    Box::new(move |result| {
+                        let Ok(response) = result else {
+                            let _ = sender.send(NodeInput::HeaderFetchFailed {
+                                source_shard,
+                                from_height,
+                            });
+                            return ResponseVerdict::Accept;
+                        };
+                        let Some(header) = response.header else {
+                            let _ = sender.send(NodeInput::HeaderFetchFailed {
+                                source_shard,
+                                from_height,
+                            });
+                            return ResponseVerdict::Reject;
+                        };
+                        let _ =
+                            sender.send(NodeInput::Protocol(ProtocolEvent::RemoteBlockCommitted {
+                                committed_header: header,
+                                sender: ValidatorId(0),
+                            }));
+                        ResponseVerdict::Accept
+                    }),
+                );
             }
         }
     }
@@ -507,13 +501,13 @@ where
     /// Dispatch outputs from the finalized-wave fetch.
     pub(super) fn process_finalized_wave_fetch_outputs(
         &self,
-        outputs: Vec<crate::protocol::fetch::IdFetchOutput<hyperscale_types::WaveIdHash>>,
+        outputs: Vec<crate::protocol::fetch::FetchOutput<hyperscale_types::WaveIdHash>>,
     ) {
-        use crate::protocol::fetch::IdFetchOutput;
+        use crate::protocol::fetch::FetchOutput;
         use hyperscale_messages::request::GetFinalizedWavesRequest;
 
         for output in outputs {
-            let IdFetchOutput::Send {
+            let FetchOutput::Send {
                 ids: wave_id_hashes,
                 peers,
             } = output;
