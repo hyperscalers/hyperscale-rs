@@ -37,7 +37,7 @@
 //! Validators collect shard execution proofs from all participating shards. When all
 //! proofs are received, a `WaveCertificate` is created.
 
-use hyperscale_core::{Action, FetchRequest, ProtocolEvent, ProvisionsRequest};
+use hyperscale_core::{Action, FetchPeers, FetchRequest, ProtocolEvent, ProvisionsRequest};
 use hyperscale_types::{
     Attempt, Block, BlockHash, BlockHeight, BloomFilter, ExecutionCertificate, ExecutionVote,
     GlobalReceiptRoot, LocalExecutionEntry, NodeId, Provisions, ReceiptBundle, RoutableTransaction,
@@ -1123,7 +1123,7 @@ impl ExecutionCoordinator {
             );
             actions.push(Action::Fetch(FetchRequest::ExecutionCerts {
                 wave_id,
-                peers,
+                peers: FetchPeers::rotation(peers),
             }));
         }
 

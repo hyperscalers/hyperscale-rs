@@ -9,13 +9,54 @@ use crate::protocol::fetch::instances::{
 };
 use crate::protocol::fetch::{IdFetchInput, PeerSource, ScopeFetchInput};
 use crate::protocol::sync::SyncInput;
-use hyperscale_core::{Action, CommitSource, FetchRequest, NodeInput, ProtocolEvent, StateMachine};
+use hyperscale_core::{
+    Action, CommitSource, FetchPeers, FetchRequest, NodeInput, ProtocolEvent, StateMachine,
+};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::Engine;
 use hyperscale_metrics as metrics;
 use hyperscale_network::Network;
 use hyperscale_storage::{ChainWriter, Storage};
 use hyperscale_types::{Block, BlockHeight, QuorumCertificate, StateRoot, ValidatorId};
+
+/// Convert a [`FetchPeers`] into the fetch protocol's [`PeerSource`].
+///
+/// Falls back to the first available peer when no `preferred` is set —
+/// `IdFetch`'s rotator needs at least one anchor to start a round.
+fn peer_source(peers: FetchPeers) -> PeerSource {
+    let FetchPeers { preferred, peers } = peers;
+    match preferred {
+        Some(p) => PeerSource::Rotation {
+            preferred: p,
+            rest: peers.into_iter().filter(|v| *v != p).collect(),
+        },
+        None => match peers.split_first() {
+            Some((first, rest)) => PeerSource::Rotation {
+                preferred: *first,
+                rest: rest.to_vec(),
+            },
+            None => PeerSource::Rotation {
+                preferred: ValidatorId(0),
+                rest: vec![],
+            },
+        },
+    }
+}
+
+/// Flatten [`FetchPeers`] into the rotator-ordered `Vec<ValidatorId>` shape
+/// `ScopeFetch` expects (preferred first, then the fallback pool).
+fn ordered_peers(peers: FetchPeers) -> Vec<ValidatorId> {
+    let FetchPeers { preferred, peers } = peers;
+    match preferred {
+        Some(p) => {
+            let mut out = Vec::with_capacity(peers.len() + 1);
+            out.push(p);
+            out.extend(peers.into_iter().filter(|v| *v != p));
+            out
+        }
+        None => peers,
+    }
+}
 use std::sync::Arc;
 use tracing::{debug, trace, warn};
 impl<S, N, D, E> IoLoop<S, N, D, E>
@@ -584,33 +625,26 @@ where
     #[allow(clippy::too_many_lines)] // single dispatch, one arm per FetchRequest variant
     fn process_fetch_request(&mut self, req: FetchRequest) {
         match req {
-            FetchRequest::Transactions { ids, proposer } => {
+            FetchRequest::Transactions { ids, peers } => {
                 self.transaction_fetch.handle(IdFetchInput::Request {
                     ids,
-                    peers: PeerSource::Pinned(proposer),
+                    peers: peer_source(peers),
                 });
                 let outputs = self.transaction_fetch.handle(IdFetchInput::Tick);
                 self.process_transaction_fetch_outputs(outputs);
             }
-            FetchRequest::LocalProvisions { ids, proposer } => {
+            FetchRequest::LocalProvisions { ids, peers } => {
                 self.local_provision_fetch.handle(IdFetchInput::Request {
                     ids,
-                    peers: PeerSource::Pinned(proposer),
+                    peers: peer_source(peers),
                 });
                 let outputs = self.local_provision_fetch.handle(IdFetchInput::Tick);
                 self.process_local_provision_fetch_outputs(outputs);
             }
-            FetchRequest::FinalizedWaves {
-                ids,
-                proposer,
-                peers,
-            } => {
+            FetchRequest::FinalizedWaves { ids, peers } => {
                 self.finalized_wave_fetch.handle(IdFetchInput::Request {
                     ids,
-                    peers: PeerSource::Rotation {
-                        preferred: proposer,
-                        rest: peers,
-                    },
+                    peers: peer_source(peers),
                 });
                 let outputs = self.finalized_wave_fetch.handle(IdFetchInput::Tick);
                 self.process_finalized_wave_fetch_outputs(outputs);
@@ -618,11 +652,10 @@ where
             FetchRequest::RemoteProvisions {
                 source_shard,
                 block_height,
-                proposer,
                 peers,
             } => {
                 debug_assert!(
-                    !peers.is_empty(),
+                    peers.preferred.is_some() || !peers.peers.is_empty(),
                     "RemoteProvisions for shard {} height {} has no peers — \
                      was the action enriched by NodeStateMachine?",
                     source_shard.0,
@@ -631,18 +664,12 @@ where
                 debug!(
                     source_shard = source_shard.0,
                     block_height = block_height.0,
-                    proposer = proposer.0,
-                    peer_count = peers.len(),
+                    peer_count = peers.peers.len() + usize::from(peers.preferred.is_some()),
                     "Requesting missing provisions from source shard"
                 );
-                // Put the proposer first so the rotator tries them on the
-                // first attempt; everyone else fills out the fallback order.
-                let mut ordered_peers = Vec::with_capacity(peers.len());
-                ordered_peers.push(proposer);
-                ordered_peers.extend(peers.into_iter().filter(|p| *p != proposer));
                 self.provision_fetch.handle(ScopeFetchInput::Request {
                     scope: provisions::scope_for(source_shard, block_height),
-                    peers: ordered_peers,
+                    peers: ordered_peers(peers),
                 });
                 let outputs = self.provision_fetch.handle(ScopeFetchInput::Tick {
                     now: std::time::Instant::now(),
@@ -652,19 +679,12 @@ where
             FetchRequest::ExecutionCerts { wave_id, peers } => {
                 debug!(
                     wave = %wave_id,
-                    peer_count = peers.len(),
+                    peer_count = peers.peers.len() + usize::from(peers.preferred.is_some()),
                     "Requesting missing execution cert from source shard"
                 );
-                // Rotation pool, shuffled with no preferred head — every peer
-                // in the source committee can serve any wave's cert equally.
-                let (preferred, rest) = peers
-                    .split_first()
-                    .map_or((hyperscale_types::ValidatorId(0), vec![]), |(p, r)| {
-                        (*p, r.to_vec())
-                    });
                 self.exec_cert_fetch.handle(IdFetchInput::Request {
                     ids: vec![wave_id],
-                    peers: PeerSource::Rotation { preferred, rest },
+                    peers: peer_source(peers),
                 });
                 let outputs = self.exec_cert_fetch.handle(IdFetchInput::Tick);
                 self.process_exec_cert_fetch_outputs(outputs);
@@ -677,12 +697,12 @@ where
                 debug!(
                     source_shard = source_shard.0,
                     from_height = from_height.0,
-                    peer_count = peers.len(),
+                    peer_count = peers.peers.len() + usize::from(peers.preferred.is_some()),
                     "Requesting missing committed block header from source shard"
                 );
                 self.header_fetch.handle(ScopeFetchInput::Request {
                     scope: headers::scope_for(source_shard, from_height),
-                    peers,
+                    peers: ordered_peers(peers),
                 });
                 let outputs = self.header_fetch.handle(ScopeFetchInput::Tick {
                     now: std::time::Instant::now(),

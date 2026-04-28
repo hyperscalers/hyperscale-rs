@@ -41,10 +41,13 @@ impl Default for IdFetchConfig {
 }
 
 /// Peer-selection policy for a fetch entry.
+///
+/// Always rotates: walks `preferred` first (one canonical-source peer), then
+/// `rest`, with backoff between full sweeps. A "pinned to one peer" effect
+/// is just `Rotation { preferred, rest: vec![] }` — same shape, but with
+/// backoff instead of a tight retry loop.
 #[derive(Debug, Clone)]
 pub enum PeerSource {
-    /// Pinned to a single peer for every attempt (no rotation, no backoff).
-    Pinned(ValidatorId),
     /// Walk through `preferred` first, then `rest`. Rotates on failure with
     /// backoff between full sweeps.
     Rotation {
@@ -98,35 +101,24 @@ pub enum IdFetchOutput<Id> {
 
 #[derive(Debug)]
 struct Entry {
-    peers: PeerSource,
-    rotator: Option<PeerRotator>,
+    rotator: PeerRotator,
     in_flight: bool,
 }
 
 impl Entry {
     fn new(peers: PeerSource) -> Self {
-        let rotator = match &peers {
-            PeerSource::Pinned(_) => None,
-            PeerSource::Rotation { preferred, rest } => {
-                let mut peer_list = Vec::with_capacity(1 + rest.len());
-                peer_list.push(*preferred);
-                peer_list.extend(rest.iter().filter(|p| *p != preferred).copied());
-                Some(PeerRotator::new(peer_list))
-            }
-        };
+        let PeerSource::Rotation { preferred, rest } = peers;
+        let mut peer_list = Vec::with_capacity(1 + rest.len());
+        peer_list.push(preferred);
+        peer_list.extend(rest.into_iter().filter(|p| *p != preferred));
         Self {
-            peers,
-            rotator,
+            rotator: PeerRotator::new(peer_list),
             in_flight: false,
         }
     }
 
     fn next_peer(&mut self, now: Instant) -> Option<ValidatorId> {
-        match (&self.peers, self.rotator.as_mut()) {
-            (PeerSource::Pinned(p), _) => Some(*p),
-            (_, Some(rot)) => rot.next(now),
-            _ => None,
-        }
+        self.rotator.next(now)
     }
 }
 
@@ -294,7 +286,10 @@ mod tests {
         let mut p = IdFetch::<TxHash>::new(config());
         p.handle(IdFetchInput::Request {
             ids: vec![tx(1), tx(2), tx(3), tx(4), tx(5)],
-            peers: PeerSource::Pinned(vid(1)),
+            peers: PeerSource::Rotation {
+                preferred: vid(1),
+                rest: vec![],
+            },
         });
 
         let out = p.handle(IdFetchInput::Tick);
@@ -310,9 +305,14 @@ mod tests {
     #[test]
     fn failed_releases_chunk_for_retry() {
         let mut p = IdFetch::<TxHash>::new(config());
+        // Two-peer rotation so retry-after-failure rotates without entering
+        // backoff (single-peer rotation backs off between rounds).
         p.handle(IdFetchInput::Request {
             ids: vec![tx(1), tx(2)],
-            peers: PeerSource::Pinned(vid(1)),
+            peers: PeerSource::Rotation {
+                preferred: vid(1),
+                rest: vec![vid(2)],
+            },
         });
         let out = p.handle(IdFetchInput::Tick);
         assert_eq!(out.len(), 1);
@@ -331,7 +331,10 @@ mod tests {
         let mut p = IdFetch::<TxHash>::new(config());
         p.handle(IdFetchInput::Request {
             ids: vec![tx(1), tx(2)],
-            peers: PeerSource::Pinned(vid(1)),
+            peers: PeerSource::Rotation {
+                preferred: vid(1),
+                rest: vec![],
+            },
         });
         p.handle(IdFetchInput::Tick);
 
@@ -353,12 +356,18 @@ mod tests {
         let mut p = IdFetch::<TxHash>::new(config());
         p.handle(IdFetchInput::Request {
             ids: vec![tx(1)],
-            peers: PeerSource::Pinned(vid(1)),
+            peers: PeerSource::Rotation {
+                preferred: vid(1),
+                rest: vec![],
+            },
         });
         // Second request adds tx(2), keeps tx(1)'s existing peer source.
         p.handle(IdFetchInput::Request {
             ids: vec![tx(1), tx(2)],
-            peers: PeerSource::Pinned(vid(2)),
+            peers: PeerSource::Rotation {
+                preferred: vid(2),
+                rest: vec![],
+            },
         });
         let out = p.handle(IdFetchInput::Tick);
         // tx(1) goes to vid(1), tx(2) goes to vid(2). Two sends.
@@ -402,7 +411,10 @@ mod tests {
         });
         p.handle(IdFetchInput::Request {
             ids: (0..10).map(tx).collect(),
-            peers: PeerSource::Pinned(vid(1)),
+            peers: PeerSource::Rotation {
+                preferred: vid(1),
+                rest: vec![],
+            },
         });
         p.handle(IdFetchInput::Tick);
         assert_eq!(p.in_flight_count(), 3, "global cap honoured");

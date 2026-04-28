@@ -2,7 +2,7 @@
 //!
 //! Tracks blocks being assembled from headers + gossiped transactions + finalized waves.
 
-use hyperscale_core::{Action, FetchRequest};
+use hyperscale_core::{Action, FetchPeers, FetchRequest};
 #[cfg(test)]
 use hyperscale_types::Hash;
 use hyperscale_types::{
@@ -347,6 +347,13 @@ pub fn check_fetches(
         }
 
         let proposer = pending.header().proposer;
+        let local_self = topology.local_validator_id();
+        let local_committee: Vec<_> = topology
+            .committee_for_shard(topology.local_shard())
+            .iter()
+            .copied()
+            .filter(|v| *v != local_self && *v != proposer)
+            .collect();
 
         let missing_txs = pending.missing_transactions();
         if !missing_txs.is_empty() {
@@ -360,7 +367,7 @@ pub fn check_fetches(
             );
             actions.push(Action::Fetch(FetchRequest::Transactions {
                 ids: missing_txs,
-                proposer,
+                peers: FetchPeers::with_preferred(proposer, local_committee.clone()),
             }));
         }
 
@@ -375,7 +382,7 @@ pub fn check_fetches(
             );
             actions.push(Action::Fetch(FetchRequest::LocalProvisions {
                 ids: missing_provisions,
-                proposer,
+                peers: FetchPeers::with_preferred(proposer, local_committee.clone()),
             }));
         }
 
@@ -388,17 +395,9 @@ pub fn check_fetches(
                 age_ms = age.as_millis(),
                 "Fetch timeout reached, requesting missing finalized waves"
             );
-            let local_self = topology.local_validator_id();
-            let peers: Vec<_> = topology
-                .committee_for_shard(topology.local_shard())
-                .iter()
-                .copied()
-                .filter(|v| *v != local_self)
-                .collect();
             actions.push(Action::Fetch(FetchRequest::FinalizedWaves {
                 ids: missing_waves,
-                proposer,
-                peers,
+                peers: FetchPeers::with_preferred(proposer, local_committee),
             }));
         }
     }

@@ -14,52 +14,90 @@ use hyperscale_types::{
     BlockHeight, ProvisionHash, ShardGroupId, TxHash, ValidatorId, WaveId, WaveIdHash,
 };
 
+/// Peer pool plus an optional canonical-source hint.
+///
+/// `preferred` is a hint to the network's selector — it tries this peer
+/// first if it's in the pool, then falls back to health-weighted selection
+/// over `peers`. Set `preferred` only when there's a structural reason
+/// to expect one peer to have the data first (e.g. block proposer for
+/// BFT-path fetches). Use `None` when any peer in the pool is equally
+/// likely to serve.
+#[derive(Debug, Clone)]
+pub struct FetchPeers {
+    /// Peer to try first each round, when one peer has a structural reason
+    /// to be the canonical source. `None` for "no preferred — let the
+    /// network pick by health/RTT."
+    pub preferred: Option<ValidatorId>,
+    /// Rotation pool walked after `preferred` (or as the full pool when
+    /// `preferred` is `None`).
+    pub peers: Vec<ValidatorId>,
+}
+
+impl FetchPeers {
+    /// Build a peer set with a canonical-source hint.
+    #[must_use]
+    pub const fn with_preferred(preferred: ValidatorId, peers: Vec<ValidatorId>) -> Self {
+        Self {
+            preferred: Some(preferred),
+            peers,
+        }
+    }
+
+    /// Build a peer set with no canonical source — any peer in the pool is
+    /// equally suitable; selection is left to the network layer.
+    #[must_use]
+    pub const fn rotation(peers: Vec<ValidatorId>) -> Self {
+        Self {
+            preferred: None,
+            peers,
+        }
+    }
+}
+
 /// Fetch family — one variant per payload type.
 #[derive(Debug, Clone)]
 pub enum FetchRequest {
-    /// Transaction fetch by id. Pinned to the proposer (no rotation).
+    /// Transaction fetch by id.
     Transactions {
         /// Transaction hashes to fetch.
         ids: Vec<TxHash>,
-        /// Block proposer (single fetch target — no peer rotation).
-        proposer: ValidatorId,
+        /// Peer pool. BFT-path emitters set `preferred = Some(proposer)`;
+        /// the mempool DA path uses `None`.
+        peers: FetchPeers,
     },
-    /// Local-provision fetch by id. Pinned to the proposer.
+    /// Local-provision fetch by id.
     LocalProvisions {
         /// Provision hashes to fetch.
         ids: Vec<ProvisionHash>,
-        /// Block proposer (single fetch target).
-        proposer: ValidatorId,
+        /// Peer pool. BFT-path emitters set `preferred = Some(proposer)`.
+        peers: FetchPeers,
     },
-    /// Finalized-wave fetch by id. Rotates from the proposer through
-    /// local-committee peers.
+    /// Finalized-wave fetch by id.
     FinalizedWaves {
         /// Wave-id hashes to fetch.
         ids: Vec<WaveIdHash>,
-        /// Block proposer (tried first).
-        proposer: ValidatorId,
-        /// Local-committee fallback peers.
-        peers: Vec<ValidatorId>,
+        /// Peer pool. BFT-path emitters set `preferred = Some(proposer)`.
+        peers: FetchPeers,
     },
     /// Cross-shard provisions fetch (`ScopeFetch` keyed by
-    /// `(ShardGroupId, BlockHeight)`). Falls back to source-shard peers.
+    /// `(ShardGroupId, BlockHeight)`).
     RemoteProvisions {
         /// Source shard whose provisions are missing.
         source_shard: ShardGroupId,
         /// Source-shard block height for the missing provisions.
         block_height: BlockHeight,
-        /// Source-shard block proposer (tried first).
-        proposer: ValidatorId,
-        /// Source-shard committee (fallback peers).
-        peers: Vec<ValidatorId>,
+        /// Source-shard peer pool. `preferred = Some(source-block proposer)`
+        /// — they originated the provisions.
+        peers: FetchPeers,
     },
-    /// Cross-shard execution-cert fetch by `WaveId`. Rotates through
-    /// source-shard committee.
+    /// Cross-shard execution-cert fetch by `WaveId`.
     ExecutionCerts {
         /// Wave whose EC is missing.
         wave_id: WaveId,
-        /// Source-shard committee (rotation pool).
-        peers: Vec<ValidatorId>,
+        /// Source-shard peer pool. No canonical preferred — the wave's
+        /// designated broadcaster role is computable but the network's
+        /// health-weighted selection works equally well empirically.
+        peers: FetchPeers,
     },
     /// Cross-shard committed-block-header fetch (`ScopeFetch` keyed by
     /// `(ShardGroupId, BlockHeight)`).
@@ -68,7 +106,8 @@ pub enum FetchRequest {
         source_shard: ShardGroupId,
         /// First missing height (fetch starts from here).
         from_height: BlockHeight,
-        /// Source-shard committee (candidate peers).
-        peers: Vec<ValidatorId>,
+        /// Source-shard peer pool. No canonical preferred — any peer can
+        /// serve.
+        peers: FetchPeers,
     },
 }

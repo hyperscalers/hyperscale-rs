@@ -16,7 +16,7 @@ use crate::pipeline::ProvisionPipeline;
 use crate::queue::QueuedProvisionBuffer;
 use crate::store::ProvisionStore;
 use crate::verified_headers::VerifiedHeaderBuffer;
-use hyperscale_core::{Action, FetchRequest, ProtocolEvent};
+use hyperscale_core::{Action, FetchPeers, FetchRequest, ProtocolEvent};
 use hyperscale_types::{
     BlockHeight, CommittedBlockHeader, Hash, LocalTimestamp, ProvisionHash, ProvisionTxRoot,
     Provisions, RETENTION_HORIZON, ShardGroupId, TopologySnapshot, compute_padded_merkle_root,
@@ -248,8 +248,15 @@ impl ProvisionCoordinator {
                 Action::Fetch(FetchRequest::RemoteProvisions {
                     source_shard: effect.source_shard,
                     block_height: effect.block_height,
-                    proposer: effect.proposer,
-                    peers: topology.committee_for_shard(effect.source_shard).to_vec(),
+                    peers: FetchPeers::with_preferred(
+                        effect.proposer,
+                        topology
+                            .committee_for_shard(effect.source_shard)
+                            .iter()
+                            .copied()
+                            .filter(|p| *p != effect.proposer)
+                            .collect(),
+                    ),
                 })
             })
             .collect()
@@ -304,8 +311,15 @@ impl ProvisionCoordinator {
                 Action::Fetch(FetchRequest::RemoteProvisions {
                     source_shard: effect.source_shard,
                     block_height: effect.block_height,
-                    proposer: effect.proposer,
-                    peers: topology.committee_for_shard(effect.source_shard).to_vec(),
+                    peers: FetchPeers::with_preferred(
+                        effect.proposer,
+                        topology
+                            .committee_for_shard(effect.source_shard)
+                            .iter()
+                            .copied()
+                            .filter(|p| *p != effect.proposer)
+                            .collect(),
+                    ),
                 })
             })
             .collect()
@@ -1407,11 +1421,10 @@ mod tests {
             Action::Fetch(FetchRequest::RemoteProvisions {
                 source_shard,
                 block_height,
-                proposer,
-                ..
+                peers,
             }) if *source_shard == ShardGroupId(1)
                 && *block_height == BlockHeight(10)
-                && *proposer == ValidatorId(0)
+                && peers.preferred == Some(ValidatorId(0))
         ));
     }
 

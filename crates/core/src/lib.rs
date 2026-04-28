@@ -36,7 +36,7 @@ mod timer;
 mod traits;
 
 pub use action::{Action, CrossShardExecutionRequest, ProvisionsRequest};
-pub use fetch_request::FetchRequest;
+pub use fetch_request::{FetchPeers, FetchRequest};
 pub use input::{EventPriority, NodeInput};
 pub use protocol_event::{CommitSource, ProtocolEvent, VerificationKind};
 pub use timer::{TimerId, TimerScheduler};
