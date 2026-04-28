@@ -248,14 +248,13 @@ where
         for output in outputs {
             let IdFetchOutput::Send {
                 ids: tx_hashes,
-                peer: proposer,
+                peers,
             } = output;
             let es = self.event_sender.clone();
             let hs = tx_hashes.clone();
-            let peers = self.local_peers();
             self.network.request(
-                &peers,
-                Some(proposer),
+                &peers.peers,
+                peers.preferred,
                 GetTransactionsRequest::new(tx_hashes),
                 Box::new(move |result| {
                     if let Ok(resp) = result {
@@ -290,14 +289,13 @@ where
         for output in outputs {
             let IdFetchOutput::Send {
                 ids: batch_hashes,
-                peer: proposer,
+                peers,
             } = output;
             let es = self.event_sender.clone();
             let hs = batch_hashes.clone();
-            let peers = self.local_peers();
             self.network.request(
-                &peers,
-                Some(proposer),
+                &peers.peers,
+                peers.preferred,
                 GetLocalProvisionsRequest::new(batch_hashes),
                 Box::new(move |result| {
                     if let Ok(resp) = result {
@@ -340,7 +338,7 @@ where
             match output {
                 ScopeFetchOutput::Send {
                     scope: (source_shard, block_height),
-                    peer,
+                    peers,
                 } => {
                     use hyperscale_messages::request::GetProvisionsRequest;
                     let target_shard = self.local_shard;
@@ -350,8 +348,8 @@ where
                     };
                     let sender = self.event_sender.clone();
                     self.network.request(
-                        &[peer],
-                        None,
+                        &peers.peers,
+                        peers.preferred,
                         request,
                         Box::new(move |result| {
                             let Ok(response) = result else {
@@ -413,14 +411,14 @@ where
         for output in outputs {
             let IdFetchOutput::Send {
                 ids: wave_ids,
-                peer,
+                peers,
             } = output;
             let failed_ids = wave_ids.clone();
             let request = GetExecutionCertsRequest { wave_ids };
             let sender = self.event_sender.clone();
             self.network.request(
-                &[peer],
-                None,
+                &peers.peers,
+                peers.preferred,
                 request,
                 Box::new(move |result| {
                     if let Ok(response) = result {
@@ -465,7 +463,7 @@ where
             match output {
                 ScopeFetchOutput::Send {
                     scope: (source_shard, from_height),
-                    peer,
+                    peers,
                 } => {
                     use hyperscale_messages::request::GetCommittedBlockHeaderRequest;
                     let request = GetCommittedBlockHeaderRequest {
@@ -474,8 +472,8 @@ where
                     };
                     let sender = self.event_sender.clone();
                     self.network.request(
-                        &[peer],
-                        None,
+                        &peers.peers,
+                        peers.preferred,
                         request,
                         Box::new(move |result| {
                             let Ok(response) = result else {
@@ -507,10 +505,6 @@ where
     }
 
     /// Dispatch outputs from the finalized-wave fetch.
-    ///
-    /// Pin each request to the chosen peer (the protocol drives rotation
-    /// itself; letting `Network::request` rotate would defeat per-peer
-    /// tried-set tracking).
     pub(super) fn process_finalized_wave_fetch_outputs(
         &self,
         outputs: Vec<crate::protocol::fetch::IdFetchOutput<hyperscale_types::WaveIdHash>>,
@@ -521,14 +515,13 @@ where
         for output in outputs {
             let IdFetchOutput::Send {
                 ids: wave_id_hashes,
-                peer,
+                peers,
             } = output;
             let es = self.event_sender.clone();
             let hs = wave_id_hashes.clone();
-            let pinned = [peer];
             self.network.request(
-                &pinned,
-                Some(peer),
+                &peers.peers,
+                peers.preferred,
                 GetFinalizedWavesRequest::new(wave_id_hashes),
                 Box::new(move |result| {
                     if let Ok(resp) = result {

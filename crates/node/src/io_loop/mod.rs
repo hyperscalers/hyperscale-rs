@@ -692,7 +692,7 @@ where
 
                 self.provision_fetch
                     .evict_abandoned(|s| provisions::is_abandoned(&self.state, s));
-                let outputs = self.provision_fetch.handle(ScopeFetchInput::Tick { now });
+                let outputs = self.provision_fetch.handle(ScopeFetchInput::Tick);
                 self.process_provision_fetch_outputs(outputs);
 
                 let outputs = self.exec_cert_fetch.handle(IdFetchInput::Tick);
@@ -700,7 +700,7 @@ where
 
                 // Header fetch drains via `Continuation(RemoteHeaderAdmitted)`
                 // through `apply_admission`.
-                let outputs = self.header_fetch.handle(ScopeFetchInput::Tick { now });
+                let outputs = self.header_fetch.handle(ScopeFetchInput::Tick);
                 self.process_header_fetch_outputs(outputs);
 
                 self.update_fetch_tick_timer();
@@ -714,10 +714,8 @@ where
                 let scope = provisions::scope_for(source_shard, block_height);
                 self.provision_fetch
                     .handle(ScopeFetchInput::Failed { scope });
-                // Tick to retry with next peer immediately.
-                let tick_outputs = self.provision_fetch.handle(ScopeFetchInput::Tick {
-                    now: std::time::Instant::now(),
-                });
+                // Tick to re-issue immediately; network handles peer rotation.
+                let tick_outputs = self.provision_fetch.handle(ScopeFetchInput::Tick);
                 self.process_provision_fetch_outputs(tick_outputs);
                 self.update_fetch_tick_timer();
             }
@@ -748,10 +746,8 @@ where
             } => {
                 let scope = headers::scope_for(source_shard, from_height);
                 self.header_fetch.handle(ScopeFetchInput::Failed { scope });
-                // Tick to retry with next peer immediately.
-                let tick_outputs = self.header_fetch.handle(ScopeFetchInput::Tick {
-                    now: std::time::Instant::now(),
-                });
+                // Tick to re-issue immediately; network handles peer rotation.
+                let tick_outputs = self.header_fetch.handle(ScopeFetchInput::Tick);
                 self.process_header_fetch_outputs(tick_outputs);
                 self.update_fetch_tick_timer();
             }

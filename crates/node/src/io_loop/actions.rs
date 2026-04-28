@@ -7,56 +7,15 @@ use crate::action_handler::{self, ActionContext, DispatchPool};
 use crate::protocol::fetch::instances::{
     exec_certs, finalized_waves, headers, local_provisions, provisions, transactions,
 };
-use crate::protocol::fetch::{IdFetchInput, PeerSource, ScopeFetchInput};
+use crate::protocol::fetch::{IdFetchInput, ScopeFetchInput};
 use crate::protocol::sync::SyncInput;
-use hyperscale_core::{
-    Action, CommitSource, FetchPeers, FetchRequest, NodeInput, ProtocolEvent, StateMachine,
-};
+use hyperscale_core::{Action, CommitSource, FetchRequest, NodeInput, ProtocolEvent, StateMachine};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::Engine;
 use hyperscale_metrics as metrics;
 use hyperscale_network::Network;
 use hyperscale_storage::{ChainWriter, Storage};
 use hyperscale_types::{Block, BlockHeight, QuorumCertificate, StateRoot, ValidatorId};
-
-/// Convert a [`FetchPeers`] into the fetch protocol's [`PeerSource`].
-///
-/// Falls back to the first available peer when no `preferred` is set —
-/// `IdFetch`'s rotator needs at least one anchor to start a round.
-fn peer_source(peers: FetchPeers) -> PeerSource {
-    let FetchPeers { preferred, peers } = peers;
-    match preferred {
-        Some(p) => PeerSource::Rotation {
-            preferred: p,
-            rest: peers.into_iter().filter(|v| *v != p).collect(),
-        },
-        None => match peers.split_first() {
-            Some((first, rest)) => PeerSource::Rotation {
-                preferred: *first,
-                rest: rest.to_vec(),
-            },
-            None => PeerSource::Rotation {
-                preferred: ValidatorId(0),
-                rest: vec![],
-            },
-        },
-    }
-}
-
-/// Flatten [`FetchPeers`] into the rotator-ordered `Vec<ValidatorId>` shape
-/// `ScopeFetch` expects (preferred first, then the fallback pool).
-fn ordered_peers(peers: FetchPeers) -> Vec<ValidatorId> {
-    let FetchPeers { preferred, peers } = peers;
-    match preferred {
-        Some(p) => {
-            let mut out = Vec::with_capacity(peers.len() + 1);
-            out.push(p);
-            out.extend(peers.into_iter().filter(|v| *v != p));
-            out
-        }
-        None => peers,
-    }
-}
 use std::sync::Arc;
 use tracing::{debug, trace, warn};
 impl<S, N, D, E> IoLoop<S, N, D, E>
@@ -626,26 +585,20 @@ where
     fn process_fetch_request(&mut self, req: FetchRequest) {
         match req {
             FetchRequest::Transactions { ids, peers } => {
-                self.transaction_fetch.handle(IdFetchInput::Request {
-                    ids,
-                    peers: peer_source(peers),
-                });
+                self.transaction_fetch
+                    .handle(IdFetchInput::Request { ids, peers });
                 let outputs = self.transaction_fetch.handle(IdFetchInput::Tick);
                 self.process_transaction_fetch_outputs(outputs);
             }
             FetchRequest::LocalProvisions { ids, peers } => {
-                self.local_provision_fetch.handle(IdFetchInput::Request {
-                    ids,
-                    peers: peer_source(peers),
-                });
+                self.local_provision_fetch
+                    .handle(IdFetchInput::Request { ids, peers });
                 let outputs = self.local_provision_fetch.handle(IdFetchInput::Tick);
                 self.process_local_provision_fetch_outputs(outputs);
             }
             FetchRequest::FinalizedWaves { ids, peers } => {
-                self.finalized_wave_fetch.handle(IdFetchInput::Request {
-                    ids,
-                    peers: peer_source(peers),
-                });
+                self.finalized_wave_fetch
+                    .handle(IdFetchInput::Request { ids, peers });
                 let outputs = self.finalized_wave_fetch.handle(IdFetchInput::Tick);
                 self.process_finalized_wave_fetch_outputs(outputs);
             }
@@ -669,11 +622,9 @@ where
                 );
                 self.provision_fetch.handle(ScopeFetchInput::Request {
                     scope: provisions::scope_for(source_shard, block_height),
-                    peers: ordered_peers(peers),
+                    peers,
                 });
-                let outputs = self.provision_fetch.handle(ScopeFetchInput::Tick {
-                    now: std::time::Instant::now(),
-                });
+                let outputs = self.provision_fetch.handle(ScopeFetchInput::Tick);
                 self.process_provision_fetch_outputs(outputs);
             }
             FetchRequest::ExecutionCerts { wave_id, peers } => {
@@ -684,7 +635,7 @@ where
                 );
                 self.exec_cert_fetch.handle(IdFetchInput::Request {
                     ids: vec![wave_id],
-                    peers: peer_source(peers),
+                    peers,
                 });
                 let outputs = self.exec_cert_fetch.handle(IdFetchInput::Tick);
                 self.process_exec_cert_fetch_outputs(outputs);
@@ -702,11 +653,9 @@ where
                 );
                 self.header_fetch.handle(ScopeFetchInput::Request {
                     scope: headers::scope_for(source_shard, from_height),
-                    peers: ordered_peers(peers),
+                    peers,
                 });
-                let outputs = self.header_fetch.handle(ScopeFetchInput::Tick {
-                    now: std::time::Instant::now(),
-                });
+                let outputs = self.header_fetch.handle(ScopeFetchInput::Tick);
                 self.process_header_fetch_outputs(outputs);
             }
         }

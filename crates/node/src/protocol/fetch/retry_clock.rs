@@ -46,13 +46,6 @@ impl RetryClock {
         self.next_retry_at = Some(now + Duration::from_millis(backoff_ms));
     }
 
-    /// Reset rounds to zero and clear any pending backoff. Used when a
-    /// duplicate request refreshes the entry's peer list.
-    pub const fn reset(&mut self) {
-        self.rounds = 0;
-        self.next_retry_at = None;
-    }
-
     #[cfg(test)]
     pub(super) const fn rounds(&self) -> u32 {
         self.rounds
@@ -112,17 +105,5 @@ mod tests {
         }
         // After many rounds, the deadline is exactly max ms past t0.
         assert!(clock.is_ready(t0 + Duration::from_secs(30)));
-    }
-
-    #[test]
-    fn reset_clears_state() {
-        let mut clock = RetryClock::new();
-        clock.advance_round(Instant::now());
-        clock.advance_round(Instant::now());
-        assert_eq!(clock.rounds(), 2);
-
-        clock.reset();
-        assert_eq!(clock.rounds(), 0);
-        assert!(clock.is_ready(Instant::now()));
     }
 }
